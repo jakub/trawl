@@ -215,6 +215,9 @@ config:
     reportMaxRows: 10000
     maxRunsPerSchedule: 100
     reportRetentionDays: 30
+    # Intervals of missed coverage one since_last catch-up run may cover
+    # before its window is clamped forward and the run flagged.
+    maxCatchupIntervals: 24
 
 # -- TLS configuration
 # "auto"        — trawld generates a self-signed cert (default, zero-config)

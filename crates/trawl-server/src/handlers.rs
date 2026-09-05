@@ -33,11 +33,12 @@ use crate::error::ServerError;
 use crate::policy::{Permission, TrawlAuthz as _};
 use crate::pool::PoolDebugInfo;
 use crate::query_log::{HotBufferDebug, QueryLogEntry, ResultDebug, SourceDebug, TimingDebug};
+use crate::report_window::{ScheduleWindow, format_window_bound};
 use crate::scheduler::execute_scheduled_query;
 use crate::state::{AppState, CachedFieldValues};
 use crate::store::{
-    HistoryEntry, ReportRun, RunClaim, RunStatus, SavedQuery, Schedule, ScheduleWithStats,
-    format_interval, parse_interval,
+    HistoryEntry, ManualRunClaim, ReportRun, RunStatus, SavedQuery, Schedule, ScheduleWithStats,
+    format_interval, parse_duration_secs, parse_interval,
 };
 
 // -- handlers ----------------------------------------------------------------
@@ -1749,11 +1750,14 @@ pub async fn update_saved(
 
     let key_id = verified.id;
 
-    // NotFound → 404, InvalidName → 400, DuplicateName → 409.
+    // NotFound → 404, InvalidName → 400, DuplicateName → 409, and a new
+    // DSL that contradicts the schedule's window → 400 naming both sides.
+    // The store proves that under the saved-query row lock, so the pair a
+    // window forbids cannot be assembled by two requests racing.
     let saved = state
         .storage
         .saved
-        .update(id, key_id, &req.query, req.name.as_deref())
+        .update_checked(id, key_id, &req.query, req.name.as_deref())
         .await?;
 
     Ok(Json(saved_query_response(saved)))
@@ -1809,6 +1813,26 @@ fn build_schedule_response(
         updated_at: schedule.updated_at.to_rfc3339(),
         last_run: latest_run.map(report_run_summary),
         total_runs,
+        window: schedule.window.map(|w| w.to_string()),
+        // The lag pair rides the window, not the stored number: query mode
+        // stores a zero that changes no answer, and reporting "0s" there
+        // would read as an allowance in force. `ensure_lag_has_window`
+        // refuses the other combination, so the stored zero is the only
+        // thing being hidden.
+        lag: schedule.window.map(|_| format_interval(schedule.lag_secs)),
+        lag_secs: schedule.window.map(|_| schedule.lag_secs),
+        // Only a tiling schedule has a watermark that claims anything. The
+        // store KEEPS the stored value across a mode change on purpose
+        // (ADR-0018 ruling 14: an edit does not reset coverage, so
+        // switching back resumes where it stopped), which is exactly why
+        // reading the column alone would report a fixed-window or
+        // query-mode schedule as covered up to some instant nothing
+        // claims.
+        covered_through: match schedule.window {
+            Some(ScheduleWindow::SinceLast) => schedule.covered_through.map(format_window_bound),
+            Some(ScheduleWindow::Fixed { .. }) | None => None,
+        },
+        next_fire_at: format_window_bound(schedule.next_fire_at),
     }
 }
 
@@ -1832,6 +1856,10 @@ fn report_run_summary(run: ReportRun) -> ReportRunSummary {
         row_count: run.row_count,
         error_message: run.error_message,
         result_path: run.result_path,
+        window_start: run.window_start.map(format_window_bound),
+        window_end: run.window_end.map(format_window_bound),
+        window_truncated: run.window_truncated,
+        window_kind: run.window_kind.map(|k| k.as_str().to_owned()),
     }
 }
 
@@ -2183,6 +2211,25 @@ async fn try_resolve_from_saved(
     Ok(Some(resolved))
 }
 
+/// What the `lag` field accepts, spelled out for a rejection message.
+const DURATION_GRAMMAR: &str = "a duration: a number and one of s, m, h, d, w";
+
+/// What the `window` field accepts. The duration half carries the same 60s
+/// floor as the schedule interval, which is why the store's own message
+/// about a short one says "interval".
+const WINDOW_GRAMMAR: &str = "\"since_last\" or a duration: a number and one of s, m, h, d, w";
+
+/// Turn a duration-grammar rejection into a 400 that names the request
+/// field and what that field would have taken.
+///
+/// The store's message says what was wrong with the value. What it cannot
+/// say is which of two duration fields carried it, and an operator who gets
+/// `invalid interval format: "11y"` back from a request with both a
+/// `window` and a `lag` has to guess.
+fn invalid_duration(field: &str, grammar: &str, e: &crate::store::StoreError) -> ServerError {
+    ServerError::BadRequest(format!("invalid {field}: {e}; {field} takes {grammar}"))
+}
+
 /// `PUT /api/v1/saved/{id}/schedule` — create or update a schedule.
 pub async fn set_schedule(
     State(state): State<AppState>,
@@ -2197,44 +2244,42 @@ pub async fn set_schedule(
     let key_id = verified.id;
     let interval_secs = parse_interval(&req.interval)
         .map_err(|e| ServerError::BadRequest(format!("invalid interval: {e}")))?;
+    let window = req
+        .window
+        .as_deref()
+        .map(ScheduleWindow::parse)
+        .transpose()
+        .map_err(|e| invalid_duration("window", WINDOW_GRAMMAR, &e))?;
+    // Absent is zero, the default ADR-0018 ruling 6 gives a window. A lag
+    // WITHOUT a window is not decided here: the store owns that refusal,
+    // because it is the one place both write doors pass through.
+    let lag_secs = req
+        .lag
+        .as_deref()
+        .map(parse_duration_secs)
+        .transpose()
+        .map_err(|e| invalid_duration("lag", DURATION_GRAMMAR, &e))?
+        .unwrap_or(0);
 
-    // Verify saved query ownership.
-    state
-        .storage
-        .saved
-        .get(saved_id, key_id)
-        .await?
-        .ok_or_else(|| ServerError::NotFound("saved query not found or unauthorized".into()))?;
-
-    // Try update first, fall back to create. A racing create between the
-    // two statements surfaces as ScheduleExists → 409.
-    let schedule = match state
+    // Ownership, the window/query compatibility rule and the create-or-
+    // update decision all happen in one transaction under the saved-query
+    // row lock. Reading the pair out here and deciding afterwards would let
+    // a concurrent PUT of the saved query's DSL slip a time clause under
+    // the window between the check and the write.
+    let schedule = state
         .storage
         .schedule
-        .get_schedule_for_saved_query(saved_id, key_id)
-        .await?
-    {
-        Some(existing) => {
-            state
-                .storage
-                .schedule
-                .update_schedule(
-                    existing.id,
-                    key_id,
-                    interval_secs,
-                    req.max_runs,
-                    req.enabled,
-                )
-                .await?
-        }
-        None => {
-            state
-                .storage
-                .schedule
-                .create_schedule(saved_id, key_id, interval_secs, req.max_runs)
-                .await?
-        }
-    };
+        .set_schedule_checked(
+            saved_id,
+            key_id,
+            interval_secs,
+            req.max_runs,
+            req.enabled,
+            window,
+            lag_secs,
+            chrono::Utc::now(),
+        )
+        .await?;
 
     // Freshly created/updated schedules can already have runs (updates);
     // fetch the stats the response carries.
@@ -2402,8 +2447,11 @@ pub async fn runs_stats(
 /// `POST /api/v1/saved/{id}/run` — trigger an immediate report run for a saved query.
 ///
 /// Bypasses the scheduler interval check. Requires a schedule to be attached
-/// (the run is stored under that schedule's history). Returns the run summary
-/// immediately with status "running" — execution continues in the background.
+/// (the run is stored under that schedule's history), and that schedule must
+/// be in query mode: a windowed one owns what its reports cover, so a manual
+/// run is a 409 naming the mode and the route that shows where coverage has
+/// reached (ADR-0018 ruling 6). Returns the run summary immediately with
+/// status "running" — execution continues in the background.
 pub async fn trigger_run(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
@@ -2415,38 +2463,42 @@ pub async fn trigger_run(
 
     let key_id = verified.id;
 
-    // Look up the saved query (ownership check included).
-    let saved = state
-        .storage
-        .saved
-        .get(saved_id, key_id)
-        .await?
-        .ok_or_else(|| ServerError::NotFound("saved query not found".into()))?;
-
-    let schedule = state
-        .storage
-        .schedule
-        .get_schedule_for_saved_query(saved_id, key_id)
-        .await?
-        .ok_or_else(|| {
-            ServerError::BadRequest("attach a schedule before triggering a run".into())
-        })?;
-
-    // One transaction: lock the schedule row, enforce max_runs, claim the
-    // run. Concurrent triggers cannot exceed the cap or double-claim.
-    let run_id = match state
+    // One transaction: lock the saved query and read the DSL from it, lock
+    // the schedule, refuse a coverage mode, enforce max_runs, claim the
+    // run. The ownership check rides the first lock, so this handler takes
+    // no snapshot of its own: what the run executes is what the claim
+    // recorded. Concurrent triggers cannot exceed the cap or double-claim,
+    // and a window added mid-request either lands before the lock (and
+    // refuses this run) or waits behind it.
+    let claimed = match state
         .storage
         .schedule
-        .claim_run(schedule.id, saved_id, &saved.query, schedule.max_runs)
+        .claim_manual_run(saved_id, key_id)
         .await?
     {
-        RunClaim::Started(id) => id,
-        RunClaim::MaxRunsReached => {
+        ManualRunClaim::Started(claimed) => claimed,
+        ManualRunClaim::NoSchedule => {
+            return Err(ServerError::BadRequest(
+                "attach a schedule before triggering a run".into(),
+            ));
+        }
+        // 409, not 400: the request is well formed and will be fine again
+        // if the operator drops the window. The message names the mode it
+        // found and the route that answers "where has coverage reached",
+        // which is what someone asking for a manual run actually wants.
+        ManualRunClaim::CoverageMode(window) => {
+            return Err(ServerError::Conflict(format!(
+                "schedule uses coverage mode \"{window}\"; manual runs are disabled for \
+                 windowed schedules; watch GET /api/v1/saved/{saved_id}/schedule \
+                 (covered_through, next_fire_at)"
+            )));
+        }
+        ManualRunClaim::MaxRunsReached => {
             return Err(ServerError::BadRequest(
                 "max runs reached for this net".into(),
             ));
         }
-        RunClaim::AlreadyRunning => {
+        ManualRunClaim::AlreadyRunning => {
             return Err(ServerError::BadRequest(
                 "a run is already in progress for this net".into(),
             ));
@@ -2455,8 +2507,8 @@ pub async fn trigger_run(
 
     // Return the summary immediately, execute in background.
     let summary = ReportRunSummary {
-        id: run_id,
-        query: saved.query.clone(),
+        id: claimed.run_id,
+        query: claimed.query.clone(),
         status: RunStatus::Running.as_str().to_string(),
         started_at: chrono::Utc::now().to_rfc3339(),
         finished_at: None,
@@ -2464,12 +2516,20 @@ pub async fn trigger_run(
         row_count: None,
         error_message: None,
         result_path: None,
+        // A manual run is query mode by construction: a schedule that owns
+        // a window refuses one (ADR-0018 ruling 6), so there are no bounds
+        // to report here.
+        window_start: None,
+        window_end: None,
+        window_truncated: None,
+        window_kind: None,
     };
 
     let schedule_store = state.storage.schedule.clone();
     let pool = state.query.pool.clone();
-    let query = saved.query;
-    let query_name = saved.name;
+    let run_id = claimed.run_id;
+    let query = claimed.query;
+    let query_name = claimed.query_name;
     let timeout_secs = state.query.timeout_secs;
 
     tokio::spawn(async move {
@@ -2490,7 +2550,12 @@ pub async fn trigger_run(
 
 /// `GET /api/v1/saved/{id}/runs/{run_id}` — get a single report run with result data.
 ///
-/// Prefers parquet result files (via `result_path`) over legacy zstd blobs.
+/// Prefers parquet result files (via `result_path`) over the zstd JSON blob.
+/// A run has a blob instead of a file in two cases: its result had no rows
+/// (there is no schema to write a parquet from), or the parquet write failed
+/// and the scheduler fell back. Either way the blob carries the column names,
+/// so a zero-row run answers with its columns and an empty row list rather
+/// than a null result.
 pub async fn get_report_run(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
@@ -2515,15 +2580,15 @@ pub async fn get_report_run(
         ));
     }
 
-    // Pre-fetch legacy blob (cheap if NULL in db). A genuine absence is `Ok(None)`;
+    // Pre-fetch the blob (cheap if NULL in db). A genuine absence is `Ok(None)`;
     // a StoreError here is a live db fault and must surface as 5xx, not empty result.
-    let legacy_blob = state
+    let result_blob = state
         .storage
         .schedule
         .get_run_result(run_id, key_id)
         .await?;
 
-    // Try parquet result first, fall back to legacy zstd blob.
+    // Try parquet result first, fall back to the zstd blob.
     let result = if let Some(ref result_path) = run.result_path {
         let base_dir = state.query.pool.base_dir().to_owned();
         let max_rows = state.query.pool.max_result_rows();
@@ -2542,51 +2607,28 @@ pub async fn get_report_run(
                     event_type = "report_run_parquet_read_failed",
                     run_id,
                     error = %e,
-                    "failed to read parquet result, trying legacy blob"
+                    "failed to read parquet result, trying the result blob"
                 );
-                decompress_legacy_blob(legacy_blob)
+                crate::scheduler::decode_result_blob(result_blob)
             }
             Err(e) => {
                 tracing::warn!(
                     event_type = "report_run_parquet_task_failed",
                     run_id,
                     error = %e,
-                    "parquet read task panicked, trying legacy blob"
+                    "parquet read task panicked, trying the result blob"
                 );
-                decompress_legacy_blob(legacy_blob)
+                crate::scheduler::decode_result_blob(result_blob)
             }
         }
     } else {
-        decompress_legacy_blob(legacy_blob)
+        crate::scheduler::decode_result_blob(result_blob)
     };
 
     Ok(Json(ReportRunResponse {
         summary: report_run_summary(run),
         result,
     }))
-}
-
-/// Decompress a legacy zstd-compressed JSON result blob.
-fn decompress_legacy_blob(blob: Option<Vec<u8>>) -> Option<QueryResult> {
-    let compressed = blob?;
-    let decompressed = zstd::decode_all(compressed.as_slice())
-        .inspect_err(|e| {
-            tracing::warn!(
-                event_type = "legacy_blob_zstd_decode_failed",
-                error = %e,
-                "failed to zstd-decode legacy result blob"
-            );
-        })
-        .ok()?;
-    serde_json::from_slice::<QueryResult>(&decompressed)
-        .inspect_err(|e| {
-            tracing::warn!(
-                event_type = "legacy_blob_deserialize_failed",
-                error = %e,
-                "failed to deserialize legacy result blob"
-            );
-        })
-        .ok()
 }
 
 /// `POST /api/v1/export` — export query results as CSV, JSON, or Parquet.

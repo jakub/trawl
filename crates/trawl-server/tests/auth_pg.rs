@@ -676,7 +676,7 @@ async fn scheduler_runs_after(
         .schedule
         // 60s is the store minimum; the first poll runs regardless of interval
         // (never-run schedules are always due), so cadence is immaterial here.
-        .create_schedule(saved.id, created.info.id, 60, None)
+        .create_schedule(saved.id, created.info.id, 60, None, None, 0, chrono::Utc::now())
         .await
         .unwrap();
 
@@ -705,6 +705,7 @@ async fn scheduler_runs_after(
             report_max_rows: 1000,
             max_runs_per_schedule: 100,
             report_retention_days: 30,
+            max_catchup_intervals: 24,
         },
         10,
         shutdown_rx,

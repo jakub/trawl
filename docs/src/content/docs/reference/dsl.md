@@ -646,6 +646,54 @@ are read before any field filter, wherever they appear, and they apply to
 the query globally. Fields of those three names are reachable with
 backticks (`` `last`=5 ``).
 
+The pair is half-open, `[earliest, latest)`: `earliest=` includes an event
+stamped exactly at the bound, `latest=` excludes it. An event at
+`2026-03-14T03:00:00Z` matches `earliest="2026-03-14T03:00:00Z"` and does
+not match `latest="2026-03-14T03:00:00Z"`.
+
+That is what makes windows tile. Run one query over
+`[03:00, 03:15)` and the next over `[03:15, 03:30)` and every event is
+counted once, in exactly one of them. A closed upper bound would put an
+event landing on 03:15 in both. Scheduled reports lean on this: the
+scheduler hands consecutive runs consecutive windows and the coverage
+neither gaps nor double-counts.
+
+### Scheduled windows
+
+A saved query with a windowed schedule does not spell its own interval.
+The schedule owns the window, and each run gets absolute bounds spliced
+onto the front of the saved text before it executes:
+
+```
+# saved DSL
+_severity>=error | stats count() by service
+
+# what the 03:00 run executed and stored, for window = "since_last", lag = 5m
+earliest="2026-03-14T01:55:00.000000Z" latest="2026-03-14T02:55:00.000000Z" _severity>=error | stats count() by service
+```
+
+The stored `query` on the run row is that resolved text, so pasting it
+back into `trawl query` reproduces the report exactly. The three time
+keywords are read before anything else in the search stage, which is why a
+prefix is valid ahead of a field filter, a bare word, a comment or a
+leading `|`, and why the splice can leave your own text byte for byte
+rather than reprinting it from the parse tree.
+
+The saved DSL may not carry `last=`, `earliest=` or `latest=` while a
+window is attached. Two spellings of one interval would both claim to say
+what the report covers, and there is no honest way to combine them: a
+`last=2h` under an hourly `since_last` schedule would re-read the same
+hour twice and still miss a gap after downtime. Attaching either side over
+the other is a 400 naming both, in both directions. A backticked
+`` `last`=5 `` is an ordinary field filter and is unaffected.
+
+Two consequences worth naming. `| from saved` may not have a window at
+all, because it reads stored report rows rather than ingest events.
+And running a scheduled saved query interactively carries no window: the
+text is what you typed, and the bounds exist only on the runs the
+scheduler made. Setup and mechanism are in
+[scheduled reports](/architecture/data-flow/#scheduled-reports).
+
 ### OR grouping
 
 ```

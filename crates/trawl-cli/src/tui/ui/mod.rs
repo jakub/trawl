@@ -184,7 +184,7 @@ fn popup_area(popup: &Popup, frame_area: Rect) -> Rect {
         Popup::EventDetail { .. } => centered_rect(70, 80, frame_area),
         Popup::ConfirmDelete { .. } | Popup::SaveQuery { .. } => centered_rect(60, 35, frame_area),
         Popup::Error { .. } => centered_rect(60, 30, frame_area),
-        Popup::SetSchedule { .. } => centered_rect(60, 40, frame_area),
+        Popup::SetSchedule { .. } => centered_rect(70, 45, frame_area),
         Popup::ColumnPicker { .. } => centered_rect(50, 60, frame_area),
         Popup::CommandPalette { .. } => centered_rect(65, 75, frame_area),
     }
@@ -223,6 +223,200 @@ mod tests {
             degraded_fields: Vec::new(),
             severity_columns: Vec::new(),
         }
+    }
+
+    /// A schedule on a one-hour interval. `window`/`lag` are the ADR-0018
+    /// report-window fields: both absent is query mode, where the saved DSL
+    /// owns its own time bounds.
+    fn make_schedule(
+        window: Option<&str>,
+        lag: Option<(&str, u64)>,
+    ) -> trawl_api::ScheduleResponse {
+        trawl_api::ScheduleResponse {
+            id: 3,
+            saved_query_id: 7,
+            interval: "1h".to_owned(),
+            interval_secs: 3600,
+            max_runs: None,
+            enabled: true,
+            created_at: "2026-03-01T00:00:00Z".to_owned(),
+            updated_at: "2026-03-01T00:00:00Z".to_owned(),
+            last_run: None,
+            total_runs: 3,
+            window: window.map(ToOwned::to_owned),
+            lag: lag.map(|(text, _)| text.to_owned()),
+            lag_secs: lag.map(|(_, secs)| secs),
+            covered_through: window.map(|_| "2026-03-14T03:00:00Z".to_owned()),
+            next_fire_at: "2026-03-14T04:00:00Z".to_owned(),
+        }
+    }
+
+    /// A saved query with an optional schedule, for the Saved tab renders.
+    fn make_saved(schedule: Option<trawl_api::ScheduleResponse>) -> trawl_api::SavedQueryResponse {
+        trawl_api::SavedQueryResponse {
+            id: 7,
+            name: "nightly errors".to_owned(),
+            query: "_severity>=error | stats count() by service".to_owned(),
+            created_at: "2026-03-01T00:00:00Z".to_owned(),
+            updated_at: "2026-03-01T00:00:00Z".to_owned(),
+            schedule,
+        }
+    }
+
+    /// A report run whose `started_at` is `minutes_ago` behind the clock, so
+    /// the list's relative time column renders the same string on every run.
+    fn make_run(id: i64, minutes_ago: i64) -> trawl_api::ReportRunSummary {
+        let started = chrono::Utc::now() - chrono::Duration::minutes(minutes_ago);
+        trawl_api::ReportRunSummary {
+            id,
+            query: "_severity>=error | stats count() by service".to_owned(),
+            status: "success".to_owned(),
+            started_at: started.to_rfc3339(),
+            finished_at: None,
+            duration_ms: Some(120),
+            row_count: Some(12),
+            error_message: None,
+            result_path: None,
+            window_start: None,
+            window_end: None,
+            window_truncated: None,
+            window_kind: None,
+        }
+    }
+
+    /// Put the app on the Saved tab with one saved query selected and its run
+    /// history loaded, which is the state the detail pane renders from.
+    fn saved_app(
+        schedule: Option<trawl_api::ScheduleResponse>,
+        runs: Vec<trawl_api::ReportRunSummary>,
+    ) -> crate::tui::App {
+        use crate::tui::state::{MainTab, SavedDetailState, SavedFocus};
+
+        // Keep the pane self-consistent: the schedule's run total is the same
+        // count the run list below it renders.
+        let schedule = schedule.map(|mut sched| {
+            sched.total_runs = u64::try_from(runs.len()).unwrap();
+            sched
+        });
+
+        let mut app = test_app();
+        app.main_tab = MainTab::Saved;
+        app.saved_cache = Some(trawl_api::ListSavedResponse {
+            queries: vec![make_saved(schedule)],
+        });
+        app.panel.saved_selected = 0;
+        app.panel.saved_focus = SavedFocus::Detail;
+        app.panel.saved_detail = Some(SavedDetailState {
+            saved_id: 7,
+            total_runs: runs.len(),
+            runs,
+            run_selected: 0,
+            run_scroll: 0,
+            result: None,
+            result_scroll: 0,
+            loading: false,
+        });
+        app
+    }
+
+    /// A run list carrying all three window shapes at once: a tiled run that
+    /// covered everything it owed, a run clamped past a catch-up gap, and a
+    /// legacy/query-mode run that has no window at all. `Some(false)` shows
+    /// its bounds bare; `None` shows nothing.
+    #[test]
+    fn render_saved_runs_with_windows() {
+        let mut normal = make_run(41, 45);
+        normal.window_start = Some("2026-03-14T02:00:00Z".to_owned());
+        normal.window_end = Some("2026-03-14T03:00:00Z".to_owned());
+        normal.window_truncated = Some(false);
+        normal.window_kind = Some("since_last".to_owned());
+
+        let mut truncated = make_run(40, 105);
+        truncated.window_start = Some("2026-03-13T23:00:00Z".to_owned());
+        truncated.window_end = Some("2026-03-14T01:00:00Z".to_owned());
+        truncated.window_truncated = Some(true);
+        truncated.window_kind = Some("fixed".to_owned());
+
+        let legacy = make_run(39, 165);
+
+        let mut app = saved_app(
+            Some(make_schedule(None, None)),
+            vec![normal, truncated, legacy],
+        );
+        // Wide enough that the whole run line lands: the window trails the
+        // row, so a narrower pane cuts the bounds and then the marker.
+        let backend = TestBackend::new(160, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| super::render(&mut app, f)).unwrap();
+        insta::assert_snapshot!(terminal.backend().to_string());
+    }
+
+    /// A run carrying the bounds of the window it covered.
+    fn windowed_run(
+        id: i64,
+        minutes_ago: i64,
+        kind: &str,
+        start: &str,
+        end: &str,
+    ) -> trawl_api::ReportRunSummary {
+        let mut run = make_run(id, minutes_ago);
+        run.window_kind = Some(kind.to_owned());
+        run.window_start = Some(start.to_owned());
+        run.window_end = Some(end.to_owned());
+        run.window_truncated = Some(false);
+        run
+    }
+
+    /// A tiling schedule with a late-arrival allowance: the detail pane names
+    /// the mode, the lag and the watermark the next window starts from.
+    #[test]
+    fn render_saved_schedule_windowed_with_lag() {
+        let run = windowed_run(
+            41,
+            45,
+            "since_last",
+            "2026-03-14T02:00:00Z",
+            "2026-03-14T03:00:00Z",
+        );
+        let mut app = saved_app(
+            Some(make_schedule(Some("since_last"), Some(("5m", 300)))),
+            vec![run],
+        );
+        let backend = TestBackend::new(160, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| super::render(&mut app, f)).unwrap();
+        insta::assert_snapshot!(terminal.backend().to_string());
+    }
+
+    /// A fixed trailing window with no lag: no `lag 0s`, and no watermark,
+    /// because a fixed window keeps none.
+    #[test]
+    fn render_saved_schedule_windowed_without_lag() {
+        let run = windowed_run(
+            41,
+            45,
+            "fixed",
+            "2026-03-14T01:00:00Z",
+            "2026-03-14T03:00:00Z",
+        );
+        let mut schedule = make_schedule(Some("2h"), Some(("0s", 0)));
+        schedule.covered_through = None;
+        let mut app = saved_app(Some(schedule), vec![run]);
+        let backend = TestBackend::new(160, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| super::render(&mut app, f)).unwrap();
+        insta::assert_snapshot!(terminal.backend().to_string());
+    }
+
+    /// Query mode: the saved DSL owns its own time bounds, so there is no
+    /// window line at all, only the fire cursor every schedule has.
+    #[test]
+    fn render_saved_schedule_query_mode() {
+        let mut app = saved_app(Some(make_schedule(None, None)), vec![make_run(41, 45)]);
+        let backend = TestBackend::new(160, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| super::render(&mut app, f)).unwrap();
+        insta::assert_snapshot!(terminal.backend().to_string());
     }
 
     #[test]
@@ -368,6 +562,48 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| super::render(&mut app, f)).unwrap();
         insta::assert_snapshot!(terminal.backend().to_string());
+    }
+
+    /// The set-schedule popup with the window row focused: the interval and
+    /// window rows carry prefilled text, the empty lag row shows what an
+    /// empty row means rather than nothing.
+    #[test]
+    fn render_with_schedule_popup() {
+        use crate::tui::state::{ScheduleField, ScheduleForm};
+
+        let mut app = test_app();
+        let mut form = ScheduleForm::new(
+            5,
+            "nightly errors".to_owned(),
+            Some(&make_schedule(Some("since_last"), None)),
+        );
+        form.focus = ScheduleField::Window;
+        app.popup = Some(Popup::SetSchedule(Box::new(form)));
+
+        let backend = TestBackend::new(90, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| super::render(&mut app, f)).unwrap();
+        insta::assert_snapshot!(terminal.backend().to_string());
+    }
+
+    /// A terminal too small to hold the popup must not panic: the cursor
+    /// clamp is the arithmetic that would. Narrower than ~37 columns trips a
+    /// pre-existing overflow in the empty-results placeholder behind the
+    /// popup, which is a separate bug and not this popup's business.
+    #[test]
+    fn render_schedule_popup_on_a_tiny_terminal() {
+        use crate::tui::state::ScheduleForm;
+
+        let mut app = test_app();
+        app.popup = Some(Popup::SetSchedule(Box::new(ScheduleForm::new(
+            5,
+            "nightly errors".to_owned(),
+            None,
+        ))));
+
+        let backend = TestBackend::new(42, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| super::render(&mut app, f)).unwrap();
     }
 
     #[test]

@@ -1,0 +1,24 @@
+---
+source: crates/trawl-cli/src/tui/ui/mod.rs
+expression: terminal.backend().to_string()
+---
+" M-1 Query   M-2 History   M-3 Schema   M-4 Saved                                                                                                               "
+"                                                                                                                                                                "
+"┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐"
+"│nightly errors [1h]                                                     nightly errors                                                                        │"
+"│                                                                        ────────────────────────────────────────                                              │"
+"│                                                                        query  _severity>=error | stats count() by service                                    │"
+"│                                                                        sched  every 1h (enabled)                                                             │"
+"│                                                                               next fire 2026-03-14 04:00:00 UTC                                              │"
+"│                                                                        runs   1                                                                              │"
+"│                                                                                                                                                              │"
+"│                                                                        runs (1 total)  ↑↓ navigate  Enter view  q query                                      │"
+"│                                                                        ✓ #41    45m 120ms 12 rows                                                            │"
+"│                                                                                                                                                              │"
+"│                                                                                                                                                              │"
+"│                                                                                                                                                              │"
+"│                                                                                                                                                              │"
+"│                                                                                                                                                              │"
+"│                                                                                                                                                              │"
+"└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
+"idle [editor]                                                                                                Shift+Enter: execute | Ctrl+S: save | Ctrl+L: clear"

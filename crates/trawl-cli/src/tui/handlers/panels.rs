@@ -7,7 +7,7 @@
 use crossterm::event::{self, KeyCode, KeyModifiers};
 
 use super::super::App;
-use super::super::state::{Focus, MainTab, Popup, SavedFocus, SimpleEditor};
+use super::super::state::{Focus, MainTab, Popup, SavedFocus, ScheduleForm};
 
 impl App {
     /// Handle key events for the History tab panel.
@@ -111,11 +111,11 @@ impl App {
                 if let Some(ref saved) = self.saved_cache
                     && let Some(entry) = saved.queries.get(selected)
                 {
-                    self.popup = Some(Popup::SetSchedule {
-                        saved_id: entry.id,
-                        name: entry.name.clone(),
-                        editor: SimpleEditor::new(),
-                    });
+                    self.popup = Some(Popup::SetSchedule(Box::new(ScheduleForm::new(
+                        entry.id,
+                        entry.name.clone(),
+                        entry.schedule.as_ref(),
+                    ))));
                 }
             }
             _ => {}

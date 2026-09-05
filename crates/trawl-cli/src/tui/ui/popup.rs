@@ -11,7 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::tui::App;
-use crate::tui::state::Popup;
+use crate::tui::state::{Popup, ScheduleField, ScheduleForm};
 use crate::tui::theme::Theme;
 
 /// Render the active popup (if any).
@@ -34,8 +34,8 @@ pub fn render(app: &App, frame: &mut Frame<'_>) {
             Popup::Error { message } => {
                 render_error(frame, theme, message);
             }
-            Popup::SetSchedule { name, editor, .. } => {
-                render_set_schedule(frame, theme, name, editor);
+            Popup::SetSchedule(form) => {
+                render_set_schedule(frame, theme, form);
             }
             Popup::ColumnPicker { selected, scroll } => {
                 render_column_picker(app, frame, *selected, *scroll);
@@ -307,15 +307,10 @@ fn render_error(frame: &mut Frame<'_>, theme: &Theme, message: &str) {
     frame.render_widget(paragraph, area);
 }
 
-/// Render text input dialog for scheduling a saved query.
-fn render_set_schedule(
-    frame: &mut Frame<'_>,
-    theme: &Theme,
-    name: &str,
-    editor: &crate::tui::state::SimpleEditor,
-) {
-    let area = centered_rect(60, 40, frame.area());
-    let input = editor.text();
+/// Render the set-schedule dialog: interval, report window and lag, one row
+/// each, with the focused row highlighted.
+fn render_set_schedule(frame: &mut Frame<'_>, theme: &Theme, form: &ScheduleForm) {
+    let area = centered_rect(70, 45, frame.area());
 
     frame.render_widget(Clear, area);
 
@@ -324,48 +319,88 @@ fn render_set_schedule(
         .borders(Borders::ALL)
         .style(Style::default().bg(theme.surface).fg(theme.text_accent));
 
+    // An empty row shows its vocabulary instead of nothing, since the window
+    // spellings are not guessable and an empty row is a meaningful value in
+    // both cases (query mode, and a zero lag).
+    let row = |label: &str, editor: &crate::tui::state::SimpleEditor, hint: &str, focused: bool| {
+        let text = editor.text();
+        let label_style = if focused {
+            Style::default()
+                .fg(theme.text_accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.text_muted)
+        };
+        let mut spans = vec![Span::styled(format!("{label:<10}"), label_style)];
+        if text.is_empty() {
+            spans.push(Span::styled(
+                hint.to_owned(),
+                Style::default().fg(theme.text_muted),
+            ));
+        } else {
+            spans.push(Span::styled(text, Style::default().fg(theme.text_primary)));
+        }
+        if focused {
+            spans.push(Span::styled(
+                "\u{2588}",
+                Style::default().fg(theme.text_accent),
+            ));
+        }
+        Line::from(spans)
+    };
+
     let text = vec![
-        Line::from(""),
         Line::from(Span::styled(
-            name,
+            form.name.clone(),
             Style::default()
                 .fg(theme.status_warning)
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from(Span::styled(
-            "Interval (e.g. 5m, 1h, 24h):",
-            Style::default().fg(theme.text_primary),
-        )),
+        row(
+            "interval",
+            &form.interval,
+            "5m | 1h | 24h",
+            form.focus == ScheduleField::Interval,
+        ),
+        row(
+            "window",
+            &form.window,
+            "since_last | 2h | empty = query owns its time",
+            form.focus == ScheduleField::Window,
+        ),
+        row(
+            "lag",
+            &form.lag,
+            "5m | empty = 0s",
+            form.focus == ScheduleField::Lag,
+        ),
         Line::from(""),
         Line::from(Span::styled(
-            format!("> {input}\u{2588}"),
-            Style::default()
-                .fg(theme.text_accent)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Enter to schedule  |  Esc to cancel",
+            "Tab next field  Enter save  Esc cancel",
             Style::default().fg(theme.text_muted),
         )),
-        Line::from(""),
     ];
 
-    let paragraph = Paragraph::new(text)
-        .block(block)
-        .alignment(Alignment::Center)
-        .wrap(ratatui::widgets::Wrap { trim: false });
+    let paragraph = Paragraph::new(text).block(block);
 
     frame.render_widget(paragraph, area);
 
-    // Position cursor inside the input field.
-    let cursor_col = editor.cursor.1;
+    // Terminal cursor on the focused row, one column past its text.
+    let (editor, row_index) = match form.focus {
+        ScheduleField::Interval => (&form.interval, 0),
+        ScheduleField::Window => (&form.window, 1),
+        ScheduleField::Lag => (&form.lag, 2),
+    };
     #[allow(clippy::cast_possible_truncation)]
-    let cursor_x =
-        area.x + (area.width / 2).saturating_sub((input.len() as u16) / 2) + 2 + cursor_col as u16;
-    let cursor_y = area.y + 6; // Row of the input line within the popup
-    frame.set_cursor_position((cursor_x, cursor_y));
+    let cursor_x = area.x + 1 + 10 + editor.cursor.1 as u16;
+    let cursor_y = area.y + 3 + row_index; // border + name + blank
+    // saturating: a terminal narrow enough to give the popup zero width would
+    // otherwise underflow the clamp.
+    frame.set_cursor_position((
+        cursor_x.min(area.x + area.width.saturating_sub(1)),
+        cursor_y,
+    ));
 }
 
 /// Render column picker popup — checklist for toggling visibility and pinning.

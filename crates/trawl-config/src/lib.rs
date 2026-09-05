@@ -715,6 +715,18 @@ pub struct SchedulerConfig {
     /// Delete report runs older than this many days.
     #[serde(default = "default_scheduler_report_retention_days")]
     pub report_retention_days: u64,
+
+    /// How many intervals of missed coverage a `since_last` report window
+    /// may swallow in one catch-up run (ADR-0018 ruling 9).
+    ///
+    /// Missed runs coalesce into one window rather than backfilling one run
+    /// each. A daemon down for a week would otherwise hand the next run a
+    /// week-wide window and one enormous query, so a gap beyond this many
+    /// intervals clamps the window forward and flags the run
+    /// (`window_truncated` plus `trawl_scheduler_window_truncated_total`).
+    /// It never wedges the schedule and never drops the gap silently.
+    #[serde(default = "default_scheduler_max_catchup_intervals")]
+    pub max_catchup_intervals: u32,
 }
 
 const DEFAULT_SCHEDULER_ENABLED: bool = true;
@@ -722,6 +734,35 @@ const DEFAULT_SCHEDULER_POLL_INTERVAL_SECS: u64 = 10;
 const DEFAULT_SCHEDULER_REPORT_MAX_ROWS: usize = 10_000;
 const DEFAULT_SCHEDULER_MAX_RUNS_PER_SCHEDULE: u64 = 100;
 const DEFAULT_SCHEDULER_REPORT_RETENTION_DAYS: u64 = 30;
+/// A day of missed coverage at the common hourly cadence.
+pub const DEFAULT_SCHEDULER_MAX_CATCHUP_INTERVALS: u32 = 24;
+
+/// The largest catch-up ceiling trawld will start with.
+///
+/// The planner multiplies this by the schedule's interval and turns the
+/// product into one `chrono::TimeDelta`. Both factors are operator-chosen,
+/// so the product needs a bound of its own: past what a `TimeDelta` can
+/// hold, `plan_due_run` answers `PlanError::Arithmetic` and every due
+/// `since_last` run fails on every poll, forever, with the fire cursor
+/// never advancing. A silent config value that stops the scheduler is a
+/// worse outcome than a boot refusal.
+///
+/// A million intervals against the ten-year interval cap is 3.15e14
+/// seconds, less than one twentieth of the maximum `TimeDelta`
+/// (`scheduler_catchup_span_always_fits_a_timedelta` proves it). It is also
+/// far past any real cadence: a million hourly intervals is 114 years of
+/// missed coverage, so nobody loses a setting they meant.
+pub const MAX_SCHEDULER_CATCHUP_INTERVALS: u32 = 1_000_000;
+
+/// The ten-year duration cap, mirrored from
+/// `trawl_server::store::MAX_DURATION_SECS`.
+///
+/// trawl-server depends on this crate, so the constant cannot travel the
+/// other way and the value is copied instead of imported.
+/// `config_duration_mirror_matches_the_grammar_cap` over in trawl-server
+/// can see both and fails if the copy drifts. Nothing here reads it except
+/// the test that proves the two caps multiply to something representable.
+pub const MIRRORED_MAX_DURATION_SECS: u64 = 315_360_000;
 
 fn default_scheduler_enabled() -> bool {
     DEFAULT_SCHEDULER_ENABLED
@@ -738,6 +779,9 @@ fn default_scheduler_max_runs_per_schedule() -> u64 {
 fn default_scheduler_report_retention_days() -> u64 {
     DEFAULT_SCHEDULER_REPORT_RETENTION_DAYS
 }
+fn default_scheduler_max_catchup_intervals() -> u32 {
+    DEFAULT_SCHEDULER_MAX_CATCHUP_INTERVALS
+}
 
 impl Default for SchedulerConfig {
     fn default() -> Self {
@@ -747,6 +791,7 @@ impl Default for SchedulerConfig {
             report_max_rows: DEFAULT_SCHEDULER_REPORT_MAX_ROWS,
             max_runs_per_schedule: DEFAULT_SCHEDULER_MAX_RUNS_PER_SCHEDULE,
             report_retention_days: DEFAULT_SCHEDULER_REPORT_RETENTION_DAYS,
+            max_catchup_intervals: DEFAULT_SCHEDULER_MAX_CATCHUP_INTERVALS,
         }
     }
 }
@@ -1477,6 +1522,27 @@ fn validate_telemetry_buffer_max_bytes(bytes: usize) -> Result<(), ConfigError> 
     Ok(())
 }
 
+/// Validate the catch-up ceiling, the other budget whose zero is invalid.
+///
+/// A catch-up window is measured in whole schedule intervals, so a ceiling
+/// of zero would clamp every `since_last` window to nothing and produce
+/// empty reports forever. Unlike the caps that use zero as an off switch,
+/// "do not clamp" is spelled with a large number here, not with none, which
+/// is why there is a ceiling too: the planner multiplies this by the
+/// interval and has to hold the product, so a number chosen to mean
+/// "never" must still be one the scheduler can compute with.
+fn validate_max_catchup_intervals(intervals: u32) -> Result<(), ConfigError> {
+    if intervals == 0 || intervals > MAX_SCHEDULER_CATCHUP_INTERVALS {
+        return Err(ConfigError::Validation(format!(
+            "scheduler.max_catchup_intervals must be between 1 and \
+             {MAX_SCHEDULER_CATCHUP_INTERVALS} (it is a count of whole schedule intervals \
+             a since_last window may cover in one catch-up run; the ceiling keeps that \
+             span inside the range the scheduler can compute)"
+        )));
+    }
+    Ok(())
+}
+
 impl Config {
     /// Parse configuration from a TOML string.
     ///
@@ -1627,6 +1693,7 @@ impl Config {
         }
 
         validate_telemetry_buffer_max_bytes(self.ingest.telemetry_buffer_max_bytes)?;
+        validate_max_catchup_intervals(self.scheduler.max_catchup_intervals)?;
 
         if self.server.tls_cert_path.is_some() != self.server.tls_key_path.is_some() {
             return Err(ConfigError::Validation(
@@ -2135,6 +2202,94 @@ telemetry_buffer_max_bytes = 0
             err.to_string(),
             "config validation error: ingest.telemetry_buffer_max_bytes must be a positive byte \
              count; set ingest.internal_telemetry = false to disable internal telemetry"
+        );
+    }
+
+    #[test]
+    fn scheduler_max_catchup_intervals_defaults_to_a_day_of_hourly_runs() {
+        let config = Config::from_toml(
+            r#"
+[server]
+[data]
+path = "/data"
+[auth]
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.scheduler.max_catchup_intervals, 24);
+        assert_eq!(
+            SchedulerConfig::default().max_catchup_intervals,
+            DEFAULT_SCHEDULER_MAX_CATCHUP_INTERVALS
+        );
+    }
+
+    /// Both ends of the range are boot-fatal, and both refusals name both
+    /// bounds: zero clamps every window to nothing, and a ceiling past the
+    /// cap makes the catch-up span unrepresentable, which stops the
+    /// scheduler as thoroughly but silently.
+    #[test]
+    fn scheduler_max_catchup_intervals_outside_the_range_is_boot_fatal() {
+        let expected = "config validation error: scheduler.max_catchup_intervals must be \
+             between 1 and 1000000 (it is a count of whole schedule intervals a since_last \
+             window may cover in one catch-up run; the ceiling keeps that span inside the \
+             range the scheduler can compute)";
+
+        for value in [0, MAX_SCHEDULER_CATCHUP_INTERVALS + 1, u32::MAX] {
+            let err = Config::from_toml(&format!(
+                r#"
+[server]
+[data]
+path = "/data"
+[auth]
+[scheduler]
+max_catchup_intervals = {value}
+"#
+            ))
+            .unwrap_err();
+            assert_eq!(err.to_string(), expected, "for {value}");
+        }
+
+        // The ceiling itself is accepted: it is a bound, not a refusal of
+        // the value an operator writes to mean "never clamp".
+        let config = Config::from_toml(&format!(
+            r#"
+[server]
+[data]
+path = "/data"
+[auth]
+[scheduler]
+max_catchup_intervals = {MAX_SCHEDULER_CATCHUP_INTERVALS}
+"#
+        ))
+        .unwrap();
+        assert_eq!(
+            config.scheduler.max_catchup_intervals,
+            MAX_SCHEDULER_CATCHUP_INTERVALS
+        );
+    }
+
+    /// The planner multiplies the catch-up ceiling by the schedule
+    /// interval and holds the product in one `chrono::TimeDelta`. Both
+    /// factors are capped, so the widest span any install can configure is
+    /// a fixed number, and it has to be representable: if it were not,
+    /// every due `since_last` run would answer `PlanError::Arithmetic` on
+    /// every poll and the schedule would never advance.
+    #[test]
+    fn scheduler_catchup_span_always_fits_a_timedelta() {
+        let widest = u64::from(MAX_SCHEDULER_CATCHUP_INTERVALS) * MIRRORED_MAX_DURATION_SECS;
+        let representable = u64::try_from(chrono::TimeDelta::MAX.num_seconds())
+            .expect("a TimeDelta's second count is non-negative at its maximum");
+        assert!(
+            widest <= representable,
+            "the widest configurable catch-up span is {widest}s, \
+             past the {representable}s a TimeDelta holds"
+        );
+        assert!(
+            chrono::TimeDelta::try_seconds(
+                i64::try_from(widest).expect("the widest span fits an i64")
+            )
+            .is_some(),
+            "chrono itself must accept the widest configurable span"
         );
     }
 

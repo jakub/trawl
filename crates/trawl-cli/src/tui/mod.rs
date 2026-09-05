@@ -1104,6 +1104,157 @@ mod tests {
         assert!(app.popup.is_none());
     }
 
+    /// A schedule with the ADR-0018 window fields under the test's control.
+    fn test_schedule(
+        window: Option<&str>,
+        lag: Option<(&str, u64)>,
+    ) -> trawl_api::ScheduleResponse {
+        trawl_api::ScheduleResponse {
+            id: 1,
+            saved_query_id: 5,
+            interval: "1h".to_owned(),
+            interval_secs: 3600,
+            max_runs: None,
+            enabled: true,
+            created_at: "2026-03-01T00:00:00Z".to_owned(),
+            updated_at: "2026-03-01T00:00:00Z".to_owned(),
+            last_run: None,
+            total_runs: 0,
+            window: window.map(ToOwned::to_owned),
+            lag: lag.map(|(text, _)| text.to_owned()),
+            lag_secs: lag.map(|(_, secs)| secs),
+            covered_through: None,
+            next_fire_at: "2026-03-14T04:00:00Z".to_owned(),
+        }
+    }
+
+    /// Open the set-schedule popup on an app, prefilled from `schedule`.
+    fn schedule_popup(schedule: Option<&trawl_api::ScheduleResponse>) -> App {
+        let mut app = test_app();
+        app.popup = Some(Popup::SetSchedule(Box::new(state::ScheduleForm::new(
+            5,
+            "nightly errors".to_owned(),
+            schedule,
+        ))));
+        app
+    }
+
+    /// Borrow the open set-schedule form, or fail loudly.
+    fn schedule_form(app: &App) -> &state::ScheduleForm {
+        match app.popup {
+            Some(Popup::SetSchedule(ref form)) => form,
+            _ => panic!("expected SetSchedule popup"),
+        }
+    }
+
+    #[test]
+    fn schedule_popup_tab_cycles_the_three_rows() {
+        use state::ScheduleField;
+
+        let mut app = schedule_popup(None);
+        assert_eq!(schedule_form(&app).focus, ScheduleField::Interval);
+
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(schedule_form(&app).focus, ScheduleField::Window);
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(schedule_form(&app).focus, ScheduleField::Lag);
+        // Wraps back to the first row.
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(schedule_form(&app).focus, ScheduleField::Interval);
+
+        // BackTab walks the other way, and Up/Down are the same two moves.
+        app.handle_key(key(KeyCode::BackTab));
+        assert_eq!(schedule_form(&app).focus, ScheduleField::Lag);
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(schedule_form(&app).focus, ScheduleField::Window);
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(schedule_form(&app).focus, ScheduleField::Lag);
+    }
+
+    /// Typed keys land in the focused row, and nowhere else.
+    #[test]
+    fn schedule_popup_types_into_the_focused_row() {
+        let mut app = schedule_popup(None);
+        for ch in "1h".chars() {
+            app.handle_key(key(KeyCode::Char(ch)));
+        }
+        app.handle_key(key(KeyCode::Tab));
+        for ch in "2h".chars() {
+            app.handle_key(key(KeyCode::Char(ch)));
+        }
+
+        let form = schedule_form(&app);
+        assert_eq!(form.interval.text(), "1h");
+        assert_eq!(form.window.text(), "2h");
+        assert_eq!(form.lag.text(), "");
+    }
+
+    /// The TUI does not second-guess the window/lag pair. A lag typed with no
+    /// window is submitted as-is; the server's 400 naming both sides is the
+    /// contract, and the operator reads that sentence rather than ours.
+    #[test]
+    fn schedule_popup_sends_a_lag_without_a_window() {
+        let mut app = schedule_popup(None);
+        for ch in "1h".chars() {
+            app.handle_key(key(KeyCode::Char(ch)));
+        }
+        // Skip the window row entirely, type only a lag.
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::Tab));
+        for ch in "5m".chars() {
+            app.handle_key(key(KeyCode::Char(ch)));
+        }
+
+        assert_eq!(
+            schedule_form(&app).submission(),
+            Some(("1h".to_owned(), None, Some("5m".to_owned())))
+        );
+    }
+
+    /// An empty interval is the one thing the popup refuses to send: there is
+    /// no request without it.
+    #[test]
+    fn schedule_popup_refuses_an_empty_interval() {
+        let app = schedule_popup(None);
+        assert!(schedule_form(&app).submission().is_none());
+    }
+
+    /// Opening the popup on a windowed schedule prefills all three rows, so
+    /// editing the interval cannot silently drop the window.
+    #[test]
+    fn schedule_popup_prefills_from_the_schedule_in_force() {
+        let sched = test_schedule(Some("since_last"), Some(("5m", 300)));
+        let app = schedule_popup(Some(&sched));
+        let form = schedule_form(&app);
+        assert_eq!(form.interval.text(), "1h");
+        assert_eq!(form.window.text(), "since_last");
+        assert_eq!(form.lag.text(), "5m");
+        assert_eq!(
+            form.submission(),
+            Some((
+                "1h".to_owned(),
+                Some("since_last".to_owned()),
+                Some("5m".to_owned())
+            ))
+        );
+    }
+
+    /// A zero lag prefills as an empty row: empty already means `0s`, and a
+    /// prefilled `0s` would suggest the operator chose it.
+    #[test]
+    fn schedule_popup_prefills_a_zero_lag_as_empty() {
+        let sched = test_schedule(Some("2h"), Some(("0s", 0)));
+        let app = schedule_popup(Some(&sched));
+        assert_eq!(schedule_form(&app).lag.text(), "");
+    }
+
+    #[test]
+    fn schedule_popup_esc_cancels() {
+        let mut app = schedule_popup(None);
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.popup.is_none());
+    }
+
     #[test]
     fn popup_blocks_global_keys() {
         let mut app = test_app();

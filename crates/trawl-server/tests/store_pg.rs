@@ -21,9 +21,10 @@
 mod common;
 
 use sqlx::PgPool;
+use trawl_server::report_window::{ReportWindow, ScheduleWindow, WindowKind, truncate_to_micros};
 use trawl_server::store::{
-    FinishOutcome, FlipOutcome, HistoryStore, RunClaim, RunStatus, SavedQueryStore, ScheduleStore,
-    StorageState, StoreError,
+    DueClaim, DueClaimError, FinishOutcome, FlipOutcome, HistoryStore, ManualRunClaim, RunClaim,
+    RunStatus, SavedQueryStore, ScheduleStore, StorageState, StoreError, WindowWriteError,
 };
 
 fn history(pool: &PgPool) -> HistoryStore {
@@ -216,7 +217,7 @@ async fn saved_update(pool: PgPool) {
     let created = store.create(1, "test", "original query").await.unwrap();
 
     let updated = store
-        .update(created.id, 1, "updated query", None)
+        .update_checked(created.id, 1, "updated query", None)
         .await
         .unwrap();
     assert_eq!(updated.query, "updated query");
@@ -230,7 +231,7 @@ async fn saved_update_with_rename(pool: PgPool) {
     let created = store.create(1, "old-name", "query").await.unwrap();
 
     let updated = store
-        .update(created.id, 1, "query", Some("new-name"))
+        .update_checked(created.id, 1, "query", Some("new-name"))
         .await
         .unwrap();
     assert_eq!(updated.name, "new-name");
@@ -242,23 +243,32 @@ async fn saved_rename_to_taken_name_conflicts(pool: PgPool) {
     let store = saved(&pool);
     store.create(1, "taken", "q").await.unwrap();
     let other = store.create(1, "other", "q").await.unwrap();
-    let result = store.update(other.id, 1, "q", Some("taken")).await;
-    assert!(matches!(result, Err(StoreError::DuplicateName { .. })));
+    let result = store.update_checked(other.id, 1, "q", Some("taken")).await;
+    assert!(matches!(
+        result,
+        Err(WindowWriteError::Store(StoreError::DuplicateName { .. }))
+    ));
 }
 
 #[sqlx::test]
 async fn saved_update_nonexistent_returns_error(pool: PgPool) {
     let store = saved(&pool);
-    let result = store.update(999, 1, "query", None).await;
-    assert!(matches!(result, Err(StoreError::NotFound { .. })));
+    let result = store.update_checked(999, 1, "query", None).await;
+    assert!(matches!(
+        result,
+        Err(WindowWriteError::Store(StoreError::NotFound { .. }))
+    ));
 }
 
 #[sqlx::test]
 async fn saved_update_other_users_query_returns_error(pool: PgPool) {
     let store = saved(&pool);
     let created = store.create(1, "test", "query").await.unwrap();
-    let result = store.update(created.id, 2, "updated", None).await;
-    assert!(matches!(result, Err(StoreError::NotFound { .. })));
+    let result = store.update_checked(created.id, 2, "updated", None).await;
+    assert!(matches!(
+        result,
+        Err(WindowWriteError::Store(StoreError::NotFound { .. }))
+    ));
 }
 
 #[sqlx::test]
@@ -350,11 +360,11 @@ async fn saved_list_with_details_bulk_join(pool: PgPool) {
     saved_store.create(1, "gamma", "q3").await.unwrap();
 
     let sched_a = schedule_store
-        .create_schedule(a.id, 1, 300, Some(10))
+        .create_schedule(a.id, 1, 300, Some(10), None, 0, chrono::Utc::now())
         .await
         .unwrap();
     schedule_store
-        .create_schedule(b.id, 1, 600, None)
+        .create_schedule(b.id, 1, 600, None, None, 0, chrono::Utc::now())
         .await
         .unwrap();
 
@@ -410,7 +420,7 @@ async fn seed_run(
     query: &str,
 ) -> i64 {
     match store
-        .claim_run(schedule_id, saved_query_id, query, None)
+        .claim_run(schedule_id, saved_query_id, query, None, None)
         .await
         .unwrap()
     {
@@ -419,12 +429,70 @@ async fn seed_run(
     }
 }
 
+/// A claim blocked on its saved query must not hold the schedule lock.
+/// Otherwise an editor holding the saved query and reaching for the schedule
+/// closes a deadlock cycle with the claim's implicit foreign-key lock.
+#[sqlx::test]
+async fn claim_run_locks_saved_query_before_schedule(pool: PgPool) {
+    let store = schedules(&pool);
+    let saved_id = seed_saved(&pool, 1, "claim-lock-order").await;
+    let schedule = store
+        .create_schedule(saved_id, 1, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
+    let mut editor = pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM saved_queries WHERE id = $1 FOR UPDATE")
+        .bind(saved_id)
+        .execute(&mut *editor)
+        .await
+        .unwrap();
+
+    let claim = tokio::spawn(async move {
+        store
+            .claim_run(schedule.id, saved_id, "q", None, None)
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+                 WHERE datname = current_database() AND wait_event_type = 'Lock'
+                   AND pid <> pg_backend_pid())",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if waiting {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("claim must reach the held saved-query lock");
+
+    let schedule_lock = sqlx::query("SELECT id FROM schedules WHERE id = $1 FOR UPDATE NOWAIT")
+        .bind(schedule.id)
+        .execute(&mut *editor)
+        .await;
+    editor.rollback().await.unwrap();
+    let claimed = claim.await.unwrap().unwrap();
+    assert!(
+        schedule_lock.is_ok(),
+        "claim took schedule before saved query: {schedule_lock:?}"
+    );
+    assert!(matches!(claimed, RunClaim::Started(_)));
+}
+
 #[sqlx::test]
 async fn schedule_create_and_get(pool: PgPool) {
     let store = schedules(&pool);
     let sq_id = seed_saved(&pool, 1, "test-query").await;
 
-    let schedule = store.create_schedule(sq_id, 1, 300, None).await.unwrap();
+    let schedule = store
+        .create_schedule(sq_id, 1, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
     assert_eq!(schedule.saved_query_id, sq_id);
     assert_eq!(schedule.interval_secs, 300);
     assert!(schedule.enabled);
@@ -443,8 +511,13 @@ async fn schedule_duplicate_returns_error(pool: PgPool) {
     let store = schedules(&pool);
     let sq_id = seed_saved(&pool, 1, "test").await;
 
-    store.create_schedule(sq_id, 1, 300, None).await.unwrap();
-    let result = store.create_schedule(sq_id, 1, 600, None).await;
+    store
+        .create_schedule(sq_id, 1, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
+    let result = store
+        .create_schedule(sq_id, 1, 600, None, None, 0, chrono::Utc::now())
+        .await;
     assert!(matches!(result, Err(StoreError::ScheduleExists { .. })));
 }
 
@@ -452,7 +525,9 @@ async fn schedule_duplicate_returns_error(pool: PgPool) {
 async fn schedule_for_missing_saved_query_is_not_found(pool: PgPool) {
     // 23503 on the named FK maps to NotFound, not a raw pg error.
     let store = schedules(&pool);
-    let result = store.create_schedule(12345, 1, 300, None).await;
+    let result = store
+        .create_schedule(12345, 1, 300, None, None, 0, chrono::Utc::now())
+        .await;
     assert!(matches!(result, Err(StoreError::NotFound { .. })));
 }
 
@@ -464,13 +539,20 @@ async fn schedule_rejects_sub_minute_interval(pool: PgPool) {
     let sq_id = seed_saved(&pool, 1, "test").await;
 
     assert!(matches!(
-        store.create_schedule(sq_id, 1, 30, None).await,
+        store
+            .create_schedule(sq_id, 1, 30, None, None, 0, chrono::Utc::now())
+            .await,
         Err(StoreError::IntervalTooShort { secs: 30 })
     ));
 
-    let created = store.create_schedule(sq_id, 1, 300, None).await.unwrap();
+    let created = store
+        .create_schedule(sq_id, 1, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
     assert!(matches!(
-        store.update_schedule(created.id, 1, 45, None, true).await,
+        store
+            .update_schedule(created.id, 1, 45, None, true, None, 0, chrono::Utc::now())
+            .await,
         Err(StoreError::IntervalTooShort { secs: 45 })
     ));
 }
@@ -480,9 +562,21 @@ async fn schedule_update(pool: PgPool) {
     let store = schedules(&pool);
     let sq_id = seed_saved(&pool, 1, "test").await;
 
-    let created = store.create_schedule(sq_id, 1, 300, None).await.unwrap();
+    let created = store
+        .create_schedule(sq_id, 1, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
     let updated = store
-        .update_schedule(created.id, 1, 600, Some(10), false)
+        .update_schedule(
+            created.id,
+            1,
+            600,
+            Some(10),
+            false,
+            None,
+            0,
+            chrono::Utc::now(),
+        )
         .await
         .unwrap();
     assert_eq!(updated.interval_secs, 600);
@@ -494,16 +588,1199 @@ async fn schedule_update(pool: PgPool) {
 async fn schedule_update_other_user_not_found(pool: PgPool) {
     let store = schedules(&pool);
     let sq_id = seed_saved(&pool, 1, "test").await;
-    let created = store.create_schedule(sq_id, 1, 300, None).await.unwrap();
-    let result = store.update_schedule(created.id, 2, 600, None, true).await;
+    let created = store
+        .create_schedule(sq_id, 1, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
+    let result = store
+        .update_schedule(created.id, 2, 600, None, true, None, 0, chrono::Utc::now())
+        .await;
     assert!(matches!(result, Err(StoreError::NotFound { .. })));
+}
+
+// ---------------------------------------------------------------------------
+// schedule windows (ADR-0018 rulings 6-14)
+// ---------------------------------------------------------------------------
+
+/// The (SQLSTATE, constraint name) pair of a rejected write. Constraint
+/// tests assert on this rather than on message text, the same way the
+/// store's own error mapping does.
+fn violation(e: sqlx::Error) -> (Option<String>, Option<String>) {
+    match e {
+        sqlx::Error::Database(db) => (
+            db.code().map(|c| c.to_string()),
+            db.constraint().map(str::to_owned),
+        ),
+        other => panic!("expected a database error, got {other:?}"),
+    }
+}
+
+/// Read a schedule's raw cursor columns, bypassing the decoder.
+async fn raw_cursors(
+    pool: &PgPool,
+    id: i64,
+) -> (
+    Option<String>,
+    Option<i64>,
+    i64,
+    Option<chrono::DateTime<chrono::Utc>>,
+    chrono::DateTime<chrono::Utc>,
+) {
+    sqlx::query_as(
+        "SELECT window_kind, window_secs, lag_secs, covered_through, next_fire_at
+         FROM schedules WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// All three window modes survive the round trip, and a `fixed` window keeps
+/// its span. Absent stays absent: a legacy schedule must not acquire a
+/// window by being written through the new columns.
+#[sqlx::test]
+async fn schedule_window_round_trips(pool: PgPool) {
+    let store = schedules(&pool);
+    let now = truncate_to_micros(chrono::Utc::now());
+
+    for (name, window, lag) in [
+        ("legacy", None, 0),
+        ("tiled", Some(ScheduleWindow::SinceLast), 300),
+        ("trailing", Some(ScheduleWindow::Fixed { secs: 7200 }), 0),
+    ] {
+        let sq_id = seed_saved(&pool, 1, name).await;
+        let created = store
+            .create_schedule(sq_id, 1, 300, None, window, lag, now)
+            .await
+            .unwrap();
+        assert_eq!(created.window, window, "{name}: created window");
+        assert_eq!(created.lag_secs, lag, "{name}: created lag");
+        assert_eq!(
+            created.covered_through,
+            match window {
+                // A since_last schedule owes coverage from its first
+                // window's start, and says so before it has ever run.
+                Some(ScheduleWindow::SinceLast) => Some(now - chrono::Duration::seconds(600)),
+                _ => None,
+            },
+            "{name}: the created watermark"
+        );
+
+        let fetched = store
+            .get_schedule_for_saved_query(sq_id, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fetched.window, window, "{name}: refetched window");
+        assert_eq!(fetched.lag_secs, lag, "{name}: refetched lag");
+
+        let (kind, secs, ..) = raw_cursors(&pool, created.id).await;
+        assert_eq!(
+            kind.as_deref(),
+            window.map(|w| w.kind().as_str()),
+            "{name}: persisted kind"
+        );
+        assert_eq!(
+            secs,
+            window
+                .and_then(ScheduleWindow::secs)
+                .map(i64::try_from)
+                .transpose()
+                .unwrap()
+        );
+    }
+}
+
+/// `next_fire_at` is the caller's instant, not the database clock: the
+/// scheduler samples one application instant per tick, and a test with a
+/// fake clock has to be able to create a schedule that is already due.
+#[sqlx::test]
+async fn schedule_create_anchors_next_fire_at_to_caller_instant(pool: PgPool) {
+    let store = schedules(&pool);
+    let sq_id = seed_saved(&pool, 1, "anchored").await;
+    let now = truncate_to_micros(chrono::Utc::now()) - chrono::Duration::hours(3);
+
+    let created = store
+        .create_schedule(sq_id, 1, 300, None, Some(ScheduleWindow::SinceLast), 0, now)
+        .await
+        .unwrap();
+    assert_eq!(created.next_fire_at, now);
+
+    let (.., next_fire_at) = raw_cursors(&pool, created.id).await;
+    assert_eq!(next_fire_at, now);
+}
+
+/// The planned cursor moves when the cadence changes and stays put
+/// otherwise. Re-anchoring on every edit would let repeated `max_runs` or
+/// `enabled` edits keep a schedule permanently un-due.
+#[sqlx::test]
+async fn schedule_update_reanchors_only_on_cadence_change(pool: PgPool) {
+    let store = schedules(&pool);
+    let sq_id = seed_saved(&pool, 1, "reanchor").await;
+    let t0 = truncate_to_micros(chrono::Utc::now());
+    let at = |mins: i64| t0 + chrono::Duration::minutes(mins);
+
+    let created = store
+        .create_schedule(sq_id, 1, 300, None, None, 0, t0)
+        .await
+        .unwrap();
+    assert_eq!(created.next_fire_at, t0);
+
+    // max_runs and enabled: not cadence.
+    let same = store
+        .update_schedule(created.id, 1, 300, Some(5), false, None, 0, at(1))
+        .await
+        .unwrap();
+    assert_eq!(same.next_fire_at, t0, "max_runs/enabled must not re-anchor");
+
+    // interval: cadence.
+    let interval = store
+        .update_schedule(created.id, 1, 600, Some(5), false, None, 0, at(2))
+        .await
+        .unwrap();
+    assert_eq!(interval.next_fire_at, at(2), "interval change re-anchors");
+
+    // window: cadence, since it changes what a fire covers.
+    let windowed = store
+        .update_schedule(
+            created.id,
+            1,
+            600,
+            Some(5),
+            false,
+            Some(ScheduleWindow::SinceLast),
+            0,
+            at(3),
+        )
+        .await
+        .unwrap();
+    assert_eq!(windowed.next_fire_at, at(3), "window change re-anchors");
+
+    // lag alone: shifts bounds, not cadence.
+    let lagged = store
+        .update_schedule(
+            created.id,
+            1,
+            600,
+            Some(5),
+            false,
+            Some(ScheduleWindow::SinceLast),
+            120,
+            at(4),
+        )
+        .await
+        .unwrap();
+    assert_eq!(lagged.next_fire_at, at(3), "lag change must not re-anchor");
+    assert_eq!(lagged.lag_secs, 120);
+}
+
+/// Editing a schedule never rewinds or advances coverage: the watermark is
+/// owned by successful runs alone (ADR-0018 ruling 14).
+#[sqlx::test]
+async fn schedule_update_preserves_covered_through(pool: PgPool) {
+    let store = schedules(&pool);
+    let sq_id = seed_saved(&pool, 1, "watermark").await;
+    let now = truncate_to_micros(chrono::Utc::now());
+    let created = store
+        .create_schedule(sq_id, 1, 300, None, Some(ScheduleWindow::SinceLast), 0, now)
+        .await
+        .unwrap();
+
+    let mark = now - chrono::Duration::hours(1);
+    sqlx::query("UPDATE schedules SET covered_through = $1 WHERE id = $2")
+        .bind(mark)
+        .bind(created.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    for (interval, window, enabled) in [
+        (300, Some(ScheduleWindow::SinceLast), true),
+        (900, Some(ScheduleWindow::Fixed { secs: 900 }), false),
+        (900, None, true),
+    ] {
+        let updated = store
+            .update_schedule(created.id, 1, interval, None, enabled, window, 0, now)
+            .await
+            .unwrap();
+        assert_eq!(
+            updated.covered_through,
+            Some(mark),
+            "edit ({interval}, {window:?}) must leave the watermark alone"
+        );
+    }
+}
+
+/// A `since_last` schedule records where it starts owing coverage BEFORE it
+/// has ever run, and an edit that re-anchors the cursor records the new
+/// origin the same way.
+///
+/// Without the seed, a first run that FAILS leaves the watermark unset, the
+/// planner falls back to ruling 14, and the next run covers one interval
+/// ending at its own fire. The failed interval is dropped, silently, with
+/// no `window_truncated` to admit it. Seeded, the failure leaves the origin
+/// standing and the next success covers both intervals.
+#[sqlx::test]
+async fn since_last_watermark_is_seeded_at_the_origin_of_owed_coverage(pool: PgPool) {
+    let store = schedules(&pool);
+    let now = truncate_to_micros(chrono::Utc::now());
+    let back = |secs: i64| Some(now - chrono::Duration::seconds(secs));
+
+    // Create: interval plus lag back from the cursor for since_last,
+    // nothing for the two modes that keep no watermark.
+    for (name, window, lag, expected) in [
+        ("tiled", Some(ScheduleWindow::SinceLast), 0, back(3600)),
+        ("lagged", Some(ScheduleWindow::SinceLast), 300, back(3900)),
+        (
+            "trailing",
+            Some(ScheduleWindow::Fixed { secs: 7200 }),
+            0,
+            None,
+        ),
+        ("query", None, 0, None),
+    ] {
+        let sq_id = seed_saved(&pool, 1, name).await;
+        let created = store
+            .create_schedule(sq_id, 1, 3600, None, window, lag, now)
+            .await
+            .unwrap();
+        assert_eq!(created.covered_through, expected, "{name}: created origin");
+    }
+
+    // An edit that re-anchors a query-mode schedule into since_last is a
+    // fresh origin, and gets one.
+    let sq_id = seed_saved(&pool, 1, "retyped").await;
+    let sched = store
+        .create_schedule(sq_id, 1, 3600, None, None, 0, now)
+        .await
+        .unwrap();
+    assert_eq!(sched.covered_through, None);
+
+    let retyped_at = now + chrono::Duration::hours(2);
+    let retyped = store
+        .update_schedule(
+            sched.id,
+            1,
+            3600,
+            None,
+            true,
+            Some(ScheduleWindow::SinceLast),
+            0,
+            retyped_at,
+        )
+        .await
+        .unwrap();
+    assert_eq!(retyped.next_fire_at, retyped_at);
+    assert_eq!(
+        retyped.covered_through,
+        Some(retyped_at - chrono::Duration::hours(1)),
+        "retyping into since_last seeds the new origin"
+    );
+
+    // A watermark that already exists is never overwritten, re-anchor or not.
+    let advanced = retyped_at + chrono::Duration::hours(3);
+    sqlx::query("UPDATE schedules SET covered_through = $1 WHERE id = $2")
+        .bind(advanced)
+        .bind(sched.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let re_edited = store
+        .update_schedule(
+            sched.id,
+            1,
+            900,
+            None,
+            true,
+            Some(ScheduleWindow::SinceLast),
+            0,
+            retyped_at + chrono::Duration::hours(4),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        re_edited.covered_through,
+        Some(advanced),
+        "coverage a run earned survives every later edit"
+    );
+
+    // An edit that does NOT re-anchor seeds nothing. Nothing this code
+    // writes leaves a since_last schedule watermark-less, so the row is
+    // forced back to that state to pin the rule.
+    sqlx::query("UPDATE schedules SET covered_through = NULL WHERE id = $1")
+        .bind(sched.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let untouched = store
+        .update_schedule(
+            sched.id,
+            1,
+            900,
+            Some(7),
+            false,
+            Some(ScheduleWindow::SinceLast),
+            0,
+            retyped_at + chrono::Duration::hours(5),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        untouched.covered_through, None,
+        "max_runs and enabled are not a new origin"
+    );
+}
+
+/// A lag with no window is refused at the store boundary, on both write
+/// paths, with the typed error the handler renders as a 400.
+#[sqlx::test]
+async fn schedule_lag_without_window_is_refused(pool: PgPool) {
+    let store = schedules(&pool);
+    let sq_id = seed_saved(&pool, 1, "lagless").await;
+    let now = chrono::Utc::now();
+
+    assert!(matches!(
+        store
+            .create_schedule(sq_id, 1, 300, None, None, 60, now)
+            .await,
+        Err(StoreError::LagWithoutWindow { lag_secs: 60 })
+    ));
+
+    let created = store
+        .create_schedule(
+            sq_id,
+            1,
+            300,
+            None,
+            Some(ScheduleWindow::SinceLast),
+            60,
+            now,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .update_schedule(created.id, 1, 300, None, true, None, 60, now)
+            .await,
+        Err(StoreError::LagWithoutWindow { lag_secs: 60 })
+    ));
+    // The refused update changed nothing.
+    let unchanged = store
+        .get_schedule_for_saved_query(sq_id, 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(unchanged.window, Some(ScheduleWindow::SinceLast));
+    assert_eq!(unchanged.lag_secs, 60);
+}
+
+/// A claimed run carries the window it is about to cover, and a claim with
+/// no window reads back three NULLs rather than a zero-length one.
+#[sqlx::test]
+async fn claimed_run_round_trips_its_window(pool: PgPool) {
+    let store = schedules(&pool);
+    let now = truncate_to_micros(chrono::Utc::now());
+
+    let windowed_sq = seed_saved(&pool, 1, "windowed").await;
+    let sched = store
+        .create_schedule(
+            windowed_sq,
+            1,
+            300,
+            None,
+            Some(ScheduleWindow::SinceLast),
+            0,
+            now,
+        )
+        .await
+        .unwrap();
+    let window = ReportWindow {
+        start: now - chrono::Duration::hours(2),
+        end: now,
+        truncated: true,
+        kind: WindowKind::SinceLast,
+    };
+    let rid = match store
+        .claim_run(sched.id, windowed_sq, "q", None, Some(&window))
+        .await
+        .unwrap()
+    {
+        RunClaim::Started(id) => id,
+        other => panic!("expected a started run, got {other:?}"),
+    };
+    let run = store.get_run(rid, 1).await.unwrap().unwrap();
+    assert_eq!(run.window_start, Some(window.start));
+    assert_eq!(run.window_end, Some(window.end));
+    assert_eq!(run.window_truncated, Some(true));
+    assert_eq!(run.window_kind, Some(WindowKind::SinceLast));
+
+    let legacy_sq = seed_saved(&pool, 1, "legacy-run").await;
+    let legacy_sched = store
+        .create_schedule(legacy_sq, 1, 300, None, None, 0, now)
+        .await
+        .unwrap();
+    let legacy_rid = seed_run(&store, legacy_sched.id, legacy_sq, "q").await;
+    let legacy = store.get_run(legacy_rid, 1).await.unwrap().unwrap();
+    assert_eq!(legacy.window_start, None);
+    assert_eq!(legacy.window_end, None);
+    assert_eq!(
+        legacy.window_truncated, None,
+        "a run with no window claims nothing, not completeness"
+    );
+    assert_eq!(legacy.window_kind, None);
+}
+
+/// The `since_last` watermark advances inside the success transaction, and
+/// only there (ADR-0018 ruling 9). A failed or timed-out run leaves the gap
+/// for the next success to cover, and a slow run finishing after a later one
+/// cannot rewind coverage.
+#[sqlx::test]
+async fn since_last_watermark_advances_only_on_success(pool: PgPool) {
+    let store = schedules(&pool);
+    let sq_id = seed_saved(&pool, 1, "tiling").await;
+    let now = truncate_to_micros(chrono::Utc::now());
+    // Anchored well before the windows below, so every one of them ends
+    // after the seeded origin and the only thing under test is which
+    // completion moves the watermark.
+    let created_at = now - chrono::Duration::hours(10);
+    let sched = store
+        .create_schedule(
+            sq_id,
+            1,
+            300,
+            None,
+            Some(ScheduleWindow::SinceLast),
+            0,
+            created_at,
+        )
+        .await
+        .unwrap();
+    let seed = created_at - chrono::Duration::seconds(300);
+
+    let covered = async || {
+        store
+            .get_schedule_for_saved_query(sq_id, 1)
+            .await
+            .unwrap()
+            .unwrap()
+            .covered_through
+    };
+    let window = |from_hours: i64, to_hours: i64| ReportWindow {
+        start: now - chrono::Duration::hours(from_hours),
+        end: now - chrono::Duration::hours(to_hours),
+        truncated: false,
+        kind: WindowKind::SinceLast,
+    };
+    let run = async |w: &ReportWindow| match store
+        .claim_run(sched.id, sq_id, "q", None, Some(w))
+        .await
+        .unwrap()
+    {
+        RunClaim::Started(id) => id,
+        other => panic!("expected a started run, got {other:?}"),
+    };
+
+    // An error completion covers nothing.
+    let failed = run(&window(4, 3)).await;
+    store
+        .finish_run(failed, RunStatus::Error, 5, None, Some("boom"), None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        covered().await,
+        Some(seed),
+        "a failed run leaves the seeded origin standing"
+    );
+
+    // Nor does a timeout.
+    let timed_out = run(&window(4, 3)).await;
+    store
+        .finish_run(timed_out, RunStatus::Timeout, 5, None, None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        covered().await,
+        Some(seed),
+        "a timed-out run leaves the seeded origin standing"
+    );
+
+    // A success advances the watermark to exactly its window_end.
+    let ok = window(4, 3);
+    let ok_id = run(&ok).await;
+    store
+        .finish_run(ok_id, RunStatus::Success, 5, Some(3), None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(covered().await, Some(ok.end));
+
+    // A later window moves it forward.
+    let later = window(3, 2);
+    let later_id = run(&later).await;
+    store
+        .finish_run(later_id, RunStatus::Success, 5, Some(1), None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(covered().await, Some(later.end));
+
+    // An out-of-order success carrying an older window does not rewind it.
+    let stale = window(9, 8);
+    let stale_id = run(&stale).await;
+    store
+        .finish_run(stale_id, RunStatus::Success, 5, Some(1), None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        covered().await,
+        Some(later.end),
+        "an older window must not rewind coverage"
+    );
+}
+
+/// The watermark decision belongs to the run, not to the schedule's current
+/// mode: finishing a run and retyping its schedule's window must give the
+/// same coverage whichever commits first.
+///
+/// The run records the mode it was CLAIMED under, so both orders answer from
+/// that one fact. Reading the schedule at finish time instead would make an
+/// operator's edit racing an in-flight run decide whether the window counts.
+#[sqlx::test]
+async fn finish_and_window_mode_edit_are_order_independent(pool: PgPool) {
+    let store = schedules(&pool);
+    let now = truncate_to_micros(chrono::Utc::now());
+    let bounds = |kind: WindowKind| ReportWindow {
+        start: now - chrono::Duration::hours(1),
+        end: now,
+        truncated: false,
+        kind,
+    };
+
+    // Claim a run under `claimed`, then finish it and retype the schedule to
+    // `edited_to` in the requested order. Answers the resulting watermark.
+    let covered_after = async |name: &str,
+                               claimed: ScheduleWindow,
+                               edited_to: ScheduleWindow,
+                               finish_first: bool| {
+        let sq_id = seed_saved(&pool, 1, name).await;
+        let sched = store
+            .create_schedule(sq_id, 1, 300, None, Some(claimed), 0, now)
+            .await
+            .unwrap();
+        let window = bounds(claimed.kind());
+        let rid = match store
+            .claim_run(sched.id, sq_id, "q", None, Some(&window))
+            .await
+            .unwrap()
+        {
+            RunClaim::Started(id) => id,
+            other => panic!("expected a started run, got {other:?}"),
+        };
+
+        let finish = async || {
+            store
+                .finish_run(rid, RunStatus::Success, 5, Some(1), None, None, None)
+                .await
+                .unwrap();
+        };
+        let edit = async || {
+            store
+                .update_schedule(sched.id, 1, 300, None, true, Some(edited_to), 0, now)
+                .await
+                .unwrap();
+        };
+        if finish_first {
+            finish().await;
+            edit().await;
+        } else {
+            edit().await;
+            finish().await;
+        }
+
+        store
+            .get_schedule_for_saved_query(sq_id, 1)
+            .await
+            .unwrap()
+            .unwrap()
+            .covered_through
+    };
+
+    // A since_last run retyped to fixed still advances, in either order.
+    let since_last = ScheduleWindow::SinceLast;
+    let fixed = ScheduleWindow::Fixed { secs: 3600 };
+    let finish_then_edit = covered_after("tiled-a", since_last, fixed, true).await;
+    let edit_then_finish = covered_after("tiled-b", since_last, fixed, false).await;
+    assert_eq!(
+        finish_then_edit, edit_then_finish,
+        "a since_last run's coverage must not depend on commit order"
+    );
+    assert_eq!(finish_then_edit, Some(now), "and it must be the run's end");
+
+    // A fixed run retyped to since_last contributes nothing to the
+    // watermark in either order. The value that ends up there is the edit's
+    // own seed, the origin the new since_last mode starts owing coverage
+    // from, and never the fixed run's end.
+    let finish_then_edit = covered_after("trailing-a", fixed, since_last, true).await;
+    let edit_then_finish = covered_after("trailing-b", fixed, since_last, false).await;
+    let seed = now - chrono::Duration::seconds(300);
+    assert_eq!(
+        (finish_then_edit, edit_then_finish),
+        (Some(seed), Some(seed)),
+        "a fixed run never moves a watermark, whichever commit lands first"
+    );
+    assert_ne!(
+        finish_then_edit,
+        Some(now),
+        "and the fixed run's own end is not what landed there"
+    );
+}
+
+/// A fixed trailing window is re-measured from every fire time, so it keeps
+/// no watermark: a success on one leaves `covered_through` untouched. Same
+/// for a legacy schedule, whose runs carry no window at all.
+#[sqlx::test]
+async fn fixed_and_legacy_schedules_keep_no_watermark(pool: PgPool) {
+    let store = schedules(&pool);
+    let now = truncate_to_micros(chrono::Utc::now());
+
+    for (name, window) in [
+        ("trailing", Some(ScheduleWindow::Fixed { secs: 3600 })),
+        ("legacy", None),
+    ] {
+        let sq_id = seed_saved(&pool, 1, name).await;
+        let sched = store
+            .create_schedule(sq_id, 1, 300, None, window, 0, now)
+            .await
+            .unwrap();
+        // The run is claimed the way the planner will claim it: a windowed
+        // schedule hands down its own mode, a legacy one hands down nothing.
+        let covered = window.map(|w| ReportWindow {
+            start: now - chrono::Duration::hours(1),
+            end: now,
+            truncated: false,
+            kind: w.kind(),
+        });
+        let rid = match store
+            .claim_run(sched.id, sq_id, "q", None, covered.as_ref())
+            .await
+            .unwrap()
+        {
+            RunClaim::Started(id) => id,
+            other => panic!("expected a started run, got {other:?}"),
+        };
+        store
+            .finish_run(rid, RunStatus::Success, 5, Some(1), None, None, None)
+            .await
+            .unwrap();
+
+        let after = store
+            .get_schedule_for_saved_query(sq_id, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.covered_through, None,
+            "{name}: only a since_last run keeps a watermark"
+        );
+        let run = store.get_run(rid, 1).await.unwrap().unwrap();
+        assert_eq!(
+            run.window_end,
+            covered.map(|w| w.end),
+            "{name}: the run still records what it covered"
+        );
+        assert_eq!(run.window_kind, window.map(ScheduleWindow::kind));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// claim_due_run: plan, materialize and claim in one transaction
+// ---------------------------------------------------------------------------
+
+/// How many intervals of catch-up these tests allow. Large enough that
+/// nothing here is truncated by accident; the clamp itself is covered by
+/// the planner's own tests and by `tests/scheduler_windows.rs`.
+const CATCHUP: u32 = 24;
+
+/// Read a schedule back through its saved query.
+async fn reread(store: &ScheduleStore, sq_id: i64) -> trawl_server::store::Schedule {
+    store
+        .get_schedule_for_saved_query(sq_id, 1)
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+/// The fire cursor is the whole due test: before it, nothing happens and
+/// nothing is written.
+#[sqlx::test]
+async fn claim_due_run_is_not_due_before_the_cursor(pool: PgPool) {
+    let store = schedules(&pool);
+    let now = truncate_to_micros(chrono::Utc::now());
+    let sq_id = seed_saved(&pool, 1, "early").await;
+    let sched = store
+        .create_schedule(sq_id, 1, 3600, None, None, 0, now)
+        .await
+        .unwrap();
+
+    let a_second_early = now - chrono::Duration::seconds(1);
+    assert_eq!(
+        store
+            .claim_due_run(sched.id, a_second_early, CATCHUP)
+            .await
+            .unwrap(),
+        DueClaim::NotDue
+    );
+    assert_eq!(store.count_runs(sched.id).await.unwrap(), 0);
+    assert_eq!(
+        reread(&store, sq_id).await.next_fire_at,
+        now,
+        "a not-due tick writes nothing at all"
+    );
+
+    // The cursor instant itself IS due: a schedule created at T fires at T.
+    assert!(matches!(
+        store.claim_due_run(sched.id, now, CATCHUP).await.unwrap(),
+        DueClaim::Started(_)
+    ));
+}
+
+/// A watermark at or past the window the cursor would produce is coverage
+/// that already exists. The cursor moves so the tick stops asking, and no
+/// run is claimed.
+#[sqlx::test]
+async fn claim_due_run_advances_over_ground_the_watermark_covers(pool: PgPool) {
+    let store = schedules(&pool);
+    let now = truncate_to_micros(chrono::Utc::now());
+    let sq_id = seed_saved(&pool, 1, "covered").await;
+    let sched = store
+        .create_schedule(
+            sq_id,
+            1,
+            3600,
+            None,
+            Some(ScheduleWindow::SinceLast),
+            0,
+            now,
+        )
+        .await
+        .unwrap();
+
+    // Only an edit can produce this shape, so plant it the way an edit would.
+    sqlx::query("UPDATE schedules SET covered_through = $1 WHERE id = $2")
+        .bind(now + chrono::Duration::hours(10))
+        .bind(sched.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store.claim_due_run(sched.id, now, CATCHUP).await.unwrap(),
+        DueClaim::Advanced
+    );
+    assert_eq!(store.count_runs(sched.id).await.unwrap(), 0);
+    assert_eq!(
+        reread(&store, sq_id).await.next_fire_at,
+        now + chrono::Duration::hours(1),
+        "the cursor moves one interval so the tick stops re-asking"
+    );
+}
+
+/// A run still in flight blocks the claim and LEAVES the cursor, so the
+/// boundary is claimed again at the next poll after that run finishes and
+/// the coverage it owed folds into one window (ADR-0018 ruling 9).
+#[sqlx::test]
+async fn claim_due_run_leaves_the_cursor_while_a_run_is_in_flight(pool: PgPool) {
+    let store = schedules(&pool);
+    let now = truncate_to_micros(chrono::Utc::now());
+    let sq_id = seed_saved(&pool, 1, "inflight").await;
+    let sched = store
+        .create_schedule(
+            sq_id,
+            1,
+            3600,
+            None,
+            Some(ScheduleWindow::SinceLast),
+            0,
+            now,
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        store.claim_due_run(sched.id, now, CATCHUP).await.unwrap(),
+        DueClaim::Started(_)
+    ));
+    let after_first = reread(&store, sq_id).await.next_fire_at;
+    assert_eq!(after_first, now + chrono::Duration::hours(1));
+
+    // The first run never finishes; the next boundary arrives anyway.
+    assert_eq!(
+        store
+            .claim_due_run(sched.id, after_first, CATCHUP)
+            .await
+            .unwrap(),
+        DueClaim::AlreadyRunning
+    );
+    assert_eq!(store.count_runs(sched.id).await.unwrap(), 1);
+    assert_eq!(
+        reread(&store, sq_id).await.next_fire_at,
+        after_first,
+        "a refused boundary must stay claimable"
+    );
+}
+
+/// The `max_runs` cap refuses the claim and leaves the cursor too: raising
+/// the cap resumes from the boundary that was refused rather than from
+/// wherever the clock has got to.
+#[sqlx::test]
+async fn claim_due_run_leaves_the_cursor_at_the_max_runs_cap(pool: PgPool) {
+    let store = schedules(&pool);
+    let now = truncate_to_micros(chrono::Utc::now());
+    let sq_id = seed_saved(&pool, 1, "capped").await;
+    let sched = store
+        .create_schedule(sq_id, 1, 3600, Some(1), None, 0, now)
+        .await
+        .unwrap();
+
+    let DueClaim::Started(first) = store.claim_due_run(sched.id, now, CATCHUP).await.unwrap()
+    else {
+        panic!("the first run is under the cap");
+    };
+    store
+        .finish_run(
+            first.run_id,
+            RunStatus::Success,
+            5,
+            Some(0),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let after_first = reread(&store, sq_id).await.next_fire_at;
+
+    assert_eq!(
+        store
+            .claim_due_run(sched.id, after_first, CATCHUP)
+            .await
+            .unwrap(),
+        DueClaim::MaxRunsReached
+    );
+    assert_eq!(store.count_runs(sched.id).await.unwrap(), 1);
+    assert_eq!(reread(&store, sq_id).await.next_fire_at, after_first);
+}
+
+/// A disabled schedule is not due whatever the clock says, and neither is
+/// one whose rows are gone.
+#[sqlx::test]
+async fn claim_due_run_is_not_due_when_disabled_or_deleted(pool: PgPool) {
+    let store = schedules(&pool);
+    let now = truncate_to_micros(chrono::Utc::now());
+    let sq_id = seed_saved(&pool, 1, "paused").await;
+    let sched = store
+        .create_schedule(sq_id, 1, 3600, None, None, 0, now)
+        .await
+        .unwrap();
+    store
+        .update_schedule(sched.id, 1, 3600, None, false, None, 0, now)
+        .await
+        .unwrap();
+
+    let later = now + chrono::Duration::hours(5);
+    assert_eq!(
+        store.claim_due_run(sched.id, later, CATCHUP).await.unwrap(),
+        DueClaim::NotDue,
+        "a disabled schedule owes nothing"
+    );
+    assert_eq!(
+        reread(&store, sq_id).await.next_fire_at,
+        now,
+        "and its cursor is not moved while it is off"
+    );
+
+    store.delete_schedule(sq_id, 1).await.unwrap();
+    assert_eq!(
+        store.claim_due_run(sched.id, later, CATCHUP).await.unwrap(),
+        DueClaim::NotDue,
+        "a deleted schedule is not an error, just nothing to do"
+    );
+}
+
+/// The claim returns the text it stored, and it is the saved DSL with the
+/// planned bounds spliced on (ADR-0018 ruling 11) — not the saved text and
+/// not something the caller has to rebuild.
+#[sqlx::test]
+async fn claim_due_run_stores_the_resolved_query_it_returns(pool: PgPool) {
+    let store = schedules(&pool);
+    let now = truncate_to_micros(chrono::Utc::now());
+    let sq_id = saved(&pool)
+        .create(1, "resolved", "service=fx | table _time")
+        .await
+        .unwrap()
+        .id;
+    let sched = store
+        .create_schedule(
+            sq_id,
+            1,
+            3600,
+            None,
+            Some(ScheduleWindow::SinceLast),
+            0,
+            now,
+        )
+        .await
+        .unwrap();
+
+    let DueClaim::Started(claimed) = store.claim_due_run(sched.id, now, CATCHUP).await.unwrap()
+    else {
+        panic!("the schedule is due at its own creation instant");
+    };
+
+    let window = claimed.window.expect("a windowed schedule claims a window");
+    assert_eq!(window.kind, WindowKind::SinceLast);
+    assert_eq!(window.end, now, "no lag, so the window ends at the fire");
+    assert_eq!(
+        window.start,
+        now - chrono::Duration::hours(1),
+        "the first since_last run covers one interval (ruling 14)"
+    );
+    assert!(!window.truncated);
+    assert!(
+        claimed.resolved_query.ends_with("service=fx | table _time"),
+        "the saved text survives verbatim: {}",
+        claimed.resolved_query
+    );
+    assert!(claimed.resolved_query.starts_with("earliest="));
+    assert_eq!(claimed.query_name, "resolved");
+    assert_eq!(claimed.saved_query_id, sq_id);
+
+    let run = store.get_run(claimed.run_id, 1).await.unwrap().unwrap();
+    assert_eq!(
+        run.query, claimed.resolved_query,
+        "the stored text and the executed text are one string"
+    );
+    assert_eq!(
+        (run.window_start, run.window_end),
+        (Some(window.start), Some(window.end))
+    );
+    assert_eq!(run.window_truncated, Some(false));
+    assert_eq!(run.window_kind, Some(WindowKind::SinceLast));
+    assert_eq!(
+        reread(&store, sq_id).await.next_fire_at,
+        now + chrono::Duration::hours(1)
+    );
+}
+
+/// A windowed schedule whose saved DSL grew its own time clause is refused,
+/// loudly, with the cursor left alone (rulings 7 and 11). Write-time
+/// validation is supposed to prevent the pair; if it is there anyway, the
+/// tick must not execute a query whose `last=` overrides the window the run
+/// row would claim to cover.
+#[sqlx::test]
+async fn claim_due_run_refuses_a_query_that_owns_its_own_window(pool: PgPool) {
+    let store = schedules(&pool);
+    let now = truncate_to_micros(chrono::Utc::now());
+    let sq_id = saved(&pool)
+        .create(1, "conflicted", "service=fx | table _time")
+        .await
+        .unwrap()
+        .id;
+    let sched = store
+        .create_schedule(
+            sq_id,
+            1,
+            3600,
+            None,
+            Some(ScheduleWindow::SinceLast),
+            0,
+            now,
+        )
+        .await
+        .unwrap();
+    // Write the forbidden pair the only way that is still possible: past
+    // the write-time gate, straight at the column. `update_checked` refuses
+    // this text under this schedule, which is exactly what makes the
+    // claim-time re-check below a test of stored state rather than a second
+    // reading of the same request.
+    sqlx::query("UPDATE saved_queries SET query = $1 WHERE id = $2")
+        .bind("service=fx last=1h | table _time")
+        .bind(sq_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let err = store
+        .claim_due_run(sched.id, now, CATCHUP)
+        .await
+        .expect_err("a windowed schedule cannot execute a query that owns its own window");
+    assert!(
+        matches!(err, DueClaimError::Policy(_)),
+        "expected the window-policy refusal, got {err:?}"
+    );
+    assert_eq!(err.class(), "window_policy");
+    assert!(
+        err.to_string().contains("last="),
+        "the message names the clause it found: {err}"
+    );
+
+    assert_eq!(store.count_runs(sched.id).await.unwrap(), 0);
+    assert_eq!(
+        reread(&store, sq_id).await.next_fire_at,
+        now,
+        "a refused claim leaves the cursor, so the state is loud every poll"
+    );
+}
+
+/// A CHECK accepts NULL as readily as TRUE, so a shape constraint written
+/// as an OR of arms has a hole wherever an arm can evaluate to NULL.
+///
+/// `(window_kind NULL, window_secs 60)` was that hole: the fixed arm read
+/// `NULL = 'fixed' AND TRUE`, which is NULL, the other arms were FALSE, and
+/// the constraint let a span with no mode through. Every arm is a CASE
+/// branch now, and these are the writes that used to land.
+#[sqlx::test]
+async fn window_shape_rejects_null_kind_with_span(pool: PgPool) {
+    let store = schedules(&pool);
+    let sq_id = seed_saved(&pool, 1, "two-valued").await;
+    let sched = store
+        .create_schedule(sq_id, 1, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
+
+    let expected = (
+        Some("23514".to_owned()),
+        Some("schedules_window_shape".to_owned()),
+    );
+
+    // A span with no mode.
+    let err =
+        sqlx::query("UPDATE schedules SET window_kind = NULL, window_secs = 60 WHERE id = $1")
+            .bind(sched.id)
+            .execute(&pool)
+            .await
+            .unwrap_err();
+    assert_eq!(violation(err), expected, "a span with no mode");
+
+    // Its mirror: a mode that needs a span, with none.
+    let err =
+        sqlx::query("UPDATE schedules SET window_kind = 'fixed', window_secs = NULL WHERE id = $1")
+            .bind(sched.id)
+            .execute(&pool)
+            .await
+            .unwrap_err();
+    assert_eq!(violation(err), expected, "fixed with no span");
+
+    // The run side has the same obligation: bounds with no claim-time mode.
+    let err = sqlx::query(
+        "INSERT INTO report_runs
+             (schedule_id, saved_query_id, query, status, started_at,
+              window_start, window_end, window_truncated)
+         VALUES ($1, $2, 'q', 'error', now(), now() - INTERVAL '1 hour', now(), FALSE)",
+    )
+    .bind(sched.id)
+    .bind(sq_id)
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        violation(err),
+        (
+            Some("23514".to_owned()),
+            Some("report_runs_window_shape".to_owned())
+        ),
+        "a run window with no mode"
+    );
+}
+
+/// The named CHECKs are the backstop under the typed API: a partial run
+/// window and a `fixed` schedule with no span are both unwritable.
+#[sqlx::test]
+async fn window_check_constraints_reject_partial_shapes(pool: PgPool) {
+    let store = schedules(&pool);
+    let sq_id = seed_saved(&pool, 1, "checks").await;
+    let now = chrono::Utc::now();
+    let sched = store
+        .create_schedule(sq_id, 1, 300, None, None, 0, now)
+        .await
+        .unwrap();
+
+    // window_start with no end/truncated.
+    let err = sqlx::query(
+        "INSERT INTO report_runs
+             (schedule_id, saved_query_id, query, status, started_at, window_start, window_kind)
+         VALUES ($1, $2, 'q', 'error', now(), now(), 'since_last')",
+    )
+    .bind(sched.id)
+    .bind(sq_id)
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        violation(err),
+        (
+            Some("23514".to_owned()),
+            Some("report_runs_window_shape".to_owned())
+        )
+    );
+
+    // An end at or before the start is not a half-open interval.
+    let err = sqlx::query(
+        "INSERT INTO report_runs
+             (schedule_id, saved_query_id, query, status, started_at,
+              window_start, window_end, window_truncated, window_kind)
+         VALUES ($1, $2, 'q', 'error', now(), now(), now() - INTERVAL '1 hour', FALSE, 'since_last')",
+    )
+    .bind(sched.id)
+    .bind(sq_id)
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        violation(err),
+        (
+            Some("23514".to_owned()),
+            Some("report_runs_window_shape".to_owned())
+        )
+    );
+
+    // A fixed window with no span.
+    let err = sqlx::query("UPDATE schedules SET window_kind = 'fixed' WHERE id = $1")
+        .bind(sched.id)
+        .execute(&pool)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        violation(err),
+        (
+            Some("23514".to_owned()),
+            Some("schedules_window_shape".to_owned())
+        )
+    );
+
+    // And one below the 60s floor.
+    let err =
+        sqlx::query("UPDATE schedules SET window_kind = 'fixed', window_secs = 30 WHERE id = $1")
+            .bind(sched.id)
+            .execute(&pool)
+            .await
+            .unwrap_err();
+    assert_eq!(
+        violation(err),
+        (
+            Some("23514".to_owned()),
+            Some("schedules_window_shape".to_owned())
+        )
+    );
 }
 
 #[sqlx::test]
 async fn schedule_delete(pool: PgPool) {
     let store = schedules(&pool);
     let sq_id = seed_saved(&pool, 1, "test").await;
-    store.create_schedule(sq_id, 1, 300, None).await.unwrap();
+    store
+        .create_schedule(sq_id, 1, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
 
     let paths = store.delete_schedule(sq_id, 1).await.unwrap();
     assert!(paths.is_empty());
@@ -520,7 +1797,10 @@ async fn schedule_delete(pool: PgPool) {
 async fn schedule_delete_other_user_not_found(pool: PgPool) {
     let store = schedules(&pool);
     let sq_id = seed_saved(&pool, 1, "test").await;
-    store.create_schedule(sq_id, 1, 300, None).await.unwrap();
+    store
+        .create_schedule(sq_id, 1, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
     let result = store.delete_schedule(sq_id, 2).await;
     assert!(matches!(result, Err(StoreError::NotFound { .. })));
 }
@@ -531,8 +1811,14 @@ async fn schedule_user_isolation(pool: PgPool) {
     let sq1 = seed_saved(&pool, 1, "user1-query").await;
     let sq2 = seed_saved(&pool, 2, "user2-query").await;
 
-    store.create_schedule(sq1, 1, 300, None).await.unwrap();
-    store.create_schedule(sq2, 2, 600, None).await.unwrap();
+    store
+        .create_schedule(sq1, 1, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
+    store
+        .create_schedule(sq2, 2, 600, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
 
     assert!(
         store
@@ -560,7 +1846,10 @@ async fn cascade_on_saved_query_delete(pool: PgPool) {
         .create(1, "test", "_severity=error")
         .await
         .unwrap();
-    let schedule = store.create_schedule(sq.id, 1, 300, None).await.unwrap();
+    let schedule = store
+        .create_schedule(sq.id, 1, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
 
     let run_id = seed_run(&store, schedule.id, sq.id, "_severity=error").await;
     assert_eq!(
@@ -596,7 +1885,10 @@ async fn cascade_on_saved_query_delete(pool: PgPool) {
 async fn schedule_delete_collects_run_paths(pool: PgPool) {
     let store = schedules(&pool);
     let sq_id = seed_saved(&pool, 1, "test").await;
-    let schedule = store.create_schedule(sq_id, 1, 300, None).await.unwrap();
+    let schedule = store
+        .create_schedule(sq_id, 1, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
 
     let run_id = seed_run(&store, schedule.id, sq_id, "q").await;
     store
@@ -624,7 +1916,10 @@ async fn schedule_delete_collects_run_paths(pool: PgPool) {
 async fn start_and_finish_run(pool: PgPool) {
     let store = schedules(&pool);
     let sq_id = seed_saved(&pool, 1, "test").await;
-    let schedule = store.create_schedule(sq_id, 1, 300, None).await.unwrap();
+    let schedule = store
+        .create_schedule(sq_id, 1, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
 
     let run_id = seed_run(&store, schedule.id, sq_id, "_severity=error").await;
 
@@ -660,10 +1955,13 @@ async fn start_and_finish_run(pool: PgPool) {
 async fn sequential_run_prevention(pool: PgPool) {
     let store = schedules(&pool);
     let sq_id = seed_saved(&pool, 1, "test").await;
-    let schedule = store.create_schedule(sq_id, 1, 300, None).await.unwrap();
+    let schedule = store
+        .create_schedule(sq_id, 1, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
 
     let first = store
-        .claim_run(schedule.id, sq_id, "q", None)
+        .claim_run(schedule.id, sq_id, "q", None, None)
         .await
         .unwrap();
     let RunClaim::Started(first_id) = first else {
@@ -672,7 +1970,7 @@ async fn sequential_run_prevention(pool: PgPool) {
 
     // Second claim is refused (already running) via the named 23505.
     let second = store
-        .claim_run(schedule.id, sq_id, "q", None)
+        .claim_run(schedule.id, sq_id, "q", None, None)
         .await
         .unwrap();
     assert!(matches!(second, RunClaim::AlreadyRunning), "got {second:?}");
@@ -683,7 +1981,7 @@ async fn sequential_run_prevention(pool: PgPool) {
         .await
         .unwrap();
     let third = store
-        .claim_run(schedule.id, sq_id, "q", None)
+        .claim_run(schedule.id, sq_id, "q", None, None)
         .await
         .unwrap();
     assert!(matches!(third, RunClaim::Started(_)), "got {third:?}");
@@ -693,7 +1991,10 @@ async fn sequential_run_prevention(pool: PgPool) {
 async fn list_runs_paginated_and_isolated(pool: PgPool) {
     let store = schedules(&pool);
     let sq_id = seed_saved(&pool, 1, "test").await;
-    let schedule = store.create_schedule(sq_id, 1, 300, None).await.unwrap();
+    let schedule = store
+        .create_schedule(sq_id, 1, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
 
     for i in 0usize..5 {
         let run_id = seed_run(&store, schedule.id, sq_id, "q").await;
@@ -727,7 +2028,10 @@ async fn list_runs_paginated_and_isolated(pool: PgPool) {
 async fn cleanup_stale_runs_marks_error(pool: PgPool) {
     let store = schedules(&pool);
     let sq_id = seed_saved(&pool, 1, "test").await;
-    let schedule = store.create_schedule(sq_id, 1, 300, None).await.unwrap();
+    let schedule = store
+        .create_schedule(sq_id, 1, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
 
     // Start a run but don't finish it (simulates crash).
     seed_run(&store, schedule.id, sq_id, "q").await;
@@ -747,7 +2051,10 @@ async fn cleanup_stale_runs_marks_error(pool: PgPool) {
 async fn latest_run_returns_newest(pool: PgPool) {
     let store = schedules(&pool);
     let sq_id = seed_saved(&pool, 1, "test").await;
-    let schedule = store.create_schedule(sq_id, 1, 300, None).await.unwrap();
+    let schedule = store
+        .create_schedule(sq_id, 1, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
 
     assert!(store.latest_run(schedule.id).await.unwrap().is_none());
 
@@ -774,10 +2081,25 @@ async fn list_enabled_schedules_filters_disabled(pool: PgPool) {
     let sq1 = seed_saved(&pool, 1, "enabled-query").await;
     let sq2 = seed_saved(&pool, 2, "disabled-query").await;
 
-    store.create_schedule(sq1, 1, 300, None).await.unwrap();
-    let disabled = store.create_schedule(sq2, 2, 600, None).await.unwrap();
     store
-        .update_schedule(disabled.id, 2, 600, None, false)
+        .create_schedule(sq1, 1, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
+    let disabled = store
+        .create_schedule(sq2, 2, 600, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
+    store
+        .update_schedule(
+            disabled.id,
+            2,
+            600,
+            None,
+            false,
+            None,
+            0,
+            chrono::Utc::now(),
+        )
         .await
         .unwrap();
 
@@ -793,9 +2115,18 @@ async fn list_all_runs_paginated_and_isolated(pool: PgPool) {
     let sq1 = seed_saved(&pool, 1, "alpha").await;
     let sq2 = seed_saved(&pool, 1, "beta").await;
     let sq3 = seed_saved(&pool, 2, "other-user").await;
-    let sched1 = store.create_schedule(sq1, 1, 300, None).await.unwrap();
-    let sched2 = store.create_schedule(sq2, 1, 300, None).await.unwrap();
-    let sched3 = store.create_schedule(sq3, 2, 300, None).await.unwrap();
+    let sched1 = store
+        .create_schedule(sq1, 1, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
+    let sched2 = store
+        .create_schedule(sq2, 1, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
+    let sched3 = store
+        .create_schedule(sq3, 2, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
 
     for _ in 0..3 {
         let rid = seed_run(&store, sched1.id, sq1, "q1").await;
@@ -839,7 +2170,10 @@ async fn runs_stats_counts_by_status(pool: PgPool) {
     assert_eq!((total, success, error, timeout, avg), (0, 0, 0, 0, None));
 
     let sq_id = seed_saved(&pool, 1, "stats-test").await;
-    let sched = store.create_schedule(sq_id, 1, 300, None).await.unwrap();
+    let sched = store
+        .create_schedule(sq_id, 1, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
 
     for (status, ms, err) in [
         (RunStatus::Success, 100, None),
@@ -873,7 +2207,10 @@ async fn runs_stats_counts_by_status(pool: PgPool) {
 async fn delete_old_runs_retention_and_paths(pool: PgPool) {
     let store = schedules(&pool);
     let sq_id = seed_saved(&pool, 1, "retention").await;
-    let sched = store.create_schedule(sq_id, 1, 300, None).await.unwrap();
+    let sched = store
+        .create_schedule(sq_id, 1, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
 
     // Four finished runs with paths; backdate the first two beyond the cutoff.
     let mut run_ids = Vec::new();
@@ -926,7 +2263,10 @@ async fn delete_old_runs_retention_and_paths(pool: PgPool) {
 async fn successful_run_selectors(pool: PgPool) {
     let store = schedules(&pool);
     let sq_id = seed_saved(&pool, 1, "sel").await;
-    let sched = store.create_schedule(sq_id, 1, 300, None).await.unwrap();
+    let sched = store
+        .create_schedule(sq_id, 1, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
 
     // error run (no path), success with path, success without path.
     let r1 = seed_run(&store, sched.id, sq_id, "q").await;
@@ -961,9 +2301,16 @@ async fn successful_run_selectors(pool: PgPool) {
         .await
         .unwrap();
 
+    // `run=latest` takes the newest SUCCESS, path or no path: a run whose
+    // result had no rows has no parquet, and skipping it would answer from
+    // a window that has already been superseded (ADR-0018 ruling 13).
     let latest = store.latest_successful_run(sq_id).await.unwrap().unwrap();
-    assert_eq!(latest.id, r2, "latest successful WITH a parquet path");
+    assert_eq!(
+        latest.id, r3,
+        "the newest success, whether or not it wrote a file"
+    );
 
+    // `run=all` unions files, so a run without one is not a member.
     let all = store.list_successful_runs(sq_id).await.unwrap();
     assert_eq!(all.len(), 1);
     assert_eq!(all[0].id, r2);
@@ -980,13 +2327,16 @@ async fn successful_run_selectors(pool: PgPool) {
 async fn concurrent_start_run_yields_exactly_one_claim(pool: PgPool) {
     let store = schedules(&pool);
     let sq_id = seed_saved(&pool, 1, "race").await;
-    let sched = store.create_schedule(sq_id, 1, 300, None).await.unwrap();
+    let sched = store
+        .create_schedule(sq_id, 1, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
 
     let s1 = store.clone();
     let s2 = store.clone();
     let (a, b) = tokio::join!(
-        tokio::spawn(async move { s1.claim_run(sched.id, sq_id, "q", None).await }),
-        tokio::spawn(async move { s2.claim_run(sched.id, sq_id, "q", None).await }),
+        tokio::spawn(async move { s1.claim_run(sched.id, sq_id, "q", None, None).await }),
+        tokio::spawn(async move { s2.claim_run(sched.id, sq_id, "q", None, None).await }),
     );
     let a = a.unwrap().unwrap();
     let b = b.unwrap().unwrap();
@@ -1006,7 +2356,10 @@ async fn concurrent_start_run_yields_exactly_one_claim(pool: PgPool) {
 async fn concurrent_claims_respect_max_runs(pool: PgPool) {
     let store = schedules(&pool);
     let sq_id = seed_saved(&pool, 1, "cap").await;
-    let sched = store.create_schedule(sq_id, 1, 300, Some(2)).await.unwrap();
+    let sched = store
+        .create_schedule(sq_id, 1, 300, Some(2), None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
 
     // One finished run: exactly one claim slot remains under max_runs = 2.
     let rid = seed_run(&store, sched.id, sq_id, "q").await;
@@ -1018,8 +2371,8 @@ async fn concurrent_claims_respect_max_runs(pool: PgPool) {
     let s1 = store.clone();
     let s2 = store.clone();
     let (a, b) = tokio::join!(
-        tokio::spawn(async move { s1.claim_run(sched.id, sq_id, "q", Some(2)).await }),
-        tokio::spawn(async move { s2.claim_run(sched.id, sq_id, "q", Some(2)).await }),
+        tokio::spawn(async move { s1.claim_run(sched.id, sq_id, "q", Some(2), None).await }),
+        tokio::spawn(async move { s2.claim_run(sched.id, sq_id, "q", Some(2), None).await }),
     );
     let a = a.unwrap().unwrap();
     let b = b.unwrap().unwrap();
@@ -1043,7 +2396,10 @@ async fn finish_run_after_cascade_delete_reports_orphan(pool: PgPool) {
     let saved_store = saved(&pool);
     let store = schedules(&pool);
     let sq = saved_store.create(1, "midflight", "q").await.unwrap();
-    let sched = store.create_schedule(sq.id, 1, 300, None).await.unwrap();
+    let sched = store
+        .create_schedule(sq.id, 1, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
 
     let rid = seed_run(&store, sched.id, sq.id, "q").await;
 
@@ -1080,7 +2436,10 @@ async fn fail_run_if_running_is_a_guarded_transition(pool: PgPool) {
 
     // A still-running run flips to error and the result path is cleared.
     let sq = saved_store.create(1, "running", "q").await.unwrap();
-    let sched = store.create_schedule(sq.id, 1, 300, None).await.unwrap();
+    let sched = store
+        .create_schedule(sq.id, 1, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
     let rid = seed_run(&store, sched.id, sq.id, "q").await;
 
     assert_eq!(
@@ -1098,7 +2457,10 @@ async fn fail_run_if_running_is_a_guarded_transition(pool: PgPool) {
     // A run whose success already committed must survive the guarded flip:
     // the ambiguous-commit case where the first finish_run's COMMIT landed.
     let sq2 = saved_store.create(1, "committed", "q").await.unwrap();
-    let sched2 = store.create_schedule(sq2.id, 1, 300, None).await.unwrap();
+    let sched2 = store
+        .create_schedule(sq2.id, 1, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
     let rid2 = seed_run(&store, sched2.id, sq2.id, "q").await;
     assert_eq!(
         store
@@ -1154,7 +2516,7 @@ async fn delete_racing_finish_run_never_orphans_path(pool: PgPool) {
     let sched_store = schedules(&pool);
     let sq = saved_store.create(1, "race", "q").await.unwrap();
     let sched = sched_store
-        .create_schedule(sq.id, 1, 300, None)
+        .create_schedule(sq.id, 1, 300, None, None, 0, chrono::Utc::now())
         .await
         .unwrap();
     let rid = seed_run(&sched_store, sched.id, sq.id, "q").await;
@@ -1197,6 +2559,91 @@ async fn delete_racing_finish_run_never_orphans_path(pool: PgPool) {
     assert_eq!(sched_store.count_runs(sched.id).await.unwrap(), 0);
 }
 
+/// The same delete against a `since_last` finish, which reaches for the
+/// schedule row that the delete's cascade also needs.
+///
+/// This is a lock CYCLE, not just a race. `SavedQueryStore::delete` ends by
+/// deleting the saved query, and that cascade needs the `schedules` row; a
+/// `since_last` `finish_run` locks `schedules` first and then updates the
+/// run row. With the delete holding the run rows and the finish holding the
+/// schedule, each waits on what the other holds and postgres kills one with
+/// 40P01. If the victim is the finish, the delete has already read that
+/// run's `result_path` as NULL, and the parquet the finish wrote is
+/// orphaned with nobody left to unlink it.
+///
+/// The blocker pins that interleaving by holding the run row: the delete
+/// queues for it first, the finish queues behind, and the rollback releases
+/// them in that order. The fix is the delete taking the schedule lock at
+/// level 2, so both sides walk saved -> schedules -> runs and neither can
+/// wait on a lock the other already holds out of order.
+#[sqlx::test]
+async fn delete_saved_racing_since_last_finish_never_orphans_path(pool: PgPool) {
+    const PATH: &str = "scheduled/race/tiled.parquet";
+    let saved_store = saved(&pool);
+    let sched_store = schedules(&pool);
+    let now = truncate_to_micros(chrono::Utc::now());
+    let sq = saved_store.create(1, "tiled-race", "q").await.unwrap();
+    let sched = sched_store
+        .create_schedule(sq.id, 1, 300, None, Some(ScheduleWindow::SinceLast), 0, now)
+        .await
+        .unwrap();
+    let window = ReportWindow {
+        start: now - chrono::Duration::seconds(300),
+        end: now,
+        truncated: false,
+        kind: WindowKind::SinceLast,
+    };
+    let rid = match sched_store
+        .claim_run(sched.id, sq.id, "q", None, Some(&window))
+        .await
+        .unwrap()
+    {
+        RunClaim::Started(id) => id,
+        other => panic!("expected a started run, got {other:?}"),
+    };
+
+    // Hold the run row: both sides end up wanting it, and the delete asks
+    // first.
+    let mut blocker = pool.begin().await.unwrap();
+    sqlx::query_scalar::<_, i64>("SELECT id FROM report_runs WHERE id = $1 FOR UPDATE")
+        .bind(rid)
+        .fetch_one(&mut *blocker)
+        .await
+        .unwrap();
+
+    let delete_store = saved_store.clone();
+    let sq_id = sq.id;
+    let delete_task = tokio::spawn(async move { delete_store.delete(sq_id, 1).await });
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+    let finish_store = sched_store.clone();
+    let finish_task = tokio::spawn(async move {
+        finish_store
+            .finish_run(rid, RunStatus::Success, 10, Some(1), None, None, Some(PATH))
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+    blocker.rollback().await.unwrap();
+
+    let delete_paths = delete_task
+        .await
+        .unwrap()
+        .unwrap_or_else(|e| panic!("the delete must not be a deadlock victim: {e}"));
+    let finished = finish_task
+        .await
+        .unwrap()
+        .unwrap_or_else(|e| panic!("the finish must not be a deadlock victim: {e}"));
+
+    assert_eq!(
+        delete_paths.contains(&PATH.to_string()),
+        finished == FinishOutcome::Persisted,
+        "exactly one side must own the parquet cleanup: delete returned {delete_paths:?}, \
+         finish returned {finished:?}"
+    );
+    assert_eq!(sched_store.count_runs(sched.id).await.unwrap(), 0);
+}
+
 /// The same race for `ScheduleStore::delete_schedule`: the blocker holds the
 /// schedule row, `finish_run` commits its path mid-delete, and
 /// `delete_schedule` must collect that path rather than cascade it away while
@@ -1207,7 +2654,7 @@ async fn delete_schedule_racing_finish_run_never_orphans_path(pool: PgPool) {
     let sched_store = schedules(&pool);
     let sq_id = seed_saved(&pool, 1, "race").await;
     let sched = sched_store
-        .create_schedule(sq_id, 1, 300, None)
+        .create_schedule(sq_id, 1, 300, None, None, 0, chrono::Utc::now())
         .await
         .unwrap();
     let rid = seed_run(&sched_store, sched.id, sq_id, "q").await;
@@ -1262,6 +2709,116 @@ async fn delete_schedule_racing_finish_run_never_orphans_path(pool: PgPool) {
 /// `boot_unreachable_database_fails_descriptively`.
 async fn boot(url: &str) -> Result<StorageState, StoreError> {
     StorageState::from_pool(common::app_pool(url).await).await
+}
+
+/// 0017's `next_fire_at` backfill multiplies a schedule's `interval_secs`
+/// by one second to extrapolate the next fire, and nothing before this
+/// change bounded that column above 60. `interval * INTERVAL '1 second'`
+/// overflows postgres' interval type far below BIGINT, so one absurd legacy
+/// row would abort the migration and wedge boot for everything behind it.
+///
+/// Surviving the migration is only half of it. A row left above the cap
+/// boots fine and then wedges the SCHEDULER instead: `plan_due_run` cannot
+/// turn `i64::MAX` seconds into a span, so it answers
+/// `PlanError::Arithmetic` and the tick spends a failed transaction on that
+/// schedule every poll, forever, without ever moving its cursor. So the
+/// migration clamps the column, and this test checks the clamp by planning
+/// a run over it.
+///
+/// This drives the real thing: migrate to 0016, plant `i64::MAX`, then
+/// apply 0017 and read back what it wrote.
+#[tokio::test]
+async fn migration_0017_survives_an_absurd_legacy_interval() {
+    let url = common::create_app_database().await;
+    let pool = common::app_pool(&url).await;
+    let migrator = sqlx::migrate::Migrator::new(std::path::Path::new("migrations"))
+        .await
+        .expect("the crate's own migrations directory");
+
+    migrator.run_to(16, &pool).await.expect("migrate to 0016");
+
+    let saved_id: i64 = sqlx::query_scalar(
+        "INSERT INTO saved_queries (key_id, name, query, created_at, updated_at)
+         VALUES (1, 'legacy', 'q', now(), now()) RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let schedule_id: i64 = sqlx::query_scalar(
+        "INSERT INTO schedules (saved_query_id, key_id, interval_secs, created_at, updated_at)
+         VALUES ($1, 1, 9223372036854775807, now(), now()) RETURNING id",
+    )
+    .bind(saved_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    // The backfill only extrapolates for a schedule that has run.
+    sqlx::query(
+        "INSERT INTO report_runs (schedule_id, saved_query_id, query, status, started_at)
+         VALUES ($1, $2, 'q', 'success', now())",
+    )
+    .bind(schedule_id)
+    .bind(saved_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // A second absurd row with NO runs. The backfill gives it now(), so it
+    // is due on the very first tick after upgrade, which is the shape that
+    // makes an unclamped interval a permanent error rather than a problem
+    // ten years out.
+    let due_saved_id: i64 = sqlx::query_scalar(
+        "INSERT INTO saved_queries (key_id, name, query, created_at, updated_at)
+         VALUES (1, 'legacy-due', 'q', now(), now()) RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let due_schedule_id: i64 = sqlx::query_scalar(
+        "INSERT INTO schedules (saved_query_id, key_id, interval_secs, created_at, updated_at)
+         VALUES ($1, 1, 9223372036854775807, now(), now()) RETURNING id",
+    )
+    .bind(due_saved_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    migrator.run(&pool).await.expect("0017 must not abort");
+
+    let next: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT next_fire_at FROM schedules WHERE id = $1")
+            .bind(schedule_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let ten_years = chrono::Duration::seconds(315_360_000);
+    let slack = chrono::Duration::hours(1);
+    let now = chrono::Utc::now();
+    assert!(
+        next > now + ten_years - slack && next < now + ten_years + slack,
+        "the cursor is the capped extrapolation, not an overflow: {next}"
+    );
+
+    let clamped: i64 = sqlx::query_scalar("SELECT interval_secs FROM schedules WHERE id = $1")
+        .bind(schedule_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        clamped, 315_360_000,
+        "the column itself is clamped, not just the arithmetic that read it"
+    );
+
+    // The whole point of the clamp: a due legacy schedule plans. Unclamped
+    // this is Err(Plan(Arithmetic)) on this poll and on every poll after it.
+    let claimed = ScheduleStore::new(pool.clone())
+        .claim_due_run(due_schedule_id, chrono::Utc::now(), 24)
+        .await
+        .expect("a clamped interval must be plannable");
+    assert!(
+        matches!(claimed, DueClaim::Started(_)),
+        "the backfilled cursor is now(), so the schedule is due: got {claimed:?}"
+    );
 }
 
 /// Fresh empty database + the real boot path applies the schema
@@ -5671,4 +7228,217 @@ mod repin_store {
         assert!(matches!(err, StoreError::Validation(_)), "{err:?}");
         assert_eq!(staged(&pool, id).await, (None, None));
     }
+}
+
+/// Read both halves of a saved query back and assert the pair ADR-0018
+/// ruling 7 forbids is not on disk. The check is the rule itself, so the
+/// assertion cannot drift from what the write doors enforce.
+async fn assert_pair_is_legal(
+    saved_store: &SavedQueryStore,
+    sched_store: &ScheduleStore,
+    sq_id: i64,
+) {
+    let dsl = saved_store.get(sq_id, 1).await.unwrap().unwrap().query;
+    let window = sched_store
+        .get_schedule_for_saved_query(sq_id, 1)
+        .await
+        .unwrap()
+        .and_then(|s| s.window);
+    assert_eq!(
+        trawl_server::report_window::validate_window_compatibility(window, &dsl),
+        Ok(()),
+        "committed pair is forbidden: window {window:?} over {dsl:?}"
+    );
+}
+
+/// ADR-0018 ruling 7 forbids exactly one pair — a schedule window over a
+/// query that spells its own interval — and the two write doors that could
+/// assemble it run concurrently.
+///
+/// Neither door can see the other's uncommitted row, so what makes the rule
+/// hold is that both take the `saved_queries` lock FIRST: the loser waits,
+/// then reads what the winner committed and refuses. The blocker
+/// transaction pins the interleaving to the dangerous window by holding
+/// that row exactly as the other door would while its write is in flight.
+///
+/// Both orders are exercised, and the invariant is asserted with the rule
+/// itself: whatever committed, `validate_window_compatibility` must accept
+/// the pair that is on disk at the end.
+#[sqlx::test]
+async fn schedule_put_and_saved_put_cannot_commit_the_forbidden_pair(pool: PgPool) {
+    let saved_store = saved(&pool);
+    let sched_store = schedules(&pool);
+
+    // Order A: the saved-query edit wins the lock, the schedule write waits
+    // and must refuse against the text that landed.
+    let first = saved_store
+        .create(1, "pair-dsl-first", "service=x")
+        .await
+        .unwrap();
+    let mut blocker = pool.begin().await.unwrap();
+    sqlx::query_scalar::<_, i64>("SELECT id FROM saved_queries WHERE id = $1 FOR UPDATE")
+        .bind(first.id)
+        .fetch_one(&mut *blocker)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE saved_queries SET query = $1 WHERE id = $2")
+        .bind("service=x last=1h")
+        .bind(first.id)
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+
+    let window_writer = sched_store.clone();
+    let first_id = first.id;
+    let now = chrono::Utc::now();
+    let task = tokio::spawn(async move {
+        window_writer
+            .set_schedule_checked(
+                first_id,
+                1,
+                3600,
+                None,
+                true,
+                Some(ScheduleWindow::SinceLast),
+                0,
+                now,
+            )
+            .await
+    });
+
+    // Let the schedule write reach the lock before the edit commits.
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    blocker.commit().await.unwrap();
+
+    let err = task
+        .await
+        .unwrap()
+        .expect_err("the window must be refused against the DSL that committed first");
+    assert!(matches!(err, WindowWriteError::Policy(_)), "got {err:?}");
+    assert!(err.to_string().contains("last="), "{err}");
+    assert!(
+        sched_store
+            .get_schedule_for_saved_query(first.id, 1)
+            .await
+            .unwrap()
+            .is_none(),
+        "a refused set_schedule writes no schedule at all"
+    );
+    assert_pair_is_legal(&saved_store, &sched_store, first.id).await;
+
+    // Order B: the window wins the lock, the saved-query edit waits and must
+    // refuse against the window that landed. The blocker inserts the
+    // schedule by hand because it has to happen on the connection holding
+    // the parent row: the FK would otherwise queue behind its own lock.
+    let second = saved_store
+        .create(1, "pair-window-first", "service=x")
+        .await
+        .unwrap();
+    let mut blocker = pool.begin().await.unwrap();
+    sqlx::query_scalar::<_, i64>("SELECT id FROM saved_queries WHERE id = $1 FOR UPDATE")
+        .bind(second.id)
+        .fetch_one(&mut *blocker)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO schedules
+             (saved_query_id, key_id, interval_secs, max_runs, enabled,
+              window_kind, window_secs, lag_secs, covered_through, next_fire_at,
+              created_at, updated_at)
+         VALUES ($1, 1, 3600, NULL, TRUE, 'since_last', NULL, 0, NULL, now(), now(), now())",
+    )
+    .bind(second.id)
+    .execute(&mut *blocker)
+    .await
+    .unwrap();
+
+    let dsl_writer = saved_store.clone();
+    let second_id = second.id;
+    let task = tokio::spawn(async move {
+        dsl_writer
+            .update_checked(second_id, 1, "service=x last=1h", None)
+            .await
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    blocker.commit().await.unwrap();
+
+    let err = task
+        .await
+        .unwrap()
+        .expect_err("the edit must be refused against the window that committed first");
+    assert!(matches!(err, WindowWriteError::Policy(_)), "got {err:?}");
+    assert!(err.to_string().contains("since_last"), "{err}");
+    assert_eq!(
+        saved_store.get(second.id, 1).await.unwrap().unwrap().query,
+        "service=x",
+        "a refused update stores nothing"
+    );
+    assert_pair_is_legal(&saved_store, &sched_store, second.id).await;
+}
+
+/// Every path that writes a `report_runs` row has to take the
+/// `saved_queries` lock first, whether or not its code asks for one.
+/// Inserting a run checks the `saved_query_id` foreign key, and that check
+/// takes FOR KEY SHARE on the parent row. A claim that locked the schedule
+/// and only then inserted would be holding level 2 while waiting for level
+/// 1, which closes a cycle against `set_schedule_checked` walking the same
+/// two levels the right way round. Postgres resolves a cycle by killing one
+/// side with 40P01, so the bug reads as an occasional 500 on a manual run,
+/// or an occasional 500 on the PUT beside it.
+///
+/// The blocker plays `set_schedule_checked`: it holds the saved-query row,
+/// then reaches for the schedule row once the manual claim is in flight.
+#[sqlx::test]
+async fn manual_claim_and_schedule_write_do_not_deadlock(pool: PgPool) {
+    let saved_store = saved(&pool);
+    let sched_store = schedules(&pool);
+    let sq = saved_store
+        .create(1, "manual-order", "service=x")
+        .await
+        .unwrap();
+    sched_store
+        .create_schedule(sq.id, 1, 3600, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
+
+    // Level 1, held open: the first thing `set_schedule_checked` does.
+    let mut blocker = pool.begin().await.unwrap();
+    sqlx::query_scalar::<_, i64>("SELECT id FROM saved_queries WHERE id = $1 FOR UPDATE")
+        .bind(sq.id)
+        .fetch_one(&mut *blocker)
+        .await
+        .unwrap();
+
+    let claimant = sched_store.clone();
+    let sq_id = sq.id;
+    let claim = tokio::spawn(async move { claimant.claim_manual_run(sq_id, 1).await });
+
+    // Let the claim reach whatever it blocks on.
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+    // Level 2, from the transaction that already holds level 1. Under the
+    // old order the claim is holding this row while waiting on the foreign
+    // key, and postgres' deadlock detector fires right here.
+    let second_level = sqlx::query_scalar::<_, i64>(
+        "SELECT id FROM schedules WHERE saved_query_id = $1 FOR UPDATE",
+    )
+    .bind(sq.id)
+    .fetch_one(&mut *blocker)
+    .await;
+    assert!(
+        second_level.is_ok(),
+        "the schedule write deadlocked against the manual claim: {:?}",
+        second_level.err()
+    );
+    blocker.commit().await.unwrap();
+
+    let claimed = claim
+        .await
+        .unwrap()
+        .expect("the manual claim must not deadlock either");
+    assert!(
+        matches!(claimed, ManualRunClaim::Started(_)),
+        "got {claimed:?}"
+    );
 }

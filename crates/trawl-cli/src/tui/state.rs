@@ -545,6 +545,38 @@ impl PanelState {
     }
 }
 
+/// Which row of the set-schedule popup takes typed keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScheduleField {
+    /// How often the schedule fires.
+    #[default]
+    Interval,
+    /// The report window the scheduler covers.
+    Window,
+    /// The late-arrival allowance.
+    Lag,
+}
+
+impl ScheduleField {
+    /// The next row, wrapping from the last back to the first.
+    pub fn next(self) -> Self {
+        match self {
+            Self::Interval => Self::Window,
+            Self::Window => Self::Lag,
+            Self::Lag => Self::Interval,
+        }
+    }
+
+    /// The previous row, wrapping from the first back to the last.
+    pub fn prev(self) -> Self {
+        match self {
+            Self::Interval => Self::Lag,
+            Self::Window => Self::Interval,
+            Self::Lag => Self::Window,
+        }
+    }
+}
+
 /// Active popup overlay.
 #[derive(Debug, Clone)]
 pub enum Popup {
@@ -577,15 +609,10 @@ pub enum Popup {
         /// Error message to display.
         message: String,
     },
-    /// Text input for setting a schedule interval on a saved query.
-    SetSchedule {
-        /// ID of the saved query to schedule.
-        saved_id: i64,
-        /// Name of the query being scheduled.
-        name: String,
-        /// Single-line editor for the interval string.
-        editor: SimpleEditor,
-    },
+    /// Text input for setting a schedule on a saved query: interval, and the
+    /// report window the scheduler owns (ADR-0018 ruling 6). Boxed because
+    /// three editors would otherwise make every `Popup` this variant's size.
+    SetSchedule(Box<ScheduleForm>),
     /// Column picker checklist for toggling visibility and pinning.
     ColumnPicker {
         /// Selected row in the column list.
@@ -611,6 +638,96 @@ pub enum Popup {
         /// Ghost text completion suffix (shown dimmed after cursor).
         ghost: Option<String>,
     },
+}
+
+/// The set-schedule popup's form: one editor per field plus the row that
+/// takes typed keys.
+#[derive(Debug, Clone)]
+pub struct ScheduleForm {
+    /// ID of the saved query to schedule.
+    pub saved_id: i64,
+    /// Name of the query being scheduled.
+    pub name: String,
+    /// How often the schedule fires.
+    pub interval: SimpleEditor,
+    /// The report window: `since_last`, a duration, or empty for query mode,
+    /// where the saved DSL owns its own time bounds.
+    pub window: SimpleEditor,
+    /// The late-arrival allowance. Empty is `0s`.
+    pub lag: SimpleEditor,
+    /// Which of the three rows takes typed keys.
+    pub focus: ScheduleField,
+}
+
+impl ScheduleForm {
+    /// Open the form for one saved query, prefilled from the schedule already
+    /// in force. Prefilling matters: an operator who opens the popup to change
+    /// the interval must not silently drop the window the schedule covers.
+    ///
+    /// A zero lag prefills as empty, because an empty row already means `0s`.
+    pub fn new(
+        saved_id: i64,
+        name: String,
+        schedule: Option<&trawl_api::ScheduleResponse>,
+    ) -> Self {
+        let mut interval = SimpleEditor::new_single_line();
+        let mut window = SimpleEditor::new_single_line();
+        let mut lag = SimpleEditor::new_single_line();
+
+        if let Some(sched) = schedule {
+            interval.insert_text(&sched.interval);
+            if let Some(ref w) = sched.window {
+                window.insert_text(w);
+            }
+            if let Some(ref l) = sched.lag
+                && sched.lag_secs != Some(0)
+            {
+                lag.insert_text(l);
+            }
+        }
+
+        Self {
+            saved_id,
+            name,
+            interval,
+            window,
+            lag,
+            focus: ScheduleField::default(),
+        }
+    }
+
+    /// The editor the next typed key goes to.
+    pub fn focused_mut(&mut self) -> &mut SimpleEditor {
+        match self.focus {
+            ScheduleField::Interval => &mut self.interval,
+            ScheduleField::Window => &mut self.window,
+            ScheduleField::Lag => &mut self.lag,
+        }
+    }
+
+    /// Read the form as the request it will be sent as: `(interval, window,
+    /// lag)`, each trimmed, with an empty window or lag becoming `None` —
+    /// which is what puts a schedule in query mode, or leaves the lag at `0s`.
+    ///
+    /// `None` when the interval is empty, the one field the TUI insists on
+    /// before it calls the server. The window/lag pair is deliberately NOT
+    /// checked here: the server owns that contract and answers a bad
+    /// combination with a 400 naming both sides, so a lag typed without a
+    /// window is sent and the operator reads the server's own sentence
+    /// instead of a second opinion from the client.
+    pub fn submission(&self) -> Option<(String, Option<String>, Option<String>)> {
+        let interval = self.interval.text().trim().to_owned();
+        if interval.is_empty() {
+            return None;
+        }
+
+        let optional = |editor: &SimpleEditor| {
+            let text = editor.text().trim().to_owned();
+            (!text.is_empty()).then_some(text)
+        };
+
+        Some((interval, optional(&self.window), optional(&self.lag)))
+    }
 }
 
 /// Chart visualization mode for results.

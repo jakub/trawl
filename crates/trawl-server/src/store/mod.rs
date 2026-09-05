@@ -42,15 +42,16 @@ pub use catalog::{
     MAX_CONFLICTS_PER_FIELD, MAX_PINNED_FIELDS, PURGE_COMMIT_BOUND, PinProposal, PurgedPin,
     PurgedPins, ServiceCursor, ServiceObservation,
 };
-pub use error::StoreError;
+pub use error::{StoreError, WindowWriteError};
 pub use history::{HistoryEntry, HistoryPage, HistoryStore};
 pub use repin::{
     CutoverOutcome, JobTotals, RepinClaim, RepinJob, RepinJobStatus, RepinPlan, RepinStore,
 };
 pub use saved::{SavedQuery, SavedQueryDetails, SavedQueryStore, ScheduleWithStats};
 pub use schedule::{
-    FinishOutcome, FlipOutcome, ReportRun, RunClaim, Schedule, ScheduleStore, format_interval,
-    parse_interval,
+    ClaimedManualRun, ClaimedRun, DueClaim, DueClaimError, FinishOutcome, FlipOutcome,
+    MAX_DURATION_SECS, ManualRunClaim, ReportRun, RunClaim, Schedule, ScheduleStore,
+    format_interval, parse_duration_secs, parse_interval,
 };
 pub use status::RunStatus;
 

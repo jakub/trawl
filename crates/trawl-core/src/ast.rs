@@ -53,10 +53,16 @@ impl Query {
     /// Whether the search stage is empty (no groups, no time filters, no bounds).
     #[must_use]
     pub fn has_empty_search(&self) -> bool {
-        self.search.groups.iter().all(Vec::is_empty)
-            && self.search.time_filter.is_none()
-            && self.search.earliest.is_none()
-            && self.search.latest.is_none()
+        self.search.groups.iter().all(Vec::is_empty) && self.time_clause().is_none()
+    }
+
+    /// The time clause this query carries, if any. Delegates to
+    /// [`SearchStage::time_clause`], the ONE predicate write policy reads
+    /// (ADR-0018 ruling 7); read it there for why a text scan cannot
+    /// stand in for it.
+    #[must_use]
+    pub fn time_clause(&self) -> Option<TimeClause> {
+        self.search.time_clause()
     }
 
     /// Whether any pipeline stage emits aggregated rows (stats, timechart,
@@ -111,6 +117,67 @@ impl SearchStage {
     /// (e.g. extracting time filters, counting tokens in tests).
     pub fn all_tokens(&self) -> impl Iterator<Item = &Spanned<SearchToken>> {
         self.groups.iter().flat_map(|g| g.iter())
+    }
+
+    /// The time clause this search stage carries, if any: the first
+    /// present of `last=`, `earliest=`, `latest=`.
+    ///
+    /// This is the ONE answer to "does this query own its own window",
+    /// and write policy reads it here (ADR-0018 ruling 7: a schedule
+    /// window and a query time clause may not coexist, in either
+    /// direction). Reading it off the parsed AST is what makes the
+    /// refusal exact. A text scan over the query source
+    /// ([`crate::parser::scan`]) cannot answer the question, in both
+    /// directions. The grammar keywords are also reachable as ordinary
+    /// field names through backticks, so `` `last`=5 `` is a filter on a
+    /// column called `last` and carries no window, while a scanner
+    /// looking for the word would refuse it. And the parser hoists a
+    /// clause out of `NOT` and out of an OR group, so
+    /// `service=x OR last=1h` carries a window that a per-group reading
+    /// of the text would miss.
+    ///
+    /// Which of the three is reported matters only for the message a
+    /// refusal prints. A query carrying two clauses is already the
+    /// emitter's error (`last=` beside an absolute bound).
+    #[must_use]
+    pub fn time_clause(&self) -> Option<TimeClause> {
+        if self.time_filter.is_some() {
+            Some(TimeClause::Last)
+        } else if self.earliest.is_some() {
+            Some(TimeClause::Earliest)
+        } else if self.latest.is_some() {
+            Some(TimeClause::Latest)
+        } else {
+            None
+        }
+    }
+}
+
+/// Which time clause a search stage carries.
+///
+/// The variants are the grammar's closed keyword set
+/// ([`crate::parser::suggest::GRAMMAR_KEYWORDS`]), and
+/// `grammar_keywords_and_time_clause_variants_agree` holds the two in
+/// step: a fourth keyword must teach this enum before it parses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeClause {
+    /// `last=2h`, a duration measured back from now.
+    Last,
+    /// `earliest="…"`, an absolute lower bound, inclusive.
+    Earliest,
+    /// `latest="…"`, an absolute upper bound, exclusive.
+    Latest,
+}
+
+impl TimeClause {
+    /// The DSL keyword that spells this clause.
+    #[must_use]
+    pub fn keyword(self) -> &'static str {
+        match self {
+            Self::Last => "last",
+            Self::Earliest => "earliest",
+            Self::Latest => "latest",
+        }
     }
 }
 
@@ -718,5 +785,68 @@ impl fmt::Display for LiteralValue {
             Self::Bool(b) => write!(f, "{b}"),
             Self::Null => write!(f, "null"),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser;
+    use crate::parser::suggest::GRAMMAR_KEYWORDS;
+
+    fn clause(dsl: &str) -> Option<TimeClause> {
+        parser::parse(dsl)
+            .expect("parse should succeed")
+            .time_clause()
+    }
+
+    /// Drift guard: the enum and the grammar's keyword set are the same
+    /// three words in the same order. A fourth keyword added to the
+    /// parser fails here until [`TimeClause`] learns it, which is what
+    /// keeps the write-policy predicate total (ADR-0018 ruling 7).
+    #[test]
+    fn grammar_keywords_and_time_clause_variants_agree() {
+        let variants = [TimeClause::Last, TimeClause::Earliest, TimeClause::Latest];
+        let spelled: Vec<&'static str> = variants.iter().map(|c| c.keyword()).collect();
+        assert_eq!(spelled.as_slice(), GRAMMAR_KEYWORDS);
+    }
+
+    #[test]
+    fn each_keyword_reports_its_own_variant() {
+        assert_eq!(clause("last=1h"), Some(TimeClause::Last));
+        assert_eq!(
+            clause(r#"earliest="2026-01-01T00:00:00Z""#),
+            Some(TimeClause::Earliest)
+        );
+        assert_eq!(
+            clause(r#"latest="2026-01-01T00:00:00Z""#),
+            Some(TimeClause::Latest)
+        );
+    }
+
+    /// The parser hoists a time clause out of `NOT` and out of an OR
+    /// group, so both queries carry a window even though the keyword
+    /// never sits at the top level of the token list.
+    #[test]
+    fn a_hoisted_clause_still_counts() {
+        assert_eq!(clause("NOT last=1h"), Some(TimeClause::Last));
+        assert_eq!(clause("service=x OR last=1h"), Some(TimeClause::Last));
+    }
+
+    /// A backticked `last` is a field name, not the keyword: the whole
+    /// reason this predicate reads the AST instead of the query text.
+    #[test]
+    fn a_backticked_keyword_is_a_field_filter_not_a_window() {
+        assert_eq!(clause("`last`=5"), None);
+    }
+
+    #[test]
+    fn a_query_without_a_time_clause_carries_none() {
+        assert_eq!(clause("service=nginx"), None);
+        assert_eq!(clause("| stats count()"), None);
     }
 }

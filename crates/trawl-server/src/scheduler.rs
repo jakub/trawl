@@ -11,6 +11,7 @@
 
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
@@ -19,7 +20,8 @@ use fleet_auth::KeyStore;
 use crate::config::SchedulerConfig;
 use crate::policy::{Permission, TrawlAuthz as _};
 use crate::pool::ExecutorPool;
-use crate::store::{FinishOutcome, FlipOutcome, RunStatus, ScheduleStore};
+use crate::report_window::{format_window_bound, truncate_to_micros};
+use crate::store::{ClaimedRun, DueClaim, FinishOutcome, FlipOutcome, RunStatus, ScheduleStore};
 
 /// Spawn the scheduler background task.
 ///
@@ -92,7 +94,25 @@ async fn scheduler_loop(
             }
         }
 
-        poll_and_execute(&schedule_store, &key_store, &pool, &config, timeout_secs).await;
+        // ONE clock reading per tick, truncated to the microsecond every
+        // stored bound shares (postgres TIMESTAMPTZ, DuckDB TIMESTAMP, and
+        // the rendered `earliest=`/`latest=` text). Sampling per schedule
+        // would let two schedules in the same poll disagree about which
+        // boundary has passed.
+        let now = truncate_to_micros(chrono::Utc::now());
+        // Dropping the handles detaches the executions: each records its own
+        // outcome through `finish_run`, so the loop never waits on one.
+        drop(
+            poll_and_execute(
+                &schedule_store,
+                &key_store,
+                &pool,
+                &config,
+                timeout_secs,
+                now,
+            )
+            .await,
+        );
 
         // Periodic retention cleanup.
         retention_counter += 1;
@@ -123,13 +143,26 @@ async fn scheduler_loop(
     }
 }
 
-async fn poll_and_execute(
+/// One scheduler tick: claim and spawn every schedule due at `now`.
+///
+/// `now` is a parameter rather than a clock reading, and [`scheduler_loop`]
+/// samples it once per tick, so every schedule in a poll is judged against
+/// the same instant. Tests drive this function directly with an explicit
+/// instant: tiling, catch-up clamping and lag are all statements about
+/// hours of coverage, and there is no other way to make them fast.
+///
+/// Returns the spawned execution tasks. The loop drops them — each run
+/// records its own outcome through `finish_run` — and tests await them.
+pub async fn poll_and_execute(
     schedule_store: &ScheduleStore,
     key_store: &KeyStore,
     pool: &ExecutorPool,
     config: &SchedulerConfig,
     timeout_secs: u64,
-) {
+    now: DateTime<Utc>,
+) -> Vec<JoinHandle<()>> {
+    let mut spawned = Vec::new();
+
     let schedules = match schedule_store.list_enabled_schedules().await {
         Ok(s) => s,
         Err(e) => {
@@ -138,87 +171,95 @@ async fn poll_and_execute(
                 error = %e,
                 "failed to list enabled schedules"
             );
-            return;
+            return spawned;
         }
     };
 
-    for (schedule, saved_query) in schedules {
-        let should_run = match schedule_store.latest_run(schedule.id).await {
-            Ok(Some(last)) => {
-                let elapsed = chrono::Utc::now()
-                    .signed_duration_since(last.started_at)
-                    .num_seconds()
-                    .unsigned_abs();
-                elapsed >= schedule.interval_secs
-            }
-            Ok(None) => true, // Never run before.
-            Err(e) => {
-                tracing::warn!(
-                    event_type = "scheduler_error",
-                    schedule_id = schedule.id,
-                    error = %e,
-                    "failed to check latest run"
-                );
-                false
-            }
-        };
-
-        if !should_run {
-            continue;
-        }
-
-        // Gate on key liveness in the fleet keystore.
+    // The listing is the enumeration and nothing more: which schedules
+    // exist. Every value the run depends on — cadence, window, watermark,
+    // and above all the saved DSL — is re-read inside `claim_due_run`,
+    // under the row locks it takes.
+    for (schedule, _saved_query) in schedules {
+        // Key liveness comes BEFORE the claim, so an unusable key leaves the
+        // fire cursor exactly where it was. The cursor is the coverage
+        // boundary: skipping the claim means a `since_last` schedule covers
+        // the whole outage in one window once the key is usable again,
+        // instead of losing every boundary that passed while it was not.
         if !owning_key_is_usable(key_store, schedule.id, schedule.key_id).await {
             continue;
         }
 
-        // Claim a run in one transaction: the max_runs check and the insert
-        // are atomic (FOR UPDATE on the schedule row), and the partial
-        // unique index rejects a second concurrent 'running' row.
-        let run_id = match schedule_store
-            .claim_run(
-                schedule.id,
-                saved_query.id,
-                &saved_query.query,
-                schedule.max_runs,
-            )
+        // Plan, materialize, claim and move the cursor — one transaction.
+        let claimed = match schedule_store
+            .claim_due_run(schedule.id, now, config.max_catchup_intervals)
             .await
         {
-            Ok(crate::store::RunClaim::Started(id)) => id,
-            Ok(crate::store::RunClaim::AlreadyRunning | crate::store::RunClaim::MaxRunsReached) => {
-                continue;
-            }
+            Ok(DueClaim::Started(claimed)) => claimed,
+            Ok(
+                DueClaim::NotDue
+                | DueClaim::Advanced
+                | DueClaim::AlreadyRunning
+                | DueClaim::MaxRunsReached,
+            ) => continue,
             Err(e) => {
+                // The class, never the message: a window failure's Display
+                // can quote the saved DSL and the parser's own text, and
+                // this event lands in the retained `service=trawld` corpus.
                 tracing::error!(
                     event_type = "scheduler_error",
                     schedule_id = schedule.id,
-                    error = %e,
-                    "failed to start run"
+                    error_class = e.class(),
+                    "failed to claim a due run; the schedule's fire cursor is unchanged"
                 );
                 continue;
             }
         };
 
-        // Spawn execution as a separate task so it doesn't block the poll loop.
+        if let Some(window) = claimed.window
+            && window.truncated
+        {
+            metrics::counter!(crate::metrics::SCHEDULER_WINDOW_TRUNCATED_TOTAL).increment(1);
+            // The bounds are instants, not operator text, so they are safe
+            // as event fields. They are fields and never metric labels: an
+            // instant is unbounded cardinality.
+            tracing::warn!(
+                event_type = "scheduler_window_truncated",
+                schedule_id = schedule.id,
+                run_id = claimed.run_id,
+                window_start = %format_window_bound(window.start),
+                window_end = %format_window_bound(window.end),
+                "report window clamped to max_catchup_intervals; the span before its start stays uncovered"
+            );
+        }
+
+        // Execute the text the claim RESOLVED and stored, never the saved
+        // DSL from the listing: with a window those two differ by the very
+        // bounds the run row claims to cover.
+        let ClaimedRun {
+            run_id,
+            query_name,
+            resolved_query,
+            ..
+        } = claimed;
         let store = schedule_store.clone();
         let pool = pool.clone();
-        let query = saved_query.query.clone();
-        let query_name = saved_query.name.clone();
         let max_rows = config.report_max_rows;
 
-        tokio::spawn(async move {
+        spawned.push(tokio::spawn(async move {
             execute_scheduled_query(
                 store,
                 pool,
                 run_id,
-                &query,
+                &resolved_query,
                 &query_name,
                 max_rows,
                 timeout_secs,
             )
             .await;
-        });
+        }));
     }
+
+    spawned
 }
 
 /// Whether the schedule's owning key may still run scheduled queries.
@@ -503,6 +544,20 @@ pub(crate) fn remove_result_file(base_dir: &str, relative: &str) -> bool {
 ///
 /// Returns `(Some(relative_path), None)` on success, or `(None, Some(blob))`
 /// as a zstd-JSON fallback if parquet writing fails.
+///
+/// A ZERO-ROW result always takes the blob. Parquet cannot carry it: the
+/// writer serialises the rows as ndjson and lets `read_json` infer the
+/// schema, so with no rows there is no schema to write and
+/// `write_query_result_to_parquet` returns without creating a file. The blob
+/// is the one representation that keeps the column NAMES, it is what
+/// `get_report_run` already reads back, and it is what
+/// `from_saved::resolve_latest` turns into an empty typed source. It also
+/// costs almost nothing: a few dozen bytes of compressed JSON for a run
+/// whose whole content is its header.
+///
+/// Recording it matters because `run=latest` resolves the NEWEST successful
+/// run and refuses to look past it. A run persisted with neither a path nor
+/// a blob would be a success nothing can read (ADR-0018 ruling 13).
 fn write_result_parquet(
     pool: &ExecutorPool,
     run_id: i64,
@@ -510,7 +565,7 @@ fn write_result_parquet(
     result: &trawl_api::value::QueryResult,
 ) -> (Option<String>, Option<Vec<u8>>) {
     if result.rows.is_empty() {
-        return (None, None);
+        return zstd_fallback(result);
     }
 
     let base = pool.base_dir().trim_end_matches('/');
@@ -569,12 +624,42 @@ fn write_result_parquet(
     (Some(relative), None)
 }
 
-/// Compress a `QueryResult` as a zstd JSON blob (fallback when parquet write fails).
+/// Compress a `QueryResult` as a zstd JSON blob (the representation for a
+/// zero-row run, and the fallback when a parquet write fails).
 fn zstd_fallback(result: &trawl_api::value::QueryResult) -> (Option<String>, Option<Vec<u8>>) {
     let blob = serde_json::to_vec(result)
         .ok()
         .and_then(|json| zstd::encode_all(json.as_slice(), 3).ok());
     (None, blob)
+}
+
+/// Read back what [`zstd_fallback`] wrote: a zstd-compressed JSON
+/// `QueryResult`, or `None` for an absent or unreadable blob.
+///
+/// Lives beside the writer so the two halves of the representation are one
+/// pair. Both readers call it: `get_report_run`, which serves the run over
+/// HTTP, and `from_saved::resolve_latest`, which turns a zero-row run's
+/// column names back into a queryable source.
+pub(crate) fn decode_result_blob(blob: Option<Vec<u8>>) -> Option<trawl_api::value::QueryResult> {
+    let compressed = blob?;
+    let decompressed = zstd::decode_all(compressed.as_slice())
+        .inspect_err(|e| {
+            tracing::warn!(
+                event_type = "run_result_blob_zstd_decode_failed",
+                error = %e,
+                "failed to zstd-decode a report run's result blob"
+            );
+        })
+        .ok()?;
+    serde_json::from_slice::<trawl_api::value::QueryResult>(&decompressed)
+        .inspect_err(|e| {
+            tracing::warn!(
+                event_type = "run_result_blob_deserialize_failed",
+                error = %e,
+                "failed to deserialize a report run's result blob"
+            );
+        })
+        .ok()
 }
 
 /// Pg-backed coverage for the ambiguous-commit recovery *wiring* — the
@@ -598,11 +683,11 @@ mod pg_tests {
         let sched_store = ScheduleStore::new(pool.clone());
         let saved = saved_store.create(1, name, "q").await.unwrap();
         let sched = sched_store
-            .create_schedule(saved.id, 1, 300, None)
+            .create_schedule(saved.id, 1, 300, None, None, 0, chrono::Utc::now())
             .await
             .unwrap();
         let rid = match sched_store
-            .claim_run(sched.id, saved.id, "q", None)
+            .claim_run(sched.id, saved.id, "q", None, None)
             .await
             .unwrap()
         {

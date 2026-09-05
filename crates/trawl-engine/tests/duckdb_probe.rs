@@ -5239,3 +5239,100 @@ fn the_anchor_literal_parses_at_every_year_chrono_can_render() {
         assert_eq!(inlined, bound, "{literal} must denote the bound instant");
     }
 }
+
+// ---------------------------------------------------------------------------
+// The absolute time window is half-open: [earliest, latest)
+// ---------------------------------------------------------------------------
+
+/// Bind an emitted query's parameters the way the executor does.
+fn bound(emitted: &trawl_core::emitter::EmittedQuery) -> Vec<Box<dyn duckdb::ToSql>> {
+    emitted
+        .params
+        .iter()
+        .map(|value| -> Box<dyn duckdb::ToSql> {
+            match value {
+                trawl_core::emitter::SqlValue::String(value) => Box::new(value.clone()),
+                trawl_core::emitter::SqlValue::Int(value) => Box::new(*value),
+                trawl_core::emitter::SqlValue::Float(value) => Box::new(*value),
+                trawl_core::emitter::SqlValue::Bool(value) => Box::new(*value),
+                trawl_core::emitter::SqlValue::Timestamp(value) => {
+                    Box::new(duckdb::types::Value::Timestamp(
+                        duckdb::types::TimeUnit::Microsecond,
+                        value.and_utc().timestamp_micros(),
+                    ))
+                }
+            }
+        })
+        .collect()
+}
+
+/// Run a DSL query's EMITTED sql over `file` and return the matching ids.
+/// The WHERE clause is never handwritten here: the point is what the
+/// emitter produces, executed.
+fn matching_ids(conn: &duckdb::Connection, file: &std::path::Path, dsl: &str) -> Vec<String> {
+    let query = trawl_core::parser::parse(dsl).unwrap_or_else(|e| panic!("{dsl} parses: {e:?}"));
+    let emitted = trawl_core::emitter::emit_with_pins(
+        &query,
+        &file.display().to_string(),
+        &trawl_core::schema::FieldTypes::new(),
+        trawl_core::context::EvalContext::capture(),
+    )
+    .unwrap_or_else(|e| panic!("{dsl} emits: {e:?}"));
+    let params = bound(&emitted);
+    let param_refs: Vec<&dyn duckdb::ToSql> = params.iter().map(AsRef::as_ref).collect();
+    let sql = format!("SELECT id FROM ({}) AS matched ORDER BY id", emitted.sql);
+    let mut statement = conn
+        .prepare(&sql)
+        .unwrap_or_else(|e| panic!("{dsl} prepares:\n{sql}\n{e}"));
+    statement
+        .query_map(param_refs.as_slice(), |row| row.get::<_, String>(0))
+        .unwrap_or_else(|e| panic!("{dsl} runs:\n{sql}\n{e}"))
+        .map(Result::unwrap)
+        .collect()
+}
+
+/// The window `earliest=`/`latest=` describes is half-open, and this is
+/// the boundary microsecond that says so: an event stamped exactly `T`
+/// is INSIDE `earliest="T"` and OUTSIDE `latest="T"` (ADR-0018 ruling
+/// 10). That is what lets a scheduler tile consecutive report windows
+/// `[a, b)`, `[b, c)` without the event at `b` landing in both runs.
+///
+/// Executed against real parquet through the emitter's own SQL, because
+/// a bound this design leans on should be pinned by what `DuckDB`
+/// answers, not by reading `>=` and `<` in the emitter.
+#[test]
+fn the_absolute_time_window_is_half_open_at_the_microsecond() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("events.parquet");
+    let conn = conn();
+    // T = 2026-03-14T03:00:00.123456Z, and its two microsecond neighbours.
+    conn.execute_batch(&format!(
+        "COPY (SELECT * FROM (VALUES \
+         ('before', TIMESTAMP '2026-03-14 03:00:00.123455'), \
+         ('at', TIMESTAMP '2026-03-14 03:00:00.123456'), \
+         ('after', TIMESTAMP '2026-03-14 03:00:00.123457')) AS t(id, \"_time\")) \
+         TO '{}' (FORMAT PARQUET)",
+        file.display()
+    ))
+    .unwrap();
+
+    assert_eq!(
+        matching_ids(&conn, &file, r#"earliest="2026-03-14T03:00:00.123456Z""#),
+        vec!["after".to_owned(), "at".to_owned()],
+        "earliest= is inclusive: the event AT the bound matches"
+    );
+    assert_eq!(
+        matching_ids(&conn, &file, r#"latest="2026-03-14T03:00:00.123456Z""#),
+        vec!["before".to_owned()],
+        "latest= is exclusive: the event AT the bound does not match"
+    );
+    assert_eq!(
+        matching_ids(
+            &conn,
+            &file,
+            r#"earliest="2026-03-14T03:00:00.123456Z" latest="2026-03-14T03:00:00.123457Z""#
+        ),
+        vec!["at".to_owned()],
+        "a one-microsecond window holds exactly the event at its start"
+    );
+}

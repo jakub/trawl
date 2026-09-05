@@ -8,6 +8,8 @@
 //! name), never by message text. Every constraint in
 //! `crates/trawl-server/migrations/` is named so this map stays exact.
 
+use crate::report_window::WindowPolicyError;
+
 /// Errors from every app-state store facade.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -69,6 +71,31 @@ pub enum StoreError {
     IntervalTooShort {
         /// The requested interval in seconds.
         secs: u64,
+    },
+
+    /// A duration exceeded [`crate::store::MAX_DURATION_SECS`]. Every
+    /// duration the schedule grammar parses becomes date arithmetic, so the
+    /// grammar bounds them all rather than each consumer proving itself
+    /// total.
+    #[error(
+        "duration {secs}s exceeds the maximum of {} seconds (10 years)",
+        crate::store::MAX_DURATION_SECS
+    )]
+    DurationTooLong {
+        /// The requested duration in seconds.
+        secs: u64,
+    },
+
+    /// A report-window `lag` was given on a schedule with no window
+    /// (ADR-0018 ruling 6). The handler turns this into a 400.
+    #[error(
+        "lag {lag_secs}s needs a report window: without `window` the saved query owns \
+         its own time clause and trawl shifts no bounds. Set window to \"since_last\" \
+         or a duration, or drop lag"
+    )]
+    LagWithoutWindow {
+        /// The requested lag in seconds.
+        lag_secs: u64,
     },
 
     /// Saved query name contains invalid characters.
@@ -186,12 +213,47 @@ impl StoreError {
             Self::Validation(_) => "validation",
             Self::InvalidInterval { .. } => "invalid_interval",
             Self::IntervalTooShort { .. } => "interval_too_short",
+            Self::DurationTooLong { .. } => "duration_too_long",
             Self::InvalidName { .. } => "invalid_name",
+            Self::LagWithoutWindow { .. } => "lag_without_window",
             Self::RepinAlreadyRunning => "repin_already_running",
             Self::PurgeCommitUnknown => "purge_commit_unknown",
             Self::PurgePrepareTimeout => "purge_prepare_timeout",
             Self::RepinPinVanished { .. } => "repin_pin_vanished",
         }
+    }
+}
+
+/// The error of a store write that first had to prove a schedule window and
+/// a saved query's text compatible (ADR-0018 rulings 7 and 12).
+///
+/// Two write paths reach that rule from opposite sides —
+/// [`crate::store::ScheduleStore::set_schedule_checked`] attaches a window
+/// to standing text, [`crate::store::SavedQueryStore::update_checked`]
+/// replaces the text under a standing window — and both can fail either as
+/// a store fault or as a policy refusal. They stay apart because the wire
+/// treatments differ: a store fault is redacted or mapped by SQLSTATE,
+/// while the refusal is the operator's own two inputs and reaches the
+/// client intact.
+///
+/// It is deliberately not a [`StoreError`] variant, for the reason
+/// [`crate::store::DueClaimError`] gives: `ServerError` already maps
+/// [`WindowPolicyError`] to a 400 that keeps its message, and a second
+/// route to the same wire would be free to drift from the first.
+#[derive(Debug, thiserror::Error)]
+pub enum WindowWriteError {
+    /// The app-state store failed.
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    /// The window and the query text cannot both say what the report
+    /// covers.
+    #[error(transparent)]
+    Policy(#[from] WindowPolicyError),
+}
+
+impl From<sqlx::Error> for WindowWriteError {
+    fn from(e: sqlx::Error) -> Self {
+        Self::Store(StoreError::from(e))
     }
 }
 

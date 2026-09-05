@@ -1,0 +1,28 @@
+---
+source: crates/trawl-cli/src/tui/ui/mod.rs
+expression: terminal.backend().to_string()
+---
+" M-1 Query   M-2 History   M-3 Schema   M-4 Saved                                         "
+"                                                                                          "
+"┌ Query Editor ──────────────────────────────────────────────────────────────────────────┐"
+"│                                                                                        │"
+"│                                                                                        │"
+"│                                                                                        │"
+"│             ┌ Set Schedule ───────────────────────────────────────────────┐            │"
+"│             │nightly errors                                               │            │"
+"│             │                                                             │            │"
+"│             │interval  1h                                                 │            │"
+"│             │window    since_last█                                        │            │"
+"└─────────────│lag       5m | empty = 0s                                    │────────────┘"
+"┌ Results ────│                                                             │────────────┐"
+"│             │Tab next field  Enter save  Esc cancel                       │            │"
+"│             │                                                             │            │"
+"│             │                                                             │            │"
+"│             └─────────────────────────────────────────────────────────────┘            │"
+"│                                     Quit: Ctrl+Q                                       │"
+"│                                     Docs: https://trawl.sh                             │"
+"│                                                                                        │"
+"│                                   Client: 0.4.0                                        │"
+"│                                   Server: —                                            │"
+"└────────────────────────────────────────────────────────────────────────────────────────┘"
+" [editor]                              Shift+Enter: execute | Ctrl+S: save | Ctrl+L: clear"

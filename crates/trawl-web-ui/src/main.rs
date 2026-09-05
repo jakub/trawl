@@ -17,6 +17,7 @@ mod perms;
 mod query_merge;
 mod repin_flow;
 mod repin_hint;
+mod schedule_edit;
 mod schema_nav;
 mod service_card_fmt;
 mod severity_cell;

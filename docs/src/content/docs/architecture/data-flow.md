@@ -280,6 +280,134 @@ A hot-only fallback is permitted only when it cannot hide cold data: on a genuin
 
 **The gate is lane-independent.** All four read lanes — query and parquet export, each with and without a hot buffer — classify their outcome the same way and route it through the same decision table, so a query running with an empty hot buffer answers exactly as one running with a full one. That matters more than it sounds: an empty hot buffer takes the *no-hot* code path, which is the state any install reaches after an idle minute. A read that answers "no files" while its source still reaches files on disk returns a retryable `503 cold_data_unread` on every lane, never an empty success. A source that genuinely reaches nothing is the one shape where an empty answer is the truth: a query returns zero rows, and an export surfaces the underlying error, because there is no empty result for it to write.
 
+## Scheduled reports
+
+A saved query plus a schedule is a report: trawld runs the query on a
+fixed interval and stores each result. What each run *covers* is the
+schedule's business, not the query text's (ADR-0018). A nightly schedule
+over a saved `last=2h` used to report 2 of every 24 hours, and a run that
+started late reported a different 2 hours than the one before it.
+
+### Window modes
+
+A schedule has one of three modes.
+
+`window = "since_last"` tiles. Each run covers `[the previous run's window
+end, this fire - lag)`, so consecutive runs cover consecutive intervals
+with no gap and no overlap. This is the mode for anything you intend to
+add up across runs.
+
+`window = "<duration>"` is a fixed trailing span, re-measured from every
+fire: a run at 03:00 with `window = "2h"` covers `[01:00, 03:00)`
+regardless of what the last run did. It keeps no watermark, so a missed
+fire is simply a missing run and nothing heals it. A span that differs
+from the interval is allowed and sometimes wanted: `interval = "1h",
+window = "2h"` gives every report an hour of overlap with its predecessor,
+which is how you write a rolling two-hour view; `interval = "1h", window =
+"30m"` samples half of each hour on purpose. Neither is a mistake trawl
+should correct, so it does not.
+
+No `window` is query mode, the shape schedules had before this: the saved
+DSL executes verbatim, time clause and all, and the run records no bounds.
+
+`lag` shifts both bounds back on either mode. With `lag = "5m"` the 03:00
+run covers up to 02:55, not 03:00, so an event stamped 02:54 that only
+reached the corpus at 02:58 is still inside the window that counts it. The
+axis is `_time`, the sender's own timestamp, which is what makes a report
+agree with an interactive query over the same interval and lets the
+partition layout prune the read. `lag` is the allowance for that choice.
+
+### Planned boundaries
+
+The scheduler fires on a planned cursor, `next_fire_at`, not on elapsed
+time since the last run started. A run that takes 90 seconds, a poll that
+lands 8 seconds late, a restart: none of them move the cursor. Each tick
+samples one instant, and every schedule in that tick is judged against it.
+
+When several boundaries have passed (the daemon was down, or the previous
+run was still going), the tick takes the *latest* boundary at or before
+now and moves the cursor one interval past it. Missed fires never replay
+as N runs.
+
+### The watermark
+
+A `since_last` schedule keeps `covered_through`, the end of the newest
+window a successful run covered. It advances only on success, only for a
+run claimed in `since_last` mode, and only when that run's end is later
+than what is already covered, so a slow run finishing after a later one
+cannot rewind coverage. A failed or timed-out run leaves it alone, and the
+next success covers its own interval and the failed one in a single
+window.
+
+It is seeded when the schedule is created, at `next_fire_at - interval -
+lag`, which is the origin of what the schedule owes. Seeding matters for
+exactly one case: if the *first* run fails, an unset watermark would send
+the next run back to "one interval ending at my own fire" and the failed
+interval would be dropped with nothing recording the loss.
+
+### Catch-up and the clamp
+
+Without a cap, coalescing would be unbounded: a week of downtime would
+hand the next run a week-wide window and one enormous query. So a gap
+wider than `max_catchup_intervals` intervals (config, default 24) clamps
+the window start forward to `window_end - max_catchup_intervals *
+interval`. The run then carries `window_truncated: true` and increments
+`trawl_scheduler_window_truncated_total`.
+
+Alert on that counter. A truncated run is the one case where coverage is
+permanently missing from the report series, and the run row is the only
+place that says so.
+
+### A worked example
+
+Hourly schedule, `window = "since_last"`, `lag = "5m"`, created at
+2026-03-14T02:00:00Z. Creation seeds `covered_through` to 00:55 and sets
+`next_fire_at` to 02:00.
+
+| fire | window | outcome | `covered_through` after |
+|------|--------|---------|-------------------------|
+| 03-14 02:00 | `[00:55, 01:55)` | success | 01:55 |
+| 03-14 03:00 | `[01:55, 02:55)` | success | 02:55 |
+| 03-14 04:00 | `[02:55, 03:55)` | error | 02:55, unchanged |
+| 03-14 05:00 | `[02:55, 04:55)` | success | 04:55 |
+| 03-16 09:00 | `[03-15 08:55, 03-16 08:55)`, truncated | success | 03-16 08:55 |
+
+The 05:00 run is the healing one: two intervals in a single window,
+because 04:00 failed and left the watermark standing.
+
+Then trawld is down from 03-14 05:30 until 03-16 09:03. The tick at 09:03
+takes 09:00 as its boundary (the fires at 06:00, 07:00, 08:00 on the 14th
+and every fire on the 15th are folded in, not replayed), and asks for
+`[03-14 04:55, 03-16 08:55)`. That is 52 hours against a bound of 24, so
+the start is clamped to 03-15 08:55 and the run is flagged. The 28 hours
+from 03-14 04:55 to 03-15 08:55 are not in any report and will not be.
+They are still in the corpus: query them interactively with
+`earliest=`/`latest=`.
+
+The 03:00 run's stored `query` is the saved DSL with
+`earliest="2026-03-14T01:55:00.000000Z" latest="2026-03-14T02:55:00.000000Z" `
+in front of it. Paste it into `trawl query` and you get that report back.
+
+### Editing a schedule
+
+Changing the interval or the window re-anchors `next_fire_at` to now: the
+cadence you asked for starts from the edit. Changing `max_runs` or
+flipping `enabled` leaves the cursor alone, so repeated edits cannot keep
+a schedule permanently un-due.
+
+An existing `covered_through` is never cleared by an edit, to the schedule
+or to the saved DSL. The per-run resolved text is the audit trail, and a
+watermark reset would silently re-report or skip coverage. An *absent* one
+is seeded at the new origin when the edit re-anchors a `since_last`
+schedule, for the reason seeding exists at creation. If an edit leaves the
+watermark at or past the window a fire would cover, the tick advances the
+cursor and runs nothing rather than asking the same question every poll.
+
+Deleting the schedule (or the saved query above it) takes the watermark
+and every run row with it, and the result files those rows pointed at are
+unlinked after the transaction commits. Recreating the schedule starts a
+fresh origin, not the old coverage.
+
 ## SSE streaming
 
 A completely separate code path from SQL queries. `CompiledFilter` compiles the search stage of the DSL into an in-memory matcher using aho-corasick for text search and regex for glob patterns. Events are filtered against the broadcast channel, not DuckDB.
