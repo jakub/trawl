@@ -242,8 +242,7 @@ pub fn Search() -> impl IntoView {
         let current_mode = mode.get();
         let q = effective_q.get();
         stream_handle.update_value(|slot| *slot = None);
-        // Keep the push counter monotonic so a new query cannot reuse row keys.
-        ring.update(|r| r.events.clear());
+        ring.set(RingBuffer::default());
         live_snapshot.set(None);
         lagged.set(None);
 
@@ -276,10 +275,7 @@ pub fn Search() -> impl IntoView {
         trawl_core::parser::parse(&q).is_ok_and(|ast| ast.has_aggregation())
     });
 
-    let ring_result = Memo::new(move |_| {
-        let ring = ring.read();
-        (ring.epoch, ring_to_result(&ring))
-    });
+    let ring_result = Memo::new(move |_| ring_to_result(&ring.read()));
 
     let loading =
         Signal::derive(move || !effective_q.get().trim().is_empty() && rows.get().is_none());
@@ -434,59 +430,42 @@ pub fn Search() -> impl IntoView {
 
 /// Simple table rendering for the ring-buffered raw-event live feed.
 #[component]
-fn LiveRawTable(#[prop(into)] result: Signal<(u64, QueryResult)>) -> impl IntoView {
-    // Rows hold immutable cells. A column change gives them new keys so their
-    // cells are rebuilt in the current first-seen column order.
-    let columns = Memo::new(move |previous: Option<&(u64, Vec<String>)>| {
-        let names =
-            result.with(|(_, r)| r.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>());
-        let version = previous.map_or(0, |(version, old)| {
-            version.wrapping_add(u64::from(old != &names))
-        });
-        (version, names)
-    });
+fn LiveRawTable(#[prop(into)] result: Signal<QueryResult>) -> impl IntoView {
     view! {
         <div class="results">
-            <Show
-                when=move || result.with(|(_, r)| !r.columns.is_empty())
-                fallback=|| view! {
-                    <div class="results-empty">"Streaming — waiting for first event…"</div>
-                }
-            >
-                <div class="results-table-wrap">
-                    <table class="results-table">
-                        <thead>
-                            <tr>
-                                {move || columns.with(|(_, names)| names.iter().map(|name| view! {
-                                    <th>{name.clone()}</th>
-                                }).collect::<Vec<_>>())}
-                            </tr>
-                        </thead>
-                        <tbody>
-                            <For
-                                each=move || {
-                                    let version = columns.read().0;
-                                    result.with(|(epoch, r)| {
-                                        let first = epoch.wrapping_sub(r.rows.len() as u64);
-                                        r.rows.iter().enumerate().map(|(index, row)| {
-                                            (first.wrapping_add(index as u64), version, row.clone())
-                                        }).collect::<Vec<_>>()
-                                    })
-                                }
-                                key=|(id, version, _)| (*id, *version)
-                                children=|(_, _, row)| view! {
+            {move || {
+                let r = result.get();
+                if r.columns.is_empty() {
+                    view! {
+                        <div class="results-empty">"Streaming — waiting for first event…"</div>
+                    }.into_any()
+                } else {
+                    let columns: Vec<String> = r.columns.iter().map(|c| c.name.clone()).collect();
+                    let rows = r.rows.clone();
+                    view! {
+                        <div class="results-table-wrap">
+                            <table class="results-table">
+                                <thead>
                                     <tr>
-                                        {row.iter().map(|v| {
-                                            let s = trawl_api::display::value_to_string(v);
-                                            view! { <td>{s}</td> }
+                                        {columns.iter().cloned().map(|name| view! {
+                                            <th>{name}</th>
                                         }).collect::<Vec<_>>()}
                                     </tr>
-                                }
-                            />
-                        </tbody>
-                    </table>
-                </div>
-            </Show>
+                                </thead>
+                                <tbody>
+                                    {rows.iter().map(|row| {
+                                        let cells = row.iter().map(|v| {
+                                            let s = trawl_api::display::value_to_string(v);
+                                            view! { <td>{s}</td> }
+                                        }).collect::<Vec<_>>();
+                                        view! { <tr>{cells}</tr> }
+                                    }).collect::<Vec<_>>()}
+                                </tbody>
+                            </table>
+                        </div>
+                    }.into_any()
+                }
+            }}
         </div>
     }
 }
