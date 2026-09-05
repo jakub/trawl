@@ -15,7 +15,7 @@
 //! transient overcount is acceptable, while invisible events (missing
 //! from both sources) are not.
 
-use std::io::Write as _;
+use std::io::{BufWriter, Write as _};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -282,6 +282,9 @@ impl HotBuffer {
         let (pioneer, keys) = survey_schema(events.iter().map(|(_, e)| *e));
 
         let mut tmpfile = tempfile::Builder::new().suffix(".ndjson").tempfile().ok()?;
+        // serde_json emits many small writes per event. Buffer them before
+        // crossing into the filesystem, then flush before publishing the file.
+        let mut writer = BufWriter::new(&mut tmpfile);
         let mut wrote_any = false;
 
         let order = (0..events.len())
@@ -295,9 +298,9 @@ impl HotBuffer {
             // Serialization failure is very unlikely (the event parsed during
             // ingest), but log and skip rather than poisoning the whole
             // snapshot.
-            match serde_json::to_writer(&mut tmpfile, event) {
+            match serde_json::to_writer(&mut writer, event) {
                 Ok(()) => {
-                    if let Err(e) = tmpfile.write_all(b"\n") {
+                    if let Err(e) = writer.write_all(b"\n") {
                         tracing::error!(event_type = "hot_buffer_error", error = %e, "hot buffer snapshot write failed");
                         return None;
                     }
@@ -319,11 +322,12 @@ impl HotBuffer {
         }
 
         // Flush to ensure DuckDB can read the file.
-        if let Err(e) = tmpfile.flush() {
+        if let Err(e) = writer.flush() {
             tracing::error!(event_type = "hot_buffer_error", error = %e, "hot buffer snapshot flush failed");
             return None;
         }
 
+        drop(writer);
         Some((tmpfile, keys))
     }
 
