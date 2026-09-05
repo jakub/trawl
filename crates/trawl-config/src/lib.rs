@@ -748,7 +748,7 @@ pub const DEFAULT_SCHEDULER_MAX_CATCHUP_INTERVALS: u32 = 24;
 /// worse outcome than a boot refusal.
 ///
 /// A million intervals against the ten-year interval cap is 3.15e14
-/// seconds, four orders of magnitude inside a `TimeDelta`
+/// seconds, less than one twentieth of the maximum `TimeDelta`
 /// (`scheduler_catchup_span_always_fits_a_timedelta` proves it). It is also
 /// far past any real cadence: a million hourly intervals is 114 years of
 /// missed coverage, so nobody loses a setting they meant.
