@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-import { test, expect } from '../fixtures';
+import { test, expect, resetScenario } from '../fixtures';
 import { SEL } from '../selectors';
 
 async function pollState(request: import('@playwright/test').APIRequestContext) {
@@ -48,4 +48,46 @@ test('an unmounted live tail closes its EventSource and stops reconnecting', asy
   await page.waitForTimeout(1_500);
   const later = await pollState(request);
   expect(later.sse.opens, 'opens count grew after unmount — the EventSource leaked and reconnected').toBe(opensAtClose);
+});
+
+test('a burst keeps the newest 5000 rows, updates columns, and releases its render timer', async ({ page, request }) => {
+  await resetScenario(request, 'stream-burst');
+  await page.addInitScript(() => {
+    const active = new Set<number>();
+    const start = window.setInterval.bind(window);
+    const clear = window.clearInterval.bind(window);
+    (window as any).__liveRenderTimers = active;
+    window.setInterval = ((handler: TimerHandler, delay?: number, ...args: any[]) => {
+      const id = start(handler, delay, ...args);
+      if (delay === 16) active.add(id);
+      return id;
+    }) as typeof window.setInterval;
+    window.clearInterval = ((id?: number) => {
+      active.delete(id!);
+      clear(id);
+    }) as typeof window.clearInterval;
+  });
+  await page.goto('/search');
+  await page.locator(SEL.cmContent).click();
+  await page.keyboard.type('service=nginx');
+  await page.locator(SEL.dateRangeTrigger).click();
+  await page.locator(SEL.realtimeTab).click();
+  await page.locator(SEL.liveTailButton).click();
+
+  await expect(page.getByText('burst-5999', { exact: true })).toBeVisible();
+  await expect(page.locator('.results tbody tr')).toHaveCount(5000);
+  const rendered = await page.locator('.results table').evaluate(table => {
+    const headers = Array.from(table.querySelectorAll('th'), th => th.textContent);
+    const index = headers.indexOf('seq');
+    return { headers, seqs: Array.from(table.querySelectorAll('tbody tr'), row => Number(row.children[index].textContent)) };
+  });
+  expect(rendered.seqs).toEqual(Array.from({ length: 5000 }, (_, i) => i + 1000));
+  expect(rendered.headers).toContain('late_column');
+  expect(rendered.headers).not.toContain('expired_only');
+  expect(await page.evaluate(() => (window as any).__liveRenderTimers.size)).toBe(1);
+
+  await page.locator(SEL.railHistoryLink).click();
+  await expect(page.locator('h1')).toHaveText('Search history');
+  expect(await page.evaluate(() => (window as any).__liveRenderTimers.size)).toBe(0);
+  expect(await waitFor(async () => (await pollState(request)).sse.open === 0, 2_000)).toBe(true);
 });

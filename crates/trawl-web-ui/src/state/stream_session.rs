@@ -15,7 +15,7 @@
 //! If the browser permanently loses the stream, the UI freezes on the
 //! last snapshot — acceptable for v1.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
 
@@ -38,11 +38,20 @@ pub struct StreamLifecycle {
     on_data: Closure<dyn FnMut(MessageEvent)>,
     on_snapshot: Closure<dyn FnMut(MessageEvent)>,
     on_lagged: Closure<dyn FnMut(MessageEvent)>,
+    render_tick: Option<gloo_timers::callback::Interval>,
+    ring: RwSignal<RingBuffer>,
+    dirty: Rc<Cell<bool>>,
 }
 
 impl Drop for StreamLifecycle {
     fn drop(&mut self) {
         self.source.close();
+        // Cancel before releasing the listener closures. On pause, publish the
+        // final received events; on unmount, the signal may already be gone.
+        self.render_tick.take();
+        if self.dirty.replace(false) {
+            self.ring.try_update(|_| {});
+        }
     }
 }
 
@@ -108,6 +117,16 @@ pub fn start_stream(query: &str, signals: LiveSignals) -> Option<StreamLifecycle
     let lagged_clear_guard: Rc<RefCell<Option<gloo_timers::callback::Timeout>>> =
         Rc::new(RefCell::new(None));
 
+    // Store every event immediately in the bounded ring, but notify the view
+    // once per frame interval instead of rebuilding its result per SSE event.
+    let dirty = Rc::new(Cell::new(false));
+    let tick_dirty = Rc::clone(&dirty);
+    let render_tick = gloo_timers::callback::Interval::new(16, move || {
+        if tick_dirty.replace(false) {
+            ring.try_update(|_| {});
+        }
+    });
+    let event_dirty = Rc::clone(&dirty);
     let on_data = Closure::<dyn FnMut(MessageEvent)>::new(move |ev: MessageEvent| {
         let Some(data_str) = ev.data().as_string() else {
             return;
@@ -115,7 +134,9 @@ pub fn start_stream(query: &str, signals: LiveSignals) -> Option<StreamLifecycle
         let Ok(map) = serde_json::from_str::<serde_json::Map<_, _>>(&data_str) else {
             return;
         };
-        ring.update(|r| r.push(map));
+        if ring.try_update_untracked(|r| r.push(map)).is_some() {
+            event_dirty.set(true);
+        }
     });
 
     let on_snapshot = Closure::<dyn FnMut(MessageEvent)>::new(move |ev: MessageEvent| {
@@ -179,6 +200,9 @@ pub fn start_stream(query: &str, signals: LiveSignals) -> Option<StreamLifecycle
         on_data,
         on_snapshot,
         on_lagged,
+        render_tick: Some(render_tick),
+        ring,
+        dirty,
     })
 }
 
