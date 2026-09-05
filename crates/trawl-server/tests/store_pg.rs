@@ -429,6 +429,61 @@ async fn seed_run(
     }
 }
 
+/// A claim blocked on its saved query must not hold the schedule lock.
+/// Otherwise an editor holding the saved query and reaching for the schedule
+/// closes a deadlock cycle with the claim's implicit foreign-key lock.
+#[sqlx::test]
+async fn claim_run_locks_saved_query_before_schedule(pool: PgPool) {
+    let store = schedules(&pool);
+    let saved_id = seed_saved(&pool, 1, "claim-lock-order").await;
+    let schedule = store
+        .create_schedule(saved_id, 1, 300, None, None, 0, chrono::Utc::now())
+        .await
+        .unwrap();
+    let mut editor = pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM saved_queries WHERE id = $1 FOR UPDATE")
+        .bind(saved_id)
+        .execute(&mut *editor)
+        .await
+        .unwrap();
+
+    let claim = tokio::spawn(async move {
+        store
+            .claim_run(schedule.id, saved_id, "q", None, None)
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+                 WHERE datname = current_database() AND wait_event_type = 'Lock'
+                   AND pid <> pg_backend_pid())",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if waiting {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("claim must reach the held saved-query lock");
+
+    let schedule_lock = sqlx::query("SELECT id FROM schedules WHERE id = $1 FOR UPDATE NOWAIT")
+        .bind(schedule.id)
+        .execute(&mut *editor)
+        .await;
+    editor.rollback().await.unwrap();
+    let claimed = claim.await.unwrap().unwrap();
+    assert!(
+        schedule_lock.is_ok(),
+        "claim took schedule before saved query: {schedule_lock:?}"
+    );
+    assert!(matches!(claimed, RunClaim::Started(_)));
+}
+
 #[sqlx::test]
 async fn schedule_create_and_get(pool: PgPool) {
     let store = schedules(&pool);

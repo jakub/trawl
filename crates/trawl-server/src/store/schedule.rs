@@ -847,9 +847,10 @@ impl ScheduleStore {
     /// Delete a schedule by its saved query id, collecting the parquet paths
     /// of its runs in the same transaction (cascade wipes the rows).
     ///
-    /// Lock order matches [`Self::claim_run`]: the schedule row first (`FOR
-    /// UPDATE`, which also blocks a concurrent run INSERT via its FK `FOR KEY
-    /// SHARE`), then every one of its `report_runs`. Locking all run rows, not
+    /// Lock the schedule before its runs, as [`Self::claim_run`] does after
+    /// locking the saved query. `FOR UPDATE` also blocks a concurrent run
+    /// INSERT via its FK `FOR KEY SHARE`. Then lock every one of its
+    /// `report_runs`. Locking all run rows, not
     /// just those with a non-null `result_path`, forces a concurrent
     /// `finish_run` to either commit its path before us (collected here) or
     /// block until our cascade deletes its row (it then updates zero rows and
@@ -984,9 +985,9 @@ impl ScheduleStore {
         Ok(u64::try_from(count).unwrap_or_default())
     }
 
-    /// Claim a run transactionally: lock the schedule row, enforce
-    /// `max_runs`, and insert the running row — all in one transaction so
-    /// concurrent manual triggers can never exceed the cap.
+    /// Claim a run in one transaction. Lock the saved query, then the schedule,
+    /// enforce `max_runs`, and insert the running row. Concurrent claims cannot
+    /// exceed the cap.
     ///
     /// `window` is the interval the run is about to cover, recorded on the
     /// row at claim time because that is when it is decided. `None` writes
@@ -1001,6 +1002,21 @@ impl ScheduleStore {
         window: Option<&ReportWindow>,
     ) -> Result<RunClaim, StoreError> {
         let mut tx = self.pool.begin().await?;
+
+        // The run insert checks its saved-query foreign key. Take that lock
+        // before the schedule lock to keep saved_queries -> schedules order.
+        let saved: Option<i64> =
+            sqlx::query_scalar("SELECT id FROM saved_queries WHERE id = $1 FOR UPDATE")
+                .bind(saved_query_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if saved.is_none() {
+            tx.rollback().await?;
+            return Err(StoreError::NotFound {
+                id: saved_query_id,
+                resource: "saved query",
+            });
+        }
 
         // FOR UPDATE serializes concurrent claims on this schedule; a claim
         // that lost the race observes the winner's committed run count.
@@ -1356,7 +1372,7 @@ impl ScheduleStore {
         let mut tx = self.pool.begin().await?;
 
         // Schedule before run, the order every multi-row path here takes:
-        // `claim_run` and `delete_schedule` both lock the schedule first, so
+        // `claim_run` and `delete_schedule` both lock the schedule before runs, so
         // updating the run first and reaching for the schedule afterwards
         // would let this transaction deadlock against either of them.
         // `FOR UPDATE OF s` locks the schedule alone — the join reads the
