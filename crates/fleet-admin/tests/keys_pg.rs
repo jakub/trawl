@@ -212,6 +212,69 @@ async fn assign_role_unknown_prefix_returns_key_not_found(pool: sqlx::PgPool) {
 }
 
 #[sqlx::test(migrations = false)]
+async fn assign_role_surfaces_key_revoked_for_inactive_keys(pool: sqlx::PgPool) {
+    let store = common::migrated_store(pool).await;
+    seed_roles(&store).await;
+    let role = RoleName::parse("trawl-admin").unwrap();
+
+    let revoked = store
+        .create_key("revoked", PrincipalKind::Human, &[], None)
+        .await
+        .unwrap();
+    store.revoke_key(&revoked.info.prefix).await.unwrap();
+    let revoked_prefix = KeyPrefix::parse(&revoked.info.prefix).unwrap();
+    let err = keys::assign_role(&store, &revoked_prefix, &role)
+        .await
+        .expect_err("revoked key must refuse role assignment");
+    assert!(
+        matches!(
+            err,
+            AdminError::Auth(AuthError::KeyRevoked { ref prefix })
+                if prefix == &revoked.info.prefix
+        ),
+        "expected KeyRevoked, got {err:?}"
+    );
+    assert!(
+        store
+            .get_key_by_prefix(&revoked.info.prefix)
+            .await
+            .unwrap()
+            .roles
+            .is_empty()
+    );
+
+    let inactive = store
+        .create_key("inactive", PrincipalKind::Human, &[], None)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE api_keys SET active = FALSE WHERE id = $1")
+        .bind(inactive.info.id)
+        .execute(store.pool())
+        .await
+        .unwrap();
+    let inactive_prefix = KeyPrefix::parse(&inactive.info.prefix).unwrap();
+    let err = keys::assign_role(&store, &inactive_prefix, &role)
+        .await
+        .expect_err("out-of-band inactive key must refuse role assignment");
+    assert!(
+        matches!(
+            err,
+            AdminError::Auth(AuthError::KeyRevoked { ref prefix })
+                if prefix == &inactive.info.prefix
+        ),
+        "expected KeyRevoked, got {err:?}"
+    );
+    assert!(
+        store
+            .get_key_by_prefix(&inactive.info.prefix)
+            .await
+            .unwrap()
+            .roles
+            .is_empty()
+    );
+}
+
+#[sqlx::test(migrations = false)]
 async fn revoke_unknown_prefix_returns_key_not_found(pool: sqlx::PgPool) {
     let store = common::migrated_store(pool).await;
 
@@ -366,6 +429,79 @@ async fn unassign_role_unknown_prefix_returns_key_not_found(pool: sqlx::PgPool) 
             AdminError::Auth(AuthError::KeyNotFound { ref prefix }) if prefix == "ghostpfx"
         ),
         "expected KeyNotFound, got {err:?}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn unassign_role_surfaces_key_revoked_for_inactive_keys(pool: sqlx::PgPool) {
+    let store = common::migrated_store(pool).await;
+    seed_roles(&store).await;
+    let role = RoleName::parse("trawl-admin").unwrap();
+
+    let revoked = store
+        .create_key(
+            "revoked",
+            PrincipalKind::Human,
+            &names(&["trawl-admin"]),
+            None,
+        )
+        .await
+        .unwrap();
+    store.revoke_key(&revoked.info.prefix).await.unwrap();
+    let revoked_prefix = KeyPrefix::parse(&revoked.info.prefix).unwrap();
+    let err = keys::unassign_role(&store, &revoked_prefix, &role, true)
+        .await
+        .expect_err("revoked key must refuse role unassignment");
+    assert!(
+        matches!(
+            err,
+            AdminError::Auth(AuthError::KeyRevoked { ref prefix })
+                if prefix == &revoked.info.prefix
+        ),
+        "expected KeyRevoked, got {err:?}"
+    );
+    assert_eq!(
+        store
+            .get_key_by_prefix(&revoked.info.prefix)
+            .await
+            .unwrap()
+            .roles,
+        ["trawl-admin"]
+    );
+
+    let inactive = store
+        .create_key(
+            "inactive",
+            PrincipalKind::Human,
+            &names(&["trawl-admin"]),
+            None,
+        )
+        .await
+        .unwrap();
+    sqlx::query("UPDATE api_keys SET active = FALSE WHERE id = $1")
+        .bind(inactive.info.id)
+        .execute(store.pool())
+        .await
+        .unwrap();
+    let inactive_prefix = KeyPrefix::parse(&inactive.info.prefix).unwrap();
+    let err = keys::unassign_role(&store, &inactive_prefix, &role, true)
+        .await
+        .expect_err("out-of-band inactive key must refuse role unassignment");
+    assert!(
+        matches!(
+            err,
+            AdminError::Auth(AuthError::KeyRevoked { ref prefix })
+                if prefix == &inactive.info.prefix
+        ),
+        "expected KeyRevoked, got {err:?}"
+    );
+    assert_eq!(
+        store
+            .get_key_by_prefix(&inactive.info.prefix)
+            .await
+            .unwrap()
+            .roles,
+        ["trawl-admin"]
     );
 }
 
