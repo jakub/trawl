@@ -5,14 +5,23 @@
 //! Background data retention task.
 //!
 //! Periodically scans the data directory for date-partitioned directories
-//! and enforces two independent retention policies:
+//! and enforces two independent retention policies (ADR-0018 §1-5):
 //!
-//! 1. **Age-based**: deletes date directories older than `max_age_days`.
-//! 2. **Disk pressure**: if free disk space drops below `min_free_disk_bytes`,
-//!    deletes the oldest data regardless of age.
+//! 1. **Age-based**: deletes a date directory once it is older than its
+//!    env's effective `max_age_days` — the `[retention.env.<name>]`
+//!    override when one exists, else the global value
+//!    ([`RetentionConfig::max_age_days_for`]). 0 keeps that env's data
+//!    forever as far as age goes.
+//! 2. **Disk pressure**: if free disk space drops below
+//!    `min_free_disk_bytes`, deletes by expiry ratio — a directory's age
+//!    over its env's effective `max_age_days`, highest ratio first — until
+//!    the threshold clears. A keep-forever env ranks last but stays
+//!    eligible: nothing is exempt from pressure, because a sweep that
+//!    cannot reach the floor is a wedged daemon. Age is a maximum, never a
+//!    guaranteed minimum.
 //!
 //! Today's directory is never deleted (compaction writes there actively).
-//! Both policies can be independently disabled by setting their value to 0.
+//! Disk-pressure retention is disabled by setting its threshold to 0.
 //!
 //! Disk-pressure deletion is additionally suppressed while any epoch
 //! set-aside root ([`crate::epoch::set_aside_paths`]) exists: a set-aside
@@ -28,6 +37,8 @@
 //! Consumers window on `last_seen`; the field axis is bounded by the pin
 //! cap ([`crate::store::MAX_PINNED_FIELDS`]).
 
+use std::cmp::Ordering;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -101,37 +112,169 @@ pub fn spawn_retention(
 }
 
 /// The longest age this install still keeps data for, in seconds, or
-/// `None` when age retention is disabled.
+/// `None` when any env keeps its data forever.
 ///
-/// Pin garbage collection ([`crate::catalog::gc`]) floors its dead window
-/// here: calling a field dead over a span shorter than the corpus trawl
-/// still stores would reclaim a pin whose data is right there on disk.
-/// Disk-pressure retention contributes nothing: it deletes by free space
-/// rather than by age, so it names no window a pin could be judged
-/// against.
+/// The set is the global `max_age_days` plus every `[retention.env.*]`
+/// entry. The global always participates: an env with no entry inherits
+/// it, and an install always has envs the config never names. A single 0
+/// anywhere is `None` — that env keeps everything, so no finite span
+/// bounds what the corpus still holds. Otherwise the answer is the
+/// maximum, never the minimum: the shortest-lived env says nothing about
+/// data a longer-lived one still stores.
+///
+/// Config domain only. Which env directories exist on disk never enters
+/// it: a horizon that read the filesystem would move as data landed and
+/// aged out, and both callers want a per-process constant.
+///
+/// Two callers ask the same question. `/api/v1/schema` windows catalog
+/// fields on `last_seen` against it, so autocomplete stops offering
+/// fields whose data has aged out everywhere. Pin garbage collection
+/// ([`crate::catalog::gc`]) floors its dead window here: calling a field
+/// dead over a span shorter than the corpus trawl still stores would
+/// reclaim a pin whose data is right there on disk. Disk-pressure
+/// retention contributes nothing: it deletes by free space rather than by
+/// age, so it names no window a pin could be judged against.
 ///
 /// `max_age_days` is an unvalidated operator `u64`, so the multiply
 /// saturates; an "effectively never" setting floors the window at
 /// "effectively never", which refuses every candidate. That is the right
 /// answer for an install that keeps everything.
-///
-/// This is the one function per-env retention (#108) changes: the floor
-/// becomes the maximum enabled age across all envs, and every caller keeps
-/// asking the same question.
 #[must_use]
 pub fn maximum_enabled_age_secs(config: &RetentionConfig) -> Option<u64> {
     const SECS_PER_DAY: u64 = 86_400;
-    if config.max_age_days == 0 {
+    let mut longest = config.max_age_days;
+    if longest == 0 {
         return None;
     }
-    Some(config.max_age_days.saturating_mul(SECS_PER_DAY))
+    for env in config.env.values() {
+        if env.max_age_days == 0 {
+            return None;
+        }
+        longest = longest.max(env.max_age_days);
+    }
+    Some(longest.saturating_mul(SECS_PER_DAY))
 }
 
-/// A single retention tick. Testable via injectable `free_space_fn`.
+/// One deletion candidate: a date directory under an env directory
+/// (`data/{env}/{date}/`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DateDir {
+    env: String,
+    date: NaiveDate,
+    path: PathBuf,
+}
+
+/// Calendar days from a directory's date to `today`; a future-dated
+/// directory is 0 days old, never negative.
+///
+/// The one age numerator. Phase 1's cutoff and phase 2's rank both read
+/// it, against the one `today` the tick sampled, so the two phases can
+/// never disagree about how old a directory is. Neither this nor anything
+/// downstream of it reads the clock.
+fn candidate_age_days(today: NaiveDate, date: NaiveDate) -> u64 {
+    // `num_days` is negative exactly for a future date, which is the one
+    // case `try_from` refuses; that clamps to 0.
+    u64::try_from((today - date).num_days()).unwrap_or(0)
+}
+
+/// Whether `dir` is older than its env's effective age limit.
+///
+/// Reads the limit through [`RetentionConfig::max_age_days_for`], the one
+/// fallback lookup, so an env without an entry inherits the global. A 0 —
+/// global or override — never expires anything. No `chrono::Duration` is
+/// built from the limit: a "keep for 10^12 days" setting is legal config,
+/// and subtracting it from a date panics inside chrono.
+fn is_age_expired(dir: &DateDir, today: NaiveDate, config: &RetentionConfig) -> bool {
+    let max = config.max_age_days_for(&dir.env);
+    max != 0 && candidate_age_days(today, dir.date) > max
+}
+
+/// Where a candidate stands in the disk-pressure order (ADR-0018 §2-3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExpiryRank {
+    /// The env has a finite age limit; the candidate has spent
+    /// `age_days / max_age_days` of it.
+    Expiring {
+        age_days: u64,
+        max_age_days: NonZeroU64,
+    },
+    /// The env's effective age is 0. Ranked after every `Expiring`
+    /// candidate, still a candidate: keep-forever is a rank, never a
+    /// filter.
+    KeepForever,
+}
+
+/// Rank `dir` for the pressure sweep, reading the same effective age and
+/// the same age numerator phase 1 read.
+fn expiry_rank(dir: &DateDir, config: &RetentionConfig, today: NaiveDate) -> ExpiryRank {
+    match NonZeroU64::new(config.max_age_days_for(&dir.env)) {
+        Some(max_age_days) => ExpiryRank::Expiring {
+            age_days: candidate_age_days(today, dir.date),
+            max_age_days,
+        },
+        None => ExpiryRank::KeepForever,
+    }
+}
+
+/// Compare two candidates by deletion priority: `Less` deletes first.
+///
+/// `Expiring` always precedes `KeepForever`; two `KeepForever` are equal
+/// and the date/path keys decide. Two `Expiring` compare by expiry ratio,
+/// highest first: `a` deletes first iff `a.age / a.max > b.age / b.max`,
+/// evaluated as `a.age * b.max > b.age * a.max` in `u128`. Cross-
+/// multiplication keeps the comparison exact at every magnitude a `u64`
+/// can hold (the product of two `u64::MAX` fits `u128`), where an `f64`
+/// division would tie candidates that differ by one day.
+fn cmp_priority(a: ExpiryRank, b: ExpiryRank) -> Ordering {
+    use ExpiryRank::{Expiring, KeepForever};
+    match (a, b) {
+        (KeepForever, KeepForever) => Ordering::Equal,
+        (Expiring { .. }, KeepForever) => Ordering::Less,
+        (KeepForever, Expiring { .. }) => Ordering::Greater,
+        (
+            Expiring {
+                age_days: a_age,
+                max_age_days: a_max,
+            },
+            Expiring {
+                age_days: b_age,
+                max_age_days: b_max,
+            },
+        ) => {
+            let a_scaled = u128::from(a_age) * u128::from(b_max.get());
+            let b_scaled = u128::from(b_age) * u128::from(a_max.get());
+            // A larger scaled ratio deletes first, so the operands are
+            // swapped: `a_scaled > b_scaled` is `Less`.
+            b_scaled.cmp(&a_scaled)
+        }
+    }
+}
+
+/// A single retention tick. Samples `today` once and sweeps against it.
 fn retention_tick(
     data_dir: &Path,
     config: &RetentionConfig,
     free_space_fn: impl Fn(&Path) -> std::io::Result<u64>,
+) -> Result<(), String> {
+    let today = chrono::Utc::now().date_naive();
+    retention_tick_at(data_dir, config, today, free_space_fn, delete_date_dir)
+}
+
+/// The tick body, with the clock and the deletion injected.
+///
+/// `today` is threaded into both phases and never resampled: the age
+/// cutoff and the pressure rank must agree on how old every directory is,
+/// and a midnight rollover between the phases would otherwise rank a
+/// directory that survived phase 1 as if it had expired. `delete_fn` is
+/// [`delete_date_dir`] in production; a test injects it to plant a repin
+/// marker after a specific deletion, which no filesystem arrangement can
+/// do on its own (deleting a directory can only make evidence vanish).
+fn retention_tick_at(
+    data_dir: &Path,
+    config: &RetentionConfig,
+    today: NaiveDate,
+    free_space_fn: impl Fn(&Path) -> std::io::Result<u64>,
+    delete_fn: impl Fn(&Path) -> Result<u64, String>,
 ) -> Result<(), String> {
     // A repin in flight — marker, shadow sibling, or aside sibling —
     // suppresses both sweeps, not just pressure (ADR-0011). Age deletion
@@ -158,61 +301,61 @@ fn retention_tick(
     }
     metrics::gauge!(crate::metrics::RETENTION_SUPPRESSED).set(0.0);
 
-    let today = chrono::Utc::now().date_naive();
-    let today_str = today.format("%Y-%m-%d").to_string();
-
-    let mut candidates = enumerate_date_dirs(data_dir, &today_str)?;
+    let candidates = enumerate_date_dirs(data_dir, today)?;
 
     let mut total_bytes_freed: u64 = 0;
     let mut total_dirs_deleted: u64 = 0;
 
-    // Phase 1: age-based retention.
-    if config.max_age_days > 0 {
-        let cutoff =
-            today - chrono::Duration::days(i64::try_from(config.max_age_days).unwrap_or(i64::MAX));
+    // Phase 1: age-based retention, decided per candidate against its own
+    // env's effective age. There is no global on/off switch: a global 0
+    // with a finite override still sweeps that env, and a finite global
+    // with a 0 override spares it. The partition hands phase 2 exactly
+    // what age retention did not attempt — a failed age deletion is not
+    // retried under pressure in the same tick.
+    let (age_targets, candidates): (Vec<DateDir>, Vec<DateDir>) = candidates
+        .into_iter()
+        .partition(|dir| is_age_expired(dir, today, config));
 
-        let age_targets: Vec<PathBuf> = candidates
-            .iter()
-            .filter(|(date, _)| *date < cutoff)
-            .map(|(_, path)| path.clone())
-            .collect();
-
-        for path in &age_targets {
-            if repin_claimed_mid_sweep(data_dir) {
-                return Ok(());
+    for dir in &age_targets {
+        if repin_claimed_mid_sweep(data_dir) {
+            return Ok(());
+        }
+        match delete_fn(&dir.path) {
+            Ok(bytes) => {
+                tracing::info!(
+                    event_type = "retention_delete",
+                    retention_env = %dir.env,
+                    date = %dir.date,
+                    max_age_days = config.max_age_days_for(&dir.env),
+                    bytes_freed = bytes,
+                    trigger = "age",
+                    "deleted date directory"
+                );
+                total_bytes_freed += bytes;
+                total_dirs_deleted += 1;
             }
-            match delete_date_dir(path) {
-                Ok(bytes) => {
-                    let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
-                    tracing::info!(
-                        event_type = "retention_delete",
-                        date = %dir_name,
-                        bytes_freed = bytes,
-                        trigger = "age",
-                        "deleted date directory"
-                    );
-                    total_bytes_freed += bytes;
-                    total_dirs_deleted += 1;
-                }
-                Err(e) => {
-                    tracing::error!(
-                        event_type = "retention_error",
-                        path = %path.display(),
-                        error = %e,
-                        "failed to delete date directory"
-                    );
-                }
+            Err(e) => {
+                tracing::error!(
+                    event_type = "retention_error",
+                    path = %dir.path.display(),
+                    error = %e,
+                    "failed to delete date directory"
+                );
             }
         }
-
-        // Everything past the cutoff was already attempted above, failures
-        // included, so phase 2 works on what age retention left alone.
-        candidates.retain(|(date, _)| *date >= cutoff);
     }
 
-    // Phase 2: disk-pressure retention.
+    // Phase 2: disk-pressure retention, install-wide over what phase 1
+    // left alone.
     if config.min_free_disk_bytes > 0 {
-        let (bytes, dirs) = disk_pressure_sweep(data_dir, config, candidates, free_space_fn)?;
+        let (bytes, dirs) = disk_pressure_sweep(
+            data_dir,
+            config,
+            candidates,
+            today,
+            free_space_fn,
+            delete_fn,
+        )?;
         total_bytes_freed += bytes;
         total_dirs_deleted += dirs;
     }
@@ -229,16 +372,30 @@ fn retention_tick(
     Ok(())
 }
 
-/// Delete oldest-first until free space clears `min_free_disk_bytes` or
-/// there is nothing left to delete. Returns `(bytes_freed, dirs_deleted)`.
+/// Delete by expiry ratio until free space clears `min_free_disk_bytes`
+/// or there is nothing left to delete. Returns `(bytes_freed,
+/// dirs_deleted)`.
 fn disk_pressure_sweep(
     data_dir: &Path,
     config: &RetentionConfig,
-    mut candidates: Vec<(NaiveDate, PathBuf)>,
+    mut candidates: Vec<DateDir>,
+    today: NaiveDate,
     free_space_fn: impl Fn(&Path) -> std::io::Result<u64>,
+    delete_fn: impl Fn(&Path) -> Result<u64, String>,
 ) -> Result<(u64, u64), String> {
     let mut total_bytes_freed: u64 = 0;
     let mut total_dirs_deleted: u64 = 0;
+
+    // Rank once, before the loop. The order is a pure function of the
+    // config, the candidate set and the tick's `today`, none of which
+    // moves while the loop runs: highest expiry ratio first, keep-forever
+    // last, then oldest date, then path. Three keys make it a total
+    // order, so a sweep over a given tree is reproducible.
+    candidates.sort_by(|a, b| {
+        cmp_priority(expiry_rank(a, config, today), expiry_rank(b, config, today))
+            .then_with(|| a.date.cmp(&b.date))
+            .then_with(|| a.path.cmp(&b.path))
+    });
 
     // An epoch set-aside root is a *sibling* of `data/`: it yields no
     // deletion candidates yet still occupies the filesystem
@@ -288,13 +445,15 @@ fn disk_pressure_sweep(
             break;
         }
 
-        // Delete the oldest remaining dir.
-        let (date, path) = candidates.remove(0);
-        match delete_date_dir(&path) {
+        // Delete the highest-ranked remaining dir.
+        let dir = candidates.remove(0);
+        match delete_fn(&dir.path) {
             Ok(bytes) => {
                 tracing::info!(
                     event_type = "retention_delete",
-                    date = %date,
+                    retention_env = %dir.env,
+                    date = %dir.date,
+                    max_age_days = config.max_age_days_for(&dir.env),
                     bytes_freed = bytes,
                     trigger = "disk_pressure",
                     available_bytes = available,
@@ -306,7 +465,7 @@ fn disk_pressure_sweep(
             Err(e) => {
                 tracing::error!(
                     event_type = "retention_error",
-                    path = %path.display(),
+                    path = %dir.path.display(),
                     error = %e,
                     "failed to delete date directory under disk pressure"
                 );
@@ -366,14 +525,15 @@ fn repin_in_flight(data_dir: &Path) -> Option<&'static str> {
 /// and non-date directories. Env directories are recognised by the env
 /// charset with `wal`/`scheduled` reserved — anything else at the top
 /// level (a stray file, the EPOCH marker, a set-aside dir) is skipped.
-/// Candidates are merged across envs, sorted oldest-first, so
-/// disk-pressure deletion stays globally oldest-first while deleting one
-/// env's date dir stays O(1) and never touches other envs.
-fn enumerate_date_dirs(data_dir: &Path, today: &str) -> Result<Vec<(NaiveDate, PathBuf)>, String> {
+/// Candidates are merged across envs and sorted by (date, path): a
+/// deterministic base order for phase 1, which deletes in it, and for
+/// phase 2, which re-sorts by expiry ratio with these two as tie-breaks.
+/// Deleting one env's date dir stays O(1) and never touches other envs.
+fn enumerate_date_dirs(data_dir: &Path, today: NaiveDate) -> Result<Vec<DateDir>, String> {
     let entries = std::fs::read_dir(data_dir)
         .map_err(|e| format!("failed to read data directory {}: {e}", data_dir.display()))?;
 
-    let mut dirs: Vec<(NaiveDate, PathBuf)> = Vec::new();
+    let mut dirs: Vec<DateDir> = Vec::new();
     for env_entry in entries.flatten() {
         let env_path = env_entry.path();
         if !env_path.is_dir() {
@@ -396,18 +556,22 @@ fn enumerate_date_dirs(data_dir: &Path, today: &str) -> Result<Vec<(NaiveDate, P
                 return None;
             }
             let name = path.file_name()?.to_str()?;
-            if name == today {
-                return None;
-            }
             if !looks_like_date(name) {
                 return None;
             }
             let date = NaiveDate::parse_from_str(name, "%Y-%m-%d").ok()?;
-            Some((date, path))
+            if date == today {
+                return None;
+            }
+            Some(DateDir {
+                env: env_name.to_owned(),
+                date,
+                path,
+            })
         }));
     }
 
-    dirs.sort_by_key(|(date, _)| *date);
+    dirs.sort_by(|a, b| a.date.cmp(&b.date).then_with(|| a.path.cmp(&b.path)));
     Ok(dirs)
 }
 
@@ -445,6 +609,10 @@ fn dir_size(path: &Path) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+
     use super::*;
     use crate::metrics::RETENTION_SUPPRESSED;
 
@@ -453,7 +621,109 @@ mod tests {
             max_age_days,
             min_free_disk_bytes,
             retention_interval_secs: 3600,
+            env: std::collections::BTreeMap::new(),
         }
+    }
+
+    /// A config with a global age and `[retention.env.*]` overrides.
+    /// Disk pressure is off; a test that wants it sets
+    /// `min_free_disk_bytes` through struct update.
+    fn config_with_envs(max_age_days: u64, envs: &[(&str, u64)]) -> RetentionConfig {
+        RetentionConfig {
+            env: envs
+                .iter()
+                .map(|(name, days)| {
+                    (
+                        (*name).to_owned(),
+                        crate::config::EnvRetention {
+                            max_age_days: *days,
+                        },
+                    )
+                })
+                .collect(),
+            ..make_config(max_age_days, 0)
+        }
+    }
+
+    /// A `today` the sweep is handed, so a tree's ages are fixed by the
+    /// test and not by the wall clock.
+    fn fixed_today() -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, 9, 4).unwrap()
+    }
+
+    fn days_before(today: NaiveDate, days: i64) -> NaiveDate {
+        today - chrono::Duration::days(days)
+    }
+
+    /// Create `data_dir/{env}/{date}/svc.parquet` and return the date dir.
+    fn plant(data_dir: &Path, env: &str, date: NaiveDate) -> PathBuf {
+        let dir = data_dir.join(env).join(date.format("%Y-%m-%d").to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("svc.parquet"), b"data").unwrap();
+        dir
+    }
+
+    /// A deletion that records the order in which the sweep asked for it.
+    fn recording_delete(log: &Mutex<Vec<PathBuf>>) -> impl Fn(&Path) -> Result<u64, String> {
+        move |path| {
+            log.lock().unwrap().push(path.to_path_buf());
+            delete_date_dir(path)
+        }
+    }
+
+    /// A free-space probe that stays below a 1 MB threshold forever.
+    fn always_pressured() -> impl Fn(&Path) -> std::io::Result<u64> {
+        |_| Ok(500_000)
+    }
+
+    /// The horizon is the LONGEST age anything still keeps, and a single
+    /// keep-forever setting lifts it entirely. A minimum would tell the
+    /// schema window and the pin-gc floor that data is gone while a
+    /// long-retention env still stores it.
+    #[test]
+    fn maximum_enabled_age_is_the_longest_age_any_env_keeps() {
+        const DAY: u64 = 86_400;
+
+        assert_eq!(
+            maximum_enabled_age_secs(&config_with_envs(90, &[("prod", 365), ("lab", 7)])),
+            Some(365 * DAY),
+            "the longest-lived env sets the horizon"
+        );
+        assert_eq!(
+            maximum_enabled_age_secs(&config_with_envs(90, &[("prod", 0)])),
+            None,
+            "one env keeping data forever leaves no finite horizon"
+        );
+        assert_eq!(
+            maximum_enabled_age_secs(&config_with_envs(0, &[("prod", 365)])),
+            None,
+            "the global always participates — envs without an entry inherit it"
+        );
+        assert_eq!(
+            maximum_enabled_age_secs(&config_with_envs(90, &[])),
+            Some(90 * DAY),
+            "no entries: the global alone, exactly as before per-env retention"
+        );
+    }
+
+    /// `max_age_days` is an unvalidated operator `u64` in the global and in
+    /// every override, and "effectively never" values are what an operator
+    /// reaches for. The multiply saturates rather than wrapping; the
+    /// `/api/v1/schema` end of the same value is covered by
+    /// `handlers::tests::since_from_secs_saturates_instead_of_panicking`,
+    /// which lands `u64::MAX` seconds on the unix epoch.
+    #[test]
+    fn maximum_enabled_age_saturates_instead_of_wrapping() {
+        assert_eq!(
+            maximum_enabled_age_secs(&config_with_envs(90, &[("archive", u64::MAX)])),
+            Some(u64::MAX),
+            "an effectively-never override saturates at u64::MAX seconds"
+        );
+        assert_eq!(
+            maximum_enabled_age_secs(&make_config(u64::MAX, 0)),
+            Some(u64::MAX),
+            "the global saturates the same way"
+        );
     }
 
     #[test]
@@ -473,6 +743,111 @@ mod tests {
     }
 
     #[test]
+    fn candidate_age_is_calendar_days_clamped_at_zero() {
+        let today = fixed_today();
+        assert_eq!(candidate_age_days(today, days_before(today, 8)), 8);
+        assert_eq!(candidate_age_days(today, today), 0);
+        assert_eq!(
+            candidate_age_days(today, days_before(today, -3)),
+            0,
+            "a future-dated directory is 0 days old, not negative"
+        );
+    }
+
+    /// Phase 1's cutoff and phase 2's rank read the same effective age
+    /// for the same env, through the one lookup. If they ever diverged, a
+    /// directory could survive age retention and still be ranked as
+    /// expired, or the reverse.
+    #[test]
+    fn age_cutoff_and_rank_read_one_effective_age() {
+        let today = fixed_today();
+        let config = config_with_envs(90, &[("lab", 7), ("archive", 0)]);
+        let dir = |env: &str, days: i64| DateDir {
+            env: env.to_owned(),
+            date: days_before(today, days),
+            path: PathBuf::from(env),
+        };
+
+        let lab = dir("lab", 8);
+        assert!(is_age_expired(&lab, today, &config));
+        assert_eq!(
+            expiry_rank(&lab, &config, today),
+            ExpiryRank::Expiring {
+                age_days: 8,
+                max_age_days: NonZeroU64::new(7).unwrap(),
+            }
+        );
+
+        let prod = dir("prod", 8);
+        assert!(!is_age_expired(&prod, today, &config), "inherits 90");
+        assert_eq!(
+            expiry_rank(&prod, &config, today),
+            ExpiryRank::Expiring {
+                age_days: 8,
+                max_age_days: NonZeroU64::new(90).unwrap(),
+            }
+        );
+
+        let archive = dir("archive", 5000);
+        assert!(!is_age_expired(&archive, today, &config), "0 keeps forever");
+        assert_eq!(
+            expiry_rank(&archive, &config, today),
+            ExpiryRank::KeepForever
+        );
+
+        let boundary = dir("lab", 7);
+        assert!(
+            !is_age_expired(&boundary, today, &config),
+            "age must exceed the limit, not merely reach it"
+        );
+    }
+
+    /// The comparator table. `Less` deletes first.
+    #[test]
+    fn cmp_priority_orders_by_exact_expiry_ratio() {
+        use ExpiryRank::{Expiring, KeepForever};
+        let expiring = |age_days: u64, max_age_days: u64| Expiring {
+            age_days,
+            max_age_days: NonZeroU64::new(max_age_days).unwrap(),
+        };
+
+        // ADR-0018 §2: 300 of 365 (0.82) is less spent than 6 of 7
+        // (0.86), so the lab noise goes before the prod evidence, in
+        // either operand order.
+        let prod = expiring(300, 365);
+        let lab = expiring(6, 7);
+        assert_eq!(cmp_priority(lab, prod), Ordering::Less);
+        assert_eq!(cmp_priority(prod, lab), Ordering::Greater);
+
+        // Keep-forever candidates are equal among themselves (date and
+        // path decide) and follow every finite candidate, even one that
+        // has spent none of its allowance.
+        assert_eq!(cmp_priority(KeepForever, KeepForever), Ordering::Equal);
+        let fresh = expiring(0, 7);
+        assert_eq!(cmp_priority(fresh, KeepForever), Ordering::Less);
+        assert_eq!(cmp_priority(KeepForever, fresh), Ordering::Greater);
+
+        // Exactness at the top of the domain. `u64::MAX - 1` and
+        // `u64::MAX` are the same f64 (2^64), so an f64 ratio would tie
+        // these; cross-multiplying in u128 sees one extra day.
+        let full = expiring(u64::MAX, u64::MAX);
+        let one_day_shy = expiring(u64::MAX - 1, u64::MAX);
+        assert_eq!(cmp_priority(full, one_day_shy), Ordering::Less);
+        assert_eq!(cmp_priority(one_day_shy, full), Ordering::Greater);
+        let also_full = expiring(u64::MAX - 1, u64::MAX - 1);
+        assert_eq!(
+            cmp_priority(full, also_full),
+            Ordering::Equal,
+            "two ratios of exactly 1 are equal at any magnitude"
+        );
+        assert_eq!(cmp_priority(full, full), Ordering::Equal);
+
+        // A ratio above 1 (an age target whose deletion failed is not
+        // here, but nothing forbids the value) still orders.
+        assert_eq!(cmp_priority(expiring(2, 1), expiring(1, 1)), Ordering::Less);
+    }
+
+    #[test]
     fn enumerate_excludes_wal_and_non_dates() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join("prod/2026-01-01")).unwrap();
@@ -485,10 +860,11 @@ mod tests {
         // Also create a regular file — should be skipped.
         std::fs::write(tmp.path().join("stray.txt"), b"hi").unwrap();
 
-        let dirs = enumerate_date_dirs(tmp.path(), "2099-01-01").unwrap();
+        let dirs = enumerate_date_dirs(tmp.path(), fixed_today()).unwrap();
         assert_eq!(dirs.len(), 1);
-        assert_eq!(dirs[0].0, NaiveDate::from_ymd_opt(2026, 1, 1).unwrap());
-        assert!(dirs[0].1.starts_with(tmp.path().join("prod")));
+        assert_eq!(dirs[0].env, "prod");
+        assert_eq!(dirs[0].date, NaiveDate::from_ymd_opt(2026, 1, 1).unwrap());
+        assert!(dirs[0].path.starts_with(tmp.path().join("prod")));
     }
 
     #[test]
@@ -497,27 +873,21 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join("prod/2026-01-20")).unwrap();
         std::fs::create_dir_all(tmp.path().join("lab/2026-01-10")).unwrap();
 
-        let dirs = enumerate_date_dirs(tmp.path(), "2099-01-01").unwrap();
+        let dirs = enumerate_date_dirs(tmp.path(), fixed_today()).unwrap();
         assert_eq!(dirs.len(), 2);
-        // Oldest first regardless of env.
-        assert!(dirs[0].1.starts_with(tmp.path().join("lab")));
-        assert!(dirs[1].1.starts_with(tmp.path().join("prod")));
+        // The base order is by date regardless of env; phase 2 re-ranks.
+        assert_eq!(dirs[0].env, "lab");
+        assert_eq!(dirs[1].env, "prod");
     }
 
     #[test]
     fn age_based_removes_one_envs_date_without_touching_others() {
         let today = chrono::Utc::now().date_naive();
-        let old_date = (today - chrono::Duration::days(200))
-            .format("%Y-%m-%d")
-            .to_string();
+        let old_date = days_before(today, 200);
 
         let tmp = tempfile::tempdir().unwrap();
-        let lab_old = tmp.path().join("lab").join(&old_date);
-        let prod_old = tmp.path().join("prod").join(&old_date);
-        std::fs::create_dir_all(&lab_old).unwrap();
-        std::fs::write(lab_old.join("svc.parquet"), b"lab data").unwrap();
-        std::fs::create_dir_all(&prod_old).unwrap();
-        std::fs::write(prod_old.join("svc.parquet"), b"prod data").unwrap();
+        let lab_old = plant(tmp.path(), "lab", old_date);
+        let prod_old = plant(tmp.path(), "prod", old_date);
 
         // Both envs' old dates age out independently; deleting one is an
         // O(1) directory remove that never touches the sibling env root.
@@ -536,26 +906,29 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join("prod/2026-02-13")).unwrap();
         std::fs::create_dir_all(tmp.path().join("prod/2026-02-12")).unwrap();
 
-        let dirs = enumerate_date_dirs(tmp.path(), "2026-02-13").unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 2, 13).unwrap();
+        let dirs = enumerate_date_dirs(tmp.path(), today).unwrap();
         assert_eq!(dirs.len(), 1);
-        assert_eq!(dirs[0].0, NaiveDate::from_ymd_opt(2026, 2, 12).unwrap());
+        assert_eq!(dirs[0].date, NaiveDate::from_ymd_opt(2026, 2, 12).unwrap());
     }
 
     #[test]
-    fn enumerate_sorts_oldest_first() {
+    fn enumerate_sorts_by_date_then_path() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join("prod/2026-03-01")).unwrap();
         std::fs::create_dir_all(tmp.path().join("prod/2026-01-15")).unwrap();
         std::fs::create_dir_all(tmp.path().join("prod/2026-02-20")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("lab/2026-02-20")).unwrap();
 
-        let dirs = enumerate_date_dirs(tmp.path(), "2099-01-01").unwrap();
-        let dates: Vec<_> = dirs.iter().map(|(d, _)| *d).collect();
+        let dirs = enumerate_date_dirs(tmp.path(), fixed_today()).unwrap();
+        let keys: Vec<_> = dirs.iter().map(|d| (d.date, d.env.as_str())).collect();
         assert_eq!(
-            dates,
+            keys,
             vec![
-                NaiveDate::from_ymd_opt(2026, 1, 15).unwrap(),
-                NaiveDate::from_ymd_opt(2026, 2, 20).unwrap(),
-                NaiveDate::from_ymd_opt(2026, 3, 1).unwrap(),
+                (NaiveDate::from_ymd_opt(2026, 1, 15).unwrap(), "prod"),
+                (NaiveDate::from_ymd_opt(2026, 2, 20).unwrap(), "lab"),
+                (NaiveDate::from_ymd_opt(2026, 2, 20).unwrap(), "prod"),
+                (NaiveDate::from_ymd_opt(2026, 3, 1).unwrap(), "prod"),
             ]
         );
     }
@@ -563,22 +936,9 @@ mod tests {
     #[test]
     fn age_based_deletes_old_dirs() {
         let today = chrono::Utc::now().date_naive();
-        let old_date = today - chrono::Duration::days(200);
-        let recent_date = today - chrono::Duration::days(30);
-
         let tmp = tempfile::tempdir().unwrap();
-        let old_dir = tmp
-            .path()
-            .join("prod")
-            .join(old_date.format("%Y-%m-%d").to_string());
-        let recent_dir = tmp
-            .path()
-            .join("prod")
-            .join(recent_date.format("%Y-%m-%d").to_string());
-        std::fs::create_dir_all(&old_dir).unwrap();
-        std::fs::write(old_dir.join("test.parquet"), b"old data").unwrap();
-        std::fs::create_dir_all(&recent_dir).unwrap();
-        std::fs::write(recent_dir.join("test.parquet"), b"recent data").unwrap();
+        let old_dir = plant(tmp.path(), "prod", days_before(today, 200));
+        let recent_dir = plant(tmp.path(), "prod", days_before(today, 30));
 
         let config = make_config(90, 0);
         retention_tick(tmp.path(), &config, |_| Ok(u64::MAX)).unwrap();
@@ -599,8 +959,124 @@ mod tests {
         assert!(old_dir.exists(), "nothing should be deleted when disabled");
     }
 
+    /// AC1: each env ages out against its own limit, an env without an
+    /// entry inherits the global, and the limit is exclusive (age must
+    /// exceed it).
     #[test]
-    fn disk_pressure_deletes_oldest_first() {
+    fn per_env_age_cutoffs_apply_per_env() {
+        let today = fixed_today();
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let lab_8 = plant(&data_dir, "lab", days_before(today, 8));
+        let lab_7 = plant(&data_dir, "lab", days_before(today, 7));
+        let prod_8 = plant(&data_dir, "prod", days_before(today, 8));
+        let prod_300 = plant(&data_dir, "prod", days_before(today, 300));
+        let prod_366 = plant(&data_dir, "prod", days_before(today, 366));
+        let staging_8 = plant(&data_dir, "staging", days_before(today, 8));
+        let staging_90 = plant(&data_dir, "staging", days_before(today, 90));
+        let staging_91 = plant(&data_dir, "staging", days_before(today, 91));
+
+        let config = config_with_envs(90, &[("prod", 365), ("lab", 7)]);
+        retention_tick_at(&data_dir, &config, today, |_| Ok(u64::MAX), delete_date_dir).unwrap();
+
+        assert!(!lab_8.exists(), "lab keeps 7 days: 8 is out");
+        assert!(lab_7.exists(), "7 days is not older than 7");
+        assert!(prod_8.exists(), "prod keeps a year");
+        assert!(prod_300.exists());
+        assert!(!prod_366.exists(), "prod's own limit still applies");
+        assert!(staging_8.exists(), "unlisted env inherits the global 90");
+        assert!(staging_90.exists(), "90 days is not older than 90");
+        assert!(!staging_91.exists(), "unlisted env inherits the global 90");
+    }
+
+    /// The old phase-1 gate (`if max_age_days > 0`) is gone: a global 0
+    /// no longer switches off an env that asked for a finite limit.
+    #[test]
+    fn global_zero_with_a_finite_override_still_ages_that_env_out() {
+        let today = fixed_today();
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let prod_40 = plant(&data_dir, "prod", days_before(today, 40));
+        let prod_20 = plant(&data_dir, "prod", days_before(today, 20));
+        let lab_4000 = plant(&data_dir, "lab", days_before(today, 4000));
+
+        let config = config_with_envs(0, &[("prod", 30)]);
+        retention_tick_at(&data_dir, &config, today, |_| Ok(u64::MAX), delete_date_dir).unwrap();
+
+        assert!(
+            !prod_40.exists(),
+            "prod's own 30 days applies under a global 0"
+        );
+        assert!(prod_20.exists());
+        assert!(lab_4000.exists(), "lab inherits the global 0: keep forever");
+    }
+
+    /// The mirror image: an override of 0 spares that env from age
+    /// retention under a finite global.
+    #[test]
+    fn per_env_zero_under_a_finite_global_keeps_that_env() {
+        let today = fixed_today();
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let archive_4000 = plant(&data_dir, "archive", days_before(today, 4000));
+        let prod_200 = plant(&data_dir, "prod", days_before(today, 200));
+
+        let config = config_with_envs(90, &[("archive", 0)]);
+        retention_tick_at(&data_dir, &config, today, |_| Ok(u64::MAX), delete_date_dir).unwrap();
+
+        assert!(archive_4000.exists(), "archive keeps forever");
+        assert!(!prod_200.exists(), "prod inherits the global 90");
+    }
+
+    /// An "effectively never" age is legal config. The previous sweep
+    /// built a `chrono::Duration` from it and panicked past ~1.07e11
+    /// days; the tick has to complete and delete nothing.
+    #[test]
+    fn huge_max_age_does_not_panic() {
+        for huge in [u64::MAX, 999_999_999_999] {
+            let today = fixed_today();
+            let tmp = tempfile::tempdir().unwrap();
+            let data_dir = tmp.path().join("data");
+            let prod = plant(
+                &data_dir,
+                "prod",
+                NaiveDate::from_ymd_opt(2020, 1, 1).unwrap(),
+            );
+            let lab = plant(
+                &data_dir,
+                "lab",
+                NaiveDate::from_ymd_opt(2020, 1, 1).unwrap(),
+            );
+
+            let config = config_with_envs(huge, &[("lab", huge)]);
+            retention_tick_at(&data_dir, &config, today, |_| Ok(u64::MAX), delete_date_dir)
+                .unwrap();
+            assert!(prod.exists(), "{huge}: age retention deletes nothing");
+            assert!(lab.exists(), "{huge}: age retention deletes nothing");
+
+            // And the rank's cross-multiplication at that magnitude fits
+            // u128: pressure drains the same tree without panicking.
+            let config = RetentionConfig {
+                min_free_disk_bytes: 1_000_000,
+                ..config
+            };
+            retention_tick_at(
+                &data_dir,
+                &config,
+                today,
+                always_pressured(),
+                delete_date_dir,
+            )
+            .unwrap();
+            assert!(
+                !prod.exists() && !lab.exists(),
+                "{huge}: pressure still reaches the floor"
+            );
+        }
+    }
+
+    #[test]
+    fn disk_pressure_breaks_equal_ranks_oldest_first() {
         let tmp = tempfile::tempdir().unwrap();
         let oldest = tmp.path().join("prod/2026-01-01");
         let middle = tmp.path().join("prod/2026-01-15");
@@ -612,10 +1088,10 @@ mod tests {
 
         // Simulate: first call reports low space, second call (after deletion)
         // reports enough space.
-        let call_count = std::sync::atomic::AtomicU32::new(0);
+        let call_count = AtomicU32::new(0);
         let config = make_config(0, 1_000_000);
         retention_tick(tmp.path(), &config, |_| {
-            let n = call_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let n = call_count.fetch_add(1, AtomicOrdering::Relaxed);
             if n == 0 {
                 Ok(500_000) // below threshold
             } else {
@@ -627,6 +1103,69 @@ mod tests {
         assert!(!oldest.exists(), "oldest should be deleted first");
         assert!(middle.exists(), "middle should survive");
         assert!(newest.exists(), "newest should survive");
+    }
+
+    /// AC2: pressure deletes by expiry ratio, a keep-forever env goes
+    /// last, and "last" is not "never": once nothing else is left, the
+    /// sweep takes it too, because a sweep that cannot reach the floor
+    /// is a wedged daemon.
+    #[test]
+    fn disk_pressure_ranks_by_ratio_and_reaches_keep_forever_last() {
+        let today = fixed_today();
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        // Ratios: lab 6/7 = 0.857, prod 300/365 = 0.822, prod 30/365 =
+        // 0.082, archive keep-forever. Under global oldest-first the
+        // archive dir would go first and the lab noise last.
+        let archive = plant(
+            &data_dir,
+            "archive",
+            NaiveDate::from_ymd_opt(2020, 1, 1).unwrap(),
+        );
+        let prod_300 = plant(&data_dir, "prod", days_before(today, 300));
+        let prod_30 = plant(&data_dir, "prod", days_before(today, 30));
+        let lab_6 = plant(&data_dir, "lab", days_before(today, 6));
+        let config = RetentionConfig {
+            min_free_disk_bytes: 1_000_000,
+            ..config_with_envs(90, &[("prod", 365), ("lab", 7), ("archive", 0)])
+        };
+
+        // Three deletions clear the threshold: the keep-forever dir is
+        // the one still standing.
+        let call_count = AtomicU32::new(0);
+        let log = Mutex::new(Vec::new());
+        retention_tick_at(
+            &data_dir,
+            &config,
+            today,
+            |_| {
+                let n = call_count.fetch_add(1, AtomicOrdering::Relaxed);
+                if n < 3 { Ok(500_000) } else { Ok(2_000_000) }
+            },
+            recording_delete(&log),
+        )
+        .unwrap();
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec![lab_6.clone(), prod_300.clone(), prod_30.clone()],
+            "highest expiry ratio first"
+        );
+        assert!(
+            archive.exists(),
+            "keep-forever ranks after every expiring candidate"
+        );
+
+        // Still under the floor next tick: keep-forever is a rank, not
+        // an exemption.
+        retention_tick_at(
+            &data_dir,
+            &config,
+            today,
+            always_pressured(),
+            delete_date_dir,
+        )
+        .unwrap();
+        assert!(!archive.exists(), "the sweep can always reach the floor");
     }
 
     /// Every suffix `epoch::set_aside_paths` reports suppresses the sweep —
@@ -663,7 +1202,7 @@ mod tests {
             // Permanently below threshold: without suppression this loop would
             // delete every candidate and still report zero remaining dirs.
             let config = make_config(0, 1_000_000);
-            retention_tick(&data_dir, &config, |_| Ok(500_000)).unwrap();
+            retention_tick(&data_dir, &config, always_pressured()).unwrap();
 
             assert!(
                 oldest.exists(),
@@ -687,10 +1226,10 @@ mod tests {
             std::fs::write(dir.join("data.parquet"), b"some data").unwrap();
         }
 
-        let call_count = std::sync::atomic::AtomicU32::new(0);
+        let call_count = AtomicU32::new(0);
         let config = make_config(0, 1_000_000);
         retention_tick(&data_dir, &config, |_| {
-            let n = call_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let n = call_count.fetch_add(1, AtomicOrdering::Relaxed);
             if n == 0 { Ok(500_000) } else { Ok(2_000_000) }
         })
         .unwrap();
@@ -699,10 +1238,12 @@ mod tests {
         assert!(newest.exists());
     }
 
+    /// The set-aside only gates disk-pressure deletion; the operator's
+    /// explicit age policy is unaffected, per env: the global, an
+    /// override and a keep-forever override each still say what they say.
     #[test]
     fn age_based_still_runs_while_set_aside_exists() {
-        let today = chrono::Utc::now().date_naive();
-        let old_date = today - chrono::Duration::days(200);
+        let today = fixed_today();
 
         for suffixes in set_aside_suffix_cases() {
             let tmp = tempfile::tempdir().unwrap();
@@ -710,20 +1251,34 @@ mod tests {
             for suffix in &suffixes {
                 std::fs::create_dir_all(tmp.path().join(format!("data{suffix}"))).unwrap();
             }
-            let old_dir = data_dir
-                .join("prod")
-                .join(old_date.format("%Y-%m-%d").to_string());
-            std::fs::create_dir_all(&old_dir).unwrap();
-            std::fs::write(old_dir.join("test.parquet"), b"old data").unwrap();
+            let prod_200 = plant(&data_dir, "prod", days_before(today, 200));
+            let lab_8 = plant(&data_dir, "lab", days_before(today, 8));
+            let archive_4000 = plant(&data_dir, "archive", days_before(today, 4000));
 
-            // The set-aside only gates disk-pressure deletion; the operator's
-            // explicit age policy is unaffected.
-            let config = make_config(90, 1_000_000);
-            retention_tick(&data_dir, &config, |_| Ok(500_000)).unwrap();
+            let config = RetentionConfig {
+                min_free_disk_bytes: 1_000_000,
+                ..config_with_envs(90, &[("lab", 7), ("archive", 0)])
+            };
+            retention_tick_at(
+                &data_dir,
+                &config,
+                today,
+                always_pressured(),
+                delete_date_dir,
+            )
+            .unwrap();
 
             assert!(
-                !old_dir.exists(),
+                !prod_200.exists(),
                 "age-based retention still applies ({suffixes:?})"
+            );
+            assert!(
+                !lab_8.exists(),
+                "the per-env age still applies ({suffixes:?})"
+            );
+            assert!(
+                archive_4000.exists(),
+                "keep-forever survives: age spares it and pressure is suppressed ({suffixes:?})"
             );
         }
     }
@@ -733,20 +1288,17 @@ mod tests {
     /// affected files out from under the shadow build (the catch-up diff
     /// sees additions, not disappearances, as normal), and pressure
     /// deletion could never reclaim the double-held bytes the job itself
-    /// is holding.
+    /// is holding. A per-env override licenses nothing the gate denies
+    /// (ADR-0018 §4).
     #[test]
     fn both_sweeps_suppressed_while_a_repin_is_in_flight() {
-        let today = chrono::Utc::now().date_naive();
-        let old_date = today - chrono::Duration::days(200);
+        let today = fixed_today();
 
         for staging in ["marker", "shadow", "aside"] {
             let tmp = tempfile::tempdir().unwrap();
             let data_dir = tmp.path().join("data");
-            let old_dir = data_dir
-                .join("prod")
-                .join(old_date.format("%Y-%m-%d").to_string());
-            std::fs::create_dir_all(&old_dir).unwrap();
-            std::fs::write(old_dir.join("svc.parquet"), b"affected bytes").unwrap();
+            let prod_200 = plant(&data_dir, "prod", days_before(today, 200));
+            let lab_8 = plant(&data_dir, "lab", days_before(today, 8));
             match staging {
                 "marker" => {
                     std::fs::write(data_dir.join("REPIN"), b"{}").unwrap();
@@ -759,11 +1311,21 @@ mod tests {
                 }
             }
 
-            // Age and pressure both armed, both hungry.
-            let config = make_config(90, 1_000_000);
-            retention_tick(&data_dir, &config, |_| Ok(500_000)).unwrap();
+            // Age (global and per-env) and pressure all armed, all hungry.
+            let config = RetentionConfig {
+                min_free_disk_bytes: 1_000_000,
+                ..config_with_envs(90, &[("lab", 7)])
+            };
+            retention_tick_at(
+                &data_dir,
+                &config,
+                today,
+                always_pressured(),
+                delete_date_dir,
+            )
+            .unwrap();
             assert!(
-                old_dir.exists(),
+                prod_200.exists() && lab_8.exists(),
                 "{staging}: no sweep may run while a repin is in flight"
             );
         }
@@ -789,11 +1351,11 @@ mod tests {
 
         // Permanently below threshold: only the mid-sweep claim can stop
         // this loop before it eats every candidate.
-        let call_count = std::sync::atomic::AtomicU32::new(0);
+        let call_count = AtomicU32::new(0);
         let marker = crate::repin::marker_path(&data_dir);
         let config = make_config(0, 1_000_000);
         retention_tick(&data_dir, &config, |_| {
-            let n = call_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let n = call_count.fetch_add(1, AtomicOrdering::Relaxed);
             if n == 1 {
                 // A job claims the data root while the sweep is running.
                 std::fs::write(&marker, b"{}").unwrap();
@@ -806,6 +1368,40 @@ mod tests {
         assert!(
             middle.exists() && newest.exists(),
             "no directory may be deleted once a repin owns the data root"
+        );
+    }
+
+    /// The same re-read guards the age phase. Phase 1 never consults the
+    /// free-space probe, so the marker is planted by the injected deletion
+    /// itself, right after the first age target is gone: the second age
+    /// target survives, and so does everything pressure would have taken
+    /// (the claim ends the whole tick, not just the phase).
+    #[test]
+    fn a_repin_admitted_mid_age_sweep_stops_before_the_next_age_deletion() {
+        let today = fixed_today();
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let first = plant(&data_dir, "prod", days_before(today, 200));
+        let second = plant(&data_dir, "prod", days_before(today, 150));
+        let recent = plant(&data_dir, "prod", days_before(today, 10));
+
+        let marker = crate::repin::marker_path(&data_dir);
+        let deleted = AtomicU32::new(0);
+        let config = make_config(90, 1_000_000);
+        retention_tick_at(&data_dir, &config, today, always_pressured(), |path| {
+            let bytes = delete_date_dir(path)?;
+            if deleted.fetch_add(1, AtomicOrdering::Relaxed) == 0 {
+                std::fs::write(&marker, b"{}").unwrap();
+            }
+            Ok(bytes)
+        })
+        .unwrap();
+
+        assert!(!first.exists(), "the pre-claim age deletion stands");
+        assert!(second.exists(), "the next age target survives the claim");
+        assert!(
+            recent.exists(),
+            "pressure never runs once the claim ends the tick"
         );
     }
 
@@ -853,14 +1449,9 @@ mod tests {
     #[test]
     fn sweeps_resume_after_the_repin_ends() {
         let today = chrono::Utc::now().date_naive();
-        let old_date = today - chrono::Duration::days(200);
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path().join("data");
-        let old_dir = data_dir
-            .join("prod")
-            .join(old_date.format("%Y-%m-%d").to_string());
-        std::fs::create_dir_all(&old_dir).unwrap();
-        std::fs::write(old_dir.join("svc.parquet"), b"old").unwrap();
+        let old_dir = plant(&data_dir, "prod", days_before(today, 200));
 
         let config = make_config(90, 0);
         retention_tick(&data_dir, &config, |_| Ok(u64::MAX)).unwrap();
@@ -935,5 +1526,192 @@ mod tests {
         let config = make_config(90, 1_000_000);
         // Should succeed with no dirs to process.
         retention_tick(tmp.path(), &config, |_| Ok(u64::MAX)).unwrap();
+    }
+
+    /// One planted directory as the oracle sees it. `age` and `max` are
+    /// `u32` so the oracle's ratio can go through `f64::from`: with ages
+    /// under 1000 and limits under 500, two distinct ratios differ by at
+    /// least 1/(500*500), far above f64's rounding error at that size, so
+    /// float division orders them exactly and equal rationals compare
+    /// equal. That is a different arithmetic from the sweep's u128
+    /// cross-multiplication, which is the point of an oracle.
+    struct Planted {
+        env: &'static str,
+        date: NaiveDate,
+        path: PathBuf,
+        age: u32,
+        max: u32,
+    }
+
+    impl Planted {
+        fn expired(&self) -> bool {
+            self.max != 0 && self.age > self.max
+        }
+
+        /// `None` is keep-forever.
+        fn ratio(&self) -> Option<f64> {
+            (self.max != 0).then(|| f64::from(self.age) / f64::from(self.max))
+        }
+    }
+
+    /// The reference deletion order for a tree under permanent pressure:
+    /// phase 1's expired set in (date, env) order, then phase 2's
+    /// survivors by ratio descending with keep-forever last, then date,
+    /// then env (the path's only varying component).
+    fn reference_order(planted: &[Planted]) -> Vec<PathBuf> {
+        let mut expired: Vec<&Planted> = planted.iter().filter(|p| p.expired()).collect();
+        expired.sort_by(|a, b| a.date.cmp(&b.date).then_with(|| a.env.cmp(b.env)));
+
+        let mut survivors: Vec<&Planted> = planted.iter().filter(|p| !p.expired()).collect();
+        survivors.sort_by(|a, b| {
+            let by_ratio = match (a.ratio(), b.ratio()) {
+                (None, None) => Ordering::Equal,
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (Some(ra), Some(rb)) => rb.partial_cmp(&ra).unwrap(),
+            };
+            by_ratio
+                .then_with(|| a.date.cmp(&b.date))
+                .then_with(|| a.env.cmp(b.env))
+        });
+
+        expired
+            .iter()
+            .chain(survivors.iter())
+            .map(|p| p.path.clone())
+            .collect()
+    }
+
+    /// Build one random tree: 1-4 envs, each inheriting, keep-forever or
+    /// finite; 1-6 distinct dates per env from 30 days ahead to 800 days
+    /// back, never today itself (that one is planted separately and must
+    /// survive). Returns the config and the oracle's view of the tree.
+    fn random_tree(
+        rng: &mut impl rand::Rng,
+        data_dir: &Path,
+        today: NaiveDate,
+    ) -> (RetentionConfig, Vec<Planted>) {
+        const ENVS: [&str; 4] = ["archive", "lab", "prod", "staging"];
+        let envs = &ENVS[..rng.gen_range(1..=ENVS.len())];
+        let global: u32 = if rng.gen_bool(0.2) {
+            0
+        } else {
+            rng.gen_range(1..=400)
+        };
+        let mut overrides: Vec<(&str, u64)> = Vec::new();
+        for &env in envs {
+            match rng.gen_range(0..3) {
+                0 => {}
+                1 => overrides.push((env, 0)),
+                _ => overrides.push((env, u64::from(rng.gen_range(1..=400u32)))),
+            }
+        }
+        let config = RetentionConfig {
+            min_free_disk_bytes: 1_000_000,
+            ..config_with_envs(u64::from(global), &overrides)
+        };
+
+        let mut planted = Vec::new();
+        for &env in envs {
+            let max = overrides
+                .iter()
+                .find(|(name, _)| *name == env)
+                .map_or(global, |(_, days)| u32::try_from(*days).unwrap());
+            let dates: BTreeSet<NaiveDate> = (0..rng.gen_range(1..=6))
+                .map(|_| rng.gen_range(-30i64..=800))
+                .filter(|offset| *offset != 0)
+                .map(|offset| days_before(today, offset))
+                .collect();
+            for date in dates {
+                planted.push(Planted {
+                    env,
+                    date,
+                    path: plant(data_dir, env, date),
+                    age: u32::try_from((today - date).num_days().max(0)).unwrap(),
+                    max,
+                });
+            }
+        }
+        (config, planted)
+    }
+
+    /// Every date dir under `data_dir`, listed without the enumerator
+    /// under test.
+    fn remaining_date_dirs(data_dir: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        for env in std::fs::read_dir(data_dir).unwrap().flatten() {
+            for date in std::fs::read_dir(env.path()).unwrap().flatten() {
+                out.push(date.path());
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Under permanent pressure a tick drains every non-today directory
+    /// (keep-forever included), in exactly the order an independent
+    /// oracle computes, and the ratios pressure deletes at never rise
+    /// along the way. Seeded, so a failure names its tree.
+    #[test]
+    fn generative_full_sweep_drains_in_reference_order() {
+        use rand::SeedableRng;
+
+        let today = fixed_today();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x0108);
+        for tree in 0..200 {
+            let tmp = tempfile::tempdir().unwrap();
+            let data_dir = tmp.path().join("data");
+            let (config, planted) = random_tree(&mut rng, &data_dir, today);
+            let today_dir = plant(&data_dir, "prod", today);
+            let expected = reference_order(&planted);
+
+            let log = Mutex::new(Vec::new());
+            retention_tick_at(
+                &data_dir,
+                &config,
+                today,
+                always_pressured(),
+                recording_delete(&log),
+            )
+            .unwrap();
+            let observed = log.into_inner().unwrap();
+
+            assert_eq!(
+                observed, expected,
+                "tree {tree}: delete sequence differs from the reference order"
+            );
+            assert_eq!(
+                remaining_date_dirs(&data_dir),
+                vec![today_dir.clone()],
+                "tree {tree}: the sweep drains everything but today"
+            );
+
+            // Along the pressure part of the sequence, ratios never rise
+            // and no expiring candidate follows a keep-forever one. The
+            // age part is date-ordered by design, so it is not
+            // ratio-monotone and is excluded.
+            let phase_two = observed
+                .iter()
+                .skip(planted.iter().filter(|p| p.expired()).count());
+            let mut previous: Option<Option<f64>> = None;
+            for path in phase_two {
+                let ratio = planted.iter().find(|p| p.path == *path).unwrap().ratio();
+                if let Some(prev) = previous {
+                    match (prev, ratio) {
+                        (Some(a), Some(b)) => assert!(
+                            b <= a,
+                            "tree {tree}: ratio rose from {a} to {b} at {}",
+                            path.display()
+                        ),
+                        (None, Some(_)) => panic!(
+                            "tree {tree}: expiring candidate {} after keep-forever",
+                            path.display()
+                        ),
+                        (_, None) => {}
+                    }
+                }
+                previous = Some(ratio);
+            }
+        }
     }
 }

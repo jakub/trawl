@@ -1173,9 +1173,11 @@ pub struct GcPinsResponse {
     pub decided_at: String,
     /// The requested window in seconds, after the server default applied.
     pub requested_older_than_secs: u64,
-    /// The retention window in seconds, when age retention is enabled.
-    /// A pin cannot be called dead over a span shorter than the corpus
-    /// trawl still keeps.
+    /// The retention window in seconds, when a finite retention horizon
+    /// exists. A pin cannot be called dead over a span shorter than the
+    /// corpus trawl still keeps, and the field is absent when the global
+    /// `max_age_days` or any `[retention.env.*]` entry is 0, since no
+    /// finite age then bounds what the corpus still holds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retention_floor_secs: Option<u64>,
     /// The window actually applied: the larger of the two above.

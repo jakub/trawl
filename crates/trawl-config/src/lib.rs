@@ -13,6 +13,7 @@
 //! `trawl-server` re-exports these types via `trawl_server::config::*`
 //! for its own modules; other crates use `trawl_config::...` directly.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -594,17 +595,40 @@ fn default_env_name() -> String {
 
 /// Data retention policy settings.
 ///
-/// Both policies are always-on with sensible defaults. Set either to 0
-/// to disable that specific policy. If both are 0, the retention task
-/// spawns but performs no deletions.
+/// Two independent policies, both always-on with defaults. Age retention
+/// deletes a date directory once it is older than the limit that applies
+/// to its env, which is the env's own `[retention.env.<name>]` entry when
+/// it has one and the global `max_age_days` otherwise. Disk-pressure
+/// retention is install-wide: below `min_free_disk_bytes` free, it deletes
+/// date directories one at a time until the volume is back over the
+/// threshold, taking the directory that has used up the largest fraction
+/// of its env's age limit first.
+///
+/// A 0 anywhere means "keep forever" for whatever it governs, never "the
+/// whole task is off": a global 0 with `[retention.env.prod] max_age_days
+/// = 30` still ages prod out, and an env whose own entry is 0 keeps its
+/// data past the global limit. A directory that no age limit will ever
+/// reach is still a disk-pressure candidate, ranked after everything that
+/// expires.
+///
+/// Unlike the rest of the config, this section refuses keys it does not
+/// know, and so does every `[retention.env.<name>]` table. Everywhere else
+/// a typo costs a setting that stays at its default. Here it costs data:
+/// `[retention.evn.prod] max_age_days = 365` would otherwise load, be
+/// discarded, and leave prod ageing out at the global limit while the
+/// operator reads their own config as keeping it a year.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RetentionConfig {
-    /// Delete date directories older than this many days. 0 = disabled.
+    /// Delete date directories older than this many days, for every env
+    /// without a `[retention.env.<name>]` entry of its own. 0 = those envs
+    /// keep their data forever.
     #[serde(default = "default_retention_max_age_days")]
     pub max_age_days: u64,
 
-    /// If free disk space drops below this many bytes, delete oldest
-    /// data first regardless of age. 0 = disabled.
+    /// If free disk space drops below this many bytes, delete date
+    /// directories regardless of age until it is back above, highest
+    /// expiry ratio (age over the env's limit) first. 0 = disabled.
     /// Accepts human-readable sizes like `"1G"`, `"500M"`.
     #[serde(
         default = "default_retention_min_free_disk_bytes",
@@ -615,6 +639,33 @@ pub struct RetentionConfig {
     /// How often the retention task runs (seconds).
     #[serde(default = "default_retention_interval_secs")]
     pub retention_interval_secs: u64,
+
+    /// Per-env age overrides, keyed by env name (`[retention.env.lab]`).
+    /// An env with no entry keeps `max_age_days`. Disk-pressure retention
+    /// is install-wide and takes no override: it deletes to free space,
+    /// and every env's data sits on the one filesystem.
+    ///
+    /// Keys are validated at load like `ingest.envs` entries, and a key
+    /// naming an env that is not in `ingest.envs` is legal: de-listing an
+    /// env stops new ingest for it while its directories stay on disk and
+    /// still need an age policy.
+    #[serde(default)]
+    pub env: BTreeMap<String, EnvRetention>,
+}
+
+/// One env's retention override.
+///
+/// `max_age_days` is required: an empty `[retention.env.lab]` table is a
+/// load error rather than a silent inherit or a silent 0, because the two
+/// readings ("keep what the global says" and "keep forever") are opposite
+/// answers and the operator wrote the table to say something.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnvRetention {
+    /// Delete this env's date directories older than this many days.
+    /// 0 = keep forever (still eligible for disk-pressure deletion, ranked
+    /// after everything that expires).
+    pub max_age_days: u64,
 }
 
 impl Default for RetentionConfig {
@@ -623,7 +674,22 @@ impl Default for RetentionConfig {
             max_age_days: DEFAULT_RETENTION_MAX_AGE_DAYS,
             min_free_disk_bytes: DEFAULT_RETENTION_MIN_FREE_DISK_BYTES,
             retention_interval_secs: DEFAULT_RETENTION_INTERVAL_SECS,
+            env: BTreeMap::new(),
         }
+    }
+}
+
+impl RetentionConfig {
+    /// The age limit that applies to `env`, in days: its own entry when it
+    /// has one, else the global `max_age_days`. 0 means keep forever.
+    ///
+    /// The one fallback lookup. Env names on disk and config keys are both
+    /// held to `[a-z0-9_-]{1,32}`, so this is byte equality with no folding.
+    #[must_use]
+    pub fn max_age_days_for(&self, env: &str) -> u64 {
+        self.env
+            .get(env)
+            .map_or(self.max_age_days, |e| e.max_age_days)
     }
 }
 
@@ -1547,9 +1613,40 @@ impl Config {
             ));
         }
 
-        // Env allowlist (ADR-0009): validated at load, refuse to start
-        // otherwise — env is a path segment and the charset is the whole
-        // injectivity argument.
+        self.validate_ingest_env_names()?;
+        self.validate_retention_env_keys()?;
+
+        if self.syslog.enabled {
+            if self.syslog.batch_interval_ms == 0 {
+                return Err(ConfigError::Validation(
+                    "syslog.batch_interval_ms must be > 0".into(),
+                ));
+            }
+            if self.syslog.batch_max_events == 0 {
+                return Err(ConfigError::Validation(
+                    "syslog.batch_max_events must be > 0".into(),
+                ));
+            }
+            if self.syslog.tcp_enabled && self.syslog.max_tcp_connections == 0 {
+                return Err(ConfigError::Validation(
+                    "syslog.max_tcp_connections must be > 0 when TCP is enabled".into(),
+                ));
+            }
+            if self.syslog.tcp_enabled && self.syslog.tcp_idle_timeout_secs == 0 {
+                return Err(ConfigError::Validation(
+                    "syslog.tcp_idle_timeout_secs must be > 0 when TCP is enabled".into(),
+                ));
+            }
+            self.validate_syslog_service_names()?;
+        }
+
+        Ok(())
+    }
+
+    /// Env allowlist (ADR-0009): validated at load, refuse to start
+    /// otherwise — env is a path segment and the charset is the whole
+    /// injectivity argument.
+    fn validate_ingest_env_names(&self) -> Result<(), ConfigError> {
         for env in &self.ingest.envs {
             if !is_valid_env_name(env) {
                 return Err(ConfigError::Validation(format!(
@@ -1587,31 +1684,32 @@ impl Config {
                 self.ingest.default_env, self.ingest.envs
             )));
         }
+        Ok(())
+    }
 
-        if self.syslog.enabled {
-            if self.syslog.batch_interval_ms == 0 {
-                return Err(ConfigError::Validation(
-                    "syslog.batch_interval_ms must be > 0".into(),
-                ));
+    /// Per-env retention keys are env names too: they are matched against
+    /// directory names under the data root, so they carry the same charset
+    /// as `ingest.envs` entries and are boot-fatal in the same way.
+    ///
+    /// Deliberately not cross-checked against `ingest.envs`: de-listing an
+    /// env stops new ingest for it while its data stays on disk, and that
+    /// data still needs an age policy.
+    fn validate_retention_env_keys(&self) -> Result<(), ConfigError> {
+        for env in self.retention.env.keys() {
+            if !is_valid_env_name(env) {
+                return Err(ConfigError::Validation(format!(
+                    "retention.env key {env:?} is not a valid env name \
+                     (must match [a-z0-9_-]{{1,32}})"
+                )));
             }
-            if self.syslog.batch_max_events == 0 {
-                return Err(ConfigError::Validation(
-                    "syslog.batch_max_events must be > 0".into(),
-                ));
+            if RESERVED_ENV_NAMES.contains(&env.as_str()) {
+                return Err(ConfigError::Validation(format!(
+                    "retention.env key {env:?} is reserved — `wal/` and \
+                     `scheduled/` live alongside env directories under the \
+                     data root"
+                )));
             }
-            if self.syslog.tcp_enabled && self.syslog.max_tcp_connections == 0 {
-                return Err(ConfigError::Validation(
-                    "syslog.max_tcp_connections must be > 0 when TCP is enabled".into(),
-                ));
-            }
-            if self.syslog.tcp_enabled && self.syslog.tcp_idle_timeout_secs == 0 {
-                return Err(ConfigError::Validation(
-                    "syslog.tcp_idle_timeout_secs must be > 0 when TCP is enabled".into(),
-                ));
-            }
-            self.validate_syslog_service_names()?;
         }
-
         Ok(())
     }
 
@@ -2723,6 +2821,208 @@ envs = ["prod", "lab"]
                 "default_env {reserved:?} must be rejected as reserved; got: {err}"
             );
         }
+    }
+
+    // -- [retention.env.<name>] overrides (#108) --------------------------
+
+    fn config_with_retention(retention: &str) -> Result<Config, ConfigError> {
+        Config::from_toml(&format!(
+            r#"
+[server]
+[data]
+path = "/data/*.parquet"
+[auth]
+[retention]
+{retention}
+"#
+        ))
+    }
+
+    #[test]
+    fn retention_env_overrides_parse_alongside_the_globals() {
+        // The sub-tables go last: TOML puts every scalar after a table
+        // header inside that table, so `min_free_disk_bytes` written below
+        // `[retention.env.prod]` would be a key of the override.
+        let config = config_with_retention(
+            r#"
+max_age_days = 90
+min_free_disk_bytes = "1G"
+
+[retention.env.prod]
+max_age_days = 365
+
+[retention.env.lab]
+max_age_days = 7
+"#,
+        )
+        .expect("per-env retention must parse and validate");
+
+        assert_eq!(config.retention.max_age_days, 90);
+        assert_eq!(config.retention.min_free_disk_bytes, 1024 * 1024 * 1024);
+        assert_eq!(config.retention.env.len(), 2);
+        assert_eq!(config.retention.env["prod"].max_age_days, 365);
+        assert_eq!(config.retention.env["lab"].max_age_days, 7);
+    }
+
+    #[test]
+    fn max_age_days_for_prefers_the_entry_then_the_global() {
+        let config = config_with_retention(
+            r"
+max_age_days = 90
+
+[retention.env.prod]
+max_age_days = 365
+
+[retention.env.scratch]
+max_age_days = 0
+",
+        )
+        .expect("per-env retention must parse and validate");
+
+        assert_eq!(config.retention.max_age_days_for("prod"), 365);
+        assert_eq!(
+            config.retention.max_age_days_for("scratch"),
+            0,
+            "an explicit 0 is keep-forever for that env, not a fall-through"
+        );
+        assert_eq!(
+            config.retention.max_age_days_for("staging"),
+            90,
+            "an env with no entry inherits the global"
+        );
+    }
+
+    #[test]
+    fn retention_env_table_without_max_age_days_is_a_load_error() {
+        // "Inherit the global" and "keep forever" are opposite answers, so
+        // an operator who wrote the table has to say which one they meant.
+        let err = config_with_retention(
+            r"
+max_age_days = 90
+
+[retention.env.lab]
+",
+        )
+        .expect_err("an empty override table must not load")
+        .to_string();
+        assert!(err.contains("max_age_days"), "got: {err}");
+    }
+
+    #[test]
+    fn retention_env_rejects_an_unknown_key() {
+        let err = config_with_retention(
+            r#"
+[retention.env.lab]
+max_age_days = 7
+min_free_disk_bytes = "1G"
+"#,
+        )
+        .expect_err("disk pressure is install-wide; no per-env knob exists")
+        .to_string();
+        assert!(err.contains("min_free_disk_bytes"), "got: {err}");
+    }
+
+    #[test]
+    fn retention_rejects_a_misspelled_sub_table_name() {
+        // The whole point of denying unknown keys here: `evn` parses as a
+        // perfectly valid table, and without the refusal the override is
+        // silently discarded while prod ages out at the global limit.
+        let err = config_with_retention(
+            r"
+max_age_days = 7
+
+[retention.evn.prod]
+max_age_days = 365
+",
+        )
+        .expect_err("a misspelled sub-table must not load")
+        .to_string();
+        assert!(err.contains("evn"), "got: {err}");
+    }
+
+    #[test]
+    fn retention_rejects_a_misspelled_scalar() {
+        let err = config_with_retention(
+            r"
+max_age_dayz = 7
+",
+        )
+        .expect_err("a misspelled scalar must not load")
+        .to_string();
+        assert!(err.contains("max_age_dayz"), "got: {err}");
+    }
+
+    #[test]
+    fn retention_env_keys_are_held_to_the_env_charset() {
+        let err = config_with_retention(
+            r"
+[retention.env.Prod]
+max_age_days = 30
+",
+        )
+        .expect_err("an env key is a directory name under the data root")
+        .to_string();
+        assert!(err.contains("retention.env"), "got: {err}");
+        assert!(err.contains("Prod"), "got: {err}");
+    }
+
+    #[test]
+    fn retention_env_keys_reject_reserved_names() {
+        for reserved in ["wal", "scheduled"] {
+            let err = config_with_retention(&format!(
+                r"
+[retention.env.{reserved}]
+max_age_days = 30
+"
+            ))
+            .expect_err("wal/ and scheduled/ are not envs")
+            .to_string();
+            assert!(
+                err.contains("reserved"),
+                "retention.env key {reserved:?} must be rejected as reserved; got: {err}"
+            );
+        }
+    }
+
+    /// The helm chart renders `config.retention.envs` through `toJson`, so a
+    /// values file's `1.9`, a `--set-string`'s `"1.9"`, a `"typo"` and a key
+    /// like `prod] #` reach trawld typed and quoted rather than laundered by
+    /// `int` into a one-day limit, a keep-forever 0, or an override for
+    /// `prod`. This pins the other half of that contract: every one of
+    /// those is a refused boot here.
+    #[test]
+    fn retention_env_refuses_what_the_chart_passes_through_typed() {
+        for (label, table) in [
+            ("float value", "[retention.env.prod]\nmax_age_days = 1.9"),
+            (
+                "string value",
+                "[retention.env.prod]\nmax_age_days = \"1.9\"",
+            ),
+            (
+                "typo value",
+                "[retention.env.prod]\nmax_age_days = \"not-a-number\"",
+            ),
+            ("negative value", "[retention.env.prod]\nmax_age_days = -1"),
+            (
+                "quoted bad key",
+                "[retention.env.\"prod] #\"]\nmax_age_days = 365",
+            ),
+        ] {
+            let err = config_with_retention(&format!("max_age_days = 90\n{table}\n"))
+                .expect_err(label)
+                .to_string();
+            assert!(
+                !err.is_empty(),
+                "{label}: must name the refusal; got: {err}"
+            );
+        }
+        // And the quoted GOOD key is the same env as the bare spelling, so
+        // the chart's quoting changes nothing for a valid name.
+        let config = config_with_retention(
+            "max_age_days = 90\n[retention.env.\"prod\"]\nmax_age_days = 365\n",
+        )
+        .expect("a quoted valid key loads");
+        assert_eq!(config.retention.max_age_days_for("prod"), 365);
     }
 
     #[test]

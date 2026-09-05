@@ -347,7 +347,8 @@ The postgres DSNs still arrive via the `FLEET_DATABASE_URL` / `TRAWL_DATABASE_UR
 | `config.ingest.hotBufferMaxBytes` | string | `100M` | Hot buffer memory limit |
 | `config.ingest.severityFrom` | list | `[severity, severity_text, level]` | Wire keys `_severity` derives from, first mappable wins. Bare names, or `{field, dialect}` where `dialect` (`otel`\|`syslog`) governs numerics only. Boot-fatal on a bad entry |
 | `config.ingest.timeFrom` | list | `[_time, timestamp, "@timestamp"]` | Wire keys `_time` derives from, first present wins. Must contain `_time`; a `dialect` here is an error |
-| `config.retention.maxAgeDays` | int | `90` | Data retention (days, 0 = disabled) |
+| `config.retention.maxAgeDays` | int | `90` | Age limit in days for every env without an `envs` entry (0 = keep forever for those envs) |
+| `config.retention.envs` | map | `{}` | Per-env age limits, env name to days, rendered as `[retention.env.<name>]` (0 = keep forever; still deleted last under disk pressure) |
 | `config.retention.minFreeDiskBytes` | string | `1G` | Disk space retention threshold |
 | `config.server.tlsReloadIntervalSecs` | int | `300` | Cert rotation check interval (seconds) |
 | `config.syslog.enabled` | bool | `false` | Enable native syslog listener |

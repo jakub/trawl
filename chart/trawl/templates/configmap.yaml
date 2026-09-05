@@ -88,6 +88,31 @@ data:
     max_age_days = {{ .Values.config.retention.maxAgeDays | int }}
     min_free_disk_bytes = {{ .Values.config.retention.minFreeDiskBytes | quote }}
     retention_interval_secs = {{ .Values.config.retention.retentionIntervalSecs | int }}
+    {{- /* Per-env age overrides. These sub-tables must follow the three
+         scalars above: in TOML a scalar after a sub-table header lands
+         inside that sub-table. Helm ranges a map in key order, so the
+         rendered config is stable across upgrades.
+         Key and value render through toJson, never `int`: this is a
+         deletion policy, and trawld's boot-fatal validation is the one
+         validator. `int` would launder `1.9` into a one-day limit and
+         `"typo"` into 0 (keep forever), and a raw key such as `prod] #`
+         would end the table header early and read as an override for
+         `prod`. As a quoted key and a typed value, every one of those is
+         a refused boot instead.
+         The shape is checked here because trawld cannot: `range` walks a
+         list as happily as a map, and a list's indexes `0`, `1` are
+         valid env names, so `envs: [7, 365]` would boot with two
+         overrides nobody wrote. nil (an override file unsetting it) is
+         an empty map. */}}
+    {{- $envs := .Values.config.retention.envs }}
+    {{- if and (not (kindIs "invalid" $envs)) (not (kindIs "map" $envs)) }}
+    {{- fail (printf "config.retention.envs must be a map of env name to max_age_days, got %s" (kindOf $envs)) }}
+    {{- end }}
+    {{- range $name, $days := $envs }}
+
+    [retention.env.{{ $name | toJson }}]
+    max_age_days = {{ $days | toJson }}
+    {{- end }}
 
     [syslog]
     enabled = {{ .Values.config.syslog.enabled }}

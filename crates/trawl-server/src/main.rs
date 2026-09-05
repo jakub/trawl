@@ -178,7 +178,11 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         epoch = trawl_server::epoch::CURRENT_EPOCH,
         "storage epoch verified"
     );
-    warn_unlisted_env_dirs(&config);
+    // One listing of the data root feeds both warnings.
+    if let Some(env_dirs) = on_disk_env_dirs(&config.data.base_dir()) {
+        warn_unlisted_env_dirs(&config, &env_dirs);
+        warn_retention_envs_without_dir(&config, &env_dirs);
+    }
 
     let (mut state, http_config) =
         AppState::from_config(&config, metrics_handle, derivation).await?;
@@ -544,36 +548,81 @@ fn spawn_ingest_pipeline(
     Ok(Some((handle, shutdown_tx)))
 }
 
+/// Directory names directly under the data root, or `None` when the root
+/// cannot be listed.
+///
+/// One `read_dir` feeds both boot warnings below. A non-directory entry is
+/// left out, so a stray file named `lab` counts as "no `data/lab/`".
+fn on_disk_env_dirs(data_dir: &std::path::Path) -> Option<Vec<String>> {
+    let entries = std::fs::read_dir(data_dir).ok()?;
+    Some(
+        entries
+            .flatten()
+            .filter(|entry| entry.path().is_dir())
+            .filter_map(|entry| entry.file_name().to_str().map(ToOwned::to_owned))
+            .collect(),
+    )
+}
+
+/// On-disk env directories missing from the current allowlist.
+fn unlisted_env_dirs<'a>(allowed: &[String], on_disk: &'a [String]) -> Vec<&'a str> {
+    on_disk
+        .iter()
+        .map(String::as_str)
+        .filter(|name| {
+            trawl_server::config::is_valid_env_name(name)
+                && !trawl_server::config::RESERVED_ENV_NAMES.contains(name)
+                && !allowed.iter().any(|e| e == name)
+        })
+        .collect()
+}
+
+/// `[retention.env.<name>]` keys with no `data/<name>/` directory.
+fn retention_envs_without_dir<'a>(
+    retention: &'a trawl_server::config::RetentionConfig,
+    on_disk: &[String],
+) -> Vec<&'a str> {
+    retention
+        .env
+        .keys()
+        .map(String::as_str)
+        .filter(|name| !on_disk.iter().any(|d| d == name))
+        .collect()
+}
+
 /// Warn about on-disk env directories missing from the current allowlist.
 ///
 /// The allowlist gates writes, not reads: removing an env stops new ingest
 /// for it, while its directories stay queryable and age out under retention
 /// (ADR-0009).
-fn warn_unlisted_env_dirs(config: &Config) {
-    let allowed = config.ingest.effective_envs();
-    let Ok(entries) = std::fs::read_dir(config.data.base_dir()) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        if trawl_server::config::is_valid_env_name(name)
-            && !trawl_server::config::RESERVED_ENV_NAMES.contains(&name)
-            && !allowed.iter().any(|e| e == name)
-        {
-            tracing::warn!(
-                event_type = "env_not_in_allowlist",
-                unlisted_env = %name,
-                "on-disk env directory is not in ingest.envs — new ingest \
-                 for it rejects, existing data stays queryable and ages out \
-                 under retention"
-            );
-        }
+fn warn_unlisted_env_dirs(config: &Config, on_disk: &[String]) {
+    for name in unlisted_env_dirs(&config.ingest.effective_envs(), on_disk) {
+        tracing::warn!(
+            event_type = "env_not_in_allowlist",
+            unlisted_env = %name,
+            "on-disk env directory is not in ingest.envs — new ingest \
+             for it rejects, existing data stays queryable and ages out \
+             under retention"
+        );
+    }
+}
+
+/// Warn about per-env retention overrides that govern nothing on disk.
+///
+/// Usually a typo in the env name, and a typo here is silent: the override
+/// never applies and the env it was meant for keeps the global age. Warn
+/// only, on every node — an env directory that does not exist yet is a
+/// legitimate way to pre-declare a policy, and query-only nodes run the
+/// same retention loop.
+fn warn_retention_envs_without_dir(config: &Config, on_disk: &[String]) {
+    for name in retention_envs_without_dir(&config.retention, on_disk) {
+        tracing::warn!(
+            event_type = "retention_env_without_dir",
+            retention_env = %name,
+            max_age_days = config.retention.max_age_days_for(name),
+            "retention.env names an env with no directory under the data \
+             root — the override governs nothing until data for it lands"
+        );
     }
 }
 
@@ -675,4 +724,94 @@ fn init_tracing(
 /// Resolve a path, expanding `~` to the home directory.
 fn resolve_path(path: &str) -> PathBuf {
     PathBuf::from(shellexpand::tilde(path).as_ref())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_with(retention: &str, ingest: &str) -> Config {
+        Config::from_toml(&format!(
+            r#"
+[server]
+[data]
+path = "/data/*.parquet"
+[auth]
+[ingest]
+{ingest}
+[retention]
+{retention}
+"#
+        ))
+        .expect("test config must load")
+    }
+
+    #[test]
+    fn on_disk_env_dirs_lists_directories_only() {
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(root.path().join("prod")).expect("mkdir prod");
+        std::fs::write(root.path().join("lab"), b"not a directory").expect("write lab");
+
+        let mut dirs = on_disk_env_dirs(root.path()).expect("the root lists");
+        dirs.sort();
+        assert_eq!(dirs, vec!["prod".to_string()]);
+
+        assert!(
+            on_disk_env_dirs(&root.path().join("absent")).is_none(),
+            "an unreadable root warns about nothing rather than everything"
+        );
+    }
+
+    #[test]
+    fn unlisted_env_dirs_names_dirs_outside_the_allowlist() {
+        let on_disk: Vec<String> = ["prod", "lab", "wal", "Not-An-Env"]
+            .into_iter()
+            .map(ToOwned::to_owned)
+            .collect();
+        let allowed = vec!["prod".to_string()];
+
+        assert_eq!(
+            unlisted_env_dirs(&allowed, &on_disk),
+            vec!["lab"],
+            "`wal` is reserved and `Not-An-Env` is not an env name at all"
+        );
+    }
+
+    #[test]
+    fn retention_env_without_dir_flags_the_entry_with_no_directory() {
+        // The typo case: `labb` governs nothing, and `lab` keeps the
+        // global 90 days while the operator thinks it keeps 7.
+        let config = config_with(
+            r"
+max_age_days = 90
+
+[retention.env.prod]
+max_age_days = 365
+
+[retention.env.labb]
+max_age_days = 7
+",
+            "",
+        );
+        let on_disk: Vec<String> = ["prod", "lab"].into_iter().map(ToOwned::to_owned).collect();
+
+        assert_eq!(
+            retention_envs_without_dir(&config.retention, &on_disk),
+            vec!["labb"]
+        );
+    }
+
+    #[test]
+    fn retention_env_without_dir_is_silent_when_every_entry_has_one() {
+        let config = config_with(
+            r"
+[retention.env.prod]
+max_age_days = 365
+",
+            "",
+        );
+        let on_disk = vec!["prod".to_string()];
+
+        assert!(retention_envs_without_dir(&config.retention, &on_disk).is_empty());
+    }
 }
