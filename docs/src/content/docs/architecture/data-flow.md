@@ -347,7 +347,7 @@ interval would be dropped with nothing recording the loss.
 
 ### Catch-up and the clamp
 
-Coalescing is unbounded by default, and a week of downtime would otherwise
+Without a cap, coalescing would be unbounded: a week of downtime would
 hand the next run a week-wide window and one enormous query. So a gap
 wider than `max_catchup_intervals` intervals (config, default 24) clamps
 the window start forward to `window_end - max_catchup_intervals *

@@ -665,12 +665,16 @@ Response body:
 - `lag` and `lag_secs` are present exactly when `window` is. A windowed
   schedule with no lag reports `"0s"` and `0`, which is the value in
   force, not an absence.
-- `covered_through` is the `since_last` watermark, the end of the newest
-  window a successful run covered. Absent for a fixed window and for query
-  mode, neither of which claims coverage. A schedule that used to tile keeps
-  its watermark stored across a mode change, so switching back to
-  `since_last` resumes from it, but it is not reported while the schedule is
-  in a mode that does not mean it.
+- `covered_through` is the `since_last` watermark, the instant the next
+  window starts from. It is not evidence that a run happened: a fresh tiling
+  schedule is seeded at the origin of the coverage it owes,
+  `next_fire_at - interval - lag`, before it has ever run, and only after a
+  success does it become the end of the newest window a run covered. Use
+  `total_runs` and `last_run` to ask whether anything has run. Absent for a
+  fixed window and for query mode, neither of which claims coverage. A
+  schedule that used to tile keeps its watermark stored across a mode
+  change, so switching back to `since_last` resumes from it, but it is not
+  reported while the schedule is in a mode that does not mean it.
 - `next_fire_at` is the planned next fire instant. Always present, windowed
   or not. All three instants are RFC 3339, UTC, microseconds.
 
@@ -763,7 +767,8 @@ query may not carry its own time clause.
 Every successful run is recorded, including one that found no rows. A
 zero-row run has no parquet file (there is no schema to write), so its
 columns are stored as a compressed JSON blob; `GET
-/saved/{id}/runs/{run_id}` returns those columns with an empty row list,
+/api/v1/saved/{id}/runs/{run_id}` returns those columns with an empty row
+list,
 and the run keeps its window like any other.
 
 Reading runs back through the DSL follows from that. `| from saved <name>
