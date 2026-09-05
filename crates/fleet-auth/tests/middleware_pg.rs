@@ -13,7 +13,7 @@
 
 #![cfg(feature = "axum")]
 
-use std::sync::Arc;
+mod common;
 
 use axum::Extension;
 use axum::Router;
@@ -30,6 +30,8 @@ use fleet_auth::{
 };
 use tower::ServiceExt as _;
 use zeroize::Zeroizing;
+
+use common::{body_string, session_state};
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -50,19 +52,16 @@ fn session_config(app_namespace: &str) -> SessionConfig {
     // ADR-0016: `public_origins` is required, so even a fixture that never
     // sends an `Origin` states one. These tests exercise `RequireSession`,
     // which does not run the origin guard.
-    SessionConfig::new(
-        "fleet_session",
-        app_namespace,
-        PublicOrigins::parse(["https://trawl.example.com"]).expect("valid allowlist"),
-    )
-    .expect("valid session config")
-}
-
-fn session_state(store: KeyStore, app_namespace: &str) -> (SessionState, Arc<SessionKey>) {
-    let session_key = Arc::new(SessionKey::generate());
-    let config = Arc::new(session_config(app_namespace));
-    let state = SessionState::new(store, Arc::clone(&session_key), config).unwrap();
-    (state, session_key)
+    SessionConfig::builder()
+        .cookie_name("fleet_session")
+        .app_namespace(app_namespace)
+        .public_origins(
+            PublicOrigins::parse(["https://trawl.example.com"]).expect("valid allowlist"),
+        )
+        .secure(true)
+        .post_login_redirect("/")
+        .build()
+        .expect("valid session config")
 }
 
 fn session_router(state: SessionState) -> Router {
@@ -108,13 +107,6 @@ async fn trawl_role(store: &KeyStore) -> Vec<String> {
     vec!["trawl-analyst".to_owned()]
 }
 
-async fn body_string(response: axum::response::Response) -> String {
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    String::from_utf8(bytes.to_vec()).unwrap()
-}
-
 // ---------------------------------------------------------------------------
 // require_session
 // ---------------------------------------------------------------------------
@@ -129,7 +121,7 @@ async fn session_valid_cookie_sets_extension(pool: sqlx::PgPool) {
         .await
         .unwrap();
 
-    let (state, session_key) = session_state(store, "trawl");
+    let (state, session_key) = session_state(store, session_config("trawl"));
     let cookie_value = issue_session_cookie(&session_key, &created.plaintext_token, 3600);
     let app = session_router(state);
 
@@ -161,7 +153,7 @@ async fn session_valid_cookie_sets_extension(pool: sqlx::PgPool) {
 async fn session_missing_cookie_returns_401(pool: sqlx::PgPool) {
     let store = KeyStore::from_pool(pool);
 
-    let (state, _) = session_state(store, "trawl");
+    let (state, _) = session_state(store, session_config("trawl"));
     let app = session_router(state);
 
     let response = app
@@ -188,7 +180,7 @@ async fn session_expired_cookie_returns_401_keeps_cookie(pool: sqlx::PgPool) {
         .await
         .unwrap();
 
-    let (state, session_key) = session_state(store, "trawl");
+    let (state, session_key) = session_state(store, session_config("trawl"));
     // ttl_secs negative → exp in the past → is_expired true
     let cookie_value = issue_session_cookie(&session_key, &created.plaintext_token, -60);
     let app = session_router(state);
@@ -226,7 +218,7 @@ async fn session_tampered_cookie_returns_401(pool: sqlx::PgPool) {
         .await
         .unwrap();
 
-    let (state, session_key) = session_state(store, "trawl");
+    let (state, session_key) = session_state(store, session_config("trawl"));
     let cookie_value = issue_session_cookie(&session_key, &created.plaintext_token, 3600);
     let mut bytes = cookie_value.into_bytes();
     let mid = bytes.len() / 2;
@@ -260,7 +252,7 @@ async fn session_no_grant_returns_403_html_keeps_cookie(pool: sqlx::PgPool) {
         .await
         .unwrap();
 
-    let (state, session_key) = session_state(store, "coastwatch");
+    let (state, session_key) = session_state(store, session_config("coastwatch"));
     let cookie_value = issue_session_cookie(&session_key, &created.plaintext_token, 3600);
     let app = session_router(state);
 
@@ -306,7 +298,7 @@ async fn session_grant_revoked_during_session_returns_403(pool: sqlx::PgPool) {
         .await
         .unwrap();
 
-    let (state, session_key) = session_state(store.clone(), "trawl");
+    let (state, session_key) = session_state(store.clone(), session_config("trawl"));
     let cookie_value = issue_session_cookie(&session_key, &created.plaintext_token, 3600);
     let app = session_router(state);
 
@@ -346,7 +338,7 @@ async fn session_revoked_key_returns_401(pool: sqlx::PgPool) {
         .await
         .unwrap();
 
-    let (state, session_key) = session_state(store.clone(), "trawl");
+    let (state, session_key) = session_state(store.clone(), session_config("trawl"));
     let cookie_value = issue_session_cookie(&session_key, &created.plaintext_token, 3600);
 
     store.revoke_key(&created.info.prefix).await.unwrap();
@@ -383,7 +375,7 @@ async fn bearer_valid_token_sets_extension(pool: sqlx::PgPool) {
         .await
         .unwrap();
 
-    let (state, _) = session_state(store, "trawl");
+    let (state, _) = session_state(store, session_config("trawl"));
     let app = bearer_router(state);
 
     let response = app
@@ -410,7 +402,7 @@ async fn bearer_valid_token_sets_extension(pool: sqlx::PgPool) {
 async fn bearer_missing_header_returns_401(pool: sqlx::PgPool) {
     let store = KeyStore::from_pool(pool);
 
-    let (state, _) = session_state(store, "trawl");
+    let (state, _) = session_state(store, session_config("trawl"));
     let app = bearer_router(state);
 
     let response = app
@@ -430,7 +422,7 @@ async fn bearer_missing_header_returns_401(pool: sqlx::PgPool) {
 async fn bearer_malformed_scheme_returns_401(pool: sqlx::PgPool) {
     let store = KeyStore::from_pool(pool);
 
-    let (state, _) = session_state(store, "trawl");
+    let (state, _) = session_state(store, session_config("trawl"));
     let app = bearer_router(state);
 
     let response = app
@@ -451,7 +443,7 @@ async fn bearer_malformed_scheme_returns_401(pool: sqlx::PgPool) {
 async fn bearer_invalid_token_returns_401(pool: sqlx::PgPool) {
     let store = KeyStore::from_pool(pool);
 
-    let (state, _) = session_state(store, "trawl");
+    let (state, _) = session_state(store, session_config("trawl"));
     let app = bearer_router(state);
 
     let response = app
@@ -485,7 +477,7 @@ async fn bearer_does_not_enforce_namespace(pool: sqlx::PgPool) {
         .await
         .unwrap();
 
-    let (state, _) = session_state(store, "coastwatch");
+    let (state, _) = session_state(store, session_config("coastwatch"));
     let app = bearer_router(state);
 
     let response = app
