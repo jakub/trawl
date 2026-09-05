@@ -152,6 +152,15 @@ for the ordered pin/conflict workflow and file-source configuration.
 `lefthook install` wires the same suites into pre-push, split across both
 compose clusters so parallel runs don't collide.
 
+### Full-app experiment
+
+`bin/app-experiment` builds this checkout, starts disposable Postgres and the
+real daemons, sends seeded synthetic logs, and drives Chromium through login,
+search, and live tail. It verifies exact results after compaction and restart,
+then removes its owned resources and retains a private diagnostic report.
+See [the experiment guide](scripts/app-experiment/README.md) for prerequisites,
+rate controls, bounded interactive use, and validation limits.
+
 ### Browser tests
 
 `cargo xtask e2e` runs a real-browser Playwright suite against the built

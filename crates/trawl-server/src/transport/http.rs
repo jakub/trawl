@@ -296,7 +296,12 @@ pub async fn serve(
         .await
         .map_err(|e| crate::error::ServerError::Internal(format!("failed to bind {addr}: {e}")))?;
 
-    tracing::info!(event_type = "lifecycle", addr = %addr, "HTTPS server listening");
+    // Report the bound port, including when a disposable instance asks the
+    // OS for a port with :0. The listener owns it before it is advertised.
+    let local_addr = listener
+        .local_addr()
+        .map_err(|e| crate::error::ServerError::Internal(format!("listener local_addr: {e}")))?;
+    tracing::info!(event_type = "lifecycle", addr = %local_addr, "HTTPS server listening");
 
     accept_loop(
         listener,
