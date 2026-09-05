@@ -15,7 +15,7 @@ import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { parseArgs } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
-import { corpus, verifyRows, percentile } from './workload.mjs';
+import { corpus, verifyRows, verifyBrowserPage, percentile } from './workload.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const { values: args } = parseArgs({ options: {
@@ -261,8 +261,10 @@ async function experiment() {
   const fleetDsn = `postgres://experiment:${password}@${mapping}/fleet`;
   const appDsn = `postgres://experiment:${password}@${mapping}/trawl`;
   secretValues.push(fleetDsn, appDsn);
+  // The image's temporary init server only listens on a Unix socket.
+  // TCP readiness proves that the final server has replaced it.
   await poll('Postgres readiness', async () => {
-    try { await command('docker', ['exec', container, 'pg_isready', '-U', 'experiment', '-d', 'fleet'], { timeout: 5000 }); return true; }
+    try { await command('docker', ['exec', container, 'pg_isready', '-h', '127.0.0.1', '-U', 'experiment', '-d', 'fleet'], { timeout: 5000 }); return true; }
     catch (e) { checkInterrupted(); return false; }
   });
   await command('docker', ['exec', container, 'createdb', '-U', 'experiment', 'trawl']);
@@ -385,8 +387,7 @@ async function experiment() {
     const initialPage = await initialResponse.json();
     await writeJSON('browser-initial-response.json', initialPage);
     assert.equal(initialResponse.status(), 200, 'browser query failed; see browser-initial-response.json');
-    assert.ok(initialPage.pagination.returned > 0, 'browser search returned no rows');
-    verifyRows(initialPage, events.slice(0, Math.min(firstCount, initialPage.pagination.returned)));
+    verifyBrowserPage(initialPage, events.slice(0, firstCount));
     await page.locator('.results table tbody tr').first().waitFor();
     const firstCells = await page.locator('.results table tbody tr').first().locator('td').allTextContents();
     assert.deepEqual(firstCells.slice(1).map(c => c.trim()), initialPage.rows[0].map(String), 'rendered cells differ from the query response');
@@ -445,8 +446,7 @@ async function experiment() {
     const restartedPage = await afterRestartResponse.json();
     await writeJSON('browser-restarted-response.json', restartedPage);
     assert.equal(afterRestartResponse.status(), 200, 'browser query failed; see browser-restarted-response.json');
-    assert.ok(restartedPage.pagination.returned > 0, 'browser search returned no rows after restart');
-    verifyRows(restartedPage, events.slice(0, restartedPage.pagination.returned));
+    verifyBrowserPage(restartedPage, events);
     await page.locator('.results table tbody tr').first().waitFor();
     const restartedCells = await page.locator('.results table tbody tr').first().locator('td').allTextContents();
     assert.deepEqual(restartedCells.slice(1).map(c => c.trim()), restartedPage.rows[0].map(String), 'rendered cells differ after restart');
@@ -484,8 +484,9 @@ try {
   // Cleanup runs even after a failed startup or a signal. No database sweep,
   // volume prune, or PID-file based kill ever touches someone else's instance.
   if (browser) await browser.close().catch(() => {});
-  for (const child of [...children].reverse()) await stop(child);
-  report.cleanup.processes = [...children].every(c => c.exitCode !== null || c.signalCode !== null);
+  const ownedChildren = [...children];
+  for (const child of ownedChildren.reverse()) await stop(child);
+  report.cleanup.processes = ownedChildren.every(c => c.exitCode !== null || c.signalCode !== null);
   const wasInterrupted = interrupted;
   interrupted = false;
   if (containerAttempted) {
