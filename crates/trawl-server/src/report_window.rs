@@ -916,6 +916,40 @@ mod tests {
         assert_eq!(plan.window, None);
     }
 
+    /// The two operator-chosen numbers the planner multiplies are both
+    /// capped, so there is one widest catch-up span any install can ask
+    /// for: a million intervals of the longest interval the duration
+    /// grammar accepts. It has to PLAN. Were the product unrepresentable,
+    /// the answer would be `PlanError::Arithmetic` on this poll and on
+    /// every poll after it, with the fire cursor never advancing.
+    #[test]
+    fn the_widest_configurable_catchup_span_still_plans() {
+        let mut widest = since_last_input(at(3, 0), Some(at(2, 0)));
+        widest.interval_secs = crate::store::MAX_DURATION_SECS;
+        widest.max_catchup_intervals = trawl_config::MAX_SCHEDULER_CATCHUP_INTERVALS;
+
+        // The watermark is an hour back, far inside the ceiling, so the
+        // window tiles from it. Reaching that answer at all means the
+        // ceiling's span was computed rather than overflowed: the
+        // comparison against it happens before the branch is chosen.
+        let window = window_of(&widest);
+        assert_eq!(window.start, at(2, 0));
+        assert_eq!(window.end, at(3, 0));
+        assert!(!window.truncated);
+    }
+
+    /// trawl-config cannot import the duration cap, because trawl-server
+    /// depends on trawl-config and not the other way round, so it carries
+    /// a copy. This is the only place that can see both.
+    #[test]
+    fn config_duration_mirror_matches_the_grammar_cap() {
+        assert_eq!(
+            trawl_config::MIRRORED_MAX_DURATION_SECS,
+            crate::store::MAX_DURATION_SECS,
+            "trawl-config's mirrored duration cap drifted from the grammar's"
+        );
+    }
+
     /// Every add and subtract is checked, so an instant near the end of
     /// the representable range is an error rather than a panic or a
     /// wrapped bound. A zero interval or catch-up bound is a config fault
