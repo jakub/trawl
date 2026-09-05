@@ -28,7 +28,10 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
-use trawl_client::{HistoryResponse, HttpClient, ListSavedResponse, QueryResponse, SchemaResponse};
+use trawl_client::{
+    ClientError, HistoryResponse, HttpClient, ListSavedResponse, QueryResponse, SchemaResponse,
+    WhoAmIResponse,
+};
 
 use self::driver::{DriverCommand, DriverResponse, ExecuteWaiter, query_response_to_data};
 use self::state::{
@@ -714,6 +717,24 @@ impl App {
     }
 }
 
+fn apply_whoami_result(app: &mut App, whoami_result: Result<WhoAmIResponse, ClientError>) {
+    match whoami_result {
+        Ok(whoami) => {
+            app.dashboard.is_admin = whoami
+                .permissions
+                .iter()
+                .any(|permission| permission == "server_manage");
+            if app.dashboard.is_admin {
+                tracing::info!("admin privileges detected — Dashboard tab enabled");
+            }
+        }
+        Err(error) => {
+            app.dashboard.is_admin = false;
+            tracing::warn!("failed to fetch permissions: {error} — Dashboard tab disabled");
+        }
+    }
+}
+
 /// Run the TUI application.
 #[allow(clippy::too_many_lines)] // orchestration entry point — splitting adds indirection without clarity
 pub async fn run(
@@ -830,15 +851,7 @@ pub async fn run(
     app.saved_cache = saved;
     app.panel.schema = schema_browser;
     app.server_version = server_version;
-    let is_admin = whoami_result
-        .as_ref()
-        .is_ok_and(|w| w.permissions.iter().any(|p| p == "server_manage"));
-    app.dashboard.is_admin = is_admin;
-    if is_admin {
-        tracing::info!("admin privileges detected — Dashboard tab enabled");
-    } else if let Err(e) = &whoami_result {
-        tracing::warn!("failed to fetch permissions: {e} — Dashboard tab disabled");
-    }
+    apply_whoami_result(&mut app, whoami_result);
 
     // Start driver socket if requested.
     if let Some(path) = driver_path {
@@ -976,6 +989,26 @@ mod tests {
         }
     }
 
+    fn whoami(roles: &[&str], permissions: &[&str]) -> WhoAmIResponse {
+        WhoAmIResponse {
+            prefix: "abcd1234".to_owned(),
+            name: "test-key".to_owned(),
+            kind: trawl_api::PrincipalKind::Human,
+            roles: roles.iter().map(|role| (*role).to_owned()).collect(),
+            permissions: permissions
+                .iter()
+                .map(|permission| (*permission).to_owned())
+                .collect(),
+        }
+    }
+
+    fn rendered_app(app: &mut App) -> String {
+        let backend = ratatui::backend::TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| ui::render(app, frame)).unwrap();
+        terminal.backend().to_string()
+    }
+
     // --- Focus transition tests ---
 
     #[test]
@@ -1007,6 +1040,54 @@ mod tests {
     }
 
     // --- Tab switching tests ---
+
+    #[test]
+    fn whoami_permissions_drive_dashboard_tab_false_true_false() {
+        let mut app = test_app();
+
+        apply_whoami_result(&mut app, Ok(whoami(&["trawl-admin"], &["query"])));
+        assert!(!app.dashboard.is_admin);
+        assert!(!rendered_app(&mut app).contains("M-5 Dashboard"));
+        app.handle_key(key_mod(KeyCode::Char('5'), KeyModifiers::ALT));
+        assert_eq!(app.main_tab, MainTab::Query);
+
+        apply_whoami_result(
+            &mut app,
+            Ok(whoami(&["arbitrary-role"], &["server_manage"])),
+        );
+        assert!(app.dashboard.is_admin);
+        assert!(rendered_app(&mut app).contains("M-5 Dashboard"));
+        app.handle_key(key_mod(KeyCode::Char('5'), KeyModifiers::ALT));
+        assert_eq!(app.main_tab, MainTab::Dashboard);
+
+        app.switch_to_main_tab(MainTab::Query);
+        apply_whoami_result(&mut app, Ok(whoami(&["trawl-admin"], &["schema_read"])));
+        assert!(!app.dashboard.is_admin);
+        assert_eq!(app.main_tab, MainTab::Query);
+        assert!(!rendered_app(&mut app).contains("M-5 Dashboard"));
+        app.handle_key(key_mod(KeyCode::Char('5'), KeyModifiers::ALT));
+        assert_eq!(app.main_tab, MainTab::Query);
+    }
+
+    #[test]
+    fn whoami_error_clears_dashboard_access() {
+        let mut app = test_app();
+        apply_whoami_result(
+            &mut app,
+            Ok(whoami(&["server-operator"], &["server_manage"])),
+        );
+        assert!(app.dashboard.is_admin);
+
+        apply_whoami_result(
+            &mut app,
+            Err(ClientError::Network("whoami unavailable".to_owned())),
+        );
+        assert!(!app.dashboard.is_admin);
+        assert_eq!(app.main_tab, MainTab::Query);
+        assert!(!rendered_app(&mut app).contains("M-5 Dashboard"));
+        app.handle_key(key_mod(KeyCode::Char('5'), KeyModifiers::ALT));
+        assert_eq!(app.main_tab, MainTab::Query);
+    }
 
     #[test]
     fn key_alt_1_switches_to_query_tab() {
