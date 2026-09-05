@@ -56,11 +56,11 @@ session = [
     "dep:chacha20poly1305",
     "dep:chrono",
     "dep:cookie",
-    # `http` types (`HeaderMap`/`Uri`) back `request_host` — the shared
-    # Host-header → `:authority` derivation both fleet-auth's own handlers and
-    # thin session-only proxies (trawl-web) feed into `check_origin`. `http` is
-    # a lightweight, wasm-clean types crate, so it stays fine for session-only
-    # (e.g. renderer) consumers.
+    # `http::HeaderMap` is what `check_origin` takes: the guard reads the
+    # `Origin` field set itself (ADR-0016), because "how many Origin headers
+    # are there" and "is this value UTF-8" are questions a caller must not be
+    # left to answer differently. `http` is a lightweight, wasm-clean types
+    # crate, so it stays fine for session-only (e.g. renderer) consumers.
     "dep:http",
     "dep:rand",
     "dep:serde_json",
@@ -89,6 +89,11 @@ fast-hash = []
 fleet-auth = { path = ".", features = ["axum", "fast-hash"] }
 tempfile = { workspace = true }
 tokio = { workspace = true }
+# Already a workspace dependency (trawl-server, trawl-web, trawl-cli). Here it
+# only backs the capture layer that pins the cross-origin rejection log's
+# fields — the claim that a hostile header never reaches the log needs a
+# subscriber to read the emitted line back.
+tracing-subscriber = { workspace = true }
 # Used by integration tests for `Router::oneshot` — only needed under the
 # `axum` feature, but dev-dependencies don't support feature-gating cleanly,
 # so it's unconditional here. The test files themselves are gated.

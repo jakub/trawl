@@ -94,7 +94,9 @@ transitional file along with the crate.
   pointed at an `op inject`-provisioned Secret. The cutover runbook documents
   the procedure. Per coastwatch ADR-0038 the key stays an `op://` runtime
   reference — never committed ciphertext — because it is cross-repo shared.
-- **Origin validation lands in the fleet-auth substrate, default-on.** The
+- **Origin validation lands in the fleet-auth substrate, default-on.**
+  (Superseded by ADR-0016: the host-only comparison described here is now a
+  whole-origin comparison against a configured `public_origins` list.) The
   shared `fleet_session` cookie makes logout forgeable cross-site (fleet-auth's
   documented caveat: a forged POST to either app's `/api/auth/logout` clears
   the cookie for both). `fleet_auth::session` gains an origin-validation helper

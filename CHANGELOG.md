@@ -373,6 +373,49 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   re-commissioning starts from ADR-0020, not from the removed stand-ins.
 
 ### Changed
+- **BREAKING: `trawl-web` requires `[web] public_origins`, and the origin
+  check compares the whole origin (ADR-0016, #92).** The CSRF guard used to
+  compare the `Origin` header's *host* against the request's `Host` header.
+  That admitted same-host cross-scheme and cross-port forgery (an active
+  attacker serving `http://trawl.example.com`, or another port of the same
+  name, passed) and it made the verdict depend on a header a reverse proxy
+  rewrites. A present `Origin` is now compared whole, normalized scheme and
+  host and effective port, against origins the operator states, and no
+  forwarding header is consulted from any peer.
+
+  **Every trawl-web install must state its browser-visible origin before
+  restart**: `[web] public_origins = ["https://trawl.example.com"]` in
+  `trawld.toml`, or `FLEET_SESSION_PUBLIC_ORIGINS` as a comma-separated
+  list. An empty list is a startup error naming the knob. There is no
+  host-only legacy mode and no empty-means-allow-everything default,
+  because both fail silently. State what the *browser* shows, not the
+  loopback address a TLS-terminating proxy forwards to, and state every
+  spelling you serve: `http://localhost:8090` and `http://127.0.0.1:8090`
+  are two origins, as are `https://x` and `https://x.` (the DNS root dot a
+  browser preserves). Only the default port normalizes, so `https://x` and
+  `https://x:443` are one.
+
+  The Debian package ships the two loopback spellings of its own packaged
+  bind, so a default install starts as it did. Helm refuses to render
+  `web.enabled=true` without `web.publicOrigins`, never derives it from
+  ingress hosts or httpRoute hostnames, and also passes the list to the
+  sidecar as `FLEET_SESSION_PUBLIC_ORIGINS` so a `config.raw` replacing the
+  generated TOML still carries it.
+
+  The check reaches further than it did. It runs in the session extractor
+  instead of at individual handlers, so it now covers `/api/v1/stream` and
+  `/api/v1/dashboard/stream` (both SSE routes bypassed the old guard
+  entirely), every proxied method including GET, and `/api/auth/me`. It is
+  decided before the cookie is read, so a disallowed origin with an expired
+  cookie is a 403 with no `Set-Cookie` rather than the expiry branch's clear
+  directive. Bearer clients stay exempt (nothing a foreign page does makes a
+  browser attach someone else's `Authorization` header), and an absent
+  `Origin` still passes, so curl, the CLI and vector are unaffected.
+
+  Sibling fleet apps adopt the fleet-auth API change in their own PR:
+  coastwatch is red against the path dependency until it does, and it will
+  need its own `public_origins` list.
+
 - **`now()` is one instant per unit of output (ADR-0017 §3, #106).** It used
   to be read per CALL SITE: a `let` and a `where` in one statement could see
   different instants, and the streaming lane sampled its filter window once

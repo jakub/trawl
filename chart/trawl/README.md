@@ -11,13 +11,18 @@ kubectl create secret generic fleet-db \
 kubectl create secret generic trawl-db \
   --from-literal=TRAWL_DATABASE_URL='postgres://trawl:...@pg:5432/trawl'
 
-# Install from GHCR OCI registry
+# Install from GHCR OCI registry. web.publicOrigins is the browser-visible
+# origin of the web UI and is required whenever the sidecar is enabled;
+# http://localhost:8090 is what a port-forwarded UI shows in the address bar.
 helm install trawl oci://ghcr.io/jakub/charts/trawl \
   --set auth.database.existingSecret=fleet-db \
-  --set storage.database.existingSecret=trawl-db
+  --set storage.database.existingSecret=trawl-db \
+  --set-string 'web.publicOrigins[0]=http://localhost:8090'
 
-# Port-forward for local access
-kubectl port-forward svc/trawl 5514:5514
+# Port-forward for local access: 5514 for the API, 8090 for the web UI.
+# The 8090 mapping is what makes http://localhost:8090 above the origin the
+# browser actually sends, so the two have to name the same port.
+kubectl port-forward svc/trawl 5514:5514 8090:8090
 
 # Query via CLI (self-signed cert; mint tokens with fleet-admin)
 trawl query --url https://localhost:5514 --insecure --token <TOKEN> "* | head 5"
@@ -55,17 +60,23 @@ There is no fallback between the two URLs — provision both databases. See the 
 # Default install (self-signed TLS, 50Gi storage)
 helm install trawl oci://ghcr.io/jakub/charts/trawl \
   --set auth.database.existingSecret=fleet-db \
-  --set storage.database.existingSecret=trawl-db
+  --set storage.database.existingSecret=trawl-db \
+  --set-string 'web.publicOrigins[0]=https://trawl.example.com'
 
 # Custom values
 helm install trawl oci://ghcr.io/jakub/charts/trawl \
   --set auth.database.existingSecret=fleet-db \
   --set storage.database.existingSecret=trawl-db \
+  --set-string 'web.publicOrigins[0]=https://trawl.example.com' \
   --set persistence.size=100Gi \
   --set config.retention.maxAgeDays=180
 
 # From source
-helm install trawl ./chart/trawl
+helm install trawl ./chart/trawl \
+  --set-string 'web.publicOrigins[0]=https://trawl.example.com'
+
+# Or turn the browser UI off entirely; then no origin is needed
+helm install trawl ./chart/trawl --set web.enabled=false
 ```
 
 ## Auth
@@ -143,10 +154,17 @@ ingress:
         - trawl.example.com
 ```
 
-Two things to keep in mind:
+Three things to keep in mind:
 
 1. **API clients keep talking to trawld directly.** `trawl query`, the `trawl-client` library, and vector all use bearer tokens against trawld's HTTPS port (5514). The web-UI ingress rejects non-cookie auth and blocks `/api/v1/ingest` outright. In-cluster clients hit the Service on 5514; external clients need a LoadBalancer or a second ingress with `ingress.backend: trawld`.
-2. **Cookie flags assume end-to-end TLS.** The proxy sets `Secure` on session cookies. If your ingress TLS-terminates AND forwards plain HTTP to the Service, browsers will discard the cookie. Flip `web.allowInsecureCookies: true` only in that topology — never over the open internet.
+2. **Keep `Secure` for browser HTTPS.** The proxy sets `Secure` on session cookies. Browsers accept these cookies over HTTPS even when the ingress forwards plain HTTP to the Service. Set `web.allowInsecureCookies: true` only when the browser itself connects over HTTP, such as on a local development network.
+3. **The ingress host is not the browser origin.** `web.publicOrigins` is required whenever `web.enabled`, and the chart refuses to render without it. State what the address bar shows, scheme and port included; the chart never derives it from `ingress.hosts` or `httpRoute.hostnames`, because a host rule carries no scheme and one install often answers to several names. The proxy compares a browser's `Origin` header against this list whole, and consults no forwarding header (ADR-0016), so a TLS-terminating ingress needs the `https://` origin here even though it forwards plain HTTP.
+
+```yaml
+web:
+  publicOrigins:
+    - https://trawl.example.com
+```
 
 Switch the ingress backend to the raw HTTPS API instead:
 
@@ -315,8 +333,9 @@ The postgres DSNs still arrive via the `FLEET_DATABASE_URL` / `TRAWL_DATABASE_UR
 | `ingress.backend` | string | `web` | Target service port: `web` (trawl-web, default) or `trawld` (raw HTTPS API) |
 | `web.enabled` | bool | `true` | Run the trawl-web session proxy sidecar |
 | `web.bindAddr` | string | `0.0.0.0:8090` | Bind address for trawl-web (pod-IP reachable) |
+| `web.publicOrigins` | list | `[]` | **Required when `web.enabled`.** Browser-visible origins allowed to carry a session cookie, e.g. `https://trawl.example.com`. Compared whole (scheme, host, port); never derived from ingress hosts. Rendered into `[web] public_origins` and passed to the sidecar as the identical `FLEET_SESSION_PUBLIC_ORIGINS`, so it survives a `config.raw`. The environment wins on read, and trawl-web warns only when the two lists differ |
 | `web.sessionTtlSecs` | int | `86400` | Browser session lifetime (seconds) |
-| `web.allowInsecureCookies` | bool | `false` | Drop `Secure` flag on session cookies (behind TLS-terminating ingress only) |
+| `web.allowInsecureCookies` | bool | `false` | Drop `Secure` from session cookies for browser HTTP. Keep false for browser HTTPS, including when an ingress terminates TLS |
 | `web.logLevel` | string | `trawl_web=info,fleet_auth=info` | RUST_LOG for the sidecar (the trawld `logLevel` names no trawl-web target) |
 | `web.resources` | object | cpu 50m / mem 64Mi–256Mi | Resource requests/limits for the sidecar |
 | `web.cookieSecret.existingSecret` | string | `""` | Name of a pre-existing Secret holding the cookie key (chart generates one when empty) |

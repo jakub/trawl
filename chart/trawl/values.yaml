@@ -307,9 +307,29 @@ web:
   # Must bind to a pod-IP-reachable address (not loopback), so the
   # Service's `web` port can route to it.
   bindAddr: "0.0.0.0:8090"
+  # Browser-visible origins allowed to carry a session cookie (ADR-0016).
+  # REQUIRED when web.enabled: the render FAILS on an empty list rather
+  # than installing a proxy that refuses every browser, and there is no
+  # "empty means allow anything" default to fall into.
+  #
+  # State what the browser's address bar shows, scheme and port included.
+  # A present Origin header is matched whole (scheme, host, port, with the
+  # default port filled in), so http://localhost:8090 and
+  # http://127.0.0.1:8090 are two entries, not one.
+  #
+  # NEVER derived from ingress.hosts or httpRoute.hostnames. Those say what
+  # routes traffic in, not what a browser calls this deployment: a host
+  # rule carries no scheme, TLS may terminate anywhere, and one install is
+  # often reached by several names. Deriving it would guess, and a wrong
+  # guess is either a 403 nobody can explain or an allowlist entry nobody
+  # asked for.
+  #
+  #   publicOrigins:
+  #     - https://trawl.example.com
+  publicOrigins: []
   sessionTtlSecs: 86400
-  # Drop the Secure cookie flag. Enable ONLY if a TLS-terminating ingress
-  # sits in front and strips it.
+  # Drop the Secure cookie flag only when the browser connects over HTTP.
+  # Keep false for browser HTTPS, including when an ingress terminates TLS.
   allowInsecureCookies: false
   # Fleet SSO: parent domain for the shared fleet_session cookie, e.g.
   # ".fleet.lab.ktle.net". Set the SAME value in every fleet app (mirrors

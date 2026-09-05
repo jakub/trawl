@@ -19,14 +19,17 @@
 //! roles-as-data (ADR-0006) the gate is at least one resolved trawl
 //! permission; role names are display/audit only.
 //!
-//! Login and logout validate the `Origin` header (present-only semantics,
-//! same helper as `fleet_auth::login`/`logout`), because with the shared
-//! cookie a forged cross-site logout would sign the user out of every
-//! fleet app.
+//! Login and logout call [`fleet_auth::check_origin`] themselves, before
+//! any upstream call and before a cookie is minted or cleared, because
+//! they are the two cookie endpoints with no session to extract. `me` does
+//! not: it takes the `Session` extractor, which runs the same guard for
+//! it (ADR-0016, `middleware::session_extractor`). The check matters most
+//! on logout, where the shared `fleet_session` cookie means a forged
+//! cross-site request would sign the user out of every fleet app.
 
 use axum::Json;
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode, Uri, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use fleet_auth::{SessionExpiry, SessionPayload, session};
 use serde::{Deserialize, Serialize};
@@ -52,41 +55,17 @@ pub struct LoginResponse {
     pub permissions: Vec<String>,
 }
 
-/// Reject cross-origin browser requests to cookie-authed, state-changing
-/// endpoints.
-///
-/// Delegates to the shared [`fleet_auth::check_origin`] (same present-only
-/// decision, log fields and message as the fleet-auth handlers, ADR-0004)
-/// and maps its rejection onto [`ProxyError::OriginMismatch`].
-///
-/// Used by `login`/`logout` and by the cookie-authed branch of the generic
-/// forwarder in `routes::proxy`: the shared `fleet_session` cookie is
-/// `SameSite=Lax` and, in SSO mode, scoped to the parent domain, so the
-/// browser attaches it to same-site sibling-origin requests. This check is
-/// the only thing standing between a compromised sibling app and a forged
-/// state-changing request carrying the victim's session.
-///
-/// The request host comes from the shared [`fleet_auth::request_host`]
-/// (`Host` header, falling back to the URI's `:authority`), the same
-/// derivation fleet-auth's own handlers use, so HTTP/2 `:authority`
-/// handling can't drift between the two origin guards.
-pub(crate) fn check_origin(
-    headers: &HeaderMap,
-    uri: &Uri,
-    handler: &str,
-) -> Result<(), ProxyError> {
-    let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
-    let host = session::request_host(headers, uri);
-    session::check_origin(origin, host, handler).map_err(|_| ProxyError::OriginMismatch)
-}
-
 pub async fn login(
     State(state): State<AppState>,
-    uri: Uri,
     headers: HeaderMap,
     Json(req): Json<LoginRequest>,
 ) -> Result<Response, ProxyError> {
-    check_origin(&headers, &uri, "login")?;
+    // These two are the only handlers that ask the guard themselves,
+    // because they are the only cookie endpoints with no session to
+    // extract: login has no cookie yet and logout is throwing one away.
+    // Everywhere else the guard rides the `Session`/`Auth` extractor.
+    fleet_auth::check_origin(&headers, state.public_origins(), "login")
+        .map_err(|_| ProxyError::OriginMismatch)?;
 
     if req.api_key.trim().is_empty() {
         return Err(ProxyError::BadRequest("api_key is required".into()));
@@ -227,10 +206,12 @@ pub async fn me(
 
 pub async fn logout(
     State(state): State<AppState>,
-    uri: Uri,
     headers: HeaderMap,
 ) -> Result<Response, ProxyError> {
-    check_origin(&headers, &uri, "logout")?;
+    // Before the clear directive is built, so a foreign page cannot make
+    // the browser drop a session it was never allowed to read.
+    fleet_auth::check_origin(&headers, state.public_origins(), "logout")
+        .map_err(|_| ProxyError::OriginMismatch)?;
 
     let header_value = state
         .build_clear_cookie()
@@ -254,10 +235,20 @@ mod tests {
     use crate::config::ResolvedConfig;
     use crate::routes;
 
+    /// The browser origin the standalone fixtures answer on.
+    const TEST_ORIGIN: &str = "https://trawl.example.com";
+
+    /// The browser origin the SSO fixtures answer on. Its sibling
+    /// `https://sibling.fleet.test` shares the parent-domain cookie and is
+    /// deliberately NOT in the list: sharing a cookie is not an origin
+    /// allowlist.
+    const SSO_ORIGIN: &str = "https://trawl.fleet.test";
+
     fn test_state(upstream_url: String) -> AppState {
         let web = WebConfig {
             upstream_url: Some(upstream_url),
             allow_insecure_cookies: true,
+            public_origins: vec![TEST_ORIGIN.to_owned()],
             ..WebConfig::default()
         };
         let cfg = ResolvedConfig::from_parsed(&web, None).unwrap();
@@ -417,6 +408,7 @@ mod tests {
         let web = WebConfig {
             upstream_url: Some(upstream.uri()),
             allow_insecure_cookies: false,
+            public_origins: vec![TEST_ORIGIN.to_owned()],
             ..WebConfig::default()
         };
         let state =
@@ -450,6 +442,7 @@ mod tests {
             allow_insecure_cookies: true,
             shared_domain: Some(".fleet.test".into()),
             session_ttl_secs: Some(3600),
+            public_origins: vec![SSO_ORIGIN.to_owned()],
             ..WebConfig::default()
         };
         let cfg = ResolvedConfig::from_parsed(&web, None).unwrap();
@@ -596,6 +589,7 @@ mod tests {
             upstream_url: Some(upstream.uri()),
             allow_insecure_cookies: true,
             cookie_secret_path: Some(key_path),
+            public_origins: vec![TEST_ORIGIN.to_owned()],
             ..WebConfig::default()
         };
         let state =
@@ -708,18 +702,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn logout_allows_same_origin_h2_without_host_header() {
-        // HTTP/2 regression: browsers send the `:authority` pseudo-header
-        // instead of a `Host` header, which hyper parks in the request URI.
-        // A present same-origin `Origin` must still be accepted — reading only
-        // the (absent) Host header would 403 legitimate logout and NOT clear
-        // the cookie. Absolute-form URI = authority present, no Host header.
+    async fn logout_allows_the_configured_origin_with_no_host_header_at_all() {
+        // Over HTTP/2 a browser sends `:authority` and no `Host` header,
+        // which hyper parks in the request URI. Since ADR-0016 neither is
+        // read: the configured allowlist decides, so a request carrying
+        // only a matching `Origin` is accepted and clears the cookie.
         let app = routes::build(test_state("http://unused".into()));
 
         let req = Request::builder()
             .method("POST")
             .uri("https://trawl.example.com/api/auth/logout")
-            .header("origin", "https://trawl.example.com")
+            .header("origin", TEST_ORIGIN)
             .body(Body::empty())
             .unwrap();
         assert!(req.headers().get(header::HOST).is_none());
@@ -727,14 +720,16 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         assert!(
             response.headers().contains_key(header::SET_COOKIE),
-            "same-origin h2 logout must clear the cookie"
+            "a configured-origin logout must clear the cookie"
         );
     }
 
     #[tokio::test]
-    async fn logout_rejects_cross_origin_h2_via_authority_fallback() {
-        // The `:authority` fallback must not weaken the guard: a cross-origin
-        // POST with no Host header is still rejected against the URI authority.
+    async fn logout_rejects_a_foreign_origin_whatever_the_uri_authority_says() {
+        // The request URI names the deployment's own authority and the
+        // `Origin` does not. The allowlist is the only input, so this is a
+        // refusal: the authority in the URI is the attacker's to choose
+        // as much as any header is.
         let app = routes::build(test_state("http://unused".into()));
 
         let req = Request::builder()
@@ -749,7 +744,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn login_allows_same_host_but_rejects_sso_sibling() {
+    async fn login_allows_the_configured_origin_but_rejects_an_sso_sibling() {
         let upstream = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/v1/whoami"))
@@ -761,13 +756,14 @@ mod tests {
             .mount(&upstream)
             .await;
 
-        // Same-host origin, standalone mode → allowed.
+        // The configured origin, standalone mode → allowed. The `host`
+        // header rides along to show it changes nothing.
         let app = routes::build(test_state(upstream.uri()));
         let req = Request::builder()
             .method("POST")
             .uri("/api/auth/login")
             .header("content-type", "application/json")
-            .header("origin", "https://trawl.example.com")
+            .header("origin", TEST_ORIGIN)
             .header("host", "trawl.example.com")
             .body(Body::from(r#"{"api_key":"flt_token"}"#))
             .unwrap();

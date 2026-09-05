@@ -46,10 +46,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config_path = PathBuf::from(shellexpand::tilde(&cli.config.to_string_lossy()).into_owned());
 
     let resolved = ResolvedConfig::load(&config_path)?;
+    // The allowlist goes in the startup line because it is the first thing
+    // to check when a browser gets a 403 from a page that looks right: the
+    // list here is normalized, so `https://x:443` in the file shows as
+    // `https://x`, which is what the browser will actually send. The count
+    // is its own field and the sample is capped, since nothing bounds how
+    // many origins an operator states.
+    let (public_origins_count, public_origins) =
+        trawl_web::config::summarize_origins(&resolved.public_origins);
     tracing::info!(
         config = %config_path.display(),
         bind_addr = %resolved.bind_addr,
         upstream = %resolved.upstream_url,
+        public_origins_count,
+        public_origins = %public_origins,
         "loaded config"
     );
 

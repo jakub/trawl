@@ -28,6 +28,8 @@ use zeroize::Zeroizing;
 fn test_state(allow_insecure_cookies: bool) -> AppState {
     let web = WebConfig {
         allow_insecure_cookies,
+        // Required since ADR-0016: resolution refuses an empty allowlist.
+        public_origins: vec!["https://trawl.example.com".to_owned()],
         ..WebConfig::default()
     };
     AppState::from_config(ResolvedConfig::from_parsed(&web, None).unwrap()).unwrap()

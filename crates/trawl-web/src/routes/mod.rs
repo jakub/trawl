@@ -39,6 +39,11 @@ pub fn build(state: AppState) -> Router {
         .route("/api/auth/logout", post(auth::logout))
         .route("/api/auth/me", get(auth::me))
         // SSE first — must outrank the generic forwarder (both are under /api/v1).
+        // Like the forwarder below, these are cookie-authenticated: the
+        // ADR-0016 origin guard reaches them through the `Auth` extractor
+        // rather than through anything written here. The 404 stubs
+        // (`block_ingest`, `not_found`) take no extractor at all, so they
+        // are never guarded and never reach upstream.
         .route("/api/v1/stream", get(stream::forward))
         .route("/api/v1/dashboard/stream", get(stream::forward_dashboard))
         // Block /ingest before it can match the generic forwarder.

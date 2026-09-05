@@ -133,8 +133,10 @@ bin/fleet-dev setup trawl --exposure tailscale --force
 ```
 
 The generated Trunk backend authority uses the same MagicDNS hostname as the
-browser origin. This preserves Fleet's same-host Origin/Host CSRF check; the
-controller does not weaken it for development.
+browser origin, and the controller publishes that origin to the browser-facing
+process as `FLEET_SESSION_PUBLIC_ORIGINS`. Fleet's CSRF check compares a
+present `Origin` header against that list whole, scheme and port included, so
+development gets the production rule rather than a relaxed one.
 
 The node's identity is discovered from `tailscaled` with `tailscale status
 --json` and `tailscale ip -4`. Pin both in the profile to skip discovery
@@ -146,9 +148,13 @@ hostname = "fractal.example.ts.net"
 ipv4 = "100.64.0.10"
 ```
 
-All apps exposed on that one development hostname form a single browser trust
-boundary: cookies and the same-host Origin check are host-scoped, not
-port-scoped. Do not expose an untrusted sibling frontend on another port.
+All apps exposed on that one development hostname share the cookie, so they
+form a single browser trust boundary for it: `fleet_session` is host-scoped,
+not port-scoped. The Origin check is narrower than the cookie's reach. It
+matches scheme, host and port, so a page served on another port of that
+hostname is a different origin and is refused. The cookie is still the
+hostname's, though, and a sibling there can overwrite it. Do not expose an
+untrusted frontend on that hostname.
 
 Matching those hostnames also means the backend binds the node's tailnet
 address, not loopback. `https://<node>:8444` is the front door, but

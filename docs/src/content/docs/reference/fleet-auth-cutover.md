@@ -182,7 +182,8 @@ kubectl create secret generic trawl-app-db \
   --from-literal=TRAWL_DATABASE_URL='postgres://trawl:…@cnpg-rw:5432/trawl'
 helm upgrade trawl chart/trawl \
   --set auth.database.existingSecret=trawl-fleet-db \
-  --set storage.database.existingSecret=trawl-app-db
+  --set storage.database.existingSecret=trawl-app-db \
+  --set-string 'web.publicOrigins[0]=https://trawl.fleet.lab.ktle.net'
 ```
 
 The fleet Secret's KEY inside the Secret stays `DATABASE_URL` by default
@@ -221,10 +222,17 @@ is scoped to it:
 - `shared_domain = ".fleet.lab.ktle.net"` in **both** apps
 
 `trawl-01.lab.ktle.net` stays the direct trawld API endpoint for CLI and
-vector bearer clients — cookie-free, unaffected. If a reverse proxy
-terminates TLS in front of trawl-web, it must forward the original `Host`
-header: login/logout validate the `Origin` header against `Host` and
-`shared_domain`, and a rewritten `Host` makes legitimate logins 403.
+vector bearer clients — cookie-free, unaffected.
+
+Each app states its own browser-visible origins and compares a present
+`Origin` header against them whole (ADR-0016). A reverse proxy in front of
+trawl-web needs no header preservation for this: `Host`, `Forwarded` and
+`X-Forwarded-*` are not read at all. What matters is that the configured
+origin is the one the browser shows, so a TLS-terminating proxy means
+`https://trawl.fleet.lab.ktle.net`, never the loopback address it forwards
+to. The shared domain is not an allowlist: coastwatch is a different
+origin and stays rejected, which is what stops a compromised sibling
+forging a fleet-wide logout.
 
 ### 3. Debian channel
 
@@ -243,6 +251,7 @@ Then in `/etc/trawl/trawld.toml`:
 
 ```toml
 [web]
+public_origins = ["https://trawl.fleet.lab.ktle.net"]
 shared_domain = ".fleet.lab.ktle.net"
 ```
 
@@ -268,7 +277,8 @@ printf '%s=' "$(op read 'op://Homelab/Fleet session key/credential')" \
 
 helm upgrade trawl chart/trawl \
   --set web.cookieSecret.existingSecret=fleet-session-key \
-  --set web.sharedDomain=.fleet.lab.ktle.net
+  --set web.sharedDomain=.fleet.lab.ktle.net \
+  --set-string 'web.publicOrigins[0]=https://trawl.fleet.lab.ktle.net'
 ```
 
 ### 5. Coastwatch side
@@ -277,9 +287,10 @@ Set the same two values in the coastwatch repo. **Note:** coastwatch's
 committed prod config predates the DNS decision and still carries
 `session.shared_domain = ".fleet.home.lan"` — it must become
 `".fleet.lab.ktle.net"` or SSO silently breaks (a mismatched `Domain=`
-means each app sets a cookie the other never sees). Coastwatch also picks
-up the default-on login/logout Origin validation on its next rebuild
-against fleet-auth.
+means each app sets a cookie the other never sees). Coastwatch adopts the
+configured-origin check (ADR-0016) in its own PR, and will need its own
+`public_origins` before it starts: the API it builds against changed, so
+it does not inherit trawl's list or pick the check up silently.
 
 ### Behavior notes
 

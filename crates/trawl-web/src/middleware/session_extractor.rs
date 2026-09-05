@@ -2,9 +2,38 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `Session` extractor: decrypts the session cookie, rejects expired /
-//! missing / tampered cookies with 401, and makes the payload available
-//! to handlers via `State<AppState>` + `Session`.
+//! `Session` extractor: runs the ADR-0016 origin guard, decrypts the
+//! session cookie, rejects expired / missing / tampered cookies with 401,
+//! and makes the payload available to handlers via `State<AppState>` +
+//! `Session`.
+//!
+//! The guard lives here, and only here, because this is the one place a
+//! cookie session comes into being. A handler cannot forget to call it,
+//! since a handler cannot obtain a `Session` (or a cookie-backed `Auth`)
+//! without passing it first. That is not a stylistic preference: while the
+//! check was a call each handler made for itself, both SSE routes had
+//! simply never made it, so any page anywhere could open an `EventSource`
+//! against `/api/v1/stream`, ride the victim's `fleet_session` cookie and
+//! read their logs. Moving the guard here deleted that bug rather than
+//! fixing it, and the same move covers every route added from now on.
+//!
+//! Precedence, and the reasons for it:
+//! - A valid `Authorization: Bearer` header wins outright and skips the
+//!   guard. The browser may well be holding a cookie and sending it on the
+//!   same request (`fetch` with `credentials: 'include'` plus an
+//!   `Authorization` header sends both), but this branch never reads the
+//!   cookie, so no session is spendable on it. What the foreign page
+//!   cannot do is supply the bearer token: a custom `Authorization` header
+//!   makes the request preflight, trawl-web sends no
+//!   `Access-Control-Allow-*` headers, and the browser drops the real
+//!   request when the preflight is not granted.
+//! - Otherwise the guard runs BEFORE the cookie is looked up, decrypted or
+//!   checked for expiry. The verdict must not depend on what the browser
+//!   happens to be holding: a foreign origin sent with an expired cookie
+//!   is a 403 with no `Set-Cookie`, never the expiry branch's clear
+//!   directive, which would otherwise let any page log a user out.
+//! - A missing, tampered or expired cookie then answers exactly as it did
+//!   before the guard existed.
 
 use std::future::{self, Future};
 
@@ -57,6 +86,18 @@ impl FromRequestParts<AppState> for Session {
 }
 
 fn session_from_parts(parts: &Parts, state: &AppState) -> Result<Session, ProxyError> {
+    // The whole-origin comparison against the deployment's configured
+    // `public_origins` (ADR-0016), first, so no cookie state can reach the
+    // answer. `fleet_auth::check_origin` reads the `Origin` field set and
+    // nothing else: not `Host`, not the request URI's authority, not any
+    // `X-Forwarded-*` header, because under a reverse proxy those are the
+    // proxy's opinion and a CSRF verdict that moves with them is a verdict
+    // the deployment topology can flip. It has already logged the
+    // rejection with its bounded fields; here it becomes a 403 that
+    // touches no cookie.
+    fleet_auth::check_origin(&parts.headers, state.public_origins(), "session")
+        .map_err(|_| ProxyError::OriginMismatch)?;
+
     let cookie_header = parts
         .headers
         .get(axum::http::header::COOKIE)
@@ -109,6 +150,14 @@ impl FromRequestParts<AppState> for Auth {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
+        // A valid bearer header wins before the origin guard is consulted.
+        // This branch never reads the cookie, so a session the browser
+        // happens to be sending alongside is not spendable here, and a
+        // foreign page cannot supply the token itself: a custom
+        // `Authorization` header makes the request preflight, and
+        // trawl-web grants no preflight (it sends no
+        // `Access-Control-Allow-*` header anywhere). Every other request
+        // falls through to the cookie branch, where the guard runs first.
         if let Some(token) = extract_bearer(parts.headers.get(header::AUTHORIZATION)) {
             return Ok(Self::Bearer(token));
         }

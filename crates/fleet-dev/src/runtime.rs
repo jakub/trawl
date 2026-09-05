@@ -227,6 +227,17 @@ fn insert_web_topology(
         fleet_auth::ENV_SESSION_COOKIE_SECURE.to_owned(),
         topology.cookie_secure.to_string(),
     );
+    // The CSRF allowlist (ADR-0016). The dev stack is the case the file-based
+    // knob cannot serve: the browser origin is decided here, per machine and
+    // per exposure mode (`http://localhost:8081` locally, the MagicDNS name
+    // and Serve port on a tailnet), so a committed `[web] public_origins`
+    // would be wrong for everyone. Exactly one entry, because the topology
+    // publishes exactly one origin. Anything else the operator browses to
+    // is a foreign origin and should 403.
+    environment.insert(
+        fleet_auth::ENV_SESSION_PUBLIC_ORIGINS.to_owned(),
+        topology.browser_origin.clone(),
+    );
 }
 
 fn render_trunk_config(

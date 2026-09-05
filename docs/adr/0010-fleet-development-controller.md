@@ -53,6 +53,16 @@ validation. Because that validation and host-only cookies intentionally span
 ports, all development apps on the shared hostname are one browser trust
 boundary.
 
+(Superseded on this point by ADR-0016, 2026-09-04. The CSRF check no longer
+consults `Host` at all, in this paragraph or in the Tailscale one below: it
+compares the browser's `Origin` whole, port included, against the configured
+`public_origins` allowlist, so two development apps on one hostname and
+different ports are no longer one origin. What still spans ports is the
+host-only cookie, which is a cookie-scoping rule the browser applies, not a
+verdict fleet-auth reaches. fleet-dev publishes the browser origin it just
+computed as `FLEET_SESSION_PUBLIC_ORIGINS`, so the allowlist follows the
+stack instead of being inferred from a header.)
+
 Tailscale exposure publishes more than the Serve front door. Trunk stamps the
 proxy backend authority into `Host`, and the present-only guard requires that
 host to equal the browser Origin host, so the application's API listener binds

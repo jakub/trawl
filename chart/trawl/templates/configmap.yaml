@@ -151,6 +151,11 @@ data:
 
     [web]
     bind_addr = {{ .Values.web.bindAddr | quote }}
+    {{- /* The browser-origin allowlist (ADR-0016). The statefulset refuses
+         to render an enabled web sidecar without one, so by the time this
+         renders the list is non-empty; trawl-web refuses to start on an
+         empty one too, and states the same knob. */}}
+    public_origins = [{{ range $i, $o := .Values.web.publicOrigins }}{{ if $i }}, {{ end }}{{ $o | quote }}{{ end }}]
     cookie_secret_path = "/etc/trawl/web.cookie"
     session_ttl_secs = {{ .Values.web.sessionTtlSecs | int }}
     allow_insecure_cookies = {{ .Values.web.allowInsecureCookies }}

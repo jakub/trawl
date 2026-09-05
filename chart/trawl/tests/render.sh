@@ -6,13 +6,43 @@ chart="$repo_root/chart/trawl"
 work_dir=$(mktemp -d)
 trap 'rm -rf "$work_dir"' EXIT
 
-render() {
+render_only() {
+  local template=$1
+  shift
   helm template trawl "$chart" \
-    --show-only templates/statefulset.yaml \
+    --show-only "templates/${template}" \
     --set auth.database.existingSecret=fleet-db \
     --set storage.database.existingSecret=trawl-db \
     --set web.enabled=false \
     "$@"
+}
+
+render() {
+  render_only statefulset.yaml "$@"
+}
+
+# The web sidecar's own defaults: enabled, with the one setting that has
+# no default (ADR-0016). Every case below that wants a working sidecar
+# passes these, so a case that omits publicOrigins is omitting it on
+# purpose.
+web_origin="https://trawl.example.com"
+web_enabled=(--set web.enabled=true --set-string "web.publicOrigins[0]=${web_origin}")
+
+assert_render_fails() {
+  local description=$1
+  local expected=$2
+  shift 2
+  local stdout="$work_dir/fail.yaml"
+  local stderr="$work_dir/fail.err"
+  if "$@" >"$stdout" 2>"$stderr"; then
+    echo "expected ${description} to fail the render" >&2
+    exit 1
+  fi
+  if ! grep -Fq "$expected" "$stderr"; then
+    echo "expected ${description} to fail naming '${expected}', got:" >&2
+    cat "$stderr" >&2
+    exit 1
+  fi
 }
 
 assert_name_count() {
@@ -88,6 +118,56 @@ disabled="$work_dir/disabled.yaml"
 render --set persistence.enabled=true --set crashDump.enabled=false >"$disabled"
 if grep -Fq 'TRAWL_CRASH_DUMP_' "$disabled" || grep -Eq '^[[:space:]]*(- )?name: cores$' "$disabled"; then
   echo "crashDump.enabled=false rendered crash-dump environment or storage" >&2
+  exit 1
+fi
+
+# -- ADR-0016: the browser-origin allowlist is stated, never derived -----
+
+# An enabled web sidecar with no origins refuses to render, and says which
+# knob to set. There is no default worth having: an empty list would be a
+# proxy that 403s every browser.
+assert_render_fails "web.enabled with an empty publicOrigins" \
+  "web.enabled=true requires web.publicOrigins" \
+  render --set web.enabled=true
+
+# An ingress host is not an origin. It carries no scheme, TLS terminates
+# wherever the operator put it, and one install answers to several names,
+# so setting one must NOT satisfy the requirement.
+assert_render_fails "an ingress host without publicOrigins" \
+  "web.enabled=true requires web.publicOrigins" \
+  render --set web.enabled=true --set ingress.enabled=true \
+  --set-string 'ingress.hosts[0].host=trawl.example.com' \
+  --set-string 'ingress.hosts[0].paths[0].path=/' \
+  --set-string 'ingress.hosts[0].paths[0].pathType=Prefix'
+
+# Stated origins reach both halves: the generated TOML the proxy reads,
+# and the env var that survives a config.raw replacing that TOML.
+origins_config="$work_dir/origins-config.yaml"
+render_only configmap.yaml "${web_enabled[@]}" \
+  --set-string 'web.publicOrigins[1]=http://localhost:8090' >"$origins_config"
+if ! grep -Fq "public_origins = [\"${web_origin}\", \"http://localhost:8090\"]" "$origins_config"; then
+  echo "expected the rendered [web] block to carry both configured origins" >&2
+  exit 1
+fi
+
+origins_sts="$work_dir/origins-sts.yaml"
+render "${web_enabled[@]}" \
+  --set-string 'web.publicOrigins[1]=http://localhost:8090' >"$origins_sts"
+assert_followed_by 'name: FLEET_SESSION_PUBLIC_ORIGINS' \
+  "value: \"${web_origin},http://localhost:8090\"" "$origins_sts"
+
+# config.raw replaces the generated TOML wholesale, so the env var is the
+# only thing carrying the allowlist in that topology.
+raw_sts="$work_dir/raw-sts.yaml"
+render "${web_enabled[@]}" --set-string 'config.raw=[server]' >"$raw_sts"
+assert_followed_by 'name: FLEET_SESSION_PUBLIC_ORIGINS' \
+  "value: \"${web_origin}\"" "$raw_sts"
+
+raw_config="$work_dir/raw-config.yaml"
+render_only configmap.yaml "${web_enabled[@]}" \
+  --set-string 'config.raw=[server]' >"$raw_config"
+if grep -Fq 'public_origins' "$raw_config"; then
+  echo "config.raw must replace the generated TOML, allowlist included" >&2
   exit 1
 fi
 

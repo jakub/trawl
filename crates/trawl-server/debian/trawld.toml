@@ -164,6 +164,24 @@ database_url = "postgres://trawl:CHANGE_ME@db.example.internal:5432/trawl"
 # browser requests into bearer-token requests to trawld. Runs as a
 # separate systemd unit (trawl-web.service).
 
+# Browser-visible origins allowed to carry a session cookie (ADR-0016).
+# REQUIRED: trawl-web refuses to start on an empty list, because an empty
+# allowlist can only mean "allow everything" or "allow nothing", and both
+# are silent failures.
+#
+# A present Origin header is compared whole against these entries: scheme,
+# host and port must all match, after the default port is filled in
+# (https://x is https://x:443). Nothing is derived and nothing is guessed,
+# which is why both loopback spellings ship below: http://localhost:8090
+# and http://127.0.0.1:8090 are two different origins to a browser, and a
+# trailing DNS root dot is a third (https://trawl.example.com. is not
+# https://trawl.example.com). Behind a TLS-terminating reverse proxy, add
+# the origin the BROWSER shows, e.g. "https://trawl.example.com", not the
+# loopback address the proxy forwards to. Forwarded and X-Forwarded-* are
+# never consulted, so nothing a client or a proxy sends can widen this
+# list.
+public_origins = ["http://127.0.0.1:8090", "http://localhost:8090"]
+
 # Address to bind the proxy's HTTP listener.
 # Default is loopback only — put a TLS-terminating reverse proxy
 # (nginx/caddy/traefik) in front for external access.
@@ -185,7 +203,8 @@ cookie_secret_path = "/var/lib/trawl/web.cookie"
 # session_ttl_secs = 86400
 
 # Drop the Secure flag on session cookies. Set true ONLY when the
-# proxy sits behind a TLS-terminating reverse proxy that strips it.
+# browser connects over HTTP. Keep false for browser HTTPS, including
+# when a reverse proxy terminates TLS.
 # allow_insecure_cookies = false
 
 # Fleet SSO: parent domain for the shared fleet_session cookie. Set the

@@ -172,6 +172,9 @@ mod tests {
         let web = WebConfig {
             upstream_url: Some(upstream.uri()),
             allow_insecure_cookies: true,
+            // Required since ADR-0016; these tests send no Origin header,
+            // and a present-only guard lets those through.
+            public_origins: vec!["https://trawl.fleet.test".to_owned()],
             ..WebConfig::default()
         };
         AppState::from_config(ResolvedConfig::from_parsed(&web, None).unwrap()).unwrap()

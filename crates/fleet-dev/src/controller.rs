@@ -494,8 +494,8 @@ fn finish_without_supervisor(
 /// Say out loud what Tailscale exposure actually publishes.
 ///
 /// Serve is the front door on the SPA port, but the API listener binds the
-/// node's tailnet address so that Trunk's proxied `Host` matches the browser
-/// Origin. Every tailnet peer can therefore reach the backend directly.
+/// node's tailnet address so the whole dev stack answers on one `MagicDNS`
+/// name. Every tailnet peer can therefore reach the backend directly.
 fn warn_tailnet_backend_exposure(plan: &DevelopmentPlan) {
     for app in &plan.apps {
         eprintln!(

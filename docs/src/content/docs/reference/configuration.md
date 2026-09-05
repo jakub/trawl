@@ -356,26 +356,63 @@ Browser-facing session proxy (`trawl-web` binary). Reads the same `trawld.toml` 
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
+| `public_origins` | string array | *(required)* | Browser-visible origins allowed to carry a session cookie. Compared whole: scheme, host and port. An empty list is a startup error |
 | `bind_addr` | string | `"127.0.0.1:8090"` | Listen address. Defaults to loopback — front with a reverse proxy for external access |
 | `upstream_url` | string | derived from `[server].http_addr` | trawld URL. Wildcard binds are rewritten to loopback |
 | `cookie_secret_path` | string | (none) | Path to a file holding the 32-byte AEAD cookie-encryption key |
 | `cookie_secret_env` | string | (none) | Env var holding the base64-encoded key. Takes precedence over `cookie_secret_path` |
 | `session_ttl_secs` | integer | `86400` | Browser session lifetime (24h default) |
-| `allow_insecure_cookies` | bool | `false` | Drop `Secure` flag on session cookies. Set true **only** when the proxy sits behind a TLS-terminating reverse proxy |
+| `allow_insecure_cookies` | bool | `false` | Drop `Secure` from session cookies. Set true only when the browser connects over HTTP. Keep false for browser HTTPS, including when a reverse proxy terminates TLS |
 | `shared_domain` | string | (none) | Parent domain for the shared `fleet_session` SSO cookie, e.g. `".fleet.lab.ktle.net"`. Mirrors coastwatch's `session.shared_domain` — set the same value in both apps. Unset/empty → origin-scoped cookie (standalone mode) |
 
 If neither `cookie_secret_path` nor `cookie_secret_env` is set, the proxy generates an ephemeral key on each startup — sessions won't survive restart. The Debian `trawld` package generates a persistent key at `/var/lib/trawl/web.cookie` automatically via its `postinst` script.
 
-Setting `shared_domain` enables fleet-wide single sign-on: the session cookie is scoped to the parent domain and every fleet app under it accepts it, provided all apps share the same session key (see the [fleet-auth cutover runbook](/reference/fleet-auth-cutover/) for key provisioning). Login and logout validate the `Origin` request header against the request `Host` only; a present Origin whose host differs is rejected with 403. Sharing a parent-domain cookie is deliberately **not** an origin allowlist — a sibling fleet app is a different origin and cannot POST to trawl's auth endpoints, so a compromised sibling can't forge a logout that clears `fleet_session` fleet-wide. **The origin check trusts the request `Host` header** — a reverse proxy in front of `trawl-web` must forward the original `Host`, or legitimate same-origin logins will be rejected.
+#### The browser-origin allowlist
+
+`public_origins` is the CSRF control (ADR-0016). When a request carries an `Origin` header, `trawl-web` compares it whole against this list before it looks at the session cookie: scheme, host and port must all match. A request with no `Origin` passes, because this is a browser control and curl, the CLI and every scripted client send none.
+
+State what the browser's address bar shows. A few consequences worth knowing before the first 403:
+
+- **Spellings that reach the same server are still different origins.** `http://localhost:8090`, `http://127.0.0.1:8090` and `http://[::1]:8090` are three entries. So are `https://trawl.example.com` and `https://trawl.example.com.`, the trailing DNS root dot a browser keeps if you browsed to `https://trawl.example.com./`. The default port is the one thing that normalizes: `https://x` and `https://x:443` are one origin.
+- **Behind a TLS-terminating proxy, configure the origin the browser sees**, e.g. `https://trawl.example.com`, not the `http://127.0.0.1:8090` the proxy forwards to. The backend never sees the browser's scheme, which is the whole reason the list is stated rather than derived.
+- **`Forwarded` and `X-Forwarded-*` are never read**, from any peer. The verdict never depends on a header a proxy rewrites or a client can type, so no proxy configuration can widen the allowlist and none is needed to keep it working.
+- **An empty list refuses to start.** There is no host-only fallback and no "empty means allow everything" default; both would fail silently, in opposite directions.
+- A request carrying a sibling fleet app's origin is rejected unless that origin is in the allowlist, even when the apps share the `fleet_session` cookie. This blocks calls to protected endpoints, including logout. It does not protect the shared cookie from a compromised sibling: that app can overwrite or clear the parent-domain cookie through its own `Set-Cookie` response.
+
+Setting `shared_domain` enables fleet-wide single sign-on: the session cookie is scoped to the parent domain and every fleet app under it accepts it, provided all apps share the same session key (see the [fleet-auth cutover runbook](/reference/fleet-auth-cutover/) for key provisioning).
 
 API clients using bearer tokens (the CLI, `trawl-client`, vector) talk to trawld directly on port 5514 — the proxy only handles cookie-authed browser traffic and blocks `/api/v1/ingest` outright.
 
 ```toml
 [web]
+public_origins = ["https://trawl.example.com"]
 bind_addr = "127.0.0.1:8090"
 cookie_secret_path = "/var/lib/trawl/web.cookie"
 session_ttl_secs = 86400
 ```
+
+The Debian package ships both loopback spellings of its own bind, since that is what a browser on the same host uses:
+
+```toml
+[web]
+public_origins = ["http://127.0.0.1:8090", "http://localhost:8090"]
+```
+
+#### `trawl-web` environment variables
+
+The proxy reads these at startup. Variables with a corresponding `[web]` field override that field, and the `FLEET_SESSION_*` variables log when they displace a configured value. `FLEET_SESSION_COOKIE_PATH` has no `[web]` counterpart.
+
+| Variable | Description |
+|----------|-------------|
+| `FLEET_SESSION_PUBLIC_ORIGINS` | Comma-separated browser origins, e.g. `https://trawl.example.com,http://localhost:8090`. Replaces `[web] public_origins` outright; entries are parsed by the same rules, and a bad one is a startup error naming its index |
+| `FLEET_SESSION_AEAD_KEY` | Base64 session AEAD key. Overrides `cookie_secret_path` / `cookie_secret_env` |
+| `FLEET_SESSION_COOKIE_DOMAIN` | Cookie `Domain=`. An empty value means a host-only cookie |
+| `FLEET_SESSION_COOKIE_SECURE` | `true` or `false`. Setting `false` clears `Secure` on the session cookie |
+| `FLEET_SESSION_COOKIE_PATH` | Cookie `Path=`. The only accepted value is `/`; anything else fails startup rather than issuing a cookie at one scope and clearing it at another. There is no `[web]` counterpart, so this variable can only agree with the proxy or stop it |
+| `TRAWL_WEB_BIND_ADDR` | Overrides `[web] bind_addr` |
+| `TRAWL_WEB_INSECURE_UPSTREAM` | Skip TLS verification of the upstream trawld cert. Loopback only |
+
+The Helm chart passes `FLEET_SESSION_PUBLIC_ORIGINS` to the sidecar as well as rendering `public_origins` into the generated TOML, so a `config.raw` that replaces that TOML still carries the allowlist.
 
 ### `[syslog]`
 

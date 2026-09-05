@@ -15,8 +15,8 @@ use axum::extract::Request;
 use axum::http::{StatusCode, header};
 use axum::routing::post;
 use fleet_auth::{
-    KeyStore, PrincipalKind, RolePermission, SessionConfig, SessionKey, SessionState, decrypt,
-    login, logout,
+    KeyStore, PrincipalKind, PublicOrigins, RolePermission, SessionConfig, SessionKey,
+    SessionState, decrypt, login, logout,
 };
 use tower::ServiceExt as _;
 
@@ -27,11 +27,18 @@ fn router_with_state(state: SessionState) -> Router {
         .with_state(state)
 }
 
+/// The deployment's browser-visible origin, as every fixture configures it
+/// (ADR-0016 makes it required, so there is no fixture without one).
+fn test_origins() -> PublicOrigins {
+    PublicOrigins::parse(["https://trawl.example.com"]).expect("valid allowlist")
+}
+
 fn session_state(store: KeyStore, app_namespace: &str) -> (SessionState, Arc<SessionKey>) {
     let session_key = Arc::new(SessionKey::generate());
     let cfg = SessionConfig::builder()
         .cookie_name("fleet_session")
         .app_namespace(app_namespace)
+        .public_origins(test_origins())
         .secure(false) // tests don't run over HTTPS
         .post_login_redirect("/dashboard")
         .build()
@@ -157,6 +164,7 @@ async fn login_includes_domain_when_configured(pool: sqlx::PgPool) {
     let cfg = SessionConfig::builder()
         .cookie_name("fleet_session")
         .app_namespace("trawl")
+        .public_origins(test_origins())
         .secure(false)
         .domain("fleet.localhost")
         .post_login_redirect("/")
@@ -253,26 +261,30 @@ async fn login_no_grant_returns_403_no_cookie(pool: sqlx::PgPool) {
 }
 
 // ---------------------------------------------------------------------------
-// origin validation (default-on, ADR-0004)
+// origin validation (default-on, ADR-0016)
 // ---------------------------------------------------------------------------
+//
+// The guard compares the whole `Origin` against the app's configured
+// `public_origins`. No request header contributes: not `Host`, not
+// `:authority`, not `Forwarded` or `X-Forwarded-*`. These tests drive the
+// real handlers, so they prove the wiring (guard first, no `Set-Cookie` on
+// the 403) rather than the comparison, which `session.rs` owns.
 
-fn login_request_with_origin(api_key: &str, origin: &str, host: &str) -> Request<Body> {
+fn login_request_with_origin(api_key: &str, origin: &str) -> Request<Body> {
     Request::builder()
         .method("POST")
         .uri("/api/auth/login")
         .header("content-type", "application/json")
         .header("origin", origin)
-        .header("host", host)
         .body(Body::from(format!(r#"{{"api_key":"{api_key}"}}"#)))
         .unwrap()
 }
 
-fn logout_request_with_origin(origin: &str, host: &str) -> Request<Body> {
+fn logout_request_with_origin(origin: &str) -> Request<Body> {
     Request::builder()
         .method("POST")
         .uri("/api/auth/logout")
         .header("origin", origin)
-        .header("host", host)
         .body(Body::empty())
         .unwrap()
 }
@@ -298,7 +310,6 @@ async fn login_rejects_cross_origin_no_cookie(pool: sqlx::PgPool) {
         .oneshot(login_request_with_origin(
             &created.plaintext_token,
             "https://evil.example.com",
-            "trawl.example.com",
         ))
         .await
         .unwrap();
@@ -318,10 +329,7 @@ async fn logout_rejects_cross_origin_no_clear(pool: sqlx::PgPool) {
     let app = router_with_state(state);
 
     let response = app
-        .oneshot(logout_request_with_origin(
-            "https://evil.example.com",
-            "trawl.example.com",
-        ))
+        .oneshot(logout_request_with_origin("https://evil.example.com"))
         .await
         .unwrap();
 
@@ -333,7 +341,7 @@ async fn logout_rejects_cross_origin_no_clear(pool: sqlx::PgPool) {
 }
 
 #[sqlx::test]
-async fn login_allows_same_host_origin(pool: sqlx::PgPool) {
+async fn login_allows_the_configured_origin(pool: sqlx::PgPool) {
     let store = KeyStore::from_pool(pool);
 
     let created = store
@@ -352,14 +360,44 @@ async fn login_allows_same_host_origin(pool: sqlx::PgPool) {
     let response = app
         .oneshot(login_request_with_origin(
             &created.plaintext_token,
-            "http://trawl.example.com",
-            "trawl.example.com",
+            "https://trawl.example.com",
         ))
         .await
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::FOUND);
     assert!(response.headers().contains_key(header::SET_COOKIE));
+}
+
+#[sqlx::test]
+async fn login_rejects_the_same_name_over_http(pool: sqlx::PgPool) {
+    let store = KeyStore::from_pool(pool);
+
+    let created = store
+        .create_key(
+            "alice",
+            PrincipalKind::Human,
+            &trawl_role(&store).await,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let (state, _) = session_state(store, "trawl");
+    let app = router_with_state(state);
+
+    // The whole point of ADR-0016: an active attacker serving
+    // `http://trawl.example.com` used to pass the host-only comparison.
+    let response = app
+        .oneshot(login_request_with_origin(
+            &created.plaintext_token,
+            "http://trawl.example.com",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(!response.headers().contains_key(header::SET_COOKIE));
 }
 
 #[sqlx::test]
@@ -380,6 +418,7 @@ async fn login_rejects_sibling_under_shared_domain(pool: sqlx::PgPool) {
     let cfg = SessionConfig::builder()
         .cookie_name("fleet_session")
         .app_namespace("trawl")
+        .public_origins(PublicOrigins::parse(["https://trawl.fleet.localhost"]).unwrap())
         .secure(false)
         .domain("fleet.localhost")
         .build()
@@ -387,15 +426,13 @@ async fn login_rejects_sibling_under_shared_domain(pool: sqlx::PgPool) {
     let state = SessionState::new(store, session_key, Arc::new(cfg)).unwrap();
     let app = router_with_state(state);
 
-    // Origin is a sibling app under the shared cookie domain. A
-    // parent-domain cookie is not an origin allowlist: origin validation
-    // stays strictly same-host, so a compromised sibling can't forge auth
-    // requests against trawl's endpoints (ADR-0004).
+    // The Origin is a sibling app under the shared cookie domain. Sharing
+    // `Domain=` governs where the browser sends the cookie, never who may
+    // call these endpoints: each app lists only its own origins.
     let response = app
         .oneshot(login_request_with_origin(
             &created.plaintext_token,
-            "http://coastwatch.fleet.localhost",
-            "trawl.fleet.localhost",
+            "https://coastwatch.fleet.localhost",
         ))
         .await
         .unwrap();
@@ -420,44 +457,16 @@ async fn logout_allows_absent_origin(pool: sqlx::PgPool) {
     assert!(response.headers().contains_key(header::SET_COOKIE));
 }
 
-// -- HTTP/2 :authority fallback (no Host header) ----------------------------
+// -- Host is not an input any more ------------------------------------------
 //
-// Under HTTP/2 browsers send the `:authority` pseudo-header instead of a
-// `Host` header, which hyper parks in the request URI (absolute-form URI).
-// These cases exercise the fallback end-to-end through the real handlers:
-// `request_host`'s unit tests prove the lookup, but only a full login/logout
-// request proves the wiring — a `reject_cross_origin` refactor that drops the
-// `uri.authority()` fallback would 403 a legitimate same-origin h2 login while
-// every `request_host` unit test still passes. Mirrors trawl-web's
-// `logout_{allows_same,rejects_cross}_origin_h2_*` coverage.
-
-/// Absolute-form URI (authority present) with an `Origin` header but no `Host`
-/// header — the shape hyper produces for an HTTP/2 request.
-fn h2_login_request(api_key: &str, origin: &str) -> Request<Body> {
-    let req = Request::builder()
-        .method("POST")
-        .uri("https://trawl.example.com/api/auth/login")
-        .header("content-type", "application/json")
-        .header("origin", origin)
-        .body(Body::from(format!(r#"{{"api_key":"{api_key}"}}"#)))
-        .unwrap();
-    assert!(req.headers().get(header::HOST).is_none());
-    req
-}
-
-fn h2_logout_request(origin: &str) -> Request<Body> {
-    let req = Request::builder()
-        .method("POST")
-        .uri("https://trawl.example.com/api/auth/logout")
-        .header("origin", origin)
-        .body(Body::empty())
-        .unwrap();
-    assert!(req.headers().get(header::HOST).is_none());
-    req
-}
+// These two replace the HTTP/2 `:authority` cases. That fallback existed
+// because the verdict needed a request host and HTTP/2 puts it somewhere
+// else; ADR-0016 deleted the need, so the interesting claims are now that a
+// request with NO host information at all still passes, and that a hostile
+// one still fails.
 
 #[sqlx::test]
-async fn login_allows_same_origin_h2_without_host_header(pool: sqlx::PgPool) {
+async fn login_allows_the_configured_origin_with_no_host_header(pool: sqlx::PgPool) {
     let store = KeyStore::from_pool(pool);
 
     let created = store
@@ -473,88 +482,57 @@ async fn login_allows_same_origin_h2_without_host_header(pool: sqlx::PgPool) {
     let (state, _) = session_state(store, "trawl");
     let app = router_with_state(state);
 
-    let response = app
-        .oneshot(h2_login_request(
-            &created.plaintext_token,
-            "https://trawl.example.com",
-        ))
-        .await
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/auth/login")
+        .header("content-type", "application/json")
+        .header("origin", "https://trawl.example.com")
+        .body(Body::from(format!(
+            r#"{{"api_key":"{}"}}"#,
+            created.plaintext_token.as_str()
+        )))
         .unwrap();
+    assert!(request.headers().get(header::HOST).is_none());
+    assert!(request.uri().authority().is_none());
+
+    let response = app.oneshot(request).await.unwrap();
 
     assert_eq!(response.status(), StatusCode::FOUND);
     assert!(
         response.headers().contains_key(header::SET_COOKIE),
-        "same-origin h2 login (Host from :authority) must set a cookie"
+        "the configured origin passes with no host information in the request"
     );
 }
 
 #[sqlx::test]
-async fn login_rejects_cross_origin_h2_via_authority_fallback(pool: sqlx::PgPool) {
+async fn logout_rejects_a_foreign_origin_whatever_the_host_and_forwarding_headers_say(
+    pool: sqlx::PgPool,
+) {
     let store = KeyStore::from_pool(pool);
-
-    let created = store
-        .create_key(
-            "alice",
-            PrincipalKind::Human,
-            &trawl_role(&store).await,
-            None,
-        )
-        .await
-        .unwrap();
 
     let (state, _) = session_state(store, "trawl");
     let app = router_with_state(state);
 
-    let response = app
-        .oneshot(h2_login_request(
-            &created.plaintext_token,
-            "https://evil.example.com",
-        ))
-        .await
+    // Every header an attacker might hope moves the verdict, all agreeing
+    // with the forged Origin. Under the old host-only rule this request
+    // passed; now none of them is read.
+    let request = Request::builder()
+        .method("POST")
+        .uri("https://evil.example.com/api/auth/logout")
+        .header("origin", "https://evil.example.com")
+        .header("host", "evil.example.com")
+        .header("x-forwarded-host", "evil.example.com")
+        .header("x-forwarded-proto", "https")
+        .header("forwarded", "host=evil.example.com;proto=https")
+        .body(Body::empty())
         .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
 
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     assert!(
         !response.headers().contains_key(header::SET_COOKIE),
-        "cross-origin h2 login must not set a cookie"
-    );
-}
-
-#[sqlx::test]
-async fn logout_allows_same_origin_h2_without_host_header(pool: sqlx::PgPool) {
-    let store = KeyStore::from_pool(pool);
-
-    let (state, _) = session_state(store, "trawl");
-    let app = router_with_state(state);
-
-    let response = app
-        .oneshot(h2_logout_request("https://trawl.example.com"))
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    assert!(
-        response.headers().contains_key(header::SET_COOKIE),
-        "same-origin h2 logout (Host from :authority) must clear the cookie"
-    );
-}
-
-#[sqlx::test]
-async fn logout_rejects_cross_origin_h2_via_authority_fallback(pool: sqlx::PgPool) {
-    let store = KeyStore::from_pool(pool);
-
-    let (state, _) = session_state(store, "trawl");
-    let app = router_with_state(state);
-
-    let response = app
-        .oneshot(h2_logout_request("https://evil.example.com"))
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    assert!(
-        !response.headers().contains_key(header::SET_COOKIE),
-        "cross-origin h2 logout must NOT clear the shared cookie"
+        "cross-origin logout must NOT clear the shared cookie"
     );
 }
 
@@ -570,6 +548,7 @@ async fn logout_clears_cookie_with_matching_attrs(pool: sqlx::PgPool) {
     let cfg = SessionConfig::builder()
         .cookie_name("fleet_session")
         .app_namespace("trawl")
+        .public_origins(test_origins())
         .secure(true)
         .domain("fleet.home.lan")
         .build()
