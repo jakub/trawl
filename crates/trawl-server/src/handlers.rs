@@ -53,7 +53,7 @@ pub async fn query(
     Json(req): Json<QueryRequest>,
 ) -> Result<Json<QueryResponse>, ServerError> {
     if !verified.has_permission(Permission::Query) {
-        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+        return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
 
     state
@@ -517,7 +517,7 @@ pub async fn schema(
     Query(params): Query<SchemaParams>,
 ) -> Result<Json<SchemaResponse>, ServerError> {
     if !verified.has_permission(Permission::SchemaRead) {
-        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+        return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
 
     // Hot buffer stats are cheap atomics — always read fresh (never cached).
@@ -737,7 +737,7 @@ pub async fn queries(
     Extension(verified): Extension<VerifiedKey>,
 ) -> Result<Json<QueriesResponse>, ServerError> {
     if !verified.has_permission(Permission::Query) {
-        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+        return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
 
     Ok(Json(QueriesResponse {
@@ -763,11 +763,11 @@ pub async fn cancel_query(
     } else if verified.has_permission(Permission::QueryCancel) {
         state.query.tracker.owner_key_id(query_id) == Some(verified.id)
     } else {
-        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+        return Err(ServerError::Forbidden("insufficient permissions".into()));
     };
 
     if !can_cancel {
-        return Err(ServerError::Unauthorized("cannot cancel this query".into()));
+        return Err(ServerError::Forbidden("cannot cancel this query".into()));
     }
 
     let cancelled = state.query.pool.cancel_by_id(query_id);
@@ -795,7 +795,7 @@ pub async fn validate_query(
     Json(req): Json<QueryRequest>,
 ) -> Result<Json<ValidationResponse>, ServerError> {
     if !verified.has_permission(Permission::Validate) {
-        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+        return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
 
     let ast = match trawl_core::parser::parse(&req.query) {
@@ -838,7 +838,7 @@ pub async fn stats(
     Extension(verified): Extension<VerifiedKey>,
 ) -> Result<Json<StatsResponse>, ServerError> {
     if !verified.has_permission(Permission::ServerManage) {
-        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+        return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
 
     Ok(Json(StatsResponse {
@@ -886,7 +886,7 @@ pub async fn dashboard(
     Extension(verified): Extension<VerifiedKey>,
 ) -> Result<Json<DashboardSnapshot>, ServerError> {
     if !verified.has_permission(Permission::ServerManage) {
-        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+        return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
 
     let snapshot = state.dashboard_snapshot.lock().clone();
@@ -917,7 +917,7 @@ pub async fn dashboard_stream(
     ServerError,
 > {
     if !verified.has_permission(Permission::ServerManage) {
-        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+        return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
 
     // Bound concurrent dashboard streams. The owned permit is held by the
@@ -959,7 +959,7 @@ pub async fn schema_services(
     Extension(verified): Extension<VerifiedKey>,
 ) -> Result<Json<trawl_api::ServiceSchemaResponse>, ServerError> {
     if !verified.has_permission(Permission::SchemaRead) {
-        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+        return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
 
     let (hot_events, hot_bytes) = hot_buffer_stats(&state);
@@ -1045,7 +1045,7 @@ pub async fn catalog_fields(
     Query(params): Query<CatalogFieldsParams>,
 ) -> Result<Json<trawl_api::CatalogFieldsResponse>, ServerError> {
     if !verified.has_permission(Permission::SchemaRead) {
-        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+        return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
 
     let limit = params
@@ -1219,7 +1219,7 @@ pub async fn catalog_field(
     Query(params): Query<CatalogFieldParams>,
 ) -> Result<Json<trawl_api::CatalogFieldResponse>, ServerError> {
     if !verified.has_permission(Permission::SchemaRead) {
-        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+        return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
 
     // One DuckDB identifier has exactly one catalog spelling (ASCII-lower,
@@ -1344,7 +1344,7 @@ pub async fn ack_degraded_field(
     Json(req): Json<FieldAckRequest>,
 ) -> Result<axum::response::Response, ServerError> {
     if !verified.has_permission(Permission::SchemaWrite) {
-        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+        return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
     let name = trawl_core::schema::catalog_key(&params.name);
     let note = req.note.as_deref();
@@ -1430,7 +1430,7 @@ pub async fn clear_degraded_field_ack(
     Query(params): Query<FieldAckParams>,
 ) -> Result<axum::response::Response, ServerError> {
     if !verified.has_permission(Permission::SchemaWrite) {
-        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+        return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
     let name = trawl_core::schema::catalog_key(&params.name);
     if state.storage.catalog.field_pin(&name).await?.is_none() {
@@ -1479,7 +1479,7 @@ pub async fn catalog_conflicts(
     Query(params): Query<CatalogConflictsParams>,
 ) -> Result<Json<trawl_api::CatalogConflictsResponse>, ServerError> {
     if !verified.has_permission(Permission::SchemaRead) {
-        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+        return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
 
     let limit = params
@@ -1523,7 +1523,7 @@ pub async fn field_values(
     Query(params): Query<FieldValuesParams>,
 ) -> Result<Json<FieldValuesResponse>, ServerError> {
     if !verified.has_permission(Permission::SchemaRead) {
-        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+        return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
 
     let limit = params.limit.unwrap_or(10).min(100);
@@ -1618,7 +1618,7 @@ pub async fn history(
     Query(params): Query<HistoryParams>,
 ) -> Result<Json<HistoryResponse>, ServerError> {
     if !verified.has_permission(Permission::Query) {
-        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+        return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
 
     // The verified key carries the authoritative fleet keystore id.
@@ -1676,7 +1676,7 @@ pub async fn list_saved(
     Extension(verified): Extension<VerifiedKey>,
 ) -> Result<Json<ListSavedResponse>, ServerError> {
     if !verified.has_permission(Permission::SavedQuery) {
-        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+        return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
 
     let key_id = verified.id;
@@ -1711,7 +1711,7 @@ pub async fn create_saved(
     Json(req): Json<CreateSavedRequest>,
 ) -> Result<Json<SavedQueryResponse>, ServerError> {
     if !verified.has_permission(Permission::SavedQuery) {
-        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+        return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
 
     let key_id = verified.id;
@@ -1734,7 +1734,7 @@ pub async fn update_saved(
     Json(req): Json<UpdateSavedRequest>,
 ) -> Result<Json<SavedQueryResponse>, ServerError> {
     if !verified.has_permission(Permission::SavedQuery) {
-        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+        return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
 
     let key_id = verified.id;
@@ -1759,7 +1759,7 @@ pub async fn delete_saved(
     Path(id): Path<i64>,
 ) -> Result<Json<DeleteSavedResponse>, ServerError> {
     if !verified.has_permission(Permission::SavedQuery) {
-        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+        return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
 
     let key_id = verified.id;
@@ -1975,7 +1975,7 @@ pub async fn schema_repin(
     Json(req): Json<trawl_api::RepinRequest>,
 ) -> Result<axum::response::Response, ServerError> {
     if !verified.has_permission(Permission::SchemaWrite) {
-        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+        return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
     let Some(engine) = state.repin.as_ref() else {
         return Err(ServerError::ServiceUnavailable(
@@ -2044,7 +2044,7 @@ pub async fn schema_repin_cancel(
     Extension(verified): Extension<VerifiedKey>,
 ) -> Result<axum::response::Response, ServerError> {
     if !verified.has_permission(Permission::SchemaWrite) {
-        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+        return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
     let Some(engine) = state.repin.as_ref() else {
         return Err(ServerError::ServiceUnavailable(
@@ -2094,7 +2094,7 @@ pub async fn schema_repin_status(
     Extension(verified): Extension<VerifiedKey>,
 ) -> Result<Json<trawl_api::RepinStatusResponse>, ServerError> {
     if !verified.has_permission(Permission::SchemaRead) {
-        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+        return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
     let job = state.storage.repin.latest().await?;
     Ok(Json(trawl_api::RepinStatusResponse {
@@ -2122,7 +2122,7 @@ pub async fn schema_gc_pins(
     Json(req): Json<trawl_api::GcPinsRequest>,
 ) -> Result<Json<trawl_api::GcPinsResponse>, ServerError> {
     if !verified.has_permission(Permission::SchemaWrite) {
-        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+        return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
     let Some(engine) = state.gc.as_ref() else {
         return Err(ServerError::ServiceUnavailable(
@@ -2227,7 +2227,7 @@ pub async fn set_schedule(
     Json(req): Json<SetScheduleRequest>,
 ) -> Result<Json<ScheduleResponse>, ServerError> {
     if !verified.has_permission(Permission::SavedQuery) {
-        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+        return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
 
     let key_id = verified.id;
@@ -2291,7 +2291,7 @@ pub async fn get_schedule(
     Path(saved_id): Path<i64>,
 ) -> Result<Json<ScheduleResponse>, ServerError> {
     if !verified.has_permission(Permission::SavedQuery) {
-        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+        return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
 
     let key_id = verified.id;
@@ -2315,7 +2315,7 @@ pub async fn delete_schedule(
     Path(saved_id): Path<i64>,
 ) -> Result<Json<DeleteScheduleResponse>, ServerError> {
     if !verified.has_permission(Permission::SavedQuery) {
-        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+        return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
 
     let key_id = verified.id;
@@ -2354,7 +2354,7 @@ pub async fn list_report_runs(
     Query(params): Query<ListRunsParams>,
 ) -> Result<Json<ListReportRunsResponse>, ServerError> {
     if !verified.has_permission(Permission::SavedQuery) {
-        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+        return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
 
     let key_id = verified.id;
@@ -2384,7 +2384,7 @@ pub async fn list_all_runs(
     Query(params): Query<ListRunsParams>,
 ) -> Result<Json<ListAllRunsResponse>, ServerError> {
     if !verified.has_permission(Permission::SavedQuery) {
-        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+        return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
 
     let key_id = verified.id;
@@ -2416,7 +2416,7 @@ pub async fn runs_stats(
     Extension(verified): Extension<VerifiedKey>,
 ) -> Result<Json<RunsStatsResponse>, ServerError> {
     if !verified.has_permission(Permission::SavedQuery) {
-        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+        return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
 
     let key_id = verified.id;
@@ -2447,7 +2447,7 @@ pub async fn trigger_run(
     Path(saved_id): Path<i64>,
 ) -> Result<Json<ReportRunSummary>, ServerError> {
     if !verified.has_permission(Permission::SavedQuery) {
-        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+        return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
 
     let key_id = verified.id;
@@ -2551,7 +2551,7 @@ pub async fn get_report_run(
     Path((saved_id, run_id)): Path<(i64, i64)>,
 ) -> Result<Json<ReportRunResponse>, ServerError> {
     if !verified.has_permission(Permission::SavedQuery) {
-        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+        return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
 
     let key_id = verified.id;
@@ -2631,7 +2631,7 @@ pub async fn export(
     Json(req): Json<ExportRequest>,
 ) -> Result<impl IntoResponse, ServerError> {
     if !verified.has_permission(Permission::Export) {
-        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+        return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
 
     let format = params.format.unwrap_or(trawl_api::ExportFormat::Csv);
@@ -3037,7 +3037,7 @@ pub async fn stream_query(
     ServerError,
 > {
     if !verified.has_permission(Permission::Stream) {
-        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+        return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
 
     // Bound concurrent SSE connections. The owned permit is held by the

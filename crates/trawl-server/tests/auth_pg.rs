@@ -9,7 +9,7 @@
 //! - AC3: route matrix (public probes, per-role denials, grantless 403
 //!   everywhere, no rate-limiter bypass)
 //! - AC4: frozen /whoami wire shape per role (golden JSON)
-//! - AC5: error envelope per failure class (401 opaque, 403 grantless,
+//! - AC5: error envelope per failure class (401 credential, 403 authorization,
 //!   503 pg-down without backend detail)
 //! - AC6: scheduler skips revoked / expired / grant-stripped keys
 //! - AC8: audit poller sees out-of-process key mutations
@@ -177,9 +177,15 @@ async fn ac3_reader_blocked_from_export_stream_manage() {
             Some(&server.reader_token),
         )
         .await;
-        assert_eq!(status, 401, "{method} {path} must be denied for reader");
+        assert_eq!(status, 403, "{method} {path} must be denied for reader");
         assert_eq!(
-            body["error"]["code"], "unauthorized",
+            body,
+            serde_json::json!({
+                "error": {
+                    "code": "forbidden",
+                    "message": "insufficient permissions"
+                }
+            }),
             "{method} {path} body: {body}"
         );
     }
@@ -209,14 +215,24 @@ async fn ac3_ingest_only_key_can_ingest_but_nothing_else() {
         (reqwest::Method::GET, "/api/v1/stats"),
         (reqwest::Method::GET, "/api/v1/schema"),
     ] {
-        let (status, _) = request(
+        let (status, body) = request(
             &server.url,
             method.clone(),
             path,
             Some(&server.ingest_token),
         )
         .await;
-        assert_eq!(status, 401, "{method} {path} must be denied for ingest key");
+        assert_eq!(status, 403, "{method} {path} must be denied for ingest key");
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "error": {
+                    "code": "forbidden",
+                    "message": "insufficient permissions"
+                }
+            }),
+            "{method} {path} body: {body}"
+        );
     }
 }
 
@@ -233,8 +249,17 @@ async fn ac3_admin_cannot_ingest() {
         .unwrap();
     assert_eq!(
         resp.status().as_u16(),
-        401,
+        403,
         "admin and ingest are orthogonal"
+    );
+    assert_eq!(
+        resp.json::<serde_json::Value>().await.unwrap(),
+        serde_json::json!({
+            "error": {
+                "code": "forbidden",
+                "message": "insufficient permissions"
+            }
+        })
     );
 }
 

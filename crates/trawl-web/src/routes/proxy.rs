@@ -129,16 +129,12 @@ async fn do_forward(
 /// by both the generic forwarder and the SSE handler so a newly added
 /// proxied path can't silently diverge.
 ///
-/// Always `None`: trawld returns an opaque `401` both for a dead key
-/// (revoked/expired fleet-wide) and for a live key that merely lacks the
-/// grant for one endpoint (a non-admin whose SPA hits an admin-only route).
-/// This layer cannot tell them apart, so clearing on a proxied `401` would
-/// sign valid users out of the whole fleet on a routine authz denial, and a
-/// `403` may likewise still carry grants for sibling apps. Cookie lifecycle
-/// therefore belongs to `auth::me`, which decides against the
-/// permission-free upstream `/whoami`, the only place a `401` is
-/// unambiguously a dead key. `_status`/`_auth` are what a future
-/// clear-on-status policy would key on.
+/// Always `None`: proxied responses never own cookie lifecycle. A trawld
+/// `401` means the upstream credential is invalid, revoked, or expired; a
+/// `403` means the valid key lacks a trawl grant or the permission for that
+/// route and may still carry grants for sibling apps. `auth::me` owns cookie
+/// clearing through the permission-free upstream `/whoami`. `_status` and
+/// `_auth` remain available if that policy changes.
 #[must_use]
 pub(crate) fn clear_cookie_for_proxied_response(
     _status: StatusCode,
@@ -420,9 +416,8 @@ mod tests {
 
     #[tokio::test]
     async fn forward_upstream_401_with_session_preserves_cookie() {
-        // trawld's 401 is opaque: a dead key and a live key lacking one
-        // endpoint's grant look identical here, so a proxied 401 must not
-        // clear the shared cookie. See `clear_cookie_for_proxied_response`.
+        // A proxied 401 means the upstream key is dead, but cookie clearing
+        // belongs to `auth::me`, not an arbitrary proxied request.
         let upstream = MockServer::start().await;
         let state = state_pointing_at(&upstream);
         let app = build_app(state);
@@ -445,16 +440,14 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         assert!(
             !resp.headers().contains_key(header::SET_COOKIE),
-            "a proxied 401 (possibly a mere authz denial) must NOT clear the \
-             shared fleet_session cookie"
+            "a proxied 401 must NOT clear the shared fleet_session cookie"
         );
     }
 
     #[tokio::test]
     async fn forward_upstream_403_preserves_cookie() {
-        // Valid key, no trawl grant: the shared fleet_session cookie may
-        // still hold grants for sibling apps — clearing it would log the
-        // user out of another fleet app. 403 passes through with NO Set-Cookie.
+        // A valid key missing either a trawl grant or this route's permission
+        // may still hold grants for sibling apps. Preserve the shared cookie.
         let upstream = MockServer::start().await;
         let state = state_pointing_at(&upstream);
         let app = build_app(state);

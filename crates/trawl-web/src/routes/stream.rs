@@ -297,10 +297,8 @@ mod tests {
 
     #[tokio::test]
     async fn stream_upstream_401_with_session_preserves_cookie() {
-        // trawld's 401 here is as ambiguous as on any other proxied route:
-        // a dead key and a live key lacking the `stream` permission look
-        // alike, so the stream path must not touch the shared cookie
-        // either. `auth::me` owns the cookie lifecycle.
+        // A stream 401 means the upstream key is dead. The stream proxy still
+        // leaves cookie lifecycle to `auth::me`.
         let upstream = MockServer::start().await;
         let state = state_pointing_at(&upstream);
         let app = routes::build(state);
@@ -583,9 +581,8 @@ mod tests {
 
     #[tokio::test]
     async fn dashboard_stream_upstream_401_preserves_cookie() {
-        // trawld 401s this path for every non-admin session (ServerManage
-        // check), so the shared-cookie rule matters most here: a routine
-        // authz denial must never sign the user out of the whole fleet.
+        // Model a dead upstream key on the admin stream. The proxy preserves
+        // the shared cookie until `auth::me` performs its `/whoami` check.
         let upstream = MockServer::start().await;
         let state = state_pointing_at(&upstream);
         let app = routes::build(state);

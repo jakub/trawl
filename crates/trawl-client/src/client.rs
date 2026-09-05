@@ -635,7 +635,7 @@ impl HttpClient {
     /// too late, 404 nothing running — so they decode into variants the way
     /// [`Self::schema_repin`] decodes its 409 plan, before the generic
     /// status check turns them into an opaque error. Everything else (401,
-    /// 503 on a query-only node, 5xx) stays a [`ClientError::Server`].
+    /// 403, 503 on a query-only node, 5xx) stays a [`ClientError::Server`].
     pub async fn schema_repin_cancel(&self) -> Result<RepinCancel, ClientError> {
         let url = self.endpoint("/api/v1/schema/repin/cancel");
         let resp = self

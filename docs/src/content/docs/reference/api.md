@@ -38,9 +38,10 @@ The migration converts the former static tiers into these roles:
 
 Handlers gate on permissions, never role names — reshape the tiers with
 `fleet-admin roles` without a deploy. A valid key that lacks the
-permission a route asks for is refused **401** (the whole per-route gate
-answers alike); **403** is reserved for the grant gate in front of it — a
-key resolving *no* recognized trawl permission at all.
+permission a route asks for is refused **403** with error code `forbidden`.
+A key resolving *no* recognized trawl permission at all is also refused 403
+by the grant gate before the handler. Missing, malformed, invalid, expired,
+and revoked credentials remain an opaque **401**.
 
 One permission exists outside the converted tiers: `schema_write` gates
 the repin trigger (the first data-mutating schema action) and is

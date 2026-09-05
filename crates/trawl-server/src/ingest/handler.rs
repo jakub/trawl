@@ -154,7 +154,7 @@ pub async fn ingest(
     body: Bytes,
 ) -> Result<Json<IngestResponse>, ServerError> {
     if !verified.has_permission(Permission::Ingest) {
-        return Err(ServerError::Unauthorized("insufficient permissions".into()));
+        return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
 
     let wal_writer = state

@@ -1052,8 +1052,7 @@ fn ndjson_field_names(out: &[u8]) -> Vec<String> {
 }
 
 /// All three read routes gate on `schema_read`: a key without it is denied
-/// (401 insufficient-permissions per the handler convention; a key with no
-/// trawl grant at all is the 403 case), the reader key passes.
+/// with 403, as is a key with no trawl grant at all; the reader key passes.
 #[tokio::test(flavor = "multi_thread")]
 async fn catalog_routes_require_schema_read() {
     let h = harness().await;
@@ -1064,8 +1063,13 @@ async fn catalog_routes_require_schema_read() {
         "/schema/field?name=duration",
         "/schema/conflicts",
     ] {
-        let (status, _) = h.get(&h.server.ingest_token, path).await;
-        assert_eq!(status, 401, "{path} must deny a key without schema_read");
+        let (status, body) = h.get(&h.server.ingest_token, path).await;
+        assert_eq!(status, 403, "{path} must deny a key without schema_read");
+        assert_eq!(body["error"]["code"], "forbidden", "{path}: {body}");
+        assert_eq!(
+            body["error"]["message"], "insufficient permissions",
+            "{path}: {body}"
+        );
 
         let (status, _) = h.get(&h.server.coastwatch_only_token, path).await;
         assert_eq!(status, 403, "{path} must 403 a grantless key");
@@ -1359,21 +1363,25 @@ async fn an_oversized_ack_note_is_refused_before_the_store() {
 }
 
 /// Both ack verbs ride `schema_write`: a `schema_read` key may read the
-/// badge and not answer it. 401 for an authenticated key without the
-/// permission, 403 for a key with no trawl grant at all — the same
-/// convention the repin route follows.
+/// badge and not answer it. Both an authenticated key without the permission
+/// and a key with no trawl grant at all receive 403.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_ack_routes_require_schema_write() {
     let h = harness().await;
     degraded_duration(&h).await;
 
     for token in [&h.server.analyst_token, &h.server.reader_token] {
-        let (status, _) = h
+        let (status, body) = h
             .post(token, "/schema/field/ack?name=duration", json!({}))
             .await;
-        assert_eq!(status, 401, "a schema_read key cannot acknowledge");
-        let (status, _) = h.delete(token, "/schema/field/ack?name=duration").await;
-        assert_eq!(status, 401, "nor withdraw");
+        assert_eq!(status, 403, "a schema_read key cannot acknowledge");
+        assert_eq!(body["error"]["code"], "forbidden", "{body}");
+        assert_eq!(body["error"]["message"], "insufficient permissions");
+        let (status, body) = h.delete(token, "/schema/field/ack?name=duration").await;
+        assert_eq!(status, 403, "nor withdraw");
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["error"]["code"], "forbidden", "{body}");
+        assert_eq!(body["error"]["message"], "insufficient permissions");
     }
 
     let (status, _) = h
