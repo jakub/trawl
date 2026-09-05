@@ -86,6 +86,23 @@ async fn key_role_names(pool: &sqlx::PgPool, key_id: i64) -> Vec<String> {
 }
 
 async fn wait_for_key_lock_waiters(pool: &sqlx::PgPool, expected: i64) {
+    wait_for_key_lock_waiters_matching(pool, expected, "%api_keys%").await;
+}
+
+async fn wait_for_role_assignment_lock_waiters(pool: &sqlx::PgPool, expected: i64) {
+    wait_for_key_lock_waiters_matching(
+        pool,
+        expected,
+        "%SELECT id, active%FROM api_keys%FOR UPDATE%",
+    )
+    .await;
+}
+
+async fn wait_for_key_lock_waiters_matching(
+    pool: &sqlx::PgPool,
+    expected: i64,
+    query_pattern: &str,
+) {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let waiting: i64 = sqlx::query_scalar(
@@ -94,8 +111,9 @@ async fn wait_for_key_lock_waiters(pool: &sqlx::PgPool, expected: i64) {
                  WHERE datname = current_database()
                    AND pid <> pg_backend_pid()
                    AND wait_event_type = 'Lock'
-                   AND query LIKE '%api_keys%'",
+                   AND query LIKE $1",
             )
+            .bind(query_pattern)
             .fetch_one(pool)
             .await
             .expect("inspect Postgres lock waiters");
@@ -751,6 +769,100 @@ async fn unassign_role_waits_for_key_row_lock(pool: sqlx::PgPool) {
     let verified = store.verify_key(&created.plaintext_token).await.unwrap();
     assert_eq!(verified.roles(), ["trawl-admin"]);
     assert!(!verified.has_any_permission("coastwatch"));
+}
+
+#[sqlx::test]
+async fn concurrent_distinct_role_assignments_both_persist(pool: sqlx::PgPool) {
+    let store = KeyStore::from_pool(pool);
+    seed_roles(&store).await;
+
+    let created = store
+        .create_key("distinct-roles", PrincipalKind::Human, &[], None)
+        .await
+        .unwrap();
+    let mut blocker = store.pool().begin().await.unwrap();
+    sqlx::query("SELECT id FROM api_keys WHERE id = $1 FOR UPDATE")
+        .bind(created.info.id)
+        .fetch_one(&mut *blocker)
+        .await
+        .unwrap();
+
+    let first_store = store.clone();
+    let first_prefix = created.info.prefix.clone();
+    let first =
+        tokio::spawn(async move { first_store.assign_role(&first_prefix, "trawl-admin").await });
+    let second_store = store.clone();
+    let second_prefix = created.info.prefix.clone();
+    let second = tokio::spawn(async move {
+        second_store
+            .assign_role(&second_prefix, "coastwatch-siem_consumer")
+            .await
+    });
+
+    wait_for_role_assignment_lock_waiters(store.pool(), 2).await;
+    blocker.commit().await.unwrap();
+
+    first.await.unwrap().expect("first assignment must succeed");
+    second
+        .await
+        .unwrap()
+        .expect("second assignment must succeed");
+    assert_eq!(
+        key_role_names(store.pool(), created.info.id).await,
+        ["coastwatch-siem_consumer", "trawl-admin"]
+    );
+}
+
+#[sqlx::test]
+async fn concurrent_duplicate_role_assignment_has_one_winner(pool: sqlx::PgPool) {
+    let store = KeyStore::from_pool(pool);
+    seed_roles(&store).await;
+
+    let created = store
+        .create_key("duplicate-role", PrincipalKind::Human, &[], None)
+        .await
+        .unwrap();
+    let mut blocker = store.pool().begin().await.unwrap();
+    sqlx::query("SELECT id FROM api_keys WHERE id = $1 FOR UPDATE")
+        .bind(created.info.id)
+        .fetch_one(&mut *blocker)
+        .await
+        .unwrap();
+
+    let first_store = store.clone();
+    let first_prefix = created.info.prefix.clone();
+    let first =
+        tokio::spawn(async move { first_store.assign_role(&first_prefix, "trawl-admin").await });
+    let second_store = store.clone();
+    let second_prefix = created.info.prefix.clone();
+    let second = tokio::spawn(async move {
+        second_store
+            .assign_role(&second_prefix, "trawl-admin")
+            .await
+    });
+
+    wait_for_role_assignment_lock_waiters(store.pool(), 2).await;
+    blocker.commit().await.unwrap();
+
+    let mut succeeded = 0;
+    let mut duplicate_errors = 0;
+    for result in [first.await.unwrap(), second.await.unwrap()] {
+        match result {
+            Ok(()) => succeeded += 1,
+            Err(AuthError::RoleAlreadyAssigned { prefix, role }) => {
+                assert_eq!(prefix, created.info.prefix);
+                assert_eq!(role, "trawl-admin");
+                duplicate_errors += 1;
+            }
+            Err(error) => panic!("unexpected assignment error: {error:?}"),
+        }
+    }
+    assert_eq!(succeeded, 1);
+    assert_eq!(duplicate_errors, 1);
+    assert_eq!(
+        key_role_names(store.pool(), created.info.id).await,
+        ["trawl-admin"]
+    );
 }
 
 // ---------------------------------------------------------------------------
