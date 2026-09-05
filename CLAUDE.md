@@ -102,6 +102,8 @@ bin/app-experiment --skip-build --hold-seconds 600
   selects the existing disk-backed cache. Set it consistently on every run
   and lifecycle-test command. Elsewhere, use an absolute disk-backed cache
   path or the default worktree `target`. Avoid a large Rust build on `/tmp`.
+  Other builds into a shared cache can replace binaries and invalidate
+  `--skip-build`; use a separate cache for concurrent worktrees.
 - Default to the 1000-event run when no workload is specified. `--batch-size`
   defaults to 50 and must be less than `--events`. `--rate` is a paced target,
   not a load-test throughput guarantee. `--skip-build` refuses stale build
@@ -114,6 +116,10 @@ bin/app-experiment --skip-build --hold-seconds 600
   Require exit 0, `status: passed`, expected phase counts, and all cleanup
   flags true. A readiness line or accepted ingest count alone is not a pass.
   Retain that exact run path; do not infer success from an older report.
+  Stopping a hold early deliberately exits 1 with `status: interrupted`.
+  Report that as an interrupted hold with completed checks only if the
+  `browser-session-after-restart` phase exists and cleanup succeeded. Let
+  the hold expire naturally for an exit-0, `passed` result.
 - Report commit/build identity, seed/count/rate, result checks, timings, and
   cleanup. Evidence includes metrics, `queries.ndjson`, memory samples, logs,
   screenshots, and a browser trace. Debug-server timings are not release

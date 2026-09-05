@@ -32,6 +32,12 @@ only after the complete scenario passes, including restart. Keep the runner
 supervised while inspecting the app. Ctrl+C or SIGTERM requests cleanup.
 The hold also ends automatically at its deadline.
 
+An early Ctrl+C or SIGTERM deliberately produces exit code 1 and
+`status: interrupted`, even after every scenario check passed. Report it as
+an interrupted hold with completed checks only when the report includes
+`browser-session-after-restart` and successful cleanup. Let the hold reach
+its deadline for an exit-0, `passed` run.
+
 The successful result is exit code 0 and `status: passed` in that run's
 `report.json`, with all cleanup flags true. A printed URL means startup
 succeeded, not that the experiment passed. Credentials, TLS keys, databases,
@@ -73,7 +79,9 @@ bin/app-experiment --seed 42 --events 1000 --rate 200
 
 Use the same value for subsequent runs and lifecycle tests. This absolute
 path is a host convenience, not a requirement. On another host choose a
-local disk-backed cache or omit it. The preparation manifest and run reports
+local disk-backed cache or omit it. Another checkout building into the same
+cache can replace binaries and make `--skip-build` refuse the next run. Use
+a separate cache for concurrent worktrees. The preparation manifest and run reports
 still live under the selected worktree's `target`, even when Cargo artifacts
 live elsewhere. The initial cache occupied about 8.4 GB on this host; allow
 room for growth and avoid building on a small `/tmp` tmpfs.
@@ -189,6 +197,7 @@ phase list. With defaults, expect 50 initial events, a 50-row browser page,
 phases, and a 50-row browser page after restart. With a different batch size,
 the initial count is the batch size and live tail receives the remainder.
 For counts below 50, the expected browser page is the available event count.
+Also require `browser-live-tail-closed`, which records closure on navigation.
 
 `queryLatencyMs` contains raw HTTP query durations and their p50/p95/max.
 They include authentication and transport. Queries also run between ingest
