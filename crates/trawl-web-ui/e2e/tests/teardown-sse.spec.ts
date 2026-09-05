@@ -84,6 +84,31 @@ test('a burst keeps the newest 5000 rows, updates columns, and releases its rend
   expect(rendered.seqs).toEqual(Array.from({ length: 5000 }, (_, i) => i + 1000));
   expect(rendered.headers).toContain('late_column');
   expect(rendered.headers).not.toContain('expired_only');
+  // Retained events keep their DOM nodes when a full ring advances.
+  const retained = await page.locator(SEL.liveResultsTable).locator('tbody tr').nth(1).elementHandle();
+  const retainedText = await retained!.textContent();
+  await request.post('/__ctl/stream-events', {
+    data: [{ seq: 6000, message: 'burst-6000', late_column: 'arrived' }],
+  });
+  await expect(page.getByText('burst-6000', { exact: true })).toBeVisible();
+  expect(await retained!.evaluate(row => ({ connected: row.isConnected, text: row.textContent })))
+    .toEqual({ connected: true, text: retainedText });
+  await expect(page.locator(SEL.liveResultsTable).locator('tbody tr')).toHaveCount(5000);
+
+  // A new column refreshes the cells of rows already retained by the ring.
+  await request.post('/__ctl/stream-events', {
+    data: [{ seq: 6001, message: 'burst-6001', later_column: 'new' }],
+  });
+  await expect(page.getByText('burst-6001', { exact: true })).toBeVisible();
+  const updated = await page.locator(SEL.liveResultsTable).evaluate(table => ({
+    headers: Array.from(table.querySelectorAll('th'), th => th.textContent),
+    counts: Array.from(table.querySelectorAll('tbody tr'), row => row.children.length),
+    first: Array.from(table.querySelectorAll('tbody tr:first-child td'), cell => cell.textContent),
+  }));
+  expect(updated.headers).toContain('later_column');
+  expect(updated.counts).toEqual(Array(5000).fill(updated.headers.length));
+  expect(Object.fromEntries(updated.headers.map((name, i) => [name, updated.first[i]])))
+    .toEqual({ seq: '1002', message: 'burst-1002', late_column: 'NULL', later_column: 'NULL' });
   expect(await page.evaluate(() => (window as any).__liveRenderTimers.size)).toBe(1);
 
   await page.locator(SEL.railHistoryLink).click();

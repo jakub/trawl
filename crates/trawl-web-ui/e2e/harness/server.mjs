@@ -220,6 +220,16 @@ const server = http.createServer(async (req, res) => {
       sendJson(res, 200, { ok: true, scenario });
       return;
     }
+    if (p === '/__ctl/stream-events' && req.method === 'POST') {
+      const events = JSON.parse(await readBody(req));
+      for (const res of sse.responses) {
+        for (const event of events) {
+          res.write(`event: data\ndata: ${JSON.stringify(event)}\n\n`);
+        }
+      }
+      sendJson(res, 200, { ok: true });
+      return;
+    }
     if (p === '/__ctl/state' && req.method === 'GET') {
       sendJson(res, 200, {
         sse: { open: sse.open, opens: sse.opens, closes: sse.closes },
