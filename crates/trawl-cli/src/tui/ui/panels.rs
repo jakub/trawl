@@ -546,8 +546,8 @@ fn format_relative_time(iso_timestamp: &str) -> String {
 /// Render a report run's covered window as `[start .. end)` in UTC.
 ///
 /// Bounds are half-open, so the closing bracket is deliberate. Both bounds are
-/// cut to whole minutes: a planned boundary never carries seconds, and the run
-/// list has no room for them. When both bounds fall on the same UTC day the end
+/// rendered with seconds and any fractional part, since schedule edits can
+/// re-anchor a boundary between minutes. When both bounds share a UTC day the end
 /// bound drops its date, which is the common case for a tiled window.
 ///
 /// A bound that does not parse is passed through verbatim rather than guessed
@@ -559,24 +559,24 @@ fn format_run_window(start: &str, end: &str) -> String {
         return format!("[{start} .. {end})");
     };
 
-    let from_text = from.format("%Y-%m-%d %H:%M").to_string();
+    let from_text = from.format("%Y-%m-%d %H:%M:%S%.f").to_string();
     let to_text = if from.date_naive() == to.date_naive() {
-        to.format("%H:%M").to_string()
+        to.format("%H:%M:%S%.f").to_string()
     } else {
-        to.format("%Y-%m-%d %H:%M").to_string()
+        to.format("%Y-%m-%d %H:%M:%S%.f").to_string()
     };
 
     format!("[{from_text} .. {to_text})")
 }
 
-/// Render an RFC 3339 instant as a whole-minute UTC wall clock. A value that
+/// Render an RFC 3339 instant in UTC, preserving seconds and fractions. A value that
 /// does not parse is passed through so an unexpected wire shape is visible.
 fn format_instant_utc(iso: &str) -> String {
     use chrono::{DateTime, Utc};
 
     iso.parse::<DateTime<Utc>>().map_or_else(
         |_| iso.to_owned(),
-        |t| format!("{} UTC", t.format("%Y-%m-%d %H:%M")),
+        |t| format!("{} UTC", t.format("%Y-%m-%d %H:%M:%S%.f")),
     )
 }
 
@@ -1161,7 +1161,7 @@ mod tests {
     fn run_window_same_day_drops_the_end_date() {
         assert_eq!(
             format_run_window("2026-03-14T02:00:00Z", "2026-03-14T03:00:00Z"),
-            "[2026-03-14 02:00 .. 03:00)"
+            "[2026-03-14 02:00:00 .. 03:00:00)"
         );
     }
 
@@ -1169,7 +1169,7 @@ mod tests {
     fn run_window_across_midnight_keeps_the_end_date() {
         assert_eq!(
             format_run_window("2026-03-14T23:30:00Z", "2026-03-15T00:30:00Z"),
-            "[2026-03-14 23:30 .. 2026-03-15 00:30)"
+            "[2026-03-14 23:30:00 .. 2026-03-15 00:30:00)"
         );
     }
 
@@ -1179,7 +1179,19 @@ mod tests {
     fn run_window_normalizes_an_offset_to_utc() {
         assert_eq!(
             format_run_window("2026-03-14T09:00:00+05:30", "2026-03-14T10:00:00+05:30"),
-            "[2026-03-14 03:30 .. 04:30)"
+            "[2026-03-14 03:30:00 .. 04:30:00)"
+        );
+    }
+
+    #[test]
+    fn schedule_bounds_preserve_subminute_precision() {
+        assert_eq!(
+            format_run_window("2026-03-14T02:00:17.123456Z", "2026-03-14T03:00:17.123457Z"),
+            "[2026-03-14 02:00:17.123456 .. 03:00:17.123457)"
+        );
+        assert_eq!(
+            format_instant_utc("2026-03-14T04:00:17.123456+01:00"),
+            "2026-03-14 03:00:17.123456 UTC"
         );
     }
 
@@ -1230,7 +1242,7 @@ mod tests {
         );
         assert_eq!(
             format_schedule_window(&sched).unwrap(),
-            "window since_last, lag 5m, covered through 2026-03-14 03:00 UTC"
+            "window since_last, lag 5m, covered through 2026-03-14 03:00:00 UTC"
         );
     }
 
@@ -1270,7 +1282,7 @@ mod tests {
     fn instant_utc_passes_through_an_unparseable_value() {
         assert_eq!(
             format_instant_utc("2026-03-14T04:00:00Z"),
-            "2026-03-14 04:00 UTC"
+            "2026-03-14 04:00:00 UTC"
         );
         assert_eq!(format_instant_utc("soon"), "soon");
     }

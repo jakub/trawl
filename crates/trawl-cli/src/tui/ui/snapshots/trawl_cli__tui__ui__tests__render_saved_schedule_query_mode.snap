@@ -9,7 +9,7 @@ expression: terminal.backend().to_string()
 "│                                                                        ────────────────────────────────────────                                              │"
 "│                                                                        query  _severity>=error | stats count() by service                                    │"
 "│                                                                        sched  every 1h (enabled)                                                             │"
-"│                                                                               next fire 2026-03-14 04:00 UTC                                                 │"
+"│                                                                               next fire 2026-03-14 04:00:00 UTC                                              │"
 "│                                                                        runs   1                                                                              │"
 "│                                                                                                                                                              │"
 "│                                                                        runs (1 total)  ↑↓ navigate  Enter view  q query                                      │"
