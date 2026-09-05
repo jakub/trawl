@@ -3,7 +3,7 @@ title: HTTP API
 description: REST API reference for trawld.
 ---
 
-The trawl server exposes a REST API over HTTPS. All routes under `/api/v1` except `/health` and `/ingest` require bearer token authentication.
+The trawl server exposes a REST API over HTTPS. All routes under `/api/v1` except `/health` require bearer token authentication, including `/ingest`.
 
 ## Authentication
 
@@ -85,7 +85,9 @@ paths.
 ```
 
 An `auth_db`, `storage_db`, or `data_path` failure returns `degraded` with
-HTTP 200 because queries can still run. A `duckdb` failure returns
+HTTP 200. This status does not guarantee that authenticated requests can
+run: an `auth_db` outage prevents new requests from authenticating and
+returns HTTP 503 on protected routes. A `duckdb` failure returns
 `unavailable` with HTTP 503. All healthy checks return `ok` with HTTP 200.
 
 ### Query
