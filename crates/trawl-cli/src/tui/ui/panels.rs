@@ -925,16 +925,17 @@ fn render_saved_detail_inner(app: &App, theme: &Theme, frame: &mut Frame<'_>, ar
                     Style::default().fg(theme.text_muted),
                 ));
             }
-            if let (Some(start), Some(end)) = (&run.window_start, &run.window_end) {
-                spans.push(Span::styled(
-                    format!(" {}", format_run_window(start, end)),
-                    Style::default().fg(theme.text_muted),
-                ));
-            }
+            // Keep the coverage-loss warning ahead of bounds that may be clipped.
             if run.window_truncated == Some(true) {
                 spans.push(Span::styled(
                     " TRUNCATED",
                     Style::default().fg(theme.status_warning),
+                ));
+            }
+            if let (Some(start), Some(end)) = (&run.window_start, &run.window_end) {
+                spans.push(Span::styled(
+                    format!(" {}", format_run_window(start, end)),
+                    Style::default().fg(theme.text_muted),
                 ));
             }
 
