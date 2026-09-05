@@ -5,11 +5,14 @@
 //! Integration coverage for `fleet-admin roles` against a real Postgres
 //! (ADR-0006).
 //!
-//! Command functions are exercised where they add behaviour over the
-//! store (confirmation flow, warn-only permission registry); pure store
-//! round-trips call `KeyStore` directly, mirroring `keys_pg.rs`.
+//! Command functions are exercised where they add behaviour over the store.
+//! The warn-only permission test runs the built binary so it can assert stderr
+//! and exit status. Pure store round-trips call `KeyStore` directly, mirroring
+//! `keys_pg.rs`.
 
 mod common;
+
+use std::process::Command;
 
 use fleet_admin::commands::keys::RoleName;
 use fleet_admin::commands::roles;
@@ -70,25 +73,37 @@ async fn create_duplicate_is_role_exists(pool: sqlx::PgPool) {
 }
 
 #[sqlx::test(migrations = false)]
-async fn unknown_permission_warns_but_persists(pool: sqlx::PgPool) {
-    // The registry is warn-only. `qyery` is not in app_permissions, so the
-    // command must still return Ok (exit 0 at the binary boundary) and the
-    // row must persist. The stderr warning text belongs to the binary; the
-    // contract pinned here is no error, row persisted, registry consulted.
+async fn binary_warns_for_unknown_permission_and_persists(pool: sqlx::PgPool) {
     let store = common::migrated_store(pool).await;
+    let database_url = common::isolated_database_url(store.pool());
+    let output = Command::new(env!("CARGO_BIN_EXE_fleet-admin"))
+        .args(["roles", "create", "--name", "typo", "--perm", "trawl:qyery"])
+        .env("DATABASE_URL", database_url)
+        .output()
+        .expect("run fleet-admin roles create");
 
-    roles::create(&store, &role_name("typo"), &[rp("trawl", "qyery")], None)
-        .await
-        .expect("unknown permission must not fail the command");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "fleet-admin roles create must exit successfully"
+    );
+    let stderr = std::str::from_utf8(&output.stderr).expect("fleet-admin stderr must be UTF-8");
+    assert!(
+        stderr.contains("warning: trawl:qyery is not in the trawl permission registry"),
+        "stderr must identify the unknown permission and registry"
+    );
+    assert!(
+        stderr.contains("persisted anyway"),
+        "stderr must explain the warn-only persistence contract"
+    );
+    assert!(
+        stderr.contains("double-check for typos"),
+        "stderr must tell the operator to check the permission spelling"
+    );
 
     let role = store.get_role("typo").await.unwrap();
-    assert_eq!(
-        role.permissions,
-        vec![rp("trawl", "qyery")],
-        "row persisted"
-    );
+    assert_eq!(role.permissions, vec![rp("trawl", "qyery")]);
     assert!(!store.is_known_permission("trawl", "qyery").await.unwrap());
-    assert!(store.is_known_permission("trawl", "query").await.unwrap());
 }
 
 #[sqlx::test(migrations = false)]

@@ -7,6 +7,8 @@
 
 #![cfg(feature = "axum")]
 
+mod common;
+
 use std::sync::Arc;
 
 use axum::Router;
@@ -19,6 +21,8 @@ use fleet_auth::{
     SessionState, decrypt, login, logout,
 };
 use tower::ServiceExt as _;
+
+use common::{body_string, session_state};
 
 fn router_with_state(state: SessionState) -> Router {
     Router::new()
@@ -33,18 +37,15 @@ fn test_origins() -> PublicOrigins {
     PublicOrigins::parse(["https://trawl.example.com"]).expect("valid allowlist")
 }
 
-fn session_state(store: KeyStore, app_namespace: &str) -> (SessionState, Arc<SessionKey>) {
-    let session_key = Arc::new(SessionKey::generate());
-    let cfg = SessionConfig::builder()
+fn session_config(app_namespace: &str) -> SessionConfig {
+    SessionConfig::builder()
         .cookie_name("fleet_session")
         .app_namespace(app_namespace)
         .public_origins(test_origins())
         .secure(false) // tests don't run over HTTPS
         .post_login_redirect("/dashboard")
         .build()
-        .unwrap();
-    let state = SessionState::new(store, Arc::clone(&session_key), Arc::new(cfg)).unwrap();
-    (state, session_key)
+        .unwrap()
 }
 
 /// Seed the `trawl-analyst` role and return its name as the role list every
@@ -81,13 +82,6 @@ fn logout_request() -> Request<Body> {
         .unwrap()
 }
 
-async fn body_string(response: axum::response::Response) -> String {
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    String::from_utf8(bytes.to_vec()).unwrap()
-}
-
 // ---------------------------------------------------------------------------
 // login
 // ---------------------------------------------------------------------------
@@ -106,7 +100,7 @@ async fn login_valid_key_sets_cookie_and_redirects(pool: sqlx::PgPool) {
         .await
         .unwrap();
 
-    let (state, session_key) = session_state(store, "trawl");
+    let (state, session_key) = session_state(store, session_config("trawl"));
     let app = router_with_state(state);
 
     let response = app
@@ -195,7 +189,7 @@ async fn login_includes_domain_when_configured(pool: sqlx::PgPool) {
 async fn login_rejects_wrong_key(pool: sqlx::PgPool) {
     let store = KeyStore::from_pool(pool);
 
-    let (state, _) = session_state(store, "trawl");
+    let (state, _) = session_state(store, session_config("trawl"));
     let app = router_with_state(state);
 
     let response = app
@@ -214,7 +208,7 @@ async fn login_rejects_wrong_key(pool: sqlx::PgPool) {
 async fn login_rejects_empty_key(pool: sqlx::PgPool) {
     let store = KeyStore::from_pool(pool);
 
-    let (state, _) = session_state(store, "trawl");
+    let (state, _) = session_state(store, session_config("trawl"));
     let app = router_with_state(state);
 
     let response = app.oneshot(login_request("")).await.unwrap();
@@ -238,7 +232,7 @@ async fn login_no_grant_returns_403_no_cookie(pool: sqlx::PgPool) {
         .await
         .unwrap();
 
-    let (state, _) = session_state(store, "coastwatch");
+    let (state, _) = session_state(store, session_config("coastwatch"));
     let app = router_with_state(state);
 
     let response = app
@@ -303,7 +297,7 @@ async fn login_rejects_cross_origin_no_cookie(pool: sqlx::PgPool) {
         .await
         .unwrap();
 
-    let (state, _) = session_state(store, "trawl");
+    let (state, _) = session_state(store, session_config("trawl"));
     let app = router_with_state(state);
 
     let response = app
@@ -325,7 +319,7 @@ async fn login_rejects_cross_origin_no_cookie(pool: sqlx::PgPool) {
 async fn logout_rejects_cross_origin_no_clear(pool: sqlx::PgPool) {
     let store = KeyStore::from_pool(pool);
 
-    let (state, _) = session_state(store, "trawl");
+    let (state, _) = session_state(store, session_config("trawl"));
     let app = router_with_state(state);
 
     let response = app
@@ -354,7 +348,7 @@ async fn login_allows_the_configured_origin(pool: sqlx::PgPool) {
         .await
         .unwrap();
 
-    let (state, _) = session_state(store, "trawl");
+    let (state, _) = session_state(store, session_config("trawl"));
     let app = router_with_state(state);
 
     let response = app
@@ -383,7 +377,7 @@ async fn login_rejects_the_same_name_over_http(pool: sqlx::PgPool) {
         .await
         .unwrap();
 
-    let (state, _) = session_state(store, "trawl");
+    let (state, _) = session_state(store, session_config("trawl"));
     let app = router_with_state(state);
 
     // The whole point of ADR-0016: an active attacker serving
@@ -449,7 +443,7 @@ async fn logout_allows_absent_origin(pool: sqlx::PgPool) {
     let store = KeyStore::from_pool(pool);
 
     // Non-browser clients send no Origin — logout keeps working.
-    let (state, _) = session_state(store, "trawl");
+    let (state, _) = session_state(store, session_config("trawl"));
     let app = router_with_state(state);
 
     let response = app.oneshot(logout_request()).await.unwrap();
@@ -479,7 +473,7 @@ async fn login_allows_the_configured_origin_with_no_host_header(pool: sqlx::PgPo
         .await
         .unwrap();
 
-    let (state, _) = session_state(store, "trawl");
+    let (state, _) = session_state(store, session_config("trawl"));
     let app = router_with_state(state);
 
     let request = Request::builder()
@@ -510,7 +504,7 @@ async fn logout_rejects_a_foreign_origin_whatever_the_host_and_forwarding_header
 ) {
     let store = KeyStore::from_pool(pool);
 
-    let (state, _) = session_state(store, "trawl");
+    let (state, _) = session_state(store, session_config("trawl"));
     let app = router_with_state(state);
 
     // Every header an attacker might hope moves the verdict, all agreeing
@@ -587,7 +581,7 @@ async fn logout_requires_no_session(pool: sqlx::PgPool) {
     // Even without a valid cookie, logout succeeds — the browser was
     // already in a confused state, our job is to make sure the cookie is
     // gone, not to gate on whether it was valid.
-    let (state, _) = session_state(store, "trawl");
+    let (state, _) = session_state(store, session_config("trawl"));
     let app = router_with_state(state);
 
     let response = app.oneshot(logout_request()).await.unwrap();
