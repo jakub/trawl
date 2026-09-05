@@ -112,6 +112,7 @@ assets = [
     ["debian/trawld.default", "etc/default/trawld", "640"],
     ["debian/trawl-web.default", "etc/default/trawl-web", "644"],
     ["debian/trawl.sysusers.conf", "usr/lib/sysusers.d/trawl.conf", "644"],
+    ["debian/crashdump.conf", "usr/share/doc/trawl-server/examples/crashdump.conf", "644"],
 ]
 
 [lints]
