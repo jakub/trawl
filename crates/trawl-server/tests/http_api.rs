@@ -24,6 +24,15 @@ async fn health_returns_ok() {
     let client = HttpClient::new_insecure(&server.url, "unused").unwrap();
     let health = client.health().await.unwrap();
     assert_eq!(health.status, trawl_api::HealthStatus::Ok);
+    assert_eq!(
+        health.checks,
+        Some(std::collections::HashMap::from([
+            ("duckdb".to_owned(), "ok".to_owned()),
+            ("auth_db".to_owned(), "ok".to_owned()),
+            ("storage_db".to_owned(), "ok".to_owned()),
+            ("data_path".to_owned(), "ok".to_owned()),
+        ]))
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -67,7 +76,7 @@ async fn query_rejects_missing_auth() {
     let err = result.unwrap_err();
     match err {
         trawl_client::ClientError::Server { status, .. } => {
-            assert!(status == 400 || status == 401);
+            assert_eq!(status, 401);
         }
         other => panic!("expected Server error, got: {other:?}"),
     }
@@ -536,9 +545,9 @@ async fn queries_rejects_ingest_role() {
     let err = result.unwrap_err();
     match err {
         trawl_client::ClientError::Server { status, .. } => {
-            assert_eq!(status, 401);
+            assert_eq!(status, 403);
         }
-        other => panic!("expected 401 for ingest role, got: {other:?}"),
+        other => panic!("expected 403 for ingest role, got: {other:?}"),
     }
 }
 
@@ -991,7 +1000,10 @@ async fn ingest_rejects_analyst_role() {
         .await
         .unwrap();
 
-    assert_eq!(resp.status(), 401);
+    assert_eq!(resp.status(), 403);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "forbidden", "{body}");
+    assert_eq!(body["error"]["message"], "insufficient permissions");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1197,7 +1209,7 @@ async fn ingest_ceiling_does_not_apply_to_keys_without_ingest_permission() {
 
     // Reader burst is default_rpm (1): rejected on permission first, then on
     // rate — never the ingest_rpm allowance of 10.
-    assert_eq!(post_ingest(&server.reader_token).await, 401);
+    assert_eq!(post_ingest(&server.reader_token).await, 403);
     assert_eq!(
         post_ingest(&server.reader_token).await,
         429,
@@ -1271,9 +1283,9 @@ async fn cancel_query_rejects_ingest_role() {
     let err = result.unwrap_err();
     match err {
         trawl_client::ClientError::Server { status, .. } => {
-            assert_eq!(status, 401);
+            assert_eq!(status, 403);
         }
-        other => panic!("expected 401 for ingest role, got: {other:?}"),
+        other => panic!("expected 403 for ingest role, got: {other:?}"),
     }
 }
 
@@ -1362,10 +1374,12 @@ async fn cancel_query_isolated_by_key_id_not_name() {
     // ownership gate — the query is guaranteed still in-flight here.
     let denied = b.cancel_query(target).await;
     match denied {
-        Err(trawl_client::ClientError::Server { status, .. }) => {
-            assert_eq!(status, 401, "twin key B must not cancel key A's query");
+        Err(trawl_client::ClientError::Server { status, error }) => {
+            assert_eq!(status, 403, "twin key B must not cancel key A's query");
+            assert_eq!(error.code, trawl_api::ErrorCode::Forbidden);
+            assert_eq!(error.message, "cannot cancel this query");
         }
-        other => panic!("expected 401 for non-owner cancel, got: {other:?}"),
+        other => panic!("expected 403 for non-owner cancel, got: {other:?}"),
     }
 
     // Owner A passes the ownership gate and interrupts the tracked query:
@@ -1485,8 +1499,8 @@ async fn stats_endpoint_analyst_forbidden() {
     let result = analyst.stats().await;
     assert!(result.is_err());
     match result.unwrap_err() {
-        trawl_client::ClientError::Server { status, .. } => assert_eq!(status, 401),
-        other => panic!("expected 401, got: {other:?}"),
+        trawl_client::ClientError::Server { status, .. } => assert_eq!(status, 403),
+        other => panic!("expected 403, got: {other:?}"),
     }
 }
 
@@ -1498,8 +1512,8 @@ async fn dashboard_rejects_analyst() {
     let result = analyst.dashboard().await;
     assert!(result.is_err());
     match result.unwrap_err() {
-        trawl_client::ClientError::Server { status, .. } => assert_eq!(status, 401),
-        other => panic!("expected 401, got: {other:?}"),
+        trawl_client::ClientError::Server { status, .. } => assert_eq!(status, 403),
+        other => panic!("expected 403, got: {other:?}"),
     }
 }
 
@@ -1542,7 +1556,10 @@ async fn dashboard_stream_rejects_analyst() {
         .await
         .unwrap();
 
-    assert_eq!(resp.status(), 401);
+    assert_eq!(resp.status(), 403);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "forbidden", "{body}");
+    assert_eq!(body["error"]["message"], "insufficient permissions");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1716,13 +1733,15 @@ async fn response_includes_ulid_request_id() {
 
 // -- reader role restriction tests -------------------------------------------
 
-fn assert_401<T: std::fmt::Debug>(result: Result<T, trawl_client::ClientError>) {
-    let err = result.expect_err("expected 401 but got success");
+fn assert_403<T: std::fmt::Debug>(result: Result<T, trawl_client::ClientError>) {
+    let err = result.expect_err("expected 403 but got success");
     match err {
-        trawl_client::ClientError::Server { status, .. } => {
-            assert_eq!(status, 401, "expected 401, got {status}");
+        trawl_client::ClientError::Server { status, error } => {
+            assert_eq!(status, 403, "expected 403, got {status}");
+            assert_eq!(error.code, trawl_api::ErrorCode::Forbidden);
+            assert_eq!(error.message, "insufficient permissions");
         }
-        other => panic!("expected Server error with 401, got: {other:?}"),
+        other => panic!("expected Server error with 403, got: {other:?}"),
     }
 }
 
@@ -1731,7 +1750,7 @@ async fn validate_rejects_reader() {
     let server = setup().await;
     let reader = HttpClient::new_insecure(&server.url, &server.reader_token).unwrap();
 
-    assert_401(reader.validate("* | head 1").await);
+    assert_403(reader.validate("* | head 1").await);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1739,10 +1758,10 @@ async fn saved_queries_reject_reader() {
     let server = setup().await;
     let reader = HttpClient::new_insecure(&server.url, &server.reader_token).unwrap();
 
-    assert_401(reader.list_saved().await);
-    assert_401(reader.create_saved("test", "* | head 1").await);
-    assert_401(reader.update_saved(1, "* | head 2").await);
-    assert_401(reader.delete_saved(1).await);
+    assert_403(reader.list_saved().await);
+    assert_403(reader.create_saved("test", "* | head 1").await);
+    assert_403(reader.update_saved(1, "* | head 2").await);
+    assert_403(reader.delete_saved(1).await);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1750,7 +1769,7 @@ async fn export_rejects_reader() {
     let server = setup().await;
     let reader = HttpClient::new_insecure(&server.url, &server.reader_token).unwrap();
 
-    assert_401(
+    assert_403(
         reader
             .export("* | head 1", trawl_api::ExportFormat::Csv, None)
             .await,
@@ -1794,7 +1813,7 @@ async fn runs_stats_rejects_reader() {
     let server = setup().await;
     let reader = HttpClient::new_insecure(&server.url, &server.reader_token).unwrap();
 
-    assert_401(reader.runs_stats().await);
+    assert_403(reader.runs_stats().await);
 }
 
 // ---------------------------------------------------------------------------
@@ -1921,7 +1940,7 @@ async fn trigger_run_rejects_reader() {
     let server = setup().await;
     let reader = HttpClient::new_insecure(&server.url, &server.reader_token).unwrap();
 
-    assert_401(reader.trigger_run(1).await);
+    assert_403(reader.trigger_run(1).await);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2231,8 +2250,8 @@ async fn repin_permission_matrix() {
         .await
         .expect_err("admin lacks schema_write");
     match err {
-        trawl_client::ClientError::Server { status, .. } => assert_eq!(status, 401),
-        other => panic!("expected auth refusal, got {other:?}"),
+        trawl_client::ClientError::Server { status, .. } => assert_eq!(status, 403),
+        other => panic!("expected 403, got {other:?}"),
     }
     // No standing role gained the permission silently.
     let resp = admin.whoami().await.unwrap();
@@ -2284,8 +2303,8 @@ async fn repin_permission_matrix() {
         .await
         .expect_err("reader lacks schema_write");
     match err {
-        trawl_client::ClientError::Server { status, .. } => assert_eq!(status, 401),
-        other => panic!("expected auth refusal, got {other:?}"),
+        trawl_client::ClientError::Server { status, .. } => assert_eq!(status, 403),
+        other => panic!("expected 403, got {other:?}"),
     }
 
     // The ingest-only key holds a trawl grant but neither schema permission.
@@ -2309,8 +2328,8 @@ async fn repin_cancel_is_schema_write_gated_and_answers_when_idle() {
             .await
             .expect_err("cancel needs schema_write");
         match err {
-            trawl_client::ClientError::Server { status, .. } => assert_eq!(status, 401),
-            other => panic!("expected auth refusal, got {other:?}"),
+            trawl_client::ClientError::Server { status, .. } => assert_eq!(status, 403),
+            other => panic!("expected 403, got {other:?}"),
         }
     }
 
@@ -2395,9 +2414,9 @@ async fn gc_pins_permission_matrix() {
             .expect_err("only schema_write may reclaim pins");
         match err {
             trawl_client::ClientError::Server { status, .. } => {
-                assert_eq!(status, 401, "{who} must be refused");
+                assert_eq!(status, 403, "{who} must be refused");
             }
-            other => panic!("expected an auth refusal for {who}, got {other:?}"),
+            other => panic!("expected a 403 for {who}, got {other:?}"),
         }
     }
 

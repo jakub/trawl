@@ -145,7 +145,7 @@ impl std::fmt::Debug for CreatedKey {
 /// unions (gates). The union fields are private: [`VerifiedKey::from_roles`]
 /// is the single place union semantics exist, so a hand-rolled construction
 /// can never disagree with the substrate's resolution rules.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct VerifiedKey {
     /// Database row id.
     pub id: i64,
@@ -161,6 +161,26 @@ pub struct VerifiedKey {
     permissions: BTreeMap<String, Vec<String>>,
     /// Max `rate_rpm` across the key's roles, if any role sets one.
     rate_rpm: Option<u32>,
+}
+
+#[allow(
+    clippy::missing_fields_in_debug,
+    reason = "sensitive identity and authorization fields are deliberately omitted"
+)]
+impl std::fmt::Debug for VerifiedKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let permission_count: usize = self.permissions.values().map(Vec::len).sum();
+
+        f.debug_struct("VerifiedKey")
+            .field("id", &self.id)
+            .field("prefix", &self.prefix)
+            .field("kind", &self.kind)
+            .field("role_count", &self.roles.len())
+            .field("app_count", &self.permissions.len())
+            .field("permission_count", &permission_count)
+            .field("has_rate_override", &self.rate_rpm.is_some())
+            .finish()
+    }
 }
 
 impl VerifiedKey {
@@ -350,6 +370,74 @@ mod tests {
         let key = key_with(vec![role("r", None, &[("trawl", "query")])]);
         assert!(key.permissions_for("coastwatch").is_empty());
         assert!(!key.has_any_permission("coastwatch"));
+    }
+
+    #[test]
+    fn verified_key_debug_is_bounded_to_identity_and_aggregate_fields() {
+        let rate_value = 4_000_000_007;
+        let key = VerifiedKey::from_roles(
+            42,
+            "safe-prefix",
+            "name-secret-sentinel",
+            PrincipalKind::Service,
+            vec![
+                role(
+                    "role-secret-one",
+                    Some(rate_value),
+                    &[
+                        ("app-secret-one", "permission-secret-one"),
+                        ("app-secret-one", "permission-secret-two"),
+                    ],
+                ),
+                role(
+                    "role-secret-two",
+                    None,
+                    &[("app-secret-two", "permission-secret-three")],
+                ),
+            ],
+        );
+
+        let debug = format!("{key:?}");
+        assert_eq!(
+            debug,
+            "VerifiedKey { id: 42, prefix: \"safe-prefix\", kind: Service, role_count: 2, app_count: 2, permission_count: 3, has_rate_override: true }"
+        );
+        for secret in [
+            "name-secret-sentinel",
+            "role-secret-one",
+            "role-secret-two",
+            "app-secret-one",
+            "app-secret-two",
+            "permission-secret-one",
+            "permission-secret-two",
+            "permission-secret-three",
+        ] {
+            assert!(!debug.contains(secret), "debug leaked {secret}: {debug}");
+        }
+        assert!(
+            !debug.contains(&rate_value.to_string()),
+            "debug leaked the rate override value: {debug}"
+        );
+    }
+
+    #[test]
+    fn verified_key_debug_reports_empty_aggregates() {
+        let debug = format!(
+            "{:?}",
+            VerifiedKey::from_roles(
+                7,
+                "empty-prefix",
+                "empty-name-secret",
+                PrincipalKind::Human,
+                vec![],
+            )
+        );
+
+        assert_eq!(
+            debug,
+            "VerifiedKey { id: 7, prefix: \"empty-prefix\", kind: Human, role_count: 0, app_count: 0, permission_count: 0, has_rate_override: false }"
+        );
+        assert!(!debug.contains("empty-name-secret"));
     }
 
     #[cfg(feature = "keystore")]

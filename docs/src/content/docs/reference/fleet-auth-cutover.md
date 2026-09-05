@@ -298,9 +298,10 @@ it does not inherit trawl's list or pick the check up silently.
   users log in once more.
 - Legacy `trawl_session` cookies are ignored and expire at their TTL — no
   cleanup needed.
-- Upstream mapping: trawld 401 (key revoked/expired fleet-wide) clears the
-  shared cookie everywhere; trawld 403 (valid key, no trawl grant) keeps
-  the cookie so the user stays signed in to sibling apps.
+- Upstream mapping: trawld 401 (invalid, revoked, or expired key) clears the
+  shared cookie through `/api/auth/me`; trawld 403 (valid key without the
+  route permission or any trawl grant) keeps the cookie so the user stays
+  signed in to sibling apps.
 
 ## Roles-as-data migration (ADR-0006 slice 1)
 
@@ -350,6 +351,9 @@ facts:
   keys, keys whose roles carry only unrecognized strings — get an opaque
   `403` on every authenticated trawl route, including `/whoami` and
   `/ingest`.
+- A key that passes the policy layer but lacks the permission for one route
+  also gets `403`, with the safe `insufficient permissions` message. Missing,
+  malformed, invalid, revoked, and expired credentials stay opaque `401`s.
 - The scheduler skips schedules whose owning key is revoked, expired, or
   no longer resolves both `query` and `saved_query` — whether the key lost
   a role or the role lost the permission.

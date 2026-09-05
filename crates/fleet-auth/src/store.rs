@@ -542,13 +542,14 @@ impl KeyStore {
     ///
     /// Locks the key row first, so an in-flight `verify_key` on the same key
     /// serializes against this mutation. Errors with
+    /// [`AuthError::KeyRevoked`] when the locked key is inactive,
     /// [`AuthError::RoleAlreadyAssigned`] on a duplicate so assignment is
     /// never a silent no-op, and [`AuthError::RoleNotFound`] for unknown
     /// role names.
     pub async fn assign_role(&self, prefix: &str, role_name: &str) -> Result<(), AuthError> {
         validate_role_name(role_name)?;
         let mut tx = self.pool.begin().await?;
-        let key_id = self.lock_key_id_by_prefix(&mut tx, prefix).await?;
+        let key_id = self.lock_active_key_id_by_prefix(&mut tx, prefix).await?;
         let role_id = Self::get_role_id_in(&mut *tx, role_name).await?;
 
         let result = sqlx::query("INSERT INTO key_roles (key_id, role_id) VALUES ($1, $2)")
@@ -581,13 +582,14 @@ impl KeyStore {
     /// Remove a role from a key.
     ///
     /// Locks the key row first (same serialization contract as
-    /// [`Self::assign_role`]). Errors with [`AuthError::RoleNotAssigned`]
-    /// when the key doesn't hold the role — silently succeeding would mask
-    /// typos — and [`AuthError::RoleNotFound`] for unknown role names.
+    /// [`Self::assign_role`]). Errors with [`AuthError::KeyRevoked`] when the
+    /// locked key is inactive, [`AuthError::RoleNotAssigned`] when the key
+    /// doesn't hold the role — silently succeeding would mask typos — and
+    /// [`AuthError::RoleNotFound`] for unknown role names.
     pub async fn unassign_role(&self, prefix: &str, role_name: &str) -> Result<(), AuthError> {
         validate_role_name(role_name)?;
         let mut tx = self.pool.begin().await?;
-        let key_id = self.lock_key_id_by_prefix(&mut tx, prefix).await?;
+        let key_id = self.lock_active_key_id_by_prefix(&mut tx, prefix).await?;
         let role_id = Self::get_role_id_in(&mut *tx, role_name).await?;
 
         let removed = sqlx::query("DELETE FROM key_roles WHERE key_id = $1 AND role_id = $2")
@@ -944,14 +946,14 @@ impl KeyStore {
         Ok(row.try_get("id")?)
     }
 
-    /// Lock the key row for the duration of a role-assignment mutation.
-    async fn lock_key_id_by_prefix(
+    /// Lock the key row and refuse inactive keys for a role mutation.
+    async fn lock_active_key_id_by_prefix(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         prefix: &str,
     ) -> Result<i64, AuthError> {
         let row_opt = sqlx::query(
-            "SELECT id
+            "SELECT id, active
              FROM api_keys
              WHERE prefix = $1
              FOR UPDATE",
@@ -964,6 +966,12 @@ impl KeyStore {
                 prefix: prefix.to_owned(),
             });
         };
+        let active: bool = row.try_get("active")?;
+        if !active {
+            return Err(AuthError::KeyRevoked {
+                prefix: prefix.to_owned(),
+            });
+        }
         Ok(row.try_get("id")?)
     }
 }

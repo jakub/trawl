@@ -7,11 +7,107 @@
 
 #![cfg(feature = "keystore")]
 
+use std::future::Future;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use fleet_auth::{
     AuthError, KeyStore, PrincipalKind, RolePermission, token, validate_app_namespace,
 };
+
+#[derive(Clone, Default)]
+struct EventCapture {
+    event_types: Arc<Mutex<Vec<String>>>,
+}
+
+#[derive(Default)]
+struct EventTypeVisitor {
+    event_type: Option<String>,
+}
+
+impl tracing::field::Visit for EventTypeVisitor {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "event_type" {
+            self.event_type = Some(value.to_owned());
+        }
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "event_type" {
+            self.event_type = Some(format!("{value:?}"));
+        }
+    }
+}
+
+impl<S> tracing_subscriber::Layer<S> for EventCapture
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut visitor = EventTypeVisitor::default();
+        event.record(&mut visitor);
+        if let Some(event_type) = visitor.event_type {
+            self.event_types
+                .lock()
+                .expect("event capture mutex")
+                .push(event_type);
+        }
+    }
+}
+
+async fn capture_event_types<T>(future: impl Future<Output = T>) -> (T, Vec<String>) {
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let capture = EventCapture::default();
+    let event_types = Arc::clone(&capture.event_types);
+    let subscriber = tracing_subscriber::registry().with(capture);
+    let result = future.with_subscriber(subscriber).await;
+    let captured = event_types.lock().expect("event capture mutex").clone();
+    (result, captured)
+}
+
+async fn key_role_names(pool: &sqlx::PgPool, key_id: i64) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT r.name
+         FROM key_roles kr
+         JOIN roles r ON r.id = kr.role_id
+         WHERE kr.key_id = $1
+         ORDER BY r.name",
+    )
+    .bind(key_id)
+    .fetch_all(pool)
+    .await
+    .expect("read key roles")
+}
+
+async fn wait_for_key_lock_waiters(pool: &sqlx::PgPool, expected: i64) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*)
+                 FROM pg_stat_activity
+                 WHERE datname = current_database()
+                   AND pid <> pg_backend_pid()
+                   AND wait_event_type = 'Lock'
+                   AND query LIKE '%api_keys%'",
+            )
+            .fetch_one(pool)
+            .await
+            .expect("inspect Postgres lock waiters");
+            if waiting >= expected {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("operations must reach the held api_keys row lock");
+}
 
 fn rp(app: &str, permission: &str) -> RolePermission {
     RolePermission {
@@ -647,16 +743,7 @@ async fn unassign_role_waits_for_key_row_lock(pool: sqlx::PgPool) {
             .await
     });
 
-    assert!(
-        tokio::time::timeout(Duration::from_millis(100), async {
-            while !unassign.is_finished() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .is_err(),
-        "unassign_role must wait for the key row lock"
-    );
+    wait_for_key_lock_waiters(store.pool(), 1).await;
 
     tx.commit().await.unwrap();
     unassign.await.unwrap().unwrap();
@@ -749,6 +836,244 @@ async fn assign_and_unassign_role_roundtrip(pool: sqlx::PgPool) {
         .unwrap();
     let after_unassign = store.get_key_by_prefix(&created.info.prefix).await.unwrap();
     assert_eq!(after_unassign.roles, ["trawl-admin"]);
+}
+
+#[sqlx::test]
+async fn role_mutations_reject_revoked_key_without_state_or_success_event(pool: sqlx::PgPool) {
+    let store = KeyStore::from_pool(pool);
+    seed_roles(&store).await;
+
+    let created = store
+        .create_key(
+            "revoked",
+            PrincipalKind::Human,
+            &names(&["trawl-admin"]),
+            None,
+        )
+        .await
+        .unwrap();
+    store.revoke_key(&created.info.prefix).await.unwrap();
+    let before = key_role_names(store.pool(), created.info.id).await;
+
+    let (assign, assign_events) =
+        capture_event_types(store.assign_role(&created.info.prefix, "trawl-admin")).await;
+    assert!(
+        matches!(assign, Err(AuthError::KeyRevoked { ref prefix }) if prefix == &created.info.prefix)
+    );
+    assert!(!assign_events.iter().any(|event| event == "role_assigned"));
+    assert_eq!(key_role_names(store.pool(), created.info.id).await, before);
+
+    let (unassign, unassign_events) =
+        capture_event_types(store.unassign_role(&created.info.prefix, "coastwatch-siem_consumer"))
+            .await;
+    assert!(
+        matches!(unassign, Err(AuthError::KeyRevoked { ref prefix }) if prefix == &created.info.prefix)
+    );
+    assert!(
+        !unassign_events
+            .iter()
+            .any(|event| event == "role_unassigned")
+    );
+
+    assert_eq!(key_role_names(store.pool(), created.info.id).await, before);
+    assert!(matches!(
+        store.verify_key(&created.plaintext_token).await,
+        Err(AuthError::InvalidKey(_))
+    ));
+}
+
+#[sqlx::test]
+async fn role_mutations_reject_out_of_band_inactive_key_without_state_or_success_event(
+    pool: sqlx::PgPool,
+) {
+    let store = KeyStore::from_pool(pool);
+    seed_roles(&store).await;
+
+    let created = store
+        .create_key(
+            "inactive",
+            PrincipalKind::Human,
+            &names(&["trawl-admin"]),
+            None,
+        )
+        .await
+        .unwrap();
+    sqlx::query("UPDATE api_keys SET active = FALSE WHERE id = $1")
+        .bind(created.info.id)
+        .execute(store.pool())
+        .await
+        .unwrap();
+    let before = key_role_names(store.pool(), created.info.id).await;
+
+    let (assign, assign_events) =
+        capture_event_types(store.assign_role(&created.info.prefix, "coastwatch-siem_consumer"))
+            .await;
+    assert!(
+        matches!(assign, Err(AuthError::KeyRevoked { ref prefix }) if prefix == &created.info.prefix)
+    );
+    assert!(!assign_events.iter().any(|event| event == "role_assigned"));
+    assert_eq!(key_role_names(store.pool(), created.info.id).await, before);
+
+    let (unassign, unassign_events) =
+        capture_event_types(store.unassign_role(&created.info.prefix, "trawl-admin")).await;
+    assert!(
+        matches!(unassign, Err(AuthError::KeyRevoked { ref prefix }) if prefix == &created.info.prefix)
+    );
+    assert!(
+        !unassign_events
+            .iter()
+            .any(|event| event == "role_unassigned")
+    );
+
+    assert_eq!(key_role_names(store.pool(), created.info.id).await, before);
+    let info = store.get_key_by_prefix(&created.info.prefix).await.unwrap();
+    assert!(!info.active);
+    assert!(info.revoked_at.is_none());
+    assert!(matches!(
+        store.verify_key(&created.plaintext_token).await,
+        Err(AuthError::InvalidKey(_))
+    ));
+}
+
+#[sqlx::test]
+async fn expired_active_key_still_accepts_role_mutations(pool: sqlx::PgPool) {
+    let store = KeyStore::from_pool(pool);
+    seed_roles(&store).await;
+
+    let created = store
+        .create_key(
+            "expired",
+            PrincipalKind::Human,
+            &names(&["trawl-admin"]),
+            None,
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE api_keys
+         SET created_at = NOW() - INTERVAL '2 seconds',
+             expires_at = NOW() - INTERVAL '1 second'
+         WHERE id = $1",
+    )
+    .bind(created.info.id)
+    .execute(store.pool())
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        store.verify_key(&created.plaintext_token).await,
+        Err(AuthError::InvalidKey(_))
+    ));
+    let (assign, assign_events) =
+        capture_event_types(store.assign_role(&created.info.prefix, "coastwatch-siem_consumer"))
+            .await;
+    assign.expect("expiry alone must not block assignment");
+    assert!(assign_events.iter().any(|event| event == "role_assigned"));
+
+    let (unassign, unassign_events) =
+        capture_event_types(store.unassign_role(&created.info.prefix, "trawl-admin")).await;
+    unassign.expect("expiry alone must not block unassignment");
+    assert!(
+        unassign_events
+            .iter()
+            .any(|event| event == "role_unassigned")
+    );
+    assert_eq!(
+        key_role_names(store.pool(), created.info.id).await,
+        ["coastwatch-siem_consumer"]
+    );
+}
+
+#[sqlx::test]
+async fn revoke_waiting_first_refuses_later_assignment(pool: sqlx::PgPool) {
+    let store = KeyStore::from_pool(pool);
+    seed_roles(&store).await;
+
+    let created = store
+        .create_key("revoke-first", PrincipalKind::Human, &[], None)
+        .await
+        .unwrap();
+    let mut blocker = store.pool().begin().await.unwrap();
+    sqlx::query("SELECT id FROM api_keys WHERE id = $1 FOR UPDATE")
+        .bind(created.info.id)
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+
+    let revoke_store = store.clone();
+    let revoke_prefix = created.info.prefix.clone();
+    let revoke = tokio::spawn(async move { revoke_store.revoke_key(&revoke_prefix).await });
+    wait_for_key_lock_waiters(store.pool(), 1).await;
+
+    let assign_store = store.clone();
+    let assign_prefix = created.info.prefix.clone();
+    let assign = tokio::spawn(async move {
+        assign_store
+            .assign_role(&assign_prefix, "trawl-admin")
+            .await
+    });
+    wait_for_key_lock_waiters(store.pool(), 2).await;
+
+    blocker.commit().await.unwrap();
+    revoke.await.unwrap().expect("queued revoke must succeed");
+    let err = assign.await.unwrap().unwrap_err();
+    assert!(matches!(err, AuthError::KeyRevoked { ref prefix } if prefix == &created.info.prefix));
+    assert!(
+        key_role_names(store.pool(), created.info.id)
+            .await
+            .is_empty()
+    );
+}
+
+#[sqlx::test]
+async fn unassignment_waiting_first_commits_before_later_revoke(pool: sqlx::PgPool) {
+    let store = KeyStore::from_pool(pool);
+    seed_roles(&store).await;
+
+    let created = store
+        .create_key(
+            "mutation-first",
+            PrincipalKind::Human,
+            &names(&["trawl-admin", "coastwatch-siem_consumer"]),
+            None,
+        )
+        .await
+        .unwrap();
+    let mut blocker = store.pool().begin().await.unwrap();
+    sqlx::query("SELECT id FROM api_keys WHERE id = $1 FOR UPDATE")
+        .bind(created.info.id)
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+
+    let unassign_store = store.clone();
+    let unassign_prefix = created.info.prefix.clone();
+    let unassign = tokio::spawn(async move {
+        unassign_store
+            .unassign_role(&unassign_prefix, "coastwatch-siem_consumer")
+            .await
+    });
+    wait_for_key_lock_waiters(store.pool(), 1).await;
+
+    let revoke_store = store.clone();
+    let revoke_prefix = created.info.prefix.clone();
+    let revoke = tokio::spawn(async move { revoke_store.revoke_key(&revoke_prefix).await });
+    wait_for_key_lock_waiters(store.pool(), 2).await;
+
+    blocker.commit().await.unwrap();
+    unassign
+        .await
+        .unwrap()
+        .expect("queued unassignment must commit first");
+    revoke.await.unwrap().expect("later revoke must succeed");
+    assert_eq!(
+        key_role_names(store.pool(), created.info.id).await,
+        ["trawl-admin"]
+    );
+    assert!(matches!(
+        store.verify_key(&created.plaintext_token).await,
+        Err(AuthError::InvalidKey(_))
+    ));
 }
 
 #[sqlx::test]

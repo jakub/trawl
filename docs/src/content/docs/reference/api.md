@@ -3,7 +3,7 @@ title: HTTP API
 description: REST API reference for trawld.
 ---
 
-The trawl server exposes a REST API over HTTPS. All routes under `/api/v1` except `/health` and `/ingest` require bearer token authentication.
+The trawl server exposes a REST API over HTTPS. All routes under `/api/v1` except `/health` require bearer token authentication, including `/ingest`.
 
 ## Authentication
 
@@ -38,9 +38,10 @@ The migration converts the former static tiers into these roles:
 
 Handlers gate on permissions, never role names — reshape the tiers with
 `fleet-admin roles` without a deploy. A valid key that lacks the
-permission a route asks for is refused **401** (the whole per-route gate
-answers alike); **403** is reserved for the grant gate in front of it — a
-key resolving *no* recognized trawl permission at all.
+permission a route asks for is refused **403** with error code `forbidden`.
+A key resolving *no* recognized trawl permission at all is also refused 403
+by the grant gate before the handler. Missing, malformed, invalid, expired,
+and revoked credentials remain an opaque **401**.
 
 One permission exists outside the converted tiers: `schema_write` gates
 the repin trigger (the first data-mutating schema action) and is
@@ -65,6 +66,29 @@ GET /api/v1/health
 ```
 
 Unauthenticated. Returns server health status.
+
+The response always contains exactly four component checks. Each value is
+`ok` or `error`; failures do not include database diagnostics or filesystem
+paths.
+
+```json
+{
+  "status": "ok",
+  "checks": {
+    "duckdb": "ok",
+    "auth_db": "ok",
+    "storage_db": "ok",
+    "data_path": "ok"
+  },
+  "version": "0.4.0"
+}
+```
+
+An `auth_db`, `storage_db`, or `data_path` failure returns `degraded` with
+HTTP 200. This status does not guarantee that authenticated requests can
+run: an `auth_db` outage prevents new requests from authenticating and
+returns HTTP 503 on protected routes. A `duckdb` failure returns
+`unavailable` with HTTP 503. All healthy checks return `ok` with HTTP 200.
 
 ### Query
 

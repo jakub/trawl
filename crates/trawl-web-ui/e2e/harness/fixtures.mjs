@@ -23,7 +23,15 @@ export function meResponse() {
 
 export function healthResponse() {
   // HealthStatus is #[serde(rename_all = "lowercase")] — "ok", not "Ok".
-  return { status: 'ok' };
+  return {
+    status: 'ok',
+    checks: {
+      duckdb: 'ok',
+      auth_db: 'ok',
+      storage_db: 'ok',
+      data_path: 'ok',
+    },
+  };
 }
 
 /** Minimal valid QueryResponse: zero rows, zero columns — the results
