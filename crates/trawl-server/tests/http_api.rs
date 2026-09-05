@@ -24,6 +24,15 @@ async fn health_returns_ok() {
     let client = HttpClient::new_insecure(&server.url, "unused").unwrap();
     let health = client.health().await.unwrap();
     assert_eq!(health.status, trawl_api::HealthStatus::Ok);
+    assert_eq!(
+        health.checks,
+        Some(std::collections::HashMap::from([
+            ("duckdb".to_owned(), "ok".to_owned()),
+            ("auth_db".to_owned(), "ok".to_owned()),
+            ("storage_db".to_owned(), "ok".to_owned()),
+            ("data_path".to_owned(), "ok".to_owned()),
+        ]))
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

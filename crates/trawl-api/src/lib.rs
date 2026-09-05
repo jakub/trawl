@@ -256,7 +256,7 @@ pub struct ExportRequest {
 pub struct HealthResponse {
     /// Daemon health status.
     pub status: HealthStatus,
-    /// Per-subsystem check results (`"ok"` or `"error: ..."`).
+    /// Per-subsystem check results (`"ok"` or `"error"`).
     ///
     /// The daemon always fills this; optional so a body that omits it parses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2116,9 +2116,12 @@ mod tests {
 
     #[test]
     fn health_response_with_checks_roundtrip() {
-        let mut checks = HashMap::new();
-        checks.insert("duckdb".into(), "ok".into());
-        checks.insert("auth_db".into(), "error: connection refused".into());
+        let checks = HashMap::from([
+            ("duckdb".into(), "ok".into()),
+            ("auth_db".into(), "error".into()),
+            ("storage_db".into(), "ok".into()),
+            ("data_path".into(), "ok".into()),
+        ]);
         let resp = HealthResponse {
             status: HealthStatus::Degraded,
             checks: Some(checks),
@@ -2129,7 +2132,8 @@ mod tests {
         assert!(json.contains("\"checks\""));
         let rt: HealthResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(rt.status, HealthStatus::Degraded);
-        assert!(rt.checks.unwrap().contains_key("duckdb"));
+        assert_eq!(rt.checks, resp.checks);
+        assert_eq!(rt.version, resp.version);
     }
 
     #[test]

@@ -1113,29 +1113,50 @@ mod tests {
 
     #[test]
     fn health_response_deserializes_ok() {
-        let json = r#"{"status": "ok"}"#;
+        let json = r#"{"status":"ok","checks":{"duckdb":"ok","auth_db":"ok","storage_db":"ok","data_path":"ok"}}"#;
         let resp: HealthResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.status, trawl_api::HealthStatus::Ok);
-        assert!(resp.checks.is_none());
+        assert_eq!(
+            resp.checks,
+            Some(std::collections::HashMap::from([
+                ("duckdb".to_owned(), "ok".to_owned()),
+                ("auth_db".to_owned(), "ok".to_owned()),
+                ("storage_db".to_owned(), "ok".to_owned()),
+                ("data_path".to_owned(), "ok".to_owned()),
+            ]))
+        );
     }
 
     #[test]
     fn health_response_deserializes_degraded() {
-        let json = r#"{"status":"degraded","checks":{"duckdb":"ok","auth_db":"error: db locked","data_path":"ok"}}"#;
+        let json = r#"{"status":"degraded","checks":{"duckdb":"ok","auth_db":"error","storage_db":"ok","data_path":"ok"}}"#;
         let resp: HealthResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.status, trawl_api::HealthStatus::Degraded);
-        let checks = resp.checks.unwrap();
-        assert_eq!(checks["duckdb"], "ok");
-        assert!(checks["auth_db"].starts_with("error:"));
+        assert_eq!(
+            resp.checks,
+            Some(std::collections::HashMap::from([
+                ("duckdb".to_owned(), "ok".to_owned()),
+                ("auth_db".to_owned(), "error".to_owned()),
+                ("storage_db".to_owned(), "ok".to_owned()),
+                ("data_path".to_owned(), "ok".to_owned()),
+            ]))
+        );
     }
 
     #[test]
     fn health_response_deserializes_unavailable() {
-        let json = r#"{"status":"unavailable","checks":{"duckdb":"error: connection lost","auth_db":"ok","data_path":"ok"}}"#;
+        let json = r#"{"status":"unavailable","checks":{"duckdb":"error","auth_db":"ok","storage_db":"ok","data_path":"ok"}}"#;
         let resp: HealthResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.status, trawl_api::HealthStatus::Unavailable);
-        let checks = resp.checks.unwrap();
-        assert!(checks["duckdb"].starts_with("error:"));
+        assert_eq!(
+            resp.checks,
+            Some(std::collections::HashMap::from([
+                ("duckdb".to_owned(), "error".to_owned()),
+                ("auth_db".to_owned(), "ok".to_owned()),
+                ("storage_db".to_owned(), "ok".to_owned()),
+                ("data_path".to_owned(), "ok".to_owned()),
+            ]))
+        );
     }
 
     // ── serde: SchemaResponse ───────────────────────────────────────────

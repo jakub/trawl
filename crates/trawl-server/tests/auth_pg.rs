@@ -605,11 +605,59 @@ async fn ac5_envelope_grantless_403() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn ac5_envelope_pg_down_503_without_backend_detail() {
+async fn ac5_health_and_envelope_pg_down_without_backend_detail() {
     let server = setup().await;
+    let client = raw_client();
+
+    // Prime the memoised successful auth probe, then force the next health
+    // request to reach the backend after it is removed.
+    let healthy = client
+        .get(format!("{}/api/v1/health", server.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(healthy.status().as_u16(), 200);
+    let healthy: serde_json::Value = healthy.json().await.unwrap();
+    let version = healthy["version"].as_str().unwrap().to_owned();
+    assert_eq!(
+        healthy,
+        serde_json::json!({
+            "status": "ok",
+            "checks": {
+                "duckdb": "ok",
+                "auth_db": "ok",
+                "storage_db": "ok",
+                "data_path": "ok"
+            },
+            "version": version
+        })
+    );
 
     // Kill the auth backend under the running server.
     server.kill_fleet_database().await;
+    *server.state.auth.auth_ping.lock().await = None;
+
+    let health = client
+        .get(format!("{}/api/v1/health", server.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(health.status().as_u16(), 200);
+    let health: serde_json::Value = health.json().await.unwrap();
+    assert_eq!(
+        health,
+        serde_json::json!({
+            "status": "degraded",
+            "checks": {
+                "duckdb": "ok",
+                "auth_db": "error",
+                "storage_db": "ok",
+                "data_path": "ok"
+            },
+            "version": version
+        }),
+        "health must not leak postgres errors, DSNs, or paths"
+    );
 
     let (status, body) = request(
         &server.url,
@@ -1028,9 +1076,16 @@ async fn storage_loss_degrades_health_and_503s_store_endpoints() {
         );
         let body: serde_json::Value = resp.json().await.unwrap();
         if body["status"] == "degraded" {
-            let storage = body["checks"]["storage_db"].as_str().unwrap_or_default();
-            assert!(storage.starts_with("error:"), "got: {body}");
-            assert_eq!(body["checks"]["duckdb"], "ok", "got: {body}");
+            assert_eq!(
+                body["checks"],
+                serde_json::json!({
+                    "duckdb": "ok",
+                    "auth_db": "ok",
+                    "storage_db": "error",
+                    "data_path": "ok"
+                }),
+                "got: {body}"
+            );
             break;
         }
         assert!(

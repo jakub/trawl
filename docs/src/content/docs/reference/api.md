@@ -66,6 +66,27 @@ GET /api/v1/health
 
 Unauthenticated. Returns server health status.
 
+The response always contains exactly four component checks. Each value is
+`ok` or `error`; failures do not include database diagnostics or filesystem
+paths.
+
+```json
+{
+  "status": "ok",
+  "checks": {
+    "duckdb": "ok",
+    "auth_db": "ok",
+    "storage_db": "ok",
+    "data_path": "ok"
+  },
+  "version": "0.4.0"
+}
+```
+
+An `auth_db`, `storage_db`, or `data_path` failure returns `degraded` with
+HTTP 200 because queries can still run. A `duckdb` failure returns
+`unavailable` with HTTP 503. All healthy checks return `ok` with HTTP 200.
+
 ### Query
 
 ```

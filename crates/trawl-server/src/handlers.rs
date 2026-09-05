@@ -415,23 +415,12 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthRe
     let auth_healthy = auth_result.is_ok();
     let storage_healthy = storage_result.is_ok();
     let data_healthy = data_result.is_ok();
+    let check_value = |healthy| String::from(if healthy { "ok" } else { "error" });
 
-    checks.insert(
-        "duckdb".into(),
-        duckdb_ok.map_or_else(|e| format!("error: {e}"), |()| "ok".into()),
-    );
-    checks.insert(
-        "auth_db".into(),
-        auth_result.map_or_else(|e| format!("error: {e}"), |()| "ok".into()),
-    );
-    checks.insert(
-        "storage_db".into(),
-        storage_result.map_or_else(|e| format!("error: {e}"), |()| "ok".into()),
-    );
-    checks.insert(
-        "data_path".into(),
-        data_result.map_or_else(|e| format!("error: {e}"), |()| "ok".into()),
-    );
+    checks.insert("duckdb".into(), check_value(duckdb_healthy));
+    checks.insert("auth_db".into(), check_value(auth_healthy));
+    checks.insert("storage_db".into(), check_value(storage_healthy));
+    checks.insert("data_path".into(), check_value(data_healthy));
 
     metrics::gauge!("trawl_health_check", "subsystem" => "duckdb").set(if duckdb_healthy {
         1.0

@@ -416,6 +416,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   re-commissioning starts from ADR-0020, not from the removed stand-ins.
 
 ### Changed
+- **Public health checks no longer disclose backend diagnostics (#120).**
+  `/api/v1/health` keeps its four component keys, overall status, HTTP status,
+  and metrics. Each component value is now exactly `ok` or `error`; database
+  errors, task errors, DSNs, and filesystem paths do not enter the response.
 - **BREAKING: `trawl-web` requires `[web] public_origins`, and the origin
   check compares the whole origin (ADR-0016, #92).** The CSRF guard used to
   compare the `Origin` header's *host* against the request's `Host` header.
