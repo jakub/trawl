@@ -1707,8 +1707,8 @@ async fn window_check_constraints_reject_partial_shapes(pool: PgPool) {
     // window_start with no end/truncated.
     let err = sqlx::query(
         "INSERT INTO report_runs
-             (schedule_id, saved_query_id, query, status, started_at, window_start)
-         VALUES ($1, $2, 'q', 'error', now(), now())",
+             (schedule_id, saved_query_id, query, status, started_at, window_start, window_kind)
+         VALUES ($1, $2, 'q', 'error', now(), now(), 'since_last')",
     )
     .bind(sched.id)
     .bind(sq_id)
@@ -1727,8 +1727,8 @@ async fn window_check_constraints_reject_partial_shapes(pool: PgPool) {
     let err = sqlx::query(
         "INSERT INTO report_runs
              (schedule_id, saved_query_id, query, status, started_at,
-              window_start, window_end, window_truncated)
-         VALUES ($1, $2, 'q', 'error', now(), now(), now() - INTERVAL '1 hour', FALSE)",
+              window_start, window_end, window_truncated, window_kind)
+         VALUES ($1, $2, 'q', 'error', now(), now(), now() - INTERVAL '1 hour', FALSE, 'since_last')",
     )
     .bind(sched.id)
     .bind(sq_id)

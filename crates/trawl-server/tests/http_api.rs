@@ -2783,15 +2783,9 @@ async fn manual_run_of_a_query_mode_schedule_still_starts() {
     assert_eq!(summary.query, "* | head 3");
     assert_eq!(summary.window_kind, None);
 
-    // Fixtures are tiny; the background execution lands well inside this.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let runs = client
-        .list_report_runs(saved.id, Some(10), None)
-        .await
-        .unwrap();
-    assert_eq!(runs.runs.len(), 1);
-    let run = &runs.runs[0];
+    let runs = wait_for_finished_runs(&client, saved.id, 1).await;
+    assert_eq!(runs.len(), 1);
+    let run = &runs[0];
     assert_eq!(run.status, "success");
     assert_eq!(run.query, "* | head 3", "the saved DSL runs verbatim");
     assert_eq!(run.window_start, None);
@@ -2824,6 +2818,8 @@ async fn schedule_response_carries_window_fields() {
         "a since_last schedule is seeded owing coverage from its first window's start"
     );
     assert!(!resp.next_fire_at.is_empty());
+
+    let tiling_covered_through = resp.covered_through;
 
     let fixed = client
         .create_saved("resp-fixed", "service=x")
@@ -2861,10 +2857,7 @@ async fn schedule_response_carries_window_fields() {
     assert_eq!(fetched.window.as_deref(), Some("since_last"));
     assert_eq!(fetched.lag.as_deref(), Some("5m"));
     assert_eq!(fetched.lag_secs, Some(300));
-    assert_eq!(
-        fetched.covered_through,
-        resp_covered(&client, tiling.id).await
-    );
+    assert_eq!(fetched.covered_through, tiling_covered_through);
 
     // A lag with no window shifts nothing, so it is refused rather than
     // stored as a number that changes no answer.
@@ -2891,11 +2884,6 @@ async fn schedule_response_carries_window_fields() {
         assert_eq!(status, 400, "for {bad}: {message}");
         assert!(message.contains("window"), "for {bad}: {message}");
     }
-}
-
-/// The watermark a GET reports, for the equality above.
-async fn resp_covered(client: &HttpClient, saved_id: i64) -> Option<String> {
-    client.get_schedule(saved_id).await.unwrap().covered_through
 }
 
 /// Ruling 11: a run records the window it covered, and a run that had none
