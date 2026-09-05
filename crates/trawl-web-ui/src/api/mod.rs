@@ -443,18 +443,26 @@ pub async fn delete_saved(id: i64) -> Result<DeleteSavedResponse, ApiError> {
 }
 
 /// PUT /api/v1/saved/{id}/schedule — create or update a schedule.
+///
+/// The PUT takes the schedule's whole shape, so `window` and `lag` are
+/// arguments rather than constants: omitting a window is not "leave it
+/// alone", it is query mode. An editing caller repeats what the server
+/// reported through `schedule_edit::preserved_window_and_lag`; a creating
+/// one passes `None`.
 pub async fn set_schedule(
     saved_id: i64,
     interval: &str,
     max_runs: Option<u64>,
     enabled: bool,
+    window: Option<&str>,
+    lag: Option<&str>,
 ) -> Result<ScheduleResponse, ApiError> {
     let body = SetScheduleRequest {
         interval: interval.to_owned(),
         max_runs,
         enabled,
-        window: None,
-        lag: None,
+        window: window.map(str::to_owned),
+        lag: lag.map(str::to_owned),
     };
     let resp = Request::put(&format!("/api/v1/saved/{saved_id}/schedule"))
         .header("content-type", "application/json")

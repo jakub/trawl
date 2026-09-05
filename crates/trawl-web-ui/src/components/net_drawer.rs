@@ -259,6 +259,23 @@ fn QuerySchedulePane(
     let saving_schedule = RwSignal::new(false);
     let show_schedule_form = RwSignal::new(has_schedule);
 
+    // The report window has no input here, and a PUT that omits it means
+    // query mode rather than "unchanged", so an edit repeats the server's
+    // own copy. Signals because the save closure has to stay Copy; the
+    // values themselves never change. `window_line` prints exactly what
+    // this pair sends.
+    let (window, lag) = net
+        .schedule
+        .as_ref()
+        .map_or((None, None), crate::schedule_edit::preserved_window_and_lag);
+    let preserved_window: RwSignal<Option<String>> = RwSignal::new(window);
+    let preserved_lag: RwSignal<Option<String>> = RwSignal::new(lag);
+    let window_line: RwSignal<Option<String>> = RwSignal::new(
+        net.schedule
+            .as_ref()
+            .and_then(crate::schedule_edit::window_summary),
+    );
+
     let do_save_schedule = {
         move || {
             saving_schedule.set(true);
@@ -266,8 +283,19 @@ fn QuerySchedulePane(
             let max_runs_str = max_runs_buf.get_untracked();
             let max_runs = max_runs_str.trim().parse::<u64>().ok();
             let enabled = enabled_buf.get_untracked();
+            let window = preserved_window.get_untracked();
+            let lag = preserved_lag.get_untracked();
             spawn_local(async move {
-                match api::set_schedule(net_id, &interval, max_runs, enabled).await {
+                match api::set_schedule(
+                    net_id,
+                    &interval,
+                    max_runs,
+                    enabled,
+                    window.as_deref(),
+                    lag.as_deref(),
+                )
+                .await
+                {
                     Ok(_) => {
                         bus.push(ToastKind::Success, "Schedule saved", None);
                         on_refresh.run(());
@@ -386,6 +414,13 @@ fn QuerySchedulePane(
                                 on:input=move |e| interval_buf.set(event_target_value(&e))
                             />
                         </div>
+
+                        // Read-only: the window belongs to the schedule and
+                        // this form has no input for it, so naming it is
+                        // what tells the operator a save keeps it.
+                        {move || window_line.get().map(|line| view! {
+                            <p style="color:var(--ink-3); font-size:11px; margin:0">{line}</p>
+                        })}
 
                         <div>
                             <label class="field-label">"Max runs "</label>
