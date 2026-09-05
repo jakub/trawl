@@ -75,8 +75,8 @@ test('a burst keeps the newest 5000 rows, updates columns, and releases its rend
   await page.locator(SEL.liveTailButton).click();
 
   await expect(page.getByText('burst-5999', { exact: true })).toBeVisible();
-  await expect(page.locator('.results tbody tr')).toHaveCount(5000);
-  const rendered = await page.locator('.results table').evaluate(table => {
+  await expect(page.locator(SEL.liveResultsTable).locator('tbody tr')).toHaveCount(5000);
+  const rendered = await page.locator(SEL.liveResultsTable).evaluate(table => {
     const headers = Array.from(table.querySelectorAll('th'), th => th.textContent);
     const index = headers.indexOf('seq');
     return { headers, seqs: Array.from(table.querySelectorAll('tbody tr'), row => Number(row.children[index].textContent)) };
