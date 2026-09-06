@@ -50,8 +50,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // monitor mode this never returns. The report owns the handler guard, so it
     // lives in this frame for the whole run; `status` is the copy of the
     // verdict `async_main` logs once a subscriber exists (ADR-0023 ruling 6).
+    //
+    // The seal is the one verdict decided here rather than there. A capability
+    // set belongs to a thread, and a new thread starts from the set of the
+    // thread that spawned it, so answering a failed seal after the runtime is
+    // built means every tokio worker already carries the `CAP_SYS_PTRACE` the
+    // seal was supposed to drop. Everything on the way there runs holding it
+    // too, including reading a config file that turns out to be a FIFO nobody
+    // writes to, which parks the process with the capability live and no bound
+    // on how long. So the check runs first, before the runtime and before there
+    // is a second thread to inherit anything, and it prints to stderr because
+    // no subscriber exists yet. Every other verdict is advisory and reaches the
+    // log in `async_main`.
     let crash_dump = trawl_crashdump::init();
     let status = crash_dump.status();
+    if matches!(
+        status,
+        trawl_crashdump::Status::Failed(trawl_crashdump::FailureReason::Seal)
+    ) {
+        // Boot-fatal (ADR-0023 ruling 4). `init()` is supposed to hand back a
+        // process with `CAP_SYS_PTRACE` gone from both its effective and its
+        // permitted set and `no_new_privs` on. A seal that did not take leaves
+        // the capability live and leaves the path back to the file capability
+        // through a re-exec open. That is a privilege boundary that failed to
+        // establish, not a degraded feature to serve past. The line names no
+        // OS message, matching the crate's own content-free reason.
+        eprintln!(
+            "[trawld] crash-dump seal failed: refusing to start with an unsealed \
+             capability set (ADR-0023 ruling 4)"
+        );
+        // Explicit, and before the error propagates: dropping the report
+        // uninstalls the handler and lets the monitor exit.
+        drop(crash_dump);
+        return Err("crash-dump capture could not drop CAP_SYS_PTRACE".into());
+    }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -121,18 +153,6 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
     }
 
     log_crash_dump(&crash_dump);
-    if matches!(
-        crash_dump,
-        trawl_crashdump::Status::Failed(trawl_crashdump::FailureReason::Seal)
-    ) {
-        // Boot-fatal (ADR-0023 ruling 4). The daemon is supposed to come back
-        // from `init()` with `CAP_SYS_PTRACE` gone from both its effective and
-        // permitted sets and `no_new_privs` set. A seal that did not take
-        // leaves the capability live and the path back to the file capability
-        // through a re-exec open, which is a privilege boundary that failed to
-        // establish, not a degraded feature to serve past.
-        return Err("crash-dump capture could not drop CAP_SYS_PTRACE".into());
-    }
 
     tracing::info!(event_type = "lifecycle", config = %config_path.display(), "configuration loaded");
 
@@ -743,14 +763,13 @@ fn init_tracing(
     }
 }
 
-/// Which of [`log_crash_dump`]'s three call sites prints the verdict.
+/// Which of [`log_crash_dump`]'s two call sites prints the verdict.
 ///
 /// The level is picked before the field list so that each level keeps exactly
 /// one `tracing` call site, and a class is never split across two of them.
 enum Emit {
     Info,
     Warn,
-    Error,
 }
 
 /// Log the crash-dump verdict, once, now that a subscriber exists.
@@ -762,14 +781,18 @@ enum Emit {
 /// dump. `Status::Disabled` says nothing at all: no dump directory was
 /// configured, which is a choice rather than a finding.
 ///
-/// All three call sites below print the same field list, so a query on
+/// One verdict never arrives here: a failed seal. `main` refuses the boot on
+/// that one before the runtime exists, so its only diagnostic is the stderr
+/// line written there (ADR-0023 ruling 4).
+///
+/// Both call sites below print the same field list, so a query on
 /// `event_type = "crash_dump"` reads the same names whatever the verdict was.
 /// A field the probe could not read is OMITTED rather than guessed: printing
 /// `monitor_cap_eff_ptrace=false` for a monitor whose `/proc` status was
 /// unreadable would state a fact nothing established, and `readiness` already
 /// carries "no verdict".
 fn log_crash_dump(status: &trawl_crashdump::Status) {
-    use trawl_crashdump::{FailureReason, ReadinessClass, Status};
+    use trawl_crashdump::{ReadinessClass, Status};
 
     const FAILED: &str = "crash-dump capture failed to arm";
 
@@ -853,17 +876,17 @@ fn log_crash_dump(status: &trawl_crashdump::Status) {
                  write a minidump with no threads",
             ),
         },
-        // The seal is the one failure the caller turns into a refused boot, so
-        // it is the one that logs at error: this line is the last thing the
-        // operator sees before the exit.
-        Status::Failed(FailureReason::Seal) => (Emit::Error, FAILED),
+        // A failed seal never reaches this match: `main` returns before the
+        // subscriber is built. Every other reason (dump directory, monitor
+        // spawn, socket connect, monitor identity, handler install) is reported
+        // by a process that DID seal, so capture is off and the capability is
+        // gone, which is a warning rather than a refused boot.
         Status::Failed(_) => (Emit::Warn, FAILED),
     };
 
     match emit {
         Emit::Info => emit!(info, message),
         Emit::Warn => emit!(warn, message),
-        Emit::Error => emit!(error, message),
     }
 }
 

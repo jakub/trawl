@@ -80,7 +80,11 @@ that reading against 6.6, 6.12 and mainline.
    through `tracing` after the subscriber is up (`info` for ready,
    `warn` for denied and indeterminate, naming the scope and the
    missing capability), so self-telemetry persists it and the operator
-   can query it. The word `enabled` never appears on a denied or
+   can query it. A failed seal is the one verdict decided before the
+   subscriber exists, and prints one content-free line to stderr
+   instead, because a capability set is per-thread and every runtime
+   worker would otherwise inherit the bit the seal failed to clear
+   (ruling 4). The word `enabled` never appears on a denied or
    indeterminate class. The fatal-signal breadcrumb and the monitor's
    own lifecycle output stay on stderr: they are signal-safe or in a
    process with no subscriber, by necessity.
