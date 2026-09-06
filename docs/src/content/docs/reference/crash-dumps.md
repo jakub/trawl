@@ -53,6 +53,20 @@ sudo systemctl daemon-reload && sudo systemctl restart trawld
 mode `0700` on every install, whether or not you enable capture, so the
 directory existing tells you nothing about whether dumps are being written.
 
+That path belongs to the package. `systemd-tmpfiles` reapplies it on every
+configure and every boot from `/usr/lib/tmpfiles.d/trawl.conf`, and the entry
+enforces the type: anything at that path that is not a directory, a regular
+file or a symlink you put there, gets removed and replaced with the directory.
+So do not point `/var/lib/trawl/cores` somewhere else with a symlink. It will
+survive until the next boot and then quietly stop being your symlink.
+
+To write dumps elsewhere, change where trawld looks instead. Edit
+`TRAWL_CRASH_DUMP_DIR` in your copy of the drop-in under
+`/etc/systemd/system/trawld.service.d/`, and create the target yourself, owned
+by `trawl` and mode `0700`. trawld only applies `0700` to directories it
+creates itself, so a directory that already exists, including a mount point,
+keeps whatever permissions you gave it.
+
 To disable, remove the file and restart:
 
 ```bash

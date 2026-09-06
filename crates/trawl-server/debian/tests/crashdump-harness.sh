@@ -728,6 +728,19 @@ run docker exec "$NODE" stat -c '%F %U %G %a' "$CORES"
 [[ "$(nshq "stat -c '%F %U %G %a' $CORES")" == "directory trawl trawl 700" ]] \
   || die "$CORES is not a plain directory owned trawl:trawl mode 0700"
 
+# The tmpfiles entry is `d=`, and the `=` is the part that matters: it removes a
+# wrong-type object at the path instead of leaving it. Whether this systemd
+# honours the suffix is a question about the running version, not about the file
+# we shipped, so put a regular file where the directory belongs and re-run the
+# same command postinst does. Plain `d` would leave the file sitting there,
+# postinst would still succeed, and capture would die on EEXIST at crash time.
+nsh "rmdir $CORES && : > $CORES && stat -c 'planted: %F' $CORES
+systemd-tmpfiles --create trawl.conf
+stat -c 'after tmpfiles: %F %U:%G %a' $CORES"
+[[ "$(nshq "stat -c '%F %U %G %a' $CORES")" == "directory trawl trawl 700" ]] \
+  || die "systemd-tmpfiles left a non-directory at $CORES; this systemd does not honour the 'd=' type suffix"
+note "systemd $(nshq "systemctl --version | head -1 | awk '{print \$2}'") replaced the planted file with the directory, so 'd=' is honoured here"
+
 # trawl-web runs as the same trawl user with /var/lib/trawl writable, so file
 # permissions alone leave the browser-facing proxy free to read every minidump.
 # The unit masks the directory. Checked three ways: systemd loaded the

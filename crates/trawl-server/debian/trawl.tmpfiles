@@ -2,4 +2,11 @@
 # copies the crashdump.conf drop-in into place, so enabling capture never has to
 # create a directory as root. 0700 because a minidump is a verbatim copy of
 # process memory: API tokens, the TLS key, the postgres DSN.
-d /var/lib/trawl/cores 0700 trawl trawl -
+#
+# `d=` rather than `d`: the `=` suffix makes systemd-tmpfiles remove whatever is
+# at the path when it is not a directory, then create the directory. Plain `d`
+# leaves a regular file or a symlink sitting there, postinst still succeeds, and
+# the failure only surfaces much later when the monitor tries to write a dump
+# and gets EEXIST. That is the same silent-denial shape this whole feature keeps
+# producing, so the type gets enforced on every configure and every boot.
+d= /var/lib/trawl/cores 0700 trawl trawl -

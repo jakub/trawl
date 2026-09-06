@@ -205,8 +205,11 @@ fi
 # shell. tmpfiles walks the path with O_NOFOLLOW, which a check-then-`install -d`
 # pair cannot do: during an upgrade the still-running trawld owns the parent and
 # could swap the directory for a symlink between the two steps.
-if ! grep -Eq "^d[[:space:]]+${dir_value}[[:space:]]+0700[[:space:]]+trawl[[:space:]]+trawl([[:space:]]|$)" "$tmpfiles_conf"; then
-  fail "crates/trawl-server/debian/trawl.tmpfiles does not carry 'd $dir_value 0700 trawl trawl -'"
+# `d=` and not plain `d`: the `=` suffix is what removes a wrong-type object
+# squatting at the path. Without it a regular file there survives, postinst
+# still succeeds, and capture dies on EEXIST at the worst possible moment.
+if ! grep -Eq "^d=[[:space:]]+${dir_value}[[:space:]]+0700[[:space:]]+trawl[[:space:]]+trawl([[:space:]]|$)" "$tmpfiles_conf"; then
+  fail "crates/trawl-server/debian/trawl.tmpfiles does not carry 'd= $dir_value 0700 trawl trawl -' (the '=' enforces the type; plain 'd' leaves a file or symlink in place)"
 fi
 # trawl-web runs as the same trawl user with /var/lib/trawl writable, so without
 # this line the browser-facing proxy can read and replace minidumps, which are
