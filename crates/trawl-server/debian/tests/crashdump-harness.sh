@@ -109,6 +109,10 @@ readonly ENABLE_CMD='sudo install -D -m 0644 \
   /etc/systemd/system/trawld.service.d/crashdump.conf
 sudo systemctl daemon-reload && sudo systemctl restart trawld'
 
+# The disable command from the same page, also verbatim, also diffed before use.
+readonly DISABLE_CMD='sudo rm /etc/systemd/system/trawld.service.d/crashdump.conf
+sudo systemctl daemon-reload && sudo systemctl restart trawld'
+
 # ------------------------------------------------------------------- options --
 
 DEB=""
@@ -1037,6 +1041,80 @@ cat /etc/systemd/system/trawld.service.d/crashdump.conf"
   nsh "install -D -m 0644 /usr/share/doc/trawl-server/examples/crashdump.conf /etc/systemd/system/trawld.service.d/crashdump.conf && systemctl daemon-reload && systemctl restart trawld"
   wait_active
   run docker exec "$NODE" systemctl show trawld -p AmbientCapabilities
+fi
+
+# ------------------------------- phase F: can the proxy reach the dumps at all --
+
+phase "F attack direction (trawl-web against the dumps)"
+
+if (( POSITIVE_RUN == 0 )); then
+  note "skipped: no crash case ran, so there are no dumps to try to reach"
+else
+# The state that makes this sharp: capture disabled, so trawld is running
+# without CAP_SYS_PTRACE, while the dumps the earlier phases produced are still
+# sitting in the directory. Nothing about the daemon is privileged any more, and
+# the only thing standing between the browser-facing proxy and a verbatim copy
+# of trawld's memory is the uid split plus the directory mode.
+#
+# Before the split this was a real hole. Running the proxy as trawl meant
+# /proc/<trawld-pid>/root passed the kernel's ptrace check on uid alone, and
+# inside trawld's own mount namespace InaccessiblePaths does not apply, so the
+# mask in trawl-web.service could be walked straight around.
+
+# Verbatim from the docs, same drift guard as the enable command.
+docs_disable=$(awk '
+  /^To disable, remove the file and restart:$/ { found = 1; next }
+  found && /^```bash$/ { inblock = 1; next }
+  inblock && /^```$/ { exit }
+  inblock { print }
+' "$DOCS_PAGE")
+if [[ "$docs_disable" != "$DISABLE_CMD" ]]; then
+  printf '\n--- docs %s ---\n%s\n--- harness ---\n%s\n' "$(rel "$DOCS_PAGE")" "$docs_disable" "$DISABLE_CMD"
+  die "the disable command in the docs no longer matches the one this harness runs"
+fi
+note "disable command matches $DOCS_PAGE"
+
+printf '\n$ docker exec -i %s bash -s   # the docs disable command, verbatim:\n%s\n' "$NODE" "$DISABLE_CMD"
+docker exec -i "$NODE" bash -s <<< "$DISABLE_CMD"
+wait_active
+
+run docker exec "$NODE" systemctl show trawld -p AmbientCapabilities -p Environment
+attack_pid=$(main_pid)
+caps_report "$attack_pid" "daemon"
+[[ "$(cap_bit "$attack_pid" CapEff)" == 0 ]] \
+  || die "trawld still holds CAP_SYS_PTRACE after the documented disable procedure"
+
+attack_dump=$(newest_dump)
+[[ -n "$attack_dump" ]] || die "no dumps left on disk; there would be nothing to try to steal"
+note "capture is off, trawld is cap-less, and $(basename "$attack_dump") is still on disk"
+
+# runuser initgroups, so this shell carries the trawl group exactly as the
+# service does. That is the strongest form of the question: even holding the
+# group, can this uid reach a dump?
+probe() { # probe <label> <command...>; expects failure
+  local label="$1"; shift
+  printf '\n$ runuser -u trawl-web -- %s\n' "$*"
+  local out rc=0
+  out=$(docker exec "$NODE" runuser -u trawl-web -- "$@" 2>&1) || rc=$?
+  printf '%s\n' "${out:-(no output)}"
+  printf 'exit=%s\n' "$rc"
+  (( rc != 0 )) || die "$label SUCCEEDED as trawl-web; the dumps are reachable"
+  grep -qiE 'permission denied|operation not permitted' <<< "$out" \
+    || die "$label failed with something other than a permission error: $out"
+  note "$label denied"
+}
+
+nsh "id trawl-web"
+probe "listing the dump directory directly" ls -l "$CORES"
+probe "reading a dump directly" cat "$attack_dump"
+probe "listing the dump directory through /proc/$attack_pid/root" ls -l "/proc/$attack_pid/root$CORES"
+probe "reading a dump through /proc/$attack_pid/root" cat "/proc/$attack_pid/root$attack_dump"
+
+# The control. Same commands as the trawl user succeed, so the denials above
+# are about who is asking, not about the files having gone away.
+printf '\n$ runuser -u trawl -- ls -l %s   # control: the owner can still read them\n' "$CORES"
+docker exec "$NODE" runuser -u trawl -- ls -l "$CORES"
+note "the trawl user reads its own dumps; the denials above are the uid split and the 0700 mode, not missing files"
 fi
 
 phase "result"
