@@ -37,6 +37,20 @@ address: `/search/schema?field=duration` is a working deep link with no
 service context, which is what makes a case file linkable from a chat message
 or an alert.
 
+A search link is readable the same way, with one part deliberately opaque.
+The search page keeps its state in the address bar, and two parameters there
+are stable: `q` is the query text, and `r` is the time range. `r` is either a
+quick label (`r=1h`) or two UTC instants joined by `..`, with `now` allowed as
+the right-hand one. Both spellings survive across releases, so a link pasted
+into a runbook keeps meaning what it said. The sidebar filters ride in `f`,
+which is an opaque encoded payload: copy it as one unit, do not hand-write it,
+and expect its spelling to change without notice. When a link's structured
+state cannot be read, whether that is a damaged `f`, a range in neither form,
+or a page number that cannot be asked for, the page shows a banner naming the
+parameter and echoing what the link actually says, and runs nothing until you
+click the repair. The broken link stays intact until then, so you can send it
+back to whoever shared it.
+
 The case file renders one `GET /api/v1/schema/field?name=` response as plain
 facts: the pin and when and where it was set, the verdict (since when, how
 many services have conflict evidence, conflict episodes, lifetime rows
