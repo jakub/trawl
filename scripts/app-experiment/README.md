@@ -138,6 +138,13 @@ Normal preparation invokes Cargo with `--locked --no-default-features` for
 DuckDB build path through `bin/trawld-dev`. Build children receive a small
 environment allowlist, without ambient application credentials.
 
+When pushing an experiment branch, the normal pre-push hook runs two Rust
+suites against separate Postgres clusters. Set `TRAWL_TEST_DATABASE_URL` and
+`TRAWL_TEST_ND_DATABASE_URL` to two owned test clusters, and keep the same
+`CARGO_TARGET_DIR` on the push command. The hook ignores ambient
+`DATABASE_URL`; without these overrides it uses the shared development
+clusters on ports 5433 and 5434. Do not run both suites against one cluster.
+
 ## Options
 
 | Option | Default | Accepted values and meaning |

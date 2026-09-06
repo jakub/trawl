@@ -19,8 +19,9 @@ pre-push:
   # enough: sqlx derives its per-test database name from the test path alone,
   # so identical tests running in both suites collide cluster-wide and race
   # dropdb against the other suite's live connections (SQLSTATE 55006).
-  # DATABASE_URLs are pinned inline so pushes don't depend on ambient shell
-  # env (direnv doesn't fire in non-interactive shells).
+  # Defaults name the two local development clusters. Agents can provide
+  # dedicated clusters through TRAWL_TEST_DATABASE_URL and
+  # TRAWL_TEST_ND_DATABASE_URL; ambient DATABASE_URL is still ignored.
   # The glob keeps doc-only pushes from paying for the full suites — tests
   # run only when the push touches code, manifests, or migrations.
   parallel: true
@@ -33,7 +34,7 @@ pre-push:
         - "crates/*/migrations/*.sql"
       # Half the cores each: two parallel suites at full test-thread counts
       # oversubscribe the machine 2x and flake every wall-clock-sensitive test.
-      run: . "$HOME/.cargo/env" 2>/dev/null; DATABASE_URL=postgres://fleet:fleet@localhost:5433/fleet_test cargo nextest run --workspace --test-threads="$(( $(nproc 2>/dev/null || sysctl -n hw.ncpu) / 2 ))"
+      run: . "$HOME/.cargo/env" 2>/dev/null; DATABASE_URL="${TRAWL_TEST_DATABASE_URL:-postgres://fleet:fleet@localhost:5433/fleet_test}" cargo nextest run --workspace --test-threads="$(( $(nproc 2>/dev/null || sysctl -n hw.ncpu) / 2 ))"
     test-no-defaults:
       glob:
         - "*.rs"
@@ -47,4 +48,4 @@ pre-push:
       # the store/engine tests), and double-booting full trawld instances
       # across two parallel suites starves the wall-clock-sensitive
       # integration tests into flaking.
-      run: . "$HOME/.cargo/env" 2>/dev/null; DATABASE_URL=postgres://fleet:fleet@localhost:5434/fleet_test_nd cargo nextest run -p fleet-auth -p trawl-web -p trawl-engine -p trawl-server -p trawl-cli --no-default-features --test-threads="$(( $(nproc 2>/dev/null || sysctl -n hw.ncpu) / 2 ))" -E 'not (binary(http_api) | binary(hot_query) | binary(timestamp_repair))'
+      run: . "$HOME/.cargo/env" 2>/dev/null; DATABASE_URL="${TRAWL_TEST_ND_DATABASE_URL:-postgres://fleet:fleet@localhost:5434/fleet_test_nd}" cargo nextest run -p fleet-auth -p trawl-web -p trawl-engine -p trawl-server -p trawl-cli --no-default-features --test-threads="$(( $(nproc 2>/dev/null || sysctl -n hw.ncpu) / 2 ))" -E 'not (binary(http_api) | binary(hot_query) | binary(timestamp_repair))'
