@@ -20,15 +20,21 @@
 //! [`crate::query_merge`], so native tests cover both. This module is the
 //! wasm-only layer over them: the navigator closure and the router memos,
 //! including the one memo that says a parameter could not be read at all.
+//! The reading itself starts from the router's RAW query string, because
+//! the decode is the pure module's job and doing it twice changes what a
+//! link means (see [`url_signals`]).
 
 use leptos::prelude::*;
 use leptos_router::NavigateOptions;
-use leptos_router::hooks::{use_navigate, use_query_map};
+use leptos_router::hooks::{use_location, use_navigate};
 
 pub use crate::query_merge::{Filter, FilterOp, QUICK_RANGES, RangeSpec, effective_query};
 pub use crate::search_url::{Mode, build_search_url};
 
-use crate::search_url::{Malformed, Verdict, decode_filters, decode_range, parse_page, repair_url};
+use crate::search_url::{
+    Malformed, Verdict, decode_filters, decode_range, first_value, parse_page, query_params,
+    repair_url,
+};
 
 /// Capture a `Navigator` closure that pushes new `(q, page, mode, filters,
 /// range)` tuples onto the router's history.
@@ -95,10 +101,10 @@ pub struct UrlSignals {
     /// replaced and every other parameter carried through as it arrived,
     /// raw. `None` while the link reads.
     ///
-    /// Built from the query map rather than from the memos above,
-    /// because those have already fallen back to their defaults: a link
-    /// that is wrong in two places must not lose the second one to a
-    /// click that repaired the first.
+    /// Built from the raw query pairs rather than from the memos
+    /// above, because those have already fallen back to their defaults:
+    /// a link that is wrong in two places must not lose the second one
+    /// to a click that repaired the first.
     pub repair_href: Memo<Option<String>>,
 }
 
@@ -106,28 +112,29 @@ pub struct UrlSignals {
 ///
 /// Back/forward buttons in the browser just work — the router re-fires
 /// every memo when the query string changes.
+///
+/// Every memo below hangs off ONE reading of the raw query string
+/// (`use_location().search`, which is the URL's own text minus the `?`),
+/// decoded once by [`query_params`]. The router's own `use_query_map`
+/// cannot be that reading: `ParamsMap::insert` percent-decodes a value
+/// `UrlSearchParams` has already decoded, so `?q=message%3D%2F100%2541%2F`
+/// reached this function as `message=/100A/` and the page ran a query
+/// its own address bar disagreed with.
 pub fn url_signals() -> UrlSignals {
-    let query_map = use_query_map();
-    let executed_q = Memo::new(move |_| query_map.get().get("q").unwrap_or_default());
-    let mode = Memo::new(move |_| Mode::from_url_param(query_map.get().get("mode").as_deref()));
+    let search = use_location().search;
+    let params = Memo::new(move |_| search.with(|raw| query_params(raw)));
+    let executed_q =
+        Memo::new(move |_| params.with(|p| first_value(p, "q").unwrap_or_default().to_owned()));
+    let mode = Memo::new(move |_| params.with(|p| Mode::from_url_param(first_value(p, "mode"))));
 
     let filters_read = Memo::new(move |_| {
-        query_map
-            .get()
-            .get("f")
-            .map_or(Verdict::Absent, |raw| decode_filters(&raw))
+        params.with(|p| first_value(p, "f").map_or(Verdict::Absent, decode_filters))
     });
     let range_read = Memo::new(move |_| {
-        query_map
-            .get()
-            .get("r")
-            .map_or(Verdict::Absent, |raw| decode_range(&raw))
+        params.with(|p| first_value(p, "r").map_or(Verdict::Absent, decode_range))
     });
     let page_read = Memo::new(move |_| {
-        query_map
-            .get()
-            .get("page")
-            .map_or(Verdict::Absent, |raw| parse_page(&raw))
+        params.with(|p| first_value(p, "page").map_or(Verdict::Absent, parse_page))
     });
 
     let filters = Memo::new(move |_| filters_read.get().into_value().unwrap_or_default());
@@ -142,9 +149,10 @@ pub fn url_signals() -> UrlSignals {
 
     let repair_href = Memo::new(move |_| {
         let param = malformed.with(|m| m.as_ref().map(|m| m.param))?;
-        Some(query_map.with(|params| {
+        Some(params.with(|p| {
             repair_url(
-                params.latest_values().map(|(name, value)| (&**name, value)),
+                p.iter()
+                    .map(|(name, value)| (name.as_str(), value.as_str())),
                 param,
             )
         }))

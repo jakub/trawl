@@ -16,9 +16,9 @@
 //! - `q` and `r` are readable and stable. `r` is a quick label (`1h`) or
 //!   `<from>..<to>` with both bounds in canonical UTC RFC 3339 (`Z`, no
 //!   fraction), the right one optionally the literal `now`. No percent
-//!   codec touches `r`: the browser decodes a query value exactly once
-//!   before the app sees it, and the old `abs:<from>:<to>` form was
-//!   split apart at the hour colon after that decode. `f` stays opaque
+//!   codec touches `r`: a query value is decoded exactly once, by
+//!   [`query_params`], and the old `abs:<from>:<to>` form was split
+//!   apart at the hour colon after that decode. `f` stays opaque
 //!   and versioned because catalog names carry `,`, `=` and `&`.
 //! - Decoding answers a [`Verdict`], not a default. A link whose
 //!   structured state cannot be read is shown with a banner and does not
@@ -297,6 +297,107 @@ pub fn percent_encode(s: &str) -> String {
         }
     }
     out
+}
+
+/// Read a raw query string into its `(name, value)` pairs, decoding each
+/// one EXACTLY ONCE.
+///
+/// The reader takes `use_location().search`, the query string as the
+/// address bar spells it, rather than the router's `ParamsMap`, whose
+/// `insert` runs `decodeURIComponent` over a value
+/// `UrlSearchParams` has already decoded. Two decodes eat a literal
+/// percent: `?q=message%3D%2F100%2541%2F` is the query text
+/// `message=/100%41/`, and the router handed it over as
+/// `message=/100A/`. `f` is base64url and `r` is a closed timestamp
+/// grammar, so neither can carry a `%` and neither ever noticed; `q` is
+/// the user's own DSL and does. The URL is the document, so the decode
+/// belongs here beside the encoder it inverts.
+///
+/// The rules are `application/x-www-form-urlencoded`'s, which is what
+/// `URLSearchParams` implements: an optional leading `?`, then split on
+/// `&`, then on the first `=` of each pair (a pair with no `=` is a name
+/// with an empty value, an empty pair is dropped); in name and value
+/// alike a `+` is a space, `%` followed by two hex digits is that byte,
+/// and any other `%` is a literal `%`, so `%zz` reads back as `%zz`.
+/// Bytes are assembled first and read as UTF-8 last, so `%E6%97%A5` is one
+/// character and a truncated sequence is U+FFFD rather than a panic.
+///
+/// Pairs come back in the order the URL carries them, duplicates and
+/// all: which duplicate wins is [`first_value`]'s rule, and `repair_url`
+/// needs every pair to carry the link through untouched.
+#[must_use]
+pub fn query_params(raw_search: &str) -> Vec<(String, String)> {
+    raw_search
+        .strip_prefix('?')
+        .unwrap_or(raw_search)
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| match pair.split_once('=') {
+            Some((name, value)) => (form_decode(name), form_decode(value)),
+            None => (form_decode(pair), String::new()),
+        })
+        .collect()
+}
+
+/// Decode one `application/x-www-form-urlencoded` name or value.
+fn form_decode(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' => {
+                if let Some(hi) = bytes.get(i + 1).copied().and_then(hex_digit)
+                    && let Some(lo) = bytes.get(i + 2).copied().and_then(hex_digit)
+                {
+                    out.push((hi << 4) | lo);
+                    i += 3;
+                } else {
+                    // Not an escape at all. The browser keeps the `%` as
+                    // text and so do we, so `color=%zz` is `%zz`.
+                    out.push(b'%');
+                    i += 1;
+                }
+            }
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    // Lossy, and deliberately: a hand-typed `%E6%97` is half a character
+    // and the banner it may end up in must be able to print it.
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// One ASCII hex digit's value, or `None` for anything else.
+const fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// The FIRST value a query string gives a key, which is what
+/// `URLSearchParams.get` answers.
+///
+/// A duplicated key has to resolve somehow, and the browser's own
+/// accessor is the rule a reader can check for themselves with
+/// `new URLSearchParams(location.search).get('r')`. (The router's
+/// `ParamsMap::get` took the last, so `?r=1h&r=garbage` used to read as
+/// the garbage.)
+#[must_use]
+pub fn first_value<'a>(params: &'a [(String, String)], key: &str) -> Option<&'a str> {
+    params
+        .iter()
+        .find(|(name, _)| name == key)
+        .map(|(_, value)| value.as_str())
 }
 
 /// Build a `/search?q=...` URL. Omits elidable params (default mode,
@@ -723,6 +824,200 @@ mod tests {
         // the browser decodes exactly once on the way back in.
         assert_eq!(percent_encode("%41"), "%2541");
         assert_eq!(percent_encode("%zz"), "%25zz");
+    }
+
+    // ---- query string reader ---------------------------------------
+
+    /// The defect this reader exists for. `leptos_router` decoded a
+    /// query value twice, once in `UrlSearchParams` and once more in
+    /// `ParamsMap`, so a literal percent in the DSL was eaten on the way
+    /// in and the link ran a query nobody wrote.
+    #[test]
+    fn a_percent_in_the_query_text_survives_exactly_one_decode() {
+        let params = query_params("q=message%3D%2F100%2541%2F&page=0");
+        assert_eq!(first_value(&params, "q"), Some("message=/100%41/"));
+        // What the second decode used to make of it.
+        assert_ne!(first_value(&params, "q"), Some("message=/100A/"));
+        // And the encoder is the inverse: this is the URL the app writes
+        // for that query text.
+        assert_eq!(
+            build_search_url(
+                "message=/100%41/",
+                0,
+                Mode::Snapshot,
+                &[],
+                &RangeSpec::default()
+            ),
+            "/search?q=message%3D%2F100%2541%2F&page=0"
+        );
+    }
+
+    #[test]
+    fn a_value_decodes_by_the_form_urlencoded_rules() {
+        for (raw, expected) in [
+            ("q=100%2541", "100%41"),
+            ("q=a%2Bb", "a+b"),
+            ("q=a+b", "a b"),
+            ("q=100%25", "100%"),
+            // Not an escape: the `%` is text, exactly as the browser
+            // reads it.
+            ("q=%zz", "%zz"),
+            ("q=%", "%"),
+            ("q=%4", "%4"),
+            ("q=50%%2041", "50% 41"),
+            ("q=%E6%97%A5", "\u{65e5}"),
+            // Hex is case-insensitive.
+            ("q=%e6%97%a5", "\u{65e5}"),
+            ("q=%F0%9F%98%80", "\u{1f600}"),
+            // Half a character: replaced, never a panic.
+            ("q=%E6%97", "\u{fffd}"),
+            ("q=%FF", "\u{fffd}"),
+            ("q=", ""),
+        ] {
+            assert_eq!(
+                first_value(&query_params(raw), "q"),
+                Some(expected),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_pair_split_follows_url_search_params() {
+        // Nothing at all.
+        assert_eq!(query_params(""), Vec::new());
+        assert_eq!(query_params("?"), Vec::new());
+        // A leading `?` is not part of the first name, and empty pairs
+        // are dropped rather than becoming empty names.
+        assert_eq!(
+            query_params("?&q=x&&page=0&"),
+            vec![("q".into(), "x".into()), ("page".into(), "0".into())]
+        );
+        // No `=` is a name with an empty value…
+        assert_eq!(query_params("live"), vec![("live".into(), String::new())]);
+        // …and only the FIRST `=` splits, so an `=` inside a DSL value
+        // stays in the value.
+        assert_eq!(
+            query_params("q=service=nginx"),
+            vec![("q".into(), "service=nginx".into())]
+        );
+        // Names decode too.
+        assert_eq!(
+            query_params("a%20b=1&c%2Bd=2"),
+            vec![("a b".into(), "1".into()), ("c+d".into(), "2".into())]
+        );
+    }
+
+    /// Duplicates: every pair is kept in arrival order, and the FIRST is
+    /// the one a lookup answers with, as `URLSearchParams.get` does.
+    #[test]
+    fn a_duplicated_key_reads_as_its_first_value() {
+        let params = query_params("r=1h&q=a&r=garbage&q=b");
+        assert_eq!(
+            params,
+            vec![
+                ("r".into(), "1h".into()),
+                ("q".into(), "a".into()),
+                ("r".into(), "garbage".into()),
+                ("q".into(), "b".into()),
+            ]
+        );
+        assert_eq!(first_value(&params, "r"), Some("1h"));
+        assert_eq!(first_value(&params, "q"), Some("a"));
+        assert_eq!(first_value(&params, "page"), None);
+        // A repair drops EVERY copy of the parameter it names, so the
+        // second `r` cannot come back as the first one's replacement.
+        assert_eq!(
+            repair_url(
+                params.iter().map(|(n, v)| (n.as_str(), v.as_str())),
+                Param::Range
+            ),
+            "/search?q=a&q=b"
+        );
+    }
+
+    /// The whole read side over one raw search string: this is what
+    /// `state::query::url_signals` wraps in memos and nothing more.
+    #[test]
+    fn a_raw_search_string_gives_the_verdicts_the_decoders_give() {
+        let params = query_params("q=service%3Dnginx&page=0&f=v1.!&r=garbage&mode=live");
+        assert_eq!(first_value(&params, "q"), Some("service=nginx"));
+        assert_eq!(
+            Mode::from_url_param(first_value(&params, "mode")),
+            Mode::Live
+        );
+        assert_eq!(
+            decode_filters(first_value(&params, "f").unwrap())
+                .malformed()
+                .map(|m| m.reason),
+            Some(Reason::UndecodableFilters)
+        );
+        assert_eq!(
+            decode_range(first_value(&params, "r").unwrap())
+                .malformed()
+                .map(|m| m.reason),
+            Some(Reason::UnreadableRange)
+        );
+        assert_eq!(
+            parse_page(first_value(&params, "page").unwrap()),
+            Verdict::Valid(0)
+        );
+        // Filters first in the banner's precedence, and its repair edits
+        // that one parameter of the link as it stands.
+        assert_eq!(
+            repair_url(
+                params.iter().map(|(n, v)| (n.as_str(), v.as_str())),
+                Param::Filters
+            ),
+            "/search?q=service%3Dnginx&page=0&r=garbage&mode=live"
+        );
+
+        // The pre-#85 plain-text filter dialect, as the address bar has
+        // to spell it to reach the app at all.
+        let legacy = query_params("q=service%3Dnginx&f=%2Bhost%3Dweb-01");
+        assert_eq!(first_value(&legacy, "f"), Some("+host=web-01"));
+        assert_eq!(
+            decode_filters(first_value(&legacy, "f").unwrap())
+                .malformed()
+                .map(|m| m.reason),
+            Some(Reason::UnversionedFilters)
+        );
+
+        // A link that reads: every parameter valid, page 2.
+        let good = query_params(
+            "q=service%3Dnginx&page=2\
+             &f=v1.W3sib3AiOiIrIiwiZmllbGQiOiJob3N0IiwidmFsdWUiOiJ3ZWItMDEifV0\
+             &r=2026-01-01T00:00:00Z..now",
+        );
+        assert_eq!(
+            decode_filters(first_value(&good, "f").unwrap()),
+            Verdict::Valid(vec![inc("host", "web-01")])
+        );
+        assert_eq!(
+            decode_range(first_value(&good, "r").unwrap()),
+            Verdict::Valid(RangeSpec::Absolute {
+                from: "2026-01-01T00:00:00Z".into(),
+                to: "now".into(),
+            })
+        );
+        assert_eq!(
+            parse_page(first_value(&good, "page").unwrap()),
+            Verdict::Valid(2)
+        );
+
+        // An unescaped `+` offset in `r` is a space by the time the app
+        // sees it, which is why only the `Z` spelling is readable.
+        let plus = query_params("r=2026-01-01T00:00:00+02:00..now");
+        assert_eq!(
+            first_value(&plus, "r"),
+            Some("2026-01-01T00:00:00 02:00..now")
+        );
+        assert_eq!(
+            decode_range(first_value(&plus, "r").unwrap())
+                .malformed()
+                .map(|m| m.reason),
+            Some(Reason::UnreadableRange)
+        );
     }
 
     // ---- build_search_url ------------------------------------------

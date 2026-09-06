@@ -61,6 +61,14 @@ A link whose structured state does not parse is shown, not run.**
   JSON allocation, the decoded filter count and field/value lengths are
   capped, and the page offset is a checked multiplication. A URL is
   attacker-controlled input to the SPA.
+- **The SPA reads the raw query string and decodes it once itself.**
+  `leptos_router`'s `ParamsMap` percent-decodes a value `UrlSearchParams`
+  has already decoded, which turns `?q=message%3D%2F100%2541%2F` into the
+  query `message=/100A/`, so the reader takes `use_location().search` and
+  applies the `application/x-www-form-urlencoded` rules in the same pure
+  module as the encoder (run ruling 2026-09-06). `f` is base64url and `r`
+  is a closed timestamp grammar, so only `q` could carry the `%` that
+  exposed it.
 - **The percent encoder is a pure, hand-rolled mirror of
   `encodeURIComponent`** (unreserved `A-Za-z0-9-_.!~*'()`, uppercase hex,
   UTF-8 bytes), used only for `q`. Two drift guards: an exhaustive native

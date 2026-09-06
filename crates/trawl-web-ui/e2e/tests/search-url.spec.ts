@@ -113,6 +113,22 @@ test('literal versioned filters and range produce the exact DSL', async ({ page,
   await expect(page.locator(SEL.urlNotice)).toHaveCount(0);
 });
 
+test('a literal percent in q survives one decode', async ({ page, request }) => {
+  // `%2541` is one encoding of `%41`, so a single decode gives the DSL
+  // `message=/100%41/` while a second gives `message=/100A/`, a
+  // different regex run without a word to the reader. leptos-router's
+  // ParamsMap did exactly that: decodeURIComponent over what
+  // UrlSearchParams had already decoded. Hence the raw query string.
+  await page.goto('/search?q=message%3D%2F100%2541%2F&page=0');
+
+  const body = await lastCapturedQuery(request, 1);
+  expect(body.query).toBe('last=15m message=/100%41/');
+  await expect(page.locator(SEL.cmContent)).toHaveText('message=/100%41/');
+  await expect(page.locator(SEL.urlNotice)).toHaveCount(0);
+  // Nothing rewrites the link on the reader's behalf.
+  expect(await page.evaluate(() => location.search)).toBe('?q=message%3D%2F100%2541%2F&page=0');
+});
+
 test('legacy and malformed filter payloads refuse to run', async ({ page, request }) => {
   // The pre-#85 plain-text dialect, as the browser hands it over: `%2B`
   // decodes to `+` before the app sees it.
