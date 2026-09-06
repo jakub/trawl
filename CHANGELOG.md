@@ -14,10 +14,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   every install. Copying the drop-in into
   `/etc/systemd/system/trawld.service.d/` and restarting trawld grants it
   `CAP_SYS_PTRACE` and sets the dump directory and retention count. The helm
-  chart's `crashDump.enabled` is the same single step on kubernetes, though
-  not the same capability coverage: `capabilities.add` reaches a non-root
-  container's bounding set only, so helm capture works at yama scope 0 and 1
-  (`PR_SET_PTRACER`) and does not work at scope 2, which is #21. It ships inert
+  chart's `crashDump.enabled` is the same single step on kubernetes, and #21
+  below gives it the same yama coverage the Debian channel has. It ships inert
   because a minidump is raw process memory and can hold tokens, TLS keys and
   database credentials. Both channels are now
   documented in the new [Crash dumps](https://trawl.sh/reference/crash-dumps/)
@@ -34,7 +32,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   regardless of the `InaccessiblePaths` mask the unit also carries, because the
   kernel's ptrace check passes on a matching uid and nothing is masked inside
   trawld's own mount namespace. Reading a dump now means being `trawl` or root.
-  (#21 tracks a startup warning and the kubernetes scope-2 gap.)
+  (#21, under Fixed, adds the startup readiness verdict and makes kubernetes
+  capture work at scope 2.)
 - **Scheduler-owned report windows (ADR-0018 rulings 6-14, #107).** A
   schedule now says what its runs cover, instead of leaving it to whatever
   time clause the saved query happened to carry. `PUT
@@ -654,6 +653,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   this is a token-rendering change only.
 
 ### Fixed
+- **Crash-dump capture works on kubernetes at yama scope 2, and now says at
+  startup whether it works at all (#21).** The image stamps
+  `cap_sys_ptrace+p` on `/usr/bin/trawld`, permitted only and never effective,
+  read back with `getcap` in the same build step so a lost xattr fails the
+  build. The monitor raises that bit to effective before it binds its socket,
+  which is what scope 2 asks of a tracer, and `crashDump.enabled=true` now also
+  sets `allowPrivilegeEscalation: true` on the trawld container, because
+  `allowPrivilegeEscalation: false` sets `no_new_privs` and the kernel then
+  ignores file capabilities on every exec. Until now `capabilities.add` reached
+  the container's bounding set alone, so a scope-2 crash wrote a dump holding
+  zero threads while the log said `wrote minidump`. trawld itself drops
+  `CAP_SYS_PTRACE` from its effective and permitted sets and sets
+  `no_new_privs` once the monitor is connected, on the Debian channel too, so
+  ptrace power lives in the monitor rather than in the process serving queries;
+  a daemon that cannot complete that drop exits instead of running. Capture is
+  no longer taken on trust either: trawld probes the monitor's capability sets,
+  the yama scope, `PR_SET_PTRACER` and its own dumpable flag, then logs one
+  `crash_dump` event whose `readiness` is `ready`, `denied`, `indeterminate` or
+  `failed`, with the masks and the dump directory beside it, so
+  `trawl query 'service=trawld event_type=crash_dump'` answers the question the
+  old `trawl-crashdump: enabled` stderr line only looked like it answered. That
+  line is gone, and the monitor's `wrote minidump` line carries `threads=` and
+  `memory_regions=`, so a denied capture shows in the log instead of only
+  inside the file. The verdict covers capabilities, yama and commoncap and not
+  seccomp or an LSM, and an enabled pod cannot run under the Restricted Pod
+  Security profile.
 - **`PUT /api/v1/saved/{id}/schedule` honours `enabled` on create (#107).**
   The flag reached the update path only; the create path's INSERT hardcoded
   it to true. A `PUT {"interval": "1h", "enabled": false}` on a saved query
