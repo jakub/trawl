@@ -16,12 +16,15 @@ Compaction prepares the replacement file without the publication write
 guard. It takes that guard for the canonical rename and hot-batch drain,
 then releases it before catalog bookkeeping. Rollup holds the write guard
 from marker publication through daily-file publication and hourly-file
-retirement. Recovery takes the same guard. An unfinished rollup marker
+retirement. The marker's complete hourly-file list is staged and atomically
+published through the shared marker writer. Recovery takes the same guard. An unfinished rollup marker
 refuses corpus reads until recovery finishes, including after a restart.
 Recovery finishes pending rollups before new WAL compaction, even when daily
 rollup is disabled. Otherwise recovery could delete hourly rows added after
 its daily file was written. Query-only processes also scan for unfinished
-markers before admitting reads.
+markers before admitting reads. Recovery clears a marker before discarding
+an invalid replacement, so a retry cannot mistake the old daily file for
+the unpublished replacement.
 
 Producers take a shared guard before writing WAL and keep it through hot
 insertion in the same blocking task. Otherwise a stalled producer could add

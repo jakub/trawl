@@ -313,8 +313,8 @@ An unfinished `.rollup-*` marker makes corpus queries return 503 until rollup
 recovery removes it. Inspect the daemon's `rollup_recovery` and `rollup_error`
 logs. Fix the reported filesystem failure and let the owning daemon retry
 before it compacts new WAL, even if daily rollup is disabled. Do not delete
-the marker to make queries pass,
-because both daily and hourly copies may still exist. Query-only instances
+the marker to make queries pass, because both daily and hourly copies may
+still exist. Query-only instances
 cannot perform that recovery. A failed startup marker scan also refuses
 reads and requires a restart after the filesystem problem is fixed.
 

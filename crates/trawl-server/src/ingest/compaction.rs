@@ -652,13 +652,12 @@ fn write_rollup_marker(
     service: &str,
     hourly_files: &[PathBuf],
 ) -> Result<(), String> {
-    let marker = rollup_marker_path(day_dir, service);
     let content = hourly_files
         .iter()
         .map(|p| p.to_string_lossy().into_owned())
         .collect::<Vec<_>>()
         .join("\n");
-    std::fs::write(&marker, content).map_err(|e| format!("failed to write rollup marker: {e}"))
+    crate::epoch::publish_marker_staged(day_dir, &format!(".rollup-{service}"), &content)
 }
 
 /// Delete the rollup marker after successful cleanup.
@@ -733,13 +732,27 @@ fn recover_rollup_markers_coordinated(
                 }
             } else {
                 // Keep the old daily and hourly sources for a fresh merge.
-                // A failed quarantine leaves the marker pending for retry.
+                // Remove the marker durably before removing the invalid tmp.
+                // Otherwise a crash after quarantine would make recovery
+                // mistake the old daily for this merge's published output.
                 tracing::warn!(
                     event_type = "rollup_recovery",
                     compact_service = %service,
                     "discarding truncated rollup tmp; retaining hourly files for retry"
                 );
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(format!("failed to remove rollup marker: {e}")),
+                }
+                std::fs::File::open(day_dir)
+                    .and_then(|dir| dir.sync_all())
+                    .map_err(|e| format!("failed to sync rollup marker removal: {e}"))?;
+                if let Some(gate) = publication {
+                    gate.finish_rollup(&path);
+                }
                 quarantine_file(&tmp, service, "rollup_quarantine")?;
+                continue;
             }
         } else {
             let canonical_exists = match std::fs::symlink_metadata(&canonical) {
@@ -3374,6 +3387,73 @@ fn extract_service_from_filename(filename: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn failed_marker_stage_preserves_complete_list_and_stage_is_ignored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("data");
+        let env = root.join("prod");
+        let old = r#"{"_time":"2026-01-15T00:00:00Z","_ingested":"2026-01-15T00:00:00Z","service":"nginx","msg":"old"}"#;
+        let new = r#"{"_time":"2026-01-15T01:00:00Z","_ingested":"2026-01-15T01:00:00Z","service":"nginx","msg":"new"}"#;
+        let first = write_hourly_parquet(&env, "2026-01-15", "00", "nginx", &[old]);
+        let second = write_hourly_parquet(&env, "2026-01-15", "01", "nginx", &[new]);
+        let combined = write_hourly_parquet(&env, "2026-01-15", "02", "nginx", &[old, new]);
+        let day = env.join("2026-01-15");
+        std::fs::rename(combined, day.join("nginx.parquet")).unwrap();
+        write_rollup_marker(&day, "nginx", &[first.clone(), second.clone()]).unwrap();
+        let marker = rollup_marker_path(&day, "nginx");
+        let complete = std::fs::read(&marker).unwrap();
+        let stage = day.join(format!("..rollup-nginx.next.{}", std::process::id()));
+        std::fs::create_dir(&stage).unwrap();
+        assert!(write_rollup_marker(&day, "nginx", std::slice::from_ref(&first)).is_err());
+        assert_eq!(std::fs::read(&marker).unwrap(), complete);
+        std::fs::remove_dir(&stage).unwrap();
+        std::fs::write(&stage, b"partial staged list").unwrap();
+        let gate = PublicationGate::new();
+        gate.initialize(&root);
+        assert_eq!(gate.pending_rollup_markers(), vec![marker]);
+        {
+            let _writer = gate.write().await;
+            recover_rollup_markers_coordinated(&day, Some(&gate)).unwrap();
+        }
+        assert!(!first.exists());
+        assert!(!second.exists());
+        assert_eq!(std::fs::read(stage).unwrap(), b"partial staged list");
+        assert!(gate.read().await.is_ok());
+        assert_eq!(
+            read_strings(&day.join("nginx.parquet"), "msg"),
+            vec!["old", "new"]
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_invalid_tmp_quarantine_cannot_retire_unpublished_rows_on_retry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("data");
+        let env = root.join("prod");
+        let old = r#"{"_time":"2026-01-15T00:00:00Z","_ingested":"2026-01-15T00:00:00Z","service":"nginx","msg":"old"}"#;
+        let new = r#"{"_time":"2026-01-15T01:00:00Z","_ingested":"2026-01-15T01:00:00Z","service":"nginx","msg":"new"}"#;
+        let first = write_hourly_parquet(&env, "2026-01-15", "00", "nginx", &[old]);
+        let hourly = write_hourly_parquet(&env, "2026-01-15", "01", "nginx", &[new]);
+        let day = env.join("2026-01-15");
+        let canonical = day.join("nginx.parquet");
+        std::fs::rename(first, &canonical).unwrap();
+        let invalid_tmp = day.join("nginx.parquet.tmp");
+        std::fs::create_dir(&invalid_tmp).unwrap();
+        write_rollup_marker(&day, "nginx", std::slice::from_ref(&hourly)).unwrap();
+        let gate = PublicationGate::new();
+        gate.initialize(&root);
+        {
+            let _writer = gate.write().await;
+            assert!(recover_rollup_markers_coordinated(&day, Some(&gate)).is_err());
+            assert!(!rollup_marker_path(&day, "nginx").exists());
+            assert!(invalid_tmp.is_dir());
+            recover_rollup_markers_coordinated(&day, Some(&gate)).unwrap();
+        }
+        assert_eq!(read_strings(&canonical, "msg"), vec!["old"]);
+        assert_eq!(read_strings(&hourly, "msg"), vec!["new"]);
+        assert!(gate.read().await.is_ok());
+    }
 
     #[tokio::test]
     async fn pending_rollup_recovers_before_fresh_wal_even_when_rollup_disabled() {
