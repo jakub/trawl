@@ -676,6 +676,43 @@ run docker exec "$NODE" stat -c '%F %U %G %a' "$CORES"
 [[ "$(nshq "stat -c '%F %U %G %a' $CORES")" == "directory trawl trawl 700" ]] \
   || die "$CORES is not a plain directory owned trawl:trawl mode 0700"
 
+# trawl-web runs as the same trawl user with /var/lib/trawl writable, so file
+# permissions alone leave the browser-facing proxy free to read every minidump.
+# The unit masks the directory. Checked three ways: systemd loaded the
+# directive, the proxy still starts (which means web.cookie beside the masked
+# directory is still readable), and the directory really is empty inside the
+# proxy's own mount namespace.
+run docker exec "$NODE" systemctl show trawl-web -p InaccessiblePaths
+web_masked=$(nshq "systemctl show trawl-web -p InaccessiblePaths --value")
+[[ "$web_masked" == *"$CORES"* ]] \
+  || die "trawl-web.service does not mask $CORES (InaccessiblePaths='$web_masked')"
+
+run docker exec "$NODE" systemctl restart trawl-web
+wait_for "$ACTIVE_WAIT_SECS" "trawl-web is-active=active" \
+  "[[ \$(docker exec $NODE systemctl is-active trawl-web 2>/dev/null) == active ]]" \
+  || { docker exec "$NODE" journalctl -u trawl-web --no-pager -n 20 || true
+       die "trawl-web did not start; the mask may be hiding web.cookie"; }
+# Type=simple reports active on exec, and trawl-web reads the cookie during
+# startup config resolution, so a still-active unit a few seconds later is the
+# evidence that the read succeeded.
+sleep 3
+[[ "$(nshq "systemctl is-active trawl-web")" == "active" ]] \
+  || die "trawl-web exited after starting; check whether the mask hid /var/lib/trawl/web.cookie"
+
+# No dumps exist yet, so an empty directory on both sides would prove nothing.
+# Plant a sentinel in the real directory AFTER the proxy started: the mask is a
+# mount established at unit start, and nothing underneath it shows through.
+web_pid=$(docker exec "$NODE" systemctl show trawl-web -p MainPID --value | tr -d ' \r')
+nsh "install -o trawl -g trawl -m 0600 /dev/null $CORES/sentinel-not-a-dump
+printf 'real directory:      '; ls -A $CORES | tr '\n' ' '; echo
+printf 'trawl-web sees:      '; ls -A /proc/$web_pid/root$CORES | tr '\n' ' '; echo '(nothing)'
+stat -c 'web.cookie in that namespace: %n %U %a' /proc/$web_pid/root/var/lib/trawl/web.cookie"
+[[ -n "$(nshq "ls -A $CORES")" ]] || die "the sentinel was not created; the check below would prove nothing"
+[[ -z "$(nshq "ls -A /proc/$web_pid/root$CORES")" ]] \
+  || die "trawl-web can see the contents of $CORES despite InaccessiblePaths"
+note "the sentinel is invisible inside trawl-web's mount namespace, web.cookie is not"
+nshq "rm -f $CORES/sentinel-not-a-dump"
+
 # ------------------------------------------------------ phase 6: B, enable --
 
 phase "6 B enable"

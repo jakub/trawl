@@ -5,6 +5,7 @@ repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)
 
 postinst="$repo_root/crates/trawl-server/debian/postinst"
 service="$repo_root/crates/trawl-server/debian/trawld.service"
+web_service="$repo_root/crates/trawl-server/debian/trawl-web.service"
 default_env="$repo_root/crates/trawl-server/debian/trawld.default"
 crashdump_conf="$repo_root/crates/trawl-server/debian/crashdump.conf"
 tmpfiles_conf="$repo_root/crates/trawl-server/debian/trawl.tmpfiles"
@@ -205,6 +206,16 @@ fi
 # could swap the directory for a symlink between the two steps.
 if ! grep -Eq "^d[[:space:]]+${dir_value}[[:space:]]+0700[[:space:]]+trawl[[:space:]]+trawl([[:space:]]|$)" "$tmpfiles_conf"; then
   fail "crates/trawl-server/debian/trawl.tmpfiles does not carry 'd $dir_value 0700 trawl trawl -'"
+fi
+# trawl-web runs as the same trawl user with /var/lib/trawl writable, so without
+# this line the browser-facing proxy can read and replace minidumps, which are
+# verbatim copies of trawld's memory. The mask covers the subdirectory only:
+# /var/lib/trawl/web.cookie has to stay reachable or the proxy will not start.
+if ! grep -Eq "^[[:space:]]*InaccessiblePaths[[:space:]]*=[[:space:]]*-?${dir_value}[[:space:]]*$" "$web_service"; then
+  fail "crates/trawl-server/debian/trawl-web.service does not mask '$dir_value' with InaccessiblePaths — the proxy runs as trawl with /var/lib/trawl writable and would be able to read every minidump"
+fi
+if grep -Eq "^[[:space:]]*InaccessiblePaths[[:space:]]*=[[:space:]]*-?/var/lib/trawl[[:space:]]*$" "$web_service"; then
+  fail "crates/trawl-server/debian/trawl-web.service masks the whole of /var/lib/trawl — that hides web.cookie too and the proxy cannot start"
 fi
 if ! grep -Eq '^[[:space:]]*systemd-tmpfiles[[:space:]]+--create[[:space:]]+trawl\.conf' "$postinst"; then
   fail "crates/trawl-server/debian/postinst does not run 'systemd-tmpfiles --create trawl.conf' — nothing would create '$dir_value' at install time"

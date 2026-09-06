@@ -37,6 +37,18 @@ MemoryDenyWriteExecute=true
 ReadWritePaths=/var/lib/trawl
 ReadOnlyPaths=/etc/trawl
 
+# The proxy runs as the same trawl user that owns the minidumps, and it needs
+# /var/lib/trawl writable for the session cookie, so nothing else would stop it
+# reading or replacing a dump. A minidump is a verbatim copy of trawld's memory:
+# API tokens, the TLS private key, the postgres password. A browser-facing proxy
+# has no business with any of it. This masks the one subdirectory; web.cookie and
+# the rest of /var/lib/trawl stay reachable. On kubernetes the same separation
+# comes for free, because the cores PVC only mounts into the trawld container.
+# The path always exists (usr/lib/tmpfiles.d/trawl.conf, recreated at every
+# boot), so this needs no `-` prefix and a missing directory is a loud failure
+# rather than a silently dropped protection.
+InaccessiblePaths=/var/lib/trawl/cores
+
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 
 [Install]
