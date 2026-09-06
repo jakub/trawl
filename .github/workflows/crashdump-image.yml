@@ -2,11 +2,11 @@ name: Crash-dump image
 
 # Builds the container image the way release.yml does, then runs the crash-dump
 # capability proof against it (ci/crashdump-image.sh). Its own workflow rather
-# than a CI job because it is a full release-profile build plus six containers,
-# and because that lets it be path-filtered down to the files that can actually
-# break it: the Dockerfile's setcap stamp, the crate that raises and drops the
-# capability, the daemon call site that logs the verdict, the lockfile the
-# --locked build reads, and the two files below.
+# than a CI job because it is a full release-profile build plus one container
+# per container shape it proves, and because that lets it be path-filtered down
+# to the files that can actually break it: the Dockerfile's setcap stamp, the
+# crate that raises and drops the capability, the daemon call site that logs
+# the verdict, the lockfile the --locked build reads, and the two files below.
 on:
   pull_request:
     paths:

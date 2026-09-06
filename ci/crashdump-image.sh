@@ -3,7 +3,7 @@
 # crashdump-image.sh proves, against the built container image, that crash-dump
 # capture has the privilege it needs and reports it honestly.
 #
-# Three things the image can get wrong that no unit test can see:
+# Four things the image can get wrong that no unit test can see:
 #
 #   1. the `cap_sys_ptrace+p` file capability has to survive the image build
 #      (an overlay that drops security.capability xattrs leaves an image that
@@ -11,7 +11,10 @@
 #   2. exec'ing trawld has to turn that permitted-only bit into an EFFECTIVE
 #      one in the monitor while the daemon itself gives it back
 #      (ADR-0023 ruling 4),
-#   3. the readiness verdict trawld logs has to match what the kernel would
+#   3. that bit has to survive the exec with no_new_privs set, because the
+#      chart deploys exactly that shape: SYS_PTRACE added and
+#      allowPrivilegeEscalation left false (step 7),
+#   4. the readiness verdict trawld logs has to match what the kernel would
 #      really allow at this host's yama ptrace_scope.
 #
 # usage: crashdump-image.sh <image>
@@ -62,7 +65,8 @@ readonly NO_MONITOR_WATCH_SECS=5
 # whose disposition is SIG_DFL, which is exactly what crash-handler restores
 # before it re-raises, and a `kill -SEGV` proof against pid 1 would depend on
 # that. The trailing echo also stops dash from exec-optimising the tail call
-# back into pid 1.
+# back into pid 1. Step 7 does run trawld as pid 1, because the shape it proves
+# has no room for a shell, and it says there what that costs.
 readonly FIFO_CMD='mkfifo '"$CFG_FIFO"' || exit 1
 /usr/bin/trawld --config '"$CFG_FIFO"' --no-monitor
 echo "trawld exit=$?"'
@@ -131,9 +135,23 @@ cleanup() {
     printf '\n  removing containers: %s\n' "${CONTAINERS[*]}"
     docker rm -f "${CONTAINERS[@]}" >/dev/null 2>&1 || true
   fi
+  if [ -n "${SEED_DIR:-}" ]; then
+    rm -rf "$SEED_DIR"
+  fi
   exit "$status"
 }
 trap cleanup EXIT INT TERM
+
+# Step 7 runs trawld as the container's own init process, so nothing inside can
+# create its config FIFO first. One host-side FIFO is made here and copied into
+# each of those containers before they start. It lives in its own temp dir and
+# not in $LOG_DIR, which CI uploads wholesale: a FIFO in an artifact upload is
+# an open() that never returns.
+SEED_DIR="$(mktemp -d)"
+mkfifo "$SEED_DIR/cfg"
+# Mode survives the copy, and the containers run as uid 1000 while the copy is
+# made by whoever runs this script, so both ends need the other's bits.
+chmod 666 "$SEED_DIR/cfg"
 
 # start <short-name> <docker run args...>
 # Detached, tracked for cleanup, and left un-removed so `docker logs` still
@@ -144,6 +162,21 @@ start() {
   CONTAINERS+=("$CONTAINER")
   printf '\n$ docker run -d --name %s %s\n' "$CONTAINER" "$*"
   docker run -d --name "$CONTAINER" "$@" >/dev/null
+}
+
+# start_as_init <short-name> <docker create args...>
+# Same tracking as start(), but trawld is the container's init process and the
+# config FIFO is planted into the created container before it runs. Step 7
+# explains why the shell has to go.
+start_as_init() {
+  CONTAINER="${PREFIX}-$1"
+  shift
+  CONTAINERS+=("$CONTAINER")
+  printf '\n$ docker create --name %s %s\n' "$CONTAINER" "$*"
+  docker create --name "$CONTAINER" "$@" >/dev/null
+  printf '$ docker cp <fifo> %s:%s && docker start %s\n' "$CONTAINER" "$CFG_FIFO" "$CONTAINER"
+  docker cp "$SEED_DIR/cfg" "$CONTAINER:$CFG_FIFO" >/dev/null
+  docker start "$CONTAINER" >/dev/null
 }
 
 # wait_until <secs> <description> <predicate...>
@@ -342,7 +375,11 @@ note "CapBnd=$base_bnd CapPrm=$base_prm CapEff=$base_eff NoNewPrivs=$base_nnp"
   die "an ordinary executable already holds CAP_SYS_PTRACE permitted; the file capability proves nothing here"
 [ "$(cap_bit "$base_eff")" = 0 ] ||
   die "an ordinary executable already holds CAP_SYS_PTRACE effective; the file capability proves nothing here"
-# no_new_privs would make the kernel ignore file capabilities outright.
+# The enabled shape leaves no_new_privs off, which is docker's default. It has
+# to be off HERE because this container reaches trawld through a shell, and a
+# shell carries no permitted capability of its own. Under no_new_privs the file
+# capability would then be a gain, and the kernel takes a gain straight back.
+# Step 7 runs the shape where no_new_privs is on and the runtime execs trawld.
 [ "$base_nnp" = 0 ] || die "the enabled container shape sets no_new_privs=$base_nnp"
 
 # ------------------------- step 4: the capability transition, and a real dump --
@@ -502,9 +539,125 @@ case "$scope" in
     ;;
 esac
 
-# --------------------------------------------------- step 7: capture disabled --
+# --------------------------------------------- step 7: the chart's own shape --
 
-phase "step 7: disabled, the stamped binary still runs and spawns nothing"
+phase "step 7: the chart shape, no_new_privs on, still captures"
+
+# The chart adds SYS_PTRACE and leaves allowPrivilegeEscalation false, so the
+# pod runs with no_new_privs set. That reads like it should be fatal, since
+# under no_new_privs an exec may not GAIN a permitted capability: the kernel
+# intersects the new permitted set back down to what the caller already held.
+#
+# The gain is what the rule is about, not the flag. The container runtime puts
+# SYS_PTRACE in the init process's permitted set, so when that process execs
+# /usr/bin/trawld the file capability grants a bit it already had. No gain,
+# nothing taken back. The monitor exec repeats the same story one level down.
+#
+# Which is why trawld has to BE the init process here, exec'd by the runtime,
+# exactly as it is in the pod. Every other step parks trawld behind a shell
+# that mkfifo's its config, and a shell holds no permitted capability of its
+# own, because its own exec emptied the set. trawld's file capability is then a
+# gain, and the kernel takes it back. That shell does not exist in the pod, and
+# leaving it in would turn this step into a proof of the opposite.
+#
+# So the FIFO is planted from outside instead, with docker cp into a created
+# but not yet started container. Same park at the config read, same proof that
+# init() finished, nothing between the runtime and trawld.
+
+start_as_init chart-shape-crash \
+  --user 1000 --cap-add SYS_PTRACE --security-opt no-new-privileges \
+  -e TRAWL_CRASH_DUMP_DIR="$DUMP_DIR" -e RUST_LOG=trawld=info \
+  --entrypoint /usr/bin/trawld "$IMAGE" --config "$CFG_FIFO" --no-monitor
+chart_c="$CONTAINER"
+
+wait_until "$PROC_WAIT_SECS" "trawld and its monitor are up" have_procs "$chart_c" 2
+resolve_pids "$chart_c"
+chart_parent_status="$(capture "$chart_c" "$PARENT_PID" 07-chart-shape-parent)"
+chart_monitor_status="$(capture "$chart_c" "$MONITOR_PID" 07-chart-shape-monitor)"
+
+chart_mon_eff="$(field "$chart_monitor_status" CapEff)"
+chart_mon_prm="$(field "$chart_monitor_status" CapPrm)"
+chart_mon_nnp="$(field "$chart_monitor_status" NoNewPrivs)"
+chart_par_eff="$(field "$chart_parent_status" CapEff)"
+chart_par_prm="$(field "$chart_parent_status" CapPrm)"
+chart_par_nnp="$(field "$chart_parent_status" NoNewPrivs)"
+note "monitor CapEff=$chart_mon_eff CapPrm=$chart_mon_prm NoNewPrivs=$chart_mon_nnp"
+note "daemon  CapEff=$chart_par_eff CapPrm=$chart_par_prm NoNewPrivs=$chart_par_nnp"
+
+# This one assertion is what the chart's securityContext rests on.
+[ "$(cap_bit "$chart_mon_eff")" = 1 ] ||
+  die "the monitor holds no CAP_SYS_PTRACE effective under no_new_privs (CapEff=$chart_mon_eff); the shape the chart deploys captures nothing"
+[ "$chart_mon_nnp" = 1 ] ||
+  die "the monitor's no_new_privs is $chart_mon_nnp, so this run did not test the chart's shape at all"
+[ "$(cap_bit "$chart_par_eff")" = 0 ] ||
+  die "the daemon still holds CAP_SYS_PTRACE effective (CapEff=$chart_par_eff); the seal did not take"
+[ "$(cap_bit "$chart_par_prm")" = 0 ] ||
+  die "the daemon still holds CAP_SYS_PTRACE permitted (CapPrm=$chart_par_prm); it could raise it again"
+[ "$chart_par_nnp" = 1 ] ||
+  die "the daemon's no_new_privs is $chart_par_nnp"
+
+# trawld is pid 1 in this container, and the kernel discards a signal sent to
+# pid 1 of a namespace when its disposition is SIG_DFL. The crash handler is
+# installed, so SIGSEGV still reaches it and the monitor still dumps; what gets
+# discarded is the re-raise the handler does afterwards, which leaves the
+# container running. Nothing here reads an exit status, only the dump.
+run docker exec "$chart_c" sh -c "kill -SEGV $PARENT_PID"
+wait_until "$LOG_WAIT_SECS" "the monitor wrote a minidump" log_has "$chart_c" 'wrote minidump'
+logs "$chart_c" >"$LOG_DIR/07-chart-shape-crash.log"
+
+chart_threads="$(mdmp_field "$chart_c" threads)"
+chart_regions="$(mdmp_field "$chart_c" memory_regions)"
+note "threads=$chart_threads memory_regions=$chart_regions"
+[[ "$chart_threads" =~ ^[0-9]+$ ]] || die "unparsable thread count: $chart_threads"
+[[ "$chart_regions" =~ ^[0-9]+$ ]] || die "unparsable region count: $chart_regions"
+case "$scope" in
+  3)
+    # yama 3 refuses every attach, so even a capable monitor writes an empty
+    # dump. The verdict below is what has to say so.
+    [ "$chart_threads" -eq 0 ] ||
+      die "at scope 3 the monitor captured $chart_threads threads, which yama should have refused"
+    ;;
+  *)
+    [ "$chart_threads" -gt 0 ] ||
+      die "the minidump captured $chart_threads threads; a denied ptrace attach writes exactly this"
+    [ "$chart_regions" -gt 0 ] ||
+      die "the minidump captured $chart_regions memory regions"
+    ;;
+esac
+
+phase "step 7b: the chart shape, what trawld logs about itself"
+
+start_as_init chart-shape-verdict \
+  --user 1000 --cap-add SYS_PTRACE --security-opt no-new-privileges \
+  -e TRAWL_CRASH_DUMP_DIR="$DUMP_DIR" -e RUST_LOG=trawld=info \
+  --entrypoint /usr/bin/trawld "$IMAGE" --config "$CFG_FIFO" --no-monitor
+chart_verdict_c="$CONTAINER"
+
+wait_until "$PROC_WAIT_SECS" "trawld and its monitor are up" have_procs "$chart_verdict_c" 2
+feed_config "$chart_verdict_c"
+wait_until "$LOG_WAIT_SECS" "trawld logged its crash-dump verdict" log_has "$chart_verdict_c" 'event_type="crash_dump"'
+logs "$chart_verdict_c" >"$LOG_DIR/07-chart-shape-verdict.log"
+
+chart_line="$(crash_dump_line "$chart_verdict_c")"
+printf '%s\n' "$chart_line"
+if [ "$scope" = 3 ]; then
+  assert_class "$chart_line" 'readiness="denied"'
+else
+  assert_class "$chart_line" 'readiness="ready"'
+fi
+refute "$chart_line" 'readiness="failed"' "arming the handler failed"
+# The first of these is the /proc capture above as trawld itself sees it; the
+# rest are the seal read-back, unchanged by the shape.
+for f in 'monitor_cap_eff_ptrace=true' 'self_cap_eff_ptrace=false' 'self_cap_prm_ptrace=false' 'self_no_new_privs=true'; do
+  case "$chart_line" in
+    *"$f"*) note "reported: $f" ;;
+    *) die "the verdict does not report $f: $chart_line" ;;
+  esac
+done
+
+# --------------------------------------------------- step 8: capture disabled --
+
+phase "step 8: disabled, the stamped binary still runs and spawns nothing"
 
 start disabled \
   --user 1000 --cap-drop ALL --security-opt no-new-privileges \
@@ -523,7 +676,7 @@ note "still exactly one trawld process after ${NO_MONITOR_WATCH_SECS}s"
 # been parked at the config open, which is past init(), for the whole of it.
 feed_config "$off_c"
 wait_until "$LOG_WAIT_SECS" "trawld got past config load" log_has "$off_c" 'configuration loaded'
-logs "$off_c" >"$LOG_DIR/07-disabled.log"
+logs "$off_c" >"$LOG_DIR/08-disabled.log"
 
 if log_has "$off_c" 'event_type="crash_dump"'; then
   die "capture is off, but trawld logged a crash-dump verdict: $(crash_dump_line "$off_c")"
@@ -554,6 +707,10 @@ fi
   echo "enabled verdict:  $enabled_line"
   echo "misconf verdict:  $misc_line"
   echo "misconf crash:    threads=$misc_threads memory_regions=$misc_regions"
+  echo "chart monitor:    CapEff=$chart_mon_eff CapPrm=$chart_mon_prm NoNewPrivs=$chart_mon_nnp"
+  echo "chart daemon:     CapEff=$chart_par_eff CapPrm=$chart_par_prm NoNewPrivs=$chart_par_nnp"
+  echo "chart crash:      threads=$chart_threads memory_regions=$chart_regions"
+  echo "chart verdict:    $chart_line"
   echo "disabled:         one trawld process, no crash-dump verdict"
   echo "logs:             $LOG_DIR"
 } | tee "$LOG_DIR/summary.txt"
