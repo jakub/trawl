@@ -38,6 +38,30 @@ export const SEL = {
   liveTailButton: '.rt-hint button',
   /// crates/fleet-ui/src/loaded/component.rs Loaded's default Error arm.
   loadHintError: '.results .load-hint.error',
+  /// crates/trawl-web-ui/src/components/editor_wrap.rs DateRangePopover —
+  /// the Segmented tab strip's "Absolute" option.
+  absoluteTab: '.dr-pop >> text=Absolute',
+  /// crates/trawl-web-ui/src/components/editor_wrap.rs DateRangePopover —
+  /// the Absolute tab's From input.
+  dateRangeFrom: '.dr-from',
+  /// crates/trawl-web-ui/src/components/editor_wrap.rs DateRangePopover —
+  /// the Absolute tab's To input.
+  dateRangeTo: '.dr-to',
+  /// crates/trawl-web-ui/src/components/editor_wrap.rs DateRangePopover —
+  /// the wrapper carrying the Apply button (fleet-ui's Btn takes no class).
+  dateRangeApply: '.dr-apply',
+  /// crates/trawl-web-ui/src/components/malformed_notice.rs — the banner a
+  /// search URL that cannot be read shows instead of results.
+  urlNotice: '.url-notice',
+  /// crates/trawl-web-ui/src/components/malformed_notice.rs — its one
+  /// repair button.
+  urlNoticeRepair: '.url-notice-repair',
+  /// crates/trawl-web-ui/src/components/malformed_notice.rs — the raw
+  /// parameter value, rendered as text.
+  urlNoticeRaw: '.url-notice-raw',
+  /// crates/trawl-web-ui/src/components/meta_strip.rs — the chip that says
+  /// the link's filters could not be read.
+  filtersBadChip: '.chip.bad',
 } as const;
 
 export const COPY = {
@@ -56,4 +80,24 @@ export const COPY = {
   /// crates/trawl-web-ui/src/components/editor_wrap.rs DateRangePopover —
   /// Real-time tab's "Live Tail" button text.
   liveTailButtonText: 'Live Tail',
+  /// crates/trawl-web-ui/src/search_url.rs Malformed::message + Param::noun.
+  urlNoticeFiltersPrefix: "This link's filters could not be read:",
+  /// crates/trawl-web-ui/src/search_url.rs Malformed::message + Param::noun.
+  urlNoticeRangePrefix: "This link's time range could not be read:",
+  /// crates/trawl-web-ui/src/search_url.rs Malformed::message + Param::noun.
+  urlNoticePagePrefix: "This link's page could not be read:",
+  /// crates/trawl-web-ui/src/search_url.rs Malformed::repair_label.
+  urlNoticeRepairFilters: 'Drop filters',
+  /// crates/trawl-web-ui/src/search_url.rs Malformed::repair_label.
+  urlNoticeRepairRange: 'Use last 15 minutes',
+  /// crates/trawl-web-ui/src/search_url.rs Malformed::repair_label.
+  urlNoticeRepairPage: 'Go to page 1',
+  /// crates/trawl-web-ui/src/components/meta_strip.rs — the bad chip's text.
+  filtersUnreadableChip: 'filters unreadable',
+  /// crates/trawl-web-ui/src/search_url.rs RESERVED_SET — the percent-codec
+  /// drift guard's input, typed into the editor by search-url.spec.ts and
+  /// checked byte for byte against the native table test's expectation.
+  reservedSet: " #&/:%'!~*()日本語😀",
+  /// crates/trawl-web-ui/src/search_url.rs RESERVED_SET_ENCODED.
+  reservedSetEncoded: "%20%23%26%2F%3A%25'!~*()%E6%97%A5%E6%9C%AC%E8%AA%9E%F0%9F%98%80",
 } as const;

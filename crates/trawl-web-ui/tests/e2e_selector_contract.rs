@@ -25,6 +25,9 @@ const RESULTS_TABLE_RS: &str = include_str!("../src/components/results_table.rs"
 const HISTORY_RS: &str = include_str!("../src/pages/history.rs");
 const LAYOUT_RS: &str = include_str!("../src/pages/layout.rs");
 const EDITOR_WRAP_RS: &str = include_str!("../src/components/editor_wrap.rs");
+const MALFORMED_NOTICE_RS: &str = include_str!("../src/components/malformed_notice.rs");
+const META_STRIP_RS: &str = include_str!("../src/components/meta_strip.rs");
+const SEARCH_URL_RS: &str = include_str!("../src/search_url.rs");
 const LOADED_COMPONENT_RS: &str = include_str!("../../fleet-ui/src/loaded/component.rs");
 const LOADED_STATE_RS: &str = include_str!("../../fleet-ui/src/loaded/state.rs");
 const RAIL_RS: &str = include_str!("../../fleet-ui/src/rail.rs");
@@ -163,6 +166,120 @@ const CONTRACTS: &[Contract] = &[
         source_path: "src/components/results_table.rs",
         source: RESULTS_TABLE_RS,
         hook: "label=\"results\"",
+    },
+    Contract {
+        assignment: "absoluteTab: '.dr-pop >> text=Absolute',",
+        source_path: "src/components/editor_wrap.rs",
+        source: EDITOR_WRAP_RS,
+        hook: "class=\"dr-pop\"",
+    },
+    Contract {
+        assignment: "absoluteTab: '.dr-pop >> text=Absolute',",
+        source_path: "src/components/editor_wrap.rs",
+        source: EDITOR_WRAP_RS,
+        hook: "\"Absolute\"",
+    },
+    Contract {
+        assignment: "dateRangeFrom: '.dr-from',",
+        source_path: "src/components/editor_wrap.rs",
+        source: EDITOR_WRAP_RS,
+        hook: "class=\"dr-from\"",
+    },
+    Contract {
+        assignment: "dateRangeTo: '.dr-to',",
+        source_path: "src/components/editor_wrap.rs",
+        source: EDITOR_WRAP_RS,
+        hook: "class=\"dr-to\"",
+    },
+    Contract {
+        assignment: "dateRangeApply: '.dr-apply',",
+        source_path: "src/components/editor_wrap.rs",
+        source: EDITOR_WRAP_RS,
+        hook: "class=\"dr-apply\"",
+    },
+    Contract {
+        assignment: "urlNotice: '.url-notice',",
+        source_path: "src/components/malformed_notice.rs",
+        source: MALFORMED_NOTICE_RS,
+        hook: "class=\"url-notice\"",
+    },
+    Contract {
+        assignment: "urlNoticeRepair: '.url-notice-repair',",
+        source_path: "src/components/malformed_notice.rs",
+        source: MALFORMED_NOTICE_RS,
+        hook: "class=\"url-notice-repair\"",
+    },
+    Contract {
+        assignment: "urlNoticeRaw: '.url-notice-raw',",
+        source_path: "src/components/malformed_notice.rs",
+        source: MALFORMED_NOTICE_RS,
+        hook: "class=\"url-notice-raw\"",
+    },
+    Contract {
+        assignment: "filtersBadChip: '.chip.bad',",
+        source_path: "src/components/meta_strip.rs",
+        source: META_STRIP_RS,
+        hook: "class=\"chip bad\"",
+    },
+    Contract {
+        assignment: "urlNoticeFiltersPrefix: \"This link's filters could not be read:\",",
+        source_path: "src/search_url.rs",
+        source: SEARCH_URL_RS,
+        hook: "This link's {} could not be read:",
+    },
+    Contract {
+        assignment: "urlNoticeFiltersPrefix: \"This link's filters could not be read:\",",
+        source_path: "src/search_url.rs",
+        source: SEARCH_URL_RS,
+        hook: "Self::Filters => \"filters\",",
+    },
+    Contract {
+        assignment: "urlNoticeRangePrefix: \"This link's time range could not be read:\",",
+        source_path: "src/search_url.rs",
+        source: SEARCH_URL_RS,
+        hook: "Self::Range => \"time range\",",
+    },
+    Contract {
+        assignment: "urlNoticePagePrefix: \"This link's page could not be read:\",",
+        source_path: "src/search_url.rs",
+        source: SEARCH_URL_RS,
+        hook: "Self::Page => \"page\",",
+    },
+    Contract {
+        assignment: "urlNoticeRepairFilters: 'Drop filters',",
+        source_path: "src/search_url.rs",
+        source: SEARCH_URL_RS,
+        hook: "Param::Filters => \"Drop filters\",",
+    },
+    Contract {
+        assignment: "urlNoticeRepairRange: 'Use last 15 minutes',",
+        source_path: "src/search_url.rs",
+        source: SEARCH_URL_RS,
+        hook: "Param::Range => \"Use last 15 minutes\",",
+    },
+    Contract {
+        assignment: "urlNoticeRepairPage: 'Go to page 1',",
+        source_path: "src/search_url.rs",
+        source: SEARCH_URL_RS,
+        hook: "Param::Page => \"Go to page 1\",",
+    },
+    Contract {
+        assignment: "filtersUnreadableChip: 'filters unreadable',",
+        source_path: "src/components/meta_strip.rs",
+        source: META_STRIP_RS,
+        hook: "\"filters unreadable\"",
+    },
+    Contract {
+        assignment: "reservedSet: \" #&/:%'!~*()\u{65e5}\u{672c}\u{8a9e}\u{1f600}\",",
+        source_path: "src/search_url.rs",
+        source: SEARCH_URL_RS,
+        hook: "pub const RESERVED_SET: &str = \" #&/:%'!~*()\u{65e5}\u{672c}\u{8a9e}\u{1f600}\";",
+    },
+    Contract {
+        assignment: "reservedSetEncoded: \"%20%23%26%2F%3A%25'!~*()%E6%97%A5%E6%9C%AC%E8%AA%9E%F0%9F%98%80\",",
+        source_path: "src/search_url.rs",
+        source: SEARCH_URL_RS,
+        hook: "\"%20%23%26%2F%3A%25'!~*()%E6%97%A5%E6%9C%AC%E8%AA%9E%F0%9F%98%80\"",
     },
     Contract {
         assignment: "liveTailButtonText: 'Live Tail',",
