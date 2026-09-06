@@ -246,10 +246,14 @@ ORIG_SCOPE=""
 # The stub SPA index.html, when this run is the one that created it. Removed on
 # the way out so a harness run leaves no file behind in the tree it tested.
 STUB_CREATED=""
-# Docker objects THIS run created, recorded before each create. Teardown removes
-# only these. Removing by name alone would let a run that died early delete the
-# containers of a run under another account, whose lock this one cannot see:
-# same hazard the preflight sweep refuses, on the way out instead of in.
+# Docker objects THIS run created, recorded as IDs from the create commands that
+# actually succeeded. Names are the wrong handle: they are fixed strings, so a
+# create that LOST a race to another run would still have left the name in a
+# list, and teardown would then remove the winner's container. An id names one
+# object, and every object this run makes carries RUN_LABEL, which teardown
+# re-checks before removing anything. Belt and braces, on purpose: teardown runs
+# `docker rm -f`, and being wrong there means killing somebody else's live run.
+readonly RUN_LABEL="trawl-crashdump-harness-run=$$-$(date +%s)"
 CREATED_CONTAINERS=()
 CREATED_NETWORK=""
 # Set to 1 BEFORE the write, never after: a write that lands and then fails to
@@ -335,11 +339,20 @@ cleanup() {
   elif (( ${#CREATED_CONTAINERS[@]} == 0 )) && [[ -z "$CREATED_NETWORK" ]]; then
     note "this run created no containers or networks; nothing to remove"
   else
-    if (( ${#CREATED_CONTAINERS[@]} )); then
-      runq docker rm -f "${CREATED_CONTAINERS[@]}" 2>/dev/null || true
-    fi
+    local id
+    for id in ${CREATED_CONTAINERS[@]+"${CREATED_CONTAINERS[@]}"}; do
+      if [[ "$(docker inspect -f '{{index .Config.Labels "trawl-crashdump-harness-run"}}' "$id" 2>/dev/null)" == "${RUN_LABEL#*=}" ]]; then
+        runq docker rm -f "$id" 2>/dev/null || true
+      else
+        note "not removing container $id: it is gone, or it is no longer the one this run created"
+      fi
+    done
     if [[ -n "$CREATED_NETWORK" ]]; then
-      runq docker network rm "$CREATED_NETWORK" 2>/dev/null || true
+      if [[ "$(docker network inspect -f '{{index .Labels "trawl-crashdump-harness-run"}}' "$CREATED_NETWORK" 2>/dev/null)" == "${RUN_LABEL#*=}" ]]; then
+        runq docker network rm "$CREATED_NETWORK" 2>/dev/null || true
+      else
+        note "not removing network $CREATED_NETWORK: it is gone, or it is no longer the one this run created"
+      fi
     fi
   fi
 
@@ -646,14 +659,16 @@ if (( ${#preflight[@]} )); then
   note "removed leftovers from an earlier run: ${preflight[*]}"
 fi
 
-CREATED_NETWORK="$NET"
-runq docker network create "$NET"
+printf '\n$ docker network create --label %s %s\n' "$RUN_LABEL" "$NET"
+CREATED_NETWORK=$(docker network create --label "$RUN_LABEL" "$NET")
+note "network id ${CREATED_NETWORK:0:12}"
 
-printf '\n$ docker run -d --name %s --network %s %s\n' "$PG" "$NET" "$POSTGRES_IMAGE"
-CREATED_CONTAINERS+=("$PG")
-docker run -d --name "$PG" --network "$NET" \
+printf '\n$ docker run -d --name %s --network %s --label %s %s\n' "$PG" "$NET" "$RUN_LABEL" "$POSTGRES_IMAGE"
+pg_id=$(docker run -d --name "$PG" --network "$NET" --label "$RUN_LABEL" \
   -e POSTGRES_PASSWORD=harness -e POSTGRES_USER=postgres -e POSTGRES_DB=postgres \
-  "$POSTGRES_IMAGE" >/dev/null
+  "$POSTGRES_IMAGE")
+CREATED_CONTAINERS+=("$pg_id")
+note "container id ${pg_id:0:12}"
 wait_for 60 "postgres accepting connections" \
   "docker exec $PG pg_isready -U postgres" || die "postgres never came up"
 
@@ -682,12 +697,13 @@ STOPSIGNAL SIGRTMIN+3
 CMD ["/sbin/init"]
 EOF
 
-printf '\n$ docker run -d --name %s --privileged --cgroupns=private --tmpfs /run --tmpfs /tmp --network %s %s /sbin/init\n' \
-  "$NODE" "$NET" "$NODE_IMAGE"
-CREATED_CONTAINERS+=("$NODE")
-docker run -d --name "$NODE" --privileged --cgroupns=private \
-  --tmpfs /run --tmpfs /tmp --network "$NET" \
-  "$NODE_IMAGE" /sbin/init >/dev/null
+printf '\n$ docker run -d --name %s --privileged --cgroupns=private --tmpfs /run --tmpfs /tmp --network %s --label %s %s /sbin/init\n' \
+  "$NODE" "$NET" "$RUN_LABEL" "$NODE_IMAGE"
+node_id=$(docker run -d --name "$NODE" --privileged --cgroupns=private \
+  --tmpfs /run --tmpfs /tmp --network "$NET" --label "$RUN_LABEL" \
+  "$NODE_IMAGE" /sbin/init)
+CREATED_CONTAINERS+=("$node_id")
+note "container id ${node_id:0:12}"
 wait_for 60 "systemd up in $NODE" \
   "docker exec $NODE systemctl is-system-running --wait 2>/dev/null | grep -qE 'running|degraded'" \
   || die "systemd never finished booting in $NODE"
