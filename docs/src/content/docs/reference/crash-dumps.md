@@ -256,12 +256,17 @@ One more thing to weigh on a multi-user host: the daemon and its monitor talk
 over an abstract unix socket, which has no filesystem permissions, and its name
 is predictable from trawld's pid, so any local process in the same network
 namespace can connect to it and could race trawld to bind the name. Winning
-that race no longer buys anything. Once its own client is connected, trawld
-opens a throwaway connection to the same name and reads `SO_PEERCRED`, which
-names the process that called `listen`. If that is not the monitor trawld
-spawned, running as trawld's own uid, capture does not arm at all: the startup
-event reports `readiness="failed"` with `reason="monitor_identity"`, and the
-daemon runs on with no crash handler installed.
+that race no longer buys anything. trawld reads `SO_PEERCRED` on the
+connection it is holding, the one a crash context would travel over, which
+names the process that called `listen` on the socket that accepted it. Asking
+about the name instead of the connection would not do: an impostor can bind
+first, accept trawld's connection, then close its listener and let the real
+monitor bind the freed name, at which point a fresh connection reports the real
+monitor while the dump still goes to the impostor. If the peer of the held
+connection is not the monitor trawld spawned, running as trawld's own uid,
+capture does not arm at all: the startup event reports `readiness="failed"`
+with `reason="monitor_identity"`, and the daemon runs on with no crash handler
+installed.
 
 The residual runs the other way. Any process under the same uid can still
 connect to the monitor as a second client and ask it for a dump. What it gets

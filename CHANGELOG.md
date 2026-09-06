@@ -681,9 +681,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Security profile. The monitor also has to prove it is the monitor: the
   socket name is abstract, so it has no permissions and is predictable from
   trawld's pid, and a connect that succeeds says only that something is bound
-  to it. trawld reads `SO_PEERCRED` on a second, throwaway connection, which
-  names the process that bound the name, and refuses to arm with
-  `reason="monitor_identity"` when that is not the child it spawned. A monitor
+  to it. trawld reads `SO_PEERCRED` on the connection it is HOLDING, which
+  names the process that called `listen` on the socket that accepted it, and
+  refuses to arm with `reason="monitor_identity"` when that is not the child
+  it spawned. The credential has to come from that descriptor rather than from
+  a second connection to the same name: an impostor that binds first, accepts,
+  and then closes only its listener leaves the real monitor free to bind the
+  name, so a fresh connection would report the monitor while the dump request
+  still travelled to the impostor. A monitor
   that has already exited is a refusal too, rather than an `indeterminate`
   verdict, because the wait that observes the exit also reaps the pid and the
   old code went on to hand that pid a `PR_SET_PTRACER` grant.
