@@ -19,6 +19,17 @@ fail() {
   exit 1
 }
 
+# systemd ignores whitespace around a directive's '=' (systemd.syntax(7)), so
+# `AmbientCapabilities = CAP_SYS_PTRACE` grants the capability just as surely as
+# the unspaced form. Every check below that looks for a directive has to see
+# both spellings, or the guard passes on the file it was written to catch.
+# Only the FIRST '=' is normalized: systemd strips whitespace around the
+# directive separator, not inside the value, so `Environment=A = b` sets A to
+# the string "A = b" and must not be folded.
+normalize_directives() { # normalize_directives <file>
+  sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; s/^([^=]*[^=[:space:]])[[:space:]]*=[[:space:]]*/\1=/' "$1"
+}
+
 # -- 1. postinst is valid POSIX sh -----------------------------------------
 
 if ! sh -n "$postinst" 2>/tmp/packaging-sh-n.$$; then
@@ -31,7 +42,7 @@ rm -f /tmp/packaging-sh-n.$$
 # -- 2. the default unit stays untouched: no active capability grant, and -
 #       no mention of the crash-dump env vars anywhere ---------------------
 
-if grep -E '^[[:space:]]*(AmbientCapabilities|CapabilityBoundingSet)=' "$service" >/dev/null; then
+if grep -E '^[[:space:]]*(AmbientCapabilities|CapabilityBoundingSet)[[:space:]]*=' "$service" >/dev/null; then
   fail "crates/trawl-server/debian/trawld.service sets AmbientCapabilities or CapabilityBoundingSet directly — the crash-dump grant belongs in the opt-in debian/crashdump.conf drop-in, not the default unit"
 fi
 if grep -F 'TRAWL_CRASH_DUMP_' "$service" >/dev/null; then
@@ -40,16 +51,16 @@ fi
 
 # -- 3. the default env file carries no active crash-dump assignment ------
 
-if grep -vE '^[[:space:]]*#' "$default_env" | grep -E 'TRAWL_CRASH_DUMP_[A-Za-z_]*=' >/dev/null; then
+if grep -vE '^[[:space:]]*#' "$default_env" | grep -E 'TRAWL_CRASH_DUMP_[A-Za-z_]*[[:space:]]*=' >/dev/null; then
   fail "crates/trawl-server/debian/trawld.default sets a TRAWL_CRASH_DUMP_* variable uncommented — the unit's EnvironmentFile would make it part of the effective default"
 fi
 
 # -- 4. the sandboxing the drop-in depends on is still in place -----------
 
-if ! grep -Fq 'ProtectSystem=strict' "$service"; then
+if ! grep -Eq '^[[:space:]]*ProtectSystem[[:space:]]*=[[:space:]]*strict[[:space:]]*$' "$service"; then
   fail "crates/trawl-server/debian/trawld.service dropped ProtectSystem=strict — the crash-dump drop-in relies on that sandbox"
 fi
-if ! grep -E '^ReadWritePaths=.*/var/lib/trawl' "$service" >/dev/null; then
+if ! grep -E '^[[:space:]]*ReadWritePaths[[:space:]]*=.*/var/lib/trawl' "$service" >/dev/null; then
   fail "crates/trawl-server/debian/trawld.service has no ReadWritePaths covering /var/lib/trawl — the crash-dump drop-in writes under that tree"
 fi
 
@@ -59,7 +70,11 @@ if [[ ! -f "$crashdump_conf" ]]; then
   fail "crates/trawl-server/debian/crashdump.conf is missing"
 fi
 
+# Raw lines feed the docs verbatim check further down; the normalized copy is
+# what gets compared and parsed, so a whitespace-around-'=' respelling is still
+# recognised as the same four directives.
 mapfile -t directive_lines < <(grep -vE '^[[:space:]]*$' "$crashdump_conf" | grep -vE '^[[:space:]]*#')
+mapfile -t normalized_lines < <(normalize_directives "$crashdump_conf" | grep -vE '^$' | grep -vE '^#')
 
 expected_lines=(
   "[Service]"
@@ -68,11 +83,11 @@ expected_lines=(
   "Environment=TRAWL_CRASH_DUMP_RETAIN=10"
 )
 
-if [[ ${#directive_lines[@]} -ne ${#expected_lines[@]} ]]; then
-  fail "crates/trawl-server/debian/crashdump.conf has ${#directive_lines[@]} directive lines, expected ${#expected_lines[@]}: ${expected_lines[*]}"
+if [[ ${#normalized_lines[@]} -ne ${#expected_lines[@]} ]]; then
+  fail "crates/trawl-server/debian/crashdump.conf has ${#normalized_lines[@]} directive lines, expected ${#expected_lines[@]}: ${expected_lines[*]}"
 fi
 for i in "${!expected_lines[@]}"; do
-  if [[ "${directive_lines[$i]}" != "${expected_lines[$i]}" ]]; then
+  if [[ "${normalized_lines[$i]}" != "${expected_lines[$i]}" ]]; then
     fail "crates/trawl-server/debian/crashdump.conf line $((i + 1)) is '${directive_lines[$i]}', expected '${expected_lines[$i]}'"
   fi
 done
@@ -83,9 +98,27 @@ asset_pattern='\[[[:space:]]*"debian/crashdump\.conf"[[:space:]]*,[[:space:]]*"u
 if ! grep -Eq "$asset_pattern" "$cargo_toml"; then
   fail "crates/trawl-server/Cargo.toml is missing the asset triple [\"debian/crashdump.conf\", \"$asset_dest\", \"644\"]"
 fi
-if grep -E '"etc/systemd/system/|"usr/lib/systemd/system/trawld\.service\.d' "$cargo_toml" >/dev/null; then
-  fail "crates/trawl-server/Cargo.toml ships an asset under a systemd unit directory (etc/systemd/system/ or usr/lib/systemd/system/trawld.service.d/) — the crash-dump example must ship as documentation only, never pre-installed"
-fi
+# The old spelling of this rule named two literal prefixes, which left every
+# other place systemd reads units from wide open: /lib/systemd/system (still a
+# real path on non-usrmerged systems and a symlinked alias everywhere else),
+# /etc/systemd/user, /usr/lib/systemd/system-preset, and a drop-in directory for
+# any unit but trawld. Walk the asset destinations instead and refuse anything
+# systemd reads, allowing only the two unit files the package legitimately owns.
+# Whatever the crash-dump example ships as, it is documentation, never
+# pre-installed configuration.
+packaged_units="usr/lib/systemd/system/trawld.service usr/lib/systemd/system/trawl-web.service"
+while IFS= read -r asset_line; do
+  dest=$(printf '%s' "$asset_line" | sed -E 's/^[^"]*"[^"]+"[^"]*"([^"]+)".*/\1/')
+  dest_norm="${dest#/}"
+  case "$dest_norm" in
+    etc/systemd/*|lib/systemd/*|usr/lib/systemd/*|usr/local/lib/systemd/*|run/systemd/*)
+      case " $packaged_units " in
+        *" $dest_norm "*) ;;
+        *) fail "crates/trawl-server/Cargo.toml ships an asset to '$dest', a path systemd reads units and drop-ins from. The crash-dump example is documentation and must never be pre-installed; unit files themselves belong in [package.metadata.deb] systemd-units." ;;
+      esac
+      ;;
+  esac
+done < <(grep -E '^[[:space:]]*\[[[:space:]]*"' "$cargo_toml")
 
 # For assets landing in sysusers.d or tmpfiles.d, cargo-deb generates a
 # `systemd-sysusers <name>` / `systemd-tmpfiles --create <name>` call in postinst
@@ -128,8 +161,8 @@ if [[ -z "$default_retain" ]]; then
   fail "crates/trawl-crashdump/src/imp.rs: could not find the DEFAULT_RETAIN constant"
 fi
 
-dir_line="${directive_lines[2]}"
-retain_line="${directive_lines[3]}"
+dir_line="${normalized_lines[2]}"
+retain_line="${normalized_lines[3]}"
 dir_rest="${dir_line#Environment=}"
 dir_name="${dir_rest%%=*}"
 dir_value="${dir_rest#*=}"
