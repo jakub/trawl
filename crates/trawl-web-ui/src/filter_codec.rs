@@ -11,16 +11,66 @@
 
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
+use std::fmt;
+
 use base64ct::{Base64UrlUnpadded, Encoding as _};
-use serde::{Deserialize, Serialize};
+use serde::de::value::MapAccessDeserializer;
+use serde::de::{MapAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 
 const VERSION: &str = "v1.";
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize)]
 struct WireFilter {
     op: char,
     field: String,
     value: String,
+}
+
+/// The record's fields, in the one shape this codec writes. Separate
+/// from [`WireFilter`] only so the manual reader below can borrow serde's
+/// derived field handling without also inheriting the derived
+/// deserializer's positional-array arm.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireFilterFields {
+    op: char,
+    field: String,
+    value: String,
+}
+
+/// A record is an OBJECT, never a JSON array.
+///
+/// serde's derived deserializer accepts both shapes: `{"op":"+",…}` and
+/// the positional `["+","host","web-01"]`. The array form is three to
+/// four times denser than the object form this codec writes, so a
+/// payload inside the raw `f` cap could decode into a filter set whose
+/// canonical re-encoding is well past it — a link the reader accepts and
+/// the producer cannot write back. Asking for a map closes that gap at
+/// the shape, and `decode_filters` re-checks the canonical size anyway.
+impl<'de> Deserialize<'de> for WireFilter {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ObjectOnly;
+
+        impl<'de> Visitor<'de> for ObjectOnly {
+            type Value = WireFilter;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a filter object with op, field and value")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+                let fields = WireFilterFields::deserialize(MapAccessDeserializer::new(map))?;
+                Ok(WireFilter {
+                    op: fields.op,
+                    field: fields.field,
+                    value: fields.value,
+                })
+            }
+        }
+
+        deserializer.deserialize_map(ObjectOnly)
+    }
 }
 
 pub fn encode_payload<'a>(parts: impl Iterator<Item = (char, &'a str, &'a str)>) -> String {
@@ -130,6 +180,29 @@ mod tests {
             decode_payload(&encode_payload(std::iter::empty())),
             Ok(Vec::new())
         );
+    }
+
+    /// The positional array form serde's derived reader would have
+    /// accepted. It is not a shape this codec writes, and it is dense
+    /// enough that a payload inside the raw cap decodes into filters
+    /// whose object-shaped re-encoding is far past it.
+    #[test]
+    fn a_positional_array_record_is_not_a_filter() {
+        for json in [
+            r#"[["+","host","web-01"]]"#,
+            // Mixed shapes fail whole, like every other bad record.
+            r#"[{"op":"+","field":"host","value":"web-01"},["-","source","auth.log"]]"#,
+        ] {
+            let payload = format!(
+                "{VERSION}{}",
+                Base64UrlUnpadded::encode_string(json.as_bytes())
+            );
+            assert_eq!(
+                decode_payload(&payload),
+                Err(PayloadError::Undecodable),
+                "{json}"
+            );
+        }
     }
 
     /// A record this codec would never write fails the WHOLE payload.

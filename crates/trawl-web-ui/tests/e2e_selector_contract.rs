@@ -222,6 +222,12 @@ const CONTRACTS: &[Contract] = &[
         hook: "class=\"chip bad\"",
     },
     Contract {
+        assignment: "resultsPane: '.results',",
+        source_path: "src/components/results_table.rs",
+        source: RESULTS_TABLE_RS,
+        hook: "class=\"results\"",
+    },
+    Contract {
         assignment: "urlNoticeFiltersPrefix: \"This link's filters could not be read:\",",
         source_path: "src/search_url.rs",
         source: SEARCH_URL_RS,

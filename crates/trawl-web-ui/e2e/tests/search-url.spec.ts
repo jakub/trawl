@@ -207,6 +207,40 @@ test('malformed r refuses to run and repairs on click', async ({ page, request }
   expect(body.query).toBe('last=15m service=nginx');
 });
 
+test('a repair fixes only the parameter the banner names', async ({ page, request }) => {
+  // Wrong in two places at once. Precedence puts filters first.
+  await expectRefused(
+    page,
+    request,
+    '/search?q=service%3Dnginx&f=v1.!&r=garbage',
+    COPY.urlNoticeFiltersPrefix,
+  );
+  // The banner is the whole results area: no rows under a notice that
+  // says the link was not run, even for an answer already in flight.
+  await expect(page.locator(SEL.resultsPane)).toHaveCount(0);
+
+  // "Drop filters" drops `f` and NOTHING else. `r=garbage` is still in
+  // the address bar, so the next verdict raises its own banner and the
+  // link still has not run.
+  await page.locator(SEL.urlNoticeRepair).click();
+  await expect(page.locator(SEL.urlNotice)).toContainText(COPY.urlNoticeRangePrefix);
+  await expect(page.locator(SEL.urlNoticeRaw)).toHaveText('garbage');
+  expect(await page.evaluate(() => location.search)).toBe('?q=service%3Dnginx&r=garbage');
+  await expect(page.locator(SEL.resultsPane)).toHaveCount(0);
+  await page.waitForTimeout(QUIET_MS);
+  expect(await capturedQueryCount(request), 'the range banner still ran a query').toBe(0);
+
+  // The second click repairs the range, and only then does it run.
+  await page.locator(SEL.urlNoticeRepair).click();
+  await expect(page.locator(SEL.urlNotice)).toHaveCount(0);
+  expect(await page.evaluate(() => location.search)).toBe('?q=service%3Dnginx');
+  const body = await lastCapturedQuery(request, 1);
+  expect(body.query).toBe('last=15m service=nginx');
+  // …and the results pane is back, so its absence above was the gate
+  // and not a selector that never matches anything.
+  await expect(page.locator(SEL.resultsPane)).toBeVisible();
+});
+
 test('page offset overflows refuse to run while an unreadable page is page 1', async ({
   page,
   request,

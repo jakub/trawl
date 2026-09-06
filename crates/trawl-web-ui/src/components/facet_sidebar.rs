@@ -28,6 +28,13 @@ pub fn FacetSidebar(
     /// Current filters — read to paint selected/excluded value rows.
     #[prop(into)]
     filters: Signal<Vec<Filter>>,
+    /// True while the link's structured state could not be read. The
+    /// rail then shows its header and nothing else: facets are counted
+    /// off rows, and a query that was refused has no rows to count —
+    /// including a response that was already in flight when the URL
+    /// turned unreadable (ADR-0027).
+    #[prop(into)]
+    suppressed: Signal<bool>,
     /// Called when the user clicks `+` or `⊘` on a facet value.
     on_add: Callback<Filter>,
     /// Called when the user clicks "clear all" in the header.
@@ -60,6 +67,9 @@ pub fn FacetSidebar(
                 // the facet rail is noise.
                 error=Box::new(|_| view! { <p class="facets-hint">"—"</p> }.into_any())
                 render=Box::new(move |resp: QueryResponse| {
+                    if suppressed.get() {
+                        return ().into_any();
+                    }
                     let facets = compute_facets(&resp.result);
                     if facets.is_empty() {
                         return ().into_any();

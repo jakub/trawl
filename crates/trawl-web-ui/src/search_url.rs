@@ -65,6 +65,13 @@ pub const MAX_FILTER_FIELD_BYTES: usize = 255;
 /// Largest value, in bytes, inside a decoded filter.
 pub const MAX_FILTER_VALUE_BYTES: usize = 1024;
 
+/// Largest raw `r` value read at all. The longest range this app writes
+/// is 42 bytes (`<from>..<to>` with two canonical UTC instants) and the
+/// `now` form is 24, so 64 leaves room to spell one and none at all to
+/// hand a 10 KB string to a timestamp parser. Checked before the split,
+/// so an oversized `r` is malformed by length and nothing else.
+pub const MAX_RANGE_BYTES: usize = 64;
+
 /// Characters a percent-encoded reserved set exercises, shared by the
 /// native table test and the browser spec so both pin one literal.
 /// Evidence, not app code: nothing in the browser build reads it.
@@ -112,6 +119,16 @@ pub enum Param {
 }
 
 impl Param {
+    /// The parameter as the address bar spells it.
+    #[must_use]
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Filters => "f",
+            Self::Range => "r",
+            Self::Page => "page",
+        }
+    }
+
     /// The parameter as the banner names it to a reader.
     #[must_use]
     pub const fn noun(self) -> &'static str {
@@ -150,6 +167,9 @@ pub enum Reason {
     UnrenderableFilterField,
     /// `r` is neither a quick label nor a readable `<from>..<to>` pair.
     UnreadableRange,
+    /// The raw `r` value is over [`MAX_RANGE_BYTES`], so it is not a
+    /// range at all and never reaches the timestamp parser.
+    RangeTooLong,
     /// `r`'s bounds are readable but `from` is after `to`.
     RangeReversed,
     /// `page * PAGE_SIZE` does not fit — the link claims a page that
@@ -157,35 +177,48 @@ pub enum Reason {
     PageOffsetOverflow,
 }
 
-/// One parameter that could not be read, with the raw value verbatim so
-/// the banner can show the reader what their link actually says.
+/// One parameter that could not be read, carrying as much of the raw
+/// value as the banner will show and nothing more.
+///
+/// The value is attacker-controlled and unbounded — a 1 MB `f` is
+/// refused before it is decoded, but the verdict that refuses it is
+/// cloned into every memo that reads it, so keeping the whole string
+/// would hand the address bar a megabyte of resident state per read. The
+/// prefix is cut once, here, at the only place a `Malformed` is built.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Malformed {
     pub param: Param,
-    pub raw: String,
+    /// The first [`RAW_DISPLAY_CHARS`] characters of the raw value. The
+    /// rest is gone: `truncated_raw` is the only reader, and no caller
+    /// has a use for text the banner will not print.
+    raw_prefix: String,
+    /// Whether anything was cut, so the display can say so without
+    /// keeping the evidence.
+    truncated: bool,
     pub reason: Reason,
 }
 
-/// How much of the raw value the banner shows.
+/// How much of the raw value the banner shows — and, since ADR-0027's
+/// review, how much of it is retained at all.
 const RAW_DISPLAY_CHARS: usize = 120;
 
 impl Malformed {
     fn new(param: Param, raw: &str, reason: Reason) -> Self {
         Self {
             param,
-            raw: raw.to_string(),
+            // Characters, not bytes: the cut is a display bound, and a
+            // byte cut could split a multibyte name in half.
+            raw_prefix: raw.chars().take(RAW_DISPLAY_CHARS).collect(),
+            truncated: raw.chars().nth(RAW_DISPLAY_CHARS).is_some(),
             reason,
         }
     }
 
-    /// The raw value cut to [`RAW_DISPLAY_CHARS`] characters on a char
-    /// boundary, with an ellipsis when anything was cut. Characters, not
-    /// bytes: the cut is a display bound, and a byte cut could split a
-    /// multibyte name in half.
+    /// The retained prefix, with an ellipsis when anything was cut.
     #[must_use]
     pub fn truncated_raw(&self) -> String {
-        let mut out: String = self.raw.chars().take(RAW_DISPLAY_CHARS).collect();
-        if self.raw.chars().nth(RAW_DISPLAY_CHARS).is_some() {
+        let mut out = self.raw_prefix.clone();
+        if self.truncated {
             out.push('\u{2026}');
         }
         out
@@ -285,20 +318,89 @@ pub fn build_search_url(
         let _ = write!(url, "&mode={m}");
     }
     if !filters.is_empty() {
-        // Every producer asks `admit_filters` before it navigates, so a
-        // URL this function builds is always one `decode_filters` reads
-        // back. A violation here would show the malformed banner for
-        // the app's own navigation.
-        debug_assert!(
-            admit_filters(filters).is_ok(),
-            "built a search URL whose filters our own reader refuses"
-        );
+        // Admission is upstream: every producer asks `admit_filters`
+        // before it navigates, and a filter set that came back out of
+        // `decode_filters` was admitted by the same rules on the way in.
+        // No assertion here — the only way to reach one would be an
+        // in-app caller that skipped the door, and a debug build that
+        // panics on a URL is worse than the banner.
         let _ = write!(url, "&f={}", encode_filters(filters));
     }
     if *range != RangeSpec::default() {
         let _ = write!(url, "&r={}", encode_range(range));
     }
     url
+}
+
+/// Rewrite a search URL, replacing ONLY the parameter the banner names
+/// and carrying every other parameter through exactly as it arrived.
+///
+/// A one-parameter edit rather than a rebuild out of the decoded memos,
+/// because a link can be wrong in more than one place at once.
+/// `?q=service%3Dnginx&f=v1.!&r=garbage` used to lose its range the
+/// moment the reader clicked "Drop filters": the rebuild wrote the
+/// range memo, which had already fallen back to the default, and the
+/// query quietly ran over the last 15 minutes with no banner and no
+/// mention. Dropping `f` and nothing else leaves `r=garbage` in the
+/// address bar, so the next verdict raises its own banner and offers
+/// its own repair.
+///
+/// `params` is the query as the router hands it over: each value
+/// decoded exactly once, in the order the URL carries them.
+#[must_use]
+pub fn repair_url<'a>(
+    params: impl IntoIterator<Item = (&'a str, &'a str)>,
+    which: Param,
+) -> String {
+    let mut url = String::from("/search");
+    let mut sep = '?';
+    let mut repaired = false;
+    for (name, value) in params {
+        if name == which.key() {
+            // The repair. Filters and range have no default spelling in
+            // the URL — an absent parameter IS the default — so the
+            // repair is the removal. A page has one, and page 0 written
+            // in place keeps the parameter where the reader saw it.
+            if which == Param::Page && !repaired {
+                let _ = write!(url, "{sep}page=0");
+                sep = '&';
+            }
+            repaired = true;
+            continue;
+        }
+        let _ = write!(
+            url,
+            "{sep}{}={}",
+            percent_encode(name),
+            carry_value(name, value)
+        );
+        sep = '&';
+    }
+    url
+}
+
+/// Write a carried-through value back the way the producer would have
+/// written it.
+///
+/// `q` is percent-encoded, exactly as `build_search_url` encodes it.
+/// Every other parameter gets the same rule with the colon left alone,
+/// because `r`'s readable `<from>..<to>` spelling is built on colons and
+/// a browser carries a colon in a query value as itself — so repairing
+/// one parameter does not sprinkle `%3A` through the hour of another.
+/// Everything else is encoded, which is how a `+` inside an unreadable
+/// range survives as a `+` instead of arriving back as a space.
+fn carry_value(name: &str, value: &str) -> String {
+    if name == "q" {
+        return percent_encode(value);
+    }
+    let mut out = String::with_capacity(value.len());
+    for (i, part) in value.split(':').enumerate() {
+        if i > 0 {
+            out.push(':');
+        }
+        out.push_str(&percent_encode(part));
+    }
+    out
 }
 
 /// Encode filters as the opaque versioned payload. Its alphabet
@@ -399,7 +501,13 @@ pub fn decode_filters(raw: &str) -> Verdict<Vec<Filter>> {
             },
         })
         .collect();
-    if let Err(reason) = admit_records(&filters) {
+    // The producer's door, not just the per-record rules: a `Valid`
+    // verdict has to imply that `build_search_url` can write this set
+    // back. JSON is a looser language than this codec's own output, so a
+    // payload inside the raw cap can still decode into filters whose
+    // canonical re-encoding is over it, and the app would then navigate
+    // into its own malformed banner.
+    if let Err(reason) = admit_filters(&filters) {
         return bad(reason);
     }
     Verdict::Valid(filters)
@@ -427,7 +535,9 @@ pub fn encode_range(range: &RangeSpec) -> String {
     }
 }
 
-/// Read the `r` parameter. Empty is missing; a known quick label is
+/// Read the `r` parameter. Empty is missing; anything over
+/// [`MAX_RANGE_BYTES`] is malformed by length before it is looked at; a
+/// known quick label is
 /// itself; `<from>..<to>` needs canonical UTC bounds (`now` allowed on
 /// the right only) in order. Everything else — including the old `abs:`
 /// form — is malformed, with no special copy for it: it is one more
@@ -437,10 +547,13 @@ pub fn decode_range(raw: &str) -> Verdict<RangeSpec> {
     if raw.is_empty() {
         return Verdict::Absent;
     }
+    let bad = |reason| Verdict::Malformed(Malformed::new(Param::Range, raw, reason));
+    if raw.len() > MAX_RANGE_BYTES {
+        return bad(Reason::RangeTooLong);
+    }
     if let Some(q) = QUICK_RANGES.iter().find(|q| **q == raw) {
         return Verdict::Valid(RangeSpec::Quick(q));
     }
-    let bad = |reason| Verdict::Malformed(Malformed::new(Param::Range, raw, reason));
     let Some((from, to)) = raw.split_once("..") else {
         return bad(Reason::UnreadableRange);
     };
@@ -517,6 +630,14 @@ pub fn parse_page(raw: &str) -> Verdict<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Base64url, unpadded, as the codec writes it — spelled out here
+    /// so a test can hand `decode_filters` a payload the codec would
+    /// never produce.
+    fn base64_url(bytes: &[u8]) -> String {
+        use base64ct::{Base64UrlUnpadded, Encoding as _};
+        Base64UrlUnpadded::encode_string(bytes)
+    }
 
     fn inc(field: &str, value: &str) -> Filter {
         Filter {
@@ -719,6 +840,39 @@ mod tests {
         assert_eq!(
             decode_filters(&over_cap).malformed().map(|m| m.reason),
             Some(Reason::FilterPayloadTooLarge)
+        );
+    }
+
+    /// The adversarial shape ADR-0027's review found: serde's derived
+    /// reader accepted positional arrays, which are dense enough that a
+    /// payload inside the raw cap decodes into filters this app cannot
+    /// write back. Both doors close it — the codec refuses the shape,
+    /// and `decode_filters` measures the canonical re-encoding.
+    #[test]
+    fn a_dense_array_shaped_payload_inside_the_raw_cap_is_malformed() {
+        let records: Vec<String> = (0..MAX_FILTERS)
+            .map(|i| format!("[\"+\",\"f{i}\",\"{}\"]", "v".repeat(75)))
+            .collect();
+        let json = format!("[{}]", records.join(","));
+        let payload = format!("v1.{}", base64_url(json.as_bytes()));
+        // Inside the raw cap, so the length gate does not fire…
+        assert_eq!(payload.len(), 3831);
+        assert!(payload.len() <= MAX_FILTER_PAYLOAD_BYTES);
+        // …while the same filters written the way this app writes them
+        // are half a kilobyte past it.
+        let equivalent: Vec<Filter> = (0..MAX_FILTERS)
+            .map(|i| inc(&format!("f{i}"), &"v".repeat(75)))
+            .collect();
+        assert_eq!(encode_filters(&equivalent).len(), 4727);
+        assert_eq!(
+            admit_filters(&equivalent),
+            Err(Reason::FilterPayloadTooLarge)
+        );
+        // The record shape is refused first, so this never reaches the
+        // size door — and it is a banner either way, never filters.
+        assert_eq!(
+            decode_filters(&payload).malformed().map(|m| m.reason),
+            Some(Reason::UndecodableFilters)
         );
     }
 
@@ -1001,6 +1155,42 @@ mod tests {
         assert_eq!(decode_range(""), Verdict::Absent);
     }
 
+    /// Length first, parser second: a 10 KB `r` is not a range, and
+    /// handing it to a timestamp parser to find that out is work an
+    /// address bar should not be able to ask for.
+    #[test]
+    fn an_oversized_range_never_reaches_the_parser() {
+        let huge = "9".repeat(10_000);
+        assert_eq!(
+            decode_range(&huge).malformed().map(|m| m.reason),
+            Some(Reason::RangeTooLong)
+        );
+
+        // The cap leaves room for the longest range this app writes…
+        let longest = encode_range(&RangeSpec::Absolute {
+            from: "2026-01-01T00:00:00Z".into(),
+            to: "2026-12-31T23:59:59Z".into(),
+        });
+        assert_eq!(longest.len(), 42);
+        assert!(longest.len() <= MAX_RANGE_BYTES);
+        assert!(matches!(decode_range(&longest), Verdict::Valid(_)));
+
+        // …and is inclusive: at the cap the value is read and found
+        // unreadable, one byte over it is refused by length.
+        assert_eq!(
+            decode_range(&"x".repeat(MAX_RANGE_BYTES))
+                .malformed()
+                .map(|m| m.reason),
+            Some(Reason::UnreadableRange)
+        );
+        assert_eq!(
+            decode_range(&"x".repeat(MAX_RANGE_BYTES + 1))
+                .malformed()
+                .map(|m| m.reason),
+            Some(Reason::RangeTooLong)
+        );
+    }
+
     // ---- page --------------------------------------------------------
 
     #[test]
@@ -1067,5 +1257,119 @@ mod tests {
         assert_eq!(wide.repair_label(), "Go to page 1");
         assert!(wide.truncated_raw().starts_with('日'));
         assert_eq!(wide.truncated_raw().chars().count(), RAW_DISPLAY_CHARS + 1);
+    }
+
+    /// The verdict is cloned into every memo that reads it, so what it
+    /// KEEPS is the display window and not a byte more. A megabyte in
+    /// the address bar must not become a megabyte of resident state.
+    #[test]
+    fn a_refused_value_is_not_retained_past_the_display_window() {
+        let huge = format!("v1.{}", "A".repeat(1_000_000));
+        let v = decode_filters(&huge);
+        let m = v.malformed().expect("a 1 MB payload is malformed");
+        assert_eq!(m.reason, Reason::FilterPayloadTooLarge);
+        assert_eq!(m.raw_prefix.chars().count(), RAW_DISPLAY_CHARS);
+        assert!(m.truncated);
+        assert_eq!(m.truncated_raw().chars().count(), RAW_DISPLAY_CHARS + 1);
+
+        // Same for the range, whose own gate is a length check.
+        let long_range = "9".repeat(10_000);
+        let r = decode_range(&long_range);
+        let m = r.malformed().expect("a 10 KB range is malformed");
+        assert_eq!(m.raw_prefix.chars().count(), RAW_DISPLAY_CHARS);
+
+        // A value inside the window is kept whole, with no ellipsis.
+        let short = Malformed::new(Param::Range, "garbage", Reason::UnreadableRange);
+        assert!(!short.truncated);
+        assert_eq!(short.truncated_raw(), "garbage");
+    }
+
+    // ---- repair ------------------------------------------------------
+
+    /// The repair edits ONE parameter. Rebuilding the URL from the
+    /// decoded memos dropped the others' raw text, so a link that was
+    /// wrong twice lost its range to a click on "Drop filters" and ran
+    /// the default window with nothing said about it.
+    #[test]
+    fn a_repair_replaces_only_the_parameter_it_names() {
+        let params = [("q", "service=nginx"), ("f", "v1.!"), ("r", "garbage")];
+        assert_eq!(
+            repair_url(params, Param::Filters),
+            "/search?q=service%3Dnginx&r=garbage"
+        );
+        assert_eq!(
+            repair_url(params, Param::Range),
+            "/search?q=service%3Dnginx&f=v1.!"
+        );
+        // And the second click, on the URL the first one produced.
+        assert_eq!(
+            repair_url([("q", "service=nginx"), ("r", "garbage")], Param::Range),
+            "/search?q=service%3Dnginx"
+        );
+    }
+
+    #[test]
+    fn a_page_repair_writes_page_zero_where_the_page_was() {
+        assert_eq!(
+            repair_url(
+                [
+                    ("q", "service=nginx"),
+                    ("page", "85899346"),
+                    ("mode", "live")
+                ],
+                Param::Page
+            ),
+            "/search?q=service%3Dnginx&page=0&mode=live"
+        );
+        // Arrival order, not a canonical order: everything but the
+        // repaired parameter is carried through as it stood.
+        assert_eq!(
+            repair_url([("page", "85899346"), ("q", "x")], Param::Page),
+            "/search?page=0&q=x"
+        );
+    }
+
+    /// A carried value must mean the same thing on the way back in.
+    #[test]
+    fn a_carried_value_survives_the_browser_unchanged() {
+        // `+` is a space once the browser decodes, so it is encoded…
+        assert_eq!(
+            repair_url(
+                [("f", "v1.!"), ("r", "2026-01-01T00:00:00+02:00..now")],
+                Param::Filters
+            ),
+            "/search?r=2026-01-01T00:00:00%2B02:00..now"
+        );
+        // …while the readable range spelling keeps its colons, so a
+        // repair elsewhere does not rewrite it.
+        assert_eq!(
+            repair_url(
+                [("f", "v1.!"), ("r", "2026-01-01T00:00:00Z..now")],
+                Param::Filters
+            ),
+            "/search?r=2026-01-01T00:00:00Z..now"
+        );
+        // An `&` or a `#` in a value cannot become URL structure.
+        assert_eq!(
+            repair_url([("f", "v1.!"), ("r", "a&b#c")], Param::Filters),
+            "/search?r=a%26b%23c"
+        );
+        // The query text is encoded exactly as the producer writes it.
+        assert_eq!(
+            repair_url([("q", RESERVED_SET), ("f", "v1.!")], Param::Filters),
+            format!("/search?q={RESERVED_SET_ENCODED}")
+        );
+    }
+
+    /// A repaired URL is one the reader reads back without a banner.
+    #[test]
+    fn a_repaired_url_no_longer_names_the_parameter_it_repaired() {
+        let repaired = repair_url([("q", "service=nginx"), ("r", "garbage")], Param::Range);
+        assert_eq!(repaired, "/search?q=service%3Dnginx");
+        assert!(!repaired.contains("r="));
+
+        let repaired = repair_url([("q", "x"), ("page", "85899346")], Param::Page);
+        assert_eq!(parse_page("0"), Verdict::Valid(0));
+        assert!(repaired.ends_with("page=0"));
     }
 }

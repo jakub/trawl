@@ -35,7 +35,7 @@ use crate::components::status_bar::StatusKind;
 use crate::pages::layout::ShellStatus;
 use crate::search_url::{Param, admit_filters, refusal_copy};
 use crate::state::query::{
-    Filter, Mode, RangeSpec, UrlSignals, effective_query, navigator, url_signals,
+    Filter, Mode, RangeSpec, UrlSignals, effective_query, navigator, replace_navigator, url_signals,
 };
 use crate::state::search_session::rows_resource;
 use fleet_ui::{TabItem, Tabs, ToastBus, ToastKind};
@@ -88,6 +88,7 @@ pub fn Search() -> impl IntoView {
         filters,
         range,
         malformed,
+        repair_href,
     } = url_signals();
 
     Effect::new(move |_| {
@@ -99,8 +100,18 @@ pub fn Search() -> impl IntoView {
     // already has: the snapshot resource short-circuits it without a
     // POST, and the live-tail effect returns before opening a stream.
     // The memos below still carry their defaults, so the page renders.
+    // Whether this link's structured state could be read at all. Every
+    // reader of `rows` below is gated on it, because refusing to RUN a
+    // link is not the same as refusing to PAINT one: a response already
+    // in flight when the URL turned unreadable (Back, mid-request) still
+    // lands in the resource, and rows under a banner that says the link
+    // was not run are a straight contradiction. That the resource keeps
+    // the in-flight request is a residual outside this slice; what it
+    // shows is not.
+    let unreadable = Signal::derive(move || malformed.with(Option::is_some));
+
     let effective_q = Memo::new(move |_| {
-        if malformed.with(Option::is_some) {
+        if unreadable.get() {
             return String::new();
         }
         let base = executed_q.get();
@@ -239,24 +250,19 @@ pub fn Search() -> impl IntoView {
         })
     };
 
-    // The repair the banner offers. Every memo already falls back to
-    // its default for the parameter that could not be read, so
-    // rebuilding the URL out of them IS the repair — the unreadable
-    // value is simply not written back. `replace` so the broken link
-    // does not become a Back destination.
-    let on_repair = {
-        let goto = goto.clone();
-        Callback::new(move |()| {
-            goto(
-                &executed_q.get_untracked(),
-                page.get_untracked(),
-                mode.get_untracked(),
-                &filters.get_untracked(),
-                &range.get_untracked(),
-                true,
-            );
-        })
-    };
+    // The repair the banner offers: the link as it stands with ONE
+    // parameter replaced, built by `search_url::repair_url` off the
+    // query map. Rebuilding it from the memos instead would write every
+    // parameter's fallback, so repairing an unreadable `f` also
+    // silently dropped an unreadable `r` beside it and ran the default
+    // window. `replace` so the broken link does not become a Back
+    // destination.
+    let repair_to = replace_navigator();
+    let on_repair = Callback::new(move |()| {
+        if let Some(url) = repair_href.get_untracked() {
+            repair_to(&url);
+        }
+    });
 
     let on_navigate_q = {
         let goto = goto.clone();
@@ -329,11 +335,13 @@ pub fn Search() -> impl IntoView {
         });
     });
     Effect::new(move |_| {
-        shell_status.count.set(
+        shell_status.count.set(if unreadable.get() {
+            None
+        } else {
             rows.get()
                 .and_then(Result::ok)
-                .map(|r| r.pagination.returned),
-        );
+                .map(|r| r.pagination.returned)
+        });
     });
     Effect::new(move |_| {
         shell_status.lagged.set(lagged.get());
@@ -345,9 +353,13 @@ pub fn Search() -> impl IntoView {
         shell_status.lagged.set(None);
     });
 
-    let truncated =
-        Signal::derive(move || rows.get().and_then(Result::ok).is_some_and(|r| r.truncated));
+    let truncated = Signal::derive(move || {
+        !unreadable.get() && rows.get().and_then(Result::ok).is_some_and(|r| r.truncated)
+    });
     let last_count = Signal::derive(move || {
+        if unreadable.get() {
+            return None;
+        }
         rows.get()
             .and_then(Result::ok)
             .map(|r| r.pagination.returned)
@@ -361,7 +373,7 @@ pub fn Search() -> impl IntoView {
     // running behind the live tail, and SSE carries no notice, so a
     // stale snapshot's fields must not be shown over streamed rows.
     let degraded_fields = Signal::derive(move || {
-        if mode.get() == Mode::Live {
+        if mode.get() == Mode::Live || unreadable.get() {
             return Vec::new();
         }
         rows.get()
@@ -390,6 +402,7 @@ pub fn Search() -> impl IntoView {
             <FacetSidebar
                 rows=rows
                 filters=filters_sig
+                suppressed=unreadable
                 on_add=on_add_filter
                 on_clear=on_clear_filters
             />
@@ -437,7 +450,11 @@ pub fn Search() -> impl IntoView {
                 // worth reading, and the Visualization tab is drawn from
                 // the same incomplete rows.
                 <DegradedNotice query=effective_q fields=degraded_fields/>
-                {move || match (active_tab.get(), mode.get()) {
+                {move || if unreadable.get() {
+                    // The banner above IS the results pane while the
+                    // link cannot be read.
+                    ().into_any()
+                } else { match (active_tab.get(), mode.get()) {
                     (ResultsTab::Events, Mode::Snapshot) => view! {
                         <>
                             <Histogram rows=rows range=range_sig/>
@@ -459,7 +476,7 @@ pub fn Search() -> impl IntoView {
                     (ResultsTab::Visualization, _) => view! {
                         <Chart snapshot=live_snapshot/>
                     }.into_any(),
-                }}
+                }}}
             </div>
         </div>
         <Show when=move || show_save_modal.get()>

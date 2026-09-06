@@ -62,6 +62,10 @@ export const SEL = {
   /// crates/trawl-web-ui/src/components/meta_strip.rs — the chip that says
   /// the link's filters could not be read.
   filtersBadChip: '.chip.bad',
+  /// crates/trawl-web-ui/src/components/results_table.rs — the snapshot
+  /// results pane. Absent entirely while the malformed banner is up: the
+  /// banner is the whole results area then (ADR-0027).
+  resultsPane: '.results',
 } as const;
 
 export const COPY = {

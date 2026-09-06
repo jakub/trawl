@@ -28,7 +28,7 @@ use leptos_router::hooks::{use_navigate, use_query_map};
 pub use crate::query_merge::{Filter, FilterOp, QUICK_RANGES, RangeSpec, effective_query};
 pub use crate::search_url::{Mode, build_search_url};
 
-use crate::search_url::{Malformed, Verdict, decode_filters, decode_range, parse_page};
+use crate::search_url::{Malformed, Verdict, decode_filters, decode_range, parse_page, repair_url};
 
 /// Capture a `Navigator` closure that pushes new `(q, page, mode, filters,
 /// range)` tuples onto the router's history.
@@ -55,8 +55,30 @@ pub fn navigator() -> impl Fn(&str, usize, Mode, &[Filter], &RangeSpec, bool) + 
     }
 }
 
-/// URL-driven signals: executed query, page, mode, filters, range, and the
-/// one parameter (if any) that could not be read.
+/// Navigate to a URL this crate already built, replacing the current
+/// history entry.
+///
+/// The banner's repair is the only caller: it edits one parameter of the
+/// link as it stands (`search_url::repair_url`) rather than rebuilding
+/// the URL out of state, so it needs a door that takes a URL and not a
+/// `(q, page, mode, filters, range)` tuple. Same `use_navigate` rule as
+/// [`navigator`] — call it from a component body.
+pub fn replace_navigator() -> impl Fn(&str) + Clone + 'static {
+    let nav = use_navigate();
+    move |url: &str| {
+        nav(
+            url,
+            NavigateOptions {
+                replace: true,
+                ..Default::default()
+            },
+        );
+    }
+}
+
+/// URL-driven signals: executed query, page, mode, filters, range, the
+/// one parameter (if any) that could not be read, and the URL its repair
+/// button goes to.
 ///
 /// `filters`, `range` and `page` fall back to their defaults for a
 /// malformed value so the page still renders; `malformed` is what stops
@@ -69,6 +91,15 @@ pub struct UrlSignals {
     pub filters: Memo<Vec<Filter>>,
     pub range: Memo<RangeSpec>,
     pub malformed: Memo<Option<Malformed>>,
+    /// Where the repair button goes: this link with the named parameter
+    /// replaced and every other parameter carried through as it arrived,
+    /// raw. `None` while the link reads.
+    ///
+    /// Built from the query map rather than from the memos above,
+    /// because those have already fallen back to their defaults: a link
+    /// that is wrong in two places must not lose the second one to a
+    /// click that repaired the first.
+    pub repair_href: Memo<Option<String>>,
 }
 
 /// Hook up URL-driven signals for everything read back from the URL.
@@ -109,6 +140,16 @@ pub fn url_signals() -> UrlSignals {
             .or_else(|| page_read.with(|v| v.malformed().cloned()))
     });
 
+    let repair_href = Memo::new(move |_| {
+        let param = malformed.with(|m| m.as_ref().map(|m| m.param))?;
+        Some(query_map.with(|params| {
+            repair_url(
+                params.latest_values().map(|(name, value)| (&**name, value)),
+                param,
+            )
+        }))
+    });
+
     UrlSignals {
         executed_q,
         page,
@@ -116,5 +157,6 @@ pub fn url_signals() -> UrlSignals {
         filters,
         range,
         malformed,
+        repair_href,
     }
 }
