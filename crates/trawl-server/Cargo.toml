@@ -111,7 +111,13 @@ assets = [
     ["debian/trawld.toml", "etc/trawl/", "640"],
     ["debian/trawld.default", "etc/default/trawld", "640"],
     ["debian/trawl-web.default", "etc/default/trawl-web", "644"],
-    ["debian/trawl.sysusers.conf", "usr/lib/sysusers.d/trawl.conf", "644"],
+    # The source name has to be the destination name with `.sysusers` in place
+    # of `.conf`: cargo-deb >= 3.8.0 generates a `systemd-sysusers <name>` call
+    # in postinst, and it derives <name> from THIS path via with_extension("conf"),
+    # not from the destination. Spell it `trawl.sysusers.conf` and the generated
+    # call asks for a file that was never installed, so dpkg leaves the package
+    # half-configured. See debian/tests/crashdump-harness.sh.
+    ["debian/trawl.sysusers", "usr/lib/sysusers.d/trawl.conf", "644"],
     ["debian/crashdump.conf", "usr/share/doc/trawl-server/examples/crashdump.conf", "644"],
 ]
 

@@ -34,14 +34,17 @@
 #     resulting Depends line describes whatever glibc the build host has. Only a
 #     trixie build produces a package that installs on trixie.
 #
-#   * cargo-deb is pinned to 3.7.0. 3.8.0 (2026-09-01) added dh_installsysusers,
-#     which derives the sysusers filename from the asset's SOURCE path
-#     (debian/trawl.sysusers.conf) while the asset installs to
-#     usr/lib/sysusers.d/trawl.conf. The generated postinst then runs
-#     `systemd-sysusers trawl.sysusers.conf`, which cannot find that name, exits
-#     1, and leaves the package half-configured. Nothing in this repo is wrong;
-#     the two names simply have to match for cargo-deb >= 3.8.0. Unpinning this
-#     is not a harness change, it is a packaging decision.
+#   * cargo-deb is pinned to 3.7.0, for a reproducible package rather than one
+#     that changes shape whenever crates.io does. 3.8.0 (2026-09-01) added
+#     dh_installsysusers, which generates a `systemd-sysusers <name>` call in
+#     postinst and derives <name> from the asset's SOURCE path via
+#     with_extension("conf"). This is why the sysusers asset is spelled
+#     debian/trawl.sysusers and installs as usr/lib/sysusers.d/trawl.conf: the
+#     two names have to agree, and under the old debian/trawl.sysusers.conf
+#     spelling the generated call asked for a file nobody installed, exited 1,
+#     and left the package half-configured. With the current spelling 3.8.x
+#     builds an installable package too, so the pin is about reproducibility
+#     only, not about dodging a bug.
 
 set -Eeuo pipefail
 
