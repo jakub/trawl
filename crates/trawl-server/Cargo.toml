@@ -118,6 +118,9 @@ assets = [
     # call asks for a file that was never installed, so dpkg leaves the package
     # half-configured. See debian/tests/crashdump-harness.sh.
     ["debian/trawl.sysusers", "usr/lib/sysusers.d/trawl.conf", "644"],
+    # Same naming rule, same reason: cargo-deb runs with_extension("conf") over
+    # the source path for tmpfiles.d assets too.
+    ["debian/trawl.tmpfiles", "usr/lib/tmpfiles.d/trawl.conf", "644"],
     ["debian/crashdump.conf", "usr/share/doc/trawl-server/examples/crashdump.conf", "644"],
 ]
 

@@ -7,6 +7,7 @@ postinst="$repo_root/crates/trawl-server/debian/postinst"
 service="$repo_root/crates/trawl-server/debian/trawld.service"
 default_env="$repo_root/crates/trawl-server/debian/trawld.default"
 crashdump_conf="$repo_root/crates/trawl-server/debian/crashdump.conf"
+tmpfiles_conf="$repo_root/crates/trawl-server/debian/trawl.tmpfiles"
 cargo_toml="$repo_root/crates/trawl-server/Cargo.toml"
 imp_rs="$repo_root/crates/trawl-crashdump/src/imp.rs"
 values_yaml="$repo_root/chart/trawl/values.yaml"
@@ -141,8 +142,18 @@ if [[ "$chart_retain" != "$retain_value" ]]; then
   fail "crates/trawl-server/debian/crashdump.conf's TRAWL_CRASH_DUMP_RETAIN ('$retain_value') disagrees with chart/trawl/values.yaml's crashDump.retain default ('$chart_retain')"
 fi
 
-if ! grep -F -- "$dir_value" "$postinst" | grep -Fq -- '-o trawl -g trawl'; then
-  fail "crates/trawl-server/debian/postinst does not create '$dir_value' with -o trawl -g trawl"
+# The dump directory is created by systemd-tmpfiles, not by postinst's own
+# shell. tmpfiles walks the path with O_NOFOLLOW, which a check-then-`install -d`
+# pair cannot do: during an upgrade the still-running trawld owns the parent and
+# could swap the directory for a symlink between the two steps.
+if ! grep -Eq "^d[[:space:]]+${dir_value}[[:space:]]+0700[[:space:]]+trawl[[:space:]]+trawl([[:space:]]|$)" "$tmpfiles_conf"; then
+  fail "crates/trawl-server/debian/trawl.tmpfiles does not carry 'd $dir_value 0700 trawl trawl -'"
+fi
+if ! grep -Eq '^[[:space:]]*systemd-tmpfiles[[:space:]]+--create[[:space:]]+trawl\.conf' "$postinst"; then
+  fail "crates/trawl-server/debian/postinst does not run 'systemd-tmpfiles --create trawl.conf' — nothing would create '$dir_value' at install time"
+fi
+if grep -Eq "install[[:space:]]+-d[^\n]*${dir_value}" "$postinst"; then
+  fail "crates/trawl-server/debian/postinst creates '$dir_value' with 'install -d' — that is the check-then-act race systemd-tmpfiles replaced"
 fi
 
 # -- 9. the docs page documents the drop-in verbatim -----------------------

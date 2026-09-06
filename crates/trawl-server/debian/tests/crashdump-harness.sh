@@ -532,9 +532,12 @@ caps_report "$pid" "trawld"
 [[ "$(cap_bit "$pid" CapAmb)" == 0 ]] || die "the inert daemon already holds CAP_SYS_PTRACE in CapAmb"
 note "CAP_SYS_PTRACE (bit $PTRACE_CAP_BIT) is clear in both CapEff and CapAmb"
 
-run docker exec "$NODE" stat -c '%U %G %a' "$CORES"
-[[ "$(nshq "stat -c '%U %G %a' $CORES")" == "trawl trawl 700" ]] \
-  || die "$CORES is not trawl:trawl 0700"
+# %F as well as the mode: stat follows symlinks, so a link pointing at some
+# other 0700 trawl-owned directory would satisfy owner and mode alone. postinst
+# creates this through systemd-tmpfiles precisely so it cannot be a link.
+run docker exec "$NODE" stat -c '%F %U %G %a' "$CORES"
+[[ "$(nshq "stat -c '%F %U %G %a' $CORES")" == "directory trawl trawl 700" ]] \
+  || die "$CORES is not a plain directory owned trawl:trawl mode 0700"
 
 # ------------------------------------------------------ phase 6: B, enable --
 

@@ -1,0 +1,5 @@
+# Crash-dump directory. It exists on every install, whether or not the operator
+# copies the crashdump.conf drop-in into place, so enabling capture never has to
+# create a directory as root. 0700 because a minidump is a verbatim copy of
+# process memory: API tokens, the TLS key, the postgres DSN.
+d /var/lib/trawl/cores 0700 trawl trawl -

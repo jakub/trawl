@@ -5,6 +5,24 @@ if [ "$1" = "configure" ]; then
   # create trawl system user/group from sysusers.d config
   systemd-sysusers trawl.conf 2>/dev/null || true
 
+  # Create /var/lib/trawl/cores, 0700 trawl:trawl, from the shipped
+  # usr/lib/tmpfiles.d/trawl.conf. The directory exists on every install,
+  # whether or not the operator enables capture, so the drop-in always has
+  # somewhere writable to point at.
+  #
+  # systemd-tmpfiles instead of a check followed by `install -d`: it opens each
+  # path component with O_NOFOLLOW and refuses to act through a symlink or on a
+  # non-directory. A test-then-create pair here is a TOCTOU window. During an
+  # upgrade the old trawld is still running as the trawl user, and it owns
+  # /var/lib/trawl, so it can rename `cores` and drop a symlink in its place
+  # between the test and the create. GNU `install -d` follows a symlink to a
+  # directory and chowns the target, as root, to trawl:trawl.
+  #
+  # Runs after systemd-sysusers, which is what makes `trawl` resolvable. `|| true`
+  # keeps a systemd-less install working; trawld creates the directory itself
+  # (0700) at startup when capture is on.
+  systemd-tmpfiles --create trawl.conf || true
+
   # NOTE (ADR-0004 slice 3): trawld's app state (history, saved queries,
   # schedules, report runs) lives in a dedicated `trawl` postgres database,
   # auto-migrated at boot. Any leftover transitional sqlite file is
@@ -26,20 +44,6 @@ if [ "$1" = "configure" ]; then
         chmod 0640 "$f"
       fi
     done
-  fi
-
-  # Create the crash-dump directory (disabled unless the operator drops in
-  # crashdump.conf, but the trawl-owned directory must exist either way so
-  # the drop-in has somewhere writable to point at). Refuse a symlink or a
-  # pre-existing non-directory at the path: root creates and chowns this
-  # directory, so a planted link would make `install -d -o trawl` chown
-  # through it to an arbitrary target.
-  if id trawl >/dev/null 2>&1; then
-    if [ -L /var/lib/trawl/cores ] || { [ -e /var/lib/trawl/cores ] && [ ! -d /var/lib/trawl/cores ]; }; then
-      echo "postinst: /var/lib/trawl/cores exists and is not a plain directory, refusing to chown through it" >&2
-      exit 1
-    fi
-    install -d -o trawl -g trawl -m 0700 /var/lib/trawl/cores
   fi
 
   # Bootstrap the trawl-web session cookie key (32 random bytes).
