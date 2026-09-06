@@ -72,6 +72,7 @@ impl ResultsTab {
 }
 
 #[component]
+#[allow(clippy::too_many_lines)] // the search page markup is one cohesive view tree
 pub fn Search() -> impl IntoView {
     let shell_status = use_context::<ShellStatus>().expect("ShellStatus context");
     let bus = expect_context::<ToastBus>();

@@ -4,11 +4,12 @@
 
 //! `<FacetSidebar/>` — 224px Splunk-style filter rail.
 //!
-//! Header (title, plus "Clear all" once a filter is set) + filter input
-//! + per-field collapsible groups with proportional value bars and
-//! hover-only include/exclude actions. Clicking `+` / `⊘` on a value
-//! adds an include / exclude `Filter` to the shared filters signal; the
-//! parent owns state and re-runs the query via URL navigation.
+//! Header (title, plus "Clear all" once a filter is set), a filter
+//! input, plus per-field collapsible groups with proportional value
+//! bars and hover-only include/exclude actions. Clicking `+` / `⊘` on a
+//! value adds an include / exclude `Filter` to the shared filters
+//! signal; the parent owns state and re-runs the query via URL
+//! navigation.
 
 use std::collections::HashMap;
 

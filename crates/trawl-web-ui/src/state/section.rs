@@ -133,7 +133,7 @@ pub fn from_url(mode: Memo<AppMode>) -> Memo<String> {
         // Longest prefix match — sort by path length descending so
         // /search/history beats /search for /search/history/... paths.
         let mut by_len: Vec<&RailItem> = valid.iter().collect();
-        by_len.sort_by(|a, b| b.path.len().cmp(&a.path.len()));
+        by_len.sort_by_key(|item| std::cmp::Reverse(item.path.len()));
         if let Some(item) = by_len
             .iter()
             .find(|item| path.starts_with(&format!("{}/", item.path)))
