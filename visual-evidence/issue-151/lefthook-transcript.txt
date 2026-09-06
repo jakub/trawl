@@ -1,0 +1,89 @@
+# lefthook pre-commit glob gate for the wasm-clippy command
+# captured 2026-09-06T19:30:10Z on host fractal
+# The two runs below use lefthook's --file flag, which overwrites the
+# staged-file list the glob is matched against. No throwaway commits
+# were needed.
+
+$ git rev-parse HEAD
+2b46a1ac9d91dbe3b44a9a7ea7b6e5c5d681b696
+
+$ rustc -V
+rustc 1.98.0 (88d9e12ae 2026-08-18)
+
+$ cargo clippy -V
+clippy 0.1.98 (88d9e12ae1 2026-08-18)
+
+==============================================================
+1. a backend-only change: crates/trawl-server/src/main.rs
+==============================================================
+$ lefthook run pre-commit --file crates/trawl-server/src/main.rs --colors off --no-tty
+╭───────────────────────────────────────╮
+│ lefthook  v2.1.11   hook:  pre-commit │
+╰───────────────────────────────────────╯
+│  wasm-clippy (skip) no matching staged files
+┃  fmt-check ❯ 
+
+┃  clippy ❯ 
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-151-wasm32-clippy-lint-the-ui-crates-on/crates/trawl-core)
+    Checking trawl-engine v0.4.0 (/home/jakub/code/trawl-issue-151-wasm32-clippy-lint-the-ui-crates-on/crates/trawl-engine)
+    Checking xtask v0.4.0 (/home/jakub/code/trawl-issue-151-wasm32-clippy-lint-the-ui-crates-on/xtask)
+    Checking trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-151-wasm32-clippy-lint-the-ui-crates-on/crates/trawl-web-ui)
+    Checking trawl-admin v0.4.0 (/home/jakub/code/trawl-issue-151-wasm32-clippy-lint-the-ui-crates-on/crates/trawl-admin)
+    Checking trawl-client v0.4.0 (/home/jakub/code/trawl-issue-151-wasm32-clippy-lint-the-ui-crates-on/crates/trawl-client)
+    Checking trawl-server v0.4.0 (/home/jakub/code/trawl-issue-151-wasm32-clippy-lint-the-ui-crates-on/crates/trawl-server)
+    Checking trawl-cli v0.4.0 (/home/jakub/code/trawl-issue-151-wasm32-clippy-lint-the-ui-crates-on/crates/trawl-cli)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.75s
+
+  ────────────────────────────────────
+summary: (done in 5.84 seconds)
+✓ fmt-check (1.41 seconds)
+✓ clippy (5.83 seconds)
+exit=0
+
+==============================================================
+2. a UI-crate change: crates/fleet-ui/src/lib.rs
+==============================================================
+$ lefthook run pre-commit --file crates/fleet-ui/src/lib.rs --colors off --no-tty
+╭───────────────────────────────────────╮
+│ lefthook  v2.1.11   hook:  pre-commit │
+╰───────────────────────────────────────╯
+┃  fmt-check ❯ 
+
+┃  clippy ❯ 
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on build directory
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-151-wasm32-clippy-lint-the-ui-crates-on/crates/trawl-core)
+    Checking trawl-engine v0.4.0 (/home/jakub/code/trawl-issue-151-wasm32-clippy-lint-the-ui-crates-on/crates/trawl-engine)
+    Checking trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-151-wasm32-clippy-lint-the-ui-crates-on/crates/trawl-web-ui)
+    Checking xtask v0.4.0 (/home/jakub/code/trawl-issue-151-wasm32-clippy-lint-the-ui-crates-on/xtask)
+    Checking trawl-admin v0.4.0 (/home/jakub/code/trawl-issue-151-wasm32-clippy-lint-the-ui-crates-on/crates/trawl-admin)
+    Checking trawl-client v0.4.0 (/home/jakub/code/trawl-issue-151-wasm32-clippy-lint-the-ui-crates-on/crates/trawl-client)
+    Checking trawl-server v0.4.0 (/home/jakub/code/trawl-issue-151-wasm32-clippy-lint-the-ui-crates-on/crates/trawl-server)
+    Checking trawl-cli v0.4.0 (/home/jakub/code/trawl-issue-151-wasm32-clippy-lint-the-ui-crates-on/crates/trawl-cli)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 6.77s
+
+┃  wasm-clippy ❯ 
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-151-wasm32-clippy-lint-the-ui-crates-on/crates/trawl-core)
+    Checking trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-151-wasm32-clippy-lint-the-ui-crates-on/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.63s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+    Blocking waiting for file lock on build directory
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.11s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.11s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+
+  ────────────────────────────────────
+summary: (done in 7.03 seconds)
+✓ fmt-check (1.14 seconds)
+✓ clippy (6.85 seconds)
+✓ wasm-clippy (7.02 seconds)
+exit=0

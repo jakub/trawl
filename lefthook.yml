@@ -12,6 +12,15 @@ pre-commit:
     clippy:
       glob: "*.rs"
       run: . "$HOME/.cargo/env" 2>/dev/null; cargo clippy --workspace --all-targets -- -D warnings
+    wasm-clippy:
+      # The host clippy job never sees the cfg(target_arch = "wasm32")
+      # component tree; this does. Glob-gated so a backend-only commit
+      # pays nothing. One sequential command: three parallel cargo
+      # processes would contend for one target dir.
+      glob:
+        - "crates/trawl-web-ui/**/*"
+        - "crates/fleet-ui/**/*"
+      run: . "$HOME/.cargo/env" 2>/dev/null; cargo clippy -p trawl-web-ui --target wasm32-unknown-unknown -- -D warnings && cargo clippy -p fleet-ui --target wasm32-unknown-unknown -- -D warnings && cargo clippy -p fleet-ui --target wasm32-unknown-unknown --features atmosphere -- -D warnings
 
 pre-push:
   # Parallel is safe because each suite gets its own postgres CLUSTER
