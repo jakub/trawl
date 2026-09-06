@@ -108,9 +108,34 @@ capture for everyone who installs trawld.
 Never attach a dump to a public bug report or upload it anywhere you do not
 control. If you need help reading one, share the stack summary, not the file.
 
-Enabling capture also grants trawld and its monitor `CAP_SYS_PTRACE`, which
-lets them attach to other processes running as the same user. On a dedicated
-log host that is a small step; on a shared box, weigh it.
+### The capability is the other half of the cost
+
+Enabling capture grants trawld and its monitor `CAP_SYS_PTRACE`. Read that
+literally. `CAP_SYS_PTRACE` is not "may attach to processes owned by the trawl
+user". It is the capability the kernel checks *instead of* the uid comparison:
+with it, `ptrace_may_access` short-circuits, and trawld can attach to any
+process it can see. Root-owned services included. sshd, your database, the
+agent holding your keys.
+
+Attaching means reading and writing another process's memory and registers, so
+this is not a read-only power. A compromised trawld with this capability can
+take over a root process rather than merely inspect it.
+
+`NoNewPrivileges=true` in the unit does not contain any of this. It stops a
+process gaining *new* privileges through `execve`, and the ambient capability
+is one trawld already holds.
+
+So the honest framing is: turning on crash dumps moves trawld from an
+unprivileged daemon to one that can compromise the whole host if it is
+compromised itself. On a dedicated log box that is a defensible trade for being
+able to debug a crash. On a machine running anything you care about
+independently, it is a real decision, and it is why the package ships the
+drop-in inert rather than enabling capture for every install.
+
+One more thing to weigh on a multi-user host: the daemon and its monitor talk
+over an abstract unix socket, which has no filesystem permissions, so any local
+user in the same network namespace can connect to it. Hardening that is tracked
+against the crashdump crate, separately from this page.
 
 ## yama ptrace_scope
 
