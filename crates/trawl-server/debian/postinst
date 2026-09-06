@@ -5,28 +5,6 @@ if [ "$1" = "configure" ]; then
   # create trawl system user/group from sysusers.d config
   systemd-sysusers trawl.conf 2>/dev/null || true
 
-  # Create /var/lib/trawl/cores, 0700 trawl:trawl, from the shipped
-  # usr/lib/tmpfiles.d/trawl.conf. The directory exists on every install,
-  # whether or not the operator enables capture, so the drop-in always has
-  # somewhere writable to point at.
-  #
-  # systemd-tmpfiles instead of a check followed by `install -d`: it opens each
-  # path component with O_NOFOLLOW and refuses to act through a symlink or on a
-  # non-directory. A test-then-create pair here is a TOCTOU window. During an
-  # upgrade the old trawld is still running as the trawl user, and it owns
-  # /var/lib/trawl, so it can rename `cores` and drop a symlink in its place
-  # between the test and the create. GNU `install -d` follows a symlink to a
-  # directory and chowns the target, as root, to trawl:trawl.
-  #
-  # Runs after systemd-sysusers, which is what makes `trawl` resolvable. Gated
-  # on the binary existing so a systemd-less chroot still configures, but NOT
-  # swallowed: a systemd-tmpfiles that is present and fails is a real failure,
-  # and an install that carries on past it leaves the drop-in pointing at a
-  # directory nobody created.
-  if command -v systemd-tmpfiles >/dev/null 2>&1; then
-    systemd-tmpfiles --create trawl.conf
-  fi
-
   # NOTE (ADR-0004 slice 3): trawld's app state (history, saved queries,
   # schedules, report runs) lives in a dedicated `trawl` postgres database,
   # auto-migrated at boot. Any leftover transitional sqlite file is
@@ -66,15 +44,26 @@ if [ "$1" = "configure" ]; then
     fi
   fi
 
-  # The proxy runs as trawl-web and reads this key through its membership of the
-  # trawl group, so the key has to be group-readable. Applied on every configure
-  # rather than at generation time only: installs predating the user split left
-  # it 0400 trawl:trawl, which the proxy's new uid cannot read, and the key is
-  # deliberately preserved across upgrades so nothing else would fix it. The
-  # trawl group has exactly one member besides trawl itself.
-  if [ -f /var/lib/trawl/web.cookie ] && id trawl >/dev/null 2>&1; then
-    chown trawl:trawl /var/lib/trawl/web.cookie
-    chmod 0640 /var/lib/trawl/web.cookie
+  # Everything under /var/lib/trawl gets its ownership and modes from
+  # usr/lib/tmpfiles.d/trawl.conf: the cores directory created, web.cookie
+  # adjusted to 0640 trawl:trawl so the trawl-web uid can read it through the
+  # trawl group.
+  #
+  # systemd-tmpfiles rather than chown and chmod in this script, for both, and
+  # for the same reason. trawl owns /var/lib/trawl, so anything running as that
+  # user can replace an entry with a symlink; a root `chown trawl:trawl
+  # /var/lib/trawl/web.cookie` follows it and hands the target away. A planted
+  # `web.cookie -> /etc/shadow` would come back 0640 trawl:trawl. tmpfiles opens
+  # each component with O_NOFOLLOW and refuses to act through a link, so there is
+  # no window to win and no check to race.
+  #
+  # Runs last, after the bootstrap above has created the key, because `z` only
+  # adjusts a file that already exists. Gated on the binary so a systemd-less
+  # chroot still configures, but NOT swallowed: a systemd-tmpfiles that is
+  # present and fails is a real failure, and carrying on past it leaves the
+  # crash-dump drop-in pointing at a directory nobody created.
+  if command -v systemd-tmpfiles >/dev/null 2>&1; then
+    systemd-tmpfiles --create trawl.conf
   fi
 fi
 

@@ -236,9 +236,15 @@ if ! grep -Eq '^[[:space:]]*m[[:space:]]+trawl-web[[:space:]]+trawl[[:space:]]*$
   fail "crates/trawl-server/debian/trawl.sysusers does not add trawl-web to the trawl group — the proxy would not be able to read /var/lib/trawl/web.cookie or /etc/trawl/trawld.toml"
 fi
 # The key is group-readable on purpose, and only because the group has one
-# other member. A recursive or wider grant would hand it to everyone.
-if ! grep -Eq '^[[:space:]]*chmod[[:space:]]+0640[[:space:]]+/var/lib/trawl/web\.cookie[[:space:]]*$' "$postinst"; then
-  fail "crates/trawl-server/debian/postinst does not make /var/lib/trawl/web.cookie group-readable — trawl-web runs as its own uid now and reads the key through the trawl group"
+# other member. A recursive or wider grant would hand it to everyone. It has to
+# come from tmpfiles: trawl owns /var/lib/trawl, so a root chown of a path under
+# it follows any symlink planted there, and a planted `web.cookie -> /etc/shadow`
+# would come back 0640 trawl:trawl.
+if ! grep -Eq '^z[[:space:]]+/var/lib/trawl/web\.cookie[[:space:]]+0640[[:space:]]+trawl[[:space:]]+trawl([[:space:]]|$)' "$tmpfiles_conf"; then
+  fail "crates/trawl-server/debian/trawl.tmpfiles does not carry 'z /var/lib/trawl/web.cookie 0640 trawl trawl -' — trawl-web reads the key through the trawl group and needs it group-readable"
+fi
+if grep -Eq '^[[:space:]]*(chown|chmod)[[:space:]].*/var/lib/trawl/web\.cookie' "$postinst"; then
+  fail "crates/trawl-server/debian/postinst chowns or chmods /var/lib/trawl/web.cookie directly — that dereferences a symlink the trawl user can plant; the z line in debian/trawl.tmpfiles is the no-follow way to do it"
 fi
 if ! grep -Eq '^[[:space:]]*systemd-tmpfiles[[:space:]]+--create[[:space:]]+trawl\.conf' "$postinst"; then
   fail "crates/trawl-server/debian/postinst does not run 'systemd-tmpfiles --create trawl.conf' — nothing would create '$dir_value' at install time"
