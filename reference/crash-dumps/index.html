@@ -83,7 +83,10 @@ Instead it re-execs its own binary as a separate <strong>monitor</strong> proces
 startup and keeps a socket open to it. On a fatal signal the handler writes a
 one-line stderr breadcrumb, asks the monitor to attach and write the dump,
 waits for the ack, then re-raises so the process still dies with the original
-signal. Supervisors see the same signal exit they always did — systemd records
+signal. The monitor’s life is tied to trawld’s with <code dir="auto">PR_SET_PDEATHSIG</code>, so it
+goes away when the daemon does, including a daemon that dies during startup
+before the socket is even connected. Supervisors see the same signal exit they
+always did — systemd records
 it as <code dir="auto">status=11/SEGV</code>, a shell renders it as 139 — and restart trawld as
 usual.</p>
 <p>The attach is the whole reason a capability appears anywhere in this page.
@@ -150,24 +153,64 @@ PVC so dumps stay out of data backups. <code dir="auto">crashDump.size</code>,
 <code dir="auto">crashDump.storageClass</code>, <code dir="auto">crashDump.mountPath</code> and <code dir="auto">crashDump.retain</code> are
 the remaining knobs; see the
 <a href="https://github.com/jakub/trawl/blob/main/chart/trawl/README.md">chart README</a>.</p>
-<p>What it cannot do is match the Debian channel’s capability coverage, and the
-difference decides whether capture works on a scope 2 node.</p>
-<p><code dir="auto">capabilities.add</code> in a pod spec fills the container’s <strong>bounding</strong> set. For a
-container that does not run as root, that is all it fills: the effective and
-permitted sets stay empty, because kubernetes has no way to hand a process an
-<strong>ambient</strong> capability. The feature that would do it, KEP-2763, is not GA, and
-ambient capabilities otherwise come from a file capability on the binary, which
-the trawl image does not carry. So trawld and the monitor it re-execs run with
-<code dir="auto">SYS_PTRACE</code> in the bounding set and nothing in <code dir="auto">CapEff</code>.</p>
-<p>That is enough at scope 0 and scope 1, where the attach is permitted by
-<code dir="auto">PR_SET_PTRACER</code> naming the monitor rather than by any capability. At scope 2
-the kernel wants the capability itself, the monitor does not have it, and you
-get the failure this page describes below: a <code dir="auto">.dmp</code> appears, the log says
-<code dir="auto">wrote minidump</code>, and the file holds zero threads. That is
-<a href="https://github.com/jakub/trawl/issues/21">issue #21</a>, and the fix is a file
-capability on the binary plus <code dir="auto">allowPrivilegeEscalation</code>.</p>
-<p>Until then: on kubernetes, crash dumps work at yama scope 0 and 1 and do not
-work at scope 2. Check the node’s <code dir="auto">ptrace_scope</code> before relying on them.</p>
+<p>The image carries the capability and the enable step grants permission to use
+it. <code dir="auto">/usr/bin/trawld</code> is stamped <code dir="auto">cap_sys_ptrace+p</code> at build time, permitted
+only and never effective. A permitted-only stamp is inert in any process that
+does not ask for the bit, so the image still runs under <code dir="auto">docker run</code>’s default
+capability set and under the chart’s default <code dir="auto">drop: [ALL]</code>. An <code dir="auto">+ep</code> stamp would
+not: <code dir="auto">commoncap</code> fails <code dir="auto">execve</code> with <code dir="auto">EPERM</code> when a file’s effective bit is set
+and the container’s bounding set lacks one of that file’s permitted
+capabilities, which describes every default pod.</p>
+<p><code dir="auto">capabilities.add</code> in a pod spec is more than a bounding-set entry. containerd
+hands an added capability to the container’s init process as permitted and
+effective, so trawld holds <code dir="auto">CAP_SYS_PTRACE</code> from its first instruction. What the
+grant does not survive on its own is trawld’s re-exec into the monitor: an
+<code dir="auto">execve</code> of a file carrying no capabilities, by a process whose inheritable and
+ambient sets are empty, leaves the new process with an empty permitted set.
+Kubernetes has no field for the ambient set either, and the feature that would
+add one, KEP-2763, is not GA. The <code dir="auto">cap_sys_ptrace+p</code> stamp is what carries the
+bit across that exec.</p>
+<p><code dir="auto">no_new_privs</code> does not object to that, which is the part worth stating plainly.
+<code dir="auto">allowPrivilegeEscalation: false</code> sets <code dir="auto">no_new_privs</code>, and the kernel enforces it
+by downgrading the new credentials only when an <code dir="auto">execve</code> would grant a permitted
+set that is not a subset of the one the process already had. Here the file
+capability hands back a bit trawld already holds, so nothing is gained and
+nothing is stripped. A kind run at <code dir="auto">ptrace_scope=2</code> with the pod at
+<code dir="auto">allowPrivilegeEscalation: false</code> gave a monitor holding <code dir="auto">CapEff=0x80000</code> under
+<code dir="auto">NoNewPrivs: 1</code>, a <code dir="auto">ready</code> verdict, and a dump with 34 threads. So the chart adds
+the capability and leaves escalation alone.</p>
+<p>That rule cuts the other way too. The bit survives only because the process
+that execs <code dir="auto">trawld</code> already holds it, and in the chart that process is the
+container’s init, since the image’s <code dir="auto">ENTRYPOINT</code> is <code dir="auto">trawld</code> itself. Put a
+shell or an init shim in front of it and the shell drops the bit at its own
+exec; <code dir="auto">trawld</code>’s exec is then a gain, <code dir="auto">no_new_privs</code> strips it, and capture goes
+dead with nothing but the <code dir="auto">denied</code> verdict to say so. So keep <code dir="auto">trawld</code> as the
+container’s first process. A wrapper entrypoint in front of it, a shell or an
+init shim, is not supported here. Setting the shared
+<code dir="auto">securityContext.allowPrivilegeEscalation</code> to <code dir="auto">true</code> in values would let the
+re-exec gain the bit again, but that map is inherited by every container in the
+pod, sidecars included, and the chart’s render test asserts the <code dir="auto">false</code>. It is
+an explicit weakening outside what the chart tests, not a documented fallback.</p>
+<p>The capability is still worth weighing before you enable, because neither
+built-in Pod Security profile admits it. Restricted refuses every added
+capability except <code dir="auto">NET_BIND_SERVICE</code>. Baseline is looser but still an
+allowlist, and the list is the set of capabilities a container runtime already
+grants by default, which does not include <code dir="auto">SYS_PTRACE</code>. Both profiles and the
+exact list are in the kubernetes
+<a href="https://kubernetes.io/docs/concepts/security/pod-security-standards/">Pod Security Standards</a>.
+So relaxing a namespace from Restricted to Baseline does not help. Admission
+rejects the StatefulSet either way, over the added capability.</p>
+<p>Enabling crash dumps needs a namespace with no Pod Security enforcement, an
+exemption for this workload, or an admission policy of your own that permits
+<code dir="auto">SYS_PTRACE</code> here. The chart documents this rather than refusing to render,
+because admission policy is cluster state the chart cannot read.</p>
+<p>The monitor raises the capability to effective before it binds its socket, and
+trawld drops it from its own sets. See “The capability is the other half of the
+cost” below for what that buys and what it does not.</p>
+<p>With the capability added, kubernetes capture works at yama scope 0, 1 and 2,
+the same values Debian works at. Scope 3 refuses every tracer on both channels.
+Check the startup verdict under “Checking that it can work” instead of assuming
+the chart’s flag landed.</p>
 <div class="sl-heading-wrapper level-h2"><h2 id="what-a-dump-contains">What a dump contains</h2><a class="sl-anchor-link" href="#what-a-dump-contains"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “What a dump contains”</span></a></div>
 <p>A minidump is raw process memory. Whatever trawld was holding when it died is
 in the file: API tokens from in-flight requests, the TLS private key, the
@@ -189,18 +232,29 @@ is yours to get right, for the reason given under “Enabling on Debian”.</p>
 <p>Never attach a dump to a public bug report or upload it anywhere you do not
 control. If you need help reading one, share the stack summary, not the file.</p>
 <div class="sl-heading-wrapper level-h3"><h3 id="the-capability-is-the-other-half-of-the-cost">The capability is the other half of the cost</h3><a class="sl-anchor-link" href="#the-capability-is-the-other-half-of-the-cost"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “The capability is the other half of the cost”</span></a></div>
-<p>Enabling capture grants trawld and its monitor <code dir="auto">CAP_SYS_PTRACE</code>. Read that
+<p>Enabling capture puts <code dir="auto">CAP_SYS_PTRACE</code> inside the trawl service. Read that
 literally. <code dir="auto">CAP_SYS_PTRACE</code> is not “may attach to processes owned by the trawl
 user”. It is the capability the kernel checks <em>instead of</em> the uid comparison:
-with it, <code dir="auto">ptrace_may_access</code> short-circuits, and trawld can attach to any
+with it, <code dir="auto">ptrace_may_access</code> short-circuits, and the holder can attach to any
 process it can see. Root-owned services included. sshd, your database, the
 agent holding your keys.</p>
 <p>Attaching means reading and writing another process’s memory and registers, so
-this is not a read-only power. A compromised trawld with this capability can
-take over a root process rather than merely inspect it.</p>
-<p><code dir="auto">NoNewPrivileges=true</code> in the unit does not contain any of this. It stops a
-process gaining <em>new</em> privileges through <code dir="auto">execve</code>, and the ambient capability
-is one trawld already holds.</p>
+this is not a read-only power. A compromised holder can take over a root
+process rather than merely inspect it.</p>
+<p>Which process holds it is narrower than it used to be. Both processes start
+with the bit, through <code dir="auto">AmbientCapabilities=</code> on Debian and through the binary’s
+file capability on kubernetes. At startup the monitor raises it to effective,
+and trawld clears it from its own effective and permitted sets and sets
+<code dir="auto">no_new_privs</code> on itself. trawld execs nothing after that, so it cannot pick the
+capability back up.</p>
+<p>That limits what an ordinary bug in the query path can reach. It is not a
+boundary against a compromised daemon. The monitor is trawld’s own child, runs
+the same binary under the same uid, and will attach to trawld on request over a
+socket trawld holds. Count the capability as held by the service, and decide on
+that basis.</p>
+<p><code dir="auto">NoNewPrivileges=true</code> in the unit does not contain any of this either. It stops
+a process gaining <em>new</em> privileges through <code dir="auto">execve</code>, and on Debian the ambient
+capability is one the service already holds before any exec.</p>
 <p>So the honest framing is: turning on crash dumps moves trawld from an
 unprivileged daemon to one that can compromise the whole host if it is
 compromised itself. On a dedicated log box that is a defensible trade for being
@@ -208,14 +262,45 @@ able to debug a crash. On a machine running anything you care about
 independently, it is a real decision, and it is why the package ships the
 drop-in inert rather than enabling capture for every install.</p>
 <p>One more thing to weigh on a multi-user host: the daemon and its monitor talk
-over an abstract unix socket, which has no filesystem permissions, so any local
-user in the same network namespace can connect to it. Hardening that is tracked
-against the crashdump crate, separately from this page.</p>
+over an abstract unix socket, which has no filesystem permissions, and its name
+is predictable from trawld’s pid, so any local process in the same network
+namespace can connect to it and could race trawld to bind the name. Winning
+that race no longer buys anything. trawld reads <code dir="auto">SO_PEERCRED</code> on the
+connection it is holding, the one a crash context would travel over, which
+names the process that called <code dir="auto">listen</code> on the socket that accepted it. Asking
+about the name instead of the connection would not do: an impostor can bind
+first, accept trawld’s connection, then close its listener and let the real
+monitor bind the freed name, at which point a fresh connection reports the real
+monitor while the dump still goes to the impostor. If the peer of the held
+connection is not the monitor trawld spawned, running as trawld’s own uid,
+capture does not arm at all: the startup event reports <code dir="auto">readiness="failed"</code>
+with <code dir="auto">reason="monitor_identity"</code>, and the daemon runs on with no crash handler
+installed.</p>
+<p>The residual runs the other way, and it is wider than one uid. An abstract unix
+socket has no filesystem permissions and no credential check of its own, so any
+process in the same network namespace can connect to the monitor as a second
+client, running as any user. <code dir="auto">SO_PEERCRED</code> settles who the monitor is, not who
+else may talk to it.</p>
+<p>A well-formed request from such a client gets back a dump of the client. The
+monitor dumps the pid the kernel reports on the other end of the connection,
+never a pid the client names. A malformed frame is the real problem. The
+minidumper server loop returns an error on a message it cannot parse, so the
+monitor prints it and exits, and trawld does not notice: the startup verdict is
+a point-in-time snapshot and nothing re-checks the monitor afterwards. The
+daemon stays armed with a dead monitor and keeps reporting the readiness it
+logged at boot.</p>
+<p>The next fatal signal then produces no dump. The handler’s request to the dead
+monitor fails, that failure is ignored on purpose so the process still dies
+with its original signal, and what you find afterwards is the <code dir="auto">trawld: FATAL signal caught</code> breadcrumb with no <code dir="auto">wrote minidump</code> line after it and nothing
+new in the dump directory. Any local process can therefore turn capture off
+without a privilege of any kind. Hardening the transport, with authenticated
+framing or a filesystem socket carrying real permissions, is tracked
+separately; it was deferred when #149 landed.</p>
 <div class="sl-heading-wrapper level-h2"><h2 id="yama-ptrace_scope">yama ptrace_scope</h2><a class="sl-anchor-link" href="#yama-ptrace_scope"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “yama ptrace_scope”</span></a></div>
 <p><code dir="auto">/proc/sys/kernel/yama/ptrace_scope</code> decides whether the monitor’s attach is
 allowed at all.</p>
-<p>The two channels do not answer the same at every value, so the table splits
-them.</p>
+<p>Both channels work at the same values. The mechanism differs, so the table
+splits them.</p>
 <table>
 <thead>
 <tr>
@@ -242,7 +327,7 @@ them.</p>
 <td><code dir="auto">2</code></td>
 <td>admin-only attach</td>
 <td>works: <code dir="auto">CAP_SYS_PTRACE</code> from the drop-in is what “admin” means here</td>
-<td>does not work yet, see <a href="https://github.com/jakub/trawl/issues/21">#21</a></td>
+<td>works: the monitor raises <code dir="auto">CAP_SYS_PTRACE</code>, put in the container by <code dir="auto">crashDump.enabled=true</code> and carried across the re-exec by the image’s file capability</td>
 </tr>
 <tr>
 <td><code dir="auto">3</code></td>
@@ -255,38 +340,112 @@ them.</p>
 <p>Scope 3 is a known limitation and there is no workaround: the setting is
 one-way until reboot, and no privilege lifts it. If your hosts run scope 3,
 crash dumps are not available there.</p>
-<p>Scope 2 on kubernetes is a different kind of gap, and a fixable one. The
-capability reaches the container’s bounding set and never its effective set,
-for the reason given under the helm section, so the monitor’s attach is refused
-exactly as it would be with no capability at all. The symptom is the empty dump
-described below rather than an error.</p>
+<p>Scope 2 asks the tracer for <code dir="auto">CAP_SYS_PTRACE</code> held effective, and both channels
+now answer it. Debian’s monitor gets the bit from the drop-in’s ambient
+capability. The kubernetes monitor raises it from the image’s file capability,
+which holds open a bit the container was already granted. Neither channel
+is quiet when it goes wrong. The startup verdict below reports <code dir="auto">denied</code> before a
+crash ever happens.</p>
 <div class="sl-heading-wrapper level-h2"><h2 id="checking-that-it-can-work">Checking that it can work</h2><a class="sl-anchor-link" href="#checking-that-it-can-work"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Checking that it can work”</span></a></div>
-<p>There is no startup probe yet. trawld prints its enabled line whenever
-<code dir="auto">TRAWL_CRASH_DUMP_DIR</code> is set:</p>
-<div class="expressive-code"><figure class="frame not-content"><figcaption class="header"></figcaption><pre data-language="plaintext"><code><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53">trawl-crashdump: enabled (dir=/var/lib/trawl/cores, retain=10)</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="trawl-crashdump: enabled (dir=/var/lib/trawl/cores, retain=10)"><div></div></button></div></figure></div>
-<p>That line means the monitor came up, not that the attach will be permitted.
-The ptrace grant is issued lazily, at crash time. So under scope 3, or with a
-half-applied drop-in that set the environment but not the capability, trawld
-logs exactly the same thing — and worse, a crash can still produce a <code dir="auto">.dmp</code>
-that looks healthy from the outside. When the monitor cannot ptrace the
-crashed process it writes the dump anyway, minus every thread and memory
-region: a small file with a valid header and nothing a debugger can use. The
-journal even records the usual <code dir="auto">wrote minidump</code> line. A denied capture is
-only visible by opening the dump, or by its size (tens of kilobytes against
-hundreds for a real one).</p>
-<p>Do not try to force a crash to test this. Check the capability instead — the
-configured unit property first, then the LIVE process, because <code dir="auto">systemctl show</code>
-only proves what systemd was told, not what the running daemon holds:</p>
-<div class="expressive-code"><figure class="frame is-terminal not-content"><figcaption class="header"><span class="title"></span><span class="sr-only">Terminal window</span></figcaption><pre data-language="bash"><code><div class="ec-line"><div class="code"><span style="--0:#82AAFF;--1:#3B61B0">systemctl</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#ECC48D;--1:#3B61B0">show</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#ECC48D;--1:#3B61B0">trawld</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#82AAFF;--1:#3B61B0">-p</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#ECC48D;--1:#3B61B0">AmbientCapabilities</span></div></div><div class="ec-line"><div class="code"><span style="--0:#82AAFF;--1:#3B61B0">grep</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#82AAFF;--1:#3B61B0">-E</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#D9F5DD;--1:#111111">'</span><span style="--0:#ECC48D;--1:#984E4D">CapEff|CapAmb</span><span style="--0:#D9F5DD;--1:#111111">'</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#ECC48D;--1:#984E4D">/proc/$(</span><span style="--0:#82AAFF;--1:#3B61B0">systemctl</span><span style="--0:#ECC48D;--1:#984E4D"> </span><span style="--0:#ECC48D;--1:#3B61B0">show</span><span style="--0:#ECC48D;--1:#984E4D"> </span><span style="--0:#ECC48D;--1:#3B61B0">trawld</span><span style="--0:#ECC48D;--1:#984E4D"> </span><span style="--0:#82AAFF;--1:#3B61B0">-p</span><span style="--0:#ECC48D;--1:#984E4D"> </span><span style="--0:#ECC48D;--1:#3B61B0">MainPID</span><span style="--0:#ECC48D;--1:#984E4D"> </span><span style="--0:#82AAFF;--1:#3B61B0">--value</span><span style="--0:#ECC48D;--1:#984E4D">)/status</span><span style="--0:#D9F5DD;--1:#111111">"</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="systemctl show trawld -p AmbientCapabilitiesgrep -E &#x27;CapEff|CapAmb&#x27; &quot;/proc/$(systemctl show trawld -p MainPID --value)/status&quot;"><div></div></button></div></figure></div>
-<p>The unit property should name <code dir="auto">cap_sys_ptrace</code> and both <code dir="auto">/proc</code> masks should
-have bit 19 set (<code dir="auto">0000000000080000</code>). The monitor is a child of that PID and
-inherits the same sets. Pair that with the enabled line in
-<code dir="auto">journalctl -u trawld</code> and the yama value above, and you have covered every
-part that can silently fall off. One more denial can still hide beyond all of
-these: an active LSM policy (SELinux, AppArmor) can refuse the attach after
-capabilities and yama both pass, with the same empty-dump symptom — if the
-checks above look right and dumps still come out empty, audit your LSM policy
-for trawld. Issue #21 tracks turning this into a real startup warning.</p>
+<p>trawld probes the setup at startup and logs one verdict. Every armed outcome and
+every failure but one is a single structured event. The exception is a failed
+seal, which is decided before the tracing subscriber exists and goes to stderr
+instead, described below. Nothing about the probe is lazy. By the time the line is written the monitor is connected, its capability
+sets have been read out of <code dir="auto">/proc</code>, <code dir="auto">PR_SET_PTRACER</code> has been issued with its
+return checked, and the daemon has sealed itself.</p>
+<p>The ready case, wrapped here but one line in the journal:</p>
+<div class="expressive-code"><figure class="frame not-content"><figcaption class="header"></figcaption><pre data-language="plaintext"><code><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53">INFO trawld: crash-dump capture ready; capability and yama checked, LSM policy not probed</span></div></div><div class="ec-line"><div class="code"><span class="indent"><span style="--0:#d6deeb;--1:#403f53">  </span></span><span style="--0:#d6deeb;--1:#403f53">event_type="crash_dump" readiness="ready" ptrace_scope=2 monitor_pid=8213</span></div></div><div class="ec-line"><div class="code"><span class="indent"><span style="--0:#d6deeb;--1:#403f53">  </span></span><span style="--0:#d6deeb;--1:#403f53">monitor_cap_eff_ptrace=true monitor_cap_prm_ptrace=true monitor_no_new_privs=true</span></div></div><div class="ec-line"><div class="code"><span class="indent"><span style="--0:#d6deeb;--1:#403f53">  </span></span><span style="--0:#d6deeb;--1:#403f53">self_cap_eff_ptrace=false self_cap_prm_ptrace=false self_no_new_privs=true</span></div></div><div class="ec-line"><div class="code"><span class="indent"><span style="--0:#d6deeb;--1:#403f53">  </span></span><span style="--0:#d6deeb;--1:#403f53">dumpable=true ptracer_set=true dir="/var/lib/trawl/cores" retain=10</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="INFO trawld: crash-dump capture ready; capability and yama checked, LSM policy not probed  event_type=&quot;crash_dump&quot; readiness=&quot;ready&quot; ptrace_scope=2 monitor_pid=8213  monitor_cap_eff_ptrace=true monitor_cap_prm_ptrace=true monitor_no_new_privs=true  self_cap_eff_ptrace=false self_cap_prm_ptrace=false self_no_new_privs=true  dumpable=true ptracer_set=true dir=&quot;/var/lib/trawl/cores&quot; retain=10"><div></div></button></div></figure></div>
+<p>Read it out of the journal:</p>
+<div class="expressive-code"><figure class="frame is-terminal not-content"><figcaption class="header"><span class="title"></span><span class="sr-only">Terminal window</span></figcaption><pre data-language="bash"><code><div class="ec-line"><div class="code"><span style="--0:#82AAFF;--1:#3B61B0">journalctl</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#82AAFF;--1:#3B61B0">-u</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#ECC48D;--1:#3B61B0">trawld</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#7FDBCA;--1:#096E72">|</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#82AAFF;--1:#3B61B0">grep</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#ECC48D;--1:#3B61B0">crash_dump</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="journalctl -u trawld | grep crash_dump"><div></div></button></div></figure></div>
+<p>Or query it back, since with <code dir="auto">[ingest] internal_telemetry</code> on the verdict is an
+ordinary trawld record:</p>
+<div class="expressive-code"><figure class="frame is-terminal not-content"><figcaption class="header"><span class="title"></span><span class="sr-only">Terminal window</span></figcaption><pre data-language="bash"><code><div class="ec-line"><div class="code"><span style="--0:#82AAFF;--1:#3B61B0">trawl</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#ECC48D;--1:#3B61B0">query</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#D9F5DD;--1:#111111">'</span><span style="--0:#ECC48D;--1:#984E4D">service=trawld event_type=crash_dump last=24h | table _time, readiness, ptrace_scope, missing</span><span style="--0:#D9F5DD;--1:#111111">'</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="trawl query &#x27;service=trawld event_type=crash_dump last=24h | table _time, readiness, ptrace_scope, missing&#x27;"><div></div></button></div></figure></div>
+<p><code dir="auto">readiness</code> takes four values and each one has a different next step.</p>
+<table>
+<thead>
+<tr>
+<th><code dir="auto">readiness</code></th>
+<th>what it found</th>
+<th>what to do</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code dir="auto">ready</code></td>
+<td>The capability, yama and commoncap prerequisites hold</td>
+<td>Nothing</td>
+</tr>
+<tr>
+<td><code dir="auto">denied</code></td>
+<td>A prerequisite is provably missing, so a crash writes a dump with zero threads</td>
+<td>Read <code dir="auto">ptrace_scope</code> and <code dir="auto">missing</code> in the same event. <code dir="auto">missing="CAP_SYS_PTRACE"</code> means the monitor never got the bit: a half-applied drop-in on Debian, or on kubernetes a capability that never reached the container, say because an admission policy stripped it. No <code dir="auto">missing</code> at <code dir="auto">ptrace_scope=3</code> means the node refuses every tracer and nothing you grant will change that</td>
+</tr>
+<tr>
+<td><code dir="auto">indeterminate</code></td>
+<td>An input was unreadable or malformed, so there is no verdict either way</td>
+<td>Treat capture as unknown. <code dir="auto">/proc</code> being unreadable usually means a container filesystem restriction or a monitor that exited during startup. Check <code dir="auto">monitor_pid</code> is alive and read the masks by hand</td>
+</tr>
+<tr>
+<td><code dir="auto">failed</code></td>
+<td>Capture never armed. <code dir="auto">reason</code> names the step that failed</td>
+<td><code dir="auto">dump_dir</code> is a directory trawld cannot create or write. <code dir="auto">spawn_monitor</code> means the re-exec could not be started. <code dir="auto">monitor_unreachable</code> means the monitor started but trawld could not prove it alive: the socket never connected, or the monitor had already exited or could not be waited on by the time trawld checked, so nothing was armed against a pid that might be recycled. A failed seal never reaches this event at all: trawld exits first, see below</td>
+</tr>
+</tbody>
+</table>
+<p><code dir="auto">ready</code> is a necessary condition, not a promise. It covers the capability sets,
+the yama scope and commoncap’s exec rules. It does not cover seccomp or an LSM,
+and SELinux or AppArmor can refuse the attach after all of those pass, with the
+same empty-dump symptom. If the verdict says <code dir="auto">ready</code> and dumps still come out
+empty, audit LSM policy for trawld.</p>
+<p>A failed seal is the one failure that stops the daemon, and the one you cannot
+query for. It means trawld could not drop <code dir="auto">CAP_SYS_PTRACE</code> from its own sets or
+could not set <code dir="auto">no_new_privs</code>, and it refuses to serve queries holding ptrace
+power it said it would give up. That check runs before the async runtime is
+built, which is before the tracing subscriber exists, so there is no
+<code dir="auto">crash_dump</code> event and no <code dir="auto">reason="seal"</code> field to read. What you get is one
+line on stderr and exit 1:</p>
+<div class="expressive-code"><figure class="frame not-content"><figcaption class="header"></figcaption><pre data-language="text"><code><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53">[trawld] crash-dump seal failed: refusing to start with an unsealed capability set (ADR-0023 ruling 4)</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="[trawld] crash-dump seal failed: refusing to start with an unsealed capability set (ADR-0023 ruling 4)"><div></div></button></div></figure></div>
+<p>Every other <code dir="auto">reason</code> leaves trawld running normally with capture off.</p>
+<p>No armed verdict disarms the handler. The signal handler is installed for
+<code dir="auto">ready</code>, <code dir="auto">denied</code> and <code dir="auto">indeterminate</code> alike, because a probe that is wrong about
+a working host must not be the reason you end up with no dump. A <code dir="auto">failed</code> start
+is the other case: capture never armed, so no handler is installed and a crash
+writes no dump at all.</p>
+<p>The monitor reports its own half on stderr, before it binds its socket:</p>
+<div class="expressive-code"><figure class="frame not-content"><figcaption class="header"></figcaption><pre data-language="plaintext"><code><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53">trawl-crashdump monitor: cap_sys_ptrace raise ok</span></div></div><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53">trawl-crashdump monitor: cap_sys_ptrace raise failed: Operation not permitted</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="trawl-crashdump monitor: cap_sys_ptrace raise oktrawl-crashdump monitor: cap_sys_ptrace raise failed: Operation not permitted"><div></div></button></div></figure></div>
+<p>A failed raise does not stop the monitor. It binds and serves anyway, so the
+parent can read the real state and classify it, and on a scope 0 or 1 host
+capture still works without the raise.</p>
+<p>Do not force a crash to test any of this. Read the masks instead. On Debian,
+check what systemd was told and then what the processes hold, because
+<code dir="auto">systemctl show</code> only proves the first:</p>
+<div class="expressive-code"><figure class="frame is-terminal not-content"><figcaption class="header"><span class="title"></span><span class="sr-only">Terminal window</span></figcaption><pre data-language="bash"><code><div class="ec-line"><div class="code"><span style="--0:#82AAFF;--1:#3B61B0">systemctl</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#ECC48D;--1:#3B61B0">show</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#ECC48D;--1:#3B61B0">trawld</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#82AAFF;--1:#3B61B0">-p</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#ECC48D;--1:#3B61B0">AmbientCapabilities</span></div></div><div class="ec-line"><div class="code"><span style="--0:#82AAFF;--1:#3B61B0">grep</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#82AAFF;--1:#3B61B0">-E</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#D9F5DD;--1:#111111">'</span><span style="--0:#ECC48D;--1:#984E4D">CapEff|CapPrm|NoNewPrivs</span><span style="--0:#D9F5DD;--1:#111111">'</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#ECC48D;--1:#984E4D">/proc/$(</span><span style="--0:#82AAFF;--1:#3B61B0">systemctl</span><span style="--0:#ECC48D;--1:#984E4D"> </span><span style="--0:#ECC48D;--1:#3B61B0">show</span><span style="--0:#ECC48D;--1:#984E4D"> </span><span style="--0:#ECC48D;--1:#3B61B0">trawld</span><span style="--0:#ECC48D;--1:#984E4D"> </span><span style="--0:#82AAFF;--1:#3B61B0">-p</span><span style="--0:#ECC48D;--1:#984E4D"> </span><span style="--0:#ECC48D;--1:#3B61B0">MainPID</span><span style="--0:#ECC48D;--1:#984E4D"> </span><span style="--0:#82AAFF;--1:#3B61B0">--value</span><span style="--0:#ECC48D;--1:#984E4D">)/status</span><span style="--0:#D9F5DD;--1:#111111">"</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="systemctl show trawld -p AmbientCapabilitiesgrep -E &#x27;CapEff|CapPrm|NoNewPrivs&#x27; &quot;/proc/$(systemctl show trawld -p MainPID --value)/status&quot;"><div></div></button></div></figure></div>
+<p>Bit 19 (<code dir="auto">0000000000080000</code>) being absent from the daemon’s <code dir="auto">CapEff</code> and <code dir="auto">CapPrm</code>,
+with <code dir="auto">NoNewPrivs: 1</code>, is the seal working rather than a fault. Bit 19 belongs to
+the monitor. Take its pid from <code dir="auto">monitor_pid</code> in the verdict and read the same
+fields from <code dir="auto">/proc/&lt;monitor_pid&gt;/status</code>.</p>
+<p><code dir="auto">dumpable</code> can read 0 even when the verdict is <code dir="auto">ready</code>. An <code dir="auto">execve</code> that gains a
+permitted capability from the file is a privileged exec, and the kernel clears
+the dumpable flag on one. A kubernetes pod reads 1, because the container’s init
+process already held the bit and the exec gained nothing. A <code dir="auto">docker run</code> through
+a shell reads 0, because the shell had dropped it and trawld’s exec took it back.
+Either way it only feeds the scope 0 and 1 verdict, where the attach rests on
+credentials instead of the capability.</p>
+<p>On kubernetes, check the two halves of the grant:</p>
+<div class="expressive-code"><figure class="frame is-terminal not-content"><figcaption class="header"><span class="title"></span><span class="sr-only">Terminal window</span></figcaption><pre data-language="bash"><code><div class="ec-line"><div class="code"><span style="--0:#82AAFF;--1:#3B61B0">kubectl</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#ECC48D;--1:#3B61B0">exec</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#82AAFF;--1:#3B61B0">-n</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#ECC48D;--1:#3B61B0">&lt;ns&gt;</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#ECC48D;--1:#3B61B0">&lt;pod&gt;</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#82AAFF;--1:#3B61B0">-c</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#ECC48D;--1:#3B61B0">trawld</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#82AAFF;--1:#3B61B0">--</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#ECC48D;--1:#3B61B0">getcap</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#ECC48D;--1:#3B61B0">/usr/bin/trawld</span></div></div><div class="ec-line"><div class="code"><span style="--0:#82AAFF;--1:#3B61B0">kubectl</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#ECC48D;--1:#3B61B0">get</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#ECC48D;--1:#3B61B0">pod</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#82AAFF;--1:#3B61B0">-n</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#ECC48D;--1:#3B61B0">&lt;ns&gt;</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#ECC48D;--1:#3B61B0">&lt;pod&gt;</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#F78C6C;--1:#AA0982">\</span></div></div><div class="ec-line"><div class="code"><span class="indent">  </span><span style="--0:#82AAFF;--1:#3B61B0">-o</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#ECC48D;--1:#3B61B0">jsonpath=</span><span style="--0:#D9F5DD;--1:#111111">'</span><span style="--0:#ECC48D;--1:#984E4D">{.spec.containers[?(@.name=="trawld")].securityContext}</span><span style="--0:#D9F5DD;--1:#111111">'</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="kubectl exec -n <ns> <pod> -c trawld -- getcap /usr/bin/trawldkubectl get pod -n <ns> <pod> \  -o jsonpath=&#x27;{.spec.containers[?(@.name==&quot;trawld&quot;)].securityContext}&#x27;"><div></div></button></div></figure></div>
+<p>The first prints <code dir="auto">/usr/bin/trawld cap_sys_ptrace=p</code>. The second must list
+<code dir="auto">SYS_PTRACE</code> among the added capabilities. Without it every capability set in
+the container reads zero and capture is inert, whatever <code dir="auto">getcap</code> prints.</p>
+<p>When a dump is written, the monitor prints the two numbers that say whether it
+is worth keeping:</p>
+<div class="expressive-code"><figure class="frame not-content"><figcaption class="header"></figcaption><pre data-language="plaintext"><code><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53">trawl-crashdump: wrote minidump /var/lib/trawl/cores/trawld-crash-1757100000000000000.dmp threads=37 memory_regions=214</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="trawl-crashdump: wrote minidump /var/lib/trawl/cores/trawld-crash-1757100000000000000.dmp threads=37 memory_regions=214"><div></div></button></div></figure></div>
+<p><code dir="auto">threads=0 memory_regions=0</code> is a denied capture. minidump-writer treats a
+refused <code dir="auto">PTRACE_ATTACH</code> as a soft error, so the monitor writes a file with a
+valid header and logs this same line. Such a dump is a few tens of kilobytes
+against hundreds for a real one, and no debugger can do anything with it. If the
+counts cannot be read back the line says
+<code dir="auto">threads=? memory_regions=? (header unreadable: ...)</code>, which points at the dump
+or the disk rather than at a denial.</p>
 <div class="sl-heading-wrapper level-h2"><h2 id="retention">Retention</h2><a class="sl-anchor-link" href="#retention"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Retention”</span></a></div>
 <p><code dir="auto">TRAWL_CRASH_DUMP_RETAIN</code> (default 10) caps how many dumps are kept. The
 pruning runs at startup, before the handler is installed, and again after
@@ -295,4 +454,4 @@ and the oldest beyond N are deleted.</p>
 <p>Because pruning deletes by pattern, not by an inventory of files trawld wrote,
 the dump directory must be trawld’s alone. Do not park anything named <code dir="auto">*.dmp</code>
 there, and do not point <code dir="auto">TRAWL_CRASH_DUMP_DIR</code> at a shared directory.</p>
-</div><footer class="sl-flex astro-xhxjzfa7"><div class="meta sl-flex astro-xhxjzfa7"><a href="https://github.com/jakub/trawl/edit/main/docs/src/content/docs/reference/crash-dumps.md" class="sl-flex print:hidden astro-xk5gmzsg"><svg aria-hidden="true" class="astro-xk5gmzsg astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.2em;"><path d="M22 7.24a1 1 0 0 0-.29-.71l-4.24-4.24a1 1 0 0 0-1.1-.22 1 1 0 0 0-.32.22l-2.83 2.83L2.29 16.05a1 1 0 0 0-.29.71V21a1 1 0 0 0 1 1h4.24a1 1 0 0 0 .76-.29l10.87-10.93L21.71 8c.1-.1.17-.2.22-.33a1 1 0 0 0 0-.24v-.14l.07-.05ZM6.83 20H4v-2.83l9.93-9.93 2.83 2.83L6.83 20ZM18.17 8.66l-2.83-2.83 1.42-1.41 2.82 2.82-1.41 1.42Z"/></svg>Edit page</a><p>Last updated: <time datetime="2026-09-06T18:48:24.000Z">Sep 6, 2026</time></p></div><div class="pagination-links print:hidden astro-jgq3vlii" dir="ltr"><a href="/reference/configuration/" rel="prev" class="astro-jgq3vlii"><svg aria-hidden="true" class="astro-jgq3vlii astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.5rem;"><path d="M17 11H9.41l3.3-3.29a1.004 1.004 0 1 0-1.42-1.42l-5 5a1 1 0 0 0-.21.33 1 1 0 0 0 0 .76 1 1 0 0 0 .21.33l5 5a1.002 1.002 0 0 0 1.639-.325 1 1 0 0 0-.219-1.095L9.41 13H17a1 1 0 0 0 0-2Z"/></svg><span class="astro-jgq3vlii">Previous<br class="astro-jgq3vlii"><span class="link-title astro-jgq3vlii">Configuration</span></span></a><a href="/reference/fleet-auth-cutover/" rel="next" class="astro-jgq3vlii"><svg aria-hidden="true" class="astro-jgq3vlii astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.5rem;"><path d="M17.92 11.62a1.001 1.001 0 0 0-.21-.33l-5-5a1.003 1.003 0 1 0-1.42 1.42l3.3 3.29H7a1 1 0 0 0 0 2h7.59l-3.3 3.29a1.002 1.002 0 0 0 .325 1.639 1 1 0 0 0 1.095-.219l5-5a1 1 0 0 0 .21-.33 1 1 0 0 0 0-.76Z"/></svg><span class="astro-jgq3vlii">Next<br class="astro-jgq3vlii"><span class="link-title astro-jgq3vlii">Fleet-Auth Cutover Runbook</span></span></a></div></footer></div></div></main></div></div></div></div></body></html>
+</div><footer class="sl-flex astro-xhxjzfa7"><div class="meta sl-flex astro-xhxjzfa7"><a href="https://github.com/jakub/trawl/edit/main/docs/src/content/docs/reference/crash-dumps.md" class="sl-flex print:hidden astro-xk5gmzsg"><svg aria-hidden="true" class="astro-xk5gmzsg astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.2em;"><path d="M22 7.24a1 1 0 0 0-.29-.71l-4.24-4.24a1 1 0 0 0-1.1-.22 1 1 0 0 0-.32.22l-2.83 2.83L2.29 16.05a1 1 0 0 0-.29.71V21a1 1 0 0 0 1 1h4.24a1 1 0 0 0 .76-.29l10.87-10.93L21.71 8c.1-.1.17-.2.22-.33a1 1 0 0 0 0-.24v-.14l.07-.05ZM6.83 20H4v-2.83l9.93-9.93 2.83 2.83L6.83 20ZM18.17 8.66l-2.83-2.83 1.42-1.41 2.82 2.82-1.41 1.42Z"/></svg>Edit page</a><p>Last updated: <time datetime="2026-09-06T22:00:11.000Z">Sep 6, 2026</time></p></div><div class="pagination-links print:hidden astro-jgq3vlii" dir="ltr"><a href="/reference/configuration/" rel="prev" class="astro-jgq3vlii"><svg aria-hidden="true" class="astro-jgq3vlii astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.5rem;"><path d="M17 11H9.41l3.3-3.29a1.004 1.004 0 1 0-1.42-1.42l-5 5a1 1 0 0 0-.21.33 1 1 0 0 0 0 .76 1 1 0 0 0 .21.33l5 5a1.002 1.002 0 0 0 1.639-.325 1 1 0 0 0-.219-1.095L9.41 13H17a1 1 0 0 0 0-2Z"/></svg><span class="astro-jgq3vlii">Previous<br class="astro-jgq3vlii"><span class="link-title astro-jgq3vlii">Configuration</span></span></a><a href="/reference/fleet-auth-cutover/" rel="next" class="astro-jgq3vlii"><svg aria-hidden="true" class="astro-jgq3vlii astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.5rem;"><path d="M17.92 11.62a1.001 1.001 0 0 0-.21-.33l-5-5a1.003 1.003 0 1 0-1.42 1.42l3.3 3.29H7a1 1 0 0 0 0 2h7.59l-3.3 3.29a1.002 1.002 0 0 0 .325 1.639 1 1 0 0 0 1.095-.219l5-5a1 1 0 0 0 .21-.33 1 1 0 0 0 0-.76Z"/></svg><span class="astro-jgq3vlii">Next<br class="astro-jgq3vlii"><span class="link-title astro-jgq3vlii">Fleet-Auth Cutover Runbook</span></span></a></div></footer></div></div></main></div></div></div></div></body></html>
