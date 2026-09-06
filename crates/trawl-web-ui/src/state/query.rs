@@ -68,9 +68,6 @@ pub struct UrlSignals {
     pub mode: Memo<Mode>,
     pub filters: Memo<Vec<Filter>>,
     pub range: Memo<RangeSpec>,
-    // Read by the search page's gate and its banner, both of which land
-    // with the wiring.
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub malformed: Memo<Option<Malformed>>,
 }
 

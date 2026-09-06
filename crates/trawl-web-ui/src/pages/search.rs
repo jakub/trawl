@@ -27,11 +27,13 @@ use crate::components::editor_wrap::EditorWrap;
 use crate::components::export_modal::ExportModal;
 use crate::components::facet_sidebar::FacetSidebar;
 use crate::components::histogram::Histogram;
+use crate::components::malformed_notice::MalformedNotice;
 use crate::components::meta_strip::MetaStrip;
 use crate::components::results_table::ResultsTable;
 use crate::components::save_as_net_modal::SaveAsNetModal;
 use crate::components::status_bar::StatusKind;
 use crate::pages::layout::ShellStatus;
+use crate::search_url::Param;
 use crate::state::query::{
     Filter, Mode, RangeSpec, UrlSignals, effective_query, navigator, url_signals,
 };
@@ -85,14 +87,22 @@ pub fn Search() -> impl IntoView {
         mode,
         filters,
         range,
-        ..
+        malformed,
     } = url_signals();
 
     Effect::new(move |_| {
         query_text.set(executed_q.get());
     });
 
+    // A link whose structured state could not be read runs nothing
+    // (ADR-0027). An empty effective query is the one gate the page
+    // already has: the snapshot resource short-circuits it without a
+    // POST, and the live-tail effect returns before opening a stream.
+    // The memos below still carry their defaults, so the page renders.
     let effective_q = Memo::new(move |_| {
+        if malformed.with(Option::is_some) {
+            return String::new();
+        }
         let base = executed_q.get();
         let fs = filters.get();
         let r = range.get();
@@ -220,6 +230,25 @@ pub fn Search() -> impl IntoView {
         })
     };
 
+    // The repair the banner offers. Every memo already falls back to
+    // its default for the parameter that could not be read, so
+    // rebuilding the URL out of them IS the repair — the unreadable
+    // value is simply not written back. `replace` so the broken link
+    // does not become a Back destination.
+    let on_repair = {
+        let goto = goto.clone();
+        Callback::new(move |()| {
+            goto(
+                &executed_q.get_untracked(),
+                page.get_untracked(),
+                mode.get_untracked(),
+                &filters.get_untracked(),
+                &range.get_untracked(),
+                true,
+            );
+        })
+    };
+
     let on_navigate_q = {
         let goto = goto.clone();
         Callback::new(move |new_q: String| {
@@ -337,6 +366,13 @@ pub fn Search() -> impl IntoView {
     let on_export = Callback::new(move |()| show_export_modal.set(true));
     let running = loading;
 
+    let malformed_sig = Signal::derive(move || malformed.get());
+    // The chip strip's own admission that the filters on screen are not
+    // the filters in the link.
+    let filters_unreadable = Signal::derive(move || {
+        malformed.with(|m| m.as_ref().is_some_and(|m| m.param == Param::Filters))
+    });
+
     let filters_sig = Signal::derive(move || filters.get());
     let range_sig = Signal::derive(move || range.get());
 
@@ -361,8 +397,10 @@ pub fn Search() -> impl IntoView {
                 <MetaStrip
                     truncated=truncated
                     filters=filters_sig
+                    filters_unreadable=filters_unreadable
                     on_remove=on_remove_filter
                 />
+                <MalformedNotice malformed=malformed_sig on_repair=on_repair/>
                 <Tabs
                     items=vec![
                         TabItem::with_count(ResultsTab::Events.id(), "Events", last_count),

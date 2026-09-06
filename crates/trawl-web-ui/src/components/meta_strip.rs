@@ -20,11 +20,19 @@ pub fn MetaStrip(
     /// calls `on_remove` with its index.
     #[prop(into)]
     filters: Signal<Vec<Filter>>,
+    /// True when the link's `f` parameter could not be read at all. The
+    /// chips beside this one are then the empty fallback, not the
+    /// link's filters, so the strip says so rather than looking like a
+    /// query with no filters (ADR-0027).
+    #[prop(into)]
+    filters_unreadable: Signal<bool>,
     /// Called with the index of a filter to remove.
     on_remove: Callback<usize>,
 ) -> impl IntoView {
     view! {
-        <Show when=move || truncated.get() || filters.with(|f| !f.is_empty())>
+        <Show when=move || {
+            truncated.get() || filters.with(|f| !f.is_empty()) || filters_unreadable.get()
+        }>
             <div class="meta">
                 <div class="meta-chips">
                     {move || filters.get().into_iter().enumerate().map(|(i, f)| {
@@ -48,6 +56,9 @@ pub fn MetaStrip(
                             </span>
                         }
                     }).collect::<Vec<_>>()}
+                    <Show when=move || filters_unreadable.get()>
+                        <span class="chip bad">"filters unreadable"</span>
+                    </Show>
                 </div>
                 <Show when=move || truncated.get()>
                     <span class="dim">"Truncated"</span>

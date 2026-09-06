@@ -27,10 +27,6 @@
 //!   input to the SPA.
 
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-// The verdict's display half (the banner's sentence, its repair label,
-// the truncated raw value) has no browser consumer until the wiring
-// checkpoint mounts the notice component over it.
-#![cfg_attr(target_arch = "wasm32", allow(dead_code))]
 
 use std::fmt::Write as _;
 
@@ -62,9 +58,12 @@ pub const MAX_FILTER_VALUE_BYTES: usize = 1024;
 
 /// Characters a percent-encoded reserved set exercises, shared by the
 /// native table test and the browser spec so both pin one literal.
+/// Evidence, not app code: nothing in the browser build reads it.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub const RESERVED_SET: &str = " #&/:%'!~*()日本語😀";
 /// [`RESERVED_SET`] as `percent_encode` renders it, which is also what
 /// the browser's own `encodeURIComponent` renders.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub const RESERVED_SET_ENCODED: &str =
     "%20%23%26%2F%3A%25'!~*()%E6%97%A5%E6%9C%AC%E8%AA%9E%F0%9F%98%80";
 

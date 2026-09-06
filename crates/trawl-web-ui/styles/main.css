@@ -521,6 +521,15 @@
 }
 .meta .chip.excl .x { color: var(--red); }
 .meta .chip.excl .x:hover { background: var(--red); color: var(--on-accent); }
+/* The link's filters could not be read at all — the chips beside this
+ * one are the empty fallback, not what the link says. No remove control:
+ * there is nothing to remove, only a link to repair. */
+.meta .chip.bad {
+  background: var(--red-wash);
+  border-color: var(--red);
+  color: var(--red);
+  padding: 1px 8px;
+}
 
 /* ─────────────────────────────────────────────────────────────────
  *  Tabs — base .tabs family moved to fleet-ui.css (issue #28,
@@ -574,6 +583,53 @@
 }
 .deg-x:hover { color: var(--ink); background: var(--panel-2); }
 .deg-x:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* ─────────────────────────────────────────────────────────────────
+ *  Malformed-link notice (ADR-0027) — a search URL whose structured
+ *  state could not be read. Red rather than the degraded notice's
+ *  yellow: nothing ran, and the results area below is empty. The
+ *  .url-live wrapper is the persistent aria-live region and carries no
+ *  box of its own.
+ * ─────────────────────────────────────────────────────────────── */
+.url-live { flex-shrink: 0; }
+.url-notice {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 14px;
+  background: var(--red-wash);
+  border-bottom: 1px solid var(--line);
+  font-family: var(--font-ui);
+  font-size: var(--fs-dense);
+  line-height: 1.5;
+  color: var(--ink-2);
+}
+.url-notice-text { flex: 1; min-width: 0; }
+/* The raw value is address-bar text: keep it on one line and let it be
+ * cut rather than reflow the notice around a 4 KiB payload. */
+.url-notice-raw {
+  font-family: var(--font-mono);
+  color: var(--ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: inline-block;
+  vertical-align: bottom;
+  max-width: 100%;
+}
+.url-notice-repair {
+  flex-shrink: 0;
+  cursor: pointer;
+  padding: 3px 10px;
+  background: var(--panel);
+  border: 1px solid var(--red);
+  border-radius: var(--radius-ctl);
+  color: var(--red);
+  font-family: var(--font-ui);
+  font-size: var(--fs-dense);
+}
+.url-notice-repair:hover { background: var(--red); color: var(--on-accent); }
+.url-notice-repair:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
 /* ─────────────────────────────────────────────────────────────────
  *  Histogram — 78px strip on Events
@@ -929,6 +985,16 @@
   border-top: 1px solid var(--line-2);
 }
 .dr-pop .foot .btns { display: flex; gap: 6px; }
+/* Wrapper around fleet-ui's Apply button, which takes no class of its
+ * own; inline-flex so it is exactly the button's box. */
+.dr-apply { display: inline-flex; }
+/* What Apply refused. The popover stays open while this shows. */
+.dr-pop .dr-err {
+  font-family: var(--font-ui);
+  font-size: var(--fs-dense);
+  line-height: 1.4;
+  color: var(--red);
+}
 .dr-pop .rt-hint {
   padding: 6px 2px;
   font-family: var(--font-ui);

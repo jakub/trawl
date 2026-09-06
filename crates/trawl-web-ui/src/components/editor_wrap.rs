@@ -14,6 +14,7 @@ use leptos::prelude::*;
 use leptos::web_sys;
 
 use crate::components::editor::DslEditor;
+use crate::search_url::{Verdict, decode_range, encode_range, normalize_instant};
 use crate::state::query::{QUICK_RANGES, RangeSpec};
 use fleet_ui::{
     Btn, CopyButton, Icon, IconView, Kbd, Segmented, SegmentedOption, Size, ToastBus, ToastKind,
@@ -173,6 +174,11 @@ fn DateRangePopover(
     };
     let from = RwSignal::new(initial_from);
     let to = RwSignal::new(initial_to);
+    // What Apply refused, shown under the inputs. The popover stays open
+    // while it is set: an instant the app cannot normalize must not
+    // reach the URL, where it would come back as an unreadable link
+    // (ADR-0027).
+    let error = RwSignal::new(None::<&'static str>);
 
     let close = move || open.set(false);
 
@@ -188,7 +194,39 @@ fn DateRangePopover(
             close();
             return;
         }
-        on_change.run(RangeSpec::Absolute { from: f, to: t });
+        // Both bounds are normalized to canonical UTC here, so what the
+        // URL carries is what the reader accepts back: an offset or a
+        // fraction is fine to type and never fine to store.
+        let Some(from_utc) = normalize_instant(&f) else {
+            error.set(Some(
+                "From needs a timestamp like 2026-04-18T00:00:00Z (an offset is fine).",
+            ));
+            return;
+        };
+        let to_utc = if t.trim().is_empty() || t.trim() == "now" {
+            "now".to_string()
+        } else if let Some(normalized) = normalize_instant(&t) {
+            normalized
+        } else {
+            error.set(Some(
+                "To needs a timestamp like 2026-04-18T00:00:00Z, or the word now.",
+            ));
+            return;
+        };
+        let picked = RangeSpec::Absolute {
+            from: from_utc,
+            to: to_utc,
+        };
+        // The picker may only emit a range the URL reader accepts back,
+        // so it asks the reader rather than restating its rules. Both
+        // bounds are canonical by now, which leaves exactly one way to
+        // fail: they are the wrong way round.
+        if !matches!(decode_range(&encode_range(&picked)), Verdict::Valid(_)) {
+            error.set(Some("To is before From."));
+            return;
+        }
+        error.set(None);
+        on_change.run(picked);
         close();
     });
 
@@ -233,6 +271,7 @@ fn DateRangePopover(
                         <div class="fld">
                             <div class="lb">"From"</div>
                             <input
+                                class="dr-from"
                                 prop:value=move || from.get()
                                 on:input=move |e| from.set(event_target_value(&e))
                                 placeholder="2026-04-18T00:00:00Z"
@@ -241,11 +280,15 @@ fn DateRangePopover(
                         <div class="fld">
                             <div class="lb">"To"</div>
                             <input
+                                class="dr-to"
                                 prop:value=move || to.get()
                                 on:input=move |e| to.set(event_target_value(&e))
                                 placeholder="now"
                             />
                         </div>
+                        <Show when=move || error.get().is_some()>
+                            <div class="dr-err">{move || error.get().unwrap_or_default()}</div>
+                        </Show>
                     </div>
                     <div class="foot">
                         <div class="btns">
@@ -253,7 +296,12 @@ fn DateRangePopover(
                                 variant=Variant::Secondary
                                 on_click=Callback::new(move |()| close())
                             >"Cancel"</Btn>
-                            <Btn variant=Variant::Primary on_click=apply_absolute>"Apply"</Btn>
+                            // fleet-ui's Btn takes no class prop, so the
+                            // browser suite's hook rides a wrapper that
+                            // is exactly the button's own box.
+                            <span class="dr-apply">
+                                <Btn variant=Variant::Primary on_click=apply_absolute>"Apply"</Btn>
+                            </span>
                         </div>
                     </div>
                 }.into_any(),

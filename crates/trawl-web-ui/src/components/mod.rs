@@ -30,6 +30,7 @@ pub mod export_modal;
 pub mod facet_sidebar;
 pub mod field_case_drawer;
 pub mod histogram;
+pub mod malformed_notice;
 pub mod meta_strip;
 pub mod net_drawer;
 pub mod repin_modal;
