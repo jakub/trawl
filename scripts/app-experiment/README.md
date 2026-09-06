@@ -43,6 +43,52 @@ The successful result is exit code 0 and `status: passed` in that run's
 succeeded, not that the experiment passed. Credentials, TLS keys, databases,
 and data files disappear after cleanup; reports remain.
 
+## Create an experiment
+
+Before running, write a short brief outside the disposable worktree. Record:
+
+- Hypothesis and decision, for example whether a query change lowers p95 at
+  the same event count without changing any returned ID or status.
+- Baseline commit, candidate change, seed, event count, batch size, target
+  rate, and number of repeats. Keep these fixed for comparisons.
+- Oracle, meaning the expected result computed independently of the app.
+  The built-in oracle checks every sequence ID and status, rejects duplicate
+  or truncated results, and checks the expected browser page size.
+- Measurements and acceptance criteria chosen before running. Name the
+  metric, phase, threshold, and allowed variation. Include correctness and
+  cleanup in the decision even for a performance experiment.
+- Evidence destination and known exclusions. State whether the built-in
+  valid HTTP workload answers the question or needs a custom scenario.
+
+For a new experiment, start from the current local `main`. These Bash
+commands create a separate branch and worktree. Choose a fresh slug once
+and retain these variables for the later evidence and removal steps:
+
+```bash
+experiment_repo=/home/jakub/code/trawl
+experiment_slug=query-latency-20260906
+experiment_wt="$experiment_repo/.worktrees/$experiment_slug"
+experiment_evidence="$HOME/trawl-experiment-evidence/$experiment_slug"
+git -C "$experiment_repo" status --short
+git -C "$experiment_repo" log -1 --format='%H %s' main
+git -C "$experiment_repo" worktree add -b "chore/$experiment_slug" "$experiment_wt" main
+install -d -m 700 "$experiment_evidence"
+git -C "$experiment_wt" rev-parse HEAD > "$experiment_evidence/base-commit.txt"
+```
+
+This does not fetch or update `main`. If the question requires the latest
+remote code, update it through the repository's normal Git workflow before
+creating the worktree. If the question names an existing candidate branch,
+use its assigned worktree and record that commit instead. Do not reset or
+stash unrelated changes. A worktree missing `bin/app-experiment` needs the
+runner change integrated before this guide applies.
+
+Write the brief to `$experiment_evidence/notes.md`. Set subsequent tool
+commands' working directory to `$experiment_wt`, or use a subshell such as
+`(cd "$experiment_wt" && bin/app-experiment --help)`. Do not run the experiment
+from the persistent developer checkout. Complete the prerequisites below,
+then run the baseline without `--skip-build` and retain its exact report path.
+
 ## Setup and build cache
 
 Use Linux with these prerequisites:
@@ -254,6 +300,85 @@ inspect its `instance.json` and the container's `trawl.experiment` label before
 removing that exact container. A normal failure, SIGINT, or SIGTERM follows
 the cleanup path and reports its outcome.
 
+### Verify teardown and recover a forced stop
+
+For normal completion, let the foreground runner exit and read its exact
+`report.json`. Require `cleanup.processes`, `cleanup.container`, and
+`cleanup.secrets` to be true. For SIGINT or SIGTERM, wait for that same final
+report before treating cleanup as complete. Keep the exit status with the
+report; an interrupted hold is not an exit-0 pass.
+
+The commands below use Python 3 to read only ownership metadata. Set the run
+path to the one printed by this execution, not the newest directory found
+by a glob. These are inspection commands and do not stop anything:
+
+```bash
+experiment_run="$experiment_wt/target/app-experiments/REPLACE_WITH_PRINTED_RUN_ID"
+experiment_run_id=$(basename -- "$experiment_run")
+python3 - "$experiment_run" <<'PY_CHECK'
+import json, pathlib, sys
+run = pathlib.Path(sys.argv[1])
+for name in ('report.json', 'instance.json'):
+    path = run / name
+    if path.exists():
+        value = json.loads(path.read_text())
+        keys = ('runId', 'status', 'cleanup', 'processes') if name == 'report.json' else ('runId', 'container', 'pids')
+        print(name, {key: value.get(key) for key in keys})
+print('private directory exists:', (run / 'private').exists())
+PY_CHECK
+docker --host unix:///var/run/docker.sock ps --all \
+  --filter "label=trawl.experiment=$experiment_run_id" \
+  --format '{{.ID}} {{.Names}} {{.Status}}'
+```
+
+An unavailable Docker daemon leaves container cleanup unknown. An empty
+successful inventory query confirms no container with this run's label.
+After SIGKILL or host loss, the report may be absent or stale. `instance.json`
+is written after startup and again after restart, so its PIDs may be stale
+and early failures may have no instance file at all.
+
+To remove an orphaned container, first establish the exact name and full ID
+from that run's instance file and live label-filtered inventory. If the
+instance file is missing, use the exact run ID and inspect the matching
+container's name, creation time, and label before selecting it. Never select
+a container by a name prefix alone. Then remove by its immutable full ID so
+a concurrent name replacement cannot redirect the removal:
+
+```bash
+experiment_container=REPLACE_WITH_VERIFIED_EXACT_NAME
+experiment_container_id=$(docker --host unix:///var/run/docker.sock inspect \
+  --format '{{.Id}}' "$experiment_container")
+experiment_owner=$(docker --host unix:///var/run/docker.sock inspect \
+  --format '{{index .Config.Labels "trawl.experiment"}}' "$experiment_container_id")
+if [ -n "$experiment_container_id" ] && [ "$experiment_owner" = "$experiment_run_id" ]; then
+  docker --host unix:///var/run/docker.sock rm --force "$experiment_container_id"
+else
+  printf '%s\n' 'Ownership not established; no container removed.' >&2
+fi
+```
+
+Repeat the inventory check afterward. Do not run Docker prune or remove
+shared volumes, databases, or developer instances.
+
+Never signal a PID or process group copied from `instance.json` or a report.
+For possible orphan processes, inspect live `/proc/<pid>/exe`, command line,
+working directory, start time, and parent/group membership. The command line
+must reference this exact run's private config, or a browser must have proven
+ancestry from this run. Do not dump process environments, which contain
+credentials. A matching name or PID is insufficient. The runner has no
+orphan-process cleanup command. If manual termination is needed, use a
+supervisor handle or Linux pidfd tied to the verified process and recheck its
+identity after acquiring the handle. If ownership cannot be established,
+leave it running and report cleanup as unknown instead of using `pkill` or
+killing a possibly reused PID.
+
+Only after every owned process and container is confirmed gone, remove any
+remaining `private` directory under this exact run path. Verify the resolved
+path first and refuse a symlink or a path outside the selected run. Preserve
+diagnostic artifacts but do not copy the residual private directory to the
+evidence archive. Do not overwrite the original report to turn manual
+recovery into a passing run; record recovery separately in `notes.md`.
+
 Focused generator and result-oracle tests:
 
 ```bash
@@ -331,7 +456,26 @@ cannot leave an incomplete publication between the check and the pause.
 The publication lock coordinates one daemon. It does not promise exactly-once
 ingestion across client retries or crash-time WAL replay, and it cannot
 coordinate another process writing the same archive. See
-[ADR-0023](../../docs/adr/0023-compaction-publication-consistency.md).
+[ADR-0026](../../docs/adr/0026-compaction-publication-consistency.md).
+
+For a custom scenario, follow this sequence:
+
+1. Save a passing baseline report before editing the generator or runner.
+2. Change `corpus()` for the new deterministic input and compute expected
+   values from those inputs. Extend the oracle when testing new columns or
+   aggregates. Do not derive the expected count from the response under test.
+3. Add generator and oracle tests that deliberately lose, duplicate, corrupt,
+   or truncate the new results. Run the focused Node tests below before a
+   full build.
+4. Add only the required configuration, query, browser action, or measurement
+   phase in `run.mjs`. Retain isolation, deadlines, existing correctness
+   phases, and cleanup. New transport or configuration coverage needs its own
+   assertions, not merely a changed setting.
+5. Run the custom scenario without `--skip-build`, repeat with the planned
+   seeds, and run lifecycle tests after runner changes. Keep baseline and
+   candidate commands identical except for the variable under test.
+6. Preserve the custom source diff and any new files with the evidence. A
+   custom experiment is not reproducible from its CLI flags alone.
 
 Read source only for the component being changed:
 
@@ -348,3 +492,82 @@ Cargo target as preparation. Application changes require the relevant
 application tests and a run without `--skip-build`. Update this guide and the
 root agent quick start when commands, prerequisites, or the scenario contract
 change.
+
+## Preserve evidence and remove the worktree
+
+Finish teardown before this step. Copy each exact run directory you used,
+including failed baselines, into the private evidence destination. The
+following refuses to copy a run whose private directory still exists:
+
+```bash
+if [ ! -e "$experiment_run/private" ] && [ ! -L "$experiment_run/private" ]; then
+  cp -a -- "$experiment_run" "$experiment_evidence/"
+else
+  printf '%s\n' 'Private data remains; complete teardown before copying evidence.' >&2
+fi
+git -C "$experiment_wt" rev-parse HEAD > "$experiment_evidence/tested-commit.txt"
+git -C "$experiment_wt" diff --binary HEAD > "$experiment_evidence/candidate.patch"
+git -C "$experiment_wt" status --short > "$experiment_evidence/worktree-status.txt"
+```
+
+The patch captures tracked changes only. Preserve any intended untracked
+scenario files separately, or commit the experiment changes through the
+normal repository workflow. Save exact commands, exit codes, environment
+choices such as `CARGO_TARGET_DIR`, and the brief beside the copied reports.
+Verify the copied `report.json`, corpus, and any artifacts cited by your
+conclusion exist before removing the worktree. Raw traces remain private;
+inspect and redact evidence before sharing it. PR evidence must use committed
+SHA-pinned files or the private artifact publisher with `--keep`.
+
+From outside the worktree, inspect its state and use ordinary Git removal:
+
+```bash
+git -C "$experiment_wt" status --short
+git -C "$experiment_repo" worktree remove "$experiment_wt"
+git -C "$experiment_repo" worktree list
+```
+
+If Git refuses removal, inspect and preserve the remaining changes. Do not
+add `--force`. Keep the experiment branch until its code and evidence have
+been reviewed; remove it later through the normal Git workflow. An external
+Cargo cache is independent of the worktree and may still serve other runs.
+
+## Result template and agent prompts
+
+Use this structure in the saved notes and final handoff:
+
+```text
+Hypothesis and acceptance criteria:
+Baseline and candidate commits, source changes, runner/build hashes:
+Host, toolchain, Cargo target, preparation command:
+Commands, seed, count, batch size, target rate, repeats:
+Exact run paths and exit statuses:
+Oracle and phase results, including expected/observed counts:
+Ingest sent/accepted/rejected/ambiguous batches:
+Measurements by run and phase, units, sample counts, variation:
+Decision against the original criteria:
+Cleanup flags, live ownership checks, any manual recovery:
+Evidence location and retained custom scenario files:
+Limitations and checks not run:
+```
+
+For a routine check, a sufficient agent request is:
+
+> Create an isolated experiment worktree from main. Follow the AGENTS quickstart
+> and app-experiment runbook. Run seed 42 with 1000 events at rate 200, then
+> seed 43 with 2000 events at rate 400. Require every built-in oracle and
+> cleanup check. Preserve both reports outside the worktree, report the
+> results and limitations, and remove the clean worktree after teardown.
+> Do not change application code.
+
+For a custom experiment:
+
+> Create an isolated experiment worktree from main. Test whether the proposed
+> query change lowers HTTP query p95 by at least 10 percent for seed 44,
+> 10000 events, batch size 1000, and target rate 2000. Run three baselines and
+> three candidates on the same host. Preserve every ID and status check.
+> Define any additional measurement phase and expected results before coding
+> it, add oracle failure tests, and run the real scenario and lifecycle tests.
+> Treat mixed-corpus latency samples as exploratory unless a fixed-corpus
+> measurement phase is added. Retain commands, changes, and evidence outside
+> the worktree. Report a failed hypothesis if the evidence does not support it.

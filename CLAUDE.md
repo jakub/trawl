@@ -82,6 +82,13 @@ trawld, session proxy, Chromium, and synthetic HTTP corpus. It needs no Fleet
 profile, existing dev instance, shared database, or manually supplied key.
 `AGENTS.md` points to this file; keep this workflow here, not in a separate skill.
 
+Create a fresh `chore/<experiment-slug>` worktree from the selected `main`
+commit, or use the assigned candidate worktree. Record the hypothesis,
+seed/count/batch/rate, expected results, measurement threshold, and evidence
+destination before running. The runbook includes exact worktree commands and
+a reusable result template. Routine runs need no initial source reading;
+custom scenarios start with a retained baseline and an independent oracle.
+
 Run from the selected worktree, using the tool's working-directory setting:
 
 ```bash
@@ -113,7 +120,7 @@ bin/app-experiment --skip-build --hold-seconds 600
   --no-default-features --test publication_consistency` with the same Cargo
   target for a deterministic publication-race check, then rebuild the app
   before a full experiment. An unfinished rollup returns 503 until recovery;
-  the detailed guide explains diagnosis. See ADR-0023 for the guarantee and
+  the detailed guide explains diagnosis. See ADR-0026 for the guarantee and
   its single-daemon scope.
 - A hold starts after browser, live-tail, compaction, and restart checks pass.
   Use the printed URL and `private/browser-key` path while it runs. Keep the
@@ -127,6 +134,14 @@ bin/app-experiment --skip-build --hold-seconds 600
   Report that as an interrupted hold with completed checks only if the
   `browser-session-after-restart` phase exists and cleanup succeeded. Let
   the hold expire naturally for an exit-0, `passed` result.
+- Test generator/oracle edits with `node --test scripts/app-experiment/workload.test.mjs`, then run the real scenario.
+  Test runner/lifecycle edits with `node scripts/app-experiment/lifecycle.test.mjs`
+  after preparation using the same Cargo target. These tests start real apps.
+- Before removing the worktree, confirm teardown and copy every cited run's
+  artifacts plus commands and candidate changes to a private location outside
+  it. Use ordinary `git worktree remove` from outside the worktree after
+  preserving changes. A forced stop requires the runbook's live ownership
+  checks. Never kill PIDs from a report or prune Docker resources.
 - Report commit/build identity, seed/count/rate, result checks, timings, and
   cleanup. Evidence includes metrics, `queries.ndjson`, memory samples, logs,
   screenshots, and a browser trace. Debug-server timings are not release
