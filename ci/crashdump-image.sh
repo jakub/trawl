@@ -43,6 +43,9 @@ readonly PTRACE_CAP_BIT=19
 readonly YAMA=/proc/sys/kernel/yama/ptrace_scope
 readonly DUMP_DIR=/tmp/cores
 readonly CFG_FIFO=/tmp/cfg
+# Touched inside the container by the config-FIFO writer this script holds open,
+# the moment that writer's open() returns. See hold_config.
+readonly CFG_HELD=/tmp/cfg-held
 
 # How long to wait for each observable. Generous: a debug-profile trawld is a
 # few hundred MB and the monitor walks its whole address space.
@@ -55,10 +58,12 @@ readonly EXEC_WAIT_SECS=60
 # trawld reached the config read, which is after init() has run to completion.
 readonly NO_MONITOR_WATCH_SECS=5
 
-# trawld parked at an unopened FIFO sits right after `trawl_crashdump::init()`
-# and before anything else: the monitor is up, the daemon is sealed, and no
-# config has been read. That is the exact moment both /proc status files mean
-# what this script claims they mean.
+# trawld parked at the FIFO sits right after `trawl_crashdump::init()` returned
+# and before anything else: the monitor is up, the daemon is sealed, the fatal
+# signal handler is attached, and no config has been read. That is the exact
+# moment both /proc status files mean what this script claims they mean, and
+# hold_config is what waits for it. No step may infer it from the mere existence
+# of two trawld processes.
 #
 # `exec` is deliberately absent. Without it the container's pid 1 is the shell,
 # so trawld is an ordinary process: pid 1 in a pid namespace ignores signals
@@ -222,6 +227,8 @@ log_has() { logs "$1" | grep -qF "$2"; }
 crash_dump_line() { logs "$1" | grep -F 'event_type="crash_dump"' | head -n 1; }
 
 trawld_procs() { docker exec "$1" sh -c "$FIND_TRAWLD" 2>/dev/null | tr -d '\r'; }
+fifo_ready() { docker exec "$1" test -p "$CFG_FIFO" >/dev/null 2>&1; }
+config_held() { docker exec "$1" test -e "$CFG_HELD" >/dev/null 2>&1; }
 trawld_count() { trawld_procs "$1" | grep -c . || true; }
 have_procs() { [ "$(trawld_count "$1")" -ge "$2" ]; }
 
@@ -256,6 +263,35 @@ capture() {
   local out="$LOG_DIR/$3.status"
   docker exec "$1" cat "/proc/$2/status" >"$out" || die "cannot read /proc/$2/status in $1"
   printf '%s' "$out"
+}
+
+# hold_config <container>. Parks trawld at its config read, proves it got there,
+# and keeps it there.
+#
+# Opening a FIFO for writing returns only once something has opened the read
+# end. trawld's read end is `Config::from_file`, which main() reaches only after
+# `trawl_crashdump::init()` has RETURNED: monitor spawned, client connected,
+# monitor declared this process's ptracer, daemon sealed, fatal signal handler
+# attached. A writer whose open returned has therefore watched the whole install
+# finish. The writer then holds the descriptor and writes nothing, and a FIFO
+# with a live writer and no data reads as "not yet" rather than EOF, so trawld
+# stays parked for as long as the container lives.
+#
+# Counting two trawld processes proves none of that, which is why no step uses
+# it that way. The child exists from the moment it is forked, which is before
+# the parent connects to it, before PR_SET_PTRACER, before the seal and before
+# the handler exists: a status capture taken there can read a daemon that has
+# not sealed yet, and a SIGSEGV sent there can find the default disposition and
+# kill trawld with no dump at all.
+hold_config() {
+  # The writer must never be what CREATES the path. In the shell-fronted steps
+  # the container mkfifo's it at startup, and an ordinary file opened into
+  # existence here first would make that mkfifo fail.
+  wait_until "$PROC_WAIT_SECS" "the config FIFO exists in $1" fifo_ready "$1"
+  docker exec -d "$1" sh -c "exec 7>$CFG_FIFO; : >$CFG_HELD; sleep 86400" ||
+    die "cannot start a config-FIFO writer in $1"
+  wait_until "$EXEC_WAIT_SECS" "trawld in $1 is parked at its config read (init() returned)" \
+    config_held "$1"
 }
 
 # feed_config <container>. Unblocks trawld's config read.
@@ -392,7 +428,10 @@ start enabled-crash \
   --entrypoint sh "$IMAGE" -c "$FIFO_CMD"
 crash_c="$CONTAINER"
 
-wait_until "$PROC_WAIT_SECS" "trawld and its monitor are up" have_procs "$crash_c" 2
+# The handshake first, then the pids: hold_config is what makes the two status
+# captures and the SIGSEGV below land after the install, and resolve_pids is
+# what insists there are exactly two processes to read.
+hold_config "$crash_c"
 resolve_pids "$crash_c"
 parent_status="$(capture "$crash_c" "$PARENT_PID" 04-enabled-parent)"
 monitor_status="$(capture "$crash_c" "$MONITOR_PID" 04-enabled-monitor)"
@@ -421,14 +460,28 @@ logs "$crash_c" >"$LOG_DIR/04-enabled-crash.log"
 threads="$(mdmp_field "$crash_c" threads)"
 regions="$(mdmp_field "$crash_c" memory_regions)"
 note "threads=$threads memory_regions=$regions"
-# With the capability effective in the monitor, yama has nothing to say at any
-# scope below 3: the attach succeeds and the dump has real content. A dump with
-# no threads is the signature of a denied attach, which is what this proves is
-# not happening.
-[[ "$threads" =~ ^[0-9]+$ ]] && [ "$threads" -gt 0 ] ||
-  die "the minidump captured $threads threads; a denied ptrace attach writes exactly this"
-[[ "$regions" =~ ^[0-9]+$ ]] && [ "$regions" -gt 0 ] ||
-  die "the minidump captured $regions memory regions"
+[[ "$threads" =~ ^[0-9]+$ ]] || die "unparsable thread count: $threads"
+[[ "$regions" =~ ^[0-9]+$ ]] || die "unparsable region count: $regions"
+case "$scope" in
+  3)
+    # yama 3 refuses every attach, so the capability buys nothing here and even
+    # this monitor writes a header and no content. Steps 6b and 7a expect the
+    # same thing at scope 3, and so must this one.
+    [ "$threads" -eq 0 ] ||
+      die "at scope 3 the monitor captured $threads threads, which yama should have refused"
+    [ "$regions" -eq 0 ] ||
+      die "at scope 3 the monitor captured $regions memory regions, which yama should have refused"
+    ;;
+  *)
+    # Below scope 3 the effective capability licenses the attach on its own, so
+    # the dump has real content. An empty dump is the signature of a denied
+    # attach, which is what this proves is not happening.
+    [ "$threads" -gt 0 ] ||
+      die "the minidump captured $threads threads; a denied ptrace attach writes exactly this"
+    [ "$regions" -gt 0 ] ||
+      die "the minidump captured $regions memory regions"
+    ;;
+esac
 
 # ------------------------------------------------ step 5: the enabled verdict --
 
@@ -510,7 +563,7 @@ start misconfigured-crash \
   --entrypoint sh "$IMAGE" -c "$FIFO_CMD"
 misc_crash_c="$CONTAINER"
 
-wait_until "$PROC_WAIT_SECS" "trawld and its monitor are up" have_procs "$misc_crash_c" 2
+hold_config "$misc_crash_c"
 resolve_pids "$misc_crash_c"
 capture "$misc_crash_c" "$PARENT_PID" 06-misconfigured-parent >/dev/null
 capture "$misc_crash_c" "$MONITOR_PID" 06-misconfigured-monitor >/dev/null
@@ -570,7 +623,7 @@ start_as_init chart-shape-crash \
   --entrypoint /usr/bin/trawld "$IMAGE" --config "$CFG_FIFO" --no-monitor
 chart_c="$CONTAINER"
 
-wait_until "$PROC_WAIT_SECS" "trawld and its monitor are up" have_procs "$chart_c" 2
+hold_config "$chart_c"
 resolve_pids "$chart_c"
 chart_parent_status="$(capture "$chart_c" "$PARENT_PID" 07-chart-shape-parent)"
 chart_monitor_status="$(capture "$chart_c" "$MONITOR_PID" 07-chart-shape-monitor)"
