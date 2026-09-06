@@ -6,7 +6,7 @@
 //! server's [`DashboardSnapshot`] every ~2s as named `stats` events,
 //! wired into a single signal the `<StatusBar/>` footer reads.
 //!
-//! The caller (AuthShell) only opens the stream for admin sessions —
+//! The caller (`AuthShell`) only opens the stream for admin sessions —
 //! the endpoint is `ServerManage`-gated upstream. `EventSource`
 //! auto-reconnects on transient blips (cookie rides along); a
 //! permanently CLOSED source clears the signal so the footer group

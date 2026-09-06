@@ -23,7 +23,7 @@ use crate::state::app_mode::{self, AppMode};
 use crate::state::section;
 use crate::state::stats_stream::{StatsLifecycle, start_stats_stream};
 
-/// Shared status signals that the shell owns and the StatusBar reads.
+/// Shared status signals that the shell owns and the `StatusBar` reads.
 /// Search (or any page that wants to drive the status bar) writes to
 /// these via `use_context::<ShellStatus>()`.
 #[derive(Clone, Copy)]
@@ -34,6 +34,7 @@ pub struct ShellStatus {
 }
 
 #[component]
+#[allow(clippy::too_many_lines)] // shell chrome is one cohesive view tree
 pub fn AuthShell() -> impl IntoView {
     let me = RwSignal::new(None::<api::MeResponse>);
     let redirect_to_login = RwSignal::new(false);
@@ -148,7 +149,7 @@ pub fn AuthShell() -> impl IntoView {
                     status=Signal::derive(move || shell_status.kind.get())
                     count=Signal::derive(move || shell_status.count.get())
                     lagged=Signal::derive(move || shell_status.lagged.get())
-                    stats=admin_stats
+                    admin=admin_stats
                 />
             }.into_any())
             rail_bottom=Box::new(|| view! {
@@ -167,6 +168,7 @@ pub fn AuthShell() -> impl IntoView {
 
 /// Generic redirect component. Navigates to `path` on mount.
 #[component]
+#[allow(clippy::needless_pass_by_value)] // Leptos component props: easier to pass owned
 pub fn RedirectTo(#[prop(into)] path: String) -> impl IntoView {
     let path = path.clone();
     Effect::new(move |_| {
