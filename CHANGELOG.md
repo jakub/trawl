@@ -671,7 +671,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   no longer taken on trust either: trawld probes the monitor's capability sets,
   the yama scope, `PR_SET_PTRACER` and its own dumpable flag, then logs one
   `crash_dump` event whose `readiness` is `ready`, `denied`, `indeterminate` or
-  `failed`, with the masks and the dump directory beside it, so
+  `failed`, with the masks and the dump directory beside it, the one exception
+  being a failed seal, which is decided before the tracing subscriber exists and
+  so prints one stderr line and exits instead of logging an event, so
   `trawl query 'service=trawld event_type=crash_dump'` answers the question the
   old `trawl-crashdump: enabled` stderr line only looked like it answered. That
   line is gone, and the monitor's `wrote minidump` line carries `threads=` and

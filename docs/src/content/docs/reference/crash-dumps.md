@@ -165,8 +165,13 @@ that execs `trawld` already holds it, and in the chart that process is the
 container's init, since the image's `ENTRYPOINT` is `trawld` itself. Put a
 shell or an init shim in front of it and the shell drops the bit at its own
 exec; `trawld`'s exec is then a gain, `no_new_privs` strips it, and capture goes
-dead with nothing but the `denied` verdict to say so. Keep `trawld` as the
-container's first process, or grant escalation if you cannot.
+dead with nothing but the `denied` verdict to say so. So keep `trawld` as the
+container's first process. A wrapper entrypoint in front of it, a shell or an
+init shim, is not supported here. Setting the shared
+`securityContext.allowPrivilegeEscalation` to `true` in values would let the
+re-exec gain the bit again, but that map is inherited by every container in the
+pod, sidecars included, and the chart's render test asserts the `false`. It is
+an explicit weakening outside what the chart tests, not a documented fallback.
 
 The capability is still worth weighing before you enable, because neither
 built-in Pod Security profile admits it. Restricted refuses every added
@@ -323,8 +328,10 @@ crash ever happens.
 
 ## Checking that it can work
 
-trawld probes the setup at startup and logs one verdict. Nothing about the probe
-is lazy. By the time the line is written the monitor is connected, its capability
+trawld probes the setup at startup and logs one verdict. Every armed outcome and
+every failure but one is a single structured event. The exception is a failed
+seal, which is decided before the tracing subscriber exists and goes to stderr
+instead, described below. Nothing about the probe is lazy. By the time the line is written the monitor is connected, its capability
 sets have been read out of `/proc`, `PR_SET_PTRACER` has been issued with its
 return checked, and the daemon has sealed itself.
 
@@ -358,7 +365,7 @@ trawl query 'service=trawld event_type=crash_dump last=24h | table _time, readin
 | `ready` | The capability, yama and commoncap prerequisites hold | Nothing |
 | `denied` | A prerequisite is provably missing, so a crash writes a dump with zero threads | Read `ptrace_scope` and `missing` in the same event. `missing="CAP_SYS_PTRACE"` means the monitor never got the bit: a half-applied drop-in on Debian, or on kubernetes a capability that never reached the container, say because an admission policy stripped it. No `missing` at `ptrace_scope=3` means the node refuses every tracer and nothing you grant will change that |
 | `indeterminate` | An input was unreadable or malformed, so there is no verdict either way | Treat capture as unknown. `/proc` being unreadable usually means a container filesystem restriction or a monitor that exited during startup. Check `monitor_pid` is alive and read the masks by hand |
-| `failed` | Capture never armed. `reason` names the step that failed | `dump_dir` is a directory trawld cannot create or write. `spawn_monitor` and `monitor_unreachable` mean the re-exec did not come up. `seal` is fatal, see below |
+| `failed` | Capture never armed. `reason` names the step that failed | `dump_dir` is a directory trawld cannot create or write. `spawn_monitor` and `monitor_unreachable` mean the re-exec did not come up. A failed seal never reaches this event at all: trawld exits first, see below |
 
 `ready` is a necessary condition, not a promise. It covers the capability sets,
 the yama scope and commoncap's exec rules. It does not cover seccomp or an LSM,
@@ -366,15 +373,25 @@ and SELinux or AppArmor can refuse the attach after all of those pass, with the
 same empty-dump symptom. If the verdict says `ready` and dumps still come out
 empty, audit LSM policy for trawld.
 
-`reason="seal"` is the one failure that stops the daemon. It means trawld could
-not drop `CAP_SYS_PTRACE` from its own sets or could not set `no_new_privs`, and
-it exits with an error rather than serve queries holding ptrace power it said it
-would give up. Every other `reason` leaves trawld running normally with capture
-off.
+A failed seal is the one failure that stops the daemon, and the one you cannot
+query for. It means trawld could not drop `CAP_SYS_PTRACE` from its own sets or
+could not set `no_new_privs`, and it refuses to serve queries holding ptrace
+power it said it would give up. That check runs before the async runtime is
+built, which is before the tracing subscriber exists, so there is no
+`crash_dump` event and no `reason="seal"` field to read. What you get is one
+line on stderr and exit 1:
 
-No verdict disarms the handler. The signal handler is installed in every class,
-including `denied`, because a probe that is wrong about a working host must not
-be the reason you end up with no dump.
+```
+[trawld] crash-dump seal failed: refusing to start with an unsealed capability set (ADR-0023 ruling 4)
+```
+
+Every other `reason` leaves trawld running normally with capture off.
+
+No armed verdict disarms the handler. The signal handler is installed for
+`ready`, `denied` and `indeterminate` alike, because a probe that is wrong about
+a working host must not be the reason you end up with no dump. A `failed` start
+is the other case: capture never armed, so no handler is installed and a crash
+writes no dump at all.
 
 The monitor reports its own half on stderr, before it binds its socket:
 
