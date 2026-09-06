@@ -36,14 +36,21 @@ A link whose structured state does not parse is shown, not run.**
   contract. Nothing rewrites a URL on the user's behalf; there is no
   canonicalization pass.
 - **Malformed structured state refuses to run.** A bad `f`, a bad `r`, or
-  a `page` beyond the server's result cap leaves the query unexecuted and
-  shows a banner naming the parameter and echoing its raw value as text,
-  truncated. The banner offers one repair (drop filters, use last 15m,
-  page 0) that rewrites the URL only when clicked, with a replace
-  navigation. The broken URL stays intact until then so it can be sent
-  back to whoever shared it. An unparseable `page` is a missing value and
-  reads as 0; an out-of-range one is a false claim and is malformed. A
-  malformed versioned `f` is no longer "zero filters".
+  a `page` whose offset the request cannot carry leaves the query
+  unexecuted and shows a banner naming the parameter and echoing its raw
+  value as text, truncated. A page is malformed exactly when
+  `page * PAGE_SIZE` does not fit `MAX_OFFSET`, which is `u32::MAX`, the
+  browser's own `usize`. The server's `max_result_rows` is
+  per-deployment configuration that appears on no API response, so the
+  client does not mirror a number it cannot read: a page past the real
+  cap gets the server's 400 through the error banner the results pane
+  already has (run ruling 2026-09-06, closing a prep gap). The banner
+  offers one repair (drop filters, use last 15m, page 0) that rewrites
+  the URL only when clicked, with a replace navigation. The broken URL
+  stays intact until then so it can be sent back to whoever shared it. An
+  unparseable `page` is a missing value and reads as 0; an out-of-range
+  one is a false claim and is malformed. A malformed versioned `f` is no
+  longer "zero filters".
 - **Bounds are validated and escaped before they enter the DSL.** The
   client checks RFC 3339 (or `now` on the right) before emitting
   `_time>=`/`_time<=`, and the bound still goes through the DSL string
@@ -80,3 +87,9 @@ A link whose structured state does not parse is shown, not run.**
 - Slice E of #100 (date-range promotion to fleet-ui) reads `RangeSpec`
   through this contract; the `DateRange` component's props may change
   here, and E is named in the PR rather than frozen around.
+- Accepted gap: a link to page 2000 is inside the offset ceiling, so it
+  runs, and a default install answers it with the API error rather than
+  the malformed banner. One broken link, two different explanations.
+  Closing that means publishing the cap on a response, `/api/v1/health`
+  being the obvious place, which is its own decision and not a client
+  one.
