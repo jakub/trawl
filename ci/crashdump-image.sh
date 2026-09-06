@@ -145,7 +145,22 @@ cleanup() {
   fi
   exit "$status"
 }
-trap cleanup EXIT INT TERM
+# INT and TERM get their own handlers rather than sharing one with EXIT. A
+# signal delivered between two commands that succeeded enters the trap with $?
+# still 0, so a single `trap cleanup EXIT INT TERM` would tear the containers
+# down and exit 0: an interrupted proof reported as a passing one, which is the
+# worst answer this script can give. These record the conventional 128+signal
+# status and hand it to cleanup through `exit`, so cleanup's `$?` is non-zero.
+# Checked by extracting cleanup and the traps into a stub and sending it
+# SIGTERM between two `true`s: the stub exits 143.
+on_signal() { # on_signal <name> <status>
+  trap - INT TERM
+  printf '\n\n!! %s received. Removing containers and exiting %s.\n' "$1" "$2"
+  exit "$2"
+}
+trap 'on_signal SIGINT 130' INT
+trap 'on_signal SIGTERM 143' TERM
+trap cleanup EXIT
 
 # Step 7 runs trawld as the container's own init process, so nothing inside can
 # create its config FIFO first. One host-side FIFO is made here and copied into
