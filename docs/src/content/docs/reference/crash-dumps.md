@@ -140,8 +140,13 @@ trawl-crashdump: enabled (dir=/var/lib/trawl/cores, retain=10)
 That line means the monitor came up, not that the attach will be permitted.
 The ptrace grant is issued lazily, at crash time. So under scope 3, or with a
 half-applied drop-in that set the environment but not the capability, trawld
-logs exactly the same thing and the failure only shows up when a crash writes
-the stderr breadcrumb and no `.dmp` appears.
+logs exactly the same thing — and worse, a crash can still produce a `.dmp`
+that looks healthy from the outside. When the monitor cannot ptrace the
+crashed process it writes the dump anyway, minus every thread and memory
+region: a small file with a valid header and nothing a debugger can use. The
+journal even records the usual `wrote minidump` line. A denied capture is
+only visible by opening the dump, or by its size (tens of kilobytes against
+hundreds for a real one).
 
 Do not try to force a crash to test this. Check the capability instead:
 
