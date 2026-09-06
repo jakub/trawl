@@ -531,6 +531,16 @@ EOF
     cargo build --release -p trawl-server -p trawl-admin -p fleet-admin -p trawl-web \
       --bin trawld --bin trawl-admin --bin fleet-admin --bin trawl-web
 
+  # The target directory is reused across runs, so a version bump leaves the
+  # previous release's .deb sitting beside the new one. Picking one of those with
+  # `find -print -quit` is picking by readdir order, which would happily certify
+  # a package this run did not build. Clear the output directory first, then
+  # require exactly one candidate afterwards.
+  if compgen -G "$target_dir/debian/*.deb" >/dev/null; then
+    note "clearing .deb files left in $target_dir/debian by an earlier run"
+    rm -f "$target_dir"/debian/*.deb
+  fi
+
   run docker run --rm --user "$(id -u):$(id -g)" \
     -v "$repo_root:/w" -w /w \
     -v "$CARGO_VOLUME:/usr/local/cargo/registry" \
@@ -538,9 +548,16 @@ EOF
     "$BUILDER_IMAGE" \
     cargo deb -p trawl-server --no-build --no-strip
 
-  DEB=$(find "$target_dir/debian" -name 'trawl-server_*.deb' -print -quit)
-  [[ -n "$DEB" ]] || die "cargo deb produced no package under $target_dir/debian"
+  mapfile -t deb_candidates < <(find "$target_dir/debian" -maxdepth 1 -name '*.deb' | sort)
+  case ${#deb_candidates[@]} in
+    0) die "cargo deb produced no package under $target_dir/debian" ;;
+    1) DEB="${deb_candidates[0]}" ;;
+    *) printf '%s\n' "${deb_candidates[@]}" | sed "s|$repo_root|\$REPO|"
+       die "${#deb_candidates[@]} .deb files under $target_dir/debian; refusing to guess which one this run built" ;;
+  esac
 fi
+
+note "installing $(basename "$DEB")"
 
 printf '\n$ sha256sum %s\n' "$(rel "$DEB")"
 sha256sum "$DEB" | sed "s|$repo_root|\$REPO|"
