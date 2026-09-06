@@ -152,22 +152,22 @@ if grep -Fq 'TRAWL_CRASH_DUMP_' "$disabled" || grep -Eq '^[[:space:]]*(- )?name:
   exit 1
 fi
 
-# -- ADR-0023 ruling 7: the escalation is trawld's alone -----------------
+# -- ADR-0023 ruling 7, amended: the capability is trawld's alone ------
 
-# CAP_SYS_PTRACE reaches the monitor through the cap_sys_ptrace+p file
-# capability on /usr/bin/trawld, and no_new_privs makes the kernel ignore
-# file capabilities. So an enabled trawld needs allowPrivilegeEscalation:
-# true or capture is armed and inert, which is the bug this chart change
-# closes. The sidecars must not come along for the ride, hence a render with
-# the web sidecar on: render_only defaults it off.
+# The added SYS_PTRACE is the whole grant. containerd hands it to the
+# container's init process as permitted and effective, and the image's
+# cap_sys_ptrace+p file capability keeps the bit across trawld's exec of the
+# monitor, so no_new_privs stays on: allowPrivilegeEscalation must render
+# false on trawld too. The sidecars must not come along for the ride, hence a
+# render with the web sidecar on: render_only defaults it off.
 security_enabled="$work_dir/security-enabled.yaml"
 render "${web_enabled[@]}" \
   --set persistence.enabled=true \
   --set crashDump.enabled=true \
   >"$security_enabled"
-assert_security_context_lines 1 '^ +allowPrivilegeEscalation: true$' \
+assert_security_context_lines 1 '^ +allowPrivilegeEscalation: false$' \
   "$security_enabled" trawld
-assert_security_context_lines 0 '^ +allowPrivilegeEscalation: false$' \
+assert_security_context_lines 0 '^ +allowPrivilegeEscalation: true$' \
   "$security_enabled" trawld
 assert_security_context_lines 1 '^ +- SYS_PTRACE$' "$security_enabled" trawld
 for sidecar in init-auth trawl-web; do
@@ -176,9 +176,9 @@ for sidecar in init-auth trawl-web; do
   assert_security_context_lines 0 '^ +- SYS_PTRACE$' "$security_enabled" "$sidecar"
 done
 
-# Disabled is not merely "no SYS_PTRACE": the shared securityContext still
-# has to render its explicit allowPrivilegeEscalation: false, so an install
-# that never enables crash dumps stays Restricted-compatible.
+# Disabled renders the shared securityContext untouched: an explicit
+# allowPrivilegeEscalation: false and no added capability at all, so an
+# install that never enables crash dumps stays Restricted-compatible.
 security_disabled="$work_dir/security-disabled.yaml"
 render "${web_enabled[@]}" \
   --set persistence.enabled=true \
@@ -201,7 +201,7 @@ render "${web_enabled[@]}" \
 assert_security_context_lines 1 '^ +- NET_BIND_SERVICE$' \
   "$security_operator_caps" trawld
 assert_security_context_lines 1 '^ +- SYS_PTRACE$' "$security_operator_caps" trawld
-assert_security_context_lines 1 '^ +allowPrivilegeEscalation: true$' \
+assert_security_context_lines 1 '^ +allowPrivilegeEscalation: false$' \
   "$security_operator_caps" trawld
 
 # -- ADR-0016: the browser-origin allowlist is stated, never derived -----

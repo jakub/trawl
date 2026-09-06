@@ -82,18 +82,18 @@ persistence:
 # the monitor to write a minidump to a dedicated PVC, then re-raises so the
 # process still exits and is restarted. The monitor ptraces the crashed trawld
 # (a process can't ptrace its own thread group), so the trawld container is
-# granted CAP_SYS_PTRACE and allowPrivilegeEscalation: true, only when this is
-# enabled and only on trawld (init-auth and trawl-web are untouched).
+# granted CAP_SYS_PTRACE, only when this is enabled and only on trawld
+# (init-auth and trawl-web are untouched).
 #
-# The escalation is not optional. The monitor holds CAP_SYS_PTRACE effective
-# only via the cap_sys_ptrace+p file capability stamped on /usr/bin/trawld, and
-# allowPrivilegeEscalation: false sets no_new_privs, which makes the kernel
-# ignore file capabilities on every exec. Listing SYS_PTRACE in the pod spec
-# without the escalation puts the bit in the bounding set alone, where no
-# non-root process can raise it. So enabling crash dumps is incompatible with
-# the Restricted Pod Security profile. A namespace that enforces Restricted
-# rejects the pod. Leave crash dumps off there, or run trawl in a Baseline
-# namespace.
+# That added capability is the whole grant. The container runtime hands it to
+# the container's init process as permitted and effective, and the
+# cap_sys_ptrace+p file capability stamped on /usr/bin/trawld keeps the bit
+# across trawld's exec of the monitor, so no_new_privs stays on and
+# allowPrivilegeEscalation stays false. Adding any capability other than
+# NET_BIND_SERVICE is still what the Restricted Pod Security profile refuses,
+# so enabling crash dumps is incompatible with Restricted. A namespace that
+# enforces it rejects the pod. Leave crash dumps off there, or run trawl in a
+# Baseline namespace.
 #
 # The dump PVC is separate from the data PVC, so dumps stay out of data backups
 # and survive container restarts, pod reschedules, and node reboots. Off by

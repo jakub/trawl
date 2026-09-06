@@ -117,9 +117,8 @@ resets every other value to the chart defaults.
 That one value is the whole enable step, the way copying the drop-in is on
 Debian. It sets `TRAWL_CRASH_DUMP_DIR` and `TRAWL_CRASH_DUMP_RETAIN` on the
 trawld container, mounts a dedicated `cores` PVC at `crashDump.mountPath`
-(`/var/lib/trawl/cores` by default), adds `SYS_PTRACE` to that container's
-capabilities and allows privilege escalation on it. The init-auth and trawl-web
-containers are untouched.
+(`/var/lib/trawl/cores` by default), and adds `SYS_PTRACE` to that container's
+capabilities. The init-auth and trawl-web containers are untouched.
 
 It requires `persistence.enabled=true`. With persistence off the chart
 refuses to render rather than writing dumps to pod-local storage that
@@ -138,30 +137,38 @@ not: `commoncap` fails `execve` with `EPERM` when a file's effective bit is set
 and the container's bounding set lacks one of that file's permitted
 capabilities, which describes every default pod.
 
-`capabilities.add` in a pod spec fills the container's **bounding** set, and for
-a container that does not run as root that is all it fills. Kubernetes has no
-field for the **ambient** set, and the feature that would add one, KEP-2763, is
-not GA. So the file capability is what puts the bit in a process's permitted
-set, and `SYS_PTRACE` in the bounding set is what allows it to stay there.
+`capabilities.add` in a pod spec is more than a bounding-set entry. containerd
+hands an added capability to the container's init process as permitted and
+effective, so trawld holds `CAP_SYS_PTRACE` from its first instruction. What the
+grant does not survive on its own is trawld's re-exec into the monitor: an
+`execve` of a file carrying no capabilities, by a process whose inheritable and
+ambient sets are empty, leaves the new process with an empty permitted set.
+Kubernetes has no field for the ambient set either, and the feature that would
+add one, KEP-2763, is not GA. The `cap_sys_ptrace+p` stamp is what carries the
+bit across that exec.
 
-That is why `crashDump.enabled=true` also sets `allowPrivilegeEscalation: true`,
-on the trawld container and on no other. `allowPrivilegeEscalation: false` sets
-`no_new_privs`, and the kernel ignores file capabilities on every `execve` by a
-`no_new_privs` process. Refuse the escalation and `SYS_PTRACE` sits in the
-bounding set where no non-root process can raise it, which is capture that arms,
-logs and produces empty dumps.
+`no_new_privs` does not object to that, which is the part worth stating plainly.
+`allowPrivilegeEscalation: false` sets `no_new_privs`, and the kernel enforces it
+by downgrading the new credentials only when an `execve` would grant a permitted
+set that is not a subset of the one the process already had. Here the file
+capability hands back a bit trawld already holds, so nothing is gained and
+nothing is stripped. A kind run at `ptrace_scope=2` with the pod at
+`allowPrivilegeEscalation: false` gave a monitor holding `CapEff=0x80000` under
+`NoNewPrivs: 1`, a `ready` verdict, and a dump with 34 threads. So the chart adds
+the capability and leaves escalation alone.
 
-Weigh that before enabling. A pod allowing privilege escalation cannot run under
-the Restricted Pod Security profile, and a namespace enforcing Restricted
-rejects it. The chart documents this rather than refusing to render, because
-admission policy is cluster state the chart cannot read. Leave crash dumps off
-in a Restricted namespace, or run trawl in a Baseline one.
+The capability is still worth weighing before you enable. The Restricted Pod
+Security profile refuses every added capability except `NET_BIND_SERVICE`, so a
+namespace enforcing Restricted rejects an enabled pod. The chart documents this
+rather than refusing to render, because admission policy is cluster state the
+chart cannot read. Leave crash dumps off in a Restricted namespace, or run trawl
+in a Baseline one.
 
 The monitor raises the capability to effective before it binds its socket, and
 trawld drops it from its own sets. See "The capability is the other half of the
 cost" below for what that buys and what it does not.
 
-With the escalation in place, kubernetes capture works at yama scope 0, 1 and 2,
+With the capability added, kubernetes capture works at yama scope 0, 1 and 2,
 the same values Debian works at. Scope 3 refuses every tracer on both channels.
 Check the startup verdict under "Checking that it can work" instead of assuming
 the chart's flag landed.
@@ -246,7 +253,7 @@ splits them.
 |-------|--------|--------|------------|
 | `0` | classic ptrace permissions | works | works |
 | `1` | attach limited to declared descendants | works: trawld calls `PR_SET_PTRACER` naming its own monitor | works, same mechanism |
-| `2` | admin-only attach | works: `CAP_SYS_PTRACE` from the drop-in is what "admin" means here | works: the monitor raises `CAP_SYS_PTRACE` from the image's file capability, which needs `crashDump.enabled=true` and the `allowPrivilegeEscalation: true` it sets |
+| `2` | admin-only attach | works: `CAP_SYS_PTRACE` from the drop-in is what "admin" means here | works: the monitor raises `CAP_SYS_PTRACE`, put in the container by `crashDump.enabled=true` and carried across the re-exec by the image's file capability |
 | `3` | no attach, ever | never works. The capability does not exempt anyone | never works |
 
 Scope 3 is a known limitation and there is no workaround: the setting is
@@ -256,7 +263,7 @@ crash dumps are not available there.
 Scope 2 asks the tracer for `CAP_SYS_PTRACE` held effective, and both channels
 now answer it. Debian's monitor gets the bit from the drop-in's ambient
 capability. The kubernetes monitor raises it from the image's file capability,
-which the chart's `allowPrivilegeEscalation: true` makes usable. Neither channel
+which holds open a bit the container was already granted. Neither channel
 is quiet when it goes wrong. The startup verdict below reports `denied` before a
 crash ever happens.
 
@@ -295,7 +302,7 @@ trawl query 'service=trawld event_type=crash_dump last=24h | table _time, readin
 | `readiness` | what it found | what to do |
 |-------------|---------------|------------|
 | `ready` | The capability, yama and commoncap prerequisites hold | Nothing |
-| `denied` | A prerequisite is provably missing, so a crash writes a dump with zero threads | Read `ptrace_scope` and `missing` in the same event. `missing="CAP_SYS_PTRACE"` means the monitor never got the bit, from a half-applied drop-in on Debian or a refused escalation on kubernetes. No `missing` at `ptrace_scope=3` means the node refuses every tracer and nothing you grant will change that |
+| `denied` | A prerequisite is provably missing, so a crash writes a dump with zero threads | Read `ptrace_scope` and `missing` in the same event. `missing="CAP_SYS_PTRACE"` means the monitor never got the bit: a half-applied drop-in on Debian, or on kubernetes a capability that never reached the container, say because an admission policy stripped it. No `missing` at `ptrace_scope=3` means the node refuses every tracer and nothing you grant will change that |
 | `indeterminate` | An input was unreadable or malformed, so there is no verdict either way | Treat capture as unknown. `/proc` being unreadable usually means a container filesystem restriction or a monitor that exited during startup. Check `monitor_pid` is alive and read the masks by hand |
 | `failed` | Capture never armed. `reason` names the step that failed | `dump_dir` is a directory trawld cannot create or write. `spawn_monitor` and `monitor_unreachable` mean the re-exec did not come up. `seal` is fatal, see below |
 
@@ -353,9 +360,9 @@ kubectl get pod -n <ns> <pod> \
   -o jsonpath='{.spec.containers[?(@.name=="trawld")].securityContext}'
 ```
 
-The first prints `/usr/bin/trawld cap_sys_ptrace=p`. The second must carry
-`allowPrivilegeEscalation` true and `SYS_PTRACE` among the added capabilities.
-One without the other is the inert case.
+The first prints `/usr/bin/trawld cap_sys_ptrace=p`. The second must list
+`SYS_PTRACE` among the added capabilities. Without it every capability set in
+the container reads zero and capture is inert, whatever `getcap` prints.
 
 When a dump is written, the monitor prints the two numbers that say whether it
 is worth keeping:

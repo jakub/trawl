@@ -658,12 +658,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `cap_sys_ptrace+p` on `/usr/bin/trawld`, permitted only and never effective,
   read back with `getcap` in the same build step so a lost xattr fails the
   build. The monitor raises that bit to effective before it binds its socket,
-  which is what scope 2 asks of a tracer, and `crashDump.enabled=true` now also
-  sets `allowPrivilegeEscalation: true` on the trawld container, because
-  `allowPrivilegeEscalation: false` sets `no_new_privs` and the kernel then
-  ignores file capabilities on every exec. Until now `capabilities.add` reached
-  the container's bounding set alone, so a scope-2 crash wrote a dump holding
-  zero threads while the log said `wrote minidump`. trawld itself drops
+  which is what scope 2 asks of a tracer, and that stamp is the whole fix: the
+  chart's `capabilities.add: [SYS_PTRACE]` already reached the container's init
+  process as permitted and effective, but nothing carried the bit across
+  trawld's re-exec into the monitor, so a scope-2 crash wrote a dump holding
+  zero threads while the log said `wrote minidump`. `allowPrivilegeEscalation`
+  stays `false` on every container. trawld itself drops
   `CAP_SYS_PTRACE` from its effective and permitted sets and sets
   `no_new_privs` once the monitor is connected, on the Debian channel too, so
   ptrace power lives in the monitor rather than in the process serving queries;

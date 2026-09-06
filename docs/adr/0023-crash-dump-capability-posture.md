@@ -4,13 +4,16 @@ status: accepted (2026-09-05) — prep ruling record for #21; binds the deb chan
 
 `trawl-crashdump` re-execs `trawld` as a monitor process that ptraces the
 crashed daemon and writes the minidump. Under `kernel.yama.ptrace_scope=2`
-the monitor must hold EFFECTIVE `CAP_SYS_PTRACE`. A Kubernetes container
-running as a non-root uid with `allowPrivilegeEscalation: false` never
-gets there: the chart's `capabilities.add: [SYS_PTRACE]` lands in the
-bounding set only, `no_new_privs` makes the kernel ignore file
-capabilities, and the ambient set has no Kubernetes field. Capture is
-armed and inert while startup prints `enabled`. The August 2026 fix
-stamped `cap_sys_ptrace+ep` on the binary. That would have broken the
+the monitor must hold EFFECTIVE `CAP_SYS_PTRACE`. It did not, on the
+chart as it stood. containerd grants `capabilities.add: [SYS_PTRACE]` to
+the container's INIT process as permitted and effective, so trawld itself
+held the bit, but trawld re-execs to become the monitor and the released
+binary carried no file capability. An `execve` of a file with no
+capabilities, by a process with an empty inheritable and ambient set,
+produces an empty permitted set. The bit died at that exec, every mask in
+`/proc/<monitor>/status` read zero, and capture was armed and inert while
+startup printed `enabled`. The August 2026 fix stamped `cap_sys_ptrace+ep`
+on the binary. That would have broken the
 DEFAULT pod: `security/commoncap.c` fails `execve` with `EPERM` when a
 file's effective bit is set and the bounding set lacks one of its
 permitted capabilities (the "`ping` in a `--cap-drop ALL` container"
@@ -22,8 +25,10 @@ that reading against 6.6, 6.12 and mainline.
 1. **One binary.** The monitor stays a re-exec of `trawld`. A dedicated
    `trawl-crashdump-monitor` executable was the rival shape: it would add
    an artifact to the image, the `.deb` and the release tarballs, and
-   buys no boundary, because a compromised daemon in a container that
-   allows privilege escalation can exec the file-capable helper itself.
+   buys no boundary, because containerd hands the pod spec's added
+   capability to the container's init process, so trawld holds
+   `CAP_SYS_PTRACE` itself until it seals (ruling 4), whoever owns the
+   binary that ptraces.
 
 2. **The file capability is permitted-only: `cap_sys_ptrace+p`, never
    `+ep`.** `commoncap` returns the exec-time `EPERM` only when the
@@ -80,14 +85,20 @@ that reading against 6.6, 6.12 and mainline.
    own lifecycle output stay on stderr: they are signal-safe or in a
    process with no subscriber, by necessity.
 
-7. **The chart forces `allowPrivilegeEscalation: true` on the `trawld`
-   container only, and only when `crashDump.enabled`.** Override, not
-   render failure: the shared `securityContext` map is what every
-   container inherits and its default is `false`, so failing would
-   refuse every enable. `init-auth` and `trawl-web` keep the untouched
-   shared map. Enabling crash dumps is therefore incompatible with the
-   Restricted Pod Security profile; that is documented, not enforced,
-   because admission policy is cluster state the chart cannot see.
+7. **The chart adds `SYS_PTRACE` to the `trawld` container only, and
+   only when `crashDump.enabled`. It forces no privilege escalation:
+   `allowPrivilegeEscalation` stays `false` everywhere.** (Amended
+   2026-09-06; see the amendment below for the run that settled it.) The
+   added capability is the whole grant. containerd hands it to the
+   container's init process as permitted and effective, and the
+   `cap_sys_ptrace+p` file capability keeps the bit across trawld's exec
+   of the monitor, which `no_new_privs` allows because nothing is gained.
+   `init-auth` and `trawl-web` keep the untouched shared map. Enabling
+   crash dumps is still incompatible with the Restricted Pod Security
+   profile, now for a different reason: Restricted refuses any added
+   capability except `NET_BIND_SERVICE`. That is documented, not
+   enforced, because admission policy is cluster state the chart cannot
+   see.
 
 8. **Evidence policy.** The capability transition and the startup
    verdict are yama-independent and become a standing CI check on the
@@ -111,3 +122,38 @@ that reading against 6.6, 6.12 and mainline.
   shipped and is the homelab stopgap, but it lowers a host-wide
   hardening control for every workload on the node to spare one
   process a narrow capability.
+
+## Amendment (2026-09-06)
+
+Ruling 7's original posture, forcing `allowPrivilegeEscalation: true` on
+the `trawld` container, is superseded. It was based on a wrong reading of
+where the pod spec's added capability lands.
+
+A kind run (containerd 2.3.1, node image v1.36.1) on a host whose
+operator had set `kernel.yama.ptrace_scope=2` settled it. With the pod
+patched to `allowPrivilegeEscalation: false` and `capabilities.add:
+[SYS_PTRACE]` kept, the monitor still held `CAP_SYS_PTRACE` effective:
+`CapEff=0x80000` with `NoNewPrivs=1`, verdict `ready ptrace_scope=2`, and
+`kill -SEGV 1` wrote a dump carrying 34 threads. `crictl inspect` shows
+why: containerd grants an added capability to the container's init
+process as permitted AND effective, plus bounding, not bounding-only.
+The `cap_sys_ptrace+p` file capability then carries the bit across
+trawld's exec of the monitor, and `no_new_privs` does not object, because
+commoncap downgrades only when the new permitted set is not a subset of
+the old one. Nothing is gained here, so nothing is stripped.
+
+The empty masks in the original bug report were the same capability dying
+at that exec: 0.3.2's trawld had no file capability, an empty ambient set
+and nothing inheritable, so the monitor started with nothing. Ruling 2's
+`+p` stamp is what fixed that, and the escalation was never the missing
+piece.
+
+The genuine denied case is the capability being absent from the pod spec:
+all sets zero, verdict `denied ... missing="CAP_SYS_PTRACE"`, and a 72 KB
+dump reporting `threads=0 memory_regions=0`.
+
+So the chart adds `SYS_PTRACE` and nothing else. Restricted Pod Security
+remains incompatible, because it refuses any added capability except
+`NET_BIND_SERVICE`. Rulings 2 and 8 are unaffected: the `+p` reasoning
+about the default `drop: [ALL]` pod still holds, and the evidence policy
+that produced this run is the reason the posture is now right.

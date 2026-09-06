@@ -347,7 +347,7 @@ The postgres DSNs still arrive via the `FLEET_DATABASE_URL` / `TRAWL_DATABASE_UR
 | `persistence.enabled` | bool | `true` | Enable persistent storage |
 | `persistence.size` | string | `50Gi` | PVC size |
 | `persistence.storageClass` | string | `""` | StorageClass (empty = default) |
-| `crashDump.enabled` | bool | `false` | Enable minidump capture; requires `persistence.enabled=true`. Grants the trawld container `SYS_PTRACE` and `allowPrivilegeEscalation: true`, without which the kernel ignores the binary's `cap_sys_ptrace+p` file capability and capture is inert, so an enabled install cannot run under the Restricted Pod Security profile. For what a dump contains, the yama `ptrace_scope` limits, and the equivalent Debian procedure, see [Crash dumps](https://trawl.sh/reference/crash-dumps/) |
+| `crashDump.enabled` | bool | `false` | Enable minidump capture; requires `persistence.enabled=true`. Adds `SYS_PTRACE` to the trawld container and nothing else: the runtime hands an added capability to the container's init process as permitted and effective, and the binary's `cap_sys_ptrace+p` file capability keeps the bit across trawld's exec of the monitor, so `allowPrivilegeEscalation` stays `false`. Restricted Pod Security still refuses any added capability except `NET_BIND_SERVICE`, so an enabled install cannot run under that profile. For what a dump contains, the yama `ptrace_scope` limits, and the equivalent Debian procedure, see [Crash dumps](https://trawl.sh/reference/crash-dumps/) |
 | `crashDump.size` | string | `2Gi` | Crash-dump PVC size |
 | `crashDump.storageClass` | string | `""` | Crash-dump StorageClass (empty = default) |
 | `crashDump.mountPath` | string | `/var/lib/trawl/cores` | Crash-dump PVC mount path |
