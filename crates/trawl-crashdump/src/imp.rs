@@ -16,7 +16,10 @@
 //!   `request_dump` (which blocks until the monitor has written the dump and
 //!   acked), then return `Handled(true)` so the instruction re-faults and the
 //!   process dies with the original signal (exit 139 for `SIGSEGV`).
-//! - the monitor exits when the client disconnects (parent died or shut down).
+//! - the monitor exits when the client disconnects (parent died or shut down),
+//!   and before that client exists it is held to the same fate by
+//!   `PR_SET_PDEATHSIG`, so a trawld that dies during startup never leaves a
+//!   privileged listener behind.
 
 use std::collections::BTreeMap;
 use std::fs::{DirBuilder, File, OpenOptions};
@@ -39,6 +42,9 @@ use crate::{caps, mdmp, probe};
 const MONITOR_ENV: &str = "TRAWL_CRASHDUMP_MONITOR";
 /// Carries the abstract-socket name from parent to monitor.
 const SOCKET_ENV: &str = "TRAWL_CRASHDUMP_SOCKET";
+/// Carries the spawning parent's pid, so the monitor can tell whether that
+/// parent is still its parent by the time it looks.
+const PARENT_ENV: &str = "TRAWL_CRASHDUMP_PARENT";
 /// Directory for `*.dmp` output (set by the chart / operator).
 const DIR_ENV: &str = "TRAWL_CRASH_DUMP_DIR";
 /// Keep at most this many dumps.
@@ -119,6 +125,9 @@ fn install(dir: &Path) -> Init {
     let Ok(mut monitor) = Command::new(exe)
         .env(MONITOR_ENV, "1")
         .env(SOCKET_ENV, &socket)
+        // Our own pid, so the monitor can close the window between its spawn
+        // and its `PR_SET_PDEATHSIG`; see `monitor_main`.
+        .env(PARENT_ENV, std::process::id().to_string())
         .env(DIR_ENV, dir)
         .env(RETAIN_ENV, retain.to_string())
         .spawn()
@@ -400,6 +409,14 @@ fn breadcrumb() {
     }
 }
 
+/// Is `spawner`, the pid trawld stamped into the environment, still our parent?
+///
+/// Fails closed: a value that is absent, empty or not a pid is not a match, so
+/// a monitor that cannot prove the tie exits instead of assuming it.
+fn spawner_is_still_our_parent(spawner: &str, current: u32) -> bool {
+    spawner.parse::<u32>() == Ok(current)
+}
+
 /// Monitor side: run the minidumper server, then exit the process.
 fn run_monitor(dir: &Path) -> ! {
     let code = match monitor_main(dir) {
@@ -414,6 +431,39 @@ fn run_monitor(dir: &Path) -> ! {
 
 fn monitor_main(dir: &Path) -> Result<(), String> {
     let socket = std::env::var(SOCKET_ENV).map_err(|_| "monitor missing socket env".to_owned())?;
+    let spawner = std::env::var(PARENT_ENV).map_err(|_| "monitor missing parent env".to_owned())?;
+
+    // Tie this process to trawld before anything else, and certainly before the
+    // capability raise below.
+    //
+    // The monitor's only other way out is the dump client disconnecting, and
+    // that client does not exist yet: trawld connects up to ~2s after the
+    // spawn. A trawld that dies inside that window leaves no descriptor whose
+    // closure ends the loop, so without a tie this process would be reparented
+    // and keep listening forever with `CAP_SYS_PTRACE` effective.
+    //
+    // Two steps, because `PR_SET_PDEATHSIG` only covers deaths from the moment
+    // of the call. The prctl handles every death from here on. The pid
+    // comparison handles the one it cannot see: a parent that died before the
+    // arm, which has already left us reparented, so our current parent is no
+    // longer the pid that spawned us.
+    //
+    // The setting is per-thread on the PARENT side too: the signal fires when
+    // the thread that forked us exits. `trawld` calls `init()` as the first
+    // statement of `main`, on the main thread and before the runtime exists, so
+    // we are tied to the main thread, which lives exactly as long as the
+    // process does.
+    //
+    // A failed arm is fatal here, unlike the failed capability raise below. A
+    // monitor with no lifetime tie is the leak this exists to close, and dying
+    // costs capture (the parent reports `monitor_unreachable`) rather than the
+    // daemon.
+    caps::set_parent_death_signal(libc::SIGTERM)
+        .map_err(|e| format!("set parent death signal: {e}"))?;
+    if !spawner_is_still_our_parent(&spawner, std::os::unix::process::parent_id()) {
+        return Err(format!("parent {spawner} died before the monitor came up"));
+    }
+
     create_dump_dir(dir).map_err(|e| format!("create dump dir: {e}"))?;
 
     // ADR-0023 ruling 3: raise before binding, so a parent that sees the socket
@@ -547,7 +597,10 @@ mod tests {
 
     use minidumper::{Server, SocketName};
 
-    use super::{Connected, client_peer_is_monitor, connect, open_fds, sole_new_socket};
+    use super::{
+        Connected, client_peer_is_monitor, connect, open_fds, sole_new_socket,
+        spawner_is_still_our_parent,
+    };
 
     fn unique_name(tag: &str) -> String {
         let nanos = SystemTime::now()
@@ -584,6 +637,26 @@ mod tests {
         );
         assert!(!client_peer_is_monitor(None, std::process::id()));
         drop(client);
+    }
+
+    /// The wiring between the two halves of the lifetime tie: `install` stamps
+    /// its own pid as decimal text, and the monitor compares it against the pid
+    /// the kernel reports. Anything else, including the shapes a stripped or
+    /// hand-edited environment produces, is a mismatch.
+    #[test]
+    fn the_spawning_parent_pid_round_trips_through_the_environment() {
+        let stamped = std::process::id().to_string();
+        assert!(spawner_is_still_our_parent(&stamped, std::process::id()));
+        assert!(
+            !spawner_is_still_our_parent(&stamped, std::process::id() + 1),
+            "reparented to some other process"
+        );
+        assert!(!spawner_is_still_our_parent("", std::process::id()));
+        assert!(!spawner_is_still_our_parent(
+            "not-a-pid",
+            std::process::id()
+        ));
+        assert!(!spawner_is_still_our_parent("-1", std::process::id()));
     }
 
     #[test]

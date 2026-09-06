@@ -176,6 +176,31 @@ pub(crate) fn set_ptracer(pid: u32) -> io::Result<()> {
     }
 }
 
+/// Ask the kernel to send `sig` to this process when its parent goes away.
+///
+/// `PR_SET_PDEATHSIG` is armed from the moment of the call and covers nothing
+/// before it, so a caller that needs the tie to be airtight has to check its
+/// parent separately; see `imp::monitor_main`, which does exactly that.
+///
+/// Two details that decide where the call belongs. The setting is per-thread,
+/// and "parent" means the THREAD that forked this process, not that process's
+/// thread group: the signal arrives when that thread exits, even if the rest of
+/// the process lives on. It is also cleared in a child of `fork` and after an
+/// exec that gains privilege, so each process arms it for itself.
+pub(crate) fn set_parent_death_signal(sig: libc::c_int) -> io::Result<()> {
+    let sig = libc::c_ulong::try_from(sig)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "signal number is negative"))?;
+    // SAFETY: `prctl(PR_SET_PDEATHSIG, sig)` takes scalars only and touches no
+    // memory of ours.
+    #[allow(unsafe_code)]
+    let rc = unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, sig) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 /// Ask the kernel who is on the other end of a connected socket.
 ///
 /// `SO_PEERCRED` freezes the peer's credentials when the connection is made,
@@ -265,6 +290,7 @@ pub(crate) fn get_dumpable() -> io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use std::io;
+    use std::io::BufRead;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::process::{Child, Command, Stdio};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -273,12 +299,18 @@ mod tests {
 
     use super::{
         PTRACE_BIT_WORD0, capget, get_dumpable, peer_cred_of_fd, raise_ptrace_effective, seal,
-        set_ptracer,
+        set_parent_death_signal, set_ptracer,
     };
     use crate::probe::{parse_status, self_status};
 
     /// Names the abstract socket [`abstract_socket_bind_helper`] should bind.
     const HELPER_ENV: &str = "TRAWL_CRASHDUMP_TEST_BIND";
+    /// Selects the middle process of the parent-death-signal test.
+    const PDEATHSIG_MIDDLE_ENV: &str = "TRAWL_CRASHDUMP_TEST_PDEATHSIG_MIDDLE";
+    /// Selects the process that arms the signal.
+    const PDEATHSIG_CHILD_ENV: &str = "TRAWL_CRASHDUMP_TEST_PDEATHSIG_CHILD";
+    /// Printed by that process once armed, followed by its pid.
+    const PDEATHSIG_ARMED: &str = "pdeathsig-armed";
 
     /// A name no other test, run or process is using.
     fn unique_name(tag: &str) -> String {
@@ -415,6 +447,32 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .expect("respawn the test binary as a bind helper")
+    }
+
+    /// Re-exec this test binary as one named ignored test, with its output
+    /// uncaptured so a helper can talk to the test over its stdout.
+    fn respawn_ignored(test: &str) -> Command {
+        let mut command = Command::new(std::env::current_exe().expect("test binary path"));
+        command.args(["--ignored", "--exact", "--nocapture", test]);
+        command
+    }
+
+    /// Is `pid` a live process, as opposed to gone or an unreaped zombie?
+    ///
+    /// A zombie still answers `kill(pid, 0)`, and whether an orphan is reaped
+    /// promptly depends on which ancestor happens to be a subreaper, so the
+    /// state letter in `/proc/<pid>/stat` is the answer that does not depend on
+    /// the harness's process tree. The comm field is parenthesised and may
+    /// itself contain spaces and parentheses, so the state is read after the
+    /// LAST `)`.
+    fn process_is_live(pid: u32) -> bool {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        let Some((_, tail)) = stat.rsplit_once(')') else {
+            return false;
+        };
+        !matches!(tail.split_whitespace().next(), None | Some("Z" | "X"))
     }
 
     /// Connect to `name` until the peer of the connection is `pid`, and return
@@ -563,6 +621,101 @@ mod tests {
             .expect("bind an abstract seqpacket listener");
         // The parent kills this process as soon as it has read the credentials;
         // the sleep only bounds an orphan if it never does.
+        std::thread::sleep(Duration::from_secs(30));
+    }
+
+    #[test]
+    fn arming_the_parent_death_signal_succeeds() {
+        // Arming it in the test process itself is harmless: the parent is the
+        // harness, and if the harness died this process would be killed off
+        // anyway.
+        set_parent_death_signal(libc::SIGTERM).expect("PR_SET_PDEATHSIG");
+    }
+
+    #[test]
+    fn a_negative_signal_number_is_refused_without_a_syscall() {
+        assert_eq!(
+            set_parent_death_signal(-1).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    /// The mechanism the monitor's lifetime tie rests on, with real processes:
+    /// a process that armed `PR_SET_PDEATHSIG` dies when its parent does, even
+    /// though nothing it holds is closed and nobody signals it directly.
+    ///
+    /// Three processes. This test spawns a MIDDLE helper, which spawns a
+    /// GRANDCHILD that arms the signal and prints its pid on the stdout it
+    /// inherited. Printing after arming is the handshake: without it the test
+    /// could kill the middle process before the `prctl` landed and prove
+    /// nothing. Then the middle process is killed, and the grandchild has to go
+    /// away on its own.
+    #[test]
+    fn a_child_that_armed_the_signal_dies_with_its_parent() {
+        let mut middle = respawn_ignored("caps::tests::pdeathsig_middle_helper")
+            .env(PDEATHSIG_MIDDLE_ENV, "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("respawn the test binary as a pdeathsig helper");
+
+        let stdout = middle.stdout.take().expect("piped stdout");
+        let armed = io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+            .find_map(|line| {
+                line.strip_prefix(PDEATHSIG_ARMED)
+                    .and_then(|rest| rest.trim().parse::<u32>().ok())
+            });
+
+        let armed = armed.expect("the grandchild armed the signal and named itself");
+        assert!(process_is_live(armed), "the grandchild is running");
+
+        let _ = middle.kill();
+        let _ = middle.wait();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while process_is_live(armed) {
+            assert!(
+                Instant::now() < deadline,
+                "pid {armed} outlived its parent by more than the deadline"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// The middle process of [`a_child_that_armed_the_signal_dies_with_its_parent`]:
+    /// spawn the grandchild, then do nothing until the test kills us.
+    #[test]
+    #[ignore = "helper process for the parent-death-signal test"]
+    fn pdeathsig_middle_helper() {
+        if std::env::var_os(PDEATHSIG_MIDDLE_ENV).is_none() {
+            return;
+        }
+        // Stdout is inherited, so the grandchild writes to the test's pipe.
+        let mut grandchild = respawn_ignored("caps::tests::pdeathsig_grandchild_helper")
+            .env(PDEATHSIG_CHILD_ENV, "1")
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("respawn the test binary as a pdeathsig grandchild");
+        // The test kills this process; the sleep only bounds an orphan if it
+        // never does.
+        std::thread::sleep(Duration::from_secs(30));
+        let _ = grandchild.kill();
+        let _ = grandchild.wait();
+    }
+
+    /// The process under test: arm the signal, say so, then wait to be killed
+    /// by the kernel rather than by anyone.
+    #[test]
+    #[ignore = "helper process for the parent-death-signal test"]
+    fn pdeathsig_grandchild_helper() {
+        if std::env::var_os(PDEATHSIG_CHILD_ENV).is_none() {
+            return;
+        }
+        set_parent_death_signal(libc::SIGTERM).expect("PR_SET_PDEATHSIG");
+        println!("{PDEATHSIG_ARMED} {}", std::process::id());
+        io::Write::flush(&mut io::stdout()).expect("flush the handshake");
         std::thread::sleep(Duration::from_secs(30));
     }
 

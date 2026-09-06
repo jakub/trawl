@@ -17,7 +17,10 @@ Instead it re-execs its own binary as a separate **monitor** process at
 startup and keeps a socket open to it. On a fatal signal the handler writes a
 one-line stderr breadcrumb, asks the monitor to attach and write the dump,
 waits for the ack, then re-raises so the process still dies with the original
-signal. Supervisors see the same signal exit they always did — systemd records
+signal. The monitor's life is tied to trawld's with `PR_SET_PDEATHSIG`, so it
+goes away when the daemon does, including a daemon that dies during startup
+before the socket is even connected. Supervisors see the same signal exit they
+always did — systemd records
 it as `status=11/SEGV`, a shell renders it as 139 — and restart trawld as
 usual.
 
