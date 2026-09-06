@@ -565,12 +565,17 @@ case "$scope" in
     assert_class "$misc_line" 'readiness="denied"'
     ;;
   *)
-    # At scope 0 and 1 the answer turns on PR_SET_PTRACER, dumpable and the
-    # credential match rather than on the capability, so both verdicts are
-    # legitimate. What is never legitimate is a shrug: every input the scope 0/1
-    # branch reads is readable in this container shape.
-    assert_class "$misc_line" 'readiness="ready"' 'readiness="denied"'
-    refute "$misc_line" 'readiness="indeterminate"' "every probe input is readable in this shape, so a no-verdict is a bug"
+    # Scope 0 and 1 never ask for the capability, so dropping it changes none of
+    # the inputs the classifier reads here: the credentials match, both sides
+    # hold an empty permitted set, the daemon is dumpable, and PR_SET_PTRACER
+    # succeeded (checked at scope 1, not required at scope 0). All of them are
+    # readable in this container shape, so ready is the only verdict the
+    # classifier can reach, and this step is the capability-free control that
+    # says so. Accepting denied too would pass a probe that stopped reading an
+    # input, or a classifier that started demanding the capability at these
+    # scopes; requiring the exact class also makes indeterminate the failure it
+    # is, since nothing here is unreadable.
+    assert_class "$misc_line" 'readiness="ready"'
     ;;
 esac
 refute "$misc_line" 'readiness="failed"' "arming the handler failed"
