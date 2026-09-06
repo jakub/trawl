@@ -165,12 +165,20 @@ exec; `trawld`'s exec is then a gain, `no_new_privs` strips it, and capture goes
 dead with nothing but the `denied` verdict to say so. Keep `trawld` as the
 container's first process, or grant escalation if you cannot.
 
-The capability is still worth weighing before you enable. The Restricted Pod
-Security profile refuses every added capability except `NET_BIND_SERVICE`, so a
-namespace enforcing Restricted rejects an enabled pod. The chart documents this
-rather than refusing to render, because admission policy is cluster state the
-chart cannot read. Leave crash dumps off in a Restricted namespace, or run trawl
-in a Baseline one.
+The capability is still worth weighing before you enable, because neither
+built-in Pod Security profile admits it. Restricted refuses every added
+capability except `NET_BIND_SERVICE`. Baseline is looser but still an
+allowlist, and the list is the set of capabilities a container runtime already
+grants by default, which does not include `SYS_PTRACE`. Both profiles and the
+exact list are in the kubernetes
+[Pod Security Standards](https://kubernetes.io/docs/concepts/security/pod-security-standards/).
+So relaxing a namespace from Restricted to Baseline does not help. Admission
+rejects the StatefulSet either way, over the added capability.
+
+Enabling crash dumps needs a namespace with no Pod Security enforcement, an
+exemption for this workload, or an admission policy of your own that permits
+`SYS_PTRACE` here. The chart documents this rather than refusing to render,
+because admission policy is cluster state the chart cannot read.
 
 The monitor raises the capability to effective before it binds its socket, and
 trawld drops it from its own sets. See "The capability is the other half of the

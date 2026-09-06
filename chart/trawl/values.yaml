@@ -89,11 +89,16 @@ persistence:
 # the container's init process as permitted and effective, and the
 # cap_sys_ptrace+p file capability stamped on /usr/bin/trawld keeps the bit
 # across trawld's exec of the monitor, so no_new_privs stays on and
-# allowPrivilegeEscalation stays false. Adding any capability other than
-# NET_BIND_SERVICE is still what the Restricted Pod Security profile refuses,
-# so enabling crash dumps is incompatible with Restricted. A namespace that
-# enforces it rejects the pod. Leave crash dumps off there, or run trawl in a
-# Baseline namespace.
+# allowPrivilegeEscalation stays false.
+#
+# Neither built-in Pod Security profile admits that capability. Restricted
+# refuses every added capability except NET_BIND_SERVICE, and Baseline's
+# allowlist is the set a container runtime already grants by default, which
+# does not include SYS_PTRACE. Relaxing a namespace from Restricted to Baseline
+# therefore changes nothing, since Baseline rejects this pod too. Enabling
+# crash dumps needs a namespace with no Pod Security enforcement, an exemption
+# for this workload, or an admission policy that permits SYS_PTRACE for it. The
+# kubernetes Pod Security Standards page carries both allowlists.
 #
 # The dump PVC is separate from the data PVC, so dumps stay out of data backups
 # and survive container restarts, pod reschedules, and node reboots. Off by
