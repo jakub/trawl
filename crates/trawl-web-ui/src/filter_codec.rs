@@ -46,6 +46,11 @@ pub enum PayloadError {
     NotVersioned,
     /// Versioned, but the base64 or the JSON inside it did not decode.
     Undecodable,
+    /// Decoded, but a record is not one this codec writes: an operator
+    /// other than `+`/`-`, or an empty field name. Dropping the record
+    /// and returning the rest would run a query the link does not
+    /// describe, which is the whole thing ADR-0027 refuses.
+    InvalidRecord,
 }
 
 /// Decode a payload written by this codec.
@@ -56,9 +61,14 @@ pub fn decode_payload(raw: &str) -> Result<Vec<(char, String, String)>, PayloadE
     let decoded = Base64UrlUnpadded::decode_vec(encoded).map_err(|_| PayloadError::Undecodable)?;
     let filters: Vec<WireFilter> =
         serde_json::from_slice(&decoded).map_err(|_| PayloadError::Undecodable)?;
+    if filters
+        .iter()
+        .any(|f| !matches!(f.op, '+' | '-') || f.field.is_empty())
+    {
+        return Err(PayloadError::InvalidRecord);
+    }
     Ok(filters
         .into_iter()
-        .filter(|f| matches!(f.op, '+' | '-') && !f.field.is_empty())
         .map(|f| (f.op, f.field, f.value))
         .collect())
 }
@@ -120,5 +130,26 @@ mod tests {
             decode_payload(&encode_payload(std::iter::empty())),
             Ok(Vec::new())
         );
+    }
+
+    /// A record this codec would never write fails the WHOLE payload.
+    /// Skipping it and returning the rest was the same lie by another
+    /// route: the link says two filters, the query carries one.
+    #[test]
+    fn an_unwritable_record_fails_the_whole_payload() {
+        for parts in [
+            vec![('x', "host", "prod")],
+            vec![('+', "", "prod")],
+            // …including when the other records are perfectly good.
+            vec![('+', "host", "web-01"), ('x', "source", "auth.log")],
+            vec![('+', "host", "web-01"), ('-', "", "auth.log")],
+        ] {
+            let payload = encode_payload(parts.iter().copied());
+            assert_eq!(
+                decode_payload(&payload),
+                Err(PayloadError::InvalidRecord),
+                "{parts:?}"
+            );
+        }
     }
 }

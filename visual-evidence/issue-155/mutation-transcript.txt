@@ -423,3 +423,19 @@ patch                        outcome
 03-sse-teardown.patch        PASS (target spec failed, control passed, exit 1)
 04-error-fallback.patch      PASS (target spec failed, control passed, exit 1)
 05-search-url-codec.patch    PASS (target spec failed, control passed, exit 1)
+
+----------------------------------------------------------------------
+
+Addendum, 2026-09-06T22:59Z
+
+The commit this addendum ships in (the reader hardening) touches
+search_url.rs after the run above, so every patch was re-checked against
+it: all five still apply, and 05-search-url-codec.patch was re-run in
+full and still killed.
+
+2026-09-06T22:59:47.210788Z  INFO applying new distribution
+2026-09-06T22:59:47.213784Z  INFO ✅ success
+
+mutation-check results:
+patch                        outcome
+05-search-url-codec.patch    PASS (target spec failed, control passed, exit 1)

@@ -32,6 +32,8 @@ use std::fmt::Write as _;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 
+use trawl_core::parser::suggest::quote_dsl_field;
+
 use crate::filter_codec::{self, PayloadError};
 use crate::query_merge::{Filter, FilterOp, QUICK_RANGES, RangeSpec};
 
@@ -45,6 +47,13 @@ pub const PAGE_SIZE: usize = 50;
 /// `page=18446744073709551615` a parse failure in the browser and an
 /// arithmetic overflow on the test host — two different contracts.
 const PAGE_SIZE_U64: u64 = PAGE_SIZE as u64;
+
+/// Largest offset a page may name. The request carries
+/// `offset: Option<usize>` and `usize` is 32 bits in the browser, so an
+/// offset past `u32::MAX` is one this client cannot ask for — and
+/// pinning the ceiling here rather than at `usize::try_from` is what
+/// keeps the host tests and the browser answering the same.
+pub const MAX_OFFSET: u64 = u32::MAX as u64;
 
 /// Largest raw `f` value read at all, checked before base64 or JSON
 /// allocation.
@@ -132,6 +141,13 @@ pub enum Reason {
     FilterFieldTooLong,
     /// A value is over [`MAX_FILTER_VALUE_BYTES`].
     FilterValueTooLong,
+    /// A record is not one this app writes: an operator other than
+    /// include/exclude, or an empty field name.
+    InvalidFilterRecord,
+    /// A field name the DSL cannot spell, even backticked. It would be
+    /// dropped from the emitted query, so the link would run something
+    /// narrower than it claims.
+    UnrenderableFilterField,
     /// `r` is neither a quick label nor a readable `<from>..<to>` pair.
     UnreadableRange,
     /// `r`'s bounds are readable but `from` is after `to`.
@@ -269,6 +285,14 @@ pub fn build_search_url(
         let _ = write!(url, "&mode={m}");
     }
     if !filters.is_empty() {
+        // Every producer asks `admit_filters` before it navigates, so a
+        // URL this function builds is always one `decode_filters` reads
+        // back. A violation here would show the malformed banner for
+        // the app's own navigation.
+        debug_assert!(
+            admit_filters(filters).is_ok(),
+            "built a search URL whose filters our own reader refuses"
+        );
         let _ = write!(url, "&f={}", encode_filters(filters));
     }
     if *range != RangeSpec::default() {
@@ -286,6 +310,60 @@ pub fn encode_filters(filters: &[Filter]) -> String {
             .iter()
             .map(|f| (f.op.prefix(), f.field.as_str(), f.value.as_str())),
     )
+}
+
+/// Every filter-set rule the DECODER and the producer share: how many
+/// filters a link may carry, how long a field or a value may be, and
+/// whether the field can be written into the DSL at all.
+fn admit_records(filters: &[Filter]) -> Result<(), Reason> {
+    if filters.len() > MAX_FILTERS {
+        return Err(Reason::TooManyFilters);
+    }
+    for f in filters {
+        if f.field.len() > MAX_FILTER_FIELD_BYTES {
+            return Err(Reason::FilterFieldTooLong);
+        }
+        if f.value.len() > MAX_FILTER_VALUE_BYTES {
+            return Err(Reason::FilterValueTooLong);
+        }
+        // `query_merge::format_filter` renders the field through this
+        // same function and drops the clause when it answers `None`, so
+        // admitting an unrenderable name here would mean a link whose
+        // filter silently does nothing (ADR-0013 ruling 7).
+        if quote_dsl_field(&f.field).is_none() {
+            return Err(Reason::UnrenderableFilterField);
+        }
+    }
+    Ok(())
+}
+
+/// Whether a filter set may be written into a link at all — the reader's
+/// rules asked BEFORE the URL is built, so the app cannot navigate to a
+/// link its own reader would refuse. The payload length is part of it,
+/// which is why this is the producer's door and `decode_filters` checks
+/// the raw value it was handed instead.
+///
+/// # Errors
+/// The first rule the set breaks, for the caller to turn into copy.
+pub fn admit_filters(filters: &[Filter]) -> Result<(), Reason> {
+    admit_records(filters)?;
+    if encode_filters(filters).len() > MAX_FILTER_PAYLOAD_BYTES {
+        return Err(Reason::FilterPayloadTooLarge);
+    }
+    Ok(())
+}
+
+/// What a refused filter says to the person who clicked. One sentence,
+/// naming the limit rather than the internal rule.
+#[must_use]
+pub const fn refusal_copy(reason: Reason) -> &'static str {
+    match reason {
+        Reason::TooManyFilters => "Can't add filter: too many filters (max 32)",
+        Reason::FilterValueTooLong => "Can't add filter: value too long",
+        Reason::FilterFieldTooLong => "Can't add filter: field name too long",
+        Reason::UnrenderableFilterField => "Can't add filter: that field name can't be queried",
+        _ => "Can't add filter: link would be too long",
+    }
 }
 
 /// Read the `f` parameter. An empty value is a missing one; anything the
@@ -306,25 +384,23 @@ pub fn decode_filters(raw: &str) -> Verdict<Vec<Filter>> {
         Ok(parts) => parts,
         Err(PayloadError::NotVersioned) => return bad(Reason::UnversionedFilters),
         Err(PayloadError::Undecodable) => return bad(Reason::UndecodableFilters),
+        Err(PayloadError::InvalidRecord) => return bad(Reason::InvalidFilterRecord),
     };
-    if parts.len() > MAX_FILTERS {
-        return bad(Reason::TooManyFilters);
-    }
-    let mut filters = Vec::with_capacity(parts.len());
-    for (op, field, value) in parts {
-        if field.len() > MAX_FILTER_FIELD_BYTES {
-            return bad(Reason::FilterFieldTooLong);
-        }
-        if value.len() > MAX_FILTER_VALUE_BYTES {
-            return bad(Reason::FilterValueTooLong);
-        }
-        // `decode_payload` yields only `+` and `-`.
-        let op = if op == '+' {
-            FilterOp::Include
-        } else {
-            FilterOp::Exclude
-        };
-        filters.push(Filter { field, value, op });
+    let filters: Vec<Filter> = parts
+        .into_iter()
+        .map(|(op, field, value)| Filter {
+            field,
+            value,
+            // `decode_payload` yields only `+` and `-`.
+            op: if op == '+' {
+                FilterOp::Include
+            } else {
+                FilterOp::Exclude
+            },
+        })
+        .collect();
+    if let Err(reason) = admit_records(&filters) {
+        return bad(reason);
     }
     Verdict::Valid(filters)
 }
@@ -424,17 +500,18 @@ pub fn normalize_instant(raw: &str) -> Option<String> {
 /// whose answer depends on that is not a contract.
 #[must_use]
 pub fn parse_page(raw: &str) -> Verdict<usize> {
+    let bad = || Verdict::Malformed(Malformed::new(Param::Page, raw, Reason::PageOffsetOverflow));
     let Ok(page) = raw.parse::<u64>() else {
         return Verdict::Valid(0);
     };
-    match page
-        .checked_mul(PAGE_SIZE_U64)
-        .and_then(|offset| usize::try_from(offset).ok())
-    {
-        // The offset fits, so the page number does too.
-        Some(_) => Verdict::Valid(usize::try_from(page).unwrap_or(0)),
-        None => Verdict::Malformed(Malformed::new(Param::Page, raw, Reason::PageOffsetOverflow)),
+    let Some(offset) = page.checked_mul(PAGE_SIZE_U64) else {
+        return bad();
+    };
+    if offset > MAX_OFFSET {
+        return bad();
     }
+    // The offset fits in 32 bits, so the page number fits any target.
+    usize::try_from(page).map_or_else(|_| bad(), Verdict::Valid)
 }
 
 #[cfg(test)]
@@ -662,6 +739,118 @@ mod tests {
         );
     }
 
+    /// A record the codec would never write fails the whole parameter,
+    /// rather than being skipped into a narrower query than the link
+    /// describes.
+    #[test]
+    fn an_unwritable_record_fails_the_whole_parameter() {
+        for parts in [
+            vec![('x', "host", "prod")],
+            vec![('+', "", "prod")],
+            vec![('+', "host", "web-01"), ('x', "source", "auth.log")],
+        ] {
+            let payload = filter_codec::encode_payload(parts.iter().copied());
+            assert_eq!(
+                decode_filters(&payload).malformed().map(|m| m.reason),
+                Some(Reason::InvalidFilterRecord),
+                "{parts:?}"
+            );
+        }
+    }
+
+    /// A field the DSL cannot spell would be dropped from the emitted
+    /// query by `format_filter`, so the link would run something
+    /// narrower than it claims. Refuse it at the door instead.
+    #[test]
+    fn a_field_the_dsl_cannot_spell_fails_the_whole_parameter() {
+        for field in ["a\u{202e}b", "a`b\u{0}"] {
+            let payload = encode_filters(&[inc(field, "x")]);
+            assert_eq!(
+                decode_filters(&payload).malformed().map(|m| m.reason),
+                Some(Reason::UnrenderableFilterField),
+                "{field:?}"
+            );
+            assert_eq!(
+                admit_filters(&[inc(field, "x")]),
+                Err(Reason::UnrenderableFilterField)
+            );
+        }
+        // …while a name that needs backticks is perfectly fine.
+        assert!(matches!(
+            decode_filters(&encode_filters(&[inc("x-forwarded-for", "10.0.0.1")])),
+            Verdict::Valid(_)
+        ));
+    }
+
+    /// The producer asks the same questions the reader does, so the app
+    /// cannot navigate to a link its own reader would refuse.
+    #[test]
+    fn the_producer_admits_exactly_what_the_reader_reads() {
+        assert_eq!(admit_filters(&[]), Ok(()));
+        let at_count: Vec<Filter> = (0..MAX_FILTERS)
+            .map(|i| inc(&format!("f{i}"), "v"))
+            .collect();
+        assert_eq!(admit_filters(&at_count), Ok(()));
+        assert!(matches!(
+            decode_filters(&encode_filters(&at_count)),
+            Verdict::Valid(_)
+        ));
+
+        let over_count: Vec<Filter> = (0..=MAX_FILTERS)
+            .map(|i| inc(&format!("f{i}"), "v"))
+            .collect();
+        assert_eq!(admit_filters(&over_count), Err(Reason::TooManyFilters));
+        assert_eq!(
+            decode_filters(&encode_filters(&over_count))
+                .malformed()
+                .map(|m| m.reason),
+            Some(Reason::TooManyFilters)
+        );
+
+        let field_over = vec![inc(&"a".repeat(MAX_FILTER_FIELD_BYTES + 1), "v")];
+        assert_eq!(admit_filters(&field_over), Err(Reason::FilterFieldTooLong));
+        let value_over = vec![inc("f", &"v".repeat(MAX_FILTER_VALUE_BYTES + 1))];
+        assert_eq!(admit_filters(&value_over), Err(Reason::FilterValueTooLong));
+
+        // A set that is legal filter by filter but whose payload is
+        // longer than the reader will look at.
+        let bulky: Vec<Filter> = (0..MAX_FILTERS)
+            .map(|i| inc(&format!("f{i}"), &"v".repeat(MAX_FILTER_VALUE_BYTES)))
+            .collect();
+        assert_eq!(admit_records(&bulky), Ok(()));
+        assert_eq!(admit_filters(&bulky), Err(Reason::FilterPayloadTooLarge));
+        assert_eq!(
+            decode_filters(&encode_filters(&bulky))
+                .malformed()
+                .map(|m| m.reason),
+            Some(Reason::FilterPayloadTooLarge)
+        );
+    }
+
+    #[test]
+    fn a_refusal_names_the_limit_it_hit() {
+        assert_eq!(
+            refusal_copy(Reason::TooManyFilters),
+            "Can't add filter: too many filters (max 32)"
+        );
+        assert_eq!(
+            refusal_copy(Reason::FilterValueTooLong),
+            "Can't add filter: value too long"
+        );
+        assert_eq!(
+            refusal_copy(Reason::FilterFieldTooLong),
+            "Can't add filter: field name too long"
+        );
+        assert_eq!(
+            refusal_copy(Reason::UnrenderableFilterField),
+            "Can't add filter: that field name can't be queried"
+        );
+        assert_eq!(
+            refusal_copy(Reason::FilterPayloadTooLarge),
+            "Can't add filter: link would be too long"
+        );
+    }
+
     #[test]
     fn the_field_and_value_caps_are_inclusive() {
         let field_at = encode_filters(&[inc(&"a".repeat(MAX_FILTER_FIELD_BYTES), "v")]);
@@ -839,9 +1028,21 @@ mod tests {
                 "{raw}"
             );
         }
-        // The largest page whose offset still fits is fine.
-        let last = u64::MAX / PAGE_SIZE_U64;
-        assert!(matches!(parse_page(&last.to_string()), Verdict::Valid(_)));
+    }
+
+    /// The offset ceiling is 32 bits because the request's own `offset`
+    /// is, so the answer cannot depend on which target ran the check.
+    #[test]
+    fn the_offset_ceiling_is_the_same_on_every_target() {
+        let last = MAX_OFFSET / PAGE_SIZE_U64;
+        assert_eq!(last, 85_899_345);
+        assert_eq!(parse_page(&last.to_string()), Verdict::Valid(85_899_345));
+        assert_eq!(
+            parse_page(&(last + 1).to_string())
+                .malformed()
+                .map(|m| m.reason),
+            Some(Reason::PageOffsetOverflow)
+        );
     }
 
     // ---- verdict surface --------------------------------------------

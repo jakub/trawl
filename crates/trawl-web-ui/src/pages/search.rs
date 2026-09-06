@@ -33,7 +33,7 @@ use crate::components::results_table::ResultsTable;
 use crate::components::save_as_net_modal::SaveAsNetModal;
 use crate::components::status_bar::StatusKind;
 use crate::pages::layout::ShellStatus;
-use crate::search_url::Param;
+use crate::search_url::{Param, admit_filters, refusal_copy};
 use crate::state::query::{
     Filter, Mode, RangeSpec, UrlSignals, effective_query, navigator, url_signals,
 };
@@ -166,6 +166,15 @@ pub fn Search() -> impl IntoView {
                 return;
             }
             current.push(f);
+            // The producer asks the reader's own rules before it
+            // navigates: a link this app builds must be one it can read
+            // back, so a set that busts a cap is refused out loud here
+            // rather than becoming the malformed banner one navigation
+            // later (ADR-0027).
+            if let Err(reason) = admit_filters(&current) {
+                bus.push(ToastKind::Error, refusal_copy(reason), None);
+                return;
+            }
             goto(
                 &executed_q.get_untracked(),
                 0,

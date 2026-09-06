@@ -146,6 +146,25 @@ test('legacy and malformed filter payloads refuse to run', async ({ page, reques
   await expect(page.locator(SEL.urlNoticeRaw)).toHaveText('v1.!');
   await expect(page.locator(SEL.filtersBadChip)).toBeVisible();
 
+  // A versioned payload whose RECORD is not one this app writes: an
+  // operator it never emits, and an empty field name. Skipping the bad
+  // record and running the rest would be the same lie in a narrower
+  // query. (Literals: base64url of
+  // [{"op":"x","field":"host","value":"prod"}] and of
+  // [{"op":"+","field":"","value":"prod"}].)
+  for (const payload of [
+    'v1.W3sib3AiOiJ4IiwiZmllbGQiOiJob3N0IiwidmFsdWUiOiJwcm9kIn1d',
+    'v1.W3sib3AiOiIrIiwiZmllbGQiOiIiLCJ2YWx1ZSI6InByb2QifV0',
+  ]) {
+    await expectRefused(
+      page,
+      request,
+      `/search?q=service%3Dnginx&page=0&f=${payload}`,
+      COPY.urlNoticeFiltersPrefix,
+    );
+    await expect(page.locator(SEL.filtersBadChip)).toBeVisible();
+  }
+
   // …and the live tail does not start either.
   const opensBefore = await sseOpens(request);
   await page.goto('/search?q=service%3Dnginx&mode=live&f=v1.!');
@@ -203,7 +222,9 @@ test('page offset overflows refuse to run while an unreadable page is page 1', a
   await expect(page.locator(SEL.urlNotice)).toHaveCount(0);
 
   // Parses, but `page * 50` does not fit: a false claim.
-  for (const raw of ['18446744073709551615', '368934881474191033']) {
+  // 85899346 * 50 is one past `u32::MAX`, the ceiling the request's own
+  // `offset` imposes; the other two overflow `u64` multiplication.
+  for (const raw of ['18446744073709551615', '368934881474191033', '85899346']) {
     await expectRefused(page, request, `/search?q=service%3Dnginx&page=${raw}`, COPY.urlNoticePagePrefix);
     await expect(page.locator(SEL.urlNoticeRepair)).toHaveText(COPY.urlNoticeRepairPage);
     await expect(page.locator(SEL.urlNoticeRaw)).toHaveText(raw);
