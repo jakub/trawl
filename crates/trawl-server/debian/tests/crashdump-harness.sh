@@ -1157,16 +1157,23 @@ note "capture is off, trawld is cap-less, and $(basename "$attack_dump") is stil
 # runuser initgroups, so this shell carries the trawl group exactly as the
 # service does. That is the strongest form of the question: even holding the
 # group, can this uid reach a dump?
-probe() { # probe <label> <command...>; expects failure
+# stdout goes to /dev/null and never to the transcript. Two of these probes cat
+# a minidump, so on the day the access control regresses, echoing what came back
+# would paste trawld's memory, TLS key and postgres password included, into a
+# file that gets committed as PR evidence. A test for a leak must not be the
+# leak. Only stderr is captured, and only the first line of it, which is where
+# the permission error lives.
+probe() { # probe <label> <command...>; expects a permission denial
   local label="$1"; shift
   printf '\n$ runuser -u trawl-web -- %s\n' "$*"
-  local out rc=0
-  out=$(docker exec "$NODE" runuser -u trawl-web -- "$@" 2>&1) || rc=$?
-  printf '%s\n' "${out:-(no output)}"
-  printf 'exit=%s\n' "$rc"
-  (( rc != 0 )) || die "$label SUCCEEDED as trawl-web; the dumps are reachable"
-  grep -qiE 'permission denied|operation not permitted' <<< "$out" \
-    || die "$label failed with something other than a permission error: $out"
+  local err rc=0
+  err=$(docker exec "$NODE" runuser -u trawl-web -- "$@" 2>&1 >/dev/null) || rc=$?
+  err=$(printf '%s' "$err" | head -1 | cut -c1-200)
+  printf '%s\nexit=%s\n' "${err:-(no stderr)}" "$rc"
+  (( rc != 0 )) \
+    || die "$label: unexpectedly readable as trawl-web (content withheld from this transcript deliberately)"
+  grep -qiE 'permission denied|operation not permitted' <<< "$err" \
+    || die "$label failed with something other than a permission error: $err"
   note "$label denied"
 }
 
