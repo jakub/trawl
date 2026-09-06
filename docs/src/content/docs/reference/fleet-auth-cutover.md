@@ -242,17 +242,28 @@ base64** — the `op://` item is base64url without padding (43 chars), so
 re-pad and decode while writing:
 
 ```bash
+umask 077
+tmp="$(mktemp -p /root fleet-session-key.XXXXXX)"
 printf '%s=' "$(op read 'op://Homelab/Fleet session key/credential')" \
-  | basenc --base64url -d > /var/lib/trawl/web.cookie   # raw 32 bytes
-chown trawl:trawl /var/lib/trawl/web.cookie
-chmod 0640 /var/lib/trawl/web.cookie
+  | basenc --base64url -d > "$tmp"   # raw 32 bytes
+install -o trawl -g trawl -m 0640 "$tmp" /var/lib/trawl/web.cookie
+rm -f "$tmp"
 ```
+
+Build the key somewhere root owns, then `install` it into place in one step.
+`install` replaces the destination instead of following a link planted there,
+which matters because `trawl` owns `/var/lib/trawl` and can put anything at that
+name. Redirecting into the path and then chowning it does follow such a link:
+measured in a container, `web.cookie -> /root/decoy` plus a redirect and a
+`chown trawl:trawl` left the decoy holding the new session key and owned
+`trawl:trawl 0640`, while the `install` form left it untouched at `root:root
+0600` and created a fresh file at the destination.
 
 `0640 trawl:trawl`, not `0600`. trawl-web runs as its own `trawl-web` user and
 reads the key through membership of the `trawl` group, so a key it cannot read
-means a proxy that will not start. This is the same mode postinst applies
-through `systemd-tmpfiles`; writing the file by hand bypasses that, so set it
-yourself.
+means a proxy that will not start. postinst applies that mode through
+`systemd-tmpfiles`; writing the file by hand goes around it, which is why the
+mode is spelled out here.
 
 Then in `/etc/trawl/trawld.toml`:
 

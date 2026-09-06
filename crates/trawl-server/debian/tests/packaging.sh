@@ -244,9 +244,37 @@ fi
 if ! grep -Eq '^z[[:space:]]+/var/lib/trawl/web\.cookie[[:space:]]+0640[[:space:]]+trawl[[:space:]]+trawl([[:space:]]|$)' "$tmpfiles_conf"; then
   fail "crates/trawl-server/debian/trawl.tmpfiles does not carry 'z /var/lib/trawl/web.cookie 0640 trawl trawl -' — trawl-web reads the key through the trawl group and needs it group-readable"
 fi
-if grep -Eq '^[[:space:]]*(chown|chmod)[[:space:]].*/var/lib/trawl/web\.cookie' "$postinst"; then
-  fail "crates/trawl-server/debian/postinst chowns or chmods /var/lib/trawl/web.cookie directly — that dereferences a symlink the trawl user can plant; the z line in debian/trawl.tmpfiles is the no-follow way to do it"
+# Nothing that prescribes commands may chown or chmod either path. Both live
+# inside /var/lib/trawl, which the trawl user owns, so anything running as that
+# user can replace an entry with a symlink and a root chown or chmod follows it.
+# Measured: a planted `web.cookie -> /root/decoy` plus a redirect and a chown
+# left the decoy holding the new session key, owned trawl:trawl 0640.
+#
+# The safe forms are the tmpfiles entries in debian/trawl.tmpfiles, which open
+# with O_NOFOLLOW, and `install`, which replaces the destination rather than
+# writing through a link. This rule covers the maintainer scripts and every docs
+# page, because an operator following a runbook is running the same root shell a
+# maintainer script does. packaging.sh and the harness are excluded: they name
+# these commands to refuse them, and the harness runs them as measurement inside
+# a throwaway container.
+guard_files=()
+while IFS= read -r guard_file; do
+  guard_files+=("$guard_file")
+done < <(find "$repo_root/docs/src/content/docs" -type f -name '*.md' | sort)
+for maintainer_script in preinst postinst prerm postrm; do
+  if [[ -f "$repo_root/crates/trawl-server/debian/$maintainer_script" ]]; then
+    guard_files+=("$repo_root/crates/trawl-server/debian/$maintainer_script")
+  fi
+done
+if (( ${#guard_files[@]} < 2 )); then
+  fail "the chown/chmod guard found ${#guard_files[@]} files to scan; the docs tree or the maintainer scripts moved and the guard is now checking nothing"
 fi
+for guard_file in "${guard_files[@]}"; do
+  if hit=$(grep -nE '(chown|chmod)' "$guard_file" | grep -E '/var/lib/trawl/(web\.cookie|cores)' | head -3); then
+    fail "${guard_file#"$repo_root/"} chowns or chmods a path under /var/lib/trawl, which the trawl user owns and can replace with a symlink that root then follows. Use the tmpfiles entry (O_NOFOLLOW) or install (replaces the destination):
+$hit"
+  fi
+done
 
 # The fleet SSO runbook tells an operator to overwrite that same key by hand,
 # which bypasses tmpfiles entirely. If it keeps saying 0600, following it leaves
@@ -254,11 +282,15 @@ fi
 if [[ ! -f "$cutover_page" ]]; then
   fail "docs/src/content/docs/reference/fleet-auth-cutover.md is missing — it carries the by-hand key install that has to agree with the packaged mode"
 fi
-if ! grep -Eq 'chmod[[:space:]]+0640[[:space:]]+/var/lib/trawl/web\.cookie' "$cutover_page"; then
-  fail "docs/src/content/docs/reference/fleet-auth-cutover.md does not install /var/lib/trawl/web.cookie as 0640 — trawl-web reads it through the trawl group and a 0600 key stops the proxy starting"
+# Mode-form agnostic on purpose: the runbook installs the key rather than
+# chmodding it, and the next rewrite may reach for something else again. What
+# has to hold is that the line putting the key in place names 0640 and no line
+# putting it in place names 0600.
+if ! grep -E '/var/lib/trawl/web\.cookie' "$cutover_page" | grep -Eq '(^|[^0-9])0640([^0-9]|$)'; then
+  fail "docs/src/content/docs/reference/fleet-auth-cutover.md does not put /var/lib/trawl/web.cookie in place as 0640 — trawl-web reads it through the trawl group and a key it cannot read stops the proxy starting"
 fi
-if grep -Eq 'chmod[[:space:]]+0?600[[:space:]]+/var/lib/trawl/web\.cookie' "$cutover_page"; then
-  fail "docs/src/content/docs/reference/fleet-auth-cutover.md still tells operators to chmod the session key 600 — that predates the trawl-web user split"
+if grep -E '/var/lib/trawl/web\.cookie' "$cutover_page" | grep -Eq '(^|[^0-9])0?600([^0-9]|$)'; then
+  fail "docs/src/content/docs/reference/fleet-auth-cutover.md still puts the session key in place as 600 — that predates the trawl-web user split"
 fi
 if ! grep -Eq '^[[:space:]]*systemd-tmpfiles[[:space:]]+--create[[:space:]]+trawl\.conf' "$postinst"; then
   fail "crates/trawl-server/debian/postinst does not run 'systemd-tmpfiles --create trawl.conf' — nothing would create '$dir_value' at install time"
