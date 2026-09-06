@@ -17,8 +17,9 @@ Instead it re-execs its own binary as a separate **monitor** process at
 startup and keeps a socket open to it. On a fatal signal the handler writes a
 one-line stderr breadcrumb, asks the monitor to attach and write the dump,
 waits for the ack, then re-raises so the process still dies with the original
-signal. systemd and the kubelet see the same exit code they always did (139
-for `SIGSEGV`) and restart trawld as usual.
+signal. Supervisors see the same signal exit they always did — systemd records
+it as `status=11/SEGV`, a shell renders it as 139 — and restart trawld as
+usual.
 
 The attach is the whole reason a capability appears anywhere in this page.
 The monitor needs `CAP_SYS_PTRACE`, or a permissive enough yama policy, to
@@ -107,8 +108,11 @@ diff /usr/share/doc/trawl-server/examples/crashdump.conf \
 ## Enabling on kubernetes (helm)
 
 ```bash
-helm upgrade trawl chart/trawl --set crashDump.enabled=true
+helm upgrade trawl chart/trawl --reuse-values --set crashDump.enabled=true
 ```
+
+`--reuse-values` keeps the release's existing settings; without it the upgrade
+resets every other value to the chart defaults.
 
 That one value is the whole enable step, the way copying the drop-in is on
 Debian. It sets `TRAWL_CRASH_DUMP_DIR` and `TRAWL_CRASH_DUMP_RETAIN` on the
@@ -246,16 +250,24 @@ journal even records the usual `wrote minidump` line. A denied capture is
 only visible by opening the dump, or by its size (tens of kilobytes against
 hundreds for a real one).
 
-Do not try to force a crash to test this. Check the capability instead:
+Do not try to force a crash to test this. Check the capability instead — the
+configured unit property first, then the LIVE process, because `systemctl show`
+only proves what systemd was told, not what the running daemon holds:
 
 ```bash
 systemctl show trawld -p AmbientCapabilities
+grep -E 'CapEff|CapAmb' "/proc/$(systemctl show trawld -p MainPID --value)/status"
 ```
 
-The output should name `cap_sys_ptrace`. Pair that with the enabled line in
+The unit property should name `cap_sys_ptrace` and both `/proc` masks should
+have bit 19 set (`0000000000080000`). The monitor is a child of that PID and
+inherits the same sets. Pair that with the enabled line in
 `journalctl -u trawld` and the yama value above, and you have covered every
-part that can silently fall off. Issue #21 tracks turning this into a real
-startup warning.
+part that can silently fall off. One more denial can still hide beyond all of
+these: an active LSM policy (SELinux, AppArmor) can refuse the attach after
+capabilities and yama both pass, with the same empty-dump symptom — if the
+checks above look right and dumps still come out empty, audit your LSM policy
+for trawld. Issue #21 tracks turning this into a real startup warning.
 
 ## Retention
 

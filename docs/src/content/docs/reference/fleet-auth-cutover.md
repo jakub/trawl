@@ -242,13 +242,24 @@ base64** — the `op://` item is base64url without padding (43 chars), so
 re-pad and decode while writing:
 
 ```bash
-umask 077
-tmp="$(mktemp -p /root fleet-session-key.XXXXXX)"
-printf '%s=' "$(op read 'op://Homelab/Fleet session key/credential')" \
-  | basenc --base64url -d > "$tmp"   # raw 32 bytes
-install -o trawl -g trawl -m 0640 "$tmp" /var/lib/trawl/web.cookie
-rm -f "$tmp"
+(
+  set -euo pipefail
+  umask 077
+  tmp="$(mktemp -p /root fleet-session-key.XXXXXX)"
+  trap 'rm -f "$tmp"' EXIT
+  key="$(op read 'op://Homelab/Fleet session key/credential')"
+  printf '%s=' "$key" | basenc --base64url -d > "$tmp"   # raw 32 bytes
+  [ "$(stat -c %s "$tmp")" -eq 32 ] || { echo "decoded key is not 32 bytes; aborting" >&2; exit 1; }
+  install -o trawl -g trawl -m 0640 "$tmp" /var/lib/trawl/web.cookie
+)
 ```
+
+Three parts of this block are load-bearing. The strict mode plus the 32-byte
+check keep a failed `op read` or a bad decode from replacing the working key
+with an empty file, which would kill every session until someone noticed. The
+surrounding subshell keeps the block copy-paste safe in an interactive shell:
+the trap deletes the decoded key the moment the subshell ends instead of at
+logout, and neither the shell options nor the trap leak into your session.
 
 Build the key somewhere root owns, then `install` it into place in one step.
 `install` replaces the destination instead of following a link planted there,
