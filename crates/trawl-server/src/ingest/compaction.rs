@@ -349,31 +349,41 @@ pub async fn compact_once_coordinated(
 }
 
 async fn recover_pending_rollups(
-    publication: &PublicationGate,
+    publication: &Arc<PublicationGate>,
     repin: Option<&Arc<RepinCoordinator>>,
 ) -> Result<(), String> {
     let markers = publication.pending_rollup_markers();
     if !markers.is_empty() {
-        let _corpus_guard = match rollup_unit(repin).await {
+        let corpus_guard = match rollup_unit(repin).await {
             RollupUnit::Proceed(guard) => guard,
             RollupUnit::StandDown => {
                 return Err("pending rollup recovery is paused by a repin job".to_owned());
             }
         };
-        let _publication_guard = publication.write().await;
-        // A previous cleanup or retention pass may already have removed a
-        // marker. Clear only confirmed missing paths before selecting days.
-        for marker in &markers {
-            publication.finish_rollup(marker);
-        }
-        let days: std::collections::BTreeSet<PathBuf> = publication
-            .pending_rollup_markers()
-            .iter()
-            .filter_map(|marker| marker.parent().map(Path::to_path_buf))
-            .collect();
-        for day in days {
-            recover_rollup_markers_coordinated(&day, Some(publication))?;
-        }
+        let publication_guard = publication.write().await;
+        let publication = Arc::clone(publication);
+        tokio::task::spawn_blocking(move || -> Result<(), String> {
+            // Own both guards here so cancellation of the async caller cannot
+            // release either guard while recovery still relocates files.
+            let _corpus_guard = corpus_guard;
+            let _publication_guard = publication_guard;
+            // A previous cleanup or retention pass may already have removed a
+            // marker. Clear only confirmed missing paths before selecting days.
+            for marker in &markers {
+                publication.finish_rollup(marker);
+            }
+            let days: std::collections::BTreeSet<PathBuf> = publication
+                .pending_rollup_markers()
+                .iter()
+                .filter_map(|marker| marker.parent().map(Path::to_path_buf))
+                .collect();
+            for day in days {
+                recover_rollup_markers_coordinated(&day, Some(&publication))?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| format!("rollup recovery task panicked: {e}"))??;
     }
     // An incomplete bootstrap scan must also stop WAL publication, even if
     // the failed scan did not discover a marker before encountering an error.
@@ -413,18 +423,18 @@ async fn rollup_once(
 /// corpus-gate read guard that keeps a repin cutover out of it while it
 /// does. Without a coordinator (tests, embedded-style callers) there is no
 /// repin engine to exclude and every unit proceeds ungated.
-enum RollupUnit<'a> {
-    Proceed(Option<tokio::sync::RwLockReadGuard<'a, ()>>),
+enum RollupUnit {
+    Proceed(Option<tokio::sync::OwnedRwLockReadGuard<()>>),
     StandDown,
 }
 
 /// Claim the corpus for one relocating unit. See
 /// [`RepinCoordinator::rollup_unit_guard`] for why the pause is read under
 /// the guard rather than before it.
-async fn rollup_unit(repin: Option<&Arc<RepinCoordinator>>) -> RollupUnit<'_> {
+async fn rollup_unit(repin: Option<&Arc<RepinCoordinator>>) -> RollupUnit {
     match repin {
         None => RollupUnit::Proceed(None),
-        Some(c) => match c.rollup_unit_guard().await {
+        Some(c) => match c.rollup_unit_guard_owned().await {
             Some(guard) => RollupUnit::Proceed(Some(guard)),
             None => RollupUnit::StandDown,
         },
@@ -483,7 +493,7 @@ async fn rollup_env_once(
         // Recovery relocates files too (it deletes the hourly sources of a
         // merge that already completed), so it is a gated unit like the
         // merges below.
-        let recovery_guard = match rollup_unit(repin).await {
+        let corpus_guard = match rollup_unit(repin).await {
             RollupUnit::Proceed(guard) => guard,
             RollupUnit::StandDown => {
                 log_rollup_stand_down();
@@ -494,8 +504,17 @@ async fn rollup_env_once(
             Some(gate) => Some(gate.write().await),
             None => None,
         };
-        let recovery = recover_rollup_markers_coordinated(&path, publication.as_deref());
-        drop(publication_guard);
+        let day = path.clone();
+        let recovery_publication = publication.clone();
+        let recovery = tokio::task::spawn_blocking(move || {
+            // Lock acquisition stays async so readers can use the blocking
+            // pool to finish. Cancellation cannot release these moved guards.
+            let _corpus_guard = corpus_guard;
+            let _publication_guard = publication_guard;
+            recover_rollup_markers_coordinated(&day, recovery_publication.as_deref())
+        })
+        .await
+        .map_err(|e| format!("rollup recovery task panicked: {e}"))?;
         if let Err(e) = recovery {
             // A wedged recovery is data-loss-adjacent (an interrupted rollup
             // left orphaned hourlies/tmp that couldn't be cleaned up), so count
@@ -510,8 +529,6 @@ async fn rollup_env_once(
             );
             continue;
         }
-        drop(recovery_guard);
-
         // Collect hourly subdirs. If none exist, this day is already consolidated.
         let hour_dirs = collect_hour_dirs(&path);
         if hour_dirs.is_empty() {
@@ -700,6 +717,8 @@ fn recover_rollup_markers_coordinated(
         };
         if let Some(gate) = publication {
             gate.mark_rollup(&path);
+            #[cfg(any(test, feature = "test-support"))]
+            gate.hold_after_publish_for_test();
         }
         let canonical = day_dir.join(format!("{service}.parquet"));
         let tmp = day_dir.join(format!("{service}.parquet.tmp"));
@@ -3388,6 +3407,103 @@ fn extract_service_from_filename(filename: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn recovery_keeps_runtime_responsive_and_guards_after_cancellation() {
+        for pending in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("data");
+            let env = root.join("prod");
+            let row = r#"{"_time":"2026-01-15T00:00:00Z","_ingested":"2026-01-15T00:00:00Z","service":"nginx","msg":"one"}"#;
+            let hourly = write_hourly_parquet(&env, "2026-01-15", "00", "nginx", &[row]);
+            let day = env.join("2026-01-15");
+            let daily = day.join("nginx.parquet");
+            std::fs::copy(&hourly, &daily).unwrap();
+            write_rollup_marker(&day, "nginx", std::slice::from_ref(&hourly)).unwrap();
+            let marker = rollup_marker_path(&day, "nginx");
+            let gate = Arc::new(PublicationGate::new());
+            gate.initialize(&root);
+            let coordinator = Arc::new(RepinCoordinator::new());
+            let (entered, release) = gate.pause_next_publication_for_test();
+            let (paused_tx, paused_rx) = tokio::sync::oneshot::channel();
+            let (checked_tx, checked_rx) = std::sync::mpsc::channel();
+            let runtime_gate = Arc::clone(&gate);
+            let runtime_coordinator = Arc::clone(&coordinator);
+            let runtime_thread = std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .max_blocking_threads(1)
+                    .build()
+                    .unwrap();
+                runtime.block_on(async move {
+                    let recovery_gate = Arc::clone(&runtime_gate);
+                    let recovery_coordinator = Arc::clone(&runtime_coordinator);
+                    let recovery = tokio::spawn(async move {
+                        if pending {
+                            recover_pending_rollups(&recovery_gate, Some(&recovery_coordinator))
+                                .await
+                        } else {
+                            rollup_env_once(
+                                &env,
+                                "2GB",
+                                Some(&recovery_coordinator),
+                                Some(recovery_gate),
+                            )
+                            .await
+                            .map(|_| ())
+                        }
+                    });
+                    paused_rx.await.unwrap();
+                    recovery.abort();
+                    let cancelled = recovery.await.is_err_and(|error| error.is_cancelled());
+                    let readers_blocked =
+                        tokio::time::timeout(Duration::from_millis(20), runtime_gate.read())
+                            .await
+                            .is_err();
+                    let cutover_blocked = tokio::time::timeout(
+                        Duration::from_millis(20),
+                        runtime_coordinator.cutover_guard(),
+                    )
+                    .await
+                    .is_err();
+                    checked_tx
+                        .send((cancelled, readers_blocked, cutover_blocked))
+                        .unwrap();
+                    drop(
+                        tokio::time::timeout(Duration::from_secs(30), runtime_gate.read())
+                            .await
+                            .unwrap()
+                            .unwrap(),
+                    );
+                    drop(
+                        tokio::time::timeout(
+                            Duration::from_secs(30),
+                            runtime_coordinator.cutover_guard(),
+                        )
+                        .await
+                        .unwrap(),
+                    );
+                });
+            });
+
+            // Control the pause outside Tokio so a regression that blocks its
+            // only worker fails within a deadline and still releases recovery.
+            let entered_result = entered.recv_timeout(Duration::from_secs(30));
+            let _ = paused_tx.send(());
+            let checks = checked_rx.recv_timeout(Duration::from_secs(5));
+            let marker_pending = gate.pending_rollup_markers() == vec![marker.clone()];
+            let hourly_retained = hourly.exists();
+            let _ = release.send(());
+            let completed = runtime_thread.join();
+            entered_result.unwrap();
+            completed.unwrap();
+            assert_eq!(checks.unwrap(), (true, true, true), "pending={pending}");
+            assert!(marker_pending && hourly_retained);
+            assert!(!marker.exists());
+            assert!(!hourly.exists());
+            assert_eq!(read_strings(&daily, "msg"), vec!["one"]);
+        }
+    }
+
     #[tokio::test]
     async fn failed_marker_stage_preserves_complete_list_and_stage_is_ignored() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3693,11 +3809,12 @@ mod tests {
         std::fs::write(aside.join("child"), b"occupied").unwrap();
         std::fs::write(day.join("nginx.parquet"), b"daily").unwrap();
         write_rollup_marker(day, "nginx", &[hourly]).unwrap();
-        let gate = PublicationGate::new();
+        let gate = Arc::new(PublicationGate::new());
         {
             let _writer = gate.write().await;
-            assert!(recover_rollup_markers_coordinated(day, Some(&gate)).is_err());
+            gate.mark_rollup(&rollup_marker_path(day, "nginx"));
         }
+        assert!(recover_pending_rollups(&gate, None).await.is_err());
         assert!(gate.read().await.is_err());
         assert!(rollup_marker_path(day, "nginx").exists());
     }

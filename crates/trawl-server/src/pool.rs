@@ -916,18 +916,22 @@ impl ExecutorPool {
     ///
     /// `service`, when present, scopes the glob to one service's files; the
     /// caller is responsible for validating the name.
+    /// `timeout` bounds the wait for publication after acquiring a pool permit.
     pub async fn sample_field_values(
         &self,
         field: &str,
         service: Option<&str>,
         limit: usize,
+        timeout: Duration,
     ) -> Result<Vec<String>, ServerError> {
         let semaphore = Arc::clone(&self.semaphore);
         let Ok(permit) = semaphore.acquire_owned().await else {
             return Err(ServerError::Internal("executor pool shut down".into()));
         };
 
-        let publication = self.publication.read().await?;
+        let publication = tokio::time::timeout(timeout, self.publication.read())
+            .await
+            .map_err(|_| ServerError::Timeout)??;
         let executor = self.take_executor();
         let fallback_glob = Arc::clone(&self.fallback_glob);
         let field = field.to_owned();
@@ -1447,7 +1451,10 @@ mod tests {
             .expect("an idle pool is immediately exclusive");
 
         let p2 = pool.clone();
-        let queued = tokio::spawn(async move { p2.sample_field_values("service", None, 10).await });
+        let queued = tokio::spawn(async move {
+            p2.sample_field_values("service", None, 10, Duration::from_secs(10))
+                .await
+        });
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(
             !queued.is_finished(),
@@ -1458,6 +1465,41 @@ mod tests {
         // (The sample itself fails against a nonexistent corpus; the point
         // is that it only ran once exclusivity was released.)
         let _ = queued.await.expect("queued sample joins");
+    }
+
+    #[tokio::test]
+    async fn field_value_sampling_publication_timeout_releases_permit() {
+        let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000, None);
+        let writer = pool.publication.write().await;
+        let idle_before = pool.idle.lock().len();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            pool.sample_field_values("service", None, 10, Duration::from_millis(20)),
+        )
+        .await
+        .expect("publication wait must return before the writer releases its guard");
+
+        assert!(
+            matches!(result, Err(ServerError::Timeout)),
+            "got {result:?}"
+        );
+        assert_eq!(
+            pool.available_permits(),
+            1,
+            "the waiting permit is released"
+        );
+        assert_eq!(
+            pool.idle.lock().len(),
+            idle_before,
+            "publication timeout must not take an executor"
+        );
+        let exclusive = pool
+            .exclusive(Duration::from_secs(1))
+            .await
+            .expect("the recovered permit is available while publication remains blocked");
+        drop(exclusive);
+        drop(writer);
     }
 
     /// A held query permit starves `exclusive()` past its budget: the

@@ -30,12 +30,12 @@
 
 use std::sync::Arc;
 
-use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard, watch};
+use tokio::sync::{OwnedRwLockReadGuard, RwLock, RwLockReadGuard, RwLockWriteGuard, watch};
 
 /// Shared interlock between the repin engine and the compaction loop.
 #[derive(Debug)]
 pub struct RepinCoordinator {
-    corpus_gate: RwLock<()>,
+    corpus_gate: Arc<RwLock<()>>,
     rollup_pause: watch::Sender<bool>,
     /// Test-only widening of the cutover pause, held on the coordinator
     /// rather than in a static so one test's widened pause cannot leak
@@ -65,7 +65,7 @@ impl RepinCoordinator {
     pub fn new() -> Self {
         let (rollup_pause, _) = watch::channel(false);
         Self {
-            corpus_gate: RwLock::new(()),
+            corpus_gate: Arc::new(RwLock::new(())),
             rollup_pause,
             #[cfg(any(test, feature = "test-support"))]
             cutover_hold: CutoverHold::default(),
@@ -120,6 +120,13 @@ impl RepinCoordinator {
     /// is held, so it means no swap can happen before this unit finishes.
     pub async fn rollup_unit_guard(&self) -> Option<RwLockReadGuard<'_, ()>> {
         let guard = self.corpus_gate.read().await;
+        (!self.rollup_paused()).then_some(guard)
+    }
+
+    /// The same claim as [`Self::rollup_unit_guard`], owned so a blocking
+    /// recovery task can retain it after cancellation of its async caller.
+    pub(crate) async fn rollup_unit_guard_owned(&self) -> Option<OwnedRwLockReadGuard<()>> {
+        let guard = Arc::clone(&self.corpus_gate).read_owned().await;
         (!self.rollup_paused()).then_some(guard)
     }
 

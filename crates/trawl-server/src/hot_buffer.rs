@@ -10,10 +10,9 @@
 //! with the parquet source.
 //!
 //! Events stay in the hot buffer until compaction writes parquet and
-//! calls [`drain`](HotBuffer::drain). During the brief window between
-//! parquet write and drain, events may appear in both sources; that
-//! transient overcount is acceptable, while invisible events (missing
-//! from both sources) are not.
+//! calls [`drain`](HotBuffer::drain). The shared publication guard keeps
+//! query and export readers outside the interval between the canonical
+//! file rename and hot drain, so they cannot count both copies.
 
 use std::io::{BufWriter, Write as _};
 use std::sync::Arc;

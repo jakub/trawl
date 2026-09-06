@@ -8,12 +8,12 @@ import { spawn, execFileSync } from 'node:child_process';
 import fs from 'node:fs/promises';
 import http from 'node:http';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
-function start(args) {
-  const child = spawn(path.join(root, 'bin/app-experiment'), ['--skip-build', '--events', '100', '--rate', '1000', ...args], { cwd: root, stdio: ['ignore', 'pipe', 'pipe'] });
+function start(args, env = {}) {
+  const child = spawn(path.join(root, 'bin/app-experiment'), ['--skip-build', '--events', '100', '--rate', '1000', ...args], { cwd: root, env: { ...process.env, ...env }, stdio: ['ignore', 'pipe', 'pipe'] });
   let output = '';
   for (const stream of [child.stdout, child.stderr]) stream.on('data', c => { output += c; });
   const done = new Promise((resolve, reject) => { child.once('error', reject); child.once('close', resolve); });
@@ -32,18 +32,25 @@ async function finish(run) {
   const timer = setTimeout(() => run.child.kill('SIGTERM'), 90000);
   try { return await run.done; } finally { clearTimeout(timer); }
 }
-async function verifyCleanup(run) {
+async function readReport(run) {
   const match = run.output().match(/Private artifacts: (.+)/);
   assert.ok(match, run.output());
   const dir = match[1].trim();
   const report = JSON.parse(await fs.readFile(path.join(dir, 'report.json'), 'utf8'));
-  assert.deepEqual(report.cleanup, { processes: true, container: true, secrets: true });
-  await assert.rejects(fs.stat(path.join(dir, 'private')), { code: 'ENOENT' });
-  const containers = execFileSync('docker', ['--host', 'unix:///var/run/docker.sock', 'ps', '--all', '--quiet', '--filter', `label=trawl.experiment=${report.runId}`], { encoding: 'utf8' });
+  return { dir, report };
+}
+async function verifyResources(report) {
+  const containers = execFileSync('docker', ['--host', 'unix:///var/run/docker.sock', 'ps', '--all', '--quiet', '--filter', `label=trawl.experiment=${report.runId}`], { encoding: 'utf8', timeout: 10000, killSignal: 'SIGKILL' });
   assert.equal(containers.trim(), '', 'owned container remained after exit');
   for (const { name, pid } of report.processes || []) {
     assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' }, `${name} remained alive after exit`);
   }
+}
+async function verifyCleanup(run) {
+  const { dir, report } = await readReport(run);
+  assert.deepEqual(report.cleanup, { processes: true, container: true, secrets: true });
+  await assert.rejects(fs.stat(path.join(dir, 'private')), { code: 'ENOENT' });
+  await verifyResources(report);
   return report;
 }
 
@@ -76,5 +83,69 @@ test('SIGTERM during an interactive hold cleans the verified instance', { timeou
     assert.ok(report.phases.some(p => p.name === 'browser-session-after-restart'));
   } finally {
     if (run.child.exitCode === null) { run.child.kill('SIGTERM'); await run.done; }
+  }
+});
+
+async function injectFilesystemFailure(method, suffix, code) {
+  const dir = await fs.mkdtemp(path.join(root, 'target/lifecycle-fault-'));
+  const module = path.join(dir, 'inject.mjs');
+  const marker = path.join(dir, 'injected');
+  await fs.writeFile(module, `import fs from 'node:fs/promises';
+const original = fs[${JSON.stringify(method)}];
+let injected = false;
+fs[${JSON.stringify(method)}] = async function(target, ...args) {
+  if (!injected && String(target).endsWith(${JSON.stringify(suffix)})) {
+    injected = true;
+    await fs.writeFile(${JSON.stringify(marker)}, 'injected');
+    throw Object.assign(new Error('lifecycle injected ${code}'), { code: ${JSON.stringify(code)} });
+  }
+  return original.call(this, target, ...args);
+};
+`);
+  return { dir, marker, env: { NODE_OPTIONS: `--import=${pathToFileURL(module).href}` } };
+}
+
+for (const code of ['ENOENT', 'ENOTDIR']) {
+  test(`compaction polling ${code === 'ENOENT' ? 'retries ENOENT' : 'reports ENOTDIR'}`, { timeout: 120000 }, async () => {
+    const fault = await injectFilesystemFailure('readdir', '/private/data/experiment', code);
+    const run = start([], fault.env);
+    try {
+      assert.equal(await finish(run), code === 'ENOENT' ? 0 : 1, run.output());
+      assert.equal(await fs.readFile(fault.marker, 'utf8'), 'injected');
+      const report = await verifyCleanup(run);
+      assert.equal(report.status, code === 'ENOENT' ? 'passed' : 'failed');
+      if (code === 'ENOTDIR') assert.match(report.error, /lifecycle injected ENOTDIR/);
+      else assert.ok(report.phases.some(p => p.name === 'browser-session-after-restart'));
+    } finally {
+      if (run.child.exitCode === null) { run.child.kill('SIGTERM'); await run.done; }
+      await fs.rm(fault.dir, { recursive: true, force: true });
+    }
+  });
+}
+
+test('private-directory removal failure still writes the final report', { timeout: 120000 }, async () => {
+  const fault = await injectFilesystemFailure('rm', '/private', 'EACCES');
+  const listener = http.createServer((req, res) => res.end('owned-by-test'));
+  await new Promise(resolve => listener.listen(0, '127.0.0.1', resolve));
+  const run = start(['--web-port', String(listener.address().port)], fault.env);
+  try {
+    assert.equal(await finish(run), 1, run.output());
+    assert.equal(await fs.readFile(fault.marker, 'utf8'), 'injected');
+    const { dir, report } = await readReport(run);
+    assert.equal(report.status, 'failed');
+    assert.match(report.error, /trawl-web exited during startup/);
+    assert.deepEqual(report.cleanup, {
+      processes: true, container: true, secrets: false,
+      secretsError: 'lifecycle injected EACCES',
+    });
+    await verifyResources(report);
+    assert.ok((await fs.stat(path.join(dir, 'private'))).isDirectory());
+    // The parent removes this test-owned residue only after checking ownership
+    // and proving the runner stopped its processes and container.
+    await fs.rm(path.join(dir, 'private'), { recursive: true, force: true });
+  } finally {
+    if (run.child.exitCode === null) { run.child.kill('SIGTERM'); await run.done; }
+    await new Promise(resolve => listener.close(resolve));
+    await fs.rm(fault.dir, { recursive: true, force: true });
   }
 });

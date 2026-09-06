@@ -405,10 +405,18 @@ Real lifecycle tests, after preparing the build:
 node scripts/app-experiment/lifecycle.test.mjs
 ```
 
-These start real disposable instances. One holds a port open and proves that
-startup refuses to reuse it without disturbing its owner. The other sends
-SIGTERM during a verified interactive hold. Both check the final report,
-private-directory removal, and Docker's live container inventory.
+These start real disposable instances. They check port collisions, SIGTERM
+during a verified hold, compaction polling with a temporarily missing directory,
+a non-retryable filesystem error, and failure to remove the private directory.
+The tests check the final report and Docker's live container inventory. Docker
+inventory checks have a ten-second deadline. A timeout fails verification.
+
+Fault injection uses a Node preload in the runner process. The runner does not
+pass that preload to app processes. The removal-failure test proves that the
+report records `cleanup.secrets: false` and `cleanup.secretsError`, then removes
+its own residue after verifying that the processes and container stopped.
+For a real removal failure, follow the ownership checks in the teardown section
+before removing the remaining private directory.
 
 ## Changing or extending an experiment
 
@@ -494,7 +502,7 @@ Read source only for the component being changed:
 | `scripts/app-experiment/run.mjs` | Preparation, instance ownership, API/browser scenario, measurements, cleanup |
 | `scripts/app-experiment/workload.mjs` | Deterministic corpus and independent result/page checks |
 | `scripts/app-experiment/workload.test.mjs` | Loss, duplication, corruption, truncation, short pages, and workload variation |
-| `scripts/app-experiment/lifecycle.test.mjs` | Real port-collision and SIGTERM cleanup checks |
+| `scripts/app-experiment/lifecycle.test.mjs` | Real lifecycle and filesystem-failure checks |
 
 After a runner change, run the focused Node tests and the full scenario.
 After lifecycle changes, also run the real lifecycle tests with the same

@@ -427,7 +427,13 @@ async function experiment() {
     await verify('ingested', events);
     await poll('compaction and hot-buffer drain', async () => {
       const metrics = (await request(`${upstream}/metrics`)).text;
-      return /^trawl_hot_buffer_events 0$/m.test(metrics) && (await fs.readdir(path.join(dataDir, 'experiment'), { recursive: true })).some(p => p.endsWith('.parquet'));
+      if (!/^trawl_hot_buffer_events 0$/m.test(metrics)) return false;
+      try {
+        return (await fs.readdir(path.join(dataDir, 'experiment'), { recursive: true })).some(p => p.endsWith('.parquet'));
+      } catch (error) {
+        if (error.code === 'ENOENT') return false;
+        throw error;
+      }
     });
     await verify('compacted', events);
     // Stop the proxy first so it cannot send requests into the restarting daemon.
@@ -511,8 +517,14 @@ try {
       process.exitCode = 1;
     }
   } else report.cleanup.container = true;
-  await fs.rm(privateDir, { recursive: true, force: true });
-  report.cleanup.secrets = true;
+  try {
+    await fs.rm(privateDir, { recursive: true, force: true });
+    report.cleanup.secrets = true;
+  } catch (error) {
+    report.cleanup.secretsError = clean(error.message);
+    report.status = 'failed';
+    process.exitCode = 1;
+  }
   report.endedAt = new Date().toISOString();
   report.interrupted = wasInterrupted;
   await writeJSON('report.json', report);

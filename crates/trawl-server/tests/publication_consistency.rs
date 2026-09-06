@@ -160,7 +160,8 @@ async fn query_only_pool_refuses_incomplete_rollup_after_restart() {
         .await;
     assert!(matches!(export, Err(ServerError::ServiceUnavailable(_))));
     assert!(matches!(
-        pool.sample_field_values("message", None, 10).await,
+        pool.sample_field_values("message", None, 10, Duration::from_secs(1))
+            .await,
         Err(ServerError::ServiceUnavailable(_))
     ));
     assert_eq!(pool.available_permits(), 1);
