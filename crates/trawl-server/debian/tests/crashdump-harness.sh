@@ -75,6 +75,7 @@ readonly CORES="/var/lib/trawl/cores"
 # Distinct exit codes, so a caller can tell an assertion failure from the two
 # outcomes that need a human rather than a rerun.
 readonly EXIT_SYSCTL_RESTORE_FAILED=3
+readonly EXIT_PARTIAL=4
 # CAP_SYS_PTRACE is capability number 19.
 readonly PTRACE_CAP_BIT=19
 
@@ -728,13 +729,21 @@ scope_case() { # scope_case <scope>
   (( restarts_after > restarts_before )) || die "scope $scope: systemd did not restart trawld"
 }
 
+# A skipped case is a hole in the evidence, not a pass. Both get counted so the
+# result block can say which of the two it is.
+POSITIVE_REQUESTED=${#SCOPES[@]}
+POSITIVE_RUN=0
+NOT_RUN=()
+
 for scope in "${SCOPES[@]}"; do
   phase "C/D fault at yama ptrace_scope=$scope"
   ensure_scope "$scope"
   if (( SCOPE_READY )); then
     scope_case "$scope"
+    POSITIVE_RUN=$((POSITIVE_RUN + 1))
   else
     note "skipped: $SCOPE_SKIP_REASON"
+    NOT_RUN+=("crash case at ptrace_scope=$scope ($SCOPE_SKIP_REASON)")
   fi
 done
 
@@ -751,6 +760,9 @@ else
     NEGATIVE_READY=1
   else
     note "skipped: $SCOPE_SKIP_REASON"
+    # --no-negative is an operator asking for less. This branch is the harness
+    # failing to deliver what it was asked for, which is a different thing.
+    NOT_RUN+=("negative control at ptrace_scope=2 ($SCOPE_SKIP_REASON)")
   fi
 fi
 
@@ -822,4 +834,15 @@ cat /etc/systemd/system/trawld.service.d/crashdump.conf"
 fi
 
 phase "result"
-note "every assertion passed"
+
+note "crash cases executed: $POSITIVE_RUN of $POSITIVE_REQUESTED requested (${SCOPES[*]})"
+if (( ${#NOT_RUN[@]} == 0 )); then
+  note "every assertion passed"
+else
+  note "result: partial"
+  for missing in "${NOT_RUN[@]}"; do
+    note "  not run: $missing"
+  done
+  note "what ran passed, but this run does not cover what it was asked to cover"
+  exit "$EXIT_PARTIAL"
+fi
