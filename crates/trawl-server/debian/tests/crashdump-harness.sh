@@ -491,7 +491,21 @@ phase "4 install"
 
 # /tmp in the node is a docker tmpfs, which docker cp cannot write into.
 run docker cp "$DEB" "$NODE:$DEB_IN_NODE"
-nsh "DEBIAN_FRONTEND=noninteractive apt-get install -y $DEB_IN_NODE 2>&1 | tail -6"
+
+# `set -o pipefail` inside the container: a bash -c does not inherit it, so
+# without this the pipeline reports tail's status and a failed configure would
+# read as a clean install. That is exactly how the cargo-deb 3.8 sysusers
+# regression could have slipped through every assertion below.
+nsh "set -o pipefail
+DEBIAN_FRONTEND=noninteractive apt-get install -y $DEB_IN_NODE 2>&1 | tail -8"
+
+# apt's exit status is one witness; dpkg's own record of the package state is a
+# second, independent one. A half-configured package is `install ok half-configured`
+# here, whatever apt returned.
+install_status=$(nshq "dpkg-query -W -f='\${Status}' trawl-server")
+printf '\n$ dpkg-query -W -f=%s trawl-server\n%s\n' "'\${Status}'" "$install_status"
+[[ "$install_status" == "install ok installed" ]] \
+  || die "trawl-server is '$install_status', not 'install ok installed' — the package did not configure"
 
 printf '\n$ dpkg-deb -c %s | grep examples/crashdump.conf\n' "$(basename "$DEB")"
 dpkg-deb -c "$DEB" | grep 'examples/crashdump.conf' \
