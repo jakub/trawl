@@ -22,6 +22,8 @@ pre-push:
   # Defaults name the two local development clusters. Agents can provide
   # dedicated clusters through TRAWL_TEST_DATABASE_URL and
   # TRAWL_TEST_ND_DATABASE_URL; ambient DATABASE_URL is still ignored.
+  # Inline defaults keep pushes independent of direnv, which does not run
+  # in these non-interactive hook shells.
   # The glob keeps doc-only pushes from paying for the full suites — tests
   # run only when the push touches code, manifests, or migrations.
   parallel: true
