@@ -85,8 +85,15 @@ applied by a trawld that is no longer capturing. When the dumps have served
 their purpose, delete or archive them:
 
 ```bash
-sudo rm /var/lib/trawl/cores/*.dmp
+sudo find /var/lib/trawl/cores -maxdepth 1 -type f -name '*.dmp' -delete
 ```
+
+`find` rather than `sudo rm .../*.dmp` because your shell expands the glob
+before `sudo` runs, as you, and the directory is `0700 trawl:trawl`. The glob
+matches nothing, and what happens next depends on your shell: bash passes the
+literal `*.dmp` through and `rm` reports one missing file, zsh refuses the
+command outright. Neither deletes anything, and the first one looks close
+enough to working to be believed.
 
 The copy under `/etc` is yours. Package upgrades never refresh it, so if a
 later release changes the shipped example your installed drop-in stays as it
