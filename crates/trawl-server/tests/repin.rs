@@ -218,6 +218,221 @@ fn event(service: &str, extra: &serde_json::Value) -> serde_json::Value {
     base
 }
 
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one incomplete rollup, its recovery, and both repin paths
+async fn pending_rollup_blocks_repin_before_scan_and_preserves_recovery() {
+    use trawl_server::error::ServerError;
+    use trawl_server::store::RepinJobStatus;
+
+    let h = harness().await;
+    h.ingest_and_compact(&[
+        event("late", &json!({"dur": 1})),
+        event("late", &json!({"dur": 2})),
+    ])
+    .await;
+    let source = walk(&h.data_dir)
+        .into_iter()
+        .find(|path| path.file_name().is_some_and(|name| name == "late.parquet"))
+        .unwrap();
+    let day = h.data_dir.join("prod/2026-01-01");
+    let canonical = day.join("late.parquet");
+    let hourly = day.join("01/late.parquet");
+    let tmp = day.join("late.parquet.tmp");
+    std::fs::create_dir_all(hourly.parent().unwrap()).unwrap();
+    let paths = [canonical.clone(), hourly.clone(), tmp.clone()];
+    tokio::task::spawn_blocking(move || {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let source_sql = source.to_string_lossy().replace('\'', "''");
+        for (path, filter) in paths.iter().zip(["WHERE dur=1", "WHERE dur=2", ""]) {
+            conn.execute_batch(&format!(
+                "COPY (SELECT * FROM read_parquet('{source_sql}') {filter}) TO '{}' (FORMAT PARQUET)",
+                path.to_string_lossy().replace('\'', "''")
+            ))
+            .unwrap();
+        }
+        std::fs::remove_file(source).unwrap();
+    })
+    .await
+    .unwrap();
+
+    let marker = day.join(".rollup-late");
+    let publication = h
+        .server
+        .state
+        .query
+        .hot_buffer
+        .as_ref()
+        .unwrap()
+        .publication();
+    {
+        let _writer = publication.write().await;
+        std::fs::write(&marker, format!("{}\n", hourly.display())).unwrap();
+        publication.mark_rollup(&marker);
+    }
+    let originals: Vec<_> = [&canonical, &hourly, &tmp, &marker]
+        .into_iter()
+        .map(|path| (path.clone(), std::fs::read(path).unwrap()))
+        .collect();
+    let engine = h.engine();
+    let coordinator = h.server.state.ingest.repin_coordinator.as_ref().unwrap();
+    for dry_run in [true, false] {
+        assert!(matches!(
+            engine
+                .start(
+                    "dur",
+                    "VARCHAR",
+                    None,
+                    dry_run,
+                    false,
+                    RequestedCeilings::default(),
+                    Some("op")
+                )
+                .await,
+            Err(ServerError::ServiceUnavailable(_))
+        ));
+        let job = engine.store().latest().await.unwrap().unwrap();
+        assert_eq!(job.status, RepinJobStatus::Blocked);
+        assert!(
+            job.planned_at.is_none(),
+            "no scan report may describe a pending rollup"
+        );
+        assert_eq!(job.files_done, 0);
+        assert!(!coordinator.rollup_paused());
+        assert!(!trawl_server::repin::marker_path(&h.data_dir).exists());
+        assert!(!trawl_server::repin::shadow_root(&h.data_dir).exists());
+        assert!(!trawl_server::repin::aside_root(&h.data_dir).exists());
+        for (path, bytes) in &originals {
+            assert_eq!(
+                &std::fs::read(path).unwrap(),
+                bytes,
+                "{} changed",
+                path.display()
+            );
+        }
+    }
+
+    h.compact_tick().await;
+    assert!(!marker.exists());
+    assert!(!tmp.exists());
+    assert!(!hourly.exists());
+    assert_eq!(h.count("service=late | stats count()").await, 2);
+    assert_eq!(h.count("service=late dur=2 | stats count()").await, 1);
+
+    let dry = engine
+        .start(
+            "dur",
+            "VARCHAR",
+            None,
+            true,
+            false,
+            RequestedCeilings::default(),
+            Some("op"),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(dry, StartOutcome::DryRun(_)));
+    assert_eq!(
+        engine.store().latest().await.unwrap().unwrap().status,
+        RepinJobStatus::Succeeded
+    );
+    assert!(
+        !coordinator.rollup_paused(),
+        "the dry run releases its admission pause"
+    );
+    let started = match engine
+        .start(
+            "dur",
+            "VARCHAR",
+            None,
+            false,
+            false,
+            RequestedCeilings::default(),
+            Some("op"),
+        )
+        .await
+        .unwrap()
+    {
+        StartOutcome::Started(job) => job,
+        other => panic!("expected a started repin after recovery, got {other:?}"),
+    };
+    assert_eq!(h.wait_terminal(started.id).await.status, "succeeded");
+    h.wait_cleanup().await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while coordinator.rollup_paused() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the completed job releases its admission pause");
+    assert_eq!(h.count("service=late | stats count()").await, 2);
+}
+
+#[tokio::test]
+async fn cancelling_repin_during_rollup_admission_terminalizes_the_job() {
+    use trawl_server::repin::cancel::{CancelActor, CancelVerdict};
+    use trawl_server::store::RepinJobStatus;
+
+    let h = harness().await;
+    h.ingest_and_compact(&[event("api", &json!({"dur": 1}))])
+        .await;
+    let engine = h.engine();
+    let coordinator = h.server.state.ingest.repin_coordinator.as_ref().unwrap();
+    let active = coordinator.rollup_unit_guard().await.unwrap();
+    let request_engine = engine.clone();
+    let request = tokio::spawn(async move {
+        request_engine
+            .start(
+                "dur",
+                "VARCHAR",
+                None,
+                false,
+                false,
+                RequestedCeilings::default(),
+                Some("op"),
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while engine.store().latest().await.unwrap().is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the request claims a job before waiting on the rollup");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match engine.cancel(&CancelActor::new("operator", "test-key")) {
+                CancelVerdict::Cancelling { .. } => break,
+                // The committed claim can precede the in-process cancel
+                // registry by the response from that database write.
+                CancelVerdict::NoJobRunning => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                CancelVerdict::PastPointOfNoReturn { .. } => {
+                    panic!("a job waiting for admission cannot reach cutover");
+                }
+            }
+        }
+    })
+    .await
+    .expect("the waiting job arms its cancellation registry");
+    let outcome = tokio::time::timeout(Duration::from_secs(5), request)
+        .await
+        .expect("cancellation cannot wait for the active rollup")
+        .unwrap()
+        .unwrap();
+    assert!(matches!(outcome, StartOutcome::Cancelled(_)));
+    assert_eq!(
+        engine.store().latest().await.unwrap().unwrap().status,
+        RepinJobStatus::Cancelled
+    );
+    assert!(!coordinator.rollup_paused());
+    assert!(!trawl_server::repin::marker_path(&h.data_dir).exists());
+    assert!(!trawl_server::repin::shadow_root(&h.data_dir).exists());
+    drop(active);
+    assert_eq!(h.count("service=api | stats count()").await, 1);
+}
+
 /// The acceptance test: a BIGINT-pinned field with a shelved conflict
 /// value is repinned to VARCHAR. The dry run projects, the rewrite
 /// matches the projection, existing queries answer identically, the

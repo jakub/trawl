@@ -1,0 +1,145 @@
+{
+  "schema": 1,
+  "runId": "run-1788714811393-07b6f46730",
+  "status": "passed",
+  "seed": 49,
+  "count": 20000,
+  "rate": 2000,
+  "batchSize": 1000,
+  "host": {
+    "platform": "linux",
+    "architecture": "x64",
+    "cpuModel": "AMD Ryzen 7 7800X3D 8-Core Processor",
+    "logicalCpus": 16,
+    "totalMemoryBytes": 33342214144
+  },
+  "build": {
+    "sourceHash": "41ad09c77170ffc789a49ae851d5099792c0a14acb6619f9506ecd8dbdb73d2a",
+    "binaries": {
+      "trawld": "673310eb7d356649301a5bf7a51a5f62a150bebb4e1ff1c9bd26035231827105",
+      "trawl-web": "6c870d3e48d9f398d04f75130f4411274ad6ee220debe12803459e177be6e49e",
+      "fleet-admin": "f9395365a13fad402b4bf3dba20c9f7cfc771dbd29491c248593af260d1d74dc",
+      "deps/libduckdb.so": "fc23f12e376c47be520f75221288281906e7942e8fd6f6ce4849198ba60d0405"
+    },
+    "profile": "debug server, release SPA, downloaded DuckDB",
+    "commit": "6ec670ccd63c97e257b5e56677123a1e38da8c4f",
+    "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+    "node": "v26.8.1",
+    "spaHash": "433bc4af308d99385bf0048fa0cf41a3eed4c6db061efd809e535f7dbd7e35f9"
+  },
+  "phases": [
+    {
+      "name": "initial",
+      "verifiedEvents": 1000,
+      "resultHash": "c0ec903d91f32f70a311dd6ce8926301b7ec52f2d71f57032d3db4d23f5baf9d",
+      "process": {
+        "VmHWM": "221088 kB",
+        "VmRSS": "103376 kB",
+        "Threads": "33"
+      }
+    },
+    {
+      "name": "browser-login-search",
+      "verifiedEvents": 50
+    },
+    {
+      "name": "browser-live-tail",
+      "verifiedEvents": 19000
+    },
+    {
+      "name": "browser-live-tail-closed"
+    },
+    {
+      "name": "ingested",
+      "verifiedEvents": 20000,
+      "resultHash": "7677e6410b0525fb7ddbc52f6a998f3d23d5fc7971ab71bd3b0fe38d343e85f5",
+      "process": {
+        "VmHWM": "243828 kB",
+        "VmRSS": "230288 kB",
+        "Threads": "33"
+      }
+    },
+    {
+      "name": "compacted",
+      "verifiedEvents": 20000,
+      "resultHash": "7677e6410b0525fb7ddbc52f6a998f3d23d5fc7971ab71bd3b0fe38d343e85f5",
+      "process": {
+        "VmHWM": "243828 kB",
+        "VmRSS": "156056 kB",
+        "Threads": "34"
+      }
+    },
+    {
+      "name": "restarted",
+      "verifiedEvents": 20000,
+      "resultHash": "7677e6410b0525fb7ddbc52f6a998f3d23d5fc7971ab71bd3b0fe38d343e85f5",
+      "process": {
+        "VmHWM": "216788 kB",
+        "VmRSS": "98584 kB",
+        "Threads": "33"
+      }
+    },
+    {
+      "name": "browser-session-after-restart",
+      "verifiedEvents": 50
+    }
+  ],
+  "ingest": {
+    "sent": 20000,
+    "accepted": 20000,
+    "rejected": 0,
+    "ambiguousBatches": 0,
+    "durationMs": 10198.248419999989,
+    "pacedEvents": 19000
+  },
+  "cleanup": {
+    "processes": true,
+    "container": true,
+    "secrets": true
+  },
+  "runnerHash": "e7861bf6630d0d8a694c9b7425b839c843dd17ed3cea37f0836d42f56de258e7",
+  "postgresImage": "sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280",
+  "corpusHash": "91823d3d574d38f12714f1ae55e7c7677387c7b6978b6b300ade4f83d16c6d21",
+  "queryLatencyMs": {
+    "values": [
+      3341.4612239999988,
+      74.76647200000298,
+      98.8561880000052,
+      123.91130799999519,
+      145.79305999999633,
+      173.88148899999214,
+      192.441273000004,
+      220.30564200000663,
+      242.23784400000295,
+      268.7023740000004,
+      292.37490300000354,
+      311.19691499999317,
+      334.83578500000294,
+      367.83856099999684,
+      388.7161389999965,
+      409.6737260000082,
+      431.5412880000076,
+      453.54564799999935,
+      475.45967999999993,
+      508.7676130000036,
+      140.95729199999187,
+      26.478698999999324,
+      3350.4041629999847
+    ],
+    "samples": 23,
+    "p50": 292.37490300000354,
+    "p95": 3341.4612239999988,
+    "max": 3350.4041629999847
+  },
+  "endedAt": "2026-09-06T17:15:43.770Z",
+  "interrupted": false,
+  "evidence": {
+    "rawReportSha256": "38d061bd362712599513209ece152dd7fa4ca33bc1e61babb22597bec52f6a7c",
+    "omittedFields": [
+      "build.checkout",
+      "build.target",
+      "processes"
+    ],
+    "note": "Local paths and process IDs omitted; result and build hashes are unchanged."
+  }
+}

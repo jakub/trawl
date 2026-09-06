@@ -9,6 +9,8 @@
 // sheet is a starting point, not gospel.
 
 export const SEL = {
+  /// crates/trawl-web-ui/src/pages/search.rs LiveRawTable.
+  liveResultsTable: '.results-table',
   /// crates/trawl-web-ui/src/components/editor.rs — the CodeMirror mount div.
   dslEditor: '.dsl-editor',
   /// CodeMirror's own contenteditable content div (standard CM6 class,

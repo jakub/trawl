@@ -74,6 +74,86 @@ crates/
 - **cargo-nextest** for testing, **cargo-insta** for snapshot tests
 - **cargo-deny** for license/vulnerability auditing
 
+## app experiments: agent quick start
+
+When asked to run an experiment, exercise the app, or investigate performance,
+use `bin/app-experiment` in an isolated worktree. It owns a disposable Postgres,
+trawld, session proxy, Chromium, and synthetic HTTP corpus. It needs no Fleet
+profile, existing dev instance, shared database, or manually supplied key.
+`AGENTS.md` points to this file; keep this workflow here, not in a separate skill.
+
+Create a fresh `chore/<experiment-slug>` worktree from the selected `main`
+commit, or use the assigned candidate worktree. Record the hypothesis,
+seed/count/batch/rate, expected results, measurement threshold, and evidence
+destination before running. The runbook includes exact worktree commands and
+a reusable result template. Routine runs need no initial source reading;
+custom scenarios start with a retained baseline and an independent oracle.
+
+Run from the selected worktree, using the tool's working-directory setting:
+
+```bash
+# First run, or after any commit, app-source, build-cache, or SPA change:
+bin/app-experiment --seed 42 --events 1000 --rate 200
+# Repeat against the same prepared checkout:
+bin/app-experiment --skip-build --seed 43 --events 2000 --rate 400
+# Keep the verified app open for browser inspection, then clean up:
+bin/app-experiment --skip-build --hold-seconds 600
+```
+
+- Linux prerequisites: local Docker socket access, Git, Node/npm, the repo's
+  Rust toolchain with `wasm32-unknown-unknown`, Trunk, and Chromium system
+  libraries. The runner builds binaries and the SPA, runs `npm ci`, installs
+  Playwright Chromium, and creates its own databases, roles, keys, and TLS.
+  Use Docker without sudo. Do not start `fleet-dev` for this workflow.
+- On this host, `CARGO_TARGET_DIR=/home/jakub/code/trawl/target/app-experiment`
+  selects the existing disk-backed cache. Set it consistently on every run
+  and lifecycle-test command. Elsewhere, use an absolute disk-backed cache
+  path or the default worktree `target`. Avoid a large Rust build on `/tmp`.
+  Other builds into a shared cache can replace binaries and invalidate
+  `--skip-build`; use a separate cache for concurrent worktrees.
+- Default to the 1000-event run when no workload is specified. `--batch-size`
+  defaults to 50 and must be less than `--events`. `--rate` is a paced target,
+  not a load-test throughput guarantee. `--skip-build` refuses stale build
+  identity; rerun without it instead of editing the preparation manifest.
+- Compaction must preserve exact query and export results. Keep the event-ID
+  and value oracle enabled under load. Run `cargo nextest run -p trawl-server
+  --no-default-features --test publication_consistency` with the same Cargo
+  target for a deterministic publication-race check, then rebuild the app
+  before a full experiment. An unfinished rollup returns 503 until recovery;
+  the detailed guide explains diagnosis. See ADR-0026 for the guarantee and
+  its single-daemon scope.
+- A hold starts after browser, live-tail, compaction, and restart checks pass.
+  Use the printed URL and `private/browser-key` path while it runs. Keep the
+  runner supervised; Ctrl+C or SIGTERM requests cleanup. Never paste keys
+  into reports. The runner removes credentials and data when it exits.
+- Read the printed `target/app-experiments/<run-id>/report.json` after exit.
+  Require exit 0, `status: passed`, expected phase counts, and all cleanup
+  flags true. A readiness line or accepted ingest count alone is not a pass.
+  Retain that exact run path; do not infer success from an older report.
+  Stopping a hold early deliberately exits 1 with `status: interrupted`.
+  Report that as an interrupted hold with completed checks only if the
+  `browser-session-after-restart` phase exists and cleanup succeeded. Let
+  the hold expire naturally for an exit-0, `passed` result.
+- Test generator/oracle edits with `node --test scripts/app-experiment/workload.test.mjs`, then run the real scenario.
+  Test runner/lifecycle edits with `node scripts/app-experiment/lifecycle.test.mjs`
+  after preparation using the same Cargo target. These tests start real apps.
+- Before removing the worktree, confirm teardown and copy every cited run's
+  artifacts plus commands and candidate changes to a private location outside
+  it. Use ordinary `git worktree remove` from outside the worktree after
+  preserving changes. A forced stop requires the runbook's live ownership
+  checks. Never kill PIDs from a report or prune Docker resources.
+- Report commit/build identity, seed/count/rate, result checks, timings, and
+  cleanup. Evidence includes metrics, `queries.ndjson`, memory samples, logs,
+  screenshots, and a browser trace. Debug-server timings are not release
+  benchmarks. Valid HTTP ingest is covered; Vector, syslog, retention,
+  scheduled reports, and repin require additional scenarios.
+
+The [detailed experiment runbook](scripts/app-experiment/README.md) contains
+setup checks, all options, evidence interpretation, failure triage, and the
+extension workflow. Read that guide when needed; routine runs do not require
+reading runner or application source. Source inspection is appropriate when
+changing a scenario or diagnosing a failure the guide does not explain.
+
 ## using trawl
 
 ### binaries

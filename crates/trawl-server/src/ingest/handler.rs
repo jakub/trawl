@@ -182,65 +182,69 @@ pub async fn ingest(
     let envs = Arc::clone(&state.ingest.envs);
     let default_env = Arc::clone(&state.ingest.default_env);
     let derivation = Arc::clone(&state.ingest.derivation);
+    let dispatch = tracing::dispatcher::get_default(Clone::clone);
+    let request_span = tracing::Span::current();
+    // Wait before dispatching blocking work. Requests waiting behind a
+    // compactor must leave blocking threads available to existing readers.
+    let publication = state.query.hot_buffer.as_ref().map(|buf| buf.publication());
+    let ingest_guard = match publication {
+        Some(gate) => Some(gate.ingest().await),
+        None => None,
+    };
 
-    let (mut parsed, wal_paths, body_bytes, decompress_ms, parse_ms, wal_ms) =
-        tokio::task::spawn_blocking(move || -> Result<_, ServerError> {
-            let ctx = EnvelopeContext {
-                arrival: &arrival,
-                arrival_instant,
-                envs: envs.as_ref(),
-                default_env: default_env.as_ref(),
-                producer: Producer::Http {
-                    peer_host: &peer_host,
-                    peer_is_trusted_relay,
-                },
-                derivation: derivation.as_ref(),
-            };
-            let t0 = std::time::Instant::now();
-            let raw = if compressed {
-                decompress_gzip(&body, body.len())?
-            } else {
-                body.to_vec()
-            };
-            let decompress_ms = t0.elapsed().as_millis();
-            let body_bytes = raw.len();
+    let result = tokio::task::spawn_blocking(move || -> Result<_, ServerError> {
+        // Cancellation cannot split durability from insertion once this
+        // task starts. The guard stays here until both steps finish.
+        let _ingest = ingest_guard;
+        let _dispatch = tracing::dispatcher::set_default(&dispatch);
+        let _span = request_span.enter();
+        let ctx = EnvelopeContext {
+            arrival: &arrival,
+            arrival_instant,
+            envs: envs.as_ref(),
+            default_env: default_env.as_ref(),
+            producer: Producer::Http {
+                peer_host: &peer_host,
+                peer_is_trusted_relay,
+            },
+            derivation: derivation.as_ref(),
+        };
+        let t0 = std::time::Instant::now();
+        let raw = if compressed {
+            decompress_gzip(&body, body.len())?
+        } else {
+            body.to_vec()
+        };
+        let decompress_ms = t0.elapsed().as_millis();
+        let body_bytes = raw.len();
 
-            if raw.is_empty() {
-                return Err(ServerError::Ingest("empty request body".into()));
-            }
+        if raw.is_empty() {
+            return Err(ServerError::Ingest("empty request body".into()));
+        }
 
-            let t1 = std::time::Instant::now();
-            let mut parsed = parse_events(&raw, &ctx)?;
-            let parse_ms = t1.elapsed().as_millis();
+        let t1 = std::time::Instant::now();
+        let mut parsed = parse_events(&raw, &ctx)?;
+        let parse_ms = t1.elapsed().as_millis();
 
-            let t2 = std::time::Instant::now();
-            let wal_paths = write_wal_batches(&wal_writer, &mut parsed);
-            let wal_ms = t2.elapsed().as_millis();
+        let t2 = std::time::Instant::now();
+        let wal_paths = write_wal_batches(&wal_writer, &mut parsed);
+        let wal_ms = t2.elapsed().as_millis();
 
-            Ok((
-                parsed,
-                wal_paths,
-                body_bytes,
-                decompress_ms,
-                parse_ms,
-                wal_ms,
-            ))
-        })
-        .await
-        .map_err(|e| ServerError::Internal(format!("ingest task panicked: {e}")))??;
-
-    let result = finalize_ingest(
-        &state,
-        &mut parsed,
-        &wal_paths,
-        &verified,
-        wire_bytes,
-        compressed,
-        body_bytes,
-        decompress_ms,
-        parse_ms,
-        wal_ms,
-    );
+        Ok(finalize_ingest(
+            &state,
+            &mut parsed,
+            &wal_paths,
+            &verified,
+            wire_bytes,
+            compressed,
+            body_bytes,
+            decompress_ms,
+            parse_ms,
+            wal_ms,
+        ))
+    })
+    .await
+    .map_err(|e| ServerError::Internal(format!("ingest task panicked: {e}")))??;
 
     Ok(Json(result))
 }
@@ -290,7 +294,8 @@ fn write_wal_batches(
     wal_paths
 }
 
-/// Post-blocking-task: update metrics, publish to event bus, log, and build response.
+/// Finish within the blocking task while its publication read guard is held.
+/// Update metrics, publish to the hot buffer and bus, and build the response.
 #[allow(clippy::too_many_arguments)]
 fn finalize_ingest(
     state: &AppState,

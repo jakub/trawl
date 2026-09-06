@@ -427,7 +427,12 @@ async fn syslog_mixed_case_sd_param_lands_folded_and_pins_folded(pool: sqlx::PgP
     batch.push(event.map);
     let mut batches = IndexMap::new();
     batches.insert((event.env, event.service), batch);
-    assert_eq!(pipeline.write(batches), 1);
+    assert_eq!(
+        tokio::task::spawn_blocking(move || pipeline.write(batches))
+            .await
+            .unwrap(),
+        1
+    );
 
     // The hot snapshot carries the folded key and no unfolded spelling.
     let snap = hot_buffer

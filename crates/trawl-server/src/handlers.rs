@@ -1573,7 +1573,12 @@ pub async fn field_values(
     let values = state
         .query
         .pool
-        .sample_field_values(&field, params.service.as_deref(), limit)
+        .sample_field_values(
+            &field,
+            params.service.as_deref(),
+            limit,
+            std::time::Duration::from_secs(state.query.timeout_secs),
+        )
         .await?;
 
     let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);

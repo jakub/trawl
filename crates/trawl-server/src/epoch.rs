@@ -437,7 +437,14 @@ fn adopt_in_place(data_root: &Path) -> Result<(), String> {
 /// share a fixture corpus) must not clobber each other's staged file
 /// between the write and the rename.
 pub(crate) fn publish_marker_staged(dir: &Path, name: &str, body: &str) -> Result<(), String> {
-    let staged = dir.join(format!("{name}{NEXT_SUFFIX}.{}", std::process::id()));
+    // A hidden marker's staged file must not share its discovery prefix.
+    // In particular, rollup recovery recognizes `.rollup-*`; it must never
+    // read a partially written `..rollup-*.next.<pid>` as a complete marker.
+    let prefix = if name.starts_with('.') { "." } else { "" };
+    let staged = dir.join(format!(
+        "{prefix}{name}{NEXT_SUFFIX}.{}",
+        std::process::id()
+    ));
     std::fs::write(&staged, body)
         .map_err(|e| format!("failed to write {}: {e}", staged.display()))?;
     std::fs::File::open(&staged)
