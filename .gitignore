@@ -1,6 +1,9 @@
 # rust build artifacts
 /target/
 
+# binaries staged for `docker build` (dev-image.yml, release.yml, ci/crashdump-image.sh)
+docker-ctx/
+
 # editor / IDE
 .idea/
 .vscode/
@@ -20,6 +23,7 @@
 # debug
 *.pdb
 *.log
+core.*
 
 # bacon state
 .bacon-locations

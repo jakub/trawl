@@ -94,6 +94,9 @@ readonly DEB_IN_NODE="/root/trawl-server.deb"
 # also has to cover the restart that follows.
 readonly DUMP_WAIT_SECS=45
 readonly ACTIVE_WAIT_SECS=60
+# How long to wait for the daemon's own crash-dump verdict line after a
+# restart. See wait_verdict: this is the observable that says init() finished.
+readonly VERDICT_WAIT_SECS=60
 # Grace after the negative control's crash has fully played out (faulted pid
 # gone, unit restarted) before enumerating dumps.
 readonly NEG_SETTLE_SECS=15
@@ -501,6 +504,45 @@ force_fault() {
 
 journal_crash_lines() {
   nsh "journalctl -u trawld --no-pager --since '-3min' | grep -iE 'crashdump|minidump|FATAL signal|Main process exited|Scheduled restart' | tail -12"
+}
+
+# The crash-dump verdict trawld logs once per start, for THIS daemon pid.
+#
+# Empty until the line is there. _SYSTEMD_UNIT and _PID are two different
+# fields, so journalctl ANDs them: an earlier start's verdict cannot answer for
+# this one.
+#
+# The sed is not cosmetic. trawld colours its output whether or not anything is
+# watching, journald stores those bytes, and the escapes land between the field
+# name and its value (`ESC[3mevent_type ESC[0m ESC[2m= ESC[0m"crash_dump"`), so
+# a grep for `event_type="crash_dump"` finds nothing in a log that plainly
+# contains it. ci/crashdump-image.sh strips them the same way.
+verdict_line() { # verdict_line <daemon pid>
+  docker exec "$NODE" journalctl _SYSTEMD_UNIT=trawld.service _PID="$1" \
+    --no-pager -o cat --since '-10min' 2>/dev/null \
+    | sed -e 's/\x1b\[[0-9;]*m//g' \
+    | grep -F 'event_type="crash_dump"' | tail -1
+}
+
+# Wait until the daemon has published that verdict, and only then read anyone's
+# capability masks.
+#
+# Neither of the observables this replaces settles the seal. The unit is
+# Type=simple, so `systemctl is-active` says active the moment the daemon
+# execs, and a monitor process exists from the moment trawld spawns it, which
+# is BEFORE the parent has connected to it, probed it and dropped
+# CAP_SYS_PTRACE (ADR-0023 ruling 4). Asserting CapEff==0 on the daemon in that
+# window is a race the harness loses at random. log_crash_dump runs after
+# init() returned and therefore after the seal, so this line is proof that the
+# masks below are being read off a settled process.
+wait_verdict() { # wait_verdict <daemon pid>
+  if wait_for "$VERDICT_WAIT_SECS" "trawld logged its crash-dump verdict" \
+    "[[ -n \$(verdict_line $1) ]]"; then
+    printf '\n%s\n' "$(verdict_line "$1")"
+    return 0
+  fi
+  docker exec "$NODE" journalctl -u trawld --no-pager -n 40 || true
+  die "trawld pid $1 never logged a crash-dump verdict"
 }
 
 # ------------------------------------------------------- phase 1: the header --
@@ -939,10 +981,16 @@ scope_case() { # scope_case <scope>
   mon=$(find_monitor "$pid")
   printf '\n$ tr "\\0" "\\n" < /proc/%s/environ | grep TRAWL_CRASHDUMP_MONITOR\n' "$mon"
   nshq "tr '\0' '\n' < /proc/$mon/environ | grep '^TRAWL_CRASHDUMP_MONITOR='"
+  wait_verdict "$pid"
   printf '\ncapabilities (bit %s = CAP_SYS_PTRACE):\n' "$PTRACE_CAP_BIT"
   caps_report "$pid" "daemon"
   caps_report "$mon" "monitor"
-  [[ "$(cap_bit "$pid" CapEff)" == 1 ]] || die "scope $scope: the daemon has no CAP_SYS_PTRACE despite the drop-in"
+  # The drop-in's AmbientCapabilities= hands CAP_SYS_PTRACE to both processes at
+  # exec, and the daemon then drops it: once the monitor is up and classified,
+  # trawld clears the bit from its own effective and permitted sets and sets
+  # no_new_privs (ADR-0023 ruling 4). Only the monitor needs it, so a daemon
+  # still holding it here means the seal did not run.
+  [[ "$(cap_bit "$pid" CapEff)" == 0 ]] || die "scope $scope: the daemon still holds CAP_SYS_PTRACE after startup"
   [[ "$(cap_bit "$mon" CapEff)" == 1 ]] || die "scope $scope: the monitor did not inherit CAP_SYS_PTRACE"
 
   before=$(dump_count)
@@ -1045,6 +1093,7 @@ cat /etc/systemd/system/trawld.service.d/crashdump.conf"
   neg_pid=$(main_pid)
   wait_for 20 "monitor process found" "find_monitor $neg_pid" || die "no monitor under pid $neg_pid"
   neg_mon=$(find_monitor "$neg_pid")
+  wait_verdict "$neg_pid"
   caps_report "$neg_pid" "daemon"
   caps_report "$neg_mon" "monitor"
   [[ "$(cap_bit "$neg_pid" CapEff)" == 0 ]] || die "the control still grants the daemon CAP_SYS_PTRACE"

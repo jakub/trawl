@@ -89,6 +89,47 @@ assert_claim_template() {
   fi
 }
 
+# The securityContext block of one container in a rendered StatefulSet.
+# Container and volume list entries share the same eight-space indent, so the
+# scan ends at the next entry or at the next six-space key (containers: ->
+# volumes:). Keys inside the securityContext sit two levels deeper, which is
+# what tells them apart from the container's own sibling keys.
+container_security_context() {
+  local manifest=$1
+  local container=$2
+  awk -v want="        - name: ${container}" '
+    $0 == want { inside = 1; in_sc = 0; next }
+    inside && (/^        - name: / || /^      [^ ]/) { inside = 0; in_sc = 0 }
+    inside && $0 == "          securityContext:" { in_sc = 1; next }
+    in_sc && /^          [^ ]/ { in_sc = 0 }
+    inside && in_sc { print }
+  ' "$manifest"
+}
+
+# Counts the lines of one container's securityContext that match a pattern.
+# The block is captured ONCE and an empty capture is a failure, not a zero: a
+# renamed container, or a `name:` that stops being the entry's first line,
+# would otherwise make every `expected 0` assertion pass while reading nothing.
+assert_security_context_lines() {
+  local expected=$1
+  local pattern=$2
+  local manifest=$3
+  local container=$4
+  local block
+  block=$(container_security_context "$manifest" "$container")
+  if [[ -z $block ]]; then
+    echo "no securityContext block found for container '${container}' in ${manifest}" >&2
+    exit 1
+  fi
+  local actual
+  actual=$(grep -Ec -- "$pattern" <<<"$block" || true)
+  if [[ $actual -ne $expected ]]; then
+    echo "expected ${expected} line(s) matching '${pattern}' in the ${container} securityContext, found ${actual}:" >&2
+    echo "$block" >&2
+    exit 1
+  fi
+}
+
 enabled="$work_dir/enabled.yaml"
 render \
   --set persistence.enabled=true \
@@ -120,6 +161,58 @@ if grep -Fq 'TRAWL_CRASH_DUMP_' "$disabled" || grep -Eq '^[[:space:]]*(- )?name:
   echo "crashDump.enabled=false rendered crash-dump environment or storage" >&2
   exit 1
 fi
+
+# -- ADR-0023 ruling 7, amended: the capability is trawld's alone ------
+
+# The added SYS_PTRACE is the whole grant. containerd hands it to the
+# container's init process as permitted and effective, and the image's
+# cap_sys_ptrace+p file capability keeps the bit across trawld's exec of the
+# monitor, so no_new_privs stays on: allowPrivilegeEscalation must render
+# false on trawld too. The sidecars must not come along for the ride, hence a
+# render with the web sidecar on: render_only defaults it off.
+security_enabled="$work_dir/security-enabled.yaml"
+render "${web_enabled[@]}" \
+  --set persistence.enabled=true \
+  --set crashDump.enabled=true \
+  >"$security_enabled"
+assert_security_context_lines 1 '^ +allowPrivilegeEscalation: false$' \
+  "$security_enabled" trawld
+assert_security_context_lines 0 '^ +allowPrivilegeEscalation: true$' \
+  "$security_enabled" trawld
+assert_security_context_lines 1 '^ +- SYS_PTRACE$' "$security_enabled" trawld
+for sidecar in init-auth trawl-web; do
+  assert_security_context_lines 1 '^ +allowPrivilegeEscalation: false$' \
+    "$security_enabled" "$sidecar"
+  assert_security_context_lines 0 '^ +- SYS_PTRACE$' "$security_enabled" "$sidecar"
+done
+
+# Disabled renders the shared securityContext untouched: an explicit
+# allowPrivilegeEscalation: false and no added capability at all, so an
+# install that never enables crash dumps stays Restricted-compatible.
+security_disabled="$work_dir/security-disabled.yaml"
+render "${web_enabled[@]}" \
+  --set persistence.enabled=true \
+  --set crashDump.enabled=false \
+  >"$security_disabled"
+assert_security_context_lines 1 '^ +allowPrivilegeEscalation: false$' \
+  "$security_disabled" trawld
+assert_security_context_lines 0 '^ +allowPrivilegeEscalation: true$' \
+  "$security_disabled" trawld
+assert_security_context_lines 0 '^ +- SYS_PTRACE$' "$security_disabled" trawld
+
+# The helper appends to whatever the operator put in securityContext, so a
+# capability they added survives and SYS_PTRACE is not added twice.
+security_operator_caps="$work_dir/security-operator-caps.yaml"
+render "${web_enabled[@]}" \
+  --set persistence.enabled=true \
+  --set crashDump.enabled=true \
+  --set-string 'securityContext.capabilities.add[0]=NET_BIND_SERVICE' \
+  >"$security_operator_caps"
+assert_security_context_lines 1 '^ +- NET_BIND_SERVICE$' \
+  "$security_operator_caps" trawld
+assert_security_context_lines 1 '^ +- SYS_PTRACE$' "$security_operator_caps" trawld
+assert_security_context_lines 1 '^ +allowPrivilegeEscalation: false$' \
+  "$security_operator_caps" trawld
 
 # -- ADR-0016: the browser-origin allowlist is stated, never derived -----
 

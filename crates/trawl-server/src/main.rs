@@ -47,22 +47,65 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Install crash-dump capture before any threads are spawned or the async
     // runtime is built: the minidump monitor is launched by re-execing this
     // binary, which is only fork-safe while the process is single-threaded. In
-    // monitor mode this never returns. Held for the whole process lifetime.
-    let _crashdump = trawl_crashdump::init();
+    // monitor mode this never returns. The report owns the handler guard, so it
+    // lives in this frame for the whole run; `status` is the copy of the
+    // verdict `async_main` logs once a subscriber exists (ADR-0023 ruling 6).
+    //
+    // The seal is the one verdict decided here rather than there. A capability
+    // set belongs to a thread, and a new thread starts from the set of the
+    // thread that spawned it, so answering a failed seal after the runtime is
+    // built means every tokio worker already carries the `CAP_SYS_PTRACE` the
+    // seal was supposed to drop. Everything on the way there runs holding it
+    // too, including reading a config file that turns out to be a FIFO nobody
+    // writes to, which parks the process with the capability live and no bound
+    // on how long. So the check runs first, before the runtime and before there
+    // is a second thread to inherit anything, and it prints to stderr because
+    // no subscriber exists yet. Every other verdict is advisory and reaches the
+    // log in `async_main`.
+    let crash_dump = trawl_crashdump::init();
+    let status = crash_dump.status();
+    if matches!(
+        status,
+        trawl_crashdump::Status::Failed(trawl_crashdump::FailureReason::Seal)
+    ) {
+        // Boot-fatal (ADR-0023 ruling 4). `init()` is supposed to hand back a
+        // process with `CAP_SYS_PTRACE` gone from both its effective and its
+        // permitted set and `no_new_privs` on. A seal that did not take leaves
+        // the capability live and leaves the path back to the file capability
+        // through a re-exec open. That is a privilege boundary that failed to
+        // establish, not a degraded feature to serve past. The line names no
+        // OS message, matching the crate's own content-free reason.
+        eprintln!(
+            "[trawld] crash-dump seal failed: refusing to start with an unsealed \
+             capability set (ADR-0023 ruling 4)"
+        );
+        // Explicit, and before the exit: dropping the report uninstalls the
+        // handler and lets the monitor exit.
+        drop(crash_dump);
+        // Exit 1 rather than returning an error. `Termination` for `Result`
+        // prints the error itself, as `Error: ...`, which would put a second
+        // diagnostic under the one above for the same failure.
+        std::process::exit(1);
+    }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    let result = runtime.block_on(async_main());
+    let result = runtime.block_on(async_main(status));
     // Bounded exit: `async_main` has already run the graceful shutdown
     // sequence (each task under its own budget), so anything still running
     // here is a wedged blocking operation, not pending work worth waiting on.
     runtime.shutdown_timeout(RUNTIME_SHUTDOWN_BUDGET);
+    // The handler has to outlive shutdown. A fatal signal raised while the
+    // runtime drains is exactly the crash worth a dump, and dropping the report
+    // uninstalls the handler and lets the monitor exit. So the drop is explicit
+    // and last, rather than an end-of-scope accident a later edit could move.
+    drop(crash_dump);
     result
 }
 
 #[allow(clippy::too_many_lines)] // lifecycle orchestration is cohesive
-async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
+async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn std::error::Error>> {
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("failed to install ring crypto provider");
@@ -111,6 +154,8 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(warning) = &log_filter.warning {
         tracing::warn!(event_type = "config_warning", "{warning}");
     }
+
+    log_crash_dump(&crash_dump);
 
     tracing::info!(event_type = "lifecycle", config = %config_path.display(), "configuration loaded");
 
@@ -718,6 +763,133 @@ fn init_tracing(
         let stdout_layer = fmt::layer().with_filter(make_filter());
         tracing_subscriber::registry().with(stdout_layer).init();
         Ok(None)
+    }
+}
+
+/// Which of [`log_crash_dump`]'s two call sites prints the verdict.
+///
+/// The level is picked before the field list so that each level keeps exactly
+/// one `tracing` call site, and a class is never split across two of them.
+enum Emit {
+    Info,
+    Warn,
+}
+
+/// Log the crash-dump verdict, once, now that a subscriber exists.
+///
+/// The crate prints nothing itself (ADR-0023 ruling 6): `init()` has to run
+/// before tracing exists, so it hands its verdict back as data and this is
+/// where the verdict becomes an event. That puts it in self-telemetry with
+/// everything else, so an operator can query why a crash produced an empty
+/// dump. `Status::Disabled` says nothing at all: no dump directory was
+/// configured, which is a choice rather than a finding.
+///
+/// One verdict never arrives here: a failed seal. `main` refuses the boot on
+/// that one before the runtime exists, so its only diagnostic is the stderr
+/// line written there (ADR-0023 ruling 4).
+///
+/// Both call sites below print the same field list, so a query on
+/// `event_type = "crash_dump"` reads the same names whatever the verdict was.
+/// A field the probe could not read is OMITTED rather than guessed: printing
+/// `monitor_cap_eff_ptrace=false` for a monitor whose `/proc` status was
+/// unreadable would state a fact nothing established, and `readiness` already
+/// carries "no verdict".
+fn log_crash_dump(status: &trawl_crashdump::Status) {
+    use trawl_crashdump::{ReadinessClass, Status};
+
+    const FAILED: &str = "crash-dump capture failed to arm";
+
+    let armed = match status {
+        Status::Disabled => return,
+        Status::Armed(readiness) => Some(readiness),
+        Status::Failed(_) => None,
+    };
+    let inputs = armed.map(|readiness| &readiness.inputs);
+    let monitor = inputs.and_then(|inputs| inputs.monitor);
+    let sealed = armed.and_then(|readiness| readiness.after_seal);
+
+    // -1 is neither a yama scope nor a pid, so the sentinel cannot be misread
+    // as an observation. Both stay integers instead of becoming strings
+    // because an operator filters and orders on them.
+    let ptrace_scope = inputs
+        .and_then(|inputs| inputs.ptrace_scope)
+        .map_or(-1_i64, i64::from);
+    let monitor_pid = armed.map_or(-1_i64, |readiness| i64::from(readiness.monitor_pid));
+    let monitor_cap_eff_ptrace = monitor.map(|monitor| monitor.has_ptrace_effective());
+    let monitor_cap_prm_ptrace = monitor.map(|monitor| monitor.has_ptrace_permitted());
+    let monitor_no_new_privs = monitor.map(|monitor| monitor.no_new_privs);
+    let self_cap_eff_ptrace = sealed.map(|sealed| sealed.has_ptrace_effective());
+    let self_cap_prm_ptrace = sealed.map(|sealed| sealed.has_ptrace_permitted());
+    let self_no_new_privs = sealed.map(|sealed| sealed.no_new_privs);
+    let dumpable = inputs.and_then(|inputs| inputs.dumpable);
+    // True only when `prctl(PR_SET_PTRACER)` returned 0. A call that failed and
+    // a call never made both leave the daemon without a declared tracer, which
+    // is the one fact yama scope 1 acts on.
+    let ptracer_set = inputs.map(|inputs| inputs.ptracer == Some(Ok(())));
+    let dir = armed.map(|readiness| readiness.dir.display().to_string());
+    let retain = armed.map(|readiness| readiness.retain);
+    let missing = armed.and_then(trawl_crashdump::Readiness::missing_capability);
+    let reason = match status {
+        Status::Failed(reason) => Some(reason.as_str()),
+        _ => None,
+    };
+
+    // One expansion per level, so each level has exactly one call site and the
+    // field list cannot drift between them.
+    macro_rules! emit {
+        ($level:ident, $message:expr) => {
+            tracing::$level!(
+                event_type = "crash_dump",
+                readiness = status.as_str(),
+                ptrace_scope,
+                monitor_pid,
+                monitor_cap_eff_ptrace,
+                monitor_cap_prm_ptrace,
+                monitor_no_new_privs,
+                self_cap_eff_ptrace,
+                self_cap_prm_ptrace,
+                self_no_new_privs,
+                dumpable,
+                ptracer_set,
+                dir = dir.as_deref(),
+                retain,
+                missing,
+                reason,
+                "{}",
+                $message
+            )
+        };
+    }
+
+    let (emit, message) = match status {
+        // Returned above. The arm exists because the match must be total.
+        Status::Disabled => return,
+        Status::Armed(readiness) => match readiness.class {
+            ReadinessClass::Ready => (
+                Emit::Info,
+                "crash-dump capture ready; capability and yama checked, LSM policy not probed",
+            ),
+            ReadinessClass::Denied => (
+                Emit::Warn,
+                "crash-dump capture DENIED: a crash would write a minidump with no threads",
+            ),
+            ReadinessClass::Indeterminate => (
+                Emit::Warn,
+                "crash-dump capture unverified: a probe input was unreadable, so a crash may \
+                 write a minidump with no threads",
+            ),
+        },
+        // A failed seal never reaches this match: `main` returns before the
+        // subscriber is built. Every other reason (dump directory, monitor
+        // spawn, socket connect, monitor identity, handler install) is reported
+        // by a process that DID seal, so capture is off and the capability is
+        // gone, which is a warning rather than a refused boot.
+        Status::Failed(_) => (Emit::Warn, FAILED),
+    };
+
+    match emit {
+        Emit::Info => emit!(info, message),
+        Emit::Warn => emit!(warn, message),
     }
 }
 

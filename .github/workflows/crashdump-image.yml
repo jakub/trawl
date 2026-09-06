@@ -1,0 +1,118 @@
+name: Crash-dump image
+
+# Builds the container image the way release.yml does, then runs the crash-dump
+# capability proof against it (ci/crashdump-image.sh). Its own workflow rather
+# than a CI job because it is a full release-profile build plus one container
+# per container shape it proves, and because that lets it be path-filtered down
+# to the files that can actually break it: the Dockerfile's setcap stamp, the
+# crate that raises and drops the capability, the daemon call site that logs
+# the verdict, the lockfile the --locked build reads, and the two files below.
+on:
+  pull_request:
+    paths:
+      - Dockerfile
+      - crates/trawl-crashdump/**
+      - crates/trawl-server/src/main.rs
+      - Cargo.lock
+      - .github/workflows/crashdump-image.yml
+      - ci/crashdump-image.sh
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - crates/trawl-crashdump/**
+      - crates/trawl-server/src/main.rs
+      - Cargo.lock
+      - .github/workflows/crashdump-image.yml
+      - ci/crashdump-image.sh
+
+# A 60-minute build on a self-hosted runner is not worth queueing twice for the
+# same ref.
+concurrency:
+  group: crashdump-image-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  crash-dump-image:
+    name: capability transition + readiness verdict
+    runs-on: k8s-big
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1; pinned via toolchain input
+        with:
+          toolchain: 1.98.0
+          targets: x86_64-unknown-linux-gnu, wasm32-unknown-unknown
+
+      # Own cache entry, so this job neither evicts nor is evicted by
+      # release-<target> and dev-aarch64-linux. First run pays for libduckdb's
+      # C++ build once; every run after is the rust delta.
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: crashdump-amd64-linux
+
+      # amd64 is the runner's own architecture, so unlike dev-image.yml and
+      # release.yml's cross leg there is no foreign libc to install. zig is
+      # still here because the glibc floor (.2.31) is what the shipped image
+      # is built against, and cargo-zigbuild is how the workspace sets it.
+      - name: Install zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+
+      - uses: taiki-e/install-action@d858f8113943481093e02986a7586a4819a3bfd6 # v2
+        with:
+          tool: cargo-zigbuild,trunk,wasm-bindgen-cli
+
+      # The SPA has to exist before trawl-web compiles: rust-embed bakes dist/
+      # into the binary at build time. Same ordering as release.yml.
+      - name: Build web UI SPA
+        working-directory: crates/trawl-web-ui
+        run: trunk build --release
+      - name: Precompress SPA + enforce wire-size budgets
+        run: cargo xtask compress-web
+
+      # Exactly the four binaries the Dockerfile COPYs, in the release profile
+      # with the shipped glibc floor. Named individually rather than
+      # --workspace: the CLI and TUI are not in the image and this job is
+      # already the most expensive one in the repo.
+      - name: Build the image binaries
+        run: |
+          cargo zigbuild --locked --release --target x86_64-unknown-linux-gnu.2.31 \
+            -p trawl-server -p trawl-admin -p fleet-admin -p trawl-web
+
+      - name: Stage binaries for the image
+        run: |
+          mkdir -p docker-ctx/amd64
+          bindir="target/x86_64-unknown-linux-gnu/release"
+          cp "${bindir}/trawld" "${bindir}/trawl-admin" "${bindir}/fleet-admin" "${bindir}/trawl-web" docker-ctx/amd64/
+          chmod +x docker-ctx/amd64/trawld docker-ctx/amd64/trawl-admin docker-ctx/amd64/fleet-admin docker-ctx/amd64/trawl-web
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      # --load, not --push: nothing publishes from here. The image has to land
+      # in the local docker store because the proof below runs containers from
+      # it. No QEMU either, unlike dev-image.yml: linux/amd64 is native.
+      - name: Build the image
+        run: docker build --platform linux/amd64 --load -t trawl-crashdump-ci:${{ github.sha }} .
+
+      - name: Prove the capability transition and the verdict
+        run: bash ci/crashdump-image.sh trawl-crashdump-ci:${{ github.sha }}
+
+      # always(): a failed assertion is exactly when the /proc captures and the
+      # container logs are worth reading, and they are the only record of what
+      # the kernel did.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: crashdump-image-logs
+          path: crashdump-ci-logs/
+          retention-days: 7
+          if-no-files-found: warn

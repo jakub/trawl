@@ -17,7 +17,10 @@ Instead it re-execs its own binary as a separate **monitor** process at
 startup and keeps a socket open to it. On a fatal signal the handler writes a
 one-line stderr breadcrumb, asks the monitor to attach and write the dump,
 waits for the ack, then re-raises so the process still dies with the original
-signal. Supervisors see the same signal exit they always did — systemd records
+signal. The monitor's life is tied to trawld's with `PR_SET_PDEATHSIG`, so it
+goes away when the daemon does, including a daemon that dies during startup
+before the socket is even connected. Supervisors see the same signal exit they
+always did — systemd records
 it as `status=11/SEGV`, a shell renders it as 139 — and restart trawld as
 usual.
 
@@ -128,27 +131,71 @@ PVC so dumps stay out of data backups. `crashDump.size`,
 the remaining knobs; see the
 [chart README](https://github.com/jakub/trawl/blob/main/chart/trawl/README.md).
 
-What it cannot do is match the Debian channel's capability coverage, and the
-difference decides whether capture works on a scope 2 node.
+The image carries the capability and the enable step grants permission to use
+it. `/usr/bin/trawld` is stamped `cap_sys_ptrace+p` at build time, permitted
+only and never effective. A permitted-only stamp is inert in any process that
+does not ask for the bit, so the image still runs under `docker run`'s default
+capability set and under the chart's default `drop: [ALL]`. An `+ep` stamp would
+not: `commoncap` fails `execve` with `EPERM` when a file's effective bit is set
+and the container's bounding set lacks one of that file's permitted
+capabilities, which describes every default pod.
 
-`capabilities.add` in a pod spec fills the container's **bounding** set. For a
-container that does not run as root, that is all it fills: the effective and
-permitted sets stay empty, because kubernetes has no way to hand a process an
-**ambient** capability. The feature that would do it, KEP-2763, is not GA, and
-ambient capabilities otherwise come from a file capability on the binary, which
-the trawl image does not carry. So trawld and the monitor it re-execs run with
-`SYS_PTRACE` in the bounding set and nothing in `CapEff`.
+`capabilities.add` in a pod spec is more than a bounding-set entry. containerd
+hands an added capability to the container's init process as permitted and
+effective, so trawld holds `CAP_SYS_PTRACE` from its first instruction. What the
+grant does not survive on its own is trawld's re-exec into the monitor: an
+`execve` of a file carrying no capabilities, by a process whose inheritable and
+ambient sets are empty, leaves the new process with an empty permitted set.
+Kubernetes has no field for the ambient set either, and the feature that would
+add one, KEP-2763, is not GA. The `cap_sys_ptrace+p` stamp is what carries the
+bit across that exec.
 
-That is enough at scope 0 and scope 1, where the attach is permitted by
-`PR_SET_PTRACER` naming the monitor rather than by any capability. At scope 2
-the kernel wants the capability itself, the monitor does not have it, and you
-get the failure this page describes below: a `.dmp` appears, the log says
-`wrote minidump`, and the file holds zero threads. That is
-[issue #21](https://github.com/jakub/trawl/issues/21), and the fix is a file
-capability on the binary plus `allowPrivilegeEscalation`.
+`no_new_privs` does not object to that, which is the part worth stating plainly.
+`allowPrivilegeEscalation: false` sets `no_new_privs`, and the kernel enforces it
+by downgrading the new credentials only when an `execve` would grant a permitted
+set that is not a subset of the one the process already had. Here the file
+capability hands back a bit trawld already holds, so nothing is gained and
+nothing is stripped. A kind run at `ptrace_scope=2` with the pod at
+`allowPrivilegeEscalation: false` gave a monitor holding `CapEff=0x80000` under
+`NoNewPrivs: 1`, a `ready` verdict, and a dump with 34 threads. So the chart adds
+the capability and leaves escalation alone.
 
-Until then: on kubernetes, crash dumps work at yama scope 0 and 1 and do not
-work at scope 2. Check the node's `ptrace_scope` before relying on them.
+That rule cuts the other way too. The bit survives only because the process
+that execs `trawld` already holds it, and in the chart that process is the
+container's init, since the image's `ENTRYPOINT` is `trawld` itself. Put a
+shell or an init shim in front of it and the shell drops the bit at its own
+exec; `trawld`'s exec is then a gain, `no_new_privs` strips it, and capture goes
+dead with nothing but the `denied` verdict to say so. So keep `trawld` as the
+container's first process. A wrapper entrypoint in front of it, a shell or an
+init shim, is not supported here. Setting the shared
+`securityContext.allowPrivilegeEscalation` to `true` in values would let the
+re-exec gain the bit again, but that map is inherited by every container in the
+pod, sidecars included, and the chart's render test asserts the `false`. It is
+an explicit weakening outside what the chart tests, not a documented fallback.
+
+The capability is still worth weighing before you enable, because neither
+built-in Pod Security profile admits it. Restricted refuses every added
+capability except `NET_BIND_SERVICE`. Baseline is looser but still an
+allowlist, and the list is the set of capabilities a container runtime already
+grants by default, which does not include `SYS_PTRACE`. Both profiles and the
+exact list are in the kubernetes
+[Pod Security Standards](https://kubernetes.io/docs/concepts/security/pod-security-standards/).
+So relaxing a namespace from Restricted to Baseline does not help. Admission
+rejects the StatefulSet either way, over the added capability.
+
+Enabling crash dumps needs a namespace with no Pod Security enforcement, an
+exemption for this workload, or an admission policy of your own that permits
+`SYS_PTRACE` here. The chart documents this rather than refusing to render,
+because admission policy is cluster state the chart cannot read.
+
+The monitor raises the capability to effective before it binds its socket, and
+trawld drops it from its own sets. See "The capability is the other half of the
+cost" below for what that buys and what it does not.
+
+With the capability added, kubernetes capture works at yama scope 0, 1 and 2,
+the same values Debian works at. Scope 3 refuses every tracer on both channels.
+Check the startup verdict under "Checking that it can work" instead of assuming
+the chart's flag landed.
 
 ## What a dump contains
 
@@ -178,20 +225,33 @@ control. If you need help reading one, share the stack summary, not the file.
 
 ### The capability is the other half of the cost
 
-Enabling capture grants trawld and its monitor `CAP_SYS_PTRACE`. Read that
+Enabling capture puts `CAP_SYS_PTRACE` inside the trawl service. Read that
 literally. `CAP_SYS_PTRACE` is not "may attach to processes owned by the trawl
 user". It is the capability the kernel checks *instead of* the uid comparison:
-with it, `ptrace_may_access` short-circuits, and trawld can attach to any
+with it, `ptrace_may_access` short-circuits, and the holder can attach to any
 process it can see. Root-owned services included. sshd, your database, the
 agent holding your keys.
 
 Attaching means reading and writing another process's memory and registers, so
-this is not a read-only power. A compromised trawld with this capability can
-take over a root process rather than merely inspect it.
+this is not a read-only power. A compromised holder can take over a root
+process rather than merely inspect it.
 
-`NoNewPrivileges=true` in the unit does not contain any of this. It stops a
-process gaining *new* privileges through `execve`, and the ambient capability
-is one trawld already holds.
+Which process holds it is narrower than it used to be. Both processes start
+with the bit, through `AmbientCapabilities=` on Debian and through the binary's
+file capability on kubernetes. At startup the monitor raises it to effective,
+and trawld clears it from its own effective and permitted sets and sets
+`no_new_privs` on itself. trawld execs nothing after that, so it cannot pick the
+capability back up.
+
+That limits what an ordinary bug in the query path can reach. It is not a
+boundary against a compromised daemon. The monitor is trawld's own child, runs
+the same binary under the same uid, and will attach to trawld on request over a
+socket trawld holds. Count the capability as held by the service, and decide on
+that basis.
+
+`NoNewPrivileges=true` in the unit does not contain any of this either. It stops
+a process gaining *new* privileges through `execve`, and on Debian the ambient
+capability is one the service already holds before any exec.
 
 So the honest framing is: turning on crash dumps moves trawld from an
 unprivileged daemon to one that can compromise the whole host if it is
@@ -201,73 +261,197 @@ independently, it is a real decision, and it is why the package ships the
 drop-in inert rather than enabling capture for every install.
 
 One more thing to weigh on a multi-user host: the daemon and its monitor talk
-over an abstract unix socket, which has no filesystem permissions, so any local
-user in the same network namespace can connect to it. Hardening that is tracked
-against the crashdump crate, separately from this page.
+over an abstract unix socket, which has no filesystem permissions, and its name
+is predictable from trawld's pid, so any local process in the same network
+namespace can connect to it and could race trawld to bind the name. Winning
+that race no longer buys anything. trawld reads `SO_PEERCRED` on the
+connection it is holding, the one a crash context would travel over, which
+names the process that called `listen` on the socket that accepted it. Asking
+about the name instead of the connection would not do: an impostor can bind
+first, accept trawld's connection, then close its listener and let the real
+monitor bind the freed name, at which point a fresh connection reports the real
+monitor while the dump still goes to the impostor. If the peer of the held
+connection is not the monitor trawld spawned, running as trawld's own uid,
+capture does not arm at all: the startup event reports `readiness="failed"`
+with `reason="monitor_identity"`, and the daemon runs on with no crash handler
+installed.
+
+The residual runs the other way, and it is wider than one uid. An abstract unix
+socket has no filesystem permissions and no credential check of its own, so any
+process in the same network namespace can connect to the monitor as a second
+client, running as any user. `SO_PEERCRED` settles who the monitor is, not who
+else may talk to it.
+
+A well-formed request from such a client gets back a dump of the client. The
+monitor dumps the pid the kernel reports on the other end of the connection,
+never a pid the client names. A malformed frame is the real problem. The
+minidumper server loop returns an error on a message it cannot parse, so the
+monitor prints it and exits, and trawld does not notice: the startup verdict is
+a point-in-time snapshot and nothing re-checks the monitor afterwards. The
+daemon stays armed with a dead monitor and keeps reporting the readiness it
+logged at boot.
+
+The next fatal signal then produces no dump. The handler's request to the dead
+monitor fails, that failure is ignored on purpose so the process still dies
+with its original signal, and what you find afterwards is the `trawld: FATAL
+signal caught` breadcrumb with no `wrote minidump` line after it and nothing
+new in the dump directory. Any local process can therefore turn capture off
+without a privilege of any kind. Hardening the transport, with authenticated
+framing or a filesystem socket carrying real permissions, is tracked
+separately; it was deferred when #149 landed.
 
 ## yama ptrace_scope
 
 `/proc/sys/kernel/yama/ptrace_scope` decides whether the monitor's attach is
 allowed at all.
 
-The two channels do not answer the same at every value, so the table splits
-them.
+Both channels work at the same values. The mechanism differs, so the table
+splits them.
 
 | value | policy | debian | kubernetes |
 |-------|--------|--------|------------|
 | `0` | classic ptrace permissions | works | works |
 | `1` | attach limited to declared descendants | works: trawld calls `PR_SET_PTRACER` naming its own monitor | works, same mechanism |
-| `2` | admin-only attach | works: `CAP_SYS_PTRACE` from the drop-in is what "admin" means here | does not work yet, see [#21](https://github.com/jakub/trawl/issues/21) |
+| `2` | admin-only attach | works: `CAP_SYS_PTRACE` from the drop-in is what "admin" means here | works: the monitor raises `CAP_SYS_PTRACE`, put in the container by `crashDump.enabled=true` and carried across the re-exec by the image's file capability |
 | `3` | no attach, ever | never works. The capability does not exempt anyone | never works |
 
 Scope 3 is a known limitation and there is no workaround: the setting is
 one-way until reboot, and no privilege lifts it. If your hosts run scope 3,
 crash dumps are not available there.
 
-Scope 2 on kubernetes is a different kind of gap, and a fixable one. The
-capability reaches the container's bounding set and never its effective set,
-for the reason given under the helm section, so the monitor's attach is refused
-exactly as it would be with no capability at all. The symptom is the empty dump
-described below rather than an error.
+Scope 2 asks the tracer for `CAP_SYS_PTRACE` held effective, and both channels
+now answer it. Debian's monitor gets the bit from the drop-in's ambient
+capability. The kubernetes monitor raises it from the image's file capability,
+which holds open a bit the container was already granted. Neither channel
+is quiet when it goes wrong. The startup verdict below reports `denied` before a
+crash ever happens.
 
 ## Checking that it can work
 
-There is no startup probe yet. trawld prints its enabled line whenever
-`TRAWL_CRASH_DUMP_DIR` is set:
+trawld probes the setup at startup and logs one verdict. Every armed outcome and
+every failure but one is a single structured event. The exception is a failed
+seal, which is decided before the tracing subscriber exists and goes to stderr
+instead, described below. Nothing about the probe is lazy. By the time the line is written the monitor is connected, its capability
+sets have been read out of `/proc`, `PR_SET_PTRACER` has been issued with its
+return checked, and the daemon has sealed itself.
+
+The ready case, wrapped here but one line in the journal:
 
 ```
-trawl-crashdump: enabled (dir=/var/lib/trawl/cores, retain=10)
+INFO trawld: crash-dump capture ready; capability and yama checked, LSM policy not probed
+  event_type="crash_dump" readiness="ready" ptrace_scope=2 monitor_pid=8213
+  monitor_cap_eff_ptrace=true monitor_cap_prm_ptrace=true monitor_no_new_privs=true
+  self_cap_eff_ptrace=false self_cap_prm_ptrace=false self_no_new_privs=true
+  dumpable=true ptracer_set=true dir="/var/lib/trawl/cores" retain=10
 ```
 
-That line means the monitor came up, not that the attach will be permitted.
-The ptrace grant is issued lazily, at crash time. So under scope 3, or with a
-half-applied drop-in that set the environment but not the capability, trawld
-logs exactly the same thing — and worse, a crash can still produce a `.dmp`
-that looks healthy from the outside. When the monitor cannot ptrace the
-crashed process it writes the dump anyway, minus every thread and memory
-region: a small file with a valid header and nothing a debugger can use. The
-journal even records the usual `wrote minidump` line. A denied capture is
-only visible by opening the dump, or by its size (tens of kilobytes against
-hundreds for a real one).
+Read it out of the journal:
 
-Do not try to force a crash to test this. Check the capability instead — the
-configured unit property first, then the LIVE process, because `systemctl show`
-only proves what systemd was told, not what the running daemon holds:
+```bash
+journalctl -u trawld | grep crash_dump
+```
+
+Or query it back, since with `[ingest] internal_telemetry` on the verdict is an
+ordinary trawld record:
+
+```bash
+trawl query 'service=trawld event_type=crash_dump last=24h | table _time, readiness, ptrace_scope, missing'
+```
+
+`readiness` takes four values and each one has a different next step.
+
+| `readiness` | what it found | what to do |
+|-------------|---------------|------------|
+| `ready` | The capability, yama and commoncap prerequisites hold | Nothing |
+| `denied` | A prerequisite is provably missing, so a crash writes a dump with zero threads | Read `ptrace_scope` and `missing` in the same event. `missing="CAP_SYS_PTRACE"` means the monitor never got the bit: a half-applied drop-in on Debian, or on kubernetes a capability that never reached the container, say because an admission policy stripped it. No `missing` at `ptrace_scope=3` means the node refuses every tracer and nothing you grant will change that |
+| `indeterminate` | An input was unreadable or malformed, so there is no verdict either way | Treat capture as unknown. `/proc` being unreadable usually means a container filesystem restriction or a monitor that exited during startup. Check `monitor_pid` is alive and read the masks by hand |
+| `failed` | Capture never armed. `reason` names the step that failed | `dump_dir` is a directory trawld cannot create or write. `spawn_monitor` means the re-exec could not be started. `monitor_unreachable` means the monitor started but trawld could not prove it alive: the socket never connected, or the monitor had already exited or could not be waited on by the time trawld checked, so nothing was armed against a pid that might be recycled. A failed seal never reaches this event at all: trawld exits first, see below |
+
+`ready` is a necessary condition, not a promise. It covers the capability sets,
+the yama scope and commoncap's exec rules. It does not cover seccomp or an LSM,
+and SELinux or AppArmor can refuse the attach after all of those pass, with the
+same empty-dump symptom. If the verdict says `ready` and dumps still come out
+empty, audit LSM policy for trawld.
+
+A failed seal is the one failure that stops the daemon, and the one you cannot
+query for. It means trawld could not drop `CAP_SYS_PTRACE` from its own sets or
+could not set `no_new_privs`, and it refuses to serve queries holding ptrace
+power it said it would give up. That check runs before the async runtime is
+built, which is before the tracing subscriber exists, so there is no
+`crash_dump` event and no `reason="seal"` field to read. What you get is one
+line on stderr and exit 1:
+
+```text
+[trawld] crash-dump seal failed: refusing to start with an unsealed capability set (ADR-0023 ruling 4)
+```
+
+Every other `reason` leaves trawld running normally with capture off.
+
+No armed verdict disarms the handler. The signal handler is installed for
+`ready`, `denied` and `indeterminate` alike, because a probe that is wrong about
+a working host must not be the reason you end up with no dump. A `failed` start
+is the other case: capture never armed, so no handler is installed and a crash
+writes no dump at all.
+
+The monitor reports its own half on stderr, before it binds its socket:
+
+```
+trawl-crashdump monitor: cap_sys_ptrace raise ok
+trawl-crashdump monitor: cap_sys_ptrace raise failed: Operation not permitted
+```
+
+A failed raise does not stop the monitor. It binds and serves anyway, so the
+parent can read the real state and classify it, and on a scope 0 or 1 host
+capture still works without the raise.
+
+Do not force a crash to test any of this. Read the masks instead. On Debian,
+check what systemd was told and then what the processes hold, because
+`systemctl show` only proves the first:
 
 ```bash
 systemctl show trawld -p AmbientCapabilities
-grep -E 'CapEff|CapAmb' "/proc/$(systemctl show trawld -p MainPID --value)/status"
+grep -E 'CapEff|CapPrm|NoNewPrivs' "/proc/$(systemctl show trawld -p MainPID --value)/status"
 ```
 
-The unit property should name `cap_sys_ptrace` and both `/proc` masks should
-have bit 19 set (`0000000000080000`). The monitor is a child of that PID and
-inherits the same sets. Pair that with the enabled line in
-`journalctl -u trawld` and the yama value above, and you have covered every
-part that can silently fall off. One more denial can still hide beyond all of
-these: an active LSM policy (SELinux, AppArmor) can refuse the attach after
-capabilities and yama both pass, with the same empty-dump symptom — if the
-checks above look right and dumps still come out empty, audit your LSM policy
-for trawld. Issue #21 tracks turning this into a real startup warning.
+Bit 19 (`0000000000080000`) being absent from the daemon's `CapEff` and `CapPrm`,
+with `NoNewPrivs: 1`, is the seal working rather than a fault. Bit 19 belongs to
+the monitor. Take its pid from `monitor_pid` in the verdict and read the same
+fields from `/proc/<monitor_pid>/status`.
+
+`dumpable` can read 0 even when the verdict is `ready`. An `execve` that gains a
+permitted capability from the file is a privileged exec, and the kernel clears
+the dumpable flag on one. A kubernetes pod reads 1, because the container's init
+process already held the bit and the exec gained nothing. A `docker run` through
+a shell reads 0, because the shell had dropped it and trawld's exec took it back.
+Either way it only feeds the scope 0 and 1 verdict, where the attach rests on
+credentials instead of the capability.
+
+On kubernetes, check the two halves of the grant:
+
+```bash
+kubectl exec -n <ns> <pod> -c trawld -- getcap /usr/bin/trawld
+kubectl get pod -n <ns> <pod> \
+  -o jsonpath='{.spec.containers[?(@.name=="trawld")].securityContext}'
+```
+
+The first prints `/usr/bin/trawld cap_sys_ptrace=p`. The second must list
+`SYS_PTRACE` among the added capabilities. Without it every capability set in
+the container reads zero and capture is inert, whatever `getcap` prints.
+
+When a dump is written, the monitor prints the two numbers that say whether it
+is worth keeping:
+
+```
+trawl-crashdump: wrote minidump /var/lib/trawl/cores/trawld-crash-1757100000000000000.dmp threads=37 memory_regions=214
+```
+
+`threads=0 memory_regions=0` is a denied capture. minidump-writer treats a
+refused `PTRACE_ATTACH` as a soft error, so the monitor writes a file with a
+valid header and logs this same line. Such a dump is a few tens of kilobytes
+against hundreds for a real one, and no debugger can do anything with it. If the
+counts cannot be read back the line says
+`threads=? memory_regions=? (header unreadable: ...)`, which points at the dump
+or the disk rather than at a denial.
 
 ## Retention
 
