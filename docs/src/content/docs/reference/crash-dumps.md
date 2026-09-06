@@ -268,12 +268,29 @@ capture does not arm at all: the startup event reports `readiness="failed"`
 with `reason="monitor_identity"`, and the daemon runs on with no crash handler
 installed.
 
-The residual runs the other way. Any process under the same uid can still
-connect to the monitor as a second client and ask it for a dump. What it gets
-back is a dump of itself: the monitor dumps the pid the kernel reports on the
-other end of the connection, never a pid the client names. Same-uid separation
-is not a boundary this design draws, and the monitor is trawld's child under
-trawld's uid anyway.
+The residual runs the other way, and it is wider than one uid. An abstract unix
+socket has no filesystem permissions and no credential check of its own, so any
+process in the same network namespace can connect to the monitor as a second
+client, running as any user. `SO_PEERCRED` settles who the monitor is, not who
+else may talk to it.
+
+A well-formed request from such a client gets back a dump of the client. The
+monitor dumps the pid the kernel reports on the other end of the connection,
+never a pid the client names. A malformed frame is the real problem. The
+minidumper server loop returns an error on a message it cannot parse, so the
+monitor prints it and exits, and trawld does not notice: the startup verdict is
+a point-in-time snapshot and nothing re-checks the monitor afterwards. The
+daemon stays armed with a dead monitor and keeps reporting the readiness it
+logged at boot.
+
+The next fatal signal then produces no dump. The handler's request to the dead
+monitor fails, that failure is ignored on purpose so the process still dies
+with its original signal, and what you find afterwards is the `trawld: FATAL
+signal caught` breadcrumb with no `wrote minidump` line after it and nothing
+new in the dump directory. Any local process can therefore turn capture off
+without a privilege of any kind. Hardening the transport, with authenticated
+framing or a filesystem socket carrying real permissions, is tracked
+separately; it was deferred when #149 landed.
 
 ## yama ptrace_scope
 
