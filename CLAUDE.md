@@ -619,3 +619,10 @@ last=1h | pivot count() on status by host
 # distinct values per group
 * | stats values(_severity), first(message) by service | head 10
 ```
+
+## Contexts
+
+The glossary is split by bounded context. The root `context.md` holds the cross-cutting ontology (events, storage, catalog, query lanes); crate-local vocabulary lives beside the crate. `docs/adr/` is the one decision record for every context.
+
+- `context.md` — root: senders, envelope, hot/cold storage, pins, repin, lanes, outcome verbs
+- `crates/trawl-web-ui/context.md` — the browser SPA: search URL, structured state, executed vs effective query, filter, range, malformed link, mode, navigator (ADR-0027)
