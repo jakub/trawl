@@ -227,9 +227,12 @@ STUB_CREATED=""
 # Set to 1 BEFORE the write, never after: a write that lands and then fails to
 # report, or a signal delivered mid-write, must still reach the restore path.
 SCOPE_MODIFIED=0
-# The value this run last wrote and read back. The restore compares against it
-# so a value some other process changed while we ran is reported rather than
-# quietly overwritten.
+# The value this run last ATTEMPTED to write, recorded before the write for the
+# same reason. Recording the readback instead would defeat the check it exists
+# for: if the write landed and the command then failed, or a signal arrived
+# between the write and the assignment, the variable would still hold the old
+# value and teardown would read the difference as somebody else's change. Intent
+# is knowable before the syscall; outcome is not.
 SCOPE_EXPECTED=""
 
 set_host_scope() {
@@ -255,8 +258,15 @@ restore_host_scope() { # 0 restored or nothing to do, 1 needs a human
   fi
 
   cur=$(host_scope)
+  if [[ "$cur" == "$ORIG_SCOPE" ]]; then
+    note "host ptrace_scope is already $ORIG_SCOPE; nothing to restore"
+    return 0
+  fi
   if [[ -n "$SCOPE_EXPECTED" && "$cur" != "$SCOPE_EXPECTED" ]]; then
-    printf '\n!! NOT RESTORING %s: it reads %s, this run last set %s.\n' \
+    # Not ours to write. It is neither the value this run tried to set nor the
+    # value it found, so something outside this run owns it now and a restore
+    # would be overwriting a stranger's decision with a stale one.
+    printf '\n!! NOT RESTORING %s: it reads %s, this run last tried to set %s.\n' \
       "$YAMA" "$cur" "$SCOPE_EXPECTED"
     printf '!! Something else changed it. Decide by hand; it was %s before this run.\n' "$ORIG_SCOPE"
     return 1
@@ -770,12 +780,14 @@ ensure_scope() { # ensure_scope <wanted>
       return 0
     fi
     printf '\n$ docker exec %s bash -c '\''echo %s > %s'\''\n' "$NODE" "$want" "$YAMA"
-    # Flag first. If the write lands and then something goes wrong before the
-    # readback, teardown still has to put the host back.
+    # Both flags go up before the write, recording intent rather than outcome.
+    # A write that lands and then reports a failure, and a signal delivered
+    # between the write and the assignment, both leave teardown knowing exactly
+    # which value this run is responsible for.
     SCOPE_MODIFIED=1
+    SCOPE_EXPECTED="$want"
     set_host_scope "$want"
     readback=$(nshq "cat $YAMA")
-    SCOPE_EXPECTED="$readback"
     [[ "$readback" == "$want" ]] \
       || die "asked the kernel for ptrace_scope=$want, it reads $readback"
     note "raised $cur -> $want, confirmed by readback (restored to $ORIG_SCOPE by the exit trap)"
