@@ -87,6 +87,30 @@ if grep -E '"etc/systemd/system/|"usr/lib/systemd/system/trawld\.service\.d' "$c
   fail "crates/trawl-server/Cargo.toml ships an asset under a systemd unit directory (etc/systemd/system/ or usr/lib/systemd/system/trawld.service.d/) — the crash-dump example must ship as documentation only, never pre-installed"
 fi
 
+# For assets landing in sysusers.d or tmpfiles.d, cargo-deb generates a
+# `systemd-sysusers <name>` / `systemd-tmpfiles --create <name>` call in postinst
+# and derives <name> from the asset's SOURCE path via with_extension("conf"). If
+# that derivation does not land on the file the asset actually installs, the
+# generated call names a file nobody installed, systemd-sysusers exits 1, and
+# dpkg leaves the package half-configured. The rule: source stem + ".conf" must
+# equal the destination filename.
+generated_dirs=0
+while IFS= read -r asset_line; do
+  src=$(printf '%s' "$asset_line" | sed -E 's/^[^"]*"([^"]+)".*/\1/')
+  dest=$(printf '%s' "$asset_line" | sed -E 's/^[^"]*"[^"]+"[^"]*"([^"]+)".*/\1/')
+  src_base="${src##*/}"
+  dest_base="${dest##*/}"
+  derived="${src_base%.*}.conf"
+  if [[ "$derived" != "$dest_base" ]]; then
+    fail "crates/trawl-server/Cargo.toml asset [\"$src\", \"$dest\"]: cargo-deb derives the postinst name '$derived' from the source, but the file installs as '$dest_base'. Rename the source to '${dest_base%.conf}.<kind>' so the two agree."
+  fi
+  generated_dirs=$((generated_dirs + 1))
+done < <(grep -E '"usr/lib/(sysusers|tmpfiles)\.d/' "$cargo_toml")
+
+if [[ "$generated_dirs" -lt 2 ]]; then
+  fail "crates/trawl-server/Cargo.toml has $generated_dirs sysusers.d/tmpfiles.d assets, expected both (the trawl user and the crash-dump directory)"
+fi
+
 # -- 7. drift guard: the drop-in's env var names and retain default track -
 #       the crate's own constants, not a hand-copied literal -------------
 

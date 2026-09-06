@@ -34,17 +34,21 @@
 #     resulting Depends line describes whatever glibc the build host has. Only a
 #     trixie build produces a package that installs on trixie.
 #
-#   * cargo-deb is pinned to 3.7.0, for a reproducible package rather than one
-#     that changes shape whenever crates.io does. 3.8.0 (2026-09-01) added
-#     dh_installsysusers, which generates a `systemd-sysusers <name>` call in
-#     postinst and derives <name> from the asset's SOURCE path via
-#     with_extension("conf"). This is why the sysusers asset is spelled
-#     debian/trawl.sysusers and installs as usr/lib/sysusers.d/trawl.conf: the
-#     two names have to agree, and under the old debian/trawl.sysusers.conf
-#     spelling the generated call asked for a file nobody installed, exited 1,
-#     and left the package half-configured. With the current spelling 3.8.x
-#     builds an installable package too, so the pin is about reproducibility
-#     only, not about dodging a bug.
+#   * cargo-deb is pinned to 3.8.0, the newest release, because the point of
+#     this harness is to exercise the package release.yml actually builds.
+#     release.yml installs cargo-deb through taiki-e/install-action with no
+#     version, so it gets the newest one; a harness pinned to an older release
+#     would happily certify a package nobody ships. It is pinned rather than
+#     floating so a run is reproducible, and moving the pin forward is a
+#     deliberate step that comes with a full run.
+#
+#     3.8.0 is also why debian/trawl.sysusers and debian/trawl.tmpfiles are
+#     spelled without .conf. It generates `systemd-sysusers <name>` and
+#     `systemd-tmpfiles --create <name>` calls in postinst, deriving <name> from
+#     the asset's SOURCE path via with_extension("conf"). Under the old
+#     debian/trawl.sysusers.conf spelling the generated call named a file nobody
+#     installed, exited 1, and left the package half-configured. packaging.sh
+#     guards that statically now; this harness is what catches it end to end.
 
 set -Eeuo pipefail
 
@@ -53,7 +57,7 @@ set -Eeuo pipefail
 readonly RUST_IMAGE="rust:1.98-trixie@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959"
 readonly DEBIAN_IMAGE="debian:trixie@sha256:f324c7ff54321e8d9c588493a20244965938ce0aa50bbd1022d38010e9ffc4b1"
 readonly POSTGRES_IMAGE="postgres:18@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280"
-readonly CARGO_DEB_VERSION="3.7.0"
+readonly CARGO_DEB_VERSION="3.8.0"
 
 readonly BUILDER_IMAGE="trawl-crashdump-builder:cargo-deb-${CARGO_DEB_VERSION}"
 readonly NODE_IMAGE="trawl-crashdump-node:trixie"
