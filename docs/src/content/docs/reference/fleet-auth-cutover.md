@@ -244,8 +244,15 @@ re-pad and decode while writing:
 ```bash
 printf '%s=' "$(op read 'op://Homelab/Fleet session key/credential')" \
   | basenc --base64url -d > /var/lib/trawl/web.cookie   # raw 32 bytes
-chmod 600 /var/lib/trawl/web.cookie
+chown trawl:trawl /var/lib/trawl/web.cookie
+chmod 0640 /var/lib/trawl/web.cookie
 ```
+
+`0640 trawl:trawl`, not `0600`. trawl-web runs as its own `trawl-web` user and
+reads the key through membership of the `trawl` group, so a key it cannot read
+means a proxy that will not start. This is the same mode postinst applies
+through `systemd-tmpfiles`; writing the file by hand bypasses that, so set it
+yourself.
 
 Then in `/etc/trawl/trawld.toml`:
 

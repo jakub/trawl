@@ -14,6 +14,7 @@ cargo_toml="$repo_root/crates/trawl-server/Cargo.toml"
 imp_rs="$repo_root/crates/trawl-crashdump/src/imp.rs"
 values_yaml="$repo_root/chart/trawl/values.yaml"
 docs_page="$repo_root/docs/src/content/docs/reference/crash-dumps.md"
+cutover_page="$repo_root/docs/src/content/docs/reference/fleet-auth-cutover.md"
 asset_dest="usr/share/doc/trawl-server/examples/crashdump.conf"
 
 fail() {
@@ -245,6 +246,19 @@ if ! grep -Eq '^z[[:space:]]+/var/lib/trawl/web\.cookie[[:space:]]+0640[[:space:
 fi
 if grep -Eq '^[[:space:]]*(chown|chmod)[[:space:]].*/var/lib/trawl/web\.cookie' "$postinst"; then
   fail "crates/trawl-server/debian/postinst chowns or chmods /var/lib/trawl/web.cookie directly — that dereferences a symlink the trawl user can plant; the z line in debian/trawl.tmpfiles is the no-follow way to do it"
+fi
+
+# The fleet SSO runbook tells an operator to overwrite that same key by hand,
+# which bypasses tmpfiles entirely. If it keeps saying 0600, following it leaves
+# a key trawl-web cannot read and a proxy that will not start.
+if [[ ! -f "$cutover_page" ]]; then
+  fail "docs/src/content/docs/reference/fleet-auth-cutover.md is missing — it carries the by-hand key install that has to agree with the packaged mode"
+fi
+if ! grep -Eq 'chmod[[:space:]]+0640[[:space:]]+/var/lib/trawl/web\.cookie' "$cutover_page"; then
+  fail "docs/src/content/docs/reference/fleet-auth-cutover.md does not install /var/lib/trawl/web.cookie as 0640 — trawl-web reads it through the trawl group and a 0600 key stops the proxy starting"
+fi
+if grep -Eq 'chmod[[:space:]]+0?600[[:space:]]+/var/lib/trawl/web\.cookie' "$cutover_page"; then
+  fail "docs/src/content/docs/reference/fleet-auth-cutover.md still tells operators to chmod the session key 600 — that predates the trawl-web user split"
 fi
 if ! grep -Eq '^[[:space:]]*systemd-tmpfiles[[:space:]]+--create[[:space:]]+trawl\.conf' "$postinst"; then
   fail "crates/trawl-server/debian/postinst does not run 'systemd-tmpfiles --create trawl.conf' — nothing would create '$dir_value' at install time"
