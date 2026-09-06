@@ -46,6 +46,9 @@ readonly CFG_FIFO=/tmp/cfg
 # Touched inside the container by the config-FIFO writer this script holds open,
 # the moment that writer's open() returns. See hold_config.
 readonly CFG_HELD=/tmp/cfg-held
+# Where that writer's own stderr goes, so a refused open is one readable line
+# instead of a 60s timeout with nothing to read. See hold_config.
+readonly CFG_WRITER_ERR=/tmp/cfg-writer-err
 
 # How long to wait for each observable. Generous: a debug-profile trawld is a
 # few hundred MB and the monitor walks its whole address space.
@@ -276,9 +279,8 @@ trap cleanup EXIT
 # an open() that never returns.
 SEED_DIR="$(mktemp -d)"
 mkfifo "$SEED_DIR/cfg"
-# Mode survives the copy, and the containers run as uid 1000 while the copy is
-# made by whoever runs this script, so both ends need the other's bits.
-chmod 666 "$SEED_DIR/cfg"
+# Its own mode and owner never matter: start_as_init plants it through a tar
+# stream that states both.
 
 # start <short-name> <docker run args...>
 # Detached, tracked for cleanup, and left un-removed so `docker logs` still
@@ -301,15 +303,34 @@ start_as_init() {
   CONTAINERS+=("$CONTAINER")
   printf '\n$ docker create --name %s %s\n' "$CONTAINER" "$*"
   docker create --name "$CONTAINER" "$@" >/dev/null
-  printf '$ docker cp <fifo> %s:%s && docker start %s\n' "$CONTAINER" "$CFG_FIFO" "$CONTAINER"
-  docker cp "$SEED_DIR/cfg" "$CONTAINER:$CFG_FIFO" >/dev/null
+  # Planted through a tar stream rather than `docker cp <path>`, which would
+  # carry the seed file's own uid into the container. That matters because
+  # /tmp is mode 1777 and the kernel's fs.protected_fifos (1 by default under
+  # systemd, and a global sysctl every container inherits) refuses an O_CREAT
+  # open of a FIFO in a sticky world-writable directory unless the FIFO is
+  # owned by the directory's owner or by the caller. hold_config's writer uses
+  # shell `>`, which is O_CREAT, and it runs as the container's uid 1000; the
+  # script itself runs as whoever CI gave it, uid 1001 on the ARC runners. So
+  # a copied-in FIFO owned by 1001 is refused, the writer's open never returns
+  # a descriptor, and the step reports a config read trawld had in fact
+  # reached. Owner 0 is the one choice that holds for every pairing, because
+  # the directory owner is root in every one of these images.
+  #
+  # The alternative, an opener without O_CREAT (`exec 7<>$CFG_FIFO`), is not
+  # used: a read-write open of a FIFO never blocks, so it would return before
+  # trawld opened the read end and destroy the only thing hold_config proves.
+  printf '$ tar <fifo> | docker cp - %s:%s && docker start %s\n' \
+    "$CONTAINER" "${CFG_FIFO%/*}" "$CONTAINER"
+  tar -C "$SEED_DIR" -cf - --owner=0 --group=0 --numeric-owner --mode=0666 cfg |
+    docker cp - "$CONTAINER:${CFG_FIFO%/*}" >/dev/null
   docker start "$CONTAINER" >/dev/null
 }
 
-# wait_until <secs> <description> <predicate...>
+# poll <secs> <description> <predicate...>
 # Polls. A bare sleep is never a synchronisation primitive here, and every wait
-# is bounded.
-wait_until() {
+# is bounded. Returns 1 on timeout, for the one caller that has more to say
+# about a timeout than the description does.
+poll() {
   local secs="$1" what="$2"
   shift 2
   local i
@@ -320,7 +341,12 @@ wait_until() {
     fi
     sleep 1
   done
-  die "timed out after ${secs}s waiting for: $what"
+  return 1
+}
+
+# wait_until <secs> <description> <predicate...>. poll, but a timeout is fatal.
+wait_until() {
+  poll "$@" || die "timed out after ${1}s waiting for: $2"
 }
 
 # ------------------------------------------------------------- small readers --
@@ -351,6 +377,14 @@ crash_dump_line() { logs "$1" | grep -F 'event_type="crash_dump"' | head -n 1; }
 trawld_procs() { docker exec "$1" sh -c "$FIND_TRAWLD" 2>/dev/null | tr -d '\r'; }
 fifo_ready() { docker exec "$1" test -p "$CFG_FIFO" >/dev/null 2>&1; }
 config_held() { docker exec "$1" test -e "$CFG_HELD" >/dev/null 2>&1; }
+# What the config-FIFO writer's own open() said, if anything. Empty when the
+# open blocked rather than failed, which is the other way hold_config times
+# out; best-effort, because a diagnostic must not fail the failure path.
+writer_error() {
+  local text
+  text="$(timeout "$DIAG_TIMEOUT_SECS" docker exec "$1" cat "$CFG_WRITER_ERR" 2>&1 | tr '\n' ' ')" || true
+  printf '%s' "${text:-<empty: the open blocked rather than failed>}"
+}
 trawld_count() { trawld_procs "$1" | grep -c . || true; }
 have_procs() { [ "$(trawld_count "$1")" -ge "$2" ]; }
 
@@ -410,10 +444,16 @@ hold_config() {
   # the container mkfifo's it at startup, and an ordinary file opened into
   # existence here first would make that mkfifo fail.
   wait_until "$PROC_WAIT_SECS" "the config FIFO exists in $1" fifo_ready "$1"
-  docker exec -d "$1" sh -c "exec 7>$CFG_FIFO; : >$CFG_HELD; sleep 86400" ||
+  # stderr is redirected in its own `exec` first, so the redirection that can
+  # actually fail reports into the file rather than into a detached `docker
+  # exec`'s discarded output. `docker exec -d` returns 0 either way, so this
+  # file is the only place a refused open is written down.
+  docker exec -d "$1" \
+    sh -c "exec 2>$CFG_WRITER_ERR; exec 7>$CFG_FIFO; : >$CFG_HELD; sleep 86400" ||
     die "cannot start a config-FIFO writer in $1"
-  wait_until "$EXEC_WAIT_SECS" "trawld in $1 is parked at its config read (init() returned)" \
-    config_held "$1"
+  poll "$EXEC_WAIT_SECS" "trawld in $1 is parked at its config read (init() returned)" \
+    config_held "$1" ||
+    die "trawld in $1 never reached its config read within ${EXEC_WAIT_SECS}s (init() did not finish?); config-FIFO writer stderr: $(writer_error "$1")"
 }
 
 # feed_config <container>. Unblocks trawld's config read.
@@ -749,9 +789,10 @@ phase "step 7: the chart shape, no_new_privs on, still captures"
 # gain, and the kernel takes it back. That shell does not exist in the pod, and
 # leaving it in would turn this step into a proof of the opposite.
 #
-# So the FIFO is planted from outside instead, with docker cp into a created
-# but not yet started container. Same park at the config read, same proof that
-# init() finished, nothing between the runtime and trawld.
+# So the FIFO is planted from outside instead, into a created but not yet
+# started container. Same park at the config read, same proof that init()
+# finished, nothing between the runtime and trawld. start_as_init says why it
+# is planted as root.
 
 start_as_init chart-shape-crash \
   --user 1000 --cap-add SYS_PTRACE --security-opt no-new-privileges \
@@ -762,9 +803,10 @@ chart_c="$CONTAINER"
 # Recorded unconditionally, because the shape docker actually built is only
 # knowable while the container exists, and this is the step whose failure mode
 # is "trawld never reached its config read on that daemon". The planted FIFO
-# goes in the same file: docker cp preserves mode and owner, and whether uid
-# 1000 inside can open it is the first thing to doubt when the read end never
-# opens.
+# goes in the same file: whether uid 1000 inside can open it is the first
+# thing to doubt when the read end never opens, and under fs.protected_fifos
+# ownership decides that as much as mode does. Owner 0 is what start_as_init
+# plants, so anything else in this listing is the answer.
 docker inspect \
   --format '{{.HostConfig.SecurityOpt}} {{.HostConfig.CapAdd}} {{.Config.User}} {{.Config.Entrypoint}} {{.Config.Cmd}}' \
   "$chart_c" >"$LOG_DIR/07-chart-shape-container.txt" 2>&1 || true
