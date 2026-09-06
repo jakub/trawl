@@ -128,10 +128,117 @@ PREFIX="trawl-cdci-$$"
 CONTAINERS=()
 CONTAINER=""
 
-die() { printf '\nFAIL: %s\n' "$*" >&2; exit 1; }
 note() { printf '  %s\n' "$*"; }
 phase() { printf '\n\n## %s\n\n' "$*"; }
 run() { printf '\n$ %s\n' "$*"; "$@"; }
+
+# ----------------------------------------------------------- failure capture --
+
+# A failure takes its own evidence with it: cleanup removes every container on
+# the way out, and what CI keeps is $LOG_DIR. So a post-mortem only gets what
+# was written to disk before die() returned. The case this exists for is step 7
+# on the CI docker daemon, where trawld never opened the config FIFO, the
+# containers were removed by the trap, and the uploaded artifact said nothing
+# about the run at all.
+#
+# Every reader below is best-effort and returns success. A diagnostic that
+# fails the script it is diagnosing would replace one unexplained failure with
+# another, so each reader keeps whatever it printed, error text included.
+
+readonly DIAG_TIMEOUT_SECS=20
+
+# Runs INSIDE a container. Prints the pid of every trawld process. It reads
+# comm rather than status or environ because comm stays readable to uid 1000
+# whatever the exec did to dumpability, and a hung process is exactly when the
+# other two are least likely to answer.
+# shellcheck disable=SC2016  # the container's shell expands these, not ours
+readonly FIND_TRAWLD_COMM='
+for d in /proc/[0-9]*; do
+  if [ "$(cat "$d/comm" 2>/dev/null)" = trawld ]; then echo "${d#/proc/}"; fi
+done
+exit 0
+'
+
+# Which uid the readers run as, set per container by capture_state.
+#
+# It matters. trawld exec's with a file capability, which makes the exec
+# secureexec, which clears dumpable, which hands the daemon's own /proc files
+# to root: uid 1000 gets "Permission denied" for wchan, syscall and fd, and
+# those are the three that tell a hang from an exit. A root `docker exec` is
+# not an escalation the container performed, so the runtime allows it even
+# under no_new_privileges, and it reads them. On the container this failure is
+# about it prints wchan=wait_for_partner and syscall=257, which names the FIFO
+# open by number. /proc/<pid>/stack stays denied: that one wants CAP_SYS_ADMIN
+# in the initial user namespace, which no container here has.
+DIAG_EXEC_USER=""
+
+# diag <container> <outfile> <sh-command>. Runs one reader in the container and
+# puts everything it printed into <outfile>, stderr included, then records the
+# exit status when it is not 0. An unreadable /proc file is itself the finding.
+diag() {
+  local rc=0
+  if [ -n "$DIAG_EXEC_USER" ]; then
+    timeout "$DIAG_TIMEOUT_SECS" docker exec -u "$DIAG_EXEC_USER" "$1" sh -c "$3" >"$2" 2>&1 || rc=$?
+  else
+    timeout "$DIAG_TIMEOUT_SECS" docker exec "$1" sh -c "$3" >"$2" 2>&1 || rc=$?
+  fi
+  [ "$rc" -eq 0 ] || printf '[reader exited %s]\n' "$rc" >>"$2"
+  return 0
+}
+
+# capture_state <container> <label>. Writes the container's logs, its state as
+# the daemon sees it, /tmp, and one set of /proc files per trawld process, all
+# under $LOG_DIR/<label>-*.
+#
+# wchan, syscall and stack are what tell a hang from an exit: a process parked
+# in the kernel names the function it is parked in, and one that is gone leaves
+# no files at all next to a non-zero exit code in <label>-state.txt.
+capture_state() {
+  local c="$1" label="$2" pids pid rc=0
+  [ -n "$c" ] || return 0
+
+  timeout "$DIAG_TIMEOUT_SECS" docker logs "$c" >"$LOG_DIR/$label-container.log" 2>&1 || rc=$?
+  # Same colouring as logs(), stripped the same way, in place.
+  sed -i -e 's/\x1b\[[0-9;]*m//g' "$LOG_DIR/$label-container.log" 2>/dev/null || true
+  [ "$rc" -eq 0 ] || printf '[docker logs exited %s]\n' "$rc" >>"$LOG_DIR/$label-container.log"
+
+  timeout "$DIAG_TIMEOUT_SECS" docker inspect \
+    --format '{{.State.Status}} {{.State.ExitCode}} {{.State.Pid}}' "$c" \
+    >"$LOG_DIR/$label-state.txt" 2>&1 || true
+
+  # Root if the runtime will give it, the container's own uid otherwise: a
+  # partial set of readable files beats none.
+  DIAG_EXEC_USER=""
+  if timeout "$DIAG_TIMEOUT_SECS" docker exec -u 0 "$c" true >/dev/null 2>&1; then
+    DIAG_EXEC_USER=0
+  fi
+
+  diag "$c" "$LOG_DIR/$label-tmp.txt" 'ls -l /tmp'
+
+  pids="$(timeout "$DIAG_TIMEOUT_SECS" docker exec "$c" sh -c "$FIND_TRAWLD_COMM" 2>/dev/null | tr -d '\r')" || pids=""
+  for pid in $pids; do
+    diag "$c" "$LOG_DIR/$label-pid$pid-status.txt" "cat /proc/$pid/status"
+    diag "$c" "$LOG_DIR/$label-pid$pid-wchan.txt" "cat /proc/$pid/wchan; echo"
+    diag "$c" "$LOG_DIR/$label-pid$pid-syscall.txt" "cat /proc/$pid/syscall"
+    diag "$c" "$LOG_DIR/$label-pid$pid-stack.txt" "cat /proc/$pid/stack"
+    diag "$c" "$LOG_DIR/$label-pid$pid-fd.txt" "ls -l /proc/$pid/fd"
+  done
+  return 0
+}
+
+# Every container this run started, labelled by its short name. Called from
+# die, so the capture happens while the containers still exist.
+capture_all_state() {
+  local c
+  ((${#CONTAINERS[@]})) || return 0
+  printf '\n  saving container diagnostics to %s\n' "$LOG_DIR" >&2
+  for c in "${CONTAINERS[@]}"; do
+    capture_state "$c" "fail-${c#"$PREFIX-"}"
+  done
+  return 0
+}
+
+die() { printf '\nFAIL: %s\n' "$*" >&2; capture_all_state; exit 1; }
 
 cleanup() {
   local status=$?
@@ -651,6 +758,19 @@ start_as_init chart-shape-crash \
   -e TRAWL_CRASH_DUMP_DIR="$DUMP_DIR" -e RUST_LOG=trawld=info \
   --entrypoint /usr/bin/trawld "$IMAGE" --config "$CFG_FIFO" --no-monitor
 chart_c="$CONTAINER"
+
+# Recorded unconditionally, because the shape docker actually built is only
+# knowable while the container exists, and this is the step whose failure mode
+# is "trawld never reached its config read on that daemon". The planted FIFO
+# goes in the same file: docker cp preserves mode and owner, and whether uid
+# 1000 inside can open it is the first thing to doubt when the read end never
+# opens.
+docker inspect \
+  --format '{{.HostConfig.SecurityOpt}} {{.HostConfig.CapAdd}} {{.Config.User}} {{.Config.Entrypoint}} {{.Config.Cmd}}' \
+  "$chart_c" >"$LOG_DIR/07-chart-shape-container.txt" 2>&1 || true
+printf 'seed fifo:\n' >>"$LOG_DIR/07-chart-shape-container.txt"
+timeout "$DIAG_TIMEOUT_SECS" docker exec "$chart_c" ls -ln "$CFG_FIFO" \
+  >>"$LOG_DIR/07-chart-shape-container.txt" 2>&1 || true
 
 hold_config "$chart_c"
 resolve_pids "$chart_c"
