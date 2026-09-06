@@ -79,10 +79,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "[trawld] crash-dump seal failed: refusing to start with an unsealed \
              capability set (ADR-0023 ruling 4)"
         );
-        // Explicit, and before the error propagates: dropping the report
-        // uninstalls the handler and lets the monitor exit.
+        // Explicit, and before the exit: dropping the report uninstalls the
+        // handler and lets the monitor exit.
         drop(crash_dump);
-        return Err("crash-dump capture could not drop CAP_SYS_PTRACE".into());
+        // Exit 1 rather than returning an error. `Termination` for `Result`
+        // prints the error itself, as `Error: ...`, which would put a second
+        // diagnostic under the one above for the same failure.
+        std::process::exit(1);
     }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
