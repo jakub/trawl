@@ -540,6 +540,26 @@ run dpkg-deb -f "$DEB" Package Version Architecture Depends
 
 phase "3 up"
 
+# The flock guarantees no other run owns these names, so anything still here is
+# debris from a run that was killed before its teardown, or from --keep. Clear
+# it rather than reusing it: a container left over from an earlier build would
+# quietly test the wrong .deb, and `docker network create` on an existing
+# network is a hard failure that leaves the operator to clean up by hand.
+preflight=()
+for stale in "$NODE" "$PG"; do
+  if docker inspect "$stale" >/dev/null 2>&1; then
+    docker rm -f "$stale" >/dev/null 2>&1 || true
+    preflight+=("container $stale")
+  fi
+done
+if docker network inspect "$NET" >/dev/null 2>&1; then
+  docker network rm "$NET" >/dev/null 2>&1 || true
+  preflight+=("network $NET")
+fi
+if (( ${#preflight[@]} )); then
+  note "removed leftovers from an earlier run: ${preflight[*]}"
+fi
+
 runq docker network create "$NET"
 
 printf '\n$ docker run -d --name %s --network %s %s\n' "$PG" "$NET" "$POSTGRES_IMAGE"
