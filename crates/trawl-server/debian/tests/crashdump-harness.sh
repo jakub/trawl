@@ -71,6 +71,10 @@ readonly TRAWL_DSN="postgres://trawl:trawlpw@${PG}:5432/trawl"
 
 readonly YAMA="/proc/sys/kernel/yama/ptrace_scope"
 readonly CORES="/var/lib/trawl/cores"
+
+# Distinct exit codes, so a caller can tell an assertion failure from the two
+# outcomes that need a human rather than a rerun.
+readonly EXIT_SYSCTL_RESTORE_FAILED=3
 # CAP_SYS_PTRACE is capability number 19.
 readonly PTRACE_CAP_BIT=19
 
@@ -183,7 +187,13 @@ die()   { printf '\nFAIL: %s\n' "$*" >&2; exit 1; }
 # ------------------------------------------------------------------ cleanup --
 
 ORIG_SCOPE=""
+# Set to 1 BEFORE the write, never after: a write that lands and then fails to
+# report, or a signal delivered mid-write, must still reach the restore path.
 SCOPE_MODIFIED=0
+# The value this run last wrote and read back. The restore compares against it
+# so a value some other process changed while we ran is reported rather than
+# quietly overwritten.
+SCOPE_EXPECTED=""
 
 set_host_scope() {
   local value="$1"
@@ -196,19 +206,47 @@ set_host_scope() {
   fi
 }
 
+# The host file and the container's view are the same kernel knob. Teardown
+# reads the host directly, because by then the container may already be gone.
+host_scope() { cat "$YAMA" 2>/dev/null || true; }
+
+restore_host_scope() { # 0 restored or nothing to do, 1 needs a human
+  local cur
+  if [[ "$SCOPE_MODIFIED" != 1 || -z "$ORIG_SCOPE" ]]; then
+    note "host ptrace_scope was never modified"
+    return 0
+  fi
+
+  cur=$(host_scope)
+  if [[ -n "$SCOPE_EXPECTED" && "$cur" != "$SCOPE_EXPECTED" ]]; then
+    printf '\n!! NOT RESTORING %s: it reads %s, this run last set %s.\n' \
+      "$YAMA" "$cur" "$SCOPE_EXPECTED"
+    printf '!! Something else changed it. Decide by hand; it was %s before this run.\n' "$ORIG_SCOPE"
+    return 1
+  fi
+
+  note "restoring host ptrace_scope to $ORIG_SCOPE"
+  if ! set_host_scope "$ORIG_SCOPE"; then
+    printf '\n!! COULD NOT WRITE %s — set it to %s by hand !!\n' "$YAMA" "$ORIG_SCOPE"
+    return 1
+  fi
+
+  cur=$(host_scope)
+  if [[ "$cur" != "$ORIG_SCOPE" ]]; then
+    printf '\n!! RESTORE DID NOT TAKE: %s reads %s, wanted %s. Set it by hand !!\n' \
+      "$YAMA" "$cur" "$ORIG_SCOPE"
+    return 1
+  fi
+  return 0
+}
+
 cleanup() {
   local rc=$?
   trap - EXIT INT TERM
   phase "down: teardown"
 
-  if [[ "$SCOPE_MODIFIED" == 1 && -n "$ORIG_SCOPE" ]]; then
-    note "restoring host ptrace_scope to $ORIG_SCOPE"
-    if ! set_host_scope "$ORIG_SCOPE"; then
-      printf '\n!! COULD NOT RESTORE %s — set it to %s by hand !!\n' "$YAMA" "$ORIG_SCOPE"
-    fi
-  else
-    note "host ptrace_scope was never modified"
-  fi
+  local restore_failed=0
+  restore_host_scope || restore_failed=1
 
   if [[ "$KEEP" == 1 ]]; then
     note "--keep: leaving $NODE, $PG and network $NET in place"
@@ -220,7 +258,14 @@ cleanup() {
   printf '\n$ cat %s   # host, after restore\n' "$YAMA"
   cat "$YAMA" 2>/dev/null || echo "(yama not present)"
 
-  printf '\nexit status: %s\n' "$rc"
+  # A leaked sysctl outranks whatever else went wrong: the machine is left in a
+  # state the operator did not ask for, and only a human can settle it.
+  if (( restore_failed )); then
+    rc="$EXIT_SYSCTL_RESTORE_FAILED"
+    printf '\nexit status: %s (host ptrace_scope needs manual attention)\n' "$rc"
+  else
+    printf '\nexit status: %s\n' "$rc"
+  fi
   finish_transcript
   exit "$rc"
 }
@@ -583,28 +628,56 @@ run docker exec "$NODE" systemctl show trawld -p AmbientCapabilities -p Environm
 
 # ---------------------------------------------- phases C/D: a fault per scope --
 
-ensure_scope() { # ensure_scope <wanted> -> 0 usable, 1 skip (reason printed)
-  local want="$1" cur
+# Sets SCOPE_READY (1 usable, 0 skip) and SCOPE_SKIP_REASON. It reports through
+# variables rather than an exit status on purpose: a function called as an `if`
+# condition runs with errexit suppressed for its whole body, so a docker exec
+# that failed inside would fall through instead of aborting, and the run could
+# certify a scope it never actually set.
+SCOPE_READY=0
+SCOPE_SKIP_REASON=""
+
+ensure_scope() { # ensure_scope <wanted>
+  local want="$1" cur readback
+  SCOPE_READY=0
+  SCOPE_SKIP_REASON=""
+
   if [[ -z "$ORIG_SCOPE" ]]; then
-    note "skipped: no $YAMA on this kernel"
-    return 1
+    SCOPE_SKIP_REASON="no $YAMA on this kernel"
+    return 0
   fi
+
   cur=$(nshq "cat $YAMA")
   printf '\n$ docker exec %s cat %s   # shared kernel: this IS the host value\n%s\n' "$NODE" "$YAMA" "$cur"
+
   if (( want < ORIG_SCOPE )); then
-    note "skipped: the host runs ptrace_scope=$ORIG_SCOPE and this harness never lowers it"
-    return 1
+    SCOPE_SKIP_REASON="the host runs ptrace_scope=$ORIG_SCOPE and this harness never lowers it"
+    return 0
   fi
   if (( want > cur )); then
     if (( ALLOW_HOST_SYSCTL == 0 )); then
-      note "skipped: requires --allow-host-sysctl"
-      return 1
+      SCOPE_SKIP_REASON="requires --allow-host-sysctl"
+      return 0
     fi
     printf '\n$ docker exec %s bash -c '\''echo %s > %s'\''\n' "$NODE" "$want" "$YAMA"
-    set_host_scope "$want"
+    # Flag first. If the write lands and then something goes wrong before the
+    # readback, teardown still has to put the host back.
     SCOPE_MODIFIED=1
-    note "raised $cur -> $want (restored to $ORIG_SCOPE by the exit trap)"
+    set_host_scope "$want"
+    readback=$(nshq "cat $YAMA")
+    SCOPE_EXPECTED="$readback"
+    [[ "$readback" == "$want" ]] \
+      || die "asked the kernel for ptrace_scope=$want, it reads $readback"
+    note "raised $cur -> $want, confirmed by readback (restored to $ORIG_SCOPE by the exit trap)"
   fi
+
+  # Whether we wrote it or found it already there, the case only runs against a
+  # kernel that reports the scope the case claims to be testing. A scope-1 run
+  # must never be filed as evidence for scope 2.
+  readback=$(nshq "cat $YAMA")
+  [[ "$readback" == "$want" ]] \
+    || die "scope case $want would run against ptrace_scope=$readback"
+
+  SCOPE_READY=1
   return 0
 }
 
@@ -657,8 +730,11 @@ scope_case() { # scope_case <scope>
 
 for scope in "${SCOPES[@]}"; do
   phase "C/D fault at yama ptrace_scope=$scope"
-  if ensure_scope "$scope"; then
+  ensure_scope "$scope"
+  if (( SCOPE_READY )); then
     scope_case "$scope"
+  else
+    note "skipped: $SCOPE_SKIP_REASON"
   fi
 done
 
@@ -666,11 +742,19 @@ done
 
 phase "E negative (capability removed)"
 
+NEGATIVE_READY=0
 if [[ "$RUN_NEGATIVE" == 0 ]]; then
   note "skipped: --no-negative"
-elif ! ensure_scope 2; then
-  note "skipped: scope 2 is not reachable"
 else
+  ensure_scope 2
+  if (( SCOPE_READY )); then
+    NEGATIVE_READY=1
+  else
+    note "skipped: $SCOPE_SKIP_REASON"
+  fi
+fi
+
+if (( NEGATIVE_READY )); then
   # What this proves, and what it does NOT prove.
   #
   # The docs say a half-applied drop-in gives you "the stderr breadcrumb and no
