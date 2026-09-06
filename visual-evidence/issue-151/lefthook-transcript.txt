@@ -87,3 +87,34 @@ summary: (done in 7.03 seconds)
 ✓ clippy (6.85 seconds)
 ✓ wasm-clippy (7.02 seconds)
 exit=0
+
+## Manifest-only case, added after review (glob fix in lefthook.yml)
+
+Review finding: lefthook's default matcher treats `**/` as at least one
+directory, so `crates/fleet-ui/**/*` skipped the crate's own Cargo.toml.
+Fix: a second pattern per crate, `crates/<crate>/*`. Probes below run
+with the fixed lefthook.yml against the tree at:
+
+$ git rev-parse HEAD
+e49a334b49c3e2a6a7ec87d459d1561ae0553c95
+(lefthook.yml modified, committed as the fix commit that carries this section)
+
+$ lefthook run pre-commit --job wasm-clippy --file crates/fleet-ui/Cargo.toml --no-auto-install --colors off --no-tty
+┃  wasm-clippy ❯ 
+✓ wasm-clippy (1.74 seconds)
+exit=0
+
+$ lefthook run pre-commit --job wasm-clippy --file crates/trawl-web-ui/Cargo.toml --no-auto-install --colors off --no-tty
+┃  wasm-clippy ❯ 
+✓ wasm-clippy (1.45 seconds)
+exit=0
+
+$ lefthook run pre-commit --job wasm-clippy --file crates/fleet-ui/src/lib.rs --no-auto-install --colors off --no-tty
+┃  wasm-clippy ❯ 
+✓ wasm-clippy (1.45 seconds)
+exit=0
+
+$ lefthook run pre-commit --job wasm-clippy --file crates/trawl-server/src/main.rs --no-auto-install --colors off --no-tty
+│  wasm-clippy (skip) no matching staged files
+exit=0
+

@@ -16,9 +16,14 @@ pre-commit:
       # The host clippy job never sees the cfg(target_arch = "wasm32")
       # component tree; this does. Glob-gated so a backend-only commit
       # pays nothing. One sequential command: three parallel cargo
-      # processes would contend for one target dir.
+      # processes would contend for one target dir. Two patterns per
+      # crate because lefthook's matcher reads `**/` as "at least one
+      # directory", so `crates/x/**/*` alone misses the crate root and
+      # a Cargo.toml-only commit (a wasm feature flip) would slip past.
       glob:
+        - "crates/trawl-web-ui/*"
         - "crates/trawl-web-ui/**/*"
+        - "crates/fleet-ui/*"
         - "crates/fleet-ui/**/*"
       run: . "$HOME/.cargo/env" 2>/dev/null; cargo clippy -p trawl-web-ui --target wasm32-unknown-unknown -- -D warnings && cargo clippy -p fleet-ui --target wasm32-unknown-unknown -- -D warnings && cargo clippy -p fleet-ui --target wasm32-unknown-unknown --features atmosphere -- -D warnings
 
