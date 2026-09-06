@@ -43,6 +43,28 @@ if [ "$1" = "configure" ]; then
       mv "$tmp" /var/lib/trawl/web.cookie
     fi
   fi
+
+  # Everything under /var/lib/trawl gets its ownership and modes from
+  # usr/lib/tmpfiles.d/trawl.conf: the cores directory created, web.cookie
+  # adjusted to 0640 trawl:trawl so the trawl-web uid can read it through the
+  # trawl group.
+  #
+  # systemd-tmpfiles rather than chown and chmod in this script, for both, and
+  # for the same reason. trawl owns /var/lib/trawl, so anything running as that
+  # user can replace an entry with a symlink; a root `chown trawl:trawl
+  # /var/lib/trawl/web.cookie` follows it and hands the target away. A planted
+  # `web.cookie -> /etc/shadow` would come back 0640 trawl:trawl. tmpfiles opens
+  # each component with O_NOFOLLOW and refuses to act through a link, so there is
+  # no window to win and no check to race.
+  #
+  # Runs last, after the bootstrap above has created the key, because `z` only
+  # adjusts a file that already exists. Gated on the binary so a systemd-less
+  # chroot still configures, but NOT swallowed: a systemd-tmpfiles that is
+  # present and fails is a real failure, and carrying on past it leaves the
+  # crash-dump drop-in pointing at a directory nobody created.
+  if command -v systemd-tmpfiles >/dev/null 2>&1; then
+    systemd-tmpfiles --create trawl.conf
+  fi
 fi
 
 #DEBHELPER#

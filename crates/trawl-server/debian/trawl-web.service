@@ -7,13 +7,23 @@ Wants=network-online.target trawld.service
 [Service]
 Type=simple
 ExecStart=/usr/bin/trawl-web --config /etc/trawl/trawld.toml
-User=trawl
+# Its own uid, deliberately not trawld's. The proxy needs two files the trawl
+# GROUP owns, /var/lib/trawl/web.cookie and /etc/trawl/trawld.toml, and nothing
+# the trawl USER owns. Running it as trawl made the InaccessiblePaths line below
+# decoration: same-uid means /proc/<trawld-pid>/root reaches into trawld's mount
+# namespace, where the crash-dump directory is not masked. A separate uid makes
+# that procfs read fail the kernel's ptrace check, and leaves the 0700 mode on
+# the directory as a second, independent denial.
+User=trawl-web
 Group=trawl
 EnvironmentFile=-/etc/default/trawl-web
 
-# State & logging — share trawld's state dir (read-only access to web.cookie).
-StateDirectory=trawl
-LogsDirectory=trawl
+# No StateDirectory=/LogsDirectory=: systemd chowns those to the unit's own
+# user, and trawld already owns /var/lib/trawl and /var/log/trawl. Two units
+# with different uids both declaring them would take turns reassigning the
+# ownership on every start. The proxy owns neither directory. It reads
+# web.cookie out of trawld's state directory and writes nothing, so
+# ReadWritePaths below is all the access it needs.
 WorkingDirectory=/var/lib/trawl
 
 # Restart policy
@@ -36,6 +46,17 @@ LockPersonality=true
 MemoryDenyWriteExecute=true
 ReadWritePaths=/var/lib/trawl
 ReadOnlyPaths=/etc/trawl
+
+# Third denial, on top of the separate uid and the directory's 0700 mode. A
+# minidump is a verbatim copy of trawld's memory: API tokens, the TLS private
+# key, the postgres password. A browser-facing proxy has no business with any of
+# it, and /var/lib/trawl has to stay reachable for web.cookie, so the mask
+# covers exactly the one subdirectory. On kubernetes the separation is
+# structural instead, since the cores PVC only mounts into the trawld container.
+# The path always exists (usr/lib/tmpfiles.d/trawl.conf, reapplied at every
+# boot), so this needs no `-` prefix and a missing directory is a loud failure
+# rather than a silently dropped protection.
+InaccessiblePaths=/var/lib/trawl/cores
 
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 

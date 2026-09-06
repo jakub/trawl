@@ -1,0 +1,7 @@
+u trawl - "Trawl log daemon" /var/lib/trawl /usr/sbin/nologin
+u trawl-web - "Trawl web proxy" - /usr/sbin/nologin
+# trawl-web reads two files the trawl group owns: /var/lib/trawl/web.cookie and
+# /etc/trawl/trawld.toml. Group membership is what grants those, so the proxy
+# never needs to BE the trawl user, and the crash-dump directory (0700
+# trawl:trawl) stays out of its reach.
+m trawl-web trawl

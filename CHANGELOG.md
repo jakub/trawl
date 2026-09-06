@@ -7,6 +7,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Crash-dump capture on the Debian channel (#19).** The `trawl-server`
+  package now ships an inactive systemd drop-in at
+  `/usr/share/doc/trawl-server/examples/crashdump.conf`, and postinst
+  pre-creates `/var/lib/trawl/cores` owned `trawl:trawl` mode `0700` on
+  every install. Copying the drop-in into
+  `/etc/systemd/system/trawld.service.d/` and restarting trawld grants it
+  `CAP_SYS_PTRACE` and sets the dump directory and retention count. The helm
+  chart's `crashDump.enabled` is the same single step on kubernetes, though
+  not the same capability coverage: `capabilities.add` reaches a non-root
+  container's bounding set only, so helm capture works at yama scope 0 and 1
+  (`PR_SET_PTRACER`) and does not work at scope 2, which is #21. It ships inert
+  because a minidump is raw process memory and can hold tokens, TLS keys and
+  database credentials. Both channels are now
+  documented in the new [Crash dumps](https://trawl.sh/reference/crash-dumps/)
+  reference page, including the yama `ptrace_scope` table and what a denied
+  ptrace attach actually looks like. It is not a missing dump. minidump-writer
+  treats a refused `PTRACE_ATTACH` as a soft error and drops the thread, so a
+  denial still produces a `.dmp` that parses, still logs
+  `trawl-crashdump: wrote minidump` in the journal, and only gives itself away
+  inside: zero threads, zero memory regions, roughly a tenth the size. The
+  presence of a dump is not proof that capture worked. The web proxy also moves
+  to its own `trawl-web` user, reading `web.cookie` and `trawld.toml` through
+  membership of the `trawl` group instead of being that user. Running it as
+  `trawl` let it read every minidump through `/proc/<trawld-pid>/root`,
+  regardless of the `InaccessiblePaths` mask the unit also carries, because the
+  kernel's ptrace check passes on a matching uid and nothing is masked inside
+  trawld's own mount namespace. Reading a dump now means being `trawl` or root.
+  (#21 tracks a startup warning and the kubernetes scope-2 gap.)
 - **Scheduler-owned report windows (ADR-0018 rulings 6-14, #107).** A
   schedule now says what its runs cover, instead of leaving it to whatever
   time clause the saved query happened to carry. `PUT

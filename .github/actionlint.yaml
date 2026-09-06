@@ -1,0 +1,6 @@
+# actionlint needs self-hosted runner labels declared, or it flags every
+# runs-on that names them (surfaced by CodeRabbit on PR #149).
+self-hosted-runner:
+  labels:
+    - k8s-small
+    - k8s-big

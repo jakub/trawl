@@ -1,0 +1,25 @@
+# Crash-dump directory. It exists on every install, whether or not the operator
+# copies the crashdump.conf drop-in into place, so enabling capture never has to
+# create a directory as root. 0700 because a minidump is a verbatim copy of
+# process memory: API tokens, the TLS key, the postgres DSN.
+#
+# `d=` rather than `d`: the `=` suffix makes systemd-tmpfiles remove whatever is
+# at the path when it is not a directory, then create the directory. Plain `d`
+# leaves a regular file or a symlink sitting there, postinst still succeeds, and
+# the failure only surfaces much later when the monitor tries to write a dump
+# and gets EEXIST. That is the same silent-denial shape this whole feature keeps
+# producing, so the type gets enforced on every configure and every boot.
+d= /var/lib/trawl/cores 0700 trawl trawl -
+
+# The trawl-web session key. `z` adjusts an existing file and creates nothing,
+# which is what this needs: postinst generates the key on first install and
+# preserves it across upgrades, so the only job here is the mode and owner.
+# 0640 because the proxy runs as trawl-web and reads the key through the trawl
+# group, whose only other member it is.
+#
+# Doing it here rather than with chown and chmod in postinst is the same lesson
+# as the line above. trawl owns /var/lib/trawl, so anything running as that user
+# can swap the key for a symlink, and root's chown would follow it: a planted
+# `web.cookie -> /etc/shadow` comes back 0640 trawl:trawl. tmpfiles opens with
+# O_NOFOLLOW and refuses.
+z /var/lib/trawl/web.cookie 0640 trawl trawl -

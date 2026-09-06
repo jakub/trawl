@@ -27,6 +27,17 @@ jobs:
       - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
       - run: bash chart/trawl/tests/render.sh
 
+  deb-packaging:
+    name: deb crash-dump packaging assertions
+    runs-on: k8s-small
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - run: bash crates/trawl-server/debian/tests/packaging.sh
+
   fmt:
     name: rustfmt
     runs-on: k8s-small
