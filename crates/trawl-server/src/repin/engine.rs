@@ -45,7 +45,7 @@ use crate::repin::ceiling::{self, ForceTerms, RequestedCeilings};
 use crate::repin::cutover::{
     finish_post_swap_staging, prepare_shadow_root, swap_envs, sweep_pre_swap_staging,
 };
-use crate::repin::gate::RepinCoordinator;
+use crate::repin::gate::{RepinCoordinator, RollupPause};
 use crate::repin::marker::{
     RepinMarker, RepinPhase, aside_root, remove_marker, shadow_root, write_marker,
 };
@@ -61,9 +61,9 @@ use crate::store::{
 /// suppressed forever).
 const MAX_CATCHUP_PASSES: usize = 8;
 
-/// How long the cutover waits for every query permit before aborting to
-/// `blocked` (a wedged query holds a permit; an unbounded wait starves the
-/// cutover with retention suppressed).
+/// How long admission waits for an active rollup, or cutover waits for
+/// every query permit, before aborting to `blocked`. A wedged operation
+/// must not leave a repin waiting indefinitely with retention suppressed.
 const CUTOVER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Attempts at the post-swap postgres flip before giving up the process
@@ -73,6 +73,42 @@ const FLIP_ATTEMPTS: u32 = 3;
 /// Cadence of the detached terminal-write retry after the fast attempts
 /// in [`RepinEngine::finish`] are exhausted (a real store outage).
 const FINISH_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Wait out an active rollup, validate its completed publication, then claim
+/// the pause before another unit can start. The corpus guard comes first,
+/// matching the rollup's lock order. Neither lock survives this admission.
+async fn claim_rollup_pause(
+    coordinator: &Arc<RepinCoordinator>,
+    publication: &crate::publication::PublicationGate,
+    cancel: &CancelHandle,
+) -> Result<RollupPause, PassStop> {
+    cancel.check(STAGE_SCAN)?;
+    let admission = async {
+        let _corpus = coordinator.cutover_guard().await;
+        let _publication = publication.read().await.map_err(|_| {
+            PassStop::Failed(
+                "repin is blocked while rollup publication is incomplete; retry after recovery"
+                    .to_owned(),
+            )
+        })?;
+        cancel.check(STAGE_SCAN)?;
+        Ok(coordinator.pause_rollup())
+    };
+    tokio::pin!(admission);
+    let deadline = tokio::time::sleep(CUTOVER_DRAIN_TIMEOUT);
+    tokio::pin!(deadline);
+    let mut cancellation = tokio::time::interval(Duration::from_millis(100));
+    loop {
+        tokio::select! {
+            result = &mut admission => return result,
+            _ = cancellation.tick() => cancel.check(STAGE_SCAN)?,
+            () = &mut deadline => return Err(PassStop::Failed(
+                "repin could not wait out active rollup publication within 30 seconds; retry after it finishes"
+                    .to_owned(),
+            )),
+        }
+    }
+}
 
 /// The terminal-outcome counter, incremented only once the terminal write
 /// has actually landed (see [`RepinEngine::finish`]).
@@ -582,6 +618,30 @@ impl RepinEngine {
         req: RequestTerms,
         cancel: CancelHandle,
     ) -> Result<StartOutcome, ServerError> {
+        // A pending rollup's marker and temporary output are one recovery
+        // operation. The shadow walk excludes temporary files, so it must
+        // never copy that marker into a generation without its output.
+        // Claim before the scan too, so a dry run cannot report mixed rows.
+        let publication = self.pool.publication();
+        let rollup_pause = match claim_rollup_pause(&self.coordinator, &publication, &cancel).await
+        {
+            Ok(pause) => pause,
+            Err(PassStop::Cancelled { stage }) => {
+                let actor = self.settle_cancel(job_id, stage);
+                self.finish_cancelled(job_id, stage, actor).await;
+                return self.cancelled_outcome(job_id).await;
+            }
+            Err(PassStop::Failed(msg)) => {
+                if self
+                    .settle_pre_cutover(job_id, STAGE_SCAN, RepinJobStatus::Blocked, Some(&msg))
+                    .await
+                {
+                    return self.cancelled_outcome(job_id).await;
+                }
+                return Err(ServerError::ServiceUnavailable(msg));
+            }
+        };
+
         // Layout pre-flight, ahead of the minutes-long scan: the staging
         // siblings must share the data root's filesystem, because both
         // halves of this engine are renames and hardlinks across that
@@ -806,7 +866,16 @@ impl RepinEngine {
         };
         tokio::spawn(async move {
             engine
-                .run_job(job_id, field, from, reading, job_terms, tallies, cancel)
+                .run_job(
+                    job_id,
+                    field,
+                    from,
+                    reading,
+                    job_terms,
+                    tallies,
+                    cancel,
+                    rollup_pause,
+                )
                 .await;
         });
         Ok(StartOutcome::Started(job))
@@ -1091,9 +1160,10 @@ impl RepinEngine {
         terms: JobTerms,
         scanned: Arc<ScanTallies>,
         cancel: CancelHandle,
+        rollup_pause: RollupPause,
     ) {
         let started = std::time::Instant::now();
-        let _rollup_pause = self.coordinator.pause_rollup();
+        let _rollup_pause = rollup_pause;
         metrics::gauge!(crate::metrics::CATALOG_REPIN_RUNNING).set(1.0);
 
         let to = reading.written.pin;
@@ -2152,6 +2222,94 @@ fn parse_target(to: &str) -> Result<CanonicalType, ServerError> {
 mod tests {
     use super::*;
 
+    async fn assert_rollup_admission_waits_for_unit(failed: bool) {
+        let coordinator = Arc::new(RepinCoordinator::new());
+        let publication = crate::publication::PublicationGate::new();
+        let registry = Arc::new(CancelRegistry::default());
+        let cancel = registry.arm(1);
+        let active = coordinator.rollup_unit_guard().await.unwrap();
+        let mut admission = Box::pin(claim_rollup_pause(&coordinator, &publication, &cancel));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), admission.as_mut())
+                .await
+                .is_err(),
+            "repin must wait for the active unit before claiming its pause"
+        );
+        assert!(!coordinator.rollup_paused());
+        let root = tempfile::tempdir().unwrap();
+        if failed {
+            let _writer = publication.write().await;
+            let marker = root.path().join(".rollup-api");
+            std::fs::write(&marker, "unfinished").unwrap();
+            publication.mark_rollup(&marker);
+        }
+        drop(active);
+        let result = tokio::time::timeout(Duration::from_secs(1), admission)
+            .await
+            .expect("admission must observe the completed unit");
+        if failed {
+            assert!(matches!(result, Err(PassStop::Failed(_))));
+            assert!(!coordinator.rollup_paused());
+        } else {
+            let pause = result.unwrap();
+            assert!(coordinator.rollup_unit_guard().await.is_none());
+            drop(pause);
+            assert!(coordinator.rollup_unit_guard().await.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn repin_admission_waits_for_successful_rollup_before_pausing() {
+        assert_rollup_admission_waits_for_unit(false).await;
+    }
+
+    #[tokio::test]
+    async fn repin_admission_observes_rollup_failure_before_pausing() {
+        assert_rollup_admission_waits_for_unit(true).await;
+    }
+
+    #[tokio::test]
+    async fn repin_admission_can_cancel_while_waiting_for_publication() {
+        let coordinator = Arc::new(RepinCoordinator::new());
+        let publication = crate::publication::PublicationGate::new();
+        let registry = Arc::new(CancelRegistry::default());
+        let cancel = registry.arm(1);
+        let _writer = publication.write().await;
+        let mut admission = Box::pin(claim_rollup_pause(&coordinator, &publication, &cancel));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), admission.as_mut())
+                .await
+                .is_err()
+        );
+        registry.request(&CancelActor::new("operator", "test-key"));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), admission)
+                .await
+                .unwrap(),
+            Err(PassStop::Cancelled { stage: STAGE_SCAN })
+        ));
+        assert!(!coordinator.rollup_paused());
+        let _corpus = tokio::time::timeout(Duration::from_secs(1), coordinator.compaction_guard())
+            .await
+            .expect("cancellation releases the corpus guard while publication is still held");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn repin_admission_wait_has_a_deadline() {
+        let coordinator = Arc::new(RepinCoordinator::new());
+        let publication = crate::publication::PublicationGate::new();
+        let registry = Arc::new(CancelRegistry::default());
+        let cancel = registry.arm(1);
+        let _active = coordinator.rollup_unit_guard().await.unwrap();
+        let started = tokio::time::Instant::now();
+        assert!(matches!(
+            claim_rollup_pause(&coordinator, &publication, &cancel).await,
+            Err(PassStop::Failed(_))
+        ));
+        assert_eq!(started.elapsed(), CUTOVER_DRAIN_TIMEOUT);
+        assert!(!coordinator.rollup_paused());
+    }
+
     /// The target vocabulary is the catalog's, the injective spelling, so
     /// `SEVERITY` is a target an operator can name and stays distinct from
     /// the `BIGINT` it shares a physical type with: the two mean different
@@ -2422,7 +2580,7 @@ mod tests {
         let body = &SOURCE[start..end];
 
         let spawn = body
-            .find(".run_job(job_id")
+            .find(".run_job(")
             .expect("decide still spawns the background half");
         let fetch = body
             .find("self.job(job_id).await")

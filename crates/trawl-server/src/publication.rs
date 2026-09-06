@@ -139,6 +139,14 @@ fn is_missing(path: &Path) -> bool {
     matches!(std::fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
 }
 
+fn directory_exists(path: &Path) -> std::io::Result<bool> {
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.is_dir()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 fn scan_markers(root: &Path, markers: &mut HashSet<PathBuf>) -> std::io::Result<()> {
     let envs = match std::fs::read_dir(root) {
         Ok(entries) => entries,
@@ -154,7 +162,7 @@ fn scan_markers(root: &Path, markers: &mut HashSet<PathBuf>) -> std::io::Result<
         {
             continue;
         }
-        if !std::fs::metadata(env.path())?.is_dir() {
+        if !directory_exists(&env.path())? {
             continue;
         }
         for date in std::fs::read_dir(env.path())? {
@@ -164,7 +172,7 @@ fn scan_markers(root: &Path, markers: &mut HashSet<PathBuf>) -> std::io::Result<
             {
                 continue;
             }
-            if !std::fs::metadata(date.path())?.is_dir() {
+            if !directory_exists(&date.path())? {
                 continue;
             }
             for entry in std::fs::read_dir(date.path())? {
@@ -239,5 +247,45 @@ mod tests {
         gate.initialize(&root);
         gate.initialize(dir.path());
         assert!(gate.read().await.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dangling_entries_do_not_poison_the_marker_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("data");
+        let day = root.join("prod/2026-01-01");
+        std::fs::create_dir_all(&day).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("absent"), root.join("offline")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("absent"), root.join("prod/2026-01-02"))
+            .unwrap();
+        let marker = day.join(".rollup-svc");
+        std::fs::write(&marker, "").unwrap();
+        let gate = PublicationGate::new();
+        gate.initialize(&root);
+        assert!(
+            gate.read().await.is_err(),
+            "a real pending marker still refuses queries"
+        );
+        std::fs::remove_file(marker).unwrap();
+        assert!(
+            gate.read().await.is_ok(),
+            "confirmed missing paths do not latch a scan failure"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unresolvable_existing_env_keeps_marker_state_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = dir.path().join("prod");
+        std::os::unix::fs::symlink(&env, &env).unwrap();
+        let gate = PublicationGate::new();
+        gate.initialize(dir.path());
+        std::fs::remove_file(&env).unwrap();
+        assert!(
+            gate.read().await.is_err(),
+            "errors other than confirmed absence remain closed until restart"
+        );
     }
 }

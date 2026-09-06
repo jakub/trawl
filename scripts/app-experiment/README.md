@@ -317,6 +317,13 @@ the marker to make queries pass, because both daily and hourly copies may
 still exist. Query-only instances
 cannot perform that recovery. A failed startup marker scan also refuses
 reads and requires a restart after the filesystem problem is fixed.
+Confirmed missing paths, including dangling directory links, do not count
+as scan failures. An unreadable existing directory still does.
+
+Repin also refuses to scan or build while a rollup needs recovery. Let
+compaction finish recovery before retrying the repin experiment. The
+admission check and rollup pause are taken together, so an in-flight rollup
+cannot leave an incomplete publication between the check and the pause.
 
 The publication lock coordinates one daemon. It does not promise exactly-once
 ingestion across client retries or crash-time WAL replay, and it cannot
