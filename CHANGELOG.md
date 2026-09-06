@@ -18,9 +18,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   kubernetes. It ships inert because a minidump is raw process memory and
   can hold tokens, TLS keys and database credentials. Both channels are now
   documented in the new [Crash dumps](https://trawl.sh/reference/crash-dumps/)
-  reference page, including the yama `ptrace_scope` table and the fact that
-  a denied ptrace attach shows up only as a missing dump at crash time
-  (#21 tracks a startup warning).
+  reference page, including the yama `ptrace_scope` table and what a denied
+  ptrace attach actually looks like. It is not a missing dump. minidump-writer
+  treats a refused `PTRACE_ATTACH` as a soft error and drops the thread, so a
+  denial still produces a `.dmp` that parses, still logs
+  `trawl-crashdump: wrote minidump` in the journal, and only gives itself away
+  inside: zero threads, zero memory regions, roughly a tenth the size. The
+  presence of a dump is not proof that capture worked. `trawl-web.service` also
+  gains `InaccessiblePaths=/var/lib/trawl/cores`, because it runs as the same
+  `trawl` user and would otherwise be able to read every dump. (#21 tracks a
+  startup warning.)
 - **Scheduler-owned report windows (ADR-0018 rulings 6-14, #107).** A
   schedule now says what its runs cover, instead of leaving it to whatever
   time clause the saved query happened to carry. `PUT
