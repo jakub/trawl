@@ -106,16 +106,26 @@ container_security_context() {
   ' "$manifest"
 }
 
+# Counts the lines of one container's securityContext that match a pattern.
+# The block is captured ONCE and an empty capture is a failure, not a zero: a
+# renamed container, or a `name:` that stops being the entry's first line,
+# would otherwise make every `expected 0` assertion pass while reading nothing.
 assert_security_context_lines() {
   local expected=$1
   local pattern=$2
   local manifest=$3
   local container=$4
+  local block
+  block=$(container_security_context "$manifest" "$container")
+  if [[ -z $block ]]; then
+    echo "no securityContext block found for container '${container}' in ${manifest}" >&2
+    exit 1
+  fi
   local actual
-  actual=$(container_security_context "$manifest" "$container" | grep -Ec -- "$pattern" || true)
+  actual=$(grep -Ec -- "$pattern" <<<"$block" || true)
   if [[ $actual -ne $expected ]]; then
     echo "expected ${expected} line(s) matching '${pattern}' in the ${container} securityContext, found ${actual}:" >&2
-    container_security_context "$manifest" "$container" >&2
+    echo "$block" >&2
     exit 1
   fi
 }
