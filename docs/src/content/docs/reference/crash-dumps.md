@@ -78,6 +78,16 @@ The restart is the part that matters. `daemon-reload` alone rewrites the
 unit's future, and the running trawld keeps `CAP_SYS_PTRACE` until something
 replaces it.
 
+Disabling stops new dumps. It does not remove the ones already written, and
+each of those is still a verbatim copy of trawld's memory sitting in
+`/var/lib/trawl/cores`. Nothing prunes them either, since the retain count is
+applied by a trawld that is no longer capturing. When the dumps have served
+their purpose, delete or archive them:
+
+```bash
+sudo rm /var/lib/trawl/cores/*.dmp
+```
+
 The copy under `/etc` is yours. Package upgrades never refresh it, so if a
 later release changes the shipped example your installed drop-in stays as it
 was. After upgrading `trawl-server`, compare the two:
@@ -93,12 +103,11 @@ diff /usr/share/doc/trawl-server/examples/crashdump.conf \
 helm upgrade trawl chart/trawl --set crashDump.enabled=true
 ```
 
-That one value does the equivalent of the drop-in automatically: it sets
-`TRAWL_CRASH_DUMP_DIR` and `TRAWL_CRASH_DUMP_RETAIN` on the trawld container,
-mounts a dedicated `cores` PVC at `crashDump.mountPath`
-(`/var/lib/trawl/cores` by default), and adds `SYS_PTRACE` to that
-container's capabilities. The init-auth and trawl-web containers are
-untouched.
+That one value is the whole enable step, the way copying the drop-in is on
+Debian. It sets `TRAWL_CRASH_DUMP_DIR` and `TRAWL_CRASH_DUMP_RETAIN` on the
+trawld container, mounts a dedicated `cores` PVC at `crashDump.mountPath`
+(`/var/lib/trawl/cores` by default), and adds `SYS_PTRACE` to that container's
+capabilities. The init-auth and trawl-web containers are untouched.
 
 It requires `persistence.enabled=true`. With persistence off the chart
 refuses to render rather than writing dumps to pod-local storage that
@@ -107,6 +116,28 @@ PVC so dumps stay out of data backups. `crashDump.size`,
 `crashDump.storageClass`, `crashDump.mountPath` and `crashDump.retain` are
 the remaining knobs; see the
 [chart README](https://github.com/jakub/trawl/blob/main/chart/trawl/README.md).
+
+What it cannot do is match the Debian channel's capability coverage, and the
+difference decides whether capture works on a scope 2 node.
+
+`capabilities.add` in a pod spec fills the container's **bounding** set. For a
+container that does not run as root, that is all it fills: the effective and
+permitted sets stay empty, because kubernetes has no way to hand a process an
+**ambient** capability. The feature that would do it, KEP-2763, is not GA, and
+ambient capabilities otherwise come from a file capability on the binary, which
+the trawl image does not carry. So trawld and the monitor it re-execs run with
+`SYS_PTRACE` in the bounding set and nothing in `CapEff`.
+
+That is enough at scope 0 and scope 1, where the attach is permitted by
+`PR_SET_PTRACER` naming the monitor rather than by any capability. At scope 2
+the kernel wants the capability itself, the monitor does not have it, and you
+get the failure this page describes below: a `.dmp` appears, the log says
+`wrote minidump`, and the file holds zero threads. That is
+[issue #21](https://github.com/jakub/trawl/issues/21), and the fix is a file
+capability on the binary plus `allowPrivilegeEscalation`.
+
+Until then: on kubernetes, crash dumps work at yama scope 0 and 1 and do not
+work at scope 2. Check the node's `ptrace_scope` before relying on them.
 
 ## What a dump contains
 
@@ -118,6 +149,18 @@ credential, because that is what it is.
 Two things follow from that. The dump directory is `0700` and each dump is
 `0600`, and the Debian package ships the drop-in inert instead of enabling
 capture for everyone who installs trawld.
+
+Reading a dump on the Debian channel means being the `trawl` user or root.
+Nothing else on the box qualifies, including trawl's own web proxy: since the
+proxy runs as `trawl-web` rather than `trawl`, the mode alone refuses it, and
+`/proc/<trawld-pid>/root` refuses it too because the kernel's ptrace check
+compares uids. That mattered enough to give the proxy its own account. On
+kubernetes the separation is structural instead, since the `cores` PVC only
+mounts into the trawld container.
+
+The `0700` is enforced on the packaged path only, by `systemd-tmpfiles` at
+every configure and boot. Point `TRAWL_CRASH_DUMP_DIR` elsewhere and the mode
+is yours to get right, for the reason given under "Enabling on Debian".
 
 Never attach a dump to a public bug report or upload it anywhere you do not
 control. If you need help reading one, share the stack summary, not the file.
@@ -156,16 +199,25 @@ against the crashdump crate, separately from this page.
 `/proc/sys/kernel/yama/ptrace_scope` decides whether the monitor's attach is
 allowed at all.
 
-| value | policy | capture |
-|-------|--------|---------|
-| `0` | classic ptrace permissions | works |
-| `1` | attach limited to declared descendants | works: trawld calls `PR_SET_PTRACER` naming its own monitor |
-| `2` | admin-only attach | works: `CAP_SYS_PTRACE` from the drop-in is what "admin" means here |
-| `3` | no attach, ever | never works. The capability does not exempt anyone |
+The two channels do not answer the same at every value, so the table splits
+them.
+
+| value | policy | debian | kubernetes |
+|-------|--------|--------|------------|
+| `0` | classic ptrace permissions | works | works |
+| `1` | attach limited to declared descendants | works: trawld calls `PR_SET_PTRACER` naming its own monitor | works, same mechanism |
+| `2` | admin-only attach | works: `CAP_SYS_PTRACE` from the drop-in is what "admin" means here | does not work yet, see [#21](https://github.com/jakub/trawl/issues/21) |
+| `3` | no attach, ever | never works. The capability does not exempt anyone | never works |
 
 Scope 3 is a known limitation and there is no workaround: the setting is
 one-way until reboot, and no privilege lifts it. If your hosts run scope 3,
 crash dumps are not available there.
+
+Scope 2 on kubernetes is a different kind of gap, and a fixable one. The
+capability reaches the container's bounding set and never its effective set,
+for the reason given under the helm section, so the monitor's attach is refused
+exactly as it would be with no capability at all. The symptom is the empty dump
+described below rather than an error.
 
 ## Checking that it can work
 
