@@ -238,7 +238,6 @@ pub fn NetsPage() -> impl IntoView {
                                     let name_for_trigger = net.name.clone();
                                     let query_for_run = net.query.clone();
                                     let on_run_in_search = on_run_in_search.clone();
-                                    let on_trigger_run = on_trigger_run.clone();
 
                                     let sched_badge = match &net.schedule {
                                         Some(s) if s.enabled => {
@@ -263,8 +262,10 @@ pub fn NetsPage() -> impl IntoView {
                                                     let when = time_ago(&run.started_at, now);
                                                     let tone = crate::components::run_status_tone(&run.status);
                                                     let next_run_label = if sched.enabled {
+                                                        #[allow(clippy::cast_possible_truncation)]
                                                         let started_ms = js_sys::Date::parse(&run.started_at) as i64;
-                                                        let next_ms = started_ms + (sched.interval_secs as i64 * 1000);
+                                                        let next_ms =
+                                                            started_ms + (sched.interval_secs.cast_signed() * 1000);
                                                         Some(time_until(next_ms, now))
                                                     } else {
                                                         None
@@ -320,7 +321,7 @@ pub fn NetsPage() -> impl IntoView {
                                                     }),
                                                     ActionItem::new("⏱ Trigger run", {
                                                         let name = name_for_trigger.clone();
-                                                        let trigger = on_trigger_run.clone();
+                                                        let trigger = on_trigger_run;
                                                         Callback::new(move |()| trigger(id, name.clone()))
                                                     }),
                                                     ActionItem::danger("Delete", {
@@ -371,7 +372,6 @@ pub fn NetsPage() -> impl IntoView {
                         return ().into_any();
                     };
                     let msg = format!("Permanently delete '{del_name}' and all its run history?");
-                    let do_delete = do_delete.clone();
                     view! {
                         <ConfirmModal
                             title="Delete net"
@@ -381,13 +381,13 @@ pub fn NetsPage() -> impl IntoView {
                                 // take() closes the dialog and yields the
                                 // payload exactly once.
                                 if let Some((id, name)) =
-                                    confirm_delete.try_update(|c| c.take()).flatten()
+                                    confirm_delete.try_update(fleet_ui::ConfirmState::take).flatten()
                                 {
                                     do_delete(id, name);
                                 }
                             })
                             on_cancel=Callback::new(move |()| {
-                                confirm_delete.update(|c| c.cancel());
+                                confirm_delete.update(fleet_ui::ConfirmState::cancel);
                             })
                         />
                     }.into_any()

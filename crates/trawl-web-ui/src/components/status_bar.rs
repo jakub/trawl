@@ -6,8 +6,8 @@
 //! admin stats, and a corner theme toggle.
 //!
 //! The stats cluster (hot buffer / WAL backlog / active queries /
-//! uptime) renders only while the `stats` signal carries a
-//! [`DashboardSnapshot`] — AuthShell feeds it from the admin-only
+//! uptime) renders only while the `admin` signal carries a
+//! [`DashboardSnapshot`] — `AuthShell` feeds it from the admin-only
 //! `/api/v1/dashboard/stream` SSE stream, so non-admins never see the
 //! group. The theme toggle calls `UiPrefs::theme()` `.update()` and
 //! fleet-ui's install effect re-projects to `<html data-theme>`.
@@ -47,7 +47,7 @@ pub fn StatusBar(
     /// Live admin stats from `/api/v1/dashboard/stream`; `None` for
     /// non-admin sessions (the stats cluster is hidden entirely).
     #[prop(into)]
-    stats: Signal<Option<DashboardSnapshot>>,
+    admin: Signal<Option<DashboardSnapshot>>,
 ) -> impl IntoView {
     let prefs = use_context::<UiPrefs>();
 
@@ -105,7 +105,7 @@ pub fn StatusBar(
                     </div>
                 </>
             })}
-            {move || stats.get().map(|s| view! {
+            {move || admin.get().map(|s| view! {
                 <>
                     <span class="divider">"·"</span>
                     <div class="grp" title="Hot buffer (events / bytes)">

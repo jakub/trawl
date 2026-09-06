@@ -44,6 +44,12 @@ struct Contract {
 
 const CONTRACTS: &[Contract] = &[
     Contract {
+        assignment: "liveResultsTable: '.results-table',",
+        source_path: "src/pages/search.rs",
+        source: include_str!("../src/pages/search.rs"),
+        hook: "class=\"results-table\"",
+    },
+    Contract {
         assignment: "dslEditor: '.dsl-editor',",
         source_path: "src/components/editor.rs",
         source: EDITOR_RS,

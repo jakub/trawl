@@ -9,7 +9,7 @@
 //! from a `_time` / `time` / `timestamp` / `@timestamp` column; with none
 //! of them there is nothing to bucket, and the strip renders the "No time
 //! series for this query" hint instead. "is error" is `_severity >= 17`
-//! (the OTel error band and above, ADR-0013 §9); a page carrying no
+//! (the `OTel` error band and above, ADR-0013 §9); a page carrying no
 //! `_severity` column draws every bar as ok.
 //!
 //! Y/X axis labels are rendered alongside the bars (`0` / `max/2` /

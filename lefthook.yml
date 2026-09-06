@@ -12,6 +12,20 @@ pre-commit:
     clippy:
       glob: "*.rs"
       run: . "$HOME/.cargo/env" 2>/dev/null; cargo clippy --workspace --all-targets -- -D warnings
+    wasm-clippy:
+      # The host clippy job never sees the cfg(target_arch = "wasm32")
+      # component tree; this does. Glob-gated so a backend-only commit
+      # pays nothing. One sequential command: three parallel cargo
+      # processes would contend for one target dir. Two patterns per
+      # crate because lefthook's matcher reads `**/` as "at least one
+      # directory", so `crates/x/**/*` alone misses the crate root and
+      # a Cargo.toml-only commit (a wasm feature flip) would slip past.
+      glob:
+        - "crates/trawl-web-ui/*"
+        - "crates/trawl-web-ui/**/*"
+        - "crates/fleet-ui/*"
+        - "crates/fleet-ui/**/*"
+      run: . "$HOME/.cargo/env" 2>/dev/null; cargo clippy -p trawl-web-ui --target wasm32-unknown-unknown -- -D warnings && cargo clippy -p fleet-ui --target wasm32-unknown-unknown -- -D warnings && cargo clippy -p fleet-ui --target wasm32-unknown-unknown --features atmosphere -- -D warnings
 
 pre-push:
   # Parallel is safe because each suite gets its own postgres CLUSTER
@@ -19,8 +33,11 @@ pre-push:
   # enough: sqlx derives its per-test database name from the test path alone,
   # so identical tests running in both suites collide cluster-wide and race
   # dropdb against the other suite's live connections (SQLSTATE 55006).
-  # DATABASE_URLs are pinned inline so pushes don't depend on ambient shell
-  # env (direnv doesn't fire in non-interactive shells).
+  # Defaults name the two local development clusters. Agents can provide
+  # dedicated clusters through TRAWL_TEST_DATABASE_URL and
+  # TRAWL_TEST_ND_DATABASE_URL; ambient DATABASE_URL is still ignored.
+  # Inline defaults keep pushes independent of direnv, which does not run
+  # in these non-interactive hook shells.
   # The glob keeps doc-only pushes from paying for the full suites — tests
   # run only when the push touches code, manifests, or migrations.
   parallel: true
@@ -33,7 +50,7 @@ pre-push:
         - "crates/*/migrations/*.sql"
       # Half the cores each: two parallel suites at full test-thread counts
       # oversubscribe the machine 2x and flake every wall-clock-sensitive test.
-      run: . "$HOME/.cargo/env" 2>/dev/null; DATABASE_URL=postgres://fleet:fleet@localhost:5433/fleet_test cargo nextest run --workspace --test-threads="$(( $(nproc 2>/dev/null || sysctl -n hw.ncpu) / 2 ))"
+      run: . "$HOME/.cargo/env" 2>/dev/null; DATABASE_URL="${TRAWL_TEST_DATABASE_URL:-postgres://fleet:fleet@localhost:5433/fleet_test}" cargo nextest run --workspace --test-threads="$(( $(nproc 2>/dev/null || sysctl -n hw.ncpu) / 2 ))"
     test-no-defaults:
       glob:
         - "*.rs"
@@ -47,4 +64,4 @@ pre-push:
       # the store/engine tests), and double-booting full trawld instances
       # across two parallel suites starves the wall-clock-sensitive
       # integration tests into flaking.
-      run: . "$HOME/.cargo/env" 2>/dev/null; DATABASE_URL=postgres://fleet:fleet@localhost:5434/fleet_test_nd cargo nextest run -p fleet-auth -p trawl-web -p trawl-engine -p trawl-server -p trawl-cli --no-default-features --test-threads="$(( $(nproc 2>/dev/null || sysctl -n hw.ncpu) / 2 ))" -E 'not (binary(http_api) | binary(hot_query) | binary(timestamp_repair))'
+      run: . "$HOME/.cargo/env" 2>/dev/null; DATABASE_URL="${TRAWL_TEST_ND_DATABASE_URL:-postgres://fleet:fleet@localhost:5434/fleet_test_nd}" cargo nextest run -p fleet-auth -p trawl-web -p trawl-engine -p trawl-server -p trawl-cli --no-default-features --test-threads="$(( $(nproc 2>/dev/null || sysctl -n hw.ncpu) / 2 ))" -E 'not (binary(http_api) | binary(hot_query) | binary(timestamp_repair))'

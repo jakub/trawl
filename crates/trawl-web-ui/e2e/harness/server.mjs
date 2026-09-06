@@ -62,7 +62,7 @@ const MIME = {
 
 // ---- mutable test-scoped state -------------------------------------------
 
-/** @type {'default'|'unauth'|'query-500'} */
+/** @type {'default'|'unauth'|'query-500'|'stream-burst'} */
 let scenario = 'default';
 
 const sse = {
@@ -153,7 +153,8 @@ function serveStream(res) {
   sse.responses.add(res);
 
   let n = 0;
-  const timer = setInterval(() => {
+  const burst = scenario === 'stream-burst';
+  const timer = burst ? undefined : setInterval(() => {
     n += 1;
     res.write(`event: data\ndata: ${JSON.stringify({ _time: new Date().toISOString(), message: `tick ${n}` })}\n\n`);
   }, 150);
@@ -171,13 +172,21 @@ function serveStream(res) {
   // EventSource auto-reconnects on a server-closed stream, so if the
   // SPA failed to `close()` it on unmount we'll see `opens` keep
   // climbing every ~200ms (the `retry:` interval) after teardown.
-  setTimeout(() => {
+  if (!burst) setTimeout(() => {
     if (sse.responses.has(res)) {
       res.end();
     }
   }, 1000);
 
   res.on('close', end);
+  if (burst) {
+    for (let seq = 0; seq < 6000; seq++) {
+      const event = { seq, message: `burst-${seq}` };
+      if (seq < 1000) event.expired_only = true;
+      if (seq === 5999) event.late_column = 'arrived';
+      res.write(`event: data\ndata: ${JSON.stringify(event)}\n\n`);
+    }
+  }
 }
 
 // ---- request handling -------------------------------------------------------

@@ -77,11 +77,9 @@ pub fn RunsPage() -> impl IntoView {
                         .and_then(Result::ok)
                         .map_or(("—".to_string(), "—".to_string()), |s| {
                             let total = s.total_runs;
-                            let rate = if total > 0 {
-                                format!("{}%", s.success_count * 100 / total)
-                            } else {
-                                "—".to_string()
-                            };
+                            let rate = (s.success_count * 100)
+                                .checked_div(total)
+                                .map_or_else(|| "—".to_string(), |pct| format!("{pct}%"));
                             let avg = s.avg_duration_ms
                                 .map_or_else(|| "—".to_string(), format_duration);
                             (rate, avg)
@@ -143,8 +141,8 @@ pub fn RunsPage() -> impl IntoView {
                                     let when = time_ago(&gr.run.started_at, now);
                                     let dur = gr.run.duration_ms.map_or_else(|| "—".to_string(), format_duration);
                                     let row_ct = gr.run.row_count.map_or_else(|| "—".to_string(), |n| n.to_string());
-                                    let status = gr.run.status.clone();
-                                    let tone = crate::components::run_status_tone(&status);
+                                    let run_status = gr.run.status.clone();
+                                    let tone = crate::components::run_status_tone(&run_status);
                                     let goto = goto.clone();
 
                                     view! {
@@ -153,7 +151,7 @@ pub fn RunsPage() -> impl IntoView {
                                             <div style="flex:0 0 70px">
                                                 <StatusDot tone=tone/>
                                                 " "
-                                                <span style="font-size:11px">{status}</span>
+                                                <span style="font-size:11px">{run_status}</span>
                                             </div>
                                             <div style="flex:0 0 80px" class="mono">{when}</div>
                                             <div style="flex:0 0 60px" class="mono">{dur}</div>

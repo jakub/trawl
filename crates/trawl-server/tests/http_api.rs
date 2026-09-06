@@ -810,14 +810,18 @@ async fn producer_is_stamped_stored_and_queryable_per_door() {
     batch.push(event.map);
     let mut batches = IndexMap::new();
     batches.insert((event.env, event.service), batch);
-    assert_eq!(
+    let pipeline = Arc::clone(
         server
             .state
             .ingest
             .pipeline
             .as_ref()
-            .expect("ingest is enabled in the test config")
-            .write(batches),
+            .expect("ingest is enabled in the test config"),
+    );
+    assert_eq!(
+        tokio::task::spawn_blocking(move || pipeline.write(batches))
+            .await
+            .unwrap(),
         1
     );
 

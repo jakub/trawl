@@ -205,7 +205,7 @@ jobs:
       - run: cargo deny check
 
   wasm-check:
-    name: wasm32 check (web UI + fleet-ui)
+    name: wasm32 clippy (web UI + fleet-ui)
     runs-on: k8s-small
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -213,15 +213,16 @@ jobs:
         with:
           toolchain: 1.98.0
           targets: wasm32-unknown-unknown
+          components: clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: wasm-check
-      - run: cargo check -p trawl-web-ui --target wasm32-unknown-unknown
+      - run: cargo clippy -p trawl-web-ui --target wasm32-unknown-unknown
       # Both sides of the default-off `atmosphere` feature: the bare run is
       # the shape non-mounting consumers compile (and the one that must NOT
       # link the vendored snippet), the second covers the backdrop itself.
-      - run: cargo check -p fleet-ui --target wasm32-unknown-unknown
-      - run: cargo check -p fleet-ui --target wasm32-unknown-unknown --features atmosphere
+      - run: cargo clippy -p fleet-ui --target wasm32-unknown-unknown
+      - run: cargo clippy -p fleet-ui --target wasm32-unknown-unknown --features atmosphere
 
   vendor-drift:
     name: web UI vendor bundle drift

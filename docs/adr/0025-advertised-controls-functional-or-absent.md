@@ -1,0 +1,62 @@
+# Advertised controls are functional or absent: disposition of the web UI placeholders
+
+status: accepted (2026-09-05) — prep ruling record for #100 (item 7)
+
+The web UI shipped with 13 visible controls that promise a capability and
+deliver a "coming soon" title or toast: five Settings rail items that all
+route to one placeholder card, a ⌘K search box and a notification bell with
+no handler, two disabled user-menu rows, a ⌘⇧L hint nothing binds, a Help
+rail item, and three toolbar actions (history Export, history Clear,
+results-toolbar Save) that toast instead of acting. The 2026-09-04 browser
+audit (`visual-evidence/ui-audit-2026-09-04/README.md`) counted them as
+broken promises, not partial screens. fleet-ui chrome is shared with
+coastwatch, which consumes it at a pinned trawl revision.
+
+## Decision
+
+**A control that is visible in shipped chrome works. A capability with no
+server contract has no control. Nothing in the rail, topbar or a toolbar
+says "coming soon".**
+
+Per affordance:
+
+- **Settings rail: Health and Schema stay, Sources / Retention / Users & API
+  leave.** Health becomes a page over the routes the footer already reads
+  (`/health`, `/stats`, `/dashboard`), permission-gated section by section
+  the way the footer is. Schema deep-links to the existing inspector under
+  Search, so the active mode flips to Search on click; that is the honest
+  destination. The three that leave need a configuration API that does not
+  exist (a config file is not one) and return with that API, each through
+  its own prep.
+- **Topbar: the bell leaves; ⌘K becomes a real palette in fleet-ui.** The
+  palette's first command set is routes only: the consumer's mode tabs and
+  rail items, the data `Shell` already receives. Both `Meta+K` and
+  `Ctrl+K` open it; the hint renders the platform's glyph. Actions,
+  saved queries and search are not commands until a later prep says so.
+- **User menu: Profile and API tokens leave; ⌘⇧L binds.** The chord is a
+  window-level keydown in fleet-ui, beside the Escape arbitration that is
+  already there.
+- **Help links to the docs site.** An in-app help surface is not planned.
+- **Results-toolbar Save reuses the editor's save modal.** One save flow,
+  and the modal's input is the editor buffer (the audit's "Save after
+  editing" finding), never the last executed query.
+- **History Export is client-side.** It serialises the loaded rows under the
+  current filter as CSV or JSON through the existing download helper. It is
+  not a second server export lane.
+- **History Clear is a key clearing its own rows, under the existing query
+  permission.** `query_history` is keyed by `key_id` and read under the
+  same permission that runs a query; a key that may write its history may
+  delete it. History is the client's convenience list. The operator's
+  record of what ran is the opt-in query debug log (`server.query_log`),
+  which this route never touches. No new permission, no cross-key
+  deletion, a confirmation in the UI.
+
+## Consequences
+
+- Removing a topbar affordance changes coastwatch's chrome on its next
+  `TRAWL_REV` bump. The bump PR carries the change; nothing here waits for
+  it.
+- The five-item Settings rail table in `state/section.rs` shrinks to two,
+  and its `from_url` first-match rule stops hiding four dead entries.
+- Each disposition lands through a #100 child slice with browser evidence;
+  this ADR records the product decision so no child re-opens it.

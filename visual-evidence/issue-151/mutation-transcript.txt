@@ -1,0 +1,75 @@
+# Mutation check: a clippy finding inside a cfg(target_arch = "wasm32")
+# module fails the wasm invocation and is invisible to host clippy.
+# captured 2026-09-06T19:31:45Z on host fractal
+# The mutation is reverted at the end and is never committed.
+#
+# The planted statement is `vec![1_u8].first().copied()`, not the
+# `.len()` the plan named: `len` is Vec's own inherent method, so the
+# vec is never used as a slice and useless_vec stays quiet. `first()`
+# derefs to the slice, which is the shape the lint looks for.
+
+$ git rev-parse HEAD
+2b46a1ac9d91dbe3b44a9a7ea7b6e5c5d681b696
+
+$ rustc -V
+rustc 1.98.0 (88d9e12ae 2026-08-18)
+
+$ cargo clippy -V
+clippy 0.1.98 (88d9e12ae1 2026-08-18)
+
+==============================================================
+the planted mutation
+==============================================================
+$ git diff -- crates/trawl-web-ui/src/pages/search.rs
+diff --git a/crates/trawl-web-ui/src/pages/search.rs b/crates/trawl-web-ui/src/pages/search.rs
+index 88f3e2bb..bcb210cc 100644
+--- a/crates/trawl-web-ui/src/pages/search.rs
++++ b/crates/trawl-web-ui/src/pages/search.rs
+@@ -74,6 +74,7 @@ impl ResultsTab {
+ #[component]
+ #[allow(clippy::too_many_lines)] // the search page markup is one cohesive view tree
+ pub fn Search() -> impl IntoView {
++    let _wasm_only_lint = vec![1_u8].first().copied();
+     let shell_status = use_context::<ShellStatus>().expect("ShellStatus context");
+     let bus = expect_context::<ToastBus>();
+ 
+exit=0
+
+==============================================================
+wasm32 clippy: sees the gated module, fails
+==============================================================
+$ cargo clippy -p trawl-web-ui --target wasm32-unknown-unknown -- -D warnings
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-151-wasm32-clippy-lint-the-ui-crates-on/crates/trawl-core)
+    Checking trawl-api v0.4.0 (/home/jakub/code/trawl-issue-151-wasm32-clippy-lint-the-ui-crates-on/crates/trawl-api)
+    Checking fleet-ui v0.4.0 (/home/jakub/code/trawl-issue-151-wasm32-clippy-lint-the-ui-crates-on/crates/fleet-ui)
+    Checking trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-151-wasm32-clippy-lint-the-ui-crates-on/crates/trawl-web-ui)
+error: useless use of `vec!`
+  --> crates/trawl-web-ui/src/pages/search.rs:77:27
+   |
+77 |     let _wasm_only_lint = vec![1_u8].first().copied();
+   |                           ^^^^^^^^^^ help: you can use an array directly: `[1_u8]`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#useless_vec
+   = note: `-D clippy::useless-vec` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::useless_vec)]`
+
+error: could not compile `trawl-web-ui` (bin "trawl-web-ui") due to 1 previous error
+wasm_status=101
+
+==============================================================
+host clippy: the module is cfg'd out, passes
+==============================================================
+$ cargo clippy -p trawl-web-ui -- -D warnings
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-151-wasm32-clippy-lint-the-ui-crates-on/crates/trawl-core)
+    Checking trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-151-wasm32-clippy-lint-the-ui-crates-on/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.49s
+host_status=0
+
+==============================================================
+revert
+==============================================================
+$ git checkout -- crates/trawl-web-ui/src/pages/search.rs
+exit=0
+$ git status --porcelain
+ M lefthook.yml
+?? visual-evidence/issue-151/

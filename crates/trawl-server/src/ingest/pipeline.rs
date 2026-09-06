@@ -60,6 +60,9 @@ pub struct PipelineWriter {
     wal_writer: Arc<WalWriter>,
     hot_buffer: Option<Arc<HotBuffer>>,
     event_bus: Option<Arc<LocalEventBus>>,
+    #[cfg(any(test, feature = "test-support"))]
+    pause_before_insert:
+        parking_lot::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 }
 
 impl PipelineWriter {
@@ -72,6 +75,8 @@ impl PipelineWriter {
             wal_writer,
             hot_buffer,
             event_bus,
+            #[cfg(any(test, feature = "test-support"))]
+            pause_before_insert: parking_lot::Mutex::new(None),
         }
     }
 
@@ -87,11 +92,17 @@ impl PipelineWriter {
     /// The env comes from the key, never from a writer-held default: a
     /// batcher that grouped by service alone would file every env it
     /// received under one path root, silently.
+    /// Call from a blocking thread because WAL I/O and the publication
+    /// read guard can wait.
     pub fn write(&self, batches: IndexMap<BatchKey, ServiceBatch>) -> usize {
         let mut total_written = 0;
 
         for ((env, svc), batch) in batches {
             let event_count = batch.maps.len();
+            // Compaction may read the WAL as soon as its rename completes.
+            // Keep its publication and drain behind this hot insertion.
+            let publication = self.hot_buffer.as_ref().map(|buf| buf.publication());
+            let _ingest = publication.as_ref().map(|gate| gate.blocking_ingest());
 
             match self.wal_writer.write(&env, &svc, &batch.ndjson) {
                 Ok(wal_path) => {
@@ -118,7 +129,18 @@ impl PipelineWriter {
     ///
     /// Called after WAL writing succeeds to make events immediately
     /// visible to queries (via hot buffer) and SSE streams (via event bus).
+    /// The caller holds the publication read guard from before the WAL
+    /// write through this call. Reacquiring here can deadlock behind a
+    /// queued compactor waiting for the caller's existing read guard.
     pub(crate) fn publish(&self, env: &str, svc: &str, batch: ServiceBatch, wal_path: &Path) {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            let pause = self.pause_before_insert.lock().take();
+            if let Some((entered, release)) = pause {
+                let _ = entered.send(());
+                let _ = release.recv();
+            }
+        }
         // `{env}/{stem}`: two envs must never collide on a hot-buffer
         // drain key (compaction derives the same shape from the env dir).
         let batch_id: Arc<str> = format!(
@@ -148,5 +170,17 @@ impl PipelineWriter {
                 "published batch to event bus"
             );
         }
+    }
+
+    /// Pause one durable batch before hot insertion on its blocking thread.
+    /// Dropping the release sender also releases the pause.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn pause_next_insert_for_test(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *self.pause_before_insert.lock() = Some((entered_tx, release_rx));
+        (entered_rx, release_tx)
     }
 }

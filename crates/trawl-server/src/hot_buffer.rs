@@ -10,12 +10,11 @@
 //! with the parquet source.
 //!
 //! Events stay in the hot buffer until compaction writes parquet and
-//! calls [`drain`](HotBuffer::drain). During the brief window between
-//! parquet write and drain, events may appear in both sources; that
-//! transient overcount is acceptable, while invisible events (missing
-//! from both sources) are not.
+//! calls [`drain`](HotBuffer::drain). The shared publication guard keeps
+//! query and export readers outside the interval between the canonical
+//! file rename and hot drain, so they cannot count both copies.
 
-use std::io::Write as _;
+use std::io::{BufWriter, Write as _};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -86,6 +85,7 @@ struct CachedSnapshot {
 /// FIFO eviction) keyed by batch id (`{env}/{WAL filename stem}`, the
 /// shape compaction derives to drain what it just wrote).
 pub struct HotBuffer {
+    publication: Arc<crate::publication::PublicationGate>,
     batches: RwLock<IndexMap<Arc<str>, Arc<IngestBatch>>>,
     total_events: AtomicUsize,
     total_bytes: AtomicUsize,
@@ -119,6 +119,7 @@ impl HotBuffer {
     /// snapshot carries empty `field_types`).
     pub fn new(config: HotBufferConfig) -> Self {
         Self {
+            publication: Arc::new(crate::publication::PublicationGate::new()),
             batches: RwLock::new(IndexMap::new()),
             total_events: AtomicUsize::new(0),
             total_bytes: AtomicUsize::new(0),
@@ -127,6 +128,12 @@ impl HotBuffer {
             snapshot_cache: Mutex::new(None),
             field_catalog: Arc::new(crate::catalog::FieldCatalog::new()),
         }
+    }
+
+    /// Shared publication interlock for this buffer and its cold corpus.
+    #[must_use]
+    pub fn publication(&self) -> Arc<crate::publication::PublicationGate> {
+        Arc::clone(&self.publication)
     }
 
     /// Attach the shared in-process pin cache; snapshots then carry the
@@ -282,6 +289,9 @@ impl HotBuffer {
         let (pioneer, keys) = survey_schema(events.iter().map(|(_, e)| *e));
 
         let mut tmpfile = tempfile::Builder::new().suffix(".ndjson").tempfile().ok()?;
+        // serde_json emits many small writes per event. Buffer them before
+        // crossing into the filesystem, then flush before publishing the file.
+        let mut writer = BufWriter::new(&mut tmpfile);
         let mut wrote_any = false;
 
         let order = (0..events.len())
@@ -295,9 +305,9 @@ impl HotBuffer {
             // Serialization failure is very unlikely (the event parsed during
             // ingest), but log and skip rather than poisoning the whole
             // snapshot.
-            match serde_json::to_writer(&mut tmpfile, event) {
+            match serde_json::to_writer(&mut writer, event) {
                 Ok(()) => {
-                    if let Err(e) = tmpfile.write_all(b"\n") {
+                    if let Err(e) = writer.write_all(b"\n") {
                         tracing::error!(event_type = "hot_buffer_error", error = %e, "hot buffer snapshot write failed");
                         return None;
                     }
@@ -319,11 +329,12 @@ impl HotBuffer {
         }
 
         // Flush to ensure DuckDB can read the file.
-        if let Err(e) = tmpfile.flush() {
+        if let Err(e) = writer.flush() {
             tracing::error!(event_type = "hot_buffer_error", error = %e, "hot buffer snapshot flush failed");
             return None;
         }
 
+        drop(writer);
         Some((tmpfile, keys))
     }
 

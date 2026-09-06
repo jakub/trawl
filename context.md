@@ -130,6 +130,18 @@ _Avoid_: column (that is its storage form), key, attribute
 A field's physical form in a parquet file or a DuckDB result. You pin a field; you read a column.
 _Avoid_: field (when talking about storage or SQL output)
 
+**Bind**:
+DuckDB's prepare/plan phase, before any row is read. Distinct from execution: an interrupt is honored during execution but not during bind, so a query stuck in bind holds its permit uninterruptibly.
+_Avoid_: prepare, compile, plan (as a verb)
+
+**Lateral expansion**:
+How much a query forces the binder to materialize beyond what its text says, measured statically from the AST as substituted node count minus source node count. A `let` target referencing an earlier target in the same stage is substituted per reference, so a doubling chain expands exponentially. A flat list or independent assignments expand not at all. The admission budget caps it.
+_Avoid_: query complexity, bind cost, node count
+
+**Retained permit**:
+An executor-pool permit still held by a blocking task after the client's query already timed out. The work is finite by construction (the DSL cannot describe an unbounded bind) but a wedged bind is unkillable, so a retained permit is counted and kept cancellable rather than released.
+_Avoid_: leaked permit, stuck query (the permit is the thing named)
+
 ### Outcome verbs
 
 Ordered by blast radius. These are the words for "what happened to the data", so precision here is an incident-response concern.

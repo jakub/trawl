@@ -48,7 +48,7 @@ pub struct Filter {
 
 /// Range window driven by the date-range popover. Merged into the wire
 /// query at request time unless the user's base query already carries a
-/// `last=` clause (user intent wins).
+/// `last=`, `earliest=`, or `latest=` clause (user intent wins).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RangeSpec {
     /// Relative window: `5m|15m|1h|4h|24h|7d`. Emitted as `last=<label>`.
@@ -85,7 +85,7 @@ pub const QUICK_RANGES: &[&str] = &["5m", "15m", "1h", "4h", "24h", "7d"];
 ///   attach to; avoids fabricating a wildcard `*` that could flood the
 ///   server).
 /// - filter clauses and the range clause prepend to the first search stage.
-/// - if the base query already carries `last=X`, the range's `last=` is
+/// - if the base query already carries a time clause, the range's `last=` is
 ///   suppressed (user intent wins). Absolute ranges always inject
 ///   `_time>="..." _time<="..."` regardless.
 /// - pipeline-only base (`| stats ...`) gets a synthetic `*` search stage
@@ -101,7 +101,7 @@ pub fn effective_query(base_q: &str, filters: &[Filter], range: &RangeSpec) -> S
     let search = search_raw.trim();
 
     let needs_star = search.is_empty() || search.starts_with('|');
-    let has_last = search_has_last_clause(search);
+    let has_time = search_has_time_clause(search);
 
     let mut prefix = String::new();
     for f in filters {
@@ -115,9 +115,9 @@ pub fn effective_query(base_q: &str, filters: &[Filter], range: &RangeSpec) -> S
     }
 
     let range_clause = match range {
-        RangeSpec::Quick(q) if !has_last => Some(format!("last={q}")),
+        RangeSpec::Quick(q) if !has_time => Some(format!("last={q}")),
         RangeSpec::Absolute { from, to } => Some(format_absolute_range(from, to)),
-        RangeSpec::Quick(_) => None, // suppressed by existing `last=`
+        RangeSpec::Quick(_) => None, // suppressed by an existing time clause
     };
     if let Some(clause) = range_clause {
         if !prefix.is_empty() {
@@ -161,18 +161,20 @@ fn split_search_stage(input: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// Heuristic: does the search stage already carry a `last=<units>` clause?
+/// Heuristic: does the search stage already carry a DSL time clause?
 /// Word-boundary check to avoid matching `loglast=` or similar. Case-insensitive.
 ///
 /// A backticked `` `last` `` is a field, not the grammar keyword, so the
 /// walk skips quoted spans entirely — otherwise the UI would read the
 /// field as an existing time clause and silently drop the range.
-fn search_has_last_clause(search: &str) -> bool {
+fn search_has_time_clause(search: &str) -> bool {
     let lower = search.to_ascii_lowercase();
     let bytes = lower.as_bytes();
-    let needle = b"last=";
     scan_outside_quotes(&lower, |i, _| {
-        bytes[i..].starts_with(needle) && (i == 0 || !is_ident_byte(bytes[i - 1]))
+        ["last=", "earliest=", "latest="]
+            .iter()
+            .any(|needle| bytes[i..].starts_with(needle.as_bytes()))
+            && (i == 0 || !is_ident_byte(bytes[i - 1]))
     })
     .is_some()
 }
@@ -283,6 +285,40 @@ mod tests {
     fn existing_last_suppresses_range() {
         let q = effective_query("last=2h _severity=error", &[], &quick("15m"));
         assert_eq!(q, "last=2h _severity=error");
+    }
+
+    #[test]
+    fn absolute_dsl_bounds_suppress_quick_range() {
+        for base in [
+            r#"earliest="2026-01-01T00:00:00Z" service=web"#,
+            r#"latest="2026-01-02T00:00:00Z" service=web"#,
+            r#"service=web earliest="2026-01-01T00:00:00Z" latest="2026-01-02T00:00:00Z" | stats count()"#,
+        ] {
+            let merged = effective_query(base, &[], &quick("15m"));
+            assert_eq!(merged, base);
+            let ast = trawl_core::parser::parse(&merged).expect("merged query parses");
+            trawl_core::emitter::emit(
+                &ast,
+                "experiment.parquet",
+                trawl_core::context::EvalContext::capture(),
+            )
+            .expect("time bounds remain valid");
+        }
+    }
+
+    #[test]
+    fn absolute_time_lookalikes_do_not_suppress_quick_range() {
+        for base in [
+            "`earliest`=x",
+            "loglatest=x",
+            r#"message="earliest=x""#,
+            "service=web # latest=x",
+        ] {
+            assert_eq!(
+                effective_query(base, &[], &quick("15m")),
+                format!("last=15m {base}")
+            );
+        }
     }
 
     #[test]
