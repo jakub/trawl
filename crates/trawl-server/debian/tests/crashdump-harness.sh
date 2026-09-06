@@ -49,6 +49,13 @@
 #     debian/trawl.sysusers.conf spelling the generated call named a file nobody
 #     installed, exited 1, and left the package half-configured. packaging.sh
 #     guards that statically now; this harness is what catches it end to end.
+#
+# WHAT THIS RUNS AS, an accepted risk rather than an oversight. The node
+# container is --privileged, which is root on the host kernel in every way that
+# matters, and inside it this harness runs the package's own maintainer scripts.
+# With --allow-host-sysctl it also raises the host's yama ptrace_scope. Point it
+# only at a tree and a .deb you trust. Running it to review an untrusted branch
+# is equivalent to running that branch's postinst as root on your machine.
 
 set -Eeuo pipefail
 
@@ -172,11 +179,34 @@ finish_transcript() {
   fi
 }
 
+# ------------------------------------------------------------------- the lock --
+
+# Container names, the network and the cargo volume are fixed strings, so two
+# concurrent runs would share them and the second one's teardown would tear down
+# the first one's containers mid-crash. Take the lock BEFORE installing the
+# cleanup trap, so a refused run exits without running any teardown at all.
+readonly LOCKFILE="${XDG_RUNTIME_DIR:-/tmp}/trawl-crashdump-harness.lock"
+command -v flock >/dev/null 2>&1 \
+  || { echo "flock is not installed; refusing to run without the concurrency lock" >&2; exit 2; }
+exec 9>"$LOCKFILE"
+if ! flock -n 9; then
+  echo "another crashdump-harness.sh run holds $LOCKFILE; refusing to start" >&2
+  echo "(the docker names this uses are fixed, so a second run would tear down the first)" >&2
+  exit 2
+fi
+
+# --------------------------------------------------------------- output helpers --
+
+# Transcripts get committed as PR evidence, so the worktree's absolute path
+# stays out of them. $REPO is substituted into everything this prints; the
+# commands themselves still run against the real path.
+rel() { printf '%s' "${1//$repo_root/\$REPO}"; }
+
 phase() { printf '\n\n## phase %s\n\n' "$*"; }
-note()  { printf '  %s\n' "$*"; }
-run()   { printf '\n$ %s\n' "$*"; "$@"; }
+note()  { printf '  %s\n' "${*//$repo_root/\$REPO}"; }
+run()   { printf '\n$ %s\n' "${*//$repo_root/\$REPO}"; "$@"; }
 # Same, but the command's stdout is noise (image ids, container ids).
-runq()  { printf '\n$ %s\n' "$*"; "$@" >/dev/null; }
+runq()  { printf '\n$ %s\n' "${*//$repo_root/\$REPO}"; "$@" >/dev/null; }
 # Run a script inside the node container, echoing it line by line first: these
 # are multi-line, and %q would render them as one backslash-mangled blob.
 nsh() {
@@ -191,6 +221,9 @@ die()   { printf '\nFAIL: %s\n' "$*" >&2; exit 1; }
 # ------------------------------------------------------------------ cleanup --
 
 ORIG_SCOPE=""
+# The stub SPA index.html, when this run is the one that created it. Removed on
+# the way out so a harness run leaves no file behind in the tree it tested.
+STUB_CREATED=""
 # Set to 1 BEFORE the write, never after: a write that lands and then fails to
 # report, or a signal delivered mid-write, must still reach the restore path.
 SCOPE_MODIFIED=0
@@ -251,6 +284,13 @@ cleanup() {
 
   local restore_failed=0
   restore_host_scope || restore_failed=1
+
+  # Exactly the file this run wrote, never a dist/ that was already there.
+  if [[ -n "$STUB_CREATED" && -f "$STUB_CREATED" ]]; then
+    note "removing the stub SPA this run created: $(rel "$STUB_CREATED")"
+    rm -f "$STUB_CREATED"
+    rmdir "$(dirname "$STUB_CREATED")" 2>/dev/null || true
+  fi
 
   if [[ "$KEEP" == 1 ]]; then
     note "--keep: leaving $NODE, $PG and network $NET in place"
@@ -414,6 +454,8 @@ run date -u
 run uname -r
 run docker --version
 
+note "file paths below are shown as \$REPO/..., where \$REPO is the worktree this ran from"
+
 printf '\npinned images:\n'
 note "rust     $RUST_IMAGE"
 note "debian   $DEBIAN_IMAGE"
@@ -463,8 +505,10 @@ EOF
   else
     mkdir -p "$dist"
     printf '%s\n' '<!doctype html><title>trawl</title><p>crashdump-harness stub SPA</p>' > "$dist/index.html"
+    STUB_CREATED="$dist/index.html"
     note "STUBBED the SPA: wrote a one-line placeholder to $dist/index.html"
     note "the embedded web UI in this .deb is a stub, not a real build"
+    note "this run created it, so teardown removes it again"
   fi
 
   mkdir -p "$target_dir"
@@ -488,7 +532,8 @@ EOF
   [[ -n "$DEB" ]] || die "cargo deb produced no package under $target_dir/debian"
 fi
 
-run sha256sum "$DEB"
+printf '\n$ sha256sum %s\n' "$(rel "$DEB")"
+sha256sum "$DEB" | sed "s|$repo_root|\$REPO|"
 run dpkg-deb -f "$DEB" Package Version Architecture Depends
 
 # ----------------------------------------------------------- phase 3: bring up --
@@ -624,7 +669,7 @@ docs_block=$(awk '
   inblock { print }
 ' "$DOCS_PAGE")
 if [[ "$docs_block" != "$ENABLE_CMD" ]]; then
-  printf '\n--- docs %s ---\n%s\n--- harness ---\n%s\n' "$DOCS_PAGE" "$docs_block" "$ENABLE_CMD"
+  printf '\n--- docs %s ---\n%s\n--- harness ---\n%s\n' "$(rel "$DOCS_PAGE")" "$docs_block" "$ENABLE_CMD"
   die "the enable command in the docs no longer matches the one this harness runs"
 fi
 note "enable command matches $DOCS_PAGE"
