@@ -942,7 +942,12 @@ scope_case() { # scope_case <scope>
   printf '\ncapabilities (bit %s = CAP_SYS_PTRACE):\n' "$PTRACE_CAP_BIT"
   caps_report "$pid" "daemon"
   caps_report "$mon" "monitor"
-  [[ "$(cap_bit "$pid" CapEff)" == 1 ]] || die "scope $scope: the daemon has no CAP_SYS_PTRACE despite the drop-in"
+  # The drop-in's AmbientCapabilities= hands CAP_SYS_PTRACE to both processes at
+  # exec, and the daemon then drops it: once the monitor is up and classified,
+  # trawld clears the bit from its own effective and permitted sets and sets
+  # no_new_privs (ADR-0023 ruling 4). Only the monitor needs it, so a daemon
+  # still holding it here means the seal did not run.
+  [[ "$(cap_bit "$pid" CapEff)" == 0 ]] || die "scope $scope: the daemon still holds CAP_SYS_PTRACE after startup"
   [[ "$(cap_bit "$mon" CapEff)" == 1 ]] || die "scope $scope: the monitor did not inherit CAP_SYS_PTRACE"
 
   before=$(dump_count)
