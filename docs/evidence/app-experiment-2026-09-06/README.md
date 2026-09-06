@@ -60,3 +60,29 @@ checks correctness at the requested rate; it does not establish maximum
 throughput or steady-state query latency. The ordinary app scenario disables
 daily rollup. Deterministic Rust tests separately cover publication waits,
 recovery failures, cancellation, and repin admission.
+
+## Final review fixes
+
+Tested implementation: `df96ba9ae382203ad90e1b803af6692ec21e7713`.
+Recovery now runs on the blocking pool and keeps both publication and corpus
+locks until it finishes, including after cancellation. Autocomplete bounds its
+publication wait. Experiment polling retries only missing-directory errors,
+and private-directory removal failures still produce a final report.
+
+Six targeted Rust tests passed, including runtime responsiveness during
+recovery, cancellation with both locks retained, recovery before WAL
+publication, repin stand-down, and autocomplete timeout/permit release.
+Normal workspace Clippy and formatting passed. Claude Opus high independently
+reviewed all nine changed files and relevant callers with no findings.
+
+[The seed-50 report](run-seed-50.json) records a fresh 20,000-event run on that
+implementation. Ingestion, exact IDs and values after compaction and restart,
+19,000 live-tail events, browser checks, and all cleanup flags passed.
+
+All five real lifecycle cases passed. The suite proves collision isolation,
+SIGTERM cleanup, ENOENT retry, ENOTDIR failure propagation, and a retained final
+report when private-directory removal fails. All four generator/oracle tests
+passed. Two lifecycle cases first failed while an unrelated build drove host
+load above 150, including a Docker cleanup deadline. Container inventory was
+reconciled, and both cases passed unchanged on a targeted rerun after load
+subsided. The original failure reports remain in the local evidence archive.
