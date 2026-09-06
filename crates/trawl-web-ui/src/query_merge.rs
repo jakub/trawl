@@ -193,9 +193,18 @@ fn format_filter(f: &Filter) -> Option<String> {
     // bare production can't spell (`x-forwarded-for`) or a keyword
     // (`last`) needs backticks or the clause is not a filter at all
     // (ADR-0013 ruling 7).
-    let quoted = format!("\"{}\"", f.value.replace('\\', "\\\\").replace('"', "\\\""));
+    let quoted = dsl_string_literal(&f.value);
     let field = quote_dsl_field(&f.field)?;
     Some(format!("{field}{op}{quoted}"))
+}
+
+/// One arbitrary string as a DSL double-quoted literal: the ONE escaper
+/// for every value this crate interpolates into a query. A filter value
+/// is a catalog value and a range bound is a URL parameter — both are
+/// client text, and a `"` in either would otherwise close the literal
+/// early and the rest would parse as grammar.
+fn dsl_string_literal(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 fn format_absolute_range(from: &str, to: &str) -> String {
@@ -205,13 +214,13 @@ fn format_absolute_range(from: &str, to: &str) -> String {
     // would name an ordinary sender field most events never carry.
     let mut out = String::new();
     if !from.is_empty() {
-        write!(&mut out, "_time>=\"{from}\"").ok();
+        write!(&mut out, "_time>={}", dsl_string_literal(from)).ok();
     }
     if !to.is_empty() && to != "now" {
         if !out.is_empty() {
             out.push(' ');
         }
-        write!(&mut out, "_time<=\"{to}\"").ok();
+        write!(&mut out, "_time<={}", dsl_string_literal(to)).ok();
     }
     out
 }
@@ -383,6 +392,42 @@ mod tests {
             },
         );
         assert_eq!(q, "_time>=\"2026-04-18T00:00:00Z\" last=1h");
+    }
+
+    /// A range bound is URL text, so it reaches the DSL through the same
+    /// escaper a filter value does. A bound carrying `"` and `\\` must
+    /// still parse as one literal rather than closing the `_time` clause
+    /// and letting the rest read as grammar.
+    #[test]
+    fn absolute_bounds_pass_through_the_dsl_escaper() {
+        let hostile = r#"2026-01-01T00:00:00Z" or host="evil\"#;
+        let q = effective_query(
+            "*",
+            &[],
+            &RangeSpec::Absolute {
+                from: hostile.into(),
+                to: "now".into(),
+            },
+        );
+        assert_eq!(q, r#"_time>="2026-01-01T00:00:00Z\" or host=\"evil\\" *"#);
+        let ast = trawl_core::parser::parse(&q).expect("the escaped bound parses");
+        // Exactly one field filter, on `_time`, carrying the bound back
+        // verbatim — no second clause was smuggled in.
+        let filters: Vec<&trawl_core::ast::FieldFilter> = ast
+            .search
+            .all_tokens()
+            .filter_map(|t| match &t.node {
+                trawl_core::ast::SearchToken::FieldFilter(f) => Some(f),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(filters.len(), 1, "{filters:?}");
+        assert_eq!(filters[0].field, "_time");
+        assert_eq!(filters[0].op, trawl_core::ast::FilterOp::Gte);
+        assert_eq!(
+            filters[0].value,
+            trawl_core::ast::FilterValue::Literal(hostile.to_string())
+        );
     }
 
     #[test]

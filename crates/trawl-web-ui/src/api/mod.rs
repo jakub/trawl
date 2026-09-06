@@ -21,8 +21,10 @@ use trawl_api::{
 
 use crate::repin_flow::{BoundCeilings, ConflictBody, classify_conflict};
 
-/// Rows per page for the snapshot results table.
-pub const PAGE_SIZE: usize = 50;
+/// Rows per page for the snapshot results table. Defined by the search
+/// URL contract (the `page` parameter's offset check is part of it) and
+/// re-exported here so request building keeps one path to it.
+pub use crate::search_url::PAGE_SIZE;
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum ApiError {

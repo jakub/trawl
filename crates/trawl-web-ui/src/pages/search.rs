@@ -85,6 +85,7 @@ pub fn Search() -> impl IntoView {
         mode,
         filters,
         range,
+        ..
     } = url_signals();
 
     Effect::new(move |_| {

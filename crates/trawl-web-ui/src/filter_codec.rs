@@ -35,23 +35,32 @@ pub fn encode_payload<'a>(parts: impl Iterator<Item = (char, &'a str, &'a str)>)
     format!("{VERSION}{}", Base64UrlUnpadded::encode_string(&json))
 }
 
-/// Decode a payload written by this codec. `None` means it is an older URL;
-/// callers retain the legacy reader for those links. A malformed versioned
-/// payload is recognized but yields no filters, never a legacy reinterpretation.
-pub fn decode_payload(raw: &str) -> Option<Vec<(char, String, String)>> {
-    let encoded = raw.strip_prefix(VERSION)?;
-    let decoded = Base64UrlUnpadded::decode_vec(encoded).ok();
-    let filters: Vec<WireFilter> = decoded
-        .as_deref()
-        .and_then(|bytes| serde_json::from_slice(bytes).ok())
-        .unwrap_or_default();
-    Some(
-        filters
-            .into_iter()
-            .filter(|f| matches!(f.op, '+' | '-') && !f.field.is_empty())
-            .map(|f| (f.op, f.field, f.value))
-            .collect(),
-    )
+/// Why a payload could not be decoded. The two cases stay apart because
+/// they are different claims about the link: one was never written by
+/// this codec, the other says it was and is not (ADR-0027). Neither is
+/// "zero filters" — a payload that decodes to nothing would run a wider
+/// query than the link says it does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PayloadError {
+    /// No `v1.` prefix: not a payload this codec ever wrote.
+    NotVersioned,
+    /// Versioned, but the base64 or the JSON inside it did not decode.
+    Undecodable,
+}
+
+/// Decode a payload written by this codec.
+pub fn decode_payload(raw: &str) -> Result<Vec<(char, String, String)>, PayloadError> {
+    let encoded = raw
+        .strip_prefix(VERSION)
+        .ok_or(PayloadError::NotVersioned)?;
+    let decoded = Base64UrlUnpadded::decode_vec(encoded).map_err(|_| PayloadError::Undecodable)?;
+    let filters: Vec<WireFilter> =
+        serde_json::from_slice(&decoded).map_err(|_| PayloadError::Undecodable)?;
+    Ok(filters
+        .into_iter()
+        .filter(|f| matches!(f.op, '+' | '-') && !f.field.is_empty())
+        .map(|f| (f.op, f.field, f.value))
+        .collect())
 }
 
 #[cfg(test)]
@@ -79,14 +88,37 @@ mod tests {
             );
             assert_eq!(
                 decode_payload(&payload),
-                Some(vec![('+', field.to_string(), "a,b=c&d\\e".to_string())])
+                Ok(vec![('+', field.to_string(), "a,b=c&d\\e".to_string())])
             );
         }
     }
 
+    /// The three answers stay apart: an unversioned payload, a
+    /// versioned one that does not decode, and a payload that decodes to
+    /// no filters at all. Only the third is an empty filter set, and the
+    /// URL reader refuses to run the first two rather than treating them
+    /// as one (ADR-0027).
     #[test]
     fn legacy_and_malformed_payloads_are_distinguished() {
-        assert_eq!(decode_payload("+host=web-01"), None);
-        assert_eq!(decode_payload("v1.not_base64!"), Some(Vec::new()));
+        assert_eq!(
+            decode_payload("+host=web-01"),
+            Err(PayloadError::NotVersioned)
+        );
+        assert_eq!(decode_payload("nonsense"), Err(PayloadError::NotVersioned));
+        assert_eq!(
+            decode_payload("v1.not_base64!"),
+            Err(PayloadError::Undecodable)
+        );
+        // Valid base64url whose bytes are not the JSON schema.
+        assert_eq!(
+            decode_payload("v1.bm90anNvbg"),
+            Err(PayloadError::Undecodable)
+        );
+        assert_eq!(decode_payload("v1."), Err(PayloadError::Undecodable));
+        // …and an honestly empty list.
+        assert_eq!(
+            decode_payload(&encode_payload(std::iter::empty())),
+            Ok(Vec::new())
+        );
     }
 }
