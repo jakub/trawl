@@ -747,6 +747,21 @@ sleep 3
 [[ "$(nshq "systemctl is-active trawl-web")" == "active" ]] \
   || die "trawl-web exited after starting; check whether the mask hid /var/lib/trawl/web.cookie"
 
+# The uid is the load-bearing part, not the mask. Read it off the running
+# process rather than off the unit file, and check the key's mode beside it:
+# the proxy reads that key through the trawl GROUP, which is the whole reason a
+# separate uid is possible at all. A still-active unit is the proof the read
+# worked, since trawl-web exits nonzero when it cannot load the key.
+nsh "ps -o pid,user,group,args -p \$(systemctl show trawld -p MainPID --value) -p \$(systemctl show trawl-web -p MainPID --value)
+id trawl-web
+stat -c '%n %U:%G %a' /var/lib/trawl /var/lib/trawl/web.cookie /var/lib/trawl/cores /etc/trawl/trawld.toml"
+web_user=$(nshq "ps -o user= -p \$(systemctl show trawl-web -p MainPID --value)" | tr -d ' \r')
+[[ "$web_user" == "trawl-web" ]] \
+  || die "trawl-web runs as '$web_user', not trawl-web; same-uid access defeats every dump protection here"
+[[ "$(nshq "stat -c '%U:%G %a' /var/lib/trawl/cores")" == "trawl:trawl 700" ]] \
+  || die "the dump directory is not trawl:trawl 0700, so the uid split alone would be carrying it"
+note "the proxy runs as trawl-web; the dump directory is trawl:trawl 0700, denying that uid by mode as well"
+
 # No dumps exist yet, so an empty directory on both sides would prove nothing.
 # Plant a sentinel in the real directory AFTER the proxy started: the mask is a
 # mount established at unit start, and nothing underneath it shows through.

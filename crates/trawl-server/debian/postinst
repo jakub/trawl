@@ -18,10 +18,14 @@ if [ "$1" = "configure" ]; then
   # between the test and the create. GNU `install -d` follows a symlink to a
   # directory and chowns the target, as root, to trawl:trawl.
   #
-  # Runs after systemd-sysusers, which is what makes `trawl` resolvable. `|| true`
-  # keeps a systemd-less install working; trawld creates the directory itself
-  # (0700) at startup when capture is on.
-  systemd-tmpfiles --create trawl.conf || true
+  # Runs after systemd-sysusers, which is what makes `trawl` resolvable. Gated
+  # on the binary existing so a systemd-less chroot still configures, but NOT
+  # swallowed: a systemd-tmpfiles that is present and fails is a real failure,
+  # and an install that carries on past it leaves the drop-in pointing at a
+  # directory nobody created.
+  if command -v systemd-tmpfiles >/dev/null 2>&1; then
+    systemd-tmpfiles --create trawl.conf
+  fi
 
   # NOTE (ADR-0004 slice 3): trawld's app state (history, saved queries,
   # schedules, report runs) lives in a dedicated `trawl` postgres database,
@@ -60,6 +64,17 @@ if [ "$1" = "configure" ]; then
       head -c 32 /dev/urandom > "$tmp"
       mv "$tmp" /var/lib/trawl/web.cookie
     fi
+  fi
+
+  # The proxy runs as trawl-web and reads this key through its membership of the
+  # trawl group, so the key has to be group-readable. Applied on every configure
+  # rather than at generation time only: installs predating the user split left
+  # it 0400 trawl:trawl, which the proxy's new uid cannot read, and the key is
+  # deliberately preserved across upgrades so nothing else would fix it. The
+  # trawl group has exactly one member besides trawl itself.
+  if [ -f /var/lib/trawl/web.cookie ] && id trawl >/dev/null 2>&1; then
+    chown trawl:trawl /var/lib/trawl/web.cookie
+    chmod 0640 /var/lib/trawl/web.cookie
   fi
 fi
 

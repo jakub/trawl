@@ -9,6 +9,7 @@ web_service="$repo_root/crates/trawl-server/debian/trawl-web.service"
 default_env="$repo_root/crates/trawl-server/debian/trawld.default"
 crashdump_conf="$repo_root/crates/trawl-server/debian/crashdump.conf"
 tmpfiles_conf="$repo_root/crates/trawl-server/debian/trawl.tmpfiles"
+sysusers_conf="$repo_root/crates/trawl-server/debian/trawl.sysusers"
 cargo_toml="$repo_root/crates/trawl-server/Cargo.toml"
 imp_rs="$repo_root/crates/trawl-crashdump/src/imp.rs"
 values_yaml="$repo_root/chart/trawl/values.yaml"
@@ -212,10 +213,29 @@ fi
 # verbatim copies of trawld's memory. The mask covers the subdirectory only:
 # /var/lib/trawl/web.cookie has to stay reachable or the proxy will not start.
 if ! grep -Eq "^[[:space:]]*InaccessiblePaths[[:space:]]*=[[:space:]]*-?${dir_value}[[:space:]]*$" "$web_service"; then
-  fail "crates/trawl-server/debian/trawl-web.service does not mask '$dir_value' with InaccessiblePaths — the proxy runs as trawl with /var/lib/trawl writable and would be able to read every minidump"
+  fail "crates/trawl-server/debian/trawl-web.service does not mask '$dir_value' with InaccessiblePaths — the third denial, after the separate uid and the 0700 mode"
 fi
 if grep -Eq "^[[:space:]]*InaccessiblePaths[[:space:]]*=[[:space:]]*-?/var/lib/trawl[[:space:]]*$" "$web_service"; then
   fail "crates/trawl-server/debian/trawl-web.service masks the whole of /var/lib/trawl — that hides web.cookie too and the proxy cannot start"
+fi
+
+# The mask alone is not enough and never was. Running the proxy as the trawl
+# user leaves /proc/<trawld-pid>/root as a way around it: same uid passes the
+# kernel's ptrace check, and inside trawld's mount namespace nothing is masked.
+# A separate uid is what closes that, so the two settings are checked together.
+if ! grep -Eq '^[[:space:]]*User[[:space:]]*=[[:space:]]*trawl-web[[:space:]]*$' "$web_service"; then
+  fail "crates/trawl-server/debian/trawl-web.service does not set User=trawl-web — as the trawl user the proxy reaches the dumps through /proc/<trawld-pid>/root regardless of InaccessiblePaths"
+fi
+if ! grep -Eq '^[[:space:]]*u[[:space:]]+trawl-web[[:space:]]' "$sysusers_conf"; then
+  fail "crates/trawl-server/debian/trawl.sysusers does not declare the trawl-web user that trawl-web.service runs as"
+fi
+if ! grep -Eq '^[[:space:]]*m[[:space:]]+trawl-web[[:space:]]+trawl[[:space:]]*$' "$sysusers_conf"; then
+  fail "crates/trawl-server/debian/trawl.sysusers does not add trawl-web to the trawl group — the proxy would not be able to read /var/lib/trawl/web.cookie or /etc/trawl/trawld.toml"
+fi
+# The key is group-readable on purpose, and only because the group has one
+# other member. A recursive or wider grant would hand it to everyone.
+if ! grep -Eq '^[[:space:]]*chmod[[:space:]]+0640[[:space:]]+/var/lib/trawl/web\.cookie[[:space:]]*$' "$postinst"; then
+  fail "crates/trawl-server/debian/postinst does not make /var/lib/trawl/web.cookie group-readable — trawl-web runs as its own uid now and reads the key through the trawl group"
 fi
 if ! grep -Eq '^[[:space:]]*systemd-tmpfiles[[:space:]]+--create[[:space:]]+trawl\.conf' "$postinst"; then
   fail "crates/trawl-server/debian/postinst does not run 'systemd-tmpfiles --create trawl.conf' — nothing would create '$dir_value' at install time"
