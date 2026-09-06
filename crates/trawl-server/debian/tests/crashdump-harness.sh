@@ -185,10 +185,28 @@ finish_transcript() {
 # concurrent runs would share them and the second one's teardown would tear down
 # the first one's containers mid-crash. Take the lock BEFORE installing the
 # cleanup trap, so a refused run exits without running any teardown at all.
-readonly LOCKFILE="${XDG_RUNTIME_DIR:-/tmp}/trawl-crashdump-harness.lock"
+#
+# The path is fixed and host-global on purpose. Those docker names are global to
+# the daemon, and the lock has to have the same reach as the thing it protects.
+# Under $XDG_RUNTIME_DIR it did not: two runs as different users, or one under a
+# session with the variable unset, would take locks on different files, both
+# succeed, and then destroy each other's containers.
+readonly LOCKFILE="/tmp/trawl-crashdump-harness.lock"
 command -v flock >/dev/null 2>&1 \
   || { echo "flock is not installed; refusing to run without the concurrency lock" >&2; exit 2; }
-exec 9>"$LOCKFILE"
+# /tmp is world-writable, so refuse anything that is not a plain file rather than
+# opening whatever a symlink points at. Residual: another user can still create
+# the file first and own it, which turns into the permission refusal below.
+if [[ -L "$LOCKFILE" || ( -e "$LOCKFILE" && ! -f "$LOCKFILE" ) ]]; then
+  echo "$LOCKFILE exists and is not a plain file; refusing to use it as a lock" >&2
+  exit 2
+fi
+if ! : >>"$LOCKFILE" 2>/dev/null; then
+  echo "cannot open $LOCKFILE for writing (owned by another user?); refusing to run" >&2
+  exit 2
+fi
+chmod 0644 "$LOCKFILE" 2>/dev/null || true
+exec 9>>"$LOCKFILE"
 if ! flock -n 9; then
   echo "another crashdump-harness.sh run holds $LOCKFILE; refusing to start" >&2
   echo "(the docker names this uses are fixed, so a second run would tear down the first)" >&2
