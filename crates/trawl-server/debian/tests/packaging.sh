@@ -243,7 +243,10 @@ fi
 if ! grep -Eq '^[[:space:]]*systemd-tmpfiles[[:space:]]+--create[[:space:]]+trawl\.conf' "$postinst"; then
   fail "crates/trawl-server/debian/postinst does not run 'systemd-tmpfiles --create trawl.conf' — nothing would create '$dir_value' at install time"
 fi
-if grep -Eq "install[[:space:]]+-d[^\n]*${dir_value}" "$postinst"; then
+# `.*` and not `[^\n]*`. In an ERE that bracket expression is "any character
+# except backslash and n", so it stops at the 'n' in the path it is looking for
+# and the guard never fires.
+if grep -Eq "install[[:space:]]+-d.*${dir_value}" "$postinst"; then
   fail "crates/trawl-server/debian/postinst creates '$dir_value' with 'install -d' — that is the check-then-act race systemd-tmpfiles replaced"
 fi
 
