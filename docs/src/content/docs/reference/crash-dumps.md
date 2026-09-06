@@ -365,7 +365,7 @@ trawl query 'service=trawld event_type=crash_dump last=24h | table _time, readin
 | `ready` | The capability, yama and commoncap prerequisites hold | Nothing |
 | `denied` | A prerequisite is provably missing, so a crash writes a dump with zero threads | Read `ptrace_scope` and `missing` in the same event. `missing="CAP_SYS_PTRACE"` means the monitor never got the bit: a half-applied drop-in on Debian, or on kubernetes a capability that never reached the container, say because an admission policy stripped it. No `missing` at `ptrace_scope=3` means the node refuses every tracer and nothing you grant will change that |
 | `indeterminate` | An input was unreadable or malformed, so there is no verdict either way | Treat capture as unknown. `/proc` being unreadable usually means a container filesystem restriction or a monitor that exited during startup. Check `monitor_pid` is alive and read the masks by hand |
-| `failed` | Capture never armed. `reason` names the step that failed | `dump_dir` is a directory trawld cannot create or write. `spawn_monitor` and `monitor_unreachable` mean the re-exec did not come up. A failed seal never reaches this event at all: trawld exits first, see below |
+| `failed` | Capture never armed. `reason` names the step that failed | `dump_dir` is a directory trawld cannot create or write. `spawn_monitor` means the re-exec could not be started. `monitor_unreachable` means the monitor started but trawld could not prove it alive: the socket never connected, or the monitor had already exited or could not be waited on by the time trawld checked, so nothing was armed against a pid that might be recycled. A failed seal never reaches this event at all: trawld exits first, see below |
 
 `ready` is a necessary condition, not a promise. It covers the capability sets,
 the yama scope and commoncap's exec rules. It does not cover seccomp or an LSM,
@@ -381,7 +381,7 @@ built, which is before the tracing subscriber exists, so there is no
 `crash_dump` event and no `reason="seal"` field to read. What you get is one
 line on stderr and exit 1:
 
-```
+```text
 [trawld] crash-dump seal failed: refusing to start with an unsealed capability set (ADR-0023 ruling 4)
 ```
 
