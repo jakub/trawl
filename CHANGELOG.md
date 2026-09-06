@@ -678,7 +678,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `memory_regions=`, so a denied capture shows in the log instead of only
   inside the file. The verdict covers capabilities, yama and commoncap and not
   seccomp or an LSM, and an enabled pod cannot run under the Restricted Pod
-  Security profile.
+  Security profile. The monitor also has to prove it is the monitor: the
+  socket name is abstract, so it has no permissions and is predictable from
+  trawld's pid, and a connect that succeeds says only that something is bound
+  to it. trawld reads `SO_PEERCRED` on a second, throwaway connection, which
+  names the process that bound the name, and refuses to arm with
+  `reason="monitor_identity"` when that is not the child it spawned. A monitor
+  that has already exited is a refusal too, rather than an `indeterminate`
+  verdict, because the wait that observes the exit also reaps the pid and the
+  old code went on to hand that pid a `PR_SET_PTRACER` grant.
 - **`PUT /api/v1/saved/{id}/schedule` honours `enabled` on create (#107).**
   The flag reached the update path only; the create path's INSERT hardcoded
   it to true. A `PUT {"interval": "1h", "enabled": false}` on a saved query

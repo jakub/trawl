@@ -253,9 +253,22 @@ independently, it is a real decision, and it is why the package ships the
 drop-in inert rather than enabling capture for every install.
 
 One more thing to weigh on a multi-user host: the daemon and its monitor talk
-over an abstract unix socket, which has no filesystem permissions, so any local
-user in the same network namespace can connect to it. Hardening that is tracked
-against the crashdump crate, separately from this page.
+over an abstract unix socket, which has no filesystem permissions, and its name
+is predictable from trawld's pid, so any local process in the same network
+namespace can connect to it and could race trawld to bind the name. Winning
+that race no longer buys anything. Once its own client is connected, trawld
+opens a throwaway connection to the same name and reads `SO_PEERCRED`, which
+names the process that called `listen`. If that is not the monitor trawld
+spawned, running as trawld's own uid, capture does not arm at all: the startup
+event reports `readiness="failed"` with `reason="monitor_identity"`, and the
+daemon runs on with no crash handler installed.
+
+The residual runs the other way. Any process under the same uid can still
+connect to the monitor as a second client and ask it for a dump. What it gets
+back is a dump of itself: the monitor dumps the pid the kernel reports on the
+other end of the connection, never a pid the client names. Same-uid separation
+is not a boundary this design draws, and the monitor is trawld's child under
+trawld's uid anyway.
 
 ## yama ptrace_scope
 
