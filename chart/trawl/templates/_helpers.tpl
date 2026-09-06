@@ -68,11 +68,20 @@ Container image with tag defaulting to appVersion.
 {{- end }}
 
 {{/*
-trawld container securityContext: the shared securityContext, plus
-CAP_SYS_PTRACE when crash-dump capture is enabled. The crash handler forks
-and ptraces itself to write a minidump, which the node's yama/ptrace_scope=2
-gates behind that capability. Scoped to trawld only — init-auth and trawl-web
-keep the unmodified securityContext.
+The trawld container's securityContext. It is the shared securityContext,
+plus CAP_SYS_PTRACE and allowPrivilegeEscalation when crash-dump capture
+is enabled. trawld re-execs itself as a separate monitor process that
+ptraces the crashed parent and writes the minidump, and the node's
+yama/ptrace_scope=2 gates that ptrace behind CAP_SYS_PTRACE held
+effective. The monitor takes it from the cap_sys_ptrace+p file capability
+the image stamps on /usr/bin/trawld. That only works if escalation is
+allowed, because allowPrivilegeEscalation: false sets no_new_privs and the
+kernel then ignores file capabilities on every exec, whether or not the
+pod spec lists the capability. Enabling crash dumps is therefore
+incompatible with the Restricted Pod Security profile. The chart documents
+that rather than enforcing it, because admission policy is cluster state
+the chart cannot read (ADR-0023 ruling 7). Only trawld is touched;
+init-auth and trawl-web keep the unmodified securityContext.
 */}}
 {{- define "trawl.trawldSecurityContext" -}}
 {{- $sc := deepCopy .Values.securityContext -}}
@@ -80,6 +89,7 @@ keep the unmodified securityContext.
 {{- $caps := default (dict) $sc.capabilities -}}
 {{- $_ := set $caps "add" (append (default (list) $caps.add) "SYS_PTRACE" | uniq) -}}
 {{- $_ := set $sc "capabilities" $caps -}}
+{{- $_ := set $sc "allowPrivilegeEscalation" true -}}
 {{- end -}}
 {{- toYaml $sc -}}
 {{- end }}
