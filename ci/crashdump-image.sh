@@ -379,7 +379,7 @@ note "getcap agrees: $actual"
 
 # ------------------------------------------------- step 2: the runner itself --
 
-phase "step 2: what the runner's kernel and bounding set allow"
+phase "step 2: the runner's kernel, and its own masks as facts"
 
 runner_bnd="$(field /proc/self/status CapBnd)"
 if [ -r "$YAMA" ]; then
@@ -393,15 +393,22 @@ fi
 docker_version="$(docker version --format '{{.Server.Version}}')"
 
 {
-  echo "docker server:  $docker_version"
-  echo "runner CapBnd:  $runner_bnd (CAP_SYS_PTRACE=$(cap_bit "$runner_bnd"))"
-  echo "ptrace_scope:   $scope"
+  echo "docker server:                 $docker_version"
+  echo "runner CapBnd (informational): $runner_bnd (CAP_SYS_PTRACE=$(cap_bit "$runner_bnd"))"
+  echo "ptrace_scope:                  $scope"
 } | tee "$LOG_DIR/02-runner.txt"
 
-# Nested containers cannot be granted a capability the runner does not hold, so
-# an absent bit is a runner problem to fix, never a reason to skip the proof.
-[ "$(cap_bit "$runner_bnd")" = 1 ] ||
-  die "the runner's own bounding set lacks CAP_SYS_PTRACE, so --cap-add SYS_PTRACE cannot grant it; this job needs a runner that has it"
+# The runner's own bounding set is recorded here and asserted nowhere. This
+# process is not the docker daemon: on the k8s runners the daemon is a separate
+# privileged container, which is the only reason `docker build` works there at
+# all, and what that daemon can hand a container it starts is unrelated to the
+# mask this shell happens to carry. Reading /proc/self/status to predict a grant
+# measures the wrong process, and it fails a job that would have passed.
+#
+# The honest measurement is a container started with --cap-add SYS_PTRACE
+# reading its OWN /proc/self/status. Step 3 does exactly that, so step 3 is the
+# gate. ptrace_scope stays a real input, because that sysctl IS this kernel's
+# and the containers share it.
 
 # -------------------------------------------------- step 3: the baseline sh --
 
@@ -417,11 +424,13 @@ base_eff="$(field "$LOG_DIR/03-baseline-sh.status" CapEff)"
 base_nnp="$(field "$LOG_DIR/03-baseline-sh.status" NoNewPrivs)"
 note "CapBnd=$base_bnd CapPrm=$base_prm CapEff=$base_eff NoNewPrivs=$base_nnp"
 
-# This is the premise of the whole exercise: --cap-add puts the capability in
-# the BOUNDING set only. An ordinary binary run by uid 1000 holds none of it.
-# Everything the monitor ends up with therefore came from the file capability.
+# This is the premise of the whole exercise, and the gate for the run: --cap-add
+# puts the capability in the BOUNDING set only. An ordinary binary run by uid
+# 1000 holds none of it. Everything the monitor ends up with therefore came from
+# the file capability, and a bounding set without the bit means every later step
+# would be testing a shape the daemon refused to build.
 [ "$(cap_bit "$base_bnd")" = 1 ] ||
-  die "--cap-add SYS_PTRACE did not reach the container's bounding set"
+  die "--cap-add SYS_PTRACE did not reach this container's bounding set, so the docker daemon could not grant SYS_PTRACE (container CapBnd=$base_bnd; the runner's own CapBnd=$runner_bnd is informational, the container's is what was measured); this job needs a daemon that can grant it"
 [ "$(cap_bit "$base_prm")" = 0 ] ||
   die "an ordinary executable already holds CAP_SYS_PTRACE permitted; the file capability proves nothing here"
 [ "$(cap_bit "$base_eff")" = 0 ] ||
@@ -766,6 +775,7 @@ fi
 {
   echo "image:            $IMAGE"
   echo "docker server:    $docker_version"
+  echo "runner CapBnd:    $runner_bnd (informational)"
   echo "ptrace_scope:     $scope (unchanged)"
   echo "file capability:  $actual"
   echo "baseline sh:      CapBnd=$base_bnd CapPrm=$base_prm CapEff=$base_eff NoNewPrivs=$base_nnp"
