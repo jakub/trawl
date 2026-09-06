@@ -157,6 +157,14 @@ nothing is stripped. A kind run at `ptrace_scope=2` with the pod at
 `NoNewPrivs: 1`, a `ready` verdict, and a dump with 34 threads. So the chart adds
 the capability and leaves escalation alone.
 
+That rule cuts the other way too. The bit survives only because the process
+that execs `trawld` already holds it, and in the chart that process is the
+container's init, since the image's `ENTRYPOINT` is `trawld` itself. Put a
+shell or an init shim in front of it and the shell drops the bit at its own
+exec; `trawld`'s exec is then a gain, `no_new_privs` strips it, and capture goes
+dead with nothing but the `denied` verdict to say so. Keep `trawld` as the
+container's first process, or grant escalation if you cannot.
+
 The capability is still worth weighing before you enable. The Restricted Pod
 Security profile refuses every added capability except `NET_BIND_SERVICE`, so a
 namespace enforcing Restricted rejects an enabled pod. The chart documents this

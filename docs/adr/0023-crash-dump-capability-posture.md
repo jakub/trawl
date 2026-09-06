@@ -152,6 +152,15 @@ The genuine denied case is the capability being absent from the pod spec:
 all sets zero, verdict `denied ... missing="CAP_SYS_PTRACE"`, and a 72 KB
 dump reporting `threads=0 memory_regions=0`.
 
+One constraint follows from the subset rule and is now part of the
+posture: `trawld` must be the container's init process. The bit survives
+the monitor exec only because the process doing that exec already holds
+it; a shell or init shim in front of `trawld` drops it at its own exec,
+`trawld`'s exec becomes a gain, and `no_new_privs` strips it. The image's
+`ENTRYPOINT` is `trawld` in exec form and the chart sets only `args`; the
+CI job asserts the chart shape (`--cap-add SYS_PTRACE` with
+`no-new-privileges`) exactly because a wrapper would fail it silently.
+
 So the chart adds `SYS_PTRACE` and nothing else. Restricted Pod Security
 remains incompatible, because it refuses any added capability except
 `NET_BIND_SERVICE`. Rulings 2 and 8 are unaffected: the `+p` reasoning
