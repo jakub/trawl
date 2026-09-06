@@ -139,6 +139,7 @@ pub(crate) fn severity_columns_for(
 /// database, sharing cached metadata.
 #[derive(Clone)]
 pub struct ExecutorPool {
+    publication: Arc<crate::publication::PublicationGate>,
     /// Base directory for parquet data (e.g. `/var/lib/trawl/data`).
     base_dir: Arc<str>,
     /// Full recursive glob for queries without a time filter.
@@ -363,6 +364,12 @@ fn capture_pool_debug(
 }
 
 impl ExecutorPool {
+    /// Publication interlock shared with compaction and rollup.
+    #[must_use]
+    pub fn publication(&self) -> Arc<crate::publication::PublicationGate> {
+        Arc::clone(&self.publication)
+    }
+
     /// Create a pool with the given concurrency limit and base data directory.
     ///
     /// Pre-creates `max_concurrent` executors sharing the same in-memory
@@ -387,7 +394,13 @@ impl ExecutorPool {
         let fallback_glob: Arc<str> =
             Arc::from(format!("{}/**/*.parquet", base_dir.trim_end_matches('/')));
 
+        let publication = hot_buffer.as_ref().map_or_else(
+            || Arc::new(crate::publication::PublicationGate::new()),
+            |buffer| buffer.publication(),
+        );
+        publication.initialize(std::path::Path::new(&base_dir));
         Self {
+            publication,
             base_dir: Arc::from(base_dir),
             fallback_glob,
             semaphore: Arc::new(Semaphore::new(max_concurrent)),
@@ -493,6 +506,21 @@ impl ExecutorPool {
             "semaphore permit acquired"
         );
 
+        let publication_start = std::time::Instant::now();
+        let publication = match tokio::time::timeout(timeout, self.publication.read())
+            .await
+            .unwrap_or(Err(ServerError::Timeout))
+        {
+            Ok(guard) => guard,
+            Err(error) => {
+                return ExecuteOutcome {
+                    result: Err(error),
+                    debug: None,
+                    severity_columns: Vec::new(),
+                };
+            }
+        };
+        let timeout = timeout.saturating_sub(publication_start.elapsed());
         let executor = self.take_executor();
 
         let dsl = dsl.to_owned();
@@ -507,6 +535,7 @@ impl ExecutorPool {
 
         let mut task = tokio::task::spawn_blocking(move || {
             let _permit = permit; // hold permit until this task completes
+            let _publication = publication; // timeout must not release a running reader
             // Send interrupt handle to async side before running the query.
             let _ = interrupt_tx.send(executor.interrupt_handle());
 
@@ -898,6 +927,7 @@ impl ExecutorPool {
             return Err(ServerError::Internal("executor pool shut down".into()));
         };
 
+        let publication = self.publication.read().await?;
         let executor = self.take_executor();
         let fallback_glob = Arc::clone(&self.fallback_glob);
         let field = field.to_owned();
@@ -905,6 +935,7 @@ impl ExecutorPool {
 
         let (executor, result) = tokio::task::spawn_blocking(move || {
             let _permit = permit;
+            let _publication = publication;
             let glob = match service {
                 Some(svc) => {
                     let base = fallback_glob.as_ref();
@@ -949,6 +980,11 @@ impl ExecutorPool {
             return Err(ServerError::Internal("executor pool shut down".into()));
         };
 
+        let publication_start = std::time::Instant::now();
+        let publication = tokio::time::timeout(timeout, self.publication.read())
+            .await
+            .map_err(|_| ServerError::Timeout)??;
+        let timeout = timeout.saturating_sub(publication_start.elapsed());
         let executor = self.take_executor();
         let dsl = dsl.to_owned();
         let base_dir = Arc::clone(&self.base_dir);
@@ -959,6 +995,7 @@ impl ExecutorPool {
 
         let mut task = tokio::task::spawn_blocking(move || {
             let _permit = permit;
+            let _publication = publication;
             let _ = interrupt_tx.send(executor.interrupt_handle());
             let source = compute_source(&base_dir, &dsl);
 

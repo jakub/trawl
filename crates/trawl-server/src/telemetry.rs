@@ -512,6 +512,9 @@ struct WalLayerInner {
     /// blocking closure has consumed a batch and a `JoinError` loses it.
     #[cfg(test)]
     panic_next_write: AtomicBool,
+    #[cfg(test)]
+    pause_before_insert:
+        Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 }
 
 #[derive(Clone, Copy)]
@@ -590,6 +593,8 @@ impl WalLayer {
                 hot_buffer: OnceLock::new(),
                 #[cfg(test)]
                 panic_next_write: AtomicBool::new(false),
+                #[cfg(test)]
+                pause_before_insert: Mutex::new(None),
             }),
         }
     }
@@ -613,7 +618,7 @@ impl WalLayer {
     ///
     /// Test-only convenience — the production flush task's sole write path
     /// is [`WalLayer::flush_cycle`], which runs the durability barriers on
-    /// the blocking pool.
+    /// the blocking pool. Call outside an async runtime task.
     pub fn flush(&self) {
         let Some((writer, env)) = self.inner.handle.get() else {
             return;
@@ -621,6 +626,8 @@ impl WalLayer {
         self.inner.stage();
         let mut coalesce = false;
         while let Some(batch) = self.inner.pop_drain_unit(coalesce) {
+            let publication = self.inner.hot_buffer.get().map(|buf| buf.publication());
+            let _ingest = publication.as_ref().map(|gate| gate.blocking_ingest());
             match writer.write(env, TELEMETRY_SERVICE, &batch.bytes) {
                 Ok(wal_path) => {
                     coalesce = true;
@@ -655,24 +662,36 @@ impl WalLayer {
         while let Some(batch) = self.inner.pop_drain_unit(coalesce) {
             let w = Arc::clone(writer);
             let batch_env = Arc::clone(env);
+            let inner = Arc::clone(&self.inner);
+            let dispatch = tracing::dispatcher::get_default(Clone::clone);
             // Captured before the batch moves into the closure, so a lost
             // batch can still be released from the shared accounting.
             let in_flight = (batch.events.len(), batch_charge(&batch), batch.bytes.len());
             #[cfg(test)]
             let panic_write = self.inner.panic_next_write.swap(false, Ordering::Relaxed);
             let joined = tokio::task::spawn_blocking(move || {
+                let _dispatch = tracing::dispatcher::set_default(&dispatch);
                 #[cfg(test)]
                 assert!(!panic_write, "injected telemetry WAL write panic");
-                let result = w.write(&batch_env, TELEMETRY_SERVICE, &batch.bytes);
-                (result, batch)
+                // The task keeps the guard through insertion even if its
+                // async caller is cancelled while the WAL write runs.
+                let publication = inner.hot_buffer.get().map(|buf| buf.publication());
+                let _ingest = publication.as_ref().map(|gate| gate.blocking_ingest());
+                match w.write(&batch_env, TELEMETRY_SERVICE, &batch.bytes) {
+                    Ok(wal_path) => {
+                        inner.publish(&batch_env, &wal_path, batch);
+                        inner.update_gauges();
+                        Ok(())
+                    }
+                    Err(e) => Err((e, batch)),
+                }
             })
             .await;
             match joined {
-                Ok((Ok(wal_path), batch)) => {
+                Ok(Ok(())) => {
                     coalesce = true;
-                    self.inner.publish(env, &wal_path, batch);
                 }
-                Ok((Err(e), batch)) => {
+                Ok(Err((e, batch))) => {
                     self.inner
                         .record_write_failure(&e, WriteFailureDisposition::Retained);
                     self.inner.requeue_front(batch);
@@ -898,7 +917,16 @@ impl WalLayerInner {
     /// strictly after WAL success, exactly once (the batch was popped).
     /// Then emit the `telemetry_dropped` recovery record if any loss
     /// accumulated (safe from recursion: `on_event` only buffers).
+    /// The caller holds the publication read guard from before WAL writing.
     fn publish(&self, env: &str, wal_path: &std::path::Path, batch: Batch) {
+        #[cfg(test)]
+        {
+            let pause = self.pause_before_insert.lock().take();
+            if let Some((entered, release)) = pause {
+                let _ = entered.send(());
+                let _ = release.recv();
+            }
+        }
         // The batch leaves the layer's accounting here: the hot buffer
         // takes ownership under its own `hot_buffer_max_bytes` budget.
         self.staged
@@ -2225,6 +2253,98 @@ mod tests {
     }
 
     use std::path::PathBuf;
+
+    async fn assert_flush_holds_publication_until_insert(synchronous: bool) {
+        use tracing_subscriber::prelude::*;
+
+        let root = tempfile::tempdir().unwrap();
+        let writer = Arc::new(WalWriter::new(root.path().join("wal")));
+        let handle = WalHandle::new();
+        handle.set(writer.clone(), "prod");
+        let layer = WalLayer::new(handle, "prod");
+        let hot = Arc::new(crate::hot_buffer::HotBuffer::new(
+            crate::hot_buffer::HotBufferConfig {
+                max_events: 100,
+                max_bytes: 100_000,
+            },
+        ));
+        layer.set_hot_buffer(hot.clone());
+        let subscriber = tracing_subscriber::registry().with(layer.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(
+                event_type = "publication_test",
+                "durable before hot insertion"
+            );
+        });
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *layer.inner.pause_before_insert.lock() = Some((entered_tx, release_rx));
+        let flushing = layer.clone();
+        let task = tokio::spawn(async move {
+            if synchronous {
+                tokio::task::spawn_blocking(move || flushing.flush())
+                    .await
+                    .unwrap();
+            } else {
+                flushing.flush_cycle().await;
+            }
+        });
+        tokio::task::spawn_blocking(move || {
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        })
+        .await
+        .unwrap();
+        let events = read_wal_events(&writer.dir().join("prod"));
+        assert_eq!(events.len(), 1, "the paused telemetry event is durable");
+        assert_eq!(events[0]["event_type"], "publication_test");
+        assert_eq!(hot.event_count(), 0);
+        let publication = hot.publication();
+        let reader = tokio::time::timeout(Duration::from_secs(1), publication.read())
+            .await
+            .expect("ingestion must permit concurrent query readers")
+            .unwrap();
+        drop(reader);
+
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let mut publishing = Box::pin(publication.write());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), publishing.as_mut())
+                .await
+                .is_err(),
+            "the blocking task retains the guard after cancellation"
+        );
+        release_tx.send(()).unwrap();
+        let _publication = tokio::time::timeout(Duration::from_secs(5), publishing)
+            .await
+            .expect("insertion must complete before the queued writer enters");
+        assert_eq!(hot.event_count(), 1);
+        assert_eq!(layer.inner.staged.events.load(Ordering::Relaxed), 0);
+        assert_eq!(layer.inner.staged.bytes.load(Ordering::Relaxed), 0);
+        let wal_path = std::fs::read_dir(writer.dir().join("prod"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let batch_id = format!("prod/{}", wal_path.file_stem().unwrap().to_str().unwrap());
+        hot.drain(&[&batch_id]);
+        assert_eq!(
+            hot.event_count(),
+            0,
+            "the batch cannot arrive after its drain"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_async_flush_keeps_wal_and_hot_insert_together() {
+        assert_flush_holds_publication_until_insert(false).await;
+    }
+
+    #[tokio::test]
+    async fn synchronous_flush_keeps_wal_and_hot_insert_together() {
+        assert_flush_holds_publication_until_insert(true).await;
+    }
 
     #[tokio::test]
     async fn wal_failure_retains_batch_then_publishes_exactly_once_after_retry() {

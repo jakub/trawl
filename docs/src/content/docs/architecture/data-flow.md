@@ -65,7 +65,7 @@ An in-memory `RwLock<IndexMap>` keyed by batch ID, holding `Arc<IngestBatch>`. E
 
 FIFO eviction at 100k events or 100MB. Generation-based snapshot caching ensures concurrent queries share a single temp ndjson file via `Arc<NamedTempFile>`.
 
-Events stay in the hot buffer until drained after confirmed parquet write. Brief duplicates (visible in both hot buffer and parquet) are acceptable; invisible events are not.
+Queries must not count an event twice as compaction moves it from memory to Parquet. A shared publication lock covers query source selection, the hot snapshot, and the final Parquet read. Compaction takes the write guard for file publication and hot-batch drain. Producers keep a read guard from WAL writing through hot insertion, so a delayed producer cannot add a second copy after compaction drains it. Daily rollup holds the write guard through hourly-file retirement; an unfinished rollup refuses queries until recovery finishes. This guarantee covers one daemon and does not deduplicate client retries or crash-time WAL replay. See ADR-0023 in the repository.
 
 ### Event bus
 

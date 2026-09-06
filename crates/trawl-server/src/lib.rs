@@ -24,6 +24,7 @@ pub mod monitor;
 pub(crate) mod ping;
 pub mod policy;
 pub mod pool;
+pub mod publication;
 pub mod query_log;
 pub mod rate_limit;
 pub mod repin;

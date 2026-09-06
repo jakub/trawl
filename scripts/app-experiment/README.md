@@ -289,6 +289,40 @@ allows two concurrent queries. Events have fixed January 2026 timestamps;
 use the explicit absolute bounds in the recorded queries. A relative
 `last=15m` search during an interactive hold will not find that corpus.
 
+Compaction must preserve exact results while the workload runs. Keep the
+independent ID and value oracle enabled, including for the 20,000-event
+scenario. Do not add `DISTINCT`, raise the result limit to hide an overlap,
+or retry an incorrect result until it happens to pass. Accepted identical
+payloads remain separate events.
+
+For a publication regression, run the focused real-WAL and DuckDB tests:
+
+```bash
+CARGO_TARGET_DIR=/home/jakub/code/trawl/target/app-experiment \
+  cargo nextest run -p trawl-server --no-default-features \
+  --test publication_consistency
+```
+
+These tests pause publication after the Parquet rename and before hot drain,
+check query and export timeouts, and check that a timed-out query retains its
+read guard until its blocking task finishes. They also check refusal after
+restart with an unfinished rollup marker. The ordinary app scenario disables
+daily rollup, so it does not replace the compactor's rollup recovery tests.
+
+An unfinished `.rollup-*` marker makes corpus queries return 503 until rollup
+recovery removes it. Inspect the daemon's `rollup_recovery` and `rollup_error`
+logs. Fix the reported filesystem failure and let the owning daemon retry
+before it compacts new WAL, even if daily rollup is disabled. Do not delete
+the marker to make queries pass,
+because both daily and hourly copies may still exist. Query-only instances
+cannot perform that recovery. A failed startup marker scan also refuses
+reads and requires a restart after the filesystem problem is fixed.
+
+The publication lock coordinates one daemon. It does not promise exactly-once
+ingestion across client retries or crash-time WAL replay, and it cannot
+coordinate another process writing the same archive. See
+[ADR-0023](../../docs/adr/0023-compaction-publication-consistency.md).
+
 Read source only for the component being changed:
 
 | File | Responsibility |

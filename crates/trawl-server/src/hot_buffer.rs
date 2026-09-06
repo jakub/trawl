@@ -86,6 +86,7 @@ struct CachedSnapshot {
 /// FIFO eviction) keyed by batch id (`{env}/{WAL filename stem}`, the
 /// shape compaction derives to drain what it just wrote).
 pub struct HotBuffer {
+    publication: Arc<crate::publication::PublicationGate>,
     batches: RwLock<IndexMap<Arc<str>, Arc<IngestBatch>>>,
     total_events: AtomicUsize,
     total_bytes: AtomicUsize,
@@ -119,6 +120,7 @@ impl HotBuffer {
     /// snapshot carries empty `field_types`).
     pub fn new(config: HotBufferConfig) -> Self {
         Self {
+            publication: Arc::new(crate::publication::PublicationGate::new()),
             batches: RwLock::new(IndexMap::new()),
             total_events: AtomicUsize::new(0),
             total_bytes: AtomicUsize::new(0),
@@ -127,6 +129,12 @@ impl HotBuffer {
             snapshot_cache: Mutex::new(None),
             field_catalog: Arc::new(crate::catalog::FieldCatalog::new()),
         }
+    }
+
+    /// Shared publication interlock for this buffer and its cold corpus.
+    #[must_use]
+    pub fn publication(&self) -> Arc<crate::publication::PublicationGate> {
+        Arc::clone(&self.publication)
     }
 
     /// Attach the shared in-process pin cache; snapshots then carry the

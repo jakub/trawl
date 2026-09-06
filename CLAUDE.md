@@ -108,6 +108,13 @@ bin/app-experiment --skip-build --hold-seconds 600
   defaults to 50 and must be less than `--events`. `--rate` is a paced target,
   not a load-test throughput guarantee. `--skip-build` refuses stale build
   identity; rerun without it instead of editing the preparation manifest.
+- Compaction must preserve exact query and export results. Keep the event-ID
+  and value oracle enabled under load. Run `cargo nextest run -p trawl-server
+  --no-default-features --test publication_consistency` with the same Cargo
+  target for a deterministic publication-race check, then rebuild the app
+  before a full experiment. An unfinished rollup returns 503 until recovery;
+  the detailed guide explains diagnosis. See ADR-0023 for the guarantee and
+  its single-daemon scope.
 - A hold starts after browser, live-tail, compaction, and restart checks pass.
   Use the printed URL and `private/browser-key` path while it runs. Keep the
   runner supervised; Ctrl+C or SIGTERM requests cleanup. Never paste keys
