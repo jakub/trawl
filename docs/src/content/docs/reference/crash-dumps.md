@@ -279,9 +279,9 @@ The ready case, wrapped here but one line in the journal:
 ```
 INFO trawld: crash-dump capture ready; capability and yama checked, LSM policy not probed
   event_type="crash_dump" readiness="ready" ptrace_scope=2 monitor_pid=8213
-  monitor_cap_eff_ptrace=true monitor_cap_prm_ptrace=true monitor_no_new_privs=false
+  monitor_cap_eff_ptrace=true monitor_cap_prm_ptrace=true monitor_no_new_privs=true
   self_cap_eff_ptrace=false self_cap_prm_ptrace=false self_no_new_privs=true
-  dumpable=false ptracer_set=true dir="/var/lib/trawl/cores" retain=10
+  dumpable=true ptracer_set=true dir="/var/lib/trawl/cores" retain=10
 ```
 
 Read it out of the journal:
@@ -347,10 +347,13 @@ with `NoNewPrivs: 1`, is the seal working rather than a fault. Bit 19 belongs to
 the monitor. Take its pid from `monitor_pid` in the verdict and read the same
 fields from `/proc/<monitor_pid>/status`.
 
-`dumpable` reads 0 on an enabled pod even when the verdict is `ready`. Granting
-a new permitted capability at `execve` makes the kernel treat that exec as
-privileged and clear the dumpable flag. It only feeds the scope 0 and 1 verdict,
-where the attach rests on credentials instead of the capability.
+`dumpable` can read 0 even when the verdict is `ready`. An `execve` that gains a
+permitted capability from the file is a privileged exec, and the kernel clears
+the dumpable flag on one. A kubernetes pod reads 1, because the container's init
+process already held the bit and the exec gained nothing. A `docker run` through
+a shell reads 0, because the shell had dropped it and trawld's exec took it back.
+Either way it only feeds the scope 0 and 1 verdict, where the attach rests on
+credentials instead of the capability.
 
 On kubernetes, check the two halves of the grant:
 
