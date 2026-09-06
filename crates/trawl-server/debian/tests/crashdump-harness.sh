@@ -357,7 +357,20 @@ cleanup() {
   finish_transcript
   exit "$rc"
 }
-trap cleanup EXIT INT TERM
+# INT and TERM get their own handlers, not a shared one with EXIT. A signal
+# delivered after a command that succeeded enters the trap with $? still 0, so a
+# single `trap cleanup EXIT INT TERM` tears the stack down and then reports
+# "exit status: 0" without ever reaching the result phase. A killed run that
+# claims success is the worst possible answer. These record the conventional
+# 128+signal status and hand it to cleanup through `exit`.
+on_signal() { # on_signal <name> <status>
+  trap - INT TERM
+  printf '\n\n!! %s received. Tearing down and exiting %s.\n' "$1" "$2"
+  exit "$2"
+}
+trap 'on_signal SIGINT 130' INT
+trap 'on_signal SIGTERM 143' TERM
+trap cleanup EXIT
 
 # ------------------------------------------------------------- small helpers --
 
