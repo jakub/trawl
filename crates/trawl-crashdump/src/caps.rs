@@ -12,6 +12,11 @@
 //! structs, so the three `cap_user_*` types are declared here and both calls go
 //! through `libc::syscall`. This is the only file in the crate that touches
 //! capabilities, and every unsafe block is a single syscall.
+//!
+//! It is also where the crate's other raw-syscall work lives, because this is
+//! the designated unsafe file: [`peer_cred_of_abstract_socket`] asks the kernel
+//! who is listening on the monitor's abstract socket, which is how the parent
+//! tells its own monitor from a process that bound the name first.
 
 use std::io;
 
@@ -170,6 +175,131 @@ pub(crate) fn set_ptracer(pid: u32) -> io::Result<()> {
     }
 }
 
+/// Ask the kernel which process is listening on an abstract socket name.
+///
+/// A successful `Client::with_name` proves only that SOMETHING is bound to the
+/// name. Abstract names carry no filesystem permissions and this one is derived
+/// from the daemon's pid, so any process in the same network namespace can bind
+/// it first; the real monitor's own bind then fails and it exits, while the
+/// parent goes on probing `/proc/<monitor>` and reporting a readiness that
+/// describes a process it is not talking to.
+///
+/// `SO_PEERCRED` is the kernel's own answer to "who is on the other end". For a
+/// connecting socket it reports the credentials captured when the peer called
+/// `listen`, so it names the process that actually holds the name, and a
+/// caller who compares that pid against the child it spawned cannot be fooled
+/// by a stranger who won the race.
+///
+/// The connection this makes is a throwaway: it is opened, asked one question
+/// and closed. `SOCK_SEQPACKET` because that is what `minidumper`'s server
+/// binds; a `SOCK_STREAM` connect to the same name is refused.
+// Three casts to fixed-width kernel types, each of a value that provably fits:
+// `AF_UNIX` is 1, a `u8` byte into `c_char` (unsigned on aarch64, signed on
+// x86-64, and only the bit pattern reaches the kernel), and `size_of::<ucred>()`
+// is 12.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss
+)]
+pub(crate) fn peer_cred_of_abstract_socket(name: &[u8]) -> io::Result<libc::ucred> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    let mut addr = libc::sockaddr_un {
+        sun_family: libc::AF_UNIX as libc::sa_family_t,
+        sun_path: [0; 108],
+    };
+    // An abstract address is a leading NUL byte, then the name, with the length
+    // passed explicitly rather than read up to a terminator.
+    if name.is_empty() || name.len() + 1 > addr.sun_path.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "abstract socket name does not fit sun_path",
+        ));
+    }
+    for (slot, &byte) in addr.sun_path[1..=name.len()].iter_mut().zip(name) {
+        *slot = byte as libc::c_char;
+    }
+    let addr_len =
+        (std::mem::offset_of!(libc::sockaddr_un, sun_path) + 1 + name.len()) as libc::socklen_t;
+
+    // SAFETY: `socket(2)` takes scalars only and touches no memory of ours. The
+    // returned descriptor is handed straight to `OwnedFd`, which closes it on
+    // every path out of this function.
+    #[allow(unsafe_code)]
+    let raw = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0) };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `raw` is a fresh descriptor this function owns and never
+    // duplicates or closes itself.
+    #[allow(unsafe_code)]
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+
+    // SAFETY: `connect(2)` reads `addr_len` bytes of the address and writes
+    // nothing back. `addr` is a live, correctly sized `#[repr(C)]` local and
+    // `addr_len` is within it by the length check above.
+    #[allow(unsafe_code)]
+    let rc = unsafe {
+        libc::connect(
+            fd.as_raw_fd(),
+            std::ptr::addr_of!(addr).cast::<libc::sockaddr>(),
+            addr_len,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: `getsockopt(SO_PEERCRED)` writes at most `len` bytes into the
+    // pointer and updates `len` to what it wrote. Both are live locals of
+    // exactly the sizes named.
+    #[allow(unsafe_code)]
+    let rc = unsafe {
+        libc::getsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            std::ptr::addr_of_mut!(cred).cast::<libc::c_void>(),
+            std::ptr::addr_of_mut!(len),
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if len as usize != std::mem::size_of::<libc::ucred>() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "SO_PEERCRED returned a short credential",
+        ));
+    }
+    if cred.pid == 0 {
+        // The peer's pid does not translate into our pid namespace, so there is
+        // no identity here to compare against.
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "SO_PEERCRED carries no pid",
+        ));
+    }
+    Ok(cred)
+}
+
+/// This process's effective uid, for comparison against a peer's.
+pub(crate) fn effective_uid() -> u32 {
+    // SAFETY: `geteuid(2)` takes no arguments, touches no memory of ours and
+    // cannot fail.
+    #[allow(unsafe_code)]
+    unsafe {
+        libc::geteuid()
+    }
+}
+
 /// Is this process dumpable in the sense `__ptrace_may_access` requires?
 ///
 /// Only `SUID_DUMP_USER` (1) counts. `SUID_DUMP_DISABLE` (0) is what an exec of
@@ -189,10 +319,42 @@ pub(crate) fn get_dumpable() -> io::Result<bool> {
 
 #[cfg(test)]
 mod tests {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    use minidumper::{Server, SocketName};
+
     use super::{
-        PTRACE_BIT_WORD0, capget, get_dumpable, raise_ptrace_effective, seal, set_ptracer,
+        PTRACE_BIT_WORD0, capget, get_dumpable, peer_cred_of_abstract_socket,
+        raise_ptrace_effective, seal, set_ptracer,
     };
     use crate::probe::{parse_status, self_status};
+
+    /// Names the abstract socket [`abstract_socket_bind_helper`] should bind.
+    const HELPER_ENV: &str = "TRAWL_CRASHDUMP_TEST_BIND";
+
+    /// A name no other test, run or process is using.
+    fn unique_name(tag: &str) -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after the epoch")
+            .as_nanos();
+        format!("trawld-crashdump-test-{tag}-{}-{nanos}", std::process::id())
+    }
+
+    /// Poll the name until something is listening on it (or give up).
+    fn peer_cred_when_bound(name: &str) -> Option<libc::ucred> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(cred) = peer_cred_of_abstract_socket(name.as_bytes()) {
+                return Some(cred);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
 
     fn masks() -> (u64, u64) {
         let data = capget().expect("capget on our own process");
@@ -225,6 +387,81 @@ mod tests {
     fn raising_succeeds_exactly_when_the_bit_is_permitted() {
         let permitted = capget().unwrap()[0].permitted & PTRACE_BIT_WORD0 != 0;
         assert_eq!(raise_ptrace_effective().is_ok(), permitted);
+    }
+
+    #[test]
+    fn peer_cred_reports_this_process_when_it_holds_the_name() {
+        let name = unique_name("self");
+        let _server = Server::with_name(SocketName::abstract_namespace(&name))
+            .expect("bind an abstract seqpacket listener");
+
+        let cred = peer_cred_of_abstract_socket(name.as_bytes()).expect("peer credentials");
+
+        assert_eq!(
+            u32::try_from(cred.pid).expect("a pid is positive"),
+            std::process::id(),
+            "SO_PEERCRED names the binder"
+        );
+        let status = self_status().expect("/proc/self/status");
+        assert_eq!(cred.uid, status.uid[1], "effective uid");
+        assert_eq!(cred.gid, status.gid[1], "effective gid");
+    }
+
+    /// The impostor case, with a real second process: the pid the kernel
+    /// reports is the one that BOUND the name, never the one that connected.
+    /// That is the whole reason `install` can tell its own monitor from a
+    /// stranger who won the race for a predictable name.
+    #[test]
+    fn peer_cred_reports_the_other_process_that_bound_the_name() {
+        let name = unique_name("impostor");
+        let mut helper = Command::new(std::env::current_exe().expect("test binary path"))
+            .args([
+                "--ignored",
+                "--exact",
+                "caps::tests::abstract_socket_bind_helper",
+            ])
+            .env(HELPER_ENV, &name)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("respawn the test binary as a bind helper");
+
+        let cred = peer_cred_when_bound(&name);
+        let _ = helper.kill();
+        let _ = helper.wait();
+        let cred = cred.expect("the helper bound the name within the deadline");
+
+        let peer = u32::try_from(cred.pid).expect("a pid is positive");
+        assert_eq!(peer, helper.id(), "SO_PEERCRED names the helper");
+        assert_ne!(peer, std::process::id(), "and not the connecting process");
+    }
+
+    /// Runs only when [`peer_cred_reports_the_other_process_that_bound_the_name`]
+    /// re-execs the test binary with `--ignored --exact` and the name to bind in
+    /// the environment. Ignored so an ordinary run never pays the sleep.
+    #[test]
+    #[ignore = "helper process for peer_cred_reports_the_other_process_that_bound_the_name"]
+    fn abstract_socket_bind_helper() {
+        let Ok(name) = std::env::var(HELPER_ENV) else {
+            return;
+        };
+        let _server = Server::with_name(SocketName::abstract_namespace(&name))
+            .expect("bind an abstract seqpacket listener");
+        // The parent kills this process as soon as it has read the credentials;
+        // the sleep only bounds an orphan if it never does.
+        std::thread::sleep(Duration::from_secs(30));
+    }
+
+    #[test]
+    fn peer_cred_of_an_unbound_name_is_an_error() {
+        let name = unique_name("unbound");
+        assert!(peer_cred_of_abstract_socket(name.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn peer_cred_refuses_a_name_that_cannot_fit_an_abstract_address() {
+        assert!(peer_cred_of_abstract_socket(b"").is_err());
+        assert!(peer_cred_of_abstract_socket(&[b'x'; 200]).is_err());
     }
 
     /// Mutates this process, so it relies on nextest running each test in its

@@ -53,7 +53,9 @@ pub struct Guard {
     ///
     /// Holding the child unreaped is also what keeps the monitor's pid
     /// reserved: nothing in trawld ignores `SIGCHLD`, so as long as this value
-    /// lives the pid cannot be recycled under the `/proc/<pid>` the probe read.
+    /// lives the pid cannot be recycled under the `/proc/<pid>` the probe read
+    /// or under the `PR_SET_PTRACER` grant. A `Guard` therefore only ever
+    /// exists for a monitor `install` observed alive and did not reap.
     _monitor: std::process::Child,
 }
 
@@ -129,22 +131,38 @@ fn install(dir: &Path) -> Init {
         return sealed_failure(FailureReason::MonitorUnreachable);
     };
 
-    // The successful connect proves the monitor is past exec, running monitor
-    // code and past its capability raise, so its `/proc` status now means
-    // something. Ask whether it is still alive BEFORE reading that status: a
-    // monitor that died leaves a zombie whose masks read as all-zero, which
-    // would be classified as a denial that never happened.
-    let alive = !matches!(monitor.try_wait(), Ok(Some(_)));
+    // A successful connect proves only that SOMETHING is bound to that name, and
+    // the name has no permissions and is derived from our own pid, so any
+    // process in this network namespace could have bound it first. Ask the
+    // kernel who the peer is. This runs AFTER the real client connected, so the
+    // probe's own disconnect leaves the monitor with one client and never trips
+    // its `on_client_disconnected` exit.
+    if !monitor_identity_holds(&socket, monitor_pid) {
+        drop(client);
+        reap(&mut monitor);
+        return sealed_failure(FailureReason::MonitorIdentity);
+    }
+
+    // The connect proves the monitor is past exec, running monitor code and past
+    // its capability raise, so its `/proc` status now means something. Whether
+    // it is still ALIVE is a separate question, and it has to be answered before
+    // the pid is used for anything: `try_wait` REAPS an exited child, after
+    // which the kernel may hand that pid to an unrelated process, and
+    // `PR_SET_PTRACER` on a recycled pid would grant a stranger the right to
+    // ptrace this daemon at yama scope 1. So a monitor that is not observably
+    // alive ends the arm here, before the grant. An errored wait is the same
+    // answer for the same reason: it leaves the pid unproven.
+    if !matches!(monitor.try_wait(), Ok(None)) {
+        drop(client);
+        reap(&mut monitor);
+        return sealed_failure(FailureReason::MonitorUnreachable);
+    }
 
     // crash-handler issues its own PR_SET_PTRACER from inside the signal
     // handler, where the return value is unobservable. This one is checked, and
     // its result is what the yama scope-1 branch of the verdict turns on.
     let ptracer = caps::set_ptracer(monitor_pid).map_err(|err| err.raw_os_error().unwrap_or(-1));
-    let monitor_status = if alive {
-        probe::monitor_status(monitor_pid)
-    } else {
-        None
-    };
+    let monitor_status = probe::monitor_status(monitor_pid);
     let self_status = probe::self_status();
     let inputs = ProbeInputs {
         ptrace_scope: probe::ptrace_scope(),
@@ -190,6 +208,29 @@ fn install(dir: &Path) -> Init {
             retain,
         },
     )
+}
+
+/// Is the process holding the monitor's socket the monitor we spawned?
+///
+/// `SO_PEERCRED` on a fresh connection reports the credentials of whoever
+/// called `listen` on that name, so it identifies the binder rather than
+/// whoever answers. A name can be bound once: if the peer of a connection made
+/// now is our child, our child holds the name, and the client's earlier
+/// connection reached that same listener, because a monitor whose bind failed
+/// exits rather than retrying. The pid cannot have been recycled underneath the
+/// comparison either, since the child is still unreaped at this point.
+///
+/// The uid is compared too: a same-name, same-pid peer under another uid is not
+/// a shape this crate produces.
+fn monitor_identity_holds(socket: &str, monitor_pid: u32) -> bool {
+    match caps::peer_cred_of_abstract_socket(socket.as_bytes()) {
+        Ok(cred) => {
+            u32::try_from(cred.pid).is_ok_and(|pid| pid == monitor_pid)
+                && cred.uid == caps::effective_uid()
+        }
+        // Unreadable credentials are not evidence of identity.
+        Err(_) => false,
+    }
 }
 
 /// Give the capability back on the way out of a failed arm.

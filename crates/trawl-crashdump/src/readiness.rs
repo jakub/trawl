@@ -105,7 +105,9 @@ impl SelfStatus {
 pub struct ProbeInputs {
     /// `/proc/sys/kernel/yama/ptrace_scope`. `None` = unreadable or out of range.
     pub ptrace_scope: Option<u8>,
-    /// The monitor's status. `None` = unreadable, malformed, or the monitor already exited.
+    /// The monitor's status. `None` = unreadable or malformed. A monitor the
+    /// parent could not observe alive never reaches a verdict at all: it fails
+    /// the arm instead.
     pub monitor: Option<MonitorStatus>,
     /// The startup `prctl(PR_SET_PTRACER)`: `Some(Ok)` returned 0, `Some(Err(errno))`
     /// failed, `None` was not attempted.
@@ -151,8 +153,10 @@ pub fn classify(inputs: ProbeInputs) -> ReadinessClass {
         None => return Indeterminate,
         _ => {}
     }
-    // A monitor that already exited leaves no status to read. Guessing from a
-    // zombie's zeroed masks would report a denial that never happened.
+    // No status to read. The parent proved the monitor alive before reading it,
+    // so this is a `/proc` file that would not parse (or a monitor that died in
+    // between); guessing from a zombie's zeroed masks would report a denial that
+    // never happened.
     let Some(monitor) = inputs.monitor else {
         return Indeterminate;
     };
@@ -238,8 +242,13 @@ pub enum FailureReason {
     DumpDir,
     /// Spawning the monitor failed.
     SpawnMonitor,
-    /// The monitor never came up on its socket.
+    /// The monitor never came up on its socket, or it had already exited when
+    /// the parent went to use its pid.
     MonitorUnreachable,
+    /// Something other than the spawned monitor holds the socket name. The
+    /// abstract name has no permissions and is predictable, so a stranger can
+    /// bind it first; `SO_PEERCRED` says who actually did.
+    MonitorIdentity,
     /// `CrashHandler::attach` failed.
     AttachHandler,
     /// Dropping `CAP_SYS_PTRACE` or setting `no_new_privs` failed.
@@ -254,6 +263,7 @@ impl FailureReason {
             Self::DumpDir => "dump_dir",
             Self::SpawnMonitor => "spawn_monitor",
             Self::MonitorUnreachable => "monitor_unreachable",
+            Self::MonitorIdentity => "monitor_identity",
             Self::AttachHandler => "attach_handler",
             Self::Seal => "seal",
         }
@@ -612,5 +622,10 @@ mod tests {
         }
         assert_eq!(FailureReason::Seal.as_str(), "seal");
         assert_eq!(FailureReason::CurrentExe.as_str(), "current_exe");
+        assert_eq!(FailureReason::MonitorIdentity.as_str(), "monitor_identity");
+        assert_eq!(
+            FailureReason::MonitorUnreachable.as_str(),
+            "monitor_unreachable"
+        );
     }
 }
