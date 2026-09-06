@@ -190,26 +190,26 @@ finish_transcript() {
 # the first one's containers mid-crash. Take the lock BEFORE installing the
 # cleanup trap, so a refused run exits without running any teardown at all.
 #
-# The path is fixed and host-global on purpose. Those docker names are global to
-# the daemon, and the lock has to have the same reach as the thing it protects.
-# Under $XDG_RUNTIME_DIR it did not: two runs as different users, or one under a
-# session with the variable unset, would take locks on different files, both
-# succeed, and then destroy each other's containers.
-readonly LOCKFILE="/tmp/trawl-crashdump-harness.lock"
+# The lock lives in the per-user runtime directory, which systemd creates 0700
+# and owns. /tmp is not usable for this: it is world-writable, so any check that
+# the path is a plain file races the open that follows it, and another user can
+# plant a symlink in between. A directory only this uid can write removes the
+# race rather than narrowing it.
+#
+# The trade is real and worth naming. Two runs as DIFFERENT users take different
+# lock files and neither sees the other, while the docker names they fight over
+# are global to the daemon. The stale-resource sweep below covers that half: it
+# refuses to touch a container that is still running, so a mislocked second run
+# stops instead of killing a live one.
+runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+if [[ ! -d "$runtime_dir" ]]; then
+  echo "no runtime directory at $runtime_dir; refusing to run without a lock on a directory only this user can write" >&2
+  echo "(set XDG_RUNTIME_DIR to one, or run from a session that has /run/user/\$(id -u))" >&2
+  exit 2
+fi
+readonly LOCKFILE="$runtime_dir/trawl-crashdump-harness.lock"
 command -v flock >/dev/null 2>&1 \
   || { echo "flock is not installed; refusing to run without the concurrency lock" >&2; exit 2; }
-# /tmp is world-writable, so refuse anything that is not a plain file rather than
-# opening whatever a symlink points at. Residual: another user can still create
-# the file first and own it, which turns into the permission refusal below.
-if [[ -L "$LOCKFILE" || ( -e "$LOCKFILE" && ! -f "$LOCKFILE" ) ]]; then
-  echo "$LOCKFILE exists and is not a plain file; refusing to use it as a lock" >&2
-  exit 2
-fi
-if ! : >>"$LOCKFILE" 2>/dev/null; then
-  echo "cannot open $LOCKFILE for writing (owned by another user?); refusing to run" >&2
-  exit 2
-fi
-chmod 0644 "$LOCKFILE" 2>/dev/null || true
 exec 9>>"$LOCKFILE"
 if ! flock -n 9; then
   echo "another crashdump-harness.sh run holds $LOCKFILE; refusing to start" >&2
@@ -246,6 +246,12 @@ ORIG_SCOPE=""
 # The stub SPA index.html, when this run is the one that created it. Removed on
 # the way out so a harness run leaves no file behind in the tree it tested.
 STUB_CREATED=""
+# Docker objects THIS run created, recorded before each create. Teardown removes
+# only these. Removing by name alone would let a run that died early delete the
+# containers of a run under another account, whose lock this one cannot see:
+# same hazard the preflight sweep refuses, on the way out instead of in.
+CREATED_CONTAINERS=()
+CREATED_NETWORK=""
 # Set to 1 BEFORE the write, never after: a write that lands and then fails to
 # report, or a signal delivered mid-write, must still reach the restore path.
 SCOPE_MODIFIED=0
@@ -326,9 +332,15 @@ cleanup() {
 
   if [[ "$KEEP" == 1 ]]; then
     note "--keep: leaving $NODE, $PG and network $NET in place"
+  elif (( ${#CREATED_CONTAINERS[@]} == 0 )) && [[ -z "$CREATED_NETWORK" ]]; then
+    note "this run created no containers or networks; nothing to remove"
   else
-    runq docker rm -f "$NODE" "$PG" 2>/dev/null || true
-    runq docker network rm "$NET" 2>/dev/null || true
+    if (( ${#CREATED_CONTAINERS[@]} )); then
+      runq docker rm -f "${CREATED_CONTAINERS[@]}" 2>/dev/null || true
+    fi
+    if [[ -n "$CREATED_NETWORK" ]]; then
+      runq docker network rm "$CREATED_NETWORK" 2>/dev/null || true
+    fi
   fi
 
   printf '\n$ cat %s   # host, after restore\n' "$YAMA"
@@ -592,16 +604,25 @@ run dpkg-deb -f "$DEB" Package Version Architecture Depends
 
 phase "3 up"
 
-# The flock guarantees no other run owns these names, so anything still here is
-# debris from a run that was killed before its teardown, or from --keep. Clear
-# it rather than reusing it: a container left over from an earlier build would
-# quietly test the wrong .deb, and `docker network create` on an existing
-# network is a hard failure that leaves the operator to clean up by hand.
+# Anything still holding these names is debris from a run that was killed before
+# its teardown, or from --keep. Clear it rather than reusing it: a container left
+# over from an earlier build would quietly test the wrong .deb, and
+# `docker network create` on an existing network is a hard failure that leaves
+# the operator to clean up by hand.
+#
+# A RUNNING container is not debris. The lock is per user, so a run under another
+# account holds no lock this one can see, and its containers are exactly what
+# this sweep would find. Removing one would kill a live run mid-crash. Refuse
+# instead and name it: either it belongs to someone else, or --keep left it and
+# the operator can remove it deliberately.
 preflight=()
 for stale in "$NODE" "$PG"; do
   if docker inspect "$stale" >/dev/null 2>&1; then
+    if [[ "$(docker inspect -f '{{.State.Running}}' "$stale" 2>/dev/null)" == "true" ]]; then
+      die "container $stale is RUNNING. Another run may own it, or --keep left it behind. Remove it with 'docker rm -f $stale' once you are sure nothing is using it."
+    fi
     docker rm -f "$stale" >/dev/null 2>&1 || true
-    preflight+=("container $stale")
+    preflight+=("container $stale (was not running)")
   fi
 done
 if docker network inspect "$NET" >/dev/null 2>&1; then
@@ -612,9 +633,11 @@ if (( ${#preflight[@]} )); then
   note "removed leftovers from an earlier run: ${preflight[*]}"
 fi
 
+CREATED_NETWORK="$NET"
 runq docker network create "$NET"
 
 printf '\n$ docker run -d --name %s --network %s %s\n' "$PG" "$NET" "$POSTGRES_IMAGE"
+CREATED_CONTAINERS+=("$PG")
 docker run -d --name "$PG" --network "$NET" \
   -e POSTGRES_PASSWORD=harness -e POSTGRES_USER=postgres -e POSTGRES_DB=postgres \
   "$POSTGRES_IMAGE" >/dev/null
@@ -648,6 +671,7 @@ EOF
 
 printf '\n$ docker run -d --name %s --privileged --cgroupns=private --tmpfs /run --tmpfs /tmp --network %s %s /sbin/init\n' \
   "$NODE" "$NET" "$NODE_IMAGE"
+CREATED_CONTAINERS+=("$NODE")
 docker run -d --name "$NODE" --privileged --cgroupns=private \
   --tmpfs /run --tmpfs /tmp --network "$NET" \
   "$NODE_IMAGE" /sbin/init >/dev/null
