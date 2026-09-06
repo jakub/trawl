@@ -532,8 +532,11 @@ EOF
     note "SPA dist present at $dist (not stubbed)"
   else
     mkdir -p "$dist"
-    printf '%s\n' '<!doctype html><title>trawl</title><p>crashdump-harness stub SPA</p>' > "$dist/index.html"
+    # Marked before the write, like SCOPE_MODIFIED: a run interrupted between
+    # the two would otherwise leave a half-written file in the tree with nothing
+    # recording that this run put it there.
     STUB_CREATED="$dist/index.html"
+    printf '%s\n' '<!doctype html><title>trawl</title><p>crashdump-harness stub SPA</p>' > "$dist/index.html"
     note "STUBBED the SPA: wrote a one-line placeholder to $dist/index.html"
     note "the embedded web UI in this .deb is a stub, not a real build"
     note "this run created it, so teardown removes it again"
