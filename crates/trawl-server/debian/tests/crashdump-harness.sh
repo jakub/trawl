@@ -1001,8 +1001,15 @@ cat /etc/systemd/system/trawld.service.d/crashdump.conf"
       printf '\n$ /root/mdmp-summary %s\n' "$p"
       dump_summary "$p"
       neg_threads=$(dump_field "$p" threads)
+      neg_mem=$(dump_field "$p" memory_regions)
       (( neg_threads == 0 )) \
         || die "negative control: $p captured $neg_threads threads without CAP_SYS_PTRACE — the capability line is not load-bearing, or the drop-in did not take effect"
+      # Both streams, because the outcome line below claims both. Thread state
+      # and memory ranges are separate ptrace reads, and a dump carrying stacks
+      # without a thread list would still be a dump the denial should have
+      # prevented.
+      (( neg_mem == 0 )) \
+        || die "negative control: $p captured $neg_mem memory regions without CAP_SYS_PTRACE"
     done
     note "outcome: ${#neg_new_paths[@]} file(s) appeared, all with 0 threads and 0 memory regions"
   fi
