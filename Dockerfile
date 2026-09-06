@@ -14,6 +14,13 @@ RUN apt-get update \
 
 COPY docker-ctx/${TARGETARCH}/trawld docker-ctx/${TARGETARCH}/trawl-admin docker-ctx/${TARGETARCH}/fleet-admin docker-ctx/${TARGETARCH}/trawl-web /usr/bin/
 
+# trawld-file-capability: cap_sys_ptrace=p
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libcap2-bin \
+    && setcap cap_sys_ptrace+p /usr/bin/trawld \
+    && [ "$(getcap /usr/bin/trawld)" = "/usr/bin/trawld cap_sys_ptrace=p" ] \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN groupadd -r trawl \
     && useradd -r -g trawl -s /usr/sbin/nologin -d /var/lib/trawl trawl \
     && mkdir -p /var/lib/trawl /etc/trawl \
