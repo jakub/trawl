@@ -5,12 +5,12 @@
   working tree is clean
 
 $ git -C $REPO rev-parse HEAD
-21ef0c26b9fb0e7114ddef5c3ff5bccc9fd81471
+9fdfa4fab53f98e181f1b2763fe1e0648c20096e
 
-argv: crashdump-harness.sh --allow-host-sysctl --out /tmp/crashdump-evidence-21ef0c26.txt
+argv: crashdump-harness.sh --allow-host-sysctl --out /tmp/crashdump-evidence-round3.txt
 
 $ date -u
-Sun Sep  6 01:13:36 AM UTC 2026
+Sun Sep  6 01:47:53 AM UTC 2026
 
 $ uname -r
 7.2.3-1-cachyos
@@ -33,7 +33,7 @@ $ cat /proc/sys/kernel/yama/ptrace_scope   # host, before anything runs
 
 
 $ docker build trawl-crashdump-builder:cargo-deb-3.8.0   # FROM rust:1.98-trixie@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959
-  sha256:e0be7c56705c80db19b5ea58a9c38ca98e82c2f3026c90b00bb8b5104034968e
+  sha256:8d84251c2395187c9dfdd2f4ee92b6a13418d3fc8cddb33a834ee96f739d62b2
 
 $ docker volume create trawl-crashdump-cargo-registry
   cargo registry cache: docker volume trawl-crashdump-cargo-registry at /usr/local/cargo/registry
@@ -48,13 +48,15 @@ $ docker run --rm --user 1000:1000 -v $REPO:/w -w /w -v trawl-crashdump-cargo-re
    Compiling trawl-engine v0.4.0 (/w/crates/trawl-engine)
    Compiling trawl-server v0.4.0 (/w/crates/trawl-server)
    Compiling trawl-admin v0.4.0 (/w/crates/trawl-admin)
-    Finished `release` profile [optimized] target(s) in 35.51s
+    Finished `release` profile [optimized] target(s) in 35.27s
+  clearing .deb files left in $REPO/target/deb-harness/debian by an earlier run
 
 $ docker run --rm --user 1000:1000 -v $REPO:/w -w /w -v trawl-crashdump-cargo-registry:/usr/local/cargo/registry -e CARGO_TARGET_DIR=/w/target/deb-harness trawl-crashdump-builder:cargo-deb-3.8.0 cargo deb -p trawl-server --no-build --no-strip
 /w/target/deb-harness/debian/trawl-server_0.4.0-1_amd64.deb
+  installing trawl-server_0.4.0-1_amd64.deb
 
 $ sha256sum $REPO/target/deb-harness/debian/trawl-server_0.4.0-1_amd64.deb
-af31c6f0e397fb2fe90e948eab72f9a3d744ff5e8b4749b8baa66e1a265aa2f1  $REPO/target/deb-harness/debian/trawl-server_0.4.0-1_amd64.deb
+f86fe061289fa1b4d2f9e78551309255a6128927bdd8dfd3917c924b4fe912bc  $REPO/target/deb-harness/debian/trawl-server_0.4.0-1_amd64.deb
 
 $ dpkg-deb -f $REPO/target/deb-harness/debian/trawl-server_0.4.0-1_amd64.deb Package Version Architecture Depends
 Package: trawl-server
@@ -78,7 +80,7 @@ CREATE ROLE
 CREATE DATABASE
 
 $ docker build trawl-crashdump-node:trixie   # FROM debian:trixie@sha256:f324c7ff54321e8d9c588493a20244965938ce0aa50bbd1022d38010e9ffc4b1
-  sha256:c0cc5500e931e55cbfdbba1ce4a88152cae5e5daac6747d20d956c243936d81b
+  sha256:0f65f4faed0c41302466cf07545ea8781032e2a4df791bf3686d8502342115e6
 
 $ docker run -d --name trawl-crashdump-node --privileged --cgroupns=private --tmpfs /run --tmpfs /tmp --network trawl-crashdump-net trawl-crashdump-node:trixie /sbin/init
   systemd up in trawl-crashdump-node after 2s
@@ -137,7 +139,7 @@ $ docker exec trawl-crashdump-node systemctl restart trawld
   trawld is-active=active after 1s
 
 $ docker exec trawl-crashdump-node systemctl show trawld -p MainPID -p ActiveState -p SubState
-MainPID=258
+MainPID=260
 ActiveState=active
 SubState=running
 
@@ -151,11 +153,27 @@ AmbientCapabilities=
 
 $ test -e /etc/systemd/system/trawld.service.d
   absent — the package installs no drop-in
-  trawld   pid=258    CapEff=0x0000000000000000 bit19=0  CapAmb=0x0000000000000000 bit19=0  NoNewPrivs=1
+  trawld   pid=260    CapEff=0x0000000000000000 bit19=0  CapAmb=0x0000000000000000 bit19=0  NoNewPrivs=1
   CAP_SYS_PTRACE (bit 19) is clear in both CapEff and CapAmb
 
 $ docker exec trawl-crashdump-node stat -c %F %U %G %a /var/lib/trawl/cores
 directory trawl trawl 700
+
+$ docker exec trawl-crashdump-node systemctl show trawl-web -p InaccessiblePaths
+InaccessiblePaths=/var/lib/trawl/cores
+
+$ docker exec trawl-crashdump-node systemctl restart trawl-web
+  trawl-web is-active=active after 1s
+
+[trawl-crashdump-node]
+$ install -o trawl -g trawl -m 0600 /dev/null /var/lib/trawl/cores/sentinel-not-a-dump
+$ printf 'real directory:      '; ls -A /var/lib/trawl/cores | tr '\n' ' '; echo
+$ printf 'trawl-web sees:      '; ls -A /proc/379/root/var/lib/trawl/cores | tr '\n' ' '; echo '(nothing)'
+$ stat -c 'web.cookie in that namespace: %n %U %a' /proc/379/root/var/lib/trawl/web.cookie
+real directory:      sentinel-not-a-dump 
+trawl-web sees:      (nothing)
+web.cookie in that namespace: /proc/379/root/var/lib/trawl/web.cookie trawl 400
+  the sentinel is invisible inside trawl-web's mount namespace, web.cookie is not
 
 
 ## phase 6 B enable
@@ -187,31 +205,31 @@ $ docker exec trawl-crashdump-node cat /proc/sys/kernel/yama/ptrace_scope
 1
   monitor process found after 1s
 
-$ tr "\0" "\n" < /proc/470/environ | grep TRAWL_CRASHDUMP_MONITOR
+$ tr "\0" "\n" < /proc/655/environ | grep TRAWL_CRASHDUMP_MONITOR
 TRAWL_CRASHDUMP_MONITOR=1
 
 capabilities (bit 19 = CAP_SYS_PTRACE):
-  daemon   pid=461    CapEff=0x0000000000080000 bit19=1  CapAmb=0x0000000000080000 bit19=1  NoNewPrivs=1
-  monitor  pid=470    CapEff=0x0000000000080000 bit19=1  CapAmb=0x0000000000080000 bit19=1  NoNewPrivs=1
+  daemon   pid=646    CapEff=0x0000000000080000 bit19=1  CapAmb=0x0000000000080000 bit19=1  NoNewPrivs=1
+  monitor  pid=655    CapEff=0x0000000000080000 bit19=1  CapAmb=0x0000000000080000 bit19=1  NoNewPrivs=1
   dumps before the fault: 0   NRestarts=0
 
-$ docker exec trawl-crashdump-node gdb -q -n -batch -p 461 -ex 'set $pc = 0' -ex detach
+$ docker exec trawl-crashdump-node gdb -q -n -batch -p 646 -ex 'set $pc = 0' -ex detach
 Using host libthread_db library "/lib/x86_64-linux-gnu/libthread_db.so.1".
-0x00007fcdf8a409ee in ?? () from target:/lib/x86_64-linux-gnu/libc.so.6
-[Inferior 1 (process 461) detached]
+0x00007ff2f3e347b9 in syscall () from target:/lib/x86_64-linux-gnu/libc.so.6
+[Inferior 1 (process 646) detached]
   a new dump appeared after 1s
 
-$ /root/mdmp-summary /var/lib/trawl/cores/trawld-crash-1788657269193137251.dmp
-path=/var/lib/trawl/cores/trawld-crash-1788657269193137251.dmp magic=MDMP bytes=723497 owner=trawl:trawl mode=600 streams=18 threads=33 memory_regions=33
-  scope 1: dumps 0 -> 1, 33 threads captured
+$ /root/mdmp-summary /var/lib/trawl/cores/trawld-crash-1788659328230692210.dmp
+path=/var/lib/trawl/cores/trawld-crash-1788659328230692210.dmp magic=MDMP bytes=701963 owner=trawl:trawl mode=600 streams=18 threads=34 memory_regions=34
+  scope 1: dumps 0 -> 1, 34 threads captured
 
 [trawl-crashdump-node]
 $ journalctl -u trawld --no-pager --since '-3min' | grep -iE 'crashdump|minidump|FATAL signal|Main process exited|Scheduled restart' | tail -12
-Sep 06 01:14:28 0eee13ae84fd trawld[392]: trawl-crashdump: enabled (dir=/var/lib/trawl/cores, retain=10)
-Sep 06 01:14:28 0eee13ae84fd trawld[461]: trawl-crashdump: enabled (dir=/var/lib/trawl/cores, retain=10)
-Sep 06 01:14:29 0eee13ae84fd trawld[461]: trawld: FATAL signal caught - writing minidump to crash-dump dir
-Sep 06 01:14:29 0eee13ae84fd trawld[470]: trawl-crashdump: wrote minidump /var/lib/trawl/cores/trawld-crash-1788657269193137251.dmp
-Sep 06 01:14:29 0eee13ae84fd systemd[1]: trawld.service: Main process exited, code=killed, status=11/SEGV
+Sep 06 01:48:47 d5c7b7f59333 trawld[556]: trawl-crashdump: enabled (dir=/var/lib/trawl/cores, retain=10)
+Sep 06 01:48:47 d5c7b7f59333 trawld[646]: trawl-crashdump: enabled (dir=/var/lib/trawl/cores, retain=10)
+Sep 06 01:48:48 d5c7b7f59333 trawld[646]: trawld: FATAL signal caught - writing minidump to crash-dump dir
+Sep 06 01:48:48 d5c7b7f59333 trawld[655]: trawl-crashdump: wrote minidump /var/lib/trawl/cores/trawld-crash-1788659328230692210.dmp
+Sep 06 01:48:48 d5c7b7f59333 systemd[1]: trawld.service: Main process exited, code=killed, status=11/SEGV
   trawld is-active=active after 6s
   NRestarts 0 -> 1 (Restart=on-failure brought trawld back)
 
@@ -232,37 +250,37 @@ $ docker exec trawl-crashdump-node cat /proc/sys/kernel/yama/ptrace_scope
 2
   monitor process found after 1s
 
-$ tr "\0" "\n" < /proc/1636/environ | grep TRAWL_CRASHDUMP_MONITOR
+$ tr "\0" "\n" < /proc/1792/environ | grep TRAWL_CRASHDUMP_MONITOR
 TRAWL_CRASHDUMP_MONITOR=1
 
 capabilities (bit 19 = CAP_SYS_PTRACE):
-  daemon   pid=1627   CapEff=0x0000000000080000 bit19=1  CapAmb=0x0000000000080000 bit19=1  NoNewPrivs=1
-  monitor  pid=1636   CapEff=0x0000000000080000 bit19=1  CapAmb=0x0000000000080000 bit19=1  NoNewPrivs=1
+  daemon   pid=1783   CapEff=0x0000000000080000 bit19=1  CapAmb=0x0000000000080000 bit19=1  NoNewPrivs=1
+  monitor  pid=1792   CapEff=0x0000000000080000 bit19=1  CapAmb=0x0000000000080000 bit19=1  NoNewPrivs=1
   dumps before the fault: 1   NRestarts=0
 
-$ docker exec trawl-crashdump-node gdb -q -n -batch -p 1627 -ex 'set $pc = 0' -ex detach
+$ docker exec trawl-crashdump-node gdb -q -n -batch -p 1783 -ex 'set $pc = 0' -ex detach
 Using host libthread_db library "/lib/x86_64-linux-gnu/libthread_db.so.1".
-0x00007f1ce4de07b9 in syscall () from target:/lib/x86_64-linux-gnu/libc.so.6
-[Inferior 1 (process 1627) detached]
+0x00007f074aac97b9 in syscall () from target:/lib/x86_64-linux-gnu/libc.so.6
+[Inferior 1 (process 1783) detached]
   a new dump appeared after 1s
 
-$ /root/mdmp-summary /var/lib/trawl/cores/trawld-crash-1788657275642362783.dmp
-path=/var/lib/trawl/cores/trawld-crash-1788657275642362783.dmp magic=MDMP bytes=710600 owner=trawl:trawl mode=600 streams=18 threads=35 memory_regions=35
-  scope 2: dumps 1 -> 2, 35 threads captured
+$ /root/mdmp-summary /var/lib/trawl/cores/trawld-crash-1788659334713310785.dmp
+path=/var/lib/trawl/cores/trawld-crash-1788659334713310785.dmp magic=MDMP bytes=683660 owner=trawl:trawl mode=600 streams=18 threads=33 memory_regions=33
+  scope 2: dumps 1 -> 2, 33 threads captured
 
 [trawl-crashdump-node]
 $ journalctl -u trawld --no-pager --since '-3min' | grep -iE 'crashdump|minidump|FATAL signal|Main process exited|Scheduled restart' | tail -12
-Sep 06 01:14:28 0eee13ae84fd trawld[392]: trawl-crashdump: enabled (dir=/var/lib/trawl/cores, retain=10)
-Sep 06 01:14:28 0eee13ae84fd trawld[461]: trawl-crashdump: enabled (dir=/var/lib/trawl/cores, retain=10)
-Sep 06 01:14:29 0eee13ae84fd trawld[461]: trawld: FATAL signal caught - writing minidump to crash-dump dir
-Sep 06 01:14:29 0eee13ae84fd trawld[470]: trawl-crashdump: wrote minidump /var/lib/trawl/cores/trawld-crash-1788657269193137251.dmp
-Sep 06 01:14:29 0eee13ae84fd systemd[1]: trawld.service: Main process exited, code=killed, status=11/SEGV
-Sep 06 01:14:34 0eee13ae84fd systemd[1]: trawld.service: Scheduled restart job, restart counter is at 1.
-Sep 06 01:14:34 0eee13ae84fd trawld[1470]: trawl-crashdump: enabled (dir=/var/lib/trawl/cores, retain=10)
-Sep 06 01:14:35 0eee13ae84fd trawld[1627]: trawl-crashdump: enabled (dir=/var/lib/trawl/cores, retain=10)
-Sep 06 01:14:35 0eee13ae84fd trawld[1627]: trawld: FATAL signal caught - writing minidump to crash-dump dir
-Sep 06 01:14:35 0eee13ae84fd trawld[1636]: trawl-crashdump: wrote minidump /var/lib/trawl/cores/trawld-crash-1788657275642362783.dmp
-Sep 06 01:14:35 0eee13ae84fd systemd[1]: trawld.service: Main process exited, code=killed, status=11/SEGV
+Sep 06 01:48:47 d5c7b7f59333 trawld[556]: trawl-crashdump: enabled (dir=/var/lib/trawl/cores, retain=10)
+Sep 06 01:48:47 d5c7b7f59333 trawld[646]: trawl-crashdump: enabled (dir=/var/lib/trawl/cores, retain=10)
+Sep 06 01:48:48 d5c7b7f59333 trawld[646]: trawld: FATAL signal caught - writing minidump to crash-dump dir
+Sep 06 01:48:48 d5c7b7f59333 trawld[655]: trawl-crashdump: wrote minidump /var/lib/trawl/cores/trawld-crash-1788659328230692210.dmp
+Sep 06 01:48:48 d5c7b7f59333 systemd[1]: trawld.service: Main process exited, code=killed, status=11/SEGV
+Sep 06 01:48:53 d5c7b7f59333 systemd[1]: trawld.service: Scheduled restart job, restart counter is at 1.
+Sep 06 01:48:53 d5c7b7f59333 trawld[1681]: trawl-crashdump: enabled (dir=/var/lib/trawl/cores, retain=10)
+Sep 06 01:48:54 d5c7b7f59333 trawld[1783]: trawl-crashdump: enabled (dir=/var/lib/trawl/cores, retain=10)
+Sep 06 01:48:54 d5c7b7f59333 trawld[1783]: trawld: FATAL signal caught - writing minidump to crash-dump dir
+Sep 06 01:48:54 d5c7b7f59333 trawld[1792]: trawl-crashdump: wrote minidump /var/lib/trawl/cores/trawld-crash-1788659334713310785.dmp
+Sep 06 01:48:54 d5c7b7f59333 systemd[1]: trawld.service: Main process exited, code=killed, status=11/SEGV
   trawld is-active=active after 6s
   NRestarts 0 -> 1 (Restart=on-failure brought trawld back)
 
@@ -299,37 +317,37 @@ $ docker exec trawl-crashdump-node systemctl show trawld -p AmbientCapabilities 
 Environment=TRAWL_CRASH_DUMP_DIR=/var/lib/trawl/cores TRAWL_CRASH_DUMP_RETAIN=10
 AmbientCapabilities=
   monitor process found after 1s
-  daemon   pid=2775   CapEff=0x0000000000000000 bit19=0  CapAmb=0x0000000000000000 bit19=0  NoNewPrivs=1
-  monitor  pid=2784   CapEff=0x0000000000000000 bit19=0  CapAmb=0x0000000000000000 bit19=0  NoNewPrivs=1
+  daemon   pid=2929   CapEff=0x0000000000000000 bit19=0  CapAmb=0x0000000000000000 bit19=0  NoNewPrivs=1
+  monitor  pid=2938   CapEff=0x0000000000000000 bit19=0  CapAmb=0x0000000000000000 bit19=0  NoNewPrivs=1
   dumps before the fault: 2   NRestarts=0
 
-$ docker exec trawl-crashdump-node gdb -q -n -batch -p 2775 -ex 'set $pc = 0' -ex detach
+$ docker exec trawl-crashdump-node gdb -q -n -batch -p 2929 -ex 'set $pc = 0' -ex detach
 Using host libthread_db library "/lib/x86_64-linux-gnu/libthread_db.so.1".
-0x00007f8da9b377b9 in syscall () from target:/lib/x86_64-linux-gnu/libc.so.6
-[Inferior 1 (process 2775) detached]
-  faulted pid 2775 is gone after 1s
+0x00007f476ab327b9 in syscall () from target:/lib/x86_64-linux-gnu/libc.so.6
+[Inferior 1 (process 2929) detached]
+  faulted pid 2929 is gone after 1s
   systemd restarted the unit after 6s
   settling 15s before judging (a working capture lands within a second of the fault)
   1 new dump(s) from this crash; every one must be empty of thread data
 
-$ /root/mdmp-summary /var/lib/trawl/cores/trawld-crash-1788657282161344800.dmp
-path=/var/lib/trawl/cores/trawld-crash-1788657282161344800.dmp magic=MDMP bytes=71023 owner=trawl:trawl mode=600 streams=18 threads=0 memory_regions=0
+$ /root/mdmp-summary /var/lib/trawl/cores/trawld-crash-1788659341291125149.dmp
+path=/var/lib/trawl/cores/trawld-crash-1788659341291125149.dmp magic=MDMP bytes=70993 owner=trawl:trawl mode=600 streams=18 threads=0 memory_regions=0
   outcome: 1 file(s) appeared, all with 0 threads and 0 memory regions
 
 [trawl-crashdump-node]
 $ journalctl -u trawld --no-pager --since '-3min' | grep -iE 'crashdump|minidump|FATAL signal|Main process exited|Scheduled restart' | tail -12
-Sep 06 01:14:35 0eee13ae84fd trawld[1627]: trawl-crashdump: enabled (dir=/var/lib/trawl/cores, retain=10)
-Sep 06 01:14:35 0eee13ae84fd trawld[1627]: trawld: FATAL signal caught - writing minidump to crash-dump dir
-Sep 06 01:14:35 0eee13ae84fd trawld[1636]: trawl-crashdump: wrote minidump /var/lib/trawl/cores/trawld-crash-1788657275642362783.dmp
-Sep 06 01:14:35 0eee13ae84fd systemd[1]: trawld.service: Main process exited, code=killed, status=11/SEGV
-Sep 06 01:14:40 0eee13ae84fd systemd[1]: trawld.service: Scheduled restart job, restart counter is at 1.
-Sep 06 01:14:40 0eee13ae84fd trawld[2656]: trawl-crashdump: enabled (dir=/var/lib/trawl/cores, retain=10)
-Sep 06 01:14:41 0eee13ae84fd trawld[2775]: trawl-crashdump: enabled (dir=/var/lib/trawl/cores, retain=10)
-Sep 06 01:14:42 0eee13ae84fd trawld[2775]: trawld: FATAL signal caught - writing minidump to crash-dump dir
-Sep 06 01:14:42 0eee13ae84fd trawld[2784]: trawl-crashdump: wrote minidump /var/lib/trawl/cores/trawld-crash-1788657282161344800.dmp
-Sep 06 01:14:42 0eee13ae84fd systemd[1]: trawld.service: Main process exited, code=killed, status=11/SEGV
-Sep 06 01:14:47 0eee13ae84fd systemd[1]: trawld.service: Scheduled restart job, restart counter is at 1.
-Sep 06 01:14:47 0eee13ae84fd trawld[2981]: trawl-crashdump: enabled (dir=/var/lib/trawl/cores, retain=10)
+Sep 06 01:48:54 d5c7b7f59333 trawld[1783]: trawl-crashdump: enabled (dir=/var/lib/trawl/cores, retain=10)
+Sep 06 01:48:54 d5c7b7f59333 trawld[1783]: trawld: FATAL signal caught - writing minidump to crash-dump dir
+Sep 06 01:48:54 d5c7b7f59333 trawld[1792]: trawl-crashdump: wrote minidump /var/lib/trawl/cores/trawld-crash-1788659334713310785.dmp
+Sep 06 01:48:54 d5c7b7f59333 systemd[1]: trawld.service: Main process exited, code=killed, status=11/SEGV
+Sep 06 01:48:59 d5c7b7f59333 systemd[1]: trawld.service: Scheduled restart job, restart counter is at 1.
+Sep 06 01:48:59 d5c7b7f59333 trawld[2810]: trawl-crashdump: enabled (dir=/var/lib/trawl/cores, retain=10)
+Sep 06 01:49:00 d5c7b7f59333 trawld[2929]: trawl-crashdump: enabled (dir=/var/lib/trawl/cores, retain=10)
+Sep 06 01:49:01 d5c7b7f59333 trawld[2929]: trawld: FATAL signal caught - writing minidump to crash-dump dir
+Sep 06 01:49:01 d5c7b7f59333 trawld[2938]: trawl-crashdump: wrote minidump /var/lib/trawl/cores/trawld-crash-1788659341291125149.dmp
+Sep 06 01:49:01 d5c7b7f59333 systemd[1]: trawld.service: Main process exited, code=killed, status=11/SEGV
+Sep 06 01:49:06 d5c7b7f59333 systemd[1]: trawld.service: Scheduled restart job, restart counter is at 1.
+Sep 06 01:49:06 d5c7b7f59333 trawld[3134]: trawl-crashdump: enabled (dir=/var/lib/trawl/cores, retain=10)
   restoring the shipped drop-in
 
 [trawl-crashdump-node]
