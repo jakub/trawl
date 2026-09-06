@@ -87,6 +87,9 @@ readonly DEB_IN_NODE="/root/trawl-server.deb"
 # also has to cover the restart that follows.
 readonly DUMP_WAIT_SECS=45
 readonly ACTIVE_WAIT_SECS=60
+# Grace after the negative control's crash has fully played out (faulted pid
+# gone, unit restarted) before enumerating dumps.
+readonly NEG_SETTLE_SECS=15
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)
 readonly repo_root
@@ -337,6 +340,11 @@ caps_report() { # caps_report <pid> <label>
 
 dump_count() { nshq "ls -1 $CORES/*.dmp 2>/dev/null | wc -l" | tr -d ' \r'; }
 newest_dump() { nshq "ls -1t $CORES/*.dmp 2>/dev/null | head -1" | tr -d '\r'; }
+# One path per line, empty when there are none. Comparing path sets is exact,
+# where "the newest file" is a guess that happens to be right most of the time.
+dump_paths() { nshq "ls -1 $CORES/*.dmp 2>/dev/null | sort" || true; }
+
+nrestarts() { docker exec "$NODE" systemctl show trawld -p NRestarts --value | tr -d ' \r'; }
 
 # A minidump that could not ptrace its target still parses: minidump-writer
 # treats a failed PTRACE_ATTACH as a soft error and drops the thread. So the
@@ -769,19 +777,20 @@ fi
 if (( NEGATIVE_READY )); then
   # What this proves, and what it does NOT prove.
   #
-  # The docs say a half-applied drop-in gives you "the stderr breadcrumb and no
-  # .dmp". That is not what happens with minidump-writer 0.13: a failed
-  # PTRACE_ATTACH is a SOFT error, so the thread is dropped from the dump and
-  # the writer reports success anyway. You still get a file, still get
-  # "wrote minidump" in the journal, and only the contents give it away — zero
-  # threads, zero memory regions, about a tenth the size. Silent denial, worse
-  # than documented, because the artifact looks fine until you open it.
+  # The docs used to say a half-applied drop-in gives you the stderr breadcrumb
+  # and no .dmp. That is not what happens with minidump-writer 0.13. A failed
+  # PTRACE_ATTACH is a SOFT error there, so the thread is dropped from the dump
+  # and the writer still reports success. You get a file, you get "wrote
+  # minidump" in the journal, and only the contents give it away: zero threads,
+  # zero memory regions, about a tenth the size. Silent denial, worse than the
+  # documented kind, because the artifact looks fine until you open it.
   cat <<'EOF'
 
   Control: the same drop-in with AmbientCapabilities removed. The two
   Environment lines stay, so trawld still starts its monitor and still logs
-  "trawl-crashdump: enabled". The assertion is that no dump carrying THREAD
-  DATA appears — a zero-thread file is a pass, and is what actually happens.
+  "trawl-crashdump: enabled". The assertion is that NO dump created by this
+  crash carries thread data. A zero-thread file is a pass, and is what
+  actually happens.
 EOF
 
   nsh "cat > /etc/systemd/system/trawld.service.d/crashdump.conf <<'EOF'
@@ -804,26 +813,49 @@ cat /etc/systemd/system/trawld.service.d/crashdump.conf"
   [[ "$(cap_bit "$neg_pid" CapEff)" == 0 ]] || die "the control still grants the daemon CAP_SYS_PTRACE"
   [[ "$(cap_bit "$neg_mon" CapEff)" == 0 ]] || die "the control still grants the monitor CAP_SYS_PTRACE"
 
-  neg_before=$(dump_count)
-  note "dumps before the fault: $neg_before"
+  mapfile -t neg_before_paths < <(dump_paths)
+  neg_restarts_before=$(nrestarts)
+  note "dumps before the fault: ${#neg_before_paths[@]}   NRestarts=$neg_restarts_before"
+
   force_fault "$neg_pid"
 
-  # Long enough that a working capture would certainly have landed: the positive
-  # cases above take a couple of seconds.
-  note "waiting ${DUMP_WAIT_SECS}s for a dump that should not be usable"
-  sleep "$DUMP_WAIT_SECS"
+  # Judge only once the crash has fully played out. Sleeping a flat window and
+  # looking is how you end up asserting "no dump" against a process that had not
+  # died yet. The dump, if there is one, is written before the process dies:
+  # the crash handler blocks on the monitor's ack.
+  wait_for "$DUMP_WAIT_SECS" "faulted pid $neg_pid is gone" \
+    "! docker exec $NODE test -d /proc/$neg_pid" \
+    || die "pid $neg_pid never exited after the fault"
+  wait_for "$DUMP_WAIT_SECS" "systemd restarted the unit" \
+    "(( \$(docker exec $NODE systemctl show trawld -p NRestarts --value | tr -d ' \r') > $neg_restarts_before ))" \
+    || die "systemd did not restart trawld after the negative-control fault"
+  note "settling ${NEG_SETTLE_SECS}s before judging (a working capture lands within a second of the fault)"
+  sleep "$NEG_SETTLE_SECS"
 
-  neg_after=$(dump_count)
-  if (( neg_after == neg_before )); then
-    note "outcome: no new dump at all (the docs' stated failure mode)"
+  # Every file this crash produced, not just the newest. If the monitor wrote
+  # more than one, a single good dump among them still disproves the control.
+  mapfile -t neg_after_paths < <(dump_paths)
+  neg_new_paths=()
+  for p in "${neg_after_paths[@]}"; do
+    seen=0
+    for q in "${neg_before_paths[@]}"; do
+      [[ "$p" == "$q" ]] && { seen=1; break; }
+    done
+    (( seen )) || neg_new_paths+=("$p")
+  done
+
+  if (( ${#neg_new_paths[@]} == 0 )); then
+    note "outcome: no new dump at all"
   else
-    neg_newest=$(newest_dump)
-    printf '\n$ /root/mdmp-summary %s\n' "$neg_newest"
-    dump_summary "$neg_newest"
-    neg_threads=$(dump_field "$neg_newest" threads)
-    (( neg_threads == 0 )) \
-      || die "negative control captured $neg_threads threads without CAP_SYS_PTRACE — the capability line is not load-bearing, or the drop-in did not take effect"
-    note "outcome: a file appeared but captured 0 threads and 0 memory regions — an unusable dump"
+    note "${#neg_new_paths[@]} new dump(s) from this crash; every one must be empty of thread data"
+    for p in "${neg_new_paths[@]}"; do
+      printf '\n$ /root/mdmp-summary %s\n' "$p"
+      dump_summary "$p"
+      neg_threads=$(dump_field "$p" threads)
+      (( neg_threads == 0 )) \
+        || die "negative control: $p captured $neg_threads threads without CAP_SYS_PTRACE — the capability line is not load-bearing, or the drop-in did not take effect"
+    done
+    note "outcome: ${#neg_new_paths[@]} file(s) appeared, all with 0 threads and 0 memory regions"
   fi
   journal_crash_lines
 
