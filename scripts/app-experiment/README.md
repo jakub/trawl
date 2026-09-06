@@ -318,7 +318,10 @@ still exist. Query-only instances
 cannot perform that recovery. A failed startup marker scan also refuses
 reads and requires a restart after the filesystem problem is fixed.
 Confirmed missing paths, including dangling directory links, do not count
-as scan failures. An unreadable existing directory still does.
+as scan failures. An unreadable existing directory still does. A failed
+startup scan also stops WAL compaction and repin admission. Ingestion can
+continue writing durable WAL, so repair the filesystem problem and restart
+the daemon before accumulated WAL consumes the available disk space.
 
 Repin also refuses to scan or build while a rollup needs recovery. Let
 compaction finish recovery before retrying the repin experiment. The

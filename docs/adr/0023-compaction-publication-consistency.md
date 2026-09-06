@@ -51,8 +51,10 @@ or the corpus guard.
 
 The startup scan skips confirmed missing paths, including dangling links.
 It refuses reads when an existing path cannot be inspected, since that path
-could hide an unfinished rollup marker. Repairing a scan failure requires
-a restart; repairing a known pending rollup lets the next read proceed.
+could hide an unfinished rollup marker. This also stops WAL compaction and
+repin admission. Ingestion can still write durable WAL, so disk usage can
+grow until the filesystem problem is repaired and the daemon restarts.
+Repairing a known pending rollup lets the next read proceed without restart.
 
 The guarantee covers compaction and rollup in one daemon. It does not
 deduplicate accepted payloads, client retries, or WAL replay after a crash.
