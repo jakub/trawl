@@ -245,9 +245,10 @@ pub enum FailureReason {
     /// The monitor never came up on its socket, or it had already exited when
     /// the parent went to use its pid.
     MonitorUnreachable,
-    /// Something other than the spawned monitor holds the socket name. The
+    /// The dump client's connection does not reach the spawned monitor. The
     /// abstract name has no permissions and is predictable, so a stranger can
-    /// bind it first; `SO_PEERCRED` says who actually did.
+    /// bind it first and accept that connection; `SO_PEERCRED` on the
+    /// descriptor the client holds says who received it.
     MonitorIdentity,
     /// `CrashHandler::attach` failed.
     AttachHandler,

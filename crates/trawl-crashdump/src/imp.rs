@@ -18,7 +18,9 @@
 //!   process dies with the original signal (exit 139 for `SIGSEGV`).
 //! - the monitor exits when the client disconnects (parent died or shut down).
 
+use std::collections::BTreeMap;
 use std::fs::{DirBuilder, File, OpenOptions};
+use std::os::fd::RawFd;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -125,7 +127,7 @@ fn install(dir: &Path) -> Init {
     };
     let monitor_pid = monitor.id();
 
-    let Some(client) = connect(&socket) else {
+    let Some(Connected { client, fd }) = connect(&socket) else {
         // Don't leave an orphaned monitor behind.
         reap(&mut monitor);
         return sealed_failure(FailureReason::MonitorUnreachable);
@@ -134,10 +136,8 @@ fn install(dir: &Path) -> Init {
     // A successful connect proves only that SOMETHING is bound to that name, and
     // the name has no permissions and is derived from our own pid, so any
     // process in this network namespace could have bound it first. Ask the
-    // kernel who the peer is. This runs AFTER the real client connected, so the
-    // probe's own disconnect leaves the monitor with one client and never trips
-    // its `on_client_disconnected` exit.
-    if !monitor_identity_holds(&socket, monitor_pid) {
+    // kernel who is on the other end of the connection the client is holding.
+    if !client_peer_is_monitor(fd, monitor_pid) {
         drop(client);
         reap(&mut monitor);
         return sealed_failure(FailureReason::MonitorIdentity);
@@ -210,20 +210,32 @@ fn install(dir: &Path) -> Init {
     )
 }
 
-/// Is the process holding the monitor's socket the monitor we spawned?
+/// Is the process on the other end of the dump client's own connection the
+/// monitor we spawned?
 ///
-/// `SO_PEERCRED` on a fresh connection reports the credentials of whoever
-/// called `listen` on that name, so it identifies the binder rather than
-/// whoever answers. A name can be bound once: if the peer of a connection made
-/// now is our child, our child holds the name, and the client's earlier
-/// connection reached that same listener, because a monitor whose bind failed
-/// exits rather than retrying. The pid cannot have been recycled underneath the
-/// comparison either, since the child is still unreaped at this point.
+/// The credentials have to come from the descriptor the [`Client`] holds, not
+/// from a second connection to the same name. A second connection can reach a
+/// different listener, and an attacker who wants that has an easy interleaving:
+/// bind the predictable name first, accept the connection `Client::with_name`
+/// makes, then close only the LISTENER. The name is free again, the real
+/// monitor's own bind succeeds, and from that moment a fresh connection reports
+/// the real monitor's credentials while the crash context still goes to the
+/// attacker's accepted connection. `SO_PEERCRED` on the held descriptor reports
+/// whoever called `listen` on the socket that accepted THIS connection, so it
+/// answers for the connection that will carry the dump request.
 ///
-/// The uid is compared too: a same-name, same-pid peer under another uid is not
-/// a shape this crate produces.
-fn monitor_identity_holds(socket: &str, monitor_pid: u32) -> bool {
-    match caps::peer_cred_of_abstract_socket(socket.as_bytes()) {
+/// `fd` is `None` when the descriptor accounting in [`connect`] could not name
+/// exactly one new socket. That is a refusal, not a reason to fall back on a
+/// weaker check: an unidentified peer is an unidentified peer.
+///
+/// The uid is compared too: a same-pid peer under another uid is not a shape
+/// this crate produces. The pid cannot have been recycled underneath the
+/// comparison either, since the monitor is still unreaped here.
+fn client_peer_is_monitor(fd: Option<RawFd>, monitor_pid: u32) -> bool {
+    let Some(fd) = fd else {
+        return false;
+    };
+    match caps::peer_cred_of_fd(fd) {
         Ok(cred) => {
             u32::try_from(cred.pid).is_ok_and(|pid| pid == monitor_pid)
                 && cred.uid == caps::effective_uid()
@@ -251,15 +263,102 @@ fn reap(monitor: &mut std::process::Child) {
     let _ = monitor.wait();
 }
 
-/// Connect to the monitor's server, retrying until it is listening (~2s max).
-fn connect(socket: &str) -> Option<Client> {
+/// A connected dump client and the descriptor its connection lives on.
+struct Connected {
+    client: Client,
+    /// `None` when the descriptor accounting did not name exactly one new
+    /// socket, which [`client_peer_is_monitor`] treats as a refusal.
+    fd: Option<RawFd>,
+}
+
+/// Connect to the monitor's server, retrying until it is listening (~2s max),
+/// and identify the descriptor the successful connect opened.
+///
+/// `minidumper::Client` keeps its socket private and implements no `AsRawFd`,
+/// so the descriptor is found by accounting: snapshot the open descriptors
+/// immediately before `Client::with_name` and immediately after, and take the
+/// single new entry. Three facts make that exact rather than a guess.
+///
+/// One, this process is single-threaded here by contract: `init()` is the first
+/// statement of `main`, before the async runtime exists, so nothing else can
+/// open or close a descriptor in between.
+///
+/// Two, on Linux `Client::with_name` opens exactly one descriptor, the
+/// `SOCK_SEQPACKET` socket it connects with (minidumper 0.11.0
+/// `src/ipc/client.rs` calls `uds::UnixSeqpacketConn::connect_unix_addr`, which
+/// is one `socket(2)` and one `connect(2)`).
+///
+/// Three, a FAILED attempt closes its own socket on the way out, so the retry
+/// loop leaves no residue. The snapshots are taken around each attempt anyway,
+/// so a leak in some future version would show up as two new descriptors and be
+/// refused rather than silently mistaken for the right one.
+fn connect(socket: &str) -> Option<Connected> {
     for _ in 0..100 {
+        let before = open_fds().ok();
         if let Ok(client) = Client::with_name(SocketName::abstract_namespace(socket)) {
-            return Some(client);
+            let fd = before
+                .zip(open_fds().ok())
+                .and_then(|(before, after)| sole_new_socket(&before, &after));
+            return Some(Connected { client, fd });
         }
         std::thread::sleep(Duration::from_millis(20));
     }
     None
+}
+
+/// Every descriptor this process has open, and what each one points at.
+///
+/// Reading `/proc/self/fd` needs a descriptor of its own, and that descriptor
+/// appears in its own listing. Leaving it in would be worse than noise: it is
+/// closed again the moment the iterator is dropped, so the second snapshot's
+/// directory descriptor can take a different number while the client's socket
+/// takes the number the first one freed, and the difference between the two
+/// snapshots would then name a closed directory instead of the socket. Every
+/// entry pointing at this process's own `/proc/<pid>/fd` is therefore dropped
+/// from both snapshots. That is exact for the transient one, and harmless for
+/// any other handle on that directory, which is in both snapshots and so in
+/// neither difference.
+fn open_fds() -> std::io::Result<BTreeMap<RawFd, PathBuf>> {
+    let own_fd_dir = PathBuf::from(format!("/proc/{}/fd", std::process::id()));
+    let mut fds = BTreeMap::new();
+    for entry in std::fs::read_dir("/proc/self/fd")? {
+        let entry = entry?;
+        let Some(fd) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<RawFd>().ok())
+        else {
+            continue;
+        };
+        // A descriptor that went away between the readdir and the readlink is
+        // not open, so it belongs in neither snapshot.
+        let Ok(target) = std::fs::read_link(entry.path()) else {
+            continue;
+        };
+        if target == own_fd_dir {
+            continue;
+        }
+        fds.insert(fd, target);
+    }
+    Ok(fds)
+}
+
+/// The one socket descriptor that is in `after` and not in `before`.
+///
+/// `None` for none, for more than one, and for a single new descriptor that is
+/// not a socket. Each of those means the accounting failed to identify the
+/// client's connection, and an unidentified connection is refused.
+fn sole_new_socket(
+    before: &BTreeMap<RawFd, PathBuf>,
+    after: &BTreeMap<RawFd, PathBuf>,
+) -> Option<RawFd> {
+    let mut new = after.iter().filter(|(fd, _)| !before.contains_key(*fd));
+    let (fd, target) = new.next()?;
+    if new.next().is_some() {
+        return None;
+    }
+    // `/proc/<pid>/fd/N` for a socket reads `socket:[<inode>]`.
+    target.to_str()?.starts_with("socket:[").then_some(*fd)
 }
 
 /// The fatal-signal handler.
@@ -439,5 +538,76 @@ fn prune_dumps(dir: &Path, retain: usize) {
     let remove = dumps.len() - retain;
     for (_, path) in dumps.into_iter().take(remove) {
         let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use minidumper::{Server, SocketName};
+
+    use super::{Connected, client_peer_is_monitor, connect, open_fds, sole_new_socket};
+
+    fn unique_name(tag: &str) -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after the epoch")
+            .as_nanos();
+        format!("trawld-crashdump-imp-{tag}-{}-{nanos}", std::process::id())
+    }
+
+    /// The whole point of the accounting: the descriptor it names is the one the
+    /// client connected on, and its peer is whoever bound the name. Here that
+    /// is this process, standing in for the monitor.
+    #[test]
+    fn connect_names_the_descriptor_the_client_opened() {
+        let name = unique_name("accounting");
+        let _server = Server::with_name(SocketName::abstract_namespace(&name))
+            .expect("bind an abstract seqpacket listener");
+
+        let Some(Connected { client, fd }) = connect(&name) else {
+            panic!("connect to our own listener");
+        };
+        let fd = fd.expect("exactly one new socket descriptor");
+
+        let target = std::fs::read_link(format!("/proc/self/fd/{fd}")).expect("readlink the fd");
+        assert!(
+            target.to_string_lossy().starts_with("socket:["),
+            "{}",
+            target.display()
+        );
+        assert!(client_peer_is_monitor(Some(fd), std::process::id()));
+        assert!(
+            !client_peer_is_monitor(Some(fd), std::process::id() + 1),
+            "a pid that is not the peer's is refused"
+        );
+        assert!(!client_peer_is_monitor(None, std::process::id()));
+        drop(client);
+    }
+
+    #[test]
+    fn an_unchanged_snapshot_names_no_new_descriptor() {
+        let before = open_fds().expect("/proc/self/fd");
+        let after = open_fds().expect("/proc/self/fd");
+        assert_eq!(before, after, "nothing opened or closed in between");
+        assert!(sole_new_socket(&before, &after).is_none());
+    }
+
+    #[test]
+    fn two_new_descriptors_are_refused() {
+        let before = open_fds().expect("/proc/self/fd");
+        let _one = std::fs::File::open("/dev/null").expect("/dev/null");
+        let _two = std::fs::File::open("/dev/null").expect("/dev/null");
+        let after = open_fds().expect("/proc/self/fd");
+        assert!(sole_new_socket(&before, &after).is_none());
+    }
+
+    #[test]
+    fn a_new_descriptor_that_is_not_a_socket_is_refused() {
+        let before = open_fds().expect("/proc/self/fd");
+        let _file = std::fs::File::open("/dev/null").expect("/dev/null");
+        let after = open_fds().expect("/proc/self/fd");
+        assert!(sole_new_socket(&before, &after).is_none());
     }
 }

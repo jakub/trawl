@@ -14,11 +14,12 @@
 //! capabilities, and every unsafe block is a single syscall.
 //!
 //! It is also where the crate's other raw-syscall work lives, because this is
-//! the designated unsafe file: [`peer_cred_of_abstract_socket`] asks the kernel
-//! who is listening on the monitor's abstract socket, which is how the parent
-//! tells its own monitor from a process that bound the name first.
+//! the designated unsafe file: [`peer_cred_of_fd`] asks the kernel who is on
+//! the other end of the socket the dump client itself holds, which is how the
+//! parent tells its own monitor from a process that bound the name first.
 
 use std::io;
+use std::os::fd::RawFd;
 
 use crate::readiness::CAP_SYS_PTRACE_BIT;
 
@@ -175,82 +176,24 @@ pub(crate) fn set_ptracer(pid: u32) -> io::Result<()> {
     }
 }
 
-/// Ask the kernel which process is listening on an abstract socket name.
+/// Ask the kernel who is on the other end of a connected socket.
 ///
-/// A successful `Client::with_name` proves only that SOMETHING is bound to the
-/// name. Abstract names carry no filesystem permissions and this one is derived
-/// from the daemon's pid, so any process in the same network namespace can bind
-/// it first; the real monitor's own bind then fails and it exits, while the
-/// parent goes on probing `/proc/<monitor>` and reporting a readiness that
-/// describes a process it is not talking to.
+/// `SO_PEERCRED` freezes the peer's credentials when the connection is made,
+/// and on the connecting side it reports the process that called `listen(2)` on
+/// the socket that accepted this connection. That is the identity worth
+/// checking: not who answers a message later, but who received this connection.
 ///
-/// `SO_PEERCRED` is the kernel's own answer to "who is on the other end". For a
-/// connecting socket it reports the credentials captured when the peer called
-/// `listen`, so it names the process that actually holds the name, and a
-/// caller who compares that pid against the child it spawned cannot be fooled
-/// by a stranger who won the race.
+/// It has to be read on the descriptor the dump client itself holds. A second
+/// connection to the same name is a different connection and can reach a
+/// different listener; see `imp::client_peer_is_monitor` for the interleaving
+/// that makes the two answers disagree.
 ///
-/// The connection this makes is a throwaway: it is opened, asked one question
-/// and closed. `SOCK_SEQPACKET` because that is what `minidumper`'s server
-/// binds; a `SOCK_STREAM` connect to the same name is refused.
-// Three casts to fixed-width kernel types, each of a value that provably fits:
-// `AF_UNIX` is 1, a `u8` byte into `c_char` (unsigned on aarch64, signed on
-// x86-64, and only the bit pattern reaches the kernel), and `size_of::<ucred>()`
-// is 12.
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss
-)]
-pub(crate) fn peer_cred_of_abstract_socket(name: &[u8]) -> io::Result<libc::ucred> {
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-
-    let mut addr = libc::sockaddr_un {
-        sun_family: libc::AF_UNIX as libc::sa_family_t,
-        sun_path: [0; 108],
-    };
-    // An abstract address is a leading NUL byte, then the name, with the length
-    // passed explicitly rather than read up to a terminator.
-    if name.is_empty() || name.len() + 1 > addr.sun_path.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "abstract socket name does not fit sun_path",
-        ));
-    }
-    for (slot, &byte) in addr.sun_path[1..=name.len()].iter_mut().zip(name) {
-        *slot = byte as libc::c_char;
-    }
-    let addr_len =
-        (std::mem::offset_of!(libc::sockaddr_un, sun_path) + 1 + name.len()) as libc::socklen_t;
-
-    // SAFETY: `socket(2)` takes scalars only and touches no memory of ours. The
-    // returned descriptor is handed straight to `OwnedFd`, which closes it on
-    // every path out of this function.
-    #[allow(unsafe_code)]
-    let raw = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0) };
-    if raw < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: `raw` is a fresh descriptor this function owns and never
-    // duplicates or closes itself.
-    #[allow(unsafe_code)]
-    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-
-    // SAFETY: `connect(2)` reads `addr_len` bytes of the address and writes
-    // nothing back. `addr` is a live, correctly sized `#[repr(C)]` local and
-    // `addr_len` is within it by the length check above.
-    #[allow(unsafe_code)]
-    let rc = unsafe {
-        libc::connect(
-            fd.as_raw_fd(),
-            std::ptr::addr_of!(addr).cast::<libc::sockaddr>(),
-            addr_len,
-        )
-    };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
-
+/// The descriptor is only borrowed for the length of the call: this never
+/// closes it and never takes ownership, so the caller holding the `Client`
+/// alive is what keeps it valid.
+// `size_of::<ucred>()` is 12, which fits `socklen_t` with room to spare.
+#[allow(clippy::cast_possible_truncation)]
+pub(crate) fn peer_cred_of_fd(fd: RawFd) -> io::Result<libc::ucred> {
     let mut cred = libc::ucred {
         pid: 0,
         uid: 0,
@@ -259,11 +202,13 @@ pub(crate) fn peer_cred_of_abstract_socket(name: &[u8]) -> io::Result<libc::ucre
     let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
     // SAFETY: `getsockopt(SO_PEERCRED)` writes at most `len` bytes into the
     // pointer and updates `len` to what it wrote. Both are live locals of
-    // exactly the sizes named.
+    // exactly the sizes named. `fd` is borrowed, never closed here, and a
+    // descriptor that is closed or is not a socket makes the call fail rather
+    // than misbehave.
     #[allow(unsafe_code)]
     let rc = unsafe {
         libc::getsockopt(
-            fd.as_raw_fd(),
+            fd,
             libc::SOL_SOCKET,
             libc::SO_PEERCRED,
             std::ptr::addr_of_mut!(cred).cast::<libc::c_void>(),
@@ -319,14 +264,16 @@ pub(crate) fn get_dumpable() -> io::Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use std::process::{Command, Stdio};
+    use std::io;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::process::{Child, Command, Stdio};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use minidumper::{Server, SocketName};
 
     use super::{
-        PTRACE_BIT_WORD0, capget, get_dumpable, peer_cred_of_abstract_socket,
-        raise_ptrace_effective, seal, set_ptracer,
+        PTRACE_BIT_WORD0, capget, get_dumpable, peer_cred_of_fd, raise_ptrace_effective, seal,
+        set_ptracer,
     };
     use crate::probe::{parse_status, self_status};
 
@@ -342,11 +289,143 @@ mod tests {
         format!("trawld-crashdump-test-{tag}-{}-{nanos}", std::process::id())
     }
 
-    /// Poll the name until something is listening on it (or give up).
-    fn peer_cred_when_bound(name: &str) -> Option<libc::ucred> {
+    /// The address of an abstract name: a leading NUL byte, then the name, with
+    /// the length passed explicitly rather than read up to a terminator.
+    ///
+    /// The production code no longer builds one of these. It reads credentials
+    /// off a descriptor `minidumper` opened, and these tests need a descriptor
+    /// of their own to read.
+    // Three casts to fixed-width kernel types, each of a value that provably
+    // fits: `AF_UNIX` is 1, a `u8` byte into `c_char` (unsigned on aarch64,
+    // signed on x86-64, and only the bit pattern reaches the kernel), and an
+    // address length under 128.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_sign_loss
+    )]
+    fn abstract_addr(name: &str) -> (libc::sockaddr_un, libc::socklen_t) {
+        let bytes = name.as_bytes();
+        let mut addr = libc::sockaddr_un {
+            sun_family: libc::AF_UNIX as libc::sa_family_t,
+            sun_path: [0; 108],
+        };
+        assert!(
+            !bytes.is_empty() && bytes.len() < addr.sun_path.len(),
+            "the name fits sun_path"
+        );
+        for (slot, &byte) in addr.sun_path[1..=bytes.len()].iter_mut().zip(bytes) {
+            *slot = byte as libc::c_char;
+        }
+        let len = (std::mem::offset_of!(libc::sockaddr_un, sun_path) + 1 + bytes.len())
+            as libc::socklen_t;
+        (addr, len)
+    }
+
+    fn seqpacket_socket() -> OwnedFd {
+        // SAFETY: `socket(2)` takes scalars only and touches no memory of ours.
+        // The descriptor is handed straight to `OwnedFd`, which closes it.
+        #[allow(unsafe_code)]
+        let raw =
+            unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0) };
+        assert!(raw >= 0, "socket: {}", io::Error::last_os_error());
+        // SAFETY: `raw` is a fresh descriptor nothing else owns.
+        #[allow(unsafe_code)]
+        unsafe {
+            OwnedFd::from_raw_fd(raw)
+        }
+    }
+
+    /// Connect to an abstract seqpacket name, exactly as `minidumper`'s client
+    /// does, and hand back the descriptor so a test can read its peer.
+    fn connect_abstract(name: &str) -> io::Result<OwnedFd> {
+        let (addr, len) = abstract_addr(name);
+        let fd = seqpacket_socket();
+        // SAFETY: `connect(2)` reads `len` bytes of the address and writes
+        // nothing back; `addr` is a live `#[repr(C)]` local and `len` is within
+        // it by construction.
+        #[allow(unsafe_code)]
+        let rc = unsafe {
+            libc::connect(
+                fd.as_raw_fd(),
+                std::ptr::addr_of!(addr).cast::<libc::sockaddr>(),
+                len,
+            )
+        };
+        if rc == 0 {
+            Ok(fd)
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    /// Bind and listen on an abstract name, the way an impostor would.
+    fn bind_listen(name: &str) -> OwnedFd {
+        let (addr, len) = abstract_addr(name);
+        let fd = seqpacket_socket();
+        // SAFETY: `bind(2)` reads `len` bytes of the address and writes nothing
+        // back; the same live local as above.
+        #[allow(unsafe_code)]
+        let rc = unsafe {
+            libc::bind(
+                fd.as_raw_fd(),
+                std::ptr::addr_of!(addr).cast::<libc::sockaddr>(),
+                len,
+            )
+        };
+        assert_eq!(rc, 0, "bind: {}", io::Error::last_os_error());
+        // SAFETY: `listen(2)` takes scalars only.
+        #[allow(unsafe_code)]
+        let rc = unsafe { libc::listen(fd.as_raw_fd(), 8) };
+        assert_eq!(rc, 0, "listen: {}", io::Error::last_os_error());
+        fd
+    }
+
+    /// Take one pending connection off a listener, so closing the listener
+    /// frees the NAME while the connection stays up.
+    fn accept_one(listener: &OwnedFd) -> OwnedFd {
+        // SAFETY: `accept(2)` with null address arguments writes nothing of
+        // ours; the returned descriptor is owned by the `OwnedFd`.
+        #[allow(unsafe_code)]
+        let raw = unsafe {
+            libc::accept(
+                listener.as_raw_fd(),
+                std::ptr::null_mut::<libc::sockaddr>(),
+                std::ptr::null_mut::<libc::socklen_t>(),
+            )
+        };
+        assert!(raw >= 0, "accept: {}", io::Error::last_os_error());
+        // SAFETY: `raw` is a fresh descriptor nothing else owns.
+        #[allow(unsafe_code)]
+        unsafe {
+            OwnedFd::from_raw_fd(raw)
+        }
+    }
+
+    /// Re-exec this test binary as a process whose only job is to bind `name`.
+    fn spawn_bind_helper(name: &str) -> Child {
+        Command::new(std::env::current_exe().expect("test binary path"))
+            .args([
+                "--ignored",
+                "--exact",
+                "caps::tests::abstract_socket_bind_helper",
+            ])
+            .env(HELPER_ENV, name)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("respawn the test binary as a bind helper")
+    }
+
+    /// Connect to `name` until the peer of the connection is `pid`, and return
+    /// the credentials that proved it.
+    fn peer_cred_when_bound_by(name: &str, pid: u32) -> Option<libc::ucred> {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            if let Ok(cred) = peer_cred_of_abstract_socket(name.as_bytes()) {
+            if let Ok(conn) = connect_abstract(name)
+                && let Ok(cred) = peer_cred_of_fd(conn.as_raw_fd())
+                && u32::try_from(cred.pid) == Ok(pid)
+            {
                 return Some(cred);
             }
             if Instant::now() >= deadline {
@@ -394,8 +473,9 @@ mod tests {
         let name = unique_name("self");
         let _server = Server::with_name(SocketName::abstract_namespace(&name))
             .expect("bind an abstract seqpacket listener");
+        let conn = connect_abstract(&name).expect("connect to our own listener");
 
-        let cred = peer_cred_of_abstract_socket(name.as_bytes()).expect("peer credentials");
+        let cred = peer_cred_of_fd(conn.as_raw_fd()).expect("peer credentials");
 
         assert_eq!(
             u32::try_from(cred.pid).expect("a pid is positive"),
@@ -407,40 +487,74 @@ mod tests {
         assert_eq!(cred.gid, status.gid[1], "effective gid");
     }
 
-    /// The impostor case, with a real second process: the pid the kernel
-    /// reports is the one that BOUND the name, never the one that connected.
-    /// That is the whole reason `install` can tell its own monitor from a
+    /// The ordinary case with a real second process: the pid the kernel reports
+    /// on the connection is the one that BOUND the name, never the one that
+    /// connected. That is what lets `install` tell its own monitor from a
     /// stranger who won the race for a predictable name.
     #[test]
     fn peer_cred_reports_the_other_process_that_bound_the_name() {
         let name = unique_name("impostor");
-        let mut helper = Command::new(std::env::current_exe().expect("test binary path"))
-            .args([
-                "--ignored",
-                "--exact",
-                "caps::tests::abstract_socket_bind_helper",
-            ])
-            .env(HELPER_ENV, &name)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("respawn the test binary as a bind helper");
+        let mut helper = spawn_bind_helper(&name);
 
-        let cred = peer_cred_when_bound(&name);
+        let cred = peer_cred_when_bound_by(&name, helper.id());
         let _ = helper.kill();
         let _ = helper.wait();
-        let cred = cred.expect("the helper bound the name within the deadline");
 
+        let cred = cred.expect("the helper bound the name within the deadline");
         let peer = u32::try_from(cred.pid).expect("a pid is positive");
         assert_eq!(peer, helper.id(), "SO_PEERCRED names the helper");
         assert_ne!(peer, std::process::id(), "and not the connecting process");
     }
 
+    /// The attack the descriptor accounting exists for, played out end to end.
+    ///
+    /// An impostor binds the predictable name first, accepts the connection the
+    /// dump client makes, and then closes only its LISTENER. That frees the
+    /// name, so the real monitor's own bind succeeds a moment later. From then
+    /// on a FRESH connection to the name reaches the real monitor and reports
+    /// its credentials, while the connection the client is actually holding
+    /// still belongs to the impostor. Reading the credentials of a second
+    /// connection would pass this; reading them off the client's own descriptor
+    /// catches it.
+    #[test]
+    fn peer_cred_separates_the_held_connection_from_a_later_binder() {
+        let name = unique_name("interleave");
+
+        let listener = bind_listen(&name);
+        let held = connect_abstract(&name).expect("connect to the impostor's listener");
+        let _accepted = accept_one(&listener);
+        drop(listener);
+
+        let mut helper = spawn_bind_helper(&name);
+        let probe = peer_cred_when_bound_by(&name, helper.id());
+        let held_cred = peer_cred_of_fd(held.as_raw_fd());
+        let _ = helper.kill();
+        let _ = helper.wait();
+
+        assert!(
+            probe.is_some(),
+            "the helper took the name the impostor released"
+        );
+        let held_cred = held_cred.expect("credentials of the connection we hold");
+        let peer = u32::try_from(held_cred.pid).expect("a pid is positive");
+        assert_eq!(
+            peer,
+            std::process::id(),
+            "the held connection still belongs to the impostor"
+        );
+        assert_ne!(
+            peer,
+            helper.id(),
+            "and never to the process that bound later"
+        );
+    }
+
     /// Runs only when [`peer_cred_reports_the_other_process_that_bound_the_name`]
+    /// or [`peer_cred_separates_the_held_connection_from_a_later_binder`]
     /// re-execs the test binary with `--ignored --exact` and the name to bind in
     /// the environment. Ignored so an ordinary run never pays the sleep.
     #[test]
-    #[ignore = "helper process for peer_cred_reports_the_other_process_that_bound_the_name"]
+    #[ignore = "helper process for the peer_cred tests"]
     fn abstract_socket_bind_helper() {
         let Ok(name) = std::env::var(HELPER_ENV) else {
             return;
@@ -453,15 +567,9 @@ mod tests {
     }
 
     #[test]
-    fn peer_cred_of_an_unbound_name_is_an_error() {
-        let name = unique_name("unbound");
-        assert!(peer_cred_of_abstract_socket(name.as_bytes()).is_err());
-    }
-
-    #[test]
-    fn peer_cred_refuses_a_name_that_cannot_fit_an_abstract_address() {
-        assert!(peer_cred_of_abstract_socket(b"").is_err());
-        assert!(peer_cred_of_abstract_socket(&[b'x'; 200]).is_err());
+    fn peer_cred_of_something_that_is_not_a_socket_is_an_error() {
+        let file = std::fs::File::open("/dev/null").expect("/dev/null");
+        assert!(peer_cred_of_fd(file.as_raw_fd()).is_err());
     }
 
     /// Mutates this process, so it relies on nextest running each test in its
