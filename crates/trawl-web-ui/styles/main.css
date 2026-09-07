@@ -251,6 +251,9 @@
 .facets .g.collapsed .vals { display: none; }
 
 .facets .v {
+  /* Width of the include/exclude area. The count reserves it while the
+   * buttons are hidden, so both boxes read the one number. */
+  --facet-act-w: 48px;
   position: relative;
   display: flex;
   align-items: center;
@@ -281,6 +284,12 @@
 .facets .v .c {
   color: var(--ink-3);
   font-variant-numeric: tabular-nums;
+  /* Reserves the action area, which is out of flow: a 1-digit count is
+   * far narrower than two glyph buttons, and `.n` is `flex: 1`, so
+   * without this the value name grows under the buttons the moment they
+   * appear. Right-aligned because the box is now wider than its digits. */
+  min-width: var(--facet-act-w);
+  text-align: right;
 }
 /* Revealed on hover OR focus, and by opacity: `display: none` would
  * take the two buttons out of the tab order (ADR-0029). They are pinned
@@ -293,15 +302,33 @@
   right: 12px;
   top: 0;
   bottom: 0;
+  min-width: var(--facet-act-w);
+  justify-content: flex-end;
   align-items: center;
   opacity: 0;
   gap: 4px;
+  padding-left: 6px;
   color: var(--ink-3);
+  /* Out of flow, so it carries its own opaque floor and repeats what
+   * the row paints: bare panel at rest and on keyboard focus, the hover
+   * wash on hover, the selected wash over panel when included. Without
+   * it a long value would read through the glyphs; the cost is that the
+   * `.bar` frequency tail is hidden under these 46px while revealed. */
+  background: var(--panel);
 }
 .facets .v:hover .act,
 .facets .v:focus-within .act { opacity: 1; }
+.facets .v:hover .act { background: var(--panel-2); }
+/* After the hover rule: `.v.selected` beats `.v:hover` for the row's own
+ * background on a tie, and the action floor follows the row. */
+.facets .v.selected .act {
+  background-color: var(--panel);
+  background-image: linear-gradient(var(--accent-wash), var(--accent-wash));
+}
+/* `visibility`, not `display: none`: the count's box is what keeps the
+ * value name out of the action area. */
 .facets .v:hover .c,
-.facets .v:focus-within .c { display: none; }
+.facets .v:focus-within .c { visibility: hidden; }
 .facets .v .act .op {
   background: none;
   border: 0;
