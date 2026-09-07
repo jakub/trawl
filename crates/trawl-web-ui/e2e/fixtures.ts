@@ -186,3 +186,64 @@ export async function intervalCount(page: Pg, delay: number): Promise<number> {
     return read(ms) as number;
   }, delay);
 }
+
+/** Count every toast that was ever ADDED to the document, cumulatively.
+ *
+ * Cumulative rather than a DOM query at assert time, because a toast
+ * dismisses itself after 4.5s (`fleet-ui/src/toast/runtime.rs`): a spec
+ * that waits out a 3s poll period and then counts `.toast` elements is
+ * racing that timer, and would report "no toast was raised" for a toast
+ * that came and went. This counts arrivals, so a toast cannot outrun it.
+ *
+ * Must be called BEFORE `page.goto`, same as `trackIntervals`.
+ */
+export async function trackToasts(page: Pg): Promise<void> {
+  await page.addInitScript(() => {
+    let count = 0;
+    // Identity dedupe: an added subtree can carry a `.toast` that is
+    // both the added node itself and, on the next record, someone's
+    // descendant. Counting it twice would turn one toast into two.
+    const seen = new WeakSet<Element>();
+    const tally = (node: Node) => {
+      if (!(node instanceof Element)) return;
+      const found: Element[] = node.matches('.toast') ? [node] : [];
+      found.push(...node.querySelectorAll('.toast'));
+      for (const el of found) {
+        if (seen.has(el)) continue;
+        seen.add(el);
+        count += 1;
+      }
+    };
+    (window as any).__e2eToastCount = () => count;
+    // `document` itself, not `documentElement`: an init script runs
+    // before the page's own scripts, and observing the document covers
+    // the element's own insertion as well as everything under it.
+    new MutationObserver((records) => {
+      for (const record of records) {
+        for (const node of record.addedNodes) tally(node);
+      }
+    }).observe(document, { childList: true, subtree: true });
+  });
+}
+
+/** How many toasts have been raised since the page loaded. */
+export async function toastCount(page: Pg): Promise<number> {
+  return page.evaluate(() => {
+    const read = (window as any).__e2eToastCount;
+    if (typeof read !== 'function') {
+      throw new Error('trackToasts(page) was not installed before page.goto');
+    }
+    return read() as number;
+  });
+}
+
+/** Arm the stub's scripted repin status sequence for one field.
+ *
+ * The reset is the ONE door that arms it (see `harness/server.mjs`), so
+ * this wraps that reset rather than adding a second control route. With
+ * the script disarmed, which is every other spec, the status route
+ * answers `{ job: null }`.
+ */
+export async function scriptRepinStatus(request: Ctl, field: string): Promise<void> {
+  await request.post('/__ctl/reset', { data: { scenario: 'default', repinField: field } });
+}

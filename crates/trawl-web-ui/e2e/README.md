@@ -55,12 +55,22 @@ the PR diff.
   legacy and malformed payloads, page-offset overflow), the percent
   encoder against the browser's own, and Back/Forward provenance. Every
   URL in that spec is a literal, never one the app's encoder built.
+- The field case drawer's repin status poll dying with the drawer, by all
+  four routes out of it (close, Escape, browser Back, and navigating
+  straight to another field's case file). A leaked `gloo_timers` Interval
+  is network-silent, so that spec reads three separate observables: the
+  browser's timer table, the stub's status-read count, and a status read
+  the stub parks open across the teardown and answers afterwards.
 - No visual regression / screenshot diffing.
 - No real backend — every response is a fixture in `harness/fixtures.mjs`.
   Re-verify those shapes against `crates/trawl-api/src/lib.rs` /
   `crates/trawl-web-ui/src/api/mod.rs` when the wire types change; the
   suite decodes the SAME structs the SPA does, so a drifted fixture
   either 500s inside `serde_json` or silently renders the empty state.
+  The bodies under `harness/wire/` are guarded for you:
+  `crates/trawl-web-ui/tests/e2e_wire_fixture_contract.rs` decodes each
+  into its trawl-api struct on every `cargo nextest` run, so prefer a
+  `wire/` file over a new inline payload.
 
 ## The per-test contract
 
