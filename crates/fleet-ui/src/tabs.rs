@@ -43,19 +43,24 @@
 //! Arrow Right/Left wrap, Home and End jump to the ends
 //! ([`crate::roving::horizontal_nav`]), each moving FOCUS only. The
 //! strip's single tab stop is derived from SELECTION — `aria-selected`
-//! and `tabindex` are one predicate over `active`, so the strip needs no
-//! focus state of its own — which is the deliberate deviation from the
-//! APG that [`crate::roving`] documents. Activation is manual: Enter and
-//! Space are the native button's own click, and an arrow never runs
-//! `on_change`, so arrowing across trawl's `?ntab=` strip does not
-//! rewrite the URL under the user.
+//! and `tabindex` are one predicate over
+//! [`resolve_selected`](crate::roving::resolve_selected), so the strip
+//! needs no focus state of its own — which is the deliberate deviation
+//! from the APG that [`crate::roving`] documents. That one predicate is
+//! also why an `active` id matching no tab selects the FIRST tab
+//! instead of none: these ids come out of the URL (`?ntab=bogus`), and
+//! selecting none would leave every tab at `tabindex="-1"`, a strip no
+//! keyboard can enter, under a pane already showing the first tab.
+//! Activation is manual: Enter and Space are the native button's own
+//! click, and an arrow never runs `on_change`, so arrowing across
+//! trawl's `?ntab=` strip does not rewrite the URL under the user.
 
 use leptos::html::Div;
 use leptos::prelude::*;
 use leptos::web_sys;
 use wasm_bindgen::JsCast;
 
-use crate::roving::{horizontal_nav, next_index};
+use crate::roving::{horizontal_nav, next_index, resolve_selected};
 
 /// One tab in the strip. `count` drives the workspace count chip
 /// (`.t .c`, e.g. the Events row count) — it renders only while the
@@ -135,6 +140,13 @@ pub fn Tabs(
     let named = !ids.is_empty();
     let role = named.then_some("tablist");
     let aria_label = named.then_some(label);
+    // One predicate for `aria-selected`, the tabindex and the active
+    // class: an id that matches no tab resolves to the first one, so
+    // the strip always has exactly one tab stop.
+    let selected = {
+        let ids = ids.clone();
+        Signal::derive(move || resolve_selected(&active.get(), &ids))
+    };
     let on_keydown = tab_keydown(list_ref, ids, active);
 
     match style {
@@ -147,16 +159,16 @@ pub fn Tabs(
                     node_ref=list_ref
                     on:keydown=on_keydown
                 >
-                    {items.into_iter().map(|item| {
+                    {items.into_iter().enumerate().map(|(i, item)| {
                         let id = item.id;
                         view! {
                             <button
                                 type="button"
                                 class="t"
-                                class:active=move || active.get() == id
+                                class:active=move || selected.get() == Some(i)
                                 role="tab"
-                                aria-selected=move || (active.get() == id).to_string()
-                                tabindex=move || if active.get() == id { "0" } else { "-1" }
+                                aria-selected=move || (selected.get() == Some(i)).to_string()
+                                tabindex=move || if selected.get() == Some(i) { "0" } else { "-1" }
                                 on:click=move |_| on_change.run(id.to_string())
                             >
                                 <span>{item.label}</span>
@@ -179,15 +191,15 @@ pub fn Tabs(
                     node_ref=list_ref
                     on:keydown=on_keydown
                 >
-                    {items.into_iter().map(|item| {
+                    {items.into_iter().enumerate().map(|(i, item)| {
                         let id = item.id;
                         view! {
                             <button
                                 type="button"
-                                class=move || if active.get() == id { "tb on" } else { "tb" }
+                                class=move || if selected.get() == Some(i) { "tb on" } else { "tb" }
                                 role="tab"
-                                aria-selected=move || (active.get() == id).to_string()
-                                tabindex=move || if active.get() == id { "0" } else { "-1" }
+                                aria-selected=move || (selected.get() == Some(i)).to_string()
+                                tabindex=move || if selected.get() == Some(i) { "0" } else { "-1" }
                                 on:click=move |_| on_change.run(id.to_string())
                             >{item.label}</button>
                         }
@@ -236,10 +248,7 @@ fn tab_keydown(
                     .zip(focused.as_ref())
                     .is_some_and(|(node, el)| el.is_same_node(Some(&node)))
             })
-            .or_else(|| {
-                let selected = active.get_untracked();
-                ids.iter().position(|id| *id == selected)
-            })
+            .or_else(|| resolve_selected(&active.get_untracked(), &ids))
             .unwrap_or(0);
         let Some(next) = next_index(current, len, nav) else {
             return;

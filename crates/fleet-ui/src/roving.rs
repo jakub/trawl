@@ -62,6 +62,23 @@ pub(crate) fn next_index(current: usize, len: usize, nav: Nav) -> Option<usize> 
     })
 }
 
+/// Which tab a strip's selected id resolves to, or `None` when the
+/// strip has no tabs at all.
+///
+/// A tab strip's single tab stop is derived from selection, so an id
+/// matching no tab would leave every tab at `tabindex="-1"` — a tablist
+/// a keyboard cannot enter, while the pane below it renders the first
+/// tab's content. Those ids are client text (trawl's `?ntab=` and
+/// `?stab=` come straight out of the URL), so "matches nothing" is a
+/// reachable state, not a programming error. An unmatched id therefore
+/// selects the first tab, which is what the pane already shows.
+pub(crate) fn resolve_selected(active: &str, ids: &[&str]) -> Option<usize> {
+    if ids.is_empty() {
+        return None;
+    }
+    Some(ids.iter().position(|id| *id == active).unwrap_or(0))
+}
+
 /// The key map for a vertically-arranged widget (both menus): Arrow
 /// Down/Up plus Home/End. Every other key returns `None` and the
 /// component leaves the event alone — Escape belongs to the overlay
@@ -94,7 +111,7 @@ pub(crate) fn horizontal_nav(key: &str) -> Option<Nav> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Nav, horizontal_nav, next_index, vertical_nav};
+    use super::{Nav, horizontal_nav, next_index, resolve_selected, vertical_nav};
 
     #[test]
     fn next_and_prev_wrap_at_both_ends() {
@@ -135,6 +152,35 @@ mod tests {
                 "{nav:?} from an index the list no longer has"
             );
         }
+    }
+
+    #[test]
+    fn a_known_tab_id_selects_its_own_tab() {
+        let ids = ["query", "runs"];
+        assert_eq!(resolve_selected("query", &ids), Some(0));
+        assert_eq!(resolve_selected("runs", &ids), Some(1));
+    }
+
+    #[test]
+    fn an_id_matching_no_tab_selects_the_first_one() {
+        // `?ntab=bogus` is a URL a user can type. Answering "none of
+        // them" would render a strip with no tabbable tab, so there
+        // would be no way to reach it by keyboard at all.
+        let ids = ["query", "runs"];
+        for active in ["bogus", "", "Query", "runs "] {
+            assert_eq!(
+                resolve_selected(active, &ids),
+                Some(0),
+                "`{active}` matches no tab and must fall back to the first"
+            );
+        }
+    }
+
+    #[test]
+    fn a_strip_with_no_tabs_selects_nothing() {
+        // The field case drawer uses the container as a meta bar only.
+        assert_eq!(resolve_selected("query", &[]), None);
+        assert_eq!(resolve_selected("", &[]), None);
     }
 
     #[test]

@@ -154,30 +154,38 @@ fn tabs_render_a_named_tablist() {
     // ADR-0028: the tabs are native buttons inside a named tablist,
     // and only the tabs are inside it — the spacer, the trailing
     // action slot and the drawer's meta text are siblings of that
-    // node, so a Save link is never announced as a tab.
+    // node, so a Save link is never announced as a tab. Scanned
+    // against the markup, so prose about a role cannot stand in for
+    // one.
+    let tabs = markup_only(TABS);
     assert!(
-        TABS.contains(r#"class="tablist""#) && TABS.contains("role=role"),
+        tabs.contains(r#"class="tablist""#) && tabs.contains("role=role"),
         "the strip must render a `.tablist` node whose role is the \
          computed one — an unconditional role would name an empty strip \
          (the field case drawer passes no tabs at all)"
     );
     assert!(
-        TABS.contains(r#"role="tab""#) && TABS.contains("aria-selected"),
+        tabs.contains(r#"role="tab""#) && tabs.contains("aria-selected"),
         "each tab must carry role=\"tab\" and aria-selected — without \
          them the strip is a row of buttons with no relationship"
     );
     assert!(
-        TABS.contains(r#"type="button""#),
+        tabs.contains(r#"type="button""#),
         "tabs are <button type=\"button\">: inside a form, a type-less \
          button submits it"
     );
-    // Selection-derived roving tabindex: one predicate over `active`,
-    // no focus state of its own (the asymmetry roving.rs documents).
+    // Selection-derived roving tabindex: one predicate over
+    // roving::resolve_selected, no focus state of its own (the
+    // asymmetry roving.rs documents). Going through that helper is
+    // what makes an id matching no tab select the first tab instead of
+    // leaving the strip with no tab stop at all.
     assert!(
-        TABS.contains(r#"if active.get() == id { "0" } else { "-1" }"#),
-        "the strip's single tab stop is derived from the selected tab — \
-         every tab tabbable puts N stops in the page and defeats the \
-         arrow walk"
+        tabs.contains(r#"if selected.get() == Some(i) { "0" } else { "-1" }"#)
+            && TABS.contains("resolve_selected"),
+        "the strip's single tab stop is derived from the selected tab, \
+         resolved through roving::resolve_selected — every tab tabbable \
+         puts N stops in the page and defeats the arrow walk, and no tab \
+         tabbable (an unknown ?ntab= id) leaves the strip unreachable"
     );
     assert!(
         TABS.contains("horizontal_nav") && TABS.contains("next_index"),
@@ -335,7 +343,7 @@ fn actions_menu_emits_its_hooks_and_registers_with_the_overlay_stack() {
          tabindex instead of grabbing the first .item"
     );
     assert!(
-        ACTIONS_MENU.contains(r#"aria-label="Actions""#),
+        markup_only(ACTIONS_MENU).contains(r#"aria-label="Actions""#),
         "the ⋯ trigger has no text content — without aria-label its \
          accessible name is the glyph"
     );
@@ -354,7 +362,7 @@ fn the_menu_contract_is_shared_and_walks_by_index() {
     // sibling walk it replaced hopped whatever came next, so a header
     // or a separator could take focus.
     assert!(
-        MENU.contains(r#"[role="menuitem"]"#) && MENU.contains("next_index"),
+        markup_only(MENU).contains(r#"[role="menuitem"]"#) && MENU.contains("next_index"),
         "the arrow walk must index the queried menuitem list through \
          roving::next_index"
     );
@@ -369,7 +377,7 @@ fn the_menu_contract_is_shared_and_walks_by_index() {
     );
     // One tab stop: exactly one item at 0, the rest at -1.
     assert!(
-        MENU.contains(r#"if focused.get() == index { "0" } else { "-1" }"#),
+        markup_only(MENU).contains(r#"if focused.get() == index { "0" } else { "-1" }"#),
         "menu items carry a true roving tabindex — every item tabbable \
          puts N tab stops in the page and defeats the arrow walk"
     );
@@ -389,13 +397,16 @@ fn topbar_menu_is_native_and_registers_with_the_stack() {
     emits(MENU, r#"class="sep""#, ".user-menu .sep");
 
     // A native trigger that reports its state, not a div with on:click.
+    // Every tag and attribute below is scanned against the markup: the
+    // module doc names each affordance it explains.
+    let markup = markup_only(TOPBAR);
     assert!(
-        TOPBAR.contains("<button") && TOPBAR.contains(r#"type="button""#),
+        markup.contains("<button") && markup.contains(r#"type="button""#),
         "the account trigger must be a native <button type=\"button\"> \
          — a div reaches neither the keyboard nor the focus ring"
     );
     assert!(
-        TOPBAR.contains(r#"aria-haspopup="menu""#) && TOPBAR.contains("aria-expanded"),
+        markup.contains(r#"aria-haspopup="menu""#) && markup.contains("aria-expanded"),
         "the trigger must announce that it opens a menu and whether it \
          is open"
     );
@@ -410,10 +421,7 @@ fn topbar_menu_is_native_and_registers_with_the_stack() {
          second contract"
     );
 
-    // ADR-0025's retirements, and the one box that stays. Scanned
-    // against the markup: the module doc names each retired affordance
-    // to explain why it left.
-    let markup = markup_only(TOPBAR);
+    // ADR-0025's retirements, and the one box that stays.
     assert!(
         !markup.contains("iconbtn"),
         "the notifications bell is retired — it was never wired"
@@ -436,7 +444,7 @@ fn topbar_menu_is_native_and_registers_with_the_stack() {
          arbitrates instead of being covered"
     );
     assert!(
-        TOPBAR.contains("Command palette"),
+        markup.contains("Command palette"),
         "the ⌘K stub stays exactly as it is until the palette slice \
          (ADR-0028, human ruling)"
     );
@@ -566,7 +574,7 @@ fn modal_close_toast_dismiss_and_bare_copy_are_native_buttons() {
         (COPY_BUTTON, "the bare copy trigger"),
     ] {
         assert!(
-            src.contains("<button") && src.contains(TYPE_BUTTON),
+            markup_only(src).contains("<button") && markup_only(src).contains(TYPE_BUTTON),
             "{what} must be a native <button type=\"button\"> — inside a \
              form a type-less button submits it, and a span reaches \
              neither the keyboard nor the ADR-0007 focus ring"
@@ -578,14 +586,14 @@ fn modal_close_toast_dismiss_and_bare_copy_are_native_buttons() {
     emits(MODAL_SHELL, "class=\"x\"", ".modal .m-hd .x");
     emits(TOAST_RUNTIME, "class=\"x\"", ".toast .x");
     assert!(
-        MODAL_SHELL.contains("aria-label=\"Close dialog\"")
-            && MODAL_SHELL.contains("title=\"Close (Esc)\""),
+        markup_only(MODAL_SHELL).contains("aria-label=\"Close dialog\"")
+            && markup_only(MODAL_SHELL).contains("title=\"Close (Esc)\""),
         "the modal close keeps a named label and the Esc hint in its \
          tooltip"
     );
     assert!(
-        TOAST_RUNTIME.contains("aria-label=\"Dismiss notification\"")
-            && TOAST_RUNTIME.contains("<span aria-hidden=\"true\">"),
+        markup_only(TOAST_RUNTIME).contains("aria-label=\"Dismiss notification\"")
+            && markup_only(TOAST_RUNTIME).contains("<span aria-hidden=\"true\">"),
         "the toast dismiss is named by aria-label, and its × is hidden \
          decoration — read aloud, \"times\" is not a dismissal"
     );

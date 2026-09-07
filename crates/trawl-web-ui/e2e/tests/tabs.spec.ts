@@ -134,3 +134,32 @@ test('drawer strip is a named tablist', async ({ page, request }) => {
   await expect(meta).toHaveCount(1);
   expect(await insideTablist(meta)).toBe(false);
 });
+
+test('an unknown drawer tab id still yields one tab stop', async ({ page, request }) => {
+  // `?ntab=` is client text. A strip that answered "none of these"
+  // rendered every tab at tabindex="-1" — no keyboard entry point at
+  // all — while the pane below it showed the first tab's content. An
+  // unmatched id selects the first tab, so markup and pane agree.
+  await resetScenario(request, 'populated');
+  await page.goto(`/jobs/nets?net=${POPULATED.netId}&ntab=bogus`);
+
+  await expect(page.locator(SEL.drawerPanel)).toBeVisible();
+  const strip = page.getByRole('tablist', { name: 'Saved query details' });
+  await expect(strip).toHaveCount(1);
+
+  const tabs = page.locator(SEL.drawerTab);
+  await expect(tabs).toHaveCount(2);
+  expect(await selectedFlags(tabs)).toEqual(['true', 'false']);
+  expect(await tabindexes(tabs)).toEqual(['0', '-1']);
+
+  // The strip is reachable by Tab: the drawer's close button is the
+  // last control before it in DOM order.
+  await page.locator(SEL.drawerClose).focus();
+  await page.keyboard.press('Tab');
+  await expect(tabs.nth(0)).toBeFocused();
+
+  // And once inside, the arrow walk works from that entry point.
+  await page.keyboard.press('ArrowRight');
+  await expect(tabs.nth(1)).toBeFocused();
+  await expect(tabs.nth(1)).toHaveAccessibleName('Runs');
+});
