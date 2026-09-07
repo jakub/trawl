@@ -61,6 +61,17 @@ the PR diff.
   is network-silent, so that spec reads three separate observables: the
   browser's timer table, the stub's status-read count, and a status read
   the stub parks open across the teardown and answers afterwards.
+- The native controls and the shared menu contract (ADR-0028): the
+  topbar account menu's keyboard lifecycle (open, arrow walk with wrap,
+  Home/End, Escape, Tab, activation, outside mousedown, and Escape being
+  topmost-only with a modal above it), the row `ActionsMenu`'s single tab
+  stop and its restore-before-callback ordering, both tab strips as named
+  tablists with manual activation, and the modal close / toast dismiss /
+  bare copy button as keyboard-operable named buttons. These are the
+  first specs that assert on `document.activeElement` (through
+  `toBeFocused`) and on a tabindex vector across a widget's items — one
+  item at `0` is the claim, so asserting the focused item alone would
+  pass with every item tabbable.
 - No visual regression / screenshot diffing.
 - No real backend — every response is a fixture in `harness/fixtures.mjs`.
   Re-verify those shapes against `crates/trawl-api/src/lib.rs` /
@@ -84,6 +95,23 @@ imported it first and silently never runs for the others. That is what
 was happening — only `api-failure.spec.ts` was getting the reset and the
 guards, which is why a spec asserting an exact captured-query count
 failed when it ran after another file and passed when run alone.
+
+## Scenarios
+
+`default` is what the auto fixture resets to. The others are named in
+`harness/server.mjs` and selected with `resetScenario(request, name)` at
+the top of a test body: `unauth` (a 401 from `/api/auth/me`),
+`query-500`, `stream-burst`, and `populated`.
+
+`populated` answers `/api/v1/saved` and `/api/v1/schema/services` with a
+corpus that has one net and one service in it, which is what makes a row
+`ActionsMenu` and the service drawer's tab strip reachable. It is an
+addition rather than a change to `default`: specs written before it read
+the empty state deliberately, and repopulating the default would have
+rewritten their meaning silently. Both bodies live under `harness/wire/`
+and are pinned by CONTENT as well as shape — the service is named
+`nginx` and the net's id is `1`, mirrored in `fixtures.ts`'s `POPULATED`,
+because the specs navigate to `?svc=nginx` and `?net=1` by hand.
 
 ## Flake policy
 
