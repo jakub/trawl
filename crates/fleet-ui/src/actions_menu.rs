@@ -20,7 +20,7 @@ use leptos::html::{Button, Div};
 use leptos::prelude::*;
 use leptos::web_sys;
 
-use crate::menu::{MenuItem, MenuPanel};
+use crate::menu::{MenuEntry, MenuItem, MenuPanel};
 
 /// One entry in the menu. `danger` renders the destructive (red)
 /// treatment. The menu closes, and focus returns to the trigger, before
@@ -63,12 +63,14 @@ pub fn ActionsMenu(items: Vec<ActionItem>) -> impl IntoView {
     let wrap_ref = NodeRef::<Div>::new();
     let trigger_ref = NodeRef::<Button>::new();
 
-    let entries: Vec<MenuItem> = items
+    let entries: Vec<MenuEntry> = items
         .into_iter()
-        .map(|item| MenuItem {
-            label: Signal::stored(item.label.to_string()),
-            danger: item.danger,
-            on_activate: item.on_click,
+        .map(|item| {
+            MenuEntry::Item(MenuItem {
+                label: Signal::stored(item.label.to_string()),
+                danger: item.danger,
+                on_activate: item.on_click,
+            })
         })
         .collect();
 
@@ -92,7 +94,7 @@ pub fn ActionsMenu(items: Vec<ActionItem>) -> impl IntoView {
                 <MenuPanel
                     panel_class="actions-menu"
                     menu_label="Actions"
-                    items=entries.clone()
+                    entries=entries.clone()
                     stop_click_propagation=true
                     open=open
                     wrap_ref=wrap_ref

@@ -90,6 +90,16 @@ mod component {
         pub on_activate: Callback<()>,
     }
 
+    /// What a menu renders, in order: commands and the rules between
+    /// groups of them. A separator is never focusable and never counts
+    /// toward the roving index, because the walk indexes the queried
+    /// `[role="menuitem"]` list and a separator is not in it.
+    #[derive(Clone)]
+    pub(crate) enum MenuEntry {
+        Item(MenuItem),
+        Separator,
+    }
+
     /// The open menu panel. Mounted only while `open` is true — a
     /// closed menu must not sit on the overlay stack shadowing Escape
     /// for the layers beneath it.
@@ -106,7 +116,7 @@ mod component {
     pub(crate) fn MenuPanel(
         panel_class: &'static str,
         menu_label: &'static str,
-        items: Vec<MenuItem>,
+        entries: Vec<MenuEntry>,
         #[prop(optional)] header: Option<Children>,
         #[prop(default = false)] stop_click_propagation: bool,
         open: RwSignal<bool>,
@@ -187,7 +197,7 @@ mod component {
             }
         };
 
-        let rendered = render_items(items, focused, stop_click_propagation, close);
+        let rendered = render_entries(entries, focused, stop_click_propagation, close);
 
         view! {
             <div class=panel_class tabindex="-1" node_ref=panel_ref>
@@ -243,20 +253,31 @@ mod component {
         );
     }
 
-    /// The item buttons, in the order the roving walk indexes them.
-    /// Each carries the roving tabindex (one `0`, the rest `-1`) and
-    /// syncs the index on focus, so a pointer landing on an item leaves
-    /// the arrows walking from where the user actually is.
-    fn render_items(
-        items: Vec<MenuItem>,
+    /// The panel's entries. Item buttons carry the roving tabindex (one
+    /// `0`, the rest `-1`) and sync the index on focus, so a pointer
+    /// landing on an item leaves the arrows walking from where the user
+    /// actually is. Only items are counted: these indices are the
+    /// indices of the queried `[role="menuitem"]` list the walk reads,
+    /// which is why a separator can neither be focused nor be skipped
+    /// past by an off-by-one.
+    fn render_entries(
+        entries: Vec<MenuEntry>,
         focused: RwSignal<usize>,
         stop_click_propagation: bool,
         close: impl Fn(MenuClose) + Copy + 'static,
     ) -> Vec<AnyView> {
-        items
+        let mut next_item = 0usize;
+        entries
             .into_iter()
-            .enumerate()
-            .map(|(index, item)| {
+            .map(|entry| {
+                let item = match entry {
+                    MenuEntry::Separator => {
+                        return view! { <div class="sep" role="separator"></div> }.into_any();
+                    }
+                    MenuEntry::Item(item) => item,
+                };
+                let index = next_item;
+                next_item += 1;
                 let class = if item.danger { "item danger" } else { "item" };
                 let label = item.label;
                 let cb = item.on_activate;
@@ -286,7 +307,7 @@ mod component {
 }
 
 #[cfg(target_arch = "wasm32")]
-pub(crate) use component::{MenuItem, MenuPanel};
+pub(crate) use component::{MenuEntry, MenuItem, MenuPanel};
 
 #[cfg(test)]
 mod tests {

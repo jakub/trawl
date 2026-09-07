@@ -44,6 +44,7 @@ const TOGGLE: &str = include_str!("../src/toggle.rs");
 const KBD: &str = include_str!("../src/kbd.rs");
 const ACTIONS_MENU: &str = include_str!("../src/actions_menu.rs");
 const MENU: &str = include_str!("../src/menu.rs");
+const TOPBAR: &str = include_str!("../src/topbar.rs");
 const ROVING: &str = include_str!("../src/roving.rs");
 const COPY_BUTTON: &str = include_str!("../src/copy_button.rs");
 const ICON: &str = include_str!("../src/icon.rs");
@@ -53,6 +54,17 @@ const WHEN: &str = include_str!("../src/time/when.rs");
 const CLOCK: &str = include_str!("../src/time/clock.rs");
 const ATMOSPHERE: &str = include_str!("../src/atmosphere/component.rs");
 const FLEET_CSS: &str = include_str!("../styles/fleet-ui.css");
+
+/// The source with its comment lines removed, for the negative scans:
+/// a module doc that explains why an affordance was retired names the
+/// affordance, and prose is not markup. Same trick as trawl-core's
+/// `now_anchor_contract`.
+fn markup_only(src: &str) -> String {
+    src.lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
 /// Assert `src` contains `hook` (a class literal or class-idiom substring),
 /// blaming the CSS rule that hook must line up with.
@@ -268,7 +280,7 @@ fn the_menu_contract_is_shared_and_walks_by_index() {
     // Both menus mount one panel, and that panel is the only place the
     // lifecycle lives: no second set of window listeners anywhere.
     assert!(
-        !ACTIONS_MENU.contains("use_event_listener"),
+        !markup_only(ACTIONS_MENU).contains("use_event_listener"),
         "menu lifecycle (Escape, outside mousedown) belongs to menu.rs \
          alone — a second listener is a second contract"
     );
@@ -294,6 +306,73 @@ fn the_menu_contract_is_shared_and_walks_by_index() {
         MENU.contains(r#"if focused.get() == index { "0" } else { "-1" }"#),
         "menu items carry a true roving tabindex — every item tabbable \
          puts N tab stops in the page and defeats the arrow walk"
+    );
+}
+
+#[test]
+fn topbar_menu_is_native_and_registers_with_the_stack() {
+    // The trigger paints through `.topbar .user` and the panel through
+    // `.user-menu`; the header/name/mail hooks are the identity block
+    // the panel renders outside role="menu".
+    emits(TOPBAR, r#"class="user""#, ".topbar .user");
+    emits(TOPBAR, r#"class="avatar""#, ".topbar .user .avatar");
+    emits(TOPBAR, r#"class="who""#, ".topbar .user .who");
+    emits(TOPBAR, r#"panel_class="user-menu""#, ".user-menu");
+    emits(TOPBAR, r#"class="hdr""#, ".user-menu .hdr");
+    emits(TOPBAR, r#"class="mail""#, ".user-menu .hdr .mail");
+    emits(MENU, r#"class="sep""#, ".user-menu .sep");
+
+    // A native trigger that reports its state, not a div with on:click.
+    assert!(
+        TOPBAR.contains("<button") && TOPBAR.contains(r#"type="button""#),
+        "the account trigger must be a native <button type=\"button\"> \
+         — a div reaches neither the keyboard nor the focus ring"
+    );
+    assert!(
+        TOPBAR.contains(r#"aria-haspopup="menu""#) && TOPBAR.contains("aria-expanded"),
+        "the trigger must announce that it opens a menu and whether it \
+         is open"
+    );
+    assert!(
+        TOPBAR.contains("MenuPanel"),
+        "the account menu mounts the shared menu panel — its own panel \
+         is how it ended up with no layer, no Escape and no restore"
+    );
+    assert!(
+        !markup_only(TOPBAR).contains("use_event_listener"),
+        "the menu lifecycle belongs to menu.rs; a listener here is a \
+         second contract"
+    );
+
+    // ADR-0025's retirements, and the one box that stays. Scanned
+    // against the markup: the module doc names each retired affordance
+    // to explain why it left.
+    let markup = markup_only(TOPBAR);
+    assert!(
+        !markup.contains("iconbtn"),
+        "the notifications bell is retired — it was never wired"
+    );
+    assert!(
+        !markup.contains("⌘⇧L"),
+        "the theme chord is not bound (it collides with Bitwarden's \
+         autofill and Safari's own binding), so the hint chip would be \
+         a lie"
+    );
+    assert!(
+        !markup.contains("API tokens") && !markup.contains("Profile"),
+        "the two disabled rows are retired — a menu item that cannot be \
+         activated is not a menu item"
+    );
+    assert!(
+        !markup.contains(r#"class="overlay""#),
+        "the menu's private full-viewport scrim is gone: dismissal is \
+         the shared outside-mousedown check, so a modal above the menu \
+         arbitrates instead of being covered"
+    );
+    assert!(
+        TOPBAR.contains("Command palette"),
+        "the ⌘K stub stays exactly as it is until the palette slice \
+         (ADR-0028, human ruling)"
     );
 }
 
