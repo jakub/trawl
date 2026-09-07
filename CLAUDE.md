@@ -626,3 +626,4 @@ The glossary is split by bounded context. The root `context.md` holds the cross-
 
 - `context.md` — root: senders, envelope, hot/cold storage, pins, repin, lanes, outcome verbs
 - `crates/trawl-web-ui/context.md` — the browser SPA: search URL, structured state, executed vs effective query, filter, range, malformed link, mode, navigator (ADR-0027)
+- `crates/fleet-ui/context.md` — the shared design system: overlay stack, layer, focus policy, focus owner, opener, scrim, menu, trigger, panel, menu item, command palette vs atmosphere palette, tab strip, drawer, toast host, toast bus, bare copy mode, native control (ADR-0003, ADR-0025, ADR-0028)

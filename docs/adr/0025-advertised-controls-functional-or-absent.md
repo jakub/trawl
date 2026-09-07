@@ -36,6 +36,13 @@ Per affordance:
 - **User menu: Profile and API tokens leave; ⌘⇧L binds.** The chord is a
   window-level keydown in fleet-ui, beside the Escape arbitration that is
   already there.
+  *Amended 2026-09-07 (slice D prep, ADR-0028): ⌘⇧L does NOT bind.*
+  Ctrl/Cmd+Shift+L is Bitwarden's default autofill chord and Safari's
+  ⇧⌘L "search with Google"; a page-level keydown cannot pre-empt an
+  extension command, so the chord would autofill for some operators and
+  toggle the theme for others, which is the broken promise this ADR bans.
+  The hint chip leaves with the two rows; the theme item stays a plain
+  menu command; no replacement chord is chosen here.
 - **Help links to the docs site.** An in-app help surface is not planned.
 - **Results-toolbar Save reuses the editor's save modal.** One save flow,
   and the modal's input is the editor buffer (the audit's "Save after

@@ -1,0 +1,91 @@
+# fleet-ui
+
+Vocabulary for the shared leptos design system consumed by trawl-web-ui and coastwatch. Cross-cutting terms (event, field, pin, lane) live in the root `context.md`; this slice names only the chrome fleet-ui owns. Decisions live in `docs/adr/`; the overlay contract's own rules are the module doc of `crates/fleet-ui/src/overlay.rs`, which ADR-0003 and ADR-0028 cite rather than restate.
+
+## Language
+
+### Overlays and focus
+
+**Overlay stack**:
+The in-process, last-in-first-out list of open layers. It answers exactly one question per layer, whether that layer is topmost, and every layer gates its own Escape and outside-click handling on that answer. The stack never handles a key itself.
+_Avoid_: modal manager, z-index stack (the stack is logical, not visual)
+
+**Layer**:
+One open overlay's registration on the stack, alive exactly as long as its panel is mounted. A closed menu is not a layer; a mounted-but-hidden panel would be, which is why panels are separate components.
+_Avoid_: overlay (that is the family of components), popup
+
+**Focus policy**:
+What a layer claims about focus when it registers: `Trap` owns focus and cycles Tab inside its panel (the modal family), `Capture` owns focus without trapping (the drawer), `None` is invisible to focus ownership and manages its own (both menus). Topmost and focus owner are different questions: a `None` layer can be topmost for Escape while a modal beneath it still owns focus.
+_Avoid_: focus mode, trap flag
+
+**Focus owner**:
+The topmost layer whose policy is not `None`. Only the owner traps, and only the owner restores on close.
+_Avoid_: active overlay
+
+**Opener**:
+The element that had focus when a focus-owning layer mounted, captured once and restored on unmount if that layer still owns focus and the element is still in the document. Menus have no captured opener; they restore their trigger by cause (see menu).
+_Avoid_: return target, previous focus
+
+**Scrim**:
+The full-viewport backdrop a modal or drawer renders behind its panel; a mousedown on the scrim itself, and nothing inside it, dismisses. Menus have no scrim: they dismiss on a mousedown outside the trigger-plus-panel wrapper.
+_Avoid_: overlay, backdrop, mask
+
+### Menus
+
+**Menu**:
+A popup of application commands: `role="menu"` holding only menu items and separators. fleet-ui has two, the topbar's account menu and the table row's actions menu, and they share one contract: a `None` layer, one tab stop, an indexed arrow walk, Tab closes and returns to the trigger, restore by cause. Not a disclosure of links and not a listbox.
+_Avoid_: dropdown, popover, user-menu dropdown
+
+**Trigger**:
+The native button that opens a menu and reports its state through `aria-haspopup` and `aria-expanded`. It is what focus returns to on Escape, on item activation (before the item's callback runs) and on Tab; never on an outside click.
+_Avoid_: opener (that is the overlay term), toggle
+
+**Panel**:
+The mounted body of an open menu, drawer or modal. For a menu it is the positioning wrapper around the identity header and the `role="menu"` node, carries `tabindex="-1"` as the empty fallback, and exists only while open.
+_Avoid_: dropdown body, popup
+
+**Menu item**:
+A native button with `role="menuitem"` inside a menu. Exactly one item in an open menu is tabbable; the others carry `tabindex="-1"` and are reached by arrows, Home and End.
+_Avoid_: row, entry, option (that is a listbox term)
+
+**Command palette**:
+The ⌘K surface ADR-0025 assigns to slice G4. Always the two-word term: an unqualified "palette" in fleet-ui is the atmosphere palette.
+_Avoid_: palette, search box, jump
+
+**Atmosphere palette**:
+The per-theme colour stops that drive the WebGL backdrop (`atmosphere::palette`). Unrelated to the command palette.
+_Avoid_: palette (unqualified), theme colours
+
+### Strips and controls
+
+**Tab strip**:
+The `Tabs` component: a `role="tablist"` wrapping only the tab buttons, each `role="tab"` with `aria-selected` and roving tabindex, arrows move focus, Enter or Space activates. It has a required accessible name and owns no panes; the consumer renders the selected content after it. Two visual families, the workspace strip and the drawer strip, are one component with one contract.
+_Avoid_: tabs bar, segmented control (that is `Segmented`, an `aria-pressed` group), toggle buttons
+
+**Workspace strip**:
+The `TabsStyle::Workspace` family: the page-level strip with a trailing action slot outside the tablist.
+_Avoid_: page tabs, results tabs
+
+**Drawer strip**:
+The `TabsStyle::Drawer` family: the strip at the top of a drawer with metadata text outside the tablist.
+_Avoid_: drawer tabs, sd-tabs
+
+**Drawer**:
+The right-slide detail inspector: a `Capture` layer with a scrim, a drawer strip and a body the consumer fills.
+_Avoid_: side panel, sheet, inspector
+
+**Toast host**:
+The one mounted `Toasts` component that renders the queue. Its dismiss control is a named native button.
+_Avoid_: toaster, notification area
+
+**Toast bus**:
+The push handle consumers use to raise a toast. Kinds are data on the bus; announcement semantics are not part of the bus.
+_Avoid_: notifier, toast service
+
+**Bare copy mode**:
+`CopyButton` rendered with a caller-supplied `class`: a native button the caller's class styles entirely, reset included. The default mode renders the design system's own button.
+_Avoid_: inline copy, span mode
+
+**Native control**:
+Any fleet-ui element that acts on click, rendered as `<button type="button">` so the keyboard, the ADR-0007 focus ring and assistive technology reach it. The only clickable non-buttons left are scrims.
+_Avoid_: pseudo-button (that is the defect, not the term), clickable
