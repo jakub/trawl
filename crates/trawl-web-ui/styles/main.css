@@ -1120,6 +1120,13 @@
 .tbl-row .row-act, .tbl-row .link, .tbl-row .row-menu {
   position: relative; z-index: 1;
 }
+/* z-index: 1 makes the cell a stacking context, so an open ActionsMenu
+ * panel (fleet-ui z-index 10, mounted inside this cell, no portal) is
+ * still painted under the NEXT row's cells, which carry the same 1 and
+ * come later in the DOM: the menu's lower half is covered and a click
+ * there lands on the next row's trigger. The panel exists only while the
+ * menu is open, so :has lifts the cell exactly then. */
+.tbl-row .row-menu:has(.actions-menu) { z-index: 3; }
 .tbl-row .num { text-align: right; font-variant-numeric: tabular-nums; color: var(--ink); }
 
 /* Sortable header cells. Unscoped from `.tbl-hd` so the service
