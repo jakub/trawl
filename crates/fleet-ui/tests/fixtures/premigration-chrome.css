@@ -18,6 +18,14 @@
  * Structure (layout, spacing, transitions) is otherwise unchanged —
  * the byte-parity guarantee now anchors on THIS baseline.
  *
+ * 2026-09-06, issue #159 (ADR-0028, native controls): .tabs .t and
+ * .sd-tabs .tb re-captured from the shipped fleet-ui.css. Both tabs are
+ * now <button role="tab"> instead of a div and a span, so each rule
+ * gained the two-declaration button reset it needs to paint as it did:
+ * `background: none` and `border: none`, prepended so the rule's own
+ * later `border-bottom` still wins. Nothing else in either body moved,
+ * and the declared weights (500 active, 600 on) are untouched.
+ *
  * The four DELIBERATE pre-ADR-0005 deltas (rail/mode anchor underline
  * suppression, .login-card .error respacing, .shell auto footer row)
  * are NOT here — they changed on purpose and are pinned individually
@@ -56,6 +64,8 @@
 }
 
 .tabs .t {
+  background: none;
+  border: none;
   padding: 8px 12px;
   font-size: var(--fs-base);
   color: var(--ink-3);
@@ -147,6 +157,7 @@
 }
 
 .sd-tabs .tb {
+  background: none; border: none;
   font-family: var(--font-ui); font-size: var(--fs-base); font-weight: 500;
   color: var(--ink-3); padding: 9px 12px; cursor: pointer;
   border-bottom: 2px solid transparent; margin-bottom: -1px;

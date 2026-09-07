@@ -2,28 +2,60 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `<Tabs/>` — generic tab strip.
+//! `<Tabs/>` — generic tab strip, rendered as a WAI-ARIA tablist
+//! (ADR-0028).
 //!
 //! One component, two class families, selected by [`TabsStyle`]:
 //!
 //! - [`TabsStyle::Workspace`] — trawl's search-workspace strip
-//!   (`.tabs > div.t.active`, weight 500, optional per-tab count chip).
-//! - [`TabsStyle::Drawer`] — the drawer strip (`.sd-tabs > span.tb.on`,
-//!   weight 600, optional trailing meta text).
-//!   [`Drawer`](crate::Drawer) composes this internally.
+//!   (`.tabs > .tablist > button.t.active`, weight 500, optional
+//!   per-tab count chip).
+//! - [`TabsStyle::Drawer`] — the drawer strip
+//!   (`.sd-tabs > .tablist > button.tb.on`, weight 600, optional
+//!   trailing meta text). [`Drawer`](crate::Drawer) composes this
+//!   internally.
 //!
-//! The families differ in element tag (`div` vs `span`) and in the
-//! active-class idiom because each matches its own CSS rules; merging
-//! them would point one strip at the other's font weight. Tab identity
-//! is a `&'static str` id; apps with typed tab enums adapt at the call
-//! site (a two-line id ↔ enum map), keeping app semantics in the app
-//! (ADR-0002).
+//! Both families render `<button type="button" role="tab">`; they
+//! differ in class and in the active-class idiom only, because each
+//! matches its own CSS rules and merging them would point one strip at
+//! the other's font weight. Tab identity is a `&'static str` id; apps
+//! with typed tab enums adapt at the call site (a two-line id ↔ enum
+//! map), keeping app semantics in the app (ADR-0002).
 //!
-//! For exclusive-choice pill strips that aren't view tabs (format
-//! pickers and the like), use [`Segmented`](crate::segmented)
-//! instead — a third strip idiom with its own `.seg` family.
+//! ## What the strip owns
+//!
+//! The `role="tablist"` node wraps the tab buttons and nothing else.
+//! The flex spacer, the workspace family's `trailing` action slot and
+//! the drawer family's `meta` text are siblings of that node, inside
+//! the outer `.tabs` / `.sd-tabs` container: a Save link announced as a
+//! tab is worse than one announced as a button. An `items`-less strip
+//! (the field case drawer uses the container purely as a meta bar)
+//! renders the `.tablist` div without `role` or `aria-label`, because a
+//! named tablist holding no tabs is a defect an assistive technology
+//! would report.
+//!
+//! `label` is required and names the strip ("Results", "Service
+//! details"): a screen reader announcing "tab list" with no name leaves
+//! two strips on one page indistinguishable.
+//!
+//! ## Keyboard
+//!
+//! Arrow Right/Left wrap, Home and End jump to the ends
+//! ([`crate::roving::horizontal_nav`]), each moving FOCUS only. The
+//! strip's single tab stop is derived from SELECTION — `aria-selected`
+//! and `tabindex` are one predicate over `active`, so the strip needs no
+//! focus state of its own — which is the deliberate deviation from the
+//! APG that [`crate::roving`] documents. Activation is manual: Enter and
+//! Space are the native button's own click, and an arrow never runs
+//! `on_change`, so arrowing across trawl's `?ntab=` strip does not
+//! rewrite the URL under the user.
 
+use leptos::html::Div;
 use leptos::prelude::*;
+use leptos::web_sys;
+use wasm_bindgen::JsCast;
+
+use crate::roving::{horizontal_nav, next_index};
 
 /// One tab in the strip. `count` drives the workspace count chip
 /// (`.t .c`, e.g. the Events row count) — it renders only while the
@@ -73,42 +105,66 @@ pub enum TabsStyle {
 }
 
 /// Generic tab strip. `active` is the id of the selected tab;
-/// `on_change` fires with the clicked tab's id. `meta` renders the
-/// drawer strip's trailing `.meta` text (service drawer's
-/// "N events · size · M fields"); ignored by the workspace family.
-/// (`meta` is a reactive optional — `MaybeProp` — so live counts tick,
-/// while static `String`s still convert via `into` and
-/// [`Drawer`](crate::Drawer) forwards its own optional straight
+/// `on_change` fires with the clicked tab's id. `label` names the
+/// tablist for assistive technology and is required (see the module
+/// docs). `meta` renders the drawer strip's trailing `.meta` text
+/// (service drawer's "N events · size · M fields"); ignored by the
+/// workspace family. (`meta` is a reactive optional — `MaybeProp` — so
+/// live counts tick, while static `String`s still convert via `into`
+/// and [`Drawer`](crate::Drawer) forwards its own optional straight
 /// through.)
 ///
 /// `trailing` is the workspace family's right-aligned action slot,
-/// rendered after the flex spacer (trawl's results Save/Export links);
-/// ignored by the drawer family, which has `meta` in that position.
+/// rendered after the flex spacer and outside the tablist (trawl's
+/// results Save/Export links); ignored by the drawer family, which has
+/// `meta` in that position.
 #[component]
 pub fn Tabs(
     #[prop(optional)] style: TabsStyle,
     items: Vec<TabItem>,
+    #[prop(into)] label: String,
     #[prop(into)] active: Signal<String>,
     on_change: Callback<String>,
     #[prop(into, optional)] meta: MaybeProp<String>,
     #[prop(optional)] trailing: Option<Children>,
 ) -> impl IntoView {
+    let list_ref = NodeRef::<Div>::new();
+    let ids: Vec<&'static str> = items.iter().map(|i| i.id).collect();
+    // A strip with no tabs is a bare container: naming an empty tablist
+    // would announce a widget that has nothing in it.
+    let named = !ids.is_empty();
+    let role = named.then_some("tablist");
+    let aria_label = named.then_some(label);
+    let on_keydown = tab_keydown(list_ref, ids, active);
+
     match style {
         TabsStyle::Workspace => view! {
             <div class="tabs">
-                {items.into_iter().map(|item| {
-                    let id = item.id;
-                    view! {
-                        <div
-                            class="t"
-                            class:active=move || active.get() == id
-                            on:click=move |_| on_change.run(id.to_string())
-                        >
-                            <span>{item.label}</span>
-                            {move || item.count.get().map(|c| view! { <span class="c">{c}</span> })}
-                        </div>
-                    }
-                }).collect_view()}
+                <div
+                    class="tablist"
+                    role=role
+                    aria-label=aria_label
+                    node_ref=list_ref
+                    on:keydown=on_keydown
+                >
+                    {items.into_iter().map(|item| {
+                        let id = item.id;
+                        view! {
+                            <button
+                                type="button"
+                                class="t"
+                                class:active=move || active.get() == id
+                                role="tab"
+                                aria-selected=move || (active.get() == id).to_string()
+                                tabindex=move || if active.get() == id { "0" } else { "-1" }
+                                on:click=move |_| on_change.run(id.to_string())
+                            >
+                                <span>{item.label}</span>
+                                {move || item.count.get().map(|c| view! { <span class="c">{c}</span> })}
+                            </button>
+                        }
+                    }).collect_view()}
+                </div>
                 <div class="sp"></div>
                 {trailing.map(|t| t())}
             </div>
@@ -116,20 +172,87 @@ pub fn Tabs(
         .into_any(),
         TabsStyle::Drawer => view! {
             <div class="sd-tabs">
-                {items.into_iter().map(|item| {
-                    let id = item.id;
-                    view! {
-                        <span
-                            class=move || if active.get() == id { "tb on" } else { "tb" }
-                            on:click=move |_| on_change.run(id.to_string())
-                        >{item.label}</span>
-                    }
-                }).collect_view()}
+                <div
+                    class="tablist"
+                    role=role
+                    aria-label=aria_label
+                    node_ref=list_ref
+                    on:keydown=on_keydown
+                >
+                    {items.into_iter().map(|item| {
+                        let id = item.id;
+                        view! {
+                            <button
+                                type="button"
+                                class=move || if active.get() == id { "tb on" } else { "tb" }
+                                role="tab"
+                                aria-selected=move || (active.get() == id).to_string()
+                                tabindex=move || if active.get() == id { "0" } else { "-1" }
+                                on:click=move |_| on_change.run(id.to_string())
+                            >{item.label}</button>
+                        }
+                    }).collect_view()}
+                </div>
                 <span class="sp"></span>
                 {move || meta.get().map(|m| view! { <span class="meta">{m}</span> })}
             </div>
         }
         .into_any(),
+    }
+}
+
+/// The tablist's arrow walk: move focus, never selection.
+///
+/// The current position is read from the DOM — the index of
+/// `document.activeElement` among the queried `[role="tab"]` list —
+/// rather than from a signal, because focus may sit on a tab the user
+/// arrowed to and never activated, which by construction is not the
+/// selected one. When focus is somewhere else entirely (a keypress
+/// routed here from the container), the walk starts from the selected
+/// tab.
+fn tab_keydown(
+    list_ref: NodeRef<Div>,
+    ids: Vec<&'static str>,
+    active: Signal<String>,
+) -> impl Fn(web_sys::KeyboardEvent) + 'static {
+    move |e: web_sys::KeyboardEvent| {
+        let Some(nav) = horizontal_nav(&e.key()) else {
+            return;
+        };
+        e.prevent_default();
+        let Some(list) = list_ref.get_untracked() else {
+            return;
+        };
+        let Ok(tabs) = list.query_selector_all(r#"[role="tab"]"#) else {
+            return;
+        };
+        let len = usize::try_from(tabs.length()).unwrap_or(0);
+        let focused = leptos::prelude::document().active_element();
+        let current = (0..len)
+            .find(|i| {
+                u32::try_from(*i)
+                    .ok()
+                    .and_then(|i| tabs.get(i))
+                    .zip(focused.as_ref())
+                    .is_some_and(|(node, el)| el.is_same_node(Some(&node)))
+            })
+            .or_else(|| {
+                let selected = active.get_untracked();
+                ids.iter().position(|id| *id == selected)
+            })
+            .unwrap_or(0);
+        let Some(next) = next_index(current, len, nav) else {
+            return;
+        };
+        // Focus moves synchronously off this event, so a held arrow key
+        // repeats at the browser's own rate instead of racing an effect.
+        if let Some(el) = u32::try_from(next)
+            .ok()
+            .and_then(|i| tabs.get(i))
+            .and_then(|n| n.dyn_into::<web_sys::HtmlElement>().ok())
+        {
+            let _ = el.focus();
+        }
     }
 }
 

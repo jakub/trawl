@@ -77,9 +77,24 @@ pub(crate) fn vertical_nav(key: &str) -> Option<Nav> {
     }
 }
 
+/// The key map for a horizontally-arranged widget (both tab strips):
+/// Arrow Right/Left plus Home/End. Vertical arrows are left alone, so a
+/// strip inside a scrolling pane still scrolls with Up and Down, and
+/// Enter/Space stay the native button's own activation, which is what
+/// makes activation manual.
+pub(crate) fn horizontal_nav(key: &str) -> Option<Nav> {
+    match key {
+        "ArrowRight" => Some(Nav::Next),
+        "ArrowLeft" => Some(Nav::Prev),
+        "Home" => Some(Nav::First),
+        "End" => Some(Nav::Last),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Nav, next_index, vertical_nav};
+    use super::{Nav, horizontal_nav, next_index, vertical_nav};
 
     #[test]
     fn next_and_prev_wrap_at_both_ends() {
@@ -143,6 +158,45 @@ mod tests {
                 None,
                 "`{key}` must not be read as a menu navigation"
             );
+        }
+    }
+    #[test]
+    fn horizontal_keys_map_to_their_navigations_and_nothing_else() {
+        assert_eq!(horizontal_nav("ArrowRight"), Some(Nav::Next));
+        assert_eq!(horizontal_nav("ArrowLeft"), Some(Nav::Prev));
+        assert_eq!(horizontal_nav("Home"), Some(Nav::First));
+        assert_eq!(horizontal_nav("End"), Some(Nav::Last));
+        for key in [
+            "ArrowDown",
+            "ArrowUp",
+            "Escape",
+            "Tab",
+            "Enter",
+            " ",
+            "a",
+            "arrowright",
+        ] {
+            assert_eq!(
+                horizontal_nav(key),
+                None,
+                "`{key}` must not be read as a tab-strip navigation"
+            );
+        }
+    }
+
+    #[test]
+    fn the_two_key_maps_share_only_the_endpoints() {
+        // Home and End mean the same thing in both orientations; the
+        // arrows do not overlap at all, so a strip nested in a menu (or
+        // the reverse) can never read one widget's arrow as the other's.
+        for key in ["Home", "End"] {
+            assert_eq!(vertical_nav(key), horizontal_nav(key));
+        }
+        for key in ["ArrowDown", "ArrowUp"] {
+            assert!(vertical_nav(key).is_some() && horizontal_nav(key).is_none());
+        }
+        for key in ["ArrowRight", "ArrowLeft"] {
+            assert!(horizontal_nav(key).is_some() && vertical_nav(key).is_none());
         }
     }
 }

@@ -185,6 +185,7 @@ fn DrawerProbe() -> impl IntoView {
                     TabItem::with_count("events", "Events", Signal::derive(|| Some(1287))),
                     TabItem::new("viz", "Visualization"),
                 ]
+                label="Demo workspace"
                 active=workspace_tab
                 on_change=Callback::new(move |id: String| workspace_tab.set(id))
             />
@@ -195,6 +196,7 @@ fn DrawerProbe() -> impl IntoView {
                     TabItem::new("overview", "Overview"),
                     TabItem::new("fields", "Fields"),
                 ]
+                tabs_label="Demo service"
                 active_tab=drawer_tab
                 on_tab_change=Callback::new(move |id: String| drawer_tab.set(id))
                 on_close=Callback::new(move |()| show_drawer.set(false))

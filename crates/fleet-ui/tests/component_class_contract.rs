@@ -145,6 +145,67 @@ fn tabs_emits_both_strip_families_with_distinct_active_idioms() {
 }
 
 #[test]
+fn tabs_render_a_named_tablist() {
+    // ADR-0028: the tabs are native buttons inside a named tablist,
+    // and only the tabs are inside it — the spacer, the trailing
+    // action slot and the drawer's meta text are siblings of that
+    // node, so a Save link is never announced as a tab.
+    assert!(
+        TABS.contains(r#"class="tablist""#) && TABS.contains("role=role"),
+        "the strip must render a `.tablist` node whose role is the \
+         computed one — an unconditional role would name an empty strip \
+         (the field case drawer passes no tabs at all)"
+    );
+    assert!(
+        TABS.contains(r#"role="tab""#) && TABS.contains("aria-selected"),
+        "each tab must carry role=\"tab\" and aria-selected — without \
+         them the strip is a row of buttons with no relationship"
+    );
+    assert!(
+        TABS.contains(r#"type="button""#),
+        "tabs are <button type=\"button\">: inside a form, a type-less \
+         button submits it"
+    );
+    // Selection-derived roving tabindex: one predicate over `active`,
+    // no focus state of its own (the asymmetry roving.rs documents).
+    assert!(
+        TABS.contains(r#"if active.get() == id { "0" } else { "-1" }"#),
+        "the strip's single tab stop is derived from the selected tab — \
+         every tab tabbable puts N stops in the page and defeats the \
+         arrow walk"
+    );
+    assert!(
+        TABS.contains("horizontal_nav") && TABS.contains("next_index"),
+        "the arrow walk must go through roving::horizontal_nav and \
+         roving::next_index — a second key map is a second contract"
+    );
+    assert!(
+        !TABS.contains("next_element_sibling"),
+        "no element-sibling walk: the spacer and the trailing slot sit \
+         in the same container and would take focus"
+    );
+    // Activation is manual: arrows move focus and nothing else. The
+    // walk lives in its own function that is not handed the callback,
+    // so it cannot select — Enter and Space reach on_change through the
+    // native button's click.
+    let walk = TABS
+        .split_once("fn tab_keydown(")
+        .expect("the arrow walk is its own function")
+        .1;
+    assert!(
+        !walk.contains("on_change"),
+        "the arrow walk must never run on_change — arrowing across \
+         trawl's ?ntab= strip would rewrite the URL under the user"
+    );
+    // Both drawer families name their strip.
+    assert!(
+        DRAWER.contains("tabs_label") && DRAWER.contains("label=tabs_label"),
+        "Drawer must require a tabs_label and forward it verbatim — the \
+         drawer is the only thing that knows what its strip lists"
+    );
+}
+
+#[test]
 fn badge_emits_the_bdg_class_and_not_the_rail_chip_class() {
     // <Badge> composes `bdg {tone}` via the natively-tested badge_class.
     emits(BADGE, "badge_class(tone)", ".bdg");

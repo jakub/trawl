@@ -664,6 +664,8 @@ textarea:focus-visible,
   flex-shrink: 0;
 }
 .tabs .t {
+  background: none;
+  border: none;
   padding: 8px 12px;
   font-size: var(--fs-base);
   color: var(--ink-3);
@@ -679,6 +681,11 @@ textarea:focus-visible,
 .tabs .t.active { color: var(--ink); border-bottom-color: var(--accent); font-weight: 500; }
 .tabs .t .c { color: var(--ink-3); font-variant-numeric: tabular-nums; font-size: var(--fs-small); }
 .tabs .sp { flex: 1; }
+/* The role="tablist" node holds ONLY the tabs (ADR-0028); the spacer
+ * and the trailing action slot are its siblings, so the strip keeps one
+ * flex row and each tab's -1px bottom margin still laps the container's
+ * border. */
+.tablist { display: flex; align-items: center; }
 
 /* ─────────────────────────────────────────────────────────────────
  *  Drawer shell — fleet_ui::Drawer (issue #28). Scrim, right-slide
@@ -726,6 +733,7 @@ textarea:focus-visible,
   background: var(--panel);
 }
 .sd-tabs .tb {
+  background: none; border: none;
   font-family: var(--font-ui); font-size: var(--fs-base); font-weight: 500;
   color: var(--ink-3); padding: 9px 12px; cursor: pointer;
   border-bottom: 2px solid transparent; margin-bottom: -1px;
@@ -735,6 +743,10 @@ textarea:focus-visible,
 .sd-tabs .tb.on { color: var(--ink); border-bottom-color: var(--accent); font-weight: 600; }
 .sd-tabs .sp { flex: 1; }
 .sd-tabs .meta { font-size: var(--fs-small); color: var(--ink-3); padding-right: 4px; }
+/* The 4px inter-tab gap moves to the nested tablist. .sd-tabs keeps its
+ * own gap, which now falls either side of the flex:1 spacer and is
+ * absorbed by it — the tabs and the meta text do not move. */
+.sd-tabs .tablist { gap: 4px; }
 
 .sd-body { flex: 1; min-height: 0; overflow: auto; padding: 16px 18px; }
 
