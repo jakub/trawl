@@ -136,12 +136,12 @@ pub fn NetDrawer(
                     fallback={
                         let name = net.name.clone();
                         move || view! {
-                            <span
+                            <button
+                                type="button"
                                 class="name"
-                                title="Click to rename"
-                                style="cursor:pointer"
+                                aria-label=format!("Rename {name}")
                                 on:click=move |_| editing_name.set(true)
-                            >{name.clone()}</span>
+                            >{name.clone()}</button>
                         }
                     }
                 >
@@ -396,11 +396,14 @@ fn QuerySchedulePane(
                             <div class="interval-chips">
                                 {INTERVAL_PRESETS.iter().map(|preset| {
                                     let p = *preset;
+                                    let is_on = move || interval_buf.get() == p;
                                     view! {
-                                        <span
-                                            class=move || if interval_buf.get() == p { "interval-chip on" } else { "interval-chip" }
+                                        <button
+                                            type="button"
+                                            class=move || if is_on() { "interval-chip on" } else { "interval-chip" }
+                                            aria-pressed=move || is_on().to_string()
                                             on:click=move |_| interval_buf.set(p.to_string())
-                                        >{p}</span>
+                                        >{p}</button>
                                     }
                                 }).collect_view()}
                             </div>

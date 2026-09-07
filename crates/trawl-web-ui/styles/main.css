@@ -553,7 +553,11 @@
   font-size: var(--fs-dense);
   font-family: var(--font-mono);
 }
+/* A <button> since ADR-0029, hence the per-rule reset (ADR-0028). */
 .meta .chip .x {
+  background: none;
+  border: 0;
+  font: inherit;
   cursor: pointer;
   padding: 0 4px;
   border-radius: var(--radius-sm);
@@ -944,7 +948,17 @@
   gap: 6px;
   padding: 0 4px;
 }
-.statusbar .grp.clickable { cursor: pointer; border-radius: var(--radius-sm); }
+/* The theme control is the one clickable group and it is a <button>
+ * (ADR-0029); .statusbar .grp gives it the flex row, this gives it the
+ * reset. */
+.statusbar .grp.clickable {
+  background: none;
+  border: 0;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+}
 .statusbar .grp.clickable:hover { background: var(--panel-2); color: var(--ink-2); }
 .statusbar .dot {
   width: 6px;
@@ -1314,6 +1328,15 @@
  * fleet_ui::Drawer emits it). Title-slot CONTENT below stays app-side:
  * the .name/.sub spans are rendered by trawl's drawer call sites. */
 .sd-ttl .name { font-family: var(--font-mono); font-size: var(--fs-heading); font-weight: 600; color: var(--ink); letter-spacing: -.2px; }
+/* The net drawer's title is a rename button (ADR-0029); the service
+ * drawer's is a plain span, so the reset is scoped to the button. */
+.sd-ttl button.name {
+  background: none;
+  border: 0;
+  padding: 0;
+  text-align: left;
+  cursor: pointer;
+}
 .sd-ttl .sub { font-size: var(--fs-ui); color: var(--ink-3); }
 
 /* Overview tab */
@@ -1601,10 +1624,13 @@
 }
 
 .interval-chips { display: flex; gap: 6px; flex-wrap: wrap; }
+/* A <button> since ADR-0029; it already declares its own border,
+ * background and font, so the reset it needs is the inherited size. */
 .interval-chip {
   padding: 4px 10px; font-size: var(--fs-ui); font-family: var(--font-mono);
   border: 1px solid var(--line); border-radius: var(--radius-sm);
   cursor: pointer; color: var(--ink-3); background: var(--panel-2);
+  line-height: inherit;
   user-select: none; transition: background 120ms, border-color 120ms;
 }
 .interval-chip:hover { border-color: var(--ink-3); color: var(--ink-2); }

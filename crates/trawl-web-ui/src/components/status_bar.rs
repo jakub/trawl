@@ -35,6 +35,7 @@ pub enum StatusKind {
 }
 
 #[component]
+#[allow(clippy::too_many_lines)] // one footer, one markup tree
 pub fn StatusBar(
     #[prop(into)] status: Signal<StatusKind>,
     /// Last-search row count (`None` if nothing has run yet).
@@ -61,6 +62,16 @@ pub fn StatusBar(
         prefs.map_or("light", |p| match p.theme().get() {
             Theme::Light => "light",
             Theme::Dark => "dark",
+        })
+    };
+
+    // The visible text is the theme in force; the accessible name is
+    // what pressing the control does (ADR-0028's ruling on its menu
+    // twin), so the two read the opposite ends of the same toggle.
+    let next_theme_label = move || {
+        prefs.map_or("dark", |p| match p.theme().get() {
+            Theme::Light => "dark",
+            Theme::Dark => "light",
         })
     };
 
@@ -145,9 +156,14 @@ pub fn StatusBar(
                 </span>
             </div>
             <div class="sp"></div>
-            <div class="grp clickable" on:click=toggle_theme title="Switch theme">
+            <button
+                type="button"
+                class="grp clickable"
+                aria-label=move || format!("Switch to {} theme", next_theme_label())
+                on:click=toggle_theme
+            >
                 <span>{theme_label}</span>
-            </div>
+            </button>
         </div>
     }
 }
