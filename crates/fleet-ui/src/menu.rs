@@ -155,11 +155,15 @@ mod component {
 
         install_dismissal(layer, wrap_ref, close);
 
-        // Keydown bubbles from the focused item to the role="menu"
-        // node. Every key handled here stops propagation as well as the
-        // default: a containing modal's window-level Tab trap must not
-        // also see the Tab that just closed this menu. Escape is
-        // deliberately NOT handled here — it belongs to the window
+        // Keydown bubbles from the focused item up to the panel
+        // wrapper. It is bound on the WRAPPER, not the role="menu"
+        // node, because an empty menu's fallback focus parks on the
+        // wrapper's own tabindex="-1" and a Tab pressed there must
+        // still close the menu rather than walk off it (shadow review
+        // 1, #159). Every key handled here stops propagation as well
+        // as the default: a containing modal's window-level Tab trap
+        // must not also see the Tab that just closed this menu. Escape
+        // is deliberately NOT handled here — it belongs to the window
         // listener above, which is the one that knows about topmost.
         let on_keydown = move |e: web_sys::KeyboardEvent| {
             let key = e.key();
@@ -200,14 +204,9 @@ mod component {
         let rendered = render_entries(entries, focused, stop_click_propagation, close);
 
         view! {
-            <div class=panel_class tabindex="-1" node_ref=panel_ref>
+            <div class=panel_class tabindex="-1" node_ref=panel_ref on:keydown=on_keydown>
                 {header.map(|h| h())}
-                <div
-                    role="menu"
-                    aria-label=menu_label
-                    node_ref=menu_ref
-                    on:keydown=on_keydown
-                >{rendered}</div>
+                <div role="menu" aria-label=menu_label node_ref=menu_ref>{rendered}</div>
             </div>
         }
     }
