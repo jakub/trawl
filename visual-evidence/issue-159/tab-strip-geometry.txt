@@ -1,6 +1,6 @@
 === capture + tab-strip geometry ===
-date: 2026-09-07T01:12:31-07:00
-HEAD: d96e1ada6c1d5a84995173582f3db278a2cf48d2
+date: 2026-09-07T01:25:59-07:00
+HEAD: 6a61a8c55e09e40b6454d6948b6b2a0b0c923b40
 command: E2E_PORT=8131 node crates/trawl-web-ui/e2e/scripts/capture-native-controls.mjs
 chromium 151.0.7922.34, playwright 1.62.1, viewport 1440x900
 
