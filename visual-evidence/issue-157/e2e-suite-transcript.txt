@@ -1,0 +1,79 @@
+cargo xtask e2e transcript, issue #157
+
+commit:     a7d1216a36b56a918428cc257a5dbbf05b31af26
+date:       2026-09-07T03:21Z
+node:       v26.8.1
+npm:        12.0.2
+playwright: 1.62.1
+command:    cargo xtask e2e
+exit:       0 (26 tests, all passed)
+
+A full run with the SPA rebuilt from source, not --skip-build.
+The header the capture itself carries follows below, including the
+git status --porcelain that printed nothing. ANSI escapes stripped;
+otherwise verbatim.
+
+----------------------------------------------------------------------
+
+commit:  a7d1216a36b56a918428cc257a5dbbf05b31af26
+subject: test(e2e): mutate the repin poll teardown and both live-tail close paths
+date:    2026-09-07T03:21:21Z
+git status --porcelain:
+(nothing above the next line means the tree was clean)
+command: cargo xtask e2e
+---
+xtask: trunk build (in /home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui)
+2026-09-07T03:21:22.458064Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T03:21:22.458184Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-core)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.93s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T03:21:30.293826Z  INFO applying new distribution
+2026-09-07T03:21:30.296907Z  INFO ✅ success
+xtask: npm ci (in /home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui/e2e)
+
+added 3 packages in 197ms
+xtask: npx playwright install chromium
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' install chromium
+BEWARE: your OS is not officially supported by Playwright; downloading fallback build for ubuntu24.04-x64.
+BEWARE: your OS is not officially supported by Playwright; downloading fallback build for ubuntu24.04-x64.
+BEWARE: your OS is not officially supported by Playwright; downloading fallback build for ubuntu24.04-x64.
+xtask: npm run test
+npm notice run trawl-web-ui-e2e@0.0.0 test
+npm notice run playwright test
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui/dist)
+
+Running 26 tests using 1 worker
+
+  ✓   1 [chromium] › tests/api-failure.spec.ts:8:5 › a 500 from /api/v1/query surfaces an inline error, not a redirect to /login (618ms)
+  ✓   2 [chromium] › tests/editor-input.spec.ts:8:5 › typing a query and pressing Ctrl+Enter submits it and syncs the URL (521ms)
+  ✓   3 [chromium] › tests/repin-poll-teardown.spec.ts:171:5 › closing the case file stops its repin poll (5.3s)
+  ✓   4 [chromium] › tests/repin-poll-teardown.spec.ts:188:5 › Escape back to the service context stops the repin poll (5.1s)
+  ✓   5 [chromium] › tests/repin-poll-teardown.spec.ts:207:5 › browser Back out of a case file stops its repin poll (5.1s)
+  ✓   6 [chromium] › tests/repin-poll-teardown.spec.ts:240:5 › navigating from one case file to another stops the first one's poll (5.1s)
+  ✓   7 [chromium] › tests/routing.spec.ts:8:5 › / redirects to /search and mounts the DSL editor (807ms)
+  ✓   8 [chromium] › tests/routing.spec.ts:14:5 › rail link to history navigates without a full page load (496ms)
+  ✓   9 [chromium] › tests/routing.spec.ts:31:5 › an unknown route renders the 404 page (356ms)
+  ✓  10 [chromium] › tests/search-url.spec.ts:75:5 › absolute range round-trips through the picker (646ms)
+  ✓  11 [chromium] › tests/search-url.spec.ts:105:5 › literal versioned filters and range produce the exact DSL (496ms)
+  ✓  12 [chromium] › tests/search-url.spec.ts:117:5 › a literal percent in q survives one decode (494ms)
+  ✓  13 [chromium] › tests/search-url.spec.ts:133:5 › legacy and malformed filter payloads refuse to run (5.3s)
+  ✓  14 [chromium] › tests/search-url.spec.ts:194:5 › malformed r refuses to run and repairs on click (4.4s)
+  ✓  15 [chromium] › tests/search-url.spec.ts:227:5 › a repair fixes only the parameter the banner names (1.6s)
+  ✓  16 [chromium] › tests/search-url.spec.ts:274:5 › a malformed link disables every control that could run it (1.1s)
+  ✓  17 [chromium] › tests/search-url.spec.ts:319:5 › an open modal closes when the link stops being readable (618ms)
+  ✓  18 [chromium] › tests/search-url.spec.ts:338:5 › the export modal refuses an empty query instead of posting it (1.0s)
+  ✓  19 [chromium] › tests/search-url.spec.ts:354:5 › page offset overflows refuse to run while an unreadable page is page 1 (3.0s)
+  ✓  20 [chromium] › tests/search-url.spec.ts:386:5 › a link past the length bound is refused whole (1.1s)
+  ✓  21 [chromium] › tests/search-url.spec.ts:426:5 › a query too long to link is refused before it navigates (1.6s)
+  ✓  22 [chromium] › tests/search-url.spec.ts:482:5 › q encoding matches encodeURIComponent (540ms)
+  ✓  23 [chromium] › tests/search-url.spec.ts:510:5 › a repair that cannot be admitted offers Start over instead (1.5s)
+  ✓  24 [chromium] › tests/search-url.spec.ts:549:5 › back and forward restore each entry exactly once (606ms)
+  ✓  25 [chromium] › tests/teardown-sse.spec.ts:27:5 › an unmounted live tail closes its EventSource and stops reconnecting (2.2s)
+  ✓  26 [chromium] › tests/teardown-sse.spec.ts:57:5 › a burst keeps the newest 5000 rows, updates columns, and releases its render timer (1.9s)
+
+  26 passed (52.0s)
+EXIT=0

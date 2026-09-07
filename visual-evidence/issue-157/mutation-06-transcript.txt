@@ -1,0 +1,214 @@
+mutation-check transcript, issue #157
+
+commit:     a7d1216a36b56a918428cc257a5dbbf05b31af26
+date:       2026-09-07T03:16Z
+node:       v26.8.1
+npm:        12.0.2
+playwright: 1.62.1
+command:    crates/trawl-web-ui/e2e/scripts/mutation-check.sh 06-repin-poll-leak.patch
+exit:       0 (the mutation was killed)
+
+The mutation leaks the field case drawer's poll Interval: on_cleanup
+takes the handle out of the StoredValue and forgets it. All four tests
+in repin-poll-teardown.spec.ts fail on the interval-count assertion, and
+routing.spec.ts passes in the same run. That assertion is the only one
+that can see this: the leaked timer's body runs a disposed leptos
+callback that no-ops, so the leak issues no HTTP read and throws no
+pageerror.
+
+mutation-check.sh refuses to start against a dirty tree and exits 2
+if the tree is not clean after it reverts, so a transcript that gets
+past its first line and ends with a results table is itself the
+proof that the working tree was clean at both ends. ANSI escapes
+stripped; otherwise verbatim.
+
+----------------------------------------------------------------------
+
+=== 06-repin-poll-leak.patch -> repin-poll-teardown.spec.ts ===
+-- trunk build --
+2026-09-07T03:16:13.652148Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T03:16:13.652266Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-core)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.11s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T03:16:24.352391Z  INFO applying new distribution
+2026-09-07T03:16:24.354957Z  INFO ✅ success
+-- playwright test tests/repin-poll-teardown.spec.ts --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/repin-poll-teardown.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui/dist)
+
+Running 4 tests using 1 worker
+
+  ✘  1 [chromium] › tests/repin-poll-teardown.spec.ts:171:5 › closing the case file stops its repin poll (844ms)
+  ✘  2 [chromium] › tests/repin-poll-teardown.spec.ts:188:5 › Escape back to the service context stops the repin poll (601ms)
+  ✘  3 [chromium] › tests/repin-poll-teardown.spec.ts:207:5 › browser Back out of a case file stops its repin poll (594ms)
+  ✘  4 [chromium] › tests/repin-poll-teardown.spec.ts:240:5 › navigating from one case file to another stops the first one's poll (649ms)
+
+
+  1) [chromium] › tests/repin-poll-teardown.spec.ts:171:5 › closing the case file stops its repin poll 
+
+    Error: timer leak: the repin poll Interval outlived the drawer that owns it (on_cleanup did not drop the StoredValue)
+
+    expect(received).toBe(expected) // Object.is equality
+
+    Expected: 0
+    Received: 1
+
+      130 |     'timer leak: the repin poll Interval outlived the drawer that owns it ' +
+      131 |       '(on_cleanup did not drop the StoredValue)',
+    > 132 |   ).toBe(0);
+          |     ^
+      133 |
+      134 |   // Real time, past one whole poll period plus slack. A leaked timer
+      135 |   // that ticks even once inside this window is a defect either way.
+        at expectPollStopped (/home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui/e2e/tests/repin-poll-teardown.spec.ts:132:5)
+        at /home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui/e2e/tests/repin-poll-teardown.spec.ts:185:3
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/repin-poll-teardown-closin-0e4f5-e-file-stops-its-repin-poll-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/repin-poll-teardown-closin-0e4f5-e-file-stops-its-repin-poll-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/repin-poll-teardown-closin-0e4f5-e-file-stops-its-repin-poll-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/repin-poll-teardown-closin-0e4f5-e-file-stops-its-repin-poll-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  2) [chromium] › tests/repin-poll-teardown.spec.ts:188:5 › Escape back to the service context stops the repin poll 
+
+    Error: timer leak: the repin poll Interval outlived the drawer that owns it (on_cleanup did not drop the StoredValue)
+
+    expect(received).toBe(expected) // Object.is equality
+
+    Expected: 0
+    Received: 1
+
+      130 |     'timer leak: the repin poll Interval outlived the drawer that owns it ' +
+      131 |       '(on_cleanup did not drop the StoredValue)',
+    > 132 |   ).toBe(0);
+          |     ^
+      133 |
+      134 |   // Real time, past one whole poll period plus slack. A leaked timer
+      135 |   // that ticks even once inside this window is a defect either way.
+        at expectPollStopped (/home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui/e2e/tests/repin-poll-teardown.spec.ts:132:5)
+        at /home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui/e2e/tests/repin-poll-teardown.spec.ts:204:3
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/repin-poll-teardown-Escape-24506-ontext-stops-the-repin-poll-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/repin-poll-teardown-Escape-24506-ontext-stops-the-repin-poll-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/repin-poll-teardown-Escape-24506-ontext-stops-the-repin-poll-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/repin-poll-teardown-Escape-24506-ontext-stops-the-repin-poll-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  3) [chromium] › tests/repin-poll-teardown.spec.ts:207:5 › browser Back out of a case file stops its repin poll 
+
+    Error: timer leak: the repin poll Interval outlived the drawer that owns it (on_cleanup did not drop the StoredValue)
+
+    expect(received).toBe(expected) // Object.is equality
+
+    Expected: 0
+    Received: 1
+
+      130 |     'timer leak: the repin poll Interval outlived the drawer that owns it ' +
+      131 |       '(on_cleanup did not drop the StoredValue)',
+    > 132 |   ).toBe(0);
+          |     ^
+      133 |
+      134 |   // Real time, past one whole poll period plus slack. A leaked timer
+      135 |   // that ticks even once inside this window is a defect either way.
+        at expectPollStopped (/home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui/e2e/tests/repin-poll-teardown.spec.ts:132:5)
+        at /home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui/e2e/tests/repin-poll-teardown.spec.ts:233:3
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/repin-poll-teardown-browse-9cdd1-e-file-stops-its-repin-poll-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/repin-poll-teardown-browse-9cdd1-e-file-stops-its-repin-poll-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/repin-poll-teardown-browse-9cdd1-e-file-stops-its-repin-poll-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/repin-poll-teardown-browse-9cdd1-e-file-stops-its-repin-poll-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  4) [chromium] › tests/repin-poll-teardown.spec.ts:240:5 › navigating from one case file to another stops the first one's poll 
+
+    Error: timer leak: the repin poll Interval outlived the drawer that owns it (on_cleanup did not drop the StoredValue)
+
+    expect(received).toBe(expected) // Object.is equality
+
+    Expected: 0
+    Received: 1
+
+      130 |     'timer leak: the repin poll Interval outlived the drawer that owns it ' +
+      131 |       '(on_cleanup did not drop the StoredValue)',
+    > 132 |   ).toBe(0);
+          |     ^
+      133 |
+      134 |   // Real time, past one whole poll period plus slack. A leaked timer
+      135 |   // that ticks even once inside this window is a defect either way.
+        at expectPollStopped (/home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui/e2e/tests/repin-poll-teardown.spec.ts:132:5)
+        at /home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui/e2e/tests/repin-poll-teardown.spec.ts:282:3
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/repin-poll-teardown-naviga-93b56--stops-the-first-one-s-poll-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/repin-poll-teardown-naviga-93b56--stops-the-first-one-s-poll-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/repin-poll-teardown-naviga-93b56--stops-the-first-one-s-poll-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/repin-poll-teardown-naviga-93b56--stops-the-first-one-s-poll-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  4 failed
+    [chromium] › tests/repin-poll-teardown.spec.ts:171:5 › closing the case file stops its repin poll 
+    [chromium] › tests/repin-poll-teardown.spec.ts:188:5 › Escape back to the service context stops the repin poll 
+    [chromium] › tests/repin-poll-teardown.spec.ts:207:5 › browser Back out of a case file stops its repin poll 
+    [chromium] › tests/repin-poll-teardown.spec.ts:240:5 › navigating from one case file to another stops the first one's poll 
+-- control: playwright test tests/routing.spec.ts (must pass) --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/routing.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui/dist)
+
+Running 3 tests using 1 worker
+
+  ✓  1 [chromium] › tests/routing.spec.ts:8:5 › / redirects to /search and mounts the DSL editor (814ms)
+  ✓  2 [chromium] › tests/routing.spec.ts:14:5 › rail link to history navigates without a full page load (575ms)
+  ✓  3 [chromium] › tests/routing.spec.ts:31:5 › an unknown route renders the 404 page (357ms)
+
+  3 passed (2.2s)
+-- trunk build (restore pristine dist) --
+2026-09-07T03:16:32.078428Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T03:16:32.078551Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-core)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.73s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T03:16:41.737225Z  INFO applying new distribution
+2026-09-07T03:16:41.742896Z  INFO ✅ success
+
+mutation-check results:
+patch                        outcome
+06-repin-poll-leak.patch     PASS (target spec failed, control passed, exit 1)
+EXIT=0
