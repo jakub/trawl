@@ -539,15 +539,23 @@ fn RunsPane(net_id: i64, bus: ToastBus, on_search: Callback<String>) -> impl Int
                             let is_expanded = move || expanded_run.get() == Some(run_id);
 
                             view! {
-                                <div
-                                    class="tbl-row"
-                                    on:click=move |_| {
-                                        expanded_run.update(|v| {
-                                            *v = if *v == Some(run_id) { None } else { Some(run_id) };
-                                        });
-                                    }
-                                >
-                                    <div style="flex:0 0 80px" class="mono">{when}</div>
+                                <div class="tbl-row">
+                                    <div style="flex:0 0 80px" class="mono">
+                                        // The row's one control (ADR-0029),
+                                        // stretched over the row: a pointer
+                                        // anywhere on it toggles the run's
+                                        // result preview exactly once.
+                                        <button
+                                            type="button"
+                                            class="row-stretch"
+                                            aria-expanded=move || is_expanded().to_string()
+                                            on:click=move |_| {
+                                                expanded_run.update(|v| {
+                                                    *v = if *v == Some(run_id) { None } else { Some(run_id) };
+                                                });
+                                            }
+                                        >{when}</button>
+                                    </div>
                                     <div style="flex:0 0 70px">
                                         <StatusDot tone=tone/>
                                         " "
