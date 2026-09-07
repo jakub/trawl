@@ -90,10 +90,14 @@ test('theme control names its result', async ({ page }) => {
 
   const before = await page.evaluate(() => document.documentElement.getAttribute('data-theme'));
   const other = before === 'dark' ? 'light' : 'dark';
-  // The visible text is the theme in force; the name is the theme a
-  // press produces. They are opposite ends of one toggle.
+  // The visible text is the theme in force; the name opens with that
+  // same word and then says the theme a press produces. Both halves are
+  // asserted: a name that dropped the visible word could not be spoken
+  // by someone reading the button (WCAG 2.5.3).
   await expect(theme).toHaveText(before ?? '');
-  await expect(theme).toHaveAccessibleName(nameFrom(COPY.themeSwitchName, other));
+  await expect(theme).toHaveAccessibleName(
+    nameFrom(COPY.themeSwitchName, before ?? '', other),
+  );
 
   await page.locator(SEL.topbarUser).focus();
   await tabUntilFocused(page, theme, 20);
@@ -103,8 +107,12 @@ test('theme control names its result', async ({ page }) => {
   await expect
     .poll(() => page.evaluate(() => document.documentElement.getAttribute('data-theme')))
     .toBe(other);
-  // And the name follows the theme rather than freezing at load.
-  await expect(theme).toHaveAccessibleName(nameFrom(COPY.themeSwitchName, before ?? ''));
+  // And the name follows the theme rather than freezing at load: both
+  // halves swap.
+  await expect(theme).toHaveText(other);
+  await expect(theme).toHaveAccessibleName(
+    nameFrom(COPY.themeSwitchName, other, before ?? ''),
+  );
 });
 
 test('interval presets expose aria-pressed', async ({ page, request }) => {

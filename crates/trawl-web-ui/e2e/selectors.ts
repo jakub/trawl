@@ -378,8 +378,10 @@ export const COPY = {
   schemaSearchName: 'Search {name_label_search}',
   schemaTailName: 'Live tail {name_label_tail}',
   /// crates/trawl-web-ui/src/components/status_bar.rs — the theme
-  /// control, named for the theme a press produces.
-  themeSwitchName: 'Switch to {} theme',
+  /// control. The name opens with the visible word (the theme in force)
+  /// and then says what a press produces, so the label is inside the
+  /// name.
+  themeSwitchName: 'Theme {current}: switch to {next} theme',
   /// crates/trawl-web-ui/src/components/net_drawer.rs — the drawer
   /// title's rename trigger.
   netRenameName: 'Rename {name}',

@@ -1086,10 +1086,10 @@ const CONTRACTS: &[Contract] = &[
         hook: "format!(\"Live tail {name_label_tail}\")",
     },
     Contract {
-        assignment: "themeSwitchName: 'Switch to {} theme',",
+        assignment: "themeSwitchName: 'Theme {current}: switch to {next} theme',",
         source_path: "src/components/status_bar.rs",
         source: STATUS_BAR_RS,
-        hook: "\"Switch to {} theme\"",
+        hook: "\"Theme {current}: switch to {next} theme\"",
     },
     Contract {
         assignment: "netRenameName: 'Rename {name}',",

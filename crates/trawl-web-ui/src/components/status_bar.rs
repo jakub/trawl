@@ -65,9 +65,12 @@ pub fn StatusBar(
         })
     };
 
-    // The visible text is the theme in force; the accessible name is
+    // The visible text is the theme in force; the accessible name says
     // what pressing the control does (ADR-0028's ruling on its menu
-    // twin), so the two read the opposite ends of the same toggle.
+    // twin). The name OPENS with the visible word because WCAG 2.5.3
+    // asks a name to contain its own label: a control reading "dark"
+    // and named only "Switch to light theme" cannot be activated by
+    // voice with the word on it.
     let next_theme_label = move || {
         prefs.map_or("dark", |p| match p.theme().get() {
             Theme::Light => "dark",
@@ -159,7 +162,11 @@ pub fn StatusBar(
             <button
                 type="button"
                 class="grp clickable"
-                aria-label=move || format!("Switch to {} theme", next_theme_label())
+                aria-label=move || {
+                    let current = theme_label();
+                    let next = next_theme_label();
+                    format!("Theme {current}: switch to {next} theme")
+                }
                 on:click=toggle_theme
             >
                 <span>{theme_label}</span>
