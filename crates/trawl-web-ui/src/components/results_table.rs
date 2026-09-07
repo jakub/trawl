@@ -96,19 +96,32 @@ fn ResultsTableBody(
     let header_cells = cols_for_header.iter().enumerate().map(|(i, name)| {
         let name = name.clone();
         view! {
+            // A real `<table>`, so direction is announced by `aria-sort`
+            // on the sorted `<th>` alone (ADR-0029) and the glyph is
+            // decoration. The control is the button inside, never the cell.
             <th
                 class:sorted=move || sort.get().is_some_and(|s| s.col == i)
-                on:click=move |_| sort.update(|cur| {
-                    *cur = match *cur {
-                        Some(s) if s.col == i => Some(SortState { col: i, asc: !s.asc }),
-                        _ => Some(SortState { col: i, asc: false }),
-                    };
-                })
+                aria-sort=move || {
+                    sort.get()
+                        .filter(|s| s.col == i)
+                        .map(|s| if s.asc { "ascending" } else { "descending" })
+                }
             >
-                <span>{name}</span>
-                <span class="sort">{move || {
-                    sort.get().filter(|s| s.col == i).map_or("·", |s| if s.asc { "▲" } else { "▼" })
-                }}</span>
+                <button
+                    type="button"
+                    class="th-sort"
+                    on:click=move |_| sort.update(|cur| {
+                        *cur = match *cur {
+                            Some(s) if s.col == i => Some(SortState { col: i, asc: !s.asc }),
+                            _ => Some(SortState { col: i, asc: false }),
+                        };
+                    })
+                >
+                    <span>{name}</span>
+                    <span class="sort" aria-hidden="true">{move || {
+                        sort.get().filter(|s| s.col == i).map_or("·", |s| if s.asc { "▲" } else { "▼" })
+                    }}</span>
+                </button>
             </th>
         }
     }).collect::<Vec<_>>();

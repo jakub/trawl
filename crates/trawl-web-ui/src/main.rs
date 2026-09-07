@@ -22,6 +22,7 @@ mod schema_nav;
 mod search_url;
 mod service_card_fmt;
 mod severity_cell;
+mod sort_label;
 mod tone_vocab;
 
 #[cfg(target_arch = "wasm32")]

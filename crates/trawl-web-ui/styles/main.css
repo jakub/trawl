@@ -775,11 +775,23 @@
   color: var(--ink-3);
 }
 .results-table thead th {
-  cursor: pointer;
-  user-select: none;
   position: sticky;
   top: 0;
   z-index: 2;
+}
+/* The header cell keeps its sticky box; the button inside it is the
+ * control (ADR-0029) and takes the whole cell so the click target is
+ * unchanged. */
+.results-table thead th .th-sort {
+  font: inherit;
+  background: none;
+  border: 0;
+  padding: 0;
+  color: inherit;
+  cursor: pointer;
+  user-select: none;
+  width: 100%;
+  text-align: left;
 }
 .results-table thead th .sort {
   opacity: .3;
@@ -1082,12 +1094,22 @@
 .tbl-row.active { background: var(--accent-wash); }
 .tbl-row .num { text-align: right; font-variant-numeric: tabular-nums; color: var(--ink); }
 
-/* Sortable header cells (schema services table). */
-.tbl-hd .th { display: flex; align-items: center; gap: 3px; }
-.tbl-hd .th.sortable { cursor: pointer; user-select: none; transition: color 100ms; }
-.tbl-hd .th.sortable:hover { color: var(--ink-2); }
-.tbl-hd .th.sortable.active { color: var(--ink); }
-.tbl-hd .th .dir { font-size: var(--fs-micro); color: var(--accent); }
+/* Sortable header cells. Unscoped from `.tbl-hd` so the service
+ * drawer's field headers share one helper (ADR-0029): the cell is a
+ * div, the control inside it is a button, and the button gets the
+ * cell's own box back (full width, the cell's justification) plus the
+ * per-rule reset ADR-0028 asks for. */
+.th { display: flex; align-items: center; gap: 3px; }
+.th.sortable { transition: color 100ms; }
+.th.sortable button {
+  font: inherit; background: none; border: 0; padding: 0; color: inherit;
+  cursor: pointer; user-select: none;
+  width: 100%; display: flex; align-items: center; gap: 3px;
+  justify-content: inherit;
+}
+.th.sortable:hover { color: var(--ink-2); }
+.th.sortable.active { color: var(--ink); }
+.th .dir { font-size: var(--fs-micro); color: var(--accent); }
 
 /* Schema services table — name cell. The canonical 7px + 2px-ring
  * StatusDot reads swollen against dense row text; scope it down to
@@ -1278,9 +1300,6 @@
   text-transform: uppercase; letter-spacing: .08em; color: var(--ink-3);
   border-bottom: 1px solid var(--line); padding-bottom: 8px; margin-bottom: 2px;
 }
-.sf-hd > div { cursor: pointer; user-select: none; }
-.sf-hd > div:hover { color: var(--ink); }
-.sf-hd .srt { color: var(--accent); font-size: var(--fs-tiny); margin-left: 4px; }
 .sf-row {
   border-bottom: 1px solid var(--line-2); cursor: pointer;
   transition: background 80ms;
