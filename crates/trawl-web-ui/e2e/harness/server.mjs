@@ -24,6 +24,10 @@ import {
   historyResponse,
   listSavedResponse,
   serviceSchemaResponse,
+  catalogFieldResponse,
+  repinStatusRunningResponse,
+  repinStatusSucceededResponse,
+  repinStatusNoJobResponse,
 } from './fixtures.mjs';
 
 const HOST = '127.0.0.1';
@@ -73,6 +77,37 @@ const sse = {
   responses: new Set(),
 };
 
+// Scripted repin status, for the field case drawer's poll. Unlike the SSE
+// counters below, EVERY field here is rolled by a reset — see the note in
+// `resetState`. The two rules are deliberately different and must stay
+// that way: unifying them would either strand a held response across
+// tests or reset a counter under a stream that is still opening.
+const repin = {
+  /** The field the scripted job belongs to. `null` = script disarmed, and
+   * the status route answers `{ job: null }` forever, so no other spec's
+   * behaviour changes. */
+  field: null,
+  /** Status reads served since the reset that armed the script. */
+  hits: 0,
+  /** The parked `ServerResponse` for hit `HELD_HIT` — headers not even
+   * written, so the client is still waiting on it.
+   * @type {import('node:http').ServerResponse|null} */
+  held: null,
+  /** The held socket closed before anything was written to it. A release
+   * after that is a lie, and `/__ctl/repin/release` answers 409. */
+  heldAborted: false,
+  /** Whether the held response was still pending at the moment
+   * `/__ctl/repin/release` wrote to it. This is the alive-latch evidence:
+   * a read still open across a teardown is a read the client never
+   * abandoned. */
+  pendingAtRelease: null,
+};
+
+/** Which status read is parked. Read 1 is the drawer's mount probe, read
+ * 2 the immediate `poll_once` the probe's adoption starts — so holding 2
+ * leaves the drawer with a read in flight for the whole test. */
+const HELD_HIT = 2;
+
 /** @type {string[]} */
 let unstubbed = [];
 /** @type {object[]} */
@@ -88,6 +123,19 @@ function resetState() {
   // the scenario, then drives its own stream lifecycle and reads the
   // counters itself. Rolling them here would race a stream this same
   // request is about to open in the previous test's teardown.
+  //
+  // The repin script is the opposite: it is armed BY a reset (which
+  // carries the field to script) and its whole point is a per-test
+  // sequence, so nothing may survive into the next test. A held response
+  // outliving its test would park a socket forever.
+  if (repin.held) {
+    repin.held.destroy();
+  }
+  repin.field = null;
+  repin.hits = 0;
+  repin.held = null;
+  repin.heldAborted = false;
+  repin.pendingAtRelease = null;
 }
 
 // ---- helpers --------------------------------------------------------------
@@ -225,16 +273,55 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       }
       scenario = parsed.scenario || 'default';
       resetState();
-      sendJson(res, 200, { ok: true, scenario });
+      // The ONE door that arms the repin script. Everything else reads
+      // `repin`; only a reset writes `field`, so a spec cannot end up
+      // scripting a second job on top of a live one.
+      repin.field = parsed.repinField || null;
+      sendJson(res, 200, { ok: true, scenario, repinField: repin.field });
       return;
     }
     if (p === '/__ctl/state' && req.method === 'GET') {
       sendJson(res, 200, {
         sse: { open: sse.open, opens: sse.opens, closes: sse.closes },
+        repin: {
+          field: repin.field,
+          hits: repin.hits,
+          held: repin.held !== null,
+          aborted: repin.heldAborted,
+          pendingAtRelease: repin.pendingAtRelease,
+        },
         unstubbed,
         queries,
         exports: exports_,
       });
+      return;
+    }
+    // Finish the parked status read. A spec calls this AFTER the drawer
+    // is gone: a 200 with `pending: true` means the response was still
+    // open at that moment, which is only true if the client never
+    // abandoned it. A premature call (nothing held) or one after the
+    // socket died must fail loudly — a 409 read as proof would be the
+    // whole assertion inverted.
+    if (p === '/__ctl/repin/release' && req.method === 'POST') {
+      if (!repin.held || repin.heldAborted) {
+        sendJson(res, 409, {
+          ok: false,
+          pending: false,
+          aborted: repin.heldAborted,
+          hits: repin.hits,
+        });
+        return;
+      }
+      const held = repin.held;
+      // Captured before the write, with nothing awaited in between: this
+      // is the fact the spec is buying, and reading it after the write
+      // would read the write's own effect.
+      repin.pendingAtRelease = true;
+      repin.held = null;
+      const body = repinStatusSucceededResponse();
+      body.job.field = repin.field;
+      sendJson(held, 200, body);
+      sendJson(res, 200, { ok: true, pending: true, aborted: false, hits: repin.hits });
       return;
     }
 
@@ -319,6 +406,51 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       return;
     }
 
+    // -- field catalog --------------------------------------------------
+    // The case file's own fetch. The name is whatever the URL asked for,
+    // so a spec that opens `?field=status` gets a case file for `status`
+    // rather than for whatever the fixture happens to be named.
+    if (p === '/api/v1/schema/field' && req.method === 'GET') {
+      const body = catalogFieldResponse();
+      body.name = url.searchParams.get('name') ?? body.name;
+      sendJson(res, 200, body);
+      return;
+    }
+
+    // -- repin status ---------------------------------------------------
+    // Scripted, and only once a reset armed it (see `repin` above). The
+    // sequence is: hit 1 running, hit HELD_HIT parked open and never
+    // answered, everything after that succeeded. Holding a read open is
+    // what makes the drawer's alive latch observable — the parked
+    // response is still there to release once the drawer is gone.
+    if (p === '/api/v1/schema/repin/status' && req.method === 'GET') {
+      if (repin.field === null) {
+        sendJson(res, 200, repinStatusNoJobResponse());
+        return;
+      }
+      repin.hits += 1;
+      if (repin.hits === HELD_HIT) {
+        repin.held = res;
+        res.on('close', () => {
+          // Identity-checked: a `close` for a response a later reset
+          // already destroyed must not clobber the fresh state.
+          if (repin.held === res) {
+            repin.held = null;
+            // Nothing was written, so the socket went away under a read
+            // the client was still owed. `/__ctl/repin/release` reports
+            // this instead of pretending it delivered.
+            repin.heldAborted = true;
+          }
+        });
+        return;
+      }
+      const body =
+        repin.hits < HELD_HIT ? repinStatusRunningResponse() : repinStatusSucceededResponse();
+      body.job.field = repin.field;
+      sendJson(res, 200, body);
+      return;
+    }
+
     // -- anything else under /api: 200 {} AND recorded as unstubbed -----
     if (p.startsWith('/api/')) {
       unstubbed.push(`${req.method} ${p}`);
@@ -351,6 +483,16 @@ function shutdown() {
     } catch {
       // already closing
     }
+  }
+  // Same reason: a status read parked with no headers written keeps its
+  // socket alive, and `server.close()` waits for it.
+  if (repin.held) {
+    try {
+      repin.held.destroy();
+    } catch {
+      // already closing
+    }
+    repin.held = null;
   }
   server.close(() => process.exit(0));
   // Force-exit if close() hangs (a lingering keep-alive socket).
