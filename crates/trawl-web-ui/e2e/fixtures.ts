@@ -141,13 +141,6 @@ export const CORPUS = {
    * opposite after the field headers moved onto the shared helper. */
   fieldFirstAlphabetically: '_time',
   fieldLastAlphabetically: 'status',
-  /** The corpus service's field names at the ends of an alphabetical
-   * sort (`_time`, `duration`, `status` in `wire/service-schema-corpus
-   * .json`). The drawer's Field header is the one column whose natural
-   * direction is ascending, so both ends are needed to tell its two
-   * presses apart. */
-  fieldFirstAlphabetically: '_time',
-  fieldLastAlphabetically: 'status',
   /** Runs of the net, newest first (`wire/net-runs.json`). */
   runIds: [501, 502] as const,
   /** The run whose expansion has a result body. */
