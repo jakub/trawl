@@ -1,7 +1,7 @@
 === capture + tab-strip geometry ===
-date: 2026-09-07T00:39:00-07:00
-HEAD: c5ba6a4468e134fc7d289199deb16b9d8dec664b
-command: node crates/trawl-web-ui/e2e/scripts/capture-native-controls.mjs
+date: 2026-09-07T01:12:31-07:00
+HEAD: d96e1ada6c1d5a84995173582f3db278a2cf48d2
+command: E2E_PORT=8131 node crates/trawl-web-ui/e2e/scripts/capture-native-controls.mjs
 chromium 151.0.7922.34, playwright 1.62.1, viewport 1440x900
 
 This run wrote every PNG beside this file as well as the numbers.
@@ -9,7 +9,12 @@ The 'ab' block per theme is the before/after: *Nested is the shipped
 DOM, *Flat is the same page with the [role=tablist] wrapper unwrapped
 in place, which is exactly the pre-#159 flat strip.
 
-e2e stub server listening on http://127.0.0.1:8129 (dist: /home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui/dist)
+underlineOverlap is measured against the strip's INNER bottom edge (its
+border-box bottom less borderBottomWidth), so 1 means the tab's box
+reaches 1px into the strip's border row and its 2px underline paints
+over the hairline. Both edges are reported per strip.
+
+e2e stub server listening on http://127.0.0.1:8131 (dist: /home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui/dist)
 light: account-menu-light.png, results-tabs-light.png, modal-header-light.png, toast-light.png, drawer-tabs-light.png
 dark: account-menu-dark.png, results-tabs-dark.png, modal-header-dark.png, toast-dark.png, drawer-tabs-dark.png
 {
@@ -26,7 +31,9 @@ dark: account-menu-dark.png, results-tabs-dark.png, modal-header-dark.png, toast
         "strip": {
           "top": 199,
           "bottom": 238.75,
-          "height": 39.75
+          "height": 39.75,
+          "borderBottomWidth": 1,
+          "innerBottom": 237.75
         },
         "tablist": {
           "x": 320,
@@ -54,15 +61,17 @@ dark: account-menu-dark.png, results-tabs-dark.png, modal-header-dark.png, toast
         ],
         "meta": null,
         "underlineOverlap": [
-          0,
-          0
+          1,
+          1
         ]
       },
       "drawer": {
         "strip": {
           "top": 62,
           "bottom": 103.75,
-          "height": 41.75
+          "height": 41.75,
+          "borderBottomWidth": 1,
+          "innerBottom": 102.75
         },
         "tablist": {
           "x": 735,
@@ -99,9 +108,9 @@ dark: account-menu-dark.png, results-tabs-dark.png, modal-header-dark.png, toast
           "right": 1426
         },
         "underlineOverlap": [
-          0,
-          0,
-          0
+          1,
+          1,
+          1
         ]
       }
     },
@@ -110,7 +119,9 @@ dark: account-menu-dark.png, results-tabs-dark.png, modal-header-dark.png, toast
         "strip": {
           "top": 199,
           "bottom": 238.75,
-          "height": 39.75
+          "height": 39.75,
+          "borderBottomWidth": 1,
+          "innerBottom": 237.75
         },
         "tablist": {
           "x": 320,
@@ -138,15 +149,17 @@ dark: account-menu-dark.png, results-tabs-dark.png, modal-header-dark.png, toast
         ],
         "meta": null,
         "underlineOverlap": [
-          0,
-          0
+          1,
+          1
         ]
       },
       "resultsFlat": {
         "strip": {
           "top": 199,
           "bottom": 238.75,
-          "height": 39.75
+          "height": 39.75,
+          "borderBottomWidth": 1,
+          "innerBottom": 237.75
         },
         "tablist": null,
         "tabs": [
@@ -165,15 +178,17 @@ dark: account-menu-dark.png, results-tabs-dark.png, modal-header-dark.png, toast
         ],
         "meta": null,
         "underlineOverlap": [
-          0,
-          0
+          1,
+          1
         ]
       },
       "drawerNested": {
         "strip": {
           "top": 62,
           "bottom": 103.75,
-          "height": 41.75
+          "height": 41.75,
+          "borderBottomWidth": 1,
+          "innerBottom": 102.75
         },
         "tablist": {
           "x": 735,
@@ -210,16 +225,18 @@ dark: account-menu-dark.png, results-tabs-dark.png, modal-header-dark.png, toast
           "right": 1426
         },
         "underlineOverlap": [
-          0,
-          0,
-          0
+          1,
+          1,
+          1
         ]
       },
       "drawerFlat": {
         "strip": {
           "top": 62,
           "bottom": 103.75,
-          "height": 41.75
+          "height": 41.75,
+          "borderBottomWidth": 1,
+          "innerBottom": 102.75
         },
         "tablist": null,
         "tabs": [
@@ -247,9 +264,9 @@ dark: account-menu-dark.png, results-tabs-dark.png, modal-header-dark.png, toast
           "right": 1426
         },
         "underlineOverlap": [
-          0,
-          0,
-          0
+          1,
+          1,
+          1
         ]
       }
     }
@@ -267,7 +284,9 @@ dark: account-menu-dark.png, results-tabs-dark.png, modal-header-dark.png, toast
         "strip": {
           "top": 199,
           "bottom": 238.75,
-          "height": 39.75
+          "height": 39.75,
+          "borderBottomWidth": 1,
+          "innerBottom": 237.75
         },
         "tablist": {
           "x": 320,
@@ -295,15 +314,17 @@ dark: account-menu-dark.png, results-tabs-dark.png, modal-header-dark.png, toast
         ],
         "meta": null,
         "underlineOverlap": [
-          0,
-          0
+          1,
+          1
         ]
       },
       "drawer": {
         "strip": {
           "top": 62,
           "bottom": 103.75,
-          "height": 41.75
+          "height": 41.75,
+          "borderBottomWidth": 1,
+          "innerBottom": 102.75
         },
         "tablist": {
           "x": 735,
@@ -340,9 +361,9 @@ dark: account-menu-dark.png, results-tabs-dark.png, modal-header-dark.png, toast
           "right": 1426
         },
         "underlineOverlap": [
-          0,
-          0,
-          0
+          1,
+          1,
+          1
         ]
       }
     },
@@ -351,7 +372,9 @@ dark: account-menu-dark.png, results-tabs-dark.png, modal-header-dark.png, toast
         "strip": {
           "top": 199,
           "bottom": 238.75,
-          "height": 39.75
+          "height": 39.75,
+          "borderBottomWidth": 1,
+          "innerBottom": 237.75
         },
         "tablist": {
           "x": 320,
@@ -379,15 +402,17 @@ dark: account-menu-dark.png, results-tabs-dark.png, modal-header-dark.png, toast
         ],
         "meta": null,
         "underlineOverlap": [
-          0,
-          0
+          1,
+          1
         ]
       },
       "resultsFlat": {
         "strip": {
           "top": 199,
           "bottom": 238.75,
-          "height": 39.75
+          "height": 39.75,
+          "borderBottomWidth": 1,
+          "innerBottom": 237.75
         },
         "tablist": null,
         "tabs": [
@@ -406,15 +431,17 @@ dark: account-menu-dark.png, results-tabs-dark.png, modal-header-dark.png, toast
         ],
         "meta": null,
         "underlineOverlap": [
-          0,
-          0
+          1,
+          1
         ]
       },
       "drawerNested": {
         "strip": {
           "top": 62,
           "bottom": 103.75,
-          "height": 41.75
+          "height": 41.75,
+          "borderBottomWidth": 1,
+          "innerBottom": 102.75
         },
         "tablist": {
           "x": 735,
@@ -451,16 +478,18 @@ dark: account-menu-dark.png, results-tabs-dark.png, modal-header-dark.png, toast
           "right": 1426
         },
         "underlineOverlap": [
-          0,
-          0,
-          0
+          1,
+          1,
+          1
         ]
       },
       "drawerFlat": {
         "strip": {
           "top": 62,
           "bottom": 103.75,
-          "height": 41.75
+          "height": 41.75,
+          "borderBottomWidth": 1,
+          "innerBottom": 102.75
         },
         "tablist": null,
         "tabs": [
@@ -488,9 +517,9 @@ dark: account-menu-dark.png, results-tabs-dark.png, modal-header-dark.png, toast
           "right": 1426
         },
         "underlineOverlap": [
-          0,
-          0,
-          0
+          1,
+          1,
+          1
         ]
       }
     }

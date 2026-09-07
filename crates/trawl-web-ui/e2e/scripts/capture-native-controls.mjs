@@ -72,10 +72,13 @@ async function shotUnion(page, selectors, file, pad = 12) {
  * device pixels by the browser rather than by reading the stylesheet.
  *
  * `underlineOverlap` is the tab's border-box bottom minus the strip's
- * OWN bottom edge: each tab carries `margin-bottom: -1px` so its 2px
- * underline laps the strip's 1px bottom border. 1 means the tab's box
- * ends 1px past the strip's, which is the lap. 0 or less means the
- * underline now floats above the border. */
+ * INNER bottom edge, the top of its 1px bottom border. Each tab carries
+ * `margin-bottom: -1px`, which pulls its box down INTO that border row,
+ * so the two outer bottoms coincide and the tab's 2px underline paints
+ * over the hairline. 1 means the tab reaches 1px past the inner edge,
+ * which is the lap; 0 or less means the underline floats above the
+ * border. Measuring against the strip's OUTER bottom would read 1 only
+ * if the tab hung below the strip entirely. */
 async function stripGeometry(page, stripSel, tabSel) {
   return page.evaluate(
     ({ stripSel, tabSel }) => {
@@ -85,15 +88,23 @@ async function stripGeometry(page, stripSel, tabSel) {
       const meta = strip.querySelector('.meta');
       const r = (el) => (el ? el.getBoundingClientRect() : null);
       const sb = r(strip);
+      const stripBorder = parseFloat(getComputedStyle(strip).borderBottomWidth) || 0;
+      const stripInnerBottom = sb.bottom - stripBorder;
       return {
-        strip: { top: sb.top, bottom: sb.bottom, height: sb.height },
+        strip: {
+          top: sb.top,
+          bottom: sb.bottom,
+          height: sb.height,
+          borderBottomWidth: stripBorder,
+          innerBottom: stripInnerBottom,
+        },
         tablist: r(tablist),
         tabs: tabs.map((t) => {
           const b = r(t);
           return { name: t.textContent.trim(), top: b.top, bottom: b.bottom, left: b.left };
         }),
         meta: meta ? { left: r(meta).left, right: r(meta).right } : null,
-        underlineOverlap: tabs.map((t) => Number((r(t).bottom - sb.bottom).toFixed(2))),
+        underlineOverlap: tabs.map((t) => Number((r(t).bottom - stripInnerBottom).toFixed(2))),
       };
     },
     { stripSel, tabSel },

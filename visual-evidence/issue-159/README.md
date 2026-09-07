@@ -105,11 +105,12 @@ That flat DOM is exactly the pre-#159 strip under the current
 stylesheet, so the two readings are a before/after on one page.
 
 Does `.t`'s `margin-bottom: -1px` still lap the strip's bottom border
-inside the nested `.tablist`? Yes. Every tab's border-box bottom equals
-the strip's own border-box bottom (238.75 on the results strip, 103.75
-on the drawer strip), which means the tab's 2px underline covers the
-strip's 1px border row rather than floating above it, and the nested and
-flat readings are identical. Zoom into `results-tabs-light.png` and you
+inside the nested `.tablist`? Yes. `underlineOverlap` reads 1 for every
+tab, nested and flat: the negative margin pulls each tab's box 1px past
+the strip's inner bottom edge, into the row the strip's 1px border
+paints, so the tab's 2px underline covers that hairline instead of
+floating above it. The outer bottoms coincide as a result (238.75 on the
+results strip, 103.75 on the drawer strip). Zoom into `results-tabs-light.png` and you
 can see it: the accent bar under "Events" sits on the same pixel row as
 the hairline running away to its left and right.
 
