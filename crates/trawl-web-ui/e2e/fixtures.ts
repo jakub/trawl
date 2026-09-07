@@ -68,6 +68,16 @@ export const test = base.extend<{ pageErrors: PageErrors; contract: void }>({
       expect(state.unstubbed, `unstubbed /api/* calls: ${JSON.stringify(state.unstubbed)}`).toEqual(
         [],
       );
+      // The same claim one level down. Under `corpus` a pipeline with no
+      // fixture is answered with a 500 and recorded here, and the page
+      // renders that as an ordinary query error — which no assertion in
+      // any spec would notice. Recording it and never reading it made
+      // the record decoration. A hit here is a fixture gap: add the
+      // shape to harness/server.mjs, never loosen this.
+      expect(
+        state.unhandledQueries ?? [],
+        `corpus queries with no fixture: ${JSON.stringify(state.unhandledQueries)}`,
+      ).toEqual([]);
     },
     { auto: true },
   ],
