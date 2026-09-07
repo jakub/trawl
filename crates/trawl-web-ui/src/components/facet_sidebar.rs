@@ -100,12 +100,19 @@ pub fn FacetSidebar(
                         let field_for_toggle = field.clone();
                         let field_for_more = field.clone();
                         let more_label = format!("Show {extra} more values for {field}");
+                        // The count is a span INSIDE the button, and a
+                        // name is the concatenation of what the button
+                        // contains: `_time` beside `8` read as `_time8`.
+                        // Naming the button explicitly puts the two back
+                        // in words; the visible markup is unchanged.
+                        let group_label = format!("{field}, {total} values");
                         let active = active.clone();
                         view! {
                             <div class="g" class:collapsed=move || is_collapsed>
                                 <button
                                     type="button"
                                     class="g-hd"
+                                    aria-label=group_label
                                     aria-expanded=move || (!is_collapsed).to_string()
                                     on:click=move |_| collapsed.update(|c| {
                                         let cur = c.get(&field_for_toggle).copied().unwrap_or(false);

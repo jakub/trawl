@@ -1004,6 +1004,12 @@ const CONTRACTS: &[Contract] = &[
         hook: "format!(\"Show {extra} more values for {field}\")",
     },
     Contract {
+        assignment: "facetGroupName: '{field}, {total} values',",
+        source_path: "src/components/facet_sidebar.rs",
+        source: FACET_SIDEBAR_RS,
+        hook: "format!(\"{field}, {total} values\")",
+    },
+    Contract {
         assignment: "chipRemoveName: 'Remove filter {} = {}',",
         source_path: "src/components/meta_strip.rs",
         source: META_STRIP_RS,

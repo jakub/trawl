@@ -344,6 +344,9 @@ export const COPY = {
   facetExcludeName: 'Exclude {field} = {v}',
   /// Its "+ N more" control, whose visible text stays `+ N more`.
   facetMoreName: 'Show {extra} more values for {field}',
+  /// The group header. Its count lives in a span inside the button, so
+  /// an unnamed header read as `_time8`; this names the two in words.
+  facetGroupName: '{field}, {total} values',
   /// crates/trawl-web-ui/src/components/meta_strip.rs — the chip's
   /// remove control. Positional placeholders, as the source writes it.
   chipRemoveName: 'Remove filter {} = {}',
