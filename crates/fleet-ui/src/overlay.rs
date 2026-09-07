@@ -261,9 +261,20 @@ fn should_restore(owned: bool, policy: FocusPolicy, opener_connected: bool) -> b
 /// a collapsed section) still match — [`focusable_descendants`] drops
 /// them with the [`is_rendered`] box-metric filter, otherwise Tab-wrap
 /// could park focus on an invisible element and it would silently vanish.
-#[cfg(target_arch = "wasm32")]
-const FOCUSABLE: &str = "a[href], button:not([disabled]), input:not([disabled]), \
-     select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1'])";
+///
+/// Every arm carries `:not([tabindex='-1'])`, not just the generic
+/// `[tabindex]` one: `tabindex="-1"` takes an element OUT of the tab
+/// order whatever its tag is, so `button:not([disabled])` alone matched
+/// the roving menu items a menu keeps at `-1` and a modal's Tab cycle
+/// walked every one of them (ADR-0028). The selector is compiled on
+/// native test builds too so the string itself is a native fact.
+#[cfg(any(target_arch = "wasm32", test))]
+const FOCUSABLE: &str = "a[href]:not([tabindex='-1']), \
+     button:not([disabled]):not([tabindex='-1']), \
+     input:not([disabled]):not([tabindex='-1']), \
+     select:not([disabled]):not([tabindex='-1']), \
+     textarea:not([disabled]):not([tabindex='-1']), \
+     [tabindex]:not([tabindex='-1'])";
 
 /// Whether an element's box metrics say it is actually rendered — the
 /// pure predicate behind [`focusable_descendants`]'s visibility filter.
@@ -326,8 +337,14 @@ fn initial_focus(has_focusable: bool) -> InitialFocus {
 /// Move focus to the panel's first focusable descendant, falling back
 /// to the panel itself. The target decision is the native-tested
 /// [`initial_focus`]; this shell only reads the DOM and applies it.
+///
+/// Crate-visible because the menus own their initial focus rather than
+/// delegating it to [`use_overlay_layer_with`]: they register as
+/// [`FocusPolicy::None`] layers, so the hook's own latch (which belongs
+/// to the focus-owning policies) never runs for them, and the shared
+/// menu panel calls this under a once-per-mount latch of its own.
 #[cfg(target_arch = "wasm32")]
-fn focus_initial(panel: &web_sys::Element) {
+pub(crate) fn focus_initial(panel: &web_sys::Element) {
     use wasm_bindgen::JsCast;
     let focusables = focusable_descendants(panel);
     match initial_focus(!focusables.is_empty()) {
@@ -579,6 +596,56 @@ mod tests {
         inner_menu.release();
         modal.release();
         menu.release();
+    }
+
+    #[test]
+    fn none_layer_above_trap_keeps_the_trap() {
+        // A menu opened from inside a modal pushes a None layer above
+        // the modal's Trap layer. The menu is topmost for Escape, but
+        // the modal must keep BOTH focus ownership and its Tab trap:
+        // handing the trap to a layer that traps nothing would let Tab
+        // walk straight out of an aria-modal="true" dialog (ADR-0028's
+        // reason menus stay FocusPolicy::None).
+        let modal = push_overlay_with(FocusPolicy::Trap);
+        let menu = push_overlay_with(FocusPolicy::None);
+
+        assert!(menu.is_topmost(), "the menu is topmost for Escape");
+        assert!(
+            modal.should_trap(),
+            "a None layer above a Trap layer leaves the trap switched on"
+        );
+        assert!(
+            modal.owns_focus(),
+            "and the Trap layer is still the focus owner"
+        );
+        assert!(!menu.owns_focus(), "a None layer never owns focus");
+
+        menu.release();
+        assert!(modal.should_trap() && modal.owns_focus());
+        modal.release();
+    }
+
+    #[test]
+    fn focusable_selector_excludes_negative_tabindex_on_every_arm() {
+        // `tabindex="-1"` removes an element from the tab order whatever
+        // its tag is. Before ADR-0028 only the generic `[tabindex]` arm
+        // said so, so `button:not([disabled])` matched a menu's roving
+        // items (all but one sit at -1) and a modal's Tab cycle walked
+        // every one of them. Every arm carries the guard.
+        let arms: Vec<&str> = FOCUSABLE.split(',').map(str::trim).collect();
+        assert!(
+            arms.len() >= 6,
+            "expected one arm per tabbable tag family plus the generic \
+             [tabindex] arm, got {arms:?}"
+        );
+        for arm in &arms {
+            assert!(
+                arm.contains(":not([tabindex='-1'])"),
+                "FOCUSABLE arm `{arm}` matches elements the author took \
+                 out of the tab order — a roving menu item at -1 would \
+                 join a modal's Tab cycle"
+            );
+        }
     }
 
     #[test]
