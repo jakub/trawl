@@ -35,7 +35,8 @@ use crate::components::status_bar::StatusKind;
 use crate::pages::layout::ShellStatus;
 use crate::search_url::{Param, admit_filters, refusal_copy};
 use crate::state::query::{
-    Filter, Mode, RangeSpec, UrlSignals, effective_query, navigator, replace_navigator, url_signals,
+    Filter, Mode, RangeSpec, UrlSignals, effective_query, navigator, replace_navigator,
+    report_refusal, url_signals,
 };
 use crate::state::search_session::rows_resource;
 use fleet_ui::{TabItem, Tabs, ToastBus, ToastKind};
@@ -140,13 +141,21 @@ pub fn Search() -> impl IntoView {
             if unreadable.get_untracked() {
                 return;
             }
-            goto(
-                &query_text.get_untracked(),
-                0,
-                mode.get_untracked(),
-                &filters.get_untracked(),
-                &range.get_untracked(),
-                false,
+            // The other half of the gate: a link this app cannot read
+            // back is not written at all. The editor keeps its text and
+            // the address bar keeps its query, so a query too long to
+            // share is a toast and an edit away from working, not a
+            // banner over an editor the page just emptied.
+            report_refusal(
+                bus,
+                goto(
+                    &query_text.get_untracked(),
+                    0,
+                    mode.get_untracked(),
+                    &filters.get_untracked(),
+                    &range.get_untracked(),
+                    false,
+                ),
             );
         })
     };
@@ -160,13 +169,16 @@ pub fn Search() -> impl IntoView {
             if unreadable.get_untracked() {
                 return;
             }
-            goto(
-                &query_text.get_untracked(),
-                0,
-                Mode::Live,
-                &filters.get_untracked(),
-                &range.get_untracked(),
-                false,
+            report_refusal(
+                bus,
+                goto(
+                    &query_text.get_untracked(),
+                    0,
+                    Mode::Live,
+                    &filters.get_untracked(),
+                    &range.get_untracked(),
+                    false,
+                ),
             );
         })
     };
@@ -177,13 +189,16 @@ pub fn Search() -> impl IntoView {
             if unreadable.get_untracked() {
                 return;
             }
-            goto(
-                &executed_q.get_untracked(),
-                new_page,
-                Mode::Snapshot,
-                &filters.get_untracked(),
-                &range.get_untracked(),
-                true,
+            report_refusal(
+                bus,
+                goto(
+                    &executed_q.get_untracked(),
+                    new_page,
+                    Mode::Snapshot,
+                    &filters.get_untracked(),
+                    &range.get_untracked(),
+                    true,
+                ),
             );
         })
     };
@@ -208,13 +223,16 @@ pub fn Search() -> impl IntoView {
                 bus.push(ToastKind::Error, refusal_copy(reason), None);
                 return;
             }
-            goto(
-                &executed_q.get_untracked(),
-                0,
-                mode.get_untracked(),
-                &current,
-                &range.get_untracked(),
-                false,
+            report_refusal(
+                bus,
+                goto(
+                    &executed_q.get_untracked(),
+                    0,
+                    mode.get_untracked(),
+                    &current,
+                    &range.get_untracked(),
+                    false,
+                ),
             );
         })
     };
@@ -230,13 +248,16 @@ pub fn Search() -> impl IntoView {
                 return;
             }
             current.remove(idx);
-            goto(
-                &executed_q.get_untracked(),
-                0,
-                mode.get_untracked(),
-                &current,
-                &range.get_untracked(),
-                false,
+            report_refusal(
+                bus,
+                goto(
+                    &executed_q.get_untracked(),
+                    0,
+                    mode.get_untracked(),
+                    &current,
+                    &range.get_untracked(),
+                    false,
+                ),
             );
         })
     };
@@ -247,13 +268,16 @@ pub fn Search() -> impl IntoView {
             if unreadable.get_untracked() || filters.get_untracked().is_empty() {
                 return;
             }
-            goto(
-                &executed_q.get_untracked(),
-                0,
-                mode.get_untracked(),
-                &[],
-                &range.get_untracked(),
-                false,
+            report_refusal(
+                bus,
+                goto(
+                    &executed_q.get_untracked(),
+                    0,
+                    mode.get_untracked(),
+                    &[],
+                    &range.get_untracked(),
+                    false,
+                ),
             );
         })
     };
@@ -264,13 +288,16 @@ pub fn Search() -> impl IntoView {
             if unreadable.get_untracked() || range.get_untracked() == new_range {
                 return;
             }
-            goto(
-                &executed_q.get_untracked(),
-                0,
-                mode.get_untracked(),
-                &filters.get_untracked(),
-                &new_range,
-                false,
+            report_refusal(
+                bus,
+                goto(
+                    &executed_q.get_untracked(),
+                    0,
+                    mode.get_untracked(),
+                    &filters.get_untracked(),
+                    &new_range,
+                    false,
+                ),
             );
         })
     };
@@ -284,9 +311,19 @@ pub fn Search() -> impl IntoView {
     // destination.
     let repair_to = replace_navigator();
     let on_repair = Callback::new(move |()| {
-        if let Some(url) = repair_href.get_untracked() {
-            repair_to(&url);
+        let Some(url) = repair_href.get_untracked() else {
+            return;
+        };
+        // "Start over" is the only repair that drops the query, and for
+        // an unread link `executed_q` is ALREADY empty, so the effect
+        // that syncs the editor to the executed query never fires and
+        // whatever was typed into the still-editable editor would
+        // survive a repair that means to clear the page. Clear it here,
+        // at the one repair that leaves no query behind.
+        if malformed.with_untracked(|m| m.as_ref().is_some_and(|m| m.param == Param::Link)) {
+            query_text.set(String::new());
         }
+        report_refusal(bus, repair_to(&url));
     });
 
     let on_navigate_q = {
@@ -295,8 +332,13 @@ pub fn Search() -> impl IntoView {
             if unreadable.get_untracked() {
                 return;
             }
-            query_text.set(new_q.clone());
-            goto(&new_q, 0, Mode::Snapshot, &[], &RangeSpec::default(), false);
+            // Buffer after navigation, not before it: a refused link
+            // must leave the editor exactly as the reader left it.
+            let outcome = goto(&new_q, 0, Mode::Snapshot, &[], &RangeSpec::default(), false);
+            if outcome.is_ok() {
+                query_text.set(new_q);
+            }
+            report_refusal(bus, outcome);
         })
     };
 

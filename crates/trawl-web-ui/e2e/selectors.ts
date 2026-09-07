@@ -80,6 +80,10 @@ export const SEL = {
   /// crates/trawl-web-ui/src/components/export_modal.rs — what the modal
   /// says when it refuses its own query rather than posting it.
   modalRefusal: '.m-refusal',
+  /// crates/fleet-ui/src/toast/runtime.rs Toasts, whose class is
+  /// `toast {kind}` from crates/fleet-ui/src/toast/kinds.rs. An error
+  /// toast is what a producer refusal raises.
+  toastError: '.toast.error',
 } as const;
 
 export const COPY = {
@@ -125,4 +129,7 @@ export const COPY = {
   urlNoticeTooLong: 'This link is too long to read.',
   /// crates/trawl-web-ui/src/search_url.rs Malformed::repair_label.
   urlNoticeRepairLink: 'Start over',
+  /// crates/trawl-web-ui/src/search_url.rs refusal_copy: what a
+  /// navigation refused by the producer's own link bound says.
+  linkTooLongToast: "Can't open this search: link too long",
 } as const;

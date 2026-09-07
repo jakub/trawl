@@ -47,10 +47,10 @@ use crate::components::service_card_fmt::{
 use crate::components::service_drawer::ServiceDrawer;
 use crate::components::sort_th::sort_th;
 use crate::schema_nav::{BackNav, DEFAULT_SCHEMA_TAB, back_nav_stack, sanitize_tab};
-use crate::state::query::{Mode, RangeSpec, navigator};
+use crate::state::query::{Mode, RangeSpec, navigator, report_refusal};
 use fleet_ui::{
     Badge, Icon, IconView, LoadState, Loaded, Pager, SearchInput, Sparkline, StatusDot, StatusTone,
-    Tone,
+    ToastBus, Tone,
 };
 
 /// Days of `daily_event_counts` history shown in the activity sparkline.
@@ -127,6 +127,10 @@ pub fn SchemaPage() -> impl IntoView {
     // reactive context (i.e. inside deferred callbacks).
     let nav = use_navigate();
     let goto_search = navigator();
+    // Only for a refused navigation into /search: this page has no
+    // toasts of its own, and a click that quietly does nothing is the
+    // thing the search page's own producers stopped doing.
+    let bus = expect_context::<ToastBus>();
 
     // The field history entries this page pushed, innermost last. The
     // case file's back affordance consults the top: popping an entry we
@@ -276,7 +280,10 @@ pub fn SchemaPage() -> impl IntoView {
         let goto = goto_search.clone();
         Callback::new(move |name: String| {
             let q = format!(r#"service="{}""#, name.replace('"', ""));
-            goto(&q, 0, Mode::Snapshot, &[], &RangeSpec::default(), false);
+            report_refusal(
+                bus,
+                goto(&q, 0, Mode::Snapshot, &[], &RangeSpec::default(), false),
+            );
         })
     };
 
@@ -293,7 +300,10 @@ pub fn SchemaPage() -> impl IntoView {
                 return;
             };
             let q = format!("{field}=*");
-            goto(&q, 0, Mode::Snapshot, &[], &RangeSpec::default(), false);
+            report_refusal(
+                bus,
+                goto(&q, 0, Mode::Snapshot, &[], &RangeSpec::default(), false),
+            );
         })
     };
 

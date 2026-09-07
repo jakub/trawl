@@ -32,9 +32,11 @@ pub use crate::query_merge::{Filter, FilterOp, QUICK_RANGES, RangeSpec, effectiv
 pub use crate::search_url::{Mode, build_search_url};
 
 use crate::search_url::{
-    Malformed, Verdict, decode_filters, decode_range, first_value, parse_page, read_search,
-    repair_url,
+    Malformed, Reason, Verdict, admit_search, decode_filters, decode_range, first_value,
+    parse_page, read_search, refusal_copy, repair_url,
 };
+
+use fleet_ui::{ToastBus, ToastKind};
 
 /// Capture a `Navigator` closure that pushes new `(q, page, mode, filters,
 /// range)` tuples onto the router's history.
@@ -48,16 +50,28 @@ use crate::search_url::{
 /// `replace = true` is appropriate for pagination clicks (user shouldn't
 /// have to hit back 20 times to undo) and for a banner's repair of an
 /// unreadable link; `false` for explicit submits.
-pub fn navigator() -> impl Fn(&str, usize, Mode, &[Filter], &RangeSpec, bool) + Clone + 'static {
+///
+/// The URL is admitted before it is pushed. A link past
+/// `MAX_SEARCH_BYTES` is one this crate's own reader refuses whole, so
+/// navigating to it would replace the page with a banner whose only
+/// action is "Start over", and, since the editor follows the executed
+/// query, would take the text that caused it down too. On a refusal
+/// nothing moves: no history entry, no address bar change, no editor
+/// change. The caller says so out loud with [`report_refusal`].
+pub fn navigator()
+-> impl Fn(&str, usize, Mode, &[Filter], &RangeSpec, bool) -> Result<(), Reason> + Clone + 'static {
     let nav = use_navigate();
     move |query, page, mode, filters, range, replace| {
+        let url = build_search_url(query, page, mode, filters, range);
+        admit_search(&url)?;
         nav(
-            &build_search_url(query, page, mode, filters, range),
+            &url,
             NavigateOptions {
                 replace,
                 ..Default::default()
             },
         );
+        Ok(())
     }
 }
 
@@ -69,9 +83,15 @@ pub fn navigator() -> impl Fn(&str, usize, Mode, &[Filter], &RangeSpec, bool) + 
 /// the URL out of state, so it needs a door that takes a URL and not a
 /// `(q, page, mode, filters, range)` tuple. Same `use_navigate` rule as
 /// [`navigator`] — call it from a component body.
-pub fn replace_navigator() -> impl Fn(&str) + Clone + 'static {
+///
+/// Admitted like [`navigator`], and for a reason that is not theoretical
+/// here: a repair carries every other parameter through, and
+/// `repair_url` percent-encodes `q` on the way, so a link inside the
+/// bound can be rewritten into one past it.
+pub fn replace_navigator() -> impl Fn(&str) -> Result<(), Reason> + Clone + 'static {
     let nav = use_navigate();
     move |url: &str| {
+        admit_search(url)?;
         nav(
             url,
             NavigateOptions {
@@ -79,6 +99,20 @@ pub fn replace_navigator() -> impl Fn(&str) + Clone + 'static {
                 ..Default::default()
             },
         );
+        Ok(())
+    }
+}
+
+/// Say a refused navigation out loud, in one sentence, and do nothing
+/// when there was nothing to refuse.
+///
+/// Every page that navigates into `/search` goes through this, so the
+/// copy for "the link this would have built is one we cannot read back"
+/// lives in [`refusal_copy`] beside the filter refusals rather than
+/// being written per caller.
+pub fn report_refusal(bus: ToastBus, outcome: Result<(), Reason>) {
+    if let Err(reason) = outcome {
+        bus.push(ToastKind::Error, refusal_copy(reason), None);
     }
 }
 

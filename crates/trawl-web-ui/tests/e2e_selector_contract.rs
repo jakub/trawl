@@ -30,6 +30,8 @@ const META_STRIP_RS: &str = include_str!("../src/components/meta_strip.rs");
 const SEARCH_URL_RS: &str = include_str!("../src/search_url.rs");
 const EXPORT_MODAL_RS: &str = include_str!("../src/components/export_modal.rs");
 const MODAL_SHELL_RS: &str = include_str!("../../fleet-ui/src/modal/shell.rs");
+const TOAST_RUNTIME_RS: &str = include_str!("../../fleet-ui/src/toast/runtime.rs");
+const TOAST_KINDS_RS: &str = include_str!("../../fleet-ui/src/toast/kinds.rs");
 const LOADED_COMPONENT_RS: &str = include_str!("../../fleet-ui/src/loaded/component.rs");
 const LOADED_STATE_RS: &str = include_str!("../../fleet-ui/src/loaded/state.rs");
 const RAIL_RS: &str = include_str!("../../fleet-ui/src/rail.rs");
@@ -329,13 +331,31 @@ const CONTRACTS: &[Contract] = &[
         assignment: "urlNoticeTooLong: 'This link is too long to read.',",
         source_path: "src/search_url.rs",
         source: SEARCH_URL_RS,
-        hook: "Param::Link => \"This link is too long to read.\".to_owned(),",
+        hook: "_ => \"This link is too long to read.\".to_owned(),",
     },
     Contract {
         assignment: "urlNoticeRepairLink: 'Start over',",
         source_path: "src/search_url.rs",
         source: SEARCH_URL_RS,
         hook: "Param::Link => \"Start over\",",
+    },
+    Contract {
+        assignment: "toastError: '.toast.error',",
+        source_path: "../fleet-ui/src/toast/runtime.rs",
+        source: TOAST_RUNTIME_RS,
+        hook: "format!(\"toast {}\", t.kind.as_class())",
+    },
+    Contract {
+        assignment: "toastError: '.toast.error',",
+        source_path: "../fleet-ui/src/toast/kinds.rs",
+        source: TOAST_KINDS_RS,
+        hook: "Self::Error => \"error\",",
+    },
+    Contract {
+        assignment: "linkTooLongToast: \"Can't open this search: link too long\",",
+        source_path: "src/search_url.rs",
+        source: SEARCH_URL_RS,
+        hook: "\"Can't open this search: link too long\"",
     },
     Contract {
         assignment: "liveTailButtonText: 'Live Tail',",

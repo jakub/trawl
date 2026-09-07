@@ -389,6 +389,16 @@ test('a link past the length bound is refused whole', async ({ page, request }) 
   await page.waitForTimeout(QUIET_MS);
   expect(await capturedQueryCount(request), 'an oversized link posted a query').toBe(0);
 
+  // The editor is still editable under the banner, and nothing the
+  // reader types there is part of the link. For an unread link
+  // `executed_q` is already empty, so the effect that syncs the editor
+  // to the executed query does not fire on "Start over": the repair has
+  // to clear the buffer itself, or the page comes back carrying text
+  // the reader typed at a broken link.
+  await page.locator(SEL.cmContent).click();
+  await page.keyboard.insertText('service=nginx');
+  await expect(page.locator(SEL.cmContent)).toHaveText('service=nginx');
+
   // "Start over" is the whole query string, not an edit of a link the
   // reader never read — and it replaces, like every other repair.
   const historyBefore = await page.evaluate(() => history.length);
@@ -397,6 +407,39 @@ test('a link past the length bound is refused whole', async ({ page, request }) 
   expect(await page.evaluate(() => location.pathname)).toBe('/search');
   expect(await page.evaluate(() => location.search)).toBe('');
   expect(await page.evaluate(() => history.length)).toBe(historyBefore);
+  await expect(page.locator(SEL.cmContent)).toHaveText('');
+});
+
+test('a query too long to link is refused before it navigates', async ({ page, request }) => {
+  // The producer's half of the bound. Submitting 33 KiB of DSL builds a
+  // URL this app's own reader refuses whole, and navigating to it used
+  // to replace the page with the "Start over" banner AND take the text
+  // that caused it down with it, leaving the reader to retype the query
+  // they had just lost. Now nothing moves.
+  await resetScenario(request, 'default');
+  await page.goto('/search');
+  const before = page.url();
+
+  await page.locator(SEL.cmContent).click();
+  await page.keyboard.press('Control+a');
+  await page.keyboard.insertText(`service=${'a'.repeat(33 * 1024)}zzzEND`);
+  await page.keyboard.press('Control+Enter');
+
+  // Said out loud: a control that quietly does nothing is worse than
+  // the banner it is avoiding.
+  await expect(page.locator(SEL.toastError)).toContainText(COPY.linkTooLongToast);
+
+  await page.waitForTimeout(QUIET_MS);
+  // The link the reader is on, and the text they typed, both untouched.
+  expect(page.url(), 'a refused submit navigated anyway').toBe(before);
+  await expect(page.locator(SEL.urlNotice)).toHaveCount(0);
+  // CodeMirror renders a ~2 KB window of a 33 KiB line, not the line, so
+  // the DOM cannot show the whole buffer. It can show the end, which is
+  // where the cursor is, and a buffer the sync effect had cleared would
+  // render as nothing at all.
+  const tail = await page.locator(SEL.cmContent).evaluate((el) => (el.textContent ?? '').slice(-6));
+  expect(tail, 'the editor lost the query it refused').toBe('zzzEND');
+  expect(await capturedQueryCount(request), 'a refused submit ran a query').toBe(0);
 });
 
 test('q encoding matches encodeURIComponent', async ({ page }) => {

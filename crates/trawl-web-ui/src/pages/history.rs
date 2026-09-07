@@ -21,7 +21,7 @@ use trawl_api::HistoryEntryResponse;
 
 use crate::api;
 use crate::components::save_as_net_modal::SaveAsNetModal;
-use crate::state::query::{Mode, RangeSpec, navigator};
+use crate::state::query::{Mode, RangeSpec, navigator, report_refusal};
 use fleet_ui::time::format_duration;
 use fleet_ui::{Btn, LoadState, Loaded, Pager, SearchInput, ToastBus, ToastKind, Variant, When};
 
@@ -54,7 +54,12 @@ pub fn HistoryPage() -> impl IntoView {
     let on_rerun = {
         let goto_search = goto_search.clone();
         move |q: String| {
-            goto_search(&q, 0, Mode::Snapshot, &[], &RangeSpec::default(), false);
+            // A stored query long enough to bust the link bound is
+            // refused rather than rerun into a banner (ADR-0027).
+            report_refusal(
+                bus,
+                goto_search(&q, 0, Mode::Snapshot, &[], &RangeSpec::default(), false),
+            );
         }
     };
 

@@ -24,7 +24,10 @@
 //!   structured state cannot be read is shown with a banner and does not
 //!   run, so a bad `f` can no longer widen a query silently. Every
 //!   decode is bounded before it allocates — a URL is attacker-controlled
-//!   input to the SPA.
+//!   input to the SPA. Every bound fails closed on both sides: the
+//!   reader refuses the whole link rather than answering from the part
+//!   that fit ([`read_search`]), and the producer asks the reader before
+//!   it navigates ([`admit_search`], [`admit_filters`]).
 
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
@@ -68,15 +71,21 @@ pub const MAX_OFFSET: u64 = u32::MAX as u64;
 /// it the whole link is one verdict rather than five.
 pub const MAX_SEARCH_BYTES: usize = 32 * 1024;
 
-/// Largest number of `&`-separated pairs examined inside a search string
-/// that is within [`MAX_SEARCH_BYTES`]. Everything after them is treated
-/// as absent.
+/// Largest number of NON-EMPTY `&`-separated pairs a search string
+/// within [`MAX_SEARCH_BYTES`] may carry. One more and the whole link is
+/// refused, unread.
 ///
 /// This app writes at most five, and the five it reads are the only ones
 /// it looks for, so 64 is room for a hand-edited link to carry unknown
-/// parameters ahead of the known ones and still be read as written. A
-/// known key sitting past the 64th pair reads as missing — the same
-/// answer a link that never carried it gets.
+/// parameters ahead of the known ones and still be read as written.
+///
+/// Past the cap the link fails CLOSED, because the alternative failed
+/// open: the cap used to stop the scan and everything after it read as
+/// absent, so `?q=service%3Dnginx` followed by 64 `&` and `f=v1.!` ran
+/// the query with no filters and no banner. The empty pairs filled the
+/// budget and the unreadable `f` was never looked at. An empty pair is
+/// not a parameter, so it costs nothing and counts for nothing; a link
+/// with a stray `&&` is an ordinary link.
 pub const MAX_SEARCH_PAIRS: usize = 64;
 
 /// The parameters the search page reads. Every other pair in a query
@@ -242,6 +251,11 @@ pub enum Reason {
     /// The whole query string is over [`MAX_SEARCH_BYTES`], so no
     /// parameter inside it was read.
     LinkTooLong,
+    /// The query string carries more than [`MAX_SEARCH_PAIRS`] non-empty
+    /// pairs. The scan stops there, so what is past it cannot be read at
+    /// all and the link is refused rather than answered from the half
+    /// that fit.
+    TooManyParameters,
 }
 
 /// One parameter that could not be read, carrying as much of the raw
@@ -295,11 +309,18 @@ impl Malformed {
     ///
     /// The whole-link verdict introduces nothing: its "value" is tens of
     /// kilobytes of address bar, and none of it is retained, so the
-    /// sentence ends itself.
+    /// sentence ends itself. Which sentence depends on the reason,
+    /// because a link of sixty-six parameters can be three hundred bytes
+    /// long and telling its reader it is too long would be a lie.
     #[must_use]
     pub fn message(&self) -> String {
         match self.param {
-            Param::Link => "This link is too long to read.".to_owned(),
+            Param::Link => match self.reason {
+                Reason::TooManyParameters => {
+                    "This link has too many parameters to read.".to_owned()
+                }
+                _ => "This link is too long to read.".to_owned(),
+            },
             Param::Filters | Param::Range | Param::Page => {
                 format!("This link's {} could not be read:", self.param.noun())
             }
@@ -380,20 +401,21 @@ pub fn percent_encode(s: &str) -> String {
 /// refusal of the whole link.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SearchRead {
-    /// Over [`MAX_SEARCH_BYTES`]. Nothing inside was parsed, so the
-    /// whole link is one verdict rather than a banner per parameter.
-    TooLong(Malformed),
+    /// Refused whole: over [`MAX_SEARCH_BYTES`], or carrying more than
+    /// [`MAX_SEARCH_PAIRS`] parameters. Nothing inside was parsed, so
+    /// the link is one verdict rather than a banner per parameter.
+    Refused(Malformed),
     /// The known parameters, first occurrence of each, in arrival order.
     Params(Vec<(String, String)>),
 }
 
 impl SearchRead {
-    /// The pairs, or none at all when the link was refused by length.
+    /// The pairs, or none at all when the link was refused whole.
     #[must_use]
     pub fn params(&self) -> &[(String, String)] {
         match self {
             Self::Params(params) => params,
-            Self::TooLong(_) => &[],
+            Self::Refused(_) => &[],
         }
     }
 
@@ -401,7 +423,7 @@ impl SearchRead {
     #[must_use]
     pub const fn malformed(&self) -> Option<&Malformed> {
         match self {
-            Self::TooLong(m) => Some(m),
+            Self::Refused(m) => Some(m),
             Self::Params(_) => None,
         }
     }
@@ -416,16 +438,25 @@ impl SearchRead {
 /// used to become a million owned `(String, String)` pairs; now it is
 /// one [`Reason::LinkTooLong`] verdict that retains none of the text.
 ///
+/// Both bounds refuse the WHOLE link, and that is the point: a bound
+/// that stops reading and answers from what it managed to read hands the
+/// unread half whatever default the app has, which is how a filter cap
+/// turned into a wider query than the link described.
+///
 /// This is the only door the app reads a search string through.
 #[must_use]
 pub fn read_search(raw_search: &str) -> SearchRead {
+    // No prefix retained by either arm: the banner's whole sentence is
+    // about the link, and echoing 120 characters of it says nothing a
+    // reader can act on.
+    let refused = |reason| SearchRead::Refused(Malformed::new(Param::Link, "", reason));
     if raw_search.len() > MAX_SEARCH_BYTES {
-        // No prefix retained: the banner's whole sentence is that the
-        // link is too long, and echoing 120 characters of it says
-        // nothing a reader can act on.
-        return SearchRead::TooLong(Malformed::new(Param::Link, "", Reason::LinkTooLong));
+        return refused(Reason::LinkTooLong);
     }
-    SearchRead::Params(query_params(raw_search))
+    match query_params(raw_search) {
+        Ok(params) => SearchRead::Params(params),
+        Err(reason) => refused(reason),
+    }
 }
 
 /// One raw name as the key it spells, or `None` for a parameter this app
@@ -472,30 +503,40 @@ fn known_key(raw_name: &str) -> Option<&'static str> {
 /// Bytes are assembled first and read as UTF-8 last, so `%E6%97%A5` is one
 /// character and a truncated sequence is U+FFFD rather than a panic.
 ///
-/// Two things are dropped rather than carried, both so an unbounded
-/// address bar cannot become unbounded work or unbounded state:
+/// Bounded so an unbounded address bar cannot become unbounded work or
+/// unbounded state, in two different ways:
 ///
 /// - A pair whose name is not one of [`KNOWN_KEYS`] is skipped without
 ///   its value being decoded or copied. A repair therefore rebuilds the
 ///   link out of the five parameters this app reads, and an unknown one
 ///   the reader never looked at does not survive the click.
-/// - At most [`MAX_SEARCH_PAIRS`] pairs are examined (empty ones
-///   included, since the split sees them); a known key past that reads
-///   as missing.
+/// - At most [`MAX_SEARCH_PAIRS`] non-empty pairs are examined, and a
+///   link with more is refused whole rather than answered from the ones
+///   that fit. Empty pairs (`&&`) are not parameters: they are skipped
+///   before the count, so they cannot push a real parameter past the
+///   cap.
 ///
 /// The FIRST occurrence of each key wins, which is what
 /// `URLSearchParams.get` answers, so a duplicate cannot come back later
 /// as its own replacement.
-fn query_params(raw_search: &str) -> Vec<(String, String)> {
+///
+/// # Errors
+/// [`Reason::TooManyParameters`] when the string carries more non-empty
+/// pairs than the cap admits, so the ones past it were never examined.
+fn query_params(raw_search: &str) -> Result<Vec<(String, String)>, Reason> {
     let mut params: Vec<(String, String)> = Vec::new();
+    let mut examined: usize = 0;
     for pair in raw_search
         .strip_prefix('?')
         .unwrap_or(raw_search)
         .split('&')
-        .take(MAX_SEARCH_PAIRS)
     {
         if pair.is_empty() {
             continue;
+        }
+        examined += 1;
+        if examined > MAX_SEARCH_PAIRS {
+            return Err(Reason::TooManyParameters);
         }
         let (raw_name, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
         let Some(key) = known_key(raw_name) else {
@@ -506,7 +547,7 @@ fn query_params(raw_search: &str) -> Vec<(String, String)> {
         }
         params.push((key.to_owned(), form_decode(raw_value)));
     }
-    params
+    Ok(params)
 }
 
 /// Decode one `application/x-www-form-urlencoded` name or value.
@@ -602,6 +643,49 @@ pub fn build_search_url(
         let _ = write!(url, "&r={}", encode_range(range));
     }
     url
+}
+
+/// Whether a link this app is about to navigate to is one its own reader
+/// will read back. The whole-link half of the producer's door, beside
+/// [`admit_filters`]' per-parameter half.
+///
+/// Asked by the two navigators in `state::query`, so every producer on
+/// the search page (submit, range, live, chips, facets, pagination,
+/// repair, history rerun, saved-query open, row actions) is covered by
+/// one check. A refusal is a toast and a navigation that does not
+/// happen: the address bar and the editor buffer stay as they were.
+/// Without it, a 33 KiB query built a URL [`read_search`] refuses whole,
+/// the editor sync effect then cleared the user's text, and the only
+/// control left was "Start over".
+///
+/// The rules are not restated here. The URL is handed to the reader
+/// itself, so the two answer the same at every boundary byte by
+/// construction rather than by a pair of constants that have to agree.
+///
+/// # Errors
+/// The bound the link busts: [`Reason::LinkTooLong`], or
+/// [`Reason::TooManyParameters`], which this app cannot produce, since
+/// it writes five parameters, and which is checked anyway because a
+/// producer that trusts its own arithmetic is how a reader and a writer
+/// drift apart.
+pub fn admit_search(url_or_search: &str) -> Result<(), Reason> {
+    match read_search(search_of(url_or_search)) {
+        SearchRead::Params(_) => Ok(()),
+        SearchRead::Refused(m) => Err(m.reason),
+    }
+}
+
+/// The query string of a URL this crate built, or the argument itself
+/// when it is already one.
+///
+/// `build_search_url` always writes the `?`, and a path without one
+/// carries no state to measure.
+fn search_of(url_or_search: &str) -> &str {
+    match url_or_search.split_once('?') {
+        Some((_, search)) => search,
+        None if url_or_search.starts_with('/') => "",
+        None => url_or_search,
+    }
 }
 
 /// Rewrite a search URL, replacing ONLY the parameter the banner names
@@ -733,11 +817,17 @@ pub fn admit_filters(filters: &[Filter]) -> Result<(), Reason> {
     Ok(())
 }
 
-/// What a refused filter says to the person who clicked. One sentence,
-/// naming the limit rather than the internal rule.
+/// What a refusal says to the person who clicked. One sentence, naming
+/// the limit rather than the internal rule.
+///
+/// Two families reach here: a filter the link cannot carry, and a link
+/// the reader would refuse whole. They read differently because they are
+/// different acts. One click added a chip, the other tried to open a
+/// search.
 #[must_use]
 pub const fn refusal_copy(reason: Reason) -> &'static str {
     match reason {
+        Reason::LinkTooLong | Reason::TooManyParameters => "Can't open this search: link too long",
         Reason::TooManyFilters => "Can't add filter: too many filters (max 32)",
         Reason::FilterValueTooLong => "Can't add filter: value too long",
         Reason::FilterFieldTooLong => "Can't add filter: field name too long",
@@ -908,6 +998,16 @@ pub fn parse_page(raw: &str) -> Verdict<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pairs a readable search string carries.
+    ///
+    /// Shadows the real `query_params` for the tables below, which are
+    /// about what a link MEANS and hand it only links the reader
+    /// accepts. The refusals are their own tests, on `read_search`,
+    /// which is the door the app actually uses.
+    fn query_params(raw: &str) -> Vec<(String, String)> {
+        super::query_params(raw).expect("a link the reader accepts")
+    }
 
     /// Base64url, unpadded, as the codec writes it — spelled out here
     /// so a test can hand `decode_filters` a payload the codec would
@@ -1115,21 +1215,85 @@ mod tests {
         assert_eq!(query_params("%71%20%20%20%20=x"), Vec::new());
     }
 
-    /// The pair cap is a bound on work, not a filter on meaning: the
-    /// five keys win wherever they sit inside it, and a key past it
-    /// reads as missing — the same answer a link without it gets.
+    /// The pair cap is a bound on work, and reaching it is a verdict
+    /// about the whole link rather than a licence to answer from the
+    /// pairs that fit.
     #[test]
-    fn a_known_key_past_the_pair_cap_reads_as_missing() {
-        let junk = |n: usize| "x=1&".repeat(n);
-        let inside = format!("{}q=late", junk(MAX_SEARCH_PAIRS - 1));
-        assert_eq!(first_value(&query_params(&inside), "q"), Some("late"));
+    fn a_link_past_the_pair_cap_is_refused_whole() {
+        // Distinct names, so nothing here is a duplicate being dropped.
+        let junk = |n: usize| {
+            (0..n).fold(String::new(), |mut acc, i| {
+                let _ = write!(acc, "x{i}=1&");
+                acc
+            })
+        };
 
+        // The last pair the cap admits is read as written.
+        let inside = format!("{}q=late", junk(MAX_SEARCH_PAIRS - 1));
+        let read = read_search(&inside);
+        assert_eq!(read.malformed(), None);
+        assert_eq!(first_value(read.params(), "q"), Some("late"));
+
+        // One more non-empty pair and the link is refused: `q` sits
+        // past the scan, and reading the link as if it carried no `q`
+        // would run the whole corpus over the default window.
         let past = format!("{}q=late", junk(MAX_SEARCH_PAIRS));
-        assert_eq!(first_value(&query_params(&past), "q"), None);
-        // 100 unknown pairs ahead of it is past the cap by the same
-        // rule; nothing else in the link is affected.
-        let hundred = format!("{}q=late", junk(100));
-        assert_eq!(query_params(&hundred), Vec::new());
+        let read = read_search(&past);
+        let m = read.malformed().expect("65 pairs plus q is refused");
+        assert_eq!(m.param, Param::Link);
+        assert_eq!(m.reason, Reason::TooManyParameters);
+        assert!(read.params().is_empty());
+        assert_eq!(m.message(), "This link has too many parameters to read.");
+        assert_eq!(m.repair_label(), "Start over");
+        assert_eq!(m.truncated_raw(), "");
+
+        // 60 unknown pairs is comfortably inside it, `q` and all.
+        let sixty = format!("{}q=late", junk(60));
+        assert_eq!(first_value(read_search(&sixty).params(), "q"), Some("late"));
+
+        // Junk alone, over the cap, is refused on its own: the rule is
+        // the count, not whether a key we read sits past it.
+        assert_eq!(
+            read_search(&junk(MAX_SEARCH_PAIRS + 1))
+                .malformed()
+                .map(|m| m.reason),
+            Some(Reason::TooManyParameters)
+        );
+    }
+
+    /// The bypass the pair cap used to hand out: 64 EMPTY pairs spent
+    /// the whole budget, so the `f` behind them was never examined and
+    /// the link ran with no filters and no banner, the one outcome
+    /// ADR-0027 exists to prevent. An empty pair is not a parameter.
+    #[test]
+    fn empty_pairs_neither_bypass_the_cap_nor_count_against_it() {
+        let bypass = format!("q=service%3Dnginx{}f=v1.!", "&".repeat(MAX_SEARCH_PAIRS));
+        let read = read_search(&bypass);
+        assert_eq!(read.malformed(), None);
+        // The `f` is read, and it is the one the banner names.
+        assert_eq!(first_value(read.params(), "f"), Some("v1.!"));
+        assert_eq!(
+            decode_filters(first_value(read.params(), "f").unwrap())
+                .malformed()
+                .map(|m| m.reason),
+            Some(Reason::UndecodableFilters)
+        );
+
+        // A handful of stray empties in an ordinary link changes
+        // nothing about it.
+        let stray = format!("q=x&&&&&f={}", encode_filters(&[inc("host", "web-01")]));
+        let read = read_search(&stray);
+        assert_eq!(read.malformed(), None);
+        assert_eq!(first_value(read.params(), "q"), Some("x"));
+        assert_eq!(
+            decode_filters(first_value(read.params(), "f").unwrap()),
+            Verdict::Valid(vec![inc("host", "web-01")])
+        );
+
+        // Even a million of them: they are skipped before the count, so
+        // only the byte bound can refuse a link made of them.
+        let empties = "&".repeat(MAX_SEARCH_BYTES - 4);
+        assert_eq!(read_search(&format!("q=x{empties}")).malformed(), None);
     }
 
     /// Length first, split second. A million pairs is 2 MB of address
@@ -1156,6 +1320,85 @@ mod tests {
                 Param::Link
             ),
             "/search"
+        );
+    }
+
+    /// The producer asks the reader, so the app cannot navigate to a
+    /// link its own banner would refuse. Before this door existed, a
+    /// long query submitted from the editor navigated, hit the banner,
+    /// and the editor sync effect wiped the text that caused it.
+    #[test]
+    fn the_producer_refuses_a_link_the_reader_would_refuse() {
+        // 32 760 `a`s: inside no single parameter's cap, past the
+        // link's once `q=` and `&page=0` are around it.
+        let long = build_search_url(
+            &"a".repeat(32_760),
+            0,
+            Mode::Snapshot,
+            &[],
+            &RangeSpec::default(),
+        );
+        assert_eq!(admit_search(&long), Err(Reason::LinkTooLong));
+
+        // 30 KiB is a link this app is content to write.
+        let ok = build_search_url(
+            &"a".repeat(30 * 1024),
+            0,
+            Mode::Snapshot,
+            &[],
+            &RangeSpec::default(),
+        );
+        assert_eq!(admit_search(&ok), Ok(()));
+
+        // Percent encoding is what decides it, not the typed length: 11
+        // 000 spaces are 33 000 bytes of `%20` in the address bar.
+        let spaced = build_search_url(
+            &" ".repeat(11_000),
+            0,
+            Mode::Snapshot,
+            &[],
+            &RangeSpec::default(),
+        );
+        assert_eq!(admit_search(&spaced), Err(Reason::LinkTooLong));
+
+        // A search string handed over without its path, as
+        // `use_location().search` spells it, reads the same.
+        assert_eq!(admit_search("q=x&page=0"), Ok(()));
+        assert_eq!(admit_search("/search"), Ok(()));
+    }
+
+    /// The two doors agree at the boundary BYTE, which is the only way
+    /// to be sure the producer's refusal and the reader's refusal are
+    /// the same rule: both are asked about one URL, one byte on each
+    /// side of the cap.
+    #[test]
+    fn the_producer_and_the_reader_share_one_boundary() {
+        // `q=` + the text + `&page=0` is exactly MAX_SEARCH_BYTES.
+        let at_cap = build_search_url(
+            &"a".repeat(MAX_SEARCH_BYTES - "q=".len() - "&page=0".len()),
+            0,
+            Mode::Snapshot,
+            &[],
+            &RangeSpec::default(),
+        );
+        let search = at_cap.split_once('?').unwrap().1;
+        assert_eq!(search.len(), MAX_SEARCH_BYTES);
+        assert_eq!(admit_search(&at_cap), Ok(()));
+        assert_eq!(read_search(search).malformed(), None);
+
+        let over_cap = build_search_url(
+            &"a".repeat(MAX_SEARCH_BYTES - "q=".len() - "&page=0".len() + 1),
+            0,
+            Mode::Snapshot,
+            &[],
+            &RangeSpec::default(),
+        );
+        let search = over_cap.split_once('?').unwrap().1;
+        assert_eq!(search.len(), MAX_SEARCH_BYTES + 1);
+        assert_eq!(admit_search(&over_cap), Err(Reason::LinkTooLong));
+        assert_eq!(
+            read_search(search).malformed().map(|m| m.reason),
+            Some(Reason::LinkTooLong)
         );
     }
 
@@ -1552,6 +1795,16 @@ mod tests {
 
     #[test]
     fn a_refusal_names_the_limit_it_hit() {
+        // The link family: a search that cannot be written as a URL the
+        // reader reads back. Different act, different sentence.
+        assert_eq!(
+            refusal_copy(Reason::LinkTooLong),
+            "Can't open this search: link too long"
+        );
+        assert_eq!(
+            refusal_copy(Reason::TooManyParameters),
+            "Can't open this search: link too long"
+        );
         assert_eq!(
             refusal_copy(Reason::TooManyFilters),
             "Can't add filter: too many filters (max 32)"

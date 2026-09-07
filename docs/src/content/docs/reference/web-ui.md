@@ -52,10 +52,16 @@ click the repair. Everything else is switched off while the banner is up —
 Haul, the range presets, Live Tail, Save, Export, pagination and the filter
 controls all refuse, so a broken link cannot be turned into a wider query
 through a control that was never named. The broken link stays intact until
-then, so you can send it back to whoever shared it. A link over 32 KiB is
-refused as a whole rather than parameter by parameter, with `Start over` as
-its repair, and parameters other than `q`, `page`, `mode`, `f` and `r` are
-not read at all.
+then, so you can send it back to whoever shared it. A link over 32 KiB, or
+one carrying more than 64 parameters, is refused as a whole rather than
+parameter by parameter, with `Start over` as its repair: nothing inside it is
+read, so padding a link cannot push the filter it carries out of sight and
+have the query run without it. Parameters other than `q`, `page`, `mode`,
+`f` and `r` are not read at all. The same two bounds apply on the way out,
+which is the one place the page declines to do what you asked: a query long
+enough that its link would be unreadable is never written to the address bar,
+and you get an error toast with your text and the current results left
+exactly where they were.
 
 The case file renders one `GET /api/v1/schema/field?name=` response as plain
 facts: the pin and when and where it was set, the verdict (since when, how
