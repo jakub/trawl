@@ -84,6 +84,36 @@ export const SEL = {
   /// `toast {kind}` from crates/fleet-ui/src/toast/kinds.rs. An error
   /// toast is what a producer refusal raises.
   toastError: '.toast.error',
+  /// crates/fleet-ui/src/toast/runtime.rs — a toast of ANY kind. What a
+  /// spec asserting that NOTHING was announced has to watch, since the
+  /// kind is the thing under test.
+  toastAny: '.toast',
+  /// crates/fleet-ui/src/drawer.rs — the sliding panel itself (the scrim
+  /// is `.sd-scrim`, a different element).
+  drawerPanel: '.sd-drawer',
+  /// crates/fleet-ui/src/drawer.rs — the built-in close button in the
+  /// header's actions row.
+  drawerClose: '.sd-x',
+  /// crates/fleet-ui/src/drawer.rs — the header title slot, filled by
+  /// whatever the app passes as `title`.
+  drawerTitle: '.sd-ttl',
+  /// crates/trawl-web-ui/src/components/field_case_drawer.rs — the case
+  /// file body, present in the loaded, missing and error arms alike.
+  fieldCase: '.fc-case',
+  /// crates/trawl-web-ui/src/components/field_case_drawer.rs `job_block`
+  /// — present exactly when a repin job was adopted, which makes it the
+  /// positive control for "the status poll actually started".
+  fieldCaseJob: '.fc-job',
+} as const;
+
+/// Timings the specs share with the app. Mirrored here rather than
+/// re-derived: a spec that waits out a poll period has to wait out the
+/// SAME one the app uses, and `e2e_selector_contract.rs` pins each value
+/// against the Rust constant it copies.
+export const TIMING = {
+  /// crates/trawl-web-ui/src/repin_flow.rs REPIN_POLL_MS — how often the
+  /// field case file re-reads the repin status while it tracks a job.
+  repinPollMs: 3000,
 } as const;
 
 export const COPY = {

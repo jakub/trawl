@@ -36,6 +36,9 @@ const LOADED_COMPONENT_RS: &str = include_str!("../../fleet-ui/src/loaded/compon
 const LOADED_STATE_RS: &str = include_str!("../../fleet-ui/src/loaded/state.rs");
 const RAIL_RS: &str = include_str!("../../fleet-ui/src/rail.rs");
 const SECTION_RS: &str = include_str!("../src/state/section.rs");
+const DRAWER_RS: &str = include_str!("../../fleet-ui/src/drawer.rs");
+const FIELD_CASE_DRAWER_RS: &str = include_str!("../src/components/field_case_drawer.rs");
+const REPIN_FLOW_RS: &str = include_str!("../src/repin_flow.rs");
 
 /// One (assignment, source file, hook) triple: `assignment` is the full
 /// `key: 'value',` line as it appears in `selectors.ts`, and `hook` must
@@ -363,6 +366,53 @@ const CONTRACTS: &[Contract] = &[
         source: EDITOR_WRAP_RS,
         hook: "\"Live Tail\"",
     },
+    Contract {
+        assignment: "toastAny: '.toast',",
+        source_path: "../fleet-ui/src/toast/runtime.rs",
+        source: TOAST_RUNTIME_RS,
+        hook: "format!(\"toast {}\", t.kind.as_class())",
+    },
+    Contract {
+        assignment: "drawerPanel: '.sd-drawer',",
+        source_path: "../fleet-ui/src/drawer.rs",
+        source: DRAWER_RS,
+        hook: "class=\"sd-drawer\"",
+    },
+    Contract {
+        assignment: "drawerClose: '.sd-x',",
+        source_path: "../fleet-ui/src/drawer.rs",
+        source: DRAWER_RS,
+        hook: "class=\"sd-x\"",
+    },
+    Contract {
+        assignment: "drawerTitle: '.sd-ttl',",
+        source_path: "../fleet-ui/src/drawer.rs",
+        source: DRAWER_RS,
+        hook: "class=\"sd-ttl\"",
+    },
+    Contract {
+        assignment: "fieldCase: '.fc-case',",
+        source_path: "src/components/field_case_drawer.rs",
+        source: FIELD_CASE_DRAWER_RS,
+        hook: "class=\"fc-case\"",
+    },
+    // The job block's class is composite in the source, and only the
+    // second half is the hook the spec selects on.
+    Contract {
+        assignment: "fieldCaseJob: '.fc-job',",
+        source_path: "src/components/field_case_drawer.rs",
+        source: FIELD_CASE_DRAWER_RS,
+        hook: "class=\"fc-sec fc-job\"",
+    },
+    // Not a selector: a timing the specs wait out. Same drift mechanism,
+    // because a spec waiting out the WRONG period proves nothing — it
+    // would pass whether or not the poll stopped.
+    Contract {
+        assignment: "repinPollMs: 3000,",
+        source_path: "src/repin_flow.rs",
+        source: REPIN_FLOW_RS,
+        hook: "pub const REPIN_POLL_MS: u32 = 3_000;",
+    },
 ];
 
 #[test]
@@ -409,7 +459,15 @@ fn every_selectors_ts_entry_is_pinned() {
             && trimmed.split_once(": ").is_some_and(|(key, rest)| {
                 !key.is_empty()
                     && key.chars().all(|ch| ch.is_ascii_alphanumeric())
-                    && (rest.starts_with('\'') || rest.starts_with('"'))
+                    // A NUMBER is an entry too. `TIMING` mirrors Rust
+                    // constants the specs wait out, and a predicate that
+                    // only recognised quoted values left those invisible
+                    // to the very mechanism that catches an unpinned
+                    // entry — the one place a silent mirror hurts most,
+                    // since a wrong wait passes either way.
+                    && (rest.starts_with('\'')
+                        || rest.starts_with('"')
+                        || rest.starts_with(|ch: char| ch.is_ascii_digit()))
             });
         if is_entry {
             assert!(
