@@ -56,6 +56,7 @@ const NET_DRAWER_RS: &str = include_str!("../src/components/net_drawer.rs");
 const FACET_SIDEBAR_RS: &str = include_str!("../src/components/facet_sidebar.rs");
 const STATUS_BAR_RS: &str = include_str!("../src/components/status_bar.rs");
 const DRAWER_QUERY_RS: &str = include_str!("../src/drawer_query.rs");
+const SEARCH_INPUT_RS: &str = include_str!("../../fleet-ui/src/search_input.rs");
 const SEGMENTED_COMPONENT_RS: &str = include_str!("../../fleet-ui/src/segmented/component.rs");
 
 /// One (assignment, source file, hook) triple: `assignment` is the full
@@ -810,37 +811,43 @@ const CONTRACTS: &[Contract] = &[
         hook: "class=\"g\"",
     },
     Contract {
-        assignment: "facetGroupHeader: '.facets button.g-hd',",
+        assignment: "facetGroupHeader: 'button.g-hd',",
         source_path: "src/components/facet_sidebar.rs",
         source: FACET_SIDEBAR_RS,
         hook: "class=\"g-hd\"",
     },
     Contract {
-        assignment: "facetValue: '.facets .v',",
+        assignment: "facetValue: '.vals .v',",
+        source_path: "src/components/facet_sidebar.rs",
+        source: FACET_SIDEBAR_RS,
+        hook: "class=\"vals\"",
+    },
+    Contract {
+        assignment: "facetValue: '.vals .v',",
         source_path: "src/components/facet_sidebar.rs",
         source: FACET_SIDEBAR_RS,
         hook: "class=\"v\"",
     },
     Contract {
-        assignment: "facetValueName: '.facets .v .n',",
+        assignment: "facetValueName: '.n',",
         source_path: "src/components/facet_sidebar.rs",
         source: FACET_SIDEBAR_RS,
         hook: "class=\"n\"",
     },
     Contract {
-        assignment: "facetActions: '.facets .v .act',",
+        assignment: "facetActions: '.act',",
         source_path: "src/components/facet_sidebar.rs",
         source: FACET_SIDEBAR_RS,
         hook: "class=\"act\"",
     },
     Contract {
-        assignment: "facetOp: '.facets .v .act button.op',",
+        assignment: "facetOp: '.act button.op',",
         source_path: "src/components/facet_sidebar.rs",
         source: FACET_SIDEBAR_RS,
         hook: "class=\"op\"",
     },
     Contract {
-        assignment: "facetMore: '.facets .g button.more',",
+        assignment: "facetMore: 'button.more',",
         source_path: "src/components/facet_sidebar.rs",
         source: FACET_SIDEBAR_RS,
         hook: "class=\"more\"",
@@ -856,6 +863,30 @@ const CONTRACTS: &[Contract] = &[
         source_path: "src/components/facet_sidebar.rs",
         source: FACET_SIDEBAR_RS,
         hook: "class=\"clear\"",
+    },
+    Contract {
+        assignment: "facetFilterInput: '.facets .inp-wrap input',",
+        source_path: "src/components/facet_sidebar.rs",
+        source: FACET_SIDEBAR_RS,
+        hook: "<SearchInput value=needle",
+    },
+    Contract {
+        assignment: "facetFilterInput: '.facets .inp-wrap input',",
+        source_path: "../fleet-ui/src/search_input.rs",
+        source: SEARCH_INPUT_RS,
+        hook: "class=\"inp-wrap\"",
+    },
+    Contract {
+        assignment: "filterChip: '.meta-chips .chip',",
+        source_path: "src/components/meta_strip.rs",
+        source: META_STRIP_RS,
+        hook: "class=\"meta-chips\"",
+    },
+    Contract {
+        assignment: "filterChip: '.meta-chips .chip',",
+        source_path: "src/components/meta_strip.rs",
+        source: META_STRIP_RS,
+        hook: "class=\"chip\"",
     },
     // -- chrome ---------------------------------------------------------
     Contract {

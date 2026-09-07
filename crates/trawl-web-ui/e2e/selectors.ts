@@ -204,23 +204,38 @@ export const SEL = {
   /// group (a field and its values).
   facetGroup: '.facets .g',
   /// Its header, which collapses the group and carries aria-expanded.
-  facetGroupHeader: '.facets button.g-hd',
+  /// Group-relative, like every entry below it: a spec scopes these to
+  /// one group or one value row, and repeating the ancestor class would
+  /// ask for a group inside a group.
+  facetGroupHeader: 'button.g-hd',
   /// One value row inside a group. Not a control itself since ADR-0029:
-  /// the two buttons in its action area are.
-  facetValue: '.facets .v',
+  /// the two buttons in its action area are. `.vals` is the group's own
+  /// value list, so this stays unambiguous when a spec uses it against
+  /// the page.
+  facetValue: '.vals .v',
   /// The value's name span, which must stay clear of the action area.
-  facetValueName: '.facets .v .n',
+  /// Row-relative.
+  facetValueName: '.n',
   /// The action area, revealed by hover or focus-within (opacity, never
-  /// `display: none`, or Tab could not reach the buttons).
-  facetActions: '.facets .v .act',
+  /// `display: none`, or Tab could not reach the buttons). Row-relative.
+  facetActions: '.act',
   /// Include (+) and exclude (⊘), told apart by accessible name.
-  facetOp: '.facets .v .act button.op',
-  /// The group's "+ N more" control.
-  facetMore: '.facets .g button.more',
+  /// Row- or group-relative.
+  facetOp: '.act button.op',
+  /// The group's "+ N more" control. Group-relative.
+  facetMore: 'button.more',
   /// The rail header's "Clear all".
   facetClear: '.facets .phead button.clear',
+  /// The rail's own value filter (fleet-ui's SearchInput), which is the
+  /// focusable immediately before the first group header.
+  facetFilterInput: '.facets .inp-wrap input',
 
   // -- chrome ---------------------------------------------------------
+  /// crates/trawl-web-ui/src/components/meta_strip.rs — one active
+  /// filter's chip. Counting these is how a spec says "exactly one
+  /// filter was added": the URL payload is base64 and says nothing on
+  /// sight.
+  filterChip: '.meta-chips .chip',
   /// crates/trawl-web-ui/src/components/meta_strip.rs — a filter chip's
   /// remove control, named after the filter it drops.
   chipRemove: '.meta-chips .chip button.x',
