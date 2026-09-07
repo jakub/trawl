@@ -1,0 +1,515 @@
+
+=== run 1/5 ===
+date: 2026-09-07T00:26:26-07:00
+HEAD: c5ba6a4468e134fc7d289199deb16b9d8dec664b
+command: crates/trawl-web-ui/e2e/scripts/mutation-check.sh 10-menu-topmost-escape.patch
+
+=== 10-menu-topmost-escape.patch -> topbar-menu.spec.ts ===
+-- trunk build --
+2026-09-07T07:26:26.029170Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T07:26:26.029287Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-core)
+   Compiling fleet-ui v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/fleet-ui)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.84s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T07:26:37.246604Z  INFO applying new distribution
+2026-09-07T07:26:37.249691Z  INFO ✅ success
+-- playwright test tests/topbar-menu.spec.ts --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/topbar-menu.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui/dist)
+
+Running 7 tests using 1 worker
+
+  ✓  1 [chromium] › tests/topbar-menu.spec.ts:49:5 › keyboard open focuses the first item and arrows walk with wrap (588ms)
+  ✓  2 [chromium] › tests/topbar-menu.spec.ts:88:5 › Escape restores the trigger (474ms)
+  ✓  3 [chromium] › tests/topbar-menu.spec.ts:98:5 › Tab closes and restores the trigger (494ms)
+  ✓  4 [chromium] › tests/topbar-menu.spec.ts:116:5 › theme item restores the trigger and flips the theme (478ms)
+  ✓  5 [chromium] › tests/topbar-menu.spec.ts:132:5 › outside mousedown leaves focus on the target (511ms)
+  ✘  6 [chromium] › tests/topbar-menu.spec.ts:146:5 › first Escape closes only the modal above the menu (5.5s)
+  ✓  7 [chromium] › tests/topbar-menu.spec.ts:168:5 › retired affordances are absent (575ms)
+
+
+  1) [chromium] › tests/topbar-menu.spec.ts:146:5 › first Escape closes only the modal above the menu 
+
+    Error: expect(locator).toBeVisible() failed
+
+    Locator: locator('.user-menu [role="menu"]')
+    Expected: visible
+    Timeout: 5000ms
+    Error: element(s) not found
+
+    Call log:
+      - Expect "toBeVisible" with timeout 5000ms
+      - waiting for locator('.user-menu [role="menu"]')
+
+
+      159 |   await page.keyboard.press('Escape');
+      160 |   await expect(page.locator(SEL.modalPanel)).toHaveCount(0);
+    > 161 |   await expect(page.locator(SEL.userMenu)).toBeVisible();
+          |                                            ^
+      162 |
+      163 |   await page.keyboard.press('Escape');
+      164 |   await expect(page.locator(SEL.userMenu)).toHaveCount(0);
+        at /home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui/e2e/tests/topbar-menu.spec.ts:161:44
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/topbar-menu-first-Escape-c-79f7d-ly-the-modal-above-the-menu-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/topbar-menu-first-Escape-c-79f7d-ly-the-modal-above-the-menu-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/topbar-menu-first-Escape-c-79f7d-ly-the-modal-above-the-menu-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/topbar-menu-first-Escape-c-79f7d-ly-the-modal-above-the-menu-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  1 failed
+    [chromium] › tests/topbar-menu.spec.ts:146:5 › first Escape closes only the modal above the menu 
+  6 passed (9.5s)
+-- control: playwright test tests/routing.spec.ts (must pass) --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/routing.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui/dist)
+
+Running 3 tests using 1 worker
+
+  ✓  1 [chromium] › tests/routing.spec.ts:8:5 › / redirects to /search and mounts the DSL editor (793ms)
+  ✓  2 [chromium] › tests/routing.spec.ts:14:5 › rail link to history navigates without a full page load (510ms)
+  ✓  3 [chromium] › tests/routing.spec.ts:31:5 › an unknown route renders the 404 page (355ms)
+
+  3 passed (2.1s)
+-- trunk build (restore pristine dist) --
+2026-09-07T07:26:50.218277Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T07:26:50.218385Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-core)
+   Compiling fleet-ui v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/fleet-ui)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.43s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T07:27:00.515785Z  INFO applying new distribution
+2026-09-07T07:27:00.518400Z  INFO ✅ success
+
+mutation-check results:
+patch                        outcome
+10-menu-topmost-escape.patch PASS (target spec failed, control passed, exit 1)
+exit status: 0
+verdict: MUTANT KILLED (kill 1 of 5)
+
+=== run 2/5 ===
+date: 2026-09-07T00:27:00-07:00
+HEAD: c5ba6a4468e134fc7d289199deb16b9d8dec664b
+command: crates/trawl-web-ui/e2e/scripts/mutation-check.sh 10-menu-topmost-escape.patch
+
+=== 10-menu-topmost-escape.patch -> topbar-menu.spec.ts ===
+-- trunk build --
+2026-09-07T07:27:00.549513Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T07:27:00.549611Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-core)
+   Compiling fleet-ui v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/fleet-ui)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.51s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T07:27:10.966654Z  INFO applying new distribution
+2026-09-07T07:27:10.970627Z  INFO ✅ success
+-- playwright test tests/topbar-menu.spec.ts --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/topbar-menu.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui/dist)
+
+Running 7 tests using 1 worker
+
+  ✓  1 [chromium] › tests/topbar-menu.spec.ts:49:5 › keyboard open focuses the first item and arrows walk with wrap (565ms)
+  ✓  2 [chromium] › tests/topbar-menu.spec.ts:88:5 › Escape restores the trigger (474ms)
+  ✓  3 [chromium] › tests/topbar-menu.spec.ts:98:5 › Tab closes and restores the trigger (496ms)
+  ✓  4 [chromium] › tests/topbar-menu.spec.ts:116:5 › theme item restores the trigger and flips the theme (495ms)
+  ✓  5 [chromium] › tests/topbar-menu.spec.ts:132:5 › outside mousedown leaves focus on the target (526ms)
+  ✘  6 [chromium] › tests/topbar-menu.spec.ts:146:5 › first Escape closes only the modal above the menu (5.5s)
+  ✓  7 [chromium] › tests/topbar-menu.spec.ts:168:5 › retired affordances are absent (573ms)
+
+
+  1) [chromium] › tests/topbar-menu.spec.ts:146:5 › first Escape closes only the modal above the menu 
+
+    Error: expect(locator).toBeVisible() failed
+
+    Locator: locator('.user-menu [role="menu"]')
+    Expected: visible
+    Timeout: 5000ms
+    Error: element(s) not found
+
+    Call log:
+      - Expect "toBeVisible" with timeout 5000ms
+      - waiting for locator('.user-menu [role="menu"]')
+
+
+      159 |   await page.keyboard.press('Escape');
+      160 |   await expect(page.locator(SEL.modalPanel)).toHaveCount(0);
+    > 161 |   await expect(page.locator(SEL.userMenu)).toBeVisible();
+          |                                            ^
+      162 |
+      163 |   await page.keyboard.press('Escape');
+      164 |   await expect(page.locator(SEL.userMenu)).toHaveCount(0);
+        at /home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui/e2e/tests/topbar-menu.spec.ts:161:44
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/topbar-menu-first-Escape-c-79f7d-ly-the-modal-above-the-menu-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/topbar-menu-first-Escape-c-79f7d-ly-the-modal-above-the-menu-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/topbar-menu-first-Escape-c-79f7d-ly-the-modal-above-the-menu-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/topbar-menu-first-Escape-c-79f7d-ly-the-modal-above-the-menu-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  1 failed
+    [chromium] › tests/topbar-menu.spec.ts:146:5 › first Escape closes only the modal above the menu 
+  6 passed (9.5s)
+-- control: playwright test tests/routing.spec.ts (must pass) --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/routing.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui/dist)
+
+Running 3 tests using 1 worker
+
+  ✓  1 [chromium] › tests/routing.spec.ts:8:5 › / redirects to /search and mounts the DSL editor (799ms)
+  ✓  2 [chromium] › tests/routing.spec.ts:14:5 › rail link to history navigates without a full page load (509ms)
+  ✓  3 [chromium] › tests/routing.spec.ts:31:5 › an unknown route renders the 404 page (356ms)
+
+  3 passed (2.1s)
+-- trunk build (restore pristine dist) --
+2026-09-07T07:27:23.951599Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T07:27:23.951714Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-core)
+   Compiling fleet-ui v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/fleet-ui)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.42s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T07:27:34.223913Z  INFO applying new distribution
+2026-09-07T07:27:34.227978Z  INFO ✅ success
+
+mutation-check results:
+patch                        outcome
+10-menu-topmost-escape.patch PASS (target spec failed, control passed, exit 1)
+exit status: 0
+verdict: MUTANT KILLED (kill 2 of 5)
+
+=== run 3/5 ===
+date: 2026-09-07T00:27:34-07:00
+HEAD: c5ba6a4468e134fc7d289199deb16b9d8dec664b
+command: crates/trawl-web-ui/e2e/scripts/mutation-check.sh 10-menu-topmost-escape.patch
+
+=== 10-menu-topmost-escape.patch -> topbar-menu.spec.ts ===
+-- trunk build --
+2026-09-07T07:27:34.258343Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T07:27:34.258441Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-core)
+   Compiling fleet-ui v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/fleet-ui)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.47s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T07:27:44.662882Z  INFO applying new distribution
+2026-09-07T07:27:44.665710Z  INFO ✅ success
+-- playwright test tests/topbar-menu.spec.ts --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/topbar-menu.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui/dist)
+
+Running 7 tests using 1 worker
+
+  ✓  1 [chromium] › tests/topbar-menu.spec.ts:49:5 › keyboard open focuses the first item and arrows walk with wrap (572ms)
+  ✓  2 [chromium] › tests/topbar-menu.spec.ts:88:5 › Escape restores the trigger (474ms)
+  ✓  3 [chromium] › tests/topbar-menu.spec.ts:98:5 › Tab closes and restores the trigger (494ms)
+  ✓  4 [chromium] › tests/topbar-menu.spec.ts:116:5 › theme item restores the trigger and flips the theme (496ms)
+  ✓  5 [chromium] › tests/topbar-menu.spec.ts:132:5 › outside mousedown leaves focus on the target (527ms)
+  ✘  6 [chromium] › tests/topbar-menu.spec.ts:146:5 › first Escape closes only the modal above the menu (5.5s)
+  ✓  7 [chromium] › tests/topbar-menu.spec.ts:168:5 › retired affordances are absent (556ms)
+
+
+  1) [chromium] › tests/topbar-menu.spec.ts:146:5 › first Escape closes only the modal above the menu 
+
+    Error: expect(locator).toBeVisible() failed
+
+    Locator: locator('.user-menu [role="menu"]')
+    Expected: visible
+    Timeout: 5000ms
+    Error: element(s) not found
+
+    Call log:
+      - Expect "toBeVisible" with timeout 5000ms
+      - waiting for locator('.user-menu [role="menu"]')
+
+
+      159 |   await page.keyboard.press('Escape');
+      160 |   await expect(page.locator(SEL.modalPanel)).toHaveCount(0);
+    > 161 |   await expect(page.locator(SEL.userMenu)).toBeVisible();
+          |                                            ^
+      162 |
+      163 |   await page.keyboard.press('Escape');
+      164 |   await expect(page.locator(SEL.userMenu)).toHaveCount(0);
+        at /home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui/e2e/tests/topbar-menu.spec.ts:161:44
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/topbar-menu-first-Escape-c-79f7d-ly-the-modal-above-the-menu-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/topbar-menu-first-Escape-c-79f7d-ly-the-modal-above-the-menu-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/topbar-menu-first-Escape-c-79f7d-ly-the-modal-above-the-menu-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/topbar-menu-first-Escape-c-79f7d-ly-the-modal-above-the-menu-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  1 failed
+    [chromium] › tests/topbar-menu.spec.ts:146:5 › first Escape closes only the modal above the menu 
+  6 passed (9.5s)
+-- control: playwright test tests/routing.spec.ts (must pass) --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/routing.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui/dist)
+
+Running 3 tests using 1 worker
+
+  ✓  1 [chromium] › tests/routing.spec.ts:8:5 › / redirects to /search and mounts the DSL editor (796ms)
+  ✓  2 [chromium] › tests/routing.spec.ts:14:5 › rail link to history navigates without a full page load (510ms)
+  ✓  3 [chromium] › tests/routing.spec.ts:31:5 › an unknown route renders the 404 page (361ms)
+
+  3 passed (2.1s)
+-- trunk build (restore pristine dist) --
+2026-09-07T07:27:57.637229Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T07:27:57.637346Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-core)
+   Compiling fleet-ui v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/fleet-ui)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.47s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T07:28:07.984682Z  INFO applying new distribution
+2026-09-07T07:28:07.987457Z  INFO ✅ success
+
+mutation-check results:
+patch                        outcome
+10-menu-topmost-escape.patch PASS (target spec failed, control passed, exit 1)
+exit status: 0
+verdict: MUTANT KILLED (kill 3 of 5)
+
+=== run 4/5 ===
+date: 2026-09-07T00:28:10-07:00
+HEAD: c5ba6a4468e134fc7d289199deb16b9d8dec664b
+command: crates/trawl-web-ui/e2e/scripts/mutation-check.sh 10-menu-topmost-escape.patch
+
+=== 10-menu-topmost-escape.patch -> topbar-menu.spec.ts ===
+-- trunk build --
+2026-09-07T07:28:10.409135Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T07:28:10.409254Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-core)
+   Compiling fleet-ui v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/fleet-ui)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.55s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T07:28:22.286277Z  INFO applying new distribution
+2026-09-07T07:28:22.289041Z  INFO ✅ success
+-- playwright test tests/topbar-menu.spec.ts --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/topbar-menu.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui/dist)
+
+Running 7 tests using 1 worker
+
+  ✓  1 [chromium] › tests/topbar-menu.spec.ts:49:5 › keyboard open focuses the first item and arrows walk with wrap (579ms)
+  ✓  2 [chromium] › tests/topbar-menu.spec.ts:88:5 › Escape restores the trigger (474ms)
+  ✓  3 [chromium] › tests/topbar-menu.spec.ts:98:5 › Tab closes and restores the trigger (495ms)
+  ✓  4 [chromium] › tests/topbar-menu.spec.ts:116:5 › theme item restores the trigger and flips the theme (495ms)
+  ✓  5 [chromium] › tests/topbar-menu.spec.ts:132:5 › outside mousedown leaves focus on the target (527ms)
+  ✘  6 [chromium] › tests/topbar-menu.spec.ts:146:5 › first Escape closes only the modal above the menu (5.5s)
+  ✓  7 [chromium] › tests/topbar-menu.spec.ts:168:5 › retired affordances are absent (567ms)
+
+
+  1) [chromium] › tests/topbar-menu.spec.ts:146:5 › first Escape closes only the modal above the menu 
+
+    Error: expect(locator).toBeVisible() failed
+
+    Locator: locator('.user-menu [role="menu"]')
+    Expected: visible
+    Timeout: 5000ms
+    Error: element(s) not found
+
+    Call log:
+      - Expect "toBeVisible" with timeout 5000ms
+      - waiting for locator('.user-menu [role="menu"]')
+
+
+      159 |   await page.keyboard.press('Escape');
+      160 |   await expect(page.locator(SEL.modalPanel)).toHaveCount(0);
+    > 161 |   await expect(page.locator(SEL.userMenu)).toBeVisible();
+          |                                            ^
+      162 |
+      163 |   await page.keyboard.press('Escape');
+      164 |   await expect(page.locator(SEL.userMenu)).toHaveCount(0);
+        at /home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui/e2e/tests/topbar-menu.spec.ts:161:44
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/topbar-menu-first-Escape-c-79f7d-ly-the-modal-above-the-menu-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/topbar-menu-first-Escape-c-79f7d-ly-the-modal-above-the-menu-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/topbar-menu-first-Escape-c-79f7d-ly-the-modal-above-the-menu-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/topbar-menu-first-Escape-c-79f7d-ly-the-modal-above-the-menu-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  1 failed
+    [chromium] › tests/topbar-menu.spec.ts:146:5 › first Escape closes only the modal above the menu 
+  6 passed (9.5s)
+-- control: playwright test tests/routing.spec.ts (must pass) --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/routing.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui/dist)
+
+Running 3 tests using 1 worker
+
+  ✓  1 [chromium] › tests/routing.spec.ts:8:5 › / redirects to /search and mounts the DSL editor (791ms)
+  ✓  2 [chromium] › tests/routing.spec.ts:14:5 › rail link to history navigates without a full page load (511ms)
+  ✓  3 [chromium] › tests/routing.spec.ts:31:5 › an unknown route renders the 404 page (339ms)
+
+  3 passed (2.1s)
+-- trunk build (restore pristine dist) --
+2026-09-07T07:28:35.245976Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T07:28:35.246087Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-core)
+   Compiling fleet-ui v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/fleet-ui)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.43s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T07:28:45.558062Z  INFO applying new distribution
+2026-09-07T07:28:45.560974Z  INFO ✅ success
+
+mutation-check results:
+patch                        outcome
+10-menu-topmost-escape.patch PASS (target spec failed, control passed, exit 1)
+exit status: 0
+verdict: MUTANT KILLED (kill 4 of 5)
+
+=== run 5/5 ===
+date: 2026-09-07T00:28:45-07:00
+HEAD: c5ba6a4468e134fc7d289199deb16b9d8dec664b
+command: crates/trawl-web-ui/e2e/scripts/mutation-check.sh 10-menu-topmost-escape.patch
+
+=== 10-menu-topmost-escape.patch -> topbar-menu.spec.ts ===
+-- trunk build --
+2026-09-07T07:28:45.591915Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T07:28:45.592024Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-core)
+   Compiling fleet-ui v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/fleet-ui)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.39s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T07:28:55.878893Z  INFO applying new distribution
+2026-09-07T07:28:55.881597Z  INFO ✅ success
+-- playwright test tests/topbar-menu.spec.ts --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/topbar-menu.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui/dist)
+
+Running 7 tests using 1 worker
+
+  ✓  1 [chromium] › tests/topbar-menu.spec.ts:49:5 › keyboard open focuses the first item and arrows walk with wrap (568ms)
+  ✓  2 [chromium] › tests/topbar-menu.spec.ts:88:5 › Escape restores the trigger (474ms)
+  ✓  3 [chromium] › tests/topbar-menu.spec.ts:98:5 › Tab closes and restores the trigger (479ms)
+  ✓  4 [chromium] › tests/topbar-menu.spec.ts:116:5 › theme item restores the trigger and flips the theme (496ms)
+  ✓  5 [chromium] › tests/topbar-menu.spec.ts:132:5 › outside mousedown leaves focus on the target (526ms)
+  ✘  6 [chromium] › tests/topbar-menu.spec.ts:146:5 › first Escape closes only the modal above the menu (5.5s)
+  ✓  7 [chromium] › tests/topbar-menu.spec.ts:168:5 › retired affordances are absent (560ms)
+
+
+  1) [chromium] › tests/topbar-menu.spec.ts:146:5 › first Escape closes only the modal above the menu 
+
+    Error: expect(locator).toBeVisible() failed
+
+    Locator: locator('.user-menu [role="menu"]')
+    Expected: visible
+    Timeout: 5000ms
+    Error: element(s) not found
+
+    Call log:
+      - Expect "toBeVisible" with timeout 5000ms
+      - waiting for locator('.user-menu [role="menu"]')
+
+
+      159 |   await page.keyboard.press('Escape');
+      160 |   await expect(page.locator(SEL.modalPanel)).toHaveCount(0);
+    > 161 |   await expect(page.locator(SEL.userMenu)).toBeVisible();
+          |                                            ^
+      162 |
+      163 |   await page.keyboard.press('Escape');
+      164 |   await expect(page.locator(SEL.userMenu)).toHaveCount(0);
+        at /home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui/e2e/tests/topbar-menu.spec.ts:161:44
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/topbar-menu-first-Escape-c-79f7d-ly-the-modal-above-the-menu-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/topbar-menu-first-Escape-c-79f7d-ly-the-modal-above-the-menu-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/topbar-menu-first-Escape-c-79f7d-ly-the-modal-above-the-menu-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/topbar-menu-first-Escape-c-79f7d-ly-the-modal-above-the-menu-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  1 failed
+    [chromium] › tests/topbar-menu.spec.ts:146:5 › first Escape closes only the modal above the menu 
+  6 passed (9.5s)
+-- control: playwright test tests/routing.spec.ts (must pass) --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/routing.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui/dist)
+
+Running 3 tests using 1 worker
+
+  ✓  1 [chromium] › tests/routing.spec.ts:8:5 › / redirects to /search and mounts the DSL editor (792ms)
+  ✓  2 [chromium] › tests/routing.spec.ts:14:5 › rail link to history navigates without a full page load (511ms)
+  ✓  3 [chromium] › tests/routing.spec.ts:31:5 › an unknown route renders the 404 page (338ms)
+
+  3 passed (2.1s)
+-- trunk build (restore pristine dist) --
+2026-09-07T07:29:08.811995Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T07:29:08.812104Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-core)
+   Compiling fleet-ui v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/fleet-ui)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.40s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T07:29:19.040596Z  INFO applying new distribution
+2026-09-07T07:29:19.043989Z  INFO ✅ success
+
+mutation-check results:
+patch                        outcome
+10-menu-topmost-escape.patch PASS (target spec failed, control passed, exit 1)
+exit status: 0
+verdict: MUTANT KILLED (kill 5 of 5)

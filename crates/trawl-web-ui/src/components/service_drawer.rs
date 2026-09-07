@@ -118,6 +118,7 @@ pub fn ServiceDrawer(
                 TabItem::new("fields", "Fields"),
                 TabItem::new("tail", "Live Tail"),
             ]
+            tabs_label="Service details"
             active_tab=eff_tab
             on_tab_change=on_tab_change
             on_close=on_close

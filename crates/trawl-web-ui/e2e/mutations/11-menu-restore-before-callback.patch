@@ -1,0 +1,20 @@
+diff --git a/crates/fleet-ui/src/menu.rs b/crates/fleet-ui/src/menu.rs
+index b267b112..53fad62e 100644
+--- a/crates/fleet-ui/src/menu.rs
++++ b/crates/fleet-ui/src/menu.rs
+@@ -291,10 +291,11 @@ mod component {
+                             if stop_click_propagation {
+                                 e.stop_propagation();
+                             }
+-                            // Restore BEFORE the callback: a callback
+-                            // that opens a dialog must capture the
+-                            // trigger as that dialog's opener.
+-                            close(MenuClose::Activate);
++                            // MUTANT: the menu still closes and the
++                            // callback still runs, but the trigger is
++                            // never restored, so a dialog the callback
++                            // opens captures <body> as its opener.
++                            close(MenuClose::Outside);
+                             cb.run(());
+                         }
+                     >{move || label.get()}</button>

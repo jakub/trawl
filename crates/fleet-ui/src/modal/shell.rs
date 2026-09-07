@@ -120,9 +120,19 @@ pub fn Modal(
                         <span class="ic"><IconView icon=ic size=12 stroke_width=1.5/></span>
                     })}
                     <span class="t">{title}</span>
-                    <span class="x" title="Close (Esc)" on:click=move |_| on_cancel.run(())>
+                    // A named native button: the glyph carries no text,
+                    // so aria-label is the whole accessible name, and
+                    // Enter/Space have to reach the cancel callback the
+                    // way Escape already does.
+                    <button
+                        type="button"
+                        class="x"
+                        aria-label="Close dialog"
+                        title="Close (Esc)"
+                        on:click=move |_| on_cancel.run(())
+                    >
                         <IconView icon=Icon::Close size=12 stroke_width=1.5/>
-                    </span>
+                    </button>
                 </div>
 
                 <div class="m-body">{children()}</div>

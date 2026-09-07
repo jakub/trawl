@@ -125,6 +125,7 @@ pub fn NetDrawer(
                 TabItem::new("query", "Query + Schedule"),
                 TabItem::new("runs", "Runs"),
             ]
+            tabs_label="Saved query details"
             active_tab=eff_tab
             on_tab_change=on_tab_change
             on_close=on_close

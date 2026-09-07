@@ -4,35 +4,27 @@
 
 //! `<ActionsMenu/>` — `⋯` overflow menu for table rows.
 //!
-//! Owns its trigger button (`.btn-icon`), its open/close state, and its
-//! dismissal: the open panel registers with the
-//! [`overlay`](crate::overlay) arbitration stack, so window-level
-//! Escape closes it only while it is the topmost overlay, and a
-//! window-level `mousedown` outside the trigger+panel wrapper closes
-//! it. The outside-click check uses `Node::contains` on the wrapper
-//! `NodeRef` rather than [`Modal`](crate::Modal)'s `is_same_node` scrim
-//! identity check, because the menu has interior `.item` children and
-//! no scrim, and because excluding the trigger keeps a trigger re-click
-//! a clean toggle instead of a close-then-reopen.
+//! This module owns the trigger button (`.btn-icon`, accessible name
+//! "Actions"), the open/close state, the positioning wrapper
+//! (`.actions-wrap`) and the entries. Everything else — the overlay
+//! layer, Escape, outside dismissal, roving tabindex, the arrow walk
+//! and restore-by-cause — is the shared contract in
+//! [`crate::menu`], which the topbar's account menu mounts too, so the
+//! two menus cannot drift apart (ADR-0028).
 //!
 //! Clicks on the trigger and the items stop propagation: every current
-//! call site nests the menu inside a clickable table row.
-//!
-//! Keyboard: the trigger and every item are real `<button>` elements, so
-//! Tab/Enter/Space reach and invoke them natively. Opening the menu moves
-//! focus to the first item (`role="menu"` / `role="menuitem"`); Arrow
-//! Up/Down (with wrap) and Home/End walk the items; Escape closes the
-//! panel and restores focus to the trigger.
+//! call site nests the menu inside a clickable table row, so the panel
+//! is mounted with `stop_click_propagation`.
 
-use leptos::ev;
 use leptos::html::{Button, Div};
 use leptos::prelude::*;
 use leptos::web_sys;
-use leptos_use::{use_event_listener, use_window};
-use wasm_bindgen::JsCast;
+
+use crate::menu::{MenuEntry, MenuItem, MenuPanel};
 
 /// One entry in the menu. `danger` renders the destructive (red)
-/// treatment. The menu closes before `on_click` runs.
+/// treatment. The menu closes, and focus returns to the trigger, before
+/// `on_click` runs.
 #[derive(Clone, Debug)]
 pub struct ActionItem {
     pub label: &'static str,
@@ -71,12 +63,24 @@ pub fn ActionsMenu(items: Vec<ActionItem>) -> impl IntoView {
     let wrap_ref = NodeRef::<Div>::new();
     let trigger_ref = NodeRef::<Button>::new();
 
+    let entries: Vec<MenuEntry> = items
+        .into_iter()
+        .map(|item| {
+            MenuEntry::Item(MenuItem {
+                label: Signal::stored(item.label.to_string()),
+                danger: item.danger,
+                on_activate: item.on_click,
+            })
+        })
+        .collect();
+
     view! {
         <div class="actions-wrap" node_ref=wrap_ref>
             <button
                 class="btn-icon"
                 type="button"
                 node_ref=trigger_ref
+                aria-label="Actions"
                 aria-haspopup="menu"
                 aria-expanded=move || open.get().to_string()
                 on:click=move |e: web_sys::MouseEvent| {
@@ -88,135 +92,15 @@ pub fn ActionsMenu(items: Vec<ActionItem>) -> impl IntoView {
             >"⋯"</button>
             <Show when=move || open.get()>
                 <MenuPanel
-                    items=items.clone()
+                    panel_class="actions-menu"
+                    menu_label="Actions"
+                    entries=entries.clone()
+                    stop_click_propagation=true
                     open=open
                     wrap_ref=wrap_ref
                     trigger_ref=trigger_ref
                 />
             </Show>
-        </div>
-    }
-}
-
-/// The open panel. A separate component so the overlay layer and the
-/// window listeners exist exactly while the menu is open — a closed
-/// menu must not sit on the overlay stack shadowing Escape for the
-/// layers beneath it.
-#[component]
-fn MenuPanel(
-    items: Vec<ActionItem>,
-    open: RwSignal<bool>,
-    wrap_ref: NodeRef<Div>,
-    trigger_ref: NodeRef<Button>,
-) -> impl IntoView {
-    let layer = crate::overlay::use_overlay_layer();
-    let panel_ref = NodeRef::<Div>::new();
-
-    // Initial focus: land on the first item when the panel mounts, so a
-    // keyboard user who opened the menu is already inside its action
-    // surface (rather than stranded on the trigger).
-    Effect::new(move |_| {
-        if let Some(panel) = panel_ref.get()
-            && let Some(first) = panel
-                .query_selector(".item")
-                .ok()
-                .flatten()
-                .and_then(|el| el.dyn_into::<web_sys::HtmlElement>().ok())
-        {
-            let _ = first.focus();
-        }
-    });
-
-    // Window-level Escape, gated on topmost-layer arbitration (same
-    // contract as Modal/Drawer): a ConfirmModal stacked above the menu
-    // takes Escape without the menu also closing. On close we restore
-    // focus to the trigger so the tab order isn't lost to <body>.
-    let _ = use_event_listener(use_window(), ev::keydown, move |e| {
-        if !layer.is_topmost() {
-            return;
-        }
-        if e.key() == "Escape" {
-            e.prevent_default();
-            open.set(false);
-            if let Some(trigger) = trigger_ref.get_untracked() {
-                let _ = trigger.focus();
-            }
-        }
-    });
-
-    // Outside-click: any mousedown outside the trigger+panel wrapper
-    // dismisses. Mousedown (not click) so drag-selections that end
-    // outside don't dismiss, matching Modal's scrim behaviour.
-    let _ = use_event_listener(
-        use_window(),
-        ev::mousedown,
-        move |e: web_sys::MouseEvent| {
-            let Some(wrap) = wrap_ref.get_untracked() else {
-                return;
-            };
-            let Some(target) = e.target() else { return };
-            let Some(node) = target.dyn_ref::<web_sys::Node>() else {
-                return;
-            };
-            if !wrap.contains(Some(node)) {
-                open.set(false);
-            }
-        },
-    );
-
-    // Roving focus across the item buttons. Keydown bubbles from the
-    // focused item to this container; we walk element siblings (with
-    // wrap) so no per-item index bookkeeping is needed.
-    let on_keydown = move |e: web_sys::KeyboardEvent| {
-        let Some(current) = e
-            .target()
-            .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
-        else {
-            return;
-        };
-        let next = match e.key().as_str() {
-            "ArrowDown" => current.next_element_sibling().or_else(|| {
-                current
-                    .parent_element()
-                    .and_then(|p| p.first_element_child())
-            }),
-            "ArrowUp" => current.previous_element_sibling().or_else(|| {
-                current
-                    .parent_element()
-                    .and_then(|p| p.last_element_child())
-            }),
-            "Home" => current
-                .parent_element()
-                .and_then(|p| p.first_element_child()),
-            "End" => current
-                .parent_element()
-                .and_then(|p| p.last_element_child()),
-            _ => return,
-        };
-        e.prevent_default();
-        if let Some(el) = next.and_then(|el| el.dyn_into::<web_sys::HtmlElement>().ok()) {
-            let _ = el.focus();
-        }
-    };
-
-    view! {
-        <div class="actions-menu" role="menu" node_ref=panel_ref on:keydown=on_keydown>
-            {items.into_iter().map(|item| {
-                let class = if item.danger { "item danger" } else { "item" };
-                let cb = item.on_click;
-                view! {
-                    <button
-                        class=class
-                        type="button"
-                        role="menuitem"
-                        on:click=move |e: web_sys::MouseEvent| {
-                            e.stop_propagation();
-                            open.set(false);
-                            cb.run(());
-                        }
-                    >{item.label}</button>
-                }
-            }).collect_view()}
         </div>
     }
 }

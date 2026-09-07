@@ -35,10 +35,17 @@ use crate::tabs::{TabItem, Tabs, TabsStyle};
 /// `.sd-actions` ahead of the built-in close button (pass `<Btn>`s);
 /// `children` fills `.sd-body`. Slots use the same boxed-closure idiom
 /// as [`Shell`](crate::Shell)'s footer. `meta` renders trailing text in
-/// the tab strip (service drawer's event/size/field summary).
+/// the tab strip (service drawer's event/size/field summary), outside
+/// the tablist.
 #[component]
 pub fn Drawer(
     tabs: Vec<TabItem>,
+    /// Names the drawer's tab strip for assistive technology
+    /// ("Service details", "Saved query details"). Required, and
+    /// forwarded verbatim to [`Tabs`]: the drawer is the only thing
+    /// that knows what its strip is a list of.
+    #[prop(into)]
+    tabs_label: String,
     #[prop(into)] active_tab: Signal<String>,
     on_tab_change: Callback<String>,
     on_close: Callback<()>,
@@ -129,6 +136,7 @@ pub fn Drawer(
                 <Tabs
                     style=TabsStyle::Drawer
                     items=tabs
+                    label=tabs_label
                     active=active_tab
                     on_change=on_tab_change
                     meta=meta

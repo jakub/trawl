@@ -19,12 +19,17 @@
 //!
 //! When this test fails, fix the FIXTURE. The wire type is the authority.
 
-use trawl_api::{CatalogFieldResponse, RepinStatusResponse, ServiceSchemaResponse};
+use trawl_api::{
+    CatalogFieldResponse, ListSavedResponse, RepinStatusResponse, ServiceSchemaResponse,
+};
 
 const CATALOG_FIELD: &str = include_str!("../e2e/harness/wire/catalog-field.json");
 const REPIN_RUNNING: &str = include_str!("../e2e/harness/wire/repin-status-running.json");
 const REPIN_SUCCEEDED: &str = include_str!("../e2e/harness/wire/repin-status-succeeded.json");
 const SERVICE_SCHEMA: &str = include_str!("../e2e/harness/wire/service-schema.json");
+const SERVICE_SCHEMA_POPULATED: &str =
+    include_str!("../e2e/harness/wire/service-schema-populated.json");
+const SAVED_QUERIES: &str = include_str!("../e2e/harness/wire/saved-queries.json");
 
 /// Decode or fail with the serde message, which names the offending key.
 fn decode<T: serde::de::DeserializeOwned>(name: &str, text: &str) -> T {
@@ -95,4 +100,25 @@ fn service_schema_fixture_decodes() {
         resp.services.is_empty(),
         "the schema specs rely on no service drawer being mountable",
     );
+}
+
+/// The `populated` scenario's two bodies. Their CONTENT is pinned, not
+/// just their shape: the specs navigate to `?svc=nginx` and `?net=1` by
+/// hand (mirrored in `e2e/fixtures.ts`'s `POPULATED`), and a renamed
+/// service or a re-numbered net would leave those URLs mounting nothing
+/// while every assertion below it waited out its timeout.
+#[test]
+fn the_populated_scenario_carries_one_service_and_one_net() {
+    let services: ServiceSchemaResponse =
+        decode("service-schema-populated.json", SERVICE_SCHEMA_POPULATED);
+    assert_eq!(services.services.len(), 1);
+    assert_eq!(services.services[0].name, "nginx");
+    assert!(
+        !services.services[0].columns.is_empty(),
+        "the service drawer's Fields pane needs at least one column to render",
+    );
+
+    let saved: ListSavedResponse = decode("saved-queries.json", SAVED_QUERIES);
+    assert_eq!(saved.queries.len(), 1);
+    assert_eq!(saved.queries[0].id, 1);
 }

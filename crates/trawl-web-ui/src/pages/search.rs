@@ -521,6 +521,7 @@ pub fn Search() -> impl IntoView {
                         TabItem::with_count(ResultsTab::Events.id(), "Events", last_count),
                         TabItem::new(ResultsTab::Visualization.id(), "Visualization"),
                     ]
+                    label="Results"
                     active=tabs_active
                     on_change=on_tab_change
                     // Buttons, not spans: an unreadable link disables

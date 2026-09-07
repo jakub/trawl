@@ -104,6 +104,42 @@ export const SEL = {
   /// — present exactly when a repin job was adopted, which makes it the
   /// positive control for "the status poll actually started".
   fieldCaseJob: '.fc-job',
+  /// crates/fleet-ui/src/topbar.rs — the account menu's trigger. A
+  /// native button since ADR-0028; the `.topbar` prefix keeps it away
+  /// from any other `.user` a page might carry.
+  topbarUser: '.topbar button.user',
+  /// crates/fleet-ui/src/menu.rs mounted by topbar.rs with
+  /// `panel_class="user-menu"` — the role="menu" node INSIDE the panel
+  /// wrapper, so the identity header (which sits outside it) is not part
+  /// of what this matches.
+  userMenu: '.user-menu [role="menu"]',
+  /// The account menu's command buttons. Ordered as rendered, so
+  /// `.nth(0)` is the theme item and `.nth(1)` Sign Out; the separator
+  /// between them is role="separator" and is not matched.
+  userMenuItem: '.user-menu [role="menuitem"]',
+  /// crates/fleet-ui/src/actions_menu.rs — the row overflow trigger.
+  actionsMenuTrigger: '.actions-wrap button.btn-icon',
+  /// crates/fleet-ui/src/menu.rs mounted by actions_menu.rs with
+  /// `panel_class="actions-menu"` — the row menu's command buttons.
+  actionsMenuItem: '.actions-menu [role="menuitem"]',
+  /// crates/fleet-ui/src/tabs.rs TabsStyle::Workspace — one tab of the
+  /// workspace strip. Selecting on the ROLE, not `.t`, is the point: the
+  /// trailing Save/Export actions live in `.tabs` too and must not be
+  /// tabs.
+  workspaceTab: '.tabs [role="tab"]',
+  /// crates/fleet-ui/src/tabs.rs TabsStyle::Drawer — one tab of the
+  /// drawer strip (the service drawer's Overview/Fields/Live Tail).
+  drawerTab: '.sd-tabs [role="tab"]',
+  /// crates/fleet-ui/src/modal/shell.rs — the dialog header's close
+  /// button.
+  modalClose: '.modal .m-hd button.x',
+  /// crates/fleet-ui/src/toast/runtime.rs — one toast's dismiss button.
+  toastDismiss: '.toast button.x',
+  /// crates/trawl-web-ui/src/components/editor_wrap.rs — a tool link
+  /// under the editor. Save is a plain button; Share is fleet-ui's
+  /// CopyButton in bare mode, which renders the caller's class on its
+  /// own native button.
+  editorTool: '.editor-tools button.tool',
 } as const;
 
 /// Timings the specs share with the app. Mirrored here rather than
@@ -165,4 +201,18 @@ export const COPY = {
   /// crates/trawl-web-ui/src/search_url.rs refusal_copy: what a
   /// navigation refused by the producer's own link bound says.
   linkTooLongToast: "Can't open this search: link too long",
+  /// crates/fleet-ui/src/modal/shell.rs — the close button's whole
+  /// accessible name (the glyph is an icon, so aria-label is all of it).
+  modalCloseName: 'Close dialog',
+  /// crates/fleet-ui/src/toast/runtime.rs — the dismiss button's whole
+  /// accessible name; the multiplication sign is aria-hidden.
+  toastDismissName: 'Dismiss notification',
+  /// crates/fleet-ui/src/actions_menu.rs — the row trigger's aria-label
+  /// AND the menu panel's aria-label, which are deliberately the same
+  /// string: the trigger names the menu it opens.
+  actionsName: 'Actions',
+  /// crates/fleet-ui/src/topbar.rs — the account menu panel's
+  /// aria-label. The TRIGGER is named by its visible user name instead,
+  /// so this is the panel's name only.
+  accountMenuName: 'Account',
 } as const;

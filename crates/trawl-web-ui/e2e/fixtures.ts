@@ -75,6 +75,19 @@ export const test = base.extend<{ pageErrors: PageErrors; contract: void }>({
 
 export { expect };
 
+/** What the `populated` scenario's corpus is called. The bodies live in
+ * `harness/wire/saved-queries.json` and
+ * `harness/wire/service-schema-populated.json`, and
+ * `crates/trawl-web-ui/tests/e2e_wire_fixture_contract.rs` pins these
+ * exact values there — a spec navigating to `?svc=nginx` against a
+ * fixture that renamed the service would silently render no drawer. */
+export const POPULATED = {
+  /** The one service `?svc=` opens the service drawer on. */
+  service: 'nginx',
+  /** The one net's id, for `?net=<id>&ntab=`. */
+  netId: 1,
+} as const;
+
 /** Re-point the stub server at a non-default scenario for this test. Call
  * at the top of the test body — `beforeEach` above already reset to
  * 'default' by the time the body runs. */

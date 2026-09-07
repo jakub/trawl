@@ -509,6 +509,7 @@ pub fn FieldCaseDrawer(
             // No tabs: the case file is one surface. The strip renders
             // as the meta bar below the header.
             tabs=vec![]
+            tabs_label="Field case file"
             active_tab=Signal::derive(String::new)
             on_tab_change=Callback::new(|_: String| {})
             on_close=on_close

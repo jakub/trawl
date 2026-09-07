@@ -5,12 +5,19 @@
 //! `<CopyButton/>` — click-to-copy wired to the toast system.
 //!
 //! The trigger is a secondary [`Btn`](crate::button::Btn) by default;
-//! passing `class` renders a bare `<span class=…>` instead — for
+//! passing `class` renders a bare `<button class=…>` instead — for
 //! app-styled inline triggers like trawl's editor `.tool` links,
-//! keeping app classes out of fleet-ui. Success and error report
-//! through the [`ToastBus`](crate::toast::ToastBus) the `Shell`
-//! provides via context, with the canonical "Copied" / "Copy failed"
-//! titles; `success_detail` is the optional app-flavored second line.
+//! keeping app classes out of fleet-ui. Bare mode is still a native
+//! button (ADR-0028), and the caller's class owns the ENTIRE look,
+//! including the button reset: fleet-ui ships no rule for a class it
+//! does not name, so a bare trigger whose class only sets colour and
+//! font arrives with the browser's grey fill and bevel. trawl's
+//! `.editor-tools button.tool` already resets both.
+//!
+//! Success and error report through the
+//! [`ToastBus`](crate::toast::ToastBus) the `Shell` provides via
+//! context, with the canonical "Copied" / "Copy failed" titles;
+//! `success_detail` is the optional app-flavored second line.
 //!
 //! The "which toast fires" decision lives in the pure [`copy_toast`]
 //! function so the click → toast outcome is a native `nextest` fact
@@ -75,17 +82,18 @@ mod component {
         };
 
         match class {
-            // Bare mode: an app-styled inline trigger. stop_propagation for
-            // the same reason as Btn's flag — copy triggers live inside
-            // clickable rows/headers.
+            // Bare mode: an app-styled inline trigger, still a native
+            // button. stop_propagation for the same reason as Btn's flag
+            // — copy triggers live inside clickable rows/headers.
             Some(cls) => view! {
-                <span
+                <button
+                    type="button"
                     class=cls
                     on:click=move |e: leptos::web_sys::MouseEvent| {
                         e.stop_propagation();
                         do_copy();
                     }
-                >{children()}</span>
+                >{children()}</button>
             }
             .into_any(),
             None => view! {

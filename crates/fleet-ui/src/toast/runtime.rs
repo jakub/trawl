@@ -112,7 +112,15 @@ pub fn Toasts(bus: ToastBus) -> impl IntoView {
                                 <div class="title">{t.title}</div>
                                 {t.detail.map(|d| view! { <div class="detail">{d}</div> })}
                             </div>
-                            <span class="x" on:click=move |_| bus.dismiss(id)>"×"</span>
+                            // The multiplication sign is decoration, so
+                            // it is hidden and the button's name comes
+                            // from aria-label; "times" is not a dismissal.
+                            <button
+                                type="button"
+                                class="x"
+                                aria-label="Dismiss notification"
+                                on:click=move |_| bus.dismiss(id)
+                            ><span aria-hidden="true">"×"</span></button>
                         </div>
                     }
                 }

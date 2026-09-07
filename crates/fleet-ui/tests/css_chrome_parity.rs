@@ -245,6 +245,80 @@ fn tab_strip_families_stay_distinct() {
 }
 
 #[test]
+fn native_control_rules_carry_the_button_reset() {
+    // ADR-0028 converted these pseudo-buttons to real ones. A browser
+    // paints a <button> with its own background and border, so each
+    // rule needs its own reset — the stylesheet has no global one
+    // beyond `button { font: inherit }`, deliberately (a global reset
+    // would strip <Btn> too). Miss one and the control ships with the
+    // UA's grey fill and bevel, which no DOM contract test can see.
+    for sel in [
+        ".tabs .t",
+        ".sd-tabs .tb",
+        ".topbar .user",
+        ".user-menu .item",
+        ".modal .m-hd .x",
+        ".toast .x",
+    ] {
+        let body = rule_body(sel);
+        assert!(
+            body.contains("background: none"),
+            "`{sel}` is a <button> now and must reset its background — \
+             the UA fill would paint over the strip, got:{body}"
+        );
+        assert!(
+            body.contains("border: 0") || body.contains("border: none"),
+            "`{sel}` is a <button> now and must reset its border — the \
+             UA bevel would box the control, got:{body}"
+        );
+    }
+    // The reset must not cost the tab strips their declared type: the
+    // weights are pinned in tab_strip_families_stay_distinct, the
+    // count chip's tabular figures here.
+    assert!(
+        rule_body(".tabs .t .c").contains("tabular-nums"),
+        ".tabs .t .c must keep its tabular figures through the conversion"
+    );
+    // `border: none` resets all four sides, so each strip's own
+    // underline has to be declared after it inside the same rule.
+    for (sel, decl) in [
+        (".tabs .t", "border-bottom: 2px solid transparent"),
+        (".sd-tabs .tb", "border-bottom: 2px solid transparent"),
+    ] {
+        let body = rule_body(sel);
+        let reset = body.find("border: none").expect("reset present");
+        let underline = body
+            .find(decl)
+            .unwrap_or_else(|| panic!("`{sel}` must keep `{decl}`"));
+        assert!(
+            reset < underline,
+            "`{sel}`'s button reset must precede its `{decl}` — declared \
+             after, the reset erases the tab underline the active tab \
+             colours in"
+        );
+    }
+}
+
+#[test]
+fn the_tablist_is_a_flex_row_inside_each_strip() {
+    // The tabs moved into a nested role="tablist" node, so that node
+    // has to be the flex row the tabs used to sit in directly, and the
+    // drawer family's 4px inter-tab gap has to travel with them.
+    let tablist = rule_body(".tablist");
+    assert!(
+        tablist.contains("display: flex"),
+        "`.tablist` must be a flex row — as a plain block the tabs stack \
+         vertically, got:{tablist}"
+    );
+    assert!(
+        rule_body(".sd-tabs .tablist").contains("gap: 4px"),
+        "the drawer strip's 4px inter-tab gap must live on the nested \
+         tablist now that .sd-tabs' own gap falls either side of the \
+         flex:1 spacer"
+    );
+}
+
+#[test]
 fn drawer_shell_classes_shipped_with_crate() {
     // Drawer owns the sd-* shell: scrim, panel, header, actions, close,
     // body. Content selectors (.sd-overview, .sd-card, .sf-*, .sd-ttl

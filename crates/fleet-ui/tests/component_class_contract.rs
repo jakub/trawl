@@ -43,6 +43,10 @@ const SEARCH_INPUT: &str = include_str!("../src/search_input.rs");
 const TOGGLE: &str = include_str!("../src/toggle.rs");
 const KBD: &str = include_str!("../src/kbd.rs");
 const ACTIONS_MENU: &str = include_str!("../src/actions_menu.rs");
+const MENU: &str = include_str!("../src/menu.rs");
+const TOPBAR: &str = include_str!("../src/topbar.rs");
+const TOAST_RUNTIME: &str = include_str!("../src/toast/runtime.rs");
+const ROVING: &str = include_str!("../src/roving.rs");
 const COPY_BUTTON: &str = include_str!("../src/copy_button.rs");
 const ICON: &str = include_str!("../src/icon.rs");
 const LIB: &str = include_str!("../src/lib.rs");
@@ -51,6 +55,77 @@ const WHEN: &str = include_str!("../src/time/when.rs");
 const CLOCK: &str = include_str!("../src/time/clock.rs");
 const ATMOSPHERE: &str = include_str!("../src/atmosphere/component.rs");
 const FLEET_CSS: &str = include_str!("../styles/fleet-ui.css");
+
+/// The `type="button"` attribute every converted control carries: a
+/// type-less button inside a form submits it.
+const TYPE_BUTTON: &str = "type=\"button\"";
+
+/// The source with its comment lines removed, for the negative scans:
+/// a module doc that explains why an affordance was retired names the
+/// affordance, and prose is not markup. Same trick as trawl-core's
+/// `now_anchor_contract`.
+///
+/// Block comments go first, counting nesting the way rustc does, then
+/// any line whose first non-space characters are `//`, which covers
+/// `//`, `///` and `//!` alike. A trailing comment after code on the
+/// same line stays: removing it would need to know where string
+/// literals end, and a literal is where hooks like `title="Close
+/// (Esc)"` legitimately live. `view!` markup is not a string literal,
+/// so nothing here strips quoted text.
+fn markup_only(src: &str) -> String {
+    let bytes = src.as_bytes();
+    let mut kept: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut depth = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i..].starts_with(b"/*") {
+            depth += 1;
+            i += 2;
+        } else if depth > 0 && bytes[i..].starts_with(b"*/") {
+            depth -= 1;
+            i += 2;
+        } else {
+            // Byte-wise: outside a comment every byte is copied, so a
+            // multi-byte character survives intact; inside one only the
+            // newline is kept, which cannot split a character.
+            if depth == 0 {
+                kept.push(bytes[i]);
+            } else if bytes[i] == b'\n' {
+                kept.push(b'\n');
+            }
+            i += 1;
+        }
+    }
+    let stripped =
+        String::from_utf8(kept).expect("dropping whole comment spans keeps the rest valid");
+    stripped
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn markup_only_hides_prose_and_keeps_markup() {
+    for (label, src) in [
+        ("///", "/// class=\"iconbtn\"\nfn f() {}\n"),
+        ("//!", "//! class=\"iconbtn\"\nfn f() {}\n"),
+        ("//", "// class=\"iconbtn\"\nfn f() {}\n"),
+        ("/* */", "/* class=\"iconbtn\" */\nfn f() {}\n"),
+        ("nested /* */", "/* a /* b */ class=\"iconbtn\" */\n"),
+    ] {
+        assert!(
+            !markup_only(src).contains("class=\"iconbtn\""),
+            "a hook living only in a {label} comment must not satisfy a \
+             positive scan, nor defeat a negative one — prose is not markup"
+        );
+    }
+    assert!(
+        markup_only("view! { <span class=\"iconbtn\"></span> } // why\n")
+            .contains("class=\"iconbtn\""),
+        "real markup must survive stripping, trailing comment and all"
+    );
+}
 
 /// Assert `src` contains `hook` (a class literal or class-idiom substring),
 /// blaming the CSS rule that hook must line up with.
@@ -127,6 +202,75 @@ fn tabs_emits_both_strip_families_with_distinct_active_idioms() {
          workspace strip's `class:active` — merging them (e.g. `class:on` \
          on the workspace tab, or `\"tb active\"` on the drawer tab) points \
          a strip at the other family's font-weight rule, a C5 regression"
+    );
+}
+
+#[test]
+fn tabs_render_a_named_tablist() {
+    // ADR-0028: the tabs are native buttons inside a named tablist,
+    // and only the tabs are inside it — the spacer, the trailing
+    // action slot and the drawer's meta text are siblings of that
+    // node, so a Save link is never announced as a tab. Scanned
+    // against the markup, so prose about a role cannot stand in for
+    // one.
+    let tabs = markup_only(TABS);
+    assert!(
+        tabs.contains(r#"class="tablist""#) && tabs.contains("role=role"),
+        "the strip must render a `.tablist` node whose role is the \
+         computed one — an unconditional role would name an empty strip \
+         (the field case drawer passes no tabs at all)"
+    );
+    assert!(
+        tabs.contains(r#"role="tab""#) && tabs.contains("aria-selected"),
+        "each tab must carry role=\"tab\" and aria-selected — without \
+         them the strip is a row of buttons with no relationship"
+    );
+    assert!(
+        tabs.contains(r#"type="button""#),
+        "tabs are <button type=\"button\">: inside a form, a type-less \
+         button submits it"
+    );
+    // Selection-derived roving tabindex: one predicate over
+    // roving::resolve_selected, no focus state of its own (the
+    // asymmetry roving.rs documents). Going through that helper is
+    // what makes an id matching no tab select the first tab instead of
+    // leaving the strip with no tab stop at all.
+    assert!(
+        tabs.contains(r#"if selected.get() == Some(i) { "0" } else { "-1" }"#)
+            && TABS.contains("resolve_selected"),
+        "the strip's single tab stop is derived from the selected tab, \
+         resolved through roving::resolve_selected — every tab tabbable \
+         puts N stops in the page and defeats the arrow walk, and no tab \
+         tabbable (an unknown ?ntab= id) leaves the strip unreachable"
+    );
+    assert!(
+        TABS.contains("horizontal_nav") && TABS.contains("next_index"),
+        "the arrow walk must go through roving::horizontal_nav and \
+         roving::next_index — a second key map is a second contract"
+    );
+    assert!(
+        !TABS.contains("next_element_sibling"),
+        "no element-sibling walk: the spacer and the trailing slot sit \
+         in the same container and would take focus"
+    );
+    // Activation is manual: arrows move focus and nothing else. The
+    // walk lives in its own function that is not handed the callback,
+    // so it cannot select — Enter and Space reach on_change through the
+    // native button's click.
+    let walk = TABS
+        .split_once("fn tab_keydown(")
+        .expect("the arrow walk is its own function")
+        .1;
+    assert!(
+        !walk.contains("on_change"),
+        "the arrow walk must never run on_change — arrowing across \
+         trawl's ?ntab= strip would rewrite the URL under the user"
+    );
+    // Both drawer families name their strip.
+    assert!(
+        DRAWER.contains("tabs_label") && DRAWER.contains("label=tabs_label"),
+        "Drawer must require a tabs_label and forward it verbatim — the \
+         drawer is the only thing that knows what its strip lists"
     );
 }
 
@@ -224,20 +368,158 @@ fn kbd_emits_both_chip_treatments() {
 fn actions_menu_emits_its_hooks_and_registers_with_the_overlay_stack() {
     emits(ACTIONS_MENU, r#"class="actions-wrap""#, ".actions-wrap");
     emits(ACTIONS_MENU, r#"class="btn-icon""#, ".btn-icon");
-    emits(ACTIONS_MENU, r#"class="actions-menu""#, ".actions-menu");
+    // The panel class is a prop of the shared menu panel now, so the
+    // hook that `.actions-menu` styles is the value ActionsMenu passes;
+    // the item classes it styles are emitted in menu.rs.
     emits(
         ACTIONS_MENU,
-        r#""item danger""#,
-        ".actions-menu .item.danger",
+        r#"panel_class="actions-menu""#,
+        ".actions-menu",
+    );
+    emits(MENU, r#""item danger""#, ".actions-menu .item.danger");
+    assert!(
+        ACTIONS_MENU.contains("MenuPanel"),
+        "ActionsMenu must mount the shared menu panel — a second local \
+         panel is how the two menus drifted apart before ADR-0028"
     );
     // The open panel arbitrates Escape through the overlay stack
-    // (topmost-only), like Modal and Drawer.
+    // (topmost-only), like Modal and Drawer. That registration moved
+    // into menu.rs with the panel, so assert it where it lives.
     assert!(
-        ACTIONS_MENU.contains("use_overlay_layer()") && ACTIONS_MENU.contains("is_topmost()"),
-        "ActionsMenu's open panel must register an overlay layer and \
-         gate its window Escape on is_topmost() — otherwise Escape \
-         under a stacked ConfirmModal closes both (the issue #28 bug \
-         class the overlay stack exists to prevent)"
+        MENU.contains("use_overlay_layer()") && MENU.contains("is_topmost()"),
+        "the shared menu panel must register an overlay layer and gate \
+         its window Escape on is_topmost() — otherwise Escape under a \
+         stacked ConfirmModal closes both (the issue #28 bug class the \
+         overlay stack exists to prevent)"
+    );
+    assert!(
+        !ACTIONS_MENU.contains(r#"query_selector(".item")"#),
+        "the local initial-focus scan is gone: initial focus is the \
+         shared overlay::focus_initial scan, which respects the roving \
+         tabindex instead of grabbing the first .item"
+    );
+    assert!(
+        markup_only(ACTIONS_MENU).contains(r#"aria-label="Actions""#),
+        "the ⋯ trigger has no text content — without aria-label its \
+         accessible name is the glyph"
+    );
+}
+
+#[test]
+fn the_menu_contract_is_shared_and_walks_by_index() {
+    // Both menus mount one panel, and that panel is the only place the
+    // lifecycle lives: no second set of window listeners anywhere.
+    assert!(
+        !markup_only(ACTIONS_MENU).contains("use_event_listener"),
+        "menu lifecycle (Escape, outside mousedown) belongs to menu.rs \
+         alone — a second listener is a second contract"
+    );
+    // The walk indexes the queried [role="menuitem"] list. The element
+    // sibling walk it replaced hopped whatever came next, so a header
+    // or a separator could take focus.
+    assert!(
+        markup_only(MENU).contains(r#"[role="menuitem"]"#) && MENU.contains("next_index"),
+        "the arrow walk must index the queried menuitem list through \
+         roving::next_index"
+    );
+    assert!(
+        !MENU.contains("next_element_sibling"),
+        "no element-sibling walk: a header or separator would take focus"
+    );
+    assert!(
+        MENU.contains("restores_trigger") && ROVING.contains("fn next_index"),
+        "restore-by-cause and the index arithmetic are the two pure \
+         halves this contract is native-tested through"
+    );
+    // One tab stop: exactly one item at 0, the rest at -1.
+    assert!(
+        markup_only(MENU).contains(r#"if focused.get() == index { "0" } else { "-1" }"#),
+        "menu items carry a true roving tabindex — every item tabbable \
+         puts N tab stops in the page and defeats the arrow walk"
+    );
+}
+
+#[test]
+fn topbar_menu_is_native_and_registers_with_the_stack() {
+    // The trigger paints through `.topbar .user` and the panel through
+    // `.user-menu`; the header/name/mail hooks are the identity block
+    // the panel renders outside role="menu".
+    emits(TOPBAR, r#"class="user""#, ".topbar .user");
+    emits(TOPBAR, r#"class="avatar""#, ".topbar .user .avatar");
+    emits(TOPBAR, r#"class="who""#, ".topbar .user .who");
+    emits(TOPBAR, r#"panel_class="user-menu""#, ".user-menu");
+    emits(TOPBAR, r#"class="hdr""#, ".user-menu .hdr");
+    emits(TOPBAR, r#"class="mail""#, ".user-menu .hdr .mail");
+    emits(MENU, r#"class="sep""#, ".user-menu .sep");
+
+    // A native trigger that reports its state, not a div with on:click.
+    // Every tag and attribute below is scanned against the markup: the
+    // module doc names each affordance it explains.
+    let markup = markup_only(TOPBAR);
+    assert!(
+        markup.contains("<button") && markup.contains(r#"type="button""#),
+        "the account trigger must be a native <button type=\"button\"> \
+         — a div reaches neither the keyboard nor the focus ring"
+    );
+    assert!(
+        markup.contains(r#"aria-haspopup="menu""#) && markup.contains("aria-expanded"),
+        "the trigger must announce that it opens a menu and whether it \
+         is open"
+    );
+    // One predicate for the mount and for the reported state. Split
+    // them and a lost identity unmounts the panel while the trigger
+    // still reads aria-expanded="true".
+    assert!(
+        markup.contains("<Show when=move || panel_open.get()>")
+            && markup.contains("aria-expanded=move || panel_open.get().to_string()"),
+        "the panel's <Show when=> and the trigger's aria-expanded must \
+         read the same derived predicate"
+    );
+    assert!(
+        markup.contains("Effect::new(move |_| {")
+            && markup.contains("if user.get().is_none() {")
+            && markup.contains("menu_open.set(false);"),
+        "an effect must clear the open flag when the identity is lost — \
+         otherwise the next identity remounts the menu, and runs its \
+         initial-focus effect, with no user activation behind it"
+    );
+    assert!(
+        TOPBAR.contains("MenuPanel"),
+        "the account menu mounts the shared menu panel — its own panel \
+         is how it ended up with no layer, no Escape and no restore"
+    );
+    assert!(
+        !markup_only(TOPBAR).contains("use_event_listener"),
+        "the menu lifecycle belongs to menu.rs; a listener here is a \
+         second contract"
+    );
+
+    // ADR-0025's retirements, and the one box that stays.
+    assert!(
+        !markup.contains("iconbtn"),
+        "the notifications bell is retired — it was never wired"
+    );
+    assert!(
+        !markup.contains("⌘⇧L"),
+        "the theme chord is not bound (it collides with Bitwarden's \
+         autofill and Safari's own binding), so the hint chip would be \
+         a lie"
+    );
+    assert!(
+        !markup.contains("API tokens") && !markup.contains("Profile"),
+        "the two disabled rows are retired — a menu item that cannot be \
+         activated is not a menu item"
+    );
+    assert!(
+        !markup.contains(r#"class="overlay""#),
+        "the menu's private full-viewport scrim is gone: dismissal is \
+         the shared outside-mousedown check, so a modal above the menu \
+         arbitrates instead of being covered"
+    );
+    assert!(
+        markup.contains("Command palette"),
+        "the ⌘K stub stays exactly as it is until the palette slice \
+         (ADR-0028, human ruling)"
     );
 }
 
@@ -352,6 +634,62 @@ fn copy_button_reports_through_the_shared_toast_bus() {
         "copy triggers sit inside clickable rows — the click must not \
          bubble into the host row handler"
     );
+}
+
+#[test]
+fn modal_close_toast_dismiss_and_bare_copy_are_native_buttons() {
+    // The last three pseudo-buttons in the crate (ADR-0028). Each has
+    // to be reachable by Tab and operable by Enter and Space, which no
+    // amount of CSS gives a <span on:click>.
+    for (src, what) in [
+        (MODAL_SHELL, "the modal close"),
+        (TOAST_RUNTIME, "the toast dismiss"),
+        (COPY_BUTTON, "the bare copy trigger"),
+    ] {
+        assert!(
+            markup_only(src).contains("<button") && markup_only(src).contains(TYPE_BUTTON),
+            "{what} must be a native <button type=\"button\"> — inside a \
+             form a type-less button submits it, and a span reaches \
+             neither the keyboard nor the ADR-0007 focus ring"
+        );
+    }
+    // Both glyph-only controls take their whole accessible name from an
+    // aria-label: a stroked X and a multiplication sign announce as
+    // nothing useful. The class hooks stay `.x` either way.
+    emits(MODAL_SHELL, "class=\"x\"", ".modal .m-hd .x");
+    emits(TOAST_RUNTIME, "class=\"x\"", ".toast .x");
+    assert!(
+        markup_only(MODAL_SHELL).contains("aria-label=\"Close dialog\"")
+            && markup_only(MODAL_SHELL).contains("title=\"Close (Esc)\""),
+        "the modal close keeps a named label and the Esc hint in its \
+         tooltip"
+    );
+    assert!(
+        markup_only(TOAST_RUNTIME).contains("aria-label=\"Dismiss notification\"")
+            && markup_only(TOAST_RUNTIME).contains("<span aria-hidden=\"true\">"),
+        "the toast dismiss is named by aria-label, and its × is hidden \
+         decoration — read aloud, \"times\" is not a dismissal"
+    );
+    // The bare copy trigger keeps the propagation stop it had as a
+    // span: it sits inside clickable rows and header bars.
+    assert!(
+        COPY_BUTTON.contains("e.stop_propagation();"),
+        "bare-mode copy must keep e.stop_propagation() — the click would \
+         otherwise also open the row the trigger sits in"
+    );
+    // Neither glyph control may go back to a span with a click handler.
+    for (src, name) in [
+        (MODAL_SHELL, "modal/shell.rs"),
+        (TOAST_RUNTIME, "toast/runtime.rs"),
+        (COPY_BUTTON, "copy_button.rs"),
+    ] {
+        assert!(
+            !markup_only(src).contains("<span\n                    class=cls")
+                && !markup_only(src).contains("<span class=\"x\""),
+            "{name} must not reopen a span with an on:click — that is the \
+             shape ADR-0028 closed"
+        );
+    }
 }
 
 #[test]

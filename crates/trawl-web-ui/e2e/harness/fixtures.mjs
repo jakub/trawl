@@ -111,3 +111,18 @@ export function listSavedResponse() {
 export function serviceSchemaResponse() {
   return wire('service-schema');
 }
+
+/** `GET /api/v1/saved` under the `populated` scenario: one net, so the
+ * nets table renders a row with an `ActionsMenu` in it and `?net=1`
+ * opens the drawer. The default stays empty — specs that assert a
+ * pristine page count on it. */
+export function populatedListSavedResponse() {
+  return wire('saved-queries');
+}
+
+/** `GET /api/v1/schema/services` under the `populated` scenario: one
+ * service, which is what makes `?svc=nginx` mount the service drawer and
+ * its three-tab strip. */
+export function populatedServiceSchemaResponse() {
+  return wire('service-schema-populated');
+}

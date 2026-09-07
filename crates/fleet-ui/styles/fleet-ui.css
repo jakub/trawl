@@ -601,6 +601,7 @@ textarea:focus-visible,
   color: var(--ink); letter-spacing: -.1px;
 }
 .modal .m-hd .x {
+  background: none; border: 0;
   cursor: pointer; color: var(--ink-3); padding: 3px 6px; border-radius: var(--radius-sm);
   display: grid; place-items: center;
 }
@@ -664,6 +665,8 @@ textarea:focus-visible,
   flex-shrink: 0;
 }
 .tabs .t {
+  background: none;
+  border: none;
   padding: 8px 12px;
   font-size: var(--fs-base);
   color: var(--ink-3);
@@ -679,6 +682,11 @@ textarea:focus-visible,
 .tabs .t.active { color: var(--ink); border-bottom-color: var(--accent); font-weight: 500; }
 .tabs .t .c { color: var(--ink-3); font-variant-numeric: tabular-nums; font-size: var(--fs-small); }
 .tabs .sp { flex: 1; }
+/* The role="tablist" node holds ONLY the tabs (ADR-0028); the spacer
+ * and the trailing action slot are its siblings, so the strip keeps one
+ * flex row and each tab's -1px bottom margin still laps the container's
+ * border. */
+.tablist { display: flex; align-items: center; }
 
 /* ─────────────────────────────────────────────────────────────────
  *  Drawer shell — fleet_ui::Drawer (issue #28). Scrim, right-slide
@@ -726,6 +734,7 @@ textarea:focus-visible,
   background: var(--panel);
 }
 .sd-tabs .tb {
+  background: none; border: none;
   font-family: var(--font-ui); font-size: var(--fs-base); font-weight: 500;
   color: var(--ink-3); padding: 9px 12px; cursor: pointer;
   border-bottom: 2px solid transparent; margin-bottom: -1px;
@@ -735,6 +744,10 @@ textarea:focus-visible,
 .sd-tabs .tb.on { color: var(--ink); border-bottom-color: var(--accent); font-weight: 600; }
 .sd-tabs .sp { flex: 1; }
 .sd-tabs .meta { font-size: var(--fs-small); color: var(--ink-3); padding-right: 4px; }
+/* The 4px inter-tab gap moves to the nested tablist. .sd-tabs keeps its
+ * own gap, which now falls either side of the flex:1 spacer and is
+ * absorbed by it — the tabs and the meta text do not move. */
+.sd-tabs .tablist { gap: 4px; }
 
 .sd-body { flex: 1; min-height: 0; overflow: auto; padding: 16px 18px; }
 
@@ -785,6 +798,7 @@ textarea:focus-visible,
 .toast .detail { color: var(--ink-2); font-size: var(--fs-small); line-height: 1.45; }
 /* Close ✕ nudged to optically align with the title's first line. */
 .toast .x {
+  background: none; border: 0;
   color: var(--ink-3);
   cursor: pointer;
   padding: 1px 6px;
@@ -859,7 +873,7 @@ textarea:focus-visible,
 }
 
 /* Top bar — application chrome.
-   Order: brand · modes · spacer · jump · env · iconbtns · user. */
+   Order: brand · modes · spacer · jump · env · user. */
 .topbar {
   display: flex;
   align-items: center;
@@ -926,30 +940,12 @@ textarea:focus-visible,
 .topbar .jump:hover { border-color: var(--ink-4); }
 .topbar .jump .gh { flex: 1; font-family: var(--font-ui); font-size: var(--fs-label); }
 
-.topbar .iconbtn {
-  width: 26px;
-  height: 26px;
-  display: grid;
-  place-items: center;
-  color: var(--ink-2);
-  border-radius: var(--radius-sm);
-  cursor: pointer;
-  position: relative;
-  transition: color 120ms, background 120ms;
-}
-.topbar .iconbtn::after {
-  content: "";
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  width: 40px;
-  height: 40px;
-  transform: translate(-50%, -50%);
-}
-.topbar .iconbtn:hover { color: var(--ink); background: var(--panel-2); }
-
 .topbar .user-wrap { position: relative; }
 .topbar .user {
+  background: none;
+  border: 0;
+  font: inherit;
+  color: inherit;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -1003,6 +999,12 @@ textarea:focus-visible,
   margin-top: 1px;
 }
 .user-menu .item {
+  background: none;
+  border: 0;
+  width: 100%;
+  text-align: left;
+  font: inherit;
+  color: inherit;
   display: flex;
   align-items: center;
   gap: 10px;
@@ -1013,14 +1015,8 @@ textarea:focus-visible,
   color: var(--ink);
 }
 .user-menu .item:hover { background: var(--panel-2); }
-.user-menu .item.disabled { color: var(--ink-3); cursor: not-allowed; }
-.user-menu .item.disabled:hover { background: transparent; }
-.user-menu .item .kbd { margin-left: auto; }
 .user-menu .item.danger { color: var(--red); }
 .user-menu .sep { height: 1px; background: var(--line-2); margin: 4px 0; }
-
-/* Overlay used to click-outside the open menu. */
-.user-wrap > .overlay { position: fixed; inset: 0; z-index: 79; }
 
 /* Body row: rail + main, fills remaining height after the topbar. */
 .body {

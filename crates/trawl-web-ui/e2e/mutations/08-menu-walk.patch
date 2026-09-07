@@ -1,0 +1,16 @@
+diff --git a/crates/fleet-ui/src/roving.rs b/crates/fleet-ui/src/roving.rs
+index d8a68ebe..424d5572 100644
+--- a/crates/fleet-ui/src/roving.rs
++++ b/crates/fleet-ui/src/roving.rs
+@@ -55,10 +55,7 @@ pub(crate) fn next_index(current: usize, len: usize, nav: Nav) -> Option<usize>
+         return None;
+     }
+     Some(match nav {
+-        Nav::Next => (current + 1) % len,
+-        Nav::Prev => (current + len - 1) % len,
+-        Nav::First => 0,
+-        Nav::Last => len - 1,
++        Nav::Next | Nav::Prev | Nav::First | Nav::Last => current,
+     })
+ }
+ 

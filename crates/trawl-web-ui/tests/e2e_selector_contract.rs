@@ -9,8 +9,10 @@
 //! contract hold: each exported entry's full `key: 'value',` assignment
 //! appears verbatim in `selectors.ts` (assignment-level, so a key's value
 //! can't rot while the old string survives in another entry), and the
-//! "hook" substring the selector is built from still appears in the Rust
-//! (or fleet-ui) source file that emits it. Same `include_str!`-and-scan
+//! "hook" substring the selector is built from still appears in a
+//! comment-stripped view of the Rust (or fleet-ui) source file that
+//! emits it, so prose describing markup cannot answer for markup that
+//! was deleted. Same `include_str!`-and-scan
 //! idiom as `crates/fleet-ui/tests/component_class_contract.rs`, aimed
 //! at the e2e suite's selector sheet instead of a stylesheet.
 //!
@@ -39,6 +41,11 @@ const SECTION_RS: &str = include_str!("../src/state/section.rs");
 const DRAWER_RS: &str = include_str!("../../fleet-ui/src/drawer.rs");
 const FIELD_CASE_DRAWER_RS: &str = include_str!("../src/components/field_case_drawer.rs");
 const REPIN_FLOW_RS: &str = include_str!("../src/repin_flow.rs");
+const TOPBAR_RS: &str = include_str!("../../fleet-ui/src/topbar.rs");
+const MENU_RS: &str = include_str!("../../fleet-ui/src/menu.rs");
+const TABS_RS: &str = include_str!("../../fleet-ui/src/tabs.rs");
+const ACTIONS_MENU_RS: &str = include_str!("../../fleet-ui/src/actions_menu.rs");
+const COPY_BUTTON_RS: &str = include_str!("../../fleet-ui/src/copy_button.rs");
 
 /// One (assignment, source file, hook) triple: `assignment` is the full
 /// `key: 'value',` line as it appears in `selectors.ts`, and `hook` must
@@ -413,6 +420,154 @@ const CONTRACTS: &[Contract] = &[
         source: REPIN_FLOW_RS,
         hook: "pub const REPIN_POLL_MS: u32 = 3_000;",
     },
+    // -- native controls and the shared menu contract (ADR-0028) ------
+    Contract {
+        assignment: "topbarUser: '.topbar button.user',",
+        source_path: "../fleet-ui/src/topbar.rs",
+        source: TOPBAR_RS,
+        hook: "class=\"user\"",
+    },
+    // Two rows, because the selector spans two files: the panel class is
+    // the topbar's, the `role="menu"` node inside it is the shared
+    // menu's.
+    Contract {
+        assignment: "userMenu: '.user-menu [role=\"menu\"]',",
+        source_path: "../fleet-ui/src/topbar.rs",
+        source: TOPBAR_RS,
+        hook: "panel_class=\"user-menu\"",
+    },
+    Contract {
+        assignment: "userMenu: '.user-menu [role=\"menu\"]',",
+        source_path: "../fleet-ui/src/menu.rs",
+        source: MENU_RS,
+        hook: "<div role=\"menu\" aria-label=menu_label",
+    },
+    Contract {
+        assignment: "userMenuItem: '.user-menu [role=\"menuitem\"]',",
+        source_path: "../fleet-ui/src/menu.rs",
+        source: MENU_RS,
+        hook: "role=\"menuitem\"",
+    },
+    Contract {
+        assignment: "actionsMenuTrigger: '.actions-wrap button.btn-icon',",
+        source_path: "../fleet-ui/src/actions_menu.rs",
+        source: ACTIONS_MENU_RS,
+        hook: "class=\"actions-wrap\"",
+    },
+    Contract {
+        assignment: "actionsMenuTrigger: '.actions-wrap button.btn-icon',",
+        source_path: "../fleet-ui/src/actions_menu.rs",
+        source: ACTIONS_MENU_RS,
+        hook: "class=\"btn-icon\"",
+    },
+    Contract {
+        assignment: "actionsMenuItem: '.actions-menu [role=\"menuitem\"]',",
+        source_path: "../fleet-ui/src/actions_menu.rs",
+        source: ACTIONS_MENU_RS,
+        hook: "panel_class=\"actions-menu\"",
+    },
+    Contract {
+        assignment: "actionsMenuItem: '.actions-menu [role=\"menuitem\"]',",
+        source_path: "../fleet-ui/src/menu.rs",
+        source: MENU_RS,
+        hook: "role=\"menuitem\"",
+    },
+    Contract {
+        assignment: "workspaceTab: '.tabs [role=\"tab\"]',",
+        source_path: "../fleet-ui/src/tabs.rs",
+        source: TABS_RS,
+        hook: "class=\"tabs\"",
+    },
+    Contract {
+        assignment: "workspaceTab: '.tabs [role=\"tab\"]',",
+        source_path: "../fleet-ui/src/tabs.rs",
+        source: TABS_RS,
+        hook: "role=\"tab\"",
+    },
+    Contract {
+        assignment: "drawerTab: '.sd-tabs [role=\"tab\"]',",
+        source_path: "../fleet-ui/src/tabs.rs",
+        source: TABS_RS,
+        hook: "class=\"sd-tabs\"",
+    },
+    Contract {
+        assignment: "drawerTab: '.sd-tabs [role=\"tab\"]',",
+        source_path: "../fleet-ui/src/tabs.rs",
+        source: TABS_RS,
+        hook: "role=\"tab\"",
+    },
+    Contract {
+        assignment: "modalClose: '.modal .m-hd button.x',",
+        source_path: "../fleet-ui/src/modal/shell.rs",
+        source: MODAL_SHELL_RS,
+        hook: "class=\"m-hd\"",
+    },
+    Contract {
+        assignment: "modalClose: '.modal .m-hd button.x',",
+        source_path: "../fleet-ui/src/modal/shell.rs",
+        source: MODAL_SHELL_RS,
+        hook: "class=\"x\"",
+    },
+    Contract {
+        assignment: "toastDismiss: '.toast button.x',",
+        source_path: "../fleet-ui/src/toast/runtime.rs",
+        source: TOAST_RUNTIME_RS,
+        hook: "class=\"x\"",
+    },
+    Contract {
+        assignment: "editorTool: '.editor-tools button.tool',",
+        source_path: "src/components/editor_wrap.rs",
+        source: EDITOR_WRAP_RS,
+        hook: "class=\"editor-tools\"",
+    },
+    Contract {
+        assignment: "editorTool: '.editor-tools button.tool',",
+        source_path: "src/components/editor_wrap.rs",
+        source: EDITOR_WRAP_RS,
+        hook: "class=\"tool\"",
+    },
+    // The Share tool is a CopyButton in bare mode, whose whole markup is
+    // fleet-ui's: if that ever stops being a native button, the
+    // `button.tool` half of the selector matches one element instead of
+    // two and the spec's propagation proof evaporates.
+    Contract {
+        assignment: "editorTool: '.editor-tools button.tool',",
+        source_path: "../fleet-ui/src/copy_button.rs",
+        source: COPY_BUTTON_RS,
+        hook: "class=cls",
+    },
+    Contract {
+        assignment: "modalCloseName: 'Close dialog',",
+        source_path: "../fleet-ui/src/modal/shell.rs",
+        source: MODAL_SHELL_RS,
+        hook: "aria-label=\"Close dialog\"",
+    },
+    Contract {
+        assignment: "toastDismissName: 'Dismiss notification',",
+        source_path: "../fleet-ui/src/toast/runtime.rs",
+        source: TOAST_RUNTIME_RS,
+        hook: "aria-label=\"Dismiss notification\"",
+    },
+    // One string, two positions: the trigger's own name and the name of
+    // the panel it opens.
+    Contract {
+        assignment: "actionsName: 'Actions',",
+        source_path: "../fleet-ui/src/actions_menu.rs",
+        source: ACTIONS_MENU_RS,
+        hook: "aria-label=\"Actions\"",
+    },
+    Contract {
+        assignment: "actionsName: 'Actions',",
+        source_path: "../fleet-ui/src/actions_menu.rs",
+        source: ACTIONS_MENU_RS,
+        hook: "menu_label=\"Actions\"",
+    },
+    Contract {
+        assignment: "accountMenuName: 'Account',",
+        source_path: "../fleet-ui/src/topbar.rs",
+        source: TOPBAR_RS,
+        hook: "menu_label=\"Account\"",
+    },
 ];
 
 #[test]
@@ -431,11 +586,96 @@ fn every_selector_assignment_appears_in_selectors_ts() {
     }
 }
 
+/// `src` with its comments removed, so a hook can only be satisfied by
+/// something the component actually renders.
+///
+/// A module doc that explains a contract quotes the markup it describes
+/// (`menu.rs`'s doc names `role="menuitem"` in prose), so a raw
+/// `contains` let the guard stay green after the attribute was deleted
+/// from the button: the prose alone answered for it.
+///
+/// Block comments are removed first, counting nesting the way rustc
+/// does; then any line whose first non-space characters are `//` goes,
+/// which covers `//`, `///` and `//!` alike. A trailing comment after
+/// code on the same line survives on purpose: stripping it would need
+/// to know where string literals end, and `'https://…'` inside a
+/// literal is exactly the kind of hook this file pins. String literals
+/// stay in for the same reason — `title="Close (Esc)"` is real markup.
+/// The block scan does not know string literals either, so a source
+/// carrying a literal `/*` would over-strip; none of the files below
+/// has one, and a hook that vanished for that reason fails loudly.
+fn comment_stripped(src: &str) -> String {
+    let bytes = src.as_bytes();
+    let mut kept: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut depth = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i..].starts_with(b"/*") {
+            depth += 1;
+            i += 2;
+        } else if depth > 0 && bytes[i..].starts_with(b"*/") {
+            depth -= 1;
+            i += 2;
+        } else {
+            if depth == 0 {
+                // Byte-wise, so a multi-byte character outside a comment
+                // is copied through unchanged; inside one every byte but
+                // the newline is dropped, which cannot split a character.
+                kept.push(bytes[i]);
+            } else if bytes[i] == b'\n' {
+                // Keep the newline so line-comment stripping below still
+                // sees real lines.
+                kept.push(b'\n');
+            }
+            i += 1;
+        }
+    }
+    let out = String::from_utf8(kept).expect("dropping whole comment spans keeps the rest valid");
+    out.lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn comment_stripped_hides_prose_and_keeps_markup() {
+    let doc_comment = "/// role=\"menuitem\"\nfn f() {}\n";
+    let inner_doc = "//! role=\"menuitem\"\nfn f() {}\n";
+    let line_comment = "// role=\"menuitem\"\nfn f() {}\n";
+    let block_comment = "/* role=\"menuitem\" */\nfn f() {}\n";
+    let markup = "view! { <button role=\"menuitem\">\"x\"</button> }\n";
+    for (label, src) in [
+        ("///", doc_comment),
+        ("//!", inner_doc),
+        ("//", line_comment),
+        ("/* */", block_comment),
+    ] {
+        assert!(
+            !comment_stripped(src).contains("role=\"menuitem\""),
+            "a hook living only in a {label} comment must not satisfy the \
+             drift guard — prose is not markup"
+        );
+    }
+    assert!(
+        comment_stripped(markup).contains("role=\"menuitem\""),
+        "a hook in real markup must survive stripping"
+    );
+    // Nesting, and a hook that shares a line with a trailing comment.
+    assert!(
+        !comment_stripped("/* a /* b */ role=\"menuitem\" */\n").contains("role=\"menuitem\""),
+        "nested block comments must be stripped whole, as rustc reads them"
+    );
+    assert!(
+        comment_stripped("<button role=\"menuitem\"> // why\n").contains("role=\"menuitem\""),
+        "a trailing comment after code must not take the code with it"
+    );
+}
+
 #[test]
 fn every_source_hook_still_exists() {
     for c in CONTRACTS {
         assert!(
-            c.source.contains(c.hook),
+            comment_stripped(c.source).contains(c.hook),
             "{} no longer contains the hook `{}` that e2e/selectors.ts's \
              `{}` assignment is built from — the Playwright suite would \
              then be asserting against markup that doesn't exist. Update \

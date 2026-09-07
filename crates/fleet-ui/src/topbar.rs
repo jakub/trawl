@@ -4,16 +4,38 @@
 
 //! `<TopBar/>` — generic application chrome.
 //!
-//! brand · mode tabs · spacer · command-palette stub · notif iconbtn ·
-//! app links · user-menu dropdown. The theme toggle reads the
-//! `UiPrefs` context the consumer provides from `fleet_ui::install()`.
-//! The bar knows nothing about auth, `/me`, or app-specific endpoints:
-//! `on_logout` is a callback the consumer wires to its own logout flow.
+//! brand · mode tabs · spacer · command-palette stub · app links ·
+//! account menu. The theme toggle reads the `UiPrefs` context the
+//! consumer provides from `fleet_ui::install()`. The bar knows nothing
+//! about auth, `/me`, or app-specific endpoints: `on_logout` is a
+//! callback the consumer wires to its own logout flow.
+//!
+//! The account menu is a native trigger plus the shared menu panel
+//! ([`crate::menu`]), the same contract `ActionsMenu` mounts: the panel
+//! is an overlay layer, so Escape closes it only while it is topmost, a
+//! modal opened from it arbitrates properly, exactly one item is
+//! tabbable, and focus returns to the trigger on every cause but an
+//! outside press. Its trigger's accessible name is the visible user
+//! name — the avatar and the chevron are `aria-hidden`, so nothing
+//! reads "JD" aloud — and it is `disabled` until the consumer's `user`
+//! signal resolves. One predicate decides both whether the panel is on
+//! the page and what `aria-expanded` reports, and losing the identity
+//! closes the menu rather than leaving it open behind an unmounted
+//! panel.
+//!
+//! Three affordances left with ADR-0025 and ADR-0028: the notifications
+//! bell (never wired), the disabled Profile and API tokens rows, and
+//! the theme item's `⌘⇧L` hint chip (the chord collides with
+//! Bitwarden's autofill and Safari's own binding, so it is not bound
+//! and the hint would be a lie). The `⌘K` command-palette stub stays as
+//! it is until the palette slice.
 
+use leptos::html::{Button, Div};
 use leptos::prelude::*;
 use leptos_router::components::A;
 
 use crate::icon::{Icon, IconView};
+use crate::menu::{MenuEntry, MenuItem, MenuPanel};
 use crate::theme::UiPrefs;
 
 /// A top-bar mode tab. Active state is baked into the struct so the
@@ -56,25 +78,6 @@ pub fn TopBar(
     on_logout: Callback<()>,
 ) -> impl IntoView {
     let prefs = use_context::<UiPrefs>();
-    let menu_open = RwSignal::new(false);
-
-    let toggle_theme = move |_| {
-        if let Some(p) = prefs {
-            p.theme.update(|t| *t = t.toggled());
-        } else {
-            // Developer-facing: consumer mounted <TopBar/> without calling
-            // `fleet_ui::install()`, so the theme toggle silently does
-            // nothing. Surface it so it's caught in dev, not QA.
-            leptos::logging::warn!(
-                "fleet-ui TopBar: UiPrefs context missing — did you call fleet_ui::install()?"
-            );
-        }
-    };
-
-    let on_logout_click = move |_| {
-        menu_open.set(false);
-        on_logout.run(());
-    };
 
     view! {
         <div class="topbar">
@@ -107,10 +110,6 @@ pub fn TopBar(
                 <span class="kbd">"⌘K"</span>
             </div>
 
-            <div class="iconbtn" title="Notifications — coming soon">
-                <IconView icon=Icon::Bell size=14 stroke_width=1.5/>
-            </div>
-
             {move || {
                 let links = app_links.get();
                 (!links.is_empty()).then(|| view! {
@@ -125,36 +124,116 @@ pub fn TopBar(
                 })
             }}
 
-            <div class="user-wrap">
-                <div class="user" on:click=move |_| menu_open.update(|v| *v = !*v)>
-                    <div class="avatar">{move || avatar_initials(user.get().as_ref())}</div>
-                    <span class="who">{move || user.get().map_or_else(|| "…".to_string(), |u| u.name)}</span>
-                    <IconView icon=Icon::Chevron size=10 stroke_width=1.5/>
-                </div>
-                <Show when=move || menu_open.get()>
-                    <div class="overlay" on:click=move |_| menu_open.set(false)></div>
-                    <div class="user-menu">
+            {account_menu(user, prefs, on_logout)}
+        </div>
+    }
+}
+
+/// The account menu: native trigger plus the shared menu panel.
+///
+/// Split out of [`TopBar`] as a unit because it is the one part of the
+/// bar with state of its own — the open flag, the wrapper the outside
+/// press is measured against, and the trigger focus returns to.
+fn account_menu(
+    user: Signal<Option<UserInfo>>,
+    prefs: Option<UiPrefs>,
+    on_logout: Callback<()>,
+) -> impl IntoView {
+    let menu_open = RwSignal::new(false);
+    let wrap_ref = NodeRef::<Div>::new();
+    let trigger_ref = NodeRef::<Button>::new();
+
+    // The one predicate: the panel mounts under it and the trigger
+    // reports it. Deriving `aria-expanded` from `menu_open` alone let
+    // the two disagree, because the panel also needs an identity to
+    // render a header for: losing the user while the menu was open
+    // unmounted the panel (disposing its layer and its focused item)
+    // and left a disabled trigger claiming aria-expanded="true".
+    let panel_open = Signal::derive(move || menu_open.get() && user.get().is_some());
+
+    // Losing the identity closes the menu for good. Without this the
+    // stale open flag survives the unmount, so the next identity
+    // (a re-login, a `/me` refetch) remounts the panel and runs its
+    // initial-focus effect with no user activation behind it.
+    Effect::new(move |_| {
+        if user.get().is_none() {
+            menu_open.set(false);
+        }
+    });
+
+    let toggle_theme = Callback::new(move |()| {
+        if let Some(p) = prefs {
+            p.theme.update(|t| *t = t.toggled());
+        } else {
+            // Developer-facing: consumer mounted <TopBar/> without calling
+            // `fleet_ui::install()`, so the theme toggle silently does
+            // nothing. Surface it so it's caught in dev, not QA.
+            leptos::logging::warn!(
+                "fleet-ui TopBar: UiPrefs context missing — did you call fleet_ui::install()?"
+            );
+        }
+    });
+
+    // The theme item renames itself with the theme it would switch to,
+    // so its label is a derived signal rather than a snapshot string.
+    let entries = move || {
+        vec![
+            MenuEntry::Item(MenuItem {
+                label: Signal::derive(move || theme_label(prefs)),
+                danger: false,
+                on_activate: toggle_theme,
+            }),
+            MenuEntry::Separator,
+            MenuEntry::Item(MenuItem {
+                label: Signal::stored("Sign Out".to_string()),
+                danger: true,
+                on_activate: on_logout,
+            }),
+        ]
+    };
+
+    view! {
+        <div class="user-wrap" node_ref=wrap_ref>
+            <button
+                class="user"
+                type="button"
+                node_ref=trigger_ref
+                aria-haspopup="menu"
+                // Rendered unconditionally, including while disabled,
+                // where it reads false: a trigger that only sometimes
+                // reports its state is worse than one that always does.
+                aria-expanded=move || panel_open.get().to_string()
+                disabled=move || user.get().is_none()
+                on:click=move |_| menu_open.update(|v| *v = !*v)
+            >
+                <span class="avatar" aria-hidden="true">
+                    {move || avatar_initials(user.get().as_ref())}
+                </span>
+                <span class="who">
+                    {move || user.get().map_or_else(|| "…".to_string(), |u| u.name)}
+                </span>
+                <IconView icon=Icon::Chevron size=10 stroke_width=1.5 attr:aria-hidden="true"/>
+            </button>
+            <Show when=move || panel_open.get()>
+                <MenuPanel
+                    panel_class="user-menu"
+                    menu_label="Account"
+                    entries=entries()
+                    header=Box::new(move || view! {
                         <div class="hdr">
-                            <div class="name">{move || user.get().map(|u| u.name).unwrap_or_default()}</div>
-                            <div class="mail">{move || user.get().map(|u| u.detail).unwrap_or_default()}</div>
+                            <div class="name">
+                                {move || user.get().map(|u| u.name).unwrap_or_default()}
+                            </div>
+                            <div class="mail">
+                                {move || user.get().map(|u| u.detail).unwrap_or_default()}
+                            </div>
                         </div>
-                        <div class="item disabled" title="Coming soon">
-                            <span>"Profile"</span>
-                        </div>
-                        <div class="item disabled" title="Coming soon">
-                            <span>"API tokens"</span>
-                        </div>
-                        <div class="item" on:click=toggle_theme>
-                            <span>{move || theme_label(prefs)}</span>
-                            <span class="kbd">"⌘⇧L"</span>
-                        </div>
-                        <div class="sep"></div>
-                        <div class="item danger" on:click=on_logout_click>
-                            <span>"Sign Out"</span>
-                        </div>
-                    </div>
-                </Show>
-            </div>
+                    }.into_any())
+                    open=menu_open
+                    wrap_ref=wrap_ref
+                    trigger_ref=trigger_ref
+                />
+            </Show>
         </div>
     }
 }
