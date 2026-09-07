@@ -386,6 +386,10 @@ export const COPY = {
   /// crates/trawl-web-ui/src/components/editor_wrap.rs — the range
   /// dialog's own name. Not a format string.
   rangeDialogName: 'Time range',
+  /// crates/trawl-web-ui/src/components/net_drawer.rs — what stands in
+  /// for the schedule form until a net has a schedule. The interval
+  /// presets live behind it.
+  addScheduleButton: '+ Add Schedule',
 
   // -- the DSL shapes the stub dispatches on --------------------------
   // Not copy the user sees: the substrings `harness/server.mjs` keys

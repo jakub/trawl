@@ -1103,6 +1103,12 @@ const CONTRACTS: &[Contract] = &[
         source: EDITOR_WRAP_RS,
         hook: "aria-label=\"Time range\"",
     },
+    Contract {
+        assignment: "addScheduleButton: '+ Add Schedule',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "\"+ Add Schedule\"",
+    },
     // -- the DSL shapes the stub dispatches on --------------------------
     // `e2e_wire_fixture_contract.rs` proves these against the builders by
     // CALLING them, which is the stronger half; these rows keep the

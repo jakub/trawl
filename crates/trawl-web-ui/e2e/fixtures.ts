@@ -141,6 +141,11 @@ export const CORPUS = {
    * opposite after the field headers moved onto the shared helper. */
   fieldFirstAlphabetically: '_time',
   fieldLastAlphabetically: 'status',
+  /** The field the service drawer's overview lists first under "Top
+   * fields by cardinality": the highest count in
+   * `wire/query-cardinality.json`. The drawer reads that answer BY
+   * COLUMN NAME, so this is the fixture's name and not the query's. */
+  topCardinalityField: '_time',
   /** Runs of the net, newest first (`wire/net-runs.json`). */
   runIds: [501, 502] as const,
   /** The run whose expansion has a result body. */
