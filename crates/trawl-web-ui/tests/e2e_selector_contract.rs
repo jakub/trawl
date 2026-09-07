@@ -983,6 +983,30 @@ const CONTRACTS: &[Contract] = &[
         hook: "\"Show details for result {}\"",
     },
     Contract {
+        assignment: "schemaServiceHeader: 'Service',",
+        source_path: "src/pages/schema.rs",
+        source: SCHEMA_RS,
+        hook: "\"Service\"",
+    },
+    Contract {
+        assignment: "schemaEventsHeader: 'Events',",
+        source_path: "src/pages/schema.rs",
+        source: SCHEMA_RS,
+        hook: "\"Events\"",
+    },
+    Contract {
+        assignment: "serviceFieldHeader: 'Field',",
+        source_path: "src/components/service_drawer.rs",
+        source: SERVICE_DRAWER_RS,
+        hook: "\"Field\"",
+    },
+    Contract {
+        assignment: "serviceCardinalityHeader: 'Cardinality',",
+        source_path: "src/components/service_drawer.rs",
+        source: SERVICE_DRAWER_RS,
+        hook: "\"Cardinality\"",
+    },
+    Contract {
         assignment: "resultsTagName: 'Include {field_for_label} = {value_for_label}',",
         source_path: "src/components/results_table.rs",
         source: RESULTS_TABLE_RS,

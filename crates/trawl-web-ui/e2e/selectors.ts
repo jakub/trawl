@@ -337,6 +337,13 @@ export const COPY = {
   /// crates/trawl-web-ui/src/components/results_table.rs — the caret
   /// button's name, numbered from 1 in render order.
   resultsExpandName: 'Show details for result {}',
+  /// Column labels a sort proof names. `sort_th` takes them as
+  /// literals, so a renamed column would otherwise fail a spec for a
+  /// reason that reads like a broken sort.
+  schemaServiceHeader: 'Service',
+  schemaEventsHeader: 'Events',
+  serviceFieldHeader: 'Field',
+  serviceCardinalityHeader: 'Cardinality',
   /// crates/trawl-web-ui/src/components/results_table.rs — a detail
   /// row's tag, which adds an include filter.
   resultsTagName: 'Include {field_for_label} = {value_for_label}',

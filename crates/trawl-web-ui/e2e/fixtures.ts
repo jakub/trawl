@@ -135,6 +135,12 @@ export const CORPUS = {
    * `wire/catalog-field.json`'s field, so the case file the badge opens
    * is about the field the badge sits on. */
   degradedField: 'duration',
+  /** The service's columns at the ends of a name sort, from
+   * `wire/service-schema-corpus.json`: `_time`, `duration`, `status`
+   * ascending. Enough to tell the drawer's default direction from its
+   * opposite after the field headers moved onto the shared helper. */
+  fieldFirstAlphabetically: '_time',
+  fieldLastAlphabetically: 'status',
   /** The corpus service's field names at the ends of an alphabetical
    * sort (`_time`, `duration`, `status` in `wire/service-schema-corpus
    * .json`). The drawer's Field header is the one column whose natural
