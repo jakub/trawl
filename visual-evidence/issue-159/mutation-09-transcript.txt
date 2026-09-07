@@ -1,0 +1,485 @@
+
+=== run 1/5 ===
+date: 2026-09-07T00:24:28-07:00
+HEAD: c5ba6a4468e134fc7d289199deb16b9d8dec664b
+command: crates/trawl-web-ui/e2e/scripts/mutation-check.sh 09-menu-roving-tabindex.patch
+
+=== 09-menu-roving-tabindex.patch -> actions-menu.spec.ts ===
+-- trunk build --
+2026-09-07T07:24:28.386131Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T07:24:28.386252Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-core)
+   Compiling fleet-ui v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/fleet-ui)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.35s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T07:24:36.609095Z  INFO applying new distribution
+2026-09-07T07:24:36.614129Z  INFO ✅ success
+-- playwright test tests/actions-menu.spec.ts --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/actions-menu.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui/dist)
+
+Running 1 test using 1 worker
+
+  ✘  1 [chromium] › tests/actions-menu.spec.ts:25:5 › actions menu has one tab stop and restores its trigger (563ms)
+
+
+  1) [chromium] › tests/actions-menu.spec.ts:25:5 › actions menu has one tab stop and restores its trigger 
+
+    Error: expect(received).toEqual(expected) // deep equality
+
+    - Expected  - 2
+    + Received  + 2
+
+      Array [
+        "0",
+    -   "-1",
+    -   "-1",
+    +   "0",
+    +   "0",
+      ]
+
+      46 |   expect(
+      47 |     await items.evaluateAll((els) => els.map((el) => el.getAttribute('tabindex'))),
+    > 48 |   ).toEqual(['0', '-1', '-1']);
+         |     ^
+      49 |
+      50 |   // Walk to the destructive item. The walk indexes role="menuitem",
+      51 |   // so the separator-free list here is the same list the arrows see.
+        at /home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui/e2e/tests/actions-menu.spec.ts:48:5
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/actions-menu-actions-menu--c2b62-op-and-restores-its-trigger-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/actions-menu-actions-menu--c2b62-op-and-restores-its-trigger-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/actions-menu-actions-menu--c2b62-op-and-restores-its-trigger-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/actions-menu-actions-menu--c2b62-op-and-restores-its-trigger-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  1 failed
+    [chromium] › tests/actions-menu.spec.ts:25:5 › actions menu has one tab stop and restores its trigger 
+-- control: playwright test tests/routing.spec.ts (must pass) --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/routing.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui/dist)
+
+Running 3 tests using 1 worker
+
+  ✓  1 [chromium] › tests/routing.spec.ts:8:5 › / redirects to /search and mounts the DSL editor (796ms)
+  ✓  2 [chromium] › tests/routing.spec.ts:14:5 › rail link to history navigates without a full page load (513ms)
+  ✓  3 [chromium] › tests/routing.spec.ts:31:5 › an unknown route renders the 404 page (352ms)
+
+  3 passed (2.1s)
+-- trunk build (restore pristine dist) --
+2026-09-07T07:24:41.123429Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T07:24:41.123542Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-core)
+   Compiling fleet-ui v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/fleet-ui)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.08s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T07:24:51.741833Z  INFO applying new distribution
+2026-09-07T07:24:51.744800Z  INFO ✅ success
+
+mutation-check results:
+patch                        outcome
+09-menu-roving-tabindex.patch PASS (target spec failed, control passed, exit 1)
+exit status: 0
+verdict: MUTANT KILLED (kill 1 of 5)
+
+=== run 2/5 ===
+date: 2026-09-07T00:24:51-07:00
+HEAD: c5ba6a4468e134fc7d289199deb16b9d8dec664b
+command: crates/trawl-web-ui/e2e/scripts/mutation-check.sh 09-menu-roving-tabindex.patch
+
+=== 09-menu-roving-tabindex.patch -> actions-menu.spec.ts ===
+-- trunk build --
+2026-09-07T07:24:51.775858Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T07:24:51.775964Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-core)
+   Compiling fleet-ui v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/fleet-ui)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.55s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T07:25:02.072026Z  INFO applying new distribution
+2026-09-07T07:25:02.074425Z  INFO ✅ success
+-- playwright test tests/actions-menu.spec.ts --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/actions-menu.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui/dist)
+
+Running 1 test using 1 worker
+
+  ✘  1 [chromium] › tests/actions-menu.spec.ts:25:5 › actions menu has one tab stop and restores its trigger (564ms)
+
+
+  1) [chromium] › tests/actions-menu.spec.ts:25:5 › actions menu has one tab stop and restores its trigger 
+
+    Error: expect(received).toEqual(expected) // deep equality
+
+    - Expected  - 2
+    + Received  + 2
+
+      Array [
+        "0",
+    -   "-1",
+    -   "-1",
+    +   "0",
+    +   "0",
+      ]
+
+      46 |   expect(
+      47 |     await items.evaluateAll((els) => els.map((el) => el.getAttribute('tabindex'))),
+    > 48 |   ).toEqual(['0', '-1', '-1']);
+         |     ^
+      49 |
+      50 |   // Walk to the destructive item. The walk indexes role="menuitem",
+      51 |   // so the separator-free list here is the same list the arrows see.
+        at /home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui/e2e/tests/actions-menu.spec.ts:48:5
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/actions-menu-actions-menu--c2b62-op-and-restores-its-trigger-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/actions-menu-actions-menu--c2b62-op-and-restores-its-trigger-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/actions-menu-actions-menu--c2b62-op-and-restores-its-trigger-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/actions-menu-actions-menu--c2b62-op-and-restores-its-trigger-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  1 failed
+    [chromium] › tests/actions-menu.spec.ts:25:5 › actions menu has one tab stop and restores its trigger 
+-- control: playwright test tests/routing.spec.ts (must pass) --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/routing.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui/dist)
+
+Running 3 tests using 1 worker
+
+  ✓  1 [chromium] › tests/routing.spec.ts:8:5 › / redirects to /search and mounts the DSL editor (791ms)
+  ✓  2 [chromium] › tests/routing.spec.ts:14:5 › rail link to history navigates without a full page load (509ms)
+  ✓  3 [chromium] › tests/routing.spec.ts:31:5 › an unknown route renders the 404 page (357ms)
+
+  3 passed (2.1s)
+-- trunk build (restore pristine dist) --
+2026-09-07T07:25:06.572204Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T07:25:06.572312Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-core)
+   Compiling fleet-ui v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/fleet-ui)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.38s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T07:25:15.105898Z  INFO applying new distribution
+2026-09-07T07:25:15.108796Z  INFO ✅ success
+
+mutation-check results:
+patch                        outcome
+09-menu-roving-tabindex.patch PASS (target spec failed, control passed, exit 1)
+exit status: 0
+verdict: MUTANT KILLED (kill 2 of 5)
+
+=== run 3/5 ===
+date: 2026-09-07T00:25:15-07:00
+HEAD: c5ba6a4468e134fc7d289199deb16b9d8dec664b
+command: crates/trawl-web-ui/e2e/scripts/mutation-check.sh 09-menu-roving-tabindex.patch
+
+=== 09-menu-roving-tabindex.patch -> actions-menu.spec.ts ===
+-- trunk build --
+2026-09-07T07:25:15.139825Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T07:25:15.139927Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-core)
+   Compiling fleet-ui v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/fleet-ui)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.66s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T07:25:23.932090Z  INFO applying new distribution
+2026-09-07T07:25:23.934990Z  INFO ✅ success
+-- playwright test tests/actions-menu.spec.ts --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/actions-menu.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui/dist)
+
+Running 1 test using 1 worker
+
+  ✘  1 [chromium] › tests/actions-menu.spec.ts:25:5 › actions menu has one tab stop and restores its trigger (560ms)
+
+
+  1) [chromium] › tests/actions-menu.spec.ts:25:5 › actions menu has one tab stop and restores its trigger 
+
+    Error: expect(received).toEqual(expected) // deep equality
+
+    - Expected  - 2
+    + Received  + 2
+
+      Array [
+        "0",
+    -   "-1",
+    -   "-1",
+    +   "0",
+    +   "0",
+      ]
+
+      46 |   expect(
+      47 |     await items.evaluateAll((els) => els.map((el) => el.getAttribute('tabindex'))),
+    > 48 |   ).toEqual(['0', '-1', '-1']);
+         |     ^
+      49 |
+      50 |   // Walk to the destructive item. The walk indexes role="menuitem",
+      51 |   // so the separator-free list here is the same list the arrows see.
+        at /home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui/e2e/tests/actions-menu.spec.ts:48:5
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/actions-menu-actions-menu--c2b62-op-and-restores-its-trigger-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/actions-menu-actions-menu--c2b62-op-and-restores-its-trigger-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/actions-menu-actions-menu--c2b62-op-and-restores-its-trigger-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/actions-menu-actions-menu--c2b62-op-and-restores-its-trigger-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  1 failed
+    [chromium] › tests/actions-menu.spec.ts:25:5 › actions menu has one tab stop and restores its trigger 
+-- control: playwright test tests/routing.spec.ts (must pass) --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/routing.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui/dist)
+
+Running 3 tests using 1 worker
+
+  ✓  1 [chromium] › tests/routing.spec.ts:8:5 › / redirects to /search and mounts the DSL editor (788ms)
+  ✓  2 [chromium] › tests/routing.spec.ts:14:5 › rail link to history navigates without a full page load (509ms)
+  ✓  3 [chromium] › tests/routing.spec.ts:31:5 › an unknown route renders the 404 page (340ms)
+
+  3 passed (2.1s)
+-- trunk build (restore pristine dist) --
+2026-09-07T07:25:28.405214Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T07:25:28.405319Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-core)
+   Compiling fleet-ui v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/fleet-ui)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.34s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T07:25:37.441279Z  INFO applying new distribution
+2026-09-07T07:25:37.446372Z  INFO ✅ success
+
+mutation-check results:
+patch                        outcome
+09-menu-roving-tabindex.patch PASS (target spec failed, control passed, exit 1)
+exit status: 0
+verdict: MUTANT KILLED (kill 3 of 5)
+
+=== run 4/5 ===
+date: 2026-09-07T00:25:39-07:00
+HEAD: c5ba6a4468e134fc7d289199deb16b9d8dec664b
+command: crates/trawl-web-ui/e2e/scripts/mutation-check.sh 09-menu-roving-tabindex.patch
+
+=== 09-menu-roving-tabindex.patch -> actions-menu.spec.ts ===
+-- trunk build --
+2026-09-07T07:25:39.769085Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T07:25:39.769210Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-core)
+   Compiling fleet-ui v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/fleet-ui)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.31s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T07:25:50.106665Z  INFO applying new distribution
+2026-09-07T07:25:50.109589Z  INFO ✅ success
+-- playwright test tests/actions-menu.spec.ts --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/actions-menu.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui/dist)
+
+Running 1 test using 1 worker
+
+  ✘  1 [chromium] › tests/actions-menu.spec.ts:25:5 › actions menu has one tab stop and restores its trigger (575ms)
+
+
+  1) [chromium] › tests/actions-menu.spec.ts:25:5 › actions menu has one tab stop and restores its trigger 
+
+    Error: expect(received).toEqual(expected) // deep equality
+
+    - Expected  - 2
+    + Received  + 2
+
+      Array [
+        "0",
+    -   "-1",
+    -   "-1",
+    +   "0",
+    +   "0",
+      ]
+
+      46 |   expect(
+      47 |     await items.evaluateAll((els) => els.map((el) => el.getAttribute('tabindex'))),
+    > 48 |   ).toEqual(['0', '-1', '-1']);
+         |     ^
+      49 |
+      50 |   // Walk to the destructive item. The walk indexes role="menuitem",
+      51 |   // so the separator-free list here is the same list the arrows see.
+        at /home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui/e2e/tests/actions-menu.spec.ts:48:5
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/actions-menu-actions-menu--c2b62-op-and-restores-its-trigger-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/actions-menu-actions-menu--c2b62-op-and-restores-its-trigger-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/actions-menu-actions-menu--c2b62-op-and-restores-its-trigger-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/actions-menu-actions-menu--c2b62-op-and-restores-its-trigger-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  1 failed
+    [chromium] › tests/actions-menu.spec.ts:25:5 › actions menu has one tab stop and restores its trigger 
+-- control: playwright test tests/routing.spec.ts (must pass) --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/routing.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui/dist)
+
+Running 3 tests using 1 worker
+
+  ✓  1 [chromium] › tests/routing.spec.ts:8:5 › / redirects to /search and mounts the DSL editor (793ms)
+  ✓  2 [chromium] › tests/routing.spec.ts:14:5 › rail link to history navigates without a full page load (512ms)
+  ✓  3 [chromium] › tests/routing.spec.ts:31:5 › an unknown route renders the 404 page (354ms)
+
+  3 passed (2.1s)
+-- trunk build (restore pristine dist) --
+2026-09-07T07:25:54.636667Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T07:25:54.636782Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-core)
+   Compiling fleet-ui v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/fleet-ui)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.34s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T07:26:02.848332Z  INFO applying new distribution
+2026-09-07T07:26:02.851230Z  INFO ✅ success
+
+mutation-check results:
+patch                        outcome
+09-menu-roving-tabindex.patch PASS (target spec failed, control passed, exit 1)
+exit status: 0
+verdict: MUTANT KILLED (kill 4 of 5)
+
+=== run 5/5 ===
+date: 2026-09-07T00:26:02-07:00
+HEAD: c5ba6a4468e134fc7d289199deb16b9d8dec664b
+command: crates/trawl-web-ui/e2e/scripts/mutation-check.sh 09-menu-roving-tabindex.patch
+
+=== 09-menu-roving-tabindex.patch -> actions-menu.spec.ts ===
+-- trunk build --
+2026-09-07T07:26:02.881568Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T07:26:02.881669Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-core)
+   Compiling fleet-ui v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/fleet-ui)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.52s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T07:26:11.339137Z  INFO applying new distribution
+2026-09-07T07:26:11.342195Z  INFO ✅ success
+-- playwright test tests/actions-menu.spec.ts --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/actions-menu.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui/dist)
+
+Running 1 test using 1 worker
+
+  ✘  1 [chromium] › tests/actions-menu.spec.ts:25:5 › actions menu has one tab stop and restores its trigger (567ms)
+
+
+  1) [chromium] › tests/actions-menu.spec.ts:25:5 › actions menu has one tab stop and restores its trigger 
+
+    Error: expect(received).toEqual(expected) // deep equality
+
+    - Expected  - 2
+    + Received  + 2
+
+      Array [
+        "0",
+    -   "-1",
+    -   "-1",
+    +   "0",
+    +   "0",
+      ]
+
+      46 |   expect(
+      47 |     await items.evaluateAll((els) => els.map((el) => el.getAttribute('tabindex'))),
+    > 48 |   ).toEqual(['0', '-1', '-1']);
+         |     ^
+      49 |
+      50 |   // Walk to the destructive item. The walk indexes role="menuitem",
+      51 |   // so the separator-free list here is the same list the arrows see.
+        at /home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui/e2e/tests/actions-menu.spec.ts:48:5
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/actions-menu-actions-menu--c2b62-op-and-restores-its-trigger-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/actions-menu-actions-menu--c2b62-op-and-restores-its-trigger-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/actions-menu-actions-menu--c2b62-op-and-restores-its-trigger-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/actions-menu-actions-menu--c2b62-op-and-restores-its-trigger-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  1 failed
+    [chromium] › tests/actions-menu.spec.ts:25:5 › actions menu has one tab stop and restores its trigger 
+-- control: playwright test tests/routing.spec.ts (must pass) --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/routing.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui/dist)
+
+Running 3 tests using 1 worker
+
+  ✓  1 [chromium] › tests/routing.spec.ts:8:5 › / redirects to /search and mounts the DSL editor (797ms)
+  ✓  2 [chromium] › tests/routing.spec.ts:14:5 › rail link to history navigates without a full page load (509ms)
+  ✓  3 [chromium] › tests/routing.spec.ts:31:5 › an unknown route renders the 404 page (356ms)
+
+  3 passed (2.1s)
+-- trunk build (restore pristine dist) --
+2026-09-07T07:26:15.855306Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T07:26:15.855418Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-core)
+   Compiling fleet-ui v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/fleet-ui)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.31s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T07:26:24.058112Z  INFO applying new distribution
+2026-09-07T07:26:24.060726Z  INFO ✅ success
+
+mutation-check results:
+patch                        outcome
+09-menu-roving-tabindex.patch PASS (target spec failed, control passed, exit 1)
+exit status: 0
+verdict: MUTANT KILLED (kill 5 of 5)

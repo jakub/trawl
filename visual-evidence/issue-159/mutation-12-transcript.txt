@@ -1,0 +1,241 @@
+=== run 1/1 ===
+date: 2026-09-07T00:20:22-07:00
+HEAD: c5ba6a4468e134fc7d289199deb16b9d8dec664b
+command: crates/trawl-web-ui/e2e/scripts/mutation-check.sh 12-toast-dismiss-span.patch
+
+=== 12-toast-dismiss-span.patch -> native-controls.spec.ts ===
+-- trunk build --
+2026-09-07T07:20:22.151059Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T07:20:22.151159Z  INFO 📦 starting build
+   Compiling memchr v2.8.3
+   Compiling unicode-ident v1.0.24
+   Compiling pin-project-lite v0.2.17
+   Compiling futures-core v0.3.33
+   Compiling futures-sink v0.3.33
+   Compiling cfg-if v1.0.4
+   Compiling futures-task v0.3.33
+   Compiling slab v0.4.12
+   Compiling serde_core v1.0.229
+   Compiling futures-io v0.3.33
+   Compiling once_cell v1.21.4
+   Compiling stable_deref_trait v1.2.1
+   Compiling thiserror v2.0.19
+   Compiling zerofrom v0.1.8
+   Compiling itoa v1.0.18
+   Compiling zmij v1.0.23
+   Compiling futures-channel v0.3.33
+   Compiling wasm-bindgen-shared v0.2.126
+   Compiling equivalent v1.0.2
+   Compiling crossbeam-utils v0.8.22
+   Compiling yoke v0.8.3
+   Compiling writeable v0.6.3
+   Compiling litemap v0.8.2
+   Compiling utf8_iter v1.0.4
+   Compiling or_poisoned v0.1.0
+   Compiling throw_error v0.3.1
+   Compiling hashbrown v0.17.1
+   Compiling icu_normalizer_data v2.2.0
+   Compiling icu_properties_data v2.2.0
+   Compiling send_wrapper v0.6.0
+   Compiling smallvec v1.15.2
+   Compiling proc-macro2 v1.0.107
+   Compiling slotmap v1.1.1
+   Compiling percent-encoding v2.3.2
+   Compiling wasm-bindgen v0.2.126
+   Compiling futures-util v0.3.33
+   Compiling unicode-segmentation v1.13.3
+   Compiling rustc-hash v2.1.3
+   Compiling zerovec v0.11.6
+   Compiling zerotrie v0.2.4
+   Compiling guardian v1.3.0
+   Compiling either v1.16.0
+   Compiling bytes v1.12.1
+   Compiling pin-project v1.1.13
+   Compiling concurrent-queue v2.5.0
+   Compiling aho-corasick v1.1.4
+   Compiling konst_macro_rules v0.2.19
+   Compiling regex-syntax v0.8.11
+   Compiling winnow v1.0.4
+   Compiling event-listener v5.4.1
+   Compiling quote v1.0.47
+   Compiling itertools v0.14.0
+   Compiling indexmap v2.14.0
+   Compiling konst v0.2.20
+   Compiling thiserror v1.0.69
+   Compiling form_urlencoded v1.2.2
+   Compiling either_of v0.1.9
+   Compiling event-listener-strategy v0.5.4
+   Compiling syn v2.0.119
+   Compiling tinystr v0.8.3
+   Compiling potential_utf v0.1.5
+   Compiling async-lock v3.4.2
+   Compiling http v1.4.2
+   Compiling const_str_slice_concat v0.1.0
+   Compiling icu_collections v2.2.0
+   Compiling erased v0.1.2
+   Compiling icu_locale_core v2.2.0
+   Compiling yansi v1.0.1
+   Compiling drain_filter_polyfill v0.1.3
+   Compiling next_tuple v0.1.0
+   Compiling html-escape v0.2.14
+   Compiling const_format v0.2.36
+   Compiling convert_case v0.6.0
+   Compiling base64 v0.22.1
+   Compiling toml_parser v1.1.2+spec-1.1.0
+   Compiling pathdiff v0.2.3
+   Compiling const-str v1.1.0
+   Compiling same-file v1.0.6
+   Compiling xxhash-rust v0.8.18
+   Compiling serde v1.0.229
+   Compiling serde_json v1.0.151
+   Compiling serde_spanned v1.1.1
+   Compiling toml_datetime v1.1.1+spec-1.1.0
+   Compiling walkdir v2.5.0
+   Compiling typed-builder v0.23.2
+   Compiling camino v1.2.4
+   Compiling icu_provider v2.2.0
+   Compiling anyhow v1.0.104
+   Compiling async-once-cell v0.5.4
+   Compiling num-traits v0.2.19
+   Compiling regex-automata v0.4.16
+   Compiling toml v1.1.3+spec-1.1.0
+   Compiling wasm_split_helpers v0.2.3
+   Compiling icu_properties v2.2.0
+   Compiling icu_normalizer v2.2.0
+   Compiling oco_ref v0.2.1
+   Compiling serde_qs v0.15.0
+   Compiling psm v0.1.31
+   Compiling libc v0.2.189
+   Compiling allocator-api2 v0.2.21
+   Compiling foldhash v0.1.5
+   Compiling stacker v0.1.24
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-core)
+   Compiling lazy_static v1.5.0
+   Compiling codee v0.3.5
+   Compiling trawl-api v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-api)
+   Compiling console_error_panic_hook v0.1.7
+   Compiling base64ct v1.8.3
+   Compiling hashbrown v0.15.5
+   Compiling js-sys v0.3.103
+   Compiling futures-executor v0.3.33
+   Compiling config v0.15.25
+   Compiling futures v0.3.33
+   Compiling hydration_context v0.3.1
+   Compiling idna_adapter v1.2.2
+   Compiling chumsky v0.13.0
+   Compiling idna v1.1.0
+   Compiling url v2.5.8
+   Compiling proc-macro2-diagnostics v0.10.1
+   Compiling regex v1.13.1
+   Compiling rstml v0.12.1
+   Compiling leptos_config v0.8.10
+   Compiling leptos_hot_reload v0.8.6
+   Compiling web-sys v0.3.103
+   Compiling wasm-bindgen-futures v0.4.76
+   Compiling chrono v0.4.45
+   Compiling gloo-timers v0.4.0
+   Compiling serde-wasm-bindgen v0.6.5
+   Compiling any_spawner v0.3.0
+   Compiling reactive_graph v0.2.14
+   Compiling gloo-utils v0.2.0
+   Compiling gloo-utils v0.3.0
+   Compiling gloo-net v0.6.0
+   Compiling gloo-net v0.7.0
+   Compiling wasm-streams v0.5.0
+   Compiling server_fn v0.8.13
+   Compiling reactive_stores v0.4.3
+   Compiling tachys v0.2.18
+   Compiling leptos_server v0.8.7
+   Compiling leptos_dom v0.8.8
+   Compiling leptos v0.8.20
+   Compiling leptos-use v0.19.0
+   Compiling leptos_router v0.8.15
+   Compiling leptos_meta v0.8.6
+   Compiling fleet-ui v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/fleet-ui)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 44.96s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T07:21:13.602690Z  INFO applying new distribution
+2026-09-07T07:21:13.604568Z  INFO ✅ success
+-- playwright test tests/native-controls.spec.ts --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/native-controls.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui/dist)
+
+Running 3 tests using 1 worker
+
+  ✓  1 [chromium] › tests/native-controls.spec.ts:44:5 › modal close is a named button that closes on Enter (619ms)
+  ✘  2 [chromium] › tests/native-controls.spec.ts:63:5 › toast dismiss is a named button that removes one toast (5.5s)
+  ✓  3 [chromium] › tests/native-controls.spec.ts:86:5 › bare copy button copies on Space and stops propagation (642ms)
+
+
+  1) [chromium] › tests/native-controls.spec.ts:63:5 › toast dismiss is a named button that removes one toast 
+
+    Error: expect(locator).toHaveJSProperty(expected) failed
+
+    Locator: locator('.toast button.x').first()
+    Expected: "BUTTON"
+    Timeout: 5000ms
+    Error: element(s) not found
+
+    Call log:
+      - Expect "toHaveJSProperty" with timeout 5000ms
+      - waiting for locator('.toast button.x').first()
+
+
+      72 |
+      73 |   const dismiss = page.locator(SEL.toastDismiss).first();
+    > 74 |   await expect(dismiss).toHaveJSProperty('tagName', 'BUTTON');
+         |                         ^
+      75 |   await expect(dismiss).toHaveAttribute('type', 'button');
+      76 |   await expect(dismiss).toHaveRole('button');
+      77 |   // "×" is aria-hidden, so the name is the label and not "times".
+        at /home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui/e2e/tests/native-controls.spec.ts:74:25
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/native-controls-toast-dism-9e2a4-tton-that-removes-one-toast-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/native-controls-toast-dism-9e2a4-tton-that-removes-one-toast-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/native-controls-toast-dism-9e2a4-tton-that-removes-one-toast-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/native-controls-toast-dism-9e2a4-tton-that-removes-one-toast-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  1 failed
+    [chromium] › tests/native-controls.spec.ts:63:5 › toast dismiss is a named button that removes one toast 
+  2 passed (7.7s)
+-- control: playwright test tests/routing.spec.ts (must pass) --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/routing.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui/dist)
+
+Running 3 tests using 1 worker
+
+  ✓  1 [chromium] › tests/routing.spec.ts:8:5 › / redirects to /search and mounts the DSL editor (777ms)
+  ✓  2 [chromium] › tests/routing.spec.ts:14:5 › rail link to history navigates without a full page load (510ms)
+  ✓  3 [chromium] › tests/routing.spec.ts:31:5 › an unknown route renders the 404 page (356ms)
+
+  3 passed (2.1s)
+-- trunk build (restore pristine dist) --
+2026-09-07T07:21:24.812197Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T07:21:24.812313Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-core)
+   Compiling fleet-ui v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/fleet-ui)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 8.15s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T07:21:38.806585Z  INFO applying new distribution
+2026-09-07T07:21:38.810180Z  INFO ✅ success
+
+mutation-check results:
+patch                        outcome
+12-toast-dismiss-span.patch  PASS (target spec failed, control passed, exit 1)
+exit status: 0
+verdict: MUTANT KILLED (kill 1 of 1)

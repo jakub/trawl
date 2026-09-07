@@ -1,0 +1,498 @@
+=== capture + tab-strip geometry ===
+date: 2026-09-07T00:39:00-07:00
+HEAD: c5ba6a4468e134fc7d289199deb16b9d8dec664b
+command: node crates/trawl-web-ui/e2e/scripts/capture-native-controls.mjs
+chromium 151.0.7922.34, playwright 1.62.1, viewport 1440x900
+
+This run wrote every PNG beside this file as well as the numbers.
+The 'ab' block per theme is the before/after: *Nested is the shipped
+DOM, *Flat is the same page with the [role=tablist] wrapper unwrapped
+in place, which is exactly the pre-#159 flat strip.
+
+e2e stub server listening on http://127.0.0.1:8129 (dist: /home/jakub/code/trawl-issue-159-fleet-ui-native-controls-account-menu/crates/trawl-web-ui/dist)
+light: account-menu-light.png, results-tabs-light.png, modal-header-light.png, toast-light.png, drawer-tabs-light.png
+dark: account-menu-dark.png, results-tabs-dark.png, modal-header-dark.png, toast-dark.png, drawer-tabs-dark.png
+{
+  "light": {
+    "files": [
+      "account-menu-light.png",
+      "results-tabs-light.png",
+      "modal-header-light.png",
+      "toast-light.png",
+      "drawer-tabs-light.png"
+    ],
+    "geometry": {
+      "results": {
+        "strip": {
+          "top": 199,
+          "bottom": 238.75,
+          "height": 39.75
+        },
+        "tablist": {
+          "x": 320,
+          "y": 199,
+          "width": 197,
+          "height": 38.75,
+          "top": 199,
+          "right": 517,
+          "bottom": 237.75,
+          "left": 320
+        },
+        "tabs": [
+          {
+            "name": "Events0",
+            "top": 199,
+            "bottom": 238.75,
+            "left": 320
+          },
+          {
+            "name": "Visualization",
+            "top": 199,
+            "bottom": 238.75,
+            "left": 406
+          }
+        ],
+        "meta": null,
+        "underlineOverlap": [
+          0,
+          0
+        ]
+      },
+      "drawer": {
+        "strip": {
+          "top": 62,
+          "bottom": 103.75,
+          "height": 41.75
+        },
+        "tablist": {
+          "x": 735,
+          "y": 62,
+          "width": 243,
+          "height": 40.75,
+          "top": 62,
+          "right": 978,
+          "bottom": 102.75,
+          "left": 735
+        },
+        "tabs": [
+          {
+            "name": "Overview",
+            "top": 62,
+            "bottom": 103.75,
+            "left": 735
+          },
+          {
+            "name": "Fields",
+            "top": 62,
+            "bottom": 103.75,
+            "left": 830
+          },
+          {
+            "name": "Live Tail",
+            "top": 62,
+            "bottom": 103.75,
+            "left": 900
+          }
+        ],
+        "meta": {
+          "left": 1229,
+          "right": 1426
+        },
+        "underlineOverlap": [
+          0,
+          0,
+          0
+        ]
+      }
+    },
+    "ab": {
+      "resultsNested": {
+        "strip": {
+          "top": 199,
+          "bottom": 238.75,
+          "height": 39.75
+        },
+        "tablist": {
+          "x": 320,
+          "y": 199,
+          "width": 197,
+          "height": 38.75,
+          "top": 199,
+          "right": 517,
+          "bottom": 237.75,
+          "left": 320
+        },
+        "tabs": [
+          {
+            "name": "Events0",
+            "top": 199,
+            "bottom": 238.75,
+            "left": 320
+          },
+          {
+            "name": "Visualization",
+            "top": 199,
+            "bottom": 238.75,
+            "left": 406
+          }
+        ],
+        "meta": null,
+        "underlineOverlap": [
+          0,
+          0
+        ]
+      },
+      "resultsFlat": {
+        "strip": {
+          "top": 199,
+          "bottom": 238.75,
+          "height": 39.75
+        },
+        "tablist": null,
+        "tabs": [
+          {
+            "name": "Events0",
+            "top": 199,
+            "bottom": 238.75,
+            "left": 320
+          },
+          {
+            "name": "Visualization",
+            "top": 199,
+            "bottom": 238.75,
+            "left": 406
+          }
+        ],
+        "meta": null,
+        "underlineOverlap": [
+          0,
+          0
+        ]
+      },
+      "drawerNested": {
+        "strip": {
+          "top": 62,
+          "bottom": 103.75,
+          "height": 41.75
+        },
+        "tablist": {
+          "x": 735,
+          "y": 62,
+          "width": 243,
+          "height": 40.75,
+          "top": 62,
+          "right": 978,
+          "bottom": 102.75,
+          "left": 735
+        },
+        "tabs": [
+          {
+            "name": "Overview",
+            "top": 62,
+            "bottom": 103.75,
+            "left": 735
+          },
+          {
+            "name": "Fields",
+            "top": 62,
+            "bottom": 103.75,
+            "left": 830
+          },
+          {
+            "name": "Live Tail",
+            "top": 62,
+            "bottom": 103.75,
+            "left": 900
+          }
+        ],
+        "meta": {
+          "left": 1229,
+          "right": 1426
+        },
+        "underlineOverlap": [
+          0,
+          0,
+          0
+        ]
+      },
+      "drawerFlat": {
+        "strip": {
+          "top": 62,
+          "bottom": 103.75,
+          "height": 41.75
+        },
+        "tablist": null,
+        "tabs": [
+          {
+            "name": "Overview",
+            "top": 62,
+            "bottom": 103.75,
+            "left": 735
+          },
+          {
+            "name": "Fields",
+            "top": 62,
+            "bottom": 103.75,
+            "left": 830
+          },
+          {
+            "name": "Live Tail",
+            "top": 62,
+            "bottom": 103.75,
+            "left": 900
+          }
+        ],
+        "meta": {
+          "left": 1229,
+          "right": 1426
+        },
+        "underlineOverlap": [
+          0,
+          0,
+          0
+        ]
+      }
+    }
+  },
+  "dark": {
+    "files": [
+      "account-menu-dark.png",
+      "results-tabs-dark.png",
+      "modal-header-dark.png",
+      "toast-dark.png",
+      "drawer-tabs-dark.png"
+    ],
+    "geometry": {
+      "results": {
+        "strip": {
+          "top": 199,
+          "bottom": 238.75,
+          "height": 39.75
+        },
+        "tablist": {
+          "x": 320,
+          "y": 199,
+          "width": 197,
+          "height": 38.75,
+          "top": 199,
+          "right": 517,
+          "bottom": 237.75,
+          "left": 320
+        },
+        "tabs": [
+          {
+            "name": "Events0",
+            "top": 199,
+            "bottom": 238.75,
+            "left": 320
+          },
+          {
+            "name": "Visualization",
+            "top": 199,
+            "bottom": 238.75,
+            "left": 406
+          }
+        ],
+        "meta": null,
+        "underlineOverlap": [
+          0,
+          0
+        ]
+      },
+      "drawer": {
+        "strip": {
+          "top": 62,
+          "bottom": 103.75,
+          "height": 41.75
+        },
+        "tablist": {
+          "x": 735,
+          "y": 62,
+          "width": 243,
+          "height": 40.75,
+          "top": 62,
+          "right": 978,
+          "bottom": 102.75,
+          "left": 735
+        },
+        "tabs": [
+          {
+            "name": "Overview",
+            "top": 62,
+            "bottom": 103.75,
+            "left": 735
+          },
+          {
+            "name": "Fields",
+            "top": 62,
+            "bottom": 103.75,
+            "left": 830
+          },
+          {
+            "name": "Live Tail",
+            "top": 62,
+            "bottom": 103.75,
+            "left": 900
+          }
+        ],
+        "meta": {
+          "left": 1229,
+          "right": 1426
+        },
+        "underlineOverlap": [
+          0,
+          0,
+          0
+        ]
+      }
+    },
+    "ab": {
+      "resultsNested": {
+        "strip": {
+          "top": 199,
+          "bottom": 238.75,
+          "height": 39.75
+        },
+        "tablist": {
+          "x": 320,
+          "y": 199,
+          "width": 197,
+          "height": 38.75,
+          "top": 199,
+          "right": 517,
+          "bottom": 237.75,
+          "left": 320
+        },
+        "tabs": [
+          {
+            "name": "Events0",
+            "top": 199,
+            "bottom": 238.75,
+            "left": 320
+          },
+          {
+            "name": "Visualization",
+            "top": 199,
+            "bottom": 238.75,
+            "left": 406
+          }
+        ],
+        "meta": null,
+        "underlineOverlap": [
+          0,
+          0
+        ]
+      },
+      "resultsFlat": {
+        "strip": {
+          "top": 199,
+          "bottom": 238.75,
+          "height": 39.75
+        },
+        "tablist": null,
+        "tabs": [
+          {
+            "name": "Events0",
+            "top": 199,
+            "bottom": 238.75,
+            "left": 320
+          },
+          {
+            "name": "Visualization",
+            "top": 199,
+            "bottom": 238.75,
+            "left": 406
+          }
+        ],
+        "meta": null,
+        "underlineOverlap": [
+          0,
+          0
+        ]
+      },
+      "drawerNested": {
+        "strip": {
+          "top": 62,
+          "bottom": 103.75,
+          "height": 41.75
+        },
+        "tablist": {
+          "x": 735,
+          "y": 62,
+          "width": 243,
+          "height": 40.75,
+          "top": 62,
+          "right": 978,
+          "bottom": 102.75,
+          "left": 735
+        },
+        "tabs": [
+          {
+            "name": "Overview",
+            "top": 62,
+            "bottom": 103.75,
+            "left": 735
+          },
+          {
+            "name": "Fields",
+            "top": 62,
+            "bottom": 103.75,
+            "left": 830
+          },
+          {
+            "name": "Live Tail",
+            "top": 62,
+            "bottom": 103.75,
+            "left": 900
+          }
+        ],
+        "meta": {
+          "left": 1229,
+          "right": 1426
+        },
+        "underlineOverlap": [
+          0,
+          0,
+          0
+        ]
+      },
+      "drawerFlat": {
+        "strip": {
+          "top": 62,
+          "bottom": 103.75,
+          "height": 41.75
+        },
+        "tablist": null,
+        "tabs": [
+          {
+            "name": "Overview",
+            "top": 62,
+            "bottom": 103.75,
+            "left": 735
+          },
+          {
+            "name": "Fields",
+            "top": 62,
+            "bottom": 103.75,
+            "left": 830
+          },
+          {
+            "name": "Live Tail",
+            "top": 62,
+            "bottom": 103.75,
+            "left": 900
+          }
+        ],
+        "meta": {
+          "left": 1229,
+          "right": 1426
+        },
+        "underlineOverlap": [
+          0,
+          0,
+          0
+        ]
+      }
+    }
+  }
+}
