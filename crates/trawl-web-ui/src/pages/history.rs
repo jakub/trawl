@@ -14,7 +14,6 @@
 //! page's `?page=` so switching sections leaves a clean history URL).
 
 use leptos::prelude::*;
-use leptos::web_sys;
 use leptos_router::NavigateOptions;
 use leptos_router::hooks::{use_navigate, use_query_map};
 use trawl_api::HistoryEntryResponse;
@@ -173,15 +172,23 @@ pub fn HistoryPage() -> impl IntoView {
                             // load.
                             let executed_at = h.executed_at.clone();
                             view! {
-                                <div
-                                    class="tbl-row"
-                                    on:click=move |_| on_rerun(q_for_row.clone())
-                                >
+                                <div class="tbl-row">
                                     <div style="flex:0 0 72px; color:var(--ink-3)" class="mono">
                                         <When ts=executed_at/>
                                     </div>
                                     <div style="flex:3; min-width:0" class="mono path">
-                                        {h.query.clone()}
+                                        // A command, not a place: the rerun
+                                        // goes through the navigator, which
+                                        // REFUSES a stored query long enough
+                                        // to bust the link bound (ADR-0027),
+                                        // and an anchor has no way to say no.
+                                        <button
+                                            type="button"
+                                            class="row-stretch"
+                                            on:click=move |_| on_rerun(q_for_row.clone())
+                                        >
+                                            {h.query.clone()}
+                                        </button>
                                     </div>
                                     <div style="flex:0 0 60px; text-align:right" class="mono">
                                         {events}
@@ -190,13 +197,11 @@ pub fn HistoryPage() -> impl IntoView {
                                         {duration}
                                     </div>
                                     <div style="flex:0 0 72px; text-align:right">
-                                        <span
+                                        <button
+                                            type="button"
                                             class="link"
-                                            on:click=move |e: web_sys::MouseEvent| {
-                                                e.stop_propagation();
-                                                on_save_as_net(q_for_save.clone());
-                                            }
-                                        >"Save as Net"</span>
+                                            on:click=move |_| on_save_as_net(q_for_save.clone())
+                                        >"Save as Net"</button>
                                     </div>
                                 </div>
                             }
