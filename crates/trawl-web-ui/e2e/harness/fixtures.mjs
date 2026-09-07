@@ -126,3 +126,83 @@ export function populatedListSavedResponse() {
 export function populatedServiceSchemaResponse() {
   return wire('service-schema-populated');
 }
+
+// ---- the `corpus` scenario ------------------------------------------------
+//
+// `corpus` is `populated` plus data: query rows, history, and the runs
+// surfaces. It exists because the row controls, the facet rail and the
+// results table are only reachable once something answers with rows, and
+// `default`/`populated` deliberately answer empty.
+
+/** The DSL substrings the stub dispatches `/api/v1/query` on.
+ *
+ * These are SHAPES, not whole queries: the service drawer composes its
+ * two reads in `src/drawer_query.rs` (`top_values_query` writes
+ * `| top 10 <field>`, `cardinality_query` writes `| stats dc(<f>) as …`),
+ * and the field name in each is whatever the user clicked, so the stub
+ * can only recognise the stage. `tests/e2e_wire_fixture_contract.rs`
+ * calls those two builders and asserts their output still carries these
+ * substrings, so a rewrite of either one fails a native test instead of
+ * silently routing every drawer read to the rows fixture.
+ */
+export const QUERY_SHAPES = {
+  topValues: '| top 10 ',
+  cardinality: '| stats dc(',
+};
+
+/** `POST /api/v1/query` under `corpus` for a plain search: 8 events over
+ * `_time, host, status, message`. `host` carries 6 distinct values, one
+ * more than the facet rail shows before it offers "+ 1 more", and no two
+ * sort orders of these rows agree, so a sort spec can tell ascending from
+ * descending by reading the first row. */
+export function corpusQueryRowsResponse() {
+  return wire('query-rows');
+}
+
+/** The service drawer's cardinality read. The columns are the fields of
+ * `service-schema-populated.json` (`_time`, `status`), because the drawer
+ * builds `dc(<field>) as <field>` per column of the service it mounted
+ * and reads the answer back BY COLUMN NAME. */
+export function corpusCardinalityResponse() {
+  return wire('query-cardinality');
+}
+
+/** The service drawer's top-values read. Its value column is named
+ * `value`, which `parse_top_values` accepts for ANY field, so one fixture
+ * serves whichever field the spec opened. */
+export function corpusTopValuesResponse() {
+  return wire('query-top-values');
+}
+
+/** `GET /api/v1/history` under `corpus`: one ordinary entry, and one
+ * whose query text is 32769 ASCII bytes — one over `MAX_SEARCH_BYTES`
+ * (`src/search_url.rs`), so rerunning it is refused by the navigator
+ * rather than navigated. The length is pinned natively in
+ * `tests/e2e_wire_fixture_contract.rs`. */
+export function corpusHistoryResponse() {
+  return wire('history');
+}
+
+/** `GET /api/v1/saved/{id}/runs` — two runs of net 1, one success and one
+ * error, so the net drawer's Runs tab renders rows to expand. */
+export function corpusNetRunsResponse() {
+  return wire('net-runs');
+}
+
+/** `GET /api/v1/saved/{id}/runs/{run_id}` — run 501 with its result, which
+ * is what a run row's expansion fetches. Answered for every run id: the
+ * expansion is the thing under test, not the id routing. */
+export function corpusRunResultResponse() {
+  return wire('run-result');
+}
+
+/** `GET /api/v1/runs` — the same two runs, enriched with the owning net,
+ * for the global Runs page. */
+export function corpusAllRunsResponse() {
+  return wire('runs-all');
+}
+
+/** `GET /api/v1/runs/stats` — the aggregates over those two runs. */
+export function corpusRunsStatsResponse() {
+  return wire('runs-stats');
+}

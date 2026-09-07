@@ -1,0 +1,6 @@
+{
+  "columns": [{ "name": "_time" }, { "name": "status" }],
+  "rows": [[1200, 5]],
+  "truncated": false,
+  "pagination": { "limit": 50, "offset": 0, "returned": 1 }
+}

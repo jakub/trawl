@@ -1,0 +1,17 @@
+{
+  "id": 501,
+  "query": "_severity>=error last=1h | stats count() by host",
+  "status": "success",
+  "started_at": "2026-09-01T10:00:00Z",
+  "finished_at": "2026-09-01T10:00:00.125Z",
+  "duration_ms": 125,
+  "row_count": 3,
+  "result": {
+    "columns": [{ "name": "host" }, { "name": "count" }],
+    "rows": [
+      ["web-02", 12],
+      ["edge-01", 5],
+      ["db-01", 1]
+    ]
+  }
+}

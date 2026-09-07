@@ -88,6 +88,52 @@ export const POPULATED = {
   netId: 1,
 } as const;
 
+/** What the `corpus` scenario's data is, by CONTENT.
+ *
+ * `corpus` is `populated` plus rows: the same one service and one net,
+ * with `/api/v1/query`, `/api/v1/history` and the runs routes answering
+ * with fixtures instead of empty bodies. A spec reads a row by the value
+ * in it, so every value it can assert on lives here and is pinned in
+ * `crates/trawl-web-ui/tests/e2e_wire_fixture_contract.rs` against the
+ * `harness/wire/` files.
+ */
+export const CORPUS = {
+  /** Same service and net as `populated` — `corpus` only adds data. */
+  service: POPULATED.service,
+  netId: POPULATED.netId,
+  /** The net's name, as the runs page prints it. */
+  netName: 'errors by host',
+  /** Rows in `wire/query-rows.json`. */
+  rowCount: 8,
+  /** Its columns, in wire order. */
+  columns: ['_time', 'host', 'status', 'message'] as const,
+  /** `host`'s distinct values, most frequent first, then alphabetical —
+   * the order the facet rail computes. Six of them, one past the five a
+   * group shows, so the group offers "+ 1 more". */
+  hosts: ['web-01', 'cache-01', 'db-01', 'edge-01', 'web-02', 'web-03'] as const,
+  /** How many values the `host` facet hides behind its more control. */
+  hostsHidden: 1,
+  /** The first `host` cell in wire order, and the last host
+   * alphabetically: enough to tell one sort order from the other. */
+  firstHost: 'web-01',
+  hostLastAlphabetically: 'web-03',
+  /** The two `wire/history.json` entries, newest first. */
+  history: {
+    /** The rerunnable one. */
+    query: 'service=nginx _severity>=error last=1h',
+    /** The one the navigator refuses: 32769 ASCII bytes, one over
+     * `MAX_SEARCH_BYTES` (`src/search_url.rs`). Its text is
+     * `host=` + 32764 `a`s, so a spec can match its prefix without
+     * carrying 32 KiB of literal. */
+    overBoundPrefix: 'host=aaaa',
+    overBoundBytes: 32769,
+  },
+  /** Runs of the net, newest first (`wire/net-runs.json`). */
+  runIds: [501, 502] as const,
+  /** The run whose expansion has a result body. */
+  runWithResult: 501,
+} as const;
+
 /** Re-point the stub server at a non-default scenario for this test. Call
  * at the top of the test body — `beforeEach` above already reset to
  * 'default' by the time the body runs. */
