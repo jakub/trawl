@@ -1,0 +1,39 @@
+diff --git a/crates/trawl-web-ui/src/pages/nets.rs b/crates/trawl-web-ui/src/pages/nets.rs
+index ba594633..92db4ee3 100644
+--- a/crates/trawl-web-ui/src/pages/nets.rs
++++ b/crates/trawl-web-ui/src/pages/nets.rs
+@@ -307,11 +307,33 @@ pub fn NetsPage() -> impl IntoView {
+                                     // `prop:replace` below is that call's
+                                     // `replace: true`.
+                                     let href = format!("/jobs/nets?net={id}&ntab=query");
++                                    // MUTANT: the router intercepting the
++                                    // press again.
++                                    let mutant_push = push_net.clone();
+ 
+                                     view! {
+                                         <div class="tbl-row">
+                                             <div style="flex:2" class="mono">
+-                                                <a class="row-stretch" href=href prop:replace=true>
++                                                <a
++                                                    class="row-stretch"
++                                                    href=href
++                                                    prop:replace=true
++                                                    // MUTANT: the anchor
++                                                    // cancels its own
++                                                    // default action and
++                                                    // navigates by hand,
++                                                    // whatever modifier
++                                                    // is held. A
++                                                    // Ctrl-click opens
++                                                    // the drawer on this
++                                                    // page instead of
++                                                    // going wherever the
++                                                    // browser decides.
++                                                    on:click=move |e| {
++                                                        e.prevent_default();
++                                                        mutant_push(Some(id), "query");
++                                                    }
++                                                >
+                                                     {name.clone()}
+                                                 </a>
+                                             </div>

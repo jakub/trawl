@@ -1,0 +1,21 @@
+diff --git a/crates/trawl-web-ui/src/components/results_table.rs b/crates/trawl-web-ui/src/components/results_table.rs
+index a0a6ffac..26642ce8 100644
+--- a/crates/trawl-web-ui/src/components/results_table.rs
++++ b/crates/trawl-web-ui/src/components/results_table.rs
+@@ -292,7 +292,15 @@ fn RowFragment(
+ 
+     view! {
+         <>
+-            <tr class:expanded=move || expanded.get() == Some(idx)>
++            // MUTANT: the pre-ADR-0029 whole-row handler, kept BESIDE
++            // the caret button. The button's click bubbles to the row,
++            // so one press toggles the detail twice: open, then shut.
++            <tr
++                class:expanded=move || expanded.get() == Some(idx)
++                on:click=move |_| expanded.update(|cur| {
++                    *cur = if *cur == Some(idx) { None } else { Some(idx) };
++                })
++            >
+                 <td class="exp-col">
+                     // The row's one control (ADR-0029): the caret button
+                     // stretches over the row, so a pointer anywhere on it

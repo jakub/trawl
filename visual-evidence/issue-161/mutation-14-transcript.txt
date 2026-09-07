@@ -1,0 +1,500 @@
+########## run 1 of 5 ##########
+=== 14-results-row-handler.patch -> row-controls.spec.ts ===
+-- trunk build --
+2026-09-07T23:33:42.365017Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T23:33:42.365141Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-core)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 6.32s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T23:33:54.305599Z  INFO applying new distribution
+2026-09-07T23:33:54.309342Z  INFO ✅ success
+-- playwright test tests/row-controls.spec.ts --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/row-controls.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/dist)
+
+Running 11 tests using 1 worker
+
+  ✓   1 [chromium] › tests/row-controls.spec.ts:62:5 › schema row: pointer on the query cell opens the drawer once (603ms)
+  ✓   2 [chromium] › tests/row-controls.spec.ts:98:5 › nets row: ActionsMenu opens without the drawer (559ms)
+  ✓   3 [chromium] › tests/row-controls.spec.ts:130:5 › history row: Save as Net opens the modal without a rerun (527ms)
+  ✘   4 [chromium] › tests/row-controls.spec.ts:150:5 › results row: Space expands once and leaves the detail open (5.6s)
+  ✓   5 [chromium] › tests/row-controls.spec.ts:186:5 › service field row: degraded badge opens the case without expanding (588ms)
+  ✓   6 [chromium] › tests/row-controls.spec.ts:230:5 › schema link: Space does not navigate (537ms)
+  ✓   7 [chromium] › tests/row-controls.spec.ts:252:5 › nets link: modified click leaves the page in place (532ms)
+  ✓   8 [chromium] › tests/row-controls.spec.ts:272:5 › schema drawer: Back skips the replace (621ms)
+  ✓   9 [chromium] › tests/row-controls.spec.ts:288:5 › runs link: Back returns to runs (533ms)
+  ✓  10 [chromium] › tests/row-controls.spec.ts:306:5 › history row: over-bound query is refused, not navigated (497ms)
+  ✓  11 [chromium] › tests/row-controls.spec.ts:325:5 › schema quick actions: Tab reveals and Enter searches (699ms)
+
+
+  1) [chromium] › tests/row-controls.spec.ts:150:5 › results row: Space expands once and leaves the detail open 
+
+    Error: expect(locator).toHaveCount(expected) failed
+
+    Locator:  locator('.results-table td.detail')
+    Expected: 1
+    Received: 0
+    Timeout:  5000ms
+
+    Call log:
+      - Expect "toHaveCount" with timeout 5000ms
+      - waiting for locator('.results-table td.detail')
+        14 × locator resolved to 0 elements
+           - unexpected value "0"
+
+
+      171 |   // activation per press, not two.
+      172 |   await page.keyboard.press('Enter');
+    > 173 |   await expect(page.locator(SEL.resultsDetailCell)).toHaveCount(1);
+          |                                                     ^
+      174 |   expect(await rowClicks(page)).toBe(1);
+      175 |   await page.keyboard.press('Enter');
+      176 |   await expect(page.locator(SEL.resultsDetailCell)).toHaveCount(0);
+        at /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/e2e/tests/row-controls.spec.ts:173:53
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/row-controls-results-row-S-441fc--and-leaves-the-detail-open-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/row-controls-results-row-S-441fc--and-leaves-the-detail-open-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/row-controls-results-row-S-441fc--and-leaves-the-detail-open-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/row-controls-results-row-S-441fc--and-leaves-the-detail-open-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  1 failed
+    [chromium] › tests/row-controls.spec.ts:150:5 › results row: Space expands once and leaves the detail open 
+  10 passed (12.1s)
+-- control: playwright test tests/routing.spec.ts (must pass) --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/routing.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/dist)
+
+Running 3 tests using 1 worker
+
+  ✓  1 [chromium] › tests/routing.spec.ts:8:5 › / redirects to /search and mounts the DSL editor (791ms)
+  ✓  2 [chromium] › tests/routing.spec.ts:14:5 › rail link to history navigates without a full page load (497ms)
+  ✓  3 [chromium] › tests/routing.spec.ts:31:5 › an unknown route renders the 404 page (354ms)
+
+  3 passed (2.1s)
+-- trunk build (restore pristine dist) --
+2026-09-07T23:34:09.769815Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T23:34:09.769921Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-core)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 6.28s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T23:34:21.705158Z  INFO applying new distribution
+2026-09-07T23:34:21.711676Z  INFO ✅ success
+
+mutation-check results:
+patch                                outcome
+14-results-row-handler.patch         PASS (target spec failed, control passed, exit 1)
+########## run 2 of 5 ##########
+=== 14-results-row-handler.patch -> row-controls.spec.ts ===
+-- trunk build --
+2026-09-07T23:34:21.750805Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T23:34:21.750906Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-core)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 6.50s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T23:34:34.414732Z  INFO applying new distribution
+2026-09-07T23:34:34.416201Z  INFO ✅ success
+-- playwright test tests/row-controls.spec.ts --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/row-controls.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/dist)
+
+Running 11 tests using 1 worker
+
+  ✓   1 [chromium] › tests/row-controls.spec.ts:62:5 › schema row: pointer on the query cell opens the drawer once (593ms)
+  ✓   2 [chromium] › tests/row-controls.spec.ts:98:5 › nets row: ActionsMenu opens without the drawer (553ms)
+  ✓   3 [chromium] › tests/row-controls.spec.ts:130:5 › history row: Save as Net opens the modal without a rerun (545ms)
+  ✘   4 [chromium] › tests/row-controls.spec.ts:150:5 › results row: Space expands once and leaves the detail open (5.6s)
+  ✓   5 [chromium] › tests/row-controls.spec.ts:186:5 › service field row: degraded badge opens the case without expanding (637ms)
+  ✓   6 [chromium] › tests/row-controls.spec.ts:230:5 › schema link: Space does not navigate (550ms)
+  ✓   7 [chromium] › tests/row-controls.spec.ts:252:5 › nets link: modified click leaves the page in place (530ms)
+  ✓   8 [chromium] › tests/row-controls.spec.ts:272:5 › schema drawer: Back skips the replace (627ms)
+  ✓   9 [chromium] › tests/row-controls.spec.ts:288:5 › runs link: Back returns to runs (531ms)
+  ✓  10 [chromium] › tests/row-controls.spec.ts:306:5 › history row: over-bound query is refused, not navigated (513ms)
+  ✓  11 [chromium] › tests/row-controls.spec.ts:325:5 › schema quick actions: Tab reveals and Enter searches (681ms)
+
+
+  1) [chromium] › tests/row-controls.spec.ts:150:5 › results row: Space expands once and leaves the detail open 
+
+    Error: expect(locator).toHaveCount(expected) failed
+
+    Locator:  locator('.results-table td.detail')
+    Expected: 1
+    Received: 0
+    Timeout:  5000ms
+
+    Call log:
+      - Expect "toHaveCount" with timeout 5000ms
+      - waiting for locator('.results-table td.detail')
+        14 × locator resolved to 0 elements
+           - unexpected value "0"
+
+
+      171 |   // activation per press, not two.
+      172 |   await page.keyboard.press('Enter');
+    > 173 |   await expect(page.locator(SEL.resultsDetailCell)).toHaveCount(1);
+          |                                                     ^
+      174 |   expect(await rowClicks(page)).toBe(1);
+      175 |   await page.keyboard.press('Enter');
+      176 |   await expect(page.locator(SEL.resultsDetailCell)).toHaveCount(0);
+        at /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/e2e/tests/row-controls.spec.ts:173:53
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/row-controls-results-row-S-441fc--and-leaves-the-detail-open-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/row-controls-results-row-S-441fc--and-leaves-the-detail-open-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/row-controls-results-row-S-441fc--and-leaves-the-detail-open-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/row-controls-results-row-S-441fc--and-leaves-the-detail-open-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  1 failed
+    [chromium] › tests/row-controls.spec.ts:150:5 › results row: Space expands once and leaves the detail open 
+  10 passed (12.1s)
+-- control: playwright test tests/routing.spec.ts (must pass) --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/routing.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/dist)
+
+Running 3 tests using 1 worker
+
+  ✓  1 [chromium] › tests/routing.spec.ts:8:5 › / redirects to /search and mounts the DSL editor (784ms)
+  ✓  2 [chromium] › tests/routing.spec.ts:14:5 › rail link to history navigates without a full page load (495ms)
+  ✓  3 [chromium] › tests/routing.spec.ts:31:5 › an unknown route renders the 404 page (355ms)
+
+  3 passed (2.1s)
+-- trunk build (restore pristine dist) --
+2026-09-07T23:34:50.041755Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T23:34:50.041878Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-core)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 6.33s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T23:35:02.049694Z  INFO applying new distribution
+2026-09-07T23:35:02.052150Z  INFO ✅ success
+
+mutation-check results:
+patch                                outcome
+14-results-row-handler.patch         PASS (target spec failed, control passed, exit 1)
+########## run 3 of 5 ##########
+=== 14-results-row-handler.patch -> row-controls.spec.ts ===
+-- trunk build --
+2026-09-07T23:35:02.091327Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T23:35:02.091428Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-core)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 6.21s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T23:35:14.027755Z  INFO applying new distribution
+2026-09-07T23:35:14.029607Z  INFO ✅ success
+-- playwright test tests/row-controls.spec.ts --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/row-controls.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/dist)
+
+Running 11 tests using 1 worker
+
+  ✓   1 [chromium] › tests/row-controls.spec.ts:62:5 › schema row: pointer on the query cell opens the drawer once (627ms)
+  ✓   2 [chromium] › tests/row-controls.spec.ts:98:5 › nets row: ActionsMenu opens without the drawer (540ms)
+  ✓   3 [chromium] › tests/row-controls.spec.ts:130:5 › history row: Save as Net opens the modal without a rerun (527ms)
+  ✘   4 [chromium] › tests/row-controls.spec.ts:150:5 › results row: Space expands once and leaves the detail open (5.6s)
+  ✓   5 [chromium] › tests/row-controls.spec.ts:186:5 › service field row: degraded badge opens the case without expanding (646ms)
+  ✓   6 [chromium] › tests/row-controls.spec.ts:230:5 › schema link: Space does not navigate (550ms)
+  ✓   7 [chromium] › tests/row-controls.spec.ts:252:5 › nets link: modified click leaves the page in place (523ms)
+  ✓   8 [chromium] › tests/row-controls.spec.ts:272:5 › schema drawer: Back skips the replace (594ms)
+  ✓   9 [chromium] › tests/row-controls.spec.ts:288:5 › runs link: Back returns to runs (547ms)
+  ✓  10 [chromium] › tests/row-controls.spec.ts:306:5 › history row: over-bound query is refused, not navigated (512ms)
+  ✓  11 [chromium] › tests/row-controls.spec.ts:325:5 › schema quick actions: Tab reveals and Enter searches (682ms)
+
+
+  1) [chromium] › tests/row-controls.spec.ts:150:5 › results row: Space expands once and leaves the detail open 
+
+    Error: expect(locator).toHaveCount(expected) failed
+
+    Locator:  locator('.results-table td.detail')
+    Expected: 1
+    Received: 0
+    Timeout:  5000ms
+
+    Call log:
+      - Expect "toHaveCount" with timeout 5000ms
+      - waiting for locator('.results-table td.detail')
+        14 × locator resolved to 0 elements
+           - unexpected value "0"
+
+
+      171 |   // activation per press, not two.
+      172 |   await page.keyboard.press('Enter');
+    > 173 |   await expect(page.locator(SEL.resultsDetailCell)).toHaveCount(1);
+          |                                                     ^
+      174 |   expect(await rowClicks(page)).toBe(1);
+      175 |   await page.keyboard.press('Enter');
+      176 |   await expect(page.locator(SEL.resultsDetailCell)).toHaveCount(0);
+        at /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/e2e/tests/row-controls.spec.ts:173:53
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/row-controls-results-row-S-441fc--and-leaves-the-detail-open-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/row-controls-results-row-S-441fc--and-leaves-the-detail-open-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/row-controls-results-row-S-441fc--and-leaves-the-detail-open-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/row-controls-results-row-S-441fc--and-leaves-the-detail-open-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  1 failed
+    [chromium] › tests/row-controls.spec.ts:150:5 › results row: Space expands once and leaves the detail open 
+  10 passed (12.1s)
+-- control: playwright test tests/routing.spec.ts (must pass) --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/routing.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/dist)
+
+Running 3 tests using 1 worker
+
+  ✓  1 [chromium] › tests/routing.spec.ts:8:5 › / redirects to /search and mounts the DSL editor (756ms)
+  ✓  2 [chromium] › tests/routing.spec.ts:14:5 › rail link to history navigates without a full page load (498ms)
+  ✓  3 [chromium] › tests/routing.spec.ts:31:5 › an unknown route renders the 404 page (335ms)
+
+  3 passed (2.0s)
+-- trunk build (restore pristine dist) --
+2026-09-07T23:35:29.473760Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T23:35:29.473884Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-core)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 6.33s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T23:35:41.472076Z  INFO applying new distribution
+2026-09-07T23:35:41.474211Z  INFO ✅ success
+
+mutation-check results:
+patch                                outcome
+14-results-row-handler.patch         PASS (target spec failed, control passed, exit 1)
+########## run 4 of 5 ##########
+=== 14-results-row-handler.patch -> row-controls.spec.ts ===
+-- trunk build --
+2026-09-07T23:35:41.514098Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T23:35:41.514215Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-core)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 6.36s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T23:35:53.474671Z  INFO applying new distribution
+2026-09-07T23:35:53.476806Z  INFO ✅ success
+-- playwright test tests/row-controls.spec.ts --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/row-controls.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/dist)
+
+Running 11 tests using 1 worker
+
+  ✓   1 [chromium] › tests/row-controls.spec.ts:62:5 › schema row: pointer on the query cell opens the drawer once (615ms)
+  ✓   2 [chromium] › tests/row-controls.spec.ts:98:5 › nets row: ActionsMenu opens without the drawer (575ms)
+  ✓   3 [chromium] › tests/row-controls.spec.ts:130:5 › history row: Save as Net opens the modal without a rerun (543ms)
+  ✘   4 [chromium] › tests/row-controls.spec.ts:150:5 › results row: Space expands once and leaves the detail open (5.6s)
+  ✓   5 [chromium] › tests/row-controls.spec.ts:186:5 › service field row: degraded badge opens the case without expanding (644ms)
+  ✓   6 [chromium] › tests/row-controls.spec.ts:230:5 › schema link: Space does not navigate (541ms)
+  ✓   7 [chromium] › tests/row-controls.spec.ts:252:5 › nets link: modified click leaves the page in place (549ms)
+  ✓   8 [chromium] › tests/row-controls.spec.ts:272:5 › schema drawer: Back skips the replace (630ms)
+  ✓   9 [chromium] › tests/row-controls.spec.ts:288:5 › runs link: Back returns to runs (543ms)
+  ✓  10 [chromium] › tests/row-controls.spec.ts:306:5 › history row: over-bound query is refused, not navigated (513ms)
+  ✓  11 [chromium] › tests/row-controls.spec.ts:325:5 › schema quick actions: Tab reveals and Enter searches (683ms)
+
+
+  1) [chromium] › tests/row-controls.spec.ts:150:5 › results row: Space expands once and leaves the detail open 
+
+    Error: expect(locator).toHaveCount(expected) failed
+
+    Locator:  locator('.results-table td.detail')
+    Expected: 1
+    Received: 0
+    Timeout:  5000ms
+
+    Call log:
+      - Expect "toHaveCount" with timeout 5000ms
+      - waiting for locator('.results-table td.detail')
+        14 × locator resolved to 0 elements
+           - unexpected value "0"
+
+
+      171 |   // activation per press, not two.
+      172 |   await page.keyboard.press('Enter');
+    > 173 |   await expect(page.locator(SEL.resultsDetailCell)).toHaveCount(1);
+          |                                                     ^
+      174 |   expect(await rowClicks(page)).toBe(1);
+      175 |   await page.keyboard.press('Enter');
+      176 |   await expect(page.locator(SEL.resultsDetailCell)).toHaveCount(0);
+        at /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/e2e/tests/row-controls.spec.ts:173:53
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/row-controls-results-row-S-441fc--and-leaves-the-detail-open-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/row-controls-results-row-S-441fc--and-leaves-the-detail-open-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/row-controls-results-row-S-441fc--and-leaves-the-detail-open-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/row-controls-results-row-S-441fc--and-leaves-the-detail-open-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  1 failed
+    [chromium] › tests/row-controls.spec.ts:150:5 › results row: Space expands once and leaves the detail open 
+  10 passed (12.2s)
+-- control: playwright test tests/routing.spec.ts (must pass) --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/routing.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/dist)
+
+Running 3 tests using 1 worker
+
+  ✓  1 [chromium] › tests/routing.spec.ts:8:5 › / redirects to /search and mounts the DSL editor (787ms)
+  ✓  2 [chromium] › tests/routing.spec.ts:14:5 › rail link to history navigates without a full page load (495ms)
+  ✓  3 [chromium] › tests/routing.spec.ts:31:5 › an unknown route renders the 404 page (339ms)
+
+  3 passed (2.1s)
+-- trunk build (restore pristine dist) --
+2026-09-07T23:36:09.055775Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T23:36:09.055896Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-core)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 6.34s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T23:36:21.044257Z  INFO applying new distribution
+2026-09-07T23:36:21.047135Z  INFO ✅ success
+
+mutation-check results:
+patch                                outcome
+14-results-row-handler.patch         PASS (target spec failed, control passed, exit 1)
+########## run 5 of 5 ##########
+=== 14-results-row-handler.patch -> row-controls.spec.ts ===
+-- trunk build --
+2026-09-07T23:36:21.087950Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T23:36:21.088047Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-core)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 6.34s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T23:36:33.018172Z  INFO applying new distribution
+2026-09-07T23:36:33.020467Z  INFO ✅ success
+-- playwright test tests/row-controls.spec.ts --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/row-controls.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/dist)
+
+Running 11 tests using 1 worker
+
+  ✓   1 [chromium] › tests/row-controls.spec.ts:62:5 › schema row: pointer on the query cell opens the drawer once (609ms)
+  ✓   2 [chromium] › tests/row-controls.spec.ts:98:5 › nets row: ActionsMenu opens without the drawer (561ms)
+  ✓   3 [chromium] › tests/row-controls.spec.ts:130:5 › history row: Save as Net opens the modal without a rerun (539ms)
+  ✘   4 [chromium] › tests/row-controls.spec.ts:150:5 › results row: Space expands once and leaves the detail open (5.6s)
+  ✓   5 [chromium] › tests/row-controls.spec.ts:186:5 › service field row: degraded badge opens the case without expanding (609ms)
+  ✓   6 [chromium] › tests/row-controls.spec.ts:230:5 › schema link: Space does not navigate (592ms)
+  ✓   7 [chromium] › tests/row-controls.spec.ts:252:5 › nets link: modified click leaves the page in place (531ms)
+  ✓   8 [chromium] › tests/row-controls.spec.ts:272:5 › schema drawer: Back skips the replace (622ms)
+  ✓   9 [chromium] › tests/row-controls.spec.ts:288:5 › runs link: Back returns to runs (534ms)
+  ✓  10 [chromium] › tests/row-controls.spec.ts:306:5 › history row: over-bound query is refused, not navigated (495ms)
+  ✓  11 [chromium] › tests/row-controls.spec.ts:325:5 › schema quick actions: Tab reveals and Enter searches (700ms)
+
+
+  1) [chromium] › tests/row-controls.spec.ts:150:5 › results row: Space expands once and leaves the detail open 
+
+    Error: expect(locator).toHaveCount(expected) failed
+
+    Locator:  locator('.results-table td.detail')
+    Expected: 1
+    Received: 0
+    Timeout:  5000ms
+
+    Call log:
+      - Expect "toHaveCount" with timeout 5000ms
+      - waiting for locator('.results-table td.detail')
+        14 × locator resolved to 0 elements
+           - unexpected value "0"
+
+
+      171 |   // activation per press, not two.
+      172 |   await page.keyboard.press('Enter');
+    > 173 |   await expect(page.locator(SEL.resultsDetailCell)).toHaveCount(1);
+          |                                                     ^
+      174 |   expect(await rowClicks(page)).toBe(1);
+      175 |   await page.keyboard.press('Enter');
+      176 |   await expect(page.locator(SEL.resultsDetailCell)).toHaveCount(0);
+        at /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/e2e/tests/row-controls.spec.ts:173:53
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/row-controls-results-row-S-441fc--and-leaves-the-detail-open-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/row-controls-results-row-S-441fc--and-leaves-the-detail-open-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/row-controls-results-row-S-441fc--and-leaves-the-detail-open-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/row-controls-results-row-S-441fc--and-leaves-the-detail-open-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  1 failed
+    [chromium] › tests/row-controls.spec.ts:150:5 › results row: Space expands once and leaves the detail open 
+  10 passed (12.2s)
+-- control: playwright test tests/routing.spec.ts (must pass) --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/routing.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/dist)
+
+Running 3 tests using 1 worker
+
+  ✓  1 [chromium] › tests/routing.spec.ts:8:5 › / redirects to /search and mounts the DSL editor (762ms)
+  ✓  2 [chromium] › tests/routing.spec.ts:14:5 › rail link to history navigates without a full page load (496ms)
+  ✓  3 [chromium] › tests/routing.spec.ts:31:5 › an unknown route renders the 404 page (353ms)
+
+  3 passed (2.0s)
+-- trunk build (restore pristine dist) --
+2026-09-07T23:36:48.656724Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T23:36:48.656837Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-core)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 6.32s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T23:37:00.600561Z  INFO applying new distribution
+2026-09-07T23:37:00.603349Z  INFO ✅ success
+
+mutation-check results:
+patch                                outcome
+14-results-row-handler.patch         PASS (target spec failed, control passed, exit 1)

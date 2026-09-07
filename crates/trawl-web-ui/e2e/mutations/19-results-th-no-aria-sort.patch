@@ -1,0 +1,19 @@
+diff --git a/crates/trawl-web-ui/src/components/results_table.rs b/crates/trawl-web-ui/src/components/results_table.rs
+index a0a6ffac..fd8b970b 100644
+--- a/crates/trawl-web-ui/src/components/results_table.rs
++++ b/crates/trawl-web-ui/src/components/results_table.rs
+@@ -102,11 +102,9 @@ fn ResultsTableBody(
+             <th
+                 class="sortable"
+                 class:sorted=move || sort.get().is_some_and(|s| s.col == i)
+-                aria-sort=move || {
+-                    sort.get()
+-                        .filter(|s| s.col == i)
+-                        .map(|s| if s.asc { "ascending" } else { "descending" })
+-                }
++                // MUTANT: no aria-sort. The header still sorts and the
++                // glyph still turns, but the sorted column and its
++                // direction are announced nowhere.
+             >
+                 <button
+                     type="button"

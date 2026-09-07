@@ -1,0 +1,90 @@
+=== 19-results-th-no-aria-sort.patch -> sort-headers.spec.ts ===
+-- trunk build --
+2026-09-07T23:33:05.512779Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T23:33:05.512885Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-core)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 6.19s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T23:33:18.582666Z  INFO applying new distribution
+2026-09-07T23:33:18.586683Z  INFO ✅ success
+-- playwright test tests/sort-headers.spec.ts --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/sort-headers.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/dist)
+
+Running 3 tests using 1 worker
+
+  ✘  1 [chromium] › tests/sort-headers.spec.ts:41:5 › results th: aria-sort follows the sorted column (642ms)
+  ✓  2 [chromium] › tests/sort-headers.spec.ts:77:5 › schema header: Enter sorts, Space reverses (565ms)
+  ✓  3 [chromium] › tests/sort-headers.spec.ts:115:5 › service fields: name header keeps ascending default (554ms)
+
+
+  1) [chromium] › tests/sort-headers.spec.ts:41:5 › results th: aria-sort follows the sorted column 
+
+    Error: expect(received).toEqual(expected) // deep equality
+
+    - Expected  - 1
+    + Received  + 1
+
+      Array [
+        null,
+    -   "descending",
+    +   null,
+        null,
+        null,
+      ]
+
+      59 |
+      60 |   await page.keyboard.press('Enter');
+    > 61 |   expect(await ariaSorts(page)).toEqual([null, 'descending', null, null]);
+         |                                 ^
+      62 |   await expect(page.locator(SEL.resultsRow).first().locator('td').nth(2)).toHaveText(
+      63 |     CORPUS.hostLastAlphabetically,
+      64 |   );
+        at /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/e2e/tests/sort-headers.spec.ts:61:33
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/sort-headers-results-th-aria-sort-follows-the-sorted-column-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/sort-headers-results-th-aria-sort-follows-the-sorted-column-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/sort-headers-results-th-aria-sort-follows-the-sorted-column-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/sort-headers-results-th-aria-sort-follows-the-sorted-column-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  1 failed
+    [chromium] › tests/sort-headers.spec.ts:41:5 › results th: aria-sort follows the sorted column ─
+  2 passed (2.5s)
+-- control: playwright test tests/routing.spec.ts (must pass) --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/routing.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/dist)
+
+Running 3 tests using 1 worker
+
+  ✓  1 [chromium] › tests/routing.spec.ts:8:5 › / redirects to /search and mounts the DSL editor (769ms)
+  ✓  2 [chromium] › tests/routing.spec.ts:14:5 › rail link to history navigates without a full page load (496ms)
+  ✓  3 [chromium] › tests/routing.spec.ts:31:5 › an unknown route renders the 404 page (338ms)
+
+  3 passed (2.0s)
+-- trunk build (restore pristine dist) --
+2026-09-07T23:33:24.440140Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T23:33:24.440261Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-core)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 6.86s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T23:33:37.000514Z  INFO applying new distribution
+2026-09-07T23:33:37.002914Z  INFO ✅ success
+
+mutation-check results:
+patch                                outcome
+19-results-th-no-aria-sort.patch     PASS (target spec failed, control passed, exit 1)
