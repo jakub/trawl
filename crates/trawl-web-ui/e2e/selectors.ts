@@ -365,6 +365,16 @@ export const COPY = {
   /// dialog's own name. Not a format string.
   rangeDialogName: 'Time range',
 
+  // -- column labels a sort name is built from ------------------------
+  /// crates/trawl-web-ui/src/pages/schema.rs — the services table's
+  /// seeded sort column, and the one the spec presses.
+  schemaServiceHeader: 'Service',
+  schemaEventsHeader: 'Events',
+  /// crates/trawl-web-ui/src/components/service_drawer.rs — the field
+  /// list's name column and its seeded sort column.
+  serviceFieldHeader: 'Field',
+  serviceCardinalityHeader: 'Cardinality',
+
   // -- the DSL shapes the stub dispatches on --------------------------
   // Not copy the user sees: the substrings `harness/server.mjs` keys
   // `/api/v1/query` on under the `corpus` scenario. A spec asserts the

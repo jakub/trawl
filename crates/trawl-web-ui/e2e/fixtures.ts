@@ -135,6 +135,13 @@ export const CORPUS = {
    * `wire/catalog-field.json`'s field, so the case file the badge opens
    * is about the field the badge sits on. */
   degradedField: 'duration',
+  /** The corpus service's field names at the ends of an alphabetical
+   * sort (`_time`, `duration`, `status` in `wire/service-schema-corpus
+   * .json`). The drawer's Field header is the one column whose natural
+   * direction is ascending, so both ends are needed to tell its two
+   * presses apart. */
+  fieldFirstAlphabetically: '_time',
+  fieldLastAlphabetically: 'status',
   /** Runs of the net, newest first (`wire/net-runs.json`). */
   runIds: [501, 502] as const,
   /** The run whose expansion has a result body. */

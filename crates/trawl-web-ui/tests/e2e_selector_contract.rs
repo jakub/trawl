@@ -1048,6 +1048,30 @@ const CONTRACTS: &[Contract] = &[
         source: EDITOR_WRAP_RS,
         hook: "aria-label=\"Time range\"",
     },
+    Contract {
+        assignment: "schemaServiceHeader: 'Service',",
+        source_path: "src/pages/schema.rs",
+        source: SCHEMA_RS,
+        hook: "\"Service\", \"flex:2",
+    },
+    Contract {
+        assignment: "schemaEventsHeader: 'Events',",
+        source_path: "src/pages/schema.rs",
+        source: SCHEMA_RS,
+        hook: "\"Events\", \"flex:0",
+    },
+    Contract {
+        assignment: "serviceFieldHeader: 'Field',",
+        source_path: "src/components/service_drawer.rs",
+        source: SERVICE_DRAWER_RS,
+        hook: "SortKey::Name.default_desc(), \"Field\"",
+    },
+    Contract {
+        assignment: "serviceCardinalityHeader: 'Cardinality',",
+        source_path: "src/components/service_drawer.rs",
+        source: SERVICE_DRAWER_RS,
+        hook: "SortKey::Cardinality.default_desc(), \"Cardinality\"",
+    },
     // -- the DSL shapes the stub dispatches on --------------------------
     // `e2e_wire_fixture_contract.rs` proves these against the builders by
     // CALLING them, which is the stronger half; these rows keep the
