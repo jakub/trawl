@@ -97,6 +97,7 @@ pub fn EditorWrap(
                         blocked=blocked
                     />
                     <button
+                        type="button"
                         class="run"
                         class:running=move || running.get()
                         disabled=move || running.get() || blocked.get()
@@ -127,10 +128,14 @@ pub fn EditorWrap(
                             text=share_text
                             success_detail="Search URL copied to clipboard."
                         >"Share"</CopyButton>
-                        <span
+                        // Same reason as Save above, plus the plain one:
+                        // Format acts on click, so it is a button and the
+                        // keyboard reaches it (ADR-0028).
+                        <button
+                            type="button"
                             class="tool"
                             on:click=do_format
-                        >"Format"</span>
+                        >"Format"</button>
                     </div>
                 </div>
             </div>
@@ -304,6 +309,12 @@ fn DateRangePopover(
                                     type="button"
                                     class="opt"
                                     class:on=move || is_on.get()
+                                    // The picked preset is a pressed
+                                    // state, not a disabled one: the
+                                    // grid is a set of toggles and the
+                                    // .on class alone says nothing to a
+                                    // screen reader.
+                                    aria-pressed=move || is_on.get().to_string()
                                     disabled=move || blocked.get()
                                     on:click=move |_| apply_quick(q)
                                 >{format!("Last {q}")}</button>
