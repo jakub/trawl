@@ -64,11 +64,67 @@ const TYPE_BUTTON: &str = "type=\"button\"";
 /// a module doc that explains why an affordance was retired names the
 /// affordance, and prose is not markup. Same trick as trawl-core's
 /// `now_anchor_contract`.
+///
+/// Block comments go first, counting nesting the way rustc does, then
+/// any line whose first non-space characters are `//`, which covers
+/// `//`, `///` and `//!` alike. A trailing comment after code on the
+/// same line stays: removing it would need to know where string
+/// literals end, and a literal is where hooks like `title="Close
+/// (Esc)"` legitimately live. `view!` markup is not a string literal,
+/// so nothing here strips quoted text.
 fn markup_only(src: &str) -> String {
-    src.lines()
+    let bytes = src.as_bytes();
+    let mut kept: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut depth = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i..].starts_with(b"/*") {
+            depth += 1;
+            i += 2;
+        } else if depth > 0 && bytes[i..].starts_with(b"*/") {
+            depth -= 1;
+            i += 2;
+        } else {
+            // Byte-wise: outside a comment every byte is copied, so a
+            // multi-byte character survives intact; inside one only the
+            // newline is kept, which cannot split a character.
+            if depth == 0 {
+                kept.push(bytes[i]);
+            } else if bytes[i] == b'\n' {
+                kept.push(b'\n');
+            }
+            i += 1;
+        }
+    }
+    let stripped =
+        String::from_utf8(kept).expect("dropping whole comment spans keeps the rest valid");
+    stripped
+        .lines()
         .filter(|line| !line.trim_start().starts_with("//"))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[test]
+fn markup_only_hides_prose_and_keeps_markup() {
+    for (label, src) in [
+        ("///", "/// class=\"iconbtn\"\nfn f() {}\n"),
+        ("//!", "//! class=\"iconbtn\"\nfn f() {}\n"),
+        ("//", "// class=\"iconbtn\"\nfn f() {}\n"),
+        ("/* */", "/* class=\"iconbtn\" */\nfn f() {}\n"),
+        ("nested /* */", "/* a /* b */ class=\"iconbtn\" */\n"),
+    ] {
+        assert!(
+            !markup_only(src).contains("class=\"iconbtn\""),
+            "a hook living only in a {label} comment must not satisfy a \
+             positive scan, nor defeat a negative one — prose is not markup"
+        );
+    }
+    assert!(
+        markup_only("view! { <span class=\"iconbtn\"></span> } // why\n")
+            .contains("class=\"iconbtn\""),
+        "real markup must survive stripping, trailing comment and all"
+    );
 }
 
 /// Assert `src` contains `hook` (a class literal or class-idiom substring),

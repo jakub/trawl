@@ -9,8 +9,10 @@
 //! contract hold: each exported entry's full `key: 'value',` assignment
 //! appears verbatim in `selectors.ts` (assignment-level, so a key's value
 //! can't rot while the old string survives in another entry), and the
-//! "hook" substring the selector is built from still appears in the Rust
-//! (or fleet-ui) source file that emits it. Same `include_str!`-and-scan
+//! "hook" substring the selector is built from still appears in a
+//! comment-stripped view of the Rust (or fleet-ui) source file that
+//! emits it, so prose describing markup cannot answer for markup that
+//! was deleted. Same `include_str!`-and-scan
 //! idiom as `crates/fleet-ui/tests/component_class_contract.rs`, aimed
 //! at the e2e suite's selector sheet instead of a stylesheet.
 //!
@@ -584,11 +586,96 @@ fn every_selector_assignment_appears_in_selectors_ts() {
     }
 }
 
+/// `src` with its comments removed, so a hook can only be satisfied by
+/// something the component actually renders.
+///
+/// A module doc that explains a contract quotes the markup it describes
+/// (`menu.rs`'s doc names `role="menuitem"` in prose), so a raw
+/// `contains` let the guard stay green after the attribute was deleted
+/// from the button: the prose alone answered for it.
+///
+/// Block comments are removed first, counting nesting the way rustc
+/// does; then any line whose first non-space characters are `//` goes,
+/// which covers `//`, `///` and `//!` alike. A trailing comment after
+/// code on the same line survives on purpose: stripping it would need
+/// to know where string literals end, and `'https://…'` inside a
+/// literal is exactly the kind of hook this file pins. String literals
+/// stay in for the same reason — `title="Close (Esc)"` is real markup.
+/// The block scan does not know string literals either, so a source
+/// carrying a literal `/*` would over-strip; none of the files below
+/// has one, and a hook that vanished for that reason fails loudly.
+fn comment_stripped(src: &str) -> String {
+    let bytes = src.as_bytes();
+    let mut kept: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut depth = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i..].starts_with(b"/*") {
+            depth += 1;
+            i += 2;
+        } else if depth > 0 && bytes[i..].starts_with(b"*/") {
+            depth -= 1;
+            i += 2;
+        } else {
+            if depth == 0 {
+                // Byte-wise, so a multi-byte character outside a comment
+                // is copied through unchanged; inside one every byte but
+                // the newline is dropped, which cannot split a character.
+                kept.push(bytes[i]);
+            } else if bytes[i] == b'\n' {
+                // Keep the newline so line-comment stripping below still
+                // sees real lines.
+                kept.push(b'\n');
+            }
+            i += 1;
+        }
+    }
+    let out = String::from_utf8(kept).expect("dropping whole comment spans keeps the rest valid");
+    out.lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn comment_stripped_hides_prose_and_keeps_markup() {
+    let doc_comment = "/// role=\"menuitem\"\nfn f() {}\n";
+    let inner_doc = "//! role=\"menuitem\"\nfn f() {}\n";
+    let line_comment = "// role=\"menuitem\"\nfn f() {}\n";
+    let block_comment = "/* role=\"menuitem\" */\nfn f() {}\n";
+    let markup = "view! { <button role=\"menuitem\">\"x\"</button> }\n";
+    for (label, src) in [
+        ("///", doc_comment),
+        ("//!", inner_doc),
+        ("//", line_comment),
+        ("/* */", block_comment),
+    ] {
+        assert!(
+            !comment_stripped(src).contains("role=\"menuitem\""),
+            "a hook living only in a {label} comment must not satisfy the \
+             drift guard — prose is not markup"
+        );
+    }
+    assert!(
+        comment_stripped(markup).contains("role=\"menuitem\""),
+        "a hook in real markup must survive stripping"
+    );
+    // Nesting, and a hook that shares a line with a trailing comment.
+    assert!(
+        !comment_stripped("/* a /* b */ role=\"menuitem\" */\n").contains("role=\"menuitem\""),
+        "nested block comments must be stripped whole, as rustc reads them"
+    );
+    assert!(
+        comment_stripped("<button role=\"menuitem\"> // why\n").contains("role=\"menuitem\""),
+        "a trailing comment after code must not take the code with it"
+    );
+}
+
 #[test]
 fn every_source_hook_still_exists() {
     for c in CONTRACTS {
         assert!(
-            c.source.contains(c.hook),
+            comment_stripped(c.source).contains(c.hook),
             "{} no longer contains the hook `{}` that e2e/selectors.ts's \
              `{}` assignment is built from — the Playwright suite would \
              then be asserting against markup that doesn't exist. Update \
