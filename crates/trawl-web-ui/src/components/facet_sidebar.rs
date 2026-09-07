@@ -151,6 +151,15 @@ pub fn FacetSidebar(
                                                         type="button"
                                                         class="op"
                                                         aria-label=inc_label
+                                                        // The glyph says
+                                                        // nothing on sight, so
+                                                        // the hover tooltip is
+                                                        // the pointer user's
+                                                        // only reading of it.
+                                                        // The verb alone: the
+                                                        // field and value are
+                                                        // on the row already.
+                                                        title="Include"
                                                         on:click=move |_| {
                                                             on_add.run(Filter {
                                                                 field: field_for_inc.clone(),
@@ -163,6 +172,7 @@ pub fn FacetSidebar(
                                                         type="button"
                                                         class="op"
                                                         aria-label=exc_label
+                                                        title="Exclude"
                                                         on:click=move |_| {
                                                             on_add.run(Filter {
                                                                 field: field_for_exc.clone(),

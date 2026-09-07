@@ -140,6 +140,10 @@ pub fn NetDrawer(
                                 type="button"
                                 class="name"
                                 aria-label=format!("Rename {name}")
+                                // The title looks like the drawer's
+                                // heading, so nothing but the tooltip
+                                // tells a pointer user it can be edited.
+                                title="Rename"
                                 on:click=move |_| editing_name.set(true)
                             >{name.clone()}</button>
                         }
