@@ -85,10 +85,6 @@ pub fn NetsPage() -> impl IntoView {
         }
     };
 
-    let on_open: Callback<i64> = {
-        let push = push_net.clone();
-        Callback::new(move |id: i64| push(Some(id), "query"))
-    };
     let on_tab_change: Callback<String> = {
         let push = push_net.clone();
         Callback::new(move |ntab: String| {
@@ -305,17 +301,30 @@ pub fn NetsPage() -> impl IntoView {
                                         }.into_any(),
                                     };
 
+                                    // The drawer is a place with a URL, so
+                                    // the row's one control is a link built
+                                    // by the same producer `push_net` uses;
+                                    // `prop:replace` below is that call's
+                                    // `replace: true`.
+                                    let href = format!("/jobs/nets?net={id}&ntab=query");
+
                                     view! {
-                                        <div
-                                            class="tbl-row"
-                                            on:click=move |_| on_open.run(id)
-                                        >
-                                            <div style="flex:2" class="mono">{name.clone()}</div>
+                                        <div class="tbl-row">
+                                            <div style="flex:2" class="mono">
+                                                <a class="row-stretch" href=href prop:replace=true>
+                                                    {name.clone()}
+                                                </a>
+                                            </div>
                                             <div style="flex:3; min-width:0" class="mono path">{query_text}</div>
                                             <div style="flex:0 0 80px">{sched_badge}</div>
                                             <div style="flex:0 0 140px">{last_run_view}</div>
                                             <div style="flex:0 0 90px" class="mono">{created}</div>
-                                            <div style="flex:0 0 40px">
+                                            // `row-menu` lifts the trigger above
+                                            // the row control's stretched
+                                            // pseudo-element; the base
+                                            // `.actions-menu` rule belongs to
+                                            // fleet-ui and stays there.
+                                            <div class="row-menu" style="flex:0 0 40px">
                                                 // fleet_ui::ActionsMenu owns the ⋯ trigger, the
                                                 // open state, and Escape/outside-click dismissal
                                                 // via the overlay stack.
