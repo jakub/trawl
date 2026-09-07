@@ -46,6 +46,17 @@ const MENU_RS: &str = include_str!("../../fleet-ui/src/menu.rs");
 const TABS_RS: &str = include_str!("../../fleet-ui/src/tabs.rs");
 const ACTIONS_MENU_RS: &str = include_str!("../../fleet-ui/src/actions_menu.rs");
 const COPY_BUTTON_RS: &str = include_str!("../../fleet-ui/src/copy_button.rs");
+const SCHEMA_RS: &str = include_str!("../src/pages/schema.rs");
+const NETS_RS: &str = include_str!("../src/pages/nets.rs");
+const RUNS_RS: &str = include_str!("../src/pages/runs.rs");
+const SORT_TH_RS: &str = include_str!("../src/components/sort_th.rs");
+const SORT_LABEL_RS: &str = include_str!("../src/sort_label.rs");
+const SERVICE_DRAWER_RS: &str = include_str!("../src/components/service_drawer.rs");
+const NET_DRAWER_RS: &str = include_str!("../src/components/net_drawer.rs");
+const FACET_SIDEBAR_RS: &str = include_str!("../src/components/facet_sidebar.rs");
+const STATUS_BAR_RS: &str = include_str!("../src/components/status_bar.rs");
+const DRAWER_QUERY_RS: &str = include_str!("../src/drawer_query.rs");
+const SEGMENTED_COMPONENT_RS: &str = include_str!("../../fleet-ui/src/segmented/component.rs");
 
 /// One (assignment, source file, hook) triple: `assignment` is the full
 /// `key: 'value',` line as it appears in `selectors.ts`, and `hook` must
@@ -567,6 +578,497 @@ const CONTRACTS: &[Contract] = &[
         source_path: "../fleet-ui/src/topbar.rs",
         source: TOPBAR_RS,
         hook: "menu_label=\"Account\"",
+    },
+    // -- the stretched row control and its neighbours (ADR-0029) ------
+    // `tableRow` reaches four pages' rows, so it is pinned in all four:
+    // a page that stops rendering `.tbl-row` would otherwise leave its
+    // specs matching nothing and passing their `toHaveCount(0)` half.
+    Contract {
+        assignment: "tableRow: '.tbl-body .tbl-row',",
+        source_path: "src/pages/schema.rs",
+        source: SCHEMA_RS,
+        hook: "class=\"tbl-body\"",
+    },
+    Contract {
+        assignment: "tableRow: '.tbl-body .tbl-row',",
+        source_path: "src/pages/schema.rs",
+        source: SCHEMA_RS,
+        hook: "class=\"tbl-row\"",
+    },
+    Contract {
+        assignment: "tableRow: '.tbl-body .tbl-row',",
+        source_path: "src/pages/nets.rs",
+        source: NETS_RS,
+        hook: "class=\"tbl-row\"",
+    },
+    Contract {
+        assignment: "tableRow: '.tbl-body .tbl-row',",
+        source_path: "src/pages/runs.rs",
+        source: RUNS_RS,
+        hook: "class=\"tbl-row\"",
+    },
+    Contract {
+        assignment: "tableRow: '.tbl-body .tbl-row',",
+        source_path: "src/pages/history.rs",
+        source: HISTORY_RS,
+        hook: "class=\"tbl-row\"",
+    },
+    // Same four pages for the control itself: the class is what carries
+    // the stretching `::after`, so losing it on one page is losing that
+    // page's whole-row pointer target.
+    Contract {
+        assignment: "rowStretch: '.row-stretch',",
+        source_path: "src/pages/schema.rs",
+        source: SCHEMA_RS,
+        hook: "class=\"row-stretch\"",
+    },
+    Contract {
+        assignment: "rowStretch: '.row-stretch',",
+        source_path: "src/pages/nets.rs",
+        source: NETS_RS,
+        hook: "class=\"row-stretch\"",
+    },
+    Contract {
+        assignment: "rowStretch: '.row-stretch',",
+        source_path: "src/pages/runs.rs",
+        source: RUNS_RS,
+        hook: "class=\"row-stretch\"",
+    },
+    Contract {
+        assignment: "rowStretch: '.row-stretch',",
+        source_path: "src/pages/history.rs",
+        source: HISTORY_RS,
+        hook: "class=\"row-stretch\"",
+    },
+    Contract {
+        assignment: "schemaQuickAction: '.tbl-row .row-act .qa',",
+        source_path: "src/pages/schema.rs",
+        source: SCHEMA_RS,
+        hook: "class=\"row-act\"",
+    },
+    Contract {
+        assignment: "schemaQuickAction: '.tbl-row .row-act .qa',",
+        source_path: "src/pages/schema.rs",
+        source: SCHEMA_RS,
+        hook: "class=\"qa\"",
+    },
+    // Two files: the header band belongs to the page, the control
+    // inside it to the shared helper.
+    Contract {
+        assignment: "tableSortControl: '.tbl-hd .th.sortable button',",
+        source_path: "src/pages/schema.rs",
+        source: SCHEMA_RS,
+        hook: "class=\"tbl-hd\"",
+    },
+    Contract {
+        assignment: "tableSortControl: '.tbl-hd .th.sortable button',",
+        source_path: "src/pages/nets.rs",
+        source: NETS_RS,
+        hook: "class=\"tbl-hd\"",
+    },
+    Contract {
+        assignment: "tableSortControl: '.tbl-hd .th.sortable button',",
+        source_path: "src/components/sort_th.rs",
+        source: SORT_TH_RS,
+        hook: "class=\"th sortable\"",
+    },
+    Contract {
+        assignment: "historySaveAsNet: '.tbl-row button.link',",
+        source_path: "src/pages/history.rs",
+        source: HISTORY_RS,
+        hook: "class=\"link\"",
+    },
+    // -- results table --------------------------------------------------
+    Contract {
+        assignment: "resultsRow: '.results-table tbody tr',",
+        source_path: "src/components/results_table.rs",
+        source: RESULTS_TABLE_RS,
+        hook: "class=\"results-table\"",
+    },
+    Contract {
+        assignment: "resultsRow: '.results-table tbody tr',",
+        source_path: "src/components/results_table.rs",
+        source: RESULTS_TABLE_RS,
+        hook: "<tbody>",
+    },
+    Contract {
+        assignment: "resultsExpandControl: '.results-table td.exp-col button.row-stretch',",
+        source_path: "src/components/results_table.rs",
+        source: RESULTS_TABLE_RS,
+        hook: "class=\"exp-col\"",
+    },
+    Contract {
+        assignment: "resultsExpandControl: '.results-table td.exp-col button.row-stretch',",
+        source_path: "src/components/results_table.rs",
+        source: RESULTS_TABLE_RS,
+        hook: "class=\"row-stretch\"",
+    },
+    Contract {
+        assignment: "resultsDetailCell: '.results-table td.detail',",
+        source_path: "src/components/results_table.rs",
+        source: RESULTS_TABLE_RS,
+        hook: "class=\"detail\"",
+    },
+    Contract {
+        assignment: "resultsDetailTag: '.results-table td.detail button.tag',",
+        source_path: "src/components/results_table.rs",
+        source: RESULTS_TABLE_RS,
+        hook: "class=\"tag\"",
+    },
+    Contract {
+        assignment: "resultsSortHeader: '.results-table th.sortable',",
+        source_path: "src/components/results_table.rs",
+        source: RESULTS_TABLE_RS,
+        hook: "class=\"sortable\"",
+    },
+    // The direction attribute the spec reads off that header. Pinned
+    // separately: a `<th class="sortable">` with no `aria-sort` is
+    // exactly mutation 19, and the selector alone cannot see it.
+    Contract {
+        assignment: "resultsSortHeader: '.results-table th.sortable',",
+        source_path: "src/components/results_table.rs",
+        source: RESULTS_TABLE_RS,
+        hook: "aria-sort=move ||",
+    },
+    Contract {
+        assignment: "resultsSortControl: '.results-table th.sortable button.th-sort',",
+        source_path: "src/components/results_table.rs",
+        source: RESULTS_TABLE_RS,
+        hook: "class=\"th-sort\"",
+    },
+    // -- service drawer -------------------------------------------------
+    Contract {
+        assignment: "serviceFieldRow: '.sd-fields .sf-row',",
+        source_path: "src/components/service_drawer.rs",
+        source: SERVICE_DRAWER_RS,
+        hook: "class=\"sd-fields\"",
+    },
+    // The row class is computed (`sf-row` / `sf-row open`), so the hook
+    // is the literal inside that closure rather than an attribute.
+    Contract {
+        assignment: "serviceFieldRow: '.sd-fields .sf-row',",
+        source_path: "src/components/service_drawer.rs",
+        source: SERVICE_DRAWER_RS,
+        hook: "\"sf-row\"",
+    },
+    Contract {
+        assignment: "serviceFieldToggle: '.sf-row button.row-stretch',",
+        source_path: "src/components/service_drawer.rs",
+        source: SERVICE_DRAWER_RS,
+        hook: "class=\"row-stretch\"",
+    },
+    Contract {
+        assignment: "serviceDegradedBadge: '.sf-row button.deg-btn',",
+        source_path: "src/components/service_drawer.rs",
+        source: SERVICE_DRAWER_RS,
+        hook: "class=\"deg-btn\"",
+    },
+    Contract {
+        assignment: "serviceFieldSortControl: '.sf-hd .th.sortable button',",
+        source_path: "src/components/service_drawer.rs",
+        source: SERVICE_DRAWER_RS,
+        hook: "class=\"sf-hd\"",
+    },
+    Contract {
+        assignment: "serviceFieldSortControl: '.sf-hd .th.sortable button',",
+        source_path: "src/components/sort_th.rs",
+        source: SORT_TH_RS,
+        hook: "class=\"th sortable\"",
+    },
+    Contract {
+        assignment: "serviceTopField: '.topfields .tf button.fn',",
+        source_path: "src/components/service_drawer.rs",
+        source: SERVICE_DRAWER_RS,
+        hook: "class=\"topfields\"",
+    },
+    Contract {
+        assignment: "serviceTopField: '.topfields .tf button.fn',",
+        source_path: "src/components/service_drawer.rs",
+        source: SERVICE_DRAWER_RS,
+        hook: "class=\"tf\"",
+    },
+    Contract {
+        assignment: "serviceTopField: '.topfields .tf button.fn',",
+        source_path: "src/components/service_drawer.rs",
+        source: SERVICE_DRAWER_RS,
+        hook: "class=\"fn row-stretch\"",
+    },
+    // -- facet rail -----------------------------------------------------
+    Contract {
+        assignment: "facetGroup: '.facets .g',",
+        source_path: "src/components/facet_sidebar.rs",
+        source: FACET_SIDEBAR_RS,
+        hook: "class=\"facets\"",
+    },
+    Contract {
+        assignment: "facetGroup: '.facets .g',",
+        source_path: "src/components/facet_sidebar.rs",
+        source: FACET_SIDEBAR_RS,
+        hook: "class=\"g\"",
+    },
+    Contract {
+        assignment: "facetGroupHeader: '.facets button.g-hd',",
+        source_path: "src/components/facet_sidebar.rs",
+        source: FACET_SIDEBAR_RS,
+        hook: "class=\"g-hd\"",
+    },
+    Contract {
+        assignment: "facetValue: '.facets .v',",
+        source_path: "src/components/facet_sidebar.rs",
+        source: FACET_SIDEBAR_RS,
+        hook: "class=\"v\"",
+    },
+    Contract {
+        assignment: "facetValueName: '.facets .v .n',",
+        source_path: "src/components/facet_sidebar.rs",
+        source: FACET_SIDEBAR_RS,
+        hook: "class=\"n\"",
+    },
+    Contract {
+        assignment: "facetActions: '.facets .v .act',",
+        source_path: "src/components/facet_sidebar.rs",
+        source: FACET_SIDEBAR_RS,
+        hook: "class=\"act\"",
+    },
+    Contract {
+        assignment: "facetOp: '.facets .v .act button.op',",
+        source_path: "src/components/facet_sidebar.rs",
+        source: FACET_SIDEBAR_RS,
+        hook: "class=\"op\"",
+    },
+    Contract {
+        assignment: "facetMore: '.facets .g button.more',",
+        source_path: "src/components/facet_sidebar.rs",
+        source: FACET_SIDEBAR_RS,
+        hook: "class=\"more\"",
+    },
+    Contract {
+        assignment: "facetClear: '.facets .phead button.clear',",
+        source_path: "src/components/facet_sidebar.rs",
+        source: FACET_SIDEBAR_RS,
+        hook: "class=\"phead\"",
+    },
+    Contract {
+        assignment: "facetClear: '.facets .phead button.clear',",
+        source_path: "src/components/facet_sidebar.rs",
+        source: FACET_SIDEBAR_RS,
+        hook: "class=\"clear\"",
+    },
+    // -- chrome ---------------------------------------------------------
+    Contract {
+        assignment: "chipRemove: '.meta-chips .chip button.x',",
+        source_path: "src/components/meta_strip.rs",
+        source: META_STRIP_RS,
+        hook: "class=\"meta-chips\"",
+    },
+    Contract {
+        assignment: "chipRemove: '.meta-chips .chip button.x',",
+        source_path: "src/components/meta_strip.rs",
+        source: META_STRIP_RS,
+        hook: "class=\"x\"",
+    },
+    Contract {
+        assignment: "themeControl: '.statusbar button.grp.clickable',",
+        source_path: "src/components/status_bar.rs",
+        source: STATUS_BAR_RS,
+        hook: "class=\"statusbar\"",
+    },
+    Contract {
+        assignment: "themeControl: '.statusbar button.grp.clickable',",
+        source_path: "src/components/status_bar.rs",
+        source: STATUS_BAR_RS,
+        hook: "class=\"grp clickable\"",
+    },
+    Contract {
+        assignment: "intervalChip: '.interval-chips button.interval-chip',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "class=\"interval-chips\"",
+    },
+    // The chip's class is computed, so the hook is the literal the
+    // closure writes when the preset is not the chosen one.
+    Contract {
+        assignment: "intervalChip: '.interval-chips button.interval-chip',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "\"interval-chip\"",
+    },
+    Contract {
+        assignment: "netRename: '.sd-ttl button.name',",
+        source_path: "../fleet-ui/src/drawer.rs",
+        source: DRAWER_RS,
+        hook: "class=\"sd-ttl\"",
+    },
+    Contract {
+        assignment: "netRename: '.sd-ttl button.name',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "class=\"name\"",
+    },
+    // -- range dialog ---------------------------------------------------
+    Contract {
+        assignment: "rangeDialog: '.dr-pop[role=\"dialog\"]',",
+        source_path: "src/components/editor_wrap.rs",
+        source: EDITOR_WRAP_RS,
+        hook: "class=\"dr-pop\"",
+    },
+    Contract {
+        assignment: "rangeDialog: '.dr-pop[role=\"dialog\"]',",
+        source_path: "src/components/editor_wrap.rs",
+        source: EDITOR_WRAP_RS,
+        hook: "role=\"dialog\"",
+    },
+    Contract {
+        assignment: "rangeScrim: '.daterange .scrim',",
+        source_path: "src/components/editor_wrap.rs",
+        source: EDITOR_WRAP_RS,
+        hook: "class=\"daterange\"",
+    },
+    Contract {
+        assignment: "rangeScrim: '.daterange .scrim',",
+        source_path: "src/components/editor_wrap.rs",
+        source: EDITOR_WRAP_RS,
+        hook: "class=\"scrim\"",
+    },
+    Contract {
+        assignment: "segmentedOption: '.dr-pop .seg-opt',",
+        source_path: "src/components/editor_wrap.rs",
+        source: EDITOR_WRAP_RS,
+        hook: "class=\"dr-pop\"",
+    },
+    Contract {
+        assignment: "segmentedOption: '.dr-pop .seg-opt',",
+        source_path: "../fleet-ui/src/segmented/component.rs",
+        source: SEGMENTED_COMPONENT_RS,
+        hook: "class=\"seg-opt\"",
+    },
+    Contract {
+        assignment: "dateRangeFromLabel: 'label[for=\"dr-from-input\"]',",
+        source_path: "src/components/editor_wrap.rs",
+        source: EDITOR_WRAP_RS,
+        hook: "for=\"dr-from-input\"",
+    },
+    Contract {
+        assignment: "dateRangeToLabel: 'label[for=\"dr-to-input\"]',",
+        source_path: "src/components/editor_wrap.rs",
+        source: EDITOR_WRAP_RS,
+        hook: "for=\"dr-to-input\"",
+    },
+    // -- accessible names that are Rust format strings ------------------
+    Contract {
+        assignment: "sortName: 'Sort by {label}',",
+        source_path: "src/sort_label.rs",
+        source: SORT_LABEL_RS,
+        hook: "format!(\"Sort by {label}\")",
+    },
+    Contract {
+        assignment: "sortNameAscending: 'Sort by {label}, ascending',",
+        source_path: "src/sort_label.rs",
+        source: SORT_LABEL_RS,
+        hook: "format!(\"Sort by {label}, ascending\")",
+    },
+    Contract {
+        assignment: "sortNameDescending: 'Sort by {label}, descending',",
+        source_path: "src/sort_label.rs",
+        source: SORT_LABEL_RS,
+        hook: "format!(\"Sort by {label}, descending\")",
+    },
+    Contract {
+        assignment: "resultsExpandName: 'Show details for result {}',",
+        source_path: "src/components/results_table.rs",
+        source: RESULTS_TABLE_RS,
+        hook: "\"Show details for result {}\"",
+    },
+    Contract {
+        assignment: "resultsTagName: 'Include {field_for_label} = {value_for_label}',",
+        source_path: "src/components/results_table.rs",
+        source: RESULTS_TABLE_RS,
+        hook: "\"Include {field_for_label} = {value_for_label}\"",
+    },
+    Contract {
+        assignment: "facetIncludeName: 'Include {field} = {v}',",
+        source_path: "src/components/facet_sidebar.rs",
+        source: FACET_SIDEBAR_RS,
+        hook: "format!(\"Include {field} = {v}\")",
+    },
+    Contract {
+        assignment: "facetExcludeName: 'Exclude {field} = {v}',",
+        source_path: "src/components/facet_sidebar.rs",
+        source: FACET_SIDEBAR_RS,
+        hook: "format!(\"Exclude {field} = {v}\")",
+    },
+    Contract {
+        assignment: "facetMoreName: 'Show {extra} more values for {field}',",
+        source_path: "src/components/facet_sidebar.rs",
+        source: FACET_SIDEBAR_RS,
+        hook: "format!(\"Show {extra} more values for {field}\")",
+    },
+    Contract {
+        assignment: "chipRemoveName: 'Remove filter {} = {}',",
+        source_path: "src/components/meta_strip.rs",
+        source: META_STRIP_RS,
+        hook: "\"Remove filter {} = {}\"",
+    },
+    Contract {
+        assignment: "schemaSearchName: 'Search {name_label_search}',",
+        source_path: "src/pages/schema.rs",
+        source: SCHEMA_RS,
+        hook: "format!(\"Search {name_label_search}\")",
+    },
+    Contract {
+        assignment: "schemaTailName: 'Live tail {name_label_tail}',",
+        source_path: "src/pages/schema.rs",
+        source: SCHEMA_RS,
+        hook: "format!(\"Live tail {name_label_tail}\")",
+    },
+    Contract {
+        assignment: "themeSwitchName: 'Switch to {} theme',",
+        source_path: "src/components/status_bar.rs",
+        source: STATUS_BAR_RS,
+        hook: "\"Switch to {} theme\"",
+    },
+    Contract {
+        assignment: "netRenameName: 'Rename {name}',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "format!(\"Rename {name}\")",
+    },
+    Contract {
+        assignment: "rangeDialogName: 'Time range',",
+        source_path: "src/components/editor_wrap.rs",
+        source: EDITOR_WRAP_RS,
+        hook: "aria-label=\"Time range\"",
+    },
+    // -- the DSL shapes the stub dispatches on --------------------------
+    // `e2e_wire_fixture_contract.rs` proves these against the builders by
+    // CALLING them, which is the stronger half; these rows keep the
+    // selector sheet's own copy honest about which source writes them.
+    Contract {
+        assignment: "queryShapeTopValues: '| top 10 ',",
+        source_path: "src/drawer_query.rs",
+        source: DRAWER_QUERY_RS,
+        hook: "| top 10 ",
+    },
+    // Two rows, because `| stats dc(` is assembled: the stage comes from
+    // the query's format string and `dc(` from the per-field expression,
+    // so no single line of that file carries the substring.
+    Contract {
+        assignment: "queryShapeCardinality: '| stats dc(',",
+        source_path: "src/drawer_query.rs",
+        source: DRAWER_QUERY_RS,
+        hook: "last=7d | stats {}",
+    },
+    Contract {
+        assignment: "queryShapeCardinality: '| stats dc(',",
+        source_path: "src/drawer_query.rs",
+        source: DRAWER_QUERY_RS,
+        hook: "dc({field}) as {field}",
+    },
+    Contract {
+        assignment: "queryShapeTimechart: '| timechart span=1h count()',",
+        source_path: "src/components/service_drawer.rs",
+        source: SERVICE_DRAWER_RS,
+        hook: "| timechart span=1h count()",
     },
 ];
 

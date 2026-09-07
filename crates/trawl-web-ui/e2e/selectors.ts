@@ -138,8 +138,114 @@ export const SEL = {
   /// crates/trawl-web-ui/src/components/editor_wrap.rs — a tool link
   /// under the editor. Save is a plain button; Share is fleet-ui's
   /// CopyButton in bare mode, which renders the caller's class on its
-  /// own native button.
+  /// own native button. Since ADR-0029 Format is a button too, so this
+  /// matches THREE buttons, not two.
   editorTool: '.editor-tools button.tool',
+
+  // -- the stretched row control and its neighbours (ADR-0029) -------
+  /// One data row of a `.tbl` div table. Every list page mounts exactly
+  /// one `.tbl-body`, so this is unambiguous per page: schema services,
+  /// nets, runs and history all render the same row shape.
+  tableRow: '.tbl-body .tbl-row',
+  /// The ONE control a list row carries, stretched over the row by its
+  /// `::after`. A link on schema, nets and runs; a button on history.
+  rowStretch: '.row-stretch',
+  /// crates/trawl-web-ui/src/pages/schema.rs — a row's hover/focus
+  /// revealed quick actions (Search, Live tail), told apart by name.
+  schemaQuickAction: '.tbl-row .row-act .qa',
+  /// crates/trawl-web-ui/src/pages/schema.rs — the services table's
+  /// sortable header controls, rendered by `components/sort_th.rs`.
+  /// The same selector reaches the nets table's one sortable header.
+  tableSortControl: '.tbl-hd .th.sortable button',
+  /// crates/trawl-web-ui/src/pages/history.rs — the Save as Net control
+  /// nested inside the history row, above the stretched rerun button.
+  historySaveAsNet: '.tbl-row button.link',
+
+  // -- results table --------------------------------------------------
+  /// crates/trawl-web-ui/src/components/results_table.rs — one data row
+  /// of the snapshot table. The detail row is a SIBLING `<tr>` with no
+  /// `.exp-col`, so a count of these is not a count of results.
+  resultsRow: '.results-table tbody tr',
+  /// Its one control: the caret button in the expander cell, stretched
+  /// over the row.
+  resultsExpandControl: '.results-table td.exp-col button.row-stretch',
+  /// The expanded row's detail cell, one per open row.
+  resultsDetailCell: '.results-table td.detail',
+  /// A key/value tag inside that detail cell, which adds an include
+  /// filter for the field it names.
+  resultsDetailTag: '.results-table td.detail button.tag',
+  /// A sortable column header of the real `<table>`. `aria-sort` rides
+  /// the CELL, so the assertion target is the th and not its button.
+  resultsSortHeader: '.results-table th.sortable',
+  /// The control inside that header.
+  resultsSortControl: '.results-table th.sortable button.th-sort',
+
+  // -- service drawer -------------------------------------------------
+  /// crates/trawl-web-ui/src/components/service_drawer.rs — one field
+  /// row of the Fields pane.
+  serviceFieldRow: '.sd-fields .sf-row',
+  /// Its one control: the caret + field name, stretched over the row.
+  serviceFieldToggle: '.sf-row button.row-stretch',
+  /// The degraded badge nested above that control, which opens the
+  /// field's case file instead of expanding the row.
+  serviceDegradedBadge: '.sf-row button.deg-btn',
+  /// The Fields pane's sortable headers — the same `sort_th` helper the
+  /// schema and nets tables use.
+  serviceFieldSortControl: '.sf-hd .th.sortable button',
+  /// crates/trawl-web-ui/src/components/service_drawer.rs — a row of the
+  /// overview's "Top fields by cardinality" card, whose control searches
+  /// for the field through the navigator.
+  serviceTopField: '.topfields .tf button.fn',
+
+  // -- facet rail -----------------------------------------------------
+  /// crates/trawl-web-ui/src/components/facet_sidebar.rs — one facet
+  /// group (a field and its values).
+  facetGroup: '.facets .g',
+  /// Its header, which collapses the group and carries aria-expanded.
+  facetGroupHeader: '.facets button.g-hd',
+  /// One value row inside a group. Not a control itself since ADR-0029:
+  /// the two buttons in its action area are.
+  facetValue: '.facets .v',
+  /// The value's name span, which must stay clear of the action area.
+  facetValueName: '.facets .v .n',
+  /// The action area, revealed by hover or focus-within (opacity, never
+  /// `display: none`, or Tab could not reach the buttons).
+  facetActions: '.facets .v .act',
+  /// Include (+) and exclude (⊘), told apart by accessible name.
+  facetOp: '.facets .v .act button.op',
+  /// The group's "+ N more" control.
+  facetMore: '.facets .g button.more',
+  /// The rail header's "Clear all".
+  facetClear: '.facets .phead button.clear',
+
+  // -- chrome ---------------------------------------------------------
+  /// crates/trawl-web-ui/src/components/meta_strip.rs — a filter chip's
+  /// remove control, named after the filter it drops.
+  chipRemove: '.meta-chips .chip button.x',
+  /// crates/trawl-web-ui/src/components/status_bar.rs — the theme
+  /// control. Its visible text is the theme in force and its accessible
+  /// name is the theme a press would produce.
+  themeControl: '.statusbar button.grp.clickable',
+  /// crates/trawl-web-ui/src/components/net_drawer.rs — one schedule
+  /// interval preset, an exclusive set carrying aria-pressed.
+  intervalChip: '.interval-chips button.interval-chip',
+  /// crates/trawl-web-ui/src/components/net_drawer.rs — the drawer
+  /// title's rename trigger (fleet-ui's drawer owns `.sd-ttl`).
+  netRename: '.sd-ttl button.name',
+
+  // -- range dialog ---------------------------------------------------
+  /// crates/trawl-web-ui/src/components/editor_wrap.rs DateRangePopover
+  /// — the panel as a modal dialog on fleet-ui's overlay stack.
+  rangeDialog: '.dr-pop[role="dialog"]',
+  /// Its scrim, a sibling before the panel. Dismissal is mousedown.
+  rangeScrim: '.daterange .scrim',
+  /// fleet-ui's Segmented option inside the dialog — the strip is the
+  /// panel's first control, so it is where initial focus lands.
+  segmentedOption: '.dr-pop .seg-opt',
+  /// The Absolute tab's From label, paired to `.dr-from` by `for`.
+  dateRangeFromLabel: 'label[for="dr-from-input"]',
+  /// Its To twin.
+  dateRangeToLabel: 'label[for="dr-to-input"]',
 } as const;
 
 /// Timings the specs share with the app. Mirrored here rather than
@@ -215,4 +321,64 @@ export const COPY = {
   /// aria-label. The TRIGGER is named by its visible user name instead,
   /// so this is the panel's name only.
   accountMenuName: 'Account',
+
+  // -- names that are Rust format strings (ADR-0029) ------------------
+  // Each of these is the format string as the source writes it, filled
+  // by `nameFrom` below. Pinning the RESOLVED name would hide the words
+  // around the values, which is the half a rename actually breaks.
+  /// crates/trawl-web-ui/src/sort_label.rs — an unsorted column.
+  sortName: 'Sort by {label}',
+  /// Its sorted spellings; the div tables carry no `aria-sort`, so the
+  /// direction is in the name.
+  sortNameAscending: 'Sort by {label}, ascending',
+  sortNameDescending: 'Sort by {label}, descending',
+  /// crates/trawl-web-ui/src/components/results_table.rs — the caret
+  /// button's name, numbered from 1 in render order.
+  resultsExpandName: 'Show details for result {}',
+  /// crates/trawl-web-ui/src/components/results_table.rs — a detail
+  /// row's tag, which adds an include filter.
+  resultsTagName: 'Include {field_for_label} = {value_for_label}',
+  /// crates/trawl-web-ui/src/components/facet_sidebar.rs — the two
+  /// value controls.
+  facetIncludeName: 'Include {field} = {v}',
+  facetExcludeName: 'Exclude {field} = {v}',
+  /// Its "+ N more" control, whose visible text stays `+ N more`.
+  facetMoreName: 'Show {extra} more values for {field}',
+  /// crates/trawl-web-ui/src/components/meta_strip.rs — the chip's
+  /// remove control. Positional placeholders, as the source writes it.
+  chipRemoveName: 'Remove filter {} = {}',
+  /// crates/trawl-web-ui/src/pages/schema.rs — the row quick actions.
+  schemaSearchName: 'Search {name_label_search}',
+  schemaTailName: 'Live tail {name_label_tail}',
+  /// crates/trawl-web-ui/src/components/status_bar.rs — the theme
+  /// control, named for the theme a press produces.
+  themeSwitchName: 'Switch to {} theme',
+  /// crates/trawl-web-ui/src/components/net_drawer.rs — the drawer
+  /// title's rename trigger.
+  netRenameName: 'Rename {name}',
+  /// crates/trawl-web-ui/src/components/editor_wrap.rs — the range
+  /// dialog's own name. Not a format string.
+  rangeDialogName: 'Time range',
+
+  // -- the DSL shapes the stub dispatches on --------------------------
+  // Not copy the user sees: the substrings `harness/server.mjs` keys
+  // `/api/v1/query` on under the `corpus` scenario. A spec asserts the
+  // drawer's reads by these, and a drifted builder would fall through to
+  // the pipeline catch-all and render an error arm that reads like a
+  // broken app rather than a stale fixture.
+  queryShapeTopValues: '| top 10 ',
+  queryShapeCardinality: '| stats dc(',
+  queryShapeTimechart: '| timechart span=1h count()',
 } as const;
+
+/** Fill a `COPY` name that is a Rust format string.
+ *
+ * The accessible names above are `format!` templates, pinned verbatim
+ * against the source that writes them. Each `{…}` placeholder is
+ * replaced, left to right, by the next value given — so a spec never
+ * spells out the words around the values, and a reworded label fails the
+ * drift guard instead of failing a spec for an unrelated-looking reason.
+ */
+export function nameFrom(template: string, ...values: string[]): string {
+  return values.reduce((out, v) => out.replace(/\{[^}]*\}/, v), template);
+}
