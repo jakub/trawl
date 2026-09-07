@@ -10,7 +10,7 @@
 # exits 0 only if every requested mutation was killed.
 #
 # Usage:
-#   e2e/scripts/mutation-check.sh                 # run all five
+#   e2e/scripts/mutation-check.sh                 # run all seven
 #   e2e/scripts/mutation-check.sh 02-editor-onchange.patch   # just one
 #
 # Refuses to run against a dirty tree — a patch applied on top of your
@@ -48,6 +48,8 @@ declare -A SPEC_FOR=(
   [03-sse-teardown.patch]="teardown-sse.spec.ts"
   [04-error-fallback.patch]="api-failure.spec.ts"
   [05-search-url-codec.patch]="search-url.spec.ts"
+  [06-repin-poll-leak.patch]="repin-poll-teardown.spec.ts"
+  [07-repin-alive-latch.patch]="repin-poll-teardown.spec.ts"
 )
 
 # patch-file -> a CONTROL spec the mutation does NOT touch, which must
@@ -63,6 +65,8 @@ declare -A CONTROL_FOR=(
   [03-sse-teardown.patch]="routing.spec.ts"
   [04-error-fallback.patch]="routing.spec.ts"
   [05-search-url-codec.patch]="routing.spec.ts"
+  [06-repin-poll-leak.patch]="routing.spec.ts"
+  [07-repin-alive-latch.patch]="routing.spec.ts"
 )
 
 PATCHES=()
@@ -75,6 +79,8 @@ else
     03-sse-teardown.patch
     04-error-fallback.patch
     05-search-url-codec.patch
+    06-repin-poll-leak.patch
+    07-repin-alive-latch.patch
   )
 fi
 

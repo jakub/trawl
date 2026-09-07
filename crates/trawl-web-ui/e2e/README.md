@@ -55,12 +55,22 @@ the PR diff.
   legacy and malformed payloads, page-offset overflow), the percent
   encoder against the browser's own, and Back/Forward provenance. Every
   URL in that spec is a literal, never one the app's encoder built.
+- The field case drawer's repin status poll dying with the drawer, by all
+  four routes out of it (close, Escape, browser Back, and navigating
+  straight to another field's case file). A leaked `gloo_timers` Interval
+  is network-silent, so that spec reads three separate observables: the
+  browser's timer table, the stub's status-read count, and a status read
+  the stub parks open across the teardown and answers afterwards.
 - No visual regression / screenshot diffing.
 - No real backend — every response is a fixture in `harness/fixtures.mjs`.
   Re-verify those shapes against `crates/trawl-api/src/lib.rs` /
   `crates/trawl-web-ui/src/api/mod.rs` when the wire types change; the
   suite decodes the SAME structs the SPA does, so a drifted fixture
   either 500s inside `serde_json` or silently renders the empty state.
+  The bodies under `harness/wire/` are guarded for you:
+  `crates/trawl-web-ui/tests/e2e_wire_fixture_contract.rs` decodes each
+  into its trawl-api struct on every `cargo nextest` run, so prefer a
+  `wire/` file over a new inline payload.
 
 ## The per-test contract
 
@@ -92,20 +102,45 @@ one thing the suite is supposed to catch:
 |---|---|---|
 | `01-route.patch` | misspells the `/search/history` route path | `routing.spec.ts` |
 | `02-editor-onchange.patch` | `DslEditor`'s onChange stops writing into `query` | `editor-input.spec.ts` |
-| `03-sse-teardown.patch` | `on_cleanup` leaks the live-tail `EventSource` (`mem::forget` instead of drop) | `teardown-sse.spec.ts` |
+| `03-sse-teardown.patch` | leaks the live-tail `EventSource` (`mem::forget` instead of drop) at BOTH close paths: `on_cleanup` and the mode/query effect's own handle-clear | `teardown-sse.spec.ts` |
 | `04-error-fallback.patch` | `<ResultsTable>` overrides `Loaded`'s error arm to render nothing | `api-failure.spec.ts` |
 | `05-search-url-codec.patch` | `encode_range` writes the retired `abs:<from>:<to>` form again | `search-url.spec.ts` |
+| `06-repin-poll-leak.patch` | `on_cleanup` leaks the field case drawer's repin poll `Interval` | `repin-poll-teardown.spec.ts` |
+| `07-repin-alive-latch.patch` | the drawer's `is_alive` latch always answers true, so a status read landing after teardown acts on a dead surface | `repin-poll-teardown.spec.ts` |
 
 Run the mechanism:
 
 ```sh
-crates/trawl-web-ui/e2e/scripts/mutation-check.sh                     # all five
+crates/trawl-web-ui/e2e/scripts/mutation-check.sh                     # all seven
 crates/trawl-web-ui/e2e/scripts/mutation-check.sh 02-editor-onchange.patch  # just one
 ```
 
-For each patch: `git apply` it, `trunk build`, run the ONE spec named
-above with `--grep`, expect a **nonzero** exit (the mutation must break
-something observable), then `git apply -R` to revert. It refuses to run
-against a dirty working tree — a patch that can't be cleanly reverted
-would otherwise strand a mutation in your tree. This is evidence tooling
-for reviewing the suite's own effectiveness, not a CI job.
+For each patch: `git apply` it, `trunk build`, run the ONE spec file
+named above, require it to EXECUTE and FAIL, then run a control spec the
+mutation does not touch and require that to pass, then `git apply -R` to
+revert. The control is what tells a kill from a broken environment: a
+missing browser fails the target spec too, and playwright records a
+launch failure as executed-and-failed tests rather than as no tests. It
+refuses to run against a dirty working tree, since a patch that can't be
+cleanly reverted would strand a mutation in your tree. This is evidence
+tooling for reviewing the suite's own effectiveness, not a CI job.
+
+Two of these mutations are worth reading before you trust the table.
+
+`03` mutates both places the live tail drops its stream handle, not just
+`on_cleanup`. Navigating away flips the URL-derived mode and query
+signals, so the mode/query effect can clear the handle before disposal
+ever reaches `on_cleanup`. Mutate `on_cleanup` alone and the slot may
+already be empty by the time it runs, which leaves the mutant alive for
+a reason that has nothing to do with the suite. Mutating both sites
+removes that ordering dependence.
+
+`06` and `07` both target the field case drawer, and they are not two
+spellings of one thing. `06` leaks the poll timer, which is network-
+silent: its body runs a disposed leptos callback that no-ops, so the leak
+issues no HTTP read and throws no `pageerror`, and only the spec's
+`setInterval` wrapper can see it. `07` leaves the timer alone and
+disables the `alive` latch instead, so the status read the stub parked
+open across the teardown comes back to a dead surface and announces a
+finished repin nobody is looking at. Different mechanism, different
+observable, same spec file.

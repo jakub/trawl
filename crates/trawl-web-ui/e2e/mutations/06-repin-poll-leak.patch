@@ -1,0 +1,19 @@
+diff --git a/crates/trawl-web-ui/src/components/field_case_drawer.rs b/crates/trawl-web-ui/src/components/field_case_drawer.rs
+index cb3862df..357c7e51 100644
+--- a/crates/trawl-web-ui/src/components/field_case_drawer.rs
++++ b/crates/trawl-web-ui/src/components/field_case_drawer.rs
+@@ -205,7 +205,13 @@ pub fn FieldCaseDrawer(
+     // on navigating to a different field (the page rebuilds the drawer),
+     // so no poll outlives the surface that started it.
+     let poller: StoredValue<Option<Interval>, LocalStorage> = StoredValue::new_local(None);
+-    on_cleanup(move || poller.update_value(|p| *p = None));
++    on_cleanup(move || {
++        poller.update_value(|p| {
++            if let Some(handle) = p.take() {
++                std::mem::forget(handle);
++            }
++        });
++    });
+ 
+     // Cancelling the interval cannot cancel a read already awaiting: a
+     // status response can land after this drawer is gone. Signal writes

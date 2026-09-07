@@ -1,0 +1,24 @@
+{
+  "job": {
+    "id": 4211,
+    "field": "duration",
+    "from_type": "VARCHAR",
+    "to_type": "BIGINT",
+    "dry_run": false,
+    "force": false,
+    "status": "succeeded",
+    "requested_by": "e2e",
+    "started_at": "2026-08-01T09:20:00Z",
+    "finished_at": "2026-08-01T09:20:31Z",
+    "error": null,
+    "files_total": 12,
+    "rows_carrying": 41822,
+    "projected_nulls": 0,
+    "resurrectable": 0,
+    "affected_bytes": 8388608,
+    "files_done": 12,
+    "rows_rewritten": 41822,
+    "rows_nulled": 0,
+    "rows_resurrected": 0
+  }
+}

@@ -1,0 +1,213 @@
+mutation-check transcript, issue #157
+
+commit:     a7d1216a36b56a918428cc257a5dbbf05b31af26
+date:       2026-09-07T03:17Z
+node:       v26.8.1
+npm:        12.0.2
+playwright: 1.62.1
+command:    crates/trawl-web-ui/e2e/scripts/mutation-check.sh 07-repin-alive-latch.patch
+exit:       0 (the mutation was killed)
+
+The mutation leaves the timer alone and makes the drawer's is_alive
+latch always answer true. The status read the stub parked open across
+the teardown is released afterwards, reaches a dead surface, and raises
+the "Repin finished" toast, so all four tests fail on the cumulative
+toast count. A different assertion from the one 06 trips, which is the
+point of keeping the two mutations separate.
+
+mutation-check.sh refuses to start against a dirty tree and exits 2
+if the tree is not clean after it reverts, so a transcript that gets
+past its first line and ends with a results table is itself the
+proof that the working tree was clean at both ends. ANSI escapes
+stripped; otherwise verbatim.
+
+----------------------------------------------------------------------
+
+=== 07-repin-alive-latch.patch -> repin-poll-teardown.spec.ts ===
+-- trunk build --
+2026-09-07T03:16:51.936052Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T03:16:51.936176Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-core)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.53s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T03:17:01.752655Z  INFO applying new distribution
+2026-09-07T03:17:01.758049Z  INFO ✅ success
+-- playwright test tests/repin-poll-teardown.spec.ts --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/repin-poll-teardown.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui/dist)
+
+Running 4 tests using 1 worker
+
+  ✘  1 [chromium] › tests/repin-poll-teardown.spec.ts:171:5 › closing the case file stops its repin poll (5.4s)
+  ✘  2 [chromium] › tests/repin-poll-teardown.spec.ts:188:5 › Escape back to the service context stops the repin poll (5.1s)
+  ✘  3 [chromium] › tests/repin-poll-teardown.spec.ts:207:5 › browser Back out of a case file stops its repin poll (5.1s)
+  ✘  4 [chromium] › tests/repin-poll-teardown.spec.ts:240:5 › navigating from one case file to another stops the first one's poll (5.2s)
+
+
+  1) [chromium] › tests/repin-poll-teardown.spec.ts:171:5 › closing the case file stops its repin poll 
+
+    Error: latch regression: a finished repin raised a toast for a drawer nobody is looking at
+
+    expect(received).toBe(expected) // Object.is equality
+
+    Expected: 0
+    Received: 1
+
+      162 |     await toastCount(page),
+      163 |     'latch regression: a finished repin raised a toast for a drawer nobody is looking at',
+    > 164 |   ).toBe(0);
+          |     ^
+      165 |   expect(
+      166 |     (await repinState(request)).hits,
+      167 |     'late read: answering the parked read restarted the poll',
+        at expectPollStopped (/home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui/e2e/tests/repin-poll-teardown.spec.ts:164:5)
+        at /home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui/e2e/tests/repin-poll-teardown.spec.ts:185:3
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/repin-poll-teardown-closin-0e4f5-e-file-stops-its-repin-poll-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/repin-poll-teardown-closin-0e4f5-e-file-stops-its-repin-poll-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/repin-poll-teardown-closin-0e4f5-e-file-stops-its-repin-poll-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/repin-poll-teardown-closin-0e4f5-e-file-stops-its-repin-poll-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  2) [chromium] › tests/repin-poll-teardown.spec.ts:188:5 › Escape back to the service context stops the repin poll 
+
+    Error: latch regression: a finished repin raised a toast for a drawer nobody is looking at
+
+    expect(received).toBe(expected) // Object.is equality
+
+    Expected: 0
+    Received: 1
+
+      162 |     await toastCount(page),
+      163 |     'latch regression: a finished repin raised a toast for a drawer nobody is looking at',
+    > 164 |   ).toBe(0);
+          |     ^
+      165 |   expect(
+      166 |     (await repinState(request)).hits,
+      167 |     'late read: answering the parked read restarted the poll',
+        at expectPollStopped (/home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui/e2e/tests/repin-poll-teardown.spec.ts:164:5)
+        at /home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui/e2e/tests/repin-poll-teardown.spec.ts:204:3
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/repin-poll-teardown-Escape-24506-ontext-stops-the-repin-poll-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/repin-poll-teardown-Escape-24506-ontext-stops-the-repin-poll-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/repin-poll-teardown-Escape-24506-ontext-stops-the-repin-poll-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/repin-poll-teardown-Escape-24506-ontext-stops-the-repin-poll-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  3) [chromium] › tests/repin-poll-teardown.spec.ts:207:5 › browser Back out of a case file stops its repin poll 
+
+    Error: latch regression: a finished repin raised a toast for a drawer nobody is looking at
+
+    expect(received).toBe(expected) // Object.is equality
+
+    Expected: 0
+    Received: 1
+
+      162 |     await toastCount(page),
+      163 |     'latch regression: a finished repin raised a toast for a drawer nobody is looking at',
+    > 164 |   ).toBe(0);
+          |     ^
+      165 |   expect(
+      166 |     (await repinState(request)).hits,
+      167 |     'late read: answering the parked read restarted the poll',
+        at expectPollStopped (/home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui/e2e/tests/repin-poll-teardown.spec.ts:164:5)
+        at /home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui/e2e/tests/repin-poll-teardown.spec.ts:233:3
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/repin-poll-teardown-browse-9cdd1-e-file-stops-its-repin-poll-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/repin-poll-teardown-browse-9cdd1-e-file-stops-its-repin-poll-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/repin-poll-teardown-browse-9cdd1-e-file-stops-its-repin-poll-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/repin-poll-teardown-browse-9cdd1-e-file-stops-its-repin-poll-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  4) [chromium] › tests/repin-poll-teardown.spec.ts:240:5 › navigating from one case file to another stops the first one's poll 
+
+    Error: latch regression: a finished repin raised a toast for a drawer nobody is looking at
+
+    expect(received).toBe(expected) // Object.is equality
+
+    Expected: 0
+    Received: 1
+
+      162 |     await toastCount(page),
+      163 |     'latch regression: a finished repin raised a toast for a drawer nobody is looking at',
+    > 164 |   ).toBe(0);
+          |     ^
+      165 |   expect(
+      166 |     (await repinState(request)).hits,
+      167 |     'late read: answering the parked read restarted the poll',
+        at expectPollStopped (/home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui/e2e/tests/repin-poll-teardown.spec.ts:164:5)
+        at /home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui/e2e/tests/repin-poll-teardown.spec.ts:282:3
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/repin-poll-teardown-naviga-93b56--stops-the-first-one-s-poll-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/repin-poll-teardown-naviga-93b56--stops-the-first-one-s-poll-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/repin-poll-teardown-naviga-93b56--stops-the-first-one-s-poll-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/repin-poll-teardown-naviga-93b56--stops-the-first-one-s-poll-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  4 failed
+    [chromium] › tests/repin-poll-teardown.spec.ts:171:5 › closing the case file stops its repin poll 
+    [chromium] › tests/repin-poll-teardown.spec.ts:188:5 › Escape back to the service context stops the repin poll 
+    [chromium] › tests/repin-poll-teardown.spec.ts:207:5 › browser Back out of a case file stops its repin poll 
+    [chromium] › tests/repin-poll-teardown.spec.ts:240:5 › navigating from one case file to another stops the first one's poll 
+-- control: playwright test tests/routing.spec.ts (must pass) --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/routing.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui/dist)
+
+Running 3 tests using 1 worker
+
+  ✓  1 [chromium] › tests/routing.spec.ts:8:5 › / redirects to /search and mounts the DSL editor (814ms)
+  ✓  2 [chromium] › tests/routing.spec.ts:14:5 › rail link to history navigates without a full page load (525ms)
+  ✓  3 [chromium] › tests/routing.spec.ts:31:5 › an unknown route renders the 404 page (357ms)
+
+  3 passed (2.2s)
+-- trunk build (restore pristine dist) --
+2026-09-07T03:17:27.690879Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T03:17:27.690993Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-core)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.47s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T03:17:37.046826Z  INFO applying new distribution
+2026-09-07T03:17:37.049729Z  INFO ✅ success
+
+mutation-check results:
+patch                        outcome
+07-repin-alive-latch.patch   PASS (target spec failed, control passed, exit 1)
+EXIT=0

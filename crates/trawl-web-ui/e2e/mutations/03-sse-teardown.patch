@@ -1,8 +1,8 @@
 diff --git a/crates/trawl-web-ui/src/pages/search.rs b/crates/trawl-web-ui/src/pages/search.rs
-index ce179fa9..024ebcf5 100644
+index fa5e727e..99eac82e 100644
 --- a/crates/trawl-web-ui/src/pages/search.rs
 +++ b/crates/trawl-web-ui/src/pages/search.rs
-@@ -234,7 +234,9 @@ pub fn Search() -> impl IntoView {
+@@ -349,14 +349,20 @@ pub fn Search() -> impl IntoView {
          StoredValue::new_local(None);
      on_cleanup(move || {
          stream_handle.update_value(|slot| {
@@ -13,3 +13,15 @@ index ce179fa9..024ebcf5 100644
          });
      });
  
+     Effect::new(move |_| {
+         let current_mode = mode.get();
+         let q = effective_q.get();
+-        stream_handle.update_value(|slot| *slot = None);
++        stream_handle.update_value(|slot| {
++            if let Some(handle) = slot.take() {
++                std::mem::forget(handle);
++            }
++        });
+         ring.set(RingBuffer::default());
+         live_snapshot.set(None);
+         lagged.set(None);

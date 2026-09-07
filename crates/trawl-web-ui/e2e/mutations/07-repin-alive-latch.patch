@@ -1,0 +1,13 @@
+diff --git a/crates/trawl-web-ui/src/components/field_case_drawer.rs b/crates/trawl-web-ui/src/components/field_case_drawer.rs
+index cb3862df..10ae5fbf 100644
+--- a/crates/trawl-web-ui/src/components/field_case_drawer.rs
++++ b/crates/trawl-web-ui/src/components/field_case_drawer.rs
+@@ -216,7 +216,7 @@ pub fn FieldCaseDrawer(
+     // as the flag itself.
+     let alive = StoredValue::new(true);
+     on_cleanup(move || alive.set_value(false));
+-    let is_alive = move || alive.try_get_value() == Some(true);
++    let is_alive = move || true;
+     let stop_poll = move || {
+         poller.update_value(|p| *p = None);
+         poll_in_flight.set(false);

@@ -2,8 +2,12 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-import { test, expect, resetScenario } from '../fixtures';
+import { test, expect, intervalCount, resetScenario, trackIntervals } from '../fixtures';
 import { SEL } from '../selectors';
+
+/** crates/trawl-web-ui/src/state/stream_session.rs — the live table's
+ * render tick, the timer this spec proves is released on unmount. */
+const RENDER_TICK_MS = 16;
 
 async function pollState(request: import('@playwright/test').APIRequestContext) {
   return (await (await request.get('/__ctl/state')).json()) as {
@@ -52,21 +56,7 @@ test('an unmounted live tail closes its EventSource and stops reconnecting', asy
 
 test('a burst keeps the newest 5000 rows, updates columns, and releases its render timer', async ({ page, request }) => {
   await resetScenario(request, 'stream-burst');
-  await page.addInitScript(() => {
-    const active = new Set<number>();
-    const start = window.setInterval.bind(window);
-    const clear = window.clearInterval.bind(window);
-    (window as any).__liveRenderTimers = active;
-    window.setInterval = ((handler: TimerHandler, delay?: number, ...args: any[]) => {
-      const id = start(handler, delay, ...args);
-      if (delay === 16) active.add(id);
-      return id;
-    }) as typeof window.setInterval;
-    window.clearInterval = ((id?: number) => {
-      active.delete(id!);
-      clear(id);
-    }) as typeof window.clearInterval;
-  });
+  await trackIntervals(page);
   await page.goto('/search');
   await page.locator(SEL.cmContent).click();
   await page.keyboard.type('service=nginx');
@@ -84,10 +74,10 @@ test('a burst keeps the newest 5000 rows, updates columns, and releases its rend
   expect(rendered.seqs).toEqual(Array.from({ length: 5000 }, (_, i) => i + 1000));
   expect(rendered.headers).toContain('late_column');
   expect(rendered.headers).not.toContain('expired_only');
-  expect(await page.evaluate(() => (window as any).__liveRenderTimers.size)).toBe(1);
+  expect(await intervalCount(page, RENDER_TICK_MS)).toBe(1);
 
   await page.locator(SEL.railHistoryLink).click();
   await expect(page.locator('h1')).toHaveText('Search history');
-  expect(await page.evaluate(() => (window as any).__liveRenderTimers.size)).toBe(0);
+  expect(await intervalCount(page, RENDER_TICK_MS)).toBe(0);
   expect(await waitFor(async () => (await pollState(request)).sse.open === 0, 2_000)).toBe(true);
 });

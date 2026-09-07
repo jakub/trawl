@@ -1,0 +1,620 @@
+mutation-check transcript, issue #157
+
+commit:     a7d1216a36b56a918428cc257a5dbbf05b31af26
+date:       2026-09-07T03:18Z to 03:21Z
+node:       v26.8.1
+npm:        12.0.2
+playwright: 1.62.1
+command:    crates/trawl-web-ui/e2e/scripts/mutation-check.sh 03-sse-teardown.patch
+            run five consecutive times, each its own invocation
+exit:       0 on all five
+
+03 now mutates both places the live tail drops its stream handle:
+on_cleanup and the mode/query effect's own clear. Mutating only
+on_cleanup left the mutant's fate to whether the effect had already
+emptied the slot, so it survived some runs for a reason that said
+nothing about the suite. Five separate runs, all killed, is the
+evidence that the ordering dependence is gone. Each run failed both
+tests in teardown-sse.spec.ts and passed all three in
+routing.spec.ts.
+
+mutation-check.sh refuses to start against a dirty tree and exits 2
+if the tree is not clean after it reverts, so each run below is its
+own proof that the tree was clean at both ends. ANSI escapes
+stripped; otherwise verbatim.
+
+
+######################################################################
+### run 1 of 5
+######################################################################
+
+=== 03-sse-teardown.patch -> teardown-sse.spec.ts ===
+-- trunk build --
+2026-09-07T03:17:45.107210Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T03:17:45.107332Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-core)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.84s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T03:17:53.895841Z  INFO applying new distribution
+2026-09-07T03:17:53.899494Z  INFO ✅ success
+-- playwright test tests/teardown-sse.spec.ts --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/teardown-sse.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui/dist)
+
+Running 2 tests using 1 worker
+
+  ✘  1 [chromium] › tests/teardown-sse.spec.ts:27:5 › an unmounted live tail closes its EventSource and stops reconnecting (3.3s)
+  ✘  2 [chromium] › tests/teardown-sse.spec.ts:57:5 › a burst keeps the newest 5000 rows, updates columns, and releases its render timer (2.0s)
+
+
+  1) [chromium] › tests/teardown-sse.spec.ts:27:5 › an unmounted live tail closes its EventSource and stops reconnecting 
+
+    Error: opens count grew after unmount — the EventSource leaked and reconnected
+
+    expect(received).toBe(expected) // Object.is equality
+
+    Expected: 1
+    Received: 3
+
+      52 |   await page.waitForTimeout(1_500);
+      53 |   const later = await pollState(request);
+    > 54 |   expect(later.sse.opens, 'opens count grew after unmount — the EventSource leaked and reconnected').toBe(opensAtClose);
+         |                                                                                                      ^
+      55 | });
+      56 |
+      57 | test('a burst keeps the newest 5000 rows, updates columns, and releases its render timer', async ({ page, request }) => {
+        at /home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui/e2e/tests/teardown-sse.spec.ts:54:102
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/teardown-sse-an-unmounted--3ce47-urce-and-stops-reconnecting-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/teardown-sse-an-unmounted--3ce47-urce-and-stops-reconnecting-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/teardown-sse-an-unmounted--3ce47-urce-and-stops-reconnecting-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/teardown-sse-an-unmounted--3ce47-urce-and-stops-reconnecting-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  2) [chromium] › tests/teardown-sse.spec.ts:57:5 › a burst keeps the newest 5000 rows, updates columns, and releases its render timer 
+
+    Error: expect(received).toBe(expected) // Object.is equality
+
+    Expected: 0
+    Received: 1
+
+      79 |   await page.locator(SEL.railHistoryLink).click();
+      80 |   await expect(page.locator('h1')).toHaveText('Search history');
+    > 81 |   expect(await intervalCount(page, RENDER_TICK_MS)).toBe(0);
+         |                                                     ^
+      82 |   expect(await waitFor(async () => (await pollState(request)).sse.open === 0, 2_000)).toBe(true);
+      83 | });
+      84 |
+        at /home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui/e2e/tests/teardown-sse.spec.ts:81:53
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/teardown-sse-a-burst-keeps-ad1d7-d-releases-its-render-timer-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/teardown-sse-a-burst-keeps-ad1d7-d-releases-its-render-timer-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/teardown-sse-a-burst-keeps-ad1d7-d-releases-its-render-timer-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/teardown-sse-a-burst-keeps-ad1d7-d-releases-its-render-timer-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  2 failed
+    [chromium] › tests/teardown-sse.spec.ts:27:5 › an unmounted live tail closes its EventSource and stops reconnecting 
+    [chromium] › tests/teardown-sse.spec.ts:57:5 › a burst keeps the newest 5000 rows, updates columns, and releases its render timer 
+-- control: playwright test tests/routing.spec.ts (must pass) --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/routing.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui/dist)
+
+Running 3 tests using 1 worker
+
+  ✓  1 [chromium] › tests/routing.spec.ts:8:5 › / redirects to /search and mounts the DSL editor (806ms)
+  ✓  2 [chromium] › tests/routing.spec.ts:14:5 › rail link to history navigates without a full page load (528ms)
+  ✓  3 [chromium] › tests/routing.spec.ts:31:5 › an unknown route renders the 404 page (355ms)
+
+  3 passed (2.1s)
+-- trunk build (restore pristine dist) --
+2026-09-07T03:18:03.572532Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T03:18:03.572647Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-core)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.83s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T03:18:12.276491Z  INFO applying new distribution
+2026-09-07T03:18:12.279351Z  INFO ✅ success
+
+mutation-check results:
+patch                        outcome
+03-sse-teardown.patch        PASS (target spec failed, control passed, exit 1)
+EXIT=0
+
+######################################################################
+### run 2 of 5
+######################################################################
+
+=== 03-sse-teardown.patch -> teardown-sse.spec.ts ===
+-- trunk build --
+2026-09-07T03:18:12.314270Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T03:18:12.314373Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-core)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.82s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T03:18:21.002035Z  INFO applying new distribution
+2026-09-07T03:18:21.005148Z  INFO ✅ success
+-- playwright test tests/teardown-sse.spec.ts --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/teardown-sse.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui/dist)
+
+Running 2 tests using 1 worker
+
+  ✘  1 [chromium] › tests/teardown-sse.spec.ts:27:5 › an unmounted live tail closes its EventSource and stops reconnecting (3.3s)
+  ✘  2 [chromium] › tests/teardown-sse.spec.ts:57:5 › a burst keeps the newest 5000 rows, updates columns, and releases its render timer (2.0s)
+
+
+  1) [chromium] › tests/teardown-sse.spec.ts:27:5 › an unmounted live tail closes its EventSource and stops reconnecting 
+
+    Error: opens count grew after unmount — the EventSource leaked and reconnected
+
+    expect(received).toBe(expected) // Object.is equality
+
+    Expected: 1
+    Received: 3
+
+      52 |   await page.waitForTimeout(1_500);
+      53 |   const later = await pollState(request);
+    > 54 |   expect(later.sse.opens, 'opens count grew after unmount — the EventSource leaked and reconnected').toBe(opensAtClose);
+         |                                                                                                      ^
+      55 | });
+      56 |
+      57 | test('a burst keeps the newest 5000 rows, updates columns, and releases its render timer', async ({ page, request }) => {
+        at /home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui/e2e/tests/teardown-sse.spec.ts:54:102
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/teardown-sse-an-unmounted--3ce47-urce-and-stops-reconnecting-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/teardown-sse-an-unmounted--3ce47-urce-and-stops-reconnecting-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/teardown-sse-an-unmounted--3ce47-urce-and-stops-reconnecting-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/teardown-sse-an-unmounted--3ce47-urce-and-stops-reconnecting-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  2) [chromium] › tests/teardown-sse.spec.ts:57:5 › a burst keeps the newest 5000 rows, updates columns, and releases its render timer 
+
+    Error: expect(received).toBe(expected) // Object.is equality
+
+    Expected: 0
+    Received: 1
+
+      79 |   await page.locator(SEL.railHistoryLink).click();
+      80 |   await expect(page.locator('h1')).toHaveText('Search history');
+    > 81 |   expect(await intervalCount(page, RENDER_TICK_MS)).toBe(0);
+         |                                                     ^
+      82 |   expect(await waitFor(async () => (await pollState(request)).sse.open === 0, 2_000)).toBe(true);
+      83 | });
+      84 |
+        at /home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui/e2e/tests/teardown-sse.spec.ts:81:53
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/teardown-sse-a-burst-keeps-ad1d7-d-releases-its-render-timer-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/teardown-sse-a-burst-keeps-ad1d7-d-releases-its-render-timer-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/teardown-sse-a-burst-keeps-ad1d7-d-releases-its-render-timer-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/teardown-sse-a-burst-keeps-ad1d7-d-releases-its-render-timer-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  2 failed
+    [chromium] › tests/teardown-sse.spec.ts:27:5 › an unmounted live tail closes its EventSource and stops reconnecting 
+    [chromium] › tests/teardown-sse.spec.ts:57:5 › a burst keeps the newest 5000 rows, updates columns, and releases its render timer 
+-- control: playwright test tests/routing.spec.ts (must pass) --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/routing.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui/dist)
+
+Running 3 tests using 1 worker
+
+  ✓  1 [chromium] › tests/routing.spec.ts:8:5 › / redirects to /search and mounts the DSL editor (818ms)
+  ✓  2 [chromium] › tests/routing.spec.ts:14:5 › rail link to history navigates without a full page load (526ms)
+  ✓  3 [chromium] › tests/routing.spec.ts:31:5 › an unknown route renders the 404 page (356ms)
+
+  3 passed (2.2s)
+-- trunk build (restore pristine dist) --
+2026-09-07T03:18:30.687971Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T03:18:30.688089Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-core)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.04s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T03:18:39.668758Z  INFO applying new distribution
+2026-09-07T03:18:39.671730Z  INFO ✅ success
+
+mutation-check results:
+patch                        outcome
+03-sse-teardown.patch        PASS (target spec failed, control passed, exit 1)
+EXIT=0
+
+######################################################################
+### run 3 of 5
+######################################################################
+
+=== 03-sse-teardown.patch -> teardown-sse.spec.ts ===
+-- trunk build --
+2026-09-07T03:18:43.425307Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T03:18:43.425428Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-core)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.83s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T03:18:52.143468Z  INFO applying new distribution
+2026-09-07T03:18:52.146154Z  INFO ✅ success
+-- playwright test tests/teardown-sse.spec.ts --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/teardown-sse.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui/dist)
+
+Running 2 tests using 1 worker
+
+  ✘  1 [chromium] › tests/teardown-sse.spec.ts:27:5 › an unmounted live tail closes its EventSource and stops reconnecting (3.3s)
+  ✘  2 [chromium] › tests/teardown-sse.spec.ts:57:5 › a burst keeps the newest 5000 rows, updates columns, and releases its render timer (2.0s)
+
+
+  1) [chromium] › tests/teardown-sse.spec.ts:27:5 › an unmounted live tail closes its EventSource and stops reconnecting 
+
+    Error: opens count grew after unmount — the EventSource leaked and reconnected
+
+    expect(received).toBe(expected) // Object.is equality
+
+    Expected: 1
+    Received: 3
+
+      52 |   await page.waitForTimeout(1_500);
+      53 |   const later = await pollState(request);
+    > 54 |   expect(later.sse.opens, 'opens count grew after unmount — the EventSource leaked and reconnected').toBe(opensAtClose);
+         |                                                                                                      ^
+      55 | });
+      56 |
+      57 | test('a burst keeps the newest 5000 rows, updates columns, and releases its render timer', async ({ page, request }) => {
+        at /home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui/e2e/tests/teardown-sse.spec.ts:54:102
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/teardown-sse-an-unmounted--3ce47-urce-and-stops-reconnecting-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/teardown-sse-an-unmounted--3ce47-urce-and-stops-reconnecting-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/teardown-sse-an-unmounted--3ce47-urce-and-stops-reconnecting-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/teardown-sse-an-unmounted--3ce47-urce-and-stops-reconnecting-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  2) [chromium] › tests/teardown-sse.spec.ts:57:5 › a burst keeps the newest 5000 rows, updates columns, and releases its render timer 
+
+    Error: expect(received).toBe(expected) // Object.is equality
+
+    Expected: 0
+    Received: 1
+
+      79 |   await page.locator(SEL.railHistoryLink).click();
+      80 |   await expect(page.locator('h1')).toHaveText('Search history');
+    > 81 |   expect(await intervalCount(page, RENDER_TICK_MS)).toBe(0);
+         |                                                     ^
+      82 |   expect(await waitFor(async () => (await pollState(request)).sse.open === 0, 2_000)).toBe(true);
+      83 | });
+      84 |
+        at /home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui/e2e/tests/teardown-sse.spec.ts:81:53
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/teardown-sse-a-burst-keeps-ad1d7-d-releases-its-render-timer-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/teardown-sse-a-burst-keeps-ad1d7-d-releases-its-render-timer-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/teardown-sse-a-burst-keeps-ad1d7-d-releases-its-render-timer-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/teardown-sse-a-burst-keeps-ad1d7-d-releases-its-render-timer-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  2 failed
+    [chromium] › tests/teardown-sse.spec.ts:27:5 › an unmounted live tail closes its EventSource and stops reconnecting 
+    [chromium] › tests/teardown-sse.spec.ts:57:5 › a burst keeps the newest 5000 rows, updates columns, and releases its render timer 
+-- control: playwright test tests/routing.spec.ts (must pass) --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/routing.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui/dist)
+
+Running 3 tests using 1 worker
+
+  ✓  1 [chromium] › tests/routing.spec.ts:8:5 › / redirects to /search and mounts the DSL editor (801ms)
+  ✓  2 [chromium] › tests/routing.spec.ts:14:5 › rail link to history navigates without a full page load (577ms)
+  ✓  3 [chromium] › tests/routing.spec.ts:31:5 › an unknown route renders the 404 page (356ms)
+
+  3 passed (2.2s)
+-- trunk build (restore pristine dist) --
+2026-09-07T03:19:01.854135Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T03:19:01.854250Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-core)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.84s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T03:19:10.670533Z  INFO applying new distribution
+2026-09-07T03:19:10.673328Z  INFO ✅ success
+
+mutation-check results:
+patch                        outcome
+03-sse-teardown.patch        PASS (target spec failed, control passed, exit 1)
+EXIT=0
+
+######################################################################
+### run 4 of 5
+######################################################################
+
+=== 03-sse-teardown.patch -> teardown-sse.spec.ts ===
+-- trunk build --
+2026-09-07T03:19:10.708911Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T03:19:10.709021Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-core)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.97s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T03:19:19.704179Z  INFO applying new distribution
+2026-09-07T03:19:19.710278Z  INFO ✅ success
+-- playwright test tests/teardown-sse.spec.ts --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/teardown-sse.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui/dist)
+
+Running 2 tests using 1 worker
+
+  ✘  1 [chromium] › tests/teardown-sse.spec.ts:27:5 › an unmounted live tail closes its EventSource and stops reconnecting (3.3s)
+  ✘  2 [chromium] › tests/teardown-sse.spec.ts:57:5 › a burst keeps the newest 5000 rows, updates columns, and releases its render timer (2.0s)
+
+
+  1) [chromium] › tests/teardown-sse.spec.ts:27:5 › an unmounted live tail closes its EventSource and stops reconnecting 
+
+    Error: opens count grew after unmount — the EventSource leaked and reconnected
+
+    expect(received).toBe(expected) // Object.is equality
+
+    Expected: 1
+    Received: 3
+
+      52 |   await page.waitForTimeout(1_500);
+      53 |   const later = await pollState(request);
+    > 54 |   expect(later.sse.opens, 'opens count grew after unmount — the EventSource leaked and reconnected').toBe(opensAtClose);
+         |                                                                                                      ^
+      55 | });
+      56 |
+      57 | test('a burst keeps the newest 5000 rows, updates columns, and releases its render timer', async ({ page, request }) => {
+        at /home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui/e2e/tests/teardown-sse.spec.ts:54:102
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/teardown-sse-an-unmounted--3ce47-urce-and-stops-reconnecting-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/teardown-sse-an-unmounted--3ce47-urce-and-stops-reconnecting-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/teardown-sse-an-unmounted--3ce47-urce-and-stops-reconnecting-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/teardown-sse-an-unmounted--3ce47-urce-and-stops-reconnecting-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  2) [chromium] › tests/teardown-sse.spec.ts:57:5 › a burst keeps the newest 5000 rows, updates columns, and releases its render timer 
+
+    Error: expect(received).toBe(expected) // Object.is equality
+
+    Expected: 0
+    Received: 1
+
+      79 |   await page.locator(SEL.railHistoryLink).click();
+      80 |   await expect(page.locator('h1')).toHaveText('Search history');
+    > 81 |   expect(await intervalCount(page, RENDER_TICK_MS)).toBe(0);
+         |                                                     ^
+      82 |   expect(await waitFor(async () => (await pollState(request)).sse.open === 0, 2_000)).toBe(true);
+      83 | });
+      84 |
+        at /home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui/e2e/tests/teardown-sse.spec.ts:81:53
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/teardown-sse-a-burst-keeps-ad1d7-d-releases-its-render-timer-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/teardown-sse-a-burst-keeps-ad1d7-d-releases-its-render-timer-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/teardown-sse-a-burst-keeps-ad1d7-d-releases-its-render-timer-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/teardown-sse-a-burst-keeps-ad1d7-d-releases-its-render-timer-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  2 failed
+    [chromium] › tests/teardown-sse.spec.ts:27:5 › an unmounted live tail closes its EventSource and stops reconnecting 
+    [chromium] › tests/teardown-sse.spec.ts:57:5 › a burst keeps the newest 5000 rows, updates columns, and releases its render timer 
+-- control: playwright test tests/routing.spec.ts (must pass) --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/routing.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui/dist)
+
+Running 3 tests using 1 worker
+
+  ✓  1 [chromium] › tests/routing.spec.ts:8:5 › / redirects to /search and mounts the DSL editor (829ms)
+  ✓  2 [chromium] › tests/routing.spec.ts:14:5 › rail link to history navigates without a full page load (526ms)
+  ✓  3 [chromium] › tests/routing.spec.ts:31:5 › an unknown route renders the 404 page (356ms)
+
+  3 passed (2.2s)
+-- trunk build (restore pristine dist) --
+2026-09-07T03:19:29.402675Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T03:19:29.402792Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-core)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.83s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T03:19:38.138943Z  INFO applying new distribution
+2026-09-07T03:19:38.144616Z  INFO ✅ success
+
+mutation-check results:
+patch                        outcome
+03-sse-teardown.patch        PASS (target spec failed, control passed, exit 1)
+EXIT=0
+
+######################################################################
+### run 5 of 5
+######################################################################
+
+=== 03-sse-teardown.patch -> teardown-sse.spec.ts ===
+-- trunk build --
+2026-09-07T03:19:38.179857Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T03:19:38.179964Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-core)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.07s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T03:19:47.283303Z  INFO applying new distribution
+2026-09-07T03:19:47.286079Z  INFO ✅ success
+-- playwright test tests/teardown-sse.spec.ts --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/teardown-sse.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui/dist)
+
+Running 2 tests using 1 worker
+
+  ✘  1 [chromium] › tests/teardown-sse.spec.ts:27:5 › an unmounted live tail closes its EventSource and stops reconnecting (3.3s)
+  ✘  2 [chromium] › tests/teardown-sse.spec.ts:57:5 › a burst keeps the newest 5000 rows, updates columns, and releases its render timer (2.0s)
+
+
+  1) [chromium] › tests/teardown-sse.spec.ts:27:5 › an unmounted live tail closes its EventSource and stops reconnecting 
+
+    Error: opens count grew after unmount — the EventSource leaked and reconnected
+
+    expect(received).toBe(expected) // Object.is equality
+
+    Expected: 1
+    Received: 3
+
+      52 |   await page.waitForTimeout(1_500);
+      53 |   const later = await pollState(request);
+    > 54 |   expect(later.sse.opens, 'opens count grew after unmount — the EventSource leaked and reconnected').toBe(opensAtClose);
+         |                                                                                                      ^
+      55 | });
+      56 |
+      57 | test('a burst keeps the newest 5000 rows, updates columns, and releases its render timer', async ({ page, request }) => {
+        at /home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui/e2e/tests/teardown-sse.spec.ts:54:102
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/teardown-sse-an-unmounted--3ce47-urce-and-stops-reconnecting-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/teardown-sse-an-unmounted--3ce47-urce-and-stops-reconnecting-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/teardown-sse-an-unmounted--3ce47-urce-and-stops-reconnecting-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/teardown-sse-an-unmounted--3ce47-urce-and-stops-reconnecting-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  2) [chromium] › tests/teardown-sse.spec.ts:57:5 › a burst keeps the newest 5000 rows, updates columns, and releases its render timer 
+
+    Error: expect(received).toBe(expected) // Object.is equality
+
+    Expected: 0
+    Received: 1
+
+      79 |   await page.locator(SEL.railHistoryLink).click();
+      80 |   await expect(page.locator('h1')).toHaveText('Search history');
+    > 81 |   expect(await intervalCount(page, RENDER_TICK_MS)).toBe(0);
+         |                                                     ^
+      82 |   expect(await waitFor(async () => (await pollState(request)).sse.open === 0, 2_000)).toBe(true);
+      83 | });
+      84 |
+        at /home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui/e2e/tests/teardown-sse.spec.ts:81:53
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/teardown-sse-a-burst-keeps-ad1d7-d-releases-its-render-timer-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/teardown-sse-a-burst-keeps-ad1d7-d-releases-its-render-timer-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/teardown-sse-a-burst-keeps-ad1d7-d-releases-its-render-timer-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/teardown-sse-a-burst-keeps-ad1d7-d-releases-its-render-timer-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  2 failed
+    [chromium] › tests/teardown-sse.spec.ts:27:5 › an unmounted live tail closes its EventSource and stops reconnecting 
+    [chromium] › tests/teardown-sse.spec.ts:57:5 › a burst keeps the newest 5000 rows, updates columns, and releases its render timer 
+-- control: playwright test tests/routing.spec.ts (must pass) --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/routing.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui/dist)
+
+Running 3 tests using 1 worker
+
+  ✓  1 [chromium] › tests/routing.spec.ts:8:5 › / redirects to /search and mounts the DSL editor (814ms)
+  ✓  2 [chromium] › tests/routing.spec.ts:14:5 › rail link to history navigates without a full page load (525ms)
+  ✓  3 [chromium] › tests/routing.spec.ts:31:5 › an unknown route renders the 404 page (358ms)
+
+  3 passed (2.2s)
+-- trunk build (restore pristine dist) --
+2026-09-07T03:19:56.950577Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T03:19:56.950694Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-core)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-157-drawer-repin-poll-teardown-evidence/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.83s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T03:20:05.655076Z  INFO applying new distribution
+2026-09-07T03:20:05.657836Z  INFO ✅ success
+
+mutation-check results:
+patch                        outcome
+03-sse-teardown.patch        PASS (target spec failed, control passed, exit 1)
+EXIT=0
