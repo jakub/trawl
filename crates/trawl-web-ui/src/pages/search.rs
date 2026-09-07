@@ -89,7 +89,7 @@ pub fn Search() -> impl IntoView {
         filters,
         range,
         malformed,
-        repair_href,
+        repair,
     } = url_signals();
 
     Effect::new(move |_| {
@@ -311,7 +311,7 @@ pub fn Search() -> impl IntoView {
     // destination.
     let repair_to = replace_navigator();
     let on_repair = Callback::new(move |()| {
-        let Some(url) = repair_href.get_untracked() else {
+        let Some(r) = repair.get_untracked() else {
             return;
         };
         // "Start over" is the only repair that drops the query, and for
@@ -319,11 +319,14 @@ pub fn Search() -> impl IntoView {
         // that syncs the editor to the executed query never fires and
         // whatever was typed into the still-editable editor would
         // survive a repair that means to clear the page. Clear it here,
-        // at the one repair that leaves no query behind.
-        if malformed.with_untracked(|m| m.as_ref().is_some_and(|m| m.param == Param::Link)) {
+        // at the one repair that leaves no query behind — which is the
+        // repair on offer, not the parameter the banner named: a named
+        // repair whose own link busts the length bound degrades to
+        // starting over, and it takes the buffer with it.
+        if r.param == Param::Link {
             query_text.set(String::new());
         }
-        report_refusal(bus, repair_to(&url));
+        report_refusal(bus, repair_to(&r.href));
     });
 
     let on_navigate_q = {
@@ -479,6 +482,7 @@ pub fn Search() -> impl IntoView {
     let running = loading;
 
     let malformed_sig = Signal::derive(move || malformed.get());
+    let repair_sig = Signal::derive(move || repair.get());
     // The chip strip's own admission that the filters on screen are not
     // the filters in the link.
     let filters_unreadable = Signal::derive(move || {
@@ -515,7 +519,7 @@ pub fn Search() -> impl IntoView {
                     blocked=unreadable
                     on_remove=on_remove_filter
                 />
-                <MalformedNotice malformed=malformed_sig on_repair=on_repair/>
+                <MalformedNotice malformed=malformed_sig repair=repair_sig on_repair=on_repair/>
                 <Tabs
                     items=vec![
                         TabItem::with_count(ResultsTab::Events.id(), "Events", last_count),

@@ -440,6 +440,30 @@ test('a query too long to link is refused before it navigates', async ({ page, r
   const tail = await page.locator(SEL.cmContent).evaluate((el) => (el.textContent ?? '').slice(-6));
   expect(tail, 'the editor lost the query it refused').toBe('zzzEND');
   expect(await capturedQueryCount(request), 'a refused submit ran a query').toBe(0);
+
+  // The same door, walked with the one character the app's encoder used
+  // to spell shorter than the browser does. 12 000 apostrophes are
+  // 12 000 typed bytes and 36 000 in the address bar, `%27` each: with
+  // the apostrophe written literally this submit was ADMITTED, the
+  // browser stored the long form, and the reader answered with the "too
+  // long" banner over an editor the sync effect had just emptied.
+  await page.locator(SEL.cmContent).click();
+  await page.keyboard.press('Control+a');
+  await page.keyboard.insertText(`message="${"'".repeat(12000)}"`);
+  await page.keyboard.press('Control+Enter');
+
+  // Toasts stack for 4.5s, so the first refusal's is probably still up;
+  // both carry the same sentence either way.
+  await expect(page.locator(SEL.toastError).last()).toContainText(COPY.linkTooLongToast);
+
+  await page.waitForTimeout(QUIET_MS);
+  expect(page.url(), 'an apostrophe query navigated anyway').toBe(before);
+  await expect(page.locator(SEL.urlNotice)).toHaveCount(0);
+  const quoted = await page
+    .locator(SEL.cmContent)
+    .evaluate((el) => (el.textContent ?? '').slice(-8));
+  expect(quoted, 'the editor lost the apostrophe query').toContain("'''");
+  expect(await capturedQueryCount(request), 'an apostrophe query ran').toBe(0);
 });
 
 test('q encoding matches encodeURIComponent', async ({ page }) => {
@@ -452,17 +476,61 @@ test('q encoding matches encodeURIComponent', async ({ page }) => {
   // encodeURIComponent produce the same string, character for
   // character.
   const browserEncoded = await page.evaluate((raw) => encodeURIComponent(raw), COPY.reservedSet);
-  expect(browserEncoded).toBe(COPY.reservedSetEncoded);
+  // One character apart, and the app is on the browser's side of it:
+  // encodeURIComponent leaves an apostrophe literal, but `'` is in the
+  // URL standard's special-query percent-encode set, so Chromium stores
+  // `%27` the moment it keeps the link. The app encodes it too, which
+  // is what makes admission measure the string the address bar will
+  // hold. Everything else agrees character for character — `!`, `~`,
+  // `*`, `(` and `)` are asserted literal on both sides below, so the
+  // apostrophe really is the only one the serializer rewrites.
+  expect(browserEncoded).toBe(COPY.reservedSetEncoded.replaceAll('%27', "'"));
 
-  // What the address bar then shows is Chromium's own re-serialization
-  // of that URL: it percent-encodes an apostrophe in the query even
-  // though encodeURIComponent leaves it (the URL standard's
-  // special-query percent-encode set). Nothing else moves…
+  // What the address bar shows is what this app wrote, byte for byte.
   const search = await page.evaluate(() => location.search);
-  expect(search).toBe(`?q=${COPY.reservedSetEncoded.replaceAll("'", '%27')}&page=0`);
+  expect(search).toBe(`?q=${COPY.reservedSetEncoded}&page=0`);
   // …and it decodes back to exactly what was typed.
   const roundTripped = await page.evaluate(() => new URLSearchParams(location.search).get('q'));
   expect(roundTripped).toBe(COPY.reservedSet);
+});
+
+test('a repair that cannot be admitted offers Start over instead', async ({ page, request }) => {
+  // This link reads fine as it stands: a bare `+` is one byte in the
+  // URL and arrives as a space. The range repair carries `q` back
+  // through the encoder, where each of those spaces becomes `%20`, so
+  // "Use last 15 minutes" would build a 32 KiB+ link the producer's own
+  // door refuses — a banner offering a button that does nothing, on a
+  // page where every other control is disabled. 10 918 spaces is the
+  // first count that busts it.
+  await resetScenario(request, 'default');
+  const url = `/search?q=service%3Dnginx${'+'.repeat(10918)}&r=garbage`;
+  await page.goto(url);
+
+  const notice = page.locator(SEL.urlNotice);
+  await expect(notice).toBeVisible();
+  // The sentence is unchanged: the banner has not changed its mind
+  // about what is broken, only about what it can do next.
+  await expect(notice).toContainText(COPY.urlNoticeRangePrefix);
+  await expect(page.locator(SEL.urlNoticeRaw)).toHaveText('garbage');
+  await expect(page.locator(SEL.urlNoticeRepair)).toHaveText(COPY.urlNoticeRepairLink);
+
+  await page.waitForTimeout(QUIET_MS);
+  expect(await capturedQueryCount(request), 'an unrepairable link posted a query').toBe(0);
+
+  const historyBefore = await page.evaluate(() => history.length);
+  await page.locator(SEL.urlNoticeRepair).click();
+  await expect(page.locator(SEL.urlNotice)).toHaveCount(0);
+  expect(await page.evaluate(() => location.pathname)).toBe('/search');
+  expect(await page.evaluate(() => location.search)).toBe('');
+  expect(await page.evaluate(() => history.length)).toBe(historyBefore);
+  // Starting over takes the editor buffer with it, wherever the repair
+  // was reached from.
+  await expect(page.locator(SEL.cmContent)).not.toContainText('service=nginx');
+  await expect(page.locator(SEL.cmContent)).toHaveText('');
+
+  // An empty query runs nothing, so the page it lands on is idle.
+  await page.waitForTimeout(QUIET_MS);
+  expect(await capturedQueryCount(request), 'starting over ran a query').toBe(0);
 });
 
 test('back and forward restore each entry exactly once', async ({ page, request }) => {

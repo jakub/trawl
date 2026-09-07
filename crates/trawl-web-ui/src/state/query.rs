@@ -32,8 +32,8 @@ pub use crate::query_merge::{Filter, FilterOp, QUICK_RANGES, RangeSpec, effectiv
 pub use crate::search_url::{Mode, build_search_url};
 
 use crate::search_url::{
-    Malformed, Reason, Verdict, admit_search, decode_filters, decode_range, first_value,
-    parse_page, read_search, refusal_copy, repair_url,
+    Malformed, Reason, Repair, Verdict, admit_search, decode_filters, decode_range, first_value,
+    parse_page, plan_repair, read_search, refusal_copy,
 };
 
 use fleet_ui::{ToastBus, ToastKind};
@@ -84,10 +84,12 @@ pub fn navigator()
 /// `(q, page, mode, filters, range)` tuple. Same `use_navigate` rule as
 /// [`navigator`] — call it from a component body.
 ///
-/// Admitted like [`navigator`], and for a reason that is not theoretical
-/// here: a repair carries every other parameter through, and
-/// `repair_url` percent-encodes `q` on the way, so a link inside the
-/// bound can be rewritten into one past it.
+/// Admitted like [`navigator`]. A repair carries every other parameter
+/// through and percent-encodes `q` on the way, so a link inside the
+/// bound can be rewritten into one past it — which is why
+/// `search_url::plan_repair` asks the same question when it decides
+/// which button to render. This check stays because a navigator that
+/// trusts its caller is how the two drift apart.
 pub fn replace_navigator() -> impl Fn(&str) -> Result<(), Reason> + Clone + 'static {
     let nav = use_navigate();
     move |url: &str| {
@@ -117,8 +119,8 @@ pub fn report_refusal(bus: ToastBus, outcome: Result<(), Reason>) {
 }
 
 /// URL-driven signals: executed query, page, mode, filters, range, the
-/// one parameter (if any) that could not be read, and the URL its repair
-/// button goes to.
+/// one parameter (if any) that could not be read, and the repair its
+/// banner offers.
 ///
 /// `filters`, `range` and `page` fall back to their defaults for a
 /// malformed value so the page still renders; `malformed` is what stops
@@ -133,15 +135,17 @@ pub struct UrlSignals {
     pub filters: Memo<Vec<Filter>>,
     pub range: Memo<RangeSpec>,
     pub malformed: Memo<Option<Malformed>>,
-    /// Where the repair button goes: this link with the named parameter
-    /// replaced and every other parameter carried through as it arrived,
-    /// raw. `None` while the link reads.
+    /// The repair on offer: where the button goes, and which repair it
+    /// is (which is its label, and whether the editor buffer is cleared
+    /// with it). `None` while the link reads.
     ///
     /// Built from the raw query pairs rather than from the memos
     /// above, because those have already fallen back to their defaults:
     /// a link that is wrong in two places must not lose the second one
-    /// to a click that repaired the first.
-    pub repair_href: Memo<Option<String>>,
+    /// to a click that repaired the first. Admitted here too, so a
+    /// candidate the producer's own door would refuse becomes "Start
+    /// over" in the banner instead of a button that fails when clicked.
+    pub repair: Memo<Option<Repair>>,
 }
 
 /// Hook up URL-driven signals for everything read back from the URL.
@@ -187,10 +191,10 @@ pub fn url_signals() -> UrlSignals {
             .or_else(|| page_read.with(|v| v.malformed().cloned()))
     });
 
-    let repair_href = Memo::new(move |_| {
+    let repair = Memo::new(move |_| {
         let param = malformed.with(|m| m.as_ref().map(|m| m.param))?;
         Some(params.with(|p| {
-            repair_url(
+            plan_repair(
                 p.iter()
                     .map(|(name, value)| (name.as_str(), value.as_str())),
                 param,
@@ -205,6 +209,6 @@ pub fn url_signals() -> UrlSignals {
         filters,
         range,
         malformed,
-        repair_href,
+        repair,
     }
 }

@@ -322,10 +322,10 @@ const CONTRACTS: &[Contract] = &[
         hook: "pub const RESERVED_SET: &str = \" #&/:%'!~*()\u{65e5}\u{672c}\u{8a9e}\u{1f600}\";",
     },
     Contract {
-        assignment: "reservedSetEncoded: \"%20%23%26%2F%3A%25'!~*()%E6%97%A5%E6%9C%AC%E8%AA%9E%F0%9F%98%80\",",
+        assignment: "reservedSetEncoded: '%20%23%26%2F%3A%25%27!~*()%E6%97%A5%E6%9C%AC%E8%AA%9E%F0%9F%98%80',",
         source_path: "src/search_url.rs",
         source: SEARCH_URL_RS,
-        hook: "\"%20%23%26%2F%3A%25'!~*()%E6%97%A5%E6%9C%AC%E8%AA%9E%F0%9F%98%80\"",
+        hook: "\"%20%23%26%2F%3A%25%27!~*()%E6%97%A5%E6%9C%AC%E8%AA%9E%F0%9F%98%80\"",
     },
     Contract {
         assignment: "urlNoticeTooLong: 'This link is too long to read.',",

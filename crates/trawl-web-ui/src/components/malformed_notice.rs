@@ -18,7 +18,7 @@
 
 use leptos::prelude::*;
 
-use crate::search_url::Malformed;
+use crate::search_url::{Malformed, Repair};
 
 /// One line over the results: which parameter could not be read, what it
 /// says, and the single repair on offer.
@@ -28,8 +28,15 @@ pub fn MalformedNotice(
     /// readable — which is the ordinary case and renders nothing.
     #[prop(into)]
     malformed: Signal<Option<Malformed>>,
-    /// Replaces the offending parameter with its default, as a replace
-    /// navigation. Nothing else in the app navigates on a decode.
+    /// The repair on offer, already admitted by `search_url::plan_repair`
+    /// — usually the named parameter's default, and "Start over" when
+    /// that one would build a link this app cannot read back. The button
+    /// reads its label, so what it says is a verdict rather than a hope
+    /// about what the click will do.
+    #[prop(into)]
+    repair: Signal<Option<Repair>>,
+    /// Navigates to that repair, replacing the current history entry.
+    /// Nothing else in the app navigates on a decode.
     on_repair: Callback<()>,
 ) -> impl IntoView {
     view! {
@@ -52,13 +59,15 @@ pub fn MalformedNotice(
                             <code class="url-notice-raw">{raw}</code>
                         })}
                     </span>
-                    <button
-                        type="button"
-                        class="url-notice-repair"
-                        on:click=move |_| on_repair.run(())
-                    >
-                        {m.repair_label()}
-                    </button>
+                    {move || repair.get().map(|r| view! {
+                        <button
+                            type="button"
+                            class="url-notice-repair"
+                            on:click=move |_| on_repair.run(())
+                        >
+                            {r.label()}
+                        </button>
+                    })}
                 </div>
             }})}
         </div>

@@ -123,10 +123,13 @@ pub const MAX_RANGE_BYTES: usize = 64;
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub const RESERVED_SET: &str = " #&/:%'!~*()日本語😀";
 /// [`RESERVED_SET`] as `percent_encode` renders it, which is also what
-/// the browser's own `encodeURIComponent` renders.
+/// the browser KEEPS in `location.search` once it has stored the link.
+/// That is the string the bounds are measured against, so it is the one
+/// pinned here — `encodeURIComponent` differs from it in exactly one
+/// place, the apostrophe (see [`percent_encode`]).
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub const RESERVED_SET_ENCODED: &str =
-    "%20%23%26%2F%3A%25'!~*()%E6%97%A5%E6%9C%AC%E8%AA%9E%F0%9F%98%80";
+    "%20%23%26%2F%3A%25%27!~*()%E6%97%A5%E6%9C%AC%E8%AA%9E%F0%9F%98%80";
 
 /// Whether a query string may be handed to an execution endpoint at all.
 ///
@@ -326,16 +329,21 @@ impl Malformed {
             }
         }
     }
+}
 
-    /// The one repair the banner offers, as its button reads.
-    #[must_use]
-    pub const fn repair_label(&self) -> &'static str {
-        match self.param {
-            Param::Filters => "Drop filters",
-            Param::Range => "Use last 15 minutes",
-            Param::Page => "Go to page 1",
-            Param::Link => "Start over",
-        }
+/// One repair's button text.
+///
+/// A free function rather than a method on [`Malformed`] or [`Param`]:
+/// the label belongs to the repair that is actually OFFERED, which
+/// [`plan_repair`] decides, and a verdict-shaped `m.repair_label()` was
+/// how the banner came to promise a button that refused itself.
+#[must_use]
+pub const fn repair_label(param: Param) -> &'static str {
+    match param {
+        Param::Filters => "Drop filters",
+        Param::Range => "Use last 15 minutes",
+        Param::Page => "Go to page 1",
+        Param::Link => "Start over",
     }
 }
 
@@ -369,23 +377,32 @@ impl<T> Verdict<T> {
     }
 }
 
-/// Percent-encode one URL query-parameter value exactly as the browser's
-/// `encodeURIComponent` does: `A-Za-z0-9-_.!~*'()` pass through, every
-/// other byte of the UTF-8 encoding becomes `%XX` with uppercase hex.
+/// Percent-encode one URL query-parameter value into the string the
+/// browser will KEEP: `A-Za-z0-9-_.!~*()` pass through, every other byte
+/// of the UTF-8 encoding becomes `%XX` with uppercase hex.
+///
+/// That set is `encodeURIComponent`'s minus the apostrophe, and the
+/// apostrophe is the whole reason this is not simply a mirror of that
+/// function. `encodeURIComponent("'")` is `'`, but `'` is in the URL
+/// standard's special-query percent-encode set, so the moment the
+/// browser stores the link it serializes it back as `%27`: one typed
+/// character, three bytes in `location.search`. Encoding it here is what
+/// makes the producer's string byte-identical to the reader's — writing
+/// it literally made [`admit_search`] measure a third of the truth, and
+/// 10 900 apostrophes passed the door and came back as the "too long"
+/// banner over an editor the page had just cleared.
 ///
 /// Hand-rolled rather than `js_sys`, so `build_search_url` is a pure
 /// function the host can test; the browser spec submits [`RESERVED_SET`]
-/// and compares against [`RESERVED_SET_ENCODED`] to prove the two agree.
+/// and compares `location.search` against [`RESERVED_SET_ENCODED`] to
+/// prove the two agree, apostrophe included.
 #[must_use]
 pub fn percent_encode(s: &str) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = String::with_capacity(s.len());
     for &byte in s.as_bytes() {
         if byte.is_ascii_alphanumeric()
-            || matches!(
-                byte,
-                b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')'
-            )
+            || matches!(byte, b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'(' | b')')
         {
             out.push(byte as char);
         } else {
@@ -741,6 +758,56 @@ pub fn repair_url<'a>(
     url
 }
 
+/// The repair the banner offers: where its button goes, and which repair
+/// it turned out to be.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Repair {
+    /// The link the button navigates to. Always one [`admit_search`]
+    /// accepts.
+    pub href: String,
+    /// Which repair this is. Usually the parameter the banner named;
+    /// [`Param::Link`] when the named repair degraded to starting over,
+    /// which is also what says the editor buffer goes with it.
+    pub param: Param,
+}
+
+impl Repair {
+    /// The button's text.
+    #[must_use]
+    pub const fn label(&self) -> &'static str {
+        repair_label(self.param)
+    }
+}
+
+/// Decide which repair a banner can actually offer, and where it goes.
+///
+/// [`repair_url`] carries every other parameter through and re-encodes
+/// it on the way, so a link that is inside the length bound as it stands
+/// can be rewritten into one past it: 10 918 spaces in `q` arrive as
+/// bare `+` (one byte each) and go back out as `%20` (three), and the
+/// range repair the banner named builds a 32 KiB+ link. Asking
+/// [`admit_search`] here rather than at the click is what stops the
+/// banner offering a button that refuses itself, leaving a reader with a
+/// dead control and every other control disabled around it.
+///
+/// The fallback is the whole-link repair: `/search`, no query string,
+/// which is admitted by construction and is exactly what a reader stuck
+/// at an unrepairable link wants.
+#[must_use]
+pub fn plan_repair<'a>(
+    params: impl IntoIterator<Item = (&'a str, &'a str)>,
+    which: Param,
+) -> Repair {
+    let href = repair_url(params, which);
+    if which != Param::Link && admit_search(&href).is_err() {
+        return Repair {
+            href: repair_url(std::iter::empty(), Param::Link),
+            param: Param::Link,
+        };
+    }
+    Repair { href, param: which }
+}
+
 /// Write a carried-through value back the way the producer would have
 /// written it.
 ///
@@ -1043,13 +1110,13 @@ mod tests {
     // ---- percent encoder -------------------------------------------
 
     /// Whether a byte passes through unencoded, spelled out here so the
-    /// table below is checked against the rule rather than the code.
+    /// table below is checked against the rule rather than the code. The
+    /// apostrophe is NOT in it: the browser re-encodes that one on the
+    /// way into `location.search`, so a link that spelled it literally
+    /// would be measured shorter than the link the browser keeps.
     fn unreserved(byte: u8) -> bool {
         byte.is_ascii_alphanumeric()
-            || matches!(
-                byte,
-                b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')'
-            )
+            || matches!(byte, b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'(' | b')')
     }
 
     #[test]
@@ -1108,6 +1175,13 @@ mod tests {
     #[test]
     fn the_reserved_set_encodes_to_the_pinned_literal() {
         assert_eq!(percent_encode(RESERVED_SET), RESERVED_SET_ENCODED);
+        // The literal is the browser's own storage form, so it carries
+        // the apostrophe encoded. `search-url.spec.ts` asserts
+        // `location.search` against this same string; the one place
+        // `encodeURIComponent` disagrees is right here.
+        assert!(RESERVED_SET.contains('\''));
+        assert!(!RESERVED_SET_ENCODED.contains('\''));
+        assert_eq!(percent_encode("'"), "%27");
     }
 
     #[test]
@@ -1244,7 +1318,7 @@ mod tests {
         assert_eq!(m.reason, Reason::TooManyParameters);
         assert!(read.params().is_empty());
         assert_eq!(m.message(), "This link has too many parameters to read.");
-        assert_eq!(m.repair_label(), "Start over");
+        assert_eq!(repair_label(m.param), "Start over");
         assert_eq!(m.truncated_raw(), "");
 
         // 60 unknown pairs is comfortably inside it, `q` and all.
@@ -1311,7 +1385,7 @@ mod tests {
         assert!(read.params().is_empty());
         assert_eq!(m.truncated_raw(), "");
         assert_eq!(m.message(), "This link is too long to read.");
-        assert_eq!(m.repair_label(), "Start over");
+        assert_eq!(repair_label(m.param), "Start over");
         // The repair is the page with no query string, not an edit of a
         // link the reader never read.
         assert_eq!(
@@ -1388,6 +1462,58 @@ mod tests {
 
         let over_cap = build_search_url(
             &"a".repeat(MAX_SEARCH_BYTES - "q=".len() - "&page=0".len() + 1),
+            0,
+            Mode::Snapshot,
+            &[],
+            &RangeSpec::default(),
+        );
+        let search = over_cap.split_once('?').unwrap().1;
+        assert_eq!(search.len(), MAX_SEARCH_BYTES + 1);
+        assert_eq!(admit_search(&over_cap), Err(Reason::LinkTooLong));
+        assert_eq!(
+            read_search(search).malformed().map(|m| m.reason),
+            Some(Reason::LinkTooLong)
+        );
+    }
+
+    /// The same boundary, walked with the one character the browser
+    /// spells differently from `encodeURIComponent`.
+    ///
+    /// A DSL string literal is where apostrophes come in bulk, and
+    /// `message="'''…"` is what the reviewer submitted. While the
+    /// encoder wrote `'` literally, admission counted one byte per
+    /// apostrophe and the address bar stored three: 10 900 of them
+    /// passed the producer's door, the browser handed back a 32 KiB+
+    /// query string, and the reader answered with the "too long" banner
+    /// over an editor the sync effect had already emptied. Both doors
+    /// now measure the same bytes.
+    #[test]
+    fn the_boundary_holds_for_the_character_the_browser_re_encodes() {
+        // `message="` + `a` + N apostrophes + `"`. The wrapper is 16
+        // bytes encoded (`message` verbatim, `%3D`, two `%22`), each
+        // apostrophe is 3, the `a` is 1, and `q=` + `&page=0` add 9 —
+        // so N = 10 914 puts the query string exactly on the cap.
+        let at_cap = build_search_url(
+            &format!("message=\"a{}\"", "'".repeat(10_914)),
+            0,
+            Mode::Snapshot,
+            &[],
+            &RangeSpec::default(),
+        );
+        let search = at_cap.split_once('?').unwrap().1;
+        assert_eq!(search.len(), MAX_SEARCH_BYTES);
+        // What admission measured is what the browser keeps: no
+        // apostrophe survives into the link.
+        assert!(!search.contains('\''));
+        assert_eq!(admit_search(&at_cap), Ok(()));
+        assert_eq!(read_search(search).malformed(), None);
+        assert_eq!(
+            first_value(read_search(search).params(), "q").map(str::len),
+            Some("message=\"a\"".len() + 10_914)
+        );
+
+        let over_cap = build_search_url(
+            &format!("message=\"aa{}\"", "'".repeat(10_914)),
             0,
             Mode::Snapshot,
             &[],
@@ -2064,19 +2190,19 @@ mod tests {
         let long = "x".repeat(200);
         let m = Malformed::new(Param::Filters, &long, Reason::UndecodableFilters);
         assert_eq!(m.message(), "This link's filters could not be read:");
-        assert_eq!(m.repair_label(), "Drop filters");
+        assert_eq!(repair_label(m.param), "Drop filters");
         assert_eq!(m.truncated_raw().chars().count(), RAW_DISPLAY_CHARS + 1);
         assert!(m.truncated_raw().ends_with('\u{2026}'));
 
         let short = Malformed::new(Param::Range, "garbage", Reason::UnreadableRange);
         assert_eq!(short.message(), "This link's time range could not be read:");
-        assert_eq!(short.repair_label(), "Use last 15 minutes");
+        assert_eq!(repair_label(short.param), "Use last 15 minutes");
         assert_eq!(short.truncated_raw(), "garbage");
 
         // Cut on a char boundary, never inside a multibyte character.
         let wide = Malformed::new(Param::Page, &"日".repeat(200), Reason::PageOffsetOverflow);
         assert_eq!(wide.message(), "This link's page could not be read:");
-        assert_eq!(wide.repair_label(), "Go to page 1");
+        assert_eq!(repair_label(wide.param), "Go to page 1");
         assert!(wide.truncated_raw().starts_with('日'));
         assert_eq!(wide.truncated_raw().chars().count(), RAW_DISPLAY_CHARS + 1);
     }
@@ -2181,6 +2307,51 @@ mod tests {
             repair_url([("q", RESERVED_SET), ("f", "v1.!")], Param::Filters),
             format!("/search?q={RESERVED_SET_ENCODED}")
         );
+    }
+
+    /// A repair whose own link busts the bound degrades to starting
+    /// over, decided here rather than at a click that would fail.
+    ///
+    /// The reviewer's link: `q=service%3Dnginx` followed by 10 918 bare
+    /// `+`, which the browser hands over as spaces, and `r=garbage`. The
+    /// raw link is 11 KB and reads fine; the range repair re-encodes
+    /// those spaces as `%20` and lands past 32 KiB, so "Use last 15
+    /// minutes" used to be a button that did nothing while every other
+    /// control on the page was disabled.
+    #[test]
+    fn a_repair_that_cannot_be_admitted_degrades_to_starting_over() {
+        let long_q = format!("service=nginx{}", " ".repeat(10_918));
+        let params = [("q", long_q.as_str()), ("r", "garbage")];
+        assert_eq!(
+            admit_search(&repair_url(params, Param::Range)),
+            Err(Reason::LinkTooLong)
+        );
+
+        let repair = plan_repair(params, Param::Range);
+        assert_eq!(repair.param, Param::Link);
+        assert_eq!(repair.href, "/search");
+        assert_eq!(repair.label(), "Start over");
+        assert_eq!(admit_search(&repair.href), Ok(()));
+
+        // One space fewer and the named repair fits, so it stands: the
+        // fallback is the exception, not the rule.
+        let fits_q = format!("service=nginx{}", " ".repeat(10_917));
+        let repair = plan_repair([("q", fits_q.as_str()), ("r", "garbage")], Param::Range);
+        assert_eq!(repair.param, Param::Range);
+        assert_eq!(repair.label(), "Use last 15 minutes");
+        assert_eq!(admit_search(&repair.href), Ok(()));
+        assert!(!repair.href.contains("r="));
+
+        // An ordinary broken link is untouched by any of this.
+        let repair = plan_repair([("q", "service=nginx"), ("f", "v1.!")], Param::Filters);
+        assert_eq!(repair.param, Param::Filters);
+        assert_eq!(repair.href, "/search?q=service%3Dnginx");
+
+        // And the whole-link repair is its own answer, not a fallback
+        // onto itself.
+        let repair = plan_repair([("q", long_q.as_str())], Param::Link);
+        assert_eq!(repair.param, Param::Link);
+        assert_eq!(repair.href, "/search");
     }
 
     /// A repaired URL is one the reader reads back without a banner.

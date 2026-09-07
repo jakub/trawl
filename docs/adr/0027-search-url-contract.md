@@ -46,7 +46,14 @@ A link whose structured state does not parse is shown, not run.**
   cap gets the server's 400 through the error banner the results pane
   already has (run ruling 2026-09-06, closing a prep gap). The banner
   offers one repair (drop filters, use last 15m, page 0) that rewrites
-  the URL only when clicked, with a replace navigation. The broken URL
+  the URL only when clicked, with a replace navigation. A repair whose
+  own candidate link cannot be admitted degrades to "Start over" — the
+  banner keeps its sentence and swaps the button, because carrying the
+  other parameters through re-encodes them and can push the repaired
+  link past the length bound, and a button that refuses itself on a page
+  where every other control is disabled is a dead end (run ruling
+  2026-09-06). The verdict is computed with the href, not discovered at
+  the click. The broken URL
   stays intact until then so it can be sent back to whoever shared it. An
   unparseable `page` is a missing value and reads as 0; an out-of-range
   one is a false claim and is malformed. A malformed versioned `f` is no
@@ -101,13 +108,19 @@ A link whose structured state does not parse is shown, not run.**
   module as the encoder (run ruling 2026-09-06). `f` is base64url and `r`
   is a closed timestamp grammar, so only `q` could carry the `%` that
   exposed it.
-- **The percent encoder is a pure, hand-rolled mirror of
-  `encodeURIComponent`** (unreserved `A-Za-z0-9-_.!~*'()`, uppercase hex,
-  UTF-8 bytes), used only for `q`. Two drift guards: an exhaustive native
-  table test over every ASCII byte plus multibyte and malformed input, and
-  one browser spec that submits the reserved set and compares
-  `location.search` to the same literal. `percent-encoding` would need the
-  same table written by hand and adds a direct dependency for nothing.
+- **The percent encoder writes the string the browser will keep**
+  (unreserved `A-Za-z0-9-_.!~*()`, uppercase hex, UTF-8 bytes), used only
+  for `q`. That is `encodeURIComponent`'s set minus the apostrophe, and
+  the app encodes the apostrophe because the browser does: `'` is in the
+  URL standard's special-query percent-encode set, so a literal one is
+  stored as `%27` and an encoder that wrote it literally measured a third
+  of the bytes admission is about, letting ~10 900 apostrophes through
+  the door and back as the "too long" banner (run ruling 2026-09-06).
+  Two drift guards: an exhaustive native table test over every ASCII byte
+  plus multibyte and malformed input, and one browser spec that submits
+  the reserved set and compares `location.search` to the same literal.
+  `percent-encoding` would need the same table written by hand and adds a
+  direct dependency for nothing.
 - **Back and Forward: the URL is the document.** After A → B → Back →
   Forward the URL is byte-identical to what the navigator built, exactly
   one query is posted per state change (the DSL sequence A, B, A, B), and

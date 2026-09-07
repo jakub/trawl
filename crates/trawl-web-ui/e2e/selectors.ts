@@ -120,8 +120,11 @@ export const COPY = {
   /// drift guard's input, typed into the editor by search-url.spec.ts and
   /// checked byte for byte against the native table test's expectation.
   reservedSet: " #&/:%'!~*()日本語😀",
-  /// crates/trawl-web-ui/src/search_url.rs RESERVED_SET_ENCODED.
-  reservedSetEncoded: "%20%23%26%2F%3A%25'!~*()%E6%97%A5%E6%9C%AC%E8%AA%9E%F0%9F%98%80",
+  /// crates/trawl-web-ui/src/search_url.rs RESERVED_SET_ENCODED — what
+  /// the app's encoder writes AND what the browser keeps in
+  /// location.search, which are the same string. encodeURIComponent
+  /// differs from it at the apostrophe alone.
+  reservedSetEncoded: '%20%23%26%2F%3A%25%27!~*()%E6%97%A5%E6%9C%AC%E8%AA%9E%F0%9F%98%80',
   /// crates/trawl-web-ui/src/search_url.rs EMPTY_QUERY_REFUSAL.
   emptyQueryRefusal: 'Nothing to export: the query is empty.',
   /// crates/trawl-web-ui/src/search_url.rs Malformed::message, the
