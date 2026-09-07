@@ -292,14 +292,24 @@ fn RowFragment(
 
     view! {
         <>
-            <tr
-                class:expanded=move || expanded.get() == Some(idx)
-                on:click=move |_| expanded.update(|cur| {
-                    *cur = if *cur == Some(idx) { None } else { Some(idx) };
-                })
-            >
+            <tr class:expanded=move || expanded.get() == Some(idx)>
                 <td class="exp-col">
-                    {move || if expanded.get() == Some(idx) { "▾" } else { "▸" }}
+                    // The row's one control (ADR-0029): the caret button
+                    // stretches over the row, so a pointer anywhere on it
+                    // toggles the detail exactly once.
+                    <button
+                        type="button"
+                        class="row-stretch"
+                        aria-expanded=move || (expanded.get() == Some(idx)).to_string()
+                        aria-label=format!("Show details for result {}", idx + 1)
+                        on:click=move |_| expanded.update(|cur| {
+                            *cur = if *cur == Some(idx) { None } else { Some(idx) };
+                        })
+                    >
+                        <span aria-hidden="true">
+                            {move || if expanded.get() == Some(idx) { "▾" } else { "▸" }}
+                        </span>
+                    </button>
                 </td>
                 {cells}
             </tr>
@@ -312,20 +322,25 @@ fn RowFragment(
                                 let value_text = value_to_string(v);
                                 let field_for_click = name.clone();
                                 let value_for_click = value_text.clone();
+                                let field_for_label = name.clone();
+                                let value_for_label = value_text.clone();
                                 view! {
                                     <span class="k">{key}</span>
                                     <span class="v">
-                                        <span
+                                        <button
+                                            type="button"
                                             class="tag"
-                                            on:click=move |e| {
-                                                e.stop_propagation();
+                                            aria-label=format!(
+                                                "Include {field_for_label} = {value_for_label}",
+                                            )
+                                            on:click=move |_| {
                                                 on_add_filter.run(Filter {
                                                     field: field_for_click.clone(),
                                                     value: value_for_click.clone(),
                                                     op: FilterOp::Include,
                                                 });
                                             }
-                                        >{value_text}</span>
+                                        >{value_text}</button>
                                     </span>
                                 }
                             }).collect::<Vec<_>>()}
@@ -383,7 +398,7 @@ fn ShowContextButton(
         ),
     });
     view! {
-        <Btn variant=Variant::Secondary stop_propagation=true on_click=on_click>"Show context"</Btn>
+        <Btn variant=Variant::Secondary on_click=on_click>"Show context"</Btn>
     }
 }
 
@@ -403,7 +418,7 @@ fn FindSimilarButton(
         ),
     });
     view! {
-        <Btn variant=Variant::Secondary stop_propagation=true on_click=on_click>"Find similar"</Btn>
+        <Btn variant=Variant::Secondary on_click=on_click>"Find similar"</Btn>
     }
 }
 
