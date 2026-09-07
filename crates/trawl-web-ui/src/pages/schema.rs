@@ -231,16 +231,6 @@ pub fn SchemaPage() -> impl IntoView {
     let on_open_field: Callback<String> = Callback::new(move |field: String| push_field(&field));
     let on_field_back: Callback<()> = Callback::new(move |()| back_field());
 
-    let on_open: Callback<String> = {
-        let push = push_svc.clone();
-        Callback::new(move |name: String| {
-            // A drawer opened from the table has no pending return: any
-            // focus request left over from an abandoned drill-in would
-            // otherwise steal focus into this service's fields.
-            focus_field.set(None);
-            push(Some(&name), DEFAULT_SCHEMA_TAB);
-        })
-    };
     let on_tail: Callback<String> = {
         let push = push_svc.clone();
         Callback::new(move |name: String| push(Some(&name), "tail"))
@@ -421,9 +411,20 @@ pub fn SchemaPage() -> impl IntoView {
                                 let degraded = degraded_count(&svc);
 
                                 let name_for_active = name.clone();
-                                let name_open = name.clone();
+                                // The row's one control is a link: the
+                                // drawer is a place with a URL, built by
+                                // the same encoder and default tab
+                                // `push_svc` writes, and `prop:replace`
+                                // below is that call's `replace: true`.
+                                let href = format!(
+                                    "/search/schema?svc={}&stab={}",
+                                    enc(&name),
+                                    sanitize_tab(Some(DEFAULT_SCHEMA_TAB)),
+                                );
                                 let name_search = name.clone();
                                 let name_tail = name.clone();
+                                let name_label_search = name.clone();
+                                let name_label_tail = name.clone();
                                 view! {
                                     <div
                                         class="tbl-row"
@@ -431,11 +432,25 @@ pub fn SchemaPage() -> impl IntoView {
                                             svc_selected.get().as_deref()
                                                 == Some(name_for_active.as_str())
                                         }
-                                        on:click=move |_| on_open.run(name_open.clone())
                                     >
                                         <div class="svc-cell" style="flex:2; min-width:0">
                                             <StatusDot tone=dot_tone/>
-                                            <span class="mono name">{name}</span>
+                                            <a
+                                                class="row-stretch"
+                                                href=href
+                                                prop:replace=true
+                                                // Not navigation and not a
+                                                // preventDefault: a drawer
+                                                // opened from the table has
+                                                // no pending return, and a
+                                                // focus request left over
+                                                // from an abandoned drill-in
+                                                // would steal focus into this
+                                                // service's fields.
+                                                on:click=move |_| focus_field.set(None)
+                                            >
+                                                <span class="mono name">{name}</span>
+                                            </a>
                                             // Count, not colour alone: the badge
                                             // says how many of this service's
                                             // fields the catalog calls degraded.
@@ -455,26 +470,27 @@ pub fn SchemaPage() -> impl IntoView {
                                         <div class="num" style="flex:0 0 56px">{field_count}</div>
                                         <div class="num" style="flex:0 0 68px">{coverage_label}</div>
                                         <div class="row-act" style="flex:0 0 64px">
-                                            <span
+                                            // Commands, not places: both go
+                                            // through the navigator, which
+                                            // can refuse an over-bound query
+                                            // (ADR-0027), and an anchor has
+                                            // no way to say no.
+                                            <button
+                                                type="button"
                                                 class="qa"
-                                                title="Search this service"
-                                                on:click=move |e: web_sys::MouseEvent| {
-                                                    e.stop_propagation();
-                                                    on_search.run(name_search.clone());
-                                                }
+                                                aria-label=format!("Search {name_label_search}")
+                                                on:click=move |_| on_search.run(name_search.clone())
                                             >
                                                 <IconView icon=Icon::Search size=12 stroke_width=1.5/>
-                                            </span>
-                                            <span
+                                            </button>
+                                            <button
+                                                type="button"
                                                 class="qa"
-                                                title="Live Tail"
-                                                on:click=move |e: web_sys::MouseEvent| {
-                                                    e.stop_propagation();
-                                                    on_tail.run(name_tail.clone());
-                                                }
+                                                aria-label=format!("Live tail {name_label_tail}")
+                                                on:click=move |_| on_tail.run(name_tail.clone())
                                             >
                                                 <IconView icon=Icon::Bolt size=12 stroke_width=1.5/>
-                                            </span>
+                                            </button>
                                         </div>
                                     </div>
                                 }
