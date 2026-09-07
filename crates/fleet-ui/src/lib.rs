@@ -70,10 +70,19 @@ pub mod field;
 pub mod icon;
 #[cfg(target_arch = "wasm32")]
 pub mod kbd;
+// The shared menu contract is crate-internal: both menus are the public
+// surface, the panel is not. Compiled on native test builds too, so its
+// pure half (restore-by-cause) is a `nextest` fact.
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) mod menu;
 #[cfg(target_arch = "wasm32")]
 pub mod pager;
 #[cfg(target_arch = "wasm32")]
 pub mod rail;
+// Roving-tabindex index arithmetic, crate-internal and native-tested
+// for the same reason.
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) mod roving;
 #[cfg(target_arch = "wasm32")]
 pub mod search_input;
 #[cfg(target_arch = "wasm32")]

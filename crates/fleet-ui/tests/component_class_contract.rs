@@ -43,6 +43,8 @@ const SEARCH_INPUT: &str = include_str!("../src/search_input.rs");
 const TOGGLE: &str = include_str!("../src/toggle.rs");
 const KBD: &str = include_str!("../src/kbd.rs");
 const ACTIONS_MENU: &str = include_str!("../src/actions_menu.rs");
+const MENU: &str = include_str!("../src/menu.rs");
+const ROVING: &str = include_str!("../src/roving.rs");
 const COPY_BUTTON: &str = include_str!("../src/copy_button.rs");
 const ICON: &str = include_str!("../src/icon.rs");
 const LIB: &str = include_str!("../src/lib.rs");
@@ -224,20 +226,74 @@ fn kbd_emits_both_chip_treatments() {
 fn actions_menu_emits_its_hooks_and_registers_with_the_overlay_stack() {
     emits(ACTIONS_MENU, r#"class="actions-wrap""#, ".actions-wrap");
     emits(ACTIONS_MENU, r#"class="btn-icon""#, ".btn-icon");
-    emits(ACTIONS_MENU, r#"class="actions-menu""#, ".actions-menu");
+    // The panel class is a prop of the shared menu panel now, so the
+    // hook that `.actions-menu` styles is the value ActionsMenu passes;
+    // the item classes it styles are emitted in menu.rs.
     emits(
         ACTIONS_MENU,
-        r#""item danger""#,
-        ".actions-menu .item.danger",
+        r#"panel_class="actions-menu""#,
+        ".actions-menu",
+    );
+    emits(MENU, r#""item danger""#, ".actions-menu .item.danger");
+    assert!(
+        ACTIONS_MENU.contains("MenuPanel"),
+        "ActionsMenu must mount the shared menu panel — a second local \
+         panel is how the two menus drifted apart before ADR-0028"
     );
     // The open panel arbitrates Escape through the overlay stack
-    // (topmost-only), like Modal and Drawer.
+    // (topmost-only), like Modal and Drawer. That registration moved
+    // into menu.rs with the panel, so assert it where it lives.
     assert!(
-        ACTIONS_MENU.contains("use_overlay_layer()") && ACTIONS_MENU.contains("is_topmost()"),
-        "ActionsMenu's open panel must register an overlay layer and \
-         gate its window Escape on is_topmost() — otherwise Escape \
-         under a stacked ConfirmModal closes both (the issue #28 bug \
-         class the overlay stack exists to prevent)"
+        MENU.contains("use_overlay_layer()") && MENU.contains("is_topmost()"),
+        "the shared menu panel must register an overlay layer and gate \
+         its window Escape on is_topmost() — otherwise Escape under a \
+         stacked ConfirmModal closes both (the issue #28 bug class the \
+         overlay stack exists to prevent)"
+    );
+    assert!(
+        !ACTIONS_MENU.contains(r#"query_selector(".item")"#),
+        "the local initial-focus scan is gone: initial focus is the \
+         shared overlay::focus_initial scan, which respects the roving \
+         tabindex instead of grabbing the first .item"
+    );
+    assert!(
+        ACTIONS_MENU.contains(r#"aria-label="Actions""#),
+        "the ⋯ trigger has no text content — without aria-label its \
+         accessible name is the glyph"
+    );
+}
+
+#[test]
+fn the_menu_contract_is_shared_and_walks_by_index() {
+    // Both menus mount one panel, and that panel is the only place the
+    // lifecycle lives: no second set of window listeners anywhere.
+    assert!(
+        !ACTIONS_MENU.contains("use_event_listener"),
+        "menu lifecycle (Escape, outside mousedown) belongs to menu.rs \
+         alone — a second listener is a second contract"
+    );
+    // The walk indexes the queried [role="menuitem"] list. The element
+    // sibling walk it replaced hopped whatever came next, so a header
+    // or a separator could take focus.
+    assert!(
+        MENU.contains(r#"[role="menuitem"]"#) && MENU.contains("next_index"),
+        "the arrow walk must index the queried menuitem list through \
+         roving::next_index"
+    );
+    assert!(
+        !MENU.contains("next_element_sibling"),
+        "no element-sibling walk: a header or separator would take focus"
+    );
+    assert!(
+        MENU.contains("restores_trigger") && ROVING.contains("fn next_index"),
+        "restore-by-cause and the index arithmetic are the two pure \
+         halves this contract is native-tested through"
+    );
+    // One tab stop: exactly one item at 0, the rest at -1.
+    assert!(
+        MENU.contains(r#"if focused.get() == index { "0" } else { "-1" }"#),
+        "menu items carry a true roving tabindex — every item tabbable \
+         puts N tab stops in the page and defeats the arrow walk"
     );
 }
 
