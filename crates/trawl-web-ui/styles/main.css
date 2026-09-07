@@ -406,7 +406,9 @@
 }
 
 /* Date range — single trigger (grafana-style); all presets live in the
- * popover. */
+ * popover. The trigger is a <button> (ADR-0029): it already declares its
+ * own background, border and colour, so `font: inherit` is the whole
+ * reset the user-agent chrome needs. */
 .daterange { position: relative; display: flex; align-items: stretch; }
 .daterange .dr-trigger { flex: 1; }
 .dr-trigger {
@@ -420,8 +422,10 @@
   border: 1px solid var(--line);
   border-radius: var(--radius-ctl);
   color: var(--ink-2);
+  font: inherit;
   font-family: var(--font-ui);
   font-size: var(--fs-ui);
+  margin: 0;
   cursor: pointer;
   user-select: none;
   white-space: nowrap;
@@ -1001,6 +1005,8 @@
   flex-direction: column;
   gap: 3px;
 }
+/* .lb is a <label for> now, not a div; it is a flex item of .fld, which
+ * blockifies it, so the box is the one the div had. */
 .dr-pop .cust .fld .lb {
   font-size: var(--fs-dense);
   color: var(--ink-3);
