@@ -641,13 +641,13 @@ const CONTRACTS: &[Contract] = &[
         hook: "class=\"row-stretch\"",
     },
     Contract {
-        assignment: "schemaQuickAction: '.tbl-row .row-act .qa',",
+        assignment: "schemaQuickAction: '.row-act .qa',",
         source_path: "src/pages/schema.rs",
         source: SCHEMA_RS,
         hook: "class=\"row-act\"",
     },
     Contract {
-        assignment: "schemaQuickAction: '.tbl-row .row-act .qa',",
+        assignment: "schemaQuickAction: '.row-act .qa',",
         source_path: "src/pages/schema.rs",
         source: SCHEMA_RS,
         hook: "class=\"qa\"",
@@ -673,7 +673,7 @@ const CONTRACTS: &[Contract] = &[
         hook: "class=\"th sortable\"",
     },
     Contract {
-        assignment: "historySaveAsNet: '.tbl-row button.link',",
+        assignment: "historySaveAsNet: 'button.link',",
         source_path: "src/pages/history.rs",
         source: HISTORY_RS,
         hook: "class=\"link\"",
@@ -751,14 +751,17 @@ const CONTRACTS: &[Contract] = &[
         source: SERVICE_DRAWER_RS,
         hook: "\"sf-row\"",
     },
+    // The service drawer's field row uses the shared `rowStretch`
+    // selector, so its own control is pinned here rather than under a
+    // second name.
     Contract {
-        assignment: "serviceFieldToggle: '.sf-row button.row-stretch',",
+        assignment: "rowStretch: '.row-stretch',",
         source_path: "src/components/service_drawer.rs",
         source: SERVICE_DRAWER_RS,
         hook: "class=\"row-stretch\"",
     },
     Contract {
-        assignment: "serviceDegradedBadge: '.sf-row button.deg-btn',",
+        assignment: "serviceDegradedBadge: 'button.deg-btn',",
         source_path: "src/components/service_drawer.rs",
         source: SERVICE_DRAWER_RS,
         hook: "class=\"deg-btn\"",

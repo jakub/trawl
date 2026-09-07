@@ -152,14 +152,17 @@ export const SEL = {
   rowStretch: '.row-stretch',
   /// crates/trawl-web-ui/src/pages/schema.rs — a row's hover/focus
   /// revealed quick actions (Search, Live tail), told apart by name.
-  schemaQuickAction: '.tbl-row .row-act .qa',
+  /// Row-relative, like every selector a spec scopes INSIDE a row:
+  /// repeating the row class here would ask for a row inside a row.
+  schemaQuickAction: '.row-act .qa',
   /// crates/trawl-web-ui/src/pages/schema.rs — the services table's
   /// sortable header controls, rendered by `components/sort_th.rs`.
   /// The same selector reaches the nets table's one sortable header.
   tableSortControl: '.tbl-hd .th.sortable button',
   /// crates/trawl-web-ui/src/pages/history.rs — the Save as Net control
   /// nested inside the history row, above the stretched rerun button.
-  historySaveAsNet: '.tbl-row button.link',
+  /// Row-relative: `.link` belongs to the history row and nothing else.
+  historySaveAsNet: 'button.link',
 
   // -- results table --------------------------------------------------
   /// crates/trawl-web-ui/src/components/results_table.rs — one data row
@@ -184,11 +187,10 @@ export const SEL = {
   /// crates/trawl-web-ui/src/components/service_drawer.rs — one field
   /// row of the Fields pane.
   serviceFieldRow: '.sd-fields .sf-row',
-  /// Its one control: the caret + field name, stretched over the row.
-  serviceFieldToggle: '.sf-row button.row-stretch',
-  /// The degraded badge nested above that control, which opens the
-  /// field's case file instead of expanding the row.
-  serviceDegradedBadge: '.sf-row button.deg-btn',
+  /// The degraded badge nested above that row's control, which opens
+  /// the field's case file instead of expanding the row. Row-relative;
+  /// the row's own control is `rowStretch`.
+  serviceDegradedBadge: 'button.deg-btn',
   /// The Fields pane's sortable headers — the same `sort_th` helper the
   /// schema and nets tables use.
   serviceFieldSortControl: '.sf-hd .th.sortable button',
