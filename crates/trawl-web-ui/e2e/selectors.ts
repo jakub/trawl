@@ -352,6 +352,10 @@ export const COPY = {
   /// crates/trawl-web-ui/src/components/results_table.rs — the caret
   /// button's name, numbered from 1 in render order.
   resultsExpandName: 'Show details for result {}',
+  /// crates/trawl-web-ui/src/components/results_table.rs — a results
+  /// column's sort control. Direction is NOT in the name here: the real
+  /// `<table>` carries it on the `<th>`'s aria-sort.
+  resultsSortName: 'Sort by {column}',
   /// Column labels a sort proof names. `sort_th` takes them as
   /// literals, so a renamed column would otherwise fail a spec for a
   /// reason that reads like a broken sort.

@@ -1014,6 +1014,12 @@ const CONTRACTS: &[Contract] = &[
         hook: "\"Show details for result {}\"",
     },
     Contract {
+        assignment: "resultsSortName: 'Sort by {column}',",
+        source_path: "src/components/results_table.rs",
+        source: RESULTS_TABLE_RS,
+        hook: "format!(\"Sort by {name}\")",
+    },
+    Contract {
         assignment: "schemaServiceHeader: 'Service',",
         source_path: "src/pages/schema.rs",
         source: SCHEMA_RS,

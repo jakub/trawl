@@ -95,6 +95,12 @@ fn ResultsTableBody(
     let cols_for_view = columns.clone();
     let header_cells = cols_for_header.iter().enumerate().map(|(i, name)| {
         let name = name.clone();
+        // The visible text is the column, so the name says what the
+        // press DOES and keeps that word inside it (WCAG 2.5.3). The
+        // direction stays on the cell's `aria-sort` rather than joining
+        // the name: on a real table it is announced once already, and
+        // repeating it here would read twice.
+        let sort_label = format!("Sort by {name}");
         view! {
             // A real `<table>`, so direction is announced by `aria-sort`
             // on the sorted `<th>` alone (ADR-0029) and the glyph is
@@ -111,6 +117,7 @@ fn ResultsTableBody(
                 <button
                     type="button"
                     class="th-sort"
+                    aria-label=sort_label
                     on:click=move |_| sort.update(|cur| {
                         *cur = match *cur {
                             Some(s) if s.col == i => Some(SortState { col: i, asc: !s.asc }),

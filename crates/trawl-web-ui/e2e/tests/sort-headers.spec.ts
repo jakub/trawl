@@ -55,7 +55,10 @@ test('results th: aria-sort follows the sorted column', async ({ page, request }
   await expectFocusRing(host);
   await expect(host).toHaveJSProperty('tagName', 'BUTTON');
   await expect(host).toHaveAttribute('type', 'button');
-  await expect(host).toHaveAccessibleName(CORPUS.columns[1]);
+  // The name says what the press does and still carries the visible
+  // column word; the direction is the cell's business, asserted above
+  // and below on `aria-sort`.
+  await expect(host).toHaveAccessibleName(nameFrom(COPY.resultsSortName, CORPUS.columns[1]));
 
   await page.keyboard.press('Enter');
   expect(await ariaSorts(page)).toEqual([null, 'descending', null, null]);
