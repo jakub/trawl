@@ -189,7 +189,12 @@
   font-weight: 600;
   color: var(--ink-2);
 }
+/* A <button> since ADR-0029, so the rule carries its own reset; there
+ * is no bare `button` selector in this sheet (ADR-0028). */
 .facets .phead .clear {
+  background: none;
+  border: 0;
+  padding: 0;
   font-family: var(--font-ui);
   font-size: var(--fs-dense);
   color: var(--accent);
@@ -208,10 +213,18 @@
   border-top: 1px solid var(--line-2);
   padding: 8px 0 4px;
 }
+/* A <button> since ADR-0029: it keeps its flex row and takes the full
+ * width of the group so the click target is what it was. */
 .facets .g-hd {
   display: flex;
   align-items: center;
+  width: 100%;
   padding: 0 12px 4px;
+  background: none;
+  border: 0;
+  color: inherit;
+  font: inherit;
+  text-align: inherit;
   cursor: pointer;
   user-select: none;
   gap: 6px;
@@ -243,7 +256,6 @@
   align-items: center;
   padding: 3px 12px;
   gap: 8px;
-  cursor: pointer;
   font-family: var(--font-mono);
   font-size: var(--fs-dense);
   min-height: 22px;
@@ -270,10 +282,31 @@
   color: var(--ink-3);
   font-variant-numeric: tabular-nums;
 }
-.facets .v .act { display: none; gap: 4px; color: var(--ink-3); }
-.facets .v:hover .act { display: flex; }
-.facets .v:hover .c { display: none; }
+/* Revealed on hover OR focus, and by opacity: `display: none` would
+ * take the two buttons out of the tab order (ADR-0029). They are pinned
+ * to the row's right edge instead of riding its flex row, because the
+ * count they replace takes a flex gap with it when it hides: in flow,
+ * arriving by Tab moved the button 8px out from under the pointer. */
+.facets .v .act {
+  display: flex;
+  position: absolute;
+  right: 12px;
+  top: 0;
+  bottom: 0;
+  align-items: center;
+  opacity: 0;
+  gap: 4px;
+  color: var(--ink-3);
+}
+.facets .v:hover .act,
+.facets .v:focus-within .act { opacity: 1; }
+.facets .v:hover .c,
+.facets .v:focus-within .c { display: none; }
 .facets .v .act .op {
+  background: none;
+  border: 0;
+  color: inherit;
+  font-family: inherit;
   cursor: pointer;
   padding: 0 4px;
   border-radius: var(--radius-sm);
@@ -283,7 +316,14 @@
 .facets .v.selected { background: var(--accent-wash); }
 .facets .v.selected .n { color: var(--accent); font-weight: 600; }
 .facets .v.excluded .n { color: var(--red); text-decoration: line-through; }
+/* A <button> since ADR-0029: full width and left-aligned keeps the row
+ * looking like the value rows above it. */
 .facets .g .more {
+  display: block;
+  width: 100%;
+  background: none;
+  border: 0;
+  text-align: left;
   font-family: var(--font-ui);
   font-size: var(--fs-dense);
   color: var(--ink-3);
