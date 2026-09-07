@@ -333,7 +333,9 @@ button { font: inherit; }
 ::selection { background: var(--selection); }
 
 /* Focus ring — accent glow, never browser blue. */
+/* Anchors are controls too. ADR-0029 stretches one over each list row. */
 button:focus-visible,
+a[href]:focus-visible,
 input:focus-visible,
 textarea:focus-visible,
 [tabindex]:focus-visible {
