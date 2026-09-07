@@ -410,6 +410,23 @@ fn topbar_menu_is_native_and_registers_with_the_stack() {
         "the trigger must announce that it opens a menu and whether it \
          is open"
     );
+    // One predicate for the mount and for the reported state. Split
+    // them and a lost identity unmounts the panel while the trigger
+    // still reads aria-expanded="true".
+    assert!(
+        markup.contains("<Show when=move || panel_open.get()>")
+            && markup.contains("aria-expanded=move || panel_open.get().to_string()"),
+        "the panel's <Show when=> and the trigger's aria-expanded must \
+         read the same derived predicate"
+    );
+    assert!(
+        markup.contains("Effect::new(move |_| {")
+            && markup.contains("if user.get().is_none() {")
+            && markup.contains("menu_open.set(false);"),
+        "an effect must clear the open flag when the identity is lost — \
+         otherwise the next identity remounts the menu, and runs its \
+         initial-focus effect, with no user activation behind it"
+    );
     assert!(
         TOPBAR.contains("MenuPanel"),
         "the account menu mounts the shared menu panel — its own panel \

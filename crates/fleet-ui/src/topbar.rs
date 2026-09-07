@@ -18,7 +18,10 @@
 //! outside press. Its trigger's accessible name is the visible user
 //! name — the avatar and the chevron are `aria-hidden`, so nothing
 //! reads "JD" aloud — and it is `disabled` until the consumer's `user`
-//! signal resolves.
+//! signal resolves. One predicate decides both whether the panel is on
+//! the page and what `aria-expanded` reports, and losing the identity
+//! closes the menu rather than leaving it open behind an unmounted
+//! panel.
 //!
 //! Three affordances left with ADR-0025 and ADR-0028: the notifications
 //! bell (never wired), the disabled Profile and API tokens rows, and
@@ -140,6 +143,24 @@ fn account_menu(
     let wrap_ref = NodeRef::<Div>::new();
     let trigger_ref = NodeRef::<Button>::new();
 
+    // The one predicate: the panel mounts under it and the trigger
+    // reports it. Deriving `aria-expanded` from `menu_open` alone let
+    // the two disagree, because the panel also needs an identity to
+    // render a header for: losing the user while the menu was open
+    // unmounted the panel (disposing its layer and its focused item)
+    // and left a disabled trigger claiming aria-expanded="true".
+    let panel_open = Signal::derive(move || menu_open.get() && user.get().is_some());
+
+    // Losing the identity closes the menu for good. Without this the
+    // stale open flag survives the unmount, so the next identity
+    // (a re-login, a `/me` refetch) remounts the panel and runs its
+    // initial-focus effect with no user activation behind it.
+    Effect::new(move |_| {
+        if user.get().is_none() {
+            menu_open.set(false);
+        }
+    });
+
     let toggle_theme = Callback::new(move |()| {
         if let Some(p) = prefs {
             p.theme.update(|t| *t = t.toggled());
@@ -181,7 +202,7 @@ fn account_menu(
                 // Rendered unconditionally, including while disabled,
                 // where it reads false: a trigger that only sometimes
                 // reports its state is worse than one that always does.
-                aria-expanded=move || menu_open.get().to_string()
+                aria-expanded=move || panel_open.get().to_string()
                 disabled=move || user.get().is_none()
                 on:click=move |_| menu_open.update(|v| *v = !*v)
             >
@@ -193,7 +214,7 @@ fn account_menu(
                 </span>
                 <IconView icon=Icon::Chevron size=10 stroke_width=1.5 attr:aria-hidden="true"/>
             </button>
-            <Show when=move || menu_open.get() && user.get().is_some()>
+            <Show when=move || panel_open.get()>
                 <MenuPanel
                     panel_class="user-menu"
                     menu_label="Account"
