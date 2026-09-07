@@ -257,6 +257,8 @@ fn native_control_rules_carry_the_button_reset() {
         ".sd-tabs .tb",
         ".topbar .user",
         ".user-menu .item",
+        ".modal .m-hd .x",
+        ".toast .x",
     ] {
         let body = rule_body(sel);
         assert!(

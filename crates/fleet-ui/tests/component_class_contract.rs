@@ -45,6 +45,7 @@ const KBD: &str = include_str!("../src/kbd.rs");
 const ACTIONS_MENU: &str = include_str!("../src/actions_menu.rs");
 const MENU: &str = include_str!("../src/menu.rs");
 const TOPBAR: &str = include_str!("../src/topbar.rs");
+const TOAST_RUNTIME: &str = include_str!("../src/toast/runtime.rs");
 const ROVING: &str = include_str!("../src/roving.rs");
 const COPY_BUTTON: &str = include_str!("../src/copy_button.rs");
 const ICON: &str = include_str!("../src/icon.rs");
@@ -54,6 +55,10 @@ const WHEN: &str = include_str!("../src/time/when.rs");
 const CLOCK: &str = include_str!("../src/time/clock.rs");
 const ATMOSPHERE: &str = include_str!("../src/atmosphere/component.rs");
 const FLEET_CSS: &str = include_str!("../styles/fleet-ui.css");
+
+/// The `type="button"` attribute every converted control carries: a
+/// type-less button inside a form submits it.
+const TYPE_BUTTON: &str = "type=\"button\"";
 
 /// The source with its comment lines removed, for the negative scans:
 /// a module doc that explains why an affordance was retired names the
@@ -548,6 +553,62 @@ fn copy_button_reports_through_the_shared_toast_bus() {
         "copy triggers sit inside clickable rows — the click must not \
          bubble into the host row handler"
     );
+}
+
+#[test]
+fn modal_close_toast_dismiss_and_bare_copy_are_native_buttons() {
+    // The last three pseudo-buttons in the crate (ADR-0028). Each has
+    // to be reachable by Tab and operable by Enter and Space, which no
+    // amount of CSS gives a <span on:click>.
+    for (src, what) in [
+        (MODAL_SHELL, "the modal close"),
+        (TOAST_RUNTIME, "the toast dismiss"),
+        (COPY_BUTTON, "the bare copy trigger"),
+    ] {
+        assert!(
+            src.contains("<button") && src.contains(TYPE_BUTTON),
+            "{what} must be a native <button type=\"button\"> — inside a \
+             form a type-less button submits it, and a span reaches \
+             neither the keyboard nor the ADR-0007 focus ring"
+        );
+    }
+    // Both glyph-only controls take their whole accessible name from an
+    // aria-label: a stroked X and a multiplication sign announce as
+    // nothing useful. The class hooks stay `.x` either way.
+    emits(MODAL_SHELL, "class=\"x\"", ".modal .m-hd .x");
+    emits(TOAST_RUNTIME, "class=\"x\"", ".toast .x");
+    assert!(
+        MODAL_SHELL.contains("aria-label=\"Close dialog\"")
+            && MODAL_SHELL.contains("title=\"Close (Esc)\""),
+        "the modal close keeps a named label and the Esc hint in its \
+         tooltip"
+    );
+    assert!(
+        TOAST_RUNTIME.contains("aria-label=\"Dismiss notification\"")
+            && TOAST_RUNTIME.contains("<span aria-hidden=\"true\">"),
+        "the toast dismiss is named by aria-label, and its × is hidden \
+         decoration — read aloud, \"times\" is not a dismissal"
+    );
+    // The bare copy trigger keeps the propagation stop it had as a
+    // span: it sits inside clickable rows and header bars.
+    assert!(
+        COPY_BUTTON.contains("e.stop_propagation();"),
+        "bare-mode copy must keep e.stop_propagation() — the click would \
+         otherwise also open the row the trigger sits in"
+    );
+    // Neither glyph control may go back to a span with a click handler.
+    for (src, name) in [
+        (MODAL_SHELL, "modal/shell.rs"),
+        (TOAST_RUNTIME, "toast/runtime.rs"),
+        (COPY_BUTTON, "copy_button.rs"),
+    ] {
+        assert!(
+            !markup_only(src).contains("<span\n                    class=cls")
+                && !markup_only(src).contains("<span class=\"x\""),
+            "{name} must not reopen a span with an on:click — that is the \
+             shape ADR-0028 closed"
+        );
+    }
 }
 
 #[test]

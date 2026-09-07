@@ -601,6 +601,7 @@ textarea:focus-visible,
   color: var(--ink); letter-spacing: -.1px;
 }
 .modal .m-hd .x {
+  background: none; border: 0;
   cursor: pointer; color: var(--ink-3); padding: 3px 6px; border-radius: var(--radius-sm);
   display: grid; place-items: center;
 }
@@ -797,6 +798,7 @@ textarea:focus-visible,
 .toast .detail { color: var(--ink-2); font-size: var(--fs-small); line-height: 1.45; }
 /* Close ✕ nudged to optically align with the title's first line. */
 .toast .x {
+  background: none; border: 0;
   color: var(--ink-3);
   cursor: pointer;
   padding: 1px 6px;
