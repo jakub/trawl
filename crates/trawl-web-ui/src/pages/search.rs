@@ -314,18 +314,14 @@ pub fn Search() -> impl IntoView {
         let Some(r) = repair.get_untracked() else {
             return;
         };
-        // "Start over" is the only repair that drops the query, and for
-        // an unread link `executed_q` is ALREADY empty, so the effect
-        // that syncs the editor to the executed query never fires and
-        // whatever was typed into the still-editable editor would
-        // survive a repair that means to clear the page. Clear it here,
-        // at the one repair that leaves no query behind — which is the
-        // repair on offer, not the parameter the banner named: a named
-        // repair whose own link busts the length bound degrades to
-        // starting over, and it takes the buffer with it.
-        if r.param == Param::Link {
-            query_text.set(String::new());
-        }
+        // Every repair keeps `q` as it stands (a named one carries it
+        // verbatim; "Start over" lands on an empty one, and an unread
+        // link's `executed_q` is ALREADY empty), so the effect that
+        // syncs the editor to the executed query never fires across a
+        // repair, and whatever was typed into the still-editable editor
+        // would sit above results from the query that actually ran.
+        // Reset the buffer here, to the query the repaired link runs.
+        query_text.set(executed_q.get_untracked());
         report_refusal(bus, repair_to(&r.href));
     });
 

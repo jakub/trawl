@@ -236,6 +236,15 @@ test('a repair fixes only the parameter the banner names', async ({ page, reques
   // says the link was not run, even for an answer already in flight.
   await expect(page.locator(SEL.resultsPane)).toHaveCount(0);
 
+  // The editor stays editable under a banner. Type over it: a named
+  // repair keeps `q`, so nothing about the URL changes to resync the
+  // buffer, and without a reset the edit would sit above results from
+  // the query that actually ran.
+  await page.locator(SEL.cmContent).click();
+  await page.keyboard.press('Control+a');
+  await page.keyboard.insertText('service=auth');
+  await expect(page.locator(SEL.cmContent)).toContainText('service=auth');
+
   // "Drop filters" drops `f` and NOTHING else. `r=garbage` is still in
   // the address bar, so the next verdict raises its own banner and the
   // link still has not run.
@@ -244,6 +253,8 @@ test('a repair fixes only the parameter the banner names', async ({ page, reques
   await expect(page.locator(SEL.urlNoticeRaw)).toHaveText('garbage');
   expect(await page.evaluate(() => location.search)).toBe('?q=service%3Dnginx&r=garbage');
   await expect(page.locator(SEL.resultsPane)).toHaveCount(0);
+  // The buffer is back on the query the link carries, not the edit.
+  await expect(page.locator(SEL.cmContent)).toHaveText('service=nginx');
   await page.waitForTimeout(QUIET_MS);
   expect(await capturedQueryCount(request), 'the range banner still ran a query').toBe(0);
 
@@ -253,6 +264,8 @@ test('a repair fixes only the parameter the banner names', async ({ page, reques
   expect(await page.evaluate(() => location.search)).toBe('?q=service%3Dnginx');
   const body = await lastCapturedQuery(request, 1);
   expect(body.query).toBe('last=15m service=nginx');
+  // …and what ran is what the editor shows.
+  await expect(page.locator(SEL.cmContent)).toHaveText('service=nginx');
   // …and the results pane is back, so its absence above was the gate
   // and not a selector that never matches anything.
   await expect(page.locator(SEL.resultsPane)).toBeVisible();
