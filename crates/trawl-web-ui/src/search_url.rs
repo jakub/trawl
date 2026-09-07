@@ -55,6 +55,42 @@ const PAGE_SIZE_U64: u64 = PAGE_SIZE as u64;
 /// keeps the host tests and the browser answering the same.
 pub const MAX_OFFSET: u64 = u32::MAX as u64;
 
+/// Largest raw query string read at all, checked before the string is
+/// split into anything.
+///
+/// The address bar is attacker-controlled and every other cap in this
+/// module applies to ONE parameter's value, which is a cap on nothing
+/// while the number of parameters is unbounded: `/search?` followed by
+/// `a&` a million times is 2 MB of input that used to be split, decoded
+/// and collected into a million owned pairs before a single cap was
+/// consulted. 32 KiB is roughly forty times the longest link this app
+/// writes (a full `f` payload plus a range plus a long query), and past
+/// it the whole link is one verdict rather than five.
+pub const MAX_SEARCH_BYTES: usize = 32 * 1024;
+
+/// Largest number of `&`-separated pairs examined inside a search string
+/// that is within [`MAX_SEARCH_BYTES`]. Everything after them is treated
+/// as absent.
+///
+/// This app writes at most five, and the five it reads are the only ones
+/// it looks for, so 64 is room for a hand-edited link to carry unknown
+/// parameters ahead of the known ones and still be read as written. A
+/// known key sitting past the 64th pair reads as missing — the same
+/// answer a link that never carried it gets.
+pub const MAX_SEARCH_PAIRS: usize = 64;
+
+/// The parameters the search page reads. Every other pair in a query
+/// string is skipped without decoding its value or allocating a copy of
+/// it, which is what makes a link full of junk cost a scan instead of a
+/// heap of owned strings.
+pub const KNOWN_KEYS: [&str; 5] = ["q", "page", "mode", "f", "r"];
+
+/// Longest a RAW name may be and still spell one of [`KNOWN_KEYS`]:
+/// `page`, the longest, is 12 bytes with every character percent-encoded
+/// (`%70%61%67%65`). A longer name cannot decode to a key we read, so it
+/// is skipped without being decoded.
+const MAX_KEY_RAW_BYTES: usize = 12;
+
 /// Largest raw `f` value read at all, checked before base64 or JSON
 /// allocation.
 pub const MAX_FILTER_PAYLOAD_BYTES: usize = 4096;
@@ -135,16 +171,24 @@ pub enum Param {
     Filters,
     Range,
     Page,
+    /// Not a parameter at all: the whole query string, refused by length
+    /// before anything inside it was read.
+    Link,
 }
 
 impl Param {
     /// The parameter as the address bar spells it.
     #[must_use]
+    /// The parameter as the address bar spells it. [`Param::Link`] names
+    /// no single parameter, so it has no key: its repair leaves the
+    /// query string behind entirely instead of editing one pair out of
+    /// it (see [`repair_url`]).
     pub const fn key(self) -> &'static str {
         match self {
             Self::Filters => "f",
             Self::Range => "r",
             Self::Page => "page",
+            Self::Link => "",
         }
     }
 
@@ -155,6 +199,7 @@ impl Param {
             Self::Filters => "filters",
             Self::Range => "time range",
             Self::Page => "page",
+            Self::Link => "link",
         }
     }
 }
@@ -194,6 +239,9 @@ pub enum Reason {
     /// `page * PAGE_SIZE` does not fit — the link claims a page that
     /// cannot be asked for.
     PageOffsetOverflow,
+    /// The whole query string is over [`MAX_SEARCH_BYTES`], so no
+    /// parameter inside it was read.
+    LinkTooLong,
 }
 
 /// One parameter that could not be read, carrying as much of the raw
@@ -244,9 +292,18 @@ impl Malformed {
     }
 
     /// The banner's sentence, up to the raw value it introduces.
+    ///
+    /// The whole-link verdict introduces nothing: its "value" is tens of
+    /// kilobytes of address bar, and none of it is retained, so the
+    /// sentence ends itself.
     #[must_use]
     pub fn message(&self) -> String {
-        format!("This link's {} could not be read:", self.param.noun())
+        match self.param {
+            Param::Link => "This link is too long to read.".to_owned(),
+            Param::Filters | Param::Range | Param::Page => {
+                format!("This link's {} could not be read:", self.param.noun())
+            }
+        }
     }
 
     /// The one repair the banner offers, as its button reads.
@@ -256,6 +313,7 @@ impl Malformed {
             Param::Filters => "Drop filters",
             Param::Range => "Use last 15 minutes",
             Param::Page => "Go to page 1",
+            Param::Link => "Start over",
         }
     }
 }
@@ -318,8 +376,81 @@ pub fn percent_encode(s: &str) -> String {
     out
 }
 
-/// Read a raw query string into its `(name, value)` pairs, decoding each
-/// one EXACTLY ONCE.
+/// What one raw query string said: the parameters this app reads, or a
+/// refusal of the whole link.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SearchRead {
+    /// Over [`MAX_SEARCH_BYTES`]. Nothing inside was parsed, so the
+    /// whole link is one verdict rather than a banner per parameter.
+    TooLong(Malformed),
+    /// The known parameters, first occurrence of each, in arrival order.
+    Params(Vec<(String, String)>),
+}
+
+impl SearchRead {
+    /// The pairs, or none at all when the link was refused by length.
+    #[must_use]
+    pub fn params(&self) -> &[(String, String)] {
+        match self {
+            Self::Params(params) => params,
+            Self::TooLong(_) => &[],
+        }
+    }
+
+    /// The whole-link failure, when there is one.
+    #[must_use]
+    pub const fn malformed(&self) -> Option<&Malformed> {
+        match self {
+            Self::TooLong(m) => Some(m),
+            Self::Params(_) => None,
+        }
+    }
+}
+
+/// Read a raw query string, BOUNDED before it is looked at.
+///
+/// The length check is the first thing this function does, ahead of any
+/// split, decode or allocation: the address bar is attacker-controlled
+/// input, and a cap that applies per parameter caps nothing while the
+/// number of parameters does not. `/search?` plus `a&` a million times
+/// used to become a million owned `(String, String)` pairs; now it is
+/// one [`Reason::LinkTooLong`] verdict that retains none of the text.
+///
+/// This is the only door the app reads a search string through.
+#[must_use]
+pub fn read_search(raw_search: &str) -> SearchRead {
+    if raw_search.len() > MAX_SEARCH_BYTES {
+        // No prefix retained: the banner's whole sentence is that the
+        // link is too long, and echoing 120 characters of it says
+        // nothing a reader can act on.
+        return SearchRead::TooLong(Malformed::new(Param::Link, "", Reason::LinkTooLong));
+    }
+    SearchRead::Params(query_params(raw_search))
+}
+
+/// One raw name as the key it spells, or `None` for a parameter this app
+/// does not read.
+///
+/// The raw comparison comes first and is the whole of the common case:
+/// a name that is already one of [`KNOWN_KEYS`] costs a few byte
+/// comparisons. Only a short name carrying an escape is decoded, because
+/// `%71=x` IS `q=x` to the browser and reading it any other way would
+/// make the app disagree with the address bar it came from.
+fn known_key(raw_name: &str) -> Option<&'static str> {
+    if let Some(key) = KNOWN_KEYS.iter().find(|key| **key == raw_name) {
+        return Some(key);
+    }
+    if raw_name.len() > MAX_KEY_RAW_BYTES
+        || !raw_name.bytes().any(|byte| byte == b'%' || byte == b'+')
+    {
+        return None;
+    }
+    let decoded = form_decode(raw_name);
+    KNOWN_KEYS.iter().copied().find(|key| *key == decoded)
+}
+
+/// Read a bounded query string into the parameters this app knows,
+/// decoding each value EXACTLY ONCE.
 ///
 /// The reader takes `use_location().search`, the query string as the
 /// address bar spells it, rather than the router's `ParamsMap`, whose
@@ -341,21 +472,41 @@ pub fn percent_encode(s: &str) -> String {
 /// Bytes are assembled first and read as UTF-8 last, so `%E6%97%A5` is one
 /// character and a truncated sequence is U+FFFD rather than a panic.
 ///
-/// Pairs come back in the order the URL carries them, duplicates and
-/// all: which duplicate wins is [`first_value`]'s rule, and `repair_url`
-/// needs every pair to carry the link through untouched.
-#[must_use]
-pub fn query_params(raw_search: &str) -> Vec<(String, String)> {
-    raw_search
+/// Two things are dropped rather than carried, both so an unbounded
+/// address bar cannot become unbounded work or unbounded state:
+///
+/// - A pair whose name is not one of [`KNOWN_KEYS`] is skipped without
+///   its value being decoded or copied. A repair therefore rebuilds the
+///   link out of the five parameters this app reads, and an unknown one
+///   the reader never looked at does not survive the click.
+/// - At most [`MAX_SEARCH_PAIRS`] pairs are examined (empty ones
+///   included, since the split sees them); a known key past that reads
+///   as missing.
+///
+/// The FIRST occurrence of each key wins, which is what
+/// `URLSearchParams.get` answers, so a duplicate cannot come back later
+/// as its own replacement.
+fn query_params(raw_search: &str) -> Vec<(String, String)> {
+    let mut params: Vec<(String, String)> = Vec::new();
+    for pair in raw_search
         .strip_prefix('?')
         .unwrap_or(raw_search)
         .split('&')
-        .filter(|pair| !pair.is_empty())
-        .map(|pair| match pair.split_once('=') {
-            Some((name, value)) => (form_decode(name), form_decode(value)),
-            None => (form_decode(pair), String::new()),
-        })
-        .collect()
+        .take(MAX_SEARCH_PAIRS)
+    {
+        if pair.is_empty() {
+            continue;
+        }
+        let (raw_name, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
+        let Some(key) = known_key(raw_name) else {
+            continue;
+        };
+        if params.iter().any(|(name, _)| name == key) {
+            continue;
+        }
+        params.push((key.to_owned(), form_decode(raw_value)));
+    }
+    params
 }
 
 /// Decode one `application/x-www-form-urlencoded` name or value.
@@ -410,7 +561,8 @@ const fn hex_digit(byte: u8) -> Option<u8> {
 /// accessor is the rule a reader can check for themselves with
 /// `new URLSearchParams(location.search).get('r')`. (The router's
 /// `ParamsMap::get` took the last, so `?r=1h&r=garbage` used to read as
-/// the garbage.)
+/// the garbage.) [`query_params`] applies the same rule as it reads, so
+/// what reaches here holds one pair per key at most.
 #[must_use]
 pub fn first_value<'a>(params: &'a [(String, String)], key: &str) -> Option<&'a str> {
     params
@@ -472,6 +624,12 @@ pub fn repair_url<'a>(
     params: impl IntoIterator<Item = (&'a str, &'a str)>,
     which: Param,
 ) -> String {
+    if which == Param::Link {
+        // A link refused as a whole names no parameter to edit out of
+        // it, and nothing inside it was read: the repair is the search
+        // page with no query string at all.
+        return String::from("/search");
+    }
     let mut url = String::from("/search");
     let mut sep = '?';
     let mut repaired = false;
@@ -928,17 +1086,102 @@ mod tests {
             vec![("q".into(), "x".into()), ("page".into(), "0".into())]
         );
         // No `=` is a name with an empty value…
-        assert_eq!(query_params("live"), vec![("live".into(), String::new())]);
+        assert_eq!(query_params("q"), vec![("q".into(), String::new())]);
         // …and only the FIRST `=` splits, so an `=` inside a DSL value
         // stays in the value.
         assert_eq!(
             query_params("q=service=nginx"),
             vec![("q".into(), "service=nginx".into())]
         );
-        // Names decode too.
+    }
+
+    /// Only the five parameters this app reads are kept, and a name is
+    /// matched the way the browser would match it — `%71` IS `q`.
+    #[test]
+    fn only_the_known_parameters_are_read() {
         assert_eq!(
-            query_params("a%20b=1&c%2Bd=2"),
-            vec![("a b".into(), "1".into()), ("c+d".into(), "2".into())]
+            query_params("utm_source=chat&q=x&ref=%2Fa&page=2&nope"),
+            vec![("q".into(), "x".into()), ("page".into(), "2".into())]
+        );
+        assert_eq!(query_params("%71=x"), vec![("q".into(), "x".into())]);
+        assert_eq!(query_params("%70age=2"), vec![("page".into(), "2".into())]);
+        // Not a key we read, however it is spelled.
+        for raw in ["live", "a%20b=1", "c%2Bd=2", "qq=x", "%71%71=x"] {
+            assert_eq!(query_params(raw), Vec::new(), "{raw}");
+        }
+        // A name long enough to be junk is never decoded to find that
+        // out: nothing that decodes to a 1-4 byte key can be over 12
+        // bytes raw.
+        assert_eq!(query_params("%71%20%20%20%20=x"), Vec::new());
+    }
+
+    /// The pair cap is a bound on work, not a filter on meaning: the
+    /// five keys win wherever they sit inside it, and a key past it
+    /// reads as missing — the same answer a link without it gets.
+    #[test]
+    fn a_known_key_past_the_pair_cap_reads_as_missing() {
+        let junk = |n: usize| "x=1&".repeat(n);
+        let inside = format!("{}q=late", junk(MAX_SEARCH_PAIRS - 1));
+        assert_eq!(first_value(&query_params(&inside), "q"), Some("late"));
+
+        let past = format!("{}q=late", junk(MAX_SEARCH_PAIRS));
+        assert_eq!(first_value(&query_params(&past), "q"), None);
+        // 100 unknown pairs ahead of it is past the cap by the same
+        // rule; nothing else in the link is affected.
+        let hundred = format!("{}q=late", junk(100));
+        assert_eq!(query_params(&hundred), Vec::new());
+    }
+
+    /// Length first, split second. A million pairs is 2 MB of address
+    /// bar, and the old reader turned it into a million owned pairs
+    /// before any cap applied.
+    #[test]
+    fn a_search_string_over_the_bound_is_one_verdict_and_nothing_else() {
+        let million = format!("?{}", "a&".repeat(1_000_000));
+        let read = read_search(&million);
+        let m = read.malformed().expect("a 2 MB link is malformed");
+        assert_eq!(m.param, Param::Link);
+        assert_eq!(m.reason, Reason::LinkTooLong);
+        // Nothing was parsed and nothing was kept: no pairs, and not one
+        // character of the raw text retained for the banner.
+        assert!(read.params().is_empty());
+        assert_eq!(m.truncated_raw(), "");
+        assert_eq!(m.message(), "This link is too long to read.");
+        assert_eq!(m.repair_label(), "Start over");
+        // The repair is the page with no query string, not an edit of a
+        // link the reader never read.
+        assert_eq!(
+            repair_url(
+                read.params().iter().map(|(n, v)| (n.as_str(), v.as_str())),
+                Param::Link
+            ),
+            "/search"
+        );
+    }
+
+    #[test]
+    fn the_search_length_bound_is_inclusive() {
+        let at_cap = format!("q={}", "a".repeat(MAX_SEARCH_BYTES - 2));
+        assert_eq!(at_cap.len(), MAX_SEARCH_BYTES);
+        let read = read_search(&at_cap);
+        assert_eq!(read.malformed(), None);
+        assert_eq!(
+            first_value(read.params(), "q").map(str::len),
+            Some(MAX_SEARCH_BYTES - 2)
+        );
+
+        let over_cap = format!("{at_cap}a");
+        assert_eq!(over_cap.len(), MAX_SEARCH_BYTES + 1);
+        assert_eq!(
+            read_search(&over_cap).malformed().map(|m| m.reason),
+            Some(Reason::LinkTooLong)
+        );
+        // A single oversized `q` is the same verdict: the bound is on
+        // the whole string, so there is no parameter to name.
+        let long_q = format!("q={}", "a".repeat(33 * 1024));
+        assert_eq!(
+            read_search(&long_q).malformed().map(|m| m.param),
+            Some(Param::Link)
         );
     }
 
@@ -946,27 +1189,24 @@ mod tests {
     /// the one a lookup answers with, as `URLSearchParams.get` does.
     #[test]
     fn a_duplicated_key_reads_as_its_first_value() {
+        // The duplicate is dropped as the string is read, so the rule is
+        // one place rather than one per consumer.
         let params = query_params("r=1h&q=a&r=garbage&q=b");
         assert_eq!(
             params,
-            vec![
-                ("r".into(), "1h".into()),
-                ("q".into(), "a".into()),
-                ("r".into(), "garbage".into()),
-                ("q".into(), "b".into()),
-            ]
+            vec![("r".into(), "1h".into()), ("q".into(), "a".into())]
         );
         assert_eq!(first_value(&params, "r"), Some("1h"));
         assert_eq!(first_value(&params, "q"), Some("a"));
         assert_eq!(first_value(&params, "page"), None);
-        // A repair drops EVERY copy of the parameter it names, so the
-        // second `r` cannot come back as the first one's replacement.
+        // A repair therefore cannot bring the second `r` back as the
+        // first one's replacement: it was never carried.
         assert_eq!(
             repair_url(
                 params.iter().map(|(n, v)| (n.as_str(), v.as_str())),
                 Param::Range
             ),
-            "/search?q=a&q=b"
+            "/search?q=a"
         );
     }
 

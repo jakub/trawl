@@ -120,4 +120,9 @@ export const COPY = {
   reservedSetEncoded: "%20%23%26%2F%3A%25'!~*()%E6%97%A5%E6%9C%AC%E8%AA%9E%F0%9F%98%80",
   /// crates/trawl-web-ui/src/search_url.rs EMPTY_QUERY_REFUSAL.
   emptyQueryRefusal: 'Nothing to export: the query is empty.',
+  /// crates/trawl-web-ui/src/search_url.rs Malformed::message, the
+  /// whole-link arm.
+  urlNoticeTooLong: 'This link is too long to read.',
+  /// crates/trawl-web-ui/src/search_url.rs Malformed::repair_label.
+  urlNoticeRepairLink: 'Start over',
 } as const;

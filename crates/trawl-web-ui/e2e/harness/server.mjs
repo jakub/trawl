@@ -194,7 +194,12 @@ function serveStream(res) {
 
 // ---- request handling -------------------------------------------------------
 
-const server = http.createServer(async (req, res) => {
+// Node's default header cap is 16 KiB INCLUDING the request line, so a
+// deliberately oversized search link (the SPA's own bound is 32 KiB)
+// would be answered with a 431 by the harness before the app ever saw
+// it. The spec that proves the app refuses such a link needs the link to
+// arrive, so this stub carries more than any real deployment would.
+const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res) => {
   let url;
   let p;
 

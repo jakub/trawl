@@ -326,6 +326,18 @@ const CONTRACTS: &[Contract] = &[
         hook: "\"%20%23%26%2F%3A%25'!~*()%E6%97%A5%E6%9C%AC%E8%AA%9E%F0%9F%98%80\"",
     },
     Contract {
+        assignment: "urlNoticeTooLong: 'This link is too long to read.',",
+        source_path: "src/search_url.rs",
+        source: SEARCH_URL_RS,
+        hook: "Param::Link => \"This link is too long to read.\".to_owned(),",
+    },
+    Contract {
+        assignment: "urlNoticeRepairLink: 'Start over',",
+        source_path: "src/search_url.rs",
+        source: SEARCH_URL_RS,
+        hook: "Param::Link => \"Start over\",",
+    },
+    Contract {
         assignment: "liveTailButtonText: 'Live Tail',",
         source_path: "src/components/editor_wrap.rs",
         source: EDITOR_WRAP_RS,

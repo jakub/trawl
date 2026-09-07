@@ -37,12 +37,20 @@ pub fn MalformedNotice(
         // degraded notice: a region that mounts with its content is not
         // reliably announced.
         <div class="url-live" aria-live="polite">
-            {move || malformed.get().map(|m| view! {
+            {move || malformed.get().map(|m| {
+                // The whole-link verdict retains none of the raw value —
+                // it is tens of kilobytes of address bar and its message
+                // introduces nothing — so the echo is rendered only when
+                // there is something to echo.
+                let raw = m.truncated_raw();
+                view! {
                 <div class="url-notice">
                     <span class="url-notice-text">
                         {m.message()}
-                        " "
-                        <code class="url-notice-raw">{m.truncated_raw()}</code>
+                        {(!raw.is_empty()).then(|| view! {
+                            " "
+                            <code class="url-notice-raw">{raw}</code>
+                        })}
                     </span>
                     <button
                         type="button"
@@ -52,7 +60,7 @@ pub fn MalformedNotice(
                         {m.repair_label()}
                     </button>
                 </div>
-            })}
+            }})}
         </div>
     }
 }

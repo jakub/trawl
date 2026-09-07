@@ -32,7 +32,7 @@ pub use crate::query_merge::{Filter, FilterOp, QUICK_RANGES, RangeSpec, effectiv
 pub use crate::search_url::{Mode, build_search_url};
 
 use crate::search_url::{
-    Malformed, Verdict, decode_filters, decode_range, first_value, parse_page, query_params,
+    Malformed, Verdict, decode_filters, decode_range, first_value, parse_page, read_search,
     repair_url,
 };
 
@@ -88,8 +88,10 @@ pub fn replace_navigator() -> impl Fn(&str) + Clone + 'static {
 ///
 /// `filters`, `range` and `page` fall back to their defaults for a
 /// malformed value so the page still renders; `malformed` is what stops
-/// it running. Precedence is `f`, then `r`, then `page` — one banner,
-/// naming the first parameter a reader would have to fix.
+/// it running. Precedence is the whole link, then `f`, then `r`, then
+/// `page` — one banner, naming the first thing a reader would have to
+/// fix. The link comes first because a link over `MAX_SEARCH_BYTES` was
+/// never parsed: there are no parameter verdicts underneath it.
 pub struct UrlSignals {
     pub executed_q: Memo<String>,
     pub page: Memo<usize>,
@@ -115,14 +117,18 @@ pub struct UrlSignals {
 ///
 /// Every memo below hangs off ONE reading of the raw query string
 /// (`use_location().search`, which is the URL's own text minus the `?`),
-/// decoded once by [`query_params`]. The router's own `use_query_map`
-/// cannot be that reading: `ParamsMap::insert` percent-decodes a value
-/// `UrlSearchParams` has already decoded, so `?q=message%3D%2F100%2541%2F`
-/// reached this function as `message=/100A/` and the page ran a query
-/// its own address bar disagreed with.
+/// bounded and decoded once by [`read_search`]. The router's own
+/// `use_query_map` cannot be that reading: `ParamsMap::insert`
+/// percent-decodes a value `UrlSearchParams` has already decoded, so
+/// `?q=message%3D%2F100%2541%2F` reached this function as
+/// `message=/100A/` and the page ran a query its own address bar
+/// disagreed with.
 pub fn url_signals() -> UrlSignals {
     let search = use_location().search;
-    let params = Memo::new(move |_| search.with(|raw| query_params(raw)));
+    let read = Memo::new(move |_| search.with(|raw| read_search(raw)));
+    // Empty when the link was refused by length, so every parameter
+    // memo below reads as absent without a special case of its own.
+    let params = Memo::new(move |_| read.with(|r| r.params().to_vec()));
     let executed_q =
         Memo::new(move |_| params.with(|p| first_value(p, "q").unwrap_or_default().to_owned()));
     let mode = Memo::new(move |_| params.with(|p| Mode::from_url_param(first_value(p, "mode"))));
@@ -141,8 +147,8 @@ pub fn url_signals() -> UrlSignals {
     let range = Memo::new(move |_| range_read.get().into_value().unwrap_or_default());
     let page = Memo::new(move |_| page_read.get().into_value().unwrap_or(0));
     let malformed = Memo::new(move |_| {
-        filters_read
-            .with(|v| v.malformed().cloned())
+        read.with(|r| r.malformed().cloned())
+            .or_else(|| filters_read.with(|v| v.malformed().cloned()))
             .or_else(|| range_read.with(|v| v.malformed().cloned()))
             .or_else(|| page_read.with(|v| v.malformed().cloned()))
     });

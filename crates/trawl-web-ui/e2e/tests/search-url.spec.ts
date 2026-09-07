@@ -370,6 +370,35 @@ test('page offset overflows refuse to run while an unreadable page is page 1', a
   expect(body.offset).toBe(0);
 });
 
+test('a link past the length bound is refused whole', async ({ page, request }) => {
+  // 40 KiB of `q`, past MAX_SEARCH_BYTES. Nothing inside is parsed, so
+  // this is ONE verdict about the link rather than a banner per
+  // parameter, and the browser is the only thing that had to carry it.
+  await resetScenario(request, 'default');
+  await page.goto(`/search?q=${'a'.repeat(40 * 1024)}`);
+
+  const notice = page.locator(SEL.urlNotice);
+  await expect(notice).toBeVisible();
+  await expect(notice).toContainText(COPY.urlNoticeTooLong);
+  // Nothing of the raw link is echoed back: there is nothing in 40 KiB
+  // of `a` a reader could act on.
+  await expect(page.locator(SEL.urlNoticeRaw)).toHaveCount(0);
+  await expect(page.locator(SEL.urlNoticeRepair)).toHaveText(COPY.urlNoticeRepairLink);
+  await expect(page.locator(SEL.runButton)).toBeDisabled();
+
+  await page.waitForTimeout(QUIET_MS);
+  expect(await capturedQueryCount(request), 'an oversized link posted a query').toBe(0);
+
+  // "Start over" is the whole query string, not an edit of a link the
+  // reader never read — and it replaces, like every other repair.
+  const historyBefore = await page.evaluate(() => history.length);
+  await page.locator(SEL.urlNoticeRepair).click();
+  await expect(page.locator(SEL.urlNotice)).toHaveCount(0);
+  expect(await page.evaluate(() => location.pathname)).toBe('/search');
+  expect(await page.evaluate(() => location.search)).toBe('');
+  expect(await page.evaluate(() => history.length)).toBe(historyBefore);
+});
+
 test('q encoding matches encodeURIComponent', async ({ page }) => {
   await page.goto('/search');
   await runInEditor(page, COPY.reservedSet);

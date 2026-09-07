@@ -71,10 +71,19 @@ A link whose structured state does not parse is shown, not run.**
   escaper `format_filter` already uses. Validation is a client courtesy;
   the server's opaque 500 on an unparseable bound is a `trawl-core` gap
   and stays outside this slice.
-- **Decoding is bounded.** The raw `f` value is capped before base64 or
-  JSON allocation, the decoded filter count and field/value lengths are
-  capped, and the page offset is a checked multiplication. A URL is
-  attacker-controlled input to the SPA.
+- **Decoding is bounded, starting with the whole link.** A raw query
+  string over `MAX_SEARCH_BYTES` (32 KiB) is one malformed verdict about
+  the link itself, refused by length before it is split into anything and
+  repaired by starting over at `/search`; a per-parameter cap bounds
+  nothing while the number of parameters does not, and `?a&` a million
+  times used to be a million owned pairs (run ruling 2026-09-06). Inside
+  that bound only the five keys this app reads are retained, first
+  occurrence each, over at most 64 examined pairs, so an unknown
+  parameter costs a name comparison rather than a decoded copy and does
+  not survive a repair. Then per parameter: the raw `f` value is capped
+  before base64 or JSON allocation, the decoded filter count and
+  field/value lengths are capped, and the page offset is a checked
+  multiplication. A URL is attacker-controlled input to the SPA.
 - **The SPA reads the raw query string and decodes it once itself.**
   `leptos_router`'s `ParamsMap` percent-decodes a value `UrlSearchParams`
   has already decoded, which turns `?q=message%3D%2F100%2541%2F` into the

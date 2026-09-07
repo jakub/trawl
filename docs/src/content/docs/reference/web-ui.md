@@ -52,7 +52,10 @@ click the repair. Everything else is switched off while the banner is up —
 Haul, the range presets, Live Tail, Save, Export, pagination and the filter
 controls all refuse, so a broken link cannot be turned into a wider query
 through a control that was never named. The broken link stays intact until
-then, so you can send it back to whoever shared it.
+then, so you can send it back to whoever shared it. A link over 32 KiB is
+refused as a whole rather than parameter by parameter, with `Start over` as
+its repair, and parameters other than `q`, `page`, `mode`, `f` and `r` are
+not read at all.
 
 The case file renders one `GET /api/v1/schema/field?name=` response as plain
 facts: the pin and when and where it was set, the verdict (since when, how
