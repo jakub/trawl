@@ -28,6 +28,8 @@ const EDITOR_WRAP_RS: &str = include_str!("../src/components/editor_wrap.rs");
 const MALFORMED_NOTICE_RS: &str = include_str!("../src/components/malformed_notice.rs");
 const META_STRIP_RS: &str = include_str!("../src/components/meta_strip.rs");
 const SEARCH_URL_RS: &str = include_str!("../src/search_url.rs");
+const EXPORT_MODAL_RS: &str = include_str!("../src/components/export_modal.rs");
+const MODAL_SHELL_RS: &str = include_str!("../../fleet-ui/src/modal/shell.rs");
 const LOADED_COMPONENT_RS: &str = include_str!("../../fleet-ui/src/loaded/component.rs");
 const LOADED_STATE_RS: &str = include_str!("../../fleet-ui/src/loaded/state.rs");
 const RAIL_RS: &str = include_str!("../../fleet-ui/src/rail.rs");
@@ -226,6 +228,42 @@ const CONTRACTS: &[Contract] = &[
         source_path: "src/components/results_table.rs",
         source: RESULTS_TABLE_RS,
         hook: "class=\"results\"",
+    },
+    Contract {
+        assignment: "exportAction: '.tabs .action.export',",
+        source_path: "src/pages/search.rs",
+        source: include_str!("../src/pages/search.rs"),
+        hook: "class=\"action export\"",
+    },
+    Contract {
+        assignment: "saveAction: '.tabs .action.save',",
+        source_path: "src/pages/search.rs",
+        source: include_str!("../src/pages/search.rs"),
+        hook: "class=\"action save\"",
+    },
+    Contract {
+        assignment: "quickRangeOption: '.dr-pop .opt',",
+        source_path: "src/components/editor_wrap.rs",
+        source: EDITOR_WRAP_RS,
+        hook: "class=\"opt\"",
+    },
+    Contract {
+        assignment: "modalPanel: '.modal',",
+        source_path: "../fleet-ui/src/modal/shell.rs",
+        source: MODAL_SHELL_RS,
+        hook: "else { \"modal\" };",
+    },
+    Contract {
+        assignment: "modalRefusal: '.m-refusal',",
+        source_path: "src/components/export_modal.rs",
+        source: EXPORT_MODAL_RS,
+        hook: "class=\"m-refusal\"",
+    },
+    Contract {
+        assignment: "emptyQueryRefusal: 'Nothing to export: the query is empty.',",
+        source_path: "src/search_url.rs",
+        source: SEARCH_URL_RS,
+        hook: "pub const EMPTY_QUERY_REFUSAL: &str = \"Nothing to export: the query is empty.\";",
     },
     Contract {
         assignment: "urlNoticeFiltersPrefix: \"This link's filters could not be read:\",",

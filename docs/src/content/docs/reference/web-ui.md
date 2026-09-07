@@ -48,8 +48,11 @@ and expect its spelling to change without notice. When a link's structured
 state cannot be read, whether that is a damaged `f`, a range in neither form,
 or a page number that cannot be asked for, the page shows a banner naming the
 parameter and echoing what the link actually says, and runs nothing until you
-click the repair. The broken link stays intact until then, so you can send it
-back to whoever shared it.
+click the repair. Everything else is switched off while the banner is up —
+Haul, the range presets, Live Tail, Save, Export, pagination and the filter
+controls all refuse, so a broken link cannot be turned into a wider query
+through a control that was never named. The broken link stays intact until
+then, so you can send it back to whoever shared it.
 
 The case file renders one `GET /api/v1/schema/field?name=` response as plain
 facts: the pin and when and where it was set, the verdict (since when, how

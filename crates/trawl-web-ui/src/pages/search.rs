@@ -95,19 +95,26 @@ pub fn Search() -> impl IntoView {
         query_text.set(executed_q.get());
     });
 
-    // A link whose structured state could not be read runs nothing
-    // (ADR-0027). An empty effective query is the one gate the page
-    // already has: the snapshot resource short-circuits it without a
-    // POST, and the live-tail effect returns before opening a stream.
-    // The memos below still carry their defaults, so the page renders.
-    // Whether this link's structured state could be read at all. Every
-    // reader of `rows` below is gated on it, because refusing to RUN a
-    // link is not the same as refusing to PAINT one: a response already
-    // in flight when the URL turned unreadable (Back, mid-request) still
-    // lands in the resource, and rows under a banner that says the link
-    // was not run are a straight contradiction. That the resource keeps
-    // the in-flight request is a residual outside this slice; what it
-    // shows is not.
+    // Whether this link's structured state could be read at all.
+    //
+    // A link that could not be read runs nothing and rewrites nothing
+    // (ADR-0027): while this is true the banner's repair is the ONLY
+    // control that navigates. That is structural, not a property of the
+    // blanked query below — every callback in this component returns
+    // early on it, and every control that reaches one of them is
+    // rendered `disabled` (or, where a span has no disabled state, not
+    // rendered). Blanking `effective_q` alone was not the gate it looked
+    // like: the export modal read that empty string and posted it, and
+    // an empty query is `SELECT *` with no WHERE to the server's
+    // emitter, so a refused link exported the whole corpus.
+    //
+    // Every reader of `rows` below is gated on it too, because refusing
+    // to RUN a link is not the same as refusing to PAINT one: a response
+    // already in flight when the URL turned unreadable (Back,
+    // mid-request) still lands in the resource, and rows under a banner
+    // that says the link was not run are a straight contradiction. That
+    // the resource keeps the in-flight request is a residual outside
+    // this slice; what it shows is not.
     let unreadable = Signal::derive(move || malformed.with(Option::is_some));
 
     let effective_q = Memo::new(move |_| {
@@ -127,6 +134,12 @@ pub fn Search() -> impl IntoView {
     let on_submit = {
         let goto = goto.clone();
         Callback::new(move |()| {
+            // The gate, at every door that navigates. The Haul button
+            // carries `disabled` as well; this is what makes the
+            // editor's own Ctrl+Enter obey the same rule.
+            if unreadable.get_untracked() {
+                return;
+            }
             goto(
                 &query_text.get_untracked(),
                 0,
@@ -144,6 +157,9 @@ pub fn Search() -> impl IntoView {
     let on_live = {
         let goto = goto.clone();
         Callback::new(move |()| {
+            if unreadable.get_untracked() {
+                return;
+            }
             goto(
                 &query_text.get_untracked(),
                 0,
@@ -158,6 +174,9 @@ pub fn Search() -> impl IntoView {
     let on_paginate = {
         let goto = goto.clone();
         Callback::new(move |new_page: usize| {
+            if unreadable.get_untracked() {
+                return;
+            }
             goto(
                 &executed_q.get_untracked(),
                 new_page,
@@ -172,6 +191,9 @@ pub fn Search() -> impl IntoView {
     let on_add_filter = {
         let goto = goto.clone();
         Callback::new(move |f: Filter| {
+            if unreadable.get_untracked() {
+                return;
+            }
             let mut current = filters.get_untracked();
             if current.iter().any(|existing| existing == &f) {
                 return;
@@ -200,6 +222,9 @@ pub fn Search() -> impl IntoView {
     let on_remove_filter = {
         let goto = goto.clone();
         Callback::new(move |idx: usize| {
+            if unreadable.get_untracked() {
+                return;
+            }
             let mut current = filters.get_untracked();
             if idx >= current.len() {
                 return;
@@ -219,7 +244,7 @@ pub fn Search() -> impl IntoView {
     let on_clear_filters = {
         let goto = goto.clone();
         Callback::new(move |()| {
-            if filters.get_untracked().is_empty() {
+            if unreadable.get_untracked() || filters.get_untracked().is_empty() {
                 return;
             }
             goto(
@@ -236,7 +261,7 @@ pub fn Search() -> impl IntoView {
     let on_range_change = {
         let goto = goto.clone();
         Callback::new(move |new_range: RangeSpec| {
-            if range.get_untracked() == new_range {
+            if unreadable.get_untracked() || range.get_untracked() == new_range {
                 return;
             }
             goto(
@@ -267,6 +292,9 @@ pub fn Search() -> impl IntoView {
     let on_navigate_q = {
         let goto = goto.clone();
         Callback::new(move |new_q: String| {
+            if unreadable.get_untracked() {
+                return;
+            }
             query_text.set(new_q.clone());
             goto(&new_q, 0, Mode::Snapshot, &[], &RangeSpec::default(), false);
         })
@@ -382,9 +410,30 @@ pub fn Search() -> impl IntoView {
     });
 
     let show_save_modal = RwSignal::new(false);
-    let on_save = Callback::new(move |()| show_save_modal.set(true));
+    let on_save = Callback::new(move |()| {
+        if unreadable.get_untracked() {
+            return;
+        }
+        show_save_modal.set(true);
+    });
     let show_export_modal = RwSignal::new(false);
-    let on_export = Callback::new(move |()| show_export_modal.set(true));
+    let on_export = Callback::new(move |()| {
+        if unreadable.get_untracked() {
+            return;
+        }
+        show_export_modal.set(true);
+    });
+    // A modal opened while the link read fine survives a Back INTO one
+    // that does not: the URL changes under an open dialog whose query
+    // preview is now the blanked sentinel. Close both the moment the
+    // link stops being readable, so the banner is what the reader is
+    // left looking at (ADR-0027).
+    Effect::new(move |_| {
+        if unreadable.get() {
+            show_save_modal.set(false);
+            show_export_modal.set(false);
+        }
+    });
     let running = loading;
 
     let malformed_sig = Signal::derive(move || malformed.get());
@@ -413,6 +462,7 @@ pub fn Search() -> impl IntoView {
                     range=range_sig
                     on_range_change=on_range_change
                     running=running
+                    blocked=unreadable
                     on_save=on_save
                     on_live=on_live
                 />
@@ -420,6 +470,7 @@ pub fn Search() -> impl IntoView {
                     truncated=truncated
                     filters=filters_sig
                     filters_unreadable=filters_unreadable
+                    blocked=unreadable
                     on_remove=on_remove_filter
                 />
                 <MalformedNotice malformed=malformed_sig on_repair=on_repair/>
@@ -430,19 +481,27 @@ pub fn Search() -> impl IntoView {
                     ]
                     active=tabs_active
                     on_change=on_tab_change
+                    // Buttons, not spans: an unreadable link disables
+                    // both. Export posts the effective query, which is
+                    // the blanked sentinel then, and the server reads
+                    // an empty query as every row (ADR-0027).
                     trailing=Box::new(move || view! {
-                        <span
-                            class="action"
+                        <button
+                            type="button"
+                            class="action save"
+                            disabled=move || unreadable.get()
                             on:click=move |_| bus.push(
                                 ToastKind::Info,
                                 "Save",
                                 Some("Net saving is landing soon — use the history page for now.".into()),
                             )
-                        >"Save"</span>
-                        <span
-                            class="action"
+                        >"Save"</button>
+                        <button
+                            type="button"
+                            class="action export"
+                            disabled=move || unreadable.get()
                             on:click=move |_| on_export.run(())
-                        >"Export"</span>
+                        >"Export"</button>
                     }.into_any())
                 />
                 // Above the results body, not inside it: a zero-row

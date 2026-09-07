@@ -112,6 +112,15 @@ export async function lastCapturedQuery(request: Ctl, expectedCount: number, tim
   }
 }
 
+/** How many `POST /api/v1/export` bodies the stub has captured since the
+ * last reset. An export is the request that mattered most in ADR-0027's
+ * review: the server reads an empty query as every row, so a link the
+ * page refused must not be exportable. */
+export async function capturedExportCount(request: Ctl): Promise<number> {
+  const state = await (await request.get('/__ctl/state')).json();
+  return state.exports.length;
+}
+
 /** Every captured query's DSL, oldest first. */
 export async function capturedQueries(request: Ctl): Promise<string[]> {
   const state = await (await request.get('/__ctl/state')).json();

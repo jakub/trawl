@@ -51,6 +51,20 @@ A link whose structured state does not parse is shown, not run.**
   unparseable `page` is a missing value and reads as 0; an out-of-range
   one is a false claim and is malformed. A malformed versioned `f` is no
   longer "zero filters".
+- **While a parameter is malformed, the repair is the only control that
+  navigates or runs.** Blanking the effective query is not the gate: the
+  export modal read that empty string and posted it, and the server's
+  emitter turns an empty query into `SELECT *` with no WHERE, so a link
+  the page had refused exported the whole corpus (run ruling 2026-09-06).
+  Every callback that navigates or submits returns early while the link
+  is unreadable, and every control that reaches one renders `disabled` —
+  Haul (and the editor's own Ctrl+Enter), the range presets, Apply, Live
+  Tail, Save, Export, pagination, facet include/exclude and clear, chip
+  removal, and the row actions that navigate. A modal already open when
+  the URL turns unreadable is closed. Nothing is re-routed through the
+  fallback memos: blocking is the fix. Underneath it, an empty query
+  never reaches an execution endpoint at all — the export modal refuses
+  it in its own body and `api::export` refuses it again.
 - **Bounds are validated and escaped before they enter the DSL.** The
   client checks RFC 3339 (or `now` on the right) before emitting
   `_time>=`/`_time<=`, and the bound still goes through the DSL string

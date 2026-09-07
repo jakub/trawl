@@ -15,6 +15,7 @@ use trawl_api::ExportFormat;
 
 use crate::api;
 use crate::download;
+use crate::search_url::{EMPTY_QUERY_REFUSAL, is_executable};
 use fleet_ui::{Btn, Icon, Kbd, Modal, Segmented, SegmentedOption, ToastBus, ToastKind, Variant};
 
 #[component]
@@ -28,12 +29,24 @@ pub fn ExportModal(
     let bus = expect_context::<ToastBus>();
     let format = RwSignal::new(ExportFormat::Csv);
     let downloading = RwSignal::new(false);
+    // What this modal refused, shown in its own body rather than as a
+    // toast: the reader is looking at the dialog they just submitted.
+    let refusal = RwSignal::new(None::<&'static str>);
 
     let q_for_submit = query.clone();
     let do_download = Callback::new(move |()| {
         if downloading.get_untracked() {
             return;
         }
+        // An empty query is the whole corpus to the server's emitter, so
+        // the download button is not a way around the malformed gate
+        // that blanked it (ADR-0027). `api::export` refuses it as well;
+        // this arm is what the reader sees.
+        if !is_executable(&q_for_submit) {
+            refusal.set(Some(EMPTY_QUERY_REFUSAL));
+            return;
+        }
+        refusal.set(None);
         downloading.set(true);
         let q = q_for_submit.clone();
         spawn_local(async move {
@@ -87,6 +100,10 @@ pub fn ExportModal(
                 <label>"Query"</label>
                 <div class="preview" title=query.clone()>{query.clone()}</div>
             </div>
+
+            <Show when=move || refusal.get().is_some()>
+                <div class="m-refusal">{move || refusal.get().unwrap_or_default()}</div>
+            </Show>
 
             <div class="m-field">
                 <label>"Format"</label>

@@ -468,8 +468,10 @@
   background: var(--panel-2);
   color: var(--ink-2);
   border-color: var(--line);
-  cursor: wait;
+  cursor: not-allowed;
 }
+/* In flight is the one disabled state that is worth waiting for. */
+.run.running { cursor: wait; }
 /* .kbd-inline moved to fleet-ui.css (issue #31) — <Kbd inline=true>
  * emits it; the .run scoping was dropped with the generalization. */
 
@@ -548,6 +550,23 @@
 }
 .tabs .action + .action { margin-left: 4px; }
 .tabs .action:hover { color: var(--ink); background: var(--panel-2); }
+/* The trailing Save/Export actions and the editor's tool row are real
+ * <button>s so a link that cannot be read can disable them (ADR-0027);
+ * these two rules put the text-link look back over the button chrome. */
+.tabs button.action, .editor-tools button.tool {
+  font: inherit;
+  background: none;
+  border: 0;
+  color: inherit;
+}
+.tabs .action:disabled, .editor-tools .tool:disabled, .dr-pop .opt:disabled {
+  opacity: .45;
+  cursor: not-allowed;
+}
+.tabs .action:disabled:hover, .editor-tools .tool:disabled:hover {
+  background: none;
+  color: inherit;
+}
 
 /* ─────────────────────────────────────────────────────────────────
  *  Incomplete-results notice (ADR-0011 C2) — one warn-toned line
@@ -936,7 +955,11 @@
   text-align: center;
   user-select: none;
 }
+/* Full width: a <button> in the preset grid does not stretch the way
+ * the <div> it replaced did. */
+.dr-pop button.opt { width: 100%; font: inherit; }
 .dr-pop .opt:hover { background: var(--accent-wash); border-color: var(--accent); }
+.dr-pop .opt:disabled:hover { background: var(--panel-2); border-color: var(--line-2); }
 .dr-pop .opt.on {
   background: var(--accent-wash);
   color: var(--accent);
@@ -1112,6 +1135,15 @@
   border-radius: var(--radius-sm); padding: 8px 10px;
   font-family: var(--font-mono); font-size: var(--table-fs); color: var(--ink-2);
   white-space: pre-wrap; word-break: break-all;
+}
+/* What a modal refused, in its own body. The export modal is the one
+ * that uses it: an empty query is refused there rather than posted
+ * (ADR-0027). */
+.modal .m-body .m-refusal {
+  font-family: var(--font-ui);
+  font-size: var(--fs-dense);
+  line-height: 1.4;
+  color: var(--red);
 }
 .modal .m-ft .hint {
   flex: 1; font-family: var(--font-mono); font-size: var(--fs-dense); color: var(--ink-3);

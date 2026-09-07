@@ -32,7 +32,8 @@ pub fn FacetSidebar(
     /// rail then shows its header and nothing else: facets are counted
     /// off rows, and a query that was refused has no rows to count —
     /// including a response that was already in flight when the URL
-    /// turned unreadable (ADR-0027).
+    /// turned unreadable (ADR-0027). "Clear all" goes with them, since
+    /// clearing filters navigates.
     #[prop(into)]
     suppressed: Signal<bool>,
     /// Called when the user clicks `+` or `⊘` on a facet value.
@@ -52,7 +53,7 @@ pub fn FacetSidebar(
         <aside class="facets">
             <div class="phead">
                 <div class="ttl">"Filters"</div>
-                <Show when=move || !filters.get().is_empty()>
+                <Show when=move || !filters.get().is_empty() && !suppressed.get()>
                     <div
                         class="clear"
                         on:click=move |_| on_clear.run(())

@@ -14,6 +14,7 @@
 import {
   test,
   expect,
+  capturedExportCount,
   capturedQueries,
   capturedQueryCount,
   lastCapturedQuery,
@@ -255,6 +256,86 @@ test('a repair fixes only the parameter the banner names', async ({ page, reques
   // …and the results pane is back, so its absence above was the gate
   // and not a selector that never matches anything.
   await expect(page.locator(SEL.resultsPane)).toBeVisible();
+});
+
+test('a malformed link disables every control that could run it', async ({ page, request }) => {
+  // Wrong in two places, so the banner names `f` while `r` is unreadable
+  // too: whatever a control read back would be the fallback, not the
+  // link. Nothing here may navigate except the repair (ADR-0027).
+  const url = '/search?q=service%3Dnginx&f=v1.!&r=garbage';
+  const search = url.slice(url.indexOf('?'));
+  await resetScenario(request, 'default');
+  const opensBefore = await sseOpens(request);
+  await page.goto(url);
+  await expect(page.locator(SEL.urlNotice)).toBeVisible();
+
+  // Haul, and the editor's own Ctrl+Enter, which reaches the same
+  // callback without touching the button.
+  await expect(page.locator(SEL.runButton)).toBeDisabled();
+  await page.locator(SEL.cmContent).click();
+  await page.keyboard.press('Control+Enter');
+  await page.locator(SEL.runButton).click({ force: true });
+
+  // Export: the one that used to post `{"query":""}`, which the server
+  // reads as every row. Disabled, and the modal does not even open.
+  await expect(page.locator(SEL.exportAction)).toBeDisabled();
+  await expect(page.locator(SEL.saveAction)).toBeDisabled();
+  await page.locator(SEL.exportAction).click({ force: true });
+  await expect(page.locator(SEL.modalPanel)).toHaveCount(0);
+
+  // The range picker still opens — it is how the current range is read —
+  // but a preset applies nothing.
+  await page.locator(SEL.dateRangeTrigger).click();
+  const preset = page.locator(SEL.quickRangeOption).first();
+  await expect(preset).toBeDisabled();
+  await preset.click({ force: true });
+
+  // Live Tail, on the same popover's Real-time tab.
+  await page.locator(SEL.realtimeTab).click();
+  await expect(page.locator(SEL.liveTailButton)).toBeDisabled();
+  await page.locator(SEL.liveTailButton).click({ force: true });
+
+  // Every refusal is an absence, so one bounded quiet wait covers them.
+  await page.waitForTimeout(QUIET_MS);
+  expect(await page.evaluate(() => location.search), 'a control rewrote the link').toBe(search);
+  expect(await capturedQueryCount(request), 'a control ran the link').toBe(0);
+  expect(await capturedExportCount(request), 'a control exported the link').toBe(0);
+  expect(await sseOpens(request), 'a control opened a stream').toBe(opensBefore);
+});
+
+test('an open modal closes when the link stops being readable', async ({ page, request }) => {
+  await page.goto('/search?q=service%3Dnginx&page=0');
+  await lastCapturedQuery(request, 1);
+  await page.locator(SEL.exportAction).click();
+  await expect(page.locator(SEL.modalPanel)).toBeVisible();
+
+  // A history entry the app itself can no longer produce — the gate
+  // above is exactly what stops it — planted with pushState (which the
+  // router does not observe) and then REACHED with a real Forward, so
+  // what the router sees is the popstate a Back into a shared broken
+  // link delivers.
+  await page.evaluate(() => history.pushState({}, '', '/search?q=service%3Dnginx&f=v1.!'));
+  await page.goBack();
+  await page.goForward();
+
+  await expect(page.locator(SEL.urlNotice)).toBeVisible();
+  await expect(page.locator(SEL.modalPanel), 'a modal outlived the link it was opened on').toHaveCount(0);
+});
+
+test('the export modal refuses an empty query instead of posting it', async ({ page, request }) => {
+  // The second layer, reached where the first one does not apply: a page
+  // with no `q` at all hands the modal the same empty string the
+  // malformed gate does, and an empty query is `SELECT *` with no WHERE
+  // to the server.
+  await page.goto('/search');
+  await page.locator(SEL.exportAction).click();
+  await expect(page.locator(SEL.modalPanel)).toBeVisible();
+  // The modal's own submit, so the refusal is proven at the callback and
+  // not at the footer button's disabled state.
+  await page.keyboard.press('Control+Enter');
+  await expect(page.locator(SEL.modalRefusal)).toHaveText(COPY.emptyQueryRefusal);
+  await page.waitForTimeout(QUIET_MS);
+  expect(await capturedExportCount(request)).toBe(0);
 });
 
 test('page offset overflows refuse to run while an unreadable page is page 1', async ({

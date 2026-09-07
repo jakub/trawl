@@ -83,6 +83,25 @@ pub const RESERVED_SET: &str = " #&/:%'!~*()日本語😀";
 pub const RESERVED_SET_ENCODED: &str =
     "%20%23%26%2F%3A%25'!~*()%E6%97%A5%E6%9C%AC%E8%AA%9E%F0%9F%98%80";
 
+/// Whether a query string may be handed to an execution endpoint at all.
+///
+/// The search page blanks its effective query while the link cannot be
+/// read (ADR-0027), and an empty query is not a narrow request: trawld's
+/// emitter turns it into `SELECT *` with no WHERE, so a request carrying
+/// it answers with the whole corpus while the page says the link was
+/// refused. `/api/v1/export` is the one that mattered — it streams rows
+/// straight to a file — so the door it goes through asks this first, and
+/// so does the modal above it.
+#[must_use]
+pub fn is_executable(query: &str) -> bool {
+    !query.trim().is_empty()
+}
+
+/// What a door that refused an empty query says. One sentence, no
+/// mention of the URL: the modal can also be open on a page where
+/// nothing has been typed yet.
+pub const EMPTY_QUERY_REFUSAL: &str = "Nothing to export: the query is empty.";
+
 /// Display mode for the search page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -745,6 +764,21 @@ mod tests {
             field: field.into(),
             value: value.into(),
             op: FilterOp::Include,
+        }
+    }
+
+    // ---- the empty-query door --------------------------------------
+
+    /// The sentinel the malformed gate produces. Whitespace counts as
+    /// empty because the DSL reader trims, so `" "` reaches the emitter
+    /// as the same `SELECT *` an empty string does.
+    #[test]
+    fn an_empty_or_blank_query_never_executes() {
+        for raw in ["", " ", "\t", "\n", "  \t\n "] {
+            assert!(!is_executable(raw), "{raw:?}");
+        }
+        for raw in ["*", "service=nginx", " service=nginx "] {
+            assert!(is_executable(raw), "{raw:?}");
         }
     }
 

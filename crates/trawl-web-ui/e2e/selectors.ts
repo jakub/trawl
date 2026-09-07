@@ -66,6 +66,20 @@ export const SEL = {
   /// results pane. Absent entirely while the malformed banner is up: the
   /// banner is the whole results area then (ADR-0027).
   resultsPane: '.results',
+  /// crates/trawl-web-ui/src/pages/search.rs — the tab strip's trailing
+  /// Export action, which opens the export modal.
+  exportAction: '.tabs .action.export',
+  /// crates/trawl-web-ui/src/pages/search.rs — its Save twin.
+  saveAction: '.tabs .action.save',
+  /// crates/trawl-web-ui/src/components/editor_wrap.rs DateRangePopover —
+  /// one quick-range preset in the Relative tab's grid.
+  quickRangeOption: '.dr-pop .opt',
+  /// crates/fleet-ui/src/modal/shell.rs — the modal panel itself (the
+  /// scrim is `.modal-scrim`, a different class).
+  modalPanel: '.modal',
+  /// crates/trawl-web-ui/src/components/export_modal.rs — what the modal
+  /// says when it refuses its own query rather than posting it.
+  modalRefusal: '.m-refusal',
 } as const;
 
 export const COPY = {
@@ -104,4 +118,6 @@ export const COPY = {
   reservedSet: " #&/:%'!~*()日本語😀",
   /// crates/trawl-web-ui/src/search_url.rs RESERVED_SET_ENCODED.
   reservedSetEncoded: "%20%23%26%2F%3A%25'!~*()%E6%97%A5%E6%9C%AC%E8%AA%9E%F0%9F%98%80",
+  /// crates/trawl-web-ui/src/search_url.rs EMPTY_QUERY_REFUSAL.
+  emptyQueryRefusal: 'Nothing to export: the query is empty.',
 } as const;

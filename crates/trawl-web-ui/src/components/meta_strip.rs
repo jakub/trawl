@@ -26,6 +26,13 @@ pub fn MetaStrip(
     /// query with no filters (ADR-0027).
     #[prop(into)]
     filters_unreadable: Signal<bool>,
+    /// True while ANY of the link's parameters could not be read.
+    /// Removing a chip navigates, so the `×` is not rendered at all
+    /// while the link is refused — a span has no disabled state, and a
+    /// dead control the reader can still click is worse than none
+    /// (ADR-0027).
+    #[prop(into)]
+    blocked: Signal<bool>,
     /// Called with the index of a filter to remove.
     on_remove: Callback<usize>,
 ) -> impl IntoView {
@@ -46,13 +53,15 @@ pub fn MetaStrip(
                         view! {
                             <span class="chip" class:excl=move || is_excl>
                                 <span>{label}</span>
-                                <span
-                                    class="x"
-                                    on:click=move |e| {
-                                        e.stop_propagation();
-                                        on_remove.run(i);
-                                    }
-                                >"×"</span>
+                                <Show when=move || !blocked.get()>
+                                    <span
+                                        class="x"
+                                        on:click=move |e| {
+                                            e.stop_propagation();
+                                            on_remove.run(i);
+                                        }
+                                    >"×"</span>
+                                </Show>
                             </span>
                         }
                     }).collect::<Vec<_>>()}
