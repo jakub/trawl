@@ -802,6 +802,10 @@
 }
 .results-table thead th.sorted { color: var(--ink); }
 .results-table thead th.sorted .sort { opacity: 1; color: var(--accent); }
+/* The row is the containing block for its caret button's stretched
+ * pseudo-element (ADR-0029). */
+.results-table tbody tr { position: relative; }
+.results-table .exp-col .row-stretch { width: 100%; }
 .results-table tbody tr.expanded td { background: var(--accent-wash); }
 .results-table tbody tr.expanded td.exp-col { color: var(--accent); }
 
@@ -850,6 +854,7 @@
   font-size: var(--table-fs);
 }
 .results-table .detail .dg .v .tag {
+  font: inherit;
   background: var(--panel-2);
   border: 1px solid var(--line-2);
   border-radius: var(--radius-sm);
@@ -1081,11 +1086,24 @@
   font-family: var(--font-ui); font-size: var(--fs-ui); font-weight: 600;
   border-bottom: 1px solid var(--line);
 }
+/* The one control a list row carries (ADR-0029). The row is the
+ * containing block, so this pseudo-element covers the whole row and a
+ * pointer anywhere on it reaches the single listener. The control and
+ * its cell stay unpositioned or the row stops being that block; nested
+ * controls sit above with `position: relative; z-index: 1`. */
+.row-stretch::after { content: ""; position: absolute; inset: 0; z-index: 0; }
+.row-stretch {
+  font: inherit; background: none; border: 0; padding: 0;
+  color: inherit; text-align: inherit; text-decoration: none;
+  cursor: pointer; min-width: 0;
+}
+
 .tbl-row {
   display: flex; padding: 6px 10px; gap: 12px; align-items: center;
   border-bottom: 1px solid var(--line-2);
   font-size: var(--fs-ui); cursor: pointer;
   transition: background 80ms;
+  position: relative;
 }
 .tbl-row:last-child { border-bottom: 0; }
 .tbl-row:hover { background: var(--panel-2); }
@@ -1094,6 +1112,14 @@
   color: var(--ink-2); white-space: pre-wrap; word-break: break-all; min-width: 0;
 }
 .tbl-row.active { background: var(--accent-wash); }
+/* The row control replaced a flex child's content, so it takes the
+ * cell's width back; truncation stays on the inner text span. */
+.tbl-row .path .row-stretch, .tbl-row .mono > .row-stretch { display: block; width: 100%; }
+.svc-cell .row-stretch { display: flex; min-width: 0; }
+/* Nested controls: above the stretched pseudo-element, and reachable. */
+.tbl-row .row-act, .tbl-row .link, .tbl-row .row-menu {
+  position: relative; z-index: 1;
+}
 .tbl-row .num { text-align: right; font-variant-numeric: tabular-nums; color: var(--ink); }
 
 /* Sortable header cells. Unscoped from `.tbl-hd` so the service
@@ -1133,8 +1159,10 @@
   display: flex; gap: 4px; justify-content: flex-end;
   opacity: 0; transition: opacity 100ms;
 }
-.tbl-row:hover .row-act, .tbl-row.active .row-act { opacity: 1; }
+.tbl-row:hover .row-act, .tbl-row:focus-within .row-act,
+.tbl-row.active .row-act { opacity: 1; }
 .row-act .qa {
+  font: inherit; color: inherit; text-align: inherit;
   display: inline-flex; align-items: center; justify-content: center;
   padding: 3px 6px; border: 1px solid var(--line); border-radius: var(--radius-sm);
   background: var(--panel-2); color: var(--ink-2); cursor: pointer;
@@ -1142,7 +1170,12 @@
 }
 .row-act .qa:hover { color: var(--accent); border-color: var(--accent); background: var(--accent-wash); }
 
-.link { color: var(--accent); cursor: pointer; font-size: var(--fs-ui); }
+/* Also a <button> (history's Save as Net), so the rule carries its own
+ * reset — there is no bare `button` selector in this sheet (ADR-0028). */
+.link {
+  font-family: inherit; background: none; border: 0; padding: 0;
+  color: var(--accent); cursor: pointer; font-size: var(--fs-ui);
+}
 .link:hover { text-decoration: underline; }
 .link.danger { color: var(--red); }
 
@@ -1285,6 +1318,7 @@
   align-items: center; gap: 10px;
   padding: 4px 8px; border-radius: var(--radius-sm);
   font-size: var(--table-fs); cursor: pointer;
+  position: relative;
 }
 .topfields .tf:hover { background: var(--panel-3); }
 .topfields .tf .fn { color: var(--ink); }
@@ -1308,6 +1342,7 @@
 .sf-row {
   border-bottom: 1px solid var(--line-2); cursor: pointer;
   transition: background 80ms;
+  position: relative;
 }
 .sf-row:hover { background: var(--panel-2); }
 .sf-row.open { background: var(--accent-wash); }
@@ -1318,6 +1353,10 @@
  * the type chip instead of truncating. */
 .sf-row > div:first-child { display: flex; align-items: center; min-width: 0; }
 .sf-row .caret, .sf-row .deg-btn { flex: none; }
+/* The caret and the field name live inside the row's one control, which
+ * takes the name cell's flex box back. */
+.sf-row .row-stretch { display: flex; align-items: center; min-width: 0; flex: 1; }
+.sf-row .deg-btn { position: relative; z-index: 1; }
 .sf-row .c-name { color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 .sf-row .c-card, .sf-row .c-size { color: var(--ink-2); text-align: right; }
 .sf-row .c-sample { color: var(--ink-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
