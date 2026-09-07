@@ -39,6 +39,11 @@ const SECTION_RS: &str = include_str!("../src/state/section.rs");
 const DRAWER_RS: &str = include_str!("../../fleet-ui/src/drawer.rs");
 const FIELD_CASE_DRAWER_RS: &str = include_str!("../src/components/field_case_drawer.rs");
 const REPIN_FLOW_RS: &str = include_str!("../src/repin_flow.rs");
+const TOPBAR_RS: &str = include_str!("../../fleet-ui/src/topbar.rs");
+const MENU_RS: &str = include_str!("../../fleet-ui/src/menu.rs");
+const TABS_RS: &str = include_str!("../../fleet-ui/src/tabs.rs");
+const ACTIONS_MENU_RS: &str = include_str!("../../fleet-ui/src/actions_menu.rs");
+const COPY_BUTTON_RS: &str = include_str!("../../fleet-ui/src/copy_button.rs");
 
 /// One (assignment, source file, hook) triple: `assignment` is the full
 /// `key: 'value',` line as it appears in `selectors.ts`, and `hook` must
@@ -412,6 +417,154 @@ const CONTRACTS: &[Contract] = &[
         source_path: "src/repin_flow.rs",
         source: REPIN_FLOW_RS,
         hook: "pub const REPIN_POLL_MS: u32 = 3_000;",
+    },
+    // -- native controls and the shared menu contract (ADR-0028) ------
+    Contract {
+        assignment: "topbarUser: '.topbar button.user',",
+        source_path: "../fleet-ui/src/topbar.rs",
+        source: TOPBAR_RS,
+        hook: "class=\"user\"",
+    },
+    // Two rows, because the selector spans two files: the panel class is
+    // the topbar's, the `role="menu"` node inside it is the shared
+    // menu's.
+    Contract {
+        assignment: "userMenu: '.user-menu [role=\"menu\"]',",
+        source_path: "../fleet-ui/src/topbar.rs",
+        source: TOPBAR_RS,
+        hook: "panel_class=\"user-menu\"",
+    },
+    Contract {
+        assignment: "userMenu: '.user-menu [role=\"menu\"]',",
+        source_path: "../fleet-ui/src/menu.rs",
+        source: MENU_RS,
+        hook: "<div role=\"menu\" aria-label=menu_label",
+    },
+    Contract {
+        assignment: "userMenuItem: '.user-menu [role=\"menuitem\"]',",
+        source_path: "../fleet-ui/src/menu.rs",
+        source: MENU_RS,
+        hook: "role=\"menuitem\"",
+    },
+    Contract {
+        assignment: "actionsMenuTrigger: '.actions-wrap button.btn-icon',",
+        source_path: "../fleet-ui/src/actions_menu.rs",
+        source: ACTIONS_MENU_RS,
+        hook: "class=\"actions-wrap\"",
+    },
+    Contract {
+        assignment: "actionsMenuTrigger: '.actions-wrap button.btn-icon',",
+        source_path: "../fleet-ui/src/actions_menu.rs",
+        source: ACTIONS_MENU_RS,
+        hook: "class=\"btn-icon\"",
+    },
+    Contract {
+        assignment: "actionsMenuItem: '.actions-menu [role=\"menuitem\"]',",
+        source_path: "../fleet-ui/src/actions_menu.rs",
+        source: ACTIONS_MENU_RS,
+        hook: "panel_class=\"actions-menu\"",
+    },
+    Contract {
+        assignment: "actionsMenuItem: '.actions-menu [role=\"menuitem\"]',",
+        source_path: "../fleet-ui/src/menu.rs",
+        source: MENU_RS,
+        hook: "role=\"menuitem\"",
+    },
+    Contract {
+        assignment: "workspaceTab: '.tabs [role=\"tab\"]',",
+        source_path: "../fleet-ui/src/tabs.rs",
+        source: TABS_RS,
+        hook: "class=\"tabs\"",
+    },
+    Contract {
+        assignment: "workspaceTab: '.tabs [role=\"tab\"]',",
+        source_path: "../fleet-ui/src/tabs.rs",
+        source: TABS_RS,
+        hook: "role=\"tab\"",
+    },
+    Contract {
+        assignment: "drawerTab: '.sd-tabs [role=\"tab\"]',",
+        source_path: "../fleet-ui/src/tabs.rs",
+        source: TABS_RS,
+        hook: "class=\"sd-tabs\"",
+    },
+    Contract {
+        assignment: "drawerTab: '.sd-tabs [role=\"tab\"]',",
+        source_path: "../fleet-ui/src/tabs.rs",
+        source: TABS_RS,
+        hook: "role=\"tab\"",
+    },
+    Contract {
+        assignment: "modalClose: '.modal .m-hd button.x',",
+        source_path: "../fleet-ui/src/modal/shell.rs",
+        source: MODAL_SHELL_RS,
+        hook: "class=\"m-hd\"",
+    },
+    Contract {
+        assignment: "modalClose: '.modal .m-hd button.x',",
+        source_path: "../fleet-ui/src/modal/shell.rs",
+        source: MODAL_SHELL_RS,
+        hook: "class=\"x\"",
+    },
+    Contract {
+        assignment: "toastDismiss: '.toast button.x',",
+        source_path: "../fleet-ui/src/toast/runtime.rs",
+        source: TOAST_RUNTIME_RS,
+        hook: "class=\"x\"",
+    },
+    Contract {
+        assignment: "editorTool: '.editor-tools button.tool',",
+        source_path: "src/components/editor_wrap.rs",
+        source: EDITOR_WRAP_RS,
+        hook: "class=\"editor-tools\"",
+    },
+    Contract {
+        assignment: "editorTool: '.editor-tools button.tool',",
+        source_path: "src/components/editor_wrap.rs",
+        source: EDITOR_WRAP_RS,
+        hook: "class=\"tool\"",
+    },
+    // The Share tool is a CopyButton in bare mode, whose whole markup is
+    // fleet-ui's: if that ever stops being a native button, the
+    // `button.tool` half of the selector matches one element instead of
+    // two and the spec's propagation proof evaporates.
+    Contract {
+        assignment: "editorTool: '.editor-tools button.tool',",
+        source_path: "../fleet-ui/src/copy_button.rs",
+        source: COPY_BUTTON_RS,
+        hook: "class=cls",
+    },
+    Contract {
+        assignment: "modalCloseName: 'Close dialog',",
+        source_path: "../fleet-ui/src/modal/shell.rs",
+        source: MODAL_SHELL_RS,
+        hook: "aria-label=\"Close dialog\"",
+    },
+    Contract {
+        assignment: "toastDismissName: 'Dismiss notification',",
+        source_path: "../fleet-ui/src/toast/runtime.rs",
+        source: TOAST_RUNTIME_RS,
+        hook: "aria-label=\"Dismiss notification\"",
+    },
+    // One string, two positions: the trigger's own name and the name of
+    // the panel it opens.
+    Contract {
+        assignment: "actionsName: 'Actions',",
+        source_path: "../fleet-ui/src/actions_menu.rs",
+        source: ACTIONS_MENU_RS,
+        hook: "aria-label=\"Actions\"",
+    },
+    Contract {
+        assignment: "actionsName: 'Actions',",
+        source_path: "../fleet-ui/src/actions_menu.rs",
+        source: ACTIONS_MENU_RS,
+        hook: "menu_label=\"Actions\"",
+    },
+    Contract {
+        assignment: "accountMenuName: 'Account',",
+        source_path: "../fleet-ui/src/topbar.rs",
+        source: TOPBAR_RS,
+        hook: "menu_label=\"Account\"",
     },
 ];
 
