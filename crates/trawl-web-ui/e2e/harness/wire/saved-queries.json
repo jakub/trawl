@@ -1,0 +1,11 @@
+{
+  "queries": [
+    {
+      "id": 1,
+      "name": "errors by host",
+      "query": "_severity>=error last=1h | stats count() by host",
+      "created_at": "2026-09-01T10:00:00Z",
+      "updated_at": "2026-09-01T10:00:00Z"
+    }
+  ]
+}

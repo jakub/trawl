@@ -23,6 +23,8 @@ import {
   queryResponse,
   historyResponse,
   listSavedResponse,
+  populatedListSavedResponse,
+  populatedServiceSchemaResponse,
   serviceSchemaResponse,
   catalogFieldResponse,
   repinStatusRunningResponse,
@@ -66,7 +68,7 @@ const MIME = {
 
 // ---- mutable test-scoped state -------------------------------------------
 
-/** @type {'default'|'unauth'|'query-500'|'stream-burst'} */
+/** @type {'default'|'unauth'|'query-500'|'stream-burst'|'populated'} */
 let scenario = 'default';
 
 const sse = {
@@ -397,12 +399,25 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       sendJson(res, 200, historyResponse());
       return;
     }
+    // The `populated` scenario answers these two with a corpus that has
+    // something in it: one service and one net. It is an ADDITIONAL
+    // scenario, never a change to `default` — the schema and nets specs
+    // written before it assert on the empty state, and the wire fixture
+    // contract pins both halves.
     if (p === '/api/v1/schema/services' && req.method === 'GET') {
-      sendJson(res, 200, serviceSchemaResponse());
+      sendJson(
+        res,
+        200,
+        scenario === 'populated' ? populatedServiceSchemaResponse() : serviceSchemaResponse(),
+      );
       return;
     }
     if (p === '/api/v1/saved' && req.method === 'GET') {
-      sendJson(res, 200, listSavedResponse());
+      sendJson(
+        res,
+        200,
+        scenario === 'populated' ? populatedListSavedResponse() : listSavedResponse(),
+      );
       return;
     }
 
