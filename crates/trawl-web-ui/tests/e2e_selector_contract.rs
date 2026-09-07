@@ -1254,3 +1254,196 @@ fn every_selectors_ts_entry_is_pinned() {
         }
     }
 }
+
+// ---- key uniqueness ---------------------------------------------------
+//
+// A duplicate key inside one object literal is silent in both languages
+// that read these files. TypeScript's checker rejects it, but the specs
+// run through a transpiler that only strips types, so the LAST spelling
+// wins and the earlier one disappears without a word. That is exactly
+// what two seats writing the same sort-header pins produced: two
+// `schemaEventsHeader` keys in `COPY`, two `fieldFirstAlphabetically`
+// in `CORPUS`, and a `CONTRACTS` table with both copies pinned.
+//
+// The same NAME in two different objects is fine and deliberate:
+// `CORPUS.netId` mirrors `POPULATED.netId` because `corpus` is
+// `populated` plus data.
+
+const FIXTURES_TS: &str = include_str!("../e2e/fixtures.ts");
+
+/// `ts` with every string literal and comment blanked to spaces, so a
+/// brace inside `'Remove filter {} = {}'` cannot be read as structure.
+/// Line breaks survive, because the key scan is line-based.
+fn blanked(ts: &str) -> String {
+    let chars: Vec<char> = ts.chars().collect();
+    let mut out = String::with_capacity(ts.len());
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            '\'' | '"' | '`' => {
+                out.push(' ');
+                i += 1;
+                while i < chars.len() && chars[i] != c {
+                    if chars[i] == '\\' {
+                        out.push(' ');
+                        i += 1;
+                        if i < chars.len() {
+                            out.push(if chars[i] == '\n' { '\n' } else { ' ' });
+                            i += 1;
+                        }
+                        continue;
+                    }
+                    out.push(if chars[i] == '\n' { '\n' } else { ' ' });
+                    i += 1;
+                }
+                if i < chars.len() {
+                    out.push(' ');
+                    i += 1;
+                }
+            }
+            '/' if chars.get(i + 1) == Some(&'/') => {
+                while i < chars.len() && chars[i] != '\n' {
+                    out.push(' ');
+                    i += 1;
+                }
+            }
+            '/' if chars.get(i + 1) == Some(&'*') => {
+                out.push_str("  ");
+                i += 2;
+                while i < chars.len() && !(chars[i] == '*' && chars.get(i + 1) == Some(&'/')) {
+                    out.push(if chars[i] == '\n' { '\n' } else { ' ' });
+                    i += 1;
+                }
+                out.push_str("  ");
+                i = (i + 2).min(chars.len());
+            }
+            _ => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// The keys declared directly inside one object literal, in source
+/// order, repeats included. `decl` is the text up to and including that
+/// object's opening brace.
+fn top_level_keys(ts: &str, decl: &str) -> Vec<String> {
+    let blank = blanked(ts);
+    let start = blank
+        .find(decl)
+        .unwrap_or_else(|| panic!("no `{decl}` in the file"))
+        + decl.len();
+    let mut depth = 1usize;
+    let mut keys = Vec::new();
+    for line in blank[start..].lines() {
+        if depth == 1 {
+            let trimmed = line.trim_start();
+            if let Some((key, _)) = trimmed.split_once(':')
+                && !key.is_empty()
+                && key
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+            {
+                keys.push(key.to_owned());
+            }
+        }
+        for ch in line.chars() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return keys;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    panic!("`{decl}` is never closed");
+}
+
+fn assert_keys_unique(file: &str, object: &str, keys: &[String]) {
+    // Non-vacuous: an object the scan cannot find yields nothing, and
+    // a uniqueness check over nothing passes forever. `TIMING` really
+    // does hold one key, so one is the floor rather than two.
+    assert!(
+        !keys.is_empty(),
+        "{file}'s {object} yielded no keys — the scan found the wrong \
+         object, or the declaration was renamed",
+    );
+    let mut seen = std::collections::BTreeSet::new();
+    let dupes: Vec<&String> = keys.iter().filter(|k| !seen.insert(*k)).collect();
+    assert!(
+        dupes.is_empty(),
+        "{file}'s {object} declares {dupes:?} more than once. The \
+         transpiler keeps the LAST spelling and drops the earlier one \
+         without a word, so one of the two is already dead.",
+    );
+}
+
+#[test]
+fn every_selector_and_pin_key_is_declared_once() {
+    for (file, ts, object, decl) in [
+        (
+            "e2e/selectors.ts",
+            SELECTORS_TS,
+            "SEL",
+            "export const SEL = {",
+        ),
+        (
+            "e2e/selectors.ts",
+            SELECTORS_TS,
+            "TIMING",
+            "export const TIMING = {",
+        ),
+        (
+            "e2e/selectors.ts",
+            SELECTORS_TS,
+            "COPY",
+            "export const COPY = {",
+        ),
+        (
+            "e2e/fixtures.ts",
+            FIXTURES_TS,
+            "POPULATED",
+            "export const POPULATED = {",
+        ),
+        (
+            "e2e/fixtures.ts",
+            FIXTURES_TS,
+            "CORPUS",
+            "export const CORPUS = {",
+        ),
+    ] {
+        assert_keys_unique(file, object, &top_level_keys(ts, decl));
+    }
+}
+
+#[test]
+fn the_key_scan_reads_nesting_strings_and_comments() {
+    let src = "export const A = {\n  one: 'a { b }',\n  // two: 'commented out',\n  \
+               nested: { one: 1, deep: { one: 2 } },\n  two: `x`,\n} as const;\n\
+               export const B = {\n  one: 'shared name, different object',\n} as const;\n";
+    // Braces inside a string, a commented-out key and a nested object's
+    // own keys are all invisible to the top-level scan.
+    assert_eq!(
+        top_level_keys(src, "export const A = {"),
+        vec!["one".to_owned(), "nested".to_owned(), "two".to_owned()],
+    );
+    // The same name in a second object is not a duplicate.
+    assert_eq!(
+        top_level_keys(src, "export const B = {"),
+        vec!["one".to_owned()]
+    );
+
+    let dup = "export const A = {\n  one: 'x',\n  two: 'y',\n  one: 'z',\n} as const;\n";
+    let keys = top_level_keys(dup, "export const A = {");
+    assert_eq!(keys.len(), 3, "the scan must see both spellings: {keys:?}");
+    let panicked =
+        std::panic::catch_unwind(|| assert_keys_unique("fixture.ts", "A", &keys)).is_err();
+    assert!(panicked, "a key declared twice in one object must fail");
+}
