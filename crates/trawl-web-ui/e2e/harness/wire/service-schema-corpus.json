@@ -1,0 +1,44 @@
+{
+  "services": [
+    {
+      "name": "nginx",
+      "columns": [
+        {
+          "name": "_time",
+          "type": "TIMESTAMP",
+          "null_count": 0,
+          "total_count": 1200,
+          "min_value": "2026-09-01T00:00:00Z",
+          "max_value": "2026-09-01T23:59:59Z",
+          "compressed_bytes": 4096
+        },
+        {
+          "name": "status",
+          "type": "BIGINT",
+          "null_count": 0,
+          "total_count": 1200,
+          "min_value": "200",
+          "max_value": "503",
+          "compressed_bytes": 2048
+        },
+        {
+          "name": "duration",
+          "type": "VARCHAR",
+          "null_count": 12,
+          "total_count": 1200,
+          "min_value": "0.4",
+          "max_value": "accepted",
+          "compressed_bytes": 3072
+        }
+      ],
+      "earliest_date": "2026-09-01",
+      "latest_date": "2026-09-01",
+      "file_count": 2,
+      "total_bytes": 65536,
+      "total_events": 1200,
+      "daily_event_counts": [{ "date": "2026-09-01", "count": 1200 }],
+      "degraded_fields": ["duration"]
+    }
+  ],
+  "cached": false
+}

@@ -128,6 +128,13 @@ export const CORPUS = {
     overBoundPrefix: 'host=aaaa',
     overBoundBytes: 32769,
   },
+  /** The service column `wire/service-schema-corpus.json` names in the
+   * service's `degraded_fields`, which is the only thing that renders a
+   * field row's degraded badge. `populated` has no such column, so a
+   * badge spec has to be on `corpus`. The name is also
+   * `wire/catalog-field.json`'s field, so the case file the badge opens
+   * is about the field the badge sits on. */
+  degradedField: 'duration',
   /** Runs of the net, newest first (`wire/net-runs.json`). */
   runIds: [501, 502] as const,
   /** The run whose expansion has a result body. */

@@ -34,6 +34,8 @@ import {
   corpusQueryRowsResponse,
   corpusCardinalityResponse,
   corpusTopValuesResponse,
+  corpusTimechartResponse,
+  corpusServiceSchemaResponse,
   corpusHistoryResponse,
   corpusNetRunsResponse,
   corpusRunResultResponse,
@@ -82,7 +84,8 @@ let scenario = 'default';
 
 /** `corpus` is `populated` plus data. Every place that used to ask
  * "is this `populated`?" asks this instead, so the two scenarios cannot
- * drift apart on the service and net bodies they share. */
+ * drift apart on a body they share. The services route is the one
+ * exception and says so where it splits. */
 function hasCorpus() {
   return scenario === 'populated' || scenario === 'corpus';
 }
@@ -386,10 +389,10 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
         return;
       }
       if (scenario === 'corpus') {
-        // Dispatch by DSL SHAPE, because the service drawer's two reads
-        // carry a field name the stub cannot predict. The order matters
-        // only in that each shape is checked before the pipeline
-        // catch-all below it.
+        // Dispatch by DSL SHAPE, because the service drawer's reads
+        // carry a field or service name the stub cannot predict. The
+        // order matters only in that each shape is checked before the
+        // pipeline catch-all below it.
         const dsl = typeof parsedBody.query === 'string' ? parsedBody.query : '';
         if (dsl.includes(QUERY_SHAPES.cardinality)) {
           sendJson(res, 200, corpusCardinalityResponse());
@@ -399,13 +402,16 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
           sendJson(res, 200, corpusTopValuesResponse());
           return;
         }
-        // A pipeline this scenario has no fixture for (the drawer's
-        // `stats count() as hits` collision form, the overview
-        // histogram's `timechart`) FAILS. Answering it with the rows
-        // fixture would hand a spec a body that says nothing about the
-        // query it asked, which is the failure mode this dispatch
-        // exists to prevent. A bare `|` test is enough here: no fixture
-        // query quotes one.
+        if (dsl.includes(QUERY_SHAPES.timechart)) {
+          sendJson(res, 200, corpusTimechartResponse());
+          return;
+        }
+        // A pipeline this scenario has no fixture for, such as the
+        // drawer's `stats count() as hits` collision form, FAILS.
+        // Answering it with the rows fixture would hand a spec a body
+        // that says nothing about the query it asked, which is the
+        // failure mode this dispatch exists to prevent. A bare `|` test
+        // is enough here: no fixture query quotes one.
         if (dsl.includes('|')) {
           unhandledQueries.push(dsl);
           sendJson(res, 500, errorEnvelope(`no corpus fixture for this pipeline shape: ${dsl}`));
@@ -460,7 +466,14 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       sendJson(
         res,
         200,
-        hasCorpus() ? populatedServiceSchemaResponse() : serviceSchemaResponse(),
+        // Three bodies, not two: `corpus` gets its own so it can carry a
+        // degraded column, and `populated` keeps the body its specs were
+        // written against.
+        scenario === 'corpus'
+          ? corpusServiceSchemaResponse()
+          : scenario === 'populated'
+            ? populatedServiceSchemaResponse()
+            : serviceSchemaResponse(),
       );
       return;
     }

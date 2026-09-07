@@ -133,6 +133,8 @@ use trawl_api::{
 const QUERY_ROWS: &str = include_str!("../e2e/harness/wire/query-rows.json");
 const QUERY_CARDINALITY: &str = include_str!("../e2e/harness/wire/query-cardinality.json");
 const QUERY_TOP_VALUES: &str = include_str!("../e2e/harness/wire/query-top-values.json");
+const QUERY_TIMECHART: &str = include_str!("../e2e/harness/wire/query-timechart.json");
+const SERVICE_SCHEMA_CORPUS: &str = include_str!("../e2e/harness/wire/service-schema-corpus.json");
 const HISTORY: &str = include_str!("../e2e/harness/wire/history.json");
 const NET_RUNS: &str = include_str!("../e2e/harness/wire/net-runs.json");
 const RUN_RESULT: &str = include_str!("../e2e/harness/wire/run-result.json");
@@ -142,6 +144,9 @@ const RUNS_STATS: &str = include_str!("../e2e/harness/wire/runs-stats.json");
 /// The harness's shape dispatch, and the source it claims to mirror.
 const HARNESS_FIXTURES: &str = include_str!("../e2e/harness/fixtures.mjs");
 const SEARCH_URL_SRC: &str = include_str!("../src/search_url.rs");
+/// The overview histogram's query is written inline here, not in
+/// `drawer_query.rs`, so the third shape is pinned by grepping this.
+const SERVICE_DRAWER_SRC: &str = include_str!("../src/components/service_drawer.rs");
 
 /// The DSL builders themselves, not a copy of them. `trawl-web-ui` is a
 /// binary crate, so an integration test cannot `use` its modules; this
@@ -150,6 +155,12 @@ const SEARCH_URL_SRC: &str = include_str!("../src/search_url.rs");
 /// is duplicated but harmless.
 #[path = "../src/drawer_query.rs"]
 mod drawer_query;
+
+/// Same trick for the grid the histogram fixture has to land on:
+/// `build_histogram` is a private component helper, but the two pure
+/// functions it reads its rows through live here and can be called.
+#[path = "../src/histogram.rs"]
+mod histogram;
 
 /// The rows every `corpus` spec reads. Their CONTENT is the contract: a
 /// spec asserts on a host name, counts facet values, and tells one sort
@@ -210,9 +221,11 @@ fn the_corpus_rows_fixture_carries_a_facetable_page() {
 fn the_corpus_drawer_fixtures_decode() {
     let card: QueryResponse = decode("query-cardinality.json", QUERY_CARDINALITY);
     // The drawer reads cardinality back BY COLUMN NAME against the
-    // columns of `service-schema-populated.json`, so these two fixtures
-    // are one contract: a column here that the service does not declare
-    // is a number nothing displays.
+    // columns of the service it mounted, so these fixtures are one
+    // contract: a column here that the service does not declare is a
+    // number nothing displays. The other direction is allowed and is how
+    // `service-schema-corpus.json`'s `duration` behaves: a column with no
+    // count is skipped, not rendered as zero.
     let names: Vec<&str> = card
         .result
         .columns
@@ -229,6 +242,101 @@ fn the_corpus_drawer_fixtures_decode() {
     // top-values read for whichever field a spec opened.
     assert_eq!(names, ["value", "count"]);
     assert!(!top.result.rows.is_empty());
+}
+
+/// The overview histogram's fixture. Its columns are what
+/// `service_drawer::build_histogram` looks for by NAME, and its rows have
+/// to survive `parse_bucket_ms` and land on the 24-slot hourly grid
+/// `align_buckets` lays out. A fixture whose timestamps the parser
+/// rejects, or whose buckets fall off the grid, renders an empty chart
+/// that looks exactly like a chart with no data.
+#[test]
+fn the_corpus_timechart_fixture_lands_on_the_drawer_grid() {
+    let resp: QueryResponse = decode("query-timechart.json", QUERY_TIMECHART);
+    let names: Vec<&str> = resp
+        .result
+        .columns
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
+    assert_eq!(names, ["_time", "count"]);
+
+    // The reader's own column rule, mirrored: the time column is one of
+    // four accepted names and the count column is `count` or a name
+    // starting with it. Asserting the names above is not enough on its
+    // own, and this is what says WHY those two names.
+    assert!(matches!(
+        names[0],
+        "_time" | "time" | "timestamp" | "@timestamp"
+    ));
+    assert!(names[1].starts_with("count"));
+
+    let rows: Vec<(i64, u64)> = resp
+        .result
+        .rows
+        .iter()
+        .map(|row| {
+            let trawl_api::value::Value::String(ts) = &row[0] else {
+                panic!("the bucket start must be a string the display path can read: {row:?}");
+            };
+            let ms = histogram::parse_bucket_ms(ts)
+                .unwrap_or_else(|| panic!("`{ts}` is not a timestamp the drawer can parse"));
+            let trawl_api::value::Value::Integer(count) = &row[1] else {
+                panic!("the bucket count must be an integer: {row:?}");
+            };
+            (
+                ms,
+                u64::try_from(*count).expect("a bucket count is not negative"),
+            )
+        })
+        .collect();
+    assert_eq!(rows.len(), 6);
+
+    // 24 hourly slots ending at the newest row, which is the grid the
+    // drawer builds (`INGEST_SLOT_MS` / `INGEST_SLOTS`). Every row has to
+    // be inside it, or the chart quietly drops a bar.
+    let slots = histogram::align_buckets(&rows, 3_600_000, 24);
+    assert_eq!(slots.len(), 24);
+    let placed: u64 = slots.iter().map(|s| s.count).sum();
+    let offered: u64 = rows.iter().map(|&(_, c)| c).sum();
+    assert_eq!(
+        placed, offered,
+        "some buckets fell outside the 24h grid the drawer lays out",
+    );
+    assert!(
+        slots.iter().any(|s| s.count == 0),
+        "an all-populated grid would not show that gaps render as gaps",
+    );
+}
+
+/// `corpus` serves its OWN services body so it can carry a degraded
+/// column; `populated` keeps the one its specs were written against.
+/// The badge is rendered from the service's `degraded_fields` list
+/// (`service_card_fmt::is_degraded_column`), so a name that is not also
+/// a column of that service renders nothing at all.
+#[test]
+fn the_corpus_service_schema_marks_one_column_degraded() {
+    let corpus: ServiceSchemaResponse = decode("service-schema-corpus.json", SERVICE_SCHEMA_CORPUS);
+    let populated: ServiceSchemaResponse =
+        decode("service-schema-populated.json", SERVICE_SCHEMA_POPULATED);
+    assert_eq!(corpus.services.len(), 1);
+    let svc = &corpus.services[0];
+    assert_eq!(svc.name, populated.services[0].name);
+    assert_eq!(svc.degraded_fields, ["duration"]);
+    assert!(
+        svc.columns.iter().any(|c| c.name == "duration"),
+        "the degraded field must be a column of the service, or no row carries the badge",
+    );
+
+    // The badge opens `/api/v1/schema/field?name=<field>`, and the stub
+    // answers that with `catalog-field.json`. Same field, so the case
+    // file is about the column the operator clicked.
+    let case: CatalogFieldResponse = decode("catalog-field.json", CATALOG_FIELD);
+    assert_eq!(case.name, svc.degraded_fields[0]);
+
+    // The split is the point: `populated` stays undegraded, so a spec
+    // that wants a badge has to say `corpus` and means it.
+    assert!(populated.services[0].degraded_fields.is_empty());
 }
 
 /// The history fixture's second entry exists to be REFUSED. Its length is
@@ -314,8 +422,9 @@ fn the_corpus_run_fixtures_decode() {
 fn the_query_shapes_match_the_dsl_the_drawer_builds() {
     let top_values = "| top 10 ";
     let cardinality = "| stats dc(";
+    let timechart = "| timechart span=1h count()";
 
-    for shape in [top_values, cardinality] {
+    for shape in [top_values, cardinality, timechart] {
         assert!(
             HARNESS_FIXTURES.contains(&format!("'{shape}'")),
             "e2e/harness/fixtures.mjs no longer exports `{shape}` in QUERY_SHAPES",
@@ -335,6 +444,15 @@ fn the_query_shapes_match_the_dsl_the_drawer_builds() {
     assert!(
         card.contains(cardinality),
         "cardinality_query now writes `{card}`, which the harness would not recognise",
+    );
+
+    // The third shape has no builder to call: the overview pane formats
+    // it inline. Pin the literal in that source file instead, which is
+    // exact enough that a reworded stage fails here.
+    assert!(
+        SERVICE_DRAWER_SRC.contains(&format!("last=24h {timechart}")),
+        "the overview histogram no longer writes `{timechart}`, so the harness \
+         would answer its read with a 500",
     );
 
     // The collision form is deliberately NOT recognised: it is the shape
