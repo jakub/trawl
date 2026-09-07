@@ -468,8 +468,10 @@
   background: var(--panel-2);
   color: var(--ink-2);
   border-color: var(--line);
-  cursor: wait;
+  cursor: not-allowed;
 }
+/* In flight is the one disabled state that is worth waiting for. */
+.run.running { cursor: wait; }
 /* .kbd-inline moved to fleet-ui.css (issue #31) — <Kbd inline=true>
  * emits it; the .run scoping was dropped with the generalization. */
 
@@ -521,6 +523,15 @@
 }
 .meta .chip.excl .x { color: var(--red); }
 .meta .chip.excl .x:hover { background: var(--red); color: var(--on-accent); }
+/* The link's filters could not be read at all — the chips beside this
+ * one are the empty fallback, not what the link says. No remove control:
+ * there is nothing to remove, only a link to repair. */
+.meta .chip.bad {
+  background: var(--red-wash);
+  border-color: var(--red);
+  color: var(--red);
+  padding: 1px 8px;
+}
 
 /* ─────────────────────────────────────────────────────────────────
  *  Tabs — base .tabs family moved to fleet-ui.css (issue #28,
@@ -539,6 +550,23 @@
 }
 .tabs .action + .action { margin-left: 4px; }
 .tabs .action:hover { color: var(--ink); background: var(--panel-2); }
+/* The trailing Save/Export actions and the editor's tool row are real
+ * <button>s so a link that cannot be read can disable them (ADR-0027);
+ * these two rules put the text-link look back over the button chrome. */
+.tabs button.action, .editor-tools button.tool {
+  font: inherit;
+  background: none;
+  border: 0;
+  color: inherit;
+}
+.tabs .action:disabled, .editor-tools .tool:disabled, .dr-pop .opt:disabled {
+  opacity: .45;
+  cursor: not-allowed;
+}
+.tabs .action:disabled:hover, .editor-tools .tool:disabled:hover {
+  background: none;
+  color: inherit;
+}
 
 /* ─────────────────────────────────────────────────────────────────
  *  Incomplete-results notice (ADR-0011 C2) — one warn-toned line
@@ -574,6 +602,53 @@
 }
 .deg-x:hover { color: var(--ink); background: var(--panel-2); }
 .deg-x:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* ─────────────────────────────────────────────────────────────────
+ *  Malformed-link notice (ADR-0027) — a search URL whose structured
+ *  state could not be read. Red rather than the degraded notice's
+ *  yellow: nothing ran, and the results area below is empty. The
+ *  .url-live wrapper is the persistent aria-live region and carries no
+ *  box of its own.
+ * ─────────────────────────────────────────────────────────────── */
+.url-live { flex-shrink: 0; }
+.url-notice {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 14px;
+  background: var(--red-wash);
+  border-bottom: 1px solid var(--line);
+  font-family: var(--font-ui);
+  font-size: var(--fs-dense);
+  line-height: 1.5;
+  color: var(--ink-2);
+}
+.url-notice-text { flex: 1; min-width: 0; }
+/* The raw value is address-bar text: keep it on one line and let it be
+ * cut rather than reflow the notice around a 4 KiB payload. */
+.url-notice-raw {
+  font-family: var(--font-mono);
+  color: var(--ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: inline-block;
+  vertical-align: bottom;
+  max-width: 100%;
+}
+.url-notice-repair {
+  flex-shrink: 0;
+  cursor: pointer;
+  padding: 3px 10px;
+  background: var(--panel);
+  border: 1px solid var(--red);
+  border-radius: var(--radius-ctl);
+  color: var(--red);
+  font-family: var(--font-ui);
+  font-size: var(--fs-dense);
+}
+.url-notice-repair:hover { background: var(--red); color: var(--on-accent); }
+.url-notice-repair:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
 /* ─────────────────────────────────────────────────────────────────
  *  Histogram — 78px strip on Events
@@ -880,7 +955,11 @@
   text-align: center;
   user-select: none;
 }
+/* Full width: a <button> in the preset grid does not stretch the way
+ * the <div> it replaced did. */
+.dr-pop button.opt { width: 100%; font: inherit; }
 .dr-pop .opt:hover { background: var(--accent-wash); border-color: var(--accent); }
+.dr-pop .opt:disabled:hover { background: var(--panel-2); border-color: var(--line-2); }
 .dr-pop .opt.on {
   background: var(--accent-wash);
   color: var(--accent);
@@ -929,6 +1008,16 @@
   border-top: 1px solid var(--line-2);
 }
 .dr-pop .foot .btns { display: flex; gap: 6px; }
+/* Wrapper around fleet-ui's Apply button, which takes no class of its
+ * own; inline-flex so it is exactly the button's box. */
+.dr-apply { display: inline-flex; }
+/* What Apply refused. The popover stays open while this shows. */
+.dr-pop .dr-err {
+  font-family: var(--font-ui);
+  font-size: var(--fs-dense);
+  line-height: 1.4;
+  color: var(--red);
+}
 .dr-pop .rt-hint {
   padding: 6px 2px;
   font-family: var(--font-ui);
@@ -1046,6 +1135,15 @@
   border-radius: var(--radius-sm); padding: 8px 10px;
   font-family: var(--font-mono); font-size: var(--table-fs); color: var(--ink-2);
   white-space: pre-wrap; word-break: break-all;
+}
+/* What a modal refused, in its own body. The export modal is the one
+ * that uses it: an empty query is refused there rather than posted
+ * (ADR-0027). */
+.modal .m-body .m-refusal {
+  font-family: var(--font-ui);
+  font-size: var(--fs-dense);
+  line-height: 1.4;
+  color: var(--red);
 }
 .modal .m-ft .hint {
   flex: 1; font-family: var(--font-mono); font-size: var(--fs-dense); color: var(--ink-3);

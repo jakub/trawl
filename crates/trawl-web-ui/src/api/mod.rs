@@ -21,8 +21,10 @@ use trawl_api::{
 
 use crate::repin_flow::{BoundCeilings, ConflictBody, classify_conflict};
 
-/// Rows per page for the snapshot results table.
-pub const PAGE_SIZE: usize = 50;
+/// Rows per page for the snapshot results table. Defined by the search
+/// URL contract (the `page` parameter's offset check is part of it) and
+/// re-exported here so request building keeps one path to it.
+pub use crate::search_url::PAGE_SIZE;
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum ApiError {
@@ -50,6 +52,13 @@ pub enum ApiError {
 
     #[error("decode: {0}")]
     Decode(String),
+
+    /// The client refused to send the request at all — nothing left the
+    /// browser. The empty query is the case that matters: the server
+    /// reads it as every row (ADR-0027), so a door that would post it
+    /// answers this instead.
+    #[error("{0}")]
+    Refused(&'static str),
 }
 
 impl ApiError {
@@ -66,7 +75,9 @@ impl ApiError {
             // The one status this enum spells as a word rather than a
             // number.
             Self::Unauthorized => Some(401),
-            Self::Network(_) | Self::Decode(_) => None,
+            // A refusal never reached the network, so its fate is not
+            // unknown — but it carries no status either.
+            Self::Network(_) | Self::Decode(_) | Self::Refused(_) => None,
         }
     }
 }
@@ -543,11 +554,20 @@ pub async fn list_all_runs(limit: usize, offset: usize) -> Result<ListAllRunsRes
 /// POST /api/v1/export?format={fmt} — export query results as binary.
 ///
 /// Returns raw bytes and a suggested filename from `Content-Disposition`.
+///
+/// An empty query never leaves the browser: the server's emitter turns
+/// it into `SELECT *` with no WHERE, so an export posted with the
+/// malformed gate's blanked query would write the whole corpus to a file
+/// while the page says the link was refused (ADR-0027). The modal above
+/// refuses it too; this is the door nothing gets past.
 pub async fn export(
     query: &str,
     format: &ExportFormat,
     limit: Option<usize>,
 ) -> Result<(Vec<u8>, String), ApiError> {
+    if !crate::search_url::is_executable(query) {
+        return Err(ApiError::Refused(crate::search_url::EMPTY_QUERY_REFUSAL));
+    }
     let body = ExportRequest {
         query: query.to_owned(),
         limit,

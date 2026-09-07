@@ -37,6 +37,32 @@ address: `/search/schema?field=duration` is a working deep link with no
 service context, which is what makes a case file linkable from a chat message
 or an alert.
 
+A search link is readable the same way, with one part deliberately opaque.
+The search page keeps its state in the address bar, and two parameters there
+are stable: `q` is the query text, and `r` is the time range. `r` is either a
+quick label (`r=1h`) or two UTC instants joined by `..`, with `now` allowed as
+the right-hand one. Both spellings survive across releases, so a link pasted
+into a runbook keeps meaning what it said. The sidebar filters ride in `f`,
+which is an opaque encoded payload: copy it as one unit, do not hand-write it,
+and expect its spelling to change without notice. When a link's structured
+state cannot be read, whether that is a damaged `f`, a range in neither form,
+or a page number that cannot be asked for, the page shows a banner naming the
+parameter and echoing what the link actually says, and runs nothing until you
+click the repair. Everything else is switched off while the banner is up —
+Haul, the range presets, Live Tail, Save, Export, pagination and the filter
+controls all refuse, so a broken link cannot be turned into a wider query
+through a control that was never named. The broken link stays intact until
+then, so you can send it back to whoever shared it. A link over 32 KiB, or
+one carrying more than 64 parameters, is refused as a whole rather than
+parameter by parameter, with `Start over` as its repair: nothing inside it is
+read, so padding a link cannot push the filter it carries out of sight and
+have the query run without it. Parameters other than `q`, `page`, `mode`,
+`f` and `r` are not read at all. The same two bounds apply on the way out,
+which is the one place the page declines to do what you asked: a query long
+enough that its link would be unreadable is never written to the address bar,
+and you get an error toast with your text and the current results left
+exactly where they were.
+
 The case file renders one `GET /api/v1/schema/field?name=` response as plain
 facts: the pin and when and where it was set, the verdict (since when, how
 many services have conflict evidence, conflict episodes, lifetime rows

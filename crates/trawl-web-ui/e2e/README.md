@@ -50,12 +50,30 @@ the PR diff.
 - Routing (`/`, rail nav, 404), CodeMirror keyboard input → URL/query
   sync, results-table error rendering, and Live Tail SSE teardown
   (`EventSource` closes on unmount and does not reconnect).
+- The search URL contract (ADR-0027): the date picker's absolute range
+  round-trip, hand-written literal links (versioned filters, `..` ranges,
+  legacy and malformed payloads, page-offset overflow), the percent
+  encoder against the browser's own, and Back/Forward provenance. Every
+  URL in that spec is a literal, never one the app's encoder built.
 - No visual regression / screenshot diffing.
 - No real backend — every response is a fixture in `harness/fixtures.mjs`.
   Re-verify those shapes against `crates/trawl-api/src/lib.rs` /
   `crates/trawl-web-ui/src/api/mod.rs` when the wire types change; the
   suite decodes the SAME structs the SPA does, so a drifted fixture
   either 500s inside `serde_json` or silently renders the empty state.
+
+## The per-test contract
+
+Every spec imports `test` from `fixtures.ts`, and that object carries an
+**auto fixture** that resets the stub to the `default` scenario, installs
+the homelab-independence network guard, and afterwards fails the test on
+any `pageerror` or unstubbed `/api/*` call. It is an auto fixture rather
+than a `test.beforeEach` on purpose: this module is loaded once per
+worker, so a hook written here is registered against whichever spec file
+imported it first and silently never runs for the others. That is what
+was happening — only `api-failure.spec.ts` was getting the reset and the
+guards, which is why a spec asserting an exact captured-query count
+failed when it ran after another file and passed when run alone.
 
 ## Flake policy
 
@@ -76,11 +94,12 @@ one thing the suite is supposed to catch:
 | `02-editor-onchange.patch` | `DslEditor`'s onChange stops writing into `query` | `editor-input.spec.ts` |
 | `03-sse-teardown.patch` | `on_cleanup` leaks the live-tail `EventSource` (`mem::forget` instead of drop) | `teardown-sse.spec.ts` |
 | `04-error-fallback.patch` | `<ResultsTable>` overrides `Loaded`'s error arm to render nothing | `api-failure.spec.ts` |
+| `05-search-url-codec.patch` | `encode_range` writes the retired `abs:<from>:<to>` form again | `search-url.spec.ts` |
 
 Run the mechanism:
 
 ```sh
-crates/trawl-web-ui/e2e/scripts/mutation-check.sh                     # all four
+crates/trawl-web-ui/e2e/scripts/mutation-check.sh                     # all five
 crates/trawl-web-ui/e2e/scripts/mutation-check.sh 02-editor-onchange.patch  # just one
 ```
 

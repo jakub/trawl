@@ -1,0 +1,481 @@
+mutation-check transcript, issue #155
+
+commit:     815f4b9d68551dab79d8bd9286686951e8854132
+date:       2026-09-06T22:53Z (run start), 2026-09-06T22:55Z (written)
+node:       v26.8.1
+npm:        12.0.2
+playwright: 1.62.1
+command:    crates/trawl-web-ui/e2e/scripts/mutation-check.sh
+exit:       0 (every requested mutation killed by its own spec)
+
+Each patch is applied to a clean tree, the SPA is rebuilt, the one spec
+that owns the mutated behaviour must fail, a control spec the mutation
+does not touch must pass, and the patch is reverted. ANSI escapes
+stripped; otherwise verbatim.
+
+----------------------------------------------------------------------
+
+=== 01-route.patch -> routing.spec.ts ===
+-- trunk build --
+2026-09-06T22:53:07.400943Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-06T22:53:07.401070Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-155-search-url-contract-readable-ranges-no/crates/trawl-core)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-155-search-url-contract-readable-ranges-no/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.33s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-06T22:53:15.618706Z  INFO applying new distribution
+2026-09-06T22:53:15.622927Z  INFO ✅ success
+-- playwright test tests/routing.spec.ts --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/routing.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-155-search-url-contract-readable-ranges-no/crates/trawl-web-ui/dist)
+
+Running 3 tests using 1 worker
+
+  ✓  1 [chromium] › tests/routing.spec.ts:8:5 › / redirects to /search and mounts the DSL editor (791ms)
+  ✘  2 [chromium] › tests/routing.spec.ts:14:5 › rail link to history navigates without a full page load (5.5s)
+  ✓  3 [chromium] › tests/routing.spec.ts:31:5 › an unknown route renders the 404 page (418ms)
+
+
+  1) [chromium] › tests/routing.spec.ts:14:5 › rail link to history navigates without a full page load 
+
+    Error: expect(locator).toHaveText(expected) failed
+
+    Locator:  locator('h1')
+    Expected: "Search history"
+    Received: "404"
+    Timeout:  5000ms
+
+    Call log:
+      - Expect "toHaveText" with timeout 5000ms
+      - waiting for locator('h1')
+        14 × locator resolved to <h1>404</h1>
+           - unexpected value "404"
+
+
+      22 |
+      23 |   await page.locator(SEL.railHistoryLink).click();
+    > 24 |   await expect(page.locator('h1')).toHaveText(COPY.historyH1);
+         |                                    ^
+      25 |   await expect(page).toHaveURL(/\/search\/history$/);
+      26 |
+      27 |   const markerSurvived = await page.evaluate(() => (window as any).__e2e_marker === true);
+        at /home/jakub/code/trawl-issue-155-search-url-contract-readable-ranges-no/crates/trawl-web-ui/e2e/tests/routing.spec.ts:24:36
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/routing-rail-link-to-histo-3698f-es-without-a-full-page-load-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/routing-rail-link-to-histo-3698f-es-without-a-full-page-load-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/routing-rail-link-to-histo-3698f-es-without-a-full-page-load-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/routing-rail-link-to-histo-3698f-es-without-a-full-page-load-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  1 failed
+    [chromium] › tests/routing.spec.ts:14:5 › rail link to history navigates without a full page load 
+  2 passed (7.5s)
+-- control: playwright test tests/api-failure.spec.ts (must pass) --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/api-failure.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-155-search-url-contract-readable-ranges-no/crates/trawl-web-ui/dist)
+
+Running 1 test using 1 worker
+
+  ✓  1 [chromium] › tests/api-failure.spec.ts:8:5 › a 500 from /api/v1/query surfaces an inline error, not a redirect to /login (606ms)
+
+  1 passed (1.1s)
+=== 02-editor-onchange.patch -> editor-input.spec.ts ===
+-- trunk build --
+2026-09-06T22:53:25.561274Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-06T22:53:25.561389Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-155-search-url-contract-readable-ranges-no/crates/trawl-core)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-155-search-url-contract-readable-ranges-no/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.14s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-06T22:53:34.493060Z  INFO applying new distribution
+2026-09-06T22:53:34.495766Z  INFO ✅ success
+-- playwright test tests/editor-input.spec.ts --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/editor-input.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-155-search-url-contract-readable-ranges-no/crates/trawl-web-ui/dist)
+
+Running 1 test using 1 worker
+
+  ✘  1 [chromium] › tests/editor-input.spec.ts:8:5 › typing a query and pressing Ctrl+Enter submits it and syncs the URL (5.6s)
+
+
+  1) [chromium] › tests/editor-input.spec.ts:8:5 › typing a query and pressing Ctrl+Enter submits it and syncs the URL 
+
+    Error: expect(page).toHaveURL(expected) failed
+
+    Expected pattern: /[?&]q=service%3Dnginx(&|$)/
+    Received string:  "http://127.0.0.1:8123/search?q=&page=0"
+    Timeout: 5000ms
+
+    Call log:
+      - Expect "toHaveURL" with timeout 5000ms
+        14 × locator resolved to <html lang="en" data-theme="light" data-rowstyle="bordered">…</html>
+           - unexpected value "http://127.0.0.1:8123/search?q=&page=0"
+
+
+      14 |   await page.keyboard.press('Control+Enter');
+      15 |
+    > 16 |   await expect(page).toHaveURL(/[?&]q=service%3Dnginx(&|$)/);
+         |                      ^
+      17 |
+      18 |   const state = await (await request.get('/__ctl/state')).json();
+      19 |   const last = state.queries.at(-1);
+        at /home/jakub/code/trawl-issue-155-search-url-contract-readable-ranges-no/crates/trawl-web-ui/e2e/tests/editor-input.spec.ts:16:22
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/editor-input-typing-a-quer-f53a9-ubmits-it-and-syncs-the-URL-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/editor-input-typing-a-quer-f53a9-ubmits-it-and-syncs-the-URL-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/editor-input-typing-a-quer-f53a9-ubmits-it-and-syncs-the-URL-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/editor-input-typing-a-quer-f53a9-ubmits-it-and-syncs-the-URL-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  1 failed
+    [chromium] › tests/editor-input.spec.ts:8:5 › typing a query and pressing Ctrl+Enter submits it and syncs the URL 
+-- control: playwright test tests/routing.spec.ts (must pass) --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/routing.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-155-search-url-contract-readable-ranges-no/crates/trawl-web-ui/dist)
+
+Running 3 tests using 1 worker
+
+  ✓  1 [chromium] › tests/routing.spec.ts:8:5 › / redirects to /search and mounts the DSL editor (864ms)
+  ✓  2 [chromium] › tests/routing.spec.ts:14:5 › rail link to history navigates without a full page load (527ms)
+  ✓  3 [chromium] › tests/routing.spec.ts:31:5 › an unknown route renders the 404 page (356ms)
+
+  3 passed (2.2s)
+=== 03-sse-teardown.patch -> teardown-sse.spec.ts ===
+-- trunk build --
+2026-09-06T22:53:44.174488Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-06T22:53:44.174595Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-155-search-url-contract-readable-ranges-no/crates/trawl-core)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-155-search-url-contract-readable-ranges-no/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.25s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-06T22:53:53.244164Z  INFO applying new distribution
+2026-09-06T22:53:53.247216Z  INFO ✅ success
+-- playwright test tests/teardown-sse.spec.ts --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/teardown-sse.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-155-search-url-contract-readable-ranges-no/crates/trawl-web-ui/dist)
+
+Running 2 tests using 1 worker
+
+  ✘  1 [chromium] › tests/teardown-sse.spec.ts:23:5 › an unmounted live tail closes its EventSource and stops reconnecting (3.3s)
+  ✘  2 [chromium] › tests/teardown-sse.spec.ts:53:5 › a burst keeps the newest 5000 rows, updates columns, and releases its render timer (1.9s)
+
+
+  1) [chromium] › tests/teardown-sse.spec.ts:23:5 › an unmounted live tail closes its EventSource and stops reconnecting 
+
+    Error: opens count grew after unmount — the EventSource leaked and reconnected
+
+    expect(received).toBe(expected) // Object.is equality
+
+    Expected: 1
+    Received: 3
+
+      48 |   await page.waitForTimeout(1_500);
+      49 |   const later = await pollState(request);
+    > 50 |   expect(later.sse.opens, 'opens count grew after unmount — the EventSource leaked and reconnected').toBe(opensAtClose);
+         |                                                                                                      ^
+      51 | });
+      52 |
+      53 | test('a burst keeps the newest 5000 rows, updates columns, and releases its render timer', async ({ page, request }) => {
+        at /home/jakub/code/trawl-issue-155-search-url-contract-readable-ranges-no/crates/trawl-web-ui/e2e/tests/teardown-sse.spec.ts:50:102
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/teardown-sse-an-unmounted--3ce47-urce-and-stops-reconnecting-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/teardown-sse-an-unmounted--3ce47-urce-and-stops-reconnecting-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/teardown-sse-an-unmounted--3ce47-urce-and-stops-reconnecting-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/teardown-sse-an-unmounted--3ce47-urce-and-stops-reconnecting-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  2) [chromium] › tests/teardown-sse.spec.ts:53:5 › a burst keeps the newest 5000 rows, updates columns, and releases its render timer 
+
+    Error: expect(received).toBe(expected) // Object.is equality
+
+    Expected: 0
+    Received: 1
+
+      89 |   await page.locator(SEL.railHistoryLink).click();
+      90 |   await expect(page.locator('h1')).toHaveText('Search history');
+    > 91 |   expect(await page.evaluate(() => (window as any).__liveRenderTimers.size)).toBe(0);
+         |                                                                              ^
+      92 |   expect(await waitFor(async () => (await pollState(request)).sse.open === 0, 2_000)).toBe(true);
+      93 | });
+      94 |
+        at /home/jakub/code/trawl-issue-155-search-url-contract-readable-ranges-no/crates/trawl-web-ui/e2e/tests/teardown-sse.spec.ts:91:78
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/teardown-sse-a-burst-keeps-ad1d7-d-releases-its-render-timer-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/teardown-sse-a-burst-keeps-ad1d7-d-releases-its-render-timer-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/teardown-sse-a-burst-keeps-ad1d7-d-releases-its-render-timer-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/teardown-sse-a-burst-keeps-ad1d7-d-releases-its-render-timer-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  2 failed
+    [chromium] › tests/teardown-sse.spec.ts:23:5 › an unmounted live tail closes its EventSource and stops reconnecting 
+    [chromium] › tests/teardown-sse.spec.ts:53:5 › a burst keeps the newest 5000 rows, updates columns, and releases its render timer 
+-- control: playwright test tests/routing.spec.ts (must pass) --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/routing.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-155-search-url-contract-readable-ranges-no/crates/trawl-web-ui/dist)
+
+Running 3 tests using 1 worker
+
+  ✓  1 [chromium] › tests/routing.spec.ts:8:5 › / redirects to /search and mounts the DSL editor (796ms)
+  ✓  2 [chromium] › tests/routing.spec.ts:14:5 › rail link to history navigates without a full page load (507ms)
+  ✓  3 [chromium] › tests/routing.spec.ts:31:5 › an unknown route renders the 404 page (355ms)
+
+  3 passed (2.1s)
+=== 04-error-fallback.patch -> api-failure.spec.ts ===
+-- trunk build --
+2026-09-06T22:54:02.804802Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-06T22:54:02.804912Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-155-search-url-contract-readable-ranges-no/crates/trawl-core)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-155-search-url-contract-readable-ranges-no/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.58s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-06T22:54:12.488034Z  INFO applying new distribution
+2026-09-06T22:54:12.490737Z  INFO ✅ success
+-- playwright test tests/api-failure.spec.ts --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/api-failure.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-155-search-url-contract-readable-ranges-no/crates/trawl-web-ui/dist)
+
+Running 1 test using 1 worker
+
+  ✘  1 [chromium] › tests/api-failure.spec.ts:8:5 › a 500 from /api/v1/query surfaces an inline error, not a redirect to /login (5.6s)
+
+
+  1) [chromium] › tests/api-failure.spec.ts:8:5 › a 500 from /api/v1/query surfaces an inline error, not a redirect to /login 
+
+    Error: expect(locator).toBeVisible() failed
+
+    Locator: locator('.results .load-hint.error')
+    Expected: visible
+    Timeout: 5000ms
+    Error: element(s) not found
+
+    Call log:
+      - Expect "toBeVisible" with timeout 5000ms
+      - waiting for locator('.results .load-hint.error')
+
+
+      15 |
+      16 |   const err = page.locator(SEL.loadHintError);
+    > 17 |   await expect(err).toBeVisible();
+         |                     ^
+      18 |   await expect(err).toContainText(COPY.loadHintErrorPrefix);
+      19 |
+      20 |   await expect(page).toHaveURL(/\/search/);
+        at /home/jakub/code/trawl-issue-155-search-url-contract-readable-ranges-no/crates/trawl-web-ui/e2e/tests/api-failure.spec.ts:17:21
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/api-failure-a-500-from-api-c72e2-ror-not-a-redirect-to-login-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/api-failure-a-500-from-api-c72e2-ror-not-a-redirect-to-login-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/api-failure-a-500-from-api-c72e2-ror-not-a-redirect-to-login-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/api-failure-a-500-from-api-c72e2-ror-not-a-redirect-to-login-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  1 failed
+    [chromium] › tests/api-failure.spec.ts:8:5 › a 500 from /api/v1/query surfaces an inline error, not a redirect to /login 
+-- control: playwright test tests/routing.spec.ts (must pass) --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/routing.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-155-search-url-contract-readable-ranges-no/crates/trawl-web-ui/dist)
+
+Running 3 tests using 1 worker
+
+  ✓  1 [chromium] › tests/routing.spec.ts:8:5 › / redirects to /search and mounts the DSL editor (808ms)
+  ✓  2 [chromium] › tests/routing.spec.ts:14:5 › rail link to history navigates without a full page load (509ms)
+  ✓  3 [chromium] › tests/routing.spec.ts:31:5 › an unknown route renders the 404 page (357ms)
+
+  3 passed (2.1s)
+=== 05-search-url-codec.patch -> search-url.spec.ts ===
+-- trunk build --
+2026-09-06T22:54:22.120399Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-06T22:54:22.120512Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-155-search-url-contract-readable-ranges-no/crates/trawl-core)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-155-search-url-contract-readable-ranges-no/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.27s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-06T22:54:31.273611Z  INFO applying new distribution
+2026-09-06T22:54:31.277113Z  INFO ✅ success
+-- playwright test tests/search-url.spec.ts --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/search-url.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-155-search-url-contract-readable-ranges-no/crates/trawl-web-ui/dist)
+
+Running 7 tests using 1 worker
+
+  ✘  1 [chromium] › tests/search-url.spec.ts:74:5 › absolute range round-trips through the picker (712ms)
+  ✓  2 [chromium] › tests/search-url.spec.ts:104:5 › literal versioned filters and range produce the exact DSL (580ms)
+  ✓  3 [chromium] › tests/search-url.spec.ts:116:5 › legacy and malformed filter payloads refuse to run (3.5s)
+  ✓  4 [chromium] › tests/search-url.spec.ts:158:5 › malformed r refuses to run and repairs on click (4.4s)
+  ✓  5 [chromium] › tests/search-url.spec.ts:191:5 › page offset overflows refuse to run while an unreadable page is page 1 (2.2s)
+  ✓  6 [chromium] › tests/search-url.spec.ts:221:5 › q encoding matches encodeURIComponent (526ms)
+  ✓  7 [chromium] › tests/search-url.spec.ts:244:5 › back and forward restore each entry exactly once (562ms)
+
+
+  1) [chromium] › tests/search-url.spec.ts:74:5 › absolute range round-trips through the picker ────
+
+    Error: expect(received).toContain(expected) // indexOf
+
+    Expected substring: "r=2026-01-01T00:00:00Z..2026-01-01T00:15:00Z"
+    Received string:    "?q=service%3Dnginx&page=0"
+
+      86 |
+      87 |   const search = await page.evaluate(() => location.search);
+    > 88 |   expect(search).toContain('r=2026-01-01T00:00:00Z..2026-01-01T00:15:00Z');
+         |                  ^
+      89 |   expect(search).not.toContain('abs:');
+      90 |   // Readable in the address bar: the only escaping in the whole URL is
+      91 |   // the query text's.
+        at /home/jakub/code/trawl-issue-155-search-url-contract-readable-ranges-no/crates/trawl-web-ui/e2e/tests/search-url.spec.ts:88:18
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/search-url-absolute-range-round-trips-through-the-picker-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/search-url-absolute-range-round-trips-through-the-picker-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/search-url-absolute-range-round-trips-through-the-picker-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/search-url-absolute-range-round-trips-through-the-picker-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  1 failed
+    [chromium] › tests/search-url.spec.ts:74:5 › absolute range round-trips through the picker ─────
+  6 passed (13.3s)
+-- control: playwright test tests/routing.spec.ts (must pass) --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/routing.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-155-search-url-contract-readable-ranges-no/crates/trawl-web-ui/dist)
+
+Running 3 tests using 1 worker
+
+  ✓  1 [chromium] › tests/routing.spec.ts:8:5 › / redirects to /search and mounts the DSL editor (797ms)
+  ✓  2 [chromium] › tests/routing.spec.ts:14:5 › rail link to history navigates without a full page load (519ms)
+  ✓  3 [chromium] › tests/routing.spec.ts:31:5 › an unknown route renders the 404 page (355ms)
+
+  3 passed (2.1s)
+-- trunk build (restore pristine dist) --
+2026-09-06T22:54:48.103525Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-06T22:54:48.103639Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-155-search-url-contract-readable-ranges-no/crates/trawl-core)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-155-search-url-contract-readable-ranges-no/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.16s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-06T22:54:56.251887Z  INFO applying new distribution
+2026-09-06T22:54:56.255115Z  INFO ✅ success
+
+mutation-check results:
+patch                        outcome
+01-route.patch               PASS (target spec failed, control passed, exit 1)
+02-editor-onchange.patch     PASS (target spec failed, control passed, exit 1)
+03-sse-teardown.patch        PASS (target spec failed, control passed, exit 1)
+04-error-fallback.patch      PASS (target spec failed, control passed, exit 1)
+05-search-url-codec.patch    PASS (target spec failed, control passed, exit 1)
+
+----------------------------------------------------------------------
+
+Addendum, 2026-09-06T22:59Z
+
+The commit this addendum ships in (the reader hardening) touches
+search_url.rs after the run above, so every patch was re-checked against
+it: all five still apply, and 05-search-url-codec.patch was re-run in
+full and still killed.
+
+2026-09-06T22:59:47.210788Z  INFO applying new distribution
+2026-09-06T22:59:47.213784Z  INFO ✅ success
+
+mutation-check results:
+patch                        outcome
+05-search-url-codec.patch    PASS (target spec failed, control passed, exit 1)
+
+----------------------------------------------------------------------
+
+Addendum, 2026-09-07T00:25Z — re-run at 6a5a567f (the control gate and
+the raw-search bound)
+
+All five patches still apply and were re-run one per invocation:
+
+patch                        outcome
+01-route.patch               PASS (target spec failed, control passed, exit 1)
+02-editor-onchange.patch     PASS (target spec failed, control passed, exit 1)
+03-sse-teardown.patch        FAIL (suite passed despite the mutation)
+04-error-fallback.patch      PASS (target spec failed, control passed, exit 1)
+05-search-url-codec.patch    PASS (target spec failed, control passed, exit 1)
+
+03 no longer kills, and it is not this branch's doing. Probed by
+checking the WHOLE crate back out at e50593c1 — the exact tree the
+22:53 run above killed it on — applying the same patch, rebuilding and
+running teardown-sse.spec.ts: both tests passed there too. Reverting
+only pages/search.rs, or only the state/search_url half, gave the same
+answer. So the difference is outside the tree.
+
+What the mutation does is forget the StreamLifecycle handle in the
+component's on_cleanup, and what makes that observable is WHICH path
+closes the EventSource on unmount. There are two: the explicit
+on_cleanup, and the live-tail Effect, which re-runs when the rail link
+changes the router location and clears the same slot before returning
+early. If the effect re-runs before the component is disposed, the
+stream closes anyway and the mutation is invisible; if disposal wins,
+the forgotten handle leaks and the spec sees `opens` climb. That order
+is leptos's effect scheduling against owner disposal, not anything the
+spec or the app states, so the kill was always a race — it happened to
+land one way at 22:53 and the other way now.
+
+The app behaviour is unchanged and correct in both directions: on the
+unmutated tree both teardown tests pass, the EventSource closes and the
+16ms render timer is released. What is lost is the PROOF that the
+explicit cleanup is the thing doing it. Making that deterministic means
+changing how the live tail is torn down, which is a bigger change than
+either commit here.

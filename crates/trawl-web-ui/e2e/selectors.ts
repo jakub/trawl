@@ -38,6 +38,52 @@ export const SEL = {
   liveTailButton: '.rt-hint button',
   /// crates/fleet-ui/src/loaded/component.rs Loaded's default Error arm.
   loadHintError: '.results .load-hint.error',
+  /// crates/trawl-web-ui/src/components/editor_wrap.rs DateRangePopover —
+  /// the Segmented tab strip's "Absolute" option.
+  absoluteTab: '.dr-pop >> text=Absolute',
+  /// crates/trawl-web-ui/src/components/editor_wrap.rs DateRangePopover —
+  /// the Absolute tab's From input.
+  dateRangeFrom: '.dr-from',
+  /// crates/trawl-web-ui/src/components/editor_wrap.rs DateRangePopover —
+  /// the Absolute tab's To input.
+  dateRangeTo: '.dr-to',
+  /// crates/trawl-web-ui/src/components/editor_wrap.rs DateRangePopover —
+  /// the wrapper carrying the Apply button (fleet-ui's Btn takes no class).
+  dateRangeApply: '.dr-apply',
+  /// crates/trawl-web-ui/src/components/malformed_notice.rs — the banner a
+  /// search URL that cannot be read shows instead of results.
+  urlNotice: '.url-notice',
+  /// crates/trawl-web-ui/src/components/malformed_notice.rs — its one
+  /// repair button.
+  urlNoticeRepair: '.url-notice-repair',
+  /// crates/trawl-web-ui/src/components/malformed_notice.rs — the raw
+  /// parameter value, rendered as text.
+  urlNoticeRaw: '.url-notice-raw',
+  /// crates/trawl-web-ui/src/components/meta_strip.rs — the chip that says
+  /// the link's filters could not be read.
+  filtersBadChip: '.chip.bad',
+  /// crates/trawl-web-ui/src/components/results_table.rs — the snapshot
+  /// results pane. Absent entirely while the malformed banner is up: the
+  /// banner is the whole results area then (ADR-0027).
+  resultsPane: '.results',
+  /// crates/trawl-web-ui/src/pages/search.rs — the tab strip's trailing
+  /// Export action, which opens the export modal.
+  exportAction: '.tabs .action.export',
+  /// crates/trawl-web-ui/src/pages/search.rs — its Save twin.
+  saveAction: '.tabs .action.save',
+  /// crates/trawl-web-ui/src/components/editor_wrap.rs DateRangePopover —
+  /// one quick-range preset in the Relative tab's grid.
+  quickRangeOption: '.dr-pop .opt',
+  /// crates/fleet-ui/src/modal/shell.rs — the modal panel itself (the
+  /// scrim is `.modal-scrim`, a different class).
+  modalPanel: '.modal',
+  /// crates/trawl-web-ui/src/components/export_modal.rs — what the modal
+  /// says when it refuses its own query rather than posting it.
+  modalRefusal: '.m-refusal',
+  /// crates/fleet-ui/src/toast/runtime.rs Toasts, whose class is
+  /// `toast {kind}` from crates/fleet-ui/src/toast/kinds.rs. An error
+  /// toast is what a producer refusal raises.
+  toastError: '.toast.error',
 } as const;
 
 export const COPY = {
@@ -56,4 +102,37 @@ export const COPY = {
   /// crates/trawl-web-ui/src/components/editor_wrap.rs DateRangePopover —
   /// Real-time tab's "Live Tail" button text.
   liveTailButtonText: 'Live Tail',
+  /// crates/trawl-web-ui/src/search_url.rs Malformed::message + Param::noun.
+  urlNoticeFiltersPrefix: "This link's filters could not be read:",
+  /// crates/trawl-web-ui/src/search_url.rs Malformed::message + Param::noun.
+  urlNoticeRangePrefix: "This link's time range could not be read:",
+  /// crates/trawl-web-ui/src/search_url.rs Malformed::message + Param::noun.
+  urlNoticePagePrefix: "This link's page could not be read:",
+  /// crates/trawl-web-ui/src/search_url.rs Malformed::repair_label.
+  urlNoticeRepairFilters: 'Drop filters',
+  /// crates/trawl-web-ui/src/search_url.rs Malformed::repair_label.
+  urlNoticeRepairRange: 'Use last 15 minutes',
+  /// crates/trawl-web-ui/src/search_url.rs Malformed::repair_label.
+  urlNoticeRepairPage: 'Go to page 1',
+  /// crates/trawl-web-ui/src/components/meta_strip.rs — the bad chip's text.
+  filtersUnreadableChip: 'filters unreadable',
+  /// crates/trawl-web-ui/src/search_url.rs RESERVED_SET — the percent-codec
+  /// drift guard's input, typed into the editor by search-url.spec.ts and
+  /// checked byte for byte against the native table test's expectation.
+  reservedSet: " #&/:%'!~*()日本語😀",
+  /// crates/trawl-web-ui/src/search_url.rs RESERVED_SET_ENCODED — what
+  /// the app's encoder writes AND what the browser keeps in
+  /// location.search, which are the same string. encodeURIComponent
+  /// differs from it at the apostrophe alone.
+  reservedSetEncoded: '%20%23%26%2F%3A%25%27!~*()%E6%97%A5%E6%9C%AC%E8%AA%9E%F0%9F%98%80',
+  /// crates/trawl-web-ui/src/search_url.rs EMPTY_QUERY_REFUSAL.
+  emptyQueryRefusal: 'Nothing to export: the query is empty.',
+  /// crates/trawl-web-ui/src/search_url.rs Malformed::message, the
+  /// whole-link arm.
+  urlNoticeTooLong: 'This link is too long to read.',
+  /// crates/trawl-web-ui/src/search_url.rs Malformed::repair_label.
+  urlNoticeRepairLink: 'Start over',
+  /// crates/trawl-web-ui/src/search_url.rs refusal_copy: what a
+  /// navigation refused by the producer's own link bound says.
+  linkTooLongToast: "Can't open this search: link too long",
 } as const;

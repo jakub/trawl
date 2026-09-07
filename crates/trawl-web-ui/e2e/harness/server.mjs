@@ -77,10 +77,13 @@ const sse = {
 let unstubbed = [];
 /** @type {object[]} */
 let queries = [];
+/** @type {object[]} */
+let exports_ = [];
 
 function resetState() {
   unstubbed = [];
   queries = [];
+  exports_ = [];
   // sse.open/opens/closes deliberately survive a reset — a spec resets
   // the scenario, then drives its own stream lifecycle and reads the
   // counters itself. Rolling them here would race a stream this same
@@ -191,7 +194,12 @@ function serveStream(res) {
 
 // ---- request handling -------------------------------------------------------
 
-const server = http.createServer(async (req, res) => {
+// Node's default header cap is 16 KiB INCLUDING the request line, so a
+// deliberately oversized search link (the SPA's own bound is 32 KiB)
+// would be answered with a 431 by the harness before the app ever saw
+// it. The spec that proves the app refuses such a link needs the link to
+// arrive, so this stub carries more than any real deployment would.
+const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res) => {
   let url;
   let p;
 
@@ -225,6 +233,7 @@ const server = http.createServer(async (req, res) => {
         sse: { open: sse.open, opens: sse.opens, closes: sse.closes },
         unstubbed,
         queries,
+        exports: exports_,
       });
       return;
     }
@@ -265,6 +274,28 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       sendJson(res, 200, queryResponse());
+      return;
+    }
+
+    // -- export -------------------------------------------------------
+    // Captured for the same reason queries are: a spec that asserts a
+    // refused link exported NOTHING needs a counter, and an export that
+    // slipped through must be visible as itself rather than as an
+    // `unstubbed` line item.
+    if (p === '/api/v1/export' && req.method === 'POST') {
+      const bodyText = await readBody(req);
+      let parsedBody = {};
+      try {
+        parsedBody = bodyText ? JSON.parse(bodyText) : {};
+      } catch {
+        // fall through with an empty body record
+      }
+      exports_.push({ format: url.searchParams.get('format'), ...parsedBody });
+      res.writeHead(200, {
+        'content-type': 'text/csv; charset=utf-8',
+        'content-disposition': 'attachment; filename="export.csv"',
+      });
+      res.end('service,count\nnginx,1\n');
       return;
     }
 

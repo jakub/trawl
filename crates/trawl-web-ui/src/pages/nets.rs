@@ -17,7 +17,7 @@ use trawl_api::SavedQueryResponse;
 use crate::api;
 use crate::components::net_drawer::NetDrawer;
 use crate::components::sort_th::sort_th;
-use crate::state::query::{Mode, RangeSpec, navigator};
+use crate::state::query::{Mode, RangeSpec, navigator, report_refusal};
 use fleet_ui::time::{time_ago, time_until};
 use fleet_ui::{
     ActionItem, ActionsMenu, ConfirmModal, ConfirmState, LoadState, Loaded, Pager, SearchInput,
@@ -106,7 +106,10 @@ pub fn NetsPage() -> impl IntoView {
     let on_search: Callback<String> = {
         let goto = goto_search.clone();
         Callback::new(move |q: String| {
-            goto(&q, 0, Mode::Snapshot, &[], &RangeSpec::default(), false);
+            report_refusal(
+                bus,
+                goto(&q, 0, Mode::Snapshot, &[], &RangeSpec::default(), false),
+            );
         })
     };
 
@@ -133,7 +136,10 @@ pub fn NetsPage() -> impl IntoView {
     let on_run_in_search = {
         let goto = goto_search.clone();
         move |q: String| {
-            goto(&q, 0, Mode::Snapshot, &[], &RangeSpec::default(), false);
+            report_refusal(
+                bus,
+                goto(&q, 0, Mode::Snapshot, &[], &RangeSpec::default(), false),
+            );
         }
     };
 

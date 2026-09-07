@@ -25,6 +25,13 @@ const RESULTS_TABLE_RS: &str = include_str!("../src/components/results_table.rs"
 const HISTORY_RS: &str = include_str!("../src/pages/history.rs");
 const LAYOUT_RS: &str = include_str!("../src/pages/layout.rs");
 const EDITOR_WRAP_RS: &str = include_str!("../src/components/editor_wrap.rs");
+const MALFORMED_NOTICE_RS: &str = include_str!("../src/components/malformed_notice.rs");
+const META_STRIP_RS: &str = include_str!("../src/components/meta_strip.rs");
+const SEARCH_URL_RS: &str = include_str!("../src/search_url.rs");
+const EXPORT_MODAL_RS: &str = include_str!("../src/components/export_modal.rs");
+const MODAL_SHELL_RS: &str = include_str!("../../fleet-ui/src/modal/shell.rs");
+const TOAST_RUNTIME_RS: &str = include_str!("../../fleet-ui/src/toast/runtime.rs");
+const TOAST_KINDS_RS: &str = include_str!("../../fleet-ui/src/toast/kinds.rs");
 const LOADED_COMPONENT_RS: &str = include_str!("../../fleet-ui/src/loaded/component.rs");
 const LOADED_STATE_RS: &str = include_str!("../../fleet-ui/src/loaded/state.rs");
 const RAIL_RS: &str = include_str!("../../fleet-ui/src/rail.rs");
@@ -163,6 +170,192 @@ const CONTRACTS: &[Contract] = &[
         source_path: "src/components/results_table.rs",
         source: RESULTS_TABLE_RS,
         hook: "label=\"results\"",
+    },
+    Contract {
+        assignment: "absoluteTab: '.dr-pop >> text=Absolute',",
+        source_path: "src/components/editor_wrap.rs",
+        source: EDITOR_WRAP_RS,
+        hook: "class=\"dr-pop\"",
+    },
+    Contract {
+        assignment: "absoluteTab: '.dr-pop >> text=Absolute',",
+        source_path: "src/components/editor_wrap.rs",
+        source: EDITOR_WRAP_RS,
+        hook: "\"Absolute\"",
+    },
+    Contract {
+        assignment: "dateRangeFrom: '.dr-from',",
+        source_path: "src/components/editor_wrap.rs",
+        source: EDITOR_WRAP_RS,
+        hook: "class=\"dr-from\"",
+    },
+    Contract {
+        assignment: "dateRangeTo: '.dr-to',",
+        source_path: "src/components/editor_wrap.rs",
+        source: EDITOR_WRAP_RS,
+        hook: "class=\"dr-to\"",
+    },
+    Contract {
+        assignment: "dateRangeApply: '.dr-apply',",
+        source_path: "src/components/editor_wrap.rs",
+        source: EDITOR_WRAP_RS,
+        hook: "class=\"dr-apply\"",
+    },
+    Contract {
+        assignment: "urlNotice: '.url-notice',",
+        source_path: "src/components/malformed_notice.rs",
+        source: MALFORMED_NOTICE_RS,
+        hook: "class=\"url-notice\"",
+    },
+    Contract {
+        assignment: "urlNoticeRepair: '.url-notice-repair',",
+        source_path: "src/components/malformed_notice.rs",
+        source: MALFORMED_NOTICE_RS,
+        hook: "class=\"url-notice-repair\"",
+    },
+    Contract {
+        assignment: "urlNoticeRaw: '.url-notice-raw',",
+        source_path: "src/components/malformed_notice.rs",
+        source: MALFORMED_NOTICE_RS,
+        hook: "class=\"url-notice-raw\"",
+    },
+    Contract {
+        assignment: "filtersBadChip: '.chip.bad',",
+        source_path: "src/components/meta_strip.rs",
+        source: META_STRIP_RS,
+        hook: "class=\"chip bad\"",
+    },
+    Contract {
+        assignment: "resultsPane: '.results',",
+        source_path: "src/components/results_table.rs",
+        source: RESULTS_TABLE_RS,
+        hook: "class=\"results\"",
+    },
+    Contract {
+        assignment: "exportAction: '.tabs .action.export',",
+        source_path: "src/pages/search.rs",
+        source: include_str!("../src/pages/search.rs"),
+        hook: "class=\"action export\"",
+    },
+    Contract {
+        assignment: "saveAction: '.tabs .action.save',",
+        source_path: "src/pages/search.rs",
+        source: include_str!("../src/pages/search.rs"),
+        hook: "class=\"action save\"",
+    },
+    Contract {
+        assignment: "quickRangeOption: '.dr-pop .opt',",
+        source_path: "src/components/editor_wrap.rs",
+        source: EDITOR_WRAP_RS,
+        hook: "class=\"opt\"",
+    },
+    Contract {
+        assignment: "modalPanel: '.modal',",
+        source_path: "../fleet-ui/src/modal/shell.rs",
+        source: MODAL_SHELL_RS,
+        hook: "else { \"modal\" };",
+    },
+    Contract {
+        assignment: "modalRefusal: '.m-refusal',",
+        source_path: "src/components/export_modal.rs",
+        source: EXPORT_MODAL_RS,
+        hook: "class=\"m-refusal\"",
+    },
+    Contract {
+        assignment: "emptyQueryRefusal: 'Nothing to export: the query is empty.',",
+        source_path: "src/search_url.rs",
+        source: SEARCH_URL_RS,
+        hook: "pub const EMPTY_QUERY_REFUSAL: &str = \"Nothing to export: the query is empty.\";",
+    },
+    Contract {
+        assignment: "urlNoticeFiltersPrefix: \"This link's filters could not be read:\",",
+        source_path: "src/search_url.rs",
+        source: SEARCH_URL_RS,
+        hook: "This link's {} could not be read:",
+    },
+    Contract {
+        assignment: "urlNoticeFiltersPrefix: \"This link's filters could not be read:\",",
+        source_path: "src/search_url.rs",
+        source: SEARCH_URL_RS,
+        hook: "Self::Filters => \"filters\",",
+    },
+    Contract {
+        assignment: "urlNoticeRangePrefix: \"This link's time range could not be read:\",",
+        source_path: "src/search_url.rs",
+        source: SEARCH_URL_RS,
+        hook: "Self::Range => \"time range\",",
+    },
+    Contract {
+        assignment: "urlNoticePagePrefix: \"This link's page could not be read:\",",
+        source_path: "src/search_url.rs",
+        source: SEARCH_URL_RS,
+        hook: "Self::Page => \"page\",",
+    },
+    Contract {
+        assignment: "urlNoticeRepairFilters: 'Drop filters',",
+        source_path: "src/search_url.rs",
+        source: SEARCH_URL_RS,
+        hook: "Param::Filters => \"Drop filters\",",
+    },
+    Contract {
+        assignment: "urlNoticeRepairRange: 'Use last 15 minutes',",
+        source_path: "src/search_url.rs",
+        source: SEARCH_URL_RS,
+        hook: "Param::Range => \"Use last 15 minutes\",",
+    },
+    Contract {
+        assignment: "urlNoticeRepairPage: 'Go to page 1',",
+        source_path: "src/search_url.rs",
+        source: SEARCH_URL_RS,
+        hook: "Param::Page => \"Go to page 1\",",
+    },
+    Contract {
+        assignment: "filtersUnreadableChip: 'filters unreadable',",
+        source_path: "src/components/meta_strip.rs",
+        source: META_STRIP_RS,
+        hook: "\"filters unreadable\"",
+    },
+    Contract {
+        assignment: "reservedSet: \" #&/:%'!~*()\u{65e5}\u{672c}\u{8a9e}\u{1f600}\",",
+        source_path: "src/search_url.rs",
+        source: SEARCH_URL_RS,
+        hook: "pub const RESERVED_SET: &str = \" #&/:%'!~*()\u{65e5}\u{672c}\u{8a9e}\u{1f600}\";",
+    },
+    Contract {
+        assignment: "reservedSetEncoded: '%20%23%26%2F%3A%25%27!~*()%E6%97%A5%E6%9C%AC%E8%AA%9E%F0%9F%98%80',",
+        source_path: "src/search_url.rs",
+        source: SEARCH_URL_RS,
+        hook: "\"%20%23%26%2F%3A%25%27!~*()%E6%97%A5%E6%9C%AC%E8%AA%9E%F0%9F%98%80\"",
+    },
+    Contract {
+        assignment: "urlNoticeTooLong: 'This link is too long to read.',",
+        source_path: "src/search_url.rs",
+        source: SEARCH_URL_RS,
+        hook: "_ => \"This link is too long to read.\".to_owned(),",
+    },
+    Contract {
+        assignment: "urlNoticeRepairLink: 'Start over',",
+        source_path: "src/search_url.rs",
+        source: SEARCH_URL_RS,
+        hook: "Param::Link => \"Start over\",",
+    },
+    Contract {
+        assignment: "toastError: '.toast.error',",
+        source_path: "../fleet-ui/src/toast/runtime.rs",
+        source: TOAST_RUNTIME_RS,
+        hook: "format!(\"toast {}\", t.kind.as_class())",
+    },
+    Contract {
+        assignment: "toastError: '.toast.error',",
+        source_path: "../fleet-ui/src/toast/kinds.rs",
+        source: TOAST_KINDS_RS,
+        hook: "Self::Error => \"error\",",
+    },
+    Contract {
+        assignment: "linkTooLongToast: \"Can't open this search: link too long\",",
+        source_path: "src/search_url.rs",
+        source: SEARCH_URL_RS,
+        hook: "\"Can't open this search: link too long\"",
     },
     Contract {
         assignment: "liveTailButtonText: 'Live Tail',",

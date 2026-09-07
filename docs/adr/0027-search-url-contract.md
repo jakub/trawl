@@ -36,31 +36,91 @@ A link whose structured state does not parse is shown, not run.**
   contract. Nothing rewrites a URL on the user's behalf; there is no
   canonicalization pass.
 - **Malformed structured state refuses to run.** A bad `f`, a bad `r`, or
-  a `page` beyond the server's result cap leaves the query unexecuted and
-  shows a banner naming the parameter and echoing its raw value as text,
-  truncated. The banner offers one repair (drop filters, use last 15m,
-  page 0) that rewrites the URL only when clicked, with a replace
-  navigation. The broken URL stays intact until then so it can be sent
-  back to whoever shared it. An unparseable `page` is a missing value and
-  reads as 0; an out-of-range one is a false claim and is malformed. A
-  malformed versioned `f` is no longer "zero filters".
+  a `page` whose offset the request cannot carry leaves the query
+  unexecuted and shows a banner naming the parameter and echoing its raw
+  value as text, truncated. A page is malformed exactly when
+  `page * PAGE_SIZE` does not fit `MAX_OFFSET`, which is `u32::MAX`, the
+  browser's own `usize`. The server's `max_result_rows` is
+  per-deployment configuration that appears on no API response, so the
+  client does not mirror a number it cannot read: a page past the real
+  cap gets the server's 400 through the error banner the results pane
+  already has (run ruling 2026-09-06, closing a prep gap). The banner
+  offers one repair (drop filters, use last 15m, page 0) that rewrites
+  the URL only when clicked, with a replace navigation. A repair whose
+  own candidate link cannot be admitted degrades to "Start over" — the
+  banner keeps its sentence and swaps the button, because carrying the
+  other parameters through re-encodes them and can push the repaired
+  link past the length bound, and a button that refuses itself on a page
+  where every other control is disabled is a dead end (run ruling
+  2026-09-06). The verdict is computed with the href, not discovered at
+  the click. The broken URL
+  stays intact until then so it can be sent back to whoever shared it. An
+  unparseable `page` is a missing value and reads as 0; an out-of-range
+  one is a false claim and is malformed. A malformed versioned `f` is no
+  longer "zero filters".
+- **While a parameter is malformed, the repair is the only control that
+  navigates or runs.** Blanking the effective query is not the gate: the
+  export modal read that empty string and posted it, and the server's
+  emitter turns an empty query into `SELECT *` with no WHERE, so a link
+  the page had refused exported the whole corpus (run ruling 2026-09-06).
+  Every callback that navigates or submits returns early while the link
+  is unreadable, and every control that reaches one renders `disabled` —
+  Haul (and the editor's own Ctrl+Enter), the range presets, Apply, Live
+  Tail, Save, Export, pagination, facet include/exclude and clear, chip
+  removal, and the row actions that navigate. A modal already open when
+  the URL turns unreadable is closed. Nothing is re-routed through the
+  fallback memos: blocking is the fix. Underneath it, an empty query
+  never reaches an execution endpoint at all — the export modal refuses
+  it in its own body and `api::export` refuses it again.
 - **Bounds are validated and escaped before they enter the DSL.** The
   client checks RFC 3339 (or `now` on the right) before emitting
   `_time>=`/`_time<=`, and the bound still goes through the DSL string
   escaper `format_filter` already uses. Validation is a client courtesy;
   the server's opaque 500 on an unparseable bound is a `trawl-core` gap
   and stays outside this slice.
-- **Decoding is bounded.** The raw `f` value is capped before base64 or
-  JSON allocation, the decoded filter count and field/value lengths are
-  capped, and the page offset is a checked multiplication. A URL is
-  attacker-controlled input to the SPA.
-- **The percent encoder is a pure, hand-rolled mirror of
-  `encodeURIComponent`** (unreserved `A-Za-z0-9-_.!~*'()`, uppercase hex,
-  UTF-8 bytes), used only for `q`. Two drift guards: an exhaustive native
-  table test over every ASCII byte plus multibyte and malformed input, and
-  one browser spec that submits the reserved set and compares
-  `location.search` to the same literal. `percent-encoding` would need the
-  same table written by hand and adds a direct dependency for nothing.
+- **Decoding is bounded, starting with the whole link.** A raw query
+  string over `MAX_SEARCH_BYTES` (32 KiB) is one malformed verdict about
+  the link itself, refused by length before it is split into anything and
+  repaired by starting over at `/search`; a per-parameter cap bounds
+  nothing while the number of parameters does not, and `?a&` a million
+  times used to be a million owned pairs (run ruling 2026-09-06). Inside
+  that bound only the five keys this app reads are retained, first
+  occurrence each, over at most 64 non-empty pairs, so an unknown
+  parameter costs a name comparison rather than a decoded copy and does
+  not survive a repair. Both whole-link bounds fail CLOSED: reaching
+  either one refuses the link rather than answering from the part that
+  fit, because the cap that merely stopped reading let 64 empty pairs
+  push an unreadable `f` out of sight and run the link with no filters
+  and no banner (run ruling 2026-09-06). The producer asks the same
+  reader before it navigates (`admit_search` on both navigators, beside
+  `admit_filters`): a link this app cannot read back is never written,
+  so a query too long to share is an error toast with the address bar
+  and the editor buffer untouched, not a banner over an editor the page
+  just emptied. Then per parameter: the raw `f` value is capped before
+  base64 or JSON allocation, the decoded filter count and field/value
+  lengths are capped, and the page offset is a checked multiplication. A
+  URL is attacker-controlled input to the SPA.
+- **The SPA reads the raw query string and decodes it once itself.**
+  `leptos_router`'s `ParamsMap` percent-decodes a value `UrlSearchParams`
+  has already decoded, which turns `?q=message%3D%2F100%2541%2F` into the
+  query `message=/100A/`, so the reader takes `use_location().search` and
+  applies the `application/x-www-form-urlencoded` rules in the same pure
+  module as the encoder (run ruling 2026-09-06). `f` is base64url and `r`
+  is a closed timestamp grammar, so only `q` could carry the `%` that
+  exposed it.
+- **The percent encoder writes the string the browser will keep**
+  (unreserved `A-Za-z0-9-_.!~*()`, uppercase hex, UTF-8 bytes), used only
+  for `q`. That is `encodeURIComponent`'s set minus the apostrophe, and
+  the app encodes the apostrophe because the browser does: `'` is in the
+  URL standard's special-query percent-encode set, so a literal one is
+  stored as `%27` and an encoder that wrote it literally measured a third
+  of the bytes admission is about, letting ~10 900 apostrophes through
+  the door and back as the "too long" banner (run ruling 2026-09-06).
+  Two drift guards: an exhaustive native table test over every ASCII byte
+  plus multibyte and malformed input, and one browser spec that submits
+  the reserved set and compares `location.search` to the same literal.
+  `percent-encoding` would need the same table written by hand and adds a
+  direct dependency for nothing.
 - **Back and Forward: the URL is the document.** After A → B → Back →
   Forward the URL is byte-identical to what the navigator built, exactly
   one query is posted per state change (the DSL sequence A, B, A, B), and
@@ -80,3 +140,9 @@ A link whose structured state does not parse is shown, not run.**
 - Slice E of #100 (date-range promotion to fleet-ui) reads `RangeSpec`
   through this contract; the `DateRange` component's props may change
   here, and E is named in the PR rather than frozen around.
+- Accepted gap: a link to page 2000 is inside the offset ceiling, so it
+  runs, and a default install answers it with the API error rather than
+  the malformed banner. One broken link, two different explanations.
+  Closing that means publishing the cap on a response, `/api/v1/health`
+  being the obvious place, which is its own decision and not a client
+  one.

@@ -182,6 +182,37 @@ impl Drop for EditorLifecycle {
     }
 }
 
+/// Make the document follow `query` when something OTHER than typing
+/// moves it — a Back navigation rewriting `?q=`, a saved query being
+/// opened. Without this the editor kept whatever was mounted into it and
+/// showed a query that was not the one on screen (ADR-0027's
+/// Back/Forward contract).
+///
+/// A keystroke never round-trips: `on_change` records the document
+/// before it sets the signal, so `push` finds them equal and does
+/// nothing. The format trigger is now a second route to the same push —
+/// the parent's contract is to set `query` and then bump the counter,
+/// and the first half alone is enough.
+fn follow_query_signal(
+    query: RwSignal<String>,
+    format_trigger: Option<RwSignal<u64>>,
+    push: impl Fn(&str) + Copy + 'static,
+) {
+    Effect::new(move |_| {
+        let text = query.get();
+        push(&text);
+    });
+
+    if let Some(fmt) = format_trigger {
+        Effect::new(move |_| {
+            if fmt.get() == 0 {
+                return;
+            }
+            push(&query.get_untracked());
+        });
+    }
+}
+
 /// Leptos component that mounts a `CodeMirror` editor into a div. The doc
 /// text is pushed into `query` on every change; `on_submit` fires when
 /// the user hits ⌘⏎ / ctrl+⏎.
@@ -202,6 +233,27 @@ pub fn DslEditor(
     // `LocalStorage` variant is the right one.
     let lifecycle: StoredValue<Option<EditorLifecycle>, leptos::prelude::LocalStorage> =
         StoredValue::new_local(None);
+    // What CodeMirror's document currently holds, as last seen by this
+    // component. The editor is the source of truth while the user types
+    // and the follower when the signal moves under it, and this is how
+    // the two are told apart without asking JS for the document.
+    let editor_doc: StoredValue<String, leptos::prelude::LocalStorage> =
+        StoredValue::new_local(String::new());
+    // Guarded: a push that would not change the document is skipped, so
+    // the effects below can be unconditional.
+    let push_doc = move |text: &str| {
+        if editor_doc.with_value(|doc| doc == text) {
+            return;
+        }
+        let pushed = lifecycle.with_value(|slot| {
+            slot.as_ref().map(|lc| {
+                lc.handle.set_doc(text);
+            })
+        });
+        if pushed.is_some() {
+            editor_doc.set_value(text.to_string());
+        }
+    };
 
     Effect::new(move |_| {
         let Some(element) = node_ref.get() else {
@@ -210,6 +262,7 @@ pub fn DslEditor(
         let html_el: web_sys::HtmlElement = (*element).clone().unchecked_into();
 
         let on_change_cb = Closure::<dyn Fn(String)>::new(move |doc: String| {
+            editor_doc.set_value(doc.clone());
             query.set(doc);
         });
 
@@ -273,6 +326,7 @@ pub fn DslEditor(
         );
 
         let initial = query.get_untracked();
+        editor_doc.set_value(initial.clone());
         let handle = create_editor(&html_el, &initial, opts.into());
 
         lifecycle.set_value(Some(EditorLifecycle {
@@ -284,20 +338,7 @@ pub fn DslEditor(
         }));
     });
 
-    if let Some(fmt) = format_trigger {
-        Effect::new(move |_| {
-            let v = fmt.get();
-            if v == 0 {
-                return;
-            }
-            let text = query.get_untracked();
-            lifecycle.with_value(|slot| {
-                if let Some(lc) = slot.as_ref() {
-                    lc.handle.set_doc(&text);
-                }
-            });
-        });
-    }
+    follow_query_signal(query, format_trigger, push_doc);
 
     on_cleanup(move || {
         // Dropping the `EditorLifecycle` is what tears the view down.

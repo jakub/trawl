@@ -27,13 +27,16 @@ use crate::components::editor_wrap::EditorWrap;
 use crate::components::export_modal::ExportModal;
 use crate::components::facet_sidebar::FacetSidebar;
 use crate::components::histogram::Histogram;
+use crate::components::malformed_notice::MalformedNotice;
 use crate::components::meta_strip::MetaStrip;
 use crate::components::results_table::ResultsTable;
 use crate::components::save_as_net_modal::SaveAsNetModal;
 use crate::components::status_bar::StatusKind;
 use crate::pages::layout::ShellStatus;
+use crate::search_url::{Param, admit_filters, refusal_copy};
 use crate::state::query::{
-    Filter, Mode, RangeSpec, UrlSignals, effective_query, navigator, url_signals,
+    Filter, Mode, RangeSpec, UrlSignals, effective_query, navigator, replace_navigator,
+    report_refusal, url_signals,
 };
 use crate::state::search_session::rows_resource;
 use fleet_ui::{TabItem, Tabs, ToastBus, ToastKind};
@@ -85,13 +88,40 @@ pub fn Search() -> impl IntoView {
         mode,
         filters,
         range,
+        malformed,
+        repair,
     } = url_signals();
 
     Effect::new(move |_| {
         query_text.set(executed_q.get());
     });
 
+    // Whether this link's structured state could be read at all.
+    //
+    // A link that could not be read runs nothing and rewrites nothing
+    // (ADR-0027): while this is true the banner's repair is the ONLY
+    // control that navigates. That is structural, not a property of the
+    // blanked query below — every callback in this component returns
+    // early on it, and every control that reaches one of them is
+    // rendered `disabled` (or, where a span has no disabled state, not
+    // rendered). Blanking `effective_q` alone was not the gate it looked
+    // like: the export modal read that empty string and posted it, and
+    // an empty query is `SELECT *` with no WHERE to the server's
+    // emitter, so a refused link exported the whole corpus.
+    //
+    // Every reader of `rows` below is gated on it too, because refusing
+    // to RUN a link is not the same as refusing to PAINT one: a response
+    // already in flight when the URL turned unreadable (Back,
+    // mid-request) still lands in the resource, and rows under a banner
+    // that says the link was not run are a straight contradiction. That
+    // the resource keeps the in-flight request is a residual outside
+    // this slice; what it shows is not.
+    let unreadable = Signal::derive(move || malformed.with(Option::is_some));
+
     let effective_q = Memo::new(move |_| {
+        if unreadable.get() {
+            return String::new();
+        }
         let base = executed_q.get();
         let fs = filters.get();
         let r = range.get();
@@ -105,13 +135,27 @@ pub fn Search() -> impl IntoView {
     let on_submit = {
         let goto = goto.clone();
         Callback::new(move |()| {
-            goto(
-                &query_text.get_untracked(),
-                0,
-                mode.get_untracked(),
-                &filters.get_untracked(),
-                &range.get_untracked(),
-                false,
+            // The gate, at every door that navigates. The Haul button
+            // carries `disabled` as well; this is what makes the
+            // editor's own Ctrl+Enter obey the same rule.
+            if unreadable.get_untracked() {
+                return;
+            }
+            // The other half of the gate: a link this app cannot read
+            // back is not written at all. The editor keeps its text and
+            // the address bar keeps its query, so a query too long to
+            // share is a toast and an edit away from working, not a
+            // banner over an editor the page just emptied.
+            report_refusal(
+                bus,
+                goto(
+                    &query_text.get_untracked(),
+                    0,
+                    mode.get_untracked(),
+                    &filters.get_untracked(),
+                    &range.get_untracked(),
+                    false,
+                ),
             );
         })
     };
@@ -122,13 +166,19 @@ pub fn Search() -> impl IntoView {
     let on_live = {
         let goto = goto.clone();
         Callback::new(move |()| {
-            goto(
-                &query_text.get_untracked(),
-                0,
-                Mode::Live,
-                &filters.get_untracked(),
-                &range.get_untracked(),
-                false,
+            if unreadable.get_untracked() {
+                return;
+            }
+            report_refusal(
+                bus,
+                goto(
+                    &query_text.get_untracked(),
+                    0,
+                    Mode::Live,
+                    &filters.get_untracked(),
+                    &range.get_untracked(),
+                    false,
+                ),
             );
         })
     };
@@ -136,13 +186,19 @@ pub fn Search() -> impl IntoView {
     let on_paginate = {
         let goto = goto.clone();
         Callback::new(move |new_page: usize| {
-            goto(
-                &executed_q.get_untracked(),
-                new_page,
-                Mode::Snapshot,
-                &filters.get_untracked(),
-                &range.get_untracked(),
-                true,
+            if unreadable.get_untracked() {
+                return;
+            }
+            report_refusal(
+                bus,
+                goto(
+                    &executed_q.get_untracked(),
+                    new_page,
+                    Mode::Snapshot,
+                    &filters.get_untracked(),
+                    &range.get_untracked(),
+                    true,
+                ),
             );
         })
     };
@@ -150,18 +206,33 @@ pub fn Search() -> impl IntoView {
     let on_add_filter = {
         let goto = goto.clone();
         Callback::new(move |f: Filter| {
+            if unreadable.get_untracked() {
+                return;
+            }
             let mut current = filters.get_untracked();
             if current.iter().any(|existing| existing == &f) {
                 return;
             }
             current.push(f);
-            goto(
-                &executed_q.get_untracked(),
-                0,
-                mode.get_untracked(),
-                &current,
-                &range.get_untracked(),
-                false,
+            // The producer asks the reader's own rules before it
+            // navigates: a link this app builds must be one it can read
+            // back, so a set that busts a cap is refused out loud here
+            // rather than becoming the malformed banner one navigation
+            // later (ADR-0027).
+            if let Err(reason) = admit_filters(&current) {
+                bus.push(ToastKind::Error, refusal_copy(reason), None);
+                return;
+            }
+            report_refusal(
+                bus,
+                goto(
+                    &executed_q.get_untracked(),
+                    0,
+                    mode.get_untracked(),
+                    &current,
+                    &range.get_untracked(),
+                    false,
+                ),
             );
         })
     };
@@ -169,18 +240,24 @@ pub fn Search() -> impl IntoView {
     let on_remove_filter = {
         let goto = goto.clone();
         Callback::new(move |idx: usize| {
+            if unreadable.get_untracked() {
+                return;
+            }
             let mut current = filters.get_untracked();
             if idx >= current.len() {
                 return;
             }
             current.remove(idx);
-            goto(
-                &executed_q.get_untracked(),
-                0,
-                mode.get_untracked(),
-                &current,
-                &range.get_untracked(),
-                false,
+            report_refusal(
+                bus,
+                goto(
+                    &executed_q.get_untracked(),
+                    0,
+                    mode.get_untracked(),
+                    &current,
+                    &range.get_untracked(),
+                    false,
+                ),
             );
         })
     };
@@ -188,16 +265,19 @@ pub fn Search() -> impl IntoView {
     let on_clear_filters = {
         let goto = goto.clone();
         Callback::new(move |()| {
-            if filters.get_untracked().is_empty() {
+            if unreadable.get_untracked() || filters.get_untracked().is_empty() {
                 return;
             }
-            goto(
-                &executed_q.get_untracked(),
-                0,
-                mode.get_untracked(),
-                &[],
-                &range.get_untracked(),
-                false,
+            report_refusal(
+                bus,
+                goto(
+                    &executed_q.get_untracked(),
+                    0,
+                    mode.get_untracked(),
+                    &[],
+                    &range.get_untracked(),
+                    false,
+                ),
             );
         })
     };
@@ -205,25 +285,59 @@ pub fn Search() -> impl IntoView {
     let on_range_change = {
         let goto = goto.clone();
         Callback::new(move |new_range: RangeSpec| {
-            if range.get_untracked() == new_range {
+            if unreadable.get_untracked() || range.get_untracked() == new_range {
                 return;
             }
-            goto(
-                &executed_q.get_untracked(),
-                0,
-                mode.get_untracked(),
-                &filters.get_untracked(),
-                &new_range,
-                false,
+            report_refusal(
+                bus,
+                goto(
+                    &executed_q.get_untracked(),
+                    0,
+                    mode.get_untracked(),
+                    &filters.get_untracked(),
+                    &new_range,
+                    false,
+                ),
             );
         })
     };
 
+    // The repair the banner offers: the link as it stands with ONE
+    // parameter replaced, built by `search_url::repair_url` off the
+    // query map. Rebuilding it from the memos instead would write every
+    // parameter's fallback, so repairing an unreadable `f` also
+    // silently dropped an unreadable `r` beside it and ran the default
+    // window. `replace` so the broken link does not become a Back
+    // destination.
+    let repair_to = replace_navigator();
+    let on_repair = Callback::new(move |()| {
+        let Some(r) = repair.get_untracked() else {
+            return;
+        };
+        // Every repair keeps `q` as it stands (a named one carries it
+        // verbatim; "Start over" lands on an empty one, and an unread
+        // link's `executed_q` is ALREADY empty), so the effect that
+        // syncs the editor to the executed query never fires across a
+        // repair, and whatever was typed into the still-editable editor
+        // would sit above results from the query that actually ran.
+        // Reset the buffer here, to the query the repaired link runs.
+        query_text.set(executed_q.get_untracked());
+        report_refusal(bus, repair_to(&r.href));
+    });
+
     let on_navigate_q = {
         let goto = goto.clone();
         Callback::new(move |new_q: String| {
-            query_text.set(new_q.clone());
-            goto(&new_q, 0, Mode::Snapshot, &[], &RangeSpec::default(), false);
+            if unreadable.get_untracked() {
+                return;
+            }
+            // Buffer after navigation, not before it: a refused link
+            // must leave the editor exactly as the reader left it.
+            let outcome = goto(&new_q, 0, Mode::Snapshot, &[], &RangeSpec::default(), false);
+            if outcome.is_ok() {
+                query_text.set(new_q);
+            }
+            report_refusal(bus, outcome);
         })
     };
 
@@ -290,11 +404,13 @@ pub fn Search() -> impl IntoView {
         });
     });
     Effect::new(move |_| {
-        shell_status.count.set(
+        shell_status.count.set(if unreadable.get() {
+            None
+        } else {
             rows.get()
                 .and_then(Result::ok)
-                .map(|r| r.pagination.returned),
-        );
+                .map(|r| r.pagination.returned)
+        });
     });
     Effect::new(move |_| {
         shell_status.lagged.set(lagged.get());
@@ -306,9 +422,13 @@ pub fn Search() -> impl IntoView {
         shell_status.lagged.set(None);
     });
 
-    let truncated =
-        Signal::derive(move || rows.get().and_then(Result::ok).is_some_and(|r| r.truncated));
+    let truncated = Signal::derive(move || {
+        !unreadable.get() && rows.get().and_then(Result::ok).is_some_and(|r| r.truncated)
+    });
     let last_count = Signal::derive(move || {
+        if unreadable.get() {
+            return None;
+        }
         rows.get()
             .and_then(Result::ok)
             .map(|r| r.pagination.returned)
@@ -322,7 +442,7 @@ pub fn Search() -> impl IntoView {
     // running behind the live tail, and SSE carries no notice, so a
     // stale snapshot's fields must not be shown over streamed rows.
     let degraded_fields = Signal::derive(move || {
-        if mode.get() == Mode::Live {
+        if mode.get() == Mode::Live || unreadable.get() {
             return Vec::new();
         }
         rows.get()
@@ -331,10 +451,39 @@ pub fn Search() -> impl IntoView {
     });
 
     let show_save_modal = RwSignal::new(false);
-    let on_save = Callback::new(move |()| show_save_modal.set(true));
+    let on_save = Callback::new(move |()| {
+        if unreadable.get_untracked() {
+            return;
+        }
+        show_save_modal.set(true);
+    });
     let show_export_modal = RwSignal::new(false);
-    let on_export = Callback::new(move |()| show_export_modal.set(true));
+    let on_export = Callback::new(move |()| {
+        if unreadable.get_untracked() {
+            return;
+        }
+        show_export_modal.set(true);
+    });
+    // A modal opened while the link read fine survives a Back INTO one
+    // that does not: the URL changes under an open dialog whose query
+    // preview is now the blanked sentinel. Close both the moment the
+    // link stops being readable, so the banner is what the reader is
+    // left looking at (ADR-0027).
+    Effect::new(move |_| {
+        if unreadable.get() {
+            show_save_modal.set(false);
+            show_export_modal.set(false);
+        }
+    });
     let running = loading;
+
+    let malformed_sig = Signal::derive(move || malformed.get());
+    let repair_sig = Signal::derive(move || repair.get());
+    // The chip strip's own admission that the filters on screen are not
+    // the filters in the link.
+    let filters_unreadable = Signal::derive(move || {
+        malformed.with(|m| m.as_ref().is_some_and(|m| m.param == Param::Filters))
+    });
 
     let filters_sig = Signal::derive(move || filters.get());
     let range_sig = Signal::derive(move || range.get());
@@ -344,6 +493,7 @@ pub fn Search() -> impl IntoView {
             <FacetSidebar
                 rows=rows
                 filters=filters_sig
+                suppressed=unreadable
                 on_add=on_add_filter
                 on_clear=on_clear_filters
             />
@@ -354,14 +504,18 @@ pub fn Search() -> impl IntoView {
                     range=range_sig
                     on_range_change=on_range_change
                     running=running
+                    blocked=unreadable
                     on_save=on_save
                     on_live=on_live
                 />
                 <MetaStrip
                     truncated=truncated
                     filters=filters_sig
+                    filters_unreadable=filters_unreadable
+                    blocked=unreadable
                     on_remove=on_remove_filter
                 />
+                <MalformedNotice malformed=malformed_sig repair=repair_sig on_repair=on_repair/>
                 <Tabs
                     items=vec![
                         TabItem::with_count(ResultsTab::Events.id(), "Events", last_count),
@@ -369,19 +523,27 @@ pub fn Search() -> impl IntoView {
                     ]
                     active=tabs_active
                     on_change=on_tab_change
+                    // Buttons, not spans: an unreadable link disables
+                    // both. Export posts the effective query, which is
+                    // the blanked sentinel then, and the server reads
+                    // an empty query as every row (ADR-0027).
                     trailing=Box::new(move || view! {
-                        <span
-                            class="action"
+                        <button
+                            type="button"
+                            class="action save"
+                            disabled=move || unreadable.get()
                             on:click=move |_| bus.push(
                                 ToastKind::Info,
                                 "Save",
                                 Some("Net saving is landing soon — use the history page for now.".into()),
                             )
-                        >"Save"</span>
-                        <span
-                            class="action"
+                        >"Save"</button>
+                        <button
+                            type="button"
+                            class="action export"
+                            disabled=move || unreadable.get()
                             on:click=move |_| on_export.run(())
-                        >"Export"</span>
+                        >"Export"</button>
                     }.into_any())
                 />
                 // Above the results body, not inside it: a zero-row
@@ -389,7 +551,11 @@ pub fn Search() -> impl IntoView {
                 // worth reading, and the Visualization tab is drawn from
                 // the same incomplete rows.
                 <DegradedNotice query=effective_q fields=degraded_fields/>
-                {move || match (active_tab.get(), mode.get()) {
+                {move || if unreadable.get() {
+                    // The banner above IS the results pane while the
+                    // link cannot be read.
+                    ().into_any()
+                } else { match (active_tab.get(), mode.get()) {
                     (ResultsTab::Events, Mode::Snapshot) => view! {
                         <>
                             <Histogram rows=rows range=range_sig/>
@@ -411,7 +577,7 @@ pub fn Search() -> impl IntoView {
                     (ResultsTab::Visualization, _) => view! {
                         <Chart snapshot=live_snapshot/>
                     }.into_any(),
-                }}
+                }}}
             </div>
         </div>
         <Show when=move || show_save_modal.get()>

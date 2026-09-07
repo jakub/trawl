@@ -1,0 +1,13 @@
+diff --git a/crates/trawl-web-ui/src/search_url.rs b/crates/trawl-web-ui/src/search_url.rs
+index 1bf48e66..a6238033 100644
+--- a/crates/trawl-web-ui/src/search_url.rs
++++ b/crates/trawl-web-ui/src/search_url.rs
+@@ -346,7 +346,7 @@ pub fn encode_range(range: &RangeSpec) -> String {
+             } else {
+                 normalize_instant(to).unwrap_or_else(|| to.clone())
+             };
+-            format!("{f}..{t}")
++            format!("abs:{f}:{t}")
+         }
+     }
+ }
