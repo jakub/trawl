@@ -126,3 +126,63 @@ export async function capturedQueries(request: Ctl): Promise<string[]> {
   const state = await (await request.get('/__ctl/state')).json();
   return state.queries.map((q: { query: string }) => q.query);
 }
+
+type Pg = import('@playwright/test').Page;
+
+/** Count `setInterval` timers the page currently holds, bucketed by
+ * delay.
+ *
+ * This is the only oracle for a LEAKED timer. A leaked `gloo_timers`
+ * `Interval` whose body runs a disposed leptos callback is network-
+ * silent: the callback no-ops, so the leak issues no HTTP read and
+ * throws no `pageerror`. Nothing the server or the DOM can see
+ * distinguishes it from a cancelled one — only the browser's own timer
+ * table does.
+ *
+ * Must be called BEFORE `page.goto`: `addInitScript` runs ahead of the
+ * page's own scripts, which is what keeps the app from capturing the
+ * native `setInterval` before the wrapper is in place. Native signatures
+ * and return values are preserved, so the app cannot tell the difference.
+ */
+export async function trackIntervals(page: Pg): Promise<void> {
+  await page.addInitScript(() => {
+    // Live count per delay, and the side map that makes `clearInterval`
+    // decrement the RIGHT bucket — a timer id carries no delay, so
+    // without this a cleared 3000ms timer could cancel out a live 16ms
+    // one and hide a leak.
+    const counts = new Map<number, number>();
+    const delays = new Map<number, number>();
+    const start = window.setInterval.bind(window);
+    const clear = window.clearInterval.bind(window);
+    (window as any).__e2eIntervalCount = (delay: number) => counts.get(delay) ?? 0;
+    window.setInterval = ((handler: TimerHandler, delay?: number, ...args: any[]) => {
+      const id = start(handler, delay, ...args);
+      // An omitted delay is 0 to the platform; bucket it as the platform
+      // sees it rather than as a distinct "no delay" case.
+      const key = delay ?? 0;
+      delays.set(id, key);
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+      return id;
+    }) as typeof window.setInterval;
+    window.clearInterval = ((id?: number) => {
+      // Only a live id decrements: `clearInterval` is idempotent on the
+      // platform, and a double clear must not drive a bucket negative.
+      if (id !== undefined && delays.has(id)) {
+        counts.set(delays.get(id)!, counts.get(delays.get(id)!)! - 1);
+        delays.delete(id);
+      }
+      clear(id);
+    }) as typeof window.clearInterval;
+  });
+}
+
+/** How many live `setInterval` timers the page holds at `delay` ms. */
+export async function intervalCount(page: Pg, delay: number): Promise<number> {
+  return page.evaluate((ms) => {
+    const read = (window as any).__e2eIntervalCount;
+    if (typeof read !== 'function') {
+      throw new Error('trackIntervals(page) was not installed before page.goto');
+    }
+    return read(ms) as number;
+  }, delay);
+}
