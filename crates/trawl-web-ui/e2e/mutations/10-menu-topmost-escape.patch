@@ -1,0 +1,14 @@
+diff --git a/crates/fleet-ui/src/menu.rs b/crates/fleet-ui/src/menu.rs
+index b267b112..056e35f9 100644
+--- a/crates/fleet-ui/src/menu.rs
++++ b/crates/fleet-ui/src/menu.rs
+@@ -222,9 +222,6 @@ mod component {
+         close: impl Fn(MenuClose) + Copy + 'static,
+     ) {
+         let _ = use_event_listener(use_window(), ev::keydown, move |e| {
+-            if !layer.is_topmost() {
+-                return;
+-            }
+             if e.key() == "Escape" {
+                 e.prevent_default();
+                 close(MenuClose::Escape);

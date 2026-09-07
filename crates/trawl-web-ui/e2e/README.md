@@ -135,11 +135,16 @@ one thing the suite is supposed to catch:
 | `05-search-url-codec.patch` | `encode_range` writes the retired `abs:<from>:<to>` form again | `search-url.spec.ts` |
 | `06-repin-poll-leak.patch` | `on_cleanup` leaks the field case drawer's repin poll `Interval` | `repin-poll-teardown.spec.ts` |
 | `07-repin-alive-latch.patch` | the drawer's `is_alive` latch always answers true, so a status read landing after teardown acts on a dead surface | `repin-poll-teardown.spec.ts` |
+| `08-menu-walk.patch` | `roving::next_index` answers `current` for every navigation, so arrows, Home and End all stand still | `topbar-menu.spec.ts` |
+| `09-menu-roving-tabindex.patch` | every menu item renders `tabindex="0"`, so the menu has as many tab stops as it has items | `actions-menu.spec.ts` |
+| `10-menu-topmost-escape.patch` | the menu's Escape listener drops its `is_topmost` guard and answers Escape from under a modal | `topbar-menu.spec.ts` |
+| `11-menu-restore-before-callback.patch` | activating an item closes the menu and runs the callback without restoring the trigger | `actions-menu.spec.ts` |
+| `12-toast-dismiss-span.patch` | the toast dismiss goes back to a `<span class="x">` with the same click and no name | `native-controls.spec.ts` |
 
 Run the mechanism:
 
 ```sh
-crates/trawl-web-ui/e2e/scripts/mutation-check.sh                     # all seven
+crates/trawl-web-ui/e2e/scripts/mutation-check.sh                     # all twelve
 crates/trawl-web-ui/e2e/scripts/mutation-check.sh 02-editor-onchange.patch  # just one
 ```
 
@@ -152,6 +157,14 @@ launch failure as executed-and-failed tests rather than as no tests. It
 refuses to run against a dirty working tree, since a patch that can't be
 cleanly reverted would strand a mutation in your tree. This is evidence
 tooling for reviewing the suite's own effectiveness, not a CI job.
+
+08 through 11 are focus-order sensitive: the thing they break is
+where `document.activeElement` ends up after a keypress, and a browser
+can lose a focus race that a network assertion would never notice. So
+each of the four was run five consecutive times, as five separate
+invocations, and killed all five (transcripts under
+`visual-evidence/issue-159/`). 12 is a DOM-shape mutation with no timing
+in it and was run once.
 
 Two of these mutations are worth reading before you trust the table.
 

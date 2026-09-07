@@ -10,7 +10,7 @@
 # exits 0 only if every requested mutation was killed.
 #
 # Usage:
-#   e2e/scripts/mutation-check.sh                 # run all seven
+#   e2e/scripts/mutation-check.sh                 # run all twelve
 #   e2e/scripts/mutation-check.sh 02-editor-onchange.patch   # just one
 #
 # Refuses to run against a dirty tree — a patch applied on top of your
@@ -50,6 +50,11 @@ declare -A SPEC_FOR=(
   [05-search-url-codec.patch]="search-url.spec.ts"
   [06-repin-poll-leak.patch]="repin-poll-teardown.spec.ts"
   [07-repin-alive-latch.patch]="repin-poll-teardown.spec.ts"
+  [08-menu-walk.patch]="topbar-menu.spec.ts"
+  [09-menu-roving-tabindex.patch]="actions-menu.spec.ts"
+  [10-menu-topmost-escape.patch]="topbar-menu.spec.ts"
+  [11-menu-restore-before-callback.patch]="actions-menu.spec.ts"
+  [12-toast-dismiss-span.patch]="native-controls.spec.ts"
 )
 
 # patch-file -> a CONTROL spec the mutation does NOT touch, which must
@@ -67,6 +72,11 @@ declare -A CONTROL_FOR=(
   [05-search-url-codec.patch]="routing.spec.ts"
   [06-repin-poll-leak.patch]="routing.spec.ts"
   [07-repin-alive-latch.patch]="routing.spec.ts"
+  [08-menu-walk.patch]="routing.spec.ts"
+  [09-menu-roving-tabindex.patch]="routing.spec.ts"
+  [10-menu-topmost-escape.patch]="routing.spec.ts"
+  [11-menu-restore-before-callback.patch]="routing.spec.ts"
+  [12-toast-dismiss-span.patch]="routing.spec.ts"
 )
 
 PATCHES=()
@@ -81,6 +91,11 @@ else
     05-search-url-codec.patch
     06-repin-poll-leak.patch
     07-repin-alive-latch.patch
+    08-menu-walk.patch
+    09-menu-roving-tabindex.patch
+    10-menu-topmost-escape.patch
+    11-menu-restore-before-callback.patch
+    12-toast-dismiss-span.patch
   )
 fi
 

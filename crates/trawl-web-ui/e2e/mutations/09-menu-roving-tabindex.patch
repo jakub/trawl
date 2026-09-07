@@ -1,0 +1,13 @@
+diff --git a/crates/fleet-ui/src/menu.rs b/crates/fleet-ui/src/menu.rs
+index b267b112..af064154 100644
+--- a/crates/fleet-ui/src/menu.rs
++++ b/crates/fleet-ui/src/menu.rs
+@@ -285,7 +285,7 @@ mod component {
+                         class=class
+                         type="button"
+                         role="menuitem"
+-                        tabindex=move || if focused.get() == index { "0" } else { "-1" }
++                        tabindex=move || if focused.get() == index { "0" } else { "0" }
+                         on:focus=move |_| focused.set(index)
+                         on:click=move |e: web_sys::MouseEvent| {
+                             if stop_click_propagation {
