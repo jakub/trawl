@@ -237,6 +237,47 @@ async function capture(browser, theme) {
   };
 }
 
+// Readiness is the CHILD's own "listening" line, never a 200 from the
+// port: a harness left by another worktree (or a parallel capture on
+// the default port) answers /__ctl/health just as happily, and the
+// script would then photograph THAT checkout's dist and reset THAT
+// run's scenario while our own child had already died with
+// EADDRINUSE. Same rule as playwright.config.ts's
+// `reuseExistingServer: false` — a port collision fails loudly.
+function waitForOwnedListener(child) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const done = (fn, v) => {
+      if (!settled) {
+        settled = true;
+        fn(v);
+      }
+    };
+    const timer = setTimeout(
+      () => done(reject, new Error(`capture: stub server did not report listening on ${BASE} within 10s`)),
+      10_000,
+    );
+    child.stdout.setEncoding('utf8');
+    let buf = '';
+    child.stdout.on('data', (chunk) => {
+      process.stdout.write(chunk);
+      buf += chunk;
+      if (buf.includes(`listening on http://127.0.0.1:${PORT}`)) {
+        clearTimeout(timer);
+        done(resolve);
+      }
+    });
+    child.on('error', (e) => {
+      clearTimeout(timer);
+      done(reject, e);
+    });
+    child.on('exit', (code, signal) => {
+      clearTimeout(timer);
+      done(reject, new Error(`capture: stub server exited before listening (code ${code}, signal ${signal}); is ${BASE} already in use?`));
+    });
+  });
+}
+
 async function waitForHealth() {
   for (let i = 0; i < 100; i += 1) {
     try {
@@ -253,10 +294,11 @@ async function waitForHealth() {
 const server = spawn('node', ['harness/server.mjs'], {
   cwd: E2E_DIR,
   env: { ...process.env, E2E_PORT: String(PORT) },
-  stdio: ['ignore', 'inherit', 'inherit'],
+  stdio: ['ignore', 'pipe', 'inherit'],
 });
 
 try {
+  await waitForOwnedListener(server);
   await waitForHealth();
   await fs.mkdir(OUT, { recursive: true });
   const browser = await chromium.launch();
