@@ -439,3 +439,43 @@ full and still killed.
 mutation-check results:
 patch                        outcome
 05-search-url-codec.patch    PASS (target spec failed, control passed, exit 1)
+
+----------------------------------------------------------------------
+
+Addendum, 2026-09-07T00:25Z — re-run at 6a5a567f (the control gate and
+the raw-search bound)
+
+All five patches still apply and were re-run one per invocation:
+
+patch                        outcome
+01-route.patch               PASS (target spec failed, control passed, exit 1)
+02-editor-onchange.patch     PASS (target spec failed, control passed, exit 1)
+03-sse-teardown.patch        FAIL (suite passed despite the mutation)
+04-error-fallback.patch      PASS (target spec failed, control passed, exit 1)
+05-search-url-codec.patch    PASS (target spec failed, control passed, exit 1)
+
+03 no longer kills, and it is not this branch's doing. Probed by
+checking the WHOLE crate back out at e50593c1 — the exact tree the
+22:53 run above killed it on — applying the same patch, rebuilding and
+running teardown-sse.spec.ts: both tests passed there too. Reverting
+only pages/search.rs, or only the state/search_url half, gave the same
+answer. So the difference is outside the tree.
+
+What the mutation does is forget the StreamLifecycle handle in the
+component's on_cleanup, and what makes that observable is WHICH path
+closes the EventSource on unmount. There are two: the explicit
+on_cleanup, and the live-tail Effect, which re-runs when the rail link
+changes the router location and clears the same slot before returning
+early. If the effect re-runs before the component is disposed, the
+stream closes anyway and the mutation is invisible; if disposal wins,
+the forgotten handle leaks and the spec sees `opens` climb. That order
+is leptos's effect scheduling against owner disposal, not anything the
+spec or the app states, so the kill was always a race — it happened to
+land one way at 22:53 and the other way now.
+
+The app behaviour is unchanged and correct in both directions: on the
+unmutated tree both teardown tests pass, the EventSource closes and the
+16ms render timer is released. What is lost is the PROOF that the
+explicit cleanup is the thing doing it. Making that deterministic means
+changing how the live tail is torn down, which is a bigger change than
+either commit here.
