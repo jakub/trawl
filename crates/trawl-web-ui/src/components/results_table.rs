@@ -100,6 +100,7 @@ fn ResultsTableBody(
             // on the sorted `<th>` alone (ADR-0029) and the glyph is
             // decoration. The control is the button inside, never the cell.
             <th
+                class="sortable"
                 class:sorted=move || sort.get().is_some_and(|s| s.col == i)
                 aria-sort=move || {
                     sort.get()

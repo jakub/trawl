@@ -781,12 +781,14 @@
 }
 /* The header cell keeps its sticky box; the button inside it is the
  * control (ADR-0029) and takes the whole cell so the click target is
- * unchanged. */
+ * unchanged. The cell's own padding moves onto the button: left on the
+ * `<th>` it would be dead space that no longer sorts. */
+.results-table thead th.sortable { padding: 0; }
 .results-table thead th .th-sort {
   font: inherit;
   background: none;
   border: 0;
-  padding: 0;
+  padding: 6px var(--row-pad-x);
   color: inherit;
   cursor: pointer;
   user-select: none;
@@ -1106,6 +1108,9 @@
   cursor: pointer; user-select: none;
   width: 100%; display: flex; align-items: center; gap: 3px;
   justify-content: inherit;
+  /* The cell centres its children; the control has to fill it, or the
+   * cell's own height above and below the label stops sorting. */
+  align-self: stretch;
 }
 .th.sortable:hover { color: var(--ink-2); }
 .th.sortable.active { color: var(--ink); }
