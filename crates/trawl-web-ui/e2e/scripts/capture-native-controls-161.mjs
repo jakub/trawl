@@ -169,14 +169,32 @@ async function present(page, selector, timeout = 4000) {
   }
 }
 
+/** Launch, capture, and close both halves whatever happens.
+ *
+ * Any step below can throw: a selector that never appears, a click that
+ * times out. An early return used to leave the chromium process running
+ * until the shell noticed it. The two `finally`s nest, so the context
+ * closes first and the browser closes even if that close fails. */
 async function run() {
   const browser = await chromium.launch();
-  const context = await browser.newContext({
-    viewport: VIEWPORT,
-    colorScheme: 'light',
-    locale: 'en-US',
-    timezoneId: 'UTC',
-  });
+  try {
+    const context = await browser.newContext({
+      viewport: VIEWPORT,
+      colorScheme: 'light',
+      locale: 'en-US',
+      timezoneId: 'UTC',
+    });
+    try {
+      return await capture(context);
+    } finally {
+      await context.close();
+    }
+  } finally {
+    await browser.close();
+  }
+}
+
+async function capture(context) {
   // The corpus query fixture carries no `degraded_fields`, and that one
   // wire field is the only thing that renders the results notice whose
   // dismiss button (`.deg-x`) lost its outline override. Adding it at
@@ -421,8 +439,6 @@ async function run() {
     focus: '.sd-drawer .tbl-body .row-stretch',
   });
 
-  await context.close();
-  await browser.close();
   return shots;
 }
 
