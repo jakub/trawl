@@ -30,8 +30,10 @@ use super::variant::{Size, Variant, btn_class};
 /// the natively-tested [`btn_class`].
 ///
 /// `stop_propagation` stops the click from bubbling before `on_click`
-/// runs — for buttons nested inside clickable rows (results-table quick
-/// actions, lineage entries).
+/// runs. No trawl caller needs it any more: ADR-0029 left trawl-web-ui
+/// with no clickable rows to escape. It stays for a consumer that still
+/// nests a control inside a pointer-handling ancestor, which today
+/// means coastwatch.
 #[component]
 pub fn Btn(
     variant: Variant,

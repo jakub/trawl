@@ -313,7 +313,7 @@
    * the row paints: bare panel at rest and on keyboard focus, the hover
    * wash on hover, the selected wash over panel when included. Without
    * it a long value would read through the glyphs; the cost is that the
-   * `.bar` frequency tail is hidden under these 46px while revealed. */
+   * `.bar` frequency tail is hidden under these 48px while revealed. */
   background: var(--panel);
 }
 .facets .v:hover .act,
