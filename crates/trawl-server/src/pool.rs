@@ -41,6 +41,7 @@ use parking_lot::Mutex;
 use std::time::Duration;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use trawl_engine::cancel::CancelLatch;
 use trawl_engine::executor::Executor;
 use trawl_engine::value::QueryResult;
 
@@ -180,7 +181,14 @@ struct InterruptSlot {
     /// Cancellation was requested. Never cleared: a repeat cancellation is
     /// accepted while the work exists, and an acknowledgement means
     /// requested, not stopped.
-    cancel_requested: bool,
+    ///
+    /// Written only inside the registry lock, so the decisions that read
+    /// it here — publish the handle, start the work — stay serialized
+    /// against invocation. It is an atomic because the executor reads the
+    /// same flag from its blocking thread at the bind-to-execute boundary
+    /// ([`WorkSlot::cancel_latch`]), where taking the registry lock would
+    /// put a `DuckDB` bind inside it.
+    cancelled: Arc<AtomicBool>,
 }
 
 /// The accounting half of a registered unit of work.
@@ -230,7 +238,7 @@ impl Registry {
         let Some(slot) = self.interrupts.get_mut(&id) else {
             return false;
         };
-        slot.cancel_requested = true;
+        slot.cancelled.store(true, Ordering::SeqCst);
         if let Some(handle) = &slot.handle {
             handle.interrupt();
         }
@@ -298,6 +306,10 @@ struct WorkSlot {
     /// lock. It outlives the registry entry, so a request that finds the
     /// entry already gone still classifies its own outcome correctly.
     started: Arc<AtomicBool>,
+    /// The registry's cancellation flag for this work, shared so the
+    /// executor can read it without the registry lock
+    /// ([`WorkSlot::cancel_latch`]).
+    cancelled: Arc<AtomicBool>,
     executor: Option<Executor>,
     publication: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
     permit: Option<OwnedSemaphorePermit>,
@@ -321,12 +333,25 @@ impl WorkSlot {
     fn publish_interrupt(&self, handle: Arc<duckdb::InterruptHandle>) -> bool {
         let mut registry = self.registry.lock();
         match registry.interrupts.get_mut(&self.id) {
-            Some(slot) if !slot.cancel_requested => {
+            Some(slot) if !slot.cancelled.load(Ordering::SeqCst) => {
                 slot.handle = Some(handle);
                 true
             }
             _ => false,
         }
+    }
+
+    /// The flag the executor reads at its bind-to-execute boundary.
+    ///
+    /// `DuckDB`'s interrupt is the first half of stopping work and cannot
+    /// be the whole of it: an interrupt raised while a statement is
+    /// binding may be swallowed, and binding is where an expensive query
+    /// spends its time (ADR-0024). Handing the same flag
+    /// [`Registry::request_cancel`] sets to the engine gives that
+    /// cancellation a second, reliable place to land — after the bind,
+    /// before execution — without a lock on the blocking thread's path.
+    fn cancel_latch(&self) -> CancelLatch {
+        CancelLatch::new(Arc::clone(&self.cancelled))
     }
 
     /// The work-start transition: the moment a permit becomes physical
@@ -348,7 +373,7 @@ impl WorkSlot {
         if registry
             .interrupts
             .get(&self.id)
-            .is_some_and(|slot| slot.cancel_requested)
+            .is_some_and(|slot| slot.cancelled.load(Ordering::SeqCst))
         {
             return Err(StartRefusal::Cancelled);
         }
@@ -865,6 +890,7 @@ impl std::fmt::Debug for ExecutorPool {
 #[allow(clippy::too_many_arguments)]
 fn run_query_blocking(
     executor: &Executor,
+    cancel: &CancelLatch,
     dsl: &str,
     source: &str,
     hot_buffer: Option<&Arc<HotBuffer>>,
@@ -913,6 +939,7 @@ fn run_query_blocking(
             // Safety: we verified UTF-8 validity above.
             let hot_path = hot.path().to_str().unwrap_or_default();
             executor
+                .cancellable(cancel)
                 .run_query_with_hot(
                     dsl,
                     source,
@@ -925,6 +952,7 @@ fn run_query_blocking(
                 .map_err(ServerError::from)
         } else {
             executor
+                .cancellable(cancel)
                 .run_query(dsl, source, pins, max_result_rows, utc_offset_secs)
                 .map_err(ServerError::from)
         }
@@ -1146,11 +1174,12 @@ impl ExecutorPool {
             );
             return Err(ServerError::Internal("executor pool inconsistent".into()));
         };
+        let cancelled = Arc::new(AtomicBool::new(false));
         registry.interrupts.insert(
             id,
             InterruptSlot {
                 handle: None,
-                cancel_requested: false,
+                cancelled: Arc::clone(&cancelled),
             },
         );
         registry.retained.insert(
@@ -1172,6 +1201,7 @@ impl ExecutorPool {
             id,
             kind: work.kind,
             started: Arc::new(AtomicBool::new(false)),
+            cancelled,
             executor: Some(executor),
             publication,
             permit: Some(permit),
@@ -1433,6 +1463,7 @@ impl ExecutorPool {
                     let pins = field_catalog.all();
                     let (result, debug) = run_query_blocking(
                         slot.executor(),
+                        &slot.cancel_latch(),
                         &dsl,
                         &source,
                         hot_buffer.as_ref(),
@@ -1613,6 +1644,7 @@ impl ExecutorPool {
                     let pins = field_catalog.all();
                     let (result, debug) = run_query_blocking(
                         slot.executor(),
+                        &slot.cancel_latch(),
                         &dsl,
                         &source,
                         None,
@@ -2009,7 +2041,8 @@ impl ExecutorPool {
                         .filter(|s| s.path().to_str().is_some());
 
                     let pins = field_catalog.all();
-                    let executor = slot.executor();
+                    let cancel = slot.cancel_latch();
+                    let executor = slot.executor().cancellable(&cancel);
                     let written = if let Some(ref hot) = hot_snapshot {
                         let hot_path = hot.path().to_str().unwrap_or_default();
                         executor.export_parquet_with_hot(
@@ -3142,6 +3175,70 @@ mod tests {
         );
         until("cleanup", || {
             idle_len(&pool) == baseline_idle && pool.available_permits() == 1
+        })
+        .await;
+        assert!(registry_is_empty(&pool));
+    }
+
+    /// A cancellation that lands after the work started stops it at the
+    /// bind-to-execute boundary (ADR-0024).
+    ///
+    /// The interrupt handle is published by then, but an interrupt raised
+    /// while `DuckDB` is binding may be swallowed — which is exactly the
+    /// case the budget exists for, since binding is where an expensive
+    /// query spends its time. The latch the pool shares with the executor
+    /// is the recovery: the worker reads it once binding is over, and the
+    /// request ends cancelled with no rows.
+    ///
+    /// There is no seam between the bind and the execution, so the
+    /// cancellation is latched with the worker parked at `Started`, one
+    /// statement earlier. The engine reads the same flag either way.
+    #[tokio::test(start_paused = true)]
+    async fn a_latched_cancellation_stops_the_query_at_the_bind_boundary() {
+        let pool = hot_pool(1);
+        let seams = pool.seams();
+        let started = seams.hold(Seam::Started);
+        let baseline_idle = idle_len(&pool);
+        let id = pool.allocate_query_id();
+
+        let submitted = pool.clone();
+        let request = tokio::spawn(async move {
+            submitted
+                .execute(
+                    id,
+                    "*",
+                    Deadline::after(Duration::from_secs(60)),
+                    false,
+                    0,
+                    TEST_WORK,
+                )
+                .await
+        });
+        until("work starts", || started.arrivals() == 1).await;
+        assert!(pool.cancel_by_id(id), "the work is still registered");
+        started.release();
+
+        let outcome = request.await.expect("the request joins");
+        assert!(
+            matches!(
+                &outcome.result,
+                Err(ServerError::Engine(
+                    trawl_engine::error::EngineError::Cancelled
+                ))
+            ),
+            "expected the engine's cancellation, got {:?}",
+            outcome.result
+        );
+        assert_eq!(
+            ServerError::Engine(trawl_engine::error::EngineError::Cancelled).error_class(),
+            "cancelled",
+            "a cancelled run is classified as such, not as a database failure"
+        );
+
+        until("cleanup", || {
+            pool.retained() == 0
+                && idle_len(&pool) == baseline_idle
+                && pool.available_permits() == pool.capacity()
         })
         .await;
         assert!(registry_is_empty(&pool));

@@ -19,11 +19,145 @@ use trawl_core::parser;
 use trawl_core::pin_scope::PinScope;
 use trawl_core::schema::{CanonicalType, FieldTypes};
 
+use crate::cancel::CancelLatch;
 use crate::error::EngineError;
 use crate::value::{Column, QueryResult, SchemaColumn, SchemaResult, Value};
 
 /// Names of the result columns `DuckDB` returned as TIMESTAMP.
 type TimestampColumns = Vec<String>;
+
+/// How many statements the query and export lanes handed `DuckDB` to bind.
+///
+/// The evidence behind "admission refuses before `DuckDB` sees anything"
+/// (ADR-0024): an over-budget pipeline must fail in the emitter, and the
+/// only way to prove no bind happened is to count the binds. There is no
+/// production seam that exposes them, so this is a test-only counter,
+/// compiled for this crate's unit tests and — through the `test-support`
+/// feature and the self dev-dependency — its integration tests. No
+/// production consumer enables the feature, so a release build carries
+/// neither the counter nor the `fetch_add`.
+///
+/// Process-global, so a reader that shares its test binary with binding
+/// tests must serialize against them (see
+/// `tests/complexity_admission.rs`).
+#[cfg(any(test, feature = "test-support"))]
+pub mod prepare_probe {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static PREPARES: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn record() {
+        PREPARES.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Binds counted since the process started.
+    #[must_use]
+    pub fn count() -> u64 {
+        PREPARES.load(Ordering::SeqCst)
+    }
+}
+
+/// One lane bind, counted for the admission tests and nothing else.
+fn record_prepare() {
+    #[cfg(any(test, feature = "test-support"))]
+    prepare_probe::record();
+}
+
+/// The four query and export lanes, bound to a caller's cancellation
+/// latch.
+///
+/// Cancellation is opt-in and explicit: [`Executor`]'s own entry points
+/// keep their signatures and pass [`CancelLatch::never`], so embedded
+/// `--data` and every test are unchanged and cannot silently acquire a
+/// latch, while the pool asks for one by name
+/// ([`Executor::cancellable`]). The lanes behind both doors are the same
+/// code, so the `_raw`-free retry and the hot-only fallback inherit the
+/// latch rather than each remembering to carry it.
+#[derive(Debug)]
+pub struct Cancellable<'a> {
+    executor: &'a Executor,
+    cancel: &'a CancelLatch,
+}
+
+impl Cancellable<'_> {
+    /// [`Executor::run_query`], stopping at the bind-to-execute boundary
+    /// once the latch is set.
+    pub fn run_query(
+        &self,
+        dsl: &str,
+        source: &str,
+        pins: &FieldTypes,
+        max_rows: usize,
+        utc_offset_secs: i32,
+    ) -> Result<QueryResult, EngineError> {
+        self.executor
+            .run_query_latched(dsl, source, pins, max_rows, utc_offset_secs, self.cancel)
+    }
+
+    /// [`Executor::run_query_with_hot`], stopping at the bind-to-execute
+    /// boundary once the latch is set.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_query_with_hot(
+        &self,
+        dsl: &str,
+        source: &str,
+        hot_source: &str,
+        hot_pins: &FieldTypes,
+        pins: &FieldTypes,
+        max_rows: usize,
+        utc_offset_secs: i32,
+    ) -> Result<QueryResult, EngineError> {
+        self.executor.run_query_with_hot_latched(
+            dsl,
+            source,
+            hot_source,
+            hot_pins,
+            pins,
+            max_rows,
+            utc_offset_secs,
+            self.cancel,
+        )
+    }
+
+    /// [`Executor::export_parquet`], stopping at the bind-to-execute
+    /// boundary once the latch is set.
+    pub fn export_parquet(
+        &self,
+        dsl: &str,
+        source: &str,
+        pins: &FieldTypes,
+        output_path: &Path,
+        max_rows: usize,
+    ) -> Result<(), EngineError> {
+        self.executor
+            .export_parquet_latched(dsl, source, pins, output_path, max_rows, self.cancel)
+    }
+
+    /// [`Executor::export_parquet_with_hot`], stopping at the
+    /// bind-to-execute boundary once the latch is set.
+    #[allow(clippy::too_many_arguments)]
+    pub fn export_parquet_with_hot(
+        &self,
+        dsl: &str,
+        source: &str,
+        hot_source: &str,
+        hot_pins: &FieldTypes,
+        pins: &FieldTypes,
+        output_path: &Path,
+        max_rows: usize,
+    ) -> Result<(), EngineError> {
+        self.executor.export_parquet_with_hot_latched(
+            dsl,
+            source,
+            hot_source,
+            hot_pins,
+            pins,
+            output_path,
+            max_rows,
+            self.cancel,
+        )
+    }
+}
 
 /// Query executor backed by an in-memory `DuckDB` connection.
 #[derive(Debug)]
@@ -86,6 +220,22 @@ impl Executor {
         self.conn.interrupt_handle()
     }
 
+    /// Run the query and export lanes under a caller's cancellation latch.
+    ///
+    /// The interrupt handle above is the first half of stopping work and
+    /// cannot be the whole of it: an interrupt raised while `DuckDB` is
+    /// binding may be swallowed, and binding is where an over-budget
+    /// query spends its time (ADR-0024). The latch is read at the
+    /// bind-to-execute boundary, so a cancellation that the interrupt
+    /// missed still prevents execution.
+    #[must_use]
+    pub fn cancellable<'a>(&'a self, cancel: &'a CancelLatch) -> Cancellable<'a> {
+        Cancellable {
+            executor: self,
+            cancel,
+        }
+    }
+
     /// Lightweight health check: runs `SELECT 1` to verify the connection is alive.
     pub fn ping(&self) -> Result<(), EngineError> {
         self.conn
@@ -111,11 +261,31 @@ impl Executor {
         max_rows: usize,
         utc_offset_secs: i32,
     ) -> Result<QueryResult, EngineError> {
+        self.run_query_latched(
+            dsl,
+            source,
+            pins,
+            max_rows,
+            utc_offset_secs,
+            &CancelLatch::never(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_query_latched(
+        &self,
+        dsl: &str,
+        source: &str,
+        pins: &FieldTypes,
+        max_rows: usize,
+        utc_offset_secs: i32,
+        cancel: &CancelLatch,
+    ) -> Result<QueryResult, EngineError> {
         let ast = parser::parse(dsl).map_err(EngineError::Parse)?;
         let resolved = self.resolve_source(source);
         let emitted = resolved.emit_cold(&ast, pins, EvalContext::capture())?;
         let sql_offset = sql_render_offset(&emitted, utc_offset_secs);
-        let outcome = self.execute_emitted_tracked(&emitted, max_rows, sql_offset);
+        let outcome = self.execute_emitted_tracked(&emitted, max_rows, sql_offset, cancel);
         // Same gate as the hot lanes, one column over: with no hot buffer to
         // fall back to, `HotOnly` is unreachable (see [`cold_action`]) — but a
         // "no files" answer over a source that still reaches files is the
@@ -169,12 +339,36 @@ impl Executor {
         max_rows: usize,
         utc_offset_secs: i32,
     ) -> Result<QueryResult, EngineError> {
+        self.run_query_with_hot_latched(
+            dsl,
+            source,
+            hot_source,
+            hot_pins,
+            pins,
+            max_rows,
+            utc_offset_secs,
+            &CancelLatch::never(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_query_with_hot_latched(
+        &self,
+        dsl: &str,
+        source: &str,
+        hot_source: &str,
+        hot_pins: &FieldTypes,
+        pins: &FieldTypes,
+        max_rows: usize,
+        utc_offset_secs: i32,
+        cancel: &CancelLatch,
+    ) -> Result<QueryResult, EngineError> {
         let ast = parser::parse(dsl).map_err(EngineError::Parse)?;
         let resolved = self.resolve_source(source);
         let emitted =
             resolved.emit_union(&ast, hot_source, hot_pins, pins, EvalContext::capture())?;
         let sql_offset = sql_render_offset(&emitted, utc_offset_secs);
-        let outcome = self.execute_emitted_tracked(&emitted, max_rows, sql_offset);
+        let outcome = self.execute_emitted_tracked(&emitted, max_rows, sql_offset, cancel);
 
         // A hot value disagreeing with a catalog pin is already conformed on
         // the union's hot branch by the emitter (TRY_CAST to NULL), and
@@ -207,7 +401,7 @@ impl Executor {
                 // (ADR-0017 §3).
                 let hot_emitted =
                     emitter::emit_hot_only(&ast, hot_source, hot_pins, pins, emitted.anchor)?;
-                match self.execute_emitted_tracked(&hot_emitted, max_rows, sql_offset) {
+                match self.execute_emitted_tracked(&hot_emitted, max_rows, sql_offset, cancel) {
                     // Hot-only also hit a binder/emit error (e.g. empty ndjson
                     // between compaction cycles). Treat as empty, not error.
                     Err(EngineError::Emit(_)) => (QueryResult::empty(), TimestampColumns::new()),
@@ -245,7 +439,7 @@ impl Executor {
         max_rows: usize,
         utc_offset_secs: i32,
     ) -> Result<QueryResult, EngineError> {
-        self.execute_emitted_tracked(query, max_rows, utc_offset_secs)
+        self.execute_emitted_tracked(query, max_rows, utc_offset_secs, &CancelLatch::never())
             .map(|(result, _)| result)
     }
 
@@ -260,9 +454,10 @@ impl Executor {
         query: &EmittedQuery,
         max_rows: usize,
         utc_offset_secs: i32,
+        cancel: &CancelLatch,
     ) -> Result<(QueryResult, TimestampColumns), EngineError> {
         with_raw_fallback(query, |q| {
-            self.execute_emitted_once(q, max_rows, utc_offset_secs)
+            self.execute_emitted_once(q, max_rows, utc_offset_secs, cancel)
         })
     }
 
@@ -271,7 +466,13 @@ impl Executor {
         query: &EmittedQuery,
         max_rows: usize,
         utc_offset_secs: i32,
+        cancel: &CancelLatch,
     ) -> Result<(QueryResult, TimestampColumns), EngineError> {
+        // Before the bind, so a cancellation that landed during the first
+        // attempt's bind stops the `_raw`-free retry and the hot-only
+        // fallback from starting a second one.
+        cancel.check()?;
+        record_prepare();
         let mut stmt = match self.conn.prepare(&query.sql) {
             Ok(s) => s,
             Err(e) if is_no_files_error(&e) => {
@@ -283,6 +484,12 @@ impl Executor {
 
         let params = bind_params(&query.params);
         let param_refs: Vec<&dyn duckdb::ToSql> = params.iter().map(AsRef::as_ref).collect();
+
+        // The bind-to-execute boundary (ADR-0024). A long bind is where an
+        // interrupt is most likely to be swallowed, so the latch is read
+        // here rather than trusting that one to have survived every
+        // `DuckDB` API phase.
+        cancel.check()?;
 
         // start query execution — column metadata is only available
         // after DuckDB resolves table-valued functions like read_parquet()
@@ -541,10 +748,30 @@ impl Executor {
         output_path: &Path,
         max_rows: usize,
     ) -> Result<(), EngineError> {
+        self.export_parquet_latched(
+            dsl,
+            source,
+            pins,
+            output_path,
+            max_rows,
+            &CancelLatch::never(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn export_parquet_latched(
+        &self,
+        dsl: &str,
+        source: &str,
+        pins: &FieldTypes,
+        output_path: &Path,
+        max_rows: usize,
+        cancel: &CancelLatch,
+    ) -> Result<(), EngineError> {
         let ast = parser::parse(dsl).map_err(EngineError::Parse)?;
         let resolved = self.resolve_source(source);
         let emitted = resolved.emit_cold(&ast, pins, EvalContext::capture())?;
-        let outcome = self.export_parquet_from_emitted(&emitted, output_path, max_rows);
+        let outcome = self.export_parquet_from_emitted(&emitted, output_path, max_rows, cancel);
         // The same gate the query lanes run, on the same classification. An
         // all-missing source keeps surfacing DuckDB's own "no files" error
         // here — deliberately loud, since there is no empty answer an export
@@ -593,11 +820,35 @@ impl Executor {
         output_path: &Path,
         max_rows: usize,
     ) -> Result<(), EngineError> {
+        self.export_parquet_with_hot_latched(
+            dsl,
+            source,
+            hot_source,
+            hot_pins,
+            pins,
+            output_path,
+            max_rows,
+            &CancelLatch::never(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn export_parquet_with_hot_latched(
+        &self,
+        dsl: &str,
+        source: &str,
+        hot_source: &str,
+        hot_pins: &FieldTypes,
+        pins: &FieldTypes,
+        output_path: &Path,
+        max_rows: usize,
+        cancel: &CancelLatch,
+    ) -> Result<(), EngineError> {
         let ast = parser::parse(dsl).map_err(EngineError::Parse)?;
         let resolved = self.resolve_source(source);
         let emitted =
             resolved.emit_union(&ast, hot_source, hot_pins, pins, EvalContext::capture())?;
-        let outcome = self.export_parquet_from_emitted(&emitted, output_path, max_rows);
+        let outcome = self.export_parquet_from_emitted(&emitted, output_path, max_rows, cancel);
 
         match self.cold_action_for(
             classify_export_outcome(&outcome),
@@ -615,7 +866,7 @@ impl Executor {
                 // it replaces (ADR-0017 §3).
                 let hot_emitted =
                     emitter::emit_hot_only(&ast, hot_source, hot_pins, pins, emitted.anchor)?;
-                self.export_parquet_from_emitted(&hot_emitted, output_path, max_rows)
+                self.export_parquet_from_emitted(&hot_emitted, output_path, max_rows, cancel)
             }
             // Same invariant as `export_parquet`: only an `is_no_files_error`
             // reaches `NoColumns`, so the discarded error text is always that
@@ -631,9 +882,10 @@ impl Executor {
         emitted: &EmittedQuery,
         output_path: &Path,
         max_rows: usize,
+        cancel: &CancelLatch,
     ) -> Result<(), EngineError> {
         with_raw_fallback(emitted, |q| {
-            self.export_parquet_from_emitted_once(q, output_path, max_rows)
+            self.export_parquet_from_emitted_once(q, output_path, max_rows, cancel)
         })
     }
 
@@ -642,7 +894,11 @@ impl Executor {
         emitted: &EmittedQuery,
         output_path: &Path,
         max_rows: usize,
+        cancel: &CancelLatch,
     ) -> Result<(), EngineError> {
+        // Same rule as the query lane: no second bind starts once the
+        // caller has asked for this work to stop.
+        cancel.check()?;
         if !emitted.rust_stages.is_empty() {
             return Err(EngineError::Emit(
                 trawl_core::emitter::EmitError::UnsupportedOperation {
@@ -678,8 +934,16 @@ impl Executor {
             let _ = conn.execute_batch("DROP TABLE IF EXISTS __trawl_export");
         };
 
+        record_prepare();
         match self.conn.prepare(&create_sql) {
             Ok(mut stmt) => {
+                // The export's bind-to-execute boundary: the staging
+                // SELECT is the whole query, so this is the same bind the
+                // query lane pays and the same recovery applies.
+                if cancel.latched() {
+                    cleanup(&self.conn);
+                    return Err(EngineError::Cancelled);
+                }
                 if let Err(e) = stmt.execute(param_refs.as_slice()) {
                     cleanup(&self.conn);
                     return Err(e.into());
@@ -881,7 +1145,13 @@ fn with_raw_fallback<T>(
         raw_free_sql: None,
         ..query.clone()
     };
-    attempt(&fallback).map_err(|_| err)
+    attempt(&fallback).map_err(|e| match e {
+        // A cancellation the retry hit is its own answer: reporting the
+        // first attempt's missing-column error would tell the caller its
+        // query was wrong when the caller is the one who stopped it.
+        EngineError::Cancelled => e,
+        _ => err,
+    })
 }
 
 /// Whether an engine failure is "a column in the query does not exist in the

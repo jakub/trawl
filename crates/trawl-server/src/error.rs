@@ -157,6 +157,7 @@ impl ServerError {
             Self::Engine(EngineError::Database(_)) => "database",
             Self::Engine(EngineError::ResultTooLarge(_)) => "result_too_large",
             Self::Engine(EngineError::ColdDataUnread) => "cold_data_unread",
+            Self::Engine(EngineError::Cancelled) => "cancelled",
             Self::Engine(EngineError::Io(_)) => "io",
             Self::Store(_) => "store",
             Self::Unauthorized(_) => "unauthorized",
@@ -264,7 +265,18 @@ impl IntoResponse for ServerError {
                 ),
             ),
             // Database/IO errors are server-side — don't leak details.
-            Self::Engine(EngineError::Database(_) | EngineError::Io(_)) => (
+            //
+            // A cancellation caught at the bind-to-execute boundary answers
+            // here too, deliberately: cancelling a running query has always
+            // surfaced as `DuckDB`'s interrupted execution, and the latch
+            // exists to catch the same request when the interrupt was
+            // swallowed during a bind (ADR-0024). One request, one answer —
+            // the latch does not earn the caller a different status than the
+            // interrupt it backs up. `error_class` still tells the two apart
+            // for telemetry.
+            Self::Engine(
+                EngineError::Database(_) | EngineError::Io(_) | EngineError::Cancelled,
+            ) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ErrorEnvelope::simple(ErrorCode::ExecutionError, "query execution failed"),
             ),
