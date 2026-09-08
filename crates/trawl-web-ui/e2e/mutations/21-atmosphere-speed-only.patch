@@ -1,0 +1,10 @@
+--- a/crates/fleet-ui/vendor/src/paper-shaders.ts
++++ b/crates/fleet-ui/vendor/src/paper-shaders.ts
+@@ -197,7 +197,6 @@
+   // later theme or reduced-motion effects cannot restart the mount.
+   const onContextLost = (): void => {
+     if (state !== "live") return;
+-    state = "dead";
+     try {
+       mount.setSpeed(0);
+     } finally {

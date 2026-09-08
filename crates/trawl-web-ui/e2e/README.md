@@ -191,6 +191,7 @@ one thing the suite is supposed to catch:
 | `17-range-dialog-no-layer.patch` | the range dialog drops its `use_overlay_layer_with` registration: no opener capture, no initial focus, no Tab trap, no restore | `range-dialog.spec.ts` |
 | `18-facet-actions-display-none.patch` | `.facets .v .act` goes back to `display: none` until hover, which takes include and exclude out of the tab order | `facets.spec.ts` |
 | `19-results-th-no-aria-sort.patch` | `aria-sort` comes off the results `<th>`, so the sorted column and its direction are announced nowhere | `sort-headers.spec.ts` |
+| `21-atmosphere-speed-only.patch` | Delete only the terminal dead assignment, keeping speed zero and hidden canvas; reactive motion changes restart shader rAF | `atmosphere-fallback.spec.ts`, dedicated `scripts/atmosphere-mutation-check.sh` |
 
 Run the mechanism:
 
@@ -305,3 +306,30 @@ EventSource observer then proves the terminal error callback ran before the
 second Forbidden assertion. A reconnect before any snapshot must keep the
 waiting label. Cancellation HTTP 500, 502, and 504 report an unknown outcome;
 HTTP 403 reports a definite refusal.
+
+Mutation 21 uses its own runner because it changes only the vendored JavaScript.
+After committing a clean baseline and building the SPA, run
+`E2E_PORT=8167 bash crates/trawl-web-ui/e2e/scripts/atmosphere-mutation-check.sh`.
+`TRAWL_E2E_DIST` can name another baseline dist. The runner requires exactly one
+shader snippet identical to the committed bundle, passes the baseline loss test,
+removes only `state = "dead"`, rebuilds the vendor bundle, and copies that bundle
+into the existing snippet and updates only its modulepreload integrity digest.
+It accepts only the loss test's
+`ATMOSPHERE_NO_RESTART` assertion as the failure, then requires the unaffected
+compile-failure control to pass. Exit and signal traps restore and byte-check
+the source, bundle, dist snippet and index. CI's `atmosphere-mutation` job downloads
+the same dist as the passing `web-ui-e2e` job and needs no Rust rebuild.
+
+The atmosphere spec forces no-WebGL, compile, link and late constructor failures.
+Its loss test overrides reduced motion, requires real rendered frames and a real
+`WEBGL_lose_context` event, and counts only callbacks scheduled by the shader
+snippet. It retains the original host through SPA unmount to inspect cleanup.
+Expected shader diagnostics must remain silent, while an unrelated diagnostic
+inside construction and another after construction must reach the console.
+
+The login page has no theme control. Its loss test exercises the actual
+reduced-motion effect; a separate browser test imports the unique emitted
+shader module and calls its real public handle. That test first proves a live
+color change reaches GL uniforms, then proves color and speed changes issue no
+GL calls or shader callbacks after loss and after repeated disposal. No test
+changes Rust signal access or framework callback lifetimes.
