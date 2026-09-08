@@ -6,10 +6,11 @@
 //!
 //! Header (title, plus "Clear all" once a filter is set), a filter
 //! input, plus per-field collapsible groups with proportional value
-//! bars and hover-only include/exclude actions. Clicking `+` / `⊘` on a
-//! value adds an include / exclude `Filter` to the shared filters
-//! signal; the parent owns state and re-runs the query via URL
-//! navigation.
+//! bars and include/exclude actions the row reveals on hover or focus
+//! (opacity, never `display: none`, so the buttons keep their place in
+//! the tab order — ADR-0029). Pressing `+` / `⊘` on a value adds an
+//! include / exclude `Filter` to the shared filters signal; the parent
+//! owns state and re-runs the query via URL navigation.
 
 use std::collections::HashMap;
 
@@ -54,10 +55,11 @@ pub fn FacetSidebar(
             <div class="phead">
                 <div class="ttl">"Filters"</div>
                 <Show when=move || !filters.get().is_empty() && !suppressed.get()>
-                    <div
+                    <button
+                        type="button"
                         class="clear"
                         on:click=move |_| on_clear.run(())
-                    >"Clear all"</div>
+                    >"Clear all"</button>
                 </Show>
             </div>
             <SearchInput value=needle placeholder="Filter field values"/>
@@ -97,20 +99,30 @@ pub fn FacetSidebar(
                         let is_collapsed = collapsed.get().get(&field).copied().unwrap_or(false);
                         let field_for_toggle = field.clone();
                         let field_for_more = field.clone();
+                        let more_label = format!("Show {extra} more values for {field}");
+                        // The count is a span INSIDE the button, and a
+                        // name is the concatenation of what the button
+                        // contains: `_time` beside `8` read as `_time8`.
+                        // Naming the button explicitly puts the two back
+                        // in words; the visible markup is unchanged.
+                        let group_label = format!("{field}, {total} values");
                         let active = active.clone();
                         view! {
                             <div class="g" class:collapsed=move || is_collapsed>
-                                <div
+                                <button
+                                    type="button"
                                     class="g-hd"
+                                    aria-label=group_label
+                                    aria-expanded=move || (!is_collapsed).to_string()
                                     on:click=move |_| collapsed.update(|c| {
                                         let cur = c.get(&field_for_toggle).copied().unwrap_or(false);
                                         c.insert(field_for_toggle.clone(), !cur);
                                     })
                                 >
-                                    <span class="chev"><IconView icon=Icon::Chevron size=10 stroke_width=1.5/></span>
+                                    <span class="chev" aria-hidden="true"><IconView icon=Icon::Chevron size=10 stroke_width=1.5/></span>
                                     <span class="name">{field.clone()}</span>
                                     <span class="cnt">{total}</span>
-                                </div>
+                                </button>
                                 <div class="vals">
                                     {visible.into_iter().map(|(v, c)| {
                                         let pct = (f64::from(c) / f64::from(max)) * 100.0;
@@ -120,6 +132,8 @@ pub fn FacetSidebar(
                                         let field_for_exc = field.clone();
                                         let value_for_inc = v.clone();
                                         let value_for_exc = v.clone();
+                                        let inc_label = format!("Include {field} = {v}");
+                                        let exc_label = format!("Exclude {field} = {v}");
                                         view! {
                                             <div
                                                 class="v"
@@ -133,43 +147,55 @@ pub fn FacetSidebar(
                                                 <span class="n" title=title>{v}</span>
                                                 <span class="c">{c}</span>
                                                 <span class="act">
-                                                    <span
+                                                    <button
+                                                        type="button"
                                                         class="op"
+                                                        aria-label=inc_label
+                                                        // The glyph says
+                                                        // nothing on sight, so
+                                                        // the hover tooltip is
+                                                        // the pointer user's
+                                                        // only reading of it.
+                                                        // The verb alone: the
+                                                        // field and value are
+                                                        // on the row already.
                                                         title="Include"
-                                                        on:click=move |e| {
-                                                            e.stop_propagation();
+                                                        on:click=move |_| {
                                                             on_add.run(Filter {
                                                                 field: field_for_inc.clone(),
                                                                 value: value_for_inc.clone(),
                                                                 op: FilterOp::Include,
                                                             });
                                                         }
-                                                    >"+"</span>
-                                                    <span
+                                                    ><span aria-hidden="true">"+"</span></button>
+                                                    <button
+                                                        type="button"
                                                         class="op"
+                                                        aria-label=exc_label
                                                         title="Exclude"
-                                                        on:click=move |e| {
-                                                            e.stop_propagation();
+                                                        on:click=move |_| {
                                                             on_add.run(Filter {
                                                                 field: field_for_exc.clone(),
                                                                 value: value_for_exc.clone(),
                                                                 op: FilterOp::Exclude,
                                                             });
                                                         }
-                                                    >"⊘"</span>
+                                                    ><span aria-hidden="true">"⊘"</span></button>
                                                 </span>
                                             </div>
                                         }
                                     }).collect::<Vec<_>>()}
                                     {(extra > 0).then(|| view! {
-                                        <div
+                                        <button
+                                            type="button"
                                             class="more"
+                                            aria-label=more_label
                                             on:click=move |_| expanded.update(|e| {
                                                 e.insert(field_for_more.clone(), true);
                                             })
                                         >
                                             {format!("+ {extra} more")}
-                                        </div>
+                                        </button>
                                     })}
                                 </div>
                             </div>

@@ -542,3 +542,36 @@ fn chrome_keyframes_present() {
         );
     }
 }
+
+#[test]
+fn the_focus_ring_reaches_anchors() {
+    // ADR-0029 makes the one stretched control on a navigating row an
+    // `<a href>`, and an anchor outside this group keeps the browser's
+    // own blue outline instead of the accent glow every other control
+    // gets. Pinning the whole selector list also pins its shape: the
+    // anchors have to ride the same rule body, not a copy beside it.
+    let group = rule_body(
+        "button:focus-visible,\na[href]:focus-visible,\ninput:focus-visible,\ntextarea:focus-visible,\n[tabindex]:focus-visible",
+    );
+    assert!(
+        group.contains("outline: none") && group.contains("box-shadow: var(--shadow-glow)"),
+        "the focus-visible group must trade the UA outline for the accent \
+         glow, got:{group}"
+    );
+    // A second `:focus-visible` rule carrying the glow would mean the
+    // anchors were bolted on beside the others, and the two bodies could
+    // drift apart.
+    let glow_groups: Vec<String> = rules(CSS)
+        .into_iter()
+        .filter(|r| {
+            let (selector, body) = r.split_once('{').unwrap_or((r.as_str(), ""));
+            selector.contains(":focus-visible") && body.contains("box-shadow: var(--shadow-glow)")
+        })
+        .collect();
+    assert_eq!(
+        glow_groups.len(),
+        1,
+        "exactly one `:focus-visible` rule may carry the accent glow, \
+         found: {glow_groups:#?}"
+    );
+}

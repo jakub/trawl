@@ -1,0 +1,55 @@
+diff --git a/crates/trawl-web-ui/src/components/sort_th.rs b/crates/trawl-web-ui/src/components/sort_th.rs
+index 16a314eb..7730a18d 100644
+--- a/crates/trawl-web-ui/src/components/sort_th.rs
++++ b/crates/trawl-web-ui/src/components/sort_th.rs
+@@ -14,7 +14,7 @@
+ 
+ use leptos::prelude::*;
+ 
+-use crate::sort_label::{sort_arrow, sort_button_name};
++use crate::sort_label::sort_arrow;
+ 
+ /// One sortable header cell. Not a `#[component]` — the flex sizing
+ /// `style` is per-column and threading it through props buys nothing.
+@@ -36,27 +36,25 @@ where
+         (k == key).then_some(desc)
+     };
+     view! {
++        // MUTANT: the pre-ADR-0029 header cell. Same class, same sort
++        // toggle, no button inside. Nothing here is focusable, carries a
++        // role, or has an accessible name.
+         <div
+             class="th sortable"
+             class:active=move || direction().is_some()
+             style=style
++            on:click=move |_| {
++                sort.update(|s| {
++                    if s.0 == key {
++                        s.1 = !s.1;
++                    } else {
++                        *s = (key, default_desc);
++                    }
++                });
++            }
+         >
+-            <button
+-                type="button"
+-                aria-label=move || sort_button_name(label, direction())
+-                on:click=move |_| {
+-                    sort.update(|s| {
+-                        if s.0 == key {
+-                            s.1 = !s.1;
+-                        } else {
+-                            *s = (key, default_desc);
+-                        }
+-                    });
+-                }
+-            >
+-                {label}
+-                <span class="dir" aria-hidden="true">{move || sort_arrow(direction())}</span>
+-            </button>
++            {label}
++            <span class="dir" aria-hidden="true">{move || sort_arrow(direction())}</span>
+         </div>
+     }
+ }

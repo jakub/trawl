@@ -8,8 +8,6 @@
 //! paginated table of recent runs across all saved queries.
 
 use leptos::prelude::*;
-use leptos_router::NavigateOptions;
-use leptos_router::hooks::use_navigate;
 
 use crate::api;
 use fleet_ui::time::{format_duration, time_ago};
@@ -31,22 +29,6 @@ pub fn RunsPage() -> impl IntoView {
 
     let nets_for_stats = LocalResource::new(|| async move { api::list_saved().await });
     let stats = LocalResource::new(|| async move { api::runs_stats().await });
-
-    let nav = use_navigate();
-
-    let goto_net = {
-        let nav = nav.clone();
-        move |net_id: i64| {
-            let url = format!("/jobs/nets?net={net_id}&ntab=runs");
-            nav(
-                &url,
-                NavigateOptions {
-                    replace: false,
-                    ..Default::default()
-                },
-            );
-        }
-    };
 
     #[allow(clippy::cast_possible_truncation)]
     let now_ms = move || js_sys::Date::now() as i64;
@@ -133,7 +115,6 @@ pub fn RunsPage() -> impl IntoView {
                                 let p = page.get();
                                 let first = p * RUNS_PAGE_SIZE + 1;
                                 let last = (first - 1 + visible.len()).min(total);
-                                let goto = goto_net.clone();
 
                                 let rows = visible.into_iter().map(|gr| {
                                     let net_id = gr.net_id;
@@ -143,11 +124,16 @@ pub fn RunsPage() -> impl IntoView {
                                     let row_ct = gr.run.row_count.map_or_else(|| "—".to_string(), |n| n.to_string());
                                     let run_status = gr.run.status.clone();
                                     let tone = crate::components::run_status_tone(&run_status);
-                                    let goto = goto.clone();
+                                    // The net's Runs drawer is a place with a
+                                    // URL, and this one pushes: browser Back
+                                    // returns to the runs list.
+                                    let href = format!("/jobs/nets?net={net_id}&ntab=runs");
 
                                     view! {
-                                        <div class="tbl-row" on:click=move |_| goto(net_id)>
-                                            <div style="flex:1" class="mono">{net_name}</div>
+                                        <div class="tbl-row">
+                                            <div style="flex:1" class="mono">
+                                                <a class="row-stretch" href=href>{net_name}</a>
+                                            </div>
                                             <div style="flex:0 0 70px">
                                                 <StatusDot tone=tone/>
                                                 " "

@@ -1,0 +1,38 @@
+diff --git a/crates/trawl-web-ui/src/components/editor_wrap.rs b/crates/trawl-web-ui/src/components/editor_wrap.rs
+index 1f013e91..4351c19c 100644
+--- a/crates/trawl-web-ui/src/components/editor_wrap.rs
++++ b/crates/trawl-web-ui/src/components/editor_wrap.rs
+@@ -201,6 +201,17 @@ fn DateRange(
+ }
+ 
+ /// Popover body: Relative (quick presets grid), Absolute (from/to inputs),
++/// MUTANT stand-in for the overlay layer handle, so the two topmost
++/// guards below still compile with no registration behind them.
++#[derive(Clone, Copy)]
++struct MutantLayer;
++
++impl MutantLayer {
++    fn is_topmost(self) -> bool {
++        true
++    }
++}
++
+ /// Real-time (Live Tail). Click-outside via a fullscreen scrim closes it.
+ #[component]
+ fn DateRangePopover(
+@@ -235,10 +246,11 @@ fn DateRangePopover(
+     // mouse cannot reach is the one combination that strands a keyboard
+     // user (ADR-0029). Trap also earns the aria-modal="true" below, and
+     // gives the panel its initial focus — the Segmented's first tab.
+-    let layer = fleet_ui::overlay::use_overlay_layer_with(
+-        fleet_ui::overlay::FocusPolicy::Trap,
+-        move || panel_ref.get().map(web_sys::Element::from),
+-    );
++    // MUTANT: the panel is no longer a layer on the overlay stack. It
++    // still renders and Escape still closes it, but nothing captures the
++    // opener, moves initial focus, traps Tab or restores the trigger,
++    // and every stack query answers yes.
++    let layer = MutantLayer;
+     // Escape at the window, not on the panel: the key has to work before
+     // focus has moved anywhere. use_event_listener registers its own
+     // on_cleanup, so the discarded handle is deliberate. The topmost

@@ -10,7 +10,7 @@
 # exits 0 only if every requested mutation was killed.
 #
 # Usage:
-#   e2e/scripts/mutation-check.sh                 # run all twelve
+#   e2e/scripts/mutation-check.sh                 # run all nineteen
 #   e2e/scripts/mutation-check.sh 02-editor-onchange.patch   # just one
 #
 # Refuses to run against a dirty tree — a patch applied on top of your
@@ -55,6 +55,13 @@ declare -A SPEC_FOR=(
   [10-menu-topmost-escape.patch]="topbar-menu.spec.ts"
   [11-menu-restore-before-callback.patch]="actions-menu.spec.ts"
   [12-toast-dismiss-span.patch]="native-controls.spec.ts"
+  [13-sort-th-div.patch]="sort-headers.spec.ts"
+  [14-results-row-handler.patch]="row-controls.spec.ts"
+  [15-schema-anchor-push.patch]="row-controls.spec.ts"
+  [16-nets-anchor-prevent-default.patch]="row-controls.spec.ts"
+  [17-range-dialog-no-layer.patch]="range-dialog.spec.ts"
+  [18-facet-actions-display-none.patch]="facets.spec.ts"
+  [19-results-th-no-aria-sort.patch]="sort-headers.spec.ts"
 )
 
 # patch-file -> a CONTROL spec the mutation does NOT touch, which must
@@ -77,6 +84,13 @@ declare -A CONTROL_FOR=(
   [10-menu-topmost-escape.patch]="routing.spec.ts"
   [11-menu-restore-before-callback.patch]="routing.spec.ts"
   [12-toast-dismiss-span.patch]="routing.spec.ts"
+  [13-sort-th-div.patch]="routing.spec.ts"
+  [14-results-row-handler.patch]="routing.spec.ts"
+  [15-schema-anchor-push.patch]="routing.spec.ts"
+  [16-nets-anchor-prevent-default.patch]="routing.spec.ts"
+  [17-range-dialog-no-layer.patch]="routing.spec.ts"
+  [18-facet-actions-display-none.patch]="routing.spec.ts"
+  [19-results-th-no-aria-sort.patch]="routing.spec.ts"
 )
 
 PATCHES=()
@@ -96,6 +110,13 @@ else
     10-menu-topmost-escape.patch
     11-menu-restore-before-callback.patch
     12-toast-dismiss-span.patch
+    13-sort-th-div.patch
+    14-results-row-handler.patch
+    15-schema-anchor-push.patch
+    16-nets-anchor-prevent-default.patch
+    17-range-dialog-no-layer.patch
+    18-facet-actions-display-none.patch
+    19-results-th-no-aria-sort.patch
   )
 fi
 
@@ -196,11 +217,11 @@ echo "-- trunk build (restore pristine dist) --"
 
 echo
 echo "mutation-check results:"
-printf '%-28s %s\n' "patch" "outcome"
+printf '%-36s %s\n' "patch" "outcome"
 overall=0
 for name in "${PATCHES[@]}"; do
   outcome="${RESULT[$name]:-not run}"
-  printf '%-28s %s\n' "$name" "$outcome"
+  printf '%-36s %s\n' "$name" "$outcome"
   [[ $outcome == PASS* ]] || overall=1
 done
 # A cleanup that could not cleanly reverse its patch (e.g. an affected

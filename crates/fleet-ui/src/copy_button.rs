@@ -83,8 +83,10 @@ mod component {
 
         match class {
             // Bare mode: an app-styled inline trigger, still a native
-            // button. stop_propagation for the same reason as Btn's flag
-            // — copy triggers live inside clickable rows/headers.
+            // button. The click stops here for the same reason Btn takes
+            // the flag: a consumer may nest this trigger inside an
+            // ancestor that handles pointer events. trawl-web-ui no
+            // longer does (ADR-0029); coastwatch still can.
             Some(cls) => view! {
                 <button
                     type="button"

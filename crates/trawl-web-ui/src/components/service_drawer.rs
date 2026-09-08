@@ -29,6 +29,7 @@ use trawl_api::{QueryResponse, ServiceColumnStats, ServiceSchema};
 use wasm_bindgen::{JsCast, JsValue};
 
 use crate::api;
+use crate::components::sort_th::sort_th;
 use crate::histogram::{Slot, align_buckets, parse_bucket_ms};
 use crate::interop::uplot::{ChartHandle, Opts, create_chart};
 use crate::state::stream_session::{LiveSignals, RingBuffer, StreamLifecycle, start_stream};
@@ -220,23 +221,33 @@ fn OverviewPane(
                             }.into_any();
                         }
                         let max = rows.iter().map(|r| r.2).max().unwrap_or(1).max(1);
-                        rows.into_iter().map(|(fname, type_label, count)| {
+                        let rows = rows.into_iter().map(|(fname, type_label, count)| {
                             let (pill_class, pill_text) = super::service_card_fmt::type_pill(&type_label);
                             #[allow(clippy::cast_precision_loss)]
                             let pct = (count as f64 / max as f64) * 100.0;
                             let bar_style = format!("width:{pct:.1}%");
                             let label = super::service_card_fmt::format_count(count);
                             let fname_cb = fname.clone();
-                            let on_use_click = move |_| on_use_field.run(fname_cb.clone());
                             view! {
-                                <div class="tf topfields" on:click=on_use_click>
-                                    <span class="fn">{fname}</span>
+                                <div class="tf">
+                                    // A command, not a place: it builds a
+                                    // search through the navigator, which can
+                                    // refuse (ADR-0027).
+                                    <button
+                                        type="button"
+                                        class="fn row-stretch"
+                                        on:click=move |_| on_use_field.run(fname_cb.clone())
+                                    >{fname}</button>
                                     <span class=format!("tp {pill_class}")>{pill_text}</span>
                                     <span class="bar-wrap"><span class="bar" style=bar_style></span></span>
                                     <span class="c">{label}</span>
                                 </div>
                             }
-                        }).collect::<Vec<_>>().into_any()
+                        }).collect::<Vec<_>>();
+                        // The wrapper the `.topfields .tf` rules have always
+                        // asked for: the rows carried both classes and had no
+                        // `.topfields` ancestor, so none of it matched.
+                        view! { <div class="topfields">{rows}</div> }.into_any()
                     })
                 />
             </div>
@@ -254,6 +265,14 @@ enum SortKey {
     Storage,
 }
 
+impl SortKey {
+    /// The direction a freshly-selected key starts in: ascending for
+    /// the field name, descending for the numeric columns.
+    fn default_desc(self) -> bool {
+        !matches!(self, Self::Name)
+    }
+}
+
 #[component]
 #[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
 fn FieldsPane(
@@ -263,7 +282,8 @@ fn FieldsPane(
     on_use_field: Callback<String>,
     on_open_field: Callback<String>,
 ) -> impl IntoView {
-    let sort = RwSignal::new((SortKey::Cardinality, false)); // desc
+    // Second element is DESCENDING, matching `sort_th`'s tuple.
+    let sort = RwSignal::new((SortKey::Cardinality, true));
     let expanded = RwSignal::new(None::<String>);
     let svc_name = svc.name.clone();
     let columns_owned = svc.columns.clone();
@@ -301,40 +321,20 @@ fn FieldsPane(
         });
     });
 
-    // Toggle direction if the key is already active, else select it at its
-    // natural direction: ascending for the name, descending for numbers.
-    let toggle_sort = move |key: SortKey| {
-        move |_| {
-            let (cur_key, cur_asc) = sort.get_untracked();
-            let next = if cur_key == key {
-                (key, !cur_asc)
-            } else {
-                let default_asc = matches!(key, SortKey::Name);
-                (key, default_asc)
-            };
-            sort.set(next);
-        }
-    };
-
-    let on_header_name = toggle_sort(SortKey::Name);
-    let on_header_card = toggle_sort(SortKey::Cardinality);
-    let on_header_cov = toggle_sort(SortKey::NonNull);
-    let on_header_size = toggle_sort(SortKey::Storage);
-
     view! {
         <div class="sd-fields">
             <div class="sf-hd">
-                <div on:click=on_header_name>"Field" {move || sort_caret(sort.get(), SortKey::Name)}</div>
+                {sort_th(sort, SortKey::Name, SortKey::Name.default_desc(), "Field", "")}
                 <div>"Type"</div>
-                <div on:click=on_header_cov>"Non-null" {move || sort_caret(sort.get(), SortKey::NonNull)}</div>
-                <div on:click=on_header_card>"Cardinality" {move || sort_caret(sort.get(), SortKey::Cardinality)}</div>
-                <div on:click=on_header_size>"Storage" {move || sort_caret(sort.get(), SortKey::Storage)}</div>
+                {sort_th(sort, SortKey::NonNull, SortKey::NonNull.default_desc(), "Non-null", "")}
+                {sort_th(sort, SortKey::Cardinality, SortKey::Cardinality.default_desc(), "Cardinality", "")}
+                {sort_th(sort, SortKey::Storage, SortKey::Storage.default_desc(), "Storage", "")}
                 <div>"Sample"</div>
                 <div></div>
             </div>
 
             {move || {
-                let (key, asc) = sort.get();
+                let (key, desc) = sort.get();
                 let card_map = cardinality.get()
                     .and_then(Result::ok)
                     .unwrap_or_default();
@@ -354,7 +354,7 @@ fn FieldsPane(
                         }
                         SortKey::Storage => a.compressed_bytes.cmp(&b.compressed_bytes),
                     };
-                    if asc { ord } else { ord.reverse() }
+                    if desc { ord.reverse() } else { ord }
                 });
                 sorted.into_iter().map(|c| {
                     let fname = c.name.clone();
@@ -388,6 +388,7 @@ fn FieldsPane(
 
                     let is_open_caret = is_open.clone();
                     let is_open_detail = is_open.clone();
+                    let is_open_aria = is_open.clone();
                     // Membership in the server-stamped list, never a join
                     // against the install-wide degraded set.
                     let degraded = super::service_card_fmt::is_degraded_column(
@@ -404,22 +405,32 @@ fn FieldsPane(
                         .map(crate::schema_nav::degraded_badge_id);
                     view! {
                         <>
-                            <div class=row_class on:click=toggle>
+                            <div class=row_class>
                                 <div>
-                                    <span class="caret">{move || if is_open_caret() { "▾" } else { "▸" }}</span>
-                                    <span class="c-name">{c.name.clone()}</span>
+                                    // The row's one control (ADR-0029): the
+                                    // caret and the field name live inside
+                                    // it, and it stretches over the row.
+                                    <button
+                                        type="button"
+                                        class="row-stretch"
+                                        aria-expanded=move || is_open_aria().to_string()
+                                        on:click=toggle
+                                    >
+                                        <span class="caret" aria-hidden="true">
+                                            {move || if is_open_caret() { "▾" } else { "▸" }}
+                                        </span>
+                                        <span class="c-name">{c.name.clone()}</span>
+                                    </button>
                                     {degraded.then(|| view! {
-                                        // Native button so it is keyboard
-                                        // operable; the click is stopped
-                                        // before it reaches the row's
-                                        // expand toggle.
+                                        // Above the stretched control, so it
+                                        // opens the case file without
+                                        // expanding the row.
                                         <button
                                             type="button"
                                             class="deg-btn"
                                             id=badge_id
                                             title="Degraded pin — open the field case file"
-                                            on:click=move |e: web_sys::MouseEvent| {
-                                                e.stop_propagation();
+                                            on:click=move |_| {
                                                 on_open_field.run(fname_for_open.clone());
                                             }
                                         >
@@ -763,13 +774,6 @@ fn sample_range(c: &ServiceColumnStats) -> String {
         (Some(a), Some(b)) => format!("{a} … {b}"),
         _ => String::new(),
     }
-}
-
-fn sort_caret(state: (SortKey, bool), key: SortKey) -> &'static str {
-    if state.0 != key {
-        return "";
-    }
-    if state.1 { " ▲" } else { " ▼" }
 }
 
 fn short_time(iso: &str) -> String {

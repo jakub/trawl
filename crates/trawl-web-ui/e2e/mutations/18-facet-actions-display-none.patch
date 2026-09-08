@@ -1,0 +1,42 @@
+diff --git a/crates/trawl-web-ui/styles/main.css b/crates/trawl-web-ui/styles/main.css
+index 675a9801..6535ea84 100644
+--- a/crates/trawl-web-ui/styles/main.css
++++ b/crates/trawl-web-ui/styles/main.css
+@@ -291,13 +291,11 @@
+   min-width: var(--facet-act-w);
+   text-align: right;
+ }
+-/* Revealed on hover OR focus, and by opacity: `display: none` would
+- * take the two buttons out of the tab order (ADR-0029). They are pinned
+- * to the row's right edge instead of riding its flex row, because the
+- * count they replace takes a flex gap with it when it hides: in flow,
+- * arriving by Tab moved the button 8px out from under the pointer. */
++/* MUTANT: the pre-ADR-0029 reveal. `display: none` takes both buttons
++ * out of the tab order entirely, so hover is the only way to reach
++ * them. */
+ .facets .v .act {
+-  display: flex;
++  display: none;
+   position: absolute;
+   right: 12px;
+   top: 0;
+@@ -316,8 +314,7 @@
+    * `.bar` frequency tail is hidden under these 48px while revealed. */
+   background: var(--panel);
+ }
+-.facets .v:hover .act,
+-.facets .v:focus-within .act { opacity: 1; }
++.facets .v:hover .act { display: flex; opacity: 1; }
+ .facets .v:hover .act { background: var(--panel-2); }
+ /* After the hover rule: `.v.selected` beats `.v:hover` for the row's own
+  * background on a tie, and the action floor follows the row. */
+@@ -327,8 +324,7 @@
+ }
+ /* `visibility`, not `display: none`: the count's box is what keeps the
+  * value name out of the action area. */
+-.facets .v:hover .c,
+-.facets .v:focus-within .c { visibility: hidden; }
++.facets .v:hover .c { visibility: hidden; }
+ .facets .v .act .op {
+   background: none;
+   border: 0;

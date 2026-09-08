@@ -30,6 +30,17 @@ import {
   repinStatusRunningResponse,
   repinStatusSucceededResponse,
   repinStatusNoJobResponse,
+  QUERY_SHAPES,
+  corpusQueryRowsResponse,
+  corpusCardinalityResponse,
+  corpusTopValuesResponse,
+  corpusTimechartResponse,
+  corpusServiceSchemaResponse,
+  corpusHistoryResponse,
+  corpusNetRunsResponse,
+  corpusRunResultResponse,
+  corpusAllRunsResponse,
+  corpusRunsStatsResponse,
 } from './fixtures.mjs';
 
 const HOST = '127.0.0.1';
@@ -68,8 +79,16 @@ const MIME = {
 
 // ---- mutable test-scoped state -------------------------------------------
 
-/** @type {'default'|'unauth'|'query-500'|'stream-burst'|'populated'} */
+/** @type {'default'|'unauth'|'query-500'|'stream-burst'|'populated'|'corpus'} */
 let scenario = 'default';
+
+/** `corpus` is `populated` plus data. Every place that used to ask
+ * "is this `populated`?" asks this instead, so the two scenarios cannot
+ * drift apart on a body they share. The services route is the one
+ * exception and says so where it splits. */
+function hasCorpus() {
+  return scenario === 'populated' || scenario === 'corpus';
+}
 
 const sse = {
   open: 0,
@@ -116,11 +135,17 @@ let unstubbed = [];
 let queries = [];
 /** @type {object[]} */
 let exports_ = [];
+/** DSL of every `corpus` query the shape dispatch did not recognise. Kept
+ * beside `unstubbed` and for the same reason: a query nobody keyed a
+ * fixture to must be visible as itself, never answered with rows a spec
+ * would read as its own. */
+let unhandledQueries = [];
 
 function resetState() {
   unstubbed = [];
   queries = [];
   exports_ = [];
+  unhandledQueries = [];
   // sse.open/opens/closes deliberately survive a reset — a spec resets
   // the scenario, then drives its own stream lifecycle and reads the
   // counters itself. Rolling them here would race a stream this same
@@ -294,6 +319,7 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
         },
         unstubbed,
         queries,
+        unhandledQueries,
         exports: exports_,
       });
       return;
@@ -362,6 +388,38 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
         sendJson(res, 500, errorEnvelope('Couldn’t load results: stub query failure'));
         return;
       }
+      if (scenario === 'corpus') {
+        // Dispatch by DSL SHAPE, because the service drawer's reads
+        // carry a field or service name the stub cannot predict. The
+        // order matters only in that each shape is checked before the
+        // pipeline catch-all below it.
+        const dsl = typeof parsedBody.query === 'string' ? parsedBody.query : '';
+        if (dsl.includes(QUERY_SHAPES.cardinality)) {
+          sendJson(res, 200, corpusCardinalityResponse());
+          return;
+        }
+        if (dsl.includes(QUERY_SHAPES.topValues)) {
+          sendJson(res, 200, corpusTopValuesResponse());
+          return;
+        }
+        if (dsl.includes(QUERY_SHAPES.timechart)) {
+          sendJson(res, 200, corpusTimechartResponse());
+          return;
+        }
+        // A pipeline this scenario has no fixture for, such as the
+        // drawer's `stats count() as hits` collision form, FAILS.
+        // Answering it with the rows fixture would hand a spec a body
+        // that says nothing about the query it asked, which is the
+        // failure mode this dispatch exists to prevent. A bare `|` test
+        // is enough here: no fixture query quotes one.
+        if (dsl.includes('|')) {
+          unhandledQueries.push(dsl);
+          sendJson(res, 500, errorEnvelope(`no corpus fixture for this pipeline shape: ${dsl}`));
+          return;
+        }
+        sendJson(res, 200, corpusQueryRowsResponse());
+        return;
+      }
       sendJson(res, 200, queryResponse());
       return;
     }
@@ -396,7 +454,7 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
 
     // -- other read-only canned surfaces --------------------------------
     if (p === '/api/v1/history' && req.method === 'GET') {
-      sendJson(res, 200, historyResponse());
+      sendJson(res, 200, scenario === 'corpus' ? corpusHistoryResponse() : historyResponse());
       return;
     }
     // The `populated` scenario answers these two with a corpus that has
@@ -408,7 +466,14 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       sendJson(
         res,
         200,
-        scenario === 'populated' ? populatedServiceSchemaResponse() : serviceSchemaResponse(),
+        // Three bodies, not two: `corpus` gets its own so it can carry a
+        // degraded column, and `populated` keeps the body its specs were
+        // written against.
+        scenario === 'corpus'
+          ? corpusServiceSchemaResponse()
+          : scenario === 'populated'
+            ? populatedServiceSchemaResponse()
+            : serviceSchemaResponse(),
       );
       return;
     }
@@ -416,9 +481,37 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       sendJson(
         res,
         200,
-        scenario === 'populated' ? populatedListSavedResponse() : listSavedResponse(),
+        hasCorpus() ? populatedListSavedResponse() : listSavedResponse(),
       );
       return;
+    }
+
+    // -- report runs (`corpus` only) ------------------------------------
+    // Gated on the scenario rather than answered everywhere: under every
+    // other scenario these paths fall through to the `unstubbed`
+    // catch-all, and the auto fixture's empty-`unstubbed` assertion is
+    // what tells a spec author they reached a surface they did not
+    // fixture. The run result is answered for ANY run id — expanding a
+    // row is the behaviour under test, not id routing.
+    const netRuns = p.match(/^\/api\/v1\/saved\/\d+\/runs$/);
+    const netRun = p.match(/^\/api\/v1\/saved\/\d+\/runs\/\d+$/);
+    if (scenario === 'corpus' && req.method === 'GET') {
+      if (netRuns) {
+        sendJson(res, 200, corpusNetRunsResponse());
+        return;
+      }
+      if (netRun) {
+        sendJson(res, 200, corpusRunResultResponse());
+        return;
+      }
+      if (p === '/api/v1/runs') {
+        sendJson(res, 200, corpusAllRunsResponse());
+        return;
+      }
+      if (p === '/api/v1/runs/stats') {
+        sendJson(res, 200, corpusRunsStatsResponse());
+        return;
+      }
     }
 
     // -- field catalog --------------------------------------------------

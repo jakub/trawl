@@ -101,7 +101,51 @@ failed when it ran after another file and passed when run alone.
 `default` is what the auto fixture resets to. The others are named in
 `harness/server.mjs` and selected with `resetScenario(request, name)` at
 the top of a test body: `unauth` (a 401 from `/api/auth/me`),
-`query-500`, `stream-burst`, and `populated`.
+`query-500`, `stream-burst`, `populated`, and `corpus`.
+
+`corpus` is `populated` plus data: it answers everything `populated`
+does, with the same service (`nginx`) and the same net (id `1`), and adds
+the fixtures the row, sort, facet and detail specs need. `populated`
+itself is byte-identical to what it was before, so specs written against
+the empty state keep reading it.
+
+What `corpus` serves:
+
+- `POST /api/v1/query` dispatches by DSL SHAPE, because the service
+  drawer's reads carry a field name the stub cannot predict. Three
+  pipeline shapes are sniffed as substrings, pinned in
+  `harness/fixtures.mjs`'s `QUERY_SHAPES` against `src/drawer_query.rs`:
+  `| stats dc(` answers `wire/query-cardinality.json`, `| top 10 `
+  answers `wire/query-top-values.json`, and
+  `| timechart span=1h count()` answers `wire/query-timechart.json`. A
+  query with no pipe at all is a plain search and gets
+  `wire/query-rows.json`: 8 events over `_time, host, status, message`,
+  with 6 distinct hosts so the facet rail hides one behind `+ 1 more`,
+  and no two sort orders agreeing.
+- Any OTHER pipeline shape is a 500 carrying its own DSL, recorded in the
+  stub's `unhandledQueries`. Falling through to the rows fixture would
+  hand a spec a body that says nothing about the query it asked, which is
+  the exact failure this dispatch exists to prevent. The drawer's
+  `stats count() as hits` collision form is the one that lands here.
+- `GET /api/v1/schema/services` gets its own body,
+  `wire/service-schema-corpus.json`, rather than `populated`'s. The one
+  thing it adds is a degraded column: the service names `duration` in
+  `degraded_fields`, which is what renders the field row's degraded
+  badge, and `wire/catalog-field.json` is about that same field, so the
+  case file the badge opens is about the field the badge sits on.
+- `GET /api/v1/history` answers `wire/history.json`: two entries, newest
+  first. The first is an ordinary rerunnable query. The second is
+  `host=` followed by 32764 `a`s, 32769 bytes in all, one byte over
+  `MAX_SEARCH_BYTES`, so the navigator refuses to rerun it instead of
+  writing a URL nothing can read back (ADR-0027).
+- The report-run routes, which have no fixture outside `corpus` at all:
+  `/api/v1/saved/{id}/runs`, `/api/v1/saved/{id}/runs/{run_id}`,
+  `/api/v1/runs` and `/api/v1/runs/stats`.
+
+Every one of those bodies decodes into its `trawl-api` struct in
+`crates/trawl-web-ui/tests/e2e_wire_fixture_contract.rs`, and the content
+the specs navigate by (row count, host values, the over-bound length, the
+degraded field) is pinned in `fixtures.ts`'s `CORPUS`.
 
 `populated` answers `/api/v1/saved` and `/api/v1/schema/services` with a
 corpus that has one net and one service in it, which is what makes a row
@@ -140,11 +184,18 @@ one thing the suite is supposed to catch:
 | `10-menu-topmost-escape.patch` | the menu's Escape listener drops its `is_topmost` guard and answers Escape from under a modal | `topbar-menu.spec.ts` |
 | `11-menu-restore-before-callback.patch` | activating an item closes the menu and runs the callback without restoring the trigger | `actions-menu.spec.ts` |
 | `12-toast-dismiss-span.patch` | the toast dismiss goes back to a `<span class="x">` with the same click and no name | `native-controls.spec.ts` |
+| `13-sort-th-div.patch` | `sort_th` renders the header cell as a bare `<div on:click>` again, so no header on the div tables is focusable or named | `sort-headers.spec.ts` |
+| `14-results-row-handler.patch` | the pre-ADR-0029 whole-row `on:click` returns to the results `<tr>`, beside the caret button whose click bubbles into it: one press expands and collapses | `row-controls.spec.ts` |
+| `15-schema-anchor-push.patch` | the schema row anchor loses `prop:replace`, so opening the drawer pushes a second history entry | `row-controls.spec.ts` |
+| `16-nets-anchor-prevent-default.patch` | the nets row anchor cancels its own default action and navigates by hand, so the router swallows a Ctrl-click the browser owns | `row-controls.spec.ts` |
+| `17-range-dialog-no-layer.patch` | the range dialog drops its `use_overlay_layer_with` registration: no opener capture, no initial focus, no Tab trap, no restore | `range-dialog.spec.ts` |
+| `18-facet-actions-display-none.patch` | `.facets .v .act` goes back to `display: none` until hover, which takes include and exclude out of the tab order | `facets.spec.ts` |
+| `19-results-th-no-aria-sort.patch` | `aria-sort` comes off the results `<th>`, so the sorted column and its direction are announced nowhere | `sort-headers.spec.ts` |
 
 Run the mechanism:
 
 ```sh
-crates/trawl-web-ui/e2e/scripts/mutation-check.sh                     # all twelve
+crates/trawl-web-ui/e2e/scripts/mutation-check.sh                     # all nineteen
 crates/trawl-web-ui/e2e/scripts/mutation-check.sh 02-editor-onchange.patch  # just one
 ```
 
@@ -165,6 +216,39 @@ each of the four was run five consecutive times, as five separate
 invocations, and killed all five (transcripts under
 `visual-evidence/issue-159/`). 12 is a DOM-shape mutation with no timing
 in it and was run once.
+
+13 through 19 follow the same rule, with transcripts under
+`visual-evidence/issue-161/`. 14 and 17 are the timing-sensitive pair and
+were each run five consecutive times: 14 turns on whether a click on the
+caret button bubbles into the row handler before the detail row settles,
+and 17 is entirely about where focus lands after Escape. Both killed all
+five. The other five are DOM-shape or CSS mutations with no race in them
+and were run once.
+
+Three of these are worth reading before you trust the table.
+
+`14` keeps the caret button and adds the row handler back beside it,
+rather than replacing one with the other. Deleting the button would break
+the spec at the first assertion, which proves only that the selector
+still resolves. Both handlers live means the DOM the spec walks is
+unchanged and the only thing that moved is the number of times one press
+acts, which is what the spec counts.
+
+`16` does two things where the acceptance criterion names one. A bare
+`e.prevent_default()` on the anchor is not enough: with nothing else in
+the handler, a Ctrl-click does nothing at all, and the spec's assertion
+that THIS page stayed put still holds. Restoring the navigation beside it
+is the real regression, the router interception the anchor replaced, and
+that is what makes the Ctrl-click open the drawer on the page the spec is
+watching.
+
+`17` cannot simply delete the registration: the scrim and Escape handlers
+both ask the layer whether they are topmost. It swaps in a stand-in that
+always answers yes, so the panel still renders and Escape still closes
+it. What is gone is the hook, and with it the opener capture, the initial
+focus move, the Tab trap and the restore. `scrim mousedown closes` and
+`From and To are labelled` survive it on purpose: they are about the
+panel, not about the stack.
 
 Two of these mutations are worth reading before you trust the table.
 

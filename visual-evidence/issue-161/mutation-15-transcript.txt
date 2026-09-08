@@ -1,0 +1,137 @@
+=== 15-schema-anchor-push.patch -> row-controls.spec.ts ===
+-- trunk build --
+2026-09-07T23:29:30.052764Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T23:29:30.052900Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-core)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.63s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T23:29:41.894110Z  INFO applying new distribution
+2026-09-07T23:29:41.895559Z  INFO ✅ success
+-- playwright test tests/row-controls.spec.ts --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/row-controls.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/dist)
+
+Running 11 tests using 1 worker
+
+  ✘   1 [chromium] › tests/row-controls.spec.ts:62:5 › schema row: pointer on the query cell opens the drawer once (5.5s)
+  ✓   2 [chromium] › tests/row-controls.spec.ts:98:5 › nets row: ActionsMenu opens without the drawer (608ms)
+  ✓   3 [chromium] › tests/row-controls.spec.ts:130:5 › history row: Save as Net opens the modal without a rerun (547ms)
+  ✓   4 [chromium] › tests/row-controls.spec.ts:150:5 › results row: Space expands once and leaves the detail open (603ms)
+  ✓   5 [chromium] › tests/row-controls.spec.ts:186:5 › service field row: degraded badge opens the case without expanding (575ms)
+  ✓   6 [chromium] › tests/row-controls.spec.ts:230:5 › schema link: Space does not navigate (537ms)
+  ✓   7 [chromium] › tests/row-controls.spec.ts:252:5 › nets link: modified click leaves the page in place (516ms)
+  ✘   8 [chromium] › tests/row-controls.spec.ts:272:5 › schema drawer: Back skips the replace (5.6s)
+  ✓   9 [chromium] › tests/row-controls.spec.ts:288:5 › runs link: Back returns to runs (610ms)
+  ✓  10 [chromium] › tests/row-controls.spec.ts:306:5 › history row: over-bound query is refused, not navigated (512ms)
+  ✓  11 [chromium] › tests/row-controls.spec.ts:325:5 › schema quick actions: Tab reveals and Enter searches (682ms)
+
+
+  1) [chromium] › tests/row-controls.spec.ts:62:5 › schema row: pointer on the query cell opens the drawer once 
+
+    Error: expect(locator).toHaveJSProperty(expected) failed
+
+    Locator:  locator('.tbl-body .tbl-row').first().locator('.row-stretch')
+    Expected: true
+    Received: undefined
+    Timeout:  5000ms
+
+    Call log:
+      - Expect "toHaveJSProperty" with timeout 5000ms
+      - waiting for locator('.tbl-body .tbl-row').first().locator('.row-stretch')
+        14 × locator resolved to <a class="row-stretch" href="/search/schema?svc=nginx&stab=overview">…</a>
+           - unexpected value "undefined"
+
+
+      69 |   await expect(link).toHaveAccessibleName(CORPUS.service);
+      70 |   // The drawer is a place, and this one replaces its history entry.
+    > 71 |   await expect(link).toHaveJSProperty('replace', true);
+         |                      ^
+      72 |
+      73 |   await countClicksOn(page, `${SEL.tableRow}`);
+      74 |
+        at /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/e2e/tests/row-controls.spec.ts:71:22
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/row-controls-schema-row-po-eee39--cell-opens-the-drawer-once-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/row-controls-schema-row-po-eee39--cell-opens-the-drawer-once-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/row-controls-schema-row-po-eee39--cell-opens-the-drawer-once-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/row-controls-schema-row-po-eee39--cell-opens-the-drawer-once-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  2) [chromium] › tests/row-controls.spec.ts:272:5 › schema drawer: Back skips the replace ─────────
+
+    Error: expect(page).toHaveURL(expected) failed
+
+    Expected pattern: /\/search\/history$/
+    Received string:  "http://127.0.0.1:8123/search/schema"
+    Timeout: 5000ms
+
+    Call log:
+      - Expect "toHaveURL" with timeout 5000ms
+        14 × locator resolved to <html lang="en" data-theme="light" data-rowstyle="bordered">…</html>
+           - unexpected value "http://127.0.0.1:8123/search/schema"
+
+
+      283 |   // page before it rather than on the drawer-less schema page.
+      284 |   await page.goBack();
+    > 285 |   await expect(page).toHaveURL(/\/search\/history$/);
+          |                      ^
+      286 | });
+      287 |
+      288 | test('runs link: Back returns to runs', async ({ page, request }) => {
+        at /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/e2e/tests/row-controls.spec.ts:285:22
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/row-controls-schema-drawer-Back-skips-the-replace-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/row-controls-schema-drawer-Back-skips-the-replace-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/row-controls-schema-drawer-Back-skips-the-replace-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/row-controls-schema-drawer-Back-skips-the-replace-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  2 failed
+    [chromium] › tests/row-controls.spec.ts:62:5 › schema row: pointer on the query cell opens the drawer once 
+    [chromium] › tests/row-controls.spec.ts:272:5 › schema drawer: Back skips the replace ──────────
+  9 passed (17.5s)
+-- control: playwright test tests/routing.spec.ts (must pass) --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/routing.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/dist)
+
+Running 3 tests using 1 worker
+
+  ✓  1 [chromium] › tests/routing.spec.ts:8:5 › / redirects to /search and mounts the DSL editor (774ms)
+  ✓  2 [chromium] › tests/routing.spec.ts:14:5 › rail link to history navigates without a full page load (513ms)
+  ✓  3 [chromium] › tests/routing.spec.ts:31:5 › an unknown route renders the 404 page (339ms)
+
+  3 passed (2.1s)
+-- trunk build (restore pristine dist) --
+2026-09-07T23:30:02.726746Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T23:30:02.726856Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-core)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.32s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T23:30:13.925048Z  INFO applying new distribution
+2026-09-07T23:30:13.931548Z  INFO ✅ success
+
+mutation-check results:
+patch                                outcome
+15-schema-anchor-push.patch          PASS (target spec failed, control passed, exit 1)

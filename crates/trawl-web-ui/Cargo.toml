@@ -52,6 +52,14 @@ chrono = { workspace = true, features = ["wasmbind"] }
 leptos = { version = "0.8", features = ["csr"] }
 leptos_router = { version = "0.8" }
 leptos_meta = "0.8"
+# The date-range dialog binds Escape at the window, exactly as fleet-ui's
+# Modal does; leptos-use is already in the wasm graph through fleet-ui, so
+# mirroring that wiring costs nothing and avoids a hand-rolled Closure
+# with its own cleanup.
+leptos-use = { version = "0.19", default-features = false, features = [
+    "use_event_listener",
+    "use_window",
+] }
 console_error_panic_hook = "0.1"
 gloo-net = "0.7"
 gloo-timers = { version = "0.4", features = ["futures"] }

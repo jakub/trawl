@@ -46,6 +46,18 @@ const MENU_RS: &str = include_str!("../../fleet-ui/src/menu.rs");
 const TABS_RS: &str = include_str!("../../fleet-ui/src/tabs.rs");
 const ACTIONS_MENU_RS: &str = include_str!("../../fleet-ui/src/actions_menu.rs");
 const COPY_BUTTON_RS: &str = include_str!("../../fleet-ui/src/copy_button.rs");
+const SCHEMA_RS: &str = include_str!("../src/pages/schema.rs");
+const NETS_RS: &str = include_str!("../src/pages/nets.rs");
+const RUNS_RS: &str = include_str!("../src/pages/runs.rs");
+const SORT_TH_RS: &str = include_str!("../src/components/sort_th.rs");
+const SORT_LABEL_RS: &str = include_str!("../src/sort_label.rs");
+const SERVICE_DRAWER_RS: &str = include_str!("../src/components/service_drawer.rs");
+const NET_DRAWER_RS: &str = include_str!("../src/components/net_drawer.rs");
+const FACET_SIDEBAR_RS: &str = include_str!("../src/components/facet_sidebar.rs");
+const STATUS_BAR_RS: &str = include_str!("../src/components/status_bar.rs");
+const DRAWER_QUERY_RS: &str = include_str!("../src/drawer_query.rs");
+const SEARCH_INPUT_RS: &str = include_str!("../../fleet-ui/src/search_input.rs");
+const SEGMENTED_COMPONENT_RS: &str = include_str!("../../fleet-ui/src/segmented/component.rs");
 
 /// One (assignment, source file, hook) triple: `assignment` is the full
 /// `key: 'value',` line as it appears in `selectors.ts`, and `hook` must
@@ -568,6 +580,614 @@ const CONTRACTS: &[Contract] = &[
         source: TOPBAR_RS,
         hook: "menu_label=\"Account\"",
     },
+    // -- the stretched row control and its neighbours (ADR-0029) ------
+    // `tableRow` reaches four pages' rows, so it is pinned in all four:
+    // a page that stops rendering `.tbl-row` would otherwise leave its
+    // specs matching nothing and passing their `toHaveCount(0)` half.
+    Contract {
+        assignment: "tableRow: '.tbl-body .tbl-row',",
+        source_path: "src/pages/schema.rs",
+        source: SCHEMA_RS,
+        hook: "class=\"tbl-body\"",
+    },
+    Contract {
+        assignment: "tableRow: '.tbl-body .tbl-row',",
+        source_path: "src/pages/schema.rs",
+        source: SCHEMA_RS,
+        hook: "class=\"tbl-row\"",
+    },
+    Contract {
+        assignment: "tableRow: '.tbl-body .tbl-row',",
+        source_path: "src/pages/nets.rs",
+        source: NETS_RS,
+        hook: "class=\"tbl-row\"",
+    },
+    Contract {
+        assignment: "tableRow: '.tbl-body .tbl-row',",
+        source_path: "src/pages/runs.rs",
+        source: RUNS_RS,
+        hook: "class=\"tbl-row\"",
+    },
+    Contract {
+        assignment: "tableRow: '.tbl-body .tbl-row',",
+        source_path: "src/pages/history.rs",
+        source: HISTORY_RS,
+        hook: "class=\"tbl-row\"",
+    },
+    // Same four pages for the control itself: the class is what carries
+    // the stretching `::after`, so losing it on one page is losing that
+    // page's whole-row pointer target.
+    Contract {
+        assignment: "rowStretch: '.row-stretch',",
+        source_path: "src/pages/schema.rs",
+        source: SCHEMA_RS,
+        hook: "class=\"row-stretch\"",
+    },
+    Contract {
+        assignment: "rowStretch: '.row-stretch',",
+        source_path: "src/pages/nets.rs",
+        source: NETS_RS,
+        hook: "class=\"row-stretch\"",
+    },
+    Contract {
+        assignment: "rowStretch: '.row-stretch',",
+        source_path: "src/pages/runs.rs",
+        source: RUNS_RS,
+        hook: "class=\"row-stretch\"",
+    },
+    Contract {
+        assignment: "rowStretch: '.row-stretch',",
+        source_path: "src/pages/history.rs",
+        source: HISTORY_RS,
+        hook: "class=\"row-stretch\"",
+    },
+    Contract {
+        assignment: "schemaQuickAction: '.row-act .qa',",
+        source_path: "src/pages/schema.rs",
+        source: SCHEMA_RS,
+        hook: "class=\"row-act\"",
+    },
+    Contract {
+        assignment: "schemaQuickAction: '.row-act .qa',",
+        source_path: "src/pages/schema.rs",
+        source: SCHEMA_RS,
+        hook: "class=\"qa\"",
+    },
+    // Two files: the header band belongs to the page, the control
+    // inside it to the shared helper.
+    Contract {
+        assignment: "tableSortControl: '.tbl-hd .th.sortable button',",
+        source_path: "src/pages/schema.rs",
+        source: SCHEMA_RS,
+        hook: "class=\"tbl-hd\"",
+    },
+    Contract {
+        assignment: "tableSortControl: '.tbl-hd .th.sortable button',",
+        source_path: "src/pages/nets.rs",
+        source: NETS_RS,
+        hook: "class=\"tbl-hd\"",
+    },
+    Contract {
+        assignment: "tableSortControl: '.tbl-hd .th.sortable button',",
+        source_path: "src/components/sort_th.rs",
+        source: SORT_TH_RS,
+        hook: "class=\"th sortable\"",
+    },
+    Contract {
+        assignment: "historySaveAsNet: 'button.link',",
+        source_path: "src/pages/history.rs",
+        source: HISTORY_RS,
+        hook: "class=\"link\"",
+    },
+    // -- results table --------------------------------------------------
+    Contract {
+        assignment: "resultsRow: '.results-table tbody tr',",
+        source_path: "src/components/results_table.rs",
+        source: RESULTS_TABLE_RS,
+        hook: "class=\"results-table\"",
+    },
+    Contract {
+        assignment: "resultsRow: '.results-table tbody tr',",
+        source_path: "src/components/results_table.rs",
+        source: RESULTS_TABLE_RS,
+        hook: "<tbody>",
+    },
+    Contract {
+        assignment: "resultsExpandControl: '.results-table td.exp-col button.row-stretch',",
+        source_path: "src/components/results_table.rs",
+        source: RESULTS_TABLE_RS,
+        hook: "class=\"exp-col\"",
+    },
+    Contract {
+        assignment: "resultsExpandControl: '.results-table td.exp-col button.row-stretch',",
+        source_path: "src/components/results_table.rs",
+        source: RESULTS_TABLE_RS,
+        hook: "class=\"row-stretch\"",
+    },
+    Contract {
+        assignment: "resultsDetailCell: '.results-table td.detail',",
+        source_path: "src/components/results_table.rs",
+        source: RESULTS_TABLE_RS,
+        hook: "class=\"detail\"",
+    },
+    Contract {
+        assignment: "resultsDetailTag: '.results-table td.detail button.tag',",
+        source_path: "src/components/results_table.rs",
+        source: RESULTS_TABLE_RS,
+        hook: "class=\"tag\"",
+    },
+    Contract {
+        assignment: "resultsSortHeader: '.results-table th.sortable',",
+        source_path: "src/components/results_table.rs",
+        source: RESULTS_TABLE_RS,
+        hook: "class=\"sortable\"",
+    },
+    // The direction attribute the spec reads off that header. Pinned
+    // separately: a `<th class="sortable">` with no `aria-sort` is
+    // exactly mutation 19, and the selector alone cannot see it.
+    Contract {
+        assignment: "resultsSortHeader: '.results-table th.sortable',",
+        source_path: "src/components/results_table.rs",
+        source: RESULTS_TABLE_RS,
+        hook: "aria-sort=move ||",
+    },
+    Contract {
+        assignment: "resultsSortControl: '.results-table th.sortable button.th-sort',",
+        source_path: "src/components/results_table.rs",
+        source: RESULTS_TABLE_RS,
+        hook: "class=\"th-sort\"",
+    },
+    // -- service drawer -------------------------------------------------
+    Contract {
+        assignment: "serviceFieldRow: '.sd-fields .sf-row',",
+        source_path: "src/components/service_drawer.rs",
+        source: SERVICE_DRAWER_RS,
+        hook: "class=\"sd-fields\"",
+    },
+    // The row class is computed (`sf-row` / `sf-row open`), so the hook
+    // is the literal inside that closure rather than an attribute.
+    Contract {
+        assignment: "serviceFieldRow: '.sd-fields .sf-row',",
+        source_path: "src/components/service_drawer.rs",
+        source: SERVICE_DRAWER_RS,
+        hook: "\"sf-row\"",
+    },
+    // The service drawer's field row uses the shared `rowStretch`
+    // selector, so its own control is pinned here rather than under a
+    // second name.
+    Contract {
+        assignment: "rowStretch: '.row-stretch',",
+        source_path: "src/components/service_drawer.rs",
+        source: SERVICE_DRAWER_RS,
+        hook: "class=\"row-stretch\"",
+    },
+    Contract {
+        assignment: "serviceDegradedBadge: 'button.deg-btn',",
+        source_path: "src/components/service_drawer.rs",
+        source: SERVICE_DRAWER_RS,
+        hook: "class=\"deg-btn\"",
+    },
+    Contract {
+        assignment: "serviceFieldSortControl: '.sf-hd .th.sortable button',",
+        source_path: "src/components/service_drawer.rs",
+        source: SERVICE_DRAWER_RS,
+        hook: "class=\"sf-hd\"",
+    },
+    Contract {
+        assignment: "serviceFieldSortControl: '.sf-hd .th.sortable button',",
+        source_path: "src/components/sort_th.rs",
+        source: SORT_TH_RS,
+        hook: "class=\"th sortable\"",
+    },
+    Contract {
+        assignment: "serviceTopField: '.topfields .tf button.fn',",
+        source_path: "src/components/service_drawer.rs",
+        source: SERVICE_DRAWER_RS,
+        hook: "class=\"topfields\"",
+    },
+    Contract {
+        assignment: "serviceTopField: '.topfields .tf button.fn',",
+        source_path: "src/components/service_drawer.rs",
+        source: SERVICE_DRAWER_RS,
+        hook: "class=\"tf\"",
+    },
+    Contract {
+        assignment: "serviceTopField: '.topfields .tf button.fn',",
+        source_path: "src/components/service_drawer.rs",
+        source: SERVICE_DRAWER_RS,
+        hook: "class=\"fn row-stretch\"",
+    },
+    // -- facet rail -----------------------------------------------------
+    Contract {
+        assignment: "facetGroup: '.facets .g',",
+        source_path: "src/components/facet_sidebar.rs",
+        source: FACET_SIDEBAR_RS,
+        hook: "class=\"facets\"",
+    },
+    Contract {
+        assignment: "facetGroup: '.facets .g',",
+        source_path: "src/components/facet_sidebar.rs",
+        source: FACET_SIDEBAR_RS,
+        hook: "class=\"g\"",
+    },
+    Contract {
+        assignment: "facetGroupHeader: 'button.g-hd',",
+        source_path: "src/components/facet_sidebar.rs",
+        source: FACET_SIDEBAR_RS,
+        hook: "class=\"g-hd\"",
+    },
+    Contract {
+        assignment: "facetValue: '.vals .v',",
+        source_path: "src/components/facet_sidebar.rs",
+        source: FACET_SIDEBAR_RS,
+        hook: "class=\"vals\"",
+    },
+    Contract {
+        assignment: "facetValue: '.vals .v',",
+        source_path: "src/components/facet_sidebar.rs",
+        source: FACET_SIDEBAR_RS,
+        hook: "class=\"v\"",
+    },
+    Contract {
+        assignment: "facetValueName: '.n',",
+        source_path: "src/components/facet_sidebar.rs",
+        source: FACET_SIDEBAR_RS,
+        hook: "class=\"n\"",
+    },
+    Contract {
+        assignment: "facetActions: '.act',",
+        source_path: "src/components/facet_sidebar.rs",
+        source: FACET_SIDEBAR_RS,
+        hook: "class=\"act\"",
+    },
+    Contract {
+        assignment: "facetOp: '.act button.op',",
+        source_path: "src/components/facet_sidebar.rs",
+        source: FACET_SIDEBAR_RS,
+        hook: "class=\"op\"",
+    },
+    Contract {
+        assignment: "facetMore: 'button.more',",
+        source_path: "src/components/facet_sidebar.rs",
+        source: FACET_SIDEBAR_RS,
+        hook: "class=\"more\"",
+    },
+    Contract {
+        assignment: "facetClear: '.facets .phead button.clear',",
+        source_path: "src/components/facet_sidebar.rs",
+        source: FACET_SIDEBAR_RS,
+        hook: "class=\"phead\"",
+    },
+    Contract {
+        assignment: "facetClear: '.facets .phead button.clear',",
+        source_path: "src/components/facet_sidebar.rs",
+        source: FACET_SIDEBAR_RS,
+        hook: "class=\"clear\"",
+    },
+    Contract {
+        assignment: "facetFilterInput: '.facets .inp-wrap input',",
+        source_path: "src/components/facet_sidebar.rs",
+        source: FACET_SIDEBAR_RS,
+        hook: "<SearchInput value=needle",
+    },
+    Contract {
+        assignment: "facetFilterInput: '.facets .inp-wrap input',",
+        source_path: "../fleet-ui/src/search_input.rs",
+        source: SEARCH_INPUT_RS,
+        hook: "class=\"inp-wrap\"",
+    },
+    Contract {
+        assignment: "filterChip: '.meta-chips .chip',",
+        source_path: "src/components/meta_strip.rs",
+        source: META_STRIP_RS,
+        hook: "class=\"meta-chips\"",
+    },
+    Contract {
+        assignment: "filterChip: '.meta-chips .chip',",
+        source_path: "src/components/meta_strip.rs",
+        source: META_STRIP_RS,
+        hook: "class=\"chip\"",
+    },
+    // -- chrome ---------------------------------------------------------
+    Contract {
+        assignment: "chipRemove: '.meta-chips .chip button.x',",
+        source_path: "src/components/meta_strip.rs",
+        source: META_STRIP_RS,
+        hook: "class=\"meta-chips\"",
+    },
+    Contract {
+        assignment: "chipRemove: '.meta-chips .chip button.x',",
+        source_path: "src/components/meta_strip.rs",
+        source: META_STRIP_RS,
+        hook: "class=\"x\"",
+    },
+    Contract {
+        assignment: "themeControl: '.statusbar button.grp.clickable',",
+        source_path: "src/components/status_bar.rs",
+        source: STATUS_BAR_RS,
+        hook: "class=\"statusbar\"",
+    },
+    Contract {
+        assignment: "themeControl: '.statusbar button.grp.clickable',",
+        source_path: "src/components/status_bar.rs",
+        source: STATUS_BAR_RS,
+        hook: "class=\"grp clickable\"",
+    },
+    Contract {
+        assignment: "intervalChip: '.interval-chips button.interval-chip',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "class=\"interval-chips\"",
+    },
+    // The chip's class is computed, so the hook is the literal the
+    // closure writes when the preset is not the chosen one.
+    Contract {
+        assignment: "intervalChip: '.interval-chips button.interval-chip',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "\"interval-chip\"",
+    },
+    Contract {
+        assignment: "netRename: '.sd-ttl button.name',",
+        source_path: "../fleet-ui/src/drawer.rs",
+        source: DRAWER_RS,
+        hook: "class=\"sd-ttl\"",
+    },
+    Contract {
+        assignment: "netRename: '.sd-ttl button.name',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "class=\"name\"",
+    },
+    Contract {
+        assignment: "netRenameInput: '.sd-ttl input.name-edit',",
+        source_path: "../fleet-ui/src/drawer.rs",
+        source: DRAWER_RS,
+        hook: "class=\"sd-ttl\"",
+    },
+    Contract {
+        assignment: "netRenameInput: '.sd-ttl input.name-edit',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "class=\"name-edit\"",
+    },
+    Contract {
+        assignment: "netRunRow: '.sd-body .tbl-body .tbl-row',",
+        source_path: "../fleet-ui/src/drawer.rs",
+        source: DRAWER_RS,
+        hook: "class=\"sd-body\"",
+    },
+    Contract {
+        assignment: "netRunRow: '.sd-body .tbl-body .tbl-row',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "class=\"tbl-row\"",
+    },
+    Contract {
+        assignment: "netRunPreview: '.sd-body .run-preview',",
+        source_path: "../fleet-ui/src/drawer.rs",
+        source: DRAWER_RS,
+        hook: "class=\"sd-body\"",
+    },
+    Contract {
+        assignment: "netRunPreview: '.sd-body .run-preview',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "class=\"run-preview\"",
+    },
+    // -- range dialog ---------------------------------------------------
+    Contract {
+        assignment: "rangeDialog: '.dr-pop[role=\"dialog\"]',",
+        source_path: "src/components/editor_wrap.rs",
+        source: EDITOR_WRAP_RS,
+        hook: "class=\"dr-pop\"",
+    },
+    Contract {
+        assignment: "rangeDialog: '.dr-pop[role=\"dialog\"]',",
+        source_path: "src/components/editor_wrap.rs",
+        source: EDITOR_WRAP_RS,
+        hook: "role=\"dialog\"",
+    },
+    Contract {
+        assignment: "rangeScrim: '.daterange .scrim',",
+        source_path: "src/components/editor_wrap.rs",
+        source: EDITOR_WRAP_RS,
+        hook: "class=\"daterange\"",
+    },
+    Contract {
+        assignment: "rangeScrim: '.daterange .scrim',",
+        source_path: "src/components/editor_wrap.rs",
+        source: EDITOR_WRAP_RS,
+        hook: "class=\"scrim\"",
+    },
+    Contract {
+        assignment: "segmentedOption: '.dr-pop .seg-opt',",
+        source_path: "src/components/editor_wrap.rs",
+        source: EDITOR_WRAP_RS,
+        hook: "class=\"dr-pop\"",
+    },
+    Contract {
+        assignment: "segmentedOption: '.dr-pop .seg-opt',",
+        source_path: "../fleet-ui/src/segmented/component.rs",
+        source: SEGMENTED_COMPONENT_RS,
+        hook: "class=\"seg-opt\"",
+    },
+    Contract {
+        assignment: "dateRangeFromLabel: 'label[for=\"dr-from-input\"]',",
+        source_path: "src/components/editor_wrap.rs",
+        source: EDITOR_WRAP_RS,
+        hook: "for=\"dr-from-input\"",
+    },
+    Contract {
+        assignment: "dateRangeToLabel: 'label[for=\"dr-to-input\"]',",
+        source_path: "src/components/editor_wrap.rs",
+        source: EDITOR_WRAP_RS,
+        hook: "for=\"dr-to-input\"",
+    },
+    // -- accessible names that are Rust format strings ------------------
+    Contract {
+        assignment: "sortName: 'Sort by {label}',",
+        source_path: "src/sort_label.rs",
+        source: SORT_LABEL_RS,
+        hook: "format!(\"Sort by {label}\")",
+    },
+    Contract {
+        assignment: "sortNameAscending: 'Sort by {label}, ascending',",
+        source_path: "src/sort_label.rs",
+        source: SORT_LABEL_RS,
+        hook: "format!(\"Sort by {label}, ascending\")",
+    },
+    Contract {
+        assignment: "sortNameDescending: 'Sort by {label}, descending',",
+        source_path: "src/sort_label.rs",
+        source: SORT_LABEL_RS,
+        hook: "format!(\"Sort by {label}, descending\")",
+    },
+    Contract {
+        assignment: "resultsExpandName: 'Show details for result {}',",
+        source_path: "src/components/results_table.rs",
+        source: RESULTS_TABLE_RS,
+        hook: "\"Show details for result {}\"",
+    },
+    Contract {
+        assignment: "resultsSortName: 'Sort by {column}',",
+        source_path: "src/components/results_table.rs",
+        source: RESULTS_TABLE_RS,
+        hook: "format!(\"Sort by {name}\")",
+    },
+    Contract {
+        assignment: "schemaServiceHeader: 'Service',",
+        source_path: "src/pages/schema.rs",
+        source: SCHEMA_RS,
+        hook: "\"Service\"",
+    },
+    Contract {
+        assignment: "schemaEventsHeader: 'Events',",
+        source_path: "src/pages/schema.rs",
+        source: SCHEMA_RS,
+        hook: "\"Events\"",
+    },
+    Contract {
+        assignment: "serviceFieldHeader: 'Field',",
+        source_path: "src/components/service_drawer.rs",
+        source: SERVICE_DRAWER_RS,
+        hook: "\"Field\"",
+    },
+    Contract {
+        assignment: "serviceCardinalityHeader: 'Cardinality',",
+        source_path: "src/components/service_drawer.rs",
+        source: SERVICE_DRAWER_RS,
+        hook: "\"Cardinality\"",
+    },
+    Contract {
+        assignment: "resultsTagName: 'Include {field_for_label} = {value_for_label}',",
+        source_path: "src/components/results_table.rs",
+        source: RESULTS_TABLE_RS,
+        hook: "\"Include {field_for_label} = {value_for_label}\"",
+    },
+    Contract {
+        assignment: "facetIncludeName: 'Include {field} = {v}',",
+        source_path: "src/components/facet_sidebar.rs",
+        source: FACET_SIDEBAR_RS,
+        hook: "format!(\"Include {field} = {v}\")",
+    },
+    Contract {
+        assignment: "facetExcludeName: 'Exclude {field} = {v}',",
+        source_path: "src/components/facet_sidebar.rs",
+        source: FACET_SIDEBAR_RS,
+        hook: "format!(\"Exclude {field} = {v}\")",
+    },
+    Contract {
+        assignment: "facetMoreName: 'Show {extra} more values for {field}',",
+        source_path: "src/components/facet_sidebar.rs",
+        source: FACET_SIDEBAR_RS,
+        hook: "format!(\"Show {extra} more values for {field}\")",
+    },
+    Contract {
+        assignment: "facetGroupName: '{field}, {total} values',",
+        source_path: "src/components/facet_sidebar.rs",
+        source: FACET_SIDEBAR_RS,
+        hook: "format!(\"{field}, {total} values\")",
+    },
+    Contract {
+        assignment: "chipRemoveName: 'Remove filter {} = {}',",
+        source_path: "src/components/meta_strip.rs",
+        source: META_STRIP_RS,
+        hook: "\"Remove filter {} = {}\"",
+    },
+    Contract {
+        assignment: "schemaSearchName: 'Search {name_label_search}',",
+        source_path: "src/pages/schema.rs",
+        source: SCHEMA_RS,
+        hook: "format!(\"Search {name_label_search}\")",
+    },
+    Contract {
+        assignment: "schemaTailName: 'Live tail {name_label_tail}',",
+        source_path: "src/pages/schema.rs",
+        source: SCHEMA_RS,
+        hook: "format!(\"Live tail {name_label_tail}\")",
+    },
+    Contract {
+        assignment: "themeSwitchName: 'Theme {current}: switch to {next} theme',",
+        source_path: "src/components/status_bar.rs",
+        source: STATUS_BAR_RS,
+        hook: "\"Theme {current}: switch to {next} theme\"",
+    },
+    Contract {
+        assignment: "netRenameName: 'Rename {name}',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "format!(\"Rename {name}\")",
+    },
+    Contract {
+        assignment: "netRenameInputName: 'New name for {name}',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "format!(\"New name for {name}\")",
+    },
+    Contract {
+        assignment: "rangeDialogName: 'Time range',",
+        source_path: "src/components/editor_wrap.rs",
+        source: EDITOR_WRAP_RS,
+        hook: "aria-label=\"Time range\"",
+    },
+    Contract {
+        assignment: "addScheduleButton: '+ Add Schedule',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "\"+ Add Schedule\"",
+    },
+    // -- the DSL shapes the stub dispatches on --------------------------
+    // `e2e_wire_fixture_contract.rs` proves these against the builders by
+    // CALLING them, which is the stronger half; these rows keep the
+    // selector sheet's own copy honest about which source writes them.
+    Contract {
+        assignment: "queryShapeTopValues: '| top 10 ',",
+        source_path: "src/drawer_query.rs",
+        source: DRAWER_QUERY_RS,
+        hook: "| top 10 ",
+    },
+    // Two rows, because `| stats dc(` is assembled: the stage comes from
+    // the query's format string and `dc(` from the per-field expression,
+    // so no single line of that file carries the substring.
+    Contract {
+        assignment: "queryShapeCardinality: '| stats dc(',",
+        source_path: "src/drawer_query.rs",
+        source: DRAWER_QUERY_RS,
+        hook: "last=7d | stats {}",
+    },
+    Contract {
+        assignment: "queryShapeCardinality: '| stats dc(',",
+        source_path: "src/drawer_query.rs",
+        source: DRAWER_QUERY_RS,
+        hook: "dc({field}) as {field}",
+    },
+    Contract {
+        assignment: "queryShapeTimechart: '| timechart span=1h count()',",
+        source_path: "src/components/service_drawer.rs",
+        source: SERVICE_DRAWER_RS,
+        hook: "| timechart span=1h count()",
+    },
 ];
 
 #[test]
@@ -718,4 +1338,197 @@ fn every_selectors_ts_entry_is_pinned() {
             );
         }
     }
+}
+
+// ---- key uniqueness ---------------------------------------------------
+//
+// A duplicate key inside one object literal is silent in both languages
+// that read these files. TypeScript's checker rejects it, but the specs
+// run through a transpiler that only strips types, so the LAST spelling
+// wins and the earlier one disappears without a word. That is exactly
+// what two seats writing the same sort-header pins produced: two
+// `schemaEventsHeader` keys in `COPY`, two `fieldFirstAlphabetically`
+// in `CORPUS`, and a `CONTRACTS` table with both copies pinned.
+//
+// The same NAME in two different objects is fine and deliberate:
+// `CORPUS.netId` mirrors `POPULATED.netId` because `corpus` is
+// `populated` plus data.
+
+const FIXTURES_TS: &str = include_str!("../e2e/fixtures.ts");
+
+/// `ts` with every string literal and comment blanked to spaces, so a
+/// brace inside `'Remove filter {} = {}'` cannot be read as structure.
+/// Line breaks survive, because the key scan is line-based.
+fn blanked(ts: &str) -> String {
+    let chars: Vec<char> = ts.chars().collect();
+    let mut out = String::with_capacity(ts.len());
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            '\'' | '"' | '`' => {
+                out.push(' ');
+                i += 1;
+                while i < chars.len() && chars[i] != c {
+                    if chars[i] == '\\' {
+                        out.push(' ');
+                        i += 1;
+                        if i < chars.len() {
+                            out.push(if chars[i] == '\n' { '\n' } else { ' ' });
+                            i += 1;
+                        }
+                        continue;
+                    }
+                    out.push(if chars[i] == '\n' { '\n' } else { ' ' });
+                    i += 1;
+                }
+                if i < chars.len() {
+                    out.push(' ');
+                    i += 1;
+                }
+            }
+            '/' if chars.get(i + 1) == Some(&'/') => {
+                while i < chars.len() && chars[i] != '\n' {
+                    out.push(' ');
+                    i += 1;
+                }
+            }
+            '/' if chars.get(i + 1) == Some(&'*') => {
+                out.push_str("  ");
+                i += 2;
+                while i < chars.len() && !(chars[i] == '*' && chars.get(i + 1) == Some(&'/')) {
+                    out.push(if chars[i] == '\n' { '\n' } else { ' ' });
+                    i += 1;
+                }
+                out.push_str("  ");
+                i = (i + 2).min(chars.len());
+            }
+            _ => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// The keys declared directly inside one object literal, in source
+/// order, repeats included. `decl` is the text up to and including that
+/// object's opening brace.
+fn top_level_keys(ts: &str, decl: &str) -> Vec<String> {
+    let blank = blanked(ts);
+    let start = blank
+        .find(decl)
+        .unwrap_or_else(|| panic!("no `{decl}` in the file"))
+        + decl.len();
+    let mut depth = 1usize;
+    let mut keys = Vec::new();
+    for line in blank[start..].lines() {
+        if depth == 1 {
+            let trimmed = line.trim_start();
+            if let Some((key, _)) = trimmed.split_once(':')
+                && !key.is_empty()
+                && key
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+            {
+                keys.push(key.to_owned());
+            }
+        }
+        for ch in line.chars() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return keys;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    panic!("`{decl}` is never closed");
+}
+
+fn assert_keys_unique(file: &str, object: &str, keys: &[String]) {
+    // Non-vacuous: an object the scan cannot find yields nothing, and
+    // a uniqueness check over nothing passes forever. `TIMING` really
+    // does hold one key, so one is the floor rather than two.
+    assert!(
+        !keys.is_empty(),
+        "{file}'s {object} yielded no keys — the scan found the wrong \
+         object, or the declaration was renamed",
+    );
+    let mut seen = std::collections::BTreeSet::new();
+    let dupes: Vec<&String> = keys.iter().filter(|k| !seen.insert(*k)).collect();
+    assert!(
+        dupes.is_empty(),
+        "{file}'s {object} declares {dupes:?} more than once. The \
+         transpiler keeps the LAST spelling and drops the earlier one \
+         without a word, so one of the two is already dead.",
+    );
+}
+
+#[test]
+fn every_selector_and_pin_key_is_declared_once() {
+    for (file, ts, object, decl) in [
+        (
+            "e2e/selectors.ts",
+            SELECTORS_TS,
+            "SEL",
+            "export const SEL = {",
+        ),
+        (
+            "e2e/selectors.ts",
+            SELECTORS_TS,
+            "TIMING",
+            "export const TIMING = {",
+        ),
+        (
+            "e2e/selectors.ts",
+            SELECTORS_TS,
+            "COPY",
+            "export const COPY = {",
+        ),
+        (
+            "e2e/fixtures.ts",
+            FIXTURES_TS,
+            "POPULATED",
+            "export const POPULATED = {",
+        ),
+        (
+            "e2e/fixtures.ts",
+            FIXTURES_TS,
+            "CORPUS",
+            "export const CORPUS = {",
+        ),
+    ] {
+        assert_keys_unique(file, object, &top_level_keys(ts, decl));
+    }
+}
+
+#[test]
+fn the_key_scan_reads_nesting_strings_and_comments() {
+    let src = "export const A = {\n  one: 'a { b }',\n  // two: 'commented out',\n  \
+               nested: { one: 1, deep: { one: 2 } },\n  two: `x`,\n} as const;\n\
+               export const B = {\n  one: 'shared name, different object',\n} as const;\n";
+    // Braces inside a string, a commented-out key and a nested object's
+    // own keys are all invisible to the top-level scan.
+    assert_eq!(
+        top_level_keys(src, "export const A = {"),
+        vec!["one".to_owned(), "nested".to_owned(), "two".to_owned()],
+    );
+    // The same name in a second object is not a duplicate.
+    assert_eq!(
+        top_level_keys(src, "export const B = {"),
+        vec!["one".to_owned()]
+    );
+
+    let dup = "export const A = {\n  one: 'x',\n  two: 'y',\n  one: 'z',\n} as const;\n";
+    let keys = top_level_keys(dup, "export const A = {");
+    assert_eq!(keys.len(), 3, "the scan must see both spellings: {keys:?}");
+    let panicked =
+        std::panic::catch_unwind(|| assert_keys_unique("fixture.ts", "A", &keys)).is_err();
+    assert!(panicked, "a key declared twice in one object must fail");
 }

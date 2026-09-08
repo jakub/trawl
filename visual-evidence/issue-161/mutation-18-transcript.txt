@@ -1,0 +1,245 @@
+=== 18-facet-actions-display-none.patch -> facets.spec.ts ===
+-- trunk build --
+2026-09-08T00:16:03.137882Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-08T00:16:03.137997Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-core)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.98s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-08T00:16:11.038445Z  INFO applying new distribution
+2026-09-08T00:16:11.040857Z  INFO ✅ success
+-- playwright test tests/facets.spec.ts --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/facets.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/dist)
+
+Running 6 tests using 1 worker
+
+  ✘  1 [chromium] › tests/facets.spec.ts:49:5 › include is reachable by Tab and adds one filter (5.5s)
+  ✘  2 [chromium] › tests/facets.spec.ts:83:5 › exclude on Space adds one filter (5.6s)
+  ✓  3 [chromium] › tests/facets.spec.ts:107:5 › group header toggles aria-expanded (632ms)
+  ✘  4 [chromium] › tests/facets.spec.ts:136:5 › show more reveals the hidden values (5.5s)
+  ✘  5 [chromium] › tests/facets.spec.ts:164:5 › long value keeps clear of the actions (5.6s)
+  ✘  6 [chromium] › tests/facets.spec.ts:202:5 › clear all removes every filter (20.1s)
+
+
+  1) [chromium] › tests/facets.spec.ts:49:5 › include is reachable by Tab and adds one filter ──────
+
+    Error: expect(locator).toHaveJSProperty(expected) failed
+
+    Locator: locator('.facets .g').filter({ has: getByRole('button', { name: 'host, 6 values' }) }).locator('.vals .v').first().getByRole('button', { name: 'Include host = web-01' })
+    Expected: "BUTTON"
+    Timeout: 5000ms
+    Error: element(s) not found
+
+    Call log:
+      - Expect "toHaveJSProperty" with timeout 5000ms
+      - waiting for locator('.facets .g').filter({ has: getByRole('button', { name: 'host, 6 values' }) }).locator('.vals .v').first().getByRole('button', { name: 'Include host = web-01' })
+
+
+      56 |     name: nameFrom(COPY.facetIncludeName, FIELD, VALUE),
+      57 |   });
+    > 58 |   await expect(include).toHaveJSProperty('tagName', 'BUTTON');
+         |                         ^
+      59 |   await expect(include).toHaveAttribute('type', 'button');
+      60 |   // Hidden at rest, and hidden by opacity: `display: none` would keep
+      61 |   // the Tab below from ever reaching it.
+        at /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/e2e/tests/facets.spec.ts:58:25
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/facets-include-is-reachable-by-Tab-and-adds-one-filter-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/facets-include-is-reachable-by-Tab-and-adds-one-filter-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/facets-include-is-reachable-by-Tab-and-adds-one-filter-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/facets-include-is-reachable-by-Tab-and-adds-one-filter-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  2) [chromium] › tests/facets.spec.ts:83:5 › exclude on Space adds one filter ─────────────────────
+
+    Error: expect(locator).toHaveJSProperty(expected) failed
+
+    Locator: locator('.facets .g').filter({ has: getByRole('button', { name: 'host, 6 values' }) }).locator('.vals .v').first().getByRole('button', { name: 'Exclude host = web-01' })
+    Expected: "BUTTON"
+    Timeout: 5000ms
+    Error: element(s) not found
+
+    Call log:
+      - Expect "toHaveJSProperty" with timeout 5000ms
+      - waiting for locator('.facets .g').filter({ has: getByRole('button', { name: 'host, 6 values' }) }).locator('.vals .v').first().getByRole('button', { name: 'Exclude host = web-01' })
+
+
+      89 |     name: nameFrom(COPY.facetExcludeName, FIELD, VALUE),
+      90 |   });
+    > 91 |   await expect(exclude).toHaveJSProperty('tagName', 'BUTTON');
+         |                         ^
+      92 |
+      93 |   // Two stops past the header: include, then exclude.
+      94 |   await group.locator(SEL.facetGroupHeader).focus();
+        at /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/e2e/tests/facets.spec.ts:91:25
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/facets-exclude-on-Space-adds-one-filter-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/facets-exclude-on-Space-adds-one-filter-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/facets-exclude-on-Space-adds-one-filter-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/facets-exclude-on-Space-adds-one-filter-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  3) [chromium] › tests/facets.spec.ts:136:5 › show more reveals the hidden values ─────────────────
+
+    Error: expect(locator).toBeFocused() failed
+
+    Locator:  locator('.facets .g').filter({ has: getByRole('button', { name: 'host, 6 values' }) }).locator('button.more')
+    Expected: focused
+    Received: inactive
+    Timeout:  5000ms
+
+    Call log:
+      - Expect "toBeFocused" with timeout 5000ms
+      - waiting for locator('.facets .g').filter({ has: getByRole('button', { name: 'host, 6 values' }) }).locator('button.more')
+        14 × locator resolved to <button class="more" type="button" aria-label="Show 1 more values for host">+ 1 more</button>
+           - unexpected value "inactive"
+
+
+      27 |
+      28 | async function expectFocusRing(control: Loc): Promise<void> {
+    > 29 |   await expect(control).toBeFocused();
+         |                         ^
+      30 |   expect(await control.evaluate((el) => el.matches(':focus-visible'))).toBe(true);
+      31 |   expect(await control.evaluate((el) => getComputedStyle(el).boxShadow)).not.toBe('none');
+      32 | }
+        at expectFocusRing (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/e2e/tests/facets.spec.ts:29:25)
+        at /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/e2e/tests/facets.spec.ts:151:9
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/facets-show-more-reveals-the-hidden-values-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/facets-show-more-reveals-the-hidden-values-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/facets-show-more-reveals-the-hidden-values-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/facets-show-more-reveals-the-hidden-values-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  4) [chromium] › tests/facets.spec.ts:164:5 › long value keeps clear of the actions ───────────────
+
+    Error: expect(locator).toBeFocused() failed
+
+    Locator:  locator('.facets .g').filter({ has: getByRole('button', { name: 'host, 6 values' }) }).locator('.vals .v').first().locator('.act button.op').first()
+    Expected: focused
+    Received: inactive
+    Timeout:  5000ms
+
+    Call log:
+      - Expect "toBeFocused" with timeout 5000ms
+      - waiting for locator('.facets .g').filter({ has: getByRole('button', { name: 'host, 6 values' }) }).locator('.vals .v').first().locator('.act button.op').first()
+        14 × locator resolved to <button class="op" type="button" title="Include" aria-label="Include host = web-01">…</button>
+           - unexpected value "inactive"
+
+
+      177 |   await group.locator(SEL.facetGroupHeader).focus();
+      178 |   await page.keyboard.press('Tab');
+    > 179 |   await expect(row.locator(SEL.facetOp).first()).toBeFocused();
+          |                                                  ^
+      180 |
+      181 |   const geometry = await row.evaluate((el) => {
+      182 |     const name = el.querySelector('.n')!.getBoundingClientRect();
+        at /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/e2e/tests/facets.spec.ts:179:50
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/facets-long-value-keeps-clear-of-the-actions-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/facets-long-value-keeps-clear-of-the-actions-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/facets-long-value-keeps-clear-of-the-actions-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/facets-long-value-keeps-clear-of-the-actions-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  5) [chromium] › tests/facets.spec.ts:202:5 › clear all removes every filter ──────────────────────
+
+    Test timeout of 20000ms exceeded.
+
+    Error: locator.click: Test timeout of 20000ms exceeded.
+    Call log:
+      - waiting for locator('.facets .g').filter({ has: getByRole('button', { name: 'host, 6 values' }) }).getByRole('button', { name: 'Include host = web-01' })
+
+
+      209 |     await hostGroup(page)
+      210 |       .getByRole('button', { name: nameFrom(COPY.facetIncludeName, FIELD, value) })
+    > 211 |       .click();
+          |        ^
+      212 |   };
+      213 |   await addInclude(CORPUS.hosts[0]);
+      214 |   await expect(page.locator(SEL.filterChip)).toHaveCount(1);
+        at addInclude (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/e2e/tests/facets.spec.ts:211:8)
+        at /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/e2e/tests/facets.spec.ts:213:9
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/facets-clear-all-removes-every-filter-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/facets-clear-all-removes-every-filter-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/facets-clear-all-removes-every-filter-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/facets-clear-all-removes-every-filter-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  5 failed
+    [chromium] › tests/facets.spec.ts:49:5 › include is reachable by Tab and adds one filter ───────
+    [chromium] › tests/facets.spec.ts:83:5 › exclude on Space adds one filter ──────────────────────
+    [chromium] › tests/facets.spec.ts:136:5 › show more reveals the hidden values ──────────────────
+    [chromium] › tests/facets.spec.ts:164:5 › long value keeps clear of the actions ────────────────
+    [chromium] › tests/facets.spec.ts:202:5 › clear all removes every filter ───────────────────────
+  1 passed (44.6s)
+-- control: playwright test tests/routing.spec.ts (must pass) --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/routing.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/dist)
+
+Running 3 tests using 1 worker
+
+  ✓  1 [chromium] › tests/routing.spec.ts:8:5 › / redirects to /search and mounts the DSL editor (728ms)
+  ✓  2 [chromium] › tests/routing.spec.ts:14:5 › rail link to history navigates without a full page load (479ms)
+  ✓  3 [chromium] › tests/routing.spec.ts:31:5 › an unknown route renders the 404 page (323ms)
+
+  3 passed (2.0s)
+-- trunk build (restore pristine dist) --
+2026-09-08T00:16:58.826046Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-08T00:16:58.826167Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-core)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.96s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-08T00:17:06.105039Z  INFO applying new distribution
+2026-09-08T00:17:06.108788Z  INFO ✅ success
+
+mutation-check results:
+patch                                outcome
+18-facet-actions-display-none.patch  PASS (target spec failed, control passed, exit 1)

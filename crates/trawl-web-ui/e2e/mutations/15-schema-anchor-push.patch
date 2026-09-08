@@ -1,0 +1,20 @@
+diff --git a/crates/trawl-web-ui/src/pages/schema.rs b/crates/trawl-web-ui/src/pages/schema.rs
+index 1e221de6..2b5734dd 100644
+--- a/crates/trawl-web-ui/src/pages/schema.rs
++++ b/crates/trawl-web-ui/src/pages/schema.rs
+@@ -438,7 +438,14 @@ pub fn SchemaPage() -> impl IntoView {
+                                             <a
+                                                 class="row-stretch"
+                                                 href=href
+-                                                prop:replace=true
++                                                // MUTANT: the replace
++                                                // property is gone, so
++                                                // the drawer pushes a
++                                                // second history entry
++                                                // and Back lands on the
++                                                // drawer-less schema
++                                                // page instead of the
++                                                // page before it.
+                                                 // Not navigation and not a
+                                                 // preventDefault: a drawer
+                                                 // opened from the table has

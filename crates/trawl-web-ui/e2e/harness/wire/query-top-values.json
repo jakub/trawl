@@ -1,0 +1,12 @@
+{
+  "columns": [{ "name": "value" }, { "name": "count" }],
+  "rows": [
+    ["200", 940],
+    ["404", 150],
+    ["500", 60],
+    ["301", 30],
+    ["503", 20]
+  ],
+  "truncated": false,
+  "pagination": { "limit": 50, "offset": 0, "returned": 5 }
+}

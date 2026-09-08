@@ -1,0 +1,835 @@
+########## run 1 of 5 ##########
+=== 17-range-dialog-no-layer.patch -> range-dialog.spec.ts ===
+-- trunk build --
+2026-09-07T23:37:06.487015Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T23:37:06.487122Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-core)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 10.05s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T23:37:22.147396Z  INFO applying new distribution
+2026-09-07T23:37:22.148913Z  INFO ✅ success
+-- playwright test tests/range-dialog.spec.ts --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/range-dialog.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/dist)
+
+Running 5 tests using 1 worker
+
+  ✘  1 [chromium] › tests/range-dialog.spec.ts:37:5 › opens from the keyboard and focuses the first control (5.6s)
+  ✘  2 [chromium] › tests/range-dialog.spec.ts:70:5 › Tab does not leave the dialog (649ms)
+  ✘  3 [chromium] › tests/range-dialog.spec.ts:96:5 › Escape restores the trigger (5.6s)
+  ✓  4 [chromium] › tests/range-dialog.spec.ts:112:5 › scrim mousedown closes (550ms)
+  ✓  5 [chromium] › tests/range-dialog.spec.ts:136:5 › From and To are labelled (527ms)
+
+
+  1) [chromium] › tests/range-dialog.spec.ts:37:5 › opens from the keyboard and focuses the first control 
+
+    Error: expect(locator).toBeFocused() failed
+
+    Locator:  locator('.dr-pop .seg-opt').first()
+    Expected: focused
+    Received: inactive
+    Timeout:  5000ms
+
+    Call log:
+      - Expect "toBeFocused" with timeout 5000ms
+      - waiting for locator('.dr-pop .seg-opt').first()
+        14 × locator resolved to <button class="seg-opt on" aria-pressed="true">Relative</button>
+           - unexpected value "inactive"
+
+
+      57 |   await expect(trigger).toHaveAttribute('aria-expanded', 'true');
+      58 |   // The hook moves focus into the panel: the tab strip's first option.
+    > 59 |   await expect(page.locator(SEL.segmentedOption).first()).toBeFocused();
+         |                                                           ^
+      60 |
+      61 |   // Space opens it too — it is a button, so both keys are a click.
+      62 |   await page.keyboard.press('Escape');
+        at /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/e2e/tests/range-dialog.spec.ts:59:59
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/range-dialog-opens-from-th-c6bc7-d-focuses-the-first-control-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/range-dialog-opens-from-th-c6bc7-d-focuses-the-first-control-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/range-dialog-opens-from-th-c6bc7-d-focuses-the-first-control-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/range-dialog-opens-from-th-c6bc7-d-focuses-the-first-control-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  2) [chromium] › tests/range-dialog.spec.ts:70:5 › Tab does not leave the dialog ──────────────────
+
+    Error: Tab 10 escaped to the Run button
+
+    expect(received).toBe(expected) // Object.is equality
+
+    Expected: false
+    Received: true
+
+      89 |       };
+      90 |     });
+    > 91 |     expect(inside.isRun, `Tab ${i + 1} escaped to the Run button`).toBe(false);
+         |                                                                    ^
+      92 |     expect(inside.inPanel, `Tab ${i + 1} left the dialog`).toBe(true);
+      93 |   }
+      94 | });
+        at /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/e2e/tests/range-dialog.spec.ts:91:68
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/range-dialog-Tab-does-not-leave-the-dialog-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/range-dialog-Tab-does-not-leave-the-dialog-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/range-dialog-Tab-does-not-leave-the-dialog-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/range-dialog-Tab-does-not-leave-the-dialog-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  3) [chromium] › tests/range-dialog.spec.ts:96:5 › Escape restores the trigger ────────────────────
+
+    Error: expect(locator).toBeFocused() failed
+
+    Locator:  locator('.daterange .dr-trigger')
+    Expected: focused
+    Received: inactive
+    Timeout:  5000ms
+
+    Call log:
+      - Expect "toBeFocused" with timeout 5000ms
+      - waiting for locator('.daterange .dr-trigger')
+        14 × locator resolved to <button type="button" class="dr-trigger" aria-expanded="false" aria-haspopup="dialog">…</button>
+           - unexpected value "inactive"
+
+
+      106 |
+      107 |   await expect(page.locator(SEL.rangeDialog)).toHaveCount(0);
+    > 108 |   await expect(page.locator(SEL.dateRangeTrigger)).toBeFocused();
+          |                                                    ^
+      109 |   await expect(page.locator(SEL.dateRangeTrigger)).toHaveAttribute('aria-expanded', 'false');
+      110 | });
+      111 |
+        at /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/e2e/tests/range-dialog.spec.ts:108:52
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/range-dialog-Escape-restores-the-trigger-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/range-dialog-Escape-restores-the-trigger-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/range-dialog-Escape-restores-the-trigger-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/range-dialog-Escape-restores-the-trigger-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  3 failed
+    [chromium] › tests/range-dialog.spec.ts:37:5 › opens from the keyboard and focuses the first control 
+    [chromium] › tests/range-dialog.spec.ts:70:5 › Tab does not leave the dialog ───────────────────
+    [chromium] › tests/range-dialog.spec.ts:96:5 › Escape restores the trigger ─────────────────────
+  2 passed (14.2s)
+-- control: playwright test tests/routing.spec.ts (must pass) --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/routing.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/dist)
+
+Running 3 tests using 1 worker
+
+  ✓  1 [chromium] › tests/routing.spec.ts:8:5 › / redirects to /search and mounts the DSL editor (757ms)
+  ✓  2 [chromium] › tests/routing.spec.ts:14:5 › rail link to history navigates without a full page load (497ms)
+  ✓  3 [chromium] › tests/routing.spec.ts:31:5 › an unknown route renders the 404 page (337ms)
+
+  3 passed (2.0s)
+-- trunk build (restore pristine dist) --
+2026-09-07T23:37:39.785622Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T23:37:39.785730Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-core)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 9.93s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T23:37:55.354064Z  INFO applying new distribution
+2026-09-07T23:37:55.356113Z  INFO ✅ success
+
+mutation-check results:
+patch                                outcome
+17-range-dialog-no-layer.patch       PASS (target spec failed, control passed, exit 1)
+########## run 2 of 5 ##########
+=== 17-range-dialog-no-layer.patch -> range-dialog.spec.ts ===
+-- trunk build --
+2026-09-07T23:37:55.396687Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T23:37:55.396797Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-core)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 10.23s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T23:38:11.317737Z  INFO applying new distribution
+2026-09-07T23:38:11.321708Z  INFO ✅ success
+-- playwright test tests/range-dialog.spec.ts --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/range-dialog.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/dist)
+
+Running 5 tests using 1 worker
+
+  ✘  1 [chromium] › tests/range-dialog.spec.ts:37:5 › opens from the keyboard and focuses the first control (5.6s)
+  ✘  2 [chromium] › tests/range-dialog.spec.ts:70:5 › Tab does not leave the dialog (604ms)
+  ✘  3 [chromium] › tests/range-dialog.spec.ts:96:5 › Escape restores the trigger (5.6s)
+  ✓  4 [chromium] › tests/range-dialog.spec.ts:112:5 › scrim mousedown closes (567ms)
+  ✓  5 [chromium] › tests/range-dialog.spec.ts:136:5 › From and To are labelled (527ms)
+
+
+  1) [chromium] › tests/range-dialog.spec.ts:37:5 › opens from the keyboard and focuses the first control 
+
+    Error: expect(locator).toBeFocused() failed
+
+    Locator:  locator('.dr-pop .seg-opt').first()
+    Expected: focused
+    Received: inactive
+    Timeout:  5000ms
+
+    Call log:
+      - Expect "toBeFocused" with timeout 5000ms
+      - waiting for locator('.dr-pop .seg-opt').first()
+        14 × locator resolved to <button class="seg-opt on" aria-pressed="true">Relative</button>
+           - unexpected value "inactive"
+
+
+      57 |   await expect(trigger).toHaveAttribute('aria-expanded', 'true');
+      58 |   // The hook moves focus into the panel: the tab strip's first option.
+    > 59 |   await expect(page.locator(SEL.segmentedOption).first()).toBeFocused();
+         |                                                           ^
+      60 |
+      61 |   // Space opens it too — it is a button, so both keys are a click.
+      62 |   await page.keyboard.press('Escape');
+        at /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/e2e/tests/range-dialog.spec.ts:59:59
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/range-dialog-opens-from-th-c6bc7-d-focuses-the-first-control-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/range-dialog-opens-from-th-c6bc7-d-focuses-the-first-control-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/range-dialog-opens-from-th-c6bc7-d-focuses-the-first-control-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/range-dialog-opens-from-th-c6bc7-d-focuses-the-first-control-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  2) [chromium] › tests/range-dialog.spec.ts:70:5 › Tab does not leave the dialog ──────────────────
+
+    Error: Tab 10 escaped to the Run button
+
+    expect(received).toBe(expected) // Object.is equality
+
+    Expected: false
+    Received: true
+
+      89 |       };
+      90 |     });
+    > 91 |     expect(inside.isRun, `Tab ${i + 1} escaped to the Run button`).toBe(false);
+         |                                                                    ^
+      92 |     expect(inside.inPanel, `Tab ${i + 1} left the dialog`).toBe(true);
+      93 |   }
+      94 | });
+        at /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/e2e/tests/range-dialog.spec.ts:91:68
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/range-dialog-Tab-does-not-leave-the-dialog-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/range-dialog-Tab-does-not-leave-the-dialog-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/range-dialog-Tab-does-not-leave-the-dialog-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/range-dialog-Tab-does-not-leave-the-dialog-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  3) [chromium] › tests/range-dialog.spec.ts:96:5 › Escape restores the trigger ────────────────────
+
+    Error: expect(locator).toBeFocused() failed
+
+    Locator:  locator('.daterange .dr-trigger')
+    Expected: focused
+    Received: inactive
+    Timeout:  5000ms
+
+    Call log:
+      - Expect "toBeFocused" with timeout 5000ms
+      - waiting for locator('.daterange .dr-trigger')
+        14 × locator resolved to <button type="button" class="dr-trigger" aria-expanded="false" aria-haspopup="dialog">…</button>
+           - unexpected value "inactive"
+
+
+      106 |
+      107 |   await expect(page.locator(SEL.rangeDialog)).toHaveCount(0);
+    > 108 |   await expect(page.locator(SEL.dateRangeTrigger)).toBeFocused();
+          |                                                    ^
+      109 |   await expect(page.locator(SEL.dateRangeTrigger)).toHaveAttribute('aria-expanded', 'false');
+      110 | });
+      111 |
+        at /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/e2e/tests/range-dialog.spec.ts:108:52
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/range-dialog-Escape-restores-the-trigger-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/range-dialog-Escape-restores-the-trigger-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/range-dialog-Escape-restores-the-trigger-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/range-dialog-Escape-restores-the-trigger-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  3 failed
+    [chromium] › tests/range-dialog.spec.ts:37:5 › opens from the keyboard and focuses the first control 
+    [chromium] › tests/range-dialog.spec.ts:70:5 › Tab does not leave the dialog ───────────────────
+    [chromium] › tests/range-dialog.spec.ts:96:5 › Escape restores the trigger ─────────────────────
+  2 passed (14.2s)
+-- control: playwright test tests/routing.spec.ts (must pass) --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/routing.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/dist)
+
+Running 3 tests using 1 worker
+
+  ✓  1 [chromium] › tests/routing.spec.ts:8:5 › / redirects to /search and mounts the DSL editor (781ms)
+  ✓  2 [chromium] › tests/routing.spec.ts:14:5 › rail link to history navigates without a full page load (512ms)
+  ✓  3 [chromium] › tests/routing.spec.ts:31:5 › an unknown route renders the 404 page (339ms)
+
+  3 passed (2.1s)
+-- trunk build (restore pristine dist) --
+2026-09-07T23:38:28.994173Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T23:38:28.994297Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-core)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 10.19s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T23:38:44.902008Z  INFO applying new distribution
+2026-09-07T23:38:44.904153Z  INFO ✅ success
+
+mutation-check results:
+patch                                outcome
+17-range-dialog-no-layer.patch       PASS (target spec failed, control passed, exit 1)
+########## run 3 of 5 ##########
+=== 17-range-dialog-no-layer.patch -> range-dialog.spec.ts ===
+-- trunk build --
+2026-09-07T23:38:44.942249Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T23:38:44.942364Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-core)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 10.18s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T23:39:00.748338Z  INFO applying new distribution
+2026-09-07T23:39:00.752349Z  INFO ✅ success
+-- playwright test tests/range-dialog.spec.ts --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/range-dialog.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/dist)
+
+Running 5 tests using 1 worker
+
+  ✘  1 [chromium] › tests/range-dialog.spec.ts:37:5 › opens from the keyboard and focuses the first control (5.6s)
+  ✘  2 [chromium] › tests/range-dialog.spec.ts:70:5 › Tab does not leave the dialog (605ms)
+  ✘  3 [chromium] › tests/range-dialog.spec.ts:96:5 › Escape restores the trigger (5.5s)
+  ✓  4 [chromium] › tests/range-dialog.spec.ts:112:5 › scrim mousedown closes (567ms)
+  ✓  5 [chromium] › tests/range-dialog.spec.ts:136:5 › From and To are labelled (527ms)
+
+
+  1) [chromium] › tests/range-dialog.spec.ts:37:5 › opens from the keyboard and focuses the first control 
+
+    Error: expect(locator).toBeFocused() failed
+
+    Locator:  locator('.dr-pop .seg-opt').first()
+    Expected: focused
+    Received: inactive
+    Timeout:  5000ms
+
+    Call log:
+      - Expect "toBeFocused" with timeout 5000ms
+      - waiting for locator('.dr-pop .seg-opt').first()
+        14 × locator resolved to <button class="seg-opt on" aria-pressed="true">Relative</button>
+           - unexpected value "inactive"
+
+
+      57 |   await expect(trigger).toHaveAttribute('aria-expanded', 'true');
+      58 |   // The hook moves focus into the panel: the tab strip's first option.
+    > 59 |   await expect(page.locator(SEL.segmentedOption).first()).toBeFocused();
+         |                                                           ^
+      60 |
+      61 |   // Space opens it too — it is a button, so both keys are a click.
+      62 |   await page.keyboard.press('Escape');
+        at /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/e2e/tests/range-dialog.spec.ts:59:59
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/range-dialog-opens-from-th-c6bc7-d-focuses-the-first-control-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/range-dialog-opens-from-th-c6bc7-d-focuses-the-first-control-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/range-dialog-opens-from-th-c6bc7-d-focuses-the-first-control-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/range-dialog-opens-from-th-c6bc7-d-focuses-the-first-control-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  2) [chromium] › tests/range-dialog.spec.ts:70:5 › Tab does not leave the dialog ──────────────────
+
+    Error: Tab 10 escaped to the Run button
+
+    expect(received).toBe(expected) // Object.is equality
+
+    Expected: false
+    Received: true
+
+      89 |       };
+      90 |     });
+    > 91 |     expect(inside.isRun, `Tab ${i + 1} escaped to the Run button`).toBe(false);
+         |                                                                    ^
+      92 |     expect(inside.inPanel, `Tab ${i + 1} left the dialog`).toBe(true);
+      93 |   }
+      94 | });
+        at /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/e2e/tests/range-dialog.spec.ts:91:68
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/range-dialog-Tab-does-not-leave-the-dialog-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/range-dialog-Tab-does-not-leave-the-dialog-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/range-dialog-Tab-does-not-leave-the-dialog-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/range-dialog-Tab-does-not-leave-the-dialog-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  3) [chromium] › tests/range-dialog.spec.ts:96:5 › Escape restores the trigger ────────────────────
+
+    Error: expect(locator).toBeFocused() failed
+
+    Locator:  locator('.daterange .dr-trigger')
+    Expected: focused
+    Received: inactive
+    Timeout:  5000ms
+
+    Call log:
+      - Expect "toBeFocused" with timeout 5000ms
+      - waiting for locator('.daterange .dr-trigger')
+        14 × locator resolved to <button type="button" class="dr-trigger" aria-expanded="false" aria-haspopup="dialog">…</button>
+           - unexpected value "inactive"
+
+
+      106 |
+      107 |   await expect(page.locator(SEL.rangeDialog)).toHaveCount(0);
+    > 108 |   await expect(page.locator(SEL.dateRangeTrigger)).toBeFocused();
+          |                                                    ^
+      109 |   await expect(page.locator(SEL.dateRangeTrigger)).toHaveAttribute('aria-expanded', 'false');
+      110 | });
+      111 |
+        at /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/e2e/tests/range-dialog.spec.ts:108:52
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/range-dialog-Escape-restores-the-trigger-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/range-dialog-Escape-restores-the-trigger-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/range-dialog-Escape-restores-the-trigger-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/range-dialog-Escape-restores-the-trigger-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  3 failed
+    [chromium] › tests/range-dialog.spec.ts:37:5 › opens from the keyboard and focuses the first control 
+    [chromium] › tests/range-dialog.spec.ts:70:5 › Tab does not leave the dialog ───────────────────
+    [chromium] › tests/range-dialog.spec.ts:96:5 › Escape restores the trigger ─────────────────────
+  2 passed (14.2s)
+-- control: playwright test tests/routing.spec.ts (must pass) --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/routing.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/dist)
+
+Running 3 tests using 1 worker
+
+  ✓  1 [chromium] › tests/routing.spec.ts:8:5 › / redirects to /search and mounts the DSL editor (768ms)
+  ✓  2 [chromium] › tests/routing.spec.ts:14:5 › rail link to history navigates without a full page load (496ms)
+  ✓  3 [chromium] › tests/routing.spec.ts:31:5 › an unknown route renders the 404 page (339ms)
+
+  3 passed (2.0s)
+-- trunk build (restore pristine dist) --
+2026-09-07T23:39:18.375308Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T23:39:18.375415Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-core)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 10.08s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T23:39:34.253904Z  INFO applying new distribution
+2026-09-07T23:39:34.256270Z  INFO ✅ success
+
+mutation-check results:
+patch                                outcome
+17-range-dialog-no-layer.patch       PASS (target spec failed, control passed, exit 1)
+########## run 4 of 5 ##########
+=== 17-range-dialog-no-layer.patch -> range-dialog.spec.ts ===
+-- trunk build --
+2026-09-07T23:39:34.295332Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T23:39:34.295431Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-core)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 10.08s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T23:39:50.045186Z  INFO applying new distribution
+2026-09-07T23:39:50.047289Z  INFO ✅ success
+-- playwright test tests/range-dialog.spec.ts --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/range-dialog.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/dist)
+
+Running 5 tests using 1 worker
+
+  ✘  1 [chromium] › tests/range-dialog.spec.ts:37:5 › opens from the keyboard and focuses the first control (5.6s)
+  ✘  2 [chromium] › tests/range-dialog.spec.ts:70:5 › Tab does not leave the dialog (613ms)
+  ✘  3 [chromium] › tests/range-dialog.spec.ts:96:5 › Escape restores the trigger (5.6s)
+  ✓  4 [chromium] › tests/range-dialog.spec.ts:112:5 › scrim mousedown closes (566ms)
+  ✓  5 [chromium] › tests/range-dialog.spec.ts:136:5 › From and To are labelled (575ms)
+
+
+  1) [chromium] › tests/range-dialog.spec.ts:37:5 › opens from the keyboard and focuses the first control 
+
+    Error: expect(locator).toBeFocused() failed
+
+    Locator:  locator('.dr-pop .seg-opt').first()
+    Expected: focused
+    Received: inactive
+    Timeout:  5000ms
+
+    Call log:
+      - Expect "toBeFocused" with timeout 5000ms
+      - waiting for locator('.dr-pop .seg-opt').first()
+        14 × locator resolved to <button class="seg-opt on" aria-pressed="true">Relative</button>
+           - unexpected value "inactive"
+
+
+      57 |   await expect(trigger).toHaveAttribute('aria-expanded', 'true');
+      58 |   // The hook moves focus into the panel: the tab strip's first option.
+    > 59 |   await expect(page.locator(SEL.segmentedOption).first()).toBeFocused();
+         |                                                           ^
+      60 |
+      61 |   // Space opens it too — it is a button, so both keys are a click.
+      62 |   await page.keyboard.press('Escape');
+        at /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/e2e/tests/range-dialog.spec.ts:59:59
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/range-dialog-opens-from-th-c6bc7-d-focuses-the-first-control-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/range-dialog-opens-from-th-c6bc7-d-focuses-the-first-control-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/range-dialog-opens-from-th-c6bc7-d-focuses-the-first-control-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/range-dialog-opens-from-th-c6bc7-d-focuses-the-first-control-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  2) [chromium] › tests/range-dialog.spec.ts:70:5 › Tab does not leave the dialog ──────────────────
+
+    Error: Tab 10 escaped to the Run button
+
+    expect(received).toBe(expected) // Object.is equality
+
+    Expected: false
+    Received: true
+
+      89 |       };
+      90 |     });
+    > 91 |     expect(inside.isRun, `Tab ${i + 1} escaped to the Run button`).toBe(false);
+         |                                                                    ^
+      92 |     expect(inside.inPanel, `Tab ${i + 1} left the dialog`).toBe(true);
+      93 |   }
+      94 | });
+        at /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/e2e/tests/range-dialog.spec.ts:91:68
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/range-dialog-Tab-does-not-leave-the-dialog-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/range-dialog-Tab-does-not-leave-the-dialog-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/range-dialog-Tab-does-not-leave-the-dialog-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/range-dialog-Tab-does-not-leave-the-dialog-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  3) [chromium] › tests/range-dialog.spec.ts:96:5 › Escape restores the trigger ────────────────────
+
+    Error: expect(locator).toBeFocused() failed
+
+    Locator:  locator('.daterange .dr-trigger')
+    Expected: focused
+    Received: inactive
+    Timeout:  5000ms
+
+    Call log:
+      - Expect "toBeFocused" with timeout 5000ms
+      - waiting for locator('.daterange .dr-trigger')
+        14 × locator resolved to <button type="button" class="dr-trigger" aria-expanded="false" aria-haspopup="dialog">…</button>
+           - unexpected value "inactive"
+
+
+      106 |
+      107 |   await expect(page.locator(SEL.rangeDialog)).toHaveCount(0);
+    > 108 |   await expect(page.locator(SEL.dateRangeTrigger)).toBeFocused();
+          |                                                    ^
+      109 |   await expect(page.locator(SEL.dateRangeTrigger)).toHaveAttribute('aria-expanded', 'false');
+      110 | });
+      111 |
+        at /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/e2e/tests/range-dialog.spec.ts:108:52
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/range-dialog-Escape-restores-the-trigger-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/range-dialog-Escape-restores-the-trigger-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/range-dialog-Escape-restores-the-trigger-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/range-dialog-Escape-restores-the-trigger-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  3 failed
+    [chromium] › tests/range-dialog.spec.ts:37:5 › opens from the keyboard and focuses the first control 
+    [chromium] › tests/range-dialog.spec.ts:70:5 › Tab does not leave the dialog ───────────────────
+    [chromium] › tests/range-dialog.spec.ts:96:5 › Escape restores the trigger ─────────────────────
+  2 passed (14.3s)
+-- control: playwright test tests/routing.spec.ts (must pass) --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/routing.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/dist)
+
+Running 3 tests using 1 worker
+
+  ✓  1 [chromium] › tests/routing.spec.ts:8:5 › / redirects to /search and mounts the DSL editor (782ms)
+  ✓  2 [chromium] › tests/routing.spec.ts:14:5 › rail link to history navigates without a full page load (560ms)
+  ✓  3 [chromium] › tests/routing.spec.ts:31:5 › an unknown route renders the 404 page (390ms)
+
+  3 passed (2.2s)
+-- trunk build (restore pristine dist) --
+2026-09-07T23:40:07.967911Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T23:40:07.968023Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-core)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 10.27s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T23:40:23.987417Z  INFO applying new distribution
+2026-09-07T23:40:23.990672Z  INFO ✅ success
+
+mutation-check results:
+patch                                outcome
+17-range-dialog-no-layer.patch       PASS (target spec failed, control passed, exit 1)
+########## run 5 of 5 ##########
+=== 17-range-dialog-no-layer.patch -> range-dialog.spec.ts ===
+-- trunk build --
+2026-09-07T23:40:24.029703Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T23:40:24.029823Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-core)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 10.21s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T23:40:39.928233Z  INFO applying new distribution
+2026-09-07T23:40:39.931880Z  INFO ✅ success
+-- playwright test tests/range-dialog.spec.ts --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/range-dialog.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/dist)
+
+Running 5 tests using 1 worker
+
+  ✘  1 [chromium] › tests/range-dialog.spec.ts:37:5 › opens from the keyboard and focuses the first control (5.6s)
+  ✘  2 [chromium] › tests/range-dialog.spec.ts:70:5 › Tab does not leave the dialog (610ms)
+  ✘  3 [chromium] › tests/range-dialog.spec.ts:96:5 › Escape restores the trigger (5.6s)
+  ✓  4 [chromium] › tests/range-dialog.spec.ts:112:5 › scrim mousedown closes (558ms)
+  ✓  5 [chromium] › tests/range-dialog.spec.ts:136:5 › From and To are labelled (577ms)
+
+
+  1) [chromium] › tests/range-dialog.spec.ts:37:5 › opens from the keyboard and focuses the first control 
+
+    Error: expect(locator).toBeFocused() failed
+
+    Locator:  locator('.dr-pop .seg-opt').first()
+    Expected: focused
+    Received: inactive
+    Timeout:  5000ms
+
+    Call log:
+      - Expect "toBeFocused" with timeout 5000ms
+      - waiting for locator('.dr-pop .seg-opt').first()
+        14 × locator resolved to <button class="seg-opt on" aria-pressed="true">Relative</button>
+           - unexpected value "inactive"
+
+
+      57 |   await expect(trigger).toHaveAttribute('aria-expanded', 'true');
+      58 |   // The hook moves focus into the panel: the tab strip's first option.
+    > 59 |   await expect(page.locator(SEL.segmentedOption).first()).toBeFocused();
+         |                                                           ^
+      60 |
+      61 |   // Space opens it too — it is a button, so both keys are a click.
+      62 |   await page.keyboard.press('Escape');
+        at /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/e2e/tests/range-dialog.spec.ts:59:59
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/range-dialog-opens-from-th-c6bc7-d-focuses-the-first-control-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/range-dialog-opens-from-th-c6bc7-d-focuses-the-first-control-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/range-dialog-opens-from-th-c6bc7-d-focuses-the-first-control-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/range-dialog-opens-from-th-c6bc7-d-focuses-the-first-control-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  2) [chromium] › tests/range-dialog.spec.ts:70:5 › Tab does not leave the dialog ──────────────────
+
+    Error: Tab 10 escaped to the Run button
+
+    expect(received).toBe(expected) // Object.is equality
+
+    Expected: false
+    Received: true
+
+      89 |       };
+      90 |     });
+    > 91 |     expect(inside.isRun, `Tab ${i + 1} escaped to the Run button`).toBe(false);
+         |                                                                    ^
+      92 |     expect(inside.inPanel, `Tab ${i + 1} left the dialog`).toBe(true);
+      93 |   }
+      94 | });
+        at /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/e2e/tests/range-dialog.spec.ts:91:68
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/range-dialog-Tab-does-not-leave-the-dialog-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/range-dialog-Tab-does-not-leave-the-dialog-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/range-dialog-Tab-does-not-leave-the-dialog-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/range-dialog-Tab-does-not-leave-the-dialog-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  3) [chromium] › tests/range-dialog.spec.ts:96:5 › Escape restores the trigger ────────────────────
+
+    Error: expect(locator).toBeFocused() failed
+
+    Locator:  locator('.daterange .dr-trigger')
+    Expected: focused
+    Received: inactive
+    Timeout:  5000ms
+
+    Call log:
+      - Expect "toBeFocused" with timeout 5000ms
+      - waiting for locator('.daterange .dr-trigger')
+        14 × locator resolved to <button type="button" class="dr-trigger" aria-expanded="false" aria-haspopup="dialog">…</button>
+           - unexpected value "inactive"
+
+
+      106 |
+      107 |   await expect(page.locator(SEL.rangeDialog)).toHaveCount(0);
+    > 108 |   await expect(page.locator(SEL.dateRangeTrigger)).toBeFocused();
+          |                                                    ^
+      109 |   await expect(page.locator(SEL.dateRangeTrigger)).toHaveAttribute('aria-expanded', 'false');
+      110 | });
+      111 |
+        at /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/e2e/tests/range-dialog.spec.ts:108:52
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/range-dialog-Escape-restores-the-trigger-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/range-dialog-Escape-restores-the-trigger-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/range-dialog-Escape-restores-the-trigger-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/range-dialog-Escape-restores-the-trigger-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  3 failed
+    [chromium] › tests/range-dialog.spec.ts:37:5 › opens from the keyboard and focuses the first control 
+    [chromium] › tests/range-dialog.spec.ts:70:5 › Tab does not leave the dialog ───────────────────
+    [chromium] › tests/range-dialog.spec.ts:96:5 › Escape restores the trigger ─────────────────────
+  2 passed (14.3s)
+-- control: playwright test tests/routing.spec.ts (must pass) --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/routing.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/dist)
+
+Running 3 tests using 1 worker
+
+  ✓  1 [chromium] › tests/routing.spec.ts:8:5 › / redirects to /search and mounts the DSL editor (774ms)
+  ✓  2 [chromium] › tests/routing.spec.ts:14:5 › rail link to history navigates without a full page load (496ms)
+  ✓  3 [chromium] › tests/routing.spec.ts:31:5 › an unknown route renders the 404 page (388ms)
+
+  3 passed (2.1s)
+-- trunk build (restore pristine dist) --
+2026-09-07T23:40:57.670243Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T23:40:57.670351Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-core)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 10.17s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T23:41:13.566485Z  INFO applying new distribution
+2026-09-07T23:41:13.568780Z  INFO ✅ success
+
+mutation-check results:
+patch                                outcome
+17-range-dialog-no-layer.patch       PASS (target spec failed, control passed, exit 1)

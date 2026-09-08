@@ -10,8 +10,12 @@
 //! so the query box gets the full width. Run mirrors ⌘⏎ in the editor —
 //! both call the parent's submit callback.
 
+use leptos::ev;
+use leptos::html::Div;
 use leptos::prelude::*;
 use leptos::web_sys;
+use leptos_use::{use_event_listener, use_window};
+use wasm_bindgen::JsCast;
 
 use crate::components::editor::DslEditor;
 use crate::search_url::{Verdict, decode_range, encode_range, normalize_instant};
@@ -97,6 +101,7 @@ pub fn EditorWrap(
                         blocked=blocked
                     />
                     <button
+                        type="button"
                         class="run"
                         class:running=move || running.get()
                         disabled=move || running.get() || blocked.get()
@@ -127,10 +132,14 @@ pub fn EditorWrap(
                             text=share_text
                             success_detail="Search URL copied to clipboard."
                         >"Share"</CopyButton>
-                        <span
+                        // Same reason as Save above, plus the plain one:
+                        // Format acts on click, so it is a button and the
+                        // keyboard reaches it (ADR-0028).
+                        <button
+                            type="button"
                             class="tool"
                             on:click=do_format
-                        >"Format"</span>
+                        >"Format"</button>
                     </div>
                 </div>
             </div>
@@ -162,15 +171,22 @@ fn DateRange(
 
     view! {
         <div class="daterange">
-            <div
+            // A native button, and the popover's focus restore depends on
+            // it: the overlay hook captures document.activeElement as the
+            // opener, and only a focusable element is the active one when
+            // the click lands.
+            <button
+                type="button"
                 class="dr-trigger"
                 class:open=move || open.get()
+                aria-haspopup="dialog"
+                aria-expanded=move || open.get().to_string()
                 on:click=move |_| open.update(|o| *o = !*o)
             >
                 <IconView icon=Icon::Clock size=12 stroke_width=1.5/>
                 <span>{trigger_label}</span>
                 <IconView icon=Icon::Chevron size=10 stroke_width=1.5/>
-            </div>
+            </button>
             <Show when=move || open.get()>
                 <DateRangePopover
                     value=value
@@ -199,6 +215,43 @@ fn DateRangePopover(
     blocked: Signal<bool>,
 ) -> impl IntoView {
     let tab = RwSignal::new(Tab::Relative);
+    let scrim_ref = NodeRef::<Div>::new();
+    let panel_ref = NodeRef::<Div>::new();
+
+    // The picker is a modal dialog on fleet-ui's overlay stack, and one
+    // causal chain runs through this registration:
+    //
+    // The hook reads `document.activeElement` at mount and keeps it as
+    // the opener, then restores focus to it on unmount. Opening the
+    // picker is a click on the trigger, so the opener is whatever the
+    // trigger element happens to be — and only a native button is
+    // focused by that click. The trigger was a `<div>`, which is not
+    // focusable, so the captured opener would have been the editor (or
+    // the body) and Escape would have dropped focus somewhere else
+    // entirely. Focus restore works because the trigger is now a button.
+    //
+    // Trap rather than Capture: the scrim already blocks every pointer
+    // event outside the panel, so letting Tab walk out into a page the
+    // mouse cannot reach is the one combination that strands a keyboard
+    // user (ADR-0029). Trap also earns the aria-modal="true" below, and
+    // gives the panel its initial focus — the Segmented's first tab.
+    let layer = fleet_ui::overlay::use_overlay_layer_with(
+        fleet_ui::overlay::FocusPolicy::Trap,
+        move || panel_ref.get().map(web_sys::Element::from),
+    );
+    // Escape at the window, not on the panel: the key has to work before
+    // focus has moved anywhere. use_event_listener registers its own
+    // on_cleanup, so the discarded handle is deliberate. The topmost
+    // guard keeps a modal stacked over the picker from closing both.
+    let _ = use_event_listener(use_window(), ev::keydown, move |e| {
+        if !layer.is_topmost() {
+            return;
+        }
+        if e.key() == "Escape" {
+            e.prevent_default();
+            open.set(false);
+        }
+    });
 
     // Seed absolute input state from the current range if it's already
     // absolute; otherwise provide sensible defaults.
@@ -270,14 +323,52 @@ fn DateRangePopover(
         close();
     });
 
+    // Dismiss on mousedown, and only when the press landed on the scrim
+    // element itself: an identity compare, never a class-name heuristic
+    // (the shape fleet-ui's Modal uses). Gated on topmost so a dialog
+    // stacked over the picker is not dismissed through it.
+    let on_scrim_mousedown = move |e: web_sys::MouseEvent| {
+        if !layer.is_topmost() {
+            return;
+        }
+        let Some(scrim) = scrim_ref.get() else {
+            return;
+        };
+        let Some(target) = e.target() else { return };
+        let Some(el) = target.dyn_ref::<web_sys::Element>() else {
+            return;
+        };
+        if el.is_same_node(Some(scrim.as_ref())) {
+            // mousedown's default action is the browser's focus fix-up,
+            // and it runs AFTER this handler: the scrim is not
+            // focusable, so it would clear focus to <body> right after
+            // the overlay hook put it back on the trigger. Suppressing
+            // it is what makes a scrim dismissal end where Escape does.
+            // Nothing else on a transparent full-screen scrim depends on
+            // that default (no selection, no drag).
+            e.prevent_default();
+            close();
+        }
+    };
+
     view! {
-        // Fullscreen scrim captures outside clicks. Transparent — the
-        // popover sits on top of it.
+        // Fullscreen scrim captures outside presses. Transparent — the
+        // popover sits on top of it. A sibling BEFORE the panel, and
+        // never the panel the focus resolver is given: only .dr-pop is
+        // resolved, so the scrim stays out of the Tab cycle.
         <div
             class="scrim"
-            on:click=move |_| close()
+            node_ref=scrim_ref
+            on:mousedown=on_scrim_mousedown
         />
-        <div class="dr-pop" on:click=|e: web_sys::MouseEvent| e.stop_propagation()>
+        <div
+            class="dr-pop"
+            node_ref=panel_ref
+            role="dialog"
+            aria-modal="true"
+            aria-label="Time range"
+            tabindex="-1"
+        >
             // The popover shell stays app-side; only the tab strip comes
             // from fleet-ui, joined to `Tab` by the id ↔ enum map below.
             <Segmented
@@ -304,6 +395,12 @@ fn DateRangePopover(
                                     type="button"
                                     class="opt"
                                     class:on=move || is_on.get()
+                                    // The picked preset is a pressed
+                                    // state, not a disabled one: the
+                                    // grid is a set of toggles and the
+                                    // .on class alone says nothing to a
+                                    // screen reader.
+                                    aria-pressed=move || is_on.get().to_string()
                                     disabled=move || blocked.get()
                                     on:click=move |_| apply_quick(q)
                                 >{format!("Last {q}")}</button>
@@ -314,8 +411,9 @@ fn DateRangePopover(
                 Tab::Absolute => view! {
                     <div class="cust">
                         <div class="fld">
-                            <div class="lb">"From"</div>
+                            <label class="lb" for="dr-from-input">"From"</label>
                             <input
+                                id="dr-from-input"
                                 class="dr-from"
                                 prop:value=move || from.get()
                                 on:input=move |e| from.set(event_target_value(&e))
@@ -323,8 +421,9 @@ fn DateRangePopover(
                             />
                         </div>
                         <div class="fld">
-                            <div class="lb">"To"</div>
+                            <label class="lb" for="dr-to-input">"To"</label>
                             <input
+                                id="dr-to-input"
                                 class="dr-to"
                                 prop:value=move || to.get()
                                 on:input=move |e| to.set(event_target_value(&e))

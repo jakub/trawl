@@ -47,6 +47,28 @@ pub fn NetDrawer(
     // -- inline rename --
     let editing_name = RwSignal::new(false);
     let name_buf = RwSignal::new(net.name.clone());
+    // The trigger REPLACES itself with the input, so focus has to be
+    // handed over in both directions or a keyboard user is dropped on
+    // `<body>`: the browser has no memory of an element it removed.
+    // Same obligation ADR-0028 puts on an overlay opener, minus the
+    // overlay.
+    let name_btn_ref = NodeRef::<leptos::html::Button>::new();
+    let name_input_ref = NodeRef::<leptos::html::Input>::new();
+    Effect::new(move |was_editing: Option<bool>| {
+        let editing = editing_name.get();
+        if editing {
+            if let Some(input) = name_input_ref.get() {
+                let _ = input.focus();
+            }
+        } else if was_editing == Some(true) {
+            // Leaving the editor, however it ended: back to the control
+            // that opened it.
+            if let Some(btn) = name_btn_ref.get() {
+                let _ = btn.focus();
+            }
+        }
+        editing
+    });
     let original_name = net.name.clone();
 
     let do_rename = {
@@ -136,21 +158,32 @@ pub fn NetDrawer(
                     fallback={
                         let name = net.name.clone();
                         move || view! {
-                            <span
+                            <button
+                                type="button"
                                 class="name"
-                                title="Click to rename"
-                                style="cursor:pointer"
+                                node_ref=name_btn_ref
+                                aria-label=format!("Rename {name}")
+                                // The title looks like the drawer's
+                                // heading, so nothing but the tooltip
+                                // tells a pointer user it can be edited.
+                                title="Rename"
                                 on:click=move |_| editing_name.set(true)
-                            >{name.clone()}</span>
+                            >{name.clone()}</button>
                         }
                     }
                 >
                     {
                         let do_rename = do_rename.clone();
                         let do_rename_blur = do_rename.clone();
+                        // The input REPLACES the heading it edits, so the
+                        // name it is editing is nowhere on screen to label
+                        // it: without this the field is an unnamed textbox.
+                        let name = net.name.clone();
                         view! {
                             <input
                                 class="name-edit"
+                                node_ref=name_input_ref
+                                aria-label=format!("New name for {name}")
                                 prop:value=move || name_buf.get()
                                 on:input=move |e| name_buf.set(event_target_value(&e))
                                 on:blur=move |_| do_rename_blur()
@@ -396,11 +429,14 @@ fn QuerySchedulePane(
                             <div class="interval-chips">
                                 {INTERVAL_PRESETS.iter().map(|preset| {
                                     let p = *preset;
+                                    let is_on = move || interval_buf.get() == p;
                                     view! {
-                                        <span
-                                            class=move || if interval_buf.get() == p { "interval-chip on" } else { "interval-chip" }
+                                        <button
+                                            type="button"
+                                            class=move || if is_on() { "interval-chip on" } else { "interval-chip" }
+                                            aria-pressed=move || is_on().to_string()
                                             on:click=move |_| interval_buf.set(p.to_string())
-                                        >{p}</span>
+                                        >{p}</button>
                                     }
                                 }).collect_view()}
                             </div>
@@ -539,15 +575,23 @@ fn RunsPane(net_id: i64, bus: ToastBus, on_search: Callback<String>) -> impl Int
                             let is_expanded = move || expanded_run.get() == Some(run_id);
 
                             view! {
-                                <div
-                                    class="tbl-row"
-                                    on:click=move |_| {
-                                        expanded_run.update(|v| {
-                                            *v = if *v == Some(run_id) { None } else { Some(run_id) };
-                                        });
-                                    }
-                                >
-                                    <div style="flex:0 0 80px" class="mono">{when}</div>
+                                <div class="tbl-row">
+                                    <div style="flex:0 0 80px" class="mono">
+                                        // The row's one control (ADR-0029),
+                                        // stretched over the row: a pointer
+                                        // anywhere on it toggles the run's
+                                        // result preview exactly once.
+                                        <button
+                                            type="button"
+                                            class="row-stretch"
+                                            aria-expanded=move || is_expanded().to_string()
+                                            on:click=move |_| {
+                                                expanded_run.update(|v| {
+                                                    *v = if *v == Some(run_id) { None } else { Some(run_id) };
+                                                });
+                                            }
+                                        >{when}</button>
+                                    </div>
                                     <div style="flex:0 0 70px">
                                         <StatusDot tone=tone/>
                                         " "

@@ -1,0 +1,20 @@
+{
+  "columns": [
+    { "name": "_time" },
+    { "name": "host" },
+    { "name": "status" },
+    { "name": "message" }
+  ],
+  "rows": [
+    ["2026-09-01T10:00:00.000000Z", "web-01", 200, "GET /health ok"],
+    ["2026-09-01T10:01:00.000000Z", "web-02", 500, "upstream timeout"],
+    ["2026-09-01T10:02:00.000000Z", "web-03", 404, "GET /missing not found"],
+    ["2026-09-01T10:03:00.000000Z", "db-01", 200, "slow query 1200ms"],
+    ["2026-09-01T10:04:00.000000Z", "cache-01", 301, "redirect to /login"],
+    ["2026-09-01T10:05:00.000000Z", "web-01", 200, "GET /assets/app.js ok"],
+    ["2026-09-01T10:06:00.000000Z", "edge-01", 503, "circuit open"],
+    ["2026-09-01T10:07:00.000000Z", "web-01", 200, "POST /api/v1/query ok"]
+  ],
+  "truncated": false,
+  "pagination": { "limit": 50, "offset": 0, "returned": 8 }
+}

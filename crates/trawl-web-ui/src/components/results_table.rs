@@ -95,20 +95,41 @@ fn ResultsTableBody(
     let cols_for_view = columns.clone();
     let header_cells = cols_for_header.iter().enumerate().map(|(i, name)| {
         let name = name.clone();
+        // The visible text is the column, so the name says what the
+        // press DOES and keeps that word inside it (WCAG 2.5.3). The
+        // direction stays on the cell's `aria-sort` rather than joining
+        // the name: on a real table it is announced once already, and
+        // repeating it here would read twice.
+        let sort_label = format!("Sort by {name}");
         view! {
+            // A real `<table>`, so direction is announced by `aria-sort`
+            // on the sorted `<th>` alone (ADR-0029) and the glyph is
+            // decoration. The control is the button inside, never the cell.
             <th
+                class="sortable"
                 class:sorted=move || sort.get().is_some_and(|s| s.col == i)
-                on:click=move |_| sort.update(|cur| {
-                    *cur = match *cur {
-                        Some(s) if s.col == i => Some(SortState { col: i, asc: !s.asc }),
-                        _ => Some(SortState { col: i, asc: false }),
-                    };
-                })
+                aria-sort=move || {
+                    sort.get()
+                        .filter(|s| s.col == i)
+                        .map(|s| if s.asc { "ascending" } else { "descending" })
+                }
             >
-                <span>{name}</span>
-                <span class="sort">{move || {
-                    sort.get().filter(|s| s.col == i).map_or("·", |s| if s.asc { "▲" } else { "▼" })
-                }}</span>
+                <button
+                    type="button"
+                    class="th-sort"
+                    aria-label=sort_label
+                    on:click=move |_| sort.update(|cur| {
+                        *cur = match *cur {
+                            Some(s) if s.col == i => Some(SortState { col: i, asc: !s.asc }),
+                            _ => Some(SortState { col: i, asc: false }),
+                        };
+                    })
+                >
+                    <span>{name}</span>
+                    <span class="sort" aria-hidden="true">{move || {
+                        sort.get().filter(|s| s.col == i).map_or("·", |s| if s.asc { "▲" } else { "▼" })
+                    }}</span>
+                </button>
             </th>
         }
     }).collect::<Vec<_>>();
@@ -278,14 +299,24 @@ fn RowFragment(
 
     view! {
         <>
-            <tr
-                class:expanded=move || expanded.get() == Some(idx)
-                on:click=move |_| expanded.update(|cur| {
-                    *cur = if *cur == Some(idx) { None } else { Some(idx) };
-                })
-            >
+            <tr class:expanded=move || expanded.get() == Some(idx)>
                 <td class="exp-col">
-                    {move || if expanded.get() == Some(idx) { "▾" } else { "▸" }}
+                    // The row's one control (ADR-0029): the caret button
+                    // stretches over the row, so a pointer anywhere on it
+                    // toggles the detail exactly once.
+                    <button
+                        type="button"
+                        class="row-stretch"
+                        aria-expanded=move || (expanded.get() == Some(idx)).to_string()
+                        aria-label=format!("Show details for result {}", idx + 1)
+                        on:click=move |_| expanded.update(|cur| {
+                            *cur = if *cur == Some(idx) { None } else { Some(idx) };
+                        })
+                    >
+                        <span aria-hidden="true">
+                            {move || if expanded.get() == Some(idx) { "▾" } else { "▸" }}
+                        </span>
+                    </button>
                 </td>
                 {cells}
             </tr>
@@ -298,20 +329,25 @@ fn RowFragment(
                                 let value_text = value_to_string(v);
                                 let field_for_click = name.clone();
                                 let value_for_click = value_text.clone();
+                                let field_for_label = name.clone();
+                                let value_for_label = value_text.clone();
                                 view! {
                                     <span class="k">{key}</span>
                                     <span class="v">
-                                        <span
+                                        <button
+                                            type="button"
                                             class="tag"
-                                            on:click=move |e| {
-                                                e.stop_propagation();
+                                            aria-label=format!(
+                                                "Include {field_for_label} = {value_for_label}",
+                                            )
+                                            on:click=move |_| {
                                                 on_add_filter.run(Filter {
                                                     field: field_for_click.clone(),
                                                     value: value_for_click.clone(),
                                                     op: FilterOp::Include,
                                                 });
                                             }
-                                        >{value_text}</span>
+                                        >{value_text}</button>
                                     </span>
                                 }
                             }).collect::<Vec<_>>()}
@@ -369,7 +405,7 @@ fn ShowContextButton(
         ),
     });
     view! {
-        <Btn variant=Variant::Secondary stop_propagation=true on_click=on_click>"Show context"</Btn>
+        <Btn variant=Variant::Secondary on_click=on_click>"Show context"</Btn>
     }
 }
 
@@ -389,7 +425,7 @@ fn FindSimilarButton(
         ),
     });
     view! {
-        <Btn variant=Variant::Secondary stop_propagation=true on_click=on_click>"Find similar"</Btn>
+        <Btn variant=Variant::Secondary on_click=on_click>"Find similar"</Btn>
     }
 }
 

@@ -1,0 +1,24 @@
+{
+  "runs": [
+    {
+      "id": 501,
+      "query": "_severity>=error last=1h | stats count() by host",
+      "status": "success",
+      "started_at": "2026-09-01T10:00:00Z",
+      "finished_at": "2026-09-01T10:00:00.125Z",
+      "duration_ms": 125,
+      "row_count": 3
+    },
+    {
+      "id": 502,
+      "query": "_severity>=error last=1h | stats count() by host",
+      "status": "error",
+      "started_at": "2026-09-01T09:00:00Z",
+      "finished_at": "2026-09-01T09:00:00.090Z",
+      "duration_ms": 90,
+      "row_count": 0,
+      "error_message": "Couldn't load results: stub run failure"
+    }
+  ],
+  "total": 2
+}

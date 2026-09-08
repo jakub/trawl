@@ -1,0 +1,138 @@
+=== 13-sort-th-div.patch -> sort-headers.spec.ts ===
+-- trunk build --
+2026-09-07T23:41:28.638670Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T23:41:28.638779Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-core)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui)
+warning: function `sort_button_name` is never used
+  --> crates/trawl-web-ui/src/sort_label.rs:18:8
+   |
+18 | pub fn sort_button_name(label: &str, direction: Option<bool>) -> String {
+   |        ^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `trawl-web-ui` (bin "trawl-web-ui") generated 1 warning
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 7.45s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T23:41:41.773002Z  INFO applying new distribution
+2026-09-07T23:41:41.775089Z  INFO ✅ success
+-- playwright test tests/sort-headers.spec.ts --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/sort-headers.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/dist)
+
+Running 3 tests using 1 worker
+
+  ✓  1 [chromium] › tests/sort-headers.spec.ts:41:5 › results th: aria-sort follows the sorted column (646ms)
+  ✘  2 [chromium] › tests/sort-headers.spec.ts:77:5 › schema header: Enter sorts, Space reverses (5.1s)
+  ✘  3 [chromium] › tests/sort-headers.spec.ts:115:5 › service fields: name header keeps ascending default (5.2s)
+
+
+  1) [chromium] › tests/sort-headers.spec.ts:77:5 › schema header: Enter sorts, Space reverses ─────
+
+    Error: expect(locator).toHaveAccessibleName(expected) failed
+
+    Locator: locator('.tbl-hd .th.sortable button').first()
+    Expected: "Sort by Service, ascending"
+    Timeout: 5000ms
+    Error: element(s) not found
+
+    Call log:
+      - Expect "toHaveAccessibleName" with timeout 5000ms
+      - waiting for locator('.tbl-hd .th.sortable button').first()
+
+
+      82 |   // Service is the seeded sort, so it is the one header that starts
+      83 |   // with a direction in its name.
+    > 84 |   await expect(controls.first()).toHaveAccessibleName(
+         |                                  ^
+      85 |     nameFrom(COPY.sortNameAscending, COPY.schemaServiceHeader),
+      86 |   );
+      87 |
+        at /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/e2e/tests/sort-headers.spec.ts:84:34
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/sort-headers-schema-header-Enter-sorts-Space-reverses-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/sort-headers-schema-header-Enter-sorts-Space-reverses-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/sort-headers-schema-header-Enter-sorts-Space-reverses-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/sort-headers-schema-header-Enter-sorts-Space-reverses-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  2) [chromium] › tests/sort-headers.spec.ts:115:5 › service fields: name header keeps ascending default 
+
+    Error: expect(locator).toHaveCount(expected) failed
+
+    Locator:  locator('.sf-hd .th.sortable button')
+    Expected: 4
+    Received: 0
+    Timeout:  5000ms
+
+    Call log:
+      - Expect "toHaveCount" with timeout 5000ms
+      - waiting for locator('.sf-hd .th.sortable button')
+        13 × locator resolved to 0 elements
+           - unexpected value "0"
+
+
+      118 |
+      119 |   const controls = page.locator(SEL.serviceFieldSortControl);
+    > 120 |   await expect(controls).toHaveCount(4);
+          |                          ^
+      121 |   // The pane still opens on cardinality, descending — the polarity flip
+      122 |   // onto `sort_th` did not change what the operator sees first.
+      123 |   await expect(controls.nth(2)).toHaveAccessibleName(
+        at /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/e2e/tests/sort-headers.spec.ts:120:26
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/sort-headers-service-field-d7389-der-keeps-ascending-default-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/sort-headers-service-field-d7389-der-keeps-ascending-default-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/sort-headers-service-field-d7389-der-keeps-ascending-default-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/sort-headers-service-field-d7389-der-keeps-ascending-default-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  2 failed
+    [chromium] › tests/sort-headers.spec.ts:77:5 › schema header: Enter sorts, Space reverses ──────
+    [chromium] › tests/sort-headers.spec.ts:115:5 › service fields: name header keeps ascending default 
+  1 passed (11.7s)
+-- control: playwright test tests/routing.spec.ts (must pass) --
+npm notice run trawl-web-ui-e2e@0.0.0 npx
+npm notice run 'playwright' test tests/routing.spec.ts
+[WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/dist)
+
+Running 3 tests using 1 worker
+
+  ✓  1 [chromium] › tests/routing.spec.ts:8:5 › / redirects to /search and mounts the DSL editor (783ms)
+  ✓  2 [chromium] › tests/routing.spec.ts:14:5 › rail link to history navigates without a full page load (512ms)
+  ✓  3 [chromium] › tests/routing.spec.ts:31:5 › an unknown route renders the 404 page (339ms)
+
+  3 passed (2.1s)
+-- trunk build (restore pristine dist) --
+2026-09-07T23:41:56.968987Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-07T23:41:56.969104Z  INFO 📦 starting build
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-core)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 7.51s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-07T23:42:10.129446Z  INFO applying new distribution
+2026-09-07T23:42:10.132122Z  INFO ✅ success
+
+mutation-check results:
+patch                                outcome
+13-sort-th-div.patch                 PASS (target spec failed, control passed, exit 1)

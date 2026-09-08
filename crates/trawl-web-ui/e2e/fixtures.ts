@@ -68,6 +68,16 @@ export const test = base.extend<{ pageErrors: PageErrors; contract: void }>({
       expect(state.unstubbed, `unstubbed /api/* calls: ${JSON.stringify(state.unstubbed)}`).toEqual(
         [],
       );
+      // The same claim one level down. Under `corpus` a pipeline with no
+      // fixture is answered with a 500 and recorded here, and the page
+      // renders that as an ordinary query error — which no assertion in
+      // any spec would notice. Recording it and never reading it made
+      // the record decoration. A hit here is a fixture gap: add the
+      // shape to harness/server.mjs, never loosen this.
+      expect(
+        state.unhandledQueries ?? [],
+        `corpus queries with no fixture: ${JSON.stringify(state.unhandledQueries)}`,
+      ).toEqual([]);
     },
     { auto: true },
   ],
@@ -86,6 +96,70 @@ export const POPULATED = {
   service: 'nginx',
   /** The one net's id, for `?net=<id>&ntab=`. */
   netId: 1,
+} as const;
+
+/** What the `corpus` scenario's data is, by CONTENT.
+ *
+ * `corpus` is `populated` plus rows: the same one service and one net,
+ * with `/api/v1/query`, `/api/v1/history` and the runs routes answering
+ * with fixtures instead of empty bodies. A spec reads a row by the value
+ * in it, so every value it can assert on lives here and is pinned in
+ * `crates/trawl-web-ui/tests/e2e_wire_fixture_contract.rs` against the
+ * `harness/wire/` files.
+ */
+export const CORPUS = {
+  /** Same service and net as `populated` — `corpus` only adds data. */
+  service: POPULATED.service,
+  netId: POPULATED.netId,
+  /** The net's name, as the runs page prints it. */
+  netName: 'errors by host',
+  /** Rows in `wire/query-rows.json`. */
+  rowCount: 8,
+  /** Its columns, in wire order. */
+  columns: ['_time', 'host', 'status', 'message'] as const,
+  /** `host`'s distinct values, most frequent first, then alphabetical —
+   * the order the facet rail computes. Six of them, one past the five a
+   * group shows, so the group offers "+ 1 more". */
+  hosts: ['web-01', 'cache-01', 'db-01', 'edge-01', 'web-02', 'web-03'] as const,
+  /** How many values the `host` facet hides behind its more control. */
+  hostsHidden: 1,
+  /** The first `host` cell in wire order, and the last host
+   * alphabetically: enough to tell one sort order from the other. */
+  firstHost: 'web-01',
+  hostLastAlphabetically: 'web-03',
+  /** The two `wire/history.json` entries, newest first. */
+  history: {
+    /** The rerunnable one. */
+    query: 'service=nginx _severity>=error last=1h',
+    /** The one the navigator refuses: 32769 ASCII bytes, one over
+     * `MAX_SEARCH_BYTES` (`src/search_url.rs`). Its text is
+     * `host=` + 32764 `a`s, so a spec can match its prefix without
+     * carrying 32 KiB of literal. */
+    overBoundPrefix: 'host=aaaa',
+    overBoundBytes: 32769,
+  },
+  /** The service column `wire/service-schema-corpus.json` names in the
+   * service's `degraded_fields`, which is the only thing that renders a
+   * field row's degraded badge. `populated` has no such column, so a
+   * badge spec has to be on `corpus`. The name is also
+   * `wire/catalog-field.json`'s field, so the case file the badge opens
+   * is about the field the badge sits on. */
+  degradedField: 'duration',
+  /** The service's columns at the ends of a name sort, from
+   * `wire/service-schema-corpus.json`: `_time`, `duration`, `status`
+   * ascending. Enough to tell the drawer's default direction from its
+   * opposite after the field headers moved onto the shared helper. */
+  fieldFirstAlphabetically: '_time',
+  fieldLastAlphabetically: 'status',
+  /** The field the service drawer's overview lists first under "Top
+   * fields by cardinality": the highest count in
+   * `wire/query-cardinality.json`. The drawer reads that answer BY
+   * COLUMN NAME, so this is the fixture's name and not the query's. */
+  topCardinalityField: '_time',
+  /** Runs of the net, newest first (`wire/net-runs.json`). */
+  runIds: [501, 502] as const,
+  /** The run whose expansion has a result body. */
+  runWithResult: 501,
 } as const;
 
 /** Re-point the stub server at a non-default scenario for this test. Call

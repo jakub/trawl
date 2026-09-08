@@ -189,7 +189,12 @@
   font-weight: 600;
   color: var(--ink-2);
 }
+/* A <button> since ADR-0029, so the rule carries its own reset; there
+ * is no bare `button` selector in this sheet (ADR-0028). */
 .facets .phead .clear {
+  background: none;
+  border: 0;
+  padding: 0;
   font-family: var(--font-ui);
   font-size: var(--fs-dense);
   color: var(--accent);
@@ -208,10 +213,18 @@
   border-top: 1px solid var(--line-2);
   padding: 8px 0 4px;
 }
+/* A <button> since ADR-0029: it keeps its flex row and takes the full
+ * width of the group so the click target is what it was. */
 .facets .g-hd {
   display: flex;
   align-items: center;
+  width: 100%;
   padding: 0 12px 4px;
+  background: none;
+  border: 0;
+  color: inherit;
+  font: inherit;
+  text-align: inherit;
   cursor: pointer;
   user-select: none;
   gap: 6px;
@@ -238,12 +251,14 @@
 .facets .g.collapsed .vals { display: none; }
 
 .facets .v {
+  /* Width of the include/exclude area. The count reserves it while the
+   * buttons are hidden, so both boxes read the one number. */
+  --facet-act-w: 48px;
   position: relative;
   display: flex;
   align-items: center;
   padding: 3px 12px;
   gap: 8px;
-  cursor: pointer;
   font-family: var(--font-mono);
   font-size: var(--fs-dense);
   min-height: 22px;
@@ -269,11 +284,56 @@
 .facets .v .c {
   color: var(--ink-3);
   font-variant-numeric: tabular-nums;
+  /* Reserves the action area, which is out of flow: a 1-digit count is
+   * far narrower than two glyph buttons, and `.n` is `flex: 1`, so
+   * without this the value name grows under the buttons the moment they
+   * appear. Right-aligned because the box is now wider than its digits. */
+  min-width: var(--facet-act-w);
+  text-align: right;
 }
-.facets .v .act { display: none; gap: 4px; color: var(--ink-3); }
-.facets .v:hover .act { display: flex; }
-.facets .v:hover .c { display: none; }
+/* Revealed on hover OR focus, and by opacity: `display: none` would
+ * take the two buttons out of the tab order (ADR-0029). They are pinned
+ * to the row's right edge instead of riding its flex row, because the
+ * count they replace takes a flex gap with it when it hides: in flow,
+ * arriving by Tab moved the button 8px out from under the pointer. */
+.facets .v .act {
+  display: flex;
+  position: absolute;
+  right: 12px;
+  top: 0;
+  bottom: 0;
+  min-width: var(--facet-act-w);
+  justify-content: flex-end;
+  align-items: center;
+  opacity: 0;
+  gap: 4px;
+  padding-left: 6px;
+  color: var(--ink-3);
+  /* Out of flow, so it carries its own opaque floor and repeats what
+   * the row paints: bare panel at rest and on keyboard focus, the hover
+   * wash on hover, the selected wash over panel when included. Without
+   * it a long value would read through the glyphs; the cost is that the
+   * `.bar` frequency tail is hidden under these 48px while revealed. */
+  background: var(--panel);
+}
+.facets .v:hover .act,
+.facets .v:focus-within .act { opacity: 1; }
+.facets .v:hover .act { background: var(--panel-2); }
+/* After the hover rule: `.v.selected` beats `.v:hover` for the row's own
+ * background on a tie, and the action floor follows the row. */
+.facets .v.selected .act {
+  background-color: var(--panel);
+  background-image: linear-gradient(var(--accent-wash), var(--accent-wash));
+}
+/* `visibility`, not `display: none`: the count's box is what keeps the
+ * value name out of the action area. */
+.facets .v:hover .c,
+.facets .v:focus-within .c { visibility: hidden; }
 .facets .v .act .op {
+  background: none;
+  border: 0;
+  color: inherit;
+  font-family: inherit;
   cursor: pointer;
   padding: 0 4px;
   border-radius: var(--radius-sm);
@@ -283,7 +343,14 @@
 .facets .v.selected { background: var(--accent-wash); }
 .facets .v.selected .n { color: var(--accent); font-weight: 600; }
 .facets .v.excluded .n { color: var(--red); text-decoration: line-through; }
+/* A <button> since ADR-0029: full width and left-aligned keeps the row
+ * looking like the value rows above it. */
 .facets .g .more {
+  display: block;
+  width: 100%;
+  background: none;
+  border: 0;
+  text-align: left;
   font-family: var(--font-ui);
   font-size: var(--fs-dense);
   color: var(--ink-3);
@@ -406,7 +473,9 @@
 }
 
 /* Date range — single trigger (grafana-style); all presets live in the
- * popover. */
+ * popover. The trigger is a <button> (ADR-0029): it already declares its
+ * own background, border and colour, so `font: inherit` is the whole
+ * reset the user-agent chrome needs. */
 .daterange { position: relative; display: flex; align-items: stretch; }
 .daterange .dr-trigger { flex: 1; }
 .dr-trigger {
@@ -420,8 +489,10 @@
   border: 1px solid var(--line);
   border-radius: var(--radius-ctl);
   color: var(--ink-2);
+  font: inherit;
   font-family: var(--font-ui);
   font-size: var(--fs-ui);
+  margin: 0;
   cursor: pointer;
   user-select: none;
   white-space: nowrap;
@@ -509,7 +580,11 @@
   font-size: var(--fs-dense);
   font-family: var(--font-mono);
 }
+/* A <button> since ADR-0029, hence the per-rule reset (ADR-0028). */
 .meta .chip .x {
+  background: none;
+  border: 0;
+  font: inherit;
   cursor: pointer;
   padding: 0 4px;
   border-radius: var(--radius-sm);
@@ -601,7 +676,6 @@
   border-radius: var(--radius-sm);
 }
 .deg-x:hover { color: var(--ink); background: var(--panel-2); }
-.deg-x:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
 /* ─────────────────────────────────────────────────────────────────
  *  Malformed-link notice (ADR-0027) — a search URL whose structured
@@ -648,7 +722,6 @@
   font-size: var(--fs-dense);
 }
 .url-notice-repair:hover { background: var(--red); color: var(--on-accent); }
-.url-notice-repair:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
 /* ─────────────────────────────────────────────────────────────────
  *  Histogram — 78px strip on Events
@@ -775,11 +848,25 @@
   color: var(--ink-3);
 }
 .results-table thead th {
-  cursor: pointer;
-  user-select: none;
   position: sticky;
   top: 0;
   z-index: 2;
+}
+/* The header cell keeps its sticky box; the button inside it is the
+ * control (ADR-0029) and takes the whole cell so the click target is
+ * unchanged. The cell's own padding moves onto the button: left on the
+ * `<th>` it would be dead space that no longer sorts. */
+.results-table thead th.sortable { padding: 0; }
+.results-table thead th .th-sort {
+  font: inherit;
+  background: none;
+  border: 0;
+  padding: 6px var(--row-pad-x);
+  color: inherit;
+  cursor: pointer;
+  user-select: none;
+  width: 100%;
+  text-align: left;
 }
 .results-table thead th .sort {
   opacity: .3;
@@ -788,6 +875,10 @@
 }
 .results-table thead th.sorted { color: var(--ink); }
 .results-table thead th.sorted .sort { opacity: 1; color: var(--accent); }
+/* The row is the containing block for its caret button's stretched
+ * pseudo-element (ADR-0029). */
+.results-table tbody tr { position: relative; }
+.results-table .exp-col .row-stretch { width: 100%; }
 .results-table tbody tr.expanded td { background: var(--accent-wash); }
 .results-table tbody tr.expanded td.exp-col { color: var(--accent); }
 
@@ -836,6 +927,7 @@
   font-size: var(--table-fs);
 }
 .results-table .detail .dg .v .tag {
+  font: inherit;
   background: var(--panel-2);
   border: 1px solid var(--line-2);
   border-radius: var(--radius-sm);
@@ -881,7 +973,17 @@
   gap: 6px;
   padding: 0 4px;
 }
-.statusbar .grp.clickable { cursor: pointer; border-radius: var(--radius-sm); }
+/* The theme control is the one clickable group and it is a <button>
+ * (ADR-0029); .statusbar .grp gives it the flex row, this gives it the
+ * reset. */
+.statusbar .grp.clickable {
+  background: none;
+  border: 0;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+}
 .statusbar .grp.clickable:hover { background: var(--panel-2); color: var(--ink-2); }
 .statusbar .dot {
   width: 6px;
@@ -982,6 +1084,8 @@
   flex-direction: column;
   gap: 3px;
 }
+/* .lb is a <label for> now, not a div; it is a flex item of .fld, which
+ * blockifies it, so the box is the one the div had. */
 .dr-pop .cust .fld .lb {
   font-size: var(--fs-dense);
   color: var(--ink-3);
@@ -1067,11 +1171,24 @@
   font-family: var(--font-ui); font-size: var(--fs-ui); font-weight: 600;
   border-bottom: 1px solid var(--line);
 }
+/* The one control a list row carries (ADR-0029). The row is the
+ * containing block, so this pseudo-element covers the whole row and a
+ * pointer anywhere on it reaches the single listener. The control and
+ * its cell stay unpositioned or the row stops being that block; nested
+ * controls sit above with `position: relative; z-index: 1`. */
+.row-stretch::after { content: ""; position: absolute; inset: 0; z-index: 0; }
+.row-stretch {
+  font: inherit; background: none; border: 0; padding: 0;
+  color: inherit; text-align: inherit; text-decoration: none;
+  cursor: pointer; min-width: 0;
+}
+
 .tbl-row {
   display: flex; padding: 6px 10px; gap: 12px; align-items: center;
   border-bottom: 1px solid var(--line-2);
   font-size: var(--fs-ui); cursor: pointer;
   transition: background 80ms;
+  position: relative;
 }
 .tbl-row:last-child { border-bottom: 0; }
 .tbl-row:hover { background: var(--panel-2); }
@@ -1080,14 +1197,42 @@
   color: var(--ink-2); white-space: pre-wrap; word-break: break-all; min-width: 0;
 }
 .tbl-row.active { background: var(--accent-wash); }
+/* The row control replaced a flex child's content, so it takes the
+ * cell's width back; truncation stays on the inner text span. */
+.tbl-row .path .row-stretch, .tbl-row .mono > .row-stretch { display: block; width: 100%; }
+.svc-cell .row-stretch { display: flex; min-width: 0; }
+/* Nested controls: above the stretched pseudo-element, and reachable. */
+.tbl-row .row-act, .tbl-row .link, .tbl-row .row-menu {
+  position: relative; z-index: 1;
+}
+/* z-index: 1 makes the cell a stacking context, so an open ActionsMenu
+ * panel (fleet-ui z-index 10, mounted inside this cell, no portal) is
+ * still painted under the NEXT row's cells, which carry the same 1 and
+ * come later in the DOM: the menu's lower half is covered and a click
+ * there lands on the next row's trigger. The panel exists only while the
+ * menu is open, so :has lifts the cell exactly then. */
+.tbl-row .row-menu:has(.actions-menu) { z-index: 3; }
 .tbl-row .num { text-align: right; font-variant-numeric: tabular-nums; color: var(--ink); }
 
-/* Sortable header cells (schema services table). */
-.tbl-hd .th { display: flex; align-items: center; gap: 3px; }
-.tbl-hd .th.sortable { cursor: pointer; user-select: none; transition: color 100ms; }
-.tbl-hd .th.sortable:hover { color: var(--ink-2); }
-.tbl-hd .th.sortable.active { color: var(--ink); }
-.tbl-hd .th .dir { font-size: var(--fs-micro); color: var(--accent); }
+/* Sortable header cells. Unscoped from `.tbl-hd` so the service
+ * drawer's field headers share one helper (ADR-0029): the cell is a
+ * div, the control inside it is a button, and the button gets the
+ * cell's own box back (full width, the cell's justification) plus the
+ * per-rule reset ADR-0028 asks for. */
+.th { display: flex; align-items: center; gap: 3px; }
+.th.sortable { transition: color 100ms; }
+.th.sortable button {
+  font: inherit; background: none; border: 0; padding: 0; color: inherit;
+  cursor: pointer; user-select: none;
+  width: 100%; display: flex; align-items: center; gap: 3px;
+  justify-content: inherit;
+  /* The cell centres its children; the control has to fill it, or the
+   * cell's own height above and below the label stops sorting. */
+  align-self: stretch;
+}
+.th.sortable:hover { color: var(--ink-2); }
+.th.sortable.active { color: var(--ink); }
+.th .dir { font-size: var(--fs-micro); color: var(--accent); }
 
 /* Schema services table — name cell. The canonical 7px + 2px-ring
  * StatusDot reads swollen against dense row text; scope it down to
@@ -1106,8 +1251,10 @@
   display: flex; gap: 4px; justify-content: flex-end;
   opacity: 0; transition: opacity 100ms;
 }
-.tbl-row:hover .row-act, .tbl-row.active .row-act { opacity: 1; }
+.tbl-row:hover .row-act, .tbl-row:focus-within .row-act,
+.tbl-row.active .row-act { opacity: 1; }
 .row-act .qa {
+  font: inherit; color: inherit; text-align: inherit;
   display: inline-flex; align-items: center; justify-content: center;
   padding: 3px 6px; border: 1px solid var(--line); border-radius: var(--radius-sm);
   background: var(--panel-2); color: var(--ink-2); cursor: pointer;
@@ -1115,7 +1262,12 @@
 }
 .row-act .qa:hover { color: var(--accent); border-color: var(--accent); background: var(--accent-wash); }
 
-.link { color: var(--accent); cursor: pointer; font-size: var(--fs-ui); }
+/* Also a <button> (history's Save as Net), so the rule carries its own
+ * reset — there is no bare `button` selector in this sheet (ADR-0028). */
+.link {
+  font-family: inherit; background: none; border: 0; padding: 0;
+  color: var(--accent); cursor: pointer; font-size: var(--fs-ui);
+}
 .link:hover { text-decoration: underline; }
 .link.danger { color: var(--red); }
 
@@ -1201,6 +1353,15 @@
  * fleet_ui::Drawer emits it). Title-slot CONTENT below stays app-side:
  * the .name/.sub spans are rendered by trawl's drawer call sites. */
 .sd-ttl .name { font-family: var(--font-mono); font-size: var(--fs-heading); font-weight: 600; color: var(--ink); letter-spacing: -.2px; }
+/* The net drawer's title is a rename button (ADR-0029); the service
+ * drawer's is a plain span, so the reset is scoped to the button. */
+.sd-ttl button.name {
+  background: none;
+  border: 0;
+  padding: 0;
+  text-align: left;
+  cursor: pointer;
+}
 .sd-ttl .sub { font-size: var(--fs-ui); color: var(--ink-3); }
 
 /* Overview tab */
@@ -1258,6 +1419,7 @@
   align-items: center; gap: 10px;
   padding: 4px 8px; border-radius: var(--radius-sm);
   font-size: var(--table-fs); cursor: pointer;
+  position: relative;
 }
 .topfields .tf:hover { background: var(--panel-3); }
 .topfields .tf .fn { color: var(--ink); }
@@ -1278,12 +1440,10 @@
   text-transform: uppercase; letter-spacing: .08em; color: var(--ink-3);
   border-bottom: 1px solid var(--line); padding-bottom: 8px; margin-bottom: 2px;
 }
-.sf-hd > div { cursor: pointer; user-select: none; }
-.sf-hd > div:hover { color: var(--ink); }
-.sf-hd .srt { color: var(--accent); font-size: var(--fs-tiny); margin-left: 4px; }
 .sf-row {
   border-bottom: 1px solid var(--line-2); cursor: pointer;
   transition: background 80ms;
+  position: relative;
 }
 .sf-row:hover { background: var(--panel-2); }
 .sf-row.open { background: var(--accent-wash); }
@@ -1294,6 +1454,10 @@
  * the type chip instead of truncating. */
 .sf-row > div:first-child { display: flex; align-items: center; min-width: 0; }
 .sf-row .caret, .sf-row .deg-btn { flex: none; }
+/* The caret and the field name live inside the row's one control, which
+ * takes the name cell's flex box back. */
+.sf-row .row-stretch { display: flex; align-items: center; min-width: 0; flex: 1; }
+.sf-row .deg-btn { position: relative; z-index: 1; }
 .sf-row .c-name { color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 .sf-row .c-card, .sf-row .c-size { color: var(--ink-2); text-align: right; }
 .sf-row .c-sample { color: var(--ink-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -1340,8 +1504,10 @@
 .deg-btn {
   background: none; border: 0; padding: 0; margin-left: 6px;
   cursor: pointer; line-height: 1; vertical-align: middle;
+  /* Shapes the focus ring, which is fleet-ui's box-shadow (ADR-0007) and
+   * follows the box's own corners. */
+  border-radius: var(--radius-xs);
 }
-.deg-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: var(--radius-xs); }
 
 /* Field case file (ADR-0011 C2) */
 .fc-back {
@@ -1350,7 +1516,6 @@
   border-radius: var(--radius-xs);
 }
 .fc-back:hover { color: var(--ink); background: var(--panel-3); }
-.fc-back:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 /* The icon set carries one chevron (pointing down); the back affordance
    is that glyph turned to point left. */
 .fc-back svg { transform: rotate(90deg); }
@@ -1407,7 +1572,6 @@
   font-family: var(--font-mono); font-size: inherit; color: var(--accent);
   text-decoration: underline; text-underline-offset: 2px;
 }
-.fc-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 /* Repin modal (ADR-0011 C2 M3) */
 .rp-note {
@@ -1485,10 +1649,13 @@
 }
 
 .interval-chips { display: flex; gap: 6px; flex-wrap: wrap; }
+/* A <button> since ADR-0029; it already declares its own border,
+ * background and font, so the reset it needs is the inherited size. */
 .interval-chip {
   padding: 4px 10px; font-size: var(--fs-ui); font-family: var(--font-mono);
   border: 1px solid var(--line); border-radius: var(--radius-sm);
   cursor: pointer; color: var(--ink-3); background: var(--panel-2);
+  line-height: inherit;
   user-select: none; transition: background 120ms, border-color 120ms;
 }
 .interval-chip:hover { border-color: var(--ink-3); color: var(--ink-2); }

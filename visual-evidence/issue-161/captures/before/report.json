@@ -1,0 +1,285 @@
+{
+  "label": "before",
+  "dist": "/tmp/trawl-161-before/crates/trawl-web-ui/dist",
+  "viewport": {
+    "width": 1440,
+    "height": 900
+  },
+  "scenario": "corpus",
+  "shots": [
+    {
+      "name": "schema-table-rest",
+      "file": "schema-table-rest.png",
+      "clipped": true,
+      "focusSelector": null,
+      "focus": null,
+      "note": null
+    },
+    {
+      "name": "schema-row-focused",
+      "file": "schema-row-focused.png",
+      "clipped": true,
+      "focusSelector": ".tbl-body .tbl-row .row-stretch",
+      "focus": null,
+      "note": "the row link focused; `.row-act` reveals the two quick actions on :focus-within"
+    },
+    {
+      "name": "nets-table-rest",
+      "file": "nets-table-rest.png",
+      "clipped": true,
+      "focusSelector": null,
+      "focus": null,
+      "note": null
+    },
+    {
+      "name": "nets-menu-open",
+      "file": "nets-menu-open.png",
+      "clipped": true,
+      "focusSelector": null,
+      "focus": null,
+      "note": "one net in the fixture, so the menu opens over its own row"
+    },
+    {
+      "name": "runs-table-rest",
+      "file": "runs-table-rest.png",
+      "clipped": true,
+      "focusSelector": null,
+      "focus": null,
+      "note": null
+    },
+    {
+      "name": "runs-row-focused",
+      "file": "runs-row-focused.png",
+      "clipped": true,
+      "focusSelector": ".tbl-body .tbl-row .row-stretch",
+      "focus": null,
+      "note": null
+    },
+    {
+      "name": "history-table-rest",
+      "file": "history-table-rest.png",
+      "clipped": true,
+      "focusSelector": null,
+      "focus": null,
+      "note": null
+    },
+    {
+      "name": "history-row-focused",
+      "file": "history-row-focused.png",
+      "clipped": true,
+      "focusSelector": ".tbl-body .tbl-row .row-stretch",
+      "focus": null,
+      "note": "a button, not a link: the rerun goes through the navigator, which refuses the second entry"
+    },
+    {
+      "name": "results-table-rest",
+      "file": "results-table-rest.png",
+      "clipped": true,
+      "focusSelector": null,
+      "focus": null,
+      "note": null
+    },
+    {
+      "name": "results-row-focused",
+      "file": "results-row-focused.png",
+      "clipped": true,
+      "focusSelector": ".results-table td.exp-col button.row-stretch",
+      "focus": null,
+      "note": null
+    },
+    {
+      "name": "results-row-expanded",
+      "file": "results-row-expanded.png",
+      "clipped": false,
+      "focusSelector": null,
+      "focus": null,
+      "note": null
+    },
+    {
+      "name": "results-sort-header-focused",
+      "file": "results-sort-header-focused.png",
+      "clipped": false,
+      "focusSelector": ".results-table th.sortable button.th-sort",
+      "focus": null,
+      "note": null
+    },
+    {
+      "name": "facets-rest",
+      "file": "facets-rest.png",
+      "clipped": true,
+      "focusSelector": null,
+      "focus": null,
+      "note": null
+    },
+    {
+      "name": "facets-include-focused",
+      "file": "facets-include-focused.png",
+      "clipped": true,
+      "focusSelector": ".facets .g .vals .v .act button.op",
+      "focus": null,
+      "note": "long value in the first row: the action area is out of flow with its own opaque floor"
+    },
+    {
+      "name": "editor-tools-rest",
+      "file": "editor-tools-rest.png",
+      "clipped": true,
+      "focusSelector": null,
+      "focus": null,
+      "note": null
+    },
+    {
+      "name": "editor-tools-focused",
+      "file": "editor-tools-focused.png",
+      "clipped": true,
+      "focusSelector": ".editor-tools button.tool",
+      "focus": {
+        "focused": true,
+        "focusVisible": true,
+        "boxShadow": "oklab(0.648258 -0.015056 -0.0388128) 0px 0px 0px 2px",
+        "outline": "oklch(0.556 0 0) none 3px",
+        "tag": "BUTTON",
+        "type": "button"
+      },
+      "note": null
+    },
+    {
+      "name": "range-dialog-open",
+      "file": "range-dialog-open.png",
+      "clipped": true,
+      "focusSelector": null,
+      "focus": null,
+      "note": "opened from the keyboard; after #161 the hook has already moved focus to the first control"
+    },
+    {
+      "name": "status-bar-theme-focused",
+      "file": "status-bar-theme-focused.png",
+      "clipped": true,
+      "focusSelector": ".statusbar button.grp.clickable",
+      "focus": null,
+      "note": null
+    },
+    {
+      "name": "service-drawer-top-fields",
+      "file": "service-drawer-top-fields.png",
+      "clipped": true,
+      "focusSelector": ".topfields .tf button.fn",
+      "focus": null,
+      "note": "the `.topfields` wrapper is what makes main.css style these rows at all"
+    },
+    {
+      "name": "service-drawer-fields-rest",
+      "file": "service-drawer-fields-rest.png",
+      "clipped": true,
+      "focusSelector": null,
+      "focus": null,
+      "note": null
+    },
+    {
+      "name": "service-drawer-field-header-focused",
+      "file": "service-drawer-field-header-focused.png",
+      "clipped": true,
+      "focusSelector": ".sf-hd .th.sortable button",
+      "focus": null,
+      "note": null
+    },
+    {
+      "name": "service-drawer-degraded-badge-focused",
+      "file": "service-drawer-degraded-badge-focused.png",
+      "clipped": true,
+      "focusSelector": "button.deg-btn",
+      "focus": {
+        "focused": true,
+        "focusVisible": true,
+        "boxShadow": "oklab(0.648258 -0.015056 -0.0388128) 0px 0px 0px 2px",
+        "outline": "rgb(42, 92, 138) solid 2px",
+        "tag": "BUTTON",
+        "type": "button"
+      },
+      "note": "one of the five controls whose app-side outline override was deleted"
+    },
+    {
+      "name": "field-case-back-focused",
+      "file": "field-case-back-focused.png",
+      "clipped": true,
+      "focusSelector": "button.fc-back",
+      "focus": {
+        "focused": true,
+        "focusVisible": true,
+        "boxShadow": "oklab(0.648258 -0.015056 -0.0388128) 0px 0px 0px 2px",
+        "outline": "rgb(42, 92, 138) solid 2px",
+        "tag": "BUTTON",
+        "type": "button"
+      },
+      "note": null
+    },
+    {
+      "name": "field-case-link-focused",
+      "file": "field-case-link-focused.png",
+      "clipped": true,
+      "focusSelector": "button.fc-link",
+      "focus": {
+        "focused": true,
+        "focusVisible": true,
+        "boxShadow": "oklab(0.648258 -0.015056 -0.0388128) 0px 0px 0px 2px",
+        "outline": "rgb(42, 92, 138) solid 2px",
+        "tag": "BUTTON",
+        "type": "button"
+      },
+      "note": null
+    },
+    {
+      "name": "url-notice-repair-focused",
+      "file": "url-notice-repair-focused.png",
+      "clipped": true,
+      "focusSelector": ".url-notice-repair",
+      "focus": {
+        "focused": true,
+        "focusVisible": true,
+        "boxShadow": "oklab(0.648258 -0.015056 -0.0388128) 0px 0px 0px 2px",
+        "outline": "rgb(42, 92, 138) solid 2px",
+        "tag": "BUTTON",
+        "type": "button"
+      },
+      "note": "reached by a hand-written malformed link, as search-url.spec.ts does"
+    },
+    {
+      "name": "degraded-notice-dismiss-focused",
+      "file": "degraded-notice-dismiss-focused.png",
+      "clipped": true,
+      "focusSelector": "button.deg-x",
+      "focus": {
+        "focused": true,
+        "focusVisible": true,
+        "boxShadow": "oklab(0.648258 -0.015056 -0.0388128) 0px 0px 0px 2px",
+        "outline": "rgb(42, 92, 138) solid 2px",
+        "tag": "BUTTON",
+        "type": "button"
+      },
+      "note": null
+    },
+    {
+      "name": "net-drawer-rename-focused",
+      "file": "net-drawer-rename-focused.png",
+      "clipped": true,
+      "focusSelector": ".sd-ttl button.name",
+      "focus": null,
+      "note": null
+    },
+    {
+      "name": "net-drawer-presets-focused",
+      "file": "net-drawer-presets-focused.png",
+      "clipped": true,
+      "focusSelector": ".interval-chips button.interval-chip",
+      "focus": null,
+      "note": null
+    },
+    {
+      "name": "net-drawer-run-row-focused",
+      "file": "net-drawer-run-row-focused.png",
+      "clipped": true,
+      "focusSelector": ".sd-drawer .tbl-body .row-stretch",
+      "focus": null,
+      "note": null
+    }
+  ]
+}
