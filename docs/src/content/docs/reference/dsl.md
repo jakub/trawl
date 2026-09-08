@@ -926,6 +926,73 @@ the way `let` does.
 | eventstats avg(duration) as avg_dur by service
 ```
 
+### How large a query may be
+
+Two fixed limits, checked before anything runs and identical in every
+lane (batch, live tail, export, validate, saved queries, scheduled runs).
+Neither is configurable.
+
+- **128 pipeline stages.** Every stage counts, including `from saved` and
+  the stages after `extract kv`. The search stage is not a pipeline stage.
+- **An alias-expansion budget of 512**, summed across the whole query.
+
+The second one needs a sentence of explanation. When an output of a stage
+names an **earlier output of the same stage**, the database does not read
+a finished column: it writes that earlier expression into the new one,
+once for every place the name appears, and binds the result. Chain a few
+of those and the work multiplies while the query text barely grows.
+`a1 = a0 + a0` costs twice `a0`, `a2 = a1 + a1` costs four times, and by
+`a7` there are 128 copies of the seed. trawl's generated SQL multiplies
+too: `sev(x) in (1,3,5,7,9,11,13,15,17,19,21,23)` writes its subject
+twelve times, once per contiguous range of the severity ladder, so each
+link of a chain built from severity sets is twelve times the last.
+
+The score counts exactly that repetition, and nothing else. An expression
+that names no earlier output of its own stage scores zero, however big it
+is: independent assignments, a 500-element `in (...)` list, a long
+pipeline of separate stages. Naming the same earlier output many times is
+cheap per use and does count: 256 outputs each reading one earlier output
+once is 512 on the nose, and admitted.
+
+Over either limit, the query is refused before it reaches the database,
+naming the stage and the output that crossed the line:
+
+```text
+pipeline stage 1 (`let`) goes over this query's alias-expansion budget of
+512 at the output `a7`: an output naming an earlier output of the same
+stage is written into it once for every place it is named, so the work
+multiplies — split the dependent assignments across separate `| let`
+stages, so each one reads a finished column
+
+this query has 129 pipeline stages, over the limit of 128; shorten the
+pipeline, or save part of it and read it back with `from saved`
+```
+
+The remedy is the split the message names. One `| let` per dependent
+step, so the next stage reads a column the previous stage finished:
+
+```
+| let a0 = status + status | let a1 = a0 + a0 | let a2 = a1 + a1
+```
+
+That form carries no alias expansion at all, however deep it goes; 24
+doublings written this way are ordinary, where the same 24 in one `| let`
+are refused. `stats`, `timechart` and `eventstats` take the same fix from
+the other end: give each output an expression of its own, then derive the
+combined values in a `| let` after the stage.
+
+```
+| stats count() as hits, avg(duration) as avg_dur by service | let ratio = hits / avg_dur
+```
+
+Splitting bounds what the binder is asked to build. It does not promise
+the optimizer computes a stage once and reuses it: there is no
+materialization guarantee here, and a stage's expression may still be
+evaluated more than once at execution time.
+
+Nothing in the documented examples on this page comes near either limit,
+and none of them names an earlier output of the same stage at all.
+
 ## Expressions
 
 Used in `where`, `let`, and aggregation arguments.

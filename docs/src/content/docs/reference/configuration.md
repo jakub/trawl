@@ -74,6 +74,73 @@ retention window at all.
 positive byte count because an unbounded buffer can grow without limit behind
 a wedged WAL write. To turn that pipeline off, set `internal_telemetry = false`.
 
+#### The query deadline, and work that outlives a request
+
+`timeout_secs` is **one absolute deadline per request**, not a budget each
+phase gets to spend again. trawld stamps it right after authentication,
+before it tracks the query, admits the DSL or resolves a saved query's
+source, and everything the request then waits for comes out of that one
+instant: waiting for an executor from the pool, waiting on the
+publication gate that keeps a query off a file compaction is replacing,
+the delay between a queued worker being handed a permit and actually
+starting, and execution itself. A best-effort history write runs under it
+too, so a slow store can cost the history row but never the answer that
+is already in hand. Time spent reading the request body is outside it,
+and so is delivering the response.
+
+Where the deadline expires decides the status code:
+
+- **Before the work starts**, the answer is `503` with
+  `server at capacity: the query was not started`. That is a fixed
+  sentence, and it is the whole answer: nothing was read, nothing ran,
+  and no timeout is written to query history.
+- **After the work starts**, it is the familiar `504` query timeout.
+
+The work-start transition is the boundary, not the order two timers
+happen to fire in. Holding an executor permit is not the same as having
+started: a worker can sit in the queue holding nothing, or hold a permit
+and be refused at the transition because the deadline passed while it
+waited.
+
+**A 503 or a 504 does not mean the database stopped.** The request ends;
+a DuckDB bind or scan that already started keeps its executor permit
+until it physically finishes. trawld now says so instead of leaving the
+capacity unaccounted:
+
+- `GET /api/v1/queries` carries a `retained` list beside the active one.
+  Each entry has the pool `id`, the work `kind` (`query`, `from_saved`,
+  `export`, `scheduled`, `ping`, `sample`), whether it `started`, and
+  `retained_ms`, how long it has outlived its request. The submitting
+  key's display name and the DSL appear only for a reader entitled to
+  them: an admin, or the exact key that submitted it. Work with no human
+  owner (ping, sampling, scheduled runs) never shows query text to
+  anyone below `server_manage`.
+- `GET /api/v1/stats` and the dashboard snapshot carry `pool_retained`
+  beside `pool_active`. Retained work is a **subset** of held permits,
+  never an extra count, and the terminal dashboard renders
+  `active: 3/4 (1 retained)` only when the number is nonzero.
+- `/metrics` carries `trawl_query_permits_retained`, a label-free gauge.
+  A steady nonzero value means capacity is occupied by work no request is
+  waiting for any more, and that is the number to alarm on if searches
+  start queueing behind nothing visible.
+- The lifecycle logs `query_permit_retained` and `query_permit_reclaimed`
+  bracket each interval. They carry metadata only, never DSL.
+
+**Cancelling.** `DELETE /api/v1/queries/{id}` still works on retained
+work, and repeating it is safe: cancellation is a latch, and asking twice
+sets a flag that is already set. What comes back is an acknowledgement
+that cancellation was **requested**, not a promise that anything has
+stopped. trawld latches the request even before an interrupt handle
+exists, so a cancel that arrives during binding is not lost, and it
+checks the latch again at the boundary between binding and execution.
+A bind already inside DuckDB is not preemptible: the honest worst case is
+that the permit stays retained until that bind returns.
+
+**The DSL admission limits are not configurable.** The 512 alias-expansion
+budget and the 128-stage cap ([DSL reference](/reference/dsl/)) are fixed
+constants, checked before a query reaches the database, and there is no
+knob here that raises them.
+
 #### `[server.rate_limit]`
 
 Per-key rate limiting in requests per minute. Every API key gets an independent token bucket, sized per route class: `default_rpm` on the interactive API routes, `ingest_rpm` on `/api/v1/ingest`. Set a field to `0` to disable rate limiting for that route class.

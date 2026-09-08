@@ -2211,7 +2211,7 @@ mod tests {
         );
 
         // Observed maxima at the time of writing, on the two reference pages:
-        //   documented queries admitted: 61
+        //   documented queries admitted: 63
         //   longest pipeline:            5 stages   (of 128)
         //   largest lateral delta:       0          (of 512)
         //
