@@ -57,6 +57,22 @@ use crate::source::compute_source;
 #[cfg(any(test, feature = "test-support"))]
 pub static TEST_QUERY_DELAY_MS: AtomicU64 = AtomicU64::new(0);
 
+/// The whole budget one health probe gets: queue wait plus the `SELECT 1`
+/// (ADR-0024).
+///
+/// `/health` is unauthenticated and unthrottled, so its cost under a busy
+/// pool has to be a fast unhealthy answer, not a request that waits as
+/// long as a query would.
+const PING_BUDGET: Duration = Duration::from_millis(250);
+
+/// The longest an autocomplete sample waits to GET a permit and the
+/// publication guard, together (ADR-0024).
+///
+/// Its own overall deadline still caps the whole call: this is the
+/// smaller of the two, so a slow acquisition fails the sample instead of
+/// eating a query-length budget before it reads anything.
+const SAMPLE_ACQUIRE_BUDGET: Duration = Duration::from_secs(1);
+
 /// Which door a unit of pool work came through.
 ///
 /// Presentation and authorization metadata only: every kind takes the same
@@ -324,9 +340,10 @@ impl WorkSlot {
     /// so the classification never depends on which side of a `select!`
     /// was polled first.
     ///
-    /// `deadline` is `None` for the helper lanes that have no budget of
-    /// their own yet (ping); they still refuse a latched cancellation.
-    fn begin_work(&self, deadline: Option<Deadline>) -> Result<(), StartRefusal> {
+    /// Every lane has a budget, helpers included: ping brings its own
+    /// [`PING_BUDGET`] one, so there is no escape hatch here for work
+    /// that could start after its caller stopped waiting.
+    fn begin_work(&self, deadline: Deadline) -> Result<(), StartRefusal> {
         let mut registry = self.registry.lock();
         if registry
             .interrupts
@@ -335,7 +352,7 @@ impl WorkSlot {
         {
             return Err(StartRefusal::Cancelled);
         }
-        if deadline.is_some_and(Deadline::expired) {
+        if deadline.expired() {
             return Err(StartRefusal::Expired);
         }
         if let Some(entry) = registry.retained.get_mut(&self.id) {
@@ -1308,7 +1325,7 @@ impl ExecutorPool {
                 if !slot.publish_interrupt(slot.executor().interrupt_handle()) {
                     return refused_outcome(query_id, kind, StartRefusal::Cancelled);
                 }
-                if let Err(refusal) = slot.begin_work(Some(deadline)) {
+                if let Err(refusal) = slot.begin_work(deadline) {
                     return refused_outcome(query_id, kind, refusal);
                 }
                 worker_seam!(Started);
@@ -1491,7 +1508,7 @@ impl ExecutorPool {
                 if !slot.publish_interrupt(slot.executor().interrupt_handle()) {
                     return refused_outcome(query_id, kind, StartRefusal::Cancelled);
                 }
-                if let Err(refusal) = slot.begin_work(Some(deadline)) {
+                if let Err(refusal) = slot.begin_work(deadline) {
                     return refused_outcome(query_id, kind, refusal);
                 }
                 worker_seam!(Started);
@@ -1596,7 +1613,24 @@ impl ExecutorPool {
         match tokio::time::timeout(timeout, semaphore.acquire_many_owned(permits)).await {
             Ok(Ok(permits)) => Ok(PoolExclusive { _permits: permits }),
             Ok(Err(_)) => Err(ServerError::Internal("executor pool shut down".into())),
-            Err(_) => Err(ServerError::Timeout),
+            Err(_) => {
+                // Name what is in the way. A permit held by work whose
+                // request already answered looks identical from here to a
+                // permit held by a query someone is waiting on, and the
+                // two call for different operator moves: one is a query
+                // to wait out, the other is work to cancel by id
+                // (ADR-0024). Counts only — no ids, no DSL.
+                let retained = self.retained();
+                tracing::warn!(
+                    event_type = "pool_exclusive_blocked",
+                    timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+                    capacity = self.max_concurrent,
+                    held = self.max_concurrent - self.semaphore.available_permits(),
+                    retained,
+                    "could not acquire the whole pool within its budget"
+                );
+                Err(ServerError::Timeout)
+            }
         }
     }
 
@@ -1657,29 +1691,39 @@ impl ExecutorPool {
     ///
     /// A permit-holding lane like any other, so it registers in the
     /// lifecycle registry and its capacity shows up in the retained count
-    /// if the probe outlives its caller. Its wait is still unbounded —
-    /// the 250 ms probe budget is a separate change.
+    /// if the probe outlives its caller.
+    ///
+    /// It carries its own [`PING_BUDGET`] deadline, covering the queue
+    /// wait AND the probe together (ADR-0024). `/health` is
+    /// unauthenticated and unthrottled, so a pool full of slow queries
+    /// must cost it a fast unhealthy answer rather than a hung request
+    /// per prober — and a probe that gives up is exactly like any other
+    /// abandoned request: it keeps its permit until the work stops, and
+    /// the failure lands on this probe's own record and nothing else.
     pub async fn ping(&self) -> Result<(), ServerError> {
+        let deadline = Deadline::after(PING_BUDGET);
         let semaphore = Arc::clone(&self.semaphore);
-        let Ok(permit) = semaphore.acquire_owned().await else {
-            return Err(ServerError::Internal("executor pool shut down".into()));
-        };
-
         let id = self.allocate_query_id();
         let work = WorkContext::system(WorkKind::Ping);
         let kind = work.kind;
+        let permit = match deadline.run(semaphore.acquire_owned()).await {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => return Err(ServerError::Internal("executor pool shut down".into())),
+            Err(crate::deadline::Expired) => {
+                return Err(capacity_refusal(id, kind, StartRefusal::Expired));
+            }
+        };
+
         let slot = self.begin_slot(id, &work, None, permit, None)?;
         let started = Arc::clone(&slot.started);
 
-        let task = tokio::task::spawn_blocking(move || {
+        let mut task = tokio::task::spawn_blocking(move || {
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 worker_seam!(Entry);
                 if !slot.publish_interrupt(slot.executor().interrupt_handle()) {
                     return Err(capacity_refusal(id, kind, StartRefusal::Cancelled));
                 }
-                // No budget of its own yet, so only a latched cancellation
-                // can refuse the start.
-                if let Err(refusal) = slot.begin_work(None) {
+                if let Err(refusal) = slot.begin_work(deadline) {
                     return Err(capacity_refusal(id, kind, refusal));
                 }
                 worker_seam!(Started);
@@ -1691,11 +1735,19 @@ impl ExecutorPool {
         });
 
         let mut request = RequestGuard::new(self, id, kind, &started);
-        let result = task
-            .await
-            .map_err(|e| ServerError::Internal(format!("ping task panicked: {e}")));
-        request.disarm();
-        result?
+        tokio::select! {
+            joined = &mut task => {
+                request.disarm();
+                joined.map_err(|e| ServerError::Internal(format!("ping task panicked: {e}")))?
+            }
+            () = tokio::time::sleep_until(deadline.instant()) => {
+                if request.abandon() {
+                    Err(ServerError::Timeout)
+                } else {
+                    Err(capacity_refusal(id, kind, StartRefusal::Expired))
+                }
+            }
+        }
     }
 
     /// Sample distinct values of one field for autocomplete.
@@ -1721,17 +1773,24 @@ impl ExecutorPool {
         let kind = work.kind;
         let semaphore = Arc::clone(&self.semaphore);
         let id = self.allocate_query_id();
-        let permit = deadline
+
+        // ONE acquisition budget across both gates, not one each: two
+        // second-long allowances would let a sample spend two seconds
+        // before reading anything. It is also never longer than what is
+        // left of the caller's own deadline.
+        let acquire = Deadline::after(SAMPLE_ACQUIRE_BUDGET.min(deadline.remaining()));
+        let permit = acquire
             .run(semaphore.acquire_owned())
             .await
             .map_err(|_| capacity_refusal(id, kind, StartRefusal::Expired))?
             .map_err(|_| ServerError::Internal("executor pool shut down".into()))?;
 
-        let publication = deadline
+        let publication = acquire
             .run(self.publication.read())
             .await
             .map_err(|_| capacity_refusal(id, kind, StartRefusal::Expired))??;
 
+        // Past acquisition the caller's overall deadline governs again.
         let slot = self.begin_slot(id, &work, None, permit, Some(publication))?;
         let started = Arc::clone(&slot.started);
         let fallback_glob = Arc::clone(&self.fallback_glob);
@@ -1744,7 +1803,7 @@ impl ExecutorPool {
                 if !slot.publish_interrupt(slot.executor().interrupt_handle()) {
                     return Err(capacity_refusal(id, kind, StartRefusal::Cancelled));
                 }
-                if let Err(refusal) = slot.begin_work(Some(deadline)) {
+                if let Err(refusal) = slot.begin_work(deadline) {
                     return Err(capacity_refusal(id, kind, refusal));
                 }
                 worker_seam!(Started);
@@ -1821,7 +1880,7 @@ impl ExecutorPool {
                 if !slot.publish_interrupt(slot.executor().interrupt_handle()) {
                     return Err(capacity_refusal(query_id, kind, StartRefusal::Cancelled));
                 }
-                if let Err(refusal) = slot.begin_work(Some(deadline)) {
+                if let Err(refusal) = slot.begin_work(deadline) {
                     return Err(capacity_refusal(query_id, kind, refusal));
                 }
                 worker_seam!(Started);
@@ -1958,6 +2017,18 @@ mod tests {
                 start.elapsed() < Duration::from_secs(20),
                 "the worker never reached: {label}"
             );
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Let every spawned task poll before the clock moves.
+    ///
+    /// A task registers its timers on its first poll, so advancing paused
+    /// time before that would place a deadline the test then never
+    /// reaches — and a paused runtime with a blocking thread in flight
+    /// does not reliably auto-advance to it either.
+    async fn settle() {
+        for _ in 0..16 {
             tokio::task::yield_now().await;
         }
     }
@@ -3144,6 +3215,246 @@ mod tests {
         assert_eq!(pool.retained(), 0);
         assert!(pool.retained_work().is_empty());
         assert!(registry_is_empty(&pool));
+    }
+
+    /// Neither helper lane may wait like a query (ADR-0024).
+    ///
+    /// The pool's one permit is parked in a worker, so both helpers can
+    /// only queue. Ping gives up after its own 250 ms probe budget and
+    /// sampling after one second of acquisition, no matter how long the
+    /// caller's overall deadline is — and the smaller of the two always
+    /// wins, so a 300 ms caller waits 300 ms. Each answers the safe
+    /// capacity refusal, and neither leaves anything behind.
+    #[tokio::test(start_paused = true)]
+    async fn ping_and_sampling_bound_their_wait() {
+        let _seams = seam::session().await;
+        let parked = seam::hold(Seam::Started);
+        let pool = hot_pool(1);
+        let baseline_idle = idle_len(&pool);
+
+        let occupant = pool.clone();
+        let occupied = tokio::spawn(async move {
+            occupant
+                .execute(
+                    occupant.allocate_query_id(),
+                    "*",
+                    Deadline::after(Duration::from_secs(600)),
+                    false,
+                    0,
+                    TEST_WORK,
+                )
+                .await
+        });
+        until("the pool's one permit is taken", || parked.arrivals() == 1).await;
+        assert_eq!(pool.available_permits(), 0);
+
+        // -- ping: 250 ms, acquisition included --
+        let prober = pool.clone();
+        let probe = tokio::spawn(async move { prober.ping().await });
+        settle().await;
+        tokio::time::advance(Duration::from_millis(200)).await;
+        settle().await;
+        assert!(
+            !probe.is_finished(),
+            "the probe must still be waiting inside its budget"
+        );
+        tokio::time::advance(Duration::from_millis(51)).await;
+        settle().await;
+        let refused = probe
+            .await
+            .expect("the probe task joins")
+            .expect_err("a full pool cannot be pinged");
+        assert!(
+            matches!(&refused, ServerError::ServiceUnavailable(msg) if msg == CAPACITY_NOT_STARTED),
+            "expected the safe capacity refusal, got {refused:?}"
+        );
+
+        // -- sampling: one second of acquisition under a long deadline --
+        let sampler = pool.clone();
+        let sample = tokio::spawn(async move {
+            sampler
+                .sample_field_values(
+                    "service",
+                    None,
+                    10,
+                    Deadline::after(Duration::from_secs(600)),
+                    TEST_SAMPLE_WORK,
+                )
+                .await
+        });
+        settle().await;
+        tokio::time::advance(Duration::from_millis(900)).await;
+        settle().await;
+        assert!(
+            !sample.is_finished(),
+            "the sample must still be waiting inside its acquisition budget"
+        );
+        tokio::time::advance(Duration::from_millis(101)).await;
+        settle().await;
+        let refused = sample
+            .await
+            .expect("the sample task joins")
+            .expect_err("a full pool cannot be sampled");
+        assert!(
+            matches!(&refused, ServerError::ServiceUnavailable(msg) if msg == CAPACITY_NOT_STARTED),
+            "expected the safe capacity refusal, got {refused:?}"
+        );
+
+        // -- and a shorter overall deadline is the one that governs --
+        let sampler = pool.clone();
+        let short = tokio::spawn(async move {
+            sampler
+                .sample_field_values(
+                    "service",
+                    None,
+                    10,
+                    Deadline::after(Duration::from_millis(300)),
+                    TEST_SAMPLE_WORK,
+                )
+                .await
+        });
+        settle().await;
+        tokio::time::advance(Duration::from_millis(301)).await;
+        settle().await;
+        assert!(short.await.expect("the sample task joins").is_err_and(
+            |e| matches!(&e, ServerError::ServiceUnavailable(m) if m == CAPACITY_NOT_STARTED)
+        ),);
+
+        // Nothing a refused helper touched is still held: it never got a
+        // permit, so it never registered.
+        assert_eq!(pool.retained(), 0);
+        assert_eq!(pool.available_permits(), 0, "the query still holds the one");
+
+        parked.release();
+        let outcome = occupied.await.expect("the query joins");
+        assert!(outcome.result.is_ok(), "{:?}", outcome.result);
+        until("cleanup returns everything", || {
+            idle_len(&pool) == baseline_idle && pool.available_permits() == pool.capacity()
+        })
+        .await;
+        assert!(registry_is_empty(&pool));
+    }
+
+    /// When the cutover cannot take the pool, the log says what is in the
+    /// way — including how much of it is work no request is waiting on
+    /// (ADR-0024). "Two permits held" and "two permits held by abandoned
+    /// work" call for different moves, and only the second is something an
+    /// operator can cancel by id.
+    #[tokio::test(start_paused = true)]
+    async fn exclusive_names_retained_permits_when_blocked() {
+        /// The bounded wait the cutover gives up after.
+        const BUDGET: Duration = Duration::from_millis(20);
+
+        use std::sync::Mutex as StdMutex;
+
+        use tracing_subscriber::prelude::*;
+
+        /// One captured event's fields, stringified.
+        #[derive(Clone, Default)]
+        struct Capture(Arc<StdMutex<Vec<std::collections::HashMap<String, String>>>>);
+
+        struct Fields<'a>(&'a mut std::collections::HashMap<String, String>);
+
+        impl tracing::field::Visit for Fields<'_> {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0.insert(field.name().to_owned(), format!("{value:?}"));
+            }
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                self.0.insert(field.name().to_owned(), value.to_owned());
+            }
+            fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+                self.0.insert(field.name().to_owned(), value.to_string());
+            }
+        }
+
+        impl<S> tracing_subscriber::Layer<S> for Capture
+        where
+            S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+        {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut fields = std::collections::HashMap::new();
+                event.record(&mut Fields(&mut fields));
+                self.0.lock().expect("capture poisoned").push(fields);
+            }
+        }
+
+        let _seams = seam::session().await;
+        let parked = seam::hold(Seam::Started);
+        let pool = hot_pool(1);
+        let id = pool.allocate_query_id();
+
+        let submitted = pool.clone();
+        let request = tokio::spawn(async move {
+            submitted
+                .execute(
+                    id,
+                    "*",
+                    Deadline::after(Duration::from_secs(5)),
+                    false,
+                    0,
+                    TEST_WORK,
+                )
+                .await
+        });
+        until("the work starts", || parked.arrivals() == 1).await;
+        tokio::time::advance(Duration::from_secs(6)).await;
+        let outcome = request.await.expect("the request joins");
+        assert!(matches!(outcome.result, Err(ServerError::Timeout)));
+        assert_eq!(pool.retained(), 1, "the permit outlived its request");
+
+        let captured = Capture::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        let guard = tracing::subscriber::set_default(subscriber);
+
+        let blocked_pool = pool.clone();
+        let attempt = tokio::spawn(async move { blocked_pool.exclusive(BUDGET).await });
+        settle().await;
+        tokio::time::advance(BUDGET + Duration::from_millis(1)).await;
+        settle().await;
+        let err = attempt
+            .await
+            .expect("the attempt joins")
+            .expect_err("a retained permit blocks exclusivity");
+        assert!(matches!(err, ServerError::Timeout), "got {err:?}");
+        drop(guard);
+
+        let events = captured.0.lock().expect("capture poisoned").clone();
+        let blocked = events
+            .iter()
+            .find(|f| f.get("event_type").map(String::as_str) == Some("pool_exclusive_blocked"))
+            .expect("the failed acquisition must say why");
+        assert_eq!(blocked.get("retained").map(String::as_str), Some("1"));
+        assert_eq!(blocked.get("held").map(String::as_str), Some("1"));
+        assert_eq!(blocked.get("capacity").map(String::as_str), Some("1"));
+        assert_eq!(blocked.get("timeout_ms").map(String::as_str), Some("20"));
+
+        // The retained reader is inside the publication gate as well as
+        // the semaphore, so a publisher cannot slip past a pool that
+        // merely looks busy: the cutover's exclusion is both halves.
+        let publisher = Arc::clone(&pool.publication);
+        let publishing = tokio::spawn(async move { publisher.write().await });
+        settle().await;
+        assert!(
+            !publishing.is_finished(),
+            "retained work still holds its publication read guard"
+        );
+
+        // Once the retained work stops, both waits clear.
+        parked.release();
+        until("the permit comes back", || pool.retained() == 0).await;
+        settle().await;
+        assert!(
+            publishing.is_finished(),
+            "cleanup releases the publication guard as well as the permit"
+        );
+        drop(publishing.await.expect("the publisher joins"));
+        pool.exclusive(Duration::from_secs(2))
+            .await
+            .expect("a drained pool becomes exclusive, with no wait to drive");
     }
 
     #[tokio::test]
