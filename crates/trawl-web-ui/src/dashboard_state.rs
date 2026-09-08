@@ -75,10 +75,15 @@ impl<T> DashboardState<T> {
     }
 
     pub fn stream_error(&mut self, reconnecting: bool) {
-        self.phase = if reconnecting {
-            DashboardPhase::Stale
-        } else {
-            DashboardPhase::Failed
+        // EventSource errors carry no HTTP status. Keep the typed GET's
+        // permission verdict until a valid stream snapshot proves recovery.
+        if self.phase == DashboardPhase::Forbidden {
+            return;
+        }
+        self.phase = match (reconnecting, self.snapshot.is_some()) {
+            (true, false) => DashboardPhase::Waiting,
+            (true, true) => DashboardPhase::Stale,
+            (false, _) => DashboardPhase::Failed,
         };
     }
 }
@@ -114,5 +119,75 @@ mod tests {
         assert_eq!(state.phase, DashboardPhase::Stale);
         state.stream_snapshot(3);
         assert_eq!(state.phase, DashboardPhase::Live);
+    }
+}
+
+#[cfg(test)]
+mod callback_order_tests {
+    use super::*;
+
+    #[test]
+    fn forbidden_survives_stream_errors_in_both_callback_orders() {
+        for reconnecting in [false, true] {
+            for error_first in [false, true] {
+                let mut state = DashboardState::<u8>::default();
+                if error_first {
+                    state.stream_error(reconnecting);
+                    state.bootstrap(Err(Some(403)));
+                } else {
+                    state.bootstrap(Err(Some(403)));
+                    state.stream_error(reconnecting);
+                }
+                assert_eq!(state.phase, DashboardPhase::Forbidden);
+                assert_eq!(state.snapshot, None);
+                // A later error must not erase the GET's permission verdict.
+                state.stream_error(!reconnecting);
+                assert_eq!(state.phase, DashboardPhase::Forbidden);
+                state.stream_snapshot(7);
+                assert_eq!(state.phase, DashboardPhase::Live);
+                assert_eq!(state.snapshot, Some(7));
+            }
+        }
+    }
+
+    #[test]
+    fn empty_feed_waits_through_reconnect_and_503_in_both_orders() {
+        for error_first in [false, true] {
+            let mut state = DashboardState::<u8>::default();
+            if error_first {
+                state.stream_error(true);
+                state.bootstrap(Err(Some(503)));
+            } else {
+                state.bootstrap(Err(Some(503)));
+                state.stream_error(true);
+            }
+            assert_eq!(state.phase, DashboardPhase::Waiting);
+            assert_eq!(state.snapshot, None);
+            state.bootstrap(Ok(7));
+            assert_eq!(state.phase, DashboardPhase::Bootstrap);
+            assert_eq!(state.snapshot, Some(7));
+        }
+    }
+
+    #[test]
+    fn only_existing_snapshots_become_stale_and_permanent_close_fails() {
+        for has_snapshot in [false, true] {
+            let mut state = DashboardState::<u8>::default();
+            if has_snapshot {
+                state.bootstrap(Ok(7));
+            }
+            state.stream_error(true);
+            assert_eq!(
+                state.phase,
+                if has_snapshot {
+                    DashboardPhase::Stale
+                } else {
+                    DashboardPhase::Waiting
+                }
+            );
+            assert_eq!(state.snapshot, has_snapshot.then_some(7));
+            state.stream_error(false);
+            assert_eq!(state.phase, DashboardPhase::Failed);
+        }
     }
 }

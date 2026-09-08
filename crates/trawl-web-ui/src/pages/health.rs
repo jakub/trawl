@@ -238,7 +238,9 @@ fn HealthQueries() -> impl IntoView {
                 }
                 Ok(answer) if answer.cancelled => "Cancellation requested".into(),
                 Ok(_) => "No work was cancelled".into(),
-                Err(error) if error.http_status().is_none() => {
+                // A proxy 5xx can follow a DELETE that reached the daemon.
+                // It does not prove whether cancellation took effect.
+                Err(error) if matches!(error.http_status(), None | Some(500..=599)) => {
                     "Cancellation outcome unknown. Refresh queries before trying again.".into()
                 }
                 Err(error) => format!(

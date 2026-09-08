@@ -88,6 +88,7 @@ let scenario = 'default';
 const dashboard = {
   open: 0, opens: 0, closes: 0, max: 0, responses: new Set(),
   hold: false, bootstrap: 'ok', pending: new Set(), cancel: 'accepted',
+  terminalHold: false, terminalPending: new Set(),
 };
 let healthHits = {};
 let cancelRequests = [];
@@ -189,6 +190,9 @@ function resetState() {
   dashboard.hold = false;
   dashboard.bootstrap = 'ok';
   dashboard.cancel = 'accepted';
+  dashboard.terminalHold = false;
+  for (const response of dashboard.terminalPending) response.destroy();
+  dashboard.terminalPending.clear();
   for (const response of dashboard.pending) response.destroy();
   dashboard.pending.clear();
   unstubbed = [];
@@ -356,6 +360,7 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       dashboard.hold = parsed.dashboardHold ?? false;
       dashboard.bootstrap = parsed.dashboardBootstrap ?? 'ok';
       dashboard.cancel = parsed.cancelOutcome ?? 'accepted';
+      dashboard.terminalHold = parsed.dashboardTerminalHold ?? false;
       sendJson(res, 200, { ok: true, scenario, repinField: repin.field });
       return;
     }
@@ -372,6 +377,7 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
         dashboard: {
           open: dashboard.open, opens: dashboard.opens, closes: dashboard.closes,
           max: dashboard.max, pending: dashboard.pending.size,
+          terminalPending: dashboard.terminalPending.size,
         },
         healthHits,
         cancelRequests,
@@ -423,6 +429,17 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       sendJson(res, 200, { ok: true });
       return;
     }
+    // Send a terminal stream refusal only after the test has observed the
+    // bootstrap's Forbidden state. This pins callback order without a timer.
+    if (p === '/__ctl/dashboard/terminal-release' && req.method === 'POST') {
+      const count = dashboard.terminalPending.size;
+      for (const response of dashboard.terminalPending) {
+        sendJson(response, 403, errorEnvelope('insufficient permissions'));
+      }
+      dashboard.terminalPending.clear();
+      sendJson(res, 200, { ok: count > 0, count });
+      return;
+    }
     if (p === '/__ctl/dashboard/bootstrap-release' && req.method === 'POST') {
       const count = dashboard.pending.size;
       for (const response of dashboard.pending) sendJson(response, 200, dashboardBody(true));
@@ -468,7 +485,13 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
           sendJson(res, 403, errorEnvelope('insufficient permissions'));
         } else if (key === 'stats') sendJson(res, 200, wire('health-stats'));
         else if (key === 'queries') sendJson(res, 200, wire('health-queries'));
-        else if (key === 'stream') serveDashboard(res);
+        else if (key === 'stream') {
+          if (dashboard.terminalHold) {
+            dashboard.terminalPending.add(res);
+            res.on('close', () => dashboard.terminalPending.delete(res));
+          } else serveDashboard(res);
+        }
+        else if (dashboard.bootstrap === 'forbidden') sendJson(res, 403, errorEnvelope('insufficient permissions'));
         else if (dashboard.bootstrap === 'waiting') sendJson(res, 503, errorEnvelope('dashboard data not yet available'));
         else if (dashboard.bootstrap === 'held') {
           dashboard.pending.add(res);
@@ -480,7 +503,10 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       if (cancel && req.method === 'DELETE') {
         const id = Number(cancel[1]);
         cancelRequests.push(id);
-        if (dashboard.cancel === 'unknown') {
+        if (/^http-(500|502|504|403)$/.test(dashboard.cancel)) {
+          const status = Number(dashboard.cancel.slice(5));
+          sendJson(res, status, errorEnvelope(status === 403 ? 'insufficient permissions' : 'upstream unavailable'));
+        } else if (dashboard.cancel === 'unknown') {
           // A response the client cannot decode leaves the mutation outcome
           // unknown. Destroying a headerless socket would let Chromium retry
           // this idempotent DELETE before reporting the network failure.
@@ -709,6 +735,7 @@ server.listen(PORT, HOST, () => {
 function shutdown() {
   for (const res of dashboard.responses) res.end();
   for (const res of dashboard.pending) res.destroy();
+  for (const res of dashboard.terminalPending) res.destroy();
   for (const res of sse.responses) {
     try {
       res.end();

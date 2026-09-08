@@ -201,3 +201,74 @@ test('leaving the authenticated shell closes its dashboard stream without reconn
   await page.waitForTimeout(650);
   expect((await state(request)).dashboard.opens).toBe(opens);
 });
+
+// Observe real browser error delivery. The counter advances in the native
+// EventSource event, not when the control server merely sends a response.
+async function observeDashboardErrors(page: Page) {
+  await page.addInitScript(() => {
+    const NativeEventSource = window.EventSource;
+    (window as any).__healthStreamErrors = [];
+    window.EventSource = class extends NativeEventSource {
+      constructor(url: string | URL, options?: EventSourceInit) {
+        super(url, options);
+        if (String(url).includes('/dashboard/stream')) {
+          this.addEventListener('error', () => {
+            (window as any).__healthStreamErrors.push(this.readyState);
+          });
+        }
+      }
+    };
+  });
+}
+
+async function afterDashboardError(page: Page, readyState: number) {
+  await expect.poll(() => page.evaluate(() => (window as any).__healthStreamErrors)).toContain(readyState);
+  // Let the application's listener and reactive render finish after the
+  // observed error dispatch. Frame boundaries prove the update ran.
+  await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+}
+
+test('regression: no snapshot plus bootstrap 503 stays waiting across stream reconnect', async ({ page, request }) => {
+  const baseline = await setup(request, 'health-admin', { dashboardHold: true, dashboardBootstrap: 'waiting' });
+  await observeDashboardErrors(page);
+  await page.goto('/settings/health');
+  await expect(page.locator(SEL.healthLiveState)).toHaveText('Waiting for first snapshot');
+  await expect.poll(async () => (await state(request)).dashboard.open).toBe(1);
+  await request.post('/__ctl/dashboard/drop');
+  await afterDashboardError(page, 0);
+  await expect.poll(async () => (await state(request)).dashboard.opens).toBe(baseline + 2);
+  await expect(page.locator(SEL.healthLiveState)).toHaveText('Waiting for first snapshot');
+  await expect(page.locator(SEL.healthFooterHot)).toHaveCount(0);
+  await request.post('/__ctl/dashboard/release');
+  await expect(page.locator(SEL.healthLiveState)).toHaveText('Live');
+  await expect(page.locator(SEL.healthLive)).toContainText('731');
+});
+
+test('regression: bootstrap 403 stays forbidden after a later terminal stream failure', async ({ page, request }) => {
+  await setup(request, 'health-admin', { dashboardBootstrap: 'forbidden', dashboardTerminalHold: true });
+  await observeDashboardErrors(page);
+  await page.goto('/settings/health');
+  await expect(page.locator(SEL.healthLiveState)).toHaveText('Forbidden');
+  await expect.poll(async () => (await state(request)).dashboard.terminalPending).toBe(1);
+  const release = await request.post('/__ctl/dashboard/terminal-release');
+  expect((await release.json()).count).toBe(1);
+  await afterDashboardError(page, 2);
+  await expect(page.locator(SEL.healthLiveState)).toHaveText('Forbidden');
+  await expect(page.locator(SEL.healthFooterHot)).toHaveCount(0);
+});
+
+for (const status of [500, 502, 504, 403]) {
+  test(`regression: cancel HTTP ${status} reports ${status === 403 ? 'definite refusal' : 'unknown outcome'}`, async ({ page, request }) => {
+    await setup(request, 'health-cancel', { cancelOutcome: `http-${status}` });
+    await page.goto('/settings/health');
+    await rows(page);
+    const dialog = await confirm(page);
+    await dialog.getByRole('button', { name: 'Cancel query', exact: true }).click();
+    const message = status === 403
+      ? 'Cancellation failed, server returned 403.'
+      : 'Cancellation outcome unknown. Refresh queries before trying again.';
+    await expect(page.locator(SEL.healthQueries)).toContainText(message);
+    await expect(page.locator(SEL.healthQueries)).not.toContainText('Cancellation requested');
+    expect((await state(request)).cancelRequests).toEqual([101]);
+  });
+}

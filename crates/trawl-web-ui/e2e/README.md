@@ -298,3 +298,10 @@ DELETE count, false and unknown cancellation outcomes, and shell teardown.
 The existing shell does not expose an in-place identity refresh to the UI;
 identity generation races belong to the native dashboard state tests rather
 than a production-only browser testing hook.
+
+The Health regression cases also pin error ordering. A held stream refusal
+is released only after the page renders the bootstrap's 403. A browser-side
+EventSource observer then proves the terminal error callback ran before the
+second Forbidden assertion. A reconnect before any snapshot must keep the
+waiting label. Cancellation HTTP 500, 502, and 504 report an unknown outcome;
+HTTP 403 reports a definite refusal.
