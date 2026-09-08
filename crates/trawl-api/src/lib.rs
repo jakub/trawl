@@ -486,6 +486,10 @@ pub struct StatsResponse {
     /// Held permits whose request already answered (ADR-0024): a subset
     /// of the permits `pool_capacity - pool_available` counts, not an
     /// addition to them.
+    ///
+    /// `default` because a server predating retained accounting sends no
+    /// such field.
+    #[serde(default)]
     pub pool_retained: usize,
 }
 
@@ -589,6 +593,10 @@ pub struct DashboardSnapshot {
     pub pool_active: usize,
     /// The subset of `pool_active` held by work no request is waiting on
     /// any more (ADR-0024).
+    ///
+    /// `default` because a server predating retained accounting sends no
+    /// such field.
+    #[serde(default)]
     pub pool_retained: usize,
 
     // -- hot buffer --
@@ -2338,9 +2346,10 @@ mod tests {
         assert!(!rt.cached);
     }
 
-    #[test]
-    fn dashboard_snapshot_roundtrip() {
-        let snapshot = DashboardSnapshot {
+    /// One fully populated snapshot, shared by the tests that need a
+    /// complete wire shape to take a field away from.
+    fn dashboard_fixture() -> DashboardSnapshot {
+        DashboardSnapshot {
             hostname: "test-host".into(),
             listen_addr: "127.0.0.1:5514".into(),
             uptime_secs: 9240,
@@ -2395,7 +2404,12 @@ mod tests {
                 query: "* | stats count()".into(),
                 running_ms: 500,
             }],
-        };
+        }
+    }
+
+    #[test]
+    fn dashboard_snapshot_roundtrip() {
+        let snapshot = dashboard_fixture();
         let rt = roundtrip(&snapshot);
         assert_eq!(rt.hostname, "test-host");
         assert_eq!(rt.uptime_secs, 9240);
@@ -2410,5 +2424,47 @@ mod tests {
         assert_eq!(rt.parquet_files, 847);
         assert_eq!(rt.recent_queries.len(), 1);
         assert_eq!(rt.active_queries.len(), 1);
+    }
+
+    /// A client built after ADR-0024 reads a server built before it.
+    ///
+    /// Retained accounting added one field to two long-lived response
+    /// shapes. Without a default the whole response fails to decode, and
+    /// a dashboard pointed at an older daemon shows nothing rather than
+    /// showing a zero. The pre-change shape is the current one minus that
+    /// field, so it is built by removing the key.
+    #[test]
+    fn retained_counts_decode_as_zero_from_a_pre_adr_0024_server() {
+        let without_retained = |value: &serde_json::Value| {
+            let mut json = value.clone();
+            let removed = json
+                .as_object_mut()
+                .expect("a response object")
+                .remove("pool_retained");
+            assert!(removed.is_some(), "the field has to be there to remove");
+            json
+        };
+
+        let stats = StatsResponse {
+            uptime_secs: 60,
+            total_queries: 3,
+            active_queries: 1,
+            pool_available: 3,
+            pool_capacity: 4,
+            pool_retained: 2,
+        };
+        let older = without_retained(&serde_json::to_value(&stats).unwrap());
+        let decoded: StatsResponse = serde_json::from_value(older).unwrap();
+        assert_eq!(decoded.pool_retained, 0);
+        assert_eq!(decoded.pool_capacity, 4, "the rest still decodes");
+
+        let snapshot = DashboardSnapshot {
+            pool_retained: 2,
+            ..dashboard_fixture()
+        };
+        let older = without_retained(&serde_json::to_value(&snapshot).unwrap());
+        let decoded: DashboardSnapshot = serde_json::from_value(older).unwrap();
+        assert_eq!(decoded.pool_retained, 0);
+        assert_eq!(decoded.pool_active, 1, "the rest still decodes");
     }
 }

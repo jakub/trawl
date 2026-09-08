@@ -58,6 +58,9 @@ use crate::source::compute_source;
 #[cfg(any(test, feature = "test-support"))]
 pub static TEST_QUERY_DELAY_MS: AtomicU64 = AtomicU64::new(0);
 
+/// Hands each [`ExecutorPool`] its `instance` id.
+static NEXT_POOL_INSTANCE: AtomicU64 = AtomicU64::new(0);
+
 /// The whole budget one health probe gets: queue wait plus the `SELECT 1`
 /// (ADR-0024).
 ///
@@ -496,18 +499,27 @@ impl Drop for RequestGuard<'_> {
 /// this, one refusal wrote two `query_not_started` events with
 /// contradictory reasons, and an operator counting them counted twice.
 #[derive(Clone)]
-struct RefusalOnce(Arc<AtomicBool>);
+struct RefusalOnce {
+    logged: Arc<AtomicBool>,
+    /// The pool whose capacity was refused, so a reader can tell two
+    /// pools' identically numbered work apart.
+    pool: u64,
+}
 
 impl RefusalOnce {
-    fn new() -> Self {
-        Self(Arc::new(AtomicBool::new(false)))
+    fn new(pool: u64) -> Self {
+        Self {
+            logged: Arc::new(AtomicBool::new(false)),
+            pool,
+        }
     }
 
     /// The error, logged if nothing has logged this work's refusal yet.
     fn refuse(&self, id: u64, kind: WorkKind, refusal: StartRefusal) -> ServerError {
-        if !self.0.swap(true, Ordering::SeqCst) {
+        if !self.logged.swap(true, Ordering::SeqCst) {
             tracing::info!(
                 event_type = "query_not_started",
+                pool = self.pool,
                 query_id = id,
                 kind = kind.as_str(),
                 reason = refusal.as_str(),
@@ -842,6 +854,14 @@ pub struct ExecutorPool {
     max_result_rows: usize,
     /// Monotonic ID counter for tracking active query handles.
     next_id: Arc<AtomicU64>,
+    /// Which pool instance this is, process-wide.
+    ///
+    /// A daemon builds exactly one pool, so in production this is always
+    /// zero and the field is there to say which pool a lifecycle event
+    /// came from. A test process builds many, each with its own id space
+    /// starting at zero, so the pair (`instance`, `query_id`) is what
+    /// identifies a unit of work when several pools are logging at once.
+    instance: u64,
     /// Interrupt slots, retained-work accounting and the idle executors,
     /// under one lock (see [`Registry`]).
     registry: Arc<Mutex<Registry>>,
@@ -1114,6 +1134,7 @@ impl ExecutorPool {
             max_concurrent,
             max_result_rows,
             next_id: Arc::new(AtomicU64::new(0)),
+            instance: NEXT_POOL_INSTANCE.fetch_add(1, Ordering::Relaxed),
             registry: Arc::new(Mutex::new(Registry {
                 interrupts: HashMap::new(),
                 retained: HashMap::new(),
@@ -1334,7 +1355,7 @@ impl ExecutorPool {
     ) -> ExecuteOutcome {
         let kind = work.kind;
         // One refusal, told once, however this work ends up refused.
-        let refusal_log = RefusalOnce::new();
+        let refusal_log = RefusalOnce::new(self.instance);
         #[cfg(any(test, feature = "test-support"))]
         let seams = Arc::clone(&self.seams);
         let available = self.semaphore.available_permits();
@@ -1553,7 +1574,7 @@ impl ExecutorPool {
     ) -> ExecuteOutcome {
         let kind = work.kind;
         // One refusal, told once, however this work ends up refused.
-        let refusal_log = RefusalOnce::new();
+        let refusal_log = RefusalOnce::new(self.instance);
         #[cfg(any(test, feature = "test-support"))]
         let seams = Arc::clone(&self.seams);
         let available = self.semaphore.available_permits();
@@ -1822,7 +1843,7 @@ impl ExecutorPool {
         let work = WorkContext::system(WorkKind::Ping);
         let kind = work.kind;
         // One refusal, told once, however this work ends up refused.
-        let refusal_log = RefusalOnce::new();
+        let refusal_log = RefusalOnce::new(self.instance);
         #[cfg(any(test, feature = "test-support"))]
         let seams = Arc::clone(&self.seams);
         let permit = match deadline.run(semaphore.acquire_owned()).await {
@@ -1896,7 +1917,7 @@ impl ExecutorPool {
     ) -> Result<Vec<String>, ServerError> {
         let kind = work.kind;
         // One refusal, told once, however this work ends up refused.
-        let refusal_log = RefusalOnce::new();
+        let refusal_log = RefusalOnce::new(self.instance);
         #[cfg(any(test, feature = "test-support"))]
         let seams = Arc::clone(&self.seams);
         let semaphore = Arc::clone(&self.semaphore);
@@ -2004,7 +2025,7 @@ impl ExecutorPool {
     ) -> Result<Vec<u8>, ServerError> {
         let kind = work.kind;
         // One refusal, told once, however this work ends up refused.
-        let refusal_log = RefusalOnce::new();
+        let refusal_log = RefusalOnce::new(self.instance);
         #[cfg(any(test, feature = "test-support"))]
         let seams = Arc::clone(&self.seams);
         let semaphore = Arc::clone(&self.semaphore);
@@ -2185,8 +2206,13 @@ mod tests {
     /// tests are about are emitted from the blocking worker thread, which
     /// does not inherit `set_default`. The sink is set for one capturing
     /// test at a time and keeps only the events carrying that test's own
-    /// `query_id`, so a concurrent test's lifecycle logging cannot be
-    /// counted here.
+    /// POOL and `query_id`.
+    ///
+    /// Both halves are needed. Ids start at zero in every pool, so under
+    /// the plain `cargo test` harness — one process, tests in threads —
+    /// filtering on the id alone let a sibling test's refusal of its own
+    /// query 0 land in this test's count, and "exactly one refusal" is a
+    /// count.
     mod capture {
         use std::collections::HashMap;
         use std::sync::{Arc, Mutex as StdMutex, OnceLock};
@@ -2194,6 +2220,7 @@ mod tests {
         type Events = Arc<StdMutex<Vec<HashMap<String, String>>>>;
 
         struct Sink {
+            pool: u64,
             query_id: u64,
             events: Events,
         }
@@ -2231,6 +2258,8 @@ mod tests {
                 event.record(&mut Fields(&mut fields));
                 let sink = SINK.lock().expect("capture sink poisoned");
                 if let Some(sink) = sink.as_ref()
+                    && fields.get("pool").map(String::as_str)
+                        == Some(sink.pool.to_string().as_str())
                     && fields.get("query_id").map(String::as_str)
                         == Some(sink.query_id.to_string().as_str())
                 {
@@ -2264,8 +2293,8 @@ mod tests {
             }
         }
 
-        /// Capture what `query_id` logs until the guard drops.
-        pub(super) async fn of_query(query_id: u64) -> Capture {
+        /// Capture what `pool`'s `query_id` logs until the guard drops.
+        pub(super) async fn of_query(pool: &super::ExecutorPool, query_id: u64) -> Capture {
             use tracing_subscriber::prelude::*;
 
             static INSTALLED: OnceLock<()> = OnceLock::new();
@@ -2281,6 +2310,7 @@ mod tests {
             let turn = TURN.lock().await;
             let events: Events = Arc::default();
             *SINK.lock().expect("capture sink poisoned") = Some(Sink {
+                pool: pool.instance,
                 query_id,
                 events: Arc::clone(&events),
             });
@@ -2463,8 +2493,11 @@ mod tests {
         assert!(outcome.severity_columns.is_empty());
 
         // A timeout: the outcome is assembled on the async side, where no
-        // snapshot and no walk exist at all.
-        TEST_QUERY_DELAY_MS.store(200, Ordering::Relaxed);
+        // snapshot and no walk exist at all. The worker is parked at this
+        // pool's own seam rather than slowed by the process-global delay,
+        // which a sibling test can reset out from under this one.
+        let seams = pool.seams();
+        let parked = seams.hold(Seam::Started);
         let outcome = pool
             .execute(
                 pool.allocate_query_id(),
@@ -2475,9 +2508,9 @@ mod tests {
                 TEST_WORK,
             )
             .await;
-        TEST_QUERY_DELAY_MS.store(0, Ordering::Relaxed);
         assert!(matches!(outcome.result, Err(ServerError::Timeout)));
         assert!(outcome.severity_columns.is_empty());
+        parked.release();
     }
 
     #[tokio::test]
@@ -2840,8 +2873,12 @@ mod tests {
     /// the job's `blocked` outcome), never an indefinite wait.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn exclusive_times_out_bounded_while_a_query_runs() {
-        TEST_QUERY_DELAY_MS.store(300, Ordering::Relaxed);
         let pool = ExecutorPool::new("/nonexistent".into(), 2, 100_000, None);
+        // This pool's own seam holds the query mid-flight: waiting a fixed
+        // 50 ms for it to take its permit, and relying on a delay any
+        // sibling test could reset, is a bet on how busy the runner is.
+        let seams = pool.seams();
+        let parked = seams.hold(Seam::Started);
         let p2 = pool.clone();
         let running = tokio::spawn(async move {
             p2.execute(
@@ -2854,8 +2891,7 @@ mod tests {
             )
             .await
         });
-        // Let the query take its permit.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        until("the query takes its permit", || parked.arrivals() == 1).await;
 
         let err = pool
             .exclusive(Duration::from_millis(20))
@@ -2863,7 +2899,7 @@ mod tests {
             .expect_err("a held permit must bound out");
         assert!(matches!(err, ServerError::Timeout), "got {err:?}");
 
-        TEST_QUERY_DELAY_MS.store(0, Ordering::Relaxed);
+        parked.release();
         let _ = running.await;
         // And once the query drains, exclusivity succeeds.
         pool.exclusive(Duration::from_secs(2))
@@ -2883,7 +2919,7 @@ mod tests {
         let started = seams.watch(Seam::Started);
         let baseline_idle = idle_len(&pool);
         let id = pool.allocate_query_id();
-        let logged = capture::of_query(id).await;
+        let logged = capture::of_query(&pool, id).await;
 
         let submitted = pool.clone();
         let request = tokio::spawn(async move {

@@ -5402,6 +5402,60 @@ fn duckdb_rewrites_a_simple_case_into_one_equality_per_arm() {
     );
 }
 
+/// How many expression nodes a parse tree holds.
+///
+/// `json_serialize_sql` writes one `"class"` key per expression node, so
+/// counting them counts the nodes the binder will walk. It is a coarse
+/// measure by design: the budget's `fixed` counts are one-sided upper
+/// bounds, and this says what the floor under them is.
+fn parsed_nodes(conn: &duckdb::Connection, expr: &str) -> u64 {
+    parse_tree(conn, expr).matches("\"class\":").count() as u64
+}
+
+/// A `CASE` written without an `ELSE` is bound WITH one.
+///
+/// `case(flag, status)` emits `CASE WHEN flag THEN status END`, and the
+/// parser hands the binder `… ELSE NULL END`: a node the SQL text never
+/// shows. The odd arity writes its fallback, so its node is one of the
+/// operands. Both parities are measured here rather than reasoned about,
+/// because `complexity::FunctionShape::Case` prices them differently and
+/// a node missed per reference is the difference between refusing a query
+/// and admitting it (one reference short of the cap, at 256 reads).
+#[test]
+fn an_else_less_case_still_binds_an_else_node() {
+    use trawl_core::complexity::{FunctionShape, Rendering, profile};
+
+    let conn = conn();
+    for argc in 2..=6usize {
+        let mut sql = String::from("(CASE");
+        for i in 0..argc / 2 {
+            use std::fmt::Write as _;
+            let _ = write!(sql, " WHEN \"c{}\" THEN \"c{}\"", i * 2, i * 2 + 1);
+        }
+        if argc % 2 == 1 {
+            use std::fmt::Write as _;
+            let _ = write!(sql, " ELSE \"c{}\"", argc - 1);
+        }
+        sql.push_str(" END)");
+
+        let parsed = parsed_nodes(&conn, &sql);
+        let declared = {
+            let p = profile(&Rendering::Function(FunctionShape::Case(argc)));
+            p.fixed + p.copies.iter().sum::<u64>()
+        };
+        assert_eq!(
+            parsed,
+            argc as u64 + if argc % 2 == 0 { 2 } else { 1 },
+            "an arity-{argc} CASE parses to its operands plus the CASE node, \
+             plus the ELSE the parser supplies when none was written: {sql}"
+        );
+        assert!(
+            declared >= parsed,
+            "arity {argc}: the parser builds {parsed} nodes, the profile declares {declared}"
+        );
+    }
+}
+
 /// Every `CASE`-bearing renderer the expansion budget prices, measured
 /// against the tree `DuckDB` actually builds.
 ///

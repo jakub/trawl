@@ -300,8 +300,19 @@ pub enum CompareKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FunctionShape {
     /// One wrapper node over `n` arguments, each written once —
-    /// `AVG(a)`, `IF(a, b, c)`, `COALESCE(a, …)`, `CASE WHEN … END`.
+    /// `AVG(a)`, `IF(a, b, c)`, `COALESCE(a, …)`.
     Plain(usize),
+    /// `case(c1, v1, …[, fallback])` — the searched `CASE`, whose fixed
+    /// cost depends on the parity of its argument list.
+    ///
+    /// An odd arity writes the trailing `ELSE`. An even one writes none,
+    /// and `DuckDB`'s parser fills in `ELSE NULL` before the binder ever
+    /// sees the tree, so the node is there either way
+    /// (`duckdb_probe::an_else_less_case_still_binds_an_else_node`).
+    /// Pricing both parities alike understated the even one by exactly
+    /// one node, which is the difference between refusing and admitting a
+    /// query sitting on the cap.
+    Case(usize),
     /// `COUNT(*)` — the row counter, whose star is a node of its own.
     CountStar,
     /// `(a IS NULL)`.
@@ -468,6 +479,9 @@ fn n_u64(n: usize) -> u64 {
 fn function_profile(shape: FunctionShape) -> RenderProfile {
     match shape {
         FunctionShape::Plain(n) => RenderProfile::uniform(1, n),
+        // The `CASE` node, plus the `ELSE` the parser supplies when the
+        // query wrote none.
+        FunctionShape::Case(n) => RenderProfile::uniform(if n % 2 == 0 { 2 } else { 1 }, n),
         // `COUNT(*)`: the aggregate and the star.
         FunctionShape::CountStar => RenderProfile::new(2, Vec::new()),
         FunctionShape::IsNull => RenderProfile::new(2, vec![1]),
@@ -1002,6 +1016,7 @@ fn call_rendering(name: &str, args: &[Spanned<Expr>]) -> Rendering {
         "split" => FunctionShape::Split,
         "now" => FunctionShape::Now,
         "p50" | "p90" | "p95" | "p99" => FunctionShape::Percentile,
+        "case" => FunctionShape::Case(arity),
         "sev" => FunctionShape::Sev {
             dialect: sev_dialect(args),
             argc: arity,
@@ -1047,7 +1062,6 @@ fn call_rendering(name: &str, args: &[Spanned<Expr>]) -> Rendering {
         | "date_diff"
         | "strftime"
         | "strptime"
-        | "case"
         | "json"
         | "json_extract"
         | "json_extract_string"
@@ -1406,6 +1420,43 @@ mod tests {
         assert_eq!(refused.limit, Limit::Lateral);
         assert_eq!(refused.stage, "let");
         assert_eq!(refused.target.as_deref(), Some("`z`"));
+    }
+
+    /// A `case()` with no fallback is bound with one: `DuckDB`'s parser
+    /// fills in `ELSE NULL` before the binder sees the tree. Pricing the
+    /// two parities alike understated the even one by a node, and one node
+    /// per reference is the whole cap once a target is read 256 times.
+    #[test]
+    fn an_else_less_case_is_priced_for_the_else_the_parser_adds() {
+        // Two arguments: one WHEN/THEN pair, no written fallback, and the
+        // `CASE` node plus the parser's `ELSE`.
+        assert_eq!(
+            profile(&Rendering::Function(FunctionShape::Case(2))),
+            RenderProfile::new(2, vec![1, 1])
+        );
+        // Three: the fallback is written, so it is an operand and the
+        // `CASE` node is the only fixed one.
+        assert_eq!(
+            profile(&Rendering::Function(FunctionShape::Case(3))),
+            RenderProfile::new(1, vec![1, 1, 1])
+        );
+
+        // `x` is four nodes, so each reference substitutes three.
+        let reads = |n: usize| {
+            let args = vec!["x"; n].join(", ");
+            format!("* | let x = case(flag, status), z = coalesce({args})")
+        };
+        check(&reads(170)).expect("170 references substitute 510 nodes");
+        let refused = refusal(&reads(256));
+        assert_eq!(refused.limit, Limit::Lateral);
+        assert_eq!(refused.target.as_deref(), Some("`z`"));
+        // The old price was the plain two-argument call: three nodes, so
+        // two a copy, which put this exact query at 512 and admitted it
+        // one node under what the binder walks.
+        assert_eq!(
+            profile(&Rendering::Function(FunctionShape::Plain(2))),
+            RenderProfile::new(1, vec![1, 1])
+        );
     }
 
     /// The same boundary written as DSL an operator could type, through

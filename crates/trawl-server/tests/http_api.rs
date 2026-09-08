@@ -544,18 +544,27 @@ async fn queries_accessible_by_analyst_and_reader() {
 /// ownership is the keystore id and never the name. The same entry is not
 /// also listed as active: one permit, one line.
 ///
-/// The retained window is manufactured, not raced for: a one-second query
-/// timeout against the pool's four-second test delay leaves ~3s in which
-/// the request has answered and the work has not stopped.
+/// The retained window is held open, not timed: this server's own pool
+/// parks its worker just past the work-start transition and stays there
+/// until the test lets it go, so every assertion below runs against a
+/// state that cannot move. A wall-clock window (a long worker delay minus
+/// a short request timeout) used to stand in for that, which made the
+/// verdict depend on how busy the runner was and put a correct 503 where
+/// the test demanded a 504.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // one retained window, asserted from three readers
 async fn retained_work_is_listed_once_and_shown_only_to_its_owner_or_an_admin() {
+    use trawl_server::pool::seam::Seam;
+
     let permissive = RateLimitConfig {
         default_rpm: 1_000_000,
         ..RateLimitConfig::default()
     };
     let server = setup_with_query_timeout(permissive, 1).await;
-    trawl_server::pool::TEST_QUERY_DELAY_MS.store(4_000, Ordering::Relaxed);
+    // This server's pool only: a hold installed here parks nothing in any
+    // other test's pool, so the plain parallel harness is safe.
+    let seams = server.state.query.pool.seams();
+    let started = seams.hold(Seam::Started);
 
     let store = KeyStore::from_pool(server.fleet_pool.clone());
     let key_a = store
@@ -588,7 +597,9 @@ async fn retained_work_is_listed_once_and_shown_only_to_its_owner_or_an_admin() 
         tokio::spawn(async move { a.query_paginated(dsl, None, None).await })
     };
 
-    // The request answers first: a 504 for work that had started.
+    // The request answers first: a 504, because the worker is parked PAST
+    // the work-start transition and expiry there is a timeout, never the
+    // capacity refusal of work that never started.
     let answered = slow.await.expect("the request task joins");
     match answered {
         Err(trawl_client::ClientError::Server { status, .. }) => assert_eq!(status, 504),
@@ -678,7 +689,10 @@ async fn retained_work_is_listed_once_and_shown_only_to_its_owner_or_an_admin() 
         "the dashboard snapshot must carry the retained permit"
     );
 
-    // When the work finally stops, every count returns to baseline.
+    // Everything above held while the worker was parked. Let it finish:
+    // when the work stops, every count returns to baseline.
+    assert_eq!(started.arrivals(), 1, "one worker, held once");
+    started.release();
     let mut reclaimed = false;
     for _ in 0..200 {
         let stats = admin.stats().await.unwrap();
@@ -688,7 +702,6 @@ async fn retained_work_is_listed_once_and_shown_only_to_its_owner_or_an_admin() 
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    trawl_server::pool::TEST_QUERY_DELAY_MS.store(0, Ordering::Relaxed);
     assert!(reclaimed, "the retained permit must come back");
     assert!(admin.queries().await.unwrap().retained.is_empty());
 }

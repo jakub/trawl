@@ -726,6 +726,7 @@ fn shape_of(name: &str, args: &str) -> Rendering {
         "isnotnull" => FunctionShape::IsNotNull,
         "p50" | "p90" | "p95" | "p99" => FunctionShape::Percentile,
         "split" => FunctionShape::Split,
+        "case" => FunctionShape::Case(arity),
         "sev" => FunctionShape::Sev {
             dialect: Dialect::Otel,
             argc: arity,
@@ -747,7 +748,7 @@ fn arity_dependent_shapes_match_their_emission() {
             .join(", ");
         check_let(
             &format!("case/{argc}"),
-            &Rendering::Function(FunctionShape::Plain(argc)),
+            &Rendering::Function(FunctionShape::Case(argc)),
             &format!("case({args})"),
             &none,
             argc,
