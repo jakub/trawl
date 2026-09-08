@@ -75,9 +75,12 @@ impl<T> DashboardState<T> {
     }
 
     pub fn stream_error(&mut self, reconnecting: bool) {
-        // EventSource errors carry no HTTP status. Keep the typed GET's
-        // permission verdict until a valid stream snapshot proves recovery.
-        if self.phase == DashboardPhase::Forbidden {
+        // EventSource errors carry no HTTP status. Keep failure and permission
+        // verdicts until a valid stream snapshot proves recovery.
+        if matches!(
+            self.phase,
+            DashboardPhase::Forbidden | DashboardPhase::Failed
+        ) {
             return;
         }
         self.phase = match (reconnecting, self.snapshot.is_some()) {
@@ -146,6 +149,31 @@ mod callback_order_tests {
                 state.stream_snapshot(7);
                 assert_eq!(state.phase, DashboardPhase::Live);
                 assert_eq!(state.snapshot, Some(7));
+            }
+        }
+    }
+
+    #[test]
+    fn bootstrap_failure_survives_stream_errors_in_both_callback_orders() {
+        for status in [Some(500), Some(502), None] {
+            for reconnecting in [false, true] {
+                for error_first in [false, true] {
+                    let mut state = DashboardState::<u8>::default();
+                    if error_first {
+                        state.stream_error(reconnecting);
+                        state.bootstrap(Err(status));
+                    } else {
+                        state.bootstrap(Err(status));
+                        state.stream_error(reconnecting);
+                    }
+                    assert_eq!(state.phase, DashboardPhase::Failed);
+                    assert_eq!(state.snapshot, None);
+                    state.stream_error(!reconnecting);
+                    assert_eq!(state.phase, DashboardPhase::Failed);
+                    state.stream_snapshot(7);
+                    assert_eq!(state.phase, DashboardPhase::Live);
+                    assert_eq!(state.snapshot, Some(7));
+                }
             }
         }
     }
