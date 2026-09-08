@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use dashmap::DashMap;
 use fleet_auth::VerifiedKey;
-use trawl_api::{ActiveQuerySnapshot, CompletedQuerySnapshot};
+use trawl_api::{ActiveQuerySnapshot, CompletedQuerySnapshot, QueryActiveEntry, QueryRecentEntry};
 
 /// Tracks active and recently completed queries.
 ///
@@ -20,7 +20,7 @@ use trawl_api::{ActiveQuerySnapshot, CompletedQuerySnapshot};
 #[derive(Debug)]
 pub struct QueryTracker {
     active: DashMap<u64, ActiveQuery>,
-    history: Mutex<VecDeque<CompletedQuerySnapshot>>,
+    history: Mutex<VecDeque<CompletedQuery>>,
     max_history: usize,
 }
 
@@ -40,6 +40,25 @@ pub struct ActiveQuery {
     pub query: String,
     /// When execution started.
     pub started_at: Instant,
+}
+
+impl ActiveQuery {
+    fn snapshot(&self) -> ActiveQuerySnapshot {
+        ActiveQuerySnapshot {
+            id: self.id,
+            user: self.user.clone(),
+            role: self.role.clone(),
+            query: self.query.clone(),
+            running_ms: elapsed_ms(self.started_at),
+        }
+    }
+}
+
+/// History keeps ownership private for reader-specific projections.
+#[derive(Debug)]
+struct CompletedQuery {
+    key_id: i64,
+    snapshot: CompletedQuerySnapshot,
 }
 
 /// Default ring buffer capacity for query history.
@@ -90,14 +109,17 @@ impl QueryTracker {
     /// Record successful completion of a query.
     pub fn complete(&self, id: u64, rows: usize) {
         if let Some((_, active)) = self.active.remove(&id) {
-            self.push_history(CompletedQuerySnapshot {
-                id: active.id,
-                user: active.user,
-                query: active.query,
-                duration_ms: elapsed_ms(active.started_at),
-                rows: Some(rows),
-                error: None,
-                timed_out: false,
+            self.push_history(CompletedQuery {
+                key_id: active.key_id,
+                snapshot: CompletedQuerySnapshot {
+                    id: active.id,
+                    user: active.user,
+                    query: active.query,
+                    duration_ms: elapsed_ms(active.started_at),
+                    rows: Some(rows),
+                    error: None,
+                    timed_out: false,
+                },
             });
         }
     }
@@ -105,14 +127,17 @@ impl QueryTracker {
     /// Record a failed query.
     pub fn fail(&self, id: u64, error: &str) {
         if let Some((_, active)) = self.active.remove(&id) {
-            self.push_history(CompletedQuerySnapshot {
-                id: active.id,
-                user: active.user,
-                query: active.query,
-                duration_ms: elapsed_ms(active.started_at),
-                rows: None,
-                error: Some(error.to_owned()),
-                timed_out: false,
+            self.push_history(CompletedQuery {
+                key_id: active.key_id,
+                snapshot: CompletedQuerySnapshot {
+                    id: active.id,
+                    user: active.user,
+                    query: active.query,
+                    duration_ms: elapsed_ms(active.started_at),
+                    rows: None,
+                    error: Some(error.to_owned()),
+                    timed_out: false,
+                },
             });
         }
     }
@@ -120,14 +145,17 @@ impl QueryTracker {
     /// Record a timed-out query.
     pub fn timeout(&self, id: u64) {
         if let Some((_, active)) = self.active.remove(&id) {
-            self.push_history(CompletedQuerySnapshot {
-                id: active.id,
-                user: active.user,
-                query: active.query,
-                duration_ms: elapsed_ms(active.started_at),
-                rows: None,
-                error: Some("query timed out".to_owned()),
-                timed_out: true,
+            self.push_history(CompletedQuery {
+                key_id: active.key_id,
+                snapshot: CompletedQuerySnapshot {
+                    id: active.id,
+                    user: active.user,
+                    query: active.query,
+                    duration_ms: elapsed_ms(active.started_at),
+                    rows: None,
+                    error: Some("query timed out".to_owned()),
+                    timed_out: true,
+                },
             });
         }
     }
@@ -144,27 +172,45 @@ impl QueryTracker {
     pub fn active(&self) -> Vec<ActiveQuerySnapshot> {
         self.active
             .iter()
-            .map(|entry| {
-                let q = entry.value();
-                ActiveQuerySnapshot {
-                    id: q.id,
-                    user: q.user.clone(),
-                    role: q.role.clone(),
-                    query: q.query.clone(),
-                    running_ms: elapsed_ms(q.started_at),
-                }
-            })
+            .map(|entry| entry.value().snapshot())
             .collect()
     }
 
     /// Recent completed queries (most recent first).
     pub fn recent(&self) -> Vec<CompletedQuerySnapshot> {
         let history = self.history.lock();
-        history.iter().rev().cloned().collect()
+        history.iter().rev().map(|q| q.snapshot.clone()).collect()
+    }
+
+    /// Active queries with ownership read from the same locked map entry.
+    pub fn active_for(&self, viewer_key_id: i64) -> Vec<QueryActiveEntry> {
+        self.active
+            .iter()
+            .map(|entry| {
+                let q = entry.value();
+                QueryActiveEntry {
+                    snapshot: q.snapshot(),
+                    own: q.key_id == viewer_key_id,
+                }
+            })
+            .collect()
+    }
+
+    /// Recent queries with ownership read under the history lock.
+    pub fn recent_for(&self, viewer_key_id: i64) -> Vec<QueryRecentEntry> {
+        self.history
+            .lock()
+            .iter()
+            .rev()
+            .map(|q| QueryRecentEntry {
+                snapshot: q.snapshot.clone(),
+                own: q.key_id == viewer_key_id,
+            })
+            .collect()
     }
 
     /// Push a completed query into the ring buffer, evicting the oldest if full.
-    fn push_history(&self, entry: CompletedQuerySnapshot) {
+    fn push_history(&self, entry: CompletedQuery) {
         let mut history = self.history.lock();
         if history.len() >= self.max_history {
             history.pop_front();
@@ -195,6 +241,73 @@ mod tests {
                 }],
             }],
         )
+    }
+
+    #[test]
+    fn queries_own_flag_tracks_exact_key_across_all_outcomes() {
+        let tracker = QueryTracker::new();
+        let first = test_key();
+        let mut second = test_key();
+        second.id = 2;
+        assert_eq!(first.name, second.name);
+
+        for (id, key) in [(10, &first), (20, &second)] {
+            for offset in 0..3 {
+                tracker.start(id + offset, key, "*");
+            }
+        }
+        for viewer in [&first, &second] {
+            let active = tracker.active_for(viewer.id);
+            assert_eq!(active.len(), 6);
+            for entry in &active {
+                assert_eq!(
+                    entry.own,
+                    (entry.snapshot.id < 20) == (viewer.id == first.id)
+                );
+                let wire = serde_json::to_value(entry).unwrap();
+                assert_eq!(wire["own"], entry.own);
+                assert_eq!(wire["id"], entry.snapshot.id);
+                assert!(wire.get("snapshot").is_none());
+                assert!(wire.get("key_id").is_none());
+                assert_eq!(wire.as_object().unwrap().len(), 6);
+            }
+        }
+        for id in [10, 20] {
+            tracker.complete(id, 42);
+            tracker.fail(id + 1, "parse error");
+            tracker.timeout(id + 2);
+        }
+        assert!(tracker.active_for(first.id).is_empty());
+        for viewer in [&first, &second] {
+            let recent = tracker.recent_for(viewer.id);
+            assert_eq!(recent.len(), 6);
+            assert_eq!(
+                recent.iter().map(|q| q.snapshot.id).collect::<Vec<_>>(),
+                [22, 21, 20, 12, 11, 10]
+            );
+            for entry in &recent {
+                assert_eq!(
+                    entry.own,
+                    (entry.snapshot.id < 20) == (viewer.id == first.id)
+                );
+                match entry.snapshot.id % 10 {
+                    0 => assert_eq!(entry.snapshot.rows, Some(42)),
+                    1 => assert_eq!(entry.snapshot.error.as_deref(), Some("parse error")),
+                    2 => assert!(entry.snapshot.timed_out),
+                    _ => unreachable!(),
+                }
+                let wire = serde_json::to_value(entry).unwrap();
+                assert_eq!(wire["own"], entry.own);
+                assert_eq!(wire["id"], entry.snapshot.id);
+                assert!(wire.get("snapshot").is_none());
+                assert!(wire.get("key_id").is_none());
+                assert_eq!(wire.as_object().unwrap().len(), 8);
+            }
+        }
+        // The collector's snapshots contain neither ownership nor key IDs.
+        let dashboard_recent = serde_json::to_value(tracker.recent()).unwrap();
+        assert!(dashboard_recent[0].get("own").is_none());
+        assert!(dashboard_recent[0].get("key_id").is_none());
     }
 
     #[test]

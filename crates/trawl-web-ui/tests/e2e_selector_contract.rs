@@ -71,7 +71,117 @@ struct Contract {
     hook: &'static str,
 }
 
+const HEALTH_RS: &str = include_str!("../src/pages/health.rs");
+
 const CONTRACTS: &[Contract] = &[
+    Contract {
+        assignment: "healthQueryScroll: '.health-query-scroll',",
+        source_path: "src/pages/health.rs",
+        source: HEALTH_RS,
+        hook: "class=\"health-query-scroll\"",
+    },
+    Contract {
+        assignment: "healthAwayLink: 'nav.rail a[title=\"Sources\"]',",
+        source_path: "src/state/section.rs",
+        source: SECTION_RS,
+        hook: "label: \"Sources\"",
+    },
+    Contract {
+        assignment: "railHealthLink: 'nav.rail a[title=\"Health\"]',",
+        source_path: "src/state/section.rs",
+        source: SECTION_RS,
+        hook: "label: \"Health\"",
+    },
+    Contract {
+        assignment: "railHealthLink: 'nav.rail a[title=\"Health\"]',",
+        source_path: "src/state/section.rs",
+        source: SECTION_RS,
+        hook: "path: \"/settings/health\"",
+    },
+    Contract {
+        assignment: "healthConfirm: '[role=\"alertdialog\"]',",
+        source_path: "../../fleet-ui/src/modal/confirm.rs",
+        source: include_str!("../../fleet-ui/src/modal/confirm.rs"),
+        hook: "role=\"alertdialog\"",
+    },
+    Contract {
+        assignment: "healthAwayLink: 'nav.rail a[title=\"Sources\"]',",
+        source_path: "../../fleet-ui/src/rail.rs",
+        source: RAIL_RS,
+        hook: "title=",
+    },
+    Contract {
+        assignment: "healthFooterHot: '.statusbar .grp[title=\"Hot buffer (events / bytes)\"]',",
+        source_path: "src/components/status_bar.rs",
+        source: STATUS_BAR_RS,
+        hook: "title=\"Hot buffer (events / bytes)\"",
+    },
+    Contract {
+        assignment: "healthPage: '.health-page',",
+        source_path: "src/pages/health.rs",
+        source: HEALTH_RS,
+        hook: "class=\"health-page\"",
+    },
+    Contract {
+        assignment: "healthSection: '.health-section',",
+        source_path: "src/pages/health.rs",
+        source: HEALTH_RS,
+        hook: "class=\"health-section\"",
+    },
+    Contract {
+        assignment: "healthCapacity: '.health-capacity',",
+        source_path: "src/pages/health.rs",
+        source: HEALTH_RS,
+        hook: "class=\"health-capacity\"",
+    },
+    Contract {
+        assignment: "healthLive: '.health-live',",
+        source_path: "src/pages/health.rs",
+        source: HEALTH_RS,
+        hook: "class=\"health-live\"",
+    },
+    Contract {
+        assignment: "healthLiveState: '.health-live-state',",
+        source_path: "src/pages/health.rs",
+        source: HEALTH_RS,
+        hook: "class=\"health-live-state\"",
+    },
+    Contract {
+        assignment: "healthQueries: '.health-queries',",
+        source_path: "src/pages/health.rs",
+        source: HEALTH_RS,
+        hook: "class=\"health-queries\"",
+    },
+    Contract {
+        assignment: "healthRefresh: '.health-refresh',",
+        source_path: "src/pages/health.rs",
+        source: HEALTH_RS,
+        hook: "class=\"btn health-refresh\"",
+    },
+    Contract {
+        assignment: "healthQueriesRefresh: '.health-queries-refresh',",
+        source_path: "src/pages/health.rs",
+        source: HEALTH_RS,
+        hook: "class=\"btn health-queries-refresh\"",
+    },
+    Contract {
+        assignment: "healthRow: 'tr[data-query-id]',",
+        source_path: "src/pages/health.rs",
+        source: HEALTH_RS,
+        hook: "data-query-id=",
+    },
+    Contract {
+        assignment: "healthOwnRow: 'tr[data-own=\"true\"]',",
+        source_path: "src/pages/health.rs",
+        source: HEALTH_RS,
+        hook: "data-own=",
+    },
+    Contract {
+        assignment: "railHealthLink: 'nav.rail a[title=\"Health\"]',",
+        source_path: "../../fleet-ui/src/rail.rs",
+        source: RAIL_RS,
+        hook: "title=",
+    },
     Contract {
         assignment: "liveResultsTable: '.results-table',",
         source_path: "src/pages/search.rs",

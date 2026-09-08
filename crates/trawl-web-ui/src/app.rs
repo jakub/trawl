@@ -8,6 +8,7 @@ use leptos::prelude::*;
 use leptos_router::components::{ParentRoute, Route, Router, Routes};
 use leptos_router::path;
 
+use crate::pages::health::HealthPage;
 use crate::pages::history::HistoryPage;
 use crate::pages::layout::{AuthShell, NotFound, RedirectTo};
 use crate::pages::login::Login;
@@ -38,6 +39,7 @@ pub fn App() -> impl IntoView {
                     <Route path=path!("/jobs") view=|| view! { <RedirectTo path="/jobs/nets"/> }/>
                     <Route path=path!("/jobs/nets") view=NetsPage/>
                     <Route path=path!("/jobs/runs") view=RunsPage/>
+                    <Route path=path!("/settings/health") view=HealthPage/>
                     <Route path=path!("/settings") view=SettingsPlaceholder/>
                 </ParentRoute>
             </Routes>

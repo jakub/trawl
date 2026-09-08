@@ -51,6 +51,16 @@ pub fn can_schema_write(permissions: &[String]) -> bool {
     permissions.iter().any(|p| p == SCHEMA_WRITE)
 }
 
+/// Query listing requires its own permission, even for administrators.
+pub fn can_query(permissions: &[String]) -> bool {
+    permissions.iter().any(|p| p == "query")
+}
+
+/// Ownership is server-computed for each row, never inferred from names.
+pub fn can_cancel_query(permissions: &[String], own: bool) -> bool {
+    is_trawl_admin(permissions) || (own && permissions.iter().any(|p| p == "query_cancel"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{can_schema_read, can_schema_write, is_trawl_admin};
@@ -86,5 +96,32 @@ mod tests {
         assert!(!can_schema_write(&["schema_read".to_string()]));
         assert!(!can_schema_write(&["server_manage".to_string()]));
         assert!(!can_schema_write(&[]));
+    }
+}
+
+#[cfg(test)]
+mod query_tests {
+    use super::*;
+    #[test]
+    fn query_and_cancel_permissions_are_independent() {
+        for admin in [false, true] {
+            for query in [false, true] {
+                for cancel in [false, true] {
+                    let p = [
+                        (admin, "server_manage"),
+                        (query, "query"),
+                        (cancel, "query_cancel"),
+                    ]
+                    .into_iter()
+                    .filter(|(enabled, _)| *enabled)
+                    .map(|(_, p)| p.to_owned())
+                    .collect::<Vec<_>>();
+                    assert_eq!(can_query(&p), query);
+                    for own in [false, true] {
+                        assert_eq!(can_cancel_query(&p, own), admin || (cancel && own));
+                    }
+                }
+            }
+        }
     }
 }

@@ -383,9 +383,9 @@ pub struct ValidationResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueriesResponse {
     /// Currently executing queries.
-    pub active: Vec<ActiveQuerySnapshot>,
+    pub active: Vec<QueryActiveEntry>,
     /// Recently completed queries (most recent first).
-    pub recent: Vec<CompletedQuerySnapshot>,
+    pub recent: Vec<QueryRecentEntry>,
     /// Work that still holds a pool permit after its request answered
     /// (ADR-0024). Disjoint from `active`: a request whose work is
     /// retained is listed here and not there. The same request may also
@@ -395,6 +395,24 @@ pub struct QueriesResponse {
     /// such field.
     #[serde(default)]
     pub retained: Vec<RetainedWorkSnapshot>,
+}
+
+/// An active query with ownership relative to the authenticated reader.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryActiveEntry {
+    #[serde(flatten)]
+    pub snapshot: ActiveQuerySnapshot,
+    /// Whether the reader's verified key submitted this query.
+    pub own: bool,
+}
+
+/// A recent query with ownership relative to the authenticated reader.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryRecentEntry {
+    #[serde(flatten)]
+    pub snapshot: CompletedQuerySnapshot,
+    /// Whether the reader's verified key submitted this query.
+    pub own: bool,
 }
 
 /// One unit of physical work that outlived the request that started it.

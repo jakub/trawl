@@ -160,7 +160,7 @@ pub async fn logout() -> Result<(), ApiError> {
 pub async fn health() -> Result<HealthResponse, ApiError> {
     let resp = Request::get("/api/v1/health").send().await?;
     match resp.status() {
-        200 => resp
+        200 | 503 => resp
             .json::<HealthResponse>()
             .await
             .map_err(|e| ApiError::Decode(e.to_string())),
@@ -664,4 +664,44 @@ fn parse_content_disposition(header: Option<&str>, format: &ExportFormat) -> Str
         ExportFormat::Parquet => "export.parquet",
     }
     .to_string()
+}
+
+/// Read capacity for the current admin session.
+pub async fn stats() -> Result<trawl_api::StatsResponse, ApiError> {
+    telemetry_get("/api/v1/stats").await
+}
+
+/// Bootstrap the shell's dashboard before the first stream snapshot.
+pub async fn dashboard() -> Result<trawl_api::DashboardSnapshot, ApiError> {
+    telemetry_get("/api/v1/dashboard").await
+}
+
+/// Read active and recent queries visible to this session.
+pub async fn queries() -> Result<trawl_api::QueriesResponse, ApiError> {
+    telemetry_get("/api/v1/queries").await
+}
+
+async fn telemetry_get<T: serde::de::DeserializeOwned>(url: &str) -> Result<T, ApiError> {
+    let resp = Request::get(url).send().await?;
+    match resp.status() {
+        200 => resp
+            .json()
+            .await
+            .map_err(|e| ApiError::Decode(e.to_string())),
+        status => Err(server_error(&resp, status).await),
+    }
+}
+
+/// Request cancellation without inferring success from an HTTP status alone.
+pub async fn cancel_query(id: u64) -> Result<trawl_api::CancelResponse, ApiError> {
+    let resp = Request::delete(&format!("/api/v1/queries/{id}"))
+        .send()
+        .await?;
+    match resp.status() {
+        200 => resp
+            .json()
+            .await
+            .map_err(|e| ApiError::Decode(e.to_string())),
+        status => Err(server_error(&resp, status).await),
+    }
 }

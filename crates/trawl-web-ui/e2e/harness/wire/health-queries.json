@@ -1,0 +1,43 @@
+{
+  "active": [
+    {
+      "id": 101,
+      "user": "same-name",
+      "role": "viewer",
+      "query": "service=mine_active",
+      "running_ms": 1234,
+      "own": true
+    },
+    {
+      "id": 102,
+      "user": "same-name",
+      "role": "viewer",
+      "query": "service=other_active",
+      "running_ms": 4567,
+      "own": false
+    }
+  ],
+  "recent": [
+    {
+      "id": 201,
+      "user": "same-name",
+      "query": "service=mine_recent",
+      "duration_ms": 345,
+      "rows": 7,
+      "error": null,
+      "timed_out": false,
+      "own": true
+    },
+    {
+      "id": 202,
+      "user": "same-name",
+      "query": "service=other_recent",
+      "duration_ms": 9000,
+      "rows": null,
+      "error": "query timed out",
+      "timed_out": true,
+      "own": false
+    }
+  ],
+  "retained": []
+}

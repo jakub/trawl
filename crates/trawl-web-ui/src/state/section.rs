@@ -102,7 +102,7 @@ pub fn items_for(mode: AppMode) -> &'static [RailItem] {
                 id: "health",
                 label: "Health",
                 icon: Chart,
-                path: "/settings",
+                path: "/settings/health",
             },
         ],
     }

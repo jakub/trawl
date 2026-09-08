@@ -67,12 +67,25 @@ pub fn AuthShell() -> impl IntoView {
     provide_context(shell_status);
     provide_context(me);
 
-    // Admin-only live stats for the footer. The stream opens only after
-    // `/me` resolves with the `server_manage` permission — the endpoint is
-    // `ServerManage`-gated upstream, so non-admins never even issue the
-    // request. The `StoredValue` bounds the `EventSource` lifetime;
-    // dropping it closes the connection.
+    // The Health page and footer share this report. Only server_manage
+    // sessions issue the bootstrap GET or open the stream. The footer
+    // receives live snapshots only, so reconnecting numbers disappear.
+    // Dropping the handle closes the stream and invalidates its callbacks.
+    let dashboard = RwSignal::new(crate::dashboard_state::DashboardState::<
+        trawl_api::DashboardSnapshot,
+    >::default());
+    provide_context(dashboard);
     let admin_stats = RwSignal::new(None::<trawl_api::DashboardSnapshot>);
+    Effect::new(move |_| {
+        let state = dashboard.get();
+        admin_stats.set(
+            if state.phase == crate::dashboard_state::DashboardPhase::Live {
+                state.snapshot
+            } else {
+                None
+            },
+        );
+    });
     let stats_handle: StoredValue<Option<StatsLifecycle>, LocalStorage> =
         StoredValue::new_local(None);
     on_cleanup(move || stats_handle.update_value(|s| *s = None));
@@ -83,10 +96,9 @@ pub fn AuthShell() -> impl IntoView {
         // Drop any previous stream first — this Effect re-runs whenever
         // `me` changes, and two live EventSources would double-push.
         stats_handle.update_value(|s| *s = None);
+        dashboard.set(crate::dashboard_state::DashboardState::default());
         if is_admin {
-            stats_handle.update_value(|s| *s = start_stats_stream(admin_stats));
-        } else {
-            admin_stats.set(None);
+            stats_handle.update_value(|s| *s = start_stats_stream(dashboard));
         }
     });
 
