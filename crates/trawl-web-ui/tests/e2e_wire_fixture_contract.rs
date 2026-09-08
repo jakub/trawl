@@ -406,6 +406,30 @@ fn the_corpus_run_fixtures_decode() {
         stats.success_count + stats.error_count + stats.timeout_count,
         stats.total_runs,
     );
+
+    // The harness serves both files under the one scenario, so the
+    // summary has to be the summary OF those runs. The server computes
+    // it with `AVG(duration_ms) FILTER (WHERE duration_ms IS NOT NULL)`
+    // over every run of the key, whatever its status, then narrows the
+    // f64 with `as u64` — which truncates. Two runs of 125 ms and 90 ms
+    // average 107.5 and report 107, not 108.
+    let timed: Vec<u64> = all.runs.iter().filter_map(|r| r.run.duration_ms).collect();
+    let expected = if timed.is_empty() {
+        None
+    } else {
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )]
+        let avg = (timed.iter().sum::<u64>() as f64 / timed.len() as f64) as u64;
+        Some(avg)
+    };
+    assert_eq!(
+        stats.avg_duration_ms, expected,
+        "runs-stats.json must summarise runs-all.json: the server truncates \
+         the average of every non-null duration_ms, so {timed:?} is {expected:?}",
+    );
 }
 
 /// The harness dispatches `/api/v1/query` under `corpus` on two DSL
