@@ -253,8 +253,8 @@ async fn aborting_request_keeps_running_reader_protected() {
     let root = tempfile::tempdir().unwrap();
     let pool = ExecutorPool::new(root.path().to_str().unwrap().into(), 1, 100, None);
     TEST_QUERY_DELAY_MS.store(1000, Ordering::Relaxed);
-    let _seams = seam::session().await;
-    let started = seam::watch(seam::Seam::Started);
+    let seams = pool.seams();
+    let started = seams.watch(seam::Seam::Started);
     let reader_pool = pool.clone();
     let id = pool.allocate_query_id();
     let request = tokio::spawn(async move {

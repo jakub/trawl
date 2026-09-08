@@ -455,28 +455,49 @@ impl Drop for RequestGuard<'_> {
     }
 }
 
-/// The one answer a request gets for work that never started (ADR-0024).
+/// The one answer a request gets for work that never started, told once
+/// (ADR-0024).
 ///
 /// A capacity refusal, not a timeout: nothing ran, so 503 rather than 504,
 /// and no timeout history row. The client-facing text is fixed and says
 /// nothing about the query — whether the budget ran out or a cancellation
 /// beat the start is an operator fact, and it goes to the log.
-fn capacity_refusal(id: u64, kind: WorkKind, refusal: StartRefusal) -> ServerError {
-    tracing::info!(
-        event_type = "query_not_started",
-        query_id = id,
-        kind = kind.as_str(),
-        reason = refusal.as_str(),
-        "query work refused before it started"
-    );
-    ServerError::ServiceUnavailable(CAPACITY_NOT_STARTED.to_owned())
-}
+///
+/// One refused request can reach two of these: the request future gives
+/// up on its budget, which latches cancellation, and the worker it
+/// released then refuses to start on that latch. Both are the same
+/// refusal, so the FIRST one to arrive logs and names the reason —
+/// whichever actually happened first — and the second is silent. Without
+/// this, one refusal wrote two `query_not_started` events with
+/// contradictory reasons, and an operator counting them counted twice.
+#[derive(Clone)]
+struct RefusalOnce(Arc<AtomicBool>);
 
-fn refused_outcome(id: u64, kind: WorkKind, refusal: StartRefusal) -> ExecuteOutcome {
-    ExecuteOutcome {
-        result: Err(capacity_refusal(id, kind, refusal)),
-        debug: None,
-        severity_columns: Vec::new(),
+impl RefusalOnce {
+    fn new() -> Self {
+        Self(Arc::new(AtomicBool::new(false)))
+    }
+
+    /// The error, logged if nothing has logged this work's refusal yet.
+    fn refuse(&self, id: u64, kind: WorkKind, refusal: StartRefusal) -> ServerError {
+        if !self.0.swap(true, Ordering::SeqCst) {
+            tracing::info!(
+                event_type = "query_not_started",
+                query_id = id,
+                kind = kind.as_str(),
+                reason = refusal.as_str(),
+                "query work refused before it started"
+            );
+        }
+        ServerError::ServiceUnavailable(CAPACITY_NOT_STARTED.to_owned())
+    }
+
+    fn refuse_outcome(&self, id: u64, kind: WorkKind, refusal: StartRefusal) -> ExecuteOutcome {
+        ExecuteOutcome {
+            result: Err(self.refuse(id, kind, refusal)),
+            debug: None,
+            severity_columns: Vec::new(),
+        }
     }
 }
 
@@ -496,7 +517,7 @@ fn refused_outcome(id: u64, kind: WorkKind, refusal: StartRefusal) -> ExecuteOut
 pub mod seam {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Condvar, LazyLock, Mutex as StdMutex};
+    use std::sync::{Arc, Condvar, Mutex as StdMutex};
 
     /// A point in the blocking worker a test can hold or fail.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -552,106 +573,137 @@ pub mod seam {
         }
     }
 
-    type Gates = HashMap<Seam, Arc<Gate>>;
-    static GATES: LazyLock<StdMutex<Gates>> = LazyLock::new(|| StdMutex::new(HashMap::new()));
-    /// Seam state is process-global, so seam tests take turns. Async
-    /// because the guard is held across the test's awaits.
-    static TURN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    /// The seams of ONE pool.
+    ///
+    /// Per pool, not per process: gates used to live in a global table,
+    /// so a hold installed by one test parked the workers of every other
+    /// pool alive in the same process — a cross-test panic or a 20-second
+    /// stall under the plain `cargo test` harness, which runs tests in
+    /// threads rather than nextest's separate processes. A pool's clones
+    /// share its table, because they are the same pool.
+    #[derive(Debug, Default)]
+    pub struct Table {
+        gates: StdMutex<HashMap<Seam, Arc<Gate>>>,
+    }
 
-    /// Exclusive use of the seams for one test, cleared on drop.
-    #[derive(Debug)]
-    pub struct Session(#[allow(dead_code)] tokio::sync::MutexGuard<'static, ()>);
+    impl Table {
+        fn install(&self, seam: Seam, gate: Gate) -> Arc<Gate> {
+            let gate = Arc::new(gate);
+            self.gates
+                .lock()
+                .expect("seam table poisoned")
+                .insert(seam, Arc::clone(&gate));
+            gate
+        }
 
-    impl Drop for Session {
-        fn drop(&mut self) {
-            // Release before clearing, so a test that fails while a worker
-            // is parked still lets that worker out: the runtime's own drop
-            // waits for blocking tasks, and a gate nobody opens would turn
-            // a failed assertion into a hung test process.
-            let gates = std::mem::take(&mut *GATES.lock().expect("seam table poisoned"));
+        /// Park every worker of this pool that reaches `seam`, until the
+        /// gate is released.
+        #[must_use]
+        pub fn hold(&self, seam: Seam) -> Arc<Gate> {
+            self.install(
+                seam,
+                Gate {
+                    open: StdMutex::new(false),
+                    opened: Condvar::new(),
+                    arrivals: AtomicUsize::new(0),
+                    panics: false,
+                },
+            )
+        }
+
+        /// Count arrivals at `seam` without holding anything.
+        #[must_use]
+        pub fn watch(&self, seam: Seam) -> Arc<Gate> {
+            self.install(
+                seam,
+                Gate {
+                    open: StdMutex::new(true),
+                    opened: Condvar::new(),
+                    arrivals: AtomicUsize::new(0),
+                    panics: false,
+                },
+            )
+        }
+
+        /// Panic the worker when it reaches `seam`.
+        #[must_use]
+        pub fn panic_at(&self, seam: Seam) -> Arc<Gate> {
+            self.install(
+                seam,
+                Gate {
+                    open: StdMutex::new(true),
+                    opened: Condvar::new(),
+                    arrivals: AtomicUsize::new(0),
+                    panics: true,
+                },
+            )
+        }
+
+        /// The worker's side: free unless this pool's test installed
+        /// something.
+        pub(crate) fn reach(&self, seam: Seam) {
+            let gate = self
+                .gates
+                .lock()
+                .expect("seam table poisoned")
+                .get(&seam)
+                .map(Arc::clone);
+            if let Some(gate) = gate {
+                gate.pass();
+            }
+        }
+
+        /// Let every parked worker out and forget every gate.
+        pub fn release_all(&self) {
+            let gates = std::mem::take(&mut *self.gates.lock().expect("seam table poisoned"));
             for gate in gates.values() {
                 gate.release();
             }
         }
     }
 
-    /// Take the seams for this test.
-    pub async fn session() -> Session {
-        let turn = TURN.lock().await;
-        GATES.lock().expect("seam table poisoned").clear();
-        Session(turn)
+    /// A test's handle on one pool's seams, released on drop.
+    ///
+    /// Dropping releases before forgetting, so a test that fails while a
+    /// worker is parked still lets that worker out: the runtime's own
+    /// drop waits for blocking tasks, and a gate nobody opens would turn
+    /// a failed assertion into a hung test process.
+    #[derive(Debug)]
+    pub struct Session(pub(crate) Arc<Table>);
+
+    impl Session {
+        /// Park every worker that reaches `seam`.
+        #[must_use]
+        pub fn hold(&self, seam: Seam) -> Arc<Gate> {
+            self.0.hold(seam)
+        }
+
+        /// Count arrivals at `seam` without holding anything.
+        #[must_use]
+        pub fn watch(&self, seam: Seam) -> Arc<Gate> {
+            self.0.watch(seam)
+        }
+
+        /// Panic the worker when it reaches `seam`.
+        #[must_use]
+        pub fn panic_at(&self, seam: Seam) -> Arc<Gate> {
+            self.0.panic_at(seam)
+        }
     }
 
-    fn install(seam: Seam, gate: Gate) -> Arc<Gate> {
-        let gate = Arc::new(gate);
-        GATES
-            .lock()
-            .expect("seam table poisoned")
-            .insert(seam, Arc::clone(&gate));
-        gate
-    }
-
-    /// Park every worker that reaches `seam` until the gate is released.
-    #[must_use]
-    pub fn hold(seam: Seam) -> Arc<Gate> {
-        install(
-            seam,
-            Gate {
-                open: StdMutex::new(false),
-                opened: Condvar::new(),
-                arrivals: AtomicUsize::new(0),
-                panics: false,
-            },
-        )
-    }
-
-    /// Count arrivals at `seam` without holding anything.
-    #[must_use]
-    pub fn watch(seam: Seam) -> Arc<Gate> {
-        install(
-            seam,
-            Gate {
-                open: StdMutex::new(true),
-                opened: Condvar::new(),
-                arrivals: AtomicUsize::new(0),
-                panics: false,
-            },
-        )
-    }
-
-    /// Panic the worker when it reaches `seam`.
-    #[must_use]
-    pub fn panic_at(seam: Seam) -> Arc<Gate> {
-        install(
-            seam,
-            Gate {
-                open: StdMutex::new(true),
-                opened: Condvar::new(),
-                arrivals: AtomicUsize::new(0),
-                panics: true,
-            },
-        )
-    }
-
-    /// The worker's side: free unless a test installed something.
-    pub(crate) fn reach(seam: Seam) {
-        let gate = GATES
-            .lock()
-            .expect("seam table poisoned")
-            .get(&seam)
-            .map(Arc::clone);
-        if let Some(gate) = gate {
-            gate.pass();
+    impl Drop for Session {
+        fn drop(&mut self) {
+            self.0.release_all();
         }
     }
 }
 
 /// The worker's seam call, compiled away entirely in a release build.
 macro_rules! worker_seam {
-    ($seam:ident) => {
+    ($seams:expr, $seam:ident) => {
         #[cfg(any(test, feature = "test-support"))]
         {
-            crate::pool::seam::reach(crate::pool::seam::Seam::$seam);
+            $seams.reach(crate::pool::seam::Seam::$seam);
         }
     };
 }
@@ -774,6 +826,10 @@ pub struct ExecutorPool {
     /// search-stage comparisons. Defaults to an empty catalog; the server
     /// wires the shared cache via [`Self::with_field_catalog`].
     field_catalog: Arc<crate::catalog::FieldCatalog>,
+    /// This pool's worker seams (see [`seam`]). Per pool, so a test
+    /// holding one pool's workers cannot park another's.
+    #[cfg(any(test, feature = "test-support"))]
+    seams: Arc<seam::Table>,
 }
 
 impl std::fmt::Debug for ExecutorPool {
@@ -1037,7 +1093,16 @@ impl ExecutorPool {
             })),
             hot_buffer,
             field_catalog: Arc::new(crate::catalog::FieldCatalog::new()),
+            #[cfg(any(test, feature = "test-support"))]
+            seams: Arc::new(seam::Table::default()),
         }
+    }
+
+    /// Take this pool's worker seams for one test (see [`seam`]).
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn seams(&self) -> seam::Session {
+        seam::Session(Arc::clone(&self.seams))
     }
 
     /// Attach the shared field-catalog pin cache. Builder-style, mirroring
@@ -1238,6 +1303,10 @@ impl ExecutorPool {
         work: WorkContext,
     ) -> ExecuteOutcome {
         let kind = work.kind;
+        // One refusal, told once, however this work ends up refused.
+        let refusal_log = RefusalOnce::new();
+        #[cfg(any(test, feature = "test-support"))]
+        let seams = Arc::clone(&self.seams);
         let available = self.semaphore.available_permits();
         if available == 0 {
             tracing::warn!(
@@ -1263,7 +1332,7 @@ impl ExecutorPool {
                 };
             }
             Err(crate::deadline::Expired) => {
-                return refused_outcome(query_id, kind, StartRefusal::Expired);
+                return refusal_log.refuse_outcome(query_id, kind, StartRefusal::Expired);
             }
         };
 
@@ -1287,7 +1356,7 @@ impl ExecutorPool {
                 };
             }
             Err(crate::deadline::Expired) => {
-                return refused_outcome(query_id, kind, StartRefusal::Expired);
+                return refusal_log.refuse_outcome(query_id, kind, StartRefusal::Expired);
             }
         };
 
@@ -1312,88 +1381,93 @@ impl ExecutorPool {
         let hot_buffer = self.hot_buffer.clone();
         let field_catalog = Arc::clone(&self.field_catalog);
 
-        let mut task = tokio::task::spawn_blocking(move || {
-            // Wider than `run_query_blocking`'s own catch: source
-            // discovery, the catalog snapshot and the presentation walk
-            // are all physical work on this thread, and a panic in any of
-            // them must still reach the slot's cleanup below.
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                worker_seam!(Entry);
-                // Interrupt registration first, so a cancellation arriving
-                // during the bind has something to reach. A refusal here
-                // means the caller already asked for this work to stop.
-                if !slot.publish_interrupt(slot.executor().interrupt_handle()) {
-                    return refused_outcome(query_id, kind, StartRefusal::Cancelled);
-                }
-                if let Err(refusal) = slot.begin_work(deadline) {
-                    return refused_outcome(query_id, kind, refusal);
-                }
-                worker_seam!(Started);
-
-                // Test-only: sleep before the query so timeout/cancellation tests
-                // can reliably win the race against spawn_blocking.
-                #[cfg(any(test, feature = "test-support"))]
-                {
-                    let delay = TEST_QUERY_DELAY_MS.load(Ordering::Relaxed);
-                    if delay > 0 {
-                        std::thread::sleep(std::time::Duration::from_millis(delay));
+        let mut task = tokio::task::spawn_blocking({
+            let refusal_log = refusal_log.clone();
+            #[cfg(any(test, feature = "test-support"))]
+            let seams = Arc::clone(&seams);
+            move || {
+                // Wider than `run_query_blocking`'s own catch: source
+                // discovery, the catalog snapshot and the presentation walk
+                // are all physical work on this thread, and a panic in any of
+                // them must still reach the slot's cleanup below.
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    worker_seam!(seams, Entry);
+                    // Interrupt registration first, so a cancellation arriving
+                    // during the bind has something to reach. A refusal here
+                    // means the caller already asked for this work to stop.
+                    if !slot.publish_interrupt(slot.executor().interrupt_handle()) {
+                        return refusal_log.refuse_outcome(query_id, kind, StartRefusal::Cancelled);
                     }
-                }
+                    if let Err(refusal) = slot.begin_work(deadline) {
+                        return refusal_log.refuse_outcome(query_id, kind, refusal);
+                    }
+                    worker_seam!(seams, Started);
 
-                let source = compute_source(&base_dir, &dsl);
-                let file_globs: usize = if source.starts_with('[') {
-                    source.matches(',').count() + 1
-                } else {
-                    1
-                };
-                tracing::debug!(
-                    event_type = "query_source",
-                    file_globs,
-                    source = %source,
-                    "computed query source"
-                );
+                    // Test-only: sleep before the query so timeout/cancellation tests
+                    // can reliably win the race against spawn_blocking.
+                    #[cfg(any(test, feature = "test-support"))]
+                    {
+                        let delay = TEST_QUERY_DELAY_MS.load(Ordering::Relaxed);
+                        if delay > 0 {
+                            std::thread::sleep(std::time::Duration::from_millis(delay));
+                        }
+                    }
 
-                // One catalog snapshot per query: every retry inside the
-                // executor sees the same comparison pins, and the presentation
-                // metadata computed beside the rows is rooted in that same
-                // snapshot.
-                let pins = field_catalog.all();
-                let (result, debug) = run_query_blocking(
-                    slot.executor(),
-                    &dsl,
-                    &source,
-                    hot_buffer.as_ref(),
-                    &pins,
-                    max_result_rows,
-                    utc_offset_secs,
-                    capture_debug,
-                    pool_wait_ms,
-                );
-                // Inside the permit, on the blocking pool: the walk compiles a
-                // regex per `extract` stage, so it may not run on a reactor
-                // thread (see `severity_columns_for`).
-                let severity_columns = if result.is_ok() {
-                    severity_columns_for(&pins, &dsl)
-                } else {
-                    Vec::new()
-                };
-                worker_seam!(Finished);
-                ExecuteOutcome {
-                    result,
-                    debug,
-                    severity_columns,
-                }
-            }));
-            outcome.unwrap_or_else(|payload| ExecuteOutcome {
-                result: Err(ServerError::Internal(format!(
-                    "query worker panicked: {}",
-                    panic_text(payload.as_ref())
-                ))),
-                debug: None,
-                severity_columns: Vec::new(),
-            })
-            // `slot` drops here, on this thread: interrupt deregistered,
-            // executor re-idled, publication and permit released.
+                    let source = compute_source(&base_dir, &dsl);
+                    let file_globs: usize = if source.starts_with('[') {
+                        source.matches(',').count() + 1
+                    } else {
+                        1
+                    };
+                    tracing::debug!(
+                        event_type = "query_source",
+                        file_globs,
+                        source = %source,
+                        "computed query source"
+                    );
+
+                    // One catalog snapshot per query: every retry inside the
+                    // executor sees the same comparison pins, and the presentation
+                    // metadata computed beside the rows is rooted in that same
+                    // snapshot.
+                    let pins = field_catalog.all();
+                    let (result, debug) = run_query_blocking(
+                        slot.executor(),
+                        &dsl,
+                        &source,
+                        hot_buffer.as_ref(),
+                        &pins,
+                        max_result_rows,
+                        utc_offset_secs,
+                        capture_debug,
+                        pool_wait_ms,
+                    );
+                    // Inside the permit, on the blocking pool: the walk compiles a
+                    // regex per `extract` stage, so it may not run on a reactor
+                    // thread (see `severity_columns_for`).
+                    let severity_columns = if result.is_ok() {
+                        severity_columns_for(&pins, &dsl)
+                    } else {
+                        Vec::new()
+                    };
+                    worker_seam!(seams, Finished);
+                    ExecuteOutcome {
+                        result,
+                        debug,
+                        severity_columns,
+                    }
+                }));
+                outcome.unwrap_or_else(|payload| ExecuteOutcome {
+                    result: Err(ServerError::Internal(format!(
+                        "query worker panicked: {}",
+                        panic_text(payload.as_ref())
+                    ))),
+                    debug: None,
+                    severity_columns: Vec::new(),
+                })
+                // `slot` drops here, on this thread: interrupt deregistered,
+                // executor re-idled, publication and permit released.
+            }
         });
 
         // A caller that walks away (client gone, task aborted) is not a
@@ -1420,7 +1494,7 @@ impl ExecutorPool {
                 let result = if request.abandon() {
                     Err(ServerError::Timeout)
                 } else {
-                    Err(capacity_refusal(query_id, kind, StartRefusal::Expired))
+                    Err(refusal_log.refuse(query_id, kind, StartRefusal::Expired))
                 };
                 ExecuteOutcome { result, debug: None, severity_columns: Vec::new() }
             }
@@ -1447,6 +1521,10 @@ impl ExecutorPool {
         work: WorkContext,
     ) -> ExecuteOutcome {
         let kind = work.kind;
+        // One refusal, told once, however this work ends up refused.
+        let refusal_log = RefusalOnce::new();
+        #[cfg(any(test, feature = "test-support"))]
+        let seams = Arc::clone(&self.seams);
         let available = self.semaphore.available_permits();
         if available == 0 {
             tracing::warn!(
@@ -1471,7 +1549,7 @@ impl ExecutorPool {
                 };
             }
             Err(crate::deadline::Expired) => {
-                return refused_outcome(query_id, kind, StartRefusal::Expired);
+                return refusal_log.refuse_outcome(query_id, kind, StartRefusal::Expired);
             }
         };
 
@@ -1502,69 +1580,74 @@ impl ExecutorPool {
         let max_result_rows = self.max_result_rows;
         let field_catalog = Arc::clone(&self.field_catalog);
 
-        let mut task = tokio::task::spawn_blocking(move || {
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                worker_seam!(Entry);
-                if !slot.publish_interrupt(slot.executor().interrupt_handle()) {
-                    return refused_outcome(query_id, kind, StartRefusal::Cancelled);
-                }
-                if let Err(refusal) = slot.begin_work(deadline) {
-                    return refused_outcome(query_id, kind, refusal);
-                }
-                worker_seam!(Started);
-
-                #[cfg(any(test, feature = "test-support"))]
-                {
-                    let delay = TEST_QUERY_DELAY_MS.load(Ordering::Relaxed);
-                    if delay > 0 {
-                        std::thread::sleep(std::time::Duration::from_millis(delay));
+        let mut task = tokio::task::spawn_blocking({
+            let refusal_log = refusal_log.clone();
+            #[cfg(any(test, feature = "test-support"))]
+            let seams = Arc::clone(&seams);
+            move || {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    worker_seam!(seams, Entry);
+                    if !slot.publish_interrupt(slot.executor().interrupt_handle()) {
+                        return refusal_log.refuse_outcome(query_id, kind, StartRefusal::Cancelled);
                     }
-                }
+                    if let Err(refusal) = slot.begin_work(deadline) {
+                        return refusal_log.refuse_outcome(query_id, kind, refusal);
+                    }
+                    worker_seam!(seams, Started);
 
-                tracing::debug!(
-                    event_type = "query_source",
-                    source = %source,
-                    "using pre-computed source (from saved)"
-                );
+                    #[cfg(any(test, feature = "test-support"))]
+                    {
+                        let delay = TEST_QUERY_DELAY_MS.load(Ordering::Relaxed);
+                        if delay > 0 {
+                            std::thread::sleep(std::time::Duration::from_millis(delay));
+                        }
+                    }
 
-                // No hot buffer — saved query results are self-contained.
-                let pins = field_catalog.all();
-                let (result, debug) = run_query_blocking(
-                    slot.executor(),
-                    &dsl,
-                    &source,
-                    None,
-                    &pins,
-                    max_result_rows,
-                    utc_offset_secs,
-                    capture_debug,
-                    pool_wait_ms,
-                );
-                // `dsl` here is what follows `| from saved`, whose `PinScope`
-                // rule clears the scope, so the presentation walk roots in an
-                // empty catalog: a saved run's stored columns are not typed by
-                // what this corpus happens to pin now. The comparison pins above
-                // are a separate question and keep the live snapshot.
-                let severity_columns = if result.is_ok() {
-                    severity_columns_for(&trawl_core::schema::FieldTypes::new(), &dsl)
-                } else {
-                    Vec::new()
-                };
-                worker_seam!(Finished);
-                ExecuteOutcome {
-                    result,
-                    debug,
-                    severity_columns,
-                }
-            }));
-            outcome.unwrap_or_else(|payload| ExecuteOutcome {
-                result: Err(ServerError::Internal(format!(
-                    "query worker panicked: {}",
-                    panic_text(payload.as_ref())
-                ))),
-                debug: None,
-                severity_columns: Vec::new(),
-            })
+                    tracing::debug!(
+                        event_type = "query_source",
+                        source = %source,
+                        "using pre-computed source (from saved)"
+                    );
+
+                    // No hot buffer — saved query results are self-contained.
+                    let pins = field_catalog.all();
+                    let (result, debug) = run_query_blocking(
+                        slot.executor(),
+                        &dsl,
+                        &source,
+                        None,
+                        &pins,
+                        max_result_rows,
+                        utc_offset_secs,
+                        capture_debug,
+                        pool_wait_ms,
+                    );
+                    // `dsl` here is what follows `| from saved`, whose `PinScope`
+                    // rule clears the scope, so the presentation walk roots in an
+                    // empty catalog: a saved run's stored columns are not typed by
+                    // what this corpus happens to pin now. The comparison pins above
+                    // are a separate question and keep the live snapshot.
+                    let severity_columns = if result.is_ok() {
+                        severity_columns_for(&trawl_core::schema::FieldTypes::new(), &dsl)
+                    } else {
+                        Vec::new()
+                    };
+                    worker_seam!(seams, Finished);
+                    ExecuteOutcome {
+                        result,
+                        debug,
+                        severity_columns,
+                    }
+                }));
+                outcome.unwrap_or_else(|payload| ExecuteOutcome {
+                    result: Err(ServerError::Internal(format!(
+                        "query worker panicked: {}",
+                        panic_text(payload.as_ref())
+                    ))),
+                    debug: None,
+                    severity_columns: Vec::new(),
+                })
+            }
         });
 
         let mut request = RequestGuard::new(self, query_id, kind, &started);
@@ -1584,7 +1667,7 @@ impl ExecutorPool {
                 let result = if request.abandon() {
                     Err(ServerError::Timeout)
                 } else {
-                    Err(capacity_refusal(query_id, kind, StartRefusal::Expired))
+                    Err(refusal_log.refuse(query_id, kind, StartRefusal::Expired))
                 };
                 ExecuteOutcome { result, debug: None, severity_columns: Vec::new() }
             }
@@ -1706,32 +1789,41 @@ impl ExecutorPool {
         let id = self.allocate_query_id();
         let work = WorkContext::system(WorkKind::Ping);
         let kind = work.kind;
+        // One refusal, told once, however this work ends up refused.
+        let refusal_log = RefusalOnce::new();
+        #[cfg(any(test, feature = "test-support"))]
+        let seams = Arc::clone(&self.seams);
         let permit = match deadline.run(semaphore.acquire_owned()).await {
             Ok(Ok(permit)) => permit,
             Ok(Err(_)) => return Err(ServerError::Internal("executor pool shut down".into())),
             Err(crate::deadline::Expired) => {
-                return Err(capacity_refusal(id, kind, StartRefusal::Expired));
+                return Err(refusal_log.refuse(id, kind, StartRefusal::Expired));
             }
         };
 
         let slot = self.begin_slot(id, &work, None, permit, None)?;
         let started = Arc::clone(&slot.started);
 
-        let mut task = tokio::task::spawn_blocking(move || {
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                worker_seam!(Entry);
-                if !slot.publish_interrupt(slot.executor().interrupt_handle()) {
-                    return Err(capacity_refusal(id, kind, StartRefusal::Cancelled));
-                }
-                if let Err(refusal) = slot.begin_work(deadline) {
-                    return Err(capacity_refusal(id, kind, refusal));
-                }
-                worker_seam!(Started);
-                let result = slot.executor().ping().map_err(ServerError::from);
-                worker_seam!(Finished);
-                result
-            }));
-            outcome.unwrap_or_else(|_| Err(ServerError::Internal("ping panicked".into())))
+        let mut task = tokio::task::spawn_blocking({
+            let refusal_log = refusal_log.clone();
+            #[cfg(any(test, feature = "test-support"))]
+            let seams = Arc::clone(&seams);
+            move || {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    worker_seam!(seams, Entry);
+                    if !slot.publish_interrupt(slot.executor().interrupt_handle()) {
+                        return Err(refusal_log.refuse(id, kind, StartRefusal::Cancelled));
+                    }
+                    if let Err(refusal) = slot.begin_work(deadline) {
+                        return Err(refusal_log.refuse(id, kind, refusal));
+                    }
+                    worker_seam!(seams, Started);
+                    let result = slot.executor().ping().map_err(ServerError::from);
+                    worker_seam!(seams, Finished);
+                    result
+                }));
+                outcome.unwrap_or_else(|_| Err(ServerError::Internal("ping panicked".into())))
+            }
         });
 
         let mut request = RequestGuard::new(self, id, kind, &started);
@@ -1744,7 +1836,7 @@ impl ExecutorPool {
                 if request.abandon() {
                     Err(ServerError::Timeout)
                 } else {
-                    Err(capacity_refusal(id, kind, StartRefusal::Expired))
+                    Err(refusal_log.refuse(id, kind, StartRefusal::Expired))
                 }
             }
         }
@@ -1771,6 +1863,10 @@ impl ExecutorPool {
         work: WorkContext,
     ) -> Result<Vec<String>, ServerError> {
         let kind = work.kind;
+        // One refusal, told once, however this work ends up refused.
+        let refusal_log = RefusalOnce::new();
+        #[cfg(any(test, feature = "test-support"))]
+        let seams = Arc::clone(&self.seams);
         let semaphore = Arc::clone(&self.semaphore);
         let id = self.allocate_query_id();
 
@@ -1782,13 +1878,13 @@ impl ExecutorPool {
         let permit = acquire
             .run(semaphore.acquire_owned())
             .await
-            .map_err(|_| capacity_refusal(id, kind, StartRefusal::Expired))?
+            .map_err(|_| refusal_log.refuse(id, kind, StartRefusal::Expired))?
             .map_err(|_| ServerError::Internal("executor pool shut down".into()))?;
 
         let publication = acquire
             .run(self.publication.read())
             .await
-            .map_err(|_| capacity_refusal(id, kind, StartRefusal::Expired))??;
+            .map_err(|_| refusal_log.refuse(id, kind, StartRefusal::Expired))??;
 
         // Past acquisition the caller's overall deadline governs again.
         let slot = self.begin_slot(id, &work, None, permit, Some(publication))?;
@@ -1797,34 +1893,39 @@ impl ExecutorPool {
         let field = field.to_owned();
         let service = service.map(ToOwned::to_owned);
 
-        let task = tokio::task::spawn_blocking(move || {
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                worker_seam!(Entry);
-                if !slot.publish_interrupt(slot.executor().interrupt_handle()) {
-                    return Err(capacity_refusal(id, kind, StartRefusal::Cancelled));
-                }
-                if let Err(refusal) = slot.begin_work(deadline) {
-                    return Err(capacity_refusal(id, kind, refusal));
-                }
-                worker_seam!(Started);
-                let glob = match service {
-                    Some(svc) => {
-                        let base = fallback_glob.as_ref();
-                        let base_prefix = base.find('*').map_or(base, |pos| &base[..pos]);
-                        format!("{base_prefix}**/{svc}.parquet")
+        let task = tokio::task::spawn_blocking({
+            let refusal_log = refusal_log.clone();
+            #[cfg(any(test, feature = "test-support"))]
+            let seams = Arc::clone(&seams);
+            move || {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    worker_seam!(seams, Entry);
+                    if !slot.publish_interrupt(slot.executor().interrupt_handle()) {
+                        return Err(refusal_log.refuse(id, kind, StartRefusal::Cancelled));
                     }
-                    None => fallback_glob.to_string(),
-                };
-                let result = slot
-                    .executor()
-                    .sample_field_values(&glob, &field, limit)
-                    .map_err(ServerError::from);
-                worker_seam!(Finished);
-                result
-            }));
-            outcome.unwrap_or_else(|_| {
-                Err(ServerError::Internal("field values sample panicked".into()))
-            })
+                    if let Err(refusal) = slot.begin_work(deadline) {
+                        return Err(refusal_log.refuse(id, kind, refusal));
+                    }
+                    worker_seam!(seams, Started);
+                    let glob = match service {
+                        Some(svc) => {
+                            let base = fallback_glob.as_ref();
+                            let base_prefix = base.find('*').map_or(base, |pos| &base[..pos]);
+                            format!("{base_prefix}**/{svc}.parquet")
+                        }
+                        None => fallback_glob.to_string(),
+                    };
+                    let result = slot
+                        .executor()
+                        .sample_field_values(&glob, &field, limit)
+                        .map_err(ServerError::from);
+                    worker_seam!(seams, Finished);
+                    result
+                }));
+                outcome.unwrap_or_else(|_| {
+                    Err(ServerError::Internal("field values sample panicked".into()))
+                })
+            }
         });
 
         let mut request = RequestGuard::new(self, id, kind, &started);
@@ -1855,17 +1956,21 @@ impl ExecutorPool {
         work: WorkContext,
     ) -> Result<Vec<u8>, ServerError> {
         let kind = work.kind;
+        // One refusal, told once, however this work ends up refused.
+        let refusal_log = RefusalOnce::new();
+        #[cfg(any(test, feature = "test-support"))]
+        let seams = Arc::clone(&self.seams);
         let semaphore = Arc::clone(&self.semaphore);
         let permit = deadline
             .run(semaphore.acquire_owned())
             .await
-            .map_err(|_| capacity_refusal(query_id, kind, StartRefusal::Expired))?
+            .map_err(|_| refusal_log.refuse(query_id, kind, StartRefusal::Expired))?
             .map_err(|_| ServerError::Internal("executor pool shut down".into()))?;
 
         let publication = deadline
             .run(self.publication.read())
             .await
-            .map_err(|_| capacity_refusal(query_id, kind, StartRefusal::Expired))??;
+            .map_err(|_| refusal_log.refuse(query_id, kind, StartRefusal::Expired))??;
 
         let slot = self.begin_slot(query_id, &work, Some(dsl), permit, Some(publication))?;
         let started = Arc::clone(&slot.started);
@@ -1874,63 +1979,68 @@ impl ExecutorPool {
         let hot_buffer = self.hot_buffer.clone();
         let field_catalog = Arc::clone(&self.field_catalog);
 
-        let mut task = tokio::task::spawn_blocking(move || {
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                worker_seam!(Entry);
-                if !slot.publish_interrupt(slot.executor().interrupt_handle()) {
-                    return Err(capacity_refusal(query_id, kind, StartRefusal::Cancelled));
-                }
-                if let Err(refusal) = slot.begin_work(deadline) {
-                    return Err(capacity_refusal(query_id, kind, refusal));
-                }
-                worker_seam!(Started);
+        let mut task = tokio::task::spawn_blocking({
+            let refusal_log = refusal_log.clone();
+            #[cfg(any(test, feature = "test-support"))]
+            let seams = Arc::clone(&seams);
+            move || {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    worker_seam!(seams, Entry);
+                    if !slot.publish_interrupt(slot.executor().interrupt_handle()) {
+                        return Err(refusal_log.refuse(query_id, kind, StartRefusal::Cancelled));
+                    }
+                    if let Err(refusal) = slot.begin_work(deadline) {
+                        return Err(refusal_log.refuse(query_id, kind, refusal));
+                    }
+                    worker_seam!(seams, Started);
 
-                let source = compute_source(&base_dir, &dsl);
+                    let source = compute_source(&base_dir, &dsl);
 
-                // Write to a temp file, then read it back as bytes.
-                let tmp = tempfile::NamedTempFile::new().map_err(|e| {
-                    ServerError::Internal(format!("failed to create temp file: {e}"))
-                })?;
-                let tmp_path = tmp.path().to_owned();
+                    // Write to a temp file, then read it back as bytes.
+                    let tmp = tempfile::NamedTempFile::new().map_err(|e| {
+                        ServerError::Internal(format!("failed to create temp file: {e}"))
+                    })?;
+                    let tmp_path = tmp.path().to_owned();
 
-                // Snapshot hot buffer for fresh events.
-                let hot_snapshot = hot_buffer
-                    .as_ref()
-                    .and_then(|hb| hb.snapshot())
-                    .filter(|s| s.path().to_str().is_some());
+                    // Snapshot hot buffer for fresh events.
+                    let hot_snapshot = hot_buffer
+                        .as_ref()
+                        .and_then(|hb| hb.snapshot())
+                        .filter(|s| s.path().to_str().is_some());
 
-                let pins = field_catalog.all();
-                let executor = slot.executor();
-                let written = if let Some(ref hot) = hot_snapshot {
-                    let hot_path = hot.path().to_str().unwrap_or_default();
-                    executor.export_parquet_with_hot(
-                        &dsl,
-                        &source,
-                        hot_path,
-                        &hot.field_types,
-                        &pins,
-                        &tmp_path,
-                        max_rows,
-                    )
-                } else {
-                    executor.export_parquet(&dsl, &source, &pins, &tmp_path, max_rows)
-                }
-                .map_err(ServerError::from);
+                    let pins = field_catalog.all();
+                    let executor = slot.executor();
+                    let written = if let Some(ref hot) = hot_snapshot {
+                        let hot_path = hot.path().to_str().unwrap_or_default();
+                        executor.export_parquet_with_hot(
+                            &dsl,
+                            &source,
+                            hot_path,
+                            &hot.field_types,
+                            &pins,
+                            &tmp_path,
+                            max_rows,
+                        )
+                    } else {
+                        executor.export_parquet(&dsl, &source, &pins, &tmp_path, max_rows)
+                    }
+                    .map_err(ServerError::from);
 
-                let bytes = written.and_then(|()| {
-                    std::fs::read(&tmp_path).map_err(|e| {
-                        ServerError::Internal(format!("failed to read parquet temp file: {e}"))
-                    })
-                });
-                worker_seam!(Finished);
-                bytes
-            }));
-            outcome.unwrap_or_else(|payload| {
-                Err(ServerError::Internal(format!(
-                    "export panicked: {}",
-                    panic_text(payload.as_ref())
-                )))
-            })
+                    let bytes = written.and_then(|()| {
+                        std::fs::read(&tmp_path).map_err(|e| {
+                            ServerError::Internal(format!("failed to read parquet temp file: {e}"))
+                        })
+                    });
+                    worker_seam!(seams, Finished);
+                    bytes
+                }));
+                outcome.unwrap_or_else(|payload| {
+                    Err(ServerError::Internal(format!(
+                        "export panicked: {}",
+                        panic_text(payload.as_ref())
+                    )))
+                })
+            }
         });
 
         let mut request = RequestGuard::new(self, query_id, kind, &started);
@@ -1946,7 +2056,7 @@ impl ExecutorPool {
                 if request.abandon() {
                     Err(ServerError::Timeout)
                 } else {
-                    Err(capacity_refusal(query_id, kind, StartRefusal::Expired))
+                    Err(refusal_log.refuse(query_id, kind, StartRefusal::Expired))
                 }
             }
         }
@@ -2018,6 +2128,118 @@ mod tests {
                 "the worker never reached: {label}"
             );
             tokio::task::yield_now().await;
+        }
+    }
+
+    /// Captured `tracing` events for ONE unit of work.
+    ///
+    /// A global subscriber, not a thread-local one: the events these
+    /// tests are about are emitted from the blocking worker thread, which
+    /// does not inherit `set_default`. The sink is set for one capturing
+    /// test at a time and keeps only the events carrying that test's own
+    /// `query_id`, so a concurrent test's lifecycle logging cannot be
+    /// counted here.
+    mod capture {
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+
+        type Events = Arc<StdMutex<Vec<HashMap<String, String>>>>;
+
+        struct Sink {
+            query_id: u64,
+            events: Events,
+        }
+
+        static SINK: StdMutex<Option<Sink>> = StdMutex::new(None);
+        /// One capturing test at a time: the sink is process-wide.
+        static TURN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+        struct Fields<'a>(&'a mut HashMap<String, String>);
+
+        impl tracing::field::Visit for Fields<'_> {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0.insert(field.name().to_owned(), format!("{value:?}"));
+            }
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                self.0.insert(field.name().to_owned(), value.to_owned());
+            }
+            fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+                self.0.insert(field.name().to_owned(), value.to_string());
+            }
+        }
+
+        struct Layer;
+
+        impl<S> tracing_subscriber::Layer<S> for Layer
+        where
+            S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+        {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut fields = HashMap::new();
+                event.record(&mut Fields(&mut fields));
+                let sink = SINK.lock().expect("capture sink poisoned");
+                if let Some(sink) = sink.as_ref()
+                    && fields.get("query_id").map(String::as_str)
+                        == Some(sink.query_id.to_string().as_str())
+                {
+                    sink.events.lock().expect("capture poisoned").push(fields);
+                }
+            }
+        }
+
+        /// The events one unit of work logged while this guard lived.
+        pub(super) struct Capture {
+            events: Events,
+            _turn: tokio::sync::MutexGuard<'static, ()>,
+        }
+
+        impl Capture {
+            /// Every captured field map whose `event_type` matches.
+            pub(super) fn of_type(&self, event_type: &str) -> Vec<HashMap<String, String>> {
+                self.events
+                    .lock()
+                    .expect("capture poisoned")
+                    .iter()
+                    .filter(|f| f.get("event_type").map(String::as_str) == Some(event_type))
+                    .cloned()
+                    .collect()
+            }
+        }
+
+        impl Drop for Capture {
+            fn drop(&mut self) {
+                *SINK.lock().expect("capture sink poisoned") = None;
+            }
+        }
+
+        /// Capture what `query_id` logs until the guard drops.
+        pub(super) async fn of_query(query_id: u64) -> Capture {
+            use tracing_subscriber::prelude::*;
+
+            static INSTALLED: OnceLock<()> = OnceLock::new();
+            INSTALLED.get_or_init(|| {
+                // Ignored on the second binary-wide attempt: another test
+                // may already own the global subscriber, and this layer
+                // is additive either way.
+                let _ = tracing::subscriber::set_global_default(
+                    tracing_subscriber::registry().with(Layer),
+                );
+            });
+
+            let turn = TURN.lock().await;
+            let events: Events = Arc::default();
+            *SINK.lock().expect("capture sink poisoned") = Some(Sink {
+                query_id,
+                events: Arc::clone(&events),
+            });
+            Capture {
+                events,
+                _turn: turn,
+            }
         }
     }
 
@@ -2385,9 +2607,9 @@ mod tests {
         // The worker is held past its work-start transition, so what the
         // request reports is a timeout on work that really is running.
         // Sleeping instead would race the blocking pool's own startup.
-        let _seams = seam::session().await;
-        let started = seam::hold(Seam::Started);
         let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000, None);
+        let seams = pool.seams();
+        let started = seams.hold(Seam::Started);
         let id = pool.allocate_query_id();
         let submitted = pool.clone();
         let request = tokio::spawn(async move {
@@ -2415,9 +2637,9 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn pool_executor_reclaimed_after_timeout() {
-        let _seams = seam::session().await;
-        let started = seam::hold(Seam::Started);
         let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000, None);
+        let seams = pool.seams();
+        let started = seams.hold(Seam::Started);
         let idle_before = idle_len(&pool);
         let id = pool.allocate_query_id();
         let submitted = pool.clone();
@@ -2607,12 +2829,13 @@ mod tests {
     /// ran, so there is nothing to have timed out (ADR-0024).
     #[tokio::test(start_paused = true)]
     async fn startup_wait_counts_against_the_deadline() {
-        let _seams = seam::session().await;
-        let entry = seam::hold(Seam::Entry);
-        let started = seam::watch(Seam::Started);
         let pool = hot_pool(1);
+        let seams = pool.seams();
+        let entry = seams.hold(Seam::Entry);
+        let started = seams.watch(Seam::Started);
         let baseline_idle = idle_len(&pool);
         let id = pool.allocate_query_id();
+        let logged = capture::of_query(id).await;
 
         let submitted = pool.clone();
         let request = tokio::spawn(async move {
@@ -2661,6 +2884,22 @@ mod tests {
             "an expired worker performs no physical work at all"
         );
         assert!(registry_is_empty(&pool));
+
+        // One refusal, one event. The request gave up on its budget and
+        // latched cancellation on the way out, and the worker it released
+        // then refused to start on that latch — two paths, one refusal,
+        // and the reason is the one that actually happened.
+        let refusals = logged.of_type("query_not_started");
+        assert_eq!(
+            refusals.len(),
+            1,
+            "a refused request must log exactly once, got {refusals:?}"
+        );
+        assert_eq!(
+            refusals[0].get("reason").map(String::as_str),
+            Some("expired")
+        );
+        assert_eq!(refusals[0].get("kind").map(String::as_str), Some("query"));
     }
 
     /// Work that started and outlived its request is visible as retained
@@ -2668,9 +2907,9 @@ mod tests {
     /// back when it ends.
     #[tokio::test(start_paused = true)]
     async fn a_retained_permit_is_visible_and_reclaimed() {
-        let _seams = seam::session().await;
-        let started = seam::hold(Seam::Started);
         let pool = hot_pool(2);
+        let seams = pool.seams();
+        let started = seams.hold(Seam::Started);
         let baseline_idle = idle_len(&pool);
         let id = pool.allocate_query_id();
 
@@ -2741,9 +2980,9 @@ mod tests {
     /// so the cancellation record has to outlive the response.
     #[tokio::test(start_paused = true)]
     async fn a_timed_out_query_stays_cancellable() {
-        let _seams = seam::session().await;
-        let started = seam::hold(Seam::Started);
         let pool = hot_pool(1);
+        let seams = pool.seams();
+        let started = seams.hold(Seam::Started);
         let id = pool.allocate_query_id();
 
         let submitted = pool.clone();
@@ -2778,13 +3017,13 @@ mod tests {
     /// or it finds nothing at all. Both orders are exercised here.
     #[tokio::test(start_paused = true)]
     async fn cancellation_cannot_interrupt_a_reused_executor() {
-        let _seams = seam::session().await;
-        // One executor, so the second query provably reuses the first's.
         let pool = hot_pool(1);
+        let seams = pool.seams();
+        // One executor, so the second query provably reuses the first's.
 
         // Order one: the cancellation arrives while the finished work is
         // still holding its slot.
-        let finished = seam::hold(Seam::Finished);
+        let finished = seams.hold(Seam::Finished);
         let first = pool.allocate_query_id();
         let submitted = pool.clone();
         let request = tokio::spawn(async move {
@@ -2831,7 +3070,7 @@ mod tests {
 
         // Order two: the cancellation arrives while the reused executor is
         // mid-query. Naming the old id must still reach nothing.
-        let started = seam::hold(Seam::Started);
+        let started = seams.hold(Seam::Started);
         let third = pool.allocate_query_id();
         let submitted = pool.clone();
         let request = tokio::spawn(async move {
@@ -2860,10 +3099,10 @@ mod tests {
     /// to completion anyway.
     #[tokio::test(start_paused = true)]
     async fn cancellation_before_the_handle_exists_refuses_the_start() {
-        let _seams = seam::session().await;
-        let entry = seam::hold(Seam::Entry);
-        let started = seam::watch(Seam::Started);
         let pool = hot_pool(1);
+        let seams = pool.seams();
+        let entry = seams.hold(Seam::Entry);
+        let started = seams.watch(Seam::Started);
         let baseline_idle = idle_len(&pool);
         let id = pool.allocate_query_id();
 
@@ -2914,11 +3153,11 @@ mod tests {
     /// `select!` happened to poll one arm first.
     #[tokio::test(start_paused = true)]
     async fn start_and_expiry_race_yields_exactly_one_classification() {
-        let _seams = seam::session().await;
         let pool = hot_pool(2);
+        let seams = pool.seams();
 
         // Expiry first: the worker is still at the door.
-        let entry = seam::hold(Seam::Entry);
+        let entry = seams.hold(Seam::Entry);
         let id = pool.allocate_query_id();
         let submitted = pool.clone();
         let request = tokio::spawn(async move {
@@ -2941,7 +3180,7 @@ mod tests {
 
         // Start first: the worker is past the transition when the budget
         // runs out.
-        let started = seam::hold(Seam::Started);
+        let started = seams.hold(Seam::Started);
         let id = pool.allocate_query_id();
         let submitted = pool.clone();
         let request = tokio::spawn(async move {
@@ -2977,9 +3216,9 @@ mod tests {
     /// and it is visible as retained meanwhile.
     #[tokio::test(start_paused = true)]
     async fn a_dropped_caller_retains_and_then_reclaims() {
-        let _seams = seam::session().await;
-        let started = seam::hold(Seam::Started);
         let pool = hot_pool(1);
+        let seams = pool.seams();
+        let started = seams.hold(Seam::Started);
         let baseline_idle = idle_len(&pool);
         let id = pool.allocate_query_id();
 
@@ -3026,12 +3265,12 @@ mod tests {
     /// way out of every one of them.
     #[tokio::test]
     async fn a_panicking_worker_leaks_no_permit_or_executor() {
-        let _seams = seam::session().await;
         let pool = hot_pool(2);
+        let seams = pool.seams();
         let baseline_idle = idle_len(&pool);
 
         for seam_point in [Seam::Entry, Seam::Started, Seam::Finished] {
-            let _gate = seam::panic_at(seam_point);
+            let _gate = seams.panic_at(seam_point);
             let id = pool.allocate_query_id();
             let outcome = pool
                 .execute(
@@ -3064,9 +3303,9 @@ mod tests {
     /// one request outcome and one cleanup, never an orphaned slot.
     #[tokio::test(start_paused = true)]
     async fn a_timeout_racing_completion_leaves_no_orphan() {
-        let _seams = seam::session().await;
-        let finished = seam::hold(Seam::Finished);
         let pool = hot_pool(1);
+        let seams = pool.seams();
+        let finished = seams.hold(Seam::Finished);
         let baseline_idle = idle_len(&pool);
         let id = pool.allocate_query_id();
 
@@ -3108,9 +3347,9 @@ mod tests {
     /// interactive query lane.
     #[tokio::test(start_paused = true)]
     async fn every_lane_registers_its_kind_and_owner() {
-        let _seams = seam::session().await;
-        let started = seam::hold(Seam::Started);
         let pool = hot_pool(2);
+        let seams = pool.seams();
+        let started = seams.hold(Seam::Started);
 
         let export_id = pool.allocate_query_id();
         let exporter = pool.clone();
@@ -3227,9 +3466,9 @@ mod tests {
     /// capacity refusal, and neither leaves anything behind.
     #[tokio::test(start_paused = true)]
     async fn ping_and_sampling_bound_their_wait() {
-        let _seams = seam::session().await;
-        let parked = seam::hold(Seam::Started);
         let pool = hot_pool(1);
+        let seams = pool.seams();
+        let parked = seams.hold(Seam::Started);
         let baseline_idle = idle_len(&pool);
 
         let occupant = pool.clone();
@@ -3349,6 +3588,10 @@ mod tests {
 
         use tracing_subscriber::prelude::*;
 
+        // Its own thread-local capture rather than the shared one: this
+        // event is emitted by the caller, on this thread, and it carries
+        // no query_id for the shared sink to key on.
+
         /// One captured event's fields, stringified.
         #[derive(Clone, Default)]
         struct Capture(Arc<StdMutex<Vec<std::collections::HashMap<String, String>>>>);
@@ -3382,9 +3625,9 @@ mod tests {
             }
         }
 
-        let _seams = seam::session().await;
-        let parked = seam::hold(Seam::Started);
         let pool = hot_pool(1);
+        let seams = pool.seams();
+        let parked = seams.hold(Seam::Started);
         let id = pool.allocate_query_id();
 
         let submitted = pool.clone();
