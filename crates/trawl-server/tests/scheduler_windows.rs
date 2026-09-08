@@ -28,7 +28,7 @@ use sqlx::PgPool;
 use trawl_api::value::Value;
 use trawl_server::config::SchedulerConfig;
 use trawl_server::deadline::Deadline;
-use trawl_server::pool::ExecutorPool;
+use trawl_server::pool::{ExecutorPool, WorkContext, WorkKind};
 use trawl_server::report_window::{
     ScheduleWindow, WindowKind, format_window_bound, truncate_to_micros,
 };
@@ -758,6 +758,7 @@ async fn a_windowed_run_query_reexecutes_standalone_with_identical_bounds() {
             Deadline::after(StdDuration::from_secs(TIMEOUT_SECS)),
             false,
             0,
+            WorkContext::system(WorkKind::Query),
         )
         .await;
     let result = outcome.result.expect("the stored text executes");

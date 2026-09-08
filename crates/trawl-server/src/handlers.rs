@@ -152,6 +152,7 @@ pub async fn query(
                     deadline,
                     capture_debug,
                     utc_offset_secs,
+                    crate::pool::WorkContext::key(crate::pool::WorkKind::FromSaved, verified.id),
                 )
                 .await,
             degraded,
@@ -168,6 +169,7 @@ pub async fn query(
                     deadline,
                     capture_debug,
                     utc_offset_secs,
+                    crate::pool::WorkContext::key(crate::pool::WorkKind::Query, verified.id),
                 )
                 .await,
             degraded,
@@ -793,7 +795,13 @@ pub async fn cancel_query(
     let can_cancel = if verified.has_permission(Permission::ServerManage) {
         true
     } else if verified.has_permission(Permission::QueryCancel) {
+        // Two records, one owner. The tracker drops a query as soon as its
+        // request records an outcome; the pool keeps the work registered
+        // until the physical query actually stops (ADR-0024). Asking both
+        // is what keeps a query the client has already been told timed out
+        // cancellable by the key that submitted it.
         state.query.tracker.owner_key_id(query_id) == Some(verified.id)
+            || state.query.pool.owner_of(query_id) == Some(crate::pool::WorkOwner::Key(verified.id))
     } else {
         return Err(ServerError::Forbidden("insufficient permissions".into()));
     };
@@ -1620,6 +1628,7 @@ pub async fn field_values(
             crate::deadline::Deadline::after(std::time::Duration::from_secs(
                 state.query.timeout_secs,
             )),
+            crate::pool::WorkContext::key(crate::pool::WorkKind::Sample, verified.id),
         )
         .await?;
 
@@ -2736,7 +2745,13 @@ pub async fn export(
         let bytes = state
             .query
             .pool
-            .export_parquet(query_id, &req.query, limit, deadline)
+            .export_parquet(
+                query_id,
+                &req.query,
+                limit,
+                deadline,
+                crate::pool::WorkContext::key(crate::pool::WorkKind::Export, verified.id),
+            )
             .await?;
         let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
@@ -2773,7 +2788,14 @@ pub async fn export(
     let outcome = state
         .query
         .pool
-        .execute(query_id, &req.query, deadline, capture_debug, 0)
+        .execute(
+            query_id,
+            &req.query,
+            deadline,
+            capture_debug,
+            0,
+            crate::pool::WorkContext::key(crate::pool::WorkKind::Export, verified.id),
+        )
         .await;
     let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 

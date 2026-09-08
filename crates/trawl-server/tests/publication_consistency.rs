@@ -13,7 +13,7 @@ use trawl_server::deadline::Deadline;
 use trawl_server::error::ServerError;
 use trawl_server::hot_buffer::{HotBuffer, HotBufferConfig};
 use trawl_server::ingest::{compaction::compact_once, wal::WalWriter};
-use trawl_server::pool::ExecutorPool;
+use trawl_server::pool::{ExecutorPool, WorkContext, WorkKind, seam};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::too_many_lines)] // one controlled publication, checked through both readers
@@ -56,6 +56,7 @@ async fn queries_and_exports_wait_for_publish_and_drain() {
             Deadline::after(Duration::from_secs(10)),
             false,
             0,
+            WorkContext::system(WorkKind::Query),
         )
         .await;
     assert_eq!(before.result.unwrap().rows.len(), 3);
@@ -87,18 +88,29 @@ async fn queries_and_exports_wait_for_publish_and_drain() {
             Deadline::after(Duration::from_millis(30)),
             false,
             0,
+            WorkContext::system(WorkKind::Query),
         )
         .await;
-    assert!(matches!(blocked.result, Err(ServerError::Timeout)));
+    // The publication gate is a wait before any work starts, so a budget
+    // that runs out there is a capacity refusal, not a query timeout
+    // (ADR-0024).
+    assert!(matches!(
+        blocked.result,
+        Err(ServerError::ServiceUnavailable(_))
+    ));
     let blocked_export = pool
         .export_parquet(
             pool.allocate_query_id(),
             "*",
             100,
             Deadline::after(Duration::from_millis(30)),
+            WorkContext::system(WorkKind::Export),
         )
         .await;
-    assert!(matches!(blocked_export, Err(ServerError::Timeout)));
+    assert!(matches!(
+        blocked_export,
+        Err(ServerError::ServiceUnavailable(_))
+    ));
     assert_eq!(
         pool.available_permits(),
         3,
@@ -115,6 +127,7 @@ async fn queries_and_exports_wait_for_publish_and_drain() {
             Deadline::after(Duration::from_secs(10)),
             false,
             0,
+            WorkContext::system(WorkKind::Query),
         )
         .await;
     assert_eq!(after.result.unwrap().rows.len(), 3);
@@ -124,6 +137,7 @@ async fn queries_and_exports_wait_for_publish_and_drain() {
             "*",
             100,
             Deadline::after(Duration::from_secs(10)),
+            WorkContext::system(WorkKind::Export),
         )
         .await
         .unwrap();
@@ -155,6 +169,7 @@ async fn query_only_pool_refuses_incomplete_rollup_after_restart() {
             Deadline::after(Duration::from_secs(1)),
             false,
             0,
+            WorkContext::system(WorkKind::Query),
         )
         .await;
     assert!(matches!(
@@ -167,12 +182,19 @@ async fn query_only_pool_refuses_incomplete_rollup_after_restart() {
             "*",
             100,
             Deadline::after(Duration::from_secs(1)),
+            WorkContext::system(WorkKind::Export),
         )
         .await;
     assert!(matches!(export, Err(ServerError::ServiceUnavailable(_))));
     assert!(matches!(
-        pool.sample_field_values("message", None, 10, Deadline::after(Duration::from_secs(1)))
-            .await,
+        pool.sample_field_values(
+            "message",
+            None,
+            10,
+            Deadline::after(Duration::from_secs(1)),
+            WorkContext::system(WorkKind::Sample),
+        )
+        .await,
         Err(ServerError::ServiceUnavailable(_))
     ));
     assert_eq!(pool.available_permits(), 1);
@@ -201,6 +223,7 @@ async fn query_timeout_keeps_publication_guard_until_duckdb_task_finishes() {
             Deadline::after(Duration::from_millis(30)),
             false,
             0,
+            WorkContext::system(WorkKind::Query),
         )
         .await;
     assert!(matches!(result.result, Err(ServerError::Timeout)));
@@ -230,16 +253,28 @@ async fn aborting_request_keeps_running_reader_protected() {
     let root = tempfile::tempdir().unwrap();
     let pool = ExecutorPool::new(root.path().to_str().unwrap().into(), 1, 100, None);
     TEST_QUERY_DELAY_MS.store(1000, Ordering::Relaxed);
+    let _seams = seam::session().await;
+    let started = seam::watch(seam::Seam::Started);
     let reader_pool = pool.clone();
     let id = pool.allocate_query_id();
     let request = tokio::spawn(async move {
         reader_pool
-            .execute(id, "*", Deadline::after(Duration::from_secs(10)), false, 0)
+            .execute(
+                id,
+                "*",
+                Deadline::after(Duration::from_secs(10)),
+                false,
+                0,
+                WorkContext::system(WorkKind::Query),
+            )
             .await
     });
-    // An interrupt handle is registered only after the blocking task starts.
+    // Wait for the reader to actually be reading. A registered slot is not
+    // enough: work that has not passed its work-start transition holds no
+    // files open, and cancelling it there would end it before the abort
+    // could prove anything (ADR-0024).
     tokio::time::timeout(Duration::from_secs(5), async {
-        while !pool.cancel_by_id(id) {
+        while started.arrivals() == 0 {
             tokio::task::yield_now().await;
         }
     })

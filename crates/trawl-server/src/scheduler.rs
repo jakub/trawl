@@ -324,9 +324,16 @@ pub(crate) async fn execute_scheduled_query(
         Err(refusal) => Err(refusal),
         // Execute the query on the pool (no debug capture, UTC timestamps).
         Ok(()) => {
-            pool.execute(pool.allocate_query_id(), query, deadline, false, 0)
-                .await
-                .result
+            pool.execute(
+                pool.allocate_query_id(),
+                query,
+                deadline,
+                false,
+                0,
+                crate::pool::WorkContext::system(crate::pool::WorkKind::Scheduled),
+            )
+            .await
+            .result
         }
     };
 

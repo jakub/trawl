@@ -11,6 +11,16 @@ use trawl_engine::error::EngineError;
 use crate::report_window::{MaterializeError, PlanError, WindowPolicyError};
 use crate::store::StoreError;
 
+/// The one reason a unit of pool work refused before it ever started
+/// (ADR-0024): the request's budget was gone, or its cancellation was
+/// latched, while the work was still queued behind capacity.
+///
+/// Fixed text, no interpolation: it is a capacity fact about the server,
+/// not a fact about the query, and it travels into the query tracker,
+/// the scheduler's run rows and the client response unchanged. A refusal
+/// here is 503, never the 504 an execution timeout earns — nothing ran.
+pub const CAPACITY_NOT_STARTED: &str = "server at capacity: the query was not started";
+
 /// Server errors, mapped to HTTP responses via [`IntoResponse`].
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError {
@@ -119,6 +129,12 @@ impl ServerError {
             Self::Forbidden(_) => "forbidden".to_owned(),
             Self::RateLimited => "rate limit exceeded".to_owned(),
             Self::TooManyStreams => "too many concurrent streams".to_owned(),
+            // [`CAPACITY_NOT_STARTED`] is a fixed server-capacity sentence
+            // with nothing to redact, and it is the whole answer a
+            // pre-start refusal gives: erasing it to "service unavailable"
+            // would leave the scheduler's run row and the query tracker
+            // unable to tell a capacity refusal from any other 503.
+            Self::ServiceUnavailable(msg) if msg == CAPACITY_NOT_STARTED => msg.clone(),
             Self::ServiceUnavailable(_) => "service unavailable".to_owned(),
             other => other.to_string(),
         }
@@ -472,6 +488,20 @@ mod tests {
             hint: None,
         }]));
         assert!(err.safe_message().contains("bad syntax"));
+    }
+
+    /// The pre-start capacity refusal is a fixed sentence about the
+    /// server, so it survives redaction and reaches the query tracker and
+    /// the run row intact. Every other 503 still generalizes: an auth or
+    /// store backend's own words are not for a client.
+    #[test]
+    fn safe_message_keeps_the_capacity_refusal_and_generalizes_the_rest() {
+        let refused = ServerError::ServiceUnavailable(CAPACITY_NOT_STARTED.to_owned());
+        assert_eq!(refused.safe_message(), CAPACITY_NOT_STARTED);
+        assert_eq!(refused.error_class(), "service_unavailable");
+
+        let backend = ServerError::ServiceUnavailable("pg://user:pw@host down".into());
+        assert_eq!(backend.safe_message(), "service unavailable");
     }
 
     #[test]

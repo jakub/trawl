@@ -11,22 +11,41 @@
 //!
 //! The semaphore limits concurrency, and each permit corresponds to exactly
 //! one pooled executor. Timed-out queries are interrupted via `DuckDB`'s
-//! interrupt handle; the executor is reclaimed asynchronously once the
-//! interrupted task completes.
+//! interrupt handle; the executor is reclaimed once the interrupted work
+//! actually stops, which is not when the request answered.
+//!
+//! # The request and the work it started are two lifetimes (ADR-0024)
+//!
+//! A request that times out, or whose caller walks away, stops waiting —
+//! it does not stop the `DuckDB` bind or scan its permit is paying for.
+//! Every resource that work holds (the permit, the publication guard, the
+//! executor and the interrupt registration) therefore belongs to
+//! [`WorkSlot`], which the request future hands to the blocking task and
+//! never owns again. Timeout, caller drop, a refusal before startup, a
+//! panic and ordinary completion all converge on that one `Drop`.
+//!
+//! Between the request's outcome and that cleanup the work is *retained*:
+//! it still occupies a permit that `pool_active` counts, and
+//! [`retained`](ExecutorPool::retained) is the subset an operator can see.
+//! One [`Registry`] mutex covers the interrupt slots, the retained entries
+//! and the idle executors together, because the invariant that matters is
+//! a cross-map one: an interrupt may only fire while the executor it was
+//! taken from is still out on the query it belongs to.
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Instant;
 
 use parking_lot::Mutex;
 use std::time::Duration;
 
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use trawl_engine::executor::Executor;
 use trawl_engine::value::QueryResult;
 
 use crate::deadline::Deadline;
-use crate::error::ServerError;
+use crate::error::{CAPACITY_NOT_STARTED, ServerError};
 use crate::hot_buffer::HotBuffer;
 use crate::source::compute_source;
 
@@ -38,8 +57,569 @@ use crate::source::compute_source;
 #[cfg(any(test, feature = "test-support"))]
 pub static TEST_QUERY_DELAY_MS: AtomicU64 = AtomicU64::new(0);
 
-/// Type-erased interrupt callback, keyed by monotonic query ID.
-type InterruptMap = HashMap<u64, Box<dyn Fn() + Send + Sync>>;
+/// Which door a unit of pool work came through.
+///
+/// Presentation and authorization metadata only: every kind takes the same
+/// permit, the same executor and the same cleanup. `Ping` and `Sample` are
+/// the helper lanes — they hold capacity like any query, so they are in
+/// the registry and in the retained count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkKind {
+    /// `POST /api/v1/query`.
+    Query,
+    /// A `| from saved` query, reading a recorded run's parquet.
+    FromSaved,
+    /// `POST /api/v1/export`, any format.
+    Export,
+    /// A scheduled report run.
+    Scheduled,
+    /// The health route's `SELECT 1` probe.
+    Ping,
+    /// Autocomplete's distinct-value sample.
+    Sample,
+}
+
+impl WorkKind {
+    /// The stable wire/log spelling.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Query => "query",
+            Self::FromSaved => "from_saved",
+            Self::Export => "export",
+            Self::Scheduled => "scheduled",
+            Self::Ping => "ping",
+            Self::Sample => "sample",
+        }
+    }
+}
+
+/// Whose authority a unit of work runs under.
+///
+/// The fleet keystore id, never a name: names are mutable and non-unique,
+/// and this is the anchor non-admin cancellation is authorized against.
+/// It stays inside the server — no route puts an owner id on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkOwner {
+    /// The key that submitted the request.
+    Key(i64),
+    /// The server itself: scheduled runs, health probes. No human owner,
+    /// admin-cancellable.
+    System,
+}
+
+/// The lifecycle identity of one unit of pool work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkContext {
+    pub kind: WorkKind,
+    pub owner: WorkOwner,
+}
+
+impl WorkContext {
+    /// Work submitted by an authenticated key, which retains that key's id.
+    #[must_use]
+    pub fn key(kind: WorkKind, key_id: i64) -> Self {
+        Self {
+            kind,
+            owner: WorkOwner::Key(key_id),
+        }
+    }
+
+    /// Work the server started for itself.
+    #[must_use]
+    pub fn system(kind: WorkKind) -> Self {
+        Self {
+            kind,
+            owner: WorkOwner::System,
+        }
+    }
+}
+
+/// One registered query's cancellation state.
+///
+/// The slot exists from registration — before the blocking task runs, let
+/// alone binds — so a cancellation arriving before the handle does is
+/// latched rather than lost, and the worker refuses to start on it.
+struct InterruptSlot {
+    /// `DuckDB`'s interrupt handle, once the worker published it.
+    handle: Option<Arc<duckdb::InterruptHandle>>,
+    /// Cancellation was requested. Never cleared: a repeat cancellation is
+    /// accepted while the work exists, and an acknowledgement means
+    /// requested, not stopped.
+    cancel_requested: bool,
+}
+
+/// The accounting half of a registered unit of work.
+struct RetainedEntry {
+    id: u64,
+    kind: WorkKind,
+    owner: WorkOwner,
+    /// The DSL, for the operator-facing retained listing. Filtered by
+    /// owner and permission at the route, never by presence here; helper
+    /// lanes carry no DSL at all.
+    display: Option<String>,
+    /// The worker passed its work-start transition. A held permit alone
+    /// does not prove this.
+    started_work: bool,
+    registered_at: Instant,
+    /// When the request recorded its outcome and left the work running.
+    /// `None` while a request is still waiting on it.
+    retained_since: Option<Instant>,
+}
+
+/// Everything the pool must decide atomically about work in flight.
+///
+/// One mutex, not three: the proof that a stale interrupt cannot hit a
+/// reused connection is that invocation and deregistration-plus-re-idle
+/// are the same critical section. Split the maps and that ordering
+/// becomes a hope. Critical sections here are map operations only — no
+/// awaits, no query execution.
+struct Registry {
+    interrupts: HashMap<u64, InterruptSlot>,
+    retained: HashMap<u64, RetainedEntry>,
+    idle: Vec<Executor>,
+}
+
+impl Registry {
+    /// Latch cancellation for one unit of work and interrupt it if it has
+    /// published a handle.
+    ///
+    /// The slot is deliberately kept: cancellation is a request, not a
+    /// stop, so a repeat cancellation must keep succeeding while the work
+    /// exists, and the worker still has to read the latch at its
+    /// work-start transition. Only [`WorkSlot::drop`] removes a slot, in
+    /// this same critical section — which is why an interrupt can never
+    /// reach the next query to take that executor.
+    fn request_cancel(&mut self, id: u64) -> bool {
+        let Some(slot) = self.interrupts.get_mut(&id) else {
+            return false;
+        };
+        slot.cancel_requested = true;
+        if let Some(handle) = &slot.handle {
+            handle.interrupt();
+        }
+        true
+    }
+
+    fn retained_count(&self) -> usize {
+        self.retained
+            .values()
+            .filter(|entry| entry.retained_since.is_some())
+            .count()
+    }
+}
+
+/// Why a worker refused to start its physical work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartRefusal {
+    /// The budget was gone before any work began.
+    Expired,
+    /// Cancellation was latched before any work began.
+    Cancelled,
+}
+
+impl StartRefusal {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Expired => "expired",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// A unit of retained physical work, as an operator sees it.
+///
+/// `owner` and `display` stay crate-internal: the route decides what a
+/// given reader may see of them.
+#[derive(Debug, Clone)]
+pub struct RetainedWork {
+    pub id: u64,
+    pub kind: WorkKind,
+    /// Whether the work passed its work-start transition.
+    pub started: bool,
+    /// How long the work has outlived its request.
+    pub retained: Duration,
+    /// Who the work belongs to, and the work's DSL. Both are carried here
+    /// and rendered nowhere yet: which reader may see either is the
+    /// retained-listing route's decision, and that route is the next slice
+    /// of this work. Cancellation authorization reads the registry
+    /// directly, through [`ExecutorPool::owner_of`].
+    #[allow(dead_code)]
+    pub(crate) owner: WorkOwner,
+    #[allow(dead_code)]
+    pub(crate) display: Option<String>,
+}
+
+/// Every resource one unit of physical work holds, released together.
+///
+/// Constructed before dispatch and moved into the blocking closure, so the
+/// request future cannot own the last reference: a timeout, a dropped
+/// caller, a refusal at startup, a panic and a clean finish all reach the
+/// same `Drop`.
+struct WorkSlot {
+    registry: Arc<Mutex<Registry>>,
+    id: u64,
+    kind: WorkKind,
+    /// Shared with the request future, written only inside the registry
+    /// lock. It outlives the registry entry, so a request that finds the
+    /// entry already gone still classifies its own outcome correctly.
+    started: Arc<AtomicBool>,
+    executor: Option<Executor>,
+    publication: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+impl WorkSlot {
+    /// The executor this work runs on. It never leaves the slot, so no
+    /// panic anywhere in the worker can lose it from the pool.
+    fn executor(&self) -> &Executor {
+        self.executor
+            .as_ref()
+            .expect("the executor leaves the slot only in Drop")
+    }
+
+    /// Hand `DuckDB`'s interrupt handle to the registry.
+    ///
+    /// Returns false when cancellation was already latched — the caller
+    /// asked for this work to stop before it could be interrupted, so the
+    /// worker must not start it. Publishing under the same lock the
+    /// latch is written in is what makes that answer final.
+    fn publish_interrupt(&self, handle: Arc<duckdb::InterruptHandle>) -> bool {
+        let mut registry = self.registry.lock();
+        match registry.interrupts.get_mut(&self.id) {
+            Some(slot) if !slot.cancel_requested => {
+                slot.handle = Some(handle);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The work-start transition: the moment a permit becomes physical
+    /// work (ADR-0024).
+    ///
+    /// Runs inside the blocking closure before source discovery or any
+    /// other physical work, and decides 503-vs-504 for the whole request:
+    /// a refusal here means nothing ran, so the answer is a capacity
+    /// refusal; past it an expiry is the ordinary query timeout. Both
+    /// halves are read and the flag is written in one critical section,
+    /// so the classification never depends on which side of a `select!`
+    /// was polled first.
+    ///
+    /// `deadline` is `None` for the helper lanes that have no budget of
+    /// their own yet (ping); they still refuse a latched cancellation.
+    fn begin_work(&self, deadline: Option<Deadline>) -> Result<(), StartRefusal> {
+        let mut registry = self.registry.lock();
+        if registry
+            .interrupts
+            .get(&self.id)
+            .is_some_and(|slot| slot.cancel_requested)
+        {
+            return Err(StartRefusal::Cancelled);
+        }
+        if deadline.is_some_and(Deadline::expired) {
+            return Err(StartRefusal::Expired);
+        }
+        if let Some(entry) = registry.retained.get_mut(&self.id) {
+            entry.started_work = true;
+        }
+        self.started.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+impl Drop for WorkSlot {
+    fn drop(&mut self) {
+        // (a) Stop being interruptible, return the executor, and stop
+        // being retained — one critical section, because an interrupt
+        // that fired here would land on the next query to take this
+        // executor.
+        let retained_for = {
+            let mut registry = self.registry.lock();
+            registry.interrupts.remove(&self.id);
+            let entry = registry.retained.remove(&self.id);
+            if let Some(executor) = self.executor.take() {
+                registry.idle.push(executor);
+            }
+            entry.and_then(|entry| entry.retained_since.map(|since| since.elapsed()))
+        };
+        // (b) then the publication guard, (c) then the permit: a
+        // compaction publisher or a cutover waiting on either must not
+        // observe capacity it cannot use.
+        drop(self.publication.take());
+        drop(self.permit.take());
+        // (d) Content-free: which work, what kind, how long it outlived
+        // its request. Only work that was actually retained logs — the
+        // pair with `query_permit_retained`.
+        if let Some(retained_for) = retained_for {
+            tracing::info!(
+                event_type = "query_permit_reclaimed",
+                query_id = self.id,
+                kind = self.kind.as_str(),
+                retained_ms = u64::try_from(retained_for.as_millis()).unwrap_or(u64::MAX),
+                "retained query permit reclaimed"
+            );
+        }
+    }
+}
+
+/// The request side of one unit of work, which may stop waiting before
+/// the work stops running.
+///
+/// Armed for as long as the request future is the one waiting. Dropping it
+/// while armed is a caller that walked away: the work is asked to stop and
+/// its permit is booked as retained, exactly as a timeout does, because
+/// nothing else will run on that path — the request future is already
+/// gone.
+struct RequestGuard<'a> {
+    pool: &'a ExecutorPool,
+    id: u64,
+    kind: WorkKind,
+    started: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl<'a> RequestGuard<'a> {
+    fn new(pool: &'a ExecutorPool, id: u64, kind: WorkKind, started: &Arc<AtomicBool>) -> Self {
+        Self {
+            pool,
+            id,
+            kind,
+            started: Arc::clone(started),
+            armed: true,
+        }
+    }
+
+    /// The work finished first: there is nothing to retain.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    /// Stop waiting on purpose. Returns whether the work had started,
+    /// which is the caller's 503-vs-504 classification.
+    fn abandon(&mut self) -> bool {
+        self.armed = false;
+        self.pool.cancel_by_id(self.id);
+        self.pool.mark_request_finished(self.id, &self.started)
+    }
+}
+
+impl Drop for RequestGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        tracing::info!(
+            event_type = "query_request_abandoned",
+            query_id = self.id,
+            kind = self.kind.as_str(),
+            "the caller stopped waiting; its work keeps its permit until cleanup"
+        );
+        self.pool.cancel_by_id(self.id);
+        self.pool.mark_request_finished(self.id, &self.started);
+    }
+}
+
+/// The one answer a request gets for work that never started (ADR-0024).
+///
+/// A capacity refusal, not a timeout: nothing ran, so 503 rather than 504,
+/// and no timeout history row. The client-facing text is fixed and says
+/// nothing about the query — whether the budget ran out or a cancellation
+/// beat the start is an operator fact, and it goes to the log.
+fn capacity_refusal(id: u64, kind: WorkKind, refusal: StartRefusal) -> ServerError {
+    tracing::info!(
+        event_type = "query_not_started",
+        query_id = id,
+        kind = kind.as_str(),
+        reason = refusal.as_str(),
+        "query work refused before it started"
+    );
+    ServerError::ServiceUnavailable(CAPACITY_NOT_STARTED.to_owned())
+}
+
+fn refused_outcome(id: u64, kind: WorkKind, refusal: StartRefusal) -> ExecuteOutcome {
+    ExecuteOutcome {
+        result: Err(capacity_refusal(id, kind, refusal)),
+        debug: None,
+        severity_columns: Vec::new(),
+    }
+}
+
+/// Deterministic control over the blocking worker, for tests only.
+///
+/// The lifecycle races this module has to get right — a request expiring
+/// exactly as its work starts, a cancellation arriving before the interrupt
+/// handle exists, a completion landing on the same instant as a timeout —
+/// are all orderings between an async task and a blocking thread. Proving
+/// one with a sleep proves it on one machine on one day. These gates let a
+/// test park the worker at a named point, observe that it arrived, and
+/// release it, so the ordering is stated rather than raced for.
+///
+/// Compiled for this crate's unit tests and, via the `test-support`
+/// feature, its integration tests. No production consumer enables it.
+#[cfg(any(test, feature = "test-support"))]
+pub mod seam {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Condvar, LazyLock, Mutex as StdMutex};
+
+    /// A point in the blocking worker a test can hold or fail.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum Seam {
+        /// First statement of the worker, before the interrupt handle is
+        /// published and before the work-start transition.
+        Entry,
+        /// Immediately after a successful work-start transition, before
+        /// source discovery.
+        Started,
+        /// After the work produced its answer, before cleanup.
+        Finished,
+    }
+
+    /// A held (or merely watched) worker seam.
+    #[derive(Debug)]
+    pub struct Gate {
+        open: StdMutex<bool>,
+        opened: Condvar,
+        arrivals: AtomicUsize,
+        panics: bool,
+    }
+
+    impl Gate {
+        /// How many workers have reached this seam.
+        #[must_use]
+        pub fn arrivals(&self) -> usize {
+            self.arrivals.load(Ordering::SeqCst)
+        }
+
+        /// Let every parked worker through, and every later one straight
+        /// past.
+        pub fn release(&self) {
+            *self.open.lock().expect("seam gate poisoned") = true;
+            self.opened.notify_all();
+        }
+
+        fn pass(&self) {
+            self.arrivals.fetch_add(1, Ordering::SeqCst);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            let mut open = self.open.lock().expect("seam gate poisoned");
+            while !*open {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                assert!(!left.is_zero(), "a worker sat at a seam nobody released");
+                open = self
+                    .opened
+                    .wait_timeout(open, left)
+                    .expect("seam gate poisoned")
+                    .0;
+            }
+            drop(open);
+            assert!(!self.panics, "test-injected panic at a worker seam");
+        }
+    }
+
+    type Gates = HashMap<Seam, Arc<Gate>>;
+    static GATES: LazyLock<StdMutex<Gates>> = LazyLock::new(|| StdMutex::new(HashMap::new()));
+    /// Seam state is process-global, so seam tests take turns. Async
+    /// because the guard is held across the test's awaits.
+    static TURN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Exclusive use of the seams for one test, cleared on drop.
+    #[derive(Debug)]
+    pub struct Session(#[allow(dead_code)] tokio::sync::MutexGuard<'static, ()>);
+
+    impl Drop for Session {
+        fn drop(&mut self) {
+            // Release before clearing, so a test that fails while a worker
+            // is parked still lets that worker out: the runtime's own drop
+            // waits for blocking tasks, and a gate nobody opens would turn
+            // a failed assertion into a hung test process.
+            let gates = std::mem::take(&mut *GATES.lock().expect("seam table poisoned"));
+            for gate in gates.values() {
+                gate.release();
+            }
+        }
+    }
+
+    /// Take the seams for this test.
+    pub async fn session() -> Session {
+        let turn = TURN.lock().await;
+        GATES.lock().expect("seam table poisoned").clear();
+        Session(turn)
+    }
+
+    fn install(seam: Seam, gate: Gate) -> Arc<Gate> {
+        let gate = Arc::new(gate);
+        GATES
+            .lock()
+            .expect("seam table poisoned")
+            .insert(seam, Arc::clone(&gate));
+        gate
+    }
+
+    /// Park every worker that reaches `seam` until the gate is released.
+    #[must_use]
+    pub fn hold(seam: Seam) -> Arc<Gate> {
+        install(
+            seam,
+            Gate {
+                open: StdMutex::new(false),
+                opened: Condvar::new(),
+                arrivals: AtomicUsize::new(0),
+                panics: false,
+            },
+        )
+    }
+
+    /// Count arrivals at `seam` without holding anything.
+    #[must_use]
+    pub fn watch(seam: Seam) -> Arc<Gate> {
+        install(
+            seam,
+            Gate {
+                open: StdMutex::new(true),
+                opened: Condvar::new(),
+                arrivals: AtomicUsize::new(0),
+                panics: false,
+            },
+        )
+    }
+
+    /// Panic the worker when it reaches `seam`.
+    #[must_use]
+    pub fn panic_at(seam: Seam) -> Arc<Gate> {
+        install(
+            seam,
+            Gate {
+                open: StdMutex::new(true),
+                opened: Condvar::new(),
+                arrivals: AtomicUsize::new(0),
+                panics: true,
+            },
+        )
+    }
+
+    /// The worker's side: free unless a test installed something.
+    pub(crate) fn reach(seam: Seam) {
+        let gate = GATES
+            .lock()
+            .expect("seam table poisoned")
+            .get(&seam)
+            .map(Arc::clone);
+        if let Some(gate) = gate {
+            gate.pass();
+        }
+    }
+}
+
+/// The worker's seam call, compiled away entirely in a release build.
+macro_rules! worker_seam {
+    ($seam:ident) => {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            crate::pool::seam::reach(crate::pool::seam::Seam::$seam);
+        }
+    };
+}
 
 /// Debug info captured from the pool's blocking execution path.
 ///
@@ -150,15 +730,9 @@ pub struct ExecutorPool {
     max_result_rows: usize,
     /// Monotonic ID counter for tracking active query handles.
     next_id: Arc<AtomicU64>,
-    /// Interrupt callbacks for currently executing queries, keyed by ID
-    /// for precise removal on completion. Type-erased to avoid coupling
-    /// to duckdb outside trawl-engine.
-    active_interrupts: Arc<Mutex<InterruptMap>>,
-    /// Pre-created executors sharing the same `DuckDB` database.
-    /// The semaphore guarantees an executor is available when a permit
-    /// is acquired, so `pop()` only fails after a task panic (which is
-    /// handled by creating a replacement).
-    idle: Arc<Mutex<Vec<Executor>>>,
+    /// Interrupt slots, retained-work accounting and the idle executors,
+    /// under one lock (see [`Registry`]).
+    registry: Arc<Mutex<Registry>>,
     /// Hot buffer for fresh events not yet compacted to parquet.
     hot_buffer: Option<Arc<HotBuffer>>,
     /// Field catalog whose full pin snapshot types every query's
@@ -169,8 +743,14 @@ pub struct ExecutorPool {
 
 impl std::fmt::Debug for ExecutorPool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let active = self.active_interrupts.lock().len();
-        let idle = self.idle.lock().len();
+        let (active, retained, idle) = {
+            let registry = self.registry.lock();
+            (
+                registry.interrupts.len(),
+                registry.retained_count(),
+                registry.idle.len(),
+            )
+        };
         f.debug_struct("ExecutorPool")
             .field("base_dir", &self.base_dir)
             .field("fallback_glob", &self.fallback_glob)
@@ -178,6 +758,7 @@ impl std::fmt::Debug for ExecutorPool {
             .field("max_result_rows", &self.max_result_rows)
             .field("next_id", &self.next_id)
             .field("active_queries", &active)
+            .field("retained_queries", &retained)
             .field("idle_executors", &idle)
             .finish_non_exhaustive()
     }
@@ -185,11 +766,14 @@ impl std::fmt::Debug for ExecutorPool {
 
 /// Run a query with panic recovery and optional hot buffer union.
 ///
-/// Returns the executor (for pool return) and the query result.
+/// The executor is borrowed from the caller's [`WorkSlot`] and never
+/// moves: the slot owns it through every exit, so no panic on this thread
+/// can shrink the pool.
+///
 /// Called inside `spawn_blocking` — all I/O here is synchronous.
 #[allow(clippy::too_many_arguments)]
 fn run_query_blocking(
-    executor: Executor,
+    executor: &Executor,
     dsl: &str,
     source: &str,
     hot_buffer: Option<&Arc<HotBuffer>>,
@@ -198,11 +782,7 @@ fn run_query_blocking(
     utc_offset_secs: i32,
     capture_debug: bool,
     pool_wait_ms: u64,
-) -> (
-    Executor,
-    Result<QueryResult, ServerError>,
-    Option<PoolDebugInfo>,
-) {
+) -> (Result<QueryResult, ServerError>, Option<PoolDebugInfo>) {
     // Snapshot hot buffer to a temp ndjson file so fresh events
     // are visible to this query via UNION ALL BY NAME. Returns a
     // cached file when the buffer hasn't changed since the last snapshot;
@@ -261,19 +841,26 @@ fn run_query_blocking(
     // hot_snapshot drops here → temp file auto-deleted
     let result = match result {
         Ok(r) => r,
-        Err(payload) => {
-            let msg = match payload.downcast_ref::<&str>() {
-                Some(s) => (*s).to_owned(),
-                None => match payload.downcast_ref::<String>() {
-                    Some(s) => s.clone(),
-                    None => "unknown panic".to_owned(),
-                },
-            };
-            Err(ServerError::Internal(format!("query panicked: {msg}")))
-        }
+        Err(payload) => Err(ServerError::Internal(format!(
+            "query panicked: {}",
+            panic_text(payload.as_ref())
+        ))),
     };
 
-    (executor, result, debug)
+    (result, debug)
+}
+
+/// The message a caught panic carried, for an internal-error string.
+fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+    payload.downcast_ref::<&str>().map_or_else(
+        || {
+            payload
+                .downcast_ref::<String>()
+                .cloned()
+                .unwrap_or_else(|| "unknown panic".to_owned())
+        },
+        |s| (*s).to_owned(),
+    )
 }
 
 /// Capture debug info about source selection, hot buffer state, and SQL generation.
@@ -408,8 +995,11 @@ impl ExecutorPool {
             max_concurrent,
             max_result_rows,
             next_id: Arc::new(AtomicU64::new(0)),
-            active_interrupts: Arc::new(Mutex::new(HashMap::new())),
-            idle: Arc::new(Mutex::new(executors)),
+            registry: Arc::new(Mutex::new(Registry {
+                interrupts: HashMap::new(),
+                retained: HashMap::new(),
+                idle: executors,
+            })),
             hot_buffer,
             field_catalog: Arc::new(crate::catalog::FieldCatalog::new()),
         }
@@ -424,25 +1014,146 @@ impl ExecutorPool {
         self
     }
 
-    /// Take an executor from the pool.
+    /// Register one unit of physical work and give it everything it holds.
     ///
-    /// The semaphore guarantees availability. If the pool is unexpectedly
-    /// empty (e.g. after a task panic lost an executor), creates a fresh
-    /// replacement that won't share the cached database.
-    fn take_executor(&self) -> Executor {
-        let mut pool = self.idle.lock();
-        pool.pop().unwrap_or_else(|| {
-            tracing::warn!(
-                event_type = "pool_pressure",
-                "executor pool unexpectedly empty, creating replacement"
+    /// The permit is already in hand, so an executor is guaranteed: every
+    /// executor is either idle or inside a [`WorkSlot`] whose `Drop`
+    /// returns it before releasing its permit, and that `Drop` runs on
+    /// completion, timeout, caller drop, refusal and panic alike. An empty
+    /// pool here is therefore a broken invariant, not pressure — this
+    /// deliberately does not mint a replacement connection, which would
+    /// silently enlarge the pool past `max_concurrent` and hand the
+    /// cutover's `exclusive()` a false exclusivity.
+    ///
+    /// `display` is the work's DSL, kept for the operator-facing retained
+    /// listing; the helper lanes have none.
+    fn begin_slot(
+        &self,
+        id: u64,
+        work: WorkContext,
+        display: Option<&str>,
+        permit: OwnedSemaphorePermit,
+        publication: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+    ) -> Result<WorkSlot, ServerError> {
+        let mut registry = self.registry.lock();
+        let Some(executor) = registry.idle.pop() else {
+            drop(registry);
+            tracing::error!(
+                event_type = "pool_invariant",
+                query_id = id,
+                kind = work.kind.as_str(),
+                "a permit was granted with no idle executor behind it"
             );
-            Executor::new().expect("failed to create replacement DuckDB connection")
+            return Err(ServerError::Internal("executor pool inconsistent".into()));
+        };
+        registry.interrupts.insert(
+            id,
+            InterruptSlot {
+                handle: None,
+                cancel_requested: false,
+            },
+        );
+        registry.retained.insert(
+            id,
+            RetainedEntry {
+                id,
+                kind: work.kind,
+                owner: work.owner,
+                display: display.map(ToOwned::to_owned),
+                started_work: false,
+                registered_at: Instant::now(),
+                retained_since: None,
+            },
+        );
+        drop(registry);
+        Ok(WorkSlot {
+            registry: Arc::clone(&self.registry),
+            id,
+            kind: work.kind,
+            started: Arc::new(AtomicBool::new(false)),
+            executor: Some(executor),
+            publication,
+            permit: Some(permit),
         })
     }
 
-    /// Return an executor to the pool for reuse.
-    fn return_executor(&self, executor: Executor) {
-        self.idle.lock().push(executor);
+    /// The request stopped waiting while its work may still be running.
+    ///
+    /// Stamps the moment the permit became *retained* — held by work no
+    /// request is waiting on any more — and answers whether that work had
+    /// started, which is the request's 503-vs-504 classification. Reading
+    /// the flag the work-start transition wrote is what keeps that answer
+    /// out of the hands of `select!`'s polling order.
+    fn mark_request_finished(&self, id: u64, started: &AtomicBool) -> bool {
+        let entry = {
+            let mut registry = self.registry.lock();
+            match registry.retained.get_mut(&id) {
+                Some(entry) if entry.retained_since.is_none() => {
+                    entry.retained_since = Some(Instant::now());
+                    Some((
+                        entry.kind,
+                        entry.started_work,
+                        entry.registered_at.elapsed(),
+                    ))
+                }
+                _ => None,
+            }
+        };
+        if let Some((kind, started_work, held_for)) = entry {
+            tracing::info!(
+                event_type = "query_permit_retained",
+                query_id = id,
+                kind = kind.as_str(),
+                started = started_work,
+                held_ms = u64::try_from(held_for.as_millis()).unwrap_or(u64::MAX),
+                "query permit retained past its request"
+            );
+        }
+        started.load(Ordering::SeqCst)
+    }
+
+    /// Whose work this is, while it is registered.
+    ///
+    /// The query tracker forgets a query the moment its request records an
+    /// outcome, but the physical work can outlive that (ADR-0024). This
+    /// record lasts until cleanup, so the key that submitted a query it
+    /// has already been told timed out can still ask for it to stop.
+    /// `None` once cleanup ran, or for an id that never existed — callers
+    /// read that as "not yours".
+    pub(crate) fn owner_of(&self, id: u64) -> Option<WorkOwner> {
+        self.registry
+            .lock()
+            .retained
+            .get(&id)
+            .map(|entry| entry.owner)
+    }
+
+    /// How many permits are held by work no request is waiting on.
+    #[must_use]
+    pub fn retained(&self) -> usize {
+        self.registry.lock().retained_count()
+    }
+
+    /// The retained work an operator can be shown, newest state as of now.
+    #[must_use]
+    pub fn retained_work(&self) -> Vec<RetainedWork> {
+        let now = Instant::now();
+        let registry = self.registry.lock();
+        registry
+            .retained
+            .values()
+            .filter_map(|entry| {
+                let since = entry.retained_since?;
+                Some(RetainedWork {
+                    id: entry.id,
+                    kind: entry.kind,
+                    started: entry.started_work,
+                    retained: now.saturating_duration_since(since),
+                    owner: entry.owner,
+                    display: entry.display.clone(),
+                })
+            })
+            .collect()
     }
 
     /// Allocate a query id from the pool's counter.
@@ -459,15 +1170,21 @@ impl ExecutorPool {
     /// Execute a DSL query, blocking on semaphore acquisition if at capacity.
     ///
     /// `query_id` must come from [`allocate_query_id`](Self::allocate_query_id);
-    /// it keys the interrupt handle for [`cancel_by_id`](Self::cancel_by_id).
+    /// it keys the interrupt slot [`cancel_by_id`](Self::cancel_by_id) latches
+    /// and the lifecycle entry [`retained_work`](Self::retained_work) lists.
     ///
     /// `deadline` is the caller's whole budget, stamped once at handler
     /// entry (ADR-0024). Every wait this lane performs — the queue, the
     /// publication gate, execution itself — spends from that one instant,
     /// so a query that queued for most of it does not then get a full
-    /// timeout to run in. Past it the `DuckDB` connection is interrupted
-    /// and the query is aborted; the executor is reclaimed asynchronously
-    /// once the interrupted task completes.
+    /// timeout to run in.
+    ///
+    /// Past the deadline the request answers and stops waiting; the work
+    /// does not stop with it. It is interrupted, and it keeps its permit,
+    /// its publication guard and its executor until it actually ends —
+    /// [`retained`](Self::retained) counts it meanwhile. Whether the answer
+    /// is a 504 timeout or a 503 capacity refusal is decided by the
+    /// worker's own work-start transition, not by this future.
     ///
     /// When `capture_debug` is true, captures source selection, hot buffer
     /// state, and generated SQL for the query debug log.
@@ -481,6 +1198,7 @@ impl ExecutorPool {
         deadline: Deadline,
         capture_debug: bool,
         utc_offset_secs: i32,
+        work: WorkContext,
     ) -> ExecuteOutcome {
         let available = self.semaphore.available_permits();
         if available == 0 {
@@ -507,11 +1225,7 @@ impl ExecutorPool {
                 };
             }
             Err(crate::deadline::Expired) => {
-                return ExecuteOutcome {
-                    result: Err(ServerError::Timeout),
-                    debug: None,
-                    severity_columns: Vec::new(),
-                };
+                return refused_outcome(query_id, work.kind, StartRefusal::Expired);
             }
         };
 
@@ -535,14 +1249,24 @@ impl ExecutorPool {
                 };
             }
             Err(crate::deadline::Expired) => {
+                return refused_outcome(query_id, work.kind, StartRefusal::Expired);
+            }
+        };
+
+        // Everything this work holds, in one guard, moved into the
+        // blocking task below: from here on the request future cannot be
+        // the thing that releases a permit or returns an executor.
+        let slot = match self.begin_slot(query_id, work, Some(dsl), permit, Some(publication)) {
+            Ok(slot) => slot,
+            Err(error) => {
                 return ExecuteOutcome {
-                    result: Err(ServerError::Timeout),
+                    result: Err(error),
                     debug: None,
                     severity_columns: Vec::new(),
                 };
             }
         };
-        let executor = self.take_executor();
+        let started = Arc::clone(&slot.started);
 
         let dsl = dsl.to_owned();
         let base_dir = Arc::clone(&self.base_dir);
@@ -550,87 +1274,99 @@ impl ExecutorPool {
         let hot_buffer = self.hot_buffer.clone();
         let field_catalog = Arc::clone(&self.field_catalog);
 
-        // Channel for the blocking task to send back its interrupt handle
-        // before starting the actual query.
-        let (interrupt_tx, interrupt_rx) = tokio::sync::oneshot::channel();
-
         let mut task = tokio::task::spawn_blocking(move || {
-            let _permit = permit; // hold permit until this task completes
-            let _publication = publication; // timeout must not release a running reader
-            // Send interrupt handle to async side before running the query.
-            let _ = interrupt_tx.send(executor.interrupt_handle());
-
-            // Test-only: sleep before the query so timeout/cancellation tests
-            // can reliably win the race against spawn_blocking.
-            #[cfg(any(test, feature = "test-support"))]
-            {
-                let delay = TEST_QUERY_DELAY_MS.load(Ordering::Relaxed);
-                if delay > 0 {
-                    std::thread::sleep(std::time::Duration::from_millis(delay));
+            // Wider than `run_query_blocking`'s own catch: source
+            // discovery, the catalog snapshot and the presentation walk
+            // are all physical work on this thread, and a panic in any of
+            // them must still reach the slot's cleanup below.
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                worker_seam!(Entry);
+                // Interrupt registration first, so a cancellation arriving
+                // during the bind has something to reach. A refusal here
+                // means the caller already asked for this work to stop.
+                if !slot.publish_interrupt(slot.executor().interrupt_handle()) {
+                    return refused_outcome(query_id, work.kind, StartRefusal::Cancelled);
                 }
-            }
+                if let Err(refusal) = slot.begin_work(Some(deadline)) {
+                    return refused_outcome(query_id, work.kind, refusal);
+                }
+                worker_seam!(Started);
 
-            let source = compute_source(&base_dir, &dsl);
-            let file_globs: usize = if source.starts_with('[') {
-                source.matches(',').count() + 1
-            } else {
-                1
-            };
-            tracing::debug!(
-                event_type = "query_source",
-                file_globs,
-                source = %source,
-                "computed query source"
-            );
+                // Test-only: sleep before the query so timeout/cancellation tests
+                // can reliably win the race against spawn_blocking.
+                #[cfg(any(test, feature = "test-support"))]
+                {
+                    let delay = TEST_QUERY_DELAY_MS.load(Ordering::Relaxed);
+                    if delay > 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(delay));
+                    }
+                }
 
-            // One catalog snapshot per query: every retry inside the
-            // executor sees the same comparison pins, and the presentation
-            // metadata computed beside the rows is rooted in that same
-            // snapshot.
-            let pins = field_catalog.all();
-            let (executor, result, debug) = run_query_blocking(
-                executor,
-                &dsl,
-                &source,
-                hot_buffer.as_ref(),
-                &pins,
-                max_result_rows,
-                utc_offset_secs,
-                capture_debug,
-                pool_wait_ms,
-            );
-            // Inside the permit, on the blocking pool: the walk compiles a
-            // regex per `extract` stage, so it may not run on a reactor
-            // thread (see `severity_columns_for`).
-            let severity_columns = if result.is_ok() {
-                severity_columns_for(&pins, &dsl)
-            } else {
-                Vec::new()
-            };
-            (executor, result, debug, severity_columns)
+                let source = compute_source(&base_dir, &dsl);
+                let file_globs: usize = if source.starts_with('[') {
+                    source.matches(',').count() + 1
+                } else {
+                    1
+                };
+                tracing::debug!(
+                    event_type = "query_source",
+                    file_globs,
+                    source = %source,
+                    "computed query source"
+                );
+
+                // One catalog snapshot per query: every retry inside the
+                // executor sees the same comparison pins, and the presentation
+                // metadata computed beside the rows is rooted in that same
+                // snapshot.
+                let pins = field_catalog.all();
+                let (result, debug) = run_query_blocking(
+                    slot.executor(),
+                    &dsl,
+                    &source,
+                    hot_buffer.as_ref(),
+                    &pins,
+                    max_result_rows,
+                    utc_offset_secs,
+                    capture_debug,
+                    pool_wait_ms,
+                );
+                // Inside the permit, on the blocking pool: the walk compiles a
+                // regex per `extract` stage, so it may not run on a reactor
+                // thread (see `severity_columns_for`).
+                let severity_columns = if result.is_ok() {
+                    severity_columns_for(&pins, &dsl)
+                } else {
+                    Vec::new()
+                };
+                worker_seam!(Finished);
+                ExecuteOutcome {
+                    result,
+                    debug,
+                    severity_columns,
+                }
+            }));
+            outcome.unwrap_or_else(|payload| ExecuteOutcome {
+                result: Err(ServerError::Internal(format!(
+                    "query worker panicked: {}",
+                    panic_text(payload.as_ref())
+                ))),
+                debug: None,
+                severity_columns: Vec::new(),
+            })
+            // `slot` drops here, on this thread: interrupt deregistered,
+            // executor re-idled, publication and permit released.
         });
 
-        // Receive interrupt handle (may fail if the task panics before sending).
-        let interrupt = interrupt_rx.await.ok();
-
-        // Register the interrupt handle for shutdown/API cancellation.
-        if let Some(ref handle) = interrupt {
-            let h = Arc::clone(handle);
-            self.active_interrupts
-                .lock()
-                .insert(query_id, Box::new(move || h.interrupt()));
-        }
-
-        // Use select! so the JoinHandle remains available for async
-        // executor reclamation if the timeout branch wins.
-        let outcome = tokio::select! {
-            // Query completed within timeout — return executor to pool.
+        // A caller that walks away (client gone, task aborted) is not a
+        // reason to abandon the work: the guard latches cancellation and
+        // records the retention on the way out.
+        let mut request = RequestGuard::new(self, query_id, work.kind, &started);
+        tokio::select! {
             join_result = &mut task => {
+                request.disarm();
                 match join_result {
-                    Ok((executor, result, debug, severity_columns)) => {
-                        self.return_executor(executor);
-                        ExecuteOutcome { result, debug, severity_columns }
-                    }
+                    Ok(outcome) => outcome,
                     Err(e) => ExecuteOutcome {
                         result: Err(ServerError::Internal(format!("query task panicked: {e}"))),
                         debug: None,
@@ -638,35 +1374,19 @@ impl ExecutorPool {
                     },
                 }
             }
-            // Timeout elapsed — interrupt the DuckDB query and reclaim
-            // the executor asynchronously once the interrupt completes.
+            // The budget is gone. Interrupt, hand the work over to its own
+            // cleanup, and answer with what the work-start transition
+            // recorded: a timeout if it ran, a capacity refusal if the
+            // permit never became work.
             () = tokio::time::sleep_until(deadline.instant()) => {
-                if let Some(handle) = &interrupt {
-                    handle.interrupt();
-                }
-                let idle = Arc::clone(&self.idle);
-                tokio::spawn(async move {
-                    match task.await {
-                        Ok((executor, ..)) => {
-                            idle.lock().push(executor);
-                        }
-                        Err(e) => {
-                            tracing::warn!(event_type = "task_panic", error = %e, "timed-out query task panicked");
-                        }
-                    }
-                });
-                ExecuteOutcome {
-                    result: Err(ServerError::Timeout),
-                    debug: None,
-                    severity_columns: Vec::new(),
-                }
+                let result = if request.abandon() {
+                    Err(ServerError::Timeout)
+                } else {
+                    Err(capacity_refusal(query_id, work.kind, StartRefusal::Expired))
+                };
+                ExecuteOutcome { result, debug: None, severity_columns: Vec::new() }
             }
-        };
-
-        // Deregister this query's interrupt handle.
-        self.active_interrupts.lock().remove(&query_id);
-
-        outcome
+        }
     }
 
     /// Execute a DSL query with a pre-computed source, skipping glob computation.
@@ -677,7 +1397,7 @@ impl ExecutorPool {
     /// expression pointing at scheduled result files, not the normal data dir.
     /// The hot buffer is intentionally skipped — saved query results are
     /// self-contained parquet files.
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     pub async fn execute_with_source(
         &self,
         query_id: u64,
@@ -686,6 +1406,7 @@ impl ExecutorPool {
         deadline: Deadline,
         capture_debug: bool,
         utc_offset_secs: i32,
+        work: WorkContext,
     ) -> ExecuteOutcome {
         let available = self.semaphore.available_permits();
         if available == 0 {
@@ -711,11 +1432,7 @@ impl ExecutorPool {
                 };
             }
             Err(crate::deadline::Expired) => {
-                return ExecuteOutcome {
-                    result: Err(ServerError::Timeout),
-                    debug: None,
-                    severity_columns: Vec::new(),
-                };
+                return refused_outcome(query_id, work.kind, StartRefusal::Expired);
             }
         };
 
@@ -729,75 +1446,94 @@ impl ExecutorPool {
             "semaphore permit acquired (from saved)"
         );
 
-        let executor = self.take_executor();
+        let slot = match self.begin_slot(query_id, work, Some(dsl), permit, None) {
+            Ok(slot) => slot,
+            Err(error) => {
+                return ExecuteOutcome {
+                    result: Err(error),
+                    debug: None,
+                    severity_columns: Vec::new(),
+                };
+            }
+        };
+        let started = Arc::clone(&slot.started);
 
         let dsl = dsl.to_owned();
         let source = source.to_owned();
         let max_result_rows = self.max_result_rows;
         let field_catalog = Arc::clone(&self.field_catalog);
 
-        let (interrupt_tx, interrupt_rx) = tokio::sync::oneshot::channel();
-
         let mut task = tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            let _ = interrupt_tx.send(executor.interrupt_handle());
-
-            #[cfg(any(test, feature = "test-support"))]
-            {
-                let delay = TEST_QUERY_DELAY_MS.load(Ordering::Relaxed);
-                if delay > 0 {
-                    std::thread::sleep(std::time::Duration::from_millis(delay));
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                worker_seam!(Entry);
+                if !slot.publish_interrupt(slot.executor().interrupt_handle()) {
+                    return refused_outcome(query_id, work.kind, StartRefusal::Cancelled);
                 }
-            }
+                if let Err(refusal) = slot.begin_work(Some(deadline)) {
+                    return refused_outcome(query_id, work.kind, refusal);
+                }
+                worker_seam!(Started);
 
-            tracing::debug!(
-                event_type = "query_source",
-                source = %source,
-                "using pre-computed source (from saved)"
-            );
+                #[cfg(any(test, feature = "test-support"))]
+                {
+                    let delay = TEST_QUERY_DELAY_MS.load(Ordering::Relaxed);
+                    if delay > 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(delay));
+                    }
+                }
 
-            // No hot buffer — saved query results are self-contained.
-            let pins = field_catalog.all();
-            let (executor, result, debug) = run_query_blocking(
-                executor,
-                &dsl,
-                &source,
-                None,
-                &pins,
-                max_result_rows,
-                utc_offset_secs,
-                capture_debug,
-                pool_wait_ms,
-            );
-            // `dsl` here is what follows `| from saved`, whose `PinScope`
-            // rule clears the scope, so the presentation walk roots in an
-            // empty catalog: a saved run's stored columns are not typed by
-            // what this corpus happens to pin now. The comparison pins above
-            // are a separate question and keep the live snapshot.
-            let severity_columns = if result.is_ok() {
-                severity_columns_for(&trawl_core::schema::FieldTypes::new(), &dsl)
-            } else {
-                Vec::new()
-            };
-            (executor, result, debug, severity_columns)
+                tracing::debug!(
+                    event_type = "query_source",
+                    source = %source,
+                    "using pre-computed source (from saved)"
+                );
+
+                // No hot buffer — saved query results are self-contained.
+                let pins = field_catalog.all();
+                let (result, debug) = run_query_blocking(
+                    slot.executor(),
+                    &dsl,
+                    &source,
+                    None,
+                    &pins,
+                    max_result_rows,
+                    utc_offset_secs,
+                    capture_debug,
+                    pool_wait_ms,
+                );
+                // `dsl` here is what follows `| from saved`, whose `PinScope`
+                // rule clears the scope, so the presentation walk roots in an
+                // empty catalog: a saved run's stored columns are not typed by
+                // what this corpus happens to pin now. The comparison pins above
+                // are a separate question and keep the live snapshot.
+                let severity_columns = if result.is_ok() {
+                    severity_columns_for(&trawl_core::schema::FieldTypes::new(), &dsl)
+                } else {
+                    Vec::new()
+                };
+                worker_seam!(Finished);
+                ExecuteOutcome {
+                    result,
+                    debug,
+                    severity_columns,
+                }
+            }));
+            outcome.unwrap_or_else(|payload| ExecuteOutcome {
+                result: Err(ServerError::Internal(format!(
+                    "query worker panicked: {}",
+                    panic_text(payload.as_ref())
+                ))),
+                debug: None,
+                severity_columns: Vec::new(),
+            })
         });
 
-        let interrupt = interrupt_rx.await.ok();
-
-        if let Some(ref handle) = interrupt {
-            let h = Arc::clone(handle);
-            self.active_interrupts
-                .lock()
-                .insert(query_id, Box::new(move || h.interrupt()));
-        }
-
-        let outcome = tokio::select! {
+        let mut request = RequestGuard::new(self, query_id, work.kind, &started);
+        tokio::select! {
             join_result = &mut task => {
+                request.disarm();
                 match join_result {
-                    Ok((executor, result, debug, severity_columns)) => {
-                        self.return_executor(executor);
-                        ExecuteOutcome { result, debug, severity_columns }
-                    }
+                    Ok(outcome) => outcome,
                     Err(e) => ExecuteOutcome {
                         result: Err(ServerError::Internal(format!("query task panicked: {e}"))),
                         debug: None,
@@ -806,31 +1542,14 @@ impl ExecutorPool {
                 }
             }
             () = tokio::time::sleep_until(deadline.instant()) => {
-                if let Some(handle) = &interrupt {
-                    handle.interrupt();
-                }
-                let idle = Arc::clone(&self.idle);
-                tokio::spawn(async move {
-                    match task.await {
-                        Ok((executor, ..)) => {
-                            idle.lock().push(executor);
-                        }
-                        Err(e) => {
-                            tracing::warn!(event_type = "task_panic", error = %e, "timed-out from-saved query task panicked");
-                        }
-                    }
-                });
-                ExecuteOutcome {
-                    result: Err(ServerError::Timeout),
-                    debug: None,
-                    severity_columns: Vec::new(),
-                }
+                let result = if request.abandon() {
+                    Err(ServerError::Timeout)
+                } else {
+                    Err(capacity_refusal(query_id, work.kind, StartRefusal::Expired))
+                };
+                ExecuteOutcome { result, debug: None, severity_columns: Vec::new() }
             }
-        };
-
-        self.active_interrupts.lock().remove(&query_id);
-
-        outcome
+        }
     }
 
     /// Acquire every permit: the repin cutover's exclusion primitive.
@@ -862,14 +1581,14 @@ impl ExecutorPool {
     /// Interrupt all currently executing queries. Called during shutdown
     /// to cancel in-flight `DuckDB` operations before draining connections.
     pub fn cancel_all(&self) {
-        let handles = {
-            let mut guard = self.active_interrupts.lock();
-            std::mem::take(&mut *guard)
+        let count = {
+            let mut registry = self.registry.lock();
+            let ids: Vec<u64> = registry.interrupts.keys().copied().collect();
+            for id in &ids {
+                registry.request_cancel(*id);
+            }
+            ids.len()
         };
-        let count = handles.len();
-        for callback in handles.values() {
-            callback();
-        }
         if count > 0 {
             tracing::info!(
                 event_type = "lifecycle",
@@ -879,16 +1598,15 @@ impl ExecutorPool {
         }
     }
 
-    /// Cancel a specific query by ID. Returns true if the query was found
-    /// and interrupted, false if the query had already completed or the ID
-    /// was invalid.
+    /// Request cancellation of one unit of work by id.
+    ///
+    /// True means the work exists and cancellation is now latched — not
+    /// that anything has stopped. It stays true for repeat requests while
+    /// the work exists, including after its request already timed out, and
+    /// covers the window before the worker publishes an interrupt handle:
+    /// the latch is what makes that worker refuse to start.
     pub fn cancel_by_id(&self, query_id: u64) -> bool {
-        if let Some(callback) = self.active_interrupts.lock().remove(&query_id) {
-            callback();
-            true
-        } else {
-            false
-        }
+        self.registry.lock().request_cancel(query_id)
     }
 
     pub fn max_result_rows(&self) -> usize {
@@ -914,30 +1632,47 @@ impl ExecutorPool {
 
     /// Lightweight health check: acquire a permit, grab an executor, run
     /// `SELECT 1`, and return it. Proves the pool and `DuckDB` are functional.
+    ///
+    /// A permit-holding lane like any other, so it registers in the
+    /// lifecycle registry and its capacity shows up in the retained count
+    /// if the probe outlives its caller. Its wait is still unbounded —
+    /// the 250 ms probe budget is a separate change.
     pub async fn ping(&self) -> Result<(), ServerError> {
         let semaphore = Arc::clone(&self.semaphore);
         let Ok(permit) = semaphore.acquire_owned().await else {
             return Err(ServerError::Internal("executor pool shut down".into()));
         };
 
-        let executor = self.take_executor();
+        let id = self.allocate_query_id();
+        let work = WorkContext::system(WorkKind::Ping);
+        let slot = self.begin_slot(id, work, None, permit, None)?;
+        let started = Arc::clone(&slot.started);
 
-        let (executor, result) = tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                executor.ping().map_err(ServerError::from)
+        let task = tokio::task::spawn_blocking(move || {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                worker_seam!(Entry);
+                if !slot.publish_interrupt(slot.executor().interrupt_handle()) {
+                    return Err(capacity_refusal(id, work.kind, StartRefusal::Cancelled));
+                }
+                // No budget of its own yet, so only a latched cancellation
+                // can refuse the start.
+                if let Err(refusal) = slot.begin_work(None) {
+                    return Err(capacity_refusal(id, work.kind, refusal));
+                }
+                worker_seam!(Started);
+                let result = slot.executor().ping().map_err(ServerError::from);
+                worker_seam!(Finished);
+                result
             }));
-            let result = match result {
-                Ok(r) => r,
-                Err(_) => Err(ServerError::Internal("ping panicked".into())),
-            };
-            (executor, result)
-        })
-        .await
-        .map_err(|e| ServerError::Internal(format!("ping task panicked: {e}")))?;
+            outcome.unwrap_or_else(|_| Err(ServerError::Internal("ping panicked".into())))
+        });
 
-        self.return_executor(executor);
-        result
+        let mut request = RequestGuard::new(self, id, work.kind, &started);
+        let result = task
+            .await
+            .map_err(|e| ServerError::Internal(format!("ping task panicked: {e}")));
+        request.disarm();
+        result?
     }
 
     /// Sample distinct values of one field for autocomplete.
@@ -958,50 +1693,63 @@ impl ExecutorPool {
         service: Option<&str>,
         limit: usize,
         deadline: Deadline,
+        work: WorkContext,
     ) -> Result<Vec<String>, ServerError> {
         let semaphore = Arc::clone(&self.semaphore);
+        let id = self.allocate_query_id();
         let permit = deadline
             .run(semaphore.acquire_owned())
             .await
-            .map_err(|_| ServerError::Timeout)?
+            .map_err(|_| capacity_refusal(id, work.kind, StartRefusal::Expired))?
             .map_err(|_| ServerError::Internal("executor pool shut down".into()))?;
 
         let publication = deadline
             .run(self.publication.read())
             .await
-            .map_err(|_| ServerError::Timeout)??;
-        let executor = self.take_executor();
+            .map_err(|_| capacity_refusal(id, work.kind, StartRefusal::Expired))??;
+
+        let slot = self.begin_slot(id, work, None, permit, Some(publication))?;
+        let started = Arc::clone(&slot.started);
         let fallback_glob = Arc::clone(&self.fallback_glob);
         let field = field.to_owned();
         let service = service.map(ToOwned::to_owned);
 
-        let (executor, result) = tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            let _publication = publication;
-            let glob = match service {
-                Some(svc) => {
-                    let base = fallback_glob.as_ref();
-                    let base_prefix = base.find('*').map_or(base, |pos| &base[..pos]);
-                    format!("{base_prefix}**/{svc}.parquet")
+        let task = tokio::task::spawn_blocking(move || {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                worker_seam!(Entry);
+                if !slot.publish_interrupt(slot.executor().interrupt_handle()) {
+                    return Err(capacity_refusal(id, work.kind, StartRefusal::Cancelled));
                 }
-                None => fallback_glob.to_string(),
-            };
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                executor
+                if let Err(refusal) = slot.begin_work(Some(deadline)) {
+                    return Err(capacity_refusal(id, work.kind, refusal));
+                }
+                worker_seam!(Started);
+                let glob = match service {
+                    Some(svc) => {
+                        let base = fallback_glob.as_ref();
+                        let base_prefix = base.find('*').map_or(base, |pos| &base[..pos]);
+                        format!("{base_prefix}**/{svc}.parquet")
+                    }
+                    None => fallback_glob.to_string(),
+                };
+                let result = slot
+                    .executor()
                     .sample_field_values(&glob, &field, limit)
-                    .map_err(ServerError::from)
+                    .map_err(ServerError::from);
+                worker_seam!(Finished);
+                result
             }));
-            let result = match result {
-                Ok(r) => r,
-                Err(_) => Err(ServerError::Internal("field values sample panicked".into())),
-            };
-            (executor, result)
-        })
-        .await
-        .map_err(|e| ServerError::Internal(format!("field values task panicked: {e}")))?;
+            outcome.unwrap_or_else(|_| {
+                Err(ServerError::Internal("field values sample panicked".into()))
+            })
+        });
 
-        self.return_executor(executor);
-        result
+        let mut request = RequestGuard::new(self, id, work.kind, &started);
+        let result = task
+            .await
+            .map_err(|e| ServerError::Internal(format!("field values task panicked: {e}")));
+        request.disarm();
+        result?
     }
 
     /// Export query results to Parquet via `DuckDB` `COPY TO`.
@@ -1010,6 +1758,10 @@ impl ExecutorPool {
     ///
     /// Acquires a pool executor, writes to a temp file, and returns the
     /// raw bytes. Respects the hot buffer for fresh event visibility.
+    ///
+    /// The same lifecycle as [`execute`](Self::execute): the budget covers
+    /// every wait up to bytes in hand, and an export that outlives its
+    /// request keeps its permit until the `COPY TO` actually stops.
     #[allow(clippy::too_many_lines)]
     pub async fn export_parquet(
         &self,
@@ -1017,46 +1769,59 @@ impl ExecutorPool {
         dsl: &str,
         max_rows: usize,
         deadline: Deadline,
+        work: WorkContext,
     ) -> Result<Vec<u8>, ServerError> {
         let semaphore = Arc::clone(&self.semaphore);
         let permit = deadline
             .run(semaphore.acquire_owned())
             .await
-            .map_err(|_| ServerError::Timeout)?
+            .map_err(|_| capacity_refusal(query_id, work.kind, StartRefusal::Expired))?
             .map_err(|_| ServerError::Internal("executor pool shut down".into()))?;
 
         let publication = deadline
             .run(self.publication.read())
             .await
-            .map_err(|_| ServerError::Timeout)??;
-        let executor = self.take_executor();
+            .map_err(|_| capacity_refusal(query_id, work.kind, StartRefusal::Expired))??;
+
+        let slot = self.begin_slot(query_id, work, Some(dsl), permit, Some(publication))?;
+        let started = Arc::clone(&slot.started);
         let dsl = dsl.to_owned();
         let base_dir = Arc::clone(&self.base_dir);
         let hot_buffer = self.hot_buffer.clone();
         let field_catalog = Arc::clone(&self.field_catalog);
 
-        let (interrupt_tx, interrupt_rx) = tokio::sync::oneshot::channel();
-
         let mut task = tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            let _publication = publication;
-            let _ = interrupt_tx.send(executor.interrupt_handle());
-            let source = compute_source(&base_dir, &dsl);
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                worker_seam!(Entry);
+                if !slot.publish_interrupt(slot.executor().interrupt_handle()) {
+                    return Err(capacity_refusal(
+                        query_id,
+                        work.kind,
+                        StartRefusal::Cancelled,
+                    ));
+                }
+                if let Err(refusal) = slot.begin_work(Some(deadline)) {
+                    return Err(capacity_refusal(query_id, work.kind, refusal));
+                }
+                worker_seam!(Started);
 
-            // Write to a temp file, then read it back as bytes.
-            let tmp = tempfile::NamedTempFile::new()
-                .map_err(|e| ServerError::Internal(format!("failed to create temp file: {e}")))?;
-            let tmp_path = tmp.path().to_owned();
+                let source = compute_source(&base_dir, &dsl);
 
-            // Snapshot hot buffer for fresh events.
-            let hot_snapshot = hot_buffer
-                .as_ref()
-                .and_then(|hb| hb.snapshot())
-                .filter(|s| s.path().to_str().is_some());
+                // Write to a temp file, then read it back as bytes.
+                let tmp = tempfile::NamedTempFile::new().map_err(|e| {
+                    ServerError::Internal(format!("failed to create temp file: {e}"))
+                })?;
+                let tmp_path = tmp.path().to_owned();
 
-            let pins = field_catalog.all();
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                if let Some(ref hot) = hot_snapshot {
+                // Snapshot hot buffer for fresh events.
+                let hot_snapshot = hot_buffer
+                    .as_ref()
+                    .and_then(|hb| hb.snapshot())
+                    .filter(|s| s.path().to_str().is_some());
+
+                let pins = field_catalog.all();
+                let executor = slot.executor();
+                let written = if let Some(ref hot) = hot_snapshot {
                     let hot_path = hot.path().to_str().unwrap_or_default();
                     executor.export_parquet_with_hot(
                         &dsl,
@@ -1070,74 +1835,109 @@ impl ExecutorPool {
                 } else {
                     executor.export_parquet(&dsl, &source, &pins, &tmp_path, max_rows)
                 }
-                .map_err(ServerError::from)
+                .map_err(ServerError::from);
+
+                let bytes = written.and_then(|()| {
+                    std::fs::read(&tmp_path).map_err(|e| {
+                        ServerError::Internal(format!("failed to read parquet temp file: {e}"))
+                    })
+                });
+                worker_seam!(Finished);
+                bytes
             }));
-
-            let result = match result {
-                Ok(r) => r,
-                Err(payload) => {
-                    let msg = match payload.downcast_ref::<&str>() {
-                        Some(s) => (*s).to_owned(),
-                        None => match payload.downcast_ref::<String>() {
-                            Some(s) => s.clone(),
-                            None => "unknown panic".to_owned(),
-                        },
-                    };
-                    Err(ServerError::Internal(format!("export panicked: {msg}")))
-                }
-            };
-
-            let bytes = result.and_then(|()| {
-                std::fs::read(&tmp_path).map_err(|e| {
-                    ServerError::Internal(format!("failed to read parquet temp file: {e}"))
-                })
-            });
-
-            Ok::<(Executor, Result<Vec<u8>, ServerError>), ServerError>((executor, bytes))
+            outcome.unwrap_or_else(|payload| {
+                Err(ServerError::Internal(format!(
+                    "export panicked: {}",
+                    panic_text(payload.as_ref())
+                )))
+            })
         });
 
-        let interrupt = interrupt_rx.await.ok();
-
-        if let Some(ref handle) = interrupt {
-            let h = Arc::clone(handle);
-            self.active_interrupts
-                .lock()
-                .insert(query_id, Box::new(move || h.interrupt()));
-        }
-
-        let outcome = tokio::select! {
+        let mut request = RequestGuard::new(self, query_id, work.kind, &started);
+        tokio::select! {
             join_result = &mut task => {
+                request.disarm();
                 match join_result {
-                    Ok(Ok((executor, result))) => {
-                        self.return_executor(executor);
-                        result
-                    }
-                    Ok(Err(e)) => Err(e),
+                    Ok(result) => result,
                     Err(e) => Err(ServerError::Internal(format!("export task panicked: {e}"))),
                 }
             }
             () = tokio::time::sleep_until(deadline.instant()) => {
-                if let Some(handle) = &interrupt {
-                    handle.interrupt();
+                if request.abandon() {
+                    Err(ServerError::Timeout)
+                } else {
+                    Err(capacity_refusal(query_id, work.kind, StartRefusal::Expired))
                 }
-                let idle = Arc::clone(&self.idle);
-                tokio::spawn(async move {
-                    if let Ok(Ok((executor, _))) = task.await {
-                        idle.lock().push(executor);
-                    }
-                });
-                Err(ServerError::Timeout)
             }
-        };
-
-        self.active_interrupts.lock().remove(&query_id);
-        outcome
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use seam::Seam;
+
+    /// Ordinary interactive work, owned by a key.
+    const TEST_WORK: WorkContext = WorkContext {
+        kind: WorkKind::Query,
+        owner: WorkOwner::Key(7),
+    };
+    const TEST_SAMPLE_WORK: WorkContext = WorkContext {
+        kind: WorkKind::Sample,
+        owner: WorkOwner::System,
+    };
+
+    fn idle_len(pool: &ExecutorPool) -> usize {
+        pool.registry.lock().idle.len()
+    }
+
+    /// Nothing is registered: no interrupt slot, no lifecycle entry.
+    fn registry_is_empty(pool: &ExecutorPool) -> bool {
+        let registry = pool.registry.lock();
+        registry.interrupts.is_empty() && registry.retained.is_empty()
+    }
+
+    /// A pool whose queries answer from a one-event hot buffer, so an
+    /// ordinary query succeeds without a parquet fixture.
+    fn hot_pool(max_concurrent: usize) -> ExecutorPool {
+        use crate::bus::IngestBatch;
+        use crate::hot_buffer::HotBufferConfig;
+
+        let hot = Arc::new(HotBuffer::new(HotBufferConfig {
+            max_events: 100,
+            max_bytes: 1 << 20,
+        }));
+        let mut event = serde_json::Map::new();
+        event.insert("service".into(), "svc".into());
+        event.insert("message".into(), "hello".into());
+        hot.insert(Arc::new(IngestBatch {
+            batch_id: "b1".into(),
+            service: "svc".into(),
+            byte_size: 64,
+            events: vec![event],
+        }));
+        ExecutorPool::new("/nonexistent".into(), max_concurrent, 100_000, Some(hot))
+    }
+
+    /// Wait for a blocking thread to reach a state, without letting paused
+    /// time move.
+    ///
+    /// Tokio auto-advances a paused clock only when the scheduler has
+    /// nothing ready, so a yield loop pins virtual time exactly where the
+    /// test put it while the worker thread makes real progress. The bound
+    /// is the real clock, which is not what any assertion here is about —
+    /// it only turns a deadlock into a failure instead of a hang.
+    async fn until(label: &str, mut reached: impl FnMut() -> bool) {
+        let start = std::time::Instant::now();
+        while !reached() {
+            assert!(
+                start.elapsed() < Duration::from_secs(20),
+                "the worker never reached: {label}"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
 
     /// The severity presentation metadata is a property of the snapshot the
     /// run executed under, so a repin landing between execution and the
@@ -1243,6 +2043,7 @@ mod tests {
                 Deadline::after(Duration::from_secs(30)),
                 false,
                 0,
+                TEST_WORK,
             )
             .await;
         assert!(outcome.result.is_ok(), "{:?}", outcome.result);
@@ -1262,6 +2063,7 @@ mod tests {
                 Deadline::after(Duration::from_secs(30)),
                 false,
                 0,
+                TEST_WORK,
             )
             .await;
         assert!(outcome.result.is_ok(), "{:?}", outcome.result);
@@ -1290,6 +2092,7 @@ mod tests {
                 Deadline::after(Duration::from_secs(10)),
                 false,
                 0,
+                TEST_WORK,
             )
             .await;
         assert!(outcome.result.is_err(), "{:?}", outcome.result);
@@ -1305,6 +2108,7 @@ mod tests {
                 Deadline::after(Duration::from_millis(10)),
                 false,
                 0,
+                TEST_WORK,
             )
             .await;
         TEST_QUERY_DELAY_MS.store(0, Ordering::Relaxed);
@@ -1323,6 +2127,7 @@ mod tests {
                 Deadline::after(Duration::from_secs(10)),
                 false,
                 0,
+                TEST_WORK,
             )
             .await;
         assert!(outcome.result.is_err());
@@ -1339,6 +2144,7 @@ mod tests {
                 Deadline::after(Duration::from_secs(10)),
                 false,
                 0,
+                TEST_WORK,
             )
             .await;
     }
@@ -1349,7 +2155,7 @@ mod tests {
 
         // Run two sequential queries — both should succeed and the pool
         // should have the same number of idle executors before and after.
-        let idle_before = pool.idle.lock().len();
+        let idle_before = idle_len(&pool);
         let _ = pool
             .execute(
                 pool.allocate_query_id(),
@@ -1357,6 +2163,7 @@ mod tests {
                 Deadline::after(Duration::from_secs(10)),
                 false,
                 0,
+                TEST_WORK,
             )
             .await;
         let _ = pool
@@ -1366,9 +2173,10 @@ mod tests {
                 Deadline::after(Duration::from_secs(10)),
                 false,
                 0,
+                TEST_WORK,
             )
             .await;
-        let idle_after = pool.idle.lock().len();
+        let idle_after = idle_len(&pool);
 
         assert_eq!(
             idle_before, idle_after,
@@ -1396,10 +2204,13 @@ mod tests {
     ///
     /// Paused time, so the five seconds are virtual and exact. A test
     /// that slept for them would prove the same thing an hour later.
+    ///
+    /// Nothing ran, so the answer is a capacity refusal rather than a
+    /// query timeout.
     #[tokio::test(start_paused = true)]
     async fn queue_wait_counts_against_the_deadline() {
         let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000, None);
-        let idle_before = pool.idle.lock().len();
+        let idle_before = idle_len(&pool);
         // The pool's one permit, held by someone else for the duration.
         let held = pool
             .exclusive(Duration::from_secs(1))
@@ -1414,18 +2225,19 @@ mod tests {
                 Deadline::after(Duration::from_secs(5)),
                 false,
                 0,
+                TEST_WORK,
             )
             .await;
         let waited = start.elapsed();
 
         assert!(
-            matches!(outcome.result, Err(ServerError::Timeout)),
-            "expected Timeout, got: {:?}",
+            matches!(&outcome.result, Err(ServerError::ServiceUnavailable(msg)) if msg == CAPACITY_NOT_STARTED),
+            "a query that never left the queue is refused, not timed out: {:?}",
             outcome.result
         );
         assert_eq!(waited, Duration::from_secs(5), "it waited the budget");
         assert_eq!(
-            pool.idle.lock().len(),
+            idle_len(&pool),
             idle_before,
             "a query that never left the queue took no executor"
         );
@@ -1434,11 +2246,12 @@ mod tests {
 
     /// The publication gate is the second wait, and it spends the same
     /// budget: the permit is acquired, then the cutover's writer holds
-    /// the gate until the deadline ends the wait.
+    /// the gate until the deadline ends the wait. Still before any work,
+    /// so still a capacity refusal.
     #[tokio::test(start_paused = true)]
     async fn publication_wait_counts_against_the_deadline() {
         let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000, None);
-        let idle_before = pool.idle.lock().len();
+        let idle_before = idle_len(&pool);
         let writer = pool.publication.write().await;
 
         let start = tokio::time::Instant::now();
@@ -1449,13 +2262,14 @@ mod tests {
                 Deadline::after(Duration::from_secs(5)),
                 false,
                 0,
+                TEST_WORK,
             )
             .await;
         let waited = start.elapsed();
 
         assert!(
-            matches!(outcome.result, Err(ServerError::Timeout)),
-            "expected Timeout, got: {:?}",
+            matches!(&outcome.result, Err(ServerError::ServiceUnavailable(msg)) if msg == CAPACITY_NOT_STARTED),
+            "a query that never passed the gate is refused, not timed out: {:?}",
             outcome.result
         );
         assert_eq!(waited, Duration::from_secs(5), "it waited the budget");
@@ -1465,28 +2279,39 @@ mod tests {
             "the permit it was holding is released"
         );
         assert_eq!(
-            pool.idle.lock().len(),
+            idle_len(&pool),
             idle_before,
             "a query that never passed the gate took no executor"
         );
         drop(writer);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn pool_timeout_returns_error() {
-        // Make the blocking task sleep so the timeout reliably fires first.
-        TEST_QUERY_DELAY_MS.store(200, Ordering::Relaxed);
+        // The worker is held past its work-start transition, so what the
+        // request reports is a timeout on work that really is running.
+        // Sleeping instead would race the blocking pool's own startup.
+        let _seams = seam::session().await;
+        let started = seam::hold(Seam::Started);
         let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000, None);
-        let outcome = pool
-            .execute(
-                pool.allocate_query_id(),
-                "*",
-                Deadline::after(Duration::from_millis(10)),
-                false,
-                0,
-            )
-            .await;
-        TEST_QUERY_DELAY_MS.store(0, Ordering::Relaxed);
+        let id = pool.allocate_query_id();
+        let submitted = pool.clone();
+        let request = tokio::spawn(async move {
+            submitted
+                .execute(
+                    id,
+                    "*",
+                    Deadline::after(Duration::from_secs(5)),
+                    false,
+                    0,
+                    TEST_WORK,
+                )
+                .await
+        });
+        until("work starts", || started.arrivals() == 1).await;
+        tokio::time::advance(Duration::from_secs(6)).await;
+        let outcome = request.await.expect("the request joins");
+        started.release();
         assert!(
             matches!(outcome.result, Err(ServerError::Timeout)),
             "expected Timeout, got: {:?}",
@@ -1494,34 +2319,41 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn pool_executor_reclaimed_after_timeout() {
-        // Make the blocking task sleep so the timeout reliably fires first.
-        TEST_QUERY_DELAY_MS.store(200, Ordering::Relaxed);
+        let _seams = seam::session().await;
+        let started = seam::hold(Seam::Started);
         let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000, None);
-        let idle_before = pool.idle.lock().len();
-
-        // Trigger a timeout.
-        let _ = pool
-            .execute(
-                pool.allocate_query_id(),
-                "*",
-                Deadline::after(Duration::from_millis(10)),
-                false,
-                0,
-            )
-            .await;
-
-        // Wait for the blocking task to finish (200ms delay) + margin
-        // for the async reclamation task to push the executor back.
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        TEST_QUERY_DELAY_MS.store(0, Ordering::Relaxed);
-
-        let idle_after = pool.idle.lock().len();
+        let idle_before = idle_len(&pool);
+        let id = pool.allocate_query_id();
+        let submitted = pool.clone();
+        let request = tokio::spawn(async move {
+            submitted
+                .execute(
+                    id,
+                    "*",
+                    Deadline::after(Duration::from_secs(5)),
+                    false,
+                    0,
+                    TEST_WORK,
+                )
+                .await
+        });
+        until("work starts", || started.arrivals() == 1).await;
+        tokio::time::advance(Duration::from_secs(6)).await;
+        let _ = request.await.expect("the request joins");
         assert_eq!(
-            idle_before, idle_after,
-            "executor should be reclaimed after timeout"
+            idle_len(&pool),
+            idle_before - 1,
+            "the timed-out query still holds its executor"
         );
+
+        // Reclamation follows the work, not the request.
+        started.release();
+        until("the executor comes back", || {
+            idle_len(&pool) == idle_before && pool.available_permits() == 1
+        })
+        .await;
     }
 
     /// The cutover's exclusion primitive: `exclusive()` holds every permit,
@@ -1548,6 +2380,7 @@ mod tests {
                 Deadline::after(Duration::from_secs(10)),
                 false,
                 0,
+                TEST_WORK,
             )
             .await
         });
@@ -1581,6 +2414,7 @@ mod tests {
                 None,
                 10,
                 Deadline::after(Duration::from_secs(10)),
+                TEST_SAMPLE_WORK,
             )
             .await
         });
@@ -1600,7 +2434,7 @@ mod tests {
     async fn field_value_sampling_publication_timeout_releases_permit() {
         let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000, None);
         let writer = pool.publication.write().await;
-        let idle_before = pool.idle.lock().len();
+        let idle_before = idle_len(&pool);
 
         let result = tokio::time::timeout(
             Duration::from_secs(1),
@@ -1609,14 +2443,15 @@ mod tests {
                 None,
                 10,
                 Deadline::after(Duration::from_millis(20)),
+                TEST_SAMPLE_WORK,
             ),
         )
         .await
         .expect("publication wait must return before the writer releases its guard");
 
         assert!(
-            matches!(result, Err(ServerError::Timeout)),
-            "got {result:?}"
+            matches!(&result, Err(ServerError::ServiceUnavailable(msg)) if msg == CAPACITY_NOT_STARTED),
+            "a sample that never started is a capacity refusal, got {result:?}"
         );
         assert_eq!(
             pool.available_permits(),
@@ -1624,7 +2459,7 @@ mod tests {
             "the waiting permit is released"
         );
         assert_eq!(
-            pool.idle.lock().len(),
+            idle_len(&pool),
             idle_before,
             "publication timeout must not take an executor"
         );
@@ -1651,6 +2486,7 @@ mod tests {
                 Deadline::after(Duration::from_secs(10)),
                 false,
                 0,
+                TEST_WORK,
             )
             .await
         });
@@ -1671,11 +2507,627 @@ mod tests {
             .expect("drained pool becomes exclusive");
     }
 
+    /// A permit is not work. A worker parked before its work-start
+    /// transition holds everything a running query holds, and if the
+    /// budget runs out there, the answer is a capacity refusal — nothing
+    /// ran, so there is nothing to have timed out (ADR-0024).
+    #[tokio::test(start_paused = true)]
+    async fn startup_wait_counts_against_the_deadline() {
+        let _seams = seam::session().await;
+        let entry = seam::hold(Seam::Entry);
+        let started = seam::watch(Seam::Started);
+        let pool = hot_pool(1);
+        let baseline_idle = idle_len(&pool);
+        let id = pool.allocate_query_id();
+
+        let submitted = pool.clone();
+        let request = tokio::spawn(async move {
+            submitted
+                .execute(
+                    id,
+                    "*",
+                    Deadline::after(Duration::from_secs(5)),
+                    false,
+                    0,
+                    TEST_WORK,
+                )
+                .await
+        });
+
+        until("the worker parks at its first statement", || {
+            entry.arrivals() == 1
+        })
+        .await;
+        assert_eq!(
+            pool.available_permits(),
+            0,
+            "a worker that has not started still holds its permit"
+        );
+
+        tokio::time::advance(Duration::from_secs(6)).await;
+        let outcome = request.await.expect("the request joins");
+        assert!(
+            matches!(&outcome.result, Err(ServerError::ServiceUnavailable(msg)) if msg == CAPACITY_NOT_STARTED),
+            "expected a capacity refusal, got {:?}",
+            outcome.result
+        );
+        assert_eq!(pool.retained(), 1, "the permit outlives the request");
+        assert_eq!(pool.available_permits(), 0, "and is not back in the pool");
+
+        entry.release();
+        until("cleanup returns everything", || {
+            pool.retained() == 0
+                && idle_len(&pool) == baseline_idle
+                && pool.available_permits() == 1
+        })
+        .await;
+        assert_eq!(
+            started.arrivals(),
+            0,
+            "an expired worker performs no physical work at all"
+        );
+        assert!(registry_is_empty(&pool));
+    }
+
+    /// Work that started and outlived its request is visible as retained
+    /// capacity, stays cancellable while it exists, and gives everything
+    /// back when it ends.
+    #[tokio::test(start_paused = true)]
+    async fn a_retained_permit_is_visible_and_reclaimed() {
+        let _seams = seam::session().await;
+        let started = seam::hold(Seam::Started);
+        let pool = hot_pool(2);
+        let baseline_idle = idle_len(&pool);
+        let id = pool.allocate_query_id();
+
+        let submitted = pool.clone();
+        let request = tokio::spawn(async move {
+            submitted
+                .execute(
+                    id,
+                    "*",
+                    Deadline::after(Duration::from_secs(5)),
+                    false,
+                    0,
+                    TEST_WORK,
+                )
+                .await
+        });
+
+        until("work starts", || started.arrivals() == 1).await;
+        assert_eq!(
+            pool.retained(),
+            0,
+            "work a request is still waiting on is not retained"
+        );
+
+        tokio::time::advance(Duration::from_secs(6)).await;
+        let outcome = request.await.expect("the request joins");
+        assert!(
+            matches!(outcome.result, Err(ServerError::Timeout)),
+            "work that started and ran out of budget is a timeout, got {:?}",
+            outcome.result
+        );
+
+        assert_eq!(pool.retained(), 1);
+        assert!(
+            pool.retained() <= pool.capacity() - pool.available_permits(),
+            "retained work is a subset of the permits actually held"
+        );
+        let snapshot = pool.retained_work();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].id, id);
+        assert_eq!(snapshot[0].kind, WorkKind::Query);
+        assert!(snapshot[0].started, "this work did start");
+        assert_eq!(snapshot[0].owner, WorkOwner::Key(7));
+
+        // The owner can keep asking while the work exists.
+        assert!(pool.cancel_by_id(id));
+        assert!(pool.cancel_by_id(id), "cancellation is repeatable");
+        assert_eq!(pool.owner_of(id), Some(WorkOwner::Key(7)));
+
+        started.release();
+        until("the permit comes back", || {
+            pool.retained() == 0
+                && idle_len(&pool) == baseline_idle
+                && pool.available_permits() == pool.capacity()
+        })
+        .await;
+        assert!(pool.retained_work().is_empty());
+        assert!(registry_is_empty(&pool));
+        assert!(
+            !pool.cancel_by_id(id),
+            "work that has ended is no longer cancellable"
+        );
+        assert_eq!(pool.owner_of(id), None);
+    }
+
+    /// A client told its query timed out can still ask for it to stop.
+    /// The request's outcome and the work's life are two different things,
+    /// so the cancellation record has to outlive the response.
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_query_stays_cancellable() {
+        let _seams = seam::session().await;
+        let started = seam::hold(Seam::Started);
+        let pool = hot_pool(1);
+        let id = pool.allocate_query_id();
+
+        let submitted = pool.clone();
+        let request = tokio::spawn(async move {
+            submitted
+                .execute(
+                    id,
+                    "*",
+                    Deadline::after(Duration::from_secs(5)),
+                    false,
+                    0,
+                    TEST_WORK,
+                )
+                .await
+        });
+        until("work starts", || started.arrivals() == 1).await;
+        tokio::time::advance(Duration::from_secs(6)).await;
+        let outcome = request.await.expect("the request joins");
+        assert!(matches!(outcome.result, Err(ServerError::Timeout)));
+
+        assert!(pool.cancel_by_id(id), "still reachable after the timeout");
+        assert!(pool.cancel_by_id(id), "and still reachable after that");
+        started.release();
+        until("cleanup", || pool.retained() == 0).await;
+        assert!(!pool.cancel_by_id(id));
+    }
+
+    /// The stale-interrupt hazard: an interrupt for a finished query must
+    /// never reach the next query on that executor. Deregistration and
+    /// invocation are the same critical section, so either the
+    /// cancellation finds the old work (and the executor is still its own)
+    /// or it finds nothing at all. Both orders are exercised here.
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_cannot_interrupt_a_reused_executor() {
+        let _seams = seam::session().await;
+        // One executor, so the second query provably reuses the first's.
+        let pool = hot_pool(1);
+
+        // Order one: the cancellation arrives while the finished work is
+        // still holding its slot.
+        let finished = seam::hold(Seam::Finished);
+        let first = pool.allocate_query_id();
+        let submitted = pool.clone();
+        let request = tokio::spawn(async move {
+            submitted
+                .execute(
+                    first,
+                    "*",
+                    Deadline::after(Duration::from_secs(60)),
+                    false,
+                    0,
+                    TEST_WORK,
+                )
+                .await
+        });
+        until("the first query finishes its work", || {
+            finished.arrivals() == 1
+        })
+        .await;
+        assert!(pool.cancel_by_id(first), "its slot is still registered");
+        finished.release();
+        let outcome = request.await.expect("the request joins");
+        assert!(outcome.result.is_ok(), "{:?}", outcome.result);
+        until("the executor is back", || pool.available_permits() == 1).await;
+
+        // The next query takes that same executor. The old id reaches
+        // nothing, and the new query answers normally.
+        assert!(!pool.cancel_by_id(first), "the old slot is gone");
+        let second = pool.allocate_query_id();
+        let outcome = pool
+            .execute(
+                second,
+                "*",
+                Deadline::after(Duration::from_secs(60)),
+                false,
+                0,
+                TEST_WORK,
+            )
+            .await;
+        assert!(
+            outcome.result.is_ok(),
+            "a stale cancellation must not disturb the reused connection: {:?}",
+            outcome.result
+        );
+
+        // Order two: the cancellation arrives while the reused executor is
+        // mid-query. Naming the old id must still reach nothing.
+        let started = seam::hold(Seam::Started);
+        let third = pool.allocate_query_id();
+        let submitted = pool.clone();
+        let request = tokio::spawn(async move {
+            submitted
+                .execute(
+                    third,
+                    "*",
+                    Deadline::after(Duration::from_secs(60)),
+                    false,
+                    0,
+                    TEST_WORK,
+                )
+                .await
+        });
+        until("the third query starts", || started.arrivals() == 1).await;
+        assert!(!pool.cancel_by_id(first));
+        assert!(!pool.cancel_by_id(second));
+        started.release();
+        let outcome = request.await.expect("the request joins");
+        assert!(outcome.result.is_ok(), "{:?}", outcome.result);
+    }
+
+    /// A cancellation can arrive before the work has an interrupt handle
+    /// to be stopped with. It latches, and the worker refuses to start —
+    /// otherwise the answer would be "cancelled" for a query that then ran
+    /// to completion anyway.
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_before_the_handle_exists_refuses_the_start() {
+        let _seams = seam::session().await;
+        let entry = seam::hold(Seam::Entry);
+        let started = seam::watch(Seam::Started);
+        let pool = hot_pool(1);
+        let baseline_idle = idle_len(&pool);
+        let id = pool.allocate_query_id();
+
+        let submitted = pool.clone();
+        let request = tokio::spawn(async move {
+            submitted
+                .execute(
+                    id,
+                    "*",
+                    Deadline::after(Duration::from_secs(60)),
+                    false,
+                    0,
+                    TEST_WORK,
+                )
+                .await
+        });
+        until("the worker parks before publishing a handle", || {
+            entry.arrivals() == 1
+        })
+        .await;
+        assert!(
+            pool.cancel_by_id(id),
+            "the slot exists from registration, handle or not"
+        );
+
+        entry.release();
+        let outcome = request.await.expect("the request joins");
+        assert!(
+            matches!(&outcome.result, Err(ServerError::ServiceUnavailable(msg)) if msg == CAPACITY_NOT_STARTED),
+            "expected a refusal, got {:?}",
+            outcome.result
+        );
+        assert_eq!(
+            started.arrivals(),
+            0,
+            "a cancelled worker runs no physical query"
+        );
+        until("cleanup", || {
+            idle_len(&pool) == baseline_idle && pool.available_permits() == 1
+        })
+        .await;
+        assert!(registry_is_empty(&pool));
+    }
+
+    /// The start and the expiry can land in either order, and the answer
+    /// is exactly one classification either way — because the work-start
+    /// transition records it under the registry lock, not because a
+    /// `select!` happened to poll one arm first.
+    #[tokio::test(start_paused = true)]
+    async fn start_and_expiry_race_yields_exactly_one_classification() {
+        let _seams = seam::session().await;
+        let pool = hot_pool(2);
+
+        // Expiry first: the worker is still at the door.
+        let entry = seam::hold(Seam::Entry);
+        let id = pool.allocate_query_id();
+        let submitted = pool.clone();
+        let request = tokio::spawn(async move {
+            submitted
+                .execute(
+                    id,
+                    "*",
+                    Deadline::after(Duration::from_secs(5)),
+                    false,
+                    0,
+                    TEST_WORK,
+                )
+                .await
+        });
+        until("parked", || entry.arrivals() == 1).await;
+        tokio::time::advance(Duration::from_secs(6)).await;
+        let expiry_first = request.await.expect("the request joins").result;
+        entry.release();
+        until("cleanup", || pool.retained() == 0).await;
+
+        // Start first: the worker is past the transition when the budget
+        // runs out.
+        let started = seam::hold(Seam::Started);
+        let id = pool.allocate_query_id();
+        let submitted = pool.clone();
+        let request = tokio::spawn(async move {
+            submitted
+                .execute(
+                    id,
+                    "*",
+                    Deadline::after(Duration::from_secs(5)),
+                    false,
+                    0,
+                    TEST_WORK,
+                )
+                .await
+        });
+        until("started", || started.arrivals() == 1).await;
+        tokio::time::advance(Duration::from_secs(6)).await;
+        let start_first = request.await.expect("the request joins").result;
+        started.release();
+        until("cleanup", || pool.retained() == 0).await;
+
+        assert!(
+            matches!(&expiry_first, Err(ServerError::ServiceUnavailable(msg)) if msg == CAPACITY_NOT_STARTED),
+            "expiry before the start is a capacity refusal, got {expiry_first:?}"
+        );
+        assert!(
+            matches!(start_first, Err(ServerError::Timeout)),
+            "expiry after the start is a timeout, got {start_first:?}"
+        );
+    }
+
+    /// A caller that walks away is not a reason to abandon the work it
+    /// started: the permit stays booked until the query actually stops,
+    /// and it is visible as retained meanwhile.
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_caller_retains_and_then_reclaims() {
+        let _seams = seam::session().await;
+        let started = seam::hold(Seam::Started);
+        let pool = hot_pool(1);
+        let baseline_idle = idle_len(&pool);
+        let id = pool.allocate_query_id();
+
+        let submitted = pool.clone();
+        let request = tokio::spawn(async move {
+            submitted
+                .execute(
+                    id,
+                    "*",
+                    Deadline::after(Duration::from_secs(600)),
+                    false,
+                    0,
+                    TEST_WORK,
+                )
+                .await
+        });
+        until("work starts", || started.arrivals() == 1).await;
+
+        request.abort();
+        assert!(
+            request.await.unwrap_err().is_cancelled(),
+            "the requesting task is gone"
+        );
+        until("the abandoned work books its permit", || {
+            pool.retained() == 1
+        })
+        .await;
+        assert_eq!(pool.available_permits(), 0, "the permit is still held");
+        assert_eq!(pool.retained_work().len(), 1);
+
+        started.release();
+        until("cleanup", || {
+            pool.retained() == 0
+                && idle_len(&pool) == baseline_idle
+                && pool.available_permits() == 1
+        })
+        .await;
+        assert!(registry_is_empty(&pool));
+    }
+
+    /// A panic anywhere in the worker — before the start, in source
+    /// discovery, or after the answer is in hand — leaves nothing behind.
+    /// The cleanup guard is outside the unwind boundary, so it runs on the
+    /// way out of every one of them.
+    #[tokio::test]
+    async fn a_panicking_worker_leaks_no_permit_or_executor() {
+        let _seams = seam::session().await;
+        let pool = hot_pool(2);
+        let baseline_idle = idle_len(&pool);
+
+        for seam_point in [Seam::Entry, Seam::Started, Seam::Finished] {
+            let _gate = seam::panic_at(seam_point);
+            let id = pool.allocate_query_id();
+            let outcome = pool
+                .execute(
+                    id,
+                    "*",
+                    Deadline::after(Duration::from_secs(60)),
+                    false,
+                    0,
+                    TEST_WORK,
+                )
+                .await;
+            assert!(
+                matches!(outcome.result, Err(ServerError::Internal(_))),
+                "a panic at {seam_point:?} reports an internal error, got {:?}",
+                outcome.result
+            );
+            until("cleanup after the panic", || {
+                idle_len(&pool) == baseline_idle && pool.available_permits() == pool.capacity()
+            })
+            .await;
+            assert!(
+                registry_is_empty(&pool),
+                "a panic at {seam_point:?} left a registration behind"
+            );
+            assert_eq!(pool.retained(), 0);
+        }
+    }
+
+    /// A completion landing on the same instant as the timeout produces
+    /// one request outcome and one cleanup, never an orphaned slot.
+    #[tokio::test(start_paused = true)]
+    async fn a_timeout_racing_completion_leaves_no_orphan() {
+        let _seams = seam::session().await;
+        let finished = seam::hold(Seam::Finished);
+        let pool = hot_pool(1);
+        let baseline_idle = idle_len(&pool);
+        let id = pool.allocate_query_id();
+
+        let submitted = pool.clone();
+        let request = tokio::spawn(async move {
+            submitted
+                .execute(
+                    id,
+                    "*",
+                    Deadline::after(Duration::from_secs(5)),
+                    false,
+                    0,
+                    TEST_WORK,
+                )
+                .await
+        });
+        // The work is done; only its cleanup is outstanding.
+        until("the answer is in hand", || finished.arrivals() == 1).await;
+        tokio::time::advance(Duration::from_secs(6)).await;
+        let outcome = request.await.expect("the request joins");
+        assert!(
+            matches!(outcome.result, Err(ServerError::Timeout)),
+            "the request that stopped waiting reports the timeout it saw"
+        );
+        assert_eq!(pool.retained(), 1);
+
+        finished.release();
+        until("cleanup", || {
+            pool.retained() == 0
+                && idle_len(&pool) == baseline_idle
+                && pool.available_permits() == 1
+        })
+        .await;
+        assert!(registry_is_empty(&pool));
+    }
+
+    /// Every lane that takes a permit is in the registry under its own
+    /// kind and owner: exports and scheduled runs included, not just the
+    /// interactive query lane.
+    #[tokio::test(start_paused = true)]
+    async fn every_lane_registers_its_kind_and_owner() {
+        let _seams = seam::session().await;
+        let started = seam::hold(Seam::Started);
+        let pool = hot_pool(2);
+
+        let export_id = pool.allocate_query_id();
+        let exporter = pool.clone();
+        let export = tokio::spawn(async move {
+            exporter
+                .export_parquet(
+                    export_id,
+                    "*",
+                    10,
+                    Deadline::after(Duration::from_secs(5)),
+                    WorkContext::key(WorkKind::Export, 11),
+                )
+                .await
+        });
+        let scheduled_id = pool.allocate_query_id();
+        let reporting = pool.clone();
+        let scheduled = tokio::spawn(async move {
+            reporting
+                .execute(
+                    scheduled_id,
+                    "*",
+                    Deadline::after(Duration::from_secs(5)),
+                    false,
+                    0,
+                    WorkContext::system(WorkKind::Scheduled),
+                )
+                .await
+        });
+
+        until("both lanes start", || started.arrivals() == 2).await;
+        tokio::time::advance(Duration::from_secs(6)).await;
+        assert!(matches!(
+            export.await.expect("the export joins"),
+            Err(ServerError::Timeout)
+        ));
+        assert!(matches!(
+            scheduled.await.expect("the run joins").result,
+            Err(ServerError::Timeout)
+        ));
+
+        let mut retained = pool.retained_work();
+        retained.sort_by_key(|work| work.id);
+        assert_eq!(retained.len(), 2);
+        assert_eq!(retained[0].id, export_id);
+        assert_eq!(retained[0].kind, WorkKind::Export);
+        assert_eq!(retained[0].owner, WorkOwner::Key(11));
+        assert_eq!(retained[1].id, scheduled_id);
+        assert_eq!(retained[1].kind, WorkKind::Scheduled);
+        assert_eq!(
+            retained[1].owner,
+            WorkOwner::System,
+            "a scheduled run has no human owner"
+        );
+
+        started.release();
+        until("cleanup", || pool.retained() == 0).await;
+    }
+
+    /// Nothing accumulates. After a mixed run of every lane the pool is
+    /// back exactly where it started.
+    #[tokio::test]
+    async fn counts_return_to_baseline() {
+        let pool = hot_pool(2);
+        let baseline_idle = idle_len(&pool);
+        let baseline_permits = pool.available_permits();
+
+        for _ in 0..3 {
+            let outcome = pool
+                .execute(
+                    pool.allocate_query_id(),
+                    "*",
+                    Deadline::after(Duration::from_secs(60)),
+                    false,
+                    0,
+                    TEST_WORK,
+                )
+                .await;
+            assert!(outcome.result.is_ok(), "{:?}", outcome.result);
+        }
+        let _ = pool
+            .export_parquet(
+                pool.allocate_query_id(),
+                "*",
+                10,
+                Deadline::after(Duration::from_secs(60)),
+                WorkContext::key(WorkKind::Export, 7),
+            )
+            .await;
+        let _ = pool
+            .sample_field_values(
+                "service",
+                None,
+                10,
+                Deadline::after(Duration::from_secs(60)),
+                TEST_SAMPLE_WORK,
+            )
+            .await;
+        pool.ping().await.expect("the pool pings");
+
+        assert_eq!(idle_len(&pool), baseline_idle);
+        assert_eq!(pool.available_permits(), baseline_permits);
+        assert_eq!(pool.retained(), 0);
+        assert!(pool.retained_work().is_empty());
+        assert!(registry_is_empty(&pool));
+    }
+
     #[tokio::test]
     async fn cancel_all_clears_interrupts() {
         let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000, None);
         // No active queries — cancel_all should be a no-op.
         pool.cancel_all();
-        assert!(pool.active_interrupts.lock().is_empty());
+        assert!(pool.registry.lock().interrupts.is_empty());
     }
 }
