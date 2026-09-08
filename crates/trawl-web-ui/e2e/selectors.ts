@@ -9,19 +9,35 @@
 // sheet is a starting point, not gospel.
 
 export const SEL = {
+  /// crates/fleet-ui/src/modal/confirm.rs ConfirmModal.
   healthConfirm: '[role="alertdialog"]',
+  /// crates/fleet-ui/src/rail.rs title, crates/trawl-web-ui/src/state/section.rs Sources label.
   healthAwayLink: 'nav.rail a[title="Sources"]',
+  /// crates/trawl-web-ui/src/components/status_bar.rs hot buffer group.
   healthFooterHot: '.statusbar .grp[title="Hot buffer (events / bytes)"]',
+  /// crates/trawl-web-ui/src/pages/health.rs HealthPage and HealthQueries.
   healthPage: '.health-page',
+  /// crates/trawl-web-ui/src/pages/health.rs HealthPage and HealthQueries.
   healthSection: '.health-section',
+  /// crates/trawl-web-ui/src/pages/health.rs HealthPage and HealthQueries.
   healthCapacity: '.health-capacity',
+  /// crates/trawl-web-ui/src/pages/health.rs HealthPage and HealthQueries.
   healthLive: '.health-live',
+  /// crates/trawl-web-ui/src/pages/health.rs HealthPage and HealthQueries.
   healthLiveState: '.health-live-state',
+  /// crates/trawl-web-ui/src/pages/health.rs HealthPage and HealthQueries.
   healthQueries: '.health-queries',
+  /// crates/trawl-web-ui/src/pages/health.rs named keyboard-scrollable query region.
+  healthQueryScroll: '.health-query-scroll',
+  /// crates/trawl-web-ui/src/pages/health.rs HealthPage and HealthQueries.
   healthRefresh: '.health-refresh',
+  /// crates/trawl-web-ui/src/pages/health.rs HealthPage and HealthQueries.
   healthQueriesRefresh: '.health-queries-refresh',
+  /// crates/trawl-web-ui/src/pages/health.rs HealthPage and HealthQueries.
   healthRow: 'tr[data-query-id]',
+  /// crates/trawl-web-ui/src/pages/health.rs HealthPage and HealthQueries.
   healthOwnRow: 'tr[data-own="true"]',
+  /// crates/fleet-ui/src/rail.rs title, crates/trawl-web-ui/src/state/section.rs Health label and path.
   railHealthLink: 'nav.rail a[title="Health"]',
 
   /// crates/trawl-web-ui/src/pages/search.rs LiveRawTable.

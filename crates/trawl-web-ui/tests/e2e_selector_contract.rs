@@ -75,6 +75,30 @@ const HEALTH_RS: &str = include_str!("../src/pages/health.rs");
 
 const CONTRACTS: &[Contract] = &[
     Contract {
+        assignment: "healthQueryScroll: '.health-query-scroll',",
+        source_path: "src/pages/health.rs",
+        source: HEALTH_RS,
+        hook: "class=\"health-query-scroll\"",
+    },
+    Contract {
+        assignment: "healthAwayLink: 'nav.rail a[title=\"Sources\"]',",
+        source_path: "src/state/section.rs",
+        source: SECTION_RS,
+        hook: "label: \"Sources\"",
+    },
+    Contract {
+        assignment: "railHealthLink: 'nav.rail a[title=\"Health\"]',",
+        source_path: "src/state/section.rs",
+        source: SECTION_RS,
+        hook: "label: \"Health\"",
+    },
+    Contract {
+        assignment: "railHealthLink: 'nav.rail a[title=\"Health\"]',",
+        source_path: "src/state/section.rs",
+        source: SECTION_RS,
+        hook: "path: \"/settings/health\"",
+    },
+    Contract {
         assignment: "healthConfirm: '[role=\"alertdialog\"]',",
         source_path: "../../fleet-ui/src/modal/confirm.rs",
         source: include_str!("../../fleet-ui/src/modal/confirm.rs"),

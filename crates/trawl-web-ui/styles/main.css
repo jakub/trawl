@@ -1727,6 +1727,7 @@
 .health-check-error { color: var(--red); }
 .health-live-state { color: var(--ink-2); }
 .health-query-scroll { overflow-x: auto; }
+.health-query-scroll:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .health-query-table { width: 100%; border-collapse: collapse; text-align: left; font-size: 13px; }
 .health-query-table th { color: var(--ink-3); font-weight: 500; }
 .health-query-table th, .health-query-table td { padding: 12px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }

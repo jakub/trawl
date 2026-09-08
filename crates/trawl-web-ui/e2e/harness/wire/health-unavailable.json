@@ -3,8 +3,8 @@
   "version": "health-fixture-163",
   "checks": {
     "duckdb": "error",
-    "auth": "ok",
-    "storage": "ok",
+    "auth_db": "ok",
+    "storage_db": "ok",
     "data_path": "ok"
   }
 }

@@ -264,7 +264,7 @@ fn HealthQueries() -> impl IntoView {
                 Some(Ok(rows)) if rows.is_empty() => view! { <p>"No active or recent queries."</p> }.into_any(),
                 Some(Ok(rows)) => {
                     let epoch = generation.load(Ordering::SeqCst);
-                    view! { <div class="health-query-scroll"><table class="health-query-table">
+                    view! { <div class="health-query-scroll" tabindex="0" role="region" aria-labelledby="health-queries-title"><table class="health-query-table">
                         <thead><tr><th>"Query"</th><th>"User"</th><th>"State"</th><th>"Elapsed"</th><th>"Action"</th></tr></thead>
                         <tbody>{rows.into_iter().map(|row| {
                             let (id, own) = (row.id, row.own);

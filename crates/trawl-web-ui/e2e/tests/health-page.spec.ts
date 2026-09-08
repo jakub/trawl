@@ -33,6 +33,8 @@ test('non-admin request silence: health 200 and queries without admin traffic or
   await page.goto('/settings/health');
   await expect(page.locator(SEL.healthSection)).toContainText('health-fixture-163');
   await expect(page.locator(SEL.healthSection)).toContainText('duckdb');
+  await expect(page.locator(SEL.healthSection)).toContainText('auth_db');
+  await expect(page.locator(SEL.healthSection)).toContainText('storage_db');
   await rows(page);
   await page.locator(SEL.healthRefresh).click();
   await expect.poll(async () => (await state(request)).healthHits.health).toBeGreaterThanOrEqual(2);
@@ -53,6 +55,8 @@ test('health 503 renders the named failed subsystem', async ({ page, request }) 
   await page.goto('/settings/health');
   await healthResponse;
   await expect(page.locator(SEL.healthSection)).toContainText('duckdb');
+  await expect(page.locator(SEL.healthSection)).toContainText('auth_db');
+  await expect(page.locator(SEL.healthSection)).toContainText('storage_db');
   await expect(page.locator(SEL.healthSection)).toContainText('error');
   await expect(page.locator(SEL.healthSection)).toContainText('health-fixture-163');
 });
@@ -272,3 +276,32 @@ for (const status of [500, 502, 504, 403]) {
     expect((await state(request)).cancelRequests).toEqual([101]);
   });
 }
+
+test('query-only readers can focus and scroll the queries table with the keyboard', async ({ page, request }) => {
+  await setup(request, 'health-viewer');
+  await page.route('**/api/v1/queries', async route => {
+    const response = await route.fetch();
+    const body = await response.json();
+    // A long display name makes the real table overflow its wrapper.
+    body.active[0].user = 'queryreader'.repeat(12);
+    await route.fulfill({ response, json: body });
+  });
+  await page.setViewportSize({ width: 640, height: 900 });
+  await page.goto('/settings/health');
+  await rows(page);
+  await expect(page.locator(SEL.healthQueries).getByRole('button', { name: 'Cancel', exact: true })).toHaveCount(0);
+  const region = page.locator(SEL.healthQueryScroll);
+  await expect(region).toBeVisible();
+  await expect(region).toHaveAttribute('role', 'region');
+  await expect(region).toHaveAccessibleName('Queries');
+  await expect.poll(() => region.evaluate(el => el.scrollWidth > el.clientWidth)).toBe(true);
+  await page.locator(SEL.healthQueriesRefresh).focus();
+  await page.keyboard.press('Tab');
+  await expect(region).toBeFocused();
+  expect(await region.evaluate(el => {
+    const style = getComputedStyle(el);
+    return style.outlineStyle !== 'none' && Number.parseFloat(style.outlineWidth) > 0;
+  })).toBe(true);
+  await page.keyboard.press('ArrowRight');
+  await expect.poll(() => region.evaluate(el => el.scrollLeft)).toBeGreaterThan(0);
+});
