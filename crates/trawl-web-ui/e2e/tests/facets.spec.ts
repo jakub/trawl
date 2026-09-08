@@ -58,10 +58,10 @@ test('include is reachable by Tab and adds one filter', async ({ page, request }
   await expect(include).toHaveJSProperty('tagName', 'BUTTON');
   await expect(include).toHaveAttribute('type', 'button');
   // Hidden at rest, and hidden by opacity: `display: none` would keep
-  // the Tab below from ever reaching it.
-  expect(await row.locator(SEL.facetActions).evaluate((el) => getComputedStyle(el).opacity)).toBe(
-    '0',
-  );
+  // the Tab below from ever reaching it. Read through a retrying
+  // assertion, never a single `evaluate`: opacity is what the reveal
+  // animates, so a one-shot read can catch it mid-flight.
+  await expect(row.locator(SEL.facetActions)).toHaveCSS('opacity', '0');
 
   // The group's own header is the focusable before the first value.
   await group.locator(SEL.facetGroupHeader).focus();
@@ -178,25 +178,27 @@ test('long value keeps clear of the actions', async ({ page, request }) => {
   await page.keyboard.press('Tab');
   await expect(row.locator(SEL.facetOp).first()).toBeFocused();
 
-  const geometry = await row.evaluate((el) => {
-    const name = el.querySelector('.n')!.getBoundingClientRect();
-    const act = el.querySelector('.act')!;
-    return {
-      nameRight: name.right,
-      actLeft: act.getBoundingClientRect().left,
-      actBackground: getComputedStyle(act).backgroundColor,
-      opacity: getComputedStyle(act).opacity,
-    };
-  });
-
-  expect(geometry.opacity).toBe('1');
-  expect(
-    geometry.nameRight,
-    'a long value must stop before the action area, not run under it',
-  ).toBeLessThan(geometry.actLeft);
+  // Every read here retries. The reveal is a style change the browser
+  // may animate, and the row reflows around the 200 characters just
+  // written into it, so a single snapshot taken the instant focus lands
+  // can catch either one part way.
+  const act = row.locator(SEL.facetActions);
+  await expect(act).toHaveCSS('opacity', '1');
   // The area is out of flow over the row, so it carries its own opaque
   // floor. Transparent would let the value read through the glyphs.
-  expect(geometry.actBackground).not.toBe('rgba(0, 0, 0, 0)');
+  await expect(act).not.toHaveCSS('background-color', 'rgba(0, 0, 0, 0)');
+
+  const gap = () =>
+    row.evaluate((el) => {
+      const name = el.querySelector('.n')!.getBoundingClientRect();
+      const actions = el.querySelector('.act')!.getBoundingClientRect();
+      return actions.left - name.right;
+    });
+  await expect
+    .poll(gap, {
+      message: 'a long value must stop before the action area, not run under it',
+    })
+    .toBeGreaterThan(0);
 });
 
 test('clear all removes every filter', async ({ page, request }) => {

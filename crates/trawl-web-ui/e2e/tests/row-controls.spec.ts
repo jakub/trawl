@@ -334,15 +334,13 @@ test('schema quick actions: Tab reveals and Enter searches', async ({ page, requ
 
   // Hidden at rest, revealed by the row's own :focus-within — which is
   // what makes Tab able to reach it at all.
-  expect(await row.locator('.row-act').evaluate((el) => getComputedStyle(el).opacity)).toBe('0');
+  await expect(row.locator('.row-act')).toHaveCSS('opacity', '0');
   await row.locator(SEL.rowStretch).focus();
   await page.keyboard.press('Tab');
   await expectFocusRing(search);
-  // Polled, not read once: the reveal is a 100ms opacity transition, so
+  // Retried, not read once: the reveal is a 100ms opacity transition, so
   // an immediate read catches it part way there.
-  await expect
-    .poll(() => row.locator('.row-act').evaluate((el) => getComputedStyle(el).opacity))
-    .toBe('1');
+  await expect(row.locator('.row-act')).toHaveCSS('opacity', '1');
 
   await page.keyboard.press('Enter');
   // A command, not a place: it goes through the navigator, which builds
