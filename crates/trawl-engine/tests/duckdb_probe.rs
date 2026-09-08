@@ -5336,3 +5336,206 @@ fn the_absolute_time_window_is_half_open_at_the_microsecond() {
         "a one-microsecond window holds exactly the event at its start"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The bind-time expansion budget's copy counts, after the PARSER
+// ---------------------------------------------------------------------------
+
+/// One SQL expression's `DuckDB` parse tree, serialized.
+///
+/// `json_serialize_sql` takes a constant, not a parameter, so the
+/// expression is inlined and its quotes doubled. What comes back is the
+/// tree the BINDER will walk — which is the tree the expansion budget is
+/// trying to bound, and it is not the same shape as the text.
+fn parse_tree(conn: &duckdb::Connection, expr: &str) -> String {
+    let statement = format!("SELECT {expr}").replace('\'', "''");
+    conn.prepare(&format!("SELECT json_serialize_sql('{statement}')"))
+        .unwrap_or_else(|e| panic!("serializing {expr}: {e}"))
+        .query_row([], |row| row.get::<_, String>(0))
+        .unwrap_or_else(|e| panic!("serializing {expr}: {e}"))
+}
+
+/// The subject marker every case below writes, chosen so it can appear
+/// nowhere else in a parse tree: no ladder token, pattern or type name
+/// contains it.
+const COPY_MARKER: &str = "__c0__";
+
+/// How many times a rendering's subject survives into the parse tree.
+fn parsed_copies(conn: &duckdb::Connection, expr: &str) -> u64 {
+    parse_tree(conn, expr).matches(COPY_MARKER).count() as u64
+}
+
+/// `DuckDB`'s parser rewrites a SIMPLE `CASE` before the binder sees it,
+/// and that rewrite duplicates the subject.
+///
+/// `CASE x WHEN 1 THEN 'a' WHEN 2 THEN 'b' END` arrives at the binder as
+/// `CASE WHEN x = 1 THEN 'a' WHEN x = 2 THEN 'b' END`: two whole copies
+/// of `x`, from one written occurrence. A SEARCHED `CASE` has no subject
+/// and is not rewritten. This is the mechanism the rest of this section
+/// measures, pinned on its own so a failure here reads as "the parser
+/// changed" rather than "a profile is wrong".
+#[test]
+fn duckdb_rewrites_a_simple_case_into_one_equality_per_arm() {
+    let conn = conn();
+    for arms in 1..=5u64 {
+        let mut when = String::new();
+        for n in 1..=arms {
+            use std::fmt::Write as _;
+            let _ = write!(when, " WHEN {n} THEN '{n}'");
+        }
+        assert_eq!(
+            parsed_copies(&conn, &format!("(CASE \"{COPY_MARKER}\"{when} END)")),
+            arms,
+            "a {arms}-arm simple CASE copies its subject once per arm"
+        );
+    }
+    // The searched form names its subject exactly as often as it is
+    // written, however many arms it has.
+    assert_eq!(
+        parsed_copies(
+            &conn,
+            &format!(
+                "(CASE WHEN \"{COPY_MARKER}\" = 1 THEN 'a' WHEN \"{COPY_MARKER}\" = 2 THEN 'b' END)"
+            )
+        ),
+        2
+    );
+}
+
+/// Every `CASE`-bearing renderer the expansion budget prices, measured
+/// against the tree `DuckDB` actually builds.
+///
+/// The text-level guard in `trawl-core/tests/complexity_emission_bounds.rs`
+/// counts the emitter's OUTPUT, which is the wrong side of the parser for
+/// a simple `CASE`: `conform::severity_token_text_sql` writes its subject
+/// once and hands the binder twenty-four copies. Understating a copy count
+/// turns a refused query into an admitted one, so the class is closed here
+/// instead — by asking the engine.
+///
+/// One-sided on purpose: a profile may declare more copies than the parser
+/// produces (`profile` overcounts a `CASE`'s `ELSE` by one node, and the
+/// pin-maximizing walk deliberately takes the widest interpretation). It
+/// may never declare fewer.
+#[test]
+fn declared_copy_counts_cover_the_parsed_tree() {
+    use trawl_core::complexity::{ConformShape, FunctionShape, Rendering, profile};
+    use trawl_core::conform;
+    use trawl_core::severity::Dialect;
+
+    let conn = conn();
+    let subject = format!("\"{COPY_MARKER}\"");
+
+    let mut cases: Vec<(String, Rendering, String)> = vec![
+        (
+            "severity_token_text_sql".to_owned(),
+            Rendering::Conform(ConformShape::SeverityTokenText),
+            conform::severity_token_text_sql(&subject),
+        ),
+        // A pattern operator over a SEVERITY pin renders THROUGH that
+        // kernel, so the composition has to carry its copies too.
+        (
+            "pattern over the severity token text".to_owned(),
+            Rendering::Pattern(trawl_core::compare::PatternForm::SeverityText),
+            format!(
+                "regexp_matches({}, 'e.*')",
+                conform::severity_token_text_sql(&subject)
+            ),
+        ),
+    ];
+    for dialect in [Dialect::Otel, Dialect::Syslog] {
+        cases.push((
+            format!("severity_reading_sql({dialect:?})"),
+            Rendering::Conform(ConformShape::SeverityReading(dialect)),
+            conform::severity_reading_sql(&subject, dialect),
+        ));
+        cases.push((
+            format!("severity_reading_sql_bind_once({dialect:?})"),
+            Rendering::Conform(ConformShape::SeverityReadingBindOnce(dialect)),
+            conform::severity_reading_sql_bind_once(&subject, dialect),
+        ));
+        // `sev()`'s emission is that bind-once reading over the argument's
+        // canonical text form.
+        cases.push((
+            format!("sev() emission ({dialect:?})"),
+            Rendering::Function(FunctionShape::Sev { dialect, argc: 1 }),
+            conform::severity_reading_sql_bind_once(&conform::untyped_text(&subject), dialect),
+        ));
+        for pin in CanonicalType::ALL {
+            cases.push((
+                format!("guarded_cast_in({pin:?}, {dialect:?})"),
+                Rendering::Conform(ConformShape::GuardedCast(pin, dialect)),
+                conform::guarded_cast_in(&subject, pin, dialect),
+            ));
+        }
+    }
+
+    for (label, rendering, sql) in cases {
+        let declared = profile(&rendering)
+            .copies
+            .first()
+            .copied()
+            .unwrap_or_else(|| panic!("{label}: the profile declares no child"));
+        let parsed = parsed_copies(&conn, &sql);
+        assert!(
+            parsed > 0,
+            "{label}: the marker vanished from the parse tree, so this case measures nothing"
+        );
+        assert!(
+            declared >= parsed,
+            "{label}: the parser builds {parsed} copies of the subject, \
+             the profile declares {declared}"
+        );
+    }
+}
+
+/// The numbers behind the one-sided bound above, pinned exactly.
+///
+/// A bound that only ever says "at least" would pass just as well if a
+/// profile declared a million copies, and would never tell anyone that the
+/// severity reading got cheaper. These are the counts on the bundled
+/// engine; a change here is a real change in what the binder is asked to
+/// do, and the profiles should move with it.
+#[test]
+fn the_severity_kernels_parse_to_their_pinned_copy_counts() {
+    use trawl_core::conform;
+    use trawl_core::severity::Dialect;
+
+    let conn = conn();
+    let subject = format!("\"{COPY_MARKER}\"");
+
+    // Twenty-four ladder arms, one copy each.
+    assert_eq!(
+        parsed_copies(&conn, &conform::severity_token_text_sql(&subject)),
+        24
+    );
+    // Thirty-eight token arms over a head that names the subject twice,
+    // plus the numeric fallthrough: 76 + 3 under OTel, and 76 + 9 under
+    // syslog, whose numeric rung is a SECOND simple CASE with eight arms.
+    assert_eq!(
+        parsed_copies(
+            &conn,
+            &conform::severity_reading_sql(&subject, Dialect::Otel)
+        ),
+        79
+    );
+    assert_eq!(
+        parsed_copies(
+            &conn,
+            &conform::severity_reading_sql(&subject, Dialect::Syslog)
+        ),
+        85
+    );
+    // The bind-once shape is the whole reason `sev()` can carry bound
+    // parameters: the rewrite multiplies the lambda-local `_sev`, and the
+    // caller's expression lands exactly once.
+    for dialect in [Dialect::Otel, Dialect::Syslog] {
+        assert_eq!(
+            parsed_copies(
+                &conn,
+                &conform::severity_reading_sql_bind_once(&subject, dialect)
+            ),
+            1,
+            "{dialect:?}"
+        );
+    }
+}

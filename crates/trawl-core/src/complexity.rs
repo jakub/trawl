@@ -56,6 +56,27 @@
 //! real emitter. A profile may overcount fixed overhead. It may never omit
 //! a child copy.
 //!
+//! # The parser multiplies too
+//!
+//! Emitted TEXT is not the last word on how many times a child is
+//! written. `DuckDB`'s parser rewrites a SIMPLE `CASE` — one with a
+//! subject at its head — into one equality predicate per `WHEN` arm, and
+//! it does that at PARSE time, before the binder ever sees a lateral
+//! alias. `CASE x WHEN 1 THEN 'a' WHEN 2 THEN 'b' END` reaches the binder
+//! as `CASE WHEN x = 1 THEN 'a' WHEN x = 2 THEN 'b' END`, with two copies
+//! of `x`. A SEARCHED `CASE` (`CASE WHEN cond THEN …`) has no subject and
+//! is not rewritten at all.
+//!
+//! That is why [`simple_case`] exists and why the severity kernels are
+//! priced the way they are: `conform::severity_token_text_sql` writes its
+//! subject once in text and twenty-four times in the parsed tree, and
+//! `conform::severity_reading_sql` writes it five times in text and
+//! seventy-nine times parsed. Text-level drift tests count the wrong side
+//! of the parser, so the copy counts here are held against the PARSED
+//! tree by `trawl-engine/tests/duckdb_probe.rs`, which serializes the
+//! renderer-shaped SQL through `json_serialize_sql` and counts a marker
+//! subject in the result.
+//!
 //! # What it does not bound
 //!
 //! Multiplication that no alias reference feeds — `x in (1,…,1000)` over an
@@ -193,6 +214,56 @@ impl RenderProfile {
             out.d = out.d.saturating_add(m.saturating_mul(child.d));
         }
         out
+    }
+}
+
+/// The shape of a rendering that has exactly ONE child — every link in
+/// the severity kernel, and every `CASE` head this module prices.
+///
+/// A distinct type rather than a [`RenderProfile`] with one entry so the
+/// composition below can read the copy count without an `Option`: a
+/// defaulted `None` there would be a silently omitted child copy, which is
+/// the one mistake the whole table may not make.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OneChild {
+    fixed: u64,
+    copies: u64,
+}
+
+impl OneChild {
+    const fn new(fixed: u64, copies: u64) -> Self {
+        Self { fixed, copies }
+    }
+
+    fn profile(self) -> RenderProfile {
+        RenderProfile::new(self.fixed, vec![self.copies])
+    }
+
+    /// This shape wrapped in `extra` nodes that do not repeat it.
+    fn wrapped(self, extra: u64) -> Self {
+        Self {
+            fixed: self.fixed.saturating_add(extra),
+            copies: self.copies,
+        }
+    }
+}
+
+/// A simple `CASE <this shape> WHEN v THEN r … END` over `arms` arms, as
+/// `DuckDB`'s PARSER leaves it.
+///
+/// The rewrite is `CASE WHEN subject = v THEN r …`, so each arm costs one
+/// equality node, the arm's value, the arm's result, and a WHOLE further
+/// copy of the subject expression. Two more nodes cover the `CASE` itself
+/// and the fallthrough result `DuckDB` supplies when the query wrote no
+/// `ELSE` — an explicit `ELSE` is added by the caller on top, which
+/// overcounts by exactly that one node and is left there rather than
+/// special-cased.
+fn simple_case(subject: OneChild, arms: u64) -> OneChild {
+    OneChild {
+        fixed: 2u64
+            .saturating_add(arms.saturating_mul(3))
+            .saturating_add(arms.saturating_mul(subject.fixed)),
+        copies: arms.saturating_mul(subject.copies),
     }
 }
 
@@ -357,14 +428,19 @@ pub fn profile(rendering: &Rendering) -> RenderProfile {
             let target = match form {
                 // The column itself; the emitter keeps this on the generic
                 // path, whose operand count is the same.
-                PatternForm::Native => 0,
+                PatternForm::Native => OneChild::new(0, 1),
                 // `CAST(target AS VARCHAR)`.
-                PatternForm::BigIntText | PatternForm::BooleanText | PatternForm::DoubleText => 1,
+                PatternForm::BigIntText | PatternForm::BooleanText | PatternForm::DoubleText => {
+                    OneChild::new(1, 1)
+                }
                 // `strftime(target, '<format>')`.
-                PatternForm::Rfc3339Text => 2,
-                PatternForm::SeverityText => severity_token_text_fixed(),
+                PatternForm::Rfc3339Text => OneChild::new(2, 1),
+                // The token table is a SIMPLE `CASE`, so the pattern's
+                // target carries the whole subject once per ladder arm.
+                PatternForm::SeverityText => severity_token_text(),
             };
-            RenderProfile::new(target + 2, vec![1])
+            // The pattern operator and its bound parameter.
+            target.wrapped(2).profile()
         }
         Rendering::SeverityRanges { runs, negated } => {
             let runs = n_u64(*runs);
@@ -434,35 +510,42 @@ fn conform_profile(shape: ConformShape) -> RenderProfile {
             // The text form IS the conform.
             CanonicalType::Varchar => RenderProfile::new(0, vec![1]),
             // `(CASE WHEN dec(t) = dec(TRY_CAST(t AS BIGINT)) THEN
-            //   TRY_CAST(t AS BIGINT) END)`.
-            CanonicalType::BigInt => RenderProfile::new(6, vec![3]),
+            //   TRY_CAST(t AS BIGINT) END)` — SEARCHED, so the parser
+            //   leaves it alone: the `CASE`, its NULL fallthrough, the
+            //   equality, two decimal casts and two integer casts.
+            CanonicalType::BigInt => RenderProfile::new(7, vec![3]),
             // `(CASE WHEN CAST(TRY_CAST(t AS BOOLEAN) AS VARCHAR) = t THEN
-            //   TRY_CAST(t AS BOOLEAN) END)`.
-            CanonicalType::Boolean => RenderProfile::new(5, vec![3]),
+            //   TRY_CAST(t AS BOOLEAN) END)`, searched likewise.
+            CanonicalType::Boolean => RenderProfile::new(6, vec![3]),
             CanonicalType::Double => RenderProfile::new(1, vec![1]),
             // `TRY_CAST(TRY_CAST(t AS TIMESTAMPTZ) AS TIMESTAMP)`.
             CanonicalType::Timestamp => RenderProfile::new(2, vec![1]),
             CanonicalType::Severity => conform_profile(ConformShape::SeverityReading(dialect)),
         },
         ConformShape::SeverityReading(dialect) => {
-            let case = reading_case_fixed(dialect);
-            let subjects = reading_case_subjects(dialect);
+            let case = reading_case(dialect);
             // `CAST(<case over trimmed(text)> AS BIGINT)`: the outer cast,
             // the case's own nodes, and one trim per writing of the
             // subject.
-            RenderProfile::new(1 + case + subjects * TRIMMED_FIXED, vec![subjects])
+            OneChild::new(
+                1 + case.fixed + case.copies.saturating_mul(TRIMMED_FIXED),
+                case.copies,
+            )
+            .profile()
         }
         ConformShape::SeverityReadingBindOnce(dialect) => {
-            let case = reading_case_fixed(dialect);
-            let subjects = reading_case_subjects(dialect);
+            let case = reading_case(dialect);
             // `CAST(list_transform([trimmed(text)], _sev -> <case>)[1] AS
             // BIGINT)`: the cast, the transform, the list, the lambda and
             // its parameter, the index and its literal, one trim, the
-            // case, and the lambda parameter once per writing.
-            RenderProfile::new(7 + TRIMMED_FIXED + case + subjects, vec![1])
+            // case, and the LAMBDA-LOCAL parameter once per writing. The
+            // subject itself lands once, inside the list literal, which is
+            // the whole point of this shape — the parser's `CASE` rewrite
+            // multiplies `_sev`, not the caller's expression.
+            OneChild::new(7 + TRIMMED_FIXED + case.fixed + case.copies, 1).profile()
         }
         // `(CASE x WHEN 1 THEN 'trace' … WHEN 24 THEN 'fatal4' END)`.
-        ConformShape::SeverityTokenText => RenderProfile::new(severity_token_text_fixed(), vec![1]),
+        ConformShape::SeverityTokenText => severity_token_text().profile(),
     }
 }
 
@@ -470,37 +553,52 @@ fn conform_profile(shape: ConformShape) -> RenderProfile {
 /// whitespace trim both severity readings wrap their subject in.
 const TRIMMED_FIXED: u64 = 6;
 
-/// Nodes in `crate::conform`'s reading `CASE`, excluding the writings of
-/// its subject.
+/// `crate::conform`'s reading `CASE`, over its ALREADY-TRIMMED subject.
 ///
-/// Read off the severity tables rather than frozen, so a token added there
-/// widens the profile instead of silently escaping it: the ASCII gate and
-/// its literal, the `lower()` fold, the two `CASE` heads, two nodes per
-/// arm, and the numeric arm the dialect chooses.
-fn reading_case_fixed(dialect: Dialect) -> u64 {
+/// The arm count is read off the severity tables rather than frozen, so a
+/// token added there widens the profile instead of silently escaping it.
+///
+/// The shape is a SIMPLE `CASE` whose head is itself an expression naming
+/// the subject twice, so the parser's rewrite dominates everything else
+/// here: thirty-eight arms times two writings is seventy-six copies of the
+/// subject before the numeric fallthrough adds its own. Text-level
+/// counting sees five (`OTel`) or four (syslog) and is wrong by more than
+/// an order of magnitude.
+fn reading_case(dialect: Dialect) -> OneChild {
+    // `(CASE WHEN regexp_full_match(t, '[A-Za-z0-9]+') THEN lower(t) END)`
+    // — the `CASE`, its NULL fallthrough, the match call, its pattern and
+    // the fold, over two writings of the subject.
+    let gate = OneChild::new(5, 2);
     let arms = n_u64(severity_case_arms());
-    let numeric = match dialect {
-        // `(CASE WHEN cast BETWEEN 1 AND 24 THEN cast END)`: the `CASE`,
-        // the ternary `BETWEEN`, its two bounds, and two casts.
-        Dialect::Otel => 7,
-        // `(CASE cast WHEN 0 THEN … WHEN 7 THEN … END)`, eight rungs.
-        Dialect::Syslog => 18,
-    };
-    // Two `CASE` heads, `regexp_full_match` and its pattern, `lower()`,
-    // and the numeric arm's own guard (`CASE`, match, pattern).
-    5 + arms.saturating_mul(2) + 3 + numeric
+    let numeric = reading_numeric_arm(dialect);
+    let case = simple_case(gate, arms);
+    // The `ELSE` arm is written once and never repeated.
+    OneChild::new(
+        case.fixed.saturating_add(numeric.fixed),
+        case.copies.saturating_add(numeric.copies),
+    )
 }
 
-/// How many times the reading `CASE` writes its (already trimmed) subject.
-///
-/// Five under `OTel` — the ASCII gate, the `lower()` fold, the digits
-/// guard, and the numeric cast's two halves — and four under syslog, whose
-/// numeric arm names the cast once.
-fn reading_case_subjects(dialect: Dialect) -> u64 {
-    match dialect {
-        Dialect::Otel => 5,
-        Dialect::Syslog => 4,
-    }
+/// The reading's numeric fallthrough, over the same trimmed subject:
+/// `(CASE WHEN regexp_full_match(t, '[+-]?[0-9]+') THEN <dialect> END)`.
+fn reading_numeric_arm(dialect: Dialect) -> OneChild {
+    // `TRY_CAST(t AS BIGINT)`.
+    let cast = OneChild::new(1, 1);
+    let numeric = match dialect {
+        // `(CASE WHEN cast BETWEEN 1 AND 24 THEN cast END)`: searched, so
+        // no rewrite — the `CASE`, its NULL fallthrough, the `BETWEEN`
+        // and its two bounds, over two writings of the cast.
+        Dialect::Otel => OneChild::new(5 + 2 * cast.fixed, cast.copies.saturating_mul(2)),
+        // `(CASE cast WHEN 0 THEN … WHEN 7 THEN … END)`: SIMPLE, eight
+        // rungs, so the cast lands eight times.
+        Dialect::Syslog => simple_case(cast, 8),
+    };
+    // The digits guard: the `CASE`, its NULL fallthrough, the match call
+    // and its pattern, over one further writing of the subject.
+    OneChild::new(
+        numeric.fixed.saturating_add(4),
+        numeric.copies.saturating_add(1),
+    )
 }
 
 /// The arms `crate::conform`'s reading `CASE` generates: every band token,
@@ -514,10 +612,11 @@ fn severity_case_arms() -> usize {
     table.len() + extras
 }
 
-/// Nodes in `crate::conform::severity_token_text_sql`: the `CASE` head and
-/// two per ladder arm.
-fn severity_token_text_fixed() -> u64 {
-    1 + 24 * 2
+/// `crate::conform::severity_token_text_sql`: a SIMPLE `CASE` over
+/// twenty-four ladder arms, which the parser rewrites into twenty-four
+/// equalities — so the subject lands twenty-four times, not once.
+fn severity_token_text() -> OneChild {
+    simple_case(OneChild::new(0, 1), 24)
 }
 
 // ---------------------------------------------------------------------------
@@ -1747,13 +1846,14 @@ mod tests {
             profile(&Rendering::Conform(ConformShape::UntypedText)),
             RenderProfile::new(3, vec![1])
         );
-        // The BIGINT rung names its text three times.
+        // The BIGINT rung names its text three times. It is a SEARCHED
+        // `CASE`, so the parser leaves the count alone.
         assert_eq!(
             profile(&Rendering::Conform(ConformShape::GuardedCast(
                 CanonicalType::BigInt,
                 Dialect::Otel
             ))),
-            RenderProfile::new(6, vec![3])
+            RenderProfile::new(7, vec![3])
         );
         // The VARCHAR rung IS the text.
         assert_eq!(
@@ -1763,32 +1863,113 @@ mod tests {
             ))),
             RenderProfile::new(0, vec![1])
         );
-        // The ladder's token text: the `CASE` head and two nodes per arm.
+        // The ladder's token text, priced as the parser leaves it: the
+        // `CASE`, its NULL fallthrough, and per arm one equality, the
+        // ladder number and the token string — over twenty-four whole
+        // copies of the subject.
         assert_eq!(
             profile(&Rendering::Conform(ConformShape::SeverityTokenText)),
-            RenderProfile::new(49, vec![1])
+            RenderProfile::new(2 + 24 * 3, vec![24])
         );
     }
 
-    /// The reading `CASE` writes its subject five times under `OTel` and
-    /// four under syslog — the counts `crate::conform` documents, read
-    /// back off the profile rather than restated.
+    /// The twenty-four-arm token kernel, hand-computed against
+    /// `DuckDB`'s simple-`CASE` rewrite, and the two renderings that carry
+    /// it.
+    ///
+    /// `CASE x WHEN 1 THEN 'trace' … WHEN 24 THEN 'fatal4' END` parses as
+    /// twenty-four `x = n` predicates, so `x` lands twenty-four times.
+    /// The nodes: one `CASE`, one fallthrough result, and three per arm
+    /// (the equality, the ladder number, the token string) — 74, plus the
+    /// 24 subject copies, which is exactly the 98-node tree
+    /// `json_serialize_sql` reports in
+    /// `trawl-engine/tests/duckdb_probe.rs`.
+    #[test]
+    fn the_token_text_kernel_is_priced_for_the_parser_rewrite() {
+        let kernel = profile(&Rendering::Conform(ConformShape::SeverityTokenText));
+        assert_eq!(kernel.fixed, 74);
+        assert_eq!(kernel.copies, vec![24]);
+        assert_eq!(kernel.fixed + kernel.copies[0], 98);
+
+        // A pattern operator over a SEVERITY pin renders through that
+        // kernel, so it inherits all twenty-four copies plus the operator
+        // and its bound pattern.
+        let pattern = profile(&Rendering::Pattern(compare::PatternForm::SeverityText));
+        assert_eq!(pattern, RenderProfile::new(76, vec![24]));
+
+        // Every other pattern target writes its subject once.
+        for form in [
+            compare::PatternForm::Native,
+            compare::PatternForm::BigIntText,
+            compare::PatternForm::BooleanText,
+            compare::PatternForm::DoubleText,
+            compare::PatternForm::Rfc3339Text,
+        ] {
+            assert_eq!(
+                profile(&Rendering::Pattern(form)).copies,
+                vec![1],
+                "{form:?}"
+            );
+        }
+    }
+
+    /// The reviewer's counterexample against the pre-repricing table: two
+    /// chained `sev(…) like` assignments, admitted at a delta of 166 when
+    /// the token kernel was priced at one subject copy, refused now that
+    /// it is priced at twenty-four.
+    ///
+    /// The arithmetic: `b` is the kernel over `sev(a)`, so it weighs about
+    /// 24 × the reading; `c` names `b` and pays 24 × that substitution,
+    /// which is six figures of bound tree for three lines of DSL.
+    #[test]
+    fn severity_pattern_chain_is_refused() {
+        let dsl = r#"* | let a = abs(_severity), b = sev(a) like "e%", c = sev(b) like "e%""#;
+        let (verdict, stats) = check_pipeline_complexity_with_stats(&pipeline(dsl));
+        let refused = verdict.expect_err("the chained severity patterns are refused");
+        assert_eq!(refused.limit, Limit::Lateral);
+        assert_eq!(refused.stage, "let");
+        assert_eq!(refused.target.as_deref(), Some("`c`"));
+        assert!(
+            stats.lateral_delta > 100_000,
+            "the chain costs {} substitutions",
+            stats.lateral_delta
+        );
+
+        // Its two prefixes stay admitted: nothing about the repricing
+        // refuses a single pattern over a severity reading.
+        check(r#"* | let a = abs(_severity), b = sev(a) like "e%""#)
+            .expect("one link is well inside the budget");
+    }
+
+    /// The reading `CASE` writes its subject five times in TEXT under
+    /// `OTel` and four under syslog — and seventy-nine / eighty-five times
+    /// once the parser has rewritten the two simple `CASE`s inside it.
+    /// Those are the numbers the profile carries, executed against the
+    /// bundled `DuckDB` in `trawl-engine/tests/duckdb_probe.rs`.
+    ///
+    /// Seventy-six of the seventy-nine come from one place: the outer
+    /// `CASE` has thirty-eight arms and its head names the subject twice.
     #[test]
     fn the_severity_reading_profiles_match_their_documented_shapes() {
         let repeated = profile(&Rendering::Conform(ConformShape::SeverityReading(
             Dialect::Otel,
         )));
-        assert_eq!(repeated.copies, vec![5]);
+        assert_eq!(repeated.copies, vec![79]);
+        // Syslog costs MORE, not less: its numeric rung is a second simple
+        // `CASE` with eight arms where `OTel`'s is a searched one.
         let syslog = profile(&Rendering::Conform(ConformShape::SeverityReading(
             Dialect::Syslog,
         )));
-        assert_eq!(syslog.copies, vec![4]);
-        // The bind-once shape names its subject exactly once, which is why
-        // `sev()` can carry bound parameters.
+        assert_eq!(syslog.copies, vec![85]);
+        // The bind-once shape still names its subject exactly once — the
+        // rewrite multiplies the LAMBDA-LOCAL variable, which is why
+        // `sev()` can carry bound parameters. Its fixed weight absorbs
+        // every one of those copies instead.
         let once = profile(&Rendering::Conform(ConformShape::SeverityReadingBindOnce(
             Dialect::Otel,
         )));
         assert_eq!(once.copies, vec![1]);
+        assert!(once.fixed > repeated.copies[0], "{once:?}");
         // Twenty band tokens plus the eighteen exact names the table does
         // not already carry.
         assert_eq!(severity_case_arms(), 38);

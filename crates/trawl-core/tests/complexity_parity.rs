@@ -232,7 +232,15 @@ fn the_verdict_never_depends_on_the_catalog() {
 
     // And the admitted side: a pinned severity chain that fits stays
     // fitting whatever the catalog says.
-    let dsl = "* | let s = sev(level) in (1, 3, 5), t = s";
+    //
+    // It is a BARE alias of one reading, not a reading inside a severity
+    // set: since the simple-`CASE` repricing, `sev()` alone weighs ~414
+    // nodes, so `t = s` spends most of the 512 budget on its own and
+    // anything multiplying it (a twelve-run set, a token-text pattern) is
+    // refused. That refusal is the point of the repricing, and this case
+    // exists to prove the CATALOG never moves the line — not to prove
+    // where the line is.
+    let dsl = "* | let s = sev(level), t = s";
     for scope in [PinScope::unpinned(), PinScope::root(&pins)] {
         trawl_core::stream::compile_stream_plan(&pipeline(dsl), &scope)
             .expect("an in-budget severity chain streams under any catalog");

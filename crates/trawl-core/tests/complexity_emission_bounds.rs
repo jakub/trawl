@@ -13,10 +13,15 @@
 //!
 //! Two assertions per case, over SQL the real emitter produced:
 //!
-//! 1. **exact child copies.** Each child operand is a field named
-//!    `__cN__`, which quotes into the SQL as `"__cN__"` and appears
-//!    nowhere else. The emitted text must carry it exactly `copies[N]`
-//!    times.
+//! 1. **child copies.** Each child operand is a field named `__cN__`,
+//!    which quotes into the SQL as `"__cN__"` and appears nowhere else.
+//!    The emitted text must carry it exactly `copies[N]` times — unless
+//!    the rendering contains a simple `CASE`, in which case the text is
+//!    the WRONG side of the parser and the declared count is only an
+//!    upper bound here ([`Copies::NormalizedCase`]). What those
+//!    renderings actually cost is counted post-parse, in
+//!    `trawl-engine/tests/duckdb_probe.rs`, which serializes the same SQL
+//!    through `json_serialize_sql`.
 //! 2. **a one-sided node bound.** `fixed + Σ copies` must be at least
 //!    [`oracle::nodes`], an independent lexical counter that reads the SQL
 //!    and knows nothing about the profile table. A profile may overcount;
@@ -273,16 +278,36 @@ fn fragment(dsl: &str, pin_map: &FieldTypes) -> String {
     tail.trim().to_string()
 }
 
+/// How the emitted TEXT's copy count relates to the declared one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Copies {
+    /// The text is the whole story: what the emitter writes is what the
+    /// binder sees.
+    Exact,
+    /// The rendering carries a simple `CASE`, which `DuckDB`'s parser
+    /// rewrites into one equality per arm — duplicating the subject —
+    /// before anything binds. The text undercounts on purpose here; the
+    /// parse-tree count lives in `trawl-engine/tests/duckdb_probe.rs`.
+    NormalizedCase,
+}
+
 /// The two assertions, for one rendering against one emitted fragment.
-fn check(label: &str, rendering: &Rendering, sql: &str, children: usize) {
+fn check(label: &str, rendering: &Rendering, sql: &str, children: usize, copies: Copies) {
     let p: RenderProfile = profile(rendering);
     for n in 0..children {
         let expected = p.copies.get(n).copied().unwrap_or(0);
         let found = sql.matches(&format!("\"{}\"", marker(n))).count() as u64;
-        assert_eq!(
-            found, expected,
-            "{label}: child {n} is written {found} times, the profile says {expected}\n{sql}"
-        );
+        match copies {
+            Copies::Exact => assert_eq!(
+                found, expected,
+                "{label}: child {n} is written {found} times, the profile says {expected}\n{sql}"
+            ),
+            Copies::NormalizedCase => assert!(
+                expected >= found,
+                "{label}: child {n} is written {found} times in text, \
+                 the profile declares only {expected}\n{sql}"
+            ),
+        }
     }
     let declared = p.fixed + p.copies.iter().sum::<u64>();
     let counted = oracle::nodes(sql);
@@ -301,7 +326,7 @@ fn check_let(
     children: usize,
 ) {
     let sql = fragment(&format!("* | let z = {expr}"), pin_map);
-    check(label, rendering, &sql, children);
+    check(label, rendering, &sql, children, Copies::Exact);
 }
 
 /// One `where` filter whose subject is a marker.
@@ -312,8 +337,19 @@ fn check_where(
     pin_map: &FieldTypes,
     children: usize,
 ) {
+    check_where_as(label, rendering, cond, pin_map, children, Copies::Exact);
+}
+
+fn check_where_as(
+    label: &str,
+    rendering: &Rendering,
+    cond: &str,
+    pin_map: &FieldTypes,
+    children: usize,
+    copies: Copies,
+) {
     let sql = fragment(&format!("* | where {cond}"), pin_map);
-    check(label, rendering, &sql, children);
+    check(label, rendering, &sql, children, copies);
 }
 
 // ── the structural renderings ─────────────────────────────────────────
@@ -460,13 +496,22 @@ fn every_pattern_target_matches_its_emission() {
     ] {
         assert_eq!(compare::pattern_form(Some(pin)), form, "{pin:?}");
         let map = pins(&[(0, pin)]);
+        // The SEVERITY target is the twenty-four-arm token table, a
+        // simple `CASE`: the text writes the subject once and the parsed
+        // tree twenty-four times.
+        let copies = if form == compare::PatternForm::SeverityText {
+            Copies::NormalizedCase
+        } else {
+            Copies::Exact
+        };
         for op in ["matches", "like", "ilike"] {
-            check_where(
+            check_where_as(
                 &format!("{pin:?} {op}"),
                 &Rendering::Pattern(form),
                 &format!("`__c0__` {op} \"x\""),
                 &map,
                 1,
+                copies,
             );
         }
     }
@@ -661,7 +706,7 @@ fn every_known_function_has_an_emission_fixture() {
     for (name, args, markers) in fixtures {
         let sql = fragment(&format!("* | let z = {name}({args})"), &none);
         let rendering = shape_of(name, args);
-        check(name, &rendering, &sql, *markers);
+        check(name, &rendering, &sql, *markers, Copies::Exact);
     }
 }
 
@@ -759,6 +804,9 @@ fn arity_dependent_shapes_match_their_emission() {
             &Rendering::Function(FunctionShape::Sev { dialect, argc }),
             &sql,
             1,
+            // `sev()` binds its subject once: the parser's `CASE` rewrite
+            // multiplies the lambda-local variable, not the argument.
+            Copies::Exact,
         );
         assert!(!sql.contains("otel") && !sql.contains("syslog"), "{sql}");
         assert_eq!(
@@ -824,41 +872,60 @@ fn every_conform_helper_matches_its_profile() {
         ),
     ];
     for (shape, sql) in cases {
-        check(&format!("{shape:?}"), &Rendering::Conform(shape), &sql, 1);
+        // The token table and both reading shapes are built out of simple
+        // `CASE`s, so their declared copy counts describe the PARSED tree
+        // and are an upper bound on the text.
+        check(
+            &format!("{shape:?}"),
+            &Rendering::Conform(shape),
+            &sql,
+            1,
+            Copies::NormalizedCase,
+        );
     }
 
     for pin in CanonicalType::ALL {
         for dialect in [Dialect::Otel, Dialect::Syslog] {
             let sql = conform::guarded_cast_in(subject, pin, dialect);
+            // Only the SEVERITY rung is the reading kernel; every other
+            // rung is a searched `CASE` or a bare cast, counted exactly.
+            let copies = if pin == CanonicalType::Severity {
+                Copies::NormalizedCase
+            } else {
+                Copies::Exact
+            };
             check(
                 &format!("guarded_cast_in({pin:?}, {dialect:?})"),
                 &Rendering::Conform(ConformShape::GuardedCast(pin, dialect)),
                 &sql,
                 1,
+                copies,
             );
         }
     }
 
-    // The counts `conform.rs` documents in prose, as numbers.
-    assert_eq!(
-        profile(&Rendering::Conform(ConformShape::SeverityReading(
-            Dialect::Otel
-        )))
-        .copies,
-        vec![5]
-    );
-    assert_eq!(
-        profile(&Rendering::Conform(ConformShape::SeverityReading(
-            Dialect::Syslog
-        )))
-        .copies,
-        vec![4]
-    );
-    assert_eq!(
-        profile(&Rendering::Conform(ConformShape::SeverityReadingBindOnce(
-            Dialect::Otel
-        )))
-        .copies,
-        vec![1]
-    );
+    // The counts `conform.rs` documents in prose, as numbers — these are
+    // TEXT counts, which is the number that matters for pushing bound
+    // parameters, and they are asserted against the emitted string.
+    for (dialect, written) in [(Dialect::Otel, 5), (Dialect::Syslog, 4)] {
+        let sql = conform::severity_reading_sql(subject, dialect);
+        assert_eq!(sql.matches(subject).count(), written, "{dialect:?}");
+        // And the profile, which counts what the BINDER sees, is strictly
+        // larger: the parser has multiplied the subject by then.
+        let declared = profile(&Rendering::Conform(ConformShape::SeverityReading(dialect)));
+        assert!(declared.copies[0] > written as u64, "{declared:?}");
+    }
+    for dialect in [Dialect::Otel, Dialect::Syslog] {
+        let sql = conform::severity_reading_sql_bind_once(subject, dialect);
+        assert_eq!(sql.matches(subject).count(), 1, "{dialect:?}");
+        // The bind-once shape is the one whose text count and parsed
+        // count agree, which is exactly what lets `sev()` carry `?`.
+        assert_eq!(
+            profile(&Rendering::Conform(ConformShape::SeverityReadingBindOnce(
+                dialect
+            )))
+            .copies,
+            vec![1]
+        );
+    }
 }
