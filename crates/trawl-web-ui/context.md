@@ -51,3 +51,9 @@ _Avoid_: clickable row, row handler, stretched link (that is the CSS technique, 
 **Range dialog**:
 The date-range picker's open panel: a named modal dialog under the overlay stack, opened by its trigger button, closed by Escape, its scrim or an applied range, returning focus to the trigger. It owns the search page's range and nothing else.
 _Avoid_: popover, date picker (that is the whole control, trigger included), dropdown
+
+### Settings surfaces
+
+**Health page**:
+The Settings destination at `/settings/health`: an operational overview over the server's health, stats and dashboard routes plus the running-queries list. Its sections gate individually — health for every signed-in user, admin telemetry only for a key holding server-manage, cancel controls only where the caller's permissions could succeed — and its live data is the shell's one dashboard stream, never a second connection.
+_Avoid_: status page, dashboard (that is the server's snapshot type), health check (that is the endpoint)

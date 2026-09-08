@@ -28,6 +28,16 @@ Per affordance:
   destination. The three that leave need a configuration API that does not
   exist (a config file is not one) and return with that API, each through
   its own prep.
+  *Amended 2026-09-08 (slices G1/G3 prep): the Health page also carries
+  query management — the running-queries list with per-row Cancel —
+  under the EXISTING authority model (`/queries` reads under the query
+  permission; cancel is ServerManage-any / QueryCancel-own-only by exact
+  key id). The wire gains a server-computed `own` flag per entry so the
+  Cancel control renders only where the caller could succeed; a
+  confirmation guards it. Sequencing is also reversed from the #100
+  table: the rail shrink cannot ship a Health entry that reaches a
+  placeholder, so the Health page (G3) lands first and points today's
+  entry at the real page; the rail shrink (G1) follows.*
 - **Topbar: the bell leaves; ⌘K becomes a real palette in fleet-ui.** The
   palette's first command set is routes only: the consumer's mode tabs and
   rail items, the data `Shell` already receives. Both `Meta+K` and

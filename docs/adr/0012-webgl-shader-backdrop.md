@@ -12,6 +12,20 @@ status: accepted (2026-08-07)
 > feature-off compile shape is still guarded by the bare
 > `cargo check -p fleet-ui` wasm gate.
 
+> **amendment (2026-09-08, slice F prep, #100):** "silent and permanent"
+> is refined into a terminal contract the code actually keeps. Shader
+> creation is transactional: WebGL absence, compile failure and link
+> failure all take one cleanup path (stop scheduled work, remove the
+> partial canvas and parent marker, suppress only the vendored library's
+> expected shader diagnostics) and return null — the compile-failure leg
+> no longer falls back by accident via a TypeError that `console.error`s.
+> A lost context flips the wrapper handle into a terminal `dead` state:
+> speed AND uniform calls become no-ops, so the live reduced-motion and
+> theme effects cannot restart a dead mount. `dispose()` also removes
+> `data-paper-shader` from the parent (upstream only deletes its JS
+> property). Rust observes none of this — the only product outcome of
+> every failure is the CSS floor, unchanged.
+
 jakub/coastwatch#308 asks fleet-ui for a decorative animated backdrop —
 a slow-drifting mesh gradient behind the login card, themed with the
 Mira Blue ramp (ADR-0007) — rendered with `@paper-design/shaders`, a
