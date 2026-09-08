@@ -29,7 +29,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   started` with no timeout history row; expiry after it is the existing
   `504`. **Work that outlives its request is now accounted**: `GET
   /api/v1/queries` carries a `retained` list (id, kind, started,
-  retained_ms, and owner-or-admin-only user and DSL), stats and the
+  retained_ms, plus the user and DSL for a submitted query, exactly as
+  the active and recent lists carry them; system work shows no text
+  below `server_manage`), stats and the
   dashboard snapshot carry `pool_retained` as a subset of `pool_active`,
   the terminal panel shows `active: 3/4 (1 retained)` when nonzero, and
   `/metrics` gains `trawl_query_permits_retained`. Cancellation reaches

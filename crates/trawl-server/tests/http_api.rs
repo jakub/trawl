@@ -538,11 +538,13 @@ async fn queries_accessible_by_analyst_and_reader() {
 /// A query whose request timed out keeps its permit until the work
 /// actually stops, and `GET /queries` says so (ADR-0024).
 ///
-/// Three readers, one retained entry. The operator and the exact key that
-/// submitted it see the name and the DSL; a second key carrying the SAME
-/// display name sees the capacity facts and nothing else, because
-/// ownership is the keystore id and never the name. The same entry is not
-/// also listed as active: one permit, one line.
+/// Three readers, one retained entry. An interactive query shows its user
+/// and its DSL to every reader of the route, exactly as the active and
+/// recent lists have always shown the same query. A reader who can watch
+/// it run and read it in history learns nothing from the retained line.
+/// The entry is not also listed as active: one permit, one line. What the
+/// key id still governs is CANCELLATION, asserted below: an unrelated key
+/// sharing the display name is refused.
 ///
 /// The retained window is held open, not timed: this server's own pool
 /// parks its worker just past the work-start transition and stays there
@@ -553,7 +555,7 @@ async fn queries_accessible_by_analyst_and_reader() {
 /// the test demanded a 504.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // one retained window, asserted from three readers
-async fn retained_work_is_listed_once_and_shown_only_to_its_owner_or_an_admin() {
+async fn retained_work_is_listed_once_and_carries_its_display_metadata() {
     use trawl_server::pool::seam::Seam;
 
     let permissive = RateLimitConfig {
@@ -646,10 +648,16 @@ async fn retained_work_is_listed_once_and_shown_only_to_its_owner_or_an_admin() 
     assert_eq!(theirs.kind, "query");
     assert!(theirs.started);
     assert_eq!(
-        theirs.user, None,
-        "an equal display name is not an ownership proof"
+        theirs.user.as_deref(),
+        Some("twin"),
+        "an interactive entry carries the display metadata this route always carried"
     );
-    assert_eq!(theirs.query, None, "nor does it earn the DSL");
+    assert_eq!(theirs.query.as_deref(), Some(dsl));
+    assert!(
+        by_twin.recent.iter().any(|q| q.id == id && q.query == dsl),
+        "the same reader reads the same query text in history, so hiding it \
+         from the retained line would protect nothing"
+    );
 
     // Cancellation authority follows the same record, not the tracker:
     // the request already answered, and the key that submitted it can

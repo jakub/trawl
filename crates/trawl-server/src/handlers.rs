@@ -129,7 +129,7 @@ pub async fn query(
     // other wait (ADR-0024) and its failures are the handler's, not the
     // caller's to catch: escaping by `?` here would leave the tracker entry
     // this request already opened running forever. Both land as a refusing
-    // outcome and finish tracking through the one path below — expiry as
+    // outcome and finish tracking through the one path below. Expiry is
     // the pre-start capacity refusal, since no work was ever started and a
     // timeout history row would claim otherwise.
     let admitted = match crate::admission::check_dsl(&req.query) {
@@ -804,19 +804,26 @@ fn is_date_dir(name: &str) -> bool {
 /// One unit of retained work as a given reader may see it (ADR-0024).
 ///
 /// The id, the kind and the timing are facts about the server's capacity
-/// and go to every reader the route already admits. The submitter's name
-/// and the DSL are the submitter's, so they reach only an operator
-/// (`ServerManage`) or the exact key that submitted the work — a
-/// name match would hand one key another key's query text, since display
-/// names are mutable and non-unique. System work (a scheduled run, a
-/// health probe) has no human owner, so nothing but an operator sees its
-/// text, and its owner id never leaves the server either way.
+/// and go to every reader the route already admits.
+///
+/// Interactive work, a query some key submitted, carries its user and
+/// its DSL to every reader of this route, which is what `active` and
+/// `recent` have always done for the same query. Retention is a phase of
+/// one request's life, not a second visibility class: hiding the text here
+/// while `recent` shows it for the same id would be an incoherence, not a
+/// protection. `Permission::Query` is the gate on all three lists.
+///
+/// System work (a scheduled run, a health probe) is the exception: it has
+/// no human owner and its DSL is the server's own, so only an operator
+/// (`ServerManage`) sees its text. Owner ids never leave the server in
+/// either case, and viewing is not cancellation. That authority is still
+/// the exact keystore id (see `check_cancel_authority`).
 pub(crate) fn retained_snapshot(
     work: &crate::pool::RetainedWork,
     verified: &VerifiedKey,
 ) -> RetainedWorkSnapshot {
     let entitled = verified.has_permission(Permission::ServerManage)
-        || work.owner == crate::pool::WorkOwner::Key(verified.id);
+        || matches!(work.owner, crate::pool::WorkOwner::Key(_));
     RetainedWorkSnapshot {
         id: work.id,
         kind: work.kind.as_str().to_owned(),
@@ -3493,19 +3500,23 @@ mod tests {
         }
     }
 
-    /// The capacity facts go to every reader the route admits; the
-    /// submitter's name and DSL go to the operator and to the exact key
-    /// that submitted the work, and to nobody else — including a second
-    /// key carrying the same display name (ADR-0024).
+    /// An interactive query shows the same user and DSL to every reader
+    /// of this route, whichever key submitted it (ADR-0024).
+    ///
+    /// That is what `active` and `recent` already do for the same id, and
+    /// a retained entry is the same request one phase later: a reader who
+    /// can watch a query run, and read its text in history when it timed
+    /// out, learns nothing new from the retained line. Cancellation is the
+    /// authority that stays keyed to the exact id.
     #[test]
-    fn retained_visibility_follows_the_key_id_not_the_name() {
+    fn retained_interactive_work_keeps_its_existing_display_visibility() {
         let work = retained_query(crate::pool::WorkOwner::Key(7));
 
         let admin = viewer(99, "ops", &["query", "server_manage"]);
         let owner = viewer(7, "twin", &["query"]);
-        let twin = viewer(8, "twin", &["query"]);
+        let unrelated = viewer(8, "twin", &["query"]);
 
-        for reader in [&admin, &owner] {
+        for reader in [&admin, &owner, &unrelated] {
             let snap = retained_snapshot(&work, reader);
             assert_eq!(snap.id, 42);
             assert_eq!(snap.kind, "query");
@@ -3514,16 +3525,6 @@ mod tests {
             assert_eq!(snap.user.as_deref(), Some("twin"));
             assert_eq!(snap.query.as_deref(), Some("service=nginx | stats count()"));
         }
-
-        let seen_by_twin = retained_snapshot(&work, &twin);
-        assert_eq!(seen_by_twin.id, 42);
-        assert_eq!(seen_by_twin.kind, "query");
-        assert_eq!(seen_by_twin.retained_ms, 1500);
-        assert_eq!(
-            seen_by_twin.user, None,
-            "an equal display name is not an ownership proof"
-        );
-        assert_eq!(seen_by_twin.query, None);
     }
 
     /// System work (a scheduled run, a health probe) has no human owner,
@@ -3547,10 +3548,11 @@ mod tests {
 
     /// Wire shape: an entry a reader may not see carries no null-valued
     /// keys at all, so the absence is not a field a client must special
-    /// case.
+    /// case. System work below `ServerManage` is the entry that hides
+    /// anything.
     #[test]
     fn a_filtered_retained_entry_omits_the_fields_it_hides() {
-        let work = retained_query(crate::pool::WorkOwner::Key(7));
+        let work = retained_query(crate::pool::WorkOwner::System);
         let snap = retained_snapshot(&work, &viewer(8, "twin", &["query"]));
         let json = serde_json::to_string(&snap).expect("serialize");
         assert!(!json.contains("\"user\":"), "{json}");

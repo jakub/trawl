@@ -2209,8 +2209,8 @@ mod tests {
     /// POOL and `query_id`.
     ///
     /// Both halves are needed. Ids start at zero in every pool, so under
-    /// the plain `cargo test` harness — one process, tests in threads —
-    /// filtering on the id alone let a sibling test's refusal of its own
+    /// the plain `cargo test` harness, one process running tests in
+    /// threads, filtering on the id alone let a sibling test's refusal of its own
     /// query 0 land in this test's count, and "exactly one refusal" is a
     /// count.
     mod capture {
@@ -3724,7 +3724,7 @@ mod tests {
 
     /// Acquisition is only half of a sample's life. Once it holds a
     /// permit it reads parquet, and that read has to answer to the
-    /// caller's deadline too (ADR-0024) — otherwise an autocomplete
+    /// caller's deadline too (ADR-0024). Otherwise an autocomplete
     /// request over a huge corpus hangs for as long as the read takes,
     /// with nothing in the retained count to explain the missing permit.
     #[tokio::test(start_paused = true)]

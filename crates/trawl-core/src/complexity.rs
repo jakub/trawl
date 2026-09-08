@@ -302,7 +302,7 @@ pub enum FunctionShape {
     /// One wrapper node over `n` arguments, each written once —
     /// `AVG(a)`, `IF(a, b, c)`, `COALESCE(a, …)`.
     Plain(usize),
-    /// `case(c1, v1, …[, fallback])` — the searched `CASE`, whose fixed
+    /// `case(c1, v1, …[, fallback])`: the searched `CASE`, whose fixed
     /// cost depends on the parity of its argument list.
     ///
     /// An odd arity writes the trailing `ELSE`. An even one writes none,

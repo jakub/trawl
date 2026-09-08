@@ -110,11 +110,13 @@ capacity unaccounted:
 - `GET /api/v1/queries` carries a `retained` list beside the active one.
   Each entry has the pool `id`, the work `kind` (`query`, `from_saved`,
   `export`, `scheduled`, `ping`, `sample`), whether it `started`, and
-  `retained_ms`, how long it has outlived its request. The submitting
-  key's display name and the DSL appear only for a reader entitled to
-  them: an admin, or the exact key that submitted it. Work with no human
-  owner (ping, sampling, scheduled runs) never shows query text to
-  anyone below `server_manage`.
+  `retained_ms`, how long it has outlived its request. A query some key
+  submitted also carries that key's display name and its DSL, to every
+  reader holding `query`, the same metadata the `active` and `recent`
+  lists carry for the same query. Work with no human owner (ping,
+  sampling, scheduled runs) never shows query text to anyone below
+  `server_manage`. Reading an entry is not authority to stop it:
+  cancellation still needs `server_manage` or the exact submitting key.
 - `GET /api/v1/stats` and the dashboard snapshot carry `pool_retained`
   beside `pool_active`. Retained work is a **subset** of held permits,
   never an extra count, and the terminal dashboard renders
