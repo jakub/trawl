@@ -253,6 +253,13 @@ export const SEL = {
   /// two never coexist, so a spec reads one of them to say which half
   /// of the swap is on screen.
   netRenameInput: '.sd-ttl input.name-edit',
+  /// crates/trawl-web-ui/src/components/net_drawer.rs — one run row of
+  /// the drawer's Runs tab. Scoped to the drawer body: the nets table
+  /// underneath the drawer renders the very same row shape.
+  netRunRow: '.sd-body .tbl-body .tbl-row',
+  /// The result preview an expanded run row mounts under itself. One
+  /// per open row, which is how a spec says the row expanded ONCE.
+  netRunPreview: '.sd-body .run-preview',
 
   // -- range dialog ---------------------------------------------------
   /// crates/trawl-web-ui/src/components/editor_wrap.rs DateRangePopover

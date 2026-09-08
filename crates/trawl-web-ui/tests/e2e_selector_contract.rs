@@ -951,6 +951,30 @@ const CONTRACTS: &[Contract] = &[
         source: NET_DRAWER_RS,
         hook: "class=\"name-edit\"",
     },
+    Contract {
+        assignment: "netRunRow: '.sd-body .tbl-body .tbl-row',",
+        source_path: "../fleet-ui/src/drawer.rs",
+        source: DRAWER_RS,
+        hook: "class=\"sd-body\"",
+    },
+    Contract {
+        assignment: "netRunRow: '.sd-body .tbl-body .tbl-row',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "class=\"tbl-row\"",
+    },
+    Contract {
+        assignment: "netRunPreview: '.sd-body .run-preview',",
+        source_path: "../fleet-ui/src/drawer.rs",
+        source: DRAWER_RS,
+        hook: "class=\"sd-body\"",
+    },
+    Contract {
+        assignment: "netRunPreview: '.sd-body .run-preview',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "class=\"run-preview\"",
+    },
     // -- range dialog ---------------------------------------------------
     Contract {
         assignment: "rangeDialog: '.dr-pop[role=\"dialog\"]',",

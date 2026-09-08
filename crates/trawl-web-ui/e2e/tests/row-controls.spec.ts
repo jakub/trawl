@@ -349,3 +349,86 @@ test('schema quick actions: Tab reveals and Enter searches', async ({ page, requ
   // the service's own search.
   await expect(page).toHaveURL(/\/search\?q=service%3D/);
 });
+
+test('net run row: Enter expands once and Space collapses', async ({ page, request }) => {
+  await resetScenario(request, 'corpus');
+  // The run's result read, counted by URL. A row that toggled on both
+  // the button AND an ancestor would open and close in one press and
+  // leave no end state to assert; the number sees it.
+  const resultPath = `/api/v1/saved/${CORPUS.netId}/runs/${CORPUS.runWithResult}`;
+  const resultReads: string[] = [];
+  page.on('request', (r) => {
+    if (new URL(r.url()).pathname === resultPath) resultReads.push(r.url());
+  });
+  await page.goto(`/jobs/nets?net=${CORPUS.netId}&ntab=runs`);
+
+  const row = page.locator(SEL.netRunRow).first();
+  const control = row.locator(SEL.rowStretch);
+  await expect(control).toHaveJSProperty('tagName', 'BUTTON');
+  await expect(control).toHaveAttribute('type', 'button');
+  await expect(control).toHaveAttribute('aria-expanded', 'false');
+
+  // The Runs tab is the focusable before the table: its header row
+  // carries no controls at all.
+  await page.locator(SEL.drawerTab).nth(1).focus();
+  await page.keyboard.press('Tab');
+  await expectFocusRing(control);
+
+  await countClicksOn(page, SEL.netRunRow);
+
+  await page.keyboard.press('Enter');
+  await expect(control).toHaveAttribute('aria-expanded', 'true');
+  await expect(page.locator(SEL.netRunPreview)).toHaveCount(1);
+  expect(await rowClicks(page)).toBe(1);
+  await expect.poll(() => resultReads.length).toBe(1);
+
+  // Space is the other half of what a button answers to, and it
+  // collapses rather than opening a second copy.
+  await page.keyboard.press(' ');
+  await expect(control).toHaveAttribute('aria-expanded', 'false');
+  await expect(page.locator(SEL.netRunPreview)).toHaveCount(0);
+  expect(await rowClicks(page)).toBe(2);
+  expect(resultReads).toHaveLength(1);
+
+  // And the pointer, landing on the far cell rather than the control:
+  // the stretched `::after` is what it hits, so the row toggles once.
+  const cell = row.locator('.mono').last();
+  const point = await cell.evaluate((el) => {
+    const box = el.getBoundingClientRect();
+    const at = { x: box.left + box.width / 2, y: box.top + box.height / 2 };
+    const under = document.elementFromPoint(at.x, at.y);
+    return { ...at, hit: under?.closest('button')?.className ?? null };
+  });
+  expect(point.hit, 'the pointer over a run cell must land on the row control').toContain(
+    'row-stretch',
+  );
+  await page.mouse.click(point.x, point.y);
+  await expect(control).toHaveAttribute('aria-expanded', 'true');
+  expect(await rowClicks(page)).toBe(3);
+});
+
+test('schema quick actions: Live Tail opens the tail tab', async ({ page, request }) => {
+  await resetScenario(request, 'corpus');
+  await page.goto('/search/schema');
+
+  const row = page.locator(SEL.tableRow).first();
+  const tail = row.locator(SEL.schemaQuickAction).nth(1);
+  await expect(tail).toHaveJSProperty('tagName', 'BUTTON');
+  await expect(tail).toHaveAttribute('type', 'button');
+  // The glyph is an icon, so the name is the whole sentence — and it
+  // names the service, since every row carries the same pair.
+  await expect(tail).toHaveAccessibleName(nameFrom(COPY.schemaTailName, CORPUS.service));
+
+  // Two stops past the row's own control: Search first, then this one.
+  await row.locator(SEL.rowStretch).focus();
+  await page.keyboard.press('Tab');
+  await page.keyboard.press('Tab');
+  await expectFocusRing(tail);
+
+  await page.keyboard.press('Enter');
+  // A command through the navigator, and what it builds is the drawer
+  // opened on the tail tab rather than on the default one.
+  await expect(page).toHaveURL(new RegExp(`svc=${CORPUS.service}&stab=tail`));
+  await expect(page.locator(SEL.drawerPanel)).toHaveCount(1);
+  await expect(page.locator(SEL.drawerTab).nth(2)).toHaveAttribute('aria-selected', 'true');
+});
