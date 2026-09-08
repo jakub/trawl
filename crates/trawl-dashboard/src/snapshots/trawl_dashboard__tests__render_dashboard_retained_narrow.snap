@@ -1,0 +1,28 @@
+---
+source: crates/trawl-dashboard/src/lib.rs
+expression: terminal.backend().to_string()
+---
+" trawld v0.1.0                                              "
+" host: test-host  addr: 127.0.0.1:5514  uptime: 2h 34m  heal"
+"┌ EXECUTOR POOL ───────┐┌ HOT BUFFER ──────────────────────┐"
+"│ active: 4/4 (2 ret...││ events: 12,847 / 100,000 (12.8%) │"
+"│█████████100% ████████││ bytes:  4.2 MB / 100.0 MB (4.2%) │"
+"│                      ││ batches: 23                      │"
+"└──────────────────────┘└──────────────────────────────────┘"
+"┌ HTTP INGEST ─────────┐┌ SYSLOG INGEST ───────────────────┐"
+"│ events: 847,293  ~340││                                  │"
+"│ rejected: 47         ││                                  │"
+"└──────────────────────┘└──────────────────────────────────┘"
+"┌ QUERY THROUGHPUT ────┐┌ DATA PIPELINE ───────────────────┐"
+"│ total: 1,247  2.1 q/s││ wal: 12 files (4.2 MB)  compacted│"
+"│ errors: 12  timeouts:││ parquet: 847 files (12.4 GB)  run│"
+"│                      ││                                  │"
+"└──────────────────────┘└──────────────────────────────────┘"
+"┌ SSE STREAMS ─────────┐┌ SCHEDULER ───────────────────────┐"
+"│ active: 2/32         ││ enabled: 3 schedules             │"
+"└──────────────────────┘└──────────────────────────────────┘"
+"┌ RECENT QUERIES ──────────────────────────────────────────┐"
+"│#1247   23ms     142 rows   OK   _severity=error last=1h |│"
+"│#1246   87ms     1 rows     OK   * | stats count()        │"
+"└──────────────────────────────────────────────────────────┘"
+" q or ctrl-c to quit                                        "

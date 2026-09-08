@@ -27,7 +27,8 @@ use fleet_auth::{KeyStore, PrincipalKind};
 use sqlx::PgPool;
 use trawl_api::value::Value;
 use trawl_server::config::SchedulerConfig;
-use trawl_server::pool::ExecutorPool;
+use trawl_server::deadline::Deadline;
+use trawl_server::pool::{ExecutorPool, WorkContext, WorkKind};
 use trawl_server::report_window::{
     ScheduleWindow, WindowKind, format_window_bound, truncate_to_micros,
 };
@@ -725,6 +726,80 @@ async fn fixed_windows_trail_each_planned_fire_and_never_catch_up() {
     );
 }
 
+/// A scheduled attempt that cannot get a permit fails THAT run and
+/// nothing else (ADR-0024).
+///
+/// The pool is held exclusively, so the attempt spends its whole budget
+/// queueing and never starts work. That is a capacity refusal, not an
+/// execution timeout: the run row carries the fixed capacity sentence,
+/// and the schedule stays enabled on its ordinary cadence, because a
+/// server that is busy for a minute is not an operator's mistake to
+/// repair.
+#[tokio::test]
+async fn a_scheduled_run_refused_for_capacity_fails_only_that_attempt() {
+    let h = harness().await;
+    let sq = h.schedule("busy", DSL, None, 3600, 0).await;
+
+    // Every permit in one hand: no lane can acquire one until it drops.
+    let held = h
+        .pool
+        .exclusive(StdDuration::from_secs(5))
+        .await
+        .expect("the idle pool grants exclusivity");
+
+    for handle in poll_and_execute(
+        &h.schedules,
+        &h.key_store,
+        &h.pool,
+        &h.config,
+        1, // a one-second budget, spent entirely on the queue
+        truncate_to_micros(at(Duration::seconds(3))),
+    )
+    .await
+    {
+        handle.await.expect("a refused execution must not panic");
+    }
+    drop(held);
+
+    let runs = h.runs(sq).await;
+    assert_eq!(runs.len(), 1, "the attempt is recorded, once");
+    assert_eq!(
+        runs[0].status,
+        RunStatus::Error,
+        "capacity is an error outcome, not an execution timeout"
+    );
+    let message = runs[0]
+        .error_message
+        .as_deref()
+        .expect("a failed run records why");
+    assert!(
+        message.contains(trawl_server::error::CAPACITY_NOT_STARTED),
+        "the fixed capacity sentence survives to the run row: {message}"
+    );
+    assert_eq!(runs[0].row_count, None);
+    assert_eq!(runs[0].result_path, None);
+
+    // Later scheduling is untouched: same enabled schedule, next fire on
+    // the ordinary cadence, and the following tick succeeds.
+    let schedule = h
+        .schedules
+        .get_schedule_for_saved_query(sq, h.key_id)
+        .await
+        .expect("read schedule")
+        .expect("the schedule still exists");
+    assert!(schedule.enabled, "a busy minute never disables a schedule");
+    assert_eq!(schedule.next_fire_at, at(hours(1)));
+
+    h.tick(at(hours(1) + Duration::seconds(3))).await;
+    let runs = h.runs(sq).await;
+    assert_eq!(runs.len(), 2);
+    assert_eq!(
+        runs[1].status,
+        RunStatus::Success,
+        "the next attempt runs normally"
+    );
+}
+
 /// `report_runs.query` is reproducible by paste (ruling 11): re-parsing it
 /// yields the run's own bounds, and re-executing it standalone yields the
 /// run's own rows.
@@ -754,9 +829,10 @@ async fn a_windowed_run_query_reexecutes_standalone_with_identical_bounds() {
         .execute(
             h.pool.allocate_query_id(),
             &run.query,
-            StdDuration::from_secs(TIMEOUT_SECS),
+            Deadline::after(StdDuration::from_secs(TIMEOUT_SECS)),
             false,
             0,
+            WorkContext::system(WorkKind::Query),
         )
         .await;
     let result = outcome.result.expect("the stored text executes");

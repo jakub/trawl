@@ -55,7 +55,12 @@ pub fn spawn_stats_emitter(
                         &sse_semaphore,
                         hot_buffer.as_ref(),
                     );
-                    crate::metrics::collect_gauges(hot_buffer.as_ref(), &fallback_glob, wal_dir.as_deref());
+                    crate::metrics::collect_gauges(
+                        hot_buffer.as_ref(),
+                        &fallback_glob,
+                        wal_dir.as_deref(),
+                        pool.retained(),
+                    );
                 }
                 _ = shutdown_rx.changed() => {
                     tracing::info!(
@@ -83,6 +88,8 @@ fn emit_stats(
     let pool_available = pool.available_permits();
     let pool_max = pool.capacity();
     let pool_active = pool_max - pool_available;
+    // A subset of pool_active, not an addition to it (ADR-0024).
+    let pool_retained = pool.retained();
     let sse_available = sse_semaphore.available_permits();
 
     let (hot_buffer_events, hot_buffer_bytes, hot_buffer_batches) = if let Some(buf) = hot_buffer {
@@ -98,6 +105,7 @@ fn emit_stats(
         pool_available,
         pool_max,
         pool_active,
+        pool_retained,
         sse_available,
         hot_buffer_events,
         hot_buffer_bytes,

@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use common::{roles, setup, setup_with_rate_limit};
+use common::{roles, setup, setup_with_query_timeout, setup_with_rate_limit};
 use fleet_auth::{KeyStore, PrincipalKind};
 use trawl_client::HttpClient;
 use trawl_server::config::RateLimitConfig;
@@ -533,6 +533,249 @@ async fn queries_accessible_by_analyst_and_reader() {
     // Both analyst and reader can list running queries.
     analyst.queries().await.unwrap();
     reader.queries().await.unwrap();
+}
+
+/// A query whose request timed out keeps its permit until the work
+/// actually stops, and `GET /queries` says so (ADR-0024).
+///
+/// Three readers, one retained entry. An interactive query shows its user
+/// and its DSL to every reader of the route, exactly as the active and
+/// recent lists have always shown the same query. A reader who can watch
+/// it run and read it in history learns nothing from the retained line.
+/// The entry is not also listed as active: one permit, one line. What the
+/// key id still governs is CANCELLATION, asserted below: an unrelated key
+/// sharing the display name is refused.
+///
+/// The retained window is held open, not timed: this server's own pool
+/// parks its worker just past the work-start transition and stays there
+/// until the test lets it go, so every assertion below runs against a
+/// state that cannot move. A wall-clock window (a long worker delay minus
+/// a short request timeout) used to stand in for that, which made the
+/// verdict depend on how busy the runner was and put a correct 503 where
+/// the test demanded a 504.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // one retained window, asserted from three readers
+async fn retained_work_is_listed_once_and_carries_its_display_metadata() {
+    use trawl_server::pool::seam::Seam;
+
+    let permissive = RateLimitConfig {
+        default_rpm: 1_000_000,
+        ..RateLimitConfig::default()
+    };
+    let server = setup_with_query_timeout(permissive, 1).await;
+    // This server's pool only: a hold installed here parks nothing in any
+    // other test's pool, so the plain parallel harness is safe.
+    let seams = server.state.query.pool.seams();
+    let started = seams.hold(Seam::Started);
+
+    let store = KeyStore::from_pool(server.fleet_pool.clone());
+    let key_a = store
+        .create_key(
+            "twin",
+            PrincipalKind::Service,
+            &roles(&["trawl-analyst"]),
+            None,
+        )
+        .await
+        .unwrap();
+    let key_b = store
+        .create_key(
+            "twin",
+            PrincipalKind::Service,
+            &roles(&["trawl-analyst"]),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_ne!(key_a.info.id, key_b.info.id);
+
+    let a = HttpClient::new_insecure(&server.url, key_a.plaintext_token.as_str()).unwrap();
+    let b = HttpClient::new_insecure(&server.url, key_b.plaintext_token.as_str()).unwrap();
+    let admin = HttpClient::new_insecure(&server.url, &server.admin_token).unwrap();
+
+    let dsl = "service=nginx | stats count()";
+    let slow = {
+        let a = a.clone();
+        tokio::spawn(async move { a.query_paginated(dsl, None, None).await })
+    };
+
+    // The request answers first: a 504, because the worker is parked PAST
+    // the work-start transition and expiry there is a timeout, never the
+    // capacity refusal of work that never started.
+    let answered = slow.await.expect("the request task joins");
+    match answered {
+        Err(trawl_client::ClientError::Server { status, .. }) => assert_eq!(status, 504),
+        other => panic!("expected the query to time out, got: {other:?}"),
+    }
+
+    let seen = admin.queries().await.unwrap();
+    let entry = seen
+        .retained
+        .iter()
+        .find(|w| w.query.as_deref() == Some(dsl))
+        .expect("the timed-out query still holds its permit");
+    let id = entry.id;
+    assert_eq!(entry.kind, "query");
+    assert!(
+        entry.started,
+        "the delay sits past the work-start transition"
+    );
+    assert_eq!(entry.user.as_deref(), Some("twin"));
+    assert!(
+        !seen.active.iter().any(|q| q.id == id),
+        "retained work is not counted again as an active request"
+    );
+    assert!(
+        seen.recent.iter().any(|q| q.id == id && q.timed_out),
+        "the same request is in recent history, where it recorded its outcome"
+    );
+
+    let by_owner = a.queries().await.unwrap();
+    let mine = by_owner
+        .retained
+        .iter()
+        .find(|w| w.id == id)
+        .expect("the owner sees its own retained work");
+    assert_eq!(mine.user.as_deref(), Some("twin"));
+    assert_eq!(mine.query.as_deref(), Some(dsl));
+
+    let by_twin = b.queries().await.unwrap();
+    let theirs = by_twin
+        .retained
+        .iter()
+        .find(|w| w.id == id)
+        .expect("every query reader sees the capacity fact");
+    assert_eq!(theirs.kind, "query");
+    assert!(theirs.started);
+    assert_eq!(
+        theirs.user.as_deref(),
+        Some("twin"),
+        "an interactive entry carries the display metadata this route always carried"
+    );
+    assert_eq!(theirs.query.as_deref(), Some(dsl));
+    assert!(
+        by_twin.recent.iter().any(|q| q.id == id && q.query == dsl),
+        "the same reader reads the same query text in history, so hiding it \
+         from the retained line would protect nothing"
+    );
+
+    // Cancellation authority follows the same record, not the tracker:
+    // the request already answered, and the key that submitted it can
+    // still ask for the work to stop while a twin cannot.
+    match b.cancel_query(id).await {
+        Err(trawl_client::ClientError::Server { status, error }) => {
+            assert_eq!(status, 403);
+            assert_eq!(error.message, "cannot cancel this query");
+        }
+        other => panic!("expected 403 for the twin key, got: {other:?}"),
+    }
+    assert!(
+        a.cancel_query(id).await.unwrap().cancelled,
+        "the submitting key can still stop work it has been told timed out"
+    );
+    assert!(
+        a.cancel_query(id).await.unwrap().cancelled,
+        "cancellation is a request, so it repeats while the work exists"
+    );
+
+    // The same one permit, in the counts: retained is a subset of held.
+    let stats = admin.stats().await.unwrap();
+    assert_eq!(stats.pool_retained, 1);
+    assert!(stats.pool_retained <= stats.pool_capacity - stats.pool_available);
+
+    // ...and in the dashboard snapshot the collector publishes.
+    let mut dashboard_saw_it = false;
+    for _ in 0..40 {
+        if admin.dashboard().await.is_ok_and(|d| d.pool_retained == 1) {
+            dashboard_saw_it = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        dashboard_saw_it,
+        "the dashboard snapshot must carry the retained permit"
+    );
+
+    // Everything above held while the worker was parked. Let it finish:
+    // when the work stops, every count returns to baseline.
+    assert_eq!(started.arrivals(), 1, "one worker, held once");
+    started.release();
+    let mut reclaimed = false;
+    for _ in 0..200 {
+        let stats = admin.stats().await.unwrap();
+        if stats.pool_retained == 0 && stats.pool_available == stats.pool_capacity {
+            reclaimed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(reclaimed, "the retained permit must come back");
+    assert!(admin.queries().await.unwrap().retained.is_empty());
+}
+
+/// Resolving `from saved` happens after the tracker has already opened an
+/// entry for the request, so a resolution failure has to finish that entry
+/// like any other failure. When it escaped the handler on its own the id
+/// stayed "active" for the life of the process, and `/queries` reported a
+/// query nobody was running.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_from_saved_resolution_finishes_its_tracking() {
+    const DSL: &str = "| from saved no_such_report | head 1";
+
+    let server = setup().await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+    let admin = HttpClient::new_insecure(&server.url, &server.admin_token).unwrap();
+
+    match client.query_paginated(DSL, None, None).await {
+        Err(trawl_client::ClientError::Server { status, .. }) => assert_eq!(status, 404),
+        other => panic!("expected 404 for an unknown saved query, got: {other:?}"),
+    }
+
+    let seen = admin.queries().await.unwrap();
+    assert!(
+        !seen.active.iter().any(|q| q.query == DSL),
+        "a refused resolution leaves nothing running"
+    );
+    let recorded = seen
+        .recent
+        .iter()
+        .find(|q| q.query == DSL)
+        .expect("the failure is recorded once, in history");
+    assert!(
+        recorded.error.is_some(),
+        "the entry carries the refusal, not a success"
+    );
+    assert!(!recorded.timed_out, "a 404 is not a timeout");
+    assert!(seen.retained.is_empty(), "no permit was ever taken");
+}
+
+/// An unparseable timezone is request validation, refused with a 400 before
+/// the tracker opens an entry. It used to be resolved after `tracker.start`
+/// and returned by `?`, which left the id active for the life of the
+/// process because nothing sweeps abandoned entries.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_invalid_timezone_leaves_no_active_entry() {
+    const DSL: &str = "service=tz-refusal last=1h | head 1";
+
+    let server = setup().await;
+    let admin = HttpClient::new_insecure(&server.url, &server.admin_token).unwrap();
+
+    let resp = raw_client()
+        .post(format!("{}/api/v1/query", server.url))
+        .header("authorization", format!("Bearer {}", server.analyst_token))
+        .json(&serde_json::json!({ "query": DSL, "timezone": "Mars/Olympus_Mons" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "an unresolvable timezone is a 400");
+
+    let seen = admin.queries().await.unwrap();
+    assert!(
+        !seen.active.iter().any(|q| q.query == DSL),
+        "a refused timezone leaves nothing running"
+    );
+    assert!(seen.retained.is_empty(), "no permit was ever taken");
 }
 
 #[tokio::test(flavor = "multi_thread")]

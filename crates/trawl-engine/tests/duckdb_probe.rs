@@ -5336,3 +5336,610 @@ fn the_absolute_time_window_is_half_open_at_the_microsecond() {
         "a one-microsecond window holds exactly the event at its start"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The bind-time expansion budget's copy counts, after the PARSER
+// ---------------------------------------------------------------------------
+
+/// One SQL expression's `DuckDB` parse tree, serialized.
+///
+/// `json_serialize_sql` takes a constant, not a parameter, so the
+/// expression is inlined and its quotes doubled. What comes back is the
+/// tree the BINDER will walk — which is the tree the expansion budget is
+/// trying to bound, and it is not the same shape as the text.
+fn parse_tree(conn: &duckdb::Connection, expr: &str) -> String {
+    let statement = format!("SELECT {expr}").replace('\'', "''");
+    conn.prepare(&format!("SELECT json_serialize_sql('{statement}')"))
+        .unwrap_or_else(|e| panic!("serializing {expr}: {e}"))
+        .query_row([], |row| row.get::<_, String>(0))
+        .unwrap_or_else(|e| panic!("serializing {expr}: {e}"))
+}
+
+/// The subject marker every case below writes, chosen so it can appear
+/// nowhere else in a parse tree: no ladder token, pattern or type name
+/// contains it.
+const COPY_MARKER: &str = "__c0__";
+
+/// How many times a rendering's subject survives into the parse tree.
+fn parsed_copies(conn: &duckdb::Connection, expr: &str) -> u64 {
+    parse_tree(conn, expr).matches(COPY_MARKER).count() as u64
+}
+
+/// `DuckDB`'s parser rewrites a SIMPLE `CASE` before the binder sees it,
+/// and that rewrite duplicates the subject.
+///
+/// `CASE x WHEN 1 THEN 'a' WHEN 2 THEN 'b' END` arrives at the binder as
+/// `CASE WHEN x = 1 THEN 'a' WHEN x = 2 THEN 'b' END`: two whole copies
+/// of `x`, from one written occurrence. A SEARCHED `CASE` has no subject
+/// and is not rewritten. This is the mechanism the rest of this section
+/// measures, pinned on its own so a failure here reads as "the parser
+/// changed" rather than "a profile is wrong".
+#[test]
+fn duckdb_rewrites_a_simple_case_into_one_equality_per_arm() {
+    let conn = conn();
+    for arms in 1..=5u64 {
+        let mut when = String::new();
+        for n in 1..=arms {
+            use std::fmt::Write as _;
+            let _ = write!(when, " WHEN {n} THEN '{n}'");
+        }
+        assert_eq!(
+            parsed_copies(&conn, &format!("(CASE \"{COPY_MARKER}\"{when} END)")),
+            arms,
+            "a {arms}-arm simple CASE copies its subject once per arm"
+        );
+    }
+    // The searched form names its subject exactly as often as it is
+    // written, however many arms it has.
+    assert_eq!(
+        parsed_copies(
+            &conn,
+            &format!(
+                "(CASE WHEN \"{COPY_MARKER}\" = 1 THEN 'a' WHEN \"{COPY_MARKER}\" = 2 THEN 'b' END)"
+            )
+        ),
+        2
+    );
+}
+
+/// How many expression nodes a parse tree holds.
+///
+/// `json_serialize_sql` writes one `"class"` key per expression node, so
+/// counting them counts the nodes the binder will walk. It is a coarse
+/// measure by design: the budget's `fixed` counts are one-sided upper
+/// bounds, and this says what the floor under them is.
+fn parsed_nodes(conn: &duckdb::Connection, expr: &str) -> u64 {
+    parse_tree(conn, expr).matches("\"class\":").count() as u64
+}
+
+/// A `CASE` written without an `ELSE` is bound WITH one.
+///
+/// `case(flag, status)` emits `CASE WHEN flag THEN status END`, and the
+/// parser hands the binder `… ELSE NULL END`: a node the SQL text never
+/// shows. The odd arity writes its fallback, so its node is one of the
+/// operands. Both parities are measured here rather than reasoned about,
+/// because `complexity::FunctionShape::Case` prices them differently and
+/// a node missed per reference is the difference between refusing a query
+/// and admitting it (one reference short of the cap, at 256 reads).
+#[test]
+fn an_else_less_case_still_binds_an_else_node() {
+    use trawl_core::complexity::{FunctionShape, Rendering, profile};
+
+    let conn = conn();
+    for argc in 2..=6usize {
+        let mut sql = String::from("(CASE");
+        for i in 0..argc / 2 {
+            use std::fmt::Write as _;
+            let _ = write!(sql, " WHEN \"c{}\" THEN \"c{}\"", i * 2, i * 2 + 1);
+        }
+        if argc % 2 == 1 {
+            use std::fmt::Write as _;
+            let _ = write!(sql, " ELSE \"c{}\"", argc - 1);
+        }
+        sql.push_str(" END)");
+
+        let parsed = parsed_nodes(&conn, &sql);
+        let declared = {
+            let p = profile(&Rendering::Function(FunctionShape::Case(argc)));
+            p.fixed + p.copies.iter().sum::<u64>()
+        };
+        assert_eq!(
+            parsed,
+            argc as u64 + if argc % 2 == 0 { 2 } else { 1 },
+            "an arity-{argc} CASE parses to its operands plus the CASE node, \
+             plus the ELSE the parser supplies when none was written: {sql}"
+        );
+        assert!(
+            declared >= parsed,
+            "arity {argc}: the parser builds {parsed} nodes, the profile declares {declared}"
+        );
+    }
+}
+
+/// Every `CASE`-bearing renderer the expansion budget prices, measured
+/// against the tree `DuckDB` actually builds.
+///
+/// The text-level guard in `trawl-core/tests/complexity_emission_bounds.rs`
+/// counts the emitter's OUTPUT, which is the wrong side of the parser for
+/// a simple `CASE`: `conform::severity_token_text_sql` writes its subject
+/// once and hands the binder twenty-four copies. Understating a copy count
+/// turns a refused query into an admitted one, so the class is closed here
+/// instead — by asking the engine.
+///
+/// One-sided on purpose: a profile may declare more copies than the parser
+/// produces (`profile` overcounts a `CASE`'s `ELSE` by one node, and the
+/// pin-maximizing walk deliberately takes the widest interpretation). It
+/// may never declare fewer.
+#[test]
+fn declared_copy_counts_cover_the_parsed_tree() {
+    use trawl_core::complexity::{ConformShape, FunctionShape, Rendering, profile};
+    use trawl_core::conform;
+    use trawl_core::severity::Dialect;
+
+    let conn = conn();
+    let subject = format!("\"{COPY_MARKER}\"");
+
+    let mut cases: Vec<(String, Rendering, String)> = vec![
+        (
+            "severity_token_text_sql".to_owned(),
+            Rendering::Conform(ConformShape::SeverityTokenText),
+            conform::severity_token_text_sql(&subject),
+        ),
+        // A pattern operator over a SEVERITY pin renders THROUGH that
+        // kernel, so the composition has to carry its copies too.
+        (
+            "pattern over the severity token text".to_owned(),
+            Rendering::Pattern(trawl_core::compare::PatternForm::SeverityText),
+            format!(
+                "regexp_matches({}, 'e.*')",
+                conform::severity_token_text_sql(&subject)
+            ),
+        ),
+    ];
+    for dialect in [Dialect::Otel, Dialect::Syslog] {
+        cases.push((
+            format!("severity_reading_sql({dialect:?})"),
+            Rendering::Conform(ConformShape::SeverityReading(dialect)),
+            conform::severity_reading_sql(&subject, dialect),
+        ));
+        cases.push((
+            format!("severity_reading_sql_bind_once({dialect:?})"),
+            Rendering::Conform(ConformShape::SeverityReadingBindOnce(dialect)),
+            conform::severity_reading_sql_bind_once(&subject, dialect),
+        ));
+        // `sev()`'s emission is that bind-once reading over the argument's
+        // canonical text form.
+        cases.push((
+            format!("sev() emission ({dialect:?})"),
+            Rendering::Function(FunctionShape::Sev { dialect, argc: 1 }),
+            conform::severity_reading_sql_bind_once(&conform::untyped_text(&subject), dialect),
+        ));
+        for pin in CanonicalType::ALL {
+            cases.push((
+                format!("guarded_cast_in({pin:?}, {dialect:?})"),
+                Rendering::Conform(ConformShape::GuardedCast(pin, dialect)),
+                conform::guarded_cast_in(&subject, pin, dialect),
+            ));
+        }
+    }
+
+    for (label, rendering, sql) in cases {
+        let declared = profile(&rendering)
+            .copies
+            .first()
+            .copied()
+            .unwrap_or_else(|| panic!("{label}: the profile declares no child"));
+        let parsed = parsed_copies(&conn, &sql);
+        assert!(
+            parsed > 0,
+            "{label}: the marker vanished from the parse tree, so this case measures nothing"
+        );
+        assert!(
+            declared >= parsed,
+            "{label}: the parser builds {parsed} copies of the subject, \
+             the profile declares {declared}"
+        );
+    }
+}
+
+/// The numbers behind the one-sided bound above, pinned exactly.
+///
+/// A bound that only ever says "at least" would pass just as well if a
+/// profile declared a million copies, and would never tell anyone that the
+/// severity reading got cheaper. These are the counts on the bundled
+/// engine; a change here is a real change in what the binder is asked to
+/// do, and the profiles should move with it.
+#[test]
+fn the_severity_kernels_parse_to_their_pinned_copy_counts() {
+    use trawl_core::conform;
+    use trawl_core::severity::Dialect;
+
+    let conn = conn();
+    let subject = format!("\"{COPY_MARKER}\"");
+
+    // Twenty-four ladder arms, one copy each.
+    assert_eq!(
+        parsed_copies(&conn, &conform::severity_token_text_sql(&subject)),
+        24
+    );
+    // Thirty-eight token arms over a head that names the subject twice,
+    // plus the numeric fallthrough: 76 + 3 under OTel, and 76 + 9 under
+    // syslog, whose numeric rung is a SECOND simple CASE with eight arms.
+    assert_eq!(
+        parsed_copies(
+            &conn,
+            &conform::severity_reading_sql(&subject, Dialect::Otel)
+        ),
+        79
+    );
+    assert_eq!(
+        parsed_copies(
+            &conn,
+            &conform::severity_reading_sql(&subject, Dialect::Syslog)
+        ),
+        85
+    );
+    // The bind-once shape is the whole reason `sev()` can carry bound
+    // parameters: the rewrite multiplies the lambda-local `_sev`, and the
+    // caller's expression lands exactly once.
+    for dialect in [Dialect::Otel, Dialect::Syslog] {
+        assert_eq!(
+            parsed_copies(
+                &conn,
+                &conform::severity_reading_sql_bind_once(&subject, dialect)
+            ),
+            1,
+            "{dialect:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// What the binder does with a same-stage alias (ADR-0024, #150)
+// ---------------------------------------------------------------------------
+
+/// The bundled engine build. Every claim in this section is a claim about
+/// THIS engine: the workspace pins `>=1.10500, <1.10600` (`DuckDB` 1.5.x)
+/// and the calibration in `visual-evidence/issue-150/bind-calibration.md`
+/// was measured on v1.5.5, so the version rides in each failure message
+/// and a bump out of the pinned line fails here first.
+fn engine_version(conn: &duckdb::Connection) -> String {
+    conn.query_row("SELECT version()", [], |row| row.get::<_, String>(0))
+        .unwrap()
+}
+
+#[test]
+fn the_bind_time_probes_run_against_the_pinned_engine_line() {
+    let version = engine_version(&conn());
+    assert!(
+        version.starts_with("v1.5."),
+        "the bind-time budget is calibrated against DuckDB 1.5.x, this is {version}"
+    );
+}
+
+/// A one-row parquet with a declared schema, owned by the test. The
+/// bind-time cost this section measures is a property of the SQL, not of
+/// the corpus, so the fixture exists only to make the emitted source
+/// readable.
+fn bind_fixture(conn: &duckdb::Connection, dir: &std::path::Path) -> String {
+    let file = dir.join("bind.parquet");
+    conn.execute_batch(&format!(
+        "COPY (SELECT * FROM (VALUES (TIMESTAMP '2026-01-01 00:00:00', 'nginx', 'h1', 200, 17, \
+         'boom')) AS t(_time, service, host, status, _severity, message)) TO '{}' (FORMAT PARQUET)",
+        file.display()
+    ))
+    .unwrap();
+    file.display().to_string()
+}
+
+/// The SQL one DSL query emits over `source`, with no pins: what the
+/// server hands `prepare`.
+fn emitted_sql(source: &str, dsl: &str) -> String {
+    let query = trawl_core::parser::parse(dsl).unwrap_or_else(|e| panic!("{dsl} parses: {e:?}"));
+    trawl_core::emitter::emit(&query, source, trawl_core::context::EvalContext::capture())
+        .unwrap_or_else(|e| panic!("{dsl} emits: {e:?}"))
+        .sql
+}
+
+/// The admission verdict and the score behind it (`trawl_core::complexity`).
+fn admission(dsl: &str) -> (bool, u64) {
+    let query = trawl_core::parser::parse(dsl).unwrap_or_else(|e| panic!("{dsl} parses: {e:?}"));
+    let (verdict, stats) =
+        trawl_core::complexity::check_pipeline_complexity_with_stats(&query.pipeline);
+    (verdict.is_ok(), stats.lateral_delta)
+}
+
+/// The emitted statement's SELECT lists, in order: the text between each
+/// `SELECT` line and the `FROM` that closes it.
+///
+/// Which list an output lands in is the whole question: two outputs in ONE
+/// list can substitute into each other, and outputs in different lists
+/// (separate `| let` stages, hence separate CTE bodies) cannot.
+fn select_lists(sql: &str) -> Vec<String> {
+    let mut lists = Vec::new();
+    let mut current: Option<String> = None;
+    for line in sql.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("SELECT") {
+            if let Some(open) = current.take() {
+                lists.push(open);
+            }
+            current = Some(trimmed.to_owned());
+        } else if trimmed.starts_with("FROM") {
+            if let Some(open) = current.take() {
+                lists.push(open);
+            }
+        } else if let Some(open) = current.as_mut() {
+            open.push(' ');
+            open.push_str(trimmed);
+        }
+    }
+    if let Some(open) = current {
+        lists.push(open);
+    }
+    lists
+}
+
+/// `DuckDB` substitutes a same-list alias's EXPRESSION; it does not read a
+/// finished column. The engine says so itself.
+///
+/// `SELECT random() AS r, r AS r2` is refused with "the expression has side
+/// effects", which is only a problem if the reference means "evaluate that
+/// expression again here". A column read would be harmless. This is the
+/// mechanism the whole expansion budget prices, stated by the binder.
+#[test]
+fn a_same_list_alias_reference_copies_its_expression() {
+    let conn = conn();
+    let version = engine_version(&conn);
+    let error = conn
+        .prepare("SELECT random() AS r, r AS r2")
+        .expect_err("a side-effecting expression cannot be substituted")
+        .to_string();
+    assert!(
+        error.contains("has side effects"),
+        "{version}: expected the side-effect refusal, got {error}"
+    );
+    // Without side effects the substitution goes through silently, which
+    // is exactly why nothing downstream can see how much work it caused.
+    let doubled: i64 = conn
+        .prepare("SELECT 21 AS r, r + r AS r2")
+        .unwrap()
+        .query_row([], |row| row.get("r2"))
+        .unwrap();
+    assert_eq!(doubled, 42, "{version}");
+}
+
+/// A scalar output of `stats` or `timechart` naming an earlier output of
+/// the SAME stage lands in the same SELECT list as that output, so it
+/// reaches the substitution above, so the aggregating stages can build the
+/// same chains `let` can, which is why ADR-0024 walks all three.
+///
+/// The contrast in the same test is the boundary that makes the claim
+/// precise: split the two outputs across stages and they land in different
+/// SELECT lists, where no substitution is possible.
+#[test]
+fn a_scalar_stats_or_timechart_output_shares_the_select_list_it_substitutes_into() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = conn();
+    let source = bind_fixture(&conn, dir.path());
+    let version = engine_version(&conn);
+
+    for (dsl, expected) in [
+        ("* | stats count() as n, abs(n) as m", 1_i64),
+        ("* | stats max(status) as n, abs(n) as m by service", 200),
+        ("* | timechart span=1h count() as n, abs(n) as m", 1),
+    ] {
+        let sql = emitted_sql(&source, dsl);
+        let lists = select_lists(&sql);
+        let holding: Vec<&String> = lists.iter().filter(|l| l.contains("AS \"m\"")).collect();
+        assert_eq!(holding.len(), 1, "{dsl}: one list defines `m`: {sql}");
+        assert!(
+            holding[0].contains("AS \"n\""),
+            "{dsl}: `m` must be defined beside `n`, not downstream of it: {sql}"
+        );
+        assert!(
+            holding[0].contains("ABS(\"n\")"),
+            "{dsl}: `m` reads `n` as a same-list alias: {sql}"
+        );
+        let value: i64 = conn
+            .prepare(&sql)
+            .unwrap_or_else(|e| panic!("{version}: {dsl} prepares: {e}"))
+            .query_row([], |row| row.get("m"))
+            .unwrap();
+        assert_eq!(value, expected, "{dsl}: {sql}");
+    }
+
+    // The same computation, one stage per output: two lists, and the
+    // second reads a column the first finished.
+    let split = emitted_sql(&source, "* | stats count() as n | let m = abs(n)");
+    let lists = select_lists(&split);
+    assert!(
+        lists.iter().filter(|l| l.contains("AS \"n\"")).count() == 1
+            && lists.iter().filter(|l| l.contains("AS \"m\"")).count() == 1
+            && !lists
+                .iter()
+                .any(|l| l.contains("AS \"n\"") && l.contains("AS \"m\"")),
+        "the split form defines each output in its own SELECT list: {split}"
+    );
+
+    // An AGGREGATE over an earlier alias is not substituted at all: the
+    // alias is not a column, so the reference simply does not resolve.
+    // Only scalar heads reach the mechanism, which is what ADR-0024 says.
+    let nested = emitted_sql(&source, "* | stats count() as n, sum(n) as m");
+    let error = conn
+        .prepare(&nested)
+        .expect_err("an aggregate cannot read a same-list alias")
+        .to_string();
+    assert!(
+        error.contains("not found in FROM clause"),
+        "{version}: {error}"
+    );
+}
+
+/// `eventstats` wraps every output in `OVER (…)`, and `DuckDB` 1.5.5
+/// refuses a substituted alias inside that wrapper: the copied
+/// `COUNT(*) OVER (…)` lands inside `ABS(…)`, which is a nested window
+/// function. What the error proves is that the copy happened; it says
+/// nothing about the order the binder does its work in, which is why
+/// ADR-0024 treats the rejection as a dependency behavior rather than a
+/// defence.
+///
+/// ADR-0024 records this dependency behavior and deliberately does NOT
+/// lean on it: the checker scores the stage exactly as it scores `let`,
+/// admits this one on its own arithmetic, and would keep admitting it if a
+/// later `DuckDB` bound the copy instead of rejecting it. The assertion
+/// below is on the engine, and the assertion on the checker beside it is
+/// the independence claim.
+#[test]
+fn eventstats_refuses_a_substituted_alias_inside_its_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = conn();
+    let source = bind_fixture(&conn, dir.path());
+    let version = engine_version(&conn);
+
+    let dsl = "* | eventstats count() as n, abs(n) as m by service";
+    let (admitted, delta) = admission(dsl);
+    assert!(
+        admitted && delta > 0,
+        "the checker prices this stage itself (delta {delta}), it does not defer to DuckDB"
+    );
+
+    let sql = emitted_sql(&source, dsl);
+    let lists = select_lists(&sql);
+    let holding: Vec<&String> = lists.iter().filter(|l| l.contains("AS \"m\"")).collect();
+    assert_eq!(holding.len(), 1, "one SELECT list defines `m`: {sql}");
+    assert!(
+        holding[0].contains("OVER (PARTITION BY \"service\") AS \"n\"")
+            && holding[0].contains("ABS(\"n\") OVER"),
+        "both outputs are window-wrapped in that one list: {sql}"
+    );
+
+    let error = conn
+        .prepare(&sql)
+        .expect_err("the substituted window lands inside a window")
+        .to_string();
+    assert!(
+        error.contains("window function calls cannot be nested"),
+        "{version}: {error}"
+    );
+}
+
+/// The severity-chain mechanism, measured at a depth that stays small.
+///
+/// One `sev(x) in (1,3,5,…,23)` writes its subject twelve times, once per
+/// disjoint ladder range. Each of those is a place the binder substitutes
+/// the whole expression the subject names, so a chain of such assignments
+/// multiplies by twelve per link: the eight links ADR-0024 describes are
+/// twelve to the eighth copies of the seed.
+///
+/// This runs the substitution the binder would perform, textually, at ONE
+/// and TWO links and counts the seed in `DuckDB`'s own parse tree: 24
+/// then 288, from 15 KB then 191 KB of SQL. The eight-link chain is never
+/// built, prepared, or handed to the engine here; the last assertion is
+/// that the checker refuses it, which is why the engine never sees it.
+#[test]
+fn a_severity_chain_multiplies_its_subject_twelve_times_per_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = conn();
+    let source = bind_fixture(&conn, dir.path());
+    let points = "1,3,5,7,9,11,13,15,17,19,21,23";
+
+    // One link's emitted predicate, over a field named `a0`.
+    let sql = emitted_sql(&source, &format!("* | where sev(a0) in ({points})"));
+    let link = sql
+        .rsplit_once("WHERE ")
+        .expect("the search stage emits a WHERE clause")
+        .1
+        .trim()
+        .to_owned();
+    assert_eq!(
+        link.matches("\"a0\"").count(),
+        trawl_core::compare::severity_ranges(&[1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23]).len(),
+        "one written subject per disjoint ladder range: {link}"
+    );
+
+    // Substitute the way the binder substitutes: the alias reference is
+    // replaced by the expression the alias named, everywhere it occurs.
+    let seed = format!("(\"{COPY_MARKER}\" + \"{COPY_MARKER}\")");
+    let one_link = link.replace("\"a0\"", &seed);
+    let two_links = link.replace("\"a0\"", &format!("({one_link})"));
+    assert_eq!(parsed_copies(&conn, &one_link), 24);
+    assert_eq!(parsed_copies(&conn, &two_links), 288);
+    assert!(
+        one_link.len() < 20_000 && two_links.len() < 250_000,
+        "SQL text grows twelvefold per link while the DSL grows by one assignment"
+    );
+
+    // One link is admitted; two links are already refused. The third-link
+    // DSL never gets emitted, and the eight-link chain ADR-0024 describes
+    // is refused by arithmetic alone.
+    let chain = |links: usize| {
+        let mut dsl = String::from("* | let a0 = _severity + _severity");
+        for i in 1..=links {
+            use std::fmt::Write as _;
+            let _ = write!(dsl, ", a{i} = sev(a{}) in ({points})", i - 1);
+        }
+        dsl
+    };
+    assert!(admission(&chain(1)).0, "one link is admitted");
+    for links in [2, 3, 8] {
+        let (admitted, delta) = admission(&chain(links));
+        assert!(
+            !admitted,
+            "{links} links of the full ladder set score {delta} and must be refused"
+        );
+    }
+}
+
+/// The remedy the refusal names, at the depth the refusal bites: the same
+/// twenty-four doublings that are impossible in one `| let` are ordinary
+/// once each one is its own stage.
+///
+/// Splitting works because each stage becomes its own SELECT: the next one
+/// reads a finished column instead of a same-list alias, so there is no
+/// substitution to multiply. It says nothing about materialization:
+/// nothing here promises the optimizer computes a stage once.
+#[test]
+fn the_split_let_remedy_admits_a_depth_twenty_four_chain() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = conn();
+    let source = bind_fixture(&conn, dir.path());
+    let version = engine_version(&conn);
+
+    let depth = 24;
+    let mut one_stage = String::from("* | let a0 = status + status");
+    let mut split = String::from("* | let a0 = status + status");
+    for i in 1..depth {
+        use std::fmt::Write as _;
+        let _ = write!(one_stage, ", a{i} = a{} + a{}", i - 1, i - 1);
+        let _ = write!(split, " | let a{i} = a{} + a{}", i - 1, i - 1);
+    }
+
+    let (admitted, delta) = admission(&one_stage);
+    assert!(
+        !admitted,
+        "twenty-four doublings in one stage score {delta} and are refused"
+    );
+    let (admitted, delta) = admission(&split);
+    assert!(
+        admitted && delta == 0,
+        "the split form carries no lateral expansion at all, scored {delta}"
+    );
+
+    let sql = emitted_sql(&source, &split);
+    let lists = select_lists(&sql);
+    assert_eq!(
+        lists.len(),
+        depth + 1,
+        "one SELECT list per stage, plus the source: {sql}"
+    );
+    for i in 0..depth {
+        let defining = lists
+            .iter()
+            .filter(|l| l.contains(&format!("AS \"a{i}\"")))
+            .count();
+        assert_eq!(defining, 1, "`a{i}` is defined in exactly one list: {sql}");
+    }
+    conn.prepare(&sql)
+        .unwrap_or_else(|e| panic!("{version}: the split chain prepares: {e}"));
+}

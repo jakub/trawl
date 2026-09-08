@@ -309,17 +309,38 @@ pub(crate) async fn execute_scheduled_query(
     timeout_secs: u64,
 ) {
     let start = std::time::Instant::now();
-    let timeout = Duration::from_secs(timeout_secs);
+    // One budget for this attempt, stamped before the first pool wait
+    // (ADR-0024): a scheduled run that spends its whole timeout queueing
+    // does not then get another one to execute in.
+    let deadline = crate::deadline::Deadline::after(Duration::from_secs(timeout_secs));
 
-    // Execute the query on the pool (no debug capture, UTC timestamps).
-    let outcome = pool
-        .execute(pool.allocate_query_id(), query, timeout, false, 0)
-        .await;
+    // The same admission door the HTTP entry points use (ADR-0024). A
+    // query stored before that door existed can be over a cap, and this
+    // is where it stops: THIS attempt fails with the diagnostic, recorded
+    // as the run's error. The schedule keeps its row and its cursor, so
+    // the operator repairs the saved DSL rather than re-enabling a
+    // schedule the server disabled behind their back.
+    let result = match crate::admission::check_dsl(query) {
+        Err(refusal) => Err(refusal),
+        // Execute the query on the pool (no debug capture, UTC timestamps).
+        Ok(()) => {
+            pool.execute(
+                pool.allocate_query_id(),
+                query,
+                deadline,
+                false,
+                0,
+                crate::pool::WorkContext::system(crate::pool::WorkKind::Scheduled),
+            )
+            .await
+            .result
+        }
+    };
 
     #[allow(clippy::cast_possible_truncation)]
     let duration_ms = start.elapsed().as_millis() as u64;
 
-    match outcome.result {
+    match result {
         Ok(query_result) => {
             let row_count = query_result.rows.len();
 

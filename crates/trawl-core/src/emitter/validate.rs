@@ -26,6 +26,17 @@ use super::functions::validate_function_arity;
 /// a reserved column is rejected the same way whether it ends up in SQL
 /// or in the post-SQL streaming engine.
 pub fn validate_pipeline(stages: &[Spanned<PipeStage>]) -> Result<(), EmitError> {
+    // The bind-time expansion budget first, over the whole pipeline
+    // (ADR-0024): a query that would make `DuckDB` bind an exponential
+    // tree must be refused before anything else looks at it, and the
+    // stream compiler runs the same check at the head of its own door so
+    // both lanes carry one sentence.
+    crate::complexity::check_pipeline_complexity(stages).map_err(|refusal| {
+        EmitError::UnsupportedOperation {
+            message: refusal.to_string(),
+        }
+    })?;
+
     for (i, stage) in stages.iter().enumerate() {
         match &stage.node {
             PipeStage::Stats(s) => {

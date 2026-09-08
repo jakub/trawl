@@ -386,6 +386,42 @@ pub struct QueriesResponse {
     pub active: Vec<ActiveQuerySnapshot>,
     /// Recently completed queries (most recent first).
     pub recent: Vec<CompletedQuerySnapshot>,
+    /// Work that still holds a pool permit after its request answered
+    /// (ADR-0024). Disjoint from `active`: a request whose work is
+    /// retained is listed here and not there. The same request may also
+    /// appear in `recent`, where it recorded its outcome.
+    ///
+    /// `default` because a server predating retained accounting sends no
+    /// such field.
+    #[serde(default)]
+    pub retained: Vec<RetainedWorkSnapshot>,
+}
+
+/// One unit of physical work that outlived the request that started it.
+///
+/// The request stopped waiting (it timed out, or its caller walked away);
+/// the `DuckDB` bind or scan it started did not stop with it, and keeps
+/// its permit until it does. Owner key ids never appear here — `user` and
+/// `query` are populated only for a reader who may see them, and are
+/// omitted from the wire otherwise.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetainedWorkSnapshot {
+    /// The pool id, the same id `DELETE /queries/{id}` cancels.
+    pub id: u64,
+    /// Which door the work came through: `query`, `from_saved`, `export`,
+    /// `scheduled`, `ping` or `sample`.
+    pub kind: String,
+    /// Whether the work passed its work-start transition. A held permit
+    /// alone does not prove it started.
+    pub started: bool,
+    /// How long the work has outlived its request (ms).
+    pub retained_ms: u64,
+    /// The submitting key's display name, for a reader entitled to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// The DSL, for a reader entitled to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
 }
 
 /// Snapshot of a currently executing query.
@@ -447,6 +483,14 @@ pub struct StatsResponse {
     pub pool_available: usize,
     /// Total connection pool capacity.
     pub pool_capacity: usize,
+    /// Held permits whose request already answered (ADR-0024): a subset
+    /// of the permits `pool_capacity - pool_available` counts, not an
+    /// addition to them.
+    ///
+    /// `default` because a server predating retained accounting sends no
+    /// such field.
+    #[serde(default)]
+    pub pool_retained: usize,
 }
 
 // -- whoami ------------------------------------------------------------------
@@ -547,6 +591,13 @@ pub struct DashboardSnapshot {
     pub pool_capacity: usize,
     /// Currently active (in-use) pool slots.
     pub pool_active: usize,
+    /// The subset of `pool_active` held by work no request is waiting on
+    /// any more (ADR-0024).
+    ///
+    /// `default` because a server predating retained accounting sends no
+    /// such field.
+    #[serde(default)]
+    pub pool_retained: usize,
 
     // -- hot buffer --
     /// Current event count in the hot buffer.
@@ -2295,9 +2346,10 @@ mod tests {
         assert!(!rt.cached);
     }
 
-    #[test]
-    fn dashboard_snapshot_roundtrip() {
-        let snapshot = DashboardSnapshot {
+    /// One fully populated snapshot, shared by the tests that need a
+    /// complete wire shape to take a field away from.
+    fn dashboard_fixture() -> DashboardSnapshot {
+        DashboardSnapshot {
             hostname: "test-host".into(),
             listen_addr: "127.0.0.1:5514".into(),
             uptime_secs: 9240,
@@ -2305,6 +2357,7 @@ mod tests {
             healthy: true,
             pool_capacity: 4,
             pool_active: 1,
+            pool_retained: 0,
             hot_buffer_events: 12_847,
             hot_buffer_max_events: 100_000,
             hot_buffer_bytes: 4_404_019,
@@ -2351,7 +2404,12 @@ mod tests {
                 query: "* | stats count()".into(),
                 running_ms: 500,
             }],
-        };
+        }
+    }
+
+    #[test]
+    fn dashboard_snapshot_roundtrip() {
+        let snapshot = dashboard_fixture();
         let rt = roundtrip(&snapshot);
         assert_eq!(rt.hostname, "test-host");
         assert_eq!(rt.uptime_secs, 9240);
@@ -2366,5 +2424,47 @@ mod tests {
         assert_eq!(rt.parquet_files, 847);
         assert_eq!(rt.recent_queries.len(), 1);
         assert_eq!(rt.active_queries.len(), 1);
+    }
+
+    /// A client built after ADR-0024 reads a server built before it.
+    ///
+    /// Retained accounting added one field to two long-lived response
+    /// shapes. Without a default the whole response fails to decode, and
+    /// a dashboard pointed at an older daemon shows nothing rather than
+    /// showing a zero. The pre-change shape is the current one minus that
+    /// field, so it is built by removing the key.
+    #[test]
+    fn retained_counts_decode_as_zero_from_a_pre_adr_0024_server() {
+        let without_retained = |value: &serde_json::Value| {
+            let mut json = value.clone();
+            let removed = json
+                .as_object_mut()
+                .expect("a response object")
+                .remove("pool_retained");
+            assert!(removed.is_some(), "the field has to be there to remove");
+            json
+        };
+
+        let stats = StatsResponse {
+            uptime_secs: 60,
+            total_queries: 3,
+            active_queries: 1,
+            pool_available: 3,
+            pool_capacity: 4,
+            pool_retained: 2,
+        };
+        let older = without_retained(&serde_json::to_value(&stats).unwrap());
+        let decoded: StatsResponse = serde_json::from_value(older).unwrap();
+        assert_eq!(decoded.pool_retained, 0);
+        assert_eq!(decoded.pool_capacity, 4, "the rest still decodes");
+
+        let snapshot = DashboardSnapshot {
+            pool_retained: 2,
+            ..dashboard_fixture()
+        };
+        let older = without_retained(&serde_json::to_value(&snapshot).unwrap());
+        let decoded: DashboardSnapshot = serde_json::from_value(older).unwrap();
+        assert_eq!(decoded.pool_retained, 0);
+        assert_eq!(decoded.pool_active, 1, "the rest still decodes");
     }
 }

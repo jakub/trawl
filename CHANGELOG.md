@@ -7,6 +7,43 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Bounded bind admission, one query deadline, and visible retained
+  capacity (ADR-0024, #150).** A 266-byte query could keep DuckDB binding
+  for over thirty seconds before it read a row, and the client's timeout
+  did nothing about it: the blocking task kept its executor permit and
+  could stall unrelated searches or a repin cutover. Three changes, one
+  PR. **Admission** now counts the repetition the database's own lateral
+  alias substitution creates. An output naming an earlier output of the
+  same stage is written into it once per mention, so `a1 = a0 + a0`
+  doubles and `sev(x) in (1,3,…,23)` copies its subject twelve times.
+  Queries over an alias-expansion budget of 512, or over 128 pipeline
+  stages, are refused before the database sees them, with the same
+  sentence in every lane (query, validate, stream, export, saved
+  create/update, scheduled runs) naming the stage, the output and the
+  split-into-separate-stages remedy. Neither limit is configurable, and
+  no documented example comes near either. **`timeout_secs` is now one
+  absolute deadline** stamped at handler entry, covering saved-source
+  resolution, the queue, the publication gate, delayed startup and
+  execution, instead of a duration each phase could spend again. Expiry
+  before work starts is `503 server at capacity: the query was not
+  started` with no timeout history row; expiry after it is the existing
+  `504`. **Work that outlives its request is now accounted**: `GET
+  /api/v1/queries` carries a `retained` list (id, kind, started,
+  retained_ms, plus the user and DSL for a submitted query, exactly as
+  the active and recent lists carry them; system work shows no text
+  below `server_manage`), stats and the
+  dashboard snapshot carry `pool_retained` as a subset of `pool_active`,
+  the terminal panel shows `active: 3/4 (1 retained)` when nonzero, and
+  `/metrics` gains `trawl_query_permits_retained`. Cancellation reaches
+  retained work, latches before an interrupt handle exists, is rechecked
+  between binding and execution, and is safe to repeat: an
+  acknowledgement means requested, not stopped. Residual: a bind already
+  inside DuckDB is not preemptible, and alias-free multiplication from
+  SQL translation, corpus width and query planning stays outside this
+  bound. Calibration on the reference host (Ryzen 7 7800X3D, DuckDB
+  1.5.5) is committed at
+  `visual-evidence/issue-150/bind-calibration.md`: ten admitted boundary
+  cases, five warmed prepares each, slowest single sample 158 ms.
 - **Crash-dump capture on the Debian channel (#19).** The `trawl-server`
   package now ships an inactive systemd drop-in at
   `/usr/share/doc/trawl-server/examples/crashdump.conf`, and postinst

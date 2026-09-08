@@ -20,9 +20,9 @@ use trawl_api::{
     DeleteScheduleResponse, ExportRequest, FieldValuesResponse, GlobalRunSummary, HealthResponse,
     HealthStatus, HistoryEntryResponse, HistoryResponse, ListAllRunsResponse,
     ListReportRunsResponse, ListSavedResponse, PaginationMeta, QueriesResponse, QueryRequest,
-    QueryResponse, QueryStatus, ReportRunResponse, ReportRunSummary, RunsStatsResponse,
-    SavedQueryResponse, ScheduleResponse, SchemaColumnResponse, SchemaResponse, SetScheduleRequest,
-    StatsResponse, UpdateSavedRequest, ValidationResponse, WhoAmIResponse,
+    QueryResponse, QueryStatus, ReportRunResponse, ReportRunSummary, RetainedWorkSnapshot,
+    RunsStatsResponse, SavedQueryResponse, ScheduleResponse, SchemaColumnResponse, SchemaResponse,
+    SetScheduleRequest, StatsResponse, UpdateSavedRequest, ValidationResponse, WhoAmIResponse,
 };
 use trawl_engine::value::{QueryResult, Value};
 
@@ -56,6 +56,12 @@ pub async fn query(
         return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
 
+    // One absolute budget for the whole request (ADR-0024), stamped
+    // before tracking, admission and source resolution: every wait below
+    // spends from this instant, so no phase gets a fresh timeout.
+    let deadline =
+        crate::deadline::Deadline::after(std::time::Duration::from_secs(state.query.timeout_secs));
+
     state
         .total_queries
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -69,6 +75,19 @@ pub async fn query(
             "offset + limit exceeds max_result_rows ({max_rows})"
         )));
     }
+
+    // Resolve the timezone from the request (default to UTC when absent)
+    // BEFORE anything opens a tracker entry. This is request validation
+    // like the offset check above, and its `?` return has no outcome path
+    // to finish tracking through: opening the entry first would leave an
+    // invalid timezone's id active forever, since nothing sweeps them.
+    let utc_offset_secs = req
+        .timezone
+        .as_deref()
+        .map(trawl_engine::timezone::resolve_utc_offset)
+        .transpose()
+        .map_err(ServerError::BadRequest)?
+        .unwrap_or(0);
 
     // One id from the pool's counter keys both the tracker entry and the
     // pool's interrupt map, so cancel-by-id interrupts the query the client
@@ -97,24 +116,50 @@ pub async fn query(
         query = %req.query,
         "raw query text (DEBUG-only: never stored under the default filter)"
     );
-    let timeout = std::time::Duration::from_secs(state.query.timeout_secs);
-
-    // Resolve timezone from request (default to UTC when absent).
-    let utc_offset_secs = req
-        .timezone
-        .as_deref()
-        .map(trawl_engine::timezone::resolve_utc_offset)
-        .transpose()
-        .map_err(ServerError::BadRequest)?
-        .unwrap_or(0);
 
     let start = std::time::Instant::now();
     let capture_debug = state.query.query_log.is_some();
 
     // Check for `| from saved` — if present, resolve to parquet source
     // and execute with the pre-computed source instead of normal glob scan.
-    let (outcome, degraded_fields) =
-        if let Some(resolved) = try_resolve_from_saved(&state, &verified, &req.query).await? {
+    //
+    // Admission runs over the pipeline the caller TYPED, before the
+    // `from saved` stage is sliced off (ADR-0024): resolving first would
+    // let an over-cap original be admitted as an under-cap suffix. Its
+    // failure takes the same route the engine's own parse/emit failures
+    // take below, so the lifecycle events and the query log are the ones
+    // this shape has always produced.
+    //
+    // Resolution reads postgres, so it spends the caller's budget like any
+    // other wait (ADR-0024) and its failures are the handler's, not the
+    // caller's to catch: escaping by `?` here would leave the tracker entry
+    // this request already opened running forever. Both land as a refusing
+    // outcome and finish tracking through the one path below. Expiry is
+    // the pre-start capacity refusal, since no work was ever started and a
+    // timeout history row would claim otherwise.
+    let admitted = match crate::admission::check_dsl(&req.query) {
+        Err(refusal) => Err(refusal),
+        Ok(()) => match deadline
+            .run(try_resolve_from_saved(&state, &verified, &req.query))
+            .await
+        {
+            Ok(resolved) => resolved,
+            Err(crate::deadline::Expired) => Err(ServerError::ServiceUnavailable(
+                crate::error::CAPACITY_NOT_STARTED.to_owned(),
+            )),
+        },
+    };
+
+    let (outcome, degraded_fields) = match admitted {
+        Err(refusal) => (
+            crate::pool::ExecuteOutcome {
+                result: Err(refusal),
+                debug: None,
+                severity_columns: Vec::new(),
+            },
+            Vec::new(),
+        ),
+        Ok(Some(resolved)) => {
             // Both halves of what the caller is actually reading: the
             // stages they typed, and the saved query whose recorded run
             // produced the rows those stages run over. Nothing stamps a
@@ -130,14 +175,20 @@ pub async fn query(
                         query_id,
                         &resolved.remaining_dsl,
                         &resolved.source,
-                        timeout,
+                        deadline,
                         capture_debug,
                         utc_offset_secs,
+                        crate::pool::WorkContext::key(
+                            crate::pool::WorkKind::FromSaved,
+                            verified.id,
+                        )
+                        .with_user(&verified.name),
                     )
                     .await,
                 degraded,
             )
-        } else {
+        }
+        Ok(None) => {
             let degraded = degraded_fields_for(&state, [req.query.as_str()]);
             (
                 state
@@ -146,14 +197,17 @@ pub async fn query(
                     .execute(
                         query_id,
                         &req.query,
-                        timeout,
+                        deadline,
                         capture_debug,
                         utc_offset_secs,
+                        crate::pool::WorkContext::key(crate::pool::WorkKind::Query, verified.id)
+                            .with_user(&verified.name),
                     )
                     .await,
                 degraded,
             )
-        };
+        }
+    };
 
     let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
     let duration_secs = start.elapsed().as_secs_f64();
@@ -181,24 +235,37 @@ pub async fn query(
             // keystore id. Best-effort: a history-store write failure must
             // not fail the query, but log it so a broken store (pg down,
             // constraint trouble) is visible.
-            if let Err(e) = state
-                .storage
-                .history
-                .record_query(
+            //
+            // Under the request's own deadline (ADR-0024), because the
+            // rows are already in hand: a wedged history store must not
+            // hold a finished answer past the budget the caller was
+            // promised. Expiry abandons the write, never the result.
+            let recorded = deadline
+                .run(state.storage.history.record_query(
                     verified.id,
                     &req.query,
                     duration_ms,
                     total,
                     RunStatus::Success,
-                )
-                .await
-            {
-                tracing::warn!(
-                    event_type = "history_error",
-                    key_id = verified.id,
-                    error = %e,
-                    "failed to record query in history store"
-                );
+                ))
+                .await;
+            match recorded {
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        event_type = "history_error",
+                        key_id = verified.id,
+                        error = %e,
+                        "failed to record query in history store"
+                    );
+                }
+                Err(crate::deadline::Expired) => {
+                    tracing::warn!(
+                        event_type = "history_error",
+                        key_id = verified.id,
+                        "abandoned the history write: the query's deadline passed with the result already in hand"
+                    );
+                }
+                Ok(Ok(_)) => {}
             }
 
             tracing::info!(
@@ -350,6 +417,10 @@ pub async fn query(
 pub async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoResponse {
     let hot_buffer = state.query.hot_buffer.clone();
     let fallback_glob = state.query.pool.fallback_glob().to_owned();
+    // Read here, on the reactor: the closure below deliberately holds no
+    // pool state, so the registry lock never travels onto the blocking
+    // pool behind a filesystem walk.
+    let retained_permits = state.query.pool.retained();
     let wal_dir = state
         .ingest
         .wal_writer
@@ -358,7 +429,12 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoRespo
     let _ = tokio::task::spawn_blocking(move || {
         #[cfg(target_os = "linux")]
         metrics_process::Collector::default().collect();
-        crate::metrics::collect_gauges(hot_buffer.as_ref(), &fallback_glob, wal_dir.as_deref());
+        crate::metrics::collect_gauges(
+            hot_buffer.as_ref(),
+            &fallback_glob,
+            wal_dir.as_deref(),
+            retained_permits,
+        );
     })
     .await;
     let body = state.metrics_handle.render();
@@ -730,7 +806,42 @@ fn is_date_dir(name: &str) -> bool {
         && name[8..10].bytes().all(|b| b.is_ascii_digit())
 }
 
-/// `GET /api/v1/queries` — view active and recent queries.
+/// One unit of retained work as a given reader may see it (ADR-0024).
+///
+/// The id, the kind and the timing are facts about the server's capacity
+/// and go to every reader the route already admits.
+///
+/// Interactive work, a query some key submitted, carries its user and
+/// its DSL to every reader of this route, which is what `active` and
+/// `recent` have always done for the same query. Retention is a phase of
+/// one request's life, not a second visibility class: hiding the text here
+/// while `recent` shows it for the same id would be an incoherence, not a
+/// protection. `Permission::Query` is the gate on all three lists.
+///
+/// System work (a scheduled run, a health probe) is the exception: it has
+/// no human owner and its DSL is the server's own, so only an operator
+/// (`ServerManage`) sees its text. Owner ids never leave the server in
+/// either case, and viewing is not cancellation. That authority is still
+/// the exact keystore id (see `check_cancel_authority`).
+pub(crate) fn retained_snapshot(
+    work: &crate::pool::RetainedWork,
+    verified: &VerifiedKey,
+) -> RetainedWorkSnapshot {
+    let entitled = verified.has_permission(Permission::ServerManage)
+        || matches!(work.owner, crate::pool::WorkOwner::Key(_));
+    RetainedWorkSnapshot {
+        id: work.id,
+        kind: work.kind.as_str().to_owned(),
+        started: work.started,
+        retained_ms: u64::try_from(work.retained.as_millis()).unwrap_or(u64::MAX),
+        user: entitled
+            .then(|| work.user.as_deref().map(ToOwned::to_owned))
+            .flatten(),
+        query: entitled.then(|| work.display.clone()).flatten(),
+    }
+}
+
+/// `GET /api/v1/queries` — view active, recent and retained queries.
 #[allow(clippy::unused_async)]
 pub async fn queries(
     State(state): State<AppState>,
@@ -740,10 +851,57 @@ pub async fn queries(
         return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
 
+    // One lifecycle read, taken first: an id it reports as retained is
+    // one whose request already recorded its outcome, so listing it as
+    // active too would count the same permit twice (ADR-0024). The
+    // tracker read happens after, so work that becomes retained in
+    // between is merely still listed as active for one more request.
+    let retained = state.query.pool.retained_work();
+    let retained_ids: std::collections::HashSet<u64> = retained.iter().map(|w| w.id).collect();
+
     Ok(Json(QueriesResponse {
-        active: state.query.tracker.active(),
+        active: state
+            .query
+            .tracker
+            .active()
+            .into_iter()
+            .filter(|q| !retained_ids.contains(&q.id))
+            .collect(),
         recent: state.query.tracker.recent(),
+        retained: retained
+            .iter()
+            .map(|work| retained_snapshot(work, &verified))
+            .collect(),
     }))
+}
+
+/// May this key ask for that work to stop?
+///
+/// Admin (`ServerManage`) can cancel any work, including the server's own
+/// (a scheduled run, a health probe). A `QueryCancel` holder can cancel
+/// work it submitted, and ownership is the exact keystore id: display
+/// names are mutable and non-unique, so two keys sharing a name must stay
+/// isolated from each other. Keys holding neither permission are rejected
+/// outright, with a different sentence — telling them nothing about
+/// whether the id exists.
+fn check_cancel_authority(
+    verified: &VerifiedKey,
+    tracker_owner: Option<i64>,
+    pool_owner: Option<crate::pool::WorkOwner>,
+) -> Result<(), ServerError> {
+    if verified.has_permission(Permission::ServerManage) {
+        return Ok(());
+    }
+    if !verified.has_permission(Permission::QueryCancel) {
+        return Err(ServerError::Forbidden("insufficient permissions".into()));
+    }
+    let mine = tracker_owner == Some(verified.id)
+        || pool_owner == Some(crate::pool::WorkOwner::Key(verified.id));
+    if mine {
+        Ok(())
+    } else {
+        Err(ServerError::Forbidden("cannot cancel this query".into()))
+    }
 }
 
 /// `DELETE /api/v1/queries/{id}` — cancel a running query by ID.
@@ -755,20 +913,16 @@ pub async fn cancel_query(
     Extension(verified): Extension<VerifiedKey>,
     Path(query_id): Path<u64>,
 ) -> Result<Json<CancelResponse>, ServerError> {
-    // Ownership is authorized by exact key id: names are mutable and
-    // non-unique, so two keys sharing a name must not be able to cancel each
-    // other's queries (`user` stays display-only).
-    let can_cancel = if verified.has_permission(Permission::ServerManage) {
-        true
-    } else if verified.has_permission(Permission::QueryCancel) {
-        state.query.tracker.owner_key_id(query_id) == Some(verified.id)
-    } else {
-        return Err(ServerError::Forbidden("insufficient permissions".into()));
-    };
-
-    if !can_cancel {
-        return Err(ServerError::Forbidden("cannot cancel this query".into()));
-    }
+    // Two records, one owner. The tracker drops a query as soon as its
+    // request records an outcome; the pool keeps the work registered until
+    // the physical query actually stops (ADR-0024). Asking both is what
+    // keeps a query the client has already been told timed out cancellable
+    // by the key that submitted it.
+    check_cancel_authority(
+        &verified,
+        state.query.tracker.owner_key_id(query_id),
+        state.query.pool.owner_of(query_id),
+    )?;
 
     let cancelled = state.query.pool.cancel_by_id(query_id);
 
@@ -790,6 +944,14 @@ pub async fn cancel_query(
 ///
 /// Performs syntax and semantic validation (function names, arity, regex patterns)
 /// but does not check field existence (which would require schema introspection).
+///
+/// This route already runs the two halves [`crate::admission::check_dsl`]
+/// runs, in the same order and from the same owners — so an over-budget
+/// pipeline reports ADR-0024's sentence here too. It reports it as this
+/// route's own answer (`valid: false` with the refusal as a detail)
+/// rather than as an error status: telling a client its query is invalid
+/// IS the successful outcome of a validation call, and routing the
+/// refusal through `check_dsl` would turn every parse error into a 400.
 pub async fn validate_query(
     Extension(verified): Extension<VerifiedKey>,
     Json(req): Json<QueryRequest>,
@@ -849,6 +1011,7 @@ pub async fn stats(
         active_queries: state.query.tracker.active().len(),
         pool_available: state.query.pool.available_permits(),
         pool_capacity: state.query.pool.capacity(),
+        pool_retained: state.query.pool.retained(),
     }))
 }
 
@@ -1577,7 +1740,11 @@ pub async fn field_values(
             &field,
             params.service.as_deref(),
             limit,
-            std::time::Duration::from_secs(state.query.timeout_secs),
+            crate::deadline::Deadline::after(std::time::Duration::from_secs(
+                state.query.timeout_secs,
+            )),
+            crate::pool::WorkContext::key(crate::pool::WorkKind::Sample, verified.id)
+                .with_user(&verified.name),
         )
         .await?;
 
@@ -1721,6 +1888,11 @@ pub async fn create_saved(
 
     let key_id = verified.id;
 
+    // Admit the DSL before it is stored (ADR-0024): a saved query is run
+    // later by a schedule, and a row nothing can execute is worth
+    // refusing at the one moment a human is there to read the reason.
+    crate::admission::check_dsl(&req.query)?;
+
     // DuplicateName → 409, InvalidName → 400 via the StoreError table.
     let saved = state
         .storage
@@ -1743,6 +1915,12 @@ pub async fn update_saved(
     }
 
     let key_id = verified.id;
+
+    // Same door as create, and before the store call, so a refused update
+    // leaves the stored row exactly as it was. The transactional
+    // schedule-window check inside `update_checked` is untouched: it
+    // proves a different thing, under the saved-query row lock.
+    crate::admission::check_dsl(&req.query)?;
 
     // NotFound → 404, InvalidName → 400, DuplicateName → 409, and a new
     // DSL that contradicts the schedule's window → 400 naming both sides.
@@ -2639,6 +2817,11 @@ pub async fn export(
         return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
 
+    // One absolute budget for the export, stamped at authenticated entry
+    // like the query handler's (ADR-0024).
+    let deadline =
+        crate::deadline::Deadline::after(std::time::Duration::from_secs(state.query.timeout_secs));
+
     let format = params.format.unwrap_or(trawl_api::ExportFormat::Csv);
 
     let max_export_rows = state.query.max_export_rows;
@@ -2665,8 +2848,12 @@ pub async fn export(
         "raw query text (DEBUG-only: never stored under the default filter)"
     );
 
+    // One admission door for every lane (ADR-0024): the parquet export
+    // takes a different route through the pool than CSV and JSON do, so
+    // asking here is what makes all three refuse the same text.
+    crate::admission::check_dsl(&req.query)?;
+
     let start = std::time::Instant::now();
-    let timeout = std::time::Duration::from_secs(state.query.timeout_secs);
 
     // Parquet export uses DuckDB's native COPY TO — no need to materialize
     // the result set in memory.
@@ -2674,7 +2861,14 @@ pub async fn export(
         let bytes = state
             .query
             .pool
-            .export_parquet(query_id, &req.query, limit, timeout)
+            .export_parquet(
+                query_id,
+                &req.query,
+                limit,
+                deadline,
+                crate::pool::WorkContext::key(crate::pool::WorkKind::Export, verified.id)
+                    .with_user(&verified.name),
+            )
             .await?;
         let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
@@ -2711,7 +2905,15 @@ pub async fn export(
     let outcome = state
         .query
         .pool
-        .execute(query_id, &req.query, timeout, capture_debug, 0)
+        .execute(
+            query_id,
+            &req.query,
+            deadline,
+            capture_debug,
+            0,
+            crate::pool::WorkContext::key(crate::pool::WorkKind::Export, verified.id)
+                .with_user(&verified.name),
+        )
         .await;
     let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
@@ -3075,6 +3277,11 @@ pub async fn stream_query(
         "raw query text (DEBUG-only: never stored under the default filter)"
     );
 
+    // The shared admission door first (ADR-0024), so a live tail and a
+    // batch query refuse the same text with the same sentence rather than
+    // with whichever refusal their own compiler reaches first.
+    crate::admission::check_dsl(&query_dsl)?;
+
     // Parse and compile the filter once upfront.
     let ast = trawl_core::parser::parse(&query_dsl)
         .map_err(|errors| ServerError::BadRequest(format!("{errors:?}")))?;
@@ -3262,6 +3469,138 @@ pub struct StreamParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A key holding exactly `permissions`, under a display name two
+    /// keys are free to share.
+    fn viewer(id: i64, name: &str, permissions: &[&str]) -> VerifiedKey {
+        VerifiedKey::from_roles(
+            id,
+            "testtest",
+            name,
+            fleet_auth::PrincipalKind::Service,
+            vec![fleet_auth::Role {
+                id: 1,
+                name: "test-role".into(),
+                rate_rpm: None,
+                permissions: permissions
+                    .iter()
+                    .map(|p| fleet_auth::RolePermission {
+                        app: "trawl".into(),
+                        permission: (*p).to_owned(),
+                    })
+                    .collect(),
+            }],
+        )
+    }
+
+    fn retained_query(owner: crate::pool::WorkOwner) -> crate::pool::RetainedWork {
+        crate::pool::RetainedWork {
+            id: 42,
+            kind: crate::pool::WorkKind::Query,
+            started: true,
+            retained: std::time::Duration::from_millis(1500),
+            owner,
+            user: Some(std::sync::Arc::from("twin")),
+            display: Some("service=nginx | stats count()".to_owned()),
+        }
+    }
+
+    /// An interactive query shows the same user and DSL to every reader
+    /// of this route, whichever key submitted it (ADR-0024).
+    ///
+    /// That is what `active` and `recent` already do for the same id, and
+    /// a retained entry is the same request one phase later: a reader who
+    /// can watch a query run, and read its text in history when it timed
+    /// out, learns nothing new from the retained line. Cancellation is the
+    /// authority that stays keyed to the exact id.
+    #[test]
+    fn retained_interactive_work_keeps_its_existing_display_visibility() {
+        let work = retained_query(crate::pool::WorkOwner::Key(7));
+
+        let admin = viewer(99, "ops", &["query", "server_manage"]);
+        let owner = viewer(7, "twin", &["query"]);
+        let unrelated = viewer(8, "twin", &["query"]);
+
+        for reader in [&admin, &owner, &unrelated] {
+            let snap = retained_snapshot(&work, reader);
+            assert_eq!(snap.id, 42);
+            assert_eq!(snap.kind, "query");
+            assert!(snap.started);
+            assert_eq!(snap.retained_ms, 1500);
+            assert_eq!(snap.user.as_deref(), Some("twin"));
+            assert_eq!(snap.query.as_deref(), Some("service=nginx | stats count()"));
+        }
+    }
+
+    /// System work (a scheduled run, a health probe) has no human owner,
+    /// so its DSL reaches an operator and nobody else. No `query`
+    /// permission holder can ever match `WorkOwner::System`.
+    #[test]
+    fn system_retained_work_shows_no_text_below_server_manage() {
+        let work = retained_query(crate::pool::WorkOwner::System);
+
+        let analyst = retained_snapshot(&work, &viewer(7, "twin", &["query", "query_cancel"]));
+        assert_eq!(analyst.user, None);
+        assert_eq!(analyst.query, None);
+        assert_eq!(analyst.kind, "query");
+
+        let admin = retained_snapshot(&work, &viewer(99, "ops", &["query", "server_manage"]));
+        assert_eq!(
+            admin.query.as_deref(),
+            Some("service=nginx | stats count()")
+        );
+    }
+
+    /// Wire shape: an entry a reader may not see carries no null-valued
+    /// keys at all, so the absence is not a field a client must special
+    /// case. System work below `ServerManage` is the entry that hides
+    /// anything.
+    #[test]
+    fn a_filtered_retained_entry_omits_the_fields_it_hides() {
+        let work = retained_query(crate::pool::WorkOwner::System);
+        let snap = retained_snapshot(&work, &viewer(8, "twin", &["query"]));
+        let json = serde_json::to_string(&snap).expect("serialize");
+        assert!(!json.contains("\"user\":"), "{json}");
+        assert!(!json.contains("\"query\":"), "{json}");
+        assert!(json.contains("\"retained_ms\":1500"), "{json}");
+    }
+
+    /// Cancellation authority, unchanged by the retained lifecycle
+    /// (ADR-0024): an operator reaches everything including the server's
+    /// own work, a `QueryCancel` holder reaches only what its own key id
+    /// owns, and a key with neither permission is told nothing about the
+    /// id at all.
+    #[test]
+    fn cancel_authority_is_the_key_id_and_admin_reaches_system_work() {
+        use crate::pool::WorkOwner;
+
+        let admin = viewer(99, "ops", &["query", "server_manage"]);
+        let owner = viewer(7, "twin", &["query", "query_cancel"]);
+        let twin = viewer(8, "twin", &["query", "query_cancel"]);
+        let reader = viewer(9, "reader", &["query"]);
+
+        // Work still tracked, and work whose request already answered:
+        // either record proves ownership.
+        assert!(check_cancel_authority(&owner, Some(7), None).is_ok());
+        assert!(check_cancel_authority(&owner, None, Some(WorkOwner::Key(7))).is_ok());
+
+        let denied = check_cancel_authority(&twin, Some(7), Some(WorkOwner::Key(7)))
+            .expect_err("a twin name is not ownership");
+        assert!(matches!(&denied, ServerError::Forbidden(m) if m == "cannot cancel this query"));
+
+        // System work has no human owner: no QueryCancel holder matches it.
+        let system = check_cancel_authority(&owner, None, Some(WorkOwner::System))
+            .expect_err("system work is not a key's own work");
+        assert!(matches!(&system, ServerError::Forbidden(m) if m == "cannot cancel this query"));
+        assert!(
+            check_cancel_authority(&admin, None, Some(WorkOwner::System)).is_ok(),
+            "an operator can stop the server's own work"
+        );
+
+        let ungranted = check_cancel_authority(&reader, Some(9), None)
+            .expect_err("QueryCancel is the gate, ownership is only the scope");
+        assert!(matches!(&ungranted, ServerError::Forbidden(m) if m == "insufficient permissions"));
+    }
 
     /// A retention config with a global age and per-env overrides.
     fn retention_config(max_age_days: u64, envs: &[(&str, u64)]) -> crate::config::RetentionConfig {

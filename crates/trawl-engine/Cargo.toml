@@ -20,12 +20,20 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+# Self-dependency: enables the bind counter (`executor::prepare_probe`) for
+# this crate's own integration tests. default-features = false so it cannot
+# re-enable `bundled` under CI's --no-default-features run.
+trawl-engine = { path = ".", default-features = false, features = ["test-support"] }
 insta = { workspace = true }
 tempfile = { workspace = true }
 
 [features]
 default = ["bundled"]
 bundled = ["duckdb/bundled", "duckdb/json", "duckdb/parquet"]
+# Exposes `executor::prepare_probe`, the count of statements handed to
+# DuckDB, to this crate's own integration tests via the self-dependency
+# above. No production consumer enables it.
+test-support = []
 
 [lints]
 workspace = true

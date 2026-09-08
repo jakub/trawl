@@ -24,6 +24,10 @@ pub mod format;
 /// the in-memory matchers.
 pub mod compare;
 
+/// The bind-time expansion budget: the corpus-independent admission
+/// check both validation doors run (ADR-0024).
+pub mod complexity;
+
 /// Write-time conformance: the guarded cast binding a pinned column to
 /// its catalog type, shared by compaction and the hot branch.
 pub mod conform;

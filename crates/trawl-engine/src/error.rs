@@ -38,6 +38,13 @@ pub enum EngineError {
     /// Filesystem I/O error (e.g. writing temp files for parquet export).
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// The caller's cancellation latch was set at the bind-to-execute
+    /// boundary, so this lane stopped before running the statement
+    /// (ADR-0024). Content-free: which query, and who cancelled it, is
+    /// the caller's own record.
+    #[error("query cancelled")]
+    Cancelled,
 }
 
 fn format_parse_errors(errors: &[ParseError]) -> String {

@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# bind-calibration: time DuckDB's prepare for the queries the bind-time
+# expansion budget ADMITS, one case per process, under an external watchdog
+# (ADR-0024, issue #150).
+#
+# WHY THIS EXISTS
+# ---------------
+# MAX_LATERAL_EXPANSION = 512 comes from structure, not from a stopwatch,
+# so it owes one measured claim: on the calibration host, a query the
+# checker admits still prepares fast. The measurement cannot live in the
+# test suite as a gate (a wall-clock assertion on a shared runner is a
+# flake), and it cannot be taken from inside a single process either: a
+# case that wedges the binder has to be killed from OUTSIDE, which is what
+# `timeout` is here for. The test process is therefore the subject, and
+# this script is the instrument.
+#
+# METHOD
+# ------
+#   1. Build the calibration test binary ONCE, outside every watchdog
+#      window, so no case is timed against a compile.
+#   2. Run each case with `timeout ${WATCHDOG}s`, in its own process, in a
+#      fixed cheapest-first order within its family.
+#   3. Stop a family at its first cutoff: past a wedge, the later members
+#      of that family measure nothing.
+#   4. Print the evidence table the committed run is pasted from.
+#
+# The harness (crates/trawl-engine/tests/bind_calibration.rs) fails the case
+# itself if any one of its five measured prepares exceeds a second, so a
+# non-zero exit here is a real calibration failure, not a formatting
+# problem. A failure blocks the checkpoint: it is not authority to raise
+# the limit.
+#
+# USAGE
+#   scripts/bind-calibration                 # every case
+#   WATCHDOG=10 scripts/bind-calibration     # a slower host
+set -euo pipefail
+
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$repo_root"
+
+WATCHDOG=${WATCHDOG:-5}
+
+# family:test-name, cheapest first within each family.
+cases=(
+  "addition:addition_chain_single_reference_depth_twenty_two"
+  "addition:addition_chain_doubling_depth_six"
+  "scalar:scalar_stats_chain_depth_thirty_one"
+  "scalar:scalar_timechart_chain_depth_thirty_one"
+  "severity:severity_ordered_chain_two_links"
+  "severity:severity_single_point_chain_two_links"
+  "severity:severity_full_ladder_set_one_link"
+  "structural:stage_cap_one_hundred_twenty_eight"
+  "structural:ordinary_alias_reuse_at_the_cap"
+  "structural:split_let_remedy_depth_twenty_four"
+)
+
+echo "building the calibration harness (outside every watchdog window)…" >&2
+if ! binary=$(cargo test -p trawl-engine --test bind_calibration --no-run \
+  --message-format=json-render-diagnostics |
+  jq -r 'select(.target.name == "bind_calibration") | .executable | select(. != null)' |
+  tail -1); then
+  echo "failed to build the bind_calibration harness or read its artifact metadata" >&2
+  exit 1
+fi
+if [[ -z "$binary" || ! -x "$binary" ]]; then
+  echo "could not locate the bind_calibration test binary" >&2
+  exit 1
+fi
+echo "harness: $binary" >&2
+
+rows=()
+outcomes=()
+dsl_lines=()
+engine=""
+samples=0
+warmups=0
+stopped=()
+status=0
+
+for entry in "${cases[@]}"; do
+  family=${entry%%:*}
+  name=${entry#*:}
+  if [[ " ${stopped[*]-} " == *" $family "* ]]; then
+    outcomes+=("$name: skipped, the $family family already hit the watchdog")
+    continue
+  fi
+  echo "--- $name (watchdog ${WATCHDOG}s)" >&2
+  set +e
+  output=$(timeout "${WATCHDOG}" "$binary" --exact --ignored --nocapture "$name" 2>&1)
+  code=$?
+  set -e
+  case $code in
+  0)
+    outcomes+=("$name: completed inside the ${WATCHDOG}s watchdog")
+    ;;
+  124)
+    outcomes+=("$name: CUT OFF by the ${WATCHDOG}s watchdog")
+    stopped+=("$family")
+    status=1
+    echo "$output" >&2
+    continue
+    ;;
+  *)
+    outcomes+=("$name: FAILED (exit $code)")
+    status=1
+    echo "$output" >&2
+    continue
+    ;;
+  esac
+  while IFS= read -r line; do
+    case "$line" in
+    row:*) rows+=("${line#row: }") ;;
+    dsl:*) dsl_lines+=("${line#dsl: }") ;;
+    engine:*) engine=${line#engine: } ;;
+    sampling:*) read -r samples warmups <<<"${line#sampling: }" ;;
+    esac
+  done <<<"$output"
+done
+
+echo
+if (( samples > 0 )); then
+  echo "engine: ${engine:-unknown}   watchdog: ${WATCHDOG}s   samples: $samples measured after $warmups warm-up"
+else
+  echo "engine: ${engine:-unknown}   watchdog: ${WATCHDOG}s   samples: unknown (no completed case metadata)"
+  status=1
+fi
+echo
+header="| case | lateral delta | stages | SQL bytes |"
+separator="| --- | ---: | ---: | ---: |"
+for ((sample=1; sample<=samples; sample++)); do
+  header+=" s$sample ms |"
+  separator+=" ---: |"
+done
+echo "$header worst ms |"
+echo "$separator ---: |"
+for row in ${rows[@]+"${rows[@]}"}; do echo "$row"; done
+echo
+echo "queries:"
+for line in ${dsl_lines[@]+"${dsl_lines[@]}"}; do echo "  $line"; done
+echo
+echo "watchdog outcomes:"
+for line in ${outcomes[@]+"${outcomes[@]}"}; do echo "  $line"; done
+
+exit $status

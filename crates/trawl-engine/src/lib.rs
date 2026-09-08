@@ -8,6 +8,7 @@
 //! and result extraction. It takes SQL + parameters from trawl-core's
 //! emitter and executes them against `DuckDB`.
 
+pub mod cancel;
 pub mod error;
 pub mod executor;
 pub mod parquet_stats;

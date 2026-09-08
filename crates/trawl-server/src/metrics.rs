@@ -42,6 +42,12 @@ pub const SEVERITY_UNMAPPED_TOTAL: &str = "trawl_severity_unmapped_total";
 pub const HOT_BUFFER_EVENTS: &str = "trawl_hot_buffer_events";
 pub const HOT_BUFFER_BYTES: &str = "trawl_hot_buffer_bytes";
 pub const ACTIVE_CONNECTIONS: &str = "trawl_active_connections";
+/// Pool permits held by work whose request already answered (ADR-0024).
+///
+/// A subset of the held permits, not an addition to them, and
+/// deliberately label-free: the only cardinality a query id or a key
+/// name could add here is unbounded.
+pub const QUERY_PERMITS_RETAINED: &str = "trawl_query_permits_retained";
 pub const PARQUET_FILES: &str = "trawl_parquet_files_total";
 pub const PARQUET_BYTES: &str = "trawl_parquet_size_bytes";
 pub const HEALTH_CHECK: &str = "trawl_health_check";
@@ -162,6 +168,11 @@ pub fn describe_metrics() {
     );
     describe_gauge!(HOT_BUFFER_BYTES, "Current byte size of the hot buffer");
     describe_gauge!(ACTIVE_CONNECTIONS, "Number of in-flight HTTP requests");
+    describe_gauge!(
+        QUERY_PERMITS_RETAINED,
+        "Executor-pool permits held by query work whose request already \
+         answered (a subset of the permits in use)"
+    );
     describe_gauge!(PARQUET_FILES, "Total number of parquet data files");
     describe_gauge!(PARQUET_BYTES, "Total byte size of parquet data files");
     describe_gauge!(
@@ -456,7 +467,14 @@ pub fn collect_gauges(
     hot_buffer: Option<&Arc<HotBuffer>>,
     fallback_glob: &str,
     wal_dir: Option<&Path>,
+    retained_permits: usize,
 ) {
+    // The caller reads the pool on its own thread and passes the number
+    // in: this function runs on the blocking pool and holds no server
+    // state, which is what keeps a filesystem walk off the reactor
+    // without dragging a lock across it.
+    metrics::gauge!(QUERY_PERMITS_RETAINED).set(retained_permits as f64);
+
     if let Some(buf) = hot_buffer {
         metrics::gauge!(HOT_BUFFER_EVENTS).set(buf.event_count() as f64);
         metrics::gauge!(HOT_BUFFER_BYTES).set(buf.byte_count() as f64);
@@ -774,6 +792,6 @@ mod tests {
     #[test]
     fn collect_gauges_no_hot_buffer_no_panic() {
         // With no recorder installed and no hot buffer, should be a no-op.
-        collect_gauges(None, "/nonexistent/path/**/*.parquet", None);
+        collect_gauges(None, "/nonexistent/path/**/*.parquet", None, 0);
     }
 }

@@ -44,7 +44,7 @@ HTTPS listener, query limits, TLS, and rate limiting.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `http_addr` | string | `"127.0.0.1:8080"` | HTTPS listen address |
-| `timeout_secs` | integer | `30` | Query execution timeout (seconds) |
+| `timeout_secs` | integer | `30` | Absolute query request deadline, including queue waits (seconds) |
 | `max_concurrent_queries` | integer | *num CPUs* | DuckDB executor pool size |
 | `max_result_rows` | integer | `100000` | Max rows before query is rejected |
 | `max_export_rows` | integer | `1000000` | Max rows for export (bypasses `max_result_rows`) |
@@ -73,6 +73,78 @@ retention window at all.
 `ingest.telemetry_buffer_max_bytes` is the deliberate exception: it must be a
 positive byte count because an unbounded buffer can grow without limit behind
 a wedged WAL write. To turn that pipeline off, set `internal_telemetry = false`.
+
+#### The query deadline, and work that outlives a request
+
+`timeout_secs` is **one absolute deadline per request**, not a budget each
+phase gets to spend again. trawld stamps it right after authentication,
+before it tracks the query, admits the DSL or resolves a saved query's
+source, and everything the request then waits for comes out of that one
+instant: waiting for an executor from the pool, waiting on the
+publication gate that keeps a query off a file compaction is replacing,
+the delay between a queued worker being handed a permit and actually
+starting, and execution itself. A best-effort history write runs under it
+too, so a slow store can cost the history row but never the answer that
+is already in hand. Time spent reading the request body is outside it,
+and so is delivering the response.
+
+Where the deadline expires decides the status code:
+
+- **Before the work starts**, the answer is `503` with
+  `server at capacity: the query was not started`. That is a fixed
+  sentence, and it is the whole answer: nothing was read, nothing ran,
+  and no timeout is written to query history.
+- **After the work starts**, it is the familiar `504` query timeout.
+
+The work-start transition is the boundary, not the order two timers
+happen to fire in. Holding an executor permit is not the same as having
+started: a worker can sit in the queue holding nothing, or hold a permit
+and be refused at the transition because the deadline passed while it
+waited.
+
+A pre-start `503` means no database work started for that request. A `504`
+means the request ended after work started, including a schema value
+sample. The DuckDB bind or scan can continue and keeps its executor permit
+until it physically finishes. trawld reports that retained capacity:
+
+- `GET /api/v1/queries` carries a `retained` list beside the active one.
+  Each entry has the pool `id`, the work `kind` (`query`, `from_saved`,
+  `export`, `scheduled`, `ping`, `sample`), whether it `started`, and
+  `retained_ms`, how long it has outlived its request. A query some key
+  submitted also carries that key's display name and its DSL, to every
+  reader holding `query`, the same metadata the `active` and `recent`
+  lists carry for the same query. An autocomplete `sample` is owned by
+  the key that asked for it too, so its entry carries that key's display
+  name to any reader holding `query`, and never any query text: a sample
+  is a field lookup, not DSL. Only work with no owner at all, `ping` and
+  `scheduled`, hides its name and its text from anyone below
+  `server_manage`. Reading an entry is not authority to stop it:
+  cancellation still needs `server_manage` or the exact submitting key.
+- `GET /api/v1/stats` and the dashboard snapshot carry `pool_retained`
+  beside `pool_active`. Retained work is a **subset** of held permits,
+  never an extra count, and the terminal dashboard renders
+  `active: 3/4 (1 retained)` only when the number is nonzero.
+- `/metrics` carries `trawl_query_permits_retained`, a label-free gauge.
+  A steady nonzero value means capacity is occupied by work no request is
+  waiting for any more, and that is the number to alarm on if searches
+  start queueing behind nothing visible.
+- The lifecycle logs `query_permit_retained` and `query_permit_reclaimed`
+  bracket each interval. They carry metadata only, never DSL.
+
+**Cancelling.** `DELETE /api/v1/queries/{id}` still works on retained
+work, and repeating it is safe: cancellation is a latch, and asking twice
+sets a flag that is already set. What comes back is an acknowledgement
+that cancellation was **requested**, not a promise that anything has
+stopped. trawld latches the request even before an interrupt handle
+exists, so a cancel that arrives during binding is not lost, and it
+checks the latch again at the boundary between binding and execution.
+A bind already inside DuckDB is not preemptible: the honest worst case is
+that the permit stays retained until that bind returns.
+
+**The DSL admission limits are not configurable.** The 512 alias-expansion
+budget and the 128-stage cap ([DSL reference](/reference/dsl/)) are fixed
+constants, checked before a query reaches the database, and there is no
+knob here that raises them.
 
 #### `[server.rate_limit]`
 
