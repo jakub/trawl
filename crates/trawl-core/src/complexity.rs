@@ -229,9 +229,14 @@ pub enum CompareKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FunctionShape {
     /// One wrapper node over `n` arguments, each written once —
-    /// `AVG(a)`, `IF(a, b, c)`, `COALESCE(a, …)`, `COUNT(*)`,
-    /// `CASE WHEN … END`.
+    /// `AVG(a)`, `IF(a, b, c)`, `COALESCE(a, …)`, `CASE WHEN … END`.
     Plain(usize),
+    /// `COUNT(*)` — the row counter, whose star is a node of its own.
+    CountStar,
+    /// `(a IS NULL)`.
+    IsNull,
+    /// `(a IS NOT NULL)`.
+    IsNotNull,
     /// `PERCENTILE_CONT(<p>) WITHIN GROUP (ORDER BY a)` — the aggregate
     /// and its inlined fraction.
     Percentile,
@@ -363,11 +368,12 @@ pub fn profile(rendering: &Rendering) -> RenderProfile {
         }
         Rendering::SeverityRanges { runs, negated } => {
             let runs = n_u64(*runs);
-            // Three nodes per range (`subject BETWEEN lo AND hi`; a
-            // one-point run writes two and is overcounted), one OR between
-            // consecutive runs, and the `NOT` wrapper for `!=`.
+            // Four nodes per range (`subject BETWEEN lo AND hi`; a
+            // one-point run writes `= p`, two nodes, and is overcounted),
+            // one OR between consecutive runs, and the `NOT` wrapper for
+            // `!=`.
             let fixed = runs
-                .saturating_mul(3)
+                .saturating_mul(4)
                 .saturating_add(runs.saturating_sub(1))
                 .saturating_add(u64::from(*negated));
             RenderProfile::new(fixed, vec![runs])
@@ -382,9 +388,14 @@ fn n_u64(n: usize) -> u64 {
     u64::try_from(n).unwrap_or(u64::MAX)
 }
 
+#[allow(clippy::match_same_arms)]
 fn function_profile(shape: FunctionShape) -> RenderProfile {
     match shape {
         FunctionShape::Plain(n) => RenderProfile::uniform(1, n),
+        // `COUNT(*)`: the aggregate and the star.
+        FunctionShape::CountStar => RenderProfile::new(2, Vec::new()),
+        FunctionShape::IsNull => RenderProfile::new(2, vec![1]),
+        FunctionShape::IsNotNull => RenderProfile::new(3, vec![1]),
         // The aggregate and its inlined percentile fraction.
         FunctionShape::Percentile => RenderProfile::new(2, vec![1]),
         // `ROUND(a, 2)`: the call and the inlined precision literal.
@@ -445,10 +456,10 @@ fn conform_profile(shape: ConformShape) -> RenderProfile {
             let case = reading_case_fixed(dialect);
             let subjects = reading_case_subjects(dialect);
             // `CAST(list_transform([trimmed(text)], _sev -> <case>)[1] AS
-            // BIGINT)`: the cast, the transform, the list, the lambda, the
-            // index and its literal, one trim, the case, and the lambda
-            // parameter once per writing.
-            RenderProfile::new(6 + TRIMMED_FIXED + case + subjects, vec![1])
+            // BIGINT)`: the cast, the transform, the list, the lambda and
+            // its parameter, the index and its literal, one trim, the
+            // case, and the lambda parameter once per writing.
+            RenderProfile::new(7 + TRIMMED_FIXED + case + subjects, vec![1])
         }
         // `(CASE x WHEN 1 THEN 'trace' … WHEN 24 THEN 'fatal4' END)`.
         ConformShape::SeverityTokenText => RenderProfile::new(severity_token_text_fixed(), vec![1]),
@@ -469,8 +480,9 @@ const TRIMMED_FIXED: u64 = 6;
 fn reading_case_fixed(dialect: Dialect) -> u64 {
     let arms = n_u64(severity_case_arms());
     let numeric = match dialect {
-        // `(CASE WHEN cast BETWEEN 1 AND 24 THEN cast END)` over two casts.
-        Dialect::Otel => 6,
+        // `(CASE WHEN cast BETWEEN 1 AND 24 THEN cast END)`: the `CASE`,
+        // the ternary `BETWEEN`, its two bounds, and two casts.
+        Dialect::Otel => 7,
         // `(CASE cast WHEN 0 THEN … WHEN 7 THEN … END)`, eight rungs.
         Dialect::Syslog => 18,
     };
@@ -630,6 +642,12 @@ fn refusal_name(name: &str) -> Option<String> {
 pub struct CheckStats {
     /// AST nodes entered, plus one per pin interpretation priced.
     pub visited_nodes: u64,
+    /// Pipeline stages counted, against [`MAX_PIPELINE_STAGES`].
+    pub stages: usize,
+    /// The summed assignment delta, against [`MAX_LATERAL_EXPANSION`] —
+    /// the headroom a query actually left, which is what the
+    /// documentation fixtures record.
+    pub lateral_delta: u64,
 }
 
 /// Admit a pipeline under the bind-time expansion budget (ADR-0024).
@@ -665,9 +683,12 @@ pub fn check_pipeline_complexity_with_stats(
         );
     }
 
+    stats.stages = stages.len();
     let mut total: u64 = 0;
     for (index, stage) in stages.iter().enumerate() {
-        if let Err(refusal) = score_stage(index, &stage.node, &mut total, &mut stats) {
+        let outcome = score_stage(index, &stage.node, &mut total, &mut stats);
+        stats.lateral_delta = total;
+        if let Err(refusal) = outcome {
             return (Err(refusal), stats);
         }
     }
@@ -875,6 +896,9 @@ fn call_rendering(name: &str, args: &[Spanned<Expr>]) -> Rendering {
         return Rendering::UnknownCall(arity);
     };
     Rendering::Function(match *known {
+        "count" if arity == 0 => FunctionShape::CountStar,
+        "isnull" => FunctionShape::IsNull,
+        "isnotnull" => FunctionShape::IsNotNull,
         "round" if arity >= 2 => FunctionShape::RoundPrecision,
         "split" => FunctionShape::Split,
         "now" => FunctionShape::Now,
@@ -907,8 +931,6 @@ fn call_rendering(name: &str, args: &[Spanned<Expr>]) -> Rendering {
         | "trim"
         | "ltrim"
         | "rtrim"
-        | "isnull"
-        | "isnotnull"
         | "abs"
         | "ceil"
         | "ceiling"
@@ -1237,6 +1259,8 @@ fn element_kind(form: &CompareForm) -> CompareKind {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
     use crate::parser;
 
@@ -1676,13 +1700,27 @@ mod tests {
             ])),
             RenderProfile::new(22, vec![5])
         );
-        // Three ranges: three nodes each, two `OR`s, one `NOT`.
+        // Three ranges: four nodes each, two `OR`s, one `NOT`.
         assert_eq!(
             profile(&Rendering::SeverityRanges {
                 runs: 3,
                 negated: true
             }),
-            RenderProfile::new(12, vec![3])
+            RenderProfile::new(15, vec![3])
+        );
+        // `COUNT(*)` has no operands at all.
+        assert_eq!(
+            profile(&Rendering::Function(FunctionShape::CountStar)),
+            RenderProfile::new(2, vec![])
+        );
+        // `(a IS NULL)` and `(a IS NOT NULL)`.
+        assert_eq!(
+            profile(&Rendering::Function(FunctionShape::IsNull)),
+            RenderProfile::new(2, vec![1])
+        );
+        assert_eq!(
+            profile(&Rendering::Function(FunctionShape::IsNotNull)),
+            RenderProfile::new(3, vec![1])
         );
         // `ABS(a)`.
         assert_eq!(
@@ -1844,6 +1882,167 @@ mod tests {
         let text = refusal.to_string();
         assert!(text.contains("pipeline stage 3 (`let`)"), "{text}");
         assert!(text.contains("512"), "{text}");
+    }
+
+    // ── the documented queries ────────────────────────────────────────
+
+    /// Every query trawl DOCUMENTS stays inside the budget (ADR-0024).
+    ///
+    /// The caps are numbers picked against a binder's behaviour, not
+    /// against the DSL's expressiveness, so the obligation runs the other
+    /// way: a limit that refused an example the reference tells operators
+    /// to type would be the wrong limit. This walks the fenced code in the
+    /// DSL and CLI references, parses what parses, and admits it.
+    ///
+    /// What it skips, and why:
+    ///
+    /// - **fences in another language.** A `toml` block is configuration
+    ///   and a `bash` block is shell; the DSL inside a `bash` block is
+    ///   recovered from the quoted argument of `trawl query` /
+    ///   `trawl validate`, which is where the CLI reference keeps it.
+    /// - **lines the prose labels as errors.** The reference shows what a
+    ///   refused query looks like. Those mostly fail to parse and drop out
+    ///   on their own; the ones that parse are semantic refusals, not
+    ///   budget ones, and stay in.
+    /// - **anything that does not parse.** Placeholders
+    ///   (`[search stage] | …`), sample output and prose fragments are not
+    ///   queries.
+    const DOCS: &[&str] = &[
+        "docs/src/content/docs/reference/dsl.md",
+        "docs/src/content/docs/reference/cli.md",
+    ];
+
+    /// The reference deliberately shows refused text. A line the prose marks
+    /// that way is not a fixture.
+    const NEGATIVE_MARKERS: &[&str] = &["error at the"];
+
+    /// Pull every candidate query out of one markdown file's fenced blocks.
+    fn candidates(markdown: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut block: Vec<&str> = Vec::new();
+        let mut lang = String::new();
+        let mut inside = false;
+
+        for line in markdown.lines() {
+            if let Some(rest) = line.strip_prefix("```") {
+                if inside {
+                    out.extend(block_candidates(&lang, &block));
+                    block.clear();
+                    inside = false;
+                } else {
+                    lang = rest.trim().to_string();
+                    inside = true;
+                }
+                continue;
+            }
+            if inside {
+                block.push(line);
+            }
+        }
+        out
+    }
+
+    fn block_candidates(lang: &str, block: &[&str]) -> Vec<String> {
+        let lines: Vec<&str> = block
+            .iter()
+            .copied()
+            .filter(|l| !l.trim().is_empty())
+            .filter(|l| !NEGATIVE_MARKERS.iter().any(|m| l.contains(m)))
+            .collect();
+        if lines.is_empty() {
+            return Vec::new();
+        }
+
+        if lang.eq_ignore_ascii_case("bash") {
+            // The CLI reference carries its DSL inside a quoted argument.
+            return lines.iter().filter_map(|l| quoted_argument(l)).collect();
+        }
+        if !lang.is_empty() {
+            // toml, json and friends are not queries.
+            return Vec::new();
+        }
+
+        // An unlabelled block is either one multi-line query or a list of
+        // one-line ones. Try the whole block first, so a wrapped pipeline is
+        // measured as the pipeline it is.
+        let joined = lines.join("\n");
+        if parser::parse(&joined).is_ok() {
+            return vec![joined];
+        }
+        lines.iter().map(|l| (*l).to_string()).collect()
+    }
+
+    /// The first double-quoted argument on a shell line, if the command is one
+    /// that takes DSL.
+    fn quoted_argument(line: &str) -> Option<String> {
+        if !line.contains("trawl query") && !line.contains("trawl validate") {
+            return None;
+        }
+        let (_, rest) = line.split_once('"')?;
+        let (arg, _) = rest.split_once('"')?;
+        // The reference elides the query itself in some option examples.
+        if arg.trim() == "..." {
+            return None;
+        }
+        Some(arg.to_string())
+    }
+
+    #[test]
+    fn docs_and_fixtures_stay_below_caps() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("the crate sits two levels under the repository root");
+
+        let mut admitted = 0usize;
+        let mut max_stages = 0usize;
+        let mut max_delta = 0u64;
+        let mut widest = String::new();
+
+        for doc in DOCS {
+            let path = root.join(doc);
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            for candidate in candidates(&text) {
+                let Ok(query) = parser::parse(&candidate) else {
+                    continue;
+                };
+                let (verdict, stats) = check_pipeline_complexity_with_stats(&query.pipeline);
+                verdict.unwrap_or_else(|refusal| {
+                    panic!(
+                        "{doc} documents a query the budget refuses:\n  {candidate}\n  {refusal}"
+                    )
+                });
+                admitted += 1;
+                max_stages = max_stages.max(stats.stages);
+                if stats.lateral_delta > max_delta {
+                    max_delta = stats.lateral_delta;
+                    widest = candidate.clone();
+                }
+            }
+        }
+
+        // The reference is not a corpus of one example; if the extraction ever
+        // stops finding queries, this test would pass by looking at nothing.
+        assert!(
+            admitted >= 60,
+            "only {admitted} documented queries were parsed — the extraction broke"
+        );
+
+        // Observed maxima at the time of writing, on the two reference pages:
+        //   documented queries admitted: 61
+        //   longest pipeline:            5 stages   (of 128)
+        //   largest lateral delta:       0          (of 512)
+        //
+        // Zero is not an accident. No documented example names an earlier
+        // output of the same stage — the pattern the budget exists for does
+        // not appear in the reference at all, which is why the caps can be
+        // this low without touching anything trawl tells people to write.
+        assert!(max_stages <= MAX_PIPELINE_STAGES / 4, "{max_stages} stages");
+        assert!(
+            max_delta <= MAX_LATERAL_EXPANSION / 4,
+            "{max_delta} lateral delta, from: {widest}"
+        );
     }
 
     /// A backticked name comes back out of the message exactly as the

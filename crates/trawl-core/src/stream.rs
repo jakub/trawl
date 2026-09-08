@@ -86,6 +86,11 @@ pub enum StreamPlanError {
     /// SQL lane reaches through `validate_pipeline` and this lane
     /// reaches itself.
     ProjectionCollision(String),
+    /// A pipeline over the bind-time expansion budget (ADR-0024). Same
+    /// reason as `ProjectionCollision`: the sentence comes from the one
+    /// shared check in `crate::complexity`, which the SQL lane reaches
+    /// through `validate_pipeline` and this lane reaches itself.
+    TooComplex(String),
 }
 
 impl fmt::Display for StreamPlanError {
@@ -100,7 +105,7 @@ impl fmt::Display for StreamPlanError {
             // Verbatim: the emitter (InvalidFunction) and the shared
             // projection check (ProjectionCollision) own their whole
             // sentence.
-            Self::InvalidFunction(msg) | Self::ProjectionCollision(msg) => {
+            Self::InvalidFunction(msg) | Self::ProjectionCollision(msg) | Self::TooComplex(msg) => {
                 write!(f, "{msg}")
             }
             Self::InvalidComparison(msg) => write!(f, "invalid comparison: {msg}"),
@@ -127,7 +132,15 @@ pub fn compile_stream_plan(
     pipeline: &[Spanned<PipeStage>],
     pins: &PinScope,
 ) -> Result<StreamPlan, StreamPlanError> {
-    // The shared projection-name check runs first, over every stage —
+    // The bind-time expansion budget first, over the whole pipeline
+    // (ADR-0024) — ahead of the projection check and of every
+    // unsupported-stage refusal, so a query the SQL door refuses for its
+    // expansion is refused here with the same sentence rather than for
+    // being unstreamable.
+    crate::complexity::check_pipeline_complexity(pipeline)
+        .map_err(|refusal| StreamPlanError::TooComplex(refusal.to_string()))?;
+
+    // The shared projection-name check runs next, over every stage —
     // before the unsupported-stage and multi-aggregation refusals — so a
     // `pivot`/`eventstats` collision gets the semantic answer even where
     // the stage itself is not streamable (ADR-0013 ruling 8).
