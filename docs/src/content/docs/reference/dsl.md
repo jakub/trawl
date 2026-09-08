@@ -951,8 +951,12 @@ The score counts exactly that repetition, and nothing else. An expression
 that names no earlier output of its own stage scores zero, however big it
 is: independent assignments, a 500-element `in (...)` list, a long
 pipeline of separate stages. Naming the same earlier output many times is
-cheap per use and does count: 256 outputs each reading one earlier output
-once is 512 on the nose, and admitted.
+charged for the entire expression copied at each use, minus the one
+reference it replaces. For example, `base = status + 1` has three nodes:
+the addition, the field and the literal. Each later output
+`xN = base + N` adds 3 - 1 = 2 to the score. With 256 such outputs, the
+score is 2 × 256 = 512, exactly the admitted limit. A larger `base`
+expression costs more per use.
 
 Over either limit, the query is refused before it reaches the database,
 naming the stage and the output that crossed the line:
@@ -971,7 +975,7 @@ pipeline, or save part of it and read it back with `from saved`
 The remedy is the split the message names. One `| let` per dependent
 step, so the next stage reads a column the previous stage finished:
 
-```
+```text
 | let a0 = status + status | let a1 = a0 + a0 | let a2 = a1 + a1
 ```
 
@@ -981,7 +985,7 @@ are refused. `stats`, `timechart` and `eventstats` take the same fix from
 the other end: give each output an expression of its own, then derive the
 combined values in a `| let` after the stage.
 
-```
+```text
 | stats count() as hits, avg(duration) as avg_dur by service | let ratio = hits / avg_dur
 ```
 

@@ -55,10 +55,13 @@ cases=(
 )
 
 echo "building the calibration harness (outside every watchdog window)…" >&2
-binary=$(cargo test -p trawl-engine --test bind_calibration --no-run \
-  --message-format=json 2>/dev/null |
+if ! binary=$(cargo test -p trawl-engine --test bind_calibration --no-run \
+  --message-format=json-render-diagnostics |
   jq -r 'select(.target.name == "bind_calibration") | .executable | select(. != null)' |
-  tail -1)
+  tail -1); then
+  echo "failed to build the bind_calibration harness or read its artifact metadata" >&2
+  exit 1
+fi
 if [[ -z "$binary" || ! -x "$binary" ]]; then
   echo "could not locate the bind_calibration test binary" >&2
   exit 1
@@ -69,6 +72,8 @@ rows=()
 outcomes=()
 dsl_lines=()
 engine=""
+samples=0
+warmups=0
 stopped=()
 status=0
 
@@ -107,15 +112,27 @@ for entry in "${cases[@]}"; do
     row:*) rows+=("${line#row: }") ;;
     dsl:*) dsl_lines+=("${line#dsl: }") ;;
     engine:*) engine=${line#engine: } ;;
+    sampling:*) read -r samples warmups <<<"${line#sampling: }" ;;
     esac
   done <<<"$output"
 done
 
 echo
-echo "engine: ${engine:-unknown}   watchdog: ${WATCHDOG}s   samples: 5 measured after 1 warm-up"
+if (( samples > 0 )); then
+  echo "engine: ${engine:-unknown}   watchdog: ${WATCHDOG}s   samples: $samples measured after $warmups warm-up"
+else
+  echo "engine: ${engine:-unknown}   watchdog: ${WATCHDOG}s   samples: unknown (no completed case metadata)"
+  status=1
+fi
 echo
-echo "| case | lateral delta | stages | SQL bytes | s1 ms | s2 ms | s3 ms | s4 ms | s5 ms | worst ms |"
-echo "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+header="| case | lateral delta | stages | SQL bytes |"
+separator="| --- | ---: | ---: | ---: |"
+for ((sample=1; sample<=samples; sample++)); do
+  header+=" s$sample ms |"
+  separator+=" ---: |"
+done
+echo "$header worst ms |"
+echo "$separator ---: |"
 for row in ${rows[@]+"${rows[@]}"}; do echo "$row"; done
 echo
 echo "queries:"

@@ -5870,9 +5870,9 @@ fn a_severity_chain_multiplies_its_subject_twelve_times_per_link() {
         "SQL text grows twelvefold per link while the DSL grows by one assignment"
     );
 
-    // The DSL that would reach a third link never gets emitted: two links
-    // are admitted, three are not, and the eight-link chain ADR-0024
-    // describes is refused by arithmetic alone.
+    // One link is admitted; two links are already refused. The third-link
+    // DSL never gets emitted, and the eight-link chain ADR-0024 describes
+    // is refused by arithmetic alone.
     let chain = |links: usize| {
         let mut dsl = String::from("* | let a0 = _severity + _severity");
         for i in 1..=links {

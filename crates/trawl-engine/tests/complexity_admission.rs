@@ -14,7 +14,7 @@
 //! `executor::prepare_probe` counts every statement the query and export
 //! lanes hand `DuckDB`, and each case here asserts the count did not move
 //! across the call. The counter is process-global, so every test in this
-//! file takes one lock: the positive control deliberately binds, and
+//! file takes one lock: the positive controls deliberately bind, and
 //! under the plain `cargo test` harness — where these run as threads of
 //! one process rather than nextest's separate processes — a concurrent
 //! refusal case must not see its increment.
@@ -165,4 +165,40 @@ fn the_bind_counter_counts_an_admitted_query() {
         prepare_probe::count() > before,
         "an admitted query binds at least one statement"
     );
+}
+
+#[test]
+fn the_bind_counter_counts_admitted_exports() {
+    let _lock = counter_lock();
+    let exec = Executor::new().expect("executor");
+    let glob = common::fixture_glob();
+    let hot = common::fixture_glob_json();
+    let out = tempfile::tempdir().expect("temp dir");
+    let path = out.path().join("cold.parquet");
+    let before = prepare_probe::count();
+    exec.export_parquet("* | head 1", &glob, &FieldTypes::new(), &path, 100)
+        .expect("an in-budget cold export runs");
+    assert!(
+        prepare_probe::count() > before,
+        "an admitted cold export binds at least one statement"
+    );
+    assert!(path.is_file(), "the cold export writes parquet");
+
+    let path = out.path().join("hot.parquet");
+    let before = prepare_probe::count();
+    exec.export_parquet_with_hot(
+        "* | head 1",
+        &glob,
+        &hot,
+        &FieldTypes::new(),
+        &FieldTypes::new(),
+        &path,
+        100,
+    )
+    .expect("an in-budget hot export runs");
+    assert!(
+        prepare_probe::count() > before,
+        "an admitted hot export binds at least one statement"
+    );
+    assert!(path.is_file(), "the hot export writes parquet");
 }

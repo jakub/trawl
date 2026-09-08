@@ -955,6 +955,13 @@ impl Executor {
             }
         }
 
+        // Staging and COPY are separate statements. A cancellation that
+        // arrived during staging must stop here, even if staging succeeded.
+        if cancel.latched() {
+            cleanup(&self.conn);
+            return Err(EngineError::Cancelled);
+        }
+
         // COPY to parquet. DuckDB's COPY TO doesn't support parameterized
         // paths, so we escape single quotes by doubling them (DuckDB convention).
         let safe_path = path_str.replace('\'', "''");

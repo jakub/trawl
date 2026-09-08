@@ -122,6 +122,7 @@ fn calibrate(case: &str, dsl: &str) {
         worst.as_secs_f64() * 1000.0
     );
     println!("engine: {version}");
+    println!("sampling: {SAMPLES} {WARMUPS}");
     assert!(
         worst < SAMPLE_BUDGET,
         "{case}: every sample must finish under {SAMPLE_BUDGET:?}, the slowest took {worst:?}"

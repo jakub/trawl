@@ -619,11 +619,14 @@ fn reading_numeric_arm(dialect: Dialect) -> OneChild {
 /// plus each `OTel` exact short name the token table does not already
 /// carry.
 fn severity_case_arms() -> usize {
-    let table: Vec<&str> = crate::severity::token_entries().map(|(t, _)| t).collect();
-    let extras = (1..=24u8)
-        .filter(|n| crate::severity::otel_name(*n).is_some_and(|name| !table.contains(&name)))
-        .count();
-    table.len() + extras
+    static ARMS: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        let table: Vec<&str> = crate::severity::token_entries().map(|(t, _)| t).collect();
+        let extras = (1..=24u8)
+            .filter(|n| crate::severity::otel_name(*n).is_some_and(|name| !table.contains(&name)))
+            .count();
+        table.len() + extras
+    });
+    *ARMS
 }
 
 /// `crate::conform::severity_token_text_sql`: a SIMPLE `CASE` over

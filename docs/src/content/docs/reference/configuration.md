@@ -44,7 +44,7 @@ HTTPS listener, query limits, TLS, and rate limiting.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `http_addr` | string | `"127.0.0.1:8080"` | HTTPS listen address |
-| `timeout_secs` | integer | `30` | Query execution timeout (seconds) |
+| `timeout_secs` | integer | `30` | Absolute query request deadline, including queue waits (seconds) |
 | `max_concurrent_queries` | integer | *num CPUs* | DuckDB executor pool size |
 | `max_result_rows` | integer | `100000` | Max rows before query is rejected |
 | `max_export_rows` | integer | `1000000` | Max rows for export (bypasses `max_result_rows`) |
@@ -102,10 +102,10 @@ started: a worker can sit in the queue holding nothing, or hold a permit
 and be refused at the transition because the deadline passed while it
 waited.
 
-**A 503 or a 504 does not mean the database stopped.** The request ends;
-a DuckDB bind or scan that already started keeps its executor permit
-until it physically finishes. trawld now says so instead of leaving the
-capacity unaccounted:
+A pre-start `503` means no database work started for that request. A `504`
+means the request ended after work started, including a schema value
+sample. The DuckDB bind or scan can continue and keeps its executor permit
+until it physically finishes. trawld reports that retained capacity:
 
 - `GET /api/v1/queries` carries a `retained` list beside the active one.
   Each entry has the pool `id`, the work `kind` (`query`, `from_saved`,

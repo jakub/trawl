@@ -141,13 +141,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn an_unrepresentable_budget_is_clamped() {
+    #[tokio::test(start_paused = true)]
+    async fn an_unrepresentable_budget_is_clamped() {
         // The clamp is what keeps an operator's `timeout_secs` from
         // overflowing the clock; the value is a year, so any real query
         // budget is unaffected.
         let clamped = Deadline::after(Duration::from_secs(u64::MAX));
-        let year = Deadline::after(super::MAX_BUDGET);
-        assert!(clamped <= year, "a huge budget lands at the clamp");
+        assert_eq!(clamped.remaining(), super::MAX_BUDGET);
     }
 }
