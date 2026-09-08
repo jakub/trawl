@@ -190,7 +190,7 @@ for name in "${PATCHES[@]}"; do
     # Require this assertion, not any failure elsewhere in the health spec.
     # Keep the report outside test-results, which Playwright cleans on run.
     health_report="$E2E_DIR/health-mutation-report.json"
-    (cd "$E2E_DIR" && npx playwright test "tests/$spec" --grep '^non-admin request silence:' --reporter=json) > "$health_report"
+    (cd "$E2E_DIR" && npx playwright test "tests/$spec" --grep 'non-admin request silence:' --reporter=json) > "$health_report"
     status=$?
     node - "$health_report" <<'JS'
 const fs = require('node:fs');
@@ -221,7 +221,7 @@ JS
   if [[ $name == 20-health-admin-gate.patch ]]; then
     # The 404 route is outside AuthShell. Authenticated routing tests
     # would correctly fail the same disabled admin gate as the target.
-    (cd "$E2E_DIR" && npx playwright test "tests/$control" --grep '^an unknown route renders the 404 page$')
+    (cd "$E2E_DIR" && npx playwright test "tests/$control" --grep 'an unknown route renders the 404 page$')
   else
     (cd "$E2E_DIR" && npx playwright test "tests/$control")
   fi
