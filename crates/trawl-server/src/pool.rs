@@ -2496,21 +2496,40 @@ mod tests {
         // snapshot and no walk exist at all. The worker is parked at this
         // pool's own seam rather than slowed by the process-global delay,
         // which a sibling test can reset out from under this one.
+        //
+        // The clock only moves once the worker is PAST its work-start
+        // transition. A short real deadline used to decide the class by
+        // wall clock: on a loaded runner expiry beat the blocking pool's
+        // own startup and the pool answered with the pre-start capacity
+        // 503, which is the correct classification for work that never
+        // started and not the one this assertion pins.
+        tokio::time::pause();
         let seams = pool.seams();
         let parked = seams.hold(Seam::Started);
-        let outcome = pool
-            .execute(
-                pool.allocate_query_id(),
-                "* | table lvl",
-                Deadline::after(Duration::from_millis(10)),
-                false,
-                0,
-                TEST_WORK,
-            )
-            .await;
-        assert!(matches!(outcome.result, Err(ServerError::Timeout)));
-        assert!(outcome.severity_columns.is_empty());
+        let id = pool.allocate_query_id();
+        let submitted = pool.clone();
+        let request = tokio::spawn(async move {
+            submitted
+                .execute(
+                    id,
+                    "* | table lvl",
+                    Deadline::after(Duration::from_secs(5)),
+                    false,
+                    0,
+                    TEST_WORK,
+                )
+                .await
+        });
+        until("work starts", || parked.arrivals() == 1).await;
+        tokio::time::advance(Duration::from_secs(6)).await;
+        let outcome = request.await.expect("the request joins");
         parked.release();
+        assert!(
+            matches!(outcome.result, Err(ServerError::Timeout)),
+            "{:?}",
+            outcome.result
+        );
+        assert!(outcome.severity_columns.is_empty());
     }
 
     #[tokio::test]

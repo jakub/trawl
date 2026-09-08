@@ -750,6 +750,34 @@ async fn a_failed_from_saved_resolution_finishes_its_tracking() {
     assert!(seen.retained.is_empty(), "no permit was ever taken");
 }
 
+/// An unparseable timezone is request validation, refused with a 400 before
+/// the tracker opens an entry. It used to be resolved after `tracker.start`
+/// and returned by `?`, which left the id active for the life of the
+/// process because nothing sweeps abandoned entries.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_invalid_timezone_leaves_no_active_entry() {
+    const DSL: &str = "service=tz-refusal last=1h | head 1";
+
+    let server = setup().await;
+    let admin = HttpClient::new_insecure(&server.url, &server.admin_token).unwrap();
+
+    let resp = raw_client()
+        .post(format!("{}/api/v1/query", server.url))
+        .header("authorization", format!("Bearer {}", server.analyst_token))
+        .json(&serde_json::json!({ "query": DSL, "timezone": "Mars/Olympus_Mons" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "an unresolvable timezone is a 400");
+
+    let seen = admin.queries().await.unwrap();
+    assert!(
+        !seen.active.iter().any(|q| q.query == DSL),
+        "a refused timezone leaves nothing running"
+    );
+    assert!(seen.retained.is_empty(), "no permit was ever taken");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn queries_rejects_ingest_role() {
     let server = setup().await;

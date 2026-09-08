@@ -113,8 +113,11 @@ capacity unaccounted:
   `retained_ms`, how long it has outlived its request. A query some key
   submitted also carries that key's display name and its DSL, to every
   reader holding `query`, the same metadata the `active` and `recent`
-  lists carry for the same query. Work with no human owner (ping,
-  sampling, scheduled runs) never shows query text to anyone below
+  lists carry for the same query. An autocomplete `sample` is owned by
+  the key that asked for it too, so its entry carries that key's display
+  name to any reader holding `query`, and never any query text: a sample
+  is a field lookup, not DSL. Only work with no owner at all, `ping` and
+  `scheduled`, hides its name and its text from anyone below
   `server_manage`. Reading an entry is not authority to stop it:
   cancellation still needs `server_manage` or the exact submitting key.
 - `GET /api/v1/stats` and the dashboard snapshot carry `pool_retained`

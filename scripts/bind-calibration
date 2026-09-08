@@ -49,9 +49,9 @@ cases=(
   "severity:severity_ordered_chain_two_links"
   "severity:severity_single_point_chain_two_links"
   "severity:severity_full_ladder_set_one_link"
-  "structural:split_let_remedy_depth_twenty_four"
   "structural:stage_cap_one_hundred_twenty_eight"
   "structural:ordinary_alias_reuse_at_the_cap"
+  "structural:split_let_remedy_depth_twenty_four"
 )
 
 echo "building the calibration harness (outside every watchdog window)…" >&2

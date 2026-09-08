@@ -76,6 +76,19 @@ pub async fn query(
         )));
     }
 
+    // Resolve the timezone from the request (default to UTC when absent)
+    // BEFORE anything opens a tracker entry. This is request validation
+    // like the offset check above, and its `?` return has no outcome path
+    // to finish tracking through: opening the entry first would leave an
+    // invalid timezone's id active forever, since nothing sweeps them.
+    let utc_offset_secs = req
+        .timezone
+        .as_deref()
+        .map(trawl_engine::timezone::resolve_utc_offset)
+        .transpose()
+        .map_err(ServerError::BadRequest)?
+        .unwrap_or(0);
+
     // One id from the pool's counter keys both the tracker entry and the
     // pool's interrupt map, so cancel-by-id interrupts the query the client
     // sees. Allocated before query_start so every lifecycle event correlates
@@ -103,14 +116,6 @@ pub async fn query(
         query = %req.query,
         "raw query text (DEBUG-only: never stored under the default filter)"
     );
-    // Resolve timezone from request (default to UTC when absent).
-    let utc_offset_secs = req
-        .timezone
-        .as_deref()
-        .map(trawl_engine::timezone::resolve_utc_offset)
-        .transpose()
-        .map_err(ServerError::BadRequest)?
-        .unwrap_or(0);
 
     let start = std::time::Instant::now();
     let capture_debug = state.query.query_log.is_some();
