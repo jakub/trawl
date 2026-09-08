@@ -29,19 +29,9 @@
 
 import { test, expect, resetScenario, CORPUS, capturedQueryCount } from '../fixtures';
 import { SEL, COPY, nameFrom } from '../selectors';
+import { expectFocusRing } from '../a11y';
 
 type Pg = import('@playwright/test').Page;
-type Loc = import('@playwright/test').Locator;
-
-/** The fleet-ui focus ring, as the browser computes it. Two readings:
- * `:focus-visible` is the state, the box-shadow is the pixels. A ring
- * rule that stopped matching leaves the first true and the second
- * `none`. */
-async function expectFocusRing(control: Loc): Promise<void> {
-  await expect(control).toBeFocused();
-  expect(await control.evaluate((el) => el.matches(':focus-visible'))).toBe(true);
-  expect(await control.evaluate((el) => getComputedStyle(el).boxShadow)).not.toBe('none');
-}
 
 /** Count clicks that reach `selector`, so an activation is a number. */
 async function countClicksOn(page: Pg, selector: string): Promise<void> {

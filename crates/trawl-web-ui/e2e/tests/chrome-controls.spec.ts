@@ -15,18 +15,13 @@
 
 import { test, expect, resetScenario, CORPUS } from '../fixtures';
 import { SEL, COPY, nameFrom } from '../selectors';
+import { expectFocusRing } from '../a11y';
 
 type Loc = import('@playwright/test').Locator;
 type Pg = import('@playwright/test').Page;
 
 const FIELD = CORPUS.columns[1];
 const VALUE = CORPUS.hosts[0];
-
-async function expectFocusRing(control: Loc): Promise<void> {
-  await expect(control).toBeFocused();
-  expect(await control.evaluate((el) => el.matches(':focus-visible'))).toBe(true);
-  expect(await control.evaluate((el) => getComputedStyle(el).boxShadow)).not.toBe('none');
-}
 
 /** Walk the tab order from wherever focus is until `target` has it.
  *

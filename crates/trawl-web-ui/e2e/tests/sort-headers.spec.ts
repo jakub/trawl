@@ -20,14 +20,7 @@
 
 import { test, expect, resetScenario, CORPUS } from '../fixtures';
 import { SEL, COPY, nameFrom } from '../selectors';
-
-type Loc = import('@playwright/test').Locator;
-
-async function expectFocusRing(control: Loc): Promise<void> {
-  await expect(control).toBeFocused();
-  expect(await control.evaluate((el) => el.matches(':focus-visible'))).toBe(true);
-  expect(await control.evaluate((el) => getComputedStyle(el).boxShadow)).not.toBe('none');
-}
+import { expectFocusRing } from '../a11y';
 
 /** `aria-sort` across every sortable header, in render order. The claim
  * is about the whole vector: the attribute belongs on the ONE sorted

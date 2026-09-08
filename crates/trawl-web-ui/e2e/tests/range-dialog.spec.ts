@@ -20,6 +20,7 @@
 
 import { test, expect } from '../fixtures';
 import { SEL, COPY } from '../selectors';
+import { expectFocusRing } from '../a11y';
 
 type Pg = import('@playwright/test').Page;
 
@@ -28,10 +29,7 @@ type Pg = import('@playwright/test').Page;
 async function tabToTrigger(page: Pg): Promise<void> {
   await page.locator(SEL.runButton).focus();
   await page.keyboard.press('Shift+Tab');
-  const trigger = page.locator(SEL.dateRangeTrigger);
-  await expect(trigger).toBeFocused();
-  expect(await trigger.evaluate((el) => el.matches(':focus-visible'))).toBe(true);
-  expect(await trigger.evaluate((el) => getComputedStyle(el).boxShadow)).not.toBe('none');
+  await expectFocusRing(page.locator(SEL.dateRangeTrigger));
 }
 
 test('opens from the keyboard and focuses the first control', async ({ page }) => {
