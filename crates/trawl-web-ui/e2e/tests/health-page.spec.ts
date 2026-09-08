@@ -293,7 +293,9 @@ test('query-only readers can focus and scroll the queries table with the keyboar
   const region = page.locator(SEL.healthQueryScroll);
   await expect(region).toBeVisible();
   await expect(region).toHaveAttribute('role', 'region');
-  await expect(region).toHaveAccessibleName('Queries');
+  await expect(page.getByRole('region', { name: 'Queries', exact: true })).toHaveCount(1);
+  await expect(page.getByRole('region', { name: 'Queries table', exact: true })).toHaveCount(1);
+  await expect(region).toHaveAccessibleName('Queries table');
   await expect.poll(() => region.evaluate(el => el.scrollWidth > el.clientWidth)).toBe(true);
   await page.locator(SEL.healthQueriesRefresh).focus();
   await page.keyboard.press('Tab');
