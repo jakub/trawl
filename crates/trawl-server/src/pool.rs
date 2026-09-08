@@ -1925,7 +1925,7 @@ impl ExecutorPool {
         let field = field.to_owned();
         let service = service.map(ToOwned::to_owned);
 
-        let task = tokio::task::spawn_blocking({
+        let mut task = tokio::task::spawn_blocking({
             let refusal_log = refusal_log.clone();
             #[cfg(any(test, feature = "test-support"))]
             let seams = Arc::clone(&seams);
@@ -1960,12 +1960,27 @@ impl ExecutorPool {
             }
         });
 
+        // Acquisition is bounded by its own short budget above, but the
+        // sample itself reads parquet and can outrun the caller's deadline
+        // just as a query can. Same handover as the query lanes: interrupt,
+        // leave the work to its own cleanup, and answer with what the
+        // work-start transition recorded.
         let mut request = RequestGuard::new(self, id, kind, &started);
-        let result = task
-            .await
-            .map_err(|e| ServerError::Internal(format!("field values task panicked: {e}")));
-        request.disarm();
-        result?
+        tokio::select! {
+            joined = &mut task => {
+                request.disarm();
+                joined.map_err(|e| {
+                    ServerError::Internal(format!("field values task panicked: {e}"))
+                })?
+            }
+            () = tokio::time::sleep_until(deadline.instant()) => {
+                if request.abandon() {
+                    Err(ServerError::Timeout)
+                } else {
+                    Err(refusal_log.refuse(id, kind, StartRefusal::Expired))
+                }
+            }
+        }
     }
 
     /// Export query results to Parquet via `DuckDB` `COPY TO`.
@@ -3668,6 +3683,65 @@ mod tests {
             idle_len(&pool) == baseline_idle && pool.available_permits() == pool.capacity()
         })
         .await;
+        assert!(registry_is_empty(&pool));
+    }
+
+    /// Acquisition is only half of a sample's life. Once it holds a
+    /// permit it reads parquet, and that read has to answer to the
+    /// caller's deadline too (ADR-0024) — otherwise an autocomplete
+    /// request over a huge corpus hangs for as long as the read takes,
+    /// with nothing in the retained count to explain the missing permit.
+    #[tokio::test(start_paused = true)]
+    async fn a_sample_that_overruns_is_a_timeout_and_stays_retained() {
+        let pool = hot_pool(1);
+        let seams = pool.seams();
+        let started = seams.hold(Seam::Started);
+        let baseline_idle = idle_len(&pool);
+
+        let sampler = pool.clone();
+        let sample = tokio::spawn(async move {
+            sampler
+                .sample_field_values(
+                    "service",
+                    None,
+                    10,
+                    Deadline::after(Duration::from_secs(5)),
+                    TEST_SAMPLE_WORK,
+                )
+                .await
+        });
+        until("the sample reaches its work", || started.arrivals() == 1).await;
+
+        // Past the work-start transition, so expiry is a timeout the
+        // caller can act on, not the pre-start capacity refusal.
+        tokio::time::advance(Duration::from_secs(6)).await;
+        let refused = sample
+            .await
+            .expect("the sample task joins")
+            .expect_err("a sample past its deadline does not answer");
+        assert!(
+            matches!(refused, ServerError::Timeout),
+            "expected a post-start timeout, got {refused:?}"
+        );
+
+        // The permit is still out, and the pool says who is holding it.
+        let retained = pool.retained_work();
+        assert_eq!(pool.retained(), 1);
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].kind, WorkKind::Sample);
+        assert!(retained[0].started);
+        let id = retained[0].id;
+        assert!(pool.cancel_by_id(id), "the abandoned sample is cancellable");
+        assert!(pool.cancel_by_id(id), "and repeatedly so");
+
+        started.release();
+        until("cleanup returns everything", || {
+            pool.retained() == 0
+                && idle_len(&pool) == baseline_idle
+                && pool.available_permits() == pool.capacity()
+        })
+        .await;
+        assert!(!pool.cancel_by_id(id));
         assert!(registry_is_empty(&pool));
     }
 

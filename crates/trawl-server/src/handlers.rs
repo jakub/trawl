@@ -124,58 +124,84 @@ pub async fn query(
     // failure takes the same route the engine's own parse/emit failures
     // take below, so the lifecycle events and the query log are the ones
     // this shape has always produced.
-    let (outcome, degraded_fields) = if let Err(refusal) = crate::admission::check_dsl(&req.query) {
-        (
+    //
+    // Resolution reads postgres, so it spends the caller's budget like any
+    // other wait (ADR-0024) and its failures are the handler's, not the
+    // caller's to catch: escaping by `?` here would leave the tracker entry
+    // this request already opened running forever. Both land as a refusing
+    // outcome and finish tracking through the one path below — expiry as
+    // the pre-start capacity refusal, since no work was ever started and a
+    // timeout history row would claim otherwise.
+    let admitted = match crate::admission::check_dsl(&req.query) {
+        Err(refusal) => Err(refusal),
+        Ok(()) => match deadline
+            .run(try_resolve_from_saved(&state, &verified, &req.query))
+            .await
+        {
+            Ok(resolved) => resolved,
+            Err(crate::deadline::Expired) => Err(ServerError::ServiceUnavailable(
+                crate::error::CAPACITY_NOT_STARTED.to_owned(),
+            )),
+        },
+    };
+
+    let (outcome, degraded_fields) = match admitted {
+        Err(refusal) => (
             crate::pool::ExecuteOutcome {
                 result: Err(refusal),
                 debug: None,
                 severity_columns: Vec::new(),
             },
             Vec::new(),
-        )
-    } else if let Some(resolved) = try_resolve_from_saved(&state, &verified, &req.query).await? {
-        // Both halves of what the caller is actually reading: the
-        // stages they typed, and the saved query whose recorded run
-        // produced the rows those stages run over. Nothing stamps a
-        // report run at write time, so a degraded pin the saved query
-        // bound would otherwise go unmentioned.
-        let halves = [resolved.saved_dsl.as_str(), resolved.remaining_dsl.as_str()];
-        let degraded = degraded_fields_for(&state, halves);
-        (
-            state
-                .query
-                .pool
-                .execute_with_source(
-                    query_id,
-                    &resolved.remaining_dsl,
-                    &resolved.source,
-                    deadline,
-                    capture_debug,
-                    utc_offset_secs,
-                    crate::pool::WorkContext::key(crate::pool::WorkKind::FromSaved, verified.id)
+        ),
+        Ok(Some(resolved)) => {
+            // Both halves of what the caller is actually reading: the
+            // stages they typed, and the saved query whose recorded run
+            // produced the rows those stages run over. Nothing stamps a
+            // report run at write time, so a degraded pin the saved query
+            // bound would otherwise go unmentioned.
+            let halves = [resolved.saved_dsl.as_str(), resolved.remaining_dsl.as_str()];
+            let degraded = degraded_fields_for(&state, halves);
+            (
+                state
+                    .query
+                    .pool
+                    .execute_with_source(
+                        query_id,
+                        &resolved.remaining_dsl,
+                        &resolved.source,
+                        deadline,
+                        capture_debug,
+                        utc_offset_secs,
+                        crate::pool::WorkContext::key(
+                            crate::pool::WorkKind::FromSaved,
+                            verified.id,
+                        )
                         .with_user(&verified.name),
-                )
-                .await,
-            degraded,
-        )
-    } else {
-        let degraded = degraded_fields_for(&state, [req.query.as_str()]);
-        (
-            state
-                .query
-                .pool
-                .execute(
-                    query_id,
-                    &req.query,
-                    deadline,
-                    capture_debug,
-                    utc_offset_secs,
-                    crate::pool::WorkContext::key(crate::pool::WorkKind::Query, verified.id)
-                        .with_user(&verified.name),
-                )
-                .await,
-            degraded,
-        )
+                    )
+                    .await,
+                degraded,
+            )
+        }
+        Ok(None) => {
+            let degraded = degraded_fields_for(&state, [req.query.as_str()]);
+            (
+                state
+                    .query
+                    .pool
+                    .execute(
+                        query_id,
+                        &req.query,
+                        deadline,
+                        capture_debug,
+                        utc_offset_secs,
+                        crate::pool::WorkContext::key(crate::pool::WorkKind::Query, verified.id)
+                            .with_user(&verified.name),
+                    )
+                    .await,
+                degraded,
+            )
+        }
     };
 
     let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);

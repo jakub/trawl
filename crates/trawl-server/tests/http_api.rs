@@ -693,6 +693,42 @@ async fn retained_work_is_listed_once_and_shown_only_to_its_owner_or_an_admin() 
     assert!(admin.queries().await.unwrap().retained.is_empty());
 }
 
+/// Resolving `from saved` happens after the tracker has already opened an
+/// entry for the request, so a resolution failure has to finish that entry
+/// like any other failure. When it escaped the handler on its own the id
+/// stayed "active" for the life of the process, and `/queries` reported a
+/// query nobody was running.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_from_saved_resolution_finishes_its_tracking() {
+    const DSL: &str = "| from saved no_such_report | head 1";
+
+    let server = setup().await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+    let admin = HttpClient::new_insecure(&server.url, &server.admin_token).unwrap();
+
+    match client.query_paginated(DSL, None, None).await {
+        Err(trawl_client::ClientError::Server { status, .. }) => assert_eq!(status, 404),
+        other => panic!("expected 404 for an unknown saved query, got: {other:?}"),
+    }
+
+    let seen = admin.queries().await.unwrap();
+    assert!(
+        !seen.active.iter().any(|q| q.query == DSL),
+        "a refused resolution leaves nothing running"
+    );
+    let recorded = seen
+        .recent
+        .iter()
+        .find(|q| q.query == DSL)
+        .expect("the failure is recorded once, in history");
+    assert!(
+        recorded.error.is_some(),
+        "the entry carries the refusal, not a success"
+    );
+    assert!(!recorded.timed_out, "a 404 is not a timeout");
+    assert!(seen.retained.is_empty(), "no permit was ever taken");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn queries_rejects_ingest_role() {
     let server = setup().await;
