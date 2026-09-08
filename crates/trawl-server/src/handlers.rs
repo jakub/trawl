@@ -863,11 +863,11 @@ pub async fn queries(
         active: state
             .query
             .tracker
-            .active()
+            .active_for(verified.id)
             .into_iter()
-            .filter(|q| !retained_ids.contains(&q.id))
+            .filter(|q| !retained_ids.contains(&q.snapshot.id))
             .collect(),
-        recent: state.query.tracker.recent(),
+        recent: state.query.tracker.recent_for(verified.id),
         retained: retained
             .iter()
             .map(|work| retained_snapshot(work, &verified))

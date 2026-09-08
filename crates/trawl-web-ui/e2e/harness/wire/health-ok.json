@@ -1,0 +1,10 @@
+{
+  "status": "ok",
+  "version": "health-fixture-163",
+  "checks": {
+    "duckdb": "ok",
+    "auth": "ok",
+    "storage": "ok",
+    "data_path": "ok"
+  }
+}

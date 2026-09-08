@@ -9,6 +9,21 @@
 // sheet is a starting point, not gospel.
 
 export const SEL = {
+  healthConfirm: '[role="alertdialog"]',
+  healthAwayLink: 'nav.rail a[title="Sources"]',
+  healthFooterHot: '.statusbar .grp[title="Hot buffer (events / bytes)"]',
+  healthPage: '.health-page',
+  healthSection: '.health-section',
+  healthCapacity: '.health-capacity',
+  healthLive: '.health-live',
+  healthLiveState: '.health-live-state',
+  healthQueries: '.health-queries',
+  healthRefresh: '.health-refresh',
+  healthQueriesRefresh: '.health-queries-refresh',
+  healthRow: 'tr[data-query-id]',
+  healthOwnRow: 'tr[data-own="true"]',
+  railHealthLink: 'nav.rail a[title="Health"]',
+
   /// crates/trawl-web-ui/src/pages/search.rs LiveRawTable.
   liveResultsTable: '.results-table',
   /// crates/trawl-web-ui/src/components/editor.rs — the CodeMirror mount div.

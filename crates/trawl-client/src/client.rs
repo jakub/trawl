@@ -1189,7 +1189,8 @@ mod tests {
                 "user": "admin",
                 "role": "admin",
                 "query": "* | stats count()",
-                "running_ms": 150
+                "running_ms": 150,
+                "own": true
             }],
             "recent": [{
                 "id": 2,
@@ -1198,15 +1199,18 @@ mod tests {
                 "duration_ms": 42,
                 "rows": 100,
                 "error": null,
-                "timed_out": false
+                "timed_out": false,
+                "own": false
             }]
         }"#;
         let resp: QueriesResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.active.len(), 1);
-        assert_eq!(resp.active[0].user, "admin");
+        assert!(resp.active[0].own);
+        assert!(!resp.recent[0].own);
+        assert_eq!(resp.active[0].snapshot.user, "admin");
         assert_eq!(resp.recent.len(), 1);
-        assert_eq!(resp.recent[0].rows, Some(100));
-        assert!(!resp.recent[0].timed_out);
+        assert_eq!(resp.recent[0].snapshot.rows, Some(100));
+        assert!(!resp.recent[0].snapshot.timed_out);
     }
 
     // ── repin start decode (#109) ───────────────────────────────────────

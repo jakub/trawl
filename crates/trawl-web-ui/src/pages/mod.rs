@@ -10,3 +10,5 @@ pub mod placeholder;
 pub mod runs;
 pub mod schema;
 pub mod search;
+
+pub mod health;

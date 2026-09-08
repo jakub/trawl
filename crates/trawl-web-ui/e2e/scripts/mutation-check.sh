@@ -3,14 +3,14 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #
-# Evidence tooling, not CI: for each mutations/*.patch, apply it, rebuild
+# Evidence tooling: for each mutations/*.patch, apply it, rebuild
 # the SPA, run the spec file that is that mutation's subject, and require
 # at least one test to EXECUTE AND FAIL (exit code alone can't tell a
 # kill from a missing browser), then revert. Prints a PASS/FAIL table and
 # exits 0 only if every requested mutation was killed.
 #
 # Usage:
-#   e2e/scripts/mutation-check.sh                 # run all nineteen
+#   e2e/scripts/mutation-check.sh                 # run all twenty
 #   e2e/scripts/mutation-check.sh 02-editor-onchange.patch   # just one
 #
 # Refuses to run against a dirty tree — a patch applied on top of your
@@ -62,6 +62,7 @@ declare -A SPEC_FOR=(
   [17-range-dialog-no-layer.patch]="range-dialog.spec.ts"
   [18-facet-actions-display-none.patch]="facets.spec.ts"
   [19-results-th-no-aria-sort.patch]="sort-headers.spec.ts"
+  [20-health-admin-gate.patch]="health-page.spec.ts"
 )
 
 # patch-file -> a CONTROL spec the mutation does NOT touch, which must
@@ -91,6 +92,7 @@ declare -A CONTROL_FOR=(
   [17-range-dialog-no-layer.patch]="routing.spec.ts"
   [18-facet-actions-display-none.patch]="routing.spec.ts"
   [19-results-th-no-aria-sort.patch]="routing.spec.ts"
+  [20-health-admin-gate.patch]="routing.spec.ts"
 )
 
 PATCHES=()
@@ -117,6 +119,7 @@ else
     17-range-dialog-no-layer.patch
     18-facet-actions-display-none.patch
     19-results-th-no-aria-sort.patch
+    20-health-admin-gate.patch
   )
 fi
 
@@ -183,14 +186,45 @@ for name in "${PATCHES[@]}"; do
   fi
 
   set +e
-  (cd "$E2E_DIR" && npx playwright test "tests/$spec")
-  status=$?
+  if [[ $name == 20-health-admin-gate.patch ]]; then
+    # Require this assertion, not any failure elsewhere in the health spec.
+    # Keep the report outside test-results, which Playwright cleans on run.
+    health_report="$E2E_DIR/health-mutation-report.json"
+    (cd "$E2E_DIR" && npx playwright test "tests/$spec" --grep '^non-admin request silence:' --reporter=json) > "$health_report"
+    status=$?
+    node - "$health_report" <<'JS'
+const fs = require('node:fs');
+const report = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const specs = [];
+function walk(suite) {
+  specs.push(...(suite.specs || []));
+  for (const child of suite.suites || []) walk(child);
+}
+for (const suite of report.suites || []) walk(suite);
+const target = specs.find(s => s.title.startsWith('non-admin request silence:'));
+const killed = target?.tests.some(t => t.results.some(r => r.status === 'failed' &&
+  r.errors?.some(e => /non-admin must not request (stats|dashboard)/.test(e.message || ''))));
+if (!killed) process.exit(1);
+JS
+    health_assertion=$?
+    rm -f "$health_report"
+    if [[ $health_assertion -ne 0 ]]; then status=0; fi
+  else
+    (cd "$E2E_DIR" && npx playwright test "tests/$spec")
+    status=$?
+  fi
   set -e
 
   control="${CONTROL_FOR[$name]}"
   echo "-- control: playwright test tests/$control (must pass) --"
   set +e
-  (cd "$E2E_DIR" && npx playwright test "tests/$control")
+  if [[ $name == 20-health-admin-gate.patch ]]; then
+    # The 404 route is outside AuthShell. Authenticated routing tests
+    # would correctly fail the same disabled admin gate as the target.
+    (cd "$E2E_DIR" && npx playwright test "tests/$control" --grep '^an unknown route renders the 404 page$')
+  else
+    (cd "$E2E_DIR" && npx playwright test "tests/$control")
+  fi
   control_status=$?
   set -e
 

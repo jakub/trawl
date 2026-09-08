@@ -269,3 +269,32 @@ disables the `alive` latch instead, so the status read the stub parked
 open across the teardown comes back to a dead surface and announces a
 finished repin nobody is looking at. Different mechanism, different
 observable, same spec file.
+
+### Health page acceptance and gate mutation
+
+`health-page.spec.ts` uses isolated `health-*` identities. JSON fixtures live
+under `harness/wire/health-*.json` and decode in the native wire contract.
+The dashboard has separate lifetime counters for opens, current connections,
+maximum simultaneous connections, and closes. These counters survive scenario
+resets so a late socket close cannot conceal a leak. Explicit controls hold,
+release, and drop stream data, and release a delayed bootstrap response.
+
+| Patch | Required failure | Unrelated control |
+| --- | --- | --- |
+| `20-health-admin-gate.patch` | `non-admin request silence:` must fail its stats or dashboard request counter assertion | `routing.spec.ts`, the unknown-route 404 test outside `AuthShell` |
+
+Run `e2e/scripts/mutation-check.sh 20-health-admin-gate.patch` from a clean
+checkout. The script reads the named test's JSON result and requires the
+request-counter assertion itself to fail. A rendering failure elsewhere in
+the spec is not a kill. The `web-ui-health-mutation` CI job depends on the
+same commit's passing `web-ui-e2e` job and builds both the mutant and restored
+SPA. Browser traces remain available on job failure.
+
+Health cases cover health 200 and structured 503, permission-gated network
+silence and DOM, independent query permission, one shared stream across
+navigation, bootstrap waiting and recovery, dropped-stream staleness, late
+bootstrap precedence, active and recent ownership, confirmation and exact
+DELETE count, false and unknown cancellation outcomes, and shell teardown.
+The existing shell does not expose an in-place identity refresh to the UI;
+identity generation races belong to the native dashboard state tests rather
+than a production-only browser testing hook.

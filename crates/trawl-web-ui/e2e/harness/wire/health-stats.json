@@ -1,0 +1,8 @@
+{
+  "uptime_secs": 90061,
+  "total_queries": 1234,
+  "active_queries": 2,
+  "pool_available": 5,
+  "pool_capacity": 8,
+  "pool_retained": 1
+}

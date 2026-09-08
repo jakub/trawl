@@ -507,6 +507,74 @@ async fn schema_caching_works() {
 // -- queries endpoint tests --------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
+async fn queries_own_flag_uses_verified_reader_and_preserves_permission_gate() {
+    let server = setup().await;
+    let store = KeyStore::from_pool(server.fleet_pool.clone());
+    let first = store
+        .create_key(
+            "twin",
+            PrincipalKind::Service,
+            &roles(&["trawl-analyst"]),
+            None,
+        )
+        .await
+        .unwrap();
+    let second = store
+        .create_key(
+            "twin",
+            PrincipalKind::Service,
+            &roles(&["trawl-analyst"]),
+            None,
+        )
+        .await
+        .unwrap();
+    let first_verified = store
+        .verify_key(first.plaintext_token.as_str())
+        .await
+        .unwrap();
+    let second_verified = store
+        .verify_key(second.plaintext_token.as_str())
+        .await
+        .unwrap();
+    let first_id = server.state.query.pool.allocate_query_id();
+    let second_id = server.state.query.pool.allocate_query_id();
+    server
+        .state
+        .query
+        .tracker
+        .start(first_id, &first_verified, "*");
+    server
+        .state
+        .query
+        .tracker
+        .start(second_id, &second_verified, "*");
+    let a = HttpClient::new_insecure(&server.url, first.plaintext_token.as_str()).unwrap();
+    let b = HttpClient::new_insecure(&server.url, second.plaintext_token.as_str()).unwrap();
+    for (client, own_id) in [(&a, first_id), (&b, second_id)] {
+        let response = client.queries().await.unwrap();
+        assert_eq!(response.active.len(), 2);
+        for entry in response.active {
+            assert_eq!(entry.own, entry.snapshot.id == own_id);
+        }
+    }
+    server.state.query.tracker.complete(first_id, 3);
+    server.state.query.tracker.timeout(second_id);
+    for (client, own_id) in [(&a, first_id), (&b, second_id)] {
+        let response = client.queries().await.unwrap();
+        assert!(response.active.is_empty());
+        assert_eq!(response.recent.len(), 2);
+        for entry in response.recent {
+            assert_eq!(entry.own, entry.snapshot.id == own_id);
+        }
+    }
+    let denied = HttpClient::new_insecure(&server.url, &server.ingest_token).unwrap();
+    assert!(matches!(
+        denied.queries().await,
+        Err(trawl_client::ClientError::Server { status: 403, .. })
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn queries_shows_history() {
     let server = setup().await;
     let analyst = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
@@ -520,8 +588,8 @@ async fn queries_shows_history() {
         !queries.recent.is_empty(),
         "recent history should contain the query we just ran"
     );
-    assert_eq!(queries.recent[0].rows, Some(3));
-    assert!(!queries.recent[0].timed_out);
+    assert_eq!(queries.recent[0].snapshot.rows, Some(3));
+    assert!(!queries.recent[0].snapshot.timed_out);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -622,11 +690,13 @@ async fn retained_work_is_listed_once_and_carries_its_display_metadata() {
     );
     assert_eq!(entry.user.as_deref(), Some("twin"));
     assert!(
-        !seen.active.iter().any(|q| q.id == id),
+        !seen.active.iter().any(|q| q.snapshot.id == id),
         "retained work is not counted again as an active request"
     );
     assert!(
-        seen.recent.iter().any(|q| q.id == id && q.timed_out),
+        seen.recent
+            .iter()
+            .any(|q| q.snapshot.id == id && q.snapshot.timed_out),
         "the same request is in recent history, where it recorded its outcome"
     );
 
@@ -654,7 +724,10 @@ async fn retained_work_is_listed_once_and_carries_its_display_metadata() {
     );
     assert_eq!(theirs.query.as_deref(), Some(dsl));
     assert!(
-        by_twin.recent.iter().any(|q| q.id == id && q.query == dsl),
+        by_twin
+            .recent
+            .iter()
+            .any(|q| q.snapshot.id == id && q.snapshot.query == dsl),
         "the same reader reads the same query text in history, so hiding it \
          from the retained line would protect nothing"
     );
@@ -734,19 +807,19 @@ async fn a_failed_from_saved_resolution_finishes_its_tracking() {
 
     let seen = admin.queries().await.unwrap();
     assert!(
-        !seen.active.iter().any(|q| q.query == DSL),
+        !seen.active.iter().any(|q| q.snapshot.query == DSL),
         "a refused resolution leaves nothing running"
     );
     let recorded = seen
         .recent
         .iter()
-        .find(|q| q.query == DSL)
+        .find(|q| q.snapshot.query == DSL)
         .expect("the failure is recorded once, in history");
     assert!(
-        recorded.error.is_some(),
+        recorded.snapshot.error.is_some(),
         "the entry carries the refusal, not a success"
     );
-    assert!(!recorded.timed_out, "a 404 is not a timeout");
+    assert!(!recorded.snapshot.timed_out, "a 404 is not a timeout");
     assert!(seen.retained.is_empty(), "no permit was ever taken");
 }
 
@@ -772,7 +845,7 @@ async fn an_invalid_timezone_leaves_no_active_entry() {
 
     let seen = admin.queries().await.unwrap();
     assert!(
-        !seen.active.iter().any(|q| q.query == DSL),
+        !seen.active.iter().any(|q| q.snapshot.query == DSL),
         "a refused timezone leaves nothing running"
     );
     assert!(seen.retained.is_empty(), "no permit was ever taken");
@@ -1606,8 +1679,8 @@ async fn cancel_query_isolated_by_key_id_not_name() {
             && let Some(id) = resp
                 .active
                 .iter()
-                .filter(|q| q.user == "twin")
-                .map(|q| q.id)
+                .filter(|q| q.snapshot.user == "twin")
+                .map(|q| q.snapshot.id)
                 .max()
         {
             target = Some(id);

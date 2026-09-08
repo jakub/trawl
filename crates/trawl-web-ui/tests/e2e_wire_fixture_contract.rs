@@ -487,3 +487,91 @@ fn the_query_shapes_match_the_dsl_the_drawer_builds() {
     assert!(!collision.dsl.contains(top_values));
     assert!(!collision.dsl.contains(cardinality));
 }
+
+#[test]
+fn health_page_fixtures_decode_and_exercise_permissions_and_failures() {
+    let ok: trawl_api::HealthResponse = decode(
+        "health-ok.json",
+        include_str!("../e2e/harness/wire/health-ok.json"),
+    );
+    let failed: trawl_api::HealthResponse = decode(
+        "health-unavailable.json",
+        include_str!("../e2e/harness/wire/health-unavailable.json"),
+    );
+    assert_eq!(ok.status, trawl_api::HealthStatus::Ok);
+    assert_eq!(failed.status, trawl_api::HealthStatus::Unavailable);
+    assert_eq!(failed.checks.as_ref().unwrap()["duckdb"], "error");
+    assert_eq!(ok.version, failed.version);
+    let stats: trawl_api::StatsResponse = decode(
+        "health-stats.json",
+        include_str!("../e2e/harness/wire/health-stats.json"),
+    );
+    assert_eq!(stats.total_queries, 1234);
+    assert_eq!(stats.pool_capacity, stats.pool_available + 3);
+    assert_eq!(stats.pool_retained, 1);
+    let dashboard: trawl_api::DashboardSnapshot = decode(
+        "health-dashboard.json",
+        include_str!("../e2e/harness/wire/health-dashboard.json"),
+    );
+    assert_eq!(dashboard.hot_buffer_events, 731);
+    assert_eq!(dashboard.pool_active, 3);
+    assert_eq!(dashboard.pool_retained, stats.pool_retained);
+    assert_eq!(dashboard.pool_capacity, stats.pool_capacity);
+    let queries: trawl_api::QueriesResponse = decode(
+        "health-queries.json",
+        include_str!("../e2e/harness/wire/health-queries.json"),
+    );
+    assert_eq!(queries.active.len(), 2);
+    assert_eq!(queries.recent.len(), 2);
+    assert_eq!(
+        queries
+            .active
+            .iter()
+            .map(|q| (q.snapshot.id, q.own))
+            .collect::<Vec<_>>(),
+        [(101, true), (102, false)]
+    );
+    assert_eq!(
+        queries
+            .recent
+            .iter()
+            .map(|q| (q.snapshot.id, q.own))
+            .collect::<Vec<_>>(),
+        [(201, true), (202, false)]
+    );
+    assert_eq!(
+        queries.active[0].snapshot.user,
+        queries.active[1].snapshot.user
+    );
+    assert_eq!(
+        queries.recent[0].snapshot.user,
+        queries.recent[1].snapshot.user
+    );
+    assert!(queries.retained.is_empty());
+    let accepted: trawl_api::CancelResponse = decode(
+        "health-cancel-accepted.json",
+        include_str!("../e2e/harness/wire/health-cancel-accepted.json"),
+    );
+    let finished: trawl_api::CancelResponse = decode(
+        "health-cancel-finished.json",
+        include_str!("../e2e/harness/wire/health-cancel-finished.json"),
+    );
+    assert!(accepted.cancelled);
+    assert!(!finished.cancelled);
+    assert_eq!(accepted.query_id, queries.active[0].snapshot.id);
+    assert_eq!(accepted.query_id, finished.query_id);
+    let value: serde_json::Value =
+        serde_json::from_str(include_str!("../e2e/harness/wire/health-queries.json")).unwrap();
+    for lane in ["active", "recent"] {
+        for entry in value[lane].as_array().unwrap() {
+            assert!(
+                entry.get("snapshot").is_none(),
+                "wire entries must remain flat"
+            );
+            assert!(
+                entry.get("key_id").is_none(),
+                "key ids must not leave the server"
+            );
+        }
+    }
+}

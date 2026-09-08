@@ -18,6 +18,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
+  wire,
   meResponse,
   healthResponse,
   queryResponse,
@@ -82,6 +83,47 @@ const MIME = {
 /** @type {'default'|'unauth'|'query-500'|'stream-burst'|'populated'|'corpus'} */
 let scenario = 'default';
 
+// Dashboard counters survive resets. Resetting a scenario cannot hide a late
+// socket close or turn a leaked connection into a fresh baseline.
+const dashboard = {
+  open: 0, opens: 0, closes: 0, max: 0, responses: new Set(),
+  hold: false, bootstrap: 'ok', pending: new Set(), cancel: 'accepted',
+};
+let healthHits = {};
+let cancelRequests = [];
+function healthScenario() { return scenario.startsWith('health-'); }
+function healthIdentity() {
+  const permissions = scenario === 'health-admin' ? ['query', 'server_manage']
+    : scenario === 'health-admin-no-query' ? ['server_manage']
+    : scenario === 'health-cancel' ? ['query', 'query_cancel']
+    : scenario === 'health-no-query' ? ['schema_read'] : ['query'];
+  return { ...meResponse(), name: 'same-name', permissions };
+}
+function dashboardBody(bootstrap = false) {
+  const body = wire('health-dashboard');
+  if (bootstrap) { body.hostname = 'old-bootstrap-host'; body.hot_buffer_events = 111; }
+  return body;
+}
+function pushDashboard() {
+  for (const response of dashboard.responses) {
+    response.write(`event: stats\ndata: ${JSON.stringify(dashboardBody())}\n\n`);
+  }
+}
+function serveDashboard(res) {
+  res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+  res.write('retry: 200\n\n');
+  dashboard.open += 1; dashboard.opens += 1;
+  dashboard.max = Math.max(dashboard.max, dashboard.open);
+  dashboard.responses.add(res);
+  res.on('close', () => {
+    if (dashboard.responses.delete(res)) { dashboard.open -= 1; dashboard.closes += 1; }
+  });
+  if (!dashboard.hold) {
+    res.write(`event: stats\ndata: ${JSON.stringify(dashboardBody())}\n\n`);
+  }
+}
+
+
 /** `corpus` is `populated` plus data. Every place that used to ask
  * "is this `populated`?" asks this instead, so the two scenarios cannot
  * drift apart on a body they share. The services route is the one
@@ -142,6 +184,13 @@ let exports_ = [];
 let unhandledQueries = [];
 
 function resetState() {
+  healthHits = {};
+  cancelRequests = [];
+  dashboard.hold = false;
+  dashboard.bootstrap = 'ok';
+  dashboard.cancel = 'accepted';
+  for (const response of dashboard.pending) response.destroy();
+  dashboard.pending.clear();
   unstubbed = [];
   queries = [];
   exports_ = [];
@@ -304,6 +353,9 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       // `repin`; only a reset writes `field`, so a spec cannot end up
       // scripting a second job on top of a live one.
       repin.field = parsed.repinField || null;
+      dashboard.hold = parsed.dashboardHold ?? false;
+      dashboard.bootstrap = parsed.dashboardBootstrap ?? 'ok';
+      dashboard.cancel = parsed.cancelOutcome ?? 'accepted';
       sendJson(res, 200, { ok: true, scenario, repinField: repin.field });
       return;
     }
@@ -317,6 +369,12 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
           aborted: repin.heldAborted,
           pendingAtRelease: repin.pendingAtRelease,
         },
+        dashboard: {
+          open: dashboard.open, opens: dashboard.opens, closes: dashboard.closes,
+          max: dashboard.max, pending: dashboard.pending.size,
+        },
+        healthHits,
+        cancelRequests,
         unstubbed,
         queries,
         unhandledQueries,
@@ -353,13 +411,33 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       return;
     }
 
+    if (p === '/__ctl/dashboard/release' && req.method === 'POST') {
+      dashboard.hold = false;
+      pushDashboard();
+      sendJson(res, 200, { ok: true, open: dashboard.open });
+      return;
+    }
+    if (p === '/__ctl/dashboard/drop' && req.method === 'POST') {
+      dashboard.hold = true;
+      for (const response of dashboard.responses) response.end();
+      sendJson(res, 200, { ok: true });
+      return;
+    }
+    if (p === '/__ctl/dashboard/bootstrap-release' && req.method === 'POST') {
+      const count = dashboard.pending.size;
+      for (const response of dashboard.pending) sendJson(response, 200, dashboardBody(true));
+      dashboard.pending.clear();
+      sendJson(res, 200, { ok: count > 0, count });
+      return;
+    }
+
     // -- auth --------------------------------------------------------------
     if (p === '/api/auth/me' && req.method === 'GET') {
       if (scenario === 'unauth') {
         sendJson(res, 401, errorEnvelope('unauthorized'));
         return;
       }
-      sendJson(res, 200, meResponse());
+      sendJson(res, 200, healthScenario() ? healthIdentity() : meResponse());
       return;
     }
     if (p === '/api/auth/logout' && req.method === 'POST') {
@@ -370,8 +448,52 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
 
     // -- health --------------------------------------------------------------
     if (p === '/api/v1/health' && req.method === 'GET') {
-      sendJson(res, 200, healthResponse());
+      healthHits.health = (healthHits.health ?? 0) + 1;
+      sendJson(res, scenario === 'health-degraded' ? 503 : 200,
+        healthScenario() ? wire(scenario === 'health-degraded' ? 'health-unavailable' : 'health-ok') : healthResponse());
       return;
+    }
+
+    // Health scenarios answer forbidden admin reads as well as counting them.
+    // A missing client gate must fail the request-silence assertion itself.
+    if (healthScenario()) {
+      const key = p === '/api/v1/stats' ? 'stats'
+        : p === '/api/v1/dashboard' ? 'dashboard'
+        : p === '/api/v1/dashboard/stream' ? 'stream'
+        : p === '/api/v1/queries' ? 'queries' : null;
+      if (key && req.method === 'GET') {
+        healthHits[key] = (healthHits[key] ?? 0) + 1;
+        const permissions = healthIdentity().permissions;
+        if (!(key === 'queries' ? permissions.includes('query') : permissions.includes('server_manage'))) {
+          sendJson(res, 403, errorEnvelope('insufficient permissions'));
+        } else if (key === 'stats') sendJson(res, 200, wire('health-stats'));
+        else if (key === 'queries') sendJson(res, 200, wire('health-queries'));
+        else if (key === 'stream') serveDashboard(res);
+        else if (dashboard.bootstrap === 'waiting') sendJson(res, 503, errorEnvelope('dashboard data not yet available'));
+        else if (dashboard.bootstrap === 'held') {
+          dashboard.pending.add(res);
+          res.on('close', () => dashboard.pending.delete(res));
+        } else sendJson(res, 200, dashboardBody(true));
+        return;
+      }
+      const cancel = p.match(/^\/api\/v1\/queries\/(\d+)$/);
+      if (cancel && req.method === 'DELETE') {
+        const id = Number(cancel[1]);
+        cancelRequests.push(id);
+        if (dashboard.cancel === 'unknown') {
+          // A response the client cannot decode leaves the mutation outcome
+          // unknown. Destroying a headerless socket would let Chromium retry
+          // this idempotent DELETE before reporting the network failure.
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end('{"cancelled":');
+        }
+        else {
+          const body = wire(dashboard.cancel === 'finished' ? 'health-cancel-finished' : 'health-cancel-accepted');
+          body.query_id = id;
+          sendJson(res, 200, body);
+        }
+        return;
+      }
     }
 
     // -- query ---------------------------------------------------------------
@@ -585,6 +707,8 @@ server.listen(PORT, HOST, () => {
 // End every open SSE response on SIGTERM so playwright's webServer
 // teardown never hangs on a keep-alive connection.
 function shutdown() {
+  for (const res of dashboard.responses) res.end();
+  for (const res of dashboard.pending) res.destroy();
   for (const res of sse.responses) {
     try {
       res.end();
