@@ -400,6 +400,10 @@ export const COPY = {
   /// crates/trawl-web-ui/src/components/net_drawer.rs — the drawer
   /// title's rename trigger.
   netRenameName: 'Rename {name}',
+  /// crates/trawl-web-ui/src/components/net_drawer.rs — the rename
+  /// editor's input. It replaces the heading it edits, so the name it is
+  /// editing is nowhere on screen to label it.
+  netRenameInputName: 'New name for {name}',
   /// crates/trawl-web-ui/src/components/editor_wrap.rs — the range
   /// dialog's own name. Not a format string.
   rangeDialogName: 'Time range',

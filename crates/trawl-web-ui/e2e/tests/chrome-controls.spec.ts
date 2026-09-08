@@ -265,6 +265,11 @@ test('net rename opens the editor', async ({ page, request }) => {
   await page.keyboard.press('Enter');
   const input = page.locator(SEL.netRenameInput);
   await expect(input).toHaveValue(CORPUS.netName);
+  // The heading the input replaced was the only thing naming it, so the
+  // input has to carry the name itself.
+  await expect(input).toHaveAccessibleName(
+    nameFrom(COPY.netRenameInputName, CORPUS.netName),
+  );
   // The trigger removed ITSELF to make room for the input, so the press
   // has to hand focus over: the browser drops it on <body> otherwise
   // and a keyboard user is left outside the editor they just opened.

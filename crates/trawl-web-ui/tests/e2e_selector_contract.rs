@@ -1140,6 +1140,12 @@ const CONTRACTS: &[Contract] = &[
         hook: "format!(\"Rename {name}\")",
     },
     Contract {
+        assignment: "netRenameInputName: 'New name for {name}',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "format!(\"New name for {name}\")",
+    },
+    Contract {
         assignment: "rangeDialogName: 'Time range',",
         source_path: "src/components/editor_wrap.rs",
         source: EDITOR_WRAP_RS,

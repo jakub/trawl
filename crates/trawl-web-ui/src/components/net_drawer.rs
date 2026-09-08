@@ -175,10 +175,15 @@ pub fn NetDrawer(
                     {
                         let do_rename = do_rename.clone();
                         let do_rename_blur = do_rename.clone();
+                        // The input REPLACES the heading it edits, so the
+                        // name it is editing is nowhere on screen to label
+                        // it: without this the field is an unnamed textbox.
+                        let name = net.name.clone();
                         view! {
                             <input
                                 class="name-edit"
                                 node_ref=name_input_ref
+                                aria-label=format!("New name for {name}")
                                 prop:value=move || name_buf.get()
                                 on:input=move |e| name_buf.set(event_target_value(&e))
                                 on:blur=move |_| do_rename_blur()
