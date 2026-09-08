@@ -97,9 +97,11 @@ causes DuckDB 1.5.5 to reject a substituted nested window before binding
 its children. That is not proof that substitution never happens; validity
 does not depend on that rejection order remaining unchanged.
 
-Rename substitutes field leaves and has zero delta. Regex extraction
-uses one fixed source per capture; pivot has one USING expression rather
-than an output-alias sequence. Other stages have no recursive output
+Rename substitutes field leaves and has zero delta. Both extraction
+arms are distinct cases in the exhaustive match: regex extraction uses
+one fixed source per capture, and `extract kv` reads one fixed source
+per stage; neither has a recursive alias sequence. Pivot has one USING
+expression rather than an output-alias sequence. Other stages have no recursive output
 sequence. Record those cases in an exhaustive stage match. All stages
 count toward 128, including `from saved` and Rust-tail stages. Search is
 not a pipeline stage and has no same-stage aliases. Generated time-bucket
@@ -137,7 +139,10 @@ pipeline length separately from corpus width.
 
 Create one absolute deadline at authenticated query/export handler entry,
 before source resolution and tracking. Carry it through semaphore and
-publication acquisition, blocking startup and execution. A scheduler
+publication acquisition, blocking startup and execution. The deadline
+covers the waits a lane actually performs: the resolved-source lane
+takes no publication guard today and does not gain one, so gate
+membership per lane is unchanged by this work. A scheduler
 attempt creates its deadline before its first pool wait. Required handler
 awaits use the remaining budget; best-effort history must not delay a ready
 result beyond it. This bounds application waiting, subject to runtime
