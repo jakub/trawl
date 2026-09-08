@@ -113,47 +113,62 @@ pub async fn query(
 
     // Check for `| from saved` — if present, resolve to parquet source
     // and execute with the pre-computed source instead of normal glob scan.
-    let (outcome, degraded_fields) =
-        if let Some(resolved) = try_resolve_from_saved(&state, &verified, &req.query).await? {
-            // Both halves of what the caller is actually reading: the
-            // stages they typed, and the saved query whose recorded run
-            // produced the rows those stages run over. Nothing stamps a
-            // report run at write time, so a degraded pin the saved query
-            // bound would otherwise go unmentioned.
-            let halves = [resolved.saved_dsl.as_str(), resolved.remaining_dsl.as_str()];
-            let degraded = degraded_fields_for(&state, halves);
-            (
-                state
-                    .query
-                    .pool
-                    .execute_with_source(
-                        query_id,
-                        &resolved.remaining_dsl,
-                        &resolved.source,
-                        timeout,
-                        capture_debug,
-                        utc_offset_secs,
-                    )
-                    .await,
-                degraded,
-            )
-        } else {
-            let degraded = degraded_fields_for(&state, [req.query.as_str()]);
-            (
-                state
-                    .query
-                    .pool
-                    .execute(
-                        query_id,
-                        &req.query,
-                        timeout,
-                        capture_debug,
-                        utc_offset_secs,
-                    )
-                    .await,
-                degraded,
-            )
-        };
+    //
+    // Admission runs over the pipeline the caller TYPED, before the
+    // `from saved` stage is sliced off (ADR-0024): resolving first would
+    // let an over-cap original be admitted as an under-cap suffix. Its
+    // failure takes the same route the engine's own parse/emit failures
+    // take below, so the lifecycle events and the query log are the ones
+    // this shape has always produced.
+    let (outcome, degraded_fields) = if let Err(refusal) = crate::admission::check_dsl(&req.query) {
+        (
+            crate::pool::ExecuteOutcome {
+                result: Err(refusal),
+                debug: None,
+                severity_columns: Vec::new(),
+            },
+            Vec::new(),
+        )
+    } else if let Some(resolved) = try_resolve_from_saved(&state, &verified, &req.query).await? {
+        // Both halves of what the caller is actually reading: the
+        // stages they typed, and the saved query whose recorded run
+        // produced the rows those stages run over. Nothing stamps a
+        // report run at write time, so a degraded pin the saved query
+        // bound would otherwise go unmentioned.
+        let halves = [resolved.saved_dsl.as_str(), resolved.remaining_dsl.as_str()];
+        let degraded = degraded_fields_for(&state, halves);
+        (
+            state
+                .query
+                .pool
+                .execute_with_source(
+                    query_id,
+                    &resolved.remaining_dsl,
+                    &resolved.source,
+                    timeout,
+                    capture_debug,
+                    utc_offset_secs,
+                )
+                .await,
+            degraded,
+        )
+    } else {
+        let degraded = degraded_fields_for(&state, [req.query.as_str()]);
+        (
+            state
+                .query
+                .pool
+                .execute(
+                    query_id,
+                    &req.query,
+                    timeout,
+                    capture_debug,
+                    utc_offset_secs,
+                )
+                .await,
+            degraded,
+        )
+    };
 
     let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
     let duration_secs = start.elapsed().as_secs_f64();
@@ -790,6 +805,14 @@ pub async fn cancel_query(
 ///
 /// Performs syntax and semantic validation (function names, arity, regex patterns)
 /// but does not check field existence (which would require schema introspection).
+///
+/// This route already runs the two halves [`crate::admission::check_dsl`]
+/// runs, in the same order and from the same owners — so an over-budget
+/// pipeline reports ADR-0024's sentence here too. It reports it as this
+/// route's own answer (`valid: false` with the refusal as a detail)
+/// rather than as an error status: telling a client its query is invalid
+/// IS the successful outcome of a validation call, and routing the
+/// refusal through `check_dsl` would turn every parse error into a 400.
 pub async fn validate_query(
     Extension(verified): Extension<VerifiedKey>,
     Json(req): Json<QueryRequest>,
@@ -1721,6 +1744,11 @@ pub async fn create_saved(
 
     let key_id = verified.id;
 
+    // Admit the DSL before it is stored (ADR-0024): a saved query is run
+    // later by a schedule, and a row nothing can execute is worth
+    // refusing at the one moment a human is there to read the reason.
+    crate::admission::check_dsl(&req.query)?;
+
     // DuplicateName → 409, InvalidName → 400 via the StoreError table.
     let saved = state
         .storage
@@ -1743,6 +1771,12 @@ pub async fn update_saved(
     }
 
     let key_id = verified.id;
+
+    // Same door as create, and before the store call, so a refused update
+    // leaves the stored row exactly as it was. The transactional
+    // schedule-window check inside `update_checked` is untouched: it
+    // proves a different thing, under the saved-query row lock.
+    crate::admission::check_dsl(&req.query)?;
 
     // NotFound → 404, InvalidName → 400, DuplicateName → 409, and a new
     // DSL that contradicts the schedule's window → 400 naming both sides.
@@ -2665,6 +2699,11 @@ pub async fn export(
         "raw query text (DEBUG-only: never stored under the default filter)"
     );
 
+    // One admission door for every lane (ADR-0024): the parquet export
+    // takes a different route through the pool than CSV and JSON do, so
+    // asking here is what makes all three refuse the same text.
+    crate::admission::check_dsl(&req.query)?;
+
     let start = std::time::Instant::now();
     let timeout = std::time::Duration::from_secs(state.query.timeout_secs);
 
@@ -3074,6 +3113,11 @@ pub async fn stream_query(
         query = %query_dsl,
         "raw query text (DEBUG-only: never stored under the default filter)"
     );
+
+    // The shared admission door first (ADR-0024), so a live tail and a
+    // batch query refuse the same text with the same sentence rather than
+    // with whichever refusal their own compiler reaches first.
+    crate::admission::check_dsl(&query_dsl)?;
 
     // Parse and compile the filter once upfront.
     let ast = trawl_core::parser::parse(&query_dsl)
