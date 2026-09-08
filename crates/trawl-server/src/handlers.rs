@@ -56,6 +56,12 @@ pub async fn query(
         return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
 
+    // One absolute budget for the whole request (ADR-0024), stamped
+    // before tracking, admission and source resolution: every wait below
+    // spends from this instant, so no phase gets a fresh timeout.
+    let deadline =
+        crate::deadline::Deadline::after(std::time::Duration::from_secs(state.query.timeout_secs));
+
     state
         .total_queries
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -97,8 +103,6 @@ pub async fn query(
         query = %req.query,
         "raw query text (DEBUG-only: never stored under the default filter)"
     );
-    let timeout = std::time::Duration::from_secs(state.query.timeout_secs);
-
     // Resolve timezone from request (default to UTC when absent).
     let utc_offset_secs = req
         .timezone
@@ -145,7 +149,7 @@ pub async fn query(
                     query_id,
                     &resolved.remaining_dsl,
                     &resolved.source,
-                    timeout,
+                    deadline,
                     capture_debug,
                     utc_offset_secs,
                 )
@@ -161,7 +165,7 @@ pub async fn query(
                 .execute(
                     query_id,
                     &req.query,
-                    timeout,
+                    deadline,
                     capture_debug,
                     utc_offset_secs,
                 )
@@ -196,24 +200,37 @@ pub async fn query(
             // keystore id. Best-effort: a history-store write failure must
             // not fail the query, but log it so a broken store (pg down,
             // constraint trouble) is visible.
-            if let Err(e) = state
-                .storage
-                .history
-                .record_query(
+            //
+            // Under the request's own deadline (ADR-0024), because the
+            // rows are already in hand: a wedged history store must not
+            // hold a finished answer past the budget the caller was
+            // promised. Expiry abandons the write, never the result.
+            let recorded = deadline
+                .run(state.storage.history.record_query(
                     verified.id,
                     &req.query,
                     duration_ms,
                     total,
                     RunStatus::Success,
-                )
-                .await
-            {
-                tracing::warn!(
-                    event_type = "history_error",
-                    key_id = verified.id,
-                    error = %e,
-                    "failed to record query in history store"
-                );
+                ))
+                .await;
+            match recorded {
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        event_type = "history_error",
+                        key_id = verified.id,
+                        error = %e,
+                        "failed to record query in history store"
+                    );
+                }
+                Err(crate::deadline::Expired) => {
+                    tracing::warn!(
+                        event_type = "history_error",
+                        key_id = verified.id,
+                        "abandoned the history write: the query's deadline passed with the result already in hand"
+                    );
+                }
+                Ok(Ok(_)) => {}
             }
 
             tracing::info!(
@@ -1600,7 +1617,9 @@ pub async fn field_values(
             &field,
             params.service.as_deref(),
             limit,
-            std::time::Duration::from_secs(state.query.timeout_secs),
+            crate::deadline::Deadline::after(std::time::Duration::from_secs(
+                state.query.timeout_secs,
+            )),
         )
         .await?;
 
@@ -2673,6 +2692,11 @@ pub async fn export(
         return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
 
+    // One absolute budget for the export, stamped at authenticated entry
+    // like the query handler's (ADR-0024).
+    let deadline =
+        crate::deadline::Deadline::after(std::time::Duration::from_secs(state.query.timeout_secs));
+
     let format = params.format.unwrap_or(trawl_api::ExportFormat::Csv);
 
     let max_export_rows = state.query.max_export_rows;
@@ -2705,7 +2729,6 @@ pub async fn export(
     crate::admission::check_dsl(&req.query)?;
 
     let start = std::time::Instant::now();
-    let timeout = std::time::Duration::from_secs(state.query.timeout_secs);
 
     // Parquet export uses DuckDB's native COPY TO — no need to materialize
     // the result set in memory.
@@ -2713,7 +2736,7 @@ pub async fn export(
         let bytes = state
             .query
             .pool
-            .export_parquet(query_id, &req.query, limit, timeout)
+            .export_parquet(query_id, &req.query, limit, deadline)
             .await?;
         let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
@@ -2750,7 +2773,7 @@ pub async fn export(
     let outcome = state
         .query
         .pool
-        .execute(query_id, &req.query, timeout, capture_debug, 0)
+        .execute(query_id, &req.query, deadline, capture_debug, 0)
         .await;
     let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 

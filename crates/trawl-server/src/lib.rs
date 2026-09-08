@@ -13,6 +13,7 @@ pub mod audit;
 pub mod bus;
 pub mod catalog;
 pub mod config;
+pub mod deadline;
 pub(crate) mod env_dirs;
 pub mod epoch;
 pub mod error;

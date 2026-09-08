@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use serde_json::json;
 use trawl_server::bus::IngestBatch;
+use trawl_server::deadline::Deadline;
 use trawl_server::error::ServerError;
 use trawl_server::hot_buffer::{HotBuffer, HotBufferConfig};
 use trawl_server::ingest::{compaction::compact_once, wal::WalWriter};
@@ -52,7 +53,7 @@ async fn queries_and_exports_wait_for_publish_and_drain() {
         .execute(
             pool.allocate_query_id(),
             "*",
-            Duration::from_secs(10),
+            Deadline::after(Duration::from_secs(10)),
             false,
             0,
         )
@@ -83,7 +84,7 @@ async fn queries_and_exports_wait_for_publish_and_drain() {
         .execute(
             pool.allocate_query_id(),
             "*",
-            Duration::from_millis(30),
+            Deadline::after(Duration::from_millis(30)),
             false,
             0,
         )
@@ -94,7 +95,7 @@ async fn queries_and_exports_wait_for_publish_and_drain() {
             pool.allocate_query_id(),
             "*",
             100,
-            Duration::from_millis(30),
+            Deadline::after(Duration::from_millis(30)),
         )
         .await;
     assert!(matches!(blocked_export, Err(ServerError::Timeout)));
@@ -111,14 +112,19 @@ async fn queries_and_exports_wait_for_publish_and_drain() {
         .execute(
             pool.allocate_query_id(),
             "*",
-            Duration::from_secs(10),
+            Deadline::after(Duration::from_secs(10)),
             false,
             0,
         )
         .await;
     assert_eq!(after.result.unwrap().rows.len(), 3);
     let export = pool
-        .export_parquet(pool.allocate_query_id(), "*", 100, Duration::from_secs(10))
+        .export_parquet(
+            pool.allocate_query_id(),
+            "*",
+            100,
+            Deadline::after(Duration::from_secs(10)),
+        )
         .await
         .unwrap();
     let exported = root.path().join("export.parquet");
@@ -146,7 +152,7 @@ async fn query_only_pool_refuses_incomplete_rollup_after_restart() {
         .execute(
             pool.allocate_query_id(),
             "*",
-            Duration::from_secs(1),
+            Deadline::after(Duration::from_secs(1)),
             false,
             0,
         )
@@ -156,11 +162,16 @@ async fn query_only_pool_refuses_incomplete_rollup_after_restart() {
         Err(ServerError::ServiceUnavailable(_))
     ));
     let export = pool
-        .export_parquet(pool.allocate_query_id(), "*", 100, Duration::from_secs(1))
+        .export_parquet(
+            pool.allocate_query_id(),
+            "*",
+            100,
+            Deadline::after(Duration::from_secs(1)),
+        )
         .await;
     assert!(matches!(export, Err(ServerError::ServiceUnavailable(_))));
     assert!(matches!(
-        pool.sample_field_values("message", None, 10, Duration::from_secs(1))
+        pool.sample_field_values("message", None, 10, Deadline::after(Duration::from_secs(1)))
             .await,
         Err(ServerError::ServiceUnavailable(_))
     ));
@@ -187,7 +198,7 @@ async fn query_timeout_keeps_publication_guard_until_duckdb_task_finishes() {
         .execute(
             pool.allocate_query_id(),
             "*",
-            Duration::from_millis(30),
+            Deadline::after(Duration::from_millis(30)),
             false,
             0,
         )
@@ -223,7 +234,7 @@ async fn aborting_request_keeps_running_reader_protected() {
     let id = pool.allocate_query_id();
     let request = tokio::spawn(async move {
         reader_pool
-            .execute(id, "*", Duration::from_secs(10), false, 0)
+            .execute(id, "*", Deadline::after(Duration::from_secs(10)), false, 0)
             .await
     });
     // An interrupt handle is registered only after the blocking task starts.

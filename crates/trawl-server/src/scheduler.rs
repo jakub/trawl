@@ -309,7 +309,10 @@ pub(crate) async fn execute_scheduled_query(
     timeout_secs: u64,
 ) {
     let start = std::time::Instant::now();
-    let timeout = Duration::from_secs(timeout_secs);
+    // One budget for this attempt, stamped before the first pool wait
+    // (ADR-0024): a scheduled run that spends its whole timeout queueing
+    // does not then get another one to execute in.
+    let deadline = crate::deadline::Deadline::after(Duration::from_secs(timeout_secs));
 
     // The same admission door the HTTP entry points use (ADR-0024). A
     // query stored before that door existed can be over a cap, and this
@@ -321,7 +324,7 @@ pub(crate) async fn execute_scheduled_query(
         Err(refusal) => Err(refusal),
         // Execute the query on the pool (no debug capture, UTC timestamps).
         Ok(()) => {
-            pool.execute(pool.allocate_query_id(), query, timeout, false, 0)
+            pool.execute(pool.allocate_query_id(), query, deadline, false, 0)
                 .await
                 .result
         }

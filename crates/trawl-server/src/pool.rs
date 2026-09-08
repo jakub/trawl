@@ -25,6 +25,7 @@ use tokio::sync::Semaphore;
 use trawl_engine::executor::Executor;
 use trawl_engine::value::QueryResult;
 
+use crate::deadline::Deadline;
 use crate::error::ServerError;
 use crate::hot_buffer::HotBuffer;
 use crate::source::compute_source;
@@ -460,8 +461,12 @@ impl ExecutorPool {
     /// `query_id` must come from [`allocate_query_id`](Self::allocate_query_id);
     /// it keys the interrupt handle for [`cancel_by_id`](Self::cancel_by_id).
     ///
-    /// If the query exceeds `timeout`, the `DuckDB` connection is interrupted
-    /// and the query is aborted. The executor is reclaimed asynchronously
+    /// `deadline` is the caller's whole budget, stamped once at handler
+    /// entry (ADR-0024). Every wait this lane performs — the queue, the
+    /// publication gate, execution itself — spends from that one instant,
+    /// so a query that queued for most of it does not then get a full
+    /// timeout to run in. Past it the `DuckDB` connection is interrupted
+    /// and the query is aborted; the executor is reclaimed asynchronously
     /// once the interrupted task completes.
     ///
     /// When `capture_debug` is true, captures source selection, hot buffer
@@ -473,7 +478,7 @@ impl ExecutorPool {
         &self,
         query_id: u64,
         dsl: &str,
-        timeout: Duration,
+        deadline: Deadline,
         capture_debug: bool,
         utc_offset_secs: i32,
     ) -> ExecuteOutcome {
@@ -486,14 +491,28 @@ impl ExecutorPool {
             );
         }
 
+        // The queue wait spends the caller's budget like every other wait
+        // (ADR-0024): it used to be measured for the log line only, so a
+        // query could sit here for minutes and still be handed a whole
+        // fresh timeout to run in.
         let wait_start = std::time::Instant::now();
         let semaphore = Arc::clone(&self.semaphore);
-        let Ok(permit) = semaphore.acquire_owned().await else {
-            return ExecuteOutcome {
-                result: Err(ServerError::Internal("executor pool shut down".into())),
-                debug: None,
-                severity_columns: Vec::new(),
-            };
+        let permit = match deadline.run(semaphore.acquire_owned()).await {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => {
+                return ExecuteOutcome {
+                    result: Err(ServerError::Internal("executor pool shut down".into())),
+                    debug: None,
+                    severity_columns: Vec::new(),
+                };
+            }
+            Err(crate::deadline::Expired) => {
+                return ExecuteOutcome {
+                    result: Err(ServerError::Timeout),
+                    debug: None,
+                    severity_columns: Vec::new(),
+                };
+            }
         };
 
         let wait_ms = wait_start.elapsed().as_millis();
@@ -506,21 +525,23 @@ impl ExecutorPool {
             "semaphore permit acquired"
         );
 
-        let publication_start = std::time::Instant::now();
-        let publication = match tokio::time::timeout(timeout, self.publication.read())
-            .await
-            .unwrap_or(Err(ServerError::Timeout))
-        {
-            Ok(guard) => guard,
-            Err(error) => {
+        let publication = match deadline.run(self.publication.read()).await {
+            Ok(Ok(guard)) => guard,
+            Ok(Err(error)) => {
                 return ExecuteOutcome {
                     result: Err(error),
                     debug: None,
                     severity_columns: Vec::new(),
                 };
             }
+            Err(crate::deadline::Expired) => {
+                return ExecuteOutcome {
+                    result: Err(ServerError::Timeout),
+                    debug: None,
+                    severity_columns: Vec::new(),
+                };
+            }
         };
-        let timeout = timeout.saturating_sub(publication_start.elapsed());
         let executor = self.take_executor();
 
         let dsl = dsl.to_owned();
@@ -619,7 +640,7 @@ impl ExecutorPool {
             }
             // Timeout elapsed — interrupt the DuckDB query and reclaim
             // the executor asynchronously once the interrupt completes.
-            () = tokio::time::sleep(timeout) => {
+            () = tokio::time::sleep_until(deadline.instant()) => {
                 if let Some(handle) = &interrupt {
                     handle.interrupt();
                 }
@@ -662,7 +683,7 @@ impl ExecutorPool {
         query_id: u64,
         dsl: &str,
         source: &str,
-        timeout: Duration,
+        deadline: Deadline,
         capture_debug: bool,
         utc_offset_secs: i32,
     ) -> ExecuteOutcome {
@@ -675,14 +696,27 @@ impl ExecutorPool {
             );
         }
 
+        // Same budget rule as the ordinary lane. This one takes no
+        // publication guard (ADR-0024 keeps per-lane gate membership as
+        // it is), so the queue and execution are the whole of its wait.
         let wait_start = std::time::Instant::now();
         let semaphore = Arc::clone(&self.semaphore);
-        let Ok(permit) = semaphore.acquire_owned().await else {
-            return ExecuteOutcome {
-                result: Err(ServerError::Internal("executor pool shut down".into())),
-                debug: None,
-                severity_columns: Vec::new(),
-            };
+        let permit = match deadline.run(semaphore.acquire_owned()).await {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => {
+                return ExecuteOutcome {
+                    result: Err(ServerError::Internal("executor pool shut down".into())),
+                    debug: None,
+                    severity_columns: Vec::new(),
+                };
+            }
+            Err(crate::deadline::Expired) => {
+                return ExecuteOutcome {
+                    result: Err(ServerError::Timeout),
+                    debug: None,
+                    severity_columns: Vec::new(),
+                };
+            }
         };
 
         let wait_ms = wait_start.elapsed().as_millis();
@@ -771,7 +805,7 @@ impl ExecutorPool {
                     },
                 }
             }
-            () = tokio::time::sleep(timeout) => {
+            () = tokio::time::sleep_until(deadline.instant()) => {
                 if let Some(handle) = &interrupt {
                     handle.interrupt();
                 }
@@ -916,20 +950,24 @@ impl ExecutorPool {
     ///
     /// `service`, when present, scopes the glob to one service's files; the
     /// caller is responsible for validating the name.
-    /// `timeout` bounds the wait for publication after acquiring a pool permit.
+    /// `deadline` is the caller's whole budget: the queue wait and the
+    /// publication wait both spend from it.
     pub async fn sample_field_values(
         &self,
         field: &str,
         service: Option<&str>,
         limit: usize,
-        timeout: Duration,
+        deadline: Deadline,
     ) -> Result<Vec<String>, ServerError> {
         let semaphore = Arc::clone(&self.semaphore);
-        let Ok(permit) = semaphore.acquire_owned().await else {
-            return Err(ServerError::Internal("executor pool shut down".into()));
-        };
+        let permit = deadline
+            .run(semaphore.acquire_owned())
+            .await
+            .map_err(|_| ServerError::Timeout)?
+            .map_err(|_| ServerError::Internal("executor pool shut down".into()))?;
 
-        let publication = tokio::time::timeout(timeout, self.publication.read())
+        let publication = deadline
+            .run(self.publication.read())
             .await
             .map_err(|_| ServerError::Timeout)??;
         let executor = self.take_executor();
@@ -972,23 +1010,25 @@ impl ExecutorPool {
     ///
     /// Acquires a pool executor, writes to a temp file, and returns the
     /// raw bytes. Respects the hot buffer for fresh event visibility.
+    #[allow(clippy::too_many_lines)]
     pub async fn export_parquet(
         &self,
         query_id: u64,
         dsl: &str,
         max_rows: usize,
-        timeout: Duration,
+        deadline: Deadline,
     ) -> Result<Vec<u8>, ServerError> {
         let semaphore = Arc::clone(&self.semaphore);
-        let Ok(permit) = semaphore.acquire_owned().await else {
-            return Err(ServerError::Internal("executor pool shut down".into()));
-        };
+        let permit = deadline
+            .run(semaphore.acquire_owned())
+            .await
+            .map_err(|_| ServerError::Timeout)?
+            .map_err(|_| ServerError::Internal("executor pool shut down".into()))?;
 
-        let publication_start = std::time::Instant::now();
-        let publication = tokio::time::timeout(timeout, self.publication.read())
+        let publication = deadline
+            .run(self.publication.read())
             .await
             .map_err(|_| ServerError::Timeout)??;
-        let timeout = timeout.saturating_sub(publication_start.elapsed());
         let executor = self.take_executor();
         let dsl = dsl.to_owned();
         let base_dir = Arc::clone(&self.base_dir);
@@ -1076,7 +1116,7 @@ impl ExecutorPool {
                     Err(e) => Err(ServerError::Internal(format!("export task panicked: {e}"))),
                 }
             }
-            () = tokio::time::sleep(timeout) => {
+            () = tokio::time::sleep_until(deadline.instant()) => {
                 if let Some(handle) = &interrupt {
                     handle.interrupt();
                 }
@@ -1200,7 +1240,7 @@ mod tests {
             .execute(
                 pool.allocate_query_id(),
                 "* | table lvl",
-                Duration::from_secs(30),
+                Deadline::after(Duration::from_secs(30)),
                 false,
                 0,
             )
@@ -1219,7 +1259,7 @@ mod tests {
             .execute(
                 pool.allocate_query_id(),
                 "* | table lvl",
-                Duration::from_secs(30),
+                Deadline::after(Duration::from_secs(30)),
                 false,
                 0,
             )
@@ -1247,7 +1287,7 @@ mod tests {
             .execute(
                 pool.allocate_query_id(),
                 "| | |",
-                Duration::from_secs(10),
+                Deadline::after(Duration::from_secs(10)),
                 false,
                 0,
             )
@@ -1262,7 +1302,7 @@ mod tests {
             .execute(
                 pool.allocate_query_id(),
                 "* | table lvl",
-                Duration::from_millis(10),
+                Deadline::after(Duration::from_millis(10)),
                 false,
                 0,
             )
@@ -1280,7 +1320,7 @@ mod tests {
             .execute(
                 pool.allocate_query_id(),
                 "| | invalid",
-                Duration::from_secs(10),
+                Deadline::after(Duration::from_secs(10)),
                 false,
                 0,
             )
@@ -1296,7 +1336,7 @@ mod tests {
             .execute(
                 pool.allocate_query_id(),
                 "service:test",
-                Duration::from_secs(10),
+                Deadline::after(Duration::from_secs(10)),
                 false,
                 0,
             )
@@ -1314,7 +1354,7 @@ mod tests {
             .execute(
                 pool.allocate_query_id(),
                 "service:test",
-                Duration::from_secs(10),
+                Deadline::after(Duration::from_secs(10)),
                 false,
                 0,
             )
@@ -1323,7 +1363,7 @@ mod tests {
             .execute(
                 pool.allocate_query_id(),
                 "service:test",
-                Duration::from_secs(10),
+                Deadline::after(Duration::from_secs(10)),
                 false,
                 0,
             )
@@ -1348,6 +1388,90 @@ mod tests {
         assert_eq!(&*pool.fallback_glob, "/var/lib/trawl/data/**/*.parquet");
     }
 
+    /// Waiting in the queue spends the caller's budget (ADR-0024). The
+    /// permit is held for the whole test, so the query never starts: what
+    /// ends the wait is the deadline, and before this it was nothing at
+    /// all — `acquire_owned` had no bound, and a query that finally got a
+    /// permit was handed a full fresh timeout to run in.
+    ///
+    /// Paused time, so the five seconds are virtual and exact. A test
+    /// that slept for them would prove the same thing an hour later.
+    #[tokio::test(start_paused = true)]
+    async fn queue_wait_counts_against_the_deadline() {
+        let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000, None);
+        let idle_before = pool.idle.lock().len();
+        // The pool's one permit, held by someone else for the duration.
+        let held = pool
+            .exclusive(Duration::from_secs(1))
+            .await
+            .expect("the idle pool grants exclusivity at once");
+
+        let start = tokio::time::Instant::now();
+        let outcome = pool
+            .execute(
+                pool.allocate_query_id(),
+                "*",
+                Deadline::after(Duration::from_secs(5)),
+                false,
+                0,
+            )
+            .await;
+        let waited = start.elapsed();
+
+        assert!(
+            matches!(outcome.result, Err(ServerError::Timeout)),
+            "expected Timeout, got: {:?}",
+            outcome.result
+        );
+        assert_eq!(waited, Duration::from_secs(5), "it waited the budget");
+        assert_eq!(
+            pool.idle.lock().len(),
+            idle_before,
+            "a query that never left the queue took no executor"
+        );
+        drop(held);
+    }
+
+    /// The publication gate is the second wait, and it spends the same
+    /// budget: the permit is acquired, then the cutover's writer holds
+    /// the gate until the deadline ends the wait.
+    #[tokio::test(start_paused = true)]
+    async fn publication_wait_counts_against_the_deadline() {
+        let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000, None);
+        let idle_before = pool.idle.lock().len();
+        let writer = pool.publication.write().await;
+
+        let start = tokio::time::Instant::now();
+        let outcome = pool
+            .execute(
+                pool.allocate_query_id(),
+                "*",
+                Deadline::after(Duration::from_secs(5)),
+                false,
+                0,
+            )
+            .await;
+        let waited = start.elapsed();
+
+        assert!(
+            matches!(outcome.result, Err(ServerError::Timeout)),
+            "expected Timeout, got: {:?}",
+            outcome.result
+        );
+        assert_eq!(waited, Duration::from_secs(5), "it waited the budget");
+        assert_eq!(
+            pool.available_permits(),
+            1,
+            "the permit it was holding is released"
+        );
+        assert_eq!(
+            pool.idle.lock().len(),
+            idle_before,
+            "a query that never passed the gate took no executor"
+        );
+        drop(writer);
+    }
+
     #[tokio::test]
     async fn pool_timeout_returns_error() {
         // Make the blocking task sleep so the timeout reliably fires first.
@@ -1357,7 +1481,7 @@ mod tests {
             .execute(
                 pool.allocate_query_id(),
                 "*",
-                Duration::from_millis(10),
+                Deadline::after(Duration::from_millis(10)),
                 false,
                 0,
             )
@@ -1382,7 +1506,7 @@ mod tests {
             .execute(
                 pool.allocate_query_id(),
                 "*",
-                Duration::from_millis(10),
+                Deadline::after(Duration::from_millis(10)),
                 false,
                 0,
             )
@@ -1421,7 +1545,7 @@ mod tests {
             p2.execute(
                 p2.allocate_query_id(),
                 "service:test",
-                Duration::from_secs(10),
+                Deadline::after(Duration::from_secs(10)),
                 false,
                 0,
             )
@@ -1452,8 +1576,13 @@ mod tests {
 
         let p2 = pool.clone();
         let queued = tokio::spawn(async move {
-            p2.sample_field_values("service", None, 10, Duration::from_secs(10))
-                .await
+            p2.sample_field_values(
+                "service",
+                None,
+                10,
+                Deadline::after(Duration::from_secs(10)),
+            )
+            .await
         });
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(
@@ -1475,7 +1604,12 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(1),
-            pool.sample_field_values("service", None, 10, Duration::from_millis(20)),
+            pool.sample_field_values(
+                "service",
+                None,
+                10,
+                Deadline::after(Duration::from_millis(20)),
+            ),
         )
         .await
         .expect("publication wait must return before the writer releases its guard");
@@ -1514,7 +1648,7 @@ mod tests {
             p2.execute(
                 p2.allocate_query_id(),
                 "service:test",
-                Duration::from_secs(10),
+                Deadline::after(Duration::from_secs(10)),
                 false,
                 0,
             )

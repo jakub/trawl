@@ -14,6 +14,7 @@ use std::time::Duration;
 use serde_json::{Map, Value, json};
 
 use trawl_server::bus::IngestBatch;
+use trawl_server::deadline::Deadline;
 use trawl_server::hot_buffer::{HotBuffer, HotBufferConfig};
 use trawl_server::ingest::wal::WalWriter;
 use trawl_server::pool::ExecutorPool;
@@ -92,7 +93,7 @@ async fn hot_buffer_makes_events_immediately_queryable() {
         .execute(
             pool.allocate_query_id(),
             "* | head 100",
-            Duration::from_secs(10),
+            Deadline::after(Duration::from_secs(10)),
             false,
             0,
         )
@@ -138,7 +139,7 @@ async fn hot_buffer_makes_events_immediately_queryable() {
         .execute(
             pool.allocate_query_id(),
             "* | head 100",
-            Duration::from_secs(10),
+            Deadline::after(Duration::from_secs(10)),
             false,
             0,
         )
@@ -229,7 +230,7 @@ async fn hot_buffer_and_parquet_produce_no_duplicates() {
         .execute(
             pool.allocate_query_id(),
             "* | head 100",
-            Duration::from_secs(10),
+            Deadline::after(Duration::from_secs(10)),
             false,
             0,
         )
@@ -324,7 +325,7 @@ async fn hot_conflict_after_pin_seeding_keeps_all_cold_rows(pool: sqlx::PgPool) 
         .execute(
             exec_pool.allocate_query_id(),
             "* | head 100",
-            Duration::from_secs(10),
+            Deadline::after(Duration::from_secs(10)),
             false,
             0,
         )
@@ -511,7 +512,7 @@ async fn query_works_without_hot_buffer() {
         .execute(
             pool.allocate_query_id(),
             "* | head 100",
-            Duration::from_secs(10),
+            Deadline::after(Duration::from_secs(10)),
             false,
             0,
         )
@@ -588,7 +589,7 @@ async fn service_scoped_query_without_hot_buffer_survives_sibling_service_hours(
         .execute(
             pool.allocate_query_id(),
             "service=nginx last=6h",
-            Duration::from_secs(10),
+            Deadline::after(Duration::from_secs(10)),
             false,
             0,
         )
@@ -675,7 +676,7 @@ async fn pinned_where_let_hot_cold_and_stream_agree() {
             pool.execute(
                 pool.allocate_query_id(),
                 dsl,
-                Duration::from_secs(10),
+                Deadline::after(Duration::from_secs(10)),
                 false,
                 0,
             )
@@ -842,7 +843,7 @@ async fn severity_pin_agrees_hot_cold_and_stream() {
             pool.execute(
                 pool.allocate_query_id(),
                 dsl,
-                Duration::from_secs(10),
+                Deadline::after(Duration::from_secs(10)),
                 false,
                 0,
             )
