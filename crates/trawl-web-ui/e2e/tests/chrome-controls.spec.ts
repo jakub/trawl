@@ -236,3 +236,46 @@ test('detail tag adds a filter', async ({ page, request }) => {
     nameFrom(COPY.chipRemoveName, FIELD, value),
   );
 });
+
+test('net rename opens the editor', async ({ page, request }) => {
+  await resetScenario(request, 'corpus');
+  await page.goto(`/jobs/nets?net=${CORPUS.netId}`);
+  const panel = page.locator(SEL.drawerPanel);
+  await expect(panel).toBeVisible();
+
+  const rename = page.locator(SEL.netRename);
+  await expect(rename).toHaveJSProperty('tagName', 'BUTTON');
+  await expect(rename).toHaveAttribute('type', 'button');
+  // The visible text is the net's name and the name adds the verb, so
+  // the label is inside the name (WCAG 2.5.3).
+  await expect(rename).toHaveText(CORPUS.netName);
+  await expect(rename).toHaveAccessibleName(nameFrom(COPY.netRenameName, CORPUS.netName));
+
+  // The drawer captures focus when it opens (fleet-ui
+  // FocusPolicy::Capture) and this is the first control inside it, so
+  // the capture lands here. That alone would also be true of a control
+  // outside the tab order, so step out backwards and come back: the
+  // Tab that returns is the proof.
+  await expect(rename).toBeFocused();
+  await page.keyboard.press('Shift+Tab');
+  await expect(rename).not.toBeFocused();
+  await page.keyboard.press('Tab');
+  await expectFocusRing(rename);
+
+  await page.keyboard.press('Enter');
+  const input = page.locator(SEL.netRenameInput);
+  await expect(input).toHaveValue(CORPUS.netName);
+  // The trigger removed ITSELF to make room for the input, so the press
+  // has to hand focus over: the browser drops it on <body> otherwise
+  // and a keyboard user is left outside the editor they just opened.
+  await expect(input).toBeFocused();
+  await expect(rename).toHaveCount(0);
+
+  // Escape cancels the rename rather than closing the drawer, and
+  // focus comes back to the control that opened the editor.
+  await page.keyboard.press('Escape');
+  await expect(input).toHaveCount(0);
+  await expect(page.locator(SEL.netRename)).toBeFocused();
+  await expect(page.locator(SEL.netRename)).toHaveText(CORPUS.netName);
+  await expect(panel).toBeVisible();
+});

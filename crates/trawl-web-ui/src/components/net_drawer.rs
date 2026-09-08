@@ -47,6 +47,28 @@ pub fn NetDrawer(
     // -- inline rename --
     let editing_name = RwSignal::new(false);
     let name_buf = RwSignal::new(net.name.clone());
+    // The trigger REPLACES itself with the input, so focus has to be
+    // handed over in both directions or a keyboard user is dropped on
+    // `<body>`: the browser has no memory of an element it removed.
+    // Same obligation ADR-0028 puts on an overlay opener, minus the
+    // overlay.
+    let name_btn_ref = NodeRef::<leptos::html::Button>::new();
+    let name_input_ref = NodeRef::<leptos::html::Input>::new();
+    Effect::new(move |was_editing: Option<bool>| {
+        let editing = editing_name.get();
+        if editing {
+            if let Some(input) = name_input_ref.get() {
+                let _ = input.focus();
+            }
+        } else if was_editing == Some(true) {
+            // Leaving the editor, however it ended: back to the control
+            // that opened it.
+            if let Some(btn) = name_btn_ref.get() {
+                let _ = btn.focus();
+            }
+        }
+        editing
+    });
     let original_name = net.name.clone();
 
     let do_rename = {
@@ -139,6 +161,7 @@ pub fn NetDrawer(
                             <button
                                 type="button"
                                 class="name"
+                                node_ref=name_btn_ref
                                 aria-label=format!("Rename {name}")
                                 // The title looks like the drawer's
                                 // heading, so nothing but the tooltip
@@ -155,6 +178,7 @@ pub fn NetDrawer(
                         view! {
                             <input
                                 class="name-edit"
+                                node_ref=name_input_ref
                                 prop:value=move || name_buf.get()
                                 on:input=move |e| name_buf.set(event_target_value(&e))
                                 on:blur=move |_| do_rename_blur()

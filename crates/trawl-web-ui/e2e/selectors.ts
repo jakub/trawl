@@ -249,6 +249,10 @@ export const SEL = {
   /// crates/trawl-web-ui/src/components/net_drawer.rs — the drawer
   /// title's rename trigger (fleet-ui's drawer owns `.sd-ttl`).
   netRename: '.sd-ttl button.name',
+  /// The input that REPLACES that trigger while a rename is open. The
+  /// two never coexist, so a spec reads one of them to say which half
+  /// of the swap is on screen.
+  netRenameInput: '.sd-ttl input.name-edit',
 
   // -- range dialog ---------------------------------------------------
   /// crates/trawl-web-ui/src/components/editor_wrap.rs DateRangePopover

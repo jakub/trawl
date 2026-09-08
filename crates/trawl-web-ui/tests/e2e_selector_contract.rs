@@ -939,6 +939,18 @@ const CONTRACTS: &[Contract] = &[
         source: NET_DRAWER_RS,
         hook: "class=\"name\"",
     },
+    Contract {
+        assignment: "netRenameInput: '.sd-ttl input.name-edit',",
+        source_path: "../fleet-ui/src/drawer.rs",
+        source: DRAWER_RS,
+        hook: "class=\"sd-ttl\"",
+    },
+    Contract {
+        assignment: "netRenameInput: '.sd-ttl input.name-edit',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "class=\"name-edit\"",
+    },
     // -- range dialog ---------------------------------------------------
     Contract {
         assignment: "rangeDialog: '.dr-pop[role=\"dialog\"]',",
