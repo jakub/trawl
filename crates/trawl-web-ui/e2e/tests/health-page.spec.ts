@@ -54,11 +54,17 @@ test('health 503 renders the named failed subsystem', async ({ page, request }) 
   const healthResponse = page.waitForResponse(r => r.url().endsWith('/api/v1/health') && r.status() === 503);
   await page.goto('/settings/health');
   await healthResponse;
-  await expect(page.locator(SEL.healthSection)).toContainText('duckdb');
-  await expect(page.locator(SEL.healthSection)).toContainText('auth_db');
-  await expect(page.locator(SEL.healthSection)).toContainText('storage_db');
-  await expect(page.locator(SEL.healthSection)).toContainText('error');
-  await expect(page.locator(SEL.healthSection)).toContainText('health-fixture-163');
+  const health = page.locator(SEL.healthSection);
+  for (const [name, value] of [
+    ['Overall state', 'unavailable'],
+    ['duckdb', 'error'],
+    ['auth_db', 'ok'],
+    ['storage_db', 'ok'],
+    ['data_path', 'ok'],
+  ]) {
+    await expect(health.getByText(name, { exact: true }).locator('..').locator('dd')).toHaveText(value);
+  }
+  await expect(health).toContainText('health-fixture-163');
 });
 
 test('admin shares one stream with the footer across direct navigation, away, Back and Forward', async ({ page, request }) => {
