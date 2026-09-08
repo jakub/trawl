@@ -386,6 +386,42 @@ pub struct QueriesResponse {
     pub active: Vec<ActiveQuerySnapshot>,
     /// Recently completed queries (most recent first).
     pub recent: Vec<CompletedQuerySnapshot>,
+    /// Work that still holds a pool permit after its request answered
+    /// (ADR-0024). Disjoint from `active`: a request whose work is
+    /// retained is listed here and not there. The same request may also
+    /// appear in `recent`, where it recorded its outcome.
+    ///
+    /// `default` because a server predating retained accounting sends no
+    /// such field.
+    #[serde(default)]
+    pub retained: Vec<RetainedWorkSnapshot>,
+}
+
+/// One unit of physical work that outlived the request that started it.
+///
+/// The request stopped waiting (it timed out, or its caller walked away);
+/// the `DuckDB` bind or scan it started did not stop with it, and keeps
+/// its permit until it does. Owner key ids never appear here — `user` and
+/// `query` are populated only for a reader who may see them, and are
+/// omitted from the wire otherwise.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetainedWorkSnapshot {
+    /// The pool id, the same id `DELETE /queries/{id}` cancels.
+    pub id: u64,
+    /// Which door the work came through: `query`, `from_saved`, `export`,
+    /// `scheduled`, `ping` or `sample`.
+    pub kind: String,
+    /// Whether the work passed its work-start transition. A held permit
+    /// alone does not prove it started.
+    pub started: bool,
+    /// How long the work has outlived its request (ms).
+    pub retained_ms: u64,
+    /// The submitting key's display name, for a reader entitled to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// The DSL, for a reader entitled to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
 }
 
 /// Snapshot of a currently executing query.
@@ -447,6 +483,10 @@ pub struct StatsResponse {
     pub pool_available: usize,
     /// Total connection pool capacity.
     pub pool_capacity: usize,
+    /// Held permits whose request already answered (ADR-0024): a subset
+    /// of the permits `pool_capacity - pool_available` counts, not an
+    /// addition to them.
+    pub pool_retained: usize,
 }
 
 // -- whoami ------------------------------------------------------------------
@@ -547,6 +587,9 @@ pub struct DashboardSnapshot {
     pub pool_capacity: usize,
     /// Currently active (in-use) pool slots.
     pub pool_active: usize,
+    /// The subset of `pool_active` held by work no request is waiting on
+    /// any more (ADR-0024).
+    pub pool_retained: usize,
 
     // -- hot buffer --
     /// Current event count in the hot buffer.
@@ -2305,6 +2348,7 @@ mod tests {
             healthy: true,
             pool_capacity: 4,
             pool_active: 1,
+            pool_retained: 0,
             hot_buffer_events: 12_847,
             hot_buffer_max_events: 100_000,
             hot_buffer_bytes: 4_404_019,

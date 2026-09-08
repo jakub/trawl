@@ -20,9 +20,9 @@ use trawl_api::{
     DeleteScheduleResponse, ExportRequest, FieldValuesResponse, GlobalRunSummary, HealthResponse,
     HealthStatus, HistoryEntryResponse, HistoryResponse, ListAllRunsResponse,
     ListReportRunsResponse, ListSavedResponse, PaginationMeta, QueriesResponse, QueryRequest,
-    QueryResponse, QueryStatus, ReportRunResponse, ReportRunSummary, RunsStatsResponse,
-    SavedQueryResponse, ScheduleResponse, SchemaColumnResponse, SchemaResponse, SetScheduleRequest,
-    StatsResponse, UpdateSavedRequest, ValidationResponse, WhoAmIResponse,
+    QueryResponse, QueryStatus, ReportRunResponse, ReportRunSummary, RetainedWorkSnapshot,
+    RunsStatsResponse, SavedQueryResponse, ScheduleResponse, SchemaColumnResponse, SchemaResponse,
+    SetScheduleRequest, StatsResponse, UpdateSavedRequest, ValidationResponse, WhoAmIResponse,
 };
 use trawl_engine::value::{QueryResult, Value};
 
@@ -152,7 +152,8 @@ pub async fn query(
                     deadline,
                     capture_debug,
                     utc_offset_secs,
-                    crate::pool::WorkContext::key(crate::pool::WorkKind::FromSaved, verified.id),
+                    crate::pool::WorkContext::key(crate::pool::WorkKind::FromSaved, verified.id)
+                        .with_user(&verified.name),
                 )
                 .await,
             degraded,
@@ -169,7 +170,8 @@ pub async fn query(
                     deadline,
                     capture_debug,
                     utc_offset_secs,
-                    crate::pool::WorkContext::key(crate::pool::WorkKind::Query, verified.id),
+                    crate::pool::WorkContext::key(crate::pool::WorkKind::Query, verified.id)
+                        .with_user(&verified.name),
                 )
                 .await,
             degraded,
@@ -384,6 +386,10 @@ pub async fn query(
 pub async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoResponse {
     let hot_buffer = state.query.hot_buffer.clone();
     let fallback_glob = state.query.pool.fallback_glob().to_owned();
+    // Read here, on the reactor: the closure below deliberately holds no
+    // pool state, so the registry lock never travels onto the blocking
+    // pool behind a filesystem walk.
+    let retained_permits = state.query.pool.retained();
     let wal_dir = state
         .ingest
         .wal_writer
@@ -392,7 +398,12 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoRespo
     let _ = tokio::task::spawn_blocking(move || {
         #[cfg(target_os = "linux")]
         metrics_process::Collector::default().collect();
-        crate::metrics::collect_gauges(hot_buffer.as_ref(), &fallback_glob, wal_dir.as_deref());
+        crate::metrics::collect_gauges(
+            hot_buffer.as_ref(),
+            &fallback_glob,
+            wal_dir.as_deref(),
+            retained_permits,
+        );
     })
     .await;
     let body = state.metrics_handle.render();
@@ -764,7 +775,35 @@ fn is_date_dir(name: &str) -> bool {
         && name[8..10].bytes().all(|b| b.is_ascii_digit())
 }
 
-/// `GET /api/v1/queries` — view active and recent queries.
+/// One unit of retained work as a given reader may see it (ADR-0024).
+///
+/// The id, the kind and the timing are facts about the server's capacity
+/// and go to every reader the route already admits. The submitter's name
+/// and the DSL are the submitter's, so they reach only an operator
+/// (`ServerManage`) or the exact key that submitted the work — a
+/// name match would hand one key another key's query text, since display
+/// names are mutable and non-unique. System work (a scheduled run, a
+/// health probe) has no human owner, so nothing but an operator sees its
+/// text, and its owner id never leaves the server either way.
+pub(crate) fn retained_snapshot(
+    work: &crate::pool::RetainedWork,
+    verified: &VerifiedKey,
+) -> RetainedWorkSnapshot {
+    let entitled = verified.has_permission(Permission::ServerManage)
+        || work.owner == crate::pool::WorkOwner::Key(verified.id);
+    RetainedWorkSnapshot {
+        id: work.id,
+        kind: work.kind.as_str().to_owned(),
+        started: work.started,
+        retained_ms: u64::try_from(work.retained.as_millis()).unwrap_or(u64::MAX),
+        user: entitled
+            .then(|| work.user.as_deref().map(ToOwned::to_owned))
+            .flatten(),
+        query: entitled.then(|| work.display.clone()).flatten(),
+    }
+}
+
+/// `GET /api/v1/queries` — view active, recent and retained queries.
 #[allow(clippy::unused_async)]
 pub async fn queries(
     State(state): State<AppState>,
@@ -774,10 +813,57 @@ pub async fn queries(
         return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
 
+    // One lifecycle read, taken first: an id it reports as retained is
+    // one whose request already recorded its outcome, so listing it as
+    // active too would count the same permit twice (ADR-0024). The
+    // tracker read happens after, so work that becomes retained in
+    // between is merely still listed as active for one more request.
+    let retained = state.query.pool.retained_work();
+    let retained_ids: std::collections::HashSet<u64> = retained.iter().map(|w| w.id).collect();
+
     Ok(Json(QueriesResponse {
-        active: state.query.tracker.active(),
+        active: state
+            .query
+            .tracker
+            .active()
+            .into_iter()
+            .filter(|q| !retained_ids.contains(&q.id))
+            .collect(),
         recent: state.query.tracker.recent(),
+        retained: retained
+            .iter()
+            .map(|work| retained_snapshot(work, &verified))
+            .collect(),
     }))
+}
+
+/// May this key ask for that work to stop?
+///
+/// Admin (`ServerManage`) can cancel any work, including the server's own
+/// (a scheduled run, a health probe). A `QueryCancel` holder can cancel
+/// work it submitted, and ownership is the exact keystore id: display
+/// names are mutable and non-unique, so two keys sharing a name must stay
+/// isolated from each other. Keys holding neither permission are rejected
+/// outright, with a different sentence — telling them nothing about
+/// whether the id exists.
+fn check_cancel_authority(
+    verified: &VerifiedKey,
+    tracker_owner: Option<i64>,
+    pool_owner: Option<crate::pool::WorkOwner>,
+) -> Result<(), ServerError> {
+    if verified.has_permission(Permission::ServerManage) {
+        return Ok(());
+    }
+    if !verified.has_permission(Permission::QueryCancel) {
+        return Err(ServerError::Forbidden("insufficient permissions".into()));
+    }
+    let mine = tracker_owner == Some(verified.id)
+        || pool_owner == Some(crate::pool::WorkOwner::Key(verified.id));
+    if mine {
+        Ok(())
+    } else {
+        Err(ServerError::Forbidden("cannot cancel this query".into()))
+    }
 }
 
 /// `DELETE /api/v1/queries/{id}` — cancel a running query by ID.
@@ -789,26 +875,16 @@ pub async fn cancel_query(
     Extension(verified): Extension<VerifiedKey>,
     Path(query_id): Path<u64>,
 ) -> Result<Json<CancelResponse>, ServerError> {
-    // Ownership is authorized by exact key id: names are mutable and
-    // non-unique, so two keys sharing a name must not be able to cancel each
-    // other's queries (`user` stays display-only).
-    let can_cancel = if verified.has_permission(Permission::ServerManage) {
-        true
-    } else if verified.has_permission(Permission::QueryCancel) {
-        // Two records, one owner. The tracker drops a query as soon as its
-        // request records an outcome; the pool keeps the work registered
-        // until the physical query actually stops (ADR-0024). Asking both
-        // is what keeps a query the client has already been told timed out
-        // cancellable by the key that submitted it.
-        state.query.tracker.owner_key_id(query_id) == Some(verified.id)
-            || state.query.pool.owner_of(query_id) == Some(crate::pool::WorkOwner::Key(verified.id))
-    } else {
-        return Err(ServerError::Forbidden("insufficient permissions".into()));
-    };
-
-    if !can_cancel {
-        return Err(ServerError::Forbidden("cannot cancel this query".into()));
-    }
+    // Two records, one owner. The tracker drops a query as soon as its
+    // request records an outcome; the pool keeps the work registered until
+    // the physical query actually stops (ADR-0024). Asking both is what
+    // keeps a query the client has already been told timed out cancellable
+    // by the key that submitted it.
+    check_cancel_authority(
+        &verified,
+        state.query.tracker.owner_key_id(query_id),
+        state.query.pool.owner_of(query_id),
+    )?;
 
     let cancelled = state.query.pool.cancel_by_id(query_id);
 
@@ -897,6 +973,7 @@ pub async fn stats(
         active_queries: state.query.tracker.active().len(),
         pool_available: state.query.pool.available_permits(),
         pool_capacity: state.query.pool.capacity(),
+        pool_retained: state.query.pool.retained(),
     }))
 }
 
@@ -1628,7 +1705,8 @@ pub async fn field_values(
             crate::deadline::Deadline::after(std::time::Duration::from_secs(
                 state.query.timeout_secs,
             )),
-            crate::pool::WorkContext::key(crate::pool::WorkKind::Sample, verified.id),
+            crate::pool::WorkContext::key(crate::pool::WorkKind::Sample, verified.id)
+                .with_user(&verified.name),
         )
         .await?;
 
@@ -2750,7 +2828,8 @@ pub async fn export(
                 &req.query,
                 limit,
                 deadline,
-                crate::pool::WorkContext::key(crate::pool::WorkKind::Export, verified.id),
+                crate::pool::WorkContext::key(crate::pool::WorkKind::Export, verified.id)
+                    .with_user(&verified.name),
             )
             .await?;
         let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -2794,7 +2873,8 @@ pub async fn export(
             deadline,
             capture_debug,
             0,
-            crate::pool::WorkContext::key(crate::pool::WorkKind::Export, verified.id),
+            crate::pool::WorkContext::key(crate::pool::WorkKind::Export, verified.id)
+                .with_user(&verified.name),
         )
         .await;
     let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -3351,6 +3431,143 @@ pub struct StreamParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A key holding exactly `permissions`, under a display name two
+    /// keys are free to share.
+    fn viewer(id: i64, name: &str, permissions: &[&str]) -> VerifiedKey {
+        VerifiedKey::from_roles(
+            id,
+            "testtest",
+            name,
+            fleet_auth::PrincipalKind::Service,
+            vec![fleet_auth::Role {
+                id: 1,
+                name: "test-role".into(),
+                rate_rpm: None,
+                permissions: permissions
+                    .iter()
+                    .map(|p| fleet_auth::RolePermission {
+                        app: "trawl".into(),
+                        permission: (*p).to_owned(),
+                    })
+                    .collect(),
+            }],
+        )
+    }
+
+    fn retained_query(owner: crate::pool::WorkOwner) -> crate::pool::RetainedWork {
+        crate::pool::RetainedWork {
+            id: 42,
+            kind: crate::pool::WorkKind::Query,
+            started: true,
+            retained: std::time::Duration::from_millis(1500),
+            owner,
+            user: Some(std::sync::Arc::from("twin")),
+            display: Some("service=nginx | stats count()".to_owned()),
+        }
+    }
+
+    /// The capacity facts go to every reader the route admits; the
+    /// submitter's name and DSL go to the operator and to the exact key
+    /// that submitted the work, and to nobody else — including a second
+    /// key carrying the same display name (ADR-0024).
+    #[test]
+    fn retained_visibility_follows_the_key_id_not_the_name() {
+        let work = retained_query(crate::pool::WorkOwner::Key(7));
+
+        let admin = viewer(99, "ops", &["query", "server_manage"]);
+        let owner = viewer(7, "twin", &["query"]);
+        let twin = viewer(8, "twin", &["query"]);
+
+        for reader in [&admin, &owner] {
+            let snap = retained_snapshot(&work, reader);
+            assert_eq!(snap.id, 42);
+            assert_eq!(snap.kind, "query");
+            assert!(snap.started);
+            assert_eq!(snap.retained_ms, 1500);
+            assert_eq!(snap.user.as_deref(), Some("twin"));
+            assert_eq!(snap.query.as_deref(), Some("service=nginx | stats count()"));
+        }
+
+        let seen_by_twin = retained_snapshot(&work, &twin);
+        assert_eq!(seen_by_twin.id, 42);
+        assert_eq!(seen_by_twin.kind, "query");
+        assert_eq!(seen_by_twin.retained_ms, 1500);
+        assert_eq!(
+            seen_by_twin.user, None,
+            "an equal display name is not an ownership proof"
+        );
+        assert_eq!(seen_by_twin.query, None);
+    }
+
+    /// System work (a scheduled run, a health probe) has no human owner,
+    /// so its DSL reaches an operator and nobody else. No `query`
+    /// permission holder can ever match `WorkOwner::System`.
+    #[test]
+    fn system_retained_work_shows_no_text_below_server_manage() {
+        let work = retained_query(crate::pool::WorkOwner::System);
+
+        let analyst = retained_snapshot(&work, &viewer(7, "twin", &["query", "query_cancel"]));
+        assert_eq!(analyst.user, None);
+        assert_eq!(analyst.query, None);
+        assert_eq!(analyst.kind, "query");
+
+        let admin = retained_snapshot(&work, &viewer(99, "ops", &["query", "server_manage"]));
+        assert_eq!(
+            admin.query.as_deref(),
+            Some("service=nginx | stats count()")
+        );
+    }
+
+    /// Wire shape: an entry a reader may not see carries no null-valued
+    /// keys at all, so the absence is not a field a client must special
+    /// case.
+    #[test]
+    fn a_filtered_retained_entry_omits_the_fields_it_hides() {
+        let work = retained_query(crate::pool::WorkOwner::Key(7));
+        let snap = retained_snapshot(&work, &viewer(8, "twin", &["query"]));
+        let json = serde_json::to_string(&snap).expect("serialize");
+        assert!(!json.contains("\"user\":"), "{json}");
+        assert!(!json.contains("\"query\":"), "{json}");
+        assert!(json.contains("\"retained_ms\":1500"), "{json}");
+    }
+
+    /// Cancellation authority, unchanged by the retained lifecycle
+    /// (ADR-0024): an operator reaches everything including the server's
+    /// own work, a `QueryCancel` holder reaches only what its own key id
+    /// owns, and a key with neither permission is told nothing about the
+    /// id at all.
+    #[test]
+    fn cancel_authority_is_the_key_id_and_admin_reaches_system_work() {
+        use crate::pool::WorkOwner;
+
+        let admin = viewer(99, "ops", &["query", "server_manage"]);
+        let owner = viewer(7, "twin", &["query", "query_cancel"]);
+        let twin = viewer(8, "twin", &["query", "query_cancel"]);
+        let reader = viewer(9, "reader", &["query"]);
+
+        // Work still tracked, and work whose request already answered:
+        // either record proves ownership.
+        assert!(check_cancel_authority(&owner, Some(7), None).is_ok());
+        assert!(check_cancel_authority(&owner, None, Some(WorkOwner::Key(7))).is_ok());
+
+        let denied = check_cancel_authority(&twin, Some(7), Some(WorkOwner::Key(7)))
+            .expect_err("a twin name is not ownership");
+        assert!(matches!(&denied, ServerError::Forbidden(m) if m == "cannot cancel this query"));
+
+        // System work has no human owner: no QueryCancel holder matches it.
+        let system = check_cancel_authority(&owner, None, Some(WorkOwner::System))
+            .expect_err("system work is not a key's own work");
+        assert!(matches!(&system, ServerError::Forbidden(m) if m == "cannot cancel this query"));
+        assert!(
+            check_cancel_authority(&admin, None, Some(WorkOwner::System)).is_ok(),
+            "an operator can stop the server's own work"
+        );
+
+        let ungranted = check_cancel_authority(&reader, Some(9), None)
+            .expect_err("QueryCancel is the gate, ownership is only the scope");
+        assert!(matches!(&ungranted, ServerError::Forbidden(m) if m == "insufficient permissions"));
+    }
 
     /// A retention config with a global age and per-env overrides.
     fn retention_config(max_age_days: u64, envs: &[(&str, u64)]) -> crate::config::RetentionConfig {

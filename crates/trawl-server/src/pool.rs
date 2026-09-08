@@ -109,10 +109,19 @@ pub enum WorkOwner {
 }
 
 /// The lifecycle identity of one unit of pool work.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Clone rather than Copy: it carries the submitter's display name, which
+/// the retained listing shows a reader entitled to see it. A lane that
+/// needs the kind past the point it hands this over keeps a copy of
+/// [`WorkKind`], which is Copy.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkContext {
     pub kind: WorkKind,
     pub owner: WorkOwner,
+    /// The submitting key's display name. Display metadata only — never
+    /// the anchor for an authorization decision, which is
+    /// [`WorkOwner::Key`]'s id, because names are mutable and non-unique.
+    user: Option<Arc<str>>,
 }
 
 impl WorkContext {
@@ -122,6 +131,7 @@ impl WorkContext {
         Self {
             kind,
             owner: WorkOwner::Key(key_id),
+            user: None,
         }
     }
 
@@ -131,7 +141,15 @@ impl WorkContext {
         Self {
             kind,
             owner: WorkOwner::System,
+            user: None,
         }
+    }
+
+    /// Record the submitter's display name for the retained listing.
+    #[must_use]
+    pub fn with_user(mut self, name: &str) -> Self {
+        self.user = Some(Arc::from(name));
+        self
     }
 }
 
@@ -154,6 +172,8 @@ struct RetainedEntry {
     id: u64,
     kind: WorkKind,
     owner: WorkOwner,
+    /// The submitting key's display name, for the retained listing.
+    user: Option<Arc<str>>,
     /// The DSL, for the operator-facing retained listing. Filtered by
     /// owner and permission at the route, never by presence here; helper
     /// lanes carry no DSL at all.
@@ -229,8 +249,12 @@ impl StartRefusal {
 
 /// A unit of retained physical work, as an operator sees it.
 ///
-/// `owner` and `display` stay crate-internal: the route decides what a
-/// given reader may see of them.
+/// `owner`, `user` and `display` stay crate-internal: which reader may
+/// see the submitter or the DSL is the retained-listing route's decision
+/// ([`crate::handlers::retained_snapshot`]), and an owner id never
+/// reaches the wire at all. Cancellation authorization does not read this
+/// type; it reads the registry directly, through
+/// [`ExecutorPool::owner_of`].
 #[derive(Debug, Clone)]
 pub struct RetainedWork {
     pub id: u64,
@@ -239,14 +263,8 @@ pub struct RetainedWork {
     pub started: bool,
     /// How long the work has outlived its request.
     pub retained: Duration,
-    /// Who the work belongs to, and the work's DSL. Both are carried here
-    /// and rendered nowhere yet: which reader may see either is the
-    /// retained-listing route's decision, and that route is the next slice
-    /// of this work. Cancellation authorization reads the registry
-    /// directly, through [`ExecutorPool::owner_of`].
-    #[allow(dead_code)]
     pub(crate) owner: WorkOwner,
-    #[allow(dead_code)]
+    pub(crate) user: Option<Arc<str>>,
     pub(crate) display: Option<String>,
 }
 
@@ -1030,7 +1048,7 @@ impl ExecutorPool {
     fn begin_slot(
         &self,
         id: u64,
-        work: WorkContext,
+        work: &WorkContext,
         display: Option<&str>,
         permit: OwnedSemaphorePermit,
         publication: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
@@ -1059,6 +1077,7 @@ impl ExecutorPool {
                 id,
                 kind: work.kind,
                 owner: work.owner,
+                user: work.user.clone(),
                 display: display.map(ToOwned::to_owned),
                 started_work: false,
                 registered_at: Instant::now(),
@@ -1150,6 +1169,7 @@ impl ExecutorPool {
                     started: entry.started_work,
                     retained: now.saturating_duration_since(since),
                     owner: entry.owner,
+                    user: entry.user.clone(),
                     display: entry.display.clone(),
                 })
             })
@@ -1200,6 +1220,7 @@ impl ExecutorPool {
         utc_offset_secs: i32,
         work: WorkContext,
     ) -> ExecuteOutcome {
+        let kind = work.kind;
         let available = self.semaphore.available_permits();
         if available == 0 {
             tracing::warn!(
@@ -1225,7 +1246,7 @@ impl ExecutorPool {
                 };
             }
             Err(crate::deadline::Expired) => {
-                return refused_outcome(query_id, work.kind, StartRefusal::Expired);
+                return refused_outcome(query_id, kind, StartRefusal::Expired);
             }
         };
 
@@ -1249,14 +1270,14 @@ impl ExecutorPool {
                 };
             }
             Err(crate::deadline::Expired) => {
-                return refused_outcome(query_id, work.kind, StartRefusal::Expired);
+                return refused_outcome(query_id, kind, StartRefusal::Expired);
             }
         };
 
         // Everything this work holds, in one guard, moved into the
         // blocking task below: from here on the request future cannot be
         // the thing that releases a permit or returns an executor.
-        let slot = match self.begin_slot(query_id, work, Some(dsl), permit, Some(publication)) {
+        let slot = match self.begin_slot(query_id, &work, Some(dsl), permit, Some(publication)) {
             Ok(slot) => slot,
             Err(error) => {
                 return ExecuteOutcome {
@@ -1285,10 +1306,10 @@ impl ExecutorPool {
                 // during the bind has something to reach. A refusal here
                 // means the caller already asked for this work to stop.
                 if !slot.publish_interrupt(slot.executor().interrupt_handle()) {
-                    return refused_outcome(query_id, work.kind, StartRefusal::Cancelled);
+                    return refused_outcome(query_id, kind, StartRefusal::Cancelled);
                 }
                 if let Err(refusal) = slot.begin_work(Some(deadline)) {
-                    return refused_outcome(query_id, work.kind, refusal);
+                    return refused_outcome(query_id, kind, refusal);
                 }
                 worker_seam!(Started);
 
@@ -1361,7 +1382,7 @@ impl ExecutorPool {
         // A caller that walks away (client gone, task aborted) is not a
         // reason to abandon the work: the guard latches cancellation and
         // records the retention on the way out.
-        let mut request = RequestGuard::new(self, query_id, work.kind, &started);
+        let mut request = RequestGuard::new(self, query_id, kind, &started);
         tokio::select! {
             join_result = &mut task => {
                 request.disarm();
@@ -1382,7 +1403,7 @@ impl ExecutorPool {
                 let result = if request.abandon() {
                     Err(ServerError::Timeout)
                 } else {
-                    Err(capacity_refusal(query_id, work.kind, StartRefusal::Expired))
+                    Err(capacity_refusal(query_id, kind, StartRefusal::Expired))
                 };
                 ExecuteOutcome { result, debug: None, severity_columns: Vec::new() }
             }
@@ -1408,6 +1429,7 @@ impl ExecutorPool {
         utc_offset_secs: i32,
         work: WorkContext,
     ) -> ExecuteOutcome {
+        let kind = work.kind;
         let available = self.semaphore.available_permits();
         if available == 0 {
             tracing::warn!(
@@ -1432,7 +1454,7 @@ impl ExecutorPool {
                 };
             }
             Err(crate::deadline::Expired) => {
-                return refused_outcome(query_id, work.kind, StartRefusal::Expired);
+                return refused_outcome(query_id, kind, StartRefusal::Expired);
             }
         };
 
@@ -1446,7 +1468,7 @@ impl ExecutorPool {
             "semaphore permit acquired (from saved)"
         );
 
-        let slot = match self.begin_slot(query_id, work, Some(dsl), permit, None) {
+        let slot = match self.begin_slot(query_id, &work, Some(dsl), permit, None) {
             Ok(slot) => slot,
             Err(error) => {
                 return ExecuteOutcome {
@@ -1467,10 +1489,10 @@ impl ExecutorPool {
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 worker_seam!(Entry);
                 if !slot.publish_interrupt(slot.executor().interrupt_handle()) {
-                    return refused_outcome(query_id, work.kind, StartRefusal::Cancelled);
+                    return refused_outcome(query_id, kind, StartRefusal::Cancelled);
                 }
                 if let Err(refusal) = slot.begin_work(Some(deadline)) {
-                    return refused_outcome(query_id, work.kind, refusal);
+                    return refused_outcome(query_id, kind, refusal);
                 }
                 worker_seam!(Started);
 
@@ -1528,7 +1550,7 @@ impl ExecutorPool {
             })
         });
 
-        let mut request = RequestGuard::new(self, query_id, work.kind, &started);
+        let mut request = RequestGuard::new(self, query_id, kind, &started);
         tokio::select! {
             join_result = &mut task => {
                 request.disarm();
@@ -1545,7 +1567,7 @@ impl ExecutorPool {
                 let result = if request.abandon() {
                     Err(ServerError::Timeout)
                 } else {
-                    Err(capacity_refusal(query_id, work.kind, StartRefusal::Expired))
+                    Err(capacity_refusal(query_id, kind, StartRefusal::Expired))
                 };
                 ExecuteOutcome { result, debug: None, severity_columns: Vec::new() }
             }
@@ -1645,19 +1667,20 @@ impl ExecutorPool {
 
         let id = self.allocate_query_id();
         let work = WorkContext::system(WorkKind::Ping);
-        let slot = self.begin_slot(id, work, None, permit, None)?;
+        let kind = work.kind;
+        let slot = self.begin_slot(id, &work, None, permit, None)?;
         let started = Arc::clone(&slot.started);
 
         let task = tokio::task::spawn_blocking(move || {
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 worker_seam!(Entry);
                 if !slot.publish_interrupt(slot.executor().interrupt_handle()) {
-                    return Err(capacity_refusal(id, work.kind, StartRefusal::Cancelled));
+                    return Err(capacity_refusal(id, kind, StartRefusal::Cancelled));
                 }
                 // No budget of its own yet, so only a latched cancellation
                 // can refuse the start.
                 if let Err(refusal) = slot.begin_work(None) {
-                    return Err(capacity_refusal(id, work.kind, refusal));
+                    return Err(capacity_refusal(id, kind, refusal));
                 }
                 worker_seam!(Started);
                 let result = slot.executor().ping().map_err(ServerError::from);
@@ -1667,7 +1690,7 @@ impl ExecutorPool {
             outcome.unwrap_or_else(|_| Err(ServerError::Internal("ping panicked".into())))
         });
 
-        let mut request = RequestGuard::new(self, id, work.kind, &started);
+        let mut request = RequestGuard::new(self, id, kind, &started);
         let result = task
             .await
             .map_err(|e| ServerError::Internal(format!("ping task panicked: {e}")));
@@ -1695,20 +1718,21 @@ impl ExecutorPool {
         deadline: Deadline,
         work: WorkContext,
     ) -> Result<Vec<String>, ServerError> {
+        let kind = work.kind;
         let semaphore = Arc::clone(&self.semaphore);
         let id = self.allocate_query_id();
         let permit = deadline
             .run(semaphore.acquire_owned())
             .await
-            .map_err(|_| capacity_refusal(id, work.kind, StartRefusal::Expired))?
+            .map_err(|_| capacity_refusal(id, kind, StartRefusal::Expired))?
             .map_err(|_| ServerError::Internal("executor pool shut down".into()))?;
 
         let publication = deadline
             .run(self.publication.read())
             .await
-            .map_err(|_| capacity_refusal(id, work.kind, StartRefusal::Expired))??;
+            .map_err(|_| capacity_refusal(id, kind, StartRefusal::Expired))??;
 
-        let slot = self.begin_slot(id, work, None, permit, Some(publication))?;
+        let slot = self.begin_slot(id, &work, None, permit, Some(publication))?;
         let started = Arc::clone(&slot.started);
         let fallback_glob = Arc::clone(&self.fallback_glob);
         let field = field.to_owned();
@@ -1718,10 +1742,10 @@ impl ExecutorPool {
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 worker_seam!(Entry);
                 if !slot.publish_interrupt(slot.executor().interrupt_handle()) {
-                    return Err(capacity_refusal(id, work.kind, StartRefusal::Cancelled));
+                    return Err(capacity_refusal(id, kind, StartRefusal::Cancelled));
                 }
                 if let Err(refusal) = slot.begin_work(Some(deadline)) {
-                    return Err(capacity_refusal(id, work.kind, refusal));
+                    return Err(capacity_refusal(id, kind, refusal));
                 }
                 worker_seam!(Started);
                 let glob = match service {
@@ -1744,7 +1768,7 @@ impl ExecutorPool {
             })
         });
 
-        let mut request = RequestGuard::new(self, id, work.kind, &started);
+        let mut request = RequestGuard::new(self, id, kind, &started);
         let result = task
             .await
             .map_err(|e| ServerError::Internal(format!("field values task panicked: {e}")));
@@ -1771,19 +1795,20 @@ impl ExecutorPool {
         deadline: Deadline,
         work: WorkContext,
     ) -> Result<Vec<u8>, ServerError> {
+        let kind = work.kind;
         let semaphore = Arc::clone(&self.semaphore);
         let permit = deadline
             .run(semaphore.acquire_owned())
             .await
-            .map_err(|_| capacity_refusal(query_id, work.kind, StartRefusal::Expired))?
+            .map_err(|_| capacity_refusal(query_id, kind, StartRefusal::Expired))?
             .map_err(|_| ServerError::Internal("executor pool shut down".into()))?;
 
         let publication = deadline
             .run(self.publication.read())
             .await
-            .map_err(|_| capacity_refusal(query_id, work.kind, StartRefusal::Expired))??;
+            .map_err(|_| capacity_refusal(query_id, kind, StartRefusal::Expired))??;
 
-        let slot = self.begin_slot(query_id, work, Some(dsl), permit, Some(publication))?;
+        let slot = self.begin_slot(query_id, &work, Some(dsl), permit, Some(publication))?;
         let started = Arc::clone(&slot.started);
         let dsl = dsl.to_owned();
         let base_dir = Arc::clone(&self.base_dir);
@@ -1794,14 +1819,10 @@ impl ExecutorPool {
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 worker_seam!(Entry);
                 if !slot.publish_interrupt(slot.executor().interrupt_handle()) {
-                    return Err(capacity_refusal(
-                        query_id,
-                        work.kind,
-                        StartRefusal::Cancelled,
-                    ));
+                    return Err(capacity_refusal(query_id, kind, StartRefusal::Cancelled));
                 }
                 if let Err(refusal) = slot.begin_work(Some(deadline)) {
-                    return Err(capacity_refusal(query_id, work.kind, refusal));
+                    return Err(capacity_refusal(query_id, kind, refusal));
                 }
                 worker_seam!(Started);
 
@@ -1853,7 +1874,7 @@ impl ExecutorPool {
             })
         });
 
-        let mut request = RequestGuard::new(self, query_id, work.kind, &started);
+        let mut request = RequestGuard::new(self, query_id, kind, &started);
         tokio::select! {
             join_result = &mut task => {
                 request.disarm();
@@ -1866,7 +1887,7 @@ impl ExecutorPool {
                 if request.abandon() {
                     Err(ServerError::Timeout)
                 } else {
-                    Err(capacity_refusal(query_id, work.kind, StartRefusal::Expired))
+                    Err(capacity_refusal(query_id, kind, StartRefusal::Expired))
                 }
             }
         }
@@ -1882,10 +1903,12 @@ mod tests {
     const TEST_WORK: WorkContext = WorkContext {
         kind: WorkKind::Query,
         owner: WorkOwner::Key(7),
+        user: None,
     };
     const TEST_SAMPLE_WORK: WorkContext = WorkContext {
         kind: WorkKind::Sample,
         owner: WorkOwner::System,
+        user: None,
     };
 
     fn idle_len(pool: &ExecutorPool) -> usize {

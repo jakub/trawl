@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use common::{roles, setup, setup_with_rate_limit};
+use common::{roles, setup, setup_with_query_timeout, setup_with_rate_limit};
 use fleet_auth::{KeyStore, PrincipalKind};
 use trawl_client::HttpClient;
 use trawl_server::config::RateLimitConfig;
@@ -533,6 +533,164 @@ async fn queries_accessible_by_analyst_and_reader() {
     // Both analyst and reader can list running queries.
     analyst.queries().await.unwrap();
     reader.queries().await.unwrap();
+}
+
+/// A query whose request timed out keeps its permit until the work
+/// actually stops, and `GET /queries` says so (ADR-0024).
+///
+/// Three readers, one retained entry. The operator and the exact key that
+/// submitted it see the name and the DSL; a second key carrying the SAME
+/// display name sees the capacity facts and nothing else, because
+/// ownership is the keystore id and never the name. The same entry is not
+/// also listed as active: one permit, one line.
+///
+/// The retained window is manufactured, not raced for: a one-second query
+/// timeout against the pool's four-second test delay leaves ~3s in which
+/// the request has answered and the work has not stopped.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // one retained window, asserted from three readers
+async fn retained_work_is_listed_once_and_shown_only_to_its_owner_or_an_admin() {
+    let permissive = RateLimitConfig {
+        default_rpm: 1_000_000,
+        ..RateLimitConfig::default()
+    };
+    let server = setup_with_query_timeout(permissive, 1).await;
+    trawl_server::pool::TEST_QUERY_DELAY_MS.store(4_000, Ordering::Relaxed);
+
+    let store = KeyStore::from_pool(server.fleet_pool.clone());
+    let key_a = store
+        .create_key(
+            "twin",
+            PrincipalKind::Service,
+            &roles(&["trawl-analyst"]),
+            None,
+        )
+        .await
+        .unwrap();
+    let key_b = store
+        .create_key(
+            "twin",
+            PrincipalKind::Service,
+            &roles(&["trawl-analyst"]),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_ne!(key_a.info.id, key_b.info.id);
+
+    let a = HttpClient::new_insecure(&server.url, key_a.plaintext_token.as_str()).unwrap();
+    let b = HttpClient::new_insecure(&server.url, key_b.plaintext_token.as_str()).unwrap();
+    let admin = HttpClient::new_insecure(&server.url, &server.admin_token).unwrap();
+
+    let dsl = "service=nginx | stats count()";
+    let slow = {
+        let a = a.clone();
+        tokio::spawn(async move { a.query_paginated(dsl, None, None).await })
+    };
+
+    // The request answers first: a 504 for work that had started.
+    let answered = slow.await.expect("the request task joins");
+    match answered {
+        Err(trawl_client::ClientError::Server { status, .. }) => assert_eq!(status, 504),
+        other => panic!("expected the query to time out, got: {other:?}"),
+    }
+
+    let seen = admin.queries().await.unwrap();
+    let entry = seen
+        .retained
+        .iter()
+        .find(|w| w.query.as_deref() == Some(dsl))
+        .expect("the timed-out query still holds its permit");
+    let id = entry.id;
+    assert_eq!(entry.kind, "query");
+    assert!(
+        entry.started,
+        "the delay sits past the work-start transition"
+    );
+    assert_eq!(entry.user.as_deref(), Some("twin"));
+    assert!(
+        !seen.active.iter().any(|q| q.id == id),
+        "retained work is not counted again as an active request"
+    );
+    assert!(
+        seen.recent.iter().any(|q| q.id == id && q.timed_out),
+        "the same request is in recent history, where it recorded its outcome"
+    );
+
+    let by_owner = a.queries().await.unwrap();
+    let mine = by_owner
+        .retained
+        .iter()
+        .find(|w| w.id == id)
+        .expect("the owner sees its own retained work");
+    assert_eq!(mine.user.as_deref(), Some("twin"));
+    assert_eq!(mine.query.as_deref(), Some(dsl));
+
+    let by_twin = b.queries().await.unwrap();
+    let theirs = by_twin
+        .retained
+        .iter()
+        .find(|w| w.id == id)
+        .expect("every query reader sees the capacity fact");
+    assert_eq!(theirs.kind, "query");
+    assert!(theirs.started);
+    assert_eq!(
+        theirs.user, None,
+        "an equal display name is not an ownership proof"
+    );
+    assert_eq!(theirs.query, None, "nor does it earn the DSL");
+
+    // Cancellation authority follows the same record, not the tracker:
+    // the request already answered, and the key that submitted it can
+    // still ask for the work to stop while a twin cannot.
+    match b.cancel_query(id).await {
+        Err(trawl_client::ClientError::Server { status, error }) => {
+            assert_eq!(status, 403);
+            assert_eq!(error.message, "cannot cancel this query");
+        }
+        other => panic!("expected 403 for the twin key, got: {other:?}"),
+    }
+    assert!(
+        a.cancel_query(id).await.unwrap().cancelled,
+        "the submitting key can still stop work it has been told timed out"
+    );
+    assert!(
+        a.cancel_query(id).await.unwrap().cancelled,
+        "cancellation is a request, so it repeats while the work exists"
+    );
+
+    // The same one permit, in the counts: retained is a subset of held.
+    let stats = admin.stats().await.unwrap();
+    assert_eq!(stats.pool_retained, 1);
+    assert!(stats.pool_retained <= stats.pool_capacity - stats.pool_available);
+
+    // ...and in the dashboard snapshot the collector publishes.
+    let mut dashboard_saw_it = false;
+    for _ in 0..40 {
+        if admin.dashboard().await.is_ok_and(|d| d.pool_retained == 1) {
+            dashboard_saw_it = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        dashboard_saw_it,
+        "the dashboard snapshot must carry the retained permit"
+    );
+
+    // When the work finally stops, every count returns to baseline.
+    let mut reclaimed = false;
+    for _ in 0..200 {
+        let stats = admin.stats().await.unwrap();
+        if stats.pool_retained == 0 && stats.pool_available == stats.pool_capacity {
+            reclaimed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    trawl_server::pool::TEST_QUERY_DELAY_MS.store(0, Ordering::Relaxed);
+    assert!(reclaimed, "the retained permit must come back");
+    assert!(admin.queries().await.unwrap().retained.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]

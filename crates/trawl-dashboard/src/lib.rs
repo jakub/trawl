@@ -165,7 +165,22 @@ fn render_executor_pool(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, are
     let [info_row, gauge_row] = vertical![==1, ==1].areas(inner);
 
     let active = snapshot.pool_active.min(snapshot.pool_capacity);
-    let info = format!(" active: {}/{}", active, snapshot.pool_capacity);
+    // Retained permits are a subset of the active ones, so they are a
+    // suffix on the same figure rather than a second count (ADR-0024).
+    // Nothing retained is the ordinary state, and a permanent "(0
+    // retained)" would teach an operator to stop reading the line.
+    let retained = if snapshot.pool_retained == 0 {
+        String::new()
+    } else {
+        format!(" ({} retained)", snapshot.pool_retained)
+    };
+    // The suffix can outgrow the narrow layout's panel, where a raw clip
+    // would read as a broken word ("(2 retain"). Truncating says so.
+    let line = format!("active: {}/{}{retained}", active, snapshot.pool_capacity);
+    let info = format!(
+        " {}",
+        truncate_query(&line, usize::from(info_row.width).saturating_sub(1))
+    );
     frame.render_widget(Paragraph::new(info), info_row);
 
     let ratio = if snapshot.pool_capacity > 0 {
@@ -619,6 +634,7 @@ mod tests {
             healthy: true,
             pool_capacity: 4,
             pool_active: 1,
+            pool_retained: 0,
             hot_buffer_events: 12_847,
             hot_buffer_max_events: 100_000,
             hot_buffer_bytes: 4_404_019,       // ~4.2 MB
@@ -731,6 +747,63 @@ mod tests {
     #[test]
     fn render_dashboard_narrow() {
         let snapshot = test_snapshot();
+        let backend = TestBackend::new(60, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                render_dashboard(&snapshot, f, area, &DashboardOptions::default());
+            })
+            .unwrap();
+        insta::assert_snapshot!(terminal.backend().to_string());
+    }
+
+    /// Nothing retained is the ordinary state: the pool line carries no
+    /// suffix at all (ADR-0024).
+    #[test]
+    fn render_dashboard_retained_zero() {
+        let snapshot = test_snapshot();
+        assert_eq!(snapshot.pool_retained, 0);
+        let backend = TestBackend::new(80, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                render_dashboard(&snapshot, f, area, &DashboardOptions::default());
+            })
+            .unwrap();
+        let rendered = terminal.backend().to_string();
+        assert!(!rendered.contains("retained"));
+        insta::assert_snapshot!(rendered);
+    }
+
+    /// A retained permit is a suffix on the active figure, not a second
+    /// count: three permits are held, one of them by work whose request
+    /// already answered.
+    #[test]
+    fn render_dashboard_retained_nonzero() {
+        let mut snapshot = test_snapshot();
+        snapshot.pool_active = 3;
+        snapshot.pool_retained = 1;
+        let backend = TestBackend::new(80, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                render_dashboard(&snapshot, f, area, &DashboardOptions::default());
+            })
+            .unwrap();
+        let rendered = terminal.backend().to_string();
+        assert!(rendered.contains("active: 3/4 (1 retained)"));
+        insta::assert_snapshot!(rendered);
+    }
+
+    /// The suffix still has to fit the narrow layout.
+    #[test]
+    fn render_dashboard_retained_narrow() {
+        let mut snapshot = test_snapshot();
+        snapshot.pool_active = 4;
+        snapshot.pool_retained = 2;
         let backend = TestBackend::new(60, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal

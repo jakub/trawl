@@ -28,6 +28,9 @@ pub struct MonitorSnapshot {
     // -- executor pool --
     pub pool_capacity: usize,
     pub pool_active: usize,
+    /// The subset of `pool_active` held by work whose request already
+    /// answered (ADR-0024).
+    pub pool_retained: usize,
 
     // -- hot buffer --
     pub hot_buffer_events: usize,
@@ -93,6 +96,7 @@ impl MonitorSnapshot {
             healthy: self.healthy,
             pool_capacity: self.pool_capacity,
             pool_active: self.pool_active,
+            pool_retained: self.pool_retained,
             hot_buffer_events: self.hot_buffer_events,
             hot_buffer_max_events: self.hot_buffer_max_events,
             hot_buffer_bytes: self.hot_buffer_bytes,
@@ -249,6 +253,7 @@ impl MonitorState {
 
         let pool_capacity = pool.capacity();
         let pool_active = pool_capacity - pool.available_permits();
+        let pool_retained = pool.retained();
 
         // Hot buffer stats (zeros when ingest is disabled).
         let (hb_events, hb_max_events, hb_bytes, hb_max_bytes, hb_batches) =
@@ -343,6 +348,7 @@ impl MonitorState {
             healthy: self.last_healthy,
             pool_capacity,
             pool_active,
+            pool_retained,
             hot_buffer_events: hb_events,
             hot_buffer_max_events: hb_max_events,
             hot_buffer_bytes: hb_bytes,

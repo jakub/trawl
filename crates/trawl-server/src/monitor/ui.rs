@@ -32,6 +32,7 @@ mod tests {
             healthy: true,
             pool_capacity: 4,
             pool_active: 1,
+            pool_retained: 0,
             hot_buffer_events: 12_847,
             hot_buffer_max_events: 100_000,
             hot_buffer_bytes: 4_404_019,       // ~4.2 MB

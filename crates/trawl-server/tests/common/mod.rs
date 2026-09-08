@@ -1264,6 +1264,25 @@ pub async fn setup_in_dir_with_data(
     data_path: String,
     rate_limit: RateLimitConfig,
 ) -> TestServer {
+    setup_in_dir_with_data_and_timeout(dir, data_path, rate_limit, DEFAULT_TEST_TIMEOUT_SECS).await
+}
+
+/// The query timeout every fixture uses unless a test needs to reach it.
+pub const DEFAULT_TEST_TIMEOUT_SECS: u64 = 10;
+
+/// A fixture whose query timeout a test can shorten.
+///
+/// Reaching the timeout is the only way to observe a retained permit end
+/// to end: the request has to stop waiting while the work is still
+/// running (ADR-0024), and ten seconds of it per test is not a bill worth
+/// paying.
+#[allow(clippy::too_many_lines)] // linear assembly: two databases, two pools, one config
+pub async fn setup_in_dir_with_data_and_timeout(
+    dir: &std::path::Path,
+    data_path: String,
+    rate_limit: RateLimitConfig,
+    timeout_secs: u64,
+) -> TestServer {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     // Both databases are the fixture's own (ADR-0021 ruling 2): the server's
@@ -1310,7 +1329,7 @@ pub async fn setup_in_dir_with_data(
     let config = Config {
         server: ServerConfig {
             http_addr: addr.clone(),
-            timeout_secs: 10,
+            timeout_secs,
             max_concurrent_queries: 2,
             max_result_rows: 100_000,
             max_export_rows: 1_000_000,
@@ -1446,6 +1465,24 @@ async fn boot_conformance_pass(state: &trawl_server::state::AppState, config: &C
         .await
         .expect("boot conformance pass must succeed");
     }
+}
+
+/// Set up a test server whose queries time out after `timeout_secs`.
+pub async fn setup_with_query_timeout(
+    rate_limit: RateLimitConfig,
+    timeout_secs: u64,
+) -> TestServer {
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+    let server = setup_in_dir_with_data_and_timeout(
+        tmp.path(),
+        seed_data_root(tmp.path()),
+        rate_limit,
+        timeout_secs,
+    )
+    .await;
+    // Leak the tempdir so it survives the test (cleaned up by OS).
+    std::mem::forget(tmp);
+    server
 }
 
 /// Set up a test server with fixtures and return a `TestServer` handle.
