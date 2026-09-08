@@ -1,26 +1,27 @@
 === 18-facet-actions-display-none.patch -> facets.spec.ts ===
 -- trunk build --
-2026-09-07T23:32:22.119883Z  INFO 🚀 Starting trunk 0.21.14
-2026-09-07T23:32:22.120022Z  INFO 📦 starting build
+2026-09-08T00:16:03.137882Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-08T00:16:03.137997Z  INFO 📦 starting build
    Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-core)
    Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.13s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.98s
 warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
 note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
-2026-09-07T23:32:30.017859Z  INFO applying new distribution
-2026-09-07T23:32:30.020421Z  INFO ✅ success
+2026-09-08T00:16:11.038445Z  INFO applying new distribution
+2026-09-08T00:16:11.040857Z  INFO ✅ success
 -- playwright test tests/facets.spec.ts --
 npm notice run trawl-web-ui-e2e@0.0.0 npx
 npm notice run 'playwright' test tests/facets.spec.ts
 [WebServer] e2e stub server listening on http://127.0.0.1:8123 (dist: /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/dist)
 
-Running 5 tests using 1 worker
+Running 6 tests using 1 worker
 
-  ✘  1 [chromium] › tests/facets.spec.ts:49:5 › include is reachable by Tab and adds one filter (5.6s)
+  ✘  1 [chromium] › tests/facets.spec.ts:49:5 › include is reachable by Tab and adds one filter (5.5s)
   ✘  2 [chromium] › tests/facets.spec.ts:83:5 › exclude on Space adds one filter (5.6s)
-  ✓  3 [chromium] › tests/facets.spec.ts:107:5 › group header toggles aria-expanded (621ms)
+  ✓  3 [chromium] › tests/facets.spec.ts:107:5 › group header toggles aria-expanded (632ms)
   ✘  4 [chromium] › tests/facets.spec.ts:136:5 › show more reveals the hidden values (5.5s)
   ✘  5 [chromium] › tests/facets.spec.ts:164:5 › long value keeps clear of the actions (5.6s)
+  ✘  6 [chromium] › tests/facets.spec.ts:202:5 › clear all removes every filter (20.1s)
 
 
   1) [chromium] › tests/facets.spec.ts:49:5 › include is reachable by Tab and adds one filter ──────
@@ -149,7 +150,7 @@ Running 5 tests using 1 worker
     Call log:
       - Expect "toBeFocused" with timeout 5000ms
       - waiting for locator('.facets .g').filter({ has: getByRole('button', { name: 'host, 6 values' }) }).locator('.vals .v').first().locator('.act button.op').first()
-        14 × locator resolved to <button class="op" type="button" aria-label="Include host = web-01">…</button>
+        14 × locator resolved to <button class="op" type="button" title="Include" aria-label="Include host = web-01">…</button>
            - unexpected value "inactive"
 
 
@@ -176,12 +177,46 @@ Running 5 tests using 1 worker
 
     ────────────────────────────────────────────────────────────────────────────────────────────────
 
-  4 failed
+  5) [chromium] › tests/facets.spec.ts:202:5 › clear all removes every filter ──────────────────────
+
+    Test timeout of 20000ms exceeded.
+
+    Error: locator.click: Test timeout of 20000ms exceeded.
+    Call log:
+      - waiting for locator('.facets .g').filter({ has: getByRole('button', { name: 'host, 6 values' }) }).getByRole('button', { name: 'Include host = web-01' })
+
+
+      209 |     await hostGroup(page)
+      210 |       .getByRole('button', { name: nameFrom(COPY.facetIncludeName, FIELD, value) })
+    > 211 |       .click();
+          |        ^
+      212 |   };
+      213 |   await addInclude(CORPUS.hosts[0]);
+      214 |   await expect(page.locator(SEL.filterChip)).toHaveCount(1);
+        at addInclude (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/e2e/tests/facets.spec.ts:211:8)
+        at /home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui/e2e/tests/facets.spec.ts:213:9
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/facets-clear-all-removes-every-filter-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/facets-clear-all-removes-every-filter-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/facets-clear-all-removes-every-filter-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/facets-clear-all-removes-every-filter-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  5 failed
     [chromium] › tests/facets.spec.ts:49:5 › include is reachable by Tab and adds one filter ───────
     [chromium] › tests/facets.spec.ts:83:5 › exclude on Space adds one filter ──────────────────────
     [chromium] › tests/facets.spec.ts:136:5 › show more reveals the hidden values ──────────────────
     [chromium] › tests/facets.spec.ts:164:5 › long value keeps clear of the actions ────────────────
-  1 passed (24.3s)
+    [chromium] › tests/facets.spec.ts:202:5 › clear all removes every filter ───────────────────────
+  1 passed (44.6s)
 -- control: playwright test tests/routing.spec.ts (must pass) --
 npm notice run trawl-web-ui-e2e@0.0.0 npx
 npm notice run 'playwright' test tests/routing.spec.ts
@@ -189,21 +224,21 @@ npm notice run 'playwright' test tests/routing.spec.ts
 
 Running 3 tests using 1 worker
 
-  ✓  1 [chromium] › tests/routing.spec.ts:8:5 › / redirects to /search and mounts the DSL editor (793ms)
-  ✓  2 [chromium] › tests/routing.spec.ts:14:5 › rail link to history navigates without a full page load (497ms)
-  ✓  3 [chromium] › tests/routing.spec.ts:31:5 › an unknown route renders the 404 page (354ms)
+  ✓  1 [chromium] › tests/routing.spec.ts:8:5 › / redirects to /search and mounts the DSL editor (728ms)
+  ✓  2 [chromium] › tests/routing.spec.ts:14:5 › rail link to history navigates without a full page load (479ms)
+  ✓  3 [chromium] › tests/routing.spec.ts:31:5 › an unknown route renders the 404 page (323ms)
 
-  3 passed (2.1s)
+  3 passed (2.0s)
 -- trunk build (restore pristine dist) --
-2026-09-07T23:32:57.723676Z  INFO 🚀 Starting trunk 0.21.14
-2026-09-07T23:32:57.723786Z  INFO 📦 starting build
+2026-09-08T00:16:58.826046Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-08T00:16:58.826167Z  INFO 📦 starting build
    Compiling trawl-core v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-core)
    Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl-issue-161-trawl-web-ui-native-controls-stretched/crates/trawl-web-ui)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.06s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.96s
 warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
 note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
-2026-09-07T23:33:05.474985Z  INFO applying new distribution
-2026-09-07T23:33:05.477283Z  INFO ✅ success
+2026-09-08T00:17:06.105039Z  INFO applying new distribution
+2026-09-08T00:17:06.108788Z  INFO ✅ success
 
 mutation-check results:
 patch                                outcome
