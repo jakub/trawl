@@ -198,3 +198,50 @@ test('long value keeps clear of the actions', async ({ page, request }) => {
   // floor. Transparent would let the value read through the glyphs.
   expect(geometry.actBackground).not.toBe('rgba(0, 0, 0, 0)');
 });
+
+test('clear all removes every filter', async ({ page, request }) => {
+  await openCorpusSearch(page, request);
+
+  // The two filters are made through the include control the tests
+  // above prove, not by hand-writing the URL's base64 payload: a seed
+  // written by hand would pass this test with the control broken.
+  const addInclude = async (value: string) => {
+    await hostGroup(page)
+      .getByRole('button', { name: nameFrom(COPY.facetIncludeName, FIELD, value) })
+      .click();
+  };
+  await addInclude(CORPUS.hosts[0]);
+  await expect(page.locator(SEL.filterChip)).toHaveCount(1);
+  await addInclude(CORPUS.hosts[1]);
+  await expect(page.locator(SEL.filterChip)).toHaveCount(2);
+
+  const clear = page.locator(SEL.facetClear);
+  await expect(clear).toHaveJSProperty('tagName', 'BUTTON');
+  await expect(clear).toHaveAttribute('type', 'button');
+  // Reached BACKWARDS from the rail's filter box. The control is the
+  // first focusable in the rail, so its predecessor is page chrome; the
+  // filter box is the neighbour that names something.
+  await page.locator(SEL.facetFilterInput).focus();
+  await page.keyboard.press('Shift+Tab');
+  await expectFocusRing(clear);
+
+  await page.keyboard.press('Enter');
+  // Both chips, and the link they were carried in.
+  await expect(page.locator(SEL.filterChip)).toHaveCount(0);
+  await expect(page).not.toHaveURL(/[?&]f=/);
+  // Nothing left to clear, so the control goes with the filters rather
+  // than sitting there doing nothing.
+  await expect(clear).toHaveCount(0);
+
+  // Space on a fresh seed. A button answers to both keys; the div this
+  // replaced answered to neither.
+  await addInclude(CORPUS.hosts[0]);
+  await expect(page.locator(SEL.filterChip)).toHaveCount(1);
+  await page.locator(SEL.facetFilterInput).focus();
+  await page.keyboard.press('Shift+Tab');
+  await expectFocusRing(page.locator(SEL.facetClear));
+
+  await page.keyboard.press(' ');
+  await expect(page.locator(SEL.filterChip)).toHaveCount(0);
+  await expect(page).not.toHaveURL(/[?&]f=/);
+});
