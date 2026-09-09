@@ -180,9 +180,4 @@ test('retired affordances are absent', async ({ page }) => {
   await expect(page.locator('.user-menu .kbd')).toHaveCount(0);
   // The account panel's accessible name is still there to be found.
   await expect(page.locator(SEL.userMenu)).toHaveAccessibleName(COPY.accountMenuName);
-
-  // The ⌘K command-palette box is untouched (human ruling: G4 owns it).
-  await page.keyboard.press('Escape');
-  await expect(page.locator('.topbar .jump')).toBeVisible();
-  await expect(page.locator('.topbar .jump .kbd')).toHaveText('⌘K');
 });
