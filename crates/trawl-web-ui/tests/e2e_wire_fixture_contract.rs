@@ -617,3 +617,24 @@ fn history_export_clear_fixtures_match_wire_types_and_test_cases() {
     );
     assert_eq!(error.error.code, trawl_api::ErrorCode::ServiceUnavailable);
 }
+
+#[test]
+fn pagination_run_fixtures_have_three_matching_rows() {
+    let global: trawl_api::ListAllRunsResponse = decode(
+        "pagination-runs-all.json",
+        include_str!("../e2e/harness/wire/pagination-runs-all.json"),
+    );
+    let drawer: trawl_api::ListReportRunsResponse = decode(
+        "pagination-net-runs.json",
+        include_str!("../e2e/harness/wire/pagination-net-runs.json"),
+    );
+    assert_eq!(global.total, 3);
+    assert_eq!(drawer.total, 3);
+    assert_eq!(global.runs.len(), 3);
+    assert_eq!(drawer.runs.len(), 3);
+    for (global, drawer) in global.runs.iter().zip(&drawer.runs) {
+        assert_eq!(global.net_id, 1);
+        assert_eq!(global.net_name, "errors by host");
+        assert_eq!(global.run.id, drawer.id);
+    }
+}

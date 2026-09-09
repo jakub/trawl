@@ -18,7 +18,7 @@
 // press lands. That works because the trigger is a button now; as a div
 // the captured opener would have been the editor or the body.
 
-import { test, expect } from '../fixtures';
+import { test, expect, capturedQueryCount, lastCapturedQuery } from '../fixtures';
 import { SEL, COPY } from '../selectors';
 import { expectFocusRing } from '../a11y';
 
@@ -159,4 +159,36 @@ test('From and To are labelled', async ({ page }) => {
   expect(pairs[1].controlClass).toBe('dr-to');
   await expect(from).toHaveAccessibleName(pairs[0].text ?? '');
   await expect(to).toHaveAccessibleName(pairs[1].text ?? '');
+});
+
+test('navigator refusal keeps the valid range draft and error in the dialog', async ({ page, request }) => {
+  test.setTimeout(35_000);
+  // Legal current link, close enough to MAX_SEARCH_BYTES that absolute
+  // bounds make the next link too long. ASCII avoids encoding ambiguity.
+  const query = 'a'.repeat(32 * 1024 - 40);
+  await page.goto(`/search?q=${query}&page=0`);
+  await lastCapturedQuery(request, 1);
+  await expect(page.locator(SEL.dateRangeTrigger)).toBeEnabled();
+  const originalUrl = page.url();
+  await page.locator(SEL.dateRangeTrigger).click();
+  await page.locator(SEL.absoluteTab).click();
+  const from = '2026-01-01T00:00:00Z';
+  const to = '2026-01-02T00:00:00Z';
+  await page.locator(SEL.dateRangeFrom).fill(from);
+  await page.locator(SEL.dateRangeTo).fill(to);
+  await page.locator(SEL.dateRangeApply).click();
+
+  // The current app reports refusal in a toast; the promoted control
+  // reports it inline. Either proves this reached the navigator gate.
+  await expect(page.getByText("Can't open this search: link too long", { exact: true })).toBeVisible();
+  expect(page.url()).toBe(originalUrl);
+  expect(await capturedQueryCount(request)).toBe(1);
+
+  // Soft assertions expose every lost-draft symptom in the red run.
+  await expect.soft(page.locator(SEL.rangeDialog)).toBeVisible();
+  await expect.soft(page.locator(SEL.dateRangeFrom)).toHaveValue(from);
+  await expect.soft(page.locator(SEL.dateRangeTo)).toHaveValue(to);
+  await expect.soft(page.locator('.dr-err')).toContainText("Can't open this search: link too long");
+  expect(page.url()).toBe(originalUrl);
+  expect(await capturedQueryCount(request)).toBe(1);
 });

@@ -134,7 +134,7 @@ function serveDashboard(res) {
  * drift apart on a body they share. The services route is the one
  * exception and says so where it splits. */
 function hasCorpus() {
-  return scenario === 'populated' || scenario === 'corpus';
+  return scenario === 'populated' || scenario === 'corpus' || scenario === 'pagination';
 }
 
 const sse = {
@@ -695,18 +695,20 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       return;
     }
 
-    // -- report runs (`corpus` only) ------------------------------------
+    // -- report runs (`corpus` and `pagination`) ------------------------------------
     // Gated on the scenario rather than answered everywhere: under every
     // other scenario these paths fall through to the `unstubbed`
     // catch-all, and the auto fixture's empty-`unstubbed` assertion is
     // what tells a spec author they reached a surface they did not
     // fixture. The run result is answered for ANY run id — expanding a
     // row is the behaviour under test, not id routing.
+    // Pagination uses a separate three-row page so the two-row corpus
+    // and its existing assertions remain stable.
     const netRuns = p.match(/^\/api\/v1\/saved\/\d+\/runs$/);
     const netRun = p.match(/^\/api\/v1\/saved\/\d+\/runs\/\d+$/);
-    if (scenario === 'corpus' && req.method === 'GET') {
+    if ((scenario === 'corpus' || scenario === 'pagination') && req.method === 'GET') {
       if (netRuns) {
-        sendJson(res, 200, corpusNetRunsResponse());
+        sendJson(res, 200, scenario === 'pagination' ? wire('pagination-net-runs') : corpusNetRunsResponse());
         return;
       }
       if (netRun) {
@@ -714,7 +716,7 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
         return;
       }
       if (p === '/api/v1/runs') {
-        sendJson(res, 200, corpusAllRunsResponse());
+        sendJson(res, 200, scenario === 'pagination' ? wire('pagination-runs-all') : corpusAllRunsResponse());
         return;
       }
       if (p === '/api/v1/runs/stats') {
