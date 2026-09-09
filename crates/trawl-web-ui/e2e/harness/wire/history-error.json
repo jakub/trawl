@@ -1,0 +1,6 @@
+{
+  "error": {
+    "code": "service_unavailable",
+    "message": "app-state store unavailable"
+  }
+}

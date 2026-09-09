@@ -575,3 +575,45 @@ fn health_page_fixtures_decode_and_exercise_permissions_and_failures() {
         }
     }
 }
+
+#[test]
+fn history_export_clear_fixtures_match_wire_types_and_test_cases() {
+    let rows: trawl_api::HistoryResponse = decode(
+        "history-export.json",
+        include_str!("../e2e/harness/wire/history-export.json"),
+    );
+    assert_eq!(rows.total, 103);
+    assert_eq!(
+        rows.entries.iter().map(|r| r.id).collect::<Vec<_>>(),
+        [103, 102, 101]
+    );
+    assert_eq!(rows.entries[0].query, "=cmd(prod)");
+    assert_eq!(rows.entries[1].query, "service=dev");
+    assert_eq!(rows.entries[2].query, "prod \"雪,one\"\r\nnext");
+    assert!(
+        rows.entries
+            .windows(2)
+            .all(|pair| pair[0].executed_at > pair[1].executed_at)
+    );
+    let cleared: trawl_api::HistoryResponse = decode(
+        "history-cleared.json",
+        include_str!("../e2e/harness/wire/history-cleared.json"),
+    );
+    assert_eq!(cleared.total, 0);
+    assert!(cleared.entries.is_empty());
+    let success: trawl_api::ClearHistoryResponse = decode(
+        "history-clear-success.json",
+        include_str!("../e2e/harness/wire/history-clear-success.json"),
+    );
+    let repeat: trawl_api::ClearHistoryResponse = decode(
+        "history-clear-repeat.json",
+        include_str!("../e2e/harness/wire/history-clear-repeat.json"),
+    );
+    assert_eq!(success.deleted, 103);
+    assert_eq!(repeat.deleted, 0);
+    let error: trawl_api::ErrorResponse = decode(
+        "history-error.json",
+        include_str!("../e2e/harness/wire/history-error.json"),
+    );
+    assert_eq!(error.error.code, trawl_api::ErrorCode::ServiceUnavailable);
+}

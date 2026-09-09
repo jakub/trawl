@@ -75,6 +75,72 @@ const HEALTH_RS: &str = include_str!("../src/pages/health.rs");
 
 const CONTRACTS: &[Contract] = &[
     Contract {
+        assignment: "historyAwayLink: 'nav.rail a[title=\"Schema\"]',",
+        source_path: "src/state/section.rs",
+        source: SECTION_RS,
+        hook: "label: \"Schema\"",
+    },
+    Contract {
+        assignment: "historyPage: '.history-page',",
+        source_path: "src/pages/history.rs",
+        source: HISTORY_RS,
+        hook: "class=\"page history-page\"",
+    },
+    Contract {
+        assignment: "historyFormat: 'select[aria-label=\"History export format\"]',",
+        source_path: "src/pages/history.rs",
+        source: HISTORY_RS,
+        hook: "aria-label=\"History export format\"",
+    },
+    Contract {
+        assignment: "historyFilter: 'input[placeholder=\"Filter history…\"]',",
+        source_path: "src/pages/history.rs",
+        source: HISTORY_RS,
+        hook: "placeholder=\"Filter history…\"",
+    },
+    Contract {
+        assignment: "historyExport: 'Export this page',",
+        source_path: "src/pages/history.rs",
+        source: HISTORY_RS,
+        hook: "Export this page",
+    },
+    Contract {
+        assignment: "historyClear: 'Clear history',",
+        source_path: "src/pages/history.rs",
+        source: HISTORY_RS,
+        hook: "Clear history",
+    },
+    Contract {
+        assignment: "historyClearConfirm: 'Clear all history',",
+        source_path: "src/pages/history.rs",
+        source: HISTORY_RS,
+        hook: "Clear all history",
+    },
+    Contract {
+        assignment: "historyClearFailed: 'Clear failed',",
+        source_path: "src/pages/history.rs",
+        source: HISTORY_RS,
+        hook: "Clear failed",
+    },
+    Contract {
+        assignment: "historyClearDone: 'History cleared',",
+        source_path: "src/pages/history.rs",
+        source: HISTORY_RS,
+        hook: "History cleared",
+    },
+    Contract {
+        assignment: "historyNext: 'Next →',",
+        source_path: "../fleet-ui/src/pager.rs",
+        source: include_str!("../../fleet-ui/src/pager.rs"),
+        hook: "Next →",
+    },
+    Contract {
+        assignment: "historyCancel: 'Cancel',",
+        source_path: "../fleet-ui/src/modal/confirm.rs",
+        source: include_str!("../../fleet-ui/src/modal/confirm.rs"),
+        hook: "Cancel",
+    },
+    Contract {
         assignment: "healthQueryScroll: '.health-query-scroll',",
         source_path: "src/pages/health.rs",
         source: HEALTH_RS,
