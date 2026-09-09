@@ -237,3 +237,18 @@ test('same-page query reload disables pagination while retained rows remain visi
   const state = await (await request.get('/__ctl/state')).json();
   expect(state.queries.map((q: { offset: number }) => q.offset)).toEqual([0, 0]);
 });
+
+for (const surface of ['global', 'drawer'] as const) {
+  test(`${surface} empty runs keep onboarding guidance and a disabled pager`, async ({ page, request }) => {
+    await configure(request, { runsTotal: 0 });
+    await page.goto(surface === 'global' ? '/jobs/runs' : '/jobs/nets?net=1&ntab=runs');
+    const scope = surface === 'global' ? page.locator('main') : page.locator(SEL.drawerPanel);
+    const guidance = surface === 'global'
+      ? 'No runs yet — attach a schedule to a net to get started'
+      : 'No runs yet — attach a schedule to start.';
+    await expect(scope.getByText(guidance, { exact: true })).toBeVisible();
+    await expect(scope.locator('.results-footer')).toBeVisible();
+    await expect(scope.getByRole('button', { name: 'Prev' })).toBeDisabled();
+    await expect(scope.getByRole('button', { name: 'Next' })).toBeDisabled();
+  });
+}

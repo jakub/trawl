@@ -629,7 +629,9 @@ fn RunsPane(net_id: i64, bus: ToastBus, on_search: Callback<String>) -> impl Int
                                     {rows}
                                 </div>
                                 {if returned == 0 { Some(view! {
-                                    <div class="tbl-empty">"No runs on this page"</div>
+                                    <div class="tbl-empty">{if total == 0 && fetched_page == 0 {
+                                            "No runs yet — attach a schedule to start."
+                                        } else { "No runs on this page" }}</div>
                                 }) } else { None }}
                                 <OffsetPager
                                     window=window

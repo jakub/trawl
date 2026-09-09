@@ -152,7 +152,9 @@ pub fn RunsPage() -> impl IntoView {
                                 view! {
                                     {rows}
                                     {if returned == 0 { Some(view! {
-                                        <div class="tbl-empty">"No runs on this page"</div>
+                                        <div class="tbl-empty">{if total == 0 && fetched_page == 0 {
+                                            "No runs yet — attach a schedule to a net to get started"
+                                        } else { "No runs on this page" }}</div>
                                     }) } else { None }}
                                     <OffsetPager
                                         window=window
