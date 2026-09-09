@@ -15,11 +15,11 @@ commit on the branch, so re-run them if a later commit touches code.
 - Three SPA round trips `/login → / → /login` (leptos-router popstate,
   no reloads): canvas count 1 → 0 → 1 on every trip — `on_cleanup`
   disposes the mount, nothing accumulates.
-- `console-roundtrips.log` — full transcript for the session: 0 errors.
-  The warnings are trunk-dev's preload-integrity notice, the EXPECTED
-  `CONTEXT_LOST_WEBGL` from `dispose()` releasing the context on route
-  exit, and NVIDIA driver perf chatter (ReadPixels stalls from the
-  screenshot captures).
+- The original console transcript was not committed. Current automated
+  console and cleanup evidence is in
+  [atmosphere-fallback.spec.ts](../../crates/trawl-web-ui/e2e/tests/atmosphere-fallback.spec.ts).
+  It checks no-WebGL, compilation, linking, late construction failure and real
+  context loss, including terminal animation shutdown and SPA disposal.
 
 ## AC-4 — theme flip re-colors the SAME canvas, no remount
 
@@ -77,7 +77,8 @@ commit on the branch, so re-run them if a later commit touches code.
   what keeps it out of a non-mounting consumer: trawl-web-ui's release
   dist contains **no** `paper-shaders.js` and **no** modulepreload for
   it (grep = 0), while the workbench dist carries all 144,920 bytes and
-  imports them on line 1. CI asserts both directions.
+  imports them on line 1. This describes the original capture. Current CI requires one snippet in both
+  consumers because trawl-web-ui now opts into Atmosphere on `/login`.
 
 ## .login-shell zero-delta check (trawl-web-ui)
 
@@ -85,4 +86,6 @@ commit on the branch, so re-run them if a later commit touches code.
   real `/login` after the `.login-shell` background removal:
   `.login-shell` computes `rgba(0,0,0,0)` and body's `var(--bg)` paints
   the viewport in both themes — visually identical to before the
-  change (no backdrop is mounted there in this slice).
+  change in the original capture. The current trawl-web-ui `/login` mounts
+  Atmosphere, as required by ADR-0012's first amendment. The images here
+  remain historical evidence; the browser spec above tests the current mount.

@@ -8,7 +8,7 @@
 # consumers. CI re-runs this script and diffs the output to catch
 # drift. Same house pattern as crates/trawl-web-ui/vendor/build.sh.
 #
-# Prerequisites: node 20+ (project uses 25.x locally) and npm.
+# Prerequisites: node 20+ and npm. CI verifies the bundle on node 22.
 
 set -euo pipefail
 
@@ -28,15 +28,7 @@ echo "[vendor] bundling paper-shaders.js"
 # survives minification. The version is read from the package.json pin
 # so the banner can never drift from it (asserted by
 # tests/atmosphere_vendor_contract.rs).
-SHADERS_VERSION="$(node -p "require('./package.json').dependencies['@paper-design/shaders']")"
-npx esbuild src/paper-shaders.ts \
-  --bundle \
-  --format=esm \
-  --minify \
-  --target=es2022 \
-  --banner:js="/*! @paper-design/shaders v${SHADERS_VERSION} | Apache-2.0 | see crates/fleet-ui/vendor/NOTICE */" \
-  --outfile=paper-shaders.js \
-  --log-level=warning
+node build.mjs
 
 echo "[vendor] ✓ bundle built:"
 ls -lh paper-shaders.js

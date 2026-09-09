@@ -78,6 +78,20 @@ const INTEROP: &str = include_str!("../src/atmosphere/interop.rs");
 const WRAPPER_TS: &str = include_str!("../vendor/src/paper-shaders.ts");
 
 #[test]
+fn atmosphere_vendor_contract_dispose_removes_the_parent_style_marker() {
+    // The upstream JS property and the DOM attribute are separate markers.
+    // Removing only paperShaderMount leaves the shared stylesheet active.
+    let dispose = WRAPPER_TS
+        .split_once("    dispose(): void {")
+        .expect("the wrapper must expose dispose")
+        .1;
+    assert!(
+        dispose.contains(r#"parent.removeAttribute("data-paper-shader")"#),
+        "wrapper disposal must remove data-paper-shader from its parent"
+    );
+}
+
+#[test]
 fn bundle_is_a_self_contained_esm_module() {
     // wasm-bindgen `module = "…"` loads the file as one browser ES
     // module with no resolver: a relative import or a CommonJS

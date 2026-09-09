@@ -142,8 +142,8 @@ function colorUniforms(colors: string[] | undefined): ShaderMountUniforms {
 
 /**
  * Mount a shader into `parent` and return a live handle, or `null` when
- * WebGL2 is unavailable (ShaderMount's constructor throws) — callers
- * treat null as "keep the CSS fallback" and never retry.
+ * construction fails. Callers treat null as "keep the CSS fallback"
+ * and never retry.
  */
 export function createShader(
   parent: HTMLElement,
@@ -157,6 +157,19 @@ export function createShader(
   };
 
   let mount: ShaderMount;
+  const reportError = console.error;
+  // Upstream reports these two expected failures before returning a null
+  // program. Suppress only those diagnostics during synchronous construction.
+  console.error = (...args: unknown[]): void => {
+    if (
+      typeof args[0] === "string" &&
+      (args[0].startsWith("An error occurred compiling the shaders: ") ||
+        args[0].startsWith("Unable to initialize the shader program: "))
+    ) {
+      return;
+    }
+    reportError.apply(console, args);
+  };
   try {
     mount = new ShaderMount(
       parent,
@@ -172,44 +185,53 @@ export function createShader(
       2_000_000
     );
   } catch {
-    // ShaderMount prepends its canvas BEFORE probing for WebGL2, so a
-    // throw can strand an inert canvas in the DOM — remove it, keep
-    // the CSS floor, stay silent (degradation is by design, AC: no
-    // user-visible error).
-    const stray = parent.firstElementChild;
-    if (stray instanceof HTMLCanvasElement) {
-      stray.remove();
-    }
+    // build.mjs makes the constructor dispose its partial instance before
+    // rethrowing. No handle escapes, and the caller keeps the CSS floor.
     return null;
+  } finally {
+    console.error = reportError;
   }
 
-  // The package has no context-loss handling: a lost context freezes
-  // the last frame instead of failing over. Hide the canvas so the
-  // theme-reactive CSS var(--bg) floor shows through.
+  let state: "live" | "dead" | "disposed" = "live";
+  // Loss is permanent. Mark the handle dead before stopping animation so
+  // later theme or reduced-motion effects cannot restart the mount.
   const onContextLost = (): void => {
-    mount.canvasElement.style.display = "none";
+    if (state !== "live") return;
+    state = "dead";
+    try {
+      mount.setSpeed(0);
+    } finally {
+      mount.canvasElement.style.display = "none";
+    }
   };
   mount.canvasElement.addEventListener("webglcontextlost", onContextLost);
 
   return {
     setUniforms(update: UniformUpdate): void {
+      if (state !== "live") return;
       mount.setUniforms({
         ...colorUniforms(update.colors),
         ...update.uniforms,
       });
     },
     setSpeed(speed: number): void {
+      if (state !== "live") return;
       mount.setSpeed(speed);
     },
     dispose(): void {
+      if (state === "disposed") return;
+      state = "disposed";
       mount.canvasElement.removeEventListener(
         "webglcontextlost",
         onContextLost
       );
-      // ShaderMount.dispose() removes the canvas and deletes the
-      // parent's paperShaderMount marker itself, so a remount into the
-      // same element is clean.
-      mount.dispose();
+      // Upstream removes the canvas and its JS property. The DOM attribute
+      // also enables its shared stylesheet, so remove that marker ourselves.
+      try {
+        mount.dispose();
+      } finally {
+        parent.removeAttribute("data-paper-shader");
+      }
     },
   };
 }

@@ -149,7 +149,7 @@ void main() {
 
   v_imageUV += .5;
   v_imageUV.y = 1. - v_imageUV.y;
-}`;var _e=1920*1080*4,C=class{parentElement;canvasElement;gl;program=null;uniformLocations={};fragmentShader;rafId=null;lastRenderTime=0;currentFrame=0;speed=0;currentSpeed=0;providedUniforms;mipmaps=[];hasBeenDisposed=!1;resolutionChanged=!0;textures=new Map;minPixelRatio;maxPixelCount;isSafari=Ve();uniformCache={};textureUnitMap=new Map;ownerDocument;constructor(e,t,a,n,r=0,s=0,l=2,d=_e,v=[]){if(e?.nodeType===1)this.parentElement=e;else throw new Error("Paper Shaders: parent element must be an HTMLElement");if(this.ownerDocument=e.ownerDocument,!this.ownerDocument.querySelector("style[data-paper-shader]")){let _=this.ownerDocument.createElement("style");_.innerHTML=Ue,_.setAttribute("data-paper-shader",""),this.ownerDocument.head.prepend(_)}let f=this.ownerDocument.createElement("canvas");this.canvasElement=f,this.parentElement.prepend(f),this.fragmentShader=t,this.providedUniforms=a,this.mipmaps=v,this.currentFrame=s,this.minPixelRatio=l,this.maxPixelCount=d;let x=f.getContext("webgl2",n);if(!x)throw new Error("Paper Shaders: WebGL is not supported in this browser");this.gl=x,this.initProgram(),this.setupPositionAttribute(),this.setupUniforms(),this.setUniformValues(this.providedUniforms),this.setupResizeObserver(),visualViewport?.addEventListener("resize",this.handleVisualViewportChange),this.setupIntersectionObserver(),this.setSpeed(r),this.parentElement.setAttribute("data-paper-shader",""),this.parentElement.paperShaderMount=this,this.ownerDocument.addEventListener("visibilitychange",this.handleDocumentVisibilityChange)}initProgram=()=>{let e=Ce(this.gl,xe,this.fragmentShader);e&&(this.program=e)};setupPositionAttribute=()=>{let e=this.gl.getAttribLocation(this.program,"a_position"),t=this.gl.createBuffer();this.gl.bindBuffer(this.gl.ARRAY_BUFFER,t);let a=[-1,-1,1,-1,-1,1,-1,1,1,-1,1,1];this.gl.bufferData(this.gl.ARRAY_BUFFER,new Float32Array(a),this.gl.STATIC_DRAW),this.gl.enableVertexAttribArray(e),this.gl.vertexAttribPointer(e,2,this.gl.FLOAT,!1,0,0)};setupUniforms=()=>{let e={u_time:this.gl.getUniformLocation(this.program,"u_time"),u_pixelRatio:this.gl.getUniformLocation(this.program,"u_pixelRatio"),u_resolution:this.gl.getUniformLocation(this.program,"u_resolution")};Object.entries(this.providedUniforms).forEach(([t,a])=>{if(e[t]=this.gl.getUniformLocation(this.program,t),a instanceof HTMLImageElement){let n=`${t}AspectRatio`;e[n]=this.gl.getUniformLocation(this.program,n)}}),this.uniformLocations=e};renderScale=1;parentWidth=0;parentHeight=0;parentDevicePixelWidth=0;parentDevicePixelHeight=0;devicePixelsSupported=!1;intersectionObserver=null;isInViewport=!0;resizeObserver=null;setupResizeObserver=()=>{this.resizeObserver=new ResizeObserver(([e])=>{if(e?.borderBoxSize[0]){let t=e.devicePixelContentBoxSize?.[0];t!==void 0&&(this.devicePixelsSupported=!0,this.parentDevicePixelWidth=t.inlineSize,this.parentDevicePixelHeight=t.blockSize),this.parentWidth=e.borderBoxSize[0].inlineSize,this.parentHeight=e.borderBoxSize[0].blockSize}this.handleResize()}),this.resizeObserver.observe(this.parentElement)};setupIntersectionObserver=()=>{let e=this.ownerDocument.defaultView;e?.IntersectionObserver&&(this.intersectionObserver=new e.IntersectionObserver(([t])=>{this.isInViewport=t?.isIntersecting??!0,this.updateCurrentSpeed()}),this.intersectionObserver.observe(this.parentElement))};handleVisualViewportChange=()=>{this.resizeObserver?.disconnect(),this.setupResizeObserver()};handleResize=()=>{let e=0,t=0,a=Math.max(1,window.devicePixelRatio),n=visualViewport?.scale??1;if(this.devicePixelsSupported){let f=Math.max(1,this.minPixelRatio/a);e=this.parentDevicePixelWidth*f*n,t=this.parentDevicePixelHeight*f*n}else{let f=Math.max(a,this.minPixelRatio)*n;if(this.isSafari){let x=Be(this.ownerDocument);f*=Math.max(1,x)}e=Math.round(this.parentWidth)*f,t=Math.round(this.parentHeight)*f}let r=Math.sqrt(this.maxPixelCount)/Math.sqrt(e*t),s=Math.min(1,r),l=Math.round(e*s),d=Math.round(t*s),v=l/Math.round(this.parentWidth);(this.canvasElement.width!==l||this.canvasElement.height!==d||this.renderScale!==v)&&(this.renderScale=v,this.canvasElement.width=l,this.canvasElement.height=d,this.resolutionChanged=!0,this.gl.viewport(0,0,this.gl.canvas.width,this.gl.canvas.height),this.render(performance.now()))};render=e=>{if(this.hasBeenDisposed)return;if(this.program===null){console.warn("Tried to render before program or gl was initialized");return}let t=e-this.lastRenderTime;this.lastRenderTime=e,this.currentSpeed!==0&&(this.currentFrame+=t*this.currentSpeed),this.gl.clear(this.gl.COLOR_BUFFER_BIT),this.gl.useProgram(this.program),this.gl.uniform1f(this.uniformLocations.u_time,this.currentFrame*.001),this.resolutionChanged&&(this.gl.uniform2f(this.uniformLocations.u_resolution,this.gl.canvas.width,this.gl.canvas.height),this.gl.uniform1f(this.uniformLocations.u_pixelRatio,this.renderScale),this.resolutionChanged=!1),this.gl.drawArrays(this.gl.TRIANGLES,0,6),this.currentSpeed!==0?this.requestRender():this.rafId=null};requestRender=()=>{this.rafId!==null&&cancelAnimationFrame(this.rafId),this.rafId=requestAnimationFrame(this.render)};setTextureUniform=(e,t)=>{if(!t.complete||t.naturalWidth===0)throw new Error(`Paper Shaders: image for uniform ${e} must be fully loaded`);let a=this.textures.get(e);a&&this.gl.deleteTexture(a),this.textureUnitMap.has(e)||this.textureUnitMap.set(e,this.textureUnitMap.size);let n=this.textureUnitMap.get(e);this.gl.activeTexture(this.gl.TEXTURE0+n);let r=this.gl.createTexture();this.gl.bindTexture(this.gl.TEXTURE_2D,r),this.gl.texParameteri(this.gl.TEXTURE_2D,this.gl.TEXTURE_WRAP_S,this.gl.CLAMP_TO_EDGE),this.gl.texParameteri(this.gl.TEXTURE_2D,this.gl.TEXTURE_WRAP_T,this.gl.CLAMP_TO_EDGE),this.gl.texParameteri(this.gl.TEXTURE_2D,this.gl.TEXTURE_MIN_FILTER,this.gl.LINEAR),this.gl.texParameteri(this.gl.TEXTURE_2D,this.gl.TEXTURE_MAG_FILTER,this.gl.LINEAR),this.gl.texImage2D(this.gl.TEXTURE_2D,0,this.gl.RGBA,this.gl.RGBA,this.gl.UNSIGNED_BYTE,t),this.mipmaps.includes(e)&&(this.gl.generateMipmap(this.gl.TEXTURE_2D),this.gl.texParameteri(this.gl.TEXTURE_2D,this.gl.TEXTURE_MIN_FILTER,this.gl.LINEAR_MIPMAP_LINEAR));let s=this.gl.getError();if(s!==this.gl.NO_ERROR||r===null){console.error("Paper Shaders: WebGL error when uploading texture:",s);return}this.textures.set(e,r);let l=this.uniformLocations[e];if(l){this.gl.uniform1i(l,n);let d=`${e}AspectRatio`,v=this.uniformLocations[d];if(v){let f=t.naturalWidth/t.naturalHeight;this.gl.uniform1f(v,f)}}};areUniformValuesEqual=(e,t)=>e===t?!0:Array.isArray(e)&&Array.isArray(t)&&e.length===t.length?e.every((a,n)=>this.areUniformValuesEqual(a,t[n])):!1;setUniformValues=e=>{this.gl.useProgram(this.program),Object.entries(e).forEach(([t,a])=>{let n=a;if(a instanceof HTMLImageElement&&(n=`${a.src.slice(0,200)}|${a.naturalWidth}x${a.naturalHeight}`),this.areUniformValuesEqual(this.uniformCache[t],n))return;this.uniformCache[t]=n;let r=this.uniformLocations[t];if(!r){console.warn(`Uniform location for ${t} not found`);return}if(a instanceof HTMLImageElement)this.setTextureUniform(t,a);else if(Array.isArray(a)){let s=null,l=null;if(a[0]!==void 0&&Array.isArray(a[0])){let d=a[0].length;if(a.every(v=>v.length===d))s=a.flat(),l=d;else{console.warn(`All child arrays must be the same length for ${t}`);return}}else s=a,l=s.length;switch(l){case 2:this.gl.uniform2fv(r,s);break;case 3:this.gl.uniform3fv(r,s);break;case 4:this.gl.uniform4fv(r,s);break;case 9:this.gl.uniformMatrix3fv(r,!1,s);break;case 16:this.gl.uniformMatrix4fv(r,!1,s);break;default:console.warn(`Unsupported uniform array length: ${l}`)}}else typeof a=="number"?this.gl.uniform1f(r,a):typeof a=="boolean"?this.gl.uniform1i(r,a?1:0):console.warn(`Unsupported uniform type for ${t}: ${typeof a}`)})};getCurrentFrame=()=>this.currentFrame;setFrame=e=>{this.currentFrame=e,this.lastRenderTime=performance.now(),this.render(performance.now())};setSpeed=(e=1)=>{this.speed=e,this.updateCurrentSpeed()};updateCurrentSpeed=()=>{this.setCurrentSpeed(this.ownerDocument.hidden||!this.isInViewport?0:this.speed)};setCurrentSpeed=e=>{this.currentSpeed=e,this.rafId===null&&e!==0&&(this.lastRenderTime=performance.now(),this.rafId=requestAnimationFrame(this.render)),this.rafId!==null&&e===0&&(cancelAnimationFrame(this.rafId),this.rafId=null)};setMaxPixelCount=(e=_e)=>{this.maxPixelCount=e,this.handleResize()};setMinPixelRatio=(e=2)=>{this.minPixelRatio=e,this.handleResize()};setUniforms=e=>{this.setUniformValues(e),this.providedUniforms={...this.providedUniforms,...e},this.render(performance.now())};handleDocumentVisibilityChange=()=>{this.updateCurrentSpeed()};dispose=()=>{this.hasBeenDisposed=!0,this.rafId!==null&&(cancelAnimationFrame(this.rafId),this.rafId=null),this.gl&&this.program&&(this.textures.forEach(e=>{this.gl.deleteTexture(e)}),this.textures.clear(),this.gl.deleteProgram(this.program),this.program=null,this.gl.bindBuffer(this.gl.ARRAY_BUFFER,null),this.gl.bindBuffer(this.gl.ELEMENT_ARRAY_BUFFER,null),this.gl.bindRenderbuffer(this.gl.RENDERBUFFER,null),this.gl.bindFramebuffer(this.gl.FRAMEBUFFER,null),this.gl.getError()),this.resizeObserver&&(this.resizeObserver.disconnect(),this.resizeObserver=null),this.intersectionObserver&&(this.intersectionObserver.disconnect(),this.intersectionObserver=null),visualViewport?.removeEventListener("resize",this.handleVisualViewportChange),this.ownerDocument.removeEventListener("visibilitychange",this.handleDocumentVisibilityChange),this.uniformLocations={},this.canvasElement.remove(),delete this.parentElement.paperShaderMount}};function ye(o,e,t){let a=o.createShader(e);return a?(o.shaderSource(a,t),o.compileShader(a),o.getShaderParameter(a,o.COMPILE_STATUS)?a:(console.error("An error occurred compiling the shaders: "+o.getShaderInfoLog(a)),o.deleteShader(a),null)):null}function Ce(o,e,t){let a=o.getShaderPrecisionFormat(o.FRAGMENT_SHADER,o.MEDIUM_FLOAT),n=a?a.precision:null;n&&n<23&&(e=e.replace(/precision\s+(lowp|mediump)\s+float;/g,"precision highp float;"),t=t.replace(/precision\s+(lowp|mediump)\s+float/g,"precision highp float").replace(/\b(uniform|varying|attribute)\s+(lowp|mediump)\s+(\w+)/g,"$1 highp $3"));let r=ye(o,o.VERTEX_SHADER,e),s=ye(o,o.FRAGMENT_SHADER,t);if(!r||!s)return null;let l=o.createProgram();return l?(o.attachShader(l,r),o.attachShader(l,s),o.linkProgram(l),o.getProgramParameter(l,o.LINK_STATUS)?(o.detachShader(l,r),o.detachShader(l,s),o.deleteShader(r),o.deleteShader(s),l):(console.error("Unable to initialize the shader program: "+o.getProgramInfoLog(l)),o.deleteProgram(l),o.deleteShader(r),o.deleteShader(s),null)):null}var Ue=`@layer paper-shaders {
+}`;var _e=1920*1080*4,C=class{parentElement;canvasElement;gl;program=null;uniformLocations={};fragmentShader;rafId=null;lastRenderTime=0;currentFrame=0;speed=0;currentSpeed=0;providedUniforms;mipmaps=[];hasBeenDisposed=!1;resolutionChanged=!0;textures=new Map;minPixelRatio;maxPixelCount;isSafari=Ve();uniformCache={};textureUnitMap=new Map;ownerDocument;constructor(e,t,a,s,r=0,n=0,l=2,f=_e,v=[]){if(e?.nodeType===1)this.parentElement=e;else throw new Error("Paper Shaders: parent element must be an HTMLElement");this.ownerDocument=e.ownerDocument;try{if(!this.ownerDocument.querySelector("style[data-paper-shader]")){let _=this.ownerDocument.createElement("style");_.innerHTML=Ue,_.setAttribute("data-paper-shader",""),this.ownerDocument.head.prepend(_)}let m=this.ownerDocument.createElement("canvas");this.canvasElement=m,this.parentElement.prepend(m),this.fragmentShader=t,this.providedUniforms=a,this.mipmaps=v,this.currentFrame=n,this.minPixelRatio=l,this.maxPixelCount=f;let x=m.getContext("webgl2",s);if(!x)throw new Error("Paper Shaders: WebGL is not supported in this browser");this.gl=x,this.initProgram(),this.setupPositionAttribute(),this.setupUniforms(),this.setUniformValues(this.providedUniforms),this.setupResizeObserver(),visualViewport?.addEventListener("resize",this.handleVisualViewportChange),this.setupIntersectionObserver(),this.setSpeed(r),this.parentElement.setAttribute("data-paper-shader",""),this.parentElement.paperShaderMount=this,this.ownerDocument.addEventListener("visibilitychange",this.handleDocumentVisibilityChange)}catch(m){try{this.dispose()}catch{}try{this.gl?.getExtension("WEBGL_lose_context")?.loseContext()}catch{}throw this.parentElement.removeAttribute("data-paper-shader"),m}}initProgram=()=>{let e=Ce(this.gl,xe,this.fragmentShader);if(!e)throw new Error("Paper Shaders: shader program initialization failed");this.program=e};setupPositionAttribute=()=>{let e=this.gl.getAttribLocation(this.program,"a_position"),t=this.gl.createBuffer();this.gl.bindBuffer(this.gl.ARRAY_BUFFER,t);let a=[-1,-1,1,-1,-1,1,-1,1,1,-1,1,1];this.gl.bufferData(this.gl.ARRAY_BUFFER,new Float32Array(a),this.gl.STATIC_DRAW),this.gl.enableVertexAttribArray(e),this.gl.vertexAttribPointer(e,2,this.gl.FLOAT,!1,0,0)};setupUniforms=()=>{let e={u_time:this.gl.getUniformLocation(this.program,"u_time"),u_pixelRatio:this.gl.getUniformLocation(this.program,"u_pixelRatio"),u_resolution:this.gl.getUniformLocation(this.program,"u_resolution")};Object.entries(this.providedUniforms).forEach(([t,a])=>{if(e[t]=this.gl.getUniformLocation(this.program,t),a instanceof HTMLImageElement){let s=`${t}AspectRatio`;e[s]=this.gl.getUniformLocation(this.program,s)}}),this.uniformLocations=e};renderScale=1;parentWidth=0;parentHeight=0;parentDevicePixelWidth=0;parentDevicePixelHeight=0;devicePixelsSupported=!1;intersectionObserver=null;isInViewport=!0;resizeObserver=null;setupResizeObserver=()=>{this.resizeObserver=new ResizeObserver(([e])=>{if(e?.borderBoxSize[0]){let t=e.devicePixelContentBoxSize?.[0];t!==void 0&&(this.devicePixelsSupported=!0,this.parentDevicePixelWidth=t.inlineSize,this.parentDevicePixelHeight=t.blockSize),this.parentWidth=e.borderBoxSize[0].inlineSize,this.parentHeight=e.borderBoxSize[0].blockSize}this.handleResize()}),this.resizeObserver.observe(this.parentElement)};setupIntersectionObserver=()=>{let e=this.ownerDocument.defaultView;e?.IntersectionObserver&&(this.intersectionObserver=new e.IntersectionObserver(([t])=>{this.isInViewport=t?.isIntersecting??!0,this.updateCurrentSpeed()}),this.intersectionObserver.observe(this.parentElement))};handleVisualViewportChange=()=>{this.resizeObserver?.disconnect(),this.setupResizeObserver()};handleResize=()=>{let e=0,t=0,a=Math.max(1,window.devicePixelRatio),s=visualViewport?.scale??1;if(this.devicePixelsSupported){let m=Math.max(1,this.minPixelRatio/a);e=this.parentDevicePixelWidth*m*s,t=this.parentDevicePixelHeight*m*s}else{let m=Math.max(a,this.minPixelRatio)*s;if(this.isSafari){let x=Be(this.ownerDocument);m*=Math.max(1,x)}e=Math.round(this.parentWidth)*m,t=Math.round(this.parentHeight)*m}let r=Math.sqrt(this.maxPixelCount)/Math.sqrt(e*t),n=Math.min(1,r),l=Math.round(e*n),f=Math.round(t*n),v=l/Math.round(this.parentWidth);(this.canvasElement.width!==l||this.canvasElement.height!==f||this.renderScale!==v)&&(this.renderScale=v,this.canvasElement.width=l,this.canvasElement.height=f,this.resolutionChanged=!0,this.gl.viewport(0,0,this.gl.canvas.width,this.gl.canvas.height),this.render(performance.now()))};render=e=>{if(this.hasBeenDisposed)return;if(this.program===null){console.warn("Tried to render before program or gl was initialized");return}let t=e-this.lastRenderTime;this.lastRenderTime=e,this.currentSpeed!==0&&(this.currentFrame+=t*this.currentSpeed),this.gl.clear(this.gl.COLOR_BUFFER_BIT),this.gl.useProgram(this.program),this.gl.uniform1f(this.uniformLocations.u_time,this.currentFrame*.001),this.resolutionChanged&&(this.gl.uniform2f(this.uniformLocations.u_resolution,this.gl.canvas.width,this.gl.canvas.height),this.gl.uniform1f(this.uniformLocations.u_pixelRatio,this.renderScale),this.resolutionChanged=!1),this.gl.drawArrays(this.gl.TRIANGLES,0,6),this.currentSpeed!==0?this.requestRender():this.rafId=null};requestRender=()=>{this.rafId!==null&&cancelAnimationFrame(this.rafId),this.rafId=requestAnimationFrame(this.render)};setTextureUniform=(e,t)=>{if(!t.complete||t.naturalWidth===0)throw new Error(`Paper Shaders: image for uniform ${e} must be fully loaded`);let a=this.textures.get(e);a&&this.gl.deleteTexture(a),this.textureUnitMap.has(e)||this.textureUnitMap.set(e,this.textureUnitMap.size);let s=this.textureUnitMap.get(e);this.gl.activeTexture(this.gl.TEXTURE0+s);let r=this.gl.createTexture();this.gl.bindTexture(this.gl.TEXTURE_2D,r),this.gl.texParameteri(this.gl.TEXTURE_2D,this.gl.TEXTURE_WRAP_S,this.gl.CLAMP_TO_EDGE),this.gl.texParameteri(this.gl.TEXTURE_2D,this.gl.TEXTURE_WRAP_T,this.gl.CLAMP_TO_EDGE),this.gl.texParameteri(this.gl.TEXTURE_2D,this.gl.TEXTURE_MIN_FILTER,this.gl.LINEAR),this.gl.texParameteri(this.gl.TEXTURE_2D,this.gl.TEXTURE_MAG_FILTER,this.gl.LINEAR),this.gl.texImage2D(this.gl.TEXTURE_2D,0,this.gl.RGBA,this.gl.RGBA,this.gl.UNSIGNED_BYTE,t),this.mipmaps.includes(e)&&(this.gl.generateMipmap(this.gl.TEXTURE_2D),this.gl.texParameteri(this.gl.TEXTURE_2D,this.gl.TEXTURE_MIN_FILTER,this.gl.LINEAR_MIPMAP_LINEAR));let n=this.gl.getError();if(n!==this.gl.NO_ERROR||r===null){console.error("Paper Shaders: WebGL error when uploading texture:",n);return}this.textures.set(e,r);let l=this.uniformLocations[e];if(l){this.gl.uniform1i(l,s);let f=`${e}AspectRatio`,v=this.uniformLocations[f];if(v){let m=t.naturalWidth/t.naturalHeight;this.gl.uniform1f(v,m)}}};areUniformValuesEqual=(e,t)=>e===t?!0:Array.isArray(e)&&Array.isArray(t)&&e.length===t.length?e.every((a,s)=>this.areUniformValuesEqual(a,t[s])):!1;setUniformValues=e=>{this.gl.useProgram(this.program),Object.entries(e).forEach(([t,a])=>{let s=a;if(a instanceof HTMLImageElement&&(s=`${a.src.slice(0,200)}|${a.naturalWidth}x${a.naturalHeight}`),this.areUniformValuesEqual(this.uniformCache[t],s))return;this.uniformCache[t]=s;let r=this.uniformLocations[t];if(!r){console.warn(`Uniform location for ${t} not found`);return}if(a instanceof HTMLImageElement)this.setTextureUniform(t,a);else if(Array.isArray(a)){let n=null,l=null;if(a[0]!==void 0&&Array.isArray(a[0])){let f=a[0].length;if(a.every(v=>v.length===f))n=a.flat(),l=f;else{console.warn(`All child arrays must be the same length for ${t}`);return}}else n=a,l=n.length;switch(l){case 2:this.gl.uniform2fv(r,n);break;case 3:this.gl.uniform3fv(r,n);break;case 4:this.gl.uniform4fv(r,n);break;case 9:this.gl.uniformMatrix3fv(r,!1,n);break;case 16:this.gl.uniformMatrix4fv(r,!1,n);break;default:console.warn(`Unsupported uniform array length: ${l}`)}}else typeof a=="number"?this.gl.uniform1f(r,a):typeof a=="boolean"?this.gl.uniform1i(r,a?1:0):console.warn(`Unsupported uniform type for ${t}: ${typeof a}`)})};getCurrentFrame=()=>this.currentFrame;setFrame=e=>{this.currentFrame=e,this.lastRenderTime=performance.now(),this.render(performance.now())};setSpeed=(e=1)=>{this.speed=e,this.updateCurrentSpeed()};updateCurrentSpeed=()=>{this.setCurrentSpeed(this.ownerDocument.hidden||!this.isInViewport?0:this.speed)};setCurrentSpeed=e=>{this.currentSpeed=e,this.rafId===null&&e!==0&&(this.lastRenderTime=performance.now(),this.rafId=requestAnimationFrame(this.render)),this.rafId!==null&&e===0&&(cancelAnimationFrame(this.rafId),this.rafId=null)};setMaxPixelCount=(e=_e)=>{this.maxPixelCount=e,this.handleResize()};setMinPixelRatio=(e=2)=>{this.minPixelRatio=e,this.handleResize()};setUniforms=e=>{this.setUniformValues(e),this.providedUniforms={...this.providedUniforms,...e},this.render(performance.now())};handleDocumentVisibilityChange=()=>{this.updateCurrentSpeed()};dispose=()=>{let e=t=>{try{t()}catch{}};this.hasBeenDisposed=!0,this.rafId!==null&&(e(()=>cancelAnimationFrame(this.rafId)),this.rafId=null),e(()=>{this.gl&&this.program&&(this.textures.forEach(t=>{this.gl.deleteTexture(t)}),this.textures.clear(),this.gl.deleteProgram(this.program),this.program=null,this.gl.bindBuffer(this.gl.ARRAY_BUFFER,null),this.gl.bindBuffer(this.gl.ELEMENT_ARRAY_BUFFER,null),this.gl.bindRenderbuffer(this.gl.RENDERBUFFER,null),this.gl.bindFramebuffer(this.gl.FRAMEBUFFER,null),this.gl.getError())}),this.resizeObserver&&(e(()=>this.resizeObserver.disconnect()),this.resizeObserver=null),this.intersectionObserver&&(e(()=>this.intersectionObserver.disconnect()),this.intersectionObserver=null),e(()=>visualViewport?.removeEventListener("resize",this.handleVisualViewportChange)),e(()=>this.ownerDocument.removeEventListener("visibilitychange",this.handleDocumentVisibilityChange)),this.uniformLocations={},e(()=>this.canvasElement?.remove()),delete this.parentElement.paperShaderMount}};function ye(o,e,t){let a=o.createShader(e);return a?(o.shaderSource(a,t),o.compileShader(a),o.getShaderParameter(a,o.COMPILE_STATUS)?a:(console.error("An error occurred compiling the shaders: "+o.getShaderInfoLog(a)),o.deleteShader(a),null)):null}function Ce(o,e,t){let a=o.getShaderPrecisionFormat(o.FRAGMENT_SHADER,o.MEDIUM_FLOAT),s=a?a.precision:null;s&&s<23&&(e=e.replace(/precision\s+(lowp|mediump)\s+float;/g,"precision highp float;"),t=t.replace(/precision\s+(lowp|mediump)\s+float/g,"precision highp float").replace(/\b(uniform|varying|attribute)\s+(lowp|mediump)\s+(\w+)/g,"$1 highp $3"));let r=ye(o,o.VERTEX_SHADER,e),n=ye(o,o.FRAGMENT_SHADER,t);if(!r||!n)return null;let l=o.createProgram();return l?(o.attachShader(l,r),o.attachShader(l,n),o.linkProgram(l),o.getProgramParameter(l,o.LINK_STATUS)?(o.detachShader(l,r),o.detachShader(l,n),o.deleteShader(r),o.deleteShader(n),l):(console.error("Unable to initialize the shader program: "+o.getProgramInfoLog(l)),o.deleteProgram(l),o.deleteShader(r),o.deleteShader(n),null)):null}var Ue=`@layer paper-shaders {
   :where([data-paper-shader]) {
     isolation: isolate;
     position: relative;
@@ -166,7 +166,7 @@ void main() {
       corner-shape: inherit;
     }
   }
-}`;function Ve(){let o=navigator.userAgent.toLowerCase();return o.includes("safari")&&!o.includes("chrome")&&!o.includes("android")}function Be(o){let e=visualViewport?.scale??1,t=visualViewport?.width??window.innerWidth,a=window.innerWidth-o.documentElement.clientWidth,n=e*t+a,r=outerWidth/n,s=Math.round(100*r);return s%5===0?s/100:s===33?1/3:s===67?2/3:s===133?4/3:r}var O={none:0,contain:1,cover:2};var i=`
+}`;function Ve(){let o=navigator.userAgent.toLowerCase();return o.includes("safari")&&!o.includes("chrome")&&!o.includes("android")}function Be(o){let e=visualViewport?.scale??1,t=visualViewport?.width??window.innerWidth,a=window.innerWidth-o.documentElement.clientWidth,s=e*t+a,r=outerWidth/s,n=Math.round(100*r);return n%5===0?n/100:n===33?1/3:n===67?2/3:n===133?4/3:r}var O={none:0,contain:1,cover:2};var i=`
 #define TWO_PI 6.28318530718
 #define PI 3.14159265358979323846
 `,c=`
@@ -179,7 +179,7 @@ vec2 rotate(vec2 uv, float th) {
     p *= p + 19.19;
     return fract(p * p);
   }
-`,m=`
+`,p=`
   float hash21(vec2 p) {
     p = fract(p * vec2(0.3183099, 0.3678794)) + 0.1;
     p += dot(p, p + 19.19);
@@ -197,7 +197,7 @@ vec2 rotate(vec2 uv, float th) {
   }
 `,u=`
   color += 1. / 256. * (fract(sin(dot(.014 * gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453123) - .5);
-`,p=`
+`,d=`
 vec3 permute(vec3 x) { return mod(((x * 34.0) + 1.0) * x, 289.0); }
 float snoise(vec2 v) {
   const vec4 C = vec4(0.211324865405187, 0.366025403784439,
@@ -281,7 +281,7 @@ out vec4 fragColor;
 
 ${i}
 ${c}
-${m}
+${p}
 
 float valueNoise(vec2 st) {
   vec2 i = floor(st);
@@ -682,7 +682,7 @@ in vec2 v_patternUV;
 out vec4 fragColor;
 
 ${i}
-${p}
+${d}
 
 float polygon(vec2 p, float N, float rot) {
   float a = atan(p.x, p.y) + rot;
@@ -754,13 +754,13 @@ void main() {
 
   fragColor = vec4(color, opacity);
 }
-`;var G={maxColorCount:10},E=`#version 300 es
+`;var E={maxColorCount:10},G=`#version 300 es
 precision mediump float;
 
 uniform float u_time;
 uniform float u_scale;
 
-uniform vec4 u_colors[${G.maxColorCount}];
+uniform vec4 u_colors[${E.maxColorCount}];
 uniform float u_colorsCount;
 uniform float u_stepsPerColor;
 uniform float u_softness;
@@ -769,7 +769,7 @@ in vec2 v_patternUV;
 
 out vec4 fragColor;
 
-${p}
+${d}
 
 float getNoise(vec2 uv, float t) {
   float noise = .5 * snoise(uv - vec2(0., .3 * t));
@@ -805,7 +805,7 @@ void main() {
 
   vec4 gradient = u_colors[0];
   gradient.rgb *= gradient.a;
-  for (int i = 1; i < ${G.maxColorCount}; i++) {
+  for (int i = 1; i < ${E.maxColorCount}; i++) {
     if (i >= int(u_colorsCount)) break;
 
     float localM = clamp(mixer - float(i - 1), 0., 1.);
@@ -952,7 +952,7 @@ out vec4 fragColor;
 
 ${i}
 ${y}
-${m}
+${p}
 
 float hash31(vec3 p) {
   p = fract(p * 0.3183099) + 0.1;
@@ -1519,7 +1519,7 @@ in vec2 v_patternUV;
 out vec4 fragColor;
 
 ${i}
-${p}
+${d}
 
 void main() {
   vec2 uv = 2. * v_patternUV;
@@ -1588,7 +1588,7 @@ in vec2 v_objectUV;
 out vec4 fragColor;
 
 ${i}
-${p}
+${d}
 ${c}
 
 void main() {
@@ -1678,10 +1678,10 @@ uniform float u_type;
 
 out vec4 fragColor;
 
-${p}
+${d}
 ${i}
 ${y}
-${m}
+${p}
 
 float getSimplexNoise(vec2 uv, float t) {
   float noise = .5 * snoise(uv - vec2(0., .3 * t));
@@ -1930,7 +1930,7 @@ in vec2 v_patternBoxSize;
 out vec4 fragColor;
 
 ${i}
-${p}
+${d}
 ${c}
 ${g}
 
@@ -2609,7 +2609,7 @@ out vec4 fragColor;
 
 ${i}
 ${c}
-${m}
+${p}
 
 float valueNoise(vec2 st) {
   vec2 i = floor(st);
@@ -2723,7 +2723,7 @@ out vec4 fragColor;
 
 ${i}
 ${c}
-${m}
+${p}
 
 float valueNoise(vec2 st) {
   vec2 i = floor(st);
@@ -3127,7 +3127,7 @@ out vec4 fragColor;
 
 ${i}
 ${c}
-${p}
+${d}
 
 float getUvFrame(vec2 uv) {
   float aax = 2. * fwidth(uv.x);
@@ -3249,7 +3249,7 @@ out vec4 fragColor;
 
 ${i}
 ${c}
-${m}
+${p}
 
 float valueNoise(vec2 st) {
   vec2 i = floor(st);
@@ -3573,7 +3573,7 @@ uniform float u_colorSteps;
 out vec4 fragColor;
 
 
-${m}
+${p}
 ${i}
 
 float getUvFrame(vec2 uv, vec2 pad) {
@@ -3754,7 +3754,7 @@ in vec2 v_imageUV;
 out vec4 fragColor;
 
 ${i}
-${m}
+${p}
 ${c}
 
 float valueNoise(vec2 st) {
@@ -4265,7 +4265,7 @@ out vec4 fragColor;
 
 ${i}
 ${c}
-${p}
+${d}
 
 float getColorChanges(float c1, float c2, float stripe_p, vec3 w, float blur, float bump, float tint) {
 
@@ -4554,4 +4554,4 @@ void main() {
 
   fragColor = vec4(color, opacity);
 }
-`;function he(o){if(Array.isArray(o))return o.length===4?o:o.length===3?[...o,1]:S;if(typeof o!="string")return S;let e,t,a,n=1;if(o.startsWith("#"))[e,t,a,n]=Re(o);else if(o.startsWith("rgb")){let r=Fe(o);if(r===null)return S;[e,t,a,n]=r}else if(o.startsWith("hsl")){let r=ze(o);if(r===null)return S;[e,t,a,n]=ke(r)}else return console.error("Unsupported color format",o),S;return[F(e,0,1),F(t,0,1),F(a,0,1),F(n,0,1)]}function Re(o){if(o=o.replace(/^#/,""),(o.length===3||o.length===4)&&(o=o.split("").map(r=>r+r).join("")),o.length===6&&(o=o+"ff"),!/^[0-9a-f]{8}$/i.test(o))return console.warn("Invalid hex color"),S;let e=parseInt(o.slice(0,2),16)/255,t=parseInt(o.slice(2,4),16)/255,a=parseInt(o.slice(4,6),16)/255,n=parseInt(o.slice(6,8),16)/255;return[e,t,a,n]}function Fe(o){let e=o.match(/^rgba?\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*(?:,\s*([0-9.]+))?\s*\)$/i);return e?[parseInt(e[1]??"0")/255,parseInt(e[2]??"0")/255,parseInt(e[3]??"0")/255,e[4]===void 0?1:parseFloat(e[4])]:null}function ze(o){let e=o.match(/^hsla?\s*\(\s*(\d+)\s*,\s*(\d+)%\s*,\s*(\d+)%\s*(?:,\s*([0-9.]+))?\s*\)$/i);return e?[parseInt(e[1]??"0"),parseInt(e[2]??"0"),parseInt(e[3]??"0"),e[4]===void 0?1:parseFloat(e[4])]:null}function ke(o){let[e,t,a,n]=o,r=e/360,s=t/100,l=a/100,d,v,f;if(t===0)d=v=f=l;else{let x=(w,k,h)=>(h<0&&(h+=1),h>1&&(h-=1),h<.16666666666666666?w+(k-w)*6*h:h<.5?k:h<.6666666666666666?w+(k-w)*(.6666666666666666-h)*6:w),_=l<.5?l*(1+s):l+s-l*s,z=2*l-_;d=x(z,_,r+1/3),v=x(z,_,r),f=x(z,_,r-1/3)}return[d,v,f,n]}var F=(o,e,t)=>Math.min(Math.max(o,e),t),S=[.5,.5,.5,1];var Oe={colorPanels:ie,dithering:ee,dotGrid:N,dotOrbit:D,flutedGlass:fe,godRays:Z,grainGradient:te,heatmap:ve,imageDithering:me,lensDistortion:pe,liquidMetal:ge,meshGradient:A,metaballs:W,neuroNoise:M,paperTexture:ce,perlinNoise:$,pulsingBorder:ae,simplexNoise:E,smokeRing:P,spiral:K,staticMeshGradient:se,staticRadialGradient:le,swirl:J,voronoi:X,warp:q,water:ue,waves:j},Ie={u_fit:O.cover,u_scale:1,u_rotation:0,u_offsetX:0,u_offsetY:0,u_originX:.5,u_originY:.5,u_worldWidth:0,u_worldHeight:0};function we(o){return o===void 0?{}:{u_colors:o.map(e=>[...he(e)]),u_colorsCount:o.length}}function Ot(o,e){let t=Oe[e.shader]??e.shader,a={...Ie,...we(e.colors),...e.uniforms},n;try{n=new C(o,t,a,void 0,e.speed??0,0,1,2e6)}catch{let s=o.firstElementChild;return s instanceof HTMLCanvasElement&&s.remove(),null}let r=()=>{n.canvasElement.style.display="none"};return n.canvasElement.addEventListener("webglcontextlost",r),{setUniforms(s){n.setUniforms({...we(s.colors),...s.uniforms})},setSpeed(s){n.setSpeed(s)},dispose(){n.canvasElement.removeEventListener("webglcontextlost",r),n.dispose()}}}export{Ot as createShader,Oe as shaderCatalog};
+`;function he(o){if(Array.isArray(o))return o.length===4?o:o.length===3?[...o,1]:S;if(typeof o!="string")return S;let e,t,a,s=1;if(o.startsWith("#"))[e,t,a,s]=Re(o);else if(o.startsWith("rgb")){let r=Fe(o);if(r===null)return S;[e,t,a,s]=r}else if(o.startsWith("hsl")){let r=ze(o);if(r===null)return S;[e,t,a,s]=ke(r)}else return console.error("Unsupported color format",o),S;return[F(e,0,1),F(t,0,1),F(a,0,1),F(s,0,1)]}function Re(o){if(o=o.replace(/^#/,""),(o.length===3||o.length===4)&&(o=o.split("").map(r=>r+r).join("")),o.length===6&&(o=o+"ff"),!/^[0-9a-f]{8}$/i.test(o))return console.warn("Invalid hex color"),S;let e=parseInt(o.slice(0,2),16)/255,t=parseInt(o.slice(2,4),16)/255,a=parseInt(o.slice(4,6),16)/255,s=parseInt(o.slice(6,8),16)/255;return[e,t,a,s]}function Fe(o){let e=o.match(/^rgba?\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*(?:,\s*([0-9.]+))?\s*\)$/i);return e?[parseInt(e[1]??"0")/255,parseInt(e[2]??"0")/255,parseInt(e[3]??"0")/255,e[4]===void 0?1:parseFloat(e[4])]:null}function ze(o){let e=o.match(/^hsla?\s*\(\s*(\d+)\s*,\s*(\d+)%\s*,\s*(\d+)%\s*(?:,\s*([0-9.]+))?\s*\)$/i);return e?[parseInt(e[1]??"0"),parseInt(e[2]??"0"),parseInt(e[3]??"0"),e[4]===void 0?1:parseFloat(e[4])]:null}function ke(o){let[e,t,a,s]=o,r=e/360,n=t/100,l=a/100,f,v,m;if(t===0)f=v=m=l;else{let x=(w,k,h)=>(h<0&&(h+=1),h>1&&(h-=1),h<.16666666666666666?w+(k-w)*6*h:h<.5?k:h<.6666666666666666?w+(k-w)*(.6666666666666666-h)*6:w),_=l<.5?l*(1+n):l+n-l*n,z=2*l-_;f=x(z,_,r+1/3),v=x(z,_,r),m=x(z,_,r-1/3)}return[f,v,m,s]}var F=(o,e,t)=>Math.min(Math.max(o,e),t),S=[.5,.5,.5,1];var Oe={colorPanels:ie,dithering:ee,dotGrid:N,dotOrbit:D,flutedGlass:fe,godRays:Z,grainGradient:te,heatmap:ve,imageDithering:me,lensDistortion:pe,liquidMetal:ge,meshGradient:A,metaballs:W,neuroNoise:M,paperTexture:ce,perlinNoise:$,pulsingBorder:ae,simplexNoise:G,smokeRing:P,spiral:K,staticMeshGradient:se,staticRadialGradient:le,swirl:J,voronoi:X,warp:q,water:ue,waves:j},Ie={u_fit:O.cover,u_scale:1,u_rotation:0,u_offsetX:0,u_offsetY:0,u_originX:.5,u_originY:.5,u_worldWidth:0,u_worldHeight:0};function we(o){return o===void 0?{}:{u_colors:o.map(e=>[...he(e)]),u_colorsCount:o.length}}function Ot(o,e){let t=Oe[e.shader]??e.shader,a={...Ie,...we(e.colors),...e.uniforms},s,r=console.error;console.error=(...f)=>{typeof f[0]=="string"&&(f[0].startsWith("An error occurred compiling the shaders: ")||f[0].startsWith("Unable to initialize the shader program: "))||r.apply(console,f)};try{s=new C(o,t,a,void 0,e.speed??0,0,1,2e6)}catch{return null}finally{console.error=r}let n="live",l=()=>{if(n==="live"){n="dead";try{s.setSpeed(0)}finally{s.canvasElement.style.display="none"}}};return s.canvasElement.addEventListener("webglcontextlost",l),{setUniforms(f){n==="live"&&s.setUniforms({...we(f.colors),...f.uniforms})},setSpeed(f){n==="live"&&s.setSpeed(f)},dispose(){if(n!=="disposed"){n="disposed",s.canvasElement.removeEventListener("webglcontextlost",l);try{s.dispose()}finally{o.removeAttribute("data-paper-shader")}}}}}export{Ot as createShader,Oe as shaderCatalog};
