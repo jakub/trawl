@@ -42,6 +42,8 @@ const SECTION_RS: &str = include_str!("../src/state/section.rs");
 const DRAWER_RS: &str = include_str!("../../fleet-ui/src/drawer.rs");
 const FIELD_CASE_DRAWER_RS: &str = include_str!("../src/components/field_case_drawer.rs");
 const REPIN_FLOW_RS: &str = include_str!("../src/repin_flow.rs");
+const PALETTE_RS: &str = include_str!("../../fleet-ui/src/command_palette.rs");
+const KBD_RS: &str = include_str!("../../fleet-ui/src/kbd.rs");
 const TOPBAR_RS: &str = include_str!("../../fleet-ui/src/topbar.rs");
 const MENU_RS: &str = include_str!("../../fleet-ui/src/menu.rs");
 const TABS_RS: &str = include_str!("../../fleet-ui/src/tabs.rs");
@@ -75,6 +77,96 @@ struct Contract {
 const HEALTH_RS: &str = include_str!("../src/pages/health.rs");
 
 const CONTRACTS: &[Contract] = &[
+    Contract {
+        assignment: "paletteTrigger: '.topbar button.jump',",
+        source_path: "../fleet-ui/src/topbar.rs",
+        source: TOPBAR_RS,
+        hook: "class=\"jump\"",
+    },
+    Contract {
+        assignment: "paletteDialog: '[role=\"dialog\"][aria-label=\"Command palette\"]',",
+        source_path: "../fleet-ui/src/command_palette.rs",
+        source: PALETTE_RS,
+        hook: "aria-label=\"Command palette\"",
+    },
+    Contract {
+        assignment: "paletteInput: '[role=\"combobox\"][aria-label=\"Find a page\"]',",
+        source_path: "../fleet-ui/src/command_palette.rs",
+        source: PALETTE_RS,
+        hook: "aria-label=\"Find a page\"",
+    },
+    Contract {
+        assignment: "paletteList: '[role=\"listbox\"][aria-label=\"Pages\"]',",
+        source_path: "../fleet-ui/src/command_palette.rs",
+        source: PALETTE_RS,
+        hook: "aria-label=\"Pages\"",
+    },
+    Contract {
+        assignment: "paletteOption: 'a[role=\"option\"]',",
+        source_path: "../fleet-ui/src/command_palette.rs",
+        source: PALETTE_RS,
+        hook: "attr:role=\"option\"",
+    },
+    Contract {
+        assignment: "paletteClose: 'button[aria-label=\"Close command palette\"]',",
+        source_path: "../fleet-ui/src/command_palette.rs",
+        source: PALETTE_RS,
+        hook: "aria-label=\"Close command palette\"",
+    },
+    Contract {
+        assignment: "paletteScrim: '.command-palette-scrim',",
+        source_path: "../fleet-ui/src/command_palette.rs",
+        source: PALETTE_RS,
+        hook: "class=\"command-palette-scrim\"",
+    },
+    Contract {
+        assignment: "paletteStatus: '.command-palette-status[role=\"status\"]',",
+        source_path: "../fleet-ui/src/command_palette.rs",
+        source: PALETTE_RS,
+        hook: "class=\"command-palette-status\"",
+    },
+    Contract {
+        assignment: "palettePath: '.command-palette-path',",
+        source_path: "../fleet-ui/src/command_palette.rs",
+        source: PALETTE_RS,
+        hook: "class=\"command-palette-path\"",
+    },
+    Contract {
+        assignment: "paletteLabel: '.command-palette-label',",
+        source_path: "../fleet-ui/src/command_palette.rs",
+        source: PALETTE_RS,
+        hook: "class=\"command-palette-label\"",
+    },
+    Contract {
+        assignment: "paletteCurrent: '.command-palette-current',",
+        source_path: "../fleet-ui/src/command_palette.rs",
+        source: PALETTE_RS,
+        hook: "class=\"command-palette-current\"",
+    },
+    Contract {
+        assignment: "paletteEmpty: '.command-palette-empty',",
+        source_path: "../fleet-ui/src/command_palette.rs",
+        source: PALETTE_RS,
+        hook: "class=\"command-palette-empty\"",
+    },
+    Contract {
+        assignment: "paletteModeLink: '.topbar .modes a',",
+        source_path: "../fleet-ui/src/topbar.rs",
+        source: TOPBAR_RS,
+        hook: "class=\"modes\"",
+    },
+    Contract {
+        assignment: "paletteRailLink: 'nav.rail a[title]',",
+        source_path: "../fleet-ui/src/rail.rs",
+        source: RAIL_RS,
+        hook: "attr:title=label_attr",
+    },
+    Contract {
+        assignment: "paletteKbd: '.topbar button.jump .kbd',",
+        source_path: "../fleet-ui/src/kbd.rs",
+        source: KBD_RS,
+        hook: "else { \"kbd\" }",
+    },
     Contract {
         assignment: "historyAwayLink: 'nav.rail a[title=\"Schema\"]',",
         source_path: "src/state/section.rs",

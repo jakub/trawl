@@ -44,6 +44,9 @@
 pub mod atmosphere;
 pub mod badge;
 pub mod button;
+// The route palette stays crate-private; its pure rules also compile in native tests.
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) mod command_palette;
 pub mod copy_button;
 pub mod load_more;
 pub mod loaded;

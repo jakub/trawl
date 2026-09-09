@@ -1,0 +1,12 @@
+diff --git a/crates/fleet-ui/src/shell.rs b/crates/fleet-ui/src/shell.rs
+--- a/crates/fleet-ui/src/shell.rs
++++ b/crates/fleet-ui/src/shell.rs
+@@ -188,7 +188,7 @@
+                     .is_some_and(OverlayLayer::is_topmost)
+                 {
+                     event.prevent_default();
+-                    close_palette.run(());
++                    let _ = close_palette;
+                 }
+             } else if !has_layers() {
+                 event.prevent_default();

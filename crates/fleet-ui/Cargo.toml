@@ -51,12 +51,16 @@ web-sys = { version = "0.3", features = [
     "DomRectList",
     "Element",
     "HtmlElement",
+    "HtmlInputElement",
+    "HtmlTextAreaElement",
     "KeyboardEvent",
     "MouseEvent",
     "Navigator",
     "Node",
     "NodeList",
     "Storage",
+    "ScrollIntoViewOptions",
+    "ScrollLogicalPosition",
     "Window",
 ] }
 

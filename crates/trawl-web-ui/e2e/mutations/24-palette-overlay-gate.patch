@@ -1,0 +1,30 @@
+diff --git a/crates/fleet-ui/src/shell.rs b/crates/fleet-ui/src/shell.rs
+--- a/crates/fleet-ui/src/shell.rs
++++ b/crates/fleet-ui/src/shell.rs
+@@ -29,7 +29,7 @@
+     ChordFacts, CommandInput, CommandPalette, commands_from, editable_target, is_palette_chord,
+     palette_available, platform_kbd_hint,
+ };
+-use crate::overlay::{OverlayLayer, has_layers};
++use crate::overlay::OverlayLayer;
+ 
+ use crate::rail::{Rail, RailItem};
+ use crate::toast::{ToastBus, Toasts};
+@@ -91,7 +91,7 @@
+         });
+     });
+     let open_palette = Callback::new(move |()| {
+-        if !available.get_untracked() || has_layers() {
++        if !available.get_untracked() {
+             return;
+         }
+         // A shortcut from the editor must restore to the visible trigger too.
+@@ -190,7 +190,7 @@
+                     event.prevent_default();
+                     close_palette.run(());
+                 }
+-            } else if !has_layers() {
++            } else {
+                 event.prevent_default();
+                 open_palette.run(());
+             }

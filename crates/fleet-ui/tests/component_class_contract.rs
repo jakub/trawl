@@ -45,6 +45,8 @@ const KBD: &str = include_str!("../src/kbd.rs");
 const ACTIONS_MENU: &str = include_str!("../src/actions_menu.rs");
 const MENU: &str = include_str!("../src/menu.rs");
 const TOPBAR: &str = include_str!("../src/topbar.rs");
+const SHELL: &str = include_str!("../src/shell.rs");
+const COMMAND_PALETTE: &str = include_str!("../src/command_palette.rs");
 const TOAST_RUNTIME: &str = include_str!("../src/toast/runtime.rs");
 const ROVING: &str = include_str!("../src/roving.rs");
 const COPY_BUTTON: &str = include_str!("../src/copy_button.rs");
@@ -494,7 +496,7 @@ fn topbar_menu_is_native_and_registers_with_the_stack() {
          second contract"
     );
 
-    // ADR-0025's retirements, and the one box that stays.
+    // ADR-0025's retired controls stay absent.
     assert!(
         !markup.contains("iconbtn"),
         "the notifications bell is retired — it was never wired"
@@ -516,11 +518,177 @@ fn topbar_menu_is_native_and_registers_with_the_stack() {
          the shared outside-mousedown check, so a modal above the menu \
          arbitrates instead of being covered"
     );
+}
+
+#[test]
+fn command_palette_trigger_is_a_live_native_button() {
+    let topbar = markup_only(TOPBAR);
+    let start = topbar
+        .find("<Show when=move || palette_available.get()>")
+        .unwrap();
+    let trigger = topbar[start..].split("</Show>").next().unwrap();
+    for required in [
+        "<button",
+        "type=\"button\"",
+        "class=\"jump\"",
+        "aria-haspopup=\"dialog\"",
+        "aria-expanded=move || palette_open.get().to_string()",
+        "aria-keyshortcuts=hint.aria_keyshortcuts",
+        "node_ref=palette_trigger",
+        "on_open_palette.run(())",
+        "<Kbd>{hint.label}</Kbd>",
+        "Go to…",
+    ] {
+        assert!(
+            trigger.contains(required),
+            "palette trigger lost {required}"
+        );
+    }
+    for required in [
+        "on_open_palette: Callback<()>",
+        "palette_open: Signal<bool>",
+        "palette_available: Signal<bool>",
+        "platform_kbd_hint(",
+    ] {
+        assert!(topbar.contains(required), "TopBar lost {required}");
+    }
+    assert!(!topbar.contains("coming soon"));
+    assert!(trigger.contains("aria-label=\"Go to… Command palette\""));
+    assert!(!trigger.contains("Search…"));
+}
+
+#[test]
+fn command_palette_dialog_uses_trap_combobox_and_real_router_options() {
+    let palette = markup_only(COMMAND_PALETTE);
+    for required in [
+        "use_overlay_layer_with(FocusPolicy::Trap",
+        "role=\"dialog\"",
+        "aria-label=\"Command palette\"",
+        "aria-modal=\"true\"",
+        "role=\"combobox\"",
+        "aria-controls=\"fleet-command-palette-list\"",
+        "aria-activedescendant=",
+        "role=\"listbox\"",
+        "id=\"fleet-command-palette-list\"",
+        "role=\"group\"",
+        "<A",
+        "attr:role=\"option\"",
+        "attr:tabindex=\"-1\"",
+        "attr:aria-selected=",
+        "anchor.click()",
+        "is_composing()",
+        "next_index(",
+        "ScrollLogicalPosition::Nearest",
+        "command.is_current(&pathname.get())",
+        "role=\"status\"",
+        "aria-live=\"polite\"",
+        "aria-label=\"Close command palette\"",
+        "type=\"button\"",
+        "ordinary_click(&event)",
+        "layer.is_topmost()",
+    ] {
+        assert!(
+            palette.contains(required),
+            "command palette lost {required}"
+        );
+    }
+    assert!(!palette.contains("on:mouseover") && !palette.contains("on:mouseenter"));
+    assert!(!palette.contains("Nav::First") && !palette.contains("Nav::Last"));
+}
+
+#[test]
+fn command_palette_shell_gates_chords_and_retains_anchors_through_dispatch() {
+    let shell = markup_only(SHELL);
+    for required in [
+        "commands_from(",
+        "palette_available(items)",
+        "has_layers()",
+        "is_palette_chord(facts, is_macos)",
+        "event.default_prevented()",
+        "event.is_composing()",
+        "event.repeat()",
+        "editable_target(&event)",
+        "UseEventListenerOptions::default().capture(false)",
+        "is_some_and(OverlayLayer::is_topmost)",
+        "if palette_open.get_untracked()",
+        "trigger.focus()",
+        "palette_open.set(false)",
+        "queue_microtask(",
+        "palette_open.try_get_untracked() == Some(false)",
+        "palette_mounted.try_set(false)",
+        "<Show when=move || palette_mounted.get() && available.get()>",
+    ] {
+        assert!(
+            shell.contains(required),
+            "Shell palette lifecycle lost {required}"
+        );
+    }
+    let palette = markup_only(COMMAND_PALETTE);
+    assert!(palette.contains("hidden=move || !open.get()"));
+    assert!(palette.contains("is_content_editable"));
     assert!(
-        markup.contains("Command palette"),
-        "the ⌘K stub stays exactly as it is until the palette slice \
-         (ADR-0028, human ruling)"
+        palette.contains("text_input_is_editable(&input.type_(), disabled, input.read_only())")
     );
+    assert!(palette.contains("!disabled && !textarea.read_only()"));
+    assert!(palette.contains("matches(\":disabled\")"));
+    assert!(palette.contains("closest(\"input, textarea\")"));
+}
+
+#[test]
+fn command_palette_class_hooks_have_viewport_and_control_styles() {
+    let palette = markup_only(COMMAND_PALETTE);
+    for class in [
+        "command-palette-scrim",
+        "command-palette",
+        "command-palette-search",
+        "command-palette-input",
+        "command-palette-close",
+        "command-palette-list",
+        "command-palette-group",
+        "command-palette-group-label",
+        "command-palette-option",
+        "command-palette-label",
+        "command-palette-path",
+        "command-palette-current",
+        "command-palette-empty",
+        "command-palette-status",
+    ] {
+        assert!(
+            palette.contains(&format!("class=\"{class}\"")),
+            "missing markup hook {class}"
+        );
+        assert!(
+            FLEET_CSS.contains(&format!(".{class} {{"))
+                || FLEET_CSS.contains(&format!(".{class} +")),
+            "missing CSS for {class}"
+        );
+    }
+    for required in [
+        ".command-palette-scrim[hidden] { display: none; }",
+        "max-height: calc(100dvh",
+    ] {
+        assert!(FLEET_CSS.contains(required), "fleet-ui.css lost {required}");
+    }
+    assert!(
+        palette.contains("ScrollLogicalPosition::Nearest"),
+        "the palette lost its nearest-scroll keyboard follow"
+    );
+    let jump = FLEET_CSS
+        .split(".topbar .jump {")
+        .nth(1)
+        .unwrap()
+        .split('}')
+        .next()
+        .unwrap();
+    for reset in [
+        "appearance: none",
+        "font: inherit",
+        "text-align: left",
+        "margin: 0",
+        "cursor: pointer",
+    ] {
+        assert!(jump.contains(reset), "jump button reset lost {reset}");
+    }
 }
 
 #[test]

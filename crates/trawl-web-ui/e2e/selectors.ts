@@ -12,6 +12,23 @@ export const SEL = {
   /// crates/fleet-ui/src/pager.rs — the shared table footer and summary.
   resultsFooter: '.results-footer',
   resultsSummary: '.results-summary',
+  // Command palette, ADR-0031. Semantic controls and their display text.
+  paletteTrigger: '.topbar button.jump',
+  paletteDialog: '[role="dialog"][aria-label="Command palette"]',
+  paletteInput: '[role="combobox"][aria-label="Find a page"]',
+  paletteList: '[role="listbox"][aria-label="Pages"]',
+  paletteOption: 'a[role="option"]',
+  paletteClose: 'button[aria-label="Close command palette"]',
+  paletteScrim: '.command-palette-scrim',
+  paletteStatus: '.command-palette-status[role="status"]',
+  palettePath: '.command-palette-path',
+  paletteLabel: '.command-palette-label',
+  paletteCurrent: '.command-palette-current',
+  paletteEmpty: '.command-palette-empty',
+  paletteModeLink: '.topbar .modes a',
+  paletteRailLink: 'nav.rail a[title]',
+  paletteKbd: '.topbar button.jump .kbd',
+
   historyAwayLink: 'nav.rail a[title="Schema"]',
   historyPage: '.history-page',
   historyFormat: 'select[aria-label="History export format"]',
