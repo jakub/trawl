@@ -156,9 +156,10 @@ pub fn HistoryPage() -> impl IntoView {
                     Ok(response) => {
                         loading.set(true);
                         filter.set(String::new());
-                        // A page change fetches offset zero. Refetch explicitly only
-                        // when already there, never against the old nonzero offset.
-                        let already_first_page = hpage.get_untracked() == Ok(0);
+                        // The resource tracks raw search identity. Canonicalizing
+                        // any query string triggers its own offset-zero read; only
+                        // the already-canonical URL needs an explicit refetch.
+                        let already_canonical = location.search.get_untracked().is_empty();
                         goto_hpage(
                             "/search/history",
                             NavigateOptions {
@@ -166,7 +167,7 @@ pub fn HistoryPage() -> impl IntoView {
                                 ..Default::default()
                             },
                         );
-                        if already_first_page {
+                        if already_canonical {
                             resource.refetch();
                         }
                         bus.push(

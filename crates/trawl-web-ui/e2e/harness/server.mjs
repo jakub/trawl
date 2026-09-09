@@ -459,7 +459,7 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
     if (p === '/__ctl/history/load' && req.method === 'POST') {
       const pending = history.loadPending.shift();
       if (!pending) { sendJson(res, 409, { error: 'no pending history load' }); return; }
-      sendJson(pending, 200, wire('history-export'));
+      sendJson(pending, 200, wire(history.cleared ? 'history-cleared' : 'history-export'));
       sendJson(res, 200, { ok: true });
       return;
     }

@@ -21,8 +21,8 @@ async function state(request: APIRequestContext) {
 async function release(request: APIRequestContext, path = '/__ctl/history/release') {
   expect((await request.post(path)).status()).toBe(200);
 }
-async function openFiltered(page: Page, hpage = 0) {
-  await page.goto(`/search/history?hpage=${hpage}`);
+async function openFiltered(page: Page, hpage: number | string = 0) {
+  await page.goto(typeof hpage === 'string' ? `/search/history${hpage}` : `/search/history?hpage=${hpage}`);
   await expect(rows(page)).toHaveCount(3);
   await page.locator(SEL.historyFilter).fill('prod');
   await expect(rows(page)).toHaveCount(2);
@@ -139,10 +139,10 @@ test('cancelling clear preserves rows, filter, and page without DELETE', async (
   expect(await state(request)).toMatchObject({ deletes: 0, offsets: [100] });
 });
 
-for (const hpage of [0, 2]) {
-  test(`clear on page ${hpage} confirms once and fetches canonical page zero`, async ({ page, request }) => {
+for (const [suffix, initialOffset] of [['', 0], ['?hpage=0', 0], ['?hpage=%2531', 0], ['?hpage=2', 100]] as const) {
+  test(`clear from ${suffix || 'canonical page zero'} confirms once and fetches canonical page zero`, async ({ page, request }) => {
     await resetScenario(request, 'history-ready');
-    await openFiltered(page, hpage);
+    await openFiltered(page, suffix);
     await clearButton(page).click();
     const button = modal(page).getByRole('button', { name: COPY.historyClearConfirm, exact: true });
     // Two activations in one turn must consume the pending confirmation once.
@@ -160,7 +160,7 @@ for (const hpage of [0, 2]) {
     await expect(rows(page)).toHaveCount(0);
     await expect(clearButton(page)).toBeEnabled();
     await expect(page.locator(SEL.toastAny)).toContainText(COPY.historyClearDone);
-    expect(await state(request)).toMatchObject({ deletes: 1, offsets: [hpage * 50, 0] });
+    expect(await state(request)).toMatchObject({ deletes: 1, offsets: [initialOffset, 0] });
     await expect(exportButton(page)).toBeDisabled();
   });
 }
@@ -214,3 +214,52 @@ for (const operation of ['GET', 'DELETE']) {
     await expect(page.locator(SEL.toastAny)).toHaveCount(0);
   });
 }
+
+
+test('a held post-clear refresh cannot export retained first-page rows', async ({ page, request }) => {
+  await resetScenario(request, 'history-page-loading');
+  await openFiltered(page, '');
+  let downloads = 0;
+  page.on('download', () => { downloads += 1; });
+  await confirm(page);
+  await expect.poll(async () => (await state(request)).pending).toBe(true);
+  await release(request);
+  await expect.poll(async () => (await state(request)).offsets).toEqual([0, 0]);
+  await expect.poll(async () => (await state(request)).loadPending).toBe(true);
+  await expect(rows(page)).toHaveCount(3);
+  await expect(exportButton(page)).toBeDisabled();
+  await expect(page.locator(SEL.historyFormat)).toBeDisabled();
+  await expect(page.getByRole('button', { name: COPY.historyNext, exact: true })).toBeDisabled();
+  await exportButton(page).dispatchEvent('click');
+  expect(downloads).toBe(0);
+  await release(request, '/__ctl/history/load');
+  await expect(rows(page)).toHaveCount(0);
+  await expect(exportButton(page)).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Prev' })).toBeDisabled();
+  await expect(page.getByRole('button', { name: COPY.historyNext, exact: true })).toBeDisabled();
+  expect(await state(request)).toMatchObject({ deletes: 1, offsets: [0, 0] });
+});
+
+test('held next-page export matches the fetched pagination window', async ({ page, request }) => {
+  await request.post('/__ctl/reset', { data: { scenario: 'pagination', pagination: { holdHistoryOffset: 50 } } });
+  await page.goto('/search/history');
+  const footer = page.locator('.results-footer');
+  await expect(footer.locator('.results-summary')).toHaveText('1–50 of 103');
+  await footer.getByRole('button', { name: 'Next' }).click();
+  await expect.poll(async () => (await (await request.get('/__ctl/state')).json()).pagination.held).toBe(true);
+  await expect(footer.locator('.results-summary')).toHaveText('1–50 of 103');
+  await expect(rows(page).first()).toHaveText('history-row-1');
+  await expect(exportButton(page)).toBeDisabled();
+  await expect(footer.getByRole('button', { name: 'Next' })).toBeDisabled();
+  await release(request, '/__ctl/pagination/release');
+  await expect(footer.locator('.results-summary')).toHaveText('51–100 of 103');
+  await expect(exportButton(page)).toBeEnabled();
+  await page.locator(SEL.historyFormat).selectOption('json');
+  const downloaded = page.waitForEvent('download');
+  await exportButton(page).click();
+  const result = JSON.parse(readFileSync((await (await downloaded).path())!, 'utf8'));
+  expect(result.map((row: { query: string }) => row.query)).toEqual(
+    Array.from({ length: 50 }, (_, index) => `history-row-${index + 51}`),
+  );
+  await expect(rows(page).first()).toHaveText('history-row-51');
+});
