@@ -195,13 +195,13 @@ one thing the suite is supposed to catch:
 | `21-atmosphere-speed-only.patch` | Delete only the terminal dead assignment, keeping speed zero and hidden canvas; reactive motion changes restart shader rAF | `atmosphere-fallback.spec.ts`, dedicated `scripts/atmosphere-mutation-check.sh` |
 | `22-runs-filtered-window.patch` | Global Runs computes its page window from filtered rows instead of the server page | `pagination.spec.ts`, zero-match filter keeps `1–3 of 3` |
 | `23-range-close-on-refusal.patch` | The shared range commit path closes after the app refuses a selection | `range-dialog.spec.ts`, retained absolute and quick drafts with inline errors |
-| `22-palette-overlay-gate.patch` | removes both closed-state overlay admission checks, in Shell's open callback and global chord listener | `command-palette.spec.ts`, export-modal chord inertness |
-| `23-palette-toggle.patch` | replaces the open palette's chord close callback with a no-op | `command-palette.spec.ts`, chord while open toggles closed |
+| `24-palette-overlay-gate.patch` | removes both closed-state overlay admission checks, in Shell's open callback and global chord listener | `command-palette.spec.ts`, export-modal chord inertness |
+| `25-palette-toggle.patch` | replaces the open palette's chord close callback with a no-op | `command-palette.spec.ts`, chord while open toggles closed |
 
 Run the mechanism:
 
 ```sh
-crates/trawl-web-ui/e2e/scripts/mutation-check.sh                     # all twenty-two (21 has a dedicated runner)
+crates/trawl-web-ui/e2e/scripts/mutation-check.sh                     # all 24 standard mutations (21 has a dedicated runner)
 crates/trawl-web-ui/e2e/scripts/mutation-check.sh 02-editor-onchange.patch  # just one
 ```
 
@@ -214,7 +214,7 @@ launch failure as executed-and-failed tests rather than as no tests. It
 refuses to run against a dirty working tree, since a patch that can't be
 cleanly reverted would strand a mutation in your tree. This is evidence
 tooling for reviewing the suite's effectiveness. Dedicated CI jobs run the
-Health and command-palette mutations after the same commit's baseline E2E job passes.
+Health, pagination, range-dialog, and command-palette mutations after the same commit's baseline E2E job passes.
 
 08 through 11 are focus-order sensitive: the thing they break is
 where `document.activeElement` ends up after a keypress, and a browser
@@ -289,7 +289,7 @@ After a passing full browser baseline on the same commit, run from a clean tree:
 
 ```sh
 env -u NO_COLOR E2E_PORT=8168 crates/trawl-web-ui/e2e/scripts/mutation-check.sh \
-  22-palette-overlay-gate.patch 23-palette-toggle.patch
+  24-palette-overlay-gate.patch 25-palette-toggle.patch
 ```
 
 `NO_COLOR` is unset because the installed Trunk parses it as a boolean and rejects

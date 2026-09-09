@@ -414,7 +414,7 @@ jobs:
       - run: npx playwright install --with-deps chromium
         working-directory: crates/trawl-web-ui/e2e
       - name: Kill command palette admission and toggle mutations
-        run: env -u NO_COLOR crates/trawl-web-ui/e2e/scripts/mutation-check.sh 22-palette-overlay-gate.patch 23-palette-toggle.patch
+        run: env -u NO_COLOR crates/trawl-web-ui/e2e/scripts/mutation-check.sh 24-palette-overlay-gate.patch 25-palette-toggle.patch
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: failure()
         with:
