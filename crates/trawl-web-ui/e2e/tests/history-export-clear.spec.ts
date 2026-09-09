@@ -235,7 +235,7 @@ test('a held post-clear refresh cannot export retained first-page rows', async (
   await release(request, '/__ctl/history/load');
   await expect(rows(page)).toHaveCount(0);
   await expect(exportButton(page)).toBeDisabled();
-  await expect(page.getByRole('button', { name: 'Prev' })).toBeDisabled();
+  await expect(page.getByRole('button', { name: COPY.historyPrev, exact: true })).toBeDisabled();
   await expect(page.getByRole('button', { name: COPY.historyNext, exact: true })).toBeDisabled();
   expect(await state(request)).toMatchObject({ deletes: 1, offsets: [0, 0] });
 });
@@ -243,16 +243,16 @@ test('a held post-clear refresh cannot export retained first-page rows', async (
 test('held next-page export matches the fetched pagination window', async ({ page, request }) => {
   await request.post('/__ctl/reset', { data: { scenario: 'pagination', pagination: { holdHistoryOffset: 50 } } });
   await page.goto('/search/history');
-  const footer = page.locator('.results-footer');
-  await expect(footer.locator('.results-summary')).toHaveText('1–50 of 103');
-  await footer.getByRole('button', { name: 'Next' }).click();
+  const footer = page.locator(SEL.resultsFooter);
+  await expect(footer.locator(SEL.resultsSummary)).toHaveText('1–50 of 103');
+  await footer.getByRole('button', { name: COPY.historyNext, exact: true }).click();
   await expect.poll(async () => (await (await request.get('/__ctl/state')).json()).pagination.held).toBe(true);
-  await expect(footer.locator('.results-summary')).toHaveText('1–50 of 103');
+  await expect(footer.locator(SEL.resultsSummary)).toHaveText('1–50 of 103');
   await expect(rows(page).first()).toHaveText('history-row-1');
   await expect(exportButton(page)).toBeDisabled();
-  await expect(footer.getByRole('button', { name: 'Next' })).toBeDisabled();
+  await expect(footer.getByRole('button', { name: COPY.historyNext, exact: true })).toBeDisabled();
   await release(request, '/__ctl/pagination/release');
-  await expect(footer.locator('.results-summary')).toHaveText('51–100 of 103');
+  await expect(footer.locator(SEL.resultsSummary)).toHaveText('51–100 of 103');
   await expect(exportButton(page)).toBeEnabled();
   await page.locator(SEL.historyFormat).selectOption('json');
   const downloaded = page.waitForEvent('download');

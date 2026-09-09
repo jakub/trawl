@@ -9,6 +9,9 @@
 // sheet is a starting point, not gospel.
 
 export const SEL = {
+  /// crates/fleet-ui/src/pager.rs — the shared table footer and summary.
+  resultsFooter: '.results-footer',
+  resultsSummary: '.results-summary',
   historyAwayLink: 'nav.rail a[title="Schema"]',
   historyPage: '.history-page',
   historyFormat: 'select[aria-label="History export format"]',
@@ -328,6 +331,8 @@ export const COPY = {
   historyClearConfirm: 'Clear all history',
   historyClearFailed: 'Clear failed',
   historyClearDone: 'History cleared',
+  /// crates/fleet-ui/src/pager.rs — exact accessible pager button names.
+  historyPrev: '← Prev',
   historyNext: 'Next →',
   historyCancel: 'Cancel',
 

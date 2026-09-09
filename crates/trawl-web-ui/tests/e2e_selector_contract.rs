@@ -130,6 +130,24 @@ const CONTRACTS: &[Contract] = &[
         hook: "History cleared",
     },
     Contract {
+        assignment: "resultsFooter: '.results-footer',",
+        source_path: "../fleet-ui/src/pager.rs",
+        source: include_str!("../../fleet-ui/src/pager.rs"),
+        hook: "class=\"results-footer\"",
+    },
+    Contract {
+        assignment: "resultsSummary: '.results-summary',",
+        source_path: "../fleet-ui/src/pager.rs",
+        source: include_str!("../../fleet-ui/src/pager.rs"),
+        hook: "class=\"results-summary\"",
+    },
+    Contract {
+        assignment: "historyPrev: '← Prev',",
+        source_path: "../fleet-ui/src/pager.rs",
+        source: include_str!("../../fleet-ui/src/pager.rs"),
+        hook: "← Prev",
+    },
+    Contract {
         assignment: "historyNext: 'Next →',",
         source_path: "../fleet-ui/src/pager.rs",
         source: include_str!("../../fleet-ui/src/pager.rs"),
