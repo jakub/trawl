@@ -83,6 +83,10 @@ const MIME = {
 /** @type {'default'|'unauth'|'query-500'|'stream-burst'|'populated'|'corpus'} */
 let scenario = 'default';
 
+// History scenarios own their held responses and request counters.
+const history = { offsets: [], deletes: 0, cleared: false, pending: null, loadPending: [] };
+function historyScenario() { return scenario.startsWith('history-'); }
+
 // Dashboard counters survive resets. Resetting a scenario cannot hide a late
 // socket close or turn a leaked connection into a fresh baseline.
 const dashboard = {
@@ -195,6 +199,9 @@ function resetState() {
   dashboard.terminalPending.clear();
   for (const response of dashboard.pending) response.destroy();
   dashboard.pending.clear();
+  history.pending?.destroy();
+  for (const response of history.loadPending.splice(0)) response.destroy();
+  Object.assign(history, { offsets: [], deletes: 0, cleared: false, pending: null });
   unstubbed = [];
   queries = [];
   exports_ = [];
@@ -380,12 +387,38 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
           terminalPending: dashboard.terminalPending.size,
         },
         healthHits,
+        history: { offsets: history.offsets, deletes: history.deletes, pending: !!history.pending, loadPending: history.loadPending.length > 0 },
         cancelRequests,
         unstubbed,
         queries,
         unhandledQueries,
         exports: exports_,
       });
+      return;
+    }
+    if (p === '/__ctl/history/release' && req.method === 'POST') {
+      const pending = history.pending;
+      if (!pending) { sendJson(res, 409, { error: 'no pending history clear' }); return; }
+      history.pending = null;
+      if (scenario === 'history-clear-failure' && history.deletes === 1) {
+        sendJson(pending, 503, wire('history-error'));
+      } else {
+        const repeat = history.cleared;
+        history.cleared = true;
+        if (scenario === 'history-clear-lost' && history.deletes === 1) pending.destroy();
+        else if (scenario === 'history-clear-decode' && history.deletes === 1) {
+          pending.writeHead(200, { 'content-type': 'application/json' });
+          pending.end('{"deleted":');
+        } else sendJson(pending, 200, wire(repeat ? 'history-clear-repeat' : 'history-clear-success'));
+      }
+      sendJson(res, 200, { ok: true });
+      return;
+    }
+    if (p === '/__ctl/history/load' && req.method === 'POST') {
+      const pending = history.loadPending.shift();
+      if (!pending) { sendJson(res, 409, { error: 'no pending history load' }); return; }
+      sendJson(pending, 200, wire('history-export'));
+      sendJson(res, 200, { ok: true });
       return;
     }
     // Finish the parked status read. A spec calls this AFTER the drawer
@@ -601,6 +634,34 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
     }
 
     // -- other read-only canned surfaces --------------------------------
+    if (p === '/api/v1/history' && historyScenario()) {
+      if (req.method === 'DELETE') {
+        history.deletes += 1;
+        if (history.pending) { sendJson(res, 409, wire('history-error')); return; }
+        history.pending = res;
+        // Start the response before losing its body. Closing an unused
+        // keep-alive connection can make Chromium retry DELETE itself.
+        if (scenario === 'history-clear-lost' && history.deletes === 1) {
+          res.writeHead(200, { 'content-type': 'application/json', 'content-length': '100' });
+          res.flushHeaders();
+        }
+        return;
+      }
+      if (req.method === 'GET') {
+        history.offsets.push(Number(url.searchParams.get('offset') || 0));
+        if (scenario === 'history-loading' || (scenario === 'history-page-loading' && history.offsets.length > 1)) {
+          history.loadPending.push(res);
+          res.once('close', () => {
+            const index = history.loadPending.indexOf(res);
+            if (index !== -1) history.loadPending.splice(index, 1);
+          });
+          return;
+        }
+        if (scenario === 'history-failure') sendJson(res, 503, wire('history-error'));
+        else sendJson(res, 200, wire(history.cleared ? 'history-cleared' : 'history-export'));
+        return;
+      }
+    }
     if (p === '/api/v1/history' && req.method === 'GET') {
       sendJson(res, 200, scenario === 'corpus' ? corpusHistoryResponse() : historyResponse());
       return;

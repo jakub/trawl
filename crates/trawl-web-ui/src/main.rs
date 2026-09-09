@@ -12,6 +12,7 @@ mod drawer_query;
 mod facets;
 mod filter_codec;
 mod histogram;
+pub mod history_export;
 mod notice_key;
 mod offset;
 mod perms;

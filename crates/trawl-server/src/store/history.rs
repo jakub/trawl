@@ -112,6 +112,18 @@ impl HistoryStore {
         Ok(id)
     }
 
+    /// Delete this key's history visible to the DELETE statement's snapshot.
+    ///
+    /// A concurrent query may commit a new history row after that snapshot,
+    /// so a successful clear does not promise that history remains empty.
+    pub async fn clear_user_history(&self, key_id: i64) -> Result<u64, StoreError> {
+        Ok(sqlx::query("DELETE FROM query_history WHERE key_id = $1")
+            .bind(key_id)
+            .execute(&self.pool)
+            .await?
+            .rows_affected())
+    }
+
     /// Get a user's query history with pagination.
     ///
     /// Most recent first — `ORDER BY executed_at DESC, id DESC` (the id

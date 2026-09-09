@@ -9,6 +9,11 @@
 // sheet is a starting point, not gospel.
 
 export const SEL = {
+  historyAwayLink: 'nav.rail a[title="Schema"]',
+  historyPage: '.history-page',
+  historyFormat: 'select[aria-label="History export format"]',
+  historyFilter: 'input[placeholder="Filter history…"]',
+
   /// crates/fleet-ui/src/modal/confirm.rs ConfirmModal.
   healthConfirm: '[role="alertdialog"]',
   /// crates/fleet-ui/src/rail.rs title, crates/trawl-web-ui/src/state/section.rs Sources label.
@@ -318,6 +323,14 @@ export const TIMING = {
 } as const;
 
 export const COPY = {
+  historyExport: 'Export this page',
+  historyClear: 'Clear history',
+  historyClearConfirm: 'Clear all history',
+  historyClearFailed: 'Clear failed',
+  historyClearDone: 'History cleared',
+  historyNext: 'Next →',
+  historyCancel: 'Cancel',
+
   /// crates/trawl-web-ui/src/pages/history.rs HistoryPage.
   historyH1: 'Search history',
   /// crates/trawl-web-ui/src/pages/layout.rs NotFound.

@@ -1,0 +1,29 @@
+{
+  "entries": [
+    {
+      "id": 103,
+      "query": "=cmd(prod)",
+      "executed_at": "2026-09-08T12:00:00Z",
+      "duration_ms": 12,
+      "row_count": 3,
+      "status": "success"
+    },
+    {
+      "id": 102,
+      "query": "service=dev",
+      "executed_at": "2026-09-08T11:00:00Z",
+      "duration_ms": 20,
+      "row_count": 4,
+      "status": "success"
+    },
+    {
+      "id": 101,
+      "query": "prod \"雪,one\"\r\nnext",
+      "executed_at": "2026-09-08T10:00:00Z",
+      "duration_ms": 30,
+      "row_count": 0,
+      "status": "error"
+    }
+  ],
+  "total": 103
+}

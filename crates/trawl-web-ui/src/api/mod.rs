@@ -11,11 +11,11 @@
 use gloo_net::http::Request;
 use serde::{Deserialize, Serialize};
 use trawl_api::{
-    CatalogFieldResponse, CreateSavedRequest, DeleteSavedResponse, DeleteScheduleResponse,
-    ErrorResponse, ExportFormat, ExportRequest, HealthResponse, HistoryResponse,
-    ListAllRunsResponse, ListReportRunsResponse, ListSavedResponse, QueryRequest, QueryResponse,
-    RepinJobResponse, RepinRequest, RepinResponse, RepinStatusResponse, ReportRunResponse,
-    ReportRunSummary, RunsStatsResponse, SavedQueryResponse, ScheduleResponse,
+    CatalogFieldResponse, ClearHistoryResponse, CreateSavedRequest, DeleteSavedResponse,
+    DeleteScheduleResponse, ErrorResponse, ExportFormat, ExportRequest, HealthResponse,
+    HistoryResponse, ListAllRunsResponse, ListReportRunsResponse, ListSavedResponse, QueryRequest,
+    QueryResponse, RepinJobResponse, RepinRequest, RepinResponse, RepinStatusResponse,
+    ReportRunResponse, ReportRunSummary, RunsStatsResponse, SavedQueryResponse, ScheduleResponse,
     ServiceSchemaResponse, SetScheduleRequest, UpdateSavedRequest,
 };
 
@@ -175,6 +175,19 @@ pub async fn history(limit: usize, offset: usize) -> Result<HistoryResponse, Api
     match resp.status() {
         200 => resp
             .json::<HistoryResponse>()
+            .await
+            .map_err(|e| ApiError::Decode(e.to_string())),
+        401 => Err(ApiError::Unauthorized),
+        s => Err(ApiError::Status(s)),
+    }
+}
+
+/// DELETE /api/v1/history clears only the current session key's history.
+pub async fn clear_history() -> Result<ClearHistoryResponse, ApiError> {
+    let resp = Request::delete("/api/v1/history").send().await?;
+    match resp.status() {
+        200 => resp
+            .json::<ClearHistoryResponse>()
             .await
             .map_err(|e| ApiError::Decode(e.to_string())),
         401 => Err(ApiError::Unauthorized),

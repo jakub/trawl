@@ -72,6 +72,7 @@ fn authenticated_routes() -> Vec<(reqwest::Method, &'static str)> {
         (Method::GET, "/api/v1/dashboard"),
         (Method::GET, "/api/v1/whoami"),
         (Method::GET, "/api/v1/history"),
+        (Method::DELETE, "/api/v1/history"),
         (Method::GET, "/api/v1/saved"),
         (Method::POST, "/api/v1/saved"),
         (Method::PUT, "/api/v1/saved/1"),
@@ -1191,4 +1192,154 @@ async fn dashboard_reports_schedule_count_from_pg() {
         );
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn history_clear_requires_query_and_scopes_to_caller() {
+    let server = setup().await;
+    let reader = trawl_client::HttpClient::new_insecure(&server.url, &server.reader_token).unwrap();
+    let analyst =
+        trawl_client::HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+    reader
+        .query_paginated("* | head 1", None, None)
+        .await
+        .unwrap();
+    reader
+        .query_paginated("* | head 2", None, None)
+        .await
+        .unwrap();
+    analyst
+        .query_paginated("* | head 3", None, None)
+        .await
+        .unwrap();
+    let foreign = analyst.history(None, None).await.unwrap();
+    let saved = analyst.create_saved("keep", "*").await.unwrap();
+
+    let (status, _) = request(
+        &server.url,
+        reqwest::Method::DELETE,
+        "/api/v1/history",
+        Some(&server.ingest_token),
+    )
+    .await;
+    assert_eq!(status, 403);
+    assert_eq!(reader.history(None, None).await.unwrap().total, 2);
+
+    // Client-supplied actor identifiers have no authority.
+    let response = raw_client()
+        .delete(format!("{}/api/v1/history?key_id=0", server.url))
+        .bearer_auth(&server.reader_token)
+        .json(&serde_json::json!({"key_id": 0}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(
+        response.json::<serde_json::Value>().await.unwrap(),
+        serde_json::json!({"deleted": 2})
+    );
+    assert_eq!(reader.clear_history().await.unwrap().deleted, 0);
+    assert_eq!(reader.history(None, None).await.unwrap().total, 0);
+    assert_eq!(
+        serde_json::to_value(analyst.history(None, None).await.unwrap()).unwrap(),
+        serde_json::to_value(foreign).unwrap()
+    );
+    assert_eq!(analyst.list_saved().await.unwrap().queries[0].id, saved.id);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn history_clear_redacts_store_failure() {
+    let server = setup().await;
+    server.kill_app_database().await;
+    let (status, body) = request(
+        &server.url,
+        reqwest::Method::DELETE,
+        "/api/v1/history",
+        Some(&server.reader_token),
+    )
+    .await;
+    assert_eq!(status, 503);
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "error": {"code": "service_unavailable", "message": "app-state store unavailable"}
+        })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn history_clear_audits_only_successful_actor_and_count() {
+    use common::audit_capture::Capture;
+    use tracing_subscriber::prelude::*;
+
+    let capture = Capture::default();
+    let subscriber = tracing_subscriber::registry().with(
+        capture
+            .clone()
+            .with_filter(tracing_subscriber::EnvFilter::new("trawl_server=info")),
+    );
+    tracing::subscriber::set_global_default(subscriber).expect("no prior global subscriber");
+
+    let server = setup().await;
+    let key_store = KeyStore::from_pool(server.fleet_pool.clone());
+    let actor = key_store.verify_key(&server.reader_token).await.unwrap();
+    let reader = trawl_client::HttpClient::new_insecure(&server.url, &server.reader_token).unwrap();
+    // Seed sensitive query text without executing a query that emits its own
+    // unrelated diagnostics. The clear event must contain metadata alone.
+    server
+        .state
+        .storage
+        .history
+        .record_query(
+            actor.id,
+            "private-query-payload-must-not-be-logged",
+            1,
+            0,
+            trawl_server::store::RunStatus::Success,
+        )
+        .await
+        .unwrap();
+    let events = || {
+        capture
+            .events()
+            .into_iter()
+            .filter(|event| {
+                event
+                    .fields
+                    .get("event_type")
+                    .is_some_and(|value| value == "\"history_cleared\"")
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let (status, _) = request(
+        &server.url,
+        reqwest::Method::DELETE,
+        "/api/v1/history",
+        Some(&server.ingest_token),
+    )
+    .await;
+    assert_eq!(status, 403);
+    assert!(events().is_empty(), "denial must not emit a clear event");
+    assert_eq!(reader.clear_history().await.unwrap().deleted, 1);
+    assert_eq!(reader.clear_history().await.unwrap().deleted, 0);
+
+    let cleared = events();
+    assert_eq!(cleared.len(), 2);
+    for (event, deleted) in cleared.iter().zip(["1", "0"]) {
+        assert_eq!(event.field("key_id"), actor.id.to_string());
+        assert_eq!(event.field("deleted"), deleted);
+        assert_eq!(event.field("message"), "Query history cleared");
+        assert_eq!(
+            event.fields.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["deleted", "event_type", "key_id", "message"]
+        );
+        assert!(event.fields.values().all(|value| {
+            !value.contains("private-query-payload") && !value.contains(&server.reader_token)
+        }));
+    }
+
+    server.kill_app_database().await;
+    assert!(reader.clear_history().await.is_err());
+    assert_eq!(events().len(), 2, "storage failure must not emit success");
 }

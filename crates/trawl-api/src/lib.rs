@@ -13,6 +13,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+pub mod csv;
 pub mod display;
 pub mod value;
 
@@ -1278,6 +1279,13 @@ pub struct GcPinCandidate {
 }
 
 // -- history -----------------------------------------------------------------
+
+/// Response after clearing the authenticated key's query history.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClearHistoryResponse {
+    /// Number of history rows deleted by this request.
+    pub deleted: u64,
+}
 
 /// Response from the history endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]

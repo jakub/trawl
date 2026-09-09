@@ -15,14 +15,16 @@ use fleet_auth::VerifiedKey;
 use serde::Deserialize;
 use std::borrow::Cow;
 use std::convert::Infallible;
+use trawl_api::csv::sanitize_csv_formula;
 use trawl_api::{
-    CancelResponse, CreateSavedRequest, DashboardSnapshot, DeleteSavedResponse,
-    DeleteScheduleResponse, ExportRequest, FieldValuesResponse, GlobalRunSummary, HealthResponse,
-    HealthStatus, HistoryEntryResponse, HistoryResponse, ListAllRunsResponse,
-    ListReportRunsResponse, ListSavedResponse, PaginationMeta, QueriesResponse, QueryRequest,
-    QueryResponse, QueryStatus, ReportRunResponse, ReportRunSummary, RetainedWorkSnapshot,
-    RunsStatsResponse, SavedQueryResponse, ScheduleResponse, SchemaColumnResponse, SchemaResponse,
-    SetScheduleRequest, StatsResponse, UpdateSavedRequest, ValidationResponse, WhoAmIResponse,
+    CancelResponse, ClearHistoryResponse, CreateSavedRequest, DashboardSnapshot,
+    DeleteSavedResponse, DeleteScheduleResponse, ExportRequest, FieldValuesResponse,
+    GlobalRunSummary, HealthResponse, HealthStatus, HistoryEntryResponse, HistoryResponse,
+    ListAllRunsResponse, ListReportRunsResponse, ListSavedResponse, PaginationMeta,
+    QueriesResponse, QueryRequest, QueryResponse, QueryStatus, ReportRunResponse, ReportRunSummary,
+    RetainedWorkSnapshot, RunsStatsResponse, SavedQueryResponse, ScheduleResponse,
+    SchemaColumnResponse, SchemaResponse, SetScheduleRequest, StatsResponse, UpdateSavedRequest,
+    ValidationResponse, WhoAmIResponse,
 };
 use trawl_engine::value::{QueryResult, Value};
 
@@ -1815,6 +1817,29 @@ pub async fn history(
     }))
 }
 
+/// `DELETE /api/v1/history` clears only the authenticated key's history.
+pub async fn clear_history(
+    State(state): State<AppState>,
+    Extension(verified): Extension<VerifiedKey>,
+) -> Result<Json<ClearHistoryResponse>, ServerError> {
+    if !verified.has_permission(Permission::Query) {
+        return Err(ServerError::Forbidden("insufficient permissions".into()));
+    }
+
+    let deleted = state
+        .storage
+        .history
+        .clear_user_history(verified.id)
+        .await?;
+    tracing::info!(
+        event_type = "history_cleared",
+        key_id = verified.id,
+        deleted,
+        "Query history cleared"
+    );
+    Ok(Json(ClearHistoryResponse { deleted }))
+}
+
 /// Query parameters for the history endpoint.
 #[derive(Debug, Deserialize)]
 pub struct HistoryParams {
@@ -3179,19 +3204,6 @@ fn value_to_string(value: &Value) -> Cow<'_, str> {
                 Cow::Owned(owned) => Cow::Owned(owned),
             }
         }
-    }
-}
-
-/// Prefix cell values that could trigger formula injection in spreadsheets.
-///
-/// See OWASP CSV injection guidelines. Only string values need
-/// sanitization — numeric values like `-42` are legitimately negative.
-/// Returns borrowed when no prefix is needed.
-fn sanitize_csv_formula(s: &str) -> Cow<'_, str> {
-    if s.starts_with(['=', '+', '-', '@', '\t', '|']) {
-        Cow::Owned(format!("'{s}"))
-    } else {
-        Cow::Borrowed(s)
     }
 }
 

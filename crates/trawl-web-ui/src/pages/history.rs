@@ -9,20 +9,28 @@
 //! - filter rows client-side by substring on the query text
 //! - click a row to reload the query into the search editor
 //! - "Save as Net" via a modal dialog → `POST /api/v1/saved`
+//! - export the filtered loaded page as CSV or JSON
+//! - confirm deletion of every history row owned by the current key
 //!
 //! URL params: `hpage=N` drives pagination (separate from the search
 //! page's `?page=` so switching sections leaves a clean history URL).
 
 use leptos::prelude::*;
+use leptos::task::spawn_local;
 use leptos_router::NavigateOptions;
 use leptos_router::hooks::{use_navigate, use_query_map};
 use trawl_api::HistoryEntryResponse;
 
 use crate::api;
 use crate::components::save_as_net_modal::SaveAsNetModal;
+use crate::download::trigger_download;
+use crate::history_export::{HistoryExportFormat, serialize_history};
 use crate::state::query::{Mode, RangeSpec, navigator, report_refusal};
 use fleet_ui::time::format_duration;
-use fleet_ui::{Btn, LoadState, Loaded, Pager, SearchInput, ToastBus, ToastKind, Variant, When};
+use fleet_ui::{
+    Btn, ConfirmModal, ConfirmState, LoadState, Loaded, Pager, SearchInput, ToastBus, ToastKind,
+    Variant, When,
+};
 
 /// Rows per page — the server caps at 1000 but 50 matches the results
 /// table's page size, so the paginator feels familiar.
@@ -41,8 +49,45 @@ pub fn HistoryPage() -> impl IntoView {
     });
     let filter = RwSignal::new(String::new());
 
-    let resource = LocalResource::new(move || async move {
-        api::history(PAGE_SIZE, hpage.get() * PAGE_SIZE).await
+    let loading = RwSignal::new(true);
+    let load_generation = RwSignal::new(0_u64);
+    let loaded_page = RwSignal::new(None::<usize>);
+    let resource = LocalResource::new(move || {
+        let page = hpage.get();
+        let offset = page * PAGE_SIZE;
+        let generation = load_generation.get_untracked().wrapping_add(1);
+        load_generation.set(generation);
+        loading.set(true);
+        async move {
+            let response = api::history(PAGE_SIZE, offset).await;
+            // An older request cannot enable export while a newer one waits.
+            if load_generation.try_get_untracked() == Some(generation) {
+                loaded_page.set(Some(page));
+                loading.set(false);
+            }
+            response
+        }
+    });
+
+    let filtered_rows = Signal::derive(move || {
+        let Some(Ok(resp)) = resource.get() else {
+            return Vec::new();
+        };
+        let needle = filter.get().to_lowercase();
+        resp.entries
+            .iter()
+            .filter(|h| needle.is_empty() || h.query.to_lowercase().contains(&needle))
+            .cloned()
+            .collect::<Vec<HistoryEntryResponse>>()
+    });
+    let export_format = RwSignal::new(HistoryExportFormat::Csv);
+    let clearing = RwSignal::new(false);
+    let confirm_clear = RwSignal::new(ConfirmState::<()>::default());
+    let export_disabled = Signal::derive(move || {
+        clearing.get()
+            || loading.get()
+            || loaded_page.get() != Some(hpage.get())
+            || filtered_rows.get().is_empty()
     });
 
     // Captured up-front — navigate() panics outside the <Router> context
@@ -69,25 +114,82 @@ pub fn HistoryPage() -> impl IntoView {
     let on_modal_close: Callback<bool> = Callback::new(move |_saved| save_target.set(None));
 
     let on_export = Callback::new(move |()| {
-        bus.push(
-            ToastKind::Info,
-            "Export",
-            Some("History export is landing soon.".into()),
-        );
+        if export_disabled.get_untracked() {
+            return;
+        }
+        let format = export_format.get_untracked();
+        let result = serialize_history(&filtered_rows.get_untracked(), format)
+            .map_err(|e| e.to_string())
+            .and_then(|bytes| trigger_download(&bytes, format.filename(), format.mime()));
+        if let Err(error) = result {
+            bus.push(ToastKind::Error, "Export failed", Some(error));
+        }
     });
     let on_clear = Callback::new(move |()| {
-        bus.push(
-            ToastKind::Info,
-            "Clear history",
-            Some("Server-side history clearing is landing soon.".into()),
-        );
+        if !clearing.get_untracked() {
+            confirm_clear.update(|state| state.request(()));
+        }
     });
+    let on_confirm_clear = {
+        let goto_hpage = goto_hpage.clone();
+        Callback::new(move |()| {
+            if clearing.get_untracked()
+                || confirm_clear
+                    .try_update(ConfirmState::take)
+                    .flatten()
+                    .is_none()
+            {
+                return;
+            }
+            clearing.set(true);
+            let goto_hpage = goto_hpage.clone();
+            spawn_local(async move {
+                let result = api::clear_history().await;
+                // The request may finish after History has unmounted.
+                if clearing.is_disposed() {
+                    return;
+                }
+                match result {
+                    Ok(response) => {
+                        loading.set(true);
+                        filter.set(String::new());
+                        // A page change fetches offset zero. Refetch explicitly only
+                        // when already there, never against the old nonzero offset.
+                        let already_first_page = hpage.get_untracked() == 0;
+                        goto_hpage(
+                            "/search/history",
+                            NavigateOptions {
+                                replace: true,
+                                ..Default::default()
+                            },
+                        );
+                        if already_first_page {
+                            resource.refetch();
+                        }
+                        bus.push(
+                            ToastKind::Success,
+                            "History cleared",
+                            Some(format!("Deleted {} history entries.", response.deleted)),
+                        );
+                    }
+                    Err(error) => {
+                        bus.push(ToastKind::Error, "Clear failed", Some(error.to_string()));
+                    }
+                }
+                clearing.set(false);
+            });
+        })
+    };
 
     let on_prev = {
         let goto_hpage = goto_hpage.clone();
         Callback::new(move |()| {
+            if clearing.get_untracked() {
+                return;
+            }
             let cur = hpage.get_untracked();
             if cur > 0 {
+                loading.set(true);
                 goto_hpage(
                     &format!("/search/history?hpage={}", cur - 1),
                     NavigateOptions {
@@ -101,7 +203,11 @@ pub fn HistoryPage() -> impl IntoView {
     let on_next = {
         let goto_hpage = goto_hpage.clone();
         Callback::new(move |()| {
+            if clearing.get_untracked() {
+                return;
+            }
             let cur = hpage.get_untracked();
+            loading.set(true);
             goto_hpage(
                 &format!("/search/history?hpage={}", cur + 1),
                 NavigateOptions {
@@ -113,7 +219,7 @@ pub fn HistoryPage() -> impl IntoView {
     };
 
     view! {
-        <div class="page">
+        <div class="page history-page">
             <div class="page-hd compact">
                 <div>
                     <h1>"Search history"</h1>
@@ -121,8 +227,23 @@ pub fn HistoryPage() -> impl IntoView {
                 </div>
                 <div class="actions">
                     <SearchInput value=filter placeholder="Filter history…"/>
-                    <Btn variant=Variant::Secondary on_click=on_export>"Export"</Btn>
-                    <Btn variant=Variant::Secondary on_click=on_clear>"Clear history"</Btn>
+                    <select
+                        class="btn-sec"
+                        aria-label="History export format"
+                        disabled=move || export_disabled.get()
+                        on:change=move |event| export_format.set(
+                            if event_target_value(&event) == "json" {
+                                HistoryExportFormat::Json
+                            } else {
+                                HistoryExportFormat::Csv
+                            }
+                        )
+                    >
+                        <option value="csv">"CSV"</option>
+                        <option value="json">"JSON"</option>
+                    </select>
+                    <Btn variant=Variant::Secondary disabled=export_disabled on_click=on_export>"Export this page"</Btn>
+                    <Btn variant=Variant::Secondary disabled=clearing on_click=on_clear>"Clear history"</Btn>
                 </div>
             </div>
 
@@ -139,13 +260,7 @@ pub fn HistoryPage() -> impl IntoView {
                     state=Signal::derive(move || LoadState::from_resource(resource.get()))
                     label="history"
                     render=Box::new(move |resp: trawl_api::HistoryResponse| {
-                        let needle = filter.get().to_lowercase();
-                        let filtered: Vec<HistoryEntryResponse> = resp
-                            .entries
-                            .iter()
-                            .filter(|h| needle.is_empty() || h.query.to_lowercase().contains(&needle))
-                            .cloned()
-                            .collect();
+                        let filtered = filtered_rows.get();
 
                         if filtered.is_empty() {
                             return view! {
@@ -229,14 +344,25 @@ pub fn HistoryPage() -> impl IntoView {
                     view! {
                         <Pager
                             summary=summary
-                            can_prev=Signal::from(can_prev)
-                            can_next=Signal::from(can_next)
+                            can_prev=Signal::derive(move || can_prev && !clearing.get())
+                            can_next=Signal::derive(move || can_next && !clearing.get())
                             on_prev=on_prev
                             on_next=on_next
                         />
                     }.into_any()
                 }}
             </div>
+
+            <Show when=move || confirm_clear.get().is_open()>
+                <ConfirmModal
+                    title="Clear history"
+                    message="Delete all query history for your current key, across every page? Saved queries will remain. A query running now may add a new history entry after the clear.".to_owned()
+                    confirm_label="Clear all history"
+                    confirm_variant=Variant::Danger
+                    on_confirm=on_confirm_clear
+                    on_cancel=Callback::new(move |()| confirm_clear.update(ConfirmState::cancel))
+                />
+            </Show>
 
             {move || save_target.get().map(|q| view! {
                 <SaveAsNetModal query=q on_close=on_modal_close/>
