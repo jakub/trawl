@@ -553,6 +553,7 @@ fn command_palette_trigger_is_a_live_native_button() {
         assert!(topbar.contains(required), "TopBar lost {required}");
     }
     assert!(!topbar.contains("coming soon"));
+    assert!(trigger.contains("aria-label=\"Go to… Command palette\""));
     assert!(!trigger.contains("Search…"));
 }
 

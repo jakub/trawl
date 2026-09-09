@@ -546,7 +546,11 @@ mod component {
         });
 
         let _ = use_event_listener(use_window(), ev::keydown, move |event| {
-            if layer.is_topmost() && event.key() == "Escape" {
+            if !event.default_prevented()
+                && !event.is_composing()
+                && layer.is_topmost()
+                && event.key() == "Escape"
+            {
                 event.prevent_default();
                 on_close.run(());
             }

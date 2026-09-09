@@ -84,6 +84,38 @@ for (const chord of ['Control+k', 'Meta+k']) {
   }
 }
 
+test('trigger accessible name includes its visible Go to label', async ({ page }) => {
+  await page.goto('/search');
+  const trigger = page.locator(SEL.paletteTrigger);
+  await expect(trigger).toContainText('Go to…');
+  await expect(trigger).toHaveAccessibleName('Go to… Command palette');
+  await page.getByRole('button', { name: 'Go to… Command palette', exact: true }).click();
+  await expect(page.locator(SEL.paletteDialog)).toBeVisible();
+});
+
+for (const kind of ['composing', 'consumed'] as const) {
+  test(`${kind} Escape leaves the palette open until an ordinary Escape`, async ({ page }) => {
+    await page.goto('/search');
+    await open(page);
+    const input = page.locator(SEL.paletteInput);
+    const prevented = await input.evaluate((node, kind) => {
+      if (kind === 'consumed') {
+        node.addEventListener('keydown', (event) => event.preventDefault(), { once: true });
+      }
+      const event = new KeyboardEvent('keydown', {
+        key: 'Escape', bubbles: true, cancelable: true, isComposing: kind === 'composing',
+      });
+      node.dispatchEvent(event);
+      return event.defaultPrevented;
+    }, kind);
+    await expect(page.locator(SEL.paletteDialog)).toBeVisible();
+    await expect(input).toBeFocused();
+    expect(prevented).toBe(kind === 'consumed');
+    await page.keyboard.press('Escape');
+    await closed(page);
+  });
+}
+
 for (const route of ['/search/schema', '/settings/health']) {
   test(`trigger opens deduplicated mode-first inventory at ${route}`, async ({ page, request }) => {
     if (route.startsWith('/settings')) await resetScenario(request, 'health-viewer');

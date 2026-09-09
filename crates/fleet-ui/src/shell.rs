@@ -168,7 +168,7 @@ fn install_palette_chord(
         leptos::ev::keydown,
         move |event: web_sys::KeyboardEvent| {
             let key = event.key();
-            let facts = ChordFacts {
+            let mut facts = ChordFacts {
                 key: &key,
                 ctrl: event.ctrl_key(),
                 meta: event.meta_key(),
@@ -177,9 +177,15 @@ fn install_palette_chord(
                 repeat: event.repeat(),
                 default_prevented: event.default_prevented(),
                 composing: event.is_composing(),
-                editable: editable_target(&event),
+                editable: false,
             };
             if !available.get_untracked() || !is_palette_chord(facts, is_macos) {
+                return;
+            }
+            // Ordinary typing never needs a composed-path walk or DOM queries.
+            // Reuse the predicate after classifying a possible chord's target.
+            facts.editable = editable_target(&event);
+            if !is_palette_chord(facts, is_macos) {
                 return;
             }
             if palette_open.get_untracked() {

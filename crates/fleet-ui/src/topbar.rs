@@ -117,7 +117,7 @@ pub fn TopBar(
                     type="button"
                     class="jump"
                     title="Command palette"
-                    aria-label="Command palette"
+                    aria-label="Go to… Command palette"
                     aria-haspopup="dialog"
                     aria-expanded=move || palette_open.get().to_string()
                     aria-keyshortcuts=hint.aria_keyshortcuts
