@@ -74,6 +74,13 @@ thread_local! {
     static NEXT_ID: RefCell<u64> = const { RefCell::new(0) };
 }
 
+/// Whether any overlay is registered, including layers without focus ownership.
+/// Shell uses this to leave global palette chords inert behind another overlay.
+#[must_use]
+pub fn has_layers() -> bool {
+    STACK.with_borrow(|stack| !stack.is_empty())
+}
+
 /// A registered overlay layer — a cheap `Copy` handle over a stack id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OverlayLayer(u64);
@@ -483,6 +490,31 @@ mod tests {
 
     // Tests balance every push with a release so they stay robust to
     // any leftover thread-local state when the harness reuses a thread.
+
+    #[test]
+    fn command_palette_has_layers_tracks_full_overlay_lifecycle() {
+        assert!(!has_layers());
+        let menu = push_overlay_with(FocusPolicy::None);
+        assert!(has_layers(), "focus-free menus still block the palette");
+        let drawer = push_overlay_with(FocusPolicy::Capture);
+        let modal = push_overlay_with(FocusPolicy::Trap);
+        drawer.release();
+        assert!(
+            has_layers(),
+            "removing a middle layer keeps the stack occupied"
+        );
+        menu.release();
+        menu.release();
+        assert!(has_layers(), "a modal alone keeps the stack occupied");
+        modal.release();
+        assert!(!has_layers());
+        modal.release();
+        assert!(!has_layers(), "repeated release cannot recreate occupancy");
+        let reopened = push_overlay_with(FocusPolicy::Capture);
+        assert!(has_layers());
+        reopened.release();
+        assert!(!has_layers());
+    }
 
     #[test]
     fn topmost_is_last_pushed() {

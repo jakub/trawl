@@ -44,6 +44,9 @@
 pub mod atmosphere;
 pub mod badge;
 pub mod button;
+// Pure palette checkpoint. Enable wasm when the browser consumers are added.
+#[cfg(test)]
+pub(crate) mod command_palette;
 pub mod copy_button;
 pub mod load_more;
 pub mod loaded;
