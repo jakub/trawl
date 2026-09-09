@@ -1831,6 +1831,12 @@ pub async fn clear_history(
         .history
         .clear_user_history(verified.id)
         .await?;
+    tracing::info!(
+        event_type = "history_cleared",
+        key_id = verified.id,
+        deleted,
+        "Query history cleared"
+    );
     Ok(Json(ClearHistoryResponse { deleted }))
 }
 

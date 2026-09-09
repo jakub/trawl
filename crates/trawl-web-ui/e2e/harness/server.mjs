@@ -84,7 +84,7 @@ const MIME = {
 let scenario = 'default';
 
 // History scenarios own their held responses and request counters.
-const history = { offsets: [], deletes: 0, cleared: false, pending: null, loadPending: null };
+const history = { offsets: [], deletes: 0, cleared: false, pending: null, loadPending: [] };
 function historyScenario() { return scenario.startsWith('history-'); }
 
 // Dashboard counters survive resets. Resetting a scenario cannot hide a late
@@ -200,8 +200,8 @@ function resetState() {
   for (const response of dashboard.pending) response.destroy();
   dashboard.pending.clear();
   history.pending?.destroy();
-  history.loadPending?.destroy();
-  Object.assign(history, { offsets: [], deletes: 0, cleared: false, pending: null, loadPending: null });
+  for (const response of history.loadPending.splice(0)) response.destroy();
+  Object.assign(history, { offsets: [], deletes: 0, cleared: false, pending: null });
   unstubbed = [];
   queries = [];
   exports_ = [];
@@ -387,7 +387,7 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
           terminalPending: dashboard.terminalPending.size,
         },
         healthHits,
-        history: { offsets: history.offsets, deletes: history.deletes, pending: !!history.pending, loadPending: !!history.loadPending },
+        history: { offsets: history.offsets, deletes: history.deletes, pending: !!history.pending, loadPending: history.loadPending.length > 0 },
         cancelRequests,
         unstubbed,
         queries,
@@ -415,9 +415,8 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       return;
     }
     if (p === '/__ctl/history/load' && req.method === 'POST') {
-      const pending = history.loadPending;
+      const pending = history.loadPending.shift();
       if (!pending) { sendJson(res, 409, { error: 'no pending history load' }); return; }
-      history.loadPending = null;
       sendJson(pending, 200, wire('history-export'));
       sendJson(res, 200, { ok: true });
       return;
@@ -650,7 +649,14 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       }
       if (req.method === 'GET') {
         history.offsets.push(Number(url.searchParams.get('offset') || 0));
-        if (scenario === 'history-loading' || (scenario === 'history-page-loading' && history.offsets.length > 1)) { history.loadPending = res; return; }
+        if (scenario === 'history-loading' || (scenario === 'history-page-loading' && history.offsets.length > 1)) {
+          history.loadPending.push(res);
+          res.once('close', () => {
+            const index = history.loadPending.indexOf(res);
+            if (index !== -1) history.loadPending.splice(index, 1);
+          });
+          return;
+        }
         if (scenario === 'history-failure') sendJson(res, 503, wire('history-error'));
         else sendJson(res, 200, wire(history.cleared ? 'history-cleared' : 'history-export'));
         return;

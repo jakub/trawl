@@ -82,6 +82,34 @@ test('export is disabled after a history load failure', async ({ page, request }
   await expect(rows(page)).toHaveCount(0);
 });
 
+test('held history loads release independently in request order', async ({ request }) => {
+  await resetScenario(request, 'history-loading');
+  const completed: string[] = [];
+  const reads: Promise<void>[] = [];
+  const read = (name: string, offset: number) => request.get(`/api/v1/history?offset=${offset}`, { timeout: 5000 })
+    .then(async (response) => {
+      expect(response.status()).toBe(200);
+      expect(await response.json()).toEqual(loaded);
+      completed.push(name);
+    });
+  try {
+    reads.push(read('first', 0));
+    await expect.poll(async () => (await state(request)).offsets).toEqual([0]);
+    reads.push(read('second', 50));
+    await expect.poll(async () => (await state(request)).offsets).toEqual([0, 50]);
+    await release(request, '/__ctl/history/load');
+    await expect.poll(() => completed).toEqual(['first']);
+    expect((await state(request)).loadPending).toBe(true);
+    await release(request, '/__ctl/history/load');
+    await Promise.all(reads);
+    expect(completed).toEqual(['first', 'second']);
+    expect((await state(request)).loadPending).toBe(false);
+  } finally {
+    await resetScenario(request, 'default');
+    await Promise.allSettled(reads);
+  }
+});
+
 test('retained rows cannot export while the next page is loading', async ({ page, request }) => {
   await resetScenario(request, 'history-page-loading');
   await openFiltered(page);
