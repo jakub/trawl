@@ -191,12 +191,15 @@ one thing the suite is supposed to catch:
 | `17-range-dialog-no-layer.patch` | the range dialog drops its `use_overlay_layer_with` registration: no opener capture, no initial focus, no Tab trap, no restore | `range-dialog.spec.ts` |
 | `18-facet-actions-display-none.patch` | `.facets .v .act` goes back to `display: none` until hover, which takes include and exclude out of the tab order | `facets.spec.ts` |
 | `19-results-th-no-aria-sort.patch` | `aria-sort` comes off the results `<th>`, so the sorted column and its direction are announced nowhere | `sort-headers.spec.ts` |
+| `20-health-admin-gate.patch` | Health mounts admin stats/dashboard requests without permission | `health-page.spec.ts`; focused request counters and a 404 routing control |
 | `21-atmosphere-speed-only.patch` | Delete only the terminal dead assignment, keeping speed zero and hidden canvas; reactive motion changes restart shader rAF | `atmosphere-fallback.spec.ts`, dedicated `scripts/atmosphere-mutation-check.sh` |
+| `22-runs-filtered-window.patch` | Global Runs computes its page window from filtered rows instead of the server page | `pagination.spec.ts`, zero-match filter keeps `1–3 of 3` |
+| `23-range-close-on-refusal.patch` | The shared range commit path closes after the app refuses a selection | `range-dialog.spec.ts`, retained absolute and quick drafts with inline errors |
 
 Run the mechanism:
 
 ```sh
-crates/trawl-web-ui/e2e/scripts/mutation-check.sh                     # all nineteen
+crates/trawl-web-ui/e2e/scripts/mutation-check.sh                     # all twenty-two (21 has a dedicated runner)
 crates/trawl-web-ui/e2e/scripts/mutation-check.sh 02-editor-onchange.patch  # just one
 ```
 
@@ -333,3 +336,45 @@ shader module and calls its real public handle. That test first proves a live
 color change reaches GL uniforms, then proves color and speed changes issue no
 GL calls or shader callbacks after loss and after repeated disposal. No test
 changes Rust signal access or framework callback lifetimes.
+
+
+### Pagination and range acceptance
+
+The `pagination` scenario supplies offset-aware History, query results and
+report-run pages. Its three-run wire bodies and matching statistics are decoded
+by the native wire contract; larger pages are generated from those same row
+shapes. Query responses stamp the requested offset and returned row count.
+Configurable totals cover full, short and empty pages, and `truncated` is
+independent of the offset paging protocol. No real database or auth service is
+involved.
+
+`pagination.spec.ts` checks History's single-decode reader, URL replacement,
+filters, offset refusal, Known totals and Probe Next behavior; global Runs and
+the unfiltered net drawer; and busy pagers with retained response summaries.
+The delayed History case holds a response, changes the page through an anchor
+intercepted by the existing SPA router, then releases the old response and
+requires the latest queued offset, rows and summary to agree. The pinned
+LocalResource executes serially: this proves final agreement after release,
+not concurrent requests or a database snapshot. A separate held query proves
+that a same-page query change disables the pager while old rows remain visible.
+
+`range-dialog.spec.ts` keeps the keyboard, focus, scrim and label checks and
+adds refused absolute/quick drafts, tab lifetime, close/reset behavior, and
+Live refusal from the editor buffer. The Fleet workbench is a separate reuse
+probe with different presets and no Live tab, not a second maintained suite.
+
+Run the focused mutations from a clean checkout:
+
+```sh
+E2E_PORT=8166 crates/trawl-web-ui/e2e/scripts/mutation-check.sh \
+  17-range-dialog-no-layer.patch \
+  22-runs-filtered-window.patch \
+  23-range-close-on-refusal.patch
+```
+
+Each uses `routing.spec.ts` as an independent passing control. The
+`web-ui-pagination-range-mutations` CI job waits for the full `web-ui-e2e`
+baseline, runs these three mutations and uploads failure traces. Apply or build
+failure is not a kill; the target must execute and fail, the control must pass,
+and the runner must restore both clean source and pristine app dist. Mutation
+21 remains reserved for the dedicated Atmosphere runner.

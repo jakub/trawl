@@ -1,0 +1,12 @@
+diff --git a/crates/trawl-web-ui/src/pages/runs.rs b/crates/trawl-web-ui/src/pages/runs.rs
+--- a/crates/trawl-web-ui/src/pages/runs.rs
++++ b/crates/trawl-web-ui/src/pages/runs.rs
+@@ -115,7 +115,7 @@
+                                 let suffix = if needle.is_empty() { String::new() }
+                                     else { format!(" · {matches} matches on this page") };
+                                 let window = Signal::derive(move || PageWindow::new(
+-                                    fetched_page, RUNS_PAGE_SIZE, returned, PageTotal::Known(total),
++                                    fetched_page, RUNS_PAGE_SIZE, matches, PageTotal::Known(total),
+                                     pending.get() || page.get() != fetched_page,
+                                 ).expect("runs page comes from checked pager navigation"));
+ 
