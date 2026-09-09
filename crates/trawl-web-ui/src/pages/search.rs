@@ -128,7 +128,8 @@ pub fn Search() -> impl IntoView {
         effective_query(&base, &fs, &r)
     });
 
-    let rows = rows_resource(effective_q, page);
+    let (query_pending, set_query_pending) = signal(false);
+    let rows = rows_resource(effective_q, page, set_query_pending);
 
     let goto = navigator();
 
@@ -392,8 +393,9 @@ pub fn Search() -> impl IntoView {
 
     let ring_result = Memo::new(move |_| ring_to_result(&ring.read()));
 
-    let loading =
-        Signal::derive(move || !effective_q.get().trim().is_empty() && rows.get().is_none());
+    let loading = Signal::derive(move || {
+        !effective_q.get().trim().is_empty() && (query_pending.get() || rows.get().is_none())
+    });
 
     // Drive the shell's status bar from search-specific state.
     Effect::new(move |_| {

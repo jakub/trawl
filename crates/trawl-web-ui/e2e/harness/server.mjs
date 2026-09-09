@@ -137,10 +137,11 @@ function hasCorpus() {
   return scenario === 'populated' || scenario === 'corpus' || scenario === 'pagination';
 }
 
-// Only the pagination scenario uses these counts and the held history read.
+// Only the pagination scenario uses these counts and held reads.
 const pagination = {
   historyTotal: 103, runsTotal: 3, queryTotal: 53, truncated: false,
   holdHistoryOffset: null, held: null, history: [], runs: [], completed: [],
+  holdQueryNumber: null, heldQuery: null,
 };
 function paginationSlice(total, offset, limit, row) {
   return Array.from({ length: Math.max(0, Math.min(limit, total - offset)) }, (_, i) => row(offset + i));
@@ -155,10 +156,10 @@ function paginationRuns(offset, limit, global) {
   return { total: pagination.runsTotal, runs: paginationSlice(pagination.runsTotal, offset, limit,
     i => ({ ...source.runs[i % source.runs.length], id: 501 + i })) };
 }
-function paginationQuery(offset, limit) {
+function paginationQuery(offset, limit, query) {
   const response = wire('query-rows');
   response.rows = paginationSlice(pagination.queryTotal, offset, limit,
-    i => [response.rows[0][0], 'web-01', 200, `query-row-${i + 1}`]);
+    i => [response.rows[0][0], 'web-01', 200, `query-row-${i + 1} ${query}`]);
   response.pagination = { offset, limit, returned: response.rows.length };
   response.truncated = pagination.truncated;
   return response;
@@ -217,9 +218,11 @@ let unhandledQueries = [];
 
 function resetState() {
   if (pagination.held) pagination.held.res.destroy();
+  if (pagination.heldQuery) pagination.heldQuery.res.destroy();
   Object.assign(pagination, {
     historyTotal: 103, runsTotal: 3, queryTotal: 53, truncated: false,
     holdHistoryOffset: null, held: null, history: [], runs: [], completed: [],
+    holdQueryNumber: null, heldQuery: null,
   });
   healthHits = {};
   cancelRequests = [];
@@ -393,7 +396,7 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       scenario = parsed.scenario || 'default';
       resetState();
       if (scenario === 'pagination' && parsed.pagination) {
-        for (const key of ['historyTotal', 'runsTotal', 'queryTotal', 'holdHistoryOffset', 'truncated']) {
+        for (const key of ['historyTotal', 'runsTotal', 'queryTotal', 'holdHistoryOffset', 'holdQueryNumber', 'truncated']) {
           if (key in parsed.pagination) pagination[key] = parsed.pagination[key];
         }
       }
@@ -424,7 +427,7 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
           terminalPending: dashboard.terminalPending.size,
         },
         pagination: { history: pagination.history, runs: pagination.runs,
-          held: pagination.held !== null, completed: pagination.completed },
+          held: pagination.held !== null, queryHeld: pagination.heldQuery !== null, completed: pagination.completed },
         healthHits,
         history: { offsets: history.offsets, deletes: history.deletes, pending: !!history.pending, loadPending: history.loadPending.length > 0 },
         cancelRequests,
@@ -457,6 +460,17 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       const pending = history.loadPending.shift();
       if (!pending) { sendJson(res, 409, { error: 'no pending history load' }); return; }
       sendJson(pending, 200, wire('history-export'));
+      sendJson(res, 200, { ok: true });
+      return;
+    }
+    if (p === '/__ctl/pagination/query-release' && req.method === 'POST') {
+      const held = pagination.heldQuery;
+      if (scenario !== 'pagination' || !held || held.res.destroyed) {
+        sendJson(res, 409, { ok: false });
+        return;
+      }
+      pagination.heldQuery = null;
+      sendJson(held.res, 200, held.body);
       sendJson(res, 200, { ok: true });
       return;
     }
@@ -617,7 +631,12 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       }
       queries.push(parsedBody);
       if (scenario === 'pagination') {
-        sendJson(res, 200, paginationQuery(parsedBody.offset ?? 0, parsedBody.limit ?? 50));
+        const body = paginationQuery(parsedBody.offset ?? 0, parsedBody.limit ?? 50, parsedBody.query ?? '');
+        if (queries.length === pagination.holdQueryNumber) {
+          pagination.heldQuery = { res, body };
+          return;
+        }
+        sendJson(res, 200, body);
         return;
       }
       if (scenario === 'query-500') {

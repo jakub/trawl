@@ -73,9 +73,13 @@ test('history reads hpage once, replaces on Next, and filters only rendered rows
   await footer.getByRole('button', { name: 'Prev' }).click();
   await expect(footer.locator('.results-summary')).toHaveText('1–50 of 103');
   await expect(footer.getByRole('button', { name: 'Prev' })).toBeDisabled();
+  // A distinct raw URL refetches even when its single-decoded page is zero.
+  const decodedPage = page.waitForResponse(r => new URL(r.url()).pathname === '/api/v1/history'
+    && new URL(r.url()).searchParams.get('offset') === '0');
   await navigateHistory(page, '%2531');
+  await (await decodedPage).finished();
   await expect(footer.locator('.results-summary')).toHaveText('1–50 of 103');
-  expect((await paginationState(request)).history.map((r: { offset: number }) => r.offset)).toEqual([50, 100, 50, 0]);
+  expect((await paginationState(request)).history.map((r: { offset: number }) => r.offset)).toEqual([50, 100, 50, 0, 0]);
 });
 
 test('history refuses an overflowing page before sending a request', async ({ page, request }) => {
@@ -202,4 +206,34 @@ test('Probe returned range overflow is visible without a wasm panic', async ({ p
   await configure(request, { queryTotal: 4_294_967_300 });
   await page.goto('/search?q=service%3Dnginx&page=85899345');
   await expect(page.getByText('This result page extends past the supported row range.', { exact: false })).toBeVisible();
+});
+
+
+test('same-page query reload disables pagination while retained rows remain visible', async ({ page, request }) => {
+  await configure(request, { holdQueryNumber: 2 });
+  await page.goto('/search?q=service%3Dnginx');
+  const footer = page.locator('.results .results-footer');
+  await expect(footer.locator('.results-summary')).toHaveText('Page 1 · showing 50 rows');
+  await expect(footer.getByRole('button', { name: 'Next' })).toBeEnabled();
+  const mountedEditor = await page.locator(SEL.dslEditor).elementHandle();
+  await page.evaluate(() => {
+    const link = document.createElement('a');
+    link.href = '/search?q=service%3Dapache';
+    document.body.append(link);
+    link.click();
+    link.remove();
+  });
+  await expect.poll(async () => (await paginationState(request)).queryHeld).toBe(true);
+  expect(await mountedEditor!.evaluate(el => el.isConnected)).toBe(true);
+  await expect(page).toHaveURL('/search?q=service%3Dapache');
+  await expect(footer.locator('.results-summary')).toHaveText('Page 1 · showing 50 rows');
+  await expect(page.locator('.results-table tbody')).toContainText('service=nginx');
+  await expect(footer.getByRole('button', { name: 'Prev' })).toBeDisabled();
+  await expect(footer.getByRole('button', { name: 'Next' })).toBeDisabled();
+
+  expect((await request.post('/__ctl/pagination/query-release')).ok()).toBeTruthy();
+  await expect(page.locator('.results-table tbody')).toContainText('service=apache');
+  await expect(footer.getByRole('button', { name: 'Next' })).toBeEnabled();
+  const state = await (await request.get('/__ctl/state')).json();
+  expect(state.queries.map((q: { offset: number }) => q.offset)).toEqual([0, 0]);
 });
