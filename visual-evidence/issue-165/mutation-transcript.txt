@@ -1,0 +1,39 @@
+History clear native mutation evidence
+Captured from the completed foreground run on 2026-09-09 UTC.
+Source commit: e7fb22beaa2343d54fc2a17ebd330cea51f232d5
+Store blob: dd404813b058d12d57e45459df95c27686095cf0
+Runner blob: d22b4f63ff0b4fb2a6a1179d81c42d4931eab46b
+Application commit: 2e81545c07a8eca434cdf109f7a5332c45016374
+Database: agent-owned Postgres 18; connection details omitted.
+Runner: bash visual-evidence/issue-165/history-clear-mutation.sh
+Each phase: cargo nextest run -p trawl-server --test store_pg -E test(=history_clear_is_scoped_counted_and_preserves_saved) --no-tests fail --retries 0 --color never --status-level all --final-status-level none --failure-output immediate --success-output never
+Each phase deadline: 900 seconds; termination grace: 30 seconds.
+Original logs: target/issue-165/mutation.K9v3JD, ignored.
+Only test-result and assertion lines are reproduced below. Build and skipped-test output omitted.
+
+baseline exit: 0
+        PASS [   1.715s] (1/1) trawl-server::store_pg history_clear_is_scoped_counted_and_preserves_saved
+     Summary [   1.716s] 1 test run: 1 passed, 163 skipped
+
+mutant exit: 100
+        FAIL [   0.603s] (1/1) trawl-server::store_pg history_clear_is_scoped_counted_and_preserves_saved
+    thread 'history_clear_is_scoped_counted_and_preserves_saved' (3755325) panicked at crates/trawl-server/tests/store_pg.rs:7464:5:
+    assertion `left == right` failed: history_clear preserves other keys
+      left: HistoryPage { entries: [], total: 0 }
+     right: HistoryPage { entries: [HistoryEntry { id: 3, key_id: 2, query: "foreign", executed_at: 2026-09-09T02:04:19.423346Z, duration_ms: 45, row_count: 6, status: Error }], total: 1 }
+     Summary [   0.604s] 1 test run: 0 passed, 1 failed, 163 skipped
+
+control exit: 0
+        PASS [   1.354s] (1/1) trawl-server::store_pg history_clear_is_scoped_counted_and_preserves_saved
+     Summary [   1.355s] 1 test run: 1 passed, 163 skipped
+
+Observed runner output:
+PASS: one baseline/control test passed
+PASS: mutant failed at history_clear preserves other keys; foreign row was deleted
+PASS: one baseline/control test passed
+PASS: reverse patch restored source; control passed; worktree clean
+Runner exit: 0
+Independent git status --short after the run: empty.
+
+Validation limits: EXIT restoration was also observed on an earlier parser rejection after the mutation. INT and TERM handlers were inspected but not signal-tested.
+An initial patch hunk count and nextest result-parser formats were corrected before this complete passing run.

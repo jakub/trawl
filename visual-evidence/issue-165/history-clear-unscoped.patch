@@ -1,0 +1,13 @@
+diff --git a/crates/trawl-server/src/store/history.rs b/crates/trawl-server/src/store/history.rs
+--- a/crates/trawl-server/src/store/history.rs
++++ b/crates/trawl-server/src/store/history.rs
+@@ -117,8 +117,7 @@ impl HistoryStore {
+     /// A concurrent query may commit a new history row after that snapshot,
+     /// so a successful clear does not promise that history remains empty.
+     pub async fn clear_user_history(&self, key_id: i64) -> Result<u64, StoreError> {
+-        Ok(sqlx::query("DELETE FROM query_history WHERE key_id = $1")
+-            .bind(key_id)
++        Ok(sqlx::query("DELETE FROM query_history")
+             .execute(&self.pool)
+             .await?
+             .rows_affected())
