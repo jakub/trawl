@@ -65,6 +65,8 @@ declare -A SPEC_FOR=(
   [20-health-admin-gate.patch]="health-page.spec.ts"
   [22-runs-filtered-window.patch]="pagination.spec.ts"
   [23-range-close-on-refusal.patch]="range-dialog.spec.ts"
+  [22-palette-overlay-gate.patch]="command-palette.spec.ts"
+  [23-palette-toggle.patch]="command-palette.spec.ts"
 )
 
 # patch-file -> a CONTROL spec the mutation does NOT touch, which must
@@ -97,6 +99,8 @@ declare -A CONTROL_FOR=(
   [20-health-admin-gate.patch]="routing.spec.ts"
   [22-runs-filtered-window.patch]="routing.spec.ts"
   [23-range-close-on-refusal.patch]="routing.spec.ts"
+  [22-palette-overlay-gate.patch]="routing.spec.ts"
+  [23-palette-toggle.patch]="routing.spec.ts"
 )
 
 PATCHES=()
@@ -126,6 +130,8 @@ else
     20-health-admin-gate.patch
     22-runs-filtered-window.patch
     23-range-close-on-refusal.patch
+    22-palette-overlay-gate.patch
+    23-palette-toggle.patch
   )
 fi
 
