@@ -186,12 +186,13 @@ mod component {
             }
         });
 
-        // Seed absolute input state from the current range if it's already
-        // absolute; otherwise provide sensible defaults.
-        let (initial_from, initial_to) = match value.get_untracked() {
-            RangeValue::Absolute { from, to } => (from, to),
-            RangeValue::Quick(_) => (String::new(), "now".to_string()),
+        // Seed both draft arms once per opening. A refused preset is still
+        // the user's attempted selection, separate from the committed value.
+        let (initial_quick, initial_from, initial_to) = match value.get_untracked() {
+            RangeValue::Absolute { from, to } => (None, from, to),
+            RangeValue::Quick(id) => (Some(id), String::new(), "now".to_string()),
         };
+        let quick = RwSignal::new(initial_quick);
         let from = RwSignal::new(initial_from);
         let to = RwSignal::new(initial_to);
         // One refusal line outside the tab bodies, so range and live errors
@@ -203,6 +204,9 @@ mod component {
         let commit = Callback::new(move |picked: RangeValue| {
             if disabled.get_untracked() {
                 return;
+            }
+            if let RangeValue::Quick(id) = &picked {
+                quick.set(Some(id.clone()));
             }
             match on_commit.run(picked) {
                 Ok(()) => close(),
@@ -284,7 +288,7 @@ mod component {
                             // with the attribute browsers already honour.
                             {presets.get_value().into_iter().map(|preset| {
                                 let id = StoredValue::new(preset.id);
-                                let is_on = Signal::derive(move || matches!(value.get(), RangeValue::Quick(cur) if cur == id.get_value()));
+                                let is_on = Signal::derive(move || quick.get() == Some(id.get_value()));
                                 view! {
                                     <button
                                         type="button"

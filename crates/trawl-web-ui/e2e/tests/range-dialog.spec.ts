@@ -256,3 +256,35 @@ test('Live refusal uses the editor buffer and remains visible across tabs', asyn
   expect(page.url()).toBe(url);
   expect(await capturedQueryCount(request)).toBe(1);
 });
+
+test('quick refusal retains the attempted preset until the dialog closes', async ({ page, request }) => {
+  const query = 'a'.repeat(32 * 1024 - 'q='.length - '&page=0'.length);
+  await page.goto(`/search?q=${query}&page=0`);
+  await lastCapturedQuery(request, 1);
+  const url = page.url();
+  await page.locator(SEL.dateRangeTrigger).click();
+  const previous = page.locator(SEL.rangeDialog).getByRole('button', { name: 'Last 15m', exact: true });
+  const attempted = page.locator(SEL.rangeDialog).getByRole('button', { name: 'Last 1h', exact: true });
+  await expect(previous).toHaveAttribute('aria-pressed', 'true');
+  await attempted.click();
+  await expect(page.locator('.dr-err')).toHaveText("Can't open this search: link too long");
+  await expect(attempted).toHaveAttribute('aria-pressed', 'true');
+  await expect(attempted).toHaveClass(/\bon\b/);
+  await expect(previous).toHaveAttribute('aria-pressed', 'false');
+  await expect(previous).not.toHaveClass(/\bon\b/);
+  await page.locator(SEL.absoluteTab).click();
+  await page.getByRole('button', { name: 'Relative', exact: true }).click();
+  await expect(attempted).toHaveAttribute('aria-pressed', 'true');
+  await expect(previous).toHaveAttribute('aria-pressed', 'false');
+  await expect(page.locator('.dr-err')).toBeVisible();
+  await expect(page.locator(SEL.toastError)).toHaveCount(0);
+  expect(page.url()).toBe(url);
+  expect(await capturedQueryCount(request)).toBe(1);
+  await page.keyboard.press('Escape');
+  await page.locator(SEL.dateRangeTrigger).click();
+  await expect(previous).toHaveAttribute('aria-pressed', 'true');
+  await expect(attempted).toHaveAttribute('aria-pressed', 'false');
+  await expect(page.locator('.dr-err')).toHaveCount(0);
+  expect(page.url()).toBe(url);
+  expect(await capturedQueryCount(request)).toBe(1);
+});
