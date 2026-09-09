@@ -44,7 +44,7 @@ use crate::error::ServerError;
 /// row bundling these strings (ADR-0006).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Permission {
-    /// Execute search queries, view history, list running queries.
+    /// Execute search queries, view history and clear it, list running queries.
     Query,
     /// Read schema and field catalog.
     ///

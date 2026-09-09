@@ -7442,3 +7442,34 @@ async fn manual_claim_and_schedule_write_do_not_deadlock(pool: PgPool) {
         "got {claimed:?}"
     );
 }
+
+#[sqlx::test]
+async fn history_clear_is_scoped_counted_and_preserves_saved(pool: PgPool) {
+    let store = history(&pool);
+    for query in ["first", "second"] {
+        store
+            .record_query(1, query, 12, 3, RunStatus::Success)
+            .await
+            .unwrap();
+    }
+    store
+        .record_query(2, "foreign", 45, 6, RunStatus::Error)
+        .await
+        .unwrap();
+    let foreign = store.get_user_history(2, 10, 0).await.unwrap();
+    let saved_store = saved(&pool);
+    let saved_query = saved_store.create(1, "keep", "*").await.unwrap();
+
+    let deleted = store.clear_user_history(1).await.unwrap();
+    assert_eq!(
+        store.get_user_history(2, 10, 0).await.unwrap(),
+        foreign,
+        "history_clear preserves other keys"
+    );
+    assert_eq!(deleted, 2);
+    assert_eq!(store.get_user_history(1, 10, 0).await.unwrap().total, 0);
+    assert_eq!(store.get_user_history(2, 10, 0).await.unwrap(), foreign);
+    assert_eq!(saved_store.list(1).await.unwrap(), vec![saved_query]);
+    assert_eq!(store.clear_user_history(1).await.unwrap(), 0);
+    assert_eq!(store.get_user_history(2, 10, 0).await.unwrap(), foreign);
+}

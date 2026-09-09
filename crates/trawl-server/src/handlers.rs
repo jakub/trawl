@@ -16,13 +16,14 @@ use serde::Deserialize;
 use std::borrow::Cow;
 use std::convert::Infallible;
 use trawl_api::{
-    CancelResponse, CreateSavedRequest, DashboardSnapshot, DeleteSavedResponse,
-    DeleteScheduleResponse, ExportRequest, FieldValuesResponse, GlobalRunSummary, HealthResponse,
-    HealthStatus, HistoryEntryResponse, HistoryResponse, ListAllRunsResponse,
-    ListReportRunsResponse, ListSavedResponse, PaginationMeta, QueriesResponse, QueryRequest,
-    QueryResponse, QueryStatus, ReportRunResponse, ReportRunSummary, RetainedWorkSnapshot,
-    RunsStatsResponse, SavedQueryResponse, ScheduleResponse, SchemaColumnResponse, SchemaResponse,
-    SetScheduleRequest, StatsResponse, UpdateSavedRequest, ValidationResponse, WhoAmIResponse,
+    CancelResponse, ClearHistoryResponse, CreateSavedRequest, DashboardSnapshot,
+    DeleteSavedResponse, DeleteScheduleResponse, ExportRequest, FieldValuesResponse,
+    GlobalRunSummary, HealthResponse, HealthStatus, HistoryEntryResponse, HistoryResponse,
+    ListAllRunsResponse, ListReportRunsResponse, ListSavedResponse, PaginationMeta,
+    QueriesResponse, QueryRequest, QueryResponse, QueryStatus, ReportRunResponse, ReportRunSummary,
+    RetainedWorkSnapshot, RunsStatsResponse, SavedQueryResponse, ScheduleResponse,
+    SchemaColumnResponse, SchemaResponse, SetScheduleRequest, StatsResponse, UpdateSavedRequest,
+    ValidationResponse, WhoAmIResponse,
 };
 use trawl_engine::value::{QueryResult, Value};
 
@@ -1813,6 +1814,23 @@ pub async fn history(
             .collect(),
         total: page.total,
     }))
+}
+
+/// `DELETE /api/v1/history` clears only the authenticated key's history.
+pub async fn clear_history(
+    State(state): State<AppState>,
+    Extension(verified): Extension<VerifiedKey>,
+) -> Result<Json<ClearHistoryResponse>, ServerError> {
+    if !verified.has_permission(Permission::Query) {
+        return Err(ServerError::Forbidden("insufficient permissions".into()));
+    }
+
+    let deleted = state
+        .storage
+        .history
+        .clear_user_history(verified.id)
+        .await?;
+    Ok(Json(ClearHistoryResponse { deleted }))
 }
 
 /// Query parameters for the history endpoint.

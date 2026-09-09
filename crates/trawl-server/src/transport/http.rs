@@ -86,7 +86,7 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
         .route("/dashboard", get(handlers::dashboard))
         .route("/dashboard/stream", get(handlers::dashboard_stream))
         .route("/whoami", get(handlers::whoami))
-        .route("/history", get(handlers::history))
+        .route("/history", get(handlers::history).delete(handlers::clear_history))
         .route(
             "/saved",
             get(handlers::list_saved).post(handlers::create_saved),

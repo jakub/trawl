@@ -13,11 +13,12 @@ use zeroize::Zeroizing;
 use crate::error::ClientError;
 use crate::types::{
     CancelResponse, CatalogConflictsResponse, CatalogFieldResponse, CatalogFieldsResponse,
-    DashboardSnapshot, DeleteSavedResponse, DeleteScheduleResponse, FieldAck, FieldValuesResponse,
-    GcPinsResponse, HealthResponse, HistoryResponse, IngestResponse, ListAllRunsResponse,
-    ListReportRunsResponse, ListSavedResponse, QueriesResponse, QueryResponse, RepinStatusResponse,
-    ReportRunResponse, ReportRunSummary, RunsStatsResponse, SavedQueryResponse, ScheduleResponse,
-    SchemaResponse, ServiceSchemaResponse, StatsResponse, ValidationResponse, WhoAmIResponse,
+    ClearHistoryResponse, DashboardSnapshot, DeleteSavedResponse, DeleteScheduleResponse, FieldAck,
+    FieldValuesResponse, GcPinsResponse, HealthResponse, HistoryResponse, IngestResponse,
+    ListAllRunsResponse, ListReportRunsResponse, ListSavedResponse, QueriesResponse, QueryResponse,
+    RepinStatusResponse, ReportRunResponse, ReportRunSummary, RunsStatsResponse,
+    SavedQueryResponse, ScheduleResponse, SchemaResponse, ServiceSchemaResponse, StatsResponse,
+    ValidationResponse, WhoAmIResponse,
 };
 use crate::types::{
     CreateSavedRequestRef, ErrorResponse, ExportRequestRef, SetScheduleRequestRef, StreamEvent,
@@ -262,6 +263,14 @@ impl HttpClient {
             req = req.query(&[("offset", o.to_string())]);
         }
         self.send_authenticated(req).await
+    }
+
+    /// Clear the authenticated key's history and return the deleted row count.
+    ///
+    /// Concurrent queries may record new history after the clear statement.
+    pub async fn clear_history(&self) -> Result<ClearHistoryResponse, ClientError> {
+        let url = self.endpoint("/api/v1/history");
+        self.send_authenticated(self.client.delete(&url)).await
     }
 
     /// List all saved queries for the authenticated user.

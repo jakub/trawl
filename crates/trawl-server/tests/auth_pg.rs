@@ -72,6 +72,7 @@ fn authenticated_routes() -> Vec<(reqwest::Method, &'static str)> {
         (Method::GET, "/api/v1/dashboard"),
         (Method::GET, "/api/v1/whoami"),
         (Method::GET, "/api/v1/history"),
+        (Method::DELETE, "/api/v1/history"),
         (Method::GET, "/api/v1/saved"),
         (Method::POST, "/api/v1/saved"),
         (Method::PUT, "/api/v1/saved/1"),
@@ -1191,4 +1192,77 @@ async fn dashboard_reports_schedule_count_from_pg() {
         );
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn history_clear_requires_query_and_scopes_to_caller() {
+    let server = setup().await;
+    let reader = trawl_client::HttpClient::new_insecure(&server.url, &server.reader_token).unwrap();
+    let analyst =
+        trawl_client::HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+    reader
+        .query_paginated("* | head 1", None, None)
+        .await
+        .unwrap();
+    reader
+        .query_paginated("* | head 2", None, None)
+        .await
+        .unwrap();
+    analyst
+        .query_paginated("* | head 3", None, None)
+        .await
+        .unwrap();
+    let foreign = analyst.history(None, None).await.unwrap();
+    let saved = analyst.create_saved("keep", "*").await.unwrap();
+
+    let (status, _) = request(
+        &server.url,
+        reqwest::Method::DELETE,
+        "/api/v1/history",
+        Some(&server.ingest_token),
+    )
+    .await;
+    assert_eq!(status, 403);
+    assert_eq!(reader.history(None, None).await.unwrap().total, 2);
+
+    // Client-supplied actor identifiers have no authority.
+    let response = raw_client()
+        .delete(format!("{}/api/v1/history?key_id=0", server.url))
+        .bearer_auth(&server.reader_token)
+        .json(&serde_json::json!({"key_id": 0}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(
+        response.json::<serde_json::Value>().await.unwrap(),
+        serde_json::json!({"deleted": 2})
+    );
+    assert_eq!(reader.clear_history().await.unwrap().deleted, 0);
+    assert_eq!(reader.history(None, None).await.unwrap().total, 0);
+    assert_eq!(
+        serde_json::to_value(analyst.history(None, None).await.unwrap()).unwrap(),
+        serde_json::to_value(foreign).unwrap()
+    );
+    assert_eq!(analyst.list_saved().await.unwrap().queries[0].id, saved.id);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn history_clear_redacts_store_failure() {
+    let server = setup().await;
+    server.kill_app_database().await;
+    let (status, body) = request(
+        &server.url,
+        reqwest::Method::DELETE,
+        "/api/v1/history",
+        Some(&server.reader_token),
+    )
+    .await;
+    assert_eq!(status, 503);
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "error": {"code": "service_unavailable", "message": "app-state store unavailable"}
+        })
+    );
 }
