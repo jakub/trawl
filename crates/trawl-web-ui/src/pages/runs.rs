@@ -9,11 +9,9 @@
 
 use leptos::prelude::*;
 
-use crate::api;
+use crate::api::{self, RUNS_PAGE_SIZE};
 use fleet_ui::time::{format_duration, time_ago};
-use fleet_ui::{LoadState, Loaded, Pager, SearchInput, StatusDot};
-
-const RUNS_PAGE_SIZE: usize = 20;
+use fleet_ui::{LoadState, Loaded, OffsetPager, PageTotal, PageWindow, SearchInput, StatusDot};
 
 #[component]
 #[allow(clippy::too_many_lines)]
@@ -21,10 +19,17 @@ pub fn RunsPage() -> impl IntoView {
     let page = RwSignal::new(0usize);
     let filter = RwSignal::new(String::new());
 
+    let pending = RwSignal::new(false);
     let runs = LocalResource::new(move || {
         let p = page.get();
-        let offset = p * RUNS_PAGE_SIZE;
-        async move { api::list_all_runs(RUNS_PAGE_SIZE, offset).await }
+        async move {
+            let offset = PageWindow::checked_offset(p, RUNS_PAGE_SIZE)
+                .map_err(|_| api::ApiError::Refused("This runs page is too large to request."))?;
+            let _ = pending.try_set(true);
+            let response = api::list_all_runs(RUNS_PAGE_SIZE.get(), offset).await;
+            let _ = pending.try_set(false);
+            response.map(|resp| (p, resp))
+        }
     });
 
     let nets_for_stats = LocalResource::new(|| async move { api::list_saved().await });
@@ -96,25 +101,23 @@ pub fn RunsPage() -> impl IntoView {
                     <Loaded
                         state=Signal::derive(move || LoadState::from_resource(runs.get()))
                         label="runs"
-                        render=Box::new(move |resp: trawl_api::ListAllRunsResponse| {
+                        render=Box::new(move |(fetched_page, resp): (usize, trawl_api::ListAllRunsResponse)| {
                                 let now = now_ms();
-                                if resp.runs.is_empty() {
-                                    return view! {
-                                        <div class="tbl-empty">
-                                            "No runs yet — attach a schedule to a net to get started"
-                                        </div>
-                                    }.into_any();
-                                }
                                 let needle = filter.get().to_lowercase();
                                 let visible: Vec<_> = resp.runs.iter()
                                     .filter(|r| {
                                         needle.is_empty() || r.net_name.to_lowercase().contains(&needle)
                                     })
                                     .collect();
+                                let returned = resp.runs.len();
                                 let total = resp.total;
-                                let p = page.get();
-                                let first = p * RUNS_PAGE_SIZE + 1;
-                                let last = (first - 1 + visible.len()).min(total);
+                                let matches = visible.len();
+                                let suffix = if needle.is_empty() { String::new() }
+                                    else { format!(" · {matches} matches on this page") };
+                                let window = Signal::derive(move || PageWindow::new(
+                                    fetched_page, RUNS_PAGE_SIZE, returned, PageTotal::Known(total),
+                                    pending.get() || page.get() != fetched_page,
+                                ).expect("runs page comes from checked pager navigation"));
 
                                 let rows = visible.into_iter().map(|gr| {
                                     let net_id = gr.net_id;
@@ -148,14 +151,15 @@ pub fn RunsPage() -> impl IntoView {
 
                                 view! {
                                     {rows}
-                                    <Pager
-                                        summary=format!("{first}–{last} of {total}")
-                                        can_prev=Signal::derive(move || page.get() != 0)
-                                        can_next=Signal::derive(move || last < total)
-                                        on_prev=Callback::new(move |()| {
-                                            page.update(|p| *p = p.saturating_sub(1));
-                                        })
-                                        on_next=Callback::new(move |()| page.update(|p| *p += 1))
+                                    {if returned == 0 { Some(view! {
+                                        <div class="tbl-empty">{if total == 0 && fetched_page == 0 {
+                                            "No runs yet — attach a schedule to a net to get started"
+                                        } else { "No runs on this page" }}</div>
+                                    }) } else { None }}
+                                    <OffsetPager
+                                        window=window
+                                        suffix=suffix
+                                        on_page=Callback::new(move |p| page.set(p))
                                     />
                                 }.into_any()
                         })

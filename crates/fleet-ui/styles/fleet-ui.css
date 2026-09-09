@@ -1342,3 +1342,162 @@ textarea:focus-visible,
   width: 100%;
   height: 100%;
 }
+
+/* Range control — trigger and dialog travel together. */
+/* Date range — single trigger (grafana-style); all presets live in the
+ * popover. The trigger is a <button> (ADR-0029): it already declares its
+ * own background, border and colour, so `font: inherit` is the whole
+ * reset the user-agent chrome needs. */
+.daterange { position: relative; display: flex; align-items: stretch; }
+.daterange .dr-trigger { flex: 1; }
+.dr-trigger {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 10px;
+  background: var(--fill);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-ctl);
+  color: var(--ink-2);
+  font: inherit;
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui);
+  margin: 0;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+  transition: color 120ms, background 120ms, border-color 120ms;
+}
+/* Absolute-range labels ("2026-07-16… → now") can exceed the column —
+ * ellipsize instead of blowing the layout out. */
+.dr-trigger span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.dr-trigger:hover { color: var(--ink); background: var(--fill-2); }
+.dr-trigger.open {
+  color: var(--accent);
+  background: var(--accent-wash);
+  border-color: color-mix(in oklab, var(--accent) 45%, transparent);
+}
+
+/* Fullscreen click-outside scrim under the popover. */
+.scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 39;
+}
+
+.dr-pop {
+  position: absolute;
+  z-index: 40;
+  top: calc(100% + 4px);
+  right: 0;
+  width: 320px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-panel);
+  box-shadow: var(--shadow-3);
+  padding: 12px;
+  animation: fadeIn 120ms;
+}
+/* .dr-pop .tabs reskin retired (issue #31): the popover's mode strip
+ * renders fleet_ui::Segmented; the layout margin stays with the dialog. */
+.dr-pop .seg { margin-bottom: 10px; }
+.dr-pop .grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 6px;
+}
+.dr-pop .opt {
+  padding: 6px 4px;
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui);
+  color: var(--ink);
+  background: var(--panel-2);
+  border: 1px solid var(--line-2);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  text-align: center;
+  user-select: none;
+}
+/* Full width: a <button> in the preset grid does not stretch the way
+ * the <div> it replaced did. */
+.dr-pop button.opt { width: 100%; font: inherit; }
+.dr-pop .opt:hover { background: var(--accent-wash); border-color: var(--accent); }
+.dr-pop .opt:disabled:hover { background: var(--panel-2); border-color: var(--line-2); }
+.dr-pop .opt.on {
+  background: var(--accent-wash);
+  color: var(--accent);
+  border-color: color-mix(in oklab, var(--accent) 45%, transparent);
+  font-weight: 600;
+}
+/* From/To stack vertically — a full ISO timestamp at mono --table-fs
+ * needs ~154px and two-abreast cells in the 320px popover can't hold
+ * that without clipping. */
+.dr-pop .cust {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line-2);
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 8px;
+}
+.dr-pop .cust .fld {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+/* .lb is a <label for> now, not a div; it is a flex item of .fld, which
+ * blockifies it, so the box is the one the div had. */
+.dr-pop .cust .fld .lb {
+  font-size: var(--fs-dense);
+  color: var(--ink-3);
+  font-family: var(--font-ui);
+  font-weight: 500;
+}
+.dr-pop .cust .fld input {
+  font-family: var(--font-mono);
+  font-size: var(--table-fs);
+  padding: 5px 8px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-ctl);
+  color: var(--ink);
+  outline: none;
+}
+.dr-pop .cust .fld input:focus { border-color: var(--accent); }
+.dr-pop .foot {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line-2);
+}
+.dr-pop .foot .btns { display: flex; gap: 6px; }
+/* Wrapper around fleet-ui's Apply button, which takes no class of its
+ * own; inline-flex so it is exactly the button's box. */
+.dr-apply { display: inline-flex; }
+/* What Apply refused. The popover stays open while this shows. */
+.dr-pop .dr-err {
+  font-family: var(--font-ui);
+  font-size: var(--fs-dense);
+  line-height: 1.4;
+  color: var(--red);
+}
+.dr-pop .rt-hint {
+  padding: 6px 2px;
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui);
+  color: var(--ink-2);
+  line-height: 1.4;
+}
+.dr-pop .rt-hint p { margin: 0 0 10px; }
+
+.dr-pop .opt:disabled {
+  opacity: .45;
+  cursor: not-allowed;
+}

@@ -64,17 +64,6 @@ impl Default for RangeSpec {
     }
 }
 
-impl RangeSpec {
-    /// Compact label for the status bar / date-range pill.
-    #[must_use]
-    pub fn label(&self) -> String {
-        match self {
-            Self::Quick(q) => (*q).to_string(),
-            Self::Absolute { from, to } => format!("{from} → {to}"),
-        }
-    }
-}
-
 /// Quick-range presets offered by the date-range popover.
 pub const QUICK_RANGES: &[&str] = &["5m", "15m", "1h", "4h", "24h", "7d"];
 
@@ -574,19 +563,6 @@ mod tests {
     #[test]
     fn default_range_is_15m() {
         assert_eq!(RangeSpec::default(), RangeSpec::Quick("15m"));
-    }
-
-    #[test]
-    fn range_label_renders_sensibly() {
-        assert_eq!(RangeSpec::Quick("1h").label(), "1h");
-        assert_eq!(
-            RangeSpec::Absolute {
-                from: "a".into(),
-                to: "b".into()
-            }
-            .label(),
-            "a → b"
-        );
     }
 
     #[test]

@@ -10,7 +10,7 @@
 # exits 0 only if every requested mutation was killed.
 #
 # Usage:
-#   e2e/scripts/mutation-check.sh                 # run all twenty
+#   e2e/scripts/mutation-check.sh                 # run all twenty-two (21 uses its own runner)
 #   e2e/scripts/mutation-check.sh 02-editor-onchange.patch   # just one
 #
 # Refuses to run against a dirty tree — a patch applied on top of your
@@ -63,6 +63,8 @@ declare -A SPEC_FOR=(
   [18-facet-actions-display-none.patch]="facets.spec.ts"
   [19-results-th-no-aria-sort.patch]="sort-headers.spec.ts"
   [20-health-admin-gate.patch]="health-page.spec.ts"
+  [22-runs-filtered-window.patch]="pagination.spec.ts"
+  [23-range-close-on-refusal.patch]="range-dialog.spec.ts"
 )
 
 # patch-file -> a CONTROL spec the mutation does NOT touch, which must
@@ -93,6 +95,8 @@ declare -A CONTROL_FOR=(
   [18-facet-actions-display-none.patch]="routing.spec.ts"
   [19-results-th-no-aria-sort.patch]="routing.spec.ts"
   [20-health-admin-gate.patch]="routing.spec.ts"
+  [22-runs-filtered-window.patch]="routing.spec.ts"
+  [23-range-close-on-refusal.patch]="routing.spec.ts"
 )
 
 PATCHES=()
@@ -120,6 +124,8 @@ else
     18-facet-actions-display-none.patch
     19-results-th-no-aria-sort.patch
     20-health-admin-gate.patch
+    22-runs-filtered-window.patch
+    23-range-close-on-refusal.patch
   )
 fi
 

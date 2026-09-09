@@ -134,7 +134,35 @@ function serveDashboard(res) {
  * drift apart on a body they share. The services route is the one
  * exception and says so where it splits. */
 function hasCorpus() {
-  return scenario === 'populated' || scenario === 'corpus';
+  return scenario === 'populated' || scenario === 'corpus' || scenario === 'pagination';
+}
+
+// Only the pagination scenario uses these counts and held reads.
+const pagination = {
+  historyTotal: 103, runsTotal: 3, queryTotal: 53, truncated: false,
+  holdHistoryOffset: null, held: null, history: [], runs: [], completed: [],
+  holdQueryNumber: null, heldQuery: null,
+};
+function paginationSlice(total, offset, limit, row) {
+  return Array.from({ length: Math.max(0, Math.min(limit, total - offset)) }, (_, i) => row(offset + i));
+}
+function paginationHistory(offset, limit) {
+  const seed = wire('history').entries[0];
+  return { total: pagination.historyTotal, entries: paginationSlice(pagination.historyTotal, offset, limit,
+    i => ({ ...seed, id: i + 1, query: `history-row-${i + 1}` })) };
+}
+function paginationRuns(offset, limit, global) {
+  const source = wire(global ? 'pagination-runs-all' : 'pagination-net-runs');
+  return { total: pagination.runsTotal, runs: paginationSlice(pagination.runsTotal, offset, limit,
+    i => ({ ...source.runs[i % source.runs.length], id: 501 + i })) };
+}
+function paginationQuery(offset, limit, query) {
+  const response = wire('query-rows');
+  response.rows = paginationSlice(pagination.queryTotal, offset, limit,
+    i => [response.rows[0][0], 'web-01', 200, `query-row-${i + 1} ${query}`]);
+  response.pagination = { offset, limit, returned: response.rows.length };
+  response.truncated = pagination.truncated;
+  return response;
 }
 
 const sse = {
@@ -189,6 +217,13 @@ let exports_ = [];
 let unhandledQueries = [];
 
 function resetState() {
+  if (pagination.held) pagination.held.res.destroy();
+  if (pagination.heldQuery) pagination.heldQuery.res.destroy();
+  Object.assign(pagination, {
+    historyTotal: 103, runsTotal: 3, queryTotal: 53, truncated: false,
+    holdHistoryOffset: null, held: null, history: [], runs: [], completed: [],
+    holdQueryNumber: null, heldQuery: null,
+  });
   healthHits = {};
   cancelRequests = [];
   dashboard.hold = false;
@@ -360,6 +395,11 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       }
       scenario = parsed.scenario || 'default';
       resetState();
+      if (scenario === 'pagination' && parsed.pagination) {
+        for (const key of ['historyTotal', 'runsTotal', 'queryTotal', 'holdHistoryOffset', 'holdQueryNumber', 'truncated']) {
+          if (key in parsed.pagination) pagination[key] = parsed.pagination[key];
+        }
+      }
       // The ONE door that arms the repin script. Everything else reads
       // `repin`; only a reset writes `field`, so a spec cannot end up
       // scripting a second job on top of a live one.
@@ -386,6 +426,8 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
           max: dashboard.max, pending: dashboard.pending.size,
           terminalPending: dashboard.terminalPending.size,
         },
+        pagination: { history: pagination.history, runs: pagination.runs,
+          held: pagination.held !== null, queryHeld: pagination.heldQuery !== null, completed: pagination.completed },
         healthHits,
         history: { offsets: history.offsets, deletes: history.deletes, pending: !!history.pending, loadPending: history.loadPending.length > 0 },
         cancelRequests,
@@ -417,8 +459,31 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
     if (p === '/__ctl/history/load' && req.method === 'POST') {
       const pending = history.loadPending.shift();
       if (!pending) { sendJson(res, 409, { error: 'no pending history load' }); return; }
-      sendJson(pending, 200, wire('history-export'));
+      sendJson(pending, 200, wire(history.cleared ? 'history-cleared' : 'history-export'));
       sendJson(res, 200, { ok: true });
+      return;
+    }
+    if (p === '/__ctl/pagination/query-release' && req.method === 'POST') {
+      const held = pagination.heldQuery;
+      if (scenario !== 'pagination' || !held || held.res.destroyed) {
+        sendJson(res, 409, { ok: false });
+        return;
+      }
+      pagination.heldQuery = null;
+      sendJson(held.res, 200, held.body);
+      sendJson(res, 200, { ok: true });
+      return;
+    }
+    if (p === '/__ctl/pagination/release' && req.method === 'POST') {
+      const held = pagination.held;
+      if (scenario !== 'pagination' || !held || held.res.destroyed) {
+        sendJson(res, 409, { ok: false });
+        return;
+      }
+      pagination.held = null;
+      sendJson(held.res, 200, held.body);
+      pagination.completed.push(held.offset);
+      sendJson(res, 200, { ok: true, offset: held.offset });
       return;
     }
     // Finish the parked status read. A spec calls this AFTER the drawer
@@ -565,6 +630,15 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
         // fall through with an empty body record
       }
       queries.push(parsedBody);
+      if (scenario === 'pagination') {
+        const body = paginationQuery(parsedBody.offset ?? 0, parsedBody.limit ?? 50, parsedBody.query ?? '');
+        if (queries.length === pagination.holdQueryNumber) {
+          pagination.heldQuery = { res, body };
+          return;
+        }
+        sendJson(res, 200, body);
+        return;
+      }
       if (scenario === 'query-500') {
         sendJson(res, 500, errorEnvelope('Couldn’t load results: stub query failure'));
         return;
@@ -663,6 +737,20 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       }
     }
     if (p === '/api/v1/history' && req.method === 'GET') {
+      if (scenario === 'pagination') {
+        const offset = Number(url.searchParams.get('offset') ?? 0);
+        const limit = Number(url.searchParams.get('limit') ?? 50);
+        pagination.history.push({ offset, limit });
+        const body = paginationHistory(offset, limit);
+        if (offset === pagination.holdHistoryOffset) {
+          pagination.holdHistoryOffset = null;
+          pagination.held = { res, body, offset };
+          return;
+        }
+        sendJson(res, 200, body);
+        pagination.completed.push(offset);
+        return;
+      }
       sendJson(res, 200, scenario === 'corpus' ? corpusHistoryResponse() : historyResponse());
       return;
     }
@@ -695,18 +783,21 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       return;
     }
 
-    // -- report runs (`corpus` only) ------------------------------------
+    // -- report runs (`corpus` and `pagination`) ------------------------------------
     // Gated on the scenario rather than answered everywhere: under every
     // other scenario these paths fall through to the `unstubbed`
     // catch-all, and the auto fixture's empty-`unstubbed` assertion is
     // what tells a spec author they reached a surface they did not
     // fixture. The run result is answered for ANY run id — expanding a
     // row is the behaviour under test, not id routing.
+    // Pagination uses a separate three-row page so the two-row corpus
+    // and its existing assertions remain stable.
     const netRuns = p.match(/^\/api\/v1\/saved\/\d+\/runs$/);
     const netRun = p.match(/^\/api\/v1\/saved\/\d+\/runs\/\d+$/);
-    if (scenario === 'corpus' && req.method === 'GET') {
+    if ((scenario === 'corpus' || scenario === 'pagination') && req.method === 'GET') {
       if (netRuns) {
-        sendJson(res, 200, corpusNetRunsResponse());
+        if (scenario === 'pagination') pagination.runs.push({ path: p, offset: Number(url.searchParams.get('offset') ?? 0) });
+        sendJson(res, 200, scenario === 'pagination' ? paginationRuns(Number(url.searchParams.get('offset') ?? 0), Number(url.searchParams.get('limit') ?? 20), false) : corpusNetRunsResponse());
         return;
       }
       if (netRun) {
@@ -714,11 +805,24 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
         return;
       }
       if (p === '/api/v1/runs') {
-        sendJson(res, 200, corpusAllRunsResponse());
+        if (scenario === 'pagination') pagination.runs.push({ path: p, offset: Number(url.searchParams.get('offset') ?? 0) });
+        sendJson(res, 200, scenario === 'pagination' ? paginationRuns(Number(url.searchParams.get('offset') ?? 0), Number(url.searchParams.get('limit') ?? 20), true) : corpusAllRunsResponse());
         return;
       }
       if (p === '/api/v1/runs/stats') {
-        sendJson(res, 200, corpusRunsStatsResponse());
+        if (scenario === 'pagination' && pagination.runsTotal === 3) {
+          sendJson(res, 200, wire('pagination-runs-stats'));
+        } else if (scenario === 'pagination') {
+          const runs = paginationRuns(0, pagination.runsTotal, true).runs;
+          const durations = runs.map(r => r.duration_ms).filter(d => d !== null);
+          sendJson(res, 200, {
+            total_runs: runs.length,
+            success_count: runs.filter(r => r.status === 'success').length,
+            error_count: runs.filter(r => r.status === 'error').length,
+            timeout_count: runs.filter(r => r.status === 'timeout').length,
+            avg_duration_ms: durations.length ? Math.trunc(durations.reduce((a, b) => a + b, 0) / durations.length) : null,
+          });
+        } else sendJson(res, 200, corpusRunsStatsResponse());
         return;
       }
     }
@@ -794,6 +898,12 @@ server.listen(PORT, HOST, () => {
 // End every open SSE response on SIGTERM so playwright's webServer
 // teardown never hangs on a keep-alive connection.
 function shutdown() {
+  // A parked pagination read has not written headers, so close() waits
+  // for its socket unless teardown destroys it explicitly.
+  if (pagination.held) pagination.held.res.destroy();
+  if (pagination.heldQuery) pagination.heldQuery.res.destroy();
+  pagination.held = null;
+  pagination.heldQuery = null;
   for (const res of dashboard.responses) res.end();
   for (const res of dashboard.pending) res.destroy();
   for (const res of dashboard.terminalPending) res.destroy();

@@ -22,9 +22,12 @@ use crate::api::{self, ApiError};
 ///
 /// Uses `LocalResource` (CSR-only, no Serialize/Deserialize bounds on the
 /// result type) because this crate doesn't do SSR hydration.
+/// `pending` tracks the request itself: a resource retains its previous
+/// `Some` response during a reload, so presence cannot report loading.
 pub fn rows_resource(
     effective_q: Memo<String>,
     page: Memo<usize>,
+    pending: WriteSignal<bool>,
 ) -> LocalResource<Result<QueryResponse, ApiError>> {
     LocalResource::new(move || {
         let q = effective_q.get();
@@ -33,7 +36,11 @@ pub fn rows_resource(
             if q.trim().is_empty() {
                 return Ok(empty_response());
             }
-            api::query(&q, p).await
+            let _ = pending.try_set(true);
+            let response = api::query(&q, p).await;
+            // A response can finish after route teardown disposed the signal.
+            let _ = pending.try_set(false);
+            response
         }
     })
 }

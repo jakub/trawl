@@ -12,7 +12,10 @@
 use crate::api::{ApiError, PAGE_SIZE};
 use crate::context_query::{build_context_query, escape_dq, find_col};
 use crate::state::query::{Filter, FilterOp};
-use fleet_ui::{Btn, CopyButton, LoadState, Loaded, Pager, ToastBus, ToastKind, Variant};
+use fleet_ui::{
+    Btn, CopyButton, LoadState, Loaded, OffsetPager, PageTotal, PageWindow, ToastBus, ToastKind,
+    Variant,
+};
 use leptos::prelude::*;
 use std::cmp::Ordering;
 use trawl_api::QueryResponse;
@@ -25,6 +28,7 @@ use trawl_api::value::Value;
 pub fn ResultsTable(
     #[prop(into)] page: Signal<usize>,
     rows: LocalResource<Result<QueryResponse, ApiError>>,
+    #[prop(into)] busy: Signal<bool>,
     /// Called with the new page index when prev/next is clicked. Parent
     /// captures a router navigator and translates to URL navigation.
     on_paginate: Callback<usize>,
@@ -45,6 +49,7 @@ pub fn ResultsTable(
                     <ResultsTableBody
                         resp=resp
                         page=page
+                        busy=busy
                         on_paginate=on_paginate
                         on_add_filter=on_add_filter
                         on_navigate=on_navigate
@@ -66,6 +71,7 @@ struct SortState {
 fn ResultsTableBody(
     resp: QueryResponse,
     page: Signal<usize>,
+    busy: Signal<bool>,
     on_paginate: Callback<usize>,
     on_add_filter: Callback<Filter>,
     on_navigate: Callback<String>,
@@ -76,7 +82,7 @@ fn ResultsTableBody(
     let returned = resp.pagination.returned;
     let truncated = resp.truncated;
 
-    if columns.is_empty() {
+    if columns.is_empty() && resp.pagination.offset == 0 {
         return view! {
             <div class="results-empty">"No fish in this net yet — type a query and press ⌘⏎"</div>
         }
@@ -136,19 +142,15 @@ fn ResultsTableBody(
 
     let has_rows = !rows_data.is_empty();
     let sorted_indices = SortedIndices::new(&rows_data, sort);
-    let cur_page = page.get();
-    let can_prev = cur_page > 0;
-    let can_next = returned == PAGE_SIZE;
-
-    let on_prev = Callback::new(move |()| {
-        if can_prev {
-            on_paginate.run(cur_page - 1);
-        }
-    });
-    let on_next = Callback::new(move |()| {
-        if can_next {
-            on_paginate.run(cur_page + 1);
-        }
+    let fetched_page = resp.pagination.offset / PAGE_SIZE;
+    let window = Signal::derive(move || {
+        PageWindow::new(
+            fetched_page,
+            std::num::NonZeroUsize::new(PAGE_SIZE).expect("query page size is nonzero"),
+            returned,
+            PageTotal::Probe,
+            busy.get() || page.get() != fetched_page,
+        )
     });
 
     view! {
@@ -187,18 +189,19 @@ fn ResultsTableBody(
                     </tbody>
                 </table>
             </div>
-            <Pager
-                summary=format!(
-                    "Page {} · showing {} {}{}",
-                    cur_page + 1,
-                    returned,
-                    if returned == 1 { "row" } else { "rows" },
-                    if truncated { " (truncated)" } else { "" },
-                )
-                can_prev=Signal::from(can_prev)
-                can_next=Signal::from(can_next)
-                on_prev=on_prev
-                on_next=on_next
+            <Loaded
+                state=Signal::derive(move || match window.get() {
+                    Ok(window) => LoadState::Ready(window),
+                    Err(_) => LoadState::Error("This result page extends past the supported row range.".to_string()),
+                })
+                label="pagination"
+                render=Box::new(move |window: PageWindow| view! {
+                    <OffsetPager
+                        window=Signal::from(window)
+                        suffix=if truncated { " (truncated)".to_string() } else { String::new() }
+                        on_page=on_paginate
+                    />
+                }.into_any())
             />
         </>
     }

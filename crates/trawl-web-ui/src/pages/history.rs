@@ -18,51 +18,54 @@
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos_router::NavigateOptions;
-use leptos_router::hooks::{use_navigate, use_query_map};
+use leptos_router::hooks::{use_location, use_navigate};
 use trawl_api::HistoryEntryResponse;
 
 use crate::api;
 use crate::components::save_as_net_modal::SaveAsNetModal;
 use crate::download::trigger_download;
 use crate::history_export::{HistoryExportFormat, serialize_history};
+use crate::search_url::{PAGE_SIZE, read_history_page};
 use crate::state::query::{Mode, RangeSpec, navigator, report_refusal};
 use fleet_ui::time::format_duration;
 use fleet_ui::{
-    Btn, ConfirmModal, ConfirmState, LoadState, Loaded, Pager, SearchInput, ToastBus, ToastKind,
-    Variant, When,
+    Btn, ConfirmModal, ConfirmState, LoadState, Loaded, OffsetPager, PageTotal, PageWindow,
+    SearchInput, ToastBus, ToastKind, Variant, When,
 };
-
-/// Rows per page — the server caps at 1000 but 50 matches the results
-/// table's page size, so the paginator feels familiar.
-const PAGE_SIZE: usize = 50;
+use std::num::NonZeroUsize;
 
 #[component]
 #[allow(clippy::too_many_lines)] // page-level component: header + table + footer
 pub fn HistoryPage() -> impl IntoView {
     let bus = expect_context::<ToastBus>();
-    let qm = use_query_map();
-    let hpage = Memo::new(move |_| {
-        qm.get()
-            .get("hpage")
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(0)
-    });
+    let location = use_location();
+    let hpage = Memo::new(move |_| read_history_page(&location.search.get()));
     let filter = RwSignal::new(String::new());
+    let size = NonZeroUsize::new(PAGE_SIZE).expect("history page size is nonzero");
 
     let loading = RwSignal::new(true);
     let load_generation = RwSignal::new(0_u64);
     let loaded_page = RwSignal::new(None::<usize>);
     let resource = LocalResource::new(move || {
-        let page = hpage.get();
-        let offset = page * PAGE_SIZE;
+        // Track the URL directly: a display memo can consume a queued change
+        // while the resource is awaiting the previous page.
+        let requested = read_history_page(&location.search.get());
         let generation = load_generation.get_untracked().wrapping_add(1);
         load_generation.set(generation);
         loading.set(true);
         async move {
-            let response = api::history(PAGE_SIZE, offset).await;
-            // An older request cannot enable export while a newer one waits.
+            let response = async {
+                let page = requested.map_err(api::ApiError::Refused)?;
+                let offset = PageWindow::checked_offset(page, size).map_err(|_| {
+                    api::ApiError::Refused("This history page is too large to request.")
+                })?;
+                api::history(PAGE_SIZE, offset)
+                    .await
+                    .map(|resp| (page, resp))
+            }
+            .await;
             if load_generation.try_get_untracked() == Some(generation) {
-                loaded_page.set(Some(page));
+                loaded_page.set(response.as_ref().ok().map(|(page, _)| *page));
                 loading.set(false);
             }
             response
@@ -70,7 +73,7 @@ pub fn HistoryPage() -> impl IntoView {
     });
 
     let filtered_rows = Signal::derive(move || {
-        let Some(Ok(resp)) = resource.get() else {
+        let Some(Ok((_, resp))) = resource.get() else {
             return Vec::new();
         };
         let needle = filter.get().to_lowercase();
@@ -86,7 +89,7 @@ pub fn HistoryPage() -> impl IntoView {
     let export_disabled = Signal::derive(move || {
         clearing.get()
             || loading.get()
-            || loaded_page.get() != Some(hpage.get())
+            || loaded_page.get() != hpage.get().ok()
             || filtered_rows.get().is_empty()
     });
 
@@ -153,9 +156,10 @@ pub fn HistoryPage() -> impl IntoView {
                     Ok(response) => {
                         loading.set(true);
                         filter.set(String::new());
-                        // A page change fetches offset zero. Refetch explicitly only
-                        // when already there, never against the old nonzero offset.
-                        let already_first_page = hpage.get_untracked() == 0;
+                        // The resource tracks raw search identity. Canonicalizing
+                        // any query string triggers its own offset-zero read; only
+                        // the already-canonical URL needs an explicit refetch.
+                        let already_canonical = location.search.get_untracked().is_empty();
                         goto_hpage(
                             "/search/history",
                             NavigateOptions {
@@ -163,7 +167,7 @@ pub fn HistoryPage() -> impl IntoView {
                                 ..Default::default()
                             },
                         );
-                        if already_first_page {
+                        if already_canonical {
                             resource.refetch();
                         }
                         bus.push(
@@ -181,42 +185,19 @@ pub fn HistoryPage() -> impl IntoView {
         })
     };
 
-    let on_prev = {
-        let goto_hpage = goto_hpage.clone();
-        Callback::new(move |()| {
-            if clearing.get_untracked() {
-                return;
-            }
-            let cur = hpage.get_untracked();
-            if cur > 0 {
-                loading.set(true);
-                goto_hpage(
-                    &format!("/search/history?hpage={}", cur - 1),
-                    NavigateOptions {
-                        replace: true,
-                        ..Default::default()
-                    },
-                );
-            }
-        })
-    };
-    let on_next = {
-        let goto_hpage = goto_hpage.clone();
-        Callback::new(move |()| {
-            if clearing.get_untracked() {
-                return;
-            }
-            let cur = hpage.get_untracked();
-            loading.set(true);
-            goto_hpage(
-                &format!("/search/history?hpage={}", cur + 1),
-                NavigateOptions {
-                    replace: true,
-                    ..Default::default()
-                },
-            );
-        })
-    };
+    let on_page = Callback::new(move |page: usize| {
+        if clearing.get_untracked() {
+            return;
+        }
+        loading.set(true);
+        goto_hpage(
+            &format!("/search/history?hpage={page}"),
+            NavigateOptions {
+                replace: true,
+                ..Default::default()
+            },
+        );
+    });
 
     view! {
         <div class="page history-page">
@@ -257,7 +238,9 @@ pub fn HistoryPage() -> impl IntoView {
                 </div>
                 <div class="tbl-body">
                 <Loaded
-                    state=Signal::derive(move || LoadState::from_resource(resource.get()))
+                    state=Signal::derive(move || LoadState::from_resource(
+                        resource.get().map(|result| result.map(|(_, resp)| resp))
+                    ))
                     label="history"
                     render=Box::new(move |resp: trawl_api::HistoryResponse| {
                         let filtered = filtered_rows.get();
@@ -326,30 +309,14 @@ pub fn HistoryPage() -> impl IntoView {
                 </div>
 
                 {move || {
-                    let Some(Ok(resp)) = resource.get() else {
+                    let Some(Ok((fetched_page, resp))) = resource.get() else {
                         return ().into_any();
                     };
-                    let cur = hpage.get();
-                    let total = resp.total;
-                    let last_page_idx = total.saturating_sub(1) / PAGE_SIZE;
-                    let can_prev = cur > 0;
-                    let can_next = cur < last_page_idx;
-                    let summary = if total == 0 {
-                        "0 entries".to_string()
-                    } else {
-                        let first = cur * PAGE_SIZE + 1;
-                        let last = (cur * PAGE_SIZE + resp.entries.len()).min(total);
-                        format!("{first}–{last} of {total}")
-                    };
-                    view! {
-                        <Pager
-                            summary=summary
-                            can_prev=Signal::derive(move || can_prev && !clearing.get())
-                            can_next=Signal::derive(move || can_next && !clearing.get())
-                            on_prev=on_prev
-                            on_next=on_next
-                        />
-                    }.into_any()
+                    let window = Signal::derive(move || PageWindow::new(
+                        fetched_page, size, resp.entries.len(), PageTotal::Known(resp.total),
+                        clearing.get() || loading.get() || hpage.get() != Ok(fetched_page),
+                    ).expect("history response follows an admitted offset"));
+                    view! { <OffsetPager window=window on_page=on_page/> }.into_any()
                 }}
             </div>
 

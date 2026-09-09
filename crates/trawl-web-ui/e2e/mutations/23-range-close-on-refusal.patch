@@ -1,0 +1,15 @@
+diff --git a/crates/fleet-ui/src/range_dialog.rs b/crates/fleet-ui/src/range_dialog.rs
+--- a/crates/fleet-ui/src/range_dialog.rs
++++ b/crates/fleet-ui/src/range_dialog.rs
+@@ -210,7 +210,10 @@
+             }
+             match on_commit.run(picked) {
+                 Ok(()) => close(),
+-                Err(message) => error.set(Some(message)),
++                Err(message) => {
++                    error.set(Some(message));
++                    close();
++                },
+             }
+         });
+         let apply_absolute = Callback::new(move |()| {
