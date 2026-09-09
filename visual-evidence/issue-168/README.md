@@ -20,10 +20,11 @@ separate palette entries. This change creates no new destinations for them.
 
 The behavioral proof is committed in
 [`command-palette.spec.ts`](../../crates/trawl-web-ui/e2e/tests/command-palette.spec.ts).
-Its 23 tests cover the keyboard and pointer contracts, one history entry per
+Its 26 tests cover the keyboard and pointer contracts, one history entry per
 normal activation, focus restoration, overlay exclusion, viewport bounds,
-and the macOS editable-control regression. The full Chromium suite passed
-140 tests after this implementation.
+and the macOS editable-control regression. They also cover the visible trigger
+label and composing or consumed Escape. After integration with PR #173, the
+full Chromium suite passed 167 tests at `54ec6b11d5c8dd72315da9012b28960879440677`.
 
 From the repository root, rebuild and run the focused evidence with:
 
