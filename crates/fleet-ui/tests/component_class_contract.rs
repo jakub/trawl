@@ -625,6 +625,11 @@ fn command_palette_shell_gates_chords_and_retains_anchors_through_dispatch() {
     let palette = markup_only(COMMAND_PALETTE);
     assert!(palette.contains("hidden=move || !open.get()"));
     assert!(palette.contains("is_content_editable"));
+    assert!(
+        palette.contains("text_input_is_editable(&input.type_(), disabled, input.read_only())")
+    );
+    assert!(palette.contains("!disabled && !textarea.read_only()"));
+    assert!(palette.contains("matches(\":disabled\")"));
     assert!(palette.contains("closest(\"input, textarea\")"));
 }
 

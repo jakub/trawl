@@ -137,8 +137,19 @@ pub(crate) fn platform_kbd_hint(ua: &str) -> PlatformKbdHint {
     }
 }
 
+/// Whether an input accepts writable text. `input_type` is the normalized
+/// HTMLInputElement.type value, so a missing or invalid type arrives as text.
+fn text_input_is_editable(input_type: &str, disabled: bool, read_only: bool) -> bool {
+    !disabled
+        && !read_only
+        && matches!(
+            input_type,
+            "text" | "search" | "url" | "tel" | "email" | "password" | "number"
+        )
+}
+
 /// Event facts normalized by Shell's browser listener. Editable includes
-/// inputs, textareas and contenteditable descendants.
+/// enabled writable text controls and contenteditable descendants.
 #[derive(Clone, Copy, Debug, Default)]
 #[allow(clippy::struct_excessive_bools)] // Independent browser event flags.
 pub(crate) struct ChordFacts<'a> {
@@ -354,6 +365,45 @@ mod tests {
     }
 
     #[test]
+    fn editable_input_table_excludes_non_text_disabled_and_read_only_controls() {
+        for input_type in [
+            "text", "search", "url", "tel", "email", "password", "number",
+        ] {
+            for disabled in [false, true] {
+                for read_only in [false, true] {
+                    assert_eq!(
+                        text_input_is_editable(input_type, disabled, read_only),
+                        !disabled && !read_only,
+                        "type={input_type} disabled={disabled} read_only={read_only}",
+                    );
+                }
+            }
+        }
+        for input_type in [
+            "checkbox",
+            "radio",
+            "range",
+            "file",
+            "button",
+            "hidden",
+            "color",
+            "date",
+            "datetime-local",
+            "month",
+            "week",
+            "time",
+            "submit",
+            "reset",
+            "image",
+        ] {
+            assert!(
+                !text_input_is_editable(input_type, false, false),
+                "{input_type}"
+            );
+        }
+    }
+
+    #[test]
     fn chord_modifier_and_editor_matrix() {
         for is_macos in [false, true] {
             for editable in [false, true] {
@@ -430,7 +480,7 @@ mod component {
     use leptos_use::{use_event_listener, use_window};
     use wasm_bindgen::JsCast;
 
-    use super::{Command, CommandGroup, PaletteState};
+    use super::{Command, CommandGroup, PaletteState, text_input_is_editable};
     use crate::icon::{Icon, IconView};
     use crate::overlay::{FocusPolicy, OverlayLayer, use_overlay_layer_with};
     use crate::roving::{Nav, next_index};
@@ -444,10 +494,19 @@ mod component {
             .iter()
             .find_map(|node| node.dyn_into::<web_sys::Element>().ok());
         element.is_some_and(|element| {
-            element.closest("input, textarea").ok().flatten().is_some()
-                || element
-                    .dyn_ref::<web_sys::HtmlElement>()
-                    .is_some_and(web_sys::HtmlElement::is_content_editable)
+            if let Some(control) = element.closest("input, textarea").ok().flatten() {
+                // :disabled also covers controls disabled by a fieldset.
+                let disabled = control.matches(":disabled").unwrap_or(true);
+                if let Some(input) = control.dyn_ref::<web_sys::HtmlInputElement>() {
+                    return text_input_is_editable(&input.type_(), disabled, input.read_only());
+                }
+                return control
+                    .dyn_ref::<web_sys::HtmlTextAreaElement>()
+                    .is_some_and(|textarea| !disabled && !textarea.read_only());
+            }
+            element
+                .dyn_ref::<web_sys::HtmlElement>()
+                .is_some_and(web_sys::HtmlElement::is_content_editable)
         })
     }
 
