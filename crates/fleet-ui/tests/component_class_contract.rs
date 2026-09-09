@@ -822,16 +822,58 @@ fn range_control_owns_its_markup_and_styles() {
     }
 }
 
+fn range_scrim_openings(source: &str) -> Vec<&str> {
+    source
+        .split("<div")
+        .skip(1)
+        .filter_map(|tail| {
+            if !tail.starts_with(|c: char| c.is_whitespace() || c == '>' || c == '/') {
+                return None;
+            }
+            let mut quoted = false;
+            let mut escaped = false;
+            let mut depth = 0usize;
+            for (index, ch) in tail.char_indices() {
+                if quoted {
+                    if escaped {
+                        escaped = false;
+                    } else if ch == '\\' {
+                        escaped = true;
+                    } else if ch == '"' {
+                        quoted = false;
+                    }
+                    continue;
+                }
+                match ch {
+                    '"' => quoted = true,
+                    '(' | '[' | '{' => depth += 1,
+                    ')' | ']' | '}' => depth = depth.saturating_sub(1),
+                    '>' if depth == 0 => return Some(&tail[..=index]),
+                    _ => {}
+                }
+            }
+            None
+        })
+        .filter(|tag| tag.contains("class=\"scrim\""))
+        .collect()
+}
+
 #[test]
 fn range_scrim_is_exactly_one_mousedown_dismisser() {
     let source = markup_only(include_str!("../src/range_dialog.rs"));
-    let scrims: Vec<_> = source
-        .split("<div")
-        .skip(1)
-        .filter_map(|tail| tail.split_once("/>").map(|(tag, _)| tag))
-        .filter(|tag| tag.contains("class=\"scrim\""))
-        .collect();
+    let scrims = range_scrim_openings(&source);
     assert_eq!(scrims.len(), 1);
     assert!(scrims[0].contains("on:mousedown="));
     assert!(!scrims[0].contains("on:click="));
+}
+
+#[test]
+fn range_scrim_scan_counts_paired_tags_and_duplicate_dismissers() {
+    let paired = r#"<div class="scrim" on:mousedown=close></div>"#;
+    assert_eq!(range_scrim_openings(paired).len(), 1);
+    let duplicate =
+        r#"<div class="scrim" on:mousedown=close/> <div class="scrim" on:click=bad></div>"#;
+    let scrims = range_scrim_openings(duplicate);
+    assert_eq!(scrims.len(), 2);
+    assert!(scrims[1].contains("on:click="));
 }

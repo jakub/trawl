@@ -670,9 +670,14 @@ fn pagination_run_fixtures_have_three_matching_rows() {
     assert_eq!(drawer.total, 3);
     assert_eq!(global.runs.len(), 3);
     assert_eq!(drawer.runs.len(), 3);
+    let saved: ListSavedResponse = decode("saved-queries.json", SAVED_QUERIES);
+    let net = saved
+        .queries
+        .first()
+        .expect("pagination's saved net must exist");
     for (global, drawer) in global.runs.iter().zip(&drawer.runs) {
-        assert_eq!(global.net_id, 1);
-        assert_eq!(global.net_name, "errors by host");
+        assert_eq!(global.net_id, net.id);
+        assert_eq!(global.net_name, net.name);
         assert_eq!(global.run.id, drawer.id);
     }
 }

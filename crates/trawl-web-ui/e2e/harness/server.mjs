@@ -898,6 +898,12 @@ server.listen(PORT, HOST, () => {
 // End every open SSE response on SIGTERM so playwright's webServer
 // teardown never hangs on a keep-alive connection.
 function shutdown() {
+  // A parked pagination read has not written headers, so close() waits
+  // for its socket unless teardown destroys it explicitly.
+  if (pagination.held) pagination.held.res.destroy();
+  if (pagination.heldQuery) pagination.heldQuery.res.destroy();
+  pagination.held = null;
+  pagination.heldQuery = null;
   for (const res of dashboard.responses) res.end();
   for (const res of dashboard.pending) res.destroy();
   for (const res of dashboard.terminalPending) res.destroy();
