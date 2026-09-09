@@ -734,10 +734,9 @@ mod component {
                                 attr:tabindex="-1"
                                 attr:aria-selected=move || (selected.get() == Some(index)).to_string()
                                 on:mousedown=move |event: web_sys::MouseEvent| {
-                                    if ordinary_click(&event) {
-                                        // Mouse selection keeps keyboard focus on the combobox.
-                                        event.prevent_default();
-                                    }
+                                    // Every pointer press keeps focus on the combobox.
+                                    // Click and auxclick retain native new-tab behavior.
+                                    event.prevent_default();
                                 }
                                 on:click=move |event: web_sys::MouseEvent| {
                                     if ordinary_click(&event) && !event.default_prevented() {

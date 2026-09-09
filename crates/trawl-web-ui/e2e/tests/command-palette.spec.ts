@@ -208,7 +208,17 @@ for (const gesture of ['control-click', 'middle-click'] as const) {
       await expect(tab).toHaveURL(/\/search\/history$/);
       await expect(page).toHaveURL(/\/search$/);
       await expect(page.locator(SEL.paletteDialog)).toBeVisible();
-      await expect(page.locator(SEL.paletteInput)).toHaveValue('history');
+      const input = page.locator(SEL.paletteInput);
+      await expect(input).toHaveValue('history');
+      await expect.soft(input, 'modified activation must keep combobox focus').toBeFocused();
+      for (const key of ['Tab', 'Tab', 'Shift+Tab', 'Shift+Tab']) {
+        await page.keyboard.press(key);
+        expect.soft(
+          await page.locator(SEL.paletteDialog).evaluate((node) => node.contains(document.activeElement)),
+          `${gesture} followed by ${key} must keep focus inside the dialog`,
+        ).toBe(true);
+      }
+      await expect(input).toBeFocused();
     } finally {
       await tab.close();
     }
