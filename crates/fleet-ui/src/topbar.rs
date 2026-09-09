@@ -4,7 +4,7 @@
 
 //! `<TopBar/>` — generic application chrome.
 //!
-//! brand · mode tabs · spacer · command-palette stub · app links ·
+//! brand · mode tabs · spacer · command palette · app links ·
 //! account menu. The theme toggle reads the `UiPrefs` context the
 //! consumer provides from `fleet_ui::install()`. The bar knows nothing
 //! about auth, `/me`, or app-specific endpoints: `on_logout` is a
@@ -27,14 +27,16 @@
 //! bell (never wired), the disabled Profile and API tokens rows, and
 //! the theme item's `⌘⇧L` hint chip (the chord collides with
 //! Bitwarden's autofill and Safari's own binding, so it is not bound
-//! and the hint would be a lie). The `⌘K` command-palette stub stays as
-//! it is until the palette slice.
+//! and the hint would be a lie). Shell owns the command palette and
+//! supplies its trigger callback, availability and open state here.
 
 use leptos::html::{Button, Div};
 use leptos::prelude::*;
 use leptos_router::components::A;
 
+use crate::command_palette::platform_kbd_hint;
 use crate::icon::{Icon, IconView};
+use crate::kbd::Kbd;
 use crate::menu::{MenuEntry, MenuItem, MenuPanel};
 use crate::theme::UiPrefs;
 
@@ -76,7 +78,13 @@ pub fn TopBar(
     #[prop(into, optional)] app_links: Signal<Vec<AppLink>>,
     #[prop(into)] user: Signal<Option<UserInfo>>,
     on_logout: Callback<()>,
+    /// Shell owns the dialog. Required props prevent a decorative dead trigger.
+    on_open_palette: Callback<()>,
+    #[prop(into)] palette_open: Signal<bool>,
+    #[prop(into)] palette_available: Signal<bool>,
+    palette_trigger: NodeRef<Button>,
 ) -> impl IntoView {
+    let hint = platform_kbd_hint(&window().navigator().user_agent().unwrap_or_default());
     let prefs = use_context::<UiPrefs>();
 
     view! {
@@ -104,11 +112,23 @@ pub fn TopBar(
 
             <div class="sp"></div>
 
-            <div class="jump" title="Command palette — coming soon">
-                <IconView icon=Icon::Search size=12 stroke_width=1.5/>
-                <span class="gh">"Search…"</span>
-                <span class="kbd">"⌘K"</span>
-            </div>
+            <Show when=move || palette_available.get()>
+                <button
+                    type="button"
+                    class="jump"
+                    title="Command palette"
+                    aria-label="Command palette"
+                    aria-haspopup="dialog"
+                    aria-expanded=move || palette_open.get().to_string()
+                    aria-keyshortcuts=hint.aria_keyshortcuts
+                    node_ref=palette_trigger
+                    on:click=move |_| on_open_palette.run(())
+                >
+                    <IconView icon=Icon::Search size=12 stroke_width=1.5/>
+                    <span class="gh">"Go to…"</span>
+                    <Kbd>{hint.label}</Kbd>
+                </button>
+            </Show>
 
             {move || {
                 let links = app_links.get();

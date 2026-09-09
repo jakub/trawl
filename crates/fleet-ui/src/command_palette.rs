@@ -419,3 +419,294 @@ mod tests {
         }
     }
 }
+
+#[cfg(target_arch = "wasm32")]
+mod component {
+    use leptos::ev;
+    use leptos::html::Div;
+    use leptos::prelude::*;
+    use leptos_router::components::A;
+    use leptos_router::hooks::use_location;
+    use leptos_use::{use_event_listener, use_window};
+    use wasm_bindgen::JsCast;
+
+    use super::{Command, CommandGroup, PaletteState};
+    use crate::icon::{Icon, IconView};
+    use crate::overlay::{FocusPolicy, OverlayLayer, use_overlay_layer_with};
+    use crate::roving::{Nav, next_index};
+
+    /// Read inherited contenteditable state on the actual target. Looking for
+    /// any contenteditable ancestor would incorrectly include a nested false
+    /// region. The composed path also reaches an editor inside a shadow root.
+    pub(crate) fn editable_target(event: &web_sys::KeyboardEvent) -> bool {
+        let element = event
+            .composed_path()
+            .iter()
+            .find_map(|node| node.dyn_into::<web_sys::Element>().ok());
+        element.is_some_and(|element| {
+            element.closest("input, textarea").ok().flatten().is_some()
+                || element
+                    .dyn_ref::<web_sys::HtmlElement>()
+                    .is_some_and(web_sys::HtmlElement::is_content_editable)
+        })
+    }
+
+    #[component]
+    pub(crate) fn CommandPalette(
+        commands: Memo<Vec<Command>>,
+        open: RwSignal<bool>,
+        on_close: Callback<()>,
+        layer_slot: StoredValue<Option<OverlayLayer>>,
+    ) -> impl IntoView {
+        let scrim_ref = NodeRef::<Div>::new();
+        let panel_ref = NodeRef::<Div>::new();
+        let list_ref = NodeRef::<Div>::new();
+        let location = use_location();
+        let state = RwSignal::new(PaletteState::new(&commands.get_untracked()));
+        // Arrow selection changes must not rebuild the options. Keep their
+        // DOM stable until the filtered inventory itself changes.
+        let visible = Memo::new(move |_| state.with(|state| state.visible.clone()));
+        let selected = Signal::derive(move || state.with(|state| state.selected));
+
+        let layer = use_overlay_layer_with(FocusPolicy::Trap, move || {
+            panel_ref.get().map(web_sys::Element::from)
+        });
+        layer_slot.set_value(Some(layer));
+        on_cleanup(move || {
+            if layer_slot.try_get_value().flatten() == Some(layer) {
+                layer_slot.try_set_value(None);
+            }
+        });
+
+        // Consumer chrome may change while open. Refilter its current routes
+        // and reset selection before an old command can be activated.
+        Effect::new(move |_| {
+            let commands = commands.get();
+            let filter = state.with_untracked(|state| state.filter.clone());
+            state.update(|state| state.set_filter(&commands, &filter));
+        });
+
+        let _ = use_event_listener(use_window(), ev::keydown, move |event| {
+            if layer.is_topmost() && event.key() == "Escape" {
+                event.prevent_default();
+                on_close.run(());
+            }
+        });
+
+        view! {
+            <div
+                class="command-palette-scrim"
+                node_ref=scrim_ref
+                hidden=move || !open.get()
+                on:mousedown=move |event: web_sys::MouseEvent| {
+                    if !layer.is_topmost() { return; }
+                    if let Some(scrim) = scrim_ref.get_untracked()
+                        && let Some(target) = event.target()
+                        && let Some(element) = target.dyn_ref::<web_sys::Element>()
+                        && element.is_same_node(Some(scrim.as_ref()))
+                    {
+                        event.prevent_default();
+                        on_close.run(());
+                    }
+                }
+            >
+                <div
+                    class="command-palette"
+                    role="dialog"
+                    aria-label="Command palette"
+                    aria-modal="true"
+                    tabindex="-1"
+                    node_ref=panel_ref
+                >
+                    <div class="command-palette-search">
+                        {palette_input(commands, state, list_ref, layer)}
+                        <button
+                            type="button"
+                            class="command-palette-close"
+                            aria-label="Close command palette"
+                            title="Close (Esc)"
+                            on:click=move |_| on_close.run(())
+                        >
+                            <IconView icon=Icon::Close size=16 stroke_width=1.5/>
+                        </button>
+                    </div>
+                    <div
+                        class="command-palette-list"
+                        id="fleet-command-palette-list"
+                        role="listbox"
+                        aria-label="Pages"
+                        node_ref=list_ref
+                    >
+                        {move || render_groups(&visible.get(), selected, location.pathname, on_close)}
+                    </div>
+                    <Show when=move || visible.with(Vec::is_empty)>
+                        <p class="command-palette-empty">"No matching pages"</p>
+                    </Show>
+                    <div class="command-palette-status" role="status" aria-live="polite" aria-atomic="true">
+                        {move || match visible.with(Vec::len) {
+                            0 => "No matching pages".to_string(),
+                            1 => "1 page available".to_string(),
+                            count => format!("{count} pages available"),
+                        }}
+                    </div>
+                </div>
+            </div>
+        }
+    }
+
+    fn palette_input(
+        commands: Memo<Vec<Command>>,
+        state: RwSignal<PaletteState>,
+        list_ref: NodeRef<Div>,
+        layer: OverlayLayer,
+    ) -> impl IntoView {
+        view! {
+            <input
+                class="command-palette-input"
+                type="text"
+                role="combobox"
+                aria-label="Find a page"
+                aria-autocomplete="list"
+                aria-haspopup="listbox"
+                aria-controls="fleet-command-palette-list"
+                aria-expanded="true"
+                aria-activedescendant=move || state.with(|state| {
+                    state.selected.and_then(|index| state.visible.get(index)).map(Command::option_id)
+                })
+                autocomplete="off"
+                spellcheck="false"
+                placeholder="Go to a page…"
+                prop:value=move || state.with(|state| state.filter.clone())
+                on:input=move |event| {
+                    let filter = event_target_value(&event);
+                    commands.with_untracked(|commands| {
+                        state.update(|state| state.set_filter(commands, &filter));
+                    });
+                    if let Some(list) = list_ref.get_untracked() {
+                        list.set_scroll_top(0);
+                    }
+                }
+                on:keydown=move |event| on_input_keydown(&event, state, layer)
+            />
+        }
+    }
+
+    fn on_input_keydown(
+        event: &web_sys::KeyboardEvent,
+        state: RwSignal<PaletteState>,
+        layer: OverlayLayer,
+    ) {
+        if event.default_prevented() || event.is_composing() || !layer.is_topmost() {
+            return;
+        }
+        let nav = match event.key().as_str() {
+            "ArrowDown" => Some(Nav::Next),
+            "ArrowUp" => Some(Nav::Prev),
+            "Enter" => {
+                event.prevent_default();
+                // Click the same router anchor a pointer activates. No
+                // second navigation API and no event for an empty list.
+                let id = state.with_untracked(|state| {
+                    state
+                        .selected
+                        .and_then(|index| state.visible.get(index))
+                        .map(Command::option_id)
+                });
+                if let Some(anchor) = id
+                    .and_then(|id| document().get_element_by_id(&id))
+                    .and_then(|element| element.dyn_into::<web_sys::HtmlElement>().ok())
+                {
+                    anchor.click();
+                }
+                return;
+            }
+            // Home/End belong to the input caret, not the option list.
+            _ => None,
+        };
+        let Some(nav) = nav else { return };
+        event.prevent_default();
+        let next = state.with_untracked(|state| {
+            state
+                .selected
+                .and_then(|selected| next_index(selected, state.visible.len(), nav))
+        });
+        if let Some(next) = next {
+            state.update(|state| state.selected = Some(next));
+            let id = state.with_untracked(|state| state.visible[next].option_id());
+            if let Some(element) = document().get_element_by_id(&id) {
+                let options = web_sys::ScrollIntoViewOptions::new();
+                options.set_block(web_sys::ScrollLogicalPosition::Nearest);
+                options.set_inline(web_sys::ScrollLogicalPosition::Nearest);
+                element.scroll_into_view_with_scroll_into_view_options(&options);
+            }
+        }
+    }
+
+    fn render_groups(
+        commands: &[Command],
+        selected: Signal<Option<usize>>,
+        pathname: Memo<String>,
+        on_close: Callback<()>,
+    ) -> impl IntoView + use<> {
+        [CommandGroup::Modes, CommandGroup::Sections].into_iter().map(|group| {
+            let entries: Vec<_> = commands.iter().enumerate()
+                .filter(|(_, command)| command.group == group)
+                .map(|(index, command)| (index, command.clone()))
+                .collect();
+            let label = match group {
+                CommandGroup::Modes => "Modes",
+                CommandGroup::Sections => "Sections",
+            };
+            (!entries.is_empty()).then(|| view! {
+                <div class="command-palette-group" role="group" aria-label=label>
+                    <div class="command-palette-group-label" aria-hidden="true">{label}</div>
+                    {entries.into_iter().map(|(index, command)| {
+                        let id = command.option_id();
+                        let href = command.path.clone();
+                        let path = command.path.clone();
+                        let label = command.label.clone();
+                        view! {
+                            <A
+                                href=href
+                                exact=true
+                                attr:id=id
+                                attr:class="command-palette-option"
+                                attr:role="option"
+                                attr:tabindex="-1"
+                                attr:aria-selected=move || (selected.get() == Some(index)).to_string()
+                                on:mousedown=move |event: web_sys::MouseEvent| {
+                                    if ordinary_click(&event) {
+                                        // Mouse selection keeps keyboard focus on the combobox.
+                                        event.prevent_default();
+                                    }
+                                }
+                                on:click=move |event: web_sys::MouseEvent| {
+                                    if ordinary_click(&event) && !event.default_prevented() {
+                                        on_close.run(());
+                                    }
+                                }
+                            >
+                                <span class="command-palette-label">{label}</span>
+                                <span class="command-palette-path">{path}</span>
+                                {move || command.is_current(&pathname.get()).then(|| view! {
+                                    <span class="command-palette-current">"current"</span>
+                                })}
+                            </A>
+                        }
+                    }).collect::<Vec<_>>()}
+                </div>
+            })
+        }).collect::<Vec<_>>()
+    }
+
+    fn ordinary_click(event: &web_sys::MouseEvent) -> bool {
+        event.button() == 0
+            && !event.meta_key()
+            && !event.ctrl_key()
+            && !event.alt_key()
+            && !event.shift_key()
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) use component::{CommandPalette, editable_target};

@@ -57,6 +57,8 @@ web-sys = { version = "0.3", features = [
     "Node",
     "NodeList",
     "Storage",
+    "ScrollIntoViewOptions",
+    "ScrollLogicalPosition",
     "Window",
 ] }
 
