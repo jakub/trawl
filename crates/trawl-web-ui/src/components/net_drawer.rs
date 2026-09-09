@@ -18,11 +18,11 @@ use trawl_api::value::QueryResult;
 use crate::api;
 use fleet_ui::time::{format_duration, time_ago};
 use fleet_ui::{
-    Btn, Drawer, LoadState, Loaded, Pager, Size, Sparkline, StatusDot, TabItem, ToastBus,
-    ToastKind, Toggle, Variant, effective_active,
+    Btn, Drawer, LoadState, Loaded, OffsetPager, PageTotal, PageWindow, Size, Sparkline, StatusDot,
+    TabItem, ToastBus, ToastKind, Toggle, Variant, effective_active,
 };
 
-const RUNS_PAGE_SIZE: usize = 20;
+use crate::api::RUNS_PAGE_SIZE;
 const RESULT_PREVIEW_ROWS: usize = 20;
 
 const INTERVAL_PRESETS: &[&str] = &["5m", "15m", "1h", "6h", "24h", "1w"];
@@ -516,10 +516,17 @@ fn RunsPane(net_id: i64, bus: ToastBus, on_search: Callback<String>) -> impl Int
     let page = RwSignal::new(0usize);
     let expanded_run: RwSignal<Option<i64>> = RwSignal::new(None);
 
+    let pending = RwSignal::new(false);
     let runs = LocalResource::new(move || {
         let p = page.get();
-        let offset = p * RUNS_PAGE_SIZE;
-        async move { api::list_runs(net_id, RUNS_PAGE_SIZE, offset).await }
+        async move {
+            let offset = PageWindow::checked_offset(p, RUNS_PAGE_SIZE)
+                .map_err(|_| api::ApiError::Refused("This runs page is too large to request."))?;
+            let _ = pending.try_set(true);
+            let response = api::list_runs(net_id, RUNS_PAGE_SIZE.get(), offset).await;
+            let _ = pending.try_set(false);
+            response.map(|resp| (p, resp))
+        }
     });
 
     #[allow(clippy::cast_possible_truncation)]
@@ -530,7 +537,7 @@ fn RunsPane(net_id: i64, bus: ToastBus, on_search: Callback<String>) -> impl Int
             {move || {
                 let data = runs.get()
                     .and_then(Result::ok)
-                    .map(|resp| {
+                    .map(|(_, resp)| {
                         resp.runs.iter()
                             .rev()
                             .map(|r| r.row_count.unwrap_or(0) as u64)
@@ -552,17 +559,14 @@ fn RunsPane(net_id: i64, bus: ToastBus, on_search: Callback<String>) -> impl Int
             <Loaded
                 state=Signal::derive(move || LoadState::from_resource(runs.get()))
                 label="runs"
-                render=Box::new(move |resp: trawl_api::ListReportRunsResponse| {
+                render=Box::new(move |(fetched_page, resp): (usize, trawl_api::ListReportRunsResponse)| {
                         let now = now_ms();
-                        if resp.runs.is_empty() {
-                            return view! {
-                                <div style="padding:12px; color:var(--ink-3)">"No runs yet — attach a schedule to start."</div>
-                            }.into_any();
-                        }
+                        let returned = resp.runs.len();
                         let total = resp.total;
-                        let p = page.get();
-                        let first = p * RUNS_PAGE_SIZE + 1;
-                        let last = (first - 1 + resp.runs.len()).min(total);
+                        let window = Signal::derive(move || PageWindow::new(
+                            fetched_page, RUNS_PAGE_SIZE, returned, PageTotal::Known(total),
+                            pending.get() || page.get() != fetched_page,
+                        ).expect("runs page comes from checked pager navigation"));
 
                         let rows = resp.runs.iter().map(|run| {
                             let run_id = run.id;
@@ -624,14 +628,12 @@ fn RunsPane(net_id: i64, bus: ToastBus, on_search: Callback<String>) -> impl Int
                                 <div class="tbl-body">
                                     {rows}
                                 </div>
-                                <Pager
-                                    summary=format!("{first}–{last} of {total}")
-                                    can_prev=Signal::derive(move || page.get() != 0)
-                                    can_next=Signal::derive(move || last < total)
-                                    on_prev=Callback::new(move |()| {
-                                        page.update(|p| *p = p.saturating_sub(1));
-                                    })
-                                    on_next=Callback::new(move |()| page.update(|p| *p += 1))
+                                {if returned == 0 { Some(view! {
+                                    <div class="tbl-empty">"No runs on this page"</div>
+                                }) } else { None }}
+                                <OffsetPager
+                                    window=window
+                                    on_page=Callback::new(move |p| page.set(p))
                                 />
                             </div>
                         }.into_any()

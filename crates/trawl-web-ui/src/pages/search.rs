@@ -561,6 +561,7 @@ pub fn Search() -> impl IntoView {
                         <>
                             <Histogram rows=rows range=range_sig/>
                             <ResultsTable
+                                busy=running
                                 page=page
                                 rows=rows
                                 on_paginate=on_paginate

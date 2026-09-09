@@ -50,6 +50,7 @@ pub mod loaded;
 pub mod login;
 pub mod modal;
 pub mod overlay;
+pub mod page_window;
 pub mod segmented;
 pub mod sparkline;
 pub mod status_dot;
@@ -100,6 +101,9 @@ pub use icon::Icon;
 pub use load_more::LoadMorePhase;
 pub use loaded::LoadState;
 pub use modal::ConfirmState;
+#[cfg(target_arch = "wasm32")]
+pub use page_window::OffsetPager;
+pub use page_window::{PageTotal, PageWindow};
 pub use segmented::{SegmentedOption, segmented_class};
 pub use sparkline::SparkPath;
 pub use status_dot::StatusTone;

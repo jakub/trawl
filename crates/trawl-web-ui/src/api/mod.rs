@@ -26,6 +26,9 @@ use crate::repin_flow::{BoundCeilings, ConflictBody, classify_conflict};
 /// re-exported here so request building keeps one path to it.
 pub use crate::search_url::PAGE_SIZE;
 
+/// Rows per page in both run browsers.
+pub const RUNS_PAGE_SIZE: std::num::NonZeroUsize = std::num::NonZeroUsize::new(20).unwrap();
+
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum ApiError {
     #[error("network: {0}")]

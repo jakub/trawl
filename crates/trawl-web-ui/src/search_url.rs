@@ -94,12 +94,6 @@ pub const MAX_SEARCH_PAIRS: usize = 64;
 /// heap of owned strings.
 pub const KNOWN_KEYS: [&str; 5] = ["q", "page", "mode", "f", "r"];
 
-/// Longest a RAW name may be and still spell one of [`KNOWN_KEYS`]:
-/// `page`, the longest, is 12 bytes with every character percent-encoded
-/// (`%70%61%67%65`). A longer name cannot decode to a key we read, so it
-/// is skipped without being decoded.
-const MAX_KEY_RAW_BYTES: usize = 12;
-
 /// Largest raw `f` value read at all, checked before base64 or JSON
 /// allocation.
 pub const MAX_FILTER_PAYLOAD_BYTES: usize = 4096;
@@ -470,7 +464,7 @@ pub fn read_search(raw_search: &str) -> SearchRead {
     if raw_search.len() > MAX_SEARCH_BYTES {
         return refused(Reason::LinkTooLong);
     }
-    match query_params(raw_search) {
+    match query_params(raw_search, &KNOWN_KEYS) {
         Ok(params) => SearchRead::Params(params),
         Err(reason) => refused(reason),
     }
@@ -484,17 +478,18 @@ pub fn read_search(raw_search: &str) -> SearchRead {
 /// comparisons. Only a short name carrying an escape is decoded, because
 /// `%71=x` IS `q=x` to the browser and reading it any other way would
 /// make the app disagree with the address bar it came from.
-fn known_key(raw_name: &str) -> Option<&'static str> {
-    if let Some(key) = KNOWN_KEYS.iter().find(|key| **key == raw_name) {
+fn known_key(raw_name: &str, keys: &[&'static str]) -> Option<&'static str> {
+    if let Some(key) = keys.iter().find(|key| **key == raw_name) {
         return Some(key);
     }
-    if raw_name.len() > MAX_KEY_RAW_BYTES
-        || !raw_name.bytes().any(|byte| byte == b'%' || byte == b'+')
+    // Each byte of a known key can occupy at most one percent escape.
+    let max_raw_bytes = keys.iter().map(|key| key.len()).max().unwrap_or(0) * 3;
+    if raw_name.len() > max_raw_bytes || !raw_name.bytes().any(|byte| byte == b'%' || byte == b'+')
     {
         return None;
     }
     let decoded = form_decode(raw_name);
-    KNOWN_KEYS.iter().copied().find(|key| *key == decoded)
+    keys.iter().copied().find(|key| *key == decoded)
 }
 
 /// Read a bounded query string into the parameters this app knows,
@@ -540,7 +535,7 @@ fn known_key(raw_name: &str) -> Option<&'static str> {
 /// # Errors
 /// [`Reason::TooManyParameters`] when the string carries more non-empty
 /// pairs than the cap admits, so the ones past it were never examined.
-fn query_params(raw_search: &str) -> Result<Vec<(String, String)>, Reason> {
+fn query_params(raw_search: &str, keys: &[&'static str]) -> Result<Vec<(String, String)>, Reason> {
     let mut params: Vec<(String, String)> = Vec::new();
     let mut examined: usize = 0;
     for pair in raw_search
@@ -556,7 +551,7 @@ fn query_params(raw_search: &str) -> Result<Vec<(String, String)>, Reason> {
             return Err(Reason::TooManyParameters);
         }
         let (raw_name, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
-        let Some(key) = known_key(raw_name) else {
+        let Some(key) = known_key(raw_name, keys) else {
             continue;
         };
         if params.iter().any(|(name, _)| name == key) {
@@ -1035,6 +1030,26 @@ pub fn normalize_instant(raw: &str) -> Option<String> {
     )
 }
 
+/// Read History's page through the same bounded, single-decode parser.
+/// Numeric values too large even for `u64` are refused before any fetch.
+pub fn read_history_page(raw_search: &str) -> Result<usize, &'static str> {
+    if raw_search.len() > MAX_SEARCH_BYTES {
+        return Err("This history link is too long to read.");
+    }
+    let params = query_params(raw_search, &["hpage"])
+        .map_err(|_| "This history link has too many parameters to read.")?;
+    let Some((_, raw)) = params.first() else {
+        return Ok(0);
+    };
+    if !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit()) && raw.parse::<u64>().is_err() {
+        return Err("This history page is too large to request.");
+    }
+    match parse_page(raw) {
+        Verdict::Valid(page) => Ok(page),
+        _ => Err("This history page is too large to request."),
+    }
+}
+
 /// Read the `page` parameter.
 ///
 /// A value that is not a number is a missing value and reads as page 0 —
@@ -1066,6 +1081,18 @@ pub fn parse_page(raw: &str) -> Verdict<usize> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn history_page_uses_single_decode_and_checked_offset() {
+        assert_eq!(read_history_page("?hpage=%31"), Ok(1));
+        assert_eq!(read_history_page("?%68%70%61%67%65=1"), Ok(1));
+        assert_eq!(read_history_page("?hpage=%2531"), Ok(0));
+        assert_eq!(read_history_page("?%68page=2&hpage=3"), Ok(2));
+        assert_eq!(read_history_page("?hpage=85899345"), Ok(85_899_345));
+        assert!(read_history_page("?hpage=85899346").is_err());
+        assert!(read_history_page("?hpage=184467440737095516160").is_err());
+        assert!(read_history_page(&format!("?{}", "a&".repeat(MAX_SEARCH_PAIRS + 1))).is_err());
+    }
+
     /// The pairs a readable search string carries.
     ///
     /// Shadows the real `query_params` for the tables below, which are
@@ -1073,7 +1100,7 @@ mod tests {
     /// accepts. The refusals are their own tests, on `read_search`,
     /// which is the door the app actually uses.
     fn query_params(raw: &str) -> Vec<(String, String)> {
-        super::query_params(raw).expect("a link the reader accepts")
+        super::query_params(raw, &KNOWN_KEYS).expect("a link the reader accepts")
     }
 
     /// Base64url, unpadded, as the codec writes it — spelled out here

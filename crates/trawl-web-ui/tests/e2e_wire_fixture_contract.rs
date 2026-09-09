@@ -628,6 +628,44 @@ fn pagination_run_fixtures_have_three_matching_rows() {
         "pagination-net-runs.json",
         include_str!("../e2e/harness/wire/pagination-net-runs.json"),
     );
+    let stats: RunsStatsResponse = decode(
+        "pagination-runs-stats.json",
+        include_str!("../e2e/harness/wire/pagination-runs-stats.json"),
+    );
+    assert_eq!(stats.total_runs, global.total as u64);
+    assert_eq!(
+        stats.success_count,
+        global
+            .runs
+            .iter()
+            .filter(|r| r.run.status == "success")
+            .count() as u64
+    );
+    assert_eq!(
+        stats.error_count,
+        global
+            .runs
+            .iter()
+            .filter(|r| r.run.status == "error")
+            .count() as u64
+    );
+    assert_eq!(
+        stats.timeout_count,
+        global
+            .runs
+            .iter()
+            .filter(|r| r.run.status == "timeout")
+            .count() as u64
+    );
+    let durations: Vec<_> = global
+        .runs
+        .iter()
+        .filter_map(|r| r.run.duration_ms)
+        .collect();
+    assert_eq!(
+        stats.avg_duration_ms,
+        Some(durations.iter().sum::<u64>() / durations.len() as u64)
+    );
     assert_eq!(global.total, 3);
     assert_eq!(drawer.total, 3);
     assert_eq!(global.runs.len(), 3);
