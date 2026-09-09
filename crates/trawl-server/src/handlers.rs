@@ -15,6 +15,7 @@ use fleet_auth::VerifiedKey;
 use serde::Deserialize;
 use std::borrow::Cow;
 use std::convert::Infallible;
+use trawl_api::csv::sanitize_csv_formula;
 use trawl_api::{
     CancelResponse, ClearHistoryResponse, CreateSavedRequest, DashboardSnapshot,
     DeleteSavedResponse, DeleteScheduleResponse, ExportRequest, FieldValuesResponse,
@@ -3197,19 +3198,6 @@ fn value_to_string(value: &Value) -> Cow<'_, str> {
                 Cow::Owned(owned) => Cow::Owned(owned),
             }
         }
-    }
-}
-
-/// Prefix cell values that could trigger formula injection in spreadsheets.
-///
-/// See OWASP CSV injection guidelines. Only string values need
-/// sanitization — numeric values like `-42` are legitimately negative.
-/// Returns borrowed when no prefix is needed.
-fn sanitize_csv_formula(s: &str) -> Cow<'_, str> {
-    if s.starts_with(['=', '+', '-', '@', '\t', '|']) {
-        Cow::Owned(format!("'{s}"))
-    } else {
-        Cow::Borrowed(s)
     }
 }
 

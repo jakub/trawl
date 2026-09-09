@@ -13,6 +13,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+pub mod csv;
 pub mod display;
 pub mod value;
 
