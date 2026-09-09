@@ -26,6 +26,7 @@ const EDITOR_RS: &str = include_str!("../src/components/editor.rs");
 const RESULTS_TABLE_RS: &str = include_str!("../src/components/results_table.rs");
 const HISTORY_RS: &str = include_str!("../src/pages/history.rs");
 const LAYOUT_RS: &str = include_str!("../src/pages/layout.rs");
+const RANGE_DIALOG_RS: &str = include_str!("../../fleet-ui/src/range_dialog.rs");
 const EDITOR_WRAP_RS: &str = include_str!("../src/components/editor_wrap.rs");
 const MALFORMED_NOTICE_RS: &str = include_str!("../src/components/malformed_notice.rs");
 const META_STRIP_RS: &str = include_str!("../src/components/meta_strip.rs");
@@ -299,32 +300,32 @@ const CONTRACTS: &[Contract] = &[
     },
     Contract {
         assignment: "dateRangeTrigger: '.daterange .dr-trigger',",
-        source_path: "src/components/editor_wrap.rs",
-        source: EDITOR_WRAP_RS,
+        source_path: "../fleet-ui/src/range_dialog.rs",
+        source: RANGE_DIALOG_RS,
         hook: "class=\"daterange\"",
     },
     Contract {
         assignment: "dateRangeTrigger: '.daterange .dr-trigger',",
-        source_path: "src/components/editor_wrap.rs",
-        source: EDITOR_WRAP_RS,
+        source_path: "../fleet-ui/src/range_dialog.rs",
+        source: RANGE_DIALOG_RS,
         hook: "class=\"dr-trigger\"",
     },
     Contract {
         assignment: "realtimeTab: '.dr-pop >> text=Real-time',",
-        source_path: "src/components/editor_wrap.rs",
-        source: EDITOR_WRAP_RS,
+        source_path: "../fleet-ui/src/range_dialog.rs",
+        source: RANGE_DIALOG_RS,
         hook: "class=\"dr-pop\"",
     },
     Contract {
         assignment: "realtimeTab: '.dr-pop >> text=Real-time',",
-        source_path: "src/components/editor_wrap.rs",
-        source: EDITOR_WRAP_RS,
+        source_path: "../fleet-ui/src/range_dialog.rs",
+        source: RANGE_DIALOG_RS,
         hook: "\"Real-time\"",
     },
     Contract {
         assignment: "liveTailButton: '.rt-hint button',",
-        source_path: "src/components/editor_wrap.rs",
-        source: EDITOR_WRAP_RS,
+        source_path: "../fleet-ui/src/range_dialog.rs",
+        source: RANGE_DIALOG_RS,
         hook: "class=\"rt-hint\"",
     },
     Contract {
@@ -371,32 +372,32 @@ const CONTRACTS: &[Contract] = &[
     },
     Contract {
         assignment: "absoluteTab: '.dr-pop >> text=Absolute',",
-        source_path: "src/components/editor_wrap.rs",
-        source: EDITOR_WRAP_RS,
+        source_path: "../fleet-ui/src/range_dialog.rs",
+        source: RANGE_DIALOG_RS,
         hook: "class=\"dr-pop\"",
     },
     Contract {
         assignment: "absoluteTab: '.dr-pop >> text=Absolute',",
-        source_path: "src/components/editor_wrap.rs",
-        source: EDITOR_WRAP_RS,
+        source_path: "../fleet-ui/src/range_dialog.rs",
+        source: RANGE_DIALOG_RS,
         hook: "\"Absolute\"",
     },
     Contract {
         assignment: "dateRangeFrom: '.dr-from',",
-        source_path: "src/components/editor_wrap.rs",
-        source: EDITOR_WRAP_RS,
+        source_path: "../fleet-ui/src/range_dialog.rs",
+        source: RANGE_DIALOG_RS,
         hook: "class=\"dr-from\"",
     },
     Contract {
         assignment: "dateRangeTo: '.dr-to',",
-        source_path: "src/components/editor_wrap.rs",
-        source: EDITOR_WRAP_RS,
+        source_path: "../fleet-ui/src/range_dialog.rs",
+        source: RANGE_DIALOG_RS,
         hook: "class=\"dr-to\"",
     },
     Contract {
         assignment: "dateRangeApply: '.dr-apply',",
-        source_path: "src/components/editor_wrap.rs",
-        source: EDITOR_WRAP_RS,
+        source_path: "../fleet-ui/src/range_dialog.rs",
+        source: RANGE_DIALOG_RS,
         hook: "class=\"dr-apply\"",
     },
     Contract {
@@ -443,8 +444,8 @@ const CONTRACTS: &[Contract] = &[
     },
     Contract {
         assignment: "quickRangeOption: '.dr-pop .opt',",
-        source_path: "src/components/editor_wrap.rs",
-        source: EDITOR_WRAP_RS,
+        source_path: "../fleet-ui/src/range_dialog.rs",
+        source: RANGE_DIALOG_RS,
         hook: "class=\"opt\"",
     },
     Contract {
@@ -1154,32 +1155,32 @@ const CONTRACTS: &[Contract] = &[
     // -- range dialog ---------------------------------------------------
     Contract {
         assignment: "rangeDialog: '.dr-pop[role=\"dialog\"]',",
-        source_path: "src/components/editor_wrap.rs",
-        source: EDITOR_WRAP_RS,
+        source_path: "../fleet-ui/src/range_dialog.rs",
+        source: RANGE_DIALOG_RS,
         hook: "class=\"dr-pop\"",
     },
     Contract {
         assignment: "rangeDialog: '.dr-pop[role=\"dialog\"]',",
-        source_path: "src/components/editor_wrap.rs",
-        source: EDITOR_WRAP_RS,
+        source_path: "../fleet-ui/src/range_dialog.rs",
+        source: RANGE_DIALOG_RS,
         hook: "role=\"dialog\"",
     },
     Contract {
         assignment: "rangeScrim: '.daterange .scrim',",
-        source_path: "src/components/editor_wrap.rs",
-        source: EDITOR_WRAP_RS,
+        source_path: "../fleet-ui/src/range_dialog.rs",
+        source: RANGE_DIALOG_RS,
         hook: "class=\"daterange\"",
     },
     Contract {
         assignment: "rangeScrim: '.daterange .scrim',",
-        source_path: "src/components/editor_wrap.rs",
-        source: EDITOR_WRAP_RS,
+        source_path: "../fleet-ui/src/range_dialog.rs",
+        source: RANGE_DIALOG_RS,
         hook: "class=\"scrim\"",
     },
     Contract {
         assignment: "segmentedOption: '.dr-pop .seg-opt',",
-        source_path: "src/components/editor_wrap.rs",
-        source: EDITOR_WRAP_RS,
+        source_path: "../fleet-ui/src/range_dialog.rs",
+        source: RANGE_DIALOG_RS,
         hook: "class=\"dr-pop\"",
     },
     Contract {
@@ -1189,16 +1190,16 @@ const CONTRACTS: &[Contract] = &[
         hook: "class=\"seg-opt\"",
     },
     Contract {
-        assignment: "dateRangeFromLabel: 'label[for=\"dr-from-input\"]',",
-        source_path: "src/components/editor_wrap.rs",
-        source: EDITOR_WRAP_RS,
-        hook: "for=\"dr-from-input\"",
+        assignment: "dateRangeFromLabel: '.dr-pop .fld:has(.dr-from) label[for]',",
+        source_path: "../fleet-ui/src/range_dialog.rs",
+        source: RANGE_DIALOG_RS,
+        hook: "for=ids.get_value().0",
     },
     Contract {
-        assignment: "dateRangeToLabel: 'label[for=\"dr-to-input\"]',",
-        source_path: "src/components/editor_wrap.rs",
-        source: EDITOR_WRAP_RS,
-        hook: "for=\"dr-to-input\"",
+        assignment: "dateRangeToLabel: '.dr-pop .fld:has(.dr-to) label[for]',",
+        source_path: "../fleet-ui/src/range_dialog.rs",
+        source: RANGE_DIALOG_RS,
+        hook: "for=ids.get_value().1",
     },
     // -- accessible names that are Rust format strings ------------------
     Contract {
@@ -1323,8 +1324,8 @@ const CONTRACTS: &[Contract] = &[
     },
     Contract {
         assignment: "rangeDialogName: 'Time range',",
-        source_path: "src/components/editor_wrap.rs",
-        source: EDITOR_WRAP_RS,
+        source_path: "../fleet-ui/src/range_dialog.rs",
+        source: RANGE_DIALOG_RS,
         hook: "aria-label=\"Time range\"",
     },
     Contract {

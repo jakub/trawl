@@ -29,10 +29,11 @@ extracted, and page sizes stay app policy — fleet-ui learns no size and
 no router. `LoadMore` (cursor) stays a separate protocol.
 
 **The window is computed from the unfiltered server page.** The runs page
-and net drawer converge on history's semantics: a local filter narrows
-the rendered rows and annotates the summary ("0 matches on this page"),
-never the window or Next. This is a deliberate, visible behaviour change
-riding an extraction slice; it lands red-test-first.
+converges on history's semantics: its local filter narrows the rendered
+rows and annotates the summary ("0 matches on this page"), never the
+window or Next. The net drawer remains unfiltered. This is a deliberate,
+visible behaviour change on the runs page riding an extraction slice;
+it lands red-test-first.
 
 **The range dialog promotes whole — trigger plus popover — because focus
 restore is a property of the pair** (the overlay hook restores to the

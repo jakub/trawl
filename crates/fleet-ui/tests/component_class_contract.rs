@@ -780,3 +780,58 @@ fn atmosphere_disposes_its_shader_mount_on_cleanup() {
          loop (the mount/dispose contract of jakub/coastwatch#308 AC 3)"
     );
 }
+
+#[test]
+fn range_control_owns_its_markup_and_styles() {
+    let source = markup_only(include_str!("../src/range_dialog.rs"));
+    for (hook, selector) in [
+        ("class=\"daterange\"", ".daterange"),
+        ("class=\"dr-trigger\"", ".dr-trigger"),
+        ("class=\"dr-pop\"", ".dr-pop"),
+        ("class=\"scrim\"", ".scrim"),
+        ("class=\"grid\"", ".dr-pop .grid"),
+        ("class=\"opt\"", ".dr-pop .opt"),
+        ("class=\"cust\"", ".dr-pop .cust"),
+        ("class=\"fld\"", ".dr-pop .cust .fld"),
+        ("class=\"lb\"", ".dr-pop .cust .fld .lb"),
+        ("class=\"dr-from\"", ".dr-pop .cust .fld input"),
+        ("class=\"dr-to\"", ".dr-pop .cust .fld input"),
+        ("class=\"foot\"", ".dr-pop .foot"),
+        ("class=\"btns\"", ".dr-pop .foot .btns"),
+        ("class=\"dr-apply\"", ".dr-apply"),
+        ("class=\"dr-err\"", ".dr-pop .dr-err"),
+        ("class=\"rt-hint\"", ".dr-pop .rt-hint"),
+    ] {
+        assert!(source.contains(hook), "range hook missing: {hook}");
+        assert!(
+            FLEET_CSS.contains(&format!("{selector} {{")),
+            "range style missing: {selector}"
+        );
+    }
+    for hook in [
+        "role=\"dialog\"",
+        "aria-modal=\"true\"",
+        "aria-label=\"Time range\"",
+        "for=ids.get_value().0",
+        "for=ids.get_value().1",
+        "\"Relative\"",
+        "\"Absolute\"",
+        "\"Real-time\"",
+    ] {
+        assert!(source.contains(hook), "range semantic hook missing: {hook}");
+    }
+}
+
+#[test]
+fn range_scrim_is_exactly_one_mousedown_dismisser() {
+    let source = markup_only(include_str!("../src/range_dialog.rs"));
+    let scrims: Vec<_> = source
+        .split("<div")
+        .skip(1)
+        .filter_map(|tail| tail.split_once("/>").map(|(tag, _)| tag))
+        .filter(|tag| tag.contains("class=\"scrim\""))
+        .collect();
+    assert_eq!(scrims.len(), 1);
+    assert!(scrims[0].contains("on:mousedown="));
+    assert!(!scrims[0].contains("on:click="));
+}

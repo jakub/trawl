@@ -349,6 +349,7 @@ fn DemoApp() -> impl IntoView {
                         // Shell-owned ToastBus via expect_context and fires
                         // success + error toasts.
                         <ToastProbe/>
+                        <RangeProbe/>
                         // Hidden export sentinel — proves Icon is in scope
                         // without re-mounting TopBar/Rail (which Shell
                         // already renders internally).
@@ -378,4 +379,26 @@ fn DemoApp() -> impl IntoView {
 #[cfg(target_arch = "wasm32")]
 fn main() {
     mount_to_body(DemoApp);
+}
+
+/// A second app's presets and refusal policy, with no live mode.
+#[cfg(target_arch = "wasm32")]
+#[component]
+fn RangeProbe() -> impl IntoView {
+    use fleet_ui::{RangeDialog, RangePreset, RangeValue};
+    view! {
+        <section style="padding:16px;max-width:360px">
+            <h2>"Range dialog"</h2>
+            <RangeDialog
+                value=Signal::from(RangeValue::Quick("30m".into()))
+                presets=vec![
+                    RangePreset { id: "30m".into(), label: "Past half hour".into() },
+                    RangePreset { id: "6h".into(), label: "Past six hours".into() },
+                ]
+                reset_key={Signal::<String>::from("workbench".to_string())}
+                disabled=Signal::from(false)
+                on_commit=Callback::new(|_| Err("Workbench refuses this range.".into()))
+            />
+        </section>
+    }
 }

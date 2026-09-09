@@ -172,23 +172,87 @@ test('navigator refusal keeps the valid range draft and error in the dialog', as
   const originalUrl = page.url();
   await page.locator(SEL.dateRangeTrigger).click();
   await page.locator(SEL.absoluteTab).click();
-  const from = '2026-01-01T00:00:00Z';
+  const from = '2026-01-01T03:00:00+03:00';
   const to = '2026-01-02T00:00:00Z';
   await page.locator(SEL.dateRangeFrom).fill(from);
   await page.locator(SEL.dateRangeTo).fill(to);
   await page.locator(SEL.dateRangeApply).click();
 
-  // The current app reports refusal in a toast; the promoted control
-  // reports it inline. Either proves this reached the navigator gate.
-  await expect(page.getByText("Can't open this search: link too long", { exact: true })).toBeVisible();
+  await expect(page.locator('.dr-err')).toHaveText("Can't open this search: link too long");
+  await expect(page.locator(SEL.toastError)).toHaveCount(0);
+  await expect(page.locator(SEL.rangeDialog)).toBeVisible();
+  await expect(page.locator(SEL.dateRangeFrom)).toHaveValue(from);
+  await expect(page.locator(SEL.dateRangeTo)).toHaveValue(to);
   expect(page.url()).toBe(originalUrl);
   expect(await capturedQueryCount(request)).toBe(1);
+});
 
-  // Soft assertions expose every lost-draft symptom in the red run.
-  await expect.soft(page.locator(SEL.rangeDialog)).toBeVisible();
-  await expect.soft(page.locator(SEL.dateRangeFrom)).toHaveValue(from);
-  await expect.soft(page.locator(SEL.dateRangeTo)).toHaveValue(to);
-  await expect.soft(page.locator('.dr-err')).toContainText("Can't open this search: link too long");
-  expect(page.url()).toBe(originalUrl);
+test('absolute drafts survive tab switches but are discarded on close', async ({ page }) => {
+  await page.goto('/search');
+  await page.locator(SEL.dateRangeTrigger).click();
+  await page.locator(SEL.absoluteTab).click();
+  await page.locator(SEL.dateRangeFrom).fill('raw draft');
+  await page.locator(SEL.dateRangeTo).fill('other draft');
+  await page.locator(SEL.realtimeTab).click();
+  await page.locator(SEL.absoluteTab).click();
+  await expect(page.locator(SEL.dateRangeFrom)).toHaveValue('raw draft');
+  await expect(page.locator(SEL.dateRangeTo)).toHaveValue('other draft');
+  await page.keyboard.press('Escape');
+  await page.locator(SEL.dateRangeTrigger).click();
+  await page.locator(SEL.absoluteTab).click();
+  await expect(page.locator(SEL.dateRangeFrom)).toHaveValue('');
+  await expect(page.locator(SEL.dateRangeTo)).toHaveValue('now');
+});
+
+test('both blank bounds close without committing', async ({ page, request }) => {
+  await page.goto('/search?q=service%3Dnginx');
+  await lastCapturedQuery(request, 1);
+  const url = page.url();
+  await page.locator(SEL.dateRangeTrigger).click();
+  await page.locator(SEL.absoluteTab).click();
+  await page.locator(SEL.dateRangeFrom).fill('  ');
+  await page.locator(SEL.dateRangeTo).fill('  ');
+  await page.locator(SEL.dateRangeApply).click();
+  await expect(page.locator(SEL.rangeDialog)).toHaveCount(0);
+  expect(page.url()).toBe(url);
+  expect(await capturedQueryCount(request)).toBe(1);
+});
+
+test('a same-range external URL change closes and discards the draft', async ({ page, request }) => {
+  await page.goto('/search?q=service%3Dnginx');
+  await lastCapturedQuery(request, 1);
+  await page.locator(SEL.dateRangeTrigger).click();
+  const label = await page.locator(SEL.dateRangeTrigger).innerText();
+  await page.locator(SEL.absoluteTab).click();
+  await page.locator(SEL.dateRangeFrom).fill('discard me');
+  // A router-intercepted anchor changes the existing SPA's URL identity.
+  await page.evaluate(() => {
+    const anchor = document.createElement('a');
+    anchor.href = '/search?q=service%3Dapache';
+    document.body.append(anchor);
+    anchor.click();
+    anchor.remove();
+  });
+  await lastCapturedQuery(request, 2);
+  await expect(page.locator(SEL.rangeDialog)).toHaveCount(0);
+  await expect(page.locator(SEL.dateRangeTrigger)).toHaveText(label);
+  await page.locator(SEL.dateRangeTrigger).click();
+  await page.locator(SEL.absoluteTab).click();
+  await expect(page.locator(SEL.dateRangeFrom)).toHaveValue('');
+});
+
+test('Live refusal uses the editor buffer and remains visible across tabs', async ({ page, request }) => {
+  await page.goto('/search?q=service%3Dnginx');
+  await lastCapturedQuery(request, 1);
+  const url = page.url();
+  await page.locator(SEL.cmContent).fill('a'.repeat(32 * 1024));
+  await page.locator(SEL.dateRangeTrigger).click();
+  await page.locator(SEL.realtimeTab).click();
+  await page.getByRole('button', { name: COPY.liveTailButtonText, exact: true }).click();
+  await expect(page.locator('.dr-err')).toHaveText("Can't open this search: link too long");
+  await page.locator(SEL.absoluteTab).click();
+  await expect(page.locator('.dr-err')).toBeVisible();
+  await expect(page.locator(SEL.toastError)).toHaveCount(0);
+  expect(page.url()).toBe(url);
   expect(await capturedQueryCount(request)).toBe(1);
 });

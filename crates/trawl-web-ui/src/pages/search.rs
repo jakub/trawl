@@ -83,6 +83,7 @@ pub fn Search() -> impl IntoView {
     let query_text = RwSignal::new(String::new());
 
     let UrlSignals {
+        raw_search,
         executed_q,
         page,
         mode,
@@ -168,19 +169,17 @@ pub fn Search() -> impl IntoView {
         let goto = goto.clone();
         Callback::new(move |()| {
             if unreadable.get_untracked() {
-                return;
+                return Err("This search link could not be read.".to_string());
             }
-            report_refusal(
-                bus,
-                goto(
-                    &query_text.get_untracked(),
-                    0,
-                    Mode::Live,
-                    &filters.get_untracked(),
-                    &range.get_untracked(),
-                    false,
-                ),
-            );
+            goto(
+                &query_text.get_untracked(),
+                0,
+                Mode::Live,
+                &filters.get_untracked(),
+                &range.get_untracked(),
+                false,
+            )
+            .map_err(|reason| crate::search_url::refusal_copy(reason).to_string())
         })
     };
 
@@ -285,21 +284,23 @@ pub fn Search() -> impl IntoView {
 
     let on_range_change = {
         let goto = goto.clone();
-        Callback::new(move |new_range: RangeSpec| {
-            if unreadable.get_untracked() || range.get_untracked() == new_range {
-                return;
+        Callback::new(move |picked: fleet_ui::RangeValue| {
+            if unreadable.get_untracked() {
+                return Err("This search link could not be read.".to_string());
             }
-            report_refusal(
-                bus,
-                goto(
-                    &executed_q.get_untracked(),
-                    0,
-                    mode.get_untracked(),
-                    &filters.get_untracked(),
-                    &new_range,
-                    false,
-                ),
-            );
+            let new_range = crate::search_url::normalize_dialog_range(picked)?;
+            if range.get_untracked() == new_range {
+                return Ok(());
+            }
+            goto(
+                &executed_q.get_untracked(),
+                0,
+                mode.get_untracked(),
+                &filters.get_untracked(),
+                &new_range,
+                false,
+            )
+            .map_err(|reason| crate::search_url::refusal_copy(reason).to_string())
         })
     };
 
@@ -505,6 +506,7 @@ pub fn Search() -> impl IntoView {
                     on_submit=on_submit
                     range=range_sig
                     on_range_change=on_range_change
+                    reset_key=raw_search
                     running=running
                     blocked=unreadable
                     on_save=on_save

@@ -129,6 +129,8 @@ pub fn report_refusal(bus: ToastBus, outcome: Result<(), Reason>) {
 /// fix. The link comes first because a link over `MAX_SEARCH_BYTES` was
 /// never parsed: there are no parameter verdicts underneath it.
 pub struct UrlSignals {
+    /// Exact router search identity, including changes with equal decoded values.
+    pub raw_search: Memo<String>,
     pub executed_q: Memo<String>,
     pub page: Memo<usize>,
     pub mode: Memo<Mode>,
@@ -203,6 +205,7 @@ pub fn url_signals() -> UrlSignals {
     });
 
     UrlSignals {
+        raw_search: search,
         executed_q,
         page,
         mode,

@@ -89,3 +89,7 @@ _Avoid_: inline copy, span mode
 **Native control**:
 Any fleet-ui element that acts on click, rendered as `<button type="button">` so the keyboard, the ADR-0007 focus ring and assistive technology reach it. The only clickable non-buttons left are scrims.
 _Avoid_: pseudo-button (that is the defect, not the term), clickable
+
+**Range dialog**:
+The whole range control: a trigger and a temporary selection panel that accepts app-supplied presets or absolute bounds. An accepted transition closes the panel and returns focus to its trigger; refusal keeps the draft and its error visible.
+_Avoid_: popover, date picker, dropdown

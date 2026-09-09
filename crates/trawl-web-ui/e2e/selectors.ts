@@ -62,28 +62,28 @@ export const SEL = {
   notFoundSubtitle: '.login-card .subtitle',
   /// crates/trawl-web-ui/src/components/editor_wrap.rs — Run/Haul button.
   runButton: 'button.run',
-  /// crates/trawl-web-ui/src/components/editor_wrap.rs DateRange — opens
+  /// crates/fleet-ui/src/range_dialog.rs RangeDialog — opens
   /// the date-range/live-tail popover.
   dateRangeTrigger: '.daterange .dr-trigger',
-  /// crates/trawl-web-ui/src/components/editor_wrap.rs DateRangePopover —
+  /// crates/fleet-ui/src/range_dialog.rs RangePanel —
   /// the Segmented tab strip's "Real-time" option (fleet-ui Segmented
   /// renders one element per SegmentedOption carrying its label text).
   realtimeTab: '.dr-pop >> text=Real-time',
-  /// crates/trawl-web-ui/src/components/editor_wrap.rs DateRangePopover —
+  /// crates/fleet-ui/src/range_dialog.rs RangePanel —
   /// the Real-time tab's "Live Tail" button, which calls `on_live`.
   liveTailButton: '.rt-hint button',
   /// crates/fleet-ui/src/loaded/component.rs Loaded's default Error arm.
   loadHintError: '.results .load-hint.error',
-  /// crates/trawl-web-ui/src/components/editor_wrap.rs DateRangePopover —
+  /// crates/fleet-ui/src/range_dialog.rs RangePanel —
   /// the Segmented tab strip's "Absolute" option.
   absoluteTab: '.dr-pop >> text=Absolute',
-  /// crates/trawl-web-ui/src/components/editor_wrap.rs DateRangePopover —
+  /// crates/fleet-ui/src/range_dialog.rs RangePanel —
   /// the Absolute tab's From input.
   dateRangeFrom: '.dr-from',
-  /// crates/trawl-web-ui/src/components/editor_wrap.rs DateRangePopover —
+  /// crates/fleet-ui/src/range_dialog.rs RangePanel —
   /// the Absolute tab's To input.
   dateRangeTo: '.dr-to',
-  /// crates/trawl-web-ui/src/components/editor_wrap.rs DateRangePopover —
+  /// crates/fleet-ui/src/range_dialog.rs RangePanel —
   /// the wrapper carrying the Apply button (fleet-ui's Btn takes no class).
   dateRangeApply: '.dr-apply',
   /// crates/trawl-web-ui/src/components/malformed_notice.rs — the banner a
@@ -107,7 +107,7 @@ export const SEL = {
   exportAction: '.tabs .action.export',
   /// crates/trawl-web-ui/src/pages/search.rs — its Save twin.
   saveAction: '.tabs .action.save',
-  /// crates/trawl-web-ui/src/components/editor_wrap.rs DateRangePopover —
+  /// crates/fleet-ui/src/range_dialog.rs RangePanel —
   /// one quick-range preset in the Relative tab's grid.
   quickRangeOption: '.dr-pop .opt',
   /// crates/fleet-ui/src/modal/shell.rs — the modal panel itself (the
@@ -298,7 +298,7 @@ export const SEL = {
   netRunPreview: '.sd-body .run-preview',
 
   // -- range dialog ---------------------------------------------------
-  /// crates/trawl-web-ui/src/components/editor_wrap.rs DateRangePopover
+  /// crates/fleet-ui/src/range_dialog.rs RangePanel
   /// — the panel as a modal dialog on fleet-ui's overlay stack.
   rangeDialog: '.dr-pop[role="dialog"]',
   /// Its scrim, a sibling before the panel. Dismissal is mousedown.
@@ -307,9 +307,9 @@ export const SEL = {
   /// panel's first control, so it is where initial focus lands.
   segmentedOption: '.dr-pop .seg-opt',
   /// The Absolute tab's From label, paired to `.dr-from` by `for`.
-  dateRangeFromLabel: 'label[for="dr-from-input"]',
+  dateRangeFromLabel: '.dr-pop .fld:has(.dr-from) label[for]',
   /// Its To twin.
-  dateRangeToLabel: 'label[for="dr-to-input"]',
+  dateRangeToLabel: '.dr-pop .fld:has(.dr-to) label[for]',
 } as const;
 
 /// Timings the specs share with the app. Mirrored here rather than
@@ -343,7 +343,7 @@ export const COPY = {
   /// tail comes from the server's own error envelope and is not pinned
   /// here).
   loadHintErrorPrefix: "Couldn't load results:",
-  /// crates/trawl-web-ui/src/components/editor_wrap.rs DateRangePopover —
+  /// crates/trawl-web-ui/src/components/editor_wrap.rs — app-supplied
   /// Real-time tab's "Live Tail" button text.
   liveTailButtonText: 'Live Tail',
   /// crates/trawl-web-ui/src/search_url.rs Malformed::message + Param::noun.
@@ -448,7 +448,7 @@ export const COPY = {
   /// editor's input. It replaces the heading it edits, so the name it is
   /// editing is nowhere on screen to label it.
   netRenameInputName: 'New name for {name}',
-  /// crates/trawl-web-ui/src/components/editor_wrap.rs — the range
+  /// crates/fleet-ui/src/range_dialog.rs — the range
   /// dialog's own name. Not a format string.
   rangeDialogName: 'Time range',
   /// crates/trawl-web-ui/src/components/net_drawer.rs — what stands in

@@ -51,6 +51,7 @@ pub mod login;
 pub mod modal;
 pub mod overlay;
 pub mod page_window;
+pub mod range_dialog;
 pub mod segmented;
 pub mod sparkline;
 pub mod status_dot;
@@ -104,6 +105,9 @@ pub use modal::ConfirmState;
 #[cfg(target_arch = "wasm32")]
 pub use page_window::OffsetPager;
 pub use page_window::{PageTotal, PageWindow};
+#[cfg(target_arch = "wasm32")]
+pub use range_dialog::RangeDialog;
+pub use range_dialog::{RangePreset, RangeValue};
 pub use segmented::{SegmentedOption, segmented_class};
 pub use sparkline::SparkPath;
 pub use status_dot::StatusTone;

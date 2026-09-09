@@ -42,15 +42,11 @@ _Avoid_: view, tab
 The one closure that turns `(query, page, mode, filters, range)` into a search URL and pushes or replaces it on the router's history.
 _Avoid_: router (that is leptos's), goto
 
-### List tables and the range dialog
+### List tables
 
 **Row control**:
 The one link or button in a list row's primary cell. Its hit area is stretched over the whole row, so the pointer opens the row from anywhere while the keyboard reaches exactly one element; nested controls sit above it. The row element itself carries no handler.
 _Avoid_: clickable row, row handler, stretched link (that is the CSS technique, not the term)
-
-**Range dialog**:
-The date-range picker's open panel: a named modal dialog under the overlay stack, opened by its trigger button, closed by Escape, its scrim or an applied range, returning focus to the trigger. It owns the search page's range and nothing else.
-_Avoid_: popover, date picker (that is the whole control, trigger included), dropdown
 
 ### Settings surfaces
 

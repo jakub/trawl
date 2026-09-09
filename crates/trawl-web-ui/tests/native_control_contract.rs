@@ -25,13 +25,8 @@
 //!      `aria-label` on one line and the handler three lines further
 //!      down.
 //!
-//! The one allowed site is the date picker's scrim, a full-screen
-//! transparent `div` that dismisses on `mousedown`. It is not a control:
-//! it has no name, does nothing a keyboard user needs (Escape closes the
-//! dialog and the overlay hook traps Tab inside the panel), and giving
-//! it a role would put a nameless button in the tab order. The
-//! allow-list is asserted to MATCH something, so deleting the scrim
-//! silently widens nothing.
+//! Range scrim ownership and its mousedown exception live in fleet-ui.
+//! This app has no pseudo-button exceptions.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -57,20 +52,6 @@ struct Site {
     tag: &'static str,
     /// The opening tag's source text, comments already stripped.
     text: String,
-}
-
-impl Site {
-    /// The date picker's scrim: `editor_wrap.rs`, a `div`, dismissing on
-    /// `mousedown` and on nothing else. Every clause is load-bearing —
-    /// an `on:click` added to it, or a second `class="scrim"` div
-    /// elsewhere, is not this site.
-    fn is_allowed_scrim(&self) -> bool {
-        self.file.ends_with("components/editor_wrap.rs")
-            && self.tag == "div"
-            && self.text.contains("class=\"scrim\"")
-            && self.text.contains("on:mousedown")
-            && !self.text.contains("on:click")
-    }
 }
 
 /// Every pseudo-button site in one file's source text.
@@ -220,9 +201,8 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 #[test]
-fn no_pseudo_button_survives_outside_the_allow_list() {
+fn no_app_pseudo_button_survives() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut allowed = 0usize;
     let mut offenders = Vec::new();
     for path in source_files() {
         let rel = path
@@ -232,11 +212,7 @@ fn no_pseudo_button_survives_outside_the_allow_list() {
             .into_owned();
         let src = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {rel}: {e}"));
         for site in pseudo_button_sites(&rel, &src) {
-            if site.is_allowed_scrim() {
-                allowed += 1;
-            } else {
-                offenders.push(format!("{}:{} <{}>", site.file, site.line, site.tag));
-            }
+            offenders.push(format!("{}:{} <{}>", site.file, site.line, site.tag));
         }
     }
 
@@ -246,14 +222,6 @@ fn no_pseudo_button_survives_outside_the_allow_list() {
          Make each one a `<button type=\"button\">` or an `<a href>` with an \
          accessible name, and prove it in a spec under e2e/tests/.",
         offenders.join(", "),
-    );
-    // Non-vacuous: the allow-list has to be matching the scrim it was
-    // written for, or it is silently permitting nothing and would keep
-    // passing after someone widened it.
-    assert_eq!(
-        allowed, 1,
-        "expected exactly one allow-listed site, the date picker's scrim \
-         in src/components/editor_wrap.rs — found {allowed}",
     );
 }
 
@@ -304,21 +272,10 @@ fn a_rust_expression_in_an_attribute_does_not_end_the_tag_early() {
 }
 
 #[test]
-fn the_scrim_is_allowed_and_an_ordinary_dismisser_is_not() {
-    let scrim = "<div\n    class=\"scrim\"\n    node_ref=scrim_ref\n    \
-                 on:mousedown=on_scrim_mousedown\n/>\n";
-    let sites = pseudo_button_sites("src/components/editor_wrap.rs", scrim);
-    assert_eq!(sites.len(), 1);
-    assert!(
-        sites[0].is_allowed_scrim(),
-        "the picker's scrim is the one exemption"
+fn a_scrim_in_the_app_is_still_detected() {
+    let sites = pseudo_button_sites(
+        "src/fixture.rs",
+        "<div class=\"scrim\" on:mousedown=close/>",
     );
-
-    // Same markup somewhere else, or the same file with a click handler
-    // added: not the exempt site.
-    let elsewhere = pseudo_button_sites("src/components/other.rs", scrim);
-    assert!(!elsewhere[0].is_allowed_scrim());
-    let clicking = scrim.replace("on:mousedown=on_scrim_mousedown", "on:click=close");
-    let clicking = pseudo_button_sites("src/components/editor_wrap.rs", &clicking);
-    assert!(!clicking[0].is_allowed_scrim());
+    assert_eq!(sites.len(), 1);
 }
