@@ -165,7 +165,7 @@ const CONTRACTS: &[Contract] = &[
         assignment: "paletteKbd: '.topbar button.jump .kbd',",
         source_path: "../fleet-ui/src/kbd.rs",
         source: KBD_RS,
-        hook: "\"kbd\"",
+        hook: "else { \"kbd\" }",
     },
     Contract {
         assignment: "historyAwayLink: 'nav.rail a[title=\"Schema\"]',",

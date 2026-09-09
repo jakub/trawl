@@ -5,6 +5,13 @@ against the disposable E2E server and SPA built from
 `51164dad6876769d0529f878a7878fbd8d9d3a17`. The source implementation is
 `9d1bd246283604294b225bff8408027966bacb94`. These captures contain fixture data.
 
+These historical images document the palette inventory and layout. Comparing
+the capture source with `232698b7236ff92431e08cc65cc52e7b2ff57092` shows later
+changes to Escape guards, pointer focus, chord target classification, and the
+trigger's accessible name. The palette's visible markup and CSS rules are
+unchanged. The current behavioral tests below cover those later changes;
+the screenshots do not prove keyboard handling or accessible names.
+
 | Capture | Setup |
 | --- | --- |
 | [Search](chromium-search.png) | `/search`, default fixture, 1440 by 900, light theme, trigger opened |

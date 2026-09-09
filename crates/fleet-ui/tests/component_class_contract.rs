@@ -666,13 +666,13 @@ fn command_palette_class_hooks_have_viewport_and_control_styles() {
     for required in [
         ".command-palette-scrim[hidden] { display: none; }",
         "max-height: calc(100dvh",
-        "ScrollLogicalPosition::Nearest",
     ] {
-        assert!(
-            FLEET_CSS.contains(required) || palette.contains(required),
-            "missing {required}"
-        );
+        assert!(FLEET_CSS.contains(required), "fleet-ui.css lost {required}");
     }
+    assert!(
+        palette.contains("ScrollLogicalPosition::Nearest"),
+        "the palette lost its nearest-scroll keyboard follow"
+    );
     let jump = FLEET_CSS
         .split(".topbar .jump {")
         .nth(1)
