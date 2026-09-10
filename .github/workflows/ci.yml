@@ -525,7 +525,7 @@ jobs:
 
   web-ui-e2e:
     name: web UI browser tests (playwright)
-    runs-on: k8s-small
+    runs-on: k8s-big
     needs: trunk-build
     timeout-minutes: 10
     # This job executes third-party code (npm packages, a CDN-fetched
