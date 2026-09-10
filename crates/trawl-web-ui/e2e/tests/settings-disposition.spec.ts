@@ -100,3 +100,10 @@ test('Help is a native keyboard link and stays outside the full Settings palette
   )).toEqual(['/search', '/jobs/nets', '/settings', '/settings/health', '/search/schema']);
   await expect(page.locator(SEL.paletteLabel).filter({ hasText: /^Help$/ })).toHaveCount(0);
 });
+
+test('Settings trailing slash reaches Health', async ({ page, request }) => {
+  await resetScenario(request, 'health-viewer');
+  await page.goto('/settings/');
+  await expect(page).toHaveURL(/\/settings\/health$/);
+  await expect(page.locator(SEL.healthPage)).toBeVisible();
+});

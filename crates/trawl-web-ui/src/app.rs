@@ -55,7 +55,7 @@ fn SettingsRedirect() -> impl IntoView {
     // Anchor navigation commits its history entry after the route mounts.
     // Replacing it during mount would replace the preceding page instead.
     let frame = request_animation_frame_with_handle(move || {
-        if location.pathname.get_untracked() != "/settings" {
+        if location.pathname.get_untracked().trim_end_matches('/') != "/settings" {
             return;
         }
         navigate(
