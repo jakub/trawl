@@ -527,7 +527,7 @@ jobs:
     name: web UI browser tests (playwright)
     runs-on: k8s-small
     needs: trunk-build
-    timeout-minutes: 10
+    timeout-minutes: 15
     # This job executes third-party code (npm packages, a CDN-fetched
     # browser): read-only token, and no credentials persisted into
     # .git/config for that code to read.
