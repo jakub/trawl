@@ -32,7 +32,9 @@ export default defineConfig({
   projects: [
     {
       name: 'chromium',
-      use: { ...devices['Desktop Chrome'] },
+      // Full Chromium avoids the headless-shell renderer crashes seen
+      // during native new-tab tests, including a plain HTML reproduction.
+      use: { ...devices['Desktop Chrome'], channel: 'chromium' },
     },
   ],
   webServer: {

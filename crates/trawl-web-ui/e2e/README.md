@@ -45,6 +45,22 @@ shared libraries are your own problem). `playwright.config.ts` switches
 its reporter to `['github', 'list']` under `CI=true` so failures annotate
 the PR diff.
 
+The Chromium project selects `channel: 'chromium'`, which runs full
+Chromium in headless mode. The default headless shell in Playwright
+1.62.1 logged renderer SIGSEGV crashes during native Ctrl-click tests,
+including a reproduction with only a plain HTML link. Full Chromium at
+the same version passed 30 Ctrl-click repetitions and the 180-test suite
+without those crashes. Both binaries come from the existing
+`playwright install chromium` step and lockfile-keyed cache.
+
+The main browser CI job enables `DEBUG=pw:browser` to retain process
+exits and browser stderr in its log. Use the same environment variable
+locally when investigating a popup timeout. A passing assertion does
+not rule out a renderer crash: the headless-shell repetitions passed
+despite their crash messages. The missing popup event in main CI run
+34440325872 has not been reproduced locally, so its cause remains
+unproven.
+
 The full CI suite gets eight minutes on the shared `k8s-small` runner,
 inside a 15-minute job budget that also covers setup and artifact upload.
 The local default remains four minutes. To reproduce CI's aggregate
