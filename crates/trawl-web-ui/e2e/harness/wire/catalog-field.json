@@ -6,9 +6,15 @@
   "services": [
     {
       "service": "nginx",
-      "first_seen": "2026-07-24T00:00:00Z",
-      "last_seen": "2026-08-01T09:00:00Z",
+      "first_seen": "2026-07-24T00:00:00.824072Z",
+      "last_seen": "2026-08-01T09:00:00.987035Z",
       "row_count": 41822
+    },
+    {
+      "service": "edgegatewaywithalongunbrokenservicenameforthefielddrawer",
+      "first_seen": "2026-07-24T00:00:00.824072Z",
+      "last_seen": "2026-08-01T09:00:00.987035Z",
+      "row_count": 1000000000000000000
     }
   ],
   "conflicts": []

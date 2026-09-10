@@ -1342,6 +1342,15 @@
 .fc-svc .nm, .fc-conflict .nm { color: var(--ink); flex: 1; min-width: 0; }
 .fc-svc .dt, .fc-conflict .dt { color: var(--ink-3); font-size: var(--fs-micro); }
 .fc-svc .ct, .fc-conflict .ct { color: var(--ink-2); font-family: var(--font-mono); }
+/* Keep the full timestamp range below the service instead of letting it
+   squeeze the service name to zero width in a narrow drawer. */
+.fc-svc {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto;
+  row-gap: 2px;
+}
+.fc-svc .nm { overflow-wrap: anywhere; }
+.fc-svc .dt { grid-column: 1 / -1; grid-row: 2; overflow-wrap: anywhere; }
+.fc-svc .ct { grid-column: 2; grid-row: 1; white-space: nowrap; }
 .fc-conflict .cast { color: var(--yellow); }
 .fc-conflict details { padding: 4px 0 8px; }
 .fc-conflict summary {
