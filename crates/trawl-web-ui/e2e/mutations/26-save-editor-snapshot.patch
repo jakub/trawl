@@ -1,0 +1,12 @@
+diff --git a/crates/trawl-web-ui/src/pages/search.rs b/crates/trawl-web-ui/src/pages/search.rs
+--- a/crates/trawl-web-ui/src/pages/search.rs
++++ b/crates/trawl-web-ui/src/pages/search.rs
+@@ -459,7 +459,7 @@
+         if unreadable.get_untracked() {
+             return;
+         }
+-        save_query.set(Some(query_text.get_untracked()));
++        save_query.set(Some(effective_q.get_untracked()));
+     });
+     let show_export_modal = RwSignal::new(false);
+     let on_export = Callback::new(move |()| {

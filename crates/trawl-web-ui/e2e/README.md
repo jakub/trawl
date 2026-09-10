@@ -197,11 +197,12 @@ one thing the suite is supposed to catch:
 | `23-range-close-on-refusal.patch` | The shared range commit path closes after the app refuses a selection | `range-dialog.spec.ts`, retained absolute and quick drafts with inline errors |
 | `24-palette-overlay-gate.patch` | removes both closed-state overlay admission checks, in Shell's open callback and global chord listener | `command-palette.spec.ts`, export-modal chord inertness |
 | `25-palette-toggle.patch` | replaces the open palette's chord close callback with a no-op | `command-palette.spec.ts`, chord while open toggles closed |
+| `26-save-editor-snapshot.patch` | captures the executed query with URL filters and range instead of the editor buffer | `settings-disposition.spec.ts`, exact preview and POST assertions for both Save controls |
 
 Run the mechanism:
 
 ```sh
-crates/trawl-web-ui/e2e/scripts/mutation-check.sh                     # all 24 standard mutations (21 has a dedicated runner)
+crates/trawl-web-ui/e2e/scripts/mutation-check.sh                     # all 25 standard mutations (21 has a dedicated runner)
 crates/trawl-web-ui/e2e/scripts/mutation-check.sh 02-editor-onchange.patch  # just one
 ```
 
@@ -214,7 +215,7 @@ launch failure as executed-and-failed tests rather than as no tests. It
 refuses to run against a dirty working tree, since a patch that can't be
 cleanly reverted would strand a mutation in your tree. This is evidence
 tooling for reviewing the suite's effectiveness. Dedicated CI jobs run the
-Health, pagination, range-dialog, and command-palette mutations after the same commit's baseline E2E job passes.
+Health, pagination, range-dialog, command-palette, and Save mutations after the same commit's baseline E2E job passes.
 
 08 through 11 are focus-order sensitive: the thing they break is
 where `document.activeElement` ends up after a keypress, and a browser
@@ -403,3 +404,34 @@ baseline, runs these three mutations and uploads failure traces. Apply or build
 failure is not a kill; the target must execute and fail, the control must pass,
 and the runner must restore both clean source and pristine app dist. Mutation
 21 remains reserved for the dedicated Atmosphere runner.
+
+### Save editor snapshot mutation
+
+`26-save-editor-snapshot.patch` changes only the shared Save callback's input
+from `query_text.get_untracked()` to `effective_q.get_untracked()`. The editor
+and toolbar tests start with different buffer, executed, and effective queries.
+They compare the preview's exact `textContent` and the captured POST body with
+the editor buffer, including whitespace.
+
+The runner selects tests whose names start with `Save captures editor buffer:`.
+Its JSON report checker requires both the editor and toolbar tests to have an
+actual `failed` result with the exact snapshot preview or POST assertion.
+Timeouts, missing tests, malformed reports, and unrelated failures do not count.
+The unaffected `routing.spec.ts` must pass. Synthetic report checks run with
+`node --test crates/trawl-web-ui/e2e/scripts/check-save-mutation.test.mjs`.
+
+Run the complete sequence from a clean repository root:
+
+```sh
+export E2E_PORT=8164 CARGO_BUILD_JOBS=4
+(cd crates/trawl-web-ui && env -u NO_COLOR trunk build)
+(cd crates/trawl-web-ui/e2e && npx playwright test tests/settings-disposition.spec.ts)
+env -u NO_COLOR crates/trawl-web-ui/e2e/scripts/mutation-check.sh 26-save-editor-snapshot.patch
+(cd crates/trawl-web-ui/e2e && npx playwright test tests/settings-disposition.spec.ts)
+```
+
+The mutation runner reverses the patch and rebuilds the pristine SPA before it
+returns. The final browser command verifies that restored build. The explicit
+`web-ui-save-snapshot-mutation` CI job runs this sequence after `web-ui-e2e`,
+with separate steps for the pristine and restored assertions. A failed build,
+unattributed target failure, failed control, or dirty restored tree fails the job.
