@@ -6,7 +6,6 @@ pub mod history;
 pub mod layout;
 pub mod login;
 pub mod nets;
-pub mod placeholder;
 pub mod runs;
 pub mod schema;
 pub mod search;

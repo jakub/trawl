@@ -78,6 +78,18 @@ const HEALTH_RS: &str = include_str!("../src/pages/health.rs");
 
 const CONTRACTS: &[Contract] = &[
     Contract {
+        assignment: "helpLink: 'nav.rail .bot a[title=\"Help\"]',",
+        source_path: "../fleet-ui/src/rail.rs",
+        source: RAIL_RS,
+        hook: "class=\"bot\"",
+    },
+    Contract {
+        assignment: "helpLink: 'nav.rail .bot a[title=\"Help\"]',",
+        source_path: "src/pages/layout.rs",
+        source: LAYOUT_RS,
+        hook: "title=\"Help\" href=\"https://trawl.sh\"",
+    },
+    Contract {
         assignment: "paletteTrigger: '.topbar button.jump',",
         source_path: "../fleet-ui/src/topbar.rs",
         source: TOPBAR_RS,
@@ -156,7 +168,7 @@ const CONTRACTS: &[Contract] = &[
         hook: "class=\"modes\"",
     },
     Contract {
-        assignment: "paletteRailLink: 'nav.rail a[title]',",
+        assignment: "paletteRailLink: 'nav.rail > a[title]',",
         source_path: "../fleet-ui/src/rail.rs",
         source: RAIL_RS,
         hook: "attr:title=label_attr",
@@ -258,10 +270,10 @@ const CONTRACTS: &[Contract] = &[
         hook: "class=\"health-query-scroll\"",
     },
     Contract {
-        assignment: "healthAwayLink: 'nav.rail a[title=\"Sources\"]',",
+        assignment: "healthAwayLink: 'nav.rail a[title=\"Schema\"]',",
         source_path: "src/state/section.rs",
         source: SECTION_RS,
-        hook: "label: \"Sources\"",
+        hook: "label: \"Schema\"",
     },
     Contract {
         assignment: "railHealthLink: 'nav.rail a[title=\"Health\"]',",
@@ -282,7 +294,7 @@ const CONTRACTS: &[Contract] = &[
         hook: "role=\"alertdialog\"",
     },
     Contract {
-        assignment: "healthAwayLink: 'nav.rail a[title=\"Sources\"]',",
+        assignment: "healthAwayLink: 'nav.rail a[title=\"Schema\"]',",
         source_path: "../../fleet-ui/src/rail.rs",
         source: RAIL_RS,
         hook: "title=",

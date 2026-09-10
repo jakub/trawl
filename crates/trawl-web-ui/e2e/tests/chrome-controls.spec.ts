@@ -72,10 +72,10 @@ test('chip remove is named by its filter', async ({ page, request }) => {
   await expect(page).not.toHaveURL(/[?&]f=/);
 });
 
-test('theme control names its result', async ({ page }) => {
-  // A page with no controls of its own, so the walk to the status bar
-  // is short enough to read.
+test('theme control names its result', async ({ page, request }) => {
+  await resetScenario(request, 'health-viewer');
   await page.goto('/settings');
+  await expect(page.locator(SEL.healthPage)).toBeVisible();
 
   const theme = page.locator(SEL.themeControl);
   await expect(theme).toHaveJSProperty('tagName', 'BUTTON');

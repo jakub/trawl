@@ -41,49 +41,6 @@
   background: var(--bg);
 }
 
-/* Placeholder body for non-implemented rail sections / app modes. */
-.placeholder {
-  flex: 1;
-  display: grid;
-  place-items: center;
-  background: var(--bg);
-}
-
-.placeholder-card {
-  background: var(--panel);
-  border: 1px solid var(--line);
-  border-radius: var(--radius-panel);
-  padding: 32px 40px;
-  max-width: 440px;
-  text-align: center;
-  box-shadow: var(--shadow-2);
-}
-
-.placeholder-card h2 {
-  margin: 8px 0 12px;
-  font-size: var(--fs-title);
-  font-weight: 600;
-  letter-spacing: -.4px;
-  color: var(--ink);
-  text-wrap: balance;
-}
-
-.placeholder-card p {
-  margin: 0;
-  color: var(--ink-2);
-  font-size: var(--fs-small);
-  line-height: 1.55;
-  text-wrap: pretty;
-}
-
-.placeholder-eyebrow {
-  font-family: var(--font-mono);
-  font-size: var(--fs-dense);
-  text-transform: uppercase;
-  letter-spacing: .08em;
-  color: var(--accent);
-}
-
 /* ─────────────────────────────────────────────────────────────────
  *  Results table — base styles (augmented by v2 block below)
  * ─────────────────────────────────────────────────────────────── */

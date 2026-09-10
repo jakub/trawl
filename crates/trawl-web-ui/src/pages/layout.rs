@@ -165,10 +165,10 @@ pub fn AuthShell() -> impl IntoView {
                 />
             }.into_any())
             rail_bottom=Box::new(|| view! {
-                <div class="it" title="Help — coming soon">
+                <a class="it" title="Help" href="https://trawl.sh" target="_blank" rel="noopener noreferrer">
                     <IconView icon=Icon::Question size=20 stroke_width=1.4/>
                     <span class="lb">"Help"</span>
-                </div>
+                </a>
             }.into_any())
         >
             <Show when=move || me.get().is_some() fallback=|| ()>

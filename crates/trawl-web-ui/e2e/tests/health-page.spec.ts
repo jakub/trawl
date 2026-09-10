@@ -76,11 +76,11 @@ test('admin shares one stream with the footer across direct navigation, away, Ba
   await expect.poll(async () => (await state(request)).dashboard.open).toBe(1);
   await page.evaluate(() => { (window as any).__healthNavigation = true; });
   await page.locator(SEL.healthAwayLink).click();
-  await expect(page).toHaveURL(/\/settings$/);
+  await expect(page).toHaveURL(/\/search\/schema$/);
   await page.goBack();
   await expect(page.locator(SEL.healthPage)).toBeVisible();
   await page.goForward();
-  await expect(page).toHaveURL(/\/settings$/);
+  await expect(page).toHaveURL(/\/search\/schema$/);
   await page.goBack();
   await expect(page.locator(SEL.healthLiveState)).toHaveText('Live');
   expect(await page.evaluate(() => (window as any).__healthNavigation)).toBe(true);

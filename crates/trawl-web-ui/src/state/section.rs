@@ -37,7 +37,7 @@ pub struct RailItem {
 #[allow(clippy::too_many_lines)]
 #[must_use]
 pub fn items_for(mode: AppMode) -> &'static [RailItem] {
-    use Icon::{Chart, Clock, Database, Grid, Search as SearchIcon, User};
+    use Icon::{Chart, Clock, Database, Grid, Search as SearchIcon};
     match mode {
         AppMode::Search => &[
             RailItem {
@@ -75,34 +75,16 @@ pub fn items_for(mode: AppMode) -> &'static [RailItem] {
         ],
         AppMode::Settings => &[
             RailItem {
-                id: "sources",
-                label: "Sources",
-                icon: Database,
-                path: "/settings",
+                id: "health",
+                label: "Health",
+                icon: Chart,
+                path: "/settings/health",
             },
             RailItem {
                 id: "schema",
                 label: "Schema",
                 icon: Grid,
-                path: "/settings",
-            },
-            RailItem {
-                id: "users",
-                label: "Users & API",
-                icon: User,
-                path: "/settings",
-            },
-            RailItem {
-                id: "retention",
-                label: "Retention",
-                icon: Clock,
-                path: "/settings",
-            },
-            RailItem {
-                id: "health",
-                label: "Health",
-                icon: Chart,
-                path: "/settings/health",
+                path: "/search/schema",
             },
         ],
     }
@@ -164,11 +146,15 @@ mod tests {
                 "{mode:?} default should be its first item's id",
             );
 
-            // ids must be unique per mode so section routing is unambiguous.
-            // (Settings items intentionally share `path: \"/settings\"`, so
-            // path uniqueness is deliberately NOT asserted.)
+            // Each section has one id and one destination within its mode.
             let mut ids = HashSet::new();
+            let mut paths = HashSet::new();
             for item in items {
+                assert!(
+                    paths.insert(item.path),
+                    "{mode:?} has a duplicate rail path: {}",
+                    item.path,
+                );
                 assert!(
                     ids.insert(item.id),
                     "{mode:?} has a duplicate rail item id: {}",

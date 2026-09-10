@@ -338,7 +338,7 @@ fn DemoApp() -> impl IntoView {
                         footer=Box::new(|| view! {
                             <div class="statusbar">"demo footer"</div>
                         }.into_any())
-                        // bottom-pinned rail slot (trawl's "Help — coming soon").
+                        // Bottom rail slot, used by trawl's Help link.
                         rail_bottom=Box::new(|| view! {
                             <div class="it" title="Pinned — demo">
                                 <span class="lb">"Pinned"</span>
