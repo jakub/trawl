@@ -525,7 +525,7 @@ jobs:
 
   web-ui-e2e:
     name: web UI browser tests (playwright)
-    runs-on: k8s-big
+    runs-on: k8s-small
     needs: trunk-build
     timeout-minutes: 10
     # This job executes third-party code (npm packages, a CDN-fetched
@@ -561,7 +561,9 @@ jobs:
         working-directory: crates/trawl-web-ui/e2e
       # retries=0 lives in playwright.config.ts (flake policy: fix or
       # quarantine loudly, never retry past it).
-      - run: npm run test
+      # The full single-worker suite needs headroom on the shared runner.
+      # Per-test timeouts stay unchanged; this bounds the aggregate run.
+      - run: npm run test -- --global-timeout=480000
         working-directory: crates/trawl-web-ui/e2e
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: failure()
