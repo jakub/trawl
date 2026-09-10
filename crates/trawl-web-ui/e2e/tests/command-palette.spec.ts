@@ -130,8 +130,8 @@ for (const route of ['/search/schema', '/settings/health']) {
     await expect(page.locator(SEL.paletteKbd)).toHaveText('Ctrl+K');
     await expect(page.locator(SEL.paletteTrigger)).toHaveAttribute('aria-keyshortcuts', 'Control+K');
     if (route.startsWith('/settings')) {
-      // Health has its own route. The Settings mode owns /settings,
-      // which the remaining Settings rail entries still share.
+      // The Settings mode keeps its entry route. Health and Schema each
+      // contribute their own destination from the Settings rail.
       expect(expected.some((command) => command.path === '/settings/health')).toBe(true);
       expect(expected.filter((command) => command.path === '/settings')).toHaveLength(1);
     }

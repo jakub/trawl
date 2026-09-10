@@ -37,8 +37,8 @@ pub struct RailItem {
 pub fn Rail(
     #[prop(into)] items: Signal<Vec<RailItem>>,
     #[prop(into)] active: Signal<String>,
-    /// Bottom-pinned slot rendered inside `<div class="bot">` (trawl's
-    /// inert "Help — coming soon" stub). Omitted → no `.bot` div.
+    /// Bottom slot rendered inside `<div class="bot">`, used by trawl's Help
+    /// link. Omitting it removes the `.bot` div.
     /// `optional_no_strip` keeps the `Option` wrapper so `Shell` can
     /// forward its own `Option<Children>` straight through.
     #[prop(optional_no_strip)]

@@ -169,6 +169,12 @@ export async function resetScenario(request: import('@playwright/test').APIReque
   await request.post('/__ctl/reset', { data: { scenario: name } });
 }
 
+/** Saved-query request bodies captured since the last scenario reset. */
+export async function capturedSavedRequests(request: Ctl): Promise<Array<{ name: string; query: string }>> {
+  const state = await (await request.get('/__ctl/state')).json();
+  return state.savedRequests;
+}
+
 type Ctl = import('@playwright/test').APIRequestContext;
 
 /** How many `POST /api/v1/query` bodies the stub has captured since the

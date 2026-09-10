@@ -10,7 +10,7 @@
 # exits 0 only if every requested mutation was killed.
 #
 # Usage:
-#   e2e/scripts/mutation-check.sh                 # run all 24 standard mutations (21 uses its own runner)
+#   e2e/scripts/mutation-check.sh                 # run all 25 standard mutations (21 uses its own runner)
 #   e2e/scripts/mutation-check.sh 02-editor-onchange.patch   # just one
 #
 # Refuses to run against a dirty tree — a patch applied on top of your
@@ -67,6 +67,7 @@ declare -A SPEC_FOR=(
   [23-range-close-on-refusal.patch]="range-dialog.spec.ts"
   [24-palette-overlay-gate.patch]="command-palette.spec.ts"
   [25-palette-toggle.patch]="command-palette.spec.ts"
+  [26-save-editor-snapshot.patch]="settings-disposition.spec.ts"
 )
 
 # patch-file -> a CONTROL spec the mutation does NOT touch, which must
@@ -101,6 +102,7 @@ declare -A CONTROL_FOR=(
   [23-range-close-on-refusal.patch]="routing.spec.ts"
   [24-palette-overlay-gate.patch]="routing.spec.ts"
   [25-palette-toggle.patch]="routing.spec.ts"
+  [26-save-editor-snapshot.patch]="routing.spec.ts"
 )
 
 PATCHES=()
@@ -132,6 +134,7 @@ else
     23-range-close-on-refusal.patch
     24-palette-overlay-gate.patch
     25-palette-toggle.patch
+    26-save-editor-snapshot.patch
   )
 fi
 
@@ -139,6 +142,9 @@ declare -A RESULT
 
 cleanup_patch() {
   local patch_path="$1"
+  if [[ "$patch_path" == "$MUTATIONS_DIR/26-save-editor-snapshot.patch" ]]; then
+    rm -f "$E2E_DIR/save-mutation-report.json"
+  fi
   if git apply --check -R "$patch_path" 2>/dev/null; then
     git apply -R "$patch_path"
   fi
@@ -177,7 +183,8 @@ for name in "${PATCHES[@]}"; do
     continue
   }
 
-  # Select the spec by FILE, not --grep: a renamed spec would make a grep
+  # Resolve the spec file before any mutation-specific test filtering.
+  # A renamed spec would make a grep
   # match nothing, and playwright's "no tests found" nonzero exit would
   # read as a successful kill. Prove the file resolves to at least one
   # test first (a spec file may legitimately hold several — the mutation
@@ -221,6 +228,16 @@ JS
     health_assertion=$?
     rm -f "$health_report"
     if [[ $health_assertion -ne 0 ]]; then status=0; fi
+  elif [[ $name == 26-save-editor-snapshot.patch ]]; then
+    # The shared callback must break both controls at the snapshot assertion.
+    # Keep the JSON outside test-results, which Playwright cleans on each run.
+    save_report="$E2E_DIR/save-mutation-report.json"
+    (cd "$E2E_DIR" && npx playwright test "tests/$spec" --grep 'Save captures editor buffer:' --reporter=json) > "$save_report"
+    status=$?
+    node "$SCRIPT_DIR/check-save-mutation.mjs" "$save_report"
+    save_assertion=$?
+    rm -f "$save_report"
+    if [[ $save_assertion -ne 0 ]]; then status=0; fi
   else
     (cd "$E2E_DIR" && npx playwright test "tests/$spec")
     status=$?

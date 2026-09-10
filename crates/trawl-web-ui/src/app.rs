@@ -6,14 +6,14 @@
 
 use leptos::prelude::*;
 use leptos_router::components::{ParentRoute, Route, Router, Routes};
-use leptos_router::path;
+use leptos_router::hooks::{use_location, use_navigate};
+use leptos_router::{NavigateOptions, path};
 
 use crate::pages::health::HealthPage;
 use crate::pages::history::HistoryPage;
 use crate::pages::layout::{AuthShell, NotFound, RedirectTo};
 use crate::pages::login::Login;
 use crate::pages::nets::NetsPage;
-use crate::pages::placeholder::SettingsPlaceholder;
 use crate::pages::runs::RunsPage;
 use crate::pages::schema::SchemaPage;
 use crate::pages::search::Search;
@@ -40,9 +40,35 @@ pub fn App() -> impl IntoView {
                     <Route path=path!("/jobs/nets") view=NetsPage/>
                     <Route path=path!("/jobs/runs") view=RunsPage/>
                     <Route path=path!("/settings/health") view=HealthPage/>
-                    <Route path=path!("/settings") view=SettingsPlaceholder/>
+                    <Route path=path!("/settings") view=SettingsRedirect/>
                 </ParentRoute>
             </Routes>
         </Router>
     }
+}
+
+/// Replace the Settings entry with Health without remounting the shell.
+#[component]
+fn SettingsRedirect() -> impl IntoView {
+    let navigate = use_navigate();
+    let location = use_location();
+    // Anchor navigation commits its history entry after the route mounts.
+    // Replacing it during mount would replace the preceding page instead.
+    let frame = request_animation_frame_with_handle(move || {
+        if location.pathname.get_untracked().trim_end_matches('/') != "/settings" {
+            return;
+        }
+        navigate(
+            "/settings/health",
+            NavigateOptions {
+                replace: true,
+                ..Default::default()
+            },
+        );
+    });
+    on_cleanup(move || {
+        if let Ok(frame) = frame {
+            frame.cancel();
+        }
+    });
 }

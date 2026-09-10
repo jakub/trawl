@@ -26,8 +26,10 @@ export const SEL = {
   paletteCurrent: '.command-palette-current',
   paletteEmpty: '.command-palette-empty',
   paletteModeLink: '.topbar .modes a',
-  paletteRailLink: 'nav.rail a[title]',
+  paletteRailLink: 'nav.rail > a[title]',
   paletteKbd: '.topbar button.jump .kbd',
+  // The external Help link occupies the bottom slot, outside route commands.
+  helpLink: 'nav.rail .bot a[title="Help"]',
 
   historyAwayLink: 'nav.rail a[title="Schema"]',
   historyPage: '.history-page',
@@ -36,8 +38,8 @@ export const SEL = {
 
   /// crates/fleet-ui/src/modal/confirm.rs ConfirmModal.
   healthConfirm: '[role="alertdialog"]',
-  /// crates/fleet-ui/src/rail.rs title, crates/trawl-web-ui/src/state/section.rs Sources label.
-  healthAwayLink: 'nav.rail a[title="Sources"]',
+  /// crates/fleet-ui/src/rail.rs title, crates/trawl-web-ui/src/state/section.rs Schema label.
+  healthAwayLink: 'nav.rail a[title="Schema"]',
   /// crates/trawl-web-ui/src/components/status_bar.rs hot buffer group.
   healthFooterHot: '.statusbar .grp[title="Hot buffer (events / bytes)"]',
   /// crates/trawl-web-ui/src/pages/health.rs HealthPage and HealthQueries.
@@ -127,6 +129,8 @@ export const SEL = {
   exportAction: '.tabs .action.export',
   /// crates/trawl-web-ui/src/pages/search.rs — its Save twin.
   saveAction: '.tabs .action.save',
+  /// crates/trawl-web-ui/src/components/save_as_net_modal.rs immutable query preview.
+  savePreview: '.modal .preview',
   /// crates/fleet-ui/src/range_dialog.rs RangePanel —
   /// one quick-range preset in the Relative tab's grid.
   quickRangeOption: '.dr-pop .opt',
