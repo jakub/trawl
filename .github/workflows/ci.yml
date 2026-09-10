@@ -565,6 +565,9 @@ jobs:
       # Per-test timeouts stay unchanged; this bounds the aggregate run.
       - run: npm run test -- --global-timeout=480000
         working-directory: crates/trawl-web-ui/e2e
+        env:
+          # Preserve browser process exits and stderr alongside test results.
+          DEBUG: pw:browser
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: failure()
         with:
