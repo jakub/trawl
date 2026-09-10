@@ -38,12 +38,19 @@ stale build) if `dist/index.html` is missing.
 CI (the `web-ui-e2e` job in `.github/workflows/ci.yml`) does not rebuild
 the SPA: it downloads the `trawl-web-ui-dist` artifact from the
 `trunk-build` job, then runs `npm ci`, `npx playwright install
---with-deps chromium`, and `npm run test` as discrete steps — so the
-browser job compiles no Rust. `cargo xtask e2e` is the local entry point
+--with-deps chromium`, and `npm run test -- --global-timeout=480000` as
+discrete steps, so the browser job compiles no Rust. `cargo xtask e2e` is the local entry point
 only (and installs chromium without `--with-deps`; on a dev machine the
 shared libraries are your own problem). `playwright.config.ts` switches
 its reporter to `['github', 'list']` under `CI=true` so failures annotate
 the PR diff.
+
+The full CI suite gets eight minutes on the shared `k8s-small` runner,
+inside a 15-minute job budget that also covers setup and artifact upload.
+The local default remains four minutes. To reproduce CI's aggregate
+budget locally, run `npm run test -- --global-timeout=480000` from this
+directory. This override leaves per-test timeouts, assertions and
+`retries: 0` unchanged.
 
 ## What it (and doesn't) cover
 
