@@ -8,10 +8,10 @@ pre-commit:
   commands:
     fmt-check:
       glob: "*.rs"
-      run: . "$HOME/.cargo/env" 2>/dev/null; cargo fmt --check
+      run: if [ -f "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env"; fi; cargo fmt --check
     clippy:
       glob: "*.rs"
-      run: . "$HOME/.cargo/env" 2>/dev/null; cargo clippy --workspace --all-targets -- -D warnings
+      run: if [ -f "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env"; fi; cargo clippy --workspace --all-targets -- -D warnings
     wasm-clippy:
       # The host clippy job never sees the cfg(target_arch = "wasm32")
       # component tree; this does. Glob-gated so a backend-only commit
@@ -25,7 +25,7 @@ pre-commit:
         - "crates/trawl-web-ui/**/*"
         - "crates/fleet-ui/*"
         - "crates/fleet-ui/**/*"
-      run: . "$HOME/.cargo/env" 2>/dev/null; cargo clippy -p trawl-web-ui --target wasm32-unknown-unknown -- -D warnings && cargo clippy -p fleet-ui --target wasm32-unknown-unknown -- -D warnings && cargo clippy -p fleet-ui --target wasm32-unknown-unknown --features atmosphere -- -D warnings
+      run: if [ -f "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env"; fi; cargo clippy -p trawl-web-ui --target wasm32-unknown-unknown -- -D warnings && cargo clippy -p fleet-ui --target wasm32-unknown-unknown -- -D warnings && cargo clippy -p fleet-ui --target wasm32-unknown-unknown --features atmosphere -- -D warnings
 
 pre-push:
   # Parallel is safe because each suite gets its own postgres CLUSTER
@@ -50,7 +50,7 @@ pre-push:
         - "crates/*/migrations/*.sql"
       # Half the cores each: two parallel suites at full test-thread counts
       # oversubscribe the machine 2x and flake every wall-clock-sensitive test.
-      run: . "$HOME/.cargo/env" 2>/dev/null; DATABASE_URL="${TRAWL_TEST_DATABASE_URL:-postgres://fleet:fleet@localhost:5433/fleet_test}" cargo nextest run --workspace --test-threads="$(( $(nproc 2>/dev/null || sysctl -n hw.ncpu) / 2 ))"
+      run: if [ -f "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env"; fi; DATABASE_URL="${TRAWL_TEST_DATABASE_URL:-postgres://fleet:fleet@localhost:5433/fleet_test}" cargo nextest run --workspace --test-threads="$(( $(nproc 2>/dev/null || sysctl -n hw.ncpu) / 2 ))"
     test-no-defaults:
       glob:
         - "*.rs"
@@ -64,4 +64,4 @@ pre-push:
       # the store/engine tests), and double-booting full trawld instances
       # across two parallel suites starves the wall-clock-sensitive
       # integration tests into flaking.
-      run: . "$HOME/.cargo/env" 2>/dev/null; DATABASE_URL="${TRAWL_TEST_ND_DATABASE_URL:-postgres://fleet:fleet@localhost:5434/fleet_test_nd}" cargo nextest run -p fleet-auth -p trawl-web -p trawl-engine -p trawl-server -p trawl-cli --no-default-features --test-threads="$(( $(nproc 2>/dev/null || sysctl -n hw.ncpu) / 2 ))" -E 'not (binary(http_api) | binary(hot_query) | binary(timestamp_repair))'
+      run: if [ -f "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env"; fi; DATABASE_URL="${TRAWL_TEST_ND_DATABASE_URL:-postgres://fleet:fleet@localhost:5434/fleet_test_nd}" cargo nextest run -p fleet-auth -p trawl-web -p trawl-engine -p trawl-server -p trawl-cli --no-default-features --test-threads="$(( $(nproc 2>/dev/null || sysctl -n hw.ncpu) / 2 ))" -E 'not (binary(http_api) | binary(hot_query) | binary(timestamp_repair))'
