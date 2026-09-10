@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Source guard for the removed Settings placeholder, ADR-0025.
+//! Source guard for removed Settings and Save placeholders, ADR-0025.
 
 use std::path::Path;
 
@@ -13,7 +13,12 @@ fn check_source(dir: &Path) {
             check_source(&path);
         } else {
             let text = std::fs::read_to_string(&path).expect("read UI source file");
-            for forbidden in ["coming soon", "SettingsPlaceholder", "mod placeholder;"] {
+            for forbidden in [
+                "coming soon",
+                "landing soon",
+                "SettingsPlaceholder",
+                "mod placeholder;",
+            ] {
                 assert!(
                     !text.contains(forbidden),
                     "{} still contains {forbidden:?}",

@@ -83,6 +83,9 @@ const MIME = {
 /** @type {'default'|'unauth'|'query-500'|'stream-burst'|'populated'|'corpus'} */
 let scenario = 'default';
 
+function savedScenario() { return scenario === 'saved-success' || scenario === 'saved-retry'; }
+let savedRequests = [];
+
 // History scenarios own their held responses and request counters.
 const history = { offsets: [], deletes: 0, cleared: false, pending: null, loadPending: [] };
 function historyScenario() { return scenario.startsWith('history-'); }
@@ -239,6 +242,7 @@ function resetState() {
   Object.assign(history, { offsets: [], deletes: 0, cleared: false, pending: null });
   unstubbed = [];
   queries = [];
+  savedRequests = [];
   exports_ = [];
   unhandledQueries = [];
   // sse.open/opens/closes deliberately survive a reset — a spec resets
@@ -435,6 +439,7 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
         queries,
         unhandledQueries,
         exports: exports_,
+        savedRequests,
       });
       return;
     }
@@ -552,7 +557,9 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
         sendJson(res, 401, errorEnvelope('unauthorized'));
         return;
       }
-      sendJson(res, 200, healthScenario() ? healthIdentity() : meResponse());
+      const identity = healthScenario() ? healthIdentity() : meResponse();
+      if (savedScenario()) identity.permissions = ['query', 'saved_query'];
+      sendJson(res, 200, identity);
       return;
     }
     if (p === '/api/auth/logout' && req.method === 'POST') {
@@ -772,6 +779,16 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
             ? populatedServiceSchemaResponse()
             : serviceSchemaResponse(),
       );
+      return;
+    }
+    if (p === '/api/v1/saved' && req.method === 'POST' && savedScenario()) {
+      const body = JSON.parse(await readBody(req));
+      savedRequests.push(body);
+      if (scenario === 'saved-retry' && savedRequests.length === 1) {
+        sendJson(res, 503, errorEnvelope('Saved query fixture failure'));
+      } else {
+        sendJson(res, 200, { ...wire('saved-created'), name: body.name, query: body.query });
+      }
       return;
     }
     if (p === '/api/v1/saved' && req.method === 'GET') {

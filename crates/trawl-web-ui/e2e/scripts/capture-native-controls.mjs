@@ -158,6 +158,7 @@ async function capture(browser, theme) {
     reducedMotion: 'reduce',
     locale: 'en-US',
     timezoneId: 'UTC',
+    permissions: ['clipboard-read', 'clipboard-write'],
   });
   const page = await context.newPage();
   const files = [];
@@ -207,7 +208,7 @@ async function capture(browser, theme) {
 
   // 4. A toast and its dismiss button, focused (keyboard again, same
   //    reason).
-  await page.locator('.tabs .action.save').focus();
+  await page.locator('.editor-tools button.tool').filter({ hasText: /^Share$/ }).focus();
   await page.keyboard.press('Enter');
   await page.locator('.toast').first().waitFor({ state: 'visible' });
   await settle(page, ['.toast', '.toast *']);

@@ -119,10 +119,8 @@ pub fn EditorWrap(
                         }}
                     </button>
                     <div class="editor-tools">
-                        // A real button, not a span, because a link that
-                        // cannot be read has to be able to disable it:
-                        // saving posts the same blanked query an export
-                        // would (ADR-0027).
+                        // Malformed URL state disables Save even though it
+                        // captures the editor buffer, ADR-0027.
                         <button
                             type="button"
                             class="tool"
@@ -134,9 +132,8 @@ pub fn EditorWrap(
                             text=share_text
                             success_detail="Search URL copied to clipboard."
                         >"Share"</CopyButton>
-                        // Same reason as Save above, plus the plain one:
-                        // Format acts on click, so it is a button and the
-                        // keyboard reaches it (ADR-0028).
+                        // Format acts on click, so a native button makes
+                        // it keyboard accessible, ADR-0028.
                         <button
                             type="button"
                             class="tool"

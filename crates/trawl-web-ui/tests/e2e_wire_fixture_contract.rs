@@ -20,7 +20,8 @@
 //! When this test fails, fix the FIXTURE. The wire type is the authority.
 
 use trawl_api::{
-    CatalogFieldResponse, ListSavedResponse, RepinStatusResponse, ServiceSchemaResponse,
+    CatalogFieldResponse, ListSavedResponse, RepinStatusResponse, SavedQueryResponse,
+    ServiceSchemaResponse,
 };
 
 const CATALOG_FIELD: &str = include_str!("../e2e/harness/wire/catalog-field.json");
@@ -680,4 +681,18 @@ fn pagination_run_fixtures_have_three_matching_rows() {
         assert_eq!(global.net_name, net.name);
         assert_eq!(global.run.id, drawer.id);
     }
+}
+
+#[test]
+fn created_saved_query_fixture_preserves_the_editor_text() {
+    let saved: SavedQueryResponse = decode(
+        "saved-created.json",
+        include_str!("../e2e/harness/wire/saved-created.json"),
+    );
+    assert_eq!(saved.id, 164);
+    assert_eq!(saved.name, "editor snapshot");
+    assert_eq!(saved.query, "  service=apache  | stats count()\n");
+    assert_eq!(saved.created_at, "2026-09-09T12:00:00Z");
+    assert_eq!(saved.updated_at, saved.created_at);
+    assert!(saved.schedule.is_none());
 }

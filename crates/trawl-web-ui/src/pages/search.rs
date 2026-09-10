@@ -453,12 +453,13 @@ pub fn Search() -> impl IntoView {
             .map_or_else(Vec::new, |r| r.degraded_fields.clone())
     });
 
-    let show_save_modal = RwSignal::new(false);
+    // Capture the editor once per opening. URL state cannot retarget this save.
+    let save_query = RwSignal::new(None::<String>);
     let on_save = Callback::new(move |()| {
         if unreadable.get_untracked() {
             return;
         }
-        show_save_modal.set(true);
+        save_query.set(Some(query_text.get_untracked()));
     });
     let show_export_modal = RwSignal::new(false);
     let on_export = Callback::new(move |()| {
@@ -467,14 +468,12 @@ pub fn Search() -> impl IntoView {
         }
         show_export_modal.set(true);
     });
-    // A modal opened while the link read fine survives a Back INTO one
-    // that does not: the URL changes under an open dialog whose query
-    // preview is now the blanked sentinel. Close both the moment the
-    // link stops being readable, so the banner is what the reader is
-    // left looking at (ADR-0027).
+    // A modal opened on a readable link must close if Back reaches a
+    // malformed one. Discard the pending Save snapshot with it, so the
+    // refusal banner is the only remaining action context, ADR-0027.
     Effect::new(move |_| {
         if unreadable.get() {
-            show_save_modal.set(false);
+            save_query.set(None);
             show_export_modal.set(false);
         }
     });
@@ -537,11 +536,7 @@ pub fn Search() -> impl IntoView {
                             type="button"
                             class="action save"
                             disabled=move || unreadable.get()
-                            on:click=move |_| bus.push(
-                                ToastKind::Info,
-                                "Save",
-                                Some("Net saving is landing soon — use the history page for now.".into()),
-                            )
+                            on:click=move |_| on_save.run(())
                         >"Save"</button>
                         <button
                             type="button"
@@ -586,12 +581,12 @@ pub fn Search() -> impl IntoView {
                 }}}
             </div>
         </div>
-        <Show when=move || show_save_modal.get()>
+        {move || save_query.get().map(|query| view! {
             <SaveAsNetModal
-                query=effective_q.get_untracked()
-                on_close=Callback::new(move |_| show_save_modal.set(false))
+                query=query
+                on_close=Callback::new(move |_| save_query.set(None))
             />
-        </Show>
+        })}
         <Show when=move || show_export_modal.get()>
             <ExportModal
                 query=effective_q.get_untracked()

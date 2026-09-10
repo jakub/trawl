@@ -129,6 +129,8 @@ export const SEL = {
   exportAction: '.tabs .action.export',
   /// crates/trawl-web-ui/src/pages/search.rs — its Save twin.
   saveAction: '.tabs .action.save',
+  /// crates/trawl-web-ui/src/components/save_as_net_modal.rs immutable query preview.
+  savePreview: '.modal .preview',
   /// crates/fleet-ui/src/range_dialog.rs RangePanel —
   /// one quick-range preset in the Relative tab's grid.
   quickRangeOption: '.dr-pop .opt',

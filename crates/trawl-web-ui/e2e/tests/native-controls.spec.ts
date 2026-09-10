@@ -60,14 +60,16 @@ test('modal close is a named button that closes on Enter', async ({ page }) => {
   await expect(page.locator(SEL.modalPanel)).toHaveCount(0);
 });
 
-test('toast dismiss is a named button that removes one toast', async ({ page }) => {
+test('toast dismiss is a named button that removes one toast', async ({ page, context }) => {
+  await context.grantPermissions(['clipboard-read', 'clipboard-write']);
   await page.goto('/search');
 
-  // Two toasts, so "removes one" is distinguishable from "clears the
-  // host". The results strip's Save raises an informational toast and
-  // nothing else, which makes it the cheapest producer on the page.
-  await page.locator(SEL.saveAction).click();
-  await page.locator(SEL.saveAction).click();
+  // Two successful copies produce two toasts. Dismissing one must leave
+  // the other in place.
+  const share = page.locator(SEL.editorTool).filter({ hasText: /^Share$/ });
+  await share.click();
+  await expect(page.locator(SEL.toastAny)).toHaveCount(1);
+  await share.click();
   await expect(page.locator(SEL.toastAny)).toHaveCount(2);
 
   const dismiss = page.locator(SEL.toastDismiss).first();

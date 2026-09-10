@@ -78,6 +78,18 @@ const HEALTH_RS: &str = include_str!("../src/pages/health.rs");
 
 const CONTRACTS: &[Contract] = &[
     Contract {
+        assignment: "savePreview: '.modal .preview',",
+        source_path: "src/components/save_as_net_modal.rs",
+        source: include_str!("../src/components/save_as_net_modal.rs"),
+        hook: "class=\"preview\"",
+    },
+    Contract {
+        assignment: "savePreview: '.modal .preview',",
+        source_path: "../fleet-ui/src/modal/shell.rs",
+        source: MODAL_SHELL_RS,
+        hook: "\"modal\"",
+    },
+    Contract {
         assignment: "helpLink: 'nav.rail .bot a[title=\"Help\"]',",
         source_path: "../fleet-ui/src/rail.rs",
         source: RAIL_RS,
