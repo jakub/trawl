@@ -38,6 +38,13 @@ Per affordance:
   table: the rail shrink cannot ship a Health entry that reaches a
   placeholder, so the Health page (G3) lands first and points today's
   entry at the real page; the rail shrink (G1) follows.*
+  The Settings mode keeps `/settings` as its destination. That exact
+  route resolves to `/settings/health` through same-document router
+  navigation that replaces the intermediate history entry. Entering
+  Settings from Search adds one final Health entry, so Back returns to
+  Search without a redirect loop or a shell reload. Health comes first
+  in the Settings rail, followed by Schema. Removed section paths render
+  the existing NotFound page; they have no equivalent destination.
 - **Topbar: the bell leaves; ⌘K becomes a real palette in fleet-ui.** The
   palette's first command set is routes only: the consumer's mode tabs and
   rail items, the data `Shell` already receives. Both `Meta+K` and
@@ -53,10 +60,21 @@ Per affordance:
   toggle the theme for others, which is the broken promise this ADR bans.
   The hint chip leaves with the two rows; the theme item stays a plain
   menu command; no replacement chord is chosen here.
-- **Help links to the docs site.** An in-app help surface is not planned.
+- **Help links to the docs site.** The native link opens `https://trawl.sh`
+  in a new tab with `rel="noopener noreferrer"`. It stays in the rail's
+  bottom slot, outside the command palette's internal route inventory.
+  An in-app help page is not planned.
 - **Results-toolbar Save reuses the editor's save modal.** One save flow,
   and the modal's input is the editor buffer (the audit's "Save after
   editing" finding), never the last executed query.
+  Both Save controls capture that buffer when activated. The modal's
+  preview and submission use the same captured text; URL filters and
+  range are excluded. A readable URL change does not retarget an open
+  modal. Closing discards the capture, and reopening captures the new
+  buffer. A malformed link prevents opening Save and closes an already
+  open modal under ADR-0027. This does not cancel a request already
+  submitted or change the server's saved-query permissions and DSL
+  admission rules.
 - **History Export is client-side.** It serialises the loaded rows under the
   current filter as CSV or JSON through the existing download helper. It is
   not a second server export lane.

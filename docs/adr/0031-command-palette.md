@@ -59,11 +59,13 @@ the macOS carve-out, rendering the platform-primary chord only.
 
 - Empty command inventory ⇒ no trigger and no chord handling (a control
   with nothing behind it is the ADR-0025 ban).
-- Until G1 lands, the palette mirrors today's rail VERBATIM — including
-  the five Settings entries sharing `/settings`, deduped to one — and is
-  exactly as broken as the chrome, no more; child-issue evidence states
-  the resulting Settings command set and claims no working Health/Schema
-  destinations. G1 fixes both surfaces at once.
+- The palette mirrors the mode tabs and active rail items. Health has
+  its own `/settings/health` destination after G3. G1 removes the remaining
+  placeholder entries and points Schema at `/search/schema`. Its final
+  Settings-mode commands are Search, Jobs, Settings, Health and Schema.
+  Settings keeps `/settings`, so exact-path deduplication preserves the
+  separately named Health command. Help stays outside this inventory in
+  the rail's bottom slot.
 - `component_class_contract.rs`'s stub assertion passes vacuously after
   this change (the title string survives in the trigger); the replacement
   pins are written deliberately: `<button`, `aria-haspopup="dialog"`,
