@@ -150,7 +150,7 @@ pub fn Chart(
         <div class="visualization">
             {move || hint.get().map(|hint| view! { <p class="results-empty" role="status">{hint}</p> })}
             {move || failure.get().and(on_retry).map(|retry| view! {
-                <button type="button" on:click=move |_| retry.run(())>"Retry live stream"</button>
+                <button type="button" class="btn-sec" on:click=move |_| retry.run(())>"Retry live stream"</button>
             })}
             <div class="chart" node_ref=node_ref></div>
             {move || hint.get().is_none().then(|| view! {

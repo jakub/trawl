@@ -572,7 +572,7 @@ pub fn Search() -> impl IntoView {
                     view! {
                         <div class="results-empty">
                             <p role="alert">{move || stream_failure.get()}</p>
-                            <button type="button" on:click=move |_| retry_stream.run(())>"Retry live stream"</button>
+                            <button type="button" class="btn-sec" on:click=move |_| retry_stream.run(())>"Retry live stream"</button>
                         </div>
                     }.into_any()
                 } else { match (active_tab.get(), mode.get()) {
@@ -601,7 +601,7 @@ pub fn Search() -> impl IntoView {
                         } else {
                             match rows.get() {
                                 Some(Ok(resp)) => view! { <Chart snapshot=Signal::derive(move || Some(resp.result.clone())) query=effective_q/> }.into_any(),
-                                Some(Err(_)) => view! { <div class="results-empty"><p role="alert">"Snapshot query failed. Open Events for the query error."</p><button type="button" on:click=move |_| rows.refetch()>"Retry snapshot"</button></div> }.into_any(),
+                                Some(Err(_)) => view! { <div class="results-empty"><p role="alert">"Snapshot query failed. Open Events for the query error."</p><button type="button" class="btn-sec" on:click=move |_| rows.refetch()>"Retry snapshot"</button></div> }.into_any(),
                                 None => view! { <p class="results-empty">"Run a query to visualize its snapshot."</p> }.into_any(),
                             }
                         }
