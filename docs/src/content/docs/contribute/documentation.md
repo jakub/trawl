@@ -1,15 +1,12 @@
 ---
 title: Maintain the documentation
-description: Build the Astro site, verify examples and links, and keep facts with their owners.
+description: Build the documentation site, check it, and keep each fact in one place.
 ---
 
-The site uses Astro and Starlight. Its content lives under
-`docs/src/content/docs/`; `docs/astro.config.mjs` defines navigation.
+The site uses Astro and Starlight. Content lives under `docs/src/content/docs/`,
+and `docs/astro.config.mjs` defines the navigation.
 
-## Run it locally
-
-Use the Node version required by `docs/package.json` and its locked dependencies.
-The current CI uses Node 22.12 or later within the supported Node 22 line.
+## Run the site locally
 
 ```bash
 cd docs
@@ -17,62 +14,59 @@ npm ci
 npm run dev
 ```
 
-Astro prints the loopback URL. For a review with built search and the same static
-HTML that will ship, build and use the local preview server:
+Astro prints the loopback URL. Open it and confirm your page renders.
+
+To review the built static HTML with working search, build with the preview flag
+and serve the result:
 
 ```bash
 TRAWL_DOCS_PREVIEW=1 npm run build
-TRAWL_DOCS_ALLOWED_HOSTS=your-host.example.ts.net npm run preview -- --host 0.0.0.0 --port 4321
+TRAWL_DOCS_ALLOWED_HOSTS=docs.example.com npm run preview -- --host 0.0.0.0 --port 4321
 ```
 
-The preview flag adds a visible notice and `noindex` metadata. Hostnames are an
-explicit comma-separated allowlist; localhost and IP addresses follow Astro's
-normal handling. Binding to `0.0.0.0` makes the preview available on the machine's
-IPv4 network interfaces. Stop the process with Ctrl+C when the review ends.
-Local preview does not publish the site or change a Trawl deployment.
+`TRAWL_DOCS_PREVIEW=1` adds a visible banner and `noindex, nofollow` metadata.
+`TRAWL_DOCS_ALLOWED_HOSTS` is a comma-separated allowlist of hostnames. Binding
+to `0.0.0.0` publishes the preview on every IPv4 interface of the machine. Stop
+the process with Ctrl+C when the review ends. A local preview does not publish
+the site and does not touch any Trawl deployment.
 
 ## Check a change
 
 ```bash
+cd docs
 npm run check
 ```
 
-This builds the site, then checks rendered local links and fragment targets,
-TOML code-block syntax, and documented DSL stages against the source inventory.
-It also confirms that each document has a title and description. These checks
-catch broken navigation and mechanical drift; they do not prove a deployment
-procedure or the meaning of a query.
+The check builds the site, then runs `docs/scripts/check-docs.py`. That script
+verifies local links and fragment targets in the rendered HTML, parses every
+TOML code block, confirms each page has a `title` and a `description`, and
+requires a `### ` heading in `reference/dsl.md` for every `PipeStage` name in
+`crates/trawl-core/src/ast.rs`. It prints the counts it checked.
 
-Run copyable install and recovery commands in disposable infrastructure. Check
-expected records, not only successful exit status. For a configuration fragment,
-state where it belongs. For a complete example, exercise the application loader.
-Test Helm examples with all documented values. Use the existing full-app runner
-for browser scenarios and record which source revision and scenario you checked.
+These checks catch broken navigation and mechanical drift. They do not prove a
+procedure works. Run copyable install and recovery commands in disposable
+infrastructure, and check the resulting records rather than the exit status. For
+a configuration fragment, say where it belongs. For a complete example, load it
+with the application. Test Helm examples with every documented value. Use the
+[full-app experiment](/contribute/experiments/) for browser scenarios, and note
+which revision and scenario you checked.
+
+The Docs workflow builds and checks every pull request that touches `docs/` or
+`crates/trawl-core/src/ast.rs`. It deploys from `main` only.
 
 ## Put each fact in one place
 
 | Material | Owner |
 | --- | --- |
-| A task with commands and expected outcomes | Start, Use Trawl, or Operate Trawl |
-| Syntax, fields, defaults, permissions, and error contracts | Reference |
-| Current mechanisms and boundaries | Architecture |
-| Agent-specific procedure | Project skills under `.agents/skills/` |
+| A task with commands and expected results | Start, Use Trawl, or Operate Trawl |
+| Syntax, fields, defaults, permissions, error contracts | Reference |
+| Mechanisms and boundaries | Architecture |
+| An agent-specific procedure | Project skills under `.agents/skills/` |
 
-A guide should state the reader's starting conditions, the operation, its expected
-result, and how to diagnose failure. Link to detailed contracts instead of copying
-them into each tutorial. Keep known limitations beside the procedure they affect.
-Do not present a page's last commit date as proof that all its commands are current.
+A guide states the reader's starting conditions, the steps, the expected result,
+and how to diagnose a failure. Link to the contract instead of copying it into
+each tutorial. Keep a known limitation beside the procedure it affects.
 
-## Keep guides current
-
-Describe the current installation and behavior. Remove superseded procedures,
-implementation timelines, and completed project plans. Keep query history,
-recovery state, and other runtime records when they explain how Trawl works.
-
-Give each page a clear task or topic. When moving content, update navigation and
-links to its new location. Remove empty headings and pages that only point to
-another guide. Run the rendered-link check after changing routes or headings.
-
-The Docs workflow builds and checks pull requests. Deployment runs only from main
-and keeps the existing package repository and symbols directories intact. A local
-review does not need a push, tag, package release, or site publication.
+Give each page one task or one topic. When you move content, update the
+navigation and every link to it. Remove empty headings and pages that only point
+somewhere else. Run `npm run check` after you change a route or a heading.
