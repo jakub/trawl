@@ -6,6 +6,9 @@
 #   3. set env vars in /etc/default/vector or vector.service override:
 #      TRAWL_URL=https://trawl.internal:5514
 #      TRAWL_INGEST_TOKEN=<token>
+#      VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION=true
+#      (Vector 0.57 and later do not expand ${VAR} in config files unless
+#      this is set or vector runs with --dangerously-allow-env-var-interpolation)
 #   4. against the selected Fleet database, create trawl-ingest with trawl:ingest,
 #      then: fleet-admin keys create --name vector --kind service --role trawl-ingest
 #      fleet-admin reads DATABASE_URL; prefer a separate key per collector fleet

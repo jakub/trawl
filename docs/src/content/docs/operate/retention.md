@@ -1,91 +1,109 @@
 ---
-title: Manage retention and disk pressure
-description: Set age limits and diagnose suppressed retention without deleting recovery state.
+title: Manage retention
+description: Set age limits per environment, respond to disk pressure, and clear suppressed retention.
 ---
 
-Age retention and disk-pressure deletion are separate policies. An age limit
-is not a guaranteed minimum: disk pressure can delete younger data, including
-an environment whose age limit is zero. Select the data filesystem and the
-server configuration before changing either setting.
+trawld deletes date directories by age, per environment, and separately under
+disk pressure. Disk pressure ignores age limits and can delete data from any
+environment, including one set to keep forever. Today's directory is never
+deleted. The [`[retention]` reference](/reference/configuration/#retention)
+states the rules and defaults.
 
 ## Set age limits
 
-```toml
-[retention]
-max_age_days = 90
-min_free_disk_bytes = "1G"
-retention_interval_secs = 3600
+1. Edit `[retention]` in `/etc/trawl/trawld.toml`. Keep the three scalars
+   before the per-environment tables. In TOML, a scalar written after
+   `[retention.env.prod]` belongs to that table:
 
-[retention.env.prod]
-max_age_days = 365
+   ```toml
+   [retention]
+   max_age_days = 90
+   min_free_disk_bytes = "1G"
+   retention_interval_secs = 3600
 
-[retention.env.lab]
-max_age_days = 7
-```
+   [retention.env.prod]
+   max_age_days = 365
 
-Put global scalars before the per-env tables. Check the env names against the
-actual archive and sender configuration, then restart trawld in the planned
-maintenance window to load the change. Watch for `retention_env_without_dir`,
-which can identify a misspelled override. Removing an env from `ingest.envs`
-blocks new writes but does not remove its old files or retention policy.
-See [configuration values and validation](/reference/configuration/#retention).
+   [retention.env.lab]
+   max_age_days = 7
+   ```
 
-## How disk pressure ranks envs
+   `max_age_days = 0` keeps that environment's data until disk pressure. An
+   environment without a table uses the global value. On Helm, set
+   `config.retention.maxAgeDays`, `config.retention.minFreeDiskBytes`,
+   `config.retention.retentionIntervalSecs`, and `config.retention.envs`, a
+   map of environment name to days.
 
-Under pressure, trawl ranks date directories by expiry ratio. A date directory's
-ratio is its age divided by its env's effective `max_age_days`. The highest
-ratio goes first; equal ratios break on the older date, then on the path.
-With `prod` at 365 days and `lab` at 7, a 300-day prod directory sits at 0.82
-and a 6-day lab directory at 0.86, so the sweep takes the lab directory and the
-prod directory remains.
+2. Restart trawld:
 
-An env at `max_age_days = 0` ranks after everything that expires, but it is
-still a candidate. An age limit is a maximum, not a guaranteed minimum. Under sustained pressure trawl deletes
-data younger than any limit you configured, keep-forever envs included. If
-that matters, give the archive more room rather than a longer age.
+   ```bash
+   sudo systemctl restart trawld
+   ```
 
-## The `/schema` horizon
+   An unknown key in `[retention]` or in a per-environment table stops the
+   start.
 
-`GET /api/v1/schema` hides a field whose most recent observation predates the
-retention horizon, and `trawl schema gc-pins` uses the same number as its
-floor. The horizon is the longest effective age across the install: the global
-`max_age_days` against every override, whichever is largest. A `0` anywhere in
-that set means no window at all, and `?all=true` lifts whatever window applies. This keeps the observation
-window at least as long as the longest configured retention. Pin reclamation
-also requires proof that no standing Parquet file declares the column.
+3. Read the retention lines in the journal:
 
-## Diagnose suppression
+   ```bash
+   journalctl -u trawld -g retention
+   ```
+
+   `retention_start` echoes the loaded values. `retention_env_without_dir`
+   names an entry whose environment has no directory under the data path,
+   usually a misspelled name.
+
+Removing an environment from `[ingest] envs` stops new events for it but
+leaves its directories on disk. Keep its retention entry until they are gone.
+
+## Free disk space
+
+Every `retention_interval_secs` seconds, trawld compares free space on the
+data filesystem with `min_free_disk_bytes`. Below it, trawld deletes the date
+directory closest to its environment's age limit, measures again, and repeats
+until free space is above the threshold. To keep young data, add space rather
+than a longer age limit.
+
+If free space stays below the threshold:
+
+1. Read `trawl_retention_suppressed` on `/metrics`. A value of 1 means a repin
+   marker or staging directory is pausing retention. Follow
+   [Clear suppressed retention](#clear-suppressed-retention).
+2. Search the journal for `retention_disk_pressure_suppressed`. Its
+   `set_aside_path` names a directory beside `data/` that trawld set aside
+   when it found data in an older format. That directory uses space, is never
+   a deletion candidate, and is never deleted by trawld. Back it up if you
+   need it, then remove it by hand. Disk-pressure deletion resumes on the next
+   tick. Age-based deletion keeps running meanwhile.
+3. Compare the threshold with the filesystem: `df -h /var/lib/trawl`.
+
+## Clear suppressed retention
 
 Both sweeps pause while `data/REPIN`, `data.repin-next/`, or
-`data.repin-aside/` exists. A repin keeps its affected files in both generations
-until cleanup and checks `min_free_disk_bytes` before starting. Retention cannot
-safely remove files from the corpus during that rewrite. It resumes on the tick
-after the job or its boot recovery completes.
+`data.repin-aside/` exists. A repin keeps the affected files in two
+generations until cleanup, and retention must not delete files under it.
+Retention resumes on the tick after the job or its boot recovery finishes.
 
-If a permission or I/O failure leaves a staging root behind, trawld retains the
-marker needed to authorize its cleanup. The next boot retries cleanup. Until it
-succeeds, the server reports `repin_recovery_incomplete` and retention stays paused.
+1. Check for a running repin:
 
-Monitor `trawl_retention_suppressed`. It is 1 when repin state suppresses a
-retention tick and 0 when that guard is clear. A prolonged value of 1 needs investigation even if
-`trawl_catalog_repin_running` is 0: an abandoned staging root can suppress
-retention without a running job.
+   ```bash
+   trawl -p prod schema repin-status
+   ```
 
-Disk-pressure cleanup can also report `retention_disk_pressure_suppressed`.
-Its `set_aside_path` field identifies a retained directory outside the live
-corpus. Inspect that path and its backup status before reclaiming space; removing
-live partitions cannot free the bytes it holds. This guard pauses pressure
-cleanup without setting the repin suppression gauge or stopping age-based retention.
+   If a job is running, wait for it. Its files use double the space until it
+   completes.
 
-## Recover space
+2. If no job is running and the paths remain, search the journal for
+   `repin_recovery_incomplete`. It names the permission or I/O failure that
+   stopped cleanup. Fix the cause and restart trawld. Boot recovery retries
+   the cleanup. Do not delete the marker or the staging directories yourself.
+   The marker is what authorizes the cleanup.
 
-1. Inspect filesystem free space, the configured data path, and the path named by
-   `retention_disk_pressure_suppressed` or `repin_recovery_incomplete`.
-2. Read the running/newest repin job and correlate its ID. If it is active, plan
-   for its affected bytes to remain doubled. Do not delete its marker or staging roots.
-3. If recovery is incomplete, resolve the reported filesystem permission or I/O
-   failure. Plan a restart so normal boot recovery can finish. Preserve all job state.
-4. On the next retention tick, verify suppression ended and free space changed.
-   Do not infer success from removal of one directory while another still blocks it.
+3. After the next tick, confirm that `trawl_retention_suppressed` is 0 and
+   that free space changed.
 
-The [backup procedure](/operate/backup-restore/) keeps corpus and catalog together.
+`trawl_catalog_repin_running` can be 0 while `trawl_retention_suppressed` is
+1. An abandoned staging directory suppresses retention without a running job.
+
+[Back up and restore](/operate/backup-restore/) keeps the data directory and
+the catalog together.

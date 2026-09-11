@@ -1,148 +1,214 @@
 ---
-title: Manage access and browser sessions
-description: Provision roles, rotate API keys, and configure TLS and shared sessions.
+title: Manage access
+description: Create roles and API keys, rotate or revoke a key, and configure TLS, the browser origin, and shared browser sessions.
 ---
 
-Trawl permissions are code-defined; roles are named bundles stored in the Fleet
-keystore. Key permissions are the union of its roles. A role called `trawl-admin`
-does not gain implicit privileges. Use the [permission reference](/reference/api/#roles-and-permissions)
-for the available permissions and the [deployment guide](/operate/deployment/#provision-the-databases)
-for database preparation.
+Permissions are fixed in code. Roles are named sets of permissions stored in
+the Fleet database, and a key's permissions are the union of its roles. A role
+name grants nothing by itself. The [permission list](/reference/api/#roles-and-permissions)
+names every permission Trawl checks.
+
+Every `fleet-admin` command except `generate-session-key` reads the Fleet DSN
+from `DATABASE_URL`, which is separate from the daemon's `FLEET_DATABASE_URL`.
 
 ## Create roles and keys
 
-Run `fleet-admin` where it can reach the selected Fleet database. Supply
-`DATABASE_URL` through a protected credential mechanism. It is not the daemon's
-`FLEET_DATABASE_URL` override. Confirm the database identity before mutation.
-A fresh keystore has no roles. Inspect existing roles before creating new ones.
+1. List the existing roles. A new Fleet database has none:
 
-```bash
-fleet-admin roles list
-fleet-admin roles create --name trawl-reader \
-  --perm trawl:query --perm trawl:schema_read --perm trawl:query_cancel
-fleet-admin roles create --name trawl-ingest --perm trawl:ingest
-fleet-admin roles create --name trawl-schema-admin \
-  --perm trawl:schema_read --perm trawl:schema_write
-fleet-admin keys create --name operator --kind human --role trawl-reader
-fleet-admin keys create --name vector --kind service --role trawl-ingest
-```
+   ```bash
+   fleet-admin roles list
+   ```
 
-Each key creation prints its token once. Store it in the intended secret manager
-or owner-only client/collector configuration immediately; do not paste it into a
-report or repository. Unknown permission strings warn but still persist, so verify
-the exact spelling and use authenticated `/api/v1/whoami` to inspect effective
-permissions. Repin requires `schema_write` on an ingest-enabled server; it does
-not require a human-kind key.
+2. Create one role per job. Each `--perm` is `trawl:` followed by a permission
+   name:
 
-To grant an existing operator schema access, identify its stable prefix first:
+   ```bash
+   fleet-admin roles create --name trawl-reader \
+     --perm trawl:query --perm trawl:schema_read --perm trawl:validate \
+     --perm trawl:export --perm trawl:stream --perm trawl:saved_query \
+     --perm trawl:query_cancel
+   fleet-admin roles create --name trawl-ingest --perm trawl:ingest
+   fleet-admin roles create --name trawl-schema-admin \
+     --perm trawl:schema_read --perm trawl:schema_write
+   ```
 
-```bash
-fleet-admin keys list
-fleet-admin keys assign-role PREFIX trawl-schema-admin
-```
+   `fleet-admin` warns about a permission it does not recognize but stores it
+   anyway. Check the spelling in the warning.
 
-Replace `PREFIX` with that selected key prefix. Read role and permission state
-afterward. `roles add-perm`, `remove-perm`, and `set-rate` affect all keys holding
-the role, while `keys assign-role` and `unassign-role` affect one key.
+3. Create one key per person or collector. A `human` key is for a person and a
+   `service` key is for software:
+
+   ```bash
+   fleet-admin keys create --name alice --kind human --role trawl-reader > alice.token
+   fleet-admin keys create --name vector --kind service --role trawl-ingest \
+     --expires 90d > vector.token
+   ```
+
+   The token goes to standard output once. The name, kind, roles, 8-character
+   prefix, and expiry go to standard error. `--role` repeats. `--expires`
+   accepts `24h`, `90d`, or `52w`, and a key without it never expires.
+
+4. Check what a key can do:
+
+   ```bash
+   curl --fail-with-body -H "Authorization: Bearer $(cat alice.token)" \
+     https://trawl.example.com:5514/api/v1/whoami
+   ```
+
+   The response lists the key's `roles` and its resolved `permissions`.
+
+To change roles and keys later, use these commands. `PREFIX` is the prefix that
+`fleet-admin keys list` prints.
+
+| Task | Command |
+| --- | --- |
+| Add permissions to a role, for every key that holds it | `fleet-admin roles add-perm ROLE trawl:export trawl:stream` |
+| Remove permissions from a role | `fleet-admin roles remove-perm ROLE trawl:export` |
+| Show a role and how many keys hold it | `fleet-admin roles show ROLE` |
+| Cap requests per minute for keys that hold a role, or clear the cap | `fleet-admin roles set-rate ROLE --rate-rpm 600`, `fleet-admin roles set-rate ROLE --default` |
+| Delete a role. `--force` takes it from every key first | `fleet-admin roles delete ROLE` |
+| Give one key a role, or take one away | `fleet-admin keys assign-role PREFIX ROLE`, `fleet-admin keys unassign-role PREFIX ROLE` |
+| Change a key between `human` and `service` | `fleet-admin keys retype PREFIX service` |
+| List keys, including revoked ones | `fleet-admin keys list --all` |
+
+`keys revoke`, `keys unassign-role`, and `roles delete` ask `[y/N]` on a
+terminal. Without a terminal they refuse unless you pass `--yes`.
 
 ## Rotate or revoke an API key
 
-1. Identify the old key by prefix, its roles, expiry, and every consumer. Inspect
-   schedules owned by the key before revoking it; replacing a token does not
-   transfer those schedules to another principal.
-2. Create a new key with the intended role set, store it securely, and update the
-   selected client or collector through its normal secret workflow.
-3. Verify `/whoami` and the actual operation with the new key. For collectors,
-   verify accepted events, not just a successful process restart.
-4. Revoke the old prefix and verify that the old key is rejected. This affects all
-   applications that trusted that Fleet key, not only Trawl.
+1. Find the key and its roles with `fleet-admin keys list`. Saved queries,
+   schedules, and query history belong to the key's id, and a replacement key
+   does not inherit them.
 
-```bash
-fleet-admin keys revoke PREFIX
+2. Create the replacement with the same roles, as in
+   [Create roles and keys](#create-roles-and-keys).
+
+3. Install the new token in the client or collector. Confirm it with
+   `/api/v1/whoami` and with the real operation. For a collector, confirm that
+   events are accepted, not only that the process restarted.
+
+4. Revoke the old key:
+
+   ```bash
+   fleet-admin keys revoke PREFIX
+   ```
+
+   The command prints the key and asks `revoke this key? [y/N]`. trawld checks
+   every request against the database, so the next request with the old token
+   gets a 401, and a browser session logged in with that key ends. Revocation
+   applies in every Fleet application that trusts the key.
+
+## Configure TLS
+
+trawld serves HTTPS only. When `tls_cert_path` and `tls_key_path` are unset, it
+generates a self-signed certificate at startup, valid for `localhost`,
+`127.0.0.1`, and `::1`, and writes `cert.pem` and `key.pem` to the `tls/`
+directory beside the data path. Clients on other hosts need a certificate they
+trust:
+
+```toml
+[server]
+tls_cert_path = "/etc/trawl/cert.pem"
+tls_key_path = "/etc/trawl/key.pem"
+tls_reload_interval_secs = 300
 ```
 
-The command confirms interactively; use `--yes` only for an already approved
-noninteractive revocation. Revocation is checked on new requests. Existing browser
-cookies still depend on the underlying key's validity; they do not override it.
+Set both paths or neither. Make the key readable by the daemon, then restart:
 
-## TLS and browser access
+```bash
+sudo chown root:trawl /etc/trawl/key.pem && sudo chmod 0640 /etc/trawl/key.pem
+sudo systemctl restart trawld
+```
 
-trawld serves HTTPS. Configure a trusted certificate/key pair and client trust for
-normal use. Generated self-signed certificates cover localhost and loopback IPs;
-`--insecure` disables verification and should be confined to a deliberate local
-check. Certificate files can reload at `tls_reload_interval_secs`; ordinary config
-changes require restarting the affected process.
+trawld re-reads both files every `tls_reload_interval_secs` seconds, so a
+renewed certificate needs no restart. `trawl --insecure` skips certificate
+verification. Use it only for a check on the same host.
 
-The browser connects to `trawl-web`, usually through HTTPS at a reverse proxy.
-Configure its exact browser-visible origin, including scheme and non-default port:
+## Set the browser origin
+
+`trawl-web` accepts a cookie-authenticated request only when its `Origin`
+header is in `[web] public_origins`. Write the origin the browser shows, scheme
+and non-default port included:
 
 ```toml
 [web]
 public_origins = ["https://trawl.example.com"]
+bind_addr = "127.0.0.1:8090"
 cookie_secret_path = "/var/lib/trawl/web.cookie"
 allow_insecure_cookies = false
 ```
 
-A present Origin must match. `Forwarded` and `X-Forwarded-*` do not widen the list.
-Keep secure cookies when the browser sees HTTPS, even if the proxy forwards HTTP.
-Only use `allow_insecure_cookies=true` when the browser itself intentionally uses
-HTTP. See [origin validation](/reference/configuration/#the-browser-origin-allowlist).
+- trawl-web compares the whole header, so `http://localhost:8090` and
+  `http://127.0.0.1:8090` are two entries. `Forwarded` and `X-Forwarded-*`
+  headers never extend the list, and an empty list stops trawl-web at startup.
+- Behind a TLS-terminating reverse proxy, list the `https://` origin, not the
+  `http://127.0.0.1:8090` address the proxy forwards to, and keep
+  `allow_insecure_cookies = false`. Set it to `true` only when the browser
+  itself uses HTTP.
+- `bind_addr` defaults to loopback. External browsers need a reverse proxy in
+  front of it.
 
-## Shared browser sessions
+Restart the proxy after a change with `sudo systemctl restart trawl-web`. The
+[`[web]` reference](/reference/configuration/#web) lists every key, including
+`session_ttl_secs`, `upstream_url`, and `cookie_secret_env`.
 
-Standalone installations need a persistent app-local key. Shared Fleet SSO is
-optional and needs the same raw 32-byte session key and parent cookie domain in
-every participating app. For example, `trawl.fleet.example.com` and
-`coastwatch.fleet.example.com` can use `.fleet.example.com`. Each app still has its
-own public-origin allowlist. Do not assume the other repository's live config.
+## Share a browser session across Fleet applications
 
-Generate a new key once, in a protected administrative shell with tracing off:
+On its own, Trawl reads the key at `cookie_secret_path` and scopes the cookie
+to its origin. To let one login work in Trawl and another Fleet application,
+every application needs the same 32-byte session key and the same
+`shared_domain`.
 
-```bash
-(
-  set -euo pipefail
-  umask 077
-  test ! -e "$TRAWL_SESSION_KEY_B64"
-  fleet-admin generate-session-key > "$TRAWL_SESSION_KEY_B64"
-)
-```
+1. Generate the key once and keep the file private:
 
-Set `TRAWL_SESSION_KEY_B64` to a new file in a private directory first. This is
-base64url text, not the raw bytes expected by `cookie_secret_path`. Store it in the
-fleet's secret manager. For Debian, run this conversion as root using that
-protected file; it stages outside the service-writable state directory:
+   ```bash
+   umask 077
+   fleet-admin generate-session-key > fleet-session.b64
+   ```
 
-```bash
-(
-  set -euo pipefail
-  umask 077
-  tmp="$(mktemp -p /root fleet-session-key.XXXXXX)"
-  trap 'rm -f "$tmp"' EXIT
-  { tr -d '\n' < "$TRAWL_SESSION_KEY_B64"; printf '='; } | basenc --base64url -d > "$tmp"
-  test "$(stat -c %s "$tmp")" -eq 32
-  install -o trawl -g trawl -m 0640 "$tmp" /var/lib/trawl/web.cookie
-)
-```
+   The output is one line of 43 base64url characters. Store it in your secret
+   manager and give the same value to every application.
 
-`install` replaces the destination instead of redirecting through a planted
-symlink. The group-readable mode lets the separate `trawl-web` user read the key.
-Do not replace it with a redirect followed by chown/chmod. Keep the temporary file
-cleanup in a subshell so the trap does not remain armed in your interactive shell.
+2. On a Debian host, decode it to the raw 32 bytes that `cookie_secret_path`
+   reads, then install it over the package-generated key:
 
-For Kubernetes, decode into a private raw file, verify 32 bytes, and use the
-selected context and namespace to create a Secret with key `cookie.key` from that
-file. Reference its name through `web.cookieSecret.existingSecret` in the complete
-[deployment values](/operate/deployment/#kubernetes-and-helm). Do not paste the
-base64url text into Kubernetes' standard-base64 `data` value.
+   ```bash
+   { tr -d '\n' < fleet-session.b64; printf '='; } | basenc --base64url -d > web.cookie.new
+   test "$(stat -c %s web.cookie.new)" -eq 32
+   sudo install -o trawl -g trawl -m 0640 web.cookie.new /var/lib/trawl/web.cookie
+   ```
 
-Set `[web] shared_domain` or Helm `web.sharedDomain` consistently across the apps.
-Restart affected proxies in a coordinated window and verify login across both
-origins. Swapping the key invalidates existing sessions; there is no old/new key
-ring. The API tokens themselves remain valid. Remove temporary exported key files
-once secure distribution is verified.
+   `install` replaces the file in place, and the `trawl` group lets the
+   `trawl-web` user read it. `cookie_secret_env` names an environment variable
+   that holds the base64 text instead and takes precedence. Protect the file
+   that sets it, because `/etc/default/trawl-web` is world-readable.
 
-A shared cookie makes participating apps part of the same session trust boundary.
-An origin allowlist rejects cross-origin requests, but cannot prevent a compromised
-sibling app from overwriting or clearing a parent-domain cookie in its own response.
-trawld 401 clears the session through `/api/auth/me`; a 403 keeps it so the same
-session can remain useful in another app.
+3. On Kubernetes, create a Secret from the raw bytes and name it in the values
+   file:
+
+   ```bash
+   kubectl -n trawl create secret generic trawl-session --from-file=cookie.key=web.cookie.new
+   ```
+
+   ```yaml
+   web:
+     sharedDomain: .fleet.example.com
+     cookieSecret:
+       existingSecret: trawl-session
+   ```
+
+4. Set the same parent domain in every application. Each application keeps
+   its own `public_origins`. For Trawl on Debian:
+
+   ```toml
+   [web]
+   shared_domain = ".fleet.example.com"
+   ```
+
+5. Restart every proxy, then log in at one application and open the other.
+   Replacing the key ends every existing browser session. API tokens are
+   unaffected.
+
+A shared cookie makes the applications one session trust boundary. A
+compromised application can overwrite or clear the cookie for all of them, and
+`public_origins` does not prevent that.

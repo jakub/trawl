@@ -1,140 +1,163 @@
 ---
 title: Ship logs with Vector
-description: Map sender fields, configure the HTTP sink, and verify accepted events.
+description: Install Vector on a Debian host, load the Trawl configuration, set the token, and confirm that events arrive.
 ---
 
-Vector collects, transforms, buffers, and sends events to trawld's direct HTTPS
-API. This guide assumes that the server is running and you have a service key
-with `trawl:ingest`. Use [access administration](/operate/access/#create-roles-and-keys)
-to create it. The browser proxy is not an ingest endpoint.
+Vector reads journald and `/var/log` files, maps them to the
+[event contract](/reference/events/), buffers to disk, and posts gzip batches
+to `POST /api/v1/ingest`. This page sets it up on one Debian host with the
+configuration shipped in the Trawl repository.
 
-## The event schema
+You need:
 
-Use the [event reference](/reference/events/) for the complete envelope and
-repair/rejection contract. In the remap, choose a valid service, preserve the
-original host, and select an environment in the server's `ingest.envs` allowlist.
-Fields are ASCII-folded at ingest; the `_` prefix belongs to Trawl. `_time` and
-string `_raw` are supported proposal fields; `_severity` is derived by the server.
+- trawld reachable from the host at its HTTPS address, for example
+  `https://trawl.example.com:5514`. Vector talks to trawld, not to `trawl-web`.
+- A service key with `trawl:ingest`, from
+  [Create roles and keys](/operate/access/#create-roles-and-keys).
+- A trawld certificate the host can verify. See [Configure TLS](/operate/access/#configure-tls).
 
-### Derivation sources: read, never consumed
+## Install Vector
 
-`timestamp` and `@timestamp` remain queryable after time derivation. Ordinary
-severity sources also survive. Only `_time` itself is consumed as the timestamp
-proposal. See [derivation configuration](/reference/configuration/#derivation-sources-severity_from--time_from)
-when the sender uses other names or numeric syslog severity.
+1. Add the Vector repository and install the package:
 
-### Severity tokens
+   ```bash
+   bash -c "$(curl -L https://setup.vector.dev)"
+   sudo apt-get install vector
+   ```
 
-The [event reference](/reference/events/) owns tokens and numeric interpretations.
-OTel 1-24 is the default numeric dialect. HTTP collectors can explicitly declare
-a syslog source; see [syslog over HTTP](/operate/ingestion/#syslog-over-http).
-An unmappable value leaves `_severity` absent without a repair or rejection.
+2. Let the `vector` user read the journal and `/var/log`:
 
-### env
+   ```bash
+   sudo usermod -aG systemd-journal,adm vector
+   ```
 
-Set the remap's environment to one allowed by the server. A missing environment
-uses `default_env` with a repair; an unlisted environment is rejected. Changing a
-collector's environment also changes where its events are stored, so verify a
-sample before rolling the mapping out to every sender.
+   Add `docker` for `docker.toml`, and the owning group of any application log
+   directory you collect.
 
-## Basic sink configuration
+## Load the Trawl configuration
 
-Combine this sink with the remap below and your existing source. Supply
-`TRAWL_URL` and `TRAWL_INGEST_TOKEN` through Vector's protected service environment.
-`TRAWL_URL` must name the direct trawld API, for example `https://logs.example.com:5514`.
-The example uses a CA file that validates the server certificate; configure its
-actual path. Do not routinely disable certificate verification.
+The repository directory [`config/vector/debian/`](https://github.com/jakub/trawl/tree/main/config/vector/debian)
+holds `base.toml` and one drop-in per service: `apache.toml`, `docker.toml`,
+`fail2ban.toml`, `mysql.toml`, `nginx.toml`, `postgresql.toml`, `redis.toml`,
+and `unifi-syslog.toml`.
+
+1. Copy `base.toml` and only the drop-ins for services on this host:
+
+   ```bash
+   sudo mkdir -p /etc/vector/vector.d
+   sudo cp base.toml nginx.toml /etc/vector/vector.d/
+   ```
+
+   `base.toml` reads journald and `/var/log/**/*.log`, maps `_SYSTEMD_UNIT` to
+   `service` and `PRIORITY` to `severity_text`, and defines the `trawld` sink.
+   The sink takes input from every transform named `trawl_*`, so a drop-in
+   needs no change to `base.toml`.
+
+2. Set the environment in `/etc/default/vector`, then restrict the file
+   because it holds the token:
+
+   ```bash
+   VECTOR_CONFIG_DIR=/etc/vector/vector.d
+   VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION=true
+   TRAWL_URL=https://trawl.example.com:5514
+   TRAWL_INGEST_TOKEN=flt_...
+   TRAWL_ENV=prod
+   ```
+
+   ```bash
+   sudo chmod 0600 /etc/default/vector
+   ```
+
+   The unit reads this file for both `vector validate` and `vector`.
+   `VECTOR_CONFIG_DIR` replaces the default `/etc/vector/vector.yaml`. The
+   interpolation variable is required: Vector 0.57 and later do not expand
+   `${TRAWL_URL}` in a configuration file without it. `TRAWL_ENV` must be in
+   the server's `[ingest] envs`.
+
+3. Verify the server certificate. As shipped, `[sinks.trawld.tls]` sets
+   `verify_certificate = false`. When trawld uses a certificate from a CA the
+   host trusts, set it to `true`. For a private CA, also name its certificate:
+
+   ```toml
+   [sinks.trawld.tls]
+   verify_certificate = true
+   ca_file = "/etc/vector/trawl-ca.pem"
+   ```
+
+   The self-signed certificate that trawld generates is valid only for
+   `localhost`, so it cannot pass verification from another host.
+
+## Start Vector and confirm delivery
+
+1. Start and enable the service:
+
+   ```bash
+   sudo systemctl enable --now vector
+   sudo systemctl status vector
+   ```
+
+   The unit runs `vector validate` before it starts. A configuration error
+   shows here.
+
+2. Watch the journal for the first batches:
+
+   ```bash
+   journalctl -u vector -f
+   ```
+
+   A `401` means the token is wrong. A `403` means the key lacks
+   `trawl:ingest`. Vector does not retry either one. A connection or TLS
+   error means `TRAWL_URL` or the certificate.
+
+3. Write a known line to the journal and query it:
+
+   ```bash
+   sudo systemd-run --unit trawl-check --quiet /bin/echo 'vector delivery check'
+   trawl -p prod query 'service=trawl-check last=15m'
+   ```
+
+   Expect one event with `message` = `vector delivery check`, `_producer` =
+   `http`, `host` = this host, and `_severity` derived from `severity_text`.
+
+4. Check for rejected events on the server. Vector counts a `200` as success
+   even when trawld rejected some events in the batch, so read
+   `trawl_ingest_events_rejected_total` and `trawl_ingest_repairs_total` on
+   `/metrics`. See [Confirm delivery over time](/operate/ingestion/#confirm-delivery-over-time).
+
+The shipped sink behaves as follows:
+
+| Setting | Value |
+| --- | --- |
+| Batch | 1 MB or 5 seconds, gzip |
+| Buffer | Disk, 1 GB under `/var/lib/vector`. Sources block when it is full. |
+| Retries | `5xx`, `408`, and `429`, with 1 to 30 second backoff. Other `4xx` responses drop the batch. |
+| Concurrency | Adaptive |
+| Acknowledgements | Enabled. A source advances only after trawld accepts the batch. |
+
+## Add your own source
+
+Name the transform `trawl_*` so the sink picks it up:
 
 ```toml
-[sinks.trawl]
-type = "http"
-inputs = ["trawl_schema"]
-uri = "${TRAWL_URL}/api/v1/ingest"
-encoding.codec = "json"
-compression = "gzip"
-batch.max_bytes = 1048576
-batch.timeout_secs = 5
+[sources.myapp]
+type = "file"
+include = ["/var/log/myapp/*.log"]
+read_from = "end"
 
-[sinks.trawl.request]
-headers.authorization = "Bearer ${TRAWL_INGEST_TOKEN}"
-
-[sinks.trawl.tls]
-ca_file = "/etc/vector/trawl-ca.pem"
-verify_certificate = true
-
-[sinks.trawl.buffer]
-type = "disk"
-max_size = 1073741824
-when_full = "block"
-```
-
-A disk buffer needs writable persistent Vector storage. Its capacity is finite;
-`when_full = "block"` propagates backpressure instead of promising unlimited
-outage coverage. Validate retry behavior for the installed Vector version,
-particularly authentication and per-event ingest rejections.
-
-## A minimal remap
-
-Replace `your_source` with the name of the source in your complete Vector config.
-Set `service` and `env` for that source. This remap assumes each event represents
-the collector's own host; a relay should preserve the originating device instead.
-
-```toml
-[transforms.trawl_schema]
+[transforms.trawl_myapp]
 type = "remap"
-inputs = ["your_source"]
+inputs = ["myapp"]
 source = '''
-._time = .timestamp
-.env = "prod"
 .service = "myapp"
-.host = get_hostname!()
-# Preserve an existing level or severity field for server-side derivation.
-# ._raw = .message  # retain a pre-parse line if available
+.env = "${TRAWL_ENV:-prod}"
+del(.source_type)
+del(.file)
 '''
 ```
 
-An absent timestamp will be repaired to arrival time. Do not assign every event a
-constant severity just to fill the column: that can hide the sender's real level.
-For a known syslog numeral, declare the server source dialect or normalize it once
-at the collector, then verify both the raw and canonical values.
-
-## Shipped configs
-
-The repository contains `config/vector/local-dev.toml` for embedded-mode demo
-files and `config/vector/debian/base.toml` with service drop-ins for Debian.
-The embedded demo materializes fields itself because no server canonicalizer runs
-in that path. It is not a replacement for the HTTP collector configuration.
-
-The Debian base reads journald and selected `/var/log` files. Drop-ins cover nginx,
-Apache, PostgreSQL, MySQL, Redis, Docker, fail2ban, and UniFi syslog. Select sources
-and permissions for the actual host; do not install unrelated collector access
-merely because a sample config lists it.
-
-## Validate and verify delivery
-
-1. Run the installed Vector version's config validation against the complete
-   configuration and service environment. Check `vector validate --help` for its
-   supported options. TOML parsing alone does not validate VRL or sink behavior.
-2. Reload or restart only the selected collector, then inspect its diagnostics
-   without exposing the token-bearing environment.
-3. Generate one known event at the source and query its service with a short time
-   window. Compare host, event time, `_producer=http`, and derived severity.
-4. Inspect rejected events, repair counters, and buffer/retry state. An HTTP response
-   can include rejected events alongside accepted siblings.
-
-Use [ingestion checks](/operate/ingestion/) for a bounded direct POST that isolates
-collector problems from server problems. Use [catalog diagnosis](/operate/catalog/)
-when values arrive but conformance shelves them as NULL.
-
-## Generate adversarial test logs
-
-The deterministic generator and its producer profiles are contributor tools.
-Use [adversarial ingest testing](/contribute/testing/#generate-adversarial-test-logs)
-on disposable storage and catalog state. Generated field names consume pin slots.
-
-## What the server records
-
-The canonical [repair-code reference](/reference/events/) defines `_repairs` and
-`trawl_ingest_repairs_total`. Query repairs by service to identify sender problems.
-Unmappable severity uses `trawl_severity_unmapped_total`, not a repair code.
-Original sender values remain available subject to the documented raw-size limit.
+Vector's sources set `timestamp` and `host`, and trawld derives `_time` from
+`timestamp`. Set `severity_text`, `severity`, or `level` from the line when
+the source has one. trawld derives `_severity` from the first that maps.
+`service`, `env`, `host`, and `message` are the envelope, and names that start
+with `_` belong to Trawl. Test one host before you roll a new mapping out to
+every sender.

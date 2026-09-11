@@ -1,126 +1,145 @@
 ---
 title: Check health and stalled work
-description: Distinguish dependency health, authorization failures, and workers that outlive a query.
+description: Confirm that a trawld server is serving, read what is degraded, and free capacity that a stalled query still holds.
 ---
 
-Start with the named server and its existing TLS trust and credential configuration.
-For curl, keep the bearer header in an owner-only config file, not a command-line
-argument. These examples assume `TRAWL_URL` names the direct HTTPS API,
-`TRAWL_CURL_CONFIG` names that file, and `TRAWL_PROFILE` names the same server.
-Do not print the config file. Disable shell tracing when loading credentials.
+These commands address one server. `TRAWL_URL` names its HTTPS API,
+`TRAWL_PROFILE` names the matching CLI profile, and `TRAWL_CURL_CONFIG` names
+an owner-only curl config file that holds the bearer header. Keep the token in
+that file, not on the command line, and do not print the file.
 
-```bash
-curl --fail-with-body --config "$TRAWL_CURL_CONFIG" "$TRAWL_URL/api/v1/health"
-curl --fail-with-body --config "$TRAWL_CURL_CONFIG" "$TRAWL_URL/api/v1/whoami"
-trawl -p "$TRAWL_PROFILE" query 'last=15m | head 20'
-```
+## Check the server
+
+1. Ask for health. `/api/v1/health` needs no key.
+
+   ```bash
+   curl --fail-with-body --config "$TRAWL_CURL_CONFIG" "$TRAWL_URL/api/v1/health"
+   ```
+
+   A serving server answers 200 with `"status":"ok"` and four checks that read `ok`:
+
+   ```json
+   {"status":"ok","checks":{"duckdb":"ok","auth_db":"ok","storage_db":"ok","data_path":"ok"},"version":"..."}
+   ```
+
+2. Confirm that your key is accepted.
+
+   ```bash
+   curl --fail-with-body --config "$TRAWL_CURL_CONFIG" "$TRAWL_URL/api/v1/whoami"
+   ```
+
+   A 200 confirms the key. A 401 means the token is invalid or revoked. A 403
+   means the key holds no Trawl permission.
+
+3. Run a bounded query.
+
+   ```bash
+   trawl -p "$TRAWL_PROFILE" query 'last=15m | head 20'
+   ```
+
+   You see a table of up to 20 events. An empty table means nothing arrived in
+   the last 15 minutes. A 503 or 504 means the query path is the problem. See
+   [Diagnose a 503 or 504 from a query](#diagnose-a-503-or-504-from-a-query).
+
+On a packaged host, `systemctl status trawld trawl-web` and `journalctl -u trawld`
+show the process state. On Kubernetes, read the pod events and each container's
+log separately, including `init-auth`. Keep Secret contents out of incident notes.
 
 ## Read the checks
 
-`/health` is unauthenticated. An auth database, storage database, or data-path
-failure can report `degraded` with HTTP 200; an unavailable query engine reports
-503. Read every check. Then verify authenticated identity and the permissions
-needed for the failing operation. A 401 points at credential validity; a 403
-can mean a valid key lacks any recognized Trawl permission or the route permission.
+`status` is `ok`, `degraded`, or `unavailable`. Only a `duckdb` failure makes
+the server `unavailable` and the response 503. Any other failing check leaves
+the response at 200 with `"status":"degraded"`. Read every check, not the status
+alone. The response shape is in [the API reference](/reference/api/#health).
 
-Use [the API reference](/reference/api/#health) for the response shape.
-For a packaged host, inspect `systemctl status trawld trawl-web` and their journals.
-For Kubernetes, inspect the selected context, namespace, pod events, and each
-container separately, including `init-auth`. Avoid dumping environment variables
-or Secret contents into incident logs.
+| Check | Meaning when it reads `error` | What to do |
+| --- | --- | --- |
+| `duckdb` | The query engine did not answer its probe. Every query fails. | Read the trawld journal for engine errors. Restart trawld if the engine does not recover. |
+| `auth_db` | The auth database did not answer within the probe timeout. Bearer checks fail and `trawl_auth_failures_total{reason="backend_unavailable"}` rises. | Check the auth database and the `[auth]` settings in `trawld.toml`. |
+| `storage_db` | The app-state database did not answer. Saved queries, history, and repin jobs fail. | Check the app-state database and the `[storage]` settings. |
+| `data_path` | `[data] path` is missing or is not a readable directory. Cold data is unreadable. | Check the mount and the directory permissions for the `trawl` user. |
 
 ## Inspect capacity
 
-```bash
-curl --fail-with-body --config "$TRAWL_CURL_CONFIG" "$TRAWL_URL/api/v1/stats"
-curl --fail-with-body --config "$TRAWL_CURL_CONFIG" "$TRAWL_URL/api/v1/queries"
-```
+1. Read the pool counters.
 
-### The query deadline, and work that outlives a request
+   ```bash
+   curl --fail-with-body --config "$TRAWL_CURL_CONFIG" "$TRAWL_URL/api/v1/stats"
+   ```
 
-`timeout_secs` sets one deadline immediately after authentication. It covers DSL
-admission, saved-source resolution, executor queueing, the publication gate, and
-execution. Receiving a permit does not reset it; a queued worker can still reach
-its start boundary after the deadline and be refused.
+   Compare `pool_capacity`, `pool_available`, `active_queries`, and
+   `pool_retained`. `pool_capacity` is `max_concurrent_queries`, which defaults
+   to the CPU count. `pool_retained` counts permits held by work whose request
+   has already ended. Retained permits are a subset of the held permits, not an
+   extra count.
 
-A best-effort history write runs under it too, so a slow store can cost the history row
-but never the answer that is already in hand. Time spent reading the request body is
-outside it, and so is delivering the response.
+2. List the work that holds those permits.
 
-Where the deadline expires decides the status code:
+   ```bash
+   curl --fail-with-body --config "$TRAWL_CURL_CONFIG" "$TRAWL_URL/api/v1/queries"
+   ```
 
-- Before the work starts, the answer is `503` with
-  `server at capacity: the query was not started`. That is a fixed
-  sentence, and it is the whole answer: nothing was read, nothing ran,
-  and no timeout is written to query history.
-- After the work starts, the answer is `504`, a query timeout.
+   The response has three lists: `active`, `recent`, and `retained`. Each
+   `retained` entry carries `id`, `kind`, `started`, and `retained_ms`. `kind`
+   is one of `query`, `from_saved`, `export`, `scheduled`, `ping`, or `sample`.
+   An entry for key-owned work also carries `user` and `query`. An entry for
+   `ping` or `scheduled` work carries them only for a reader with `server_manage`.
 
-The work-start transition is the boundary, not the order two timers
-happen to fire in. Holding an executor permit is not the same as having
-started: a worker can sit in the queue holding nothing, or hold a permit
-and be refused at the transition because the deadline passed while it
-waited.
+3. Watch `trawl_query_permits_retained` on `/metrics`. A value that stays above
+   zero means capacity is held by work that no request waits for. Alarm on that
+   gauge.
 
-A pre-start `503` means no database work started for that request. A `504`
-means the request ended after work started, including a schema value
-sample. The DuckDB bind or scan can continue and keeps its executor permit
-until it physically finishes. trawld reports that retained capacity:
+The events `query_permit_retained` and `query_permit_reclaimed` bracket each
+retained interval in the trawld log. They carry metadata, never DSL. Field
+details are in the API reference under [Running queries](/reference/api/#running-queries)
+and [Server info](/reference/api/#server-info).
 
-- `GET /api/v1/queries` carries a `retained` list beside the active one.
-  Each entry has the pool `id`, the work `kind` (`query`, `from_saved`,
-  `export`, `scheduled`, `ping`, `sample`), whether it `started`, and
-  `retained_ms`, how long it has outlived its request. A query some key
-  submitted also carries that key's display name and its DSL, to every
-  reader holding `query`, the same metadata the `active` and `recent`
-  lists carry for the same query. An autocomplete `sample` is owned by
-  the key that asked for it too, so its entry carries that key's display
-  name to any reader holding `query`, and never any query text: a sample
-  is a field lookup, not DSL. Only work with no owner at all, `ping` and
-  `scheduled`, hides its name and its text from anyone below
-  `server_manage`. Reading an entry is not authority to stop it:
-  cancellation needs `server_manage`, or `query_cancel` held by the exact submitting key.
-- `GET /api/v1/stats` and the dashboard snapshot carry `pool_retained`
-  beside `pool_active`. Retained work is a subset of held permits,
-  never an extra count, and the terminal dashboard renders
-  `active: 3/4 (1 retained)` only when the number is nonzero.
-- `/metrics` carries `trawl_query_permits_retained`, a label-free gauge.
-  A steady nonzero value means capacity is occupied by work no request is
-  waiting for any more, and that is the number to alarm on if searches
-  start queueing behind nothing visible.
-- The lifecycle logs `query_permit_retained` and `query_permit_reclaimed`
-  bracket each interval. They carry metadata only, never DSL.
+## Diagnose a 503 or 504 from a query
 
-`DELETE /api/v1/queries/{id}` still works on retained
-work, and repeating it is safe: cancellation is a latch, and asking twice
-sets a flag that is already set. What comes back is an acknowledgement
-that cancellation was requested, not a promise that anything has
-stopped. trawld latches the request even before an interrupt handle
-exists, so a cancel that arrives during binding is not lost, and it
-checks the latch again at the boundary between binding and execution.
-A bind already inside DuckDB is not preemptible: the honest worst case is
-that the permit stays retained until that bind returns.
+`timeout_secs`, 30 seconds by default, starts one deadline right after
+authentication, and that deadline covers admission, queueing, and execution.
+Where it expires decides the status code.
 
-The DSL admission limits are fixed. The 512 alias-expansion
-budget and the 128-stage cap ([DSL reference](/reference/dsl/)) are fixed
-constants, checked before a query reaches the database, and there is no
-knob here that raises them.
+| Symptom | Meaning | What to do |
+| --- | --- | --- |
+| 503 with `server at capacity: the query was not started` | The deadline expired before any database work started. Nothing ran, and query history has no row. | Read `pool_retained` and the `retained` list. Cancel retained work, or raise `max_concurrent_queries`. |
+| 504 with `query timed out` | The deadline expired after work started. The bind or scan can still hold its permit. | Find the id in `retained` and cancel it. |
+| `trawl_query_permits_retained` stays above zero | Finished requests still occupy the pool. | Cancel each retained id. |
 
-## Logging filter (`RUST_LOG`)
+To cancel, send `DELETE /api/v1/queries/{id}` with `server_manage`, or with
+`query_cancel` when your key submitted the query. The response
+`{"cancelled":true,"query_id":N}` acknowledges the request without proving that
+the work stopped, and a repeated cancel changes nothing. trawld records a cancel
+that arrives during the bind and checks it again before execution. A bind
+already inside DuckDB cannot be interrupted, so its permit returns only when the
+bind returns.
 
-trawld resolves one directive string at startup for stdout logging and
-[`internal_telemetry`](/reference/configuration/#ingest):
+## Restore missing log lines
 
-- If `RUST_LOG` is unset, it uses the packaged default below.
-- If `RUST_LOG` is valid, that value replaces the default.
-- If `RUST_LOG` is invalid, it uses the default and emits one `config_warning`
-  about the parse error. It does not log the raw environment value.
+Symptom: expected `trawl_server` or `fleet_auth` lines are absent from the
+journal or from stored telemetry.
 
-```text
-trawl_server=info,trawld=info,fleet_auth=info,auth.backend=info,storage.backend=info,preauth.transport=info
-```
+Check:
 
-The code fallback, Helm `logLevel`, and Debian environment example use this
-same default. Keep these targets when customizing the filter:
+1. Look for a parse warning.
+
+   ```bash
+   journalctl -u trawld | grep config_warning
+   ```
+
+   `RUST_LOG is set but could not be parsed` means trawld ignored the value and
+   used its default. It does not log the raw value.
+
+2. Compare the current `RUST_LOG` against the default:
+
+   ```text
+   trawl_server=info,trawld=info,fleet_auth=info,auth.backend=info,storage.backend=info,preauth.transport=info
+   ```
+
+Fix: set a valid `RUST_LOG` that keeps these six targets, then restart trawld.
+On Debian the variable lives in `/etc/default/trawld`. On Helm it is `logLevel`.
+The same filter feeds stdout and
+[`internal_telemetry`](/reference/configuration/#ingest).
 
 | Target | Diagnostics |
 | --- | --- |
@@ -131,72 +150,75 @@ same default. Keep these targets when customizing the filter:
 | `storage.backend` | App-state database failures |
 | `preauth.transport` | TLS handshakes and connection failures |
 
-A global `info` filter also enables dependency logs. A configuration-file
-failure happens before tracing starts and appears on stderr with the resolved
-config path; it cannot appear in stored telemetry.
+A global `info` filter also enables dependency logs.
 
-Some rejection events remain outside the stored event corpus, regardless of
-`RUST_LOG`. The excluded targets are `fleet_auth`, `auth.backend`,
-`preauth.transport`, and `trawl_server::policy::unmetered`. Their events still
-print to stdout, and to `log_file` when telemetry is disabled.
+The browser proxy reads its own `RUST_LOG`. Its default is
+`trawl_web=info,fleet_auth=info`, set in `/etc/default/trawl-web` on Debian and
+`web.logLevel` on Helm. A filter copied from trawld omits `trawl_web` and
+silences the proxy's session, origin, and upstream diagnostics.
 
-These rejections occur before per-key rate limiting. For example, a client can
-provoke a TLS handshake warning without authenticating, and a valid key with no
-Trawl permission receives a 403 before it reaches a rate bucket. Persisting each
-rejection would let that traffic fill the data filesystem.
+A configuration-file failure happens before tracing starts. It appears on
+stderr with the resolved config path and never in stored telemetry.
 
-Monitor those failures through the external log pipeline and the
-`trawl_auth_failures_total` metric. Its `reason` label has five possible values:
-`unauthorized`, `backend_unavailable`, `no_trawl_grant`, `forbidden`, and `internal`.
-It carries no key, display name, or request path. Events emitted behind the rate
-limiter, `storage.backend` errors, and catalog/health events remain eligible for
-stored telemetry.
+## Find authentication failures
 
-The browser proxy uses a separate filter. Its default is:
+Symptom: a client reports 401 or 403, and a query for `service=trawld` shows no
+rejection event.
 
-```text
-trawl_web=info,fleet_auth=info
-```
+Check: rejections from the targets `fleet_auth`, `auth.backend`,
+`preauth.transport`, and `trawl_server::policy::unmetered` never enter stored
+telemetry, whatever `RUST_LOG` says. They print to stdout, and to `log_file`
+when telemetry is disabled. Read them there, or read
+`trawl_auth_failures_total` on `/metrics`. Its `reason` label has five values.
 
-`trawl_web` carries session, origin, upstream, and startup diagnostics. `fleet_auth`
-carries the shared session and origin checks. The proxy's code fallback, Helm
-`web.logLevel`, and Debian environment example agree. A valid `RUST_LOG` replaces
-that default. Copying trawld's target filter would omit `trawl_web` and silence
-those proxy diagnostics.
+| `reason` | Meaning | Fix |
+| --- | --- | --- |
+| `unauthorized` | The bearer token is missing, invalid, or revoked. The client sees 401. | Issue a key or re-enable the key. |
+| `no_trawl_grant` | The key is valid but holds no Trawl permission. The client sees 403. | Grant a Trawl role to the key. |
+| `forbidden` | The key lacks the permission the route needs. The client sees 403. | Grant the route permission. |
+| `backend_unavailable` | The auth database did not answer. | See `auth_db` under [Read the checks](#read-the-checks). |
+| `internal` | The middleware failed. | Read the trawld journal. |
 
-## The query debug log
+The metric carries no key name and no request path. Ship the stdout stream
+through your log pipeline when you need those details.
 
-Set `server.query_log`, `TRAWL_QUERY_LOG`, or `--query-log` to enable an ndjson
-log with one entry per query execution. Each entry includes authenticated identity,
-raw DSL, generated SQL and parameter values, source paths, hot-buffer state, and
-sample result rows. This log can expose more than the event corpus itself.
+## Enable the query debug log
 
-Use a directory only trawld can write, such as `/var/lib/trawl`, and plan a
-restart to enable or disable logging. File modes cannot protect a directory
-entry that another local user can replace.
+Use this log when you need the raw DSL, the generated SQL with its parameter
+values, the source paths, and sample rows for one query. Each entry names the
+authenticated identity. The file can expose more than the event corpus.
 
-When opening the log, trawld:
+1. Set `server.query_log` in `trawld.toml`, or `TRAWL_QUERY_LOG`, or pass
+   `--query-log` to trawld. Point it at a directory only trawld can write, such
+   as `/var/lib/trawl`.
+2. Restart trawld. The journal shows one `query_log_enabled` warning that names
+   the path.
+3. Tail the file.
 
-- creates it with Unix mode `0600` and tightens an existing looser file;
-- refuses a symlink at the configured path through `O_NOFOLLOW`;
-- emits a startup warning naming the path and describing the sensitive contents;
-- limits it with `server.query_log_max_bytes`, 100 MiB by default, and retains
-  one rollover file at `<path>.1`, also mode `0600`. Zero disables rollover.
+   ```bash
+   tail -f /var/lib/trawl/query-debug.log | jq
+   ```
 
-There is no age-based cleanup or additional generation count. Once debugging is
-finished, disable the log, stop trawld in a planned window, remove both files,
-and restart. Deleting the active file while trawld runs leaves it writing to an
-unlinked inode, so space is not reclaimed until it closes the file. That also
-breaks the rollover rename.
+trawld creates the file with mode `0600`, tightens an existing looser file, and
+refuses a symlink at the path. At `server.query_log_max_bytes`, 100 MiB by
+default, it renames the file to `<path>.1` and starts a new one. One rollover
+file is kept. `0` disables rollover.
 
-A failed rename is retried after another `query_log_max_bytes` of output, with
-one warning per attempt. If the rename succeeds but reopening fails, trawld tries
-to undo the rename. If that undo also fails, it closes the log and emits an error.
-Logging then remains disabled until restart rather than growing a file that the
-configured path no longer names.
+## Remove the query debug log
 
-Default `service=trawld` telemetry for queries, exports, and SSE streams contains
-query metadata: `query_id`, `query_len`, actor, outcome, timing, and `error_class`.
-It contains neither raw query/error text nor result samples. Raw text is available
-in authenticated query history, the opt-in debug log, and DEBUG tracing events
+1. Unset `server.query_log`, `TRAWL_QUERY_LOG`, and `--query-log`.
+2. Stop trawld.
+3. Delete the log and its `.1` sibling.
+4. Start trawld.
+
+Do not delete the active file while trawld runs. trawld keeps writing to the
+unlinked inode, the space is not reclaimed, and the next rollover rename fails.
+After a failed rename trawld retries after another `query_log_max_bytes` of
+output, with one warning per attempt. If a rename succeeds but the reopen fails,
+trawld undoes the rename. If the undo also fails, trawld closes the log until
+restart.
+
+Default telemetry for queries, exports, and streams carries `query_id`,
+`query_len`, the actor, the outcome, timing, and `error_class`, never raw query
+text. Raw text is in query history, in this log, and in the DEBUG events
 `query_text` and `query_error_text`.
