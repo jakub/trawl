@@ -61,6 +61,12 @@ pub fn Drawer(
     #[prop(optional)] actions: Option<Children>,
     children: Children,
 ) -> impl IntoView {
+    thread_local! { static NEXT_TITLE_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
+    let title_id = NEXT_TITLE_ID.with(|next| {
+        let id = next.get();
+        next.set(id + 1);
+        format!("fleet-drawer-title-{id}")
+    });
     let scrim_ref = NodeRef::<Div>::new();
     let panel_ref = NodeRef::<Aside>::new();
 
@@ -108,9 +114,9 @@ pub fn Drawer(
             node_ref=scrim_ref
             on:mousedown=on_scrim_mousedown
         >
-            <aside class="sd-drawer" role="dialog" tabindex="-1" node_ref=panel_ref>
+            <aside class="sd-drawer" role="dialog" aria-labelledby=title_id.clone() tabindex="-1" node_ref=panel_ref>
                 <div class="sd-hd">
-                    <div class="sd-ttl">{title()}</div>
+                    <div class="sd-ttl" id=title_id.clone()>{title()}</div>
                     <div class="sd-actions">
                         {actions.map(|a| a())}
                         // A native button, not a styled span: the close

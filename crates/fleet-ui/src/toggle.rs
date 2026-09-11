@@ -10,13 +10,19 @@ use leptos::web_sys;
 use wasm_bindgen::JsCast;
 
 /// Slide switch. `checked` drives the knob position reactively;
-/// `on_change` fires with the new state on every flip.
+/// `on_change` fires with the new state on every flip. `label` names the
+/// control independently of its checked state.
 #[component]
-pub fn Toggle(#[prop(into)] checked: Signal<bool>, on_change: Callback<bool>) -> impl IntoView {
+pub fn Toggle(
+    label: &'static str,
+    #[prop(into)] checked: Signal<bool>,
+    on_change: Callback<bool>,
+) -> impl IntoView {
     view! {
         <label class="toggle">
             <input
                 type="checkbox"
+                aria-label=label
                 prop:checked=move || checked.get()
                 on:change=move |e| {
                     let Some(el) = e.target()

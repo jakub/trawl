@@ -87,7 +87,7 @@ pub fn SaveAsNetModal(
             on_submit=do_save
             footer=Box::new(move || view! {
                 <div class="hint">
-                    <Kbd>"⏎"</Kbd>
+                    <Kbd>"Ctrl/⌘ + Enter"</Kbd>
                     " save"
                     <span style="opacity:.5">"·"</span>
                     <Kbd>"Esc"</Kbd>
@@ -95,7 +95,7 @@ pub fn SaveAsNetModal(
                 </div>
                 <Btn variant=Variant::Secondary on_click=cancel>"Cancel"</Btn>
                 <Btn variant=Variant::Primary disabled=save_disabled on_click=do_save>
-                    {move || if submitting.get() { "Saving…" } else { "Save Net" }}
+                    {move || if submitting.get() { "Saving…" } else { "Save as net" }}
                 </Btn>
             }.into_any())
         >

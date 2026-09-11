@@ -1113,8 +1113,7 @@
 /* .tbl-foot retired (issue #31): every table footer renders
  * fleet_ui::Pager (.results-footer family, shipped with the crate). */
 
-/* ============================================================
-   Schema page — sortable services table (.tbl family above) +
+/* =====================================================   Schema page — sortable services table (.tbl family above) +
    slide-out drawer inspector. The v2 cards grid (.sc-grid/.sc-card
    and friends) is retired; only the drawer-side classes remain.
    ============================================================ */
@@ -1592,3 +1591,9 @@
 }
 
 .stat-card .load-hint { padding: 0; font-size: var(--fs-ui); font-weight: 400; line-height: 1.4; }
+/* Live state and new rows remain readable without repeating motion. */
+@media (prefers-reduced-motion: reduce) {
+  .pulse > span, .tl-row, .statusbar .dot.live, .sf-detail {
+    animation: none;
+  }
+}

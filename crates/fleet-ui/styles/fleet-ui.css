@@ -1627,3 +1627,35 @@ textarea:focus-visible,
 
 /* Shown by OverflowHint only when its associated region overflows. */
 .overflow-hint { flex-shrink: 0; margin: 0; padding: 6px 12px; font-size: var(--fs-dense); color: var(--ink-2); background: var(--panel); }
+
+/* Focus belongs on the visible switch track, since the checkbox is hidden. */
+.toggle input:focus-visible + .toggle-slider {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Forced colors removes box shadows. Keep an outline even where a component
+ * resets its ordinary outline with a more specific selector. */
+@media (forced-colors: active) {
+  button:focus-visible,
+  a[href]:focus-visible,
+  input:focus-visible,
+  textarea:focus-visible,
+  select:focus-visible,
+  [tabindex]:focus-visible,
+  .toggle input:focus-visible + .toggle-slider {
+    outline: 2px solid Highlight !important;
+    outline-offset: 2px;
+  }
+}
+
+/* These effects are decorative; state remains visible without motion. */
+@media (prefers-reduced-motion: reduce) {
+  .modal-scrim, .modal, .sd-scrim, .sd-drawer, .toast,
+  .user-menu, .dr-pop, .status-dot.running {
+    animation: none;
+  }
+  .toggle-slider, .toggle-slider::before {
+    transition: none;
+  }
+}

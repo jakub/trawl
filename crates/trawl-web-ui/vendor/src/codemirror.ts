@@ -49,6 +49,7 @@ export function createEditor(
   const state = EditorState.create({
     doc: initial,
     extensions: [
+      EditorView.contentAttributes.of({ "aria-label": "Search query" }),
       lineNumbers(),
       highlightActiveLine(),
       history(),

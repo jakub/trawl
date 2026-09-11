@@ -365,7 +365,7 @@ fn QuerySchedulePane(
             // -- query section --
             <div class="sd-card">
                 <div class="sd-card-hd">
-                    <span class="ttl">"Query"</span>
+                    <span class="ttl" id="net-query-label">"Query"</span>
                     <Show when=move || !editing.get()>
                         <Btn
                             variant=Variant::Secondary
@@ -382,9 +382,10 @@ fn QuerySchedulePane(
                     }
                 >
                     <textarea
+                        aria-labelledby="net-query-label"
                         class="mono"
                         rows="4"
-                        style="width:100%; resize:vertical; font-size:12px; padding:8px; background:var(--panel-2); border:1px solid var(--line); border-radius:3px; color:var(--ink)"
+                        style="width:100%; resize:vertical; font-size:12px; padding:8px; background:var(--fill); border:1px solid var(--line); border-radius:var(--radius-ctl); color:var(--ink)"
                         prop:value=move || query_buf.get()
                         on:input=move |e| query_buf.set(event_target_value(&e))
                     ></textarea>
@@ -425,7 +426,7 @@ fn QuerySchedulePane(
                 >
                     <div style="display:flex; flex-direction:column; gap:10px">
                         <div>
-                            <label class="field-label">"Interval"</label>
+                            <label class="field-label" for="net-interval">"Interval"</label>
                             <div class="interval-chips">
                                 {INTERVAL_PRESETS.iter().map(|preset| {
                                     let p = *preset;
@@ -442,7 +443,8 @@ fn QuerySchedulePane(
                             </div>
                             <input
                                 class="mono"
-                                style="margin-top:6px; width:80px; font-size:12px; padding:4px 6px; background:var(--panel-2); border:1px solid var(--line); border-radius:3px; color:var(--ink)"
+                                style="margin-top:6px; width:80px; font-size:12px; padding:4px 6px; background:var(--fill); border:1px solid var(--line); border-radius:var(--radius-ctl); color:var(--ink)"
+                                id="net-interval"
                                 placeholder="Custom…"
                                 prop:value=move || {
                                     let v = interval_buf.get();
@@ -460,13 +462,15 @@ fn QuerySchedulePane(
                         })}
 
                         <div>
-                            <label class="field-label">"Max runs "</label>
-                            <span style="color:var(--ink-3); font-size:11px">"(blank = unlimited)"</span>
+                            <label class="field-label" for="net-max-runs">"Max runs "</label>
+                            <span id="net-max-runs-help" style="color:var(--ink-3); font-size:11px">"(blank = unlimited)"</span>
                             <input
                                 class="mono"
                                 type="number"
+                                id="net-max-runs"
+                                aria-describedby="net-max-runs-help"
                                 min="1"
-                                style="display:block; margin-top:4px; width:80px; font-size:12px; padding:4px 6px; background:var(--panel-2); border:1px solid var(--line); border-radius:3px; color:var(--ink)"
+                                style="display:block; margin-top:4px; width:80px; font-size:12px; padding:4px 6px; background:var(--fill); border:1px solid var(--line); border-radius:var(--radius-ctl); color:var(--ink)"
                                 prop:value=move || max_runs_buf.get()
                                 on:input=move |e| max_runs_buf.set(event_target_value(&e))
                             />
@@ -474,6 +478,7 @@ fn QuerySchedulePane(
 
                         <div style="display:flex; align-items:center; gap:8px">
                             <Toggle
+                                label="Schedule enabled"
                                 checked=enabled_buf
                                 on_change=Callback::new(move |v| enabled_buf.set(v))
                             />
@@ -488,7 +493,7 @@ fn QuerySchedulePane(
                                 size=Size::Xs
                                 disabled=saving_schedule
                                 on_click=Callback::new(move |()| do_save_schedule())
-                            >{move || if saving_schedule.get() { "Saving…" } else { "Save Schedule" }}</Btn>
+                            >{move || if saving_schedule.get() { "Saving…" } else { "Save schedule" }}</Btn>
                             {has_schedule.then(|| {
                                 view! {
                                     <Btn
