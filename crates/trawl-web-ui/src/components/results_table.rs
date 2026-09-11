@@ -40,8 +40,10 @@ pub fn ResultsTable(
     on_navigate: Callback<String>,
 ) -> impl IntoView {
     let bus = expect_context::<ToastBus>();
+    let table_viewport = NodeRef::<leptos::html::Div>::new();
     view! {
-        <div class="results">
+        <fleet_ui::OverflowHint viewport=table_viewport/>
+        <div node_ref=table_viewport class="results" role="region" aria-label="Search results" tabindex="0">
             <Loaded
                 state=Signal::derive(move || LoadState::from_resource(rows.get()))
                 label="results"

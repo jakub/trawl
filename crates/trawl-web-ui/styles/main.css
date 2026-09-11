@@ -1544,3 +1544,49 @@
 .health-query-table code { white-space: pre-wrap; overflow-wrap: anywhere; }
 .health-query-id { display: block; margin-bottom: 5px; color: var(--ink-3); }
 @media (max-width: 640px) { .health-page { padding: 20px 16px; } .health-facts { gap: 16px 24px; } }
+
+/* The sidebar remains one mounted disclosure so field search and group
+ * expansion survive viewport changes. Match the media query in FacetSidebar. */
+.facet-panel { width: var(--facets-w); flex-shrink: 0; min-height: 0; }
+.facet-panel > summary { display: none; }
+.facet-panel > .facets { width: 100%; height: 100%; }
+.page, .health-page { min-width: 0; }
+.page-hd, .page-hd .actions, .health-heading { flex-wrap: wrap; }
+.page-hd > *, .health-heading > * { min-width: 0; max-width: 100%; }
+.page-hd .actions { flex-shrink: 1; }
+.sd-overview { grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); }
+.sd-card { min-width: 0; }
+.sd-ttl .name, .sd-ttl .sub { overflow-wrap: anywhere; }
+@media (max-width: 900px) {
+  .search-layout { flex-direction: column; overflow-y: auto; }
+  .facet-panel { width: auto; border-bottom: 1px solid var(--line); background: var(--panel); }
+  .facet-panel > summary { display: list-item; padding: 10px 12px; font-size: var(--fs-ui); font-weight: 500; color: var(--ink-2); cursor: pointer; }
+  .facet-panel .facet-count { color: var(--ink-3); font-weight: 400; margin-inline-start: 6px; }
+  .facet-panel > .facets { height: auto; max-height: min(45dvh, 360px); border-right: 0; }
+  .search-col { flex-shrink: 0; min-height: 480px; }
+  .statusbar { height: auto; min-height: var(--statusbar-h); flex-wrap: wrap; gap: 4px 10px; padding-block: 4px; }
+}
+@media (max-width: 600px) {
+  .page { padding: 16px 16px 24px; gap: 16px; }
+  .page-hd { gap: 12px; }
+  .editor-row { flex-direction: column; }
+  .editor-right { width: auto; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  .editor-tools { grid-column: 1 / -1; justify-content: flex-end; flex-wrap: wrap; gap: 8px; }
+  .editor-tools .tool { min-height: 28px; }
+  .search-col { min-height: 560px; }
+  .sd-overview { grid-template-columns: minmax(0, 1fr); grid-template-areas: "chart" "types" "top"; }
+  .stats-row { flex-wrap: wrap; }
+  .stat-card { flex-basis: 120px; min-width: 0; }
+}
+
+/* One scroll region keeps list headings aligned with wide rows. */
+.tbl-scroll { display: block; min-height: 180px; overflow: auto; }
+.tbl-scroll > .tbl-hd, .tbl-scroll > .tbl-body { min-width: var(--list-min-width); }
+.tbl-scroll .tbl-body { overflow: visible; }
+.tbl-scroll .tbl-hd { position: sticky; top: 0; z-index: 4; flex-shrink: 0; }
+.tbl-scroll:focus-visible, .results:focus-visible, .facet-panel > summary:focus-visible { outline: 2px solid var(--ring); outline-offset: -2px; }
+
+@media (max-width: 600px) {
+  .modal .m-ft { justify-content: flex-end; }
+  .modal .m-ft .hint { flex-basis: 100%; }
+}

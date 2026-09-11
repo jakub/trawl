@@ -37,6 +37,7 @@ use std::num::NonZeroUsize;
 #[component]
 #[allow(clippy::too_many_lines)] // page-level component: header + table + footer
 pub fn HistoryPage() -> impl IntoView {
+    let table_viewport = NodeRef::<leptos::html::Div>::new();
     let bus = expect_context::<ToastBus>();
     let location = use_location();
     let hpage = Memo::new(move |_| read_history_page(&location.search.get()));
@@ -228,7 +229,8 @@ pub fn HistoryPage() -> impl IntoView {
                 </div>
             </div>
 
-            <div class="tbl">
+            <fleet_ui::OverflowHint viewport=table_viewport/>
+            <div node_ref=table_viewport class="tbl tbl-scroll" role="region" aria-label="Search history" tabindex="0" style="--list-min-width:640px">
                 <div class="tbl-hd">
                     <div style="flex:0 0 72px">"When"</div>
                     <div style="flex:3; min-width:0">"Query"</div>

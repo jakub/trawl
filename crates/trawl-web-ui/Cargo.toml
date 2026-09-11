@@ -58,6 +58,7 @@ leptos_meta = "0.8"
 # with its own cleanup.
 leptos-use = { version = "0.19", default-features = false, features = [
     "use_event_listener",
+    "use_media_query",
     "use_window",
 ] }
 console_error_panic_hook = "0.1"

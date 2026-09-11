@@ -42,6 +42,7 @@ impl NetSort {
 #[component]
 #[allow(clippy::too_many_lines)]
 pub fn NetsPage() -> impl IntoView {
+    let table_viewport = NodeRef::<leptos::html::Div>::new();
     let bus = expect_context::<ToastBus>();
     let qm = use_query_map();
     let net_selected: Memo<Option<i64>> =
@@ -195,7 +196,8 @@ pub fn NetsPage() -> impl IntoView {
                 </div>
             </div>
 
-            <div class="tbl">
+            <fleet_ui::OverflowHint viewport=table_viewport/>
+            <div node_ref=table_viewport class="tbl tbl-scroll" role="region" aria-label="Saved queries" tabindex="0" style="--list-min-width:760px">
                 <div class="tbl-hd">
                     {sort_th(sort, NetSort::Name, NetSort::Name.default_desc(), "Name", "flex:2")}
                     <div class="th" style="flex:3">"Query"</div>

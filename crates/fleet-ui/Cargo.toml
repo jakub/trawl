@@ -42,7 +42,7 @@ gloo-timers   = { version = "0.4", features = ["futures"] }
 js-sys        = "0.3"
 leptos        = { version = "0.8", features = ["csr"] }
 leptos_router = { version = "0.8" }
-leptos-use    = { version = "0.19", default-features = false, features = ["use_event_listener", "use_media_query", "use_window"] }
+leptos-use    = { version = "0.19", default-features = false, features = ["use_event_listener", "use_media_query", "use_mutation_observer", "use_resize_observer", "use_window"] }
 wasm-bindgen  = "0.2"
 wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = [

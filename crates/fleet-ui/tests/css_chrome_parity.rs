@@ -15,7 +15,7 @@
 //!   * `.login-card .error-banner` re-establishes the login form's 16px
 //!     error spacing via a *more specific* selector over the base
 //!     `.error-banner`. Lose the override and login spacing shifts.
-//!   * `.shell` grid rows are `var(--topbar-h) 1fr auto` — the `auto`
+//!   * `.shell` grid rows are `auto minmax(0, 1fr) auto` — the `auto`
 //!     row lets a footer-less app collapse the footer to zero while
 //!     trawl's statusbar sizes itself.
 //!   * The six chrome keyframes ship from fleet-ui.css.
@@ -145,8 +145,8 @@ fn login_shell_declares_no_background() {
 #[test]
 fn shell_grid_has_auto_footer_row() {
     assert!(
-        rule_body(".shell").contains("grid-template-rows: var(--topbar-h) 1fr auto"),
-        "`.shell` grid rows must be `var(--topbar-h) 1fr auto` — the `auto` \
+        rule_body(".shell").contains("grid-template-rows: auto minmax(0, 1fr) auto"),
+        "`.shell` grid rows must be `auto minmax(0, 1fr) auto` — the `auto` \
          footer row collapses to zero footer-less and sizes trawl's statusbar"
     );
 }

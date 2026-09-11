@@ -16,6 +16,7 @@ use fleet_ui::{LoadState, Loaded, OffsetPager, PageTotal, PageWindow, SearchInpu
 #[component]
 #[allow(clippy::too_many_lines)]
 pub fn RunsPage() -> impl IntoView {
+    let table_viewport = NodeRef::<leptos::html::Div>::new();
     let page = RwSignal::new(0usize);
     let filter = RwSignal::new(String::new());
 
@@ -89,7 +90,8 @@ pub fn RunsPage() -> impl IntoView {
                 }}
             </div>
 
-            <div class="tbl" style="margin-top:16px">
+            <fleet_ui::OverflowHint viewport=table_viewport/>
+            <div node_ref=table_viewport class="tbl tbl-scroll" role="region" aria-label="Recent runs" tabindex="0" style="--list-min-width:560px;margin-top:16px">
                 <div class="tbl-hd">
                     <div style="flex:1">"Net"</div>
                     <div style="flex:0 0 70px">"Status"</div>

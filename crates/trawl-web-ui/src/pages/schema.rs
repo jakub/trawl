@@ -96,6 +96,7 @@ impl SvcSort {
 #[component]
 #[allow(clippy::too_many_lines)]
 pub fn SchemaPage() -> impl IntoView {
+    let table_viewport = NodeRef::<leptos::html::Div>::new();
     let qm = use_query_map();
     // An empty param is an absent one: `?svc=` / `?field=` reach here
     // from a hand-edited URL, and an empty name resolves to nothing.
@@ -313,7 +314,8 @@ pub fn SchemaPage() -> impl IntoView {
                 </div>
             </div>
 
-            <div class="tbl">
+            <fleet_ui::OverflowHint viewport=table_viewport/>
+            <div node_ref=table_viewport class="tbl tbl-scroll" role="region" aria-label="Services" tabindex="0" style="--list-min-width:880px">
                 <div class="tbl-hd">
                     {sort_th(sort, SvcSort::Name, SvcSort::Name.default_desc(), "Service", "flex:2; min-width:0")}
                     <div class="th" style="flex:0 0 110px">"Activity"</div>
