@@ -237,7 +237,7 @@ pub fn HistoryPage() -> impl IntoView {
                         resource.get().map(|result| result.map(|(_, resp)| resp))
                     ))
                     label="history"
-                    retry=Callback::new(move |()| resource.refetch())
+                    retry=Callback::new(move |()| { resource.set(None); resource.refetch(); })
                     render=Box::new(move |resp: trawl_api::HistoryResponse| {
                         let filtered = filtered_rows.get();
 

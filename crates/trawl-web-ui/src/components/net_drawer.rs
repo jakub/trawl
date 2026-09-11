@@ -565,7 +565,7 @@ fn RunsPane(net_id: i64, bus: ToastBus, on_search: Callback<String>) -> impl Int
             <Loaded
                 state=Signal::derive(move || LoadState::from_resource(runs.get()))
                 label="runs"
-                retry=Callback::new(move |()| runs.refetch())
+                retry=Callback::new(move |()| { runs.set(None); runs.refetch(); })
                 render=Box::new(move |(fetched_page, resp): (usize, trawl_api::ListReportRunsResponse)| {
                         let now = now_ms();
                         let returned = resp.runs.len();
@@ -671,7 +671,7 @@ fn RunResultPreview(
             <Loaded
                 state=Signal::derive(move || LoadState::from_resource(result.get()))
                 label="result"
-                retry=Callback::new(move |()| result.refetch())
+                retry=Callback::new(move |()| { result.set(None); result.refetch(); })
                 render=Box::new(move |resp: trawl_api::ReportRunResponse| {
                     match resp.result {
                         None => view! {

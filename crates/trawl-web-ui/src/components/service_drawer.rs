@@ -149,7 +149,7 @@ pub fn ServiceDrawer(
                         <FieldsPane
                             svc=svc_for_fields.clone()
                             cardinality=cardinality_sig
-                            on_retry_cardinality=Callback::new(move |()| cardinality.refetch())
+                            on_retry_cardinality=Callback::new(move |()| { cardinality.set(None); cardinality.refetch(); })
                             focus_field=focus_field
                             on_use_field=on_use_field
                             on_open_field=on_open_field
@@ -164,7 +164,7 @@ pub fn ServiceDrawer(
                         <OverviewPane
                             svc=svc_for_over.clone()
                             cardinality=cardinality_sig
-                            on_retry_cardinality=Callback::new(move |()| cardinality.refetch())
+                            on_retry_cardinality=Callback::new(move |()| { cardinality.set(None); cardinality.refetch(); })
                             on_use_field=on_use_field
                         />
                     }.into_any()
@@ -525,7 +525,7 @@ fn FieldDetail(
                 <Loaded
                     state=Signal::derive(move || LoadState::from_resource(top.get()))
                     label="values"
-                    retry=Callback::new(move |()| top.refetch())
+                    retry=Callback::new(move |()| { top.set(None); top.refetch(); })
                     render=Box::new(move |resp: QueryResponse| {
                         let rows = parse_top_values(&resp, &field_name, count_column);
                         if rows.is_empty() {
@@ -827,7 +827,7 @@ fn HistogramChart(resource: LocalResource<Result<QueryResponse, api::ApiError>>)
         <Loaded
             state=Signal::derive(move || LoadState::from_resource(resource.get()))
             label="histogram"
-            retry=Callback::new(move |()| resource.refetch())
+            retry=Callback::new(move |()| { resource.set(None); resource.refetch(); })
             render=Box::new(move |resp: QueryResponse| {
                 let slots = build_histogram(&resp);
                 if slots.is_empty() {

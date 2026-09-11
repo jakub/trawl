@@ -202,7 +202,7 @@ pub fn NetsPage() -> impl IntoView {
                     <Loaded
                         state=Signal::derive(move || LoadState::from_resource(nets.get()))
                         label="nets"
-                        retry=Callback::new(move |()| nets.refetch())
+                        retry=Callback::new(move |()| { nets.set(None); nets.refetch(); })
                         render=Box::new(move |resp: trawl_api::ListSavedResponse| {
                                 let now = now_ms();
                                 let needle = filter.get().to_lowercase();

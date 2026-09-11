@@ -320,7 +320,7 @@ pub fn SchemaPage() -> impl IntoView {
                     <Loaded
                         state=Signal::derive(move || LoadState::from_resource(services.get()))
                         label="schema"
-                        retry=Callback::new(move |()| services.refetch())
+                        retry=Callback::new(move |()| { services.set(None); services.refetch(); })
                         render=Box::new(move |resp: trawl_api::ServiceSchemaResponse| {
                             let needle = filter.get().to_lowercase();
                             let mut visible: Vec<ServiceSchema> = resp.services.iter()

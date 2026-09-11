@@ -58,7 +58,7 @@ pub fn RunsPage() -> impl IntoView {
                         <Loaded
                             state=Signal::derive(move || LoadState::from_resource(nets_for_stats.get()))
                             label="active nets"
-                            retry=Callback::new(move |()| nets_for_stats.refetch())
+                            retry=Callback::new(move |()| { nets_for_stats.set(None); nets_for_stats.refetch(); })
                             render=Box::new(|resp: trawl_api::ListSavedResponse| {
                                 resp.queries.iter().filter(|q| q.schedule.as_ref().is_some_and(|s| s.enabled))
                                     .count().to_string().into_any()
@@ -72,7 +72,7 @@ pub fn RunsPage() -> impl IntoView {
                         <Loaded
                             state=Signal::derive(move || LoadState::from_resource(stats.get()))
                             label="success rate"
-                            retry=Callback::new(move |()| stats.refetch())
+                            retry=Callback::new(move |()| { stats.set(None); stats.refetch(); })
                             render=Box::new(|s: trawl_api::RunsStatsResponse| {
                                 (s.success_count * 100).checked_div(s.total_runs)
                                     .map_or_else(|| "—".to_string(), |pct| format!("{pct}%")).into_any()
@@ -86,7 +86,7 @@ pub fn RunsPage() -> impl IntoView {
                         <Loaded
                             state=Signal::derive(move || LoadState::from_resource(stats.get()))
                             label="average duration"
-                            retry=Callback::new(move |()| stats.refetch())
+                            retry=Callback::new(move |()| { stats.set(None); stats.refetch(); })
                             render=Box::new(|s: trawl_api::RunsStatsResponse| {
                                 s.avg_duration_ms.map_or_else(|| "—".to_string(), format_duration).into_any()
                             })
@@ -101,7 +101,7 @@ pub fn RunsPage() -> impl IntoView {
                     <Loaded
                         state=Signal::derive(move || LoadState::from_resource(runs.get()))
                         label="runs"
-                        retry=Callback::new(move |()| runs.refetch())
+                        retry=Callback::new(move |()| { runs.set(None); runs.refetch(); })
                         render=Box::new(move |(fetched_page, resp): (usize, trawl_api::ListAllRunsResponse)| {
                                 let now = now_ms();
                                 let needle = filter.get().to_lowercase();

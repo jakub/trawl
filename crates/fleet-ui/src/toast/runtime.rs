@@ -96,25 +96,49 @@ impl Default for ToastBus {
 
 #[component]
 pub fn Toasts(bus: ToastBus) -> impl IntoView {
+    let host = NodeRef::<leptos::html::Div>::new();
+    let hovered = RwSignal::new(false);
+    let focused = RwSignal::new(false);
+    let paused = Signal::derive(move || hovered.get() || focused.get());
+    Effect::new(move |_| {
+        // Follow additions after the keyed list has rendered. While someone
+        // reads or operates the stack, keep its scroll position and pause all
+        // routine expiry, including notices outside the visible scroll area.
+        let _latest = bus
+            .stack
+            .with(|stack| stack.items().last().map(|toast| toast.id));
+        if !paused.get() {
+            request_animation_frame(move || {
+                if paused.try_get_untracked() == Some(false)
+                    && let Some(Some(element)) = host.try_get_untracked()
+                {
+                    element.set_scroll_top(element.scroll_height());
+                }
+            });
+        }
+    });
     view! {
         // Routine operation outcomes are polite. The region is mounted
         // empty before the first push; additions announce only new items.
-        <div class="toasts" role="status" aria-label="Notifications" aria-live="polite" aria-atomic="false" aria-relevant="additions">
+        <div node_ref=host class="toasts"
+            on:pointerenter=move |_| hovered.set(true)
+            on:pointerleave=move |_| hovered.set(false)
+            on:focusin=move |_| focused.set(true)
+            on:focusout=move |_| focused.set(false)
+            role="status" aria-label="Notifications" aria-live="polite" aria-atomic="false" aria-relevant="additions">
             <For
                 each=move || bus.stack.with(|s| s.items().to_vec())
                 key=|t| t.id
-                children=move |toast| view! { <ToastItem toast=toast bus=bus/> }
+                children=move |toast| view! { <ToastItem toast=toast bus=bus paused=paused/> }
             />
         </div>
     }
 }
 
 #[component]
-fn ToastItem(toast: Toast, bus: ToastBus) -> impl IntoView {
+fn ToastItem(toast: Toast, bus: ToastBus, paused: Signal<bool>) -> impl IntoView {
     let id = toast.id;
     let persistent = toast.kind == ToastKind::Error;
-    let hovered = RwSignal::new(false);
-    let focused = RwSignal::new(false);
     let timer = StoredValue::new(None::<TimeoutHandle>);
     Effect::new(move |_| {
         timer.update_value(|timer| {
@@ -123,8 +147,7 @@ fn ToastItem(toast: Toast, bus: ToastBus) -> impl IntoView {
             }
         });
         if !persistent
-            && !hovered.get()
-            && !focused.get()
+            && !paused.get()
             && let Ok(handle) =
                 set_timeout_with_handle(move || bus.dismiss(id), Duration::from_millis(4500))
         {
@@ -139,10 +162,6 @@ fn ToastItem(toast: Toast, bus: ToastBus) -> impl IntoView {
     view! {
         <div
             class=format!("toast {}", toast.kind.as_class())
-            on:pointerenter=move |_| hovered.set(true)
-            on:pointerleave=move |_| hovered.set(false)
-            on:focusin=move |_| focused.set(true)
-            on:focusout=move |_| focused.set(false)
         >
             <div class="toast-body">
                 <div class="title">{toast.title}</div>

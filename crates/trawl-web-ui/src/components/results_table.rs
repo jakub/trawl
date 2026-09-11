@@ -47,7 +47,7 @@ pub fn ResultsTable(
             <Loaded
                 state=Signal::derive(move || LoadState::from_resource(rows.get()))
                 label="results"
-                retry=Callback::new(move |()| rows.refetch())
+                retry=Callback::new(move |()| { rows.set(None); rows.refetch(); })
                 render=Box::new(move |resp: QueryResponse| view! {
                     <ResultsTableBody
                         resp=resp

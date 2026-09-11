@@ -63,6 +63,10 @@ test('persistent error stacks remain bounded and every dismiss control is reacha
   for (let i = 1; i <= 8; i++) {
     await save.click();
     await expect(page.locator('.toast.error')).toHaveCount(i);
+    await expect.poll(() => page.locator('.toast.error').last().evaluate(el => {
+      const item = el.getBoundingClientRect(), host = el.parentElement!.getBoundingClientRect();
+      return item.top >= host.top && item.bottom <= host.bottom;
+    })).toBe(true);
   }
   const host = page.locator('.toasts');
   const box = await host.boundingBox();
@@ -85,9 +89,12 @@ for (const [path, endpoint, filter] of [
   test(`resource retry preserves page context on ${path}`, async ({ page, request }) => {
     await request.post('/__ctl/reset', { data: { scenario: 'corpus' } });
     let fail = true, attempts = 0;
-    await page.route(`**${endpoint}*`, route => {
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    await page.route(`**${endpoint}*`, async route => {
       if (new URL(route.request().url()).pathname !== endpoint) return route.continue();
       attempts++;
+      if (!fail) await held;
       return fail ? route.fulfill({ status: 503, json: { error: 'Unavailable' } }) : route.continue();
     });
     await page.goto(path);
@@ -97,7 +104,10 @@ for (const [path, endpoint, filter] of [
     const url = page.url(), before = attempts;
     fail = false;
     await page.locator('.tbl').getByRole('button', { name: 'Retry', exact: true }).click();
-    await expect(page.locator('.tbl .load-hint.error')).toHaveCount(0);
+    await expect(page.locator('.tbl .load-hint')).toContainText('Loading');
+    await expect(page.locator('.tbl').getByRole('button', { name: 'Retry', exact: true })).toHaveCount(0);
+    release();
+    await expect(page.locator('.tbl .load-hint')).toHaveCount(0);
     await expect.poll(() => attempts).toBe(before + 1);
     await expect(input).toHaveValue('nginx');
     expect(page.url()).toBe(url);
@@ -220,3 +230,16 @@ for (const detail of [false, true]) {
     expect(page.url()).toBe(url);
   });
 }
+
+test('toast scroll boundary leaves room for its elevation shadow', async ({ page, context }) => {
+  await context.grantPermissions(['clipboard-read', 'clipboard-write']);
+  await page.goto('/search');
+  await page.locator('.editor-tools').getByRole('button', { name: 'Share', exact: true }).click();
+  const toast = page.locator('.toast');
+  await expect(toast).toBeVisible();
+  const space = await toast.evaluate(el => {
+    const item = el.getBoundingClientRect(), host = el.parentElement!.getBoundingClientRect();
+    return { left: item.left-host.left, right: host.right-item.right, top: item.top-host.top, bottom: host.bottom-item.bottom };
+  });
+  for (const gap of Object.values(space)) expect(gap).toBeGreaterThanOrEqual(24);
+});
