@@ -513,14 +513,19 @@ mod tests {
     /// The full ten-field envelope, assembled by the door.
     #[test]
     fn converted_event_carries_the_envelope() {
-        let raw = "<134>Mar 12 10:00:00 web01 nginx: GET /";
+        // Year-less timestamps resolve near arrival. A fixed calendar date
+        // becomes a future event for part of the year and earns a repair.
+        let raw = format!(
+            "<134>{} web01 nginx: GET /",
+            chrono::Local::now().format("%b %e %H:%M:%S")
+        );
         let lab = SyslogDoor {
             default_env: "lab".into(),
             ..door()
         };
         let event = lab
             .admit(
-                raw,
+                &raw,
                 "10.0.0.1".parse().unwrap(),
                 &HashMap::new(),
                 "syslog",
