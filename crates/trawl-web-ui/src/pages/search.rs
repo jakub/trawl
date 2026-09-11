@@ -565,6 +565,16 @@ pub fn Search() -> impl IntoView {
                     // The banner above IS the results pane while the
                     // link cannot be read.
                     ().into_any()
+                } else if mode.get() == Mode::Live
+                    && !is_chart_query.get()
+                    && stream_failure.get().is_some()
+                {
+                    view! {
+                        <div class="results-empty">
+                            <p role="alert">{move || stream_failure.get()}</p>
+                            <button type="button" on:click=move |_| retry_stream.run(())>"Retry live stream"</button>
+                        </div>
+                    }.into_any()
                 } else { match (active_tab.get(), mode.get()) {
                     (ResultsTab::Events, Mode::Snapshot) => view! {
                         <>

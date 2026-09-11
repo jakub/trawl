@@ -63,6 +63,12 @@ pub fn Chart(
     #[prop(optional, into)] failure: Signal<Option<&'static str>>,
     #[prop(optional)] on_retry: Option<Callback<()>>,
 ) -> impl IntoView {
+    let hint = Memo::new(move |_| {
+        failure.get().or_else(|| match snapshot.get() {
+            None => Some("Waiting for the first live aggregation snapshot."),
+            Some(result) => chart_hint(&result, &query.get()),
+        })
+    });
     let node_ref = NodeRef::<leptos::html::Div>::new();
     let handle: StoredValue<Option<ChartHandle>, leptos::prelude::LocalStorage> =
         StoredValue::new_local(None);
@@ -86,10 +92,7 @@ pub fn Chart(
         };
         let measured_width = width.get();
         let result = snapshot.get();
-        let query = query.get();
-        let failure = failure.get();
-        let Some(result) = result.filter(|r| failure.is_none() && chart_hint(r, &query).is_none())
-        else {
+        let Some(result) = result.filter(|_| hint.get().is_none()) else {
             handle.update_value(|slot| {
                 if let Some(h) = slot.take() {
                     h.destroy();
@@ -145,15 +148,12 @@ pub fn Chart(
 
     view! {
         <div class="visualization">
-            {move || failure.get().or_else(|| match snapshot.get() {
-                None => Some("Waiting for the first live aggregation snapshot."),
-                Some(result) => chart_hint(&result, &query.get()),
-            }).map(|hint| view! { <p class="results-empty" role="status">{hint}</p> })}
+            {move || hint.get().map(|hint| view! { <p class="results-empty" role="status">{hint}</p> })}
             {move || failure.get().and(on_retry).map(|retry| view! {
                 <button type="button" on:click=move |_| retry.run(())>"Retry live stream"</button>
             })}
             <div class="chart" node_ref=node_ref></div>
-            {move || snapshot.get().filter(|r| failure.get().is_none() && chart_hint(r, &query.get()).is_none()).map(|_| view! {
+            {move || hint.get().is_none().then(|| view! {
                 <p class="chart-note">"Count metrics by result position, up to six series. Open Events for exact times and values."</p>
             })}
         </div>
