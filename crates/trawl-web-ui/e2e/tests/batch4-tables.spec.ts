@@ -141,12 +141,15 @@ test('Net run preview stays a native button and expands into a spanning table ce
 test('live-tail wraps the whole message including unbroken suffixes', async ({ page, request }) => {
   await resetScenario(request, 'corpus');
   const message = `start ${'error details '.repeat(90)}${'x'.repeat(200)} UNIQUE-END`;
+  // This geometry fixture sends one event. Delay reconnection beyond the
+  // 20-second test timeout so the closed response cannot replay that event.
   await page.route('**/api/v1/stream?*', route => route.fulfill({
-    contentType: 'text/event-stream', body: `event: data\ndata: ${JSON.stringify({ _time: '2026-09-10T12:00:00Z', message })}\n\n`,
+    contentType: 'text/event-stream', body: `retry: 60000\nevent: data\ndata: ${JSON.stringify({ _time: '2026-09-10T12:00:00Z', message })}\n\n`,
   }));
   await page.setViewportSize({ width: 390, height: 900 });
   await page.goto('/search/schema?svc=nginx&stab=tail');
   const msg = page.locator('.tl-row .msg').first();
+  await expect(page.locator('.tl-row')).toHaveCount(1);
   await expect(msg).toHaveText(message);
   const geometry = await msg.evaluate(el => {
     const range = document.createRange();
@@ -171,4 +174,5 @@ test('live-tail wraps the whole message including unbroken suffixes', async ({ p
     range.setEnd(el.firstChild!, el.textContent!.length);
     return range.getBoundingClientRect().bottom <= el.closest('.tl-stream')!.getBoundingClientRect().bottom;
   })).toBe(true);
+  await expect(page.locator('.tl-row')).toHaveCount(1);
 });

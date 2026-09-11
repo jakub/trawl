@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-import { test, expect } from '../fixtures';
+import { test, expect, resetScenario } from '../fixtures';
 import type { Locator, Page } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
 
@@ -22,7 +22,7 @@ async function noPageOverflow(page: Page) {
 
 for (const width of [320, 720, 1024, 1440]) {
   test(`responsive search keeps navigation and actions reachable at ${width}px`, async ({ page, request }) => {
-    await request.post('/__ctl/reset', { data: { scenario: 'corpus' } });
+    await resetScenario(request, 'corpus');
     await page.setViewportSize({ width, height: 900 });
     await page.goto('/search?q=service%3Dnginx');
     await expect(page.locator('.results-table tbody tr')).toHaveCount(8);
@@ -48,7 +48,7 @@ for (const width of [320, 720, 1024, 1440]) {
 }
 
 test('responsive filters preserve field search, expanded groups and URL filters across layouts', async ({ page, request }) => {
-  await request.post('/__ctl/reset', { data: { scenario: 'corpus' } });
+  await resetScenario(request, 'corpus');
   await page.setViewportSize({ width: 720, height: 900 });
   await page.goto('/search?q=service%3Dnginx');
   const panel = page.locator('.facet-panel'), summary = panel.locator('summary');
@@ -70,8 +70,19 @@ test('responsive filters preserve field search, expanded groups and URL filters 
   await expect(summary).not.toBeVisible();
   await expect(needle).toHaveValue('0');
   await expect(panel.locator('.v.selected .n')).toHaveText('web-01');
+  // Clear the compact disclosure state before testing focus-driven reopening.
+  await page.setViewportSize({ width: 720, height: 900 });
+  await expect(summary).toBeVisible();
+  await Promise.all([
+    panel.evaluate(el => new Promise<void>(resolve => el.addEventListener('toggle', () => resolve(), { once: true }))),
+    summary.click(),
+  ]);
+  await expect(panel).not.toHaveAttribute('open', '');
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await expect(needle).toBeVisible();
   await needle.focus();
   await page.setViewportSize({ width: 320, height: 900 });
+  await expect(panel).toHaveAttribute('open', '');
   await expect(needle).toBeFocused();
   await expect(needle).toBeVisible();
   await noPageOverflow(page);
@@ -80,7 +91,7 @@ test('responsive filters preserve field search, expanded groups and URL filters 
 test('responsive page headers and labelled list scrolling keep controls and columns reachable', async ({ page, request }) => {
   await page.setViewportSize({ width: 320, height: 900 });
   for (const path of ['/search/history', '/search/schema', '/jobs/nets', '/jobs/runs']) {
-    await request.post('/__ctl/reset', { data: { scenario: 'corpus' } });
+    await resetScenario(request, 'corpus');
     await page.goto(path);
     await expect(page.locator('.tbl-row').first()).toBeVisible();
     await noPageOverflow(page);
@@ -95,11 +106,11 @@ test('responsive page headers and labelled list scrolling keep controls and colu
     await expect.poll(() => scroller.evaluate(e => e.scrollLeft)).toBeGreaterThan(0);
     expect(await page.locator('.fleet-table thead').evaluate(e => e.getBoundingClientRect().x)).toBeLessThan(old);
   }
-  await request.post('/__ctl/reset', { data: { scenario: 'health-admin' } });
+  await resetScenario(request, 'health-admin');
   await page.goto('/settings/health');
   await insideViewport(page.getByRole('button', { name: 'Refresh', exact: true }));
   await noPageOverflow(page);
-  await request.post('/__ctl/reset', { data: { scenario: 'unauth' } });
+  await resetScenario(request, 'unauth');
   await page.goto('/login');
   await insideViewport(page.locator('.login-card'));
   for (const control of await page.locator('.login-card input, .login-card button').all()) await insideViewport(control);
@@ -107,7 +118,7 @@ test('responsive page headers and labelled list scrolling keep controls and colu
 });
 
 test('scroll instructions follow actual overflow as the viewport and results change', async ({ page, request }) => {
-  await request.post('/__ctl/reset', { data: { scenario: 'corpus' } });
+  await resetScenario(request, 'corpus');
   for (const [path, width] of [['/jobs/runs', 720], ['/search/history', 1024]] as const) {
     await page.setViewportSize({ width, height: 900 });
     await page.goto(path);
@@ -131,7 +142,7 @@ test('scroll instructions follow actual overflow as the viewport and results cha
 
 for (const width of [320, 720]) {
   test(`responsive Repin keeps footer visible through normal and forced plans at ${width}x450`, async ({ page, request }) => {
-    await request.post('/__ctl/reset', { data: { scenario: 'corpus' } });
+    await resetScenario(request, 'corpus');
     await page.setViewportSize({ width, height: 450 });
     await page.route('**/api/auth/me', async route => {
       const response = await route.fetch(), json = await response.json();

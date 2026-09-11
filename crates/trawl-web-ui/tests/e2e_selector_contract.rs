@@ -970,6 +970,18 @@ const CONTRACTS: &[Contract] = &[
         assignment: "tableSortControl: '.fleet-table thead .th.sortable button',",
         source_path: "src/pages/schema.rs",
         source: SCHEMA_RS,
+        hook: "<thead>",
+    },
+    Contract {
+        assignment: "tableSortControl: '.fleet-table thead .th.sortable button',",
+        source_path: "src/pages/nets.rs",
+        source: NETS_RS,
+        hook: "<thead>",
+    },
+    Contract {
+        assignment: "tableSortControl: '.fleet-table thead .th.sortable button',",
+        source_path: "src/pages/schema.rs",
+        source: SCHEMA_RS,
         hook: "class=\"fleet-table schema-table\"",
     },
     Contract {
@@ -1267,6 +1279,18 @@ const CONTRACTS: &[Contract] = &[
         source_path: "../fleet-ui/src/drawer.rs",
         source: DRAWER_RS,
         hook: "class=\"sd-body\"",
+    },
+    Contract {
+        assignment: "netRunRow: '.sd-body .run-preview-table > tbody > .tbl-row',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "class=\"fleet-table run-preview-table\"",
+    },
+    Contract {
+        assignment: "netRunRow: '.sd-body .run-preview-table > tbody > .tbl-row',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "</tr></thead><tbody>",
     },
     Contract {
         assignment: "netRunRow: '.sd-body .run-preview-table > tbody > .tbl-row',",

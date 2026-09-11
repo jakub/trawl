@@ -80,8 +80,7 @@ for (const colorScheme of ['light', 'dark'] as const) {
       const b = luminance(background);
       return { outline, background, ratio: (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05) };
     });
-    console.log(`Schedule switch ${colorScheme}: ${JSON.stringify(contrast)}`);
-    expect(contrast.ratio, `focused switch against schedule card in ${colorScheme}`).toBeGreaterThanOrEqual(3);
+    expect(contrast.ratio, `focused switch against schedule card in ${colorScheme}: ${JSON.stringify(contrast)}`).toBeGreaterThanOrEqual(3);
     const checked = await toggle.isChecked();
     await page.keyboard.press('Space');
     await expect(toggle).toBeChecked({ checked: !checked });
@@ -130,14 +129,16 @@ test('forced colors retains a visible navigation outline', async ({ page }) => {
   await expect(search).toHaveCSS('outline-width', '2px');
 });
 
-test('Tab draws focus on the visible schedule switch track', async ({ page, request }) => {
+test('schedule editor opens without editing the saved query', async ({ page, request }) => {
   await resetScenario(request, 'corpus');
   await page.goto(`/jobs/nets?net=${CORPUS.netId}&ntab=query`);
   const drawer = page.locator('.sd-drawer');
+  await expect(drawer.getByRole('textbox', { name: 'Query', exact: true })).toHaveCount(0);
   await drawer.getByRole('button', { name: '+ Add Schedule', exact: true }).click();
-  await drawer.getByRole('spinbutton').focus();
-  await page.keyboard.press('Tab');
-  await expect(drawer.getByRole('checkbox')).toBeFocused();
-  await expect(drawer.locator('.toggle-slider')).toHaveCSS('outline-style', 'solid');
-  await expect(drawer.locator('.toggle-slider')).toHaveCSS('outline-width', '2px');
+  await expect(drawer.getByRole('button', { name: 'Edit', exact: true })).toBeVisible();
+  await expect(drawer.getByRole('textbox', { name: 'Query', exact: true })).toHaveCount(0);
+  await drawer.getByRole('textbox', { name: 'Interval', exact: true }).fill('10m');
+  await expect(drawer.getByRole('textbox', { name: 'Interval', exact: true })).toHaveValue('10m');
+  await expect(drawer.getByRole('checkbox', { name: 'Schedule enabled', exact: true })).toBeAttached();
+  await expect(drawer.locator('.toggle-slider')).toBeVisible();
 });

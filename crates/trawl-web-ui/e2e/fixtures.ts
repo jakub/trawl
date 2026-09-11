@@ -166,7 +166,9 @@ export const CORPUS = {
  * at the top of the test body — `beforeEach` above already reset to
  * 'default' by the time the body runs. */
 export async function resetScenario(request: import('@playwright/test').APIRequestContext, name: string) {
-  await request.post('/__ctl/reset', { data: { scenario: name } });
+  const response = await request.post('/__ctl/reset', { data: { scenario: name } });
+  expect(response.ok(), `reset ${name}: HTTP ${response.status()}`).toBe(true);
+  expect(await response.json()).toMatchObject({ ok: true, scenario: name });
 }
 
 /** Saved-query request bodies captured since the last scenario reset. */
