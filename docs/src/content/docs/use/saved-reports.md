@@ -24,8 +24,9 @@ for everyone.
 
 ## Add a schedule
 
-Open the net's **Query + Schedule** tab. Set **Interval** and **Max runs**,
-switch on **Schedule enabled**, and select **Save schedule**. The interval says
+Open the net's **Query + Schedule** tab. A new net shows `No schedule
+attached.`, so select **+ Add Schedule** first. Set **Interval** and
+**Max runs**, switch on **Schedule enabled**, and select **Save schedule**. The interval says
 how often the query runs, not how wide the data window is. For an hourly
 error report:
 
@@ -56,10 +57,12 @@ Open the net's **Runs** tab or the **Runs** page. Check the status, the
 execution time, and the result before you trust it. A failed run and a
 successful run with zero rows mean different things.
 
-Each run keeps the resolved query text with the concrete interval it ran,
-which explains why a report included an event. The same text can answer
-differently later, after retention or a repin, and the stored result stays as
-the record of that run. Select **Trigger run** only when you want a new run.
+Each run keeps the query text it ran. A run under a schedule window stores
+the absolute bounds it covered, which explains why a report included an
+event. A run without a window, including every run of the schedule above and
+every manual run, stores the saved text as written, so its `last=1h` stays
+relative and a rerun of that text reads a different hour. The stored result
+is the record of the run either way. Select **Trigger run** only when you want a new run.
 It changes the server, not only your screen.
 
 ## Reuse a report in a query

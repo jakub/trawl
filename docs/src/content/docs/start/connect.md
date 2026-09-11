@@ -39,7 +39,8 @@ chmod 0600 ~/.config/trawl/config.toml
 trawl query 'last=15m | head 20'
 ```
 
-Expect up to 20 events and a `20 row(s)` footer. Use the API URL, not the
+Expect up to 20 events and a footer with the number of rows returned, such
+as `3 row(s)`, or `no results` when nothing matched. Use the API URL, not the
 browser URL. Keep `--token` off the command line, because shell history keeps
 it. `TRAWL_TOKEN` in the environment overrides the file.
 

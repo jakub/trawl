@@ -13,7 +13,8 @@ more than one server.
 trawl --profile lab query 'service=nginx last=15m | head 20'
 ```
 
-Expect up to 20 rows and a `20 row(s)` footer. The `lab` profile must exist.
+Expect up to 20 rows and a footer with the number returned, such as
+`3 row(s)`. The `lab` profile must exist.
 Replace `nginx` with your service.
 
 ## Choose the output format

@@ -15,7 +15,8 @@ Quote the glob so `trawl` expands it, not your shell.
 trawl query --data '/path/to/logs/*.parquet' '* | head 5'
 ```
 
-Expect five rows and the footer `5 row(s)`. The column names tell you what to
+Expect up to five rows and a footer with the number returned, such as
+`5 row(s)`. The column names tell you what to
 filter on. Files from other tools have `_time` or `_severity` only if their
 writer added them.
 

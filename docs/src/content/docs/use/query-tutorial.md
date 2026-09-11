@@ -96,8 +96,8 @@ Expect the same row.
 service=tutorial last=1h | timechart span=5m count()
 ```
 
-In the browser, open **Visualization**. Expect one bar, because all three
-events fall in one five-minute bucket. For events still arriving, use
+In the browser, open **Visualization**. Expect a line with one point at
+count 3, because all three events fall in one five-minute bucket. For events still arriving, use
 [live tail](/use/live-tail/). To run a query again later, [save it](/use/saved-reports/).
 The [DSL reference](/reference/dsl/) lists every stage and function, time
 bounds, quoting, pinned types, and what runs in a stream.
