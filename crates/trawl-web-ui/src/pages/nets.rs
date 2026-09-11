@@ -16,7 +16,7 @@ use trawl_api::SavedQueryResponse;
 
 use crate::api;
 use crate::components::net_drawer::NetDrawer;
-use crate::components::sort_th::sort_th;
+use crate::components::sort_th::table_sort_th;
 use crate::state::query::{Mode, RangeSpec, navigator, report_refusal};
 use fleet_ui::time::{time_ago, time_until};
 use fleet_ui::{
@@ -197,15 +197,7 @@ pub fn NetsPage() -> impl IntoView {
             </div>
 
             <fleet_ui::OverflowHint viewport=table_viewport/>
-            <div node_ref=table_viewport class="tbl tbl-scroll" role="region" aria-label="Saved queries" tabindex="0" style="--list-min-width:760px">
-                <div class="tbl-hd">
-                    {sort_th(sort, NetSort::Name, NetSort::Name.default_desc(), "Name", "flex:2")}
-                    <div class="th" style="flex:3">"Query"</div>
-                    <div class="th" style="flex:0 0 80px">"Schedule"</div>
-                    {sort_th(sort, NetSort::LastRun, NetSort::LastRun.default_desc(), "Last run", "flex:0 0 140px")}
-                    {sort_th(sort, NetSort::Created, NetSort::Created.default_desc(), "Created", "flex:0 0 90px")}
-                    <div style="flex:0 0 40px"></div>
-                </div>
+                <div node_ref=table_viewport class="tbl fleet-table-frame tbl-scroll" role="region" aria-label="Saved queries" tabindex="0" style="--list-min-width:760px">
                 <div class="tbl-body">
                     <Loaded
                         state=Signal::derive(move || LoadState::from_resource(nets.get()))
@@ -278,6 +270,7 @@ pub fn NetsPage() -> impl IntoView {
                                                     view! {
                                                         <span>
                                                             <StatusDot tone=tone/>
+                                                                <span class="run-status">{run.status.clone()}</span>
                                                             " "
                                                             <span class="mono" style="color:var(--ink-2)">{when}</span>
                                                             {next_run_label.map(|label| view! {
@@ -312,22 +305,22 @@ pub fn NetsPage() -> impl IntoView {
                                     let href = format!("/jobs/nets?net={id}&ntab=query");
 
                                     view! {
-                                        <div class="tbl-row">
-                                            <div style="flex:2" class="mono">
+                                            <tr class="tbl-row">
+                                                <td class="mono">
                                                 <a class="row-stretch" href=href prop:replace=true>
                                                     {name.clone()}
                                                 </a>
-                                            </div>
-                                            <div style="flex:3; min-width:0" class="mono path">{query_text}</div>
-                                            <div style="flex:0 0 80px">{sched_badge}</div>
-                                            <div style="flex:0 0 140px">{last_run_view}</div>
-                                            <div style="flex:0 0 90px" class="mono">{created}</div>
+                                                </td>
+                                                <td style="min-width:0" class="mono path">{query_text}</td>
+                                                <td>{sched_badge}</td>
+                                                <td>{last_run_view}</td>
+                                                <td class="mono">{created}</td>
                                             // `row-menu` lifts the trigger above
                                             // the row control's stretched
                                             // pseudo-element; the base
                                             // `.actions-menu` rule belongs to
                                             // fleet-ui and stays there.
-                                            <div class="row-menu" style="flex:0 0 40px">
+                                                <td class="row-menu">
                                                 // fleet_ui::ActionsMenu owns the ⋯ trigger, the
                                                 // open state, and Escape/outside-click dismissal
                                                 // via the overlay stack.
@@ -349,12 +342,21 @@ pub fn NetsPage() -> impl IntoView {
                                                         })
                                                     }),
                                                 ]/>
-                                            </div>
-                                        </div>
+                                                </td>
+                                            </tr>
                                     }
                                 }).collect_view();
                                 view! {
-                                    {rows}
+                                    <table class="fleet-table nets-table" aria-label="Saved queries">
+                                        <thead><tr>
+                                            {table_sort_th(sort, NetSort::Name, NetSort::Name.default_desc(), "Name", "")}
+                                            <th scope="col" class="th">"Query"</th>
+                                            <th scope="col" class="th" style="width:100px">"Schedule"</th>
+                                            {table_sort_th(sort, NetSort::LastRun, NetSort::LastRun.default_desc(), "Last run", "width:160px")}
+                                            {table_sort_th(sort, NetSort::Created, NetSort::Created.default_desc(), "Created", "width:110px")}
+                                            <th scope="col" style="width:60px"><span class="sr-only">Actions</span></th>
+                                        </tr></thead>
+                                        <tbody>{rows}</tbody></table>
                                     // Summary-only Pager: this table is
                                     // unpaginated, so no prev/next controls.
                                     <Pager summary=format!("{count} net{}", if count == 1 { "" } else { "s" })/>

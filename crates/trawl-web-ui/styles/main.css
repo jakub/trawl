@@ -959,18 +959,7 @@
  * emits it. */
 
 /* Generic list table for page-level views (no sort, no expand). */
-.tbl {
-  border: 1px solid var(--line); border-radius: var(--radius-panel); background: var(--panel);
-  display: flex; flex-direction: column; min-height: 0; overflow: hidden;
-  flex: 1;
-}
 .tbl-body { flex: 1; min-height: 0; overflow-y: auto; }
-.tbl-hd {
-  display: flex; padding: 8px 14px; gap: 12px;
-  background: var(--panel-2); color: var(--ink-3);
-  font-family: var(--font-ui); font-size: var(--fs-ui); font-weight: 600;
-  border-bottom: 1px solid var(--line);
-}
 /* The one control a list row carries (ADR-0029). The row is the
  * containing block, so this pseudo-element covers the whole row and a
  * pointer anywhere on it reaches the single listener. The control and
@@ -1434,7 +1423,7 @@
 }
 .tl-row { display: grid; grid-template-columns: 70px 1fr; gap: 12px; animation: tail-in 220ms ease-out; }
 .tl-row .ts { color: var(--ink-3); }
-.tl-row .msg { color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tl-row .msg { color: var(--ink); white-space: pre-wrap; overflow-wrap: anywhere; min-width: 0; }
 @keyframes tail-in { from { opacity: 0; transform: translateY(-2px); } to { opacity: 1; transform: none; } }
 
 /* ── nets & runs (Jobs mode) ─────────────────────────────────── */
@@ -1580,9 +1569,8 @@
 
 /* One scroll region keeps list headings aligned with wide rows. */
 .tbl-scroll { display: block; min-height: 180px; overflow: auto; }
-.tbl-scroll > .tbl-hd, .tbl-scroll > .tbl-body { min-width: var(--list-min-width); }
+.tbl-scroll > .tbl-body { min-width: var(--list-min-width); }
 .tbl-scroll .tbl-body { overflow: visible; }
-.tbl-scroll .tbl-hd { position: sticky; top: 0; z-index: 4; flex-shrink: 0; }
 .tbl-scroll:focus-visible, .results:focus-visible, .facet-panel > summary:focus-visible { outline: 2px solid var(--ring); outline-offset: -2px; }
 
 @media (max-width: 600px) {
@@ -1597,3 +1585,21 @@
     animation: none;
   }
 }
+
+/* Column content and route-specific density stay in Trawl. */
+.fleet-table .tbl-row { display: table-row; }
+.fleet-table th.th, .fleet-table td.svc-cell, .fleet-table td.row-act { display: table-cell; }
+.fleet-table .svc-cell .row-stretch { display: block; }
+.fleet-table .svc-cell .name { white-space: normal; overflow-wrap: anywhere; }
+.fleet-table .freshness { display: inline; font-size: var(--fs-ui); color: var(--ink-3); }
+.fleet-table .run-status { margin-inline-start: 4px; }
+.fleet-table.history-table > tbody > tr > td { vertical-align: top; }
+.fleet-table .row-act { white-space: nowrap; }
+.fleet-table th .th { justify-content: inherit; }
+.fleet-table th[style*="text-align:right"] button { justify-content: flex-end; }
+
+.fleet-table .path { word-break: normal; overflow-wrap: anywhere; }
+.schema-table td.mono { white-space: nowrap; }
+.nets-table th:first-child { width: 25%; }
+
+.tl-stream:focus-visible { outline: 2px solid var(--ring); outline-offset: -2px; }

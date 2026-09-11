@@ -218,7 +218,7 @@ export const SEL = {
   /// crates/trawl-web-ui/src/pages/schema.rs — the services table's
   /// sortable header controls, rendered by `components/sort_th.rs`.
   /// The same selector reaches the nets table's one sortable header.
-  tableSortControl: '.tbl-hd .th.sortable button',
+  tableSortControl: '.fleet-table thead .th.sortable button',
   /// crates/trawl-web-ui/src/pages/history.rs — the Save as Net control
   /// nested inside the history row, above the stretched rerun button.
   /// Row-relative: `.link` belongs to the history row and nothing else.
@@ -316,7 +316,7 @@ export const SEL = {
   /// crates/trawl-web-ui/src/components/net_drawer.rs — one run row of
   /// the drawer's Runs tab. Scoped to the drawer body: the nets table
   /// underneath the drawer renders the very same row shape.
-  netRunRow: '.sd-body .tbl-body .tbl-row',
+  netRunRow: '.sd-body .run-preview-table > tbody > .tbl-row',
   /// The result preview an expanded run row mounts under itself. One
   /// per open row, which is how a spec says the row expanded ONCE.
   netRunPreview: '.sd-body .run-preview',

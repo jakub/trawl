@@ -45,7 +45,7 @@ use crate::components::service_card_fmt::{
     today_yesterday_utc,
 };
 use crate::components::service_drawer::ServiceDrawer;
-use crate::components::sort_th::sort_th;
+use crate::components::sort_th::table_sort_th;
 use crate::schema_nav::{BackNav, DEFAULT_SCHEMA_TAB, back_nav_stack, sanitize_tab};
 use crate::state::query::{Mode, RangeSpec, navigator, report_refusal};
 use fleet_ui::{
@@ -315,18 +315,7 @@ pub fn SchemaPage() -> impl IntoView {
             </div>
 
             <fleet_ui::OverflowHint viewport=table_viewport/>
-            <div node_ref=table_viewport class="tbl tbl-scroll" role="region" aria-label="Services" tabindex="0" style="--list-min-width:880px">
-                <div class="tbl-hd">
-                    {sort_th(sort, SvcSort::Name, SvcSort::Name.default_desc(), "Service", "flex:2; min-width:0")}
-                    <div class="th" style="flex:0 0 110px">"Activity"</div>
-                    {sort_th(sort, SvcSort::Earliest, SvcSort::Earliest.default_desc(), "Earliest", "flex:0 0 88px")}
-                    {sort_th(sort, SvcSort::Latest, SvcSort::Latest.default_desc(), "Latest", "flex:0 0 88px")}
-                    {sort_th(sort, SvcSort::Events, SvcSort::Events.default_desc(), "Events", "flex:0 0 64px; justify-content:flex-end")}
-                    {sort_th(sort, SvcSort::Storage, SvcSort::Storage.default_desc(), "Storage", "flex:0 0 80px; justify-content:flex-end")}
-                    {sort_th(sort, SvcSort::Fields, SvcSort::Fields.default_desc(), "Fields", "flex:0 0 56px; justify-content:flex-end")}
-                    {sort_th(sort, SvcSort::Coverage, SvcSort::Coverage.default_desc(), "Avg cov", "flex:0 0 68px; justify-content:flex-end")}
-                    <div style="flex:0 0 64px"></div>
-                </div>
+                <div node_ref=table_viewport class="tbl fleet-table-frame tbl-scroll" role="region" aria-label="Services" tabindex="0" style="--list-min-width:1040px">
                 <div class="tbl-body">
                     <Loaded
                         state=Signal::derive(move || LoadState::from_resource(services.get()))
@@ -429,15 +418,14 @@ pub fn SchemaPage() -> impl IntoView {
                                 let name_label_search = name.clone();
                                 let name_label_tail = name.clone();
                                 view! {
-                                    <div
+                                        <tr
                                         class="tbl-row"
                                         class:active=move || {
                                             svc_selected.get().as_deref()
                                                 == Some(name_for_active.as_str())
                                         }
                                     >
-                                        <div class="svc-cell" style="flex:2; min-width:0">
-                                            <StatusDot tone=dot_tone/>
+                                            <td class="svc-cell" style="min-width:0">
                                             <a
                                                 class="row-stretch"
                                                 href=href
@@ -454,6 +442,7 @@ pub fn SchemaPage() -> impl IntoView {
                                             >
                                                 <span class="mono name">{name}</span>
                                             </a>
+                                                <span class="freshness"><StatusDot tone=dot_tone/>" "{crate::service_card_fmt::freshness_label(&svc)}</span>
                                             // Count, not colour alone: the badge
                                             // says how many of this service's
                                             // fields the catalog calls degraded.
@@ -462,17 +451,17 @@ pub fn SchemaPage() -> impl IntoView {
                                                     {format!("{degraded} degraded")}
                                                 </Badge>
                                             })}
-                                        </div>
-                                        <div style="flex:0 0 110px">
+                                            </td>
+                                            <td>
                                             <Sparkline data=spark_data color=spark_color w=96 h=16/>
-                                        </div>
-                                        <div class="mono" style="flex:0 0 88px">{earliest}</div>
-                                        <div class="mono" style="flex:0 0 88px">{latest}</div>
-                                        <div class="num" style="flex:0 0 64px">{events_label}</div>
-                                        <div class="num" style="flex:0 0 80px">{storage_label}</div>
-                                        <div class="num" style="flex:0 0 56px">{field_count}</div>
-                                        <div class="num" style="flex:0 0 68px">{coverage_label}</div>
-                                        <div class="row-act" style="flex:0 0 64px">
+                                            </td>
+                                            <td class="mono">{earliest}</td>
+                                            <td class="mono">{latest}</td>
+                                            <td class="num">{events_label}</td>
+                                            <td class="num">{storage_label}</td>
+                                            <td class="num">{field_count}</td>
+                                            <td class="num">{coverage_label}</td>
+                                            <td class="row-act">
                                             // Commands, not places: both go
                                             // through the navigator, which
                                             // can refuse an over-bound query
@@ -494,12 +483,24 @@ pub fn SchemaPage() -> impl IntoView {
                                             >
                                                 <IconView icon=Icon::Bolt size=12 stroke_width=1.5/>
                                             </button>
-                                        </div>
-                                    </div>
+                                            </td>
+                                        </tr>
                                 }
                             }).collect::<Vec<_>>();
                             view! {
-                                {rows}
+                                    <table class="fleet-table schema-table" aria-label="Services">
+                                        <thead><tr>
+                                            {table_sort_th(sort, SvcSort::Name, SvcSort::Name.default_desc(), "Service", "")}
+                                            <th scope="col" class="th" style="width:130px">"Activity"</th>
+                                            {table_sort_th(sort, SvcSort::Earliest, SvcSort::Earliest.default_desc(), "Earliest", "width:108px")}
+                                            {table_sort_th(sort, SvcSort::Latest, SvcSort::Latest.default_desc(), "Latest", "width:108px")}
+                                            {table_sort_th(sort, SvcSort::Events, SvcSort::Events.default_desc(), "Events", "width:84px; text-align:right")}
+                                            {table_sort_th(sort, SvcSort::Storage, SvcSort::Storage.default_desc(), "Storage", "width:100px; text-align:right")}
+                                            {table_sort_th(sort, SvcSort::Fields, SvcSort::Fields.default_desc(), "Fields", "width:76px; text-align:right")}
+                                            {table_sort_th(sort, SvcSort::Coverage, SvcSort::Coverage.default_desc(), "Avg cov", "width:88px; text-align:right")}
+                                            <th scope="col" style="width:84px"><span class="sr-only">Actions</span></th>
+                                        </tr></thead>
+                                        <tbody>{rows}</tbody></table>
                                 // Summary-only Pager — the table is unpaginated.
                                 <Pager summary=format!(
                                     "{count} service{}",

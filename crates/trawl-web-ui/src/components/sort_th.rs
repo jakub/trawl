@@ -2,15 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Sortable table header cell, shared by the `.tbl` div tables (schema
-//! services, nets) and the service drawer's field list. Clicking the
-//! active header flips direction; a fresh key starts at its natural
-//! direction.
-//!
-//! The control is a button INSIDE the header cell, never the cell
-//! (ADR-0029). These are div tables with no ARIA table roles, so there
-//! is no `<th>` to carry `aria-sort` and the direction is spelled out
-//! in the button's accessible name instead.
+//! Sort controls shared by native management tables and the service
+//! drawer's field list. The native wrapper adds a scoped header and
+//! `aria-sort`; the field list keeps its div container. The button's
+//! accessible name includes the current sort direction in both cases.
 
 use leptos::prelude::*;
 
@@ -58,5 +53,26 @@ where
                 <span class="dir" aria-hidden="true">{move || sort_arrow(direction())}</span>
             </button>
         </div>
+    }
+}
+
+/// Native management table header. Sort policy stays with the caller.
+pub fn table_sort_th<K>(
+    sort: RwSignal<(K, bool)>,
+    key: K,
+    default_desc: bool,
+    label: &'static str,
+    style: &'static str,
+) -> impl IntoView
+where
+    K: Copy + PartialEq + Send + Sync + 'static,
+{
+    view! {
+        <th scope="col" style=style aria-sort=move || {
+            let (active, desc) = sort.get();
+            (active == key).then_some(if desc { "descending" } else { "ascending" })
+        }>
+            {sort_th(sort, key, default_desc, label, "")}
+        </th>
     }
 }

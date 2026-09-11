@@ -518,6 +518,7 @@ fn QuerySchedulePane(
 
 #[component]
 fn RunsPane(net_id: i64, bus: ToastBus, on_search: Callback<String>) -> impl IntoView {
+    let table_viewport = NodeRef::<leptos::html::Div>::new();
     let page = RwSignal::new(0usize);
     let expanded_run: RwSignal<Option<i64>> = RwSignal::new(None);
 
@@ -585,8 +586,8 @@ fn RunsPane(net_id: i64, bus: ToastBus, on_search: Callback<String>) -> impl Int
                             let is_expanded = move || expanded_run.get() == Some(run_id);
 
                             view! {
-                                <div class="tbl-row">
-                                    <div style="flex:0 0 80px" class="mono">
+                                <tr class="tbl-row">
+                                    <td class="mono">
                                         // The row's one control (ADR-0029),
                                         // stretched over the row: a pointer
                                         // anywhere on it toggles the run's
@@ -601,39 +602,39 @@ fn RunsPane(net_id: i64, bus: ToastBus, on_search: Callback<String>) -> impl Int
                                                 });
                                             }
                                         >{when}</button>
-                                    </div>
-                                    <div style="flex:0 0 70px">
+                                    </td>
+                                    <td>
                                         <StatusDot tone=tone/>
                                         " "
                                         <span style="font-size:11px">{status}</span>
-                                    </div>
-                                    <div style="flex:0 0 60px" class="mono">{dur}</div>
-                                    <div style="flex:0 0 50px; text-align:right" class="mono">{row_ct}</div>
-                                    <div style="flex:1; min-width:0; color:var(--red); font-size:11px" class="path">{err_msg}</div>
-                                </div>
+                                    </td>
+                                    <td class="mono">{dur}</td>
+                                    <td style="text-align:right" class="mono">{row_ct}</td>
+                                    <td style="min-width:0; color:var(--red); font-size:11px" class="path">{err_msg}</td>
+                                </tr>
                                 <Show when=is_expanded>
-                                    <RunResultPreview
+                                    <tr><td colspan="5"><RunResultPreview
                                         net_id=net_id
                                         run_id=run_id
                                         bus=bus
                                         on_search=on_search
-                                    />
+                                    /></td></tr>
                                 </Show>
                             }
                         }).collect_view();
 
                         view! {
-                            <div class="tbl">
-                                <div class="tbl-hd" style="font-size:11px">
-                                    <div style="flex:0 0 80px">"When"</div>
-                                    <div style="flex:0 0 70px">"Status"</div>
-                                    <div style="flex:0 0 60px">"Duration"</div>
-                                    <div style="flex:0 0 50px; text-align:right">"Rows"</div>
-                                    <div style="flex:1">"Error"</div>
-                                </div>
-                                <div class="tbl-body">
+                            <fleet_ui::OverflowHint viewport=table_viewport/>
+                            <div node_ref=table_viewport class="tbl fleet-table-frame tbl-scroll" role="region" aria-label="Net runs" tabindex="0" style="--list-min-width:480px">
+                                <table class="fleet-table run-preview-table" aria-label="Net runs"><thead><tr>
+                                    <th scope="col" style="width:100px">"When"</th>
+                                    <th scope="col" style="width:90px">"Status"</th>
+                                    <th scope="col" style="width:80px">"Duration"</th>
+                                    <th scope="col" style="width:70px; text-align:right">"Rows"</th>
+                                    <th scope="col">"Error"</th>
+                                </tr></thead><tbody>
                                     {rows}
-                                </div>
+                                </tbody></table>
                                 {if returned == 0 { Some(view! {
                                     <div class="tbl-empty">{if total == 0 && fetched_page == 0 {
                                             "No runs yet — attach a schedule to start."
@@ -711,7 +712,7 @@ fn ResultPreviewTable(result: QueryResult) -> impl IntoView {
         <table>
             <thead>
                 <tr>
-                    {cols.iter().map(|c| view! { <th>{c.name.clone()}</th> }).collect_view()}
+                    {cols.iter().map(|c| view! { <th scope="col">{c.name.clone()}</th> }).collect_view()}
                 </tr>
             </thead>
             <tbody>

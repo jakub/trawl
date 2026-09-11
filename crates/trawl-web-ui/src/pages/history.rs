@@ -230,14 +230,7 @@ pub fn HistoryPage() -> impl IntoView {
             </div>
 
             <fleet_ui::OverflowHint viewport=table_viewport/>
-            <div node_ref=table_viewport class="tbl tbl-scroll" role="region" aria-label="Search history" tabindex="0" style="--list-min-width:640px">
-                <div class="tbl-hd">
-                    <div style="flex:0 0 72px">"When"</div>
-                    <div style="flex:3; min-width:0">"Query"</div>
-                    <div style="flex:0 0 60px; text-align:right">"Events"</div>
-                    <div style="flex:0 0 60px; text-align:right">"Duration"</div>
-                    <div style="flex:0 0 72px; text-align:right"></div>
-                </div>
+                <div node_ref=table_viewport class="tbl fleet-table-frame tbl-scroll" role="region" aria-label="Search history" tabindex="0" style="--list-min-width:640px">
                 <div class="tbl-body">
                 <Loaded
                     state=Signal::derive(move || LoadState::from_resource(
@@ -250,7 +243,7 @@ pub fn HistoryPage() -> impl IntoView {
 
                         if filtered.is_empty() {
                             return view! {
-                                <div class="tbl-row" style="cursor:default">
+                                    <div class="tbl-empty">
                                     <span class="mono" style="color:var(--ink-3)">
                                         {if resp.entries.is_empty() {
                                             "No queries yet — run one in /search to see it here"
@@ -262,7 +255,7 @@ pub fn HistoryPage() -> impl IntoView {
                             }.into_any();
                         }
 
-                        filtered.into_iter().map(|h| {
+                            let rows = filtered.into_iter().map(|h| {
                             let q_for_row = h.query.clone();
                             let q_for_save = h.query.clone();
                             let on_rerun = on_rerun.clone();
@@ -273,11 +266,11 @@ pub fn HistoryPage() -> impl IntoView {
                             // load.
                             let executed_at = h.executed_at.clone();
                             view! {
-                                <div class="tbl-row">
-                                    <div style="flex:0 0 72px; color:var(--ink-3)" class="mono">
+                                    <tr class="tbl-row">
+                                        <td style="color:var(--ink-3)" class="mono">
                                         <When ts=executed_at/>
-                                    </div>
-                                    <div style="flex:3; min-width:0" class="mono path">
+                                        </td>
+                                        <td style="min-width:0" class="mono path">
                                         // A command, not a place: the rerun
                                         // goes through the navigator, which
                                         // REFUSES a stored query long enough
@@ -290,23 +283,34 @@ pub fn HistoryPage() -> impl IntoView {
                                         >
                                             {h.query.clone()}
                                         </button>
-                                    </div>
-                                    <div style="flex:0 0 60px; text-align:right" class="mono">
+                                        </td>
+                                        <td style="text-align:right" class="mono">
                                         {events}
-                                    </div>
-                                    <div style="flex:0 0 60px; text-align:right" class="mono">
+                                        </td>
+                                        <td style="text-align:right" class="mono">
                                         {duration}
-                                    </div>
-                                    <div style="flex:0 0 72px; text-align:right">
+                                        </td>
+                                        <td style="text-align:right">
                                         <button
                                             type="button"
                                             class="link"
                                             on:click=move |_| on_save_as_net(q_for_save.clone())
                                         >"Save as net"</button>
-                                    </div>
-                                </div>
+                                        </td>
+                                    </tr>
                             }
-                        }).collect::<Vec<_>>().into_any()
+                            }).collect::<Vec<_>>();
+                            view! {
+                                    <table class="fleet-table history-table" aria-label="Search history">
+                                        <thead><tr>
+                                            <th scope="col" style="width:92px">"When"</th>
+                                            <th scope="col">"Query"</th>
+                                            <th scope="col" style="width:80px; text-align:right">"Events"</th>
+                                            <th scope="col" style="width:90px; text-align:right">"Duration"</th>
+                                            <th scope="col" style="width:92px; text-align:right"><span class="sr-only">Actions</span></th>
+                                        </tr></thead>
+                                        <tbody>{rows}</tbody></table>
+                            }.into_any()
                     })
                 />
                 </div>

@@ -96,14 +96,7 @@ pub fn RunsPage() -> impl IntoView {
             </div>
 
             <fleet_ui::OverflowHint viewport=table_viewport/>
-            <div node_ref=table_viewport class="tbl tbl-scroll" role="region" aria-label="Recent runs" tabindex="0" style="--list-min-width:560px;margin-top:16px">
-                <div class="tbl-hd">
-                    <div style="flex:1">"Net"</div>
-                    <div style="flex:0 0 70px">"Status"</div>
-                    <div style="flex:0 0 80px">"When"</div>
-                    <div style="flex:0 0 60px">"Duration"</div>
-                    <div style="flex:0 0 50px; text-align:right">"Rows"</div>
-                </div>
+                <div node_ref=table_viewport class="tbl fleet-table-frame tbl-scroll" role="region" aria-label="Recent runs" tabindex="0" style="--list-min-width:560px;margin-top:16px">
                 <div class="tbl-body">
                     <Loaded
                         state=Signal::derive(move || LoadState::from_resource(runs.get()))
@@ -141,24 +134,32 @@ pub fn RunsPage() -> impl IntoView {
                                     let href = format!("/jobs/nets?net={net_id}&ntab=runs");
 
                                     view! {
-                                        <div class="tbl-row">
-                                            <div style="flex:1" class="mono">
+                                            <tr class="tbl-row">
+                                                <td class="mono">
                                                 <a class="row-stretch" href=href>{net_name}</a>
-                                            </div>
-                                            <div style="flex:0 0 70px">
+                                                </td>
+                                                <td>
                                                 <StatusDot tone=tone/>
                                                 " "
                                                 <span style="font-size:11px">{run_status}</span>
-                                            </div>
-                                            <div style="flex:0 0 80px" class="mono">{when}</div>
-                                            <div style="flex:0 0 60px" class="mono">{dur}</div>
-                                            <div style="flex:0 0 50px; text-align:right" class="mono">{row_ct}</div>
-                                        </div>
+                                                </td>
+                                                <td class="mono">{when}</td>
+                                                <td class="mono">{dur}</td>
+                                                <td style="text-align:right" class="mono">{row_ct}</td>
+                                            </tr>
                                     }
                                 }).collect_view();
 
                                 view! {
-                                    {rows}
+                                    <table class="fleet-table runs-table" aria-label="Recent runs">
+                                        <thead><tr>
+                                            <th scope="col">"Net"</th>
+                                            <th scope="col" style="width:90px">"Status"</th>
+                                            <th scope="col" style="width:100px">"When"</th>
+                                            <th scope="col" style="width:80px">"Duration"</th>
+                                            <th scope="col" style="width:70px; text-align:right">"Rows"</th>
+                                        </tr></thead>
+                                        <tbody>{rows}</tbody></table>
                                     {if returned == 0 { Some(view! {
                                         <div class="tbl-empty">{if total == 0 && fetched_page == 0 {
                                             "No runs yet — attach a schedule to a net to get started"

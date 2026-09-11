@@ -639,7 +639,7 @@ fn TailPane(svc: ServiceSchema, bus: ToastBus) -> impl IntoView {
                 </Btn>
             </div>
 
-            <div class="tl-stream">
+            <div class="tl-stream" role="region" aria-label="Live tail messages" tabindex="0">
                 {move || {
                     let rb = ring.read();
                     let total = rb.events.len();
@@ -1037,5 +1037,6 @@ fn HealthDot(svc: ServiceSchema) -> impl IntoView {
     } else {
         fleet_ui::StatusTone::Error
     };
-    view! { <fleet_ui::StatusDot tone=tone/> }
+    view! { <span class="service-freshness"><fleet_ui::StatusDot tone=tone/>
+    " "{super::service_card_fmt::freshness_label(&svc)}</span> }
 }
