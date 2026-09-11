@@ -601,6 +601,7 @@ fn TailPane(svc: ServiceSchema, bus: ToastBus) -> impl IntoView {
             ring,
             snapshot,
             lagged,
+            failure: None,
         };
         match start_stream(&q, sig) {
             Some(lc) => lifecycle.set_value(Some(lc)),

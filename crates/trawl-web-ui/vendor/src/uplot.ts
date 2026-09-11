@@ -23,6 +23,8 @@ export interface ChartOpts {
    * label by the viewer's own offset.
    */
   utc?: boolean;
+  /** Search snapshots use result positions instead of epoch seconds. */
+  rowIndex?: boolean;
 }
 
 export interface ChartHandle {
@@ -140,7 +142,7 @@ export function createChart(
       ? { tzDate: (ts: number) => uPlot.tzDate(new Date(ts * 1000), "Etc/UTC") }
       : {}),
     scales: {
-      x: { time: true, ...(bars ? { range: barRange } : {}) },
+      x: { time: !opts.rowIndex, ...(bars ? { range: barRange } : {}) },
       // Counts start at zero — letting uPlot auto-range the floor makes a
       // flat-ish series look far more dramatic than it is.
       y: { range: (_u, _min, max) => [0, Math.max(max, 1)] },

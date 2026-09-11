@@ -6,7 +6,7 @@
 
 use leptos::prelude::*;
 use trawl_api::display::extract_series;
-use trawl_api::value::QueryResult;
+use trawl_api::value::{QueryResult, Value};
 use wasm_bindgen::JsValue;
 
 use crate::interop::uplot::{ChartHandle, Opts, create_chart};
@@ -57,36 +57,79 @@ fn snapshot_to_aligned(result: &QueryResult) -> (JsValue, Vec<String>) {
 }
 
 #[component]
-pub fn Chart(#[prop(into)] snapshot: Signal<Option<QueryResult>>) -> impl IntoView {
+pub fn Chart(
+    #[prop(into)] snapshot: Signal<Option<QueryResult>>,
+    #[prop(into)] query: Signal<String>,
+    #[prop(optional, into)] failure: Signal<Option<&'static str>>,
+    #[prop(optional)] on_retry: Option<Callback<()>>,
+) -> impl IntoView {
     let node_ref = NodeRef::<leptos::html::Div>::new();
     let handle: StoredValue<Option<ChartHandle>, leptos::prelude::LocalStorage> =
         StoredValue::new_local(None);
+
+    let mounted_labels = StoredValue::new(Vec::<String>::new());
+    let width = RwSignal::new(0.0_f64);
+    // Measure the content box, excluding the chart host's padding. The
+    // observer disconnects with the component through leptos-use.
+    let _ = leptos_use::use_resize_observer(node_ref, move |entries, _| {
+        if let Some(entry) = entries.first() {
+            let next = entry.content_rect().width();
+            if (next - width.get_untracked()).abs() >= 0.5 {
+                width.set(next);
+            }
+        }
+    });
 
     Effect::new(move |_| {
         let Some(element) = node_ref.get() else {
             return;
         };
-        let Some(result) = snapshot.get() else {
+        let measured_width = width.get();
+        let result = snapshot.get();
+        let query = query.get();
+        let failure = failure.get();
+        let Some(result) = result.filter(|r| failure.is_none() && chart_hint(r, &query).is_none())
+        else {
+            handle.update_value(|slot| {
+                if let Some(h) = slot.take() {
+                    h.destroy();
+                }
+            });
+            mounted_labels.set_value(Vec::new());
             return;
         };
+        if measured_width <= 0.0 {
+            return;
+        }
         let (data, labels) = snapshot_to_aligned(&result);
         let html_el: web_sys::HtmlElement = (*element).clone().unchecked_into();
 
         handle.update_value(|slot| {
+            // Series labels belong to the chart options, so data-only updates
+            // are safe only while the series stay the same.
+            if mounted_labels.get_value() != labels {
+                if let Some(h) = slot.take() {
+                    h.destroy();
+                }
+                mounted_labels.set_value(labels.clone());
+            }
             if let Some(h) = slot.as_ref() {
                 h.set_data(data);
+                h.resize(measured_width, 320.0);
             } else {
                 // First snapshot — construct the chart. x values here are
                 // row indices, not real instants, so `utc` stays off.
                 let opts = Opts {
-                    width: f64::from(html_el.client_width()),
+                    width: measured_width,
                     height: 320.0,
                     series: &labels,
                     y_label: None,
                     bars: false,
                     utc: false,
                 };
-                let h = create_chart(&html_el, data, opts.to_js());
+                let options = opts.to_js();
+                let _ = js_sys::Reflect::set(&options, &"rowIndex".into(), &JsValue::TRUE);
+                let h = create_chart(&html_el, data, options);
                 *slot = Some(h);
             }
         });
@@ -100,7 +143,96 @@ pub fn Chart(#[prop(into)] snapshot: Signal<Option<QueryResult>>) -> impl IntoVi
         });
     });
 
-    view! { <div class="chart" node_ref=node_ref></div> }
+    view! {
+        <div class="visualization">
+            {move || failure.get().or_else(|| match snapshot.get() {
+                None => Some("Waiting for the first live aggregation snapshot."),
+                Some(result) => chart_hint(&result, &query.get()),
+            }).map(|hint| view! { <p class="results-empty" role="status">{hint}</p> })}
+            {move || failure.get().and(on_retry).map(|retry| view! {
+                <button type="button" on:click=move |_| retry.run(())>"Retry live stream"</button>
+            })}
+            <div class="chart" node_ref=node_ref></div>
+            {move || snapshot.get().filter(|r| failure.get().is_none() && chart_hint(r, &query.get()).is_none()).map(|_| view! {
+                <p class="chart-note">"Count metrics by result position, up to six series. Open Events for exact times and values."</p>
+            })}
+        </div>
+    }
 }
 
 use wasm_bindgen::JsCast;
+
+// The shared extractor converts metrics to unsigned counts. Refuse values
+// that conversion would truncate or replace with zero.
+fn chart_hint(result: &QueryResult, query: &str) -> Option<&'static str> {
+    // Column values cannot identify numeric group keys. Use parsed query
+    // stages before interpreting any numeric column as a metric. Refuse
+    // grouped results until this chart can align groups by actual time.
+    let parsed = trawl_core::parser::parse(query).ok();
+    let grouped = parsed.as_ref().is_some_and(|ast| {
+        ast.pipeline.iter().any(|stage| match &stage.node {
+            trawl_core::ast::PipeStage::Timechart(stage) => !stage.group_by.is_empty(),
+            trawl_core::ast::PipeStage::Stats(stage) => !stage.group_by.is_empty(),
+            trawl_core::ast::PipeStage::Pivot(_)
+            | trawl_core::ast::PipeStage::Top(_)
+            | trawl_core::ast::PipeStage::Rare(_) => true,
+            _ => false,
+        })
+    });
+    if grouped {
+        return Some(
+            "Grouped results are not supported by this chart. Use timechart without by, or open Events for exact group times and values.",
+        );
+    }
+    if result.rows.is_empty() {
+        return Some("No rows returned for this visualization.");
+    }
+    if !result.columns.iter().any(|c| c.name == "_time") {
+        return Some(
+            "Visualization requires a _time column and non-negative integer metrics. Use timechart count() or open Events for these results.",
+        );
+    }
+    let mut groups = 0;
+    let mut metrics = 0;
+    for (i, col) in result.columns.iter().enumerate() {
+        if col.name == "_time" {
+            continue;
+        }
+        if result
+            .rows
+            .iter()
+            .all(|r| matches!(r.get(i), Some(Value::String(_))))
+        {
+            groups += 1;
+        } else if result
+            .rows
+            .iter()
+            .all(|r| matches!(r.get(i), Some(Value::Integer(n)) if *n >= 0))
+        {
+            metrics += 1;
+        } else {
+            return Some(
+                "This chart supports non-negative integer metrics only. Open Events for fractional, negative, null, or mixed values.",
+            );
+        }
+    }
+    if groups > 0 {
+        return Some(
+            "This result includes non-metric columns. Use an ungrouped timechart query, or open Events for these rows.",
+        );
+    }
+    let timechart = parsed.as_ref().is_some_and(|ast| ast.pipeline.iter().any(|stage| {
+        matches!(&stage.node, trawl_core::ast::PipeStage::Timechart(chart) if chart.group_by.is_empty())
+    }));
+    if metrics > 1 && !timechart {
+        return Some(
+            "These numeric columns may include group keys. Use an ungrouped timechart query, or open Events for the exact values.",
+        );
+    }
+    if metrics == 0 {
+        return Some(
+            "Visualization requires _time and non-negative integer metrics. Open Events for these results.",
+        );
+    }
+    None
+}

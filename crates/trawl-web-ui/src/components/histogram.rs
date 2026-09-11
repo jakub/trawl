@@ -85,7 +85,40 @@ pub fn Histogram(
                 })
             />
         </div>
+        {move || rows.get().and_then(Result::ok).map(|resp| {
+            let buckets = build_buckets(&resp);
+            let ti = resp.result.columns.iter().position(|c| matches!(c.name.as_str(), "_time" | "time" | "timestamp" | "@timestamp"));
+            let times: Vec<f64> = resp.result.rows.iter().filter_map(|row| row.get(ti?).and_then(value_to_seconds)).filter(|t| t.is_finite()).collect();
+            let min = times.iter().copied().fold(f64::INFINITY, f64::min);
+            let max = times.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let width = (max - min).max(1.0) / 48.0;
+            (!buckets.is_empty()).then(|| view! {
+                <details class="bucket-data">
+                    <summary>"Histogram bucket data"</summary>
+                    <div class="bucket-scroll" tabindex="0" role="region" aria-label="Histogram bucket data">
+                        <table>
+                            <caption>"Current page only. Times are UTC, rounded outward to milliseconds. Counts use unrounded intervals."</caption>
+                            <thead><tr><th scope="col">"Start"</th><th scope="col">"End"</th><th scope="col">"Events"</th><th scope="col">"Errors"</th></tr></thead>
+                            <tbody>{buckets.into_iter().enumerate().map(|(i, b)| {
+                                let start = min + f64::from(u32::try_from(i).unwrap_or(0)) * width;
+                                view! { <tr><td>{bucket_time(start, false)}</td><td>{bucket_time(start + width, true)}</td><td>{b.ok + b.err}</td><td>{b.err}</td></tr> }
+                            }).collect::<Vec<_>>()}</tbody>
+                        </table>
+                    </div>
+                </details>
+            })
+        })}
     }
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn bucket_time(seconds: f64, end: bool) -> String {
+    let millis = seconds * 1000.0;
+    let bound = if end { millis.ceil() } else { millis.floor() };
+    chrono::DateTime::from_timestamp_millis(bound as i64).map_or_else(
+        || seconds.to_string(),
+        |dt| dt.format("%Y-%m-%d %H:%M:%S%.3f").to_string(),
+    )
 }
 
 fn build_buckets(resp: &QueryResponse) -> Vec<Bucket> {
@@ -109,7 +142,9 @@ fn build_buckets(resp: &QueryResponse) -> Vec<Bucket> {
             continue;
         };
         let is_err = crate::severity_cell::row_is_error(row, severity_idx);
-        events.push((t, is_err));
+        if t.is_finite() {
+            events.push((t, is_err));
+        }
     }
     if events.is_empty() {
         return Vec::new();
@@ -128,7 +163,9 @@ fn value_to_seconds(v: &Value) -> Option<f64> {
             if let Ok(n) = s.parse::<f64>() {
                 return Some(n);
             }
-            fleet_ui::time::parse_timestamp(s).map(|dt| dt.timestamp() as f64)
+            fleet_ui::time::parse_timestamp(s).map(|dt| {
+                dt.timestamp() as f64 + f64::from(dt.timestamp_subsec_nanos()) / 1_000_000_000.0
+            })
         }
         _ => None,
     }

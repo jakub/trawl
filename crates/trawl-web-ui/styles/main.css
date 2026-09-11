@@ -1603,3 +1603,11 @@
 .nets-table th:first-child { width: 25%; }
 
 .tl-stream:focus-visible { outline: 2px solid var(--ring); outline-offset: -2px; }
+
+.bucket-data { padding: 6px 14px; background: var(--panel); }
+.bucket-data summary { cursor: pointer; min-height: 32px; align-content: center; }
+.bucket-scroll { overflow: auto; max-height: 240px; }
+.bucket-data table { width: 100%; border-collapse: collapse; }
+.bucket-data th, .bucket-data td { text-align: start; padding: 6px 10px; white-space: nowrap; }
+.bucket-data caption { text-align: start; padding-block: 8px; }
+.chart-note { padding: 8px 14px; color: var(--ink-2); }
