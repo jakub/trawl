@@ -1,35 +1,28 @@
 ---
 title: Connect to a server
-description: Connect the browser or CLI to an existing Trawl installation.
+description: Sign in to an existing Trawl server from the browser or the CLI.
 ---
 
-Ask the operator for a browser URL or API URL and an API key with the
-permissions you need. Those URLs can differ: browsers use `trawl-web`, while
-the CLI talks directly to `trawld` over HTTPS. A name such as `reader` is a
-role label, not a fixed permission tier.
+Ask the operator for a URL and an API key. Browser URLs point at `trawl-web`
+and API URLs at `trawld`. The key's permissions, such as `query` and
+`schema_read`, decide what you can do, not its role name.
 
-## Use the browser
+## Sign in from the browser
 
-Open the browser URL and sign in with your API key. The browser proxy keeps
-the token in an encrypted session cookie; subsequent browser requests use
-that session. If your Fleet installation shares sessions, you may already
-be signed in through another Fleet application.
+1. Open the browser URL.
+2. Enter your key in **API key** and select **Sign In**.
+3. On Search, enter `last=15m | head 20` and select **Haul**, or press Ctrl+Enter.
 
-Start on Search and enter a bounded query such as:
-
-```text
-last=15m | head 20
-```
-
-Use **Haul** to run it. Follow the [browser guide](/reference/web-ui/) for
-filters, history, saved queries, and reports. If an action is unavailable,
-check the key's permissions with the operator instead of changing its role
-name locally.
+Expect up to 20 events in **Events** and **Connected** in the status bar.
+`trawl-web` keeps your key in an encrypted session cookie, and a shared Fleet
+session may have signed you in already. If a control is missing, ask the
+operator about the key's permissions. The [browser guide](/reference/web-ui/)
+covers the rest.
 
 ## Configure the CLI
 
-Install `trawl`, then create `~/.config/trawl/config.toml` with your editor.
-Keep the directory private and the file readable only by your account:
+[Install](/getting-started/) `trawl`, then create `~/.config/trawl/config.toml`,
+private to your account.
 
 ```bash
 install -d -m 0700 ~/.config/trawl
@@ -46,12 +39,13 @@ chmod 0600 ~/.config/trawl/config.toml
 trawl query 'last=15m | head 20'
 ```
 
-Use the operator's API URL, not the browser login URL. The example hostname
-is a placeholder. Avoid putting the token in `--token` commands that remain
-in shell history. The CLI also accepts `TRAWL_TOKEN`; an inherited value
-overrides the config token.
+Expect up to 20 events and a `20 row(s)` footer. Use the API URL, not the
+browser URL. Keep `--token` off the command line, because shell history keeps
+it. `TRAWL_TOKEN` in the environment overrides the file.
 
-## Keep servers in named profiles
+## Keep more than one server in profiles
+
+A profile overlays `[server]` for one command.
 
 ```toml
 [server]
@@ -68,23 +62,21 @@ trawl --profile lab query 'last=15m | head 20'
 trawl --profile lab
 ```
 
-`TRAWL_PROFILE` selects a profile too. Explicitly select the target before
-running an operational command. A profile can point at live data.
-Use `--config /path/to/client.toml` to keep a separate configuration file.
+The first command queries `lab` and the second opens the TUI against it.
+`TRAWL_PROFILE` selects a profile too. `--config /path/to/client.toml` reads a
+different file. Name the server every time you change something.
 
-## Resolve connection problems
+## Fix a connection problem
 
 | Symptom | Check |
 | --- | --- |
-| Connection refused or timed out | API hostname, port, network route, and daemon status |
-| Certificate validation error | Correct hostname, certificate chain, and client trust store |
-| Authentication rejected | Complete token, expiration/revocation, and an inherited `TRAWL_TOKEN` |
-| Permission denied | The permission required by this action, such as `query` or `schema_read` |
-| A successful query returns no rows | Time range, service spelling, and whether logs have arrived |
+| Connection refused or timed out | API host and port, network route, `trawld` running |
+| Certificate validation error | Hostname in the URL, certificate chain, your trust store |
+| Authentication rejected | Complete token, key expiry or revocation, inherited `TRAWL_TOKEN` |
+| Permission denied | The permission the action needs, such as `query` or `schema_read` |
+| A query returns no rows | Time range, service spelling, whether logs have arrived |
 
-For a local self-signed test server, `insecure = true` in `[server]` disables
-certificate verification. Use that only for the intended test connection;
-permanent connections should use a trusted certificate.
-
-Continue with [Build a query](/use/query-tutorial/) or
-[CLI and TUI workflows](/use/cli-tui/).
+For a self-signed test server, `insecure = true` under `[server]` or in the
+profile turns off certificate verification for that connection only. Anything
+permanent needs a trusted certificate. Continue with
+[Build a query](/use/query-tutorial/) or [CLI and TUI workflows](/use/cli-tui/).

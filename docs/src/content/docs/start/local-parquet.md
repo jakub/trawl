@@ -1,58 +1,59 @@
 ---
 title: Query local Parquet
-description: Inspect exported or existing Parquet files with the CLI and no server.
+description: Run queries against Parquet files on disk with the CLI and no server.
 ---
 
-Local mode runs a query against files you name. It needs the `trawl` binary
-and readable Parquet files, with no server, API key, PostgreSQL, or hot buffer.
-It is useful for an exported incident dataset or an archive on your laptop.
+`trawl query --data` runs a query against files you name, with no server,
+key, PostgreSQL, or hot buffer. Use it for an exported incident dataset or an
+archive on your laptop.
 
-## Start with a small result
+## Look at the first rows
 
-Quote the path so Trawl receives the glob rather than your shell expanding it:
+Quote the glob so `trawl` expands it, not your shell.
 
 ```bash
 trawl query --data '/path/to/logs/*.parquet' '* | head 5'
 ```
 
-Replace the example path with your files. The first result tells you their
-column names. Foreign Parquet files do not automatically have Trawl's envelope
-fields, so begin without `_time` or `_severity` assumptions.
+Expect five rows and the footer `5 row(s)`. The column names tell you what to
+filter on. Files from other tools have `_time` or `_severity` only if their
+writer added them.
 
-If the files carry a `service` column:
+## Count by a column
+
+If the files have a `service` column:
 
 ```bash
 trawl query --data '/path/to/logs/*.parquet' \
   '* | stats count() by service | sort -count'
 ```
 
-A recursive glob includes nested directories:
+Expect one row per service, largest first. A `**` glob includes nested
+directories:
 
 ```bash
 trawl query --data '/path/to/archive/**/*.parquet' \
   '* | head 20' --format json
 ```
 
-Narrow the file selection before running a large scan. Local mode has no
-server row cap; use `head`, an aggregation, or an output file deliberately.
+There is no server row cap here. Narrow the glob, add `head`, or aggregate
+before a large scan.
 
-## Work with an exported Trawl dataset
+## Query an exported Trawl dataset
 
-The [first-query tutorial](/getting-started/first-query/#try-embedded-mode-no-server)
-creates a Parquet export. Its canonical event time is `_time`. For an old
-export, an absolute interval is often more useful than `last=1h`:
+[Your first query](/getting-started/first-query/#query-the-export-without-a-server)
+creates a Parquet export. Its event time is `_time`. For an old export, use an
+absolute interval instead of `last=1h`:
 
 ```text
 earliest="2026-09-01T00:00:00Z" latest="2026-09-02T00:00:00Z" | stats count() by service
 ```
 
-The lower bound is inclusive; the upper bound is exclusive. An export does
-not bring the server's catalog pin snapshot with it. Do not assume every
-pin-aware comparison or severity token expression retains the server's
-interpretation in embedded mode. For a numeric exported `_severity` column,
-`_severity>=17` selects ERROR and higher severity numbers.
+The start is inclusive and the end is exclusive. An export has no catalog, so
+`_severity>=error` may not read as it does on the server. `_severity>=17`
+compares the number and selects ERROR and above.
 
-## Save the result
+## Save the result to a file
 
 ```bash
 trawl query --data '/path/to/logs/*.parquet' \
@@ -61,15 +62,15 @@ trawl query --data '/path/to/logs/*.parquet' \
   '* | stats count() by service' --format csv --output services.csv
 ```
 
-JSON output is one object per line. The output is data, not an HTTP response
-wrapper. See [Sharing and export](/use/sharing-export/) for format choices.
+Expect no output on success. JSON is one object per line with no HTTP
+envelope. [Share searches and export results](/use/sharing-export/) compares
+the formats.
 
-## Know the boundary
+## Know what a local query leaves out
 
-This is a file query, not a connection to your server. It does not include
-uncompacted events, saved-report storage, permissions, or the live field
-catalog. Files with incompatible types can fail to combine; local mode does
-not repair the corpus. Keep originals when investigating a damaged archive.
-
-Use [server mode](/start/connect/) when you need current hot events,
-catalog semantics, or live tail.
+A local query reads files, not your server: no hot buffer, saved reports,
+permissions, or field catalog, and no `from saved`. Files with incompatible
+column types can fail to combine, and nothing rewrites them, so keep the
+originals of a damaged archive. Use [a server connection](/start/connect/) for
+events still in the hot buffer, catalog types, or live tail. The
+[CLI reference](/reference/cli/#embedded-mode) calls this embedded mode.

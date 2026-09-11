@@ -1,30 +1,25 @@
 ---
 title: Installation
-description: Choose the Trawl components you need and install a consistent release.
+description: Install the Trawl client and server packages from APT, a release tarball, or source.
 ---
 
-If someone already runs Trawl for you, start with
-[Connect to a server](/start/connect/). If you have Parquet files to inspect,
-[local mode](/start/local-parquet/) needs only the CLI.
+If someone already runs Trawl for you, [connect to it](/start/connect/). To
+inspect Parquet files only, [Query local Parquet](/start/local-parquet/) needs
+the `trawl` CLI alone. A server installation has these parts:
 
-A server installation has several parts:
-
-| Component | Purpose |
+| Component | Responsibility |
 | --- | --- |
-| `trawl` | CLI queries and interactive terminal UI |
-| `trawld` | HTTPS API, ingestion, storage, and query execution |
-| `fleet-admin` | Database migrations, roles, and API keys |
-| `trawl-admin` | Local TLS certificate generation |
-| `trawl-web` | Browser UI and cookie-to-token session proxy |
-| PostgreSQL | Separate Fleet identity and Trawl application databases |
+| `trawl` | CLI queries, local Parquet queries, and the terminal UI |
+| `trawld` | Ingest, storage, queries, and the HTTPS API |
+| `trawl-web` | Browser UI and session proxy |
+| `fleet-admin` | Fleet migrations, keys, roles, and session keys |
+| `trawl-admin` | Self-signed TLS certificate generation |
+| PostgreSQL | The Fleet keystore and the Trawl app-state database |
 
-The query engine runs inside `trawld`; you do not install a separate DuckDB
-service. Logs are stored as Parquet on the server's filesystem. PostgreSQL
-holds identity and application state, including the field catalog.
+## Install from APT on Debian or Ubuntu
 
-## APT repository (Debian/Ubuntu)
-
-Add the repository, then install the client and server packages:
+`trawl-cli` installs `trawl`. `trawl-server` installs `trawld`, `trawl-web`,
+`fleet-admin`, and `trawl-admin`, with systemd units for the two daemons.
 
 ```bash
 curl -fsSL https://trawl.sh/gpg.key \
@@ -33,29 +28,29 @@ echo "deb [signed-by=/usr/share/keyrings/trawl.gpg] https://trawl.sh/apt stable 
   | sudo tee /etc/apt/sources.list.d/trawl.list
 sudo apt update
 sudo apt install trawl-cli trawl-server
+trawl --version
 ```
 
-`trawl-cli` installs the `trawl` client. The `trawl-server` package includes the daemon,
-administrative tools, and browser proxy, with systemd units. Installing
-binaries does not replace database and identity setup. Read the
-[deployment guide](/operate/deployment/) before configuring a permanent host.
-The browser proxy defaults to loopback; external browser access needs a
-TLS-terminating reverse proxy and the configured public origin.
+Expect `trawl`, the version, and the build details. A client-only machine
+needs `trawl-cli` alone. The package writes `/etc/trawl/trawld.toml` and
+enables both units. `trawld` refuses to start until `[auth]` and `[storage]`
+have database URLs, so the [deployment guide](/operate/deployment/) is next.
+`trawl-web` listens on `127.0.0.1:8090` by default, so browser access from
+other machines needs a TLS-terminating reverse proxy and a public origin.
 
-## GitHub releases (tarball)
+## Install from a GitHub release tarball
 
-Open [GitHub releases](https://github.com/jakub/trawl/releases) and select a
-release and its Linux architecture. Use the same release tag in both the URL
-and filename. Do not combine a fixed filename with `releases/latest`.
-
-In Bash, enter the selected tag, including its leading `v`:
+Each release has one tarball per Linux architecture,
+`trawl-<tag>-<target>.tar.gz`, with all five executables. Pick a tag from
+[GitHub releases](https://github.com/jakub/trawl/releases) and enter it, with
+its leading `v`, when prompted:
 
 ```bash
 read -r -p 'Release tag, including v: ' TRAWL_RELEASE
 case "$(uname -m)" in
   x86_64) TRAWL_TARGET=x86_64-unknown-linux-gnu ;;
   aarch64) TRAWL_TARGET=aarch64-unknown-linux-gnu ;;
-  *) echo 'Choose an available release asset for this architecture'; exit 1 ;;
+  *) echo 'No release asset for this architecture'; exit 1 ;;
 esac
 TRAWL_ARCHIVE="trawl-$TRAWL_RELEASE-$TRAWL_TARGET"
 curl --fail --location --output "$TRAWL_ARCHIVE.tar.gz" \
@@ -66,34 +61,31 @@ sudo install -m 0755 \
   "$TRAWL_ARCHIVE/trawl-admin" "$TRAWL_ARCHIVE/fleet-admin" \
   "$TRAWL_ARCHIVE/trawl-web" /usr/local/bin/
 trawl --version
-trawld --version
 ```
 
-The archive contains all five executables. It does not install systemd units,
-create your databases, or choose a storage directory. Keep the executables on
-the same release when following its documentation.
+Expect the version from your tag, without the `v`. The tarball has no systemd
+units, databases, or data directory. Keep all five executables on one release.
 
 ## Build from source
 
-For source work, use [Local development](/getting-started/development/).
-The workspace's `rust-toolchain.toml` and Cargo manifests specify the Rust
-requirements. Bundled DuckDB builds need a C/C++ toolchain and CMake; the
-browser build also needs the Wasm target and Trunk.
+[Local development](/getting-started/development/) lists the toolchain:
+`rust-toolchain.toml` pins Rust, the bundled DuckDB needs a C and C++
+toolchain and CMake, and the browser build needs the `wasm32-unknown-unknown`
+target and Trunk.
 
 ```bash
 git clone https://github.com/jakub/trawl.git
 cd trawl
 cargo build --release -p trawl-cli -p trawl-admin -p trawl-server -p fleet-admin
 env -u NO_COLOR cargo xtask build-web --release
+sudo install -m 0755 target/release/{trawl,trawld,trawl-admin,fleet-admin,trawl-web} /usr/local/bin/
+trawl --version
 ```
 
-The task runner builds the SPA and embeds it in the browser proxy. A Rust-only
-build is not a substitute for the release browser asset build. Install the
-five executables from `target/release/` for a complete manual installation.
+Expect the version from `Cargo.toml`. `cargo xtask build-web` builds the
+browser UI into `trawl-web`, which a plain `cargo build` leaves out.
 
 ## What's next
 
-Follow [Your first query](/getting-started/first-query/) for an isolated local
-installation with two databases, TLS, identities, sample ingest, and expected
-results. For an existing server, get its URL and a reader key from its operator
-and [connect](/start/connect/).
+[Your first query](/getting-started/first-query/) starts a private server with
+two databases, TLS, keys, and three sample events, and checks an exact result.

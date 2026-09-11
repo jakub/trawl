@@ -1,13 +1,12 @@
 ---
 title: Build a query
-description: Go from a few events to a filtered result and a useful summary.
+description: Filter events, pick columns, sort rows, and summarize counts with the query language.
 ---
 
-A Trawl query starts by selecting events, then passes them through pipe stages.
-Run these examples in browser Search or pass the quoted text to `trawl query`.
-The [first-query tutorial](/getting-started/first-query/) supplies the three
-`service=tutorial` events used below. With your own logs, replace that service
-and inspect a few rows before choosing field names.
+A query selects events, then passes them through pipe stages. Run each example
+in browser Search or pass it, quoted, to `trawl query`. The examples use the
+three `service=tutorial` events from [Your first query](/getting-started/first-query/).
+With your own logs, replace the service and look at a few rows first.
 
 ## Find your events
 
@@ -15,63 +14,58 @@ and inspect a few rows before choosing field names.
 service=tutorial last=1h
 ```
 
-The search stage combines these filters: service must be `tutorial` and the
-event time must fall in the last hour. Use a small range first. Expand it when
-you have a reason, such as looking for an incident from yesterday.
+Expect three rows. Both filters apply: `service` equals `tutorial` and the
+event time falls in the last hour. Start with a small range and widen it when
+you have a reason. In the browser, the range control and the **Filters**
+sidebar add to the editor text, and a [shared link](/use/sharing-export/)
+carries all three.
 
-The browser has its own range and sidebar controls. Check the visible range
-and filter chips as well as the editor: they contribute to the executed query.
-See [Sharing and export](/use/sharing-export/) for retaining that full state.
-
-## Read the fields
+## Pick the columns to show
 
 ```text
 service=tutorial last=1h | table _time, level, _severity, message, duration
 ```
 
-`table` chooses output columns. `_time` is the canonical event time and
-`_severity` is Trawl's derived severity. `level` and `duration` are sender
-fields. The sample has durations 12, 1500, and 700; it does not declare a unit,
-so a real source should document whether its duration means milliseconds or
-seconds before you set thresholds.
+Expect three rows with those five columns. `_time` is the event time and
+`_severity` is the severity Trawl derived. `level` and `duration` came from
+the sender. The sample durations 12, 1500, and 700 have no unit. Ask what a
+real source means before you set a threshold.
 
-Browse Schema to discover fields in your installation. Names that contain
-spaces or punctuation can be quoted with backticks, such as `` `http.status` ``.
-Do not rename source fields merely to fit the query grammar.
+Open **Schema** to find your fields. Quote a name with spaces or punctuation
+in backticks, such as `` `http.status` ``, rather than renaming source fields.
 
-## Select an error
+## Select errors
 
 ```text
 service=tutorial _severity>=error last=1h | table message, duration
 ```
 
-This returns the `connection refused` event from the sample. Use `_severity`
-for severity bands; `level=error` instead compares the sender's own `level`
-value. A sender is allowed to use a completely different vocabulary there.
+Expect the one `connection refused` row. `_severity` compares severity bands.
+`level=error` compares the sender's own `level` text, which can use any
+vocabulary.
 
-A bare term searches raw event text:
+## Search raw text
 
 ```text
 service=tutorial "connection refused" last=1h
 ```
 
-Raw JSON can include field names as well as values. If you mean a specific
-field, name it in the filter rather than relying on a text match.
+Expect the same row. A quoted term matches the raw event text, field names
+included, so name the field when you mean one. See [text search](/reference/dsl/#text-search).
 
-## Filter and order a result
+## Filter and sort rows
 
 ```text
 service=tutorial last=1h | where duration > 500 | sort -duration | table message, duration
 ```
 
-`where` evaluates an expression on each row. The sample returns the 1500 row
-before the 700 row. A minus sign on a sort key requests descending order.
-Add `| head 10` after the sort for the ten largest matching values.
+Expect the 1500 row, then the 700 row. `where` keeps rows where the expression
+is true. A minus sign sorts descending. Add `| head 10` after `sort` for the
+ten largest.
 
-Missing fields do not behave like empty strings. Expressions can evaluate to
-unknown, and `where` keeps only true rows. See the
-[null and comparison rules](/reference/dsl/#missing-fields-and-nulls) when a
-negated filter returns fewer rows than expected.
+A missing field is not an empty string. An expression on it is unknown, and
+`where` drops unknown rows. See [missing fields and nulls](/reference/dsl/#missing-fields-and-nulls)
+when a negated filter returns fewer rows than you expect.
 
 ## Count and summarize
 
@@ -79,33 +73,31 @@ negated filter returns fewer rows than expected.
 service=tutorial last=1h | stats count() by service
 ```
 
-The sample produces one row with count 3. Aggregation replaces event rows
-with summary rows. Fields you did not group or aggregate no longer exist.
-Give calculated columns short explicit names when you will use them later:
+Expect one row: `tutorial`, `3`. `stats` replaces event rows with summary
+rows, and fields you did not group by or aggregate are gone. Name calculated
+columns for later use:
 
 ```text
 service=tutorial last=1h | stats avg(duration) as mean_duration, count() as events by service
 ```
 
-The mean duration is approximately 737.33 and the event count is 3. A
-post-aggregation filter uses those output names:
+Expect `mean_duration` close to 737.33 and `events` equal to 3. Filter after
+`stats` with the output names:
 
 ```text
 service=tutorial last=1h | stats count() as events by service | where events >= 3
 ```
 
-## Choose the next step
+Expect the same row.
 
-Use `timechart` for counts over time:
+## Chart counts over time
 
 ```text
 service=tutorial last=1h | timechart span=5m count()
 ```
 
-In the browser, open **Visualization**. All three tutorial events belong to
-the same five-minute bucket. For newly arriving events, try
-[Live tail](/use/live-tail/). For repeated investigations,
-[save a query or report](/use/saved-reports/).
-
-The [DSL reference](/reference/dsl/) lists stages and functions, precise time
-bounds, quoting, pinned types, and the differences between batch and streaming.
+In the browser, open **Visualization**. Expect one bar, because all three
+events fall in one five-minute bucket. For events still arriving, use
+[live tail](/use/live-tail/). To run a query again later, [save it](/use/saved-reports/).
+The [DSL reference](/reference/dsl/) lists every stage and function, time
+bounds, quoting, pinned types, and what runs in a stream.

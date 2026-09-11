@@ -1,19 +1,19 @@
 ---
 title: Know what your systems are saying.
-description: A practical guide to collecting, searching, and operating your logs with Trawl.
+description: Collect, search, and operate your logs with Trawl.
 tableOfContents: false
 ---
 
-<p class="lead">Trawl collects logs from your infrastructure and lets you search them with a pipeline query language. Run it on one node, keep your events in Parquet, and investigate through a browser, terminal, or API.</p>
+<p class="lead">Trawl collects logs from your systems and searches them with a pipeline query language. It is for one person or a small team who wants answers about their own infrastructure from a browser, a terminal, or a script.</p>
 
 <div class="entry-paths">
   <section>
     <h2>Get an answer</h2>
-    <p>Start with the system or files you already have.</p>
+    <p>Fastest path first.</p>
     <ul>
-      <li><a href="/start/connect/">Connect to a Trawl server</a></li>
-      <li><a href="/start/local-parquet/">Query local Parquet files</a></li>
-      <li><a href="/getting-started/first-query/">Install and run your first query</a></li>
+      <li><a href="/start/connect/">Connect to a Trawl server</a>, about 2 minutes</li>
+      <li><a href="/start/local-parquet/">Query local Parquet files</a>, about 5 minutes</li>
+      <li><a href="/getting-started/">Install Trawl</a> and <a href="/getting-started/first-query/">run your first query</a>, about 20 minutes</li>
     </ul>
   </section>
   <section>
@@ -27,7 +27,7 @@ tableOfContents: false
   </section>
   <section>
     <h2>Work on Trawl</h2>
-    <p>Find the implementation and choose the right checks.</p>
+    <p>Find the code and run the right checks.</p>
     <ul>
       <li><a href="/getting-started/development/">Start local development</a></li>
       <li><a href="/architecture/overview/">Understand the components</a></li>
@@ -47,26 +47,21 @@ _severity>=error last=1h
 ```
 
 <div class="query-result">
-The search selects error events. <code>stats</code> counts them by service, and <code>sort</code> puts the largest count first. Run the same query in the browser or pass it to <code>trawl query</code>.
+The search selects the last hour's errors, <code>stats</code> counts them by service, and <code>sort</code> puts the largest first. Run it in the browser or with <code>trawl query</code>.
 </div>
 
-Follow the [query tutorial](/use/query-tutorial/) to filter, extract fields,
-and compare results. Keep the [DSL reference](/reference/dsl/) open for exact
-syntax and comparison rules.
+[Build a query](/use/query-tutorial/) adds filters, columns, and summaries.
+The [DSL reference](/reference/dsl/) has the exact syntax.
 
 ## Choose how much to run
 
-The CLI can read local Parquet with no server. A log installation uses
-`trawld` for ingestion and queries, plus PostgreSQL for keys, roles, application
-state, and field types. Add `trawl-web` for browser access.
-
-Trawl targets homelabs and small installations. It runs its log corpus on one
-node and has no clustering or multi-tenancy. See [requirements and components](/start/overview/)
-before choosing a deployment.
+The `trawl` CLI reads local Parquet with no server. A log installation adds
+`trawld`, PostgreSQL, and `trawl-web` for browser access, on one node with no
+clustering or multi-tenancy. See [requirements and components](/start/overview/).
 
 ## Keep these references nearby
 
-- [Event fields and repairs](/reference/events/) explains what ingestion stores.
-- [CLI](/reference/cli/) and [HTTP API](/reference/api/) describe command and request contracts.
-- [Configuration](/reference/configuration/) lists the settings and their defaults.
-- [Catalog operations](/operate/catalog/) explains missing values, conflicts, and repin.
+- [Event fields and repairs](/reference/events/): what ingest stores.
+- [CLI](/reference/cli/) and [HTTP API](/reference/api/): flags, routes, and responses.
+- [Configuration](/reference/configuration/): every setting and default.
+- [Catalog operations](/operate/catalog/): missing values, conflicts, and repin.

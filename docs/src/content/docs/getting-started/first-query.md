@@ -1,26 +1,25 @@
 ---
 title: Your first query
-description: Start an isolated local server, send three events, and check an exact query result.
+description: Start a private Trawl server, send three events, and check an exact query result.
 ---
 
-This tutorial runs Trawl on your Linux machine with a separate PostgreSQL
-container and a private working directory. It uses the CLI, not the browser.
-Allow about 15 minutes after installing the binaries. You need Docker, Python 3,
-`curl`, and `trawl`, `trawld`, `trawl-admin`, and `fleet-admin` in your PATH.
-See [Installation](/getting-started/) first.
+In this tutorial we start a private Trawl server on your Linux machine, send it
+three events, and check an exact answer from the CLI, the TUI, and a local
+Parquet export. Allow about 15 minutes after installation.
 
-Use Bash for the commands below. Keep the first terminal open: later commands
-reuse its variables. Ports 55439 and 15514 must be free. This creates a fresh
-installation; do not substitute a production database or existing data directory.
+You need:
 
-## Prepare the databases
+- Linux with Bash, Docker, Python 3, and `curl`.
+- `trawl`, `trawld`, `trawl-admin`, and `fleet-admin` in your `PATH`. See [Installation](/getting-started/).
+- Ports 55439 and 15514 free.
 
-Trawl uses two databases: Fleet stores keys and roles; Trawl stores history,
-saved queries, schedules, and the field catalog. They can share a PostgreSQL
-server, but each has its own database and login.
+Keep the first terminal open, because later steps reuse its variables. Do not
+reuse an existing database or data directory.
 
-Create a private directory and random tutorial passwords. Nothing prints the
-passwords or API tokens to the terminal.
+## Start PostgreSQL
+
+Trawl needs two databases. Create a private working directory and random
+passwords first. Nothing prints a password or a token.
 
 ```bash
 umask 077
@@ -34,8 +33,7 @@ docker run --detach --name trawl-docs-postgres \
   --env-file "$TRAWL_TUTORIAL_DIR/postgres.env" postgres:18
 ```
 
-Wait until PostgreSQL accepts connections. If the container fails to start,
-inspect `docker logs trawl-docs-postgres` before continuing.
+Now wait for PostgreSQL:
 
 ```bash
 for attempt in {1..30}; do
@@ -45,8 +43,13 @@ done
 docker exec trawl-docs-postgres pg_isready -U postgres
 ```
 
-The last command must say `accepting connections`. Create the database owners
-and databases. The generated passwords contain only hexadecimal characters.
+The last line must end with `accepting connections`. If not, read
+`docker logs trawl-docs-postgres`.
+
+## Create the databases
+
+Create a login and a database for each, then apply the Fleet migrations.
+Hexadecimal passwords are safe inside the SQL quotes.
 
 ```bash
 docker exec -i trawl-docs-postgres psql -U postgres -v ON_ERROR_STOP=1 <<SQL
@@ -59,13 +62,13 @@ export DATABASE_URL="postgres://fleet:$TRAWL_FLEET_PASSWORD@127.0.0.1:55439/flee
 fleet-admin migrate
 ```
 
-Fleet migrations are an explicit administrative step. `trawld` applies its
-own app-state migrations when it starts.
+Expect four `CREATE` lines, then `fleet-admin: migrations applied`. `trawld`
+runs its own app-state migrations at startup.
 
 ## Create an API key
 
-Create separate identities for reading and sending events. Role names do not
-grant permissions by themselves; the permission list defines what each key can do.
+One key reads, another sends. Permissions come from the role's list, not its
+name.
 
 ```bash
 fleet-admin roles create --name tutorial-reader \
@@ -79,15 +82,12 @@ fleet-admin keys create --name tutorial-ingest --kind service \
 unset DATABASE_URL
 ```
 
-`fleet-admin` writes the token once to standard output and metadata to standard
-error. The redirects keep each token in a private file. A reader key cannot
-send the sample events; the next steps use the ingest key for that operation.
+`keys create` prints metadata to stderr and the token to stdout once, so the
+redirect keeps it in a private file.
 
 ## Start the server
 
-Generate TLS material and write the complete configuration before starting
-`trawld`. The server listens only on this machine. Its data directory belongs
-to this tutorial.
+Generate a self-signed certificate and write the configuration.
 
 ```bash
 trawl-admin tls generate --output-dir "$TRAWL_TUTORIAL_DIR/tls"
@@ -111,13 +111,12 @@ database_url = "postgres://trawl:$TRAWL_APP_PASSWORD@127.0.0.1:55439/trawl"
 enabled = true
 internal_telemetry = false
 TOML
-printf 'env -u FLEET_DATABASE_URL -u TRAWL_DATABASE_URL trawld --config %q\n' "$TRAWL_TUTORIAL_DIR/trawld.toml"
+printf 'env -u FLEET_DATABASE_URL -u TRAWL_DATABASE_URL -u TRAWL_HTTP_ADDR trawld --config %q\n' "$TRAWL_TUTORIAL_DIR/trawld.toml"
 ```
 
-Run the printed command in a second terminal and leave it running in the
-foreground. The printed command clears database URL overrides for this process
-so its config selects the tutorial databases. Back in the first terminal,
-check the HTTPS endpoint:
+`tls generate` prints the `cert:` and `key:` paths. The last command prints a
+`trawld` command line, with `env -u` clearing environment overrides. Run it in
+a second terminal and leave it running. Back in the first terminal:
 
 ```bash
 curl --fail --silent --show-error \
@@ -125,15 +124,14 @@ curl --fail --silent --show-error \
   https://localhost:15514/api/v1/health
 ```
 
-Expect an HTTP success with JSON health information. If startup fails, read
-the second terminal's error. Connection failures usually mean PostgreSQL or
-`trawld` is not running; authentication failures during startup mean the
-configured database login or migrations need attention.
+Expect a JSON object whose `status` is `ok`. If not, read the error in the
+second terminal. A connection error points at PostgreSQL, an authentication
+error at a database login or the migrations.
 
-## Configure your client
+## Configure the client
 
-Write a separate client config so this tutorial does not replace your usual
-server or profiles.
+Write a client config for this tutorial only, so your usual
+`~/.config/trawl/config.toml` stays untouched.
 
 ```bash
 printf '[server]\nurl = "https://localhost:15514"\ntoken = "%s"\ninsecure = true\n' \
@@ -141,14 +139,13 @@ printf '[server]\nurl = "https://localhost:15514"\ntoken = "%s"\ninsecure = true
 unset TRAWL_TOKEN TRAWL_URL TRAWL_PROFILE TRAWL_INSECURE
 ```
 
-The CLI's `insecure = true` accepts this tutorial's self-signed certificate.
-Use a certificate trusted by your client for a permanent installation. The
-`curl` commands instead trust the generated certificate explicitly.
+`insecure = true` accepts the self-signed certificate. Use a trusted
+certificate for a permanent installation.
 
-## Send some test data
+## Send three events
 
-Prepare three events with the current UTC timestamp. The shared service name
-keeps the expected result separate from any other source.
+Build three events with the current UTC time, then post them with the ingest
+key.
 
 ```bash
 python3 - <<'PYDATA' > "$TRAWL_TUTORIAL_DIR/events.json"
@@ -173,9 +170,8 @@ curl --fail --silent --show-error \
   https://localhost:15514/api/v1/ingest
 ```
 
-Expect `{"accepted":3}`. Do not resend to fix a display problem: sending the
-same payload again stores another three events. The accepted events are
-queryable through the hot buffer before Parquet compaction finishes.
+Expect `{"accepted":3}`. Send it once, because a second post adds three more
+events. The events are visible at once from the hot buffer.
 
 ## Run your first query
 
@@ -184,13 +180,13 @@ trawl --config "$TRAWL_TUTORIAL_DIR/client.toml" query --format json \
   'service=tutorial last=1h | stats count() by service'
 ```
 
-Expected result:
+Expect:
 
 ```json
 {"service":"tutorial","count":3}
 ```
 
-JSON property order does not matter. Now select the error event:
+Property order can differ. Now select the error event:
 
 ```bash
 trawl --config "$TRAWL_TUTORIAL_DIR/client.toml" query --format json \
@@ -198,23 +194,22 @@ trawl --config "$TRAWL_TUTORIAL_DIR/client.toml" query --format json \
 ```
 
 Expect one row with `message` equal to `connection refused` and `duration`
-equal to `1500`. Trawl derives `_severity` from the sender's `level` while
-keeping `level` as an ordinary field. See the
-[query tutorial](/use/query-tutorial/) to build on this example.
+equal to `1500`. Trawl derived `_severity` from `level`. [Build a query](/use/query-tutorial/)
+continues from here.
 
-## Launch the TUI
+## Open the TUI
 
 ```bash
 trawl --config "$TRAWL_TUTORIAL_DIR/client.toml"
 ```
 
-Enter the same query and use the execute shortcut shown in Help. The TUI uses
-the same reader identity. See [CLI and TUI workflows](/use/cli-tui/).
-Exit the TUI before cleaning up.
+Press F1 for the shortcut list. Enter the same query and press Shift+Enter or
+F5. Expect the same rows. Press Ctrl+Q to quit before you clean up. See
+[CLI and TUI workflows](/use/cli-tui/).
 
-## Try embedded mode (no server)
+## Query the export without a server
 
-Export these events and query the file without a server:
+Export the events to Parquet, then query the file with no server:
 
 ```bash
 trawl --config "$TRAWL_TUTORIAL_DIR/client.toml" query \
@@ -224,19 +219,20 @@ trawl query --data "$TRAWL_TUTORIAL_DIR/tutorial.parquet" \
   '* | stats count() by service'
 ```
 
-See [Local Parquet](/start/local-parquet/) for the differences from server mode.
+Expect one row with `tutorial` and `3`, then `1 row(s)`. See
+[Query local Parquet](/start/local-parquet/).
 
 ## Clean up
 
-Stop `trawld` with Ctrl+C in its terminal. Then remove only this tutorial's
-container and its anonymous database volume:
+Stop `trawld` with Ctrl+C in its terminal. Remove the container and its
+anonymous volume:
 
 ```bash
 docker rm --force --volumes trawl-docs-postgres
 ```
 
-The private directory still contains tokens, database passwords, TLS keys,
-and the exported data. Once you have finished inspecting it, remove it:
+The working directory still holds tokens, passwords, TLS keys, and the export.
+Remove it when you are done:
 
 ```bash
 rm -r -- "$TRAWL_TUTORIAL_DIR"
@@ -245,7 +241,6 @@ unset TRAWL_PG_ADMIN_PASSWORD TRAWL_FLEET_PASSWORD TRAWL_APP_PASSWORD TRAWL_TUTO
 
 ## What's next
 
-- [Search in the browser](/reference/web-ui/) when your installation has a browser URL.
-- [Vector integration](/getting-started/vector-integration/) to send logs continuously.
-- [Sharing and export](/use/sharing-export/) to retain or share an answer.
-- [Configuration](/reference/configuration/) for a permanent installation.
+- [Search in the browser](/reference/web-ui/) once you have a browser URL.
+- [Vector integration](/getting-started/vector-integration/) sends logs continuously.
+- [Share searches and export results](/use/sharing-export/) keeps or shares an answer.

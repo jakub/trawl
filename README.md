@@ -5,62 +5,52 @@
 # trawl
 
 Self-hosted log collection and search for homelabs and small installations.
-Use a pipeline query language to investigate events through the browser, CLI,
-or terminal UI. Trawl keeps its log corpus on one node in Parquet and queries
-it with DuckDB.
+Trawl keeps logs on one node as Parquet, queries them with DuckDB, and answers
+a pipeline query language from the browser, the CLI, or the terminal UI. No
+clustering, no multi-tenancy.
 
 ## Start here
 
-- [Connect to an existing server](https://trawl.sh/start/connect/).
-- [Query local Parquet files](https://trawl.sh/start/local-parquet/) with the CLI alone.
-- [Install Trawl](https://trawl.sh/getting-started/) and [run your first query](https://trawl.sh/getting-started/first-query/) against known sample data.
+- [Connect to a server](https://trawl.sh/start/connect/) someone already runs. About 2 minutes.
+- [Query local Parquet files](https://trawl.sh/start/local-parquet/) with the CLI alone. About 5 minutes.
+- [Install Trawl](https://trawl.sh/getting-started/) and [run your first query](https://trawl.sh/getting-started/first-query/). About 20 minutes.
 
-A server installation uses `trawld` plus two PostgreSQL databases, one for the
-Fleet keystore and one for Trawl app state and field types. Add `trawl-web` for
-browser access. `fleet-admin` manages keys and roles; `trawl-admin` generates TLS
-certificates. See [requirements and components](https://trawl.sh/start/overview/).
-
-## Query your logs
+## Ask a question
 
 ```bash
-# Count errors by service on your configured server.
+# Which services logged errors in the last hour?
 trawl query '_severity>=error last=1h | stats count() as errors by service | sort -errors'
 
-# Read local Parquet without a server.
+# The same count over local Parquet, with no server.
 trawl query --data 'data/**/*.parquet' '* | stats count() by service'
 ```
 
-Follow the [query tutorial](https://trawl.sh/use/query-tutorial/), or use the
-[DSL reference](https://trawl.sh/reference/dsl/) for exact syntax and comparison rules.
+[Build a query](https://trawl.sh/use/query-tutorial/) and the
+[DSL reference](https://trawl.sh/reference/dsl/) cover the language.
 
-## Documentation
+## Components
 
-[trawl.sh](https://trawl.sh) separates setup, investigation, operations, reference,
-architecture, and contributor guides.
+| Component | Responsibility |
+| --- | --- |
+| `trawl` | CLI queries, local Parquet queries, and the terminal UI |
+| `trawld` | Ingest, storage, queries, and the HTTPS API |
+| `trawl-web` | Browser UI and session proxy |
+| `fleet-admin` | Fleet migrations, keys, roles, and session keys |
+| `trawl-admin` | Self-signed TLS certificate generation |
+| PostgreSQL | The Fleet keystore and the Trawl app-state database |
 
-- [Browser workflows](https://trawl.sh/reference/web-ui/)
-- [Deployment and operations](https://trawl.sh/operate/deployment/)
-- [Configuration](https://trawl.sh/reference/configuration/)
-- [HTTP API](https://trawl.sh/reference/api/)
-- [Architecture](https://trawl.sh/architecture/overview/)
+The manual at [trawl.sh](https://trawl.sh) covers
+[requirements](https://trawl.sh/start/overview/),
+[deployment](https://trawl.sh/operate/deployment/),
+[configuration](https://trawl.sh/reference/configuration/), the
+[HTTP API](https://trawl.sh/reference/api/), and
+[architecture](https://trawl.sh/architecture/overview/).
 
 ## Develop
 
-Read the [local development guide](docs/src/content/docs/getting-started/development.md)
-for prerequisites, profiles, and persistent state before starting the stack:
-
-```bash
-bin/fleet-dev plan trawl --format human
-bin/fleet-dev doctor trawl
-bin/dev
-```
-
-Agent tests use disposable infrastructure. The [test guide](docs/src/content/docs/contribute/testing.md)
-explains focused Rust and browser checks; the
-[experiment runbook](scripts/app-experiment/README.md) exercises the real application.
-[AGENTS.md](AGENTS.md) links to project task skills.
-
-The Astro documentation site has its own [development and checking guide](docs/src/content/docs/contribute/documentation.md).
+[Local development](https://trawl.sh/getting-started/development/) covers the
+prerequisites and the `bin/dev` stack. [Testing](https://trawl.sh/contribute/testing/)
+picks the checks for a change. [AGENTS.md](AGENTS.md) links the task skills.
 
 ## License
 
