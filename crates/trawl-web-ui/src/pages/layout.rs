@@ -199,6 +199,7 @@ pub fn NotFound() -> impl IntoView {
             <div class="login-card">
                 <h1>"404"</h1>
                 <p class="subtitle">"That page does not exist."</p>
+                <a href="/search">"Go to Search"</a>
             </div>
         </div>
     }

@@ -12,8 +12,8 @@
 //! - `lagged` → `{missed: N}` back-pressure notification
 //!
 //! `EventSource` auto-reconnects on network blips (cookie rides along).
-//! If the browser permanently loses the stream, the UI freezes on the
-//! last snapshot — acceptable for v1.
+//! Search reports failed connections and malformed snapshots, and clears
+//! stale chart data. A valid event or reopened connection clears the failure.
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -38,6 +38,8 @@ pub struct StreamLifecycle {
     on_data: Closure<dyn FnMut(MessageEvent)>,
     on_snapshot: Closure<dyn FnMut(MessageEvent)>,
     on_lagged: Closure<dyn FnMut(MessageEvent)>,
+    on_open: Closure<dyn FnMut(web_sys::Event)>,
+    on_error: Closure<dyn FnMut(web_sys::Event)>,
     render_tick: Option<gloo_timers::callback::Interval>,
     ring: RwSignal<RingBuffer>,
     dirty: Rc<Cell<bool>>,
@@ -63,6 +65,8 @@ pub struct LiveSignals {
     pub ring: RwSignal<RingBuffer>,
     pub snapshot: RwSignal<Option<QueryResult>>,
     pub lagged: RwSignal<Option<u64>>,
+    /// Search displays failures; callers without a status view may omit it.
+    pub failure: Option<RwSignal<Option<&'static str>>>,
 }
 
 /// Bounded, append-only-from-the-tail ring of raw events.
@@ -109,6 +113,7 @@ pub fn start_stream(query: &str, signals: LiveSignals) -> Option<StreamLifecycle
         ring,
         snapshot,
         lagged,
+        failure,
     } = signals;
 
     // Lagged signal auto-clear: set(Some(n)) then schedule a set(None)
@@ -139,13 +144,105 @@ pub fn start_stream(query: &str, signals: LiveSignals) -> Option<StreamLifecycle
         }
     });
 
-    let on_snapshot = Closure::<dyn FnMut(MessageEvent)>::new(move |ev: MessageEvent| {
+    let on_snapshot = snapshot_listener(signals);
+
+    let on_lagged = Closure::<dyn FnMut(MessageEvent)>::new(move |ev: MessageEvent| {
         let Some(data_str) = ev.data().as_string() else {
             return;
         };
-        let Ok(wire) = serde_json::from_str::<SnapshotWire>(&data_str) else {
+        let Ok(wire) = serde_json::from_str::<LaggedWire>(&data_str) else {
             return;
         };
+        lagged.set(Some(wire.missed));
+        // Schedule a clear after 3s. Dropping the previous Timeout
+        // cancels it, so rapid-fire lagged events don't stack.
+        let lagged_sig = lagged;
+        let guard = lagged_clear_guard.clone();
+        let timeout = gloo_timers::callback::Timeout::new(3_000, move || {
+            lagged_sig.set(None);
+        });
+        *guard.borrow_mut() = Some(timeout);
+    });
+
+    let on_open = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
+        if let Some(failure) = failure {
+            failure.set(None);
+        }
+    });
+    let error_source = source.clone();
+    let on_error = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
+        snapshot.set(None);
+        if let Some(failure) = failure {
+            let message = if error_source.ready_state() == EventSource::CONNECTING {
+                "Live stream disconnected. Reconnecting; retry or switch to Snapshot if this persists."
+            } else {
+                "Live stream unavailable. Retry or switch to Snapshot."
+            };
+            failure.set(Some(message));
+        }
+    });
+
+    // Attach listeners. The `Result` carries only an exception thrown by
+    // the JS call itself, and the event names are compile-time strings,
+    // so there is nothing here to act on.
+    let _ = source.add_event_listener_with_callback("data", on_data.as_ref().unchecked_ref());
+    let _ =
+        source.add_event_listener_with_callback("snapshot", on_snapshot.as_ref().unchecked_ref());
+    let _ = source.add_event_listener_with_callback("lagged", on_lagged.as_ref().unchecked_ref());
+
+    let _ = source.add_event_listener_with_callback("open", on_open.as_ref().unchecked_ref());
+    let _ = source.add_event_listener_with_callback("error", on_error.as_ref().unchecked_ref());
+
+    Some(StreamLifecycle {
+        source,
+        on_data,
+        on_snapshot,
+        on_lagged,
+        on_open,
+        on_error,
+        render_tick: Some(render_tick),
+        ring,
+        dirty,
+    })
+}
+
+fn snapshot_listener(signals: LiveSignals) -> Closure<dyn FnMut(MessageEvent)> {
+    let LiveSignals {
+        snapshot, failure, ..
+    } = signals;
+    Closure::<dyn FnMut(MessageEvent)>::new(move |ev: MessageEvent| {
+        let wire = ev
+            .data()
+            .as_string()
+            .and_then(|data| serde_json::from_str::<SnapshotWire>(&data).ok());
+        let Some(wire) = wire else {
+            snapshot.set(None);
+            if let Some(failure) = failure {
+                failure.set(Some(
+                    "Live stream returned an unreadable snapshot. Retry or switch to Snapshot.",
+                ));
+            }
+            return;
+        };
+        if (wire.columns.is_empty() && !wire.rows.is_empty())
+            || wire
+                .columns
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                != wire.columns.len()
+        {
+            snapshot.set(None);
+            if let Some(failure) = failure {
+                failure.set(Some(
+                    "Live stream returned an unreadable snapshot. Retry or switch to Snapshot.",
+                ));
+            }
+            return;
+        }
+        if let Some(failure) = failure {
+            failure.set(None);
+        }
         // Rehydrate rows in declared column order. Missing keys land as
         // Null (consistent with how the server materializes sparse rows).
         let rows: Vec<Vec<Value>> = wire
@@ -167,42 +264,6 @@ pub fn start_stream(query: &str, signals: LiveSignals) -> Option<StreamLifecycle
             rows,
         };
         snapshot.set(Some(result));
-    });
-
-    let on_lagged = Closure::<dyn FnMut(MessageEvent)>::new(move |ev: MessageEvent| {
-        let Some(data_str) = ev.data().as_string() else {
-            return;
-        };
-        let Ok(wire) = serde_json::from_str::<LaggedWire>(&data_str) else {
-            return;
-        };
-        lagged.set(Some(wire.missed));
-        // Schedule a clear after 3s. Dropping the previous Timeout
-        // cancels it, so rapid-fire lagged events don't stack.
-        let lagged_sig = lagged;
-        let guard = lagged_clear_guard.clone();
-        let timeout = gloo_timers::callback::Timeout::new(3_000, move || {
-            lagged_sig.set(None);
-        });
-        *guard.borrow_mut() = Some(timeout);
-    });
-
-    // Attach listeners. The `Result` carries only an exception thrown by
-    // the JS call itself, and the event names are compile-time strings,
-    // so there is nothing here to act on.
-    let _ = source.add_event_listener_with_callback("data", on_data.as_ref().unchecked_ref());
-    let _ =
-        source.add_event_listener_with_callback("snapshot", on_snapshot.as_ref().unchecked_ref());
-    let _ = source.add_event_listener_with_callback("lagged", on_lagged.as_ref().unchecked_ref());
-
-    Some(StreamLifecycle {
-        source,
-        on_data,
-        on_snapshot,
-        on_lagged,
-        render_tick: Some(render_tick),
-        ring,
-        dirty,
     })
 }
 

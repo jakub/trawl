@@ -15,6 +15,6 @@ use super::tone::{StatusTone, dot_class};
 #[component]
 pub fn StatusDot(#[prop(optional)] tone: StatusTone) -> impl IntoView {
     view! {
-        <span class=dot_class(tone)></span>
+        <span class=dot_class(tone) aria-hidden="true"></span>
     }
 }

@@ -148,7 +148,7 @@ async function submitSave(page: Page, status = 200) {
   const answered = page.waitForResponse((response) =>
     response.url().endsWith('/api/v1/saved') && response.request().method() === 'POST',
   );
-  await page.getByRole('button', { name: 'Save Net', exact: true }).click();
+  await page.getByRole('button', { name: 'Save as net', exact: true }).click();
   const response = await answered;
   expect(response.status()).toBe(status);
   await response.finished();
@@ -223,7 +223,7 @@ test('Save retries an explicit POST failure with the original snapshot', async (
   await submitSave(page, 503);
   await expect(page.locator(SEL.toastError)).toContainText("Couldn't save");
   await expect(page.locator(SEL.modalPanel)).toBeVisible();
-  await expect(page.getByRole('button', { name: 'Save Net', exact: true })).toBeEnabled();
+  await expect(page.getByRole('button', { name: 'Save as net', exact: true })).toBeEnabled();
   await changeReadableUrl(page);
   await expectExactPreview(page);
   await submitSave(page);

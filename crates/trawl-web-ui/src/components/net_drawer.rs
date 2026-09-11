@@ -365,7 +365,7 @@ fn QuerySchedulePane(
             // -- query section --
             <div class="sd-card">
                 <div class="sd-card-hd">
-                    <span class="ttl">"Query"</span>
+                    <span class="ttl" id="net-query-label">"Query"</span>
                     <Show when=move || !editing.get()>
                         <Btn
                             variant=Variant::Secondary
@@ -382,9 +382,10 @@ fn QuerySchedulePane(
                     }
                 >
                     <textarea
+                        aria-labelledby="net-query-label"
                         class="mono"
                         rows="4"
-                        style="width:100%; resize:vertical; font-size:12px; padding:8px; background:var(--panel-2); border:1px solid var(--line); border-radius:3px; color:var(--ink)"
+                        style="width:100%; resize:vertical; font-size:12px; padding:8px; background:var(--fill); border:1px solid var(--line); border-radius:var(--radius-ctl); color:var(--ink)"
                         prop:value=move || query_buf.get()
                         on:input=move |e| query_buf.set(event_target_value(&e))
                     ></textarea>
@@ -425,7 +426,7 @@ fn QuerySchedulePane(
                 >
                     <div style="display:flex; flex-direction:column; gap:10px">
                         <div>
-                            <label class="field-label">"Interval"</label>
+                            <label class="field-label" for="net-interval">"Interval"</label>
                             <div class="interval-chips">
                                 {INTERVAL_PRESETS.iter().map(|preset| {
                                     let p = *preset;
@@ -442,7 +443,8 @@ fn QuerySchedulePane(
                             </div>
                             <input
                                 class="mono"
-                                style="margin-top:6px; width:80px; font-size:12px; padding:4px 6px; background:var(--panel-2); border:1px solid var(--line); border-radius:3px; color:var(--ink)"
+                                style="margin-top:6px; width:80px; font-size:12px; padding:4px 6px; background:var(--fill); border:1px solid var(--line); border-radius:var(--radius-ctl); color:var(--ink)"
+                                id="net-interval"
                                 placeholder="Custom…"
                                 prop:value=move || {
                                     let v = interval_buf.get();
@@ -460,13 +462,15 @@ fn QuerySchedulePane(
                         })}
 
                         <div>
-                            <label class="field-label">"Max runs "</label>
-                            <span style="color:var(--ink-3); font-size:11px">"(blank = unlimited)"</span>
+                            <label class="field-label" for="net-max-runs">"Max runs "</label>
+                            <span id="net-max-runs-help" style="color:var(--ink-3); font-size:11px">"(blank = unlimited)"</span>
                             <input
                                 class="mono"
                                 type="number"
+                                id="net-max-runs"
+                                aria-describedby="net-max-runs-help"
                                 min="1"
-                                style="display:block; margin-top:4px; width:80px; font-size:12px; padding:4px 6px; background:var(--panel-2); border:1px solid var(--line); border-radius:3px; color:var(--ink)"
+                                style="display:block; margin-top:4px; width:80px; font-size:12px; padding:4px 6px; background:var(--fill); border:1px solid var(--line); border-radius:var(--radius-ctl); color:var(--ink)"
                                 prop:value=move || max_runs_buf.get()
                                 on:input=move |e| max_runs_buf.set(event_target_value(&e))
                             />
@@ -474,6 +478,7 @@ fn QuerySchedulePane(
 
                         <div style="display:flex; align-items:center; gap:8px">
                             <Toggle
+                                label="Schedule enabled"
                                 checked=enabled_buf
                                 on_change=Callback::new(move |v| enabled_buf.set(v))
                             />
@@ -488,7 +493,7 @@ fn QuerySchedulePane(
                                 size=Size::Xs
                                 disabled=saving_schedule
                                 on_click=Callback::new(move |()| do_save_schedule())
-                            >{move || if saving_schedule.get() { "Saving…" } else { "Save Schedule" }}</Btn>
+                            >{move || if saving_schedule.get() { "Saving…" } else { "Save schedule" }}</Btn>
                             {has_schedule.then(|| {
                                 view! {
                                     <Btn
@@ -513,6 +518,7 @@ fn QuerySchedulePane(
 
 #[component]
 fn RunsPane(net_id: i64, bus: ToastBus, on_search: Callback<String>) -> impl IntoView {
+    let table_viewport = NodeRef::<leptos::html::Div>::new();
     let page = RwSignal::new(0usize);
     let expanded_run: RwSignal<Option<i64>> = RwSignal::new(None);
 
@@ -559,6 +565,7 @@ fn RunsPane(net_id: i64, bus: ToastBus, on_search: Callback<String>) -> impl Int
             <Loaded
                 state=Signal::derive(move || LoadState::from_resource(runs.get()))
                 label="runs"
+                retry=Callback::new(move |()| { runs.set(None); runs.refetch(); })
                 render=Box::new(move |(fetched_page, resp): (usize, trawl_api::ListReportRunsResponse)| {
                         let now = now_ms();
                         let returned = resp.runs.len();
@@ -579,8 +586,8 @@ fn RunsPane(net_id: i64, bus: ToastBus, on_search: Callback<String>) -> impl Int
                             let is_expanded = move || expanded_run.get() == Some(run_id);
 
                             view! {
-                                <div class="tbl-row">
-                                    <div style="flex:0 0 80px" class="mono">
+                                <tr class="tbl-row">
+                                    <td class="mono">
                                         // The row's one control (ADR-0029),
                                         // stretched over the row: a pointer
                                         // anywhere on it toggles the run's
@@ -595,39 +602,39 @@ fn RunsPane(net_id: i64, bus: ToastBus, on_search: Callback<String>) -> impl Int
                                                 });
                                             }
                                         >{when}</button>
-                                    </div>
-                                    <div style="flex:0 0 70px">
+                                    </td>
+                                    <td>
                                         <StatusDot tone=tone/>
                                         " "
                                         <span style="font-size:11px">{status}</span>
-                                    </div>
-                                    <div style="flex:0 0 60px" class="mono">{dur}</div>
-                                    <div style="flex:0 0 50px; text-align:right" class="mono">{row_ct}</div>
-                                    <div style="flex:1; min-width:0; color:var(--red); font-size:11px" class="path">{err_msg}</div>
-                                </div>
+                                    </td>
+                                    <td class="mono">{dur}</td>
+                                    <td style="text-align:right" class="mono">{row_ct}</td>
+                                    <td style="min-width:0; color:var(--red); font-size:11px" class="path">{err_msg}</td>
+                                </tr>
                                 <Show when=is_expanded>
-                                    <RunResultPreview
+                                    <tr><td colspan="5"><RunResultPreview
                                         net_id=net_id
                                         run_id=run_id
                                         bus=bus
                                         on_search=on_search
-                                    />
+                                    /></td></tr>
                                 </Show>
                             }
                         }).collect_view();
 
                         view! {
-                            <div class="tbl">
-                                <div class="tbl-hd" style="font-size:11px">
-                                    <div style="flex:0 0 80px">"When"</div>
-                                    <div style="flex:0 0 70px">"Status"</div>
-                                    <div style="flex:0 0 60px">"Duration"</div>
-                                    <div style="flex:0 0 50px; text-align:right">"Rows"</div>
-                                    <div style="flex:1">"Error"</div>
-                                </div>
-                                <div class="tbl-body">
+                            <fleet_ui::OverflowHint viewport=table_viewport/>
+                            <div node_ref=table_viewport class="tbl fleet-table-frame tbl-scroll" role="region" aria-label="Net runs" tabindex="0" style="--list-min-width:480px">
+                                <table class="fleet-table run-preview-table" aria-label="Net runs"><thead><tr>
+                                    <th scope="col" style="width:100px">"When"</th>
+                                    <th scope="col" style="width:90px">"Status"</th>
+                                    <th scope="col" style="width:80px">"Duration"</th>
+                                    <th scope="col" style="width:70px; text-align:right">"Rows"</th>
+                                    <th scope="col">"Error"</th>
+                                </tr></thead><tbody>
                                     {rows}
-                                </div>
+                                </tbody></table>
                                 {if returned == 0 { Some(view! {
                                     <div class="tbl-empty">{if total == 0 && fetched_page == 0 {
                                             "No runs yet — attach a schedule to start."
@@ -664,6 +671,7 @@ fn RunResultPreview(
             <Loaded
                 state=Signal::derive(move || LoadState::from_resource(result.get()))
                 label="result"
+                retry=Callback::new(move |()| { result.set(None); result.refetch(); })
                 render=Box::new(move |resp: trawl_api::ReportRunResponse| {
                     match resp.result {
                         None => view! {
@@ -678,7 +686,7 @@ fn RunResultPreview(
                                     size=Size::Xs
                                     attr:style="margin-top:6px"
                                     on_click=Callback::new(move |()| on_search.run(query.clone()))
-                                >"View full results →"</Btn>
+                                >"Run query again"</Btn>
                             }.into_any()
                         }
                     }
@@ -704,7 +712,7 @@ fn ResultPreviewTable(result: QueryResult) -> impl IntoView {
         <table>
             <thead>
                 <tr>
-                    {cols.iter().map(|c| view! { <th>{c.name.clone()}</th> }).collect_view()}
+                    {cols.iter().map(|c| view! { <th scope="col">{c.name.clone()}</th> }).collect_view()}
                 </tr>
             </thead>
             <tbody>

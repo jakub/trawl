@@ -1,3 +1,6 @@
+/* F01 amendment: drawer headings and actions wrap; the close control retains its width.
+ * Only .sd-hd, .sd-ttl, .sd-actions and .sd-x differ from the prior fixture.
+ * responsive-layout.spec.ts verifies their rendered behavior. */
 /* GOLDEN FIXTURE — DO NOT EDIT to make a test pass.
  *
  * The chrome rules issue #28 moved out of trawl-web-ui/styles/main.css
@@ -132,18 +135,19 @@
 @keyframes sd-slide-in { from { transform: translateX(20px); opacity: 0; } to { transform: none; opacity: 1; } }
 
 .sd-hd {
-  display: flex; align-items: center; justify-content: space-between;
+  display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap;
+  flex-shrink: 0;
   padding: 14px 18px; border-bottom: 1px solid var(--line);
   gap: 16px; background: var(--panel-2);
 }
 
-.sd-ttl { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.sd-ttl { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; min-width: 0; overflow-wrap: anywhere; }
 
-.sd-actions { display: flex; align-items: center; gap: 8px; }
+.sd-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-inline-start: auto; }
 
 .sd-x {
   background: none; border: 1px solid transparent; cursor: pointer;
-  width: 28px; height: 28px; border-radius: var(--radius-sm);
+  width: 28px; height: 28px; flex-shrink: 0; border-radius: var(--radius-sm);
   font-size: 18px; color: var(--ink-3); line-height: 1;
   display: inline-flex; align-items: center; justify-content: center;
 }

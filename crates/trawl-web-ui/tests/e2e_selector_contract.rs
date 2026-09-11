@@ -676,7 +676,7 @@ const CONTRACTS: &[Contract] = &[
         assignment: "toastError: '.toast.error',",
         source_path: "../fleet-ui/src/toast/runtime.rs",
         source: TOAST_RUNTIME_RS,
-        hook: "format!(\"toast {}\", t.kind.as_class())",
+        hook: "format!(\"toast {}\", toast.kind.as_class())",
     },
     Contract {
         assignment: "toastError: '.toast.error',",
@@ -700,7 +700,7 @@ const CONTRACTS: &[Contract] = &[
         assignment: "toastAny: '.toast',",
         source_path: "../fleet-ui/src/toast/runtime.rs",
         source: TOAST_RUNTIME_RS,
-        hook: "format!(\"toast {}\", t.kind.as_class())",
+        hook: "format!(\"toast {}\", toast.kind.as_class())",
     },
     Contract {
         assignment: "drawerPanel: '.sd-drawer',",
@@ -967,19 +967,31 @@ const CONTRACTS: &[Contract] = &[
     // Two files: the header band belongs to the page, the control
     // inside it to the shared helper.
     Contract {
-        assignment: "tableSortControl: '.tbl-hd .th.sortable button',",
+        assignment: "tableSortControl: '.fleet-table thead .th.sortable button',",
         source_path: "src/pages/schema.rs",
         source: SCHEMA_RS,
-        hook: "class=\"tbl-hd\"",
+        hook: "<thead>",
     },
     Contract {
-        assignment: "tableSortControl: '.tbl-hd .th.sortable button',",
+        assignment: "tableSortControl: '.fleet-table thead .th.sortable button',",
         source_path: "src/pages/nets.rs",
         source: NETS_RS,
-        hook: "class=\"tbl-hd\"",
+        hook: "<thead>",
     },
     Contract {
-        assignment: "tableSortControl: '.tbl-hd .th.sortable button',",
+        assignment: "tableSortControl: '.fleet-table thead .th.sortable button',",
+        source_path: "src/pages/schema.rs",
+        source: SCHEMA_RS,
+        hook: "class=\"fleet-table schema-table\"",
+    },
+    Contract {
+        assignment: "tableSortControl: '.fleet-table thead .th.sortable button',",
+        source_path: "src/pages/nets.rs",
+        source: NETS_RS,
+        hook: "class=\"fleet-table nets-table\"",
+    },
+    Contract {
+        assignment: "tableSortControl: '.fleet-table thead .th.sortable button',",
         source_path: "src/components/sort_th.rs",
         source: SORT_TH_RS,
         hook: "class=\"th sortable\"",
@@ -1263,13 +1275,25 @@ const CONTRACTS: &[Contract] = &[
         hook: "class=\"name-edit\"",
     },
     Contract {
-        assignment: "netRunRow: '.sd-body .tbl-body .tbl-row',",
+        assignment: "netRunRow: '.sd-body .run-preview-table > tbody > .tbl-row',",
         source_path: "../fleet-ui/src/drawer.rs",
         source: DRAWER_RS,
         hook: "class=\"sd-body\"",
     },
     Contract {
-        assignment: "netRunRow: '.sd-body .tbl-body .tbl-row',",
+        assignment: "netRunRow: '.sd-body .run-preview-table > tbody > .tbl-row',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "class=\"fleet-table run-preview-table\"",
+    },
+    Contract {
+        assignment: "netRunRow: '.sd-body .run-preview-table > tbody > .tbl-row',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "</tr></thead><tbody>",
+    },
+    Contract {
+        assignment: "netRunRow: '.sd-body .run-preview-table > tbody > .tbl-row',",
         source_path: "src/components/net_drawer.rs",
         source: NET_DRAWER_RS,
         hook: "class=\"tbl-row\"",

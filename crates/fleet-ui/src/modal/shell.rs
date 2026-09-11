@@ -53,6 +53,12 @@ pub fn Modal(
     footer: Children,
     children: Children,
 ) -> impl IntoView {
+    thread_local! { static NEXT_TITLE_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
+    let title_id = NEXT_TITLE_ID.with(|next| {
+        let id = next.get();
+        next.set(id + 1);
+        format!("fleet-modal-title-{id}")
+    });
     let scrim_ref = NodeRef::<Div>::new();
     let panel_ref = NodeRef::<Div>::new();
 
@@ -114,12 +120,12 @@ pub fn Modal(
             node_ref=scrim_ref
             on:mousedown=on_scrim_mousedown
         >
-            <div class=panel_class role=role aria-modal="true" tabindex="-1" node_ref=panel_ref>
+            <div class=panel_class role=role aria-labelledby=title_id.clone() aria-modal="true" tabindex="-1" node_ref=panel_ref>
                 <div class="m-hd">
                     {icon.map(|ic| view! {
                         <span class="ic"><IconView icon=ic size=12 stroke_width=1.5/></span>
                     })}
-                    <span class="t">{title}</span>
+                    <span class="t" id=title_id.clone()>{title}</span>
                     // A named native button: the glyph carries no text,
                     // so aria-label is the whole accessible name, and
                     // Enter/Space have to reach the cancel callback the

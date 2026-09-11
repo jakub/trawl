@@ -81,6 +81,8 @@ pub mod kbd;
 #[cfg(any(target_arch = "wasm32", test))]
 pub(crate) mod menu;
 #[cfg(target_arch = "wasm32")]
+pub mod overflow_hint;
+#[cfg(target_arch = "wasm32")]
 pub mod pager;
 #[cfg(target_arch = "wasm32")]
 pub mod rail;
@@ -147,6 +149,8 @@ pub use loaded::Loaded;
 pub use login::Login;
 #[cfg(target_arch = "wasm32")]
 pub use modal::{ConfirmModal, ConfirmWithReasonModal, Modal};
+#[cfg(target_arch = "wasm32")]
+pub use overflow_hint::OverflowHint;
 #[cfg(target_arch = "wasm32")]
 pub use pager::Pager;
 #[cfg(target_arch = "wasm32")]

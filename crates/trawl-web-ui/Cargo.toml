@@ -58,6 +58,8 @@ leptos_meta = "0.8"
 # with its own cleanup.
 leptos-use = { version = "0.19", default-features = false, features = [
     "use_event_listener",
+    "use_media_query",
+    "use_resize_observer",
     "use_window",
 ] }
 console_error_panic_hook = "0.1"
@@ -74,6 +76,7 @@ web-sys = { version = "0.3", features = [
     "CloseEvent",
     "Document",
     "Element",
+    "Event",
     "EventSource",
     "EventTarget",
     # `History` is the Schema page's origin-aware back: an entry the SPA

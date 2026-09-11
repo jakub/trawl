@@ -23,6 +23,8 @@ export interface ChartOpts {
    * label by the viewer's own offset.
    */
   utc?: boolean;
+  /** Search snapshots use result positions instead of epoch seconds. */
+  rowIndex?: boolean;
 }
 
 export interface ChartHandle {
@@ -39,8 +41,8 @@ export interface ChartHandle {
  *
  * The chart paints onto a canvas, so it can't inherit the Mira palette
  * the way the DOM chrome does — the tokens have to be read out and
- * handed to uPlot as literal colours. Resolved once at construction;
- * charts are rebuilt when their host component remounts.
+ * handed to uPlot through color callbacks. Read on mount and whenever
+ * the root theme attribute changes, without replacing the chart.
  */
 function token(name: string, fallback: string): string {
   const v = getComputedStyle(document.documentElement)
@@ -68,14 +70,42 @@ function translucent(color: string, alpha: number): string {
   return `#${hex[1]}${a}`;
 }
 
+// Canvas and legend use the same CSS-pixel patterns. A CSS border marker
+// cannot represent dash-dot patterns, so each line gets an SVG legend key.
+const lineDashes = [[], [6, 4], [2, 4], [12, 4], [8, 3, 2, 3], [8, 3, 2, 3, 2, 3]];
+
+function lineLabel(label: string, color: string, dash: number[]): HTMLElement {
+  const key = document.createElement("span");
+  key.className = "series-key";
+  key.style.cssText = "display:inline-flex;align-items:center;gap:.4em;color:var(--ink)";
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("width", "44");
+  svg.setAttribute("height", "12");
+  svg.setAttribute("viewBox", "0 0 44 12");
+  svg.setAttribute("aria-hidden", "true");
+  const line = document.createElementNS(svg.namespaceURI, "line");
+  line.setAttribute("x1", "0");
+  line.setAttribute("x2", "44");
+  line.setAttribute("y1", "6");
+  line.setAttribute("y2", "6");
+  line.setAttribute("stroke", color);
+  line.setAttribute("stroke-width", "2");
+  line.setAttribute("stroke-dasharray", dash.join(" "));
+  svg.append(line);
+  const text = document.createElement("span");
+  text.textContent = label;
+  key.append(svg, text);
+  return key;
+}
+
 export function createChart(
   parent: HTMLElement,
   data: AlignedData,
   opts: ChartOpts
 ): ChartHandle {
-  const accent = token("--accent", "#2a5c8a");
-  const ink3 = token("--ink-3", "#8a8a8a");
-  const line2 = token("--line-2", "rgba(128,128,128,.2)");
+  let accent = token("--accent", "#2a5c8a");
+  let ink3 = token("--ink-3", "#8a8a8a");
+  let line2 = token("--line-2", "rgba(128,128,128,.2)");
   const mono = token("--font-mono", "monospace");
 
   const bars = opts.kind === "bars";
@@ -106,18 +136,23 @@ export function createChart(
     return [min, max + step];
   };
 
+  const readColors = () => [accent, token("--teal", accent), token("--red", accent),
+    token("--yellow", accent), token("--green", accent), token("--ink", accent)];
+  let colors = readColors();
   const series = [
-    { label: "time" },
-    ...seriesLabels.map((label) => ({
-      label,
-      stroke: accent,
+    { label: opts.rowIndex ? "Result position" : "time" },
+    ...seriesLabels.map((label, index) => ({
+      label: bars ? label : lineLabel(label, colors[index % colors.length], lineDashes[index % lineDashes.length]),
+      stroke: () => bars ? accent : colors[index % colors.length],
+      // uPlot passes dash lengths directly to its device-pixel canvas.
+      dash: bars ? [] : lineDashes[index % lineDashes.length].map(length => length * window.devicePixelRatio),
       // Bars are flat fills with NO stroke: uPlot strokes zero-height
       // rects too, which drew a dashed hairline along the baseline for
       // every empty bucket. Flat also matches the Mira button recipe.
       width: bars ? 0 : 2,
       ...(bars
         ? {
-            fill: translucent(accent, 0.8),
+            fill: () => translucent(accent, 0.8),
             paths: barPath,
             points: { show: false },
           }
@@ -126,9 +161,9 @@ export function createChart(
   ];
 
   const axisBase = {
-    stroke: ink3,
-    grid: { stroke: line2, width: 1 },
-    ticks: { stroke: line2, width: 1 },
+    stroke: () => ink3,
+    grid: { stroke: () => line2, width: 1 },
+    ticks: { stroke: () => line2, width: 1 },
     font: `10px ${mono}`,
   };
 
@@ -140,7 +175,7 @@ export function createChart(
       ? { tzDate: (ts: number) => uPlot.tzDate(new Date(ts * 1000), "Etc/UTC") }
       : {}),
     scales: {
-      x: { time: true, ...(bars ? { range: barRange } : {}) },
+      x: { time: !opts.rowIndex, ...(bars ? { range: barRange } : {}) },
       // Counts start at zero — letting uPlot auto-range the floor makes a
       // flat-ish series look far more dramatic than it is.
       y: { range: (_u, _min, max) => [0, Math.max(max, 1)] },
@@ -161,16 +196,43 @@ export function createChart(
       points: { show: !bars },
       y: !bars,
     },
-    legend: { live: true },
+    legend: { live: true, markers: { show: bars } },
   };
 
   const chart = new uPlot(options, data, parent);
+  let destroyed = false;
+  const themeObserver = new MutationObserver(() => {
+    if (destroyed) return;
+    accent = token("--accent", "#2a5c8a");
+    ink3 = token("--ink-3", "#8a8a8a");
+    line2 = token("--line-2", "rgba(128,128,128,.2)");
+    colors = readColors();
+    chart.root.querySelectorAll(".series-key line").forEach((line, index) => {
+      line.setAttribute("stroke", colors[index % colors.length]);
+    });
+    if (bars) {
+      chart.root.querySelectorAll<HTMLElement>(".u-legend .u-marker").forEach((marker, index) => {
+        if (index > 0) marker.style.background = translucent(accent, 0.8);
+      });
+    }
+    // Bar paths cache their fill, so rebuild those paths at the current scales.
+    // Keep the chart instance, data, native legend listeners and hidden series.
+    chart.redraw(bars, true);
+    // uPlot commits redraw in a microtask. Refresh hover points after its
+    // cached stroke colors update, including a stationary cursor.
+    queueMicrotask(() => {
+      if (!destroyed) chart.setCursor({ left: chart.cursor.left ?? -10, top: chart.cursor.top ?? -10 }, false);
+    });
+  });
+  themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
 
   return {
     setData(next: AlignedData) {
       chart.setData(next);
     },
     destroy() {
+      destroyed = true;
+      themeObserver.disconnect();
       chart.destroy();
     },
     resize(w: number, h: number) {

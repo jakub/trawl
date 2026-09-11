@@ -959,18 +959,7 @@
  * emits it. */
 
 /* Generic list table for page-level views (no sort, no expand). */
-.tbl {
-  border: 1px solid var(--line); border-radius: var(--radius-panel); background: var(--panel);
-  display: flex; flex-direction: column; min-height: 0; overflow: hidden;
-  flex: 1;
-}
 .tbl-body { flex: 1; min-height: 0; overflow-y: auto; }
-.tbl-hd {
-  display: flex; padding: 8px 14px; gap: 12px;
-  background: var(--panel-2); color: var(--ink-3);
-  font-family: var(--font-ui); font-size: var(--fs-ui); font-weight: 600;
-  border-bottom: 1px solid var(--line);
-}
 /* The one control a list row carries (ADR-0029). The row is the
  * containing block, so this pseudo-element covers the whole row and a
  * pointer anywhere on it reaches the single listener. The control and
@@ -1113,8 +1102,7 @@
 /* .tbl-foot retired (issue #31): every table footer renders
  * fleet_ui::Pager (.results-footer family, shipped with the crate). */
 
-/* ============================================================
-   Schema page — sortable services table (.tbl family above) +
+/* =====================================================   Schema page — sortable services table (.tbl family above) +
    slide-out drawer inspector. The v2 cards grid (.sc-grid/.sc-card
    and friends) is retired; only the drawer-side classes remain.
    ============================================================ */
@@ -1435,7 +1423,7 @@
 }
 .tl-row { display: grid; grid-template-columns: 70px 1fr; gap: 12px; animation: tail-in 220ms ease-out; }
 .tl-row .ts { color: var(--ink-3); }
-.tl-row .msg { color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tl-row .msg { color: var(--ink); white-space: pre-wrap; overflow-wrap: anywhere; min-width: 0; }
 @keyframes tail-in { from { opacity: 0; transform: translateY(-2px); } to { opacity: 1; transform: none; } }
 
 /* ── nets & runs (Jobs mode) ─────────────────────────────────── */
@@ -1544,3 +1532,84 @@
 .health-query-table code { white-space: pre-wrap; overflow-wrap: anywhere; }
 .health-query-id { display: block; margin-bottom: 5px; color: var(--ink-3); }
 @media (max-width: 640px) { .health-page { padding: 20px 16px; } .health-facts { gap: 16px 24px; } }
+
+/* The sidebar remains one mounted disclosure so field search and group
+ * expansion survive viewport changes. Match the media query in FacetSidebar. */
+.facet-panel { width: var(--facets-w); flex-shrink: 0; min-height: 0; }
+.facet-panel > summary { display: none; }
+.facet-panel > .facets { width: 100%; height: 100%; }
+.page, .health-page { min-width: 0; }
+.page-hd, .page-hd .actions, .health-heading { flex-wrap: wrap; }
+.page-hd > *, .health-heading > * { min-width: 0; max-width: 100%; }
+.page-hd .actions { flex-shrink: 1; }
+.sd-overview { grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); }
+.sd-card { min-width: 0; }
+.sd-ttl .name, .sd-ttl .sub { overflow-wrap: anywhere; }
+@media (max-width: 900px) {
+  .search-layout { flex-direction: column; overflow-y: auto; }
+  .facet-panel { width: auto; border-bottom: 1px solid var(--line); background: var(--panel); }
+  .facet-panel > summary { display: list-item; padding: 10px 12px; font-size: var(--fs-ui); font-weight: 500; color: var(--ink-2); cursor: pointer; }
+  .facet-panel .facet-count { color: var(--ink-3); font-weight: 400; margin-inline-start: 6px; }
+  .facet-panel > .facets { height: auto; max-height: min(45dvh, 360px); border-right: 0; }
+  .search-col { flex-shrink: 0; min-height: 480px; }
+  .statusbar { height: auto; min-height: var(--statusbar-h); flex-wrap: wrap; gap: 4px 10px; padding-block: 4px; }
+}
+@media (max-width: 600px) {
+  .page { padding: 16px 16px 24px; gap: 16px; }
+  .page-hd { gap: 12px; }
+  .editor-row { flex-direction: column; }
+  .editor-right { width: auto; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  .editor-tools { grid-column: 1 / -1; justify-content: flex-end; flex-wrap: wrap; gap: 8px; }
+  .editor-tools .tool { min-height: 28px; }
+  .search-col { min-height: 560px; }
+  .sd-overview { grid-template-columns: minmax(0, 1fr); grid-template-areas: "chart" "types" "top"; }
+  .stats-row { flex-wrap: wrap; }
+  .stat-card { flex-basis: 120px; min-width: 0; }
+}
+
+/* One scroll region keeps list headings aligned with wide rows. */
+.tbl-scroll { display: block; min-height: 180px; overflow: auto; }
+.tbl-scroll > .tbl-body { min-width: var(--list-min-width); }
+.tbl-scroll .tbl-body { overflow: visible; }
+.tbl-scroll:focus-visible, .results:focus-visible, .facet-panel > summary:focus-visible { outline: 2px solid var(--ring); outline-offset: -2px; }
+
+@media (max-width: 600px) {
+  .modal .m-ft { justify-content: flex-end; }
+  .modal .m-ft .hint { flex-basis: 100%; }
+}
+
+.stat-card .load-hint { padding: 0; font-size: var(--fs-ui); font-weight: 400; line-height: 1.4; }
+/* Live state and new rows remain readable without repeating motion. */
+@media (prefers-reduced-motion: reduce) {
+  .pulse > span, .tl-row, .statusbar .dot.live, .sf-detail {
+    animation: none;
+  }
+}
+
+/* Column content and route-specific density stay in Trawl. */
+.fleet-table .tbl-row { display: table-row; }
+.fleet-table th.th, .fleet-table td.svc-cell, .fleet-table td.row-act { display: table-cell; }
+.fleet-table .svc-cell .row-stretch { display: block; }
+.fleet-table .svc-cell .name { white-space: normal; overflow-wrap: anywhere; }
+.fleet-table .freshness { display: inline; font-size: var(--fs-ui); color: var(--ink-3); }
+.fleet-table .run-status { margin-inline-start: 4px; }
+.fleet-table.history-table > tbody > tr > td { vertical-align: top; }
+.fleet-table .row-act { white-space: nowrap; }
+.fleet-table th .th { justify-content: inherit; }
+.fleet-table th[style*="text-align:right"] button { justify-content: flex-end; }
+
+.fleet-table .path { word-break: normal; overflow-wrap: anywhere; }
+.schema-table td.mono { white-space: nowrap; }
+.nets-table th:first-child { width: 25%; }
+
+.tl-stream:focus-visible { outline: 2px solid var(--ring); outline-offset: -2px; }
+
+.bucket-data { padding: 6px 14px; background: var(--panel); }
+.bucket-data summary { cursor: pointer; min-height: 32px; align-content: center; }
+.bucket-scroll { overflow: auto; max-height: 240px; }
+.bucket-data table { width: 100%; border-collapse: collapse; }
+.bucket-data th, .bucket-data td { text-align: start; padding: 6px 10px; white-space: nowrap; }
+.bucket-data caption { text-align: start; padding-block: 8px; }
+.chart-note { padding: 8px 14px; color: var(--ink-2); }
+
+.sd-ttl .service-freshness { flex-basis: 100%; display: flex; align-items: center; gap: 6px; font-size: var(--fs-ui); color: var(--ink-2); }

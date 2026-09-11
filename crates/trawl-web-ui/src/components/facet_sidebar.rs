@@ -16,6 +16,7 @@ use std::collections::HashMap;
 
 use fleet_ui::{Icon, IconView, LoadState, Loaded, SearchInput};
 use leptos::prelude::*;
+use leptos_use::use_media_query;
 use trawl_api::QueryResponse;
 
 use crate::api::ApiError;
@@ -50,8 +51,41 @@ pub fn FacetSidebar(
     // Per-field expansion (show top 5 vs all matching values).
     let expanded: RwSignal<HashMap<String, bool>> = RwSignal::new(HashMap::new());
 
+    // Keep one facet tree mounted across both layouts. Filters themselves
+    // remain URL-owned; this disclosure only controls their presentation.
+    let compact = use_media_query("(max-width: 900px)");
+    let open = RwSignal::new(false);
+    let panel = NodeRef::<leptos::html::Details>::new();
+    Effect::new(move |_| {
+        if compact.get()
+            && let Some(panel) = panel.get()
+            && let Some(active) = document().active_element()
+            && panel.contains(Some(&active))
+        {
+            open.set(true);
+        }
+    });
+
     view! {
-        <aside class="facets">
+        <details
+            class="facet-panel"
+            node_ref=panel
+            open=move || !compact.get() || open.get()
+            on:toggle=move |_| {
+                if compact.get() && let Some(panel) = panel.get() {
+                    open.set(panel.has_attribute("open"));
+                }
+            }
+        >
+        <summary>
+            "Filters"
+            <span class="facet-count">{move || {
+                let count = filters.get().len();
+                if count == 0 || suppressed.get() { String::new() }
+                else { format!("{count} active") }
+            }}</span>
+        </summary>
+        <aside class="facets" aria-label="Search filters">
             <div class="phead">
                 <div class="ttl">"Filters"</div>
                 <Show when=move || !filters.get().is_empty() && !suppressed.get()>
@@ -204,6 +238,7 @@ pub fn FacetSidebar(
                 })
             />
         </aside>
+        </details>
     }
 }
 

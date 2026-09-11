@@ -80,7 +80,7 @@ const MIME = {
 
 // ---- mutable test-scoped state -------------------------------------------
 
-/** @type {'default'|'unauth'|'query-500'|'stream-burst'|'populated'|'corpus'} */
+/** @type {'default'|'unauth'|'query-500'|'stream-chart'|'stream-burst'|'populated'|'corpus'} */
 let scenario = 'default';
 
 function savedScenario() { return scenario === 'saved-success' || scenario === 'saved-retry'; }
@@ -331,7 +331,8 @@ function serveStream(res) {
 
   let n = 0;
   const burst = scenario === 'stream-burst';
-  const timer = burst ? undefined : setInterval(() => {
+  const chart = scenario === 'stream-chart';
+  const timer = (burst || chart) ? undefined : setInterval(() => {
     n += 1;
     res.write(`event: data\ndata: ${JSON.stringify({ _time: new Date().toISOString(), message: `tick ${n}` })}\n\n`);
   }, 150);
@@ -349,7 +350,7 @@ function serveStream(res) {
   // EventSource auto-reconnects on a server-closed stream, so if the
   // SPA failed to `close()` it on unmount we'll see `opens` keep
   // climbing every ~200ms (the `retry:` interval) after teardown.
-  if (!burst) setTimeout(() => {
+  if (!burst && !chart) setTimeout(() => {
     if (sse.responses.has(res)) {
       res.end();
     }
@@ -384,6 +385,23 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
     url = new URL(req.url, `http://${req.headers.host}`);
     p = url.pathname;
     // -- control plane ---------------------------------------------------
+    // Keep the chart connection open while a test sends valid or malformed
+    // snapshot frames. A closed fixture response is a real disconnect.
+    if (p === '/__ctl/stream/frame' && req.method === 'POST') {
+      const { data } = JSON.parse(await readBody(req));
+      if (scenario !== 'stream-chart' || typeof data !== 'string' || data.includes('\n') || sse.responses.size === 0) {
+        sendJson(res, 409, { ok: false });
+        return;
+      }
+      for (const response of sse.responses) response.write(`event: snapshot\ndata: ${data}\n\n`);
+      sendJson(res, 200, { ok: true, sent: sse.responses.size });
+      return;
+    }
+    if (p === '/__ctl/stream/drop' && req.method === 'POST') {
+      for (const response of sse.responses) response.end();
+      sendJson(res, 200, { ok: true });
+      return;
+    }
     if (p === '/__ctl/health' && req.method === 'GET') {
       res.writeHead(200, { 'content-type': 'text/plain' });
       res.end('ok');

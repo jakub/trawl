@@ -16,6 +16,7 @@ use fleet_ui::{LoadState, Loaded, OffsetPager, PageTotal, PageWindow, SearchInpu
 #[component]
 #[allow(clippy::too_many_lines)]
 pub fn RunsPage() -> impl IntoView {
+    let table_viewport = NodeRef::<leptos::html::Div>::new();
     let page = RwSignal::new(0usize);
     let filter = RwSignal::new(String::new());
 
@@ -51,56 +52,56 @@ pub fn RunsPage() -> impl IntoView {
             </div>
 
             <div class="stats-row">
-                {move || {
-                    let active_nets = nets_for_stats.get()
-                        .and_then(Result::ok)
-                        .map_or(0, |resp| {
-                            resp.queries.iter()
-                                .filter(|q| q.schedule.as_ref().is_some_and(|s| s.enabled))
-                                .count()
-                        });
-
-                    let (success_rate, avg_dur) = stats.get()
-                        .and_then(Result::ok)
-                        .map_or(("—".to_string(), "—".to_string()), |s| {
-                            let total = s.total_runs;
-                            let rate = (s.success_count * 100)
-                                .checked_div(total)
-                                .map_or_else(|| "—".to_string(), |pct| format!("{pct}%"));
-                            let avg = s.avg_duration_ms
-                                .map_or_else(|| "—".to_string(), format_duration);
-                            (rate, avg)
-                        });
-
-                    view! {
-                        <div class="stat-card">
-                            <div class="label">"Active nets"</div>
-                            <div class="value">{active_nets.to_string()}</div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="label">"Success rate"</div>
-                            <div class="value">{success_rate}</div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="label">"Avg duration"</div>
-                            <div class="value">{avg_dur}</div>
-                        </div>
-                    }
-                }}
+                <div class="stat-card">
+                    <div class="label">"Active nets"</div>
+                    <div class="value">
+                        <Loaded
+                            state=Signal::derive(move || LoadState::from_resource(nets_for_stats.get()))
+                            label="active nets"
+                            retry=Callback::new(move |()| { nets_for_stats.set(None); nets_for_stats.refetch(); })
+                            render=Box::new(|resp: trawl_api::ListSavedResponse| {
+                                resp.queries.iter().filter(|q| q.schedule.as_ref().is_some_and(|s| s.enabled))
+                                    .count().to_string().into_any()
+                            })
+                        />
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="label">"Success rate"</div>
+                    <div class="value">
+                        <Loaded
+                            state=Signal::derive(move || LoadState::from_resource(stats.get()))
+                            label="success rate"
+                            retry=Callback::new(move |()| { stats.set(None); stats.refetch(); })
+                            render=Box::new(|s: trawl_api::RunsStatsResponse| {
+                                (s.success_count * 100).checked_div(s.total_runs)
+                                    .map_or_else(|| "—".to_string(), |pct| format!("{pct}%")).into_any()
+                            })
+                        />
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="label">"Avg duration"</div>
+                    <div class="value">
+                        <Loaded
+                            state=Signal::derive(move || LoadState::from_resource(stats.get()))
+                            label="average duration"
+                            retry=Callback::new(move |()| { stats.set(None); stats.refetch(); })
+                            render=Box::new(|s: trawl_api::RunsStatsResponse| {
+                                s.avg_duration_ms.map_or_else(|| "—".to_string(), format_duration).into_any()
+                            })
+                        />
+                    </div>
+                </div>
             </div>
 
-            <div class="tbl" style="margin-top:16px">
-                <div class="tbl-hd">
-                    <div style="flex:1">"Net"</div>
-                    <div style="flex:0 0 70px">"Status"</div>
-                    <div style="flex:0 0 80px">"When"</div>
-                    <div style="flex:0 0 60px">"Duration"</div>
-                    <div style="flex:0 0 50px; text-align:right">"Rows"</div>
-                </div>
+            <fleet_ui::OverflowHint viewport=table_viewport/>
+                <div node_ref=table_viewport class="tbl fleet-table-frame tbl-scroll" role="region" aria-label="Recent runs" tabindex="0" style="--list-min-width:560px;margin-top:16px">
                 <div class="tbl-body">
                     <Loaded
                         state=Signal::derive(move || LoadState::from_resource(runs.get()))
                         label="runs"
+                        retry=Callback::new(move |()| { runs.set(None); runs.refetch(); })
                         render=Box::new(move |(fetched_page, resp): (usize, trawl_api::ListAllRunsResponse)| {
                                 let now = now_ms();
                                 let needle = filter.get().to_lowercase();
@@ -133,24 +134,32 @@ pub fn RunsPage() -> impl IntoView {
                                     let href = format!("/jobs/nets?net={net_id}&ntab=runs");
 
                                     view! {
-                                        <div class="tbl-row">
-                                            <div style="flex:1" class="mono">
+                                            <tr class="tbl-row">
+                                                <td class="mono">
                                                 <a class="row-stretch" href=href>{net_name}</a>
-                                            </div>
-                                            <div style="flex:0 0 70px">
+                                                </td>
+                                                <td>
                                                 <StatusDot tone=tone/>
                                                 " "
                                                 <span style="font-size:11px">{run_status}</span>
-                                            </div>
-                                            <div style="flex:0 0 80px" class="mono">{when}</div>
-                                            <div style="flex:0 0 60px" class="mono">{dur}</div>
-                                            <div style="flex:0 0 50px; text-align:right" class="mono">{row_ct}</div>
-                                        </div>
+                                                </td>
+                                                <td class="mono">{when}</td>
+                                                <td class="mono">{dur}</td>
+                                                <td style="text-align:right" class="mono">{row_ct}</td>
+                                            </tr>
                                     }
                                 }).collect_view();
 
                                 view! {
-                                    {rows}
+                                    <table class="fleet-table runs-table" aria-label="Recent runs">
+                                        <thead><tr>
+                                            <th scope="col">"Net"</th>
+                                            <th scope="col" style="width:90px">"Status"</th>
+                                            <th scope="col" style="width:100px">"When"</th>
+                                            <th scope="col" style="width:80px">"Duration"</th>
+                                            <th scope="col" style="width:70px; text-align:right">"Rows"</th>
+                                        </tr></thead>
+                                        <tbody>{rows}</tbody></table>
                                     {if returned == 0 { Some(view! {
                                         <div class="tbl-empty">{if total == 0 && fetched_page == 0 {
                                             "No runs yet — attach a schedule to a net to get started"

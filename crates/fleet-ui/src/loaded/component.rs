@@ -33,12 +33,15 @@ use super::state::{LoadState, error_copy, loading_copy, missing_copy};
 /// second line. `missing_subtitle` decorates only that default arm:
 /// pass a custom `missing` closure and the subtitle is ignored (render
 /// it yourself inside the closure).
+/// `retry` adds a recovery button to the default error presentation. The
+/// caller owns the request and its context; custom error views own recovery too.
 #[component]
 pub fn Loaded<T>(
     #[prop(into)] state: Signal<LoadState<T>>,
     #[prop(optional)] label: Option<&'static str>,
     render: Box<dyn Fn(T) -> AnyView + Send + Sync>,
     #[prop(optional)] error: Option<Box<dyn Fn(String) -> AnyView + Send + Sync>>,
+    #[prop(optional)] retry: Option<Callback<()>>,
     #[prop(optional)] missing: Option<Box<dyn Fn() -> AnyView + Send + Sync>>,
     /// Optional second line under the default "not found" copy;
     /// ignored when a custom `missing` closure is supplied.
@@ -67,7 +70,14 @@ where
             LoadState::Error(msg) => match &error {
                 Some(render_err) => render_err(msg),
                 None => view! {
-                    <div class="load-hint error">{error_copy(label, &msg)}</div>
+                    <div class="load-hint error">
+                        <div>{error_copy(label, &msg)}</div>
+                        {retry.map(|on_retry| view! {
+                            <div class="load-recovery">
+                                <crate::Btn variant=crate::Variant::Secondary on_click=on_retry>"Retry"</crate::Btn>
+                            </div>
+                        })}
+                    </div>
                 }.into_any(),
             },
             LoadState::Ready(value) => render(value),

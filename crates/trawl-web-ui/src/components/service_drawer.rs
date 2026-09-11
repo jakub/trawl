@@ -128,11 +128,11 @@ pub fn ServiceDrawer(
             close_size=12
             meta=meta_text
             title=Box::new(move || view! {
-                <HealthDot svc=svc_for_head.clone()/>
                 <span class="name">{svc_for_head.name.clone()}</span>
                 {(!sub_text.is_empty()).then_some(view! {
                     <span class="sub">{sub_text}</span>
                 })}
+                <HealthDot svc=svc_for_head.clone()/>
             }.into_any())
             actions=Box::new(move || view! {
                 <Btn variant=Variant::Secondary on_click=on_search_click>
@@ -149,6 +149,7 @@ pub fn ServiceDrawer(
                         <FieldsPane
                             svc=svc_for_fields.clone()
                             cardinality=cardinality_sig
+                            on_retry_cardinality=Callback::new(move |()| { cardinality.set(None); cardinality.refetch(); })
                             focus_field=focus_field
                             on_use_field=on_use_field
                             on_open_field=on_open_field
@@ -163,6 +164,7 @@ pub fn ServiceDrawer(
                         <OverviewPane
                             svc=svc_for_over.clone()
                             cardinality=cardinality_sig
+                            on_retry_cardinality=Callback::new(move |()| { cardinality.set(None); cardinality.refetch(); })
                             on_use_field=on_use_field
                         />
                     }.into_any()
@@ -179,6 +181,7 @@ pub fn ServiceDrawer(
 fn OverviewPane(
     svc: ServiceSchema,
     cardinality: Signal<Option<Result<HashMap<String, u64>, String>>>,
+    on_retry_cardinality: Callback<()>,
     on_use_field: Callback<String>,
 ) -> impl IntoView {
     let svc_name = svc.name.clone();
@@ -213,6 +216,7 @@ fn OverviewPane(
                 <Loaded
                     state=Signal::derive(move || LoadState::from_resource(cardinality.get()))
                     label="cardinality"
+                    retry=on_retry_cardinality
                     render=Box::new(move |card_map: HashMap<String, u64>| {
                         let rows = top_cardinality_rows(&columns_for_top, &card_map, TOP_CARDINALITY_ROWS);
                         if rows.is_empty() {
@@ -278,6 +282,7 @@ impl SortKey {
 fn FieldsPane(
     svc: ServiceSchema,
     cardinality: Signal<Option<Result<HashMap<String, u64>, String>>>,
+    on_retry_cardinality: Callback<()>,
     focus_field: RwSignal<Option<String>>,
     on_use_field: Callback<String>,
     on_open_field: Callback<String>,
@@ -323,6 +328,12 @@ fn FieldsPane(
 
     view! {
         <div class="sd-fields">
+            {move || cardinality.get().and_then(Result::err).map(|msg| view! {
+                <div class="load-hint error">
+                    <div>{format!("Couldn't load cardinality: {msg}")}</div>
+                    <div class="load-recovery"><Btn variant=Variant::Secondary on_click=on_retry_cardinality>"Retry"</Btn></div>
+                </div>
+            })}
             <div class="sf-hd">
                 {sort_th(sort, SortKey::Name, SortKey::Name.default_desc(), "Field", "")}
                 <div>"Type"</div>
@@ -514,6 +525,7 @@ fn FieldDetail(
                 <Loaded
                     state=Signal::derive(move || LoadState::from_resource(top.get()))
                     label="values"
+                    retry=Callback::new(move |()| { top.set(None); top.refetch(); })
                     render=Box::new(move |resp: QueryResponse| {
                         let rows = parse_top_values(&resp, &field_name, count_column);
                         if rows.is_empty() {
@@ -589,6 +601,7 @@ fn TailPane(svc: ServiceSchema, bus: ToastBus) -> impl IntoView {
             ring,
             snapshot,
             lagged,
+            failure: None,
         };
         match start_stream(&q, sig) {
             Some(lc) => lifecycle.set_value(Some(lc)),
@@ -627,7 +640,7 @@ fn TailPane(svc: ServiceSchema, bus: ToastBus) -> impl IntoView {
                 </Btn>
             </div>
 
-            <div class="tl-stream">
+            <div class="tl-stream" role="region" aria-label="Live tail messages" tabindex="0">
                 {move || {
                     let rb = ring.read();
                     let total = rb.events.len();
@@ -815,6 +828,7 @@ fn HistogramChart(resource: LocalResource<Result<QueryResponse, api::ApiError>>)
         <Loaded
             state=Signal::derive(move || LoadState::from_resource(resource.get()))
             label="histogram"
+            retry=Callback::new(move |()| { resource.set(None); resource.refetch(); })
             render=Box::new(move |resp: QueryResponse| {
                 let slots = build_histogram(&resp);
                 if slots.is_empty() {
@@ -1024,5 +1038,6 @@ fn HealthDot(svc: ServiceSchema) -> impl IntoView {
     } else {
         fleet_ui::StatusTone::Error
     };
-    view! { <fleet_ui::StatusDot tone=tone/> }
+    view! { <span class="service-freshness"><fleet_ui::StatusDot tone=tone/>
+    " "{super::service_card_fmt::freshness_label(&svc)}</span> }
 }

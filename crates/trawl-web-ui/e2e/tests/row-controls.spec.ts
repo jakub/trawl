@@ -356,9 +356,10 @@ test('net run row: Enter expands once and Space collapses', async ({ page, reque
   await expect(control).toHaveAttribute('type', 'button');
   await expect(control).toHaveAttribute('aria-expanded', 'false');
 
-  // The Runs tab is the focusable before the table: its header row
-  // carries no controls at all.
+  // The local scroll region follows Runs, then the first row control.
   await page.locator(SEL.drawerTab).nth(1).focus();
+  await page.keyboard.press('Tab');
+  await expect(page.getByRole('region', { name: 'Net runs', exact: true })).toBeFocused();
   await page.keyboard.press('Tab');
   await expectFocusRing(control);
 
