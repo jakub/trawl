@@ -383,7 +383,8 @@ jobs:
     name: Command palette admission and toggle mutations
     runs-on: k8s-big
     needs: web-ui-e2e
-    timeout-minutes: 20
+    # Browser system packages can take 15 minutes before the SPA rebuilds.
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
@@ -426,7 +427,8 @@ jobs:
     name: Save editor snapshot mutation
     runs-on: k8s-big
     needs: web-ui-e2e
-    timeout-minutes: 20
+    # Allow package setup plus pristine, mutated, and restored SPA checks.
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
