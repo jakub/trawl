@@ -3,7 +3,9 @@ title: CLI & TUI
 description: Command-line interface and terminal UI reference.
 ---
 
-The `trawl` binary provides three modes of operation: an interactive TUI, a query command for scripting, and a validate command for syntax checking.
+The `trawl` binary provides interactive TUI, query, validation, schema, and
+TUI-driver commands. This page defines command syntax and output. For catalog
+procedures, use [catalog administration](/operate/catalog/).
 
 ## TUI (interactive mode)
 
@@ -49,9 +51,8 @@ footer line follows:
 note: results may be incomplete — degraded field(s): duration (see: trawl schema field duration)
 ```
 
-The notice is table-only: json/csv carry the same fact as a
-`degraded_fields` list on the wire, where a prose line would corrupt the
-stream. With `--output <file>` it goes to stderr, so the file stays clean.
+The notice is table-only. The HTTP query response carries `degraded_fields`,
+but CLI JSON/CSV output remains data rows without an added prose record. With `--output <file>` it goes to stderr, so the file stays clean.
 Embedded `--data` mode has no catalog and never prints it.
 
 **JSON** output emits one JSON object per row, ndjson-style. Ideal for piping to `jq`:
@@ -107,248 +108,71 @@ accepts DSL-style windows (`s`, `m`, `h`, `d`, `w`).
 
 ### Degraded pins
 
-`fields` carries a `degraded` column, and its stderr summary counts them:
-a pin is degraded when it has been shelving values for **over a day** and
-in volume (100 rows or 3 distinct episodes). `schema field <name>` then
-renders the case file — when the damage started, how many senders and
-episodes, the lifetime rows shelved, a sample of the values that were
-nulled, and the repin command to run:
+`fields` carries a `degraded` column. `field` prints a verdict and bounded
+samples; conflict rows and verdict lifetime totals have different windows.
+See [diagnosis and acknowledgement](/operate/catalog/#degraded-pins).
+`ack FIELD [--note TEXT | --clear]` needs `schema_write`; note limit is 1024 bytes.
 
-```
-degraded pin:
-  since:          2026-08-01T10:00:00.000000Z
-  senders:        2
-  episodes:       41
-  rows shelved:   1290 (lifetime)
-  sample values:
-    - n/a
-    - pending
-  suggested:      VARCHAR
-  trawl schema repin duration --to varchar --dry-run
-```
-
-`rows shelved` is the lifetime total; the `rows_nulled` column in the
-conflict table below it sums only the evidence still inside the per-field
-recency window, so the two differ on purpose. Every shelved value remains
-in `_raw`. The verdict is advisory — nothing repins without `--yes` and
-`schema_write`.
-
-**Retiring a badge after fixing the sender.** The gate has no recency term:
-evidence is never aged out, so a field stays badged after its shipper is
-corrected. That is on purpose — the shelved rows are still missing from the
-corpus. Clearing both is one command, the same-type pass:
-
-```bash
-trawl schema repin duration --to bigint --force --dry-run   # `bigint` = the current pin
-trawl schema repin duration --to bigint --force --yes
-```
-
-A repin whose target equals the current pin is the **resurrection-only**
-pass: it re-extracts the shelved values from `_raw` under the pin they
-already have, and — because a successful repin clears the field's conflict
-evidence in the same transaction as the flip — the badge goes out with the
-damage it was reporting. Repinning to a *different* type does both as well.
-
-**Acknowledging a badge you are not repinning yet.** Sometimes the fix is
-with the sender and the shelved rows have to stay shelved for a while.
-`schema ack` says "seen, and accepted for now" without touching the corpus:
-
-```bash
-trawl schema ack duration --note "sender ships a fix on Friday"
-trawl schema ack duration --clear     # withdraw it
-```
-
-The ack covers the conflict evidence that exists when it is written and
-nothing beyond, so the badge goes quiet and comes straight back the moment
-the pin shelves another batch. That is the whole lifecycle: acknowledge,
-suppressed, a new episode re-raises it, and a repin clears the ack along
-with the evidence it acknowledged. `--note` is optional prose (max 1024
-bytes) and cannot be combined with `--clear`, which writes no note.
-Acknowledging needs `schema_write`, and a field whose evidence does not
-meet the degraded threshold is refused: there is nothing to acknowledge.
-
-`field` pages its service observations — the service axis is client-chosen
-and never pruned, so the server caps a page at 1000 rows (default 100).
-When more remain, a cursor is printed to stderr; pass it to `--after` for
-the next page:
-
-```bash
-trawl schema field duration --limit 500
-trawl schema field duration --limit 500 --after '2026-08-02T10:00:00.000000Z|nginx'
-```
+`field FIELD [--limit N] [--after CURSOR]` pages service observations.
+The default page is 100 and the maximum is 1000. Pass the returned cursor
+unchanged; it is opaque.
 
 ### Repin
 
-`schema repin` changes a wrongly-pinned field's type by rewriting the
-corpus (ADR-0011): affected files are rebuilt to the new type with
-conflict-shelved values resurrected from `_raw`, unaffected files are
-hardlinked, and the switch is atomic and crash-recoverable. It needs the
-`schema_write` permission.
-
-```bash
-trawl schema repin status --to varchar --dry-run   # mandatory first look
-trawl schema repin status --to varchar --yes       # execute (background job)
-trawl schema repin status --to varchar --yes --wait  # poll to completion
-trawl schema repin dur --to bigint --yes --force   # accept a lossy projection
-trawl schema repin-status                          # the running/last job
-trawl schema repin-cancel                          # ask the running job to stop
+```text
+trawl schema repin FIELD --to TYPE [--dialect otel|syslog] [--dry-run]
+    [--force] [--yes] [--wait] [--max-nulled-rows N] [--max-ambiguous-rows N]
+trawl schema repin-status
+trawl schema repin-cancel
 ```
 
-An executing repin confirms interactively; off a TTY it refuses without
-`--yes`. A repin whose dry run projects nulled values refuses without
-`--force` and prints the plan (the values it would null stay findable in
-`_raw`). `--to <current type> --force` runs a resurrection-only pass.
-All three commands honour `-f table|json|csv`.
+Types are `BIGINT`, `DOUBLE`, `TIMESTAMP`, `BOOLEAN`, `VARCHAR`, and
+`SEVERITY`, case-insensitive. `--dialect` is legal only for SEVERITY.
+Repin and cancellation need `schema_write` on an ingest-enabled node.
+Status needs `schema_read` and returns the running or newest job, with no ID lookup.
+There is no human-key-kind gate.
 
-**What `--force` accepts.** A forced repin is held to a number rather than
-to a blank cheque. `--max-nulled-rows N` bounds the rows the rewrite may
-null and `--max-ambiguous-rows N` the dialect-ambiguous numerals it may
-carry; state neither and the server derives both from its own scan, ten
-percent headroom over a floor of ten rows. The headroom is there because
-ingest keeps writing for the whole build, so the finished shadow is never
-quite the corpus the plan photographed, and a cutover refuses only when the
-rewrite comes out worse than what force accepted. That refusal reads
-`refused: over its ceilings`, and the case file names the accepted and the
-actual count: the remedy is a higher `--max-nulled-rows` /
-`--max-ambiguous-rows`, never the `--force` the job already carried.
+| Option | Contract |
+| --- | --- |
+| `--dry-run` | Scan and persist a report job; do not rewrite the corpus |
+| `--force` | Accept projected loss or run a same-type resurrection pass, subject to ceilings |
+| `--yes` | Skip interactive confirmation; required off a TTY |
+| `--wait` | Poll for this job's terminal result; fail if the status endpoint stops naming it |
+| `--max-nulled-rows N` | With force, bound rows the rewrite may null |
+| `--max-ambiguous-rows N` | With force, bound dialect-ambiguous numerals |
 
-`--yes --force` prints the ceilings it accepts, resolved from a preview
-scan, and binds them: without explicit flags the run takes a forced dry run
-first, prints those numbers, and then states them on the executing request.
-The printed line is therefore the bound the job is held to, not a default
-that a second scan might land somewhere else. State both flags and the
-preview is skipped.
+Unspecified force ceilings derive from the preview scan with ten percent
+headroom and a minimum addition of ten rows. The CLI prints and binds them on
+execution; explicit applicable ceilings avoid that preview. `requires_force`
+on the report says whether the identical executing request would be refused.
 
-Every report — dry run, running job, terminal job — carries
-`requires_force`: whether the *identical executing* request would be
-refused. A dry run succeeds by design, so without that column a plan
-carrying loss or dialect ambiguity would read as a clean pass and the
-refusal would arrive with the request that was meant to do the work.
+`--wait` exits zero for a completed rewrite or dry-run report. Other terminal
+states and a lost job identity are nonzero. Formats are `table`, `json`, and `csv`.
+See [the repin procedure](/operate/catalog/#repin) before executing.
 
 #### Stopping a running repin
 
-`schema repin-cancel` asks the running job to stop. It needs
-`schema_write` and takes no confirmation prompt, because cancelling only
-ever leaves the corpus as it already is. There are three answers, and the
-exit code carries the verdict:
-
-- accepted (exit 0): the job stops at the next file boundary of its scan or
-  build loop, sweeps its staging, and ends `cancelled` with the live corpus
-  and the pin unchanged. The snapshot walk and the filesystem preflight are
-  not checkpointed, so a job inside one of those stops when it leaves it.
-- past the point of no return (exit non-zero): the job is already swapping
-  the corpus. The request is refused rather than queued, and the job
-  completes.
-- no job running (exit non-zero): nothing to stop on this node.
-
-Acceptance is not a promise of a terminal `cancelled` status. A job that
-finishes first finishes, and a trawld that dies between the request and any
-boundary acting on it leaves the job `failed` with `cancel_requested_at`
-and `cancelled_by` set. A restart is the stronger cancel: killing trawld
-before the cutover leaves the live corpus untouched, and boot recovery
-sweeps the shadow generation.
-
-In `-f json` and `-f csv` the receipt is one record: the verdict, the
-server's sentence, and the job's own columns, nulled when no job is
-attached. `-f table` keeps the sentence and the job table as two blocks.
-
-`repin --wait` exits zero only for a repin that actually finished, and for
-a dry run's report. Every other terminal status is non-zero: `cancelled`
-names who asked, `refused_needs_force` says what would be lost, and
-`failed` or `blocked` print the row and the server's own error text. A
-script that read any of those as success would go on to trust a rewrite
-that never happened. It also exits non-zero when the status surface stops
-naming the job it is following: there is no way to ask that route for a job by id, so a second
-job claiming the freed slot leaves the first job's outcome unknown, and the
-message says so rather than reporting the last row it saw.
+Cancellation exits zero when accepted, nonzero when no job is running or cutover
+already started. Acceptance does not prove terminal cancellation. In JSON/CSV
+the receipt is one record with verdict, detail, and job columns; table output
+separates the sentence and job table. See [cancellation and verification](/operate/catalog/#stopping-a-running-repin).
 
 #### Putting a sender's own field on the severity ladder
 
-`--to severity` is the one target that changes what values *mean* rather
-than only how they are stored: the field joins `_severity`'s vocabulary, so
-`level=error` becomes a band match, `level>=warn` compares ladder
-positions, and results render tokens.
-
-```bash
-trawl schema repin level --to severity --dry-run                    # plan first
-trawl schema repin level --to severity --dialect syslog --dry-run   # sender speaks syslog PRI
-trawl schema repin level --to severity --yes --force                # accept the plan
-```
-
-`--dialect` reads **numerals only** (tokens are dialect-free): `otel`
-counts up 1-24, `syslog` counts down 0-7 and is inverted. The two ladders
-overlap over 1-7 with opposite meanings — `3` is `trace3` to OTel and `err`
-to syslog — and no value-shape rule can tell them apart, so trawl refuses
-rather than guesses: a corpus carrying those numerals needs either
-`--dialect syslog` or `--force`, and force accepts them only up to
-`--max-ambiguous-rows`. The count of such rows is reported
-whatever you assert (`ambiguous_numerals`); only the refusal depends on it.
-`--dialect` with any other target is an error, not an ignored flag.
-
-The report also names the values the new pin cannot read at all (up to five
-distinct samples) and warns when something is **still writing** the field.
-That warning matters: a repin translates **history**. After the cutover,
-live events keep taking the ingest-time reading, so under `--dialect
-syslog` a historical `3` becomes 17 (`err`) while the next live `3`
-conforms as OTel 3 (`trace3`) — one column, two meanings, split at the
-cutover instant. If the sender really speaks syslog PRI, declare it in
-`[ingest] severity_from` (`dialect = "syslog"`) so live events read the
-same way, then repin the history.
-
-**What it costs.** The severity rung is the most expensive conform in the
-vocabulary: it is a token table, an ASCII gate and a guarded numeric read
-per value, measured at roughly **36 µs per affected row** — about 10× any
-other target — so a 100-million-row field is on the order of one CPU-hour
-of rewriting. Retention stands down for the job's whole life and the
-affected bytes are held twice until it sweeps, so size the window before
-starting: a repin that runs for hours is a repin that suppresses deletion
-for hours. Unaffected files are hardlinked and cost nothing, so the number
-that matters is `rows_carrying` in the dry run, not the corpus total.
-
-`repin --to severity` needs `schema_write` and a human, like every other
-repin. `_severity` itself — and every other declared envelope field — is
-refused: its type is part of the event contract.
+See [severity repinning](/operate/catalog/#putting-a-senders-own-field-on-the-severity-ladder)
+for dialect selection and the distinction between historical rewriting and future ingestion.
 
 ### Reclaiming dead pin slots
 
-`schema gc-pins` deletes the catalog entries of fields nothing writes any
-more, freeing their slots against the install-wide pin cap. It needs the
-`schema_write` permission.
-
-```bash
-trawl schema gc-pins --dry-run                       # what would be reclaimed
-trawl schema gc-pins --dry-run --older-than 90d      # a stricter window
-trawl schema gc-pins                                 # execute
+```text
+trawl schema gc-pins [--dry-run] [--older-than WINDOW] [-f table|json|csv]
 ```
 
-A pin is reclaimed only when both halves of the proof hold: nothing has
-observed the field inside the window, **and** no standing parquet declares
-the column. `--older-than` takes the same units as `--last` (`s`, `m`, `h`,
-`d`, `w`) and defaults to 30 days. The server raises it to the retention
-window when that is longer, and the report prints all three numbers, so a
-`--older-than 7d` against a 90-day retention says plainly that 90 days is
-what ran.
-
-There is no `--yes`. The deletion is catalog metadata only, and a field
-reclaimed by mistake pins again from scratch the next time a sender writes
-it, so `--dry-run` is the whole safety story. A refusal prints the server's message and
-exits non-zero without deleting anything: a repin owns the data root or
-claimed it mid-run, another gc run is already going, or something under
-the data root could not be read (including the root itself, which is
-UNKNOWN rather than an empty corpus).
-
-The summary lines go to stdout for a table and to stderr under `-f json`
-or `-f csv`, so a piped run is one rectangular record set of candidate
-rows.
-
-**This is a repair, not a defense.** `gc-pins` cleans up slots that went
-dead by accident: a typo'd field name, a decommissioned sender, a
-retired label. It is not an answer to hostile catalog exhaustion. A
-sender that mints new field names faster than the window expires still
-fills the catalog, and what stops that remains what always stopped it:
-the `MAX_PINNED_FIELDS` cap, the half-of-free-slots ration per compaction
-batch, and alerting on the `trawl_catalog_pinned_fields` /
-`trawl_catalog_pin_capacity` fill gauges.
+There is no `--yes`: omitting `--dry-run` executes metadata deletion.
+`WINDOW` accepts `s`, `m`, `h`, `d`, or `w`, defaults to 30 days, and is raised
+to the server's retention floor. Output states requested, floor, and effective
+windows. Summary text goes to stderr for JSON/CSV and stdout for tables.
+See [pin reclamation](/operate/catalog/#reclaiming-dead-pin-slots) for proof and refusal conditions.
 
 Embedded mode works for the field listing only — a plain `DESCRIBE` over
 local parquet, no server or postgres needed:

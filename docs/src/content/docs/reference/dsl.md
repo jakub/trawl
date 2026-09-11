@@ -5,6 +5,8 @@ description: Complete reference for trawl's pipeline query language.
 
 trawl uses a pipeline-oriented query language inspired by Splunk's SPL. Queries flow through stages separated by `|`, with each stage transforming the data for the next.
 
+Use this page for exact syntax and comparison rules. The [event reference](/reference/events/) defines input fields and derivation; [query execution](/architecture/query-execution/) explains how batch and live evaluation apply these rules.
+
 ## Query structure
 
 ```
@@ -355,24 +357,11 @@ is live on day one.
 
 ### The two namespaces
 
-One sentence, learned once (ADR-0013):
+Bare names identify sender fields, with ASCII case folding and catalog conformance applied at ingest and storage. `env`, `service`, `host`, and `message` have declared envelope roles; other bare names such as `level` and `timestamp` do not become aliases for Trawl's derived values.
 
-- **Bare names are your data.** `service`, `host`, `status`, `level`,
-  `timestamp` — whatever your senders emit, stored verbatim under the
-  name they sent. trawl never assigns meaning to a bare name.
-- **Underscore names are trawl's.** `_time`, `_ingested`, `_raw`,
-  `_repairs`, `_severity`, `_producer` are contract slots whose semantics
-  trawl guarantees on every corpus. `_producer` names the door an event
-  entered through (`http` | `syslog` | `trawld`), server-stamped and
-  unforgeable — `_producer=syslog | stats count()` is provenance as a
-  query. The whole `_` prefix is reserved: an
-  incoming `_x` that is not a slot you may propose has its leading
-  underscores stripped and lands under the bare remainder (`_HOSTNAME` →
-  `hostname`), and the DSL cannot mint one either — `let _foo = 1`,
-  `rename x as _foo` and `extract "(?P<_foo>…)"` are errors.
+The underscore namespace belongs to Trawl. Its declared slots are `_time`, `_ingested`, `_raw`, `_repairs`, `_severity`, and `_producer`, with presence rules in the [event reference](/reference/events/#declared-fields). An incoming reserved name normally loses its leading underscore run, while the DSL cannot mint reserved outputs: `let _foo = 1`, `rename x as _foo`, and an `_foo` regex capture are refused. See [name handling](/reference/events/#names-and-original-values) for proposal exceptions and collisions.
 
-There are **no aliases**. The name you type is the column in `DESCRIBE`
-is the identifier in the SQL, in every lane.
+There are no field-name aliases. Use `_time` for the event instant and `_severity` for derived severity. Stage aliases such as `head` and `eval` remain valid.
 
 ### Backtick-quoted names
 
@@ -480,8 +469,8 @@ _severity=warn*                 # glob over the canonical token text: 13-16
 
 `_severity` is **derived, never proposed**: ingest reads `severity` →
 `severity_text` → `level` (first mappable wins — the packaged default of
-`[ingest] severity_from`) and stores every one of them verbatim as your
-own columns. A word maps through the token table or the exact names; a
+`[ingest] severity_from`) and retains those source fields under their own names, subject to catalog
+conformance. A word maps through the token table or the exact names; a
 number maps strictly as OTel 1-24, so `3` is `trace`, unless the source
 was configured with `dialect = "syslog"` — which is how the syslog
 listener's own `syslog_severity` numeral inverts, and how a
@@ -552,14 +541,9 @@ Then `level` behaves as `_severity` does — bands, ordered comparison and
 token rendering — in every lane, for stored history and for events ingested
 after the cutover.
 
-One caveat, and it is the whole reason `--dialect` exists: the repin
-rewrites **history** with the dialect you assert, while live events keep
-taking the ingest-time reading, which is always OTel. Under `--dialect
-syslog` a historical `3` becomes 17 (`err`) and the next live `3` conforms
-as OTel 3 (`trace3`) — one column, two meanings, split at the cutover
-instant. Tokens are unaffected (`"error"` is 17 either way); only numerals
-carry the split. If the sender really speaks syslog PRI, declare it in
-`[ingest] severity_from` first, then repin the history.
+The repin dialect applies to the historical rewrite. Ordinary conformance of new values in that custom field uses the OTel interpretation. With `--dialect syslog`, a historical raw `3` becomes 17, while a new raw `3` in that field reads as OTel 3. Text severity tokens do not have that numeric ambiguity.
+
+Configuring `severity_from` with a syslog dialect derives `_severity`; it does not rewrite the bare source field. For a continuing syslog-number sender, query the derived `_severity` or `sev(field, "syslog")`. If you intend to repin the source field itself, account for how future values will be normalized before relying on a single meaning across the cutover.
 
 The dry run reports the values the ladder cannot read, and — for a corpus
 carrying numerals 1-7, which OTel and syslog PRI read as different
@@ -583,9 +567,9 @@ the name would be trawl assigning it a meaning again.
 ### `timestamp` and `@timestamp`
 
 Ordinary sender fields. They are **read** as sources for the `_time`
-derivation (`_time` → `timestamp` → `@timestamp`, first present wins)
-and **stored verbatim** under their own names, so both the canonical
-instant and what the sender actually sent stay queryable. Only `_time`
+derivation (default `_time` → `timestamp` → `@timestamp`, first present wins)
+and retained under their own names, subject to their catalog pins. The
+original representation remains in `_raw` subject to its cap. Only `_time`
 itself is consumed and canonicalized — it is the proposal slot.
 
 They are no longer aliases for `_time`, so `| sort -timestamp` sorts the
@@ -702,6 +686,29 @@ a b OR c d                      # implicit AND within groups: (a AND b) OR (c AN
 ```
 
 ## Pipe stages
+
+The parser defines 18 stage variants. Aliases such as `head` and `eval` are alternate spellings, not additional variants. The table is a syntax index; each section below states its constraints.
+
+| Stage | Purpose |
+| --- | --- |
+| [stats](#stats) | Aggregate rows, optionally by fields. |
+| [where](#where) | Filter rows by an expression. |
+| [sort](#sort) | Order rows by fields. |
+| [limit / head](#limit--head) | Keep the first rows. |
+| [table / fields](#table--fields) | Select columns. |
+| [top](#top) | Count the most common values. |
+| [rare](#rare) | Count the least common values. |
+| [drop](#drop) | Remove columns. |
+| [let / eval](#let--eval) | Compute or replace values. |
+| [extract / rex](#extract--rex) | Extract regex captures or key/value fields. |
+| [dedup](#dedup) | Remove duplicate rows or keys. |
+| [timechart](#timechart) | Aggregate into time buckets. |
+| [pivot](#pivot) | Turn distinct values into aggregate columns. |
+| [tail](#tail) | Keep the last rows. |
+| [rename](#rename) | Rename fields. |
+| [sample](#sample) | Randomly sample a percentage or row count. |
+| [eventstats](#eventstats) | Add grouped aggregate values to each row. |
+| [from saved](#from-saved) | Read stored report runs. |
 
 ### stats
 
@@ -892,6 +899,51 @@ Pivot table transformation.
 pivot count() on status
 pivot avg(duration) on service by host
 ```
+
+### sample
+
+```text
+sample 10%
+sample 1000
+```
+
+`sample N%` accepts an integer percentage from 1 through 100 and uses Bernoulli sampling. Each row is independently eligible, so the returned row count is approximate. `sample N` accepts a positive integer count and uses reservoir sampling for a fixed-size sample, limited by the available rows.
+
+There is no DSL seed argument or stable ordering guarantee. A repeated query can return different rows. Sampling is batch SQL only; it is unsupported in live streams and after `extract kv` has moved execution into the Rust tail. Apply other stages in the intended pipeline order; sampling a filtered relation and filtering a sample answer different questions.
+
+### eventstats
+
+```text
+* | eventstats count() as total
+service=nginx | eventstats avg(duration) as service_avg by service
+* | eventstats count() as host_rows, max(duration) as host_max by host
+  | where duration > host_max / 2
+```
+
+`eventstats` preserves the input rows and adds aggregate values using SQL window functions. Without `by`, each aggregate covers all input rows. With `by`, each row receives the aggregate for its group. This differs from `stats`, which reduces each group to an output row.
+
+Every aggregate needs an explicit `as` alias. Output aliases must not collide with each other or with the grouping keys under ASCII case folding. An alias can replace an existing input column that is not a grouping key. Other input columns remain available.
+
+`dc`, `distinct_count`, `values`, and `list` are refused in `eventstats`; their DISTINCT forms are not supported by this emitter's window-function contract. Use an accepted aggregate such as `count`, `avg`, or `max`. This stage runs in batch SQL, not live streams or the Rust tail after `extract kv`.
+
+### from saved
+
+```text
+| from saved daily_errors
+| from saved "hourly-error-count" run=latest | where count > 10
+| from saved daily_errors run=all | stats sum(count) by _run_id
+| from saved daily_errors run=42 | table service, count
+```
+
+Start the query with `from saved` as its first pipe stage, then put filters and transformations after it. A saved-query name is a bare name or quoted string, not a backtick-quoted field name. The source is a materialized report result; Trawl does not execute the saved query again.
+
+The name must resolve among the caller's saved queries. `run=latest`, also the default when omitted, selects that saved query's newest successful run. It never substitutes an older run merely because the latest has no Parquet result. `run=all` unions its successful runs with Parquet results and adds `_run_id` plus `_run_time`, the run's start time. It omits runs without a Parquet result, including zero-row runs. If no qualifying file-backed runs exist, resolution returns not found.
+
+`run=N` selects a successful run ID owned by the caller. The current resolver checks ownership of that run, but does not require it to belong to the named saved query. Use an ID from the intended saved query's run list. A missing, foreign-owned, or unsuccessful run has no readable result through this selector.
+
+For `latest` or a specific ID, a successful empty result without Parquet becomes an empty relation with the recorded column names. `stats count()` can return zero without borrowing rows from an earlier success. A successful nonempty blob-only result returns a conflict; fetch that run through the report-result API instead. Corrupt success metadata is an error, not an empty result.
+
+This source requires the server's saved-query store. Embedded `--data` and live streams cannot resolve it. The remaining pipeline begins with no live-catalog pins: report columns can be computed values, so their names do not acquire today's event-field types. Read [scheduled reports](/architecture/reports-telemetry/#scheduled-reports) for window and stored-result behavior.
 
 ### Output names must be unique
 
@@ -1206,7 +1258,7 @@ in both paths.
 
 ### Date and time functions
 
-Date/time functions operate on **timestamps** — the `timestamp` field is stored as a timezone-naive `TIMESTAMP` in both the batch and streaming paths. Ingest first canonicalizes the value to UTC, so an incoming offset is *applied* (`12:00:00+05:30` becomes `06:30:00Z`) rather than dropped in favour of its wall-clock components; the naive timestamp everything downstream sees is therefore UTC. See [Data flow](/architecture/data-flow/#timestamp-canonicalization) for the accepted input grammar.
+Date/time functions operate on timestamp values. The event instant `_time` is canonicalized to UTC at ingest and stored as a timezone-naive `TIMESTAMP`: an input `12:00:00+05:30` becomes `06:30:00Z`. The bare sender field `timestamp` is a separate field with its own catalog pin. See [time derivation](/reference/events/#time-derivation) for accepted event-time encodings and [catalog conformance](/architecture/catalog/#write-time-conformance) for custom TIMESTAMP fields.
 
 | Function | Description |
 |----------|-------------|

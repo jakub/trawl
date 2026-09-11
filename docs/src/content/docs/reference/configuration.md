@@ -76,75 +76,12 @@ a wedged WAL write. To turn that pipeline off, set `internal_telemetry = false`.
 
 #### The query deadline, and work that outlives a request
 
-`timeout_secs` is **one absolute deadline per request**, not a budget each
-phase gets to spend again. trawld stamps it right after authentication,
-before it tracks the query, admits the DSL or resolves a saved query's
-source, and everything the request then waits for comes out of that one
-instant: waiting for an executor from the pool, waiting on the
-publication gate that keeps a query off a file compaction is replacing,
-the delay between a queued worker being handed a permit and actually
-starting, and execution itself. A best-effort history write runs under it
-too, so a slow store can cost the history row but never the answer that
-is already in hand. Time spent reading the request body is outside it,
-and so is delivering the response.
-
-Where the deadline expires decides the status code:
-
-- **Before the work starts**, the answer is `503` with
-  `server at capacity: the query was not started`. That is a fixed
-  sentence, and it is the whole answer: nothing was read, nothing ran,
-  and no timeout is written to query history.
-- **After the work starts**, it is the familiar `504` query timeout.
-
-The work-start transition is the boundary, not the order two timers
-happen to fire in. Holding an executor permit is not the same as having
-started: a worker can sit in the queue holding nothing, or hold a permit
-and be refused at the transition because the deadline passed while it
-waited.
-
-A pre-start `503` means no database work started for that request. A `504`
-means the request ended after work started, including a schema value
-sample. The DuckDB bind or scan can continue and keeps its executor permit
-until it physically finishes. trawld reports that retained capacity:
-
-- `GET /api/v1/queries` carries a `retained` list beside the active one.
-  Each entry has the pool `id`, the work `kind` (`query`, `from_saved`,
-  `export`, `scheduled`, `ping`, `sample`), whether it `started`, and
-  `retained_ms`, how long it has outlived its request. A query some key
-  submitted also carries that key's display name and its DSL, to every
-  reader holding `query`, the same metadata the `active` and `recent`
-  lists carry for the same query. An autocomplete `sample` is owned by
-  the key that asked for it too, so its entry carries that key's display
-  name to any reader holding `query`, and never any query text: a sample
-  is a field lookup, not DSL. Only work with no owner at all, `ping` and
-  `scheduled`, hides its name and its text from anyone below
-  `server_manage`. Reading an entry is not authority to stop it:
-  cancellation still needs `server_manage` or the exact submitting key.
-- `GET /api/v1/stats` and the dashboard snapshot carry `pool_retained`
-  beside `pool_active`. Retained work is a **subset** of held permits,
-  never an extra count, and the terminal dashboard renders
-  `active: 3/4 (1 retained)` only when the number is nonzero.
-- `/metrics` carries `trawl_query_permits_retained`, a label-free gauge.
-  A steady nonzero value means capacity is occupied by work no request is
-  waiting for any more, and that is the number to alarm on if searches
-  start queueing behind nothing visible.
-- The lifecycle logs `query_permit_retained` and `query_permit_reclaimed`
-  bracket each interval. They carry metadata only, never DSL.
-
-**Cancelling.** `DELETE /api/v1/queries/{id}` still works on retained
-work, and repeating it is safe: cancellation is a latch, and asking twice
-sets a flag that is already set. What comes back is an acknowledgement
-that cancellation was **requested**, not a promise that anything has
-stopped. trawld latches the request even before an interrupt handle
-exists, so a cancel that arrives during binding is not lost, and it
-checks the latch again at the boundary between binding and execution.
-A bind already inside DuckDB is not preemptible: the honest worst case is
-that the permit stays retained until that bind returns.
-
-**The DSL admission limits are not configurable.** The 512 alias-expansion
-budget and the 128-stage cap ([DSL reference](/reference/dsl/)) are fixed
-constants, checked before a query reaches the database, and there is no
-knob here that raises them.
+`timeout_secs` is one absolute deadline after authentication, including queue
+waits, execution, and best-effort history writes. Request-body reading and response
+delivery are outside it. Expiry before work starts is 503; after work starts it
+is 504. Timed-out workers can retain permits until they finish. The fixed DSL
+admission budgets cannot be raised through configuration.
+See [capacity diagnosis and cancellation](/operate/health/#the-query-deadline-and-work-that-outlives-a-request).
 
 #### `[server.rate_limit]`
 
@@ -174,48 +111,25 @@ Re-tiering is in place and non-destructive: `fleet-admin roles set-rate shipper 
 
 #### TLS auto-generation
 
-When `tls_cert_path` and `tls_key_path` are omitted, trawld generates a self-signed ECDSA P-256 certificate at startup with SANs for `localhost`, `127.0.0.1`, and `::1`. The cert and key are written to `{state_dir}/tls/` (where `state_dir` is the parent of `data.path`). Clients connecting to a self-signed server need `insecure = true` in their config or the `--insecure` flag.
+When `tls_cert_path` and `tls_key_path` are omitted, trawld generates a self-signed ECDSA P-256 certificate at startup with SANs for `localhost`, `127.0.0.1`, and `::1`. The cert and key are written to `{state_dir}/tls/` (where `state_dir` is the parent of `data.path`). Configure client trust for the issuing certificate. `insecure = true` or `--insecure` bypasses verification and is suitable only for an explicitly selected local test connection.
 
 The `tls_reload_interval_secs` setting polls the cert/key files for content changes and hot-reloads them without restarting the server.
 
 #### Logging filter (`RUST_LOG`)
 
-trawld's stdout log and its internal telemetry ([`internal_telemetry`](#ingest)) build their filters from one directive string, resolved explicitly at startup:
-
-- **`RUST_LOG` unset** → the shipped default filter:
-
-  ```text
-  trawl_server=info,trawld=info,fleet_auth=info,auth.backend=info,storage.backend=info,preauth.transport=info
-  ```
-
-  This exact string is a cross-packaging contract — the code fallback, the Helm chart's `logLevel`, and the Debian environment example all carry it. It enumerates every target trawl emits under: `trawl_server` (the library — handlers, ingest, compaction), `trawld` (the binary — startup banner, config warnings, task panics), `fleet_auth` (auth middleware), the deliberately-overridden `auth.backend` / `storage.backend` targets that make backend failures independently alarmable, and `preauth.transport` (the accept loop's TLS-handshake and connection diagnostics, overridden off `trawl_server` so they can be kept out of the corpus — see below). When customizing, keep all six — dropping the backend or transport targets makes those errors invisible. A global `info` is deliberately not the default: it would enable noisy dependency targets.
-- **`RUST_LOG` set and valid** → your value is authoritative, verbatim.
-- **`RUST_LOG` set but unparseable** → the default filter is installed and exactly one `config_warning` event reports the parse error (never the raw environment value).
-
-A configuration-file failure happens *before* any tracing subscriber exists: it is reported on stderr with the resolved config path, not through telemetry.
-
-**Unmetered rejections are logged, never persisted.** Whatever the directives say, the `fleet_auth`, `auth.backend`, `preauth.transport` and `trawl_server::policy::unmetered` targets are excluded from `service=trawld` telemetry (they still print on stdout, and to `log_file` when telemetry is disabled). The first two come from the bearer middleware, which necessarily runs *before* per-key rate limiting; `preauth.transport` is cheaper still — a bare TCP connect-and-close provokes a `tls_handshake_failed` warning before any request exists; `trawl_server::policy::unmetered` is the 403 for an authenticated key that resolves no trawl permission, which the policy layer also decides outside the limiter (so a grantless key never spends a bucket to be told no). Persisting any of them would let a client no rate limit can slow turn a connection or request flood into durable corpus growth, one record per rejection. Failed authentication, failed handshakes and grantless 403s are therefore stdout/log-pipeline signals; the corpus still carries everything trawld emits behind the limiter, the `storage.backend` alarm target, and the catalog/health events a backend outage produces. Alerting does not depend on that stdout pipeline: rejected requests are counted on `/metrics` as `trawl_auth_failures_total{reason="unauthorized"|"backend_unavailable"|"no_trawl_grant"|"forbidden"|"internal"}`, a closed label set with no key, name or path in it — safe to expose on a flooded endpoint, and the signal to alarm on for credential stuffing or a revoked key still in use.
-
-**`trawl-web` filters separately.** The session proxy is a different process with a different target, so it must never inherit trawld's filter — a target-only filter that omits `trawl_web` silences the proxy completely. Its own default is:
-
-```text
-trawl_web=info,fleet_auth=info
-```
-
-`trawl_web` carries the proxy's session, origin, upstream and startup diagnostics; `fleet_auth` the shared session/origin primitives. Same contract shape as trawld's: the binary fallback, the Helm chart's `web.logLevel`, and the Debian `/etc/default/trawl-web` example all carry this exact string, and a set-and-valid `RUST_LOG` is authoritative.
+Unset or invalid `RUST_LOG` selects the packaged target filter; an invalid value
+also emits one configuration warning. A valid value replaces the filter.
+The daemon and browser proxy have different target names and defaults.
+See [logging and authentication signals](/operate/health/#logging-filter-rust_log)
+for both defaults and the events excluded from stored telemetry.
 
 #### The query debug log
 
-`server.query_log` (or `TRAWL_QUERY_LOG` / `--query-log`) enables an ndjson debug log with one entry per query execution — built for `tail -f | jq` debugging.
-
-**Sensitivity.** Each entry combines the authenticated identity, the raw DSL, the generated SQL *with parameter values*, source file paths, hot-buffer state, and a sample of result rows — more sensitive than the event corpus it debugs. trawld therefore:
-
-- creates the file **owner-only** (`0600` on Unix) and tightens a pre-existing looser file at open;
-- opens it with `O_NOFOLLOW`: a **symlink at the configured path is refused**, not followed — otherwise a local user who can create that path could redirect the log into a file of their choosing and have trawld `chmod` it;
-- emits a startup `warn` naming the path and its contents whenever the log is enabled;
-- bounds it with `server.query_log_max_bytes` (default 100 MiB): past the cap the file rolls over to a single retained `<path>.1` (also `0600`); `0` disables rollover.
-
-Retention is exactly those two files — there is no multi-generation rotation or age-based cleanup; delete them when done debugging, preferably with trawld stopped. Deleting the *active* file under a running trawld leaves it writing to the unlinked inode (the space is not reclaimed until restart) and makes the rollover rename fail; trawld keeps the entries and re-attempts the rollover only once per `query_log_max_bytes` written, so a broken rotation path costs one `warn` per cap rather than one per query. A rollover whose rename lands but whose reopen fails is undone, so the cap always applies to the file at the configured path; in the one case where the undo fails too, trawld holds a file that path can no longer name, and closes the log (an `error` says so) until restart rather than growing it unbounded. **Point it at a directory only trawld can write** (`/var/lib/trawl/query-debug.log`, say — not `/tmp`): the mode protects the file's contents, but nothing trawld does can protect a path a local user is free to create entries in. Result samples never enter default `service=trawld` telemetry, which since issue #56 carries query metadata (`query_id`, `query_len`, actor, outcome, timing, and a stable `error_class`) but neither raw query text nor error text — for queries, exports, and SSE streams alike. The full text lives in authenticated query history, this debug log, and the DEBUG-only `query_text` / `query_error_text` tracing events.
+`server.query_log`, `TRAWL_QUERY_LOG`, or `--query-log` selects an owner-only
+ndjson log containing identity, DSL, SQL parameters, source paths, and result
+samples. `query_log_max_bytes` caps it with one `.1` generation; zero disables
+rollover. Symlinks at the configured path are refused. Use a private directory.
+See [enable, inspect, and remove the debug log](/operate/health/#the-query-debug-log).
 
 ### `[data]`
 
@@ -243,7 +157,7 @@ Trawl's own app state — query history, saved queries, schedules, and report ru
 | `database_url` | string | *(required unless `TRAWL_DATABASE_URL` is set)* | Trawl app-state postgres URL. The `TRAWL_DATABASE_URL` environment variable takes precedence. **No fallback to the `[auth]` URL** |
 
 :::note
-trawld migrates this database automatically at boot (it is the sole writer) and holds a session advisory lock for its lifetime — a second trawld against the same database fails startup instead of racing. Provision a separate database whose role owns the schema; see the [fleet-auth cutover runbook](/reference/fleet-auth-cutover/) for the exact role/grants.
+trawld migrates this database automatically at boot (it is the sole writer) and holds a session advisory lock for its lifetime — a second trawld against the same database fails startup instead of racing. Provision a separate database whose role owns the schema; see [database provisioning](/operate/deployment/#provision-the-databases) for the roles and ownership.
 :::
 
 ### `[ingest]`
@@ -270,7 +184,7 @@ trawld migrates this database automatically at boot (it is the sole writer) and 
 
 #### Derivation sources (`severity_from` / `time_from`)
 
-`_severity` and `_time` are trawl-owned envelope slots, and these two lists are the whole of what they read. Derivation only **reads**: every source stays exactly where it arrived, as an ordinary queryable column under the name its sender chose, and a derivation into the `_` namespace touches nothing sender-visible, so it is never recorded as a repair.
+`_severity` and `_time` are trawl-owned envelope slots, and these two lists are the whole of what they read. Derivation only **reads**: every source stays exactly where it arrived, as an ordinary queryable column under the name its sender chose, and severity derivation leaves sender values alone. Time repair is recorded when the proposed timestamp cannot be used.
 
 An entry takes either spelling:
 
@@ -279,7 +193,12 @@ An entry takes either spelling:
 severity_from = ["severity", "severity_text", "level"]
 time_from = ["_time", "timestamp", "@timestamp"]
 
-# The typed form declares the dialect an entry's NUMERICS read in.
+```
+
+Alternatively, declare a dialect for a numeric source:
+
+```toml
+[ingest]
 severity_from = ["level", { field = "syslog_severity", dialect = "syslog" }]
 ```
 
@@ -301,7 +220,7 @@ Both lists are validated at startup and **trawld refuses to start** on a bad ent
 | `dialect` on an entry is an error — dialects govern severity numerics alone | `time_from` |
 | Empty list | legal for `severity_from` (derive nothing), illegal for `time_from` |
 
-Changing either list is **forward-only**. There is no policy history and nothing re-derives stored events: an event keeps the `_severity` and `_time` it was written with, and the new lists apply from the next event onward. Reinterpreting an old corpus means a repin, not a config reload.
+Changing either list is **forward-only**. There is no policy history and nothing re-derives stored events: an event keeps the `_severity` and `_time` it was written with, and the new lists apply from the next event onward. Neither list retroactively changes envelope fields. Repin can change custom pinned fields, but refuses declared envelope fields such as `_time` and `_severity`.
 
 **Profile-fixed sources are not configurable.** Each producer profile prepends its own transport-proven sources to these lists: the syslog listener contributes `{ field = "syslog_severity", dialect = "syslog" }` and `syslog_timestamp`, while the HTTP and trawld doors contribute none. Those fixed entries win over anything configured under the same name and do not count against the 8-entry bound — they are trawl's, not the operator's. Everything else about the two lists is global and identical at every door.
 
@@ -313,24 +232,10 @@ Changing either list is **forward-only**. There is no policy history and nothing
 | `min_free_disk_bytes` | byte size | `"1G"` | When free disk drops below, delete date directories highest expiry ratio first (age over that env's limit); `0` disables |
 | `retention_interval_secs` | integer | `3600` | Retention check frequency (default: 1 hour) |
 
-Both sweeps stand down while a repin job's marker or staging roots exist
-(`data/REPIN`, `data.repin-next/`, `data.repin-aside/`): the job
-double-holds its affected bytes until its final sweep and pre-flights
-against `min_free_disk_bytes` before starting, so retention could neither
-relieve the pressure nor safely delete files out from under the shadow
-build. They resume the tick after the job (or its boot replay) finishes.
-A staging root that survives its sweep — a permission or I/O error —
-deliberately keeps the marker, since the marker is what licenses trawl to
-delete that root: the cleanup is retried at the next boot
-(`repin_recovery_incomplete` meanwhile), and retention stays suppressed
-until the root is actually gone. Alert on `trawl_retention_suppressed` —
-it is 1 for every tick either sweep stands down and 0 once they run
-again, so it distinguishes a repin in progress (minutes, hours) from
-staging nothing owns, which holds it at 1 indefinitely while the archive
-grows. `trawl_catalog_repin_running` cannot: it is 0 in exactly the
-stranded case.
-
-Disk-pressure deletion is suppressed while a pre-cutover `data.pre-schema-v2/` set-aside directory exists (it sits outside `data/`, so deleting partitions could never reclaim it); each tick under pressure logs `retention_disk_pressure_suppressed` instead. Remove the set-aside to reclaim the space and re-enable the policy. Age-based retention is unaffected.
+Repin markers or staging roots suppress both sweeps. Either epoch archive,
+`data.pre-schema-v2/` or `data.pre-epoch-3/`, suppresses disk-pressure deletion
+but not age retention. See [suppression and recovery](/operate/retention/#diagnose-suppression)
+before removing any data or recovery state.
 
 #### `[retention.env.<name>]`
 
@@ -386,31 +291,15 @@ the per-env tables after them.
 
 ##### How disk pressure ranks envs
 
-Under pressure trawl deletes by expiry ratio, not by date. A date directory's
-ratio is its age divided by its env's effective `max_age_days`. The highest
-ratio goes first; equal ratios break on the older date, then on the path.
-With `prod` at 365 days and `lab` at 7, a 300-day prod directory sits at 0.82
-and a 6-day lab directory at 0.86, so the sweep takes the lab directory and the
-prod evidence survives. Plain oldest-first would have done the opposite and
-deleted 300-day prod evidence to make room for six-day-old lab noise.
-
-An env at `max_age_days = 0` ranks after everything that expires, but it is
-still a candidate. Nothing is exempt from pressure, because a sweep that
-cannot reach the free-space floor is a wedged daemon. So the age limit is a
-maximum, never a guaranteed minimum. Under sustained pressure trawl deletes
-data younger than any limit you configured, keep-forever envs included. If
-that matters, give the archive more room rather than a longer age.
+Candidates rank by age divided by their env's effective age limit, largest first;
+ties use older date then path. Zero-age-limit envs rank last but remain eligible.
+See [the worked example](/operate/retention/#how-disk-pressure-ranks-envs).
 
 ##### The `/schema` horizon
 
-`GET /api/v1/schema` hides a field whose most recent observation predates the
-retention horizon, and `trawl schema gc-pins` uses the same number as its
-floor. The horizon is the longest effective age across the install: the global
-`max_age_days` against every override, whichever is largest. A `0` anywhere in
-that set means no window at all, exactly as a global `0` has always meant, and
-`?all=true` still lifts whatever window applies. The maximum is the safe
-direction. A minimum would hide a field, and let gc reclaim its pin, while an
-env with a longer retention still has that data on disk.
+The maximum global or per-env age is both the schema observation window and the
+pin-GC floor. A zero anywhere disables that window; `?all=true` lifts it.
+See [schema and retention](/operate/retention/#the-schema-horizon).
 
 ### `[scheduler]`
 
@@ -442,7 +331,7 @@ Browser-facing session proxy (`trawl-web` binary). Reads the same `trawld.toml` 
 | `allow_insecure_cookies` | bool | `false` | Drop `Secure` from session cookies. Set true only when the browser connects over HTTP. Keep false for browser HTTPS, including when a reverse proxy terminates TLS |
 | `shared_domain` | string | (none) | Parent domain for the shared `fleet_session` SSO cookie, e.g. `".fleet.lab.ktle.net"`. Mirrors coastwatch's `session.shared_domain` — set the same value in both apps. Unset/empty → origin-scoped cookie (standalone mode) |
 
-If neither `cookie_secret_path` nor `cookie_secret_env` is set, the proxy generates an ephemeral key on each startup — sessions won't survive restart. The Debian `trawld` package generates a persistent key at `/var/lib/trawl/web.cookie` automatically via its `postinst` script.
+If neither `cookie_secret_path` nor `cookie_secret_env` is set, the proxy generates an ephemeral key on each startup. Sessions will not survive restart. The Debian `trawl-server` package creates a persistent key at `/var/lib/trawl/web.cookie` through its `postinst` script and preserves it on ordinary upgrades.
 
 #### The browser-origin allowlist
 
@@ -456,7 +345,7 @@ State what the browser's address bar shows. A few consequences worth knowing bef
 - **An empty list refuses to start.** There is no host-only fallback and no "empty means allow everything" default; both would fail silently, in opposite directions.
 - A request carrying a sibling fleet app's origin is rejected unless that origin is in the allowlist, even when the apps share the `fleet_session` cookie. This blocks calls to protected endpoints, including logout. It does not protect the shared cookie from a compromised sibling: that app can overwrite or clear the parent-domain cookie through its own `Set-Cookie` response.
 
-Setting `shared_domain` enables fleet-wide single sign-on: the session cookie is scoped to the parent domain and every fleet app under it accepts it, provided all apps share the same session key (see the [fleet-auth cutover runbook](/reference/fleet-auth-cutover/) for key provisioning).
+Setting `shared_domain` enables fleet-wide single sign-on: the session cookie is scoped to the parent domain and every fleet app under it accepts it, provided all apps share the same session key (see [shared browser sessions](/operate/access/#shared-browser-sessions) for key provisioning).
 
 API clients using bearer tokens (the CLI, `trawl-client`, vector) talk to trawld directly on port 5514 — the proxy only handles cookie-authed browser traffic and blocks `/api/v1/ingest` outright.
 

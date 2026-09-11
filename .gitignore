@@ -51,6 +51,7 @@ tls/
 docs/node_modules/
 docs/dist/
 docs/.astro/
+__pycache__/
 
 # fuzz artifacts and corpus
 crates/trawl-core/fuzz/target/

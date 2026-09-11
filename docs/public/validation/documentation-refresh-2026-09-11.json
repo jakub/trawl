@@ -1,0 +1,31 @@
+{
+  "source_revision": "92d3c28c",
+  "binary_version": "0.4.0",
+  "binary_revision": "a347a177",
+  "binary_kind": "existing development build with cached DuckDB shared library",
+  "tutorial": {
+    "health": "ok",
+    "accepted": 3,
+    "query_count": 3,
+    "error_message": "connection refused",
+    "error_duration": 1500,
+    "parquet_export_and_embedded_query": "passed"
+  },
+  "restore_drill": {
+    "topology": "one disposable PostgreSQL 18 container; separate restored databases and filesystem tree; local daemon",
+    "dump_format": "custom, no-owner, no-acl",
+    "filesystem_archive": "tar with ACLs, xattrs, numeric owners",
+    "catalog_marker_matches_database": true,
+    "restored_identity_matches": true,
+    "restored_count": 3,
+    "post_restore_ingest_count": 4,
+    "post_restart_count": 4,
+    "post_restart_visibility": "bounded polling until WAL compaction; health alone did not establish data readiness"
+  },
+  "limits": [
+    "Release installation not exercised",
+    "Existing development binaries used with cached DuckDB loader path",
+    "Packaged service paths and systemd installation not exercised",
+    "No browser, session-cookie, saved-report, repin or production cutover proof"
+  ]
+}

@@ -3,6 +3,12 @@ title: Crash dumps
 description: Enabling minidump capture for trawld on the Debian and helm channels, what a dump contains, and how to check that capture can actually work.
 ---
 
+Use this procedure when enabling capture or diagnosing an empty dump. First
+identify the host or Kubernetes workload; ordinary health checks are in
+[health diagnosis](/operate/health/). Dumps are a separate sensitive diagnostic
+store and are excluded from the routine [backup procedure](/operate/backup-restore/).
+
+
 When trawld dies on a fatal signal (`SIGSEGV`, `SIGABRT`, `SIGBUS`), it can
 write a **minidump**: a `.dmp` file holding the crashed process's threads,
 their stacks, and the memory around them. Dumps land in a directory you
@@ -293,8 +299,7 @@ logged at boot.
 
 The next fatal signal then produces no dump. The handler's request to the dead
 monitor fails, that failure is ignored on purpose so the process still dies
-with its original signal, and what you find afterwards is the `trawld: FATAL
-signal caught` breadcrumb with no `wrote minidump` line after it and nothing
+with its original signal, and what you find afterwards is the `trawld: FATAL signal caught` breadcrumb with no `wrote minidump` line after it and nothing
 new in the dump directory. Any local process can therefore turn capture off
 without a privilege of any kind. Hardening the transport, with authenticated
 framing or a filesystem socket carrying real permissions, is tracked
@@ -426,11 +431,12 @@ a shell reads 0, because the shell had dropped it and trawld's exec took it back
 Either way it only feeds the scope 0 and 1 verdict, where the attach rests on
 credentials instead of the capability.
 
-On kubernetes, check the two halves of the grant:
+On Kubernetes, set `TRAWL_CONTEXT`, `TRAWL_NAMESPACE`, and `TRAWL_POD` to the
+selected workload, then check the two halves of the grant:
 
 ```bash
-kubectl exec -n <ns> <pod> -c trawld -- getcap /usr/bin/trawld
-kubectl get pod -n <ns> <pod> \
+kubectl --context "$TRAWL_CONTEXT" exec -n "$TRAWL_NAMESPACE" "$TRAWL_POD" -c trawld -- getcap /usr/bin/trawld
+kubectl --context "$TRAWL_CONTEXT" get pod -n "$TRAWL_NAMESPACE" "$TRAWL_POD" \
   -o jsonpath='{.spec.containers[?(@.name=="trawld")].securityContext}'
 ```
 

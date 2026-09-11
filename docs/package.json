@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "astro dev",
     "build": "astro build",
+    "check": "astro build && python3 scripts/check-docs.py",
     "preview": "astro preview",
     "astro": "astro"
   },

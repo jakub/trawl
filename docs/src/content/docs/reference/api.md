@@ -14,12 +14,13 @@ Authorization: Bearer flt_your_token_here
 ```
 
 API keys are managed with `fleet-admin` against the fleet postgres
-keystore (`DATABASE_URL`):
+keystore (`DATABASE_URL`). Replace `PREFIX` with the selected stable key prefix;
+create roles before keys on a fresh database:
 
 ```bash
 fleet-admin keys create --name "my-key" --kind human --role trawl-analyst
 fleet-admin keys list
-fleet-admin keys revoke <key-prefix>
+fleet-admin keys revoke PREFIX
 ```
 
 ### Roles and permissions
@@ -27,7 +28,9 @@ fleet-admin keys revoke <key-prefix>
 Roles are data-defined (ADR-0006): named, cross-app bundles of permission
 strings stored in the fleet keystore, managed with `fleet-admin roles`.
 A key holds any number of roles; effective permissions are the union.
-The migration converts the former static tiers into these roles:
+The historical grant migration converts its tiers to the bundles below. A fresh
+keystore starts with no roles; use [access administration](/operate/access/) to
+create them. These are example bundles, not privileged role names:
 
 | Role | Trawl permissions |
 |------|------------|
@@ -43,19 +46,10 @@ A key resolving *no* recognized trawl permission at all is also refused 403
 by the grant gate before the handler. Missing, malformed, invalid, expired,
 and revoked credentials remain an opaque **401**.
 
-One permission exists outside the converted tiers: `schema_write` gates
-the repin trigger (the first data-mutating schema action) and is
-deliberately granted to **no** role by default — a schema-admin role is
-one `fleet-admin roles create` away:
-
-```bash
-fleet-admin roles create --name trawl-schema-admin \
-  --perm trawl:schema_read --perm trawl:schema_write
-fleet-admin keys assign-role <key-prefix> trawl-schema-admin
-```
-
-No `server_manage` rides along, and no deploy is involved: the migration
-only registers `trawl:schema_write` in the permission vocabulary.
+`schema_write` is separate from these bundles and gates catalogue mutations.
+It is registered but not granted by the migration. Repin has no human-key-kind
+requirement. See [role assignment](/operate/access/#create-roles-and-keys) and
+[catalog procedures](/operate/catalog/) before granting it.
 
 ## Endpoints
 
@@ -136,6 +130,9 @@ Validate DSL syntax without executing.
 
 ### Schema
 
+Read routes require `schema_read`. Mutation permissions and ingest-node requirements
+are stated separately below. Use [catalog administration](/operate/catalog/) for procedures.
+
 ```
 GET /api/v1/schema
 GET /api/v1/schema?service=nginx
@@ -199,7 +196,7 @@ the **lifetime** total from durable aggregates the window cannot evict.
 a sample, never a manifest; every one of them remains in `_raw`.
 
 The verdict is advisory and sender-influenceable by construction: acting
-on it means `trawl schema repin`, which needs `schema_write` and a human.
+on it means `trawl schema repin`, which needs `schema_write` on an ingest-enabled node.
 `trawl_catalog_degraded_fields` gauges how many pins currently qualify.
 
 `?service=` scopes the numbers, not just the row set: `service_count`,
@@ -264,17 +261,11 @@ logged. A successful POST returns 200 with the acknowledgement:
   "note": "sender ships a fix on Friday", "evidence_through": 7 }
 ```
 
-`evidence_through` is the point of the whole route. It is the count of
-conflict episodes the ack covers, not a timestamp: compaction can record
-several episodes inside one clock tick, so an ack keyed on time would
-suppress evidence nobody had seen. The badge stays down while the field's
-episode count is at or below that high-water and comes back the moment the
-pin shelves another batch. Re-acknowledging advances the high-water and
-replaces the note and the actor, but only when the incoming high-water is
-at least the stored one: two operators acking a moment apart both get 200,
-and the row keeps the name, note and timestamp of the one who covered more
-evidence. `acked_by` is the key's stable prefix, not its display name,
-because this row outlives renames and rotations.
+`evidence_through` counts conflict episodes, not timestamps. New episodes beyond
+that count raise the badge again. Re-acknowledgement replaces actor, note, and time
+only if its episode count is at least the stored count. Concurrent requests can
+both return 200 while the larger count wins. `acked_by` is a stable key prefix.
+See [acknowledgement lifecycle](/operate/catalog/#degraded-pins).
 
 A field whose evidence does not meet the degraded threshold answers **409**:
 there is no verdict to acknowledge, and writing a high-water there would
@@ -283,15 +274,10 @@ swallow the evidence that first raises the badge. An unpinned name is a
 acknowledged is the state the caller asked for either way) and 404 only for
 an unpinned name.
 
-The field detail carries a standing ack as `ack`, beside `verdict` rather
-than instead of it: an acknowledgement overtaken by newer evidence appears
-next to a re-raised verdict, and that pair is the story. A successful repin
-of the field clears the ack outright, since the evidence it acknowledged no
-longer describes the pin. That clear commits with the pin flip and is
-logged as `field_degraded_ack_cleared` once per clear the server observes:
-a crash between the commit and the log line loses the line, and the deleted
-row leaves nothing to replay it from. The acknowledgement is gone either
-way; only the audit trail is a line short.
+Field detail returns `ack` beside `verdict`; an old ack can remain beside a
+newly raised verdict. Successful repin clears it in the pin-flip transaction.
+`field_degraded_ack_cleared` is logged after that commit, so a crash can lose the
+audit line without undoing the clear.
 
 ```
 POST /api/v1/schema/repin
@@ -314,15 +300,10 @@ field on the OTel ladder, and takes an optional `dialect` — `"otel"`
 (default) or `"syslog"` — which reads NUMERALS only; a `dialect` with any
 other target is a 400 rather than an ignored field.
 
-`force` alone used to be a blank check. It is now a number. A forced
-request may state `max_nulled_rows` (rows the rewrite may null) and
-`max_ambiguous_rows` (dialect-ambiguous numerals it may carry); either one
-without `force` is a 400, since an unforced repin accepts no loss at all.
-An unstated ceiling is derived from that job's own scan, `scan + max(scan /
-10 rounded up, 10)`: ten percent headroom for proportional growth on a big
-corpus, a flat floor of ten rows for a small one. The headroom exists
-because the plan is a photograph of a moving corpus, and refusing on a
-one-row drift would make `force` useless on a live install.
+With `force`, `max_nulled_rows` and `max_ambiguous_rows` bound accepted loss and
+ambiguous numerals. Either ceiling without force is 400. An omitted ceiling is
+`scan + max(ceil(scan / 10), 10)`, resolved once from the job's own scan.
+See [preview and force ceilings](/operate/catalog/#repin) for the CLI procedure.
 
 Both pairs come back on the job row: `max_nulled_rows` /
 `max_ambiguous_rows` echo what the request asked for, and
@@ -334,10 +315,11 @@ existed all read as "no number here". A finished rewrite worse than its
 accepted ceilings refuses the cutover exactly as an unforced lossy plan
 does, with the accepted and actual counts named in the reason.
 
-The HTTP status carries the verdict, and the body is the job row in every
-case:
+Successful starts, scan refusals, and dry runs return a `job` wrapper around
+the job row. Validation and concurrent-job errors use the ordinary error envelope:
 
-- **200** — a dry-run report: affected files, rows carrying a value,
+- **200**: a dry-run report, or a job cancelled while the request was scanning
+  (inspect `job.status`). A dry-run report includes: affected files, rows carrying a value,
   `projected_nulls` (stored values the new type cannot read),
   `resurrectable` (shelved values `_raw` gives back), affected bytes,
   `ambiguous_numerals` (rows whose numeral reads as a different severity
@@ -364,11 +346,10 @@ case:
   actual count. (A second repin while one runs also 409s, with the ordinary
   error envelope.)
 
-The request holds open for the whole scan, which is a full-corpus pass —
-minutes on a large archive, past most client and proxy timeouts. A
-disconnect does not cancel anything: the claimed job runs to a terminal
-status on its own and the verdict is readable from the status route, so a
-timed-out repin is polled, never retried blind.
+The request remains open during the full-corpus scan. Disconnect does not cancel
+the job. After a timeout, correlate the running/newest status with the original
+job before retrying; that route has no lookup by ID. See
+[lost-response recovery](/operate/catalog/#resolve-a-lost-response).
 
 The same gate is asked again of the finished rewrite: ingest keeps running
 for the whole job, so a file written after the scan can carry values the
@@ -394,7 +375,8 @@ GET /api/v1/schema/repin/status
 
 The running job if any, else the newest job of any status —
 `schema_read`-gated (read-only surfaces show repin state without offering
-the trigger) and served on query-only nodes too.
+the trigger) and served on query-only nodes too. It takes no job ID and returns `job: null`
+when no job exists. A newer job can hide the outcome a caller was following.
 
 The job row also carries `cancel_requested_at` and `cancelled_by` when
 someone asked the job to stop: a `running` row carrying them is a cancel in
@@ -422,22 +404,12 @@ words and the job row under `job` when there is one:
   to stop. The two read the same to a caller: nothing was cancelled, and the
   status route says how the job actually ended.
 
-The latency contract is a boundary, not an instant. The scan and build
-loops check before and after each file, but the whole-corpus snapshot walk
-and the filesystem preflight are not checkpointed, so a job inside one of
-those stops only when it leaves it. Early-phase cancels can therefore take
-longer than one file.
-
-A 202 accepts the request; it does not promise a terminal `cancelled`
-status. The job's own completion can win the race, and a process that dies
-between the request and any boundary acting on it lands `failed` with
-`cancel_requested_at` and `cancelled_by` preserved (recovery never infers
-`cancelled` from a request nothing acted on). Those two fields are written
-durably as the request is accepted, but a process death in the same instant
-as the request can still lose them, so treat the 202 as an accepted request
-rather than a receipt for a durable one. Restarting trawld is the
-stronger cancel: a killed job leaves the live corpus untouched and boot
-recovery sweeps its staging. Read the outcome from the status route.
+Scan and build loops check cancellation before and after each file; the snapshot
+walk and filesystem preflight are not checkpointed. A 202 is acceptance, not a
+terminal `cancelled` guarantee. Completion can win the race. A process death can
+leave `failed` with cancellation fields, or lose those fields before persistence.
+After the cutover marker, recovery finishes forward. Do not treat a restart as
+an unconditional cancellation. See [cancel and verify](/operate/catalog/#stopping-a-running-repin).
 
 ```text
 POST /api/v1/schema/gc-pins
@@ -452,13 +424,9 @@ none of them.
 { "dry_run": true, "older_than_secs": 2592000 }
 ```
 
-A pin is reclaimed only when **both** axes agree it is dead: no
-`field_services` observation at or after the cutoff, **and** no standing
-parquet under any live env directory declares the column. One axis alone
-is not enough. Observations can lapse while a file still carries the
-column, and a file can carry a column no live sender writes. The footer
-scan runs under the compaction corpus gate, so nothing publishes between
-the proof and the deletion.
+A candidate needs no observation at or after the cutoff and no standing Parquet
+column under any live env. The footer proof and deletion hold the compaction
+corpus gate. See [pin reclamation](/operate/catalog/#reclaiming-dead-pin-slots).
 
 `older_than_secs` defaults to 30 days and is accepted literally, `0`
 included. The server then raises it to the retention window when that is
@@ -505,8 +473,7 @@ Three outcomes:
   commit). Re-run with `dry_run` to see which way it went.
 
 The deletion is metadata only: catalog rows and the in-process pin cache,
-in one transaction, `repin_jobs` history untouched. Being wrong is cheap.
-A reclaimed field that a sender writes again simply pins again from
+in one transaction, `repin_jobs` history untouched. A reclaimed field that a sender writes again simply pins again from
 scratch. Envelope and sender-asserted contract fields (`_time`, `service`
 and the rest) are never candidates. One staleness residual: the unscoped
 `/api/v1/schema` column listing is TTL-cached, so a reclaimed field can
@@ -524,8 +491,7 @@ in-process pin cache; a physically-present column with no pin (foreign or
 boot-skipped parquet) reports the sentinel type `UNPINNED`.
 
 Each service also carries `degraded_fields` — the degraded pins **this
-service has actually conflicted on**, from the durable per-`(field,
-service)` conflict aggregates. It is not a client-computable join:
+service has actually conflicted on**, from the durable per-`(field, service)` conflict aggregates. It is not a client-computable join:
 carrying a degraded field's column is not evidence that this service is
 what degraded it, so a service that only ever sent well-typed values for
 `duration` is not listed under it. The key is **absent when empty** (the
@@ -553,13 +519,18 @@ Returns distinct values for a specific field. Useful for building autocomplete.
 GET /api/v1/queries
 ```
 
-List currently running queries.
+Returns active, recent, and retained work. Retained entries include work ID,
+kind, started state, and retained duration. Metadata visibility and cancellation
+authority differ; see [capacity diagnosis](/operate/health/#inspect-capacity).
 
 ```
 DELETE /api/v1/queries/{id}
 ```
 
-Cancel a running query by ID.
+Request cancellation by ID, including retained work. `server_manage` can cancel
+any work; `query_cancel` can cancel work owned by the exact submitting key. An
+acknowledgement does not prove the worker stopped. Binding already inside DuckDB
+can retain a permit until it returns. Repeat cancellation is idempotent.
 
 ### Server info
 
@@ -648,8 +619,7 @@ Request body:
 - `interval` is the period, a duration: a number and one of `s`, `m`, `h`,
   `d`, `w`. Minimum 60s, maximum 10 years.
 - `window` says what each run covers (ADR-0018 ruling 6). Three spellings.
-  `"since_last"` tiles: each run covers `[the previous run's window end,
-  this fire - lag)`, so consecutive runs cover consecutive intervals and a
+  `"since_last"` tiles: each run covers `[the previous run's window end, this fire - lag)`, so consecutive runs cover consecutive intervals and a
   failed run's gap is healed by the next success. A duration such as
   `"2h"` is a fixed trailing span, re-measured from every fire and never
   healing anything; it takes the same 60s floor as the interval. Absent is
@@ -752,13 +722,10 @@ conflict, because the server has no basis for choosing which one to drop:
   invalid window: invalid interval format: "5x"; window takes "since_last" or a duration: a number and one of s, m, h, d, w
   ```
 
-  A short window reports the interval floor it shares (`schedule interval
-  30s is below minimum of 60s`), and anything over ten years reports
-  `duration 315360001s exceeds the maximum of 315360000 seconds (10
-  years)`.
+  A short window reports the interval floor it shares (`schedule interval 30s is below minimum of 60s`), and anything over ten years reports
+  `duration 315360001s exceeds the maximum of 315360000 seconds (10 years)`.
 
-A window over text that does not parse at all is refused too: `schedule
-window "2h" cannot be attached to a query that does not parse: ...`. Query
+A window over text that does not parse at all is refused too: `schedule window "2h" cannot be attached to a query that does not parse: ...`. Query
 mode parses nothing, so a saved query with no window keeps storing whatever
 text you give it.
 
@@ -790,13 +757,11 @@ query may not carry its own time clause.
 
 Every successful run is recorded, including one that found no rows. A
 zero-row run has no parquet file (there is no schema to write), so its
-columns are stored as a compressed JSON blob; `GET
-/api/v1/saved/{id}/runs/{run_id}` returns those columns with an empty row
+columns are stored as a compressed JSON blob; `GET /api/v1/saved/{id}/runs/{run_id}` returns those columns with an empty row
 list,
 and the run keeps its window like any other.
 
-Reading runs back through the DSL follows from that. `| from saved <name>
-run=latest` resolves the newest successful run and refuses to look past
+Reading runs back through the DSL follows from that. `| from saved <name> run=latest` resolves the newest successful run and refuses to look past
 it, so a zero-row run answers as itself (as an empty typed source that
 downstream stages bind against) instead of quietly serving an older
 window's numbers. `run=N` resolves one run by id and answers identically.
@@ -845,20 +810,17 @@ Content-Type: application/json
 
 Accepts JSON arrays or ndjson. Supports optional gzip compression (`Content-Encoding: gzip`). Requires a token whose roles grant the `ingest` permission.
 
-Every accepted event is canonicalized into the declared envelope (ADR-0009) — see the [Vector integration guide](/getting-started/vector-integration/) for the full field table, accepted wire aliases (`timestamp`/`@timestamp` → `_time`, `level` → severity derivation), and the severity token table. The policy is **repair when the server has an honest answer; reject when it would guess**:
+The [event reference](/reference/events/) defines the envelope, derivation,
+reserved-name handling, repair codes, and per-event rejection rules. Source fields
+such as `timestamp` and `level` remain ordinary fields. An unmappable severity
+source leaves `_severity` absent and increments the unmapped counter; it is not
+a repair and does not erase the source value.
 
-- `_time` missing or unparseable → arrival time, repair code `time.from_ingest`; parseable but implausible (>10y past / >1d future) → kept, flagged `time.out_of_range`
-- `env` missing → `default_env` (`env.defaulted`); present but not in the configured allowlist → **rejected** with a typed reason
-- `host` missing → filled from the peer IP (`host.from_peer`) — **rejected** instead when the peer is in `trusted_relays`
-- `service` missing, non-string, empty, over 128 bytes, containing invalid characters, or dot-leading → **rejected** with a typed reason
-- unmappable severity → `severity` NULL, `severity.unmapped`, never a rejection
-- client-sent `_ingested`/`_repairs` or a non-string `_raw` → stripped and replaced (`meta.stripped`)
-- a field whose **name** carries ASCII uppercase → the name is folded to lowercase (`field.name_case_folded`). DuckDB identifiers are ASCII case-insensitive, so `Dur` and `dur` name the *same* column — folding at ingest keeps the catalog, parquet, and hot buffer on one spelling. When two keys in one event collide after folding (`Status` + `status`), one value is kept — the exact-lowercase spelling's when present, else the lexicographically first variant's — and the loser is dropped (`field.name_case_collision`). A case-variant of an envelope column with no exact counterpart is simply consumed as that column (`_Time` is the `_time` wire input); with the exact spelling present, the variant loses the collision, so the canonical value can never be shadowed. Original spellings stay findable in `_raw`.
-- a field whose **name** exceeds 255 bytes → that field is dropped (`field.name_too_long`), the rest of the event is accepted. The field catalog keys on the name, and a name too long to be a postgres btree key could never be pinned — which would stall compaction for that service rather than lose one field. The name and its value stay findable in `_raw`.
-
-Repairs are recorded per-event in `_repairs` (comma-separated codes, NULL when untouched) and counted in `trawl_ingest_repairs_total{code, service}`; they do not affect the `accepted`/`rejected` counts in the response. The `service` label is client-supplied, so it is capped at the first 256 distinct services seen since boot — repairs for services past the cap count under `service="<other>"` instead of growing the metric registry without bound. Rejections are per-event: valid siblings in the same batch still land.
-
-Reserved field: `_trawl_wal_file` is trawl's own, used internally to carry each row's source WAL file through compaction. If an event supplies it, the key is silently dropped before the event is written — the rest of the event is accepted unchanged.
+Repairs do not change accepted/rejected counts. Valid siblings in a batch still
+land when another event is rejected. Repairs are stored in `_repairs` and counted
+by `trawl_ingest_repairs_total{code,service}`. The service label is capped at the
+first 256 distinct services since boot, with later services grouped as `<other>`.
+See [connect and verify a sender](/operate/ingestion/) for a bounded ingest check.
 
 ### Metrics
 

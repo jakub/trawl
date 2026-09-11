@@ -4,29 +4,33 @@ Self-hosted log collection, storage, and search for homelabs and small-to-medium
 
 ## Quick Start
 
-```bash
-# Two Secrets holding the postgres DSNs (fleet keystore + trawl app state)
-kubectl create secret generic fleet-db \
-  --from-literal=DATABASE_URL='postgres://fleet:...@pg:5432/fleet'
-kubectl create secret generic trawl-db \
-  --from-literal=TRAWL_DATABASE_URL='postgres://trawl:...@pg:5432/trawl'
+Choose a Kubernetes context, namespace, release name, and chart version first.
+The examples below use `TRAWL_CONTEXT`, `TRAWL_NAMESPACE`, and `TRAWL_RELEASE`
+for that selected target. Provision the two database Secrets through your secret
+manager: `fleet-db` with key `DATABASE_URL`, and `trawl-db` with key
+`TRAWL_DATABASE_URL`. Do not put real DSNs in shell history.
 
-# Install from GHCR OCI registry. web.publicOrigins is the browser-visible
-# origin of the web UI and is required whenever the sidecar is enabled;
-# http://localhost:8090 is what a port-forwarded UI shows in the address bar.
-helm install trawl oci://ghcr.io/jakub/charts/trawl \
+```bash
+helm install "$TRAWL_RELEASE" oci://ghcr.io/jakub/charts/trawl \
+  --version "$TRAWL_CHART_VERSION" \
+  --kube-context "$TRAWL_CONTEXT" --namespace "$TRAWL_NAMESPACE" \
   --set auth.database.existingSecret=fleet-db \
   --set storage.database.existingSecret=trawl-db \
-  --set-string 'web.publicOrigins[0]=http://localhost:8090'
+  --set-string 'web.publicOrigins[0]=http://localhost:8090' \
+  --set web.allowInsecureCookies=true
 
-# Port-forward for local access: 5514 for the API, 8090 for the web UI.
-# The 8090 mapping is what makes http://localhost:8090 above the origin the
-# browser actually sends, so the two have to name the same port.
-kubectl port-forward svc/trawl 5514:5514 8090:8090
-
-# Query via CLI (self-signed cert; mint tokens with fleet-admin)
-trawl query --url https://localhost:5514 --insecure --token <TOKEN> "* | head 5"
+kubectl --context "$TRAWL_CONTEXT" --namespace "$TRAWL_NAMESPACE" \
+  port-forward "svc/$TRAWL_RELEASE" 5514:5514 8090:8090
 ```
+
+This example deliberately uses HTTP for a local browser port-forward, so it
+allows insecure cookies. Use HTTPS origins and secure cookies for a normal
+reverse-proxy deployment. If `nameOverride` or `fullnameOverride` changes the
+Service name, use the rendered name in the port-forward command.
+Create keys through the [access guide](../../docs/src/content/docs/operate/access.md),
+then configure a named CLI profile for this target. See the
+[deployment guide](../../docs/src/content/docs/operate/deployment.md) for full
+preparation and verification.
 
 ## Architecture
 
@@ -45,7 +49,7 @@ Two **external postgres databases** back it (CNPG or any reachable postgres):
 | `fleet` (shared across fleet apps) | Secret → `FLEET_DATABASE_URL` env (fleet-admin init container reads it as `DATABASE_URL`) | migrated by `fleet-admin migrate` (init container) | API keys, roles, grants |
 | `trawl` (dedicated) | Secret → `TRAWL_DATABASE_URL` env | migrated by trawld at boot (sole writer, advisory-locked) | query history, saved queries, schedules, report runs |
 
-There is no fallback between the two URLs — provision both databases. See the fleet-auth cutover runbook in the docs for the exact roles/grants (boot-time migration means the trawld role owns the `trawl` schema).
+There is no fallback between the two URLs — provision both databases. See [database preparation](../../docs/src/content/docs/operate/deployment.md#provision-the-databases) for ownership and migration requirements.
 
 ## Prerequisites
 
@@ -56,57 +60,41 @@ There is no fallback between the two URLs — provision both databases. See the 
 
 ## Installing
 
+Every install needs both database Secret value names, including when the web
+sidecar is disabled. These source examples use an already selected checkout and
+explicit target. Render with `helm template` and the same values before applying.
+
 ```bash
-# Default install (self-signed TLS, 50Gi storage)
-helm install trawl oci://ghcr.io/jakub/charts/trawl \
+# Source chart, browser behind an existing HTTPS ingress.
+helm install "$TRAWL_RELEASE" ./chart/trawl \
+  --kube-context "$TRAWL_CONTEXT" --namespace "$TRAWL_NAMESPACE" \
   --set auth.database.existingSecret=fleet-db \
   --set storage.database.existingSecret=trawl-db \
   --set-string 'web.publicOrigins[0]=https://trawl.example.com'
 
-# Custom values
-helm install trawl oci://ghcr.io/jakub/charts/trawl \
+# Source chart, API only.
+helm install "$TRAWL_RELEASE" ./chart/trawl \
+  --kube-context "$TRAWL_CONTEXT" --namespace "$TRAWL_NAMESPACE" \
   --set auth.database.existingSecret=fleet-db \
   --set storage.database.existingSecret=trawl-db \
-  --set-string 'web.publicOrigins[0]=https://trawl.example.com' \
-  --set persistence.size=100Gi \
-  --set config.retention.maxAgeDays=180
-
-# From source
-helm install trawl ./chart/trawl \
-  --set-string 'web.publicOrigins[0]=https://trawl.example.com'
-
-# Or turn the browser UI off entirely; then no origin is needed
-helm install trawl ./chart/trawl --set web.enabled=false
+  --set web.enabled=false
 ```
+
+For repeatable upgrades, keep these values plus storage, image version, ingress,
+and TLS choices in a complete values file. `web.publicOrigins` allows an origin;
+it does not create the ingress. The chart's `values.yaml` owns the full key list.
 
 ## Auth
 
-API keys live in the shared fleet keystore. An init container runs `fleet-admin migrate` on every pod start (idempotent — sqlx tracks applied migrations). Roles are data-defined permission bundles (ADR-0006), managed with `fleet-admin roles` against the keystore database.
+The init container runs `fleet-admin migrate` against the shared Fleet keystore.
+The daemon separately migrates its dedicated Trawl app-state database. On a fresh
+Fleet database, create roles before keys; the migration only converts legacy
+roles that already exist. A role name does not imply permissions.
 
-The migration only *converts* the legacy grants it finds, so a **fresh install starts with no roles at all** — create the tiers you need once per fleet database before minting any key (`keys create --role` errors on an unknown role rather than minting a capability-less key):
-
-```bash
-# fresh install only — a converted deployment already has these
-fleet-admin roles create --name trawl-admin \
-  --perm trawl:query --perm trawl:schema_read --perm trawl:validate \
-  --perm trawl:saved_query --perm trawl:export --perm trawl:stream \
-  --perm trawl:query_cancel --perm trawl:server_manage
-fleet-admin roles create --name trawl-analyst \
-  --perm trawl:query --perm trawl:schema_read --perm trawl:validate \
-  --perm trawl:saved_query --perm trawl:export --perm trawl:stream \
-  --perm trawl:query_cancel
-fleet-admin roles create --name trawl-reader \
-  --perm trawl:query --perm trawl:schema_read --perm trawl:query_cancel
-fleet-admin roles create --name trawl-ingest --perm trawl:ingest
-```
-
-Then mint keys against those roles:
-
-```bash
-fleet-admin keys create --name "my-analyst-key" --kind human --role trawl-analyst
-```
-
-On a deployment upgraded from the pre-ADR-0006 grant model the migration has already created the same four tiers (`trawl-admin`, `trawl-analyst`, `trawl-reader`, `trawl-ingest`) with exactly the permission sets above — skip the `roles create` block there. One key can hold several roles spanning several fleet apps; only the resolved `trawl` permissions matter to trawld.
+Use [access administration](../../docs/src/content/docs/operate/access.md) for
+current role creation and rotation. `fleet-admin` expects `DATABASE_URL`; trawld
+receives `FLEET_DATABASE_URL`, so an administrative command executed inside the
+daemon container does not automatically inherit fleet-admin's required variable.
 
 ## TLS
 
@@ -114,7 +102,7 @@ trawld always speaks HTTPS. Three modes are available:
 
 | Mode | Description |
 |------|-------------|
-| `auto` (default) | trawld generates a self-signed ECDSA P-256 cert at startup. Clients need `--insecure`. |
+| `auto` (default) | trawld generates a self-signed ECDSA P-256 cert at startup. Configure client certificate trust; `--insecure` is for a deliberate local test. |
 | `secret` | Mount an existing Kubernetes TLS Secret. Set `tls.secretName`. |
 | `certManager` | Create a cert-manager Certificate. Set `tls.certManager.issuerRef`. |
 
@@ -124,7 +112,11 @@ tls:
   mode: secret
   secretName: trawl-tls-cert
 
-# Example: cert-manager
+```
+
+Or use cert-manager:
+
+```yaml
 tls:
   mode: certManager
   certManager:
@@ -185,7 +177,10 @@ web:
 
 ## Gateway API (HTTPRoute)
 
-For clusters using Gateway API instead of Ingress (e.g. Traefik, Envoy Gateway, Istio):
+The chart's HTTPRoute targets the raw trawld HTTPS Service port, even when the
+web sidecar is enabled. It is not a browser-proxy route. Configure a separate
+route to the web Service port if the browser also needs Gateway API exposure.
+For an API route:
 
 ```yaml
 httpRoute:

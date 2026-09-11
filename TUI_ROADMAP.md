@@ -1,3 +1,13 @@
+# Historical TUI design review
+
+Status: historical proposal, retained for design context. It is not a current backlog or implementation plan. The source review on 2026-09-11 confirmed that mouse configuration and theme selection are wired in `crates/trawl-cli/src/tui/mod.rs`; earlier claims below that they only need wiring are obsolete.
+
+For current controls, read `crates/trawl-cli/src/tui/ui/help.rs`. For driver behavior, read `crates/trawl-cli/src/tui/driver.rs`. The CLI reference and project `trawl-tui` skill describe current interaction. Check each remaining proposal against source before using it as acceptance criteria.
+
+The original review follows unchanged so its historical assessments remain distinguishable from current facts.
+
+---
+
 # trawl TUI — opinionated UX review
 
 ## context

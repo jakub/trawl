@@ -1,0 +1,17 @@
+---
+import Banner from '@astrojs/starlight/components/Banner.astro';
+const preview = import.meta.env.TRAWL_DOCS_PREVIEW === '1';
+---
+
+{preview ? <aside class="preview-banner">Local documentation preview. Changes here have not been published.</aside> : <Banner />}
+
+<style>
+  .preview-banner {
+    padding: 0.65rem var(--sl-content-pad-x);
+    background: var(--sl-color-accent-low);
+    color: var(--sl-color-accent-high);
+    border-bottom: 1px solid var(--sl-color-hairline-light);
+    font-size: 0.875rem;
+    text-align: center;
+  }
+</style>

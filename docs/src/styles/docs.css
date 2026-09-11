@@ -1,0 +1,67 @@
+:root {
+  --sl-color-accent-low: #152f49;
+  --sl-color-accent: #5aa4e6;
+  --sl-color-accent-high: #b8ddff;
+  --sl-color-bg: #131b25;
+  --sl-color-bg-nav: #17222f;
+  --sl-color-bg-sidebar: #131b25;
+  --sl-color-text: #ccd5e0;
+  --sl-color-white: #f0f5fc;
+  --sl-color-gray-5: #334354;
+  --sl-color-gray-6: #202e3d;
+  --sl-color-black: #131b25;
+  --sl-content-width: 48rem;
+  --sl-sidebar-width: 17.5rem;
+  --sl-font: 'Segoe UI', 'Noto Sans', Arial, sans-serif;
+  --sl-line-height: 1.7;
+  --sl-text-h1: 2.65rem;
+  --sl-text-h2: 1.8rem;
+  --sl-text-h3: 1.3rem;
+}
+:root[data-theme='light'] {
+  --sl-color-accent-low: #e4f0fc;
+  --sl-color-accent: #1e65a2;
+  --sl-color-accent-high: #194e7b;
+  --sl-color-bg: #fff;
+  --sl-color-bg-nav: #f6f8fb;
+  --sl-color-bg-sidebar: #f6f8fb;
+  --sl-color-text: #344457;
+  --sl-color-white: #172b40;
+  --sl-color-gray-5: #d3dce7;
+  --sl-color-gray-6: #edf2f7;
+  --sl-color-black: #fff;
+}
+h1, h2, h3 { letter-spacing: -0.025em; }
+.site-title { letter-spacing: -0.035em; }
+.sl-markdown-content :is(p, li) { overflow-wrap: anywhere; }
+.sl-markdown-content :is(h2, h3) { text-wrap: balance; }
+.sl-markdown-content table { font-size: 0.9375rem; }
+.sl-markdown-content th { color: var(--sl-color-white); }
+.sl-markdown-content a:not([class]) { text-underline-offset: 0.18em; }
+.sl-markdown-content code:not(pre code) { border-radius: 0.2rem; }
+.sl-markdown-content .expressive-code { margin-block: 1.6rem; }
+.sl-markdown-content .expressive-code pre { border-radius: 0.45rem; }
+.sl-markdown-content .lead { font-size: 1.25rem; line-height: 1.65; max-width: 58ch; }
+.sl-markdown-content .entry-paths {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1.5rem;
+  margin-block: 2.3rem;
+  padding-block: 1.5rem;
+  border-block: 1px solid var(--sl-color-hairline-light);
+}
+.sl-markdown-content .entry-paths > section { margin: 0; }
+.sl-markdown-content .entry-paths h2 { margin: 0; font-size: 1.1rem; }
+.sl-markdown-content .entry-paths p { font-size: 0.95rem; }
+.sl-markdown-content .entry-paths ul { padding-inline-start: 1rem; font-size: 0.95rem; }
+.sl-markdown-content .entry-paths li { margin-block: 0.5rem; }
+.sl-markdown-content .query-result {
+  padding: 1rem 1.25rem;
+  border-inline-start: 3px solid var(--sl-color-accent);
+  background: var(--sl-color-bg-nav);
+}
+:focus-visible { outline: 2px solid var(--sl-color-accent); outline-offset: 3px; }
+@media (max-width: 50rem) {
+  :root { --sl-text-h1: 2.1rem; }
+  .sl-markdown-content .entry-paths { grid-template-columns: 1fr; gap: 1.75rem; }
+}

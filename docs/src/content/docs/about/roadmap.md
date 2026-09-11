@@ -1,70 +1,55 @@
 ---
-title: Roadmap
-description: What's done, what's planned, and what's out of scope.
+title: Project direction
+description: Current capabilities, unresolved product directions, and the single-node boundary.
 ---
+
+This page distinguishes implemented capabilities from possible future work. It is not a release schedule. Check the selected release's documentation and changelog when deploying; a capability in the source tree may be newer than your installation.
 
 ## What's done
 
-trawl's core is production-quality. Here's what's shipped:
+<span id="ingestion-pipeline"></span>
 
-### Query language
-Complete pipeline DSL with 14 pipe stages, 17 aggregation functions, 12 scalar functions, OR groups, time filters, and regex/glob/KV extraction. Parameterized SQL emission throughout — no injection vectors. `CompiledFilter` provides in-memory matching for SSE streaming, property-tested against DuckDB output for equivalence.
+Trawl has HTTP and syslog ingestion, a durable WAL, a queryable hot buffer, hourly Parquet compaction, daily rollup, and per-environment retention. Its catalog pins field types and records conflicts. Operators can inspect evidence, acknowledge degradation, repin a field, and reclaim proven-dead pins.
 
-### Ingestion pipeline
-ndjson/JSON ingest → WAL → hot buffer (visible within milliseconds) → hourly parquet compaction → daily rollup. Event bus with broadcast channel for real-time streaming. Age-based + disk-pressure retention policies.
+<span id="query-language"></span>
 
-### Server
-axum with a full middleware stack: rate limiting per API key, CORS, HSTS, concurrency limits, request IDs. TLS with auto-generated self-signed certs and hot-reload. Prometheus metrics. Internal telemetry that feeds server ops back into its own pipeline.
+The [DSL reference](/reference/dsl/#pipe-stages) indexes the implemented stages, including sampling, eventstats, and saved-run sources. SQL and live evaluation share comparison rules, with explicit unsupported stages and parity tests. Embedded CLI mode queries local Parquet without a server catalog.
 
-### Authentication
-argon2id-hashed API keys with four roles (admin, analyst, reader, ingest), verified against the shared fleet-auth postgres keystore with timing-safe dummy hashes. Query history, saved queries, and schedules live in a dedicated trawl postgres database (boot-migrated, advisory-locked sole writer).
+<span id="server"></span>
+<span id="authentication"></span>
+<span id="tui"></span>
+<span id="cli"></span>
 
-### CLI
-Query, validate, and embedded mode. Four output formats (table, JSON, CSV, parquet). Formula injection protection on CSV export.
+Server authorization uses data-defined Fleet roles and compiled permissions. Browser access uses a session proxy. The browser supports search, live tail, history, saved jobs and runs, schema inspection, and health. The CLI and TUI provide their own query and investigation workflows.
 
-### TUI
-Multi-tab editor with syntax highlighting, schema browser with field profiling, query history, saved queries, live tail via SSE, vim-style result search, clipboard integration, and driver mode for programmatic control.
+<span id="scheduled-reports"></span>
 
-### Scheduled reports
-Fixed-interval query execution with zstd-compressed result storage, crash recovery, and atomic run tracking. The schedule owns the reporting window, not the query text: `since_last` tiles consecutive runs with no gap and no double-count, a fixed trailing span re-measures from every fire, and `lag` covers late arrivals. Runs fire on planned boundaries, missed ones coalesce into a single catch-up window bounded by `max_catchup_intervals`, and each run stores the resolved DSL it executed, so a report reproduces by paste (ADR-0018).
+Scheduled reports store materialized results and support explicit reporting windows, lag, and bounded catch-up. Internal telemetry and Prometheus expose daemon activity and loss, with the [limits documented here](/architecture/reports-telemetry/). Storage epochs, catalog identity, repin markers, and rollup markers provide explicit recovery behavior.
 
-### Testing
-~100 emitter snapshots, filter/SQL parity property test, ~30 engine integration tests against fixture parquet, ~40 HTTP integration tests against real server instances, hot buffer pipeline end-to-end test.
+<span id="testing"></span>
+<span id="release-infrastructure"></span>
 
-### Release infrastructure
-Cross-compiled binaries (x86_64 + aarch64 Linux), `.deb` packages, APT repository, GitHub releases.
+The repository has release automation, package and container definitions, focused Rust tests, browser tests, and disposable full-app experiments. These are mechanisms for verification, not a blanket assertion that every environment or failure mode has been tested.
 
 ## What's next
 
-### Documentation
-You're reading the first pass. Getting-started guides, Vector integration cookbook, and configuration reference are in progress.
+<span id="alerting-and-webhooks"></span>
+<span id="s3minio-cold-storage"></span>
+<span id="config-reload-on-sighup"></span>
+<span id="upgrade-and-migration-story"></span>
 
-### Upgrade and migration story
-Both postgres databases carry sqlx-versioned embedded migrations (the fleet keystore via `fleet-admin migrate`, the trawl app-state database auto-migrated by trawld at boot). Still to come: a documented breaking change policy.
+Future product choices include alert delivery, remote cold storage, and broader configuration reload. They require designs and implementation before they can be used. A supported-version and breaking-change policy also remains a product decision. This page assigns no dates and promises no particular storage backend.
 
-### Graceful degradation
-Explicit handling and recovery guidance for corrupted parquet files, truncated WAL files, and unreachable postgres backends.
+<span id="documentation"></span>
+<span id="graceful-degradation"></span>
 
-### Alerting and webhooks
-The scheduled reports infrastructure is a natural foundation — the next step is "when this condition fires, POST to a webhook or send to Slack."
+Documentation changes should make complete installation, investigation, and recovery procedures testable. Recovery mechanisms already exist; remaining guidance must describe them accurately rather than label all degradation handling unfinished.
 
-### S3/MinIO cold storage
-DuckDB's `httpfs` extension makes this relatively cheap. Daily rollup parquets upload to S3 or a MinIO instance, extending retention from "however much disk you have" to effectively infinite.
+<span id="column-level-bloom-filter-targeting"></span>
+<span id="cross-platform-ci"></span>
 
-### Column-level bloom filter targeting
-Hourly compaction and rollup now write parquet bloom filters with a pinned false-positive ratio of 0.01, but DuckDB 1.4 only emits them on columns that get dictionary-encoded. High-cardinality fields like `trace_id` miss out. A future improvement is forcing dictionary encoding (via `DICTIONARY_SIZE_LIMIT` tuning, or upstream DuckDB support for per-column bloom filter targeting) so exact-match lookups on `trace_id`, `request_id`, and similar fields can prune row groups without a separate inverted index.
-
-### Config reload on SIGHUP
-TLS certs already hot-reload, but the rest of the config requires a restart.
-
-### Cross-platform CI
-CI currently runs on Ubuntu only. macOS compilation testing is planned.
+For a proposed change, inspect current code and the [decision records](/contribute/decisions/) before treating an older roadmap bullet as authorization or acceptance criteria. The repository-root TUI review is historical, not a current backlog.
 
 ## Out of scope
 
-These are explicitly **not** on the roadmap. They fight the single-node design thesis.
-
-- **Multi-node write sharding** — consistent hashing, coordination layer, rebalancing. If you need this, you've outgrown trawl.
-- **Distributed query execution** — scatter-gather, partial aggregation, network partition tolerance. This is building a distributed database.
-- **Custom storage format** — parquet is industry standard, well-optimized, and queryable by any tool. The complexity cost of a custom format is astronomical.
-- **Consensus-based metadata store** — raft/paxos for cluster membership. Needed for exactly zero of trawl's requirements.
+Trawl remains single-node. Multi-node write sharding, distributed query execution, clustering, and multi-tenancy are outside that boundary. Parquet remains the event storage format. Adding a consensus service or a custom storage format is not part of the current design.
