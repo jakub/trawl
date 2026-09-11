@@ -1590,3 +1590,5 @@
   .modal .m-ft { justify-content: flex-end; }
   .modal .m-ft .hint { flex-basis: 100%; }
 }
+
+.stat-card .load-hint { padding: 0; font-size: var(--fs-ui); font-weight: 400; line-height: 1.4; }

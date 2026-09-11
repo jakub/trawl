@@ -559,6 +559,7 @@ fn RunsPane(net_id: i64, bus: ToastBus, on_search: Callback<String>) -> impl Int
             <Loaded
                 state=Signal::derive(move || LoadState::from_resource(runs.get()))
                 label="runs"
+                retry=Callback::new(move |()| runs.refetch())
                 render=Box::new(move |(fetched_page, resp): (usize, trawl_api::ListReportRunsResponse)| {
                         let now = now_ms();
                         let returned = resp.runs.len();
@@ -664,6 +665,7 @@ fn RunResultPreview(
             <Loaded
                 state=Signal::derive(move || LoadState::from_resource(result.get()))
                 label="result"
+                retry=Callback::new(move |()| result.refetch())
                 render=Box::new(move |resp: trawl_api::ReportRunResponse| {
                     match resp.result {
                         None => view! {
@@ -678,7 +680,7 @@ fn RunResultPreview(
                                     size=Size::Xs
                                     attr:style="margin-top:6px"
                                     on_click=Callback::new(move |()| on_search.run(query.clone()))
-                                >"View full results →"</Btn>
+                                >"Run query again"</Btn>
                             }.into_any()
                         }
                     }

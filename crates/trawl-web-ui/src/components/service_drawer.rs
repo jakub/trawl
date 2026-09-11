@@ -149,6 +149,7 @@ pub fn ServiceDrawer(
                         <FieldsPane
                             svc=svc_for_fields.clone()
                             cardinality=cardinality_sig
+                            on_retry_cardinality=Callback::new(move |()| cardinality.refetch())
                             focus_field=focus_field
                             on_use_field=on_use_field
                             on_open_field=on_open_field
@@ -163,6 +164,7 @@ pub fn ServiceDrawer(
                         <OverviewPane
                             svc=svc_for_over.clone()
                             cardinality=cardinality_sig
+                            on_retry_cardinality=Callback::new(move |()| cardinality.refetch())
                             on_use_field=on_use_field
                         />
                     }.into_any()
@@ -179,6 +181,7 @@ pub fn ServiceDrawer(
 fn OverviewPane(
     svc: ServiceSchema,
     cardinality: Signal<Option<Result<HashMap<String, u64>, String>>>,
+    on_retry_cardinality: Callback<()>,
     on_use_field: Callback<String>,
 ) -> impl IntoView {
     let svc_name = svc.name.clone();
@@ -213,6 +216,7 @@ fn OverviewPane(
                 <Loaded
                     state=Signal::derive(move || LoadState::from_resource(cardinality.get()))
                     label="cardinality"
+                    retry=on_retry_cardinality
                     render=Box::new(move |card_map: HashMap<String, u64>| {
                         let rows = top_cardinality_rows(&columns_for_top, &card_map, TOP_CARDINALITY_ROWS);
                         if rows.is_empty() {
@@ -278,6 +282,7 @@ impl SortKey {
 fn FieldsPane(
     svc: ServiceSchema,
     cardinality: Signal<Option<Result<HashMap<String, u64>, String>>>,
+    on_retry_cardinality: Callback<()>,
     focus_field: RwSignal<Option<String>>,
     on_use_field: Callback<String>,
     on_open_field: Callback<String>,
@@ -323,6 +328,12 @@ fn FieldsPane(
 
     view! {
         <div class="sd-fields">
+            {move || cardinality.get().and_then(Result::err).map(|msg| view! {
+                <div class="load-hint error">
+                    <div>{format!("Couldn't load cardinality: {msg}")}</div>
+                    <div class="load-recovery"><Btn variant=Variant::Secondary on_click=on_retry_cardinality>"Retry"</Btn></div>
+                </div>
+            })}
             <div class="sf-hd">
                 {sort_th(sort, SortKey::Name, SortKey::Name.default_desc(), "Field", "")}
                 <div>"Type"</div>
@@ -514,6 +525,7 @@ fn FieldDetail(
                 <Loaded
                     state=Signal::derive(move || LoadState::from_resource(top.get()))
                     label="values"
+                    retry=Callback::new(move |()| top.refetch())
                     render=Box::new(move |resp: QueryResponse| {
                         let rows = parse_top_values(&resp, &field_name, count_column);
                         if rows.is_empty() {
@@ -815,6 +827,7 @@ fn HistogramChart(resource: LocalResource<Result<QueryResponse, api::ApiError>>)
         <Loaded
             state=Signal::derive(move || LoadState::from_resource(resource.get()))
             label="histogram"
+            retry=Callback::new(move |()| resource.refetch())
             render=Box::new(move |resp: QueryResponse| {
                 let slots = build_histogram(&resp);
                 if slots.is_empty() {

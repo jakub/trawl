@@ -773,9 +773,13 @@ textarea:focus-visible,
   display: flex;
   flex-direction: column;
   gap: 8px;
-  pointer-events: none;
+  max-height: calc(100dvh - var(--statusbar-h) - 28px);
+  max-width: calc(100vw - 32px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 .toast {
+  flex-shrink: 0;
   pointer-events: auto;
   min-width: 280px;
   max-width: 380px;
@@ -1252,6 +1256,7 @@ textarea:focus-visible,
   font-family: var(--font-ui);
 }
 .load-hint.error { color: var(--red); }
+.load-recovery { margin-top: 8px; }
 /* Missing-state explanatory second line (issue #33 D5) — stays on the
  * neutral hint tone, slightly dimmer than the headline copy. */
 .load-hint .load-sub {

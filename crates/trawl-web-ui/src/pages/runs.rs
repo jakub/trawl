@@ -52,42 +52,47 @@ pub fn RunsPage() -> impl IntoView {
             </div>
 
             <div class="stats-row">
-                {move || {
-                    let active_nets = nets_for_stats.get()
-                        .and_then(Result::ok)
-                        .map_or(0, |resp| {
-                            resp.queries.iter()
-                                .filter(|q| q.schedule.as_ref().is_some_and(|s| s.enabled))
-                                .count()
-                        });
-
-                    let (success_rate, avg_dur) = stats.get()
-                        .and_then(Result::ok)
-                        .map_or(("—".to_string(), "—".to_string()), |s| {
-                            let total = s.total_runs;
-                            let rate = (s.success_count * 100)
-                                .checked_div(total)
-                                .map_or_else(|| "—".to_string(), |pct| format!("{pct}%"));
-                            let avg = s.avg_duration_ms
-                                .map_or_else(|| "—".to_string(), format_duration);
-                            (rate, avg)
-                        });
-
-                    view! {
-                        <div class="stat-card">
-                            <div class="label">"Active nets"</div>
-                            <div class="value">{active_nets.to_string()}</div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="label">"Success rate"</div>
-                            <div class="value">{success_rate}</div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="label">"Avg duration"</div>
-                            <div class="value">{avg_dur}</div>
-                        </div>
-                    }
-                }}
+                <div class="stat-card">
+                    <div class="label">"Active nets"</div>
+                    <div class="value">
+                        <Loaded
+                            state=Signal::derive(move || LoadState::from_resource(nets_for_stats.get()))
+                            label="active nets"
+                            retry=Callback::new(move |()| nets_for_stats.refetch())
+                            render=Box::new(|resp: trawl_api::ListSavedResponse| {
+                                resp.queries.iter().filter(|q| q.schedule.as_ref().is_some_and(|s| s.enabled))
+                                    .count().to_string().into_any()
+                            })
+                        />
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="label">"Success rate"</div>
+                    <div class="value">
+                        <Loaded
+                            state=Signal::derive(move || LoadState::from_resource(stats.get()))
+                            label="success rate"
+                            retry=Callback::new(move |()| stats.refetch())
+                            render=Box::new(|s: trawl_api::RunsStatsResponse| {
+                                (s.success_count * 100).checked_div(s.total_runs)
+                                    .map_or_else(|| "—".to_string(), |pct| format!("{pct}%")).into_any()
+                            })
+                        />
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="label">"Avg duration"</div>
+                    <div class="value">
+                        <Loaded
+                            state=Signal::derive(move || LoadState::from_resource(stats.get()))
+                            label="average duration"
+                            retry=Callback::new(move |()| stats.refetch())
+                            render=Box::new(|s: trawl_api::RunsStatsResponse| {
+                                s.avg_duration_ms.map_or_else(|| "—".to_string(), format_duration).into_any()
+                            })
+                        />
+                    </div>
+                </div>
             </div>
 
             <fleet_ui::OverflowHint viewport=table_viewport/>
@@ -103,6 +108,7 @@ pub fn RunsPage() -> impl IntoView {
                     <Loaded
                         state=Signal::derive(move || LoadState::from_resource(runs.get()))
                         label="runs"
+                        retry=Callback::new(move |()| runs.refetch())
                         render=Box::new(move |(fetched_page, resp): (usize, trawl_api::ListAllRunsResponse)| {
                                 let now = now_ms();
                                 let needle = filter.get().to_lowercase();
