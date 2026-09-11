@@ -5,8 +5,8 @@ description: Inspect a pinned field, acknowledge or repin a degraded pin, recove
 
 These commands address the server named by `TRAWL_PROFILE`. Set it to the server
 you intend to change. Reads need `schema_read`. Acknowledgement, repin, and pin
-reclamation need `schema_write` and an ingest-enabled node. Any other node
-answers 503. Command syntax is in the [CLI reference](/reference/cli/#schema-mode).
+reclamation need `schema_write`. Repin and pin reclamation also need an
+ingest-enabled node, and any other node answers 503 for those two. Command syntax is in the [CLI reference](/reference/cli/#schema-mode).
 Status codes and job fields are in the [API reference](/reference/api/#schema).
 
 ## Inspect a field
@@ -111,7 +111,8 @@ envelope field.
 
 ### Preview the repin
 
-1. Run the dry run. An execution is refused without one.
+1. Run the dry run. Nothing enforces it: `--yes` on its own rewrites the
+   corpus at once, so the dry run is the only preview you get.
 
    ```bash
    trawl -p "$TRAWL_PROFILE" schema repin duration --to varchar --dry-run
@@ -144,8 +145,13 @@ trawl -p "$TRAWL_PROFILE" schema repin level --to severity --dialect syslog --dr
 them is refused without `--dialect syslog` or `--force`. `--dialect` with any
 other target is an error.
 
-The repin changes history only. To map the sender's future values, set
-`[ingest] severity_from` as shown under
+The dialect applies to the rewrite of stored values only. After the repin,
+`level` is a severity field, and a new value conforms under the OTel reading.
+With `--dialect syslog`, a stored raw `3` becomes 17, while a raw `3` that
+arrives after the cutover becomes 3. For a sender that keeps sending syslog
+numerals, set `[ingest] severity_from` with the syslog dialect so `_severity`
+is derived correctly, and query `_severity` or `sev(level, "syslog")` rather
+than `level`. See
 [Map a raw syslog severity sent over HTTP](/operate/ingestion/#map-a-raw-syslog-severity-sent-over-http).
 
 ### Run the repin

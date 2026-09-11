@@ -19,11 +19,12 @@ HTTPS address. `trawl-web` answers 404 on `/api/v1/ingest`.
    defaults to `["prod"]`:
 
    ```bash
-   cat > events.json <<'JSON'
-   [{"service":"ingest-check","host":"app1.example.com","env":"prod","level":"info",
-     "timestamp":"2026-09-11T12:00:00Z","message":"connection check"}]
-   JSON
+   printf '[{"service":"ingest-check","host":"app1.example.com","env":"prod","level":"info","timestamp":"%s","message":"connection check"}]\n' \
+     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > events.json
    ```
+
+   The timestamp is the current time, so the `last=15m` query below finds
+   the event. An old timestamp is stored as sent and falls outside that range.
 
 2. Send it:
 

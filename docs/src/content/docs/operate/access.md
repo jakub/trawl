@@ -39,12 +39,15 @@ from `DATABASE_URL`, which is separate from the daemon's `FLEET_DATABASE_URL`.
    `service` key is for software:
 
    ```bash
-   fleet-admin keys create --name alice --kind human --role trawl-reader > alice.token
-   fleet-admin keys create --name vector --kind service --role trawl-ingest \
-     --expires 90d > vector.token
+   (umask 077
+    fleet-admin keys create --name alice --kind human --role trawl-reader > alice.token
+    fleet-admin keys create --name vector --kind service --role trawl-ingest \
+      --expires 90d > vector.token)
    ```
 
-   The token goes to standard output once. The name, kind, roles, 8-character
+   `umask 077` makes each new token file readable by you alone. A redirect
+   into a file that already exists keeps that file's mode, so delete a stale
+   token file before you reuse its name. The token goes to standard output once. The name, kind, roles, 8-character
    prefix, and expiry go to standard error. `--role` repeats. `--expires`
    accepts `24h`, `90d`, or `52w`, and a key without it never expires.
 

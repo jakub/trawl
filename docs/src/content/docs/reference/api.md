@@ -356,7 +356,7 @@ data: {"missed": 40}
 |-------|------|------|
 | `data` | One row object | Each matching event, for a pipeline with no aggregation |
 | `snapshot` | `{"columns": [...], "rows": [...]}` | For an aggregating pipeline, every 500 ms or every 100 matching events, whichever comes first, and only when new events arrived |
-| `lagged` | `{"missed": n}` | The subscriber fell behind the event bus and `n` events were skipped |
+| `lagged` | `{"missed": n}` | The subscriber fell behind the event bus and `n` ingest batches were skipped. A batch holds one or more events, so the number of missed events is unknown. |
 
 The stream closes when the pipeline finishes, for example after `| limit 10`.
 
@@ -406,13 +406,13 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -H "Content-Type: applicatio
 | `rejected` | integer | Events refused by per-event validation. Omitted when `0`. |
 | `errors` | array | One entry per rejected event: `index` is the zero-based array position or line number, counting blank lines. Omitted when empty. |
 
-A rejected event does not stop its siblings. Repairs do not change `accepted` or `rejected`. See [connect and verify a sender](/operate/ingestion/) for an end-to-end check.
+A rejected event does not stop its siblings. Repairs do not change `accepted` or `rejected`. A body whose first non-blank byte is not `[` is read as newline-delimited JSON, so a single event object is accepted and a line that is not an event object counts as one rejected event with the response still 200. See [connect and verify a sender](/operate/ingestion/) for an end-to-end check.
 
 **Errors**
 
 | Status | Code | When |
 |--------|------|------|
-| 400 | `ingest_error` | Empty body, invalid UTF-8, an unparseable or empty JSON array, a top-level value that is not an array, a gzip body that fails to decode, or a gzip body that expands past 10 times its wire size |
+| 400 | `ingest_error` | Empty body, invalid UTF-8, an unparseable or empty JSON array, a gzip body that fails to decode, or a gzip body that expands past 10 times its wire size |
 | 413 | none | The body exceeds `[ingest] max_body_bytes` |
 | 429 | `rate_limited` | The key's ingest bucket is empty |
 
