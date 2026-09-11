@@ -561,20 +561,20 @@ pub fn Search() -> impl IntoView {
                 // worth reading, and the Visualization tab is drawn from
                 // the same incomplete rows.
                 <DegradedNotice query=effective_q fields=degraded_fields/>
+                <Show when=move || !unreadable.get()
+                    && mode.get() == Mode::Live
+                    && !is_chart_query.get()
+                    && stream_failure.get().is_some()
+                >
+                    <div class="results-empty">
+                        <p role="alert">{move || stream_failure.get()}</p>
+                        <button type="button" class="btn-sec" on:click=move |_| retry_stream.run(())>"Retry live stream"</button>
+                    </div>
+                </Show>
                 {move || if unreadable.get() {
                     // The banner above IS the results pane while the
                     // link cannot be read.
                     ().into_any()
-                } else if mode.get() == Mode::Live
-                    && !is_chart_query.get()
-                    && stream_failure.get().is_some()
-                {
-                    view! {
-                        <div class="results-empty">
-                            <p role="alert">{move || stream_failure.get()}</p>
-                            <button type="button" class="btn-sec" on:click=move |_| retry_stream.run(())>"Retry live stream"</button>
-                        </div>
-                    }.into_any()
                 } else { match (active_tab.get(), mode.get()) {
                     (ResultsTab::Events, Mode::Snapshot) => view! {
                         <>
@@ -593,7 +593,7 @@ pub fn Search() -> impl IntoView {
                         <Chart snapshot=live_snapshot query=effective_q failure=stream_failure on_retry=retry_stream/>
                     }.into_any(),
                     (ResultsTab::Events, Mode::Live) => view! {
-                        <LiveRawTable result=ring_result/>
+                        <LiveRawTable result=ring_result failure=stream_failure/>
                     }.into_any(),
                     (ResultsTab::Visualization, Mode::Snapshot) => {
                         if loading.get() {
@@ -610,7 +610,9 @@ pub fn Search() -> impl IntoView {
                         <Chart snapshot=live_snapshot query=effective_q failure=stream_failure on_retry=retry_stream/>
                     }.into_any(),
                     (ResultsTab::Visualization, Mode::Live) => view! {
-                        <p class="results-empty">"Live event queries appear in Events. Use timechart with a count metric for a live visualization."</p>
+                        <Show when=move || stream_failure.get().is_none()>
+                            <p class="results-empty">"Live event queries appear in Events. Use timechart with a count metric for a live visualization."</p>
+                        </Show>
                     }.into_any(),
                 }}}
             </div>
@@ -632,14 +634,19 @@ pub fn Search() -> impl IntoView {
 
 /// Simple table rendering for the ring-buffered raw-event live feed.
 #[component]
-fn LiveRawTable(#[prop(into)] result: Signal<QueryResult>) -> impl IntoView {
+fn LiveRawTable(
+    #[prop(into)] result: Signal<QueryResult>,
+    #[prop(into)] failure: Signal<Option<&'static str>>,
+) -> impl IntoView {
     view! {
         <div class="results">
             {move || {
                 let r = result.get();
                 if r.columns.is_empty() {
                     view! {
-                        <div class="results-empty">"Streaming — waiting for first event…"</div>
+                        <Show when=move || failure.get().is_none()>
+                            <div class="results-empty">"Streaming — waiting for first event…"</div>
+                        </Show>
                     }.into_any()
                 } else {
                     let columns: Vec<String> = r.columns.iter().map(|c| c.name.clone()).collect();

@@ -41,19 +41,27 @@ for (const tab of ['Events', 'Visualization']) {
   });
 }
 
-test('a disconnected raw live stream hides stale rows and recovers after retry', async ({ page, request }, testInfo) => {
+test('a disconnected raw live stream retains received rows and recovers after retry', async ({ page, request }, testInfo) => {
   await resetScenario(request, 'stream-burst');
   let failed = false;
   await page.route('**/api/v1/stream?*', route => failed
     ? route.fulfill({ status: 400, json: { error: 'unavailable' } }) : route.continue());
   await page.goto('/search?q=service%3Dnginx&mode=live');
   await expect(page.getByText('burst-5999', { exact: true })).toBeVisible();
+  const receivedTable = await page.locator('.results-table').elementHandle();
   failed = true;
   expect((await request.post('/__ctl/stream/drop')).ok()).toBe(true);
   await expect(page.getByRole('button', { name: 'Retry live stream' })).toBeVisible();
-  await expect(page.locator('.results-table')).toHaveCount(0);
+  await expect(page.getByText('burst-5999', { exact: true })).toBeVisible();
+  await expect(page.locator('.results-table tbody tr')).toHaveCount(5000);
+  expect(await receivedTable!.evaluate(table => table.isConnected)).toBe(true);
   await expect(page.getByText('Live stream unavailable.', { exact: false })).toBeVisible();
   await page.screenshot({ path: testInfo.outputPath('disconnected-events.png') });
+  await page.getByRole('tab', { name: 'Visualization', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Retry live stream' })).toBeVisible();
+  await expect(page.locator('.results-table')).toHaveCount(0);
+  await page.getByRole('tab', { name: /^Events/ }).click();
+  await expect(page.getByText('burst-5999', { exact: true })).toBeVisible();
   failed = false;
   await page.getByRole('button', { name: 'Retry live stream' }).click();
   await expect(page.getByText('burst-5999', { exact: true })).toBeVisible();
