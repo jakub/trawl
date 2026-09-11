@@ -90,10 +90,10 @@ test('responsive page headers and labelled list scrolling keep controls and colu
     await expect(scroller).toHaveAccessibleName(/Search history|Services|Saved queries|Recent runs/);
     await expect(page.locator('.overflow-hint')).toBeVisible();
     await scroller.focus();
-    const old = await page.locator('.tbl-hd').evaluate(e => e.getBoundingClientRect().x);
+    const old = await page.locator('.fleet-table thead').evaluate(e => e.getBoundingClientRect().x);
     await page.keyboard.press('ArrowRight');
     await expect.poll(() => scroller.evaluate(e => e.scrollLeft)).toBeGreaterThan(0);
-    expect(await page.locator('.tbl-hd').evaluate(e => e.getBoundingClientRect().x)).toBeLessThan(old);
+    expect(await page.locator('.fleet-table thead').evaluate(e => e.getBoundingClientRect().x)).toBeLessThan(old);
   }
   await request.post('/__ctl/reset', { data: { scenario: 'health-admin' } });
   await page.goto('/settings/health');
@@ -146,7 +146,7 @@ for (const width of [320, 720]) {
     let executes = 0;
     await page.route('**/api/v1/schema/repin', async route => {
       const input = route.request().postDataJSON();
-      const json = JSON.parse(await readFile('harness/wire/repin-status-running.json', 'utf8'));
+      const json = JSON.parse(await readFile(`${__dirname}/../harness/wire/repin-status-running.json`, 'utf8'));
       Object.assign(json.job, { dry_run: input.dry_run, force: input.force, to_type: input.to, status: input.dry_run ? 'succeeded' : 'refused_needs_force', finished_at: '2026-09-10T20:00:00Z', projected_nulls: 150 });
       if (!input.dry_run) executes++;
       await route.fulfill({ status: input.dry_run ? 200 : 409, json });

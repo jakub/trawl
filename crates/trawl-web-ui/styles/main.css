@@ -1611,3 +1611,5 @@
 .bucket-data th, .bucket-data td { text-align: start; padding: 6px 10px; white-space: nowrap; }
 .bucket-data caption { text-align: start; padding-block: 8px; }
 .chart-note { padding: 8px 14px; color: var(--ink-2); }
+
+.sd-ttl .service-freshness { flex-basis: 100%; display: flex; align-items: center; gap: 6px; font-size: var(--fs-ui); color: var(--ink-2); }

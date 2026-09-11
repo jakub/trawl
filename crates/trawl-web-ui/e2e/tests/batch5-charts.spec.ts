@@ -73,12 +73,13 @@ test('snapshot chart handles completed, unsupported, empty and failed responses 
 });
 
 test('live raw visualization explains its supported query and preserves live connection', async ({ page, request }) => {
+  const opensBefore = (await (await request.get('/__ctl/state')).json()).sse.opens;
   await page.goto('/search?q=service%3Dnginx&mode=live');
   await page.getByRole('tab', { name: 'Visualization' }).click();
   await expect(page.getByText('Live event queries appear in Events.', { exact: false })).toBeVisible();
   await expect(page.locator('.chart canvas')).toHaveCount(0);
   expect(new URL(page.url()).searchParams.get('mode')).toBe('live');
-  await expect.poll(async () => (await (await request.get('/__ctl/state')).json()).sse.opens).toBe(1);
+  await expect.poll(async () => (await (await request.get('/__ctl/state')).json()).sse.opens).toBe(opensBefore + 1);
 });
 
 test('chart refuses lossy metrics and supports multiple integer metrics', async ({ page }) => {

@@ -128,11 +128,11 @@ pub fn ServiceDrawer(
             close_size=12
             meta=meta_text
             title=Box::new(move || view! {
-                <HealthDot svc=svc_for_head.clone()/>
                 <span class="name">{svc_for_head.name.clone()}</span>
                 {(!sub_text.is_empty()).then_some(view! {
                     <span class="sub">{sub_text}</span>
                 })}
+                <HealthDot svc=svc_for_head.clone()/>
             }.into_any())
             actions=Box::new(move || view! {
                 <Btn variant=Variant::Secondary on_click=on_search_click>
