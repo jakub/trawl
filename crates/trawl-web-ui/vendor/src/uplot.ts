@@ -70,6 +70,34 @@ function translucent(color: string, alpha: number): string {
   return `#${hex[1]}${a}`;
 }
 
+// Canvas and legend use the same CSS-pixel patterns. A CSS border marker
+// cannot represent dash-dot patterns, so each line gets an SVG legend key.
+const lineDashes = [[], [6, 4], [2, 4], [12, 4], [8, 3, 2, 3], [8, 3, 2, 3, 2, 3]];
+
+function lineLabel(label: string, color: string, dash: number[]): HTMLElement {
+  const key = document.createElement("span");
+  key.className = "series-key";
+  key.style.cssText = "display:inline-flex;align-items:center;gap:.4em;color:var(--ink)";
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("width", "44");
+  svg.setAttribute("height", "12");
+  svg.setAttribute("viewBox", "0 0 44 12");
+  svg.setAttribute("aria-hidden", "true");
+  const line = document.createElementNS(svg.namespaceURI, "line");
+  line.setAttribute("x1", "0");
+  line.setAttribute("x2", "44");
+  line.setAttribute("y1", "6");
+  line.setAttribute("y2", "6");
+  line.setAttribute("stroke", color);
+  line.setAttribute("stroke-width", "2");
+  line.setAttribute("stroke-dasharray", dash.join(" "));
+  svg.append(line);
+  const text = document.createElement("span");
+  text.textContent = label;
+  key.append(svg, text);
+  return key;
+}
+
 export function createChart(
   parent: HTMLElement,
   data: AlignedData,
@@ -108,11 +136,15 @@ export function createChart(
     return [min, max + step];
   };
 
+  const colors = [accent, token("--teal", accent), token("--red", accent),
+    token("--yellow", accent), token("--green", accent), token("--ink", accent)];
   const series = [
-    { label: "time" },
-    ...seriesLabels.map((label) => ({
-      label,
-      stroke: accent,
+    { label: opts.rowIndex ? "Result position" : "time" },
+    ...seriesLabels.map((label, index) => ({
+      label: bars ? label : lineLabel(label, colors[index % colors.length], lineDashes[index % lineDashes.length]),
+      stroke: bars ? accent : colors[index % colors.length],
+      // uPlot passes dash lengths directly to its device-pixel canvas.
+      dash: bars ? [] : lineDashes[index % lineDashes.length].map(length => length * window.devicePixelRatio),
       // Bars are flat fills with NO stroke: uPlot strokes zero-height
       // rects too, which drew a dashed hairline along the baseline for
       // every empty bucket. Flat also matches the Mira button recipe.
@@ -163,7 +195,7 @@ export function createChart(
       points: { show: !bars },
       y: !bars,
     },
-    legend: { live: true },
+    legend: { live: true, markers: { show: bars } },
   };
 
   const chart = new uPlot(options, data, parent);
