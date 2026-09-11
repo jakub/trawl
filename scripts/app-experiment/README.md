@@ -9,7 +9,8 @@ existing Playwright dependency in `crates/trawl-web-ui/e2e`.
 
 Ask an agent to "run an app experiment" for the default 1000-event check, or
 specify a seed, count, rate, and whether to keep the browser available. The
-root `AGENTS.md` links to `CLAUDE.md`, which gives agents the default workflow.
+project [trawl-experiment skill](../../.agents/skills/trawl-experiment/SKILL.md)
+gives agents the default workflow; root `AGENTS.md` links to the task skills.
 This guide supplies the setup context without requiring source inspection.
 
 Run commands from the worktree containing the code you want to exercise.
