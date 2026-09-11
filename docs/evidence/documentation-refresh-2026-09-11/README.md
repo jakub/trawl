@@ -3,6 +3,60 @@
 Checked on 2026-09-11 against source base `92d3c28c917fd820f3e446971e6167e90c6446e7`.
 The local agent documentation refresh is a separate commit on the same branch.
 
+## Writing pass
+
+The writing pass starts from `b0eb1bc2` and ends at `cb31153e`, six commits
+over 40 files. It applies the technical-writing standard to every page: one
+Diátaxis mode per page, commands as instructions with the condition first,
+one thought per sentence, no rationale or history in reference pages, and
+every route, flag, key, default, path, and shortcut checked against the code
+in the same tree.
+
+Seven writer seats edited disjoint file sets in the shared worktree, four on
+Fable 5.1 (quickstart and usage, HTTP API, operator installation, diagnostics
+and crash dumps) and three on Opus 5 (DSL, the other references, architecture
+and contributor pages), all at the session's inherited effort. The seats
+reported 68 claims corrected against the source. Among them: the API page
+documented `format` as a body field where the export handler reads it from
+the query string, the configuration page omitted four keys, the CLI page had
+no exit codes or environment variable table, the DSL page omitted ten scalar
+functions and stated the streaming predicate too widely, the component
+diagram routed ingest through the browser proxy, and the Vector guide did not
+set the interpolation variable that Vector 0.57 and later require.
+
+Two adversarial reviews by gpt-6-astra at high effort covered the range from
+the immutable base. Job `032a7fa7-85e0-4dbf-afae-6df84f3c17ab` reviewed
+`b0eb1bc2..8cabb845` and returned seven findings, all confirmed at the cited
+code and fixed in `d04c7ef9`. Job `de0bb0f0-2065-4b1c-9ebf-4f22a9359c2c`
+reviewed the final quickstart round, `8cabb845..15bdf9cb`, and returned four
+findings, all confirmed and fixed in `cb31153e`. No finding was rejected.
+
+Checks at `cb31153e`:
+
+- `npm run check` passes: 38 HTML pages, 2,866 local links, 25 TOML blocks,
+  and all 18 DSL stages.
+- All 108 Bash blocks pass `bash -n`. Every page has a title and description.
+- A sweep for em and en dashes, curly quotes, decision-record mentions,
+  development history, real homelab identifiers, and the name Coastwatch
+  outside the development guide finds nothing. The four remaining em dashes
+  quote program output verbatim.
+- The site holds 52,293 words, from 52,892. The HTTP API page grew from 5,546
+  to 9,591 words because every route now has the same block with its errors
+  table, and the DSL page held at 9,756 because every rule stayed.
+
+Not done in this pass:
+
+- No sample dataset ships with the site. The build host has no Parquet
+  tooling, so the no-server path still needs the reader's own files.
+- The tutorial and operator commands were syntax-checked and their quoted
+  outputs verified against the source strings. They were not executed.
+- `TUI_ROADMAP.md` at the repository root and the `docs/evidence` directories
+  are outside the site and were not changed.
+- One code observation, not changed: `POST /api/v1/query` answers
+  `offset + limit > max_result_rows` with the `ingest_error` code
+  (`crates/trawl-server/src/handlers.rs:73`). The API page documents the
+  code as it is.
+
 ## Clean manual revision
 
 The follow-up revision starts from `9d0ef610`. It removes the public decision
