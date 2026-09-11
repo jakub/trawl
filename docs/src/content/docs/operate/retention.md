@@ -66,17 +66,16 @@ If a permission or I/O failure leaves a staging root behind, trawld retains the
 marker needed to authorize its cleanup. The next boot retries cleanup. Until it
 succeeds, the server reports `repin_recovery_incomplete` and retention stays paused.
 
-Monitor `trawl_retention_suppressed`. It is 1 when a retention tick stands down and
-0 when the sweeps run. A prolonged value of 1 needs investigation even if
+Monitor `trawl_retention_suppressed`. It is 1 when repin state suppresses a
+retention tick and 0 when that guard is clear. A prolonged value of 1 needs investigation even if
 `trawl_catalog_repin_running` is 0: an abandoned staging root can suppress
 retention without a running job.
 
-Either epoch archive, `data.pre-schema-v2/` or `data.pre-epoch-3/`, also suppresses
-disk-pressure deletion. Those archives sit outside the live data root, so deleting
-live partitions cannot reclaim their space. Each tick under pressure logs
-`retention_disk_pressure_suppressed` with `set_aside_path`. Inspect all retained
-archives before reclaiming space. Age-based retention is unaffected by these
-epoch archives.
+Disk-pressure cleanup can also report `retention_disk_pressure_suppressed`.
+Its `set_aside_path` field identifies a retained directory outside the live
+corpus. Inspect that path and its backup status before reclaiming space; removing
+live partitions cannot free the bytes it holds. This guard pauses pressure
+cleanup without setting the repin suppression gauge or stopping age-based retention.
 
 ## Recover space
 
@@ -86,11 +85,7 @@ epoch archives.
    for its affected bytes to remain doubled. Do not delete its marker or staging roots.
 3. If recovery is incomplete, resolve the reported filesystem permission or I/O
    failure. Plan a restart so normal boot recovery can finish. Preserve all job state.
-4. Treat epoch set-asides as historical archives. Verify and back them up before
-   an explicit decision to archive them elsewhere or delete them. They may be the
-   only copy of old events. Both epoch suffixes can exist at once.
-5. On the next retention tick, verify suppression ended and free space changed.
+4. On the next retention tick, verify suppression ended and free space changed.
    Do not infer success from removal of one directory while another still blocks it.
 
-The [upgrade guide](/operate/upgrades/) explains epoch cutovers. The
-[backup procedure](/operate/backup-restore/) keeps corpus and catalog together.
+The [backup procedure](/operate/backup-restore/) keeps corpus and catalog together.

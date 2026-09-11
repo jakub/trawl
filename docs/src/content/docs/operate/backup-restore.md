@@ -107,7 +107,7 @@ If a listed config file is absent, identify whether the layout is actually in
 scope before editing the inventory and rerunning into a new backup directory.
 Do not label a partially written backup complete. `files.tar` preserves the
 whole state tree, including WAL, scheduled results, `EPOCH`, `CATALOG`, TLS files,
-session material, and any epoch archives. Crash dumps are excluded because they
+session material, and any repin recovery state. Crash dumps are excluded because they
 are a separate sensitive diagnostic store; archive them separately if needed.
 The archive may still contain query-debug data or credentials, so keep it private.
 
@@ -151,7 +151,7 @@ is intentionally limited to the single-owner arrangement described above.
 If a restore fails, keep the target stopped and create fresh empty databases
 before retrying. Do not retry by layering a partial restore over an unknown state.
 Verify service user IDs match the manifest before installing the filesystem copy.
-On this fresh target, `/var/lib/trawl/data` and all its epoch or repin siblings
+On this fresh target, `/var/lib/trawl/data` and all its repin siblings
 must be absent. Replace only the packaged state/configuration paths listed below;
 never overlay a pre-existing corpus. The package-created cookie is replaced by the
 backed-up cookie so the drill tests the selected recovery point.
@@ -204,19 +204,3 @@ scheduled catch-up windows before re-enabling the scheduler. Reconcile key
 revocations and role changes made since the backup before replacing a shared
 Fleet keystore. Keep the backup and validation record until the recovered service
 has passed its normal operating checks.
-
-## Verification status
-
-On 2026-09-11, a disposable PostgreSQL 18 installation and Trawl 0.4.0 development
-binaries passed an offline two-database and filesystem restore drill. The
-restored catalog marker and API identity matched. Queries returned the three
-original events; a fourth event ingested after restore remained present after
-another daemon restart. The check waited for post-restart compaction before
-asserting the final count.
-
-That drill used private temporary paths and one user, not the packaged paths,
-systemd units, or UID restoration above. It did not exercise browser cookies,
-saved reports, custom grants, or a shared-Fleet production cutover. The
-[validation record](/validation/documentation-refresh-2026-09-11.json)
-names the source and binary revisions and these limits. Rehearse the complete
-procedure on your own isolated topology before relying on it for recovery.

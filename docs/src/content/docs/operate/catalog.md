@@ -94,7 +94,7 @@ trawl -p "$TRAWL_PROFILE" schema field duration --limit 500 --after '2026-08-02T
 ## Repin
 
 `schema repin` changes a wrongly-pinned field's type by rewriting the
-corpus (ADR-0011): affected files are rebuilt to the new type with
+corpus: affected files are rebuilt to the new type with
 conflict-shelved values resurrected from `_raw`, unaffected files are
 hardlinked, and the switch is atomic and crash-recoverable. It needs the
 `schema_write` permission.

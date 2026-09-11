@@ -47,7 +47,7 @@ A no-files read after source evidence established cold data becomes retryable `5
 
 The pool bounds concurrent physical DuckDB work. Query, export, schema-value sampling, and report execution use their applicable admission and ownership paths. Request lifetime and worker lifetime are distinct: DuckDB binding may continue after an interrupt or timeout.
 
-A timed-out request therefore does not release a permit or publication guard while physical work still holds it. Running-query information can expose retained work. A cutover waits for actual exclusion, not merely for HTTP responses to finish. [ADR-0024](/contribute/decisions/#adr-0024) defines admission, deadlines, and retained permits; [ADR-0026](/contribute/decisions/#adr-0026) defines publication guards.
+A timed-out request therefore does not release a permit or publication guard while physical work still holds it. Running-query information can expose retained work. A cutover waits for actual exclusion, not merely for HTTP responses to finish.
 
 ## Rust tail and display
 
@@ -65,4 +65,4 @@ The event bus is bounded and lossy for slow consumers. A lag notification means 
 
 ## Source owners
 
-`trawl-core/src/{compare,pin_scope,filter,stream}.rs`, `trawl-core/src/emitter/`, `trawl-engine/src/executor.rs`, and `trawl-server/src/pool.rs` own these mechanisms. See the [source map](/contribute/source-map/) for tests and related decisions.
+`trawl-core/src/{compare,pin_scope,filter,stream}.rs`, `trawl-core/src/emitter/`, `trawl-engine/src/executor.rs`, and `trawl-server/src/pool.rs` own these mechanisms. See the [source map](/contribute/source-map/) for tests and related modules.

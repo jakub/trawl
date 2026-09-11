@@ -165,6 +165,6 @@ Targets `fleet_auth`, `auth.backend`, `preauth.transport`, and `trawl_server::po
 
 The events remain on stdout. `trawl_auth_failures_total{reason}` exposes a fixed vocabulary of rejection counts without client-chosen key names or paths in metric labels. Persistence filtering is narrower than stdout filtering, and operator log directives cannot override this exclusion.
 
-## Source and decision owners
+## Source owners
 
-Scheduling lives in `trawl-server/src/scheduler.rs` and the app-state store. Telemetry lives in `src/telemetry.rs`, with content-free failure classification in `src/error.rs`. See [ADR-0018](/contribute/decisions/#adr-0018) for report-window policy and [configuration](/reference/configuration/) for defaults and logging options.
+Scheduling lives in `trawl-server/src/scheduler.rs` and the app-state store. Telemetry lives in `src/telemetry.rs`, with content-free failure classification in `src/error.rs`. See [configuration](/reference/configuration/) for defaults and logging options.

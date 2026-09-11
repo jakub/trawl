@@ -48,7 +48,3 @@ Fleet crates also serve Coastwatch through sibling dependencies. A shared change
 [Local development](/getting-started/development/) describes the persistent interactive stack. Agent tests need disposable infrastructure. README and `lefthook.yml` describe focused test commands and broader automated gates; Cargo manifests own feature and target selection.
 
 The [full-app experiment](https://github.com/jakub/trawl/blob/main/scripts/app-experiment/README.md) uses real daemons, PostgreSQL, ingest, and Chromium. The [browser E2E suite](https://github.com/jakub/trawl/blob/main/crates/trawl-web-ui/e2e/README.md) uses a stub API. Neither is a substitute for the other's claims, and neither demonstrates Firefox or Safari behavior unless separately tested.
-
-## Decisions
-
-Use the [ADR index](/contribute/decisions/) to find rationale and amendments. Current source and tests establish what is implemented; an accepted proposal or an old test report alone does not establish current runtime behavior.

@@ -25,10 +25,9 @@ role and API key. It then starts `trawld`, `trawl-web`, and Trunk. Open
 `bin/dev` is also the canonical fast server build. It downloads the
 version-matched DuckDB shared library on first use and caches the archive and
 extracted libraries below `target/duckdb-download`; later builds reuse it.
-The development launcher supplies the library path only to `trawld`. The
-browser flow and the three `mprocs` panes do not change. A direct
-`cargo build -p trawl-server` remains the production-style path and compiles
-bundled DuckDB.
+The development launcher supplies the library path only to `trawld`.
+A direct `cargo build -p trawl-server` compiles bundled DuckDB for production
+builds.
 
 The interactive database lives in the named
 `fleet-dev-postgres-data` volume. It is intentionally separate from
@@ -46,7 +45,7 @@ bin/fleet-dev setup trawl
 bin/dev --release-spa
 ```
 
-If historical bundled DuckDB fingerprints grow too large, preview and remove
+If bundled DuckDB build artifacts grow too large, preview and remove
 only `libduckdb-sys` build artifacts with:
 
 ```bash
@@ -61,7 +60,7 @@ automatically.
 `plan` is pure: it does not read token files, resolve credentials, connect to a
 database, or change Tailscale configuration. Under Tailscale exposure it does
 make two read-only queries to the local daemon, for the node's MagicDNS name
-and tailnet IPv4 — so `plan` needs a running, logged-in `tailscaled` unless you
+and tailnet IPv4, so `plan` needs a running, logged-in `tailscaled` unless you
 pin both values (see below).
 
 ## Machine profile
@@ -206,10 +205,8 @@ or its superuser contract outside the loopback-only development provider.
 
 ## Coastwatch
 
-The controller already supports a Coastwatch manifest and a combined plan.
-Cross-repository adoption is tracked separately. Trawl remains independently
-launchable, and `bin/dev --with-coastwatch` is a frozen compatibility
-translation to `fleet-dev all` during that rollout.
+The controller supports a Coastwatch manifest and a combined plan. Use
+`bin/fleet-dev all` to launch both apps. Trawl can also run independently.
 
 The two-app schema uses fixed conventions rather than a plugin API. A
 browser-facing backend named `web` receives the Coastwatch bind alias and the

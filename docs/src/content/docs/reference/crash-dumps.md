@@ -384,11 +384,8 @@ could not set `no_new_privs`, and it refuses to serve queries holding ptrace
 power it said it would give up. That check runs before the async runtime is
 built, which is before the tracing subscriber exists, so there is no
 `crash_dump` event and no `reason="seal"` field to read. What you get is one
-line on stderr and exit 1:
-
-```text
-[trawld] crash-dump seal failed: refusing to start with an unsealed capability set (ADR-0023 ruling 4)
-```
+line on stderr and exit 1. The message begins with
+`[trawld] crash-dump seal failed` and says that the capability set is unsealed.
 
 Every other `reason` leaves trawld running normally with capture off.
 

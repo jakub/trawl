@@ -14,9 +14,8 @@ and configuration source. A saved CLI profile is a connection, not a statement
 that its server is disposable. Follow the existing GitOps source when it owns
 the workload. Use [installation](/getting-started/) for obtaining binaries.
 
-Before an upgrade, read [upgrade boundaries](/operate/upgrades/) and take a
-[coordinated backup](/operate/backup-restore/). A build request does not require
-publishing a release or changing a running server.
+Plan [coordinated backups](/operate/backup-restore/) for the databases and data
+filesystem before collecting events.
 
 ## Provision the databases
 

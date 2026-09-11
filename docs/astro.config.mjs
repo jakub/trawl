@@ -31,7 +31,7 @@ export default defineConfig({
         },
         {
           label: 'Operate Trawl', collapsed: true,
-          items: ['operate/deployment', 'operate/ingestion', 'getting-started/vector-integration', 'operate/access', 'operate/health', 'operate/catalog', 'operate/retention', 'operate/backup-restore', 'operate/upgrades', 'reference/crash-dumps', 'reference/fleet-auth-cutover'].map((slug) => ({ slug })),
+          items: ['operate/deployment', 'operate/ingestion', 'getting-started/vector-integration', 'operate/access', 'operate/health', 'operate/catalog', 'operate/retention', 'operate/backup-restore', 'reference/crash-dumps'].map((slug) => ({ slug })),
         },
         {
           label: 'Reference', collapsed: true,
@@ -43,7 +43,7 @@ export default defineConfig({
         },
         {
           label: 'Contribute', collapsed: true,
-          items: ['getting-started/development', 'contribute/source-map', 'contribute/testing', 'contribute/experiments', 'contribute/documentation', 'contribute/decisions', 'about/roadmap'].map((slug) => ({ slug })),
+          items: ['getting-started/development', 'contribute/source-map', 'contribute/testing', 'contribute/experiments', 'contribute/documentation'].map((slug) => ({ slug })),
         },
       ],
       favicon: '/favicon.svg',

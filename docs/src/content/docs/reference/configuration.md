@@ -33,7 +33,7 @@ hot_buffer_max_bytes = "100M"
 min_free_disk_bytes = "1G"
 ```
 
-Raw integers are also accepted for backward compatibility.
+Raw integers specify a number of bytes.
 
 **Paths** support tilde expansion: `"~/.trawl/data"` expands to `$HOME/.trawl/data` at startup.
 
@@ -96,7 +96,7 @@ The shipper-sized ceiling is earned by the `ingest` permission, not by the route
 
 The two classes need ceilings orders of magnitude apart: vector flushes a batch per 1 MB / 5 s per source and sources commonly share one ingest key, while `/query`, `/export`, and `/stream` each run a DuckDB scan. Raise `ingest_rpm` for large shipper fleets; raise `default_rpm` for dashboard-heavy UI use.
 
-##### Per-role `rate_rpm` override (ADR-0006 slice 1)
+##### Per-role `rate_rpm` override
 
 Class-of-service lives on the role row: `fleet-admin roles create --name shipper --perm trawl:ingest --rate-rpm 2000` gives every key holding that role a 2000-rpm ceiling. Precedence:
 
@@ -107,7 +107,6 @@ Class-of-service lives on the role row: `fleet-admin roles create --name shipper
 
 Re-tiering is in place and non-destructive: `fleet-admin roles set-rate shipper --rate-rpm 4000` changes the ceiling for every key holding the role (effective on the next request — roles are resolved per verify, never cached), and `fleet-admin roles set-rate shipper --default` clears the override so those keys fall back to the class defaults. Neither touches the role's permission bundle or its key assignments.
 
-**Migration note**: the per-role config keys (`admin`, `analyst`, `reader`, `ingest`) were removed in ADR-0006 slice 0 — a config still carrying them fails validation at boot rather than being silently ignored. Replace `ingest` with `ingest_rpm`, and the interactive roles with `default_rpm`.
 
 #### TLS auto-generation
 
@@ -145,12 +144,16 @@ See [enable, inspect, and remove the debug log](/operate/health/#the-query-debug
 | `audit_interval_secs` | integer | `30` | Poll the fleet keystore for key *and role* changes from `fleet-admin` — emits `key_created` / `key_revoked` / `key_roles_changed` / `role_created` / `role_changed` / `role_deleted` audit events, each key event carrying the permissions its roles resolved to; `0` disables |
 
 :::note
-trawld will not start until the fleet database is reachable and migrated (`fleet-admin migrate`). Key revocation takes effect immediately — liveness is checked in postgres on every request. The bare `DATABASE_URL` override was removed in the slice-3 cutover (it is ceded to sqlx's test harness); a leftover `db_path` (the retired transitional SQLite store) fails validation with a message naming the migration. See the [fleet-auth cutover runbook](/reference/fleet-auth-cutover/) for migrating an existing deployment.
+trawld starts only after the Fleet database is reachable and initialized with
+`fleet-admin migrate`. It checks key validity in PostgreSQL on every request,
+so revocation takes effect on the next request. Set `FLEET_DATABASE_URL` or
+`[auth] database_url` for the daemon. `fleet-admin` uses `DATABASE_URL`.
+See [database provisioning](/operate/deployment/#provision-the-databases).
 :::
 
 ### `[storage]`
 
-Trawl's own app state — query history, saved queries, schedules, and report runs — lives in a **dedicated postgres database** owned by trawld (ADR-0004 slice 3).
+Trawl's own app state — query history, saved queries, schedules, and report runs — lives in a **dedicated postgres database** owned by trawld.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -177,7 +180,7 @@ trawld migrates this database automatically at boot (it is the sole writer) and 
 | `telemetry_flush_interval_secs` | integer | `1` | Telemetry WAL flush interval |
 | `telemetry_buffer_max_bytes` | byte size | `"16M"` | One memory budget for everything self-telemetry holds while the WAL is unhealthy — active buffer, retry queue and the in-flight batch (estimated charge, like `hot_buffer_max_bytes`). Must be positive; `0` is boot-fatal (use `internal_telemetry = false` to turn self-telemetry off). Enforced as events arrive: over budget the oldest queued batches are shed first, then the incoming event itself, counted in `trawl_telemetry_events_dropped_total{reason="buffer_cap"}` |
 | `default_env` | string | `"prod"` | Fills a missing `env` on ingested events (repair code `env.defaulted`). Must pass the env charset and be a member of `envs` |
-| `envs` | string list | `[default_env]` | Environment allowlist (ADR-0009). Events with an unlisted `env` hard-reject. Entries must match `[a-z0-9_-]{1,32}`; `wal` and `scheduled` are reserved. Validated at load — trawld refuses to start otherwise. The allowlist gates writes, not reads: removing an env stops new ingest but its directories stay queryable and age out normally |
+| `envs` | string list | `[default_env]` | Environment allowlist. Events with an unlisted `env` hard-reject. Entries must match `[a-z0-9_-]{1,32}`; `wal` and `scheduled` are reserved. Validated at load — trawld refuses to start otherwise. The allowlist gates writes, not reads: removing an env stops new ingest but its directories stay queryable and age out normally |
 | `trusted_relays` | CIDR list | `[]` | Peers (collectors/relays) whose address must never be stamped as an event's `host`: a host-less event from one of these is rejected instead of peer-repaired (HTTP) or kept with `host` omitted (syslog). Invalid entries are boot-fatal. Peer addresses are canonicalized before matching — a dual-stack bind's IPv4-mapped peer (`::ffff:10.1.2.3`) matches a plain v4 entry (`10.0.0.0/8`), and a mapped-form entry folds to its v4 meaning at load |
 | `severity_from` | source list | `["severity", "severity_text", "level"]` | Wire keys `_severity` derives from, in precedence order — first *mappable* wins. Empty is legal and derives nothing |
 | `time_from` | source list | `["_time", "timestamp", "@timestamp"]` | Wire keys `_time` derives from, in precedence order — first *present* wins. Must contain `_time` |
@@ -232,9 +235,7 @@ Changing either list is **forward-only**. There is no policy history and nothing
 | `min_free_disk_bytes` | byte size | `"1G"` | When free disk drops below, delete date directories highest expiry ratio first (age over that env's limit); `0` disables |
 | `retention_interval_secs` | integer | `3600` | Retention check frequency (default: 1 hour) |
 
-Repin markers or staging roots suppress both sweeps. Either epoch archive,
-`data.pre-schema-v2/` or `data.pre-epoch-3/`, suppresses disk-pressure deletion
-but not age retention. See [suppression and recovery](/operate/retention/#diagnose-suppression)
+Repin markers or staging roots suppress both sweeps. See [suppression and recovery](/operate/retention/#diagnose-suppression)
 before removing any data or recovery state.
 
 #### `[retention.env.<name>]`
@@ -314,7 +315,7 @@ See [schema and retention](/operate/retention/#the-schema-horizon).
 
 A schedule in `since_last` mode keeps a watermark and tiles forward from it, so runs missed while trawld was down do not vanish: the next successful run covers everything back to the watermark in one window. `max_catchup_intervals` bounds that window. Past the bound the start is clamped forward to `window_end - max_catchup_intervals * interval`, the run row carries `window_truncated: true`, and `trawl_scheduler_window_truncated_total` counts it. The coverage before the clamp is then permanently missing from the report series, which is the trade: one enormous query after a week of downtime would be worse. The unit is intervals, not hours, so the default of 24 means a day of missed hourly runs or 24 days of missed daily ones. Raise it if you would rather pay for the catch-up query than lose the coverage; there is no "never clamp" switch, spell that as a large number. The ceiling is 1000000, and trawld refuses to start above it: the scheduler multiplies this by the interval to get the widest window it may plan, and a number too large to multiply would stop every `since_last` schedule instead of un-clamping it. A million intervals is 114 years of missed hourly runs, so the bound costs nothing anyone means.
 
-Window modes, `lag` and the watermark are per-schedule settings, not config: see [scheduled reports](/architecture/data-flow/#scheduled-reports) for the mechanism and the [schedules API](/reference/api/#schedules) for the request and response fields.
+Window modes, `lag` and the watermark are per-schedule settings, not config: see [scheduled reports](/architecture/reports-telemetry/#scheduled-reports) for the mechanism and the [schedules API](/reference/api/#schedules) for the request and response fields.
 
 ### `[web]`
 
@@ -335,7 +336,7 @@ If neither `cookie_secret_path` nor `cookie_secret_env` is set, the proxy genera
 
 #### The browser-origin allowlist
 
-`public_origins` is the CSRF control (ADR-0016). When a request carries an `Origin` header, `trawl-web` compares it whole against this list before it looks at the session cookie: scheme, host and port must all match. A request with no `Origin` passes, because this is a browser control and curl, the CLI and every scripted client send none.
+`public_origins` is the CSRF control. When a request carries an `Origin` header, `trawl-web` compares it whole against this list before it looks at the session cookie: scheme, host and port must all match. A request with no `Origin` passes, because this is a browser control and curl, the CLI and every scripted client send none.
 
 State what the browser's address bar shows. A few consequences worth knowing before the first 403:
 

@@ -4,8 +4,7 @@ description: Build the Astro site, verify examples and links, and keep facts wit
 ---
 
 The site uses Astro and Starlight. Its content lives under
-`docs/src/content/docs/`; `docs/astro.config.mjs` defines navigation. Existing
-public page URLs remain in use even when their sidebar section changes.
+`docs/src/content/docs/`; `docs/astro.config.mjs` defines navigation.
 
 ## Run it locally
 
@@ -57,8 +56,6 @@ for browser scenarios and record which source revision and scenario you checked.
 | A task with commands and expected outcomes | Start, Use Trawl, or Operate Trawl |
 | Syntax, fields, defaults, permissions, and error contracts | Reference |
 | Current mechanisms and boundaries | Architecture |
-| A design decision and its amendments | Existing repository ADR |
-| A particular test result | A dated evidence record |
 | Agent-specific procedure | Project skills under `.agents/skills/` |
 
 A guide should state the reader's starting conditions, the operation, its expected
@@ -66,12 +63,15 @@ result, and how to diagnose failure. Link to detailed contracts instead of copyi
 them into each tutorial. Keep known limitations beside the procedure they affect.
 Do not present a page's last commit date as proof that all its commands are current.
 
-## Preserve links
+## Keep guides current
 
-Keep existing routes when reorganizing navigation. When extracting a section,
-retain its old heading and replace its body with a short explanation and a link
-to the new owner. This preserves old fragment URLs. The rendered-link check verifies
-links in the site; reviewers also need to compare removed headings with the old page.
+Describe the current installation and behavior. Remove superseded procedures,
+implementation timelines, and completed project plans. Keep query history,
+recovery state, and other runtime records when they explain how Trawl works.
+
+Give each page a clear task or topic. When moving content, update navigation and
+links to its new location. Remove empty headings and pages that only point to
+another guide. Run the rendered-link check after changing routes or headings.
 
 The Docs workflow builds and checks pull requests. Deployment runs only from main
 and keeps the existing package repository and symbols directories intact. A local

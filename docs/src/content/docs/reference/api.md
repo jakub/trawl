@@ -18,38 +18,46 @@ keystore (`DATABASE_URL`). Replace `PREFIX` with the selected stable key prefix;
 create roles before keys on a fresh database:
 
 ```bash
-fleet-admin keys create --name "my-key" --kind human --role trawl-analyst
+fleet-admin roles create --name trawl-reader \
+  --perm trawl:query --perm trawl:schema_read --perm trawl:query_cancel
+fleet-admin keys create --name "my-key" --kind human --role trawl-reader
 fleet-admin keys list
 fleet-admin keys revoke PREFIX
 ```
 
 ### Roles and permissions
 
-Roles are data-defined (ADR-0006): named, cross-app bundles of permission
-strings stored in the fleet keystore, managed with `fleet-admin roles`.
-A key holds any number of roles; effective permissions are the union.
-The historical grant migration converts its tiers to the bundles below. A fresh
-keystore starts with no roles; use [access administration](/operate/access/) to
-create them. These are example bundles, not privileged role names:
+Roles are named, cross-app bundles of permission strings stored in the Fleet
+keystore and managed with `fleet-admin roles`. A key can hold any number of
+roles. Its effective permissions are the union of those roles.
 
-| Role | Trawl permissions |
-|------|------------|
-| `trawl-admin` | `query`, `schema_read`, `validate`, `saved_query`, `export`, `stream`, `query_cancel`, `server_manage` |
-| `trawl-analyst` | `query`, `schema_read`, `validate`, `saved_query`, `export`, `stream`, `query_cancel` |
-| `trawl-reader` | `query`, `schema_read`, `query_cancel` |
-| `trawl-ingest` | `ingest` |
+A fresh keystore has no roles. Use [access administration](/operate/access/) to
+create roles with the permissions each client needs. Trawl recognizes these
+permission strings in the `trawl` namespace:
 
-Handlers gate on permissions, never role names — reshape the tiers with
-`fleet-admin roles` without a deploy. A valid key that lacks the
-permission a route asks for is refused **403** with error code `forbidden`.
-A key resolving *no* recognized trawl permission at all is also refused 403
-by the grant gate before the handler. Missing, malformed, invalid, expired,
-and revoked credentials remain an opaque **401**.
+| Permission | Allows |
+|------------|--------|
+| `query` | Execute searches, read and clear query history, and list running queries |
+| `schema_read` | Read the schema, field catalog, and conflict samples |
+| `validate` | Validate DSL syntax without executing a query |
+| `saved_query` | Create, read, update, and delete saved queries |
+| `export` | Export query results |
+| `stream` | Subscribe to live event streams |
+| `query_cancel` | Cancel the key's own running queries |
+| `server_manage` | View server statistics and dashboard telemetry, cancel any query, and, together with `query`, inspect system-owned work |
+| `ingest` | Submit events to the HTTP ingest endpoint |
+| `schema_write` | Mutate the field catalog, including repin |
 
-`schema_write` is separate from these bundles and gates catalogue mutations.
-It is registered but not granted by the migration. Repin has no human-key-kind
-requirement. See [role assignment](/operate/access/#create-roles-and-keys) and
-[catalog procedures](/operate/catalog/) before granting it.
+For example, `--perm trawl:query` adds the query permission to a role.
+Handlers check permissions, never role names. A valid key that lacks a required
+permission receives HTTP 403 with error code `forbidden`. A key with no recognized
+Trawl permission also receives 403 before it reaches the handler. Missing,
+malformed, invalid, expired, and revoked credentials receive an opaque HTTP 401.
+
+`schema_read` exposes bounded samples of event values in conflict evidence.
+`schema_write` is separate from `server_manage`, so catalog administration does
+not require server administration. Repin does not require a human-kind key.
+See [catalog procedures](/operate/catalog/) before granting catalog write access.
 
 ## Endpoints
 
@@ -61,6 +69,7 @@ GET /api/v1/health
 
 Unauthenticated. Returns server health status.
 
+The example uses `<installed-version>` as a placeholder for the running binary's version.
 The response always contains exactly four component checks. Each value is
 `ok` or `error`; failures do not include database diagnostics or filesystem
 paths.
@@ -74,7 +83,7 @@ paths.
     "storage_db": "ok",
     "data_path": "ok"
   },
-  "version": "0.4.0"
+  "version": "<installed-version>"
 }
 ```
 
@@ -283,7 +292,7 @@ audit line without undoing the clear.
 POST /api/v1/schema/repin
 ```
 
-Repin a field to a new catalog type (ADR-0011 slice B): a
+Repin a field to a new catalog type: a
 shadow-generation rewrite of every affected file, with resurrection of
 conflict-shelved values from `_raw`, an atomic crash-recoverable cutover,
 and one job at a time install-wide. `schema_write`-gated; a query-only
@@ -567,12 +576,10 @@ Response shape:
 Fields:
 
 - `kind` — `"human"` or `"service"`. Distinguishes interactive users from non-interactive principals.
-- `roles` — the names of every data-defined role the key holds, sorted. Roles are cross-app permission bundles (ADR-0006), so the list is NOT app-scoped — it is display/audit metadata, never a gating input.
+- `roles` — the names of every data-defined role the key holds, sorted. Roles are cross-app permission bundles, so the list is NOT app-scoped — it is display/audit metadata, never a gating input.
 - `permissions` — the trawl-server-resolved permission union for the `trawl` namespace, in canonical order. Only permissions this server recognizes appear (unknown strings stored on a role are ignored, fail closed). Empty is impossible on the wire — a key resolving zero trawl permissions is rejected with 403 before reaching `/whoami`.
 
-Per ADR-0006, roles are data: a single key can hold any number of roles, each role can span apps, and effective permissions are the union. Other consumers (e.g. coastwatch) resolve their own namespace from the shared keystore.
-
-**Breaking change (ADR-0006 slice 1)**: the `assignments` array of `(app, role)` grants was replaced by `roles`; the `role_for` client helper is gone.
+Roles are data: a single key can hold any number of roles, each role can span apps, and effective permissions are the union. Other consumers (e.g. coastwatch) resolve their own namespace from the shared keystore.
 
 ### Query history
 
@@ -618,12 +625,12 @@ Request body:
 
 - `interval` is the period, a duration: a number and one of `s`, `m`, `h`,
   `d`, `w`. Minimum 60s, maximum 10 years.
-- `window` says what each run covers (ADR-0018 ruling 6). Three spellings.
+- `window` says what each run covers. There are three modes.
   `"since_last"` tiles: each run covers `[the previous run's window end, this fire - lag)`, so consecutive runs cover consecutive intervals and a
   failed run's gap is healed by the next success. A duration such as
   `"2h"` is a fixed trailing span, re-measured from every fire and never
   healing anything; it takes the same 60s floor as the interval. Absent is
-  query mode, the legacy shape: the saved DSL runs verbatim and the run
+  query mode: the saved DSL runs verbatim and the run
   records no bounds.
 - `lag` is the late-arrival allowance, default `"0s"`. It shifts *both* window
   bounds back, so it delays coverage rather than widening it: an event
@@ -775,7 +782,7 @@ report run 42 produced 17 rows but no parquet result, so it cannot be read throu
 ```
 
 The mechanism behind the windows, with a worked example, is in
-[scheduled reports](/architecture/data-flow/#scheduled-reports).
+[scheduled reports](/architecture/reports-telemetry/#scheduled-reports).
 
 ### Export
 

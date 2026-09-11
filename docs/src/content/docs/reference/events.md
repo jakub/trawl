@@ -94,4 +94,4 @@ A catalog conflict occurs later, when a value cannot conform to its pinned type.
 
 ## Contract owners
 
-The implementation is [envelope.rs](https://github.com/jakub/trawl/blob/main/crates/trawl-server/src/ingest/envelope.rs), [producer.rs](https://github.com/jakub/trawl/blob/main/crates/trawl-server/src/ingest/producer.rs), and [schema.rs](https://github.com/jakub/trawl/blob/main/crates/trawl-core/src/schema.rs). The governing decisions are [ADR-0009](/contribute/decisions/#adr-0009) and [ADR-0013](/contribute/decisions/#adr-0013).
+The implementation is [envelope.rs](https://github.com/jakub/trawl/blob/main/crates/trawl-server/src/ingest/envelope.rs), [producer.rs](https://github.com/jakub/trawl/blob/main/crates/trawl-server/src/ingest/producer.rs), and [schema.rs](https://github.com/jakub/trawl/blob/main/crates/trawl-core/src/schema.rs).

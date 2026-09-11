@@ -71,7 +71,7 @@ Query local parquet files directly, without a server:
 
 ```bash
 trawl query --data 'data/**/*.parquet' "* | stats count() by service"
-trawl query --data '/path/to/*.parquet' "_severity>=error | head 10"
+trawl query --data '/path/to/*.parquet' "_severity>=17 | head 10"
 ```
 
 Embedded mode uses a single ephemeral DuckDB connection with no hot buffer, no auth, and no row limit.

@@ -6,7 +6,7 @@ description: Provision roles, rotate API keys, and configure TLS and shared sess
 Trawl permissions are code-defined; roles are named bundles stored in the Fleet
 keystore. Key permissions are the union of its roles. A role called `trawl-admin`
 does not gain implicit privileges. Use the [permission reference](/reference/api/#roles-and-permissions)
-for the available bundles and the [deployment guide](/operate/deployment/#provision-the-databases)
+for the available permissions and the [deployment guide](/operate/deployment/#provision-the-databases)
 for database preparation.
 
 ## Create roles and keys
@@ -14,7 +14,7 @@ for database preparation.
 Run `fleet-admin` where it can reach the selected Fleet database. Supply
 `DATABASE_URL` through a protected credential mechanism. It is not the daemon's
 `FLEET_DATABASE_URL` override. Confirm the database identity before mutation.
-A fresh keystore has no roles; do not rerun role creation on a converted deployment.
+A fresh keystore has no roles. Inspect existing roles before creating new ones.
 
 ```bash
 fleet-admin roles list

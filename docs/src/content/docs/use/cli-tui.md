@@ -87,6 +87,5 @@ a user's socket: startup removes an existing file at that path. Driver
 means the driver stopped waiting, not that execution was cancelled.
 These details matter when deciding whether a retry is safe.
 
-The repository's `trawl-tui` skill describes the agent workflow. For normal
-interactive use, current Help and the [CLI reference](/reference/cli/) are
-the command and keyboard authorities.
+Use Help for interactive keyboard shortcuts and the
+[CLI reference](/reference/cli/) for command syntax.

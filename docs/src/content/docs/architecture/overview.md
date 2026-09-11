@@ -38,7 +38,7 @@ The [contributor source map](/contribute/source-map/) identifies crate boundarie
 
 ### Authentication
 
-Roles are data, and permissions are code. A key can hold several roles; its effective permissions are their union. Handlers gate on recognized permissions, not names such as `admin`. A role with no recognized Trawl permissions does not grant Trawl access. See [the permission reference](/reference/api/) and [ADR-0006](/contribute/decisions/#adr-0006).
+Roles are data, and permissions are code. A key can hold several roles; its effective permissions are their union. Handlers gate on recognized permissions, not names such as `admin`. A role with no recognized Trawl permissions does not grant Trawl access. See [the permission reference](/reference/api/).
 
 ### Server middleware stack
 
@@ -71,7 +71,3 @@ That familiarity is not a compatibility or performance guarantee. Its own [DSL r
 ## Comparison to Datadog
 
 Trawl is self-hosted and single-node. This documentation does not claim performance equivalence with a hosted log service. Evaluate your workload with known data and measured queries.
-
-## Scaling roadmap
-
-See [project direction](/about/roadmap/) for current capabilities and boundaries. Proposed storage extensions are not implemented features or release commitments.

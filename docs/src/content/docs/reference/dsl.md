@@ -45,8 +45,7 @@ Only those four ASCII characters open a comment, because they are also
 the only ones that END an unquoted token: a no-break space is an
 ordinary character inside a word or a value, so `foo`, a no-break space
 and `# note` is one token carrying a `#` and gets the same parse error
-rather than a comment. Between tokens any
-Unicode whitespace still separates, exactly as it always has.
+rather than a comment. Between tokens, Unicode whitespace separates.
 
 The hint names the spelling that works **in that position**: quoting the
 whole of `color=#ff0000` would turn a field filter into a phrase search,
@@ -74,9 +73,8 @@ path=/api//v1                      the value /api//v1
 url=//cdn.example.com/x            an ordinary value
 ```
 
-The one loud spot: a bare search **term** that *starts* with `//` is a
-parse error naming `#`, so an old `// note` line fails instead of quietly
-becoming two AND-ed text searches that match nothing.
+A bare search term that starts with `//` is a parse error. Use `#` to
+start a comment.
 
 ## Search stage
 
@@ -99,8 +97,8 @@ env=prod                        # environment (path-pruned)
 Comma-separated lists support `=` and `!=` only. A positive list is
 membership (`f=a,b`); a negated list is compositional non-membership:
 `f!=a,b` means `f!=a AND f!=b`. Because each term is the search stage's
-ordinary `!=`, the expression keeps ADR-0011's NULL widening: an event
-without `f` matches. Ordered spellings such as `f>=a,b` are parse errors.
+ordinary `!=`, an event without `f` matches the negated list. Ordered
+spellings such as `f>=a,b` are parse errors.
 
 #### Quoted list elements
 
@@ -124,8 +122,8 @@ text search for `,y`.
 
 On a server, every stored field carries a type pin in the field catalog
 (the envelope columns are pinned on install; custom fields pin at first
-typed sight). Two rules follow, and they are one rule seen from either
-end:
+typed sight). `host`, `service`, `env`, `message`, and `_raw` have VARCHAR
+pins; `_severity` has a SEVERITY pin. Two rules apply:
 
 - **What is stored** is the value's reading under the pin — but only when
   that reading is *value-preserving*. A cast that would silently alter the
@@ -185,7 +183,7 @@ a VARCHAR-pinned field can express.
   doesn't match those rows either. A *literal* with no reading
   (`dur>1e40`) matches nothing at all, on either side.
 - **VARCHAR-pinned field, ordered comparison with a non-numeric
-  literal** — lexical string comparison, unchanged.
+  literal** uses lexical string comparison.
 - **Integer-pinned field, glob or regex** — matches the **stored
   integer's** text form, which is not always how the event spelled it:
   `status=4*` finds 404 in a BIGINT column, and a wire `"0404"` is stored
@@ -241,14 +239,6 @@ a VARCHAR-pinned field can express.
 - Every comparison on an **unpinned** field keeps plain literal-driven
   behavior.
 
-:::caution[Changed in the ADR-0011 release]
-The zone-aware timestamp parse applies to values conformed **from this
-release onward**. A custom timestamp field that received offset-bearing
-values before it may hold wall-clock instants in already-compacted
-partitions; those are not rewritten, so a glob over such a field can span
-both readings until the old partitions age out.
-:::
-
 #### Missing fields and nulls
 
 A field an event doesn't carry is a NULL column, and a comparison against
@@ -268,25 +258,16 @@ filtered out. Two consequences are worth knowing before you write an alert:
   `NOT f=x`. The same holds for `NOT _severity=...` when an event has no
   derived severity.
 
-:::caution[Changed in the ADR-0011 release]
-Live tail previously treated a missing field as *false* rather than
-unknown, so `f!=x` matched nothing on such events and `NOT f=x` matched
-all of them — the opposite of what the same query returned from
-`/api/v1/query`. Live tail now agrees with the batch answer. Alerts built
-on `NOT f=x` to catch events missing a field need rewriting as `f!=x`.
-:::
-
 Two deliberate boundaries:
 
 - **Numeric-literal detection is by content, not quoting**: the parser
   discards quote provenance, so `status>"400"` and `status>400` are the
   same query — in the search stage and in `| where` alike (`where
   status == "400"` binds exactly as `where status == 400`).
-- **Embedded mode (`--data`) stays literal-driven** — there is no
-  catalog behind `--data`, so every comparison keeps its pre-catalog
-  behavior there.
+- **Embedded mode (`--data`) uses literal-driven comparisons.** It has no
+  field catalog to supply type pins.
 
-#### Pin-aware `| where` and `| let` (ADR-0011 slice A′)
+#### Pin-aware `| where` and `| let`
 
 A **bare field-vs-literal comparison** inside `| where` or `| let`
 consults the same catalog pin the search stage does, and adopts exactly
@@ -305,7 +286,7 @@ rules, so a pipeline means one thing in every lane.
 (`where a == b`), function-wrapped fields (`where lower(status) == "a"`),
 arithmetic on the field (`where status * 2 > 400`), `== null`, and a
 pattern with the field on the right (`where "x" matches f`). Unpinned
-fields are unchanged everywhere.
+fields use literal-driven comparisons throughout.
 
 **Which pin applies follows the pipeline**, not a flat name lookup:
 
@@ -340,20 +321,8 @@ tail derived and renders as UTC text.
 **One NULL-policy difference from the search stage, kept on purpose**:
 the pipeline `!=` does *not* carry the search stage's `OR field IS NULL`
 widening. `| where f != x` over an event without `f` is unknown and
-filtered — exactly what the pin-blind `| where` always answered — so a
-repin never changes missing-field semantics. Use the search-stage `f!=x`
-when you want the missing-field net.
-
-:::caution[Changed in the ADR-0011 slice A′ release]
-`| where` and `| let` comparisons on pinned fields change answers:
-`| where status > 400` over a VARCHAR pin stops raising a Conversion
-error and starts filtering; `== 200` gains the numeric arm (it now
-matches a stored `"200.0"`); on TIMESTAMP pins live-tail ordered
-comparisons become the instant comparison batch always performed instead
-of lexical text. The envelope seed pins `host`/`service`/`env`/`message`/
-`_raw` as VARCHAR (and `_severity` as SEVERITY) on every install, so this
-is live on day one.
-:::
+filtered out. A repin does not change missing-field semantics. Use the
+search-stage `f!=x` to include events missing the field.
 
 ### The two namespaces
 
@@ -515,9 +484,8 @@ applied at **query time**, to any field you name:
   | let s = sev(lower(level)) | where s == "error"
   ```
 
-  The narrowness is deliberate (ADR-0013 ruling 9): which pin types a
-  comparison has to be decidable from the query text alone, in all three
-  lanes, and a bare field reference is where that stops being a guess.
+  The compiler determines the comparison type from the query text. A direct
+  field argument supplies that type in batch, live, and post-SQL evaluation.
 - `dialect` governs NUMERICS only — words always read the one token
   table. `sev(x, "syslog")` inverts 0-7 (syslog counts down: `3` is
   `err` → 17), which is the reading for a foreign syslog dump. It must be
@@ -551,17 +519,17 @@ severities — refuses until you assert `--dialect syslog` or pass `--force`.
 `_severity` itself cannot be repinned: its type is part of the event
 contract. See the [CLI reference](/reference/cli/#repin).
 
-:::caution[`level=error` is not a severity filter]
-`level` is an ordinary field now, so `level=error` compares the sender's
-own value. A game server emitting `{"service":"game","level":"gold"}`
-keeps a fully queryable `level` column — that is the point — but if you
-meant severity, you want `_severity>=error` — or `sev(level)>="error"`
-to read the sender's own field on the ladder, or
-`trawl schema repin level --to severity` to put it there for good. And a field no sender writes
-is not an error: it simply matches nothing, so a query written against
-the old alias comes back empty rather than failing. trawl says nothing
-about it — `level` is your vocabulary, not trawl's, and a notice keyed on
-the name would be trawl assigning it a meaning again.
+:::caution[Choose the severity field explicitly]
+`level` is an ordinary sender field. Unless you repin it as SEVERITY,
+`level=error` compares its stored value. A game server sending
+`{"service":"game","level":"gold"}` has a queryable `level` column.
+
+Use `_severity>=error` to filter derived severity, or
+`| where sev(level) >= "error"` to interpret the sender's field at query time.
+An operator can use `trawl schema repin level --to severity` to give the
+field severity comparisons and token rendering. A field filter matches no
+events when no sender supplies that field, except for the documented `!=`
+missing-field rule.
 :::
 
 ### `timestamp` and `@timestamp`
@@ -572,10 +540,8 @@ and retained under their own names, subject to their catalog pins. The
 original representation remains in `_raw` subject to its cap. Only `_time`
 itself is consumed and canonicalized — it is the proposal slot.
 
-They are no longer aliases for `_time`, so `| sort -timestamp` sorts the
-sender's column and finds nothing where no sender sends one — silently,
-exactly as `level` does. Sort, filter and project `_time` when you mean
-the event's instant.
+`| sort -timestamp` sorts the sender's column. Sort, filter and project
+`_time` when you mean the event's instant.
 
 ### Text search
 
@@ -588,7 +554,7 @@ error                           # bare word — substring match
 Bare-word and phrase search match the `message` column **and** `_raw`,
 so content that was parsed away is still findable. Negation excludes an
 event when either column matches. Text containment is deliberately
-**two-valued** (ADR-0015):
+**two-valued**:
 a missing, null, or non-text `message`/`_raw` does not contain the term. Consequently
 `-debug`, `NOT debug`, and `NOT "debug"` agree even on foreign data that
 does not carry one or both columns.
@@ -676,7 +642,7 @@ all, because it reads stored report rows rather than ingest events.
 And running a scheduled saved query interactively carries no window: the
 text is what you typed, and the bounds exist only on the runs the
 scheduler made. Setup and mechanism are in
-[scheduled reports](/architecture/data-flow/#scheduled-reports).
+[scheduled reports](/architecture/reports-telemetry/#scheduled-reports).
 
 ### OR grouping
 
@@ -1177,9 +1143,9 @@ unreadable condition after a match is never looked at — but an unreadable
 one reached before any match takes down the whole call, in whichever way
 its lane does, rather than skipping that arm.
 
-`and`, `or`, `not` and the pipeline's `where` gate keep their older,
-wider predicate (anything non-null and non-`false` passes); only `if()`
-and `case()` take the cast domain.
+`and`, `or`, `not` and the pipeline's `where` gate use a wider predicate:
+anything non-null and non-`false` passes. `if()` and `case()` use the
+BOOLEAN cast rules above.
 
 #### typeof and large integers
 
@@ -1229,8 +1195,7 @@ Boundaries worth stating plainly:
   carried across it;
 - `strftime(now(), …)` and `tostring(now())` return TEXT. The display
   timezone offset applies to TIMESTAMP result cells only, and a value
-  the `extract kv` tail computed renders as UTC text — both pre-existing
-  display rules, unchanged here.
+  the `extract kv` tail computed renders as UTC text.
 
 ### Nested fields (JSON)
 
@@ -1322,7 +1287,7 @@ Standard C `strftime` codes (`%Y`, `%m`, `%d`, `%H`, `%M`, `%S`, etc.) produce i
 
 `%f` is a **six-digit microsecond** field in both paths: `strftime(ts, "%f")` over `…09:00:00.5` gives `500000`, and a zero fraction gives `000000`. (chrono spells that field `%6f`; the streaming path translates a bare `%f` for you, and leaves an escaped `%%f` alone as the literal it is.) One residual comes with the fixed width: on the way IN, DuckDB reads a fraction of any length (`.5` is half a second) where the streaming path reads exactly six digits and yields `null` for anything else.
 
-Invalid format codes (e.g. `%Q`, or a trailing `%`) are rejected before execution in both paths when the format is a string literal — they no longer error in batch while silently nulling in streaming.
+Invalid format codes, such as `%Q` or a trailing `%`, are rejected before execution in both paths when the format is a string literal.
 
 **Partial formats:** `strptime` fills the components a format omits from a `1900-01-01 00:00:00` base, identically in the batch (DuckDB) and streaming paths. A **date-only** format (e.g. `%Y-%m-%d`) yields midnight (`00:00:00`); a **time-only** format (e.g. `%H:%M:%S`) yields the `1900-01-01` base date; **year-only** (`%Y` → `2023-01-01 00:00:00`), **year-month** (`%Y-%m` → `2023-11-01 00:00:00`), a bare **month-day** (`%m-%d` → `1900-11-07 00:00:00`), and a date with an *incomplete* time (`%Y-%m-%d %H` → `…14:00:00`) all fill the same way. Exotic or locale-dependent codes follow chrono in the streaming path and may differ from DuckDB: a bare two-digit year (`%y` alone) yields `null` where DuckDB fills the base year, and timezone-offset codes (`%Z`/`%z`) keep chrono's wall-clock time rather than normalizing to UTC. (A two-digit year *with* a month/day, like `%y-%m-%d`, resolves via chrono's pivot and matches DuckDB.)
 

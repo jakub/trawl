@@ -53,6 +53,6 @@ Unscoped column and corpus facts can be TTL-cached. Service-scoped listing is fr
 
 Repin retypes one field across the corpus through a shadow rewrite, with possible recovery from `_raw`. The comparison contract defines its query effects; it does not promise identical results for every query. Read [recovery and cutover](/architecture/recovery/#repin-cutover) for the mechanism and the [CLI schema guide](/reference/cli/) for the procedure.
 
-## Decision and source owners
+## Source owners
 
-[ADR-0009](/contribute/decisions/#adr-0009), [ADR-0011](/contribute/decisions/#adr-0011), and [ADR-0019](/contribute/decisions/#adr-0019) record the decisions. Implementation lives in `trawl-server/src/catalog/`, `src/store/catalog.rs`, `src/ingest/compaction.rs`, and `trawl-core/src/conform.rs`.
+Implementation lives in `trawl-server/src/catalog/`, `src/store/catalog.rs`, `src/ingest/compaction.rs`, and `trawl-core/src/conform.rs`.

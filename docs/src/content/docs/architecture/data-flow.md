@@ -77,7 +77,7 @@ Hourly files consolidate into a daily file per service, ordered by `_time`. [Rol
 
 ### Retention
 
-Retention removes date directories inside individual environments. Age policy is per environment; disk-pressure selection ranks candidates across environments by the fraction of their age allowance consumed. An unlimited age policy does not exempt data from disk-pressure removal. Repin and epoch recovery can suppress deletion. See [recovery](/architecture/recovery/) and [configuration](/reference/configuration/) before changing policy.
+Retention removes date directories inside individual environments. Age policy is per environment; disk-pressure selection ranks candidates across environments by the fraction of their age allowance consumed. An unlimited age policy does not exempt data from disk-pressure removal. Recovery state can suppress deletion. See [recovery](/architecture/recovery/) and [configuration](/reference/configuration/) before changing policy.
 
 ## Storage layout
 
@@ -95,9 +95,9 @@ data/
 
 The diagram shows both possible event-file shapes. Normal completed rollup retires its hourly inputs; queries must not count both copies. WAL may use its configured separate directory. Repin stages sibling roots, not subdirectories of this tree.
 
-### The epoch cutover
+### Storage format marker
 
-The [epoch table](/architecture/recovery/#the-epoch-cutover) explains epoch 3 and both preserved old-root names.
+The [storage format marker](/architecture/recovery/#storage-format-marker) identifies the corpus format and travels with its backup.
 
 ### The boot conformance pass and the `CATALOG` marker
 
@@ -107,62 +107,7 @@ Read [boot conformance](/architecture/recovery/#boot-conformance-and-the-catalog
 
 Trawl's PostgreSQL database stores history, saved queries, schedules, report metadata, and the catalog. Fleet authentication uses a separate keystore database. See [process boundaries](/architecture/overview/#components).
 
-## Query execution
+## Read and query the data
 
-[Query execution](/architecture/query-execution/) explains batch SQL and Rust evaluation.
-
-### Parser
-
-See [parser and SQL emitter](/architecture/query-execution/#parser-and-sql-emitter).
-
-### SQL emitter
-
-See [parser and SQL emitter](/architecture/query-execution/#parser-and-sql-emitter) and the [DSL reference](/reference/dsl/).
-
-### Executor pool
-
-See [executor pool and deadlines](/architecture/query-execution/#executor-pool-and-deadlines).
-
-### Source computation
-
-See [source computation](/architecture/query-execution/#source-computation).
-
-### Hot buffer integration
-
-See [hot buffer integration](/architecture/query-execution/#hot-buffer-integration).
-
-## Scheduled reports
-
-[Reports and telemetry](/architecture/reports-telemetry/#scheduled-reports) now owns the reporting-window mechanism.
-
-### Window modes
-
-See [window modes](/architecture/reports-telemetry/#window-modes).
-
-### Planned boundaries
-
-See [planned boundaries](/architecture/reports-telemetry/#planned-boundaries).
-
-### The watermark
-
-See [the watermark](/architecture/reports-telemetry/#the-watermark).
-
-### Catch-up and the clamp
-
-See [catch-up and the clamp](/architecture/reports-telemetry/#catch-up-and-the-clamp).
-
-### A worked example
-
-See [the worked report example](/architecture/reports-telemetry/#a-worked-example).
-
-### Editing a schedule
-
-See [editing a schedule](/architecture/reports-telemetry/#editing-a-schedule).
-
-## SSE streaming
-
-See [SSE streaming](/architecture/query-execution/#sse-streaming) for pin snapshots and loss boundaries.
-
-## Internal telemetry
-
-See [internal telemetry](/architecture/reports-telemetry/#internal-telemetry) for persistence, bounded loss, and monitoring limits.
+- [Query execution](/architecture/query-execution/) explains source selection, batch SQL, hot-buffer snapshots, and live streaming.
+- [Reports and telemetry](/architecture/reports-telemetry/) explains scheduled query windows, stored results, and daemon telemetry.
