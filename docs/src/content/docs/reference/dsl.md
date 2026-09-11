@@ -1,659 +1,421 @@
 ---
 title: Query Language (DSL)
-description: Complete reference for trawl's pipeline query language.
+description: Look up the exact syntax and evaluation rules of trawl's pipeline query language.
 ---
 
-trawl uses a pipeline-oriented query language inspired by Splunk's SPL. Queries flow through stages separated by `|`, with each stage transforming the data for the next.
+A trawl query is a search stage followed by pipe stages. The search stage selects events. Each `|` passes rows to the next stage.
 
-Use this page for exact syntax and comparison rules. The [event reference](/reference/events/) defines input fields and derivation; [query execution](/architecture/query-execution/) explains how batch and live evaluation apply these rules.
+The [event reference](/reference/events/) defines the input fields. [Query execution](/architecture/query-execution/) describes how the lanes run a query.
 
 ## Query structure
 
-```
+```text
 [search stage] | [pipe stage] | [pipe stage] ...
 ```
 
-The search stage is optional. Pipelines can start with `|` for raw log access.
+The search stage is optional, so a query may start with its first pipe stage. Whitespace between search tokens is an implicit AND.
+
+- A query may be 65536 bytes long. A longer one returns `query too long (N bytes, max 65536)`.
+- One parse reports at most 8 errors, and the last message carries `(N earlier errors omitted)`.
+- A `/pattern/` filter value holds at least one character, cannot contain `/`, and may be 1024 characters long. A longer one returns `regex pattern too long (N chars, max 1024)`, and an unparseable one returns `invalid regex: <detail>`.
 
 ## Comments
 
-`#` starts a comment. It runs to the end of the line, and it is the
-**only** comment character — `//` is not one.
+`#` starts a comment that runs to the end of the line. `#` is the only comment character.
+
+A comment opens at the start of the input, or directly after a space, tab, carriage return, or newline. Other Unicode whitespace separates two tokens without opening a comment, so `foo`, a no-break space and `# note` is one token carrying a `#`.
 
 ```
 # find the noisy services
 _severity>=error last=1h    # only the last hour
 | stats count() by service
-# and only the interesting ones
 | where count > 10
 ```
 
-A comment opens only where the query is **between tokens**: at the start
-of the input, or after a space, tab, carriage return or newline. Inside
-an unquoted token a `#` is neither data nor a comment — it is a parse
-error naming the byte, with a hint to quote it:
+To carry a `#` in a value or a name, quote it. A double-quoted value, a backtick-quoted name and a regex body all carry it verbatim. `//` is not a comment opener, so a value carries it unquoted.
 
-```
-a=1 # note        filter a=1, plus a comment
-a=1# note         error at the '#'
-foo#bar           error at the '#'  — write "foo#bar" to search for it
-color=#ff0000     error at the '#'  — write color="#ff0000"
--foo#bar          error at the '#'  — write NOT "foo#bar"
-```
+| Query | Result |
+| --- | --- |
+| `a=1 # note` | The filter `a=1`, plus a comment. |
+| `a=1# note` | Parse error: `'#' inside an unquoted value` |
+| `color=#ff0000` | Parse error: `'#' inside an unquoted value` |
+| `foo#bar` | Parse error: `'#' inside an unquoted token` |
+| `count(),# x` | Parse error: `'#' inside an unquoted token` |
+| `-foo#bar` | Parse error: `'#' inside a negated search term` |
+| `co#unt()` as a stage name | Parse error: `'#' inside a pipe stage name` |
+| `//cdn.example.com` | Parse error: ``'//' does not start a comment — '#' is the comment character`` |
+| `-//cdn.example.com` | An ordinary negated search term. |
+| `host="a#b"` | The value `a#b`. |
+| `` `a#b`=1 `` | A filter on the field `a#b`. |
+| `message=/a#b/` | A regex containing `#`. |
+| `url=https://example.com/x` | The value `https://example.com/x`. |
+| `path=/api//v1` | The value `/api//v1`. |
 
-Only those four ASCII characters open a comment, because they are also
-the only ones that END an unquoted token: a no-break space is an
-ordinary character inside a word or a value, so `foo`, a no-break space
-and `# note` is one token carrying a `#` and gets the same parse error
-rather than a comment. Between tokens, Unicode whitespace separates.
+Each error carries a hint, and the hint spells a concrete rewrite only where the production that failed held the exact text. Every hint ends with `put whitespace before the '#' to start a comment`.
 
-The hint names the spelling that works **in that position**: quoting the
-whole of `color=#ff0000` would turn a field filter into a phrase search,
-and a leading `-` cannot negate a quoted term at all, so those two are
-pointed at `color="#ff0000"` and `NOT "foo#bar"` rather than at a quote
-around everything.
-
-To include a `#` in a value or a name, quote it. All three quoted forms
-carry it verbatim, because none of them has a place inside where the
-grammar skips whitespace:
-
-```
-host="a#b"        a double-quoted value
-`a#b`=1           a backtick-quoted field name
-message=/a#b/     a regex body
-```
-
-Because `//` is not a comment, a value carries it freely and needs no
-quoting — which is the everyday case in log data:
-
-```
-url=https://example.com/x          the value https://example.com/x
-referrer=https://a.b/c status=200  BOTH filters
-path=/api//v1                      the value /api//v1
-url=//cdn.example.com/x            an ordinary value
-```
-
-A bare search term that starts with `//` is a parse error. Use `#` to
-start a comment.
+- Unquoted search term: `quote it ("foo#bar") to search for it, or ...`
+- Unquoted value: `quote the value ("#ff0000"), or ...`. A value holding `*` or `?` adds `to carry the '#' (a quoted value is never a pattern)`.
+- Negated search term: `write it as NOT "foo#bar", or ...`
+- Any other position, including a stage name: the whitespace advice alone, or ``put whitespace before the '#' to start a comment, or carry the '#' inside a quoted value ("…") or a backticked field name (`…`)``
+- A bare term starting with `//`: `write '#' to start a comment, or quote the term to search for the slashes`
 
 ## Search stage
 
-The search stage filters events before they enter the pipeline. Multiple conditions within a group are AND-joined.
+The search stage filters events before they enter the pipeline. Tokens separated by whitespace are AND-joined.
 
 ### Field filters
 
-```
-service=nginx                    # exact match
-status=200,301,404              # IN list (comma-separated)
-status>=400                     # comparison
-path=/api/*                     # glob pattern
-message=/error.*/               # regex pattern (slash-delimited)
-host="db host"                  # quoted values for spaces/special chars
-env=prod                        # environment (path-pruned)
+```text
+<field><operator><value>
 ```
 
-**Operators:** `=`, `!=`, `>`, `>=`, `<`, `<=`
+| Operator | Meaning |
+| --- | --- |
+| `=` | Equal, or membership when the value is a comma list. |
+| `!=` | Not equal, or non-membership when the value is a comma list. |
+| `>` `>=` `<` `<=` | Ordered comparison. |
+| `=<value with * or ?>` | Glob, detected from an unquoted value. |
+| `=/pattern/` | Regex, detected from the value. |
 
-Comma-separated lists support `=` and `!=` only. A positive list is
-membership (`f=a,b`); a negated list is compositional non-membership:
-`f!=a,b` means `f!=a AND f!=b`. Because each term is the search stage's
-ordinary `!=`, an event without `f` matches the negated list. Ordered
-spellings such as `f>=a,b` are parse errors.
+```
+# exact match
+service=nginx
+# IN list
+status=200,301,404
+# ordered comparison
+status>=400
+# glob pattern
+path=/api/*
+# regex pattern, slash-delimited
+message=/error.*/
+# quoted value, for spaces and special characters
+host="db host"
+```
+
+An unquoted value holding `*` or `?` becomes a glob whatever operator you typed, and a quoted value is never a glob. A `/pattern/` value becomes a regex, and its closing `/` must be followed by whitespace, a stage separator, or the end of the query. Globs and regexes are case-sensitive.
+
+Comma lists take `=` and `!=` only, so an ordered spelling such as `f>=a,b` is a parse error. `f=a,b` is membership, and `f!=a,b` is `f!=a AND f!=b` with the search-stage null rule on each term, so an event without `f` matches it.
+
+A bare `*` term matches everything and emits no filter. A bare field name is `[A-Za-z_][A-Za-z0-9_]*` with `.` separating segments; `@name` and a backtick-quoted name are field names too.
 
 #### Quoted list elements
 
-Any element of a comma-separated list may be written quoted, in any
-position — the quotes are quoting, not data:
+Any element of a comma list may be quoted, in any position. The quotes are quoting, not data.
 
 ```
-status=200,"301",404             the three values 200, 301, 404
-host="db host",web-01            a value with a space, beside a bare one
-tag="a#b",plain                  a value carrying a comment opener
+# the three values 200, 301, 404
+status=200,"301",404
+# a value with a space, beside a bare one
+host="db host",web-01
+# a value carrying a comment opener
+tag="a#b",plain
 ```
 
-Quoting an element is how a value that the bare production cannot spell —
-a space, a backtick, a `#` — reaches a list at all, and it is what lets a
-list survive `format → reparse` unchanged. Note the consequence for a
-list whose first element is quoted and whose rest is bare: `a="x",y` is
-the list `a IN ("x","y")`, not an equality on `x` followed by a bare
-text search for `,y`.
+Quoting is how a value the bare production cannot spell reaches a list: a space, a backtick, or a `#`. A list whose first element is quoted and whose rest is bare stays one list, so `a="x",y` is `a IN ("x","y")`.
 
 #### Pinned comparison semantics
 
-On a server, every stored field carries a type pin in the field catalog
-(the envelope columns are pinned on install; custom fields pin at first
-typed sight). `host`, `service`, `env`, `message`, and `_raw` have VARCHAR
-pins; `_severity` has a SEVERITY pin. Two rules apply:
+On a server, every stored field carries a type pin in the field catalog. The envelope columns pin on install, and a custom field pins at first typed sight. `host`, `service`, `env`, `message` and `_raw` hold VARCHAR pins. `_severity` holds a SEVERITY pin.
 
-- **What is stored** is the value's reading under the pin — but only when
-  that reading is *value-preserving*. A cast that would silently alter the
-  value is refused: the column holds NULL, the disagreement is recorded as
-  a conflict (`trawl schema conflicts`), and the original text stays
-  findable in `_raw`. Spelling drift is not alteration, so `"0404"` under
-  a BIGINT pin stores as `404`, but `"1.5"` stores as NULL rather than
-  rounding to `2`.
-- **What matches** is decided by the pin, not by the shape of the query
-  literal, so a comparison means the same thing however you spell it.
+What is stored is the value's reading under the pin, when that reading is value-preserving. A cast that would alter the value shelves it instead: the column holds NULL, `trawl schema conflicts` records the disagreement, and the original text stays in `_raw`. Spelling drift is not alteration, so `"0404"` under a BIGINT pin stores as `404` while `"1.5"` shelves rather than rounding to `2`.
 
-An event answers the same way the moment it lands as it will hours later:
-the hot buffer conforms through the identical expression compaction writes
-with. Live tail (SSE) applies the same rules again, so a streamed query,
-its batch form, and the same query after the compactor runs all agree
-event for event.
+What matches is decided by the pin, not by the shape of the query literal. Batch SQL, live tail and the kv batch tail answer identically. The hot buffer conforms through the same expression compaction writes with. Embedded `--data` has no catalog and no pins, so every comparison there is literal-driven.
 
 ##### The numeric reading
 
-Both VARCHAR-pinned numeric rungs below read the column *and* the literal
-through the same `DECIMAL(38,6)` cast, so the two sides can never disagree
-about what a string means. That space is **exact for every 64-bit
-integer** and out to 10^32 — `id=1737000000123456789` matches that id and
-no neighbour.
+Both VARCHAR-pinned numeric rules read the column and the literal through one `DECIMAL(38,6)` cast, which is exact for every 64-bit integer and out to 10^32.
 
-What has a reading: surrounding whitespace is ignored (`" 200"` is 200),
-`_` between digits is a separator (`"200_000"` is 200000), leading zeros
-are fine (`"0404"` is 404), and `"+5"`, `"1."`, `".5"`, `"1e3"` and
-`"1E-3"` all read.
+| Text | Reading |
+| --- | --- |
+| `" 200"` | 200. ASCII whitespace at both ends is ignored. |
+| `"200_000"` | 200000. `_` separates two digits. |
+| `"0404"` | 404. |
+| `"+5"`, `"1."`, `".5"`, `"1e3"`, `"1E-3"` | The number they spell. |
+| `"nan"`, `"inf"`, `"infinity"` | No reading. |
+| `"0x10"`, and any radix prefix | No reading. |
+| `"1,000"`, and any grouped digits | No reading. |
+| Empty or blank text | No reading. |
+| A magnitude at or above 10^32 | No reading. |
+| A fraction below 10^-6 | Quantized, rounded half away from zero, so two values a nanosecond apart compare equal. |
 
-What has **no** reading — and no reading means *unknown*, never a false
-match, and `NOT` cannot invert it into one: `"nan"`, `"inf"`,
-`"infinity"`, radix prefixes like `"0x10"`, grouped digits like
-`"1,000"`, empty or blank text, and any magnitude at or above 10^32.
-Fractions quantize at 10^-6 (rounded half away from zero), so two values a
-nanosecond apart compare equal — sub-microsecond ordering is not something
-a VARCHAR-pinned field can express.
+No reading means unknown, never a false match, and `NOT` cannot invert an unknown into a match.
 
 ##### The rules, per pin
 
-- **VARCHAR-pinned field, `=` / `!=` / IN list** — compares **as text**:
-  `status=accepted` matches the stored string `"accepted"`, exactly. A
-  *numeric* literal matches the exact text **or** any spelling of the
-  same number: `status=200` finds `"200"`, `"0200"` and `"200.0"`, but
-  not `"accepted"` or `"404"`. The numeric half is not optional — the
-  text a number is stored under depends on the batch it arrived in (one
-  fractional value anywhere in the batch stores `200` as `"200.0"`), and
-  live tail must answer the same as a batch query. `!=` is the exact
-  complement: `status!=200` returns `"accepted"` and every other
-  non-200 value. A literal the numeric space can't read (`status=nan`,
-  `id=1e40`) falls back to the text comparison alone.
-- **VARCHAR-pinned field, ordered comparison with a numeric literal** —
-  compares **numerically** in that same space: `status>=400` matches
-  `"404"`/`"500"`, and values with no numeric reading like `"accepted"`
-  simply don't match (they never error the query). Such a value is
-  *unknown*, not *false*, exactly as in SQL — so `NOT status>=400`
-  doesn't match those rows either. A *literal* with no reading
-  (`dur>1e40`) matches nothing at all, on either side.
-- **VARCHAR-pinned field, ordered comparison with a non-numeric
-  literal** uses lexical string comparison.
-- **Integer-pinned field, glob or regex** — matches the **stored
-  integer's** text form, which is not always how the event spelled it:
-  `status=4*` finds 404 in a BIGINT column, and a wire `"0404"` is stored
-  as 404, so it matches `status=4*` and *not* `status=0*`. The same holds
-  for `"4.0"`, `" 200"`, `"200_000"` and `"1e3"` — value-preserving
-  spellings, stored as the integer. A value the cast would *rewrite* —
-  `"1.5"` (rounded to 2), or `"0x10"` (read as 16, but a spelling DuckDB
-  would never write back) — and one it can't read at all (`"accepted"`)
-  are stored as NULL and are *unknown*, not false.
-- **Boolean-pinned field, glob or regex** — matches `true` or `false`,
-  lowercase, and only genuine ones. DuckDB's boolean vocabulary is wider
-  than what it writes back (`"TRUE"`, `"t"`, `"yes"`, `"1"` are all inside
-  the cast), but none of those survive the round trip, so they are stored
-  as NULL and counted as conflicts — the stored column holds exactly the
-  values the wire spelled `true` or `false`. `flag=/^true$/` matches
-  those; `flag=TRUE*` matches nothing. A NULL is *unknown*, not false.
-- **Double-pinned field, glob or regex** — matches the value's text form
-  too, but a double's text form is not what the event's JSON looked like:
-  it always carries a fraction, and switches to a signed, two-digit
-  exponent outside `1e-4 … 1e16` (`200.0`, `0.0`, `-3.0`, `1e-07`,
-  `1.2345678901234568e+17`). So `dur=/^200$/` matches nothing while
-  `dur=/^200\.0$/` matches — the same on both sides, batch and live.
-  Pinning DOUBLE *means* accepting DOUBLE's precision, so this is the one
-  rung with no round-trip guard: anything the cast reads is stored. A
-  value with no numeric reading is stored as NULL and is *unknown*, not
-  false.
-- **Timestamp-pinned field, glob or regex** — matches the **RFC 3339
-  UTC-microsecond form** of the instant, always with a `T` separator, six
-  fractional digits and a trailing `Z`
-  (`2026-01-15T09:00:00.000000Z`). The parse is **zone-aware**: an offset
-  in the wire text is *applied*, so `2026-01-15T09:00:00+05:30` is stored
-  and matched as `2026-01-15T03:30:00.000000Z` — `_time=/T03:30/`, not
-  `/T09:00/`. Text without an offset is read as UTC, a bare date is
-  midnight, and fractions truncate at six digits. So `_time=2026-01-15*`,
-  `_time=/T09:/` and `_time=/\.123456Z$/` all mean the same thing in a
-  batch query and in live tail. A value with no timestamp reading is
-  stored as NULL and is *unknown*, not false — `NOT _time=/T09:/` doesn't
-  match it either. (The envelope's own `_time`/`_ingested` are already
-  canonicalized to UTC at ingest, so this only changes how a *custom*
-  timestamp-pinned field reads.)
-- **Typed-pinned field (BIGINT / DOUBLE / BOOLEAN / TIMESTAMP),
-  comparison** — compares what the column **stores**, which is the
-  conformed value: a wire `1.5` under a BIGINT pin is NULL there, so
-  `duration>1` does not match it, `NOT duration>1` does not either
-  (*unknown*, not false), and `duration!=2` does — a NULL column matches
-  `!=` by design. The literal binds exactly as on an unpinned field
-  (the column already has the pinned type) and DuckDB reads it against
-  that type, so `flag=TRUE` and `flag=yes` both match a stored `true`
-  even though those same texts *stored* conform to NULL, and an offset
-  spelled in a timestamp literal is ignored where the same offset in a
-  stored value is applied. Live tail answers the same way, event for
-  event.
-- Every comparison on an **unpinned** field keeps plain literal-driven
-  behavior.
+The pattern target is what a glob or regex matches against.
+
+| Pin | `=`, `!=`, `in` | Ordered comparison | Pattern target |
+| --- | --- | --- | --- |
+| None | Literal-driven. | Literal-driven. | The column. |
+| VARCHAR | The exact text, or any spelling of the same number when the literal is numeric. | Numeric for a numeric literal, lexical otherwise. | The column. |
+| BIGINT | The stored integer. | The stored integer. | The integer's text, such as `404`. |
+| DOUBLE | The stored double. | The stored double. | DuckDB's double text, which always carries a fraction and takes a signed two-digit exponent outside 1e-4 to 1e16: `200.0`, `0.0`, `-3.0`, `1e-07`, `1.2345678901234568e+17`. |
+| BOOLEAN | The stored boolean. | Not applicable. | `true` or `false`, lowercase. |
+| TIMESTAMP | The stored instant. | The stored instant. | RFC 3339 UTC microseconds, with a `T` separator, six fractional digits and a trailing `Z`: `2026-01-15T09:00:00.000000Z`. |
+| SEVERITY | The band containing the token. | The token's exact number. | The canonical OTel short name, such as `error2`. |
+
+- On a VARCHAR pin, `status=200` finds `"200"`, `"0200"` and `"200.0"`, and not `"accepted"` or `"404"`; `status!=200` returns `"accepted"` and every other non-200 value. A literal the numeric space cannot read, such as `status=nan` or `id=1e40`, falls back to the text comparison alone.
+- On a VARCHAR pin, `status>=400` matches `"404"` and `"500"`, while `"accepted"` is unknown, so `NOT status>=400` does not match it either. A literal with no reading matches nothing on either side.
+- A BIGINT pin stores `"0404"`, `"4.0"`, `" 200"`, `"200_000"` and `"1e3"` as their integer, so `status=4*` finds 404 and `status=0*` does not. `"1.5"`, `"0x10"` and `"accepted"` shelve.
+- A BOOLEAN pin keeps only the values the wire spelled `true` or `false`. `"TRUE"`, `"t"`, `"yes"` and `"1"` are inside DuckDB's cast but do not survive the round trip, so they shelve. `flag=/^true$/` matches a stored `true`, and `flag=TRUE*` matches nothing.
+- A DOUBLE pin stores anything its cast reads, so it is the one pin with no round-trip guard. `dur=/^200$/` matches nothing while `dur=/^200\.0$/` matches.
+- A TIMESTAMP pin applies an offset in the wire text, so `2026-01-15T09:00:00+05:30` stores and matches as `2026-01-15T03:30:00.000000Z`. Text without an offset reads as UTC, a bare date is midnight, and fractions truncate at six digits. The envelope's `_time` and `_ingested` are canonicalized at ingest, so this rule reaches only a custom timestamp-pinned field.
+- A typed pin compares the conformed value, so a wire `1.5` under a BIGINT pin is shelved: `duration>1` does not match it, `NOT duration>1` does not either, and `duration!=2` does.
+- A literal under a typed pin binds as it does on an unpinned field, and DuckDB reads it against the column's type. `flag=TRUE` and `flag=yes` both match a stored `true`, and an offset inside a timestamp literal is ignored where the same offset in a stored value is applied.
+- A shelved value is a NULL column, which is unknown, not false.
 
 #### Missing fields and nulls
 
-A field an event doesn't carry is a NULL column, and a comparison against
-NULL is **unknown** — neither true nor false. This is SQL's rule and it
-holds everywhere: batch queries, exports, and live tail, on pinned and
-unpinned fields alike. Only a *true* row is returned, so an unknown one is
-filtered out. Two consequences are worth knowing before you write an alert:
+A field an event does not carry is a NULL column, and a comparison against NULL is unknown: neither true nor false. Only a true row is returned. This holds in every lane, on pinned and unpinned fields alike.
 
-- `f!=x` **matches events that carry no `f`** (and events whose `f` is
-  null). Its emitted form is `("f" != ? OR "f" IS NULL)` — the one total
-  comparison. On live tail that is a wide net: bus events carry the
-  envelope plus whatever their sender sent, so `f!=x` over a sparse custom
-  field streams nearly everything. Pair it with `f=*` to require the field.
-- `NOT f=x` **does not match events that carry no `f`** — `NOT (NULL)` is
-  NULL, which is unknown, which is filtered out. If you want "events
-  missing `f`, plus events where it isn't `x`", write `f!=x`, not
-  `NOT f=x`. The same holds for `NOT _severity=...` when an event has no
-  derived severity.
+| Spelling | Events missing the field | Emitted shape |
+| --- | --- | --- |
+| `f!=x` in the search stage | Match. | `("f" != ? OR "f" IS NULL)` |
+| `NOT f=x` in the search stage | Do not match. | `NOT ("f" = ?)` |
+| `where f != x` in a pipe stage | Do not match. | `("f" != ?)` |
 
-Two deliberate boundaries:
+On live tail, `f!=x` over a sparse custom field streams nearly everything, so pair it with `f=*` to require the field. To match events missing `f` plus events whose `f` is not `x`, write `f!=x`. The same holds for `NOT _severity=...` when an event has no derived severity. A repin does not change missing-field semantics.
 
-- **Numeric-literal detection is by content, not quoting**: the parser
-  discards quote provenance, so `status>"400"` and `status>400` are the
-  same query — in the search stage and in `| where` alike (`where
-  status == "400"` binds exactly as `where status == 400`).
-- **Embedded mode (`--data`) uses literal-driven comparisons.** It has no
-  field catalog to supply type pins.
+Numeric-literal detection reads content, not quoting: `status>"400"` and `status>400` are the same query, and `where status == "400"` binds as `where status == 400`.
 
 #### Pin-aware `| where` and `| let`
 
-A **bare field-vs-literal comparison** inside `| where` or `| let`
-consults the same catalog pin the search stage does, and adopts exactly
-the same rule table: on a VARCHAR pin `where status > 400` compares in
-`DECIMAL(38,6)` (a value with no reading is unknown, never an error),
-`where status == 200` matches the stored text *or* its numeric reading,
-`where status in (200, "accepted")` routes each element through the
-equality rule; pattern operators (`matches`, `like`, `ilike`) against a
-typed pin target the same canonical text form globs do. Both operand
-orders bind (`400 < status` is `status > 400`); for pattern operators
-only the *left* operand is a subject — the right operand is the pattern.
-Live tail (SSE) and the batch tail behind `extract kv` evaluate the same
-rules, so a pipeline means one thing in every lane.
+A bare field-vs-literal comparison inside `| where` or `| let` reads the same catalog pin the search stage reads, and applies the same rule table.
 
-**Excluded shapes** stay literal-driven, structurally: field-vs-field
-(`where a == b`), function-wrapped fields (`where lower(status) == "a"`),
-arithmetic on the field (`where status * 2 > 400`), `== null`, and a
-pattern with the field on the right (`where "x" matches f`). Unpinned
-fields use literal-driven comparisons throughout.
+```
+# DECIMAL(38,6) comparison on a VARCHAR pin
+| where status > 400
+# the stored text or its numeric reading
+| where status == 200
+# each element routes through the equality rule
+| where status in (200, "accepted")
+```
 
-**Which pin applies follows the pipeline**, not a flat name lookup:
+Three shapes are pin-aware: `where field <op> literal`, the reversed `where literal <op> field` (`400 < status` is `status > 400`), and `where field matches|like|ilike <pattern>`, where only the left operand is a subject.
 
-- `rename status as st | where st > 400` is pin-aware under the new name
-  (and `status` no longer resolves the pin).
-- `let status = <expr> | where status > 400` is literal-driven — a
-  computed value has no pin. A **bare alias** copies the pin:
-  `let s2 = status | where s2 > 400` is pin-aware. Within one `let`, a
-  reference to a sibling target resolves the way the SQL does — an
-  existing *column* of that name wins (so `let a = 1, b = a` gives `b`
-  the original `a`, not `1`), and only a name the row doesn't carry reads
-  the sibling's freshly computed value (`let ms = 1000, total = ms * 2`
-  gives `total = 2000`). *Pins* stay strictly pre-stage either way, so
-  `let a = status, b = a` gives `b` no pin.
-- Aggregations keep their group-by keys and nothing else:
-  `stats count() by status | where status == 200` stays pin-aware, while
-  aggregate outputs (`count`, aliases, the `timechart` time bucket) are
-  never pinned.
-- `extract <regex>` unpins its capture-group names; `extract kv` passes
-  the scope through — with one caveat: a kv key that *shadows* a pinned
-  field name is read under that pin. Confine kv extraction to fields
-  that don't collide with pinned names if that matters.
-- `from saved` reads another query's output: no pins apply.
+Everything else stays literal-driven: field against field (`where a == b`), a function around the field (`where lower(status) == "a"`), arithmetic on the field (`where status * 2 > 400`), `where f == null`, a pattern with the field on the right (`where "x" matches f`), and every comparison on an unpinned field.
 
-**Timestamps in the `extract kv` tail** are compared as stored instants
-and shifted to your display timezone *last*, like every other lane. The
-shift follows the tail's own lineage: `rename _time as t` and a bare
-alias `let t2 = _time` still render in your zone, while a *computed*
-value (`let t = coalesce(_time, x)`, aggregate outputs) is a value the
-tail derived and renders as UTC text.
+Which pin applies follows the pipeline, not a flat name lookup.
 
-**One NULL-policy difference from the search stage, kept on purpose**:
-the pipeline `!=` does *not* carry the search stage's `OR field IS NULL`
-widening. `| where f != x` over an event without `f` is unknown and
-filtered out. A repin does not change missing-field semantics. Use the
-search-stage `f!=x` to include events missing the field.
+| Stage | Effect on pins |
+| --- | --- |
+| `rename status as st` | `st` carries the pin, and `status` no longer resolves it. |
+| `let s2 = status` | A bare alias copies the pin. |
+| `let status = <expr>` | A computed value has no pin. |
+| `stats ... by status` | Group keys keep their pins. Aggregate outputs, aliases and the `timechart` bucket are never pinned. |
+| `extract <regex>` | Capture-group names lose their pins. |
+| `extract kv` | Passes the scope through. A kv key that shadows a pinned field name is read under that pin. |
+| `from saved` | No pins apply. |
+
+Inside one `let`, a reference to a sibling target resolves the way the SQL does: an existing column of that name wins, so `let a = 1, b = a` gives `b` the original `a`, and only a name the row does not carry reads the sibling's fresh value, so `let ms = 1000, total = ms * 2` gives `total = 2000`. Pins stay pre-stage, so `let a = status, b = a` gives `b` no pin.
+
+Timestamps in the kv batch tail compare as stored instants and shift to your display timezone last. The shift follows the tail's lineage, so `rename _time as t` and the bare alias `let t2 = _time` render in your zone, while a computed value such as `let t = coalesce(_time, x)` and every aggregate output render as UTC text.
 
 ### The two namespaces
 
-Bare names identify sender fields, with ASCII case folding and catalog conformance applied at ingest and storage. `env`, `service`, `host`, and `message` have declared envelope roles; other bare names such as `level` and `timestamp` do not become aliases for Trawl's derived values.
+Bare names identify sender fields, with ASCII case folding and catalog conformance applied at ingest and storage. `env`, `service`, `host` and `message` have declared envelope roles. Other bare names, such as `level` and `timestamp`, are ordinary sender fields, and there are no field-name aliases: use `_time` for the event instant and `_severity` for derived severity.
 
-The underscore namespace belongs to Trawl. Its declared slots are `_time`, `_ingested`, `_raw`, `_repairs`, `_severity`, and `_producer`, with presence rules in the [event reference](/reference/events/#declared-fields). An incoming reserved name normally loses its leading underscore run, while the DSL cannot mint reserved outputs: `let _foo = 1`, `rename x as _foo`, and an `_foo` regex capture are refused. See [name handling](/reference/events/#names-and-original-values) for proposal exceptions and collisions.
+The underscore namespace belongs to trawl. Its declared slots are `_time`, `_ingested`, `_raw`, `_repairs`, `_severity` and `_producer`, with presence rules in the [event reference](/reference/events/#declared-fields).
 
-There are no field-name aliases. Use `_time` for the event instant and `_severity` for derived severity. Stage aliases such as `head` and `eval` remain valid.
+- An incoming reserved name loses its leading underscore run. See [name handling](/reference/events/#names-and-original-values) for proposal exceptions and collisions.
+- `let _foo = 1` and `rename x as _foo` are parse errors naming the reserved namespace, and an `_foo` regex capture in `extract` is refused before the query runs.
+- A kv key starting with `_` is dropped. Its text stays findable in the source field and `_raw`.
+- The stage aliases `head`, `fields`, `eval` and `rex` remain valid.
 
 ### Backtick-quoted names
 
-Any field name can be written between backticks, and a backticked name is
-**always** a field reference:
+Any field name can be written between backticks, and a backticked name is always a field reference.
 
 ```
-`http-status`=500                # a name the bare form cannot spell
-`last`=5                         # the FIELD last, beside last=2h
-| table `request id`, `x-request-id`
-| stats count() as `total count` by `where`
-| table `a``b`                   # a doubled backtick escapes one: the name a`b
+# a name the bare form cannot spell
+`http-status`=500
+# the field last, beside the time keyword
+`last`=5 last=2h
+# a doubled backtick escapes one: the name a`b
+| table `a``b`
 ```
 
-Backticks change how a name is **lexed**, never what a name may be:
+Backticks change how a name is lexed, never what a name may be. Content is any character except a backtick, and a doubled backtick escapes one. A dot inside the quotes is a literal character, not a segment separator. The ASCII fold still applies, so `` `Dur` `` is `dur`, and the `_` namespace is still sealed, so ``let `_foo` = 1`` is the same error as the bare spelling.
 
-- content is any character except a backtick, and a doubled backtick
-  escapes one (last line above);
-- an empty name is a parse error, as is one carrying a character that
-  cannot render as itself — a control character, a bidi or zero-width
-  format character, or the soft hyphen;
-- the ASCII fold still applies: `` `Dur` `` **is** `dur`;
-- trawl's `_` namespace is still sealed: ``let `_foo` = 1`` and
-  ``rename x as `_foo` `` are the same errors as the bare spellings.
+- An empty name is a parse error: ``` empty field name: `` names no column ```
+- A control, bidi or zero-width format character, or the soft hyphen, is a parse error: `field name contains a control or invisible format character (U+XXXX); such characters are not part of any column name`
 
-They are accepted in every field position — search-stage filters,
-expressions, aggregation arguments and `by` keys, `table`/`fields`,
-`sort`, `drop`, `dedup`, both sides of `rename`, `let` targets and `as`
-aliases — so a name that exists is a name you can reach.
+Backticks are accepted in every field position: search-stage filters, expressions, aggregation arguments, `by` keys, `table`, `fields`, `sort`, `drop`, `dedup`, both sides of `rename`, `let` targets and `as` aliases. They are not accepted for a function name, a stage name, or a saved-query name, so `` `lower`(x) `` is a field reference rather than a call.
 
-**Not fields, so no backticks:** function names (`` `lower`(x) `` is a
-field reference, never a call), stage names, and saved-query names.
+A backtick also ends an unquoted value and an unquoted word, so text containing one is written double-quoted, as in `` host="a`b" `` and `` "er`ror" ``. Backticks are not value quotes, so `` service=`nginx` `` is a parse error, and `-` cannot negate a quoted name, so write ``NOT `http-status`=500``.
 
-A backtick also **ends an unquoted value and an unquoted word**, so text
-that contains one is written double-quoted — `` host="a`b" ``, `` "er`ror" ``
-— which carries the tick verbatim. Backticks are not value quotes:
-`` service=`nginx` `` and `` service=`my service` `` are parse errors, not
-filters on the literal text. Nor can `-` negate a quoted name: write
-``NOT `http-status`=500``, since `` -`http-status`=500 `` is an error too.
-(Ending unquoted text at the tick is what keeps a stray one a parse error
-instead of a silently different query.)
+The search stage reads `last=`, `earliest=` and `latest=` before anything else, and backticks reach fields with those names. Inside `| where`, `| let` and aggregation arguments, the words an expression is made of are read before a field reference is tried: `true`, `false` and `null` are literals, and `and`, `or`, `not`, `in`, `matches`, `like` and `ilike` are operators. ``| where `true` == 1`` filters on the column named `true`.
 
-The search stage reads exactly three words before anything else —
-`last=`, `earliest=`, `latest=`. Backticks are how you reach fields with
-those names; everywhere else they are ordinary names already.
-
-Inside an expression (`| where`, `| let`, aggregation arguments) the
-words an expression is made of are read before a field reference is
-tried: `true`, `false` and `null` are literals, and `and`, `or`, `not`,
-`in`, `matches`, `like`, `ilike` are operators. Backticks reach the
-fields — ``| where `true` == 1`` filters on the column named `true`,
-while `| where true == 1` compares the boolean.
-
-A `#` inside backticks is part of the name, not a comment, so
-`` | sort -`a#b` `` sorts on the field `a#b`. Nothing decides that outside
-the grammar: a comment opens only where the grammar skips whitespace, and
-a quoted name has no such place inside it. See [Comments](#comments).
+A `#` inside backticks is part of the name. See [Comments](#comments).
 
 ### Severity: `_severity`
 
-`_severity` is the derived OTel SeverityNumber (1-24), pinned to the
-`SEVERITY` type on every install. Because the pin types the comparison,
-the token vocabulary works identically in the SQL emitter, the live
-filter, the stream compiler and the post-SQL tail:
+`_severity` is the derived OTel SeverityNumber, 1 to 24, pinned to the `SEVERITY` type on every install.
 
 ```
-_severity=error                 # BETWEEN 17 AND 20 (the ERROR band)
-_severity!=info                 # NOT BETWEEN 9 AND 12, or _severity IS NULL
-_severity=warn,error            # either band — the two merge: BETWEEN 13 AND 20
-_severity=warn,fatal            # disjoint, so two ranges: 13-16 OR 21-24
-_severity>=warn                 # >= 13 (the token's exact number)
-_severity=error2                # exactly 18 (the OTel exact short name)
-_severity=17                    # exactly 17
-_severity=warn*                 # glob over the canonical token text: 13-16
-| where _severity == "error"    # the same rule, in a pipe stage
+# the ERROR band: BETWEEN 17 AND 20
+_severity=error
+# NOT BETWEEN 9 AND 12, or _severity IS NULL
+_severity!=info
+# two adjacent bands merge: BETWEEN 13 AND 20
+_severity=warn,error
+# disjoint, so two ranges: 13-16 OR 21-24
+_severity=warn,fatal
+# the token's exact number: >= 13
+_severity>=warn
+# the OTel exact short name: exactly 18
+_severity=error2
+# glob over the canonical token text: 13-16
+_severity=warn*
 ```
 
-- Equality and IN match the whole **band** containing the token
-  (`notice` falls inside the INFO band); ordered comparisons use the
-  token's **exact** number.
-- A comma list is one **set** over the ladder, emitted as the minimal
-  contiguous ranges covering it: adjacent bands merge into a single
-  `BETWEEN` (`warn,error` is 13-20, and all six base bands are one
-  `BETWEEN 1 AND 24`), a band and a point beside it merge too
-  (`warn,17` is 13-17), and only a genuinely disjoint selection emits
-  more than one range. This is a performance property — the merge never
-  changes which rows match.
-- A negated comma list composes scalar `!=`: `_severity!=warn,error`
-  matches severities outside both bands (outside 13–20) and events with no
-  `_severity`. The positive `_severity=warn,error` remains membership in
-  the combined 13–20 range.
-- OTel's exact short names (`trace2`, `warn3`, `error2`, …) name one
-  number, under every operator.
-- Glob and regex match the **canonical token text** — the injective OTel
-  short name of the stored number — which is also what results display:
-  a `_severity` cell reads `error`, not `17`. The wire keeps the number:
-  `-f json`, `-f csv` and SSE carry it for arithmetic consumers.
-- An unrecognized value is a **query error naming the vocabulary**, never
-  a filter that quietly matches nothing.
-- Valid band tokens: `trace`/`t`, `debug`/`d`, `info`/`i`, `notice`,
-  `warn`/`warning`/`w`, `error`/`err`/`e`, `fatal`/`critical`/`crit`/`f`,
-  `alert`, `emerg`/`panic`.
-- Embedded `--data` mode has no catalog, so it has no `SEVERITY` pin:
-  compare the ladder number there (`_severity>=17`).
+- Equality and `in` match the whole band containing the token, so `notice` falls inside the INFO band. An ordered comparison uses the token's exact number.
+- A comma list is one set over the ladder, emitted as the minimal contiguous ranges covering it: `warn,17` is 13 to 17, and all six base bands are one `BETWEEN 1 AND 24`. The merge changes speed, not which rows match.
+- A negated comma list composes scalar `!=`, so `_severity!=warn,error` matches severities outside 13 to 20, and events with no `_severity`.
+- The exact OTel short names, such as `trace2`, `warn3` and `error2`, name one number under every operator.
+- Globs and regexes match the canonical OTel short name of the stored number, which is what results display: a `_severity` cell reads `error`, not `17`. `-f json`, `-f csv` and SSE carry the number.
+- An unrecognized value is a query error: ``unknown severity value 'x' — a severity field takes a band token (trace, debug, info, notice, warn, error, fatal, alert, emerg), an exact OTel short name (error2, warn3), or a number on the 1-24 ladder``
+- Embedded `--data` has no `SEVERITY` pin, so compare the ladder number there, as in `_severity>=17`.
 
-`_severity` is **derived, never proposed**: ingest reads `severity` →
-`severity_text` → `level` (first mappable wins — the packaged default of
-`[ingest] severity_from`) and retains those source fields under their own names, subject to catalog
-conformance. A word maps through the token table or the exact names; a
-number maps strictly as OTel 1-24, so `3` is `trace`, unless the source
-was configured with `dialect = "syslog"` — which is how the syslog
-listener's own `syslog_severity` numeral inverts, and how a
-syslog-over-HTTP forwarder reaches the same reading. An event with no
-mappable source simply has no `_severity`.
+Band tokens are case-insensitive.
+
+| Token and aliases | Number |
+| --- | --- |
+| `trace`, `t` | 1 |
+| `debug`, `d` | 5 |
+| `info`, `i` | 9 |
+| `notice` | 10 |
+| `warn`, `warning`, `w` | 13 |
+| `error`, `err`, `e` | 17 |
+| `fatal`, `critical`, `crit`, `f` | 21 |
+| `alert` | 23 |
+| `emerg`, `panic` | 24 |
+
+trawl derives `_severity` at ingest and never accepts it from a sender. The packaged `[ingest] severity_from` reads `severity`, then `severity_text`, then `level`, and the first mappable source wins. trawl retains those source fields under their own names. A word maps through the token table or the exact names, and a number maps as OTel 1 to 24, so `3` is `trace` unless the source sets `dialect = "syslog"`. An event with no mappable source has no `_severity`.
+
+`level` is an ordinary sender field, so `level=error` compares its stored value. An event carrying `{"service":"game","level":"gold"}` has a queryable `level` column holding `gold`.
 
 #### Reading any field as a severity: `sev()`
 
-`_severity` is what trawl derived at ingest. `sev(x)` is the same reading
-applied at **query time**, to any field you name:
+`sev(x)` applies the same reading at query time, to any field you name.
 
 ```
-| where sev(level) >= "error"       # the ORDERED rule: >= 17
-| where sev(level) == "error"       # the EQUALITY rule: the 17-20 band
+# the ordered rule: >= 17
+| where sev(level) >= "error"
+# the equality rule: the 17-20 band
+| where sev(level) == "error"
+# a foreign syslog numeral
 | where sev(syslog_severity, "syslog") == "error"
-| let s = sev(level) | stats count() by s
 ```
 
-- One kernel. `sev()` reads exactly what ingest's derivation reads: the
-  band tokens with their aliases, OTel's exact short names, then a strict
-  integer. Anything else — `1.5`, `1e1`, `0x10`, `gold`, a boolean — has
-  **no reading**, which is `null`, never an error.
-- `sev()` **declares** its result as `SEVERITY`, so a comparison against
-  it binds through the rules above (band for `==`/`in`, exact number when
-  ordered, canonical token text for `matches`/globs) and its column
-  displays tokens in the CLI table, the TUI and the web UI. Machine
-  formats keep the number, as always.
-- The **literals must be quoted**: `sev(level) >= "error"`. A bare
-  `error` in a pipe stage is a field reference, exactly as it is
-  everywhere else in `| where`.
-- The pin travels: `| let s = sev(level)` gives `s` the `SEVERITY` type,
-  and `| stats count() by s` keeps it.
-- The subject must be `sev(<field>)` **directly**. A computed inner
-  expression — `sev(lower(x))`, `sev(coalesce(a, b))` — still *computes*
-  the reading, but the comparison around it falls back to the generic,
-  literal-driven path, so `sev(lower(x)) == "error"` compares against the
-  string `"error"` rather than the band — a `Conversion Error` in batch,
-  and a filter that never matches in the live tail. Bind it first, which
-  adopts the pin:
-
-  ```
-  | let s = sev(lower(level)) | where s == "error"
-  ```
-
-  The compiler determines the comparison type from the query text. A direct
-  field argument supplies that type in batch, live, and post-SQL evaluation.
-- `dialect` governs NUMERICS only — words always read the one token
-  table. `sev(x, "syslog")` inverts 0-7 (syslog counts down: `3` is
-  `err` → 17), which is the reading for a foreign syslog dump. It must be
-  a **literal** from `otel`/`syslog`; anything else is a query error
-  naming the vocabulary, in batch and live alike.
-- It works in embedded `--data` mode, where nothing else is pin-aware:
-  the type is declared by the function, not looked up in a catalog.
+- The vocabulary is the band tokens with their aliases, the OTel exact short names, then a strict integer. Anything else, including `1.5`, `1e1`, `0x10`, `gold` and a boolean, has no reading, which is `null` rather than an error.
+- `sev()` declares its result as `SEVERITY`, so comparisons against it bind through the severity rules, the pin travels through `| let s = sev(level) | stats count() by s`, and the column displays tokens in the CLI table, the TUI and the web UI.
+- Literals must be quoted. A bare `error` in a pipe stage is a field reference.
+- The subject must be `sev(<field>)` directly. `sev(lower(x))` still computes the reading, but the comparison around it falls back to the literal-driven path, so `sev(lower(x)) == "error"` compares against the string: a `Conversion Error` in batch, and a filter that never matches on live tail. Bind it first with `| let s = sev(lower(level)) | where s == "error"`.
+- `dialect` governs numbers only. Words always read the one token table. `sev(x, "syslog")` inverts 0 to 7, so `3` is `err`, which is 17. An unknown dialect is a query error naming `otel` and `syslog`.
+- `sev()` works in embedded `--data`, where nothing else is pin-aware. The function declares the type.
 
 #### Putting the field itself on the ladder
 
-`sev()` reads a field on the ladder at QUERY time, every time. To make the
-field *be* a severity — so `level=error` is a band match, `level>=warn`
-compares ladder positions, and results render tokens — an operator repins
-the column once:
+To make a field be a severity rather than read one at query time, an operator repins the column once with `trawl schema repin level --to severity`. See the [CLI reference](/reference/cli/#repin) for the command and its dry run.
 
-```bash
-trawl schema repin level --to severity --dry-run   # plan first, always
-```
-
-Then `level` behaves as `_severity` does — bands, ordered comparison and
-token rendering — in every lane, for stored history and for events ingested
-after the cutover.
-
-The repin dialect applies to the historical rewrite. Ordinary conformance of new values in that custom field uses the OTel interpretation. With `--dialect syslog`, a historical raw `3` becomes 17, while a new raw `3` in that field reads as OTel 3. Text severity tokens do not have that numeric ambiguity.
-
-Configuring `severity_from` with a syslog dialect derives `_severity`; it does not rewrite the bare source field. For a continuing syslog-number sender, query the derived `_severity` or `sev(field, "syslog")`. If you intend to repin the source field itself, account for how future values will be normalized before relying on a single meaning across the cutover.
-
-The dry run reports the values the ladder cannot read, and — for a corpus
-carrying numerals 1-7, which OTel and syslog PRI read as different
-severities — refuses until you assert `--dialect syslog` or pass `--force`.
-`_severity` itself cannot be repinned: its type is part of the event
-contract. See the [CLI reference](/reference/cli/#repin).
-
-:::caution[Choose the severity field explicitly]
-`level` is an ordinary sender field. Unless you repin it as SEVERITY,
-`level=error` compares its stored value. A game server sending
-`{"service":"game","level":"gold"}` has a queryable `level` column.
-
-Use `_severity>=error` to filter derived severity, or
-`| where sev(level) >= "error"` to interpret the sender's field at query time.
-An operator can use `trawl schema repin level --to severity` to give the
-field severity comparisons and token rendering. A field filter matches no
-events when no sender supplies that field, except for the documented `!=`
-missing-field rule.
-:::
+- After the repin, `level` behaves as `_severity` does in every lane, for stored history and for events ingested after the cutover.
+- The repin dialect applies to the historical rewrite only, and new values conform under the OTel interpretation. With `--dialect syslog`, a historical raw `3` becomes 17 while a new raw `3` reads as OTel 3. Text severity tokens carry no such ambiguity.
+- `severity_from` with a syslog dialect derives `_severity` without rewriting the bare source field. For a continuing syslog-number sender, query `_severity` or `sev(field, "syslog")`.
+- `_severity` cannot be repinned. Its type is part of the event contract.
 
 ### `timestamp` and `@timestamp`
 
-Ordinary sender fields. They are **read** as sources for the `_time`
-derivation (default `_time` → `timestamp` → `@timestamp`, first present wins)
-and retained under their own names, subject to their catalog pins. The
-original representation remains in `_raw` subject to its cap. Only `_time`
-itself is consumed and canonicalized — it is the proposal slot.
+Ordinary sender fields. trawl reads them as sources for the `_time` derivation, in the packaged `[ingest] time_from` order `_time`, then `timestamp`, then `@timestamp`, first present wins. trawl retains them under their own names and their own catalog pins, and the original representation stays in `_raw`, subject to its cap. Only `_time` is consumed and canonicalized.
 
-`| sort -timestamp` sorts the sender's column. Sort, filter and project
-`_time` when you mean the event's instant.
+`| sort -timestamp` sorts the sender's column. Sort, filter and project `_time` when you mean the event's instant.
 
 ### Text search
 
 ```
-error                           # bare word — substring match
--debug                          # negated — exclude matches
-"connection refused"            # exact phrase
+# substring match, case-insensitive
+error
+# negated, excludes matches
+-debug
+# exact phrase
+"connection refused"
 ```
 
-Bare-word and phrase search match the `message` column **and** `_raw`,
-so content that was parsed away is still findable. Negation excludes an
-event when either column matches. Text containment is deliberately
-**two-valued**:
-a missing, null, or non-text `message`/`_raw` does not contain the term. Consequently
-`-debug`, `NOT debug`, and `NOT "debug"` agree even on foreign data that
-does not carry one or both columns.
+Bare words and phrases match `message` and `_raw`, case-insensitively. Negation excludes an event when either column matches. Containment is two-valued, so a missing, null or non-text `message` or `_raw` does not contain the term, and `-debug`, `NOT debug` and `NOT "debug"` agree even on foreign data that lacks one or both columns.
 
-Because `_raw` holds the most original form of the event, searching it is
-**whole-event search**, and what "whole event" means depends on who filled
-it:
+Searching `_raw` is whole-event search. `_raw` holds the most original form of the event, so what a term reaches depends on who filled it.
 
-- a collector that sent its own string `_raw` — the pre-parse line, matched
-  as text;
-- everything else — the server's JSON serialization of the event as it
-  arrived, so a term matches anywhere in that object: another field's
-  **value** (`nginx` finds an event with `service=nginx`, even when
-  `message` never says it) and a field **name** (`debug` finds an event
-  carrying `debug_mode`, and `-debug` therefore excludes it).
+- A collector that sent its own string `_raw`: the pre-parse line, matched as text.
+- Everything else: the server's JSON serialization of the event as it arrived. A term matches another field's value, so `nginx` finds an event with `service=nginx` even when `message` never says it, and a term matches a field name, so `debug` finds an event carrying `debug_mode` and `-debug` excludes it.
 
-That is the point of a bare word — find the event without knowing which
-field holds the term. When you do know, filter the field and `_raw` is
-never consulted:
+A field filter never consults `_raw`.
 
 ```
-message=/debug/                 # regex, message only
-message=*debug*                 # glob, message only (case-sensitive)
-service=nginx                   # exact field match
+# regex, message only
+message=/debug/
+# glob, message only, case-sensitive
+message=*debug*
 ```
 
 ### Time filters
 
 ```
-last=2h                         # units: s, m, h, d, w
-last=7d
-last=30m
-earliest="2026-03-14T03:00:00Z" # absolute lower bound (quoted)
-latest="2026-03-14T03:15:00Z"   # absolute upper bound (quoted)
+# a relative window; units are s, m, h, d, w
+last=2h
+# an absolute lower bound, quoted
+earliest="2026-03-14T03:00:00Z"
+# an absolute upper bound, quoted
+latest="2026-03-14T03:15:00Z"
 ```
 
-`last=`, `earliest=` and `latest=` are the DSL's whole keyword set: they
-are read before any field filter, wherever they appear, and they apply to
-the query globally. Fields of those three names are reachable with
-backticks (`` `last`=5 ``).
+| Keyword | Argument | Bound |
+| --- | --- | --- |
+| `last=` | An unquoted duration: a positive integer and one of `s`, `m`, `h`, `d`, `w`. | `_time >= now() - duration`, with no upper bound. |
+| `earliest=` | A quoted timestamp. | `_time >=` the bound, inclusive. |
+| `latest=` | A quoted timestamp. | `_time <` the bound, exclusive. |
 
-The pair is half-open, `[earliest, latest)`: `earliest=` includes an event
-stamped exactly at the bound, `latest=` excludes it. An event at
-`2026-03-14T03:00:00Z` matches `earliest="2026-03-14T03:00:00Z"` and does
-not match `latest="2026-03-14T03:00:00Z"`.
+The three keywords are read before any field filter, wherever they appear, and they apply to the query globally. Fields of those names are reachable with backticks, as in `` `last`=5 ``.
 
-That is what makes windows tile. Run one query over
-`[03:00, 03:15)` and the next over `[03:15, 03:30)` and every event is
-counted once, in exactly one of them. A closed upper bound would put an
-event landing on 03:15 in both. Scheduled reports lean on this: the
-scheduler hands consecutive runs consecutive windows and the coverage
-neither gaps nor double-counts.
+- `last=` with `earliest=` or `latest=` is refused: `cannot combine 'last=' with 'earliest='/'latest='`
+- A repeated keyword takes its last spelling.
+- A zero duration returns `duration must be greater than zero`, and an overflowing one returns `duration too large`.
+- The pair is half-open, `[earliest, latest)`, so an event at `2026-03-14T03:00:00Z` matches `earliest="2026-03-14T03:00:00Z"` and does not match `latest="2026-03-14T03:00:00Z"`. Consecutive windows tile.
 
 ### Scheduled windows
 
-A saved query with a windowed schedule does not spell its own interval.
-The schedule owns the window, and each run gets absolute bounds spliced
-onto the front of the saved text before it executes:
+A saved query with a windowed schedule does not spell its own interval. The schedule owns the window, and each run gets absolute bounds spliced onto the front of the saved text before it executes.
 
 ```
-# saved DSL
+# the saved DSL
 _severity>=error | stats count() by service
-
-# what the 03:00 run executed and stored, for window = "since_last", lag = 5m
+# what the 03:00 run executed, for window = "since_last" and lag = 5m
 earliest="2026-03-14T01:55:00.000000Z" latest="2026-03-14T02:55:00.000000Z" _severity>=error | stats count() by service
 ```
 
-The stored `query` on the run row is that resolved text, so pasting it
-back into `trawl query` reproduces the report exactly. The three time
-keywords are read before anything else in the search stage, which is why a
-prefix is valid ahead of a field filter, a bare word, a comment or a
-leading `|`, and why the splice can leave your own text byte for byte
-rather than reprinting it from the parse tree.
+- The stored `query` on a run row is that resolved text, so pasting it into `trawl query` reproduces the report.
+- The splice is valid ahead of a field filter, a bare word, a comment or a leading stage separator, and leaves your text byte for byte.
+- `last=`, `earliest=` or `latest=` in a windowed saved query is a 400 naming both, in both directions. A backticked `` `last`=5 `` is an ordinary field filter and is unaffected.
+- `| from saved` may not have a window. It reads stored report rows, not ingest events.
+- An interactive run of a scheduled saved query carries no window. The bounds exist only on the runs the scheduler made.
 
-The saved DSL may not carry `last=`, `earliest=` or `latest=` while a
-window is attached. Two spellings of one interval would both claim to say
-what the report covers, and there is no honest way to combine them: a
-`last=2h` under an hourly `since_last` schedule would re-read the same
-hour twice and still miss a gap after downtime. Attaching either side over
-the other is a 400 naming both, in both directions. A backticked
-`` `last`=5 `` is an ordinary field filter and is unaffected.
-
-Two consequences worth naming. `| from saved` may not have a window at
-all, because it reads stored report rows rather than ingest events.
-And running a scheduled saved query interactively carries no window: the
-text is what you typed, and the bounds exist only on the runs the
-scheduler made. Setup and mechanism are in
-[scheduled reports](/architecture/reports-telemetry/#scheduled-reports).
+Setup and mechanism are in [scheduled reports](/architecture/reports-telemetry/#scheduled-reports).
 
 ### OR grouping
 
 ```
+# either filter matches
 service=nginx OR service=apache
-a b OR c d                      # implicit AND within groups: (a AND b) OR (c AND d)
+# implicit AND within groups: (a AND b) OR (c AND d)
+a b OR c d
+# parentheses group explicitly
+(service=nginx OR service=apache) status>=400
 ```
+
+`OR` may be spelled `OR` or `or`. `NOT` is uppercase only, and a lowercase `not` in the search stage is a bare search term. Whitespace binds tighter than `OR`. Parentheses group tokens and may nest. A time keyword inside a group is hoisted out and applied globally.
 
 ## Pipe stages
 
-The parser defines 18 stage variants. Aliases such as `head` and `eval` are alternate spellings, not additional variants. The table is a syntax index; each section below states its constraints.
+The parser defines 18 stage variants. `head`, `fields`, `eval` and `rex` are alternate spellings, not additional variants.
 
 | Stage | Purpose |
 | --- | --- |
@@ -661,323 +423,404 @@ The parser defines 18 stage variants. Aliases such as `head` and `eval` are alte
 | [where](#where) | Filter rows by an expression. |
 | [sort](#sort) | Order rows by fields. |
 | [limit / head](#limit--head) | Keep the first rows. |
+| [tail](#tail) | Keep the last rows. |
 | [table / fields](#table--fields) | Select columns. |
 | [top](#top) | Count the most common values. |
 | [rare](#rare) | Count the least common values. |
 | [drop](#drop) | Remove columns. |
 | [let / eval](#let--eval) | Compute or replace values. |
-| [extract / rex](#extract--rex) | Extract regex captures or key/value fields. |
+| [extract / rex](#extract--rex) | Extract regex captures or key-value fields. |
+| [rename](#rename) | Rename fields. |
 | [dedup](#dedup) | Remove duplicate rows or keys. |
 | [timechart](#timechart) | Aggregate into time buckets. |
 | [pivot](#pivot) | Turn distinct values into aggregate columns. |
-| [tail](#tail) | Keep the last rows. |
-| [rename](#rename) | Rename fields. |
-| [sample](#sample) | Randomly sample a percentage or row count. |
+| [sample](#sample) | Sample a percentage or a row count. |
 | [eventstats](#eventstats) | Add grouped aggregate values to each row. |
 | [from saved](#from-saved) | Read stored report runs. |
 
 ### stats
 
-Aggregate with optional grouping.
+```text
+stats <agg>[ as <name>][, <agg> ...] [by <field>[, <field> ...]]
+```
+
+| Argument | Required | Meaning |
+| --- | --- | --- |
+| `<agg>` | Yes | An [aggregation function](#aggregation-functions) call. |
+| `as <name>` | No | The output column name. |
+| `by <field>` | No | Group keys. |
 
 ```
+# one row, one column
 stats count()
+# one row per host
 stats count() by host
-stats avg(duration) by status
+# several aggregates, several keys
 stats count(), avg(duration) by service, host
-stats avg(duration) as avg_duration
 ```
+
+`stats` reduces each group to one output row, and projects the group keys plus one column per aggregate. Group keys keep their catalog pins; aggregate outputs do not.
 
 ### where
 
-Filter on computed values.
+```text
+where <expression>
+```
 
 ```
-where count > 10
-where avg_duration > 100
+# combine conditions
 where status == 200 and count > 5
-where host matches /prod-.*/
-where x in (1, 2, 3)
+# regex and membership
+where host matches /prod-.*/ and x in (1, 2, 3)
 ```
+
+The condition is an [expression](#expressions). A bare field-vs-literal comparison is pin-aware. `!=` carries no null widening here, so a row whose field is missing is filtered out.
 
 ### sort
 
-Order results. Prefix with `-` for descending.
+```text
+sort [-]<field>[, [-]<field> ...]
+```
 
 ```
-sort count                      # ascending
-sort -count                     # descending
-sort status, -count             # multi-field
+# ascending
+sort count
+# descending, then a second key
+sort -count, status
 ```
+
+A leading `-` sorts descending. There is no `+` prefix.
 
 ### limit / head
 
-Cap the number of results.
+```text
+limit <n>
+head <n>
+```
 
 ```
+# keep the first 20 rows
 limit 20
-head 20                         # alias for limit
+# the same stage
+head 20
 ```
+
+`<n>` is a non-negative integer.
 
 ### tail
 
-Last N rows. Defaults to timestamp descending if no prior sort.
+```text
+tail <n>
+```
 
 ```
+# the last 5 rows
 tail 5
 ```
 
+Without an earlier `sort`, `tail` orders by `_time` descending first. With one, it keeps that order and limits.
+
 ### table / fields
 
-Select output columns.
+```text
+table <field>[, <field> ...]
+fields <field>[, <field> ...]
+```
 
 ```
+# select two columns
 table host, status
-fields host, status             # alias for table
+# the same stage
+fields host, status
 ```
+
+Columns appear in the order you name them.
 
 ### top
 
-Most frequent values.
+```text
+top <n> <field> [by <field>[, <field> ...]]
+```
+
+| Argument | Required | Meaning |
+| --- | --- | --- |
+| `<n>` | Yes | How many values to keep. |
+| `<field>` | Yes | The field whose values are counted. |
+| `by <field>` | No | Group keys. |
 
 ```
-top 10 host                     # top 10 hosts by frequency
-top 5 status by service         # top 5 statuses per service
+# the 10 most frequent hosts
+top 10 host
+# the 5 most frequent statuses per service
+top 5 status by service
 ```
+
+`top` mints its own `count` column and cannot spell `as`.
 
 ### rare
 
-Least frequent values.
+```text
+rare <n> <field> [by <field>[, <field> ...]]
+```
 
 ```
-rare 5 status                   # 5 rarest status codes
-rare 3 host by service          # 3 rarest hosts per service
+# the 5 rarest status codes
+rare 5 status
+# the 3 rarest hosts per service
+rare 3 host by service
 ```
+
+The arguments and the minted `count` column match [top](#top).
 
 ### drop
 
-Exclude columns from output.
+```text
+drop <field>[, <field> ...]
+```
 
 ```
+# remove one column
 drop message
+# remove several
 drop host, raw
 ```
 
 ### let / eval
 
-Create computed fields.
+```text
+let <name> = <expression>[, <name> = <expression> ...]
+eval <name> = <expression>[, <name> = <expression> ...]
+```
 
 ```
+# a computed column
 let duration_ms = duration * 1000
-eval status_class = floor(status / 100)   # eval is an alias for let
-let is_error = status >= 400
+# the same stage
+eval status_class = floor(status / 100)
 ```
+
+A target naming an existing column replaces it. A target in the `_` namespace is a parse error, and two targets that fold to one name in a single stage are a parse error. See [Pin-aware where and let](#pin-aware--where-and--let) for how a sibling reference resolves.
 
 #### Arithmetic
 
-`/` is **true division**: `status / 100` over a `404` is `4.04`, not `4`,
-and the result is a DOUBLE whatever the operands were. Wrap it in
-`floor()` for the integer part — `floor(status / 100)` answers `4.0`,
-also a DOUBLE (see [Numeric functions](#numeric-functions)).
+`/` is true division, so `status / 100` over a `404` is `4.04`, and the result is a DOUBLE whatever the operands were. Wrap it in `floor()` for the integer part: `floor(status / 100)` answers `4.0`, also a DOUBLE.
 
-`+`, `-` and `*` stay integral over two integers. An overflow has no
-answer: the batch lane raises an error and the streaming lane yields
-`null`, because a live tail cannot raise a per-event error without
-killing the subscription.
+`+`, `-` and `*` stay integral over two integers. An integer overflow raises an error in batch SQL and yields `null` in the streaming lane.
 
 #### Infinities and NaN
 
-Division never fails: `1.0 / 0` is `inf`, `-1.0 / 0` is `-inf` and
-`0.0 / 0` is `NaN`, exactly as in the query engine. `%` follows `/`
-whenever either side is a float (`5 % 0.0` is `NaN`), while integer
-`% 0` stays `null`.
+Division never fails: `1.0 / 0` is `inf`, `-1.0 / 0` is `-inf`, and `0.0 / 0` is `NaN`. `%` follows `/` whenever either side is a float, so `5 % 0.0` is `NaN`, while integer `5 % 0` is `null`.
 
-Those values flow between stages like any other number and compare the
-way DuckDB compares them — a **total** order, not IEEE's: every NaN
-equals every other NaN and outranks every finite value (so
-`| let x = 0.0 / 0 | where x == x` keeps the row, and `max(x)` over a
-column holding one answers `NaN`), and the two zeros compare equal, so
-`-0.0` groups with `0.0`.
+These values flow between stages like any other number and compare in DuckDB's total order, not IEEE's.
 
-JSON has no spelling for any of them, so **JSON output renders them
-`null`**: the API wire, `-f json`, and the SSE stream all show `null`
-where a special was computed. The table and CSV renderers print the value
-itself (`inf`, `-inf`, `NaN`) when the query runs embedded (`--data`),
-which is the only path that does not cross the JSON wire.
+- Every NaN equals every other NaN and outranks every finite value, so `| let x = 0.0 / 0 | where x == x` keeps the row and `max(x)` over a column holding one answers `NaN`.
+- The two zeros compare equal, so `-0.0` groups with `0.0`.
+- JSON has no spelling for any of them, so the API wire, `-f json` and the SSE stream render `null`. The table and CSV renderers print `inf`, `-inf` and `NaN` under embedded `--data`, the one path that does not cross the JSON wire.
 
 ### extract / rex
 
-Extract fields from text using regex or key-value parsing.
+```text
+extract "<regex>" [from <field>]
+extract kv [sep="<char>"] [from <field>]
+```
 
-**Named capture groups:**
+| Argument | Required | Meaning |
+| --- | --- | --- |
+| `"<regex>"` | One of these two | A pattern whose named capture groups become columns. Backslashes need no doubling. |
+| `kv` | One of these two | Key-value parsing of the source text. |
+| `sep="<char>"` | No | The key-value separator. Default `=`. A value longer than one character falls back to `=`. |
+| `from <field>` | No | The source field. Default `message`. |
 
 ```
+# named capture groups become columns
 extract "(?P<ip>\d+\.\d+\.\d+\.\d+)" from message
-rex "(?P<code>[A-Z]+)" from raw    # rex is an alias for extract
+# the same stage, spelled rex
+rex "(?P<code>[A-Z]+)" from raw
+# key-value pairs, with a different separator and source
+extract kv sep=":" from raw
 ```
 
-**Key-value extraction:**
-
-```
-extract kv                      # from 'message' field
-extract kv from raw             # from a specific field
-```
-
-A kv key starting with `_` is dropped rather than extracted: the `_`
-namespace is trawl's, and a key parsed out of a log line is sender-controlled
-text, so `_severity=17` in a message body would otherwise forge trawl's own
-verdict slot. The text stays findable in the source field and `_raw`.
+- A capture group in the `_` namespace is refused before the query runs, in every lane, and so are two capture groups that fold to one name.
+- A kv key is alphanumerics, `_` and `.`, starting with an alphanumeric or `_`. A kv value is a double-quoted string, or a run ending at whitespace or a comma.
+- A kv key starting with `_` is dropped, and its text stays findable in the source field and `_raw`.
+- `extract kv` moves the rest of the pipeline into the kv batch tail. See [Batch and streaming differences](#batch-and-streaming-differences).
 
 ### rename
 
-Rename output columns.
+```text
+rename <field> as <name>[, <field> as <name> ...]
+```
 
 ```
+# one column
 rename service as svc
+# several columns
 rename service as svc, host as hostname
 ```
 
+The new name carries the old name's catalog pin. A new name in the `_` namespace is a parse error, and two new names that fold to one name in a single stage are a parse error.
+
 ### dedup
 
-Remove duplicate rows. Keeps the most recent.
+```text
+dedup [<field>[, <field> ...]]
+```
 
 ```
-dedup                           # entire row
-dedup host                      # by single field
-dedup host, service             # by multiple fields
+# exact duplicate rows
+dedup
+# one row per host and service
+dedup host, service
 ```
+
+Bare `dedup` keeps distinct whole rows. With fields, `dedup` keeps the row with the latest `_time` in each key group.
 
 ### timechart
 
-Time-bucketed aggregation.
+```text
+timechart [span=<duration>] <agg>[ as <name>][, <agg> ...] [by <field>[, <field> ...]]
+```
 
 ```
+# five-minute buckets
 timechart span=5m count()
+# one series per service
 timechart span=1h count() by service
-timechart span=30s count(), avg(duration)
 ```
+
+The bucket column is always named `_time`, and rows come back in bucket order. Without `span=`, trawl derives the bucket from the `last=` window.
+
+| `last=` window | Bucket |
+| --- | --- |
+| Up to 1 hour, or no `last=` | 1 minute |
+| Up to 6 hours | 5 minutes |
+| Up to 24 hours | 15 minutes |
+| Up to 7 days | 1 hour |
+| Up to 30 days | 6 hours |
+| Longer | 1 day |
 
 ### pivot
 
-Pivot table transformation.
+```text
+pivot <agg> on <field> [by <field>[, <field> ...]]
+```
 
 ```
+# one column per distinct status
 pivot count() on status
+# one column per service, one row per host
 pivot avg(duration) on service by host
 ```
+
+`pivot` takes exactly one aggregate.
 
 ### sample
 
 ```text
+sample <n>%
+sample <n>
+```
+
+| Form | Range | Method |
+| --- | --- | --- |
+| `sample <n>%` | 1 to 100 | Bernoulli. Each row is independently eligible, so the row count is approximate. |
+| `sample <n>` | 1 or more | Reservoir, for a fixed-size sample, limited by the available rows. |
+
+```
+# about a tenth of the rows
 sample 10%
+# up to 1000 rows
 sample 1000
 ```
 
-`sample N%` accepts an integer percentage from 1 through 100 and uses Bernoulli sampling. Each row is independently eligible, so the returned row count is approximate. `sample N` accepts a positive integer count and uses reservoir sampling for a fixed-size sample, limited by the available rows.
-
-There is no DSL seed argument or stable ordering guarantee. A repeated query can return different rows. Sampling is batch SQL only; it is unsupported in live streams and after `extract kv` has moved execution into the Rust tail. Apply other stages in the intended pipeline order; sampling a filtered relation and filtering a sample answer different questions.
+There is no seed argument and no stable ordering, so a repeated query can return different rows. Stage order matters: sampling a filtered relation and filtering a sample answer different questions.
 
 ### eventstats
 
 ```text
-* | eventstats count() as total
-service=nginx | eventstats avg(duration) as service_avg by service
-* | eventstats count() as host_rows, max(duration) as host_max by host
-  | where duration > host_max / 2
+eventstats <agg> as <name>[, <agg> as <name> ...] [by <field>[, <field> ...]]
 ```
 
-`eventstats` preserves the input rows and adds aggregate values using SQL window functions. Without `by`, each aggregate covers all input rows. With `by`, each row receives the aggregate for its group. This differs from `stats`, which reduces each group to an output row.
+```
+# a total on every row
+* | eventstats count() as total
+# compare a row against its group
+* | eventstats max(duration) as host_max by host | where duration > host_max / 2
+```
 
-Every aggregate needs an explicit `as` alias. Output aliases must not collide with each other or with the grouping keys under ASCII case folding. An alias can replace an existing input column that is not a grouping key. Other input columns remain available.
+`eventstats` returns the input rows and adds the aggregate values. Without `by`, each aggregate covers all input rows. With `by`, each row receives its group's aggregate.
 
-`dc`, `distinct_count`, `values`, and `list` are refused in `eventstats`; their DISTINCT forms are not supported by this emitter's window-function contract. Use an accepted aggregate such as `count`, `avg`, or `max`. This stage runs in batch SQL, not live streams or the Rust tail after `extract kv`.
+- Every aggregate needs an explicit `as`.
+- Aliases must not collide with each other or with the grouping keys, under ASCII case folding. An alias naming an existing column replaces it, unless that column is a grouping key.
+- `dc`, `distinct_count`, `values` and `list` are refused. Use an accepted aggregate such as `count`, `avg` or `max`.
 
 ### from saved
 
 ```text
-| from saved daily_errors
-| from saved "hourly-error-count" run=latest | where count > 10
-| from saved daily_errors run=all | stats sum(count) by _run_id
-| from saved daily_errors run=42 | table service, count
+from saved <name> [run=latest|all|<id>]
 ```
 
-Start the query with `from saved` as its first pipe stage, then put filters and transformations after it. A saved-query name is a bare name or quoted string, not a backtick-quoted field name. The source is a materialized report result; Trawl does not execute the saved query again.
+| Argument | Required | Meaning |
+| --- | --- | --- |
+| `<name>` | Yes | A bare name or a quoted string, never a backtick-quoted name. |
+| `run=latest` | No | The newest successful run. The default. |
+| `run=all` | No | Every successful run that has a Parquet result. |
+| `run=<id>` | No | One successful run ID owned by the caller. |
 
-The name must resolve among the caller's saved queries. `run=latest`, also the default when omitted, selects that saved query's newest successful run. It never substitutes an older run merely because the latest has no Parquet result. `run=all` unions its successful runs with Parquet results and adds `_run_id` plus `_run_time`, the run's start time. It omits runs without a Parquet result, including zero-row runs. If no qualifying file-backed runs exist, resolution returns not found.
+```
+# the newest run
+| from saved daily_errors
+# every run, tagged by run
+| from saved daily_errors run=all | stats sum(count) by _run_id
+```
 
-`run=N` selects a successful run ID owned by the caller. The current resolver checks ownership of that run, but does not require it to belong to the named saved query. Use an ID from the intended saved query's run list. A missing, foreign-owned, or unsuccessful run has no readable result through this selector.
+`from saved` must be the query's first pipe stage, and the rest of the pipeline follows it. The source is a materialized report result, so trawl does not execute the saved query again. The name must resolve among the caller's saved queries.
 
-For `latest` or a specific ID, a successful empty result without Parquet becomes an empty relation with the recorded column names. `stats count()` can return zero without borrowing rows from an earlier success. A successful nonempty blob-only result returns a conflict; fetch that run through the report-result API instead. Corrupt success metadata is an error, not an empty result.
+- `run=latest` never substitutes an older run when the latest has no Parquet result.
+- `run=all` adds `_run_id` and `_run_time`, the run's start time. It omits runs without a Parquet result, including zero-row runs, and resolution returns not found when no run qualifies.
+- `run=<id>` checks ownership of that run, and does not require the run to belong to the named saved query, so use an ID from that query's run list. A missing, foreign-owned or unsuccessful run has no readable result.
+- A successful empty result without Parquet becomes an empty relation with the recorded column names, so `stats count()` returns zero.
+- A successful nonempty blob-only result returns a conflict. Fetch that run through the report-result API.
+- Corrupt success metadata is an error, not an empty result.
+- The remaining pipeline starts with no pins. Report columns can be computed values.
 
-This source requires the server's saved-query store. Embedded `--data` and live streams cannot resolve it. The remaining pipeline begins with no live-catalog pins: report columns can be computed values, so their names do not acquire today's event-field types. Read [scheduled reports](/architecture/reports-telemetry/#scheduled-reports) for window and stored-result behavior.
+Read [scheduled reports](/architecture/reports-telemetry/#scheduled-reports) for window and stored-result behavior.
 
 ### Output names must be unique
 
-Every aggregating stage projects a fixed set of columns: its group keys,
-`timechart`'s `_time` bucket, the `count` column `top`/`rare` mint, and
-one column per aggregate — named by its `as` alias, else `count`,
-`avg_duration`, `dc_host`. An un-aliased aggregate over a computed
-argument names its innermost field (`avg(tonumber(rssi) * -1)` →
-`avg_rssi`); the in-memory lanes — live tail, and the batch tail behind
-`extract kv` — refuse that argument outright, because their accumulators
-read a bare field out of the event rather than evaluating an expression.
-Two producers naming one column is refused before the query runs, in
-batch and in a live tail alike, with both producers named:
+Every aggregating stage projects a fixed set of columns: its group keys, `timechart`'s `_time` bucket, the `count` column `top` and `rare` mint, and one column per aggregate. An aggregate takes its `as` alias, otherwise a default name such as `count`, `avg_duration` or `dc_host`. An un-aliased aggregate over a computed argument takes its innermost field name, so `avg(tonumber(rssi) * -1)` is `avg_rssi`.
+
+Two producers naming one column is refused before the query runs, in every lane, with both producers named.
 
 ```
-| stats count() by count        # the group key `count` and the aggregate count()
-| stats count() as n, sum(x) as N   # `n` and `N` are one name (names fold)
-| timechart span=1h count() by _time  # the bucket is always `_time`
-| top 5 count                   # `top` mints its own `count` column
+# the group key `count` and the aggregate count()
+| stats count() by count
+# `n` and `N` are one name: names fold
+| stats count() as n, sum(x) as N
+# the bucket is always `_time`
+| timechart span=1h count() by _time
+# `top` mints its own `count` column
+| top 5 count
 ```
 
-The remedy is usually `as`: `| stats count() as hits by count`. `top` and
-`rare` cannot spell `as`, so write them out —
-`| stats count() as hits by count | sort -hits | head 5`.
+The remedy is usually `as`, as in `| stats count() as hits by count`. `top` and `rare` cannot spell `as`, so write them out: `| stats count() as hits by count | sort -hits | head 5`. The in-memory lanes refuse an un-aliased aggregate over a computed argument outright.
 
-`eventstats` adds its column to every row and therefore **requires** an
-explicit `as`: a live tail cannot know a row's schema before the rows
-arrive. An alias naming a column the rows already carry overwrites it,
-the way `let` does.
+### Query limits
 
-```
-| eventstats avg(duration) as avg_dur by service
-```
+Two fixed limits, checked before anything runs and identical in every lane. Neither is configurable.
 
-### How large a query may be
+| Limit | Value | Counted over |
+| --- | --- | --- |
+| Pipeline stages | 128 | Every stage, including `from saved` and the stages after `extract kv`. The search stage is not a pipeline stage. |
+| Alias expansion | 512 | The whole query. |
 
-Two fixed limits, checked before anything runs and identical in every
-lane (batch, live tail, export, validate, saved queries, scheduled runs).
-Neither is configurable.
+Alias expansion scores one thing: an output of a stage naming an earlier output of the same stage. The database writes that earlier expression into the new one, once for every place the name appears.
 
-- **128 pipeline stages.** Every stage counts, including `from saved` and
-  the stages after `extract kv`. The search stage is not a pipeline stage.
-- **An alias-expansion budget of 512**, summed across the whole query.
+- An expression that names no earlier output of its own stage scores zero, however large it is. Independent assignments, a 500-element `in (...)` list and a long pipeline of separate stages all score zero.
+- Naming the same earlier output many times is charged for the whole expression copied at each use, minus the one reference it replaces. `base = status + 1` has three nodes, so each later `xN = base + N` adds two, and 256 such outputs score 512, exactly the admitted limit.
+- trawl's generated SQL multiplies too. `sev(x) in (1,3,5,7,9,11,13,15,17,19,21,23)` writes its subject twelve times, once per contiguous range of the ladder.
 
-The second one needs a sentence of explanation. When an output of a stage
-names an **earlier output of the same stage**, the database does not read
-a finished column: it writes that earlier expression into the new one,
-once for every place the name appears, and binds the result. Chain a few
-of those and the work multiplies while the query text barely grows.
-`a1 = a0 + a0` costs twice `a0`, `a2 = a1 + a1` costs four times, and by
-`a7` there are 128 copies of the seed. trawl's generated SQL multiplies
-too: `sev(x) in (1,3,5,7,9,11,13,15,17,19,21,23)` writes its subject
-twelve times, once per contiguous range of the severity ladder, so each
-link of a chain built from severity sets is twelve times the last.
-
-The score counts exactly that repetition, and nothing else. An expression
-that names no earlier output of its own stage scores zero, however big it
-is: independent assignments, a 500-element `in (...)` list, a long
-pipeline of separate stages. Naming the same earlier output many times is
-charged for the entire expression copied at each use, minus the one
-reference it replaces. For example, `base = status + 1` has three nodes:
-the addition, the field and the literal. Each later output
-`xN = base + N` adds 3 - 1 = 2 to the score. With 256 such outputs, the
-score is 2 × 256 = 512, exactly the admitted limit. A larger `base`
-expression costs more per use.
-
-Over either limit, the query is refused before it reaches the database,
-naming the stage and the output that crossed the line:
+Over either limit, trawl refuses the query before it reaches the database, naming the stage and the output that crossed the line.
 
 ```text
 pipeline stage 1 (`let`) goes over this query's alias-expansion budget of
@@ -990,334 +833,243 @@ this query has 129 pipeline stages, over the limit of 128; shorten the
 pipeline, or save part of it and read it back with `from saved`
 ```
 
-The remedy is the split the message names. One `| let` per dependent
-step, so the next stage reads a column the previous stage finished:
+One `| let` per dependent step carries no alias expansion, however deep it goes.
 
 ```text
 | let a0 = status + status | let a1 = a0 + a0 | let a2 = a1 + a1
 ```
 
-That form carries no alias expansion at all, however deep it goes; 24
-doublings written this way are ordinary, where the same 24 in one `| let`
-are refused. `stats`, `timechart` and `eventstats` take the same fix from
-the other end: give each output an expression of its own, then derive the
-combined values in a `| let` after the stage.
-
-```text
-| stats count() as hits, avg(duration) as avg_dur by service | let ratio = hits / avg_dur
-```
-
-Splitting bounds what the binder is asked to build. It does not promise
-the optimizer computes a stage once and reuses it: there is no
-materialization guarantee here, and a stage's expression may still be
-evaluated more than once at execution time.
-
-Nothing in the documented examples on this page comes near either limit,
-and none of them names an earlier output of the same stage at all.
+`stats`, `timechart` and `eventstats` take the same fix from the other end: give each output an expression of its own, then derive combined values in a later `| let`. Splitting carries no materialization guarantee, so a stage's expression may still be evaluated more than once.
 
 ## Expressions
 
-Used in `where`, `let`, and aggregation arguments.
+Expressions appear in `where`, `let` and aggregation arguments.
 
-| Type | Examples |
-|------|----------|
+| Kind | Examples |
+| --- | --- |
 | Literals | `42`, `1.5`, `"string"`, `true`, `false`, `null` |
-| Field refs | `host`, `host.name`, `@timestamp` |
-| Arithmetic | `+`, `-`, `*`, `/`, `%` |
+| Field references | `host`, `host.name`, `@timestamp`, `` `request id` `` |
+| Arithmetic | `+`, `-`, `*`, `/`, `%`, unary `-` |
 | Comparison | `==`, `!=`, `>`, `>=`, `<`, `<=` |
 | Logical | `and`, `or`, `not` |
-| Pattern | `matches` (regex) |
+| Pattern | `matches`, `like`, `ilike` |
 | Membership | `x in (1, 2, 3)` |
 | Grouping | `(count + 1) * 2` |
 
-Expressions may nest **16 levels deep**. A nesting level is a
-parenthesised sub-expression, a function call's arguments, or an
-`in (…)` list, so `abs((a + b) * 2)` is two — the call's arguments and
-the inner parentheses. Deeper than the limit is a
-parse error naming the limit — parsing a nesting level costs stack, and
-the query text is chosen by the client, so the recursion is bounded
-rather than left to run a server thread off the end of its stack.
+Precedence runs from lowest to highest: `or`, `and`, `not`, the comparison and pattern operators, `+` and `-`, `*` and `/` and `%`, then unary `-`.
+
+`matches` takes a `/regex/` literal or a string on its right. `like` and `ilike` take a SQL pattern, where `%` matches any run and `_` matches one character.
+
+Expressions may nest 16 levels deep. A nesting level is a parenthesised sub-expression, a function call's arguments, or an `in (...)` list, so `abs((a + b) * 2)` is two levels. Deeper is a parse error naming the limit.
 
 ## Aggregation functions
 
-### Basic stats
-
-| Function | Description |
-|----------|-------------|
-| `count()` | Row count |
-| `count(field)` | Non-null count |
-| `avg(field)` | Mean |
-| `sum(field)` | Total |
-| `min(field)` | Minimum |
-| `max(field)` | Maximum |
-
-### Cardinality
-
-| Function | Description |
-|----------|-------------|
-| `dc(field)` | Distinct count |
-| `distinct_count(field)` | Alias for `dc` |
-
-### Percentiles
-
-| Function | Description |
-|----------|-------------|
-| `p50(field)` | Median (50th percentile) |
-| `p90(field)` | 90th percentile |
-| `p95(field)` | 95th percentile |
-| `p99(field)` | 99th percentile |
-
-### Positional and collection
-
-| Function | Description |
-|----------|-------------|
-| `first(field)` | First value |
-| `last(field)` | Last value |
-| `values(field)` | List of distinct values |
-| `list(field)` | Alias for `values` |
-| `median(field)` | Median value |
-| `stddev(field)` | Standard deviation |
+| Function | Result |
+| --- | --- |
+| `count()` | Row count. |
+| `count(field)` | Non-null count. |
+| `avg(field)` | Mean. |
+| `sum(field)` | Total. |
+| `min(field)`, `max(field)` | Minimum, maximum. |
+| `dc(field)`, `distinct_count(field)` | Distinct count. |
+| `p50(field)`, `p90(field)`, `p95(field)`, `p99(field)` | Percentiles. |
+| `median(field)` | Median value. |
+| `stddev(field)` | Standard deviation. |
+| `first(field)`, `last(field)` | First, last value. |
+| `values(field)`, `list(field)` | List of distinct values. |
 
 ## Scalar functions
 
-Available in `let`/`eval` and `where` expressions.
+Scalar functions are available in `let`, `eval` and `where` expressions.
 
 ### String functions
 
-| Function | Description |
-|----------|-------------|
-| `lower(field)` | Lowercase |
-| `upper(field)` | Uppercase |
-| `length(field)` / `len(field)` | String length |
-| `trim(field)` / `ltrim(field)` / `rtrim(field)` | Whitespace trimming |
-| `replace(field, old, new)` | String replacement |
-| `substr(field, start[, len])` | Substring extraction |
+| Function | Result |
+| --- | --- |
+| `lower(x)`, `upper(x)` | Lowercase, uppercase. |
+| `length(x)`, `len(x)` | String length. |
+| `trim(x)`, `ltrim(x)`, `rtrim(x)` | Whitespace trimming. |
+| `replace(x, old, new)` | String replacement. |
+| `substr(x, start[, len])` | Substring, 1-based and character-based. A negative `start` counts from the end, and a negative `len` is a leftward window. |
+| `concat(a, b, ...)` | Concatenation of one or more arguments. |
+| `contains(x, part)` | Whether `part` occurs in `x`. |
+| `startswith(x, prefix)`, `endswith(x, suffix)` | Prefix and suffix tests. |
+| `split(x, delimiter, index)` | One part of a split, 0-indexed. `index` must be an integer literal. |
 
 ### Numeric functions
 
-| Function | Description |
-|----------|-------------|
-| `abs(x)` | Absolute value |
-| `ceil(x)` / `ceiling(x)` | Round up — always a DOUBLE, even over an integer (`ceil(5)` is `5.0`) |
-| `floor(x)` | Round down — always a DOUBLE, same as `ceil` |
-| `round(x[, n])` | Round to n decimal places — an INTEGER argument stays integral (`round(5)` is `5`), a float stays a float (`round(1.5)` is `2.0`) |
+| Function | Result |
+| --- | --- |
+| `abs(x)` | Absolute value. |
+| `ceil(x)`, `ceiling(x)` | Round up. Always a DOUBLE, even over an integer, so `ceil(5)` is `5.0`. |
+| `floor(x)` | Round down. Always a DOUBLE, like `ceil`. |
+| `round(x[, n])` | Round to `n` decimal places. An integer argument stays integral, so `round(5)` is `5`, and a float stays a float, so `round(1.5)` is `2.0`. `n` must be an integer literal. |
 
 ### Conditional and type functions
 
-| Function | Description |
-|----------|-------------|
-| `if(cond, then, else)` | Ternary conditional — see [Conditions](#conditions) for what counts as true |
-| `isnull(x)` / `isnotnull(x)` | Null checks |
-| `coalesce(a, b, ...)` | First non-null value |
-| `typeof(x)` | Value type name (`"BIGINT"` for an integer, `"DOUBLE"`, `"VARCHAR"`, `"TIMESTAMP"`, …) |
-| `now()` | The query's instant (timezone-naive, wall-clock UTC, microsecond resolution) — one value per unit of output, see [now() and the unit of output](#now-and-the-unit-of-output) |
-| `tonumber(x)` | Cast to float (`null` on parse failure — mirrors `TRY_CAST AS DOUBLE`); a boolean reads as `1.0`/`0.0` |
-| `tostring(x)` | Cast to string (`null` for null/array input) |
-| `sev(x[, dialect])` | Read a value's OTel SeverityNumber (`null` when it has no reading). `dialect` is `"otel"` (default) or `"syslog"` — see [Reading any field as a severity](#reading-any-field-as-a-severity-sev) |
+| Function | Result |
+| --- | --- |
+| `if(cond, then, else)` | Ternary conditional. See [Conditions](#conditions). |
+| `case(cond, then[, cond, then ...][, else])` | The first true arm's value. A trailing odd argument is the else value. |
+| `isnull(x)`, `isnotnull(x)` | Null checks. |
+| `coalesce(a, b, ...)` | First non-null value. |
+| `typeof(x)` | The type name of the value the expression read: `"BIGINT"`, `"DOUBLE"`, `"VARCHAR"`, `"TIMESTAMP"` and the rest. |
+| `now()` | The query's instant, timezone-naive UTC at microsecond resolution. See [now() and the unit of output](#now-and-the-unit-of-output). |
+| `tonumber(x)` | Cast to float, mirroring `TRY_CAST AS DOUBLE`, and `null` on a parse failure. A boolean reads as `1.0` or `0.0`. |
+| `tostring(x)` | Cast to string, and `null` for null or array input. |
+| `sev(x[, dialect])` | The value's OTel SeverityNumber, or `null` when it has no reading. `dialect` is `"otel"` or `"syslog"`. See [Reading any field as a severity](#reading-any-field-as-a-severity-sev). |
 
 #### Conditions
 
-`if()` and `case()` read their condition the way DuckDB casts one to
-BOOLEAN, not as "truthiness":
+`if()` and `case()` read their condition the way DuckDB casts one to BOOLEAN, not as truthiness.
 
-- a **boolean** is itself, and SQL `null` takes the else branch;
-- a **number** is true when it is non-zero — both zeros are false, and
-  `NaN` is true;
-- a **string** reads through DuckDB's closed, case-insensitive
-  vocabulary: `true`/`t`/`yes`/`y`/`1` and `false`/`f`/`no`/`n`/`0`.
-  **Any other string has no reading** — `"nonempty"`, and `" true "`
-  (with the spaces) too, because the cast does not trim;
-- a **timestamp** or a **list** has no boolean cast at all.
+| Condition value | Reading |
+| --- | --- |
+| A boolean | Itself. |
+| SQL `null` | The else branch. |
+| A number | True when non-zero. Both zeros are false, and `NaN` is true. |
+| A string | DuckDB's closed, case-insensitive vocabulary: `true`, `t`, `yes`, `y`, `1`, `false`, `f`, `no`, `n`, `0`. |
+| Any other string | No reading, for `"nonempty"` and for `" true "` alike. The cast does not trim. |
+| A timestamp or a list | No reading. Neither has a boolean cast. |
 
-A condition with no reading has no answer, so the two lanes part exactly
-as they do for an [arithmetic overflow](#arithmetic): the batch lane
-raises a conversion error and the query returns no rows at all
-(`Could not convert string 'nonempty' to BOOL`, or
-`Unimplemented type for cast` for a timestamp or a list), while the
-streaming lane yields `null` for the whole call — `if("nonempty", 1, 2)`
-is `null` there, not `1` — because a live tail cannot raise a per-event
-error without killing the subscription.
+A condition with no reading has no answer, and the lanes part as they do for an [arithmetic overflow](#arithmetic). Batch SQL raises a conversion error and the query returns no rows, reporting `Could not convert string 'nonempty' to BOOL`, or `Unimplemented type for cast` for a timestamp or a list. The streaming lane yields `null` for the whole call, so `if("nonempty", 1, 2)` is `null` there.
 
-`case()` reads its arms in order and stops at the first true one, so an
-unreadable condition after a match is never looked at — but an unreadable
-one reached before any match takes down the whole call, in whichever way
-its lane does, rather than skipping that arm.
+`case()` reads its arms in order and stops at the first true one, so an unreadable condition after a match is never looked at. An unreadable condition reached before any match takes down the whole call in its lane's way, rather than skipping that arm.
 
-`and`, `or`, `not` and the pipeline's `where` gate use a wider predicate:
-anything non-null and non-`false` passes. `if()` and `case()` use the
-BOOLEAN cast rules above.
+`and`, `or`, `not` and the streaming `where` gate use a permissive predicate instead: `null`, `false`, zero, an empty string and an empty list are false, and every other value is true.
 
 #### typeof and large integers
 
-`typeof` returns the type name of the value the expression READ. A wire
-integer above `i64::MAX` is read as a `DOUBLE` — so `typeof(request_id)`
-says `"DOUBLE"` for one — while the value itself keeps its digits
-wherever identity matters: on the wire, in a `dedup` key, and in a
-`stats … by` group.
+`typeof` returns the type name of the value the expression read. A wire integer above `i64::MAX` reads as a `DOUBLE`, so `typeof(request_id)` says `"DOUBLE"` for one. The value keeps its digits where identity matters: on the wire, in a `dedup` key, and in a `stats ... by` group.
 
 #### now() and the unit of output
 
-`now()` is read ONCE per unit of output, not once per call site. Two
-`now()` reads in one statement are always equal, and `typeof(now())` is
-`"TIMESTAMP"` (never `"TIMESTAMP WITH TIME ZONE"`): the instant is
-sampled in trawl and bound as a TIMESTAMP parameter, so its type does not
-depend on the connection.
+`now()` is read once per unit of output, not once per call site. Two `now()` reads in one statement are always equal, and `typeof(now())` is `"TIMESTAMP"`, never `"TIMESTAMP WITH TIME ZONE"`.
 
-What "unit of output" means per lane:
+| Lane | Unit of output |
+| --- | --- |
+| Batch: `trawl query`, `/api/v1/query`, `/api/v1/export` | One instant per logical query invocation. A retried statement, the hot-only cold-start fallback and the kv batch tail all read the instant the first attempt read. |
+| Live pass-through: SSE with no aggregation | Processing time, sampled once per event. Each row is frozen internally, and successive rows advance. `last=`, `earliest=` and `latest=` read that same per-event instant. |
+| Aggregate streams: SSE over `stats`, `timechart`, `top` or `rare` | Stages before the aggregation read the source event's per-event instant. Every row of one emitted snapshot shares one instant, and the next snapshot advances. |
 
-- **batch** (`trawl query`, `/api/v1/query`, `/api/v1/export`): one
-  instant per logical query invocation. A retried statement, the hot-only
-  cold-start fallback and the `rust_stages` tail behind `extract kv` all
-  read the SAME instant as the first attempt — a re-emission of one
-  logical query never re-samples.
-- **live pass-through** (SSE, no aggregation): processing time, sampled
-  once per event. Each row is internally frozen and successive rows
-  advance. The search stage's `last=`/`earliest=`/`latest=` window reads
-  that same per-event instant, so one event cannot be admitted by one
-  clock and evaluated against another.
-- **aggregate streams** (SSE over `stats`/`timechart`/`top`/`rare` — the
-  live compiler's whole aggregate set; `pivot` is refused live, because
-  its dynamic column structure breaks progressive rendering): stages
-  BEFORE the aggregation read the per-event instant of the source event;
-  every row of ONE emitted snapshot shares one instant, and the next
-  snapshot advances.
+- The `last=` window in a batch query evaluates on DuckDB's statement clock, a separate clock from `now()`, and the gap between the two reads is unbounded.
+- Wall-clock sampling carries no monotonic guarantee, so an NTP step backward can put a later event's instant before an earlier one's.
+- An SSE reconnect is a new subscription with a fresh clock, and nothing carries across it.
+- `strftime(now(), ...)` and `tostring(now())` return text. The display timezone offset applies to TIMESTAMP result cells only, and a value the kv batch tail computed renders as UTC text.
 
-Boundaries worth stating plainly:
+### JSON functions
 
-- the search stage's `last=` window in a BATCH query evaluates on
-  DuckDB's own statement clock, a separate clock domain from `now()`:
-  two reads taken at two moments, with no bound on the gap between them
-  (query preparation, thread scheduling and a retry all sit in it);
-- wall-clock sampling makes no monotonic guarantee: NTP can step the
-  clock backward, so a later event's instant can precede an earlier
-  one's;
-- an SSE reconnect is a NEW subscription with a fresh clock — nothing is
-  carried across it;
-- `strftime(now(), …)` and `tostring(now())` return TEXT. The display
-  timezone offset applies to TIMESTAMP result cells only, and a value
-  the `extract kv` tail computed renders as UTC text.
+Nested objects and arrays are stringified at ingest, so a field such as `k8s: {"pod": "x", "ns": "default"}` is stored as JSON text in a `VARCHAR` column, never as a `STRUCT`. Bare text search matches inside that text, which is part of both the column and `_raw`.
 
-### Nested fields (JSON)
-
-Nested objects and arrays are stringified at ingest: a field like `k8s: {"pod": "x", "ns": "default"}` is stored as its JSON text in a `VARCHAR` column (the field catalog pins it as such), never as a `STRUCT`. Reach into it with `json_extract_string`:
+| Function | Result |
+| --- | --- |
+| `json_extract_string(x, path)`, `json(x, path)` | The contents of a JSON string, unquoted: `"x"` becomes `x`. |
+| `json_extract(x, path)` | The value's JSON text. A string keeps its quotes, a number, boolean or `null` is its own text, and an array or object is compact JSON. |
+| `json_valid(x)` | Whether `x` parses as JSON. |
+| `json_keys(x)` | The object's keys. |
+| `json_array_length(x)` | The array's length. |
 
 ```
+# reach into a stringified object
 service=kubelet | eval pod = json_extract_string(k8s, "$.pod") | where isnotnull(pod)
 ```
 
-Bare text search also matches inside the stringified value (it is part of `_raw` and of the column's text).
+On numbers of exotic magnitude, the streaming lane re-renders a number from its `f64` where the query engine renders the source spelling. A value written `1e16` through `1e20`, or an integer with more digits than a 64-bit one holds, can come back spelled differently, as `1e20` against `100000000000000000000`. Values inside those bounds render identically in both lanes.
 
-`json_extract_string` is the UNQUOTING door: it returns a JSON string's
-contents (`"x"` → `x`). `json_extract` returns the value's JSON text —
-for a string that keeps the quotes (`"x"`), for a number, boolean or
-`null` it is the value's own text, and for an array or object it is
-compact JSON. Reach for `json_extract_string` unless you want the JSON.
+## Date and time functions
 
-One residual, on numbers of exotic magnitude: the streaming path
-re-renders a number from its `f64` where the query engine renders the
-source spelling, so a value written `1e16`…`1e20`, or an integer with
-more digits than a 64-bit one holds, can come back spelled differently
-(`1e20` against `100000000000000000000`). Values inside those bounds —
-which is every number a log realistically carries — render identically
-in both paths.
+Date and time functions operate on timestamp values. `_time` is canonicalized to UTC at ingest and stored as a timezone-naive `TIMESTAMP`, so an input `12:00:00+05:30` becomes `06:30:00Z`. The bare sender field `timestamp` is a separate field with its own catalog pin. See [time derivation](/reference/events/#time-derivation) for accepted event-time encodings and [catalog conformance](/architecture/catalog/#write-time-conformance) for custom TIMESTAMP fields.
 
-### Date and time functions
+| Function | Result |
+| --- | --- |
+| `date_part(unit, ts)` | A calendar component, as an integer, or a float for `epoch`. |
+| `date_trunc(unit, ts)` | The start of the period, as a timestamp. |
+| `date_diff(unit, start, end)` | Calendar-unit boundaries crossed, as `end - start`. |
+| `strftime(ts, fmt)` | The timestamp formatted as a string. |
+| `strptime(str, fmt)` | The string parsed as a timestamp, or `null` on failure. |
 
-Date/time functions operate on timestamp values. The event instant `_time` is canonicalized to UTC at ingest and stored as a timezone-naive `TIMESTAMP`: an input `12:00:00+05:30` becomes `06:30:00Z`. The bare sender field `timestamp` is a separate field with its own catalog pin. See [time derivation](/reference/events/#time-derivation) for accepted event-time encodings and [catalog conformance](/architecture/catalog/#write-time-conformance) for custom TIMESTAMP fields.
+The argument order for `strftime` is `(timestamp, format)`, the opposite of C `strftime`. `strptime` returns `null` for a value that does not parse against the format, in both lanes, so one unparseable value is not a query error.
 
-| Function | Description |
-|----------|-------------|
-| `date_part(unit, ts)` | Extract a calendar component (returns integer or float for `epoch`) |
-| `date_trunc(unit, ts)` | Truncate to start of period (returns timestamp) |
-| `date_diff(unit, start, end)` | Count calendar-unit boundaries crossed (`end - start`); `week` is the exception (see note below) |
-| `strftime(ts, fmt)` | Format timestamp as string (chrono `%`-codes) |
-| `strptime(str, fmt)` | Parse string to timestamp (returns `null` on failure) |
+### The unit allowlist
 
-**Note:** the argument order for `strftime` is `(timestamp, format)` — the opposite of C `strftime`. DuckDB's `STRFTIME` is overloaded and accepts this order directly, so it is emitted unchanged.
-
-**Note:** `strptime` returns `null` when a value cannot be parsed against the format — a single unparseable value yields `null`, not a query error. This holds in both the batch path (emitted as DuckDB `TRY_STRPTIME`) and the streaming path.
-
-#### Comparing a timestamp against text
-
-A timestamp compares against a string by reading the string as a
-timestamp — the same cast DuckDB applies to a bound parameter, which
-takes the wall-clock components and DISCARDS any offset
-(`'…T09:00:00+05:30'` is 09:00). A text with **no** reading makes the
-comparison `null`: there is no fallback to string ordering, so
-`t < "zzz"` is unknown rather than true, and a malformed offset like
-`+ab:cd` matches nothing rather than being stripped and ignored.
-
-The accepted differences from the engine's own parser are narrow and
-one-directional (the mirror reads less, never more): zone NAMES beyond
-`UTC`, and years outside chrono's calendar.
-
-#### Infinity timestamps
-
-`infinity` and `-infinity` are values a timestamp can hold, and they read
-from text like any other instant. They order below and above every date,
-render as their own words through `tostring()`, and the date scalars
-treat them exactly as the engine does:
-
-| Function | Answer for `±infinity` |
-|----------|------------------------|
-| `date_part(unit, ts)` | `null`, for every unit including `epoch` |
-| `date_trunc(unit, ts)` | the infinity, unchanged, for every unit |
-| `date_diff(unit, a, b)` | `null` whenever either side is infinite |
-| `strftime(ts, fmt)` | `infinity` / `-infinity`, whatever the format asks for |
-
-#### Date/time unit allowlist
-
-The `unit` argument to `date_part`, `date_trunc`, and `date_diff` must be a **string literal** from the allowed set. Non-literal expressions (field refs, computed values) and unlisted units are rejected before execution in both batch and streaming modes (batch validates at SQL-emit time, streaming at stream-plan compile time).
+The `unit` argument must be a string literal from the allowed set. A non-literal expression and an unlisted unit are refused before execution, in both lanes.
 
 | Function | Allowed units |
-|----------|--------------|
+| --- | --- |
 | `date_part` | `year`, `quarter`, `month`, `week`, `day`, `hour`, `minute`, `second`, `dow`, `doy`, `epoch` |
 | `date_trunc` | `year`, `quarter`, `month`, `week`, `day`, `hour`, `minute`, `second` |
 | `date_diff` | `year`, `quarter`, `month`, `week`, `day`, `hour`, `minute`, `second` |
 
-`dow` = day of week (Sunday = 0 … Saturday = 6). `doy` = day of year (1–366). `epoch` = seconds since Unix epoch (float).
+`dow` is the day of the week, Sunday 0 through Saturday 6. `doy` is the day of the year, 1 through 366. `epoch` is seconds since the Unix epoch, as a float. `date_trunc("week", ts)` truncates to Monday midnight, the ISO 8601 week start.
 
-`date_trunc("week", ts)` truncates to **Monday midnight** (ISO 8601 week start).
+`date_diff` counts boundary crossings for every unit except `week`. For `week`, DuckDB computes the whole number of days between the dates divided by 7, with integer division toward zero.
 
-`date_diff` counts boundary crossings between the two timestamps for `year`, `quarter`, `month`, `day`, `hour`, `minute`, and `second`. The `week` unit is the exception: DuckDB computes it as the whole number of days between the dates divided by 7 (integer division toward zero), **not** week-boundary crossings.
+### Comparing a timestamp against text
 
-#### strftime/strptime format codes
+A timestamp compares against a string by reading the string as a timestamp. That cast takes the wall-clock components and discards any offset, so `'...T09:00:00+05:30'` is 09:00.
 
-Standard C `strftime` codes (`%Y`, `%m`, `%d`, `%H`, `%M`, `%S`, etc.) produce identical output in both batch (DuckDB) and streaming (chrono) paths. chrono operates on a timezone-naive timestamp, so it is **not** locale-dependent — but codes that depend on timezone or locale (`%Z`, `%z`, `%c`, `%x`, `%X`) render empty or fixed under chrono's naive semantics and can differ from DuckDB. Stick to explicit numeric codes for portable output.
+Text with no reading makes the comparison `null`. There is no fallback to string ordering, so `t < "zzz"` is unknown rather than true, and a malformed offset such as `+ab:cd` matches nothing. The streaming lane reads less than the query engine, never more: it declines zone names beyond `UTC`, and years outside chrono's calendar.
 
-`%f` is a **six-digit microsecond** field in both paths: `strftime(ts, "%f")` over `…09:00:00.5` gives `500000`, and a zero fraction gives `000000`. (chrono spells that field `%6f`; the streaming path translates a bare `%f` for you, and leaves an escaped `%%f` alone as the literal it is.) One residual comes with the fixed width: on the way IN, DuckDB reads a fraction of any length (`.5` is half a second) where the streaming path reads exactly six digits and yields `null` for anything else.
+### Infinity timestamps
 
-Invalid format codes, such as `%Q` or a trailing `%`, are rejected before execution in both paths when the format is a string literal.
+`infinity` and `-infinity` are values a timestamp can hold, and they read from text like any other instant. They order below and above every date, and render as their own words through `tostring()`.
 
-**Partial formats:** `strptime` fills the components a format omits from a `1900-01-01 00:00:00` base, identically in the batch (DuckDB) and streaming paths. A **date-only** format (e.g. `%Y-%m-%d`) yields midnight (`00:00:00`); a **time-only** format (e.g. `%H:%M:%S`) yields the `1900-01-01` base date; **year-only** (`%Y` → `2023-01-01 00:00:00`), **year-month** (`%Y-%m` → `2023-11-01 00:00:00`), a bare **month-day** (`%m-%d` → `1900-11-07 00:00:00`), and a date with an *incomplete* time (`%Y-%m-%d %H` → `…14:00:00`) all fill the same way. Exotic or locale-dependent codes follow chrono in the streaming path and may differ from DuckDB: a bare two-digit year (`%y` alone) yields `null` where DuckDB fills the base year, and timezone-offset codes (`%Z`/`%z`) keep chrono's wall-clock time rather than normalizing to UTC. (A two-digit year *with* a month/day, like `%y-%m-%d`, resolves via chrono's pivot and matches DuckDB.)
+| Function | Answer for an infinity |
+| --- | --- |
+| `date_part(unit, ts)` | `null`, for every unit including `epoch`. |
+| `date_trunc(unit, ts)` | The infinity, unchanged, for every unit. |
+| `date_diff(unit, a, b)` | `null` whenever either side is infinite. |
+| `strftime(ts, fmt)` | `infinity` or `-infinity`, whatever the format asks for. |
+
+### Format codes
+
+Standard C `strftime` codes such as `%Y`, `%m`, `%d`, `%H`, `%M` and `%S` produce identical output in both lanes. An invalid code, such as `%Q` or a trailing `%`, is refused before execution in both lanes when the format is a string literal.
+
+- `%Z`, `%z`, `%c`, `%x` and `%X` depend on timezone or locale. The streaming lane operates on a timezone-naive timestamp, so these render empty or fixed and can differ from batch SQL. Use explicit numeric codes for portable output.
+- `%f` is a six-digit microsecond field in both lanes, so `strftime(ts, "%f")` over `...09:00:00.5` gives `500000`, and a zero fraction gives `000000`. The streaming lane translates a bare `%f` to chrono's `%6f` and leaves an escaped `%%f` as the literal it is.
+- On input, batch SQL reads a fraction of any length, so `.5` is half a second, while the streaming lane reads exactly six digits and yields `null` for anything else.
+
+`strptime` fills the components a format omits from a `1900-01-01 00:00:00` base, identically in both lanes. A date-only format such as `%Y-%m-%d` yields midnight, and a time-only format such as `%H:%M:%S` yields the base date. A partial date fills the rest: `%Y` gives `2023-01-01 00:00:00`, `%Y-%m` gives `2023-11-01 00:00:00`, `%m-%d` gives `1900-11-07 00:00:00`, and `%Y-%m-%d %H` gives the named hour with zero minutes and seconds.
+
+Two codes follow chrono in the streaming lane and can differ from batch SQL. A bare two-digit year, `%y`, yields `null` where batch SQL fills the base year, though `%y-%m-%d` resolves through chrono's pivot and matches. `%Z` and `%z` keep chrono's wall-clock time rather than normalizing to UTC.
+
+## Batch and streaming differences
+
+Four lanes answer a query: batch SQL, the live stream (SSE), the kv batch tail behind `extract kv`, and embedded `--data`. The comparison rules are identical in all of them. Stage support is not.
+
+| Stage | Live stream | kv batch tail |
+| --- | --- | --- |
+| `where`, `let`, `table`, `fields`, `drop`, `rename`, `limit`, `head`, `tail`, `dedup`, `extract` | Supported | Supported |
+| `stats`, `timechart`, `top`, `rare` | One aggregation stage per query | Supported |
+| `sort` | Refused: `contradicts real-time arrival order` | Supported |
+| `pivot` | Refused: `dynamic column structure breaks progressive rendering` | Refused |
+| `sample` | Refused: `statistical sampling requires the full dataset` | Refused |
+| `eventstats` | Refused: `window functions require the full dataset` | Refused |
+| `from saved` | Refused: `saved query sources are not supported in streaming mode` | Refused |
+
+- A live stream admits one aggregation stage. A second one is refused with `only one aggregation stage is supported in streaming mode`.
+- Where batch SQL raises a per-value error, the streaming lane yields `null` instead. This covers an integer overflow and an unreadable `if()` or `case()` condition. A live tail cannot raise a per-event error without ending the subscription.
+- Embedded `--data` has no field catalog, so every comparison there is literal-driven. `sev()` still declares its own type.
 
 ## Examples
 
 ```
-# Errors in the last hour by service
+# errors in the last hour, by service
 _severity>=error last=1h | stats count() by service | sort -count
-
-# Slow requests by endpoint
+# slow requests by endpoint
 status=200 last=24h | where duration > 1000 | stats avg(duration) by uri | sort -avg_duration | head 10
-
-# 4xx/5xx rate by host
+# 4xx and 5xx rates by host
 status>=400 last=2h | stats count() by host, status | where count > 10
-
-# Extract IPs and count
+# extract IP addresses and count them
 "connection from" | rex "(?P<ip>\d+\.\d+\.\d+\.\d+)" from message | stats count() by ip | sort -count
-
-# Time series of error rate
+# a time series of the error rate
 _severity>=error | timechart span=5m count() by service
-
-# Dedup flapping alerts
+# collapse flapping alerts
 service=monitoring | dedup host, alert_name
-
-# Pivot status codes by host
+# status codes as columns, hosts as rows
 last=1h | pivot count() on status by host
-
-# Conditional field with null handling
+# a computed field with null handling
 * | eval msg_len = if(isnotnull(message), length(message), 0) | fields host, msg_len | head 10
-
-# Distinct values per group
+# distinct values per group
 * | stats values(_severity), first(message) by service | head 10
 ```
