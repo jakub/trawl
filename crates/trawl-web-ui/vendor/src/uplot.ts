@@ -41,8 +41,8 @@ export interface ChartHandle {
  *
  * The chart paints onto a canvas, so it can't inherit the Mira palette
  * the way the DOM chrome does — the tokens have to be read out and
- * handed to uPlot as literal colours. Resolved once at construction;
- * charts are rebuilt when their host component remounts.
+ * handed to uPlot through color callbacks. Read on mount and whenever
+ * the root theme attribute changes, without replacing the chart.
  */
 function token(name: string, fallback: string): string {
   const v = getComputedStyle(document.documentElement)
@@ -103,9 +103,9 @@ export function createChart(
   data: AlignedData,
   opts: ChartOpts
 ): ChartHandle {
-  const accent = token("--accent", "#2a5c8a");
-  const ink3 = token("--ink-3", "#8a8a8a");
-  const line2 = token("--line-2", "rgba(128,128,128,.2)");
+  let accent = token("--accent", "#2a5c8a");
+  let ink3 = token("--ink-3", "#8a8a8a");
+  let line2 = token("--line-2", "rgba(128,128,128,.2)");
   const mono = token("--font-mono", "monospace");
 
   const bars = opts.kind === "bars";
@@ -136,13 +136,14 @@ export function createChart(
     return [min, max + step];
   };
 
-  const colors = [accent, token("--teal", accent), token("--red", accent),
+  const readColors = () => [accent, token("--teal", accent), token("--red", accent),
     token("--yellow", accent), token("--green", accent), token("--ink", accent)];
+  let colors = readColors();
   const series = [
     { label: opts.rowIndex ? "Result position" : "time" },
     ...seriesLabels.map((label, index) => ({
       label: bars ? label : lineLabel(label, colors[index % colors.length], lineDashes[index % lineDashes.length]),
-      stroke: bars ? accent : colors[index % colors.length],
+      stroke: () => bars ? accent : colors[index % colors.length],
       // uPlot passes dash lengths directly to its device-pixel canvas.
       dash: bars ? [] : lineDashes[index % lineDashes.length].map(length => length * window.devicePixelRatio),
       // Bars are flat fills with NO stroke: uPlot strokes zero-height
@@ -151,7 +152,7 @@ export function createChart(
       width: bars ? 0 : 2,
       ...(bars
         ? {
-            fill: translucent(accent, 0.8),
+            fill: () => translucent(accent, 0.8),
             paths: barPath,
             points: { show: false },
           }
@@ -160,9 +161,9 @@ export function createChart(
   ];
 
   const axisBase = {
-    stroke: ink3,
-    grid: { stroke: line2, width: 1 },
-    ticks: { stroke: line2, width: 1 },
+    stroke: () => ink3,
+    grid: { stroke: () => line2, width: 1 },
+    ticks: { stroke: () => line2, width: 1 },
     font: `10px ${mono}`,
   };
 
@@ -199,12 +200,39 @@ export function createChart(
   };
 
   const chart = new uPlot(options, data, parent);
+  let destroyed = false;
+  const themeObserver = new MutationObserver(() => {
+    if (destroyed) return;
+    accent = token("--accent", "#2a5c8a");
+    ink3 = token("--ink-3", "#8a8a8a");
+    line2 = token("--line-2", "rgba(128,128,128,.2)");
+    colors = readColors();
+    chart.root.querySelectorAll(".series-key line").forEach((line, index) => {
+      line.setAttribute("stroke", colors[index % colors.length]);
+    });
+    if (bars) {
+      chart.root.querySelectorAll<HTMLElement>(".u-legend .u-marker").forEach((marker, index) => {
+        if (index > 0) marker.style.background = translucent(accent, 0.8);
+      });
+    }
+    // Bar paths cache their fill, so rebuild those paths at the current scales.
+    // Keep the chart instance, data, native legend listeners and hidden series.
+    chart.redraw(bars, true);
+    // uPlot commits redraw in a microtask. Refresh hover points after its
+    // cached stroke colors update, including a stationary cursor.
+    queueMicrotask(() => {
+      if (!destroyed) chart.setCursor({ left: chart.cursor.left ?? -10, top: chart.cursor.top ?? -10 }, false);
+    });
+  });
+  themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
 
   return {
     setData(next: AlignedData) {
       chart.setData(next);
     },
     destroy() {
+      destroyed = true;
+      themeObserver.disconnect();
       chart.destroy();
     },
     resize(w: number, h: number) {
