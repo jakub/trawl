@@ -5,7 +5,7 @@ the browser UI, a Service, and optional Ingress, HTTPRoute, ServiceMonitor,
 and crash-dump volume. trawld is single-node, and the chart never scales above
 one replica.
 
-## Install
+## Quick start
 
 You need Kubernetes 1.26 or later, Helm 3, a StorageClass that provides
 `ReadWriteOnce` volumes, PostgreSQL with the `fleet` and `trawl` databases from
@@ -13,18 +13,27 @@ You need Kubernetes 1.26 or later, Helm 3, a StorageClass that provides
 a Secret with the Fleet DSN under key `DATABASE_URL`, and a Secret with the
 Trawl DSN under key `TRAWL_DATABASE_URL`.
 
+This install reaches the browser UI through a local port-forward, so its
+origin is `http://localhost:8090` and it allows insecure cookies. Use an HTTPS
+origin and secure cookies behind a reverse proxy or ingress.
+
 ```bash
 helm upgrade --install trawl oci://ghcr.io/jakub/charts/trawl \
   --namespace trawl --create-namespace \
   --set auth.database.existingSecret=fleet-db \
   --set storage.database.existingSecret=trawl-db \
-  --set-string 'web.publicOrigins[0]=https://trawl.example.com'
+  --set-string 'web.publicOrigins[0]=http://localhost:8090' \
+  --set web.allowInsecureCookies=true
+
+kubectl port-forward --namespace trawl svc/trawl 5514:5514 8090:8090
 ```
 
+Open `http://localhost:8090` and sign in with a key from
+[Create roles and keys](https://trawl.sh/operate/access/#create-roles-and-keys).
 `web.publicOrigins` is required while `web.enabled` is true, and the render
 fails without it. Set `web.enabled=false` for an API-only install.
 [Install with Helm](https://trawl.sh/operate/deployment/#install-with-helm)
-covers the values file, ingress, and verification.
+covers a values file, an ingress with an HTTPS origin, and verification.
 
 ## Values
 

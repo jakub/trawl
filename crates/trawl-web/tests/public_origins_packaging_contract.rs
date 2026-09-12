@@ -2,13 +2,13 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The `public_origins` packaging contract (ADR-0016).
+//! The `public_origins` packaging contract.
 //!
 //! `[web] public_origins` has no default: an install that does not state
 //! its browser-visible origin does not start. That makes every packaged
 //! spelling of the knob load-bearing, and a wrong one is not a typo but an
-//! outage. Three artifacts state it — the Debian `trawld.toml`, the
-//! configuration reference, and the Helm chart — and this file feeds each
+//! outage. Four artifacts state it: the Debian `trawld.toml`, the
+//! configuration reference, the operator guides, and the Helm chart. This file feeds each
 //! of them to the real parsers rather than eyeballing them.
 //!
 //! Precedent: `crates/trawl-web/tests/log_filter_contract.rs` and
@@ -148,8 +148,17 @@ fn every_documented_example_loads() {
         !examples.is_empty(),
         "the configuration reference must show public_origins at all"
     );
-    let runbook = read("docs/src/content/docs/reference/fleet-auth-cutover.md");
-    for entries in examples.iter().chain(&declared_origin_lists(&runbook)) {
+    let access = read("docs/src/content/docs/operate/access.md");
+    let deployment = read("docs/src/content/docs/operate/deployment.md");
+    let guides = declared_origin_lists(&access)
+        .into_iter()
+        .chain(declared_origin_lists(&deployment))
+        .collect::<Vec<_>>();
+    assert!(
+        !guides.is_empty(),
+        "the operator guides must show public_origins at all"
+    );
+    for entries in examples.iter().chain(&guides) {
         assert!(!entries.is_empty(), "an empty example teaches nothing");
         PublicOrigins::parse(entries)
             .unwrap_or_else(|e| panic!("the docs document an unloadable list {entries:?}: {e}"));
@@ -240,7 +249,7 @@ fn the_chart_quick_start_forwards_the_port_its_origin_names() {
     // fail in a way that looks like the CSRF guard misfiring.
     let readme = read("chart/trawl/README.md");
     let quick_start = readme
-        .split("## Quick Start")
+        .split("## Quick start")
         .nth(1)
         .expect("the README must have a quick start")
         .split("\n## ")
