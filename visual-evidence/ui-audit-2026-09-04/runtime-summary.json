@@ -1,0 +1,257 @@
+{
+  "source_commit": "a9628da7c73be7e397b83aeabbe5bd4f29787627",
+  "build_command": "CARGO_TARGET_DIR=/home/jakub/code/trawl/target/app-experiment cargo build --no-default-features -p trawl-server -p trawl-web",
+  "build_result": "exit 0, 21.81 seconds",
+  "dirty_marker_reason": "Untracked .audit-runtime files, no tracked source diff",
+  "daemon_sha256": "ef184479190e73f6404902094e215e36978050b367204ff5c2ea8d594d1d1053",
+  "proxy_sha256": "512647a6f7cd3c39c60f152675d86a71671eec69c6baea6c1998a29e9a67d678",
+  "daemon_port": 15514,
+  "proxy_port": 18090,
+  "postgres_port": 15439,
+  "postgres_container": "trawl-ui-audit-pg-20260904",
+  "postgres_image": "postgres:18",
+  "initial_events": 240,
+  "initial_service_counts": {
+    "auth": 80,
+    "nginx": 80,
+    "payments": 80
+  },
+  "saved_queries": [
+    {
+      "id": 1,
+      "name": "audit-errors"
+    },
+    {
+      "id": 2,
+      "name": "audit-service-volume",
+      "schedule": "1h disabled",
+      "report_run": 1,
+      "report_status": "success",
+      "report_rows": 3
+    }
+  ],
+  "backend_provenance_note": "Initial fixture setup used existing 29788ae4 dirty binary; before resumed browser testing both daemon and proxy were rebuilt from audit commit and restarted. Current boot and query succeeded against fixture database.",
+  "final_counts": {
+    "columns": [
+      {
+        "name": "service"
+      },
+      {
+        "name": "count"
+      }
+    ],
+    "rows": [
+      [
+        "payments",
+        80
+      ],
+      [
+        "nginx",
+        119
+      ],
+      [
+        "auth",
+        80
+      ]
+    ],
+    "truncated": false,
+    "pagination": {
+      "limit": 100000,
+      "offset": 0,
+      "returned": 3
+    }
+  },
+  "final_saved": {
+    "queries": [
+      {
+        "id": 3,
+        "name": "audit-browser-volume",
+        "query": "last=24h | stats count() by service",
+        "created_at": "2026-09-05T06:18:31.013235+00:00",
+        "updated_at": "2026-09-05T06:18:31.013235+00:00",
+        "schedule": {
+          "id": 2,
+          "saved_query_id": 3,
+          "interval": "1h",
+          "interval_secs": 3600,
+          "enabled": true,
+          "created_at": "2026-09-05T06:20:07.574066+00:00",
+          "updated_at": "2026-09-05T06:20:07.574066+00:00",
+          "last_run": {
+            "id": 3,
+            "query": "last=24h | stats count() by service",
+            "status": "success",
+            "started_at": "2026-09-05T06:20:07.893626+00:00",
+            "finished_at": "2026-09-05T06:20:07.923908+00:00",
+            "duration_ms": 3,
+            "row_count": 3,
+            "result_path": "scheduled/audit-browser-volume/run_3.parquet"
+          },
+          "total_runs": 2,
+          "next_fire_at": "2026-09-05T07:20:07.573524Z"
+        }
+      },
+      {
+        "id": 1,
+        "name": "audit-errors",
+        "query": "_severity>=error last=24h | head 100",
+        "created_at": "2026-09-05T06:16:41.198195+00:00",
+        "updated_at": "2026-09-05T06:16:41.198195+00:00"
+      },
+      {
+        "id": 2,
+        "name": "audit-service-volume",
+        "query": "last=24h | stats count() by service",
+        "created_at": "2026-09-05T06:16:41.209709+00:00",
+        "updated_at": "2026-09-05T06:16:41.209709+00:00",
+        "schedule": {
+          "id": 1,
+          "saved_query_id": 2,
+          "interval": "1h",
+          "interval_secs": 3600,
+          "enabled": false,
+          "created_at": "2026-09-05T06:17:19.990332+00:00",
+          "updated_at": "2026-09-05T06:17:19.990332+00:00",
+          "last_run": {
+            "id": 1,
+            "query": "last=24h | stats count() by service",
+            "status": "success",
+            "started_at": "2026-09-05T06:17:20.007471+00:00",
+            "finished_at": "2026-09-05T06:17:20.025649+00:00",
+            "duration_ms": 3,
+            "row_count": 3,
+            "result_path": "scheduled/audit-service-volume/run_1.parquet"
+          },
+          "total_runs": 1,
+          "next_fire_at": "2026-09-05T06:17:19.990110Z"
+        }
+      }
+    ]
+  },
+  "final_schema": {
+    "columns": [
+      {
+        "name": "_time",
+        "type": "TIMESTAMP"
+      },
+      {
+        "name": "env",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "service",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "host",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "_severity",
+        "type": "SEVERITY"
+      },
+      {
+        "name": "message",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "latency_ms",
+        "type": "BIGINT"
+      },
+      {
+        "name": "level",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "path",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "request_id",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "status",
+        "type": "BIGINT"
+      },
+      {
+        "name": "timestamp",
+        "type": "TIMESTAMP"
+      },
+      {
+        "name": "user_id",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "_raw",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "_ingested",
+        "type": "TIMESTAMP"
+      },
+      {
+        "name": "_repairs",
+        "type": "VARCHAR"
+      },
+      {
+        "name": "_producer",
+        "type": "VARCHAR"
+      }
+    ],
+    "file_count": 3,
+    "cached": false,
+    "earliest_date": "2026-09-05",
+    "latest_date": "2026-09-05",
+    "total_bytes": 27461,
+    "services": [
+      "auth",
+      "nginx",
+      "payments"
+    ],
+    "hot_buffer_events": 0,
+    "hot_buffer_bytes": 0
+  },
+  "fixture_runs": {
+    "runs": [
+      {
+        "id": 1,
+        "query": "last=24h | stats count() by service",
+        "status": "success",
+        "started_at": "2026-09-05T06:17:20.007471+00:00",
+        "finished_at": "2026-09-05T06:17:20.025649+00:00",
+        "duration_ms": 3,
+        "row_count": 3,
+        "result_path": "scheduled/audit-service-volume/run_1.parquet"
+      }
+    ],
+    "total": 1
+  },
+  "cleanup": {
+    "daemon_exit": 0,
+    "proxy_exit": 143,
+    "removed_container": "trawl-ui-audit-pg-20260904",
+    "removed_secrets": [
+      "admin-token",
+      "session-key",
+      "tls/key.pem"
+    ],
+    "verified_absent_listeners": [
+      15439,
+      15514,
+      18090
+    ],
+    "existing_dev_containers_unchanged": [
+      {
+        "name": "fleet-auth-dev-nd",
+        "id": "4c5916e715b5",
+        "status": "Up 6 hours"
+      },
+      {
+        "name": "fleet-auth-dev",
+        "id": "a881c1f37415",
+        "status": "Up 6 hours"
+      }
+    ]
+  }
+}
