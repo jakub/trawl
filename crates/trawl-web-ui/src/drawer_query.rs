@@ -66,6 +66,13 @@ pub struct Cardinality {
     pub fields: Vec<String>,
 }
 
+/// The alias of the i-th emitted expression. [`cardinality_query`]
+/// mints it and [`decode_cardinality`] demands it back, so the two read
+/// it from here and cannot drift apart.
+fn alias(i: usize) -> String {
+    format!("c{i}")
+}
+
 /// `dc(<field>) as c<i>`, one per field the renderer can spell.
 ///
 /// The alias is the field's POSITION, never its name. Every service
@@ -85,9 +92,9 @@ pub fn cardinality_query(svc: &str, fields: &[String]) -> Option<Cardinality> {
         .iter()
         .filter_map(|field| {
             let rendered = trawl_core::parser::suggest::quote_dsl_field(field)?;
-            let i = emitted.len();
+            let alias = alias(emitted.len());
             emitted.push(field.clone());
-            Some(format!("dc({rendered}) as c{i}"))
+            Some(format!("dc({rendered}) as {alias}"))
         })
         .collect();
     if expressions.is_empty() {
@@ -105,22 +112,34 @@ pub fn cardinality_query(svc: &str, fields: &[String]) -> Option<Cardinality> {
 
 /// Read a cardinality response back onto its field names BY POSITION.
 ///
-/// The response's column names are ignored: they are the aliases
-/// [`cardinality_query`] minted, which deliberately say nothing about
-/// the fields. `fields` must be the list that came back beside the DSL.
+/// The column names say nothing about the fields — they are the
+/// positional aliases [`cardinality_query`] minted — but they are still
+/// checked: the i-th column must be named [`alias`]`(i)`, so a response
+/// whose columns were reordered or came from some other query cannot be
+/// zipped onto this field list. `fields` must be the list that came back
+/// beside the DSL.
 ///
 /// A response that does not answer this field list — a different column
-/// count, or a first row with a different number of cells — yields an
-/// empty map rather than a partial one, because zipping a mismatched
-/// response would key counts onto the wrong fields. A cell no count can
-/// be read from (a null) is skipped, and that field renders as unknown
-/// rather than as zero.
+/// count, a column under an unexpected name, or a first row with a
+/// different number of cells — yields an empty map rather than a partial
+/// one, because zipping a mismatched response would key counts onto the
+/// wrong fields. A cell no count can be read from (a null) is skipped,
+/// and that field renders as unknown rather than as zero.
 pub fn decode_cardinality(
     resp: &trawl_api::QueryResponse,
     fields: &[String],
 ) -> std::collections::HashMap<String, u64> {
     let mut out = std::collections::HashMap::new();
     if resp.result.columns.len() != fields.len() {
+        return out;
+    }
+    if resp
+        .result
+        .columns
+        .iter()
+        .enumerate()
+        .any(|(i, column)| column.name != alias(i))
+    {
         return out;
     }
     let Some(row) = resp.result.rows.first() else {
@@ -212,7 +231,8 @@ mod tests {
     }
 
     /// A response with the builder's field list. Column NAMES are
-    /// deliberately not the field names: the decoder must not read them.
+    /// deliberately not the field names: they are the positional
+    /// aliases, and the decoder demands exactly those.
     fn response(
         columns: &[&str],
         rows: Vec<Vec<trawl_api::value::Value>>,
@@ -291,11 +311,11 @@ mod tests {
             .map(|s| (*s).to_string())
             .collect();
 
-        // Garbage column names, and a null cell: the null field is
+        // The builder's aliases, and a null cell: the null field is
         // absent from the map rather than counted as zero.
         let map = decode_cardinality(
             &response(
-                &["x", "y", "z"],
+                &["c0", "c1", "c2"],
                 vec![vec![Value::Integer(1200), Value::Integer(5), Value::Null]],
             ),
             &fields,
@@ -305,7 +325,24 @@ mod tests {
         assert_eq!(map.get("duration"), None);
 
         // A response that does not answer this field list yields nothing
-        // at all: a partial map would key counts onto the wrong fields.
+        // at all: a partial map would key counts onto the wrong fields,
+        // and so would a right-width response under other names.
+        let reordered = response(
+            &["c1", "c0", "c2"],
+            vec![vec![
+                Value::Integer(1),
+                Value::Integer(2),
+                Value::Integer(3),
+            ]],
+        );
+        let garbage_names = response(
+            &["x", "y", "z"],
+            vec![vec![
+                Value::Integer(1),
+                Value::Integer(2),
+                Value::Integer(3),
+            ]],
+        );
         let too_many = response(
             &["c0", "c1", "c2", "c3"],
             vec![vec![
@@ -324,7 +361,14 @@ mod tests {
             vec![vec![Value::Integer(1), Value::Integer(2)]],
         );
         let no_rows = response(&["c0", "c1", "c2"], Vec::new());
-        for resp in [&too_many, &too_few, &short_row, &no_rows] {
+        for resp in [
+            &reordered,
+            &garbage_names,
+            &too_many,
+            &too_few,
+            &short_row,
+            &no_rows,
+        ] {
             assert!(decode_cardinality(resp, &fields).is_empty());
         }
     }
