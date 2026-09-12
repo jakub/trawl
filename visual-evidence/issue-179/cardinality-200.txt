@@ -1,0 +1,55 @@
+# issue #179 — the service cardinality request against a real trawld
+
+Source: branch fix/issue-179-web-ui-service-cardinality-query at 5c7caa74eca93df8482404f594826612b8adf912.
+Stack: bin/app-experiment --seed 179 --events 300 --rate 100 --hold-seconds 1500
+(disposable Postgres + trawld + trawl-web + the release SPA built from this checkout),
+run run-1789248120853-37746ecce1. Captured 2026-09-12 during the hold. The browser was driven by
+a throwaway Playwright script against the served SPA; requests were recorded from the
+page's own network traffic. Credentials were removed at teardown and appear nowhere here.
+
+## 1. What the built SPA sent, and what the server answered
+
+Opened /search/schema?svc=web&stab=overview. The service schema lists 15 columns, led by
+_time and including _severity, _raw, _ingested and _producer (all reserved names).
+
+POST /api/v1/query (from the SPA), request body query:
+service="web" last=7d | stats dc(_time) as c0, dc(env) as c1, dc(service) as c2, dc(host) as c3, dc(_severity) as c4, dc(message) as c5, dc(experiment_run) as c6, dc(experiment_seq) as c7, dc(latency_ms) as c8, dc(level) as c9, dc(status) as c10, dc(timestamp) as c11, dc(_raw) as c12, dc(_ingested) as c13, dc(_producer) as c14
+
+HTTP 200
+columns: c0 c1 c2 c3 c4 c5 c6 c7 c8 c9 c10 c11 c12 c13 c14
+rows[0]:  0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+
+Every count is zero because the experiment corpus stamps every event with
+timestamp 2026-01-01T12:00:00Z (corpus.ndjson), outside the builder's fixed last=7d.
+That is a property of the seeded workload, not of the query: the same statement
+without the range, sent directly to the upstream API with the same key:
+
+POST https://127.0.0.1:39653/api/v1/query
+query: service="web" | stats dc(_time) as c0, dc(host) as c1
+HTTP 200
+{"columns":[{"name":"c0"},{"name":"c1"}],"rows":[[1,8]],"truncated":false,"pagination":{"limit":1,"offset":0,"returned":1}}
+
+## 2. The spelling this issue replaces, same server, same key
+
+query: service="web" last=7d | stats dc(_time) as _time
+HTTP 400
+{"error":{"code":"parse_error","message":"'_time' is in trawl's reserved namespace — names starting with '_' are trawl's contract slots and only trawl writes them; choose a name without the underscore","details":[{"message":"'_time' is in trawl's reserved namespace — names starting with '_' are trawl's contract slots and only trawl writes them; choose a name without the underscore","span":{"start":43,"end":48}}]}}
+
+## 3. A service with no events (the decoder's arity guard)
+
+query: service="nomatch" last=7d | stats dc(_time) as c0, dc(host) as c1, dc(`request id`) as c2
+HTTP 200
+{"columns":[],"rows":[],"truncated":false,"pagination":{"limit":1,"offset":0,"returned":0}}
+
+The server answers an unknown service with no columns at all. decode_cardinality sees
+0 columns against 3 fields and returns an empty map; the card reads
+"No distinct values observed yet". No panic, no partial map.
+
+## 4. Rendered state during the hold
+
+Overview card "TOP FIELDS BY CARDINALITY" read "No distinct values observed yet", which is
+the correct rendering of an all-zero row (zero counts are dropped by top_cardinality_rows).
+Before this branch the same card read "Couldn't load cardinality: server returned 400".
+The rendered non-zero case is pinned by the Playwright case
+"service cardinality reaches every column, including the reserved _time" in
+crates/trawl-web-ui/e2e/tests/batch2-feedback.spec.ts over the corpus fixture.

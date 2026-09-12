@@ -162,12 +162,14 @@ export function corpusQueryRowsResponse() {
   return wire('query-rows');
 }
 
-/** The service drawer's cardinality read. The columns are `_time` and
- * `status`, because the drawer builds `dc(<field>) as <field>` per column
- * of the service it mounted and reads the answer back BY COLUMN NAME.
- * The corpus service's third column, `duration`, is deliberately absent:
- * a column with no count is skipped by `top_cardinality_rows`, so the
- * overview card lists the same two rows it always did. */
+/** The service drawer's cardinality read. Its columns are `c0`, `c1` and
+ * `c2`, because the drawer builds `dc(<field>) as c<i>` per column of the
+ * service it mounted and reads the answer back BY POSITION — a field name
+ * cannot be an alias, since `_time` is reserved. So the columns stand for
+ * `service-schema-corpus.json`'s columns in order: `_time`, `status`,
+ * `duration`. The third count is null on purpose: a field with no count is
+ * skipped by `top_cardinality_rows`, so the overview card lists two rows
+ * and the Fields tab shows `duration` as unknown. */
 export function corpusCardinalityResponse() {
   return wire('query-cardinality');
 }
