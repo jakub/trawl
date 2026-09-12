@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-import { test, expect } from '../fixtures';
+import { test, expect, CORPUS } from '../fixtures';
 
 test('failed edits stay available, announce through the existing host and leave focus in the form', async ({ page, request }) => {
   await request.post('/__ctl/reset', { data: { scenario: 'corpus' } });
@@ -206,6 +206,28 @@ for (const [tab, queryPart, errorLabel, readySelector] of [
     expect(page.url()).toBe(url);
   });
 }
+
+test('service cardinality reaches every column, including the reserved _time', async ({ page, request }) => {
+  await request.post('/__ctl/reset', { data: { scenario: 'corpus' } });
+  await page.goto('/search/schema?svc=nginx&stab=overview');
+  // `_time` leads every service schema and is a reserved name, so an
+  // alias spelled after the field failed the whole statement and the
+  // card rendered its error arm for all three columns.
+  const top = page.locator('.topfields .tf');
+  await expect(top.first()).toBeVisible();
+  await expect(top.filter({ hasText: CORPUS.topCardinalityField })).toHaveCount(1);
+
+  await page.goto('/search/schema?svc=nginx&stab=fields');
+  const rows = page.locator('.sf-row');
+  await expect(rows).toHaveCount(3);
+  const card = (name: string) =>
+    rows.filter({ has: page.locator('.c-name', { hasText: new RegExp(`^${name}$`) }) }).locator('.c-card');
+  await expect(card('_time')).toHaveText('1.2k');
+  await expect(card('status')).toHaveText('5');
+  // The fixture answers `duration` with a null count, which is unknown
+  // rather than zero.
+  await expect(card('duration')).toHaveText('…');
+});
 
 for (const detail of [false, true]) {
   test(`net ${detail ? 'run result' : 'runs list'} retries in its open drawer`, async ({ page, request }) => {
