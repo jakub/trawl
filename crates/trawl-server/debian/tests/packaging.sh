@@ -14,7 +14,7 @@ cargo_toml="$repo_root/crates/trawl-server/Cargo.toml"
 imp_rs="$repo_root/crates/trawl-crashdump/src/imp.rs"
 values_yaml="$repo_root/chart/trawl/values.yaml"
 docs_page="$repo_root/docs/src/content/docs/reference/crash-dumps.md"
-cutover_page="$repo_root/docs/src/content/docs/reference/fleet-auth-cutover.md"
+access_page="$repo_root/docs/src/content/docs/operate/access.md"
 asset_dest="usr/share/doc/trawl-server/examples/crashdump.conf"
 
 fail() {
@@ -276,21 +276,21 @@ $hit"
   fi
 done
 
-# The fleet SSO runbook tells an operator to overwrite that same key by hand,
-# which bypasses tmpfiles entirely. If it keeps saying 0600, following it leaves
-# a key trawl-web cannot read and a proxy that will not start.
-if [[ ! -f "$cutover_page" ]]; then
-  fail "docs/src/content/docs/reference/fleet-auth-cutover.md is missing — it carries the by-hand key install that has to agree with the packaged mode"
+# The access guide tells an operator to overwrite that same key by hand for a
+# shared session, which bypasses tmpfiles entirely. If it says 0600, following
+# it leaves a key trawl-web cannot read and a proxy that will not start.
+if [[ ! -f "$access_page" ]]; then
+  fail "docs/src/content/docs/operate/access.md is missing — it carries the by-hand key install that has to agree with the packaged mode"
 fi
-# Mode-form agnostic on purpose: the runbook installs the key rather than
+# Mode-form agnostic on purpose: the guide installs the key rather than
 # chmodding it, and the next rewrite may reach for something else again. What
 # has to hold is that the line putting the key in place names 0640 and no line
 # putting it in place names 0600.
-if ! grep -E '/var/lib/trawl/web\.cookie' "$cutover_page" | grep -Eq '(^|[^0-9])0640([^0-9]|$)'; then
-  fail "docs/src/content/docs/reference/fleet-auth-cutover.md does not put /var/lib/trawl/web.cookie in place as 0640 — trawl-web reads it through the trawl group and a key it cannot read stops the proxy starting"
+if ! grep -E '/var/lib/trawl/web\.cookie' "$access_page" | grep -Eq '(^|[^0-9])0640([^0-9]|$)'; then
+  fail "docs/src/content/docs/operate/access.md does not put /var/lib/trawl/web.cookie in place as 0640 — trawl-web reads it through the trawl group and a key it cannot read stops the proxy starting"
 fi
-if grep -E '/var/lib/trawl/web\.cookie' "$cutover_page" | grep -Eq '(^|[^0-9])0?600([^0-9]|$)'; then
-  fail "docs/src/content/docs/reference/fleet-auth-cutover.md still puts the session key in place as 600 — that predates the trawl-web user split"
+if grep -E '/var/lib/trawl/web\.cookie' "$access_page" | grep -Eq '(^|[^0-9])0?600([^0-9]|$)'; then
+  fail "docs/src/content/docs/operate/access.md still puts the session key in place as 600 — that predates the trawl-web user split"
 fi
 if ! grep -Eq '^[[:space:]]*systemd-tmpfiles[[:space:]]+--create[[:space:]]+trawl\.conf' "$postinst"; then
   fail "crates/trawl-server/debian/postinst does not run 'systemd-tmpfiles --create trawl.conf' — nothing would create '$dir_value' at install time"

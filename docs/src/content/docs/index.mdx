@@ -1,77 +1,67 @@
 ---
-title: trawl
-description: Self-hosted log collection, storage, and search for homelabs and small-to-medium infra.
-template: splash
-hero:
-  title: trawl
-  tagline: Self-hosted log collection, storage, and search. Splunk-like DSL, zero licensing cost, single binary.
-  image:
-    file: ../../assets/trawl.png
-    alt: trawl logo — a fishing trawler
-  actions:
-    - text: Get Started
-      link: /getting-started/
-      icon: right-arrow
-      variant: primary
-    - text: DSL Reference
-      link: /reference/dsl/
-      icon: open-book
-      variant: secondary
-    - text: GitHub
-      link: https://github.com/jakub/trawl
-      icon: external
-      variant: minimal
+title: Know what your systems are saying.
+description: Collect, search, and operate your logs with Trawl.
+tableOfContents: false
 ---
 
-import { Card, CardGrid } from '@astrojs/starlight/components';
+<p class="lead">Trawl collects logs from your systems and searches them with a pipeline query language. It is for one person or a small team who wants answers about their own infrastructure from a browser, a terminal, or a script.</p>
 
-<CardGrid>
-  <Card title="Pipeline DSL" icon="pencil">
-    Splunk-inspired query language with 14 pipe stages, 17 aggregation functions, and full regex/glob support.
-    Filter, aggregate, extract, and visualize — all from one query string.
-  </Card>
-  <Card title="Instant ingest" icon="rocket">
-    Events are queryable within milliseconds of ingest via the hot buffer.
-    No waiting for indexing — search your logs the moment they arrive.
-  </Card>
-  <Card title="Parquet + DuckDB" icon="seti:db">
-    Columnar storage with vectorized analytical queries.
-    Your data stays in open formats, queryable by any tool.
-  </Card>
-  <Card title="Single binary" icon="laptop">
-    One daemon, one CLI. No JVM, no Elasticsearch cluster, no Kubernetes.
-    Runs on a Raspberry Pi or a 64-core server.
-  </Card>
-</CardGrid>
+<div class="entry-paths">
+  <section>
+    <h2>Get an answer</h2>
+    <p>Fastest path first.</p>
+    <ul>
+      <li><a href="/start/connect/">Connect to a Trawl server</a>, about 2 minutes</li>
+      <li><a href="/start/local-parquet/">Query local Parquet files</a>, about 5 minutes</li>
+      <li><a href="/getting-started/">Install Trawl</a> and <a href="/getting-started/first-query/">run your first query</a>, about 20 minutes</li>
+    </ul>
+  </section>
+  <section>
+    <h2>Run an installation</h2>
+    <p>Send logs, manage access, and keep storage healthy.</p>
+    <ul>
+      <li><a href="/operate/deployment/">Choose a deployment</a></li>
+      <li><a href="/operate/ingestion/">Connect your log sources</a></li>
+      <li><a href="/operate/health/">Diagnose an unhealthy server</a></li>
+    </ul>
+  </section>
+  <section>
+    <h2>Work on Trawl</h2>
+    <p>Find the code and run the right checks.</p>
+    <ul>
+      <li><a href="/getting-started/development/">Start local development</a></li>
+      <li><a href="/architecture/overview/">Understand the components</a></li>
+      <li><a href="/contribute/testing/">Test a change</a></li>
+    </ul>
+  </section>
+</div>
 
-## Quick taste
+## Start with a question
 
-```bash
-# errors in the last hour, grouped by service
-trawl query "_severity>=error last=1h | stats count() by service | sort -count"
+Which services logged errors in the last hour?
 
-# slow requests by endpoint
-trawl query "status=200 last=24h | where duration > 1000 | stats avg(duration) by uri | sort -avg_duration | head 10"
-
-# live tail with filtering
-trawl query "service=nginx _severity>=error" --stream
-
-# query local parquet files directly (no server needed)
-trawl query --data 'data/**/*.parquet' "* | stats count() by service"
+```text
+_severity>=error last=1h
+| stats count() as errors by service
+| sort -errors
 ```
 
-## Install
+<div class="query-result">
+The search selects the last hour's errors, <code>stats</code> counts them by service, and <code>sort</code> puts the largest first. Run it in the browser or with <code>trawl query</code>.
+</div>
 
-```bash
-# Debian/Ubuntu (APT repository)
-curl -fsSL https://trawl.sh/gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/trawl.gpg
-echo "deb [signed-by=/usr/share/keyrings/trawl.gpg] https://trawl.sh/apt stable main" \
-  | sudo tee /etc/apt/sources.list.d/trawl.list
-sudo apt update && sudo apt install trawl trawld
+[Build a query](/use/query-tutorial/) adds filters, columns, and summaries.
+The [DSL reference](/reference/dsl/) has the exact syntax.
 
-# From GitHub releases
-curl -fsSL https://github.com/jakub/trawl/releases/latest/download/trawl-v0.1.8-x86_64-unknown-linux-gnu.tar.gz \
-  | tar xz
-```
+## Choose how much to run
 
-See the [installation guide](/getting-started/) for more options.
+The `trawl` CLI reads local Parquet with no server. A log installation adds
+`trawld`, PostgreSQL, and `trawl-web` for browser access, on one node with no
+clustering or multi-tenancy. See [requirements and components](/start/overview/).
+
+## Keep these references nearby
+
+- [Event fields and repairs](/reference/events/): what ingest stores.
+- [CLI](/reference/cli/) and [HTTP API](/reference/api/): flags, routes, and responses.
+- [Configuration](/reference/configuration/): every setting and default.
+- [Catalog operations](/operate/catalog/): missing values, conflicts, and repin.

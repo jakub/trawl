@@ -1,30 +1,76 @@
 ---
 title: CLI & TUI
-description: Command-line interface and terminal UI reference.
+description: Command syntax, options, defaults, and output formats for the trawl binary.
 ---
 
-The `trawl` binary provides three modes of operation: an interactive TUI, a query command for scripting, and a validate command for syntax checking.
+The `trawl` binary runs the terminal UI, executes queries, validates syntax,
+inspects the field catalog, and drives a running TUI over a Unix socket.
+For catalog procedures, see [catalog administration](/operate/catalog/).
 
-## TUI (interactive mode)
+## Global options
 
-Launch with no subcommand to open the terminal UI.
+Every subcommand accepts these options.
 
-```bash
-trawl                           # connects to default server
-trawl -p dev                    # connects to dev profile server
+| Flag | Value | Default | Description |
+|------|-------|---------|-------------|
+| `-p, --profile` | `<NAME>` | *(none)* | Named profile from the config file. Overrides `[server]` |
+| `--url` | `<URL>` | `https://localhost:5514` | Server URL |
+| `--token` | `<TOKEN>` | *(none)* | API token |
+| `--insecure` | *(flag)* | `false` | Accept self-signed TLS certificates |
+| `-c, --config` | `<PATH>` | `~/.config/trawl/config.toml` | Config file path |
+| `-V, --version` | *(flag)* | | Print the version and exit |
+| `-h, --help` | *(flag)* | | Print help and exit |
+
+A flag beats an environment variable, which beats the config file. Profiles and
+the `[ui]` and `[tail]` settings live in
+[client configuration](/reference/configuration/#client-configuration).
+
+## Environment variables
+
+| Variable | Equivalent flag | Description |
+|----------|-----------------|-------------|
+| `TRAWL_PROFILE` | `-p, --profile` | Named profile to select |
+| `TRAWL_URL` | `--url` | Server URL |
+| `TRAWL_TOKEN` | `--token` | API token |
+| `TRAWL_INSECURE` | `--insecure` | Accept self-signed certificates |
+| `RUST_LOG` | `warn` | Tracing filter for the TUI log file |
+
+## Exit codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | The command succeeded |
+| `1` | The command failed. `trawl` prints the reason to stderr, except for a broken pipe, which exits quietly |
+
+## TUI mode
+
+```text
+trawl [--driver [PATH]]
 ```
 
-The TUI provides:
-- Multi-tab query editor with syntax highlighting
-- Schema browser with field value profiling
-- Query history and saved queries
-- Live tail via SSE streaming
-- Vim-style result search
-- Clipboard integration
+Run `trawl` with no subcommand to open the terminal UI: a multi-tab query
+editor, a schema browser, query history, saved queries, live tail over SSE, and
+result search. Tracing goes to `~/.config/trawl/tui.log`, not stderr.
+
+| Flag | Value | Default | Description |
+|------|-------|---------|-------------|
+| `--driver` | `[PATH]` | `~/.config/trawl/driver.sock` | Listen on a Unix socket for programmatic control. The path is optional |
+
+```bash
+trawl -p dev
+```
 
 ## Query mode
 
-Execute a query and print results to stdout.
+```text
+trawl query <QUERY> [--data GLOB] [-f FORMAT] [-o PATH]
+```
+
+| Flag | Value | Default | Description |
+|------|-------|---------|-------------|
+| `--data` | `<GLOB>` | *(none)* | Parquet glob for embedded mode. No server is contacted |
+| `-f, --format` | `table\|json\|csv\|parquet` | `table` on a TTY, `json` on a pipe | Output format |
+| `-o, --output` | `<PATH>` | *(stdout)* | Write output to a file. Required for `parquet` |
 
 ```bash
 trawl query "_severity>=error last=1h | stats count() by service"
@@ -32,361 +78,248 @@ trawl query "_severity>=error last=1h | stats count() by service"
 
 ### Output formats
 
-Output format is auto-detected: table for TTY, JSON for pipes. Override with `-f`:
-
-```bash
-trawl query -f table "..."      # pretty-printed box-drawing table
-trawl query -f json "..."       # one JSON object per line (ndjson)
-trawl query -f csv "..."        # RFC 4180 with formula injection protection
-trawl query -f parquet -o out.parquet "..."  # Snappy-compressed parquet file
-```
-
-**Table** output includes a row count footer and box-drawing borders. When
-the query bound a field whose catalog pin is degraded (see below), one more
-footer line follows:
-
-```
-note: results may be incomplete — degraded field(s): duration (see: trawl schema field duration)
-```
-
-The notice is table-only: json/csv carry the same fact as a
-`degraded_fields` list on the wire, where a prose line would corrupt the
-stream. With `--output <file>` it goes to stderr, so the file stays clean.
-Embedded `--data` mode has no catalog and never prints it.
-
-**JSON** output emits one JSON object per row, ndjson-style. Ideal for piping to `jq`:
+| Format | Shape | Notes |
+|--------|-------|-------|
+| `table` | Box-drawing table with a row-count footer | Adds the incomplete-results footer when one applies |
+| `json` | One JSON object per row, newline-delimited | Pipe it to `jq` |
+| `csv` | RFC 4180 | A string value starting with `=`, `+`, `-`, `@`, tab, or `\|` is prefixed with `'` |
+| `parquet` | Snappy-compressed Parquet file | Requires `-o, --output` |
 
 ```bash
 trawl query "last=1h | stats count() by service" | jq '.service'
 ```
 
-**CSV** output follows RFC 4180 with formula injection protection — string values starting with `=`, `+`, `-`, `@`, `\t`, or `|` are prefixed with `'`.
+### The incomplete-results footer
 
-**Parquet** output requires `--output <path>` and produces a Snappy-compressed parquet file.
+When a query binds a field whose catalog pin is degraded, `table` output adds
+one line after the row count:
+
+```text
+note: results may be incomplete — degraded field(s): duration (see: trawl schema field duration)
+```
+
+With `-o, --output` the footer goes to stderr, so the file holds only rows.
+`json`, `csv`, and `parquet` never print it: the HTTP response carries
+`degraded_fields` instead. Embedded mode reads no catalog and never prints it.
 
 ### Embedded mode
 
-Query local parquet files directly, without a server:
+`--data` queries local Parquet files through one ephemeral DuckDB connection,
+with no server, no hot buffer, no authentication, and no row limit.
 
 ```bash
 trawl query --data 'data/**/*.parquet' "* | stats count() by service"
-trawl query --data '/path/to/*.parquet' "_severity>=error | head 10"
 ```
-
-Embedded mode uses a single ephemeral DuckDB connection with no hot buffer, no auth, and no row limit.
 
 ## Validate mode
 
-Check query syntax without executing:
+```text
+trawl validate <QUERY>
+```
+
+Validate checks syntax without executing. With a resolvable token the server
+also checks semantics, function arity, and regex patterns. Without one, `trawl`
+parses locally.
 
 ```bash
 trawl validate "_severity>=error | stats count() by host"
-trawl validate -p dev "..."     # validate against dev server
 ```
 
 ## Schema mode
 
-Inspect the field catalog — pinned types, per-service observations, and
-type-conflict evidence:
+```text
+trawl schema <SUBCOMMAND>
+```
+
+Schema subcommands read and change the field catalog: pinned types, per-service
+observations, and type-conflict evidence. Reads need `schema_read`. Repin,
+cancellation, pin reclamation, and acknowledgement need `schema_write`.
+
+Every subcommand takes `-f, --format` with the `table`, `json`, and `csv` values
+and the TTY auto-detection `query` uses. A `--last` window accepts `s`, `m`,
+`h`, `d`, and `w`. Field names fold to ASCII lowercase.
+
+### Fields
+
+```text
+trawl schema fields [--service NAME] [--last WINDOW] [--limit N] [--data GLOB] [-f FORMAT]
+```
+
+| Flag | Value | Default | Description |
+|------|-------|---------|-------------|
+| `--service` | `<NAME>` | *(all)* | Only fields observed for this service |
+| `--last` | `<WINDOW>` | *(all)* | Only fields observed inside this window |
+| `--limit` | `<N>` | `500` | Maximum fields to list. The server clamps to the pin cap of 10000 |
+| `--data` | `<GLOB>` | *(none)* | Embedded listing over local Parquet: names and physical types only |
+
+The listing carries a `degraded` column. Catalog fill (`N/M pins used`) goes to
+stderr. Embedded mode runs a plain `DESCRIBE` and reads no catalog metadata.
 
 ```bash
-trawl schema fields                    # pinned fields, types, conflict counts
-trawl schema fields --service nginx    # only fields that service has carried
-trawl schema fields --last 7d          # only fields observed in the window
-trawl schema field duration            # detail: type, when/where pinned, which services
-trawl schema conflicts --last 7d       # schema-health dashboard
-trawl schema conflicts --field duration --service envoy
-trawl schema ack duration --note "fix due Friday"   # acknowledge a degraded badge
+trawl schema fields --service nginx --last 7d
 ```
 
-`fields` and `conflicts` render through the standard output formats
-(`-f table|json|csv`, auto-detected like `query`). `fields` prints the
-catalog fill (`N/M pins used`) to stderr; `--limit` raises the listing
-caps (fields default 500, conflicts default 100/max 1000). `--last`
-accepts DSL-style windows (`s`, `m`, `h`, `d`, `w`).
+### Field
 
-### Degraded pins
-
-`fields` carries a `degraded` column, and its stderr summary counts them:
-a pin is degraded when it has been shelving values for **over a day** and
-in volume (100 rows or 3 distinct episodes). `schema field <name>` then
-renders the case file — when the damage started, how many senders and
-episodes, the lifetime rows shelved, a sample of the values that were
-nulled, and the repin command to run:
-
-```
-degraded pin:
-  since:          2026-08-01T10:00:00.000000Z
-  senders:        2
-  episodes:       41
-  rows shelved:   1290 (lifetime)
-  sample values:
-    - n/a
-    - pending
-  suggested:      VARCHAR
-  trawl schema repin duration --to varchar --dry-run
+```text
+trawl schema field <NAME> [--limit N] [--after CURSOR] [-f FORMAT]
 ```
 
-`rows shelved` is the lifetime total; the `rows_nulled` column in the
-conflict table below it sums only the evidence still inside the per-field
-recency window, so the two differ on purpose. Every shelved value remains
-in `_raw`. The verdict is advisory — nothing repins without `--yes` and
-`schema_write`.
+| Flag | Value | Default | Description |
+|------|-------|---------|-------------|
+| `--limit` | `<N>` | `100` | Service observations per page. The maximum is 1000 |
+| `--after` | `<CURSOR>` | *(first page)* | Resume after a previous run's printed cursor. The cursor is opaque, so pass it unchanged |
 
-**Retiring a badge after fixing the sender.** The gate has no recency term:
-evidence is never aged out, so a field stays badged after its shipper is
-corrected. That is on purpose — the shelved rows are still missing from the
-corpus. Clearing both is one command, the same-type pass:
+The detail view prints the pin, the degraded verdict, bounded conflict samples,
+and per-service observations. Conflict rows and lifetime totals use different
+windows. See [degraded pins](/operate/catalog/#read-a-degraded-pin).
 
 ```bash
-trawl schema repin duration --to bigint --force --dry-run   # `bigint` = the current pin
-trawl schema repin duration --to bigint --force --yes
+trawl schema field duration
 ```
 
-A repin whose target equals the current pin is the **resurrection-only**
-pass: it re-extracts the shelved values from `_raw` under the pin they
-already have, and — because a successful repin clears the field's conflict
-evidence in the same transaction as the flip — the badge goes out with the
-damage it was reporting. Repinning to a *different* type does both as well.
+### Conflicts
 
-**Acknowledging a badge you are not repinning yet.** Sometimes the fix is
-with the sender and the shelved rows have to stay shelved for a while.
-`schema ack` says "seen, and accepted for now" without touching the corpus:
-
-```bash
-trawl schema ack duration --note "sender ships a fix on Friday"
-trawl schema ack duration --clear     # withdraw it
+```text
+trawl schema conflicts [--field NAME] [--service NAME] [--last WINDOW] [--limit N] [-f FORMAT]
 ```
 
-The ack covers the conflict evidence that exists when it is written and
-nothing beyond, so the badge goes quiet and comes straight back the moment
-the pin shelves another batch. That is the whole lifecycle: acknowledge,
-suppressed, a new episode re-raises it, and a repin clears the ack along
-with the evidence it acknowledged. `--note` is optional prose (max 1024
-bytes) and cannot be combined with `--clear`, which writes no note.
-Acknowledging needs `schema_write`, and a field whose evidence does not
-meet the degraded threshold is refused: there is nothing to acknowledge.
-
-`field` pages its service observations — the service axis is client-chosen
-and never pruned, so the server caps a page at 1000 rows (default 100).
-When more remain, a cursor is printed to stderr; pass it to `--after` for
-the next page:
+| Flag | Value | Default | Description |
+|------|-------|---------|-------------|
+| `--field` | `<NAME>` | *(all)* | Only conflicts for this field |
+| `--service` | `<NAME>` | *(all)* | Only conflicts from this service |
+| `--last` | `<WINDOW>` | *(all)* | Only conflicts recorded inside this window |
+| `--limit` | `<N>` | `100` | Maximum rows. The maximum is 1000 |
 
 ```bash
-trawl schema field duration --limit 500
-trawl schema field duration --limit 500 --after '2026-08-02T10:00:00.000000Z|nginx'
+trawl schema conflicts --field duration --service envoy --last 7d
 ```
 
 ### Repin
 
-`schema repin` changes a wrongly-pinned field's type by rewriting the
-corpus (ADR-0011): affected files are rebuilt to the new type with
-conflict-shelved values resurrected from `_raw`, unaffected files are
-hardlinked, and the switch is atomic and crash-recoverable. It needs the
-`schema_write` permission.
+```text
+trawl schema repin <FIELD> --to TYPE [--dialect otel|syslog] [--dry-run] [--force]
+    [--yes] [--wait] [--max-nulled-rows N] [--max-ambiguous-rows N] [-f FORMAT]
+```
+
+| Flag | Value | Default | Description |
+|------|-------|---------|-------------|
+| `--to` | `<TYPE>` | *(required)* | `BIGINT`, `DOUBLE`, `TIMESTAMP`, `BOOLEAN`, `VARCHAR`, or `SEVERITY`, case-insensitive |
+| `--dialect` | `otel\|syslog` | `otel` | Which ladder the corpus numerals read in. Legal only with `--to severity` |
+| `--dry-run` | *(flag)* | `false` | Scan and persist a report job. The corpus is not rewritten |
+| `--force` | *(flag)* | `false` | Accept a projected loss, or run a same-type resurrection pass, inside the ceilings |
+| `--yes` | *(flag)* | `false` | Skip the interactive confirmation. Required off a TTY |
+| `--wait` | *(flag)* | `false` | Poll this job to a terminal result |
+| `--max-nulled-rows` | `<N>` | derived | With `--force`, the most rows the rewrite may null |
+| `--max-ambiguous-rows` | `<N>` | derived | With `--force` and `--to severity`, the most dialect-ambiguous numerals the rewrite may carry |
+
+Repin runs on an ingest-enabled node. An unspecified force ceiling derives from
+the preview scan, with ten percent headroom and a minimum addition of ten rows,
+and the CLI prints the ceiling it binds. `requires_force` in the report says
+whether the same executing request would be refused.
+
+With `--wait`, the command exits `0` for a completed rewrite or a dry-run
+report. Any other terminal state exits nonzero, as does a job identity the
+status endpoint stops naming. See [the repin procedure](/operate/catalog/#repin-a-field)
+and [severity repinning](/operate/catalog/#repin-to-severity).
 
 ```bash
-trawl schema repin status --to varchar --dry-run   # mandatory first look
-trawl schema repin status --to varchar --yes       # execute (background job)
-trawl schema repin status --to varchar --yes --wait  # poll to completion
-trawl schema repin dur --to bigint --yes --force   # accept a lossy projection
-trawl schema repin-status                          # the running/last job
-trawl schema repin-cancel                          # ask the running job to stop
+trawl schema repin duration --to BIGINT --dry-run
 ```
 
-An executing repin confirms interactively; off a TTY it refuses without
-`--yes`. A repin whose dry run projects nulled values refuses without
-`--force` and prints the plan (the values it would null stay findable in
-`_raw`). `--to <current type> --force` runs a resurrection-only pass.
-All three commands honour `-f table|json|csv`.
+### Repin status
 
-**What `--force` accepts.** A forced repin is held to a number rather than
-to a blank cheque. `--max-nulled-rows N` bounds the rows the rewrite may
-null and `--max-ambiguous-rows N` the dialect-ambiguous numerals it may
-carry; state neither and the server derives both from its own scan, ten
-percent headroom over a floor of ten rows. The headroom is there because
-ingest keeps writing for the whole build, so the finished shadow is never
-quite the corpus the plan photographed, and a cutover refuses only when the
-rewrite comes out worse than what force accepted. That refusal reads
-`refused: over its ceilings`, and the case file names the accepted and the
-actual count: the remedy is a higher `--max-nulled-rows` /
-`--max-ambiguous-rows`, never the `--force` the job already carried.
+```text
+trawl schema repin-status [-f FORMAT]
+```
 
-`--yes --force` prints the ceilings it accepts, resolved from a preview
-scan, and binds them: without explicit flags the run takes a forced dry run
-first, prints those numbers, and then states them on the executing request.
-The printed line is therefore the bound the job is held to, not a default
-that a second scan might land somewhere else. State both flags and the
-preview is skipped.
-
-Every report — dry run, running job, terminal job — carries
-`requires_force`: whether the *identical executing* request would be
-refused. A dry run succeeds by design, so without that column a plan
-carrying loss or dialect ambiguity would read as a clean pass and the
-refusal would arrive with the request that was meant to do the work.
-
-#### Stopping a running repin
-
-`schema repin-cancel` asks the running job to stop. It needs
-`schema_write` and takes no confirmation prompt, because cancelling only
-ever leaves the corpus as it already is. There are three answers, and the
-exit code carries the verdict:
-
-- accepted (exit 0): the job stops at the next file boundary of its scan or
-  build loop, sweeps its staging, and ends `cancelled` with the live corpus
-  and the pin unchanged. The snapshot walk and the filesystem preflight are
-  not checkpointed, so a job inside one of those stops when it leaves it.
-- past the point of no return (exit non-zero): the job is already swapping
-  the corpus. The request is refused rather than queued, and the job
-  completes.
-- no job running (exit non-zero): nothing to stop on this node.
-
-Acceptance is not a promise of a terminal `cancelled` status. A job that
-finishes first finishes, and a trawld that dies between the request and any
-boundary acting on it leaves the job `failed` with `cancel_requested_at`
-and `cancelled_by` set. A restart is the stronger cancel: killing trawld
-before the cutover leaves the live corpus untouched, and boot recovery
-sweeps the shadow generation.
-
-In `-f json` and `-f csv` the receipt is one record: the verdict, the
-server's sentence, and the job's own columns, nulled when no job is
-attached. `-f table` keeps the sentence and the job table as two blocks.
-
-`repin --wait` exits zero only for a repin that actually finished, and for
-a dry run's report. Every other terminal status is non-zero: `cancelled`
-names who asked, `refused_needs_force` says what would be lost, and
-`failed` or `blocked` print the row and the server's own error text. A
-script that read any of those as success would go on to trust a rewrite
-that never happened. It also exits non-zero when the status surface stops
-naming the job it is following: there is no way to ask that route for a job by id, so a second
-job claiming the freed slot leaves the first job's outcome unknown, and the
-message says so rather than reporting the last row it saw.
-
-#### Putting a sender's own field on the severity ladder
-
-`--to severity` is the one target that changes what values *mean* rather
-than only how they are stored: the field joins `_severity`'s vocabulary, so
-`level=error` becomes a band match, `level>=warn` compares ladder
-positions, and results render tokens.
+Status needs `schema_read` and returns the running job, or the newest one when
+none is running. There is no lookup by job ID.
 
 ```bash
-trawl schema repin level --to severity --dry-run                    # plan first
-trawl schema repin level --to severity --dialect syslog --dry-run   # sender speaks syslog PRI
-trawl schema repin level --to severity --yes --force                # accept the plan
+trawl schema repin-status
 ```
 
-`--dialect` reads **numerals only** (tokens are dialect-free): `otel`
-counts up 1-24, `syslog` counts down 0-7 and is inverted. The two ladders
-overlap over 1-7 with opposite meanings — `3` is `trace3` to OTel and `err`
-to syslog — and no value-shape rule can tell them apart, so trawl refuses
-rather than guesses: a corpus carrying those numerals needs either
-`--dialect syslog` or `--force`, and force accepts them only up to
-`--max-ambiguous-rows`. The count of such rows is reported
-whatever you assert (`ambiguous_numerals`); only the refusal depends on it.
-`--dialect` with any other target is an error, not an ignored flag.
+### Repin cancel
 
-The report also names the values the new pin cannot read at all (up to five
-distinct samples) and warns when something is **still writing** the field.
-That warning matters: a repin translates **history**. After the cutover,
-live events keep taking the ingest-time reading, so under `--dialect
-syslog` a historical `3` becomes 17 (`err`) while the next live `3`
-conforms as OTel 3 (`trace3`) — one column, two meanings, split at the
-cutover instant. If the sender really speaks syslog PRI, declare it in
-`[ingest] severity_from` (`dialect = "syslog"`) so live events read the
-same way, then repin the history.
+```text
+trawl schema repin-cancel [-f FORMAT]
+```
 
-**What it costs.** The severity rung is the most expensive conform in the
-vocabulary: it is a token table, an ASCII gate and a guarded numeric read
-per value, measured at roughly **36 µs per affected row** — about 10× any
-other target — so a 100-million-row field is on the order of one CPU-hour
-of rewriting. Retention stands down for the job's whole life and the
-affected bytes are held twice until it sweeps, so size the window before
-starting: a repin that runs for hours is a repin that suppresses deletion
-for hours. Unaffected files are hardlinked and cost nothing, so the number
-that matters is `rows_carrying` in the dry run, not the corpus total.
-
-`repin --to severity` needs `schema_write` and a human, like every other
-repin. `_severity` itself — and every other declared envelope field — is
-refused: its type is part of the event contract.
-
-### Reclaiming dead pin slots
-
-`schema gc-pins` deletes the catalog entries of fields nothing writes any
-more, freeing their slots against the install-wide pin cap. It needs the
-`schema_write` permission.
+Cancellation exits `0` when the server accepts the request, and nonzero when no
+job is running or the cutover has started. Acceptance is not proof of terminal
+cancellation. In `json` and `csv` the receipt is one record with verdict,
+detail, and job columns. In `table` the sentence and the job table are separate.
+See [cancellation and verification](/operate/catalog/#cancel-the-repin).
 
 ```bash
-trawl schema gc-pins --dry-run                       # what would be reclaimed
-trawl schema gc-pins --dry-run --older-than 90d      # a stricter window
-trawl schema gc-pins                                 # execute
+trawl schema repin-cancel
 ```
 
-A pin is reclaimed only when both halves of the proof hold: nothing has
-observed the field inside the window, **and** no standing parquet declares
-the column. `--older-than` takes the same units as `--last` (`s`, `m`, `h`,
-`d`, `w`) and defaults to 30 days. The server raises it to the retention
-window when that is longer, and the report prints all three numbers, so a
-`--older-than 7d` against a 90-day retention says plainly that 90 days is
-what ran.
+### Reclaim dead pin slots
 
-There is no `--yes`. The deletion is catalog metadata only, and a field
-reclaimed by mistake pins again from scratch the next time a sender writes
-it, so `--dry-run` is the whole safety story. A refusal prints the server's message and
-exits non-zero without deleting anything: a repin owns the data root or
-claimed it mid-run, another gc run is already going, or something under
-the data root could not be read (including the root itself, which is
-UNKNOWN rather than an empty corpus).
+```text
+trawl schema gc-pins [--dry-run] [--older-than WINDOW] [-f FORMAT]
+```
 
-The summary lines go to stdout for a table and to stderr under `-f json`
-or `-f csv`, so a piped run is one rectangular record set of candidate
-rows.
+| Flag | Value | Default | Description |
+|------|-------|---------|-------------|
+| `--dry-run` | *(flag)* | `false` | Scan and report only. There is no `--yes`, so omitting this flag deletes metadata |
+| `--older-than` | `<WINDOW>` | `30d` | How long a field must have gone unobserved. The server raises it to the retention floor when that floor is longer |
 
-**This is a repair, not a defense.** `gc-pins` cleans up slots that went
-dead by accident: a typo'd field name, a decommissioned sender, a
-retired label. It is not an answer to hostile catalog exhaustion. A
-sender that mints new field names faster than the window expires still
-fills the catalog, and what stops that remains what always stopped it:
-the `MAX_PINNED_FIELDS` cap, the half-of-free-slots ration per compaction
-batch, and alerting on the `trawl_catalog_pinned_fields` /
-`trawl_catalog_pin_capacity` fill gauges.
-
-Embedded mode works for the field listing only — a plain `DESCRIBE` over
-local parquet, no server or postgres needed:
+The output states the requested window, the floor, and the effective window.
+Summary text goes to stderr for `json` and `csv`, and to stdout for `table`.
+See [pin reclamation](/operate/catalog/#reclaim-unused-pins).
 
 ```bash
-trawl schema fields --data 'data/**/*.parquet'   # names + physical types only
+trawl schema gc-pins --dry-run --older-than 90d
 ```
 
-Catalog metadata (pins, observations, conflicts) requires a server. Note
-that over foreign parquet with irreconcilably drifted columns, embedded
-queries error loudly instead of silently coercing to `VARCHAR` — trawl's
-own files can never conflict (write-time catalog conformance).
+### Acknowledge a degraded pin
 
-## Global flags
-
-| Flag | Environment variable | Description |
-|------|---------------------|-------------|
-| `-p, --profile <NAME>` | `TRAWL_PROFILE` | Named profile from config |
-| `--url <URL>` | `TRAWL_URL` | Server URL (default: `https://localhost:5514`) |
-| `--token <TOKEN>` | `TRAWL_TOKEN` | API token |
-| `--insecure` | `TRAWL_INSECURE` | Accept self-signed TLS certificates |
-| `-c, --config <PATH>` | — | Config file path (default: `~/.config/trawl/config.toml`) |
-
-## Configuration
-
-Client configuration uses named profiles in `~/.config/trawl/config.toml`:
-
-```toml
-# Default server (used when no --profile is specified)
-[server]
-url = "https://trawl-01.lab.example.com:5514"
-token = "flt_your_token_here"
-
-# Dev profile (used with --profile dev or TRAWL_PROFILE=dev)
-[profiles.dev]
-url = "https://localhost:5514"
-token = "flt_dev_token_here"
-insecure = true
+```text
+trawl schema ack <FIELD> [--note TEXT | --clear] [-f FORMAT]
 ```
 
-Environment variables and CLI flags override profile settings.
+| Flag | Value | Default | Description |
+|------|-------|---------|-------------|
+| `--note` | `<TEXT>` | *(none)* | Why the pin is accepted as it stands. The limit is 1024 bytes. Conflicts with `--clear` |
+| `--clear` | *(flag)* | `false` | Withdraw the acknowledgement |
+
+An acknowledgement covers the evidence that exists when you write it. The next
+conflict episode raises the badge again.
+
+```bash
+trawl schema ack duration --note "fix due Friday"
+```
+
+## Driver mode
+
+```text
+trawl driver [--socket PATH] <SUBCOMMAND>
+```
+
+Driver subcommands control a TUI started with `--driver`. Each invocation opens
+one connection to the socket and closes it.
+
+| Flag | Value | Default | Description |
+|------|-------|---------|-------------|
+| `--socket` | `<PATH>` | `~/.config/trawl/driver.sock` | Path to the driver Unix socket |
+
+| Subcommand | Arguments | Description |
+|------------|-----------|-------------|
+| `status` | | Print TUI state as JSON |
+| `query <QUERY>` | `-f, --format`, `--timeout <MS>` (default `300000`) | Set the editor content, execute it, and print the results |
+| `set-query <QUERY>` | | Set the editor content without executing |
+| `capture` | `--width <N>` (default `120`), `--height <N>` (default `40`) | Render the TUI to text |
+| `key <KEY>` | | Inject one keystroke, such as `ctrl+enter`, `F5`, or `a` |
+| `keys <KEYS>...` | | Inject several keystrokes in order |
+| `get-results` | `--tab <N>`, `-f, --format` | Print structured result data from a tab. The tab index is 0-based and defaults to the active tab |
+| `quit` | | Ask the TUI to exit cleanly |
+
+`parquet` is not a driver output format. Starting a TUI removes an existing file
+at the socket path, so give an automated session its own socket.
+
+```bash
+trawl driver --socket /tmp/session.sock capture --width 160 --height 50
+```

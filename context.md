@@ -21,7 +21,7 @@ _Avoid_: user, consumer
 ### Ingest
 
 **Envelope**:
-The ten fields trawl guarantees on every event after ingest: six trawl-owned `_` slots (stamped or derived by trawl; senders cannot write them) and four sender-asserted slots (`env`, `service`, `host`, `message` — the sender owns the value, trawl reserves the meaning).
+The ten declared event fields: six trawl-owned `_` slots and four sender-asserted slots, `env`, `service`, `host`, and `message`. A declared field is not necessarily present on every event; its presence depends on the producer and available values.
 _Avoid_: metadata, system fields, keywords
 
 **Reserved name**:
@@ -59,7 +59,7 @@ Finished parquet files, hourly or daily. Cold never includes the WAL.
 _Avoid_: archive, on-disk data (the WAL is on disk too)
 
 **WAL**:
-The durability log between ingest and compaction. WAL events are neither hot nor cold: safe on disk, not yet visible.
+The durability log between ingest and compaction. An event recorded in the WAL may also be visible through the hot buffer; WAL storage alone does not make it visible.
 _Avoid_: journal, buffer
 
 **Marker**:
@@ -101,7 +101,7 @@ The record that conform shelved rows for a (field, service) pair: a tally, sampl
 _Avoid_: type error, schema mismatch
 
 **Repin**:
-An operator-triggered retype of one field across the whole stored corpus, done as a shadow rewrite and an atomic cutover. Query meaning never changes with a repin — only storage does.
+An operator-triggered change to one field's pinned type across the whole stored corpus. Its effect on query results follows the comparison contract; a repin does not promise unchanged results for every query.
 _Avoid_: migration, retype (as a noun)
 
 **Resurrection**:

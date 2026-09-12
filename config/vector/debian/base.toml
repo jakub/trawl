@@ -6,8 +6,12 @@
 #   3. set env vars in /etc/default/vector or vector.service override:
 #      TRAWL_URL=https://trawl.internal:5514
 #      TRAWL_INGEST_TOKEN=<token>
-#   4. create token on trawld host: trawl-admin key create --name vector --role ingest
-#      (same token works for all forwarders — ingest role is write-only)
+#      VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION=true
+#      (Vector 0.57 and later do not expand ${VAR} in config files unless
+#      this is set or vector runs with --dangerously-allow-env-var-interpolation)
+#   4. against the selected Fleet database, create trawl-ingest with trawl:ingest,
+#      then: fleet-admin keys create --name vector --kind service --role trawl-ingest
+#      fleet-admin reads DATABASE_URL; prefer a separate key per collector fleet
 #   5. start: systemctl enable --now vector
 #
 # permissions (ansible should handle):
@@ -15,8 +19,8 @@
 #   - for docker.toml: vector user in docker group
 #   - for app-specific logs: add to www-data, postgres, mysql, redis as needed
 #
-# all service drop-ins are safe to deploy everywhere — sources for
-# uninstalled apps simply idle with zero resource cost.
+# Deploy only the service drop-ins this host needs. Account for their
+# permissions, listening sockets, and retries when a dependency is unavailable.
 
 # =============================================================================
 # GLOBAL

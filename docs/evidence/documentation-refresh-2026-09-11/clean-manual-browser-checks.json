@@ -1,0 +1,74 @@
+{
+  "base": "9d0ef610",
+  "preview": "https://fractal.reverse-manta.ts.net:8446/",
+  "certificateChecks": true,
+  "routes": [
+    {
+      "route": "/",
+      "status": 200,
+      "overflow": false
+    },
+    {
+      "route": "/reference/dsl/",
+      "status": 200,
+      "overflow": false
+    },
+    {
+      "route": "/reference/api/",
+      "status": 200,
+      "overflow": false
+    },
+    {
+      "route": "/reference/configuration/",
+      "status": 200,
+      "overflow": false
+    },
+    {
+      "route": "/architecture/recovery/",
+      "status": 200,
+      "overflow": false
+    }
+  ],
+  "search": {
+    "\"ADR\"": 0,
+    "legacy": 0,
+    "repin": 20
+  },
+  "pageErrors": [],
+  "searchUi": "20 results for repin",
+  "mobile": {
+    "width": 390,
+    "overflow": false
+  },
+  "finalHttpChecks": [
+    {
+      "route": "/reference/api/",
+      "status": 200,
+      "verified": [
+        "fleet-admin roles create",
+        "View server statistics and dashboard telemetry",
+        "query permission required to inspect system-owned work"
+      ]
+    },
+    {
+      "route": "/architecture/recovery/",
+      "status": 200,
+      "verified": [
+        "Startup creates a missing data root",
+        "including when ingestion is disabled"
+      ]
+    },
+    {
+      "route": "/operate/retention/",
+      "status": 200,
+      "verified": [
+        "set_aside_path",
+        "without setting the repin suppression gauge"
+      ]
+    },
+    {
+      "route": "http://10.0.99.30:4321/",
+      "status": 200
+    }
+  ]
+}

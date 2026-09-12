@@ -1,138 +1,177 @@
 ---
-title: Web UI
-description: Browser surfaces for the field catalog — degraded pins, the field case file, repin, and the incomplete-results notice.
+title: Search in the browser
+description: The browser pages, their controls, and what each control does.
 ---
 
-`trawl-web` serves the browser UI and translates its session cookie into a
-bearer token; it listens on `127.0.0.1:8090` by default (see the
-[`[web]` configuration block](/reference/configuration/#web)). Every screen
-below reads the same API the CLI does, under the same permissions — the
-browser is given no capability a token does not already have.
+`trawl-web` serves the browser UI and turns your session into requests against
+the Trawl API. Every action uses your API key's permissions, and a browser
+session grants none of its own. The proxy listens on `127.0.0.1:8090` by
+default, which is an address on the server, not the URL you open. See
+[configuration](/reference/configuration/#web) to enable browser access, and the
+[query tutorial](/use/query-tutorial/) to learn the query language.
 
-This page documents the **field catalog** surfaces (ADR-0011). The search,
-history and saved-query screens mirror the [CLI](/reference/cli/) and the
-[DSL reference](/reference/dsl/).
+## Navigation
 
-## Degraded pins on the schema page
+The top bar carries three mode tabs. Each mode has its own left rail.
 
-A pin is *degraded* when it has been shelving values for over a day and in
-volume — the same verdict `trawl schema fields` marks and
-`GET /api/v1/schema/fields` carries.
+| Mode | Rail item | Route | What the page does |
+|------|-----------|-------|--------------------|
+| **Search** | **Search** | `/search` | Run a snapshot query or stream live events |
+| **Search** | **History** | `/search/history` | Reopen an earlier query |
+| **Search** | **Schema** | `/search/schema` | Browse services and fields, inspect conflicts |
+| **Jobs** | **Nets** | `/jobs/nets` | Manage saved queries and their schedules |
+| **Jobs** | **Runs** | `/jobs/runs` | Inspect scheduled run outcomes |
+| **Settings** | **Health** | `/settings/health` | Read server health and running queries |
+| **Settings** | **Schema** | `/search/schema` | The same schema page |
 
-On `/search/schema`, a service row shows a **count badge** for the degraded
-fields that service has actually conflicted on. The count comes from the
-server's per-`(field, service)` conflict evidence, not from a name match:
-carrying a degraded field's column is not evidence of having degraded it, so
-a service that only ever sent well-typed values for it is not badged. Inside
-the service drawer, the **fields** tab badges those fields individually.
+Ctrl+K, or Command+K on macOS, opens the command palette, which lists the mode
+tabs and the rail sections and filters on both label and route. The rail's
+bottom item, **Help**, opens the documentation site in a new tab.
 
-Badges are stamped from an in-process snapshot refreshed on the schema tick,
-so they can lag a repin by one tick (`schema_cache_ttl_secs`, default 60s).
+`/login` takes an API key. A rejected key reports `Invalid API key`, and a
+successful sign-in lands on `/search`.
 
-## The field case file
+## Search
 
-Clicking a badged field opens the **case file** for it and adds `?field=` to
-the URL, with a back arrow to the service you came from. The URL is the whole
-address: `/search/schema?field=duration` is a working deep link with no
-service context, which is what makes a case file linkable from a chat message
-or an alert.
+| Control | Effect |
+|---------|--------|
+| Editor | Holds the in-progress query. Editing it executes nothing |
+| Date range | Selects `5m`, `15m`, `1h`, `4h`, `24h`, `7d`, or an absolute interval |
+| **Live Tail** | In the date-range popover. Streams the editor's query over SSE |
+| **Haul** | Executes the editor's query. Ctrl+Enter and Command+Enter do the same |
+| **Save** | Names the query and stores it as a net. It does not freeze the rows |
+| **Share** | Copies the current URL to the clipboard |
+| **Format** | Reformats the editor text. A query with parse errors is left alone |
+| **Filters** sidebar | Field values with counts. **Include** and **Exclude** add a filter, **Clear all** removes every filter |
+| Filter chips | Above the tabs. Selecting a chip removes that filter |
+| **Events** tab | The result table, with the row count in the tab |
+| **Visualization** tab | The chart for a `timechart` or aggregate query |
+| **Export** | Downloads the results as CSV, JSON, or Parquet |
+| **← Prev**, **Next →** | Page through snapshot results, 50 rows per page |
 
-A search link is readable the same way, with one part deliberately opaque.
-The search page keeps its state in the address bar, and two parameters there
-are stable: `q` is the query text, and `r` is the time range. `r` is either a
-quick label (`r=1h`) or two UTC instants joined by `..`, with `now` allowed as
-the right-hand one. Both spellings survive across releases, so a link pasted
-into a runbook keeps meaning what it said. The sidebar filters ride in `f`,
-which is an opaque encoded payload: copy it as one unit, do not hand-write it,
-and expect its spelling to change without notice. When a link's structured
-state cannot be read, whether that is a damaged `f`, a range in neither form,
-or a page number that cannot be asked for, the page shows a banner naming the
-parameter and echoing what the link actually says, and runs nothing until you
-click the repair. Everything else is switched off while the banner is up —
-Haul, the range presets, Live Tail, Save, Export, pagination and the filter
-controls all refuse, so a broken link cannot be turned into a wider query
-through a control that was never named. The broken link stays intact until
-then, so you can send it back to whoever shared it. A link over 32 KiB, or
-one carrying more than 64 parameters, is refused as a whole rather than
-parameter by parameter, with `Start over` as its repair: nothing inside it is
-read, so padding a link cannot push the filter it carries out of sight and
-have the query run without it. Parameters other than `q`, `page`, `mode`,
-`f` and `r` are not read at all. The same two bounds apply on the way out,
-which is the one place the page declines to do what you asked: a query long
-enough that its link would be unreadable is never written to the address bar,
-and you get an error toast with your text and the current results left
-exactly where they were.
+Expanding a row shows its fields and raw text, and carries **Copy \_raw**,
+**Show context**, and **Find similar**. Selecting a field tag adds an include
+filter for that value.
 
-The case file renders one `GET /api/v1/schema/field?name=` response as plain
-facts: the pin and when and where it was set, the verdict (since when, how
-many services have conflict evidence, conflict episodes, lifetime rows
-shelved, a sample of the values that were nulled, the suggested target type),
-the remedy, the services carrying the field (paged — the service axis is
-never pruned), and recent conflict rows with their own samples. Every shelved
-value shown here still exists in `_raw`.
+A live stream has no page count and no incomplete-results notice. See
+[live tail](/use/live-tail/) for its limits and
+[sharing and export](/use/sharing-export/) for the choice between a link, a
+saved query, and a file.
 
-A **conflict episode** is one conforming cast that had to shelve at least one
-value for this field — one compaction batch per sending service, or one file
-for the boot pass that types an existing archive. Three episodes means three
-separate writes put NULL where a value did not survive the pin, not three
-values.
+### Sharing search links
 
-Two things it always says out loud: `rows shelved` is a **lifetime** total
-and deliberately differs from the windowed `rows nulled` beside it, and a
-repin rewrites the field across the **entire corpus** — every service, every
-environment, every day — not just the service the case file was reached
-through.
+The page reads five URL parameters and ignores the rest.
 
-A name with no pin is not an error and not a blank drawer: it renders a
-case file that says the catalog has never typed that name. A healthy pinned
-field renders a healthy case file, with no repin affordance and no command
-hint.
+| Parameter | Value |
+|-----------|-------|
+| `q` | Query text |
+| `r` | A quick label such as `1h`, or two UTC instants joined by `..`. The right-hand instant can be `now` |
+| `f` | The filter payload. It is opaque, so copy it rather than edit it |
+| `page` | Zero-based page index |
+| `mode` | `live` for a stream. Any other value is a snapshot |
 
-## Repinning from the browser
+Copy the whole URL after the search has run. A malformed `f`, `r`, or `page`
+blocks execution until you apply the offered repair, and the broken URL stays
+intact. While that notice is present, the page also blocks **Haul**,
+**Live Tail**, **Save**, **Export**, pagination, range changes, and the filter
+controls.
 
-The repin trigger needs the `schema_write` permission. Without it the case
-file renders in full and the remedy is the equivalent CLI line
-(`trawl schema repin <field> --to <type> --dry-run`) — never a disabled
-button. The server is the only enforcement either way.
+A URL larger than 32 KiB, or one with more than 64 parameters, is refused whole,
+with **Start over** as the repair. The same limits apply when the page writes
+state back into the URL. A search too large to write leaves the editor and the
+existing results in place and reports the problem in a toast.
 
-With it, the button is **dry-run-first**, mirroring the CLI's
-`--dry-run` → `--yes` → `--force` ladder:
+### The incomplete-results notice
 
-1. The button opens the plan: affected files, rows carrying a value,
-   projected nulls, values resurrectable from `_raw`, affected bytes. Nothing
-   has been rewritten; the numbers are a snapshot of a scan, not a
-   reservation — the real run scans again.
-2. Confirming starts the job in the background and the case file polls its
-   status while it is open. Closing the case file stops the polling; it does
-   **not** cancel the job.
-3. A plan that would lose values refuses (`refused_needs_force`) and is
-   re-presented with an explicit force toggle and the count it would null.
-   Because ingest keeps running, a job that started cleanly can still end
-   this way — the same gate is asked again of the finished rewrite.
-4. Completion raises a toast; the outcome, and any `blocked` or `failed`
-   status, is shown verbatim with whatever the server said went wrong.
+A query that binds a degraded field shows a notice above its results. Some
+original values did not fit the pinned type and now read as NULL, so filters,
+grouping, and sorting can omit or combine rows differently from the source data.
 
-One repin runs at a time install-wide. When the slot belongs to another
-field, the case file says which field and links to its case file rather than
-queueing anything.
+- Each field name links to its case file when your session holds `schema_read`. Without that permission the names are plain text.
+- Dismissing the notice hides it for that query and field set. Paging keeps the dismissal. A new query or a changed field set can show it again.
+- The notice describes the execution that produced the rows under it. A later catalog change does not rewrite it.
+- Live tail carries no such notice, so its absence is not proof that every field is healthy.
 
-## The incomplete-results notice
+## History
 
-When a query **binds** a degraded field — filters, `where`/`let`
-expressions, group-by and sort keys, including fields it filtered on and then
-projected away — the results carry a one-line notice above them: results may
-be incomplete, because a type conflict has shelved values for the named
-fields, so rows that carried one read as empty. It is the same
-`degraded_fields` list `POST /api/v1/query` returns and
-`trawl query -f table` prints as a footer.
+`/search/history` lists completed queries with **When**, **Query**, **Events**,
+and **Duration**, and a filter box narrows the list. **Save as net** stores a
+row as a saved query. **Export this page** downloads the visible page as CSV or
+JSON. **Clear history** asks for confirmation, then deletes every row for your
+key.
 
-Each name links to its case file when the session has `schema_read`, and is
-plain text when it does not. The notice is dismissible, and the dismissal
-holds for that query and that set of fields: paging the same result keeps it
-dismissed, while a new query — or the same query after the set changes —
-brings it back. A notice already on screen is a fact about the execution that
-produced the rows beneath it, so it is never edited away by a later catalog
-change; the next query is the next answer.
+## Schema
 
-The live tail carries no notice: the SSE stream has no such stamp (a named
-residual), so switching to Live shows none.
+`/search/schema` lists services with their activity, earliest and latest dates,
+event count, storage, field count, and average coverage. Column headers sort,
+and the filter box matches service names and field names.
+
+Selecting a service opens its drawer: **Overview** for ingest rate and field
+types, **Fields** for the per-field table of type, non-null share, cardinality,
+storage, and a sample, and **Live Tail** for a bounded stream of that service's
+events.
+
+A service's badge counts degraded fields with conflict evidence for that
+service. Carrying a column alone does not earn the badge, and the badge snapshot
+can lag a completed repin by the schema refresh interval.
+
+### The field case file
+
+Selecting a field opens its case file, which shows the pin, who pinned it and
+when, the health verdict, conflict samples, the suggested type, and the services
+carrying the field. `/search/schema?field=duration` opens it directly.
+
+- A conflict episode is a write that shelved at least one value, not a count of values.
+- The shelved total is a lifetime figure. The windowed count covers a shorter period.
+- The services list is paged and can include historical observations.
+- A shelved value stays available in the event's `_raw` text.
+
+A field with no pin gets an explicit untyped case file, and a healthy field has
+no remedy to apply.
+
+### Repinning from the browser
+
+**Repin this field** needs `schema_write`. Without it, the case file offers the
+equivalent `trawl schema repin` command. A repin changes the field across the
+whole corpus, including other services, environments, and dates.
+
+The browser presents a dry-run plan first: files affected, rows carrying the
+field, values the new pin cannot keep, values that would come back from `_raw`,
+and bytes to rewrite. **Get plan** and **Run repin** become **Get forced plan**
+and **Run forced repin** when the projection is lossy, and a forced run needs
+you to accept its loss bounds.
+
+The plan is a scan of the corpus as it stands, not a reservation, so a job can
+refuse for projected loss after a dry run looked safe. One repin runs at a time.
+Closing the drawer stops its polling, not the server job. See
+[catalog administration](/operate/catalog/) for the procedure.
+
+## Nets
+
+`/jobs/nets` lists saved queries with **Name**, **Query**, **Schedule**,
+**Last run**, and **Created**. A row's drawer offers **Rename**, **Edit** for the
+query text, **Open query in search**, **Trigger a scheduled run now**, and
+**Runs**. Its schedule block sets **Interval** and **Max runs**, switches the
+schedule between **Active** and **Paused**, and removes it. **Delete** asks for
+confirmation. See [saved queries and reports](/use/saved-reports/).
+
+## Runs
+
+`/jobs/runs` summarizes **Active nets**, **Success rate**, and **Avg duration**,
+then lists recent runs with **Net**, **Status**, **When**, **Duration**, and
+**Rows**. A filter box narrows the list to one net.
+
+## Health
+
+`/settings/health` reports the server's state and checks. **Refresh** re-reads
+every section on the page.
+
+| Section | Permission | Contents |
+|---------|------------|----------|
+| Health | any signed-in key | Overall state, version, and each named check |
+| Capacity | `server_manage` | Uptime, queries since startup, active queries, executors available, and retained work |
+| Live operations | `server_manage` | A streamed snapshot: host, ingest rate, query rate, hot buffer events and memory, and executors occupied |
+| Queries | `query` | Running and recent queries with user, state, and elapsed time. **Cancel** stops one you may cancel |
+
+Retained work occupies executors and counts toward pool usage. A cancellation
+that reports no work cancelled means the query had already finished.

@@ -1,0 +1,67 @@
+{
+  "browser": "installed Chromium, Playwright",
+  "desktop": "1440x1000",
+  "mobile": "390x844",
+  "pages": [
+    {
+      "path": "/",
+      "overflow": false,
+      "title": "Know what your systems are saying. | trawl",
+      "heading": "Know what your systems are saying."
+    },
+    {
+      "path": "/getting-started/first-query/",
+      "overflow": false,
+      "title": "Your first query | trawl",
+      "heading": "Your first query"
+    },
+    {
+      "path": "/operate/catalog/",
+      "overflow": false,
+      "title": "Repair catalog conflicts | trawl",
+      "heading": "Repair catalog conflicts"
+    },
+    {
+      "path": "/operate/backup-restore/",
+      "overflow": false,
+      "title": "Back up and restore | trawl",
+      "heading": "Back up and restore"
+    },
+    {
+      "path": "/reference/dsl/",
+      "overflow": false,
+      "title": "Query Language (DSL) | trawl",
+      "heading": "Query Language (DSL)"
+    },
+    {
+      "path": "/contribute/decisions/",
+      "overflow": false,
+      "title": "Decision records | trawl",
+      "heading": "Decision records"
+    }
+  ],
+  "search_query": "repin",
+  "search_results": [
+    "Repair catalog conflicts",
+    "Degraded pins",
+    "Repin",
+    "Putting a sender’s own field on the severity ladder",
+    "Recovery and cutover",
+    "Repin cutover",
+    "Repin recovery and retention",
+    "Recovery is not backup",
+    "CLI & TUI",
+    "Repin",
+    "Stopping a running repin",
+    "Putting a sender’s own field on the severity ladder",
+    "HTTP API",
+    "Roles and permissions",
+    "Schema",
+    "Catalog and conformance",
+    "Write-time conformance",
+    "Conflict evidence and degraded pins",
+    "Repin"
+  ],
+  "mobile_navigation": "passed",
+  "javascript_errors": []
+}
