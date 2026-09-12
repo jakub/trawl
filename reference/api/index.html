@@ -222,7 +222,7 @@
 <tr>
 <td><code dir="auto">ingest_error</code></td>
 <td>400</td>
-<td>An ingest body that cannot be read, or a query page that runs past <code dir="auto">max_result_rows</code></td>
+<td>An ingest body that cannot be read</td>
 </tr>
 <tr>
 <td><code dir="auto">auth_error</code></td>
@@ -499,12 +499,7 @@
 <tr>
 <td>400</td>
 <td><code dir="auto">bad_request</code></td>
-<td><code dir="auto">timezone</code> is not <code dir="auto">UTC</code>, <code dir="auto">local</code>, or a fixed offset</td>
-</tr>
-<tr>
-<td>400</td>
-<td><code dir="auto">ingest_error</code></td>
-<td><code dir="auto">offset + limit</code> exceeds <code dir="auto">max_result_rows</code></td>
+<td><code dir="auto">timezone</code> is not <code dir="auto">UTC</code>, <code dir="auto">local</code>, or a fixed offset, or <code dir="auto">offset + limit</code> exceeds <code dir="auto">max_result_rows</code></td>
 </tr>
 <tr>
 <td>400</td>
