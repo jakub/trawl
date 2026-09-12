@@ -467,8 +467,9 @@ fn the_query_shapes_match_the_dsl_the_drawer_builds() {
     let card = drawer_query::cardinality_query("nginx", &["status".to_owned()])
         .expect("one nameable field is enough to build a cardinality query");
     assert!(
-        card.contains(cardinality),
-        "cardinality_query now writes `{card}`, which the harness would not recognise",
+        card.dsl.contains(cardinality),
+        "cardinality_query now writes `{}`, which the harness would not recognise",
+        card.dsl,
     );
 
     // The third shape has no builder to call: the overview pane formats

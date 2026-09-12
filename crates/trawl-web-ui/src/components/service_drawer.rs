@@ -7,8 +7,10 @@
 //!
 //! Three tabs, URL-synced via `?stab=overview|fields|tail`:
 //! - Overview: 24h ingest histogram + field-type donut + top-fields by
-//!   cardinality. Cardinality comes from a `stats dc(f1), dc(f2), …`
-//!   DSL query fired once per drawer open and cached for the lifetime.
+//!   cardinality. Cardinality comes from a `stats dc(f1) as c0, …`
+//!   DSL query fired once per drawer open and cached for the lifetime;
+//!   its answer is read back by POSITION, keyed onto the field names the
+//!   builder returned beside the DSL.
 //! - Fields: sortable table of all columns with click-to-expand rows.
 //!   Expanding a row fires `service=<name> | top 10 <field>` via DSL
 //!   to render a top-values bar chart.
@@ -30,6 +32,7 @@ use wasm_bindgen::{JsCast, JsValue};
 
 use crate::api;
 use crate::components::sort_th::sort_th;
+use crate::drawer_query::{decode_cardinality, value_as_u64};
 use crate::histogram::{Slot, align_buckets, parse_bucket_ms};
 use crate::interop::uplot::{ChartHandle, Opts, create_chart};
 use crate::state::stream_session::{LiveSignals, RingBuffer, StreamLifecycle, start_stream};
@@ -700,23 +703,14 @@ fn cardinality_resource(
             let Some(q) = crate::drawer_query::cardinality_query(&svc_name, &fields) else {
                 return Ok(HashMap::new());
             };
-            let resp = api::query(&q, 0).await?;
-            Ok(parse_cardinality(&resp))
+            let resp = api::query(&q.dsl, 0).await?;
+            // Read back against the fields the BUILDER emitted, not the
+            // service's whole column list: a name it could not render is
+            // absent from the response and from `q.fields` alike
+            // (`drawer_query::cardinality_query`).
+            Ok(decode_cardinality(&resp, &q.fields))
         }
     })
-}
-
-fn parse_cardinality(resp: &QueryResponse) -> HashMap<String, u64> {
-    let mut out = HashMap::new();
-    let Some(row) = resp.result.rows.first() else {
-        return out;
-    };
-    for (col, val) in resp.result.columns.iter().zip(row.iter()) {
-        if let Some(n) = value_as_u64(val) {
-            out.insert(col.name.clone(), n);
-        }
-    }
-    out
 }
 
 fn parse_top_values(resp: &QueryResponse, field: &str, count_column: &str) -> Vec<(String, u64)> {
@@ -744,20 +738,6 @@ fn parse_top_values(resp: &QueryResponse, field: &str, count_column: &str) -> Ve
             Some((label, count))
         })
         .collect()
-}
-
-fn value_as_u64(v: &Value) -> Option<u64> {
-    match v {
-        #[allow(clippy::cast_sign_loss)]
-        Value::Integer(i) if *i >= 0 => Some(*i as u64),
-        Value::Float(f) if *f >= 0.0 =>
-        {
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            Some(*f as u64)
-        }
-        Value::String(s) => s.parse().ok(),
-        _ => None,
-    }
 }
 
 fn value_as_display(v: &Value) -> String {
