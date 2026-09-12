@@ -174,8 +174,17 @@ Notes:
 #### Derivation sources (`severity_from` / `time_from`)
 
 Derivation only reads. Every source stays where it arrived, as an ordinary
-queryable column under its sender's name. An entry takes the bare spelling or
-the typed spelling.
+queryable column under its sender's name. These are the defaults, and the
+packaged `trawld.toml` and the Helm chart state the same lists:
+
+```toml
+[ingest]
+severity_from = ["severity", "severity_text", "level"]
+time_from = ["_time", "timestamp", "@timestamp"]
+```
+
+An entry takes the bare spelling or the typed spelling. For a sender whose
+`syslog_severity` carries syslog numerals:
 
 ```toml
 [ingest]
