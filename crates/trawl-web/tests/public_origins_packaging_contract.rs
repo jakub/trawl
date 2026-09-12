@@ -70,6 +70,25 @@ fn declared_origin_lists(source: &str) -> Vec<Vec<String>> {
         .collect()
 }
 
+/// Every `publicOrigins:` list in a YAML example, in order: the `- item`
+/// lines that follow the key, trimmed.
+fn yaml_origin_lists(source: &str) -> Vec<Vec<String>> {
+    let mut out = Vec::new();
+    let mut lines = source.lines().map(str::trim).peekable();
+    while let Some(line) = lines.next() {
+        if line != "publicOrigins:" {
+            continue;
+        }
+        let mut entries = Vec::new();
+        while let Some(item) = lines.peek().and_then(|next| next.strip_prefix("- ")) {
+            entries.push(item.trim().to_owned());
+            lines.next();
+        }
+        out.push(entries);
+    }
+    out
+}
+
 /// Run `helm template` over the chart, returning the rendered manifest or
 /// the error text helm refused with.
 ///
@@ -158,7 +177,12 @@ fn every_documented_example_loads() {
         !guides.is_empty(),
         "the operator guides must show public_origins at all"
     );
-    for entries in examples.iter().chain(&guides) {
+    let helm = yaml_origin_lists(&deployment);
+    assert!(
+        !helm.is_empty(),
+        "the deployment guide must show web.publicOrigins for Helm"
+    );
+    for entries in examples.iter().chain(&guides).chain(&helm) {
         assert!(!entries.is_empty(), "an empty example teaches nothing");
         PublicOrigins::parse(entries)
             .unwrap_or_else(|e| panic!("the docs document an unloadable list {entries:?}: {e}"));
