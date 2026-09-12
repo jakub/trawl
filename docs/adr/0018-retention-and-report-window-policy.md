@@ -81,3 +81,15 @@ behavior is a wrong answer, not merely coarse; includes the `latest=`
 exclusivity change as prerequisite), then per-env age retention with the
 ratio comparator (a delete path — its own review posture). Web-UI window
 display and catch-up dashboards ride later work.
+
+*Amended 2026-09-12 (UI-audit remainder prep): the web form is the third
+write door beside the API and the TUI. It renders the window as an
+exclusive three-way choice (query text, since last run, fixed span), shows
+lag only beside a window, and sends exactly what it shows: query mode
+sends neither field, a blank lag sends none. The browser validates nothing
+the server already validates; the envelope message is rendered under Save
+with the draft intact. Switching a windowed schedule to query mode is an
+edit plus Save with an inline hint, not a confirmation: the server keeps
+the watermark, so the change is reversible. The manual run control is
+absent for a saved windowed schedule (ADR-0025). Catch-up dashboards still
+ride later work.*

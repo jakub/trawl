@@ -35,12 +35,38 @@ A search URL whose structured state does not parse or makes a false claim. It is
 _Avoid_: invalid URL, broken link (too broad), stale link
 
 **Mode**:
-Snapshot (a paginated one-shot query) or live (an SSE stream). The URL carries `mode=live` or nothing.
-_Avoid_: view, tab
+Snapshot (a paginated one-shot query) or live (an SSE stream). The URL carries `mode=live` or nothing. Live Tail enters live; Stop live or any range selection leaves it, always by navigation. Nothing pauses it: a URL that says live streams, or shows why it cannot. While live, no snapshot query runs.
+_Avoid_: view, tab, pause
+
+**Live ring**:
+The newest raw events the stream delivered, up to a fixed size. In live it is what the Events tab, its count and the filter rail show; the footer's Received count is everything delivered since the stream opened, including what rolled off.
+_Avoid_: buffer (unqualified), tail rows, history
+
+**Filter rail**:
+The sidebar counting field values over the rows on screen: the snapshot page or the live ring. Its counts describe what is shown, never the corpus, and it is absent for an aggregation-shaped result because a value filter on an aggregate column names a field no event carries.
+_Avoid_: facet sidebar (the code name), facets
+
+**Histogram**:
+The strip above the snapshot table: the page's rows bucketed over their own time span, captioned with the window the effective query ran. Absent in live. Neither ingest volume nor the full distribution of matches.
+_Avoid_: timeline, chart (that is Visualization)
+
+**Count**:
+The Events tab shows rows on screen. The footer names its source: Last (rows the last snapshot returned), Received (events delivered since the stream opened), Updates (aggregation frames since the stream opened).
+_Avoid_: total, matches, hits
 
 **Navigator**:
 The one closure that turns `(query, page, mode, filters, range)` into a search URL and pushes or replaces it on the router's history.
 _Avoid_: router (that is leptos's), goto
+
+### Nets
+
+**Net**:
+A saved query as the browser names it, with its optional schedule and its recorded runs.
+_Avoid_: saved search, report (that is a run's output)
+
+**Run**:
+One stored execution of a net's schedule: the resolved query text, the window it covered and the result rows the server kept. The drawer pages a fetched result locally; a run is never re-fetched by page.
+_Avoid_: report, execution, job
 
 ### List tables
 

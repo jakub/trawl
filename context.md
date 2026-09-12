@@ -142,6 +142,20 @@ _Avoid_: query complexity, bind cost, node count
 An executor-pool permit still held by physical work after its request has ended. Request completion and permit reclamation are separate events.
 _Avoid_: leaked permit, stuck query (the permit is the thing named)
 
+### Schedules
+
+**Schedule**:
+The cadence, window and lag attached to one saved query. Replacing a schedule replaces the whole shape: a schedule without a window is in query mode, and "omitted" never means "unchanged".
+_Avoid_: cron, timer, job (that is a repin)
+
+**Window**:
+What one scheduled run covers in event time: absent (the query text owns its time), since the previous run's covered point, or a fixed trailing span ending at the run. Half-open.
+_Avoid_: range (that is the search page's control), period, report window (the wire name is accepted shorthand)
+
+**Lag**:
+The late-arrival allowance that moves both bounds of a window back. It exists only beside a window; zero is spelled as absence.
+_Avoid_: delay, grace period, offset
+
 ### Outcome verbs
 
 Ordered by blast radius. These are the words for "what happened to the data", so precision here is an incident-response concern.

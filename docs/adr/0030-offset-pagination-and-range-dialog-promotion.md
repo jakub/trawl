@@ -75,3 +75,10 @@ copy. Second visible behaviour change, same red-test-first rule.
 - history's `hpage` read folds into the single-decode `query_params`
   reader while those lines are open (#156 residual); schema and nets stay
   untouched.
+
+*Amended 2026-09-12 (UI-audit remainder prep): the stored-run preview
+pages the fetched result locally with `PageWindow` and `OffsetPager`, the
+total being the rows fetched, never the run's recorded row count. The run
+endpoint stays whole-result; the server's row ceiling is disclosed as a
+separate line when the recorded count exceeds the rows fetched, and it is
+independent of paging.*

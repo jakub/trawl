@@ -130,6 +130,18 @@ A link whose structured state does not parse is shown, not run.**
   a lie about what ran, and the router exposes no Back-versus-push signal
   to do better with.
 
+  *Amended 2026-09-12 (UI-audit remainder prep, Search live-mode
+  coherence): `mode=live` is a claim the page keeps true. Leaving live is
+  a push navigation to the same `q`, `f` and `r` with `mode` elided, from
+  Stop live or from any committed range selection; Haul and the filter
+  controls keep the current mode. No local pause exists: a frozen table
+  under a live URL is a false claim, the class this ADR refuses to run.
+  While live, `/api/v1/query` is not called, and status, counts, the
+  filter rail and the histogram read only the active result source. A
+  same-`q` navigation does not replace the editor buffer: the sync is
+  keyed on the executed query, so an unsubmitted edit survives Stop live
+  the way it survives a page change.*
+
 ## Consequences
 
 - `state/query.rs` splits into a pure, natively tested URL module and a
