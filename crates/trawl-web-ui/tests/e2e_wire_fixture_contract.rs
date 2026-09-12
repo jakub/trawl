@@ -221,20 +221,41 @@ fn the_corpus_rows_fixture_carries_a_facetable_page() {
 #[test]
 fn the_corpus_drawer_fixtures_decode() {
     let card: QueryResponse = decode("query-cardinality.json", QUERY_CARDINALITY);
-    // The drawer reads cardinality back BY COLUMN NAME against the
-    // columns of the service it mounted, so these fixtures are one
-    // contract: a column here that the service does not declare is a
-    // number nothing displays. The other direction is allowed and is how
-    // `service-schema-corpus.json`'s `duration` behaves: a column with no
-    // count is skipped, not rendered as zero.
+    // The drawer reads cardinality back BY POSITION, against the aliases
+    // the builder minted for the columns of the service it mounted, so
+    // these two fixtures are one contract: the cardinality answer has to
+    // have exactly one column per column of `service-schema-corpus.json`,
+    // named `c0..c{n-1}`, or the decoder refuses the whole response.
+    //
+    // So the expectation is DERIVED from the builder rather than typed
+    // out: ask it what it would send for the corpus service, and hold the
+    // fixture to the answer.
+    let corpus: ServiceSchemaResponse = decode("service-schema-corpus.json", SERVICE_SCHEMA_CORPUS);
+    let columns: Vec<String> = corpus.services[0]
+        .columns
+        .iter()
+        .map(|c| c.name.clone())
+        .collect();
+    let q = drawer_query::cardinality_query("nginx", &columns)
+        .expect("the corpus service's columns are all nameable");
+    let aliases: Vec<String> = (0..q.fields.len()).map(|i| format!("c{i}")).collect();
     let names: Vec<&str> = card
         .result
         .columns
         .iter()
         .map(|c| c.name.as_str())
         .collect();
-    assert_eq!(names, ["_time", "status"]);
+    assert_eq!(names, aliases);
     assert_eq!(card.result.rows.len(), 1);
+    assert_eq!(card.result.rows[0].len(), q.fields.len());
+
+    // A null cell is how the fixture says "no count for this field": the
+    // decoder skips it, and `service-schema-corpus.json`'s `duration` row
+    // renders as unknown rather than as zero.
+    let counts = drawer_query::decode_cardinality(&card, &q.fields);
+    assert_eq!(counts.get("_time"), Some(&1200));
+    assert_eq!(counts.get("status"), Some(&5));
+    assert_eq!(counts.get("duration"), None);
 
     let top: QueryResponse = decode("query-top-values.json", QUERY_TOP_VALUES);
     let names: Vec<&str> = top.result.columns.iter().map(|c| c.name.as_str()).collect();

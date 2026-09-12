@@ -154,7 +154,8 @@ export const CORPUS = {
   /** The field the service drawer's overview lists first under "Top
    * fields by cardinality": the highest count in
    * `wire/query-cardinality.json`. The drawer reads that answer BY
-   * COLUMN NAME, so this is the fixture's name and not the query's. */
+   * POSITION, so this is the service column the fixture's first cell
+   * stands for, not a name the fixture carries. */
   topCardinalityField: '_time',
   /** Runs of the net, newest first (`wire/net-runs.json`). */
   runIds: [501, 502] as const,
