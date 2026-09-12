@@ -1,0 +1,595 @@
+<!DOCTYPE html><html lang="en" dir="ltr" data-theme="dark" data-has-toc data-has-sidebar class="astro-vdxcvpsm"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>Event contract | trawl</title><link rel="canonical" href="https://trawl.sh/reference/events/"/><link rel="sitemap" href="/sitemap-index.xml"/><link rel="shortcut icon" href="/favicon.svg" type="image/svg+xml"/><meta name="generator" content="Astro v7.1.1"/><meta name="generator" content="Starlight v0.41.3"/><meta property="og:title" content="Event contract"/><meta property="og:type" content="article"/><meta property="og:url" content="https://trawl.sh/reference/events/"/><meta property="og:locale" content="en"/><meta property="og:description" content="The declared envelope, derivation rules, repair codes, and rejection reasons for every ingested event."/><meta property="og:site_name" content="trawl"/><meta name="twitter:card" content="summary_large_image"/><meta name="description" content="The declared envelope, derivation rules, repair codes, and rejection reasons for every ingested event."/><script>
+	window.StarlightThemeProvider = (() => {
+		const storedTheme =
+			typeof localStorage !== 'undefined' && localStorage.getItem('starlight-theme');
+		const theme =
+			storedTheme ||
+			(window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+		document.documentElement.dataset.theme = theme === 'light' ? 'light' : 'dark';
+		return {
+			updatePickers(theme = storedTheme || 'auto') {
+				document.querySelectorAll('starlight-theme-select').forEach((picker) => {
+					const select = picker.querySelector('select');
+					if (select) select.value = theme;
+					/** @type {HTMLTemplateElement | null} */
+					const tmpl = document.querySelector(`#theme-icons`);
+					const newIcon = tmpl && tmpl.content.querySelector('.' + theme);
+					if (newIcon) {
+						const oldIcon = picker.querySelector('svg.label-icon');
+						if (oldIcon) {
+							oldIcon.replaceChildren(...newIcon.cloneNode(true).childNodes);
+						}
+					}
+				});
+			},
+		};
+	})();
+</script><template id="theme-icons"><svg aria-hidden="true" class="light astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M5 12a1 1 0 0 0-1-1H3a1 1 0 0 0 0 2h1a1 1 0 0 0 1-1Zm.64 5-.71.71a1 1 0 0 0 0 1.41 1 1 0 0 0 1.41 0l.71-.71A1 1 0 0 0 5.64 17ZM12 5a1 1 0 0 0 1-1V3a1 1 0 0 0-2 0v1a1 1 0 0 0 1 1Zm5.66 2.34a1 1 0 0 0 .7-.29l.71-.71a1 1 0 1 0-1.41-1.41l-.66.71a1 1 0 0 0 0 1.41 1 1 0 0 0 .66.29Zm-12-.29a1 1 0 0 0 1.41 0 1 1 0 0 0 0-1.41l-.71-.71a1.004 1.004 0 1 0-1.43 1.41l.73.71ZM21 11h-1a1 1 0 0 0 0 2h1a1 1 0 0 0 0-2Zm-2.64 6A1 1 0 0 0 17 18.36l.71.71a1 1 0 0 0 1.41 0 1 1 0 0 0 0-1.41l-.76-.66ZM12 6.5a5.5 5.5 0 1 0 5.5 5.5A5.51 5.51 0 0 0 12 6.5Zm0 9a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7Zm0 3.5a1 1 0 0 0-1 1v1a1 1 0 0 0 2 0v-1a1 1 0 0 0-1-1Z"/></svg><svg aria-hidden="true" class="dark astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M21.64 13a1 1 0 0 0-1.05-.14 8.049 8.049 0 0 1-3.37.73 8.15 8.15 0 0 1-8.14-8.1 8.59 8.59 0 0 1 .25-2A1 1 0 0 0 8 2.36a10.14 10.14 0 1 0 14 11.69 1 1 0 0 0-.36-1.05Zm-9.5 6.69A8.14 8.14 0 0 1 7.08 5.22v.27a10.15 10.15 0 0 0 10.14 10.14 9.784 9.784 0 0 0 2.1-.22 8.11 8.11 0 0 1-7.18 4.32v-.04Z"/></svg><svg aria-hidden="true" class="auto astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M21 14h-1V7a3 3 0 0 0-3-3H7a3 3 0 0 0-3 3v7H3a1 1 0 0 0-1 1v2a3 3 0 0 0 3 3h14a3 3 0 0 0 3-3v-2a1 1 0 0 0-1-1ZM6 7a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v7H6V7Zm14 10a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-1h16v1Z"/></svg></template><link rel="stylesheet" href="/_astro/print.ehPL0gv-.css" media="print"><link rel="stylesheet" href="/_astro/common.f_p_cAqF.css"><script type="module" src="/_astro/page.B2uBVZjk.js"></script></head><body class="astro-vdxcvpsm"><a class="sl-skip-link astro-vxeigawq" href="#_top">Skip to content</a><div class="page sl-flex astro-gqpr5s5a"><header class="header astro-gqpr5s5a"><div class="header astro-nczgtkxc"><div class="title-wrapper sl-flex astro-nczgtkxc"><a href="/" class="site-title sl-flex astro-clw6ags5"><img class="astro-clw6ags5" alt src="/_astro/trawl.NZOzpwx_.png" width="458" height="350"><span class="astro-clw6ags5" translate="no">trawl</span></a></div><div class="sl-flex print:hidden astro-nczgtkxc"><site-search class="astro-nczgtkxc astro-r5ar4xm7" data-translations="{&quot;placeholder&quot;:&quot;Search&quot;}"><button data-open-modal disabled aria-label="Search" aria-keyshortcuts="Control+K" class="astro-r5ar4xm7"><svg aria-hidden="true" class="astro-r5ar4xm7 astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M21.71 20.29 18 16.61A9 9 0 1 0 16.61 18l3.68 3.68a.999.999 0 0 0 1.42 0 1 1 0 0 0 0-1.39ZM11 18a7 7 0 1 1 0-14 7 7 0 0 1 0 14Z"/></svg><span class="sl-hidden md:sl-block astro-r5ar4xm7" aria-hidden="true">Search</span><kbd class="sl-hidden md:sl-flex astro-r5ar4xm7" style="display: none;"><kbd class="astro-r5ar4xm7">Ctrl</kbd><kbd class="astro-r5ar4xm7">K</kbd></kbd></button><dialog style="padding:0" aria-label="Search" class="astro-r5ar4xm7"><div class="dialog-frame sl-flex astro-r5ar4xm7"><button data-close-modal class="sl-flex md:sl-hidden astro-r5ar4xm7">Cancel</button><div class="search-container astro-r5ar4xm7"><div id="starlight__search" class="astro-r5ar4xm7"></div></div></div></dialog></site-search><script>
+	(() => {
+		const openBtn = document.querySelector('button[data-open-modal]');
+		const shortcut = openBtn?.querySelector('kbd');
+		if (!openBtn || !(shortcut instanceof HTMLElement)) return;
+		const platformKey = shortcut.querySelector('kbd');
+		if (platformKey && /(Mac|iPhone|iPod|iPad)/i.test(navigator.platform)) {
+			platformKey.textContent = '⌘';
+			openBtn.setAttribute('aria-keyshortcuts', 'Meta+K');
+		}
+		shortcut.style.display = '';
+	})();
+</script><script type="module" src="/_astro/Search.astro_astro_type_script_index_0_lang.vTFUHulS.js"></script></div><div class="sl-hidden md:sl-flex print:hidden right-group astro-nczgtkxc"><div class="sl-flex social-icons astro-nczgtkxc"><a href="https://github.com/jakub/trawl" rel="me" class="sl-flex astro-cg55etiy"><span class="sr-only astro-cg55etiy">GitHub</span><svg aria-hidden="true" class="astro-cg55etiy astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M12 .3a12 12 0 0 0-3.8 23.38c.6.12.83-.26.83-.57L9 21.07c-3.34.72-4.04-1.61-4.04-1.61-.55-1.39-1.34-1.76-1.34-1.76-1.08-.74.09-.73.09-.73 1.2.09 1.83 1.24 1.83 1.24 1.08 1.83 2.81 1.3 3.5 1 .1-.78.42-1.31.76-1.61-2.67-.3-5.47-1.33-5.47-5.93 0-1.31.47-2.38 1.24-3.22-.14-.3-.54-1.52.1-3.18 0 0 1-.32 3.3 1.23a11.5 11.5 0 0 1 6 0c2.28-1.55 3.29-1.23 3.29-1.23.64 1.66.24 2.88.12 3.18a4.65 4.65 0 0 1 1.23 3.22c0 4.61-2.8 5.63-5.48 5.92.42.36.81 1.1.81 2.22l-.01 3.29c0 .31.2.69.82.57A12 12 0 0 0 12 .3Z"/></svg></a></div><starlight-theme-select><label style="--sl-select-width: 6.25em" class="astro-r2p65idu"><span class="sr-only astro-r2p65idu">Select theme</span><svg aria-hidden="true" class="icon label-icon astro-r2p65idu astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M21 14h-1V7a3 3 0 0 0-3-3H7a3 3 0 0 0-3 3v7H3a1 1 0 0 0-1 1v2a3 3 0 0 0 3 3h14a3 3 0 0 0 3-3v-2a1 1 0 0 0-1-1ZM6 7a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v7H6V7Zm14 10a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-1h16v1Z"/></svg><select autocomplete="off" class="astro-r2p65idu"><option value="dark" class="astro-r2p65idu">Dark</option><option value="light" class="astro-r2p65idu">Light</option><option value="auto" selected class="astro-r2p65idu">Auto</option></select><svg aria-hidden="true" class="icon caret astro-r2p65idu astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M17 9.17a1 1 0 0 0-1.41 0L12 12.71 8.46 9.17a1 1 0 1 0-1.41 1.42l4.24 4.24a1.002 1.002 0 0 0 1.42 0L17 10.59a1.002 1.002 0 0 0 0-1.42Z"/></svg></label></starlight-theme-select><script>
+	StarlightThemeProvider.updatePickers();
+</script><script type="module">var e=`starlight-theme`,t=e=>e===`auto`||e===`dark`||e===`light`?e:`auto`,n=()=>t(typeof localStorage<`u`&&localStorage.getItem(e));function r(t){typeof localStorage<`u`&&localStorage.setItem(e,t===`light`||t===`dark`?t:``)}var i=()=>matchMedia(`(prefers-color-scheme: light)`).matches?`light`:`dark`;function a(e){StarlightThemeProvider.updatePickers(e),document.documentElement.dataset.theme=e===`auto`?i():e,r(e)}matchMedia(`(prefers-color-scheme: light)`).addEventListener(`change`,()=>{n()===`auto`&&a(`auto`)});var o=class extends HTMLElement{constructor(){super(),a(n()),this.querySelector(`select`)?.addEventListener(`change`,e=>{e.currentTarget instanceof HTMLSelectElement&&a(t(e.currentTarget.value))})}};customElements.define(`starlight-theme-select`,o);</script><script type="module">var e=class extends HTMLElement{constructor(){super();let e=this.querySelector(`select`);e&&(e.addEventListener(`change`,e=>{e.currentTarget instanceof HTMLSelectElement&&(window.location.pathname=e.currentTarget.value)}),window.addEventListener(`pageshow`,t=>{if(!t.persisted)return;let n=e.querySelector(`option[selected]`)?.index;n!==e.selectedIndex&&(e.selectedIndex=n??0)}))}};customElements.define(`starlight-lang-select`,e);</script></div></div></header><nav class="sidebar print:hidden astro-gqpr5s5a" aria-label="Main"><starlight-menu-button class="print:hidden astro-vvx7mffu"><button aria-expanded="false" aria-label="Menu" aria-controls="starlight__sidebar" class="sl-flex md:sl-hidden astro-vvx7mffu"><svg aria-hidden="true" class="open-menu astro-vvx7mffu astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M3 8h18a1 1 0 1 0 0-2H3a1 1 0 0 0 0 2Zm18 8H3a1 1 0 0 0 0 2h18a1 1 0 0 0 0-2Zm0-5H3a1 1 0 0 0 0 2h18a1 1 0 0 0 0-2Z"/></svg><svg aria-hidden="true" class="close-menu astro-vvx7mffu astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="m13.41 12 6.3-6.29a1.004 1.004 0 1 0-1.42-1.42L12 10.59l-6.29-6.3a1.004 1.004 0 0 0-1.42 1.42l6.3 6.29-6.3 6.29a1 1 0 0 0 0 1.42.998.998 0 0 0 1.42 0l6.29-6.3 6.29 6.3a.999.999 0 0 0 1.42 0 1 1 0 0 0 0-1.42L13.41 12Z"/></svg></button></starlight-menu-button><script type="module">var e=class extends HTMLElement{btn=this.querySelector(`button`);constructor(){super(),this.btn.addEventListener(`click`,()=>this.toggleExpanded());let e=this.closest(`nav`);e&&e.addEventListener(`keyup`,e=>this.closeOnEscape(e)),matchMedia(`(min-width: 50em)`).addEventListener(`change`,()=>this.setExpanded(!1))}setExpanded(e){this.setAttribute(`aria-expanded`,String(e)),document.body.toggleAttribute(`data-mobile-menu-expanded`,e),document.querySelectorAll(`.main-frame, .sl-skip-link`).forEach(t=>{t.toggleAttribute(`inert`,e)})}toggleExpanded(){this.setExpanded(this.getAttribute(`aria-expanded`)!==`true`)}closeOnEscape(e){e.code===`Escape`&&(this.setExpanded(!1),this.btn.focus())}};customElements.define(`starlight-menu-button`,e);</script><div id="starlight__sidebar" class="sidebar-pane astro-gqpr5s5a"><div class="sidebar-content sl-flex astro-gqpr5s5a"><sl-sidebar-state-persist data-hash="0d5rjc6" class="astro-f5yvicm7"><script aria-hidden="true">
+		(() => {
+			try {
+				if (!matchMedia('(min-width: 50em)').matches) return;
+				/** @type {HTMLElement | null} */
+				const target = document.querySelector('sl-sidebar-state-persist');
+				const state = JSON.parse(sessionStorage.getItem('sl-sidebar-state') || '0');
+				if (!target || !state || target.dataset.hash !== state.hash) return;
+				window._starlightScrollRestore = state.scroll;
+				customElements.define(
+					'sl-sidebar-restore',
+					class SidebarRestore extends HTMLElement {
+						connectedCallback() {
+							try {
+								const idx = parseInt(this.dataset.index || '');
+								const details = this.closest('details');
+								if (details && typeof state.open[idx] === 'boolean') details.open = state.open[idx];
+							} catch {}
+						}
+					}
+				);
+			} catch {}
+		})();
+	</script><ul class="top-level astro-ojxuodky"><li class="astro-ojxuodky"><details open class="astro-ojxuodky"><summary class="astro-ojxuodky"><span class="group-label astro-ojxuodky"><span class="large astro-ojxuodky">Start here</span></span><svg aria-hidden="true" class="caret astro-ojxuodky astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.25rem;"><path d="m14.83 11.29-4.24-4.24a1 1 0 1 0-1.42 1.41L12.71 12l-3.54 3.54a1 1 0 0 0 0 1.41 1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.24-4.24a1.002 1.002 0 0 0 0-1.42Z"/></svg></summary><sl-sidebar-restore data-index="0"></sl-sidebar-restore><ul class="astro-ojxuodky"><li class="astro-ojxuodky"><a href="/start/overview/" class="astro-ojxuodky"><span class="astro-ojxuodky">Requirements and components</span></a></li><li class="astro-ojxuodky"><a href="/start/connect/" class="astro-ojxuodky"><span class="astro-ojxuodky">Connect to a server</span></a></li><li class="astro-ojxuodky"><a href="/start/local-parquet/" class="astro-ojxuodky"><span class="astro-ojxuodky">Query local Parquet</span></a></li><li class="astro-ojxuodky"><a href="/getting-started/" class="astro-ojxuodky"><span class="astro-ojxuodky">Installation</span></a></li><li class="astro-ojxuodky"><a href="/getting-started/first-query/" class="astro-ojxuodky"><span class="astro-ojxuodky">Your first query</span></a></li></ul></details></li><li class="astro-ojxuodky"><details open class="astro-ojxuodky"><summary class="astro-ojxuodky"><span class="group-label astro-ojxuodky"><span class="large astro-ojxuodky">Use Trawl</span></span><svg aria-hidden="true" class="caret astro-ojxuodky astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.25rem;"><path d="m14.83 11.29-4.24-4.24a1 1 0 1 0-1.42 1.41L12.71 12l-3.54 3.54a1 1 0 0 0 0 1.41 1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.24-4.24a1.002 1.002 0 0 0 0-1.42Z"/></svg></summary><sl-sidebar-restore data-index="1"></sl-sidebar-restore><ul class="astro-ojxuodky"><li class="astro-ojxuodky"><a href="/reference/web-ui/" class="astro-ojxuodky"><span class="astro-ojxuodky">Search in the browser</span></a></li><li class="astro-ojxuodky"><a href="/use/query-tutorial/" class="astro-ojxuodky"><span class="astro-ojxuodky">Build a query</span></a></li><li class="astro-ojxuodky"><a href="/use/cli-tui/" class="astro-ojxuodky"><span class="astro-ojxuodky">CLI and TUI workflows</span></a></li><li class="astro-ojxuodky"><a href="/use/live-tail/" class="astro-ojxuodky"><span class="astro-ojxuodky">Watch live events</span></a></li><li class="astro-ojxuodky"><a href="/use/saved-reports/" class="astro-ojxuodky"><span class="astro-ojxuodky">Saved queries and reports</span></a></li><li class="astro-ojxuodky"><a href="/use/sharing-export/" class="astro-ojxuodky"><span class="astro-ojxuodky">Share searches and export results</span></a></li></ul></details></li><li class="astro-ojxuodky"><details class="astro-ojxuodky"><summary class="astro-ojxuodky"><span class="group-label astro-ojxuodky"><span class="large astro-ojxuodky">Operate Trawl</span></span><svg aria-hidden="true" class="caret astro-ojxuodky astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.25rem;"><path d="m14.83 11.29-4.24-4.24a1 1 0 1 0-1.42 1.41L12.71 12l-3.54 3.54a1 1 0 0 0 0 1.41 1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.24-4.24a1.002 1.002 0 0 0 0-1.42Z"/></svg></summary><sl-sidebar-restore data-index="2"></sl-sidebar-restore><ul class="astro-ojxuodky"><li class="astro-ojxuodky"><a href="/operate/deployment/" class="astro-ojxuodky"><span class="astro-ojxuodky">Deploy Trawl</span></a></li><li class="astro-ojxuodky"><a href="/operate/ingestion/" class="astro-ojxuodky"><span class="astro-ojxuodky">Connect log senders</span></a></li><li class="astro-ojxuodky"><a href="/getting-started/vector-integration/" class="astro-ojxuodky"><span class="astro-ojxuodky">Ship logs with Vector</span></a></li><li class="astro-ojxuodky"><a href="/operate/access/" class="astro-ojxuodky"><span class="astro-ojxuodky">Manage access</span></a></li><li class="astro-ojxuodky"><a href="/operate/health/" class="astro-ojxuodky"><span class="astro-ojxuodky">Check health and stalled work</span></a></li><li class="astro-ojxuodky"><a href="/operate/catalog/" class="astro-ojxuodky"><span class="astro-ojxuodky">Repair catalog conflicts</span></a></li><li class="astro-ojxuodky"><a href="/operate/retention/" class="astro-ojxuodky"><span class="astro-ojxuodky">Manage retention</span></a></li><li class="astro-ojxuodky"><a href="/operate/backup-restore/" class="astro-ojxuodky"><span class="astro-ojxuodky">Back up and restore</span></a></li><li class="astro-ojxuodky"><a href="/reference/crash-dumps/" class="astro-ojxuodky"><span class="astro-ojxuodky">Crash dumps</span></a></li></ul></details></li><li class="astro-ojxuodky"><details open class="astro-ojxuodky"><summary class="astro-ojxuodky"><span class="group-label astro-ojxuodky"><span class="large astro-ojxuodky">Reference</span></span><svg aria-hidden="true" class="caret astro-ojxuodky astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.25rem;"><path d="m14.83 11.29-4.24-4.24a1 1 0 1 0-1.42 1.41L12.71 12l-3.54 3.54a1 1 0 0 0 0 1.41 1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.24-4.24a1.002 1.002 0 0 0 0-1.42Z"/></svg></summary><sl-sidebar-restore data-index="3"></sl-sidebar-restore><ul class="astro-ojxuodky"><li class="astro-ojxuodky"><a href="/reference/dsl/" class="astro-ojxuodky"><span class="astro-ojxuodky">Query Language (DSL)</span></a></li><li class="astro-ojxuodky"><a href="/reference/cli/" class="astro-ojxuodky"><span class="astro-ojxuodky">CLI &amp; TUI</span></a></li><li class="astro-ojxuodky"><a href="/reference/api/" class="astro-ojxuodky"><span class="astro-ojxuodky">HTTP API</span></a></li><li class="astro-ojxuodky"><a href="/reference/configuration/" class="astro-ojxuodky"><span class="astro-ojxuodky">Configuration</span></a></li><li class="astro-ojxuodky"><a href="/reference/events/" aria-current="page" class="astro-ojxuodky"><span class="astro-ojxuodky">Event contract</span></a></li></ul></details></li><li class="astro-ojxuodky"><details class="astro-ojxuodky"><summary class="astro-ojxuodky"><span class="group-label astro-ojxuodky"><span class="large astro-ojxuodky">Architecture</span></span><svg aria-hidden="true" class="caret astro-ojxuodky astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.25rem;"><path d="m14.83 11.29-4.24-4.24a1 1 0 1 0-1.42 1.41L12.71 12l-3.54 3.54a1 1 0 0 0 0 1.41 1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.24-4.24a1.002 1.002 0 0 0 0-1.42Z"/></svg></summary><sl-sidebar-restore data-index="4"></sl-sidebar-restore><ul class="astro-ojxuodky"><li class="astro-ojxuodky"><a href="/architecture/overview/" class="astro-ojxuodky"><span class="astro-ojxuodky">Architecture overview</span></a></li><li class="astro-ojxuodky"><a href="/architecture/data-flow/" class="astro-ojxuodky"><span class="astro-ojxuodky">Ingest and publication</span></a></li><li class="astro-ojxuodky"><a href="/architecture/catalog/" class="astro-ojxuodky"><span class="astro-ojxuodky">Catalog and conformance</span></a></li><li class="astro-ojxuodky"><a href="/architecture/query-execution/" class="astro-ojxuodky"><span class="astro-ojxuodky">Query execution</span></a></li><li class="astro-ojxuodky"><a href="/architecture/recovery/" class="astro-ojxuodky"><span class="astro-ojxuodky">Recovery and cutover</span></a></li><li class="astro-ojxuodky"><a href="/architecture/reports-telemetry/" class="astro-ojxuodky"><span class="astro-ojxuodky">Reports and telemetry</span></a></li></ul></details></li><li class="astro-ojxuodky"><details class="astro-ojxuodky"><summary class="astro-ojxuodky"><span class="group-label astro-ojxuodky"><span class="large astro-ojxuodky">Contribute</span></span><svg aria-hidden="true" class="caret astro-ojxuodky astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.25rem;"><path d="m14.83 11.29-4.24-4.24a1 1 0 1 0-1.42 1.41L12.71 12l-3.54 3.54a1 1 0 0 0 0 1.41 1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.24-4.24a1.002 1.002 0 0 0 0-1.42Z"/></svg></summary><sl-sidebar-restore data-index="5"></sl-sidebar-restore><ul class="astro-ojxuodky"><li class="astro-ojxuodky"><a href="/getting-started/development/" class="astro-ojxuodky"><span class="astro-ojxuodky">Local development</span></a></li><li class="astro-ojxuodky"><a href="/contribute/source-map/" class="astro-ojxuodky"><span class="astro-ojxuodky">Source map</span></a></li><li class="astro-ojxuodky"><a href="/contribute/testing/" class="astro-ojxuodky"><span class="astro-ojxuodky">Test a change</span></a></li><li class="astro-ojxuodky"><a href="/contribute/experiments/" class="astro-ojxuodky"><span class="astro-ojxuodky">Run a full-app experiment</span></a></li><li class="astro-ojxuodky"><a href="/contribute/documentation/" class="astro-ojxuodky"><span class="astro-ojxuodky">Maintain the documentation</span></a></li></ul></details></li></ul><script aria-hidden="true">
+		(() => {
+			const scroller = document.getElementById('starlight__sidebar');
+			if (!window._starlightScrollRestore || !scroller) return;
+			scroller.scrollTop = window._starlightScrollRestore;
+			delete window._starlightScrollRestore;
+		})();
+	</script></sl-sidebar-state-persist><div class="md:sl-hidden"><div class="mobile-preferences sl-flex astro-b5gddk54"><div class="social-icons astro-b5gddk54"><a href="https://github.com/jakub/trawl" rel="me" class="sl-flex astro-cg55etiy"><span class="sr-only astro-cg55etiy">GitHub</span><svg aria-hidden="true" class="astro-cg55etiy astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M12 .3a12 12 0 0 0-3.8 23.38c.6.12.83-.26.83-.57L9 21.07c-3.34.72-4.04-1.61-4.04-1.61-.55-1.39-1.34-1.76-1.34-1.76-1.08-.74.09-.73.09-.73 1.2.09 1.83 1.24 1.83 1.24 1.08 1.83 2.81 1.3 3.5 1 .1-.78.42-1.31.76-1.61-2.67-.3-5.47-1.33-5.47-5.93 0-1.31.47-2.38 1.24-3.22-.14-.3-.54-1.52.1-3.18 0 0 1-.32 3.3 1.23a11.5 11.5 0 0 1 6 0c2.28-1.55 3.29-1.23 3.29-1.23.64 1.66.24 2.88.12 3.18a4.65 4.65 0 0 1 1.23 3.22c0 4.61-2.8 5.63-5.48 5.92.42.36.81 1.1.81 2.22l-.01 3.29c0 .31.2.69.82.57A12 12 0 0 0 12 .3Z"/></svg></a></div><starlight-theme-select><label style="--sl-select-width: 6.25em" class="astro-r2p65idu"><span class="sr-only astro-r2p65idu">Select theme</span><svg aria-hidden="true" class="icon label-icon astro-r2p65idu astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M21 14h-1V7a3 3 0 0 0-3-3H7a3 3 0 0 0-3 3v7H3a1 1 0 0 0-1 1v2a3 3 0 0 0 3 3h14a3 3 0 0 0 3-3v-2a1 1 0 0 0-1-1ZM6 7a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v7H6V7Zm14 10a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-1h16v1Z"/></svg><select autocomplete="off" class="astro-r2p65idu"><option value="dark" class="astro-r2p65idu">Dark</option><option value="light" class="astro-r2p65idu">Light</option><option value="auto" selected class="astro-r2p65idu">Auto</option></select><svg aria-hidden="true" class="icon caret astro-r2p65idu astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M17 9.17a1 1 0 0 0-1.41 0L12 12.71 8.46 9.17a1 1 0 1 0-1.41 1.42l4.24 4.24a1.002 1.002 0 0 0 1.42 0L17 10.59a1.002 1.002 0 0 0 0-1.42Z"/></svg></label></starlight-theme-select><script>
+	StarlightThemeProvider.updatePickers();
+</script></div></div></div></div></nav><div class="main-frame astro-gqpr5s5a"><script type="module">var e=document.getElementById(`starlight__sidebar`),t=e?.querySelector(`sl-sidebar-state-persist`),n=`sl-sidebar-state`,r=()=>{let r=[],i=t?.dataset.hash||``;try{let e=sessionStorage.getItem(n),t=JSON.parse(e||`{}`);Array.isArray(t.open)&&t.hash===i&&(r=t.open)}catch{}return{hash:i,open:r,scroll:e?.scrollTop||0}},i=e=>{try{sessionStorage.setItem(n,JSON.stringify(e))}catch{}},a=()=>i(r()),o=(e,t)=>{let n=r();n.open[t]=e,i(n)};t?.addEventListener(`click`,e=>{if(!(e.target instanceof Element))return;let t=e.target.closest(`summary`)?.closest(`details`);if(!t)return;let n=t.querySelector(`sl-sidebar-restore`),r=parseInt(n?.dataset.index||``);isNaN(r)||o(!t.open,r)}),addEventListener(`visibilitychange`,()=>{document.visibilityState===`hidden`&&a()}),addEventListener(`pageHide`,a);</script><div class="lg:sl-flex astro-abfeecmu"><aside class="right-sidebar-container print:hidden astro-abfeecmu"><div class="right-sidebar astro-abfeecmu"><div class="lg:sl-hidden astro-q5mffni3"><mobile-starlight-toc data-min-h="2" data-max-h="3" class="astro-5ulgm6bh"><nav aria-labelledby="starlight__on-this-page--mobile" class="astro-5ulgm6bh"><details id="starlight__mobile-toc" class="astro-5ulgm6bh"><summary id="starlight__on-this-page--mobile" class="sl-flex astro-5ulgm6bh"><span class="toggle sl-flex astro-5ulgm6bh">On this page<svg aria-hidden="true" class="caret astro-5ulgm6bh astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1rem;"><path d="m14.83 11.29-4.24-4.24a1 1 0 1 0-1.42 1.41L12.71 12l-3.54 3.54a1 1 0 0 0 0 1.41 1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.24-4.24a1.002 1.002 0 0 0 0-1.42Z"/></svg></span><span class="display-current astro-5ulgm6bh"></span></summary><div class="dropdown astro-5ulgm6bh"><ul class="isMobile astro-cxyftcne" style="--depth: 0;"><li style="--depth: 0;" class="astro-cxyftcne"><a href="#_top" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Overview</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#declared-fields" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Declared fields</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#names-and-original-values" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Names and original values</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#producer-profiles" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Producer profiles</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#time-derivation" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Time derivation</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#severity-derivation" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Severity derivation</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#conformance-outcomes" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Conformance outcomes</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#repair-codes" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Repair codes</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#rejection-reasons" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Rejection reasons</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#syslog-listener-fields" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Syslog listener fields</span></a></li></ul></div></details></nav></mobile-starlight-toc><script type="module" src="/_astro/MobileTableOfContents.astro_astro_type_script_index_0_lang.BcSo_yiZ.js"></script></div><div class="right-sidebar-panel sl-hidden lg:sl-block astro-q5mffni3"><div class="sl-container astro-q5mffni3"><starlight-toc data-min-h="2" data-max-h="3"><nav aria-labelledby="starlight__on-this-page"><h2 id="starlight__on-this-page">On this page</h2><ul class="astro-cxyftcne" style="--depth: 0;"><li style="--depth: 0;" class="astro-cxyftcne"><a href="#_top" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Overview</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#declared-fields" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Declared fields</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#names-and-original-values" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Names and original values</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#producer-profiles" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Producer profiles</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#time-derivation" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Time derivation</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#severity-derivation" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Severity derivation</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#conformance-outcomes" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Conformance outcomes</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#repair-codes" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Repair codes</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#rejection-reasons" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Rejection reasons</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#syslog-listener-fields" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Syslog listener fields</span></a></li></ul></nav></starlight-toc><script type="module" src="/_astro/TableOfContents.astro_astro_type_script_index_0_lang.Csloo1VZ.js"></script></div></div></div></aside><div class="main-pane astro-abfeecmu"><main data-pagefind-body class="astro-vdxcvpsm" lang="en" dir="ltr"><div class="content-panel astro-oil7k7jf"><div class="sl-container astro-oil7k7jf"><h1 id="_top" class="astro-2sm4b3ln">Event contract</h1></div></div><div class="content-panel astro-oil7k7jf"><div class="sl-container astro-oil7k7jf"><div class="sl-markdown-content"><p>Every accepted event passes through one canonicalizer. HTTP ingest, the syslog
+listener, and internal telemetry select different producer profiles and share
+every rule below.</p>
+<div class="sl-heading-wrapper level-h2"><h2 id="declared-fields">Declared fields</h2><a class="sl-anchor-link" href="#declared-fields"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Declared fields”</span></a></div>
+<p>The envelope has ten declared fields. A declared field is not a value present
+on every event: a missing column reads as NULL when a query combines
+heterogeneous records.</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Stored type</th>
+<th>Set by</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code dir="auto">_time</code></td>
+<td>TIMESTAMP</td>
+<td>derivation</td>
+<td>Event instant. Derived from the configured sources, otherwise arrival time</td>
+</tr>
+<tr>
+<td><code dir="auto">_ingested</code></td>
+<td>TIMESTAMP</td>
+<td>trawld</td>
+<td>Arrival instant. A sender cannot set it</td>
+</tr>
+<tr>
+<td><code dir="auto">_raw</code></td>
+<td>VARCHAR</td>
+<td>trawld, or the sender’s proposal</td>
+<td>The most original representation available, subject to the character cap</td>
+</tr>
+<tr>
+<td><code dir="auto">_repairs</code></td>
+<td>VARCHAR</td>
+<td>trawld</td>
+<td>Comma-separated repair codes. Omitted for a clean event</td>
+</tr>
+<tr>
+<td><code dir="auto">_severity</code></td>
+<td>SEVERITY over BIGINT</td>
+<td>derivation</td>
+<td>OpenTelemetry severity number, 1 to 24. Omitted when no source maps</td>
+</tr>
+<tr>
+<td><code dir="auto">_producer</code></td>
+<td>VARCHAR</td>
+<td>trawld</td>
+<td>The door the event entered: <code dir="auto">http</code>, <code dir="auto">syslog</code>, or <code dir="auto">trawld</code></td>
+</tr>
+<tr>
+<td><code dir="auto">env</code></td>
+<td>VARCHAR</td>
+<td>sender or profile</td>
+<td>Environment, validated against the configured allowlist</td>
+</tr>
+<tr>
+<td><code dir="auto">service</code></td>
+<td>VARCHAR</td>
+<td>sender or profile</td>
+<td>Service name. An HTTP event without a usable name is rejected</td>
+</tr>
+<tr>
+<td><code dir="auto">host</code></td>
+<td>VARCHAR</td>
+<td>sender or profile</td>
+<td>Origin host</td>
+</tr>
+<tr>
+<td><code dir="auto">message</code></td>
+<td>VARCHAR</td>
+<td>sender or profile</td>
+<td>The sender’s message, when it supplied one</td>
+</tr>
+</tbody>
+</table>
+<p><code dir="auto">env</code>, <code dir="auto">service</code>, <code dir="auto">host</code>, and <code dir="auto">message</code> are the sender-asserted slots. A sender
+names them, and a profile that can prove its own identity overrides a
+conflicting payload value. HTTP can fill <code dir="auto">host</code> from an honest peer address,
+and the syslog and telemetry profiles can omit <code dir="auto">host</code> when no honest identity
+exists. The canonicalizer never invents a <code dir="auto">message</code>.</p>
+<p>The underscore namespace belongs to trawl. A sender field such as <code dir="auto">timestamp</code>,
+<code dir="auto">severity</code>, or <code dir="auto">level</code> stays an ordinary field after derivation. None of them
+are query aliases.</p>
+<div class="sl-heading-wrapper level-h2"><h2 id="names-and-original-values">Names and original values</h2><a class="sl-anchor-link" href="#names-and-original-values"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Names and original values”</span></a></div>
+<table>
+<thead>
+<tr>
+<th>Rule</th>
+<th>Behavior</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Case</td>
+<td>A field name folds to ASCII lowercase (<code dir="auto">field.name_case_folded</code>)</td>
+</tr>
+<tr>
+<td>Case collision</td>
+<td>The exact lowercase spelling wins, otherwise the ASCII-lexicographically first variant. The loser is dropped (<code dir="auto">field.name_case_collision</code>)</td>
+</tr>
+<tr>
+<td>Name length</td>
+<td>A name longer than 255 bytes drops its column (<code dir="auto">field.name_too_long</code>)</td>
+</tr>
+<tr>
+<td>Nested values</td>
+<td>An object or array becomes JSON text</td>
+</tr>
+<tr>
+<td>Reserved input name</td>
+<td>The leading underscore run is stripped and the value lands under the bare remainder: <code dir="auto">_HOSTNAME</code> becomes <code dir="auto">hostname</code>, <code dir="auto">__name__</code> becomes <code dir="auto">name__</code> (<code dir="auto">field.reserved_prefix</code>)</td>
+</tr>
+<tr>
+<td>All-underscore name</td>
+<td>Dropped (<code dir="auto">field.reserved_prefix</code>)</td>
+</tr>
+<tr>
+<td>Stripped name already present</td>
+<td>The stripped loser is dropped (<code dir="auto">field.reserved_prefix_collision</code>)</td>
+</tr>
+<tr>
+<td><code dir="auto">_raw</code> cap</td>
+<td>65536 Unicode characters. Truncation records <code dir="auto">field.truncated</code></td>
+</tr>
+</tbody>
+</table>
+<p>A dropped field’s name and value stay findable in <code dir="auto">_raw</code>, up to the cap. Past
+that boundary they are not recoverable.</p>
+<p>The reserved-name rule has two exceptions: the <code dir="auto">_time</code> proposal that time
+derivation reads, and the <code dir="auto">_raw</code> proposal the HTTP and syslog profiles may make.
+A proposed string <code dir="auto">_raw</code> is kept verbatim to the cap. Otherwise trawld
+serializes the original object before repair and case folding, which is what
+telemetry always gets. A sender cannot forge any other slot: an input
+<code dir="auto">_producer</code> or <code dir="auto">_severity</code> lands as a bare <code dir="auto">producer</code> or <code dir="auto">severity</code>, and trawld
+writes the real one.</p>
+<table>
+<thead>
+<tr>
+<th>Name</th>
+<th>Charset</th>
+<th>Bounds</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code dir="auto">env</code></td>
+<td><code dir="auto">[a-z0-9_-]</code></td>
+<td>1 to 32 characters. <code dir="auto">wal</code> and <code dir="auto">scheduled</code> are reserved</td>
+</tr>
+<tr>
+<td><code dir="auto">service</code></td>
+<td>ASCII letters, digits, <code dir="auto">.</code>, <code dir="auto">_</code>, <code dir="auto">-</code></td>
+<td>1 to 128 bytes, not dot-leading</td>
+</tr>
+</tbody>
+</table>
+<p>Path names are written verbatim after validation, so <code dir="auto">api.v2</code> and <code dir="auto">api_v2</code> stay
+distinct.</p>
+<div class="sl-heading-wrapper level-h2"><h2 id="producer-profiles">Producer profiles</h2><a class="sl-anchor-link" href="#producer-profiles"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Producer profiles”</span></a></div>
+<table>
+<thead>
+<tr>
+<th>Producer</th>
+<th>Identity it asserts</th>
+<th>Fixed derivation sources</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code dir="auto">http</code></td>
+<td>None. The sender owns <code dir="auto">env</code>, <code dir="auto">service</code>, and <code dir="auto">host</code>, and the peer address is evidence for a fill</td>
+<td>None</td>
+</tr>
+<tr>
+<td><code dir="auto">syslog</code></td>
+<td>Configured env. Service from a source-IP mapping, a usable APP-NAME, or <code dir="auto">default_service</code>. Host from the frame, or the peer address</td>
+<td><code dir="auto">syslog_severity</code> in the syslog dialect, then <code dir="auto">syslog_timestamp</code></td>
+</tr>
+<tr>
+<td><code dir="auto">trawld</code></td>
+<td>Configured env, service <code dir="auto">trawld</code>, and the resolved hostname when one is available</td>
+<td>None</td>
+</tr>
+</tbody>
+</table>
+<p>An asserted value beats a conflicting payload value. The displaced value stays
+in <code dir="auto">_raw</code>, and <code dir="auto">field.producer_asserted</code> records the conflict. An equal value
+and a JSON null are not conflicting assertions.</p>
+<p>trawld rejects a hostname-less HTTP event behind a configured trusted relay
+rather than attributing it to the relay. Syslog and telemetry cannot ask a
+sender to resend, so they keep the event with <code dir="auto">host</code> omitted and <code dir="auto">host.omitted</code>.
+trawld counts an unexpected profile rejection in
+<code dir="auto">trawl_ingest_profile_reject_total</code>.</p>
+<div class="sl-heading-wrapper level-h2"><h2 id="time-derivation">Time derivation</h2><a class="sl-anchor-link" href="#time-derivation"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Time derivation”</span></a></div>
+<p>The configured default source order is <code dir="auto">_time</code>, <code dir="auto">timestamp</code>, <code dir="auto">@timestamp</code>. A
+profile’s fixed sources come first, and a duplicate configured source cannot
+replace a fixed source.</p>
+<table>
+<thead>
+<tr>
+<th>Rule</th>
+<th>Behavior</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Selection</td>
+<td>The first source present wins, not the first parseable one</td>
+</tr>
+<tr>
+<td>No usable value</td>
+<td>Arrival time, recorded as <code dir="auto">time.from_ingest</code>. An invalid first value does not fall through to a later source</td>
+</tr>
+<tr>
+<td>Consumption</td>
+<td>Only the <code dir="auto">_time</code> proposal is consumed. Every bare source field stays in the event</td>
+</tr>
+<tr>
+<td>Normalization</td>
+<td>RFC 3339 UTC at microsecond precision</td>
+</tr>
+<tr>
+<td>Plausibility</td>
+<td>A parseable time more than ten years before arrival, or more than one day after it, is kept and flagged <code dir="auto">time.out_of_range</code></td>
+</tr>
+</tbody>
+</table>
+<p>Accepted string forms:</p>
+<table>
+<thead>
+<tr>
+<th>Form</th>
+<th>Example</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>RFC 3339</td>
+<td><code dir="auto">2026-02-15T06:30:00.123456Z</code></td>
+</tr>
+<tr>
+<td>ISO basic offset</td>
+<td><code dir="auto">2026-02-15T06:30:00+0530</code>, <code dir="auto">2026-02-15T06:30:00+02</code></td>
+</tr>
+<tr>
+<td>Offset-less date-time, read as UTC</td>
+<td><code dir="auto">2026-02-15 06:30:00</code>, <code dir="auto">2026/02/15 06:30</code></td>
+</tr>
+<tr>
+<td>Date only, read as midnight UTC</td>
+<td><code dir="auto">2026-02-15</code>, <code dir="auto">2026/02/15</code></td>
+</tr>
+</tbody>
+</table>
+<p>A <code dir="auto">T</code> or a space separates the date from the time, and seconds and a fraction
+are optional. A number is not an event-time encoding, and neither is a nested
+value.</p>
+<p>For an RFC 3164 frame with no year, the syslog listener considers the previous,
+current, and next year in its local timezone, then takes the valid date nearest
+arrival, breaking an exact tie toward the past. With no valid candidate,
+ordinary derivation handles the missing time.</p>
+<div class="sl-heading-wrapper level-h2"><h2 id="severity-derivation">Severity derivation</h2><a class="sl-anchor-link" href="#severity-derivation"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Severity derivation”</span></a></div>
+<p>The configured default source order is <code dir="auto">severity</code>, <code dir="auto">severity_text</code>, <code dir="auto">level</code>.</p>
+<table>
+<thead>
+<tr>
+<th>Rule</th>
+<th>Behavior</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Selection</td>
+<td>The first source that maps to a severity wins</td>
+</tr>
+<tr>
+<td>Unmappable source</td>
+<td>Derivation falls through to the next source</td>
+</tr>
+<tr>
+<td>No source maps</td>
+<td><code dir="auto">_severity</code> is absent. That alone is not a repair</td>
+</tr>
+<tr>
+<td>Numerals</td>
+<td>Read on the OpenTelemetry ladder, 1 to 24, unless the source declares <code dir="auto">dialect = "syslog"</code>, which reads 0 to 7 inverted</td>
+</tr>
+<tr>
+<td>Words</td>
+<td>Always read through the one token vocabulary, whichever dialect the source declares</td>
+</tr>
+<tr>
+<td>Sources</td>
+<td>Every source stays in the event under its own name</td>
+</tr>
+</tbody>
+</table>
+<p>A numeric range alone cannot establish a sender’s dialect, so an HTTP source
+known to carry a raw PRI numeral needs <code dir="auto">dialect = "syslog"</code> written on it. The
+syslog profile prepends that dialect for <code dir="auto">syslog_severity</code>, so the raw numeral
+stays stored while <code dir="auto">_severity</code> takes the mapped value. The word vocabulary is in
+the <a href="/reference/dsl/">DSL reference</a>.</p>
+<p>A change to <code dir="auto">[ingest] severity_from</code> or <code dir="auto">[ingest] time_from</code> applies to events
+that arrive after the configuration loads, and reinterprets no stored record.
+Query-time <code dir="auto">sev()</code> and a field repin are separate operations.</p>
+<div class="sl-heading-wrapper level-h2"><h2 id="conformance-outcomes">Conformance outcomes</h2><a class="sl-anchor-link" href="#conformance-outcomes"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Conformance outcomes”</span></a></div>
+<p>These four words name what happened to the data. They are not interchangeable.</p>
+<table>
+<thead>
+<tr>
+<th>Outcome</th>
+<th>Scope</th>
+<th>What survives</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Reject</td>
+<td>One whole event, at ingest</td>
+<td>Nothing lands. The response carries a typed reason</td>
+</tr>
+<tr>
+<td>Repair</td>
+<td>One event, at ingest</td>
+<td>The event lands, with a code in <code dir="auto">_repairs</code></td>
+</tr>
+<tr>
+<td>Drop</td>
+<td>One field, at ingest</td>
+<td>The rest of the event lands. The field’s name and value stay in <code dir="auto">_raw</code></td>
+</tr>
+<tr>
+<td>Shelve</td>
+<td>One value, at conform time</td>
+<td>The typed column reads NULL, <code dir="auto">_raw</code> keeps the value, the shelving counts as a conflict, and a repin can resurrect it</td>
+</tr>
+</tbody>
+</table>
+<p>A shelved value is a catalog event, not an ingest repair, and it adds no repair
+code. See <a href="/architecture/catalog/">catalog conformance</a>.</p>
+<div class="sl-heading-wrapper level-h2"><h2 id="repair-codes">Repair codes</h2><a class="sl-anchor-link" href="#repair-codes"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Repair codes”</span></a></div>
+<p><code dir="auto">_repairs</code> carries each applicable code once, separated by commas. Deriving a
+value is not a repair. Repair metrics use the same vocabulary.</p>
+<table>
+<thead>
+<tr>
+<th>Code</th>
+<th>What happened</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code dir="auto">host.from_peer</code></td>
+<td>A missing host was filled from an honest peer address</td>
+</tr>
+<tr>
+<td><code dir="auto">host.omitted</code></td>
+<td>A profile kept the event with no honest host value</td>
+</tr>
+<tr>
+<td><code dir="auto">env.defaulted</code></td>
+<td>A missing environment used <code dir="auto">[ingest] default_env</code></td>
+</tr>
+<tr>
+<td><code dir="auto">service.from_profile</code></td>
+<td>A profile used its service default after an unusable frame service</td>
+</tr>
+<tr>
+<td><code dir="auto">time.from_ingest</code></td>
+<td>Event time was missing or invalid, so arrival time was used</td>
+</tr>
+<tr>
+<td><code dir="auto">time.out_of_range</code></td>
+<td>A parseable event time was kept outside the plausibility window</td>
+</tr>
+<tr>
+<td><code dir="auto">field.truncated</code></td>
+<td><code dir="auto">_raw</code> exceeded its character cap</td>
+</tr>
+<tr>
+<td><code dir="auto">field.reserved_prefix</code></td>
+<td>A reserved prefix was stripped, or an all-underscore name was dropped</td>
+</tr>
+<tr>
+<td><code dir="auto">field.reserved_prefix_collision</code></td>
+<td>A stripped name collided with an existing bare name</td>
+</tr>
+<tr>
+<td><code dir="auto">field.name_too_long</code></td>
+<td>A field name exceeded 255 bytes and its column was dropped</td>
+</tr>
+<tr>
+<td><code dir="auto">field.name_case_folded</code></td>
+<td>A field name changed to ASCII lowercase</td>
+</tr>
+<tr>
+<td><code dir="auto">field.name_case_collision</code></td>
+<td>Two names differed only in ASCII case, and the losing one was dropped</td>
+</tr>
+<tr>
+<td><code dir="auto">field.producer_asserted</code></td>
+<td>A profile’s asserted identity displaced a conflicting payload value</td>
+</tr>
+</tbody>
+</table>
+<div class="sl-heading-wrapper level-h2"><h2 id="rejection-reasons">Rejection reasons</h2><a class="sl-anchor-link" href="#rejection-reasons"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Rejection reasons”</span></a></div>
+<p>trawld rejects an event rather than guessing an environment or a service. Each
+reason is also its metric label value.</p>
+<table>
+<thead>
+<tr>
+<th>Reason</th>
+<th>Cause</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code dir="auto">missing_service</code></td>
+<td>No <code dir="auto">service</code> key</td>
+</tr>
+<tr>
+<td><code dir="auto">service_not_string</code></td>
+<td><code dir="auto">service</code> present but not a JSON string</td>
+</tr>
+<tr>
+<td><code dir="auto">empty_service</code></td>
+<td><code dir="auto">service</code> is an empty string</td>
+</tr>
+<tr>
+<td><code dir="auto">service_too_long</code></td>
+<td><code dir="auto">service</code> exceeds 128 bytes</td>
+</tr>
+<tr>
+<td><code dir="auto">invalid_chars</code></td>
+<td><code dir="auto">service</code> fails the service charset, or starts with a dot</td>
+</tr>
+<tr>
+<td><code dir="auto">invalid_env</code></td>
+<td><code dir="auto">env</code> is not a string, or fails the env charset</td>
+</tr>
+<tr>
+<td><code dir="auto">env_not_allowed</code></td>
+<td><code dir="auto">env</code> is valid in shape but is not in the effective env allowlist</td>
+</tr>
+<tr>
+<td><code dir="auto">host_missing_from_relay</code></td>
+<td><code dir="auto">host</code> is missing and the peer is a configured trusted relay</td>
+</tr>
+<tr>
+<td><code dir="auto">not_object</code></td>
+<td>The payload is not a JSON object</td>
+</tr>
+<tr>
+<td><code dir="auto">invalid_json</code></td>
+<td>The body is not valid JSON</td>
+</tr>
+<tr>
+<td><code dir="auto">wal_failure</code></td>
+<td>The write-ahead log write failed</td>
+</tr>
+</tbody>
+</table>
+<p>One batch can hold rejected events beside accepted siblings. The
+<a href="/reference/api/#ingest">ingest response</a> carries the counts and the errors.</p>
+<div class="sl-heading-wrapper level-h2"><h2 id="syslog-listener-fields">Syslog listener fields</h2><a class="sl-anchor-link" href="#syslog-listener-fields"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Syslog listener fields”</span></a></div>
+<p>The listener publishes what it parsed as ordinary columns, and the syslog
+profile’s fixed derivation sources read the first two.</p>
+<table>
+<thead>
+<tr>
+<th>Column</th>
+<th>Value</th>
+<th>Present when</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code dir="auto">syslog_severity</code></td>
+<td>The raw PRI severity numeral, 0 to 7</td>
+<td>The frame carried a PRI</td>
+</tr>
+<tr>
+<td><code dir="auto">syslog_timestamp</code></td>
+<td>The frame time, as RFC 3339 UTC at microsecond precision</td>
+<td>The frame carried a timestamp</td>
+</tr>
+<tr>
+<td><code dir="auto">syslog_facility</code></td>
+<td>The facility name, such as <code dir="auto">local0</code></td>
+<td>The facility is known</td>
+</tr>
+<tr>
+<td><code dir="auto">syslog_pid</code></td>
+<td>The frame’s PROCID</td>
+<td>The frame carried one</td>
+</tr>
+<tr>
+<td><code dir="auto">syslog_msgid</code></td>
+<td>The frame’s MSGID</td>
+<td>The frame carried one</td>
+</tr>
+<tr>
+<td><code dir="auto">syslog_source_ip</code></td>
+<td>The peer address</td>
+<td>Always</td>
+</tr>
+<tr>
+<td><code dir="auto">sd_&lt;id&gt;_&lt;param&gt;</code></td>
+<td>One RFC 5424 structured-data parameter</td>
+<td>The frame carried structured data</td>
+</tr>
+</tbody>
+</table>
+<p>Structured data is bounded at 32 elements and 128 parameters in total. Keys
+arrive as the frame spelled them, then take the ordinary name rules. <code dir="auto">_raw</code> is
+the pre-parse wire line, and <code dir="auto">env</code> comes from <code dir="auto">[ingest] default_env</code>. An
+APP-NAME that fails the service charset lands under <code dir="auto">[syslog] default_service</code>
+with a <code dir="auto">service.from_profile</code> repair.</p>
+</div><footer class="sl-flex astro-xhxjzfa7"><div class="meta sl-flex astro-xhxjzfa7"><a href="https://github.com/jakub/trawl/edit/main/docs/src/content/docs/reference/events.md" class="sl-flex print:hidden astro-xk5gmzsg"><svg aria-hidden="true" class="astro-xk5gmzsg astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.2em;"><path d="M22 7.24a1 1 0 0 0-.29-.71l-4.24-4.24a1 1 0 0 0-1.1-.22 1 1 0 0 0-.32.22l-2.83 2.83L2.29 16.05a1 1 0 0 0-.29.71V21a1 1 0 0 0 1 1h4.24a1 1 0 0 0 .76-.29l10.87-10.93L21.71 8c.1-.1.17-.2.22-.33a1 1 0 0 0 0-.24v-.14l.07-.05ZM6.83 20H4v-2.83l9.93-9.93 2.83 2.83L6.83 20ZM18.17 8.66l-2.83-2.83 1.42-1.41 2.82 2.82-1.41 1.42Z"/></svg>Edit page</a></div><div class="pagination-links print:hidden astro-jgq3vlii" dir="ltr"><a href="/reference/configuration/" rel="prev" class="astro-jgq3vlii"><svg aria-hidden="true" class="astro-jgq3vlii astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.5rem;"><path d="M17 11H9.41l3.3-3.29a1.004 1.004 0 1 0-1.42-1.42l-5 5a1 1 0 0 0-.21.33 1 1 0 0 0 0 .76 1 1 0 0 0 .21.33l5 5a1.002 1.002 0 0 0 1.639-.325 1 1 0 0 0-.219-1.095L9.41 13H17a1 1 0 0 0 0-2Z"/></svg><span class="astro-jgq3vlii">Previous<br class="astro-jgq3vlii"><span class="link-title astro-jgq3vlii">Configuration</span></span></a><a href="/architecture/overview/" rel="next" class="astro-jgq3vlii"><svg aria-hidden="true" class="astro-jgq3vlii astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.5rem;"><path d="M17.92 11.62a1.001 1.001 0 0 0-.21-.33l-5-5a1.003 1.003 0 1 0-1.42 1.42l3.3 3.29H7a1 1 0 0 0 0 2h7.59l-3.3 3.29a1.002 1.002 0 0 0 .325 1.639 1 1 0 0 0 1.095-.219l5-5a1 1 0 0 0 .21-.33 1 1 0 0 0 0-.76Z"/></svg><span class="astro-jgq3vlii">Next<br class="astro-jgq3vlii"><span class="link-title astro-jgq3vlii">Architecture overview</span></span></a></div></footer></div></div></main></div></div></div></div></body></html>
