@@ -1515,7 +1515,7 @@ const CONTRACTS: &[Contract] = &[
         assignment: "queryShapeCardinality: '| stats dc(',",
         source_path: "src/drawer_query.rs",
         source: DRAWER_QUERY_RS,
-        hook: "dc({rendered}) as c{i}",
+        hook: "dc({rendered}) as {alias}",
     },
     Contract {
         assignment: "queryShapeTimechart: '| timechart span=1h count()',",
