@@ -1793,6 +1793,27 @@ async fn query_pagination_offset_beyond_results() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn query_pagination_page_past_max_rows_is_bad_request() {
+    let server = setup().await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+
+    // The fixture caps max_result_rows at 100_000; a page whose window
+    // ends past the cap is request validation, not an ingest failure.
+    let result = client.query_paginated("*", Some(10), Some(100_000)).await;
+    match result {
+        Err(trawl_client::ClientError::Server { status, error }) => {
+            assert_eq!(status, 400);
+            assert_eq!(error.code, trawl_api::ErrorCode::BadRequest);
+            assert_eq!(
+                error.message,
+                "offset + limit exceeds max_result_rows (100000)"
+            );
+        }
+        other => panic!("expected 400 bad_request, got: {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn query_pagination_defaults() {
     let server = setup().await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();

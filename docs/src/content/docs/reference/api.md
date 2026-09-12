@@ -73,7 +73,7 @@ Every error that trawld itself produces has this body:
 | `validation_error` | 400 | The DSL parses but fails semantic checks: unknown function, wrong arity, or a pipeline over the expression budget or stage cap |
 | `result_too_large` | 400 | The result exceeded `max_result_rows` |
 | `bad_request` | 400 | Malformed input. Also the code on every 409, which has no code of its own. |
-| `ingest_error` | 400 | An ingest body that cannot be read, or a query page that runs past `max_result_rows` |
+| `ingest_error` | 400 | An ingest body that cannot be read |
 | `auth_error` | 401 | Authentication failed |
 | `forbidden` | 403 | The key lacks a permission |
 | `not_found` | 404 | No such resource, or the key does not own it. The response does not say which. |
@@ -219,8 +219,7 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -H "Content-Type: applicatio
 |--------|------|------|
 | 400 | `parse_error` | The DSL does not parse |
 | 400 | `validation_error` | Unknown function, wrong arity, or a pipeline over the expression budget or stage cap |
-| 400 | `bad_request` | `timezone` is not `UTC`, `local`, or a fixed offset |
-| 400 | `ingest_error` | `offset + limit` exceeds `max_result_rows` |
+| 400 | `bad_request` | `timezone` is not `UTC`, `local`, or a fixed offset, or `offset + limit` exceeds `max_result_rows` |
 | 400 | `result_too_large` | The result exceeded `max_result_rows` |
 | 404 | `not_found` | A `from saved` stage names a saved query the key does not own, or one with no successful run |
 | 409 | `bad_request` | A `from saved` stage selects a run that has rows but no Parquet file. The message names the run route. |

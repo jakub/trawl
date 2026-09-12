@@ -73,7 +73,7 @@ pub async fn query(
     let offset = req.offset.unwrap_or(0);
 
     if offset + limit > max_rows {
-        return Err(ServerError::Ingest(format!(
+        return Err(ServerError::BadRequest(format!(
             "offset + limit exceeds max_result_rows ({max_rows})"
         )));
     }
