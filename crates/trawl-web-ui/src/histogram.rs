@@ -6,10 +6,12 @@
 //!
 //! Two independent jobs live here:
 //!
-//! - [`bucketize`] — the search-page strip. Splits an iterator of
+//! - [`bucketize_series`] — the search-page strip. Splits an iterator of
 //!   `(timestamp_seconds, is_error)` tuples into `n_buckets`
-//!   evenly-spaced buckets between the observed min/max timestamp.
-//!   Each bucket returns `(ok_count, err_count)`.
+//!   evenly-spaced buckets between the observed min/max timestamp, and
+//!   returns the bounds it used with them so the bars, the axis labels
+//!   ([`axis_labels`]) and the accessible bucket table all read one
+//!   geometry. Each bucket carries `(ok_count, err_count)`.
 //! - [`align_buckets`] — the service drawer's ingest chart. Lays rows
 //!   the server already aggregated (`timechart span=1h`) onto a fixed
 //!   grid, so gaps in the data render as gaps instead of collapsing the
@@ -28,6 +30,33 @@ pub struct Bucket {
     pub err: u32,
 }
 
+/// Bucketed counts plus the time span they were laid out over.
+///
+/// `max_secs` is the span's end, not the largest observed timestamp:
+/// for a page whose events all share one timestamp it is one second
+/// past `min_secs`, the same widening bucket assignment uses. Every
+/// surface that positions something on the strip — bar tooltips, the
+/// axis labels, the accessible bucket table — measures from these two
+/// numbers, so none of them can disagree about where a bucket starts.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Series {
+    pub buckets: Vec<Bucket>,
+    pub min_secs: f64,
+    pub max_secs: f64,
+}
+
+impl Series {
+    /// Width of one bucket, in seconds.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)] // bucket counts are small
+    pub fn bucket_width(&self) -> f64 {
+        (self.max_secs - self.min_secs) / self.buckets.len() as f64
+    }
+}
+
+/// Lay `(timestamp_seconds, is_error)` events onto `n_buckets` even
+/// buckets spanning the observed extent. `None` when there is nothing
+/// to lay out.
 #[must_use]
 #[allow(
     clippy::cast_precision_loss,
@@ -35,9 +64,9 @@ pub struct Bucket {
     clippy::cast_sign_loss,
     clippy::cast_possible_wrap
 )] // bucket arithmetic is bounded; precision loss past 2^52 events is acceptable
-pub fn bucketize(events: &[(f64, bool)], n_buckets: usize) -> Vec<Bucket> {
+pub fn bucketize_series(events: &[(f64, bool)], n_buckets: usize) -> Option<Series> {
     if events.is_empty() || n_buckets == 0 {
-        return Vec::new();
+        return None;
     }
     let mut min = f64::INFINITY;
     let mut max = f64::NEG_INFINITY;
@@ -52,19 +81,50 @@ pub fn bucketize(events: &[(f64, bool)], n_buckets: usize) -> Vec<Bucket> {
     // All same timestamp → degenerate range; widen by 1s so bucket
     // assignment doesn't divide by zero.
     let range = (max - min).max(1.0);
-    let mut out = vec![Bucket { ok: 0, err: 0 }; n_buckets];
+    let mut buckets = vec![Bucket { ok: 0, err: 0 }; n_buckets];
     let n = n_buckets as f64;
     for &(t, is_err) in events {
         let raw = (((t - min) / range) * n).floor();
         let idx = if raw <= 0.0 { 0 } else { raw as usize };
         let i = idx.min(n_buckets - 1);
         if is_err {
-            out[i].err += 1;
+            buckets[i].err += 1;
         } else {
-            out[i].ok += 1;
+            buckets[i].ok += 1;
         }
     }
-    out
+    Some(Series {
+        buckets,
+        min_secs: min,
+        max_secs: min + range,
+    })
+}
+
+/// One bucket bound as a UTC timestamp, rounded outward to the
+/// millisecond: down for a start, up for an end, so a bucket's printed
+/// interval always contains every event counted in it.
+#[must_use]
+#[allow(clippy::cast_possible_truncation)]
+pub fn bucket_time(seconds: f64, end: bool) -> String {
+    let millis = seconds * 1000.0;
+    let bound = if end { millis.ceil() } else { millis.floor() };
+    chrono::DateTime::from_timestamp_millis(bound as i64).map_or_else(
+        || seconds.to_string(),
+        |dt| dt.format("%Y-%m-%d %H:%M:%S%.3f").to_string(),
+    )
+}
+
+/// The strip's three x-axis labels: the first bucket's start, the
+/// midpoint, and the last bucket's end. Real timestamps off the data
+/// that was bucketed — never `-15m` / `now` over an observed extent the
+/// picker's range may not describe (ADR-0027, amended 2026-09-12).
+#[must_use]
+pub fn axis_labels(series: &Series) -> (String, String, String) {
+    (
+        bucket_time(series.min_secs, false),
+        bucket_time(f64::midpoint(series.min_secs, series.max_secs), false),
+        bucket_time(series.max_secs, true),
+    )
 }
 
 /// One slot of a fixed-width timechart grid.
@@ -186,21 +246,25 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 mod tests {
     use super::*;
 
-    #[test]
-    fn empty_input_returns_empty() {
-        assert!(bucketize(&[], 10).is_empty());
+    fn buckets(events: &[(f64, bool)], n: usize) -> Vec<Bucket> {
+        bucketize_series(events, n).map_or_else(Vec::new, |s| s.buckets)
     }
 
     #[test]
-    fn zero_buckets_returns_empty() {
+    fn empty_input_returns_no_series() {
+        assert!(bucketize_series(&[], 10).is_none());
+    }
+
+    #[test]
+    fn zero_buckets_returns_no_series() {
         let events = [(1.0, false), (2.0, true)];
-        assert!(bucketize(&events, 0).is_empty());
+        assert!(bucketize_series(&events, 0).is_none());
     }
 
     #[test]
     fn single_event_lands_in_first_bucket() {
         let events = [(5.0, false)];
-        let out = bucketize(&events, 4);
+        let out = buckets(&events, 4);
         assert_eq!(out.len(), 4);
         assert_eq!(out[0], Bucket { ok: 1, err: 0 });
         assert_eq!(out[1], Bucket { ok: 0, err: 0 });
@@ -209,7 +273,7 @@ mod tests {
     #[test]
     fn distributes_across_buckets() {
         let events = [(0.0, false), (1.0, true), (2.0, false), (3.0, true)];
-        let out = bucketize(&events, 4);
+        let out = buckets(&events, 4);
         assert_eq!(out.len(), 4);
         let total_ok: u32 = out.iter().map(|b| b.ok).sum();
         let total_err: u32 = out.iter().map(|b| b.err).sum();
@@ -220,9 +284,49 @@ mod tests {
     #[test]
     fn last_event_lands_in_last_bucket() {
         let events = [(0.0, false), (10.0, true)];
-        let out = bucketize(&events, 5);
+        let out = buckets(&events, 5);
         assert_eq!(out[0].ok, 1);
         assert_eq!(out[4].err, 1);
+    }
+
+    #[test]
+    fn series_bounds_are_the_observed_extent() {
+        let series = bucketize_series(&[(0.0, false), (10.0, true)], 5).expect("series");
+        assert!((series.min_secs - 0.0).abs() < f64::EPSILON);
+        assert!((series.max_secs - 10.0).abs() < f64::EPSILON);
+        assert!((series.bucket_width() - 2.0).abs() < f64::EPSILON);
+    }
+
+    /// One timestamp on every row is still a page worth drawing: the
+    /// span widens by a second rather than collapsing to zero width.
+    #[test]
+    fn identical_timestamps_widen_to_one_second() {
+        let series = bucketize_series(&[(100.0, false), (100.0, true)], 4).expect("series");
+        assert!((series.max_secs - series.min_secs - 1.0).abs() < f64::EPSILON);
+        assert_eq!(series.buckets[0], Bucket { ok: 1, err: 1 });
+    }
+
+    #[test]
+    fn axis_labels_are_the_first_start_the_midpoint_and_the_last_end() {
+        // 2026-09-01T00:00:00Z .. +1h
+        let start = 1_788_220_800.0;
+        let series = bucketize_series(&[(start, false), (start + 3600.0, false)], 4).expect("s");
+        let (left, mid, right) = axis_labels(&series);
+        assert_eq!(left, "2026-09-01 00:00:00.000");
+        assert_eq!(mid, "2026-09-01 00:30:00.000");
+        assert_eq!(right, "2026-09-01 01:00:00.000");
+    }
+
+    #[test]
+    fn bucket_time_rounds_outward_to_milliseconds() {
+        assert_eq!(
+            bucket_time(1_788_220_800.000_4, false),
+            "2026-09-01 00:00:00.000"
+        );
+        assert_eq!(
+            bucket_time(1_788_220_800.000_4, true),
+            "2026-09-01 00:00:00.001"
+        );
     }
 
     // ── align_buckets ──────────────────────────────────────────────

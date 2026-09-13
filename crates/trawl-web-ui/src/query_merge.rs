@@ -150,22 +150,169 @@ fn split_search_stage(input: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// Heuristic: does the search stage already carry a DSL time clause?
-/// Word-boundary check to avoid matching `loglast=` or similar. Case-insensitive.
+/// One time clause the user wrote in the search stage. `keyword` is the
+/// bare grammar word (`last`, `earliest`, `latest`); the scanner matches
+/// it followed by `=`. `value` is what the user typed after the `=`,
+/// unquoted if it was a DSL string literal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimeClause {
+    pub keyword: &'static str,
+    pub value: String,
+}
+
+/// The time restriction the effective query actually runs under.
 ///
-/// A backticked `` `last` `` is a field, not the grammar keyword, so the
-/// walk skips quoted spans entirely — otherwise the UI would read the
-/// field as an existing time clause and silently drop the range.
-fn search_has_time_clause(search: &str) -> bool {
+/// The picker's trigger keeps saying what the URL carries (`r=15m`) even
+/// when the DSL runs two hours; this is the truth the histogram caption
+/// states (ADR-0027, amended 2026-09-12). It describes what
+/// [`effective_query`] merged — it never changes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EffectiveWindow {
+    /// The user's own clauses won; the quick range was suppressed.
+    Dsl(Vec<TimeClause>),
+    /// The picker's quick range ran, with no DSL clause beside it.
+    Quick(String),
+    /// An absolute range always applies, AND-ed with any DSL clauses the
+    /// search stage carries.
+    Absolute {
+        from: String,
+        to: String,
+        dsl: Vec<TimeClause>,
+    },
+}
+
+/// Every DSL time clause in a search stage, in written order.
+///
+/// Word-boundary check to avoid matching `loglast=` or similar.
+/// Case-insensitive. A backticked `` `last` `` is a field, not the
+/// grammar keyword, and a `last=` inside a quoted value or a comment is
+/// prose, so the walk skips those spans entirely — otherwise the UI
+/// would read them as an existing time clause and silently drop the
+/// range. The closure never claims a hit, so one walk collects them all.
+#[must_use]
+pub fn find_time_clauses(search: &str) -> Vec<TimeClause> {
+    const KEYWORDS: [&str; 3] = ["last", "earliest", "latest"];
     let lower = search.to_ascii_lowercase();
     let bytes = lower.as_bytes();
+    let mut found: Vec<(usize, &'static str)> = Vec::new();
     scan_outside_quotes(&lower, |i, _| {
-        ["last=", "earliest=", "latest="]
-            .iter()
-            .any(|needle| bytes[i..].starts_with(needle.as_bytes()))
-            && (i == 0 || !is_ident_byte(bytes[i - 1]))
-    })
-    .is_some()
+        if i > 0 && is_ident_byte(bytes[i - 1]) {
+            return false;
+        }
+        for kw in KEYWORDS {
+            if bytes[i..].starts_with(kw.as_bytes()) && bytes.get(i + kw.len()) == Some(&b'=') {
+                found.push((i + kw.len() + 1, kw));
+                break;
+            }
+        }
+        false
+    });
+    // `to_ascii_lowercase` is byte-for-byte, so the offsets index the
+    // original: the value keeps the case the user typed.
+    found
+        .into_iter()
+        .map(|(at, keyword)| TimeClause {
+            keyword,
+            value: read_clause_value(search, at),
+        })
+        .collect()
+}
+
+/// The value token after a `<keyword>=`, with a DSL string literal
+/// unquoted and unescaped. An unterminated literal reads to the end.
+fn read_clause_value(search: &str, start: usize) -> String {
+    let bytes = search.as_bytes();
+    if start >= bytes.len() {
+        return String::new();
+    }
+    if bytes[start] == b'"' {
+        let mut out = String::new();
+        let mut i = start + 1;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\\' if i + 1 < bytes.len() => {
+                    // The next byte is taken verbatim; a continuation
+                    // byte can only follow a multi-byte lead, never a
+                    // backslash, so this stays on a char boundary.
+                    let next = i + 1;
+                    let end = search[next..]
+                        .char_indices()
+                        .nth(1)
+                        .map_or(search.len(), |(o, _)| next + o);
+                    out.push_str(&search[next..end]);
+                    i = end;
+                }
+                b'"' => break,
+                _ => {
+                    let end = search[i..]
+                        .char_indices()
+                        .nth(1)
+                        .map_or(search.len(), |(o, _)| i + o);
+                    out.push_str(&search[i..end]);
+                    i = end;
+                }
+            }
+        }
+        return out;
+    }
+    let end = bytes[start..]
+        .iter()
+        .position(|b| b.is_ascii_whitespace() || *b == b'|')
+        .map_or(bytes.len(), |p| start + p);
+    search[start..end].to_string()
+}
+
+/// Which time restriction `(base_q, range)` actually runs under.
+///
+/// Mirrors [`effective_query`]'s merge exactly: DSL clauses suppress a
+/// quick range, and an absolute range always applies, carrying any DSL
+/// clauses beside it because both restrictions are AND-ed in the search
+/// stage.
+#[must_use]
+pub fn effective_window(base_q: &str, range: &RangeSpec) -> EffectiveWindow {
+    let (search_raw, _) = split_search_stage(base_q.trim());
+    let dsl = find_time_clauses(search_raw.trim());
+    match range {
+        RangeSpec::Absolute { from, to } => EffectiveWindow::Absolute {
+            from: from.clone(),
+            to: to.clone(),
+            dsl,
+        },
+        RangeSpec::Quick(q) if dsl.is_empty() => EffectiveWindow::Quick((*q).to_string()),
+        RangeSpec::Quick(_) => EffectiveWindow::Dsl(dsl),
+    }
+}
+
+/// The window as one readable phrase: `last 24h`, `earliest 2026-01-01
+/// and latest 2026-01-02`, or `<from> to <to>` with ` and <clauses>`
+/// appended when the DSL restricts it further.
+#[must_use]
+pub fn window_caption(window: &EffectiveWindow) -> String {
+    match window {
+        EffectiveWindow::Dsl(clauses) => clause_phrase(clauses),
+        EffectiveWindow::Quick(q) => format!("last {q}"),
+        EffectiveWindow::Absolute { from, to, dsl } => {
+            let mut out = format!("{from} to {to}");
+            if !dsl.is_empty() {
+                out.push_str(" and ");
+                out.push_str(&clause_phrase(dsl));
+            }
+            out
+        }
+    }
+}
+
+fn clause_phrase(clauses: &[TimeClause]) -> String {
+    clauses
+        .iter()
+        .map(|c| format!("{} {}", c.keyword, c.value))
+        .collect::<Vec<_>>()
+        .join(" and ")
+}
+
+/// Does the search stage already carry a DSL time clause?
+fn search_has_time_clause(search: &str) -> bool {
+    !find_time_clauses(search).is_empty()
 }
 
 const fn is_ident_byte(b: u8) -> bool {
@@ -574,5 +721,129 @@ mod tests {
     #[test]
     fn quick_ranges_contains_default() {
         assert!(QUICK_RANGES.contains(&"15m"));
+    }
+
+    fn clause(keyword: &'static str, value: &str) -> TimeClause {
+        TimeClause {
+            keyword,
+            value: value.to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_dsl_last_clause_wins_over_the_quick_range() {
+        let w = effective_window("service=x last=2h", &quick("15m"));
+        assert_eq!(w, EffectiveWindow::Dsl(vec![clause("last", "2h")]));
+        assert_eq!(window_caption(&w), "last 2h");
+    }
+
+    #[test]
+    fn earliest_and_latest_are_both_read_in_written_order() {
+        let w = effective_window(
+            r#"earliest="2026-01-01T00:00:00Z" service=web latest="2026-01-02T00:00:00Z""#,
+            &quick("15m"),
+        );
+        assert_eq!(
+            w,
+            EffectiveWindow::Dsl(vec![
+                clause("earliest", "2026-01-01T00:00:00Z"),
+                clause("latest", "2026-01-02T00:00:00Z"),
+            ])
+        );
+        assert_eq!(
+            window_caption(&w),
+            "earliest 2026-01-01T00:00:00Z and latest 2026-01-02T00:00:00Z"
+        );
+    }
+
+    #[test]
+    fn a_quoted_or_backticked_lookalike_falls_through_to_the_range() {
+        for base in [
+            "`last=2h`=x",
+            r#"message="last=2h""#,
+            "loglast=2h",
+            "service=web # last=2h",
+        ] {
+            let w = effective_window(base, &quick("15m"));
+            assert_eq!(w, EffectiveWindow::Quick("15m".into()), "{base}");
+            assert_eq!(window_caption(&w), "last 15m", "{base}");
+        }
+    }
+
+    #[test]
+    fn an_absolute_range_names_itself_and_any_dsl_clause_beside_it() {
+        let range = RangeSpec::Absolute {
+            from: "2026-09-05T06:00:00Z".into(),
+            to: "now".into(),
+        };
+        let w = effective_window("service=x", &range);
+        assert_eq!(
+            w,
+            EffectiveWindow::Absolute {
+                from: "2026-09-05T06:00:00Z".into(),
+                to: "now".into(),
+                dsl: vec![],
+            }
+        );
+        assert_eq!(window_caption(&w), "2026-09-05T06:00:00Z to now");
+
+        let both = effective_window("service=x last=2h", &range);
+        assert_eq!(
+            window_caption(&both),
+            "2026-09-05T06:00:00Z to now and last 2h"
+        );
+    }
+
+    #[test]
+    fn a_time_clause_in_the_pipeline_is_not_the_search_stage_window() {
+        // `split_search_stage` bounds the read the same way the merge does.
+        let w = effective_window("service=x | stats count() by last=2h", &quick("1h"));
+        assert_eq!(w, EffectiveWindow::Quick("1h".into()));
+    }
+
+    /// The caption describes what ran. For every base query where
+    /// `effective_query` suppresses the quick range, `effective_window`
+    /// must say `Dsl` — and where it injects one, `Quick`.
+    #[test]
+    fn the_window_agrees_with_the_merge_on_every_suppression() {
+        for base in [
+            "service=x last=2h",
+            "LAST=2h service=x",
+            r#"earliest="2026-01-01T00:00:00Z" service=web"#,
+            r#"latest="2026-01-02T00:00:00Z" service=web"#,
+            "url=https://a/b last=1h",
+            "message=\"x\" last=1h",
+            "service=x",
+            "`last`=5",
+            "loglast=2h",
+            "service=web # latest=x",
+            r#"message="earliest=x""#,
+            "| stats count() by host",
+        ] {
+            let range = quick("15m");
+            let merged = effective_query(base, &[], &range);
+            let suppressed = !merged.contains("last=15m");
+            let window = effective_window(base, &range);
+            assert_eq!(
+                suppressed,
+                matches!(window, EffectiveWindow::Dsl(_)),
+                "{base}: merged={merged}, window={window:?}"
+            );
+        }
+        // An empty base runs nothing at all rather than suppressing
+        // anything, so it is outside the table: there is no page to
+        // caption, and the window still reads as the picker's range.
+        assert_eq!(effective_query("", &[], &quick("15m")), "");
+        assert_eq!(
+            effective_window("", &quick("15m")),
+            EffectiveWindow::Quick("15m".into())
+        );
+    }
+
+    #[test]
+    fn a_quoted_clause_value_is_unescaped_once() {
+        let clauses = find_time_clauses(r#"earliest="2026-01-01T00:00:00Z\" x" service=web"#);
+        assert_eq!(clauses.len(), 1);
+        assert_eq!(clauses[0].value, r#"2026-01-01T00:00:00Z" x"#);
     }
 }

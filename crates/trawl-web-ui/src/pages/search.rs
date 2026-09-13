@@ -36,8 +36,8 @@ use crate::pages::layout::ShellStatus;
 use crate::search_status::{CountSource, FooterCount, StatusInputs, StatusKind, search_status};
 use crate::search_url::{Param, admit_filters, refusal_copy};
 use crate::state::query::{
-    Filter, Mode, RangeSpec, UrlSignals, effective_query, navigator, replace_navigator,
-    report_refusal, url_signals,
+    Filter, Mode, RangeSpec, UrlSignals, effective_query, effective_window, navigator,
+    replace_navigator, report_refusal, url_signals,
 };
 use crate::state::search_session::rows_resource;
 use fleet_ui::{LoadState, TabItem, Tabs, ToastBus, ToastKind};
@@ -605,6 +605,11 @@ pub fn Search() -> impl IntoView {
 
     let filters_sig = Signal::derive(move || filters.get());
     let range_sig = Signal::derive(move || range.get());
+    // What the histogram's caption states: the restriction the effective
+    // query ran under, which is the base query's own time clause when it
+    // carries one — the picker's trigger keeps saying what the URL holds
+    // (ADR-0027, amended 2026-09-12).
+    let window = Signal::derive(move || effective_window(&executed_q.get(), &range.get()));
 
     view! {
         <div class="search-layout">
@@ -694,7 +699,7 @@ pub fn Search() -> impl IntoView {
                 } else { match (active_tab.get(), mode.get()) {
                     (ResultsTab::Events, Mode::Snapshot) => view! {
                         <>
-                            <Histogram rows=rows range=range_sig/>
+                            <Histogram rows=rows window=window/>
                             <ResultsTable
                                 busy=running
                                 page=page
