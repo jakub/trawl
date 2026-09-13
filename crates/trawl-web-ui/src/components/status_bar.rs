@@ -19,28 +19,16 @@ use trawl_api::DashboardSnapshot;
 
 use crate::api;
 use crate::components::service_card_fmt::{format_bytes, format_count, format_uptime};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StatusKind {
-    /// Connected to trawld; idle, ready to run.
-    Connected,
-    /// Snapshot query in flight.
-    Hauling,
-    /// Live SSE stream open.
-    Live,
-    /// Last query errored; the status dot turns red. Nothing constructs
-    /// it yet, hence the allow below.
-    #[allow(dead_code)]
-    Error,
-}
+use crate::search_status::{FooterCount, StatusKind, footer_count_label};
 
 #[component]
 #[allow(clippy::too_many_lines)] // one footer, one markup tree
 pub fn StatusBar(
     #[prop(into)] status: Signal<StatusKind>,
-    /// Last-search row count (`None` if nothing has run yet).
+    /// The active result source's count and the source it names
+    /// (`Last —` before anything has run).
     #[prop(into)]
-    count: Signal<Option<usize>>,
+    count: Signal<FooterCount>,
     /// Currently lagged events count, if the live stream emitted a
     /// back-pressure notification.
     #[prop(into)]
@@ -109,7 +97,7 @@ pub fn StatusBar(
         <div class="statusbar">
             <div class="grp">
                 <span class=status_class></span>
-                <span class="strong">{status_label}</span>
+                <span class="strong status-label">{status_label}</span>
             </div>
             {move || lagged.get().map(|n| view! {
                 <>
@@ -150,11 +138,14 @@ pub fn StatusBar(
                 </>
             })}
             <span class="divider">"·"</span>
-            <div class="grp">
+            // The footer names the source it counted, so the label is
+            // data, not markup: `Last` in snapshot, `Received` or
+            // `Updates` while the stream is the active source.
+            <div class="grp count">
                 <span>
-                    "Last "
+                    {move || format!("{} ", footer_count_label(&count.get()).0)}
                     <span class="strong">
-                        {move || count.get().map_or_else(|| "—".to_string(), |c| c.to_string())}
+                        {move || footer_count_label(&count.get()).1}
                     </span>
                 </span>
             </div>

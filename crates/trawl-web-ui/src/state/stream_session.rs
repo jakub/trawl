@@ -67,6 +67,11 @@ pub struct LiveSignals {
     pub lagged: RwSignal<Option<u64>>,
     /// Search displays failures; callers without a status view may omit it.
     pub failure: Option<RwSignal<Option<&'static str>>>,
+    /// Aggregation frames accepted since the stream opened — the
+    /// footer's `Updates` count. Bumped only for a frame that passed
+    /// validation, so a malformed one raises the failure without
+    /// claiming an update. Callers without a count may omit it.
+    pub frames: Option<RwSignal<u64>>,
 }
 
 /// Bounded, append-only-from-the-tail ring of raw events.
@@ -114,6 +119,7 @@ pub fn start_stream(query: &str, signals: LiveSignals) -> Option<StreamLifecycle
         snapshot,
         lagged,
         failure,
+        ..
     } = signals;
 
     // Lagged signal auto-clear: set(Some(n)) then schedule a set(None)
@@ -208,7 +214,10 @@ pub fn start_stream(query: &str, signals: LiveSignals) -> Option<StreamLifecycle
 
 fn snapshot_listener(signals: LiveSignals) -> Closure<dyn FnMut(MessageEvent)> {
     let LiveSignals {
-        snapshot, failure, ..
+        snapshot,
+        failure,
+        frames,
+        ..
     } = signals;
     Closure::<dyn FnMut(MessageEvent)>::new(move |ev: MessageEvent| {
         let wire = ev
@@ -242,6 +251,9 @@ fn snapshot_listener(signals: LiveSignals) -> Closure<dyn FnMut(MessageEvent)> {
         }
         if let Some(failure) = failure {
             failure.set(None);
+        }
+        if let Some(frames) = frames {
+            frames.update(|n| *n = n.wrapping_add(1));
         }
         // Rehydrate rows in declared column order. Missing keys land as
         // Null (consistent with how the server materializes sparse rows).

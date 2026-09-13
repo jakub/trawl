@@ -10,7 +10,7 @@
 # exits 0 only if every requested mutation was killed.
 #
 # Usage:
-#   e2e/scripts/mutation-check.sh                 # run all 25 standard mutations (21 uses its own runner)
+#   e2e/scripts/mutation-check.sh                 # run all 27 standard mutations (21 uses its own runner)
 #   e2e/scripts/mutation-check.sh 02-editor-onchange.patch   # just one
 #
 # Refuses to run against a dirty tree — a patch applied on top of your
@@ -68,6 +68,8 @@ declare -A SPEC_FOR=(
   [24-palette-overlay-gate.patch]="command-palette.spec.ts"
   [25-palette-toggle.patch]="command-palette.spec.ts"
   [26-save-editor-snapshot.patch]="settings-disposition.spec.ts"
+  [27-stop-live-replace.patch]="live-coherence.spec.ts"
+  [28-live-snapshot-query.patch]="live-coherence.spec.ts"
 )
 
 # patch-file -> a CONTROL spec the mutation does NOT touch, which must
@@ -103,6 +105,8 @@ declare -A CONTROL_FOR=(
   [24-palette-overlay-gate.patch]="routing.spec.ts"
   [25-palette-toggle.patch]="routing.spec.ts"
   [26-save-editor-snapshot.patch]="routing.spec.ts"
+  [27-stop-live-replace.patch]="routing.spec.ts"
+  [28-live-snapshot-query.patch]="routing.spec.ts"
 )
 
 PATCHES=()
@@ -135,6 +139,8 @@ else
     24-palette-overlay-gate.patch
     25-palette-toggle.patch
     26-save-editor-snapshot.patch
+    27-stop-live-replace.patch
+    28-live-snapshot-query.patch
   )
 fi
 

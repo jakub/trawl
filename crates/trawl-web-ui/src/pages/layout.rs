@@ -18,7 +18,8 @@ use leptos_router::components::Outlet;
 use fleet_ui::{Icon, IconView, ModeTab, RailItem, Shell, UserInfo};
 
 use crate::api;
-use crate::components::status_bar::{StatusBar, StatusKind};
+use crate::components::status_bar::StatusBar;
+use crate::search_status::{FooterCount, StatusKind};
 use crate::state::app_mode::{self, AppMode};
 use crate::state::section;
 use crate::state::stats_stream::{StatsLifecycle, start_stats_stream};
@@ -29,7 +30,7 @@ use crate::state::stats_stream::{StatsLifecycle, start_stats_stream};
 #[derive(Clone, Copy)]
 pub struct ShellStatus {
     pub kind: RwSignal<StatusKind>,
-    pub count: RwSignal<Option<usize>>,
+    pub count: RwSignal<FooterCount>,
     pub lagged: RwSignal<Option<u64>>,
 }
 
@@ -61,7 +62,9 @@ pub fn AuthShell() -> impl IntoView {
 
     let shell_status = ShellStatus {
         kind: RwSignal::new(StatusKind::Connected),
-        count: RwSignal::new(None),
+        // Pages that never run a search keep the shell's own default:
+        // the snapshot source with nothing counted yet.
+        count: RwSignal::new(FooterCount::last(None)),
         lagged: RwSignal::new(None),
     };
     provide_context(shell_status);

@@ -58,6 +58,7 @@ const SERVICE_DRAWER_RS: &str = include_str!("../src/components/service_drawer.r
 const NET_DRAWER_RS: &str = include_str!("../src/components/net_drawer.rs");
 const FACET_SIDEBAR_RS: &str = include_str!("../src/components/facet_sidebar.rs");
 const STATUS_BAR_RS: &str = include_str!("../src/components/status_bar.rs");
+const HISTOGRAM_RS: &str = include_str!("../src/components/histogram.rs");
 const DRAWER_QUERY_RS: &str = include_str!("../src/drawer_query.rs");
 const SEARCH_INPUT_RS: &str = include_str!("../../fleet-ui/src/search_input.rs");
 const SEGMENTED_COMPONENT_RS: &str = include_str!("../../fleet-ui/src/segmented/component.rs");
@@ -565,6 +566,30 @@ const CONTRACTS: &[Contract] = &[
         hook: "class=\"results\"",
     },
     Contract {
+        assignment: "stopLive: '.tabs button.action.stop-live',",
+        source_path: "src/pages/search.rs",
+        source: include_str!("../src/pages/search.rs"),
+        hook: "class=\"action stop-live\"",
+    },
+    Contract {
+        assignment: "histoStrip: '.histo',",
+        source_path: "src/components/histogram.rs",
+        source: HISTOGRAM_RS,
+        hook: "class=\"histo\"",
+    },
+    Contract {
+        assignment: "histoCaption: '.histo-caption',",
+        source_path: "src/components/histogram.rs",
+        source: HISTOGRAM_RS,
+        hook: "class=\"histo-caption\"",
+    },
+    Contract {
+        assignment: "histoCaptionPrefix: 'Current page · window: ',",
+        source_path: "src/components/histogram.rs",
+        source: HISTOGRAM_RS,
+        hook: "Current page · window: {}",
+    },
+    Contract {
         assignment: "exportAction: '.tabs .action.export',",
         source_path: "src/pages/search.rs",
         source: include_str!("../src/pages/search.rs"),
@@ -695,6 +720,12 @@ const CONTRACTS: &[Contract] = &[
         source_path: "src/components/editor_wrap.rs",
         source: EDITOR_WRAP_RS,
         hook: "\"Live Tail\"",
+    },
+    Contract {
+        assignment: "stopLiveText: 'Stop live',",
+        source_path: "src/pages/search.rs",
+        source: include_str!("../src/pages/search.rs"),
+        hook: ">\"Stop live\"<",
     },
     Contract {
         assignment: "toastAny: '.toast',",
@@ -1223,6 +1254,18 @@ const CONTRACTS: &[Contract] = &[
         source_path: "src/components/meta_strip.rs",
         source: META_STRIP_RS,
         hook: "class=\"x\"",
+    },
+    Contract {
+        assignment: "statusLabel: '.statusbar .status-label',",
+        source_path: "src/components/status_bar.rs",
+        source: STATUS_BAR_RS,
+        hook: "class=\"strong status-label\"",
+    },
+    Contract {
+        assignment: "footerCount: '.statusbar .grp.count',",
+        source_path: "src/components/status_bar.rs",
+        source: STATUS_BAR_RS,
+        hook: "class=\"grp count\"",
     },
     Contract {
         assignment: "themeControl: '.statusbar button.grp.clickable',",

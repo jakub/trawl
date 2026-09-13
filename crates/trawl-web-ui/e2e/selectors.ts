@@ -125,6 +125,17 @@ export const SEL = {
   /// banner is the whole results area then (ADR-0027).
   resultsPane: '.results',
   /// crates/trawl-web-ui/src/pages/search.rs — the tab strip's trailing
+  /// Stop live action, rendered only while the stream is the active
+  /// result source.
+  stopLive: '.tabs button.action.stop-live',
+  /// crates/trawl-web-ui/src/components/histogram.rs — the histogram
+  /// strip itself. Absent in live, where the ring is the active result
+  /// source and a page-scoped strip would describe nothing.
+  histoStrip: '.histo',
+  /// crates/trawl-web-ui/src/components/histogram.rs — the one caption
+  /// naming the window the effective query ran under.
+  histoCaption: '.histo-caption',
+  /// crates/trawl-web-ui/src/pages/search.rs — the tab strip's trailing
   /// Export action, which opens the export modal.
   exportAction: '.tabs .action.export',
   /// crates/trawl-web-ui/src/pages/search.rs — its Save twin.
@@ -299,6 +310,12 @@ export const SEL = {
   /// crates/trawl-web-ui/src/components/meta_strip.rs — a filter chip's
   /// remove control, named after the filter it drops.
   chipRemove: '.meta-chips .chip button.x',
+  /// crates/trawl-web-ui/src/components/status_bar.rs — the footer's
+  /// status text (Connected / Hauling / Live / Error).
+  statusLabel: '.statusbar .status-label',
+  /// crates/trawl-web-ui/src/components/status_bar.rs — the footer's
+  /// count group, whose label names the source it counted.
+  footerCount: '.statusbar .grp.count',
   /// crates/trawl-web-ui/src/components/status_bar.rs — the theme
   /// control. Its visible text is the theme in force and its accessible
   /// name is the theme a press would produce.
@@ -372,6 +389,12 @@ export const COPY = {
   /// crates/trawl-web-ui/src/components/editor_wrap.rs — app-supplied
   /// Real-time tab's "Live Tail" button text.
   liveTailButtonText: 'Live Tail',
+  /// crates/trawl-web-ui/src/pages/search.rs — the tab strip's Stop
+  /// live button text.
+  stopLiveText: 'Stop live',
+  /// crates/trawl-web-ui/src/components/histogram.rs — the histogram
+  /// caption's lead-in, before the window the query ran under.
+  histoCaptionPrefix: 'Current page · window: ',
   /// crates/trawl-web-ui/src/search_url.rs Malformed::message + Param::noun.
   urlNoticeFiltersPrefix: "This link's filters could not be read:",
   /// crates/trawl-web-ui/src/search_url.rs Malformed::message + Param::noun.

@@ -40,6 +40,25 @@ pub fn compute_facets(result: &QueryResult) -> Vec<FieldFacet> {
     out
 }
 
+/// Does this query return an aggregation-shaped result?
+///
+/// The filter rail is suppressed for one. `compute_facets` keys integer
+/// cells, so a `stats count() by status` page facets its own `count`
+/// column and the include control would build `count="42"` — a search
+/// clause `effective_query` prepends to the search stage, naming a field
+/// no event carries. The chart surfaces read the same answer to decide
+/// whether a result is plottable.
+///
+/// An empty or unparseable query is not aggregation-shaped: there is no
+/// pipeline to read, and the rail's ordinary behaviour is the safe one.
+#[must_use]
+pub fn is_aggregation_shape(query: &str) -> bool {
+    if query.trim().is_empty() {
+        return false;
+    }
+    trawl_core::parser::parse(query).is_ok_and(|ast| ast.has_aggregation())
+}
+
 fn facet_column(rows: &[Vec<Value>], idx: usize) -> Option<Vec<(String, u32)>> {
     let mut counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     for row in rows {
@@ -162,5 +181,44 @@ mod tests {
         // Both count 1 — alphabetic order wins the tie.
         assert_eq!(facets[0].1[0].0, "apple");
         assert_eq!(facets[0].1[1].0, "zebra");
+    }
+
+    #[test]
+    fn stats_by_is_aggregation_shaped() {
+        assert!(is_aggregation_shape("last=15m * | stats count() by status"));
+        assert!(is_aggregation_shape(
+            "service=web | timechart span=1h count()"
+        ));
+    }
+
+    #[test]
+    fn a_plain_search_on_an_integer_field_is_not_aggregation_shaped() {
+        assert!(!is_aggregation_shape("last=15m status=200"));
+        assert!(!is_aggregation_shape("* | head 10"));
+        // Nothing to read is not a shape.
+        assert!(!is_aggregation_shape(""));
+        assert!(!is_aggregation_shape("   "));
+        assert!(!is_aggregation_shape("| | |"));
+    }
+
+    /// Why the gate exists: an aggregation page facets its own aggregate
+    /// column, and the include control would then build `count="2"` — a
+    /// search-stage clause naming a field no event carries.
+    #[test]
+    fn an_aggregation_result_would_facet_its_aggregate_column() {
+        let result = QueryResult {
+            columns: vec![col("status"), col("count")],
+            rows: vec![
+                vec![Value::String("200".into()), Value::Integer(2)],
+                vec![Value::String("404".into()), Value::Integer(2)],
+            ],
+        };
+        let facets = compute_facets(&result);
+        assert!(
+            facets
+                .iter()
+                .any(|(field, values)| field == "count" && values.contains(&("2".to_string(), 2))),
+            "{facets:?}"
+        );
     }
 }

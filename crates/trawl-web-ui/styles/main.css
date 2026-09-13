@@ -1604,6 +1604,13 @@
 
 .tl-stream:focus-visible { outline: 2px solid var(--ring); outline-offset: -2px; }
 
+.histo-caption {
+  padding: 6px 14px 0;
+  background: var(--panel);
+  font-family: var(--font-ui);
+  font-size: var(--fs-micro);
+  color: var(--ink-3);
+}
 .bucket-data { padding: 6px 14px; background: var(--panel); }
 .bucket-data summary { cursor: pointer; min-height: 32px; align-content: center; }
 .bucket-scroll { overflow: auto; max-height: 240px; }

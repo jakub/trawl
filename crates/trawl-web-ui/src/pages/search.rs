@@ -31,15 +31,16 @@ use crate::components::malformed_notice::MalformedNotice;
 use crate::components::meta_strip::MetaStrip;
 use crate::components::results_table::ResultsTable;
 use crate::components::save_as_net_modal::SaveAsNetModal;
-use crate::components::status_bar::StatusKind;
+use crate::facets::is_aggregation_shape;
 use crate::pages::layout::ShellStatus;
+use crate::search_status::{CountSource, FooterCount, StatusInputs, StatusKind, search_status};
 use crate::search_url::{Param, admit_filters, refusal_copy};
 use crate::state::query::{
-    Filter, Mode, RangeSpec, UrlSignals, effective_query, navigator, replace_navigator,
-    report_refusal, url_signals,
+    Filter, Mode, RangeSpec, UrlSignals, effective_query, effective_window, navigator,
+    replace_navigator, report_refusal, url_signals,
 };
 use crate::state::search_session::rows_resource;
-use fleet_ui::{TabItem, Tabs, ToastBus, ToastKind};
+use fleet_ui::{LoadState, TabItem, Tabs, ToastBus, ToastKind};
 
 use crate::state::stream_session::{
     LiveSignals, RingBuffer, StreamLifecycle, ring_to_result, start_stream,
@@ -129,8 +130,27 @@ pub fn Search() -> impl IntoView {
         effective_query(&base, &fs, &r)
     });
 
+    // Whether the stream, not the snapshot resource, is the active
+    // result source. `mode=live` is a claim the page keeps true
+    // (ADR-0027, amended 2026-09-12).
+    let live = Signal::derive(move || mode.get() == Mode::Live);
+
+    // What the snapshot resource runs: nothing at all while live. The
+    // resource short-circuits an empty query without a round trip, so
+    // no `/api/v1/query` leaves the page behind a stream, and every
+    // reader of `rows` below reads the "no query yet" placeholder
+    // instead of the page the previous mode left behind. `effective_q`
+    // still drives the stream, the export modal and the notice.
+    let snapshot_q = Memo::new(move |_| {
+        if live.get() {
+            String::new()
+        } else {
+            effective_q.get()
+        }
+    });
+
     let (query_pending, set_query_pending) = signal(false);
-    let rows = rows_resource(effective_q, page, set_query_pending);
+    let rows = rows_resource(snapshot_q, page, set_query_pending);
 
     let goto = navigator();
 
@@ -148,17 +168,28 @@ pub fn Search() -> impl IntoView {
             // the address bar keeps its query, so a query too long to
             // share is a toast and an edit away from working, not a
             // banner over an editor the page just emptied.
-            report_refusal(
-                bus,
-                goto(
-                    &query_text.get_untracked(),
-                    0,
-                    mode.get_untracked(),
-                    &filters.get_untracked(),
-                    &range.get_untracked(),
-                    false,
-                ),
+            // Hauling the query the URL already carries writes the same
+            // link, and the memos behind the resource do not notify on an
+            // unchanged value — so a snapshot Haul would be silent just
+            // when it is the only way to retry a page that failed. Ask
+            // the resource itself in that case. In live the same Haul is
+            // a no-op: no snapshot runs, and the stream's own key
+            // (retry, mode, effective query) has not moved.
+            let rerun = !live.get_untracked()
+                && page.get_untracked() == 0
+                && query_text.get_untracked() == executed_q.get_untracked();
+            let outcome = goto(
+                &query_text.get_untracked(),
+                0,
+                mode.get_untracked(),
+                &filters.get_untracked(),
+                &range.get_untracked(),
+                false,
             );
+            if rerun && outcome.is_ok() {
+                rows.refetch();
+            }
+            report_refusal(bus, outcome);
         })
     };
 
@@ -289,13 +320,17 @@ pub fn Search() -> impl IntoView {
                 return Err("This search link could not be read.".to_string());
             }
             let new_range = crate::search_url::normalize_dialog_range(picked)?;
-            if range.get_untracked() == new_range {
+            // Committing a range is a bounded question, so it leaves
+            // live even when it names the range already selected — the
+            // short-circuit is for a selection that changes nothing at
+            // all, and in live the mode is the change.
+            if range.get_untracked() == new_range && !live.get_untracked() {
                 return Ok(());
             }
             goto(
                 &executed_q.get_untracked(),
                 0,
-                mode.get_untracked(),
+                Mode::Snapshot,
                 &filters.get_untracked(),
                 &new_range,
                 false,
@@ -343,11 +378,37 @@ pub fn Search() -> impl IntoView {
         })
     };
 
+    // Leaving live is a navigation, not a local pause: the same query,
+    // page 0 and the URL's filters and range, with `mode` elided. Push,
+    // so Back returns to the stream.
+    let on_stop_live = {
+        let goto = goto.clone();
+        Callback::new(move |()| {
+            if unreadable.get_untracked() {
+                return;
+            }
+            report_refusal(
+                bus,
+                goto(
+                    &executed_q.get_untracked(),
+                    0,
+                    Mode::Snapshot,
+                    &filters.get_untracked(),
+                    &range.get_untracked(),
+                    false,
+                ),
+            );
+        })
+    };
+
     // --- live-tail state ----------------------------------------------
     let ring = RwSignal::new(RingBuffer::default());
     let live_snapshot = RwSignal::new(None::<QueryResult>);
     let lagged = RwSignal::new(None::<u64>);
     let stream_failure = RwSignal::new(None::<&'static str>);
+    // Aggregation frames this session accepted — the footer's `Updates`
+    // count. The ring's own `epoch` is the raw twin (`Received`).
+    let frames = RwSignal::new(0_u64);
     let stream_retry = RwSignal::new(0_u64);
     let retry_stream = Callback::new(move |()| stream_retry.update(|n| *n = n.wrapping_add(1)));
     let stream_handle: StoredValue<Option<StreamLifecycle>, LocalStorage> =
@@ -367,6 +428,10 @@ pub fn Search() -> impl IntoView {
         live_snapshot.set(None);
         lagged.set(None);
         stream_failure.set(None);
+        // A new session counts from zero. An automatic EventSource
+        // reconnect does not re-run this effect, so a blip keeps the
+        // rows and both counts.
+        frames.set(0);
 
         if current_mode != Mode::Live || q.trim().is_empty() {
             return;
@@ -377,6 +442,7 @@ pub fn Search() -> impl IntoView {
             snapshot: live_snapshot,
             lagged,
             failure: Some(stream_failure),
+            frames: Some(frames),
         };
         if let Some(handle) = start_stream(&q, signals) {
             stream_handle.update_value(|slot| *slot = Some(handle));
@@ -394,36 +460,87 @@ pub fn Search() -> impl IntoView {
     let tabs_active = Signal::derive(move || active_tab.get().id().to_string());
     let on_tab_change = Callback::new(move |id: String| active_tab.set(ResultsTab::from_id(&id)));
 
-    let is_chart_query = Memo::new(move |_| {
-        let q = effective_q.get();
-        if q.trim().is_empty() {
-            return false;
-        }
-        trawl_core::parser::parse(&q).is_ok_and(|ast| ast.has_aggregation())
-    });
+    let is_chart_query = Memo::new(move |_| is_aggregation_shape(&effective_q.get()));
 
     let ring_result = Memo::new(move |_| ring_to_result(&ring.read()));
 
-    let loading = Signal::derive(move || {
-        !effective_q.get().trim().is_empty() && (query_pending.get() || rows.get().is_none())
+    // The rows on screen, from whichever source the mode makes active:
+    // the snapshot page, the live ring, or the latest aggregation frame.
+    // The tab count, the footer count and the filter rail all read this
+    // and nothing else (ADR-0027, amended 2026-09-12).
+    let active_rows = Memo::new(move |_| {
+        if unreadable.get() {
+            // Nothing ran, and the banner is the results pane: no source
+            // to describe, so no count either.
+            return LoadState::Loading;
+        }
+        if live.get() {
+            return if is_chart_query.get() {
+                // Before the first frame the stream has delivered no
+                // rows, which is a count of zero rather than a pending
+                // request.
+                LoadState::Ready(live_snapshot.get().unwrap_or_else(QueryResult::empty))
+            } else {
+                LoadState::Ready(ring_result.get())
+            };
+        }
+        LoadState::from_resource(rows.get().map(|r| r.map(|resp| resp.result)))
+    });
+    let active_row_count = Signal::derive(move || match active_rows.get() {
+        LoadState::Ready(result) => Some(result.rows.len()),
+        _ => None,
     });
 
-    // Drive the shell's status bar from search-specific state.
+    // A resource keeps its previous response while the next one loads,
+    // so "did a snapshot run" is `snapshot_q`, not the mode: the strip
+    // and the notice below must not describe the page live replaced for
+    // the frame it takes the empty query to resolve.
+    let snapshot_ran = Signal::derive(move || !snapshot_q.get().trim().is_empty());
+
+    let loading = Signal::derive(move || {
+        !snapshot_q.get().trim().is_empty() && (query_pending.get() || rows.get().is_none())
+    });
+
+    // Drive the shell's status bar from search-specific state. Both
+    // derivations are pure (`search_status.rs`): the footer describes
+    // the active result source, and nothing else on the page.
+    let snapshot_failed = Signal::derive(move || rows.get().is_some_and(|r| r.is_err()));
     Effect::new(move |_| {
-        shell_status.kind.set(match (mode.get(), loading.get()) {
-            (Mode::Live, _) => StatusKind::Live,
-            (_, true) => StatusKind::Hauling,
-            _ => StatusKind::Connected,
-        });
+        shell_status.kind.set(search_status(StatusInputs {
+            unreadable: unreadable.get(),
+            live: live.get(),
+            stream_failed: stream_failure.get().is_some(),
+            snapshot_failed: snapshot_failed.get(),
+            snapshot_pending: loading.get(),
+        }));
     });
     Effect::new(move |_| {
-        shell_status.count.set(if unreadable.get() {
-            None
+        // Each mode's count names its own source: the rows the last
+        // snapshot returned, the events delivered since the stream
+        // opened (including those that rolled off the ring), or the
+        // aggregation frames it accepted.
+        let count = if !unreadable.get() && live.get() {
+            if is_chart_query.get() {
+                FooterCount {
+                    source: CountSource::Updates,
+                    value: Some(frames.get()),
+                }
+            } else {
+                FooterCount {
+                    source: CountSource::Received,
+                    value: Some(ring.read().epoch),
+                }
+            }
         } else {
-            rows.get()
-                .and_then(Result::ok)
-                .map(|r| r.pagination.returned)
-        });
+            FooterCount::last(if unreadable.get() || !snapshot_ran.get() {
+                None
+            } else {
+                rows.get()
+                    .and_then(Result::ok)
+                    .map(|r| u64::try_from(r.pagination.returned).unwrap_or(u64::MAX))
+            })
+        };
+        shell_status.count.set(count);
     });
     Effect::new(move |_| {
         shell_status.lagged.set(lagged.get());
@@ -431,31 +548,20 @@ pub fn Search() -> impl IntoView {
 
     on_cleanup(move || {
         shell_status.kind.set(StatusKind::Connected);
-        shell_status.count.set(None);
+        shell_status.count.set(FooterCount::last(None));
         shell_status.lagged.set(None);
     });
 
     let truncated = Signal::derive(move || {
-        !unreadable.get() && rows.get().and_then(Result::ok).is_some_and(|r| r.truncated)
+        !unreadable.get()
+            && snapshot_ran.get()
+            && rows.get().and_then(Result::ok).is_some_and(|r| r.truncated)
     });
-    let last_count = Signal::derive(move || {
-        if unreadable.get() {
-            return None;
-        }
-        rows.get()
-            .and_then(Result::ok)
-            .map(|r| r.pagination.returned)
-    });
-
     // The degraded fields this execution reported. Read off the
     // response, never re-derived and never refreshed from the catalog:
     // it describes the answer already on screen.
-    //
-    // Empty in live mode by construction — the snapshot resource keeps
-    // running behind the live tail, and SSE carries no notice, so a
-    // stale snapshot's fields must not be shown over streamed rows.
     let degraded_fields = Signal::derive(move || {
-        if mode.get() == Mode::Live || unreadable.get() {
+        if unreadable.get() || !snapshot_ran.get() {
             return Vec::new();
         }
         rows.get()
@@ -499,13 +605,19 @@ pub fn Search() -> impl IntoView {
 
     let filters_sig = Signal::derive(move || filters.get());
     let range_sig = Signal::derive(move || range.get());
+    // What the histogram's caption states: the restriction the effective
+    // query ran under, which is the base query's own time clause when it
+    // carries one — the picker's trigger keeps saying what the URL holds
+    // (ADR-0027, amended 2026-09-12).
+    let window = Signal::derive(move || effective_window(&executed_q.get(), &range.get()));
 
     view! {
         <div class="search-layout">
             <FacetSidebar
-                rows=rows
+                state=active_rows
                 filters=filters_sig
                 suppressed=unreadable
+                aggregate_shape=is_chart_query
                 on_add=on_add_filter
                 on_clear=on_clear_filters
             />
@@ -531,7 +643,7 @@ pub fn Search() -> impl IntoView {
                 <MalformedNotice malformed=malformed_sig repair=repair_sig on_repair=on_repair/>
                 <Tabs
                     items=vec![
-                        TabItem::with_count(ResultsTab::Events.id(), "Events", last_count),
+                        TabItem::with_count(ResultsTab::Events.id(), "Events", active_row_count),
                         TabItem::new(ResultsTab::Visualization.id(), "Visualization"),
                     ]
                     label="Results"
@@ -542,6 +654,15 @@ pub fn Search() -> impl IntoView {
                     // the blanked sentinel then, and the server reads
                     // an empty query as every row (ADR-0027).
                     trailing=Box::new(move || view! {
+                        <Show when=move || live.get()>
+                            <button
+                                type="button"
+                                class="action stop-live"
+                                title="Stop the live stream and run this query once"
+                                disabled=move || unreadable.get()
+                                on:click=move |_| on_stop_live.run(())
+                            >"Stop live"</button>
+                        </Show>
                         <button
                             type="button"
                             class="action save"
@@ -578,7 +699,7 @@ pub fn Search() -> impl IntoView {
                 } else { match (active_tab.get(), mode.get()) {
                     (ResultsTab::Events, Mode::Snapshot) => view! {
                         <>
-                            <Histogram rows=rows range=range_sig/>
+                            <Histogram rows=rows window=window pending=loading/>
                             <ResultsTable
                                 busy=running
                                 page=page

@@ -38,6 +38,7 @@ successful sign-in lands on `/search`.
 | Editor | Holds the in-progress query. Editing it executes nothing |
 | Date range | Selects `5m`, `15m`, `1h`, `4h`, `24h`, `7d`, or an absolute interval |
 | **Live Tail** | In the date-range popover. Streams the editor's query over SSE |
+| **Stop live** | Beside the tabs, in live mode only. Closes the stream and runs the same query once, with the filters and the range unchanged |
 | **Haul** | Executes the editor's query. Ctrl+Enter and Command+Enter do the same |
 | **Save** | Names the query and stores it as a net. It does not freeze the rows |
 | **Share** | Copies the current URL to the clipboard |
@@ -52,6 +53,18 @@ successful sign-in lands on `/search`.
 Expanding a row shows its fields and raw text, and carries **Copy \_raw**,
 **Show context**, and **Find similar**. Selecting a field tag adds an include
 filter for that value.
+
+The URL carries live mode as `mode=live`. **Stop live** and any range
+selection leave live mode, including a repeat of the range already selected.
+**Haul** and the filter controls keep the current mode. **Stop live** is a
+history entry, so the browser Back button returns to the stream.
+
+The status bar names the source it counted. In snapshot it reads **Last** and
+the number of rows the page returned. In live it reads **Received** and the
+number of events the browser buffer accepted since the stream opened, which is
+not the number of messages the server sent, or, for an aggregation, **Updates**
+and the number of snapshots. The **Events** tab counts the rows on screen in
+both modes.
 
 A live stream has no page count and no incomplete-results notice. See
 [live tail](/use/live-tail/) for its limits and
