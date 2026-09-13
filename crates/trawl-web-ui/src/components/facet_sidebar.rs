@@ -41,6 +41,14 @@ pub fn FacetSidebar(
     /// clearing filters navigates.
     #[prop(into)]
     suppressed: Signal<bool>,
+    /// True when the active result is aggregation-shaped. The rail then
+    /// computes no groups and offers no value search: `compute_facets`
+    /// keys integer cells, so an aggregation page facets its own
+    /// aggregate column and the include control would build a search
+    /// clause naming a field no event carries (`facets::is_aggregation_shape`).
+    /// The header and "Clear all" stay, so URL filters remain removable.
+    #[prop(into)]
+    aggregate_shape: Signal<bool>,
     /// Called when the user clicks `+` or `⊘` on a facet value.
     on_add: Callback<Filter>,
     /// Called when the user clicks "clear all" in the header.
@@ -99,12 +107,16 @@ pub fn FacetSidebar(
                     >"Clear all"</button>
                 </Show>
             </div>
-            <SearchInput value=needle placeholder="Filter field values"/>
+            // Both gates hide the value search with the groups: it
+            // filters names that are not being computed.
+            <Show when=move || !aggregate_shape.get()>
+                <SearchInput value=needle placeholder="Filter field values"/>
+            </Show>
             // Suppression is total: an unreadable link has no active
             // source, so the rail shows its header and nothing else —
             // not even the loading hint the state would otherwise
             // render (ADR-0027).
-            <Show when=move || !suppressed.get()>
+            <Show when=move || !suppressed.get() && !aggregate_shape.get()>
             <Loaded
                 state=state
                 // Deliberate quiet-error override: the results table

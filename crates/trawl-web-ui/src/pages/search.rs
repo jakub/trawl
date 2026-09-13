@@ -31,6 +31,7 @@ use crate::components::malformed_notice::MalformedNotice;
 use crate::components::meta_strip::MetaStrip;
 use crate::components::results_table::ResultsTable;
 use crate::components::save_as_net_modal::SaveAsNetModal;
+use crate::facets::is_aggregation_shape;
 use crate::pages::layout::ShellStatus;
 use crate::search_status::{CountSource, FooterCount, StatusInputs, StatusKind, search_status};
 use crate::search_url::{Param, admit_filters, refusal_copy};
@@ -459,13 +460,7 @@ pub fn Search() -> impl IntoView {
     let tabs_active = Signal::derive(move || active_tab.get().id().to_string());
     let on_tab_change = Callback::new(move |id: String| active_tab.set(ResultsTab::from_id(&id)));
 
-    let is_chart_query = Memo::new(move |_| {
-        let q = effective_q.get();
-        if q.trim().is_empty() {
-            return false;
-        }
-        trawl_core::parser::parse(&q).is_ok_and(|ast| ast.has_aggregation())
-    });
+    let is_chart_query = Memo::new(move |_| is_aggregation_shape(&effective_q.get()));
 
     let ring_result = Memo::new(move |_| ring_to_result(&ring.read()));
 
@@ -617,6 +612,7 @@ pub fn Search() -> impl IntoView {
                 state=active_rows
                 filters=filters_sig
                 suppressed=unreadable
+                aggregate_shape=is_chart_query
                 on_add=on_add_filter
                 on_clear=on_clear_filters
             />
