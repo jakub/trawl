@@ -22,10 +22,13 @@ use fleet_ui::{
     Size, Sparkline, StatusDot, TabItem, ToastBus, ToastKind, Toggle, Variant, effective_active,
 };
 
-use crate::schedule_edit::{WindowDraft, WindowMode, validate_max_runs};
+use crate::schedule_edit::{WindowDraft, WindowMode, preview_cap, validate_max_runs};
 
 use crate::api::RUNS_PAGE_SIZE;
-const RESULT_PREVIEW_ROWS: usize = 20;
+
+/// Rows per page inside an expanded run's stored result. The preview
+/// pages what the response already carries; it never re-fetches.
+const PREVIEW_PAGE_SIZE: std::num::NonZeroUsize = std::num::NonZeroUsize::new(20).unwrap();
 
 const INTERVAL_PRESETS: &[&str] = &["5m", "15m", "1h", "6h", "24h", "1w"];
 
@@ -854,8 +857,9 @@ fn RunResultPreview(
                         }.into_any(),
                         Some(qr) => {
                             let query = resp.summary.query.clone();
+                            let row_count = resp.summary.row_count;
                             view! {
-                                <ResultPreviewTable result=qr/>
+                                <ResultPreviewTable result=qr row_count=row_count/>
                                 <Btn
                                     variant=Variant::Secondary
                                     size=Size::Xs
@@ -872,16 +876,31 @@ fn RunResultPreview(
 }
 
 #[component]
-fn ResultPreviewTable(result: QueryResult) -> impl IntoView {
+fn ResultPreviewTable(result: QueryResult, row_count: Option<usize>) -> impl IntoView {
     let cols = result.columns.clone();
     let rows: Vec<Vec<String>> = result
         .rows
         .iter()
-        .take(RESULT_PREVIEW_ROWS)
         .map(|row| row.iter().map(ToString::to_string).collect())
         .collect();
-    let total_rows = result.rows.len();
-    let truncated = total_rows > RESULT_PREVIEW_ROWS;
+    let total = rows.len();
+    // Local to this expansion, so collapsing a run and opening it again
+    // starts at page 1 rather than on a page the operator left behind.
+    let page = RwSignal::new(0usize);
+    let cap = preview_cap(row_count, total);
+
+    let window = Signal::derive(move || {
+        let offset = PageWindow::checked_offset(page.get(), PREVIEW_PAGE_SIZE).unwrap_or(0);
+        let returned = total.saturating_sub(offset).min(PREVIEW_PAGE_SIZE.get());
+        PageWindow::new(
+            page.get(),
+            PREVIEW_PAGE_SIZE,
+            returned,
+            PageTotal::Known(total),
+            false,
+        )
+        .expect("preview page comes from checked pager navigation")
+    });
 
     view! {
         <table>
@@ -891,19 +910,26 @@ fn ResultPreviewTable(result: QueryResult) -> impl IntoView {
                 </tr>
             </thead>
             <tbody>
-                {rows.into_iter().map(|row| {
-                    view! {
-                        <tr>
-                            {row.into_iter().map(|cell| view! { <td>{cell}</td> }).collect_view()}
-                        </tr>
-                    }
-                }).collect_view()}
+                {move || {
+                    let offset = PageWindow::checked_offset(page.get(), PREVIEW_PAGE_SIZE).unwrap_or(0);
+                    let end = offset.saturating_add(PREVIEW_PAGE_SIZE.get()).min(total);
+                    rows.get(offset..end).unwrap_or_default().iter().map(|row| {
+                        view! {
+                            <tr>
+                                {row.iter().map(|cell| view! { <td>{cell.clone()}</td> }).collect_view()}
+                            </tr>
+                        }
+                    }).collect_view()
+                }}
             </tbody>
         </table>
-        {truncated.then(|| view! {
-            <div style="font-size:11px; color:var(--ink-3); margin-top:4px">
-                {format!("Showing {RESULT_PREVIEW_ROWS} of {total_rows} rows")}
-            </div>
-        })}
+        <OffsetPager
+            window=window
+            on_page=Callback::new(move |p| page.set(p))
+        />
+        // Outside the paged slice: the gap between what the run stored
+        // and what this response carries is a property of the response,
+        // not of the page being read.
+        {cap.map(|text| view! { <p class="preview-cap">{text}</p> })}
     }
 }

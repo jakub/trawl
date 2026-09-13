@@ -18,9 +18,7 @@
 //! Pure + ungated so its tests run natively; the callers are
 //! wasm32-only.
 
-// `preview_cap` has no caller until the run preview pages; the rest is
-// wasm-only, so the native test build sees it all as dead.
-#![allow(dead_code)]
+#![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
 use trawl_api::ScheduleResponse;
 

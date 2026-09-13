@@ -1495,6 +1495,11 @@
 .run-preview table { width: 100%; font-family: var(--font-mono); font-size: var(--fs-dense); border-collapse: collapse; }
 .run-preview th { text-align: left; color: var(--ink-3); padding: 2px 6px; border-bottom: 1px solid var(--line); }
 .run-preview td { padding: 2px 6px; color: var(--ink-2); }
+/* The preview pages the rows the response carried; this line names the
+ * ones it never had. */
+.preview-cap {
+  margin: 6px 0 0; font-size: var(--fs-small); color: var(--ink-3);
+}
 
 /* .actions-menu moved to fleet-ui.css (issue #31) —
  * fleet_ui::ActionsMenu emits it. */
