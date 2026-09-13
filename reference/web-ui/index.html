@@ -318,9 +318,25 @@ Closing the drawer stops its polling, not the server job. See
 <p><code dir="auto">/jobs/nets</code> lists saved queries with <strong>Name</strong>, <strong>Query</strong>, <strong>Schedule</strong>,
 <strong>Last run</strong>, and <strong>Created</strong>. A row’s drawer offers <strong>Rename</strong>, <strong>Edit</strong> for the
 query text, <strong>Open query in search</strong>, <strong>Trigger a scheduled run now</strong>, and
-<strong>Runs</strong>. Its schedule block sets <strong>Interval</strong> and <strong>Max runs</strong>, switches the
-schedule between <strong>Active</strong> and <strong>Paused</strong>, and removes it. <strong>Delete</strong> asks for
-confirmation. See <a href="/use/saved-reports/">saved queries and reports</a>.</p>
+<strong>Runs</strong>. Its schedule block sets <strong>Interval</strong>, <strong>Window</strong>, and <strong>Max runs</strong>,
+switches the schedule between <strong>Active</strong> and <strong>Paused</strong>, and removes it.
+<strong>Delete</strong> asks for confirmation.</p>
+<p><strong>Window</strong> has three modes. <strong>Query text</strong> runs the saved text as written.
+<strong>Since last run</strong> covers from the previous run’s covered point to the run time.
+<strong>Fixed span</strong> covers the trailing <strong>Span</strong> below it, measured from the run time.
+Both windowed modes take a <strong>Lag</strong>, which moves both window bounds back by that
+much so late events can land first; blank is none. A save the server refuses
+appears under <strong>Save schedule</strong> in the server’s own words, and the form keeps
+what you entered.</p>
+<p><strong>Trigger run</strong> is absent for a net whose saved schedule carries a window,
+because the scheduler owns every windowed run: a since-last-run schedule would
+have its coverage point moved out of band, and a fixed-span run outside the
+cadence covers a span the schedule never asked for.</p>
+<p>Expanding a run in <strong>Runs</strong> shows the stored result 20 rows to a page, with a
+pager under the table. Paging works on the rows the response carried and issues
+no further request. When the run stored more rows than the response carried, a
+line under the pager gives both counts. See
+<a href="/use/saved-reports/">saved queries and reports</a>.</p>
 <div class="sl-heading-wrapper level-h2"><h2 id="runs">Runs</h2><a class="sl-anchor-link" href="#runs"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Runs”</span></a></div>
 <p><code dir="auto">/jobs/runs</code> summarizes <strong>Active nets</strong>, <strong>Success rate</strong>, and <strong>Avg duration</strong>,
 then lists recent runs with <strong>Net</strong>, <strong>Status</strong>, <strong>When</strong>, <strong>Duration</strong>, and
