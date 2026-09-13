@@ -473,9 +473,13 @@ pub async fn delete_saved(id: i64) -> Result<DeleteSavedResponse, ApiError> {
 ///
 /// The PUT takes the schedule's whole shape, so `window` and `lag` are
 /// arguments rather than constants: omitting a window is not "leave it
-/// alone", it is query mode. An editing caller repeats what the server
-/// reported through `schedule_edit::preserved_window_and_lag`; a creating
-/// one passes `None`.
+/// alone", it is query mode. The pair comes from
+/// `schedule_edit::WindowDraft::to_request`, which is what the form is
+/// showing.
+///
+/// The server refuses several window and lag combinations by name, so a
+/// non-2xx carries its envelope message through rather than collapsing
+/// to a bare status the operator cannot act on.
 pub async fn set_schedule(
     saved_id: i64,
     interval: &str,
@@ -502,7 +506,7 @@ pub async fn set_schedule(
             .await
             .map_err(|e| ApiError::Decode(e.to_string())),
         401 => Err(ApiError::Unauthorized),
-        s => Err(ApiError::Status(s)),
+        s => Err(server_error(&resp, s).await),
     }
 }
 
