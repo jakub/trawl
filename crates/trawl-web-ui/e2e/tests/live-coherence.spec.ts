@@ -254,20 +254,33 @@ test('the caption waits for the response rather than naming the window mid-fligh
   // must keep describing that page and not the URL's new range.
   let release!: () => void;
   const held = new Promise<void>(resolve => { release = resolve; });
+  let entered!: () => void;
+  const requestEntered = new Promise<void>(resolve => { entered = resolve; });
   await page.route('**/api/v1/query', async route => {
+    entered();
     await held;
     await route.continue();
   });
 
-  await page.locator(SEL.dateRangeTrigger).click();
-  await page.locator(SEL.quickRangeOption).filter({ hasText: 'Last 1h' }).click();
-  await expect(page).toHaveURL(/r=1h/);
+  try {
+    await page.locator(SEL.dateRangeTrigger).click();
+    await page.locator(SEL.quickRangeOption).filter({ hasText: 'Last 1h' }).click();
+    await expect(page).toHaveURL(/r=1h/);
 
-  // Give the mismatch every chance to render, then assert it did not.
-  await page.waitForTimeout(500);
-  const caption = page.locator(SEL.histoCaption);
-  expect(await caption.count()).toBe(0);
+    // The request is provably in flight once the route handler has
+    // entered; from then until release the caption must be absent.
+    // An awaited zero-count assertion reads the pending state itself
+    // rather than a fixed settle, so a slow browser cannot pass a
+    // reverted fix by racing the assertion.
+    await requestEntered;
+    const caption = page.locator(SEL.histoCaption);
+    await expect(caption).toHaveCount(0);
 
-  release();
-  await expect(caption).toHaveText(`${COPY.histoCaptionPrefix}last 1h`);
+    release();
+    await expect(caption).toHaveText(`${COPY.histoCaptionPrefix}last 1h`);
+  } finally {
+    // A failed assertion above must not leave the handler parked on
+    // the promise until teardown.
+    release();
+  }
 });
