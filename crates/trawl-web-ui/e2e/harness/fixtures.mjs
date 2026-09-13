@@ -238,3 +238,51 @@ export function corpusTimechartResponse() {
 export function corpusServiceSchemaResponse() {
   return wire('service-schema-corpus');
 }
+
+// ---- the `schedule` scenario ----------------------------------------------
+//
+// `schedule` is the drawer's schedule form with something to edit: TWO
+// nets, one of them carrying a windowed schedule, plus a run whose
+// stored result is longer than one preview page. It is a separate
+// scenario rather than a change to `populated`/`corpus` because those
+// two are pinned as one service and one net, and the specs written
+// against them count rows.
+
+/** `GET /api/v1/saved` under `schedule`: the `populated` net verbatim,
+ * plus a second net whose schedule tiles (`window: "since_last"`, a 5m
+ * lag and a coverage watermark). One drawer per case, so a spec can put
+ * the windowed and the unwindowed side by side without a second
+ * scenario. */
+export function windowedListSavedResponse() {
+  return wire('saved-queries-windowed');
+}
+
+/** `PUT /api/v1/saved/{id}/schedule` — what a successful save answers.
+ * The body is only decoded, never read for content: the assertion a
+ * schedule spec makes is about the REQUEST. */
+export function scheduleSavedResponse() {
+  return wire('schedule-saved');
+}
+
+/** The 400 `/__ctl/schedule/refuse` arms. The message is the server's
+ * own `WindowPolicyError::TimeClause` sentence, which is what the form
+ * renders verbatim in its inline error. */
+export function scheduleConflictResponse() {
+  return wire('schedule-conflict');
+}
+
+/** `GET /api/v1/saved/{id}/runs` under `schedule`: the two `corpus` runs
+ * plus a newest third whose result is 45 rows. A separate file, so
+ * `net-runs.json` and every `corpus` count written against it stay as
+ * they are. */
+export function scheduleNetRunsResponse() {
+  return wire('schedule-net-runs');
+}
+
+/** `GET /api/v1/saved/{id}/runs/503` — 45 rows over `seq` and `message`,
+ * where `seq` is the row's 1-based position. Two and a bit preview pages
+ * at `PREVIEW_PAGE_SIZE` = 20, and every row names its own index, so a
+ * paging spec can say WHICH rows it is looking at. */
+export function pagedRunResultResponse() {
+  return wire('run-result-paged');
+}

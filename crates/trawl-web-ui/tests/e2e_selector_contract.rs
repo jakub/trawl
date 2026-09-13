@@ -62,6 +62,8 @@ const HISTOGRAM_RS: &str = include_str!("../src/components/histogram.rs");
 const DRAWER_QUERY_RS: &str = include_str!("../src/drawer_query.rs");
 const SEARCH_INPUT_RS: &str = include_str!("../../fleet-ui/src/search_input.rs");
 const SEGMENTED_COMPONENT_RS: &str = include_str!("../../fleet-ui/src/segmented/component.rs");
+const SCHEDULE_EDIT_RS: &str = include_str!("../src/schedule_edit.rs");
+const API_MOD_RS: &str = include_str!("../src/api/mod.rs");
 
 /// One (assignment, source file, hook) triple: `assignment` is the full
 /// `key: 'value',` line as it appears in `selectors.ts`, and `hook` must
@@ -1535,6 +1537,176 @@ const CONTRACTS: &[Contract] = &[
         source: NET_DRAWER_RS,
         hook: "\"+ Add Schedule\"",
     },
+    // -- the schedule form's window controls ----------------------------
+    Contract {
+        assignment: "windowOption: '[role=\"group\"][aria-labelledby=\"net-window-label\"] .seg-opt',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "aria-labelledby=\"net-window-label\"",
+    },
+    Contract {
+        assignment: "windowOption: '[role=\"group\"][aria-labelledby=\"net-window-label\"] .seg-opt',",
+        source_path: "../fleet-ui/src/segmented/component.rs",
+        source: SEGMENTED_COMPONENT_RS,
+        hook: "class=\"seg-opt\"",
+    },
+    Contract {
+        assignment: "windowSpanInput: '#net-window-span',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "id=\"net-window-span\"",
+    },
+    Contract {
+        assignment: "windowSpanChip: '.interval-chips:has(+ #net-window-span) button.interval-chip',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "class=\"interval-chips\"",
+    },
+    // The chips and the box are siblings inside one `DurationChips`, which
+    // is what the `+` combinator above is reading.
+    Contract {
+        assignment: "windowSpanChip: '.interval-chips:has(+ #net-window-span) button.interval-chip',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "id=\"net-window-span\"",
+    },
+    Contract {
+        assignment: "windowLagInput: '#net-lag',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "id=\"net-lag\"",
+    },
+    Contract {
+        assignment: "windowLagHint: '#net-lag-help',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "id=\"net-lag-help\"",
+    },
+    Contract {
+        assignment: "scheduleSaveError: '.net-sched .error-banner',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "class=\"net-sched\"",
+    },
+    Contract {
+        assignment: "scheduleSaveError: '.net-sched .error-banner',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "class=\"error-banner\" role=\"alert\"",
+    },
+    // -- the stored run preview's local pager ---------------------------
+    Contract {
+        assignment: "previewRow: 'table tbody tr',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "<tbody>",
+    },
+    // The preview mounts fleet-ui's OffsetPager for its own footer, so a
+    // spec reads that footer through `resultsFooter` scoped to the
+    // preview rather than through a selector of its own.
+    Contract {
+        assignment: "previewCap: '.preview-cap',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "class=\"preview-cap\"",
+    },
+    // -- the schedule window form's copy --------------------------------
+    Contract {
+        assignment: "windowLabel: 'Window',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "\"Window\"",
+    },
+    Contract {
+        assignment: "windowOptionQuery: 'Query text',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "SegmentedOption::new(\"query\", \"Query text\")",
+    },
+    Contract {
+        assignment: "windowOptionSinceLast: 'Since last run',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "SegmentedOption::new(\"since_last\", \"Since last run\")",
+    },
+    Contract {
+        assignment: "windowOptionFixed: 'Fixed span',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "SegmentedOption::new(\"fixed\", \"Fixed span\")",
+    },
+    Contract {
+        assignment: "windowSpanLabel: 'Span',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "label=\"Span\"",
+    },
+    Contract {
+        assignment: "windowLagLabel: 'Lag',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "for=\"net-lag\">\"Lag\"",
+    },
+    Contract {
+        assignment: "windowQueryHint: 'Runs the saved text as written.',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "Runs the saved text as written.",
+    },
+    Contract {
+        assignment: "windowSinceLastHint: \"Each run covers from the previous run's covered point to the run time.\",",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "Each run covers from the previous run's covered point to the run time.",
+    },
+    Contract {
+        assignment: "windowFixedHint: 'Each run covers the trailing span below, measured from the run time.',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "Each run covers the trailing span below, measured from the run time.",
+    },
+    Contract {
+        assignment: "windowRemovalHint: 'Saving removes the window and lag.',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "Saving removes the window and lag.",
+    },
+    Contract {
+        assignment: "windowRescheduleHint: 'Changing the window or interval may run the schedule immediately.',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "Changing the window or interval may run the schedule immediately.",
+    },
+    Contract {
+        assignment: "windowLagHintText: 'Late-arrival allowance. Both window bounds move back by this much. Blank is none.',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "Late-arrival allowance. Both window bounds move back by this much. Blank is none.",
+    },
+    Contract {
+        assignment: "netRunAction: '⏱ Run',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "\"⏱ Run\"",
+    },
+    Contract {
+        assignment: "netTriggerAction: '⏱ Trigger run',",
+        source_path: "src/pages/nets.rs",
+        source: NETS_RS,
+        hook: "ActionItem::new(\"⏱ Trigger run\"",
+    },
+    Contract {
+        assignment: "previewCapLine: 'This run stored {n} rows; {fetched} were fetched. Paging covers the fetched rows.',",
+        source_path: "src/schedule_edit.rs",
+        source: SCHEDULE_EDIT_RS,
+        hook: "\"This run stored {n} rows; {fetched} were fetched. Paging covers the fetched rows.\"",
+    },
+    Contract {
+        assignment: "apiStatusText: 'server returned {0}',",
+        source_path: "src/api/mod.rs",
+        source: API_MOD_RS,
+        hook: "#[error(\"server returned {0}\")]",
+    },
     // -- the DSL shapes the stub dispatches on --------------------------
     // `e2e_wire_fixture_contract.rs` proves these against the builders by
     // CALLING them, which is the stronger half; these rows keep the
@@ -1880,6 +2052,12 @@ fn every_selector_and_pin_key_is_declared_once() {
             FIXTURES_TS,
             "CORPUS",
             "export const CORPUS = {",
+        ),
+        (
+            "e2e/fixtures.ts",
+            FIXTURES_TS,
+            "SCHEDULE",
+            "export const SCHEDULE = {",
         ),
     ] {
         assert_keys_unique(file, object, &top_level_keys(ts, decl));

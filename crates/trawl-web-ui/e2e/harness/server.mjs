@@ -42,6 +42,11 @@ import {
   corpusRunResultResponse,
   corpusAllRunsResponse,
   corpusRunsStatsResponse,
+  windowedListSavedResponse,
+  scheduleSavedResponse,
+  scheduleConflictResponse,
+  scheduleNetRunsResponse,
+  pagedRunResultResponse,
 } from './fixtures.mjs';
 
 const HOST = '127.0.0.1';
@@ -80,11 +85,24 @@ const MIME = {
 
 // ---- mutable test-scoped state -------------------------------------------
 
-/** @type {'default'|'unauth'|'query-500'|'stream-chart'|'stream-burst'|'populated'|'corpus'} */
+/** @type {'default'|'unauth'|'query-500'|'stream-chart'|'stream-burst'|'populated'|'corpus'|'schedule'} */
 let scenario = 'default';
 
 function savedScenario() { return scenario === 'saved-success' || scenario === 'saved-retry'; }
 let savedRequests = [];
+
+// `PUT /api/v1/saved/{id}/schedule` bodies, and the one-shot refusal a
+// spec arms before pressing Save. The window and lag halves are ABSENT
+// keys rather than nulls when the form drops them, so the bodies are
+// recorded raw: a normalising read here would erase the very distinction
+// the schedule spec asserts.
+let scheduleRequests = [];
+/** @type {null|'conflict'|'fail'} */
+let scheduleRefusal = null;
+// Every `GET /api/v1/saved/{id}/runs/{run_id}`, in order. The preview
+// pages rows the response already carried, so "no second read while
+// paging" is the claim; a counter is what can say it.
+let runDetailReads = [];
 
 // History scenarios own their held responses and request counters.
 const history = { offsets: [], deletes: 0, cleared: false, pending: null, loadPending: [] };
@@ -243,6 +261,9 @@ function resetState() {
   unstubbed = [];
   queries = [];
   savedRequests = [];
+  scheduleRequests = [];
+  scheduleRefusal = null;
+  runDetailReads = [];
   exports_ = [];
   unhandledQueries = [];
   // sse.open/opens/closes deliberately survive a reset — a spec resets
@@ -458,7 +479,20 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
         unhandledQueries,
         exports: exports_,
         savedRequests,
+        scheduleRequests,
+        scheduleRefusal,
+        runDetailReads,
       });
+      return;
+    }
+    // Arm the NEXT schedule PUT to be refused. Two shapes, because the
+    // form reads them differently: `refuse` answers the server's own
+    // error envelope (whose message the inline error shows verbatim) and
+    // `fail` answers a 5xx with no envelope at all (which collapses to
+    // the client's generic status text).
+    if ((p === '/__ctl/schedule/refuse' || p === '/__ctl/schedule/fail') && req.method === 'POST') {
+      scheduleRefusal = p.endsWith('refuse') ? 'conflict' : 'fail';
+      sendJson(res, 200, { ok: true, armed: scheduleRefusal });
       return;
     }
     if (p === '/__ctl/history/release' && req.method === 'POST') {
@@ -813,8 +847,41 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       sendJson(
         res,
         200,
-        hasCorpus() ? populatedListSavedResponse() : listSavedResponse(),
+        scenario === 'schedule'
+          ? windowedListSavedResponse()
+          : hasCorpus() ? populatedListSavedResponse() : listSavedResponse(),
       );
+      return;
+    }
+
+    // -- schedule writes (`schedule`) ----------------------------------
+    // Recorded rather than answered from a fixture keyed to the body: the
+    // spec's whole subject is WHICH keys travelled, so the route keeps
+    // each body as it arrived and answers the same success either way.
+    const schedulePut = p.match(/^\/api\/v1\/saved\/(\d+)\/schedule$/);
+    if (schedulePut && req.method === 'PUT' && scenario === 'schedule') {
+      const bodyText = await readBody(req);
+      let parsedBody = {};
+      try {
+        parsedBody = bodyText ? JSON.parse(bodyText) : {};
+      } catch {
+        // fall through with an empty body record
+      }
+      scheduleRequests.push({ savedId: Number(schedulePut[1]), body: parsedBody });
+      // One-shot: the arming spec presses Save once against the refusal
+      // and once against a server that accepts, without a second reset.
+      const armed = scheduleRefusal;
+      scheduleRefusal = null;
+      if (armed === 'conflict') {
+        sendJson(res, 400, scheduleConflictResponse());
+      } else if (armed === 'fail') {
+        // Deliberately NOT an error envelope: this is the 5xx a proxy or
+        // a panic writes, which the client cannot quote back.
+        res.writeHead(500, { 'content-type': 'text/plain; charset=utf-8' });
+        res.end('upstream failure');
+      } else {
+        sendJson(res, 200, scheduleSavedResponse());
+      }
       return;
     }
 
@@ -829,6 +896,17 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
     // and its existing assertions remain stable.
     const netRuns = p.match(/^\/api\/v1\/saved\/\d+\/runs$/);
     const netRun = p.match(/^\/api\/v1\/saved\/\d+\/runs\/\d+$/);
+    if (scenario === 'schedule' && req.method === 'GET' && (netRuns || netRun)) {
+      if (netRuns) {
+        sendJson(res, 200, scheduleNetRunsResponse());
+      } else {
+        runDetailReads.push(p);
+        // Run 503 is the long one; the other two keep the `corpus` body,
+        // so an expansion spec can tell a capped preview from a short one.
+        sendJson(res, 200, p.endsWith('/503') ? pagedRunResultResponse() : corpusRunResultResponse());
+      }
+      return;
+    }
     if ((scenario === 'corpus' || scenario === 'pagination') && req.method === 'GET') {
       if (netRuns) {
         if (scenario === 'pagination') pagination.runs.push({ path: p, offset: Number(url.searchParams.get('offset') ?? 0) });

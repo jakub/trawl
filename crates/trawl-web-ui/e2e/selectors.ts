@@ -338,6 +338,43 @@ export const SEL = {
   /// per open row, which is how a spec says the row expanded ONCE.
   netRunPreview: '.sd-body .run-preview',
 
+  // -- the schedule form's window controls ----------------------------
+  /// crates/trawl-web-ui/src/components/net_drawer.rs — one option of
+  /// the window mode strip, which fleet-ui's Segmented renders as a
+  /// `.seg-opt` toggle button carrying aria-pressed. Scoped by the
+  /// group's own label id: the drawer mounts other Segmented strips and
+  /// an unscoped `.seg-opt` would reach them.
+  windowOption: '[role="group"][aria-labelledby="net-window-label"] .seg-opt',
+  /// The fixed span's custom box. Its preset chips are the same
+  /// `intervalChip` shape, which is why the id is what tells the two
+  /// strips apart.
+  windowSpanInput: '#net-window-span',
+  /// The span strip's own chips, found through the box they share a
+  /// parent with: `intervalChip` alone matches the interval strip too,
+  /// and both strips carry a `1h`.
+  windowSpanChip: '.interval-chips:has(+ #net-window-span) button.interval-chip',
+  /// The lag box, present only while the window is not query mode.
+  windowLagInput: '#net-lag',
+  /// Its helper paragraph, paired to the box by aria-describedby.
+  windowLagHint: '#net-lag-help',
+  /// The schedule form's inline save refusal, under the Save button.
+  /// Scoped to the pane: a toast is `.toast`, a different element, and
+  /// telling them apart is half of what the schedule spec proves.
+  scheduleSaveError: '.net-sched .error-banner',
+
+  // -- the stored run preview's local pager ---------------------------
+  // Preview-relative, like every selector a spec scopes INSIDE one
+  // element: the runs list one level up renders both a table and the
+  // same fleet-ui `.results-footer`, so each of these is used through
+  // `netRunPreview` and repeating that class here would ask for a
+  // preview inside a preview.
+  /// crates/trawl-web-ui/src/components/net_drawer.rs — one row of the
+  /// preview's current page.
+  previewRow: 'table tbody tr',
+  /// The line naming rows the response never carried. Absent when paging
+  /// covers everything.
+  previewCap: '.preview-cap',
+
   // -- range dialog ---------------------------------------------------
   /// crates/fleet-ui/src/range_dialog.rs RangePanel
   /// — the panel as a modal dialog on fleet-ui's overlay stack.
@@ -504,6 +541,39 @@ export const COPY = {
   /// for the schedule form until a net has a schedule. The interval
   /// presets live behind it.
   addScheduleButton: '+ Add Schedule',
+
+  // -- the schedule window form ---------------------------------------
+  /// crates/trawl-web-ui/src/components/net_drawer.rs — the window
+  /// strip's group label and its three option labels, in strip order.
+  windowLabel: 'Window',
+  windowOptionQuery: 'Query text',
+  windowOptionSinceLast: 'Since last run',
+  windowOptionFixed: 'Fixed span',
+  /// The fixed span's field label, and the lag's.
+  windowSpanLabel: 'Span',
+  windowLagLabel: 'Lag',
+  /// Each mode's hint. The query-mode one continues into a `<code>`
+  /// element, so only the sentence before it is pinned.
+  windowQueryHint: 'Runs the saved text as written.',
+  windowSinceLastHint: "Each run covers from the previous run's covered point to the run time.",
+  windowFixedHint: 'Each run covers the trailing span below, measured from the run time.',
+  /// What a save about to drop a window says before it drops it.
+  windowRemovalHint: 'Saving removes the window and lag.',
+  /// What a changed window or interval warns about.
+  windowRescheduleHint: 'Changing the window or interval may run the schedule immediately.',
+  /// The lag box's own helper.
+  windowLagHintText: 'Late-arrival allowance. Both window bounds move back by this much. Blank is none.',
+  /// crates/trawl-web-ui/src/components/net_drawer.rs — the manual run
+  /// action, withdrawn when the SAVED schedule carries a window.
+  netRunAction: '⏱ Run',
+  /// Its twin in the nets table's row menu.
+  netTriggerAction: '⏱ Trigger run',
+  /// crates/trawl-web-ui/src/schedule_edit.rs `preview_cap` — the line a
+  /// capped preview shows, as the source formats it.
+  previewCapLine: 'This run stored {n} rows; {fetched} were fetched. Paging covers the fetched rows.',
+  /// crates/trawl-web-ui/src/api/mod.rs ApiError::Status — what a non-2xx
+  /// with no error envelope collapses to.
+  apiStatusText: 'server returned {0}',
 
   // -- the DSL shapes the stub dispatches on --------------------------
   // Not copy the user sees: the substrings `harness/server.mjs` keys

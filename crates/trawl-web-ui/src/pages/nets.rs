@@ -304,6 +304,32 @@ pub fn NetsPage() -> impl IntoView {
                                     // `replace: true`.
                                     let href = format!("/jobs/nets?net={id}&ntab=query");
 
+                                    // A windowed schedule advances its own
+                                    // coverage point, so a manual run out
+                                    // of band leaves a hole it will not
+                                    // revisit. Same predicate the drawer
+                                    // applies, read off the saved state.
+                                    let mut actions = vec![
+                                        ActionItem::new("▶ Open in search", {
+                                            let q = query_for_run.clone();
+                                            let run = on_run_in_search.clone();
+                                            Callback::new(move |()| run(q.clone()))
+                                        }),
+                                    ];
+                                    if net.schedule.as_ref().and_then(|s| s.window.as_ref()).is_none() {
+                                        actions.push(ActionItem::new("⏱ Trigger run", {
+                                            let name = name_for_trigger.clone();
+                                            let trigger = on_trigger_run;
+                                            Callback::new(move |()| trigger(id, name.clone()))
+                                        }));
+                                    }
+                                    actions.push(ActionItem::danger("Delete", {
+                                        let name = name_for_delete.clone();
+                                        Callback::new(move |()| {
+                                            confirm_delete.update(|c| c.request((id, name.clone())));
+                                        })
+                                    }));
+
                                     view! {
                                             <tr class="tbl-row">
                                                 <td class="mono">
@@ -324,24 +350,7 @@ pub fn NetsPage() -> impl IntoView {
                                                 // fleet_ui::ActionsMenu owns the ⋯ trigger, the
                                                 // open state, and Escape/outside-click dismissal
                                                 // via the overlay stack.
-                                                <ActionsMenu items=vec![
-                                                    ActionItem::new("▶ Open in search", {
-                                                        let q = query_for_run.clone();
-                                                        let run = on_run_in_search.clone();
-                                                        Callback::new(move |()| run(q.clone()))
-                                                    }),
-                                                    ActionItem::new("⏱ Trigger run", {
-                                                        let name = name_for_trigger.clone();
-                                                        let trigger = on_trigger_run;
-                                                        Callback::new(move |()| trigger(id, name.clone()))
-                                                    }),
-                                                    ActionItem::danger("Delete", {
-                                                        let name = name_for_delete.clone();
-                                                        Callback::new(move |()| {
-                                                            confirm_delete.update(|c| c.request((id, name.clone())));
-                                                        })
-                                                    }),
-                                                ]/>
+                                                <ActionsMenu items=actions/>
                                                 </td>
                                             </tr>
                                     }

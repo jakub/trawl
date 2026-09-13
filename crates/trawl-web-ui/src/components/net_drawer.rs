@@ -18,12 +18,17 @@ use trawl_api::value::QueryResult;
 use crate::api;
 use fleet_ui::time::{format_duration, time_ago};
 use fleet_ui::{
-    Btn, Drawer, LoadState, Loaded, OffsetPager, PageTotal, PageWindow, Size, Sparkline, StatusDot,
-    TabItem, ToastBus, ToastKind, Toggle, Variant, effective_active,
+    Btn, Drawer, LoadState, Loaded, OffsetPager, PageTotal, PageWindow, Segmented, SegmentedOption,
+    Size, Sparkline, StatusDot, TabItem, ToastBus, ToastKind, Toggle, Variant, effective_active,
 };
 
+use crate::schedule_edit::{WindowDraft, WindowMode, preview_cap, validate_max_runs};
+
 use crate::api::RUNS_PAGE_SIZE;
-const RESULT_PREVIEW_ROWS: usize = 20;
+
+/// Rows per page inside an expanded run's stored result. The preview
+/// pages what the response already carries; it never re-fetches.
+const PREVIEW_PAGE_SIZE: std::num::NonZeroUsize = std::num::NonZeroUsize::new(20).unwrap();
 
 const INTERVAL_PRESETS: &[&str] = &["5m", "15m", "1h", "6h", "24h", "1w"];
 
@@ -43,6 +48,15 @@ pub fn NetDrawer(
     let query_for_run = net.query.clone();
     let net_id_for_trigger = net.id;
     let name_for_trigger = net.name.clone();
+    // A windowed schedule computes each run's bounds from the last one
+    // it covered, so a manual run out of band moves that point and
+    // leaves a hole the schedule will not revisit. The offer is withdrawn
+    // from the SAVED state, never from an unsaved draft of it.
+    let manual_run_allowed = net
+        .schedule
+        .as_ref()
+        .and_then(|s| s.window.as_ref())
+        .is_none();
 
     // -- inline rename --
     let editing_name = RwSignal::new(false);
@@ -206,13 +220,15 @@ pub fn NetDrawer(
                 >
                     "▶ Search"
                 </Btn>
-                <Btn
-                    variant=Variant::Secondary
-                    on_click=on_trigger_click
-                    attr:title="Trigger a scheduled run now"
-                >
-                    "⏱ Run"
-                </Btn>
+                {manual_run_allowed.then(|| view! {
+                    <Btn
+                        variant=Variant::Secondary
+                        on_click=on_trigger_click
+                        attr:title="Trigger a scheduled run now"
+                    >
+                        "⏱ Run"
+                    </Btn>
+                })}
             }.into_any())
         >
             {move || {
@@ -293,32 +309,43 @@ fn QuerySchedulePane(
     let saving_schedule = RwSignal::new(false);
     let show_schedule_form = RwSignal::new(has_schedule);
 
-    // The report window has no input here, and a PUT that omits it means
-    // query mode rather than "unchanged", so an edit repeats the server's
-    // own copy. Signals because the save closure has to stay Copy; the
-    // values themselves never change. `window_line` prints exactly what
-    // this pair sends.
-    let (window, lag) = net
+    // The window is an edit like any other, and the PUT carries the
+    // schedule's whole shape, so the form holds a draft rather than a
+    // pass-through: `seed` is what the server reported and `window_draft`
+    // is what Save will send. The span and lag buffers are fields of the
+    // one draft, so a look at query mode and back does not erase typing.
+    let seed = WindowDraft::from_schedule(net.schedule.as_ref());
+    let window_draft = RwSignal::new(seed.clone());
+    let saved_window = net.schedule.as_ref().and_then(|s| s.window.clone());
+    let saved_covered = net
         .schedule
         .as_ref()
-        .map_or((None, None), crate::schedule_edit::preserved_window_and_lag);
-    let preserved_window: RwSignal<Option<String>> = RwSignal::new(window);
-    let preserved_lag: RwSignal<Option<String>> = RwSignal::new(lag);
-    let window_line: RwSignal<Option<String>> = RwSignal::new(
-        net.schedule
-            .as_ref()
-            .and_then(crate::schedule_edit::window_summary),
-    );
+        .and_then(|s| s.covered_through.clone());
+    let saved_interval = net.schedule.as_ref().map(|s| s.interval.clone());
+    // A local refusal is not a failed request, so it stays in the form
+    // next to the Save button instead of flying past as a toast.
+    let save_error: RwSignal<Option<String>> = RwSignal::new(None);
 
     let do_save_schedule = {
         move || {
+            save_error.set(None);
+            let max_runs = match validate_max_runs(&max_runs_buf.get_untracked()) {
+                Ok(max_runs) => max_runs,
+                Err(e) => {
+                    save_error.set(Some(e.to_string()));
+                    return;
+                }
+            };
+            let (window, lag) = match window_draft.get_untracked().to_request() {
+                Ok(pair) => pair,
+                Err(e) => {
+                    save_error.set(Some(e.to_string()));
+                    return;
+                }
+            };
             saving_schedule.set(true);
             let interval = interval_buf.get_untracked();
-            let max_runs_str = max_runs_buf.get_untracked();
-            let max_runs = max_runs_str.trim().parse::<u64>().ok();
             let enabled = enabled_buf.get_untracked();
-            let window = preserved_window.get_untracked();
-            let lag = preserved_lag.get_untracked();
             spawn_local(async move {
                 match api::set_schedule(
                     net_id,
@@ -335,7 +362,9 @@ fn QuerySchedulePane(
                         on_refresh.run(());
                     }
                     Err(e) => {
-                        bus.push(ToastKind::Error, "Schedule failed", Some(e.to_string()));
+                        // The draft survives a refusal: the operator's
+                        // next move is to fix what the server named.
+                        save_error.set(Some(e.to_string()));
                     }
                 }
                 saving_schedule.set(false);
@@ -425,51 +454,105 @@ fn QuerySchedulePane(
                     }
                 >
                     <div style="display:flex; flex-direction:column; gap:10px">
-                        <div>
-                            <label class="field-label" for="net-interval">"Interval"</label>
-                            <div class="interval-chips">
-                                {INTERVAL_PRESETS.iter().map(|preset| {
-                                    let p = *preset;
-                                    let is_on = move || interval_buf.get() == p;
-                                    view! {
-                                        <button
-                                            type="button"
-                                            class=move || if is_on() { "interval-chip on" } else { "interval-chip" }
-                                            aria-pressed=move || is_on().to_string()
-                                            on:click=move |_| interval_buf.set(p.to_string())
-                                        >{p}</button>
+                        <DurationChips
+                            id="net-interval"
+                            label="Interval"
+                            value=Signal::derive(move || interval_buf.get())
+                            on_set=Callback::new(move |v| interval_buf.set(v))
+                        />
+
+                        // The window decides what each run reads, so it
+                        // is a control here rather than a line of prose
+                        // about the TUI. The strip is a set of toggle
+                        // buttons, not a radio group, hence the explicit
+                        // group role and label.
+                        <div role="group" aria-labelledby="net-window-label">
+                            <span class="field-label" id="net-window-label">"Window"</span>
+                            <Segmented
+                                size=Size::Xs
+                                options=vec![
+                                    SegmentedOption::new("query", "Query text"),
+                                    SegmentedOption::new("since_last", "Since last run"),
+                                    SegmentedOption::new("fixed", "Fixed span"),
+                                ]
+                                active=Signal::derive(move || window_draft.get().mode.id().to_string())
+                                on_change=Callback::new(move |id: String| {
+                                    if let Some(mode) = WindowMode::from_id(&id) {
+                                        window_draft.update(|d| d.mode = mode);
                                     }
-                                }).collect_view()}
-                            </div>
-                            <input
-                                class="mono"
-                                style="margin-top:6px; width:80px; font-size:12px; padding:4px 6px; background:var(--fill); border:1px solid var(--line); border-radius:var(--radius-ctl); color:var(--ink)"
-                                id="net-interval"
-                                placeholder="Custom…"
-                                prop:value=move || {
-                                    let v = interval_buf.get();
-                                    if INTERVAL_PRESETS.contains(&v.as_str()) { String::new() } else { v }
-                                }
-                                on:input=move |e| interval_buf.set(event_target_value(&e))
+                                })
                             />
+                            {move || match window_draft.get().mode {
+                                WindowMode::Query => view! {
+                                    <p style="color:var(--ink-3); font-size:11px; margin:6px 0 0">
+                                        "Runs the saved text as written. Put the time range in the query, for example "
+                                        <code>"last=1h"</code>
+                                        "."
+                                    </p>
+                                }.into_any(),
+                                WindowMode::SinceLast => view! {
+                                    <p style="color:var(--ink-3); font-size:11px; margin:6px 0 0">
+                                        "Each run covers from the previous run's covered point to the run time."
+                                    </p>
+                                }.into_any(),
+                                WindowMode::Fixed => view! {
+                                    <p style="color:var(--ink-3); font-size:11px; margin:6px 0 0">
+                                        "Each run covers the trailing span below, measured from the run time."
+                                    </p>
+                                }.into_any(),
+                            }}
                         </div>
 
-                        // Read-only: the window belongs to the schedule and
-                        // this form has no input for it, so naming it is
-                        // what tells the operator a save keeps it.
-                        {move || window_line.get().map(|line| view! {
-                            <p style="color:var(--ink-3); font-size:11px; margin:0">{line}</p>
-                        })}
+                        // One grammar and one floor for every duration in
+                        // this form, so the span reuses the interval's
+                        // chips rather than growing a second spelling.
+                        <Show when=move || window_draft.get().mode == WindowMode::Fixed>
+                            <DurationChips
+                                id="net-window-span"
+                                label="Span"
+                                helper="At least 60s."
+                                value=Signal::derive(move || window_draft.get().span)
+                                on_set=Callback::new(move |v| window_draft.update(|d| d.span = v))
+                            />
+                        </Show>
+
+                        <Show when=move || window_draft.get().mode != WindowMode::Query>
+                            <div>
+                                <label class="field-label" for="net-lag">"Lag"</label>
+                                <input
+                                    class="mono"
+                                    id="net-lag"
+                                    aria-describedby="net-lag-help"
+                                    placeholder="0s"
+                                    style="width:80px; font-size:12px; padding:4px 6px; background:var(--fill); border:1px solid var(--line); border-radius:var(--radius-ctl); color:var(--ink)"
+                                    prop:value=move || window_draft.get().lag
+                                    on:input=move |e| {
+                                        let v = event_target_value(&e);
+                                        window_draft.update(|d| d.lag = v);
+                                    }
+                                />
+                                <p id="net-lag-help" style="color:var(--ink-3); font-size:11px; margin:4px 0 0">
+                                    "Late-arrival allowance. Both window bounds move back by this much. Blank is none."
+                                </p>
+                            </div>
+                        </Show>
 
                         <div>
                             <label class="field-label" for="net-max-runs">"Max runs "</label>
                             <span id="net-max-runs-help" style="color:var(--ink-3); font-size:11px">"(blank = unlimited)"</span>
                             <input
                                 class="mono"
-                                type="number"
+                                // Text, not `number`: a browser reports
+                                // malformed numeric text (`1e`, a lone
+                                // `-`) as an empty value, which reads as
+                                // "blank = unlimited" and silently clears
+                                // an existing cap. Text keeps what was
+                                // typed visible so `validate_max_runs`
+                                // can refuse it by name.
+                                type="text"
+                                inputmode="numeric"
                                 id="net-max-runs"
                                 aria-describedby="net-max-runs-help"
-                                min="1"
                                 style="display:block; margin-top:4px; width:80px; font-size:12px; padding:4px 6px; background:var(--fill); border:1px solid var(--line); border-radius:var(--radius-ctl); color:var(--ink)"
                                 prop:value=move || max_runs_buf.get()
                                 on:input=move |e| max_runs_buf.set(event_target_value(&e))
@@ -486,6 +569,50 @@ fn QuerySchedulePane(
                                 {move || if enabled_buf.get() { "Active" } else { "Paused" }}
                             </span>
                         </div>
+
+                        // What a save is about to cost, said before it
+                        // costs it: dropping a window is not an edit the
+                        // schedule can undo by itself.
+                        {
+                            let had_window = saved_window.is_some();
+                            let saved_covered = saved_covered.clone();
+                            move || {
+                                (had_window && window_draft.get().mode == WindowMode::Query).then(|| {
+                                    let coverage = saved_covered.clone().map(|t| format!(
+                                        " Coverage stops at {t}; switching back resumes from there, within the server's catch-up limit."
+                                    ));
+                                    view! {
+                                        <p style="color:var(--ink-3); font-size:11px; margin:0">
+                                            "Saving removes the window and lag. Without a time clause in the query, the schedule imposes no time limit."
+                                            {coverage}
+                                        </p>
+                                    }
+                                })
+                            }
+                        }
+
+                        // A window or interval change can make the next
+                        // run due already, which surprises an operator
+                        // who expected to wait for the next tick.
+                        {
+                            let seed = seed.clone();
+                            let saved_interval = saved_interval.clone();
+                            move || {
+                                let draft = window_draft.get();
+                                // Only request-effective fields count: the span
+                                // rides on the PUT in fixed mode alone, and
+                                // `to_request` trims it.
+                                let moved = draft.mode != seed.mode
+                                    || (draft.mode == WindowMode::Fixed
+                                        && draft.span.trim() != seed.span.trim())
+                                    || saved_interval.as_ref().is_some_and(|i| *i != interval_buf.get());
+                                moved.then(|| view! {
+                                    <p style="color:var(--ink-3); font-size:11px; margin:0">
+                                        "Changing the window or interval may run the schedule immediately."
+                                    </p>
+                                })
+                            }
+                        }
 
                         <div style="display:flex; gap:6px; align-items:center">
                             <Btn
@@ -505,9 +632,71 @@ fn QuerySchedulePane(
                                 }
                             })}
                         </div>
+
+                        // Reuses fleet_ui::Field's error paragraph, since
+                        // this refusal reads like any other field's.
+                        {move || save_error.get().map(|e| view! {
+                            <p class="error-banner" role="alert">{e}</p>
+                        })}
                     </div>
                 </Show>
             </div>
+        </div>
+    }
+}
+
+/// One duration field: the preset chips plus the custom box behind them.
+///
+/// The schedule form has two of these (interval and fixed span) and they
+/// share a grammar and a 60s floor, so they share markup as well. The id
+/// is a parameter because two strips on one form cannot both be
+/// `net-interval`.
+///
+/// The custom box reads blank while a preset is pressed, and typing in
+/// it clears the pressed chip, because the two are one value shown two
+/// ways rather than two values.
+#[component]
+fn DurationChips(
+    id: &'static str,
+    label: &'static str,
+    #[prop(into)] value: Signal<String>,
+    on_set: Callback<String>,
+    #[prop(optional)] helper: Option<&'static str>,
+) -> impl IntoView {
+    let helper_id = helper.map(|_| format!("{id}-help"));
+
+    view! {
+        <div>
+            <label class="field-label" for=id>{label}</label>
+            <div class="interval-chips">
+                {INTERVAL_PRESETS.iter().map(|preset| {
+                    let p = *preset;
+                    let is_on = move || value.get() == p;
+                    view! {
+                        <button
+                            type="button"
+                            class=move || if is_on() { "interval-chip on" } else { "interval-chip" }
+                            aria-pressed=move || is_on().to_string()
+                            on:click=move |_| on_set.run(p.to_string())
+                        >{p}</button>
+                    }
+                }).collect_view()}
+            </div>
+            <input
+                class="mono"
+                style="margin-top:6px; width:80px; font-size:12px; padding:4px 6px; background:var(--fill); border:1px solid var(--line); border-radius:var(--radius-ctl); color:var(--ink)"
+                id=id
+                aria-describedby=helper_id.clone()
+                placeholder="Custom…"
+                prop:value=move || {
+                    let v = value.get();
+                    if INTERVAL_PRESETS.contains(&v.as_str()) { String::new() } else { v }
+                }
+                on:input=move |e| on_set.run(event_target_value(&e))
+            />
+            {helper.map(|text| view! {
+                <p id=helper_id style="color:var(--ink-3); font-size:11px; margin:4px 0 0">{text}</p>
+            })}
         </div>
     }
 }
@@ -679,8 +868,9 @@ fn RunResultPreview(
                         }.into_any(),
                         Some(qr) => {
                             let query = resp.summary.query.clone();
+                            let row_count = resp.summary.row_count;
                             view! {
-                                <ResultPreviewTable result=qr/>
+                                <ResultPreviewTable result=qr row_count=row_count/>
                                 <Btn
                                     variant=Variant::Secondary
                                     size=Size::Xs
@@ -697,16 +887,31 @@ fn RunResultPreview(
 }
 
 #[component]
-fn ResultPreviewTable(result: QueryResult) -> impl IntoView {
+fn ResultPreviewTable(result: QueryResult, row_count: Option<usize>) -> impl IntoView {
     let cols = result.columns.clone();
     let rows: Vec<Vec<String>> = result
         .rows
         .iter()
-        .take(RESULT_PREVIEW_ROWS)
         .map(|row| row.iter().map(ToString::to_string).collect())
         .collect();
-    let total_rows = result.rows.len();
-    let truncated = total_rows > RESULT_PREVIEW_ROWS;
+    let total = rows.len();
+    // Local to this expansion, so collapsing a run and opening it again
+    // starts at page 1 rather than on a page the operator left behind.
+    let page = RwSignal::new(0usize);
+    let cap = preview_cap(row_count, total);
+
+    let window = Signal::derive(move || {
+        let offset = PageWindow::checked_offset(page.get(), PREVIEW_PAGE_SIZE).unwrap_or(0);
+        let returned = total.saturating_sub(offset).min(PREVIEW_PAGE_SIZE.get());
+        PageWindow::new(
+            page.get(),
+            PREVIEW_PAGE_SIZE,
+            returned,
+            PageTotal::Known(total),
+            false,
+        )
+        .expect("preview page comes from checked pager navigation")
+    });
 
     view! {
         <table>
@@ -716,19 +921,26 @@ fn ResultPreviewTable(result: QueryResult) -> impl IntoView {
                 </tr>
             </thead>
             <tbody>
-                {rows.into_iter().map(|row| {
-                    view! {
-                        <tr>
-                            {row.into_iter().map(|cell| view! { <td>{cell}</td> }).collect_view()}
-                        </tr>
-                    }
-                }).collect_view()}
+                {move || {
+                    let offset = PageWindow::checked_offset(page.get(), PREVIEW_PAGE_SIZE).unwrap_or(0);
+                    let end = offset.saturating_add(PREVIEW_PAGE_SIZE.get()).min(total);
+                    rows.get(offset..end).unwrap_or_default().iter().map(|row| {
+                        view! {
+                            <tr>
+                                {row.iter().map(|cell| view! { <td>{cell.clone()}</td> }).collect_view()}
+                            </tr>
+                        }
+                    }).collect_view()
+                }}
             </tbody>
         </table>
-        {truncated.then(|| view! {
-            <div style="font-size:11px; color:var(--ink-3); margin-top:4px">
-                {format!("Showing {RESULT_PREVIEW_ROWS} of {total_rows} rows")}
-            </div>
-        })}
+        <OffsetPager
+            window=window
+            on_page=Callback::new(move |p| page.set(p))
+        />
+        // Outside the paged slice: the gap between what the run stored
+        // and what this response carries is a property of the response,
+        // not of the page being read.
+        {cap.map(|text| view! { <p class="preview-cap">{text}</p> })}
     }
 }

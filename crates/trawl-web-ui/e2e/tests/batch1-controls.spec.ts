@@ -41,7 +41,10 @@ for (const colorScheme of ['light', 'dark'] as const) {
     await drawer.getByRole('button', { name: 'Edit', exact: true }).click();
     await expect(drawer.getByRole('textbox', { name: 'Query', exact: true })).toBeVisible();
     await drawer.getByRole('button', { name: '+ Add Schedule', exact: true }).click();
-    const max = drawer.getByRole('spinbutton', { name: 'Max runs', exact: true });
+    // A text box, not a number spinner: a browser reports malformed
+    // numeric text as an empty value, which the form would read as
+    // "blank = unlimited" (issue #181).
+    const max = drawer.getByRole('textbox', { name: 'Max runs', exact: true });
     await expect(max).toHaveAccessibleDescription('(blank = unlimited)');
     await expect(drawer.getByRole('textbox', { name: 'Interval', exact: true })).toBeVisible();
     await expect(drawer.getByRole('button', { name: 'Save schedule', exact: true })).toBeVisible();

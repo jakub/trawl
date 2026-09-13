@@ -718,3 +718,165 @@ fn created_saved_query_fixture_preserves_the_editor_text() {
     assert_eq!(saved.updated_at, saved.created_at);
     assert!(saved.schedule.is_none());
 }
+
+// ---- the `schedule` scenario -----------------------------------------------
+
+const SAVED_QUERIES_WINDOWED: &str =
+    include_str!("../e2e/harness/wire/saved-queries-windowed.json");
+const SCHEDULE_SAVED: &str = include_str!("../e2e/harness/wire/schedule-saved.json");
+const SCHEDULE_CONFLICT: &str = include_str!("../e2e/harness/wire/schedule-conflict.json");
+const SCHEDULE_NET_RUNS: &str = include_str!("../e2e/harness/wire/schedule-net-runs.json");
+const RUN_RESULT_PAGED: &str = include_str!("../e2e/harness/wire/run-result-paged.json");
+
+/// The `schedule` scenario's saved list: two nets, one windowed and one
+/// not, decoded through the SAME type the `populated` list uses.
+///
+/// Both halves are the contract. The windowed net is what the form opens
+/// showing, and `lag` and `lag_secs` have to agree, because
+/// `WindowDraft::from_schedule` reads the SECONDS to decide whether a lag
+/// is real and prints the STRING — a fixture where those two disagree
+/// would make the form show a value the spec cannot explain. The
+/// unwindowed net is the control for the withdrawn manual run.
+#[test]
+fn the_schedule_scenario_carries_a_windowed_net_and_an_unwindowed_one() {
+    let saved: ListSavedResponse = decode("saved-queries-windowed.json", SAVED_QUERIES_WINDOWED);
+    assert_eq!(saved.queries.len(), 2);
+
+    let plain = &saved.queries[0];
+    let windowed = &saved.queries[1];
+    assert_eq!(plain.id, 1);
+    assert_eq!(windowed.id, 2);
+    assert_eq!(windowed.name, "tiled error digest");
+
+    // The unwindowed net is the `populated` one verbatim: the specs read
+    // it as the case where "⏱ Run" is still offered.
+    let populated: ListSavedResponse = decode("saved-queries.json", SAVED_QUERIES);
+    assert_eq!(plain.id, populated.queries[0].id);
+    assert_eq!(plain.name, populated.queries[0].name);
+    assert_eq!(plain.query, populated.queries[0].query);
+    assert!(
+        plain
+            .schedule
+            .as_ref()
+            .and_then(|s| s.window.as_ref())
+            .is_none(),
+        "the plain net must carry no window, or the drawer withdraws the manual run from both",
+    );
+    // Its query owns a time clause, which is the half a window conflicts
+    // with — the refusal fixture below names that clause.
+    assert!(plain.query.contains("last=1h"));
+
+    let schedule = windowed
+        .schedule
+        .as_ref()
+        .expect("the windowed net must carry a schedule, or the form has nothing to open on");
+    assert_eq!(schedule.window.as_deref(), Some("since_last"));
+    assert_eq!(schedule.lag.as_deref(), Some("5m"));
+    assert_eq!(schedule.lag_secs, Some(300));
+    assert_eq!(schedule.interval, "1h");
+    assert!(
+        schedule.covered_through.is_some(),
+        "a tiling schedule reports where coverage resumes, and the removal hint quotes it",
+    );
+    // A window on a query that spells its own interval is what the server
+    // refuses, so the windowed net's text must NOT carry one.
+    assert!(!windowed.query.contains("last="));
+}
+
+/// The two schedule PUT answers. Shape only for the success, because no
+/// spec reads it: the assertion a schedule spec makes is about the
+/// request. The refusal's MESSAGE is the contract, since the form renders
+/// it verbatim.
+#[test]
+fn the_schedule_put_fixtures_decode_as_their_wire_types() {
+    let saved: trawl_api::ScheduleResponse = decode("schedule-saved.json", SCHEDULE_SAVED);
+    assert_eq!(saved.saved_query_id, 2);
+
+    let refusal: trawl_api::ErrorResponse = decode("schedule-conflict.json", SCHEDULE_CONFLICT);
+    assert_eq!(refusal.error.code, trawl_api::ErrorCode::BadRequest);
+    // `ServerError::WindowPolicy` answers 400 with an envelope carrying
+    // `WindowPolicyError::TimeClause`'s own sentence
+    // (`crates/trawl-server/src/report_window.rs`). Mirrored, not
+    // invented: the spec asserts the form shows it character for
+    // character, which is only worth asserting if it is the real one.
+    assert_eq!(
+        refusal.error.message,
+        "schedule window \"since_last\" conflicts with the saved query's \
+         last= time clause; remove one side",
+    );
+}
+
+/// The long run and the list that offers it.
+///
+/// `row_count` is the run's own stored count and `rows.len()` is what the
+/// response carried. They are EQUAL here on purpose: the preview's cap
+/// line appears only when they differ, and the paging spec overrides the
+/// count in the browser to produce that case. A fixture that shipped them
+/// unequal would leave the uncapped assertion untestable.
+#[test]
+fn the_paged_run_fixture_carries_more_rows_than_one_preview_page() {
+    let runs: ListReportRunsResponse = decode("schedule-net-runs.json", SCHEDULE_NET_RUNS);
+    assert_eq!(runs.runs.len(), 3);
+    assert_eq!(runs.total, 3);
+    // Newest first, and the long run is the newest: a spec expands the
+    // first row rather than hunting for an id.
+    assert_eq!(runs.runs[0].id, 503);
+    assert_eq!(runs.runs[0].row_count, Some(45));
+    // The other two are the `corpus` runs verbatim, so the one short
+    // preview stays available under this scenario as well.
+    let corpus: ListReportRunsResponse = decode("net-runs.json", NET_RUNS);
+    assert_eq!(
+        runs.runs[1..].iter().map(|r| r.id).collect::<Vec<_>>(),
+        corpus.runs.iter().map(|r| r.id).collect::<Vec<_>>(),
+    );
+
+    let run: ReportRunResponse = decode("run-result-paged.json", RUN_RESULT_PAGED);
+    assert_eq!(run.summary.id, runs.runs[0].id);
+    assert_eq!(run.summary.row_count, Some(45));
+    let result = run
+        .result
+        .expect("run-result-paged.json must carry a result — the expansion pages it");
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>(),
+        ["seq", "message"],
+    );
+    assert_eq!(result.rows.len(), 45);
+    assert_eq!(run.summary.row_count, Some(result.rows.len()));
+
+    // `seq` is the row's own 1-based position, so a spec can name the
+    // rows it expects on each page instead of counting them. 45 rows at
+    // the preview's 20 per page is three pages, the last one short —
+    // which is the case a pager gets wrong.
+    let seqs: Vec<i64> = result
+        .rows
+        .iter()
+        .map(|row| match &row[0] {
+            trawl_api::value::Value::Integer(n) => *n,
+            other => panic!("the `seq` cell must be an integer: {other:?}"),
+        })
+        .collect();
+    assert_eq!(seqs, (1..=45).collect::<Vec<i64>>());
+    assert_eq!(
+        result.rows[0][1].to_string(),
+        "row-01",
+        "each row's message names its own index, so a page assertion reads as itself",
+    );
+    assert_eq!(result.rows[44][1].to_string(), "row-45");
+
+    // The page size the spec's expectations are written against lives in
+    // the component. Pin its spelling: a change there has to reach the
+    // spec, and this names the file to fix.
+    assert!(
+        NET_DRAWER_SRC.contains("const PREVIEW_PAGE_SIZE: std::num::NonZeroUsize ="),
+        "PREVIEW_PAGE_SIZE moved or was renamed — the paging spec's 20-row pages follow it",
+    );
+    assert!(NET_DRAWER_SRC.contains("NonZeroUsize::new(20)"));
+}
+
+/// The net drawer's own source, for the one constant the paging spec
+/// mirrors.
+const NET_DRAWER_SRC: &str = include_str!("../src/components/net_drawer.rs");
