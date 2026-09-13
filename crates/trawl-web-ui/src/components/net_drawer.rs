@@ -599,8 +599,12 @@ fn QuerySchedulePane(
                             let saved_interval = saved_interval.clone();
                             move || {
                                 let draft = window_draft.get();
+                                // Only request-effective fields count: the span
+                                // rides on the PUT in fixed mode alone, and
+                                // `to_request` trims it.
                                 let moved = draft.mode != seed.mode
-                                    || draft.span != seed.span
+                                    || (draft.mode == WindowMode::Fixed
+                                        && draft.span.trim() != seed.span.trim())
                                     || saved_interval.as_ref().is_some_and(|i| *i != interval_buf.get());
                                 moved.then(|| view! {
                                     <p style="color:var(--ink-3); font-size:11px; margin:0">

@@ -55,9 +55,11 @@ Pick a mode in the **Window** control:
 both window bounds back by that much, so late events land before the window that
 owes them closes. Leave it blank for none.
 
-A windowed schedule advances its own coverage point. A manual run out of band
-would move that point and leave a hole the schedule never revisits, so the
-browser withdraws **Trigger run** from a net that has a window. When the
+A **Since last run** schedule advances its own coverage point, and a manual run
+out of band would move that point and leave a hole the schedule never revisits.
+A **Fixed span** run has no coverage point, but the window is still the
+scheduler's to place. The browser withdraws **Trigger run** from a net that has
+a window of either kind. When the
 scheduler misses boundaries, it runs one bounded catch-up window instead of a
 backlog.
 

@@ -177,7 +177,9 @@ appears under **Save schedule** in the server's own words, and the form keeps
 what you entered.
 
 **Trigger run** is absent for a net whose saved schedule carries a window,
-because a manual run would move the coverage point out of band.
+because the scheduler owns every windowed run: a since-last-run schedule would
+have its coverage point moved out of band, and a fixed-span run outside the
+cadence covers a span the schedule never asked for.
 
 Expanding a run in **Runs** shows the stored result 20 rows to a page, with a
 pager under the table. Paging works on the rows the response carried and issues
