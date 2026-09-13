@@ -159,6 +159,10 @@ successful sign-in lands on <code dir="auto">/search</code>.</p>
 <td>In the date-range popover. Streams the editor’s query over SSE</td>
 </tr>
 <tr>
+<td><strong>Stop live</strong></td>
+<td>Beside the tabs, in live mode only. Closes the stream and runs the same query once, with the filters and the range unchanged</td>
+</tr>
+<tr>
 <td><strong>Haul</strong></td>
 <td>Executes the editor’s query. Ctrl+Enter and Command+Enter do the same</td>
 </tr>
@@ -203,6 +207,16 @@ successful sign-in lands on <code dir="auto">/search</code>.</p>
 <p>Expanding a row shows its fields and raw text, and carries <strong>Copy _raw</strong>,
 <strong>Show context</strong>, and <strong>Find similar</strong>. Selecting a field tag adds an include
 filter for that value.</p>
+<p>The URL carries live mode as <code dir="auto">mode=live</code>. <strong>Stop live</strong> and any range
+selection leave live mode, including a repeat of the range already selected.
+<strong>Haul</strong> and the filter controls keep the current mode. <strong>Stop live</strong> is a
+history entry, so the browser Back button returns to the stream.</p>
+<p>The status bar names the source it counted. In snapshot it reads <strong>Last</strong> and
+the number of rows the page returned. In live it reads <strong>Received</strong> and the
+number of events the browser buffer accepted since the stream opened, which is
+not the number of messages the server sent, or, for an aggregation, <strong>Updates</strong>
+and the number of snapshots. The <strong>Events</strong> tab counts the rows on screen in
+both modes.</p>
 <p>A live stream has no page count and no incomplete-results notice. See
 <a href="/use/live-tail/">live tail</a> for its limits and
 <a href="/use/sharing-export/">sharing and export</a> for the choice between a link, a
