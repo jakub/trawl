@@ -21,6 +21,14 @@
 //! the window the effective query ran under — which is the DSL's own
 //! time clause when it carries one, not the range the picker shows
 //! (ADR-0027, amended 2026-09-12).
+//!
+//! The caption is the one part of the strip that does not come from the
+//! response, so it is the one part that can disagree with it: a
+//! resource holds its previous page while the next request is in
+//! flight, while `window` follows the URL at once. `pending` is what
+//! keeps them honest — while a snapshot is running the caption is not
+//! rendered at all, so it never names a window the bars below it were
+//! not drawn over.
 
 use fleet_ui::{LoadState, Loaded};
 use leptos::prelude::*;
@@ -41,6 +49,10 @@ pub fn Histogram(
     /// the query carries its own `last=`.
     #[prop(into)]
     window: Signal<EffectiveWindow>,
+    /// Whether a snapshot request is in flight. The caption describes a
+    /// completed response or nothing.
+    #[prop(into)]
+    pending: Signal<bool>,
 ) -> impl IntoView {
     view! {
         <div class="histo">
@@ -103,10 +115,13 @@ pub fn Histogram(
             />
         </div>
         {move || rows.get().and_then(Result::ok).map(|resp| {
-            let caption = format!("Current page · window: {}", window_caption(&window.get()));
             let series = build_series(&resp);
             view! {
-                <p class="histo-caption">{caption}</p>
+                <Show when=move || !pending.get()>
+                    <p class="histo-caption">
+                        {move || format!("Current page · window: {}", window_caption(&window.get()))}
+                    </p>
+                </Show>
                 {series.map(|series| {
                     let width = series.bucket_width();
                     let min = series.min_secs;

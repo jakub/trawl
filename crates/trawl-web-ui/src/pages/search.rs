@@ -699,7 +699,7 @@ pub fn Search() -> impl IntoView {
                 } else { match (active_tab.get(), mode.get()) {
                     (ResultsTab::Events, Mode::Snapshot) => view! {
                         <>
-                            <Histogram rows=rows window=window/>
+                            <Histogram rows=rows window=window pending=loading/>
                             <ResultsTable
                                 busy=running
                                 page=page
