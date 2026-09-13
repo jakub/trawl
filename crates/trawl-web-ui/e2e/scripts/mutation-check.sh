@@ -70,6 +70,8 @@ declare -A SPEC_FOR=(
   [26-save-editor-snapshot.patch]="settings-disposition.spec.ts"
   [27-stop-live-replace.patch]="live-coherence.spec.ts"
   [28-live-snapshot-query.patch]="live-coherence.spec.ts"
+  [29-schedule-lag-leak.patch]="schedule-window.spec.ts"
+  [30-preview-known-total.patch]="run-preview-paging.spec.ts"
 )
 
 # patch-file -> a CONTROL spec the mutation does NOT touch, which must
@@ -107,6 +109,8 @@ declare -A CONTROL_FOR=(
   [26-save-editor-snapshot.patch]="routing.spec.ts"
   [27-stop-live-replace.patch]="routing.spec.ts"
   [28-live-snapshot-query.patch]="routing.spec.ts"
+  [29-schedule-lag-leak.patch]="routing.spec.ts"
+  [30-preview-known-total.patch]="routing.spec.ts"
 )
 
 PATCHES=()
@@ -141,6 +145,8 @@ else
     26-save-editor-snapshot.patch
     27-stop-live-replace.patch
     28-live-snapshot-query.patch
+    29-schedule-lag-leak.patch
+    30-preview-known-total.patch
   )
 fi
 

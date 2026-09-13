@@ -1,0 +1,16 @@
+diff --git a/crates/trawl-web-ui/src/schedule_edit.rs b/crates/trawl-web-ui/src/schedule_edit.rs
+index 5ccfac95..df4654f4 100644
+--- a/crates/trawl-web-ui/src/schedule_edit.rs
++++ b/crates/trawl-web-ui/src/schedule_edit.rs
+@@ -140,7 +140,10 @@ impl WindowDraft {
+     /// span to send.
+     pub fn to_request(&self) -> Result<(Option<String>, Option<String>), ScheduleEditError> {
+         let window = match self.mode {
+-            WindowMode::Query => return Ok((None, None)),
++            WindowMode::Query => {
++                let lag = self.lag.trim();
++                return Ok((None, (!lag.is_empty()).then(|| lag.to_owned())));
++            }
+             WindowMode::SinceLast => "since_last".to_owned(),
+             WindowMode::Fixed => {
+                 let span = self.span.trim();
