@@ -51,11 +51,31 @@ Treat a lag or **Error** as a gap in what you saw, even if events resume. Live
 tail carries no degraded-pin notice, so open **Schema** and run a bounded
 query when you investigate a conflict or missing values.
 
+The status bar counts the stream. **Received** is the number of events the
+browser buffer accepted since the stream opened, not the number of messages
+the server sent. For a query that charts an aggregation, the status bar reads
+**Updates** and counts the snapshots instead. The **Events** tab counts the
+rows on screen, so **Received** passes the tab count once the buffer starts
+dropping the oldest rows. Both counts restart when you retry the stream or
+change the query, and both survive a reconnect.
+
 ## Return to a bounded query
 
-Open the range control, select a range such as **Last 15m** or an **Absolute**
-interval with **From** and **To**, select **Apply**, then select **Haul**. Use
-absolute UTC times when you compare notes with someone else. The bounded query
-reads the hot buffer and stored events for that interval, subject to retention
-and query limits. [Export the result](/use/sharing-export/) to keep the rows.
-A live buffer is never proof of every event during an incident.
+Select **Stop live**, above the results. Trawl closes the stream and runs the
+same query once, with your filters and the range unchanged. The browser Back
+button returns to the stream.
+
+To leave live mode on a different window, open the range control, select a
+range such as **Last 15m** or an **Absolute** interval with **From** and
+**To**, then select **Apply**. Any range selection leaves live mode, including
+a repeat of the range already selected. Use absolute UTC times when you
+compare notes with someone else.
+
+**Haul** keeps the mode you are in. In live mode it streams the edited query,
+and an unchanged query changes nothing. Adding, removing, or clearing a filter
+also keeps the mode.
+
+The bounded query reads the hot buffer and stored events for that interval,
+subject to retention and query limits. [Export the result](/use/sharing-export/)
+to keep the rows. A live buffer is never proof of every event during an
+incident.

@@ -128,6 +128,13 @@ export const SEL = {
   /// Stop live action, rendered only while the stream is the active
   /// result source.
   stopLive: '.tabs button.action.stop-live',
+  /// crates/trawl-web-ui/src/components/histogram.rs — the histogram
+  /// strip itself. Absent in live, where the ring is the active result
+  /// source and a page-scoped strip would describe nothing.
+  histoStrip: '.histo',
+  /// crates/trawl-web-ui/src/components/histogram.rs — the one caption
+  /// naming the window the effective query ran under.
+  histoCaption: '.histo-caption',
   /// crates/trawl-web-ui/src/pages/search.rs — the tab strip's trailing
   /// Export action, which opens the export modal.
   exportAction: '.tabs .action.export',
@@ -385,6 +392,9 @@ export const COPY = {
   /// crates/trawl-web-ui/src/pages/search.rs — the tab strip's Stop
   /// live button text.
   stopLiveText: 'Stop live',
+  /// crates/trawl-web-ui/src/components/histogram.rs — the histogram
+  /// caption's lead-in, before the window the query ran under.
+  histoCaptionPrefix: 'Current page · window: ',
   /// crates/trawl-web-ui/src/search_url.rs Malformed::message + Param::noun.
   urlNoticeFiltersPrefix: "This link's filters could not be read:",
   /// crates/trawl-web-ui/src/search_url.rs Malformed::message + Param::noun.

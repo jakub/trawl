@@ -1,0 +1,12 @@
+diff --git a/crates/trawl-web-ui/src/pages/search.rs b/crates/trawl-web-ui/src/pages/search.rs
+--- a/crates/trawl-web-ui/src/pages/search.rs
++++ b/crates/trawl-web-ui/src/pages/search.rs
+@@ -395,7 +395,7 @@ pub fn Search() -> impl IntoView {
+                     Mode::Snapshot,
+                     &filters.get_untracked(),
+                     &range.get_untracked(),
+-                    false,
++                    true,
+                 ),
+             );
+         })
