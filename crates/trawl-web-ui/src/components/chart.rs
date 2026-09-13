@@ -148,7 +148,14 @@ pub fn Chart(
 
     view! {
         <div class="visualization">
-            {move || hint.get().map(|hint| view! { <p class="results-empty" role="status">{hint}</p> })}
+            // A failure is an alert, a waiting-for-data hint is a
+            // status: the live stream's error must announce itself here
+            // the way it does over the raw table.
+            {move || hint.get().map(|hint| if failure.get().is_some() {
+                view! { <p class="results-empty" role="alert">{hint}</p> }.into_any()
+            } else {
+                view! { <p class="results-empty" role="status">{hint}</p> }.into_any()
+            })}
             {move || failure.get().and(on_retry).map(|retry| view! {
                 <button type="button" class="btn-sec" on:click=move |_| retry.run(())>"Retry live stream"</button>
             })}

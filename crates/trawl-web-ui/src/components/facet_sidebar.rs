@@ -17,16 +17,19 @@ use std::collections::HashMap;
 use fleet_ui::{Icon, IconView, LoadState, Loaded, SearchInput};
 use leptos::prelude::*;
 use leptos_use::use_media_query;
-use trawl_api::QueryResponse;
+use trawl_api::value::QueryResult;
 
-use crate::api::ApiError;
 use crate::facets::compute_facets;
 use crate::state::query::{Filter, FilterOp};
 
 #[component]
 #[allow(clippy::too_many_lines)] // facet markup tree is one cohesive view
 pub fn FacetSidebar(
-    rows: LocalResource<Result<QueryResponse, ApiError>>,
+    /// The rows on screen, from whichever source the page's mode makes
+    /// active: the snapshot page, or the live ring. The rail counts what
+    /// is shown, never the corpus.
+    #[prop(into)]
+    state: Signal<LoadState<QueryResult>>,
     /// Current filters — read to paint selected/excluded value rows.
     #[prop(into)]
     filters: Signal<Vec<Filter>>,
@@ -97,17 +100,19 @@ pub fn FacetSidebar(
                 </Show>
             </div>
             <SearchInput value=needle placeholder="Filter field values"/>
+            // Suppression is total: an unreadable link has no active
+            // source, so the rail shows its header and nothing else —
+            // not even the loading hint the state would otherwise
+            // render (ADR-0027).
+            <Show when=move || !suppressed.get()>
             <Loaded
-                state=Signal::derive(move || LoadState::from_resource(rows.get()))
+                state=state
                 // Deliberate quiet-error override: the results table
                 // already reports the query failure, and repeating it in
                 // the facet rail is noise.
                 error=Box::new(|_| view! { <p class="facets-hint">"—"</p> }.into_any())
-                render=Box::new(move |resp: QueryResponse| {
-                    if suppressed.get() {
-                        return ().into_any();
-                    }
-                    let facets = compute_facets(&resp.result);
+                render=Box::new(move |result: QueryResult| {
+                    let facets = compute_facets(&result);
                     if facets.is_empty() {
                         return ().into_any();
                     }
@@ -237,6 +242,7 @@ pub fn FacetSidebar(
                     }).collect::<Vec<_>>().into_any()
                 })
             />
+            </Show>
         </aside>
         </details>
     }

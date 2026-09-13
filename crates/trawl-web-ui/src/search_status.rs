@@ -79,9 +79,6 @@ pub fn search_status(i: StatusInputs) -> StatusKind {
 
 /// Which source the footer's number was counted from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-// `Received` and `Updates` gain their live-mode constructors with the
-// ring and frame counters; only `Last` has a caller on wasm until then.
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub enum CountSource {
     /// Rows the last snapshot returned.
     Last,
