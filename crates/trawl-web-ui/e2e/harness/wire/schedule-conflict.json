@@ -1,0 +1,6 @@
+{
+  "error": {
+    "code": "bad_request",
+    "message": "schedule window \"since_last\" conflicts with the saved query's last= time clause; remove one side"
+  }
+}

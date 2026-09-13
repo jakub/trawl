@@ -1,0 +1,33 @@
+{
+  "queries": [
+    {
+      "id": 1,
+      "name": "errors by host",
+      "query": "_severity>=error last=1h | stats count() by host",
+      "created_at": "2026-09-01T10:00:00Z",
+      "updated_at": "2026-09-01T10:00:00Z"
+    },
+    {
+      "id": 2,
+      "name": "tiled error digest",
+      "query": "_severity>=error | stats count() by service",
+      "created_at": "2026-09-01T10:00:00Z",
+      "updated_at": "2026-09-01T10:00:00Z",
+      "schedule": {
+        "id": 7,
+        "saved_query_id": 2,
+        "interval": "1h",
+        "interval_secs": 3600,
+        "enabled": true,
+        "created_at": "2026-09-01T10:00:00Z",
+        "updated_at": "2026-09-01T10:00:00Z",
+        "total_runs": 3,
+        "window": "since_last",
+        "lag": "5m",
+        "lag_secs": 300,
+        "covered_through": "2026-09-01T09:55:00.000000Z",
+        "next_fire_at": "2026-09-01T11:00:00.000000Z"
+      }
+    }
+  ]
+}

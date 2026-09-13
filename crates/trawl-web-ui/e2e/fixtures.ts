@@ -163,6 +163,35 @@ export const CORPUS = {
   runWithResult: 501,
 } as const;
 
+/** What the `schedule` scenario's two nets are.
+ *
+ * `schedule` exists so the drawer's schedule form has both cases on one
+ * page: a net with no schedule at all and a net whose schedule tiles.
+ * The bodies live in `harness/wire/saved-queries-windowed.json`,
+ * `harness/wire/schedule-net-runs.json` and
+ * `harness/wire/run-result-paged.json`, and
+ * `crates/trawl-web-ui/tests/e2e_wire_fixture_contract.rs` pins every
+ * value below against them.
+ */
+export const SCHEDULE = {
+  /** The net with no schedule: the `populated` net, verbatim. Its query
+   * carries `last=1h`, which is the clause a window conflicts with. */
+  plainNetId: 1,
+  /** The net whose schedule tiles. */
+  windowedNetId: 2,
+  /** Its name, as the drawer titles itself. */
+  windowedNetName: 'tiled error digest',
+  /** Its saved window and lag, which the form opens showing. */
+  window: 'since_last',
+  lag: '5m',
+  /** The run whose stored result is longer than one preview page. */
+  pagedRunId: 503,
+  /** How many rows that result carries, and the page the preview cuts
+   * them into (`PREVIEW_PAGE_SIZE` in `src/components/net_drawer.rs`). */
+  pagedRunRows: 45,
+  previewPageSize: 20,
+} as const;
+
 /** Re-point the stub server at a non-default scenario for this test. Call
  * at the top of the test body — `beforeEach` above already reset to
  * 'default' by the time the body runs. */
@@ -179,6 +208,30 @@ export async function capturedSavedRequests(request: Ctl): Promise<Array<{ name:
 }
 
 type Ctl = import('@playwright/test').APIRequestContext;
+
+/** Schedule PUT bodies captured since the last scenario reset, oldest
+ * first. Each entry is `{ savedId, body }`, and `body` is exactly what
+ * arrived: a dropped `window` is an ABSENT key, not a null, which is the
+ * distinction the schedule spec is built on. */
+export async function capturedScheduleRequests(
+  request: Ctl,
+): Promise<Array<{ savedId: number; body: Record<string, unknown> }>> {
+  const state = await (await request.get('/__ctl/state')).json();
+  return state.scheduleRequests;
+}
+
+/** How many run-result reads the stub has served since the last reset. */
+export async function runDetailReadCount(request: Ctl): Promise<number> {
+  const state = await (await request.get('/__ctl/state')).json();
+  return state.runDetailReads.length;
+}
+
+/** Arm the next schedule PUT to be refused: `'refuse'` answers the
+ * server's own 400 envelope, `'fail'` a 500 with no envelope at all. */
+export async function armScheduleRefusal(request: Ctl, kind: 'refuse' | 'fail'): Promise<void> {
+  const response = await request.post(`/__ctl/schedule/${kind}`);
+  expect(response.ok(), `arm ${kind}: HTTP ${response.status()}`).toBe(true);
+}
 
 /** How many `POST /api/v1/query` bodies the stub has captured since the
  * last reset. A spec that asserts a URL does NOT run reads this before
