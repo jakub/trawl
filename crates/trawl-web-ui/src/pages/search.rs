@@ -129,8 +129,27 @@ pub fn Search() -> impl IntoView {
         effective_query(&base, &fs, &r)
     });
 
+    // Whether the stream, not the snapshot resource, is the active
+    // result source. `mode=live` is a claim the page keeps true
+    // (ADR-0027, amended 2026-09-12).
+    let live = Signal::derive(move || mode.get() == Mode::Live);
+
+    // What the snapshot resource runs: nothing at all while live. The
+    // resource short-circuits an empty query without a round trip, so
+    // no `/api/v1/query` leaves the page behind a stream, and every
+    // reader of `rows` below reads the "no query yet" placeholder
+    // instead of the page the previous mode left behind. `effective_q`
+    // still drives the stream, the export modal and the notice.
+    let snapshot_q = Memo::new(move |_| {
+        if live.get() {
+            String::new()
+        } else {
+            effective_q.get()
+        }
+    });
+
     let (query_pending, set_query_pending) = signal(false);
-    let rows = rows_resource(effective_q, page, set_query_pending);
+    let rows = rows_resource(snapshot_q, page, set_query_pending);
 
     let goto = navigator();
 
@@ -148,17 +167,28 @@ pub fn Search() -> impl IntoView {
             // the address bar keeps its query, so a query too long to
             // share is a toast and an edit away from working, not a
             // banner over an editor the page just emptied.
-            report_refusal(
-                bus,
-                goto(
-                    &query_text.get_untracked(),
-                    0,
-                    mode.get_untracked(),
-                    &filters.get_untracked(),
-                    &range.get_untracked(),
-                    false,
-                ),
+            // Hauling the query the URL already carries writes the same
+            // link, and the memos behind the resource do not notify on an
+            // unchanged value — so a snapshot Haul would be silent just
+            // when it is the only way to retry a page that failed. Ask
+            // the resource itself in that case. In live the same Haul is
+            // a no-op: no snapshot runs, and the stream's own key
+            // (retry, mode, effective query) has not moved.
+            let rerun = !live.get_untracked()
+                && page.get_untracked() == 0
+                && query_text.get_untracked() == executed_q.get_untracked();
+            let outcome = goto(
+                &query_text.get_untracked(),
+                0,
+                mode.get_untracked(),
+                &filters.get_untracked(),
+                &range.get_untracked(),
+                false,
             );
+            if rerun && outcome.is_ok() {
+                rows.refetch();
+            }
+            report_refusal(bus, outcome);
         })
     };
 
@@ -289,13 +319,17 @@ pub fn Search() -> impl IntoView {
                 return Err("This search link could not be read.".to_string());
             }
             let new_range = crate::search_url::normalize_dialog_range(picked)?;
-            if range.get_untracked() == new_range {
+            // Committing a range is a bounded question, so it leaves
+            // live even when it names the range already selected — the
+            // short-circuit is for a selection that changes nothing at
+            // all, and in live the mode is the change.
+            if range.get_untracked() == new_range && !live.get_untracked() {
                 return Ok(());
             }
             goto(
                 &executed_q.get_untracked(),
                 0,
-                mode.get_untracked(),
+                Mode::Snapshot,
                 &filters.get_untracked(),
                 &new_range,
                 false,
@@ -340,6 +374,29 @@ pub fn Search() -> impl IntoView {
                 query_text.set(new_q);
             }
             report_refusal(bus, outcome);
+        })
+    };
+
+    // Leaving live is a navigation, not a local pause: the same query,
+    // page 0 and the URL's filters and range, with `mode` elided. Push,
+    // so Back returns to the stream.
+    let on_stop_live = {
+        let goto = goto.clone();
+        Callback::new(move |()| {
+            if unreadable.get_untracked() {
+                return;
+            }
+            report_refusal(
+                bus,
+                goto(
+                    &executed_q.get_untracked(),
+                    0,
+                    Mode::Snapshot,
+                    &filters.get_untracked(),
+                    &range.get_untracked(),
+                    false,
+                ),
+            );
         })
     };
 
@@ -405,7 +462,7 @@ pub fn Search() -> impl IntoView {
     let ring_result = Memo::new(move |_| ring_to_result(&ring.read()));
 
     let loading = Signal::derive(move || {
-        !effective_q.get().trim().is_empty() && (query_pending.get() || rows.get().is_none())
+        !snapshot_q.get().trim().is_empty() && (query_pending.get() || rows.get().is_none())
     });
 
     // Drive the shell's status bar from search-specific state. Both
@@ -415,7 +472,7 @@ pub fn Search() -> impl IntoView {
     Effect::new(move |_| {
         shell_status.kind.set(search_status(StatusInputs {
             unreadable: unreadable.get(),
-            live: mode.get() == Mode::Live,
+            live: live.get(),
             stream_failed: stream_failure.get().is_some(),
             snapshot_failed: snapshot_failed.get(),
             snapshot_pending: loading.get(),
@@ -442,8 +499,15 @@ pub fn Search() -> impl IntoView {
         shell_status.lagged.set(None);
     });
 
+    // A resource keeps its previous response while the next one loads,
+    // so "did a snapshot run" is `snapshot_q`, not the mode: the strip
+    // and the notice below must not describe the page live replaced for
+    // the frame it takes the empty query to resolve.
+    let snapshot_ran = Signal::derive(move || !snapshot_q.get().trim().is_empty());
     let truncated = Signal::derive(move || {
-        !unreadable.get() && rows.get().and_then(Result::ok).is_some_and(|r| r.truncated)
+        !unreadable.get()
+            && snapshot_ran.get()
+            && rows.get().and_then(Result::ok).is_some_and(|r| r.truncated)
     });
     let last_count = Signal::derive(move || {
         if unreadable.get() {
@@ -457,12 +521,8 @@ pub fn Search() -> impl IntoView {
     // The degraded fields this execution reported. Read off the
     // response, never re-derived and never refreshed from the catalog:
     // it describes the answer already on screen.
-    //
-    // Empty in live mode by construction — the snapshot resource keeps
-    // running behind the live tail, and SSE carries no notice, so a
-    // stale snapshot's fields must not be shown over streamed rows.
     let degraded_fields = Signal::derive(move || {
-        if mode.get() == Mode::Live || unreadable.get() {
+        if unreadable.get() || !snapshot_ran.get() {
             return Vec::new();
         }
         rows.get()
@@ -549,6 +609,15 @@ pub fn Search() -> impl IntoView {
                     // the blanked sentinel then, and the server reads
                     // an empty query as every row (ADR-0027).
                     trailing=Box::new(move || view! {
+                        <Show when=move || live.get()>
+                            <button
+                                type="button"
+                                class="action stop-live"
+                                title="Stop the live stream and run this query once"
+                                disabled=move || unreadable.get()
+                                on:click=move |_| on_stop_live.run(())
+                            >"Stop live"</button>
+                        </Show>
                         <button
                             type="button"
                             class="action save"

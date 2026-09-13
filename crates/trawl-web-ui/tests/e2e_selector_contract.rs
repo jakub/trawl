@@ -565,6 +565,12 @@ const CONTRACTS: &[Contract] = &[
         hook: "class=\"results\"",
     },
     Contract {
+        assignment: "stopLive: '.tabs button.action.stop-live',",
+        source_path: "src/pages/search.rs",
+        source: include_str!("../src/pages/search.rs"),
+        hook: "class=\"action stop-live\"",
+    },
+    Contract {
         assignment: "exportAction: '.tabs .action.export',",
         source_path: "src/pages/search.rs",
         source: include_str!("../src/pages/search.rs"),
@@ -695,6 +701,12 @@ const CONTRACTS: &[Contract] = &[
         source_path: "src/components/editor_wrap.rs",
         source: EDITOR_WRAP_RS,
         hook: "\"Live Tail\"",
+    },
+    Contract {
+        assignment: "stopLiveText: 'Stop live',",
+        source_path: "src/pages/search.rs",
+        source: include_str!("../src/pages/search.rs"),
+        hook: ">\"Stop live\"<",
     },
     Contract {
         assignment: "toastAny: '.toast',",
