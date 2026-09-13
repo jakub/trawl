@@ -34,22 +34,36 @@ error report:
 service=nginx _severity>=error last=1h | stats count() as errors by host
 ```
 
-A schedule created in the browser runs the saved text as written, so `last=1h`
-measures the trailing hour on each run. If you give the schedule its own window
-through the TUI or the API, remove `last=1h` from the text. Trawl rejects a
-schedule whose text and window both set a time range.
+**Window** decides what each run reads. Under **Query text**, the run executes
+the saved text as written, so the `last=1h` above measures the trailing hour on
+each run. The other two modes give the schedule its own bounds, and a query that
+already sets a time range cannot take one. Remove `last=1h` from the text
+before you save a window, or the server refuses the save and names both sides.
 
 ## Choose the reporting window
 
-A `since_last` window covers consecutive periods with no gap. A fixed trailing
-window, such as two hours on an hourly schedule, overlaps between runs. `lag`
-ends the window before the scheduled time so late events can land first. When
-the scheduler misses boundaries, it runs one bounded catch-up window instead
-of a backlog.
+Pick a mode in the **Window** control:
 
-The browser shows an existing window and lag but has no controls for them, and
-it keeps them when you change the interval or enabled state. Set them from the
-TUI's Saved tab with `s`, or with the [schedule API](/reference/api/#schedules).
+- **Query text** leaves the bounds to the query. Without a time clause in the
+  text, the schedule imposes no time limit.
+- **Since last run** covers consecutive periods with no gap. Each run starts
+  where the previous one stopped covering.
+- **Fixed span** covers a trailing **Span**, measured again from every run. A
+  two-hour span on an hourly schedule overlaps between runs.
+
+**Lag** is a late-arrival allowance and applies to both windowed modes. It moves
+both window bounds back by that much, so late events land before the window that
+owes them closes. Leave it blank for none.
+
+A windowed schedule advances its own coverage point. A manual run out of band
+would move that point and leave a hole the schedule never revisits, so the
+browser withdraws **Trigger run** from a net that has a window. When the
+scheduler misses boundaries, it runs one bounded catch-up window instead of a
+backlog.
+
+Switching a windowed schedule back to **Query text** removes the window and the
+lag. The form says so before you save, and names the point coverage stops at.
+Changing the window or the interval can make the next run due immediately.
 
 ## Inspect a run
 
@@ -64,6 +78,11 @@ every manual run, stores the saved text as written, so its `last=1h` stays
 relative and a rerun of that text reads a different hour. The stored result
 is the record of the run either way. Select **Trigger run** only when you want a new run.
 It changes the server, not only your screen.
+
+Expanding a run shows its stored result 20 rows to a page. Paging reads the
+rows the browser already has and sends no further request. A run that stored
+more rows than the server returned says how many of each above the table, so a
+short preview reads as a capped fetch rather than a short run.
 
 ## Reuse a report in a query
 

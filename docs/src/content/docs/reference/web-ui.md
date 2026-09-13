@@ -164,9 +164,26 @@ Closing the drawer stops its polling, not the server job. See
 `/jobs/nets` lists saved queries with **Name**, **Query**, **Schedule**,
 **Last run**, and **Created**. A row's drawer offers **Rename**, **Edit** for the
 query text, **Open query in search**, **Trigger a scheduled run now**, and
-**Runs**. Its schedule block sets **Interval** and **Max runs**, switches the
-schedule between **Active** and **Paused**, and removes it. **Delete** asks for
-confirmation. See [saved queries and reports](/use/saved-reports/).
+**Runs**. Its schedule block sets **Interval**, **Window**, and **Max runs**,
+switches the schedule between **Active** and **Paused**, and removes it.
+**Delete** asks for confirmation.
+
+**Window** has three modes. **Query text** runs the saved text as written.
+**Since last run** covers from the previous run's covered point to the run time.
+**Fixed span** covers the trailing **Span** below it, measured from the run time.
+Both windowed modes take a **Lag**, which moves both window bounds back by that
+much so late events can land first; blank is none. A save the server refuses
+appears under **Save schedule** in the server's own words, and the form keeps
+what you entered.
+
+**Trigger run** is absent for a net whose saved schedule carries a window,
+because a manual run would move the coverage point out of band.
+
+Expanding a run in **Runs** shows the stored result 20 rows to a page, with a
+pager under the table. Paging works on the rows the response carried and issues
+no further request. When the run stored more rows than the response carried, a
+line under the pager gives both counts. See
+[saved queries and reports](/use/saved-reports/).
 
 ## Runs
 
