@@ -62,7 +62,7 @@ scheduler misses boundaries, it runs one bounded catch-up window instead of a
 backlog.
 
 Switching a windowed schedule back to **Query text** removes the window and the
-lag. The form says so before you save, and names the point coverage stops at.
+lag. The form says so before you save and, when the schedule reports one, names the point coverage stops at.
 Changing the window or the interval can make the next run due immediately.
 
 ## Inspect a run
@@ -81,7 +81,7 @@ It changes the server, not only your screen.
 
 Expanding a run shows its stored result 20 rows to a page. Paging reads the
 rows the browser already has and sends no further request. A run that stored
-more rows than the server returned says how many of each above the table, so a
+more rows than the server returned says how many of each under the pager, so a
 short preview reads as a capped fetch rather than a short run.
 
 ## Reuse a report in a query

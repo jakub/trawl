@@ -54,7 +54,10 @@ test('the stored preview pages in the browser without a second read', async ({ p
   await expect(preview.locator(SEL.previewRow).last()).toContainText('row-45');
   await expect(next).toBeDisabled();
 
-  // Two page turns, still one read: the rows never left the browser.
+  // Two page turns, still one read: the rows never left the browser. Wait
+  // for the network to go quiet first, so a late second fetch cannot slip
+  // past an assertion that read the counter too early.
+  await page.waitForLoadState('networkidle');
   expect(await runDetailReadCount(request)).toBe(1);
 
   // Collapsing drops the preview's page along with the preview, so the
