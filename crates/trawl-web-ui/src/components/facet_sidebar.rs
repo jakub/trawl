@@ -109,7 +109,7 @@ pub fn FacetSidebar(
             </div>
             // Both gates hide the value search with the groups: it
             // filters names that are not being computed.
-            <Show when=move || !aggregate_shape.get()>
+            <Show when=move || !suppressed.get() && !aggregate_shape.get()>
                 <SearchInput value=needle placeholder="Filter field values"/>
             </Show>
             // Suppression is total: an unreadable link has no active
