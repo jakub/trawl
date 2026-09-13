@@ -542,10 +542,17 @@ fn QuerySchedulePane(
                             <span id="net-max-runs-help" style="color:var(--ink-3); font-size:11px">"(blank = unlimited)"</span>
                             <input
                                 class="mono"
-                                type="number"
+                                // Text, not `number`: a browser reports
+                                // malformed numeric text (`1e`, a lone
+                                // `-`) as an empty value, which reads as
+                                // "blank = unlimited" and silently clears
+                                // an existing cap. Text keeps what was
+                                // typed visible so `validate_max_runs`
+                                // can refuse it by name.
+                                type="text"
+                                inputmode="numeric"
                                 id="net-max-runs"
                                 aria-describedby="net-max-runs-help"
-                                min="1"
                                 style="display:block; margin-top:4px; width:80px; font-size:12px; padding:4px 6px; background:var(--fill); border:1px solid var(--line); border-radius:var(--radius-ctl); color:var(--ink)"
                                 prop:value=move || max_runs_buf.get()
                                 on:input=move |e| max_runs_buf.set(event_target_value(&e))
