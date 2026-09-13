@@ -191,7 +191,10 @@ pub enum EffectiveWindow {
 /// range. The closure never claims a hit, so one walk collects them all.
 #[must_use]
 pub fn find_time_clauses(search: &str) -> Vec<TimeClause> {
-    const KEYWORDS: [&str; 3] = ["last", "earliest", "latest"];
+    // The grammar's own closed set, so a fourth keyword reaches this
+    // scanner the day the parser learns it (trawl-core pins the set
+    // against `TimeClause` in `ast.rs`).
+    const KEYWORDS: &[&str] = trawl_core::parser::suggest::GRAMMAR_KEYWORDS;
     let lower = search.to_ascii_lowercase();
     let bytes = lower.as_bytes();
     let mut found: Vec<(usize, &'static str)> = Vec::new();
