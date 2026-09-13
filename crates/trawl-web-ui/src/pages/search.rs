@@ -31,8 +31,8 @@ use crate::components::malformed_notice::MalformedNotice;
 use crate::components::meta_strip::MetaStrip;
 use crate::components::results_table::ResultsTable;
 use crate::components::save_as_net_modal::SaveAsNetModal;
-use crate::components::status_bar::StatusKind;
 use crate::pages::layout::ShellStatus;
+use crate::search_status::{FooterCount, StatusInputs, StatusKind, search_status};
 use crate::search_url::{Param, admit_filters, refusal_copy};
 use crate::state::query::{
     Filter, Mode, RangeSpec, UrlSignals, effective_query, navigator, replace_navigator,
@@ -408,22 +408,29 @@ pub fn Search() -> impl IntoView {
         !effective_q.get().trim().is_empty() && (query_pending.get() || rows.get().is_none())
     });
 
-    // Drive the shell's status bar from search-specific state.
+    // Drive the shell's status bar from search-specific state. Both
+    // derivations are pure (`search_status.rs`): the footer describes
+    // the active result source, and nothing else on the page.
+    let snapshot_failed = Signal::derive(move || rows.get().is_some_and(|r| r.is_err()));
     Effect::new(move |_| {
-        shell_status.kind.set(match (mode.get(), loading.get()) {
-            (Mode::Live, _) => StatusKind::Live,
-            (_, true) => StatusKind::Hauling,
-            _ => StatusKind::Connected,
-        });
+        shell_status.kind.set(search_status(StatusInputs {
+            unreadable: unreadable.get(),
+            live: mode.get() == Mode::Live,
+            stream_failed: stream_failure.get().is_some(),
+            snapshot_failed: snapshot_failed.get(),
+            snapshot_pending: loading.get(),
+        }));
     });
     Effect::new(move |_| {
-        shell_status.count.set(if unreadable.get() {
-            None
-        } else {
-            rows.get()
-                .and_then(Result::ok)
-                .map(|r| r.pagination.returned)
-        });
+        shell_status
+            .count
+            .set(FooterCount::last(if unreadable.get() {
+                None
+            } else {
+                rows.get()
+                    .and_then(Result::ok)
+                    .map(|r| u64::try_from(r.pagination.returned).unwrap_or(u64::MAX))
+            }));
     });
     Effect::new(move |_| {
         shell_status.lagged.set(lagged.get());
@@ -431,7 +438,7 @@ pub fn Search() -> impl IntoView {
 
     on_cleanup(move || {
         shell_status.kind.set(StatusKind::Connected);
-        shell_status.count.set(None);
+        shell_status.count.set(FooterCount::last(None));
         shell_status.lagged.set(None);
     });
 

@@ -1225,6 +1225,18 @@ const CONTRACTS: &[Contract] = &[
         hook: "class=\"x\"",
     },
     Contract {
+        assignment: "statusLabel: '.statusbar .status-label',",
+        source_path: "src/components/status_bar.rs",
+        source: STATUS_BAR_RS,
+        hook: "class=\"strong status-label\"",
+    },
+    Contract {
+        assignment: "footerCount: '.statusbar .grp.count',",
+        source_path: "src/components/status_bar.rs",
+        source: STATUS_BAR_RS,
+        hook: "class=\"grp count\"",
+    },
+    Contract {
         assignment: "themeControl: '.statusbar button.grp.clickable',",
         source_path: "src/components/status_bar.rs",
         source: STATUS_BAR_RS,

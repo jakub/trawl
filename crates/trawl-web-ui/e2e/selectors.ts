@@ -299,6 +299,12 @@ export const SEL = {
   /// crates/trawl-web-ui/src/components/meta_strip.rs — a filter chip's
   /// remove control, named after the filter it drops.
   chipRemove: '.meta-chips .chip button.x',
+  /// crates/trawl-web-ui/src/components/status_bar.rs — the footer's
+  /// status text (Connected / Hauling / Live / Error).
+  statusLabel: '.statusbar .status-label',
+  /// crates/trawl-web-ui/src/components/status_bar.rs — the footer's
+  /// count group, whose label names the source it counted.
+  footerCount: '.statusbar .grp.count',
   /// crates/trawl-web-ui/src/components/status_bar.rs — the theme
   /// control. Its visible text is the theme in force and its accessible
   /// name is the theme a press would produce.

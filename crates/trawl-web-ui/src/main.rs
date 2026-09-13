@@ -21,6 +21,7 @@ mod repin_flow;
 mod repin_hint;
 mod schedule_edit;
 mod schema_nav;
+mod search_status;
 mod search_url;
 mod service_card_fmt;
 mod severity_cell;
