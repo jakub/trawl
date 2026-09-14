@@ -781,6 +781,7 @@ pub fn Search() -> impl IntoView {
                         <>
                             <Histogram rows=rows window=window pending=loading/>
                             <ResultsTable
+                                queried=snapshot_ran
                                 busy=running
                                 page=page
                                 rows=rows
@@ -820,6 +821,7 @@ pub fn Search() -> impl IntoView {
         </div>
         {move || save_query.get().map(|query| view! {
             <SaveAsNetModal
+                from_editor=true
                 query=query
                 on_close=Callback::new(move |_| save_query.set(None))
             />

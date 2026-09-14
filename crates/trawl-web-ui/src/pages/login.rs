@@ -56,13 +56,19 @@ pub fn Login() -> impl IntoView {
     // "trawl", and the empty accent span renders nothing.
     view! {
         <Atmosphere theme=prefs.theme()/>
-        <fleet_ui::Login
-            brand="trawl"
-            brand_accent=""
-            on_submit=on_submit
-            error=error
-            submitting=submitting
-            invalid=invalid
-        />
+        <div class="trawl-login">
+            <fleet_ui::Login
+                brand="trawl"
+                brand_accent=""
+                on_submit=on_submit
+                error=error
+                submitting=submitting
+                invalid=invalid
+            />
+            <aside class="trawl-login-help" aria-label="Get an API key">
+                <p>"Ask your Trawl operator for a personal API key."</p>
+                <p>"Setting up Trawl? "<a href="https://trawl.sh/operate/access/#create-roles-and-keys" target="_blank" rel="noopener noreferrer">"Create your first API key"</a>"."</p>
+            </aside>
+        </div>
     }
 }

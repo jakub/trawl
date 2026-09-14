@@ -30,6 +30,9 @@ use trawl_api::value::Value;
 pub fn ResultsTable(
     #[prop(into)] page: Signal<usize>,
     rows: LocalResource<Result<ExecutedResponse, ApiError>>,
+    /// Whether a snapshot query has been submitted. Empty columns alone cannot prove this.
+    #[prop(into)]
+    queried: Signal<bool>,
     #[prop(into)] busy: Signal<bool>,
     /// Called with the new page index when prev/next is clicked. Parent
     /// captures a router navigator and translates to URL navigation.
@@ -53,6 +56,7 @@ pub fn ResultsTable(
                     <ResultsTableBody
                         resp=resp.response
                         executed_query=resp.query
+                        queried=queried
                         page=page
                         busy=busy
                         on_paginate=on_paginate
@@ -76,6 +80,7 @@ struct SortState {
 fn ResultsTableBody(
     resp: QueryResponse,
     executed_query: ExecutedQuery,
+    queried: Signal<bool>,
     page: Signal<usize>,
     busy: Signal<bool>,
     on_paginate: Callback<usize>,
@@ -88,10 +93,21 @@ fn ResultsTableBody(
     let rows_data = resp.result.rows.clone();
     let returned = resp.pagination.returned;
     let truncated = resp.truncated;
+    let empty_message = if resp.pagination.offset == 0 {
+        "No events match this query. Check the time range and filters."
+    } else {
+        "No events on this page. Try the previous page or check the time range and filters."
+    };
 
-    if columns.is_empty() && resp.pagination.offset == 0 {
+    if !queried.get_untracked() {
         return view! {
-            <div class="results-empty">"No fish in this net yet — type a query and press ⌘⏎"</div>
+            <div class="results-empty">
+                <p>"Search your events"</p>
+                <p>"Try "<code>"last=1h | head 20"</code>" to return up to 20 events from the last hour."</p>
+                <Btn variant=Variant::Secondary on_click=Callback::new(move |()| on_navigate.run("last=1h | head 20".to_string()))>"Run example"</Btn>
+                <p>"Or enter a query and press "{crate::components::editor_wrap::run_shortcut()}"."</p>
+                <a href="https://trawl.sh/use/query-tutorial/" target="_blank" rel="noopener noreferrer">"Query guide"</a>
+            </div>
         }
         .into_any();
     }
@@ -190,7 +206,7 @@ fn ResultsTableBody(
                             view! {
                                 <tr>
                                     <td class="results-empty-cell" colspan=cols_len>
-                                        "No fish in this net yet"
+                                        {empty_message}
                                     </td>
                                 </tr>
                             }.into_any()

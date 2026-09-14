@@ -30,6 +30,9 @@ use fleet_ui::{Btn, Field, Icon, Kbd, Modal, ToastBus, ToastKind, Variant};
 pub fn SaveAsNetModal(
     /// The DSL query to save. Shown read-only in the preview strip.
     query: String,
+    /// Search captures an editor buffer; History supplies a recorded query instead.
+    #[prop(optional)]
+    from_editor: bool,
     /// Called after a successful save or cancel — parent should clear
     /// whatever made the modal open. The bool is `true` on save, `false`
     /// on cancel; the parent can use that to decide whether to also
@@ -122,6 +125,10 @@ pub fn SaveAsNetModal(
                 <div class="preview" title=query.clone()>{query.clone()}</div>
             </div>
 
+            <Show when=move || from_editor>
+                <p class="save-scope">"Save captures the editor query text shown above. It omits sidebar filters and the time range control."</p>
+                <p class="save-scope">"To share the full browser search state, cancel and use Share beside the editor. Run any editor changes first."</p>
+            </Show>
             <Field id="netName" label="Name" class="m-field">
                 <input
                     id="netName"

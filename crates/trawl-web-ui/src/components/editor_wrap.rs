@@ -17,6 +17,23 @@ use crate::components::editor::DslEditor;
 use crate::state::query::{QUICK_RANGES, RangeSpec};
 use fleet_ui::{CopyButton, Kbd, RangeDialog, RangePreset, RangeValue, ToastBus, ToastKind};
 
+/// Match the editor's primary modifier on Apple and other platforms.
+pub(crate) fn run_shortcut() -> &'static str {
+    let ua = window()
+        .navigator()
+        .user_agent()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if ["macintosh", "mac os x", "iphone", "ipad", "ipod"]
+        .iter()
+        .any(|name| ua.contains(name))
+    {
+        "⌘ + Enter"
+    } else {
+        "Ctrl + Enter"
+    }
+}
+
 #[component]
 pub fn EditorWrap(
     /// Editor buffer — bound to the `DslEditor` document.
@@ -114,7 +131,7 @@ pub fn EditorWrap(
                         } else {
                             view! {
                                 <span>"Haul"</span>
-                                <Kbd inline=true>"⌘⏎"</Kbd>
+                                <Kbd inline=true>{run_shortcut()}</Kbd>
                             }.into_any()
                         }}
                     </button>
