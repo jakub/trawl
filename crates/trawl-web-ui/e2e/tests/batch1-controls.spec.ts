@@ -113,6 +113,11 @@ test('reduced motion stops actual overlays, toasts and live tail pulses', async 
   await expect(page.locator('.modal')).toHaveCSS('animation-name', 'none');
   await expect(page.locator('.modal-scrim')).toHaveCSS('animation-name', 'none');
   await page.keyboard.press('Escape');
+  // The service panel docks beside the list at 1100px and up, where
+  // there is no scrim and nothing slides in (ADR-0032). The entrance
+  // animations this test is about only exist in the narrow overlay
+  // presentation, so measure them there.
+  await page.setViewportSize({ width: 1024, height: 900 });
   await page.goto(`/search/schema?svc=${CORPUS.service}&stab=tail`);
   await expect(page.locator('.sd-drawer')).toHaveCSS('animation-name', 'none');
   await expect(page.locator('.sd-scrim')).toHaveCSS('animation-name', 'none');

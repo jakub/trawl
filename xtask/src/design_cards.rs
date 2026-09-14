@@ -797,7 +797,7 @@ fn reason_modal_card() -> Card {
 }
 
 fn login_card() -> Card {
-    let submit = btn_full(Variant::Form, Size::Default, true, "Sign In", false);
+    let submit = btn_full(Variant::Form, Size::Default, true, "Sign in", false);
     let body = format!(
         r#"{h}<div class="login-shell"><form class="login-card"><h1><span>traw</span><span class="accent">l</span></h1><p class="subtitle">sign in with your API key</p><label class="field"><span>API key</span><input type="password" autocomplete="off" spellcheck="false"/></label>{submit}</form></div>"#,
         h = heading("Login"),

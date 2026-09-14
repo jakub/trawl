@@ -21,7 +21,9 @@ test('Settings opens Health and offers only Health and the existing Schema page'
 
   await rail.nth(2).click();
   await expect(page).toHaveURL(/\/search\/schema$/);
-  await expect(page.getByRole('heading', { name: 'Schema', exact: true })).toBeVisible();
+  // Scoped to the page: the command bar's crumb is a heading with the
+  // same name, which is the point of a breadcrumb.
+  await expect(page.getByRole('main').getByRole('heading', { name: 'Schema', exact: true })).toBeVisible();
   await expect(rail.nth(2)).toHaveClass(/\bactive\b/);
 });
 

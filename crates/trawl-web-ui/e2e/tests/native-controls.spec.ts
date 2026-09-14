@@ -66,7 +66,7 @@ test('toast dismiss is a named button that removes one toast', async ({ page, co
 
   // Two successful copies produce two toasts. Dismissing one must leave
   // the other in place.
-  const share = page.locator(SEL.editorTool).filter({ hasText: /^Share$/ });
+  const share = page.locator(SEL.editorTool).filter({ hasText: COPY.copyUrlTool });
   await share.click();
   await expect(page.locator(SEL.toastAny)).toHaveCount(1);
   await share.click();
@@ -90,12 +90,12 @@ test('bare copy button copies on Space and stops propagation', async ({ page, co
   await page.goto('/search');
   await expect(page.locator(SEL.dslEditor)).toBeVisible();
 
-  const share = page.locator(SEL.editorTool).filter({ hasText: 'Share' });
-  const save = page.locator(SEL.editorTool).filter({ hasText: 'Save' });
+  const share = page.locator(SEL.editorTool).filter({ hasText: COPY.copyUrlTool });
+  const save = page.locator(SEL.editorTool).filter({ hasText: COPY.saveAsNetTool });
   await expect(share).toHaveCount(1);
   await expect(share).toHaveJSProperty('tagName', 'BUTTON');
   await expect(share).toHaveAttribute('type', 'button');
-  await expect(share).toHaveAccessibleName('Share');
+  await expect(share).toHaveAccessibleName(COPY.copyUrlTool);
 
   await countBubbledToolClicks(page);
 

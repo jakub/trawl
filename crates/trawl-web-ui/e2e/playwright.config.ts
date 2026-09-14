@@ -17,7 +17,12 @@ export default defineConfig({
   retries: 0,
   timeout: 20_000,
   expect: { timeout: 5_000 },
-  globalTimeout: 240_000,
+  // The same budget CI passes on the command line (ci.yml's web-ui-e2e
+  // job runs `npm run test -- --global-timeout=720000`). The suite grew
+  // past the old 240s ceiling with the redesign's console, reading-mode,
+  // aggregate and sidebar specs, and a run that is cut off reports the
+  // rest as "did not run" rather than as a failure.
+  globalTimeout: 720_000,
   reporter: process.env.CI ? [['github'], ['list']] : [['list']],
   use: {
     baseURL: `http://127.0.0.1:${PORT}`,

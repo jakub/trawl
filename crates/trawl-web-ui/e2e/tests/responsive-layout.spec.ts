@@ -38,6 +38,15 @@ for (const width of [320, 720, 1024, 1440]) {
       const toggle = page.locator(SEL.navToggle);
       await insideViewport(toggle);
       await toggle.click();
+      // The overlay slides in from 20px off the left edge. Measure it at
+      // rest, by its own animation's `finished` promise: this suite does
+      // not run under emulated reduced motion, so a box read on the
+      // frame after the click is a frame of the entrance, not the
+      // layout. (`animation-fill-mode` is `none`, so an element that
+      // never animates resolves immediately.)
+      await page.locator('nav.rail.overlay').evaluate(async (el) => {
+        await Promise.all(el.getAnimations().map((a) => a.finished));
+      });
       for (const link of await page.locator(SEL.paletteRailLink).all()) await insideViewport(link);
       await page.keyboard.press('Escape');
       await expect(toggle).toBeFocused();

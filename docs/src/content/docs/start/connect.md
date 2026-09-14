@@ -10,7 +10,7 @@ and API URLs at `trawld`. The key's permissions, such as `query` and
 ## Sign in from the browser
 
 1. Open the browser URL.
-2. Enter your key in **API key** and select **Sign In**.
+2. Enter your key in **API key** and select **Sign in**.
 3. On Search, enter `last=15m | head 20` and select **Haul**, or press Ctrl+Enter.
 
 Expect up to 20 events in **Events** and **Connected** in the status bar.
