@@ -19,16 +19,17 @@
 use leptos::prelude::*;
 use wasm_bindgen::JsValue;
 
-use super::prefs::{ParseOutcome, RowStyle, Sidebar, Stored, Theme, parse_stored};
+use super::prefs::{Details, ParseOutcome, RowStyle, Rows, Sidebar, Stored, Theme, parse_stored};
 
 /// Reactive UI preference signals + an effect that mirrors them onto
 /// `<html data-*>` and persists them to `localStorage`.
 ///
 /// Construction is sealed: [`install`] is the only way to get a
 /// `UiPrefs`. The signals are exposed via [`UiPrefs::theme`],
-/// [`UiPrefs::rowstyle`] and [`UiPrefs::sidebar`] — each returns the
-/// underlying [`RwSignal`] so consumers can read with `.get()`, write
-/// with `.set()`, and feed into derived signals or effects.
+/// [`UiPrefs::rowstyle`], [`UiPrefs::sidebar`], [`UiPrefs::details`]
+/// and [`UiPrefs::rows`] — each returns the underlying [`RwSignal`] so
+/// consumers can read with `.get()`, write with `.set()`, and feed into
+/// derived signals or effects.
 ///
 /// Stash the returned value with `provide_context` from a top-level
 /// component so descendants can pick it up via `use_context`.
@@ -37,6 +38,8 @@ pub struct UiPrefs {
     pub(crate) theme: RwSignal<Theme>,
     pub(crate) rowstyle: RwSignal<RowStyle>,
     pub(crate) sidebar: RwSignal<Sidebar>,
+    pub(crate) details: RwSignal<Details>,
+    pub(crate) rows: RwSignal<Rows>,
 }
 
 impl UiPrefs {
@@ -53,6 +56,16 @@ impl UiPrefs {
     #[must_use]
     pub fn sidebar(self) -> RwSignal<Sidebar> {
         self.sidebar
+    }
+
+    #[must_use]
+    pub fn details(self) -> RwSignal<Details> {
+        self.details
+    }
+
+    #[must_use]
+    pub fn rows(self) -> RwSignal<Rows> {
+        self.rows
     }
 }
 
@@ -71,6 +84,8 @@ pub fn install(storage_key: &'static str) -> UiPrefs {
         theme: RwSignal::new(stored.theme),
         rowstyle: RwSignal::new(stored.rowstyle),
         sidebar: RwSignal::new(stored.sidebar),
+        details: RwSignal::new(stored.details),
+        rows: RwSignal::new(stored.rows),
     };
 
     // Track the last value we persisted so we never overwrite storage with
@@ -85,6 +100,8 @@ pub fn install(storage_key: &'static str) -> UiPrefs {
             theme: prefs.theme.get(),
             rowstyle: prefs.rowstyle.get(),
             sidebar: prefs.sidebar.get(),
+            details: prefs.details.get(),
+            rows: prefs.rows.get(),
         };
         apply_to_dom(snap);
         if last_written.with_value(|w| *w != snap) {
@@ -118,6 +135,8 @@ fn write_stored(storage_key: &str, s: Stored) {
         "theme":    s.theme.as_attr(),
         "rowstyle": s.rowstyle.as_attr(),
         "sidebar":  s.sidebar.as_attr(),
+        "details":  s.details.as_attr(),
+        "rows":     s.rows.as_attr(),
     });
     if let Err(err) = storage.set_item(storage_key, &payload.to_string()) {
         // QuotaExceededError (Safari private browsing, full storage) is the
