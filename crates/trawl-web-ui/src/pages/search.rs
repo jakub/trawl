@@ -911,6 +911,7 @@ pub fn Search() -> impl IntoView {
                                 on_add_filter=on_result_filter
                                 on_navigate=on_navigate_q
                                 details=details
+                                rows_mode=rows_mode
                                 selected=selected
                                 generation=generation
                             />

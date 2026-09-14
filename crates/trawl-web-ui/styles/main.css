@@ -1022,6 +1022,24 @@
 }
 
 /* ─────────────────────────────────────────────────────────────────
+ *  Message-first rows (ADR-0032). Time, severity and the message at
+ *  full width, with service / host / latency as a muted second line;
+ *  every other column is read in the detail or the inspector.
+ * ─────────────────────────────────────────────────────────────── */
+.results-table.msg-first tbody td { white-space: normal; vertical-align: top; }
+.results-table.msg-first .mf-time { white-space: nowrap; color: var(--ink-3); width: 1%; }
+.results-table.msg-first .mf-msg .msg { color: var(--ink); overflow-wrap: anywhere; }
+.results-table.msg-first .mf-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 2px;
+  font-family: var(--font-ui);
+  font-size: var(--fs-micro);
+  color: var(--ink-3);
+}
+
+/* ─────────────────────────────────────────────────────────────────
  *  Docked inspector (ADR-0032). The table and the panel are one grid,
  *  not a scrim over the page: the rows stay put and stay readable while
  *  a row is open. Below 900px the panel stacks under the table and the

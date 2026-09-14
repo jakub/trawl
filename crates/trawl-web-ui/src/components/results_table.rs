@@ -29,12 +29,12 @@ use crate::api::{ApiError, PAGE_SIZE};
 use crate::context_query::SearchNavigation;
 use crate::context_query::{build_context_query, escape_dq, find_col};
 use crate::result_actions::{Capabilities, compare};
-use crate::results_layout::inspector_selection;
+use crate::results_layout::{MessageFirst, inspector_selection, message_first};
 use crate::state::query::{Filter, FilterOp};
 use crate::state::search_session::{ExecutedQuery, ExecutedResponse};
 use fleet_ui::overlay::has_layers;
 use fleet_ui::{
-    Btn, CopyButton, Details, Drawer, LoadState, Loaded, OffsetPager, PageTotal, PageWindow,
+    Btn, CopyButton, Details, Drawer, LoadState, Loaded, OffsetPager, PageTotal, PageWindow, Rows,
     ToastBus, ToastKind, Variant,
 };
 use leptos::prelude::*;
@@ -67,6 +67,10 @@ pub fn ResultsTable(
     /// inspector. `Inline` is the default and renders today's markup.
     #[prop(into)]
     details: Signal<Details>,
+    /// Compact column table, or message-first rows. `Compact` is the
+    /// default and renders today's markup.
+    #[prop(into)]
+    rows_mode: Signal<Rows>,
     /// The inspector's selection, owned by the page: only the page knows
     /// when a new response, a page turn or a new effective query has
     /// landed under it.
@@ -121,6 +125,7 @@ pub fn ResultsTable(
                             on_navigate=on_navigate
                             bus=bus
                             details=details
+                            rows_mode=rows_mode
                             selected=selected
                             generation=generation
                             order=order
@@ -370,6 +375,7 @@ fn ResultsTableBody(
     on_navigate: Callback<SearchNavigation>,
     bus: ToastBus,
     details: Signal<Details>,
+    rows_mode: Signal<Rows>,
     selected: RwSignal<Option<(u64, usize)>>,
     generation: Signal<u64>,
     order: StoredValue<Vec<usize>>,
@@ -410,10 +416,25 @@ fn ResultsTableBody(
     let expanded = RwSignal::new(None::<usize>);
     let sort = RwSignal::new(None::<SortState>);
 
+    // The message-first plan for THIS response, if it has a message to
+    // lead with. Computed once; the memo below decides whether the mode
+    // in force actually uses it.
+    let plan = message_first(&columns, &severity_cols);
+    let layout = Memo::new(move |_| {
+        if rows_mode.get() == Rows::MessageFirst {
+            plan.clone()
+        } else {
+            None
+        }
+    });
+
     let cols_for_header = columns.clone();
     let cols_for_view = columns.clone();
-    let header_cells = cols_for_header.iter().enumerate().map(|(i, name)| {
-        let name = name.clone();
+    // One header cell, by original column index. A closure rather than a
+    // pre-built Vec because the message-first layout renders three of
+    // these and the compact layout renders all of them, and both need
+    // the same `th-sort` markup and the same sort state.
+    let sort_header = move |i: usize, name: String| {
         // The visible text is the column, so the name says what the
         // press DOES and keeps that word inside it (WCAG 2.5.3). The
         // direction stays on the cell's `aria-sort` rather than joining
@@ -451,7 +472,19 @@ fn ResultsTableBody(
                 </button>
             </th>
         }
-    }).collect::<Vec<_>>();
+    };
+    let header_cells = move || match layout.get() {
+        Some(mf) => mf
+            .header_indices()
+            .into_iter()
+            .map(|i| sort_header(i, cols_for_header[i].clone()))
+            .collect::<Vec<_>>(),
+        None => cols_for_header
+            .iter()
+            .enumerate()
+            .map(|(i, name)| sort_header(i, name.clone()))
+            .collect::<Vec<_>>(),
+    };
 
     let has_rows = !rows_data.is_empty();
     let sorted_indices = SortedIndices::new(&rows_data, sort);
@@ -460,6 +493,15 @@ fn ResultsTableBody(
     // that knows the current sort, and the keystroke handler must not
     // subscribe to it or every re-sort would re-run the handler.
     Effect::new(move |_| order.set_value(sorted_indices.indices.get()));
+    // Cells per row, including the expander column: the colspans of the
+    // empty-result cell and the inline detail must follow the layout.
+    let visible_cols = columns.len();
+    let span = Memo::new(move |_| {
+        layout
+            .get()
+            .map_or(visible_cols, |mf| mf.header_indices().len())
+            + 1
+    });
     let fetched_page = resp.pagination.offset / PAGE_SIZE;
     let window = Signal::derive(move || {
         PageWindow::new(
@@ -475,6 +517,8 @@ fn ResultsTableBody(
         on_navigate,
         bus,
         details,
+        layout,
+        span,
         selected,
         generation,
         executed_query,
@@ -484,7 +528,7 @@ fn ResultsTableBody(
     view! {
         <>
             <div class="results-table-wrap">
-                <table class="results-table">
+                <table class="results-table" class:msg-first=move || layout.get().is_some()>
                     <thead>
                         <tr>
                             <th class="exp-col"><span class="sr-only">"Details"</span></th>
@@ -503,10 +547,9 @@ fn ResultsTableBody(
                                 wiring.clone(),
                             )).into_any()
                         } else {
-                            let cols_len = columns.len() + 1;
                             view! {
                                 <tr>
-                                    <td class="results-empty-cell" colspan=cols_len>
+                                    <td class="results-empty-cell" colspan=move || span.get()>
                                         {empty_message}
                                     </td>
                                 </tr>
@@ -601,6 +644,11 @@ struct RowWiring {
     on_navigate: Callback<SearchNavigation>,
     bus: ToastBus,
     details: Signal<Details>,
+    /// The message-first plan in force, or `None` for the compact table.
+    layout: Memo<Option<MessageFirst>>,
+    /// Cells per row including the expander column, for the detail
+    /// row's `colspan`.
+    span: Memo<usize>,
     selected: RwSignal<Option<(u64, usize)>>,
     generation: Signal<u64>,
     executed_query: ExecutedQuery,
@@ -621,6 +669,8 @@ fn RowFragment(
         on_navigate,
         bus,
         details,
+        layout,
+        span,
         selected,
         generation,
         executed_query,
@@ -641,21 +691,11 @@ fn RowFragment(
     };
 
     let cells_row = row.clone();
-    let cells = cells_row
-        .iter()
-        .enumerate()
-        .map(|(ci, v)| {
-            if severity_cols.contains(&ci) {
-                // Display shows the token; the wire (json/csv/SSE) keeps
-                // the number for arithmetic consumers.
-                let s = severity_display(v);
-                let cls = severity_class(v);
-                view! { <td><span class=cls>{s}</span></td> }.into_any()
-            } else {
-                view! { <td>{value_to_string(v)}</td> }.into_any()
-            }
-        })
-        .collect::<Vec<_>>();
+    let cells_cols = columns.clone();
+    let cells = move || match layout.get() {
+        Some(mf) => message_first_cells(&cells_row, &cells_cols, &mf),
+        None => compact_cells(&cells_row, &severity_cols),
+    };
 
     let columns_for_detail = columns.clone();
     let row_for_detail = row.clone();
@@ -719,7 +759,7 @@ fn RowFragment(
             </tr>
             <Show when=move || !inspecting() && expanded.get() == Some(idx)>
                 <tr>
-                    <td class="detail" colspan=columns_for_detail.len() + 1>
+                    <td class="detail" colspan=move || span.get()>
                         <div class="dg">
                             {columns_for_detail.iter().zip(row_for_detail.iter()).map(|(name, v)| {
                                 let key = name.clone();
@@ -831,6 +871,66 @@ fn FindSimilarButton(
     view! {
         <Btn variant=Variant::Secondary on_click=on_click>"Find similar"</Btn>
     }
+}
+
+/// The compact layout's cells: one per column, in wire order.
+fn compact_cells(row: &[Value], severity_cols: &[usize]) -> Vec<AnyView> {
+    row.iter()
+        .enumerate()
+        .map(|(ci, v)| {
+            if severity_cols.contains(&ci) {
+                // Display shows the token; the wire (json/csv/SSE) keeps
+                // the number for arithmetic consumers.
+                let s = severity_display(v);
+                let cls = severity_class(v);
+                view! { <td><span class=cls>{s}</span></td> }.into_any()
+            } else {
+                view! { <td>{value_to_string(v)}</td> }.into_any()
+            }
+        })
+        .collect()
+}
+
+/// The message-first layout's cells: time, severity pill, then the
+/// message at full width with service / host / latency under it.
+///
+/// Every column this drops is still reachable in the inline detail or
+/// the docked inspector — the mode trades the columns for one readable
+/// message, it does not hide data.
+fn message_first_cells(row: &[Value], columns: &[String], mf: &MessageFirst) -> Vec<AnyView> {
+    let mut out: Vec<AnyView> = Vec::with_capacity(3);
+    if let Some(i) = mf.time {
+        let text = row.get(i).map(value_to_string).unwrap_or_default();
+        out.push(view! { <td class="mono mf-time">{text}</td> }.into_any());
+    }
+    if let Some(i) = mf.severity
+        && let Some(v) = row.get(i)
+    {
+        let s = severity_display(v);
+        let cls = severity_class(v);
+        out.push(view! { <td><span class=cls>{s}</span></td> }.into_any());
+    }
+    let message = row.get(mf.message).map(value_to_string).unwrap_or_default();
+    let meta = mf
+        .meta
+        .iter()
+        .filter_map(|&i| {
+            let name = columns.get(i)?;
+            let value = value_to_string(row.get(i)?);
+            Some(view! { <span>{format!("{name} {value}")}</span> })
+        })
+        .collect::<Vec<_>>();
+    let has_meta = !meta.is_empty();
+    out.push(
+        view! {
+            <td class="mf-msg">
+                <div class="msg">{message}</div>
+                {has_meta.then_some(view! { <div class="mf-meta">{meta}</div> })}
+            </td>
+        }
+        .into_any(),
+    );
+    out
 }
 
 fn raw_or_synthesized(row: &[Value], columns: &[String]) -> String {
