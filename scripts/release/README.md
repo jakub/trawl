@@ -11,10 +11,31 @@ refused. Do not silently use a newer runtime for that tag.
 `build-distribution.sh SOURCE TARGET RUNTIME [--cli-only|--image-only]` verifies the official
 DuckDB archive, disables the bundled feature, retains CLI clipboard support,
 and adds a relative runtime search path. `--image-only` selects the four
-server-image executables without changing their release profile or debug settings. Linux uses cargo-zigbuild; macOS uses
+server-image executables without changing their release profile or debug settings.
+Linux amd64 uses cargo-zigbuild with a glibc 2.31 compilation target. Linux arm64
+uses Cargo with a GNU compiler driver so Rust's Cortex-A53 erratum 843419
+mitigation reaches the linker. Native arm64 source builds need a GNU compiler;
+cross builds also need the target compiler and standard library. macOS uses
 native Cargo. Build and precompress the SPA before the Linux server build.
 The official shared library includes ICU, JSON, and Parquet. Changing the
 runtime manifest requires repeating the extension and timezone checks.
+
+`build-arm64.sh SOURCE RUNTIME [--cli-only|--image-only]` builds Linux arm64
+distributions in the pinned Rust 1.98.0 Bookworm container. It supports amd64
+cross compilation and native arm64 hosts. Docker is required. The container
+uses GNU target tools, checks the Cortex-A53 mitigation with an aligned
+instruction sequence, and runs as the caller's UID/GID. It preserves
+`RUSTFLAGS` and `CARGO_PROFILE_RELEASE_STRIP`. Output goes under
+`SOURCE/target/bookworm`, separate from host SPA and build-script artifacts.
+An isolated Cargo home under `target/bookworm-home` contains the container's
+registry cache; host Cargo credentials and executables are not mounted.
+Linked-worktree Git metadata is mounted read-only for source provenance.
+
+The supported Linux distribution floor is Debian 12, including the official
+DuckDB library and system C++ runtime. The amd64 Zig target does not declare an
+older supported distribution. A direct native arm64 build on a newer system
+does not establish Bookworm compatibility; use `build-arm64.sh` for portable
+artifacts and repeat the fresh native Bookworm checks.
 
 `distribution.py stage` creates `bin/` and `lib/trawl/`, includes the runtime
 license, the product checkout's MPL license, platform floor, and provenance, and normalizes/signs Mach-O loader paths on macOS.
@@ -44,7 +65,7 @@ Fast helper tests:
 ```sh
 python3 scripts/release/test_distribution.py
 python3 scripts/release/test_release_source.py
-bash -n scripts/release/build-distribution.sh scripts/release/test-installed-debian.sh
+bash -n scripts/release/build-distribution.sh scripts/release/build-arm64.sh scripts/release/test-installed-debian.sh
 ```
 
 These source-level tests do not replace the native Linux and macOS artifact

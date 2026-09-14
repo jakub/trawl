@@ -35,34 +35,13 @@ jobs:
       # downloaded separately; this cache contains Rust compilation artifacts.
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          shared-key: dev-aarch64-linux
-
-      - name: Install zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
-
-      # arm64 is cross-compiled from the x86_64 runner; pull in the arm64
-      # libc so zig's lld can link. Mirrors release.yml's cross leg.
-      - name: Install cross-arch dpkg libs
-        run: |
-          sudo dpkg --add-architecture arm64
-          for f in /etc/apt/sources.list.d/*.sources; do
-            [ -f "$f" ] && sudo sed -i '/^Architectures:/!s/^Types: deb/Architectures: amd64\nTypes: deb/' "$f"
-          done
-          for f in /etc/apt/sources.list.d/*.list; do
-            [ -f "$f" ] && sudo sed -i '/\[arch=/!s/^deb /deb [arch=amd64] /' "$f"
-          done
-          codename="$(lsb_release -cs)"
-          printf 'deb [arch=arm64] http://ports.ubuntu.com/ %s %s\n' \
-            "$codename"          "main universe" \
-            "$codename-updates"  "main universe" \
-            "$codename-security" "main universe" \
-            | sudo tee /etc/apt/sources.list.d/arm64.list
-          sudo apt-get update
-          sudo apt-get install -y libc6-arm64-cross dpkg-dev
+          shared-key: dev-aarch64-linux-bookworm-gnu
+          workspaces: . -> target/bookworm
+          cache-directories: target/bookworm-home/.cargo/registry
 
       - uses: taiki-e/install-action@d858f8113943481093e02986a7586a4819a3bfd6 # v2
         with:
-          tool: cargo-zigbuild,trunk,wasm-bindgen-cli
+          tool: trunk,wasm-bindgen-cli
 
       # Build the leptos SPA first so rust-embed bakes a populated dist/ into
       # trawl-web (the web sidecar shares this image). Same ordering as release.
@@ -74,15 +53,15 @@ jobs:
 
       # No CARGO_PROFILE_RELEASE_STRIP=false / --build-id override here (unlike
       # release.yml): a dev image publishes no breakpad symbols, so the default
-      # profile's strip = "debuginfo" + zig lld's .symtab strip give lean
-      # binaries straight out of the build — smaller image, faster push.
+      # profile's strip = "debuginfo" removes DWARF without requesting the
+      # release workflow's full debug information.
       - name: Build
-        run: bash scripts/release/build-distribution.sh "$PWD" aarch64-unknown-linux-gnu "$PWD/runtime"
+        run: bash scripts/release/build-arm64.sh "$PWD" "$PWD/runtime"
 
       - name: Stage binaries and shared runtime for the image
         run: |
           python3 scripts/release/distribution.py stage --source . \
-            --binaries target/aarch64-unknown-linux-gnu/release --runtime runtime \
+            --binaries target/bookworm/aarch64-unknown-linux-gnu/release --runtime runtime \
             --output docker-ctx/arm64 --target aarch64-unknown-linux-gnu \
             --source-sha "$(git rev-parse HEAD)" --tooling-sha "$(git rev-parse HEAD)"
 

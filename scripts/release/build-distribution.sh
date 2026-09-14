@@ -10,7 +10,10 @@ export DUCKDB_LIB_DIR="$runtime"
 unset DUCKDB_DOWNLOAD_LIB DUCKDB_STATIC
 case "$target" in
   *-apple-darwin) export MACOSX_DEPLOYMENT_TARGET=15.0; loader='@executable_path/../lib/trawl'; command=(cargo build); build_target="$target" ;;
-  *-unknown-linux-gnu) loader='$ORIGIN/../lib/trawl'; command=(cargo zigbuild); build_target="$target.2.31" ;;
+  # GNU accepts Rust's Cortex-A53 erratum mitigation; zig cc rejects it and
+  # recent cargo-zigbuild versions discard it. Use build-arm64.sh for Bookworm.
+  aarch64-unknown-linux-gnu) loader='$ORIGIN/../lib/trawl'; command=(cargo build); build_target="$target" ;;
+  x86_64-unknown-linux-gnu) loader='$ORIGIN/../lib/trawl'; command=(cargo zigbuild); build_target="$target.2.31" ;;
   *) echo 'unsupported distribution target' >&2; exit 1 ;;
 esac
 # Preserve release build-id flags, but keep the literal loader token intact.

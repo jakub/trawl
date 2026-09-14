@@ -1,0 +1,22 @@
+# Build on the supported Debian 12 floor with a linker that retains Rust's
+# Cortex-A53 erratum 843419 mitigation. The index also supports native arm64.
+FROM rust:1.98.0-bookworm@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3 ca-certificates curl git \
+    && case "$(dpkg --print-architecture)" in \
+         amd64) apt-get install -y --no-install-recommends \
+           gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libc6-dev-arm64-cross ;; \
+         arm64) apt-get install -y --no-install-recommends gcc g++ libc6-dev binutils ;; \
+         *) echo 'unsupported ARM64 build host' >&2; exit 1 ;; \
+       esac \
+    && rm -rf /var/lib/apt/lists/* \
+    && rustup target add aarch64-unknown-linux-gnu
+
+# Select the installed compiler without asking rustup to install the source
+# checkout's editor, lint, or Wasm components as the unprivileged build user.
+ENV RUSTUP_TOOLCHAIN=1.98.0 \
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+    CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
+    CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++ \
+    AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar

@@ -50,9 +50,11 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             arch: amd64
             cross: false
+            build-root: target
           - target: aarch64-unknown-linux-gnu
             arch: arm64
             cross: true
+            build-root: target/bookworm
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -78,9 +80,12 @@ jobs:
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          key: release-${{ matrix.target }}
+          key: release-${{ matrix.target }}-${{ matrix.cross && 'bookworm-gnu' || 'zig' }}
+          workspaces: . -> ${{ matrix.build-root }}
+          cache-directories: ${{ matrix.cross && 'target/bookworm-home/.cargo/registry' || '' }}
 
       - name: Install zig
+        if: ${{ !matrix.cross }}
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
 
       - name: Install cross-arch dpkg libs
@@ -108,7 +113,7 @@ jobs:
 
       # Build the leptos SPA first so rust-embed picks up a populated
       # dist/ when trawl-web compiles. wasm toolchain is host-only, so
-      # this runs before the cross-target cargo zigbuild step.
+      # this runs before either native-code distribution build.
       - name: Build web UI SPA
         working-directory: crates/trawl-web-ui
         run: trunk build --release
@@ -120,10 +125,15 @@ jobs:
       # builds every crate (including trawl-web) except the wasm32-only
       # SPA crate — which was already built by the preceding trunk step.
       - name: Build
-        run: bash .release-tooling/scripts/release/build-distribution.sh "$PWD" "${{ matrix.target }}" "$PWD/runtime"
+        run: |
+          if [ "${{ matrix.cross }}" = true ]; then
+            bash .release-tooling/scripts/release/build-arm64.sh "$PWD" "$PWD/runtime"
+          else
+            bash .release-tooling/scripts/release/build-distribution.sh "$PWD" "${{ matrix.target }}" "$PWD/runtime"
+          fi
         env:
-          # Zig's lld strips .symtab regardless of the profile's
-          # strip = "debuginfo". Override strip to false so the build retains
+          # Zig's lld on amd64 strips .symtab regardless of the profile's
+          # strip = "debuginfo". Override strip on both architectures to retain
           # full symbols + DWARF; the dump_syms step below harvests breakpad
           # .sym files from these fat binaries before they are stripped for
           # shipping. --build-id=sha1 stamps a content-based GNU build-id note
@@ -155,7 +165,7 @@ jobs:
       - name: Dump breakpad symbols
         run: |
           set -euo pipefail
-          bindir="target/${{ matrix.target }}/release"
+          bindir="${{ matrix.build-root }}/${{ matrix.target }}/release"
           for bin in trawld trawl trawl-admin trawl-web fleet-admin; do
             dump_syms --store symbols/ "${bindir}/${bin}"
           done
@@ -190,7 +200,7 @@ jobs:
             exit 1
           fi
           echo "using ${llvm_strip}"
-          bindir="target/${{ matrix.target }}/release"
+          bindir="${{ matrix.build-root }}/${{ matrix.target }}/release"
           for bin in trawld trawl trawl-admin trawl-web fleet-admin; do
             "${llvm_strip}" "${bindir}/${bin}"
             rm -f build-id.note
@@ -203,16 +213,18 @@ jobs:
           rm -f build-id.note
 
       - name: Build .deb packages with one runtime owner
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/${{ matrix.build-root }}
         run: |
           python3 .release-tooling/scripts/release/package-debian.py --source . \
-            --binaries "target/${{ matrix.target }}/release" --runtime runtime \
+            --binaries "${{ matrix.build-root }}/${{ matrix.target }}/release" --runtime runtime \
             --output "target/${{ matrix.target }}/debian" --target "${{ matrix.target }}"
 
       - name: Create relocatable tarball
         run: |
           staging="trawl-${RELEASE_TAG}-${{ matrix.target }}"
           python3 .release-tooling/scripts/release/distribution.py stage --source . \
-            --binaries "target/${{ matrix.target }}/release" --runtime runtime --output "$staging" \
+            --binaries "${{ matrix.build-root }}/${{ matrix.target }}/release" --runtime runtime --output "$staging" \
             --target "${{ matrix.target }}" --source-sha "$SOURCE_SHA" --tooling-sha "$TOOLING_SHA"
           tar czf "${staging}.tar.gz" "$staging"
           sha256sum "${staging}.tar.gz" > "${staging}.tar.gz.sha256"
