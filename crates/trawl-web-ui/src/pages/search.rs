@@ -5,12 +5,16 @@
 //! `/search` — query workspace.
 //!
 //! Layout (top to bottom inside `.search-col`, the page's one sheet):
-//! query console (header + draft state + `DslEditor` + date range +
-//! Haul + tools + the executed-scope strip)
+//! `h1` → query console (header + draft state + `DslEditor` + date
+//! range + Haul + tools + the executed-scope strip)
 //! → tabs (Events / Visualization · trailing Truncated / Stop live /
 //!   Save / Export)
 //! → degraded-field notice (hidden unless the execution reported one)
 //! → tab body (Events: histogram + results table | Visualization: chart)
+//!
+//! Two skip links open the page ahead of the filter rail, because the
+//! rail's value controls stay in the tab order on purpose: one focuses
+//! the editor, one the results region (audit finding A03).
 //!
 //! State split:
 //! - `query_text` — in-progress editor buffer (not URL-synced).
@@ -23,6 +27,7 @@
 //!   cannot itself become a navigation (ADR-0027).
 
 use leptos::prelude::*;
+use leptos::web_sys;
 use trawl_api::value::QueryResult;
 use wasm_bindgen::JsCast;
 
@@ -693,6 +698,9 @@ pub fn Search() -> impl IntoView {
 
     view! {
         <div class="search-layout">
+            // Ahead of the rail, whose value controls stay in the tab
+            // order by design: the two bypasses are what keeps that from
+            // costing 110 tab stops to reach the editor (A03).
             <a class="skip-link" href="#search-query" on:click=move |event: web_sys::MouseEvent| {
                 event.prevent_default();
                 focus_search_control(".dsl-editor [contenteditable=true]");
@@ -712,6 +720,7 @@ pub fn Search() -> impl IntoView {
                 on_clear=on_clear_filters
             />
             <div class="search-col">
+                <h1 class="search-heading">"Search"</h1>
                 <div class="console">
                     <EditorWrap
                         query=query_text

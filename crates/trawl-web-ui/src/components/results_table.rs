@@ -185,7 +185,7 @@ fn ResultsTableBody(
                 <table class="results-table">
                     <thead>
                         <tr>
-                            <th class="exp-col"></th>
+                            <th class="exp-col"><span class="sr-only">"Details"</span></th>
                             {header_cells}
                         </tr>
                     </thead>

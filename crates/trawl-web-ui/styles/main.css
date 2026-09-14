@@ -33,6 +33,17 @@
   background: var(--bg);
 }
 
+/* The page's one h1 (A06). Compact on purpose: the console under it is
+ * the page, and a display heading would cost a row of results. */
+.search-heading {
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui);
+  font-weight: 600;
+  color: var(--ink-2);
+  margin: 0;
+  padding: 8px 12px 0;
+}
+
 /* The work surface is one sheet floating on the layout's floor
  * (ADR-0032): panel fill, hairline, edge highlight and the first step
  * of the elevation ramp. `overflow: hidden` keeps the results scroller
@@ -626,7 +637,7 @@
 .tabs .action {
   cursor: pointer;
   align-self: center;
-  color: var(--ink-3);
+  color: var(--ink-2);
   font-size: var(--fs-ui);
   padding: 3px 6px;
   border-radius: var(--radius-sm);
@@ -634,6 +645,9 @@
 /* The truncation badge leads the trailing slot: it qualifies the count
  * on the tab beside it, so it sits before the actions, not among them. */
 .tabs .bdg { margin-inline-end: 4px; }
+/* Stop live is the one tinted action in the header — it ends the state
+ * the rest of the row is describing. */
+.tabs .action.stop-live { color: var(--accent-ink); background: var(--accent-wash); }
 .tabs .action + .action { margin-left: 4px; }
 .tabs .action:hover { color: var(--ink); background: var(--panel-2); }
 /* The trailing Save/Export actions and the editor's tool row are real
@@ -666,7 +680,7 @@
   align-items: flex-start;
   gap: 10px;
   padding: 7px 14px;
-  background: var(--yellow-wash);
+  background: var(--panel);
   border-bottom: 1px solid var(--line);
   font-family: var(--font-ui);
   font-size: var(--fs-dense);
@@ -701,7 +715,7 @@
   align-items: center;
   gap: 10px;
   padding: 7px 14px;
-  background: var(--red-wash);
+  background: var(--panel);
   border-bottom: 1px solid var(--line);
   font-family: var(--font-ui);
   font-size: var(--fs-dense);
