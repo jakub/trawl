@@ -2185,7 +2185,7 @@
 <td>body</td>
 <td>string</td>
 <td>yes</td>
-<td>Must match <code dir="auto">[a-zA-Z0-9_-]+</code> and be unique for the key</td>
+<td>Display name; outer whitespace is trimmed, blank names, control characters, and unsafe invisible formatting characters are rejected. Interior spacing, ordinary Unicode, and punctuation are preserved. Unique for the key, case-sensitive</td>
 </tr>
 <tr>
 <td><code dir="auto">query</code></td>
@@ -2196,6 +2196,11 @@
 </tr>
 </tbody>
 </table>
+<p>Names follow the field-name display-safety rules. Bidi controls, zero-width
+characters and joiners, BOM, and soft hyphen are rejected. This also excludes
+ZWJ emoji sequences and text that requires ZWJ or ZWNJ shaping. Combining
+accents, standalone emoji, skin-tone modifiers, flags, and variation selectors
+are allowed.</p>
 <p><strong>Request</strong></p>
 <div class="expressive-code"><figure class="frame is-terminal not-content"><figcaption class="header"><span class="title"></span><span class="sr-only">Terminal window</span></figcaption><pre data-language="bash"><code><div class="ec-line"><div class="code"><span style="--0:#82AAFF;--1:#3B61B0">curl</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#82AAFF;--1:#3B61B0">--fail-with-body</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#82AAFF;--1:#3B61B0">--config</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C5E478;--1:#3B61B0">$TRAWL_CURL_CONFIG</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#82AAFF;--1:#3B61B0">-H</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#ECC48D;--1:#984E4D">Content-Type: application/json</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#F78C6C;--1:#AA0982">\</span></div></div><div class="ec-line"><div class="code"><span class="indent">  </span><span style="--0:#82AAFF;--1:#3B61B0">-d</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#D9F5DD;--1:#111111">'</span><span style="--0:#ECC48D;--1:#984E4D">{"name": "errors-by-service", "query": "_severity&gt;=error | stats count() by service"}</span><span style="--0:#D9F5DD;--1:#111111">'</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#F78C6C;--1:#AA0982">\</span></div></div><div class="ec-line"><div class="code"><span class="indent">  </span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C5E478;--1:#3B61B0">$TRAWL_URL</span><span style="--0:#ECC48D;--1:#984E4D">/api/v1/saved</span><span style="--0:#D9F5DD;--1:#111111">"</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="curl --fail-with-body --config &quot;$TRAWL_CURL_CONFIG&quot; -H &quot;Content-Type: application/json&quot; \  -d &#x27;{&quot;name&quot;: &quot;errors-by-service&quot;, &quot;query&quot;: &quot;_severity>=error | stats count() by service&quot;}&#x27; \  &quot;$TRAWL_URL/api/v1/saved&quot;"><div></div></button></div></figure></div>
 <p><strong>Response</strong></p>
@@ -2223,7 +2228,7 @@
 <tr>
 <td>400</td>
 <td><code dir="auto">bad_request</code></td>
-<td><code dir="auto">name</code> does not match <code dir="auto">[a-zA-Z0-9_-]+</code></td>
+<td><code dir="auto">name</code> is blank or contains control or unsafe invisible formatting characters</td>
 </tr>
 <tr>
 <td>409</td>
