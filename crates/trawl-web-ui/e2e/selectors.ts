@@ -223,6 +223,12 @@ export const SEL = {
   /// page's table sits in. Its header carries the list's title, the
   /// count of what is shown, and the filter input (ADR-0032).
   listSheet: '.list-sheet',
+  /// crates/trawl-web-ui/src/pages/runs.rs — the selected run's sheet:
+  /// its stored result beside the execution receipt.
+  runDetail: '.run-detail',
+  /// The receipt's one PUSHING control, which opens the net's Runs tab
+  /// so Back returns to the runs page with this run still selected.
+  runOpenNet: '.run-detail a.open-net',
   /// One data row of a `.tbl` div table. Every list page mounts exactly
   /// one `.tbl-body`, so this is unambiguous per page: schema services,
   /// nets, runs and history all render the same row shape.

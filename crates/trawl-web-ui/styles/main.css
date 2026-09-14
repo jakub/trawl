@@ -1668,7 +1668,7 @@
  * words and leaves the enabled/paused judgement to fleet_ui::Badge. */
 .cadence { font-size: var(--fs-ui); color: var(--ink-2); margin-inline-end: 6px; }
 
-.stats-row { display: flex; gap: 12px; margin-top: 16px; }
+.stats-row { display: flex; gap: 12px; }
 .stat-card {
   flex: 1; padding: 14px 16px;
   background: var(--panel); border: 1px solid var(--line);
@@ -1683,6 +1683,35 @@
   font-size: var(--fs-title); font-weight: 600; color: var(--ink);
   margin-top: 4px; font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
+}
+
+/* The selected run: its stored result beside the receipt of how it was
+ * produced. The receipt is a well on the sheet, so it reads as a record
+ * rather than a second set of controls. */
+.run-detail .result-grid { display: grid; grid-template-columns: minmax(0, 1fr) 280px; min-height: 0; }
+.run-detail .data-area { min-width: 0; padding: 12px; }
+.run-detail .receipt {
+  border-left: 1px solid var(--line); padding: 14px 16px;
+  background: var(--well); box-shadow: var(--inset);
+}
+.run-detail .receipt h3 { margin: 0 0 10px; font-family: var(--font-ui); font-size: var(--fs-control); font-weight: 600; }
+.fieldlist { margin: 0; }
+.fieldlist > div {
+  display: flex; justify-content: space-between; gap: 10px;
+  padding: 8px 0; border-bottom: 1px solid var(--line-2);
+  font-size: var(--fs-dense);
+}
+.fieldlist dt { color: var(--ink-3); font-family: var(--font-mono); font-size: var(--fs-micro); }
+.fieldlist dd {
+  margin: 0; text-align: right; overflow-wrap: anywhere; max-width: 65%;
+  font-family: var(--font-mono); font-size: var(--fs-micro); color: var(--ink);
+}
+.run-detail .small { margin: 12px 0 0; font-size: var(--fs-dense); color: var(--ink-3); }
+/* Under 900px the receipt stacks below the rows it describes rather
+ * than squeezing both into one column of a narrow viewport. */
+@media (max-width: 899.98px) {
+  .run-detail .result-grid { grid-template-columns: minmax(0, 1fr); }
+  .run-detail .receipt { border-left: 0; border-top: 1px solid var(--line); }
 }
 
 .run-preview {

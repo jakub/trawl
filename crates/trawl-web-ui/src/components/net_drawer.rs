@@ -1000,9 +1000,14 @@ fn RunsPane(
 // Expanded run result preview
 // ---------------------------------------------------------------------------
 
+/// One stored run's result, with the rerun control beneath it.
+///
+/// Shared with the runs page, which mounts it beside its own execution
+/// receipt: the receipt reads `summary`, filled from the same response
+/// this already fetches, rather than asking for the run a second time.
 #[component]
 #[allow(unused_variables)]
-fn RunResultPreview(
+pub(crate) fn RunResultPreview(
     active: Signal<bool>,
     summary: RwSignal<Option<trawl_api::ReportRunSummary>>,
     net_id: i64,

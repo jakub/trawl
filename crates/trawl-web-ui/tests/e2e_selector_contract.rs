@@ -977,6 +977,18 @@ const CONTRACTS: &[Contract] = &[
         hook: "class=\"list-sheet\"",
     },
     Contract {
+        assignment: "runDetail: '.run-detail',",
+        source_path: "src/pages/runs.rs",
+        source: RUNS_RS,
+        hook: "class=\"list-sheet run-detail\"",
+    },
+    Contract {
+        assignment: "runOpenNet: '.run-detail a.open-net',",
+        source_path: "src/pages/runs.rs",
+        source: RUNS_RS,
+        hook: "class=\"open-net btn-sec\"",
+    },
+    Contract {
         assignment: "tableRow: '.tbl-body .tbl-row',",
         source_path: "src/pages/schema.rs",
         source: SCHEMA_RS,
