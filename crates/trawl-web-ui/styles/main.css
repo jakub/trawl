@@ -2189,7 +2189,7 @@
   z-index: 1;
 }
 .trawl-login .login-shell { min-height: auto; width: 100%; }
-.trawl-login-help { max-width: 360px; color: var(--muted); font-size: var(--fs-sm); }
+.trawl-login-help { max-width: 360px; color: var(--ink-3); font-size: var(--fs-dense); }
 .trawl-login-help p { margin: 8px 0; }
 
 /* Forced colors: a background wash, an inset rule and an elevation all
