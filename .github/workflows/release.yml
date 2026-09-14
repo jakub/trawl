@@ -384,12 +384,14 @@ jobs:
         env:
           GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
 
-      - name: Load APT index builder from release source
+      # Publisher tooling belongs to the workflow revision, like the resolver.
+      # Older product tags may predate it; product builds use the resolved tag commit.
+      - name: Load APT index builder from workflow source
         env:
-          RELEASE_SHA: ${{ needs.resolve-source.outputs.sha }}
+          WORKFLOW_SHA: ${{ github.sha }}
         run: |
-          git fetch --no-tags --depth=1 origin "$RELEASE_SHA"
-          git show "${RELEASE_SHA}:scripts/release/build-apt-index.py" > "$RUNNER_TEMP/build-apt-index.py"
+          git fetch --no-tags --depth=1 origin "$WORKFLOW_SHA"
+          git show "${WORKFLOW_SHA}:scripts/release/build-apt-index.py" > "$RUNNER_TEMP/build-apt-index.py"
 
       - name: Build APT repository
         shell: bash

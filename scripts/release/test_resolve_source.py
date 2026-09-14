@@ -35,6 +35,9 @@ class ReleaseSourceTests(unittest.TestCase):
         self.git(self.remote, "tag", "v1.1.0-rc.1+build.7")
         for path in ["Cargo.toml", "Dockerfile", "chart/trawl/Chart.yaml"]:
             (self.remote / path).write_text("workflow branch source\n")
+        helper = self.remote / "scripts/release/build-apt-index.py"
+        helper.parent.mkdir(parents=True)
+        helper.write_text("print('publisher tooling from workflow')\n")
         self.git(self.remote, "add", ".")
         self.git(self.remote, "commit", "-m", "workflow source")
         self.workflow_sha = self.git(self.remote, "rev-parse", "HEAD")
@@ -74,6 +77,37 @@ class ReleaseSourceTests(unittest.TestCase):
             self.git(checkout, "checkout", "--detach", "FETCH_HEAD")
             for path in ["Cargo.toml", "Dockerfile", "chart/trawl/Chart.yaml"]:
                 self.assertEqual((checkout / path).read_text(), "release source\n")
+
+    def test_older_release_uses_publisher_from_workflow_revision(self):
+        self.assert_resolves("v1.0.0")
+        helper = "scripts/release/build-apt-index.py"
+        absent = subprocess.run(
+            ["git", "cat-file", "-e", f"{self.release_sha}:{helper}"],
+            cwd=self.checkout, env=self.env, capture_output=True,
+        )
+        self.assertNotEqual(absent.returncode, 0)
+        # Execute the workflow's actual loading commands. The fixture models
+        # gh-pages as a separate destination checkout without product source.
+        pages = Path(self.temp.name) / "pages"
+        pages.mkdir()
+        self.git(pages, "init")
+        self.git(pages, "remote", "add", "origin", str(self.remote))
+        workflow = RESOLVER.parents[2] / ".github/workflows/release.yml"
+        text = workflow.read_text()
+        step = text.split("      - name: Load APT index builder from workflow source\n", 1)[1]
+        step = step.split("\n      - name:", 1)[0]
+        self.assertIn("WORKFLOW_SHA: ${{ github.sha }}", step)
+        commands = step.split("        run: |\n", 1)[1]
+        commands = "\n".join(line.removeprefix("          ") for line in commands.splitlines())
+        result = subprocess.run(
+            ["bash", "-e", "-c", commands], cwd=pages,
+            env=dict(self.env, WORKFLOW_SHA=self.workflow_sha, RUNNER_TEMP=str(pages)),
+            text=True, capture_output=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((pages / "build-apt-index.py").read_text(),
+                         "print('publisher tooling from workflow')\n")
+        self.assertFalse((pages / "Cargo.toml").exists())
 
     def test_annotated_tag_peels_to_commit(self):
         self.assert_resolves("v1.0.1")
