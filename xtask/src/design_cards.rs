@@ -311,7 +311,7 @@ fn heading(text: &str) -> String {
 // ── cards ───────────────────────────────────────────────────────────
 
 fn tokens_card() -> Card {
-    let surface_tokens = ["--bg", "--panel", "--panel-2", "--panel-3"];
+    let surface_tokens = ["--bg", "--panel", "--panel-2", "--panel-3", "--well"];
     let ink_tokens = ["--ink", "--ink-2", "--ink-3", "--ink-4"];
     let line_tokens = ["--line", "--line-2", "--selection", "--accent-glow"];
     let semantic_tokens = [
@@ -357,7 +357,7 @@ fn tokens_card() -> Card {
         })
         .collect();
 
-    let shadows: String = ["--shadow-1", "--shadow-2", "--shadow-3", "--shadow-glow"]
+    let shadows: String = ["--shadow-1", "--shadow-2", "--shadow-3"]
         .iter()
         .map(|t| format!(r#"<div class="ds-shadowbox" style="box-shadow:var({t})">{t}</div>"#))
         .collect();

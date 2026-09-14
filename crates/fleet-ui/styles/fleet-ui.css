@@ -38,12 +38,16 @@
  *     (+ .ic icon chip), .m-body, .m-ft; modal fields: .m-field,
  *     .reason-input (emitted by ConfirmWithReasonModal / Field)
  *   - Tab strips: .tabs (workspace) + .sd-tabs (drawer) families
- *   - Drawer shell: .sd-scrim, .sd-drawer, .sd-hd, .sd-ttl,
- *     .sd-actions, .sd-x, .sd-body (+ sd-fade-in/sd-slide-in)
+ *   - Drawer shell: .sd-scrim, .sd-host, .sd-drawer,
+ *     .sd-drawer.sd-docked, .sd-hd, .sd-ttl, .sd-actions, .sd-x,
+ *     .sd-body (+ sd-fade-in/sd-slide-in)
  *   - Toast host + items: .toasts, .toast, .toast.{success,error,info}
  *   - Login page: .login-shell, .login-card
- *   - App chrome: .shell grid, .topbar (brand/modes/jump/env/user),
- *     .user-menu, .body, .main, .rail (+ .badge chip, .bot slot)
+ *   - App chrome: .shell grid + .shell-content, .topbar
+ *     (nav-toggle/crumb/jump/user), .user-menu, .body, .main, and the
+ *     .rail sidebar: .brand, .grp/.grp-lb group headings, .it items
+ *     (+ .badge chip), .bot slot, .collapsed and .overlay states,
+ *     .nav-scrim
  *   - Small widgets (issue #31): .bdg tones, .seg strip, .load-hint,
  *     .status-dot tones, .sc-spark, .toggle, .kbd/.kbd-inline,
  *     .results-footer pager family, .inp-wrap, .actions-wrap/
@@ -1736,7 +1740,10 @@ select:focus-visible,
  * the <div> it replaced did. */
 .dr-pop button.opt { width: 100%; font: inherit; }
 .dr-pop .opt:hover { background: var(--accent-wash); border-color: var(--accent); }
-.dr-pop .opt:disabled:hover { background: var(--panel-2); border-color: var(--line-2); }
+/* A disabled preset does not change under the pointer: this restates
+ * the base rule's own resting tones, which the plane pass moved to a
+ * --fill track with no border. */
+.dr-pop .opt:disabled:hover { background: var(--fill); border-color: transparent; }
 .dr-pop .opt.on {
   background: var(--panel);
   color: var(--accent-ink);
