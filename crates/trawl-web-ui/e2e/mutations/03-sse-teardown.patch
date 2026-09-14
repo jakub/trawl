@@ -1,8 +1,8 @@
 diff --git a/crates/trawl-web-ui/src/pages/search.rs b/crates/trawl-web-ui/src/pages/search.rs
-index fa5e727e..99eac82e 100644
+index 19e7d09c..4e055353 100644
 --- a/crates/trawl-web-ui/src/pages/search.rs
 +++ b/crates/trawl-web-ui/src/pages/search.rs
-@@ -349,14 +349,20 @@ pub fn Search() -> impl IntoView {
+@@ -467,7 +467,9 @@ pub fn Search() -> impl IntoView {
          StoredValue::new_local(None);
      on_cleanup(move || {
          stream_handle.update_value(|slot| {
@@ -13,7 +13,8 @@ index fa5e727e..99eac82e 100644
          });
      });
  
-     Effect::new(move |_| {
+@@ -475,7 +477,11 @@ pub fn Search() -> impl IntoView {
+         stream_retry.get();
          let current_mode = mode.get();
          let q = effective_q.get();
 -        stream_handle.update_value(|slot| *slot = None);

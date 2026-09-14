@@ -1,25 +1,23 @@
 diff --git a/crates/fleet-ui/src/toast/runtime.rs b/crates/fleet-ui/src/toast/runtime.rs
-index 8fb07a2e..fd95c119 100644
+index 1988bf2f..3cf4888c 100644
 --- a/crates/fleet-ui/src/toast/runtime.rs
 +++ b/crates/fleet-ui/src/toast/runtime.rs
-@@ -112,15 +112,13 @@ pub fn Toasts(bus: ToastBus) -> impl IntoView {
-                                 <div class="title">{t.title}</div>
-                                 {t.detail.map(|d| view! { <div class="detail">{d}</div> })}
-                             </div>
--                            // The multiplication sign is decoration, so
--                            // it is hidden and the button's name comes
--                            // from aria-label; "times" is not a dismissal.
--                            <button
--                                type="button"
-+                            // MUTANT: the pre-ADR-0028 dismiss. Same
-+                            // class, same click, no role, no tabindex,
-+                            // no name but the glyph.
-+                            <span
-                                 class="x"
--                                aria-label="Dismiss notification"
-                                 on:click=move |_| bus.dismiss(id)
--                            ><span aria-hidden="true">"×"</span></button>
-+                            >"×"</span>
-                         </div>
-                     }
-                 }
+@@ -167,14 +167,12 @@ fn ToastItem(toast: Toast, bus: ToastBus, paused: Signal<bool>) -> impl IntoView
+                 <div class="title">{toast.title}</div>
+                 {toast.detail.map(|d| view! { <div class="detail">{d}</div> })}
+             </div>
+-            // The multiplication sign is decoration; the button's name
+-            // comes from aria-label, not a spoken "times" glyph.
+-            <button
+-                type="button"
++            // MUTANT: the pre-ADR-0028 dismiss. Same class, same
++            // click, no role, no tabindex, no name but the glyph.
++            <span
+                 class="x"
+-                aria-label="Dismiss notification"
+                 on:click=move |_| bus.dismiss(id)
+-            ><span aria-hidden="true">"×"</span></button>
++            >"×"</span>
+         </div>
+     }
+ }

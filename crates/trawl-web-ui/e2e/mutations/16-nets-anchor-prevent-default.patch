@@ -1,8 +1,8 @@
 diff --git a/crates/trawl-web-ui/src/pages/nets.rs b/crates/trawl-web-ui/src/pages/nets.rs
-index ba594633..92db4ee3 100644
+index 8566e82a..81d9733e 100644
 --- a/crates/trawl-web-ui/src/pages/nets.rs
 +++ b/crates/trawl-web-ui/src/pages/nets.rs
-@@ -307,11 +307,33 @@ pub fn NetsPage() -> impl IntoView {
+@@ -331,6 +331,9 @@ pub fn NetsPage() -> impl IntoView {
                                      // `prop:replace` below is that call's
                                      // `replace: true`.
                                      let href = format!("/jobs/nets?net={id}&ntab=query");
@@ -10,9 +10,12 @@ index ba594633..92db4ee3 100644
 +                                    // press again.
 +                                    let mutant_push = push_net.clone();
  
-                                     view! {
-                                         <div class="tbl-row">
-                                             <div style="flex:2" class="mono">
+                                     // A windowed schedule advances its own
+                                     // coverage point, so a manual run out
+@@ -364,7 +367,26 @@ pub fn NetsPage() -> impl IntoView {
+                                                 class:active=move || net_selected.get() == Some(id)
+                                             >
+                                                 <td class="mono">
 -                                                <a class="row-stretch" href=href prop:replace=true>
 +                                                <a
 +                                                    class="row-stretch"
@@ -36,4 +39,4 @@ index ba594633..92db4ee3 100644
 +                                                >
                                                      {name.clone()}
                                                  </a>
-                                             </div>
+                                                 </td>

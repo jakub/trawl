@@ -1,8 +1,8 @@
 diff --git a/crates/trawl-web-ui/styles/main.css b/crates/trawl-web-ui/styles/main.css
-index 675a9801..6535ea84 100644
+index 92d34af2..e9958d85 100644
 --- a/crates/trawl-web-ui/styles/main.css
 +++ b/crates/trawl-web-ui/styles/main.css
-@@ -291,13 +291,11 @@
+@@ -307,13 +307,11 @@
    min-width: var(--facet-act-w);
    text-align: right;
  }
@@ -20,9 +20,9 @@ index 675a9801..6535ea84 100644
    position: absolute;
    right: 12px;
    top: 0;
-@@ -316,8 +314,7 @@
-    * `.bar` frequency tail is hidden under these 48px while revealed. */
-   background: var(--panel);
+@@ -333,8 +331,7 @@
+    * these 48px while revealed. */
+   background: var(--bg);
  }
 -.facets .v:hover .act,
 -.facets .v:focus-within .act { opacity: 1; }
@@ -30,7 +30,7 @@ index 675a9801..6535ea84 100644
  .facets .v:hover .act { background: var(--panel-2); }
  /* After the hover rule: `.v.selected` beats `.v:hover` for the row's own
   * background on a tie, and the action floor follows the row. */
-@@ -327,8 +324,7 @@
+@@ -344,8 +341,7 @@
  }
  /* `visibility`, not `display: none`: the count's box is what keeps the
   * value name out of the action area. */
