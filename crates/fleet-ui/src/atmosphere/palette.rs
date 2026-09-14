@@ -25,15 +25,15 @@ use crate::theme::Theme;
 /// `vendor/src/paper-shaders.ts` for the full catalog.
 pub const SHADER: &str = "meshGradient";
 
-/// Light mesh stops: bg-white base (`--bg` `oklch(98.5%)` ≈ `#fafafa`),
-/// two panel-derived blue washes, and the `--accent` / `--accent-soft`
-/// literals (#2a5c8a / #7ea6cc).
-pub const LIGHT_COLORS: [&str; 5] = ["#fafafa", "#e9eff6", "#c8d9ea", "#7ea6cc", "#2a5c8a"];
+/// Light mesh stops: the floor plane (`--bg` `oklch(95.4% .005 248)` ≈
+/// `#edf0f3`, ADR-0032), two panel-derived blue washes, and the
+/// `--accent` / `--accent-soft` literals (#2a5c8a / #7ea6cc).
+pub const LIGHT_COLORS: [&str; 5] = ["#edf0f3", "#e9eff6", "#c8d9ea", "#7ea6cc", "#2a5c8a"];
 
-/// Dark mesh stops: near-black base (`--bg` `oklch(14.5%)` ≈ `#0a0a0a`),
-/// two deep blue washes, and the dark `--accent` / `--accent-soft`
-/// literals (#5a9fd4 / #8fb8dc).
-pub const DARK_COLORS: [&str; 5] = ["#0a0a0a", "#12202e", "#1d3a57", "#5a9fd4", "#8fb8dc"];
+/// Dark mesh stops: the floor plane (`--bg` `oklch(18.9% .012 254)` ≈
+/// `#101419`, ADR-0032), two deep blue washes, and the dark `--accent` /
+/// `--accent-soft` literals (#5a9fd4 / #8fb8dc).
+pub const DARK_COLORS: [&str; 5] = ["#101419", "#12202e", "#1d3a57", "#5a9fd4", "#8fb8dc"];
 
 /// Slow drift; the intended range is 0.1 to 0.2.
 pub const SPEED: f64 = 0.15;
@@ -112,11 +112,11 @@ mod tests {
         // stops. Deliberate re-tuning re-pins here.
         assert_eq!(
             LIGHT_COLORS,
-            ["#fafafa", "#e9eff6", "#c8d9ea", "#7ea6cc", "#2a5c8a"]
+            ["#edf0f3", "#e9eff6", "#c8d9ea", "#7ea6cc", "#2a5c8a"]
         );
         assert_eq!(
             DARK_COLORS,
-            ["#0a0a0a", "#12202e", "#1d3a57", "#5a9fd4", "#8fb8dc"]
+            ["#101419", "#12202e", "#1d3a57", "#5a9fd4", "#8fb8dc"]
         );
     }
 

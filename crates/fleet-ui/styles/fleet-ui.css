@@ -90,7 +90,7 @@
  * OKLCH surface ramp with fleet's blue accent retained. Dark lines are
  * white-alpha overlays, not solid greys. --on-accent carries button
  * text (dark mode keeps Mira's inversion: near-black on light blue);
- * --ring drives the 2px solid focus ring via --shadow-glow, and
+ * --ring drives the 2px solid focus outline, and
  * --accent-glow aliases it for the brand text-shadow. The accent hue
  * deliberately equals --blue today; the tokens stay separate because
  * they name different ROLES (brand accent vs info semantic) that
@@ -98,27 +98,34 @@
 :root, [data-theme="light"] {
   color-scheme: light;
 
-  --bg:        oklch(98.5% 0 0);
+  /* Plane ramp (ADR-0032): floor / sheet / support / well. Direction A's
+   * measured hexes (#edf0f3 / #ffffff / #f3f5f7 / #e5eaf0 / #eef2f6)
+   * expressed in OKLCH. --bg is the floor every page, drawer body and
+   * expanded-row detail sits on; --panel is the sheet; --panel-2 the
+   * support strip (sidebar, table headers); --well the inset control. */
+  --bg:        oklch(95.4% .005 248);
   --panel:     oklch(100% 0 0);
-  --panel-2:   oklch(97% 0 0);
-  --panel-3:   oklch(93.5% 0 0);
-  --ink:       oklch(14.5% 0 0);
-  --ink-2:     oklch(37% 0 0);
-  /* Small labels also sit on tinted rows and --panel-3. */
-  --ink-3:     oklch(50% 0 0);
-  /* --ink-4 is a TEXT colour, not a hairline: the DEBUG level pill
-   * (.lvl-debug, --fs-micro over actual log data), .editor-hd .dim, the
-   * DSL editor's gutter line numbers and .divider all read it (so did
-   * trawl's .claim-meta .sep, until #112 retired that surface).
-   * Mira's own step here is oklch(70.8%), which measures 2.59:1
-   * on --panel and 2.48:1 on the editor's --fill wash — under even the
-   * 3:1 non-text floor. Hold the pre-Mira tone's luminance instead
-   * (#82868e is oklch(61.9%), rendered neutral): 3.64:1 on --panel,
-   * 3.48:1 on the editor fill, and >=3.01:1 on every other light
-   * surface, at or above the ramp's origin/main contrast everywhere. */
-  --ink-4:     oklch(62% 0 0);
-  --line:      oklch(92.2% 0 0);
-  --line-2:    oklch(94.8% 0 0);
+  --panel-2:   oklch(96.9% .003 248);
+  --panel-3:   oklch(93.5% .010 253);
+  --well:      oklch(95.9% .007 248);
+  --ink:       oklch(26.6% .016 252);
+  --ink-2:     oklch(43.7% .024 251);
+  /* --ink-3 carries every secondary label and count: table headers, the
+   * kbd chip, facet counts, captions. Measured on its composited floors:
+   * 5.86:1 on --panel, 5.36:1 on --panel-2, 5.21:1 on --well, 5.13:1 on
+   * --bg and on the accent wash over --panel, 4.71:1 on the wash over
+   * --panel-2. The pairs the 2026-09-13 audit measured at 4.34:1 and
+   * 4.14:1 with the old oklch(55.6%) neutral now clear AA. */
+  --ink-3:     oklch(50.5% .029 252);
+  /* --ink-4 is a TEXT colour, not a hairline: .lvl-debug (over a --panel
+   * row), the DSL editor gutter numbers (over --well) and .divider (over
+   * --panel) read it. Held one step lighter than --ink-3 so the ramp keeps
+   * four visible stops: 5.27:1 on --panel, 4.82:1 on --panel-2, 4.68:1 on
+   * --well, 4.60:1 on --bg. It measures 4.35:1 on --panel-3, so no text
+   * on that surface may read it (none does today). */
+  --ink-4:     oklch(53% .024 253);
+  --line:      oklch(90.7% .010 248);
+  --line-2:    oklch(94.4% .007 248);
   --selection: rgba(0,0,0,.08);
 
   /* Control fills (ADR-0007): the translucent wash under inputs, the
@@ -148,12 +155,22 @@
   --accent-2:    color-mix(in oklab, #2a5c8a 85%, white);
   --accent-soft: #7ea6cc;
   --on-accent:   oklch(98.5% 0 0);
-  --ring:        color-mix(in oklab, #2a5c8a 45%, oklch(80% 0 0));
+  /* --ring is the 2px focus outline (outline-offset 2px, so it sits on
+   * whatever floor surrounds the control): 3.98:1 on --bg, 4.05:1 on
+   * --well, 4.55:1 on --panel. The 45% mix it replaces measured 2.83:1
+   * on the new floor, under the 3:1 non-text floor. */
+  --ring:        color-mix(in oklab, #2a5c8a 70%, oklch(80% 0 0));
   --accent-glow: var(--ring);
+  /* Accent-coloured TEXT reads --accent-ink, never --accent. The two are
+   * equal here and diverge in dark, where the brand blue misses AA on
+   * --panel-3 (see the dark block). */
+  --accent-ink:  #2a5c8a;
   --accent-wash: color-mix(in oklab, #2a5c8a 9%, transparent);
 
-  --teal:       #0e8b7a;
-  --teal-wash:  rgba(14,139,122,.10);
+  /* --teal is text in the schema drawer's BOOL/IP type chips (.tp-bool,
+   * .tp-ip, a 12% mix over --panel-2): 4.66:1 there, 6.23:1 on --panel. */
+  --teal:       #0a6d60;
+  --teal-wash:  rgba(10,109,96,.10);
   /* Light --red is toned for the TINTED destructive recipe, not for a
    * solid fill: it is the FOREGROUND over --red-wash (.btn-danger,
    * .lvl-error, .meta .chip.excl), so its contrast is measured against
@@ -166,16 +183,33 @@
   --red:        oklch(48% .177 27.325);
   --red-2:      oklch(41% .155 27.325);
   --red-wash:   color-mix(in oklab, var(--red) 10%, transparent);
-  --yellow:     #80600a;
-  --yellow-wash:rgba(166,130,16,.10);
-  --green:      #4a7d3f;
-  --green-wash: rgba(74,125,63,.10);
+  /* --yellow and --green are foregrounds over their own 10% washes
+   * (.bdg.warn, .lvl-warn, .bdg.success) and bare on --panel-2 (the tail
+   * bar's lag label). Mira's #a68210 measured 3.24:1 on the warn wash in
+   * the 2026-09-13 audit; these tones measure 5.42:1 / 5.54:1 on the
+   * washes and 6.24:1 / 6.38:1 on --panel. Dark keeps its lighter pair. */
+  --yellow:     #7a5c0c;
+  --yellow-wash:rgba(122,92,12,.10);
+  --green:      #3a6a33;
+  --green-wash: rgba(58,106,51,.10);
   --blue:       #2a5c8a;
 
-  --shadow-1:    0 1px 2px rgba(0,0,0,.04);
-  --shadow-2:    0 1px 2px rgba(0,0,0,.05), 0 2px 8px rgba(0,0,0,.04);
-  --shadow-3:    0 8px 24px rgba(0,0,0,.10), 0 2px 6px rgba(0,0,0,.05);
-  --shadow-glow: 0 0 0 2px var(--ring);
+  /* Elevation ramp (ADR-0032): a well inset plus three raised steps, each
+   * a tight contact layer under a soft ambient one, tinted toward the
+   * accent hue so light-mode shadows read as ambient rather than soot.
+   * --edge-hi is the 1px top highlight a raised surface adds as its FIRST
+   * box-shadow layer. --shadow-1/2/3 alias the ramp so existing readers
+   * (toasts, popovers, coastwatch.css) keep working. Shadows are never the
+   * only separator: every plane keeps its hairline. */
+  --edge-hi:     rgb(255 255 255 / .9);
+  --inset:       inset 0 1px 3px rgb(15 25 40 / .075);
+  --elev-1:      0 1px 2px rgb(25 39 53 / .09), 0 5px 14px rgb(25 39 53 / .045);
+  --elev-2:      0 1px 2px rgb(25 39 53 / .10), 0 8px 24px -6px rgb(25 39 53 / .12);
+  --elev-3:      0 2px 6px rgb(15 25 40 / .12), 0 18px 48px rgb(15 25 40 / .17);
+  --header-shadow: 0 1px 4px rgb(0 0 0 / .06);
+  --shadow-1:    var(--elev-1);
+  --shadow-2:    var(--elev-2);
+  --shadow-3:    var(--elev-3);
 }
 
 /* Dark theme — Mira's dark neutrals. Lines are white-alpha overlays so
@@ -184,15 +218,22 @@
 [data-theme="dark"] {
   color-scheme: dark;
 
-  --bg:        oklch(14.5% 0 0);
-  --panel:     oklch(18% 0 0);
-  --panel-2:   oklch(22% 0 0);
-  --panel-3:   oklch(26.9% 0 0);
-  --ink:       oklch(98.5% 0 0);
-  --ink-2:     oklch(82% 0 0);
-  --ink-3:     oklch(70.8% 0 0);
-  --ink-4:     oklch(56% 0 0);
-  --line:      oklch(100% 0 0 / .10);
+  /* Direction A's dark planes (#101419 / #1a1f25 / #222931 / #2b3440 /
+   * #13191f) in OKLCH. Lines stay white-alpha overlays (dark block
+   * rule, see --fill below). */
+  --bg:        oklch(18.9% .012 254);
+  --panel:     oklch(23.7% .014 253);
+  --panel-2:   oklch(27.8% .018 252);
+  --panel-3:   oklch(32.2% .025 256);
+  --well:      oklch(21% .015 249);
+  --ink:       oklch(95.6% .007 248);
+  --ink-2:     oklch(84.1% .017 251);
+  /* 7.42:1 on --panel, 6.58:1 on --panel-2, 5.64:1 on --panel-3, 5.26:1
+   * on the accent wash over --panel-2. */
+  --ink-3:     oklch(74.8% .025 250);
+  /* 6.44:1 on --panel, 6.88:1 on --well, 4.89:1 on --panel-3. */
+  --ink-4:     oklch(70.9% .027 250);
+  --line:      oklch(100% 0 0 / .11);
   --line-2:    oklch(100% 0 0 / .06);
   --selection: rgba(255,255,255,.14);
 
@@ -221,8 +262,16 @@
   --accent-2:    color-mix(in oklab, #5a9fd4 85%, black);
   --accent-soft: #8fb8dc;
   --on-accent:   oklch(16% 0 0);
-  --ring:        color-mix(in oklab, #5a9fd4 55%, oklch(40% 0 0));
+  /* 3.54:1 on --panel-3, 4.66:1 on --panel, 5.19:1 on --bg; the 55% mix
+   * it replaces measured 2.65:1 on --panel-3. */
+  --ring:        color-mix(in oklab, #5a9fd4 80%, oklch(40% 0 0));
   --accent-glow: var(--ring);
+  /* The dark accent stays the brand, button and chart colour (a six-digit
+   * hex: atmosphere parity and uPlot's translucent() read it). As TEXT it
+   * measures 4.40:1 on --panel-3, the raised segmented option's floor, so
+   * accent text reads this lighter step: 5.05:1 on --panel-3, 4.71:1 on
+   * the wash over --panel-2, 6.65:1 on --panel. */
+  --accent-ink:  #6baadd;
   --accent-wash: color-mix(in oklab, #5a9fd4 14%, transparent);
 
   --teal:       #4ec9b0;
@@ -236,10 +285,15 @@
   --green-wash: rgba(123,189,106,.12);
   --blue:       #5a9fd4;
 
-  --shadow-1:    0 1px 2px rgba(0,0,0,.4);
-  --shadow-2:    0 1px 2px rgba(0,0,0,.5), 0 2px 8px rgba(0,0,0,.35);
-  --shadow-3:    0 8px 24px rgba(0,0,0,.5), 0 2px 6px rgba(0,0,0,.35);
-  --shadow-glow: 0 0 0 2px var(--ring);
+  --edge-hi:     rgb(255 255 255 / .09);
+  --inset:       inset 0 1px 3px rgb(0 0 0 / .38);
+  --elev-1:      0 1px 2px rgb(0 0 0 / .34), 0 6px 18px rgb(0 0 0 / .14);
+  --elev-2:      0 2px 4px rgb(0 0 0 / .40), 0 10px 28px -6px rgb(0 0 0 / .30);
+  --elev-3:      0 2px 7px rgb(0 0 0 / .5), 0 18px 48px rgb(0 0 0 / .4);
+  --header-shadow: 0 1px 4px rgb(0 0 0 / .35);
+  --shadow-1:    var(--elev-1);
+  --shadow-2:    var(--elev-2);
+  --shadow-3:    var(--elev-3);
 }
 
 :root {
@@ -302,7 +356,9 @@
 
   --topbar-h:   40px;
   --statusbar-h: 26px;
-  --rail-w:     84px;
+  --sidebar-w:  200px;
+  --sidebar-w-collapsed: 56px;
+  --inspector-w: clamp(320px, 28vw, 420px);
   --facets-w:   224px;
 }
 
@@ -333,15 +389,17 @@ body {
 button { font: inherit; }
 ::selection { background: var(--selection); }
 
-/* Focus ring — accent glow, never browser blue. */
-/* Anchors are controls too. ADR-0029 stretches one over each list row. */
+/* Focus ring — a 2px outline offset from the control, so it never
+ * competes with an elevation box-shadow (ADR-0032) and survives
+ * forced colors. Anchors are controls too (ADR-0029). */
 button:focus-visible,
 a[href]:focus-visible,
 input:focus-visible,
 textarea:focus-visible,
+select:focus-visible,
 [tabindex]:focus-visible {
-  outline: none;
-  box-shadow: var(--shadow-glow);
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
 }
 
 /* Scrollbars — slim, panel-toned. */
@@ -393,7 +451,8 @@ textarea:focus-visible,
 .field input[type="text"] {
   width: 100%;
   padding: 8px 10px;
-  background: var(--fill);
+  background: var(--well);
+  box-shadow: var(--inset);
   color: var(--ink);
   border: 1px solid var(--line);
   border-radius: var(--radius-ctl);
@@ -402,8 +461,6 @@ textarea:focus-visible,
 }
 
 .field input:focus {
-  outline: none;
-  box-shadow: var(--shadow-glow);
   border-color: var(--accent);
 }
 
@@ -443,11 +500,12 @@ textarea:focus-visible,
   font-family: var(--font-ui);
   font-weight: 500;
   font-size: var(--fs-control);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / .2), 0 1px 2px rgb(0 0 0 / .15);
   cursor: pointer;
   transition: background 150ms ease-out, translate 150ms ease-out;
 }
 .btn:hover { background: color-mix(in oklab, var(--accent) 85%, var(--bg)); }
-.btn:active:not(:disabled) { translate: 0 1px; }
+.btn:active:not(:disabled) { translate: 0 1px; box-shadow: inset 0 1px 0 rgb(255 255 255 / .2); }
 .btn:disabled { opacity: 0.5; cursor: not-allowed; }
 .btn-full { width: 100%; }
 
@@ -482,13 +540,14 @@ textarea:focus-visible,
   font-size: var(--fs-control);
   font-family: var(--font-ui);
   font-weight: 500;
-  background: transparent;
+  background: var(--fill);
+  box-shadow: inset 0 1px 0 var(--edge-hi);
   border: 1px solid var(--line);
   color: var(--ink-2);
   border-radius: var(--radius-ctl);
   cursor: pointer;
 }
-.btn-sec:hover { background: color-mix(in oklab, var(--panel-3) 55%, transparent); color: var(--ink); }
+.btn-sec:hover { background: var(--fill-2); color: var(--ink); }
 .btn-sec:disabled { opacity: .5; cursor: not-allowed; }
 
 .btn-pri {
@@ -500,11 +559,12 @@ textarea:focus-visible,
   color: var(--on-accent);
   border: 1px solid transparent;
   border-radius: var(--radius-ctl);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / .2), 0 1px 2px rgb(0 0 0 / .15);
   cursor: pointer;
   transition: background 150ms ease-out, translate 150ms ease-out;
 }
 .btn-pri:hover { background: color-mix(in oklab, var(--accent) 85%, var(--bg)); }
-.btn-pri:active:not(:disabled) { translate: 0 1px; }
+.btn-pri:active:not(:disabled) { translate: 0 1px; box-shadow: inset 0 1px 0 rgb(255 255 255 / .2); }
 .btn-pri:disabled { opacity: .5; cursor: not-allowed; }
 
 /* Destructive is TINTED (ADR-0007): red text on the red wash, never a
@@ -536,7 +596,8 @@ textarea:focus-visible,
  *   they did when main.css loaded after this file. */
 .btn-sm {
   padding: 3px 10px;
-  background: transparent;
+  background: var(--fill);
+  box-shadow: inset 0 1px 0 var(--edge-hi);
   color: var(--ink-2);
   border: 1px solid var(--line);
   border-radius: var(--radius-ctl);
@@ -546,7 +607,7 @@ textarea:focus-visible,
   cursor: pointer;
 }
 .btn-sm:hover:not(:disabled) {
-  background: color-mix(in oklab, var(--panel-3) 55%, transparent);
+  background: var(--fill-2);
   color: var(--ink);
 }
 .btn-sm:disabled {
@@ -577,8 +638,7 @@ textarea:focus-visible,
   max-height: calc(100dvh - 14dvh - 32px);
   background: var(--panel); border: 1px solid var(--line);
   border-radius: var(--radius-panel);
-  box-shadow: 0 24px 64px -12px rgba(0,0,0,.32),
-              0 8px 24px -8px rgba(0,0,0,.18);
+  box-shadow: inset 0 1px 0 var(--edge-hi), var(--elev-3);
   display: flex; flex-direction: column;
   animation: modalIn 180ms cubic-bezier(.2,.8,.2,1);
   overflow: hidden;
@@ -638,24 +698,24 @@ textarea:focus-visible,
   letter-spacing: var(--label-spacing); color: var(--ink-3);
 }
 .modal .m-field input {
-  background: var(--fill);
+  background: var(--well);
+  box-shadow: var(--inset);
   border: 1px solid var(--line); border-radius: var(--radius-ctl);
   padding: 6px 10px; font-family: var(--font-ui); font-size: var(--fs-base);
-  color: var(--ink); outline: none; height: 30px;
+  color: var(--ink); height: 30px;
 }
 .modal .m-field input:focus {
-  border-color: var(--accent); box-shadow: var(--shadow-glow);
+  border-color: var(--accent);
 }
 
 .reason-input {
   width: 100%; min-height: 60px; padding: 6px 8px;
-  background: var(--fill); color: var(--ink);
+  background: var(--well); box-shadow: var(--inset); color: var(--ink);
   border: 1px solid var(--line); border-radius: var(--radius-ctl);
   font-family: var(--font-mono); font-size: var(--fs-base);
   resize: vertical;
 }
 .reason-input:focus {
-  outline: none; box-shadow: var(--shadow-glow);
   border-color: var(--accent);
 }
 
@@ -670,6 +730,9 @@ textarea:focus-visible,
  * ─────────────────────────────────────────────────────────────── */
 .tabs {
   display: flex;
+  align-items: center;
+  min-height: 38px;
+  gap: 6px;
   background: var(--panel);
   border-bottom: 1px solid var(--line);
   padding: 0 12px;
@@ -678,7 +741,8 @@ textarea:focus-visible,
 .tabs .t {
   background: none;
   border: none;
-  padding: 8px 12px;
+  height: 38px;
+  padding: 0 12px;
   font-size: var(--fs-base);
   color: var(--ink-3);
   cursor: pointer;
@@ -714,7 +778,7 @@ textarea:focus-visible,
   position: fixed; top: 0; right: 0; bottom: 0;
   width: min(720px, 92vw);
   background: var(--panel); border-left: 1px solid var(--line);
-  box-shadow: -8px 0 32px -10px rgba(0,0,0,.25);
+  box-shadow: inset 0 1px 0 var(--edge-hi), var(--elev-3);
   z-index: 51;
   display: flex; flex-direction: column;
   animation: sd-slide-in 200ms cubic-bezier(.2,.8,.3,1);
@@ -727,7 +791,8 @@ textarea:focus-visible,
   display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap;
   flex-shrink: 0;
   padding: 14px 18px; border-bottom: 1px solid var(--line);
-  gap: 16px; background: var(--panel-2);
+  gap: 16px; background: var(--panel);
+  box-shadow: inset 0 1px 0 var(--edge-hi), var(--header-shadow);
 }
 .sd-ttl { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; min-width: 0; overflow-wrap: anywhere; }
 .sd-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-inline-start: auto; }
@@ -737,7 +802,7 @@ textarea:focus-visible,
   font-size: 18px; color: var(--ink-3); line-height: 1;
   display: inline-flex; align-items: center; justify-content: center;
 }
-.sd-x:hover { background: var(--panel-3); color: var(--ink); border-color: var(--line); }
+.sd-x:hover { background: var(--fill-2); color: var(--ink); border-color: var(--line); }
 
 /* Drawer tabs */
 .sd-tabs {
@@ -761,7 +826,7 @@ textarea:focus-visible,
  * absorbed by it — the tabs and the meta text do not move. */
 .sd-tabs .tablist { gap: 4px; }
 
-.sd-body { flex: 1; min-height: 0; overflow: auto; padding: 16px 18px; }
+.sd-body { flex: 1; min-height: 0; overflow: auto; padding: 16px 18px; background: var(--bg); }
 
 /* ─────────────────────────────────────────────────────────────────
  *  Toasts (bottom-right stack)
@@ -857,7 +922,7 @@ textarea:focus-visible,
   border-radius: var(--radius-panel);
   padding: 32px;
   width: 360px; max-width: 100%;
-  box-shadow: var(--shadow-2);
+  box-shadow: inset 0 1px 0 var(--edge-hi), var(--elev-3);
 }
 
 .login-card h1 {
@@ -954,7 +1019,8 @@ textarea:focus-visible,
   gap: 8px;
   height: 26px;
   padding: 0 8px 0 10px;
-  background: var(--fill);
+  background: var(--well);
+  box-shadow: var(--inset);
   border: 1px solid var(--line);
   border-radius: var(--radius-ctl);
   width: 280px;
@@ -963,7 +1029,7 @@ textarea:focus-visible,
   cursor: pointer;
   transition: border-color 120ms;
 }
-.topbar .jump:hover { border-color: var(--ink-4); }
+.topbar .jump:hover { border-color: var(--ink-3); }
 .topbar .jump .gh { flex: 1; font-family: var(--font-ui); font-size: var(--fs-label); }
 
 /* Command palette: the input keeps focus while arrows select real links. */
@@ -982,7 +1048,7 @@ textarea:focus-visible,
   display: flex; flex-direction: column; overflow: hidden;
   background: var(--panel); color: var(--ink);
   border: 1px solid var(--line); border-radius: var(--radius-panel);
-  box-shadow: 0 24px 64px -12px rgba(0,0,0,.32), 0 8px 24px -8px rgba(0,0,0,.18);
+  box-shadow: inset 0 1px 0 var(--edge-hi), var(--elev-3);
 }
 .command-palette-search {
   display: flex; align-items: center; gap: 8px; flex-shrink: 0;
@@ -991,7 +1057,7 @@ textarea:focus-visible,
 .command-palette-input {
   appearance: none; font: inherit; font-size: var(--fs-ui);
   flex: 1; min-width: 0; height: 36px; padding: 0 10px;
-  background: var(--fill); color: var(--ink);
+  background: var(--well); box-shadow: var(--inset); color: var(--ink);
   border: 1px solid var(--line); border-radius: var(--radius-ctl);
 }
 .command-palette-input::placeholder { color: var(--ink-3); }
@@ -1015,7 +1081,13 @@ textarea:focus-visible,
   color: var(--ink); text-decoration: none; font-size: var(--fs-ui);
 }
 .command-palette-option:hover { background: var(--panel-2); }
-.command-palette-option[aria-selected="true"] { background: var(--accent-wash); color: var(--accent); }
+/* Selected is the wash plus a 3px rule; focus stays on the combobox
+ * input, so the selected option and the focus ring never collide. */
+.command-palette-option[aria-selected="true"] {
+  background: var(--accent-wash);
+  color: var(--accent-ink);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
 .command-palette-label { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 .command-palette-path {
   max-width: 55%; overflow-wrap: anywhere; text-align: right;
@@ -1070,7 +1142,7 @@ textarea:focus-visible,
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: var(--radius-panel);
-  box-shadow: var(--shadow-3);
+  box-shadow: inset 0 1px 0 var(--edge-hi), var(--elev-3);
   padding: 4px;
   animation: fadeIn 120ms;
 }
@@ -1220,36 +1292,39 @@ textarea:focus-visible,
   white-space: nowrap; text-transform: uppercase;
 }
 .bdg.neutral { background: var(--panel-2);   color: var(--ink-3); }
-.bdg.info    { background: var(--panel-2);   color: var(--blue); }
+.bdg.info    { background: var(--panel-2);   color: var(--accent-ink); }
 .bdg.success { background: var(--green-wash);color: var(--green); }
 /* warn reads yellow, not the accent — warnings must keep their
  * semantic color regardless of what hue the accent slot carries. */
 .bdg.warn    { background: var(--yellow-wash);color: var(--yellow); }
 .bdg.danger  { background: var(--red-wash);  color: var(--red); }
 
-/* Segmented — <Segmented/>. One active treatment: accent wash. */
+/* Segmented — <Segmented/>. One active treatment: the option is raised
+ * out of the well track (ADR-0032), never a second active rule. */
 .seg {
-  display: inline-flex; background: var(--panel-2);
+  display: inline-flex; gap: 2px; padding: 2px;
+  background: var(--well); box-shadow: var(--inset);
   border: 1px solid var(--line); border-radius: var(--radius-ctl);
-  font-family: var(--font-ui); overflow: hidden;
+  font-family: var(--font-ui);
 }
 .seg-full { display: flex; }
 .seg-full .seg-opt { flex: 1; }
 .seg .seg-opt {
-  padding: 6px 10px; font-size: var(--fs-control); font-weight: 500;
+  padding: 4px 10px; font-size: var(--fs-control); font-weight: 500;
   color: var(--ink-3); background: transparent;
-  border: none; border-right: 1px solid var(--line);
+  border: 1px solid transparent; border-radius: var(--radius-sm);
   cursor: pointer;
   transition: background 100ms, color 100ms;
 }
-.seg .seg-opt:last-child { border-right: none; }
 .seg .seg-opt:hover { color: var(--ink-2); }
 .seg .seg-opt.on {
-  background: var(--accent-wash);
-  color: var(--accent);
+  background: var(--panel);
+  color: var(--accent-ink);
+  border-color: var(--line);
+  box-shadow: var(--elev-1);
   font-weight: 600;
 }
-.seg-sm .seg-opt { padding: 4px 9px; font-size: var(--fs-small); }
+.seg-sm .seg-opt { padding: 3px 9px; font-size: var(--fs-small); }
 
 /* Loaded — <Loaded/> tri-state hints (canonical copy tested natively). */
 .load-hint {
@@ -1299,13 +1374,14 @@ textarea:focus-visible,
 .toggle input { opacity: 0; width: 0; height: 0; }
 .toggle-slider {
   position: absolute; inset: 0; cursor: pointer;
-  background: var(--line); border-radius: var(--radius-pill);
+  background: var(--well); box-shadow: var(--inset), inset 0 0 0 1px var(--line);
+  border-radius: var(--radius-pill);
   transition: background 200ms;
 }
 .toggle-slider::before {
   content: ""; position: absolute; left: 2px; top: 2px;
   width: 14px; height: 14px; border-radius: var(--radius-round);
-  background: var(--panel); transition: transform 200ms;
+  background: var(--panel); box-shadow: var(--elev-1); transition: transform 200ms;
 }
 .toggle input:checked + .toggle-slider { background: var(--accent); }
 .toggle input:checked + .toggle-slider::before { transform: translateX(14px); }
@@ -1357,13 +1433,21 @@ textarea:focus-visible,
 .inp-wrap {
   display: flex; align-items: center; gap: 6px;
   padding: 4px 10px;
-  background: var(--fill);
+  background: var(--well);
+  box-shadow: var(--inset);
   border: 1px solid var(--line);
   border-radius: var(--radius-ctl); color: var(--ink-3); min-width: 200px;
 }
 .inp-wrap input {
   flex: 1; background: transparent; border: 0; outline: none;
   font-family: var(--font-ui); font-size: var(--fs-base); color: var(--ink);
+}
+/* The input keeps no ring of its own — the wrapper is the visible
+ * control, so the focus outline rides it. */
+.inp-wrap:focus-within {
+  border-color: var(--accent);
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
 }
 
 /* ActionsMenu trigger + panel (moved verbatim from trawl's main.css;
@@ -1378,7 +1462,8 @@ textarea:focus-visible,
 .actions-menu {
   position: absolute; right: 0; top: 100%;
   background: var(--panel); border: 1px solid var(--line);
-  border-radius: var(--radius-panel); box-shadow: 0 4px 12px rgba(0,0,0,.15);
+  border-radius: var(--radius-panel);
+  box-shadow: inset 0 1px 0 var(--edge-hi), var(--elev-3);
   z-index: 10; min-width: 140px;
 }
 .actions-menu .item {
@@ -1388,7 +1473,10 @@ textarea:focus-visible,
   color: var(--ink-2);
 }
 .actions-menu .item:hover,
-.actions-menu .item:focus-visible { background: var(--panel-2); color: var(--ink); outline: none; }
+.actions-menu .item:focus-visible { background: var(--panel-2); color: var(--ink); }
+/* Full-bleed rows: the ring rides inside the panel instead of straddling
+ * its rounded edge. */
+.actions-menu .item:focus-visible { outline-offset: -2px; }
 .actions-menu .item.danger { color: var(--red); }
 .actions-menu .item.danger:hover,
 .actions-menu .item.danger:focus-visible { background: color-mix(in oklab, var(--red) 10%, var(--panel-2)); }
@@ -1420,6 +1508,7 @@ textarea:focus-visible,
   z-index: -1;
   pointer-events: none;
   background: var(--bg);
+  opacity: .8;
 }
 /* ShaderMount sizes its canvas to the parent; make that sizing
  * explicit so a partially-initialized mount can't leave a 0×0 or
@@ -1444,27 +1533,33 @@ textarea:focus-visible,
   align-items: center;
   justify-content: center;
   gap: 6px;
-  height: 28px;
-  padding: 0 10px;
-  background: var(--fill);
+  min-height: 32px;
+  height: auto;
+  width: 100%;
+  padding: 5px 10px;
+  background: var(--well);
+  box-shadow: var(--inset);
   border: 1px solid var(--line);
   border-radius: var(--radius-ctl);
   color: var(--ink-2);
   font: inherit;
   font-family: var(--font-ui);
   font-size: var(--fs-ui);
+  line-height: 1.35;
   margin: 0;
   cursor: pointer;
   user-select: none;
-  white-space: nowrap;
+  white-space: normal;
+  overflow-wrap: anywhere;
   transition: color 120ms, background 120ms, border-color 120ms;
 }
-/* Absolute-range labels ("2026-07-16… → now") can exceed the column —
- * ellipsize instead of blowing the layout out. */
+/* Absolute-range labels ("2026-07-16… → now") exceed the column at
+ * narrow widths: the trigger grows down and wraps the whole value
+ * rather than ellipsizing it into the Haul button (F06). */
 .dr-trigger span {
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 .dr-trigger svg { flex-shrink: 0; }
 
@@ -1505,7 +1600,7 @@ textarea:focus-visible,
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: var(--radius-panel);
-  box-shadow: var(--shadow-3);
+  box-shadow: inset 0 1px 0 var(--edge-hi), var(--elev-3);
   padding: 12px;
   animation: fadeIn 120ms;
 }
@@ -1522,8 +1617,8 @@ textarea:focus-visible,
   font-family: var(--font-ui);
   font-size: var(--fs-ui);
   color: var(--ink);
-  background: var(--panel-2);
-  border: 1px solid var(--line-2);
+  background: var(--fill);
+  border: 1px solid transparent;
   border-radius: var(--radius-sm);
   cursor: pointer;
   text-align: center;
@@ -1535,9 +1630,10 @@ textarea:focus-visible,
 .dr-pop .opt:hover { background: var(--accent-wash); border-color: var(--accent); }
 .dr-pop .opt:disabled:hover { background: var(--panel-2); border-color: var(--line-2); }
 .dr-pop .opt.on {
-  background: var(--accent-wash);
-  color: var(--accent);
-  border-color: color-mix(in oklab, var(--accent) 45%, transparent);
+  background: var(--panel);
+  color: var(--accent-ink);
+  border-color: var(--line);
+  box-shadow: var(--elev-1);
   font-weight: 600;
 }
 /* From/To stack vertically — a full ISO timestamp at mono --table-fs
@@ -1568,11 +1664,11 @@ textarea:focus-visible,
   font-family: var(--font-mono);
   font-size: var(--table-fs);
   padding: 5px 8px;
-  background: var(--panel-2);
+  background: var(--well);
+  box-shadow: var(--inset);
   border: 1px solid var(--line);
   border-radius: var(--radius-ctl);
   color: var(--ink);
-  outline: none;
 }
 .dr-pop .cust .fld input:focus { border-color: var(--accent); }
 .dr-pop .foot {
@@ -1640,8 +1736,6 @@ textarea:focus-visible,
   .tabs { flex-wrap: wrap; padding-inline: 8px; align-items: center; }
   .tabs .tablist { flex-wrap: wrap; }
   .modal .seg-full { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .modal .seg-full .seg-opt:nth-child(2n) { border-right: 0; }
-  .modal .seg-full .seg-opt:nth-last-child(n + 3) { border-bottom: 1px solid var(--line); }
   .dr-pop { position: fixed; inset: 16px 16px auto; width: auto; max-height: calc(100dvh - 32px); overflow-y: auto; overscroll-behavior: contain; }
   .dr-pop .foot { flex-wrap: wrap; }
   .toast { min-width: 0; max-width: calc(100vw - 32px); }
@@ -1652,7 +1746,7 @@ textarea:focus-visible,
 
 /* Focus belongs on the visible switch track, since the checkbox is hidden. */
 .toggle input:focus-visible + .toggle-slider {
-  outline: 2px solid var(--accent);
+  outline: 2px solid var(--ring);
   outline-offset: 2px;
 }
 
@@ -1669,13 +1763,27 @@ textarea:focus-visible,
     outline: 2px solid Highlight !important;
     outline-offset: 2px;
   }
+  /* Every plane is a box-shadow, which forced colors drops: each one
+   * falls back to a border, and the three selected states keep a
+   * Highlight outline of their own. The raised segmented option is
+   * addressed through aria-pressed so the stylesheet keeps exactly one
+   * active-option rule (component_class_contract). */
+  .rail .it.active, .sd-drawer, .sd-hd, .sd-host, .scope,
+  .seg .seg-opt[aria-pressed="true"],
+  .command-palette-option[aria-selected="true"], .fleet-table-frame,
+  .list-sheet, .console, .cat-track, .cat-track i { box-shadow: none; border: 1px solid CanvasText; }
+  .rail .it.active, .seg .seg-opt[aria-pressed="true"],
+  .command-palette-option[aria-selected="true"] { outline: 2px solid Highlight; outline-offset: -2px; }
 }
 
 /* These effects are decorative; state remains visible without motion. */
 @media (prefers-reduced-motion: reduce) {
   .modal-scrim, .modal, .sd-scrim, .sd-drawer, .toast,
-  .user-menu, .dr-pop, .status-dot.running {
+  .user-menu, .dr-pop, .status-dot.running, .nav-scrim, .rail.overlay {
     animation: none;
+  }
+  .rail {
+    transition: none;
   }
   .toggle-slider, .toggle-slider::before {
     transition: none;
@@ -1685,6 +1793,7 @@ textarea:focus-visible,
 /* Native management tables share tracks and cell insets. Consumers own columns. */
 .fleet-table-frame {
   border: 1px solid var(--line); border-radius: var(--radius-panel); background: var(--panel);
+  box-shadow: inset 0 1px 0 var(--edge-hi), var(--elev-1);
   display: flex; flex-direction: column; min-height: 0; overflow: hidden;
   flex: 1;
 }
@@ -1700,7 +1809,8 @@ textarea:focus-visible,
 }
 .fleet-table > thead > tr > th {
   position: sticky; top: 0; z-index: 4; white-space: nowrap;
-  background: var(--panel-2); color: var(--ink-3); font-weight: 600;
+  background: var(--panel-2); color: var(--ink-2); font-weight: 500;
+  box-shadow: 0 1px 0 var(--line);
   border-bottom-color: var(--line);
 }
 .fleet-table > tbody > tr:last-child > td { border-bottom: 0; }

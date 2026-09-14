@@ -162,9 +162,9 @@ fn btn_size_classes_shipped_with_crate() {
         ".btn-sm padding moved verbatim"
     );
     assert!(
-        sm.contains("background: transparent"),
-        ".btn-sm is the Mira outline treatment (ADR-0007): transparent \
-         fill, 1px line border — still self-contained, not a modifier"
+        sm.contains("background: var(--fill)"),
+        "the Mira outline treatment is now the --fill plane with an edge \
+         highlight (ADR-0032) — still self-contained, not a modifier"
     );
     assert!(
         rule_body(".btn-sm:disabled").contains("opacity: 0.4"),
@@ -332,8 +332,9 @@ fn drawer_shell_classes_shipped_with_crate() {
         ".sd-drawer moved verbatim"
     );
     assert!(
-        rule_body(".sd-hd").contains("background: var(--panel-2)"),
-        ".sd-hd moved verbatim"
+        rule_body(".sd-hd").contains("background: var(--panel)"),
+        ".sd-hd is the drawer's sheet header (ADR-0032): --panel with an \
+         edge highlight over the floor-toned body, not the support tone"
     );
     assert!(
         rule_body(".sd-x").contains("width: 28px"),
@@ -465,23 +466,49 @@ fn mira_blue_tokens_declared() {
         2,
         "--on-accent must be declared exactly once per theme block"
     );
-    // Focus is the 2px solid ring in both themes.
+    // Focus is the 2px --ring outline in both themes (ADR-0032 retired
+    // --shadow-glow: every focusable element now carries the outline, so
+    // a glow consumer would be a second focus idiom).
     assert_eq!(
-        CSS.matches("--shadow-glow: 0 0 0 2px var(--ring)").count(),
+        CSS.matches("\n  --ring:").count(),
         2,
-        "--shadow-glow must be the 2px var(--ring) ring in both theme blocks"
+        "--ring must be declared exactly once per theme block"
     );
+    // Accent-coloured TEXT reads --accent-ink: the dark brand blue
+    // measures 4.40:1 on --panel-3, the raised segmented option's floor.
+    assert_eq!(
+        CSS.matches("\n  --accent-ink:").count(),
+        2,
+        "--accent-ink must be declared exactly once per theme block"
+    );
+    // The plane and elevation ramp: a well inset, three raised steps and
+    // the 1px edge highlight, one declaration per theme block at the
+    // two-space indent the token blocks use.
+    for token in [
+        "\n  --well:",
+        "\n  --inset:",
+        "\n  --elev-1:",
+        "\n  --elev-2:",
+        "\n  --elev-3:",
+        "\n  --edge-hi:",
+    ] {
+        assert_eq!(
+            CSS.matches(token).count(),
+            2,
+            "`{}` must be declared exactly once per theme block (ADR-0032)",
+            token.trim()
+        );
+    }
     // Light --ink-4 is contrast-bound: it paints TEXT (the --fs-micro
-    // DEBUG level pill, the DSL editor gutter numbers, .editor-hd .dim,
-    // .divider), so it holds the pre-Mira tone's luminance rather than the
-    // skin's oklch(70.8%), which measures 2.59:1 on --panel and 2.48:1 on
-    // the editor's --fill wash. Re-measure the composited pixels before
+    // DEBUG level pill, the DSL editor gutter numbers, .divider), so it
+    // clears AA on every surface that reads it rather than sitting at the
+    // 3:1 non-text floor. Re-measure the composited pixels before
     // lightening it.
     assert!(
-        CSS.contains("--ink-4:     oklch(62% 0 0)"),
-        "the light `--ink-4` is toned for the 3:1 floor as a text colour \
-         (3.64:1 on --panel, 3.48:1 on the editor fill) — a lighter step \
-         drops the DEBUG pill and the gutter rule below it"
+        CSS.contains("--ink-4:     oklch(53% .024 253)"),
+        "5.27:1 on --panel, 4.82:1 on --panel-2, 4.68:1 on --well, \
+         4.60:1 on --bg — a lighter step drops the DEBUG pill and the \
+         gutter rule below AA"
     );
 }
 
@@ -547,20 +574,21 @@ fn chrome_keyframes_present() {
 fn the_focus_ring_reaches_anchors() {
     // ADR-0029 makes the one stretched control on a navigating row an
     // `<a href>`, and an anchor outside this group keeps the browser's
-    // own blue outline instead of the accent glow every other control
-    // gets. Pinning the whole selector list also pins its shape: the
-    // anchors have to ride the same rule body, not a copy beside it.
+    // own blue outline instead of the ring every other control gets.
+    // Pinning the whole selector list also pins its shape: the anchors
+    // have to ride the same rule body, not a copy beside it.
     let group = rule_body(
-        "button:focus-visible,\na[href]:focus-visible,\ninput:focus-visible,\ntextarea:focus-visible,\n[tabindex]:focus-visible",
+        "button:focus-visible,\na[href]:focus-visible,\ninput:focus-visible,\ntextarea:focus-visible,\nselect:focus-visible,\n[tabindex]:focus-visible",
     );
     assert!(
-        group.contains("outline: none") && group.contains("box-shadow: var(--shadow-glow)"),
-        "the focus-visible group must trade the UA outline for the accent \
-         glow, got:{group}"
+        group.contains("outline: 2px solid var(--ring)") && group.contains("outline-offset: 2px"),
+        "the focus-visible group must carry the 2px --ring outline at a \
+         2px offset (ADR-0032: an outline never competes with the \
+         elevation box-shadow a plane already paints), got:{group}"
     );
-    // A second `:focus-visible` rule carrying the glow would mean the
-    // anchors were bolted on beside the others, and the two bodies could
-    // drift apart.
+    // The ring is an outline now, so a `:focus-visible` rule that painted
+    // it as a box-shadow would be a second focus idiom — and --shadow-glow
+    // no longer exists to paint it with.
     let glow_groups: Vec<String> = rules(CSS)
         .into_iter()
         .filter(|r| {
@@ -568,10 +596,24 @@ fn the_focus_ring_reaches_anchors() {
             selector.contains(":focus-visible") && body.contains("box-shadow: var(--shadow-glow)")
         })
         .collect();
-    assert_eq!(
-        glow_groups.len(),
-        1,
-        "exactly one `:focus-visible` rule may carry the accent glow, \
+    assert!(
+        glow_groups.is_empty(),
+        "the accent glow is retired: focus is the --ring outline, \
          found: {glow_groups:#?}"
+    );
+    // And a rule that resets `outline: none` on a focused control erases
+    // the ring outright — `.actions-menu .item:focus-visible`
+    // (fleet-ui.css:1390) did exactly that before ADR-0032.
+    let suppressed: Vec<String> = rules(CSS)
+        .into_iter()
+        .filter(|r| {
+            let (selector, body) = r.split_once('{').unwrap_or((r.as_str(), ""));
+            selector.contains(":focus-visible") && body.contains("outline: none")
+        })
+        .collect();
+    assert!(
+        suppressed.is_empty(),
+        "no `:focus-visible` rule may reset the outline — that erases the \
+         ring instead of restyling it, found: {suppressed:#?}"
     );
 }
