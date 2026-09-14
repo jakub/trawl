@@ -810,13 +810,23 @@ fn validate_log_destination(
     let resolved = resolve_log_destination(path).map_err(with_context)?;
     for name in STORAGE_MARKERS {
         let marker = data_root.join(name);
-        if resolved == resolve_log_destination(&marker).map_err(with_context)? {
+        let resolved_marker = resolve_log_destination(&marker).map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to inspect reserved storage marker {} while validating server.log_file {}: {error}",
+                    marker.display(),
+                    path.display()
+                ),
+            )
+        })?;
+        if resolved == resolved_marker {
             return Err(marker_log_error(&marker));
         }
     }
     #[cfg(unix)]
     match std::fs::metadata(&resolved) {
-        Ok(metadata) => validate_log_identity(&metadata, data_root).map_err(with_context)?,
+        Ok(metadata) => validate_log_identity(&metadata, data_root)?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(with_context(error)),
     }
@@ -837,7 +847,15 @@ fn validate_log_identity(
             }
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
+            Err(error) => {
+                return Err(std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "failed to inspect reserved storage marker {}: {error}",
+                        marker.display()
+                    ),
+                ));
+            }
         }
     }
     Ok(())
