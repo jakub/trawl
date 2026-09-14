@@ -267,6 +267,6 @@ pub fn DslEditor(
     });
 
     view! {
-        <div node_ref=node_ref class="dsl-editor"></div>
+        <div node_ref=node_ref id="search-editor" class="dsl-editor"></div>
     }
 }

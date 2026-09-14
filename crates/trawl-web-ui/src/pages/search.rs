@@ -4,10 +4,11 @@
 
 //! `/search` — query workspace.
 //!
-//! Layout (top to bottom inside `.search-col`):
-//! editor wrap (header + `DslEditor` + date range + run button)
-//! → meta strip (filter chips — hidden while empty)
-//! → tabs (Events / Visualization · trailing Save/Export actions)
+//! Layout (top to bottom inside `.search-col`, the page's one sheet):
+//! query console (header + draft state + `DslEditor` + date range +
+//! Haul + tools + the executed-scope strip)
+//! → tabs (Events / Visualization · trailing Truncated / Stop live /
+//!   Save / Export)
 //! → degraded-field notice (hidden unless the execution reported one)
 //! → tab body (Events: histogram + results table | Visualization: chart)
 //!
@@ -15,8 +16,11 @@
 //! - `query_text` — in-progress editor buffer (not URL-synced).
 //! - `executed_q` / `filters` / `range` — URL-driven memos (canonical).
 //! - `effective_q` — derived from the triple; what actually hits the
-//!   server. Filter chips in the meta strip and the date-range popover
+//!   server. Filter chips in the scope strip and the date-range popover
 //!   mutate state by navigating; URL drives memos drives resource.
+//! - `draft_dirty` — the console header's own comparison of the two.
+//!   It reads both and writes neither, so saying "unsent changes"
+//!   cannot itself become a navigation (ADR-0027).
 
 use leptos::prelude::*;
 use trawl_api::value::QueryResult;
@@ -41,7 +45,7 @@ use crate::state::query::{
     report_refusal, url_signals,
 };
 use crate::state::search_session::rows_resource;
-use fleet_ui::{LoadState, TabItem, Tabs, ToastBus, ToastKind};
+use fleet_ui::{Badge, LoadState, TabItem, Tabs, ToastBus, ToastKind, Tone};
 
 use crate::state::stream_session::{
     LiveSignals, RingBuffer, StreamLifecycle, ring_to_result, start_stream,
@@ -107,6 +111,11 @@ pub fn Search() -> impl IntoView {
     Effect::new(move |_| {
         query_text.set(executed_q.get());
     });
+
+    // The console header's draft state. Trimmed on both sides: trailing
+    // whitespace the editor adds is not an unsent change, and `Haul`
+    // would produce the same link.
+    let draft_dirty = Memo::new(move |_| query_text.get().trim() != executed_q.get().trim());
 
     // Whether this link's structured state could be read at all.
     //
@@ -698,28 +707,38 @@ pub fn Search() -> impl IntoView {
                 suppressed=unreadable
                 rows_suppressed=facet_rows_suppressed
                 capabilities=facet_capabilities
+                live=live
                 on_add=on_add_filter
                 on_clear=on_clear_filters
             />
             <div class="search-col">
-                <EditorWrap
-                    query=query_text
-                    on_submit=on_submit
-                    range=range_sig
-                    on_range_change=on_range_change
-                    reset_key=raw_search
-                    running=running
-                    blocked=unreadable
-                    on_save=on_save
-                    on_live=on_live
-                />
-                <MetaStrip
-                    truncated=truncated
-                    filters=filters_sig
-                    filters_unreadable=filters_unreadable
-                    blocked=unreadable
-                    on_remove=on_remove_filter
-                />
+                <div class="console">
+                    <EditorWrap
+                        query=query_text
+                        on_submit=on_submit
+                        range=range_sig
+                        on_range_change=on_range_change
+                        reset_key=raw_search
+                        running=running
+                        blocked=unreadable
+                        draft_dirty=draft_dirty
+                        on_save=on_save
+                        on_live=on_live
+                    />
+                    // The strip under the editor describes the EXECUTED
+                    // query, not the buffer above it: window, filters,
+                    // mode and row count all come from the URL and the
+                    // active result source (ADR-0027).
+                    <MetaStrip
+                        window=window
+                        filters=filters_sig
+                        filters_unreadable=filters_unreadable
+                        blocked=unreadable
+                        live=live
+                        count=active_row_count
+                        on_remove=on_remove_filter
+                    />
+                </div>
                 <MalformedNotice malformed=malformed_sig repair=repair_sig on_repair=on_repair/>
                 <Tabs
                     items=vec![
@@ -734,6 +753,12 @@ pub fn Search() -> impl IntoView {
                     // the blanked sentinel then, and the server reads
                     // an empty query as every row (ADR-0027).
                     trailing=Box::new(move || view! {
+                        // The truncation notice moved out of the scope
+                        // strip: it qualifies the row count on the tab
+                        // beside it, not the window under the editor.
+                        <Show when=move || truncated.get()>
+                            <Badge tone=Tone::Warn>"Truncated"</Badge>
+                        </Show>
                         <Show when=move || live.get()>
                             <button
                                 type="button"

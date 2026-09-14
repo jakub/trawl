@@ -294,9 +294,12 @@ fn app_control_fills_read_the_fill_token() {
     // fill written as `color-mix(in oklab, var(--line) N%, transparent)`
     // renders at .10 x N in dark mode (a 20% fill lands at 2%). App fills
     // read fleet-ui's per-theme `--fill` / `--fill-2` tokens instead.
+    // Either step of the ramp satisfies the vacuous-pass guard: the
+    // editor well moved onto `--well` with ADR-0032, so the app's
+    // remaining control fill is the `--fill-2` hover step.
     assert!(
-        APP_CSS.contains("var(--fill)"),
-        "expected the app control fills to read fleet-ui's --fill token"
+        APP_CSS.contains("var(--fill)") || APP_CSS.contains("var(--fill-2)"),
+        "expected the app control fills to read fleet-ui's --fill / --fill-2 tokens"
     );
     let strays: Vec<&str> = APP_CSS
         .match_indices("var(--line) ")
