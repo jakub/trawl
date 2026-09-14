@@ -1,0 +1,196 @@
+
+> trawl-web-ui-e2e@0.0.0 test
+> playwright test tests/first-use.spec.ts tests/settings-disposition.spec.ts tests/readable-net-names.spec.ts tests/pre1-modal-lifetime.spec.ts tests/result-actions.spec.ts tests/pre1-auth.spec.ts tests/pre1-accessibility-layout.spec.ts --global-timeout=480000
+
+[WebServer] (node:3814756) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+[WebServer] (Use `node --trace-warnings ...` to show where the warning was created)
+[WebServer] e2e stub server listening on http://127.0.0.1:18243 (dist: /home/jakub/code/trawl/.worktrees/launch-readiness/crates/trawl-web-ui/dist)
+
+Running 67 tests using 1 worker
+
+(node:3814960) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+  ✓   1 [chromium] › tests/first-use.spec.ts:8:5 › login explains personal keys and links operators to provisioning (893ms)
+  ✓   2 [chromium] › tests/first-use.spec.ts:24:7 › first search on Linux offers a bounded executable example and platform shortcut (338ms)
+  ✓   3 [chromium] › tests/first-use.spec.ts:24:7 › first search on Mac offers a bounded executable example and platform shortcut (343ms)
+  ✓   4 [chromium] › tests/first-use.spec.ts:41:5 › a direct zero-match search gives range and filter guidance (273ms)
+  ✓   5 [chromium] › tests/first-use.spec.ts:47:5 › an empty later page does not claim that the query has no matches (265ms)
+  ✓   6 [chromium] › tests/pre1-accessibility-layout.spec.ts:10:9 › absolute range keeps Haul reachable at 320px in light (411ms)
+  ✓   7 [chromium] › tests/pre1-accessibility-layout.spec.ts:10:9 › absolute range keeps Haul reachable at 390px in light (410ms)
+  ✓   8 [chromium] › tests/pre1-accessibility-layout.spec.ts:10:9 › absolute range keeps Haul reachable at 768px in light (405ms)
+  ✓   9 [chromium] › tests/pre1-accessibility-layout.spec.ts:10:9 › absolute range keeps Haul reachable at 1440px in light (438ms)
+  ✓  10 [chromium] › tests/pre1-accessibility-layout.spec.ts:37:7 › secondary text and degraded badges retain contrast in light (585ms)
+  ✓  11 [chromium] › tests/pre1-accessibility-layout.spec.ts:10:9 › absolute range keeps Haul reachable at 320px in dark (497ms)
+  ✓  12 [chromium] › tests/pre1-accessibility-layout.spec.ts:10:9 › absolute range keeps Haul reachable at 390px in dark (513ms)
+  ✓  13 [chromium] › tests/pre1-accessibility-layout.spec.ts:10:9 › absolute range keeps Haul reachable at 768px in dark (500ms)
+  ✓  14 [chromium] › tests/pre1-accessibility-layout.spec.ts:10:9 › absolute range keeps Haul reachable at 1440px in dark (542ms)
+  ✓  15 [chromium] › tests/pre1-accessibility-layout.spec.ts:37:7 › secondary text and degraded badges retain contrast in dark (638ms)
+  ✓  16 [chromium] › tests/pre1-accessibility-layout.spec.ts:88:5 › keyboard shortcuts bypass the rail and facets without changing the search (449ms)
+  ✓  17 [chromium] › tests/pre1-accessibility-layout.spec.ts:110:5 › drawer uses valid dialog semantics and keeps the background reachable (368ms)
+  ✓  18 [chromium] › tests/pre1-auth.spec.ts:9:7 › auth server failure retains the destination and retries without credentials (447ms)
+  ✓  19 [chromium] › tests/pre1-auth.spec.ts:9:7 › auth network failure retains the destination and retries without credentials (446ms)
+  ✓  20 [chromium] › tests/pre1-auth.spec.ts:28:5 › auth rejection redirects, while lack of permission has its own state (697ms)
+  ✓  21 [chromium] › tests/pre1-auth.spec.ts:40:7 › logout server failure remains visible until a successful retry (641ms)
+  ✓  22 [chromium] › tests/pre1-auth.spec.ts:40:7 › logout network failure remains visible until a successful retry (643ms)
+  ✘  23 [chromium] › tests/pre1-auth.spec.ts:64:5 › login validation identifies and focuses the invalid API key (891ms)
+(node:3834048) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+  ✘  24 [chromium] › tests/pre1-auth.spec.ts:78:7 › login HTTP 401 associates the error with the key and distinguishes rejection (568ms)
+(node:3834255) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+  ✘  25 [chromium] › tests/pre1-auth.spec.ts:78:7 › login HTTP 503 associates the error with the key and distinguishes rejection (722ms)
+(node:3835675) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+  ✓  26 [chromium] › tests/pre1-modal-lifetime.spec.ts:12:9 › late Save success from search preserves a replacement dialog (874ms)
+  ✓  27 [chromium] › tests/pre1-modal-lifetime.spec.ts:12:9 › late Save failure from search preserves a replacement dialog (842ms)
+  ✓  28 [chromium] › tests/pre1-modal-lifetime.spec.ts:12:9 › late Save success from history preserves a replacement dialog (771ms)
+  ✓  29 [chromium] › tests/pre1-modal-lifetime.spec.ts:12:9 › late Save failure from history preserves a replacement dialog (740ms)
+  ✓  30 [chromium] › tests/pre1-modal-lifetime.spec.ts:49:7 › late Export success preserves a replacement dialog and reports once (738ms)
+  ✓  31 [chromium] › tests/pre1-modal-lifetime.spec.ts:49:7 › late Export failure preserves a replacement dialog and reports once (485ms)
+  ✓  32 [chromium] › tests/pre1-modal-lifetime.spec.ts:78:5 › Save completion survives navigation away from its page (854ms)
+  ✓  33 [chromium] › tests/readable-net-names.spec.ts:5:5 › readable net names preserve punctuation and show bounded refusals (1.0s)
+  ✓  34 [chromium] › tests/readable-net-names.spec.ts:52:5 › readable net rename validates blanks and preserves the draft on refusal (965ms)
+  ✓  35 [chromium] › tests/result-actions.spec.ts:13:5 › result audit: numeric sorting and only original aggregate group Include (1.0s)
+  ✓  36 [chromium] › tests/result-actions.spec.ts:34:5 › result audit: uppercase grouping keeps original lowercase output Include (892ms)
+  ✓  37 [chromium] › tests/result-actions.spec.ts:51:7 › result audit: suppress transformed or saved input actions: * | let HOST = lower(host) | stats count() by host (793ms)
+  ✓  38 [chromium] › tests/result-actions.spec.ts:51:7 › result audit: suppress transformed or saved input actions: * | stats count() by HOST | let host = lower(host) (642ms)
+  ✓  39 [chromium] › tests/result-actions.spec.ts:51:7 › result audit: suppress transformed or saved input actions: * | stats count() by host | rename HOST as other (677ms)
+  ✓  40 [chromium] › tests/result-actions.spec.ts:51:7 › result audit: suppress transformed or saved input actions: | from saved "example" | stats count() by host (866ms)
+  ✓  41 [chromium] › tests/result-actions.spec.ts:60:5 › result audit: historical context owns absolute range and clears facets and page (1.1s)
+  ✓  42 [chromium] › tests/result-actions.spec.ts:79:5 › result audit: live aggregate Events replaces exact table while Visualization stays separate (904ms)
+  ✓  43 [chromium] › tests/result-actions.spec.ts:96:5 › result audit: service tail refusal, retry, pause, resume and teardown (1.4s)
+  ✓  44 [chromium] › tests/result-actions.spec.ts:116:5 › result audit: stats completion after Unicode and quoted pipe (860ms)
+  ✓  45 [chromium] › tests/result-actions.spec.ts:127:5 › result audit: pending query cannot retarget retained aggregate row actions (955ms)
+  ✓  46 [chromium] › tests/result-actions.spec.ts:175:9 › result facet review: snapshot * | let status = 0 keeps original host and service (1.1s)
+  ✓  47 [chromium] › tests/result-actions.spec.ts:175:9 › result facet review: snapshot * | let STATUS = 0 keeps original host and service (989ms)
+  ✓  48 [chromium] › tests/result-actions.spec.ts:175:9 › result facet review: snapshot * | rename message as summary keeps original host and service (995ms)
+  ✓  49 [chromium] › tests/result-actions.spec.ts:175:9 › result facet review: snapshot * | rename MESSAGE as SUMMARY keeps original host and service (998ms)
+  ✓  50 [chromium] › tests/result-actions.spec.ts:175:9 › result facet review: live * | let status = 0 keeps original host and service (719ms)
+  ✓  51 [chromium] › tests/result-actions.spec.ts:175:9 › result facet review: live * | let STATUS = 0 keeps original host and service (726ms)
+  ✓  52 [chromium] › tests/result-actions.spec.ts:175:9 › result facet review: live * | rename message as summary keeps original host and service (876ms)
+  ✓  53 [chromium] › tests/result-actions.spec.ts:175:9 › result facet review: live * | rename MESSAGE as SUMMARY keeps original host and service (927ms)
+  ✓  54 [chromium] › tests/result-actions.spec.ts:203:5 › result facet review: pending Include keeps Clear all and active count, and Clear all preserves the draft (1.4s)
+  ✓  55 [chromium] › tests/settings-disposition.spec.ts:10:5 › Settings opens Health and offers only Health and the existing Schema page (747ms)
+  ✓  56 [chromium] › tests/settings-disposition.spec.ts:29:5 › Settings replaces its intermediate history entry and preserves the shell stream (947ms)
+  ✓  57 [chromium] › tests/settings-disposition.spec.ts:62:7 › obsolete Settings sources route renders the existing NotFound page (604ms)
+  ✓  58 [chromium] › tests/settings-disposition.spec.ts:62:7 › obsolete Settings retention route renders the existing NotFound page (550ms)
+  ✓  59 [chromium] › tests/settings-disposition.spec.ts:62:7 › obsolete Settings users route renders the existing NotFound page (512ms)
+  ✓  60 [chromium] › tests/settings-disposition.spec.ts:70:5 › Help is a native keyboard link and stays outside the full Settings palette inventory (518ms)
+  ✓  61 [chromium] › tests/settings-disposition.spec.ts:105:5 › Settings trailing slash reaches Health (347ms)
+  ✓  62 [chromium] › tests/settings-disposition.spec.ts:158:7 › Save captures editor buffer: editor preview and POST preserve exact text without filters or range (667ms)
+  ✓  63 [chromium] › tests/settings-disposition.spec.ts:158:7 › Save captures editor buffer: toolbar preview and POST preserve exact text without filters or range (651ms)
+  ✓  64 [chromium] › tests/settings-disposition.spec.ts:176:5 › Save cancel sends no POST and reopening captures the new buffer (957ms)
+  ✓  65 [chromium] › tests/settings-disposition.spec.ts:203:5 › Save keeps one modal and its captured buffer through a readable URL change (676ms)
+  ✓  66 [chromium] › tests/settings-disposition.spec.ts:222:5 › Save retries an explicit POST failure with the original snapshot (793ms)
+  ✓  67 [chromium] › tests/settings-disposition.spec.ts:241:5 › Save controls refuse malformed URLs and an open Save closes without a POST (705ms)
+
+
+  1) [chromium] › tests/pre1-auth.spec.ts:64:5 › login validation identifies and focuses the invalid API key
+
+    Error: expect(locator).toHaveAttribute(expected) failed
+
+    Locator: getByLabel('API key')
+    Expected: "true"
+    Error: strict mode violation: getByLabel('API key') resolved to 2 elements:
+        1) <input type="password" autocomplete="off" spellcheck="false" aria-invalid="true" aria-describedby="fleet-login-error"/> aka getByRole('textbox', { name: 'API key' })
+        2) <aside class="trawl-login-help" aria-label="Get an API key">…</aside> aka getByRole('complementary', { name: 'Get an API key' })
+
+    Call log:
+      - Expect "toHaveAttribute" with timeout 5000ms
+      - waiting for getByLabel('API key')
+
+
+      66 |   const key = page.getByLabel('API key');
+      67 |   await page.getByRole('button', { name: 'Sign In', exact: true }).click();
+    > 68 |   await expect(key).toHaveAttribute('aria-invalid', 'true');
+         |                     ^
+      69 |   await expect(key).toBeFocused();
+      70 |   const errorId = await key.getAttribute('aria-describedby');
+      71 |   expect(errorId).toBeTruthy();
+        at /home/jakub/code/trawl/.worktrees/launch-readiness/crates/trawl-web-ui/e2e/tests/pre1-auth.spec.ts:68:21
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/pre1-auth-login-validation-164bb-focuses-the-invalid-API-key-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/pre1-auth-login-validation-164bb-focuses-the-invalid-API-key-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/pre1-auth-login-validation-164bb-focuses-the-invalid-API-key-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/pre1-auth-login-validation-164bb-focuses-the-invalid-API-key-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  2) [chromium] › tests/pre1-auth.spec.ts:78:7 › login HTTP 401 associates the error with the key and distinguishes rejection
+
+    Error: locator.fill: Error: strict mode violation: getByLabel('API key') resolved to 2 elements:
+        1) <input type="password" autocomplete="off" spellcheck="false" aria-invalid="false"/> aka getByRole('textbox', { name: 'API key' })
+        2) <aside class="trawl-login-help" aria-label="Get an API key">…</aside> aka getByRole('complementary', { name: 'Get an API key' })
+
+    Call log:
+      - waiting for getByLabel('API key')
+
+
+      80 |     await page.goto('/login');
+      81 |     const key = page.getByLabel('API key');
+    > 82 |     await key.fill('disposable-invalid-key');
+         |               ^
+      83 |     await page.getByRole('button', { name: 'Sign In', exact: true }).click();
+      84 |     await expect(page.getByRole('alert')).toBeVisible();
+      85 |     await expect(key).toHaveAttribute('aria-invalid', String(status === 401));
+        at /home/jakub/code/trawl/.worktrees/launch-readiness/crates/trawl-web-ui/e2e/tests/pre1-auth.spec.ts:82:15
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/pre1-auth-login-HTTP-401-a-f4c75-and-distinguishes-rejection-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/pre1-auth-login-HTTP-401-a-f4c75-and-distinguishes-rejection-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/pre1-auth-login-HTTP-401-a-f4c75-and-distinguishes-rejection-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/pre1-auth-login-HTTP-401-a-f4c75-and-distinguishes-rejection-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  3) [chromium] › tests/pre1-auth.spec.ts:78:7 › login HTTP 503 associates the error with the key and distinguishes rejection
+
+    Error: locator.fill: Error: strict mode violation: getByLabel('API key') resolved to 2 elements:
+        1) <input type="password" autocomplete="off" spellcheck="false" aria-invalid="false"/> aka getByRole('textbox', { name: 'API key' })
+        2) <aside class="trawl-login-help" aria-label="Get an API key">…</aside> aka getByRole('complementary', { name: 'Get an API key' })
+
+    Call log:
+      - waiting for getByLabel('API key')
+
+
+      80 |     await page.goto('/login');
+      81 |     const key = page.getByLabel('API key');
+    > 82 |     await key.fill('disposable-invalid-key');
+         |               ^
+      83 |     await page.getByRole('button', { name: 'Sign In', exact: true }).click();
+      84 |     await expect(page.getByRole('alert')).toBeVisible();
+      85 |     await expect(key).toHaveAttribute('aria-invalid', String(status === 401));
+        at /home/jakub/code/trawl/.worktrees/launch-readiness/crates/trawl-web-ui/e2e/tests/pre1-auth.spec.ts:82:15
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/pre1-auth-login-HTTP-503-a-9fb09-and-distinguishes-rejection-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/pre1-auth-login-HTTP-503-a-9fb09-and-distinguishes-rejection-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results/pre1-auth-login-HTTP-503-a-9fb09-and-distinguishes-rejection-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace test-results/pre1-auth-login-HTTP-503-a-9fb09-and-distinguishes-rejection-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  3 failed
+    [chromium] › tests/pre1-auth.spec.ts:64:5 › login validation identifies and focuses the invalid API key
+    [chromium] › tests/pre1-auth.spec.ts:78:7 › login HTTP 401 associates the error with the key and distinguishes rejection
+    [chromium] › tests/pre1-auth.spec.ts:78:7 › login HTTP 503 associates the error with the key and distinguishes rejection
+  64 passed (50.6s)

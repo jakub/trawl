@@ -1,0 +1,11 @@
+warning: ignoring `resolver.incompatible-publish-age` without `-Zmin-publish-age`
+warning: ignoring `registry.global-min-publish-age` without `-Zmin-publish-age`
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl/.worktrees/launch-readiness/crates/trawl-core)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.87s
+     Running tests/build_provenance.rs (/home/jakub/code/trawl/target/launch-readiness/debug/deps/build_provenance-5563a739f727860f)
+
+running 2 tests
+test normal_repository_metadata_tracks_only_product_changes ... ok
+test linked_worktree_metadata_tracks_only_product_changes ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.85s

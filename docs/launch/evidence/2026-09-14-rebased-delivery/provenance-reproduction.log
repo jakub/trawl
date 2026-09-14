@@ -1,0 +1,71 @@
+warning: ignoring `resolver.incompatible-publish-age` without `-Zmin-publish-age`
+warning: ignoring `registry.global-min-publish-age` without `-Zmin-publish-age`
+   Compiling ring v0.17.14
+   Compiling syn v2.0.119
+   Compiling smallvec v1.15.2
+   Compiling syn v3.0.3
+   Compiling serde v1.0.229
+   Compiling indexmap v2.14.0
+   Compiling serde_core v1.0.229
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl/.worktrees/launch-readiness/crates/trawl-core)
+   Compiling insta v1.48.0
+   Compiling parking_lot_core v0.9.12
+   Compiling parking_lot v0.12.5
+   Compiling zip v6.0.0
+   Compiling crossterm v0.28.1
+   Compiling comfy-table v7.1.4
+   Compiling serde_derive v1.0.229
+   Compiling serde_json v1.0.151
+   Compiling zerocopy-derive v0.8.55
+   Compiling strum_macros v0.27.2
+   Compiling rustls v0.23.42
+   Compiling zerocopy v0.8.55
+   Compiling strum v0.27.2
+   Compiling rustls-webpki v0.103.13
+   Compiling half v2.7.1
+   Compiling ahash v0.8.12
+   Compiling arrow-buffer v58.4.0
+   Compiling ureq v3.3.0
+   Compiling arrow-data v58.4.0
+   Compiling libduckdb-sys v1.10505.0
+   Compiling arrow-array v58.4.0
+   Compiling arrow-select v58.4.0
+   Compiling arrow-row v58.4.0
+   Compiling arrow-arith v58.4.0
+   Compiling arrow-ord v58.4.0
+   Compiling arrow-string v58.4.0
+   Compiling arrow-cast v58.4.0
+   Compiling arrow v58.4.0
+   Compiling duckdb v1.10505.0
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 11.66s
+     Running tests/build_provenance.rs (/home/jakub/code/trawl/target/launch-readiness/debug/deps/build_provenance-5563a739f727860f)
+
+running 2 tests
+test normal_repository_metadata_tracks_only_product_changes ... FAILED
+test linked_worktree_metadata_tracks_only_product_changes ... FAILED
+
+failures:
+
+---- normal_repository_metadata_tracks_only_product_changes stdout ----
+
+thread 'normal_repository_metadata_tracks_only_product_changes' (3885167) panicked at crates/trawl-core/tests/build_provenance.rs:91:5:
+assertion `left == right` failed
+  left: "335a34df true"
+ right: "b569282 false"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- linked_worktree_metadata_tracks_only_product_changes stdout ----
+
+thread 'linked_worktree_metadata_tracks_only_product_changes' (3885166) panicked at crates/trawl-core/tests/build_provenance.rs:91:5:
+assertion `left == right` failed
+  left: "335a34df true"
+ right: "b569282 false"
+
+
+failures:
+    linked_worktree_metadata_tracks_only_product_changes
+    normal_repository_metadata_tracks_only_product_changes
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.27s
+
+error: test failed, to rerun pass `-p trawl-core --test build_provenance`
