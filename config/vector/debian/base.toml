@@ -47,6 +47,8 @@ current_boot_only = true
 # -- varlog catch-all: everything not handled by dedicated drop-ins -----------
 # anything that writes directly to /var/log and isn't covered by a service-
 # specific config (dpkg, apt, unattended-upgrades, misc application logs).
+# Excluded application files require their service drop-in; base alone skips them.
+# read_from=end collects newly appended lines, not existing file history.
 
 [sources.varlog]
 type = "file"
@@ -189,20 +191,22 @@ del(.SYSLOG_IDENTIFIER)
 del(.source_type)
 '''
 
-# -- noise filter: drop high-volume low-signal journald events ----------------
-# serial-getty crash loops on VMs without a real serial console generate ~4.3M
-# events per 15 days. docker container lifecycle causes veth/bridge churn in
-# networkd-dispatcher, NetworkManager, and systemd-networkd.
+# -- optional homelab noise policy ------------------------------------------
+# Default: forward every normalized journal event. To suppress serial-console
+# and container-network messages, explicitly set TRAWL_SUPPRESS_HOMELAB_NOISE=true
+# in /etc/default/vector. Review these rules before opting in.
 
 [transforms.trawl_journal]
 type = "filter"
 inputs = ["journal_enriched"]
 condition = '''
+if "${TRAWL_SUPPRESS_HOMELAB_NOISE:-false}" != "true" { return true }
+
 svc = to_string(.service) ?? ""
 msg = to_string(.message) ?? ""
 
 # drop serial-getty crash loop (the service itself + init reporting restarts)
-if svc == "serial-getty-ttyS0" { return false }
+if svc == "serial-getty@ttyS0" { return false }
 if svc == "init" && contains(msg, "serial-getty") { return false }
 
 # drop docker network churn from networkd/NM/systemd-networkd

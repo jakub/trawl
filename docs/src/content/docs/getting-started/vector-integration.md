@@ -55,6 +55,22 @@ and `unifi-syslog.toml`.
    transforms, such as `journal_enriched`, to prevent duplicate delivery and
    filter bypass.
 
+   The catch-all always excludes nginx, Apache, PostgreSQL, MySQL, Redis,
+   and fail2ban files. Install the corresponding drop-in to collect those
+   files, even if the application also writes some events to the journal.
+   All shipped file sources use `read_from = "end"`. When Vector first
+   discovers a file without a saved checkpoint, it collects newly appended
+   lines and skips existing history. On restart, it resumes saved checkpoints.
+
+   Journal collection covers the current boot. By default, every normalized
+   journal event passes through. To enable the optional homelab noise policy,
+   set `TRAWL_SUPPRESS_HOMELAB_NOISE=true` in `/etc/default/vector` and restart
+   Vector. This drops `serial-getty@ttyS0` events, `init` messages containing
+   `serial-getty`, and container-network churn from `networkd-dispatcher`,
+   `NetworkManager`, and `systemd-networkd`. Review the conditions in
+   `transforms.trawl_journal` before enabling them. Leave the variable unset
+   to keep these events.
+
 2. Set the environment in `/etc/default/vector`, then restrict the file
    because it holds the token:
 

@@ -30,6 +30,7 @@ ENV = dict(os.environ, VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION="true",
 ENV.pop("VECTOR_CONFIG", None)
 ENV.pop("VECTOR_CONFIG_DIR", None)
 ENV.pop("VAR", None)
+ENV.pop("TRAWL_SUPPRESS_HOMELAB_NOISE", None)
 
 
 def load(tcp):
@@ -52,7 +53,7 @@ def load(tcp):
     return config
 
 
-def fixtures():
+def fixtures(suppress):
     events, expected = [], {}
 
     def add(source, name, service, severity="info", **fields):
@@ -66,10 +67,11 @@ def fixtures():
 
     add("journald", "journal-accepted", "sshd", _SYSTEMD_UNIT="sshd.service", PRIORITY="6")
     add("journald", "journal-warning", "sshd", "warn", SYSLOG_IDENTIFIER="sshd", PRIORITY="4")
-    add("journald", "journal-rejected", None, _SYSTEMD_UNIT="serial-getty-ttyS0.service")
-    add("journald", "serial-getty restart", None, SYSLOG_IDENTIFIER="init")
+    add("journald", "serial-console", None if suppress else "serial-getty@ttyS0",
+        _SYSTEMD_UNIT="serial-getty@ttyS0.service")
+    add("journald", "serial-getty restart", None if suppress else "init", SYSLOG_IDENTIFIER="init")
     for service in ("networkd-dispatcher", "NetworkManager", "systemd-networkd"):
-        add("journald", f"veth churn {service}", None, SYSLOG_IDENTIFIER=service)
+        add("journald", f"veth churn {service}", None if suppress else service, SYSLOG_IDENTIFIER=service)
         add("journald", f"normal {service}", service, SYSLOG_IDENTIFIER=service)
     add("journald", "ufw", "ufw", "warn", message="[UFW BLOCK] SRC=192.0.2.1 DST=192.0.2.2 PROTO=TCP SPT=123 DPT=443")
     add("varlog", "varlog", "dpkg", file="/var/log/dpkg.log")
@@ -91,12 +93,15 @@ def fixtures():
     return events, expected
 
 
-def run(tcp):
+def run(tcp, suppress):
     config = load(tcp)
     # A final output must never also feed another transform.
     for name, transform in config["transforms"].items():
         assert not any(i.startswith("trawl_") for i in transform["inputs"]), name
-    events, expected = fixtures()
+    events, expected = fixtures(suppress)
+    env = dict(ENV)
+    if suppress:
+        env["TRAWL_SUPPRESS_HOMELAB_NOISE"] = "true"
     received = []
     failures = []
 
@@ -118,7 +123,7 @@ def run(tcp):
         def log_message(self, *_args):
             pass
 
-    with tempfile.TemporaryDirectory(prefix="trawl-vector-") as directory:
+    with tempfile.TemporaryDirectory(prefix="trawl-vector-", dir=ROOT / ".tmp") as directory:
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Capture)
         thread = threading.Thread(target=server.serve_forever)
         thread.start()
@@ -150,7 +155,7 @@ def run(tcp):
             for reservation in reservations:
                 reservation.close()
             with (Path(directory) / "vector.log").open("w+") as log:
-                process = subprocess.Popen([VECTOR, "--config", str(path)], env=ENV,
+                process = subprocess.Popen([VECTOR, "--config", str(path)], env=env,
                                            stdin=subprocess.PIPE, stdout=log, stderr=log, text=True)
                 deadline = time.monotonic() + 20
                 while True:
@@ -198,7 +203,8 @@ def run(tcp):
                         assert event["host"] == "ap-fixture", event
                         assert event["syslog_source_ip"] == "127.0.0.1", event
                 print(f"PASS {'UDP + TCP' if tcp else 'UDP only'}: {len(events)} synthetic inputs, "
-                      f"{len(ports)} syslog inputs, {len(received)} HTTP events, zero duplicates; five journal events filtered")
+                      f"{len(ports)} syslog inputs, {len(received)} HTTP events, zero duplicates; "
+                      f"{5 if suppress else 0} journal events filtered")
         finally:
             if process and process.poll() is None:
                 process.kill()
@@ -216,5 +222,7 @@ if __name__ == "__main__":
     print(version, flush=True)
     subprocess.run([VECTOR, "validate", "--no-environment", "--config-dir", str(CONFIG)],
                    env=ENV, check=True)
-    run(False)
-    run(True)
+    (ROOT / ".tmp").mkdir(exist_ok=True)
+    for tcp in (False, True):
+        for suppress in (False, True):
+            run(tcp, suppress)
