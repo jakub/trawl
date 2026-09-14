@@ -24,6 +24,8 @@ const SELECTORS_TS: &str = include_str!("../e2e/selectors.ts");
 
 const EDITOR_RS: &str = include_str!("../src/components/editor.rs");
 const RESULTS_TABLE_RS: &str = include_str!("../src/components/results_table.rs");
+const EXACT_TABLE_RS: &str = include_str!("../src/components/exact_table.rs");
+const CAT_CHART_RS: &str = include_str!("../src/components/cat_chart.rs");
 const HISTORY_RS: &str = include_str!("../src/pages/history.rs");
 const LAYOUT_RS: &str = include_str!("../src/pages/layout.rs");
 const RANGE_DIALOG_RS: &str = include_str!("../../fleet-ui/src/range_dialog.rs");
@@ -1139,6 +1141,28 @@ const CONTRACTS: &[Contract] = &[
         hook: "class=\"tag\"",
     },
     Contract {
+        assignment: "resultsSelectedRow: '.results-table tbody tr.selected',",
+        source_path: "src/components/results_table.rs",
+        source: RESULTS_TABLE_RS,
+        hook: "class:selected=",
+    },
+    // The panel id, which is also the target of the caret's
+    // `aria-controls` and of the "Jump to details" link. Pinned in the
+    // table rather than the page: the docked drawer is rendered beside
+    // the rows it describes, not from the page body.
+    Contract {
+        assignment: "inspector: '#search-inspector',",
+        source_path: "src/components/results_table.rs",
+        source: RESULTS_TABLE_RS,
+        hook: "panel_id=\"search-inspector\"",
+    },
+    Contract {
+        assignment: "inspectorTag: '#search-inspector button.tag',",
+        source_path: "src/components/results_table.rs",
+        source: RESULTS_TABLE_RS,
+        hook: "class=\"tag\"",
+    },
+    Contract {
         assignment: "resultsSortHeader: '.results-table th.sortable',",
         source_path: "src/components/results_table.rs",
         source: RESULTS_TABLE_RS,
@@ -1321,6 +1345,36 @@ const CONTRACTS: &[Contract] = &[
         source_path: "src/components/editor_wrap.rs",
         source: EDITOR_WRAP_RS,
         hook: "class=\"draft\"",
+    },
+    Contract {
+        assignment: "viewControl: '.tabs button.action.view',",
+        source_path: "src/pages/search.rs",
+        source: include_str!("../src/pages/search.rs"),
+        hook: "class=\"action view\"",
+    },
+    Contract {
+        assignment: "viewPanel: '#search-view',",
+        source_path: "src/pages/search.rs",
+        source: include_str!("../src/pages/search.rs"),
+        hook: "id=\"search-view\"",
+    },
+    Contract {
+        assignment: "exactTable: '.results-table.exact',",
+        source_path: "src/components/exact_table.rs",
+        source: EXACT_TABLE_RS,
+        hook: "class=\"results-table exact\"",
+    },
+    Contract {
+        assignment: "groupSearch: '.results-table.exact button.grp-search',",
+        source_path: "src/components/exact_table.rs",
+        source: EXACT_TABLE_RS,
+        hook: "class=\"grp-search\"",
+    },
+    Contract {
+        assignment: "catChart: '.cat-chart',",
+        source_path: "src/components/cat_chart.rs",
+        source: CAT_CHART_RS,
+        hook: "class=\"cat-chart\"",
     },
     // Two halves, since the class alone reaches both bypasses.
     Contract {

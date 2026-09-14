@@ -33,6 +33,7 @@ import {
   repinStatusNoJobResponse,
   QUERY_SHAPES,
   corpusQueryRowsResponse,
+  corpusStatsByResponse,
   corpusCardinalityResponse,
   corpusTopValuesResponse,
   corpusTimechartResponse,
@@ -718,6 +719,10 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
         }
         if (dsl.includes(QUERY_SHAPES.timechart)) {
           sendJson(res, 200, corpusTimechartResponse());
+          return;
+        }
+        if (dsl.includes(QUERY_SHAPES.statsBy)) {
+          sendJson(res, 200, corpusStatsByResponse());
           return;
         }
         // A pipeline this scenario has no fixture for, such as the

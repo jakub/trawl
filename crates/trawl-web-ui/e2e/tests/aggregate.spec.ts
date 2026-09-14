@@ -1,0 +1,126 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+// The aggregate presentation on the Events tab: the exact numbers, and
+// the bars beside them (ADR-0032, functional finding F02).
+//
+// THE PROPERTY UNDER TEST IS WHAT THE TABLE REFUSES TO OFFER. An
+// aggregate row has no underlying event, so it has no expansion control;
+// `count` is a number this query generated, so it has no Include. Both
+// are absences, and an absence only counts as evidence when the positive
+// case is asserted beside it — so every test that says "no control on
+// the metric" also says "a control on the group", from the same page.
+//
+// The chart is aria-hidden on purpose: the table beside it already
+// states every number in it. The assertions read the chart by class and
+// the numbers off the table, which is the same split a screen reader
+// gets.
+
+import { test, expect, resetScenario } from '../fixtures';
+import { SEL } from '../selectors';
+
+// `| stats count() by status` — the harness dispatches the `corpus`
+// scenario on that pipeline shape and answers `wire/query-stats-by.json`:
+// five groups, one negative count and one null one.
+const AGG_URL = '/search?q=service%3Dnginx%20%7C%20stats%20count()%20by%20status';
+const GROUPS = 5;
+
+test('an aggregate answers with an exact table and no expansion column', async ({ page, request }) => {
+  await resetScenario(request, 'corpus');
+  await page.goto(AGG_URL);
+
+  const table = page.locator(SEL.exactTable);
+  await expect(table).toHaveCount(1);
+  await expect(table.locator('tbody tr')).toHaveCount(GROUPS);
+
+  // No event underneath a group total, so nothing claims to reveal one.
+  await expect(page.locator(SEL.resultsExpandControl)).toHaveCount(0);
+  await expect(page.locator('.results-table th.exp-col')).toHaveCount(0);
+
+  // The two columns the query named, still sortable.
+  const headers = table.locator('thead th.sortable');
+  await expect(headers).toHaveCount(2);
+  await expect(headers.nth(0)).toContainText('status');
+  await expect(headers.nth(1)).toContainText('count');
+
+  // The filter rail stays out of an aggregate page: its values describe
+  // events, and these rows are not events.
+  await expect(page.locator(SEL.facetGroup)).toHaveCount(0);
+});
+
+test('only the grouped column offers a search, never the generated metric', async ({ page, request }) => {
+  await resetScenario(request, 'corpus');
+  await page.goto(AGG_URL);
+
+  const table = page.locator(SEL.exactTable);
+  // Exactly one control per row — the `status` cell — and none anywhere
+  // in the `count` column. That is F02: a filter on a generated metric
+  // would name a field the corpus has never held.
+  await expect(page.locator(SEL.groupSearch)).toHaveCount(GROUPS);
+  await expect(table.locator('tbody tr td:nth-child(1) button')).toHaveCount(GROUPS);
+  await expect(table.locator('tbody tr td:nth-child(2) button')).toHaveCount(0);
+
+  const first = page.locator(SEL.groupSearch).first();
+  await expect(first).toHaveAttribute('type', 'button');
+  await expect(first).toHaveAccessibleName('Search status = 200');
+});
+
+test('a group search adds one include filter to the link', async ({ page, request }) => {
+  await resetScenario(request, 'corpus');
+  await page.goto(AGG_URL);
+
+  await expect(page.locator(SEL.filterChip)).toHaveCount(0);
+  await page.locator(SEL.groupSearch).first().click();
+
+  // The URL carries the filter payload and the scope strip says so; the
+  // pipeline itself is untouched (ADR-0027).
+  await expect(page).toHaveURL(/[?&]f=v1\./);
+  await expect(page).toHaveURL(/stats/);
+  await expect(page.locator(SEL.filterChip)).toHaveCount(1);
+  await expect(page.locator(SEL.filterChip)).toContainText('status = 200');
+});
+
+test('the categorical chart draws one bar per group beside the numbers', async ({ page, request }) => {
+  await resetScenario(request, 'corpus');
+  await page.goto(AGG_URL);
+
+  const chart = page.locator(SEL.catChart);
+  await expect(chart).toHaveCount(1);
+  await expect(chart.locator('.cat-title')).toHaveText('count by status');
+
+  const bars = chart.locator('.cat-bars li');
+  await expect(bars).toHaveCount(GROUPS);
+  // The table is the accessible representation, so the bars are hidden
+  // from it rather than read out twice.
+  await expect(chart.locator('.cat-bars')).toHaveAttribute('aria-hidden', 'true');
+
+  // One negative count makes the whole track two-sided, and that row is
+  // the one drawn to the left of the midpoint.
+  await expect(chart.locator('.cat-bars.signed')).toHaveCount(1);
+  await expect(chart.locator('.cat-bars li.neg')).toHaveCount(1);
+  await expect(chart.locator('.cat-bars li.neg .cat-val')).toHaveText('-1');
+
+  // A null count is an absent measurement, not a zero-length bar: no
+  // fill is drawn at all, and the value reads as a dash.
+  const nulls = chart.locator('.cat-bars li.null');
+  await expect(nulls).toHaveCount(1);
+  await expect(nulls.locator('.cat-track i')).toHaveCount(0);
+  await expect(nulls.locator('.cat-val')).toHaveText('—');
+
+  // The largest value fills its track; every other bar is measured
+  // against it.
+  await expect(bars.nth(0).locator('.cat-val')).toHaveText('940');
+  await expect(bars.nth(0).locator('.cat-track i')).toHaveAttribute('style', 'width:50.00%');
+});
+
+test('a non-chartable aggregate renders the exact table alone', async ({ page, request }) => {
+  await resetScenario(request, 'corpus');
+  // `top` is an aggregation the categorical renderer cannot draw: it
+  // names no grouped field, so there is no axis to label.
+  await page.goto('/search?q=service%3Dnginx%20%7C%20top%2010%20host');
+
+  await expect(page.locator(SEL.exactTable)).toHaveCount(1);
+  await expect(page.locator(SEL.catChart)).toHaveCount(0);
+  await expect(page.locator('.agg-split.has-chart')).toHaveCount(0);
+});

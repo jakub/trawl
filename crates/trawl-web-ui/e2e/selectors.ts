@@ -266,6 +266,18 @@ export const SEL = {
   /// A key/value tag inside that detail cell, which adds an include
   /// filter for the field it names.
   resultsDetailTag: '.results-table td.detail button.tag',
+  /// The row the docked inspector is describing. Counting these is how
+  /// a spec says "exactly one event is open": the inspector can only
+  /// ever hold one, and the class is the visible half of that claim.
+  resultsSelectedRow: '.results-table tbody tr.selected',
+  /// The docked inspector panel itself. Matched by id because that id
+  /// is also what the caret's `aria-controls` and the "Jump to details"
+  /// link point at.
+  inspector: '#search-inspector',
+  /// One Include / Exclude / Copy control inside the inspector's
+  /// key-value grid. Told apart by accessible name, which carries the
+  /// field and value the press acts on.
+  inspectorTag: '#search-inspector button.tag',
   /// A sortable column header of the real `<table>`. `aria-sort` rides
   /// the CELL, so the assertion target is the th and not its button.
   resultsSortHeader: '.results-table th.sortable',
@@ -332,6 +344,23 @@ export const SEL = {
   /// header's draft state. Text only: it states whether the buffer and
   /// the executed query agree and navigates nothing.
   draftState: '.console-hd .draft',
+  /// crates/trawl-web-ui/src/pages/search.rs — the reading-mode
+  /// disclosure in the result header. A button, so it is the thing that
+  /// opens the popover and the thing `aria-expanded` rides.
+  viewControl: '.tabs button.action.view',
+  /// The popover it opens, holding the Details and Rows groups.
+  viewPanel: '#search-view',
+  /// crates/trawl-web-ui/src/components/exact_table.rs — the aggregate
+  /// result's exact numbers. Distinct from the raw table by class: this
+  /// one has no expansion column and no Include on a metric (F02).
+  exactTable: '.results-table.exact',
+  /// Its one control, on a grouped column only. A metric column has
+  /// none, which is the F02 fix a spec can count.
+  groupSearch: '.results-table.exact button.grp-search',
+  /// crates/trawl-web-ui/src/components/cat_chart.rs — the bars beside
+  /// that table. aria-hidden, so a spec reads it by class and reads the
+  /// numbers themselves off the table.
+  catChart: '.cat-chart',
   /// crates/trawl-web-ui/src/pages/search.rs — the first of the two
   /// keyboard bypasses, ahead of the filter rail in DOM order. Matched
   /// by href because both links share the class.
