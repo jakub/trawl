@@ -2076,7 +2076,10 @@
 .sd-overview { grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); }
 .sd-card { min-width: 0; }
 .sd-ttl .name, .sd-ttl .sub { overflow-wrap: anywhere; }
-@media (max-width: 900px) {
+/* 899.98px is the codebase's one spelling of "narrow": FacetSidebar
+ * queries the same width, so the rail's disclosure and its layout can
+ * never disagree by a pixel. */
+@media (max-width: 899.98px) {
   .search-layout { flex-direction: column; overflow-y: auto; }
   .facet-panel { width: auto; border-bottom: 1px solid var(--line); background: var(--panel); }
   .facet-panel > summary { display: list-item; padding: 10px 12px; font-size: var(--fs-ui); font-weight: 500; color: var(--ink-2); cursor: pointer; }

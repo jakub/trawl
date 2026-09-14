@@ -70,7 +70,10 @@ pub fn FacetSidebar(
 
     // Keep one facet tree mounted across both layouts. Filters themselves
     // remain URL-owned; this disclosure only controls their presentation.
-    let compact = use_media_query("(max-width: 900px)");
+    // 899.98px is the codebase's one spelling of "narrow" (`Shell` and
+    // both stylesheets query it), so the disclosure and the layout it
+    // presents can never disagree by a pixel.
+    let compact = use_media_query("(max-width: 899.98px)");
     let open = RwSignal::new(false);
     let panel = NodeRef::<leptos::html::Details>::new();
     Effect::new(move |_| {

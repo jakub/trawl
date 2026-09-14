@@ -142,6 +142,14 @@ pub fn Shell(
     // reports.
     let compact = use_media_query("(max-width: 899.98px)");
     let nav_open = RwSignal::new(false);
+    // Leaving compact docks the sidebar and unmounts the overlay, but the
+    // flag it was opened with survived, so narrowing again re-opened the
+    // overlay by itself over a page nobody had asked it about.
+    Effect::new(move |_| {
+        if !compact.get() {
+            nav_open.set(false);
+        }
+    });
     let nav_toggle = NodeRef::<Button>::new();
     let close_nav = Callback::new(move |()| nav_open.set(false));
     let toggle_nav = Callback::new(move |()| nav_open.update(|open| *open = !*open));

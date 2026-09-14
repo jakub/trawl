@@ -21,7 +21,7 @@ async function noPageOverflow(page: Page) {
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(page.viewportSize()!.width);
 }
 
-for (const width of [320, 720, 1024, 1440]) {
+for (const width of [320, 720, 900, 1024, 1440]) {
   test(`responsive search keeps navigation and actions reachable at ${width}px`, async ({ page, request }) => {
     await resetScenario(request, 'corpus');
     await page.setViewportSize({ width, height: 900 });
@@ -33,6 +33,10 @@ for (const width of [320, 720, 1024, 1440]) {
     }
     if (width >= 900) {
       for (const link of await page.locator(SEL.paletteRailLink).all()) await insideViewport(link);
+      // The sidebar is docked here, so a toggle would be a control that
+      // opens nothing. At exactly 900 the CSS used to reveal it while
+      // `Shell` still gated the overlay on 899.98 — visible and dead.
+      await expect(page.locator(SEL.navToggle)).toBeHidden();
     } else {
       // Below 900px navigation is an overlay the command bar opens.
       const toggle = page.locator(SEL.navToggle);
@@ -213,3 +217,24 @@ for (const width of [320, 720]) {
     await noPageOverflow(page);
   });
 }
+
+// The overlay's open flag survived the viewport leaving compact, so the
+// next narrowing re-opened it by itself over a page nobody had asked it
+// about.
+test('the nav overlay does not re-open by itself after a wide detour', async ({ page, request }) => {
+  await resetScenario(request, 'corpus');
+  await page.setViewportSize({ width: 720, height: 900 });
+  await page.goto('/search?q=service%3Dnginx');
+
+  await page.locator(SEL.navToggle).click();
+  await expect(page.locator('nav.rail.overlay')).toHaveCount(1);
+
+  await page.setViewportSize({ width: 1200, height: 900 });
+  await expect(page.locator('nav.rail.overlay')).toHaveCount(0);
+  await expect(page.locator(SEL.navToggle)).toBeHidden();
+
+  await page.setViewportSize({ width: 720, height: 900 });
+  await expect(page.locator(SEL.navToggle)).toBeVisible();
+  await expect(page.locator('nav.rail.overlay')).toHaveCount(0);
+  await expect(page.locator('.nav-scrim')).toHaveCount(0);
+});
