@@ -45,6 +45,7 @@
 # this path is not opened. Stdout remains active unless the TUI monitor owns it.
 # File logging starts after database and storage admission. Earlier JSON events
 # go to stderr, so a refused startup does not create files in the data root.
+# It must not name or alias the data root's EPOCH, CATALOG, or REPIN marker.
 # log_file = "/var/log/trawld.log"
 
 # ndjson query debug log (one entry per query execution). SENSITIVE:

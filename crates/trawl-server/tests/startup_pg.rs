@@ -578,6 +578,28 @@ async fn admitted_lock_and_fatal_watcher_cover_store_reconciliation() {
 }
 
 #[tokio::test]
+async fn log_marker_collision_refuses_before_database_or_storage_mutation() {
+    for marker in ["EPOCH", "CATALOG", "REPIN"] {
+        for current in [false, true] {
+            let mut fixture = Fixture::new().await;
+            fixture.current_fleet().await;
+            fixture.log_file = Some(fixture.data().join(marker));
+            if current {
+                std::fs::create_dir_all(fixture.data()).unwrap();
+                std::fs::write(fixture.data().join("EPOCH"), b"3\n").unwrap();
+            }
+            let before_files = bytes(&fixture.storage_root());
+            let before_app = rows(&fixture.app).await;
+            let before_fleet = rows(&fixture.fleet).await;
+            fixture.spawn().refused("reserved storage marker").await;
+            assert_eq!(bytes(&fixture.storage_root()), before_files);
+            assert_eq!(rows(&fixture.app).await, before_app);
+            assert_eq!(rows(&fixture.fleet).await, before_fleet);
+        }
+    }
+}
+
+#[tokio::test]
 async fn log_inside_fresh_data_root_starts_and_restarts() {
     let mut fixture = Fixture::new().await;
     fixture.log_file = Some(fixture.data().join("logs/server.json"));

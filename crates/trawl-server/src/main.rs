@@ -127,9 +127,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Validate local configuration only. Database URLs are required, but no
-/// network connectivity, credentials, or existing data are inspected.
+/// network connectivity, credentials, or stored data contents are inspected.
+/// File-log validation reads path metadata to detect marker aliases.
 fn check_config(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_file(path)?;
+    validate_file_log_config(&config)?;
     config.auth.resolve_database_url()?;
     config.storage.resolve_database_url()?;
     trawl_server::ingest::producer::Derivation::resolve(&config.ingest)
@@ -155,6 +157,10 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
         );
         e
     })?;
+
+    // Reject file-log marker collisions before either backend or filesystem
+    // initialization can change state. Telemetry-only configurations ignore it.
+    validate_file_log_config(&config)?;
 
     // Auto-detect TTY: monitor when interactive, log tail when piped.
     let monitor_active = std::io::IsTerminal::is_terminal(&std::io::stdout()) && !cli.no_monitor;
@@ -725,6 +731,109 @@ fn warn_retention_envs_without_dir(config: &Config, on_disk: &[String]) {
     }
 }
 
+const STORAGE_MARKERS: [&str; 3] = ["EPOCH", "CATALOG", "REPIN"];
+
+fn validate_file_log_config(config: &Config) -> std::io::Result<()> {
+    if !config.internal_telemetry_enabled()
+        && let Some(path) = &config.server.log_file
+    {
+        validate_log_destination(path, &config.data.base_dir())?;
+    }
+    Ok(())
+}
+
+/// Resolve existing aliases and missing suffixes without creating anything.
+/// Resolve symlinks before `..`, including dangling links to future markers.
+fn resolve_log_destination(path: &std::path::Path) -> std::io::Result<PathBuf> {
+    fn resolve(path: &std::path::Path, links: u8) -> std::io::Result<PathBuf> {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_symlink() => {
+                if links == 40 {
+                    return Err(std::io::Error::other(
+                        "too many symlinks in log or storage path",
+                    ));
+                }
+                let target = std::fs::read_link(path)?;
+                resolve(&path.parent().unwrap_or(path).join(target), links + 1)
+            }
+            Ok(_) => std::fs::canonicalize(path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let Some(parent) = path.parent() else {
+                    return Err(error);
+                };
+                let mut resolved = resolve(parent, links)?;
+                match path.components().next_back() {
+                    Some(std::path::Component::Normal(name)) => resolved.push(name),
+                    Some(std::path::Component::ParentDir) => {
+                        resolved.pop();
+                    }
+                    Some(std::path::Component::CurDir) => {}
+                    _ => return Err(error),
+                }
+                // Collapsing a missing `child/..` can reveal an existing
+                // symlink at the resulting path. Resolve that alias too.
+                if resolved == path {
+                    Ok(resolved)
+                } else {
+                    resolve(&resolved, links)
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+    resolve(&std::env::current_dir()?.join(path), 0)
+}
+
+fn marker_log_error(marker: &std::path::Path) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "server.log_file overlaps reserved storage marker {}; select a separate log file",
+            marker.display()
+        ),
+    )
+}
+
+fn validate_log_destination(
+    path: &std::path::Path,
+    data_root: &std::path::Path,
+) -> std::io::Result<PathBuf> {
+    let resolved = resolve_log_destination(path)?;
+    for name in STORAGE_MARKERS {
+        let marker = data_root.join(name);
+        if resolved == resolve_log_destination(&marker)? {
+            return Err(marker_log_error(&marker));
+        }
+    }
+    #[cfg(unix)]
+    match std::fs::metadata(&resolved) {
+        Ok(metadata) => validate_log_identity(&metadata, data_root)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    Ok(resolved)
+}
+
+#[cfg(unix)]
+fn validate_log_identity(
+    metadata: &std::fs::Metadata,
+    data_root: &std::path::Path,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+    for name in STORAGE_MARKERS {
+        let marker = data_root.join(name);
+        match std::fs::metadata(&marker) {
+            Ok(other) if metadata.dev() == other.dev() && metadata.ino() == other.ino() => {
+                return Err(marker_log_error(&marker));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 type JsonLogLayer = fmt::Layer<
     tracing_subscriber::Registry,
     fmt::format::JsonFields,
@@ -734,6 +843,7 @@ type JsonLogLayer = fmt::Layer<
 
 struct FileLog {
     path: PathBuf,
+    data_root: PathBuf,
     writer: tracing_subscriber::reload::Handle<JsonLogLayer, tracing_subscriber::Registry>,
 }
 
@@ -741,17 +851,18 @@ impl FileLog {
     /// Open only after database and storage admission. Until then, this
     /// layer sends JSON events to stderr without touching the configured path.
     fn open(self) -> Result<(), Box<dyn std::error::Error>> {
-        if let Some(parent) = self
-            .path
-            .parent()
-            .filter(|path| !path.as_os_str().is_empty())
-        {
+        let path = validate_log_destination(&self.path, &self.data_root)?;
+        if let Some(parent) = path.parent().filter(|path| !path.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)?;
         }
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&self.path)?;
+            .open(&path)?;
+        // Check the opened file too, before installing a writer that can
+        // append bytes. This also detects existing hard-link aliases.
+        #[cfg(unix)]
+        validate_log_identity(&file.metadata()?, &self.data_root)?;
         self.writer.modify(|layer| {
             *layer.writer_mut() = fmt::writer::BoxMakeWriter::new(file);
         })?;
@@ -837,6 +948,7 @@ fn init_tracing(
             telemetry: None,
             file_log: Some(FileLog {
                 path: log_path.clone(),
+                data_root: config.data.base_dir(),
                 writer,
             }),
         }
@@ -993,6 +1105,88 @@ fn resolve_path(path: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn log_destination_rejects_marker_aliases_and_keeps_normal_paths() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(data.join("nested")).unwrap();
+        let alias = tmp.path().join("alias");
+        symlink("data/nested", &alias).unwrap();
+        let log_link = tmp.path().join("server.log");
+        for marker in STORAGE_MARKERS {
+            symlink(format!("data/{marker}"), &log_link).unwrap();
+            for path in [
+                log_link.clone(),
+                tmp.path().join("missing/../server.log"),
+                alias.join(format!("../{marker}")),
+                data.join(format!("missing/../{marker}")),
+            ] {
+                let error = validate_log_destination(&path, &data).unwrap_err();
+                assert!(
+                    error.to_string().contains("reserved storage marker"),
+                    "{error}"
+                );
+                assert!(!data.join(marker).exists());
+                assert!(!data.join("missing").exists());
+            }
+            std::fs::remove_file(&log_link).unwrap();
+            std::fs::write(data.join(marker), b"marker bytes").unwrap();
+            std::fs::hard_link(data.join(marker), &log_link).unwrap();
+            assert!(validate_log_destination(&log_link, &data).is_err());
+            let opened = std::fs::File::open(&log_link).unwrap();
+            assert!(validate_log_identity(&opened.metadata().unwrap(), &data).is_err());
+            assert_eq!(std::fs::read(&log_link).unwrap(), b"marker bytes");
+            std::fs::remove_file(log_link.clone()).unwrap();
+            std::fs::remove_file(data.join(marker)).unwrap();
+        }
+        for path in [
+            data.join("server.log"),
+            data.join("logs/EPOCH"),
+            tmp.path().join("EPOCH"),
+        ] {
+            assert!(validate_log_destination(&path, &data).is_ok());
+            assert!(!path.exists());
+        }
+        symlink("data", tmp.path().join("data-alias")).unwrap();
+        assert!(
+            validate_log_destination(&data.join("EPOCH"), &tmp.path().join("data-alias")).is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn log_destination_resolution_errors_do_not_change_storage() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let cycle = tmp.path().join("cycle");
+        symlink("cycle", &cycle).unwrap();
+        assert!(validate_log_destination(&cycle, &data).is_err());
+        assert!(!data.exists());
+        let file = tmp.path().join("file");
+        std::fs::write(&file, b"preserve").unwrap();
+        assert!(validate_log_destination(&file.join("log"), &data).is_err());
+        assert_eq!(std::fs::read(&file).unwrap(), b"preserve");
+        assert!(!data.exists());
+        let blocked = tmp.path().join("blocked");
+        std::fs::create_dir(&blocked).unwrap();
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let traversal = std::fs::read_dir(&blocked);
+        let result = validate_log_destination(&blocked.join("server.log"), &data);
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // Privileged runners can traverse mode 000. Where the filesystem
+        // denies traversal, resolution must preserve that error.
+        if traversal.is_err() {
+            assert_eq!(
+                result.unwrap_err().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+        }
+        assert!(!data.exists());
+    }
 
     #[test]
     fn prepare_data_root_refuses_epoch_or_wal_before_repin_cleanup() {

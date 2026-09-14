@@ -92,6 +92,31 @@ cookie_secret_path = "~/session.key"
 }
 
 #[test]
+fn config_check_rejects_active_log_marker_collisions_without_side_effects() {
+    for name in ["EPOCH", "CATALOG", "REPIN"] {
+        for telemetry in [false, true] {
+            let document = format!(
+                "[server]\nlog_file='~/data/child/../{name}'\n[data]\npath='~/data'\n[ingest]\nenabled=true\ninternal_telemetry={telemetry}"
+            );
+            let output = check(&document);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.success(), telemetry, "{stderr}");
+            if !telemetry {
+                assert!(stderr.contains("reserved storage marker"), "{stderr}");
+            }
+        }
+    }
+    let output = check(
+        "[server]\nlog_file='~/data/logs/EPOCH'\n[data]\npath='~/data'\n[ingest]\ninternal_telemetry=false",
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn config_check_accepts_shipped_configuration() {
     for document in [
         include_str!("../../../config/trawld.toml"),
