@@ -268,7 +268,7 @@ trawl query --data "$TRAWL_TUTORIAL_DIR/tutorial.parquet" --format json \
   '* | stats count() by service'
 ```
 
-Expect `{"service":"tutorial","count":3}`. Property order can differ. See
+Expect `{"count":3,"service":"tutorial"}`. Property order can differ. See
 [Query local Parquet](/start/local-parquet/).
 
 ## Clean up
