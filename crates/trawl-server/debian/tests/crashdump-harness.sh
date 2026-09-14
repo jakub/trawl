@@ -11,10 +11,10 @@
 # real SIGSEGV, and looks at what landed in /var/lib/trawl/cores.
 #
 # Usage:
-#   crashdump-harness.sh [--deb PATH] [--scopes 1,2] [--allow-host-sysctl]
+#   crashdump-harness.sh [--packages DIRECTORY] [--scopes 1,2] [--allow-host-sysctl]
 #                        [--no-negative] [--keep] [--out FILE] [--allow-dirty]
 #
-#   --deb PATH            use an existing .deb instead of building one
+#   --packages DIRECTORY  use the three distribution .debs in DIRECTORY
 #   --scopes LIST         yama ptrace_scope values to exercise (default 1,2)
 #   --allow-host-sysctl   permit RAISING the host's kernel.yama.ptrace_scope
 #   --no-negative         skip phase E (the capability-removed control)
@@ -27,20 +27,14 @@
 # it, needs --allow-host-sysctl to raise it, and restores it from an EXIT/INT/
 # TERM trap — including under --keep.
 #
-# Two build-tool pins, both deliberate:
+# The build runs the release distribution and Debian packaging helpers inside
+# a pinned Rust container. They verify DuckDB, set a relocatable loader path,
+# and resolve system dependencies plus the exact trawl-runtime dependency.
+# The systemd assertions run on trixie; this is not the Bookworm portability test.
+# Build tools are pinned so reruns use the same packaging implementation.
 #
-#   * The .deb is built inside a pinned rust:1.98-trixie container, not on the
-#     host. cargo-deb runs dpkg-shlibdeps to resolve `depends = "$auto"`, so the
-#     resulting Depends line describes whatever glibc the build host has. Only a
-#     trixie build produces a package that installs on trixie.
-#
-#   * cargo-deb is pinned to 3.8.0, the newest release, because the point of
-#     this harness is to exercise the package release.yml actually builds.
-#     release.yml installs cargo-deb through taiki-e/install-action with no
-#     version, so it gets the newest one; a harness pinned to an older release
-#     would happily certify a package nobody ships. It is pinned rather than
-#     floating so a run is reproducible, and moving the pin forward is a
-#     deliberate step that comes with a full run.
+#   * cargo-deb is pinned to 3.8.0. Updating it requires a full run because its
+#     generated maintainer-script behavior is part of what this tests.
 #
 #     3.8.0 is also why debian/trawl.sysusers and debian/trawl.tmpfiles are
 #     spelled without .conf. It generates `systemd-sysusers <name>` and
@@ -65,6 +59,7 @@ readonly RUST_IMAGE="rust:1.98-trixie@sha256:620dbcd124499c59e2406d3741574b5c583
 readonly DEBIAN_IMAGE="debian:trixie@sha256:f324c7ff54321e8d9c588493a20244965938ce0aa50bbd1022d38010e9ffc4b1"
 readonly POSTGRES_IMAGE="postgres:18@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280"
 readonly CARGO_DEB_VERSION="3.8.0"
+readonly CARGO_ZIGBUILD_VERSION="0.23.4"
 
 readonly BUILDER_IMAGE="trawl-crashdump-builder:cargo-deb-${CARGO_DEB_VERSION}"
 readonly NODE_IMAGE="trawl-crashdump-node:trixie"
@@ -88,7 +83,7 @@ readonly PTRACE_CAP_BIT=19
 
 # docker cp cannot write into a tmpfs mount, and the node container runs with
 # --tmpfs /tmp, so the .deb is staged under /root instead.
-readonly DEB_IN_NODE="/root/trawl-server.deb"
+readonly PACKAGES_IN_NODE="/root/trawl-packages"
 
 # How long to wait for a dump to appear after a fault. RestartSec=5s, so this
 # also has to cover the restart that follows.
@@ -118,6 +113,7 @@ sudo systemctl daemon-reload && sudo systemctl restart trawld'
 
 # ------------------------------------------------------------------- options --
 
+PACKAGES=""
 DEB=""
 SCOPES_ARG="1,2"
 ALLOW_HOST_SYSCTL=0
@@ -129,10 +125,10 @@ ARGV=("$@")
 
 usage() {
   cat <<'EOF'
-crashdump-harness.sh [--deb PATH] [--scopes 1,2] [--allow-host-sysctl]
+crashdump-harness.sh [--packages DIRECTORY] [--scopes 1,2] [--allow-host-sysctl]
                      [--no-negative] [--keep] [--out FILE] [--allow-dirty]
 
-  --deb PATH            use an existing .deb instead of building one
+  --packages DIRECTORY  use the three distribution .debs in DIRECTORY
   --scopes LIST         yama ptrace_scope values to exercise (default 1,2)
   --allow-host-sysctl   permit RAISING the host's kernel.yama.ptrace_scope
   --no-negative         skip phase E (the capability-removed control)
@@ -144,7 +140,7 @@ EOF
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --deb) DEB="${2:?--deb needs a path}"; shift 2 ;;
+    --packages) PACKAGES="${2:?--packages needs a directory}"; shift 2 ;;
     --scopes) SCOPES_ARG="${2:?--scopes needs a list}"; shift 2 ;;
     --allow-host-sysctl) ALLOW_HOST_SYSCTL=1; shift ;;
     --no-negative) RUN_NEGATIVE=0; shift ;;
@@ -586,16 +582,31 @@ fi
 
 phase "2 build"
 
-if [[ -n "$DEB" ]]; then
-  [[ -f "$DEB" ]] || die "--deb $DEB does not exist"
-  DEB=$(cd "$(dirname "$DEB")" && pwd)/$(basename "$DEB")
-  note "skipped: using --deb $DEB"
+if [[ -n "$PACKAGES" ]]; then
+  [[ -d "$PACKAGES" ]] || die "--packages $PACKAGES does not exist"
+  PACKAGES=$(cd "$PACKAGES" && pwd)
+  note "skipped: using --packages $PACKAGES"
 else
   target_dir="$repo_root/target/deb-harness"
+  case "$(uname -m)" in
+    x86_64) build_target=x86_64-unknown-linux-gnu ;;
+    aarch64) build_target=aarch64-unknown-linux-gnu ;;
+    *) die "unsupported distribution build host: $(uname -m)" ;;
+  esac
+  PACKAGES="$target_dir/$build_target/debian"
 
   printf '\n$ docker build %s   # FROM %s\n' "$BUILDER_IMAGE" "$RUST_IMAGE"
   docker build -t "$BUILDER_IMAGE" -q - <<EOF | sed 's/^/  /'
 FROM $RUST_IMAGE
+RUN apt-get update && apt-get install -y --no-install-recommends python3 curl dpkg-dev \
+ && rm -rf /var/lib/apt/lists/*
+# Only amd64 uses Zig; arm64 uses the native GNU compiler in the Rust image.
+RUN if [ "\$(uname -m)" = x86_64 ]; then \
+      curl --proto '=https' --tlsv1.2 -fLsS https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz -o /tmp/zig.tar.xz \
+      && echo '70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00  /tmp/zig.tar.xz' | sha256sum --check --strict \
+      && mkdir /opt/zig && tar -xf /tmp/zig.tar.xz --strip-components=1 -C /opt/zig \
+      && ln -s /opt/zig/zig /usr/local/bin/zig && rm /tmp/zig.tar.xz; fi
+RUN cargo install cargo-zigbuild --version $CARGO_ZIGBUILD_VERSION --locked
 RUN rustup component add clippy rustfmt rust-analyzer
 RUN cargo install cargo-deb --version $CARGO_DEB_VERSION --locked \\
  && chmod -R a+rwX "\$CARGO_HOME" "\$RUSTUP_HOME"
@@ -627,46 +638,62 @@ EOF
   fi
 
   mkdir -p "$target_dir"
-  # Exactly the four binaries crates/trawl-server/Cargo.toml lists as assets.
-  run docker run --rm --user "$(id -u):$(id -g)" \
-    -v "$repo_root:/w" -w /w \
-    -v "$CARGO_VOLUME:/usr/local/cargo/registry" \
-    -e CARGO_TARGET_DIR=/w/target/deb-harness \
-    "$BUILDER_IMAGE" \
-    cargo build --release -p trawl-server -p trawl-admin -p fleet-admin -p trawl-web \
-      --bin trawld --bin trawl-admin --bin fleet-admin --bin trawl-web
+  # Preserve linked-worktree provenance without permitting Git metadata writes.
+  common_git=$(git -C "$repo_root" rev-parse --path-format=absolute --git-common-dir)
+  builder=(docker run --rm --user "$(id -u):$(id -g)"
+    -v "$repo_root:$repo_root" -w "$repo_root"
+    -v "$common_git:$common_git:ro"
+    -v "$CARGO_VOLUME:/usr/local/cargo/registry"
+    -e "CARGO_TARGET_DIR=$target_dir" -e "XDG_CACHE_HOME=$target_dir/cache" "$BUILDER_IMAGE")
+  # Build all five distribution executables, including the standalone CLI.
+  run "${builder[@]}" bash scripts/release/build-distribution.sh \
+    "$repo_root" "$build_target" "$target_dir/runtime"
 
   # The target directory is reused across runs, so a version bump leaves the
   # previous release's .deb sitting beside the new one. Picking one of those with
   # `find -print -quit` is picking by readdir order, which would happily certify
   # a package this run did not build. Clear the output directory first, then
-  # require exactly one candidate afterwards.
-  if compgen -G "$target_dir/debian/*.deb" >/dev/null; then
-    note "clearing .deb files left in $target_dir/debian by an earlier run"
-    rm -f "$target_dir"/debian/*.deb
+  # require exactly the three matching distribution packages afterwards.
+  if compgen -G "$PACKAGES/*.deb" >/dev/null; then
+    note "clearing .deb files left in $PACKAGES by an earlier run"
+    rm -f "$PACKAGES"/*.deb
   fi
 
-  run docker run --rm --user "$(id -u):$(id -g)" \
-    -v "$repo_root:/w" -w /w \
-    -v "$CARGO_VOLUME:/usr/local/cargo/registry" \
-    -e CARGO_TARGET_DIR=/w/target/deb-harness \
-    "$BUILDER_IMAGE" \
-    cargo deb -p trawl-server --no-build --no-strip
+  run "${builder[@]}" python3 scripts/release/package-debian.py --source "$repo_root" \
+    --binaries "$target_dir/$build_target/release" --runtime "$target_dir/runtime" \
+    --output "$PACKAGES" --target "$build_target"
 
-  mapfile -t deb_candidates < <(find "$target_dir/debian" -maxdepth 1 -name '*.deb' | sort)
-  case ${#deb_candidates[@]} in
-    0) die "cargo deb produced no package under $target_dir/debian" ;;
-    1) DEB="${deb_candidates[0]}" ;;
-    *) printf '%s\n' "${deb_candidates[@]}" | sed "s|$repo_root|\$REPO|"
-       die "${#deb_candidates[@]} .deb files under $target_dir/debian; refusing to guess which one this run built" ;;
-  esac
 fi
 
-note "installing $(basename "$DEB")"
-
-printf '\n$ sha256sum %s\n' "$(rel "$DEB")"
-sha256sum "$DEB" | sed "s|$repo_root|\$REPO|"
-run dpkg-deb -f "$DEB" Package Version Architecture Depends
+mapfile -t deb_candidates < <(find "$PACKAGES" -maxdepth 1 -name '*.deb' | sort)
+[[ ${#deb_candidates[@]} == 3 ]] || die "expected exactly three distribution .debs in $PACKAGES"
+declare -A package_paths=()
+package_version=""
+package_arch=""
+for candidate in "${deb_candidates[@]}"; do
+  name=$(dpkg-deb -f "$candidate" Package)
+  version=$(dpkg-deb -f "$candidate" Version)
+  arch=$(dpkg-deb -f "$candidate" Architecture)
+  case "$name" in
+    trawl-cli|trawl-server|trawl-runtime) ;;
+    *) die "unexpected distribution package $name" ;;
+  esac
+  [[ -z "${package_paths[$name]:-}" ]] || die "duplicate distribution package $name"
+  package_paths[$name]="$candidate"
+  package_version="${package_version:-$version}"
+  package_arch="${package_arch:-$arch}"
+  [[ "$version" == "$package_version" && "$arch" == "$package_arch" ]] \
+    || die "distribution packages have different versions or architectures"
+  if [[ "$name" != trawl-runtime ]]; then
+    depends=$(dpkg-deb -f "$candidate" Depends)
+    [[ ", $depends," == *", trawl-runtime (= $version),"* ]] \
+      || die "$name does not require the exact matching trawl-runtime"
+  fi
+  note "installing $(basename "$candidate")"
+  sha256sum "$candidate" | sed "s|$repo_root|\$REPO|"
+  run dpkg-deb -f "$candidate" Package Version Architecture Depends
+done
+DEB="${package_paths[trawl-server]}"
 
 # ----------------------------------------------------------- phase 3: bring up --
 
@@ -760,22 +787,29 @@ install_dump_reader
 phase "4 install"
 
 # /tmp in the node is a docker tmpfs, which docker cp cannot write into.
-run docker cp "$DEB" "$NODE:$DEB_IN_NODE"
+run docker exec "$NODE" mkdir -p "$PACKAGES_IN_NODE"
+for name in trawl-runtime trawl-cli trawl-server; do
+  run docker cp "${package_paths[$name]}" "$NODE:$PACKAGES_IN_NODE/$name.deb"
+done
 
 # `set -o pipefail` inside the container: a bash -c does not inherit it, so
 # without this the pipeline reports tail's status and a failed configure would
 # read as a clean install. That is exactly how the cargo-deb 3.8 sysusers
 # regression could have slipped through every assertion below.
 nsh "set -o pipefail
-DEBIAN_FRONTEND=noninteractive apt-get install -y $DEB_IN_NODE 2>&1 | tail -8"
+DEBIAN_FRONTEND=noninteractive apt-get install -y $PACKAGES_IN_NODE/*.deb 2>&1 | tail -8"
 
 # apt's exit status is one witness; dpkg's own record of the package state is a
 # second, independent one. A half-configured package is `install ok half-configured`
 # here, whatever apt returned.
-install_status=$(nshq "dpkg-query -W -f='\${Status}' trawl-server")
-printf '\n$ dpkg-query -W -f=%s trawl-server\n%s\n' "'\${Status}'" "$install_status"
-[[ "$install_status" == "install ok installed" ]] \
-  || die "trawl-server is '$install_status', not 'install ok installed' — the package did not configure"
+for name in trawl-runtime trawl-cli trawl-server; do
+  install_status=$(nshq "dpkg-query -W -f='\${Status}' $name")
+  printf '\n$ dpkg-query -W -f=%s %s\n%s\n' "'\${Status}'" "$name" "$install_status"
+  [[ "$install_status" == "install ok installed" ]] \
+    || die "$name is '$install_status', not 'install ok installed' — the package did not configure"
+done
+run docker exec "$NODE" dpkg-query -S /usr/lib/trawl/libduckdb.so
+run docker exec "$NODE" trawl --version
 
 printf '\n$ dpkg-deb -c %s | grep examples/crashdump.conf\n' "$(basename "$DEB")"
 dpkg-deb -c "$DEB" | grep 'examples/crashdump.conf' \
@@ -895,10 +929,10 @@ phase "6 B enable"
 # Verbatim from the docs. If the page changes, this stops rather than silently
 # testing something the operator was never told to run.
 docs_block=$(awk '
-  /^To enable:$/ { found = 1; next }
-  found && /^```bash$/ { inblock = 1; next }
-  inblock && /^```$/ { exit }
-  inblock { print }
+  /^### Enable capture on Debian$/ { found = 1; next }
+  found && /^   ```bash$/ { inblock = 1; next }
+  inblock && /^   ```$/ { exit }
+  inblock { sub(/^   /, ""); print }
 ' "$DOCS_PAGE")
 if [[ "$docs_block" != "$ENABLE_CMD" ]]; then
   printf '\n--- docs %s ---\n%s\n--- harness ---\n%s\n' "$(rel "$DOCS_PAGE")" "$docs_block" "$ENABLE_CMD"
@@ -1178,10 +1212,10 @@ else
 
 # Verbatim from the docs, same drift guard as the enable command.
 docs_disable=$(awk '
-  /^To disable, remove the file and restart:$/ { found = 1; next }
-  found && /^```bash$/ { inblock = 1; next }
-  inblock && /^```$/ { exit }
-  inblock { print }
+  /^### Disable capture and delete dumps$/ { found = 1; next }
+  found && /^   ```bash$/ { inblock = 1; next }
+  inblock && /^   ```$/ { exit }
+  inblock { sub(/^   /, ""); print }
 ' "$DOCS_PAGE")
 if [[ "$docs_disable" != "$DISABLE_CMD" ]]; then
   printf '\n--- docs %s ---\n%s\n--- harness ---\n%s\n' "$(rel "$DOCS_PAGE")" "$docs_disable" "$DISABLE_CMD"
