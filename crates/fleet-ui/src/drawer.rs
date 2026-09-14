@@ -15,7 +15,9 @@
 //! **Presentation.** `docked` picks it. Undocked (the default) is the
 //! right-slide overlay: a scrim host, a `Capture`
 //! [`overlay`](crate::overlay) layer, initial focus into the panel and
-//! restore to the opener on close. Docked is the same header, tabs and
+//! restore to the opener on close. Both presentations restore the
+//! opener; only the undocked one takes focus on open, and only it can
+//! read the answer off its layer. Docked is the same header, tabs and
 //! body rendered in flow beside its list: the host collapses to
 //! `display: contents`, there is no scrim, and no overlay layer is
 //! registered (ADR-0032). The children mount once and stay mounted when
@@ -238,10 +240,17 @@ fn overlay_presentation(
         if let Some(live) = layer.get_value() {
             live.release();
             layer.set_value(None);
-            opener.set_value(None);
             focus_done.set_value(false);
         }
     };
+
+    // The opener is recorded for BOTH presentations. A docked panel
+    // holds no layer, so the layer's own restore never runs for it and
+    // closing one dropped focus to <body> — the keyboard lost the page.
+    // Whatever had focus when the panel mounted is the place to go back
+    // to: the row control that was clicked, or the results region a
+    // keyboard selection was made from.
+    opener.set_value(document().active_element());
 
     // An overlay drawer registers synchronously at mount, exactly where
     // `use_overlay_layer_with` did: the stack is LIFO, so its order has
@@ -270,23 +279,44 @@ fn overlay_presentation(
         }
     });
 
+    let restore_opener = move || {
+        if let Some(back) = opener
+            .get_value()
+            .and_then(|el| el.dyn_into::<web_sys::HtmlElement>().ok())
+            && back.is_connected()
+        {
+            let _ = back.focus();
+        }
+    };
+
     on_cleanup(move || {
         // Ownership must be read before release: a drawer unmounting
-        // beneath a live modal doesn't own focus and must not restore,
-        // and a docked drawer holds no layer to restore from at all.
+        // beneath a live modal doesn't own focus and must not restore.
         let Some(live) = layer.get_value() else {
+            // Docked. There is no layer, so the question the layer
+            // answers — "is this panel where focus lives?" — is asked of
+            // the document instead: focus is still inside the panel that
+            // is going away, or it has already fallen to <body>. Both
+            // are the case where leaving it alone loses the keyboard.
+            // Anything else (a click on another row, a page turn) put
+            // focus somewhere deliberate and must not be overruled.
+            let active = document().active_element();
+            let inside = panel_ref
+                .get_untracked()
+                .is_some_and(|panel| panel.contains(active.as_deref()));
+            let orphaned = active
+                .as_ref()
+                .is_none_or(|el| el.tag_name().eq_ignore_ascii_case("body"));
+            if inside || orphaned {
+                restore_opener();
+            }
             return;
         };
         let owned = live.owns_focus();
         live.release();
         layer.set_value(None);
-        if owned
-            && let Some(back) = opener
-                .get_value()
-                .and_then(|el| el.dyn_into::<web_sys::HtmlElement>().ok())
-            && back.is_connected()
-        {
-            let _ = back.focus();
+        if owned {
+            restore_opener();
         }
     });
 

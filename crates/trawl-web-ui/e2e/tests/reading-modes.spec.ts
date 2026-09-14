@@ -116,6 +116,40 @@ test('inspector mode opens the selected event beside the table', async ({ page, 
   await expect(page.locator(SEL.resultsSelectedRow)).toHaveCount(0);
 });
 
+// A docked drawer registers no overlay layer, so the layer's own
+// focus restore never ran for it and closing one dropped focus to
+// <body>: the keyboard lost the page entirely. The opener is recorded
+// at mount for both presentations now, and the proof is that the next
+// keystroke still reaches the table.
+test('closing a docked inspector hands focus back to the control that opened it', async ({ page, request }) => {
+  await resetScenario(request, 'corpus');
+  await page.goto(CORPUS_URL);
+  await pickMode(page, 'Inspector');
+
+  const second = page.locator(SEL.resultsExpandControl).nth(1);
+  await second.click();
+  await expect(page.locator(SEL.inspector)).toContainText('Event 2');
+
+  await page.locator(`${SEL.inspector} ${SEL.drawerClose}`).click();
+  await expect(page.locator(SEL.inspector)).toHaveCount(0);
+  await expect(second).toBeFocused();
+
+  // Still in the table: j walks from the top of the sorted order.
+  await page.keyboard.press('j');
+  await expect(page.locator(SEL.inspector)).toContainText('Event 1');
+
+  // Escape pressed from inside the panel goes back the same way.
+  const third = page.locator(SEL.resultsExpandControl).nth(2);
+  await third.click();
+  await expect(page.locator(SEL.inspector)).toContainText('Event 3');
+  await page.locator(`${SEL.inspector} ${SEL.drawerClose}`).focus();
+  await page.keyboard.press('Escape');
+  await expect(page.locator(SEL.inspector)).toHaveCount(0);
+  await expect(third).toBeFocused();
+  await page.keyboard.press('j');
+  await expect(page.locator(SEL.inspector)).toContainText('Event 1');
+});
+
 test('j and k walk the sorted order without moving the open event', async ({ page, request }) => {
   await resetScenario(request, 'corpus');
   await page.goto(CORPUS_URL);
