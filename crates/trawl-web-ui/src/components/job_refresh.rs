@@ -76,6 +76,12 @@ where
         if !visible || busy.replace(true) {
             return;
         }
+        // Only successful data is useful while a retry is pending. Clear
+        // an initial failure so the canonical loading state replaces Retry.
+        if !matches!(data.get_untracked(), Some(Ok(_))) {
+            data.set(None);
+            error.set(None);
+        }
         let generation = desired.get();
         let live = alive.clone();
         let busy = busy.clone();

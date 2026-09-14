@@ -5,7 +5,7 @@
 mod common;
 
 #[test]
-fn moved_range_rules_keep_their_exact_declarations() {
+fn range_rules_match_the_documented_capture() {
     let golden = common::rules(include_str!("fixtures/premigration-range.css"));
     assert_eq!(golden.len(), 27, "the whole captured range rule set");
     let css = include_str!("../styles/fleet-ui.css");

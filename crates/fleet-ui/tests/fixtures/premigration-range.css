@@ -1,13 +1,17 @@
 /* Captured from trawl-web-ui/styles/main.css at d53ee232.
- * The shared disabled selector is split without changing its declarations. */
+ * The shared disabled selector is split without changing its declarations.
+ * Pre-1.0: update the three trigger sizing rules to keep Haul reachable with
+ * long absolute ranges; browser geometry checks cover 320-1440px in both themes. */
 /* Date range — single trigger (grafana-style); all presets live in the
  * popover. The trigger is a <button> (ADR-0029): it already declares its
  * own background, border and colour, so `font: inherit` is the whole
  * reset the user-agent chrome needs. */
-.daterange { position: relative; display: flex; align-items: stretch; }
+.daterange { position: relative; display: flex; align-items: stretch; min-width: 0; }
 .daterange .dr-trigger { flex: 1; }
 .dr-trigger {
   display: flex;
+  min-width: 0;
+  max-width: 100%;
   align-items: center;
   justify-content: center;
   gap: 6px;
@@ -29,6 +33,7 @@
 /* Absolute-range labels ("2026-07-16… → now") can exceed the column —
  * ellipsize instead of blowing the layout out. */
 .dr-trigger span {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
 }

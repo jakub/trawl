@@ -163,7 +163,13 @@ test('live-tail wraps the whole message including unbroken suffixes', async ({ p
   expect(geometry.height).toBeGreaterThan(60);
   expect(geometry.suffixFits).toBe(true);
   const stream = page.getByRole('region', { name: 'Live tail messages', exact: true });
+  // This finite response disconnects after its one event. Retry is now a
+  // reachable control between Pause and the retained messages.
+  const retry = page.getByRole('button', { name: 'Retry live stream', exact: true });
+  await expect(retry).toBeVisible();
   await page.getByRole('button', { name: 'Pause', exact: true }).focus();
+  await page.keyboard.press('Tab');
+  await expect(retry).toBeFocused();
   await page.keyboard.press('Tab');
   await expect(stream).toBeFocused();
   await page.keyboard.press('End');

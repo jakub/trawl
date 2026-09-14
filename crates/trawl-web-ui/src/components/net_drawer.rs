@@ -882,11 +882,12 @@ fn RunsPane(
     view! {
         <div>
             {move || refresh_error.get().map(|e| view! { <p role="status">{e}</p> })}
-            {move || match runs.get() {
-                None => Some(view! { <p role="status">"Loading runs…"</p> }.into_any()),
-                Some(Err(_)) => Some(view! { <p role="alert">"Could not load runs." <button on:click=move |_| retry.run(())>"Retry"</button></p> }.into_any()),
-                Some(Ok(_)) => None,
-            }}
+            <Loaded
+                state=Signal::derive(move || LoadState::from_resource(runs.get().map(|result| result.map(|_| ()))))
+                label="runs"
+                retry=retry
+                render=Box::new(|()| ().into_any())
+            />
             {move || {
                 let data = runs.get().and_then(Result::ok).map(|(_, r)| r.runs.iter().rev()
                     .map(|r| r.row_count.unwrap_or(0) as u64).collect::<Vec<_>>()).unwrap_or_default();

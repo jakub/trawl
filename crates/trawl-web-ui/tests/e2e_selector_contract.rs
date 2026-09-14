@@ -1517,13 +1517,13 @@ const CONTRACTS: &[Contract] = &[
         assignment: "netRenameName: 'Rename {name}',",
         source_path: "src/components/net_drawer.rs",
         source: NET_DRAWER_RS,
-        hook: "format!(\"Rename {name}\")",
+        hook: "aria-label=move || format!(\"Rename {}\", saved.get().map_or_else(|| \"deleted net\".to_string(), |n| n.name))",
     },
     Contract {
         assignment: "netRenameInputName: 'New name for {name}',",
         source_path: "src/components/net_drawer.rs",
         source: NET_DRAWER_RS,
-        hook: "format!(\"New name for {name}\")",
+        hook: "aria-label=move || format!(\"New name for {}\", saved.get().map_or_else(|| \"deleted net\".to_string(), |n| n.name))",
     },
     Contract {
         assignment: "rangeDialogName: 'Time range',",
