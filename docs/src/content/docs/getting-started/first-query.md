@@ -1,17 +1,17 @@
 ---
 title: Your first query
-description: Start a private Trawl server, send three events, and check an exact query result.
+description: Start a private Trawl server and browser UI, send three events, and check an exact query result.
 ---
 
 In this tutorial we start a private Trawl server on your Linux machine, send it
-three events, and check an exact answer from the CLI, the TUI, and a local
-Parquet export. Allow about 15 minutes after installation.
+three events, and check an exact answer in the browser, CLI, TUI, and a local
+Parquet export. Allow about 20 minutes after installation.
 
 You need:
 
 - Linux with Bash, Docker, Python 3, and `curl`.
-- `trawl`, `trawld`, `trawl-admin`, and `fleet-admin` in your `PATH`. See [Installation](/getting-started/).
-- Ports 55439 and 15514 free.
+- `trawl`, `trawld`, `trawl-web`, `trawl-admin`, and `fleet-admin` in your `PATH`. See [Installation](/getting-started/).
+- Ports 55439, 15514, and 18090 free, and a browser on this machine.
 
 Keep the first terminal open, because later steps reuse its variables. Do not
 reuse an existing database or data directory.
@@ -73,7 +73,8 @@ name.
 ```bash
 fleet-admin roles create --name tutorial-reader \
   --perm trawl:query --perm trawl:schema_read --perm trawl:validate \
-  --perm trawl:export --perm trawl:stream --perm trawl:saved_query
+  --perm trawl:export --perm trawl:stream --perm trawl:saved_query \
+  --perm trawl:query_cancel
 fleet-admin roles create --name tutorial-ingest --perm trawl:ingest
 fleet-admin keys create --name tutorial-reader --kind human \
   --role tutorial-reader > "$TRAWL_TUTORIAL_DIR/reader.token"
@@ -87,10 +88,14 @@ redirect keeps it in a private file.
 
 ## Start the server
 
-Generate a self-signed certificate and write the configuration.
+Generate a self-signed certificate and a persistent browser-session key,
+then write the configuration shared by the two daemons. The private working
+directory and `umask 077` protect the session key.
 
 ```bash
 trawl-admin tls generate --output-dir "$TRAWL_TUTORIAL_DIR/tls"
+python3 -c 'import secrets, sys; sys.stdout.buffer.write(secrets.token_bytes(32))' \
+  > "$TRAWL_TUTORIAL_DIR/web.cookie"
 cat > "$TRAWL_TUTORIAL_DIR/trawld.toml" <<TOML
 [server]
 http_addr = "127.0.0.1:15514"
@@ -110,6 +115,13 @@ database_url = "postgres://trawl:$TRAWL_APP_PASSWORD@127.0.0.1:55439/trawl"
 [ingest]
 enabled = true
 internal_telemetry = false
+
+[web]
+bind_addr = "127.0.0.1:18090"
+upstream_url = "https://localhost:15514"
+public_origins = ["http://localhost:18090"]
+cookie_secret_path = "$TRAWL_TUTORIAL_DIR/web.cookie"
+allow_insecure_cookies = true
 TOML
 printf 'env -u FLEET_DATABASE_URL -u TRAWL_DATABASE_URL -u TRAWL_HTTP_ADDR trawld --config %q\n' "$TRAWL_TUTORIAL_DIR/trawld.toml"
 ```
@@ -124,9 +136,31 @@ curl --fail --silent --show-error \
   https://localhost:15514/api/v1/health
 ```
 
-Expect a JSON object whose `status` is `ok`. If not, read the error in the
+Expect a JSON object whose `status` and every entry in `checks` are `ok`.
+HTTP 200 alone can report degraded dependencies. If not, read the error in the
 second terminal. A connection error points at PostgreSQL, an authentication
 error at a database login or the migrations.
+
+## Start the browser UI
+
+Print the proxy command in the first terminal:
+
+```bash
+printf 'env -u FLEET_SESSION_AEAD_KEY -u FLEET_SESSION_PUBLIC_ORIGINS -u FLEET_SESSION_COOKIE_DOMAIN -u FLEET_SESSION_COOKIE_PATH -u FLEET_SESSION_COOKIE_SECURE -u TRAWL_WEB_BIND_ADDR TRAWL_WEB_INSECURE_UPSTREAM=1 trawl-web --config %q\n' "$TRAWL_TUTORIAL_DIR/trawld.toml"
+```
+
+Run the printed command in a third terminal and leave it running. Expect a
+`trawl-web listening` message for `127.0.0.1:18090`.
+`TRAWL_WEB_INSECURE_UPSTREAM=1` lets this local proxy contact the tutorial's
+self-signed API. `allow_insecure_cookies = true` permits browser sessions
+over local HTTP. Permanent installations need the [TLS and browser-origin setup](/operate/access/).
+
+The two URLs serve different clients:
+
+| URL | Use |
+| --- | --- |
+| `https://localhost:15514` | HTTPS API for the CLI and event senders |
+| `http://localhost:18090` | Browser UI |
 
 ## Configure the client
 
@@ -197,6 +231,21 @@ Expect one row with `message` equal to `connection refused` and `duration`
 equal to `1500`. Trawl derived `_severity` from `level`. [Build a query](/use/query-tutorial/)
 continues from here.
 
+## Run the same query in the browser
+
+1. Open `http://localhost:18090`. Use `localhost` as written: `127.0.0.1`
+   is a different browser origin.
+2. Open the private file `$TRAWL_TUTORIAL_DIR/reader.token` in a text editor,
+   copy its contents into the API-key field, and sign in. Use the personal
+   reader key; the ingest key only sends events.
+3. In Search, enter `service=tutorial last=1h | stats count() by service`
+   and select **Haul**. Expect one row with service `tutorial` and count `3`.
+4. Run `service=tutorial _severity>=error last=1h | table message, duration`.
+   Expect `connection refused` and `1500`, as in the CLI.
+
+The [browser guide](/reference/web-ui/) explains the time range, filters,
+live mode, and saved queries.
+
 ## Open the TUI
 
 ```bash
@@ -224,7 +273,7 @@ Expect one row with `tutorial` and `3`, then `1 row(s)`. See
 
 ## Clean up
 
-Stop `trawld` with Ctrl+C in its terminal. Remove the container and its
+Stop `trawl-web` and `trawld` with Ctrl+C in their terminals. Remove the container and its
 anonymous volume:
 
 ```bash
@@ -241,6 +290,6 @@ unset TRAWL_PG_ADMIN_PASSWORD TRAWL_FLEET_PASSWORD TRAWL_APP_PASSWORD TRAWL_TUTO
 
 ## What's next
 
-- [Search in the browser](/reference/web-ui/) once you have a browser URL.
+- [Search in the browser](/reference/web-ui/) explains the other search controls.
 - [Vector integration](/getting-started/vector-integration/) sends logs continuously.
 - [Share searches and export results](/use/sharing-export/) keeps or shares an answer.
