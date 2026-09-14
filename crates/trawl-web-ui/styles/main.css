@@ -477,7 +477,7 @@
 /* CM6's injected base theme puts `font-family: monospace` directly on
  * .cm-scroller, which beats the stack inherited from .cm-editor above
  * (injected <style> comes after this sheet in source order). Re-state
- * the stack at higher specificity so Geist Mono actually renders. */
+ * the stack at higher specificity so Chivo Mono actually renders. */
 .dsl-editor .cm-editor .cm-scroller { overflow: auto; max-height: 40vh; font-family: var(--font-mono); }
 /* Same story for the gutter. CM6's base theme paints the line-number
  * rail with an unconditional LIGHT palette — `#f5f5f5` rail, `#ddd`

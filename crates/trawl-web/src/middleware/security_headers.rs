@@ -29,8 +29,8 @@ pub type HeaderLayer = SetResponseHeaderLayer<HeaderValue>;
 /// - `style-src 'self' 'unsafe-inline'`: inline style attributes are used by
 ///   some component patterns (codemirror does this); all styles are otherwise
 ///   same-origin
-/// - `font-src 'self'`: fleet-ui's committed Geist WOFF2 assets are served
-///   from the SPA distribution
+/// - `font-src 'self'`: fleet-ui's committed Albert Sans and Chivo Mono
+///   TrueType assets are served from the SPA distribution
 /// - `connect-src 'self'`: fetch/XHR/SSE only to same origin
 /// - `img-src 'self' data:`: allow data URLs for inline SVGs
 /// - `frame-ancestors 'none'`: disallow embedding in iframes (belt and

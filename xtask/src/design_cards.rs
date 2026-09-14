@@ -99,10 +99,8 @@ struct Card {
 pub fn generate(css_path: &Path, fonts_dir: &Path, out_dir: &Path) -> ExitCode {
     let assets = fs::read_to_string(css_path)
         .and_then(|css| inline_fonts(css, fonts_dir))
-        .and_then(|css| {
-            fs::read_to_string(fonts_dir.join("OFL.txt")).map(|license| (css, license))
-        });
-    let (css, font_license) = match assets {
+        .and_then(|css| inline_licenses(fonts_dir).map(|license| (css, license)));
+    let (css, font_licenses) = match assets {
         Ok(assets) => assets,
         Err(e) => {
             eprintln!("xtask: failed to load design assets: {e}");
@@ -129,7 +127,7 @@ pub fn generate(css_path: &Path, fonts_dir: &Path, out_dir: &Path) -> ExitCode {
 
     for card in &cards {
         let path = out_dir.join(format!("{}.html", card.slug));
-        let html = render_card(card, &css, &font_license);
+        let html = render_card(card, &css, &font_licenses);
         if let Err(e) = fs::write(&path, html) {
             eprintln!("xtask: failed to write {}: {e}", path.display());
             return ExitCode::FAILURE;
@@ -143,7 +141,7 @@ pub fn generate(css_path: &Path, fonts_dir: &Path, out_dir: &Path) -> ExitCode {
 /// stylesheet's dist-relative font URLs with data URLs sourced from the exact
 /// committed fleet-ui files. The Trunk consumers copy those same files.
 fn inline_fonts(mut css: String, fonts_dir: &Path) -> std::io::Result<String> {
-    for name in ["Geist-Variable.woff2", "GeistMono-Variable.woff2"] {
+    for name in ["AlbertSans-Variable.ttf", "ChivoMono-Variable.ttf"] {
         let bytes = fs::read(fonts_dir.join(name))?;
         let relative = format!("fonts/{name}");
         if !css.contains(&relative) {
@@ -152,16 +150,33 @@ fn inline_fonts(mut css: String, fonts_dir: &Path) -> std::io::Result<String> {
                 format!("fleet-ui.css has no `{relative}` font URL"),
             ));
         }
-        let data_url = format!("data:font/woff2;base64,{}", Base64::encode_string(&bytes));
+        let data_url = format!("data:font/ttf;base64,{}", Base64::encode_string(&bytes));
         css = css.replace(&relative, &data_url);
     }
     Ok(css)
 }
 
+/// The OFL obliges us to distribute the license with the font software, and
+/// each family carries its own copyright line, so a card embeds both texts.
+fn inline_licenses(fonts_dir: &Path) -> std::io::Result<String> {
+    let mut license = String::new();
+    for name in ["OFL-AlbertSans.txt", "OFL-ChivoMono.txt"] {
+        let text = fs::read_to_string(fonts_dir.join(name))?;
+        if !license.is_empty() {
+            license.push_str("\n\n");
+        }
+        license.push_str("=== ");
+        license.push_str(name);
+        license.push_str(" ===\n\n");
+        license.push_str(&text);
+    }
+    Ok(license)
+}
+
 /// Wrap a card body in the full HTML shell: `@dsCard` marker first
 /// line, inlined fleet CSS, then the same body stamped into a light
 /// pane and a dark pane.
-fn render_card(card: &Card, fleet_css: &str, font_license: &str) -> String {
+fn render_card(card: &Card, fleet_css: &str, font_licenses: &str) -> String {
     format!(
         r#"<!-- @dsCard group="{group}" -->
 <!doctype html>
@@ -169,8 +184,8 @@ fn render_card(card: &Card, fleet_css: &str, font_license: &str) -> String {
 <head>
 <meta charset="utf-8"/>
 <title>{title} — fleet-ui</title>
-<script type="text/plain" id="geist-font-license">
-{font_license}
+<script type="text/plain" id="font-licenses">
+{font_licenses}
 </script>
 <style>
 {fleet_css}
@@ -194,7 +209,7 @@ fn render_card(card: &Card, fleet_css: &str, font_license: &str) -> String {
         group = card.group,
         title = card.title,
         body = card.body,
-        font_license = font_license,
+        font_licenses = font_licenses,
         stacked = if card.stacked { " ds-stacked" } else { "" },
     )
 }
@@ -338,14 +353,14 @@ fn tokens_card() -> Card {
     };
 
     let type_specimens = r#"
-<p class="ds-type" style="font-size:var(--fs-title); font-weight:600">Title — Geist 600 / var(--fs-title)</p>
-<p class="ds-type" style="font-size:var(--fs-section); font-weight:600">Section — Geist 600 / var(--fs-section)</p>
-<p class="ds-type" style="font-size:var(--fs-base)">Body — Geist 400 / var(--fs-base)</p>
-<p class="ds-type" style="font-size:var(--fs-control)">Control — Geist 400 / var(--fs-control)</p>
-<p class="ds-type" style="font-size:var(--fs-label)">Label — Geist 400 / var(--fs-label)</p>
-<p class="ds-type" style="font-size:var(--fs-small); color:var(--ink-3)">Small — Geist 400 / var(--fs-small)</p>
-<p class="ds-type" style="font-family:var(--font-mono); font-size:var(--editor-fs)">Editor mono — Geist Mono / var(--editor-fs)</p>
-<p class="ds-type" style="font-family:var(--font-mono); font-size:var(--table-fs)">Table mono — Geist Mono / var(--table-fs)</p>"#;
+<p class="ds-type" style="font-size:var(--fs-title); font-weight:600">Title — Albert Sans 600 / var(--fs-title)</p>
+<p class="ds-type" style="font-size:var(--fs-section); font-weight:600">Section — Albert Sans 600 / var(--fs-section)</p>
+<p class="ds-type" style="font-size:var(--fs-base)">Body — Albert Sans 400 / var(--fs-base)</p>
+<p class="ds-type" style="font-size:var(--fs-control)">Control — Albert Sans 400 / var(--fs-control)</p>
+<p class="ds-type" style="font-size:var(--fs-label)">Label — Albert Sans 400 / var(--fs-label)</p>
+<p class="ds-type" style="font-size:var(--fs-small); color:var(--ink-3)">Small — Albert Sans 400 / var(--fs-small)</p>
+<p class="ds-type" style="font-family:var(--font-mono); font-size:var(--editor-fs)">Editor mono — Chivo Mono / var(--editor-fs)</p>
+<p class="ds-type" style="font-family:var(--font-mono); font-size:var(--table-fs)">Table mono — Chivo Mono / var(--table-fs)</p>"#;
 
     let spacing_bars: String = ["--row-pad-y", "--row-pad-x", "--ui-gap", "--pad", "--row-h"]
         .iter()

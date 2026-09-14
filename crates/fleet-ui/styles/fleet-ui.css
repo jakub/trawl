@@ -5,7 +5,8 @@
  * Extracted verbatim from trawl-web-ui's "Herring" main.css, restyled
  * by the design-workbench pass (ADR-0005), then ported to the Mira
  * Blue design language (ADR-0007): neutral OKLCH surfaces, blue
- * accent, Geist/Geist Mono, tokenized radii, --fs-* type rhythm. App
+ * accent, Albert Sans/Chivo Mono, tokenized radii, --fs-* type
+ * rhythm. App
  * consumers reach this file via Trunk's `data-trunk rel="css"`
  * directive; Trunk resolves the href relative to the consumer's
  * index.html location. The two current consumers:
@@ -27,7 +28,8 @@
  * What this file ships:
  *   - Design tokens: :root + [data-theme="light"] + [data-theme="dark"]
  *   - Typography + spacing custom properties
- *   - Self-hosted Geist / Geist Mono faces plus reset + base styles
+ *   - Self-hosted Albert Sans / Chivo Mono faces plus reset + base
+ *     styles
  *     (box-sizing, typography, focus ring, scrollbars, ::selection)
  *   - Universal keyframes: blink, spin, toastIn, fadeIn, modalFadeIn,
  *     modalIn
@@ -67,21 +69,25 @@
  *   - Anything app-specific: facets, editor, histogram, schema cards.
  */
 
-/* Self-hosted Geist 1.8.0 variable faces (issue #119). fleet-ui owns the
- * committed WOFF2 files; every Trunk consumer copies `fonts/` beside the
- * emitted stylesheet. Restrict the advertised axis to the weights the UI
- * already uses so the typography contract remains 400/500/600/700. */
+/* Self-hosted Albert Sans and Chivo Mono variable faces (ADR-0007
+ * amendment). fleet-ui owns two committed TrueType files, pinned to the
+ * google/fonts bytes, because neither family publishes a variable WOFF2;
+ * every Trunk consumer copies `fonts/` beside the emitted stylesheet. Both
+ * files carry a 100-900 wght axis; the advertised axis is restricted to the
+ * weights the UI uses, so the typography contract remains 400/500/600/700
+ * and no weight is synthesized. Neither family ships an italic file, so
+ * italics stay synthesized, as they were under the previous pair. */
 @font-face {
-  font-family: "Geist";
-  src: url("fonts/Geist-Variable.woff2") format("woff2");
+  font-family: "Albert Sans";
+  src: url("fonts/AlbertSans-Variable.ttf") format("truetype");
   font-style: normal;
   font-weight: 400 700;
   font-display: swap;
 }
 
 @font-face {
-  font-family: "Geist Mono";
-  src: url("fonts/GeistMono-Variable.woff2") format("woff2");
+  font-family: "Chivo Mono";
+  src: url("fonts/ChivoMono-Variable.ttf") format("truetype");
   font-style: normal;
   font-weight: 400 700;
   font-display: swap;
@@ -305,8 +311,8 @@
 }
 
 :root {
-  --font-ui:   "Geist", ui-sans-serif, system-ui, sans-serif;
-  --font-mono: "Geist Mono", ui-monospace, Menlo, monospace;
+  --font-ui:   "Albert Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "Chivo Mono", ui-monospace, Menlo, monospace;
 
   /* Radius scale (ADR-0007): every border-radius in fleet-ui.css and
    * app stylesheets reads one of these — no px literals. panel/ctl/sm
@@ -391,6 +397,13 @@ body {
   font-family: var(--font-ui);
   font-size: var(--fs-base);
   line-height: var(--lh);
+  /* Chivo Mono draws zero as an unslashed oval unless its `zero` feature
+   * is on, and a log viewer has to keep 0 and O apart. Albert Sans has no
+   * `zero` feature, so the declaration is inert for UI text.
+   * font-feature-settings inherits and is independent of the
+   * font-variant-numeric: tabular-nums declarations elsewhere, so no
+   * per-rule change is needed. */
+  font-feature-settings: "zero";
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
 }
