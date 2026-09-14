@@ -119,6 +119,22 @@ source paths, and result samples, so keep the file in a private directory.
 trawld refuses a symlink at the configured path. See
 [enable, inspect, and remove the debug log](/operate/health/#enable-the-query-debug-log).
 
+### Helm TLS selection
+
+The chart's `tls.mode` selects `auto` for a daemon-generated self-signed
+certificate, `secret` for the existing `tls.secretName`, or `certManager` to
+create a Certificate and mount its generated Secret. cert-manager mode requires
+`tls.certManager.issuerRef.name` and `tls.certManager.dnsNames`; issuer kind
+defaults to `ClusterIssuer` and group to `cert-manager.io`. Namespaced `Issuer`
+resources must be in the release namespace.
+
+Both Secret modes mount `tls.crt` and `tls.key` at `/etc/trawl/tls/` and set the
+daemon paths accordingly. They require structured config values;
+`config.raw` is supported only with `tls.mode: auto`, without chart-managed
+TLS Secret mounts. See [configure the daemon API certificate](/operate/deployment/#configure-the-daemon-api-certificate)
+for complete setup and verification instructions. Browser-ingress TLS remains
+a separate setting under `ingress.tls`.
+
 ### `[data]`
 
 The daemon owns a directory tree. For local file or glob selection, use the

@@ -7,6 +7,40 @@ Use a personal API key to sign in to the browser and a service key for each coll
 The init-auth container initializes the database schema; it does not create API keys.
 {{- end }}
 
+{{- if eq .Values.tls.mode "certManager" }}
+
+The chart requested Certificate {{ include "trawl.tlsSecretName" . }} in namespace {{ .Release.Namespace }}.
+It uses {{ .Values.tls.certManager.issuerRef.kind }} {{ .Values.tls.certManager.issuerRef.name }}
+in API group {{ .Values.tls.certManager.issuerRef.group }}. cert-manager and this issuer must already exist.
+{{- if eq .Values.tls.certManager.issuerRef.kind "Issuer" }}
+The Issuer must be in namespace {{ .Release.Namespace }}.
+{{- end }}
+cert-manager fills Secret {{ include "trawl.tlsSecretName" . }}; the daemon mounts tls.crt and tls.key from it.
+Wait for issuance before waiting for the StatefulSet:
+
+  kubectl wait --namespace {{ .Release.Namespace }} certificate/{{ include "trawl.tlsSecretName" . }} --for=condition=Ready --timeout=120s
+
+If issuance fails, inspect the Certificate and its issuer; the chart does not install cert-manager or create issuers.
+Requested API certificate DNS names:
+{{- range .Values.tls.certManager.dnsNames }}
+  {{ . }}
+{{- end }}
+Remote API clients must use a covered DNS name and trust the issuer's CA.
+{{- else if eq .Values.tls.mode "secret" }}
+
+The daemon mounts existing TLS Secret {{ .Values.tls.secretName }} in namespace {{ .Release.Namespace }}.
+It must contain tls.crt and tls.key. Remote API clients must trust its CA and use a covered name.
+{{- else if .Values.config.raw }}
+
+config.raw controls daemon TLS. The chart mounts no TLS Secret in this mode.
+{{- else }}
+
+The daemon generates a self-signed certificate. For trusted remote API access, choose tls.mode=secret or certManager:
+  https://trawl.sh/operate/deployment/#configure-the-daemon-api-certificate
+{{- end }}
+
+Browser-ingress TLS is configured separately through ingress.tls.
+
 Check the HTTPS API through a local port-forward:
 
   kubectl port-forward --namespace {{ .Release.Namespace }} svc/{{ include "trawl.fullname" . }} 5514:{{ .Values.service.port }}

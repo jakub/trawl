@@ -223,14 +223,10 @@ spec:
         - name: config
           configMap:
             name: {{ include "trawl.fullname" . }}
-        {{- if eq .Values.tls.mode "secret" }}
+        {{- if ne .Values.tls.mode "auto" }}
         - name: tls
           secret:
-            secretName: {{ .Values.tls.secretName }}
-        {{- else if eq .Values.tls.mode "certManager" }}
-        - name: tls
-          secret:
-            secretName: {{ include "trawl.fullname" . }}-tls
+            secretName: {{ include "trawl.tlsSecretName" . }}
         {{- end }}
         {{- if .Values.web.enabled }}
         - name: web-cookie

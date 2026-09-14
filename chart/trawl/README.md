@@ -46,6 +46,36 @@ record. Source `Chart.yaml` versions do not select an image.
 Published release packages set `image.tag` to their matching release image,
 so the OCI installation above needs no image override.
 
+## Daemon API certificates
+
+The default `tls.mode: auto` lets trawld create a self-signed certificate.
+For trusted API TLS, choose one of these routes:
+
+- `tls.mode: secret` mounts the existing `tls.secretName` from the release namespace. The Secret must contain `tls.crt` and `tls.key`.
+- `tls.mode: certManager` creates a `cert-manager.io/v1` Certificate named `<fullname>-tls`. An existing issuer supplies its certificate and key in the same-named Secret. Set `tls.certManager.issuerRef.name`, select `Issuer` or `ClusterIssuer`, and list all client-facing names in `tls.certManager.dnsNames`.
+
+The chart installs neither cert-manager nor an issuer. An `Issuer` must be in
+the release namespace; a `ClusterIssuer` is cluster-scoped. The default issuer
+group is `cert-manager.io`. The generated Secret name must not also name a
+Fleet/Trawl database Secret or browser-cookie Secret.
+
+The Certificate covers the daemon API. Browser ingress uses `ingress.tls`
+separately. If ingress deliberately reuses the generated Secret, its hosts
+must also be covered, and ingress-shim issuer annotations must be absent so
+two Certificates do not manage that Secret. The sidecar keeps its existing
+loopback-only HTTPS connection with certificate verification disabled.
+
+Chart-managed TLS mounts require structured config values. `config.raw` is
+accepted only with `tls.mode: auto`, where the raw TOML controls TLS and the
+chart mounts no TLS Secret. Helm cannot validate arbitrary TOML certificate
+paths against its volume mounts.
+
+Follow [configure the daemon API certificate](https://trawl.sh/operate/deployment/#configure-the-daemon-api-certificate)
+for complete values, issuance checks, and client verification. cert-manager's
+[Certificate documentation](https://cert-manager.io/docs/usage/certificate/)
+describes issuance, Secret contents, and renewal. trawld checks mounted
+certificate files every `config.server.tlsReloadIntervalSecs` seconds.
+
 ## Values
 
 | Key | Type | Default | Description |
@@ -83,7 +113,7 @@ so the OCI installation above needs no image override.
 | `crashDump.storageClass` | string | `""` | Crash-dump StorageClass. Empty uses the cluster default |
 | `crashDump.mountPath` | string | `/var/lib/trawl/cores` | Crash-dump mount path, passed as `TRAWL_CRASH_DUMP_DIR` |
 | `crashDump.retain` | int | `10` | Dumps to keep, passed as `TRAWL_CRASH_DUMP_RETAIN` |
-| `config.raw` | string | `""` | Complete `trawld.toml` text. Replaces every `config.*` value below. The DSNs still arrive from the Secrets, and `web.publicOrigins` still reaches trawl-web |
+| `config.raw` | string | `""` | Complete `trawld.toml` text. Replaces every `config.*` value below. Requires `tls.mode: auto`; raw TOML owns TLS configuration and the chart mounts no TLS Secret. The DSNs still arrive from the Secrets, and `web.publicOrigins` still reaches trawl-web |
 | `config.server.httpAddr` | string | `0.0.0.0:5514` | `[server] http_addr` |
 | `config.server.timeoutSecs` | int | `30` | `[server] timeout_secs` |
 | `config.server.maxConcurrentQueries` | string | `""` | `[server] max_concurrent_queries`. Empty uses the CPU count |
@@ -139,10 +169,12 @@ so the OCI installation above needs no image override.
 | `config.scheduler.maxRunsPerSchedule` | int | `100` | `[scheduler] max_runs_per_schedule` |
 | `config.scheduler.reportRetentionDays` | int | `30` | `[scheduler] report_retention_days` |
 | `config.scheduler.maxCatchupIntervals` | int | `24` | `[scheduler] max_catchup_intervals` |
-| `tls.mode` | string | `auto` | `auto` lets trawld generate a self-signed certificate. `secret` mounts `tls.secretName`. `certManager` mounts the Secret `<fullname>-tls`, which a cert-manager Certificate you create must fill |
+| `tls.mode` | string | `auto` | `auto` lets trawld generate a self-signed certificate. `secret` mounts `tls.secretName`. `certManager` creates a Certificate in the release namespace and mounts its Secret `<fullname>-tls` |
 | `tls.secretName` | string | `""` | TLS Secret name for `tls.mode: secret` |
-| `tls.certManager.issuerRef.name` | string | `""` | Reserved. No template reads it. Create the cert-manager Certificate yourself, targeting Secret `<fullname>-tls` |
-| `tls.certManager.issuerRef.kind` | string | `ClusterIssuer` | Reserved. No template reads it |
+| `tls.certManager.issuerRef.name` | string | `""` | Required for `certManager`. Name of an existing issuer |
+| `tls.certManager.issuerRef.kind` | string | `ClusterIssuer` | `Issuer` in the release namespace or `ClusterIssuer` |
+| `tls.certManager.issuerRef.group` | string | `cert-manager.io` | Issuer API group. No namespace field is supported |
+| `tls.certManager.dnsNames` | list | `[]` | Required DNS SANs for `certManager`. Must cover API ingress/HTTPRoute hostnames. Wildcards cover one label. IP-address certificates use `secret` mode |
 | `auth.database.existingSecret` | string | `""` | Secret holding the Fleet DSN. Required |
 | `auth.database.existingSecretKey` | string | `DATABASE_URL` | Key in that Secret. Injected into `init-auth` as `DATABASE_URL` and into trawld as `FLEET_DATABASE_URL` |
 | `storage.database.existingSecret` | string | `""` | Secret holding the Trawl app-state DSN. Required |

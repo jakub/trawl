@@ -1,0 +1,18 @@
+{{- include "trawl.validateTLS" . -}}
+{{- if eq .Values.tls.mode "certManager" }}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "trawl.tlsSecretName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "trawl.labels" . | nindent 4 }}
+spec:
+  secretName: {{ include "trawl.tlsSecretName" . }}
+  issuerRef:
+    name: {{ .Values.tls.certManager.issuerRef.name | quote }}
+    kind: {{ .Values.tls.certManager.issuerRef.kind }}
+    group: {{ .Values.tls.certManager.issuerRef.group | quote }}
+  dnsNames:
+    {{- toYaml .Values.tls.certManager.dnsNames | nindent 4 }}
+{{- end }}

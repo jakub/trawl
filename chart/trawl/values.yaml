@@ -124,6 +124,7 @@ crashDump:
 # or set config.raw to provide your own TOML verbatim.
 config:
   # Set to a complete trawld.toml string to bypass structured templating.
+  # Only supported with tls.mode=auto; raw TOML owns its TLS paths.
   raw: ""
 
   server:
@@ -246,11 +247,15 @@ tls:
   mode: auto
   # For mode=secret: name of the existing TLS Secret.
   secretName: ""
-  # For mode=certManager:
+  # For mode=certManager: cert-manager and the issuer must already exist.
   certManager:
     issuerRef:
       name: ""
       kind: ClusterIssuer
+      group: cert-manager.io
+    # Required: every DNS name clients use for the daemon API.
+    # Include in-cluster Service names if clients connect through them.
+    dnsNames: []
 
 # -- Fleet-auth PostgreSQL keystore
 # API keys and roles live in an external database shared across Fleet apps.

@@ -267,5 +267,6 @@ fi
 
 python3 "$chart/tests/image.py"
 python3 "$chart/tests/notes.py"
+python3 "$chart/tests/tls.py"
 
 echo "helm render assertions passed"

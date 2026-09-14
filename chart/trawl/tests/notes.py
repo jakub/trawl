@@ -70,6 +70,26 @@ class InstallNotes(unittest.TestCase):
         self.assertNotIn("Open http", notes)
         self.assertNotIn("Configured browser origins", notes)
 
+    def test_tls_instructions_match_selected_mode(self):
+        notes, _ = render()
+        self.assertIn("generates a self-signed certificate", notes)
+        self.assertNotIn("kubectl wait", notes)
+        notes, _ = render(**{"tls.mode": "secret", "tls.secretName": "operator-tls"})
+        self.assertIn("existing TLS Secret operator-tls in namespace example", notes)
+        self.assertNotIn("kubectl wait", notes)
+        notes, _ = render(**{
+            "tls.mode": "certManager", "fullnameOverride": "logs",
+            "tls.certManager.issuerRef.name": "local-ca",
+            "tls.certManager.issuerRef.kind": "Issuer",
+            "tls.certManager.dnsNames[0]": "api.example.com",
+        })
+        self.assertIn("Certificate logs-tls in namespace example", notes)
+        self.assertIn("Issuer local-ca", notes)
+        self.assertIn("The Issuer must be in namespace example", notes)
+        self.assertIn("certificate/logs-tls --for=condition=Ready", notes)
+        self.assertIn("api.example.com", notes)
+        self.assertNotIn("generates a self-signed certificate", notes)
+
     def test_external_schema_setup_still_explains_key_creation(self):
         notes, _ = render(**{"initAuth.enabled": "false"})
         self.assertIn("/operate/access/#create-roles-and-keys", notes)
