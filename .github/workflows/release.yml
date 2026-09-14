@@ -16,11 +16,35 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
+  resolve-source:
+    name: resolve release source
+    runs-on: k8s-small
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.source.outputs.tag }}
+      sha: ${{ steps.source.outputs.sha }}
+    steps:
+      # The resolver belongs to the workflow revision. Product source below
+      # always comes from the single immutable commit it resolves.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.sha }}
+      - name: Resolve exact release tag
+        id: source
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_REF: ${{ github.ref }}
+          REQUESTED_TAG: ${{ inputs.tag }}
+        run: python3 scripts/release/resolve-source.py "$EVENT_NAME" "$EVENT_REF" "$REQUESTED_TAG" >> "$GITHUB_OUTPUT"
+
   build-linux:
+    needs: resolve-source
     name: build (${{ matrix.target }})
+    env:
+      RELEASE_TAG: ${{ needs.resolve-source.outputs.tag }}
     runs-on: k8s-big
     strategy:
       fail-fast: false
@@ -35,7 +59,7 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ needs.resolve-source.outputs.sha }}
 
       - name: Set version from tag
         run: |
@@ -216,14 +240,17 @@ jobs:
           if-no-files-found: error
 
   build-macos:
+    needs: resolve-source
     name: build (aarch64-apple-darwin)
+    env:
+      RELEASE_TAG: ${{ needs.resolve-source.outputs.tag }}
     runs-on: k8s-big
     # macOS cross-compile is best-effort — don't block release artifacts
     continue-on-error: true
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ needs.resolve-source.outputs.sha }}
 
       - name: Set version from tag
         run: |
@@ -270,7 +297,9 @@ jobs:
 
   release:
     name: github release
-    needs: build-linux
+    needs: [resolve-source, build-linux]
+    env:
+      RELEASE_TAG: ${{ needs.resolve-source.outputs.tag }}
     runs-on: k8s-small
     steps:
       - name: Download artifacts
@@ -293,7 +322,9 @@ jobs:
 
   publish-apt:
     name: publish APT repository
-    needs: [build-linux, release]
+    needs: [resolve-source, build-linux, release]
+    env:
+      RELEASE_TAG: ${{ needs.resolve-source.outputs.tag }}
     runs-on: k8s-small
     concurrency:
       group: gh-pages-deploy
@@ -415,10 +446,14 @@ jobs:
 
   docker:
     name: container image
-    needs: build-linux
+    needs: [resolve-source, build-linux]
+    env:
+      RELEASE_TAG: ${{ needs.resolve-source.outputs.tag }}
     runs-on: k8s-big
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.resolve-source.outputs.sha }}
 
       - name: Download Linux tarballs
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -457,6 +492,8 @@ jobs:
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: ghcr.io/${{ github.repository }}
+          labels: |
+            org.opencontainers.image.revision=${{ needs.resolve-source.outputs.sha }}
           tags: |
             type=semver,pattern={{version}},value=${{ env.RELEASE_TAG }}
             type=raw,value=latest
@@ -471,10 +508,14 @@ jobs:
 
   helm-package:
     name: helm chart
-    needs: docker
+    needs: [resolve-source, docker]
+    env:
+      RELEASE_TAG: ${{ needs.resolve-source.outputs.tag }}
     runs-on: k8s-small
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.resolve-source.outputs.sha }}
 
       - name: Install Helm
         uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4

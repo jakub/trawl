@@ -15,6 +15,17 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
+  release-source:
+    name: release source resolution
+    runs-on: k8s-small
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - run: python3 -m unittest discover -s scripts/release -p 'test_*.py' -v
+
   helm-template:
     name: helm template
     runs-on: k8s-small
