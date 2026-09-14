@@ -38,6 +38,9 @@ class ReleaseSourceTests(unittest.TestCase):
         helper = self.remote / "scripts/release/build-apt-index.py"
         helper.parent.mkdir(parents=True)
         helper.write_text("print('publisher tooling from workflow')\n")
+        (helper.parent / "package-chart.sh").write_text(
+            RESOLVER.with_name("package-chart.sh").read_text()
+        )
         self.git(self.remote, "add", ".")
         self.git(self.remote, "commit", "-m", "workflow source")
         self.workflow_sha = self.git(self.remote, "rev-parse", "HEAD")
@@ -108,6 +111,29 @@ class ReleaseSourceTests(unittest.TestCase):
         self.assertEqual((pages / "build-apt-index.py").read_text(),
                          "print('publisher tooling from workflow')\n")
         self.assertFalse((pages / "Cargo.toml").exists())
+
+    def test_older_release_uses_chart_packager_from_workflow_revision(self):
+        self.assert_resolves("v1.0.0")
+        self.git(self.checkout, "checkout", "--detach", self.release_sha)
+        self.assertFalse((self.checkout / "scripts/release/package-chart.sh").exists())
+        workflow = (RESOLVER.parents[2] / ".github/workflows/release.yml").read_text()
+        step = workflow.split("      - name: Load chart packager from workflow source\n", 1)[1]
+        step = step.split("\n      - name:", 1)[0]
+        self.assertIn("WORKFLOW_SHA: ${{ github.sha }}", step)
+        commands = step.split("        run: |\n", 1)[1]
+        commands = "\n".join(line.removeprefix("          ") for line in commands.splitlines())
+        runner_temp = Path(self.temp.name) / "runner-temp"
+        runner_temp.mkdir()
+        result = subprocess.run(
+            ["bash", "-e", "-c", commands], cwd=self.checkout,
+            env=dict(self.env, WORKFLOW_SHA=self.workflow_sha, RUNNER_TEMP=str(runner_temp)),
+            text=True, capture_output=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((runner_temp / "package-chart.sh").read_text(),
+                         RESOLVER.with_name("package-chart.sh").read_text())
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.release_sha)
+        self.assertEqual((self.checkout / "chart/trawl/Chart.yaml").read_text(), "release source\n")
 
     def test_annotated_tag_peels_to_commit(self):
         self.assert_resolves("v1.0.1")

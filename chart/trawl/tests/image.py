@@ -3,6 +3,7 @@
 
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -48,7 +49,7 @@ class ImageSelection(unittest.TestCase):
             with self.subTest(tag=tag), tempfile.TemporaryDirectory() as directory:
                 result = subprocess.run(
                     ["bash", str(ROOT / "scripts/release/package-chart.sh"),
-                     "v9.8.7", tag, directory], capture_output=True, text=True,
+                     "v9.8.7", tag, str(CHART), directory], capture_output=True, text=True,
                 )
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(list(Path(directory).glob("*.tgz")), [])
@@ -63,7 +64,7 @@ class ImageSelection(unittest.TestCase):
             with self.subTest(version=version), tempfile.TemporaryDirectory() as directory:
                 subprocess.run(
                     ["bash", str(ROOT / "scripts/release/package-chart.sh"),
-                     f"v{version}", image_tag, directory], check=True, capture_output=True, text=True,
+                     f"v{version}", image_tag, str(CHART), directory], check=True, capture_output=True, text=True,
                 )
                 package = Path(directory) / f"trawl-{version}.tgz"
                 self.assertTrue(package.is_file())
@@ -80,6 +81,27 @@ class ImageSelection(unittest.TestCase):
                 self.assertIn("image.tag is required", result.stderr)
         self.assertEqual((CHART / "values.yaml").read_bytes(), source_values)
         self.assertEqual((CHART / "Chart.yaml").read_bytes(), source_metadata)
+
+    def test_packager_uses_selected_product_chart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            selected = root / "product-chart"
+            shutil.copytree(CHART, selected)
+            # Model a product revision that differs from the tooling checkout.
+            metadata = selected / "Chart.yaml"
+            metadata.write_text(re.sub(r"(?m)^description:.*$",
+                                      "description: Selected product revision", metadata.read_text()))
+            destination = root / "packages"
+            destination.mkdir()
+            subprocess.run(
+                ["bash", str(ROOT / "scripts/release/package-chart.sh"),
+                 "v9.8.7", "9.8.7", str(selected), str(destination)],
+                check=True, capture_output=True, text=True,
+            )
+            package = destination / "trawl-9.8.7.tgz"
+            packaged = subprocess.check_output(["helm", "show", "chart", str(package)], text=True)
+            self.assertIn("description: Selected product revision", packaged)
+            self.assert_images(render(package), "9.8.7")
 
 
 if __name__ == "__main__":

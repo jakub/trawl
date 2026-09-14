@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# Package this checkout with Docker metadata's published primary image tag.
+# Package the selected product chart with Docker metadata's primary image tag.
 # Never resolve another ref or edit the source chart's values in place.
 set -euo pipefail
-repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-version=${1:?usage: package-chart.sh RELEASE_TAG IMAGE_TAG DESTINATION}
+version=${1:?usage: package-chart.sh RELEASE_TAG IMAGE_TAG SOURCE_CHART DESTINATION}
 version=${version#v}
-image_tag=${2:?usage: package-chart.sh RELEASE_TAG IMAGE_TAG DESTINATION}
-destination=${3:?usage: package-chart.sh RELEASE_TAG IMAGE_TAG DESTINATION}
+image_tag=${2:?usage: package-chart.sh RELEASE_TAG IMAGE_TAG SOURCE_CHART DESTINATION}
+source_chart=${3:?usage: package-chart.sh RELEASE_TAG IMAGE_TAG SOURCE_CHART DESTINATION}
+destination=${4:?usage: package-chart.sh RELEASE_TAG IMAGE_TAG SOURCE_CHART DESTINATION}
 work_dir=$(mktemp -d)
 trap 'rm -rf "$work_dir"' EXIT
-cp -R "$repo_root/chart/trawl" "$work_dir/trawl"
+cp -R "$source_chart" "$work_dir/trawl"
 python3 - "$work_dir/trawl/values.yaml" "$image_tag" <<'PY'
 import json
 import re

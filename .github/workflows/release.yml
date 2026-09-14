@@ -518,6 +518,14 @@ jobs:
         with:
           ref: ${{ needs.resolve-source.outputs.sha }}
 
+      # Packaging tooling can postdate the requested product tag.
+      - name: Load chart packager from workflow source
+        env:
+          WORKFLOW_SHA: ${{ github.sha }}
+        run: |
+          git fetch --no-tags --depth=1 origin "$WORKFLOW_SHA"
+          git show "${WORKFLOW_SHA}:scripts/release/package-chart.sh" > "$RUNNER_TEMP/package-chart.sh"
+
       - name: Install Helm
         uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
 
@@ -529,5 +537,5 @@ jobs:
           VERSION: ${{ env.RELEASE_TAG }}
           IMAGE_TAG: ${{ needs.docker.outputs.image-tag }}
         run: |
-          bash scripts/release/package-chart.sh "${VERSION}" "${IMAGE_TAG}" .
+          bash "$RUNNER_TEMP/package-chart.sh" "${VERSION}" "${IMAGE_TAG}" chart/trawl .
           helm push trawl-*.tgz oci://ghcr.io/${{ github.repository_owner }}/charts
