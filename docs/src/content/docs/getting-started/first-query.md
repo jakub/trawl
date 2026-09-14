@@ -264,11 +264,11 @@ Export the events to Parquet, then query the file with no server:
 trawl --config "$TRAWL_TUTORIAL_DIR/client.toml" query \
   'service=tutorial last=1h' --format parquet \
   --output "$TRAWL_TUTORIAL_DIR/tutorial.parquet"
-trawl query --data "$TRAWL_TUTORIAL_DIR/tutorial.parquet" \
+trawl query --data "$TRAWL_TUTORIAL_DIR/tutorial.parquet" --format json \
   '* | stats count() by service'
 ```
 
-Expect one row with `tutorial` and `3`, then `1 row(s)`. See
+Expect `{"service":"tutorial","count":3}`. Property order can differ. See
 [Query local Parquet](/start/local-parquet/).
 
 ## Clean up
