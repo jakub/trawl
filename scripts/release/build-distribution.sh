@@ -9,7 +9,7 @@ python3 "$tooling/distribution.py" prepare --source "$source_dir" --target "$tar
 export DUCKDB_LIB_DIR="$runtime"
 unset DUCKDB_DOWNLOAD_LIB DUCKDB_STATIC
 case "$target" in
-  *-apple-darwin) loader='@executable_path/../lib/trawl'; command=(cargo build); build_target="$target" ;;
+  *-apple-darwin) export MACOSX_DEPLOYMENT_TARGET=15.0; loader='@executable_path/../lib/trawl'; command=(cargo build); build_target="$target" ;;
   *-unknown-linux-gnu) loader='$ORIGIN/../lib/trawl'; command=(cargo zigbuild); build_target="$target.2.31" ;;
   *) echo 'unsupported distribution target' >&2; exit 1 ;;
 esac

@@ -45,6 +45,8 @@ jobs:
     name: build (${{ matrix.target }})
     env:
       RELEASE_TAG: ${{ needs.resolve-source.outputs.tag }}
+      SOURCE_SHA: ${{ needs.resolve-source.outputs.sha }}
+      TOOLING_SHA: ${{ github.sha }}
     runs-on: k8s-big
     strategy:
       fail-fast: false
@@ -61,12 +63,13 @@ jobs:
         with:
           ref: ${{ needs.resolve-source.outputs.sha }}
 
-      - name: Set version from tag
-        run: |
-          version="${RELEASE_TAG#v}"
-          echo "Setting workspace version to ${version}"
-          sed -i "0,/^version = \".*\"/s//version = \"${version}\"/" Cargo.toml
-          grep '^version' Cargo.toml
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.sha }}
+          path: .release-tooling
+          persist-credentials: false
+      - name: Verify committed release source and version
+        run: python3 .release-tooling/scripts/release/check-release-source.py . "$RELEASE_TAG" "$SOURCE_SHA"
 
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1; pinned via toolchain input
         with:
@@ -100,7 +103,7 @@ jobs:
             "$codename-security" "main universe" \
             | sudo tee /etc/apt/sources.list.d/arm64.list
           sudo apt-get update
-          sudo apt-get install -y libc6-arm64-cross dpkg-dev
+          sudo apt-get install -y libc6:arm64 libgcc-s1:arm64 libstdc++6:arm64 dpkg-dev
 
       - uses: taiki-e/install-action@d858f8113943481093e02986a7586a4819a3bfd6 # v2
         with:
@@ -120,7 +123,7 @@ jobs:
       # builds every crate (including trawl-web) except the wasm32-only
       # SPA crate — which was already built by the preceding trunk step.
       - name: Build
-        run: cargo zigbuild --release --workspace --exclude trawl-web-ui --target ${{ matrix.target }}.2.31
+        run: bash .release-tooling/scripts/release/build-distribution.sh "$PWD" "${{ matrix.target }}" "$PWD/runtime"
         env:
           # Zig's lld strips .symtab regardless of the profile's
           # strip = "debuginfo". Override strip to false so the build retains
@@ -149,8 +152,9 @@ jobs:
 
       # Harvest breakpad symbols from the FAT binaries (with .symtab + DWARF)
       # BEFORE stripping. --store writes <module>/<DEBUG_ID>/<module>.sym, the
-      # exact layout `minidump-stackwalk --symbols-url` expects. libduckdb is
-      # statically linked, so each binary's .sym also covers its C++ frames.
+      # exact layout `minidump-stackwalk --symbols-url` expects. These symbols
+      # cover application modules; the official shared DuckDB library ships
+      # separately and does not provide full upstream C++ debug information.
       - name: Dump breakpad symbols
         run: |
           set -euo pipefail
@@ -201,28 +205,28 @@ jobs:
           done
           rm -f build-id.note
 
-      - name: Build .deb packages
+      - name: Build .deb packages with one runtime owner
         run: |
-          cargo deb -p trawl-server --no-build --no-strip --target ${{ matrix.target }}
-          cargo deb -p trawl-cli --no-build --no-strip --target ${{ matrix.target }}
+          python3 .release-tooling/scripts/release/package-debian.py --source . \
+            --binaries "target/${{ matrix.target }}/release" --runtime runtime \
+            --output "target/${{ matrix.target }}/debian" --target "${{ matrix.target }}"
 
-      - name: Create tarball
+      - name: Create relocatable tarball
         run: |
-          tag="${RELEASE_TAG}"
-          staging="trawl-${tag}-${{ matrix.target }}"
-          mkdir -p "${staging}"
-          cp "target/${{ matrix.target }}/release/trawl" "${staging}/"
-          cp "target/${{ matrix.target }}/release/trawld" "${staging}/"
-          cp "target/${{ matrix.target }}/release/trawl-admin" "${staging}/"
-          cp "target/${{ matrix.target }}/release/fleet-admin" "${staging}/"
-          cp "target/${{ matrix.target }}/release/trawl-web" "${staging}/"
-          tar czf "${staging}.tar.gz" "${staging}"
+          staging="trawl-${RELEASE_TAG}-${{ matrix.target }}"
+          python3 .release-tooling/scripts/release/distribution.py stage --source . \
+            --binaries "target/${{ matrix.target }}/release" --runtime runtime --output "$staging" \
+            --target "${{ matrix.target }}" --source-sha "$SOURCE_SHA" --tooling-sha "$TOOLING_SHA"
+          tar czf "${staging}.tar.gz" "$staging"
+          sha256sum "${staging}.tar.gz" > "${staging}.tar.gz.sha256"
 
       - name: Upload tarball
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: dist-${{ matrix.target }}
-          path: trawl-*.tar.gz
+          path: |
+            trawl-*.tar.gz
+            trawl-*.tar.gz.sha256
           if-no-files-found: error
 
       - name: Upload .deb packages
@@ -241,70 +245,83 @@ jobs:
 
   build-macos:
     needs: resolve-source
-    name: build (aarch64-apple-darwin)
+    uses: ./.github/workflows/macos-cli.yml
+    with:
+      source-sha: ${{ needs.resolve-source.outputs.sha }}
+      tooling-sha: ${{ github.sha }}
+      release-tag: ${{ needs.resolve-source.outputs.tag }}
+
+  build-docs:
+    needs: resolve-source
+    uses: ./.github/workflows/docs.yml
+    with:
+      source-sha: ${{ needs.resolve-source.outputs.sha }}
+      release-tag: ${{ needs.resolve-source.outputs.tag }}
+
+  verify-linux:
+    name: installed Linux artifacts (${{ matrix.target }})
+    needs: [resolve-source, build-linux]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
     env:
+      TARGET: ${{ matrix.target }}
+      SOURCE_SHA: ${{ needs.resolve-source.outputs.sha }}
+      TOOLING_SHA: ${{ github.sha }}
       RELEASE_TAG: ${{ needs.resolve-source.outputs.tag }}
-    runs-on: k8s-big
-    # macOS cross-compile is best-effort — don't block release artifacts
-    continue-on-error: true
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          ref: ${{ needs.resolve-source.outputs.sha }}
-
-      - name: Set version from tag
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout: scripts/release
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: incoming
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: deb-${{ matrix.target }}
+          path: debs
+      - name: Prepare native Debian verification environment
+        run: docker build -f scripts/release/Dockerfile.verify -t trawl-artifact-check scripts/release
+      - name: Relocate and verify tarball without network
         run: |
-          version="${RELEASE_TAG#v}"
-          sed -i "0,/^version = \".*\"/s//version = \"${version}\"/" Cargo.toml
-
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1; pinned via toolchain input
-        with:
-          toolchain: 1.98.0
-          targets: aarch64-apple-darwin
-
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          key: release-aarch64-apple-darwin
-
-      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
-
-      - uses: taiki-e/install-action@d858f8113943481093e02986a7586a4819a3bfd6 # v2
-        with:
-          tool: cargo-zigbuild
-
-      # Follow-up: this path downloads libduckdb.dylib while the tarball below
-      # currently stages only `trawl`. Audit with `otool -L`, then either ship
-      # and locate the dylib or produce a correctly linked static artifact.
-      - name: Build CLI for macOS
-        run: cargo zigbuild --release --target aarch64-apple-darwin -p trawl-cli --no-default-features
-        env:
-          DUCKDB_DOWNLOAD_LIB: "1"
-
-      - name: Create tarball
+          (cd incoming && sha256sum -c ./*.sha256)
+          mkdir installed
+          tar xzf incoming/*.tar.gz -C installed --strip-components=1
+          docker run --rm --network none -v "$PWD:/verify:ro" -w /verify \
+            trawl-artifact-check python3 scripts/release/verify-distribution.py installed \
+            --target "$TARGET" --source-sha "$SOURCE_SHA" --tooling-sha "$TOOLING_SHA" \
+            --expected-version "${RELEASE_TAG#v}"
+      - name: Install and remove real Debian packages without network
         run: |
-          tag="${RELEASE_TAG}"
-          staging="trawl-${tag}-aarch64-apple-darwin"
-          mkdir -p "${staging}"
-          cp "target/aarch64-apple-darwin/release/trawl" "${staging}/"
-          tar czf "${staging}.tar.gz" "${staging}"
-
-      - name: Upload tarball
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: dist-aarch64-apple-darwin
-          path: trawl-*.tar.gz
-          if-no-files-found: error
+          docker run --rm --network none --cap-add SYS_PTRACE -v "$PWD:/verify:ro" -w /verify \
+            trawl-artifact-check bash scripts/release/test-installed-debian.sh debs
 
   release:
     name: github release
-    needs: [resolve-source, build-linux]
+    needs: [resolve-source, verify-linux, build-macos, build-docs]
     env:
       RELEASE_TAG: ${{ needs.resolve-source.outputs.tag }}
     runs-on: k8s-small
     steps:
-      - name: Download artifacts
+      - name: Download tarballs
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - name: Download Debian packages
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: deb-*
           path: dist
           merge-multiple: true
 
@@ -319,6 +336,34 @@ jobs:
           files: |
             dist/**/*.tar.gz
             dist/**/*.deb
+            dist/**/*.sha256
+
+  publish-docs:
+    needs: [resolve-source, build-docs, release]
+    runs-on: k8s-small
+    permissions:
+      contents: write
+    concurrency:
+      group: gh-pages-deploy
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: documentation-site
+          path: docs/dist
+      - name: Deploy selected release documentation
+        uses: JamesIves/github-pages-deploy-action@d92aa235d04922e8f08b40ce78cc5442fcfbfa2f # v4
+        with:
+          branch: gh-pages
+          folder: docs/dist
+          clean: true
+          clean-exclude: |
+            apt/
+            gpg.key
+            symbols/
 
   publish-apt:
     name: publish APT repository
@@ -447,14 +492,14 @@ jobs:
     name: container image
     outputs:
       image-tag: ${{ steps.meta.outputs.version }}
-    needs: [resolve-source, build-linux]
+    needs: [resolve-source, verify-linux, build-macos, build-docs]
     env:
       RELEASE_TAG: ${{ needs.resolve-source.outputs.tag }}
     runs-on: k8s-big
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          ref: ${{ needs.resolve-source.outputs.sha }}
+          ref: ${{ github.sha }}
 
       - name: Download Linux tarballs
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -463,20 +508,15 @@ jobs:
           pattern: dist-*-unknown-linux-gnu
           merge-multiple: true
 
-      - name: Extract binaries by arch
+      - name: Extract verified artifact layout by arch
         run: |
           for arch in amd64 arm64; do
             case $arch in
               amd64) target="x86_64-unknown-linux-gnu" ;;
               arm64) target="aarch64-unknown-linux-gnu" ;;
             esac
-            mkdir -p "docker-ctx/${arch}"
-            tar xzf dist/trawl-*-${target}.tar.gz
-            cp trawl-*-${target}/trawld "docker-ctx/${arch}/"
-            cp trawl-*-${target}/trawl-admin "docker-ctx/${arch}/"
-            cp trawl-*-${target}/fleet-admin "docker-ctx/${arch}/"
-            cp trawl-*-${target}/trawl-web "docker-ctx/${arch}/"
-            chmod +x "docker-ctx/${arch}/trawld" "docker-ctx/${arch}/trawl-admin" "docker-ctx/${arch}/fleet-admin" "docker-ctx/${arch}/trawl-web"
+            mkdir -p "docker-ctx/$arch"
+            tar xzf "dist/trawl-${RELEASE_TAG}-${target}.tar.gz" -C "docker-ctx/$arch" --strip-components=1
           done
 
       - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3

@@ -9,10 +9,12 @@ LABEL org.opencontainers.image.title="trawl" \
       org.opencontainers.image.licenses="MPL-2.0"
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates libstdc++6 libgcc-s1 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY docker-ctx/${TARGETARCH}/trawld docker-ctx/${TARGETARCH}/trawl-admin docker-ctx/${TARGETARCH}/fleet-admin docker-ctx/${TARGETARCH}/trawl-web /usr/bin/
+COPY docker-ctx/${TARGETARCH}/bin/trawld docker-ctx/${TARGETARCH}/bin/trawl-admin docker-ctx/${TARGETARCH}/bin/fleet-admin docker-ctx/${TARGETARCH}/bin/trawl-web /usr/bin/
+COPY docker-ctx/${TARGETARCH}/lib/trawl/ /usr/lib/trawl/
+COPY docker-ctx/${TARGETARCH}/LICENSE docker-ctx/${TARGETARCH}/LICENSE.duckdb docker-ctx/${TARGETARCH}/distribution.json /usr/share/doc/trawl/
 
 # trawld-file-capability: cap_sys_ptrace=p
 RUN apt-get update \

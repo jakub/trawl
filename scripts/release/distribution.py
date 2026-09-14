@@ -40,12 +40,12 @@ def prepare(source, target, output):
     (output / "runtime.json").write_text(json.dumps({"version": manifest["version"], "archive": archive, "sha256": checksum}, indent=2) + "\n")
 
 
-def stage(binaries, runtime, output, target, source_sha, tooling_sha, cli_only):
+def stage(binaries, runtime, output, target, source_sha, tooling_sha, cli_only, source):
     if output.exists():
         raise SystemExit("staging destination already exists")
     names = ["trawl"] if cli_only else ["trawl", "trawld", "trawl-admin", "fleet-admin", "trawl-web"]
     library = "libduckdb.dylib" if "apple" in target else "libduckdb.so"
-    for path in [*[binaries / name for name in names], runtime / library, runtime / "LICENSE.duckdb", runtime / "runtime.json"]:
+    for path in [*[binaries / name for name in names], runtime / library, runtime / "LICENSE.duckdb", runtime / "runtime.json", source / "LICENSE"]:
         if not path.is_file():
             raise SystemExit(f"missing distribution input: {path}")
     (output / "bin").mkdir(parents=True)
@@ -56,8 +56,10 @@ def stage(binaries, runtime, output, target, source_sha, tooling_sha, cli_only):
     shipped = output / "lib/trawl" / library
     shutil.copy2(runtime / library, shipped)
     shutil.copy2(runtime / "LICENSE.duckdb", output / "LICENSE.duckdb")
+    shutil.copy2(source / "LICENSE", output / "LICENSE")
     metadata = json.loads((runtime / "runtime.json").read_text())
-    metadata.update(target=target, source_sha=source_sha, tooling_sha=tooling_sha)
+    metadata.update(target=target, source_sha=source_sha, tooling_sha=tooling_sha,
+                    platform_floor="macOS 15" if "apple" in target else "Debian 12")
     (output / "distribution.json").write_text(json.dumps(metadata, indent=2) + "\n")
     if "apple" in target:
         subprocess.run(["install_name_tool", "-id", "@rpath/libduckdb.dylib", str(shipped)], check=True)
@@ -80,6 +82,7 @@ if __name__ == "__main__":
     p.add_argument("--target", required=True)
     p.add_argument("--output", type=Path, required=True)
     p = commands.add_parser("stage")
+    p.add_argument("--source", type=Path, required=True)
     p.add_argument("--binaries", type=Path, required=True)
     p.add_argument("--runtime", type=Path, required=True)
     p.add_argument("--output", type=Path, required=True)

@@ -31,8 +31,8 @@ jobs:
           targets: aarch64-unknown-linux-gnu, wasm32-unknown-unknown
 
       # Own cache (shared-key, stable across dev-image runs) so dev churn
-      # doesn't evict release.yml's `release-<target>` entry. First run is a
-      # cold libduckdb C++ build; every run after is the warm rust delta.
+      # doesn't evict release.yml's `release-<target>` entry. The official runtime is
+      # downloaded separately; this cache contains Rust compilation artifacts.
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: dev-aarch64-linux
@@ -77,16 +77,14 @@ jobs:
       # profile's strip = "debuginfo" + zig lld's .symtab strip give lean
       # binaries straight out of the build — smaller image, faster push.
       - name: Build
-        run: cargo zigbuild --release --workspace --exclude trawl-web-ui --target aarch64-unknown-linux-gnu.2.31
+        run: bash scripts/release/build-distribution.sh "$PWD" aarch64-unknown-linux-gnu "$PWD/runtime"
 
-      # Stage exactly the four binaries the Dockerfile COPYs into
-      # docker-ctx/arm64/ (buildx sets TARGETARCH=arm64 for linux/arm64).
-      - name: Stage binaries for the image
+      - name: Stage binaries and shared runtime for the image
         run: |
-          mkdir -p docker-ctx/arm64
-          bindir="target/aarch64-unknown-linux-gnu/release"
-          cp "${bindir}/trawld" "${bindir}/trawl-admin" "${bindir}/fleet-admin" "${bindir}/trawl-web" docker-ctx/arm64/
-          chmod +x docker-ctx/arm64/trawld docker-ctx/arm64/trawl-admin docker-ctx/arm64/fleet-admin docker-ctx/arm64/trawl-web
+          python3 scripts/release/distribution.py stage --source . \
+            --binaries target/aarch64-unknown-linux-gnu/release --runtime runtime \
+            --output docker-ctx/arm64 --target aarch64-unknown-linux-gnu \
+            --source-sha "$(git rev-parse HEAD)" --tooling-sha "$(git rev-parse HEAD)"
 
       # QEMU is needed: the Dockerfile's apt-get/groupadd RUN steps execute in
       # the arm64 target context on this x86_64 host.
@@ -128,8 +126,11 @@ jobs:
             echo ""
             echo '```sh'
             echo "git worktree add --detach ${checkout} ${revision}"
-            echo "(cd ${checkout} && CARGO_TARGET_DIR=target cargo +1.98.0 build --locked --release -p trawl-cli --bin trawl)"
-            echo "${checkout}/target/release/trawl --version"
+            echo "cd ${checkout}"
+            echo 'TRAWL_TARGET="$(rustc -vV | sed -n "s/^host: //p")"'
+            echo 'bash scripts/release/build-distribution.sh "$PWD" "$TRAWL_TARGET" "$PWD/target/duckdb-runtime" --cli-only'
+            echo 'python3 scripts/release/distribution.py stage --source . --binaries "target/$TRAWL_TARGET/release" --runtime target/duckdb-runtime --output target/package --target "$TRAWL_TARGET" --source-sha "$(git rev-parse HEAD)" --tooling-sha "$(git rev-parse HEAD)" --cli-only'
+            echo 'target/package/bin/trawl --version'
             echo '```'
             echo ""
             echo "For an existing arm64 test release, review a complete development values file for this source chart."

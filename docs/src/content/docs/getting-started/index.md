@@ -46,7 +46,12 @@ Linux tarballs contain all five executables in `bin/`. Native macOS arm64
 and Intel tarballs contain the CLI. Every tarball includes its DuckDB library
 in `lib/trawl/`; keep both directories together. Pick a tag from
 [GitHub releases](https://github.com/jakub/trawl/releases) and enter it, with
-its leading `v`, when prompted:
+its leading `v`, when prompted. Linux artifacts are verified on Debian 12
+(Bookworm), with the system `libstdc++6` and `libgcc-s1` packages installed.
+macOS artifacts require macOS 15 or newer and are built and tested
+natively for arm64 and Intel. They use ad-hoc signatures; they are not Apple
+Developer ID signed or notarized, so Gatekeeper can require explicit approval
+before first use:
 
 ```bash
 read -r -p 'Release tag, including v: ' TRAWL_RELEASE
@@ -68,12 +73,15 @@ trawl --version
 ```
 
 Expect the version from your tag, without the `v`. The tarball has no systemd
-units, databases, or data directory. Keep all five executables on one release.
+units, databases, or data directory. On Linux, keep all five executables on one
+release. On both platforms, keep the executable and shared runtime versions
+together.
 
 ## Build from source
 
 Use the pinned Rust toolchain, a native C toolchain, Python 3.11 or newer,
-and curl. Linux distribution builds also require Zig and `cargo-zigbuild`.
+and curl. Linux distribution builds also require [Zig](https://ziglang.org/download/)
+and [cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild).
 The Linux server's browser build requires Trunk and the Rust
 `wasm32-unknown-unknown` target.
 
@@ -91,7 +99,7 @@ cd trawl
 TRAWL_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
 env -u NO_COLOR cargo xtask build-web --release
 bash scripts/release/build-distribution.sh "$PWD" "$TRAWL_TARGET" "$PWD/target/duckdb-runtime"
-python3 scripts/release/distribution.py stage \
+python3 scripts/release/distribution.py stage --source . \
   --binaries "target/$TRAWL_TARGET/release" --runtime target/duckdb-runtime \
   --output target/package --target "$TRAWL_TARGET" \
   --source-sha "$(git rev-parse HEAD)" --tooling-sha "$(git rev-parse HEAD)"

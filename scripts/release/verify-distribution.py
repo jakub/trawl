@@ -16,6 +16,8 @@ def output(*args):
 def verify(package, target, source_sha, tooling_sha, expected_version):
     metadata = json.loads((package / "distribution.json").read_text())
     assert metadata["target"] == target
+    assert metadata["platform_floor"] == ("macOS 15" if "apple" in target else "Debian 12")
+    assert (package / "LICENSE").is_file() and (package / "LICENSE.duckdb").is_file()
     assert metadata["source_sha"] == source_sha
     assert metadata["tooling_sha"] == tooling_sha
     binaries = list((package / "bin").iterdir())
@@ -28,10 +30,15 @@ def verify(package, target, source_sha, tooling_sha, expected_version):
             assert arch in architectures, (path, architectures)
             if path != library:
                 assert architectures == [arch]
-            deps = [line.strip().split(" (", 1)[0] for line in output("otool", "-L", path).splitlines()[1:]]
+            deps = [line.strip().split(" (", 1)[0] for line in output("otool", "-arch", arch, "-L", path).splitlines()[1:]]
+            if path.name == "trawl":
+                assert "@rpath/libduckdb.dylib" in deps
             assert all(d.startswith(("/usr/lib/", "/System/Library/")) or d == "@rpath/libduckdb.dylib" for d in deps), (path, deps)
             if path != library:
-                rpaths = re.findall(r"cmd LC_RPATH\s+cmdsize \d+\s+path (\S+)", output("otool", "-l", path))
+                load_commands = output("otool", "-arch", arch, "-l", path)
+                minimum = re.search(r"cmd LC_BUILD_VERSION.*?minos (\S+)", load_commands, re.S)
+                assert minimum and minimum[1] in ("15.0", "15.0.0"), (path, minimum)
+                rpaths = re.findall(r"cmd LC_RPATH\s+cmdsize \d+\s+path (\S+)", load_commands)
                 assert rpaths == ["@executable_path/../lib/trawl"], rpaths
             subprocess.run(["codesign", "--verify", "--strict", str(path)], check=True)
     else:
@@ -48,6 +55,8 @@ def verify(package, target, source_sha, tooling_sha, expected_version):
             needed = re.findall(r"\(NEEDED\).*\[(.*?)\]", dynamic)
             allowed = {"libduckdb.so", "libgcc_s.so.1", "libstdc++.so.6", "libm.so.6", "libc.so.6", "libpthread.so.0", "libdl.so.2", "librt.so.1", "ld-linux-x86-64.so.2", "ld-linux-aarch64.so.1"}
             assert set(needed) <= allowed, (path, needed)
+            if path.name in ("trawl", "trawld"):
+                assert "libduckdb.so" in needed, (path, needed)
     scripts = Path(__file__).parent
     subprocess.run([sys.executable, str(scripts / "check-runtime.py"), str(library), str(scripts / "fixtures/cli.parquet")], check=True)
     command = [sys.executable, str(scripts / "smoke-cli.py"), str(package / "bin/trawl"), str(scripts / "fixtures/cli.parquet")]
