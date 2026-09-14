@@ -580,6 +580,20 @@ async fn build_storage_state(config: &Config) -> Result<StorageState, crate::err
 }
 
 impl AppState {
+    /// Admit both databases without constructing corpus readers or writers.
+    ///
+    /// Fleet validation is read-only. Trawl takes its sole-writer lock before
+    /// schema admission and migration. Keep the returned storage owner alive
+    /// through filesystem recovery and store reconciliation, then pass these
+    /// same backends to [`Self::from_parts`].
+    pub async fn connect_backends(
+        config: &Config,
+    ) -> Result<(AuthState, StorageState), crate::error::ServerError> {
+        let auth = build_auth_state(config).await?;
+        let storage = build_storage_state(config).await?;
+        Ok((auth, storage))
+    }
+
     /// Construct app state from a validated [`Config`].
     ///
     /// Connects to the fleet-auth Postgres keystore and the trawl app-state
@@ -591,8 +605,7 @@ impl AppState {
         metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
         derivation: Arc<crate::ingest::producer::Derivation>,
     ) -> Result<(Self, HttpConfig), crate::error::ServerError> {
-        let auth = build_auth_state(config).await?;
-        let storage = build_storage_state(config).await?;
+        let (auth, storage) = Self::connect_backends(config).await?;
 
         Self::from_parts(config, metrics_handle, derivation, auth, storage).await
     }

@@ -234,6 +234,31 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
         }
     });
 
+    // Admit both databases before the epoch gate can initialize a fresh
+    // root or repin recovery can rename/sweep an existing corpus. This exact
+    // storage owner holds the sole-writer lock through recovery and serving.
+    let (auth, storage) = AppState::connect_backends(&config).await?;
+
+    // Sole-writer guard: if the app-state advisory lock is ever lost (its
+    // session died and postgres freed the lock), a second trawld could
+    // acquire it and become a concurrent writer. Terminate immediately —
+    // split-brain is a correctness emergency, so a hard exit that stops all
+    // writes beats a graceful drain that keeps serving. The supervisor
+    // restarts us; boot re-acquires the lock or fails on the replacement.
+    {
+        let mut lock_lost = storage.lock_lost();
+        tokio::spawn(async move {
+            if lock_lost.wait_for(|lost| *lost).await.is_ok() {
+                tracing::error!(
+                    event_type = "lifecycle",
+                    "app-state sole-writer lock lost; terminating trawld to prevent a \
+                     split-brain second writer"
+                );
+                std::process::exit(1);
+            }
+        });
+    }
+
     let (epoch_outcome, recovered_repin) = prepare_data_root(
         &config.data.base_dir(),
         &config.wal_dir(),
@@ -251,8 +276,20 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
         warn_retention_envs_without_dir(&config, &env_dirs);
     }
 
+    // Finish the recovered job and catalog pin before constructing a live
+    // cache or any corpus reader. Recovery's cache argument is temporary:
+    // no reader exists yet, and from_parts hydrates its real cache from the
+    // reconciled PostgreSQL catalog. No reference to this cache escapes.
+    trawl_server::repin::recover::reconcile_store(
+        &storage,
+        &trawl_server::catalog::FieldCatalog::new(),
+        &config.data.base_dir(),
+        recovered_repin,
+    )
+    .await?;
+
     let (mut state, http_config) =
-        AppState::from_config(&config, metrics_handle, derivation).await?;
+        AppState::from_parts(&config, metrics_handle, derivation, auth, storage).await?;
 
     // Open query debug log if configured (CLI flag overrides config).
     let query_log_path = cli.query_log.or(config.server.query_log.clone());
@@ -271,54 +308,6 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
         );
         state.query.query_log = Some(Arc::new(log));
     }
-
-    // Activate internal telemetry by injecting the WAL writer.
-    if let Some((handle, layer)) = &telemetry {
-        if let Some(writer) = &state.ingest.wal_writer {
-            handle.set(Arc::clone(writer), &config.ingest.default_env);
-        }
-        // Activate event bus for real-time telemetry fanout (SSE streaming).
-        if let Some(bus) = &state.ingest.event_bus {
-            layer.set_bus(Arc::clone(bus));
-        }
-        // Activate hot buffer for synchronous telemetry event insertion.
-        if let Some(buf) = &state.query.hot_buffer {
-            layer.set_hot_buffer(Arc::clone(buf));
-        }
-    }
-
-    // Sole-writer guard: if the app-state advisory lock is ever lost (its
-    // session died and postgres freed the lock), a second trawld could
-    // acquire it and become a concurrent writer. Terminate immediately —
-    // split-brain is a correctness emergency, so a hard exit that stops all
-    // writes beats a graceful drain that keeps serving. The supervisor
-    // restarts us; boot re-acquires the lock or fails on the replacement.
-    {
-        let mut lock_lost = state.storage.lock_lost();
-        tokio::spawn(async move {
-            if lock_lost.wait_for(|lost| *lost).await.is_ok() {
-                tracing::error!(
-                    event_type = "lifecycle",
-                    "app-state sole-writer lock lost; terminating trawld to prevent a \
-                     split-brain second writer"
-                );
-                std::process::exit(1);
-            }
-        });
-    }
-
-    // Repin recovery, postgres half: finish the recovered job row
-    // (idempotent flip or failure), re-arm the conformance pass for a
-    // recovered cutover, sweep the aside, reconcile orphaned running rows.
-    // Runs before the conformance pass so a cleared `conformed_at`
-    // re-proves the corpus in this very boot.
-    trawl_server::repin::recover::reconcile_store(
-        &state.storage,
-        &state.query.field_catalog,
-        &config.data.base_dir(),
-        recovered_repin,
-    )
-    .await?;
 
     // ADR-0009 boot conformance pass: make the write-time invariant true
     // over the standing corpus before anything reads or writes it. Only on
@@ -372,6 +361,23 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
                 identity = ?identity,
                 "query-only node: archive belongs to the connected catalog"
             ),
+        }
+    }
+
+    // Recovery and conformance are complete. Telemetry can now write to
+    // the WAL and hot buffer, alongside the other ingest producers.
+    // Activate internal telemetry by injecting the WAL writer.
+    if let Some((handle, layer)) = &telemetry {
+        if let Some(writer) = &state.ingest.wal_writer {
+            handle.set(Arc::clone(writer), &config.ingest.default_env);
+        }
+        // Activate event bus for real-time telemetry fanout (SSE streaming).
+        if let Some(bus) = &state.ingest.event_bus {
+            layer.set_bus(Arc::clone(bus));
+        }
+        // Activate hot buffer for synchronous telemetry event insertion.
+        if let Some(buf) = &state.query.hot_buffer {
+            layer.set_hot_buffer(Arc::clone(buf));
         }
     }
 
@@ -545,8 +551,9 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
     Ok(())
 }
 
-/// Validate the current format before recovery can mutate storage. Repin
-/// swaps environment directories only; EPOCH stays in the live root throughout.
+/// After database admission, validate the format before recovery can mutate
+/// storage. Repin swaps environment directories only; EPOCH stays in the live
+/// root throughout. The caller retains the admitted sole-writer lock.
 /// Finish recovery before state construction or any corpus reader starts.
 fn prepare_data_root(
     data_root: &std::path::Path,
