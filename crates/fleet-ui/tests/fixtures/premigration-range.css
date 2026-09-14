@@ -13,7 +13,14 @@
  * trigger also loses `height: 28px` and `white-space: nowrap` so an
  * absolute range wraps its whole value instead of ellipsizing it into
  * the Haul button (F06), and its input rule drops `outline: none`
- * because :focus-visible now paints a 2px --ring outline. */
+ * because :focus-visible now paints a 2px --ring outline.
+ *
+ * 2026-09-14, review fix: .dr-pop .opt:disabled:hover re-captured
+ * verbatim from the shipped fleet-ui.css; the other 26 rules are
+ * untouched and the count stays 27. Its declarations had been left
+ * pointing at the pre-redesign --panel-2 / --line-2 while the base rule
+ * became a --fill track with no border, so a disabled preset changed
+ * tone under the pointer; the hover rule now restates the base. */
 /* Date range — single trigger (grafana-style); all presets live in the
  * popover. The trigger is a <button> (ADR-0029): it already declares its
  * own background, border and colour, so `font: inherit` is the whole
@@ -106,7 +113,7 @@
  * the <div> it replaced did. */
 .dr-pop button.opt { width: 100%; font: inherit; }
 .dr-pop .opt:hover { background: var(--accent-wash); border-color: var(--accent); }
-.dr-pop .opt:disabled:hover { background: var(--panel-2); border-color: var(--line-2); }
+.dr-pop .opt:disabled:hover { background: var(--fill); border-color: transparent; }
 .dr-pop .opt.on {
   background: var(--panel);
   color: var(--accent-ink);
