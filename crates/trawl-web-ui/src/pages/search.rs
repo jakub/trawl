@@ -545,6 +545,10 @@ pub fn Search() -> impl IntoView {
 
     let ring_result = Memo::new(move |_| ring_to_result(&ring.read()));
 
+    let loading = Signal::derive(move || {
+        !snapshot_q.get().trim().is_empty() && (query_pending.get() || rows.get().is_none())
+    });
+
     // The rows on screen, from whichever source the mode makes active:
     // the snapshot page, the live ring, or the latest aggregation frame.
     // The tab count, the footer count and the filter rail all read this
@@ -567,8 +571,12 @@ pub fn Search() -> impl IntoView {
         }
         LoadState::from_resource(rows.get().map(|r| r.map(|resp| resp.response.result)))
     });
+    // A resource holds its previous response while the next request is
+    // in flight, so a count taken straight off `active_rows` would put
+    // the old page's row count under the new executed scope and on the
+    // Events tab beside it. No count until the answer matches.
     let active_row_count = Signal::derive(move || match active_rows.get() {
-        LoadState::Ready(result) => Some(result.rows.len()),
+        LoadState::Ready(result) if !loading.get() => Some(result.rows.len()),
         _ => None,
     });
 
@@ -577,10 +585,6 @@ pub fn Search() -> impl IntoView {
     // and the notice below must not describe the page live replaced for
     // the frame it takes the empty query to resolve.
     let snapshot_ran = Signal::derive(move || !snapshot_q.get().trim().is_empty());
-
-    let loading = Signal::derive(move || {
-        !snapshot_q.get().trim().is_empty() && (query_pending.get() || rows.get().is_none())
-    });
 
     // Drive the shell's status bar from search-specific state. Both
     // derivations are pure (`search_status.rs`): the footer describes
@@ -827,6 +831,7 @@ pub fn Search() -> impl IntoView {
                         blocked=unreadable
                         live=live
                         count=active_row_count
+                        pending=loading
                         on_remove=on_remove_filter
                     />
                 </div>

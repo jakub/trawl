@@ -13,10 +13,13 @@
 //! words instead of left for the reader to infer.
 //!
 //! While the link cannot be read the strip states nothing at all beyond
-//! the "filters unreadable" chip: no window, no badge, no count and no
-//! remove controls, because nothing ran and removing a chip navigates
-//! (ADR-0027). The truncation notice lives in the result header, beside
-//! the row count it qualifies.
+//! the "filters unreadable" chip: no window, no badge, no count, no
+//! chips and no remove controls, because nothing ran and removing a chip
+//! navigates (ADR-0027). That holds whichever parameter is the malformed
+//! one — `r` and `page` refuse the link exactly as `f` does, and the
+//! filters would otherwise still parse and render under a banner saying
+//! nothing had run. The truncation notice lives in the result header,
+//! beside the row count it qualifies.
 
 use leptos::prelude::*;
 
@@ -53,6 +56,11 @@ pub fn MetaStrip(
     /// active. `None` while there is no answer to count.
     #[prop(into)]
     count: Signal<Option<usize>>,
+    /// True while a snapshot is in flight. The count then reads as an
+    /// ellipsis rather than as the rows of the response the resource is
+    /// still holding, which belong to the previous query.
+    #[prop(into)]
+    pending: Signal<bool>,
     /// Called with the index of a filter to remove.
     on_remove: Callback<usize>,
 ) -> impl IntoView {
@@ -63,32 +71,32 @@ pub fn MetaStrip(
                 <span class="scope-window">{move || window_caption(&window.get())}</span>
             </Show>
             <div class="meta-chips">
-                {move || filters.get().into_iter().enumerate().map(|(i, f)| {
-                    let is_excl = f.op == FilterOp::Exclude;
-                    let label = format!(
-                        "{}{} = {}",
-                        if is_excl { "⊘ " } else { "◆ " },
-                        f.field,
-                        f.value,
-                    );
-                    // Copy handle: the `<Show>` below re-renders its
-                    // children, so the name cannot be moved into them.
-                    let remove_label =
-                        StoredValue::new(format!("Remove filter {} = {}", f.field, f.value));
-                    view! {
-                        <span class="chip" class:excl=move || is_excl>
-                            <span>{label}</span>
-                            <Show when=move || !blocked.get()>
+                // The whole loop, not just the remove control: a chip
+                // under a refused link describes a query that did not
+                // run, whichever parameter the reader got wrong.
+                <Show when=move || !blocked.get()>
+                    {move || filters.get().into_iter().enumerate().map(|(i, f)| {
+                        let is_excl = f.op == FilterOp::Exclude;
+                        let label = format!(
+                            "{}{} = {}",
+                            if is_excl { "⊘ " } else { "◆ " },
+                            f.field,
+                            f.value,
+                        );
+                        let remove_label = format!("Remove filter {} = {}", f.field, f.value);
+                        view! {
+                            <span class="chip" class:excl=move || is_excl>
+                                <span>{label}</span>
                                 <button
                                     type="button"
                                     class="x"
-                                    aria-label=move || remove_label.get_value()
+                                    aria-label=remove_label
                                     on:click=move |_| on_remove.run(i)
                                 ><span aria-hidden="true">"×"</span></button>
-                            </Show>
-                        </span>
-                    }
-                }).collect::<Vec<_>>()}
+                            </span>
+                        }
+                    }).collect::<Vec<_>>()}
+                </Show>
                 <Show when=move || filters_unreadable.get()>
                     <span class="chip bad">"filters unreadable"</span>
                 </Show>
@@ -107,10 +115,14 @@ pub fn MetaStrip(
                     }}
                 </span>
                 <span class="scope-count">
-                    {move || count.get().map_or_else(
-                        || "—".to_string(),
-                        |n| format!("{n} rows"),
-                    )}
+                    {move || if pending.get() {
+                        "…".to_string()
+                    } else {
+                        count.get().map_or_else(
+                            || "—".to_string(),
+                            |n| format!("{n} rows"),
+                        )
+                    }}
                 </span>
             </Show>
         </div>

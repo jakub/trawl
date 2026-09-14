@@ -82,6 +82,47 @@ test('a link that cannot be read leaves the strip saying only that', async ({ pa
   await expect(page.locator(SEL.chipRemove)).toHaveCount(0);
 });
 
+test('a malformed range refuses the strip as completely as a malformed filter', async ({ page, request }) => {
+  await resetScenario(request, 'corpus');
+  // `f` reads perfectly here; `r` is the parameter the link got wrong.
+  // The chips used to survive that, so a refused link still listed the
+  // filters of a query that had not run (ADR-0027).
+  await page.goto(`${FILTERED_URL}&r=garbage`);
+
+  await expect(page.locator(SEL.urlNotice)).toBeVisible();
+  const strip = page.locator(SEL.scopeStrip);
+  await expect(strip.locator(SEL.filterChip)).toHaveCount(0);
+  await expect(page.locator(SEL.chipRemove)).toHaveCount(0);
+  await expect(page.locator(SEL.scopeWindow)).toHaveCount(0);
+  await expect(page.locator('.scope-count')).toHaveCount(0);
+});
+
+test('the strip counts the response it is describing, never the one before it', async ({ page, request }) => {
+  await resetScenario(request, 'corpus');
+  await page.goto('/search?q=service%3Dnginx&page=0');
+  await expect(page.locator('.scope-count')).toHaveText(`${CORPUS.rowCount} rows`);
+
+  // Hold the next query open. The resource keeps the rows already on
+  // screen, so an ungated count would state them under the new scope and
+  // on the Events tab beside it.
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  await page.route('**/api/v1/query*', async (route) => {
+    await held;
+    await route.continue();
+  });
+
+  await editBuffer(page, 'service=nginx last=7d');
+  await page.locator(SEL.runButton).click();
+
+  await expect(page.locator(SEL.scopeWindow)).toHaveText('last 7d');
+  await expect(page.locator('.scope-count')).toHaveText('…');
+  await expect(page.locator(`${SEL.workspaceTab} .c`)).toHaveCount(0);
+
+  release();
+  await expect(page.locator('.scope-count')).toHaveText(`${CORPUS.rowCount} rows`);
+});
+
 test('the result header badges a truncated answer', async ({ page, request }) => {
   await truncatedScenario(request);
   await page.goto('/search?q=service%3Dnginx');
