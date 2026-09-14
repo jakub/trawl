@@ -11,6 +11,28 @@ description: Every trawld and trawl client configuration key, with its type, def
 trawld --config /etc/trawl/trawld.toml
 ```
 
+### Validate without starting the daemon
+
+```bash
+trawld --check-config --config /etc/trawl/trawld.toml
+```
+
+Check mode requires an explicit `--config` path or `TRAWL_CONFIG`. It checks
+TOML syntax, supported setting names and types, config constraints, ingest
+derivation settings, and the presence of both database URLs. It exits with
+code 0 for valid configuration or a nonzero code for an error.
+
+Check mode does not connect to databases, bind listeners, generate keys or
+certificates, start crash capture, or write data and log files. It does not
+verify database credentials, network reachability, certificate contents, or
+filesystem permissions. Environment overrides apply as they do at startup.
+
+All typed sections reject unknown settings, including nested sections.
+Dynamic tables such as `retention.env.<name>` and `syslog.source_service_map`
+accept operator-defined names; each retention entry still requires supported
+fields. Error messages identify the setting path without printing its value
+or the surrounding configuration text.
+
 ### Server environment variables
 
 | Variable | Description |

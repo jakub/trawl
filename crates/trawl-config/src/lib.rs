@@ -22,6 +22,7 @@ pub mod fs;
 
 /// Top-level daemon configuration, loaded from TOML.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub server: ServerConfig,
     pub data: DataConfig,
@@ -43,6 +44,7 @@ pub struct Config {
 
 /// HTTPS listener settings.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     /// Address to bind the HTTPS listener (e.g. "127.0.0.1:5514").
     #[serde(default = "default_http_addr")]
@@ -189,6 +191,7 @@ impl ServerConfig {
 /// interactive key the shipper-sized ceiling. These are the class defaults; a
 /// role's `rate_rpm` in the fleet keystore overrides them for its keys.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RateLimitConfig {
     /// Requests/minute allowed per API key on the interactive API routes
     /// (default: 100). 0 = disabled.
@@ -198,24 +201,11 @@ pub struct RateLimitConfig {
     /// (default: 1000). 0 = disabled.
     #[serde(default = "default_ingest_rate_limit_rpm")]
     pub ingest_rpm: u32,
-    /// Retired per-role knob (ADR-0006), kept as a deserialization sentinel
-    /// so an old config's tuned value fails loudly at validation instead of
-    /// being silently ignored.
-    #[serde(default)]
-    pub admin: Option<u32>,
-    /// Retired per-role knob (sentinel).
-    #[serde(default)]
-    pub analyst: Option<u32>,
-    /// Retired per-role knob (sentinel).
-    #[serde(default)]
-    pub reader: Option<u32>,
-    /// Retired per-role knob (sentinel).
-    #[serde(default)]
-    pub ingest: Option<u32>,
 }
 
 /// Parquet data source settings.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DataConfig {
     /// Directory containing parquet files (e.g. "/var/lib/trawl/data").
     ///
@@ -262,6 +252,7 @@ impl DataConfig {
 
 /// Log ingestion pipeline settings.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IngestConfig {
     /// Whether the ingest endpoint is enabled.
     #[serde(default = "default_ingest_enabled")]
@@ -695,6 +686,7 @@ impl RetentionConfig {
 
 /// Scheduler configuration for background query execution.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SchedulerConfig {
     /// Enable the scheduler. When false, no scheduled queries run.
     #[serde(default = "default_scheduler_enabled")]
@@ -798,6 +790,7 @@ impl Default for SchedulerConfig {
 
 /// Native syslog listener settings for receiving logs from network appliances.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SyslogConfig {
     /// Enable the syslog listener. Default: false.
     #[serde(default)]
@@ -1187,17 +1180,8 @@ pub const DEFAULT_AUDIT_INTERVAL_SECS: u64 = 30;
 ///
 /// API keys live in the fleet-auth Postgres keystore (`database_url`).
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthConfig {
-    /// Retired knob, kept only as a sentinel.
-    ///
-    /// App state (query history, saved queries, schedules) lives in the
-    /// dedicated `trawl` postgres database (`[storage] database_url`,
-    /// ADR-0004). serde has no `deny_unknown_fields` here, so without this
-    /// field an old config's `db_path` would silently vanish; instead
-    /// [`Config::validate`] rejects it with a message naming the migration.
-    #[serde(default)]
-    pub db_path: Option<PathBuf>,
-
     /// Fleet-auth Postgres keystore URL (e.g.
     /// `postgres://user:pass@host:5432/fleet`). The `FLEET_DATABASE_URL`
     /// environment variable takes precedence. trawld refuses to start when
@@ -1215,7 +1199,6 @@ pub struct AuthConfig {
 impl Default for AuthConfig {
     fn default() -> Self {
         Self {
-            db_path: None,
             database_url: None,
             audit_interval_secs: default_audit_interval_secs(),
         }
@@ -1266,6 +1249,7 @@ impl AuthConfig {
 /// from `[auth]`: the stores are app state, not auth, and neither URL falls
 /// back to the other.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StorageConfig {
     /// Postgres URL of the dedicated `trawl` app-state database (e.g.
     /// `postgres://trawl:pass@host:5432/trawl`). The `TRAWL_DATABASE_URL`
@@ -1313,6 +1297,7 @@ impl StorageConfig {
 /// optional so the proxy can supply its own defaults without coupling trawld
 /// to the proxy's operational choices.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WebConfig {
     /// Bind address for the proxy HTTP listener. Default: "127.0.0.1:8090".
     pub bind_addr: Option<String>,
@@ -1459,10 +1444,6 @@ impl Default for RateLimitConfig {
         Self {
             default_rpm: DEFAULT_RATE_LIMIT_RPM,
             ingest_rpm: DEFAULT_INGEST_RATE_LIMIT_RPM,
-            admin: None,
-            analyst: None,
-            reader: None,
-            ingest: None,
         }
     }
 }
@@ -1475,35 +1456,6 @@ fn num_cpus() -> usize {
 /// Expand a leading `~/` to `$HOME/`.
 fn expand_tilde(path: &str) -> String {
     shellexpand::tilde(path).into_owned()
-}
-
-/// Reject leftover keys from a superseded config shape.
-///
-/// Package upgrades keep the operator's existing config (deb conffile
-/// semantics, reused helm config maps) and serde silently ignores unknown
-/// keys — so every removed knob has to fail loudly, naming the migration that
-/// killed it and what replaces it, rather than quietly dropping tuned values.
-///
-/// `fields` pairs each removed key's fully-qualified name with whether the
-/// parsed config still carries a value for it; only the present ones are
-/// named in the error.
-fn reject_removed_fields(
-    fields: &[(&str, bool)],
-    migration: &str,
-    guidance: &str,
-) -> Result<(), ConfigError> {
-    let present: Vec<&str> = fields
-        .iter()
-        .filter(|(_, is_set)| *is_set)
-        .map(|&(name, _)| name)
-        .collect();
-    if present.is_empty() {
-        return Ok(());
-    }
-    Err(ConfigError::Validation(format!(
-        "{} removed in {migration}: {guidance}",
-        present.join(", "),
-    )))
 }
 
 /// Validate the one safety budget whose zero value is deliberately invalid.
@@ -1548,10 +1500,33 @@ impl Config {
     ///
     /// Resolves paths (tilde expansion) and validates, same as [`from_file`].
     pub fn from_toml(contents: &str) -> Result<Self, ConfigError> {
-        let mut config: Self = toml::from_str(contents).map_err(|e| ConfigError::Parse {
-            path: PathBuf::from("<inline>"),
-            source: e,
-        })?;
+        let deserializer =
+            toml::de::Deserializer::parse(contents).map_err(|e| ConfigError::Parse {
+                path: PathBuf::from("<inline>"),
+                setting: "<document>".into(),
+                reason: "invalid TOML syntax",
+                offset: e.span().map(|span| span.start),
+            })?;
+        let mut config: Self =
+            serde_path_to_error::deserialize(deserializer).map_err(|e| ConfigError::Parse {
+                path: PathBuf::from("<inline>"),
+                setting: if let Some(field) = e
+                    .inner()
+                    .message()
+                    .strip_prefix("missing field `")
+                    .and_then(|s| s.strip_suffix('`'))
+                {
+                    format!("{}.{field}", e.path())
+                } else {
+                    e.path().to_string()
+                },
+                reason: if e.inner().message().starts_with("unknown field") {
+                    "unknown setting"
+                } else {
+                    "invalid or missing setting"
+                },
+                offset: e.inner().span().map(|span| span.start),
+            })?;
         config.resolve_paths();
         // Applied before validation so an env-supplied address is held to the
         // same checks as a configured one, and so every downstream reader of
@@ -1571,9 +1546,16 @@ impl Config {
             source: e,
         })?;
         Self::from_toml(&contents).map_err(|e| match e {
-            ConfigError::Parse { source, .. } => ConfigError::Parse {
+            ConfigError::Parse {
+                setting,
+                reason,
+                offset,
+                ..
+            } => ConfigError::Parse {
                 path: path.as_ref().to_owned(),
-                source,
+                setting,
+                reason,
+                offset,
             },
             other => other,
         })
@@ -1659,33 +1641,6 @@ impl Config {
             return Err(ConfigError::Validation("data.path cannot be empty".into()));
         }
 
-        reject_removed_fields(
-            &[("auth.db_path", self.auth.db_path.is_some())],
-            "the ADR-0004 slice-3 migration",
-            "query history, saved queries, and schedules now live in the dedicated trawl \
-             postgres database. Remove db_path from [auth], configure [storage] database_url \
-             (or TRAWL_DATABASE_URL), and see the fleet-auth cutover runbook. The old sqlite \
-             file is not imported — recreate saved queries and schedules",
-        )?;
-
-        let rl = &self.server.rate_limit;
-        reject_removed_fields(
-            &[
-                ("server.rate_limit.admin", rl.admin.is_some()),
-                ("server.rate_limit.analyst", rl.analyst.is_some()),
-                ("server.rate_limit.reader", rl.reader.is_some()),
-                ("server.rate_limit.ingest", rl.ingest.is_some()),
-            ],
-            "ADR-0006 slice 0",
-            &format!(
-                "rate limiting is now per API key, not per role. Replace the per-role keys \
-                 with default_rpm for the interactive API routes (requests/minute per key, \
-                 0 disables; default {DEFAULT_RATE_LIMIT_RPM}) and ingest_rpm for \
-                 /api/v1/ingest (default {DEFAULT_INGEST_RATE_LIMIT_RPM}). Per-role \
-                 class-of-service returns in slice 1 as a role rate_rpm attribute"
-            ),
-        )?;
-
         if self.server.max_concurrent_queries == 0 {
             return Err(ConfigError::Validation(
                 "server.max_concurrent_queries must be > 0".into(),
@@ -1735,42 +1690,32 @@ impl Config {
     /// otherwise — env is a path segment and the charset is the whole
     /// injectivity argument.
     fn validate_ingest_env_names(&self) -> Result<(), ConfigError> {
-        for env in &self.ingest.envs {
+        for (index, env) in self.ingest.envs.iter().enumerate() {
             if !is_valid_env_name(env) {
                 return Err(ConfigError::Validation(format!(
-                    "ingest.envs entry {env:?} is not a valid env name \
-                     (must match [a-z0-9_-]{{1,32}})"
+                    "ingest.envs[{index}] is not a valid env name (must match [a-z0-9_-]{{1,32}})"
                 )));
             }
             if RESERVED_ENV_NAMES.contains(&env.as_str()) {
                 return Err(ConfigError::Validation(format!(
-                    "ingest.envs entry {env:?} is reserved — `wal/` and \
-                     `scheduled/` live alongside env directories under the \
-                     data root"
+                    "ingest.envs[{index}] is reserved"
                 )));
             }
         }
         if !is_valid_env_name(&self.ingest.default_env) {
-            return Err(ConfigError::Validation(format!(
-                "ingest.default_env {:?} is not a valid env name \
-                 (must match [a-z0-9_-]{{1,32}})",
-                self.ingest.default_env
-            )));
+            return Err(ConfigError::Validation(
+                "ingest.default_env is not a valid env name (must match [a-z0-9_-]{1,32})".into(),
+            ));
         }
         if RESERVED_ENV_NAMES.contains(&self.ingest.default_env.as_str()) {
-            return Err(ConfigError::Validation(format!(
-                "ingest.default_env {:?} is reserved — `wal/` and \
-                 `scheduled/` live alongside env directories under the data \
-                 root",
-                self.ingest.default_env
-            )));
+            return Err(ConfigError::Validation(
+                "ingest.default_env is reserved".into(),
+            ));
         }
         if !self.ingest.envs.is_empty() && !self.ingest.envs.contains(&self.ingest.default_env) {
-            return Err(ConfigError::Validation(format!(
-                "ingest.default_env {:?} must be a member of ingest.envs \
-                 ({:?})",
-                self.ingest.default_env, self.ingest.envs
-            )));
+            return Err(ConfigError::Validation(
+                "ingest.default_env must be a member of ingest.envs".into(),
+            ));
         }
         Ok(())
     }
@@ -1806,26 +1751,20 @@ impl Config {
     /// ingested ones — refuse to start rather than write outside the data
     /// tree or produce a name no query can name.
     fn validate_syslog_service_names(&self) -> Result<(), ConfigError> {
-        let invalid = |field: String, value: &String| {
+        let invalid = |field: String| {
             ConfigError::Validation(format!(
-                "{field} {value:?} is not a valid service name \
+                "{field} is not a valid service name \
                  (1-{MAX_SERVICE_NAME_LEN} chars of [A-Za-z0-9._-], not \
                  dot-leading)"
             ))
         };
 
         if !is_valid_service_name(&self.syslog.default_service) {
-            return Err(invalid(
-                "syslog.default_service".to_owned(),
-                &self.syslog.default_service,
-            ));
+            return Err(invalid("syslog.default_service".to_owned()));
         }
         for (ip, service) in &self.syslog.source_service_map {
             if !is_valid_service_name(service) {
-                return Err(invalid(
-                    format!("syslog.source_service_map entry {ip:?} ="),
-                    service,
-                ));
+                return Err(invalid(format!("syslog.source_service_map[{ip:?}]")));
             }
         }
 
@@ -1842,10 +1781,14 @@ pub enum ConfigError {
         source: std::io::Error,
     },
 
-    #[error("invalid TOML in {}: {source}", path.display())]
+    // Never retain the TOML error: both its display and debug forms can
+    // include config values such as database credentials.
+    #[error("{reason} at {setting} in {} (byte offset {offset:?})", path.display())]
     Parse {
         path: PathBuf,
-        source: toml::de::Error,
+        setting: String,
+        reason: &'static str,
+        offset: Option<usize>,
     },
 
     #[error("config validation error: {0}")]
@@ -1855,6 +1798,99 @@ pub enum ConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_settings_fail_with_paths_without_values() {
+        for (table, key) in [
+            ("", "servre"),
+            ("server", "http_adrr"),
+            ("server.rate_limit", "admin"),
+            ("server.rate_limit", "analyst"),
+            ("server.rate_limit", "reader"),
+            ("server.rate_limit", "ingest"),
+            ("auth", "db_path"),
+            ("auth", "auth_cache_ttl_secs"),
+            ("web", "coastwatch_url"),
+            ("data", "paht"),
+            ("ingest", "enable"),
+            ("retention", "max_agge_days"),
+            ("retention.env.prod", "max_agge_days"),
+            ("scheduler", "enable"),
+            ("syslog", "enable"),
+            ("storage", "databse_url"),
+        ] {
+            let mut document = "[server]\n[data]\npath='/data'\n".to_owned();
+            if table.is_empty() {
+                document.insert_str(0, &format!("{key}='private-secret'\n"));
+            } else if table == "server" || table == "data" {
+                document = document.replace(
+                    &format!("[{table}]"),
+                    &format!("[{table}]\n{key}='private-secret'"),
+                );
+            } else {
+                use std::fmt::Write as _;
+                writeln!(document, "[{table}]\n{key}='private-secret'").unwrap();
+            }
+            let error = Config::from_toml(&document).unwrap_err();
+            let expected = if table.is_empty() {
+                key.to_owned()
+            } else {
+                format!("{table}.{key}")
+            };
+            assert!(error.to_string().contains(&expected), "{expected}: {error}");
+            assert!(error.to_string().contains("unknown setting"), "{error}");
+            assert!(!format!("{error:?}").contains("private-secret"));
+        }
+    }
+
+    #[test]
+    fn dynamic_maps_and_typed_derivation_entries_remain_supported() {
+        let config = Config::from_toml(
+            r#"
+[server]
+[data]
+path = "/data"
+[retention.env.prod]
+max_age_days = 7
+[syslog.source_service_map]
+"192.0.2.1" = "router"
+[ingest]
+severity_from = [{ field = "level", dialect = "syslog" }]
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.retention.env["prod"].max_age_days, 7);
+        assert_eq!(config.syslog.source_service_map["192.0.2.1"], "router");
+        let error = Config::from_toml(
+            r#"
+[server]
+[data]
+path = "/data"
+[ingest]
+severity_from = [{ field = "level", dialcet = "private-secret" }]
+"#,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("ingest.severity_from[0]"),
+            "{error}"
+        );
+        assert!(!format!("{error:?}").contains("private-secret"));
+    }
+
+    #[test]
+    fn invalid_values_and_syntax_do_not_echo_credentials() {
+        for document in [
+            "[server]\ntimeout_secs='postgres://user:private-secret@host/db'\n[data]\npath='/data'",
+            "[server]\npassword='private-secret\n[data]\npath='/data'",
+            "[server]\n[data]\npath='/data'\n[ingest]\ndefault_env='PRIVATE-secret'",
+            "[server]\n[data]\npath='/data'\n[syslog]\nenabled=true\ndefault_service='private-secret/invalid'",
+        ] {
+            let error = Config::from_toml(document).unwrap_err();
+            assert!(!error.to_string().contains("private-secret"));
+            assert!(!format!("{error:?}").contains("private-secret"));
+        }
+    }
 
     #[test]
     fn parse_minimal_config() {
@@ -1911,26 +1947,6 @@ path = ""
         let config: Config = toml::from_str(toml).unwrap();
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("data.path"));
-    }
-
-    #[test]
-    fn validation_rejects_leftover_db_path() {
-        // Deb conffile upgrades preserve old trawld.toml files, so a leftover
-        // db_path must be a loud error naming the migration, never a silent
-        // ignore.
-        let toml = r#"
-[server]
-[data]
-path = "/data/*.parquet"
-[auth]
-db_path = "/var/lib/trawl/store.db"
-"#;
-        let config: Config = toml::from_str(toml).unwrap();
-        let err = config.validate().unwrap_err().to_string();
-        assert!(err.contains("auth.db_path removed"), "got: {err}");
-        assert!(err.contains("slice-3"), "got: {err}");
-        assert!(err.contains("[storage]"), "got: {err}");
-        assert!(err.contains("runbook"), "got: {err}");
     }
 
     #[test]
@@ -2128,32 +2144,6 @@ path = "/data/*.parquet"
         assert_eq!(config.server.rate_limit.default_rpm, 250);
         assert_eq!(config.server.rate_limit.ingest_rpm, 5000);
         config.validate().unwrap();
-    }
-
-    #[test]
-    fn validation_rejects_legacy_rate_limit_fields() {
-        // Deb conffile upgrades preserve old trawld.toml files, so a leftover
-        // per-role key must be a loud error naming the migration, never a
-        // silent ignore of the operator's tuned quotas.
-        for legacy_key in ["admin", "analyst", "reader", "ingest"] {
-            let toml = format!(
-                r#"
-[server]
-[server.rate_limit]
-{legacy_key} = 100
-[data]
-path = "/data/*.parquet"
-[auth]
-"#
-            );
-            let config: Config = toml::from_str(&toml).unwrap();
-            let err = config.validate().unwrap_err().to_string();
-            assert!(err.contains(legacy_key), "got: {err}");
-            assert!(err.contains("removed"), "got: {err}");
-            assert!(err.contains("default_rpm"), "got: {err}");
-            assert!(err.contains("ingest_rpm"), "got: {err}");
-            assert!(err.contains("ADR-0006"), "got: {err}");
-        }
     }
 
     #[test]
@@ -2657,7 +2647,7 @@ path = "/data"
     }
 
     #[test]
-    fn validation_accepts_auth_without_db_path() {
+    fn validation_accepts_fleet_database_url() {
         let toml = r#"
 [server]
 [data]
@@ -2667,41 +2657,6 @@ database_url = "postgres://fleet:fleet@localhost:5433/fleet"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         config.validate().unwrap();
-    }
-
-    #[test]
-    fn legacy_auth_cache_ttl_key_still_parses() {
-        // auth_cache_ttl_secs is not a config key; a trawld.toml still
-        // carrying it must keep parsing (serde ignores unknown fields).
-        let toml = r#"
-[server]
-[data]
-path = "/data"
-[auth]
-auth_cache_ttl_secs = 300
-"#;
-        let config: Config = toml::from_str(toml).unwrap();
-        assert_eq!(config.auth.audit_interval_secs, 30);
-    }
-
-    #[test]
-    fn retired_web_upstream_key_is_ignored_by_serde_default() {
-        // WebConfig intentionally has no deny_unknown_fields attribute, so
-        // deployed config files carrying a removed optional knob keep parsing.
-        let removed_key = "coastwatch_url";
-        let toml = format!(
-            r#"
-[server]
-[data]
-path = "/data"
-[auth]
-[web]
-{removed_key} = "https://retired.invalid"
-"#
-        );
-
-        let config: Config = toml::from_str(&toml).unwrap();
-        assert!(config.web.shared_domain.is_none());
     }
 
     #[test]
@@ -2991,7 +2946,7 @@ envs = ["prod", "lab"]
         );
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("default_env"), "got: {err}");
-        assert!(err.contains("dev"), "got: {err}");
+        assert!(err.contains("ingest.envs"), "got: {err}");
     }
 
     #[test]

@@ -1351,7 +1351,6 @@ pub async fn setup_in_dir_with_data_and_timeout(
         },
         data: DataConfig { path: data_path },
         auth: AuthConfig {
-            db_path: None,
             database_url: Some(fleet_db_url.clone()),
             audit_interval_secs: 0,
         },

@@ -90,9 +90,23 @@ impl InitReport {
     }
 }
 
+/// Seal a validation-only process without starting crash capture.
+///
+/// Call on the main thread before reading configuration or starting threads.
+/// This drops ptrace privileges and prevents privilege acquisition on exec,
+/// but creates no files, monitor processes, or signal handlers.
+///
+/// # Errors
+/// Returns a content-free seal failure if either protection cannot be set.
+pub fn seal_for_config_check() -> Result<(), FailureReason> {
+    #[cfg(target_os = "linux")]
+    caps::seal().map_err(|_| FailureReason::Seal)?;
+    Ok(())
+}
+
 /// Initialize crash-dump capture.
 ///
-/// MUST be the very first statement in `main()`, before any threads are spawned
+/// For daemon startup, call before config reads or any threads are spawned
 /// or the async runtime is built: the monitor is launched by re-execing this
 /// binary, that re-exec/spawn is only fork-safe while the process is still
 /// single-threaded, and the capability seal applies to the calling thread, which

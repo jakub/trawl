@@ -359,7 +359,6 @@ async fn ac5_rate_rpm_role_ceiling_spent_separately_per_class() {
     let server = common::setup_with_rate_limit(RateLimitConfig {
         default_rpm: 10_000,
         ingest_rpm: 10_000,
-        ..RateLimitConfig::default()
     })
     .await;
     let store = KeyStore::from_pool(server.fleet_pool.clone());

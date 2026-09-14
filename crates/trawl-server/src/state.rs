@@ -575,7 +575,7 @@ async fn build_storage_state(config: &Config) -> Result<StorageState, crate::err
             }
             other => crate::error::ServerError::ServiceUnavailable(format!(
                 "trawl app-state database unreachable at startup (is postgres up and the \
-                 [storage] database provisioned? see the fleet-auth cutover runbook): {other}"
+                 [storage] database provisioned? Check [storage] database_url or TRAWL_DATABASE_URL): {other}"
             )),
         })
 }

@@ -1413,7 +1413,6 @@ async fn ingest_rpm_is_independent_of_the_interactive_ceiling() {
     let server = setup_with_rate_limit(RateLimitConfig {
         default_rpm: 1,
         ingest_rpm: 10,
-        ..RateLimitConfig::default()
     })
     .await;
     let raw = raw_client();
@@ -1511,7 +1510,6 @@ async fn ingest_ceiling_does_not_apply_to_keys_without_ingest_permission() {
     let server = setup_with_rate_limit(RateLimitConfig {
         default_rpm: 1,
         ingest_rpm: 10,
-        ..RateLimitConfig::default()
     })
     .await;
     let raw = raw_client();

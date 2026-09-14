@@ -21,9 +21,13 @@ use trawl_server::transport::http;
 #[derive(Parser)]
 #[command(name = "trawld", version, long_version = trawl_core::version::long_version(), about)]
 struct Cli {
-    /// Path to the configuration file.
-    #[arg(long, env = "TRAWL_CONFIG", default_value = "~/.trawl/trawld.toml")]
-    config: String,
+    /// Path to the configuration file (default: ~/.trawl/trawld.toml).
+    #[arg(long, env = "TRAWL_CONFIG")]
+    config: Option<String>,
+
+    /// Validate an explicitly selected config and exit without starting services.
+    #[arg(long, requires = "config")]
+    check_config: bool,
 
     /// Path to ndjson query debug log. Overrides config `server.query_log`.
     #[arg(long, env = "TRAWL_QUERY_LOG")]
@@ -44,6 +48,24 @@ struct Cli {
 const RUNTIME_SHUTDOWN_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Inspect only arguments before choosing the seal. The monitor re-exec
+    // carries no arguments, so it always reaches normal crash-dump init.
+    // Both paths seal before config reads or threads. Check mode must not
+    // start the monitor or create its directory, even when capture is enabled.
+    if std::env::args_os().any(|arg| arg == "--check-config") {
+        if trawl_crashdump::seal_for_config_check().is_err() {
+            eprintln!("[trawld] configuration check refused: capability seal failed");
+            std::process::exit(1);
+        }
+        let cli = Cli::parse();
+        let path = resolve_path(cli.config.as_deref().expect("clap requires config"));
+        if let Err(error) = check_config(&path) {
+            eprintln!("[trawld] {error}");
+            std::process::exit(1);
+        }
+        println!("Configuration is valid: {}", path.display());
+        return Ok(());
+    }
     // Install crash-dump capture before any threads are spawned or the async
     // runtime is built: the minidump monitor is launched by re-execing this
     // binary, which is only fork-safe while the process is single-threaded. In
@@ -104,6 +126,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     result
 }
 
+/// Validate local configuration only. Database URLs are required, but no
+/// network connectivity, credentials, or existing data are inspected.
+fn check_config(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    let config = Config::from_file(path)?;
+    config.auth.resolve_database_url()?;
+    config.storage.resolve_database_url()?;
+    trawl_server::ingest::producer::Derivation::resolve(&config.ingest)
+        .map_err(|_| "invalid setting at ingest: check severity_from and time_from")?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)] // lifecycle orchestration is cohesive
 async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn std::error::Error>> {
     rustls::crypto::ring::default_provider()
@@ -111,7 +144,7 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
         .expect("failed to install ring crypto provider");
 
     let cli = Cli::parse();
-    let config_path = resolve_path(&cli.config);
+    let config_path = resolve_path(cli.config.as_deref().unwrap_or("~/.trawl/trawld.toml"));
     // Pre-tracing boundary: no subscriber exists yet, so a config failure
     // here can only surface through stderr. Name the resolved path so the
     // operator can tell which file failed.

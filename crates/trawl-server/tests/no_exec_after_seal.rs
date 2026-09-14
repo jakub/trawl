@@ -4,7 +4,7 @@
 
 //! trawld execs nothing after the crash-dump monitor (ADR-0023 ruling 4).
 //!
-//! `trawl_crashdump::init()` is the first statement of `main`. It re-execs
+//! Normal startup calls `trawl_crashdump::init()` before config reads. It re-execs
 //! this binary as the minidump monitor, then seals the daemon: it clears
 //! `CAP_SYS_PTRACE` from its own effective and permitted sets and sets
 //! `no_new_privs`. Both halves matter here. The cleared permitted set is what

@@ -80,6 +80,7 @@ tokio-stream = "0.1"
 shellexpand = "3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_path_to_error = "0.1.20"
 sha2 = "0.10"
 # Umbrella sqlx: the rusqlite (links = "sqlite3") collision that forced the
 # direct sqlx-core/sqlx-postgres workaround died with the trawl-auth crate in

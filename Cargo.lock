@@ -6319,6 +6319,7 @@ dependencies = [
  "chrono",
  "libc",
  "serde",
+ "serde_path_to_error",
  "shellexpand",
  "tempfile",
  "thiserror 2.0.19",
