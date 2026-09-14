@@ -1,13 +1,13 @@
 {
   "stamp": "ui-redesign-2026-09-13",
-  "commit": "517110c025cb6788cebf7f22aa9845e0e9502700",
-  "dist_sha256": "1ca3aabd1fdddfa14b7a039ba22d160df1e4ae6a4ec73db7341f718810bd4964",
+  "commit": "2e4960ae4dd47f035f925d085305236d3835b554",
+  "dist_sha256": "91a78c9b1899107613fab7c27df750a8cd739390d56213de76a63e807c3f8403",
   "dist_files": [
     "index.html",
     "trawl-web-ui-a24b67756531e158_bg.wasm"
   ],
   "port": 8131,
-  "captured_at": "2026-09-14T20:56:51.111Z",
+  "captured_at": "2026-09-14T21:31:52.108Z",
   "viewports": {
     "wide": {
       "width": 1440,
