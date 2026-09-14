@@ -6,6 +6,7 @@
 
 // Pure modules that don't touch Leptos/web-sys — keep them ungated so
 // their tests run under plain `cargo test` on native.
+mod completion;
 mod context_query;
 mod dashboard_state;
 mod drawer_query;
@@ -19,6 +20,7 @@ mod perms;
 mod query_merge;
 mod repin_flow;
 mod repin_hint;
+mod result_actions;
 mod schedule_edit;
 mod schema_nav;
 mod search_status;

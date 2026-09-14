@@ -880,3 +880,35 @@ fn the_paged_run_fixture_carries_more_rows_than_one_preview_page() {
 /// The net drawer's own source, for the one constant the paging spec
 /// mirrors.
 const NET_DRAWER_SRC: &str = include_str!("../src/components/net_drawer.rs");
+
+#[test]
+fn result_actions_fixture_has_numeric_and_null_aggregate_cells() {
+    use trawl_api::value::Value;
+    let resp: QueryResponse = decode(
+        "result-actions.json",
+        include_str!("../e2e/harness/wire/result-actions.json"),
+    );
+    assert_eq!(
+        resp.result
+            .columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>(),
+        ["host", "count"]
+    );
+    assert_eq!(resp.pagination.returned, resp.result.rows.len());
+    assert_eq!(
+        resp.result
+            .rows
+            .iter()
+            .map(|r| r[1].clone())
+            .collect::<Vec<_>>(),
+        vec![
+            Value::Integer(100),
+            Value::Integer(20),
+            Value::Integer(10),
+            Value::Null,
+            Value::Float(-1.5)
+        ]
+    );
+}

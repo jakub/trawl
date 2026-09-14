@@ -109,7 +109,7 @@ test('touch can open the bucket table', async ({ browser }) => {
   await context.close();
 });
 
-test('live aggregation waits for its snapshot and charts it in either tab', async ({ page, request }) => {
+test('live aggregation waits, charts in Visualization and shows exact rows in Events', async ({ page, request }) => {
   await resetScenario(request, 'stream-chart');
   await page.goto('/search?q=service%3Dnginx%20%7C%20timechart%20count()&mode=live');
   await expect(page.getByText('Waiting for the first live aggregation snapshot.')).toBeVisible();
@@ -119,7 +119,9 @@ test('live aggregation waits for its snapshot and charts it in either tab', asyn
   expect((await request.post('/__ctl/stream/frame', { data: { data: JSON.stringify({ columns: ['_time', 'count'], rows: [{ _time: '2026-09-01T00:00:00Z', count: 2 }, { _time: '2026-09-01T00:01:00Z', count: 4 }] }) } })).ok()).toBe(true);
   await expect(page.locator('.chart canvas')).toHaveCount(1);
   await page.getByRole('tab', { name: /^Events/ }).click();
-  await expect(page.locator('.chart canvas')).toHaveCount(1);
+  await expect(page.locator('.chart canvas')).toHaveCount(0);
+  await expect(page.locator('.results-table tbody tr')).toHaveCount(2);
+  await expect(page.locator('.results-table tbody tr').first()).toContainText('2026-09-01T00:00:00Z');
 });
 
 test('grouped snapshots explain the unsupported shape for equal or unequal series', async ({ page }) => {
@@ -270,6 +272,7 @@ test('disconnected live charts show reconnecting and recover on a fresh snapshot
 test('live chart updates data and series while its supported hint stays unchanged', async ({ page, request }) => {
   await resetScenario(request, 'stream-chart');
   await page.goto('/search?q=service%3Dnginx%20%7C%20timechart%20count()&mode=live');
+  await page.getByRole('tab', { name: 'Visualization' }).click();
   await expect.poll(async () => (await (await request.get('/__ctl/state')).json()).sse.open).toBe(1);
   const send = async (columns: string[], rows: Record<string, string | number>[]) => {
     expect((await request.post('/__ctl/stream/frame', { data: { data: JSON.stringify({ columns, rows }) } })).ok()).toBe(true);

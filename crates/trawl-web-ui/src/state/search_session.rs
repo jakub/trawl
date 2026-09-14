@@ -8,6 +8,29 @@ use leptos::prelude::*;
 use trawl_api::QueryResponse;
 
 use crate::api::{self, ApiError};
+use crate::query_merge::{Filter, RangeSpec};
+
+/// Query provenance captured with one response. Keep structured URL state
+/// separate from effective DSL so Include preserves the original navigation.
+#[derive(Clone)]
+pub struct ExecutedQuery {
+    pub effective: String,
+    pub base: String,
+    pub filters: Vec<Filter>,
+    pub range: RangeSpec,
+}
+
+#[derive(Clone)]
+pub struct ExecutedResponse {
+    pub query: ExecutedQuery,
+    pub response: QueryResponse,
+}
+impl std::ops::Deref for ExecutedResponse {
+    type Target = QueryResponse;
+    fn deref(&self) -> &Self::Target {
+        &self.response
+    }
+}
 
 /// Build a Leptos `LocalResource` that runs `api::query(q, page)` whenever
 /// the effective-query or page signals change.
@@ -28,19 +51,31 @@ pub fn rows_resource(
     effective_q: Memo<String>,
     page: Memo<usize>,
     pending: WriteSignal<bool>,
-) -> LocalResource<Result<QueryResponse, ApiError>> {
+    base: Memo<String>,
+    filters: Memo<Vec<Filter>>,
+    range: Memo<RangeSpec>,
+) -> LocalResource<Result<ExecutedResponse, ApiError>> {
     LocalResource::new(move || {
         let q = effective_q.get();
         let p = page.get();
+        let query = ExecutedQuery {
+            effective: q.clone(),
+            base: base.get(),
+            filters: filters.get(),
+            range: range.get(),
+        };
         async move {
             if q.trim().is_empty() {
-                return Ok(empty_response());
+                return Ok(ExecutedResponse {
+                    query,
+                    response: empty_response(),
+                });
             }
             let _ = pending.try_set(true);
             let response = api::query(&q, p).await;
             // A response can finish after route teardown disposed the signal.
             let _ = pending.try_set(false);
-            response
+            response.map(|response| ExecutedResponse { query, response })
         }
     })
 }

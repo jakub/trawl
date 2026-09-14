@@ -583,6 +583,8 @@ fn TailPane(svc: ServiceSchema, bus: ToastBus) -> impl IntoView {
     let snapshot = RwSignal::new(None::<QueryResult>);
     let lagged = RwSignal::new(None::<u64>);
     let paused = RwSignal::new(false);
+    let failure = RwSignal::new(Some("Connecting…"));
+    let retry = RwSignal::new(0_u64);
 
     // Lifecycle holder — drop closes the SSE. `StreamLifecycle` owns a
     // `wasm_bindgen::Closure`, which isn't Send/Sync, so we need the
@@ -595,29 +597,35 @@ fn TailPane(svc: ServiceSchema, bus: ToastBus) -> impl IntoView {
 
     Effect::new(move |_| {
         let is_paused = paused.get();
+        let _ = retry.get();
         if is_paused {
             lifecycle.set_value(None);
             return;
         }
-        let q = format!(r#"service="{}""#, svc_name_for_stream.replace('"', ""));
+        lifecycle.set_value(None);
+        failure.set(Some("Connecting…"));
+        let q = format!(
+            r#"service="{}""#,
+            crate::context_query::escape_dq(&svc_name_for_stream)
+        );
         let sig = LiveSignals {
             ring,
             snapshot,
             lagged,
-            failure: None,
+            failure: Some(failure),
             frames: None,
         };
-        match start_stream(&q, sig) {
-            Some(lc) => lifecycle.set_value(Some(lc)),
-            None => {
-                bus.push(
-                    ToastKind::Error,
-                    "Tail unavailable",
-                    Some(format!(
-                        "Couldn't open a live stream for {svc_name_for_toast}."
-                    )),
-                );
-            }
+        if let Some(lc) = start_stream(&q, sig) {
+            lifecycle.set_value(Some(lc));
+        } else {
+            failure.set(Some("Live stream unavailable."));
+            bus.push(
+                ToastKind::Error,
+                "Tail unavailable",
+                Some(format!(
+                    "Couldn't open a live stream for {svc_name_for_toast}."
+                )),
+            );
         }
     });
 
@@ -630,8 +638,8 @@ fn TailPane(svc: ServiceSchema, bus: ToastBus) -> impl IntoView {
     view! {
         <div class="sd-tail">
             <div class="tl-bar">
-                <span class=move || if paused.get() { "pulse off" } else { "pulse" }><span></span></span>
-                <span class="lbl">{move || if paused.get() { "Paused" } else { "Tailing" }}</span>
+                <span class=move || if paused.get() || failure.get().is_some() { "pulse off" } else { "pulse" }><span></span></span>
+                <span class="lbl">{move || if paused.get() { "Paused" } else if failure.get() == Some("Connecting…") { "Connecting…" } else if failure.get().is_some() { "Disconnected" } else { "Tailing" }}</span>
                 <span class="sp"></span>
                 {move || lagged_label().map(|l| view! {
                     <span class="lbl" style="color:var(--yellow)">{l}</span>
@@ -644,12 +652,17 @@ fn TailPane(svc: ServiceSchema, bus: ToastBus) -> impl IntoView {
                 </Btn>
             </div>
 
+            <Show when=move || !paused.get() && failure.get().is_some_and(|f| f != "Connecting…")>
+                <p role="alert">"Live tail disconnected. Retry to reconnect."</p>
+                <Btn variant=Variant::Secondary on_click=Callback::new(move |()| retry.update(|n| *n = n.wrapping_add(1)))>"Retry live stream"</Btn>
+            </Show>
+
             <div class="tl-stream" role="region" aria-label="Live tail messages" tabindex="0">
                 {move || {
                     let rb = ring.read();
                     let total = rb.events.len();
                     if total == 0 {
-                        return view! { <div class="sc-more">"Waiting for events…"</div> }.into_any();
+                        return view! { <div class="sc-more">{move || if paused.get() { "Tail paused." } else if failure.get().is_some() { "No events received." } else { "Waiting for events…" }}</div> }.into_any();
                     }
                     let skip = total.saturating_sub(TAIL_DISPLAY_MAX);
                     rb.events.iter().skip(skip).map(|ev| {

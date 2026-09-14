@@ -20,6 +20,7 @@
 
 use leptos::prelude::*;
 use trawl_api::value::QueryResult;
+use wasm_bindgen::JsCast;
 
 use crate::components::chart::Chart;
 use crate::components::degraded_notice::DegradedNotice;
@@ -36,8 +37,8 @@ use crate::pages::layout::ShellStatus;
 use crate::search_status::{CountSource, FooterCount, StatusInputs, StatusKind, search_status};
 use crate::search_url::{Param, admit_filters, refusal_copy};
 use crate::state::query::{
-    Filter, Mode, RangeSpec, UrlSignals, effective_query, effective_window, navigator,
-    replace_navigator, report_refusal, url_signals,
+    Filter, Mode, UrlSignals, effective_query, effective_window, navigator, replace_navigator,
+    report_refusal, url_signals,
 };
 use crate::state::search_session::rows_resource;
 use fleet_ui::{LoadState, TabItem, Tabs, ToastBus, ToastKind};
@@ -45,6 +46,15 @@ use fleet_ui::{LoadState, TabItem, Tabs, ToastBus, ToastKind};
 use crate::state::stream_session::{
     LiveSignals, RingBuffer, StreamLifecycle, ring_to_result, start_stream,
 };
+
+fn focus_search_control(selector: &str) {
+    if let Some(document) = web_sys::window().and_then(|window| window.document())
+        && let Ok(Some(element)) = document.query_selector(selector)
+        && let Ok(element) = element.dyn_into::<web_sys::HtmlElement>()
+    {
+        let _ = element.focus();
+    }
+}
 
 /// Results-area tab. The typed enum is search-page semantics rather than
 /// design-system chrome, so it stays app-side while the strip itself is
@@ -150,7 +160,14 @@ pub fn Search() -> impl IntoView {
     });
 
     let (query_pending, set_query_pending) = signal(false);
-    let rows = rows_resource(snapshot_q, page, set_query_pending);
+    let rows = rows_resource(
+        snapshot_q,
+        page,
+        set_query_pending,
+        executed_q,
+        filters,
+        range,
+    );
 
     let goto = navigator();
 
@@ -364,18 +381,50 @@ pub fn Search() -> impl IntoView {
 
     let on_navigate_q = {
         let goto = goto.clone();
-        Callback::new(move |new_q: String| {
+        Callback::new(move |nav: crate::context_query::SearchNavigation| {
+            let new_q = nav.query;
             if unreadable.get_untracked() {
                 return;
             }
             // Buffer after navigation, not before it: a refused link
             // must leave the editor exactly as the reader left it.
-            let outcome = goto(&new_q, 0, Mode::Snapshot, &[], &RangeSpec::default(), false);
+            let outcome = goto(&new_q, 0, Mode::Snapshot, &[], &nav.range, false);
             if outcome.is_ok() {
                 query_text.set(new_q);
             }
             report_refusal(bus, outcome);
         })
+    };
+
+    let on_result_filter = {
+        let goto = goto.clone();
+        Callback::new(
+            move |(query, filter): (crate::state::search_session::ExecutedQuery, Filter)| {
+                if unreadable.get_untracked() {
+                    return;
+                }
+                let mut filters = query.filters;
+                if filters.contains(&filter) {
+                    return;
+                }
+                filters.push(filter);
+                if let Err(reason) = admit_filters(&filters) {
+                    bus.push(ToastKind::Error, refusal_copy(reason), None);
+                    return;
+                }
+                report_refusal(
+                    bus,
+                    goto(
+                        &query.base,
+                        0,
+                        Mode::Snapshot,
+                        &filters,
+                        &query.range,
+                        false,
+                    ),
+                );
+            },
+        )
     };
 
     // Leaving live is a navigation, not a local pause: the same query,
@@ -484,7 +533,7 @@ pub fn Search() -> impl IntoView {
                 LoadState::Ready(ring_result.get())
             };
         }
-        LoadState::from_resource(rows.get().map(|r| r.map(|resp| resp.result)))
+        LoadState::from_resource(rows.get().map(|r| r.map(|resp| resp.response.result)))
     });
     let active_row_count = Signal::derive(move || match active_rows.get() {
         LoadState::Ready(result) => Some(result.rows.len()),
@@ -609,15 +658,43 @@ pub fn Search() -> impl IntoView {
     // query ran under, which is the base query's own time clause when it
     // carries one — the picker's trigger keeps saying what the URL holds
     // (ADR-0027, amended 2026-09-12).
+    // Facets read the displayed response too. A pending URL must not turn
+    // retained aggregate cells into input fields for the new query.
+    let facet_suppressed = Signal::derive(move || {
+        unreadable.get()
+            || (!live.get()
+                && rows
+                    .get()
+                    .and_then(Result::ok)
+                    .is_some_and(|r| r.query.effective != effective_q.get()))
+    });
+    let facet_aggregate = Signal::derive(move || {
+        if live.get() {
+            is_chart_query.get()
+        } else {
+            rows.get().and_then(Result::ok).is_some_and(|r| {
+                !crate::result_actions::Capabilities::for_query(&r.query.effective).raw_actions()
+            })
+        }
+    });
+
     let window = Signal::derive(move || effective_window(&executed_q.get(), &range.get()));
 
     view! {
         <div class="search-layout">
+            <a class="skip-link" href="#search-query" on:click=move |event: web_sys::MouseEvent| {
+                event.prevent_default();
+                focus_search_control(".dsl-editor [contenteditable=true]");
+            }>"Skip to query editor"</a>
+            <a class="skip-link" href="#search-results" on:click=move |event: web_sys::MouseEvent| {
+                event.prevent_default();
+                focus_search_control("[role=tablist][aria-label=Results] [role=tab][tabindex='0']");
+            }>"Skip to results"</a>
             <FacetSidebar
                 state=active_rows
                 filters=filters_sig
-                suppressed=unreadable
-                aggregate_shape=is_chart_query
+                suppressed=facet_suppressed
+                aggregate_shape=facet_aggregate
                 on_add=on_add_filter
                 on_clear=on_clear_filters
             />
@@ -684,7 +761,7 @@ pub fn Search() -> impl IntoView {
                 <DegradedNotice query=effective_q fields=degraded_fields/>
                 <Show when=move || !unreadable.get()
                     && mode.get() == Mode::Live
-                    && !is_chart_query.get()
+                    && (active_tab.get() == ResultsTab::Events || !is_chart_query.get())
                     && stream_failure.get().is_some()
                 >
                     <div class="results-empty">
@@ -705,13 +782,13 @@ pub fn Search() -> impl IntoView {
                                 page=page
                                 rows=rows
                                 on_paginate=on_paginate
-                                on_add_filter=on_add_filter
+                                on_add_filter=on_result_filter
                                 on_navigate=on_navigate_q
                             />
                         </>
                     }.into_any(),
                     (ResultsTab::Events, Mode::Live) if is_chart_query.get() => view! {
-                        <Chart snapshot=live_snapshot query=effective_q failure=stream_failure on_retry=retry_stream/>
+                        <LiveRawTable result=Signal::derive(move || live_snapshot.get().unwrap_or_else(QueryResult::empty)) failure=stream_failure waiting="Waiting for the first live aggregation snapshot."/>
                     }.into_any(),
                     (ResultsTab::Events, Mode::Live) => view! {
                         <LiveRawTable result=ring_result failure=stream_failure/>
@@ -756,17 +833,18 @@ pub fn Search() -> impl IntoView {
 /// Simple table rendering for the ring-buffered raw-event live feed.
 #[component]
 fn LiveRawTable(
+    #[prop(default = "Streaming — waiting for first event…")] waiting: &'static str,
     #[prop(into)] result: Signal<QueryResult>,
     #[prop(into)] failure: Signal<Option<&'static str>>,
 ) -> impl IntoView {
     view! {
-        <div class="results">
+        <div id="search-results" class="results" tabindex="-1">
             {move || {
                 let r = result.get();
                 if r.columns.is_empty() {
                     view! {
                         <Show when=move || failure.get().is_none()>
-                            <div class="results-empty">"Streaming — waiting for first event…"</div>
+                            <div class="results-empty">{waiting}</div>
                         </Show>
                     }.into_any()
                 } else {

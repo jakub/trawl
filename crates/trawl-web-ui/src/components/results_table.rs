@@ -10,14 +10,16 @@
 //! parent-supplied callback.
 
 use crate::api::{ApiError, PAGE_SIZE};
+use crate::context_query::SearchNavigation;
 use crate::context_query::{build_context_query, escape_dq, find_col};
+use crate::result_actions::{Capabilities, compare};
 use crate::state::query::{Filter, FilterOp};
+use crate::state::search_session::{ExecutedQuery, ExecutedResponse};
 use fleet_ui::{
     Btn, CopyButton, LoadState, Loaded, OffsetPager, PageTotal, PageWindow, ToastBus, ToastKind,
     Variant,
 };
 use leptos::prelude::*;
-use std::cmp::Ordering;
 use trawl_api::QueryResponse;
 use trawl_api::display::value_to_string;
 
@@ -27,30 +29,30 @@ use trawl_api::value::Value;
 #[component]
 pub fn ResultsTable(
     #[prop(into)] page: Signal<usize>,
-    rows: LocalResource<Result<QueryResponse, ApiError>>,
+    rows: LocalResource<Result<ExecutedResponse, ApiError>>,
     #[prop(into)] busy: Signal<bool>,
     /// Called with the new page index when prev/next is clicked. Parent
     /// captures a router navigator and translates to URL navigation.
     on_paginate: Callback<usize>,
     /// Called when a detail-row field tag is clicked — adds an include
     /// filter for that `field = value`.
-    on_add_filter: Callback<Filter>,
-    /// Navigate to a fresh search with the given DSL query and default
-    /// filters/range. Used by "Show context" and "Find similar".
-    on_navigate: Callback<String>,
+    on_add_filter: Callback<(ExecutedQuery, Filter)>,
+    /// Navigate to a fresh snapshot search with its own query and range. Used by "Show context" and "Find similar".
+    on_navigate: Callback<SearchNavigation>,
 ) -> impl IntoView {
     let bus = expect_context::<ToastBus>();
     let table_viewport = NodeRef::<leptos::html::Div>::new();
     view! {
         <fleet_ui::OverflowHint viewport=table_viewport/>
-        <div node_ref=table_viewport class="results" role="region" aria-label="Search results" tabindex="0">
+        <div node_ref=table_viewport id="search-results" class="results" role="region" aria-label="Search results" tabindex="-1">
             <Loaded
                 state=Signal::derive(move || LoadState::from_resource(rows.get()))
                 label="results"
                 retry=Callback::new(move |()| { rows.set(None); rows.refetch(); })
-                render=Box::new(move |resp: QueryResponse| view! {
+                render=Box::new(move |resp: ExecutedResponse| view! {
                     <ResultsTableBody
-                        resp=resp
+                        resp=resp.response
+                        executed_query=resp.query
                         page=page
                         busy=busy
                         on_paginate=on_paginate
@@ -73,13 +75,15 @@ struct SortState {
 #[component]
 fn ResultsTableBody(
     resp: QueryResponse,
+    executed_query: ExecutedQuery,
     page: Signal<usize>,
     busy: Signal<bool>,
     on_paginate: Callback<usize>,
-    on_add_filter: Callback<Filter>,
-    on_navigate: Callback<String>,
+    on_add_filter: Callback<(ExecutedQuery, Filter)>,
+    on_navigate: Callback<SearchNavigation>,
     bus: ToastBus,
 ) -> impl IntoView {
+    let capabilities = Capabilities::for_query(&executed_query.effective);
     let columns: Vec<String> = resp.result.columns.iter().map(|c| c.name.clone()).collect();
     let rows_data = resp.result.rows.clone();
     let returned = resp.pagination.returned;
@@ -178,6 +182,8 @@ fn ResultsTableBody(
                                 on_add_filter,
                                 on_navigate,
                                 bus,
+                                executed_query.clone(),
+                                capabilities.clone(),
                             )).into_any()
                         } else {
                             let cols_len = columns.len() + 1;
@@ -241,9 +247,11 @@ impl SortedIndices {
         columns: Vec<String>,
         severity_cols: Vec<usize>,
         expanded: RwSignal<Option<usize>>,
-        on_add_filter: Callback<Filter>,
-        on_navigate: Callback<String>,
+        on_add_filter: Callback<(ExecutedQuery, Filter)>,
+        on_navigate: Callback<SearchNavigation>,
         bus: ToastBus,
+        executed_query: ExecutedQuery,
+        capabilities: Capabilities,
     ) -> Vec<leptos::prelude::AnyView> {
         let indices = self.indices.get();
         indices
@@ -254,6 +262,8 @@ impl SortedIndices {
                 let sev_cols = severity_cols.clone();
                 view! {
                     <RowFragment
+                        executed_query=executed_query.clone()
+                        capabilities=capabilities.clone()
                         idx=i
                         row=row
                         columns=cols
@@ -272,15 +282,18 @@ impl SortedIndices {
 
 #[component]
 fn RowFragment(
+    executed_query: ExecutedQuery,
+    capabilities: Capabilities,
     idx: usize,
     row: Vec<Value>,
     columns: Vec<String>,
     severity_cols: Vec<usize>,
     expanded: RwSignal<Option<usize>>,
-    on_add_filter: Callback<Filter>,
-    on_navigate: Callback<String>,
+    on_add_filter: Callback<(ExecutedQuery, Filter)>,
+    on_navigate: Callback<SearchNavigation>,
     bus: ToastBus,
 ) -> impl IntoView {
+    let raw_actions = capabilities.raw_actions();
     let cells_row = row.clone();
     let cells = cells_row
         .iter()
@@ -337,27 +350,30 @@ fn RowFragment(
                                 let value_for_click = value_text.clone();
                                 let field_for_label = name.clone();
                                 let value_for_label = value_text.clone();
+                                let allowed = capabilities.include(name, v);
+                                let query_for_click = executed_query.clone();
                                 view! {
                                     <span class="k">{key}</span>
                                     <span class="v">
-                                        <button
+                                        {if allowed { view! { <button
                                             type="button"
                                             class="tag"
                                             aria-label=format!(
                                                 "Include {field_for_label} = {value_for_label}",
                                             )
                                             on:click=move |_| {
-                                                on_add_filter.run(Filter {
+                                                on_add_filter.run((query_for_click.clone(), Filter {
                                                     field: field_for_click.clone(),
                                                     value: value_for_click.clone(),
                                                     op: FilterOp::Include,
-                                                });
+                                                }));
                                             }
-                                        >{value_text}</button>
+                                        >{value_text}</button> }.into_any() } else { view! { <span>{value_text}</span> }.into_any() }}
                                     </span>
                                 }
                             }).collect::<Vec<_>>()}
                         </div>
+                        {if raw_actions { view! {
                         <div class="actions">
                             <CopyRawButton
                                 row=row_for_actions.clone()
@@ -376,6 +392,7 @@ fn RowFragment(
                                 bus=bus
                             />
                         </div>
+                        }.into_any() } else { ().into_any() }}
                     </td>
                 </tr>
             </Show>
@@ -399,7 +416,7 @@ fn CopyRawButton(row: Vec<Value>, columns: Vec<String>) -> impl IntoView {
 fn ShowContextButton(
     row: Vec<Value>,
     columns: Vec<String>,
-    on_navigate: Callback<String>,
+    on_navigate: Callback<SearchNavigation>,
     bus: ToastBus,
 ) -> impl IntoView {
     let on_click = Callback::new(move |()| match build_context_query(&row, &columns) {
@@ -419,11 +436,14 @@ fn ShowContextButton(
 fn FindSimilarButton(
     row: Vec<Value>,
     columns: Vec<String>,
-    on_navigate: Callback<String>,
+    on_navigate: Callback<SearchNavigation>,
     bus: ToastBus,
 ) -> impl IntoView {
     let on_click = Callback::new(move |()| match build_similar_query(&row, &columns) {
-        Some(q) => on_navigate.run(q),
+        Some(q) => on_navigate.run(SearchNavigation {
+            query: q,
+            range: crate::query_merge::RangeSpec::default(),
+        }),
         None => bus.push(
             ToastKind::Info,
             "Find similar",
@@ -461,13 +481,4 @@ fn build_similar_query(row: &[Value], columns: &[String]) -> Option<String> {
     }
     let take: String = trimmed.chars().take(60).collect();
     Some(format!("\"{}\"", escape_dq(&take)))
-}
-
-fn compare(a: Option<&Value>, b: Option<&Value>) -> Ordering {
-    match (a, b) {
-        (None, None) => Ordering::Equal,
-        (None, _) => Ordering::Less,
-        (_, None) => Ordering::Greater,
-        (Some(x), Some(y)) => value_to_string(x).cmp(&value_to_string(y)),
-    }
 }
