@@ -160,8 +160,8 @@ jobs:
       # Harvest breakpad symbols from the FAT binaries (with .symtab + DWARF)
       # BEFORE stripping. --store writes <module>/<DEBUG_ID>/<module>.sym, the
       # exact layout `minidump-stackwalk --symbols-url` expects. These symbols
-      # cover application modules; the official shared DuckDB library ships
-      # separately and does not provide full upstream C++ debug information.
+      # cover application modules and the separate DuckDB module. The official
+      # library provides public dynamic symbols, but no full C++ debug info.
       - name: Dump breakpad symbols
         run: |
           set -euo pipefail
@@ -169,6 +169,10 @@ jobs:
           for bin in trawld trawl trawl-admin trawl-web fleet-admin; do
             dump_syms --store symbols/ "${bindir}/${bin}"
           done
+          dump_syms --store symbols/ runtime/libduckdb.so
+          # A module entry alone cannot resolve query-engine frames. Require
+          # the exported symbols that the official library actually supplies.
+          grep -q '^PUBLIC ' symbols/libduckdb.so/*/libduckdb.so.sym
           find symbols -type f | sort
 
       # Strip the shipped binaries now that symbols are captured, so the

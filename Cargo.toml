@@ -125,8 +125,8 @@ zstd = "0.13"
 # usable for crash dumps under the release CI: that build cross-links with
 # zig, whose lld strips .symtab regardless of this setting. So release CI
 # overrides strip to false, runs dump_syms to publish breakpad .sym files
-# (the symbolication source for minidumps — including the statically linked
-# libduckdb frames), then llvm-strips the shipped artifacts with the GNU
+# for the application modules and public symbols for the separate libduckdb
+# module, then llvm-strips the application artifacts with the GNU
 # build-id note preserved. See .github/workflows/release.yml + trawl-crashdump.
 strip = "debuginfo"
 lto = "thin"
