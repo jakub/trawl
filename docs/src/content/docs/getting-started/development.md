@@ -210,3 +210,24 @@ backend, and preserves settings such as CSP nonces and `no_redirect`. Both apps'
 browser-facing processes must map
 `FLEET_SESSION_AEAD_KEY = "fleet.session_aead_key"`. Manifest validation rejects
 an app that could drift away from the shared development identity.
+
+## Use an internal development image
+
+The manually dispatched [Dev image workflow](https://github.com/jakub/trawl/actions/workflows/dev-image.yml)
+publishes a `linux/arm64` image for existing internal test installations. This
+channel publishes no matching CLI download, Helm package, or stable release.
+
+Use the completed run's summary for the image tag and full source revision.
+The summary gives commands to create an isolated checkout at that revision and
+build `trawl` for your local host with Rust 1.98.0. Install the
+[source-build prerequisites](/getting-started/#build-from-source) before that
+build. The CLI and image then use the same source revision, even when your CLI
+host uses a different architecture.
+
+Use `chart/trawl` from that same checkout. Select the test Kubernetes context,
+namespace, and existing release explicitly. Review a complete development
+values file against that chart, then use the summary's command with explicit
+image repository and tag. The command resets previous chart values before it
+applies your file, so include all configuration that the test installation
+requires. Do not combine an arbitrary local chart or retained release values
+with a new development image.

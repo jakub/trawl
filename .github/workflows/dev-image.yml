@@ -1,12 +1,9 @@
 name: Dev image
 
-# Manual-only lean image build for fast k8s iteration. Unlike release.yml
-# this builds a SINGLE arm64 image and skips all the release ceremony
-# (second arch, macOS, .deb/APT, breakpad symbols, GitHub release, Helm
-# package). The image is tagged with the git short-sha and pushed to ghcr,
-# so `helm upgrade --set image.tag=sha-...` rolls the pod reliably despite
-# the chart's imagePullPolicy: IfNotPresent (a re-pushed *same* tag would
-# not re-pull). Everything runs in one job — no artifact round-trip.
+# Internal development channel, dispatched manually for arm64 Kubernetes testing.
+# Publishes one SHA-tagged linux/arm64 image. It publishes no CLI downloads,
+# release packages, symbols, or Helm package. The summary identifies the source
+# revision to use for a matching CLI build and source chart.
 on:
   workflow_dispatch:
 
@@ -109,21 +106,36 @@ jobs:
           push: true
           tags: ghcr.io/${{ github.repository }}:${{ steps.tag.outputs.value }}
 
-      - name: Deploy hint
+      - name: Internal development usage
         env:
           TAG: ${{ steps.tag.outputs.value }}
           REPO: ${{ github.repository }}
         run: |
           tag="$TAG"
           image="ghcr.io/${REPO}:${tag}"
+          revision="$(git rev-parse HEAD)"
+          checkout="../trawl-dev-${revision}"
           {
-            echo "### Dev image pushed"
+            echo "### Internal arm64 development image"
             echo ""
-            echo "\`${image}\`"
+            echo "Manual development channel for an existing test installation; not a stable release or first-install procedure."
             echo ""
-            echo "Roll it onto the cluster (substitute your release name):"
+            echo "Image: \`${image}\` (linux/arm64 only)."
+            echo "Source revision: \`${revision}\`. No matching CLI download or Helm package is published."
+            echo ""
+            echo "From an existing repository clone with this commit fetched, prepare its source chart and build the CLI for your local host."
+            echo "The source-build prerequisites and Rust 1.98.0 are required."
             echo ""
             echo '```sh'
-            echo "helm upgrade <release> ./chart/trawl --reuse-values --set image.tag=${tag}"
+            echo "git worktree add --detach ${checkout} ${revision}"
+            echo "(cd ${checkout} && CARGO_TARGET_DIR=target cargo +1.98.0 build --locked --release -p trawl-cli --bin trawl)"
+            echo "${checkout}/target/release/trawl --version"
+            echo '```'
+            echo ""
+            echo "For an existing arm64 test release, review a complete development values file for this source chart."
+            echo "Replace the context, namespace, release, and values-file placeholders before running:"
+            echo ""
+            echo '```sh'
+            echo "helm upgrade <release> ${checkout}/chart/trawl --kube-context <test-context> --namespace <namespace> --reset-values --values <development-values.yaml> --set-string image.repository=ghcr.io/${REPO} --set-string image.tag=${tag}"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
