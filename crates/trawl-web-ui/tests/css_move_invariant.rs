@@ -218,6 +218,9 @@ const RETIRED_SELECTORS: &[&str] = &[
     ".sched-badge",
     ".sched-badge.active",
     ".sched-badge.disabled",
+    // The health reports are cards in a split (ADR-0032), so the stack
+    // of hairline-separated bands they used to be has no markup left.
+    ".health-page > section",
     ".live-badge",
     ".live-badge.live",
     ".live-badge.lagged",

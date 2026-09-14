@@ -1754,7 +1754,8 @@
 
 /* Health reports share the shell's type, color and control tokens. */
 .health-page { flex: 1; min-height: 0; overflow: auto; padding: 24px 32px 48px; background: var(--bg); }
-.health-page > section { padding: 24px 0; border-bottom: 1px solid var(--line); }
+/* .health-page > section retired (ADR-0032): the reports are cards in
+ * the split above, not a stack of hairline-separated bands. */
 /* One column until the checks card can sit beside the operations
  * cards; each section is a sheet on the page's floor. */
 .health-split { display: grid; grid-template-columns: minmax(0, 1fr); gap: 20px; margin-top: 16px; }
@@ -1777,7 +1778,6 @@
 .health-page dt { color: var(--ink-3); font-size: 13px; }
 .health-page dd { margin: 6px 0 0; font-variant-numeric: tabular-nums; }
 .health-checks { margin: 0; }
-.health-checks > div { display: flex; justify-content: space-between; padding: 8px 0; }
 /* One check per row: friendly name over the raw key, outcome badge on
  * the right. */
 .health-check {

@@ -8,13 +8,61 @@ use crate::{
     api, perms,
     service_card_fmt::{format_bytes, format_count, format_exact, format_uptime},
 };
-use fleet_ui::{ConfirmModal, ConfirmState};
+use fleet_ui::{Badge, ConfirmModal, ConfirmState, StatusDot, StatusTone, Tone};
 use leptos::{prelude::*, task::spawn_local};
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
-use trawl_api::{HealthResponse, QueriesResponse, StatsResponse};
+use trawl_api::{HealthResponse, HealthStatus, QueriesResponse, StatsResponse};
+
+/// Human names for the checks the daemon ships. A key with no entry
+/// renders verbatim: the page does not invent a name for a subsystem it
+/// has not met.
+const CHECK_NAMES: &[(&str, &str)] = &[
+    ("auth_db", "Authentication database"),
+    ("data_path", "Data path"),
+    ("duckdb", "Query engine"),
+    ("storage_db", "Catalog database"),
+];
+
+/// The friendly name for a check key, or `None` when there is none.
+fn check_name(key: &str) -> Option<&'static str> {
+    CHECK_NAMES
+        .iter()
+        .find(|(known, _)| *known == key)
+        .map(|(_, name)| *name)
+}
+
+/// The checks card's dot and title.
+///
+/// A report that did not arrive is never called healthy: a transport
+/// failure and a permission refusal both reach here as `Err`, and
+/// claiming health on either would be a state the page cannot see
+/// (ADR-0025).
+fn health_title(report: Option<&Result<HealthResponse, String>>) -> (StatusTone, &'static str) {
+    match report {
+        None => (StatusTone::Neutral, "Health checks"),
+        Some(Err(_)) => (StatusTone::Error, "Health report unavailable"),
+        Some(Ok(report)) => match report.status {
+            HealthStatus::Ok => (StatusTone::Success, "Server is healthy"),
+            HealthStatus::Degraded => (StatusTone::Error, "Server is degraded"),
+            HealthStatus::Unavailable => (StatusTone::Error, "Server is unavailable"),
+        },
+    }
+}
+
+/// A query's state as a badge tone. Active work is in progress, not a
+/// judgement, so it takes the informational tone.
+fn query_state_tone(state: &str) -> Tone {
+    match state {
+        "Active" => Tone::Info,
+        "Completed" => Tone::Success,
+        "Failed" => Tone::Danger,
+        "Timed out" => Tone::Warn,
+        _ => Tone::Neutral,
+    }
+}
 
 fn read_error(error: &api::ApiError) -> String {
     match error.http_status() {
@@ -70,8 +118,16 @@ pub fn HealthPage() -> impl IntoView {
             <header class="health-heading"><div><h1>"Health"</h1><p>"Server checks and operations"</p></div>
                 <button class="btn health-refresh" on:click=move |_| refresh.update(|n| *n += 1)>"Refresh"</button>
             </header>
+            <div class="health-split">
             <section class="health-section" aria-labelledby="health-checks-title">
-                <h2 id="health-checks-title">"Health"</h2>
+                {move || {
+                    let (tone, title) = health_title(health.get().as_ref());
+                    view! {
+                        <h2 id="health-checks-title" class="health-card-ttl">
+                            <StatusDot tone=tone/>{title}
+                        </h2>
+                    }
+                }}
                 {move || match health.get() {
                     None => view! { <p role="status">"Loading health report..."</p> }.into_any(),
                     Some(Err(error)) => view! { <p role="alert">{error}</p> }.into_any(),
@@ -79,12 +135,33 @@ pub fn HealthPage() -> impl IntoView {
                         let mut checks = report.checks.unwrap_or_default().into_iter().collect::<Vec<_>>();
                         checks.sort_by(|a, b| a.0.cmp(&b.0));
                         view! {
-                            <dl class="health-facts"><div><dt>"Overall state"</dt><dd>{match report.status { trawl_api::HealthStatus::Ok => "ok", trawl_api::HealthStatus::Degraded => "degraded", trawl_api::HealthStatus::Unavailable => "unavailable" }}</dd></div>
+                            <dl class="health-checks">{checks.into_iter().map(|(key, result)| {
+                                // An unknown key IS the name: naming a
+                                // check the daemon has not shipped would
+                                // be a guess dressed as a fact.
+                                let friendly = check_name(&key);
+                                let ok = result == "ok";
+                                view! {
+                                    <div class="health-check">
+                                        <dt>
+                                            <strong class="health-check-name">
+                                                {friendly.map_or_else(|| key.clone(), ToOwned::to_owned)}
+                                            </strong>
+                                            {friendly.map(|_| view! {
+                                                <span class="mono health-check-key">{key.clone()}</span>
+                                            })}
+                                        </dt>
+                                        <dd class:health-check-error=!ok>
+                                            <Badge tone={if ok { Tone::Success } else { Tone::Danger }}>
+                                                {result.clone()}
+                                            </Badge>
+                                        </dd>
+                                    </div>
+                                }
+                            }).collect_view()}</dl>
+                            <dl class="health-facts"><div><dt>"Overall state"</dt><dd>{match report.status { HealthStatus::Ok => "ok", HealthStatus::Degraded => "degraded", HealthStatus::Unavailable => "unavailable" }}</dd></div>
                                 <div><dt>"Version"</dt><dd>{report.version.unwrap_or_else(|| "Not reported".into())}</dd></div>
                             </dl>
-                            <dl class="health-checks">{checks.into_iter().map(|(name, result)| view! {
-                                <div><dt>{name}</dt><dd class:health-check-error=result != "ok">{result.clone()}</dd></div>
-                            }).collect_view()}</dl>
                         }.into_any()
                     }
                 }}
@@ -120,6 +197,7 @@ pub fn HealthPage() -> impl IntoView {
                 </section>
             </Show>
             <Show when=move || me.get().is_some_and(|m| perms::can_query(&m.permissions))><HealthQueries/></Show>
+            </div>
         </div>
     }
 }
@@ -269,7 +347,7 @@ fn HealthQueries() -> impl IntoView {
                         <tbody>{rows.into_iter().map(|row| {
                             let (id, own) = (row.id, row.own);
                             view! { <tr data-query-id=id data-own=own.to_string()>
-                                <td><span class="health-query-id">{format!("#{id}")}</span><code>{row.query}</code></td><td>{row.user}</td><td>{row.state}</td><td>{row.elapsed}</td>
+                                <td><span class="health-query-id">{format!("#{id}")}</span><code>{row.query}</code></td><td>{row.user}</td><td><Badge tone=query_state_tone(&row.state)>{row.state.clone()}</Badge></td><td>{row.elapsed}</td>
                                 <td><Show when=move || me.get().is_some_and(|m| perms::can_cancel_query(&m.permissions, own))>
                                     <button class="btn health-query-cancel" disabled=move || pending.get() on:click=move |_| confirm.update(|s| s.request((id, own, epoch)))>"Cancel"</button>
                                 </Show></td>

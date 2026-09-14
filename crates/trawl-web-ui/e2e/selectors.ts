@@ -59,6 +59,9 @@ export const SEL = {
   healthLiveState: '.health-live-state',
   /// crates/trawl-web-ui/src/pages/health.rs HealthPage and HealthQueries.
   healthQueries: '.health-queries',
+  /// crates/trawl-web-ui/src/pages/health.rs — one check row: the
+  /// friendly name over the raw key, with the outcome badge beside it.
+  healthCheck: '.health-check',
   /// crates/trawl-web-ui/src/pages/health.rs named keyboard-scrollable query region.
   healthQueryScroll: '.health-query-scroll',
   /// crates/trawl-web-ui/src/pages/health.rs HealthPage and HealthQueries.

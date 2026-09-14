@@ -27,7 +27,6 @@ use crate::download::trigger_download;
 use crate::history_export::{HistoryExportFormat, serialize_history};
 use crate::search_url::{PAGE_SIZE, read_history_page};
 use crate::state::query::{Mode, RangeSpec, navigator, report_refusal};
-use fleet_ui::time::format_duration;
 use fleet_ui::{
     Btn, ConfirmModal, ConfirmState, LoadState, Loaded, OffsetPager, PageTotal, PageWindow,
     SearchInput, ToastBus, ToastKind, Variant, When,
@@ -208,7 +207,6 @@ pub fn HistoryPage() -> impl IntoView {
                     <p class="sub">"Every query you've run. Re-cast the net anytime or create a scheduled search."</p>
                 </div>
                 <div class="actions">
-                    <SearchInput value=filter placeholder="Filter history…"/>
                     <select
                         class="btn-sec"
                         aria-label="History export format"
@@ -229,8 +227,16 @@ pub fn HistoryPage() -> impl IntoView {
                 </div>
             </div>
 
+            <div class="page-split">
+            <section class="list-sheet" aria-labelledby="history-sheet-title">
+                <div class="list-sheet-hd">
+                    <h2 id="history-sheet-title" class="list-sheet-ttl">
+                        "Recent searches"<span class="cnt">{move || filtered_rows.get().len()}</span>
+                    </h2>
+                    <SearchInput value=filter placeholder="Filter history…"/>
+                </div>
             <fleet_ui::OverflowHint viewport=table_viewport/>
-                <div node_ref=table_viewport class="tbl fleet-table-frame tbl-scroll" role="region" aria-label="Search history" tabindex="0" style="--list-min-width:640px">
+                <div node_ref=table_viewport class="tbl fleet-table-frame tbl-scroll" role="region" aria-label="Search history" tabindex="0" style="--list-min-width:560px">
                 <div class="tbl-body">
                 <Loaded
                     state=Signal::derive(move || LoadState::from_resource(
@@ -260,16 +266,12 @@ pub fn HistoryPage() -> impl IntoView {
                             let q_for_save = h.query.clone();
                             let on_rerun = on_rerun.clone();
                             let events = format_with_commas(h.row_count as u64);
-                            let duration = format_duration(h.duration_ms);
                             // `<When>` ticks off fleet-ui's shared 30s
                             // clock, so the label doesn't freeze at page
                             // load.
                             let executed_at = h.executed_at.clone();
                             view! {
                                     <tr class="tbl-row">
-                                        <td style="color:var(--ink-3)" class="mono">
-                                        <When ts=executed_at/>
-                                        </td>
                                         <td style="min-width:0" class="mono path">
                                         // A command, not a place: the rerun
                                         // goes through the navigator, which
@@ -284,11 +286,11 @@ pub fn HistoryPage() -> impl IntoView {
                                             {h.query.clone()}
                                         </button>
                                         </td>
-                                        <td style="text-align:right" class="mono">
-                                        {events}
+                                        <td style="color:var(--ink-3)" class="mono">
+                                        <When ts=executed_at/>
                                         </td>
                                         <td style="text-align:right" class="mono">
-                                        {duration}
+                                        {events}
                                         </td>
                                         <td style="text-align:right">
                                         <button
@@ -303,11 +305,10 @@ pub fn HistoryPage() -> impl IntoView {
                             view! {
                                     <table class="fleet-table history-table" aria-label="Search history">
                                         <thead><tr>
+                                            <th scope="col">"Executed query"</th>
                                             <th scope="col" style="width:92px">"When"</th>
-                                            <th scope="col">"Query"</th>
-                                            <th scope="col" style="width:80px; text-align:right">"Events"</th>
-                                            <th scope="col" style="width:90px; text-align:right">"Duration"</th>
-                                            <th scope="col" style="width:92px; text-align:right"><span class="sr-only">Actions</span></th>
+                                            <th scope="col" style="width:80px; text-align:right">"Rows"</th>
+                                            <th scope="col" style="width:100px; text-align:right">"Action"</th>
                                         </tr></thead>
                                         <tbody>{rows}</tbody></table>
                             }.into_any()
@@ -325,6 +326,8 @@ pub fn HistoryPage() -> impl IntoView {
                     ).expect("history response follows an admitted offset"));
                     view! { <OffsetPager window=window on_page=on_page/> }.into_any()
                 }}
+            </div>
+            </section>
             </div>
 
             <Show when=move || confirm_clear.get().is_open()>

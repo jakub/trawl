@@ -291,6 +291,12 @@ const CONTRACTS: &[Contract] = &[
         hook: "Cancel",
     },
     Contract {
+        assignment: "healthCheck: '.health-check',",
+        source_path: "src/pages/health.rs",
+        source: HEALTH_RS,
+        hook: "class=\"health-check\"",
+    },
+    Contract {
         assignment: "healthQueryScroll: '.health-query-scroll',",
         source_path: "src/pages/health.rs",
         source: HEALTH_RS,
@@ -1998,6 +2004,44 @@ fn every_selectors_ts_entry_is_pinned() {
                 "e2e/selectors.ts entry `{trimmed}` has no drift-guard \
                  contract in e2e_selector_contract.rs — add one pinning \
                  it to the source that renders it.",
+            );
+        }
+    }
+}
+
+/// Every check key the health fixtures carry resolves to a friendly
+/// name in `CHECK_NAMES`.
+///
+/// The page renders an unknown key verbatim, which is the honest
+/// fallback but also a silent one: a daemon check the map never grew a
+/// name for would read as a raw identifier forever. The fixtures are the
+/// set of keys the suite exercises, so they are the set this holds the
+/// map to. Lives here rather than in `pages/health.rs` because that
+/// module is wasm-only and a `#[cfg(test)]` inside it never runs.
+#[test]
+fn every_fixture_check_key_has_a_friendly_name() {
+    for (name, json) in [
+        (
+            "health-ok.json",
+            include_str!("../e2e/harness/wire/health-ok.json"),
+        ),
+        (
+            "health-unavailable.json",
+            include_str!("../e2e/harness/wire/health-unavailable.json"),
+        ),
+    ] {
+        let report: trawl_api::HealthResponse = serde_json::from_str(json)
+            .unwrap_or_else(|e| panic!("{name} is not a HealthResponse: {e}"));
+        let checks = report
+            .checks
+            .unwrap_or_else(|| panic!("{name} carries no checks"));
+        assert!(!checks.is_empty(), "{name} carries no checks");
+        for key in checks.keys() {
+            assert!(
+                HEALTH_RS.contains(&format!("(\"{key}\", \"")),
+                "health fixture {name} carries the check `{key}`, which has no \
+                 entry in CHECK_NAMES in src/pages/health.rs — it would render \
+                 as a raw identifier.",
             );
         }
     }
