@@ -138,6 +138,7 @@ class PublicationOrder(unittest.TestCase):
             '.github/workflows/macos-cli.yml', '.github/workflows/distribution-preflight.yml',
             'scripts/release/**', 'Cargo.lock', 'Cargo.toml',
             'crates/trawl-cli/Cargo.toml', 'crates/trawl-core/build.rs',
+            'crates/trawl-core/build_support/**',
             'crates/trawl-core/Cargo.toml', 'crates/trawl-engine/Cargo.toml',
             'crates/trawl-server/Cargo.toml',
         })
@@ -163,6 +164,21 @@ class PublicationOrder(unittest.TestCase):
         self.assertFalse(any('permissions' in job for job in jobs.values()))
         self.assertEqual(simulate(jobs, 'metadata'),
                          {'metadata': 'failure', 'linux': 'skipped', 'macos': 'skipped'})
+
+    def test_crashdump_image_checks_native_build_helpers_on_pr_and_push(self):
+        workflow = parse_workflow(WORKFLOW.with_name('crashdump-image.yml'))
+        triggers = workflow.get('on') or workflow.get('true')
+        expected = {
+            'Dockerfile', 'scripts/release/build-distribution.sh',
+            'scripts/release/distribution.py', 'scripts/release/duckdb-runtime.json',
+            'scripts/release/duckdb-LICENSE', 'crates/trawl-core/build.rs',
+            'crates/trawl-core/build_support/**', 'crates/trawl-crashdump/**',
+            'crates/trawl-server/src/main.rs', 'Cargo.lock',
+            '.github/workflows/crashdump-image.yml', 'ci/crashdump-image.sh',
+        }
+        for event in ('pull_request', 'push'):
+            with self.subTest(event=event):
+                self.assertEqual(set(triggers[event]['paths']), expected)
 
     def test_pr_metadata_reads_committed_version_and_refuses_wrong_sha(self):
         workflow = parse_workflow(WORKFLOW.with_name('distribution-preflight.yml'))
