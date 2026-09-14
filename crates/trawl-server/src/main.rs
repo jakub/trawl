@@ -798,18 +798,27 @@ fn validate_log_destination(
     path: &std::path::Path,
     data_root: &std::path::Path,
 ) -> std::io::Result<PathBuf> {
-    let resolved = resolve_log_destination(path)?;
+    let with_context = |error: std::io::Error| {
+        std::io::Error::new(
+            error.kind(),
+            format!(
+                "failed to validate server.log_file {}: {error}",
+                path.display()
+            ),
+        )
+    };
+    let resolved = resolve_log_destination(path).map_err(with_context)?;
     for name in STORAGE_MARKERS {
         let marker = data_root.join(name);
-        if resolved == resolve_log_destination(&marker)? {
+        if resolved == resolve_log_destination(&marker).map_err(with_context)? {
             return Err(marker_log_error(&marker));
         }
     }
     #[cfg(unix)]
     match std::fs::metadata(&resolved) {
-        Ok(metadata) => validate_log_identity(&metadata, data_root)?,
+        Ok(metadata) => validate_log_identity(&metadata, data_root).map_err(with_context)?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
+        Err(error) => return Err(with_context(error)),
     }
     Ok(resolved)
 }
@@ -1168,7 +1177,11 @@ mod tests {
         assert!(!data.exists());
         let file = tmp.path().join("file");
         std::fs::write(&file, b"preserve").unwrap();
-        assert!(validate_log_destination(&file.join("log"), &data).is_err());
+        let path = file.join("log");
+        let error = validate_log_destination(&path, &data).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotADirectory);
+        assert!(error.to_string().contains("server.log_file"));
+        assert!(error.to_string().contains(&path.display().to_string()));
         assert_eq!(std::fs::read(&file).unwrap(), b"preserve");
         assert!(!data.exists());
         let blocked = tmp.path().join("blocked");

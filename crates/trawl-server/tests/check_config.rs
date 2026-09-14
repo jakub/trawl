@@ -117,6 +117,23 @@ fn config_check_rejects_active_log_marker_collisions_without_side_effects() {
 }
 
 #[test]
+fn config_check_names_the_log_path_when_resolution_fails() {
+    for telemetry in [false, true] {
+        // The check helper creates trawld.toml as a regular file. Treating
+        // it as a parent must fail without creating data or other files.
+        let output = check(&format!(
+            "[server]\nlog_file='trawld.toml/server.log'\n[data]\npath='~/data'\n[ingest]\nenabled=true\ninternal_telemetry={telemetry}"
+        ));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.success(), telemetry, "{stderr}");
+        if !telemetry {
+            assert!(stderr.contains("server.log_file"), "{stderr}");
+            assert!(stderr.contains("trawld.toml/server.log"), "{stderr}");
+        }
+    }
+}
+
+#[test]
 fn config_check_accepts_shipped_configuration() {
     for document in [
         include_str!("../../../config/trawld.toml"),
