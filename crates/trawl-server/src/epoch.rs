@@ -97,6 +97,7 @@ pub fn ensure_current_epoch(
     let mut empty = true;
     let mut owned = false;
     let mut staged_epochs = Vec::new();
+    let mut refused_staging = None;
     for entry in entries {
         let entry = entry
             .map_err(|e| format!("failed to inspect data root {}: {e}", data_root.display()))?;
@@ -116,6 +117,9 @@ pub fn ensure_current_epoch(
             staged_epochs.push(entry.path());
         } else {
             empty = false;
+            if name.starts_with("EPOCH.next.") {
+                refused_staging = Some(entry.path());
+            }
         }
     }
     if !ingest_enabled && !owned {
@@ -131,6 +135,16 @@ pub fn ensure_current_epoch(
         }
         publish_epoch(data_root)?;
         return Ok(Outcome::InitializedEmpty);
+    }
+    if let Some(staged) = refused_staging.as_ref().or_else(|| staged_epochs.first()) {
+        return Err(format!(
+            "data root {} is nonempty but has no EPOCH marker; refusing to start without \
+             changing storage. Cannot recover staged epoch entry {} automatically; inspect \
+             its type, contents, and origin along with the data root before choosing a recovery \
+             action. Startup has not removed or relabeled this entry",
+            data_root.display(),
+            staged.display()
+        ));
     }
     Err(format!(
         "data root {} is nonempty but has no EPOCH marker; refusing to start without \
@@ -418,10 +432,13 @@ mod tests {
             std::fs::write(data.join("EPOCH.next.456"), b"3\n").unwrap();
             std::fs::write(data.join(name), content).unwrap();
             let before = snapshot(tmp.path());
+            let err = ensure_current_epoch(&data, &data.join("wal"), true).unwrap_err();
             assert!(
-                ensure_current_epoch(&data, &data.join("wal"), true).is_err(),
-                "{name}: {content:?}"
+                err.contains(&data.join(name).display().to_string()),
+                "{err}"
             );
+            assert!(err.contains("inspect"), "{err}");
+            assert!(!err.contains("delete"), "{err}");
             assert_eq!(snapshot(tmp.path()), before);
         }
     }
