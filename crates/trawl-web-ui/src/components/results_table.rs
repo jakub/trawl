@@ -104,7 +104,10 @@ fn ResultsTableBody(
             <div class="results-empty">
                 <p>"Search your events"</p>
                 <p>"Try "<code>"last=1h | head 20"</code>" to return up to 20 events from the last hour."</p>
-                <Btn variant=Variant::Secondary on_click=Callback::new(move |()| on_navigate.run("last=1h | head 20".to_string()))>"Run example"</Btn>
+                <Btn variant=Variant::Secondary on_click=Callback::new(move |()| on_navigate.run(SearchNavigation {
+                    query: "last=1h | head 20".to_string(),
+                    range: crate::query_merge::RangeSpec::Quick("1h"),
+                }))>"Run example"</Btn>
                 <p>"Or enter a query and press "{crate::components::editor_wrap::run_shortcut()}"."</p>
                 <a href="https://trawl.sh/use/query-tutorial/" target="_blank" rel="noopener noreferrer">"Query guide"</a>
             </div>

@@ -31,6 +31,7 @@ for (const [platform, ua, shortcut] of [
     await expect(page.getByRole('link', { name: 'Query guide', exact: true })).toHaveAttribute('href', 'https://trawl.sh/use/query-tutorial/');
     await page.getByRole('button', { name: 'Run example', exact: true }).click();
     expect((await lastCapturedQuery(request, 1)).query).toBe('last=1h | head 20');
+    expect(new URL(page.url()).searchParams.get('r')).toBe('1h');
     await expect(page.locator(SEL.cmContent)).toHaveText('last=1h | head 20');
     await expect(page.getByText('No events match this query. Check the time range and filters.')).toBeVisible();
     await expect(page.getByRole('button', { name: 'Run example', exact: true })).toHaveCount(0);
