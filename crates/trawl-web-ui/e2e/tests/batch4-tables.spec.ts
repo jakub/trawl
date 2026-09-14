@@ -8,10 +8,10 @@ import { test, expect, resetScenario } from '../fixtures';
 const wire = (name: string) => JSON.parse(readFileSync(`${__dirname}/../harness/wire/${name}.json`, 'utf8'));
 
 for (const [path, label, columns] of [
-  ['/search/history', 'Search history', 5],
-  ['/jobs/nets', 'Saved queries', 6],
+  ['/search/history', 'Search history', 4],
+  ['/jobs/nets', 'Saved queries', 4],
   ['/jobs/runs', 'Recent runs', 5],
-  ['/search/schema', 'Services', 9],
+  ['/search/schema', 'Services', 6],
 ] as const) {
   test(`management table relationships and local scroll: ${label}`, async ({ page, request }, testInfo) => {
     await resetScenario(request, 'corpus');

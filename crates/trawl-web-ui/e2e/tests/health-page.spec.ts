@@ -62,7 +62,11 @@ test('health 503 renders the named failed subsystem', async ({ page, request }) 
     ['storage_db', 'ok'],
     ['data_path', 'ok'],
   ]) {
-    await expect(health.getByText(name, { exact: true }).locator('..').locator('dd')).toHaveText(value);
+    // The key now sits in a span inside the dt, so the row is the
+    // nearest ancestor div rather than the matched node's parent.
+    await expect(
+      health.getByText(name, { exact: true }).locator('xpath=ancestor::div[1]').locator('dd'),
+    ).toHaveText(value);
   }
   await expect(health).toContainText('health-fixture-163');
 });

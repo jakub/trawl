@@ -2,8 +2,11 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+import { readFileSync } from 'node:fs';
 import { test, expect, CORPUS } from '../fixtures';
 import { COPY } from '../selectors';
+
+const wire = (name: string) => JSON.parse(readFileSync(`${__dirname}/../harness/wire/${name}.json`, 'utf8'));
 
 test('failed edits stay available, announce through the existing host and leave focus in the form', async ({ page, request }) => {
   await request.post('/__ctl/reset', { data: { scenario: 'corpus' } });
@@ -137,26 +140,29 @@ test('query retry keeps the executed URL and unsent editor buffer', async ({ pag
   await expect(editor).toHaveText('service=postgres');
 });
 
-test('active-net count distinguishes pending, failure and a confirmed zero', async ({ page, request }) => {
+test('recorded-run count distinguishes pending, failure and the confirmed total', async ({ page, request }) => {
   await request.post('/__ctl/reset', { data: { scenario: 'corpus' } });
+  const total = String(wire('runs-stats').total_runs);
   let release!: () => void;
   const held = new Promise<void>(resolve => { release = resolve; });
   let fail = true, calls = 0;
-  await page.route('**/api/v1/saved', async route => {
+  await page.route('**/api/v1/runs/stats', async route => {
     calls++;
     if (calls === 1) await held;
     return fail ? route.fulfill({ status: 503, json: { error: 'Unavailable' } }) : route.continue();
   });
   await page.goto('/jobs/runs');
-  const card = page.locator('.stat-card').filter({ hasText: 'Active nets' });
-  await expect(card).toContainText('Loading active nets');
+  const card = page.locator('.stat-card').filter({ hasText: 'Recorded runs' });
+  await expect(card).toContainText('Loading recorded runs');
   await expect(page.locator('.tbl-row')).toHaveCount(2);
   release();
-  await expect(card).toContainText("Couldn't load active nets");
-  await expect(card.locator('.value')).not.toHaveText('0');
+  await expect(card).toContainText("Couldn't load recorded runs");
+  // A failed read never reads as a count: the card says it failed
+  // rather than showing the number it could not fetch.
+  await expect(card.locator('.value')).not.toHaveText(total);
   fail = false;
   await card.getByRole('button', { name: 'Retry' }).click();
-  await expect(card.locator('.value')).toHaveText('0');
+  await expect(card.locator('.value')).toHaveText(total);
   expect(calls).toBe(2);
 });
 
