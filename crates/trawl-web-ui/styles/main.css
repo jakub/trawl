@@ -1116,6 +1116,10 @@
  * ─────────────────────────────────────────────────────────────── */
 .results-table.msg-first tbody td { white-space: normal; vertical-align: top; }
 .results-table.msg-first .mf-time { white-space: nowrap; color: var(--ink-3); width: 1%; }
+/* The message is the row. Below a floor it stops being one and becomes
+ * a column of single words, so the table overflows horizontally instead
+ * — which the scroll hint above it already announces. */
+.results-table.msg-first .mf-msg { min-width: 220px; }
 .results-table.msg-first .mf-msg .msg { color: var(--ink); overflow-wrap: anywhere; }
 .results-table.msg-first .mf-meta {
   display: flex;
@@ -1136,14 +1140,19 @@
 .results-split {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
+  /* Two named rows, not two auto ones. With `auto auto` the hint and
+   * the table shared the free space and a ~70px dead band opened
+   * between them; the hint takes its own height and the results take
+   * the rest. */
+  grid-template-rows: max-content minmax(0, 1fr);
   flex: 1;
   min-height: 0;
 }
 .results-split > .results { min-width: 0; }
 /* The scroll instruction is a sibling of the region it describes, so it
  * spans both tracks rather than taking the inspector's column. */
-.results-split > .overflow-hint { grid-column: 1 / -1; }
-.results-split > .sd-host + * { min-width: 0; }
+.results-split > .overflow-hint { grid-row: 1; grid-column: 1 / -1; }
+.results-split > .results, .results-split > .sd-host { grid-row: 2; }
 .jump-details {
   display: none;
   margin-inline-start: 4px;
@@ -1924,6 +1933,27 @@
  * a way down to it and the panel drops the edge that said "beside". */
 @media (max-width: 899.98px) {
   .results-split.has-inspector .jump-details { display: inline-flex; }
+  /* The link lives in the 1.6em caret cell, so the column has to make
+   * room for it: unstyled it rendered on top of the timestamp beside
+   * it, which is not a visible link. */
+  .results-split.has-inspector .results-table .exp-col { width: auto; }
+  .results-split.has-inspector .results-table tbody tr.selected .exp-col {
+    white-space: nowrap;
+  }
+  /* The caret gives up its cell-filling width on the selected row: at
+   * 100% it took the whole widened cell and pushed the link out over
+   * the timestamp beside it. The stretched ::after still covers the
+   * row, so the click target is unchanged (ADR-0029). */
+  .results-split.has-inspector .results-table tbody tr.selected .exp-col .row-stretch {
+    width: auto;
+  }
+  /* Stacked, the two rows must grow to their content and let the page
+   * scroll. Sharing one column's height starved the table to a header
+   * and a sliver, so neither the selected row nor its way down to the
+   * panel was on screen. */
+  .search-col:has(> .results-split.has-inspector) { flex: none; }
+  .results-split.has-inspector { grid-template-rows: max-content auto auto; }
+  .results-split.has-inspector > .sd-host { grid-row: 3; }
   .results-split > .sd-host .sd-drawer.sd-docked {
     position: static;
     max-height: none;
