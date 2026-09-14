@@ -106,8 +106,6 @@ pub enum ErrorCode {
     ResultTooLarge,
     /// Authentication failure.
     AuthError,
-    /// Legacy `unauthorized` wire code retained for client compatibility.
-    Unauthorized,
     /// Authenticated but missing the required app permission (403), including
     /// a fleet key with no trawl grant.
     Forbidden,

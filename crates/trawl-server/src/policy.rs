@@ -481,6 +481,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_marked_handler_auth_failure_keeps_the_current_wire_code() {
+        let app = Router::new()
+            .route(
+                "/x",
+                get(|| async {
+                    ServerError::from(fleet_auth::AuthError::InvalidKey(
+                        "private-rejection-reason".into(),
+                    ))
+                }),
+            )
+            .layer(from_fn(require_trawl_grant))
+            .layer(from_fn(normalize_auth_errors));
+        let mut request = HttpRequest::builder()
+            .uri("/x")
+            .body(Body::empty())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(key_with(vec![role("trawl-reader", &[("trawl", "query")])]));
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(response.extensions().get::<TrawlPolicyApplied>().is_some());
+        let body = body_json(response).await;
+        assert_eq!(body["error"]["code"], "auth_error");
+        assert_eq!(body["error"]["message"], "authentication failed");
+        assert!(!body.to_string().contains("private-rejection-reason"));
+    }
+
+    #[tokio::test]
     async fn policy_passes_granted_key_and_marks_response() {
         let resp = run_policy(Some(key_with(vec![role(
             "trawl-reader",
