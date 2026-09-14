@@ -33,6 +33,16 @@ npm run test                          # -- --headed / --grep <pattern>
 `--skip-build` fails loudly at server startup (not silently against a
 stale build) if `dist/index.html` is missing.
 
+The harness serves a private copy of that `dist/`, taken at startup into
+`e2e/.dist-snapshot-<port>/` and checked against index.html's own asset
+list. A `trunk serve` running from the same checkout writes the same
+directory, so without the copy a rebuild mid-run pulls the hashed wasm
+out from under the browser, and trunk's injected autoreload client (whose
+`{{__TRUNK_ADDRESS__}}` placeholder only trunk's server substitutes) logs
+a WebSocket failure that console-error assertions read as the SPA's. The
+snapshot drops that client; a `trunk build` index.html carries none and
+is copied verbatim.
+
 ## CI
 
 CI (the `web-ui-e2e` job in `.github/workflows/ci.yml`) does not rebuild

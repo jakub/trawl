@@ -17,6 +17,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { snapshotDist } from './dist-snapshot.mjs';
 import {
   wire,
   meResponse,
@@ -56,18 +57,22 @@ const HOST = '127.0.0.1';
 const PORT = Number(process.env.E2E_PORT ?? 8123);
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DIST = path.resolve(
+const BUILD_DIST = path.resolve(
   process.env.TRAWL_E2E_DIST || path.join(__dirname, '..', '..', 'dist'),
 );
 
-if (!fs.existsSync(path.join(DIST, 'index.html'))) {
+if (!fs.existsSync(path.join(BUILD_DIST, 'index.html'))) {
   console.error(
-    `e2e harness: no built SPA found at ${DIST}/index.html.\n` +
+    `e2e harness: no built SPA found at ${BUILD_DIST}/index.html.\n` +
       'Run `cargo xtask e2e` without --skip-build (or `trunk build` in ' +
       'crates/trawl-web-ui/) before running the suite directly.',
   );
   process.exit(1);
 }
+
+// Serve a private copy, so a `trunk serve` sharing this checkout's dist
+// cannot rewrite the SPA mid-run — see harness/dist-snapshot.mjs.
+const DIST = snapshotDist(BUILD_DIST, PORT, { log: (line) => console.log(line) });
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',

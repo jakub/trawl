@@ -37,12 +37,12 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { chromium } from '@playwright/test';
+import { snapshotPath } from '../harness/dist-snapshot.mjs';
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const E2E_DIR = path.resolve(SCRIPT_DIR, '..');
 const WEB_UI_DIR = path.resolve(E2E_DIR, '..');
 const ROOT_DIR = path.resolve(WEB_UI_DIR, '..', '..');
-const DIST_DIR = path.join(WEB_UI_DIR, 'dist');
 const PORT = Number(process.env.E2E_PORT ?? 8131);
 const BASE = `http://127.0.0.1:${PORT}`;
 const STAMP = 'ui-redesign-2026-09-13';
@@ -309,14 +309,18 @@ async function shoot(browser, scene, theme, viewport) {
 
 /** Identity of the bundle under the camera: the commit plus a digest of
  * the artifacts the harness actually serves. A capture set whose dist
- * hash does not match the tree it claims is not evidence. */
+ * hash does not match the tree it claims is not evidence. The digest
+ * reads the harness's own snapshot, which is what the browser loaded —
+ * `crates/trawl-web-ui/dist` may already have moved on under a running
+ * `trunk serve` by the time the last scene is shot. */
 async function distDigest() {
-  const names = ['index.html', ...(await fs.readdir(DIST_DIR)).filter((n) => n.endsWith('.wasm'))]
+  const dir = snapshotPath(PORT);
+  const names = ['index.html', ...(await fs.readdir(dir)).filter((n) => n.endsWith('.wasm'))]
     .sort();
   const hash = createHash('sha256');
   for (const name of names) {
     hash.update(name);
-    hash.update(await fs.readFile(path.join(DIST_DIR, name)));
+    hash.update(await fs.readFile(path.join(dir, name)));
   }
   return { files: names, sha256: hash.digest('hex') };
 }
