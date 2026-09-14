@@ -72,3 +72,11 @@ manifests. It derives the version label from the checked-out PR merge commit
 and uses that full commit SHA for both product and tooling. This caller allows
 verification before the manual workflows are registered on the default branch;
 it has read-only repository permissions and no publication jobs.
+
+Release preparation also requires a nonempty `docs/releases/RELEASE_TAG.md`
+announcement in the selected product commit, for example
+`docs/releases/v1.0.0.md`. Preparation reads committed bytes, preserves them in
+a checksum-checked artifact, and fails before registry publication if the file
+is missing or empty. GitHub publishes that exact body with generated release
+notes disabled. The workflow checkout and local file edits cannot substitute
+announcement text for the selected product commit.

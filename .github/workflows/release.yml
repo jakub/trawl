@@ -41,13 +41,14 @@ jobs:
         run: python3 scripts/release/resolve-source.py "$EVENT_NAME" "$EVENT_REF" "$REQUESTED_TAG" >> "$GITHUB_OUTPUT"
 
   build-chart:
-    name: prepare and validate release chart
+    name: prepare release chart and announcement
     needs: resolve-source
     runs-on: k8s-small
     permissions:
       contents: read
     env:
       RELEASE_TAG: ${{ needs.resolve-source.outputs.tag }}
+      SOURCE_SHA: ${{ needs.resolve-source.outputs.sha }}
     outputs:
       image-tag: ${{ steps.meta.outputs.version }}
       image-tags: ${{ steps.meta.outputs.tags }}
@@ -57,6 +58,28 @@ jobs:
         with:
           ref: ${{ needs.resolve-source.outputs.sha }}
           persist-credentials: false
+
+      - name: Prepare curated announcement from selected product source
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          mkdir announcement-artifact
+          if ! git show "${SOURCE_SHA}:docs/releases/${RELEASE_TAG}.md" > announcement-artifact/body.md; then
+            echo "Missing curated release announcement: docs/releases/${RELEASE_TAG}.md" >&2
+            exit 1
+          fi
+          if ! test -s announcement-artifact/body.md; then
+            echo "Curated release announcement must not be empty" >&2
+            exit 1
+          fi
+          (cd announcement-artifact && sha256sum body.md > SHA256SUMS)
+
+      - name: Keep the exact curated announcement
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-announcement
+          path: announcement-artifact/
+          if-no-files-found: error
 
       # Metadata normalization and chart construction finish before any
       # registry write. Docker consumes these exact tags and labels later.
@@ -149,11 +172,20 @@ jobs:
       - name: List artifacts
         run: find dist -type f | sort
 
+      - name: Download curated announcement
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-announcement
+          path: announcement
+      - name: Verify exact prepared announcement
+        run: cd announcement && sha256sum --check SHA256SUMS
+
       - name: Create release
         uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
-          generate_release_notes: true
+          generate_release_notes: false
+          body_path: announcement/body.md
           files: |
             dist/**/*.tar.gz
             dist/**/*.deb

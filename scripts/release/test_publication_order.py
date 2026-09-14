@@ -191,12 +191,32 @@ class PublicationOrder(unittest.TestCase):
             self.assertIn('does not match the PR commit', result.stderr)
             self.assertFalse(output.exists())
 
+    def test_curated_announcement_is_prepared_before_registry_publication(self):
+        jobs = self.workflow['jobs']
+        prepare = jobs['build-chart']
+        self.assertEqual(prepare['env']['SOURCE_SHA'], '${{ needs.resolve-source.outputs.sha }}')
+        upload = next(s for s in prepare['steps'] if s.get('with', {}).get('name') == 'release-announcement')
+        self.assertEqual(upload['with']['path'], 'announcement-artifact/')
+        self.assertEqual(upload['with']['if-no-files-found'], 'error')
+        self.assertIn('build-chart', dependencies(jobs['docker']))
+        steps = jobs['release']['steps']
+        download = next(s for s in steps if s.get('with', {}).get('name') == 'release-announcement')
+        self.assertEqual(download['with']['path'], 'announcement')
+        verify = next(s for s in steps if s.get('name') == 'Verify exact prepared announcement')
+        publish = next(s for s in steps if s.get('name') == 'Create release')
+        self.assertLess(steps.index(download), steps.index(verify))
+        self.assertLess(steps.index(verify), steps.index(publish))
+        self.assertIn('sha256sum --check SHA256SUMS', verify['run'])
+        self.assertIs(publish['with']['generate_release_notes'], False)
+        self.assertEqual(publish['with']['body_path'], 'announcement/body.md')
+        self.assertNotIn('body', publish['with'])
+
     def test_publisher_consumes_exact_prebuilt_chart_and_metadata(self):
         jobs = self.workflow['jobs']
         prepare = jobs['build-chart']
         publish = jobs['publish-helm']
         self.assertEqual(prepare['permissions'], {'contents': 'read'})
-        uploaded = next(s['with']['name'] for s in prepare['steps'] if s.get('uses', '').startswith('actions/upload-artifact@'))
+        uploaded = next(s['with']['name'] for s in prepare['steps'] if s.get('uses', '').startswith('actions/upload-artifact@') and s['with']['name'] == 'release-chart')
         downloaded = next(s['with']['name'] for s in publish['steps'] if s.get('uses', '').startswith('actions/download-artifact@'))
         self.assertEqual(uploaded, downloaded)
         prepare_commands = '\n'.join(s.get('run', '') for s in prepare['steps'])

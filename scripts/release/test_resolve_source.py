@@ -27,6 +27,10 @@ class ReleaseSourceTests(unittest.TestCase):
             target = self.remote / path
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text("release source\n")
+        notes = self.remote / "docs/releases"
+        notes.mkdir(parents=True)
+        (notes / "v1.0.0.md").write_bytes(b"# Curated launch\n\nProduct announcement.\n")
+        (notes / "v1.0.2.md").write_bytes(b"")
         self.git(self.remote, "add", ".")
         self.git(self.remote, "commit", "-m", "release source")
         self.release_sha = self.git(self.remote, "rev-parse", "HEAD")
@@ -35,6 +39,7 @@ class ReleaseSourceTests(unittest.TestCase):
         self.git(self.remote, "tag", "v1.1.0-rc.1+build.7")
         for path in ["Cargo.toml", "Dockerfile", "chart/trawl/Chart.yaml"]:
             (self.remote / path).write_text("workflow branch source\n")
+        (notes / "v1.0.0.md").write_text("Workflow development journal\n")
         helper = self.remote / "scripts/release/build-apt-index.py"
         helper.parent.mkdir(parents=True)
         helper.write_text("print('publisher tooling from workflow')\n")
@@ -132,6 +137,37 @@ class ReleaseSourceTests(unittest.TestCase):
         self.assertIn(".release-tooling/scripts/release/package-chart.sh", workflow)
         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.release_sha)
         self.assertEqual((self.checkout / "chart/trawl/Chart.yaml").read_text(), "release source\n")
+
+    def test_announcement_uses_exact_product_commit_and_refuses_missing_or_empty_notes(self):
+        self.assert_resolves("v1.0.0")
+        workflow = (RESOLVER.parents[2] / ".github/workflows/release.yml").read_text()
+        step = workflow.split("      - name: Prepare curated announcement from selected product source\n", 1)[1]
+        step = step.split("\n      - name:", 1)[0]
+        commands = step.split("        run: |\n", 1)[1]
+        commands = "\n".join(line.removeprefix("          ") for line in commands.splitlines())
+        for tag, diagnostic in [('v1.0.0', None), ('v1.0.1', 'Missing curated release announcement'),
+                                ('v1.0.2', 'must not be empty')]:
+            with self.subTest(tag=tag):
+                checkout = Path(self.temp.name) / tag
+                self.git(checkout.parent, "clone", "--no-tags", str(self.remote), str(checkout))
+                self.git(checkout, "checkout", "--detach", self.release_sha)
+                # A local edit must not replace the committed announcement.
+                (checkout / "docs/releases/v1.0.0.md").write_text("Uncommitted journal\n")
+                result = subprocess.run(['bash', '-e', '-c', commands], cwd=checkout,
+                                        env=dict(self.env, SOURCE_SHA=self.release_sha, RELEASE_TAG=tag),
+                                        text=True, capture_output=True)
+                artifact = checkout / 'announcement-artifact'
+                if diagnostic:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(diagnostic, result.stderr)
+                    self.assertFalse((artifact / 'SHA256SUMS').exists())
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual((artifact / 'body.md').read_bytes(),
+                                     b"# Curated launch\n\nProduct announcement.\n")
+                    subprocess.run(['sha256sum', '--check', 'SHA256SUMS'], cwd=artifact,
+                                   check=True, capture_output=True)
+                    self.assertEqual(self.git(checkout, 'rev-parse', 'HEAD'), self.release_sha)
 
     def test_annotated_tag_peels_to_commit(self):
         self.assert_resolves("v1.0.1")
