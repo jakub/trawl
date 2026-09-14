@@ -10,7 +10,9 @@ on:
       - 'scripts/release/**'
       - 'Cargo.lock'
       - 'Cargo.toml'
+      - 'crates/trawl-cli/Cargo.toml'
       - 'crates/trawl-core/Cargo.toml'
+      - 'crates/trawl-core/build.rs'
       - 'crates/trawl-engine/Cargo.toml'
       - 'crates/trawl-server/Cargo.toml'
 

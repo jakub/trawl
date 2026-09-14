@@ -137,6 +137,7 @@ class PublicationOrder(unittest.TestCase):
             '.github/workflows/release.yml', '.github/workflows/linux-distribution.yml',
             '.github/workflows/macos-cli.yml', '.github/workflows/distribution-preflight.yml',
             'scripts/release/**', 'Cargo.lock', 'Cargo.toml',
+            'crates/trawl-cli/Cargo.toml', 'crates/trawl-core/build.rs',
             'crates/trawl-core/Cargo.toml', 'crates/trawl-engine/Cargo.toml',
             'crates/trawl-server/Cargo.toml',
         })
