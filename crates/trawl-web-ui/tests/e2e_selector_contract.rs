@@ -742,6 +742,36 @@ const CONTRACTS: &[Contract] = &[
         hook: ">\"Stop live\"<",
     },
     Contract {
+        assignment: "truncatedBadge: 'Truncated',",
+        source_path: "src/pages/search.rs",
+        source: include_str!("../src/pages/search.rs"),
+        hook: ">\"Truncated\"<",
+    },
+    Contract {
+        assignment: "draftClean: 'Editor matches execution',",
+        source_path: "src/components/editor_wrap.rs",
+        source: EDITOR_WRAP_RS,
+        hook: "\"Editor matches execution\"",
+    },
+    Contract {
+        assignment: "draftDirty: 'Unsent changes \u{b7} Haul to run them',",
+        source_path: "src/components/editor_wrap.rs",
+        source: EDITOR_WRAP_RS,
+        hook: "\"Unsent changes \u{b7} Haul to run them\"",
+    },
+    Contract {
+        assignment: "saveAsNetTool: 'Save as net',",
+        source_path: "src/components/editor_wrap.rs",
+        source: EDITOR_WRAP_RS,
+        hook: ">\"Save as net\"<",
+    },
+    Contract {
+        assignment: "copyUrlTool: 'Copy search URL',",
+        source_path: "src/components/editor_wrap.rs",
+        source: EDITOR_WRAP_RS,
+        hook: ">\"Copy search URL\"<",
+    },
+    Contract {
         assignment: "toastAny: '.toast',",
         source_path: "../fleet-ui/src/toast/runtime.rs",
         source: TOAST_RUNTIME_RS,
@@ -1243,6 +1273,43 @@ const CONTRACTS: &[Contract] = &[
         source_path: "../fleet-ui/src/search_input.rs",
         source: SEARCH_INPUT_RS,
         hook: "class=\"inp-wrap\"",
+    },
+    Contract {
+        assignment: "scopeStrip: '.scope',",
+        source_path: "src/components/meta_strip.rs",
+        source: META_STRIP_RS,
+        hook: "class=\"scope\"",
+    },
+    Contract {
+        assignment: "scopeWindow: '.scope-window',",
+        source_path: "src/components/meta_strip.rs",
+        source: META_STRIP_RS,
+        hook: "class=\"scope-window\"",
+    },
+    Contract {
+        assignment: "draftState: '.console-hd .draft',",
+        source_path: "src/components/editor_wrap.rs",
+        source: EDITOR_WRAP_RS,
+        hook: "class=\"console-hd\"",
+    },
+    Contract {
+        assignment: "draftState: '.console-hd .draft',",
+        source_path: "src/components/editor_wrap.rs",
+        source: EDITOR_WRAP_RS,
+        hook: "class=\"draft\"",
+    },
+    // Two halves, since the class alone reaches both bypasses.
+    Contract {
+        assignment: "skipToQuery: 'a.skip[href=\"#search-editor\"]',",
+        source_path: "src/pages/search.rs",
+        source: include_str!("../src/pages/search.rs"),
+        hook: "class=\"skip\"",
+    },
+    Contract {
+        assignment: "skipToQuery: 'a.skip[href=\"#search-editor\"]',",
+        source_path: "src/pages/search.rs",
+        source: include_str!("../src/pages/search.rs"),
+        hook: "href=\"#search-editor\"",
     },
     Contract {
         assignment: "filterChip: '.meta-chips .chip',",

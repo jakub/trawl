@@ -212,10 +212,10 @@ export const SEL = {
   /// crates/fleet-ui/src/toast/runtime.rs — one toast's dismiss button.
   toastDismiss: '.toast button.x',
   /// crates/trawl-web-ui/src/components/editor_wrap.rs — a tool link
-  /// under the editor. Save is a plain button; Share is fleet-ui's
-  /// CopyButton in bare mode, which renders the caller's class on its
-  /// own native button. Since ADR-0029 Format is a button too, so this
-  /// matches THREE buttons, not two.
+  /// under the editor. Save as net is a plain button; Copy search URL is
+  /// fleet-ui's CopyButton in bare mode, which renders the caller's
+  /// class on its own native button. Since ADR-0029 Format is a button
+  /// too, so this matches THREE buttons, not two.
   editorTool: '.editor-tools button.tool',
 
   // -- the stretched row control and its neighbours (ADR-0029) -------
@@ -307,6 +307,22 @@ export const SEL = {
   facetFilterInput: '.facets .inp-wrap input',
 
   // -- chrome ---------------------------------------------------------
+  /// crates/trawl-web-ui/src/components/meta_strip.rs — the query
+  /// console's closing row, which describes the EXECUTED query: window,
+  /// chips, mode badge and row count. It never reads the editor buffer,
+  /// so a spec that typed and did not Haul asserts NO change here.
+  scopeStrip: '.scope',
+  /// Its window phrase, the same text the histogram caption carries
+  /// after COPY.histoCaptionPrefix.
+  scopeWindow: '.scope-window',
+  /// crates/trawl-web-ui/src/components/editor_wrap.rs — the console
+  /// header's draft state. Text only: it states whether the buffer and
+  /// the executed query agree and navigates nothing.
+  draftState: '.console-hd .draft',
+  /// crates/trawl-web-ui/src/pages/search.rs — the first of the two
+  /// keyboard bypasses, ahead of the filter rail in DOM order. Matched
+  /// by href because both links share the class.
+  skipToQuery: 'a.skip[href="#search-editor"]',
   /// crates/trawl-web-ui/src/components/meta_strip.rs — one active
   /// filter's chip. Counting these is how a spec says "exactly one
   /// filter was added": the URL payload is base64 and says nothing on
@@ -434,6 +450,19 @@ export const COPY = {
   /// crates/trawl-web-ui/src/pages/search.rs — the tab strip's Stop
   /// live button text.
   stopLiveText: 'Stop live',
+  /// crates/trawl-web-ui/src/pages/search.rs — the warn badge the result
+  /// header shows when the server cut the answer short.
+  truncatedBadge: 'Truncated',
+  /// crates/trawl-web-ui/src/components/editor_wrap.rs — the console
+  /// header's two draft states, in full. The dirty one carries its own
+  /// instruction, so a spec asserting it also asserts the way out.
+  draftClean: 'Editor matches execution',
+  draftDirty: 'Unsent changes · Haul to run them',
+  /// crates/trawl-web-ui/src/components/editor_wrap.rs — the visible
+  /// names of two of the three editor tools. Both say what they act on,
+  /// since "Save" and "Share" named neither the net nor the URL.
+  saveAsNetTool: 'Save as net',
+  copyUrlTool: 'Copy search URL',
   /// crates/trawl-web-ui/src/components/histogram.rs — the histogram
   /// caption's lead-in, before the window the query ran under.
   histoCaptionPrefix: 'Current page · window: ',

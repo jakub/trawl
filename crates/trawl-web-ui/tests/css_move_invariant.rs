@@ -194,6 +194,19 @@ const RETIRED_SELECTORS: &[&str] = &[
     ".topbar .mode:hover",
     ".topbar .mode.active",
     ".topbar .app-links",
+    // The meta strip became the executed-scope strip (ADR-0032): the
+    // chips kept their `.meta-chips` wrapper and their own classes, but
+    // every rule that scoped them under `.meta` is re-homed under
+    // `.scope`, and the truncation note left for the result header.
+    ".meta",
+    ".meta .dim",
+    ".meta .chip",
+    ".meta .chip .x",
+    ".meta .chip .x:hover",
+    ".meta .chip.excl",
+    ".meta .chip.excl .x",
+    ".meta .chip.excl .x:hover",
+    ".meta .chip.bad",
     ".live-badge",
     ".live-badge.live",
     ".live-badge.lagged",

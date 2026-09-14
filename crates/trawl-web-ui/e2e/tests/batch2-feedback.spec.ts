@@ -3,6 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 import { test, expect, CORPUS } from '../fixtures';
+import { COPY } from '../selectors';
 
 test('failed edits stay available, announce through the existing host and leave focus in the form', async ({ page, request }) => {
   await request.post('/__ctl/reset', { data: { scenario: 'corpus' } });
@@ -34,7 +35,7 @@ test('routine notification expiry pauses for pointer and keyboard interaction', 
   test.setTimeout(30_000);
   await context.grantPermissions(['clipboard-read', 'clipboard-write']);
   await page.goto('/search');
-  const share = page.locator('.editor-tools').getByRole('button', { name: 'Share', exact: true });
+  const share = page.locator('.editor-tools').getByRole('button', { name: COPY.copyUrlTool, exact: true });
   await expect(share).toBeVisible();
   await share.click();
   const toast = page.locator('.toast');
@@ -256,7 +257,7 @@ for (const detail of [false, true]) {
 test('toast scroll boundary leaves room for its elevation shadow', async ({ page, context }) => {
   await context.grantPermissions(['clipboard-read', 'clipboard-write']);
   await page.goto('/search');
-  await page.locator('.editor-tools').getByRole('button', { name: 'Share', exact: true }).click();
+  await page.locator('.editor-tools').getByRole('button', { name: COPY.copyUrlTool, exact: true }).click();
   const toast = page.locator('.toast');
   await expect(toast).toBeVisible();
   const space = await toast.evaluate(el => {

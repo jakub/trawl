@@ -141,7 +141,7 @@ async function prepareSave(page: Page, request: APIRequestContext, scenario = 's
 
 function saveEntry(page: Page, entry: 'editor' | 'toolbar') {
   return entry === 'editor'
-    ? page.locator(SEL.editorTool).filter({ hasText: /^Save$/ })
+    ? page.locator(SEL.editorTool).filter({ hasText: /^Save as net$/ })
     : page.locator(SEL.saveAction);
 }
 
@@ -155,7 +155,8 @@ async function submitSave(page: Page, status = 200) {
   const answered = page.waitForResponse((response) =>
     response.url().endsWith('/api/v1/saved') && response.request().method() === 'POST',
   );
-  await page.getByRole('button', { name: 'Save as net', exact: true }).click();
+  // Modal-scoped: the editor tool carries the same name now.
+  await page.locator(SEL.modalPanel).getByRole('button', { name: 'Save as net', exact: true }).click();
   const response = await answered;
   expect(response.status()).toBe(status);
   await response.finished();
@@ -234,7 +235,7 @@ test('Save retries an explicit POST failure with the original snapshot', async (
   await submitSave(page, 503);
   await expect(page.locator(SEL.toastError)).toContainText("Couldn't save");
   await expect(page.locator(SEL.modalPanel)).toBeVisible();
-  await expect(page.getByRole('button', { name: 'Save as net', exact: true })).toBeEnabled();
+  await expect(page.locator(SEL.modalPanel).getByRole('button', { name: 'Save as net', exact: true })).toBeEnabled();
   await changeReadableUrl(page);
   await expectExactPreview(page);
   await submitSave(page);
