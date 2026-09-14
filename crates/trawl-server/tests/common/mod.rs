@@ -856,7 +856,7 @@ fn copy_tree(src: &std::path::Path, dest: &std::path::Path) -> std::io::Result<(
 }
 
 /// Seed a PRIVATE data root under `dir` from the published parquet tree
-/// and return the glob that reads it.
+/// and return its directory path.
 ///
 /// Every test gets its own copy because the data root is WRITABLE: the
 /// scheduler drops report output under `scheduled/`, and repin stages
@@ -869,7 +869,7 @@ fn copy_tree(src: &std::path::Path, dest: &std::path::Path) -> std::io::Result<(
 pub fn seed_data_root(dir: &std::path::Path) -> String {
     let data = dir.join("data");
     copy_tree(&published_parquet_root(), &data).expect("seed the private data root");
-    format!("{}/**/*.parquet", data.display())
+    data.to_str().unwrap().to_owned()
 }
 
 /// Return a shared self-signed cert/key pair, published on first call.
@@ -1255,7 +1255,7 @@ fn resolve_derivation(
     )
 }
 
-/// Like [`setup_in_dir`], but with an explicit cold-data glob — for tests
+/// Like [`setup_in_dir`], but with an explicit cold-data directory — for tests
 /// that compact into a per-test data directory instead of the shared
 /// fixtures.
 #[allow(clippy::too_many_lines)] // linear assembly: two databases, two pools, one config
@@ -1283,6 +1283,10 @@ pub async fn setup_in_dir_with_data_and_timeout(
     rate_limit: RateLimitConfig,
     timeout_secs: u64,
 ) -> TestServer {
+    assert!(
+        std::path::Path::new(&data_path).is_dir(),
+        "the fixture data path must be an existing directory: {data_path}"
+    );
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     // Both databases are the fixture's own (ADR-0021 ruling 2): the server's

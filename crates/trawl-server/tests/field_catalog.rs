@@ -82,9 +82,9 @@ async fn harness() -> Harness {
     let wal_dir = root.join("wal");
     let data_dir = root.join("data");
     std::fs::create_dir_all(&data_dir).unwrap();
-    let data_glob = format!("{}/**/*.parquet", data_dir.display());
+    let data_path = data_dir.to_str().unwrap().to_owned();
 
-    let server = setup_in_dir_with_data(&root, data_glob, RateLimitConfig::default()).await;
+    let server = setup_in_dir_with_data(&root, data_path, RateLimitConfig::default()).await;
     // Leak the tempdir so it survives the server (cleaned up by OS).
     std::mem::forget(tmp);
 
@@ -1618,11 +1618,11 @@ mod boot {
         let root = tmp.path().to_path_buf();
         let data_dir = root.join("data");
         let (majority, minority) = plant_disagreeing_corpus(&data_dir);
-        let data_glob = format!("{}/**/*.parquet", data_dir.display());
+        let data_path = data_dir.to_str().unwrap().to_owned();
 
         let server = crate::common::setup_in_dir_with_data(
             &root,
-            data_glob,
+            data_path,
             trawl_server::config::RateLimitConfig::default(),
         )
         .await;

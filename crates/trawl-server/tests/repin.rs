@@ -68,9 +68,9 @@ async fn harness() -> Harness {
     let wal_dir = root.join("wal");
     let data_dir = root.join("data");
     std::fs::create_dir_all(&data_dir).unwrap();
-    let data_glob = format!("{}/**/*.parquet", data_dir.display());
+    let data_path = data_dir.to_str().unwrap().to_owned();
 
-    let server = setup_in_dir_with_data(&root, data_glob, RateLimitConfig::default()).await;
+    let server = setup_in_dir_with_data(&root, data_path, RateLimitConfig::default()).await;
     std::mem::forget(tmp); // outlives the server; OS cleans up
 
     let ingest = HttpClient::new_insecure(&server.url, &server.ingest_token).unwrap();
