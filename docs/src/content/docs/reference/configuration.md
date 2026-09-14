@@ -121,9 +121,12 @@ trawld refuses a symlink at the configured path. See
 
 ### `[data]`
 
+The daemon owns a directory tree. For local file or glob selection, use the
+CLI's `trawl query --data` option instead.
+
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `path` | string | *(required)* | Parquet data directory. Accepts a bare directory or a glob. Glob characters derive the base directory |
+| `path` | string | *(required)* | Parquet data directory. Glob metacharacters (`*`, `?`, `[`) are not accepted |
 
 Notes:
 

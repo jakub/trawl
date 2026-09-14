@@ -95,8 +95,7 @@
 # ingest_rpm = 1000
 
 [data]
-# Directory containing parquet files. Also accepts a glob pattern
-# (e.g. "/var/lib/trawl/data/**/*.parquet") for backwards compatibility.
+# Directory containing parquet files. Glob patterns are not accepted.
 path = "~/.trawl/data"
 
 [auth]

@@ -209,44 +209,15 @@ pub struct RateLimitConfig {
 pub struct DataConfig {
     /// Directory containing parquet files (e.g. "/var/lib/trawl/data").
     ///
-    /// Accepts either a bare directory path or a glob pattern. Glob
-    /// characters (`*`, `?`, `[`) are stripped to derive the base directory.
+    /// Must be a directory path. Glob metacharacters (`*`, `?`, `[`) are
+    /// rejected when daemon configuration is validated.
     pub path: String,
 }
 
 impl DataConfig {
-    /// The base directory where parquet files live.
+    /// The configured directory where parquet files live.
     pub fn base_dir(&self) -> PathBuf {
-        if self.has_glob() {
-            let path = Path::new(&self.path);
-            let mut base = PathBuf::new();
-            for component in path.components() {
-                let s = component.as_os_str().to_string_lossy();
-                if s.contains('*') || s.contains('?') || s.contains('[') {
-                    break;
-                }
-                base.push(component);
-            }
-            base
-        } else {
-            PathBuf::from(&self.path)
-        }
-    }
-
-    /// Return the glob pattern for `read_parquet()`.
-    ///
-    /// If the configured path is already a glob, returns it as-is.
-    /// If it's a bare directory, appends `**/*.parquet`.
-    pub fn parquet_glob(&self) -> String {
-        if self.has_glob() {
-            self.path.clone()
-        } else {
-            format!("{}/**/*.parquet", self.path.trim_end_matches('/'))
-        }
-    }
-
-    fn has_glob(&self) -> bool {
-        self.path.contains('*') || self.path.contains('?') || self.path.contains('[')
+        PathBuf::from(&self.path)
     }
 }
 
@@ -1646,6 +1617,12 @@ impl Config {
             return Err(ConfigError::Validation("data.path cannot be empty".into()));
         }
 
+        if self.data.path.contains(['*', '?', '[']) {
+            return Err(ConfigError::Validation(
+                "data.path must be a directory path without glob metacharacters (*, ?, [)".into(),
+            ));
+        }
+
         if self.server.max_concurrent_queries == 0 {
             return Err(ConfigError::Validation(
                 "server.max_concurrent_queries must be > 0".into(),
@@ -1903,7 +1880,7 @@ severity_from = [{ field = "level", dialcet = "private-secret" }]
 [server]
 
 [data]
-path = "/var/lib/trawl/data/**/*.parquet"
+path = "/var/lib/trawl/data"
 
 [auth]
 "#;
@@ -1911,7 +1888,7 @@ path = "/var/lib/trawl/data/**/*.parquet"
         assert_eq!(config.server.http_addr, "127.0.0.1:5514");
         assert_eq!(config.server.timeout_secs, 30);
         assert!(config.server.max_concurrent_queries > 0);
-        assert_eq!(config.data.path, "/var/lib/trawl/data/**/*.parquet");
+        assert_eq!(config.data.path, "/var/lib/trawl/data");
         assert!(config.server.log_file.is_none());
         assert!(config.server.tls_cert_path.is_none());
         assert!(config.server.tls_key_path.is_none());
@@ -1927,7 +1904,7 @@ max_concurrent_queries = 8
 log_file = "/var/log/trawld.log"
 
 [data]
-path = "/data/**/*.parquet"
+path = "/data"
 
 [auth]
 "#;
@@ -1960,7 +1937,7 @@ path = ""
 [server]
 max_concurrent_queries = 0
 [data]
-path = "/data/*.parquet"
+path = "/data"
 [auth]
 "#;
         let config: Config = toml::from_str(toml).unwrap();
@@ -1975,7 +1952,7 @@ path = "/data/*.parquet"
 tls_cert_path = "/etc/trawl/cert.pem"
 tls_key_path = "/etc/trawl/key.pem"
 [data]
-path = "/data/*.parquet"
+path = "/data"
 [auth]
 "#;
         let config: Config = toml::from_str(toml).unwrap();
@@ -1995,7 +1972,7 @@ path = "/data/*.parquet"
 [server]
 tls_cert_path = "/etc/trawl/cert.pem"
 [data]
-path = "/data/*.parquet"
+path = "/data"
 [auth]
 "#;
         let config: Config = toml::from_str(toml).unwrap();
@@ -2008,7 +1985,7 @@ path = "/data/*.parquet"
         let toml = r#"
 [server]
 [data]
-path = "/data/*.parquet"
+path = "/data"
 [auth]
 "#;
         let config: Config = toml::from_str(toml).unwrap();
@@ -2023,7 +2000,7 @@ path = "/data/*.parquet"
 tls_cert_path = "/etc/trawl/cert.pem"
 tls_key_path = "/etc/trawl/key.pem"
 [data]
-path = "/data/*.parquet"
+path = "/data"
 [auth]
 "#;
         let config: Config = toml::from_str(toml).unwrap();
@@ -2036,7 +2013,7 @@ path = "/data/*.parquet"
         let toml = r#"
 [server]
 [data]
-path = "/data/*.parquet"
+path = "/data"
 [auth]
 "#;
         let config: Config = toml::from_str(toml).unwrap();
@@ -2044,43 +2021,40 @@ path = "/data/*.parquet"
     }
 
     #[test]
-    fn base_dir_strips_glob() {
-        let data = DataConfig {
-            path: "/var/lib/trawl/data/**/*.parquet".into(),
-        };
-        assert_eq!(data.base_dir(), std::path::Path::new("/var/lib/trawl/data"));
+    fn daemon_data_path_rejects_glob_metacharacters() {
+        for path in [
+            "/data/*.parquet",
+            "/data/**/*.parquet",
+            "data?",
+            "/data/[ab]",
+            "[",
+            "*",
+            "?",
+            "/data/private-secret[unfinished",
+        ] {
+            let document = format!("[server]\n[data]\npath = '{path}'");
+            let error = Config::from_toml(&document).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "config validation error: data.path must be a directory path without glob metacharacters (*, ?, [)"
+            );
+            assert!(!format!("{error:?}").contains("private-secret"));
+        }
     }
 
     #[test]
-    fn base_dir_bare_directory() {
-        let data = DataConfig {
-            path: "/var/lib/trawl/data".into(),
-        };
-        assert_eq!(data.base_dir(), std::path::Path::new("/var/lib/trawl/data"));
-    }
-
-    #[test]
-    fn parquet_glob_from_directory() {
-        let data = DataConfig {
-            path: "/var/lib/trawl/data".into(),
-        };
-        assert_eq!(data.parquet_glob(), "/var/lib/trawl/data/**/*.parquet");
-    }
-
-    #[test]
-    fn parquet_glob_passthrough_existing_glob() {
-        let data = DataConfig {
-            path: "/data/**/*.parquet".into(),
-        };
-        assert_eq!(data.parquet_glob(), "/data/**/*.parquet");
-    }
-
-    #[test]
-    fn parquet_glob_strips_trailing_slash() {
-        let data = DataConfig {
-            path: "/var/lib/trawl/data/".into(),
-        };
-        assert_eq!(data.parquet_glob(), "/var/lib/trawl/data/**/*.parquet");
+    fn daemon_data_directory_is_preserved_and_drives_wal_location() {
+        for path in [
+            "/var/lib/trawl/data",
+            "/var/lib/trawl/data/",
+            "relative/data",
+            "/data with spaces",
+            "/",
+        ] {
+            let config = Config::from_toml(&format!("[server]\n[data]\npath = '{path}'")).unwrap();
+            assert_eq!(config.data.base_dir(), PathBuf::from(path));
+            assert_eq!(config.wal_dir(), PathBuf::from(path).join("wal"));
+        }
     }
 
     #[test]
@@ -2107,7 +2081,7 @@ path = "/data"
 [server]
 cors_allowed_origins = ["https://trawl.example.com", "https://admin.example.com"]
 [data]
-path = "/data/*.parquet"
+path = "/data"
 [auth]
 "#;
         let config: Config = toml::from_str(toml).unwrap();
@@ -2123,7 +2097,7 @@ path = "/data/*.parquet"
         let toml = r#"
 [server]
 [data]
-path = "/data/*.parquet"
+path = "/data"
 [auth]
 "#;
         let config: Config = toml::from_str(toml).unwrap();
@@ -2142,7 +2116,7 @@ path = "/data/*.parquet"
 default_rpm = 250
 ingest_rpm = 5000
 [data]
-path = "/data/*.parquet"
+path = "/data"
 [auth]
 "#;
         let config: Config = toml::from_str(toml).unwrap();
@@ -2572,7 +2546,7 @@ stats_interval_secs = 0
         let toml = r#"
 [server]
 [data]
-path = "/data/*.parquet"
+path = "/data"
 [auth]
 "#;
         let config: Config = toml::from_str(toml).unwrap();
@@ -2833,7 +2807,7 @@ database_url = "postgres://fleet:fleet@localhost:5433/fleet"
         let toml = r#"
 [server]
 [data]
-path = "/data/*.parquet"
+path = "/data"
 [auth]
 [web]
 bind_addr = "0.0.0.0:8090"
@@ -2863,7 +2837,7 @@ allow_insecure_cookies = true
         let toml = r#"
 [server]
 [data]
-path = "/data/*.parquet"
+path = "/data"
 [auth]
 [web]
 shared_domain = ".fleet.lab.ktle.net"
@@ -2881,7 +2855,7 @@ shared_domain = ".fleet.lab.ktle.net"
         let toml = r#"
 [server]
 [data]
-path = "/data/*.parquet"
+path = "/data"
 [auth]
 [web]
 "#;
@@ -2896,7 +2870,7 @@ path = "/data/*.parquet"
             r#"
 [server]
 [data]
-path = "/data/*.parquet"
+path = "/data"
 [auth]
 [ingest]
 {ingest}
@@ -3011,7 +2985,7 @@ envs = ["prod", "lab"]
             r#"
 [server]
 [data]
-path = "/data/*.parquet"
+path = "/data"
 [auth]
 [retention]
 {retention}
@@ -3247,7 +3221,7 @@ max_age_days = 30
                 r#"
 [server]
 [data]
-path = "/data/*.parquet"
+path = "/data"
 [auth]
 [syslog]
 enabled = true
@@ -3360,7 +3334,7 @@ time_from = ["_time"]
         let toml = r#"
 [server]
 [data]
-path = "/data/*.parquet"
+path = "/data"
 [auth]
 [ingest]
 severity_from = [{ field = "syslog_severity", dialct = "syslog" }]
@@ -3374,7 +3348,7 @@ severity_from = [{ field = "syslog_severity", dialct = "syslog" }]
         let toml = r#"
 [server]
 [data]
-path = "/data/*.parquet"
+path = "/data"
 [auth]
 [ingest]
 time_from = [{ dialect = "otel" }]
@@ -3390,7 +3364,7 @@ time_from = [{ dialect = "otel" }]
         let toml = r#"
 [server]
 [data]
-path = "/data/*.parquet"
+path = "/data"
 [auth]
 [ingest]
 severity_from = [7]

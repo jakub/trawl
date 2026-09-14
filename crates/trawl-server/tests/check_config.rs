@@ -128,6 +128,23 @@ fn config_check_rejects_errors_without_echoing_config_values() {
 }
 
 #[test]
+fn config_check_rejects_daemon_globs_without_side_effects() {
+    for path in [
+        "~/private-secret/*.parquet",
+        "~/private-secret?",
+        "~/private-secret[ab]",
+        "[",
+    ] {
+        let output = check(&format!("[server]\n[data]\npath = '{path}'"));
+        assert_eq!(output.status.code(), Some(1));
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("data.path must be a directory path")
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("Configuration is valid"));
+    }
+}
+
+#[test]
 fn config_check_requires_an_explicit_config() {
     let output = command().arg("--check-config").output().unwrap();
     assert_eq!(output.status.code(), Some(2));

@@ -1003,7 +1003,7 @@ mod tests {
             r#"
 [server]
 [data]
-path = "/data/*.parquet"
+path = "/data"
 [auth]
 [ingest]
 {ingest}
