@@ -184,6 +184,7 @@ jobs:
       - run: >-
           cargo nextest run --workspace --no-default-features
           --features fleet-auth/keystore,fleet-auth/axum,fleet-auth/fast-hash
+        env:
           # DATABASE_URL, not FLEET_DATABASE_URL: trawld's [auth] resolution
           # treats FLEET_DATABASE_URL as its highest-precedence keystore
           # override (ADR-0004 slice 3), so setting it process-wide would
