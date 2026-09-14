@@ -1,0 +1,9 @@
+warning: ignoring `resolver.incompatible-publish-age` without `-Zmin-publish-age`
+warning: ignoring `registry.global-min-publish-age` without `-Zmin-publish-age`
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl/.flow-worktrees/launch-distribution-review/crates/trawl-core)
+   Compiling trawl-engine v0.4.0 (/home/jakub/code/trawl/.flow-worktrees/launch-distribution-review/crates/trawl-engine)
+   Compiling trawl-client v0.4.0 (/home/jakub/code/trawl/.flow-worktrees/launch-distribution-review/crates/trawl-client)
+   Compiling trawl-cli v0.4.0 (/home/jakub/code/trawl/.flow-worktrees/launch-distribution-review/crates/trawl-cli)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.23s
+     Running `target/debug/trawl query --data scripts/release/fixtures/cli.parquet '* | stats count() as rows'`
+{"rows":3}

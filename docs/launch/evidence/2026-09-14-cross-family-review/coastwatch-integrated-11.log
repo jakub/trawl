@@ -1,0 +1,20 @@
+warning: unused config key `resolver.incompatible-publish-age` in `/home/jakub/.cargo/config.toml`
+warning: unused config key `resolver.incompatible-publish-age` in `/home/jakub/.cargo/config.toml`
+   Compiling coastwatch-web v0.1.0 (/home/jakub/code/trawl/.flow-worktrees/launch-consumer-babysit/coastwatch/crates/web)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.55s
+────────────
+ Nextest run ID 48bfb5cf-a23d-4ec2-9bd3-77070340d288 with nextest profile: default
+    Starting 11 tests across 2 binaries
+        PASS [   0.665s] ( 1/11) coastwatch-web::fleet_schema fixture_cleans_up_after_a_panicking_test
+        PASS [   0.692s] ( 2/11) coastwatch-web::fleet_schema fixture_preserves_original_panic_when_cleanup_fails
+        PASS [   0.694s] ( 3/11) coastwatch-web::fleet_schema nonempty_untracked_database_is_refused_without_ledger
+        PASS [   0.696s] ( 4/11) coastwatch-web::fleet_schema fresh_requires_opt_in_then_reopens_without_migration
+        PASS [   0.696s] ( 5/11) coastwatch-web::fleet_schema old_history_is_refused_without_mutation_in_both_modes
+        PASS [   0.701s] ( 6/11) coastwatch-web::build_with_spa_role_gate valid_operator_cookie_cannot_upload_from_an_unapproved_origin
+        PASS [   0.851s] ( 7/11) coastwatch-web::build_with_spa_role_gate uploads_route_is_session_guarded_not_upload_gated
+        PASS [   0.854s] ( 8/11) coastwatch-web::build_with_spa_role_gate analyst_cookie_clears_upload_gate_on_post_documents
+        PASS [   0.903s] ( 9/11) coastwatch-web::build_with_spa_role_gate siem_cookie_is_403_on_post_documents
+        PASS [   0.957s] (10/11) coastwatch-web::build_with_spa_role_gate operator_cookie_clears_upload_gate_on_post_documents
+        PASS [   0.965s] (11/11) coastwatch-web::build_with_spa_role_gate session_origin_policy_checks_safe_methods_and_preserves_missing_origin
+────────────
+     Summary [   0.965s] 11 tests run: 11 passed, 0 skipped

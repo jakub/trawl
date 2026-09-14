@@ -1,0 +1,55 @@
+warning: ignoring `resolver.incompatible-publish-age` without `-Zmin-publish-age`
+warning: ignoring `registry.global-min-publish-age` without `-Zmin-publish-age`
+warning: ignoring `resolver.incompatible-publish-age` without `-Zmin-publish-age`
+warning: ignoring `registry.global-min-publish-age` without `-Zmin-publish-age`
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl/.flow-worktrees/trawl-pr-186/crates/trawl-core)
+   Compiling fleet-auth v0.4.0 (/home/jakub/code/trawl/.flow-worktrees/trawl-pr-186/crates/fleet-auth)
+   Compiling trawl-engine v0.4.0 (/home/jakub/code/trawl/.flow-worktrees/trawl-pr-186/crates/trawl-engine)
+   Compiling trawl-server v0.4.0 (/home/jakub/code/trawl/.flow-worktrees/trawl-pr-186/crates/trawl-server)
+   Compiling trawl-client v0.4.0 (/home/jakub/code/trawl/.flow-worktrees/trawl-pr-186/crates/trawl-client)
+   Compiling trawl-cli v0.4.0 (/home/jakub/code/trawl/.flow-worktrees/trawl-pr-186/crates/trawl-cli)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 27.49s
+────────────
+ Nextest run ID ba4f03fc-2bd2-464f-ad14-55a304caa825 with nextest profile: default
+    Starting 39 tests across 4 binaries (747 tests skipped)
+        PASS [   0.012s] ( 1/39) trawl-server epoch::tests::epoch_publication_refuses_a_replacement_staging_entry
+        PASS [   0.013s] ( 2/39) trawl-server epoch::tests::query_only_generic_archives_and_unused_wal_are_untouched
+        PASS [   0.014s] ( 3/39) trawl-server epoch::tests::dangling_symlinks_are_errors_not_absence
+        PASS [   0.016s] ( 4/39) trawl-server epoch::tests::staged_epoch_symlinks_and_directories_are_never_retried
+        PASS [   0.018s] ( 5/39) trawl-server epoch::tests::markerless_nonempty_ingest_roots_refuse_without_mutation
+        PASS [   0.019s] ( 6/39) trawl-server epoch::tests::flat_wal_refuses_before_fresh_empty_or_current_root_mutation
+        PASS [   0.020s] ( 7/39) trawl-server epoch::tests::current_environment_wal_is_preserved
+        PASS [   0.021s] ( 8/39) trawl-server epoch::tests::invalid_path_types_fail_before_initialization
+        PASS [   0.022s] ( 9/39) trawl-server epoch::tests::suffix_siblings_and_report_results_are_never_adopted_or_deleted
+        PASS [   0.022s] (10/39) trawl-server epoch::tests::query_only_owned_roots_still_require_their_epoch_marker
+        PASS [   0.024s] (11/39) trawl-server epoch::tests::staging_retry_requires_current_bytes_and_generated_name
+        PASS [   0.024s] (12/39) trawl-server epoch::tests::staging_files_never_admit_mixed_or_query_only_roots
+        PASS [   0.025s] (13/39) trawl-server epoch::tests::explicit_noncurrent_epochs_refuse_in_every_mode_without_mutation
+        PASS [   0.014s] (14/39) trawl-server::check_config config_check_has_no_startup_side_effects
+        PASS [   0.027s] (15/39) trawl-server epoch::tests::interrupted_epoch_publication_retries_then_restarts
+        PASS [   0.028s] (16/39) trawl-server epoch::tests::fresh_and_empty_roots_initialize_and_restart
+        PASS [   0.010s] (17/39) trawl-server::check_config config_check_requires_an_explicit_config
+        PASS [   0.043s] (18/39) trawl-server::check_config config_check_accepts_shipped_configuration
+        PASS [   0.045s] (19/39) trawl-server::check_config config_check_rejects_daemon_globs_without_side_effects
+        PASS [   0.045s] (20/39) trawl-server::check_config config_check_rejects_errors_without_echoing_config_values
+        PASS [   0.076s] (21/39) trawl-server::check_config config_check_rejects_active_log_marker_collisions_without_side_effects
+        PASS [   0.004s] (22/39) trawl-server::bin/trawld tests::log_destination_resolution_errors_do_not_change_storage
+        PASS [   0.004s] (23/39) trawl-server::bin/trawld tests::prepare_data_root_refuses_epoch_or_wal_before_repin_cleanup
+        PASS [   0.005s] (24/39) trawl-server::bin/trawld tests::log_destination_rejects_marker_aliases_and_keeps_normal_paths
+        PASS [   0.059s] (25/39) trawl-server::bin/trawld tests::prepare_data_root_recovers_current_repin_before_returning
+        PASS [   5.833s] (26/39) trawl-server::startup_pg admitted_lock_and_fatal_watcher_cover_store_reconciliation
+        PASS [   0.024s] (27/39) trawl-server::startup_pg common::publish_dir_once_has_one_winner_under_thread_contention
+        PASS [   0.009s] (28/39) trawl-server::startup_pg common::sweep_guards_parse_own_database_name
+        PASS [   0.492s] (29/39) trawl-server::startup_pg competing_writer_refuses_before_filesystem_recovery
+        PASS [   0.625s] (30/39) trawl-server::startup_pg database_refusal_does_not_initialize_fresh_root
+        PASS [   0.610s] (31/39) trawl-server::startup_pg epoch_refusal_preserves_storage_and_releases_admitted_lock
+        PASS [   1.366s] (32/39) trawl-server::startup_pg fresh_boot_restart_and_interrupted_current_cutover
+        PASS [   0.829s] (33/39) trawl-server::startup_pg interrupted_epoch_publication_starts_and_restarts
+        PASS [   0.771s] (34/39) trawl-server::startup_pg log_inside_fresh_data_root_starts_and_restarts
+        PASS [   1.854s] (35/39) trawl-server::startup_pg log_marker_collision_refuses_before_database_or_storage_mutation
+        PASS [   0.517s] (36/39) trawl-server::startup_pg old_fleet_refuses_before_cutover
+        PASS [   0.747s] (37/39) trawl-server::startup_pg old_trawl_refuses_before_cutover
+        PASS [   0.471s] (38/39) trawl-server::startup_pg untracked_fleet_refuses_before_cutover
+        PASS [   0.659s] (39/39) trawl-server::startup_pg untracked_trawl_refuses_before_cutover
+────────────
+     Summary [  14.837s] 39 tests run: 39 passed, 747 skipped

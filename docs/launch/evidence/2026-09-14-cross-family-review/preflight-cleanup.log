@@ -1,0 +1,9 @@
+{"container": "786ac5da53b95351ad0208a182cc8d330bb819524609205ebab76324c6a8b6a5", "name": "trawl-sweep-proof-f2728c38048b422bbb581837fe67f90c", "volumes": ["b22321b62c3c5c25117b4bf9d5c220acedbc25ec5b55f854839c3e9721fe5f6e"], "owner": "1234-1789401499", "running": true}
+.{"container": "ee748b92f566a4529aeaae79e890a28302eac09011c3211d19fa3d0f4590a5ee", "name": "trawl-sweep-proof-a4e5a818eae04e1196a1c083a7dc97bd", "volumes": ["5b71a121a66e865f3e6d03ff686e615e1c99abcf7ceb6adff3541c2796872efb"], "owner": "1234-1789401499", "running": false}
+.{"container": "ec48c0df758d392c4945f0d0596c33ccf4919702a533b8ff832a1e4c2e64e72c", "name": "trawl-sweep-proof-3162d11d954842de82b3b3148045a02f", "volumes": ["403eba625c6cfe18ed896852c28603d9515ad41eac05e79a841a56ae1611ad35"], "owner": null, "running": false}
+{"container": "9d95b0ba055d3ccbecbb7bda9640aeb827e972619f17772d246b20ca8dcca213", "name": "trawl-sweep-proof-f0c642f2573c4f228349bfadad194482", "volumes": ["63e41fb1da2ae0036beba868e33e66367850041a321e0def0280987dbad25fc2"], "owner": "unrecognized", "running": false}
+.
+----------------------------------------------------------------------
+Ran 3 tests in 0.571s
+
+OK

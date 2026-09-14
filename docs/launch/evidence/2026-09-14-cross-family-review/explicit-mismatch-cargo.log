@@ -1,0 +1,18 @@
+warning: ignoring `resolver.incompatible-publish-age` without `-Zmin-publish-age`
+warning: ignoring `registry.global-min-publish-age` without `-Zmin-publish-age`
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl/.flow-worktrees/launch-distribution-review/crates/trawl-core)
+error: failed to run custom build command for `trawl-core v0.4.0 (/home/jakub/code/trawl/.flow-worktrees/launch-distribution-review/crates/trawl-core)`
+
+Caused by:
+  process didn't exit successfully: `/home/jakub/code/trawl/.flow-worktrees/launch-distribution-review/target/debug/build/trawl-core-20fb364931c7de46/build-script-build` (exit status: 101)
+  --- stdout
+  cargo:rerun-if-env-changed=DUCKDB_DOWNLOAD_LIB
+  cargo:rerun-if-env-changed=DUCKDB_LIB_DIR
+  cargo:rerun-if-env-changed=DUCKDB_STATIC
+
+  --- stderr
+  DUCKDB_LIB_DIR libduckdb.so does not match the verified runtime; input left unchanged
+
+  thread 'main' (3140501) panicked at crates/trawl-core/build_support/duckdb.rs:75:5:
+  failed to prepare the checksum-verified DuckDB runtime
+  note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

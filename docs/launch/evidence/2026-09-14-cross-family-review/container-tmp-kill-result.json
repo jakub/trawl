@@ -1,0 +1,13 @@
+{
+  "snapshot": "/tmp/package-source-h3a05p0a/source",
+  "commit": "0f01318e212e37c6f3ade2f0f47d7e690a7e0f10",
+  "files": 5455,
+  "container": "560a4cc398310eece404fedecd85d63315cd6655b89589b0c7d807b6dba51ee8",
+  "name": "trawl-snapshot-kill-c942509f8c724edb847710aa06fc33f9",
+  "exit": 137,
+  "auto_remove": true,
+  "tmp_is_container_owned": true,
+  "container_absent": true,
+  "persistent_snapshot_list_unchanged": true,
+  "original_manifests_unchanged": true
+}

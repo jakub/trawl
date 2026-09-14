@@ -1,0 +1,30 @@
+[
+  {
+    "revision": "before",
+    "case": "storage_parent",
+    "correct_context": false,
+    "unchanged_files": true,
+    "stderr": "[trawld] failed to validate server.log_file logs/server.log: Not a directory (os error 20)"
+  },
+  {
+    "revision": "before",
+    "case": "hardlink",
+    "correct_context": false,
+    "unchanged_files": true,
+    "stderr": "[trawld] failed to validate server.log_file server.log: server.log_file overlaps reserved storage marker data/EPOCH; select a separate log file"
+  },
+  {
+    "revision": "after",
+    "case": "storage_parent",
+    "correct_context": true,
+    "unchanged_files": true,
+    "stderr": "[trawld] failed to inspect reserved storage marker block/child/EPOCH while validating server.log_file logs/server.log: Not a directory (os error 20)"
+  },
+  {
+    "revision": "after",
+    "case": "hardlink",
+    "correct_context": true,
+    "unchanged_files": true,
+    "stderr": "[trawld] server.log_file overlaps reserved storage marker data/EPOCH; select a separate log file"
+  }
+]

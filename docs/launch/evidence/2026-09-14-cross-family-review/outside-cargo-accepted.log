@@ -1,0 +1,12 @@
+warning: unused config key `resolver.incompatible-publish-age` in `/home/jakub/.cargo/config.toml`
+   Compiling stacker v0.1.24
+   Compiling num-traits v0.2.19
+    Checking regex-automata v0.4.16
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl/.flow-worktrees/launch-distribution-review/crates/trawl-core)
+   Compiling ar_archive_writer v0.5.2
+    Checking serde_json v1.0.151
+    Checking chrono v0.4.45
+   Compiling psm v0.1.31
+    Checking chumsky v0.13.0
+    Checking regex v1.13.1
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.07s

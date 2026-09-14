@@ -1,0 +1,38 @@
+warning: unused config key `resolver.incompatible-publish-age` in `/home/jakub/.cargo/config.toml`
+   Compiling shlex v2.0.1
+   Compiling find-msvc-tools v0.1.9
+   Compiling object v0.37.3
+   Compiling memchr v2.8.3
+   Compiling autocfg v1.5.1
+   Compiling libc v0.2.189
+   Compiling serde_core v1.0.229
+   Compiling zmij v1.0.23
+    Checking cfg-if v1.0.4
+    Checking equivalent v1.0.2
+    Checking regex-syntax v0.8.11
+   Compiling serde_json v1.0.151
+    Checking allocator-api2 v0.2.21
+    Checking foldhash v0.1.5
+    Checking unicode-ident v1.0.24
+    Checking unicode-segmentation v1.13.3
+    Checking itoa v1.0.18
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl/.flow-worktrees/launch-distribution-review/crates/trawl-core)
+    Checking iana-time-zone v0.1.65
+   Compiling cc v1.4.0
+    Checking hashbrown v0.15.5
+   Compiling num-traits v0.2.19
+    Checking aho-corasick v1.1.4
+error: failed to run custom build command for `trawl-core v0.4.0 (/home/jakub/code/trawl/.flow-worktrees/launch-distribution-review/crates/trawl-core)`
+
+Caused by:
+  process didn't exit successfully: `/home/jakub/code/trawl/.flow-worktrees/launch-distribution-review/target/debug/build/trawl-core-638a84827168850e/build-script-build` (exit status: 101)
+  --- stdout
+  cargo:rerun-if-env-changed=DUCKDB_DOWNLOAD_LIB
+  cargo:rerun-if-env-changed=DUCKDB_NO_PKG_CONFIG
+
+  --- stderr
+
+  thread 'main' (3216021) panicked at crates/trawl-core/build_support/duckdb.rs:33:5:
+  host DuckDB pkg-config selection must be disabled; run Cargo from the checkout, or use DUCKDB_NO_PKG_CONFIG=1 cargo ... when invoking --manifest-path or install --path from outside it (also required with DUCKDB_LIB_DIR)
+  note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+warning: build failed, waiting for other jobs to finish...

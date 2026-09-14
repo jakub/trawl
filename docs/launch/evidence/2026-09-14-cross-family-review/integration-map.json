@@ -1,0 +1,255 @@
+[
+  {
+    "repository": "trawl",
+    "delivery_commit": "3863ba4634ecac98d98a9c01574fef1c94617305",
+    "subject": "docs: pin historical links to a published commit",
+    "stable_patch_id": "eafd856c3fa158fd95adcfa18d75e91bd481dafc",
+    "matching_author_commits": []
+  },
+  {
+    "repository": "trawl",
+    "delivery_commit": "25d5c4a8abcff0fef25d5d82e88627677eca698e",
+    "subject": "fix(server): retry interrupted initial epoch publication",
+    "stable_patch_id": "c2039bac61bd0ec774def37595bf4b0dd85bb4bd",
+    "matching_author_commits": [
+      "a8e8b5a12e951099ebe8c11b4ebb9e7f40719db0"
+    ]
+  },
+  {
+    "repository": "trawl",
+    "delivery_commit": "c1fb6cde69d6813b45544236971d28eb56f645dd",
+    "subject": "fix(server): defer file logging until storage admission",
+    "stable_patch_id": "ea991dacedb9c2eb1aa5728ed9dd58dbee667004",
+    "matching_author_commits": [
+      "d78ac29dd49cdaeeb19ae80aadfba26b97170045"
+    ]
+  },
+  {
+    "repository": "trawl",
+    "delivery_commit": "a164645300653488a21ace63a9aee5ab12a943ef",
+    "subject": "fix(release): publish shared DuckDB crash symbols",
+    "stable_patch_id": "21af9e7acba58d7be3eee79d8753678824b63208",
+    "matching_author_commits": [
+      "11c055e171433180753c1fd7f64da80d56b7765d"
+    ]
+  },
+  {
+    "repository": "trawl",
+    "delivery_commit": "eb3d76e589163cf13ef5ba23f56f8548c4ac38e7",
+    "subject": "fix(debian): exercise the shipped runtime package in crash tests",
+    "stable_patch_id": "bd394d4af46d8da9b508db808a4a22a58ca32d48",
+    "matching_author_commits": [
+      "5bc8a66e696c94b58f29c44d04d27d5e38873da4"
+    ]
+  },
+  {
+    "repository": "trawl",
+    "delivery_commit": "daae316a700bd0b2c593a9334a65daea644f1369",
+    "subject": "fix(build): verify the DuckDB runtime for ordinary Cargo commands",
+    "stable_patch_id": "abbb3cca34f12b5ad171d82a151496ce261daa74",
+    "matching_author_commits": [
+      "ef68665ce78fb1ca9f44845e92f408a1bfc1e705"
+    ]
+  },
+  {
+    "repository": "trawl",
+    "delivery_commit": "18611c01aac069e3ecbe9f84fe6d817bac0f81c3",
+    "subject": "fix(server): identify refused epoch staging entries",
+    "stable_patch_id": "d0594ecfc7d7b77ad9de327a9bd091597285eeb7",
+    "matching_author_commits": [
+      "5ff3416b313e5d791ac7062924fc98668bc4e60e"
+    ]
+  },
+  {
+    "repository": "trawl",
+    "delivery_commit": "d195efa0d9fc73058fd058c1ff6a21732ab761bf",
+    "subject": "fix(server): reject file logs that alias storage markers",
+    "stable_patch_id": "876c5bbdd28dbf5eb1a43e1feb5cad0d516518cd",
+    "matching_author_commits": [
+      "08902bcec05047a54a9c33d91ec79b38bbb1aebe"
+    ]
+  },
+  {
+    "repository": "trawl",
+    "delivery_commit": "77415fc42510f47b873595cc886c30f8bc8ea3a1",
+    "subject": "fix(build): keep explicit DuckDB runtime inputs read-only",
+    "stable_patch_id": "73d3fa7a12f6eda3dc4837a35e448552eda9a3eb",
+    "matching_author_commits": [
+      "bf21e5b8bd3371c91d188fc7bd992c912d3434e9"
+    ]
+  },
+  {
+    "repository": "trawl",
+    "delivery_commit": "cdd12a5c857e4632cb5719c7f97cc949881558e5",
+    "subject": "fix(test): remove owned crashdump database volumes at teardown",
+    "stable_patch_id": "10d47782230b34f71e42e2907077bec0926df9bc",
+    "matching_author_commits": [
+      "a15f49adec632e5c38678fb40b37e6b2fb17558d"
+    ]
+  },
+  {
+    "repository": "trawl",
+    "delivery_commit": "6b156f2089939e985b9d1f2ea2ea91b6a21eb6de",
+    "subject": "fix(server): preserve markerless root recovery guidance",
+    "stable_patch_id": "f873ecb819feb8eec9e387c78d347b16de2f4311",
+    "matching_author_commits": [
+      "01babc9f613c1c2c3f1a287653d6f0fe16cb3010"
+    ]
+  },
+  {
+    "repository": "trawl",
+    "delivery_commit": "c1a82fb722a750da05cd9c57401a121190ac4f6c",
+    "subject": "fix(server): identify log paths in validation errors",
+    "stable_patch_id": "f13779f51dd302cc75ab28fb2b8d864220d84cdb",
+    "matching_author_commits": [
+      "105663fb0b92b3b0cbcefd45dd1d531ba22654fe"
+    ]
+  },
+  {
+    "repository": "trawl",
+    "delivery_commit": "cd533944d914c9adee8617cea4c4a97b49add5ed",
+    "subject": "fix(server): identify storage paths in log validation errors",
+    "stable_patch_id": "9d3f50e36542cefcc092f858aea4934a364c42cc",
+    "matching_author_commits": []
+  },
+  {
+    "repository": "trawl",
+    "delivery_commit": "0c326c4523867793965aa82ea389f96adf5578df",
+    "subject": "fix(ci): trigger native checks for shared build helpers",
+    "stable_patch_id": "f9484dd8807fd7df14912b258ed277109c9ea143",
+    "matching_author_commits": [
+      "2f9c901e7df555579337db1e2726f45dde9745f1"
+    ]
+  },
+  {
+    "repository": "trawl",
+    "delivery_commit": "ed9f83eea0c9c6932136079530a6e80508dc2ad2",
+    "subject": "fix(build): reject host DuckDB pkg-config selection",
+    "stable_patch_id": "0f7c73b1b51cc4af3b5223e78041137bcd3a1515",
+    "matching_author_commits": [
+      "308a316e445c59ab9fc80421bcedb38c20f9915e"
+    ]
+  },
+  {
+    "repository": "trawl",
+    "delivery_commit": "8f58718e9d7759f956b85fea80ebb8c11356dc8c",
+    "subject": "fix(test): package Debian artifacts from disposable source copies",
+    "stable_patch_id": "075d4bd80e64cb79ff71691c514f304bfbf4b58d",
+    "matching_author_commits": [
+      "5ec1a3f403c07d1565401411d36d1c2cad779157"
+    ]
+  },
+  {
+    "repository": "trawl",
+    "delivery_commit": "f333e2d7213c3021f420e754f5325c90c279420f",
+    "subject": "docs(dev): describe verified native Cargo runtime requirements",
+    "stable_patch_id": "96a4414143554dd77e56171d579bdb21fbba2ced",
+    "matching_author_commits": [
+      "83ddeb15ff07088b5ae46bacda2809952a4c4e88"
+    ]
+  },
+  {
+    "repository": "trawl",
+    "delivery_commit": "468f4f8bf376874cb139ceacf7b3b4219ed62230",
+    "subject": "fix(test): verify ownership before removing stopped harness containers",
+    "stable_patch_id": "d874c43d1b5120564577919e298e1a9305d65b6b",
+    "matching_author_commits": [
+      "0f01318e212e37c6f3ade2f0f47d7e690a7e0f10"
+    ]
+  },
+  {
+    "repository": "trawl",
+    "delivery_commit": "4a46bd4bd1c05cb33a8251ae642a33905a0a0b1a",
+    "subject": "fix(test): keep packaging snapshots in disposable container storage",
+    "stable_patch_id": "d0c585e268dafe30110b7fcd49fce41c549e484b",
+    "matching_author_commits": [
+      "e34833a62c94627aa25f843c38919d1c9455f085"
+    ]
+  },
+  {
+    "repository": "coastwatch",
+    "delivery_commit": "90dc436da2eec903a1eee6850cd802280ec309a6",
+    "subject": "fix: isolate Fleet schema test databases",
+    "stable_patch_id": "500bc574623549e62ad9df53abe8e35c92331689",
+    "matching_author_commits": [
+      "537387ce9732435f809ec6201f724d878dc9ae15"
+    ]
+  },
+  {
+    "repository": "coastwatch",
+    "delivery_commit": "698753d8e35c7928ab45117bd29988c772d49872",
+    "subject": "fix: validate session origins on every method",
+    "stable_patch_id": "5a4c44f7c808eaee10414d6c7c64397e286a86c9",
+    "matching_author_commits": [
+      "bf877af5c85a3408af670333c494bf0d31205946"
+    ]
+  },
+  {
+    "repository": "coastwatch",
+    "delivery_commit": "285d2b25774a1717c3a31dde66ea2cf702e716b7",
+    "subject": "docs: clarify Fleet startup and override requirements",
+    "stable_patch_id": "25145e781f97309a420e7445c85305c281e76d33",
+    "matching_author_commits": [
+      "cc15cc7b10e40130e668e2db57c01a52d7501507"
+    ]
+  },
+  {
+    "repository": "coastwatch",
+    "delivery_commit": "ac7a42d76c174331f897ed2f2b6d7b2a0dbf25a4",
+    "subject": "ci: remove obsolete Wasm target reinstall",
+    "stable_patch_id": "81b00054acf581f269a5cb607bf9857987391e63",
+    "matching_author_commits": [
+      "297dd3e0dfb9023c61d4ef6f63a416b4f12962e7"
+    ]
+  },
+  {
+    "repository": "coastwatch",
+    "delivery_commit": "16e7a5eacae8425aa0617e58ccceb75acd51d53e",
+    "subject": "fix: preserve empty Fleet fixtures and assertion failures",
+    "stable_patch_id": "44fb29ccf8dce6f9a1c6398528a1d918616acf8d",
+    "matching_author_commits": [
+      "81a19e3c3a87b2a9bd07bfc15a7bed80b129d633"
+    ]
+  },
+  {
+    "repository": "coastwatch",
+    "delivery_commit": "76b64c0fe39eca9f2f0568b2a099ad88c99b25c1",
+    "subject": "docs: clarify test Fleet configuration inputs",
+    "stable_patch_id": "5cd86ddb45d0ffb439d30ebf5e9c134791cc414d",
+    "matching_author_commits": [
+      "8e1cdba18fcca4f57af4bbcc01e147cb8fb310d5"
+    ]
+  },
+  {
+    "repository": "coastwatch",
+    "delivery_commit": "1bc169332c5333ccea77397b0c3223ef7e9ae215",
+    "subject": "test: allow explicit disposable database targets in push hooks",
+    "stable_patch_id": "e15a0189c943d9b393ea5173507ecd2e1c95b763",
+    "matching_author_commits": []
+  },
+  {
+    "repository": "coastwatch",
+    "delivery_commit": "4a16c61aeaeefd1ad5adfa36bd0bb57a3e3dbbfe",
+    "subject": "ci: pin the reviewed Trawl launch fixes",
+    "stable_patch_id": "2b3b0cf56d9823a4f9aa7d1c4e4efc5721e2f980",
+    "matching_author_commits": []
+  },
+  {
+    "repository": "coastwatch",
+    "delivery_commit": "c45e3acc319eb5ea3fef916056738198b14cb88f",
+    "subject": "fix: make Fleet cleanup failure probe deterministic",
+    "stable_patch_id": "2baf728f02c12a461da49aa7153806e5c8a59da6",
+    "matching_author_commits": [
+      "d6a3d323aa4679782af4142ffd6630415d62453d"
+    ]
+  },
+  {
+    "repository": "coastwatch",
+    "delivery_commit": "79be6c06c599abcd48c211c590d94f0f9dc1523f",
+    "subject": "docs: distinguish test database config from CI inputs",
+    "stable_patch_id": "31e640a0c2e6bc8ad0374c12b9134250cbaac1b1",
+    "matching_author_commits": [
+      "f5a446f48a6e2b9e3be7e75123205f7bf3456578"
+    ]
+  }
+]

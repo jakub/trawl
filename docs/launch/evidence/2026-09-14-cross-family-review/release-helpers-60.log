@@ -1,0 +1,9 @@
+.........................{"container": "c5bcfc4db32758ee8235dc2b5910ceac515cc6caaabc61cf352b8eddc407e335", "name": "trawl-sweep-proof-bd9858a4d2294a548ce36bab59f5d876", "volumes": ["ae8b10e65d896598ff97bcf157fa91b3e476fd0e4f49b14605d96b39f07937dc"], "owner": "1234-1789401499", "running": true}
+.{"container": "b0d2e809fccbcae2f2f43fd3b2ffad5b8e71eace5978ea3cb9f728c4b72b0c86", "name": "trawl-sweep-proof-d7c17b10fef7459fb9e3e972291356d1", "volumes": ["d7071e98db69666c0ad30e4583a08691848f302a964349b0d6b47cfcd8164798"], "owner": "1234-1789401499", "running": false}
+.{"container": "fb9da34214fbeb01f4cf325a38ad34e97d78387f51a79bb46507d2a0904a09b4", "name": "trawl-sweep-proof-ed5d2dd2ff34451596d951031944af9f", "volumes": ["77dae172ad8dacb42408a6e4cd7acf0c0222ab4ebb1657026c07d4fa34fed4d8"], "owner": null, "running": false}
+{"container": "ff39927854dce593a9935dbebe905b8b59768967b9c4ccb575f55d12ce019e7c", "name": "trawl-sweep-proof-c7c0d0f1698949c5afc7ee25f92cf1be", "volumes": ["544785d1bf56486a64f7e46a5c8b3307d1a4ecf32804801bd68a6cdecd969a9d"], "owner": "unrecognized", "running": false}
+.................................
+----------------------------------------------------------------------
+Ran 60 tests in 4.986s
+
+OK
