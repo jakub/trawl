@@ -1,0 +1,156 @@
+{
+  "schema": 1,
+  "runId": "run-1789350917170-5c84888283",
+  "status": "passed",
+  "seed": 42,
+  "count": 1000,
+  "rate": 200,
+  "batchSize": 50,
+  "host": {
+    "platform": "linux",
+    "architecture": "x64",
+    "cpuModel": "AMD Ryzen 7 7800X3D 8-Core Processor",
+    "logicalCpus": 16,
+    "totalMemoryBytes": 33341956096
+  },
+  "build": {
+    "sourceHash": "e686e0bf3f9ce5b7fdec4d9117fcc753494f42d3d84a05bf050dd230e7d9185e",
+    "target": "/home/jakub/code/trawl/target/launch-readiness",
+    "checkout": "/home/jakub/code/trawl/.worktrees/launch-readiness",
+    "binaries": {
+      "trawld": "6a174fee7f7b3ee3efc50fdc15b09ffd472e5064754ded235688d1f919081a47",
+      "trawl-web": "580c97211d0cf5fc5e65d841a46a2eaf2dfc3be45559fb3b50c6f2511901fb13",
+      "fleet-admin": "82a3a268ffdb6b18e93cf0c67e8e2e6a1e8445e865498fba36a8cc1b8e131dcc",
+      "deps/libduckdb.so": "fc23f12e376c47be520f75221288281906e7942e8fd6f6ce4849198ba60d0405"
+    },
+    "profile": "debug server, release SPA, downloaded DuckDB",
+    "commit": "6b3febff4209518564cef2eaa85cc5b2281f7d58",
+    "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+    "node": "v26.8.1",
+    "spaHash": "3fcd1ba483b14e08ef79d5ee58a47bf9ee2c92ebdbbe68f027a42c032b393624"
+  },
+  "phases": [
+    {
+      "name": "initial",
+      "verifiedEvents": 50,
+      "resultHash": "b7de77dcd087ed6537c08b25a8e389336cc2ebd3979d161f39a3ccea659a265d",
+      "process": {
+        "VmHWM": "227176 kB",
+        "VmRSS": "116072 kB",
+        "Threads": "33"
+      }
+    },
+    {
+      "name": "browser-login-search",
+      "verifiedEvents": 50
+    },
+    {
+      "name": "browser-live-tail",
+      "verifiedEvents": 950
+    },
+    {
+      "name": "browser-live-tail-closed"
+    },
+    {
+      "name": "ingested",
+      "verifiedEvents": 1000,
+      "resultHash": "7edcb63c386112d2a4d1f9a7bb15097f53c44f58cdb5ed5741e5f023836a4bb8",
+      "process": {
+        "VmHWM": "227176 kB",
+        "VmRSS": "151464 kB",
+        "Threads": "33"
+      }
+    },
+    {
+      "name": "compacted",
+      "verifiedEvents": 1000,
+      "resultHash": "7edcb63c386112d2a4d1f9a7bb15097f53c44f58cdb5ed5741e5f023836a4bb8",
+      "process": {
+        "VmHWM": "227176 kB",
+        "VmRSS": "143212 kB",
+        "Threads": "34"
+      }
+    },
+    {
+      "name": "restarted",
+      "verifiedEvents": 1000,
+      "resultHash": "7edcb63c386112d2a4d1f9a7bb15097f53c44f58cdb5ed5741e5f023836a4bb8",
+      "process": {
+        "VmHWM": "248444 kB",
+        "VmRSS": "139180 kB",
+        "Threads": "33"
+      }
+    },
+    {
+      "name": "browser-session-after-restart",
+      "verifiedEvents": 50
+    }
+  ],
+  "ingest": {
+    "sent": 1000,
+    "accepted": 1000,
+    "rejected": 0,
+    "ambiguousBatches": 0,
+    "durationMs": 4819.5484949999955,
+    "pacedEvents": 950
+  },
+  "cleanup": {
+    "processes": true,
+    "container": true,
+    "secrets": true
+  },
+  "runnerHash": "ccab7ce04b250d7d3c3c2574ba5ef8296c7a58e16eda33fb92a70467663e9539",
+  "postgresImage": "sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280",
+  "processes": [
+    {
+      "name": "trawld",
+      "pid": 2004085
+    },
+    {
+      "name": "trawl-web",
+      "pid": 2004149
+    },
+    {
+      "name": "trawld-restart",
+      "pid": 2006453
+    },
+    {
+      "name": "trawl-web-restart",
+      "pid": 2006498
+    }
+  ],
+  "corpusHash": "fac4dc74db17ec1ad6b79429e7f7cb9a81fc137991399f0db005e4522484c14f",
+  "queryLatencyMs": {
+    "values": [
+      2855.000199000002,
+      17.735348000001977,
+      17.903685999990557,
+      19.640841000000364,
+      20.755090999999084,
+      22.547074000001885,
+      23.048448999994434,
+      25.31149799999548,
+      26.91353399999207,
+      28.079524000000674,
+      28.242522000000463,
+      29.213143000000855,
+      32.30739500001073,
+      31.72435000000405,
+      34.389245999991545,
+      34.16177800000878,
+      36.62010499999451,
+      39.02174299999024,
+      41.89482699999644,
+      43.360153000001446,
+      24.430647000001045,
+      6.878658000001451,
+      2800.255852999995
+    ],
+    "samples": 23,
+    "p50": 28.242522000000463,
+    "p95": 2800.255852999995,
+    "max": 2855.000199000002
+  },
+  "endedAt": "2026-09-14T01:57:20.836Z",
+  "interrupted": false
+}
