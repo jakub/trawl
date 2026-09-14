@@ -321,7 +321,7 @@ mod tests {
 
     /// A run list carrying all three window shapes at once: a tiled run that
     /// covered everything it owed, a run clamped past a catch-up gap, and a
-    /// legacy/query-mode run that has no window at all. `Some(false)` shows
+    /// Query text run that has no window at all. `Some(false)` shows
     /// its bounds bare; `None` shows nothing.
     #[test]
     fn render_saved_runs_with_windows() {
@@ -337,11 +337,11 @@ mod tests {
         truncated.window_truncated = Some(true);
         truncated.window_kind = Some("fixed".to_owned());
 
-        let legacy = make_run(39, 165);
+        let query_text = make_run(39, 165);
 
         let mut app = saved_app(
             Some(make_schedule(None, None)),
-            vec![normal, truncated, legacy],
+            vec![normal, truncated, query_text],
         );
         // Wide enough that the whole run line lands: the window trails the
         // row, so a narrower pane cuts the bounds and then the marker.

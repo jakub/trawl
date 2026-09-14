@@ -503,10 +503,6 @@ pub struct StatsResponse {
     /// Held permits whose request already answered (ADR-0024): a subset
     /// of the permits `pool_capacity - pool_available` counts, not an
     /// addition to them.
-    ///
-    /// `default` because a server predating retained accounting sends no
-    /// such field.
-    #[serde(default)]
     pub pool_retained: usize,
 }
 
@@ -610,10 +606,6 @@ pub struct DashboardSnapshot {
     pub pool_active: usize,
     /// The subset of `pool_active` held by work no request is waiting on
     /// any more (ADR-0024).
-    ///
-    /// `default` because a server predating retained accounting sends no
-    /// such field.
-    #[serde(default)]
     pub pool_retained: usize,
 
     // -- hot buffer --
@@ -1131,9 +1123,8 @@ pub struct RepinJobResponse {
     pub max_ambiguous_rows: Option<u64>,
     /// The loss ceiling the job is held to: the stated value when there was
     /// one, else the scan-derived default. Resolved once, at plan time, so
-    /// it is absent on a claimed job that has not scanned yet, on an
-    /// unforced one (which accepts no loss at all), and on a job row written
-    /// before ceilings existed.
+    /// it is absent before a plan is recorded and on unforced jobs. A
+    /// planned forced job always records both accepted ceilings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accepted_max_nulled_rows: Option<u64>,
     /// The ambiguity ceiling the job is held to, resolved the same way.
@@ -1477,8 +1468,8 @@ pub struct ReportRunSummary {
     pub result_path: Option<String>,
     /// Inclusive lower bound of the window this run covered (RFC 3339, UTC,
     /// microseconds). All four `window_*` fields are absent together for a
-    /// run that had no window: a query-mode run, or one from before the
-    /// schedule grew one. They are never backfilled (ADR-0018 ruling 11).
+    /// run claimed in Query text mode. Changing the schedule mode later
+    /// does not add a window to an existing run (ADR-0018 ruling 11).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window_start: Option<String>,
     /// Exclusive upper bound of the covered window. Windows are half-open
@@ -1702,9 +1693,8 @@ mod tests {
     }
 
     /// An unacknowledged field carries no `ack` key at all, and an ack
-    /// without a note carries no `note` key: absent is the encoding, so an
-    /// install that never acknowledges anything reads byte-identically to
-    /// one from before the routes shipped.
+    /// without a note carries no `note` key. Absence is the current wire
+    /// representation for an unset acknowledgement or note.
     #[test]
     fn an_unacknowledged_field_carries_no_ack_key() {
         let resp = CatalogFieldResponse {
@@ -2152,13 +2142,17 @@ mod tests {
     }
 
     #[test]
-    fn ingest_response_backward_compat_deserialize() {
-        // A body carrying only {"accepted": N} still parses.
+    fn successful_ingest_omits_zero_rejections() {
+        // A successful batch omits its zero rejection count and empty errors.
         let json = r#"{"accepted": 5}"#;
         let resp: IngestResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.accepted, 5);
         assert_eq!(resp.rejected, 0);
         assert!(resp.errors.is_empty());
+        assert_eq!(
+            serde_json::to_value(&resp).unwrap(),
+            serde_json::from_str::<serde_json::Value>(json).unwrap()
+        );
     }
 
     #[test]
@@ -2324,14 +2318,14 @@ mod tests {
     /// empty on the way out never reaches the wire at all.
     #[test]
     fn service_schema_degraded_fields_defaults_and_omits() {
-        let legacy = serde_json::json!({
+        let healthy = serde_json::json!({
             "name": "nginx",
             "columns": [],
             "file_count": 0,
             "total_bytes": 0,
             "total_events": 0,
         });
-        let parsed: ServiceSchema = serde_json::from_value(legacy).unwrap();
+        let parsed: ServiceSchema = serde_json::from_value(healthy).unwrap();
         assert!(
             parsed.degraded_fields.is_empty(),
             "a body with no degraded_fields key is a healthy service, not an error"
@@ -2450,15 +2444,10 @@ mod tests {
         assert_eq!(rt.active_queries.len(), 1);
     }
 
-    /// A client built after ADR-0024 reads a server built before it.
-    ///
-    /// Retained accounting added one field to two long-lived response
-    /// shapes. Without a default the whole response fails to decode, and
-    /// a dashboard pointed at an older daemon shows nothing rather than
-    /// showing a zero. The pre-change shape is the current one minus that
-    /// field, so it is built by removing the key.
+    /// Retained work is reported explicitly. An omitted measurement must not
+    /// silently turn into a claim that no executor remains busy.
     #[test]
-    fn retained_counts_decode_as_zero_from_a_pre_adr_0024_server() {
+    fn retained_counts_are_required_and_roundtrip() {
         let without_retained = |value: &serde_json::Value| {
             let mut json = value.clone();
             let removed = json
@@ -2477,18 +2466,18 @@ mod tests {
             pool_capacity: 4,
             pool_retained: 2,
         };
-        let older = without_retained(&serde_json::to_value(&stats).unwrap());
-        let decoded: StatsResponse = serde_json::from_value(older).unwrap();
-        assert_eq!(decoded.pool_retained, 0);
-        assert_eq!(decoded.pool_capacity, 4, "the rest still decodes");
+        let encoded = serde_json::to_value(&stats).unwrap();
+        let decoded: StatsResponse = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(decoded.pool_retained, 2);
+        assert!(serde_json::from_value::<StatsResponse>(without_retained(&encoded)).is_err());
 
         let snapshot = DashboardSnapshot {
             pool_retained: 2,
             ..dashboard_fixture()
         };
-        let older = without_retained(&serde_json::to_value(&snapshot).unwrap());
-        let decoded: DashboardSnapshot = serde_json::from_value(older).unwrap();
-        assert_eq!(decoded.pool_retained, 0);
-        assert_eq!(decoded.pool_active, 1, "the rest still decodes");
+        let encoded = serde_json::to_value(&snapshot).unwrap();
+        let decoded: DashboardSnapshot = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(decoded.pool_retained, 2);
+        assert!(serde_json::from_value::<DashboardSnapshot>(without_retained(&encoded)).is_err());
     }
 }
