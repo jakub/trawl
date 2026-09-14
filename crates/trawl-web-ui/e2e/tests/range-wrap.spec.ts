@@ -14,6 +14,7 @@
 // whole value rather than an ellipsis, since "no overlap" is also what a
 // clipped trigger produces.
 
+import type { Locator } from '@playwright/test';
 import { test, expect, resetScenario } from '../fixtures';
 import { SEL } from '../selectors';
 
@@ -52,3 +53,44 @@ for (const width of [320, 390]) {
     await run.click({ trial: true });
   });
 }
+
+// The console used to clip its own popover: `.console { overflow: hidden }`
+// cut `.dr-pop` — which RangeDialog renders absolutely inside `.daterange`,
+// with no portal — off at the console's bottom edge, so the lower presets,
+// the Absolute inputs and Apply were unreachable at desktop widths. Below
+// 600px the popover is `position: fixed`, so only the wide layout proves it.
+test('the range dialog is fully visible inside the console at 1440px', async ({ page, request }) => {
+  await resetScenario(request, 'corpus');
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await page.goto('/search?q=service%3Dnginx&page=0');
+
+  await page.locator(SEL.dateRangeTrigger).click();
+  const pop = page.locator('.dr-pop');
+  await expect(pop).toBeVisible();
+
+  // What the browser would hit at the centre of a control is the only
+  // proof that nothing clips or covers it; a bounding box alone is not.
+  const hits = async (target: Locator, closest: string, name: string) => {
+    await expect(target).toBeVisible();
+    const box = await target.boundingBox();
+    expect(box, `${name} must have a layout box`).not.toBeNull();
+    const inViewport = await page.evaluate(
+      ({ x, y, w, h }) => y >= 0 && x >= 0 && y + h <= window.innerHeight && x + w <= window.innerWidth,
+      { x: box!.x, y: box!.y, w: box!.width, h: box!.height },
+    );
+    expect(inViewport, `${name} must be inside the viewport`).toBe(true);
+    const onTarget = await page.evaluate(
+      ({ x, y, sel }) => {
+        const hit = document.elementFromPoint(x, y);
+        return hit !== null && hit.closest(sel) !== null;
+      },
+      { x: box!.x + box!.width / 2, y: box!.y + box!.height / 2, sel: closest },
+    );
+    expect(onTarget, `the centre of ${name} must belong to it`).toBe(true);
+  };
+
+  await hits(page.locator(SEL.quickRangeOption).last(), SEL.quickRangeOption, 'the last preset');
+
+  await page.locator(SEL.absoluteTab).click();
+  await hits(page.locator(SEL.dateRangeApply), SEL.dateRangeApply, 'Apply');
+});
