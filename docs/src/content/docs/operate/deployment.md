@@ -246,6 +246,27 @@ nothing else. You supply what the package supplies:
   Start from the packaged units in
   [`crates/trawl-server/debian/`](https://github.com/jakub/trawl/tree/main/crates/trawl-server/debian).
 
+## Use a current storage root
+
+An ingesting daemon initializes a missing or empty data directory with
+`EPOCH` set to `3`. A nonempty owned directory must already carry that marker.
+If the marker names another format, restore a complete epoch-3 backup or
+configure new empty data and WAL directories. Do not change the marker to
+relabel existing files. Startup does not convert, rename, or import an older
+root or its scheduled report results.
+
+Current WAL batches live under environment directories. A batch directly
+under the configured WAL directory causes startup to refuse before storage
+recovery. Keep the files intact and select an empty WAL directory or restore
+WAL from a complete current backup.
+
+With ingestion disabled, the daemon can also read a generic unversioned
+Parquet archive without changing its storage markers. That archive must not
+contain Trawl ownership entries such as `wal`, `CATALOG`, `REPIN`, `scheduled`,
+or top-level date partitions. An explicit noncurrent `EPOCH` still refuses.
+For standalone exports or files from other tools, you can also
+[query local Parquet](/start/local-parquet/) without running a daemon.
+
 ## Verify the installation
 
 1. Check health. The route needs no token:

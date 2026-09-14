@@ -234,18 +234,7 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
         }
     });
 
-    // Repin recovery, filesystem half: an interrupted repin must be
-    // finished before the epoch gate forms an opinion of the data root,
-    // because a half-swapped corpus does not error, it silently promotes
-    // (ADR-0011). One stat on the marker-less fast path.
-    let recovered_repin = trawl_server::repin::recover::recover_filesystem(
-        &config.data.base_dir(),
-        config.ingest.enabled,
-    )?;
-
-    // ADR-0009 storage-epoch gate: runs before any component touches the
-    // data root. Refuses to start on the ambiguous branch.
-    let epoch_outcome = trawl_server::epoch::ensure_current_epoch(
+    let (epoch_outcome, recovered_repin) = prepare_data_root(
         &config.data.base_dir(),
         &config.wal_dir(),
         config.ingest.enabled,
@@ -554,6 +543,25 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
     shutdown_task(audit_handle, "audit").await;
 
     Ok(())
+}
+
+/// Validate the current format before recovery can mutate storage. Repin
+/// swaps environment directories only; EPOCH stays in the live root throughout.
+/// Finish recovery before state construction or any corpus reader starts.
+fn prepare_data_root(
+    data_root: &std::path::Path,
+    wal_dir: &std::path::Path,
+    ingest_enabled: bool,
+) -> Result<
+    (
+        trawl_server::epoch::Outcome,
+        Option<trawl_server::repin::recover::Recovered>,
+    ),
+    String,
+> {
+    let epoch = trawl_server::epoch::ensure_current_epoch(data_root, wal_dir, ingest_enabled)?;
+    let recovered = trawl_server::repin::recover::recover_filesystem(data_root, ingest_enabled)?;
+    Ok((epoch, recovered))
 }
 
 /// Signal a background task to shut down and await its completion.
@@ -934,6 +942,61 @@ fn resolve_path(path: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepare_data_root_refuses_epoch_or_wal_before_repin_cleanup() {
+        for invalid_epoch in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let data = tmp.path().join("data");
+            let shadow = tmp.path().join("data.repin-next");
+            std::fs::create_dir(&data).unwrap();
+            std::fs::create_dir(&shadow).unwrap();
+            std::fs::write(shadow.join("sentinel"), b"must survive").unwrap();
+            std::fs::write(data.join("EPOCH"), if invalid_epoch { "2" } else { "3" }).unwrap();
+            let wal = tmp.path().join("wal");
+            if !invalid_epoch {
+                std::fs::create_dir(&wal).unwrap();
+                std::fs::write(wal.join("flat.ndjson"), b"unsupported").unwrap();
+            }
+            // Recovery without the gate would sweep this markerless shadow.
+            assert!(prepare_data_root(&data, &wal, true).is_err());
+            assert_eq!(
+                std::fs::read(shadow.join("sentinel")).unwrap(),
+                b"must survive"
+            );
+        }
+    }
+
+    #[test]
+    fn prepare_data_root_recovers_current_repin_before_returning() {
+        use trawl_server::repin::marker::{RepinMarker, RepinPhase, write_marker};
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let shadow = tmp.path().join("data.repin-next");
+        std::fs::create_dir_all(data.join("prod")).unwrap();
+        std::fs::create_dir_all(shadow.join("prod")).unwrap();
+        std::fs::write(data.join("EPOCH"), "3").unwrap();
+        std::fs::write(data.join("prod/a.parquet"), b"old").unwrap();
+        std::fs::write(shadow.join("prod/a.parquet"), b"new").unwrap();
+        write_marker(
+            &data,
+            &RepinMarker {
+                job_id: 1,
+                field: "status".into(),
+                from_type: "BIGINT".into(),
+                to_type: "VARCHAR".into(),
+                phase: RepinPhase::Cutover,
+            },
+        )
+        .unwrap();
+        assert!(prepare_data_root(&data, &data.join("wal"), false).is_err());
+        assert_eq!(std::fs::read(data.join("prod/a.parquet")).unwrap(), b"old");
+        let (epoch, recovered) = prepare_data_root(&data, &data.join("wal"), true).unwrap();
+        assert_eq!(epoch, trawl_server::epoch::Outcome::Current);
+        assert!(recovered.is_some());
+        assert_eq!(std::fs::read(data.join("prod/a.parquet")).unwrap(), b"new");
+        assert_eq!(std::fs::read(data.join("EPOCH")).unwrap(), b"3");
+    }
 
     fn config_with(retention: &str, ingest: &str) -> Config {
         Config::from_toml(&format!(

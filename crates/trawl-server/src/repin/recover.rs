@@ -6,10 +6,10 @@
 //! decision table, split in two halves because the two resources come up
 //! at different times:
 //!
-//! - the filesystem half runs before `ensure_current_epoch`
-//!   (non-negotiable: a half-swapped root must be finished before the
-//!   epoch gate forms an opinion of it), needs no postgres, and is one
-//!   `stat` on the marker-less fast path;
+//! - the filesystem half runs after `ensure_current_epoch` validates the
+//!   format and before any corpus reader starts. Per-env swaps leave EPOCH
+//!   in place, so an incompatible root can be refused before recovery mutates
+//!   anything. This half needs no postgres;
 //! - the postgres half runs after `AppState::from_config`, finishes the
 //!   job row (idempotent flip or failure), re-arms the boot conformance
 //!   pass for any recovered cutover, sweeps the aside, and removes the
