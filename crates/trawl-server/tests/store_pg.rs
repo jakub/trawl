@@ -316,7 +316,17 @@ async fn saved_user_isolation_and_name_sort(pool: PgPool) {
 #[sqlx::test]
 async fn saved_name_validation(pool: PgPool) {
     let store = saved(&pool);
-    for bad in ["", "   ", "a\nb", "\tname", "name\0", "name\u{7f}"] {
+    for bad in [
+        "",
+        "   ",
+        "a\nb",
+        "\tname",
+        "name\0",
+        "name\u{7f}",
+        "\u{200b}",
+        "a\u{202e}b",
+        "👩\u{200d}💻",
+    ] {
         assert!(
             matches!(
                 store.create(1, bad, "q").await,

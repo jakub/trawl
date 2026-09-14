@@ -5,10 +5,11 @@
 //! Shared display-name contract for saved queries.
 
 /// Trim outer whitespace, preserving interior spacing, Unicode and punctuation.
-/// Controls are rejected before trimming so tabs and newlines cannot disappear.
+/// Unsafe display characters are rejected before trimming. This shares the
+/// field-name policy, including its refusal of invisible format characters and joiners.
 pub fn normalize(name: &str) -> Result<&str, &'static str> {
-    if name.chars().any(char::is_control) {
-        return Err("Name must not contain control characters.");
+    if name.chars().any(crate::sanitize::is_unsafe_display_char) {
+        return Err("Name must not contain control or invisible formatting characters.");
     }
     let name = name.trim();
     if name.is_empty() {
@@ -26,10 +27,25 @@ mod tests {
             "a  b",
             "雪 / \"quoted\" \\ path",
             "../report",
+            "e\u{301} café 日本語",
+            "🙂 👍🏽 🇯🇵 ✈\u{fe0f}",
         ] {
             assert_eq!(super::normalize(&format!("  {name}  ")), Ok(name));
         }
-        for name in ["", "  ", "a\nb", "\tname", "name\0", "name\u{7f}"] {
+        for name in [
+            "",
+            "  ",
+            "a\nb",
+            "\tname",
+            "name\0",
+            "name\u{7f}",
+            "\u{200b}",
+            "a\u{202e}b",
+            "a\u{200c}b",
+            "👩\u{200d}💻",
+            "a\u{feff}b",
+            "a\u{00ad}b",
+        ] {
             assert!(super::normalize(name).is_err(), "{name:?}");
         }
     }

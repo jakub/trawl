@@ -1168,8 +1168,14 @@ Stores a named query. The DSL is admitted before it is stored.
 
 | Name | In | Type | Required | Description |
 |------|----|------|----------|-------------|
-| `name` | body | string | yes | Display name; outer whitespace is trimmed, blank names and control characters are rejected. Interior spacing, Unicode, and punctuation are preserved. Unique for the key, case-sensitive |
+| `name` | body | string | yes | Display name; outer whitespace is trimmed, blank names, control characters, and unsafe invisible formatting characters are rejected. Interior spacing, ordinary Unicode, and punctuation are preserved. Unique for the key, case-sensitive |
 | `query` | body | string | yes | The DSL query |
+
+Names follow the field-name display-safety rules. Bidi controls, zero-width
+characters and joiners, BOM, and soft hyphen are rejected. This also excludes
+ZWJ emoji sequences and text that requires ZWJ or ZWNJ shaping. Combining
+accents, standalone emoji, skin-tone modifiers, flags, and variation selectors
+are allowed.
 
 **Request**
 
@@ -1191,7 +1197,7 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -H "Content-Type: applicatio
 |--------|------|------|
 | 400 | `parse_error` | The DSL does not parse |
 | 400 | `validation_error` | Semantic check failed |
-| 400 | `bad_request` | `name` is blank or contains control characters |
+| 400 | `bad_request` | `name` is blank or contains control or unsafe invisible formatting characters |
 | 409 | `bad_request` | The key already has a saved query with that name |
 
 ### Update a saved query

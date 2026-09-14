@@ -16,15 +16,28 @@ test('readable net names preserve punctuation and show bounded refusals', async 
   expect(await capturedSavedRequests(request)).toHaveLength(0);
   await input.fill('name\tbad');
   await expect(save).toBeDisabled();
-  await expect(dialog.locator('#netNameError')).toHaveText('Name must not contain control characters.');
+  await expect(dialog.locator('#netNameError')).toHaveText('Name must not contain control or invisible formatting characters.');
+  for (const unsafe of ['\u200b', 'name\u202e', '👩\u200d💻']) {
+    await input.fill(unsafe);
+    await expect(save).toBeDisabled();
+    await expect(input).toHaveAttribute('aria-invalid', 'true');
+    await expect(dialog.locator('#netNameError')).toHaveText('Name must not contain control or invisible formatting characters.');
+  }
   const name = '雪  / "Audit" \\ reports';
   await input.fill(`  ${name}  `);
   await expect(save).toBeEnabled();
+  let refusals = 0;
   await page.route('**/api/v1/saved', async route => {
     if (route.request().method() !== 'POST') return route.continue();
     expect(route.request().postDataJSON().name).toBe(name);
-    await route.fulfill({ status: 409, json: { error: { code: 'bad_request', message: 'a saved query with this name already exists' } } });
+    refusals++;
+    await route.fulfill({ status: refusals === 1 ? 400 : 409, json: { error: { code: 'bad_request', message: refusals === 1
+      ? 'name must not be blank or contain control or invisible formatting characters'
+      : 'a saved query with this name already exists' } } });
   });
+  await save.click();
+  await expect(page.getByText('Name must not be blank or contain control or invisible formatting characters.', { exact: true })).toBeVisible();
+  await expect(input).toHaveValue(`  ${name}  `);
   await save.click();
   await expect(page.getByText('A net with this name already exists. Choose another name.', { exact: true })).toBeVisible();
   await expect(input).toHaveValue(`  ${name}  `);

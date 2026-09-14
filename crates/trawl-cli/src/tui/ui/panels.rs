@@ -644,6 +644,32 @@ fn render_saved_panel(app: &App, theme: &Theme, frame: &mut Frame<'_>, area: Rec
     render_saved_detail(app, theme, frame, detail_col);
 }
 
+/// Fit a name into terminal columns without splitting a grapheme. Ratatui's
+/// grapheme iterator uses the same segmentation as the list renderer.
+fn fit_saved_name(name: &str, columns: usize) -> String {
+    use unicode_width::UnicodeWidthStr as _;
+
+    if columns == 0 {
+        return String::new();
+    }
+    if name.width() <= columns {
+        return name.to_owned();
+    }
+    let span = Span::raw(name);
+    let mut remaining = columns - "…".width();
+    let mut fitted = String::new();
+    for grapheme in span.styled_graphemes(Style::default()) {
+        let width = grapheme.symbol.width();
+        if width > remaining {
+            break;
+        }
+        fitted.push_str(grapheme.symbol);
+        remaining -= width;
+    }
+    fitted.push('…');
+    fitted
+}
+
 /// Render the left-pane saved query list.
 fn render_saved_list(app: &App, theme: &Theme, frame: &mut Frame<'_>, area: Rect) {
     let selected = app.panel.saved_selected;
@@ -679,11 +705,7 @@ fn render_saved_list(app: &App, theme: &Theme, frame: &mut Frame<'_>, area: Rect
             // Compute suffix width for name budget.
             let suffix_width: usize = suffixes.iter().map(Span::width).sum();
             let name_budget = max_width.saturating_sub(suffix_width);
-            let display_name = if entry.name.len() > name_budget {
-                format!("{}…", &entry.name[..name_budget.saturating_sub(1)])
-            } else {
-                entry.name.clone()
-            };
+            let display_name = fit_saved_name(&entry.name, name_budget);
 
             let mut spans = vec![Span::styled(
                 display_name,
@@ -1294,5 +1316,71 @@ mod tests {
         let past = now - chrono::Duration::minutes(5);
         let result = format_relative_time(&past.to_rfc3339());
         assert_eq!(result, "  5m");
+    }
+}
+
+#[cfg(test)]
+mod saved_name_tests {
+    use super::*;
+    use ratatui::{Terminal, backend::TestBackend};
+    use unicode_width::UnicodeWidthStr as _;
+
+    #[test]
+    fn saved_name_column_boundaries_preserve_graphemes() {
+        for (name, columns, expected) in [
+            ("日本語", 0, ""),
+            ("日本語", 1, "…"),
+            ("日本語", 2, "…"),
+            ("日本語", 3, "日…"),
+            ("日本語", 4, "日…"),
+            ("日本語", 6, "日本語"),
+            ("éabc", 2, "é…"),
+            ("e\u{301}abc", 2, "e\u{301}…"),
+            ("🙂🙂", 3, "🙂…"),
+            ("👍🏽ab", 3, "👍🏽…"),
+            ("🇯🇵ab", 3, "🇯🇵…"),
+            // A legacy name can contain a joiner even though new writes refuse it.
+            ("👩\u{200d}💻ab", 3, "👩\u{200d}💻…"),
+        ] {
+            let actual = fit_saved_name(name, columns);
+            assert_eq!(actual, expected, "{name:?}, columns={columns}");
+            assert!(actual.width() <= columns);
+        }
+    }
+
+    #[test]
+    fn saved_list_renders_long_unicode_names_in_narrow_columns() {
+        for (name, width, expected) in [
+            ("日本語".repeat(20), 4, "日… "),
+            ("é".repeat(20), 4, "ééé…"),
+            ("e\u{301}".repeat(20), 4, "e\u{301}e\u{301}e\u{301}…"),
+            ("🙂".repeat(20), 4, "🙂… "),
+            ("👩\u{200d}💻".repeat(20), 4, "👩\u{200d}💻… "),
+        ] {
+            let mut app = crate::tui::tests::test_app();
+            app.saved_cache = Some(trawl_api::ListSavedResponse {
+                queries: vec![trawl_api::SavedQueryResponse {
+                    id: 1,
+                    name,
+                    query: "*".to_owned(),
+                    created_at: "2026-01-01T00:00:00Z".to_owned(),
+                    updated_at: "2026-01-01T00:00:00Z".to_owned(),
+                    schedule: None,
+                }],
+            });
+            let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+            terminal
+                .draw(|frame| render_saved_list(&app, &app.theme, frame, frame.area()))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let mut actual = String::new();
+            let mut x = 0;
+            while x < width {
+                let symbol = buffer[(x, 0)].symbol();
+                actual.push_str(symbol);
+                x += u16::try_from(symbol.width().max(1)).unwrap();
+            }
+            assert_eq!(actual, expected);
+        }
     }
 }

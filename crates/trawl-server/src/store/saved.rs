@@ -169,7 +169,7 @@ impl SavedQueryStore {
 
     /// Create a new saved query.
     ///
-    /// Returns `InvalidName` for blank names or control characters and
+    /// Returns `InvalidName` for blank names or unsafe display characters and
     /// `DuplicateName` on the named unique constraint.
     pub async fn create(
         &self,

@@ -99,7 +99,7 @@ pub enum StoreError {
     },
 
     /// Saved query name contains invalid characters.
-    #[error("name must not be blank or contain control characters")]
+    #[error("name must not be blank or contain control or invisible formatting characters")]
     InvalidName {
         /// The rejected name.
         name: String,

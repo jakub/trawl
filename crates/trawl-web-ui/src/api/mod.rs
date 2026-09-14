@@ -733,9 +733,10 @@ async fn saved_write_error(resp: gloo_net::http::Response, status: u16) -> ApiEr
         && let Ok(body) = resp.json::<ErrorResponse>().await
     {
         let message = match (status, body.error.message.as_str()) {
-            (400, "name must not be blank or contain control characters") => {
-                "Name must not be blank or contain control characters."
-            }
+            (
+                400,
+                "name must not be blank or contain control or invisible formatting characters",
+            ) => "Name must not be blank or contain control or invisible formatting characters.",
             (409, "a saved query with this name already exists") => {
                 "A net with this name already exists. Choose another name."
             }
