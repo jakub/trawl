@@ -341,7 +341,9 @@ cleanup() {
     local id
     for id in ${CREATED_CONTAINERS[@]+"${CREATED_CONTAINERS[@]}"}; do
       if [[ "$(docker inspect -f '{{index .Config.Labels "trawl-crashdump-harness-run"}}' "$id" 2>/dev/null)" == "${RUN_LABEL#*=}" ]]; then
-        runq docker rm -f "$id" 2>/dev/null || true
+        # Postgres declares an anonymous data volume. Remove it with its owned
+        # disposable container; named registry caches are unaffected by -v.
+        runq docker rm -fv "$id" 2>/dev/null || true
       else
         note "not removing container $id: it is gone, or it is no longer the one this run created"
       fi
