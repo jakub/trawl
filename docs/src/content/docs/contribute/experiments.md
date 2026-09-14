@@ -47,6 +47,15 @@ Ctrl+C or SIGTERM during the hold requests cleanup, exits `1`, and records
 deadline if you want an exit-`0`, `passed` run. The run's credentials are
 temporary, so keep them out of screenshots and published evidence.
 
+## Capture visual evidence
+
+Use the supervised hold to inspect the changed pages and capture screenshots
+in both themes. Record the source revision, viewport, seeded workload, and UI
+state with each capture. For a before-and-after comparison, run the experiment
+in each revision's isolated worktree with the same seed and capture settings.
+Review expected visual changes explicitly. The default scenario checks browser
+behavior but does not compare screenshot pixels.
+
 ## Extend the scenario
 
 The default scenario does not cover Vector, native syslog, retention, report
