@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""Check install instructions against real client-only Helm renders.
+"""Check install instructions against real offline Helm template renders.
 
-No Kubernetes connection, install, or Secret creation takes place. JSON output
+No Kubernetes connection, install, or Secret creation takes place. Render output
 stays in memory because it contains the chart's generated cookie Secret.
 """
 
 import json
 from pathlib import Path
 import re
+import shutil
 import subprocess
+import tempfile
 import unittest
 
 
@@ -22,15 +24,25 @@ def render(**settings):
         "web.enabled": "false",
     }
     values.update(settings)
-    command = [
-        "helm", "install", "launch", str(CHART), "--dry-run=client",
-        "--output=json", "--namespace=example",
-    ]
-    for key, value in values.items():
-        command.extend(["--set", f"{key}={value}"])
-    result = subprocess.run(command, capture_output=True, text=True, check=True)
-    release = json.loads(result.stdout)
-    return release["info"]["notes"], release["manifest"]
+    # Helm 3 install --dry-run=client still checks cluster reachability. Use
+    # helm template and expose the exact NOTES source through a temporary
+    # ConfigMap, because helm template otherwise omits NOTES from its output.
+    with tempfile.TemporaryDirectory(prefix="trawl-helm-notes-") as directory:
+        chart = Path(directory) / "trawl"
+        shutil.copytree(CHART, chart)
+        shutil.copyfile(chart / "templates/NOTES.txt", chart / "fixture-notes.txt")
+        (chart / "templates/fixture-notes.yaml").write_text(
+            'apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: notes-fixture\n'
+            'data:\n  notes: {{ tpl (.Files.Get "fixture-notes.txt") . | toJson }}\n'
+        )
+        command = ["helm", "template", "launch", str(chart), "--namespace=example"]
+        for key, value in values.items():
+            command.extend(["--set", f"{key}={value}"])
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode:
+            raise RuntimeError(result.stderr)
+        encoded = re.search(r'\n  notes: (".*")\n', result.stdout)[1]
+        return json.loads(encoded), result.stdout
 
 
 class InstallNotes(unittest.TestCase):
