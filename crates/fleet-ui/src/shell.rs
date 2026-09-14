@@ -48,6 +48,7 @@ use crate::command_palette::{
 use crate::overlay::{FocusPolicy, OverlayLayer, has_layers, use_overlay_layer_with};
 
 use crate::sidebar::{Sidebar, SidebarGroup};
+use crate::theme::{Sidebar as SidebarPref, UiPrefs};
 use crate::toast::{ToastBus, Toasts};
 use crate::topbar::{TopBar, UserInfo};
 
@@ -162,6 +163,15 @@ pub fn Shell(
             .unwrap_or_else(|| brand_title.clone())
     });
 
+    // Collapse is a persisted preference, so the control exists only
+    // where `fleet_ui::install()` was called: without prefs there is
+    // nowhere to write the state and the sidebar stays expanded.
+    let prefs = use_context::<UiPrefs>();
+    let collapsed =
+        prefs.map(|p| Signal::derive(move || p.sidebar().get() == SidebarPref::Collapsed));
+    let on_toggle_collapse = prefs
+        .map(|p| Callback::new(move |()| p.sidebar().update(|state| *state = state.toggled())));
+
     let overlay_bottom = sidebar_bottom.clone();
     let brand_overlay = brand.clone();
     let accent_overlay = brand_accent.clone();
@@ -191,6 +201,8 @@ pub fn Shell(
                         brand_accent=brand_accent.clone()
                         groups=sidebar_groups
                         active=sidebar_active
+                        collapsed=collapsed
+                        on_toggle_collapse=on_toggle_collapse
                         bottom=sidebar_bottom.clone()
                     />
                 </Show>

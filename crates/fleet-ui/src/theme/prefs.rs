@@ -21,7 +21,7 @@ pub struct ParseThemeError(pub String);
 
 impl fmt::Display for ParseThemeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "unknown theme/rowstyle value: `{}`", self.0)
+        write!(f, "unknown ui pref value: `{}`", self.0)
     }
 }
 
@@ -95,6 +95,43 @@ impl FromStr for RowStyle {
     }
 }
 
+/// Sidebar presentation — expanded is the default; collapsed is
+/// icon-only, with every label kept as screen-reader text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sidebar {
+    Expanded,
+    Collapsed,
+}
+
+impl Sidebar {
+    #[must_use]
+    pub fn as_attr(self) -> &'static str {
+        match self {
+            Self::Expanded => "expanded",
+            Self::Collapsed => "collapsed",
+        }
+    }
+
+    #[must_use]
+    pub fn toggled(self) -> Self {
+        match self {
+            Self::Expanded => Self::Collapsed,
+            Self::Collapsed => Self::Expanded,
+        }
+    }
+}
+
+impl FromStr for Sidebar {
+    type Err = ParseThemeError;
+    fn from_str(s: &str) -> Result<Self, ParseThemeError> {
+        match s {
+            "collapsed" => Ok(Self::Collapsed),
+            "expanded" => Ok(Self::Expanded),
+            _ => Err(ParseThemeError(s.to_owned())),
+        }
+    }
+}
+
 /// Persisted preference snapshot — the JSON shape on disk in
 /// `localStorage`. `pub(crate)` so the wasm `runtime` layer can build,
 /// read, and write it without leaking the on-disk shape to consumers.
@@ -107,6 +144,7 @@ impl FromStr for RowStyle {
 pub(crate) struct Stored {
     pub(crate) theme: Theme,
     pub(crate) rowstyle: RowStyle,
+    pub(crate) sidebar: Sidebar,
 }
 
 impl Default for Stored {
@@ -114,6 +152,7 @@ impl Default for Stored {
         Self {
             theme: Theme::Light,
             rowstyle: RowStyle::Bordered,
+            sidebar: Sidebar::Expanded,
         }
     }
 }
@@ -153,6 +192,7 @@ pub(crate) fn parse_stored(raw: &str) -> ParseOutcome {
     let mut out = Stored::default();
     parse_field(&value, "theme", &mut warnings, |t| out.theme = t);
     parse_field(&value, "rowstyle", &mut warnings, |r| out.rowstyle = r);
+    parse_field(&value, "sidebar", &mut warnings, |s| out.sidebar = s);
     ParseOutcome {
         stored: out,
         warnings,
@@ -195,6 +235,14 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_round_trips() {
+        for v in [Sidebar::Expanded, Sidebar::Collapsed] {
+            assert_eq!(Sidebar::from_str(v.as_attr()), Ok(v));
+            assert_eq!(v.toggled().toggled(), v);
+        }
+    }
+
+    #[test]
     fn parse_error_carries_offending_input() {
         let err = Theme::from_str("midnight").unwrap_err();
         assert_eq!(err.0, "midnight");
@@ -223,15 +271,20 @@ mod tests {
 
     #[test]
     fn parse_stored_unknown_variant_warns_and_keeps_default() {
-        let out = parse_stored(r#"{"theme":"midnight"}"#);
-        assert_eq!(
-            out.stored,
-            Stored::default(),
-            "unknown theme value must not mutate the snapshot"
-        );
-        assert_eq!(out.warnings.len(), 1);
-        assert!(out.warnings[0].contains("midnight"));
-        assert!(out.warnings[0].contains("theme"));
+        for (raw, field, value) in [
+            (r#"{"theme":"midnight"}"#, "theme", "midnight"),
+            (r#"{"sidebar":"hidden"}"#, "sidebar", "hidden"),
+        ] {
+            let out = parse_stored(raw);
+            assert_eq!(
+                out.stored,
+                Stored::default(),
+                "unknown {field} value must not mutate the snapshot"
+            );
+            assert_eq!(out.warnings.len(), 1, "{raw}");
+            assert!(out.warnings[0].contains(value), "{raw}");
+            assert!(out.warnings[0].contains(field), "{raw}");
+        }
     }
 
     #[test]
@@ -256,13 +309,14 @@ mod tests {
 
     #[test]
     fn parse_stored_full_payload_round_trips() {
-        let raw = r#"{"theme":"dark","rowstyle":"plain"}"#;
+        let raw = r#"{"theme":"dark","rowstyle":"plain","sidebar":"collapsed"}"#;
         let out = parse_stored(raw);
         assert_eq!(
             out.stored,
             Stored {
                 theme: Theme::Dark,
                 rowstyle: RowStyle::Plain,
+                sidebar: Sidebar::Collapsed,
             }
         );
         assert!(out.warnings.is_empty());

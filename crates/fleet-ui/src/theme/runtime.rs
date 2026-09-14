@@ -8,7 +8,9 @@
 //! The CSS in `styles/fleet-ui.css` reads `[data-theme]` and
 //! `[data-rowstyle]` selectors. Writing them on
 //! `<html>` (not `<body>`) matches the design spec and keeps the
-//! cascade authoritative for `:root` token overrides.
+//! cascade authoritative for `:root` token overrides. Prefs that no
+//! global selector reads get no attribute: the sidebar collapse state
+//! is a class on `nav.rail`, so it is persisted here and applied there.
 //!
 //! [`install`] takes a `storage_key` so each consuming app uses its own
 //! localStorage namespace — `"trawl.ui"` for trawl-web, `"coastwatch.ui"`
@@ -17,14 +19,14 @@
 use leptos::prelude::*;
 use wasm_bindgen::JsValue;
 
-use super::prefs::{ParseOutcome, RowStyle, Stored, Theme, parse_stored};
+use super::prefs::{ParseOutcome, RowStyle, Sidebar, Stored, Theme, parse_stored};
 
 /// Reactive UI preference signals + an effect that mirrors them onto
 /// `<html data-*>` and persists them to `localStorage`.
 ///
 /// Construction is sealed: [`install`] is the only way to get a
-/// `UiPrefs`. The signals are exposed via [`UiPrefs::theme`]
-/// and [`UiPrefs::rowstyle`] — each returns the
+/// `UiPrefs`. The signals are exposed via [`UiPrefs::theme`],
+/// [`UiPrefs::rowstyle`] and [`UiPrefs::sidebar`] — each returns the
 /// underlying [`RwSignal`] so consumers can read with `.get()`, write
 /// with `.set()`, and feed into derived signals or effects.
 ///
@@ -34,6 +36,7 @@ use super::prefs::{ParseOutcome, RowStyle, Stored, Theme, parse_stored};
 pub struct UiPrefs {
     pub(crate) theme: RwSignal<Theme>,
     pub(crate) rowstyle: RwSignal<RowStyle>,
+    pub(crate) sidebar: RwSignal<Sidebar>,
 }
 
 impl UiPrefs {
@@ -45,6 +48,11 @@ impl UiPrefs {
     #[must_use]
     pub fn rowstyle(self) -> RwSignal<RowStyle> {
         self.rowstyle
+    }
+
+    #[must_use]
+    pub fn sidebar(self) -> RwSignal<Sidebar> {
+        self.sidebar
     }
 }
 
@@ -62,6 +70,7 @@ pub fn install(storage_key: &'static str) -> UiPrefs {
     let prefs = UiPrefs {
         theme: RwSignal::new(stored.theme),
         rowstyle: RwSignal::new(stored.rowstyle),
+        sidebar: RwSignal::new(stored.sidebar),
     };
 
     // Track the last value we persisted so we never overwrite storage with
@@ -75,6 +84,7 @@ pub fn install(storage_key: &'static str) -> UiPrefs {
         let snap = Stored {
             theme: prefs.theme.get(),
             rowstyle: prefs.rowstyle.get(),
+            sidebar: prefs.sidebar.get(),
         };
         apply_to_dom(snap);
         if last_written.with_value(|w| *w != snap) {
@@ -107,6 +117,7 @@ fn write_stored(storage_key: &str, s: Stored) {
     let payload = serde_json::json!({
         "theme":    s.theme.as_attr(),
         "rowstyle": s.rowstyle.as_attr(),
+        "sidebar":  s.sidebar.as_attr(),
     });
     if let Err(err) = storage.set_item(storage_key, &payload.to_string()) {
         // QuotaExceededError (Safari private browsing, full storage) is the

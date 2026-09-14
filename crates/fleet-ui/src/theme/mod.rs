@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Theme / row-style preferences synced to `localStorage`
+//! Theme, row-style and sidebar preferences synced to `localStorage`
 //! and projected onto `<html data-*>` attributes.
 //!
 //! Split into two layers:
@@ -17,7 +17,7 @@ pub mod prefs;
 #[cfg(target_arch = "wasm32")]
 pub mod runtime;
 
-pub use prefs::{ParseThemeError, RowStyle, Theme};
+pub use prefs::{ParseThemeError, RowStyle, Sidebar, Theme};
 
 #[cfg(target_arch = "wasm32")]
 pub use runtime::{UiPrefs, install};
