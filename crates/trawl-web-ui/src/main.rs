@@ -21,6 +21,7 @@ mod query_merge;
 mod repin_flow;
 mod repin_hint;
 mod result_actions;
+mod results_layout;
 mod schedule_edit;
 mod schema_nav;
 mod search_status;

@@ -25,6 +25,15 @@
 //! - `draft_dirty` — the console header's own comparison of the two.
 //!   It reads both and writes neither, so saying "unsent changes"
 //!   cannot itself become a navigation (ADR-0027).
+//! - `selected` / `result_gen` — the docked inspector's selection, a
+//!   `(response generation, ORIGINAL row index)` pair. Sorting re-orders
+//!   the rows on screen but never the pair, so a re-sort keeps the same
+//!   event open; a new response, a page turn or a new effective query
+//!   bumps the generation, which closes the panel.
+//!
+//! Both reading modes (`View`) default off and apply to SNAPSHOT raw
+//! results only: a live ring evicts rows every frame, so a selection in
+//! it would be cleared continuously (ADR-0032).
 
 use leptos::prelude::*;
 use leptos::web_sys;
@@ -50,7 +59,13 @@ use crate::state::query::{
     report_refusal, url_signals,
 };
 use crate::state::search_session::rows_resource;
-use fleet_ui::{Badge, LoadState, TabItem, Tabs, ToastBus, ToastKind, Tone};
+use fleet_ui::overlay::use_overlay_layer;
+use fleet_ui::{
+    Badge, Details, LoadState, Rows, Segmented, SegmentedOption, Size, TabItem, Tabs, ToastBus,
+    ToastKind, Tone, UiPrefs,
+};
+use leptos::ev;
+use leptos_use::{use_event_listener, use_window};
 
 use crate::state::stream_session::{
     LiveSignals, RingBuffer, StreamLifecycle, ring_to_result, start_stream,
@@ -696,6 +711,52 @@ pub fn Search() -> impl IntoView {
     // (ADR-0027, amended 2026-09-12).
     let window = Signal::derive(move || effective_window(&executed_q.get(), &range.get()));
 
+    // --- reading modes ------------------------------------------------
+    // Both default off (ADR-0032): with the defaults in force the
+    // results DOM is exactly what it was before this slice.
+    let prefs = use_context::<UiPrefs>();
+    let details = Signal::derive(move || prefs.map_or(Details::Inline, |p| p.details().get()));
+    let rows_mode = Signal::derive(move || prefs.map_or(Rows::Compact, |p| p.rows().get()));
+    let set_details = Callback::new(move |id: String| {
+        if let Some(p) = prefs {
+            p.details().set(if id == "inspector" {
+                Details::Inspector
+            } else {
+                Details::Inline
+            });
+        }
+    });
+    let set_rows = Callback::new(move |id: String| {
+        if let Some(p) = prefs {
+            p.rows().set(if id == "message-first" {
+                Rows::MessageFirst
+            } else {
+                Rows::Compact
+            });
+        }
+    });
+
+    let view_open = RwSignal::new(false);
+    let view_wrap = NodeRef::<leptos::html::Div>::new();
+    let view_btn = NodeRef::<leptos::html::Button>::new();
+    let close_view = Callback::new(move |()| view_open.set(false));
+
+    // The inspector's selection. Owned here rather than in the table,
+    // because only this component sees the three things that invalidate
+    // it: a fresh response, a page turn and a new effective query.
+    let selected = RwSignal::new(None::<(u64, usize)>);
+    let result_gen = RwSignal::new(0_u64);
+    Effect::new(move |_| {
+        let _ = rows.get();
+        result_gen.update(|g| *g = g.wrapping_add(1));
+    });
+    Effect::new(move |_| {
+        snapshot_q.track();
+        page.track();
+        selected.set(None);
+    });
+    let generation = Signal::derive(move || result_gen.get());
+
     view! {
         <div class="search-layout">
             // Ahead of the rail, whose value controls stay in the tab
@@ -777,6 +838,33 @@ pub fn Search() -> impl IntoView {
                                 on:click=move |_| on_stop_live.run(())
                             >"Stop live"</button>
                         </Show>
+                        // The reading-mode disclosure. A button plus a
+                        // popover rather than two segmented strips in the
+                        // header: the header is a 36-40px row and the
+                        // modes are read rarely, so they are one press
+                        // away instead of permanently spending its width.
+                        <div class="view-wrap" node_ref=view_wrap>
+                            <button
+                                type="button"
+                                class="action view"
+                                aria-expanded=move || view_open.get().to_string()
+                                aria-controls="search-view"
+                                node_ref=view_btn
+                                on:click=move |_| view_open.update(|open| *open = !*open)
+                            >"View"</button>
+                            <Show when=move || view_open.get()>
+                                <ViewPanel
+                                    details=details
+                                    rows_mode=rows_mode
+                                    aggregate=is_chart_query
+                                    on_details=set_details
+                                    on_rows=set_rows
+                                    on_close=close_view
+                                    wrap=view_wrap
+                                    trigger=view_btn
+                                />
+                            </Show>
+                        </div>
                         <button
                             type="button"
                             class="action save"
@@ -822,6 +910,9 @@ pub fn Search() -> impl IntoView {
                                 on_paginate=on_paginate
                                 on_add_filter=on_result_filter
                                 on_navigate=on_navigate_q
+                                details=details
+                                selected=selected
+                                generation=generation
                             />
                         </>
                     }.into_any(),
@@ -866,6 +957,94 @@ pub fn Search() -> impl IntoView {
                 on_close=Callback::new(move |_| show_export_modal.set(false))
             />
         </Show>
+    }
+}
+
+/// The reading-mode popover behind the result header's "View" button.
+///
+/// A `FocusPolicy::None` overlay layer (`fleet_ui::overlay`), so it
+/// arbitrates Escape against whatever else is open without taking focus
+/// or silencing the command palette's chord. It closes on Escape while
+/// topmost — returning focus to the trigger — and on any mousedown
+/// outside its wrapper.
+#[component]
+fn ViewPanel(
+    #[prop(into)] details: Signal<Details>,
+    #[prop(into)] rows_mode: Signal<Rows>,
+    /// Aggregation-shaped results always render the plain table, so the
+    /// Rows group states that instead of offering a choice it would not
+    /// honour (ADR-0025: nothing advertises a capability that does not
+    /// exist).
+    #[prop(into)]
+    aggregate: Signal<bool>,
+    on_details: Callback<String>,
+    on_rows: Callback<String>,
+    on_close: Callback<()>,
+    wrap: NodeRef<leptos::html::Div>,
+    trigger: NodeRef<leptos::html::Button>,
+) -> impl IntoView {
+    let layer = use_overlay_layer();
+
+    let _ = use_event_listener(use_window(), ev::keydown, move |e| {
+        if e.key() != "Escape" || !layer.is_topmost() {
+            return;
+        }
+        e.prevent_default();
+        on_close.run(());
+        if let Some(btn) = trigger.get_untracked() {
+            let _ = btn.focus();
+        }
+    });
+    // Identity through `contains`, the same rule the modal and drawer
+    // scrims use: a press on the trigger is inside the wrapper, so the
+    // button's own click still toggles instead of re-opening.
+    let _ = use_event_listener(use_window(), ev::mousedown, move |e| {
+        let Some(host) = wrap.get_untracked() else {
+            return;
+        };
+        let inside = e
+            .target()
+            .and_then(|t| t.dyn_into::<web_sys::Node>().ok())
+            .is_some_and(|node| host.contains(Some(&node)));
+        if !inside {
+            on_close.run(());
+        }
+    });
+
+    view! {
+        <div id="search-view" class="view-pop">
+            <div role="group" aria-labelledby="view-details-lb">
+                <span id="view-details-lb" class="view-lb">"Details"</span>
+                <Segmented
+                    size=Size::Xs
+                    options=vec![
+                        SegmentedOption::new("inline", "Inline"),
+                        SegmentedOption::new("inspector", "Inspector"),
+                    ]
+                    active=Signal::derive(move || details.get().as_attr().to_string())
+                    on_change=on_details
+                />
+            </div>
+            <div role="group" aria-labelledby="view-rows-lb">
+                <span id="view-rows-lb" class="view-lb">"Rows"</span>
+                <Show
+                    when=move || !aggregate.get()
+                    fallback=move || view! {
+                        <p class="view-note">"Aggregation results always use the plain table"</p>
+                    }
+                >
+                    <Segmented
+                        size=Size::Xs
+                        options=vec![
+                            SegmentedOption::new("compact", "Compact"),
+                            SegmentedOption::new("message-first", "Message first"),
+                        ]
+                        active=Signal::derive(move || rows_mode.get().as_attr().to_string())
+                        on_change=on_rows
+                    />
+                </Show>
+            </div>
+        </div>
     }
 }
 

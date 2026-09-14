@@ -669,6 +669,37 @@
 }
 
 /* ─────────────────────────────────────────────────────────────────
+ *  Reading-mode disclosure ("View") in the result header. The wrapper
+ *  is the positioning context AND the identity the outside-mousedown
+ *  test uses, so the popover must stay inside it.
+ * ─────────────────────────────────────────────────────────────── */
+.view-wrap { position: relative; display: inline-flex; }
+.view-pop {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 40;
+  width: 260px;
+  padding: 10px;
+  display: grid;
+  gap: 10px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-panel);
+  box-shadow: inset 0 1px 0 var(--edge-hi), var(--elev-3);
+}
+.view-lb {
+  display: block;
+  margin-bottom: 4px;
+  font-family: var(--font-ui);
+  font-size: var(--fs-dense);
+  color: var(--ink-3);
+}
+/* What the Rows group says instead of a control it would not honour:
+ * aggregation-shaped results always render the plain table. */
+.view-note { margin: 0; font-family: var(--font-ui); font-size: var(--fs-dense); color: var(--ink-3); }
+
+/* ─────────────────────────────────────────────────────────────────
  *  Incomplete-results notice (ADR-0011 C2) — one warn-toned line
  *  between the tab strip and the results body. The .deg-live wrapper
  *  is the persistent aria-live region and carries no box of its own,
@@ -989,6 +1020,71 @@
   display: flex;
   gap: 8px;
 }
+
+/* ─────────────────────────────────────────────────────────────────
+ *  Docked inspector (ADR-0032). The table and the panel are one grid,
+ *  not a scrim over the page: the rows stay put and stay readable while
+ *  a row is open. Below 900px the panel stacks under the table and the
+ *  selected row grows a link down to it.
+ * ─────────────────────────────────────────────────────────────── */
+.results-split {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  flex: 1;
+  min-height: 0;
+}
+.results-split > .results { min-width: 0; }
+/* The scroll instruction is a sibling of the region it describes, so it
+ * spans both tracks rather than taking the inspector's column. */
+.results-split > .overflow-hint { grid-column: 1 / -1; }
+.results-split > .sd-host + * { min-width: 0; }
+.jump-details {
+  display: none;
+  margin-inline-start: 4px;
+  font-family: var(--font-ui);
+  font-size: var(--fs-micro);
+  color: var(--accent-ink);
+  position: relative;
+  z-index: 1;
+}
+.inspector .dg {
+  display: grid;
+  grid-template-columns: 96px minmax(0, 1fr) auto;
+  gap: 6px 10px;
+  font-size: var(--fs-dense);
+  align-items: baseline;
+}
+.inspector .k {
+  color: var(--ink-3);
+  font-family: var(--font-mono);
+  font-size: var(--fs-micro);
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  overflow-wrap: anywhere;
+}
+.inspector .v {
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: var(--table-fs);
+  overflow-wrap: anywhere;
+}
+.inspector .kv-act { display: inline-flex; gap: 4px; }
+.inspector .tag {
+  font: inherit;
+  font-size: var(--fs-micro);
+  background: var(--panel-2);
+  border: 1px solid var(--line-2);
+  border-radius: var(--radius-sm);
+  padding: 0 6px;
+  cursor: pointer;
+  color: var(--ink-2);
+}
+.inspector .tag:hover { border-color: var(--accent); color: var(--accent-ink); background: var(--accent-wash); }
+.inspector .actions { margin-top: 12px; display: flex; flex-wrap: wrap; gap: 8px; }
+/* The selected row reads like the expanded one, plus the 3px rule the
+ * list pages already use to say "this is the one on the right". */
+.results-table tbody tr.selected td { background: var(--accent-wash); }
+.results-table tbody tr.selected td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
 
 /* .results-footer moved to fleet-ui.css (issue #31) — fleet_ui::Pager
  * emits it (and supersedes the .tbl-foot mirror). */
@@ -1712,6 +1808,24 @@
 @media (max-width: 899.98px) {
   .run-detail .result-grid { grid-template-columns: minmax(0, 1fr); }
   .run-detail .receipt { border-left: 0; border-top: 1px solid var(--line); }
+}
+
+/* Wide enough for the inspector to sit beside the rows it describes. */
+@media (min-width: 900px) {
+  .results-split.has-inspector { grid-template-columns: minmax(0, 1fr) var(--inspector-w); }
+}
+/* Below it the panel stacks under the table, so the selected row needs
+ * a way down to it and the panel drops the edge that said "beside". */
+@media (max-width: 899.98px) {
+  .results-split.has-inspector .jump-details { display: inline-flex; }
+  .results-split > .sd-host .sd-drawer.sd-docked {
+    position: static;
+    max-height: none;
+    border-left: 0;
+    border-top: 1px solid var(--line);
+    border-radius: 0;
+    box-shadow: none;
+  }
 }
 
 .run-preview {
