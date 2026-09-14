@@ -21,7 +21,9 @@ def verify(package, target, source_sha, tooling_sha, expected_version):
     assert metadata["source_sha"] == source_sha
     assert metadata["tooling_sha"] == tooling_sha
     binaries = list((package / "bin").iterdir())
-    assert binaries and (package / "bin/trawl").is_file()
+    expected = {"trawl"} if "apple" in target else {"trawl", "trawld", "trawl-admin", "fleet-admin", "trawl-web"}
+    found = {p.name for p in binaries}
+    assert found == expected and all(p.is_file() for p in binaries), f"packaged executables differ: expected {sorted(expected)}, found {sorted(found)}"
     if "apple" in target:
         arch = "arm64" if target.startswith("aarch64") else "x86_64"
         library = package / "lib/trawl/libduckdb.dylib"

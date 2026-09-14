@@ -1,6 +1,22 @@
 name: macOS CLI package
 
 on:
+  # Run the native checks before approving publication. This workflow never
+  # creates a tag or publishes a release, under either trigger.
+  workflow_dispatch:
+    inputs:
+      source-sha:
+        description: Full immutable product commit SHA
+        required: true
+        type: string
+      tooling-sha:
+        description: Full immutable verification-tooling commit SHA
+        required: true
+        type: string
+      release-tag:
+        description: Version label matching committed source, for example v0.4.0; no tag is created
+        required: true
+        type: string
   workflow_call:
     inputs:
       source-sha:
