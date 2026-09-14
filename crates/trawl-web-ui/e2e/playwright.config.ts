@@ -12,6 +12,14 @@ const PORT = Number(process.env.E2E_PORT ?? 8123);
 // contract) — so specs never run concurrently against it.
 export default defineConfig({
   testDir: './tests',
+  // Scratch output — traces, failure screenshots, `.last-run.json` — lands
+  // at the repository root, not beside the suite. `trunk serve` watches
+  // crates/trawl-web-ui, so a write anywhere below it wakes a running dev
+  // server for a full rebuild, and that rebuild's "applying new
+  // distribution" step clears `dist/.stage` under any concurrent `trunk
+  // build`, which then dies with "error writing JS loader file to stage
+  // dir". Relative paths here resolve against this file's directory.
+  outputDir: '../../../e2e-artifacts/test-results',
   workers: 1,
   fullyParallel: false,
   retries: 0,

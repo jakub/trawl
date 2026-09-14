@@ -43,7 +43,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 # Run the exact target against the baseline too. A broken test cannot count as
 # a killed mutant, even if another CI job previously passed the whole suite.
-(cd "$cd_path" && npx playwright test atmosphere-fallback.spec.ts --grep 'live shader stays stopped' --output=test-results/atmosphere-baseline --reporter=json) > "$backup/baseline.json"
+(cd "$cd_path" && npx playwright test atmosphere-fallback.spec.ts --grep 'live shader stays stopped' --output=$root/e2e-artifacts/test-results/atmosphere-baseline --reporter=json) > "$backup/baseline.json"
 node - "$backup/baseline.json" <<'NODE'
 const fs = require('node:fs');
 const report = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
@@ -87,7 +87,7 @@ if (oldIntegrity !== digest(baseline)) throw Error('Baseline shader preload inte
 fs.writeFileSync(indexPath, index.replace(tags[0], tags[0].replace(oldIntegrity, digest(snippet))));
 NODE
 set +e
-(cd "$cd_path" && npx playwright test atmosphere-fallback.spec.ts --grep 'live shader stays stopped' --output=test-results/atmosphere-mutant --reporter=json) > "$backup/mutant.json"
+(cd "$cd_path" && npx playwright test atmosphere-fallback.spec.ts --grep 'live shader stays stopped' --output=$root/e2e-artifacts/test-results/atmosphere-mutant --reporter=json) > "$backup/mutant.json"
 mutant_status=$?
 set -e
 [[ "$mutant_status" == 1 ]] || { echo "Expected test failure, got $mutant_status" >&2; exit 1; }
@@ -109,7 +109,7 @@ if (errors.length !== 1 || !errors[0].message.includes('ATMOSPHERE_NO_RESTART:')
 console.log('Mutation 21 killed by ATMOSPHERE_NO_RESTART.');
 NODE
 # Constructor cleanup is independent of the deleted context-loss latch.
-(cd "$cd_path" && npx playwright test atmosphere-fallback.spec.ts --grep 'compile failure leaves' --output=test-results/atmosphere-control --reporter=line)
-cp "$backup/baseline.json" "$cd_path/test-results/atmosphere-baseline.json"
-cp "$backup/mutant.json" "$cd_path/test-results/atmosphere-mutant.json"
+(cd "$cd_path" && npx playwright test atmosphere-fallback.spec.ts --grep 'compile failure leaves' --output=$root/e2e-artifacts/test-results/atmosphere-control --reporter=line)
+cp "$backup/baseline.json" "$root/e2e-artifacts/test-results/atmosphere-baseline.json"
+cp "$backup/mutant.json" "$root/e2e-artifacts/test-results/atmosphere-mutant.json"
 echo 'Mutation 21 unaffected compile-failure control passed.'

@@ -30,11 +30,17 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const HARNESS_DIR = path.dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = path.resolve(HARNESS_DIR, '..', '..', '..', '..');
 
-/** Where the snapshot for one server lives. Keyed by port so parallel
- * suites in one worktree (E2E_PORT) own separate copies. */
+/** Where the snapshot for one server lives: under the repository root,
+ * never inside crates/trawl-web-ui. `trunk serve` watches that crate and
+ * rebuilds on any write below it, and a rebuild applying its distribution
+ * clears `dist/.stage` under a concurrent `trunk build` — so copying a
+ * dist into the source tree breaks the very builds this suite runs
+ * against. Keyed by port so parallel suites in one worktree (E2E_PORT)
+ * own separate copies. */
 export function snapshotPath(port) {
-  return path.join(HARNESS_DIR, '..', `.dist-snapshot-${port}`);
+  return path.join(REPO_ROOT, 'e2e-artifacts', `dist-snapshot-${port}`);
 }
 
 /** Local assets index.html names, as dist-relative paths. */
@@ -62,6 +68,7 @@ function withoutAutoreload(html) {
 export function snapshotDist(source, port, { attempts = 5, log = () => {} } = {}) {
   const target = snapshotPath(port);
   let missing = [];
+  fs.mkdirSync(path.dirname(target), { recursive: true });
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     fs.rmSync(target, { recursive: true, force: true });
     fs.cpSync(source, target, { recursive: true });

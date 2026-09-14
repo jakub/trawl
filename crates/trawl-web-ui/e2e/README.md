@@ -34,14 +34,24 @@ npm run test                          # -- --headed / --grep <pattern>
 stale build) if `dist/index.html` is missing.
 
 The harness serves a private copy of that `dist/`, taken at startup into
-`e2e/.dist-snapshot-<port>/` and checked against index.html's own asset
-list. A `trunk serve` running from the same checkout writes the same
-directory, so without the copy a rebuild mid-run pulls the hashed wasm
-out from under the browser, and trunk's injected autoreload client (whose
-`{{__TRUNK_ADDRESS__}}` placeholder only trunk's server substitutes) logs
-a WebSocket failure that console-error assertions read as the SPA's. The
-snapshot drops that client; a `trunk build` index.html carries none and
-is copied verbatim.
+`e2e-artifacts/dist-snapshot-<port>/` and checked against index.html's
+own asset list. A `trunk serve` running from the same checkout writes the
+same directory, so without the copy a rebuild mid-run pulls the hashed
+wasm out from under the browser, and trunk's injected autoreload client
+(whose `{{__TRUNK_ADDRESS__}}` placeholder only trunk's server
+substitutes) logs a WebSocket failure that console-error assertions read
+as the SPA's. The snapshot drops that client; a `trunk build` index.html
+carries none and is copied verbatim.
+
+Everything a run writes — that snapshot, playwright traces, failure
+screenshots, `.last-run.json` — goes to `e2e-artifacts/` at the
+repository root, never under `crates/`. Trunk's watcher covers the whole
+`crates/trawl-web-ui` tree and does not read `.gitignore`, so a run that
+wrote beside the suite woke any live `trunk serve` for a full rebuild;
+about a hundred seconds later that rebuild applied its distribution,
+clearing `dist/.stage` under whatever `trunk build` was staging into it,
+and the build died with `error writing JS loader file to stage dir: No
+such file or directory`. CI uploads the traces from the new path.
 
 ## CI
 
