@@ -1642,18 +1642,10 @@ const CONTRACTS: &[Contract] = &[
         hook: "id=\"net-window-span\"",
     },
     Contract {
-        assignment: "windowSpanChip: '.interval-chips:has(+ #net-window-span) button.interval-chip',",
+        assignment: "windowSpanHint: '#net-window-span-help',",
         source_path: "src/components/net_drawer.rs",
         source: NET_DRAWER_RS,
-        hook: "class=\"interval-chips\"",
-    },
-    // The chips and the box are siblings inside one `DurationChips`, which
-    // is what the `+` combinator above is reading.
-    Contract {
-        assignment: "windowSpanChip: '.interval-chips:has(+ #net-window-span) button.interval-chip',",
-        source_path: "src/components/net_drawer.rs",
-        source: NET_DRAWER_RS,
-        hook: "id=\"net-window-span\"",
+        hook: "id=\"net-window-span-help\"",
     },
     Contract {
         assignment: "windowLagInput: '#net-lag',",
@@ -1690,6 +1682,12 @@ const CONTRACTS: &[Contract] = &[
     // spec reads that footer through `resultsFooter` scoped to the
     // preview rather than through a selector of its own.
     Contract {
+        assignment: "previewScroll: '.preview-scroll',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "class=\"preview-scroll\"",
+    },
+    Contract {
         assignment: "previewCap: '.preview-cap',",
         source_path: "src/components/net_drawer.rs",
         source: NET_DRAWER_RS,
@@ -1697,10 +1695,10 @@ const CONTRACTS: &[Contract] = &[
     },
     // -- the schedule window form's copy --------------------------------
     Contract {
-        assignment: "windowLabel: 'Window',",
+        assignment: "windowLabel: 'Each run covers',",
         source_path: "src/components/net_drawer.rs",
         source: NET_DRAWER_RS,
-        hook: "\"Window\"",
+        hook: "\"Each run covers\"",
     },
     Contract {
         assignment: "windowOptionQuery: 'Query text',",
@@ -1721,16 +1719,34 @@ const CONTRACTS: &[Contract] = &[
         hook: "SegmentedOption::new(\"fixed\", \"Fixed span\")",
     },
     Contract {
-        assignment: "windowSpanLabel: 'Span',",
+        assignment: "intervalLabel: 'Run every',",
         source_path: "src/components/net_drawer.rs",
         source: NET_DRAWER_RS,
-        hook: "label=\"Span\"",
+        hook: "label=\"Run every\"",
     },
     Contract {
-        assignment: "windowLagLabel: 'Lag',",
+        assignment: "maxRunsLabel: 'Keep schedule running for',",
         source_path: "src/components/net_drawer.rs",
         source: NET_DRAWER_RS,
-        hook: "for=\"net-lag\">\"Lag\"",
+        hook: "for=\"net-max-runs\">\"Keep schedule running for\"",
+    },
+    Contract {
+        assignment: "windowSpanLabel: 'Trailing span',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "for=\"net-window-span\">\"Trailing span\"",
+    },
+    Contract {
+        assignment: "windowSpanHint: 'At least 60 seconds.',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "\"At least 60 seconds.\"",
+    },
+    Contract {
+        assignment: "windowLagLabel: 'Late-arrival lag',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "for=\"net-lag\">\"Late-arrival lag\"",
     },
     Contract {
         assignment: "windowQueryHint: 'Runs the saved text as written.',",
@@ -1763,10 +1779,10 @@ const CONTRACTS: &[Contract] = &[
         hook: "Changing the window or interval may run the schedule immediately.",
     },
     Contract {
-        assignment: "windowLagHintText: 'Late-arrival allowance. Both window bounds move back by this much. Blank is none.',",
+        assignment: "windowLagHintText: 'Moves both bounds back by this much. Blank is none.',",
         source_path: "src/components/net_drawer.rs",
         source: NET_DRAWER_RS,
-        hook: "Late-arrival allowance. Both window bounds move back by this much. Blank is none.",
+        hook: "Moves both bounds back by this much. Blank is none.",
     },
     Contract {
         assignment: "netRunAction: '⏱ Run',",

@@ -370,14 +370,12 @@ export const SEL = {
   /// group's own label id: the drawer mounts other Segmented strips and
   /// an unscoped `.seg-opt` would reach them.
   windowOption: '[role="group"][aria-labelledby="net-window-label"] .seg-opt',
-  /// The fixed span's custom box. Its preset chips are the same
-  /// `intervalChip` shape, which is why the id is what tells the two
-  /// strips apart.
+  /// The fixed span's box. One span is one value in the server's
+  /// grammar, so it is a plain input rather than a second preset strip
+  /// beside the interval's.
   windowSpanInput: '#net-window-span',
-  /// The span strip's own chips, found through the box they share a
-  /// parent with: `intervalChip` alone matches the interval strip too,
-  /// and both strips carry a `1h`.
-  windowSpanChip: '.interval-chips:has(+ #net-window-span) button.interval-chip',
+  /// Its helper paragraph, paired to the box by aria-describedby.
+  windowSpanHint: '#net-window-span-help',
   /// The lag box, present only while the window is not query mode.
   windowLagInput: '#net-lag',
   /// Its helper paragraph, paired to the box by aria-describedby.
@@ -396,6 +394,9 @@ export const SEL = {
   /// crates/trawl-web-ui/src/components/net_drawer.rs — one row of the
   /// preview's current page.
   previewRow: 'table tbody tr',
+  /// The named scroll region the preview's rows sit in. The pager, the
+  /// cap line and Run-query-again are siblings of it, never inside.
+  previewScroll: '.preview-scroll',
   /// The line naming rows the response never carried. Absent when paging
   /// covers everything.
   previewCap: '.preview-cap',
@@ -583,13 +584,17 @@ export const COPY = {
   // -- the schedule window form ---------------------------------------
   /// crates/trawl-web-ui/src/components/net_drawer.rs — the window
   /// strip's group label and its three option labels, in strip order.
-  windowLabel: 'Window',
+  windowLabel: 'Each run covers',
   windowOptionQuery: 'Query text',
   windowOptionSinceLast: 'Since last run',
   windowOptionFixed: 'Fixed span',
-  /// The fixed span's field label, and the lag's.
-  windowSpanLabel: 'Span',
-  windowLagLabel: 'Lag',
+  /// The interval strip's field label, and the max-runs box's.
+  intervalLabel: 'Run every',
+  maxRunsLabel: 'Keep schedule running for',
+  /// The fixed span's field label, its helper, and the lag's label.
+  windowSpanLabel: 'Trailing span',
+  windowSpanHint: 'At least 60 seconds.',
+  windowLagLabel: 'Late-arrival lag',
   /// Each mode's hint. The query-mode one continues into a `<code>`
   /// element, so only the sentence before it is pinned.
   windowQueryHint: 'Runs the saved text as written.',
@@ -600,7 +605,7 @@ export const COPY = {
   /// What a changed window or interval warns about.
   windowRescheduleHint: 'Changing the window or interval may run the schedule immediately.',
   /// The lag box's own helper.
-  windowLagHintText: 'Late-arrival allowance. Both window bounds move back by this much. Blank is none.',
+  windowLagHintText: 'Moves both bounds back by this much. Blank is none.',
   /// crates/trawl-web-ui/src/components/net_drawer.rs — the manual run
   /// action, withdrawn when the SAVED schedule carries a window.
   netRunAction: '⏱ Run',

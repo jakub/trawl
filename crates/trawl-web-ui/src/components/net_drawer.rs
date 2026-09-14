@@ -22,7 +22,9 @@ use fleet_ui::{
     Size, Sparkline, StatusDot, TabItem, ToastBus, ToastKind, Toggle, Variant, effective_active,
 };
 
-use crate::schedule_edit::{WindowDraft, WindowMode, preview_cap, validate_max_runs};
+use crate::schedule_edit::{
+    WindowDraft, WindowMode, preview_cap, schedule_sentence, validate_max_runs,
+};
 
 use crate::api::RUNS_PAGE_SIZE;
 
@@ -390,6 +392,11 @@ fn QuerySchedulePane(
     });
     let saved_interval =
         Signal::derive(move || saved.get().and_then(|n| n.schedule).map(|s| s.interval));
+    // The example the callout prints needs the seconds the server
+    // already parsed for this schedule's own durations, so the whole
+    // saved shape rides along beside the draft, following the server
+    // like the fields above.
+    let saved_schedule = Signal::derive(move || saved.get().and_then(|n| n.schedule));
     // A local refusal is not a failed request, so it stays in the form
     // next to the Save button instead of flying past as a toast.
     let save_error: RwSignal<Option<String>> = RwSignal::new(None);
@@ -552,9 +559,9 @@ fn QuerySchedulePane(
                 >
                     <textarea
                         aria-labelledby="net-query-label"
-                        class="mono"
+                        class="mono sched-input"
                         rows="4"
-                        style="width:100%; resize:vertical; font-size:12px; padding:8px; background:var(--fill); border:1px solid var(--line); border-radius:var(--radius-ctl); color:var(--ink)"
+                        style="resize:vertical"
                         prop:value=move || query_buf.get()
                         on:input=move |e| query_buf.set(event_target_value(&e))
                     ></textarea>
@@ -596,7 +603,7 @@ fn QuerySchedulePane(
                     <div style="display:flex; flex-direction:column; gap:10px">
                         <DurationChips
                             id="net-interval"
-                            label="Interval"
+                            label="Run every"
                             value=Signal::derive(move || interval_buf.get())
                             on_set=Callback::new(move |v| interval_buf.set(v))
                         />
@@ -607,7 +614,7 @@ fn QuerySchedulePane(
                         // buttons, not a radio group, hence the explicit
                         // group role and label.
                         <div role="group" aria-labelledby="net-window-label">
-                            <span class="field-label" id="net-window-label">"Window"</span>
+                            <span class="field-label" id="net-window-label">"Each run covers"</span>
                             <Segmented
                                 size=Size::Xs
                                 options=vec![
@@ -643,45 +650,80 @@ fn QuerySchedulePane(
                             }}
                         </div>
 
-                        // One grammar and one floor for every duration in
-                        // this form, so the span reuses the interval's
-                        // chips rather than growing a second spelling.
-                        <Show when=move || window_draft.get().mode == WindowMode::Fixed>
-                            <DurationChips
-                                id="net-window-span"
-                                label="Span"
-                                helper="At least 60s."
-                                value=Signal::derive(move || window_draft.get().span)
-                                on_set=Callback::new(move |v| window_draft.update(|d| d.span = v))
-                            />
-                        </Show>
+                        // The two free durations, side by side: one span
+                        // is one value in the server's grammar, so it is
+                        // a plain box rather than a second preset strip
+                        // competing with the interval's.
+                        <div class="formcols">
+                            <Show when=move || window_draft.get().mode == WindowMode::Fixed>
+                                <div>
+                                    <label class="field-label" for="net-window-span">"Trailing span"</label>
+                                    <input
+                                        class="mono sched-input"
+                                        id="net-window-span"
+                                        aria-describedby="net-window-span-help"
+                                        placeholder="1h"
+                                        prop:value=move || window_draft.get().span
+                                        on:input=move |e| {
+                                            let v = event_target_value(&e);
+                                            window_draft.update(|d| d.span = v);
+                                        }
+                                    />
+                                    <p id="net-window-span-help" class="field-hint-sm">
+                                        "At least 60 seconds."
+                                    </p>
+                                </div>
+                            </Show>
 
-                        <Show when=move || window_draft.get().mode != WindowMode::Query>
-                            <div>
-                                <label class="field-label" for="net-lag">"Lag"</label>
-                                <input
-                                    class="mono"
-                                    id="net-lag"
-                                    aria-describedby="net-lag-help"
-                                    placeholder="0s"
-                                    style="width:80px; font-size:12px; padding:4px 6px; background:var(--fill); border:1px solid var(--line); border-radius:var(--radius-ctl); color:var(--ink)"
-                                    prop:value=move || window_draft.get().lag
-                                    on:input=move |e| {
-                                        let v = event_target_value(&e);
-                                        window_draft.update(|d| d.lag = v);
-                                    }
-                                />
-                                <p id="net-lag-help" style="color:var(--ink-3); font-size:11px; margin:4px 0 0">
-                                    "Late-arrival allowance. Both window bounds move back by this much. Blank is none."
-                                </p>
-                            </div>
-                        </Show>
+                            <Show when=move || window_draft.get().mode != WindowMode::Query>
+                                <div>
+                                    <label class="field-label" for="net-lag">"Late-arrival lag"</label>
+                                    <input
+                                        class="mono sched-input"
+                                        id="net-lag"
+                                        aria-describedby="net-lag-help"
+                                        placeholder="0s"
+                                        prop:value=move || window_draft.get().lag
+                                        on:input=move |e| {
+                                            let v = event_target_value(&e);
+                                            window_draft.update(|d| d.lag = v);
+                                        }
+                                    />
+                                    <p id="net-lag-help" class="field-hint-sm">
+                                        "Moves both bounds back by this much. Blank is none."
+                                    </p>
+                                </div>
+                            </Show>
+                        </div>
+
+                        // The draft read back as a sentence, with a
+                        // worked example whenever every duration in it
+                        // resolves to seconds. Computed, never canned: a
+                        // fixed pair of timestamps beside a different
+                        // cadence would advertise a window the schedule
+                        // will not read (ADR-0025).
+                        {
+                            move || {
+                                let saved_schedule = saved_schedule.get();
+                                let said = schedule_sentence(
+                                    &interval_buf.get(),
+                                    saved_schedule.as_ref(),
+                                    &window_draft.get(),
+                                );
+                                view! {
+                                    <div class="timeline">
+                                        <strong>{said.headline}</strong>
+                                        {said.example.map(|text| view! { <code>{text}</code> })}
+                                        {said.note.map(|text| view! { <p class="small">{text}</p> })}
+                                    </div>
+                                }
+                            }
+                        }
 
                         <div>
-                            <label class="field-label" for="net-max-runs">"Max runs "</label>
-                            <span id="net-max-runs-help" style="color:var(--ink-3); font-size:11px">"(blank = unlimited)"</span>
+                            <label class="field-label" for="net-max-runs">"Keep schedule running for"</label>
                             <input
-                                class="mono"
+                                class="mono sched-input"
                                 // Text, not `number`: a browser reports
                                 // malformed numeric text (`1e`, a lone
                                 // `-`) as an empty value, which reads as
@@ -693,10 +735,10 @@ fn QuerySchedulePane(
                                 inputmode="numeric"
                                 id="net-max-runs"
                                 aria-describedby="net-max-runs-help"
-                                style="display:block; margin-top:4px; width:80px; font-size:12px; padding:4px 6px; background:var(--fill); border:1px solid var(--line); border-radius:var(--radius-ctl); color:var(--ink)"
                                 prop:value=move || max_runs_buf.get()
                                 on:input=move |e| max_runs_buf.set(event_target_value(&e))
                             />
+                            <span id="net-max-runs-help" class="field-hint-sm">"runs (blank = unlimited)"</span>
                         </div>
 
                         <div style="display:flex; align-items:center; gap:8px">
@@ -753,23 +795,25 @@ fn QuerySchedulePane(
                             }
                         }
 
-                        <div style="display:flex; gap:6px; align-items:center">
+                        // Removal leads, save trails: the tinted
+                        // destructive variant carries the warning the
+                        // inline red used to, without a second idiom.
+                        <div class="savebar">
+                            {move || saved.get().is_some_and(|n| n.schedule.is_some()).then(|| {
+                                view! {
+                                    <Btn
+                                        variant=Variant::Danger
+                                        size=Size::Xs
+                                        on_click=Callback::new(move |()| do_delete_schedule())
+                                    >"Remove schedule"</Btn>
+                                }
+                            })}
                             <Btn
                                 variant=Variant::Primary
                                 size=Size::Xs
                                 disabled=Signal::derive(move || saving_schedule.get() || missing.get())
                                 on_click=Callback::new(move |()| do_save_schedule())
                             >{move || if saving_schedule.get() { "Saving…" } else { "Save schedule" }}</Btn>
-                            {move || saved.get().is_some_and(|n| n.schedule.is_some()).then(|| {
-                                view! {
-                                    <Btn
-                                        variant=Variant::Secondary
-                                        size=Size::Xs
-                                        attr:style="color:var(--red)"
-                                        on_click=Callback::new(move |()| do_delete_schedule())
-                                    >"Remove Schedule"</Btn>
-                                }
-                            })}
                         </div>
 
                         // Reuses fleet_ui::Field's error paragraph, since
@@ -822,8 +866,8 @@ fn DurationChips(
                 }).collect_view()}
             </div>
             <input
-                class="mono"
-                style="margin-top:6px; width:80px; font-size:12px; padding:4px 6px; background:var(--fill); border:1px solid var(--line); border-radius:var(--radius-ctl); color:var(--ink)"
+                class="mono sched-input"
+                style="margin-top:6px"
                 id=id
                 aria-describedby=helper_id.clone()
                 placeholder="Custom…"
@@ -834,7 +878,7 @@ fn DurationChips(
                 on:input=move |e| on_set.run(event_target_value(&e))
             />
             {helper.map(|text| view! {
-                <p id=helper_id style="color:var(--ink-3); font-size:11px; margin:4px 0 0">{text}</p>
+                <p id=helper_id class="field-hint-sm">{text}</p>
             })}
         </div>
     }
@@ -1049,6 +1093,10 @@ fn ResultPreviewTable(
     });
 
     view! {
+        // The rows scroll in their own named, focusable region; the
+        // pager, the cap line and Run-query-again stay outside it, so
+        // reaching them never means scrolling the table first.
+        <div class="preview-scroll" role="region" aria-label="Stored result rows" tabindex="0">
         <table>
             <thead>
                 <tr>
@@ -1069,6 +1117,7 @@ fn ResultPreviewTable(
                 }}
             </tbody>
         </table>
+        </div>
         <OffsetPager
             window=window
             on_page=Callback::new(move |p| page.set(p))

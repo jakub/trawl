@@ -208,6 +208,175 @@ pub fn cadence_sentence(schedule: Option<&ScheduleResponse>) -> String {
     format!("Every {} · {covers}", schedule.interval)
 }
 
+/// Noon UTC, in seconds from midnight: the anchor the worked example
+/// counts back from. A run time rather than a run: the example says what
+/// a schedule would read, and midnight-relative arithmetic keeps it
+/// inside one day for every duration it will print.
+const EXAMPLE_END_SECS: u64 = 12 * 3600;
+
+/// Every duration the example can print resolves to seconds, or it is
+/// not printed. `5m 15m 1h 6h 24h 1w` are the form's own presets.
+const PRESET_SECS: &[(&str, u64)] = &[
+    ("5m", 300),
+    ("15m", 900),
+    ("1h", 3600),
+    ("6h", 21_600),
+    ("24h", 86_400),
+    ("1w", 604_800),
+];
+
+/// What the form says when a duration it was given is one the browser
+/// cannot read.
+const CUSTOM_NOTE: &str = "The server validates custom durations when you save.";
+
+/// The plain-language reading of a schedule edit: what it will do, an
+/// optional worked example, and an optional note about what could not be
+/// worked out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduleSentence {
+    /// One sentence naming the cadence and what each run covers.
+    pub headline: String,
+    /// A concrete pair of bounds, present only when every duration in
+    /// the draft resolved to seconds.
+    pub example: Option<String>,
+    /// Why there is no example, when the reason is custom text.
+    pub note: Option<&'static str>,
+}
+
+/// The seconds `text` names, or `None` when the browser cannot know.
+///
+/// A preset spells its own duration. Otherwise the one thing the browser
+/// knows is what the server already parsed: a string byte-equal to a
+/// duration the server reported seconds for has those seconds, because a
+/// duration's value is a function of its text. Anything else is custom
+/// text, and the browser has no duration grammar to guess with.
+fn secs_of(text: &str, saved_text: Option<&str>, saved_secs: Option<u64>) -> Option<u64> {
+    let text = text.trim();
+    if let Some((_, secs)) = PRESET_SECS.iter().find(|(preset, _)| *preset == text) {
+        return Some(*secs);
+    }
+    match (saved_text, saved_secs) {
+        (Some(saved_text), Some(saved_secs)) if saved_text.trim() == text => Some(saved_secs),
+        _ => None,
+    }
+}
+
+/// `secs_of` against both pairs the server reports: the interval and its
+/// seconds, the lag and its seconds.
+fn resolve(text: &str, saved: Option<&ScheduleResponse>) -> Option<u64> {
+    secs_of(
+        text,
+        saved.map(|s| s.interval.as_str()),
+        saved.map(|s| s.interval_secs),
+    )
+    .or_else(|| {
+        secs_of(
+            text,
+            saved.and_then(|s| s.lag.as_deref()),
+            saved.and_then(|s| s.lag_secs),
+        )
+    })
+}
+
+/// The lag in seconds. Blank is none, which the server applies as zero.
+fn resolve_lag(text: &str, saved: Option<&ScheduleResponse>) -> Option<u64> {
+    if text.trim().is_empty() {
+        return Some(0);
+    }
+    resolve(text, saved)
+}
+
+/// `HH:MM`, or `HH:MM:SS` when the time carries seconds.
+fn clock(secs: u64) -> String {
+    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    if s == 0 {
+        format!("{h:02}:{m:02}")
+    } else {
+        format!("{h:02}:{m:02}:{s:02}")
+    }
+}
+
+/// Whether `text` was offered and could not be read.
+fn unresolved(text: &str, secs: Option<u64>) -> bool {
+    secs.is_none() && !text.trim().is_empty()
+}
+
+/// What the schedule form's callout says about the edit in the draft.
+///
+/// The example is computed, never canned: a fixed "11:00 → 12:00" beside
+/// a 5m interval would advertise a window the schedule will not read
+/// (ADR-0025). So it exists only when every duration in the draft
+/// resolves to seconds, and custom text yields the validation note
+/// instead.
+#[must_use]
+pub fn schedule_sentence(
+    interval: &str,
+    saved: Option<&ScheduleResponse>,
+    draft: &WindowDraft,
+) -> ScheduleSentence {
+    let interval = interval.trim();
+    if interval.is_empty() {
+        return ScheduleSentence {
+            headline: "Choose how often to run.".to_owned(),
+            example: None,
+            note: None,
+        };
+    }
+    let lag_secs = resolve_lag(&draft.lag, saved);
+    match draft.mode {
+        WindowMode::Query => ScheduleSentence {
+            headline: format!("Every {interval}, run the saved text as written."),
+            example: Some("No schedule-imposed time limit.".to_owned()),
+            note: None,
+        },
+        WindowMode::SinceLast => {
+            let example = lag_secs.filter(|lag| *lag <= EXAMPLE_END_SECS).map(|lag| {
+                format!(
+                    "Example: from the last covered point → {} UTC exclusive",
+                    clock(EXAMPLE_END_SECS - lag)
+                )
+            });
+            let note =
+                (example.is_none() && unresolved(&draft.lag, lag_secs)).then_some(CUSTOM_NOTE);
+            ScheduleSentence {
+                headline: format!("Every {interval}, continue from the last covered point."),
+                example,
+                note,
+            }
+        }
+        WindowMode::Fixed => {
+            let span = draft.span.trim();
+            if span.is_empty() {
+                return ScheduleSentence {
+                    headline: format!("Every {interval}, read a trailing span."),
+                    example: None,
+                    note: None,
+                };
+            }
+            let span_secs = resolve(span, saved);
+            let example = span_secs
+                .zip(lag_secs)
+                .filter(|(span, lag)| span + lag <= EXAMPLE_END_SECS)
+                .map(|(span, lag)| {
+                    let end = EXAMPLE_END_SECS - lag;
+                    format!(
+                        "Example: {} UTC inclusive → {} UTC exclusive",
+                        clock(end - span),
+                        clock(end)
+                    )
+                });
+            let note = (example.is_none()
+                && (unresolved(span, span_secs) || unresolved(&draft.lag, lag_secs)))
+            .then_some(CUSTOM_NOTE);
+            ScheduleSentence {
+                headline: format!("Every {interval}, read the previous {span}."),
+                example,
+                note,
+            }
+        }
+    }
+}
+
 /// The line a stored run's preview shows when the run stored more rows
 /// than the response carries, or `None` when paging covers everything.
 ///
@@ -371,6 +540,131 @@ mod tests {
             cadence_sentence(Some(&schedule(Some("15m"), None))),
             "Every 1h · fixed span 15m"
         );
+    }
+
+    /// A draft in one of the three modes, with whatever span and lag
+    /// text the case is about.
+    fn draft(mode: WindowMode, span: &str, lag: &str) -> WindowDraft {
+        WindowDraft {
+            mode,
+            span: span.to_owned(),
+            lag: lag.to_owned(),
+        }
+    }
+
+    /// Nothing to say about a cadence that has not been chosen.
+    #[test]
+    fn schedule_sentence_asks_for_an_interval_first() {
+        let said = schedule_sentence("  ", None, &draft(WindowMode::Fixed, "1h", ""));
+        assert_eq!(said.headline, "Choose how often to run.");
+        assert_eq!(said.example, None);
+        assert_eq!(said.note, None);
+    }
+
+    /// Query mode reads the saved text, so the "example" is the absence
+    /// of a bound rather than a pair of timestamps.
+    #[test]
+    fn schedule_sentence_query_mode_names_no_bound() {
+        let said = schedule_sentence("1h", None, &draft(WindowMode::Query, "", "5m"));
+        assert_eq!(said.headline, "Every 1h, run the saved text as written.");
+        assert_eq!(
+            said.example.as_deref(),
+            Some("No schedule-imposed time limit.")
+        );
+        assert_eq!(said.note, None);
+    }
+
+    /// Tiling has one bound to print: the run time, moved back by a lag
+    /// the browser could read.
+    #[test]
+    fn schedule_sentence_since_last_prints_the_end_bound() {
+        let said = schedule_sentence("1h", None, &draft(WindowMode::SinceLast, "", "5m"));
+        assert_eq!(
+            said.headline,
+            "Every 1h, continue from the last covered point."
+        );
+        assert_eq!(
+            said.example.as_deref(),
+            Some("Example: from the last covered point → 11:55 UTC exclusive")
+        );
+        assert_eq!(said.note, None);
+    }
+
+    /// A lag the browser has no grammar for yields the note instead of a
+    /// guess.
+    #[test]
+    fn schedule_sentence_since_last_custom_lag_notes_the_server() {
+        let said = schedule_sentence("1h", None, &draft(WindowMode::SinceLast, "", "90s"));
+        assert_eq!(said.example, None);
+        assert_eq!(said.note, Some(CUSTOM_NOTE));
+    }
+
+    /// The common case, both bounds printed: a blank lag is none.
+    #[test]
+    fn schedule_sentence_fixed_prints_both_bounds() {
+        let said = schedule_sentence("1h", None, &draft(WindowMode::Fixed, "1h", ""));
+        assert_eq!(said.headline, "Every 1h, read the previous 1h.");
+        assert_eq!(
+            said.example.as_deref(),
+            Some("Example: 11:00 UTC inclusive → 12:00 UTC exclusive")
+        );
+        assert_eq!(said.note, None);
+    }
+
+    /// A lag moves BOTH bounds back, which is the whole reason the
+    /// example is computed rather than canned.
+    #[test]
+    fn schedule_sentence_fixed_lag_moves_both_bounds() {
+        let said = schedule_sentence("15m", None, &draft(WindowMode::Fixed, "15m", "5m"));
+        assert_eq!(
+            said.example.as_deref(),
+            Some("Example: 11:40 UTC inclusive → 11:55 UTC exclusive")
+        );
+    }
+
+    /// Seconds print only when a bound carries them, and a duration the
+    /// server already parsed is one the browser can read back.
+    #[test]
+    fn schedule_sentence_fixed_prints_seconds_when_a_bound_has_them() {
+        let mut saved = schedule(Some("90s"), None);
+        saved.interval = "90s".to_owned();
+        saved.interval_secs = 90;
+        let said = schedule_sentence("90s", Some(&saved), &draft(WindowMode::Fixed, "90s", ""));
+        assert_eq!(said.headline, "Every 90s, read the previous 90s.");
+        assert_eq!(
+            said.example.as_deref(),
+            Some("Example: 11:58:30 UTC inclusive → 12:00 UTC exclusive")
+        );
+    }
+
+    /// A span not yet chosen is not a refusal, so the callout says what
+    /// the mode means and stops there.
+    #[test]
+    fn schedule_sentence_fixed_blank_span_says_only_the_shape() {
+        let said = schedule_sentence("1h", None, &draft(WindowMode::Fixed, "  ", "5m"));
+        assert_eq!(said.headline, "Every 1h, read a trailing span.");
+        assert_eq!(said.example, None);
+        assert_eq!(said.note, None);
+    }
+
+    /// Custom span text the browser cannot read: the headline still
+    /// quotes it, the example does not exist, the note says who decides.
+    #[test]
+    fn schedule_sentence_fixed_custom_span_notes_the_server() {
+        let said = schedule_sentence("1h", None, &draft(WindowMode::Fixed, "45m", ""));
+        assert_eq!(said.headline, "Every 1h, read the previous 45m.");
+        assert_eq!(said.example, None);
+        assert_eq!(said.note, Some(CUSTOM_NOTE));
+    }
+
+    /// A span that resolves but runs past the example's own day gets no
+    /// example and no note: nothing failed to be read.
+    #[test]
+    fn schedule_sentence_fixed_week_span_has_no_worked_example() {
+        let said = schedule_sentence("1w", None, &draft(WindowMode::Fixed, "1w", ""));
+        assert_eq!(said.headline, "Every 1w, read the previous 1w.");
+        assert_eq!(said.example, None);
+        assert_eq!(said.note, None);
     }
 }
 
