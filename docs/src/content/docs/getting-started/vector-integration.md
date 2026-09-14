@@ -92,18 +92,34 @@ and `unifi-syslog.toml`.
    `${TRAWL_URL}` in a configuration file without it. `TRAWL_ENV` must be in
    the server's `[ingest] envs`.
 
-3. Verify the server certificate. As shipped, `[sinks.trawld.tls]` sets
-   `verify_certificate = false`. When trawld uses a certificate from a CA the
-   host trusts, set it to `true`. For a private CA, also name its certificate:
+3. Configure certificate trust before starting Vector. The shipped sink
+   verifies the server certificate and the hostname in `TRAWL_URL` against
+   the host's system CA store. For a publicly trusted certificate, keep the
+   shipped TLS settings.
+
+   For a private CA, obtain its PEM certificate from your CA administrator
+   through a trusted channel. Copy the CA certificate to the collector:
+
+   ```bash
+   sudo install -m 0644 trawl-ca.pem /etc/vector/trawl-ca.pem
+   ```
+
+   Add `ca_file` to the existing `[sinks.trawld.tls]` table in `base.toml`:
 
    ```toml
    [sinks.trawld.tls]
    verify_certificate = true
+   verify_hostname = true
    ca_file = "/etc/vector/trawl-ca.pem"
    ```
 
-   The self-signed certificate that trawld generates is valid only for
-   `localhost`, so it cannot pass verification from another host.
+   Configure trawld with a certificate whose Subject Alternative Name
+   includes the real DNS hostname in `TRAWL_URL`, such as
+   `trawl.example.com`. Configure the server certificate chain and key as
+   described in [Configure TLS](/operate/access/#configure-tls). The generated
+   localhost certificate cannot verify a different hostname, even if you
+   trust its issuer. Keep both verification settings enabled on deployed
+   collectors.
 
 ## Start Vector and confirm delivery
 

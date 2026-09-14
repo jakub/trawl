@@ -13,7 +13,9 @@
 #   4. against the selected Fleet database, create trawl-ingest with trawl:ingest,
 #      then: fleet-admin keys create --name vector --kind service --role trawl-ingest
 #      fleet-admin reads DATABASE_URL; prefer a separate key per collector fleet
-#   5. start: systemctl enable --now vector
+#   5. use a server certificate valid for the TRAWL_URL hostname. For a private
+#      CA, install its PEM certificate and set ca_file in sinks.trawld.tls below.
+#   6. start: systemctl enable --now vector
 #
 # permissions (ansible should handle):
 #   - vector user in: systemd-journal, adm
@@ -302,5 +304,8 @@ timeout_secs = 30
 concurrency = "adaptive"
 
 [sinks.trawld.tls]
-# set to true and provide ca_file for production CA verification
-verify_certificate = false
+# Trust the system CA store and verify the hostname in TRAWL_URL.
+# For a private CA, install its PEM certificate readable by the vector user:
+# ca_file = "/etc/vector/trawl-ca.pem"
+verify_certificate = true
+verify_hostname = true

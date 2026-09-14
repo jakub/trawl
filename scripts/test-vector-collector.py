@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run the Debian collector with Vector 0.57.0 and disposable loopback inputs.
 
-Requires Python 3.11+ and VECTOR_BIN (or vector on PATH). No host journal,
+Requires Python 3.11+, OpenSSL, and VECTOR_BIN (or vector on PATH). No host journal,
 application files, Docker socket, credentials, or running collector are used.
 """
 
@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import signal
 import socket
+import ssl
 import subprocess
 import tempfile
 import threading
@@ -93,7 +94,27 @@ def fixtures(suppress):
     return events, expected
 
 
-def run(tcp, suppress):
+def certificates(directory):
+    """Create a private fixture CA and a server certificate for loopback only."""
+    directory = Path(directory)
+
+    def openssl(*args):
+        subprocess.run(["openssl", *args], cwd=directory, check=True,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    openssl("req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+            "-subj", "/CN=Trawl fixture CA", "-keyout", "ca.key", "-out", "ca.pem",
+            "-addext", "basicConstraints=critical,CA:TRUE")
+    openssl("req", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=localhost",
+            "-keyout", "server.key", "-out", "server.csr")
+    (directory / "server.ext").write_text(
+        "subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\n")
+    openssl("x509", "-req", "-in", "server.csr", "-CA", "ca.pem", "-CAkey", "ca.key",
+            "-CAcreateserial", "-days", "1", "-extfile", "server.ext", "-out", "server.pem")
+    return directory / "ca.pem", directory / "server.pem", directory / "server.key"
+
+
+def run(tcp, suppress, tls="http"):
     config = load(tcp)
     # A final output must never also feed another transform.
     for name, transform in config["transforms"].items():
@@ -102,10 +123,16 @@ def run(tcp, suppress):
     env = dict(ENV)
     if suppress:
         env["TRAWL_SUPPRESS_HOMELAB_NOISE"] = "true"
+    assert config["sinks"]["trawld"]["tls"]["verify_certificate"] is True
+    assert config["sinks"]["trawld"]["tls"]["verify_hostname"] is True
     received = []
     failures = []
 
     class Capture(http.server.BaseHTTPRequestHandler):
+        def do_HEAD(self):
+            self.send_response(200)
+            self.end_headers()
+
         def do_POST(self):
             try:
                 assert self.path == "/api/v1/ingest"
@@ -125,6 +152,11 @@ def run(tcp, suppress):
 
     with tempfile.TemporaryDirectory(prefix="trawl-vector-", dir=ROOT / ".tmp") as directory:
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Capture)
+        if tls != "http":
+            ca, cert, key = certificates(directory)
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(cert, key)
+            server.socket = context.wrap_socket(server.socket, server_side=True)
         thread = threading.Thread(target=server.serve_forever)
         thread.start()
         process = None
@@ -132,7 +164,12 @@ def run(tcp, suppress):
         try:
             config["data_dir"] = directory
             sink = config["sinks"]["trawld"]
-            sink["uri"] = f"http://127.0.0.1:{server.server_port}/api/v1/ingest"
+            scheme = "http" if tls == "http" else "https"
+            sink["uri"] = f"{scheme}://127.0.0.1:{server.server_port}/api/v1/ingest"
+            if tls != "http":
+                sink["healthcheck"] = {"enabled": True, "uri": sink["uri"]}
+                if tls == "trusted":
+                    sink["tls"]["ca_file"] = str(ca)
             sink["batch"]["timeout_secs"] = 0.1
             ports = {}
             for name, source in list(config["sources"].items()):
@@ -155,8 +192,17 @@ def run(tcp, suppress):
             for reservation in reservations:
                 reservation.close()
             with (Path(directory) / "vector.log").open("w+") as log:
-                process = subprocess.Popen([VECTOR, "--config", str(path)], env=env,
+                process = subprocess.Popen([VECTOR, "--require-healthy", "true", "--config", str(path)], env=env,
                                            stdin=subprocess.PIPE, stdout=log, stderr=log, text=True)
+                if tls == "untrusted":
+                    process.communicate(timeout=20)
+                    log.seek(0)
+                    output = log.read()
+                    assert process.returncode != 0, output
+                    assert "certificate verify failed" in output, output
+                    assert not received and not failures, (received, failures)
+                    print("PASS untrusted HTTPS: certificate verification refused the server; zero events")
+                    return
                 deadline = time.monotonic() + 20
                 while True:
                     log.seek(0)
@@ -202,7 +248,7 @@ def run(tcp, suppress):
                     if name.startswith("unifi-"):
                         assert event["host"] == "ap-fixture", event
                         assert event["syslog_source_ip"] == "127.0.0.1", event
-                print(f"PASS {'UDP + TCP' if tcp else 'UDP only'}: {len(events)} synthetic inputs, "
+                print(f"PASS {tls} {'UDP + TCP' if tcp else 'UDP only'}: {len(events)} synthetic inputs, "
                       f"{len(ports)} syslog inputs, {len(received)} HTTP events, zero duplicates; "
                       f"{5 if suppress else 0} journal events filtered")
         finally:
@@ -226,3 +272,5 @@ if __name__ == "__main__":
     for tcp in (False, True):
         for suppress in (False, True):
             run(tcp, suppress)
+    run(True, False, "trusted")
+    run(False, False, "untrusted")
