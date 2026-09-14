@@ -47,6 +47,8 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
+      - name: Install Debian package test tooling
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends dpkg-dev
       - run: python3 -m unittest discover -s scripts/release -p 'test_*.py' -v
 
   helm-template:

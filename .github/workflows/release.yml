@@ -384,23 +384,20 @@ jobs:
         env:
           GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
 
+      - name: Load APT index builder from release source
+        env:
+          RELEASE_SHA: ${{ needs.resolve-source.outputs.sha }}
+        run: |
+          git fetch --no-tags --depth=1 origin "$RELEASE_SHA"
+          git show "${RELEASE_SHA}:scripts/release/build-apt-index.py" > "$RUNNER_TEMP/build-apt-index.py"
+
       - name: Build APT repository
         shell: bash
         run: |
           set -euo pipefail
 
-          mkdir -p apt/pool
-          find incoming -name '*.deb' -exec cp {} apt/pool/ \;
-          ls -la apt/pool/
-
+          python3 "$RUNNER_TEMP/build-apt-index.py" incoming apt
           cd apt
-
-          for arch in amd64 arm64; do
-            dir="dists/stable/main/binary-${arch}"
-            mkdir -p "${dir}"
-            dpkg-scanpackages --arch "${arch}" pool /dev/null > "${dir}/Packages"
-            gzip -9c "${dir}/Packages" > "${dir}/Packages.gz"
-          done
 
           cd dists/stable
           cat > Release <<'RELEASE'
