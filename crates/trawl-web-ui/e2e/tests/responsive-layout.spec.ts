@@ -33,6 +33,9 @@ for (const width of [320, 720, 900, 1024, 1440]) {
     }
     if (width >= 900) {
       for (const link of await page.locator(SEL.paletteRailLink).all()) await insideViewport(link);
+      for (const control of await page.locator('nav.rail .bot a, nav.rail .bot button').all()) {
+        await insideViewport(control);
+      }
       // The sidebar is docked here, so a toggle would be a control that
       // opens nothing. At exactly 900 the CSS used to reveal it while
       // `Shell` still gated the overlay on 899.98 — visible and dead.
@@ -52,6 +55,12 @@ for (const width of [320, 720, 900, 1024, 1440]) {
         await Promise.all(el.getAnimations().map((a) => a.finished));
       });
       for (const link of await page.locator(SEL.paletteRailLink).all()) await insideViewport(link);
+      // The bottom slot too: Help and the collapse control live outside
+      // the destination list the palette selector names, and a sweep
+      // that skips them is a sweep of half the sidebar.
+      for (const control of await page.locator('nav.rail .bot a, nav.rail .bot button').all()) {
+        await insideViewport(control);
+      }
       await page.keyboard.press('Escape');
       await expect(toggle).toBeFocused();
     }

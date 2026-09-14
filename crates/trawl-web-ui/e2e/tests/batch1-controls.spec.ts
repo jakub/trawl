@@ -126,6 +126,17 @@ test('reduced motion stops actual overlays, toasts and live tail pulses', async 
   await expect(page.locator('.pulse > span')).toHaveCSS('animation-name', 'pulse-ring');
   await page.emulateMedia({ reducedMotion: 'reduce' });
   await expect(page.locator('.pulse > span')).toHaveCSS('animation-name', 'none');
+
+  // The nav overlay is the other thing that slides and fades in, and the
+  // test never opened it, so its reduce rules were asserted nowhere.
+  // Off the schema route first: its scrim drawer is over the toggle.
+  await page.setViewportSize({ width: 720, height: 900 });
+  await page.goto('/search');
+  await page.locator(SEL.navToggle).click();
+  await expect(page.locator('nav.rail.overlay')).toHaveCSS('animation-name', 'none');
+  await expect(page.locator('.nav-scrim')).toHaveCSS('animation-name', 'none');
+  await page.keyboard.press('Escape');
+  await expect(page.locator('nav.rail.overlay')).toHaveCount(0);
 });
 
 test('forced colors retains a visible navigation outline', async ({ page }) => {
