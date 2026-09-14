@@ -32,7 +32,7 @@ def write_atomic(path, data):
         temporary_path.unlink(missing_ok=True)
 
 
-def prepare(source, target, output, cache=None, deps=None):
+def pinned_runtime(source, target):
     manifest = json.loads(MANIFEST.read_text())
     lock = tomllib.loads((source / "Cargo.lock").read_text())
     for name in ("duckdb", "libduckdb-sys"):
@@ -40,6 +40,11 @@ def prepare(source, target, output, cache=None, deps=None):
         if versions != [manifest["crate_version"]]:
             raise SystemExit(f"unsupported product Cargo.lock {name} version; update the verified runtime manifest")
     archive, checksum = manifest["archives"][target]
+    return manifest, archive, checksum
+
+
+def prepare(source, target, output, cache=None, deps=None):
+    manifest, archive, checksum = pinned_runtime(source, target)
     # Cargo profiles share a content-addressed archive cache. Release callers
     # keep the ZIP alongside their prepared runtime as before.
     archive_dir = cache / checksum if cache is not None else output
@@ -64,8 +69,8 @@ def prepare(source, target, output, cache=None, deps=None):
             write_atomic(downloaded, data)
         library = "libduckdb.dylib" if "apple" in target else "libduckdb.so"
         with zipfile.ZipFile(io.BytesIO(data)) as zipped:
-            # Select known files rather than extracting archive paths. Refresh
-            # extracted files on every prepare, including explicit LIB_DIRs.
+            # Select known files rather than extracting archive paths. This
+            # command owns its requested output and may repair extracted files.
             for name in (library, "duckdb.h"):
                 content = zipped.read(name)
                 write_atomic(output / name, content)
@@ -76,6 +81,40 @@ def prepare(source, target, output, cache=None, deps=None):
         metadata = {"version": manifest["version"], "archive": archive, "sha256": checksum}
         write_atomic(output / "runtime.json", (json.dumps(metadata, indent=2) + "\n").encode())
     return downloaded
+
+
+def verify(source, target, runtime, deps):
+    """Check an operator-provided runtime without writing to that directory."""
+    manifest, archive, checksum = pinned_runtime(source, target)
+    if deps.resolve().is_relative_to(runtime.resolve()):
+        raise SystemExit("DUCKDB_LIB_DIR must be separate from the Cargo loader output directory")
+
+    def existing(name):
+        path = runtime / name
+        if not path.is_file():
+            raise SystemExit(f"DUCKDB_LIB_DIR is missing {name}; select a runtime created by distribution.py prepare")
+        return path.read_bytes()
+
+    data = existing(archive)
+    if hashlib.sha256(data).hexdigest() != checksum:
+        raise SystemExit("DuckDB archive checksum mismatch in DUCKDB_LIB_DIR; input left unchanged")
+    library = "libduckdb.dylib" if "apple" in target else "libduckdb.so"
+    with zipfile.ZipFile(io.BytesIO(data)) as zipped:
+        contents = {name: zipped.read(name) for name in (library, "duckdb.h")}
+    contents["LICENSE.duckdb"] = Path(__file__).with_name("duckdb-LICENSE").read_bytes()
+    for name, expected in contents.items():
+        if existing(name) != expected:
+            raise SystemExit(f"DUCKDB_LIB_DIR {name} does not match the verified runtime; input left unchanged")
+    try:
+        metadata = json.loads(existing("runtime.json"))
+    except (ValueError, UnicodeDecodeError):
+        raise SystemExit("DUCKDB_LIB_DIR runtime.json is invalid; input left unchanged") from None
+    expected_metadata = {"version": manifest["version"], "archive": archive, "sha256": checksum}
+    if not isinstance(metadata, dict) or any(metadata.get(k) != v for k, v in expected_metadata.items()):
+        raise SystemExit("DUCKDB_LIB_DIR runtime.json does not match the pinned runtime; input left unchanged")
+    # Stage the bytes already checked against the ZIP, never a later reread of
+    # the external library. Only the Cargo-owned loader directory is writable.
+    write_atomic(deps / library, contents[library])
 
 
 def stage(binaries, runtime, output, target, source_sha, tooling_sha, cli_only, source, image_only=False):
@@ -123,6 +162,11 @@ if __name__ == "__main__":
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--cache", type=Path)
     p.add_argument("--deps", type=Path)
+    p = commands.add_parser("verify")
+    p.add_argument("--source", type=Path, required=True)
+    p.add_argument("--target", required=True)
+    p.add_argument("--runtime", type=Path, required=True)
+    p.add_argument("--deps", type=Path, required=True)
     p = commands.add_parser("stage")
     p.add_argument("--source", type=Path, required=True)
     p.add_argument("--binaries", type=Path, required=True)

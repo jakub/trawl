@@ -35,9 +35,11 @@ when Fleet launches the already-built daemon. Keep the library with that build.
 Native `trawl-core` builds also prepare the runtime so its standalone parity
 tests work with ordinary Cargo commands. Wasm and other parser-only targets do
 not acquire a native library. An inherited `DUCKDB_DOWNLOAD_LIB=1` is rejected;
-unset it or set it to `0`. An explicit `DUCKDB_LIB_DIR` must be a writable
-runtime directory prepared by the distribution helper, with its verified ZIP.
-The build rechecks that archive and replaces the extracted library before linking.
+unset it or set it to `0`. An explicit `DUCKDB_LIB_DIR` selects an existing runtime directory prepared
+by the distribution helper, with its verified ZIP. Cargo checks the archive,
+library, header, license, and runtime metadata without changing that directory.
+Missing or mismatched files stop the build. Only the loader copy under the Cargo
+target directory is written; the selected runtime can be read-only.
 For distributable artifacts, use the [shared-runtime source build](/getting-started/#build-from-source).
 
 The interactive database lives in the named `fleet-dev-postgres-data` volume,

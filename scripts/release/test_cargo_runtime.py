@@ -78,6 +78,11 @@ class CargoRuntime(unittest.TestCase):
         (self.root / "scripts/release/duckdb-runtime.json").write_text(json.dumps(self.manifest))
         env = {**self.env, "TARGET": target, "OUT_DIR": str(out)}
         if explicit:
+            # This is the intentional construction step. The subsequent Cargo
+            # helper must only read this existing dependency directory.
+            subprocess.run([sys.executable, str(self.root / "scripts/release/distribution.py"),
+                            "prepare", "--source", str(self.root), "--target", target,
+                            "--output", str(runtime)], check=True, env=self.env)
             env["DUCKDB_LIB_DIR"] = str(runtime)
         return env, runtime, target_root / profile / "deps" / library, archive_dir / archive
 
@@ -114,18 +119,55 @@ class CargoRuntime(unittest.TestCase):
             with self.subTest(explicit=explicit):
                 env, runtime, deps, archive = self.runtime("x86_64-unknown-linux-gnu", explicit=explicit)
                 archive.write_bytes(b"corrupted ZIP")
+                before = self.snapshot(runtime) if explicit else None
                 result = self.run_helper(env, success=False)
                 self.assertIn("checksum mismatch", result.stderr)
                 self.assertNotIn("cargo:rustc-link-search", result.stdout)
                 self.assertFalse(deps.exists())
-                self.assertFalse((runtime / deps.name).exists())
+                if explicit:
+                    self.assertEqual(self.snapshot(runtime), before)
+                else:
+                    self.assertFalse((runtime / deps.name).exists())
 
-    def test_explicit_directory_extraction_is_reverified(self):
+    @staticmethod
+    def snapshot(directory):
+        return {str(path.relative_to(directory)): (path.read_bytes() if path.is_file() else None,
+                                                   path.stat().st_mtime_ns, path.stat().st_mode)
+                for path in [directory, *directory.rglob("*")]}
+
+    def test_explicit_prepared_readonly_directory_is_unchanged(self):
         env, runtime, deps, _ = self.runtime("x86_64-unknown-linux-gnu", explicit=True)
+        for path in runtime.iterdir():
+            path.chmod(0o444)
+        runtime.chmod(0o555)
+        before = self.snapshot(runtime)
         self.run_helper(env)
-        (runtime / deps.name).write_bytes(b"tampered")
-        self.run_helper(env)
-        self.assertEqual((runtime / deps.name).read_bytes(), env["TARGET"].encode())
+        self.assertEqual(deps.read_bytes(), env["TARGET"].encode())
+        self.assertEqual(self.snapshot(runtime), before)
+
+    def test_explicit_directory_mismatches_are_refused_without_mutation(self):
+        for name in ("libduckdb.so", "duckdb.h", "LICENSE.duckdb", "runtime.json"):
+            with self.subTest(name=name):
+                env, runtime, deps, _ = self.runtime("x86_64-unknown-linux-gnu", explicit=True)
+                (runtime / name).write_bytes(b"tampered")
+                before = self.snapshot(runtime)
+                result = self.run_helper(env, success=False)
+                self.assertIn(name, result.stderr)
+                self.assertIn("input left unchanged", result.stderr)
+                self.assertEqual(self.snapshot(runtime), before)
+                self.assertFalse(deps.exists())
+
+    def test_explicit_directory_missing_inputs_are_not_created_or_downloaded(self):
+        for name in ("libduckdb.so", "duckdb.h", "LICENSE.duckdb", "runtime.json",
+                     "libduckdb-linux-amd64.zip"):
+            with self.subTest(name=name):
+                env, runtime, deps, _ = self.runtime("x86_64-unknown-linux-gnu", explicit=True)
+                (runtime / name).unlink()
+                before = self.snapshot(runtime)
+                result = self.run_helper(env, success=False)
+                self.assertIn(f"DUCKDB_LIB_DIR is missing {name}", result.stderr)
+                self.assertEqual(self.snapshot(runtime), before)
+                self.assertFalse(deps.exists())
 
     def test_downloader_override_fails_with_actionable_diagnostic(self):
         env, _, deps, _ = self.runtime("x86_64-unknown-linux-gnu")

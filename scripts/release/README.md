@@ -42,8 +42,11 @@ Ordinary native Cargo commands use `trawl-core`'s build script to call the same
 The helper checks each cached ZIP before extraction, stages files atomically,
 and serializes writers to the same checksum-addressed archive cache. Each build
 gets a private runtime plus a loader copy in its profile's `deps` directory.
-`DUCKDB_LIB_DIR` selects the release runtime directory and rechecks its ZIP;
-it does not skip verification. The helper does not add an absolute rpath, so
+`DUCKDB_LIB_DIR` selects an existing release runtime directory. Cargo invokes
+`distribution.py verify` to check its ZIP and extracted files without writing to
+that directory or downloading missing inputs. Mismatches stop the build. Only
+the Cargo loader copy is staged. `distribution.py prepare` remains the explicit
+command for constructing or repairing an output directory. The helper does not add an absolute rpath, so
 the distribution build's relative loader path remains the only shipped rpath.
 
 `distribution.py stage` creates `bin/` and `lib/trawl/`, includes the runtime

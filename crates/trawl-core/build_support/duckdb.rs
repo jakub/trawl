@@ -54,17 +54,24 @@ pub fn prepare() {
         .map_or_else(|| out.join("duckdb"), PathBuf::from);
     let script = source.join("scripts/release/distribution.py");
     let mut command = Command::new("python3");
+    command.arg(&script);
+    if explicit_runtime.is_some() {
+        // An operator-supplied dependency directory is an input. Verify its
+        // existing files without creating, repairing or downloading into it.
+        command.args(["verify", "--runtime"]).arg(&runtime);
+    } else {
+        command
+            .args(["prepare", "--output"])
+            .arg(&runtime)
+            .arg("--cache")
+            .arg(&cache);
+    }
     command
-        .arg(&script)
-        .args(["prepare", "--source"])
+        .arg("--source")
         .arg(&source)
-        .args(["--target", &target, "--output"])
-        .arg(&runtime)
+        .args(["--target", &target])
         .arg("--deps")
         .arg(&deps);
-    if explicit_runtime.is_none() {
-        command.arg("--cache").arg(&cache);
-    }
     assert!(
         command
             .status()
