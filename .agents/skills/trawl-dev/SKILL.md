@@ -32,11 +32,22 @@ Tests use disposable databases, never this interactive data. Use
 | Browser interactions | `env -u NO_COLOR cargo xtask e2e --grep 'scenario'`; see the [E2E guide](../../../crates/trawl-web-ui/e2e/README.md) |
 | Full API, auth, ingest, compaction, and restart | [trawl-experiment](../trawl-experiment/SKILL.md) |
 
-Cargo defaults use the downloaded DuckDB shared runtime, including ICU, JSON,
-and Parquet. Cargo provides its loader path for `cargo run` and tests; an
-already-built development daemon uses `bin/trawld-dev`. For relocatable
-artifacts, use the documented distribution build helper instead of copying a
-Cargo executable alone.
+Native Cargo builds require Python 3.11 or newer and curl. They verify the
+official DuckDB shared runtime against `scripts/release/duckdb-runtime.json`,
+reuse a checksum-verified archive cache, and stage the library for linking and
+loading. The runtime includes ICU, JSON, and Parquet. Cargo provides its loader
+path for `cargo run` and tests; an already-built development daemon uses
+`bin/trawld-dev`. Wasm and unsupported parser-only targets acquire no runtime.
+
+Run Cargo from the checkout so it discovers `.cargo/config.toml`. Commands
+started elsewhere with `--manifest-path` or `cargo install --path` require
+`DUCKDB_NO_PKG_CONFIG=1`, including when `DUCKDB_LIB_DIR` is set. Unset
+`DUCKDB_DOWNLOAD_LIB` or set it to `0`; an unchecked downloader override stops
+the build. An explicit `DUCKDB_LIB_DIR` must already contain the archive and
+files produced by `distribution.py prepare`. Cargo verifies those inputs
+without changing them and refuses missing or mismatched files. See the
+[distribution helpers](../../../scripts/release/README.md) to prepare a runtime
+or build relocatable artifacts; a Cargo executable alone is incomplete.
 
 Unset `NO_COLOR` for Trunk because the installed version rejects its inherited
 value of `1`. The Playwright suite uses a stub API. It does not prove real
