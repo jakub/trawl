@@ -23,7 +23,8 @@ inputs = ["apache"]
 
 [transforms.route_apache.route]
 access = '.file != null && contains(to_string!(.file), "access")'
-error = '.file != null && contains(to_string!(.file), "error")'
+# Give access precedence when both words occur in the filename.
+error = '.file != null && contains(to_string!(.file), "error") && !contains(to_string!(.file), "access")'
 
 # -- apache access logs (combined format) -------------------------------------
 
@@ -37,15 +38,15 @@ if err == null {
   .src_ip = parsed.host
   .method = parsed.method
   .uri = parsed.path
-  .status = to_int(parsed.status) ?? null
+  .status = to_int(parsed.status)
   .message = .message
 
-  user = to_string(parsed.identity) ?? "-"
-  if user != "-" {
+  user = to_string(parsed.user)
+  if user != "" && user != "-" {
     .user_name = user
   }
 
-  status = to_int(parsed.status) ?? 0
+  status = to_int(parsed.status)
   if status >= 500 {
     .severity_text = "error"
   } else if status >= 400 {

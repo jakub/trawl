@@ -13,7 +13,9 @@
 #      are routed through vector
 #
 # the gateway (UDM/USG) can also be routed here. set a static service name
-# for the gateway IP using the remap below, or use trawld's source_service_map.
+# for the gateway IP using the remap below before HTTP forwarding.
+# trawld's source_service_map applies only when devices send directly to its
+# native syslog listener; it does not map events received over HTTP.
 
 # =============================================================================
 # SOURCE
@@ -36,7 +38,7 @@ mode = "udp"
 
 [transforms.trawl_unifi]
 type = "remap"
-inputs = ["unifi_syslog"]
+inputs = ["unifi_syslog*"]
 source = '''
 # --- service name: rewrite unifi APP-NAME format ---
 # unifi devices send APP-NAME as {12-hex-MAC}{Model}-{Firmware}, e.g.:
@@ -53,13 +55,13 @@ if appname != "" {
   # check for unifi format: 12 hex chars followed by a device model
   mac_match, err = parse_regex(appname, r'^(?i)[0-9a-f]{12}(?P<rest>.+)$')
   if err == null {
-    rest = mac_match.rest
+    rest = string!(mac_match.rest)
 
     # strip firmware version: find last segment matching digits.digits...
     # e.g. "U6-Lite-6.7.4915634" → "U6-Lite", "USW-Flex-7.4.116850" → "USW-Flex"
     model_match, err = parse_regex(rest, r'^(?P<model>.+?)-\d+\.\d+')
     if err == null {
-      service = "unifi-" + downcase(model_match.model)
+      service = "unifi-" + downcase(string!(model_match.model))
     } else {
       # no firmware version found — use the whole rest as model
       service = "unifi-" + downcase(rest)
@@ -73,7 +75,7 @@ if appname != "" {
 .service = service
 
 # --- host: prefer syslog hostname, fall back to source IP ---
-if !exists(.hostname) || to_string(.hostname) ?? "" == "" {
+if !exists(.hostname) || (to_string(.hostname) ?? "") == "" {
   .host = to_string(.source_ip) ?? "unknown"
 } else {
   .host = to_string(.hostname) ?? "unknown"
@@ -81,7 +83,7 @@ if !exists(.hostname) || to_string(.hostname) ?? "" == "" {
 
 # --- gateway override (optional) ---
 # uncomment and set your gateway IP to give it a stable service name:
-# if to_string(.source_ip) ?? "" == "10.0.0.1" {
+# if (to_string(.source_ip) ?? "") == "10.0.0.1" {
 #   .service = "unifi-gateway"
 # }
 

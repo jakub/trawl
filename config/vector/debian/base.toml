@@ -4,10 +4,11 @@
 #   1. install vector: https://vector.dev/docs/setup/installation/package-managers/apt/
 #   2. deploy configs to /etc/vector/vector.d/ (base.toml + service drop-ins)
 #   3. set env vars in /etc/default/vector or vector.service override:
+#      VECTOR_CONFIG_DIR=/etc/vector/vector.d
 #      TRAWL_URL=https://trawl.internal:5514
 #      TRAWL_INGEST_TOKEN=<token>
 #      VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION=true
-#      (Vector 0.57 and later do not expand ${VAR} in config files unless
+#      (Vector 0.57 and later do not expand environment variables in config files unless
 #      this is set or vector runs with --dangerously-allow-env-var-interpolation)
 #   4. against the selected Fleet database, create trawl-ingest with trawl:ingest,
 #      then: fleet-admin keys create --name vector --kind service --role trawl-ingest
@@ -87,7 +88,7 @@ exclude = [
 # maps systemd journal fields to trawl's expected schema. includes UFW firewall
 # log enhancement: kernel messages containing [UFW are parsed for src/dst/proto.
 
-[transforms.trawl_journal_enriched]
+[transforms.journal_enriched]
 type = "remap"
 inputs = ["journald"]
 source = '''
@@ -154,7 +155,7 @@ if contains(msg, "[UFW ") {
   if err == null { .dst_port = to_int(dpt_match.dst_port) ?? null }
 
   proto_match, err = parse_regex(msg, r'PROTO=(?P<protocol>\S+)')
-  if err == null { .protocol = downcase(proto_match.protocol) }
+  if err == null { .protocol = downcase(string!(proto_match.protocol)) }
 }
 
 # --- drop internal journal metadata ---
@@ -195,7 +196,7 @@ del(.source_type)
 
 [transforms.trawl_journal]
 type = "filter"
-inputs = ["trawl_journal_enriched"]
+inputs = ["journal_enriched"]
 condition = '''
 svc = to_string(.service) ?? ""
 msg = to_string(.message) ?? ""
@@ -233,7 +234,7 @@ if filepath != "" {
     .service = parts[0]
   } else {
     # top-level: strip .log extension (e.g. dpkg.log → dpkg)
-    .service = replace(parts[0], r'\.log$', "")
+    .service = replace(string!(parts[0]), r'\.log$', "")
   }
 } else {
   .service = "varlog"
@@ -260,7 +261,9 @@ del(.source_type)
 # =============================================================================
 
 # -- HTTP sink to trawld ------------------------------------------------------
-# wildcard input "trawl_*" automatically discovers all normalized transforms
+# Reserve "trawl_*" for final outputs only; intermediate stages must use
+# another prefix so they cannot bypass filters or deliver duplicates.
+# Wildcard input "trawl_*" automatically discovers all final transforms
 # from this config AND any drop-in configs loaded via --config-dir.
 # adding a new drop-in requires NO changes to this file.
 

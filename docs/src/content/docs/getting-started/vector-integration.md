@@ -50,8 +50,10 @@ and `unifi-syslog.toml`.
 
    `base.toml` reads journald and `/var/log/**/*.log`, maps `_SYSTEMD_UNIT` to
    `service` and `PRIORITY` to `severity_text`, and defines the `trawld` sink.
-   The sink takes input from every transform named `trawl_*`, so a drop-in
-   needs no change to `base.toml`.
+   The sink takes input from every final transform named `trawl_*`, so a
+   drop-in needs no change to `base.toml`. Use another prefix for intermediate
+   transforms, such as `journal_enriched`, to prevent duplicate delivery and
+   filter bypass.
 
 2. Set the environment in `/etc/default/vector`, then restrict the file
    because it holds the token:
@@ -134,9 +136,22 @@ The shipped sink behaves as follows:
 | Concurrency | Adaptive |
 | Acknowledgements | Enabled. A source advances only after trawld accepts the batch. |
 
+## Receive UniFi syslog
+
+Deploy `unifi-syslog.toml` and point the devices at the Vector host on UDP port
+1514. To also receive TCP on that port, uncomment the complete
+`sources.unifi_syslog_tcp` block. The `unifi_syslog*` input sends both sources
+through the same normalizer before HTTP forwarding.
+
+For a gateway with a fixed service name, enable the gateway override in that
+normalizer and set its source IP. The daemon's `source_service_map` applies
+when devices send directly to trawld's native syslog listener. It does not
+map the events that Vector forwards over HTTP.
+
 ## Add your own source
 
-Name the transform `trawl_*` so the sink picks it up:
+Name only the final transform `trawl_*` so the sink picks it up. Intermediate
+parsers, routes, and filters must use another prefix:
 
 ```toml
 [sources.myapp]

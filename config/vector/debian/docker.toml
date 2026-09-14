@@ -47,7 +47,7 @@ if compose_svc != "" {
   swarm_match, err = parse_regex(clean, r'^(?P<base>.+)\.[a-z0-9]{25}\.[a-z0-9]{25}$')
   if err == null {
     # base may be {stack}_{service}.{replica} or {stack}_{service}
-    base = swarm_match.base
+    base = string!(swarm_match.base)
     # strip trailing .{digit} replica number if present
     base = replace(base, r'\.\d+$', "")
     # normalize {stack}_{service} to hyphenated name
@@ -58,7 +58,7 @@ if compose_svc != "" {
 } else if image != "" {
   # strip tag and registry prefix: registry.io/org/name:tag → name
   parts = split(image, ":")
-  name = parts[0]
+  name = string!(parts[0])
   name_parts = split(name, "/")
   .service = name_parts[-1]
 } else {
@@ -78,7 +78,7 @@ if compose_project != "" {
   # for swarm containers, use stack name as host
   host_swarm_match, err = parse_regex(clean_host, r'^(?P<base>.+)\.[a-z0-9]{25}\.[a-z0-9]{25}$')
   if err == null {
-    host_base = replace(host_swarm_match.base, r'\.\d+$', "")
+    host_base = replace(string!(host_swarm_match.base), r'\.\d+$', "")
     host_parts = split(host_base, "_", limit: 2)
     .host = host_parts[0]
   } else {

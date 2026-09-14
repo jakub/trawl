@@ -15,6 +15,29 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
+  vector-collector:
+    name: Vector collector delivery
+    runs-on: k8s-small
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Validate and exercise the Debian collector with Vector 0.57.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          fixture_dir=$(mktemp -d)
+          trap 'rm -rf "$fixture_dir"' EXIT
+          curl --fail --location --retry 3 \
+            https://github.com/vectordotdev/vector/releases/download/v0.57.0/vector-0.57.0-x86_64-unknown-linux-gnu.tar.gz \
+            --output "$fixture_dir/vector.tar.gz"
+          echo "4d156e6859e235b366f5b77121ae59d5440c93acab215c45f30f3fc839d20f65  $fixture_dir/vector.tar.gz" | sha256sum --check
+          tar -xzf "$fixture_dir/vector.tar.gz" -C "$fixture_dir"
+          VECTOR_BIN="$fixture_dir/vector-x86_64-unknown-linux-gnu/bin/vector" \
+            python3 scripts/test-vector-collector.py
+
   release-source:
     name: release source resolution
     runs-on: k8s-small
