@@ -1,0 +1,52 @@
+[
+  {
+    "file": "macos-intel-installed.txt",
+    "input_sha256": "90582f4d4ce43300cb2088c0fcffd59043b62b7dfd618291e0a96357e12e1071",
+    "stored_sha256": "90582f4d4ce43300cb2088c0fcffd59043b62b7dfd618291e0a96357e12e1071",
+    "input_name": "macos-intel-installed.log"
+  },
+  {
+    "file": "macos-arm-installed.txt",
+    "input_sha256": "833f85d8f073b654a26dc09fdcc262163b3094ceb348720b2f206efe6a0d1fd8",
+    "stored_sha256": "833f85d8f073b654a26dc09fdcc262163b3094ceb348720b2f206efe6a0d1fd8",
+    "input_name": "macos-arm-installed.log"
+  },
+  {
+    "file": "trawl-ci-34811397502.json",
+    "input_sha256": "a7e94d151d49dbf416a69ba1a4aeb3fef1ed6ba4f99a1894739719e116611140",
+    "stored_sha256": "a7e94d151d49dbf416a69ba1a4aeb3fef1ed6ba4f99a1894739719e116611140"
+  },
+  {
+    "file": "distribution-34811398487.json",
+    "input_sha256": "419bf2f0a5ddd9630c0db018d7e94504b7275f5e90ada59a7a4aae09a4aeeac8",
+    "stored_sha256": "419bf2f0a5ddd9630c0db018d7e94504b7275f5e90ada59a7a4aae09a4aeeac8"
+  },
+  {
+    "file": "docs-34811397622.json",
+    "input_sha256": "5f90830258e3159cd72afd17dc39817900cd8630c6be2fdc75c3d610a8db965a",
+    "stored_sha256": "5f90830258e3159cd72afd17dc39817900cd8630c6be2fdc75c3d610a8db965a"
+  },
+  {
+    "file": "crash-34811397608.json",
+    "input_sha256": "e4be5fe7d7a19653df0dde85b518a3654358ab467a69b211bd8d7366db7ed854",
+    "stored_sha256": "e4be5fe7d7a19653df0dde85b518a3654358ab467a69b211bd8d7366db7ed854"
+  },
+  {
+    "file": "arm64-cli-build.txt",
+    "input_sha256": "2df56f784fb8afb02aeb40e0ec63dd826fac6adeece3c0a7a4b9686c0cbf60e4",
+    "stored_sha256": "2df56f784fb8afb02aeb40e0ec63dd826fac6adeece3c0a7a4b9686c0cbf60e4",
+    "input_name": "arm64-cli-build.log"
+  },
+  {
+    "file": "release-helpers-arm64.txt",
+    "input_sha256": "bc0ff4dd04a420d8d9129ccc3d0d7beaffb328cdcd167c29b04d112101660e87",
+    "stored_sha256": "bc0ff4dd04a420d8d9129ccc3d0d7beaffb328cdcd167c29b04d112101660e87",
+    "input_name": "release-helpers-arm64.log"
+  },
+  {
+    "file": "docs-arm-prerequisites.txt",
+    "input_sha256": "4a23ec10a46588f78c5b3b612f8cc1d77d6bb4893e766cb6f7073abaaff70aac",
+    "stored_sha256": "32b29c2f25ec5eb48a3a446a2d6b5393c6217749c275e403e73c953134417e2a",
+    "input_name": "docs-arm-prerequisites.log"
+  }
+]
