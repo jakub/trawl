@@ -58,3 +58,10 @@ successful image and chart publication permit GitHub release creation. Docs
 and APT publication follow the GitHub release. This ordering prevents an
 announcement before its registry channels exist. It is not a transaction
 across services: a later GitHub or Pages failure still requires a rerun.
+
+`linux-distribution.yml` and `macos-cli.yml` accept non-publishing manual runs
+as well as reusable workflow calls. Both require full `source-sha` and
+`tooling-sha` commits and a `release-tag` label matching the committed version
+(for example, `v0.4.0`). A manual run creates no tag. Linux completion includes
+both native architecture verification jobs; the release workflow calls this
+same workflow and waits for its verification results.

@@ -12,15 +12,15 @@ import unittest
 
 WORKFLOW = Path(__file__).resolve().parents[2] / '.github/workflows/release.yml'
 ANNOUNCEMENTS = ('release', 'publish-docs', 'publish-apt')
-FAILURES = ('build-chart', 'build-linux', 'verify-linux', 'build-macos', 'build-docs', 'docker', 'publish-helm')
+FAILURES = ('build-chart', 'build-linux', 'build-macos', 'build-docs', 'docker', 'publish-helm')
 
 
-def parse_workflow():
+def parse_workflow(path=WORKFLOW):
     with tempfile.TemporaryDirectory(prefix='trawl-publication-dag-') as directory:
         root = Path(directory)
         (root / 'templates').mkdir()
         (root / 'Chart.yaml').write_text('apiVersion: v2\nname: publication-test\nversion: 0.0.0\n')
-        (root / 'release.yml').write_bytes(WORKFLOW.read_bytes())
+        (root / 'release.yml').write_bytes(path.read_bytes())
         (root / 'templates/graph.yaml').write_text(
             'apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: graph\ndata:\n'
             '  graph: {{ .Files.Get "release.yml" | fromYaml | toJson | quote }}\n'
@@ -86,7 +86,7 @@ class PublicationOrder(unittest.TestCase):
 
     def test_original_parallel_announcement_defect_is_detected(self):
         jobs = copy.deepcopy(self.workflow['jobs'])
-        jobs['release']['needs'] = ['resolve-source', 'verify-linux', 'build-macos', 'build-docs']
+        jobs['release']['needs'] = ['resolve-source', 'build-linux', 'build-macos', 'build-docs']
         with self.assertRaisesRegex(AssertionError, 'release can start after'):
             assert_publication_order(jobs)
 
@@ -95,6 +95,38 @@ class PublicationOrder(unittest.TestCase):
         jobs['docker']['needs'].remove('build-chart')
         with self.assertRaisesRegex(AssertionError, 'registry write can start before chart preparation'):
             assert_publication_order(jobs)
+
+    def test_native_linux_failures_fail_the_called_release_gate(self):
+        jobs = self.workflow['jobs']
+        self.assertEqual(jobs['build-linux']['uses'], './.github/workflows/linux-distribution.yml')
+        linux = parse_workflow(WORKFLOW.with_name('linux-distribution.yml'))
+        self.assertEqual(linux['permissions'], {'contents': 'read'})
+        self.assertEqual(set(linux['jobs']), {'build', 'verify'})
+        self.assertEqual(dependencies(linux['jobs']['verify']), ['build'])
+        source_check = next(s for s in linux['jobs']['build']['steps'] if s.get('name') == 'Verify committed release source and version')
+        self.assertIn('test "$(git -C .release-tooling rev-parse HEAD)" = "$TOOLING_SHA"', source_check['run'])
+        for failed in ('build', 'verify'):
+            with self.subTest(failed=failed):
+                native_status = simulate(linux['jobs'], failed)
+                self.assertEqual(native_status[failed], 'failure')
+                # A failed job makes the workflow_call fail; there is no
+                # continue-on-error or condition bypass in the called graph.
+                release_status = simulate(jobs, 'build-linux')
+                for announcement in ANNOUNCEMENTS:
+                    self.assertEqual(release_status[announcement], 'skipped')
+        self.assertTrue(all(s == 'success' for s in simulate(linux['jobs']).values()))
+
+    def test_both_native_preflights_accept_identical_required_inputs(self):
+        for filename in ('linux-distribution.yml', 'macos-cli.yml'):
+            workflow = parse_workflow(WORKFLOW.with_name(filename))
+            # Helm's YAML 1.1 parser spells the unquoted `on` mapping key true.
+            triggers = workflow.get('on') or workflow.get('true')
+            self.assertEqual(set(triggers), {'workflow_call', 'workflow_dispatch'})
+            for trigger in triggers.values():
+                self.assertEqual(set(trigger['inputs']), {'source-sha', 'tooling-sha', 'release-tag'})
+                for field in trigger['inputs'].values():
+                    self.assertTrue(field['required'])
+                    self.assertEqual(field['type'], 'string')
 
     def test_publisher_consumes_exact_prebuilt_chart_and_metadata(self):
         jobs = self.workflow['jobs']
@@ -115,7 +147,11 @@ class PublicationOrder(unittest.TestCase):
         self.assertNotIn('helm package', publish_commands)
         checkout = next(s for s in prepare['steps'] if s.get('uses', '').startswith('actions/checkout@'))
         self.assertEqual(checkout['with']['ref'], '${{ needs.resolve-source.outputs.sha }}')
-        self.assertIn('WORKFLOW_SHA', prepare_commands)
+        tooling_checkout = next(s for s in prepare['steps'] if s.get('with', {}).get('path') == '.release-tooling')
+        self.assertEqual(tooling_checkout['with']['ref'], '${{ github.sha }}')
+        self.assertFalse(tooling_checkout['with']['persist-credentials'])
+        self.assertIn('bash .release-tooling/scripts/release/package-chart.sh', prepare_commands)
+        self.assertNotIn('git fetch', prepare_commands)
         docker_build = next(s for s in jobs['docker']['steps'] if s.get('uses', '').startswith('docker/build-push-action@'))
         self.assertEqual(docker_build['with']['tags'], '${{ needs.build-chart.outputs.image-tags }}')
         self.assertEqual(docker_build['with']['labels'], '${{ needs.build-chart.outputs.image-labels }}')

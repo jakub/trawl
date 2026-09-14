@@ -117,21 +117,19 @@ class ReleaseSourceTests(unittest.TestCase):
         self.git(self.checkout, "checkout", "--detach", self.release_sha)
         self.assertFalse((self.checkout / "scripts/release/package-chart.sh").exists())
         workflow = (RESOLVER.parents[2] / ".github/workflows/release.yml").read_text()
-        step = workflow.split("      - name: Load chart packager from workflow source\n", 1)[1]
+        step = workflow.split("      - name: Check out chart tooling at the workflow source\n", 1)[1]
         step = step.split("\n      - name:", 1)[0]
-        self.assertIn("WORKFLOW_SHA: ${{ github.sha }}", step)
-        commands = step.split("        run: |\n", 1)[1]
-        commands = "\n".join(line.removeprefix("          ") for line in commands.splitlines())
-        runner_temp = Path(self.temp.name) / "runner-temp"
-        runner_temp.mkdir()
-        result = subprocess.run(
-            ["bash", "-e", "-c", commands], cwd=self.checkout,
-            env=dict(self.env, WORKFLOW_SHA=self.workflow_sha, RUNNER_TEMP=str(runner_temp)),
-            text=True, capture_output=True,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual((runner_temp / "package-chart.sh").read_text(),
+        self.assertIn("ref: ${{ github.sha }}", step)
+        self.assertIn("path: .release-tooling", step)
+        self.assertIn("persist-credentials: false", step)
+        # Model the independent checkout action at the selected tooling SHA.
+        # Product source deliberately lacks the helper and remains untouched.
+        tooling = self.checkout / ".release-tooling"
+        self.git(self.checkout, "clone", "--no-tags", str(self.remote), str(tooling))
+        self.git(tooling, "checkout", "--detach", self.workflow_sha)
+        self.assertEqual((tooling / "scripts/release/package-chart.sh").read_text(),
                          RESOLVER.with_name("package-chart.sh").read_text())
+        self.assertIn(".release-tooling/scripts/release/package-chart.sh", workflow)
         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.release_sha)
         self.assertEqual((self.checkout / "chart/trawl/Chart.yaml").read_text(), "release source\n")
 

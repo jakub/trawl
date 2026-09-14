@@ -71,12 +71,12 @@ jobs:
             type=semver,pattern={{version}},value=${{ env.RELEASE_TAG }}
             type=raw,value=latest
 
-      - name: Load chart packager from workflow source
-        env:
-          WORKFLOW_SHA: ${{ github.sha }}
-        run: |
-          git fetch --no-tags --depth=1 origin "$WORKFLOW_SHA"
-          git show "${WORKFLOW_SHA}:scripts/release/package-chart.sh" > "$RUNNER_TEMP/package-chart.sh"
+      - name: Check out chart tooling at the workflow source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.sha }}
+          path: .release-tooling
+          persist-credentials: false
 
       - name: Install Helm
         uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
@@ -87,7 +87,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir chart-artifact
-          bash "$RUNNER_TEMP/package-chart.sh" "$RELEASE_TAG" "$IMAGE_TAG" chart/trawl chart-artifact
+          bash .release-tooling/scripts/release/package-chart.sh "$RELEASE_TAG" "$IMAGE_TAG" chart/trawl chart-artifact
           helm lint chart-artifact/trawl-*.tgz --strict \
             --set auth.database.existingSecret=fleet-db \
             --set storage.database.existingSecret=trawl-db --set web.enabled=false
@@ -105,206 +105,11 @@ jobs:
 
   build-linux:
     needs: resolve-source
-    name: build (${{ matrix.target }})
-    env:
-      RELEASE_TAG: ${{ needs.resolve-source.outputs.tag }}
-      SOURCE_SHA: ${{ needs.resolve-source.outputs.sha }}
-      TOOLING_SHA: ${{ github.sha }}
-    runs-on: k8s-big
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            arch: amd64
-            cross: false
-          - target: aarch64-unknown-linux-gnu
-            arch: arm64
-            cross: true
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          ref: ${{ needs.resolve-source.outputs.sha }}
-
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          ref: ${{ github.sha }}
-          path: .release-tooling
-          persist-credentials: false
-      - name: Verify committed release source and version
-        run: python3 .release-tooling/scripts/release/check-release-source.py . "$RELEASE_TAG" "$SOURCE_SHA"
-
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1; pinned via toolchain input
-        with:
-          toolchain: 1.98.0
-          targets: ${{ matrix.target }}, wasm32-unknown-unknown
-          # llvm-tools ships llvm-strip, used to strip the shipped binaries
-          # after breakpad symbols are dumped (see the dump_syms/strip steps).
-          components: llvm-tools
-
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          key: release-${{ matrix.target }}
-
-      - name: Install zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
-
-      - name: Install cross-arch dpkg libs
-        if: matrix.cross
-        run: |
-          sudo dpkg --add-architecture arm64
-          for f in /etc/apt/sources.list.d/*.sources; do
-            [ -f "$f" ] && sudo sed -i '/^Architectures:/!s/^Types: deb/Architectures: amd64\nTypes: deb/' "$f"
-          done
-          for f in /etc/apt/sources.list.d/*.list; do
-            [ -f "$f" ] && sudo sed -i '/\[arch=/!s/^deb /deb [arch=amd64] /' "$f"
-          done
-          codename="$(lsb_release -cs)"
-          printf 'deb [arch=arm64] http://ports.ubuntu.com/ %s %s\n' \
-            "$codename"          "main universe" \
-            "$codename-updates"  "main universe" \
-            "$codename-security" "main universe" \
-            | sudo tee /etc/apt/sources.list.d/arm64.list
-          sudo apt-get update
-          sudo apt-get install -y libc6:arm64 libgcc-s1:arm64 libstdc++6:arm64 dpkg-dev
-
-      - uses: taiki-e/install-action@d858f8113943481093e02986a7586a4819a3bfd6 # v2
-        with:
-          tool: cargo-zigbuild,cargo-deb,trunk,wasm-bindgen-cli
-
-      # Build the leptos SPA first so rust-embed picks up a populated
-      # dist/ when trawl-web compiles. wasm toolchain is host-only, so
-      # this runs before the cross-target cargo zigbuild step.
-      - name: Build web UI SPA
-        working-directory: crates/trawl-web-ui
-        run: trunk build --release
-      - name: Precompress SPA + enforce wire-size budgets
-        run: cargo xtask compress-web
-
-      # `cargo build --release` alone honors workspace default-members,
-      # which excludes trawl-web. `--workspace --exclude trawl-web-ui`
-      # builds every crate (including trawl-web) except the wasm32-only
-      # SPA crate — which was already built by the preceding trunk step.
-      - name: Build
-        run: bash .release-tooling/scripts/release/build-distribution.sh "$PWD" "${{ matrix.target }}" "$PWD/runtime"
-        env:
-          # Zig's lld strips .symtab regardless of the profile's
-          # strip = "debuginfo". Override strip to false so the build retains
-          # full symbols + DWARF; the dump_syms step below harvests breakpad
-          # .sym files from these fat binaries before they are stripped for
-          # shipping. --build-id=sha1 stamps a content-based GNU build-id note
-          # so the runtime minidump's module id matches the published .sym's
-          # DEBUG_ID (the id is preserved across the later llvm-strip).
-          CARGO_PROFILE_RELEASE_STRIP: "false"
-          RUSTFLAGS: "-C link-arg=-Wl,--build-id=sha1"
-
-      - name: Install dump_syms
-        run: |
-          set -euo pipefail
-          version="2.3.7"
-          sha256="928f9902244f63be4b3b0acf56963ecad97b7227ecfd9ee645d73683f75a9285"
-          url="https://github.com/mozilla/dump_syms/releases/download/v${version}/dump_syms-x86_64-unknown-linux-gnu.tar.xz"
-          curl --proto '=https' --tlsv1.2 -fLsS "$url" -o dump_syms.tar.xz
-          echo "${sha256}  dump_syms.tar.xz" | sha256sum --check --strict
-          # Self-hosted runners can't write /usr/local/bin; install into the
-          # cargo bin dir, which is writable and already on PATH for later steps.
-          mkdir -p "$CARGO_HOME/bin"
-          tar -xf dump_syms.tar.xz --strip-components=1 -C "$CARGO_HOME/bin" dump_syms-x86_64-unknown-linux-gnu/dump_syms
-          rm dump_syms.tar.xz
-          dump_syms --version
-
-      # Harvest breakpad symbols from the FAT binaries (with .symtab + DWARF)
-      # BEFORE stripping. --store writes <module>/<DEBUG_ID>/<module>.sym, the
-      # exact layout `minidump-stackwalk --symbols-url` expects. These symbols
-      # cover application modules; the official shared DuckDB library ships
-      # separately and does not provide full upstream C++ debug information.
-      - name: Dump breakpad symbols
-        run: |
-          set -euo pipefail
-          bindir="target/${{ matrix.target }}/release"
-          for bin in trawld trawl trawl-admin trawl-web fleet-admin; do
-            dump_syms --store symbols/ "${bindir}/${bin}"
-          done
-          find symbols -type f | sort
-
-      # Strip the shipped binaries now that symbols are captured, so the
-      # deb/tarball stay lean. llvm-strip keeps allocated notes (including
-      # .note.gnu.build-id) by default, so the shipped build-id still matches
-      # the .sym DEBUG_ID. Strip in place, before the deb/tarball steps.
-      #
-      # After each strip, ASSERT the build-id note actually survived: the entire
-      # symbolication chain hinges on the runtime minidump's module id matching
-      # the published .sym DEBUG_ID, and zig's lld defaults to --build-id=none,
-      # so a silent miss (here or on a future toolchain bump) would ship green
-      # builds whose crash dumps never resolve. Runs on both matrix legs, so it
-      # also covers the aarch64 cross binaries.
-      - name: Strip shipped binaries
-        run: |
-          set -euo pipefail
-          llvm_strip="$(find "$(rustc --print sysroot)"/lib/rustlib/*/bin -name llvm-strip | head -n1 || true)"
-          if [ -z "${llvm_strip}" ] || [ ! -x "${llvm_strip}" ]; then
-            echo "::error::llvm-strip not found under $(rustc --print sysroot)/lib/rustlib/*/bin -- is the llvm-tools component installed?" >&2
-            exit 1
-          fi
-          # llvm-tools ships llvm-objcopy but NOT llvm-readelf, so verify the
-          # build-id by extracting the note section with objcopy and checking it
-          # is non-empty (an absent note extracts to a 0-byte file; verified on
-          # real ELF). objcopy writes a separate output, leaving the binary as-is.
-          llvm_objcopy="${llvm_strip%/*}/llvm-objcopy"
-          if [ ! -x "${llvm_objcopy}" ]; then
-            echo "::error::llvm-objcopy not found next to llvm-strip -- cannot verify build-id" >&2
-            exit 1
-          fi
-          echo "using ${llvm_strip}"
-          bindir="target/${{ matrix.target }}/release"
-          for bin in trawld trawl trawl-admin trawl-web fleet-admin; do
-            "${llvm_strip}" "${bindir}/${bin}"
-            rm -f build-id.note
-            "${llvm_objcopy}" -O binary --only-section=.note.gnu.build-id "${bindir}/${bin}" build-id.note 2>/dev/null || true
-            if [ ! -s build-id.note ]; then
-              echo "::error::${bin} (${{ matrix.target }}) has no GNU build-id note after strip -- minidumps would never symbolicate" >&2
-              exit 1
-            fi
-          done
-          rm -f build-id.note
-
-      - name: Build .deb packages with one runtime owner
-        run: |
-          python3 .release-tooling/scripts/release/package-debian.py --source . \
-            --binaries "target/${{ matrix.target }}/release" --runtime runtime \
-            --output "target/${{ matrix.target }}/debian" --target "${{ matrix.target }}"
-
-      - name: Create relocatable tarball
-        run: |
-          staging="trawl-${RELEASE_TAG}-${{ matrix.target }}"
-          python3 .release-tooling/scripts/release/distribution.py stage --source . \
-            --binaries "target/${{ matrix.target }}/release" --runtime runtime --output "$staging" \
-            --target "${{ matrix.target }}" --source-sha "$SOURCE_SHA" --tooling-sha "$TOOLING_SHA"
-          tar czf "${staging}.tar.gz" "$staging"
-          sha256sum "${staging}.tar.gz" > "${staging}.tar.gz.sha256"
-
-      - name: Upload tarball
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: dist-${{ matrix.target }}
-          path: |
-            trawl-*.tar.gz
-            trawl-*.tar.gz.sha256
-          if-no-files-found: error
-
-      - name: Upload .deb packages
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: deb-${{ matrix.target }}
-          path: target/${{ matrix.target }}/debian/*.deb
-          if-no-files-found: error
-
-      - name: Upload breakpad symbols
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: symbols-${{ matrix.target }}
-          path: symbols/
-          if-no-files-found: error
+    uses: ./.github/workflows/linux-distribution.yml
+    with:
+      source-sha: ${{ needs.resolve-source.outputs.sha }}
+      tooling-sha: ${{ github.sha }}
+      release-tag: ${{ needs.resolve-source.outputs.tag }}
 
   build-macos:
     needs: resolve-source
@@ -320,53 +125,6 @@ jobs:
     with:
       source-sha: ${{ needs.resolve-source.outputs.sha }}
       release-tag: ${{ needs.resolve-source.outputs.tag }}
-
-  verify-linux:
-    name: installed Linux artifacts (${{ matrix.target }})
-    needs: [resolve-source, build-linux]
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-          - runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-    runs-on: ${{ matrix.runner }}
-    env:
-      TARGET: ${{ matrix.target }}
-      SOURCE_SHA: ${{ needs.resolve-source.outputs.sha }}
-      TOOLING_SHA: ${{ github.sha }}
-      RELEASE_TAG: ${{ needs.resolve-source.outputs.tag }}
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-          sparse-checkout: scripts/release
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: dist-${{ matrix.target }}
-          path: incoming
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: deb-${{ matrix.target }}
-          path: debs
-      - name: Prepare native Debian verification environment
-        run: docker build -f scripts/release/Dockerfile.verify -t trawl-artifact-check scripts/release
-      - name: Relocate and verify tarball without network
-        run: |
-          (cd incoming && sha256sum -c ./*.sha256)
-          mkdir installed
-          tar xzf incoming/*.tar.gz -C installed --strip-components=1
-          docker run --rm --network none -v "$PWD:/verify:ro" -w /verify \
-            trawl-artifact-check python3 scripts/release/verify-distribution.py installed \
-            --target "$TARGET" --source-sha "$SOURCE_SHA" --tooling-sha "$TOOLING_SHA" \
-            --expected-version "${RELEASE_TAG#v}"
-      - name: Install and remove real Debian packages without network
-        run: |
-          docker run --rm --network none --cap-add SYS_PTRACE -v "$PWD:/verify:ro" -w /verify \
-            trawl-artifact-check bash scripts/release/test-installed-debian.sh debs
 
   release:
     name: github release
@@ -555,7 +313,7 @@ jobs:
     name: container image
     outputs:
       image-tag: ${{ needs.build-chart.outputs.image-tag }}
-    needs: [resolve-source, verify-linux, build-macos, build-docs, build-chart]
+    needs: [resolve-source, build-linux, build-macos, build-docs, build-chart]
     env:
       RELEASE_TAG: ${{ needs.resolve-source.outputs.tag }}
     runs-on: k8s-big
