@@ -9,17 +9,6 @@ use crossterm::event::{self, KeyCode, KeyModifiers};
 use super::super::state::Popup;
 use super::super::{App, MutationResult};
 
-/// Check if a saved query name matches `[a-zA-Z0-9_-]+`.
-///
-/// Mirrors the server-side validation in trawl-server's app-state store for immediate
-/// client-side feedback (the server still validates independently).
-fn is_valid_query_name(name: &str) -> bool {
-    !name.is_empty()
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-}
-
 impl App {
     /// Handle key events when a popup is open.
     #[allow(clippy::too_many_lines)] // Inherently large popup dispatch
@@ -219,18 +208,18 @@ impl App {
             // Confirm save: Enter
             (KeyModifiers::NONE, KeyCode::Enter) => {
                 if let Some(Popup::SaveQuery { ref editor }) = self.popup {
-                    let name = editor.text().trim().to_owned();
-                    if name.is_empty() {
-                        // Ignore empty names.
-                    } else if !is_valid_query_name(&name) {
-                        self.popup = Some(Popup::Error {
-                            message: "name must contain only letters, numbers, \
-                                      hyphens, and underscores"
-                                .to_string(),
-                        });
-                    } else {
-                        self.popup = None;
-                        self.save_current_query(name);
+                    let draft = editor.text();
+                    match trawl_core::saved_name::normalize(&draft) {
+                        Err(message) => {
+                            self.popup = Some(Popup::Error {
+                                message: message.to_owned(),
+                            });
+                        }
+                        Ok(name) => {
+                            let name = name.to_owned();
+                            self.popup = None;
+                            self.save_current_query(name);
+                        }
                     }
                 }
             }

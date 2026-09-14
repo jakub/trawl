@@ -32,7 +32,7 @@ pub enum StoreError {
 
     /// A saved query with this name already exists for this user (23505 on
     /// `saved_queries_key_name_unique`).
-    #[error("a saved query named '{name}' already exists")]
+    #[error("a saved query with this name already exists")]
     DuplicateName {
         /// The duplicate name.
         name: String,
@@ -99,7 +99,7 @@ pub enum StoreError {
     },
 
     /// Saved query name contains invalid characters.
-    #[error("invalid saved query name '{name}': must match [a-zA-Z0-9_-]+")]
+    #[error("name must not be blank or contain control characters")]
     InvalidName {
         /// The rejected name.
         name: String,

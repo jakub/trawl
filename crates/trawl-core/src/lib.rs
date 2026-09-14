@@ -81,3 +81,6 @@ pub mod stream;
 
 /// Build-time version metadata.
 pub mod version;
+
+/// Saved query display-name validation.
+pub mod saved_name;

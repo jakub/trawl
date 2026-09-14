@@ -304,7 +304,7 @@ pub(crate) async fn execute_scheduled_query(
     pool: ExecutorPool,
     run_id: i64,
     query: &str,
-    query_name: &str,
+    _query_name: &str,
     _max_rows: usize,
     timeout_secs: u64,
 ) {
@@ -345,8 +345,7 @@ pub(crate) async fn execute_scheduled_query(
             let row_count = query_result.rows.len();
 
             // Write result as parquet file.
-            let (result_path, result_data) =
-                write_result_parquet(&pool, run_id, query_name, &query_result);
+            let (result_path, result_data) = write_result_parquet(&pool, run_id, &query_result);
 
             finish_run_or_recover(
                 &schedule_store,
@@ -561,7 +560,7 @@ pub(crate) fn remove_result_file(base_dir: &str, relative: &str) -> bool {
     }
 }
 
-/// Write a `QueryResult` to a parquet file under `{data_dir}/scheduled/{name}/`.
+/// Write a `QueryResult` to a parquet file under `{data_dir}/scheduled/`, keyed only by the stable run ID.
 ///
 /// Returns `(Some(relative_path), None)` on success, or `(None, Some(blob))`
 /// as a zstd-JSON fallback if parquet writing fails.
@@ -582,7 +581,6 @@ pub(crate) fn remove_result_file(base_dir: &str, relative: &str) -> bool {
 fn write_result_parquet(
     pool: &ExecutorPool,
     run_id: i64,
-    query_name: &str,
     result: &trawl_api::value::QueryResult,
 ) -> (Option<String>, Option<Vec<u8>>) {
     if result.rows.is_empty() {
@@ -590,11 +588,11 @@ fn write_result_parquet(
     }
 
     let base = pool.base_dir().trim_end_matches('/');
-    let relative = format!("scheduled/{query_name}/run_{run_id}.parquet");
+    let relative = format!("scheduled/run_{run_id}.parquet");
     let full_path = format!("{base}/{relative}");
     let temp_path = format!("{full_path}.tmp");
 
-    if let Err(e) = std::fs::create_dir_all(format!("{base}/scheduled/{query_name}")) {
+    if let Err(e) = std::fs::create_dir_all(format!("{base}/scheduled")) {
         tracing::warn!(
             event_type = "scheduler_parquet_error",
             run_id,

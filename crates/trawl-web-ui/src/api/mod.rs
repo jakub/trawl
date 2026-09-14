@@ -215,7 +215,7 @@ pub async fn create_saved(name: &str, query: &str) -> Result<SavedQueryResponse,
             .await
             .map_err(|e| ApiError::Decode(e.to_string())),
         401 => Err(ApiError::Unauthorized),
-        s => Err(ApiError::Status(s)),
+        s => Err(saved_write_error(resp, s).await),
     }
 }
 
@@ -637,7 +637,7 @@ pub async fn update_saved_full(
             .await
             .map_err(|e| ApiError::Decode(e.to_string())),
         401 => Err(ApiError::Unauthorized),
-        s => Err(ApiError::Status(s)),
+        s => Err(saved_write_error(resp, s).await),
     }
 }
 
@@ -724,4 +724,27 @@ pub async fn cancel_query(id: u64) -> Result<trawl_api::CancelResponse, ApiError
             .map_err(|e| ApiError::Decode(e.to_string())),
         status => Err(server_error(&resp, status).await),
     }
+}
+
+/// Only expose the fixed messages for recognized name refusals. Other errors
+/// retain the status fallback rather than rendering arbitrary response text.
+async fn saved_write_error(resp: gloo_net::http::Response, status: u16) -> ApiError {
+    if matches!(status, 400 | 409)
+        && let Ok(body) = resp.json::<ErrorResponse>().await
+    {
+        let message = match (status, body.error.message.as_str()) {
+            (400, "name must not be blank or contain control characters") => {
+                "Name must not be blank or contain control characters."
+            }
+            (409, "a saved query with this name already exists") => {
+                "A net with this name already exists. Choose another name."
+            }
+            _ => return ApiError::Status(status),
+        };
+        return ApiError::Server {
+            status,
+            message: message.to_owned(),
+        };
+    }
+    ApiError::Status(status)
 }

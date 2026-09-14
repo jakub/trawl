@@ -1168,7 +1168,7 @@ Stores a named query. The DSL is admitted before it is stored.
 
 | Name | In | Type | Required | Description |
 |------|----|------|----------|-------------|
-| `name` | body | string | yes | Must match `[a-zA-Z0-9_-]+` and be unique for the key |
+| `name` | body | string | yes | Display name; outer whitespace is trimmed, blank names and control characters are rejected. Interior spacing, Unicode, and punctuation are preserved. Unique for the key, case-sensitive |
 | `query` | body | string | yes | The DSL query |
 
 **Request**
@@ -1191,7 +1191,7 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -H "Content-Type: applicatio
 |--------|------|------|
 | 400 | `parse_error` | The DSL does not parse |
 | 400 | `validation_error` | Semantic check failed |
-| 400 | `bad_request` | `name` does not match `[a-zA-Z0-9_-]+` |
+| 400 | `bad_request` | `name` is blank or contains control characters |
 | 409 | `bad_request` | The key already has a saved query with that name |
 
 ### Update a saved query

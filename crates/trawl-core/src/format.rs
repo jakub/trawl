@@ -436,13 +436,7 @@ fn format_extract(s: &crate::ast::ExtractStage, out: &mut String) {
 }
 
 fn format_from_saved(s: &FromSavedStage, out: &mut String) {
-    // Name needs quoting if it contains spaces or special chars.
-    if s.name.contains(' ') || s.name.contains('"') {
-        let escaped = s.name.replace('"', "\\\"");
-        let _ = write!(out, "from saved \"{escaped}\"");
-    } else {
-        let _ = write!(out, "from saved {}", s.name);
-    }
+    let _ = write!(out, "from saved {}", format_saved_name(&s.name));
     match s.run {
         SavedRunSelector::Latest => {} // default, don't emit
         SavedRunSelector::All => out.push_str(" run=all"),
@@ -579,6 +573,20 @@ fn format_literal(lit: &LiteralValue, ctx: ExprContext, out: &mut String) {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// Serialize a saved-query name in its DSL literal position.
+pub fn format_saved_name(name: &str) -> String {
+    use chumsky::Parser as _;
+    if crate::parser::primitives::plain_name()
+        .parse(name)
+        .into_result()
+        .is_ok()
+    {
+        name.to_owned()
+    } else {
+        format!("\"{}\"", escape_quoted(name))
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1213,5 +1221,36 @@ mod tests {
         | table `last`, `earliest`, `latest`
         "
         );
+    }
+}
+
+#[cfg(test)]
+mod saved_name_tests {
+    #[test]
+    fn names_round_trip() {
+        for name in [
+            "daily_report",
+            "daily-report",
+            "a  b",
+            "雪/報告",
+            "a\\b",
+            "a\"b",
+            "x | head 1 #",
+            "123",
+            "a\\",
+        ] {
+            let dsl = format!("| from saved {} run=42", super::format_saved_name(name));
+            let parsed = crate::parser::parse(&dsl).unwrap();
+            assert_eq!(parsed.from_saved_stage().unwrap().name, name, "{dsl}");
+            let formatted = super::format_query(&parsed);
+            assert_eq!(
+                crate::parser::parse(&formatted)
+                    .unwrap()
+                    .from_saved_stage()
+                    .unwrap()
+                    .name,
+                name
+            );
+        }
     }
 }

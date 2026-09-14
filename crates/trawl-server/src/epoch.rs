@@ -65,7 +65,7 @@ pub const SET_ASIDE_SUFFIX: &str = ".pre-schema-v2";
 /// epoch-1 stays exactly where they left it while epoch 2 goes beside it.
 pub const EPOCH_3_SET_ASIDE_SUFFIX: &str = ".pre-epoch-3";
 
-/// Report-run results under the data root (`scheduled/{name}/run_{id}.parquet`),
+/// Report-run results under the data root (`scheduled/run_{id}.parquet`),
 /// referenced by relative path from postgres `report_runs.result_path`.
 pub const REPORT_RUNS_DIR: &str = "scheduled";
 
@@ -277,7 +277,7 @@ fn epoch_2_branch(
 /// Move `{aside}/scheduled/` into the current data root.
 ///
 /// Report-run results are not epoch-1 event data: they are materialized
-/// query results whose *relative* path (`scheduled/{name}/run_{id}.parquet`)
+/// query results whose *relative* path (`scheduled/run_{id}.parquet`)
 /// is recorded in a live postgres `report_runs` row, and the cutover
 /// deliberately touches no postgres state. Setting them aside with the
 /// event tree would dangle every one of those rows, and each consumer

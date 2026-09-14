@@ -15,18 +15,11 @@ use super::schedule::{
 };
 use crate::report_window::validate_window_compatibility;
 
-/// Validate that a saved query name matches `[a-zA-Z0-9_-]+`.
-fn validate_name(name: &str) -> Result<(), StoreError> {
-    if name.is_empty()
-        || !name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-    {
-        return Err(StoreError::InvalidName {
-            name: name.to_owned(),
-        });
-    }
-    Ok(())
+/// Normalize the shared saved-query display name before storing it.
+fn validate_name(name: &str) -> Result<&str, StoreError> {
+    trawl_core::saved_name::normalize(name).map_err(|_| StoreError::InvalidName {
+        name: name.to_owned(),
+    })
 }
 
 /// A single saved query entry.
@@ -176,7 +169,7 @@ impl SavedQueryStore {
 
     /// Create a new saved query.
     ///
-    /// Returns `InvalidName` for names outside `[a-zA-Z0-9_-]+` and
+    /// Returns `InvalidName` for blank names or control characters and
     /// `DuplicateName` on the named unique constraint.
     pub async fn create(
         &self,
@@ -184,7 +177,7 @@ impl SavedQueryStore {
         name: &str,
         query: &str,
     ) -> Result<SavedQuery, StoreError> {
-        validate_name(name)?;
+        let name = validate_name(name)?;
 
         let row = sqlx::query(AssertSqlSafe(format!(
             "INSERT INTO saved_queries (key_id, name, query, created_at, updated_at)
@@ -250,9 +243,7 @@ impl SavedQueryStore {
         query: &str,
         name: Option<&str>,
     ) -> Result<SavedQuery, WindowWriteError> {
-        if let Some(n) = name {
-            validate_name(n)?;
-        }
+        let name = name.map(validate_name).transpose()?;
 
         let mut tx = self.pool.begin().await?;
 
