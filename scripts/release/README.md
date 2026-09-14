@@ -50,3 +50,11 @@ bash -n scripts/release/build-distribution.sh scripts/release/test-installed-deb
 These source-level tests do not replace the native Linux and macOS artifact
 jobs. macOS signing here is ad-hoc signing for a valid modified Mach-O image;
 it is not Apple Developer ID signing or notarization.
+
+Release publication prepares and validates the chart before any registry write.
+The image push consumes the same normalized Docker metadata as that chart.
+Helm then publishes the exact prebuilt, checksum-checked chart artifact; only
+successful image and chart publication permit GitHub release creation. Docs
+and APT publication follow the GitHub release. This ordering prevents an
+announcement before its registry channels exist. It is not a transaction
+across services: a later GitHub or Pages failure still requires a rerun.

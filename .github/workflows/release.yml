@@ -40,6 +40,69 @@ jobs:
           REQUESTED_TAG: ${{ inputs.tag }}
         run: python3 scripts/release/resolve-source.py "$EVENT_NAME" "$EVENT_REF" "$REQUESTED_TAG" >> "$GITHUB_OUTPUT"
 
+  build-chart:
+    name: prepare and validate release chart
+    needs: resolve-source
+    runs-on: k8s-small
+    permissions:
+      contents: read
+    env:
+      RELEASE_TAG: ${{ needs.resolve-source.outputs.tag }}
+    outputs:
+      image-tag: ${{ steps.meta.outputs.version }}
+      image-tags: ${{ steps.meta.outputs.tags }}
+      image-labels: ${{ steps.meta.outputs.labels }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.resolve-source.outputs.sha }}
+          persist-credentials: false
+
+      # Metadata normalization and chart construction finish before any
+      # registry write. Docker consumes these exact tags and labels later.
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          labels: |
+            org.opencontainers.image.revision=${{ needs.resolve-source.outputs.sha }}
+          tags: |
+            type=semver,pattern={{version}},value=${{ env.RELEASE_TAG }}
+            type=raw,value=latest
+
+      - name: Load chart packager from workflow source
+        env:
+          WORKFLOW_SHA: ${{ github.sha }}
+        run: |
+          git fetch --no-tags --depth=1 origin "$WORKFLOW_SHA"
+          git show "${WORKFLOW_SHA}:scripts/release/package-chart.sh" > "$RUNNER_TEMP/package-chart.sh"
+
+      - name: Install Helm
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
+
+      - name: Package and validate selected chart
+        env:
+          IMAGE_TAG: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir chart-artifact
+          bash "$RUNNER_TEMP/package-chart.sh" "$RELEASE_TAG" "$IMAGE_TAG" chart/trawl chart-artifact
+          helm lint chart-artifact/trawl-*.tgz --strict \
+            --set auth.database.existingSecret=fleet-db \
+            --set storage.database.existingSecret=trawl-db --set web.enabled=false
+          helm template release-proof chart-artifact/trawl-*.tgz \
+            --set auth.database.existingSecret=fleet-db \
+            --set storage.database.existingSecret=trawl-db --set web.enabled=false >/dev/null
+          (cd chart-artifact && sha256sum ./*.tgz > SHA256SUMS)
+
+      - name: Keep the exact validated chart
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-chart
+          path: chart-artifact/
+          if-no-files-found: error
+
   build-linux:
     needs: resolve-source
     name: build (${{ matrix.target }})
@@ -307,7 +370,7 @@ jobs:
 
   release:
     name: github release
-    needs: [resolve-source, verify-linux, build-macos, build-docs]
+    needs: [resolve-source, docker, publish-helm]
     env:
       RELEASE_TAG: ${{ needs.resolve-source.outputs.tag }}
     runs-on: k8s-small
@@ -491,8 +554,8 @@ jobs:
   docker:
     name: container image
     outputs:
-      image-tag: ${{ steps.meta.outputs.version }}
-    needs: [resolve-source, verify-linux, build-macos, build-docs]
+      image-tag: ${{ needs.build-chart.outputs.image-tag }}
+    needs: [resolve-source, verify-linux, build-macos, build-docs, build-chart]
     env:
       RELEASE_TAG: ${{ needs.resolve-source.outputs.tag }}
     runs-on: k8s-big
@@ -528,54 +591,35 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Docker metadata
-        id: meta
-        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
-        with:
-          images: ghcr.io/${{ github.repository }}
-          labels: |
-            org.opencontainers.image.revision=${{ needs.resolve-source.outputs.sha }}
-          tags: |
-            type=semver,pattern={{version}},value=${{ env.RELEASE_TAG }}
-            type=raw,value=latest
-
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ needs.build-chart.outputs.image-tags }}
+          labels: ${{ needs.build-chart.outputs.image-labels }}
 
-  helm-package:
-    name: helm chart
-    needs: [resolve-source, docker]
-    env:
-      RELEASE_TAG: ${{ needs.resolve-source.outputs.tag }}
+  publish-helm:
+    name: publish validated Helm chart
+    needs: [build-chart, docker]
     runs-on: k8s-small
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Download the validated chart artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          ref: ${{ needs.resolve-source.outputs.sha }}
+          name: release-chart
+          path: chart-artifact
 
-      # Packaging tooling can postdate the requested product tag.
-      - name: Load chart packager from workflow source
-        env:
-          WORKFLOW_SHA: ${{ github.sha }}
-        run: |
-          git fetch --no-tags --depth=1 origin "$WORKFLOW_SHA"
-          git show "${WORKFLOW_SHA}:scripts/release/package-chart.sh" > "$RUNNER_TEMP/package-chart.sh"
+      - name: Verify the chart bytes before publication
+        run: (cd chart-artifact && sha256sum -c SHA256SUMS)
 
       - name: Install Helm
         uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
 
       - name: Login to GHCR for Helm
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io --username ${{ github.actor }} --password-stdin
-
-      - name: Package and push chart
         env:
-          VERSION: ${{ env.RELEASE_TAG }}
-          IMAGE_TAG: ${{ needs.docker.outputs.image-tag }}
-        run: |
-          bash "$RUNNER_TEMP/package-chart.sh" "${VERSION}" "${IMAGE_TAG}" chart/trawl .
-          helm push trawl-*.tgz oci://ghcr.io/${{ github.repository_owner }}/charts
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GHCR_TOKEN" | helm registry login ghcr.io --username ${{ github.actor }} --password-stdin
+
+      - name: Publish the exact prebuilt chart
+        run: helm push chart-artifact/trawl-*.tgz oci://ghcr.io/${{ github.repository_owner }}/charts

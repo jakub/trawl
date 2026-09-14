@@ -51,6 +51,8 @@ jobs:
           persist-credentials: false
       - name: Install Debian package test tooling
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends dpkg-dev
+      # Publication DAG tests use Helm's YAML parser, avoiding another YAML dependency.
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
       - run: python3 -m unittest discover -s scripts/release -p 'test_*.py' -v
 
   helm-template:
