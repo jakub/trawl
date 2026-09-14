@@ -567,6 +567,22 @@ async fn admitted_lock_and_fatal_watcher_cover_store_reconciliation() {
 }
 
 #[tokio::test]
+async fn interrupted_epoch_publication_starts_and_restarts() {
+    let fixture = Fixture::new().await;
+    fixture.current_fleet().await;
+    std::fs::create_dir_all(fixture.data()).unwrap();
+    std::fs::write(fixture.data().join("EPOCH.next.123"), b"3").unwrap();
+    for _ in 0..2 {
+        let mut daemon = fixture.spawn();
+        daemon.ready().await;
+        daemon.stop().await;
+        fixture.assert_lock_free().await;
+        assert_eq!(std::fs::read(fixture.data().join("EPOCH")).unwrap(), b"3\n");
+        assert!(!fixture.data().join("EPOCH.next.123").exists());
+    }
+}
+
+#[tokio::test]
 async fn fresh_boot_restart_and_interrupted_current_cutover() {
     let fixture = Fixture::new().await;
     fixture.current_fleet().await;

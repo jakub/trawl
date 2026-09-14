@@ -5,8 +5,10 @@
 //! Current storage-format gate. No storage conversion runs at startup.
 //!
 //! Owned roots require `EPOCH = 3`. A missing or empty root can be initialized;
-//! a nonempty root without its marker must be restored from a complete current
-//! backup or replaced with a new empty root selected by the operator.
+//! an interrupted initial marker write can be retried on an otherwise empty
+//! owned root. Any other nonempty root without its marker must be restored
+//! from a complete current backup or replaced with a new empty root selected
+//! by the operator.
 //! Query-only nodes can also read unversioned generic archives without Trawl
 //! ownership markers. They never initialize those archives or inspect unused WAL.
 //! An explicit incompatible epoch refuses in every mode.
@@ -15,6 +17,7 @@
 //! directories, so it cannot change EPOCH. Recovery still finishes before
 //! readers or conformance inspect the corpus.
 
+use std::io::{Read as _, Write as _};
 use std::path::Path;
 
 /// The current storage epoch, written to `data/EPOCH`.
@@ -93,6 +96,7 @@ pub fn ensure_current_epoch(
         .map_err(|e| format!("failed to inspect data root {}: {e}", data_root.display()))?;
     let mut empty = true;
     let mut owned = false;
+    let mut staged_epochs = Vec::new();
     for entry in entries {
         let entry = entry
             .map_err(|e| format!("failed to inspect data root {}: {e}", data_root.display()))?;
@@ -100,17 +104,31 @@ pub fn ensure_current_epoch(
         // than treating metadata failure as an unowned generic archive.
         let meta = std::fs::metadata(entry.path())
             .map_err(|e| format!("failed to inspect {}: {e}", entry.path().display()))?;
-        empty = false;
         let name = entry.file_name();
         let name = name.to_string_lossy();
         owned |= matches!(name.as_ref(), "wal" | "CATALOG" | "REPIN" | "scheduled")
             || name.starts_with("EPOCH.next.")
             || (meta.is_dir() && is_date_partition(&name));
+        // A PID name alone is not authority to discard an entry. An initial
+        // publication can leave only a regular file containing a prefix of
+        // the current marker, including zero bytes before its first write.
+        if ingest_enabled && is_staged_epoch(&entry)? {
+            staged_epochs.push(entry.path());
+        } else {
+            empty = false;
+        }
     }
     if !ingest_enabled && !owned {
         return Ok(Outcome::ReadOnlyArchive);
     }
-    if empty {
+    if ingest_enabled && empty {
+        // Inspect the entire root and WAL before removing any staging file.
+        // A crash during cleanup leaves either valid staging or an empty
+        // directory; both can be retried. Unlinking never follows a symlink.
+        for staged in staged_epochs {
+            std::fs::remove_file(&staged)
+                .map_err(|e| format!("failed to remove {}: {e}", staged.display()))?;
+        }
         publish_epoch(data_root)?;
         return Ok(Outcome::InitializedEmpty);
     }
@@ -121,6 +139,40 @@ pub fn ensure_current_epoch(
          ingest disabled and must not contain Trawl ownership markers",
         data_root.display()
     ))
+}
+
+/// Recognize only names and bytes an interrupted current publication writes.
+fn is_staged_epoch(entry: &std::fs::DirEntry) -> Result<bool, String> {
+    let name = entry.file_name();
+    let Some(pid) = name
+        .to_str()
+        .and_then(|name| name.strip_prefix("EPOCH.next."))
+    else {
+        return Ok(false);
+    };
+    if !pid
+        .parse::<u32>()
+        .is_ok_and(|value| value > 0 && value.to_string() == pid)
+    {
+        return Ok(false);
+    }
+    let kind = entry
+        .file_type()
+        .map_err(|e| format!("failed to inspect {}: {e}", entry.path().display()))?;
+    if !kind.is_file() {
+        return Ok(false);
+    }
+    let body = format!("{CURRENT_EPOCH}\n");
+    let mut bytes = Vec::new();
+    std::fs::File::open(entry.path())
+        .and_then(|file| file.take(body.len() as u64 + 1).read_to_end(&mut bytes))
+        .map_err(|e| {
+            format!(
+                "failed to read staged epoch {}: {e}",
+                entry.path().display()
+            )
+        })?;
+    Ok(body.as_bytes().starts_with(&bytes))
 }
 
 /// Preserve read errors, including dangling symlinks. Only a genuinely absent
@@ -173,7 +225,19 @@ fn is_date_partition(name: &str) -> bool {
 }
 
 fn publish_epoch(data_root: &Path) -> Result<(), String> {
-    publish_marker_staged(data_root, EPOCH_FILE, &format!("{CURRENT_EPOCH}\n"))
+    let staged = data_root.join(format!("EPOCH.next.{}", std::process::id()));
+    // Admission removed only proven initial-publication remnants. Exclusive
+    // creation refuses any replacement entry, including a symlink, instead
+    // of truncating or following it. Keep the same handle through fsync.
+    let mut file = std::fs::File::create_new(&staged)
+        .map_err(|e| format!("failed to create {}: {e}", staged.display()))?;
+    file.write_all(format!("{CURRENT_EPOCH}\n").as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(|e| format!("failed to write and fsync {}: {e}", staged.display()))?;
+    std::fs::rename(&staged, data_root.join(EPOCH_FILE))
+        .map_err(|e| format!("failed to publish epoch in {}: {e}", data_root.display()))?;
+    fsync_dir_best_effort(data_root);
+    Ok(())
 }
 
 /// Publish a small marker file into a directory via the staged-write
@@ -181,11 +245,10 @@ fn publish_epoch(data_root: &Path) -> Result<(), String> {
 /// rename → dir fsync. A crash can then never publish a half-written
 /// marker — every reader sees either the previous content or the new one.
 ///
-/// This is the one implementation of that sequence: the epoch marker
-/// ([`EPOCH_FILE`]), the catalog identity marker
-/// (`catalog::conform::publish_marker`) and the repin marker
-/// (`repin::marker::write_marker`) all publish through it, so a future
-/// hardening of the sequence lands on all three at once.
+/// The catalog identity marker (`catalog::conform::publish_marker`) and the
+/// repin marker (`repin::marker::write_marker`) publish through this helper.
+/// Initial epoch publication uses exclusive staging creation in
+/// [`publish_epoch`] after admission validates any interrupted initial write.
 ///
 /// The staged name is PID-unique: concurrent publishers (test harnesses
 /// share a fixture corpus) must not clobber each other's staged file
@@ -286,6 +349,127 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_epoch_publication_retries_then_restarts() {
+        for content in [b"".as_slice(), b"3", b"3\n"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let data = tmp.path().join("data");
+            std::fs::create_dir(&data).unwrap();
+            for pid in [123, std::process::id()] {
+                std::fs::write(data.join(format!("EPOCH.next.{pid}")), content).unwrap();
+            }
+            assert_eq!(
+                ensure_current_epoch(&data, &data.join("wal"), true).unwrap(),
+                Outcome::InitializedEmpty
+            );
+            assert_eq!(std::fs::read(data.join(EPOCH_FILE)).unwrap(), b"3\n");
+            assert_eq!(std::fs::read_dir(&data).unwrap().count(), 1);
+            let before = snapshot(tmp.path());
+            assert_eq!(
+                ensure_current_epoch(&data, &data.join("wal"), true).unwrap(),
+                Outcome::Current
+            );
+            assert_eq!(snapshot(tmp.path()), before);
+        }
+    }
+
+    #[test]
+    fn staging_files_never_admit_mixed_or_query_only_roots() {
+        for extra in [
+            None,
+            Some("notes.txt"),
+            Some("prod/events.parquet"),
+            Some("wal/prod/batch.ndjson"),
+        ] {
+            for ingest in [false, true] {
+                if extra.is_none() && ingest {
+                    continue;
+                }
+                let tmp = tempfile::tempdir().unwrap();
+                let data = tmp.path().join("data");
+                std::fs::create_dir(&data).unwrap();
+                std::fs::write(data.join("EPOCH.next.123"), b"3\n").unwrap();
+                if let Some(extra) = extra {
+                    let path = data.join(extra);
+                    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    std::fs::write(path, b"preserve").unwrap();
+                }
+                let before = snapshot(tmp.path());
+                assert!(ensure_current_epoch(&data, &data.join("wal"), ingest).is_err());
+                assert_eq!(snapshot(tmp.path()), before);
+            }
+        }
+    }
+
+    #[test]
+    fn staging_retry_requires_current_bytes_and_generated_name() {
+        for (name, content) in [
+            ("EPOCH.next.123", "2\n"),
+            ("EPOCH.next.123", "garbage"),
+            ("EPOCH.next.123", "3\nextra"),
+            ("EPOCH.next.123", " 3\n"),
+            ("EPOCH.next.", "3\n"),
+            ("EPOCH.next.backup", "3\n"),
+            ("EPOCH.next.0", "3\n"),
+            ("EPOCH.next.0123", "3\n"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let data = tmp.path().join("data");
+            std::fs::create_dir(&data).unwrap();
+            std::fs::write(data.join("EPOCH.next.456"), b"3\n").unwrap();
+            std::fs::write(data.join(name), content).unwrap();
+            let before = snapshot(tmp.path());
+            assert!(
+                ensure_current_epoch(&data, &data.join("wal"), true).is_err(),
+                "{name}: {content:?}"
+            );
+            assert_eq!(snapshot(tmp.path()), before);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_epoch_symlinks_and_directories_are_never_retried() {
+        use std::os::unix::fs::symlink;
+        for kind in ["symlink", "dangling", "directory"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let data = tmp.path().join("data");
+            std::fs::create_dir(&data).unwrap();
+            let target = tmp.path().join("target");
+            std::fs::write(&target, b"3\n").unwrap();
+            let stage = data.join(format!("EPOCH.next.{}", std::process::id()));
+            match kind {
+                "directory" => std::fs::create_dir(&stage).unwrap(),
+                "dangling" => symlink(tmp.path().join("absent"), &stage).unwrap(),
+                _ => symlink(&target, &stage).unwrap(),
+            }
+            std::fs::write(data.join("EPOCH.next.123"), b"3\n").unwrap();
+            for ingest in [false, true] {
+                assert!(ensure_current_epoch(&data, &data.join("wal"), ingest).is_err());
+                assert!(std::fs::symlink_metadata(&stage).is_ok());
+                assert_eq!(std::fs::read(&target).unwrap(), b"3\n");
+                assert!(!data.join(EPOCH_FILE).exists());
+                assert!(data.join("EPOCH.next.123").exists());
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn epoch_publication_refuses_a_replacement_staging_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staged = tmp
+            .path()
+            .join(format!("EPOCH.next.{}", std::process::id()));
+        let target = tmp.path().join("target");
+        std::fs::write(&target, b"preserve").unwrap();
+        std::os::unix::fs::symlink(&target, &staged).unwrap();
+        assert!(publish_epoch(tmp.path()).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"preserve");
+        assert!(std::fs::symlink_metadata(&staged).unwrap().is_symlink());
+        assert!(!tmp.path().join(EPOCH_FILE).exists());
+    }
+
+    #[test]
     fn explicit_noncurrent_epochs_refuse_in_every_mode_without_mutation() {
         for content in ["1\n", "2\n", "4\n", "", "3 extra", "garbage"] {
             for ingest in [false, true] {
@@ -328,7 +512,7 @@ mod tests {
 
     #[test]
     fn flat_wal_refuses_before_fresh_empty_or_current_root_mutation() {
-        for root_state in ["missing", "empty", "current"] {
+        for root_state in ["missing", "empty", "staged", "current"] {
             for internal in [false, true] {
                 let tmp = tempfile::tempdir().unwrap();
                 let data = tmp.path().join("data");
@@ -337,6 +521,9 @@ mod tests {
                 }
                 if root_state == "current" {
                     std::fs::write(data.join(EPOCH_FILE), "3\n").unwrap();
+                }
+                if root_state == "staged" {
+                    std::fs::write(data.join("EPOCH.next.123"), "3\n").unwrap();
                 }
                 let wal = if internal {
                     data.join("wal")
