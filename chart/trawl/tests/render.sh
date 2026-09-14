@@ -14,6 +14,7 @@ render_only() {
     --set auth.database.existingSecret=fleet-db \
     --set storage.database.existingSecret=trawl-db \
     --set web.enabled=false \
+    --set-string image.tag=source-render-test \
     "$@"
 }
 
@@ -264,6 +265,7 @@ if grep -Fq 'public_origins' "$raw_config"; then
   exit 1
 fi
 
+python3 "$chart/tests/image.py"
 python3 "$chart/tests/notes.py"
 
 echo "helm render assertions passed"

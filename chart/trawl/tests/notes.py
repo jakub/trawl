@@ -22,6 +22,7 @@ def render(**settings):
         "auth.database.existingSecret": "fleet-db",
         "storage.database.existingSecret": "trawl-db",
         "web.enabled": "false",
+        "image.tag": "source-render-test",
     }
     values.update(settings)
     # Helm 3 install --dry-run=client still checks cluster reachability. Use

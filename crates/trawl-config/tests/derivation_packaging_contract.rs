@@ -110,6 +110,7 @@ fn chart_defaults(key: &str, values_key: &str) -> Vec<String> {
         .args(["template", "trawl"])
         .arg(&chart)
         .args(["--show-only", "templates/configmap.yaml"])
+        .args(["--set-string", "image.tag=source-render-test"])
         // Both DSN Secrets are `required`; the names are irrelevant here.
         .args(["--set", "auth.database.existingSecret=test-fleet-dsn"])
         .args(["--set", "storage.database.existingSecret=test-trawl-dsn"])

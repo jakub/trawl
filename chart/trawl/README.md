@@ -35,12 +35,23 @@ fails without it. Set `web.enabled=false` for an API-only install.
 [Install with Helm](https://trawl.sh/operate/deployment/#install-with-helm)
 covers a values file, an ingress with an HTTPS origin, and verification.
 
+## Install from a source checkout
+
+A source chart requires `image.tag`. Select an image built from the same Git
+revision as the checkout and pass `--set-string image.tag="$TRAWL_IMAGE_TAG"`
+when replacing the OCI chart reference above with `./chart/trawl`. Helm cannot
+verify the image's source revision; check the release or development build
+record. Source `Chart.yaml` versions do not select an image.
+
+Published release packages set `image.tag` to their matching release image,
+so the OCI installation above needs no image override.
+
 ## Values
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `image.repository` | string | `ghcr.io/jakub/trawl` | Container image repository |
-| `image.tag` | string | `""` | Image tag. Empty uses the chart `appVersion` |
+| `image.tag` | string | `""` in source; release version in packages | Required image tag, built from the same revision as the chart |
 | `image.pullPolicy` | string | `IfNotPresent` | Image pull policy |
 | `imagePullSecrets` | list | `[]` | Pull secrets for the pod |
 | `nameOverride` | string | `""` | Replaces the chart name in resource names |

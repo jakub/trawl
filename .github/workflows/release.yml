@@ -445,6 +445,8 @@ jobs:
 
   docker:
     name: container image
+    outputs:
+      image-tag: ${{ steps.meta.outputs.version }}
     needs: [resolve-source, build-linux]
     env:
       RELEASE_TAG: ${{ needs.resolve-source.outputs.tag }}
@@ -525,7 +527,7 @@ jobs:
       - name: Package and push chart
         env:
           VERSION: ${{ env.RELEASE_TAG }}
+          IMAGE_TAG: ${{ needs.docker.outputs.image-tag }}
         run: |
-          version="${VERSION#v}"
-          helm package chart/trawl --version "${version}" --app-version "${version}"
+          bash scripts/release/package-chart.sh "${VERSION}" "${IMAGE_TAG}" .
           helm push trawl-*.tgz oci://ghcr.io/${{ github.repository_owner }}/charts

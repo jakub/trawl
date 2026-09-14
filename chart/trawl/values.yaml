@@ -7,7 +7,8 @@
 
 image:
   repository: ghcr.io/jakub/trawl
-  # Defaults to the chart appVersion when empty.
+  # Required for source checkouts: use an image built from the same revision.
+  # Release packaging sets this to the matching release image tag.
   tag: ""
   pullPolicy: IfNotPresent
 
