@@ -24,6 +24,8 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
+      - name: Install collector TLS test tooling
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends openssl
       - name: Validate and exercise the Debian collector with Vector 0.57.0
         shell: bash
         run: |
