@@ -16,6 +16,9 @@ the `trawl` CLI alone. A server installation has these parts:
 | `trawl-admin` | Self-signed TLS certificate generation |
 | PostgreSQL | The Fleet keystore and the Trawl app-state database |
 
+Run the command blocks on this page in Bash. On macOS, run `bash` to start it
+before pasting the commands.
+
 ## Install from APT on Debian or Ubuntu
 
 `trawl-cli` installs `trawl`. `trawl-server` installs `trawld`, `trawl-web`,
@@ -65,6 +68,12 @@ esac
 TRAWL_ARCHIVE="trawl-$TRAWL_RELEASE-$TRAWL_TARGET"
 curl --fail --location --output "$TRAWL_ARCHIVE.tar.gz" \
   "https://github.com/jakub/trawl/releases/download/$TRAWL_RELEASE/$TRAWL_ARCHIVE.tar.gz"
+curl --fail --location --output "$TRAWL_ARCHIVE.tar.gz.sha256" \
+  "https://github.com/jakub/trawl/releases/download/$TRAWL_RELEASE/$TRAWL_ARCHIVE.tar.gz.sha256"
+case "$(uname -s)" in
+  Linux) sha256sum --check "$TRAWL_ARCHIVE.tar.gz.sha256" || exit 1 ;;
+  Darwin) shasum -a 256 --check "$TRAWL_ARCHIVE.tar.gz.sha256" || exit 1 ;;
+esac
 tar -xzf "$TRAWL_ARCHIVE.tar.gz"
 sudo install -d /usr/local/bin /usr/local/lib/trawl
 sudo install -m 0755 "$TRAWL_ARCHIVE"/bin/* /usr/local/bin/
@@ -97,7 +106,8 @@ On Linux, build the server, browser, and CLI:
 git clone https://github.com/jakub/trawl.git
 cd trawl
 TRAWL_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
-env -u NO_COLOR cargo xtask build-web --release
+(cd crates/trawl-web-ui && env -u NO_COLOR trunk build --release)
+cargo xtask compress-web
 bash scripts/release/build-distribution.sh "$PWD" "$TRAWL_TARGET" "$PWD/target/duckdb-runtime"
 python3 scripts/release/distribution.py stage --source . \
   --binaries "target/$TRAWL_TARGET/release" --runtime target/duckdb-runtime \
@@ -110,11 +120,26 @@ sudo install -m 0644 target/package/lib/trawl/* /usr/local/lib/trawl/
 trawl --version
 ```
 
-On macOS, use the same checkout and host-target selection, skip the browser
-build, and append `--cli-only` to both the build helper and the `stage` command.
-The helper uses native Cargo on macOS. Packaged macOS binaries require macOS 15
-or newer. The resulting `bin/trawl` locates its library relative to itself;
-no `LD_LIBRARY_PATH` or `DYLD_LIBRARY_PATH` setting is needed.
+On macOS 15 or newer, build the CLI with native Cargo:
+
+```bash
+git clone https://github.com/jakub/trawl.git
+cd trawl
+TRAWL_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
+bash scripts/release/build-distribution.sh "$PWD" "$TRAWL_TARGET" "$PWD/target/duckdb-runtime" --cli-only
+python3 scripts/release/distribution.py stage --source . \
+  --binaries "target/$TRAWL_TARGET/release" --runtime target/duckdb-runtime \
+  --output target/package --target "$TRAWL_TARGET" \
+  --source-sha "$(git rev-parse HEAD)" --tooling-sha "$(git rev-parse HEAD)" --cli-only
+python3 scripts/release/smoke-cli.py target/package/bin/trawl scripts/release/fixtures/cli.parquet
+sudo install -d /usr/local/bin /usr/local/lib/trawl
+sudo install -m 0755 target/package/bin/trawl /usr/local/bin/
+sudo install -m 0644 target/package/lib/trawl/libduckdb.dylib /usr/local/lib/trawl/
+trawl --version
+```
+
+The resulting `bin/trawl` locates its library relative to itself. Neither
+platform needs a `LD_LIBRARY_PATH` or `DYLD_LIBRARY_PATH` setting.
 
 Expect the version from `Cargo.toml`. A staging destination must not already
 exist; select a new `--output` path for another build. Do not copy only the

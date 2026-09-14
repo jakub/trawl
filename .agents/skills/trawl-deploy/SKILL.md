@@ -13,22 +13,29 @@ deployment, use its declared source and existing authorized workflow.
 
 ## Prepare the artifact
 
-Prefer the requested version or image digest. For source builds, use
-`env -u NO_COLOR cargo xtask build-web --release` to build and precompress the
-SPA before embedding it in `trawl-web`. Plain `cargo build --release` omits that sequence
-and does not build every distribution binary. Unset `NO_COLOR` because the
-installed Trunk rejects its inherited value of `1`.
+Prefer the requested version or image digest. For a Linux source distribution,
+build the SPA with `(cd crates/trawl-web-ui && env -u NO_COLOR trunk build --release)`,
+then run `cargo xtask compress-web` before compiling `trawl-web`. Unset
+`NO_COLOR` because Trunk rejects its inherited value of `1`. Use the
+[distribution helpers](../../../scripts/release/README.md) for the native or
+cross-target binaries and their checksum-verified DuckDB runtime. Plain
+`cargo build --release` does not prepare a complete distribution.
 
 Read only the channel's build and installation owners:
 
 | Channel | Owners |
 | --- | --- |
-| Release binaries and Debian packages | [release.yml](../../../.github/workflows/release.yml), `crates/trawl-server/Cargo.toml`, and `crates/trawl-server/debian/` |
+| Release binaries and Debian packages | [release.yml](../../../.github/workflows/release.yml), [distribution helpers](../../../scripts/release/README.md), `crates/trawl-cli/Cargo.toml`, `crates/trawl-server/Cargo.toml`, and `crates/trawl-server/debian/` |
+| macOS CLI | [macos-cli.yml](../../../.github/workflows/macos-cli.yml) and [distribution helpers](../../../scripts/release/README.md) |
 | Container and Helm | [Dockerfile](../../../Dockerfile), [chart README](../../../chart/trawl/README.md), `chart/trawl/values.yaml`, and `chart/trawl/templates/` |
 
-The Dockerfile consumes prebuilt `docker-ctx/${TARGETARCH}` binaries; it is
-not a source builder. Follow the release workflow for the complete binary set,
-architecture, and symbols. Do not invent an independent packaging recipe.
+The Dockerfile consumes the staged `docker-ctx/${TARGETARCH}/bin/` and
+`lib/trawl/` layout, licenses, and `distribution.json`; it is not a source
+builder. Keep the binaries and runtime together. The `trawl-runtime` Debian
+package owns the private library; CLI and server packages require its exact
+version. Follow the release workflow for the complete binary set,
+architecture, and symbols. Native macOS execution is required to verify a
+macOS artifact; a Linux cross-build does not establish that evidence.
 
 ## Prepare and apply the change
 
