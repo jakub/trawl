@@ -1,0 +1,243 @@
+{
+    "apiVersion": "v1",
+    "items": [
+        {
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {
+                "annotations": {
+                    "node.alpha.kubernetes.io/ttl": "0",
+                    "volumes.kubernetes.io/controller-managed-attach-detach": "true"
+                },
+                "creationTimestamp": "2026-09-14T03:46:35Z",
+                "labels": {
+                    "beta.kubernetes.io/arch": "amd64",
+                    "beta.kubernetes.io/os": "linux",
+                    "kubernetes.io/arch": "amd64",
+                    "kubernetes.io/hostname": "trawl-l06-cert-manager-control-plane",
+                    "kubernetes.io/os": "linux",
+                    "node-role.kubernetes.io/control-plane": ""
+                },
+                "name": "trawl-l06-cert-manager-control-plane",
+                "resourceVersion": "696",
+                "uid": "5fedbd6e-82f5-49ca-9d56-ac80990a2fd9"
+            },
+            "spec": {
+                "podCIDR": "10.244.0.0/24",
+                "podCIDRs": [
+                    "10.244.0.0/24"
+                ],
+                "providerID": "kind://docker/trawl-l06-cert-manager/trawl-l06-cert-manager-control-plane"
+            },
+            "status": {
+                "addresses": [
+                    {
+                        "address": "172.20.0.2",
+                        "type": "InternalIP"
+                    },
+                    {
+                        "address": "trawl-l06-cert-manager-control-plane",
+                        "type": "Hostname"
+                    }
+                ],
+                "allocatable": {
+                    "cpu": "16",
+                    "ephemeral-storage": "951803Mi",
+                    "hugepages-1Gi": "0",
+                    "hugepages-2Mi": "0",
+                    "memory": "32560504Ki",
+                    "pods": "110"
+                },
+                "capacity": {
+                    "cpu": "16",
+                    "ephemeral-storage": "951803Mi",
+                    "hugepages-1Gi": "0",
+                    "hugepages-2Mi": "0",
+                    "memory": "32560504Ki",
+                    "pods": "110"
+                },
+                "conditions": [
+                    {
+                        "lastHeartbeatTime": "2026-09-14T03:47:38Z",
+                        "lastTransitionTime": "2026-09-14T03:46:35Z",
+                        "message": "kubelet has sufficient memory available",
+                        "reason": "KubeletHasSufficientMemory",
+                        "status": "False",
+                        "type": "MemoryPressure"
+                    },
+                    {
+                        "lastHeartbeatTime": "2026-09-14T03:47:38Z",
+                        "lastTransitionTime": "2026-09-14T03:46:35Z",
+                        "message": "kubelet has no disk pressure",
+                        "reason": "KubeletHasNoDiskPressure",
+                        "status": "False",
+                        "type": "DiskPressure"
+                    },
+                    {
+                        "lastHeartbeatTime": "2026-09-14T03:47:38Z",
+                        "lastTransitionTime": "2026-09-14T03:46:35Z",
+                        "message": "kubelet has sufficient PID available",
+                        "reason": "KubeletHasSufficientPID",
+                        "status": "False",
+                        "type": "PIDPressure"
+                    },
+                    {
+                        "lastHeartbeatTime": "2026-09-14T03:47:38Z",
+                        "lastTransitionTime": "2026-09-14T03:46:54Z",
+                        "message": "kubelet is posting ready status",
+                        "reason": "KubeletReady",
+                        "status": "True",
+                        "type": "Ready"
+                    }
+                ],
+                "daemonEndpoints": {
+                    "kubeletEndpoint": {
+                        "Port": 10250
+                    }
+                },
+                "declaredFeatures": [
+                    "ExtendWebSocketsToKubelet",
+                    "InPlacePodLevelResourcesVerticalScaling",
+                    "InPlacePodVerticalScalingInitContainers",
+                    "RestartAllContainersOnContainerExits"
+                ],
+                "features": {
+                    "supplementalGroupsPolicy": true
+                },
+                "images": [
+                    {
+                        "names": [
+                            "docker.io/library/import-2026-08-26@sha256:2123d119ca32eb19622df2e6279e27bc028d2c33d0e4afb46f197ca134e5f687",
+                            "registry.k8s.io/kube-apiserver-amd64:v1.36.4",
+                            "registry.k8s.io/kube-apiserver:v1.36.4"
+                        ],
+                        "sizeBytes": 96820468
+                    },
+                    {
+                        "names": [
+                            "docker.io/library/import-2026-08-26@sha256:5d1180ec5fa02cc8ffe2244491197efc92b5afe8637dbd2267cdb3a2102cde9c",
+                            "registry.k8s.io/kube-controller-manager-amd64:v1.36.4",
+                            "registry.k8s.io/kube-controller-manager:v1.36.4"
+                        ],
+                        "sizeBytes": 85995229
+                    },
+                    {
+                        "names": [
+                            "docker.io/library/import-2026-08-26@sha256:306a0415be3708a014f45abffffdffbf23c3625029b7b7b35c310b801205512a",
+                            "registry.k8s.io/kube-proxy-amd64:v1.36.4",
+                            "registry.k8s.io/kube-proxy:v1.36.4"
+                        ],
+                        "sizeBytes": 81709149
+                    },
+                    {
+                        "names": [
+                            "docker.io/library/import-2026-08-26@sha256:8aec479d9e6484c30cd03cc157e65ce2f661e4f5f67876aa6315686602faccdd",
+                            "registry.k8s.io/kube-scheduler-amd64:v1.36.4",
+                            "registry.k8s.io/kube-scheduler:v1.36.4"
+                        ],
+                        "sizeBytes": 60788445
+                    },
+                    {
+                        "names": [
+                            "docker.io/kindest/kindnetd:v20260820-69b56db7"
+                        ],
+                        "sizeBytes": 39744255
+                    },
+                    {
+                        "names": [
+                            "quay.io/jetstack/cert-manager-controller@sha256:416a2d76870d996460e62bd7f521bf14fa017be9e3e904aab92163a331fcb61a",
+                            "quay.io/jetstack/cert-manager-controller:v1.21.1"
+                        ],
+                        "sizeBytes": 24873252
+                    },
+                    {
+                        "names": [
+                            "registry.k8s.io/coredns/coredns:v1.14.2"
+                        ],
+                        "sizeBytes": 23257541
+                    },
+                    {
+                        "names": [
+                            "registry.k8s.io/etcd:3.6.8-0"
+                        ],
+                        "sizeBytes": 22885795
+                    },
+                    {
+                        "names": [
+                            "quay.io/jetstack/cert-manager-webhook@sha256:d8b3961b51c8c7320633f8208dc46bf88aa13804d0f7cbe48a096b2c523cee42",
+                            "quay.io/jetstack/cert-manager-webhook:v1.21.1"
+                        ],
+                        "sizeBytes": 19783279
+                    },
+                    {
+                        "names": [
+                            "docker.io/kindest/local-path-provisioner:v20260820-69b56db7"
+                        ],
+                        "sizeBytes": 15868133
+                    },
+                    {
+                        "names": [
+                            "quay.io/jetstack/cert-manager-cainjector@sha256:ccf6b919ec0500745a47a910118f834f9636d0aac1ff221245cd2557ed8c7c98",
+                            "quay.io/jetstack/cert-manager-cainjector:v1.21.1"
+                        ],
+                        "sizeBytes": 12390173
+                    },
+                    {
+                        "names": [
+                            "docker.io/kindest/local-path-helper:v20260131-7181c60a"
+                        ],
+                        "sizeBytes": 2872608
+                    },
+                    {
+                        "names": [
+                            "registry.k8s.io/pause:3.10"
+                        ],
+                        "sizeBytes": 320368
+                    }
+                ],
+                "nodeInfo": {
+                    "architecture": "amd64",
+                    "bootID": "cecbe4bd-6c67-42a8-885f-7257df4d1d27",
+                    "containerRuntimeVersion": "containerd://2.3.4",
+                    "kernelVersion": "7.2.4-arch1-2",
+                    "kubeProxyVersion": "",
+                    "kubeletVersion": "v1.36.4",
+                    "machineID": "0eee3d6a11454f63afc6e1b020b64fe3",
+                    "operatingSystem": "linux",
+                    "osImage": "Debian GNU/Linux 13 (trixie)",
+                    "swap": {
+                        "capacity": 66683531264
+                    },
+                    "systemUUID": "25cf5ebe-c5a9-4512-9aae-55b737b79976"
+                },
+                "runtimeHandlers": [
+                    {
+                        "features": {
+                            "recursiveReadOnlyMounts": true,
+                            "userNamespaces": true
+                        },
+                        "name": ""
+                    },
+                    {
+                        "features": {
+                            "recursiveReadOnlyMounts": true,
+                            "userNamespaces": true
+                        },
+                        "name": "runc"
+                    },
+                    {
+                        "features": {
+                            "recursiveReadOnlyMounts": true,
+                            "userNamespaces": true
+                        },
+                        "name": "test-handler"
+                    }
+                ]
+            }
+        }
+    ],
+    "kind": "List",
+    "metadata": {
+        "resourceVersion": ""
+    }
+}

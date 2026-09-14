@@ -13,6 +13,16 @@ on:
       - "crates/trawl-core/src/ast.rs"
       - ".github/workflows/docs.yml"
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      source-sha:
+        description: Exact product commit selected by the release resolver
+        required: true
+        type: string
+      release-tag:
+        description: Release tag selected by the release resolver
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -22,6 +32,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.source-sha || github.sha }}
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
@@ -30,36 +42,39 @@ jobs:
       - name: Install dependencies
         working-directory: docs
         run: npm ci
+      - name: Record documentation source identity
+        env:
+          PRODUCT_SHA: ${{ inputs.source-sha || github.sha }}
+          RELEASE_TAG: ${{ inputs.release-tag }}
+        run: |
+          python3 - <<'PYTHON'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+
+          actual = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          expected = os.environ["PRODUCT_SHA"]
+          if actual != expected or not re.fullmatch(r"[0-9a-f]{40}", expected):
+              raise SystemExit("documentation checkout differs from selected product commit")
+          tag = os.environ["RELEASE_TAG"]
+          if tag and not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?", tag):
+              raise SystemExit("invalid release tag for documentation")
+          Path("docs/public/release.json").write_text(json.dumps({
+              "source_sha": actual,
+              "workflow_sha": os.environ["GITHUB_SHA"],
+              "release_tag": tag or None,
+              "channel": "release" if tag else "development",
+          }, indent=2) + "\n")
+          PYTHON
       - name: Build and check documentation
+        env:
+          TRAWL_DOCS_DEVELOPMENT: ${{ inputs.release-tag == '' && '1' || '0' }}
+          TRAWL_DOCS_RELEASE_TAG: ${{ inputs.release-tag }}
         working-directory: docs
         run: npm run check
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: documentation-site
           path: docs/dist
-
-  deploy:
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    concurrency:
-      group: gh-pages-deploy
-      cancel-in-progress: false
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: documentation-site
-          path: docs/dist
-      - name: Deploy to gh-pages
-        uses: JamesIves/github-pages-deploy-action@d92aa235d04922e8f08b40ce78cc5442fcfbfa2f # v4
-        with:
-          branch: gh-pages
-          folder: docs/dist
-          clean: true
-          clean-exclude: |
-            apt/
-            gpg.key
-            symbols/

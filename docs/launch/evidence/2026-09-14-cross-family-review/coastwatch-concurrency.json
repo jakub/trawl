@@ -1,0 +1,14 @@
+{
+  "schema_invocations": [
+    0,
+    0
+  ],
+  "schema_tests": 8,
+  "overlap_samples": 5,
+  "unique_created_databases": 8,
+  "cleanup_matched": true,
+  "base_database_unchanged": true,
+  "origin_exit_code": 0,
+  "postgres_image": "pgvector/pgvector:pg18",
+  "app_migration_files": 64
+}

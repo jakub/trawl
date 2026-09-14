@@ -2416,7 +2416,7 @@ fn hot_and_compaction_conform_agree_across_inference_classes() {
 /// TIMESTAMP cast IGNORES an offset (storing `09:00` for
 /// `09:00:00+05:30`, where `read_json`'s own inference stores `03:30`),
 /// and the `TIMESTAMPTZ` parse that fixes it reads the SESSION zone — which
-/// the bundled `DuckDB` links ICU for and defaults to the HOST zone. Under
+/// the shared `DuckDB` runtime includes ICU for and defaults to the HOST zone. Under
 /// a hostile session the same conform writes a different instant, which is
 /// what `conform::SESSION_TIME_ZONE_SQL` exists to prevent.
 #[test]
@@ -2490,7 +2490,7 @@ fn timestamp_conform_applies_the_offset_under_the_pinned_session() {
 /// `Executor::configure` runs on every connection the pool makes, clones
 /// included, and that is load-bearing rather than defensive: `try_clone()`
 /// shares the DATABASE, not the session, so a clone starts from the
-/// process default — which the bundled ICU build takes from the HOST — and
+/// process default — which the shared ICU runtime takes from the HOST — and
 /// would read a zoneless text in `/etc/localtime`'s zone.
 ///
 /// Written host-independently: the assertion is that a clone reports the
@@ -2506,7 +2506,7 @@ fn a_cloned_connection_starts_from_the_process_default_not_the_parent() {
     let default = zone_of(&duckdb::Connection::open_in_memory().unwrap());
     assert!(
         !default.is_empty(),
-        "the bundled build links ICU, so a session always has a zone"
+        "the shared runtime includes ICU, so a session always has a zone"
     );
 
     let parent = duckdb::Connection::open_in_memory().unwrap();

@@ -1,0 +1,12 @@
+{
+  "namespace": "arc-runners",
+  "name": "coastwatch-small-kd6v9-runner-lqmpx",
+  "memory_limit": "2Gi",
+  "phase": "Failed",
+  "terminated": {
+    "exitCode": 137,
+    "reason": "OOMKilled",
+    "startedAt": "2026-09-14T06:53:14Z",
+    "finishedAt": "2026-09-14T07:00:40Z"
+  }
+}

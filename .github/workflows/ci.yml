@@ -15,6 +15,51 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
+  vector-collector:
+    name: Vector collector delivery
+    runs-on: k8s-small
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Install collector TLS test tooling
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends openssl
+      - name: Validate and exercise the Debian collector with Vector 0.57.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          fixture_dir=$(mktemp -d)
+          trap 'rm -rf "$fixture_dir"' EXIT
+          curl --fail --location --retry 3 \
+            https://github.com/vectordotdev/vector/releases/download/v0.57.0/vector-0.57.0-x86_64-unknown-linux-gnu.tar.gz \
+            --output "$fixture_dir/vector.tar.gz"
+          echo "4d156e6859e235b366f5b77121ae59d5440c93acab215c45f30f3fc839d20f65  $fixture_dir/vector.tar.gz" | sha256sum --check
+          tar -xzf "$fixture_dir/vector.tar.gz" -C "$fixture_dir"
+          VECTOR_BIN="$fixture_dir/vector-x86_64-unknown-linux-gnu/bin/vector" \
+            python3 scripts/test-vector-collector.py
+
+  release-source:
+    name: release source resolution
+    runs-on: k8s-small
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Install Debian package test tooling
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends dpkg-dev
+      # Runtime tests compile the actual Cargo helper, then exercise its target
+      # and integrity boundaries with cached fixtures and no downloader on PATH.
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1; pinned via toolchain input
+        with:
+          toolchain: 1.98.0
+      # Publication DAG tests use Helm's YAML parser, avoiding another YAML dependency.
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
+      - run: python3 -m unittest discover -s scripts/release -p 'test_*.py' -v
+
   helm-template:
     name: helm template
     runs-on: k8s-small
@@ -61,13 +106,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: clippy
-      # Force build script re-run so it re-downloads the prebuilt library.
-      # rust-cache cleans non-standard target dirs (including duckdb-download/)
-      # but preserves stale build script output, causing linker failures.
-      - run: cargo clean -p libduckdb-sys 2>/dev/null || true
       - run: cargo clippy --workspace --all-targets --no-default-features
-        env:
-          DUCKDB_DOWNLOAD_LIB: "1"
 
   test:
     # The single workspace test job. Postgres backs the pg-based integration
@@ -110,6 +149,8 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
+      # Exercise real chart rendering in trawl-config's packaging contracts.
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1; pinned via toolchain input
         with:
           toolchain: 1.98.0
@@ -124,12 +165,10 @@ jobs:
       - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079
         with:
           tool: nextest@0.9.143
-      - run: cargo clean -p libduckdb-sys 2>/dev/null || true
       # Explicit migration step: run the operational `fleet-admin migrate`
       # command against the service container. Spells out AC10's migration
       # step and exercises the exact deploy-time command the helm init
-      # container runs (AC11) against a live postgres. fleet-admin has no
-      # duckdb dependency, so no DUCKDB_DOWNLOAD_LIB is needed here.
+      # container runs (AC11) against a live postgres.
       - name: Apply fleet-auth schema migrations
         run: cargo run -p fleet-admin -- migrate
         env:
@@ -146,7 +185,6 @@ jobs:
           cargo nextest run --workspace --no-default-features
           --features fleet-auth/keystore,fleet-auth/axum,fleet-auth/fast-hash
         env:
-          DUCKDB_DOWNLOAD_LIB: "1"
           # DATABASE_URL, not FLEET_DATABASE_URL: trawld's [auth] resolution
           # treats FLEET_DATABASE_URL as its highest-precedence keystore
           # override (ADR-0004 slice 3), so setting it process-wide would
@@ -165,14 +203,10 @@ jobs:
           cargo xtask pg-admission-guard --
           --no-default-features
           --features fleet-auth/keystore,fleet-auth/axum,fleet-auth/fast-hash
-        env:
-          DUCKDB_DOWNLOAD_LIB: "1"
-      - name: Smoke-test downloaded DuckDB development launcher
+      - name: Smoke-test verified DuckDB development launcher
         run: |
           cargo build -p trawl-server --no-default-features
           bin/trawld-dev --version
-        env:
-          DUCKDB_DOWNLOAD_LIB: "1"
 
   msrv:
     name: msrv check
@@ -183,10 +217,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: msrv
-      - run: cargo clean -p libduckdb-sys 2>/dev/null || true
       - run: cargo check --workspace --no-default-features
-        env:
-          DUCKDB_DOWNLOAD_LIB: "1"
 
   deny:
     name: cargo-deny
@@ -305,6 +336,8 @@ jobs:
     runs-on: k8s-big
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      # Exercise real chart rendering in the packaging contract tests.
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1; pinned via toolchain input
         with:
           toolchain: 1.98.0

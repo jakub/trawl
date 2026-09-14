@@ -11,6 +11,12 @@ on:
   pull_request:
     paths:
       - Dockerfile
+      - scripts/release/build-distribution.sh
+      - scripts/release/distribution.py
+      - scripts/release/duckdb-runtime.json
+      - scripts/release/duckdb-LICENSE
+      - crates/trawl-core/build.rs
+      - crates/trawl-core/build_support/**
       - crates/trawl-crashdump/**
       - crates/trawl-server/src/main.rs
       - Cargo.lock
@@ -20,6 +26,12 @@ on:
     branches: [main]
     paths:
       - Dockerfile
+      - scripts/release/build-distribution.sh
+      - scripts/release/distribution.py
+      - scripts/release/duckdb-runtime.json
+      - scripts/release/duckdb-LICENSE
+      - crates/trawl-core/build.rs
+      - crates/trawl-core/build_support/**
       - crates/trawl-crashdump/**
       - crates/trawl-server/src/main.rs
       - Cargo.lock
@@ -54,8 +66,8 @@ jobs:
           targets: x86_64-unknown-linux-gnu, wasm32-unknown-unknown
 
       # Own cache entry, so this job neither evicts nor is evicted by
-      # release-<target> and dev-aarch64-linux. First run pays for libduckdb's
-      # C++ build once; every run after is the rust delta.
+      # release-<target> and dev-aarch64-linux. The official DuckDB runtime
+      # is downloaded separately from the Rust compilation cache.
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: crashdump-amd64-linux
@@ -85,15 +97,14 @@ jobs:
       # already the most expensive one in the repo.
       - name: Build the image binaries
         run: |
-          cargo zigbuild --locked --release --target x86_64-unknown-linux-gnu.2.31 \
-            -p trawl-server -p trawl-admin -p fleet-admin -p trawl-web
+          bash scripts/release/build-distribution.sh "$PWD" x86_64-unknown-linux-gnu "$PWD/runtime" --image-only
 
-      - name: Stage binaries for the image
+      - name: Stage image binaries and shared runtime
         run: |
-          mkdir -p docker-ctx/amd64
-          bindir="target/x86_64-unknown-linux-gnu/release"
-          cp "${bindir}/trawld" "${bindir}/trawl-admin" "${bindir}/fleet-admin" "${bindir}/trawl-web" docker-ctx/amd64/
-          chmod +x docker-ctx/amd64/trawld docker-ctx/amd64/trawl-admin docker-ctx/amd64/fleet-admin docker-ctx/amd64/trawl-web
+          python3 scripts/release/distribution.py stage --source . \
+            --binaries target/x86_64-unknown-linux-gnu/release --runtime runtime \
+            --output docker-ctx/amd64 --target x86_64-unknown-linux-gnu --image-only \
+            --source-sha "$(git rev-parse HEAD)" --tooling-sha "$(git rev-parse HEAD)"
 
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 

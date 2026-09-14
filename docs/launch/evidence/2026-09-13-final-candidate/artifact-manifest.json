@@ -1,0 +1,66 @@
+{
+  "source_sha": "384a28a8fbc2615c3f6de439f1027b115e2c43d5",
+  "tooling_sha": "384a28a8fbc2615c3f6de439f1027b115e2c43d5",
+  "product_version": "0.4.0",
+  "target": "x86_64-unknown-linux-gnu",
+  "platform_floor": "Debian 12",
+  "rustc_build": "1.98.0",
+  "cargo_deb_metadata_rust_toolchain": "1.98.1",
+  "strip_tool": "system LLVM 22.1.8",
+  "dump_syms": "2.3.7",
+  "verifier_image": "sha256:2b61d140dc73660765783fcbf56c637bdcd369d2d1826161c55abd53f3938c46",
+  "artifacts": [
+    {
+      "name": "trawl-v0.4.0-x86_64-unknown-linux-gnu.tar.gz",
+      "bytes": 53387142,
+      "sha256": "43ae33ba4b7f07a88f4ba246ec8f76253c0dac3322c9f99fc195f289728bef29"
+    },
+    {
+      "name": "trawl-cli_0.4.0-1_amd64.deb",
+      "bytes": 3867800,
+      "sha256": "fbb605a7f1432b17a2a50824ca374d678470a137e5697ca8a04173be17fd491c"
+    },
+    {
+      "name": "trawl-runtime_0.4.0-1_amd64.deb",
+      "bytes": 16479096,
+      "sha256": "9c920ec418af62b9a3d9447ae4f6d4bc50f45686f1f339588bc96873fe45d061"
+    },
+    {
+      "name": "trawl-server_0.4.0-1_amd64.deb",
+      "bytes": 17314892,
+      "sha256": "fa74c64198be5e095f9708aaa2579e525791be28ba17028ebde8235d95cc3e96"
+    }
+  ],
+  "application_symbols": [
+    {
+      "path": "fleet-admin/946A041AF38637D3D5CEDB86C64672070/fleet-admin.sym",
+      "bytes": 4792122,
+      "sha256": "5f15740ffd9b1d6084f3f86afb1b2d02c905500542df3f651114ec6d73956e96",
+      "module": "MODULE Linux x86_64 946A041AF38637D3D5CEDB86C64672070 fleet-admin"
+    },
+    {
+      "path": "trawl/FDAA9D6F48ECC40100ADB325791E1EC10/trawl.sym",
+      "bytes": 14998193,
+      "sha256": "08ed262d1539f024e4840d466af7ae17cfd6d45f43ec0c06b0661b929fd51277",
+      "module": "MODULE Linux x86_64 FDAA9D6F48ECC40100ADB325791E1EC10 trawl"
+    },
+    {
+      "path": "trawl-admin/8D20E301DE835E6862557FBC4745620B0/trawl-admin.sym",
+      "bytes": 843703,
+      "sha256": "92283d0e173dc342bbd25e9803423580660e794ff7547cf585b25e50fecd9be5",
+      "module": "MODULE Linux x86_64 8D20E301DE835E6862557FBC4745620B0 trawl-admin"
+    },
+    {
+      "path": "trawl-web/13209F6B12088F6B796FF582AC30EEDF0/trawl-web.sym",
+      "bytes": 6881407,
+      "sha256": "e556d93e0a51a62801ef9df80302dc6f8f42a75bd38e40beffe01d44b9e58ce9",
+      "module": "MODULE Linux x86_64 13209F6B12088F6B796FF582AC30EEDF0 trawl-web"
+    },
+    {
+      "path": "trawld/1E551B6E423CD4358A952D8875CC10610/trawld.sym",
+      "bytes": 22732371,
+      "sha256": "d7d443b1f86d68a64d0962980be4340231ed2c8359cdb2006568f16b32653c08",
+      "module": "MODULE Linux x86_64 1E551B6E423CD4358A952D8875CC10610 trawld"
+    }
+  ]
+}

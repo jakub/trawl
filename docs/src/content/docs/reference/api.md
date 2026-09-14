@@ -1613,7 +1613,7 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" "$TRAWL_URL/api/v1/dashboard
 
 ```json
 {
-  "hostname": "trawl.example.com", "listen_addr": "127.0.0.1:8080", "uptime_secs": 86400, "version": "<installed-version>", "healthy": true,
+  "hostname": "trawl.example.com", "listen_addr": "127.0.0.1:5514", "uptime_secs": 86400, "version": "<installed-version>", "healthy": true,
   "pool_capacity": 4, "pool_active": 1, "pool_retained": 0,
   "hot_buffer_events": 120, "hot_buffer_max_events": 100000, "hot_buffer_bytes": 40960, "hot_buffer_max_bytes": 268435456, "hot_buffer_batches": 3,
   "total_queries": 1200, "query_rate": 0.4, "query_errors": 2, "query_timeouts": 0,

@@ -38,8 +38,7 @@ tracing-subscriber = { workspace = true }
 unicode-width = { workspace = true }
 
 [features]
-default = ["bundled", "clipboard"]
-bundled = ["trawl-engine/bundled"]
+default = ["clipboard"]
 clipboard = ["dep:arboard"]
 
 [dev-dependencies]

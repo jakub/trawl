@@ -1,0 +1,350 @@
+
+
+## phase 1 header
+
+  --allow-dirty: not checking the working tree
+ M crates/trawl-server/debian/tests/crashdump-harness.sh
+?? .tmp/
+?? crates/trawl-server/debian/tests/harness-cleanup.sh
+?? scripts/release/test_harness_cleanup.py
+
+$ git -C $REPO rev-parse HEAD
+83ddeb15ff07088b5ae46bacda2809952a4c4e88
+
+argv: crashdump-harness.sh --packages /home/jakub/code/trawl/.flow-worktrees/launch-distribution-review/target/deb-harness/snapshot-proof/debian --scopes 1 --no-negative --allow-dirty --out /home/jakub/code/trawl/.flow-worktrees/launch-distribution-review/.tmp/harness-snapshot-final.log
+
+$ date -u
+Mon Sep 14 16:39:58 UTC 2026
+
+$ uname -r
+7.2.4-arch1-2
+
+$ docker --version
+Docker version 29.7.2, build a7dcaa6fdb
+  file paths below are shown as $REPO/..., where $REPO is the worktree this ran from
+
+pinned images:
+  rust     rust:1.98-trixie@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959
+  debian   debian:trixie@sha256:f324c7ff54321e8d9c588493a20244965938ce0aa50bbd1022d38010e9ffc4b1
+  postgres postgres:18@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280
+  cargo-deb 3.8.0 (see the header comment for why this is pinned)
+
+$ cat /proc/sys/kernel/yama/ptrace_scope   # host, before anything runs
+1
+
+
+## phase 2 build
+
+  skipped: using --packages $REPO/target/deb-harness/snapshot-proof/debian
+  installing trawl-cli_0.4.0-1_amd64.deb
+699ff7c2f865737a528fe555df8f6813aefb4fd38a12a0d9c2bcd4e66752253c  $REPO/target/deb-harness/snapshot-proof/debian/trawl-cli_0.4.0-1_amd64.deb
+
+$ dpkg-deb -f $REPO/target/deb-harness/snapshot-proof/debian/trawl-cli_0.4.0-1_amd64.deb Package Version Architecture Depends
+Package: trawl-cli
+Version: 0.4.0-1
+Architecture: amd64
+Depends: libc6 (>= 2.34), trawl-runtime (= 0.4.0-1)
+  installing trawl-runtime_0.4.0-1_amd64.deb
+ec87c8f9c073fdb79f1375bb43ea3d4f4de656c3a190667787d75e7d7fc86c35  $REPO/target/deb-harness/snapshot-proof/debian/trawl-runtime_0.4.0-1_amd64.deb
+
+$ dpkg-deb -f $REPO/target/deb-harness/snapshot-proof/debian/trawl-runtime_0.4.0-1_amd64.deb Package Version Architecture Depends
+Package: trawl-runtime
+Version: 0.4.0-1
+Architecture: amd64
+Depends: libc6 (>= 2.34), libgcc-s1 (>= 3.4), libstdc++6 (>= 6)
+  installing trawl-server_0.4.0-1_amd64.deb
+cc572c2f9b7506d69e1333dab866eb00b8201fea9acd724f6494000cac555f92  $REPO/target/deb-harness/snapshot-proof/debian/trawl-server_0.4.0-1_amd64.deb
+
+$ dpkg-deb -f $REPO/target/deb-harness/snapshot-proof/debian/trawl-server_0.4.0-1_amd64.deb Package Version Architecture Depends
+Package: trawl-server
+Version: 0.4.0-1
+Architecture: amd64
+Depends: libc6 (>= 2.34), trawl-runtime (= 0.4.0-1)
+
+
+## phase 3 up
+
+
+$ docker network create --label trawl-crashdump-harness-run=3271534-1789403998 trawl-crashdump-net
+  network id 59d7e6855907
+
+$ docker run -d --name trawl-crashdump-pg --network trawl-crashdump-net --label trawl-crashdump-harness-run=3271534-1789403998 postgres:18@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280
+  container id d42b50f09c4b
+  postgres accepting connections after 2s
+
+$ docker exec trawl-crashdump-pg psql -U postgres -v ON_ERROR_STOP=1 -c CREATE ROLE fleet LOGIN PASSWORD 'fleetpw'; -c CREATE DATABASE fleet OWNER fleet; -c CREATE ROLE trawl LOGIN PASSWORD 'trawlpw'; -c CREATE DATABASE trawl OWNER trawl;
+CREATE ROLE
+CREATE DATABASE
+CREATE ROLE
+CREATE DATABASE
+
+$ docker build trawl-crashdump-node:trixie   # FROM debian:trixie@sha256:f324c7ff54321e8d9c588493a20244965938ce0aa50bbd1022d38010e9ffc4b1
+  sha256:b53a323df832ce3a0116c7bba6e542b6f2484aaef59dd58e0e5f7b0b6058eec5
+
+$ docker run -d --name trawl-crashdump-node --privileged --cgroupns=private --tmpfs /run --tmpfs /tmp --network trawl-crashdump-net --label trawl-crashdump-harness-run=3271534-1789403998 trawl-crashdump-node:trixie /sbin/init
+  container id ec9dbd3fb24a
+  systemd up in trawl-crashdump-node after 2s
+
+$ docker exec trawl-crashdump-node systemctl is-system-running
+running
+
+[trawl-crashdump-node]
+$ dpkg-query -W -f='  ${Package} ${Version}\n' systemd gdb sudo procps libc6
+  gdb 16.3-1
+  libc6 2.41-12+deb13u3
+  procps 2:4.0.4-9
+  sudo 1.9.16p2-3+deb13u2
+  systemd 257.13-1~deb13u1
+
+$ docker exec trawl-crashdump-pg postgres --version
+postgres (PostgreSQL) 18.6 (Debian 18.6-1.pgdg13+2)
+
+
+## phase 4 install
+
+
+$ docker exec trawl-crashdump-node mkdir -p /root/trawl-packages
+
+$ docker cp $REPO/target/deb-harness/snapshot-proof/debian/trawl-runtime_0.4.0-1_amd64.deb trawl-crashdump-node:/root/trawl-packages/trawl-runtime.deb
+
+$ docker cp $REPO/target/deb-harness/snapshot-proof/debian/trawl-cli_0.4.0-1_amd64.deb trawl-crashdump-node:/root/trawl-packages/trawl-cli.deb
+
+$ docker cp $REPO/target/deb-harness/snapshot-proof/debian/trawl-server_0.4.0-1_amd64.deb trawl-crashdump-node:/root/trawl-packages/trawl-server.deb
+
+[trawl-crashdump-node]
+$ set -o pipefail
+$ DEBIAN_FRONTEND=noninteractive apt-get install -y /root/trawl-packages/*.deb 2>&1 | tail -8
+Unpacking trawl-server (0.4.0-1) ...
+Setting up trawl-runtime (0.4.0-1) ...
+Setting up trawl-server (0.4.0-1) ...
+Created symlink '/etc/systemd/system/multi-user.target.wants/trawld.service' → '/usr/lib/systemd/system/trawld.service'.
+/usr/sbin/policy-rc.d returned 101, not running 'start trawld.service'
+Created symlink '/etc/systemd/system/multi-user.target.wants/trawl-web.service' → '/usr/lib/systemd/system/trawl-web.service'.
+/usr/sbin/policy-rc.d returned 101, not running 'start trawl-web.service'
+Setting up trawl-cli (0.4.0-1) ...
+
+$ dpkg-query -W -f='${Status}' trawl-runtime
+install ok installed
+
+$ dpkg-query -W -f='${Status}' trawl-cli
+install ok installed
+
+$ dpkg-query -W -f='${Status}' trawl-server
+install ok installed
+
+$ docker exec trawl-crashdump-node dpkg-query -S /usr/lib/trawl/libduckdb.so
+trawl-runtime: /usr/lib/trawl/libduckdb.so
+
+$ docker exec trawl-crashdump-node trawl --version
+trawl 0.4.0 (11c055e1* 2026-09-14, rustc 1.98.0, x86_64-unknown-linux-gnu)
+
+$ dpkg-deb -c trawl-server_0.4.0-1_amd64.deb | grep examples/crashdump.conf
+-rw-r--r-- 0/0             674 2026-09-13 17:00 ./usr/share/doc/trawl-server/examples/crashdump.conf
+
+[trawl-crashdump-node]
+$ cat >> /etc/default/trawld <<'EOF'
+$ FLEET_DATABASE_URL=postgres://fleet:<fixture-password>@trawl-crashdump-pg:5432/fleet
+$ TRAWL_DATABASE_URL=postgres://trawl:<fixture-password>@trawl-crashdump-pg:5432/trawl
+$ EOF
+$ chown root:trawl /etc/default/trawld && chmod 0640 /etc/default/trawld
+$ grep -c '^[A-Z_]*DATABASE_URL=' /etc/default/trawld
+2
+
+$ docker exec -e DATABASE_URL=... trawl-crashdump-node /usr/bin/fleet-admin migrate
+fleet-admin: migrations applied
+
+$ docker exec trawl-crashdump-node systemctl restart trawld
+  trawld is-active=active after 1s
+
+$ docker exec trawl-crashdump-node systemctl show trawld -p MainPID -p ActiveState -p SubState
+MainPID=327
+ActiveState=active
+SubState=running
+
+
+## phase 5 A inert
+
+
+$ docker exec trawl-crashdump-node systemctl show trawld -p AmbientCapabilities -p Environment
+Environment=
+AmbientCapabilities=
+
+$ test -e /etc/systemd/system/trawld.service.d
+  absent — the package installs no drop-in
+  trawld   pid=327    CapEff=0x0000000000000000 bit19=0  CapAmb=0x0000000000000000 bit19=0  NoNewPrivs=1
+  CAP_SYS_PTRACE (bit 19) is clear in both CapEff and CapAmb
+
+$ docker exec trawl-crashdump-node stat -c %F %U %G %a /var/lib/trawl/cores
+directory trawl trawl 700
+
+[trawl-crashdump-node]
+$ rmdir /var/lib/trawl/cores && : > /var/lib/trawl/cores && stat -c 'planted: %F' /var/lib/trawl/cores
+$ systemd-tmpfiles --create trawl.conf
+$ stat -c 'after tmpfiles: %F %U:%G %a' /var/lib/trawl/cores
+planted: regular empty file
+Wrong file type 0o100000; rm -rf "/var/lib/trawl/cores"
+after tmpfiles: directory trawl:trawl 700
+  systemd 257 replaced the planted file with the directory, so 'd=' is honoured here
+
+$ docker exec trawl-crashdump-node systemctl show trawl-web -p InaccessiblePaths
+InaccessiblePaths=/var/lib/trawl/cores
+
+$ docker exec trawl-crashdump-node systemctl restart trawl-web
+  trawl-web is-active=active after 1s
+
+[trawl-crashdump-node]
+$ ps -o pid,user,group,args -p $(systemctl show trawld -p MainPID --value) -p $(systemctl show trawl-web -p MainPID --value)
+$ id trawl-web
+$ stat -c '%n %U:%G %a' /var/lib/trawl /var/lib/trawl/web.cookie /var/lib/trawl/cores /etc/trawl/trawld.toml
+    PID USER     GROUP    COMMAND
+    327 trawl    trawl    /usr/bin/trawld --config /etc/trawl/trawld.toml --no-monitor
+    485 trawl-w+ trawl    /usr/bin/trawl-web --config /etc/trawl/trawld.toml
+uid=995(trawl-web) gid=995(trawl-web) groups=995(trawl-web),996(trawl)
+/var/lib/trawl trawl:trawl 755
+/var/lib/trawl/web.cookie trawl:trawl 640
+/var/lib/trawl/cores trawl:trawl 700
+/etc/trawl/trawld.toml root:trawl 640
+  the proxy runs as trawl-web; the dump directory is trawl:trawl 0700, denying that uid by mode as well
+
+[trawl-crashdump-node]
+$ install -o trawl -g trawl -m 0600 /dev/null /var/lib/trawl/cores/sentinel-not-a-dump
+$ printf 'real directory:      '; ls -A /var/lib/trawl/cores | tr '\n' ' '; echo
+$ printf 'trawl-web sees:      '; ls -A /proc/485/root/var/lib/trawl/cores | tr '\n' ' '; echo '(nothing)'
+$ stat -c 'web.cookie in that namespace: %n %U %a' /proc/485/root/var/lib/trawl/web.cookie
+real directory:      sentinel-not-a-dump 
+trawl-web sees:      (nothing)
+web.cookie in that namespace: /proc/485/root/var/lib/trawl/web.cookie trawl 640
+  the sentinel is invisible inside trawl-web's mount namespace, web.cookie is not
+
+
+## phase 6 B enable
+
+  enable command matches $REPO/docs/src/content/docs/reference/crash-dumps.md
+
+$ docker exec -i trawl-crashdump-node bash -s   # the docs enable command, verbatim:
+sudo install -D -m 0644 \
+  /usr/share/doc/trawl-server/examples/crashdump.conf \
+  /etc/systemd/system/trawld.service.d/crashdump.conf
+sudo systemctl daemon-reload && sudo systemctl restart trawld
+  trawld is-active=active after 1s
+
+$ docker exec trawl-crashdump-node systemctl show trawld -p AmbientCapabilities -p Environment
+Environment=TRAWL_CRASH_DUMP_DIR=/var/lib/trawl/cores TRAWL_CRASH_DUMP_RETAIN=10
+AmbientCapabilities=cap_sys_ptrace
+
+
+## phase C/D fault at yama ptrace_scope=1
+
+
+$ docker exec trawl-crashdump-node cat /proc/sys/kernel/yama/ptrace_scope   # shared kernel: this IS the host value
+1
+
+$ docker exec trawl-crashdump-node systemctl restart trawld
+  trawld is-active=active after 1s
+
+$ docker exec trawl-crashdump-node cat /proc/sys/kernel/yama/ptrace_scope
+1
+  monitor process found after 1s
+
+$ tr "\0" "\n" < /proc/687/environ | grep TRAWL_CRASHDUMP_MONITOR
+TRAWL_CRASHDUMP_MONITOR=1
+  trawld logged its crash-dump verdict after 1s
+
+2026-09-14T16:40:08.009366Z  INFO trawld: crash-dump capture ready; capability and yama checked, LSM policy not probed event_type="crash_dump" readiness="ready" ptrace_scope=1 monitor_pid=687 monitor_cap_eff_ptrace=true monitor_cap_prm_ptrace=true monitor_no_new_privs=true self_cap_eff_ptrace=false self_cap_prm_ptrace=false self_no_new_privs=true dumpable=true ptracer_set=true dir="/var/lib/trawl/cores" retain=10
+
+capabilities (bit 19 = CAP_SYS_PTRACE):
+  daemon   pid=678    CapEff=0x0000000000000000 bit19=0  CapAmb=0x0000000000000000 bit19=0  NoNewPrivs=1
+  monitor  pid=687    CapEff=0x0000000000080000 bit19=1  CapAmb=0x0000000000080000 bit19=1  NoNewPrivs=1
+  dumps before the fault: 0   NRestarts=0
+
+$ docker exec trawl-crashdump-node gdb -q -n -batch -p 678 -ex 'set $pc = 0' -ex detach
+Using host libthread_db library "/lib/x86_64-linux-gnu/libthread_db.so.1".
+0x00007f4c7f9327b9 in syscall () from target:/lib/x86_64-linux-gnu/libc.so.6
+[Inferior 1 (process 678) detached]
+  a new dump appeared after 1s
+
+$ /root/mdmp-summary /var/lib/trawl/cores/trawld-crash-1789404008568081441.dmp
+path=/var/lib/trawl/cores/trawld-crash-1789404008568081441.dmp magic=MDMP bytes=805067 owner=trawl:trawl mode=600 streams=18 threads=33 memory_regions=33
+  scope 1: dumps 0 -> 1, 33 threads captured
+
+[trawl-crashdump-node]
+$ journalctl -u trawld --no-pager --since '-3min' | grep -iE 'crashdump|minidump|FATAL signal|Main process exited|Scheduled restart' | tail -12
+Sep 14 16:40:07 ec9dbd3fb24a trawld[616]: trawl-crashdump monitor: cap_sys_ptrace raise ok
+Sep 14 16:40:07 ec9dbd3fb24a trawld[687]: trawl-crashdump monitor: cap_sys_ptrace raise ok
+Sep 14 16:40:08 ec9dbd3fb24a trawld[678]: trawld: FATAL signal caught - writing minidump to crash-dump dir
+Sep 14 16:40:08 ec9dbd3fb24a trawld[687]: trawl-crashdump: wrote minidump /var/lib/trawl/cores/trawld-crash-1789404008568081441.dmp threads=33 memory_regions=33
+Sep 14 16:40:08 ec9dbd3fb24a systemd[1]: trawld.service: Main process exited, code=killed, status=11/SEGV
+  trawld is-active=active after 6s
+  NRestarts 0 -> 1 (Restart=on-failure brought trawld back)
+
+
+## phase E negative (capability removed)
+
+  skipped: --no-negative
+
+
+## phase F attack direction (trawl-web against the dumps)
+
+  disable command matches $REPO/docs/src/content/docs/reference/crash-dumps.md
+
+$ docker exec -i trawl-crashdump-node bash -s   # the docs disable command, verbatim:
+sudo rm /etc/systemd/system/trawld.service.d/crashdump.conf
+sudo systemctl daemon-reload && sudo systemctl restart trawld
+  trawld is-active=active after 1s
+
+$ docker exec trawl-crashdump-node systemctl show trawld -p AmbientCapabilities -p Environment
+Environment=
+AmbientCapabilities=
+  daemon   pid=1787   CapEff=0x0000000000000000 bit19=0  CapAmb=0x0000000000000000 bit19=0  NoNewPrivs=1
+  capture is off, trawld is cap-less, and trawld-crash-1789404008568081441.dmp is still on disk
+
+[trawl-crashdump-node]
+$ id trawl-web
+uid=995(trawl-web) gid=995(trawl-web) groups=995(trawl-web),996(trawl)
+
+$ runuser -u trawl-web -- ls -l /var/lib/trawl/cores
+ls: cannot open directory '/var/lib/trawl/cores': Permission denied
+exit=2
+  listing the dump directory directly denied
+
+$ runuser -u trawl-web -- cat /var/lib/trawl/cores/trawld-crash-1789404008568081441.dmp
+cat: /var/lib/trawl/cores/trawld-crash-1789404008568081441.dmp: Permission denied
+exit=1
+  reading a dump directly denied
+
+$ runuser -u trawl-web -- ls -l /proc/1787/root/var/lib/trawl/cores
+ls: cannot access '/proc/1787/root/var/lib/trawl/cores': Permission denied
+exit=2
+  listing the dump directory through /proc/1787/root denied
+
+$ runuser -u trawl-web -- cat /proc/1787/root/var/lib/trawl/cores/trawld-crash-1789404008568081441.dmp
+cat: /proc/1787/root/var/lib/trawl/cores/trawld-crash-1789404008568081441.dmp: Permission denied
+exit=1
+  reading a dump through /proc/1787/root denied
+
+$ runuser -u trawl -- ls -l /var/lib/trawl/cores   # control: the owner can still read them
+total 788
+-rw------- 1 trawl trawl 805067 Sep 14 16:40 trawld-crash-1789404008568081441.dmp
+  the trawl user reads its own dumps; the denials above are the uid split and the 0700 mode, not missing files
+
+
+## phase result
+
+  crash cases executed: 1 of 1 requested (1)
+  every assertion passed
+
+
+## phase down: teardown
+
+  host ptrace_scope was never modified
+
+$ docker rm -fv d42b50f09c4b6f7bf23bf5a57fb79ee4683c8d4e9ebeddf54c5b319e35836061
+
+$ docker rm -fv ec9dbd3fb24a56fd138d9356aba75f488050a8767e68365e60b6243552c7bef4
+
+$ docker network rm 59d7e6855907dd14d65850067fc4160ade45b8695e2921694653a8c52fd862d8
+
+$ cat /proc/sys/kernel/yama/ptrace_scope   # host, after restore
+1
+
+exit status: 0

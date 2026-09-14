@@ -1,0 +1,41 @@
+warning: ignoring `resolver.incompatible-publish-age` without `-Zmin-publish-age`
+warning: ignoring `registry.global-min-publish-age` without `-Zmin-publish-age`
+warning: ignoring `resolver.incompatible-publish-age` without `-Zmin-publish-age`
+warning: ignoring `registry.global-min-publish-age` without `-Zmin-publish-age`
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl/.flow-worktrees/trawl-pr-186/crates/trawl-core)
+   Compiling trawl-engine v0.4.0 (/home/jakub/code/trawl/.flow-worktrees/trawl-pr-186/crates/trawl-engine)
+   Compiling trawl-client v0.4.0 (/home/jakub/code/trawl/.flow-worktrees/trawl-pr-186/crates/trawl-client)
+   Compiling trawl-server v0.4.0 (/home/jakub/code/trawl/.flow-worktrees/trawl-pr-186/crates/trawl-server)
+   Compiling trawl-cli v0.4.0 (/home/jakub/code/trawl/.flow-worktrees/trawl-pr-186/crates/trawl-cli)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 7.47s
+────────────
+ Nextest run ID 46aff345-9863-43bf-ab01-c13f9b8caac6 with nextest profile: default
+    Starting 26 tests across 3 binaries (747 tests skipped)
+        PASS [   0.012s] ( 1/26) trawl-server epoch::tests::epoch_publication_refuses_a_replacement_staging_entry
+        PASS [   0.012s] ( 2/26) trawl-server epoch::tests::current_environment_wal_is_preserved
+        PASS [   0.012s] ( 3/26) trawl-server epoch::tests::fresh_and_empty_roots_initialize_and_restart
+        PASS [   0.012s] ( 4/26) trawl-server epoch::tests::suffix_siblings_and_report_results_are_never_adopted_or_deleted
+        PASS [   0.013s] ( 5/26) trawl-server epoch::tests::staged_epoch_symlinks_and_directories_are_never_retried
+        PASS [   0.013s] ( 6/26) trawl-server epoch::tests::invalid_path_types_fail_before_initialization
+        PASS [   0.013s] ( 7/26) trawl-server epoch::tests::flat_wal_refuses_before_fresh_empty_or_current_root_mutation
+        PASS [   0.013s] ( 8/26) trawl-server epoch::tests::interrupted_epoch_publication_retries_then_restarts
+        PASS [   0.014s] ( 9/26) trawl-server epoch::tests::markerless_nonempty_ingest_roots_refuse_without_mutation
+        PASS [   0.014s] (10/26) trawl-server epoch::tests::explicit_noncurrent_epochs_refuse_in_every_mode_without_mutation
+        PASS [   0.016s] (11/26) trawl-server epoch::tests::query_only_owned_roots_still_require_their_epoch_marker
+        PASS [   0.016s] (12/26) trawl-server epoch::tests::dangling_symlinks_are_errors_not_absence
+        PASS [   0.016s] (13/26) trawl-server epoch::tests::staging_files_never_admit_mixed_or_query_only_roots
+        PASS [   0.017s] (14/26) trawl-server epoch::tests::query_only_generic_archives_and_unused_wal_are_untouched
+        PASS [   0.018s] (15/26) trawl-server epoch::tests::staging_retry_requires_current_bytes_and_generated_name
+        PASS [   0.004s] (16/26) trawl-server::bin/trawld tests::log_destination_resolution_errors_do_not_change_storage
+        PASS [   0.004s] (17/26) trawl-server::bin/trawld tests::prepare_data_root_recovers_current_repin_before_returning
+        PASS [   0.004s] (18/26) trawl-server::bin/trawld tests::prepare_data_root_refuses_epoch_or_wal_before_repin_cleanup
+        PASS [   0.005s] (19/26) trawl-server::bin/trawld tests::log_destination_rejects_marker_aliases_and_keeps_normal_paths
+        PASS [   0.012s] (20/26) trawl-server::check_config config_check_requires_an_explicit_config
+        PASS [   0.014s] (21/26) trawl-server::check_config config_check_has_no_startup_side_effects
+        PASS [   0.037s] (22/26) trawl-server::check_config config_check_accepts_shipped_configuration
+        PASS [   0.025s] (23/26) trawl-server::check_config config_check_names_the_log_path_when_resolution_fails
+        PASS [   0.045s] (24/26) trawl-server::check_config config_check_rejects_errors_without_echoing_config_values
+        PASS [   0.045s] (25/26) trawl-server::check_config config_check_rejects_daemon_globs_without_side_effects
+        PASS [   0.075s] (26/26) trawl-server::check_config config_check_rejects_active_log_marker_collisions_without_side_effects
+────────────
+     Summary [   0.090s] 26 tests run: 26 passed, 747 skipped

@@ -3,17 +3,20 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Boot recovery for an interrupted repin (ADR-0011) — the marker-driven
-//! decision table, split in two halves because the two resources come up
-//! at different times:
+//! decision table, split into filesystem and store phases before the
+//! daemon constructs corpus readers and writers:
 //!
-//! - the filesystem half runs before `ensure_current_epoch`
-//!   (non-negotiable: a half-swapped root must be finished before the
-//!   epoch gate forms an opinion of it), needs no postgres, and is one
-//!   `stat` on the marker-less fast path;
-//! - the postgres half runs after `AppState::from_config`, finishes the
-//!   job row (idempotent flip or failure), re-arms the boot conformance
-//!   pass for any recovered cutover, sweeps the aside, and removes the
-//!   marker — then reconciles any orphaned `running` rows.
+//! - both databases are admitted first, with the Trawl sole-writer lock held
+//!   across both recovery halves;
+//! - the filesystem half runs after `ensure_current_epoch` validates the
+//!   format and before any corpus reader starts. Per-env swaps leave EPOCH
+//!   in place, so an incompatible root can be refused before recovery mutates
+//!   anything. This half needs no postgres;
+//! - the postgres half runs before `AppState::from_parts` loads the live
+//!   catalog cache or constructs readers and writers. It finishes the job row
+//!   (idempotent flip or failure), re-arms the boot conformance pass for any
+//!   recovered cutover, sweeps the aside, and removes the marker — then
+//!   reconciles any orphaned `running` rows.
 //!
 //! Every branch is idempotent: recovery interrupted mid-recovery is the
 //! same state re-entered.

@@ -20,7 +20,7 @@ PostgreSQL holds two databases: the Fleet keystore for keys, roles, and
 permissions, and the Trawl app-state database for history, saved queries,
 report runs, and the field catalog. `trawl-web` serves the browser UI and
 keeps each session in an encrypted cookie in front of `trawld`. It needs the
-database and API connections, a public origin, and a session key.
+API connection, a public origin, and a session key.
 
 | Component | Responsibility |
 | --- | --- |

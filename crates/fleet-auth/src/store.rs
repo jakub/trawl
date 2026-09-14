@@ -9,7 +9,7 @@
 //! lifecycle, role CRUD, role assignment) from whatever CLI / API surface
 //! owns the lifecycle.
 //!
-//! Construction does NOT run migrations — apply them via [`crate::MIGRATOR`]
+//! Construction does NOT run migrations — apply them via [`crate::migrate`]
 //! from the operational tool that owns deploys (e.g. `fleet-admin migrate`).
 //!
 //! [`from_pool`]: KeyStore::from_pool
@@ -65,7 +65,7 @@ impl KeyStore {
     ///
     /// Callers own pool lifecycle and connectivity validation (use
     /// [`Self::ping`] to confirm the database is reachable). Migrations are
-    /// applied via [`crate::MIGRATOR`] from an operational tool, never here.
+    /// applied via [`crate::migrate`] from an operational tool, never here.
     pub fn from_pool(pool: PgPool) -> Self {
         Self {
             pool,
@@ -79,12 +79,13 @@ impl KeyStore {
     /// this returns), so daemon consumers fail fast at startup when the
     /// auth backend is unreachable instead of on the first request.
     ///
-    /// Does NOT run migrations — apply them via [`crate::MIGRATOR`] from the
+    /// Does NOT run migrations — apply them via [`crate::migrate`] from the
     /// operational tool that owns deploys (e.g. `fleet-admin migrate`).
     ///
     /// # Errors
     /// Returns [`AuthError::Database`] when the URL is malformed or the
-    /// database is unreachable.
+    /// database is unreachable, or [`AuthError::Schema`] when read-only
+    /// history validation finds an unsupported or incomplete schema.
     pub async fn connect(database_url: &str) -> Result<Self, AuthError> {
         /// Upper bound on pooled connections. Sized for a single daemon's
         /// request path plus background pollers — not a tunable yet.
@@ -97,6 +98,7 @@ impl KeyStore {
             .max_connections(MAX_CONNECTIONS)
             .connect(database_url)
             .await?;
+        crate::validate_schema(&pool).await?;
         Ok(Self::from_pool(pool))
     }
 

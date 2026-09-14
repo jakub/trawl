@@ -4,7 +4,7 @@
 
 Slices A (#27/PR #29) and B (#28/PR #30) of the fleet-ui migration were gated
 as strictly zero-visual-change refactors: a pixel-diff parity harness
-(`scripts/web-visual-parity`) had to report 0 unexplained deltas. That
+([retired visual-parity script](https://github.com/jakub/trawl/blob/723ac5d70834cda4d923652a9797ef0037c43e54/scripts/web-visual-parity)) had to report 0 unexplained deltas. That
 discipline fit those slices — they moved big structural chrome whose look was
 already settled, and pixel identity was the cheapest proof the refactor was
 pure.

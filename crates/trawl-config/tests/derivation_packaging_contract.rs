@@ -6,7 +6,7 @@
 //!
 //! `severity_from` and `time_from` decide what `_severity` and `_time`
 //! read, and the answer must not depend on how trawl was installed. Five
-//! places state that default — the code, the example `trawld.toml`, the
+//! places state that default — the code, the annotated `trawld.reference.toml`, the
 //! Debian example, the Helm chart and the configuration reference — and
 //! this test makes them one fact instead of five. Precedent:
 //! `crates/trawl-web/tests/log_filter_contract.rs`.
@@ -23,7 +23,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use trawl_config::{DEFAULT_SEVERITY_FROM, DEFAULT_TIME_FROM, DerivationSourceSpec, IngestConfig};
+use trawl_config::{
+    Config, DEFAULT_SEVERITY_FROM, DEFAULT_TIME_FROM, DerivationSourceSpec, IngestConfig,
+};
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -108,6 +110,7 @@ fn chart_defaults(key: &str, values_key: &str) -> Vec<String> {
         .args(["template", "trawl"])
         .arg(&chart)
         .args(["--show-only", "templates/configmap.yaml"])
+        .args(["--set-string", "image.tag=source-render-test"])
         // Both DSN Secrets are `required`; the names are irrelevant here.
         .args(["--set", "auth.database.existingSecret=test-fleet-dsn"])
         .args(["--set", "storage.database.existingSecret=test-trawl-dsn"])
@@ -160,6 +163,23 @@ fn the_code_default_is_what_ingest_config_deserializes_to() {
 }
 
 #[test]
+fn standalone_starter_uses_defaults_without_development_credentials() {
+    let config: Config = toml::from_str(&read("config/trawld.toml"))
+        .expect("the standalone starter must load as a shared server/proxy config");
+    assert!(config.auth.database_url.is_none());
+    assert!(config.storage.database_url.is_none());
+    assert_eq!(config.server.http_addr, "127.0.0.1:5514");
+    assert_eq!(config.web.bind_addr.as_deref(), Some("127.0.0.1:8090"));
+    assert!(!config.web.public_origins.is_empty());
+    assert!(config.web.cookie_secret_path.is_some());
+    assert_eq!(
+        spellings(&config.ingest.severity_from),
+        DEFAULT_SEVERITY_FROM
+    );
+    assert_eq!(spellings(&config.ingest.time_from), DEFAULT_TIME_FROM);
+}
+
+#[test]
 fn every_packaging_artifact_states_the_same_derivation_defaults() {
     let expected_severity: Vec<String> = DEFAULT_SEVERITY_FROM
         .iter()
@@ -167,15 +187,15 @@ fn every_packaging_artifact_states_the_same_derivation_defaults() {
         .collect();
     let expected_time: Vec<String> = DEFAULT_TIME_FROM.iter().map(|s| (*s).to_owned()).collect();
 
-    let example = read("config/trawld.toml");
+    let example = read("config/trawld.reference.toml");
     let debian = read("crates/trawl-server/debian/trawld.toml");
     let docs = read("docs/src/content/docs/reference/configuration.md");
 
     let artifacts: Vec<(&str, Vec<String>, Vec<String>)> = vec![
         (
-            "config/trawld.toml",
-            toml_default(&example, "severity_from", "config/trawld.toml"),
-            toml_default(&example, "time_from", "config/trawld.toml"),
+            "config/trawld.reference.toml",
+            toml_default(&example, "severity_from", "config/trawld.reference.toml"),
+            toml_default(&example, "time_from", "config/trawld.reference.toml"),
         ),
         (
             "crates/trawl-server/debian/trawld.toml",
@@ -214,7 +234,10 @@ fn every_packaging_artifact_states_the_same_derivation_defaults() {
 #[test]
 fn every_documented_typed_example_actually_loads() {
     let sources = [
-        ("config/trawld.toml", read("config/trawld.toml")),
+        (
+            "config/trawld.reference.toml",
+            read("config/trawld.reference.toml"),
+        ),
         (
             "crates/trawl-server/debian/trawld.toml",
             read("crates/trawl-server/debian/trawld.toml"),

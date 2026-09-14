@@ -1,0 +1,67 @@
+
+> trawl-docs@0.0.1 check
+> astro build && python3 scripts/check-docs.py
+
+21:28:31 [content] Syncing content
+21:28:32 [content] Synced content
+21:28:32 [types] Generated 369ms
+21:28:32 [build] output: "static"
+21:28:32 [build] mode: "static"
+21:28:32 [build] directory: /home/jakub/code/trawl/.worktrees/launch-readiness/docs/dist/
+21:28:32 [build] Collecting build info...
+21:28:32 [build] ✓ Completed in 459ms.
+21:28:32 [build] Building static entrypoints...
+21:28:32 [vite] ✓ built in 210ms
+21:28:32 [vite] ✓ built in 28ms
+21:28:32 [build] Rearranging server assets...
+
+ generating static routes
+21:28:32 [WARN] [build] Could not render `/404` from route `/[...slug]` as it conflicts with higher priority route `/404`.
+21:28:32   ├─ /404.html (+11ms)
+21:28:32   ├─ /architecture/catalog/index.html (+3ms)
+21:28:32   ├─ /architecture/data-flow/index.html (+6ms)
+21:28:32   ├─ /architecture/overview/index.html (+2ms)
+21:28:32   ├─ /architecture/query-execution/index.html (+2ms)
+21:28:32   ├─ /architecture/recovery/index.html (+2ms)
+21:28:32   ├─ /architecture/reports-telemetry/index.html (+2ms)
+21:28:32   ├─ /contribute/documentation/index.html (+2ms)
+21:28:32   ├─ /contribute/experiments/index.html (+2ms)
+21:28:32   ├─ /contribute/source-map/index.html (+2ms)
+21:28:32   ├─ /contribute/testing/index.html (+1ms)
+21:28:32   ├─ /getting-started/index.html (+2ms)
+21:28:32   ├─ /getting-started/development/index.html (+2ms)
+21:28:32   ├─ /getting-started/first-query/index.html (+2ms)
+21:28:32   ├─ /getting-started/vector-integration/index.html (+4ms)
+21:28:32   ├─ /index.html (+4ms)
+21:28:32   ├─ /operate/access/index.html (+2ms)
+21:28:32   ├─ /operate/backup-restore/index.html (+1ms)
+21:28:32   ├─ /operate/catalog/index.html (+1ms)
+21:28:32   ├─ /operate/deployment/index.html (+2ms)
+21:28:32   ├─ /operate/health/index.html (+1ms)
+21:28:32   ├─ /operate/ingestion/index.html (+1ms)
+21:28:32   ├─ /operate/retention/index.html (+1ms)
+21:28:32   ├─ /reference/api/index.html (+2ms)
+21:28:32   ├─ /reference/cli/index.html (+1ms)
+21:28:32   ├─ /reference/configuration/index.html (+1ms)
+21:28:32   ├─ /reference/crash-dumps/index.html (+1ms)
+21:28:32   ├─ /reference/dsl/index.html (+2ms)
+21:28:32   ├─ /reference/events/index.html (+1ms)
+21:28:32   ├─ /reference/web-ui/index.html (+1ms)
+21:28:32   ├─ /start/connect/index.html (+1ms)
+21:28:32   ├─ /start/local-parquet/index.html (+1ms)
+21:28:32   ├─ /start/overview/index.html (+2ms)
+21:28:32   ├─ /use/cli-tui/index.html (+1ms)
+21:28:32   ├─ /use/live-tail/index.html (+1ms)
+21:28:32   ├─ /use/query-tutorial/index.html (+1ms)
+21:28:32   ├─ /use/saved-reports/index.html (+1ms)
+21:28:32   ├─ /use/sharing-export/index.html (+1ms)
+21:28:32 ✓ Completed in 105ms.
+
+21:28:32 [build] ✓ Completed in 362ms.
+21:28:32 [starlight:pagefind] Building search index with Pagefind...
+21:28:32 [starlight:pagefind] Found 38 HTML files.
+21:28:32 [starlight:pagefind] Finished building search index in 95ms.
+21:28:32 [@astrojs/sitemap] `sitemap-index.xml` created at `dist`
+21:28:32 [build] 38 page(s) built in 935ms
+21:28:32 [build] Complete!
+Checked 38 HTML pages, 2947 local links, 26 TOML blocks, and 18 DSL stages.

@@ -1,0 +1,1 @@
+xtask: web bundle raw=28.60 MiB, gzip=3.33 MiB, brotli=2.05 MiB (budgets: gzip 4.00 MiB, brotli 2.50 MiB)

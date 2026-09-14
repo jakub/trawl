@@ -21,9 +21,13 @@ use trawl_server::transport::http;
 #[derive(Parser)]
 #[command(name = "trawld", version, long_version = trawl_core::version::long_version(), about)]
 struct Cli {
-    /// Path to the configuration file.
-    #[arg(long, env = "TRAWL_CONFIG", default_value = "~/.trawl/trawld.toml")]
-    config: String,
+    /// Path to the configuration file (default: ~/.trawl/trawld.toml).
+    #[arg(long, env = "TRAWL_CONFIG")]
+    config: Option<String>,
+
+    /// Validate an explicitly selected config and exit without starting services.
+    #[arg(long, requires = "config")]
+    check_config: bool,
 
     /// Path to ndjson query debug log. Overrides config `server.query_log`.
     #[arg(long, env = "TRAWL_QUERY_LOG")]
@@ -44,6 +48,24 @@ struct Cli {
 const RUNTIME_SHUTDOWN_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Inspect only arguments before choosing the seal. The monitor re-exec
+    // carries no arguments, so it always reaches normal crash-dump init.
+    // Both paths seal before config reads or threads. Check mode must not
+    // start the monitor or create its directory, even when capture is enabled.
+    if std::env::args_os().any(|arg| arg == "--check-config") {
+        if trawl_crashdump::seal_for_config_check().is_err() {
+            eprintln!("[trawld] configuration check refused: capability seal failed");
+            std::process::exit(1);
+        }
+        let cli = Cli::parse();
+        let path = resolve_path(cli.config.as_deref().expect("clap requires config"));
+        if let Err(error) = check_config(&path) {
+            eprintln!("[trawld] {error}");
+            std::process::exit(1);
+        }
+        println!("Configuration is valid: {}", path.display());
+        return Ok(());
+    }
     // Install crash-dump capture before any threads are spawned or the async
     // runtime is built: the minidump monitor is launched by re-execing this
     // binary, which is only fork-safe while the process is single-threaded. In
@@ -104,6 +126,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     result
 }
 
+/// Validate local configuration only. Database URLs are required, but no
+/// network connectivity, credentials, or stored data contents are inspected.
+/// File-log validation reads path metadata to detect marker aliases.
+fn check_config(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    let config = Config::from_file(path)?;
+    validate_file_log_config(&config)?;
+    config.auth.resolve_database_url()?;
+    config.storage.resolve_database_url()?;
+    trawl_server::ingest::producer::Derivation::resolve(&config.ingest)
+        .map_err(|_| "invalid setting at ingest: check severity_from and time_from")?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)] // lifecycle orchestration is cohesive
 async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn std::error::Error>> {
     rustls::crypto::ring::default_provider()
@@ -111,7 +146,7 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
         .expect("failed to install ring crypto provider");
 
     let cli = Cli::parse();
-    let config_path = resolve_path(&cli.config);
+    let config_path = resolve_path(cli.config.as_deref().unwrap_or("~/.trawl/trawld.toml"));
     // Pre-tracing boundary: no subscriber exists yet, so a config failure
     // here can only surface through stderr. Name the resolved path so the
     // operator can tell which file failed.
@@ -122,6 +157,10 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
         );
         e
     })?;
+
+    // Reject file-log marker collisions before either backend or filesystem
+    // initialization can change state. Telemetry-only configurations ignore it.
+    validate_file_log_config(&config)?;
 
     // Auto-detect TTY: monitor when interactive, log tail when piped.
     let monitor_active = std::io::IsTerminal::is_terminal(&std::io::stdout()) && !cli.no_monitor;
@@ -145,12 +184,15 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
         })?,
     );
 
-    let telemetry = init_tracing(
+    let Tracing {
+        telemetry,
+        file_log,
+    } = init_tracing(
         &config,
         monitor_active,
         &log_filter.directives,
         Arc::clone(&derivation),
-    )?;
+    );
     if let Some(warning) = &log_filter.warning {
         tracing::warn!(event_type = "config_warning", "{warning}");
     }
@@ -201,22 +243,39 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
         }
     });
 
-    // Repin recovery, filesystem half: an interrupted repin must be
-    // finished before the epoch gate forms an opinion of the data root,
-    // because a half-swapped corpus does not error, it silently promotes
-    // (ADR-0011). One stat on the marker-less fast path.
-    let recovered_repin = trawl_server::repin::recover::recover_filesystem(
-        &config.data.base_dir(),
-        config.ingest.enabled,
-    )?;
+    // Admit both databases before the epoch gate can initialize a fresh
+    // root or repin recovery can rename/sweep an existing corpus. This exact
+    // storage owner holds the sole-writer lock through recovery and serving.
+    let (auth, storage) = AppState::connect_backends(&config).await?;
 
-    // ADR-0009 storage-epoch gate: runs before any component touches the
-    // data root. Refuses to start on the ambiguous branch.
-    let epoch_outcome = trawl_server::epoch::ensure_current_epoch(
+    // Sole-writer guard: if the app-state advisory lock is ever lost (its
+    // session died and postgres freed the lock), a second trawld could
+    // acquire it and become a concurrent writer. Terminate immediately —
+    // split-brain is a correctness emergency, so a hard exit that stops all
+    // writes beats a graceful drain that keeps serving. The supervisor
+    // restarts us; boot re-acquires the lock or fails on the replacement.
+    {
+        let mut lock_lost = storage.lock_lost();
+        tokio::spawn(async move {
+            if lock_lost.wait_for(|lost| *lost).await.is_ok() {
+                tracing::error!(
+                    event_type = "lifecycle",
+                    "app-state sole-writer lock lost; terminating trawld to prevent a \
+                     split-brain second writer"
+                );
+                std::process::exit(1);
+            }
+        });
+    }
+
+    let (epoch_outcome, recovered_repin) = prepare_data_root(
         &config.data.base_dir(),
         &config.wal_dir(),
         config.ingest.enabled,
     )?;
+    if let Some(file_log) = file_log {
+        file_log.open()?;
+    }
     tracing::info!(
         event_type = "epoch_gate",
         outcome = ?epoch_outcome,
@@ -229,8 +288,20 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
         warn_retention_envs_without_dir(&config, &env_dirs);
     }
 
+    // Finish the recovered job and catalog pin before constructing a live
+    // cache or any corpus reader. Recovery's cache argument is temporary:
+    // no reader exists yet, and from_parts hydrates its real cache from the
+    // reconciled PostgreSQL catalog. No reference to this cache escapes.
+    trawl_server::repin::recover::reconcile_store(
+        &storage,
+        &trawl_server::catalog::FieldCatalog::new(),
+        &config.data.base_dir(),
+        recovered_repin,
+    )
+    .await?;
+
     let (mut state, http_config) =
-        AppState::from_config(&config, metrics_handle, derivation).await?;
+        AppState::from_parts(&config, metrics_handle, derivation, auth, storage).await?;
 
     // Open query debug log if configured (CLI flag overrides config).
     let query_log_path = cli.query_log.or(config.server.query_log.clone());
@@ -249,54 +320,6 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
         );
         state.query.query_log = Some(Arc::new(log));
     }
-
-    // Activate internal telemetry by injecting the WAL writer.
-    if let Some((handle, layer)) = &telemetry {
-        if let Some(writer) = &state.ingest.wal_writer {
-            handle.set(Arc::clone(writer), &config.ingest.default_env);
-        }
-        // Activate event bus for real-time telemetry fanout (SSE streaming).
-        if let Some(bus) = &state.ingest.event_bus {
-            layer.set_bus(Arc::clone(bus));
-        }
-        // Activate hot buffer for synchronous telemetry event insertion.
-        if let Some(buf) = &state.query.hot_buffer {
-            layer.set_hot_buffer(Arc::clone(buf));
-        }
-    }
-
-    // Sole-writer guard: if the app-state advisory lock is ever lost (its
-    // session died and postgres freed the lock), a second trawld could
-    // acquire it and become a concurrent writer. Terminate immediately —
-    // split-brain is a correctness emergency, so a hard exit that stops all
-    // writes beats a graceful drain that keeps serving. The supervisor
-    // restarts us; boot re-acquires the lock or fails on the replacement.
-    {
-        let mut lock_lost = state.storage.lock_lost();
-        tokio::spawn(async move {
-            if lock_lost.wait_for(|lost| *lost).await.is_ok() {
-                tracing::error!(
-                    event_type = "lifecycle",
-                    "app-state sole-writer lock lost; terminating trawld to prevent a \
-                     split-brain second writer"
-                );
-                std::process::exit(1);
-            }
-        });
-    }
-
-    // Repin recovery, postgres half: finish the recovered job row
-    // (idempotent flip or failure), re-arm the conformance pass for a
-    // recovered cutover, sweep the aside, reconcile orphaned running rows.
-    // Runs before the conformance pass so a cleared `conformed_at`
-    // re-proves the corpus in this very boot.
-    trawl_server::repin::recover::reconcile_store(
-        &state.storage,
-        &state.query.field_catalog,
-        &config.data.base_dir(),
-        recovered_repin,
-    )
-    .await?;
 
     // ADR-0009 boot conformance pass: make the write-time invariant true
     // over the standing corpus before anything reads or writes it. Only on
@@ -350,6 +373,23 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
                 identity = ?identity,
                 "query-only node: archive belongs to the connected catalog"
             ),
+        }
+    }
+
+    // Recovery and conformance are complete. Telemetry can now write to
+    // the WAL and hot buffer, alongside the other ingest producers.
+    // Activate internal telemetry by injecting the WAL writer.
+    if let Some((handle, layer)) = &telemetry {
+        if let Some(writer) = &state.ingest.wal_writer {
+            handle.set(Arc::clone(writer), &config.ingest.default_env);
+        }
+        // Activate event bus for real-time telemetry fanout (SSE streaming).
+        if let Some(bus) = &state.ingest.event_bus {
+            layer.set_bus(Arc::clone(bus));
+        }
+        // Activate hot buffer for synchronous telemetry event insertion.
+        if let Some(buf) = &state.query.hot_buffer {
+            layer.set_hot_buffer(Arc::clone(buf));
         }
     }
 
@@ -523,6 +563,26 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
     Ok(())
 }
 
+/// After database admission, validate the format before recovery can mutate
+/// storage. Repin swaps environment directories only; EPOCH stays in the live
+/// root throughout. The caller retains the admitted sole-writer lock.
+/// Finish recovery before state construction or any corpus reader starts.
+fn prepare_data_root(
+    data_root: &std::path::Path,
+    wal_dir: &std::path::Path,
+    ingest_enabled: bool,
+) -> Result<
+    (
+        trawl_server::epoch::Outcome,
+        Option<trawl_server::repin::recover::Recovered>,
+    ),
+    String,
+> {
+    let epoch = trawl_server::epoch::ensure_current_epoch(data_root, wal_dir, ingest_enabled)?;
+    let recovered = trawl_server::repin::recover::recover_filesystem(data_root, ingest_enabled)?;
+    Ok((epoch, recovered))
+}
+
 /// Signal a background task to shut down and await its completion.
 async fn shutdown_task(task: Option<(JoinHandle<()>, watch::Sender<bool>)>, name: &str) {
     if let Some((handle, shutdown_tx)) = task {
@@ -671,6 +731,177 @@ fn warn_retention_envs_without_dir(config: &Config, on_disk: &[String]) {
     }
 }
 
+const STORAGE_MARKERS: [&str; 3] = ["EPOCH", "CATALOG", "REPIN"];
+
+fn validate_file_log_config(config: &Config) -> std::io::Result<()> {
+    if !config.internal_telemetry_enabled()
+        && let Some(path) = &config.server.log_file
+    {
+        validate_log_destination(path, &config.data.base_dir())?;
+    }
+    Ok(())
+}
+
+/// Resolve existing aliases and missing suffixes without creating anything.
+/// Resolve symlinks before `..`, including dangling links to future markers.
+fn resolve_log_destination(path: &std::path::Path) -> std::io::Result<PathBuf> {
+    fn resolve(path: &std::path::Path, links: u8) -> std::io::Result<PathBuf> {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_symlink() => {
+                if links == 40 {
+                    return Err(std::io::Error::other(
+                        "too many symlinks in log or storage path",
+                    ));
+                }
+                let target = std::fs::read_link(path)?;
+                resolve(&path.parent().unwrap_or(path).join(target), links + 1)
+            }
+            Ok(_) => std::fs::canonicalize(path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let Some(parent) = path.parent() else {
+                    return Err(error);
+                };
+                let mut resolved = resolve(parent, links)?;
+                match path.components().next_back() {
+                    Some(std::path::Component::Normal(name)) => resolved.push(name),
+                    Some(std::path::Component::ParentDir) => {
+                        resolved.pop();
+                    }
+                    Some(std::path::Component::CurDir) => {}
+                    _ => return Err(error),
+                }
+                // Collapsing a missing `child/..` can reveal an existing
+                // symlink at the resulting path. Resolve that alias too.
+                if resolved == path {
+                    Ok(resolved)
+                } else {
+                    resolve(&resolved, links)
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+    resolve(&std::env::current_dir()?.join(path), 0)
+}
+
+fn marker_log_error(marker: &std::path::Path) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "server.log_file overlaps reserved storage marker {}; select a separate log file",
+            marker.display()
+        ),
+    )
+}
+
+fn validate_log_destination(
+    path: &std::path::Path,
+    data_root: &std::path::Path,
+) -> std::io::Result<PathBuf> {
+    let with_context = |error: std::io::Error| {
+        std::io::Error::new(
+            error.kind(),
+            format!(
+                "failed to validate server.log_file {}: {error}",
+                path.display()
+            ),
+        )
+    };
+    let resolved = resolve_log_destination(path).map_err(with_context)?;
+    for name in STORAGE_MARKERS {
+        let marker = data_root.join(name);
+        let resolved_marker = resolve_log_destination(&marker).map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to inspect reserved storage marker {} while validating server.log_file {}: {error}",
+                    marker.display(),
+                    path.display()
+                ),
+            )
+        })?;
+        if resolved == resolved_marker {
+            return Err(marker_log_error(&marker));
+        }
+    }
+    #[cfg(unix)]
+    match std::fs::metadata(&resolved) {
+        Ok(metadata) => validate_log_identity(&metadata, data_root)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(with_context(error)),
+    }
+    Ok(resolved)
+}
+
+#[cfg(unix)]
+fn validate_log_identity(
+    metadata: &std::fs::Metadata,
+    data_root: &std::path::Path,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+    for name in STORAGE_MARKERS {
+        let marker = data_root.join(name);
+        match std::fs::metadata(&marker) {
+            Ok(other) if metadata.dev() == other.dev() && metadata.ino() == other.ino() => {
+                return Err(marker_log_error(&marker));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "failed to inspect reserved storage marker {}: {error}",
+                        marker.display()
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+type JsonLogLayer = fmt::Layer<
+    tracing_subscriber::Registry,
+    fmt::format::JsonFields,
+    fmt::format::Format<fmt::format::Json>,
+    fmt::writer::BoxMakeWriter,
+>;
+
+struct FileLog {
+    path: PathBuf,
+    data_root: PathBuf,
+    writer: tracing_subscriber::reload::Handle<JsonLogLayer, tracing_subscriber::Registry>,
+}
+
+impl FileLog {
+    /// Open only after database and storage admission. Until then, this
+    /// layer sends JSON events to stderr without touching the configured path.
+    fn open(self) -> Result<(), Box<dyn std::error::Error>> {
+        let path = validate_log_destination(&self.path, &self.data_root)?;
+        if let Some(parent) = path.parent().filter(|path| !path.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        // Check the opened file too, before installing a writer that can
+        // append bytes. This also detects existing hard-link aliases.
+        #[cfg(unix)]
+        validate_log_identity(&file.metadata()?, &self.data_root)?;
+        self.writer.modify(|layer| {
+            *layer.writer_mut() = fmt::writer::BoxMakeWriter::new(file);
+        })?;
+        Ok(())
+    }
+}
+
+struct Tracing {
+    telemetry: Option<(WalHandle, WalLayer)>,
+    file_log: Option<FileLog>,
+}
+
 /// Initialize the tracing subscriber.
 ///
 /// When internal telemetry is enabled, registers a [`WalLayer`] in place of
@@ -679,7 +910,8 @@ fn warn_retention_envs_without_dir(config: &Config, on_disk: &[String]) {
 /// the flush task.
 ///
 /// When telemetry is disabled and `log_file` is configured, falls back
-/// to the JSON file layer.
+/// to a JSON layer that writes to stderr until the caller opens the file
+/// after storage admission.
 ///
 /// When `monitor_active` is true, the stdout `fmt::layer()` is omitted
 /// to avoid corrupting the TUI with interleaved log output.
@@ -688,7 +920,7 @@ fn init_tracing(
     monitor_active: bool,
     filter_directives: &str,
     derivation: Arc<trawl_server::ingest::producer::Derivation>,
-) -> Result<Option<(WalHandle, WalLayer)>, Box<dyn std::error::Error>> {
+) -> Tracing {
     // The directives were resolved (and validated when operator-supplied) by
     // `telemetry::resolve_log_filter`; each layer builds its own EnvFilter
     // from the same string. The WAL layer builds a narrower one
@@ -722,47 +954,46 @@ fn init_tracing(
                 .with(wal_layer.with_filter(telemetry::wal_filter(filter_directives)))
                 .init();
         }
-        Ok(Some((handle, flush_layer)))
+        Tracing {
+            telemetry: Some((handle, flush_layer)),
+            file_log: None,
+        }
     } else if let Some(log_path) = &config.server.log_file {
-        if let Some(parent) = log_path.parent() {
-            std::fs::create_dir_all(parent)?;
+        // Logging must not create occupancy in a fresh root or alter refused
+        // storage. Retain startup diagnostics on stderr until admission succeeds.
+        let file_layer = fmt::layer()
+            .json()
+            .with_ansi(false)
+            .with_writer(fmt::writer::BoxMakeWriter::new(std::io::stderr));
+        let (file_layer, writer) = tracing_subscriber::reload::Layer::new(file_layer);
+        let stdout_layer = (!monitor_active).then(|| fmt::layer().with_filter(make_filter()));
+        tracing_subscriber::registry()
+            .with(file_layer.with_filter(make_filter()))
+            .with(stdout_layer)
+            .init();
+        Tracing {
+            telemetry: None,
+            file_log: Some(FileLog {
+                path: log_path.clone(),
+                data_root: config.data.base_dir(),
+                writer,
+            }),
         }
-        let open_file = || -> Result<std::fs::File, Box<dyn std::error::Error>> {
-            Ok(std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(log_path)?)
-        };
-
-        if monitor_active {
-            let file_layer = fmt::layer()
-                .json()
-                .with_ansi(false)
-                .with_writer(open_file()?)
-                .with_filter(make_filter());
-            tracing_subscriber::registry().with(file_layer).init();
-        } else {
-            let stdout_layer = fmt::layer().with_filter(make_filter());
-            let file_layer = fmt::layer()
-                .json()
-                .with_ansi(false)
-                .with_writer(open_file()?)
-                .with_filter(make_filter());
-            tracing_subscriber::registry()
-                .with(stdout_layer)
-                .with(file_layer)
-                .init();
-        }
-        Ok(None)
     } else if monitor_active {
         // Monitor active, no telemetry, no file — still need a subscriber
         // but skip stdout to avoid TUI corruption.
         tracing_subscriber::registry().init();
-        Ok(None)
+        Tracing {
+            telemetry: None,
+            file_log: None,
+        }
     } else {
         let stdout_layer = fmt::layer().with_filter(make_filter());
         tracing_subscriber::registry().with(stdout_layer).init();
-        Ok(None)
+        Tracing {
+            telemetry: None,
+            file_log: None,
+        }
     }
 }
 
@@ -902,12 +1133,153 @@ fn resolve_path(path: &str) -> PathBuf {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn log_destination_rejects_marker_aliases_and_keeps_normal_paths() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(data.join("nested")).unwrap();
+        let alias = tmp.path().join("alias");
+        symlink("data/nested", &alias).unwrap();
+        let log_link = tmp.path().join("server.log");
+        for marker in STORAGE_MARKERS {
+            symlink(format!("data/{marker}"), &log_link).unwrap();
+            for path in [
+                log_link.clone(),
+                tmp.path().join("missing/../server.log"),
+                alias.join(format!("../{marker}")),
+                data.join(format!("missing/../{marker}")),
+            ] {
+                let error = validate_log_destination(&path, &data).unwrap_err();
+                assert!(
+                    error.to_string().contains("reserved storage marker"),
+                    "{error}"
+                );
+                assert!(!data.join(marker).exists());
+                assert!(!data.join("missing").exists());
+            }
+            std::fs::remove_file(&log_link).unwrap();
+            std::fs::write(data.join(marker), b"marker bytes").unwrap();
+            std::fs::hard_link(data.join(marker), &log_link).unwrap();
+            assert!(validate_log_destination(&log_link, &data).is_err());
+            let opened = std::fs::File::open(&log_link).unwrap();
+            assert!(validate_log_identity(&opened.metadata().unwrap(), &data).is_err());
+            assert_eq!(std::fs::read(&log_link).unwrap(), b"marker bytes");
+            std::fs::remove_file(log_link.clone()).unwrap();
+            std::fs::remove_file(data.join(marker)).unwrap();
+        }
+        for path in [
+            data.join("server.log"),
+            data.join("logs/EPOCH"),
+            tmp.path().join("EPOCH"),
+        ] {
+            assert!(validate_log_destination(&path, &data).is_ok());
+            assert!(!path.exists());
+        }
+        symlink("data", tmp.path().join("data-alias")).unwrap();
+        assert!(
+            validate_log_destination(&data.join("EPOCH"), &tmp.path().join("data-alias")).is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn log_destination_resolution_errors_do_not_change_storage() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let cycle = tmp.path().join("cycle");
+        symlink("cycle", &cycle).unwrap();
+        assert!(validate_log_destination(&cycle, &data).is_err());
+        assert!(!data.exists());
+        let file = tmp.path().join("file");
+        std::fs::write(&file, b"preserve").unwrap();
+        let path = file.join("log");
+        let error = validate_log_destination(&path, &data).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotADirectory);
+        assert!(error.to_string().contains("server.log_file"));
+        assert!(error.to_string().contains(&path.display().to_string()));
+        assert_eq!(std::fs::read(&file).unwrap(), b"preserve");
+        assert!(!data.exists());
+        let blocked = tmp.path().join("blocked");
+        std::fs::create_dir(&blocked).unwrap();
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let traversal = std::fs::read_dir(&blocked);
+        let result = validate_log_destination(&blocked.join("server.log"), &data);
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // Privileged runners can traverse mode 000. Where the filesystem
+        // denies traversal, resolution must preserve that error.
+        if traversal.is_err() {
+            assert_eq!(
+                result.unwrap_err().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+        }
+        assert!(!data.exists());
+    }
+
+    #[test]
+    fn prepare_data_root_refuses_epoch_or_wal_before_repin_cleanup() {
+        for invalid_epoch in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let data = tmp.path().join("data");
+            let shadow = tmp.path().join("data.repin-next");
+            std::fs::create_dir(&data).unwrap();
+            std::fs::create_dir(&shadow).unwrap();
+            std::fs::write(shadow.join("sentinel"), b"must survive").unwrap();
+            std::fs::write(data.join("EPOCH"), if invalid_epoch { "2" } else { "3" }).unwrap();
+            let wal = tmp.path().join("wal");
+            if !invalid_epoch {
+                std::fs::create_dir(&wal).unwrap();
+                std::fs::write(wal.join("flat.ndjson"), b"unsupported").unwrap();
+            }
+            // Recovery without the gate would sweep this markerless shadow.
+            assert!(prepare_data_root(&data, &wal, true).is_err());
+            assert_eq!(
+                std::fs::read(shadow.join("sentinel")).unwrap(),
+                b"must survive"
+            );
+        }
+    }
+
+    #[test]
+    fn prepare_data_root_recovers_current_repin_before_returning() {
+        use trawl_server::repin::marker::{RepinMarker, RepinPhase, write_marker};
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let shadow = tmp.path().join("data.repin-next");
+        std::fs::create_dir_all(data.join("prod")).unwrap();
+        std::fs::create_dir_all(shadow.join("prod")).unwrap();
+        std::fs::write(data.join("EPOCH"), "3").unwrap();
+        std::fs::write(data.join("prod/a.parquet"), b"old").unwrap();
+        std::fs::write(shadow.join("prod/a.parquet"), b"new").unwrap();
+        write_marker(
+            &data,
+            &RepinMarker {
+                job_id: 1,
+                field: "status".into(),
+                from_type: "BIGINT".into(),
+                to_type: "VARCHAR".into(),
+                phase: RepinPhase::Cutover,
+            },
+        )
+        .unwrap();
+        assert!(prepare_data_root(&data, &data.join("wal"), false).is_err());
+        assert_eq!(std::fs::read(data.join("prod/a.parquet")).unwrap(), b"old");
+        let (epoch, recovered) = prepare_data_root(&data, &data.join("wal"), true).unwrap();
+        assert_eq!(epoch, trawl_server::epoch::Outcome::Current);
+        assert!(recovered.is_some());
+        assert_eq!(std::fs::read(data.join("prod/a.parquet")).unwrap(), b"new");
+        assert_eq!(std::fs::read(data.join("EPOCH")).unwrap(), b"3");
+    }
+
     fn config_with(retention: &str, ingest: &str) -> Config {
         Config::from_toml(&format!(
             r#"
 [server]
 [data]
-path = "/data/*.parquet"
+path = "/data"
 [auth]
 [ingest]
 {ingest}

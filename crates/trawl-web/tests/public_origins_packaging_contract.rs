@@ -100,6 +100,7 @@ fn helm_template(template: &str, extra: &[&str]) -> Option<Result<String, String
         .args(["template", "trawl"])
         .arg(&chart)
         .args(["--show-only", &format!("templates/{template}")])
+        .args(["--set-string", "image.tag=source-render-test"])
         // Both DSN Secrets are `required`; the names are irrelevant here.
         .args(["--set", "auth.database.existingSecret=test-fleet-dsn"])
         .args(["--set", "storage.database.existingSecret=test-trawl-dsn"])

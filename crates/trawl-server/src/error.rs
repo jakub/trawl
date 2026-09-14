@@ -209,6 +209,10 @@ impl From<fleet_auth::AuthError> for ServerError {
                 tracing::error!(target: "auth.backend", error = %e, "fleet auth migration error");
                 Self::ServiceUnavailable("auth backend unavailable".into())
             }
+            E::Schema(e) => {
+                tracing::error!(target: "auth.backend", error = %e, "fleet auth schema error");
+                Self::ServiceUnavailable("auth backend unavailable".into())
+            }
             E::Hash(e) | E::TokenGeneration(e) => {
                 tracing::error!(target: "auth.backend", error = %e, "fleet auth worker error");
                 Self::ServiceUnavailable("auth backend unavailable".into())
@@ -361,7 +365,7 @@ impl IntoResponse for ServerError {
             },
             Self::Unauthorized(msg) => (
                 StatusCode::UNAUTHORIZED,
-                ErrorEnvelope::simple(ErrorCode::Unauthorized, msg.clone()),
+                ErrorEnvelope::simple(ErrorCode::AuthError, msg.clone()),
             ),
             Self::Forbidden(msg) => (
                 StatusCode::FORBIDDEN,
@@ -438,11 +442,22 @@ impl IntoResponse for ServerError {
 mod tests {
     use super::*;
 
-    #[test]
-    fn unauthorized_maps_to_401() {
-        let err = ServerError::Unauthorized("missing token".into());
-        let response = err.into_response();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    #[tokio::test]
+    async fn authentication_failures_use_the_current_opaque_wire_code() {
+        for error in [
+            fleet_auth::AuthError::InvalidKey("private-rejection-reason".into()),
+            fleet_auth::AuthError::MalformedToken("private-token-value".into()),
+        ] {
+            let response = ServerError::from(error).into_response();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["error"]["code"], "auth_error");
+            assert_eq!(body["error"]["message"], "authentication failed");
+            assert!(!String::from_utf8_lossy(&bytes).contains("private-"));
+        }
     }
 
     #[test]

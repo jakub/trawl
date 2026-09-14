@@ -1,0 +1,8 @@
+Certificate Ready=True; Secret type kubernetes.io/tls; tls.crt/tls.key present; public keys match.
+subject=
+issuer=
+notBefore=Sep 14 03:47:51 2026 GMT
+notAfter=Dec 13 03:47:51 2026 GMT
+sha256 Fingerprint=A3:89:64:38:E2:9A:63:E0:DE:6E:37:A4:03:69:35:0D:7F:21:DF:58:9A:0F:A7:54:7A:5C:EF:2A:15:5E:EB:99
+X509v3 Subject Alternative Name: critical
+    DNS:l06-trawl.l06-cert-manager.svc, DNS:trawl.l06.example.test

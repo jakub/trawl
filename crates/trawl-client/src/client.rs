@@ -952,14 +952,22 @@ fn normalize_base_url(url: String) -> String {
     }
 }
 
-/// Categorize a reqwest error without exposing raw details that might
-/// contain tokens or internal URLs.
+/// Categorize a reqwest error without exposing raw details or URL secrets.
+/// Connection diagnostics identify only the API origin, never URL userinfo,
+/// paths, query parameters, or fragments.
 #[allow(clippy::needless_pass_by_value)] // used as `.map_err(sanitize_reqwest_error)`
 fn sanitize_reqwest_error(e: reqwest::Error) -> ClientError {
-    if e.is_timeout() {
-        ClientError::Network("request timed out".into())
-    } else if e.is_connect() {
-        ClientError::Network("connection failed".into())
+    if e.is_timeout() || e.is_connect() {
+        let reason = if e.is_timeout() {
+            "request timed out"
+        } else {
+            "connection failed"
+        };
+        let message = e.url().map_or_else(
+            || reason.to_owned(),
+            |url| format!("{reason} for API {}", url.origin().ascii_serialization()),
+        );
+        ClientError::Network(message)
     } else if e.is_builder() {
         ClientError::Network("invalid request configuration".into())
     } else if e.is_redirect() {
@@ -1038,6 +1046,72 @@ mod tests {
 
     fn init() {
         let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
+    #[tokio::test]
+    async fn connection_error_identifies_api_origin_without_url_secrets() {
+        init();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let url = format!(
+            "https://private-user:private-password@{address}/private-token-path?query=private-dsl&token=private-query-token#private-fragment"
+        );
+        let client = HttpClient::with_client(
+            url,
+            "private-bearer-token",
+            Client::builder().no_proxy().build().unwrap(),
+        );
+        // Close the accepted socket during TLS setup to produce a real
+        // connection error without racing another process for a closed port.
+        let (result, ()) = tokio::join!(
+            client.query_paginated("private-query-text", None, None),
+            async {
+                let (socket, _) = listener.accept().await.unwrap();
+                drop(socket);
+            }
+        );
+        let error = result.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("network error: connection failed for API https://{address}")
+        );
+        assert!(!format!("{error:?}").contains("private-"));
+    }
+
+    #[tokio::test]
+    async fn timeout_identifies_only_api_origin() {
+        init();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_millis(50))
+            .build()
+            .unwrap();
+        let error = client
+            .get(format!("http://private-user:private-password@{address}/private-path?query=private-dsl#private-fragment"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(error.is_timeout());
+        assert_eq!(
+            sanitize_reqwest_error(error).to_string(),
+            format!("network error: request timed out for API http://{address}")
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_url_error_does_not_expose_input() {
+        init();
+        let error = Client::new()
+            .get("private-invalid-url")
+            .send()
+            .await
+            .unwrap_err();
+        assert_eq!(
+            sanitize_reqwest_error(error).to_string(),
+            "network error: invalid request configuration"
+        );
     }
 
     // ── endpoint URL construction ───────────────────────────────────────

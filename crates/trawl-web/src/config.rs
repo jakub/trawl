@@ -90,7 +90,7 @@ pub enum ConfigError {
     #[error("failed to parse config file {path}: {source}")]
     ParseFile {
         path: PathBuf,
-        source: toml::de::Error,
+        source: trawl_config::ConfigError,
     },
 
     #[error("env var {name} is referenced by config but not set in the environment")]
@@ -153,7 +153,7 @@ impl ResolvedConfig {
             path: path.to_owned(),
             source: e,
         })?;
-        let config: Config = toml::from_str(&contents).map_err(|e| ConfigError::ParseFile {
+        let config = Config::parse_toml(&contents).map_err(|e| ConfigError::ParseFile {
             path: path.to_owned(),
             source: e,
         })?;
@@ -493,6 +493,66 @@ mod tests {
 
     /// The origin every fixture below states as the browser-visible one.
     const TEST_ORIGIN: &str = "https://trawl.example.com";
+
+    #[test]
+    fn file_load_errors_identify_paths_without_config_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("trawld.toml");
+        for (document, expected) in [
+            (
+                "[server]\n[data]\npath='/data'\n[web]\ncoastwatch_url='private-secret'",
+                "web.coastwatch_url",
+            ),
+            (
+                "[server]\n[data]\npath='/data'\n[web]\nsession_ttl_secs='private-secret'",
+                "web.session_ttl_secs",
+            ),
+            (
+                "[server]\n[data]\npath='/data'\n[web]\nupstream_url='private-secret",
+                "invalid TOML syntax",
+            ),
+        ] {
+            std::fs::write(&path, document).unwrap();
+            let error = ResolvedConfig::load(&path).unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+            assert!(!error.to_string().contains("private-secret"));
+            assert!(!format!("{error:?}").contains("private-secret"));
+        }
+    }
+
+    #[test]
+    fn file_load_resolves_the_current_web_configuration() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("trawld.toml");
+        let key_path = directory.path().join("session.key");
+        std::fs::write(&key_path, [0x42u8; KEY_LEN]).unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                r#"
+[server]
+http_addr = "127.0.0.1:5514"
+[data]
+path = "~/data"
+[web]
+public_origins = ["https://trawl.example.com"]
+cookie_secret_path = "{}"
+session_ttl_secs = 3600
+"#,
+                key_path.display()
+            ),
+        )
+        .unwrap();
+        let resolved = ResolvedConfig::load(&path).unwrap();
+        assert_eq!(resolved.upstream_url, "https://127.0.0.1:5514");
+        assert_eq!(resolved.session_ttl_secs, 3600);
+        assert_eq!(
+            resolved.cookie_key.to_base64url().as_str(),
+            SessionKey::from_bytes([0x42; KEY_LEN])
+                .to_base64url()
+                .as_str()
+        );
+    }
 
     #[test]
     fn a_long_allowlist_is_summarized_by_count_and_a_capped_sample() {

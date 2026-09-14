@@ -20,7 +20,7 @@ pub enum StoreError {
 
     /// Boot-time migration failed.
     #[error("app-state store migration failed: {0}")]
-    Migration(#[from] sqlx::migrate::MigrateError),
+    Migration(#[from] super::migrations::SchemaError),
 
     /// Another trawld instance holds the app-state advisory lock.
     #[error(

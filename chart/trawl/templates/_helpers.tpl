@@ -60,10 +60,10 @@ Service account name.
 {{- end }}
 
 {{/*
-Container image with tag defaulting to appVersion.
+Container image. Source checkouts require a tag; release packages supply it.
 */}}
 {{- define "trawl.image" -}}
-{{- $tag := default .Chart.AppVersion .Values.image.tag -}}
+{{- $tag := required "image.tag is required: select an image built from this chart checkout" .Values.image.tag -}}
 {{- printf "%s:%s" .Values.image.repository $tag }}
 {{- end }}
 

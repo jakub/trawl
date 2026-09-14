@@ -16,284 +16,213 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
-  build-linux:
-    name: build (${{ matrix.target }})
-    runs-on: k8s-big
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            arch: amd64
-            cross: false
-          - target: aarch64-unknown-linux-gnu
-            arch: arm64
-            cross: true
+  resolve-source:
+    name: resolve release source
+    runs-on: k8s-small
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.source.outputs.tag }}
+      sha: ${{ steps.source.outputs.sha }}
+    steps:
+      # The resolver belongs to the workflow revision. Product source below
+      # always comes from the single immutable commit it resolves.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.sha }}
+      - name: Resolve exact release tag
+        id: source
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_REF: ${{ github.ref }}
+          REQUESTED_TAG: ${{ inputs.tag }}
+        run: python3 scripts/release/resolve-source.py "$EVENT_NAME" "$EVENT_REF" "$REQUESTED_TAG" >> "$GITHUB_OUTPUT"
+
+  build-chart:
+    name: prepare release chart and announcement
+    needs: resolve-source
+    runs-on: k8s-small
+    permissions:
+      contents: read
+    env:
+      RELEASE_TAG: ${{ needs.resolve-source.outputs.tag }}
+      SOURCE_SHA: ${{ needs.resolve-source.outputs.sha }}
+    outputs:
+      image-tag: ${{ steps.meta.outputs.version }}
+      image-tags: ${{ steps.meta.outputs.tags }}
+      image-labels: ${{ steps.meta.outputs.labels }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ needs.resolve-source.outputs.sha }}
+          persist-credentials: false
 
-      - name: Set version from tag
+      - name: Prepare curated announcement from selected product source
         run: |
-          version="${RELEASE_TAG#v}"
-          echo "Setting workspace version to ${version}"
-          sed -i "0,/^version = \".*\"/s//version = \"${version}\"/" Cargo.toml
-          grep '^version' Cargo.toml
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          mkdir announcement-artifact
+          if ! git show "${SOURCE_SHA}:docs/releases/${RELEASE_TAG}.md" > announcement-artifact/body.md; then
+            echo "Missing curated release announcement: docs/releases/${RELEASE_TAG}.md" >&2
+            exit 1
+          fi
+          if ! test -s announcement-artifact/body.md; then
+            echo "Curated release announcement must not be empty" >&2
+            exit 1
+          fi
+          (cd announcement-artifact && sha256sum body.md > SHA256SUMS)
 
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1; pinned via toolchain input
+      - name: Keep the exact curated announcement
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          toolchain: 1.98.0
-          targets: ${{ matrix.target }}, wasm32-unknown-unknown
-          # llvm-tools ships llvm-strip, used to strip the shipped binaries
-          # after breakpad symbols are dumped (see the dump_syms/strip steps).
-          components: llvm-tools
+          name: release-announcement
+          path: announcement-artifact/
+          if-no-files-found: error
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      # Metadata normalization and chart construction finish before any
+      # registry write. Docker consumes these exact tags and labels later.
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
-          key: release-${{ matrix.target }}
+          images: ghcr.io/${{ github.repository }}
+          labels: |
+            org.opencontainers.image.revision=${{ needs.resolve-source.outputs.sha }}
+          tags: |
+            type=semver,pattern={{version}},value=${{ env.RELEASE_TAG }}
+            type=raw,value=latest
 
-      - name: Install zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
-
-      - name: Install cross-arch dpkg libs
-        if: matrix.cross
-        run: |
-          sudo dpkg --add-architecture arm64
-          for f in /etc/apt/sources.list.d/*.sources; do
-            [ -f "$f" ] && sudo sed -i '/^Architectures:/!s/^Types: deb/Architectures: amd64\nTypes: deb/' "$f"
-          done
-          for f in /etc/apt/sources.list.d/*.list; do
-            [ -f "$f" ] && sudo sed -i '/\[arch=/!s/^deb /deb [arch=amd64] /' "$f"
-          done
-          codename="$(lsb_release -cs)"
-          printf 'deb [arch=arm64] http://ports.ubuntu.com/ %s %s\n' \
-            "$codename"          "main universe" \
-            "$codename-updates"  "main universe" \
-            "$codename-security" "main universe" \
-            | sudo tee /etc/apt/sources.list.d/arm64.list
-          sudo apt-get update
-          sudo apt-get install -y libc6-arm64-cross dpkg-dev
-
-      - uses: taiki-e/install-action@d858f8113943481093e02986a7586a4819a3bfd6 # v2
+      - name: Check out chart tooling at the workflow source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          tool: cargo-zigbuild,cargo-deb,trunk,wasm-bindgen-cli
+          ref: ${{ github.sha }}
+          path: .release-tooling
+          persist-credentials: false
 
-      # Build the leptos SPA first so rust-embed picks up a populated
-      # dist/ when trawl-web compiles. wasm toolchain is host-only, so
-      # this runs before the cross-target cargo zigbuild step.
-      - name: Build web UI SPA
-        working-directory: crates/trawl-web-ui
-        run: trunk build --release
-      - name: Precompress SPA + enforce wire-size budgets
-        run: cargo xtask compress-web
+      - name: Install Helm
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
 
-      # `cargo build --release` alone honors workspace default-members,
-      # which excludes trawl-web. `--workspace --exclude trawl-web-ui`
-      # builds every crate (including trawl-web) except the wasm32-only
-      # SPA crate — which was already built by the preceding trunk step.
-      - name: Build
-        run: cargo zigbuild --release --workspace --exclude trawl-web-ui --target ${{ matrix.target }}.2.31
+      - name: Package and validate selected chart
         env:
-          # Zig's lld strips .symtab regardless of the profile's
-          # strip = "debuginfo". Override strip to false so the build retains
-          # full symbols + DWARF; the dump_syms step below harvests breakpad
-          # .sym files from these fat binaries before they are stripped for
-          # shipping. --build-id=sha1 stamps a content-based GNU build-id note
-          # so the runtime minidump's module id matches the published .sym's
-          # DEBUG_ID (the id is preserved across the later llvm-strip).
-          CARGO_PROFILE_RELEASE_STRIP: "false"
-          RUSTFLAGS: "-C link-arg=-Wl,--build-id=sha1"
-
-      - name: Install dump_syms
+          IMAGE_TAG: ${{ steps.meta.outputs.version }}
         run: |
           set -euo pipefail
-          version="2.3.7"
-          sha256="928f9902244f63be4b3b0acf56963ecad97b7227ecfd9ee645d73683f75a9285"
-          url="https://github.com/mozilla/dump_syms/releases/download/v${version}/dump_syms-x86_64-unknown-linux-gnu.tar.xz"
-          curl --proto '=https' --tlsv1.2 -fLsS "$url" -o dump_syms.tar.xz
-          echo "${sha256}  dump_syms.tar.xz" | sha256sum --check --strict
-          # Self-hosted runners can't write /usr/local/bin; install into the
-          # cargo bin dir, which is writable and already on PATH for later steps.
-          mkdir -p "$CARGO_HOME/bin"
-          tar -xf dump_syms.tar.xz --strip-components=1 -C "$CARGO_HOME/bin" dump_syms-x86_64-unknown-linux-gnu/dump_syms
-          rm dump_syms.tar.xz
-          dump_syms --version
+          mkdir chart-artifact
+          bash .release-tooling/scripts/release/package-chart.sh "$RELEASE_TAG" "$IMAGE_TAG" chart/trawl chart-artifact
+          helm lint chart-artifact/trawl-*.tgz --strict \
+            --set auth.database.existingSecret=fleet-db \
+            --set storage.database.existingSecret=trawl-db --set web.enabled=false
+          helm template release-proof chart-artifact/trawl-*.tgz \
+            --set auth.database.existingSecret=fleet-db \
+            --set storage.database.existingSecret=trawl-db --set web.enabled=false >/dev/null
+          (cd chart-artifact && sha256sum ./*.tgz > SHA256SUMS)
 
-      # Harvest breakpad symbols from the FAT binaries (with .symtab + DWARF)
-      # BEFORE stripping. --store writes <module>/<DEBUG_ID>/<module>.sym, the
-      # exact layout `minidump-stackwalk --symbols-url` expects. libduckdb is
-      # statically linked, so each binary's .sym also covers its C++ frames.
-      - name: Dump breakpad symbols
-        run: |
-          set -euo pipefail
-          bindir="target/${{ matrix.target }}/release"
-          for bin in trawld trawl trawl-admin trawl-web fleet-admin; do
-            dump_syms --store symbols/ "${bindir}/${bin}"
-          done
-          find symbols -type f | sort
-
-      # Strip the shipped binaries now that symbols are captured, so the
-      # deb/tarball stay lean. llvm-strip keeps allocated notes (including
-      # .note.gnu.build-id) by default, so the shipped build-id still matches
-      # the .sym DEBUG_ID. Strip in place, before the deb/tarball steps.
-      #
-      # After each strip, ASSERT the build-id note actually survived: the entire
-      # symbolication chain hinges on the runtime minidump's module id matching
-      # the published .sym DEBUG_ID, and zig's lld defaults to --build-id=none,
-      # so a silent miss (here or on a future toolchain bump) would ship green
-      # builds whose crash dumps never resolve. Runs on both matrix legs, so it
-      # also covers the aarch64 cross binaries.
-      - name: Strip shipped binaries
-        run: |
-          set -euo pipefail
-          llvm_strip="$(find "$(rustc --print sysroot)"/lib/rustlib/*/bin -name llvm-strip | head -n1 || true)"
-          if [ -z "${llvm_strip}" ] || [ ! -x "${llvm_strip}" ]; then
-            echo "::error::llvm-strip not found under $(rustc --print sysroot)/lib/rustlib/*/bin -- is the llvm-tools component installed?" >&2
-            exit 1
-          fi
-          # llvm-tools ships llvm-objcopy but NOT llvm-readelf, so verify the
-          # build-id by extracting the note section with objcopy and checking it
-          # is non-empty (an absent note extracts to a 0-byte file; verified on
-          # real ELF). objcopy writes a separate output, leaving the binary as-is.
-          llvm_objcopy="${llvm_strip%/*}/llvm-objcopy"
-          if [ ! -x "${llvm_objcopy}" ]; then
-            echo "::error::llvm-objcopy not found next to llvm-strip -- cannot verify build-id" >&2
-            exit 1
-          fi
-          echo "using ${llvm_strip}"
-          bindir="target/${{ matrix.target }}/release"
-          for bin in trawld trawl trawl-admin trawl-web fleet-admin; do
-            "${llvm_strip}" "${bindir}/${bin}"
-            rm -f build-id.note
-            "${llvm_objcopy}" -O binary --only-section=.note.gnu.build-id "${bindir}/${bin}" build-id.note 2>/dev/null || true
-            if [ ! -s build-id.note ]; then
-              echo "::error::${bin} (${{ matrix.target }}) has no GNU build-id note after strip -- minidumps would never symbolicate" >&2
-              exit 1
-            fi
-          done
-          rm -f build-id.note
-
-      - name: Build .deb packages
-        run: |
-          cargo deb -p trawl-server --no-build --no-strip --target ${{ matrix.target }}
-          cargo deb -p trawl-cli --no-build --no-strip --target ${{ matrix.target }}
-
-      - name: Create tarball
-        run: |
-          tag="${RELEASE_TAG}"
-          staging="trawl-${tag}-${{ matrix.target }}"
-          mkdir -p "${staging}"
-          cp "target/${{ matrix.target }}/release/trawl" "${staging}/"
-          cp "target/${{ matrix.target }}/release/trawld" "${staging}/"
-          cp "target/${{ matrix.target }}/release/trawl-admin" "${staging}/"
-          cp "target/${{ matrix.target }}/release/fleet-admin" "${staging}/"
-          cp "target/${{ matrix.target }}/release/trawl-web" "${staging}/"
-          tar czf "${staging}.tar.gz" "${staging}"
-
-      - name: Upload tarball
+      - name: Keep the exact validated chart
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: dist-${{ matrix.target }}
-          path: trawl-*.tar.gz
+          name: release-chart
+          path: chart-artifact/
           if-no-files-found: error
 
-      - name: Upload .deb packages
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: deb-${{ matrix.target }}
-          path: target/${{ matrix.target }}/debian/*.deb
-          if-no-files-found: error
-
-      - name: Upload breakpad symbols
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: symbols-${{ matrix.target }}
-          path: symbols/
-          if-no-files-found: error
+  build-linux:
+    needs: resolve-source
+    uses: ./.github/workflows/linux-distribution.yml
+    with:
+      source-sha: ${{ needs.resolve-source.outputs.sha }}
+      tooling-sha: ${{ github.sha }}
+      release-tag: ${{ needs.resolve-source.outputs.tag }}
 
   build-macos:
-    name: build (aarch64-apple-darwin)
-    runs-on: k8s-big
-    # macOS cross-compile is best-effort — don't block release artifacts
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          ref: ${{ env.RELEASE_TAG }}
+    needs: resolve-source
+    uses: ./.github/workflows/macos-cli.yml
+    with:
+      source-sha: ${{ needs.resolve-source.outputs.sha }}
+      tooling-sha: ${{ github.sha }}
+      release-tag: ${{ needs.resolve-source.outputs.tag }}
 
-      - name: Set version from tag
-        run: |
-          version="${RELEASE_TAG#v}"
-          sed -i "0,/^version = \".*\"/s//version = \"${version}\"/" Cargo.toml
-
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1; pinned via toolchain input
-        with:
-          toolchain: 1.98.0
-          targets: aarch64-apple-darwin
-
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          key: release-aarch64-apple-darwin
-
-      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
-
-      - uses: taiki-e/install-action@d858f8113943481093e02986a7586a4819a3bfd6 # v2
-        with:
-          tool: cargo-zigbuild
-
-      # Follow-up: this path downloads libduckdb.dylib while the tarball below
-      # currently stages only `trawl`. Audit with `otool -L`, then either ship
-      # and locate the dylib or produce a correctly linked static artifact.
-      - name: Build CLI for macOS
-        run: cargo zigbuild --release --target aarch64-apple-darwin -p trawl-cli --no-default-features
-        env:
-          DUCKDB_DOWNLOAD_LIB: "1"
-
-      - name: Create tarball
-        run: |
-          tag="${RELEASE_TAG}"
-          staging="trawl-${tag}-aarch64-apple-darwin"
-          mkdir -p "${staging}"
-          cp "target/aarch64-apple-darwin/release/trawl" "${staging}/"
-          tar czf "${staging}.tar.gz" "${staging}"
-
-      - name: Upload tarball
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: dist-aarch64-apple-darwin
-          path: trawl-*.tar.gz
-          if-no-files-found: error
+  build-docs:
+    needs: resolve-source
+    uses: ./.github/workflows/docs.yml
+    with:
+      source-sha: ${{ needs.resolve-source.outputs.sha }}
+      release-tag: ${{ needs.resolve-source.outputs.tag }}
 
   release:
     name: github release
-    needs: build-linux
+    needs: [resolve-source, docker, publish-helm]
+    env:
+      RELEASE_TAG: ${{ needs.resolve-source.outputs.tag }}
     runs-on: k8s-small
     steps:
-      - name: Download artifacts
+      - name: Download tarballs
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - name: Download Debian packages
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: deb-*
           path: dist
           merge-multiple: true
 
       - name: List artifacts
         run: find dist -type f | sort
 
+      - name: Download curated announcement
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-announcement
+          path: announcement
+      - name: Verify exact prepared announcement
+        run: cd announcement && sha256sum --check SHA256SUMS
+
       - name: Create release
         uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
-          generate_release_notes: true
+          generate_release_notes: false
+          body_path: announcement/body.md
           files: |
             dist/**/*.tar.gz
             dist/**/*.deb
+            dist/**/*.sha256
+
+  publish-docs:
+    needs: [resolve-source, build-docs, release]
+    runs-on: k8s-small
+    permissions:
+      contents: write
+    concurrency:
+      group: gh-pages-deploy
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: documentation-site
+          path: docs/dist
+      - name: Deploy selected release documentation
+        uses: JamesIves/github-pages-deploy-action@d92aa235d04922e8f08b40ce78cc5442fcfbfa2f # v4
+        with:
+          branch: gh-pages
+          folder: docs/dist
+          clean: true
+          clean-exclude: |
+            apt/
+            gpg.key
+            symbols/
 
   publish-apt:
     name: publish APT repository
-    needs: [build-linux, release]
+    needs: [resolve-source, build-linux, release]
+    env:
+      RELEASE_TAG: ${{ needs.resolve-source.outputs.tag }}
     runs-on: k8s-small
     concurrency:
       group: gh-pages-deploy
@@ -353,23 +282,22 @@ jobs:
         env:
           GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
 
+      # Publisher tooling belongs to the workflow revision, like the resolver.
+      # Older product tags may predate it; product builds use the resolved tag commit.
+      - name: Load APT index builder from workflow source
+        env:
+          WORKFLOW_SHA: ${{ github.sha }}
+        run: |
+          git fetch --no-tags --depth=1 origin "$WORKFLOW_SHA"
+          git show "${WORKFLOW_SHA}:scripts/release/build-apt-index.py" > "$RUNNER_TEMP/build-apt-index.py"
+
       - name: Build APT repository
         shell: bash
         run: |
           set -euo pipefail
 
-          mkdir -p apt/pool
-          find incoming -name '*.deb' -exec cp {} apt/pool/ \;
-          ls -la apt/pool/
-
+          python3 "$RUNNER_TEMP/build-apt-index.py" incoming apt
           cd apt
-
-          for arch in amd64 arm64; do
-            dir="dists/stable/main/binary-${arch}"
-            mkdir -p "${dir}"
-            dpkg-scanpackages --arch "${arch}" pool /dev/null > "${dir}/Packages"
-            gzip -9c "${dir}/Packages" > "${dir}/Packages.gz"
-          done
 
           cd dists/stable
           cat > Release <<'RELEASE'
@@ -415,10 +343,16 @@ jobs:
 
   docker:
     name: container image
-    needs: build-linux
+    outputs:
+      image-tag: ${{ needs.build-chart.outputs.image-tag }}
+    needs: [resolve-source, build-linux, build-macos, build-docs, build-chart]
+    env:
+      RELEASE_TAG: ${{ needs.resolve-source.outputs.tag }}
     runs-on: k8s-big
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.sha }}
 
       - name: Download Linux tarballs
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -427,20 +361,15 @@ jobs:
           pattern: dist-*-unknown-linux-gnu
           merge-multiple: true
 
-      - name: Extract binaries by arch
+      - name: Extract verified artifact layout by arch
         run: |
           for arch in amd64 arm64; do
             case $arch in
               amd64) target="x86_64-unknown-linux-gnu" ;;
               arm64) target="aarch64-unknown-linux-gnu" ;;
             esac
-            mkdir -p "docker-ctx/${arch}"
-            tar xzf dist/trawl-*-${target}.tar.gz
-            cp trawl-*-${target}/trawld "docker-ctx/${arch}/"
-            cp trawl-*-${target}/trawl-admin "docker-ctx/${arch}/"
-            cp trawl-*-${target}/fleet-admin "docker-ctx/${arch}/"
-            cp trawl-*-${target}/trawl-web "docker-ctx/${arch}/"
-            chmod +x "docker-ctx/${arch}/trawld" "docker-ctx/${arch}/trawl-admin" "docker-ctx/${arch}/fleet-admin" "docker-ctx/${arch}/trawl-web"
+            mkdir -p "docker-ctx/$arch"
+            tar xzf "dist/trawl-${RELEASE_TAG}-${target}.tar.gz" -C "docker-ctx/$arch" --strip-components=1
           done
 
       - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
@@ -452,40 +381,35 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Docker metadata
-        id: meta
-        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
-        with:
-          images: ghcr.io/${{ github.repository }}
-          tags: |
-            type=semver,pattern={{version}},value=${{ env.RELEASE_TAG }}
-            type=raw,value=latest
-
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ needs.build-chart.outputs.image-tags }}
+          labels: ${{ needs.build-chart.outputs.image-labels }}
 
-  helm-package:
-    name: helm chart
-    needs: docker
+  publish-helm:
+    name: publish validated Helm chart
+    needs: [build-chart, docker]
     runs-on: k8s-small
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Download the validated chart artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-chart
+          path: chart-artifact
+
+      - name: Verify the chart bytes before publication
+        run: (cd chart-artifact && sha256sum -c SHA256SUMS)
 
       - name: Install Helm
         uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
 
       - name: Login to GHCR for Helm
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io --username ${{ github.actor }} --password-stdin
-
-      - name: Package and push chart
         env:
-          VERSION: ${{ env.RELEASE_TAG }}
-        run: |
-          version="${VERSION#v}"
-          helm package chart/trawl --version "${version}" --app-version "${version}"
-          helm push trawl-*.tgz oci://ghcr.io/${{ github.repository_owner }}/charts
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GHCR_TOKEN" | helm registry login ghcr.io --username ${{ github.actor }} --password-stdin
+
+      - name: Publish the exact prebuilt chart
+        run: helm push chart-artifact/trawl-*.tgz oci://ghcr.io/${{ github.repository_owner }}/charts

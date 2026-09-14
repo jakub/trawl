@@ -68,9 +68,9 @@ async fn harness() -> Harness {
     let wal_dir = root.join("wal");
     let data_dir = root.join("data");
     std::fs::create_dir_all(&data_dir).unwrap();
-    let data_glob = format!("{}/**/*.parquet", data_dir.display());
+    let data_path = data_dir.to_str().unwrap().to_owned();
 
-    let server = setup_in_dir_with_data(&root, data_glob, RateLimitConfig::default()).await;
+    let server = setup_in_dir_with_data(&root, data_path, RateLimitConfig::default()).await;
     std::mem::forget(tmp); // outlives the server; OS cleans up
 
     let ingest = HttpClient::new_insecure(&server.url, &server.ingest_token).unwrap();
@@ -1905,69 +1905,72 @@ async fn a_dry_run_reports_the_force_verdict_it_would_hit() {
 /// that a job about to 409 is clean.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_force_verdict_is_absent_until_the_scan_has_a_plan() {
-    let h = harness().await;
-    h.ingest_and_compact(&[event("api", &json!({"level": "error", "dur": 12}))])
-        .await;
-    h.ingest_and_compact(&[event("web", &json!({"level": "gold", "dur": 34}))])
-        .await;
+    for force in [false, true] {
+        let h = harness().await;
+        h.ingest_and_compact(&[event("api", &json!({"level": "error", "dur": 12}))])
+            .await;
+        h.ingest_and_compact(&[event("web", &json!({"level": "gold", "dur": 34}))])
+            .await;
 
-    // Slow the scan so the claimed-but-unplanned window is observable.
-    trawl_server::repin::engine::TEST_SCAN_DELAY_MS
-        .store(500, std::sync::atomic::Ordering::Relaxed);
-    let client = h.schema_admin.clone();
-    let dry = tokio::spawn(async move {
-        client
-            .schema_repin(
-                "level",
-                "severity",
-                None,
-                true,
-                false,
-                RepinCeilings::default(),
-            )
+        // Slow the scan so the claimed-but-unplanned window is observable.
+        trawl_server::repin::engine::TEST_SCAN_DELAY_MS
+            .store(500, std::sync::atomic::Ordering::Relaxed);
+        let client = h.schema_admin.clone();
+        let dry = tokio::spawn(async move {
+            client
+                .schema_repin(
+                    "level",
+                    "severity",
+                    None,
+                    true,
+                    force,
+                    RepinCeilings::default(),
+                )
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let running = h
+            .schema_admin
+            .schema_repin_status()
             .await
-    });
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let running = h
-        .schema_admin
-        .schema_repin_status()
-        .await
-        .expect("status")
-        .job
-        .expect("a job is claimed");
-    assert_eq!(running.status, "running");
-    assert_eq!(
-        running.requires_force, None,
-        "a job with no recorded plan has no verdict to report: {running:?}"
-    );
-    assert_eq!(running.requires_force_reason, None);
+            .expect("status")
+            .job
+            .expect("a job is claimed");
+        assert_eq!(running.status, "running");
+        assert_eq!(
+            running.requires_force, None,
+            "a job with no recorded plan has no verdict to report: {running:?}"
+        );
+        assert_eq!(running.requires_force_reason, None);
 
-    let dry = match dry.await.expect("join").expect("dry run") {
-        RepinStart::Report(job) => job,
-        other => panic!("expected a report, got {other:?}"),
-    };
-    trawl_server::repin::engine::TEST_SCAN_DELAY_MS.store(0, std::sync::atomic::Ordering::Relaxed);
-    // …and once the plan exists the verdict is a fact, both on the report
-    // and on the status route.
-    assert_eq!(dry.requires_force, Some(true), "{dry:?}");
-    let latest = h
-        .schema_admin
-        .schema_repin_status()
-        .await
-        .expect("status")
-        .job
-        .expect("a job has run");
-    assert_eq!(latest.requires_force, Some(true));
+        let dry = match dry.await.expect("join").expect("dry run") {
+            RepinStart::Report(job) => job,
+            other => panic!("expected a report, got {other:?}"),
+        };
+        trawl_server::repin::engine::TEST_SCAN_DELAY_MS
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        // …and once the plan exists the verdict is a fact, both on the report
+        // and on the status route.
+        assert_eq!(dry.requires_force, Some(!force), "{dry:?}");
+        let latest = h
+            .schema_admin
+            .schema_repin_status()
+            .await
+            .expect("status")
+            .job
+            .expect("a job has run");
+        assert_eq!(latest.requires_force, Some(!force));
 
-    // The third state: a plan with nothing to accept (a BIGINT field to
-    // VARCHAR, which is lossless by construction).
-    let clean = dry_run(&h.schema_admin, "dur", "varchar", None, false).await;
-    assert_eq!(
-        clean.requires_force,
-        Some(false),
-        "VARCHAR is the always-lossless target: {clean:?}"
-    );
-    assert_eq!(clean.requires_force_reason, None);
+        // The third state: a plan with nothing to accept (a BIGINT field to
+        // VARCHAR, which is lossless by construction).
+        let clean = dry_run(&h.schema_admin, "dur", "varchar", None, false).await;
+        assert_eq!(
+            clean.requires_force,
+            Some(false),
+            "VARCHAR is the always-lossless target: {clean:?}"
+        );
+        assert_eq!(clean.requires_force_reason, None);
+    }
 }
 
 /// One sender field carrying the five shapes a severity repin has to answer
@@ -2600,76 +2603,83 @@ async fn a_mid_build_cancel_leaves_the_corpus_and_the_staging_untouched() {
 /// asserts never happened.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cancel_during_the_scan_stops_before_any_plan_is_published() {
-    let h = harness().await;
-    let services = ["api", "web", "worker", "edge"];
-    for svc in services {
-        h.ingest_and_compact(&[event(svc, &json!({"status": 200}))])
-            .await;
-    }
+    for force in [false, true] {
+        let h = harness().await;
+        let services = ["api", "web", "worker", "edge"];
+        for svc in services {
+            h.ingest_and_compact(&[event(svc, &json!({"status": 200}))])
+                .await;
+        }
 
-    TEST_SCAN_HELD.store(false, Ordering::SeqCst);
-    TEST_RELEASE_SCAN.store(false, Ordering::SeqCst);
-    TEST_HOLD_IN_SCAN.store(true, Ordering::SeqCst);
+        TEST_SCAN_HELD.store(false, Ordering::SeqCst);
+        TEST_RELEASE_SCAN.store(false, Ordering::SeqCst);
+        TEST_HOLD_IN_SCAN.store(true, Ordering::SeqCst);
 
-    let client = h.schema_admin.clone();
-    let dry = tokio::spawn(async move {
-        client
-            .schema_repin(
-                "status",
-                "VARCHAR",
-                None,
-                true,
-                false,
-                RepinCeilings::default(),
-            )
+        let client = h.schema_admin.clone();
+        let dry = tokio::spawn(async move {
+            client
+                .schema_repin(
+                    "status",
+                    "VARCHAR",
+                    None,
+                    true,
+                    force,
+                    RepinCeilings::default(),
+                )
+                .await
+        });
+        await_barrier(&TEST_SCAN_HELD, "the scan never reached a file boundary").await;
+
+        // A scan has staged nothing, so there is nothing on disk to unwind.
+        assert!(!trawl_server::repin::marker_path(&h.data_dir).exists());
+        assert!(!trawl_server::repin::shadow_root(&h.data_dir).exists());
+
+        match h.schema_admin.schema_repin_cancel().await.expect("cancel") {
+            RepinCancel::Cancelling(_) => {}
+            other => panic!("expected an accepted cancel, got {other:?}"),
+        }
+        TEST_RELEASE_SCAN.store(true, Ordering::SeqCst);
+
+        let report = match dry
             .await
-    });
-    await_barrier(&TEST_SCAN_HELD, "the scan never reached a file boundary").await;
+            .expect("join")
+            .expect("a cancelled dry run answers with its row, not an error")
+        {
+            // The 200 is shared with the dry-run report, and the client tells
+            // the two apart by the row's own status, so a cancelled job can
+            // never be printed as a plan.
+            RepinStart::Cancelled(job) => job,
+            other => panic!("expected the cancelled row, got {other:?}"),
+        };
+        assert_eq!(report.status, "cancelled");
+        assert_eq!(report.force, force);
+        assert_eq!(report.requires_force, None);
+        assert_eq!(report.requires_force_reason, None);
+        assert_eq!(report.accepted_max_nulled_rows, None);
+        assert_eq!(report.accepted_max_ambiguous_rows, None);
+        assert_eq!(report.cancelled_by.as_deref(), Some("schema-admin-key"));
+        let error = report
+            .error
+            .clone()
+            .expect("a cancelled row explains itself");
+        assert!(error.contains("during scan"), "{error}");
 
-    // A scan has staged nothing, so there is nothing on disk to unwind.
-    assert!(!trawl_server::repin::marker_path(&h.data_dir).exists());
-    assert!(!trawl_server::repin::shadow_root(&h.data_dir).exists());
+        // No plan: the counts are the row's zeros meaning "not measured", and
+        // `planned_at` is what says so.
+        let row = h.repin_row(report.id).await;
+        assert_eq!(row.planned_at, None, "no partial plan may be published");
+        assert_eq!(report.files_total, 0);
+        assert!(
+            report.files_total < u64::try_from(services.len()).unwrap(),
+            "the scan stopped short of the corpus"
+        );
 
-    match h.schema_admin.schema_repin_cancel().await.expect("cancel") {
-        RepinCancel::Cancelling(_) => {}
-        other => panic!("expected an accepted cancel, got {other:?}"),
+        // And the disk was never touched, before or after the stop.
+        assert!(!trawl_server::repin::marker_path(&h.data_dir).exists());
+        assert!(!trawl_server::repin::shadow_root(&h.data_dir).exists());
+        assert!(!trawl_server::repin::aside_root(&h.data_dir).exists());
+        assert_eq!(h.pinned_type("status").await, "BIGINT");
     }
-    TEST_RELEASE_SCAN.store(true, Ordering::SeqCst);
-
-    let report = match dry
-        .await
-        .expect("join")
-        .expect("a cancelled dry run answers with its row, not an error")
-    {
-        // The 200 is shared with the dry-run report, and the client tells
-        // the two apart by the row's own status, so a cancelled job can
-        // never be printed as a plan.
-        RepinStart::Cancelled(job) => job,
-        other => panic!("expected the cancelled row, got {other:?}"),
-    };
-    assert_eq!(report.status, "cancelled");
-    assert_eq!(report.cancelled_by.as_deref(), Some("schema-admin-key"));
-    let error = report
-        .error
-        .clone()
-        .expect("a cancelled row explains itself");
-    assert!(error.contains("during scan"), "{error}");
-
-    // No plan: the counts are the row's zeros meaning "not measured", and
-    // `planned_at` is what says so.
-    let row = h.repin_row(report.id).await;
-    assert_eq!(row.planned_at, None, "no partial plan may be published");
-    assert_eq!(report.files_total, 0);
-    assert!(
-        report.files_total < u64::try_from(services.len()).unwrap(),
-        "the scan stopped short of the corpus"
-    );
-
-    // And the disk was never touched, before or after the stop.
-    assert!(!trawl_server::repin::marker_path(&h.data_dir).exists());
-    assert!(!trawl_server::repin::shadow_root(&h.data_dir).exists());
-    assert!(!trawl_server::repin::aside_root(&h.data_dir).exists());
-    assert_eq!(h.pinned_type("status").await, "BIGINT");
 }
 
 /// AC3: past the point of no return a cancel is refused, not queued. The
@@ -3271,12 +3281,8 @@ mod audit_capture {
 
 // -- force ceilings (#111) ---------------------------------------------------
 //
-// Force used to be a blank check: whatever the finished shadow lost, force
-// covered it, however far the corpus had moved since the operator read the
-// plan. A forced job now carries a number per dimension and both gates hold
-// it to that number. These drive the engine directly — the request surface
-// carries the ceilings from a later milestone, and the engine API is where
-// the values are enforced.
+// A forced job records a ceiling per dimension, and both gates enforce it.
+// These tests exercise the request surface and direct engine execution.
 
 impl Harness {
     fn engine(&self) -> std::sync::Arc<RepinEngine> {

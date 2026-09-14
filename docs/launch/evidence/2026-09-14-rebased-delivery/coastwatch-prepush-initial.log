@@ -1,0 +1,1219 @@
+╭─────────────────────────────────────╮
+│ lefthook  v2.1.12   hook:  pre-push │
+╰─────────────────────────────────────╯
+┃  test ❯
+warning: unused config key `resolver.incompatible-publish-age` in `/home/jakub/.cargo/config.toml`
+warning: unused config key `resolver.incompatible-publish-age` in `/home/jakub/.cargo/config.toml`
+    Blocking waiting for file lock on package cache
+   Compiling num-traits v0.2.19
+   Compiling regex-syntax v0.8.10
+   Compiling slab v0.4.12
+   Compiling rustls v0.23.40
+   Compiling fnv v1.0.7
+   Compiling idna v1.1.0
+   Compiling futures-util v0.3.32
+   Compiling chrono v0.4.44
+   Compiling atoi v2.0.0
+   Compiling try-lock v0.2.5
+   Compiling sync_wrapper v1.0.2
+   Compiling ipnet v2.12.0
+   Compiling bit-vec v0.8.0
+   Compiling coastwatch-embeddings v0.1.0 (/home/jakub/code/trawl/.worktrees/launch-consumers/coastwatch/crates/embeddings)
+   Compiling want v0.3.1
+   Compiling selectors v0.36.1
+   Compiling lopdf v0.42.0
+   Compiling axum-core v0.5.6
+   Compiling url v2.5.8
+   Compiling regex-automata v0.4.14
+   Compiling chrono-tz v0.10.4
+   Compiling bit-set v0.8.0
+   Compiling tokio-util v0.7.18
+   Compiling tower v0.5.3
+   Compiling multer v3.1.0
+   Compiling ammonia v4.1.4
+   Compiling sqlx-core v0.9.0
+   Compiling dom_query v0.27.0
+   Compiling euclid v0.20.14
+   Compiling h2 v0.4.14
+   Compiling tower-http v0.6.11
+   Compiling regex v1.12.3
+   Compiling dom_smoothie v0.17.0
+   Compiling pdf-extract v0.12.0
+   Compiling sqlx-postgres v0.9.0
+   Compiling coastwatch-domain v0.1.0 (/home/jakub/code/trawl/.worktrees/launch-consumers/coastwatch/crates/domain)
+   Compiling matchers v0.2.0
+   Compiling tracing-subscriber v0.3.23
+   Compiling hyper v1.9.0
+   Compiling sqlx-macros-core v0.9.0
+   Compiling hyper-util v0.1.20
+   Compiling coastwatch-render v0.1.0 (/home/jakub/code/trawl/.worktrees/launch-consumers/coastwatch/crates/render)
+   Compiling coastwatch-claim-verification v0.1.0 (/home/jakub/code/trawl/.worktrees/launch-consumers/coastwatch/crates/claim-verification)
+   Compiling axum v0.8.9
+   Compiling coastwatch-text-extract v0.1.0 (/home/jakub/code/trawl/.worktrees/launch-consumers/coastwatch/crates/text-extract)
+   Compiling coastwatch-telemetry v0.1.0 (/home/jakub/code/trawl/.worktrees/launch-consumers/coastwatch/crates/telemetry)
+   Compiling num-integer v0.1.46
+   Compiling ref-cast v1.0.25
+   Compiling num-bigint v0.4.6
+   Compiling num-iter v0.1.45
+   Compiling tokio-rustls v0.26.4
+   Compiling num-complex v0.4.6
+   Compiling borrow-or-share v0.2.4
+   Compiling openssl-probe v0.2.1
+   Compiling fluent-uri v0.4.1
+   Compiling ahash v0.8.12
+   Compiling rustls-native-certs v0.8.3
+   Compiling num-rational v0.4.2
+   Compiling email_address v0.2.9
+   Compiling num v0.4.3
+   Compiling outref v0.5.2
+   Compiling micromap v0.3.0
+   Compiling vsimd v0.8.0
+   Compiling fraction v0.15.4
+   Compiling referencing v0.46.5
+   Compiling rustls-platform-verifier v0.7.0
+   Compiling unicode-general-category v1.1.0
+   Compiling uuid-simd v0.8.0
+   Compiling hyper-rustls v0.27.9
+   Compiling fancy-regex v0.18.0
+   Compiling data-encoding v2.11.0
+   Compiling num-cmp v0.1.0
+   Compiling coastwatch-llm v0.1.0 (/home/jakub/code/trawl/.worktrees/launch-consumers/coastwatch/crates/llm)
+   Compiling bytecount v0.6.9
+   Compiling reqwest v0.13.3
+   Compiling futures-executor v0.3.32
+   Compiling jsonschema v0.46.5
+   Compiling coastwatch-wire v0.1.0 (/home/jakub/code/trawl/.worktrees/launch-consumers/coastwatch/crates/wire)
+   Compiling num_cpus v1.17.0
+   Compiling deadpool-runtime v0.1.4
+   Compiling futures v0.3.32
+   Compiling deadpool v0.12.3
+   Compiling assert-json-diff v2.0.2
+   Compiling tempfile v3.27.0
+   Compiling wiremock v0.6.5
+   Compiling sdd v3.0.10
+   Compiling quick-xml v0.37.5
+   Compiling scc v2.4.0
+   Compiling mediatype v0.19.20
+   Compiling email-encoding v0.4.1
+   Compiling hostname v0.4.2
+   Compiling quoted_printable v0.5.2
+   Compiling feed-rs v2.3.1
+   Compiling lettre v0.11.22
+   Compiling wait-timeout v0.2.1
+   Compiling serial_test v3.4.0
+   Compiling quick-error v1.2.3
+   Compiling rand_xorshift v0.4.0
+   Compiling unarray v0.1.4
+   Compiling rusty-fork v0.3.1
+   Compiling console v0.16.3
+   Compiling similar v2.7.0
+   Compiling proptest v1.11.0
+   Compiling unsafe-libyaml v0.2.11
+   Compiling insta v1.47.2
+   Compiling anyhow v1.0.104
+   Compiling fleet-ui v0.4.0 (/home/jakub/code/trawl/.worktrees/launch-consumers/trawl/crates/fleet-ui)
+   Compiling serde_yaml v0.9.34+deprecated
+   Compiling coastwatch-attack-data v0.1.0 (/home/jakub/code/trawl/.worktrees/launch-consumers/coastwatch/crates/attack-data)
+   Compiling coastwatch-web-ui v0.1.0 (/home/jakub/code/trawl/.worktrees/launch-consumers/coastwatch/crates/web-ui)
+   Compiling sqlx-macros v0.9.0
+   Compiling sqlx v0.9.0
+   Compiling fleet-auth v0.4.0 (/home/jakub/code/trawl/.worktrees/launch-consumers/trawl/crates/fleet-auth)
+   Compiling coastwatch-db v0.1.0 (/home/jakub/code/trawl/.worktrees/launch-consumers/coastwatch/crates/db)
+   Compiling pgvector v0.4.2
+   Compiling coastwatch-jobs v0.1.0 (/home/jakub/code/trawl/.worktrees/launch-consumers/coastwatch/crates/jobs)
+   Compiling coastwatch-storage v0.1.0 (/home/jakub/code/trawl/.worktrees/launch-consumers/coastwatch/crates/storage)
+   Compiling coastwatch-test-support v0.1.0 (/home/jakub/code/trawl/.worktrees/launch-consumers/coastwatch/crates/test-support)
+   Compiling coastwatch-config v0.1.0 (/home/jakub/code/trawl/.worktrees/launch-consumers/coastwatch/crates/config)
+   Compiling coastwatch-auth v0.1.0 (/home/jakub/code/trawl/.worktrees/launch-consumers/coastwatch/crates/auth)
+   Compiling coastwatch-claims-extract v0.1.0 (/home/jakub/code/trawl/.worktrees/launch-consumers/coastwatch/crates/claims-extract)
+   Compiling coastwatch-web v0.1.0 (/home/jakub/code/trawl/.worktrees/launch-consumers/coastwatch/crates/web)
+   Compiling coastwatch-worker v0.1.0 (/home/jakub/code/trawl/.worktrees/launch-consumers/coastwatch/crates/worker)
+   Compiling coastwatch-bench v0.1.0 (/home/jakub/code/trawl/.worktrees/launch-consumers/coastwatch/crates/bench)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 27s
+────────────
+ Nextest run ID a2feccc8-f09d-469a-987a-2a2b3c8a2972 with nextest profile: default
+    Starting 2754 tests across 118 binaries
+        PASS [   0.006s] (   1/2754) coastwatch-auth principal::tests::require_returns_missing_permission_with_roles_display
+        PASS [   0.007s] (   2/2754) coastwatch-attack-data tests::decode_rejects_an_unknown_field
+        PASS [   0.006s] (   3/2754) coastwatch-auth principal::tests::has_permission_reflects_the_carried_set
+        PASS [   0.007s] (   4/2754) coastwatch-auth error::tests::no_coastwatch_grant_maps_to_403
+        PASS [   0.007s] (   5/2754) coastwatch-attack-data tests::embedded_techniques_parse_and_cover_the_anchors
+        PASS [   0.007s] (   6/2754) coastwatch-auth principal::tests::require_returns_ok_for_held_permission
+        PASS [   0.008s] (   7/2754) coastwatch-auth principal::tests::permissions_are_normalised_to_canonical_order_and_deduped
+        PASS [   0.012s] (   8/2754) coastwatch-auth translate::tests::human_kind_is_never_flagged
+        PASS [   0.012s] (   9/2754) coastwatch-auth translate::tests::analyst_bundle_translates_to_full_permission_set
+        PASS [   0.012s] (  10/2754) coastwatch-auth error::tests::misconfigured_auth_maps_to_500
+        PASS [   0.012s] (  11/2754) coastwatch-auth translate::tests::mixed_known_and_unknown_keeps_the_recognized_remainder
+        PASS [   0.012s] (  12/2754) coastwatch-auth principal::tests::kind_is_inert_metadata
+        PASS [   0.012s] (  13/2754) coastwatch-auth error::tests::missing_permission_maps_to_403
+        PASS [   0.013s] (  14/2754) coastwatch-auth translate::tests::malformed_prefix_errors_at_translation
+        PASS [   0.013s] (  15/2754) coastwatch-auth principal::tests::roles_display_joins_names_with_none_fallback
+        PASS [   0.007s] (  16/2754) coastwatch-auth translate::tests::no_coastwatch_permissions_errors_no_coastwatch_grant
+        PASS [   0.006s] (  17/2754) coastwatch-auth translate::tests::unknown_strings_only_errors_no_coastwatch_grant
+        PASS [   0.006s] (  18/2754) coastwatch-auth translate::tests::zero_roles_errors_no_coastwatch_grant
+        PASS [   0.008s] (  19/2754) coastwatch-auth translate::tests::service_kind_with_analyst_permissions_translates
+        PASS [   0.008s] (  20/2754) coastwatch-auth translate::tests::multi_role_union_is_read_across_bundles
+        PASS [   0.009s] (  21/2754) coastwatch-auth translate::tests::service_kind_holding_human_judgement_permissions_is_flagged
+        PASS [   0.017s] (  22/2754) coastwatch-auth error::tests::invalid_key_prefix_maps_to_500
+        PASS [   0.008s] (  23/2754) coastwatch-auth::middleware_unit grantless_key_returns_403
+        PASS [   0.007s] (  24/2754) coastwatch-bench args::tests::concurrency_override_parses_in_corpus_mode
+        PASS [   0.010s] (  25/2754) coastwatch-auth::middleware_unit mixed_known_and_unknown_strings_pass_with_the_known_remainder
+        PASS [   0.010s] (  26/2754) coastwatch-auth::middleware_unit require_permission_passes_for_held_permission
+        PASS [   0.017s] (  27/2754) coastwatch-auth translate::tests::service_kind_with_machine_permissions_is_not_flagged
+        PASS [   0.012s] (  28/2754) coastwatch-auth::middleware_unit auth_error_variants_exist
+        PASS [   0.012s] (  29/2754) coastwatch-auth::middleware_unit inject_principal_without_verified_returns_500
+        PASS [   0.012s] (  30/2754) coastwatch-auth::middleware_unit require_permission_without_auth_middleware_returns_500
+        PASS [   0.012s] (  31/2754) coastwatch-bench args::tests::from_dev_with_limit_and_sources
+        PASS [   0.015s] (  32/2754) coastwatch-auth::middleware_unit require_permission_returns_403_for_missing_permission
+        PASS [   0.015s] (  33/2754) coastwatch-auth::middleware_unit analyst_bundle_translates_and_handler_runs
+        PASS [   0.014s] (  34/2754) coastwatch-bench args::tests::accepts_judge_with_explicit_tool_mechanism
+        PASS [   0.006s] (  35/2754) coastwatch-bench args::tests::max_reasoning_effort_parses_in_corpus_mode
+        PASS [   0.016s] (  36/2754) coastwatch-auth::middleware_unit unknown_strings_only_returns_403
+        PASS [   0.013s] (  37/2754) coastwatch-bench args::tests::judge_mechanism_and_routing_tail_parses_and_is_carried
+        PASS [   0.014s] (  38/2754) coastwatch-bench args::tests::json_and_fail_fast_and_corpus_dir
+        PASS [   0.016s] (  39/2754) coastwatch-auth::middleware_unit zero_coastwatch_permissions_returns_403
+        PASS [   0.009s] (  40/2754) coastwatch-bench args::tests::judge_override_parses_as_a_spec
+        PASS [   0.008s] (  41/2754) coastwatch-bench args::tests::parses_multiple_specs_via_flag_and_positional
+        PASS [   0.011s] (  42/2754) coastwatch-bench args::tests::parses_compact_history_path
+        PASS [   0.010s] (  43/2754) coastwatch-bench args::tests::reasoning_effort_absent_is_none
+        PASS [   0.015s] (  44/2754) coastwatch-bench args::tests::parses_a_single_bare_spec_in_corpus_mode
+        PASS [   0.010s] (  45/2754) coastwatch-bench args::tests::rejects_missing_value
+        PASS [   0.013s] (  46/2754) coastwatch-bench args::tests::rejects_judge_without_from_dev
+        PASS [   0.008s] (  47/2754) coastwatch-bench corpus::tests::missing_frontmatter_is_an_error
+        PASS [   0.012s] (  48/2754) coastwatch-bench corpus::tests::frontmatter_manifest_id_mismatch_is_an_error
+        PASS [   0.018s] (  49/2754) coastwatch-bench args::tests::reasoning_effort_parses_in_corpus_mode
+        PASS [   0.014s] (  50/2754) coastwatch-bench args::tests::rejects_dev_only_flags_without_from_dev
+        PASS [   0.016s] (  51/2754) coastwatch-bench args::tests::rejects_anthropic_judge_with_routing_pin
+        PASS [   0.014s] (  52/2754) coastwatch-bench args::tests::rejects_bad_concurrency
+        PASS [   0.010s] (  53/2754) coastwatch-bench corpus::tests::manifest_rejects_wrong_field_count
+        PASS [   0.020s] (  54/2754) coastwatch-bench args::tests::parses_repetitions
+        PASS [   0.014s] (  55/2754) coastwatch-bench args::tests::rejects_zero_limit
+        PASS [   0.016s] (  56/2754) coastwatch-bench args::tests::rejects_bad_reasoning_effort
+        PASS [   0.018s] (  57/2754) coastwatch-bench args::tests::rejects_no_spec
+        PASS [   0.017s] (  58/2754) coastwatch-bench corpus::tests::manifest_rejects_non_numeric_byte_len
+        PASS [   0.020s] (  59/2754) coastwatch-bench args::tests::rejects_unknown_flag
+        PASS [   0.013s] (  60/2754) coastwatch-bench corpus::tests::parses_frontmatter_and_strips_the_block
+        PASS [   0.016s] (  61/2754) coastwatch-bench corpus::tests::missing_required_key_is_an_error
+        PASS [   0.014s] (  62/2754) coastwatch-bench corpus::tests::parses_manifest_skipping_header
+        PASS [   0.010s] (  63/2754) coastwatch-bench expectations::tests::rejects_ambiguous_clause_with_two_shapes
+        PASS [   0.015s] (  64/2754) coastwatch-bench dev_pull::tests::select_entries_filters_by_source_case_insensitively
+        PASS [   0.015s] (  65/2754) coastwatch-bench expectations::tests::folds_long_form_predicate_clauses
+        PASS [   0.016s] (  66/2754) coastwatch-bench dev_pull::tests::select_entries_applies_limit_in_manifest_order
+        PASS [   0.018s] (  67/2754) coastwatch-bench expectations::tests::folds_relationship_anchor_and_distinct_count_contract
+        PASS [   0.009s] (  68/2754) coastwatch-bench expectations::tests::rejects_anchor_rider_on_must_produce_shorthand
+        PASS [   0.019s] (  69/2754) coastwatch-bench corpus::tests::url_value_keeps_its_colons
+        PASS [   0.012s] (  70/2754) coastwatch-bench expectations::tests::rejects_anchor_rider_on_must_not_produce_shorthand
+        PASS [   0.018s] (  71/2754) coastwatch-bench expectations::tests::folds_every_shorthand_clause
+        PASS [   0.019s] (  72/2754) coastwatch-bench corpus::tests::unclosed_frontmatter_is_an_error
+        PASS [   0.019s] (  73/2754) coastwatch-bench expectations::tests::interleaved_dual_grammar_in_one_list_routes_each_clause
+        PASS [   0.021s] (  74/2754) coastwatch-bench dev_pull::tests::select_entries_empty_sources_keeps_all
+        PASS [   0.020s] (  75/2754) coastwatch-bench expectations::tests::folds_ioc_count_max_shorthand
+        PASS [   0.016s] (  76/2754) coastwatch-bench expectations::tests::rejects_clause_carrying_both_ioc_count_min_and_max
+        PASS [   0.020s] (  77/2754) coastwatch-bench expectations::tests::rejects_anchor_path_that_is_not_required
+        PASS [   0.007s] (  78/2754) coastwatch-bench judge::tests::default_judge_is_opus
+        PASS [   0.015s] (  79/2754) coastwatch-bench expectations::tests::rejects_duplicate_doc_id
+        PASS [   0.010s] (  80/2754) coastwatch-bench judge::tests::judge_prompt_carries_dimensions_and_claims
+        PASS [   0.016s] (  81/2754) coastwatch-bench expectations::tests::rejects_empty_clause
+        PASS [   0.018s] (  82/2754) coastwatch-bench expectations::tests::rejects_ioc_count_max_in_must_produce
+        PASS [   0.017s] (  83/2754) coastwatch-bench expectations::tests::rejects_must_not_produce_predicate_without_count_max
+        PASS [   0.017s] (  84/2754) coastwatch-bench expectations::tests::rejects_ioc_count_min_in_must_not_produce
+        PASS [   0.014s] (  85/2754) coastwatch-bench expectations::tests::rejects_unknown_predicate_name
+        PASS [   0.015s] (  86/2754) coastwatch-bench expectations::tests::rejects_unknown_clause_key
+        PASS [   0.013s] (  87/2754) coastwatch-bench judge::tests::assessment_deserialises_from_the_judge_structured_shape
+        PASS [   0.015s] (  88/2754) coastwatch-bench expectations::tests::rejects_required_slots_on_must_not_produce_predicate
+        PASS [   0.014s] (  89/2754) coastwatch-bench expectations::tests::rejects_unknown_required_slot_path
+        PASS [   0.012s] (  90/2754) coastwatch-bench judge::tests::judge_prompt_truncates_a_long_body
+        PASS [   0.014s] (  91/2754) coastwatch-bench judge::tests::judge_override_is_respected
+        PASS [   0.009s] (  92/2754) coastwatch-bench judge::tests::validate_dimensions_rejects_a_duplicate_dimension
+        PASS [   0.014s] (  93/2754) coastwatch-bench judge::tests::validate_dimensions_accepts_full_coverage
+        PASS [   0.019s] (  94/2754) coastwatch-bench judge::tests::output_schema_pins_dimensions_and_grade_enum
+        PASS [   0.014s] (  95/2754) coastwatch-bench payloads::tests::render_payloads_emits_parseable_jsonl
+        PASS [   0.020s] (  96/2754) coastwatch-bench judge::tests::validate_dimensions_rejects_a_missing_dimension
+        PASS [   0.014s] (  97/2754) coastwatch-bench provider_build::tests::only_and_order_compose_in_routing
+        PASS [   0.015s] (  98/2754) coastwatch-bench provider_build::tests::attribution_config_uses_passed_version_not_the_spec_claims_version
+        PASS [   0.019s] (  99/2754) coastwatch-bench payloads::tests::payload_lines_cover_every_outcome_and_doc_errors
+        PASS [   0.016s] ( 100/2754) coastwatch-bench provider_build::tests::extract_config_uses_the_spec_claims_version
+        PASS [   0.015s] ( 101/2754) coastwatch-bench provider_build::tests::json_and_order_compose_on_the_extract_config
+        PASS [   0.016s] ( 102/2754) coastwatch-bench provider_build::tests::extract_config_maps_spec_and_task_fields
+        PASS [   0.016s] ( 103/2754) coastwatch-bench provider_build::tests::default_spec_keeps_tool_choice_and_no_routing
+        PASS [   0.017s] ( 104/2754) coastwatch-bench provider_build::tests::routing_threads_into_extract_config_only
+        PASS [   0.018s] ( 105/2754) coastwatch-bench report::tests::build_report_grounds_semantic_gate_against_the_doc_body
+        PASS [   0.015s] ( 106/2754) coastwatch-bench report::tests::build_report_sets_vocab_pending_on_the_sentinel_token
+        PASS [   0.022s] ( 107/2754) coastwatch-bench provider_build::tests::bare_only_pin_is_not_dropped
+        PASS [   0.022s] ( 108/2754) coastwatch-bench provider_build::tests::json_spec_threads_mechanism_into_extract_only
+        PASS [   0.013s] ( 109/2754) coastwatch-bench report::tests::failed_docs_stay_in_required_denominator_and_repetitions_get_stability
+        PASS [   0.011s] ( 110/2754) coastwatch-bench report::tests::json_round_trips_a_minimal_report
+        PASS [   0.010s] ( 111/2754) coastwatch-bench report::tests::json_serialises_judge_not_run_state
+        PASS [   0.025s] ( 112/2754) coastwatch-bench provider_build::tests::order_pin_threads_into_sealed_routing_on_extract_config_only
+        PASS [   0.013s] ( 113/2754) coastwatch-bench report::tests::gate_tally_counts_each_outcome
+        PASS [   0.008s] ( 114/2754) coastwatch-bench report::tests::markdown_renders_per_doc_judge_assessment_when_run
+        PASS [   0.016s] ( 115/2754) coastwatch-bench report::tests::markdown_anthropic_empty_served_by_is_a_benign_dash
+        PASS [   0.016s] ( 116/2754) coastwatch-bench report::tests::markdown_marks_incomplete_attribution_as_partial
+        PASS [   0.016s] ( 117/2754) coastwatch-bench report::tests::markdown_marks_openrouter_empty_served_by_as_unverified
+        PASS [   0.010s] ( 118/2754) coastwatch-bench report::tests::report_surfaces_attribution_at_doc_and_spec_level
+        PASS [   0.018s] ( 119/2754) coastwatch-bench report::tests::json_serialises_judge_ran_state_with_grades
+        PASS [   0.018s] ( 120/2754) coastwatch-bench report::tests::markdown_carries_banner_and_vocab_flag
+        PASS [   0.010s] ( 121/2754) coastwatch-bench run::tests::run_attribution_collects_distinct_first_seen
+        PASS [   0.012s] ( 122/2754) coastwatch-bench report::tests::report_surfaces_missing_dev_docs_in_markdown_and_json
+        PASS [   0.014s] ( 123/2754) coastwatch-bench run::tests::run_attribution_merge_dedupes_and_ors_incomplete
+        PASS [   0.024s] ( 124/2754) coastwatch-bench report::tests::json_sidecar_carries_the_flattened_incomplete_key
+        PASS [   0.021s] ( 125/2754) coastwatch-bench report::tests::markdown_marks_partial_cost_as_a_floor
+        PASS [   0.024s] ( 126/2754) coastwatch-bench report::tests::markdown_complete_cost_has_no_floor_footnote
+        PASS [   0.008s] ( 127/2754) coastwatch-bench score::tests::anchored_predicate_counts_distinct_relationship_tuples
+        PASS [   0.019s] ( 128/2754) coastwatch-bench run::tests::verify_split_downgrades_unresolvable_technique_to_ga
+        PASS [   0.025s] ( 129/2754) coastwatch-bench report::tests::more_than_one_failed_doc_marks_repetition_invalid
+        PASS [   0.012s] ( 130/2754) coastwatch-bench score::tests::forbidden_surface_matches_ioc_value_scalar
+        PASS [   0.015s] ( 131/2754) coastwatch-bench score::tests::anchored_any_of_matches_whole_tuples_not_slot_cross_products
+        PASS [   0.013s] ( 132/2754) coastwatch-bench score::tests::count_max_zero_clean_side_clause_present_and_met
+        PASS [   0.013s] ( 133/2754) coastwatch-bench score::tests::doc_level_mention_min_reads_ungated_aux_channel
+        PASS [   0.023s] ( 134/2754) coastwatch-bench report::tests::yield_only_when_no_expectation
+        PASS [   0.013s] ( 135/2754) coastwatch-bench score::tests::anchored_predicate_requires_expected_values_on_the_same_claim
+        PASS [   0.013s] ( 136/2754) coastwatch-bench score::tests::forbidden_surface_in_entity_slot_trips_but_in_free_text_does_not
+        PASS [   0.015s] ( 137/2754) coastwatch-bench score::tests::ioc_count_max_counts_infra_claims_not_raw_iocs
+        PASS [   0.010s] ( 138/2754) coastwatch-bench score::tests::ioc_count_max_reads_rows_not_groupings
+        PASS [   0.010s] ( 139/2754) coastwatch-bench score::tests::ioc_count_max_over_ceiling_fails
+        PASS [   0.013s] ( 140/2754) coastwatch-bench score::tests::ioc_count_max_met_exactly_at_ceiling
+        PASS [   0.030s] ( 141/2754) coastwatch-bench repro::tests::real_corpus_and_prompt_fingerprints_are_stable_length
+        PASS [   0.018s] ( 142/2754) coastwatch-bench score::tests::ioc_count_min_collapses_per_encoding_rows_to_one_grouping
+        PASS [   0.011s] ( 143/2754) coastwatch-bench score::tests::semantic_mixed_subject_and_technique_clause_is_skipped
+        PASS [   0.012s] ( 144/2754) coastwatch-bench score::tests::per_predicate_ceiling_breach_fails
+        PASS [   0.021s] ( 145/2754) coastwatch-bench score::tests::ioc_count_min_counts_groupings_not_raw_iocs
+        PASS [   0.016s] ( 146/2754) coastwatch-bench score::tests::ioc_count_min_folds_accepted_subject_synonyms_to_one_family
+        PASS [   0.016s] ( 147/2754) coastwatch-bench score::tests::kev_clean_doc_06_passes_structural_and_suppression
+        PASS [   0.014s] ( 148/2754) coastwatch-bench score::tests::ioc_count_min_unaudited_doc_scores_raw_claim_rows_not_groupings
+        PASS [   0.017s] ( 149/2754) coastwatch-bench score::tests::semantic_excludes_ioc_type_vocabulary_token_from_grounding_ratio
+        PASS [   0.015s] ( 150/2754) coastwatch-bench score::tests::semantic_grounds_canonical_ioc_value_against_defanged_body
+        PASS [   0.015s] ( 151/2754) coastwatch-bench score::tests::ioc_count_min_grouping_splits_on_role_within_one_family
+        PASS [   0.017s] ( 152/2754) coastwatch-bench score::tests::semantic_all_technique_clause_is_skipped
+        PASS [   0.017s] ( 153/2754) coastwatch-bench score::tests::per_predicate_ceiling_met_exactly_at_limit
+        PASS [   0.019s] ( 154/2754) coastwatch-bench score::tests::kev_trap_doc_07_fabricated_exploiter_breaches_ceiling
+        PASS [   0.024s] ( 155/2754) coastwatch-bench score::tests::semantic_resolved_technique_grounds_even_when_absent_from_body
+        PASS [   0.013s] ( 156/2754) coastwatch-bench score::tests::total_claim_count_max_met_exactly_at_ceiling
+        PASS [   0.014s] ( 157/2754) coastwatch-bench score::tests::structural_predicate_floor_unmet_when_predicate_absent
+        PASS [   0.012s] ( 158/2754) coastwatch-bench score::tests::unmet_anchored_floor_names_near_miss_slot_values
+        PASS [   0.022s] ( 159/2754) coastwatch-bench score::tests::semantic_threshold_is_inclusive_at_95_percent
+        PASS [   0.022s] ( 160/2754) coastwatch-bench score::tests::total_claim_count_max_breach_fails
+        PASS [   0.016s] ( 161/2754) coastwatch-bench spec::tests::label_round_trips_only_comma_list
+        PASS [   0.019s] ( 162/2754) coastwatch-bench score::tests::unmet_anchored_floor_with_no_same_predicate_claims_has_no_near_miss_suffix
+        PASS [   0.009s] ( 163/2754) coastwatch-bench spec::tests::label_round_trips_order_pin
+        PASS [   0.014s] ( 164/2754) coastwatch-bench spec::tests::label_round_trips_order_and_only
+        PASS [   0.029s] ( 165/2754) coastwatch-bench score::tests::semantic_unresolved_technique_is_unmet_even_when_present_in_body
+        PASS [   0.017s] ( 166/2754) coastwatch-bench spec::tests::label_round_trips_only_pin
+        PASS [   0.020s] ( 167/2754) coastwatch-bench spec::tests::label_omits_the_default_tool_token
+        PASS [   0.019s] ( 168/2754) coastwatch-bench spec::tests::label_round_trips_json_mechanism
+        PASS [   0.026s] ( 169/2754) coastwatch-bench score::tests::structural_predicate_floor_met_when_verified_claim_has_required_slots
+        PASS [   0.020s] ( 170/2754) coastwatch-bench spec::tests::label_round_trips_for_any_valid_spec
+        PASS [   0.019s] ( 171/2754) coastwatch-bench spec::tests::label_round_trips_json_and_order
+        PASS [   0.011s] ( 172/2754) coastwatch-bench spec::tests::only_and_order_compose
+        PASS [   0.011s] ( 173/2754) coastwatch-bench spec::tests::only_tail_is_order_tolerant
+        PASS [   0.012s] ( 174/2754) coastwatch-bench spec::tests::label_round_trips_the_canonical_form
+        PASS [   0.012s] ( 175/2754) coastwatch-bench spec::tests::parses_explicit_prompt_version
+        PASS [   0.012s] ( 176/2754) coastwatch-bench spec::tests::parses_openrouter_slash_namespaced_model
+        PASS [   0.010s] ( 177/2754) coastwatch-bench spec::tests::rejects_duplicate_only_token
+        PASS [   0.012s] ( 178/2754) coastwatch-bench spec::tests::rejects_anthropic_json_mechanism
+        PASS [   0.014s] ( 179/2754) coastwatch-bench spec::tests::parses_order_pin
+        PASS [   0.016s] ( 180/2754) coastwatch-bench spec::tests::parses_explicit_tool_mechanism
+        PASS [   0.015s] ( 181/2754) coastwatch-bench spec::tests::parses_order_pin_without_explicit_version
+        PASS [   0.015s] ( 182/2754) coastwatch-bench spec::tests::parses_provider_model_with_default_version
+        PASS [   0.016s] ( 183/2754) coastwatch-bench spec::tests::rejects_anthropic_only_pin
+        PASS [   0.017s] ( 184/2754) coastwatch-bench spec::tests::parses_only_pin
+        PASS [   0.016s] ( 185/2754) coastwatch-bench spec::tests::rejects_duplicate_mechanism_token
+        PASS [   0.018s] ( 186/2754) coastwatch-bench spec::tests::rejects_anthropic_order_pin
+        PASS [   0.022s] ( 187/2754) coastwatch-bench spec::tests::parses_only_pin_without_explicit_version
+        PASS [   0.010s] ( 188/2754) coastwatch-bench spec::tests::rejects_empty_model_field
+        PASS [   0.022s] ( 189/2754) coastwatch-bench spec::tests::parses_json_mechanism_without_explicit_version
+        PASS [   0.020s] ( 190/2754) coastwatch-bench spec::tests::rejects_duplicate_order_token
+        PASS [   0.020s] ( 191/2754) coastwatch-bench spec::tests::parses_json_mechanism_on_openrouter
+        PASS [   0.009s] ( 192/2754) coastwatch-bench spec::tests::rejects_invalid_model_shape
+        PASS [   0.010s] ( 193/2754) coastwatch-bench spec::tests::rejects_empty_order_pin
+        PASS [   0.025s] ( 194/2754) coastwatch-bench spec::tests::parses_only_comma_list
+        PASS [   0.009s] ( 195/2754) coastwatch-bench spec::tests::rejects_unknown_provider
+        PASS [   0.012s] ( 196/2754) coastwatch-bench spec::tests::rejects_missing_model
+        PASS [   0.006s] ( 197/2754) coastwatch-bench spec::tests::three_field_spec_defaults_to_tool_mechanism_and_no_order
+        PASS [   0.012s] ( 198/2754) coastwatch-bench spec::tests::rejects_only_pin_with_blank_comma_segment
+        PASS [   0.007s] ( 199/2754) coastwatch-bench spec::tests::two_field_spec_defaults_mechanism_and_order
+        PASS [   0.017s] ( 200/2754) coastwatch-bench spec::tests::rejects_empty_only_pin
+        PASS [   0.017s] ( 201/2754) coastwatch-bench spec::tests::rejects_duplicate_version_token
+        PASS [   0.008s] ( 202/2754) coastwatch-bench surfaces::tests::incident_reported_yields_incident_name_scalar
+        PASS [   0.016s] ( 203/2754) coastwatch-bench spec::tests::rejects_invalid_prompt_version
+        PASS [   0.010s] ( 204/2754) coastwatch-bench surfaces::tests::general_assertion_mentioned_entities_are_in_both_scopes
+        PASS [   0.010s] ( 205/2754) coastwatch-bench surfaces::tests::uses_infrastructure_yields_ioc_value_as_entity_scalar
+        PASS [   0.011s] ( 206/2754) coastwatch-bench surfaces::tests::slot_path_parse_round_trips_fixed_variants_and_rejects_typos
+        PASS [   0.010s] ( 207/2754) coastwatch-bench surfaces::tests::uses_technique_yields_technique_surface_path
+        PASS [   0.012s] ( 208/2754) coastwatch-bench surfaces::tests::general_assertion_free_text_only_in_all_scope
+        PASS [   0.016s] ( 209/2754) coastwatch-bench spec::tests::tail_tokens_are_order_tolerant
+        PASS [   0.009s] ( 210/2754) coastwatch-bench technique::tests::resolved_and_unresolved_are_not_skipped
+        PASS [   0.008s] ( 211/2754) coastwatch-bench technique::tests::vocab_resolver_misses_are_unresolved_never_skipped
+        PASS [   0.019s] ( 212/2754) coastwatch-bench spec::tests::slash_model_without_version_defaults
+        PASS [   0.011s] ( 213/2754) coastwatch-bench technique::tests::stub_always_skips_with_the_vocab_pending_reason
+        PASS [   0.012s] ( 214/2754) coastwatch-bench technique::tests::vocab_resolver_resolves_id_and_name_to_canonical_id
+        PASS [   0.009s] ( 215/2754) coastwatch-bench::pipeline_config resolve_pipeline_config_reads_tier_config_not_defaults
+        PASS [   0.019s] ( 216/2754) coastwatch-bench::judge_dispatch judge_doc_debug_asserts_a_mismatched_provider_spec_pair
+        PASS [   0.018s] ( 217/2754) coastwatch-bench::judge_dispatch judge_doc_honours_the_spec_mechanism_and_routing
+        PASS [   0.020s] ( 218/2754) coastwatch-bench::judge_dispatch judge_doc_dispatches_and_parses_the_per_dimension_assessment
+        PASS [   0.023s] ( 219/2754) coastwatch-bench::judge_dispatch judge_doc_surfaces_a_provider_error_without_panicking
+        PASS [   0.006s] ( 220/2754) coastwatch-claim-verification downgrade::tests::exploitation_observed_drops_technique_keeps_cve
+        PASS [   0.007s] ( 221/2754) coastwatch-claim-verification downgrade::tests::exploitation_observed_downgrade_drops_typeless_target_from_mentions
+        PASS [   0.029s] ( 222/2754) coastwatch-bench::golden_corpus real_expectations_yaml_folds_clean_for_all_50_docs
+        PASS [   0.027s] ( 223/2754) coastwatch-bench::judge_dispatch judge_doc_rejects_a_partial_dimension_payload
+        PASS [   0.008s] ( 224/2754) coastwatch-claim-verification downgrade::tests::uses_technique_rewrites_to_ga_with_subject_only
+        PASS [   0.008s] ( 225/2754) coastwatch-claim-verification slots::tests::typed_walk_classifies_disclosure_slots
+        PASS [   0.008s] ( 226/2754) coastwatch-claim-verification slots::tests::typed_and_untyped_walks_agree_on_count
+        PASS [   0.008s] ( 227/2754) coastwatch-claim-verification slots::tests::typed_walk_covers_every_affects_product_slot
+        PASS [   0.006s] ( 228/2754) coastwatch-claim-verification slots::tests::typed_walk_is_subset_of_entity_slots
+        PASS [   0.008s] ( 229/2754) coastwatch-claim-verification slots::tests::typed_walk_skips_typeless_exploitation_observed_target
+        PASS [   0.008s] ( 230/2754) coastwatch-claim-verification slots::tests::typed_walk_types_exploitation_observed_target_as_product
+        PASS [   0.006s] ( 231/2754) coastwatch-claim-verification technique_vocab::tests::fabricated_id_and_empty_do_not_resolve
+        PASS [   0.007s] ( 232/2754) coastwatch-claim-verification technique_vocab::tests::empty_vocab_resolves_nothing
+        PASS [   0.006s] ( 233/2754) coastwatch-claim-verification technique_vocab::tests::from_techniques_builds_a_resolvable_set
+        PASS [   0.010s] ( 234/2754) coastwatch-claim-verification technique_vocab::tests::every_vendored_surface_round_trips_the_alias_mint_normalizer
+        PASS [   0.006s] ( 235/2754) coastwatch-claim-verification technique_vocab::tests::resolves_is_case_insensitive
+        PASS [   0.011s] ( 236/2754) coastwatch-claim-verification technique_vocab::tests::embedded_vocab_resolves_known_id_and_name
+        PASS [   0.007s] ( 237/2754) coastwatch-claim-verification tests::empty_needle_never_matches
+        PASS [   0.009s] ( 238/2754) coastwatch-claim-verification tests::case_fold_does_not_bleed_across_combining_mark
+        PASS [   0.005s] ( 239/2754) coastwatch-claim-verification tests::exploitation_observed_technique_some_unresolved_downgrades
+        PASS [   0.006s] ( 240/2754) coastwatch-claim-verification tests::exploitation_observed_ransomware_use_known_still_verifies
+        PASS [   0.011s] ( 241/2754) coastwatch-claim-verification tests::empty_vocab_downgrades_a_resolvable_looking_technique
+        PASS [   0.007s] ( 242/2754) coastwatch-claim-verification tests::exploitation_observed_typeless_target_absent_from_body_fails_slot_check
+        PASS [   0.006s] ( 243/2754) coastwatch-claim-verification tests::exploitation_observed_typeless_target_in_body_verifies
+        PASS [   0.005s] ( 244/2754) coastwatch-claim-verification tests::fabricated_span_with_unresolved_technique_fails_span_check_first
+        PASS [   0.011s] ( 245/2754) coastwatch-claim-verification tests::exploitation_observed_technique_none_does_not_downgrade
+        PASS [   0.007s] ( 246/2754) coastwatch-claim-verification tests::finds_match_after_earlier_non_boundary_occurrence
+        PASS [   0.004s] ( 247/2754) coastwatch-claim-verification tests::general_assertion_technique_mention_grounds_by_body_not_vocab
+        PASS [   0.004s] ( 248/2754) coastwatch-claim-verification tests::partial_alias_matches_with_word_boundaries
+        PASS [   0.007s] ( 249/2754) coastwatch-claim-verification tests::general_assertion_technique_mention_absent_from_body_fails_slot_check
+        PASS [   0.007s] ( 250/2754) coastwatch-claim-verification tests::multi_word_surface_matches_when_bounded
+        PASS [   0.008s] ( 251/2754) coastwatch-claim-verification tests::partial_alias_does_not_match_inside_longer_word
+        PASS [   0.005s] ( 252/2754) coastwatch-claim-verification tests::short_surface_does_not_match_inside_unrelated_word
+        PASS [   0.008s] ( 253/2754) coastwatch-claim-verification tests::resolved_technique_verifies
+        PASS [   0.006s] ( 254/2754) coastwatch-claim-verification tests::short_surface_matches_with_word_boundaries
+        PASS [   0.005s] ( 255/2754) coastwatch-claim-verification tests::slot_is_grounded_direct_surface_arm_stays_byte_exact
+        PASS [   0.006s] ( 256/2754) coastwatch-claim-verification tests::slot_is_grounded_alias_arm_case_insensitive
+        PASS [   0.004s] ( 257/2754) coastwatch-claim-verification tests::unresolved_technique_with_ungrounded_subject_fails_slot_check
+        PASS [   0.006s] ( 258/2754) coastwatch-claim-verification tests::slot_is_grounded_unresolved_entity_no_alias_path_stays_exact
+        PASS [   0.005s] ( 259/2754) coastwatch-claim-verification tests::unresolved_technique_with_grounded_subject_downgrades
+        PASS [   0.004s] ( 260/2754) coastwatch-claim-verification tests::verify_span_check_stays_byte_exact_pin
+        PASS [   0.004s] ( 261/2754) coastwatch-claim-verification tests::word_boundary_guard_still_applies_under_case_fold
+        PASS [   0.005s] ( 262/2754) coastwatch-claim-verification::slot_walker affects_product_walks_three_required_refs
+        PASS [   0.003s] ( 263/2754) coastwatch-claim-verification::slot_walker exploitation_observed_skips_absent_refs
+        PASS [   0.004s] ( 264/2754) coastwatch-claim-verification::slot_walker disclosure_walks_required_cve_and_optional_vendor
+        PASS [   0.004s] ( 265/2754) coastwatch-claim-verification::slot_walker attribution_walks_subject_and_actor
+        PASS [   0.004s] ( 266/2754) coastwatch-claim-verification::slot_walker exploitation_observed_walks_all_optional_refs_when_present
+        PASS [   0.007s] ( 267/2754) coastwatch-claim-verification::slot_walker general_assertion_indexes_mentioned_entities
+        PASS [   0.005s] ( 268/2754) coastwatch-claim-verification::slot_walker incident_reported_walks_optional_incident_and_victim
+        PASS [   0.005s] ( 269/2754) coastwatch-claim-verification::slot_walker targets_geography_walks_subject_and_target
+        PASS [   0.080s] ( 270/2754) coastwatch-bench::golden_corpus real_corpus_docs_parse_and_canonicalise
+        PASS [   0.007s] ( 271/2754) coastwatch-claim-verification::slot_walker incident_reported_skips_absent_refs
+        PASS [   0.007s] ( 272/2754) coastwatch-claim-verification::slot_walker iter_entity_refs_equals_entity_slots_for_every_variant
+        PASS [   0.008s] ( 273/2754) coastwatch-claim-verification::slot_walker patch_available_walks_cve_vendor_product
+        PASS [   0.004s] ( 274/2754) coastwatch-claim-verification::slot_walker targets_organization_type_walks_only_subject
+        PASS [   0.005s] ( 275/2754) coastwatch-claim-verification::slot_walker uses_technique_walks_subject_and_technique
+        PASS [   0.005s] ( 276/2754) coastwatch-claim-verification::slot_walker uses_infrastructure_walks_only_subject_not_ioc
+        PASS [   0.004s] ( 277/2754) coastwatch-claim-verification::verify entity_in_body_but_outside_span_grounds
+        PASS [   0.008s] ( 278/2754) coastwatch-claim-verification::slot_walker targets_sector_walks_subject_and_target
+        PASS [   0.004s] ( 279/2754) coastwatch-claim-verification::verify verbatim_unicode_dash_cve_surface_still_grounds
+        PASS [   0.093s] ( 280/2754) coastwatch-bench::golden_corpus expectation_anchors_are_groundable_and_cases_internally_consistent
+        PASS [   0.005s] ( 281/2754) coastwatch-claims-extract attribution_prefilter::tests::empty_text_has_no_markers
+        PASS [   0.006s] ( 282/2754) coastwatch-claims-extract attribution_prefilter::tests::ignores_verbs_embedded_in_longer_tokens
+        PASS [   0.006s] ( 283/2754) coastwatch-claims-extract attribution_prefilter::tests::is_case_insensitive
+        PASS [   0.005s] ( 284/2754) coastwatch-claims-extract attribution_prefilter::tests::matches_each_verb_on_a_word_boundary
+        PASS [   0.005s] ( 285/2754) coastwatch-claims-extract attribution_prefilter::tests::no_markers_in_a_bare_technical_advisory
+        PASS [   0.004s] ( 286/2754) coastwatch-claims-extract error::tests::exhausted_reason_display_matches_adr0025_spellings
+        PASS [   0.027s] ( 287/2754) coastwatch-claim-verification::verify legitimate_claim_verifies
+        PASS [   0.028s] ( 288/2754) coastwatch-claim-verification::verify fabricated_span_fails_span_check
+        PASS [   0.030s] ( 289/2754) coastwatch-claim-verification::verify aliased_entity_grounds_via_alias_db
+        PASS [   0.004s] ( 290/2754) coastwatch-claims-extract error::tests::exhausted_source_chain_survives_for_parity
+        PASS [   0.025s] ( 291/2754) coastwatch-claim-verification::verify missing_evidence_span_fails_span_check
+        PASS [   0.025s] ( 292/2754) coastwatch-claim-verification::verify verify_and_hash_are_idempotent
+        PASS [   0.004s] ( 293/2754) coastwatch-claims-extract error::tests::helpers_round_trip_via_display
+        PASS [   0.024s] ( 294/2754) coastwatch-claim-verification::verify wrong_entity_fails_slot_check
+        PASS [   0.006s] ( 295/2754) coastwatch-claims-extract ioc_regex::tests::byte_spans_are_correct
+        PASS [   0.006s] ( 296/2754) coastwatch-claims-extract ioc_regex::tests::cross_pass_order_does_not_break_dedup
+        PASS [   0.006s] ( 297/2754) coastwatch-claims-extract ioc_regex::tests::cve_case_insensitive_with_leading_zeros
+        PASS [   0.005s] ( 298/2754) coastwatch-claims-extract ioc_regex::tests::domain_basic_and_defanged
+        PASS [   0.006s] ( 299/2754) coastwatch-claims-extract ioc_regex::tests::cve_rejects_five_digit_year
+        PASS [   0.006s] ( 300/2754) coastwatch-claims-extract ioc_regex::tests::email_consumes_domain
+        PASS [   0.009s] ( 301/2754) coastwatch-claims-extract ioc_regex::tests::caps_accepted_iocs_at_max
+        PASS [   0.010s] ( 302/2754) coastwatch-claims-extract ioc_regex::tests::cap_truncation_keeps_pass_order_first_n_across_types
+        PASS [   0.005s] ( 303/2754) coastwatch-claims-extract ioc_regex::tests::email_lowercase_and_defanged
+        PASS [   0.006s] ( 304/2754) coastwatch-claims-extract ioc_regex::tests::empty_input_returns_empty
+        PASS [   0.005s] ( 305/2754) coastwatch-claims-extract ioc_regex::tests::ipv4_invalid_octet_dropped
+        PASS [   0.007s] ( 306/2754) coastwatch-claims-extract ioc_regex::tests::hash_only_exact_lengths
+        PASS [   0.006s] ( 307/2754) coastwatch-claims-extract ioc_regex::tests::ipv4_plain_and_defanged
+        PASS [   0.007s] ( 308/2754) coastwatch-claims-extract ioc_regex::tests::ipv4_before_url_does_not_emit_url_fragment
+        PASS [   0.006s] ( 309/2754) coastwatch-claims-extract ioc_regex::tests::mixed_document_all_types
+        PASS [   0.006s] ( 310/2754) coastwatch-claims-extract ioc_regex::tests::ipv6_canonical
+        PASS [   0.006s] ( 311/2754) coastwatch-claims-extract ioc_regex::tests::no_iocs_in_plain_prose
+        PASS [   0.004s] ( 312/2754) coastwatch-claims-extract kev::tests::extract_kev_returns_exactly_one_draft_no_aux_surfaces
+        PASS [   0.004s] ( 313/2754) coastwatch-claims-extract kev::tests::draft_is_one_exploitation_observed_with_kev_shape
+        PASS [   0.006s] ( 314/2754) coastwatch-claims-extract ioc_regex::tests::under_cap_body_observes_no_drop
+        PASS [   0.006s] ( 315/2754) coastwatch-claims-extract ioc_regex::tests::url_consumes_internal_ipv4_and_domain
+        PASS [   0.004s] ( 316/2754) coastwatch-claims-extract kev::tests::ransomware_unknown_maps_to_unknown_enum
+        PASS [   0.004s] ( 317/2754) coastwatch-claims-extract kev::tests::span_is_a_byte_exact_slice_of_the_rendered_body
+        PASS [   0.004s] ( 318/2754) coastwatch-claims-extract kev::tests::target_falls_back_to_vendor_when_product_generic
+        PASS [   0.004s] ( 319/2754) coastwatch-claims-extract kev_render::tests::optional_fields_dropped_cleanly
+        PASS [   0.005s] ( 320/2754) coastwatch-claims-extract kev_render::tests::fixed_point_holds_with_messy_surfaces
+        PASS [   0.004s] ( 321/2754) coastwatch-claims-extract kev_render::tests::ransomware_known_and_unknown_bodies_differ
+        PASS [   0.004s] ( 322/2754) coastwatch-claims-extract kev_render::tests::render_is_deterministic
+        PASS [   0.004s] ( 323/2754) coastwatch-claims-extract kev_render::tests::renders_all_core_fields
+        PASS [   0.004s] ( 324/2754) coastwatch-claims-extract kev_render::tests::renderer_output_is_a_fixed_point_of_normalise
+        PASS [   0.004s] ( 325/2754) coastwatch-claims-extract kev_render::tests::target_falls_back_to_vendor_when_product_generic
+        PASS [   0.004s] ( 326/2754) coastwatch-claims-extract kev_render::tests::target_none_when_neither_usable
+        PASS [   0.004s] ( 327/2754) coastwatch-claims-extract kev_render::tests::target_prefers_product_when_specific
+        PASS [   0.004s] ( 328/2754) coastwatch-claims-extract kev_render::tests::vendor_fallback_surface_is_cleaned
+        PASS [   0.015s] ( 329/2754) coastwatch-claims-extract ioc_regex::tests::overlaps_any_dedup_scales_subquadratically
+        PASS [   0.003s] ( 330/2754) coastwatch-claims-extract llm::tests::attribution_claims_fence_closer_is_not_forgeable_from_a_hostile_span
+        PASS [   0.004s] ( 331/2754) coastwatch-claims-extract llm::tests::extraction_caps_default_matches_q13_q2
+        PASS [   0.004s] ( 332/2754) coastwatch-claims-extract llm::tests::attribution_ctx_carries_only_fenced_slots
+        PASS [   0.004s] ( 333/2754) coastwatch-claims-extract llm::tests::classify_attempts_exhausted_source_maps_each_reason
+        PASS [   0.004s] ( 334/2754) coastwatch-claims-extract llm::tests::finalise_success_over_cap_returns_output_count_exceeded
+        PASS [   0.004s] ( 335/2754) coastwatch-claims-extract llm::tests::finalise_success_at_cap_returns_ok
+        PASS [   0.004s] ( 336/2754) coastwatch-claims-extract llm::tests::finalise_success_threads_doc_level_mentions_and_drops_invalid_surfaces
+        PASS [   0.004s] ( 337/2754) coastwatch-claims-extract llm::tests::head_truncate_utf8_drops_partial_codepoint
+        PASS [   0.004s] ( 338/2754) coastwatch-claims-extract llm::tests::head_truncate_utf8_handles_ascii_only
+        PASS [   0.004s] ( 339/2754) coastwatch-claims-extract llm::tests::is_transient_llm_source_buckets_correctly
+        PASS [   0.005s] ( 340/2754) coastwatch-claims-extract llm::tests::finalise_success_truncates_runaway_doc_level_mentions
+        PASS [   0.004s] ( 341/2754) coastwatch-claims-extract llm::tests::map_call_error_routes_malformed_tool_call_exhaustion_to_validation_exhausted_keeping_iocs
+        PASS [   0.004s] ( 342/2754) coastwatch-claims-extract llm::tests::map_call_error_routes_semantic_classes_to_exhausted
+        PASS [   0.004s] ( 343/2754) coastwatch-claims-extract llm::tests::map_call_error_routes_output_truncated_to_exhausted_keeping_iocs
+        PASS [   0.004s] ( 344/2754) coastwatch-claims-extract llm::tests::map_call_error_routes_transient_classes_to_transient
+        PASS [   0.006s] ( 345/2754) coastwatch-claims-extract llm::tests::map_call_error_routes_missing_tool_call_exhaustion_to_validation_exhausted
+        PASS [   0.004s] ( 346/2754) coastwatch-claims-extract llm::tests::mint_doc_fence_tag_avoids_strings_that_appear_in_body
+        PASS [   0.004s] ( 347/2754) coastwatch-claims-extract llm::tests::mint_doc_fence_tag_is_unique_per_call
+        PASS [   0.004s] ( 348/2754) coastwatch-claims-extract llm::tests::template_ctx_does_not_contain_document_source_url
+        PASS [   0.005s] ( 349/2754) coastwatch-claims-extract llm::tests::prompt_injection_via_closing_tag_in_body_is_neutralised
+        PASS [   0.004s] ( 350/2754) coastwatch-claims-extract stub::tests::default_behaviour_is_ok_empty
+        PASS [   0.005s] ( 351/2754) coastwatch-claims-extract stub::tests::configured_permanent_propagates
+        PASS [   0.004s] ( 352/2754) coastwatch-claims-extract stub::tests::non_strict_default_still_returns_ok_empty
+        PASS [   0.005s] ( 353/2754) coastwatch-claims-extract stub::tests::strict_mode_errors_on_unconfigured_doc
+        PASS [   0.004s] ( 354/2754) coastwatch-claims-extract stub::tests::strict_mode_honours_configured_behaviour
+        PASS [   0.004s] ( 355/2754) coastwatch-claims-extract wire::tests::adr_0032_shape_pin_entity_id_present_as_null_in_slots_json
+        PASS [   0.004s] ( 356/2754) coastwatch-claims-extract wire::tests::ambiguous_span_grounds_to_first_occurrence
+        PASS [   0.004s] ( 357/2754) coastwatch-claims-extract wire::tests::attribution_invalid_surface_is_dropped
+        PASS [   0.004s] ( 358/2754) coastwatch-claims-extract wire::tests::attribution_out_of_range_index_is_dropped
+        PASS [   0.004s] ( 359/2754) coastwatch-claims-extract wire::tests::attribution_maps_and_locates_span
+        PASS [   0.004s] ( 360/2754) coastwatch-claims-extract wire::tests::attribution_text_absent_from_body_keeps_attribution_with_no_span
+        PASS [   0.005s] ( 361/2754) coastwatch-claims-extract wire::tests::current_slot_versions_are_a_subset_of_drifted_versions
+        PASS [   0.005s] ( 362/2754) coastwatch-claims-extract wire::tests::claim_decode_failure_captures_raw_and_reuses_slot_shape_invalid
+        PASS [   0.005s] ( 363/2754) coastwatch-claims-extract wire::tests::evidence_span_not_in_body_fails_mismatch
+        PASS [   0.004s] ( 364/2754) coastwatch-claims-extract wire::tests::exploitation_observed_typeless_target_drops_mixed_script_gate_and_sets_target_type_none
+        PASS [   0.004s] ( 365/2754) coastwatch-claims-extract wire::tests::general_assertion_mention_entries_carry_declared_type
+        PASS [   0.004s] ( 366/2754) coastwatch-claims-extract wire::tests::happy_path_exploitation_observed_with_span
+        PASS [   0.004s] ( 367/2754) coastwatch-claims-extract wire::tests::known_predicates_count_matches_adr_0032
+        PASS [   0.004s] ( 368/2754) coastwatch-claims-extract wire::tests::invalid_wire_entity_id_is_sanitized_before_typed_decode
+        PASS [   0.003s] ( 369/2754) coastwatch-claims-extract wire::tests::llm_call_id_propagates_to_draft
+        PASS [   0.003s] ( 370/2754) coastwatch-claims-extract wire::tests::lower_all_variants_surface_survives_entity_id_is_none
+        PASS [   0.004s] ( 371/2754) coastwatch-claims-extract wire::tests::missing_evidence_span_fails_slot_shape_invalid
+        PASS [   0.003s] ( 372/2754) coastwatch-claims-extract wire::tests::missing_required_slot_fails_slot_shape_invalid
+        PASS [   0.003s] ( 373/2754) coastwatch-claims-extract wire::tests::mixed_script_actor_product_vendor_surfaces_fail_slot_shape_invalid
+        PASS [   0.004s] ( 374/2754) coastwatch-claims-extract wire::tests::mixed_script_mention_surface_fails_under_declared_type
+        PASS [   0.004s] ( 375/2754) coastwatch-claims-extract wire::tests::off_enum_doc_level_entity_type_fails_the_whole_decode
+        PASS [   0.004s] ( 376/2754) coastwatch-claims-extract wire::tests::one_date_only_claim_does_not_torch_envelope_decode
+        PASS [   0.003s] ( 377/2754) coastwatch-claims-extract wire::tests::one_garbage_claim_yields_one_failure_and_n_minus_one_drafts
+        PASS [   0.003s] ( 378/2754) coastwatch-claims-extract wire::tests::per_claim_auxiliary_mentioned_entities_are_rejected
+        PASS [   0.003s] ( 379/2754) coastwatch-claims-extract wire::tests::oversize_entity_surface_fails_slot_shape_invalid
+        PASS [   0.003s] ( 380/2754) coastwatch-claims-extract wire::tests::predicate_slot_fields_covers_all_known_predicates
+        PASS [   0.003s] ( 381/2754) coastwatch-claims-extract wire::tests::predicate_slot_fields_match_the_decoder
+        PASS [   0.138s] ( 382/2754) coastwatch-claims-extract wire::tests::openrouter_schema_slot_shapes_and_enums_match_decoder
+        PASS [   0.005s] ( 383/2754) coastwatch-claims-extract wire::tests::raw_wire_capture_on_failure
+        PASS [   0.149s] ( 384/2754) coastwatch-claims-extract wire::tests::openrouter_schema_envelope_matches_canonical
+        PASS [   0.005s] ( 385/2754) coastwatch-claims-extract wire::tests::saturating_offset_path_quarantines_not_panics
+        PASS [   0.007s] ( 386/2754) coastwatch-claims-extract wire::tests::tool_output_accepts_claims_without_doc_level_mentions
+        PASS [   0.164s] ( 387/2754) coastwatch-claims-extract wire::tests::inline_worked_examples_decode_and_teach_canonical_ioc_values
+        PASS [   0.154s] ( 388/2754) coastwatch-claims-extract wire::tests::openrouter_schema_slots_match_the_const
+        PASS [   0.007s] ( 389/2754) coastwatch-claims-extract wire::tests::tool_output_decodes_typed_doc_level_mentions_and_drops_entity_id
+        PASS [   0.007s] ( 390/2754) coastwatch-claims-extract wire::tests::unknown_predicate_fails_slot_shape_invalid
+        PASS [   0.154s] ( 391/2754) coastwatch-claims-extract wire::tests::prompt_slot_reference_matches_the_const
+        PASS [   0.008s] ( 392/2754) coastwatch-claims-extract wire::tests::untyped_mention_entries_default_to_actor_for_v1_outputs
+        PASS [   0.008s] ( 393/2754) coastwatch-claims-extract wire::tests::unknown_slot_field_fails_slot_shape_invalid
+        PASS [   0.010s] ( 394/2754) coastwatch-claims-extract wire::tests::uses_infrastructure_ioc_value_normalises_at_wire_lowering
+        PASS [   0.006s] ( 395/2754) coastwatch-claims-extract wire::tests::uses_infrastructure_unnormalisable_ioc_value_quarantines_slot_shape
+        PASS [   0.010s] ( 396/2754) coastwatch-claims-extract wire::tests::wire_claim_predicate_decode_cve_present_still_lowers
+        PASS [   0.013s] ( 397/2754) coastwatch-claims-extract wire::tests::wire_claim_predicate_decode_cve_absent_or_null_ok
+        PASS [   0.015s] ( 398/2754) coastwatch-claims-extract wire::tests::whitespace_only_entity_surface_fails_slot_shape_invalid
+        PASS [   0.019s] ( 399/2754) coastwatch-claims-extract wire::tests::wire_claim_predicate_decode_covers_all_ten_known_predicates
+        PASS [   0.006s] ( 400/2754) coastwatch-claims-extract wire::tests::wire_claim_predicate_decode_missing_required_slot_fails
+        PASS [   0.017s] ( 401/2754) coastwatch-claims-extract wire::tests::wire_claim_predicate_decode_exploitation_observed_drops_entity_id
+        PASS [   0.177s] ( 402/2754) coastwatch-claims-extract wire::tests::prompt_parser_actually_extracts_field_names
+        PASS [   0.008s] ( 403/2754) coastwatch-claims-extract wire::tests::wire_claim_predicate_decode_ransomware_use_known
+        PASS [   0.202s] ( 404/2754) coastwatch-claims-extract wire::tests::bundle_carries_at_least_five_examples
+        PASS [   0.009s] ( 405/2754) coastwatch-claims-extract wire::tests::wire_claim_predicate_decode_ransomware_use_unknown_and_absent
+        PASS [   0.014s] ( 406/2754) coastwatch-claims-extract wire::tests::wire_claim_predicate_decode_ransomware_use_invalid_value_fails
+        PASS [   0.009s] ( 407/2754) coastwatch-claims-extract wire::tests::wire_claim_predicate_decode_unknown_slot_field_fails
+        PASS [   0.006s] ( 408/2754) coastwatch-claims-extract wire::tests::wire_to_draft_ambiguity_still_fires_on_cross_paragraph_multi_match
+        PASS [   0.011s] ( 409/2754) coastwatch-claims-extract wire::tests::wire_entity_ref_silently_drops_stray_entity_id_key
+        PASS [   0.009s] ( 410/2754) coastwatch-claims-extract wire::tests::wire_to_attribution_cross_paragraph_span_uses_matcher
+        PASS [   0.010s] ( 411/2754) coastwatch-claims-extract wire::tests::wire_supplied_entity_id_is_cleared_before_processor_resolution
+        PASS [   0.006s] ( 412/2754) coastwatch-claims-extract wire::tests::wire_to_draft_cross_paragraph_span_now_grounds_and_stores_real_slice
+        PASS [   0.005s] ( 413/2754) coastwatch-config tests::absent_llm_block_yields_hardcoded_defaults
+        PASS [   0.005s] ( 414/2754) coastwatch-config tests::absent_models_block_yields_empty_map
+        PASS [   0.213s] ( 415/2754) coastwatch-claims-extract wire::tests::examples_decode_and_survive_the_decoder
+        PASS [   0.010s] ( 416/2754) coastwatch-config tests::absent_rendering_block_yields_defaults
+        PASS [   0.007s] ( 417/2754) coastwatch-config tests::cluster_absent_is_none
+        PASS [   0.007s] ( 418/2754) coastwatch-config tests::batch_size_zero_rejected
+        PASS [   0.009s] ( 419/2754) coastwatch-config tests::cluster_with_full_pipeline_loads
+        PASS [   0.010s] ( 420/2754) coastwatch-config tests::correction_absent_resolves_to_adr_defaults
+        PASS [   0.012s] ( 421/2754) coastwatch-config tests::correction_block_overrides_and_validates
+        PASS [   0.012s] ( 422/2754) coastwatch-config tests::correction_partial_block_defaults_the_omitted_field
+        PASS [   0.014s] ( 423/2754) coastwatch-config tests::cluster_without_extract_is_rejected
+        PASS [   0.006s] ( 424/2754) coastwatch-config tests::delivery_config_resolves_a_valid_block
+        PASS [   0.011s] ( 425/2754) coastwatch-config tests::correction_unknown_key_is_load_error
+        PASS [   0.009s] ( 426/2754) coastwatch-config tests::default_tier_is_test
+        PASS [   0.011s] ( 427/2754) coastwatch-config tests::correction_zero_cap_is_load_error
+        PASS [   0.004s] ( 428/2754) coastwatch-config tests::delivery_rejects_duplicate_audience
+        PASS [   0.007s] ( 429/2754) coastwatch-config tests::delivery_rejects_empty_public_base_url
+        PASS [   0.010s] ( 430/2754) coastwatch-config tests::delivery_empty_recipient_list_is_legal
+        PASS [   0.007s] ( 431/2754) coastwatch-config tests::delivery_rejects_empty_smtp_host_and_from
+        PASS [   0.009s] ( 432/2754) coastwatch-config tests::delivery_rejects_token_ttl_out_of_bounds
+        PASS [   0.005s] ( 433/2754) coastwatch-config tests::delivery_rejects_zero_smtp_port
+        PASS [   0.006s] ( 434/2754) coastwatch-config tests::delivery_rejects_unknown_audience
+        PASS [   0.008s] ( 435/2754) coastwatch-config tests::delivery_token_ttl_days_defaults_to_seven
+        PASS [   0.005s] ( 436/2754) coastwatch-config tests::editions_rejects_bad_publish_time
+        PASS [   0.007s] ( 437/2754) coastwatch-config tests::editions_config_resolves_a_valid_block
+        PASS [   0.008s] ( 438/2754) coastwatch-config tests::dev_tier_resolves_op_refs
+        PASS [   0.008s] ( 439/2754) coastwatch-config tests::editions_rejects_duplicate_audience
+        PASS [   0.009s] ( 440/2754) coastwatch-config tests::editions_rejects_invalid_timezone
+        PASS [   0.008s] ( 441/2754) coastwatch-config tests::editions_rejects_zero_top_n
+        PASS [   0.008s] ( 442/2754) coastwatch-config tests::editions_rejects_tick_not_shorter_than_cut_lead
+        PASS [   0.007s] ( 443/2754) coastwatch-config tests::embed_absent_is_none
+        PASS [   0.007s] ( 444/2754) coastwatch-config tests::embed_with_full_pipeline_loads
+        PASS [   0.008s] ( 445/2754) coastwatch-config tests::empty_extract_prompt_version_rejected_at_parse_boundary
+        PASS [   0.010s] ( 446/2754) coastwatch-config tests::embed_without_extract_is_rejected
+        PASS [   0.010s] ( 447/2754) coastwatch-config tests::empty_required_env_var_fails_closed_in_prod
+        PASS [   0.008s] ( 448/2754) coastwatch-config tests::env_is_ignored_in_test_tier
+        PASS [   0.007s] ( 449/2754) coastwatch-config tests::env_value_preserves_trailing_whitespace
+        PASS [   0.006s] ( 450/2754) coastwatch-config tests::env_var_wins_over_op_in_dev
+        PASS [   0.007s] ( 451/2754) coastwatch-config tests::external_web_loads_only_web_secrets_and_applies_fleet_session_overrides
+        PASS [   0.006s] ( 452/2754) coastwatch-config tests::external_worker_requires_declared_llm_keys_and_no_fleet_material
+        PASS [   0.015s] ( 453/2754) coastwatch-config tests::extract_floor_skipped_when_no_extract_stage
+        PASS [   0.011s] ( 454/2754) coastwatch-config tests::extract_model_with_no_profiles_authored_passes
+        PASS [   0.018s] ( 455/2754) coastwatch-config tests::external_web_rejects_invalid_shared_session_runtime_values
+        PASS [   0.009s] ( 456/2754) coastwatch-config tests::extract_provider_agreeing_with_profile_passes
+        PASS [   0.013s] ( 457/2754) coastwatch-config tests::extract_prompt_version_parses_into_newtype
+        PASS [   0.025s] ( 458/2754) coastwatch-config tests::extract_model_referencing_unknown_profile_rejected
+        PASS [   0.013s] ( 459/2754) coastwatch-config tests::extract_provider_anthropic_explicit_parses
+        PASS [   0.007s] ( 460/2754) coastwatch-config tests::extract_provider_openrouter_parses
+        PASS [   0.012s] ( 461/2754) coastwatch-config tests::extract_provider_defaults_to_anthropic_when_absent
+        PASS [   0.009s] ( 462/2754) coastwatch-config tests::extract_provider_disagreeing_with_profile_rejected
+        PASS [   0.007s] ( 463/2754) coastwatch-config tests::extract_worst_case_formula_is_pinned
+        PASS [   0.005s] ( 464/2754) coastwatch-config tests::feed_seed_rejects_bad_feed_url_before_bootstrap
+        PASS [   0.005s] ( 465/2754) coastwatch-config tests::feed_seed_kind_defaults_to_rss_and_round_trips_kev_json
+        PASS [   0.004s] ( 466/2754) coastwatch-config tests::feed_seed_rejects_bad_kind
+        PASS [   0.005s] ( 467/2754) coastwatch-config tests::feed_seed_rejects_bad_handling_label
+        PASS [   0.006s] ( 468/2754) coastwatch-config tests::feed_seed_rejects_empty_title_skip_pattern
+        PASS [   0.006s] ( 469/2754) coastwatch-config tests::feed_seed_rejects_bad_source_homepage_before_bootstrap
+        PASS [   0.005s] ( 470/2754) coastwatch-config tests::feed_seed_rejects_title_skip_patterns_on_kev_json
+        PASS [   0.006s] ( 471/2754) coastwatch-config tests::feed_seed_rejects_too_short_poll_interval
+        PASS [   0.005s] ( 472/2754) coastwatch-config tests::feed_seed_title_skip_patterns_default_empty
+        PASS [   0.005s] ( 473/2754) coastwatch-config tests::feed_seed_rejects_unknown_keys
+        PASS [   0.005s] ( 474/2754) coastwatch-config tests::feed_seed_title_skip_patterns_round_trip_trimmed
+        PASS [   0.005s] ( 475/2754) coastwatch-config tests::feed_seeds_parse_and_validate
+        PASS [   0.004s] ( 476/2754) coastwatch-config tests::feeds_default_empty
+        PASS [   0.005s] ( 477/2754) coastwatch-config tests::fetch_without_entry_is_rejected
+        PASS [   0.005s] ( 478/2754) coastwatch-config tests::full_loader_names_the_fleet_session_vars_it_ignores
+        PASS [   0.006s] ( 479/2754) coastwatch-config tests::ioc_assess_stage_loads_and_absent_is_none
+        PASS [   0.005s] ( 480/2754) coastwatch-config tests::ioc_export_absent_resolves_to_adr_defaults
+        PASS [   0.007s] ( 481/2754) coastwatch-config tests::ioc_export_empty_handling_allow_is_load_error
+        PASS [   0.007s] ( 482/2754) coastwatch-config tests::ioc_export_empty_role_allow_is_load_error
+        PASS [   0.011s] ( 483/2754) coastwatch-config tests::ioc_export_block_overrides_and_validates
+        PASS [   0.005s] ( 484/2754) coastwatch-config tests::ioc_export_invalid_handling_label_is_load_error
+        PASS [   0.009s] ( 485/2754) coastwatch-config tests::ioc_export_invalid_credibility_digit_is_load_error
+        PASS [   0.004s] ( 486/2754) coastwatch-config tests::ioc_export_invalid_role_is_load_error
+        PASS [   0.004s] ( 487/2754) coastwatch-config tests::ioc_export_unknown_key_is_load_error
+        PASS [   0.005s] ( 488/2754) coastwatch-config tests::ioc_export_partial_block_defaults_the_omitted_fields
+        PASS [   0.004s] ( 489/2754) coastwatch-config tests::ioc_lifecycle_absent_block_is_none
+        PASS [   0.004s] ( 490/2754) coastwatch-config tests::ioc_lifecycle_default_ttl_defaults_to_30_days_and_no_overrides
+        PASS [   0.004s] ( 491/2754) coastwatch-config tests::ioc_lifecycle_loads_default_and_sparse_type_role_overrides
+        PASS [   0.004s] ( 492/2754) coastwatch-config tests::ioc_lifecycle_rejects_duplicate_type_role_override
+        PASS [   0.004s] ( 493/2754) coastwatch-config tests::ioc_lifecycle_rejects_non_positive_scan_limit
+        PASS [   0.004s] ( 494/2754) coastwatch-config tests::ioc_lifecycle_rejects_unknown_override_role
+        PASS [   0.004s] ( 495/2754) coastwatch-config tests::ioc_lifecycle_rejects_unknown_override_type
+        PASS [   0.004s] ( 496/2754) coastwatch-config tests::ioc_lifecycle_rejects_zero_default_ttl
+        PASS [   0.005s] ( 497/2754) coastwatch-config tests::ioc_lifecycle_rejects_zero_override_ttl
+        PASS [   0.004s] ( 498/2754) coastwatch-config tests::ioc_lifecycle_rejects_zero_tick_interval
+        PASS [   0.004s] ( 499/2754) coastwatch-config tests::lifecycle_absent_block_is_none
+        PASS [   0.004s] ( 500/2754) coastwatch-config tests::lifecycle_actor_velocity_window_defaults_to_30_days
+        PASS [   0.004s] ( 501/2754) coastwatch-config tests::lifecycle_config_loads_and_converts_days_to_secs
+        PASS [   0.004s] ( 502/2754) coastwatch-config tests::lifecycle_rejects_close_shorter_than_velocity
+        PASS [   0.004s] ( 503/2754) coastwatch-config tests::lifecycle_rejects_overflow_actor_velocity_window
+        PASS [   0.004s] ( 504/2754) coastwatch-config tests::lifecycle_rejects_overflow_cve_velocity_window
+        PASS [   0.004s] ( 505/2754) coastwatch-config tests::lifecycle_rejects_zero_actor_velocity_window
+        PASS [   0.004s] ( 506/2754) coastwatch-config tests::lifecycle_rejects_zero_tick_interval
+        PASS [   0.004s] ( 507/2754) coastwatch-config tests::lifecycle_rejects_zero_velocity_window
+        PASS [   0.004s] ( 508/2754) coastwatch-config tests::llm_extraction_block_parses_into_typed_config
+        PASS [   0.004s] ( 509/2754) coastwatch-config tests::llm_extraction_zero_max_tokens_rejected
+        PASS [   0.004s] ( 510/2754) coastwatch-config tests::llm_extraction_zero_request_timeout_rejected
+        PASS [   0.004s] ( 511/2754) coastwatch-config tests::llm_extraction_zero_retry_backoff_base_rejected
+        PASS [   0.004s] ( 512/2754) coastwatch-config tests::llm_extraction_zero_retry_max_attempts_rejected
+        PASS [   0.004s] ( 513/2754) coastwatch-config tests::llm_rendering_block_parses_into_typed_config
+        PASS [   0.004s] ( 514/2754) coastwatch-config tests::loaded_secret_sources_cover_registry_in_order
+        PASS [   0.004s] ( 515/2754) coastwatch-config tests::malformed_attribution_prompt_version_rejected_at_parse_boundary
+        PASS [   0.005s] ( 516/2754) coastwatch-config tests::malformed_extract_prompt_version_rejected_at_parse_boundary
+        PASS [   0.004s] ( 517/2754) coastwatch-config tests::max_attempts_zero_rejected
+        PASS [   0.004s] ( 518/2754) coastwatch-config tests::malformed_model_rejected_at_parse_boundary
+        PASS [   0.004s] ( 519/2754) coastwatch-config tests::max_document_chars_defaults_when_absent
+        PASS [   0.004s] ( 520/2754) coastwatch-config tests::max_document_chars_explicit_override_parses
+        PASS [   0.004s] ( 521/2754) coastwatch-config tests::model_profile_duplicate_id_rejected
+        PASS [   0.004s] ( 522/2754) coastwatch-config tests::model_profile_empty_routing_only_rejected
+        PASS [   0.004s] ( 523/2754) coastwatch-config tests::model_profile_empty_routing_order_rejected
+        PASS [   0.004s] ( 524/2754) coastwatch-config tests::model_profile_empty_routing_quantizations_rejected
+        PASS [   0.004s] ( 525/2754) coastwatch-config tests::model_profile_json_schema_on_anthropic_rejected
+        PASS [   0.004s] ( 526/2754) coastwatch-config tests::model_profile_json_with_reasoning_rejected
+        PASS [   0.004s] ( 527/2754) coastwatch-config tests::model_profile_mechanism_not_in_supported_rejected
+        PASS [   0.004s] ( 528/2754) coastwatch-config tests::model_profile_multi_mechanism_requires_explicit_selection
+        PASS [   0.004s] ( 529/2754) coastwatch-config tests::model_profile_parses_and_implies_single_mechanism
+        PASS [   0.004s] ( 530/2754) coastwatch-config tests::model_profile_routing_data_collection_rejected
+        PASS [   0.004s] ( 531/2754) coastwatch-config tests::model_profile_routing_only_parses
+        PASS [   0.004s] ( 532/2754) coastwatch-config tests::model_profile_routing_require_parameters_rejected
+        PASS [   0.004s] ( 533/2754) coastwatch-config tests::model_profile_typo_profile_key_rejected
+        PASS [   0.004s] ( 534/2754) coastwatch-config tests::model_profile_unknown_provider_rejected
+        PASS [   0.004s] ( 535/2754) coastwatch-config tests::op_ref_in_test_tier_is_rejected
+        PASS [   0.004s] ( 536/2754) coastwatch-config tests::op_resolve_failure_fails_closed
+        PASS [   0.004s] ( 537/2754) coastwatch-config tests::openrouter_api_key_absent_is_none
+        PASS [   0.004s] ( 538/2754) coastwatch-config tests::openrouter_api_key_resolves_from_op_ref
+        PASS [   0.004s] ( 539/2754) coastwatch-config tests::password_with_reserved_chars_is_percent_encoded
+        PASS [   0.005s] ( 540/2754) coastwatch-config tests::prod_missing_required_secret_fails_closed
+        PASS [   0.004s] ( 541/2754) coastwatch-config tests::prod_resolves_secrets_from_env_without_op
+        PASS [   0.006s] ( 542/2754) coastwatch-config tests::reasoning_effort_absent_is_none
+        PASS [   0.005s] ( 543/2754) coastwatch-config tests::reasoning_effort_parses_into_typed_config
+        PASS [   0.004s] ( 544/2754) coastwatch-config tests::registry_emit_maps_each_field_to_its_value
+        PASS [   0.005s] ( 545/2754) coastwatch-config tests::reasoning_effort_under_anthropic_provider_is_no_op_not_error
+        PASS [   0.004s] ( 546/2754) coastwatch-config tests::registry_required_flags_match_field_optionality
+        PASS [   0.004s] ( 547/2754) coastwatch-config tests::render_floor_skipped_when_no_render_stage
+        PASS [   0.004s] ( 548/2754) coastwatch-config tests::render_guard_requires_a_companion_profile_once_extract_is_profiled
+        PASS [   0.005s] ( 549/2754) coastwatch-config tests::render_stale_lock_below_llm_floor_is_rejected
+        PASS [   0.006s] ( 550/2754) coastwatch-config tests::render_stale_lock_above_llm_floor_passes_and_pins_fields
+        PASS [   0.004s] ( 551/2754) coastwatch-config tests::resolver_preserves_trailing_whitespace_in_secrets
+        PASS [   0.005s] ( 552/2754) coastwatch-config tests::revision_absent_resolves_to_adr_defaults
+        PASS [   0.004s] ( 553/2754) coastwatch-config tests::revision_block_overrides_and_validates
+        PASS [   0.005s] ( 554/2754) coastwatch-config tests::revision_partial_block_defaults_the_omitted_field
+        PASS [   0.005s] ( 555/2754) coastwatch-config tests::revision_k_threshold_out_of_range_is_load_error
+        PASS [   0.004s] ( 556/2754) coastwatch-config tests::revision_unknown_key_is_load_error
+        PASS [   0.003s] ( 557/2754) coastwatch-config tests::secret_field_registry_has_no_duplicate_env_names
+        PASS [   0.004s] ( 558/2754) coastwatch-config tests::session_public_origins_toml_and_env_are_validated_with_env_precedence
+        PASS [   0.004s] ( 559/2754) coastwatch-config tests::soft_match_absent_is_none
+        PASS [   0.004s] ( 560/2754) coastwatch-config tests::soft_match_overrides_matcher_knobs
+        PASS [   0.004s] ( 561/2754) coastwatch-config tests::soft_match_rejects_out_of_range_floor
+        PASS [   0.008s] ( 562/2754) coastwatch-config tests::shipped_config_passes_cross_validation_for_every_tier
+        PASS [   0.004s] ( 563/2754) coastwatch-config tests::soft_match_with_full_pipeline_loads_with_default_knobs
+        PASS [   0.004s] ( 564/2754) coastwatch-config tests::soft_match_without_extract_is_rejected
+        PASS [   0.004s] ( 565/2754) coastwatch-config tests::stale_lock_above_llm_floor_passes
+        PASS [   0.004s] ( 566/2754) coastwatch-config tests::stale_lock_below_llm_floor_is_rejected
+        PASS [   0.004s] ( 567/2754) coastwatch-config tests::stale_lock_floor_at_exact_boundary_passes
+        PASS [   0.004s] ( 568/2754) coastwatch-config tests::stale_lock_below_poll_interval_rejected
+        PASS [   0.004s] ( 569/2754) coastwatch-config tests::stale_lock_floor_uses_llm_retry_not_queue_backoff
+        PASS [   0.004s] ( 570/2754) coastwatch-config tests::structured_resolver_reads_only_the_mapped_llm_fields
+        PASS [   0.003s] ( 571/2754) coastwatch-config tests::tier_from_env_defaults_to_default_tier_when_unset
+        PASS [   0.004s] ( 572/2754) coastwatch-config tests::test_tier_passes_plaintext_through_untouched
+        PASS [   0.003s] ( 573/2754) coastwatch-config tests::tier_from_env_reads_coastwatch_env
+        PASS [   0.003s] ( 574/2754) coastwatch-config tests::tier_from_env_rejects_junk
+        PASS [   0.003s] ( 575/2754) coastwatch-config tests::unknown_reasoning_effort_rejected
+        PASS [   0.004s] ( 576/2754) coastwatch-config tests::unknown_extract_provider_rejected_at_parse_boundary
+        PASS [   0.003s] ( 577/2754) coastwatch-config tests::unknown_tier_returns_typed_error
+        PASS [   0.004s] ( 578/2754) coastwatch-config tests::upload_max_bytes_below_floor_rejected
+        PASS [   0.003s] ( 579/2754) coastwatch-config tests::upload_max_bytes_defaults_when_block_absent
+        PASS [   0.003s] ( 580/2754) coastwatch-config tests::upload_max_bytes_defaults_when_field_absent
+        PASS [   0.003s] ( 581/2754) coastwatch-config tests::upload_max_bytes_honours_explicit_override
+        PASS [   0.003s] ( 582/2754) coastwatch-config tests::upload_pdf_blast_radius_defaults
+        PASS [   0.003s] ( 583/2754) coastwatch-config tests::upload_pdf_blast_radius_honours_overrides
+        PASS [   0.003s] ( 584/2754) coastwatch-config tests::upload_zero_max_extracted_bytes_rejected
+        PASS [   0.003s] ( 585/2754) coastwatch-config tests::upload_zero_pdf_concurrency_rejected
+        PASS [   0.003s] ( 586/2754) coastwatch-config tests::upload_zero_pdf_timeout_rejected
+        PASS [   0.004s] ( 587/2754) coastwatch-config tests::valid_stage_loads
+        PASS [   0.003s] ( 588/2754) coastwatch-config tests::worker_count_zero_rejected
+        PASS [   0.003s] ( 589/2754) coastwatch-config tests::zero_max_document_chars_rejected_at_load
+        PASS [   0.007s] ( 590/2754) coastwatch-config::dev_wrapper wrapper_fails_cleanly_when_fleet_dev_is_unavailable
+        PASS [   0.007s] ( 591/2754) coastwatch-config::dev_wrapper wrapper_falls_back_to_sibling_trawl_checkout
+        PASS [   0.006s] ( 592/2754) coastwatch-config::resolver_cli json_mode_cannot_be_combined_with_legacy_key_mode
+        PASS [   0.007s] ( 593/2754) coastwatch-config::dev_wrapper wrapper_uses_explicit_trawl_root_and_preserves_arguments_from_any_cwd
+        PASS [   0.004s] ( 594/2754) coastwatch-config::resolver_cli json_mode_emits_one_schema_document_with_lowercase_field_names
+        PASS [   0.003s] ( 595/2754) coastwatch-config::bin/coastwatch-env tests::discriminator_handles_unprefixed_names
+        PASS [   0.004s] ( 596/2754) coastwatch-config::session_process_env normal_web_loader_rejects_non_unicode_origin_override
+        PASS [   0.003s] ( 597/2754) coastwatch-config::bin/coastwatch-env tests::discriminator_is_none_for_canonical_checkout
+        PASS [   0.006s] ( 598/2754) coastwatch-config::session_process_env external_worker_ignores_non_unicode_web_origin_override
+        PASS [   0.003s] ( 599/2754) coastwatch-config::bin/coastwatch-env tests::discriminator_strips_repo_token_and_sanitises
+        PASS [   0.003s] ( 600/2754) coastwatch-config::bin/coastwatch-env tests::isolate_db_name_appends_suffix_preserving_credentials
+        PASS [   0.003s] ( 601/2754) coastwatch-config::bin/coastwatch-env tests::isolate_db_name_caps_at_namedatalen
+        PASS [   0.003s] ( 602/2754) coastwatch-config::bin/coastwatch-env tests::non_test_tier_is_never_rewritten
+        PASS [   0.004s] ( 603/2754) coastwatch-domain admiralty::tests::all_speculative_standalone_caps_at_doubtful
+        PASS [   0.006s] ( 604/2754) coastwatch-db::migrate_cli migrator_never_echoes_a_failed_dsn
+        PASS [   0.004s] ( 605/2754) coastwatch-domain admiralty::tests::corroboration_overrides_speculation
+        PASS [   0.007s] ( 606/2754) coastwatch-db::migrate_cli migrator_requires_database_url_and_rejects_arguments
+        PASS [   0.004s] ( 607/2754) coastwatch-domain admiralty::tests::display_covers_both_endpoints
+        PASS [   0.004s] ( 608/2754) coastwatch-domain admiralty::tests::display_renders_letter_then_digit
+        PASS [   0.004s] ( 609/2754) coastwatch-domain admiralty::tests::empty_cluster_is_f6
+        PASS [   0.004s] ( 610/2754) coastwatch-domain admiralty::tests::one_distinct_corroboration_is_probably_true
+        PASS [   0.004s] ( 611/2754) coastwatch-domain admiralty::tests::parse_rejects_malformed_input
+        PASS [   0.004s] ( 612/2754) coastwatch-domain admiralty::tests::parse_round_trips_every_pair
+        PASS [   0.004s] ( 613/2754) coastwatch-domain admiralty::tests::reliability_maps_tier_to_letter_with_f_default
+        PASS [   0.004s] ( 614/2754) coastwatch-domain admiralty::tests::same_source_echo_does_not_corroborate
+        PASS [   0.004s] ( 615/2754) coastwatch-domain admiralty::tests::speculative_echo_does_not_downgrade_standalone
+        PASS [   0.004s] ( 616/2754) coastwatch-domain admiralty::tests::speculative_folds_evidentiality_and_hedge
+        PASS [   0.004s] ( 617/2754) coastwatch-domain admiralty::tests::standalone_bplus_or_medium_is_possibly_true
+        PASS [   0.004s] ( 618/2754) coastwatch-domain admiralty::tests::standalone_low_authority_is_doubtful
+        PASS [   0.004s] ( 619/2754) coastwatch-domain admiralty::tests::standalone_unjudged_source_is_six
+        PASS [   0.004s] ( 620/2754) coastwatch-domain admiralty::tests::two_distinct_bplus_sources_confirm
+        PASS [   0.004s] ( 621/2754) coastwatch-domain admiralty::tests::two_distinct_low_authority_sources_still_corroborate_to_two
+        PASS [   0.004s] ( 622/2754) coastwatch-domain audience::tests::all_index_agrees_with_all_order
+        PASS [   0.004s] ( 623/2754) coastwatch-domain audience::tests::analyst_has_no_handling_ceiling
+        PASS [   0.004s] ( 624/2754) coastwatch-domain audience::tests::analyst_wire_token
+        PASS [   0.004s] ( 625/2754) coastwatch-domain audience::tests::exec_ceiling_is_amber_and_wire_token_is_exec
+        PASS [   0.004s] ( 626/2754) coastwatch-domain audience::tests::parse_round_trips_wire_tokens_and_rejects_garbage
+        PASS [   0.004s] ( 627/2754) coastwatch-domain authority::tests::ordering_runs_low_to_high
+        PASS [   0.004s] ( 628/2754) coastwatch-domain authority::tests::parse_rejects_unknown
+        PASS [   0.004s] ( 629/2754) coastwatch-domain authority::tests::wire_str_round_trips
+        PASS [   0.004s] ( 630/2754) coastwatch-domain canonical::tests::canonical_body_normalise_is_idempotent
+        PASS [   0.005s] ( 631/2754) coastwatch-domain canonical::tests::canonical_body_normalise_handles_whitespace_only
+        PASS [   0.004s] ( 632/2754) coastwatch-domain canonical::tests::canonical_body_round_trips_through_as_str
+        PASS [   0.004s] ( 633/2754) coastwatch-domain canonical::tests::eq_helper_different_non_ws_content_not_equal
+        PASS [   0.004s] ( 634/2754) coastwatch-domain canonical::tests::eq_helper_identical_strings_are_equal
+        PASS [   0.004s] ( 635/2754) coastwatch-domain canonical::tests::eq_helper_leading_trailing_ws_mismatch
+        PASS [   0.004s] ( 636/2754) coastwatch-domain canonical::tests::eq_helper_single_space_vs_double_newline
+        PASS [   0.004s] ( 637/2754) coastwatch-domain canonical::tests::eq_helper_supplied_offsets_case_with_double_newline
+        PASS [   0.004s] ( 638/2754) coastwatch-domain canonical::tests::matcher_cross_paragraph_needle_locates_region_with_double_newline
+        PASS [   0.004s] ( 639/2754) coastwatch-domain canonical::tests::matcher_cross_paragraph_slice_length_invariant
+        PASS [   0.004s] ( 640/2754) coastwatch-domain canonical::tests::matcher_empty_needle_returns_none
+        PASS [   0.004s] ( 641/2754) coastwatch-domain canonical::tests::matcher_exact_match_returns_same_offsets_as_find
+        PASS [   0.004s] ( 642/2754) coastwatch-domain canonical::tests::matcher_ignores_leading_trailing_whitespace_needle
+        PASS [   0.004s] ( 643/2754) coastwatch-domain canonical::tests::matcher_mixed_whitespace_run_tab_nbsp_double_newline
+        PASS [   0.004s] ( 644/2754) coastwatch-domain canonical::tests::matcher_multibyte_utf8_boundary_safety
+        PASS [   0.003s] ( 645/2754) coastwatch-domain canonical::tests::matcher_multiple_non_overlapping_matches_counted_correctly
+        PASS [   0.004s] ( 646/2754) coastwatch-domain canonical::tests::matcher_near_miss_non_whitespace_does_not_match
+        PASS [   0.004s] ( 647/2754) coastwatch-domain canonical::tests::matcher_no_match_returns_none
+        PASS [   0.004s] ( 648/2754) coastwatch-domain canonical::tests::matcher_self_overlapping_needle_is_not_double_counted
+        PASS [   0.005s] ( 649/2754) coastwatch-domain canonical::tests::matcher_pure_whitespace_needle_returns_none
+        PASS [   0.004s] ( 650/2754) coastwatch-domain canonical::tests::normalise_canonicalises_smart_quotes
+        PASS [   0.004s] ( 651/2754) coastwatch-domain canonical::tests::normalise_collapses_repeated_spaces_identically
+        PASS [   0.006s] ( 652/2754) coastwatch-domain canonical::tests::normalise_collapses_whitespace
+        PASS [   0.006s] ( 653/2754) coastwatch-domain canonical::tests::normalise_collapses_three_plus_newlines_to_single_paragraph_break
+        PASS [   0.004s] ( 654/2754) coastwatch-domain canonical::tests::normalise_does_not_collide_on_paragraph_vs_inline
+        PASS [   0.005s] ( 655/2754) coastwatch-domain canonical::tests::normalise_empty_and_whitespace_only_share_fingerprint
+        PASS [   0.005s] ( 656/2754) coastwatch-domain canonical::tests::normalise_empty_input_is_empty
+        PASS [   0.005s] ( 657/2754) coastwatch-domain canonical::tests::normalise_folds_intra_paragraph_crlf_to_space
+        PASS [   0.005s] ( 658/2754) coastwatch-domain canonical::tests::normalise_is_idempotent
+        PASS [   0.005s] ( 659/2754) coastwatch-domain canonical::tests::normalise_is_idempotent_for_crlf_input
+        PASS [   0.005s] ( 660/2754) coastwatch-domain canonical::tests::normalise_is_idempotent_with_new_passes
+        PASS [   0.005s] ( 661/2754) coastwatch-domain canonical::tests::normalise_keeps_distinct_word_content_distinct
+        PASS [   0.006s] ( 662/2754) coastwatch-domain canonical::tests::normalise_keeps_smart_quote_content_distinct_from_unquoted
+        PASS [   0.006s] ( 663/2754) coastwatch-domain canonical::tests::normalise_preserves_paragraph_breaks
+        PASS [   0.004s] ( 664/2754) coastwatch-domain canonical::tests::normalise_strips_soft_hyphens
+        PASS [   0.005s] ( 665/2754) coastwatch-domain canonical::tests::normalise_treats_mixed_unicode_whitespace_equally
+        PASS [   0.004s] ( 666/2754) coastwatch-domain canonical::tests::normalise_whitespace_only_variants_all_empty
+        PASS [   0.004s] ( 667/2754) coastwatch-domain capability_token::tests::correction_payload_json_bytes_are_wire_stable
+        PASS [   0.004s] ( 668/2754) coastwatch-domain capability_token::tests::correction_token_round_trips_and_authorizes_its_edition
+        PASS [   0.004s] ( 669/2754) coastwatch-domain capability_token::tests::expired_token_is_rejected_even_with_a_valid_signature
+        PASS [   0.004s] ( 670/2754) coastwatch-domain capability_token::tests::decode_signing_seed_accepts_hex_and_base64_and_rejects_wrong_length
+        PASS [   0.004s] ( 671/2754) coastwatch-domain capability_token::tests::payload_json_bytes_are_wire_stable
+        PASS [   0.004s] ( 672/2754) coastwatch-domain capability_token::tests::round_trip_recovers_the_payload
+        PASS [   0.004s] ( 673/2754) coastwatch-domain capability_token::tests::scope_mismatch_is_detectable_on_the_recovered_payload
+        PASS [   0.004s] ( 674/2754) coastwatch-domain capability_token::tests::structurally_broken_tokens_are_malformed
+        PASS [   0.004s] ( 675/2754) coastwatch-domain capability_token::tests::tampered_payload_fails_the_signature_check
+        PASS [   0.004s] ( 676/2754) coastwatch-domain capability_token::tests::wrong_key_fails_the_signature_check
+        PASS [   0.004s] ( 677/2754) coastwatch-domain claim::tests::affects_product_distinct_version_range_stays_distinct
+        PASS [   0.004s] ( 678/2754) coastwatch-domain claim::tests::affects_product_round_trips
+        PASS [   0.004s] ( 679/2754) coastwatch-domain claim::tests::attribution_round_trips
+        PASS [   0.004s] ( 680/2754) coastwatch-domain claim::tests::canonical_name_accepts_known_and_rejects_typos
+        PASS [   0.004s] ( 681/2754) coastwatch-domain claim::tests::content_dedup_key_distinguishes_predicates
+        PASS [   0.004s] ( 682/2754) coastwatch-domain claim::tests::content_dedup_key_is_32_bytes_for_every_variant
+        PASS [   0.004s] ( 683/2754) coastwatch-domain claim::tests::content_dedup_key_is_deterministic
+        PASS [   0.004s] ( 684/2754) coastwatch-domain claim::tests::content_dedup_key_wire_format_is_frozen
+        PASS [   0.004s] ( 685/2754) coastwatch-domain claim::tests::cve_absent_yields_distinct_key_and_no_entity_slot
+        PASS [   0.004s] ( 686/2754) coastwatch-domain claim::tests::cve_slot_decodes_present_absent_and_null_on_all_three_predicates
+        PASS [   0.004s] ( 687/2754) coastwatch-domain claim::tests::deny_unknown_fields_fires_for_typo
+        PASS [   0.004s] ( 688/2754) coastwatch-domain claim::tests::disclosure_round_trips
+        PASS [   0.005s] ( 689/2754) coastwatch-domain claim::tests::entity_ref_inside_slot_json_serialises_with_explicit_null
+        PASS [   0.005s] ( 690/2754) coastwatch-domain claim::tests::entity_slots_attribution
+        PASS [   0.005s] ( 691/2754) coastwatch-domain claim::tests::entity_slots_disclosure
+        PASS [   0.005s] ( 692/2754) coastwatch-domain claim::tests::entity_slots_exploitation_observed_emits_all_present_refs
+        PASS [   0.011s] ( 693/2754) coastwatch-domain claim::tests::entity_slots_affects_product
+        PASS [   0.007s] ( 694/2754) coastwatch-domain claim::tests::entity_slots_exploitation_observed_skips_absent_options
+        PASS [   0.005s] ( 695/2754) coastwatch-domain claim::tests::entity_slots_general_assertion_indexes_mentions
+        PASS [   0.005s] ( 696/2754) coastwatch-domain claim::tests::entity_slots_incident_reported
+        PASS [   0.005s] ( 697/2754) coastwatch-domain claim::tests::entity_slots_patch_available
+        PASS [   0.006s] ( 698/2754) coastwatch-domain claim::tests::entity_slots_targets_organization_type_emits_only_subject
+        PASS [   0.005s] ( 699/2754) coastwatch-domain claim::tests::entity_slots_uses_infrastructure_emits_only_subject
+        PASS [   0.006s] ( 700/2754) coastwatch-domain claim::tests::entity_slots_targets_sector_and_geography_emit_target
+        PASS [   0.004s] ( 701/2754) coastwatch-domain claim::tests::entity_slots_uses_technique
+        PASS [   0.004s] ( 702/2754) coastwatch-domain claim::tests::exploitation_observed_round_trips
+        PASS [   0.004s] ( 703/2754) coastwatch-domain claim::tests::from_storage_rejects_malformed_slots
+        PASS [   0.004s] ( 704/2754) coastwatch-domain claim::tests::general_assertion_distinct_free_text_stays_distinct
+        PASS [   0.005s] ( 705/2754) coastwatch-domain claim::tests::from_storage_rejects_unknown_predicate
+        PASS [   0.005s] ( 706/2754) coastwatch-domain claim::tests::general_assertion_round_trips
+        PASS [   0.004s] ( 707/2754) coastwatch-domain claim::tests::incident_reported_round_trips
+        PASS [   0.004s] ( 708/2754) coastwatch-domain claim::tests::ioc_role_is_excluded_from_the_key
+        PASS [   0.004s] ( 709/2754) coastwatch-domain claim::tests::legacy_untyped_mention_entries_decode_as_actor
+        PASS [   0.004s] ( 710/2754) coastwatch-domain claim::tests::mentioned_entity_ref_rejects_unknown_keys
+        PASS [   0.004s] ( 711/2754) coastwatch-domain claim::tests::mentioned_entities_reorder_collapses
+        PASS [   0.004s] ( 712/2754) coastwatch-domain claim::tests::mentioned_entity_ref_serialises_flat_with_entity_type
+        PASS [   0.004s] ( 713/2754) coastwatch-domain claim::tests::modality_is_not_a_slot_so_cannot_affect_the_key
+        PASS [   0.004s] ( 714/2754) coastwatch-domain claim::tests::old_stored_row_without_target_type_decodes_to_none
+        PASS [   0.004s] ( 715/2754) coastwatch-domain claim::tests::old_stored_row_without_ransomware_use_decodes_to_none
+        PASS [   0.004s] ( 716/2754) coastwatch-domain claim::tests::patch_available_round_trips
+        PASS [   0.006s] ( 717/2754) coastwatch-domain claim::tests::predicate_str_matches_all_ten_variants
+        PASS [   0.005s] ( 718/2754) coastwatch-domain claim::tests::ransomware_use_known_vs_unknown_are_distinct
+        PASS [   0.005s] ( 719/2754) coastwatch-domain claim::tests::ransomware_use_invalid_enum_value_errs
+        PASS [   0.006s] ( 720/2754) coastwatch-domain claim::tests::ransomware_use_none_vs_some_unknown_are_distinct
+        PASS [   0.005s] ( 721/2754) coastwatch-domain claim::tests::ransomware_use_round_trips_none
+        PASS [   0.007s] ( 722/2754) coastwatch-domain claim::tests::ransomware_use_round_trips_some_unknown
+        PASS [   0.008s] ( 723/2754) coastwatch-domain claim::tests::ransomware_use_round_trips_some_known
+        PASS [   0.005s] ( 724/2754) coastwatch-domain claim::tests::ransomware_use_typo_still_errs_under_deny_unknown_fields
+        PASS [   0.007s] ( 725/2754) coastwatch-domain claim::tests::ransomware_use_serialises_snake_case
+        PASS [   0.005s] ( 726/2754) coastwatch-domain claim::tests::resolved_and_unresolved_same_surface_are_distinct
+        PASS [   0.005s] ( 727/2754) coastwatch-domain claim::tests::resolved_entity_keys_on_id_not_surface
+        PASS [   0.005s] ( 728/2754) coastwatch-domain claim::tests::target_kind_wire_str_matches_target_serde_tag
+        PASS [   0.005s] ( 729/2754) coastwatch-domain claim::tests::target_type_does_not_affect_the_key
+        PASS [   0.005s] ( 730/2754) coastwatch-domain claim::tests::target_type_some_product_round_trips
+        PASS [   0.005s] ( 731/2754) coastwatch-domain claim::tests::targets_round_trips_with_geography_target
+        PASS [   0.005s] ( 732/2754) coastwatch-domain claim::tests::targets_round_trips_with_organization_type_target
+        PASS [   0.004s] ( 733/2754) coastwatch-domain claim::tests::targets_round_trips_with_sector_target
+        PASS [   0.004s] ( 734/2754) coastwatch-domain claim::tests::targets_slots_organization_type_carries_name_not_target
+        PASS [   0.004s] ( 735/2754) coastwatch-domain claim::tests::unresolved_entity_keys_on_normalized_surface
+        PASS [   0.004s] ( 736/2754) coastwatch-domain claim::tests::targets_slots_wire_shape_flattens_discriminator
+        PASS [   0.004s] ( 737/2754) coastwatch-domain claim::tests::unresolved_genuinely_different_surfaces_stay_distinct
+        PASS [   0.004s] ( 738/2754) coastwatch-domain claim::tests::unresolved_surface_nfc_normalizes
+        PASS [   0.004s] ( 739/2754) coastwatch-domain claim::tests::uses_technique_round_trips
+        PASS [   0.006s] ( 740/2754) coastwatch-domain claim::tests::uses_infrastructure_round_trips
+        PASS [   0.007s] ( 741/2754) coastwatch-domain correction::tests::adr_default_is_one_per_edition_three_per_day
+        PASS [   0.005s] ( 742/2754) coastwatch-domain correction::tests::new_accepts_positive_caps
+        PASS [   0.005s] ( 743/2754) coastwatch-domain correction::tests::new_rejects_a_zero_edition_cap
+        PASS [   0.007s] ( 744/2754) coastwatch-domain curation::tests::below_fold_drops_remainder_without_activity_since_previous
+        PASS [   0.007s] ( 745/2754) coastwatch-domain curation::tests::claim_count_dominates_recency
+        PASS [   0.013s] ( 746/2754) coastwatch-domain correction::tests::new_rejects_a_zero_day_cap
+        PASS [   0.006s] ( 747/2754) coastwatch-domain curation::tests::excluded_when_featured_in_previous_edition_with_unchanged_hash
+        PASS [   0.010s] ( 748/2754) coastwatch-domain curation::tests::claims_added_is_exact_set_difference_under_add_and_remove
+        PASS [   0.007s] ( 749/2754) coastwatch-domain curation::tests::empty_candidates_produce_empty_split
+        PASS [   0.005s] ( 750/2754) coastwatch-domain curation::tests::exploitation_dominates_claim_count
+        PASS [   0.004s] ( 751/2754) coastwatch-domain curation::tests::id_is_the_deterministic_tie_break
+        PASS [   0.004s] ( 752/2754) coastwatch-domain curation::tests::never_featured_counts_whole_cluster_and_any_exploitation
+        PASS [   0.004s] ( 753/2754) coastwatch-domain curation::tests::never_in_previous_edition_is_a_candidate
+        PASS [   0.005s] ( 754/2754) coastwatch-domain curation::tests::never_featured_with_no_exploitation_claim_is_not_new_exploitation
+        PASS [   0.004s] ( 755/2754) coastwatch-domain curation::tests::new_exploitation_since_last_featuring_needs_a_fresh_exploitation_claim
+        PASS [   0.004s] ( 756/2754) coastwatch-domain curation::tests::recency_dominates_id
+        PASS [   0.004s] ( 757/2754) coastwatch-domain curation::tests::not_excluded_when_hash_changed_since_previous_edition
+        PASS [   0.005s] ( 758/2754) coastwatch-domain curation::tests::top_n_boundary_splits_featured_from_below_fold
+        PASS [   0.004s] ( 759/2754) coastwatch-domain document::tests::default_is_rss
+        PASS [   0.004s] ( 760/2754) coastwatch-domain document::tests::wire_round_trips
+        PASS [   0.005s] ( 761/2754) coastwatch-domain document::tests::rejects_unknown_kind
+        PASS [   0.005s] ( 762/2754) coastwatch-domain edition_schedule::tests::catch_up_cuts_late_within_the_same_local_day
+        PASS [   0.005s] ( 763/2754) coastwatch-domain edition_schedule::tests::cut_fires_when_due_and_no_edition_exists
+        PASS [   0.006s] ( 764/2754) coastwatch-domain edition_schedule::tests::no_cross_midnight_backfill_before_todays_cut
+        PASS [   0.011s] ( 765/2754) coastwatch-domain edition_schedule::tests::fall_back_ambiguous_resolves_to_earlier_offset
+        PASS [   0.005s] ( 766/2754) coastwatch-domain edition_schedule::tests::nothing_fires_before_cut_time
+        PASS [   0.008s] ( 767/2754) coastwatch-domain edition_schedule::tests::normal_local_time_resolves_through_the_offset
+        PASS [   0.011s] ( 768/2754) coastwatch-domain edition_schedule::tests::no_publish_while_compiling_before_publish_time
+        PASS [   0.004s] ( 769/2754) coastwatch-domain edition_schedule::tests::publish_fires_when_compiling_and_past_publish_time
+        PASS [   0.004s] ( 770/2754) coastwatch-domain edition_schedule::tests::published_today_is_a_noop
+        PASS [   0.005s] ( 771/2754) coastwatch-domain edition_schedule::tests::only_todays_date_is_cut_never_a_missed_previous_day
+        PASS [   0.004s] ( 772/2754) coastwatch-domain edition_schedule::tests::scheduling_uses_the_dst_resolved_publish_instant
+        PASS [   0.004s] ( 773/2754) coastwatch-domain edition_schedule::tests::spring_forward_gap_resolves_to_next_valid_instant
+        PASS [   0.004s] ( 774/2754) coastwatch-domain edition_schedule::tests::stuck_compiling_edition_from_yesterday_is_not_published_today
+        PASS [   0.004s] ( 775/2754) coastwatch-domain entity::tests::actor_product_vendor_reject_mixed_script_surfaces
+        PASS [   0.005s] ( 776/2754) coastwatch-domain entity::tests::all_index_agrees_with_all_order
+        PASS [   0.004s] ( 777/2754) coastwatch-domain entity::tests::canonical_name_rejects_empty_and_oversize
+        PASS [   0.004s] ( 778/2754) coastwatch-domain entity::tests::canonical_name_serde_via_string_validates
+        PASS [   0.004s] ( 779/2754) coastwatch-domain entity::tests::canonical_name_trims_and_nfc_normalizes
+        PASS [   0.004s] ( 780/2754) coastwatch-domain entity::tests::canonical_name_trims_and_rejects_empty
+        PASS [   0.005s] ( 781/2754) coastwatch-domain entity::tests::confidence_certain_round_trips_as_one
+        PASS [   0.006s] ( 782/2754) coastwatch-domain entity::tests::confidence_rejects_non_finite
+        PASS [   0.005s] ( 783/2754) coastwatch-domain entity::tests::confidence_rejects_out_of_range
+        PASS [   0.008s] ( 784/2754) coastwatch-domain entity::tests::confidence_accepts_mid_range_and_exactly_one
+        PASS [   0.008s] ( 785/2754) coastwatch-domain entity::tests::entity_ref_rejects_unknown_field
+        PASS [   0.006s] ( 786/2754) coastwatch-domain entity::tests::entity_ref_resolved_serialises_uuid
+        PASS [   0.005s] ( 787/2754) coastwatch-domain entity::tests::entity_ref_round_trips_through_serde
+        PASS [   0.009s] ( 788/2754) coastwatch-domain entity::tests::entity_ref_unresolved_serialises_with_explicit_null
+        PASS [   0.005s] ( 789/2754) coastwatch-domain entity::tests::entity_type_count_matches_adr_0032
+        PASS [   0.007s] ( 790/2754) coastwatch-domain entity::tests::entity_type_parse_rejects_garbage
+        PASS [   0.007s] ( 791/2754) coastwatch-domain entity::tests::entity_type_serde_matches_wire_str
+        PASS [   0.004s] ( 792/2754) coastwatch-domain entity::tests::entity_type_wire_round_trips
+        PASS [   0.004s] ( 793/2754) coastwatch-domain entity::tests::is_discriminating_pins_the_nine_five_split
+        PASS [   0.004s] ( 794/2754) coastwatch-domain entity::tests::non_confusable_entity_types_allow_mixed_script_labels
+        PASS [   0.004s] ( 795/2754) coastwatch-domain entity::tests::normalized_name_mixed_script_gate_is_type_scoped
+        PASS [   0.005s] ( 796/2754) coastwatch-domain entity::tests::normalized_name_from_storage_is_a_passthrough
+        PASS [   0.004s] ( 797/2754) coastwatch-domain entity::tests::normalized_name_rejects_empty_after_trim
+        PASS [   0.004s] ( 798/2754) coastwatch-domain entity::tests::normalized_name_rejects_oversize_surface
+        PASS [   0.004s] ( 799/2754) coastwatch-domain entity::tests::normalized_name_trims_and_accepts_a_normal_surface
+        PASS [   0.004s] ( 800/2754) coastwatch-domain extraction::tests::evidence_span_new_accepts_valid
+        PASS [   0.006s] ( 801/2754) coastwatch-domain extraction::tests::evidence_span_new_rejects_empty_or_inverted
+        PASS [   0.005s] ( 802/2754) coastwatch-domain extraction::tests::evidence_span_new_rejects_length_mismatch
+        PASS [   0.005s] ( 803/2754) coastwatch-domain extraction::tests::evidence_span_new_rejects_negative_start
+        PASS [   0.005s] ( 804/2754) coastwatch-domain extraction::tests::evidence_span_new_rejects_saturated_equal_offsets_without_panicking
+        PASS [   0.005s] ( 805/2754) coastwatch-domain extraction::tests::raw_ioc_new_accepts_value
+        PASS [   0.005s] ( 806/2754) coastwatch-domain extraction::tests::raw_ioc_new_rejects_empty_value
+        PASS [   0.005s] ( 807/2754) coastwatch-domain feed::tests::rejects_unknown_kind
+        PASS [   0.006s] ( 808/2754) coastwatch-domain feed::tests::default_is_rss
+        PASS [   0.005s] ( 809/2754) coastwatch-domain feed::tests::wire_round_trips
+        PASS [   0.005s] ( 810/2754) coastwatch-domain fingerprint::tests::compute_diverges_for_different_input
+        PASS [   0.005s] ( 811/2754) coastwatch-domain fingerprint::tests::compute_is_deterministic_for_identical_input
+        PASS [   0.005s] ( 812/2754) coastwatch-domain fingerprint::tests::display_is_lowercase_hex_padded
+        PASS [   0.004s] ( 813/2754) coastwatch-domain fingerprint::tests::display_round_trips_through_parse
+        PASS [   0.005s] ( 814/2754) coastwatch-domain fingerprint::tests::parse_rejects_non_hex
+        PASS [   0.004s] ( 815/2754) coastwatch-domain handling::tests::elevate_returns_more_restrictive_of_two
+        PASS [   0.004s] ( 816/2754) coastwatch-domain handling::tests::is_at_least_implements_gating_predicate
+        PASS [   0.005s] ( 817/2754) coastwatch-domain fingerprint::tests::parse_rejects_wrong_length
+        PASS [   0.004s] ( 818/2754) coastwatch-domain handling::tests::ordering_runs_from_clear_to_red
+        PASS [   0.004s] ( 819/2754) coastwatch-domain handling::tests::parse_rejects_garbage
+        PASS [   0.004s] ( 820/2754) coastwatch-domain ids::tests::display_round_trips_via_from_str
+        PASS [   0.004s] ( 821/2754) coastwatch-domain handling::tests::wire_label_round_trips_through_str
+        PASS [   0.004s] ( 822/2754) coastwatch-domain ids::tests::distinct_id_types_are_not_interchangeable_at_compile_time
+        PASS [   0.007s] ( 823/2754) coastwatch-domain ids::tests::from_uuid_round_trips_through_as_uuid
+        PASS [   0.008s] ( 824/2754) coastwatch-domain ids::tests::generate_yields_distinct_uuid_v7
+        PASS [   0.009s] ( 825/2754) coastwatch-domain ids::tests::from_str_rejects_non_uuid
+        PASS [   0.005s] ( 826/2754) coastwatch-domain ioc::tests::ioc_type_count_matches_adr_0032
+        PASS [   0.008s] ( 827/2754) coastwatch-domain ioc::tests::canonical_cve_from_surface_is_idempotent_and_case_folding
+        PASS [   0.015s] ( 828/2754) coastwatch-domain ioc::tests::canonical_cve_from_surface_folds_unicode_dashes_to_ascii_canonical
+        PASS [   0.009s] ( 829/2754) coastwatch-domain ioc::tests::canonical_cve_from_surface_rejects_junk
+        PASS [   0.005s] ( 830/2754) coastwatch-domain ioc::tests::ioc_type_serde_matches_wire_str
+        PASS [   0.005s] ( 831/2754) coastwatch-domain ioc::tests::ioc_type_wire_round_trips
+        PASS [   0.004s] ( 832/2754) coastwatch-domain ioc::tests::normalise_cve_lowercase_with_leading_zeros
+        PASS [   0.004s] ( 833/2754) coastwatch-domain ioc::tests::normalise_cve_preserves_leading_zeros
+        PASS [   0.004s] ( 834/2754) coastwatch-domain ioc::tests::normalise_cve_rejects_malformed
+        PASS [   0.004s] ( 835/2754) coastwatch-domain ioc::tests::normalise_cve_uppercases_prefix_preserves_digits
+        PASS [   0.004s] ( 836/2754) coastwatch-domain ioc::tests::normalise_domain_lowercases_strips_trailing_dot_and_refangs
+        PASS [   0.004s] ( 837/2754) coastwatch-domain ioc::tests::normalise_domain_rejects_obviously_bad_shapes
+        PASS [   0.003s] ( 838/2754) coastwatch-domain ioc::tests::normalise_email_lowercases_both_parts
+        PASS [   0.004s] ( 839/2754) coastwatch-domain ioc::tests::normalise_email_rejects_obviously_bad
+        PASS [   0.004s] ( 840/2754) coastwatch-domain ioc::tests::normalise_hash_accepts_md5_sha1_sha256_sha512_and_lowercases
+        PASS [   0.004s] ( 841/2754) coastwatch-domain ioc::tests::normalise_hash_rejects_bad_length_and_non_hex
+        PASS [   0.006s] ( 842/2754) coastwatch-domain ioc::tests::normalise_ipv4_parses_and_refangs
+        PASS [   0.005s] ( 843/2754) coastwatch-domain ioc::tests::normalise_rejects_empty
+        PASS [   0.005s] ( 844/2754) coastwatch-domain ioc::tests::normalise_url_does_not_panic_on_unicode_prefix
+        PASS [   0.008s] ( 845/2754) coastwatch-domain ioc::tests::normalise_ipv6_canonicalises
+        PASS [   0.009s] ( 846/2754) coastwatch-domain ioc::tests::normalise_url_refangs_bracket_colon_in_scheme
+        PASS [   0.006s] ( 847/2754) coastwatch-domain ioc::tests::normalise_url_rejects_garbage
+        PASS [   0.012s] ( 848/2754) coastwatch-domain ioc::tests::normalise_url_lowercases_scheme_and_host_preserves_path_case
+        PASS [   0.010s] ( 849/2754) coastwatch-domain ioc::tests::normalise_url_refangs_dot_brackets
+        PASS [   0.004s] ( 850/2754) coastwatch-domain ioc_export_policy::tests::adr_default_shape
+        PASS [   0.005s] ( 851/2754) coastwatch-domain ioc_export_policy::tests::adr_default_floor_is_inert
+        PASS [   0.004s] ( 852/2754) coastwatch-domain ioc_export_policy::tests::exclude_reason_wire_tokens_are_stable
+        PASS [   0.005s] ( 853/2754) coastwatch-domain ioc_export_policy::tests::below_confidence_floor_excludes_when_handling_and_role_ok
+        PASS [   0.003s] ( 854/2754) coastwatch-domain ioc_export_policy::tests::floor_boundary_is_inclusive_on_the_credible_side
+        PASS [   0.004s] ( 855/2754) coastwatch-domain ioc_export_policy::tests::handling_ceiling_excludes_and_wins_ordering
+        PASS [   0.004s] ( 856/2754) coastwatch-domain ioc_export_policy::tests::included_when_all_three_pass
+        PASS [   0.004s] ( 857/2754) coastwatch-domain ioc_export_policy::tests::role_filtered_excludes_when_handling_ok
+        PASS [   0.003s] ( 858/2754) coastwatch-domain ioc_policy::tests::assessed_sighting_without_active_support_is_noop_not_refresh
+        PASS [   0.004s] ( 859/2754) coastwatch-domain ioc_policy::tests::double_suppress_and_stray_resurrect_are_illegal
+        PASS [   0.004s] ( 860/2754) coastwatch-domain ioc_policy::tests::evaluate_matrix_is_total_and_correct
+        PASS [   0.004s] ( 861/2754) coastwatch-domain ioc_policy::tests::gate_strength_from_predicates_normalises_the_impossible_pair
+        PASS [   0.004s] ( 862/2754) coastwatch-domain ioc_policy::tests::gate_strength_ladder_couples_refresh_to_gate
+        PASS [   0.007s] ( 863/2754) coastwatch-domain ioc_policy::tests::expired_revives_to_assessed_with_new_evidence_rule
+        PASS [   0.005s] ( 864/2754) coastwatch-domain ioc_policy::tests::infer_role_falls_back_per_type_when_no_hint_maps
+        PASS [   0.009s] ( 865/2754) coastwatch-domain ioc_policy::tests::infer_role_is_case_and_whitespace_insensitive
+        PASS [   0.012s] ( 866/2754) coastwatch-domain ioc_policy::tests::infer_role_exact_matches_each_wire_token
+        PASS [   0.010s] ( 867/2754) coastwatch-domain ioc_policy::tests::infer_role_most_recent_verified_hint_wins
+        PASS [   0.007s] ( 868/2754) coastwatch-domain ioc_policy::tests::infer_role_skips_noise_before_a_substantive_hint
+        PASS [   0.005s] ( 869/2754) coastwatch-domain ioc_policy::tests::per_type_default_only_hash_is_artifact
+        PASS [   0.005s] ( 870/2754) coastwatch-domain ioc_policy::tests::resurrect_of_suppressed_targets_extracted_not_assessed
+        PASS [   0.005s] ( 871/2754) coastwatch-domain ioc_policy::tests::role_all_index_agrees_with_all_order
+        PASS [   0.005s] ( 872/2754) coastwatch-domain ioc_policy::tests::role_count_is_seven
+        PASS [   0.004s] ( 873/2754) coastwatch-domain ioc_policy::tests::role_wire_round_trips
+        PASS [   0.004s] ( 874/2754) coastwatch-domain ioc_policy::tests::rule_parse_rejects_unknown
+        PASS [   0.004s] ( 875/2754) coastwatch-domain ioc_policy::tests::rule_wire_round_trips
+        PASS [   0.004s] ( 876/2754) coastwatch-domain ioc_policy::tests::state_all_index_agrees_with_all_order
+        PASS [   0.004s] ( 877/2754) coastwatch-domain ioc_policy::tests::state_parse_rejects_unknown
+        PASS [   0.004s] ( 878/2754) coastwatch-domain ioc_policy::tests::suppress_from_extracted_is_legal
+        PASS [   0.007s] ( 879/2754) coastwatch-domain ioc_policy::tests::state_wire_round_trips
+        PASS [   0.007s] ( 880/2754) coastwatch-domain ioc_policy::tests::suppressed_never_exits_on_evidence
+        PASS [   0.005s] ( 881/2754) coastwatch-domain ioc_policy::tests::transition_error_display_names_endpoint_and_trigger
+        PASS [   0.005s] ( 882/2754) coastwatch-domain ioc_policy::tests::ttl_window_exact_type_role_override_wins
+        PASS [   0.005s] ( 883/2754) coastwatch-domain key_prefix::tests::key_prefix_rejects_non_base64url_byte
+        PASS [   0.005s] ( 884/2754) coastwatch-domain key_prefix::tests::key_prefix_rejects_seven_char_prefix
+        PASS [   0.005s] ( 885/2754) coastwatch-domain key_prefix::tests::key_prefix_rejects_wrong_length
+        PASS [   0.012s] ( 886/2754) coastwatch-domain ioc_policy::tests::ttl_window_falls_back_to_default_when_unmatched
+        PASS [   0.013s] ( 887/2754) coastwatch-domain key_prefix::tests::key_prefix_accepts_base64url_alphabet
+        PASS [   0.008s] ( 888/2754) coastwatch-domain llm::tests::caller_kind_rejects_unknown
+        PASS [   0.005s] ( 889/2754) coastwatch-domain llm::tests::caller_kind_wire_roundtrip
+        PASS [   0.005s] ( 890/2754) coastwatch-domain llm::tests::correlation_ref_kind_str_matches_variants
+        PASS [   0.005s] ( 891/2754) coastwatch-domain llm::tests::model_id_accepts_real_provider_ids
+        PASS [   0.004s] ( 892/2754) coastwatch-domain llm::tests::model_id_rejects_malformed
+        PASS [   0.005s] ( 893/2754) coastwatch-domain llm::tests::newtypes_roundtrip_via_display
+        PASS [   0.004s] ( 894/2754) coastwatch-domain llm::tests::output_mechanism_default_is_tool_choice
+        PASS [   0.004s] ( 895/2754) coastwatch-domain llm::tests::output_mechanism_rejects_unknown
+        PASS [   0.007s] ( 896/2754) coastwatch-domain llm::tests::output_mechanism_deserializes_snake_case
+        PASS [   0.005s] ( 897/2754) coastwatch-domain llm::tests::output_mechanism_wire_roundtrip
+        PASS [   0.008s] ( 898/2754) coastwatch-domain llm::tests::prompt_version_accepts_semver_ish_shapes
+        PASS [   0.011s] ( 899/2754) coastwatch-domain llm::tests::provider_kind_as_provider_id_matches_wire_str
+        PASS [   0.012s] ( 900/2754) coastwatch-domain llm::tests::prompt_version_rejects_malformed
+        PASS [   0.010s] ( 901/2754) coastwatch-domain llm::tests::provider_kind_deserializes_lowercase
+        PASS [   0.007s] ( 902/2754) coastwatch-domain llm::tests::provider_kind_rejects_unknown
+        PASS [   0.005s] ( 903/2754) coastwatch-domain llm::tests::reasoning_effort_rejects_unknown
+        PASS [   0.006s] ( 904/2754) coastwatch-domain llm::tests::provider_kind_wire_roundtrip
+        PASS [   0.006s] ( 905/2754) coastwatch-domain llm::tests::reasoning_effort_deserializes_lowercase
+        PASS [   0.006s] ( 906/2754) coastwatch-domain llm::tests::reasoning_effort_wire_roundtrip
+        PASS [   0.004s] ( 907/2754) coastwatch-domain llm::tests::task_name_rejects_empty_and_whitespace
+        PASS [   0.004s] ( 908/2754) coastwatch-domain manual_upload::tests::manual_uuids_match_migration_0007
+        PASS [   0.004s] ( 909/2754) coastwatch-domain manual_upload::tests::manual_source_id_round_trips_to_uuid
+        PASS [   0.004s] ( 910/2754) coastwatch-domain modality::tests::confidence_hedge_serde_matches_wire_str
+        PASS [   0.004s] ( 911/2754) coastwatch-domain modality::tests::confidence_hedge_wire_round_trips
+        PASS [   0.004s] ( 912/2754) coastwatch-domain modality::tests::evidentiality_serde_matches_wire_str
+        PASS [   0.005s] ( 913/2754) coastwatch-domain modality::tests::evidentiality_wire_round_trips
+        PASS [   0.006s] ( 914/2754) coastwatch-domain modality::tests::evidentiality_from_str_rejects_garbage
+        PASS [   0.005s] ( 915/2754) coastwatch-domain modality::tests::modality_accepts_missing_observed_at_key_for_back_compat
+        PASS [   0.007s] ( 916/2754) coastwatch-domain modality::tests::lenient_datetime_serialises_back_to_full_rfc3339
+        PASS [   0.009s] ( 917/2754) coastwatch-domain modality::tests::lenient_observed_at_handles_null_and_each_format
+        PASS [   0.011s] ( 918/2754) coastwatch-domain modality::tests::lenient_datetime_format_matrix
+        PASS [   0.005s] ( 919/2754) coastwatch-domain relevance::tests::band_orders_direct_highest_none_lowest
+        PASS [   0.008s] ( 920/2754) coastwatch-domain modality::tests::modality_rejects_missing_as_of
+        PASS [   0.009s] ( 921/2754) coastwatch-domain modality::tests::modality_round_trips_with_observed_at_none
+        PASS [   0.010s] ( 922/2754) coastwatch-domain modality::tests::modality_round_trips_with_observed_at_some
+        PASS [   0.005s] ( 923/2754) coastwatch-domain relevance::tests::duplicate_org_facet_entity_collapses
+        PASS [   0.005s] ( 924/2754) coastwatch-domain relevance::tests::exploitation_only_yields_watch
+        FAIL [   1.044s] ( 925/2754) coastwatch-bench::dev_pull_path dev_pull_fetches_a_seeded_document_yield_only
+  stdout ───
+
+    running 1 test
+    test dev_pull_fetches_a_seeded_document_yield_only ... FAILED
+
+    failures:
+
+    failures:
+        dev_pull_fetches_a_seeded_document_yield_only
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1 filtered out; finished in 1.04s
+
+  stderr ───
+
+    thread 'dev_pull_fetches_a_seeded_document_yield_only' (3815632) panicked at crates/test-support/src/db.rs:94:29:
+    run migrations against test database: database migration failed
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+  Cancelling due to test failure: 15 tests still running
+        PASS [   0.005s] ( 926/2754) coastwatch-domain relevance::tests::higher_band_always_outranks_lower_regardless_of_tier
+        FAIL [   1.033s] ( 927/2754) coastwatch-bench::run_extract_path run_collects_per_doc_error_as_a_failed_row_without_fail_fast
+  stdout ───
+
+    running 1 test
+    test run_collects_per_doc_error_as_a_failed_row_without_fail_fast ... FAILED
+
+    failures:
+
+    failures:
+        run_collects_per_doc_error_as_a_failed_row_without_fail_fast
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 5 filtered out; finished in 1.02s
+
+  stderr ───
+
+    thread 'run_collects_per_doc_error_as_a_failed_row_without_fail_fast' (3815669) panicked at crates/test-support/src/db.rs:94:29:
+    run migrations against test database: database migration failed
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+        FAIL [   1.033s] ( 928/2754) coastwatch-bench::run_extract_path run_extracts_verifies_and_lands_audit_rows_without_persisting_claims
+  stdout ───
+
+    running 1 test
+    test run_extracts_verifies_and_lands_audit_rows_without_persisting_claims ... FAILED
+
+    failures:
+
+    failures:
+        run_extracts_verifies_and_lands_audit_rows_without_persisting_claims
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 5 filtered out; finished in 1.02s
+
+  stderr ───
+
+    thread 'run_extracts_verifies_and_lands_audit_rows_without_persisting_claims' (3815687) panicked at crates/test-support/src/db.rs:94:29:
+    run migrations against test database: database migration failed
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+        FAIL [   1.041s] ( 929/2754) coastwatch-bench::run_extract_path cost_sums_both_the_extract_and_x2d_attribution_calls
+  stdout ───
+
+    running 1 test
+    test cost_sums_both_the_extract_and_x2d_attribution_calls ... FAILED
+
+    failures:
+
+    failures:
+        cost_sums_both_the_extract_and_x2d_attribution_calls
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 5 filtered out; finished in 1.03s
+
+  stderr ───
+
+    thread 'cost_sums_both_the_extract_and_x2d_attribution_calls' (3815663) panicked at crates/test-support/src/db.rs:94:29:
+    run migrations against test database: database migration failed
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+        FAIL [   1.040s] ( 930/2754) coastwatch-bench::run_extract_path attribution_flows_from_attempt_rows_through_docrun_into_the_report
+  stdout ───
+
+    running 1 test
+    test attribution_flows_from_attempt_rows_through_docrun_into_the_report ... FAILED
+
+    failures:
+
+    failures:
+        attribution_flows_from_attempt_rows_through_docrun_into_the_report
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 5 filtered out; finished in 1.03s
+
+  stderr ───
+
+    thread 'attribution_flows_from_attempt_rows_through_docrun_into_the_report' (3815642) panicked at crates/test-support/src/db.rs:94:29:
+    run migrations against test database: database migration failed
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+        FAIL [   1.041s] ( 931/2754) coastwatch-bench::run_extract_path fail_fast_short_circuits_before_billing_later_docs
+  stdout ───
+
+    running 1 test
+    test fail_fast_short_circuits_before_billing_later_docs ... FAILED
+
+    failures:
+
+    failures:
+        fail_fast_short_circuits_before_billing_later_docs
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 5 filtered out; finished in 1.04s
+
+  stderr ───
+
+    thread 'fail_fast_short_circuits_before_billing_later_docs' (3815649) panicked at crates/test-support/src/db.rs:94:29:
+    run migrations against test database: database migration failed
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+        PASS [   0.005s] ( 932/2754) coastwatch-domain relevance::tests::nothing_yields_none
+        PASS [   0.005s] ( 933/2754) coastwatch-domain relevance::tests::multiple_exploitation_claims_fold_to_one
+        FAIL [   1.051s] ( 934/2754) coastwatch-bench::dev_pull_path dev_pull_collects_absent_slug_as_missing_not_fatal
+  stdout ───
+
+    running 1 test
+    test dev_pull_collects_absent_slug_as_missing_not_fatal ... FAILED
+
+    failures:
+
+    failures:
+        dev_pull_collects_absent_slug_as_missing_not_fatal
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1 filtered out; finished in 1.04s
+
+  stderr ───
+
+    thread 'dev_pull_collects_absent_slug_as_missing_not_fatal' (3815626) panicked at crates/test-support/src/db.rs:94:29:
+    run migrations against test database: database migration failed
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+        PASS [   0.006s] ( 935/2754) coastwatch-domain relevance::tests::no_match_term_and_no_id_yields_nothing
+        PASS [   0.747s] ( 936/2754) coastwatch-claims-extract::attribution_extractor attribution_call_failure_propagates_as_extract_error
+        PASS [   0.746s] ( 937/2754) coastwatch-claims-extract::attribution_extractor attribution_markers_trigger_the_second_call_and_fold_results
+        PASS [   0.748s] ( 938/2754) coastwatch-claims-extract::attribution_extractor no_attribution_markers_skips_the_second_call
+        PASS [   0.756s] ( 939/2754) coastwatch-claims-extract::attribution_extractor out_of_range_claim_index_is_dropped
+        PASS [   1.134s] ( 940/2754) coastwatch-bench::run_extract_path real_builders_resolve_attribution_at_v1_not_the_spec_version
+────────────
+     Summary [   1.340s] 940/2754 tests run: 933 passed, 7 failed, 0 skipped
+        FAIL [   1.044s] ( 925/2754) coastwatch-bench::dev_pull_path dev_pull_fetches_a_seeded_document_yield_only
+        FAIL [   1.033s] ( 927/2754) coastwatch-bench::run_extract_path run_collects_per_doc_error_as_a_failed_row_without_fail_fast
+        FAIL [   1.033s] ( 928/2754) coastwatch-bench::run_extract_path run_extracts_verifies_and_lands_audit_rows_without_persisting_claims
+        FAIL [   1.041s] ( 929/2754) coastwatch-bench::run_extract_path cost_sums_both_the_extract_and_x2d_attribution_calls
+        FAIL [   1.040s] ( 930/2754) coastwatch-bench::run_extract_path attribution_flows_from_attempt_rows_through_docrun_into_the_report
+        FAIL [   1.041s] ( 931/2754) coastwatch-bench::run_extract_path fail_fast_short_circuits_before_billing_later_docs
+        FAIL [   1.051s] ( 934/2754) coastwatch-bench::dev_pull_path dev_pull_collects_absent_slug_as_missing_not_fatal
+warning: 1814/2754 tests were not run due to test failure (run with --no-fail-fast to run all tests, or run with --max-fail)
+error: test run failed
+
+exit status 100
+  ────────────────────────────────────
+summary: (done in 90.59 seconds)
+✗ test (90.59 seconds)
+error: failed to push some refs to 'https://github.com/jakub/coastwatch.git'

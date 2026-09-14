@@ -1,0 +1,17 @@
+Executed tutorial block 1
+Executed tutorial block 2
+Executed tutorial block 3
+Executed tutorial block 4
+Executed tutorial block 5
+Executed tutorial block 6
+Executed tutorial block 7
+Executed tutorial block 8
+Executed tutorial block 9
+Executed tutorial block 10
+Exact three-event ingest and both CLI query oracles passed
+Browser tutorial and first-use checks passed: personal-key-login, bounded-example-three-real-events, both-exact-tutorial-queries, true-zero-match-guidance, save-editor-only-with-real-database, share-executed-state-roundtrip
+Owned TUI: both exact queries, text rendering, clean exit and socket cleanup passed
+Executed tutorial block 12
+Local Parquet query completed
+Packaged tutorial smoke passed, including the owned TUI session
+Tutorial cleanup complete; test exit=0

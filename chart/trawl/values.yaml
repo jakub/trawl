@@ -1,14 +1,14 @@
 # trawl helm chart values
 #
-# trawl is single-node only — replicas are hardcoded to 1.
-# multiple replicas would corrupt the transitional SQLite app-state store
-# (query history, saved queries, schedules — moves to postgres in a later
-# ADR-0004 slice). API keys already live in the external fleet-auth
-# postgres keystore.
+# Trawl is single-node only. The chart fixes replicas at 1.
+# trawld owns its Parquet files and in-memory hot buffer. A session advisory
+# lock on its PostgreSQL app-state database prevents a second writer.
+# API keys and roles live in a separate Fleet-auth PostgreSQL database.
 
 image:
   repository: ghcr.io/jakub/trawl
-  # Defaults to the chart appVersion when empty.
+  # Required for source checkouts: use an image built from the same revision.
+  # Release packaging sets this to the matching release image tag.
   tag: ""
   pullPolicy: IfNotPresent
 
@@ -124,6 +124,7 @@ crashDump:
 # or set config.raw to provide your own TOML verbatim.
 config:
   # Set to a complete trawld.toml string to bypass structured templating.
+  # Only supported with tls.mode=auto; raw TOML owns its TLS paths.
   raw: ""
 
   server:
@@ -146,8 +147,10 @@ config:
     # Per-key rate limit (requests/minute): every API key gets an
     # independent bucket — defaultRpm on the interactive API routes,
     # ingestRpm on /api/v1/ingest. 0 = disabled for that route class.
-    # The per-role keys (admin/analyst/reader/ingest) were removed in
-    # ADR-0006 slice 0 — a values file still carrying them fails at render.
+    # The highest rate_rpm set by the key's roles replaces the route-class
+    # default, including when that default is 0. See
+    # https://trawl.sh/operate/access/#create-roles-and-keys.
+    # Legacy per-role keys (admin/analyst/reader/ingest) fail at render.
     rateLimit:
       defaultRpm: 100
       ingestRpm: 1000
@@ -244,37 +247,39 @@ tls:
   mode: auto
   # For mode=secret: name of the existing TLS Secret.
   secretName: ""
-  # For mode=certManager:
+  # For mode=certManager: cert-manager and the issuer must already exist.
   certManager:
     issuerRef:
       name: ""
       kind: ClusterIssuer
+      group: cert-manager.io
+    # Required: every DNS name clients use for the daemon API.
+    # Include in-cluster Service names if clients connect through them.
+    dnsNames: []
 
-# -- Fleet-auth postgres keystore (ADR-0004)
-# API keys are verified against an EXTERNAL postgres database shared across
-# fleet apps. The connection string is injected from an existing Secret
-# into the init-auth container (as DATABASE_URL, what fleet-admin reads)
-# and into trawld (as FLEET_DATABASE_URL — the bare DATABASE_URL override
-# was removed from trawld in ADR-0004 slice 3). It is never rendered into
-# the ConfigMap or config.raw. Provision keys with fleet-admin (see the
-# cutover runbook); expect vector ingest to buffer to disk during the
-# cutover window (size buffers accordingly, e.g. 1 GiB).
+# -- Fleet-auth PostgreSQL keystore
+# API keys and roles live in an external database shared across Fleet apps.
+# An existing Secret supplies DATABASE_URL to fleet-admin in the init-auth
+# container and FLEET_DATABASE_URL to trawld. The chart never renders the
+# connection string into the ConfigMap or config.raw. Provision the database
+# using https://trawl.sh/operate/deployment/#provision-the-databases and create keys
+# using https://trawl.sh/operate/access/#create-roles-and-keys.
+# Size Vector disk buffers for deployment downtime, for example 1 GiB.
 auth:
   database:
     # Name of an existing Secret holding the postgres URL. REQUIRED.
     existingSecret: ""
-    # Key within that Secret (the SECRET key name, not the env var name —
-    # existing Secrets keep working unchanged across the slice-3 upgrade).
+    # Key within that Secret. This is independent of the environment variable name.
     existingSecretKey: "DATABASE_URL"
 
-# -- Trawl app-state database (ADR-0004 slice 3)
+# -- Trawl app-state database
 # Query history, saved queries, schedules, and report runs live in a
 # DEDICATED postgres database owned by trawld: boot-migrated automatically
 # and guarded by a session advisory lock (sole writer). The connection
 # string is injected as the TRAWL_DATABASE_URL env var from an existing
 # Secret — never rendered into the ConfigMap. There is NO fallback to the
-# auth URL; provision a separate database whose role owns the schema (see
-# the fleet-auth cutover runbook for the exact role/grants).
+# auth URL. Provision a separate database whose role owns the schema. See
+# https://trawl.sh/operate/deployment/#provision-the-databases.
 storage:
   database:
     # Name of an existing Secret holding the postgres URL. REQUIRED.
@@ -284,10 +289,10 @@ storage:
 
 # -- Auth schema migration
 # An init container runs `fleet-admin migrate` against the fleet keystore
-# on every pod start (idempotent by construction — sqlx tracks applied
-# migrations). Key minting moved to the cutover runbook: with a shared
-# fleet keystore, keys may already exist from sibling-app provisioning, so
-# the chart no longer auto-mints per-install tokens.
+# on every pod start when enabled. sqlx tracks applied migrations.
+# If disabled, apply the Fleet schema before starting trawld.
+# The chart does not create API keys. Use fleet-admin against the shared
+# keystore as described in https://trawl.sh/operate/access/#create-roles-and-keys.
 initAuth:
   enabled: true
   resources:
@@ -354,8 +359,9 @@ web:
   # Fleet SSO: parent domain for the shared fleet_session cookie, e.g.
   # ".fleet.lab.ktle.net". Set the SAME value in every fleet app (mirrors
   # coastwatch's session.shared_domain) AND point cookieSecret.existingSecret
-  # at the shared session key so every app can decrypt the cookie — see the
-  # fleet-auth cutover runbook, "Fleet SSO" section. Empty = standalone mode
+  # at the shared session key so every app can decrypt the cookie. See
+  # https://trawl.sh/operate/access/#share-a-browser-session-across-fleet-applications.
+  # Empty = standalone mode
   # (origin-scoped cookie, chart-generated key keeps working).
   sharedDomain: ""
   resources:

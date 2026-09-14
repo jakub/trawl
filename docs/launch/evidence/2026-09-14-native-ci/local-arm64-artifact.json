@@ -1,0 +1,13 @@
+{
+  "source_sha": "7226dff1544b3cb3411d04007be056229bf45f2e",
+  "artifact": "target/bookworm/aarch64-unknown-linux-gnu/release/trawl",
+  "sha256": "0a3c26f95156fff0bbda79b5af71c25a9c70e4afc2e2a2dfd6309f0a7e4a7582",
+  "gnu_build_id": "ae39b99a2cefa6a49b55a6ffa87e7bff6c0f0ae7",
+  "architecture": "AArch64",
+  "runpath": "$ORIGIN/../lib/trawl",
+  "retained_sections": [
+    ".debug_info",
+    ".symtab"
+  ],
+  "native_execution": false
+}

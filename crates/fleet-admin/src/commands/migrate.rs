@@ -4,7 +4,7 @@
 
 //! `fleet-admin migrate` — apply embedded fleet-auth schema migrations.
 
-use fleet_auth::MIGRATOR;
+use fleet_auth::migrate;
 use sqlx::postgres::PgPool;
 
 use crate::error::AdminError;
@@ -15,7 +15,7 @@ use crate::error::AdminError;
 /// `_sqlx_migrations`, so re-running this against an up-to-date database
 /// is a no-op.
 pub async fn run(pool: &PgPool) -> Result<(), AdminError> {
-    MIGRATOR.run(pool).await?;
+    migrate(pool).await?;
     eprintln!("fleet-admin: migrations applied");
     Ok(())
 }

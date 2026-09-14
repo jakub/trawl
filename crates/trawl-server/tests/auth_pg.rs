@@ -359,7 +359,6 @@ async fn ac5_rate_rpm_role_ceiling_spent_separately_per_class() {
     let server = common::setup_with_rate_limit(RateLimitConfig {
         default_rpm: 10_000,
         ingest_rpm: 10_000,
-        ..RateLimitConfig::default()
     })
     .await;
     let store = KeyStore::from_pool(server.fleet_pool.clone());
@@ -764,8 +763,7 @@ async fn scheduler_runs_after(
     // root is this test's own copy: the scheduler WRITES report output
     // under `scheduled/`, which no other test may see.
     let data_dir = tempfile::tempdir().expect("scheduler data root");
-    let data_glob = seed_data_root(data_dir.path());
-    let base_dir = data_glob.trim_end_matches("/**/*.parquet").to_owned();
+    let base_dir = seed_data_root(data_dir.path());
     let exec_pool = trawl_server::pool::ExecutorPool::new(base_dir, 1, 1000, None);
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);

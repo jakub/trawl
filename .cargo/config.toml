@@ -1,9 +1,9 @@
 [env]
-# Safety net: prevents linker errors when a single-crate build doesn't
-# activate the `bundled` feature (e.g. `cargo test -p trawl-api`).
-# Completely ignored when `bundled` is active — the duckdb-sys build.rs
-# never checks this env var in the bundled code path.
-DUCKDB_DOWNLOAD_LIB = "1"
+# trawl-core's build script prepares the checksum-verified shared runtime for
+# native builds, including its standalone DuckDB parity tests. libduckdb-sys
+# only emits bindings and -lduckdb; it must not download or select a host copy.
+DUCKDB_DOWNLOAD_LIB = "0"
+DUCKDB_NO_PKG_CONFIG = { value = "1", force = true }
 
 # `cargo xtask <cmd>` → workspace task runner. The double-dash separates
 # cargo args from subcommand args so flags like `--release` reach xtask.

@@ -1,0 +1,100 @@
+warning: unused config key `resolver.incompatible-publish-age` in `/home/jakub/.cargo/config.toml`
+warning: unused config key `resolver.incompatible-publish-age` in `/home/jakub/.cargo/config.toml`
+   Compiling serde_core v1.0.228
+   Compiling form_urlencoded v1.2.2
+   Compiling sha2 v0.10.9
+   Compiling crossbeam-utils v0.8.21
+   Compiling md-5 v0.10.6
+   Compiling rustls-platform-verifier v0.7.0
+   Compiling rand v0.9.4
+   Compiling rand_chacha v0.9.0
+   Compiling ed25519-dalek v2.2.0
+   Compiling rust-embed-utils v8.11.0
+   Compiling lopdf v0.42.0
+   Compiling concurrent-queue v2.5.0
+   Compiling crossbeam-queue v0.3.12
+   Compiling proptest v1.11.0
+   Compiling event-listener v5.4.1
+   Compiling rust-embed-impl v8.11.0
+   Compiling serde v1.0.228
+   Compiling serde_json v1.0.149
+   Compiling uuid v1.23.1
+   Compiling rust-embed v8.11.0
+   Compiling smallvec v1.15.1
+   Compiling chrono v0.4.44
+   Compiling either v1.15.0
+   Compiling toml_datetime v0.6.11
+   Compiling serde_spanned v0.6.9
+   Compiling fluent-uri v0.4.1
+   Compiling ahash v0.8.12
+   Compiling minijinja v2.20.0
+   Compiling email_address v0.2.9
+   Compiling serde_yaml v0.9.34+deprecated
+   Compiling coastwatch-attack-data v0.1.0 (/home/jakub/code/trawl/.worktrees/launch-consumers/coastwatch/crates/attack-data)
+   Compiling coastwatch-embeddings v0.1.0 (/home/jakub/code/trawl/.worktrees/launch-consumers/coastwatch/crates/embeddings)
+   Compiling parking_lot_core v0.9.12
+   Compiling icu_normalizer v2.2.0
+   Compiling cssparser v0.36.0
+   Compiling toml_edit v0.22.27
+   Compiling parking_lot v0.12.5
+   Compiling cssparser v0.37.0
+   Compiling comrak v0.52.0
+   Compiling idna_adapter v1.2.2
+   Compiling tokio v1.52.3
+   Compiling idna v1.1.0
+   Compiling url v2.5.8
+   Compiling string_cache v0.9.0
+   Compiling futures-intrusive v0.5.0
+   Compiling web_atoms v0.2.4
+   Compiling chrono-tz v0.10.4
+   Compiling markup5ever v0.38.0
+   Compiling markup5ever v0.39.0
+   Compiling sqlx-core v0.9.0
+   Compiling html5ever v0.38.0
+   Compiling selectors v0.36.1
+   Compiling html5ever v0.39.0
+   Compiling toml v0.8.23
+   Compiling dom_query v0.27.0
+   Compiling referencing v0.46.5
+   Compiling ammonia v4.1.4
+   Compiling tokio-util v0.7.18
+   Compiling tokio-stream v0.1.18
+   Compiling tokio-rustls v0.26.4
+   Compiling sqlx-postgres v0.9.0
+   Compiling tower v0.5.3
+   Compiling h2 v0.4.14
+   Compiling coastwatch-domain v0.1.0 (/home/jakub/code/trawl/.worktrees/launch-consumers/coastwatch/crates/domain)
+   Compiling tower-http v0.6.11
+   Compiling dom_smoothie v0.17.0
+   Compiling jsonschema v0.46.5
+   Compiling sqlx-macros-core v0.9.0
+   Compiling hyper v1.9.0
+   Compiling pdf-extract v0.12.0
+   Compiling coastwatch-render v0.1.0 (/home/jakub/code/trawl/.worktrees/launch-consumers/coastwatch/crates/render)
+   Compiling coastwatch-claim-verification v0.1.0 (/home/jakub/code/trawl/.worktrees/launch-consumers/coastwatch/crates/claim-verification)
+   Compiling hyper-util v0.1.20
+   Compiling coastwatch-text-extract v0.1.0 (/home/jakub/code/trawl/.worktrees/launch-consumers/coastwatch/crates/text-extract)
+   Compiling hyper-rustls v0.27.9
+   Compiling fleet-auth v0.4.0 (/home/jakub/code/trawl/.worktrees/launch-consumers/trawl/crates/fleet-auth)
+   Compiling reqwest v0.13.3
+   Compiling deadpool v0.12.3
+   Compiling assert-json-diff v2.0.2
+   Compiling coastwatch-config v0.1.0 (/home/jakub/code/trawl/.worktrees/launch-consumers/coastwatch/crates/config)
+   Compiling wiremock v0.6.5
+   Compiling sqlx-macros v0.9.0
+   Compiling sqlx v0.9.0
+   Compiling coastwatch-db v0.1.0 (/home/jakub/code/trawl/.worktrees/launch-consumers/coastwatch/crates/db)
+   Compiling pgvector v0.4.2
+   Compiling coastwatch-jobs v0.1.0 (/home/jakub/code/trawl/.worktrees/launch-consumers/coastwatch/crates/jobs)
+   Compiling coastwatch-test-support v0.1.0 (/home/jakub/code/trawl/.worktrees/launch-consumers/coastwatch/crates/test-support)
+   Compiling coastwatch-llm v0.1.0 (/home/jakub/code/trawl/.worktrees/launch-consumers/coastwatch/crates/llm)
+   Compiling coastwatch-storage v0.1.0 (/home/jakub/code/trawl/.worktrees/launch-consumers/coastwatch/crates/storage)
+   Compiling coastwatch-claims-extract v0.1.0 (/home/jakub/code/trawl/.worktrees/launch-consumers/coastwatch/crates/claims-extract)
+   Compiling coastwatch-bench v0.1.0 (/home/jakub/code/trawl/.worktrees/launch-consumers/coastwatch/crates/bench)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 31.19s
+────────────
+ Nextest run ID 96d2c38a-9e36-4735-9131-c18237ff9919 with nextest profile: default
+    Starting 1 test across 1 binary (1 test skipped)
+        PASS [   0.038s] (1/1) coastwatch-bench::dev_pull_path dev_pull_fetches_a_seeded_document_yield_only
+────────────
+     Summary [   0.039s] 1 test run: 1 passed, 1 skipped

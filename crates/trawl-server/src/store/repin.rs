@@ -76,6 +76,8 @@ impl RepinJobStatus {
 /// One `repin_jobs` row.
 #[derive(Debug, Clone)]
 pub struct RepinJob {
+    /// Validated terms, absent until the scan records its plan.
+    pub(crate) force_terms: Option<crate::repin::ceiling::ForceTerms>,
     /// Job id.
     pub id: i64,
     /// The repinned field (catalog key, folded).
@@ -136,13 +138,12 @@ pub struct RepinJob {
     /// One service behind that observation (audit/display only).
     pub field_last_service: Option<String>,
     /// Ceiling on nulled rows as the REQUEST stated it, or `None` when the
-    /// operator stated none (or the row predates migration 0015).
+    /// operator stated none.
     pub max_nulled_rows: Option<i64>,
     /// Ceiling on dialect-ambiguous numerals as the request stated it.
     pub max_ambiguous_rows: Option<i64>,
     /// The nulled-row ceiling the job is actually HELD to, resolved once at
-    /// plan time. `None` until the scan records its plan, and on every
-    /// legacy row (the blank-check force).
+    /// plan time. `None` until the scan records its plan, and for unforced jobs.
     pub accepted_max_nulled_rows: Option<i64>,
     /// The ambiguity ceiling the job is held to. See above.
     pub accepted_max_ambiguous_rows: Option<i64>,
@@ -324,7 +325,27 @@ fn row_to_job(row: &PgRow) -> Result<RepinJob, sqlx::Error> {
     let status = RepinJobStatus::parse(&status).ok_or_else(|| {
         sqlx::Error::Decode(format!("repin_jobs holds non-canonical status {status:?}").into())
     })?;
+    let force: bool = row.try_get("force")?;
+    let planned_at: Option<DateTime<Utc>> = row.try_get("planned_at")?;
+    let force_terms = crate::repin::ceiling::ForceTerms::from_record(
+        force,
+        planned_at.is_some(),
+        row.try_get("accepted_max_nulled_rows")?,
+        row.try_get("accepted_max_ambiguous_rows")?,
+    )
+    .map_err(|message| sqlx::Error::Decode(message.into()))?;
+    if !force
+        && (row.try_get::<Option<i64>, _>("max_nulled_rows")?.is_some()
+            || row
+                .try_get::<Option<i64>, _>("max_ambiguous_rows")?
+                .is_some())
+    {
+        return Err(sqlx::Error::Decode(
+            "unforced repin has requested force ceilings".into(),
+        ));
+    }
     Ok(RepinJob {
+        force_terms,
         id: row.try_get("id")?,
         field: row.try_get("field")?,
         from_type: row.try_get("from_type")?,
@@ -913,15 +934,17 @@ mod tests {
     }
 
     /// The spellings inside the status CHECK's `IN (...)` list, in the
-    /// migration that last re-created it. The extractor is deliberately
-    /// dumb — first `CHECK (status IN (` to the next `)` — which is why
-    /// that list stays on its own lines with nothing but quoted spellings
-    /// in it.
+    /// initial schema's `repin_jobs` table. Scope to the named constraint so
+    /// report/history status checks cannot satisfy the assertion.
     fn migration_status_spellings() -> Vec<String> {
-        const SQL: &str = include_str!("../../migrations/0014_repin_cancel.sql");
+        const SQL: &str = include_str!("../../migrations/20260913000001_initial_schema.sql");
         const OPEN: &str = "CHECK (status IN (";
-        let start = SQL.find(OPEN).expect("0014 re-creates the status CHECK") + OPEN.len();
-        let rest = &SQL[start..];
+        let constraint = SQL
+            .split_once("CONSTRAINT repin_jobs_status_check")
+            .expect("repin status constraint")
+            .1;
+        let start = constraint.find(OPEN).expect("repin status IN list") + OPEN.len();
+        let rest = &constraint[start..];
         let end = rest.find(')').expect("the IN list closes");
         rest[..end]
             .split(',')

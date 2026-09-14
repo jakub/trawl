@@ -59,7 +59,7 @@ use crate::ping::{PingCache, ping_cached_with};
 
 /// Embedded schema migrations for the trawl app-state database, applied by
 /// trawld at boot (after the advisory lock, before the stores open).
-static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
+pub mod migrations;
 
 /// Application-wide advisory lock key on the `trawl` database.
 ///
@@ -259,7 +259,7 @@ impl StorageState {
             return Err(StoreError::LockHeld);
         }
 
-        MIGRATOR.run(&pool).await?;
+        migrations::migrate(&pool).await?;
 
         // Guard the lock for the process lifetime: keepalive-probe its
         // session and flip `lock_lost_rx` the instant it dies.

@@ -1,0 +1,323 @@
+---
+# Source: trawl/templates/serviceaccount.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: l06-trawl
+  labels:
+    helm.sh/chart: trawl-0.1.0
+    app.kubernetes.io/name: trawl
+    app.kubernetes.io/instance: l06
+    app.kubernetes.io/version: "0.1.18"
+    app.kubernetes.io/managed-by: Helm
+automountServiceAccountToken: false
+
+---
+# Source: trawl/templates/configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: l06-trawl
+  labels:
+    helm.sh/chart: trawl-0.1.0
+    app.kubernetes.io/name: trawl
+    app.kubernetes.io/instance: l06
+    app.kubernetes.io/version: "0.1.18"
+    app.kubernetes.io/managed-by: Helm
+data:
+  trawld.toml: |
+    [server]
+    http_addr = "0.0.0.0:5514"
+    timeout_secs = 30
+    max_result_rows = 100000
+    max_export_rows = 1000000
+    max_request_body_bytes = "128K"
+    max_concurrent_requests = 256
+    shutdown_drain_secs = 30
+    max_sse_connections = 32
+    schema_cache_ttl_secs = 60
+    max_query_history = 1000
+    tls_cert_path = "/etc/trawl/tls/tls.crt"
+    tls_key_path = "/etc/trawl/tls/tls.key"
+    tls_reload_interval_secs = 300
+    [server.rate_limit]
+    default_rpm = 100
+    ingest_rpm = 1000
+
+    [data]
+    path = "/var/lib/trawl/data"
+
+    [auth]
+    # database_url deliberately absent: the fleet keystore DSN is injected
+    # as the FLEET_DATABASE_URL env var from a Secret (never rendered here).
+    audit_interval_secs = 30
+
+    # [storage] database_url deliberately absent too: the trawl app-state
+    # DSN is injected as the TRAWL_DATABASE_URL env var from a Secret.
+
+    [ingest]
+    enabled = true
+    max_body_bytes = "16M"
+    compaction_interval_secs = 10
+    internal_telemetry = true
+    daily_rollup = true
+    event_bus_capacity = 4096
+    hot_buffer_max_events = 100000
+    hot_buffer_max_bytes = "100M"
+    stats_interval_secs = 60
+    telemetry_flush_interval_secs = 1
+    severity_from = ["severity", "severity_text", "level"]
+    time_from = ["_time", "timestamp", "@timestamp"]
+
+    [retention]
+    max_age_days = 90
+    min_free_disk_bytes = "1G"
+    retention_interval_secs = 3600
+
+    [syslog]
+    enabled = false
+
+    [scheduler]
+    enabled = true
+    poll_interval_secs = 10
+    report_max_rows = 10000
+    max_runs_per_schedule = 100
+    report_retention_days = 30
+    max_catchup_intervals = 24
+
+---
+# Source: trawl/templates/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: l06-trawl
+  labels:
+    helm.sh/chart: trawl-0.1.0
+    app.kubernetes.io/name: trawl
+    app.kubernetes.io/instance: l06
+    app.kubernetes.io/version: "0.1.18"
+    app.kubernetes.io/managed-by: Helm
+spec:
+  type: ClusterIP
+  ports:
+    - name: https
+      port: 5514
+      targetPort: https
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: trawl
+    app.kubernetes.io/instance: l06
+
+---
+# Source: trawl/templates/statefulset.yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: l06-trawl
+  labels:
+    helm.sh/chart: trawl-0.1.0
+    app.kubernetes.io/name: trawl
+    app.kubernetes.io/instance: l06
+    app.kubernetes.io/version: "0.1.18"
+    app.kubernetes.io/managed-by: Helm
+spec:
+  # Single-node by design: trawld owns its parquet data dir and in-memory
+  # hot buffer outright (no shared/clustered storage model), and it holds a
+  # session advisory lock on the trawl app-state database — a second
+  # replica would fail startup rather than split-brain.
+  replicas: 1
+  serviceName: l06-trawl
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: trawl
+      app.kubernetes.io/instance: l06
+  template:
+    metadata:
+      annotations:
+        checksum/config: 76968222f465841968d20cfa19f62033c459278e890596d511d681f87e126962
+      labels:
+        app.kubernetes.io/name: trawl
+        app.kubernetes.io/instance: l06
+    spec:
+      serviceAccountName: l06-trawl
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+        runAsGroup: 1000
+        runAsUser: 1000
+      terminationGracePeriodSeconds: 30
+      initContainers:
+        # Apply Fleet-auth schema migrations on every pod start when enabled.
+        # sqlx tracks applied migrations. Create keys with fleet-admin as
+        # described in https://trawl.sh/operate/access/#create-roles-and-keys.
+        - name: init-auth
+          image: ghcr.io/jakub/trawl:source-965d945d-verification-only
+          imagePullPolicy: IfNotPresent
+          command: ["fleet-admin", "migrate"]
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: unused-fleet-db
+                  key: DATABASE_URL
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+          resources:
+            limits:
+              memory: 128Mi
+            requests:
+              cpu: 50m
+              memory: 64Mi
+      containers:
+        - name: trawld
+          image: ghcr.io/jakub/trawl:source-965d945d-verification-only
+          imagePullPolicy: IfNotPresent
+          args: ["--config", "/etc/trawl/trawld.toml", "--no-monitor"]
+          ports:
+            - name: https
+              containerPort: 5514
+              protocol: TCP
+          env:
+            - name: HOME
+              value: /var/lib/trawl
+            # Fleet keystore DSN — from the Secret, never the ConfigMap.
+            # trawld reads FLEET_DATABASE_URL. fleet-admin in the init
+            # container reads DATABASE_URL. See
+            # https://trawl.sh/operate/deployment/#provision-the-databases.
+            - name: FLEET_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: unused-fleet-db
+                  key: DATABASE_URL
+            # Trawl app-state DSN (history/saved/schedules/runs) — a
+            # DEDICATED database, boot-migrated and advisory-locked by
+            # trawld. No fallback to the auth URL.
+            - name: TRAWL_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: unused-trawl-db
+                  key: TRAWL_DATABASE_URL
+            - name: RUST_LOG
+              value: "trawl_server=info,trawld=info,fleet_auth=info,auth.backend=info,storage.backend=info,preauth.transport=info"
+          startupProbe:
+            httpGet:
+              path: /api/v1/health
+              port: https
+              scheme: HTTPS
+            failureThreshold: 30
+            periodSeconds: 2
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: https
+              scheme: HTTPS
+            periodSeconds: 30
+            timeoutSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: https
+              scheme: HTTPS
+            periodSeconds: 10
+            timeoutSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+          resources:
+            limits:
+              memory: 2Gi
+            requests:
+              cpu: 250m
+              memory: 512Mi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/trawl
+            - name: tmp
+              mountPath: /tmp
+            - name: config
+              mountPath: /etc/trawl/trawld.toml
+              subPath: trawld.toml
+              readOnly: true
+            - name: tls
+              mountPath: /etc/trawl/tls
+              readOnly: true
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 512Mi
+        - name: config
+          configMap:
+            name: l06-trawl
+        - name: tls
+          secret:
+            secretName: l06-trawl-tls
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app.kubernetes.io/name: trawl
+          app.kubernetes.io/instance: l06
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 50Gi
+
+---
+# Source: trawl/templates/certificate.yaml
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: l06-trawl-tls
+  namespace: l06-cert-manager
+  labels:
+    helm.sh/chart: trawl-0.1.0
+    app.kubernetes.io/name: trawl
+    app.kubernetes.io/instance: l06
+    app.kubernetes.io/version: "0.1.18"
+    app.kubernetes.io/managed-by: Helm
+spec:
+  secretName: l06-trawl-tls
+  issuerRef:
+    name: "l06-selfsigned"
+    kind: Issuer
+    group: "cert-manager.io"
+  dnsNames:
+    - l06-trawl.l06-cert-manager.svc
+    - trawl.l06.example.test
+---
+# Source: trawl/templates/tests/test-connection.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: l06-trawl-test-connection
+  labels:
+    helm.sh/chart: trawl-0.1.0
+    app.kubernetes.io/name: trawl
+    app.kubernetes.io/instance: l06
+    app.kubernetes.io/version: "0.1.18"
+    app.kubernetes.io/managed-by: Helm
+  annotations:
+    "helm.sh/hook": test
+spec:
+  containers:
+    - name: wget
+      image: busybox:stable
+      command:
+        - wget
+        - --no-check-certificate
+        - -qO-
+        - https://l06-trawl:5514/api/v1/health
+  restartPolicy: Never
+

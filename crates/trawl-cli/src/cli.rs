@@ -963,6 +963,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn embedded_data_glob_still_selects_local_parquet_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = trawl_engine::executor::Executor::new().unwrap();
+        let source = QueryResult {
+            columns: vec![trawl_engine::value::Column {
+                name: "message".into(),
+            }],
+            rows: vec![vec![Value::String("local row".into())]],
+        };
+        for name in ["one.parquet", "two.parquet", "excluded.other"] {
+            executor
+                .write_query_result_to_parquet(&source, &dir.path().join(name))
+                .unwrap();
+        }
+        let glob = dir.path().join("*.parquet");
+        let result = run_embedded_mode(glob.to_str().unwrap(), "*", "UTC").unwrap();
+        assert_eq!(result.columns, source.columns);
+        assert_eq!(
+            result.rows,
+            vec![source.rows[0].clone(), source.rows[0].clone()]
+        );
+    }
+
     /// Embedded parquet export is unbounded when the CLI supplies no row
     /// limit. Exercises the public CLI lane and reads the artifact back
     /// through `DuckDB`, since a literal `LIMIT usize::MAX` fails inside

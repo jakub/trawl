@@ -82,9 +82,9 @@ async fn harness() -> Harness {
     let wal_dir = root.join("wal");
     let data_dir = root.join("data");
     std::fs::create_dir_all(&data_dir).unwrap();
-    let data_glob = format!("{}/**/*.parquet", data_dir.display());
+    let data_path = data_dir.to_str().unwrap().to_owned();
 
-    let server = setup_in_dir_with_data(&root, data_glob, RateLimitConfig::default()).await;
+    let server = setup_in_dir_with_data(&root, data_path, RateLimitConfig::default()).await;
     // Leak the tempdir so it survives the server (cleaned up by OS).
     std::mem::forget(tmp);
 
@@ -1186,14 +1186,11 @@ mod boot {
         assert_eq!(again[0].last_seen, obs[0].last_seen);
     }
 
-    /// A node can be conformed (`conformed_at` set, `data/CATALOG` naming
-    /// this catalog) and still hold an empty `field_services`, and no live
-    /// batch re-sends a standing corpus to refill it. Gating the backfill on
-    /// the conformance marker alone would skip the pass on exactly those
-    /// installs, so the backfill carries its own flag and an unset one
-    /// re-arms the pass.
+    /// Completion covers both file rewrites and observations. A database
+    /// failure after scanning must leave the pass armed, so the next boot
+    /// retries the standing corpus even when no sender sends it again.
     #[sqlx::test]
-    async fn backfill_reruns_on_a_corpus_conformed_before_the_backfill_existed(pool: sqlx::PgPool) {
+    async fn failed_observation_backfill_keeps_conformance_armed(pool: sqlx::PgPool) {
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path().join("data");
         plant(
@@ -1205,32 +1202,50 @@ mod boot {
 
         let store = CatalogStore::new(pool.clone());
         let cache = FieldCatalog::new();
-        conform::ensure_conformance(&store, &cache, &data_dir, "2GB")
+        sqlx::raw_sql(
+            "CREATE FUNCTION refuse_observation() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN RAISE EXCEPTION 'injected observation failure'; END $$;
+             CREATE TRIGGER refuse_observation BEFORE INSERT ON field_services
+             FOR EACH ROW EXECUTE FUNCTION refuse_observation();",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let error = conform::ensure_conformance(&store, &cache, &data_dir, "2GB")
             .await
-            .expect("boot pass runs");
-
-        // The state to reproduce: conformed, marker published, pins seeded,
-        // observations never taken.
-        sqlx::query("DELETE FROM field_services")
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query("UPDATE catalog_state SET services_backfilled_at = NULL")
-            .execute(&pool)
-            .await
-            .unwrap();
-        assert!(store.is_conformed().await.unwrap(), "still conformed");
+            .expect_err("the observation failure must fail the boot pass");
         assert!(
-            data_dir.join("CATALOG").exists(),
-            "the marker still names this catalog"
+            error.contains("failed to backfill field_services"),
+            "{error}"
+        );
+        assert!(!store.is_conformed().await.unwrap());
+        assert!(!data_dir.join("CATALOG").exists());
+        assert!(
+            store
+                .field_services("duration", None, 1000)
+                .await
+                .unwrap()
+                .0
+                .is_empty()
         );
 
-        let upgrade = conform::ensure_conformance(&store, &cache, &data_dir, "2GB")
+        sqlx::raw_sql(
+            "DROP TRIGGER refuse_observation ON field_services;
+             DROP FUNCTION refuse_observation();",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let retry = conform::ensure_conformance(&store, &cache, &data_dir, "2GB")
             .await
             .unwrap();
-        assert!(
-            upgrade.ran,
-            "an un-backfilled corpus must re-arm the pass despite conformance"
+        assert!(retry.ran, "an incomplete pass must retry");
+        assert!(store.is_conformed().await.unwrap());
+        assert_eq!(
+            std::fs::read_to_string(data_dir.join("CATALOG"))
+                .unwrap()
+                .trim(),
+            store.catalog_id().await.unwrap()
         );
         let obs = store
             .field_services("duration", None, 1000)
@@ -1241,14 +1256,12 @@ mod boot {
         assert_eq!(obs[0].service, "svc-a");
         assert_eq!(obs[0].row_count, 3);
 
-        // And exactly once: the flag the pass stamps stops the next boot
-        // paying for the scan again.
         let settled = conform::ensure_conformance(&store, &cache, &data_dir, "2GB")
             .await
             .unwrap();
         assert!(
             !settled.ran,
-            "both flags set and the marker matching must skip the pass"
+            "completion and the matching marker skip the pass"
         );
     }
 
@@ -1618,11 +1631,11 @@ mod boot {
         let root = tmp.path().to_path_buf();
         let data_dir = root.join("data");
         let (majority, minority) = plant_disagreeing_corpus(&data_dir);
-        let data_glob = format!("{}/**/*.parquet", data_dir.display());
+        let data_path = data_dir.to_str().unwrap().to_owned();
 
         let server = crate::common::setup_in_dir_with_data(
             &root,
-            data_glob,
+            data_path,
             trawl_server::config::RateLimitConfig::default(),
         )
         .await;

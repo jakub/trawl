@@ -57,11 +57,8 @@ pre-push:
         - "*.toml"
         - "Cargo.lock"
         - "crates/*/migrations/*.sql"
-      # Scoped to the crates that declare features — the featureless rest
-      # resolves identically under --no-default-features and is already
-      # covered by `test`. The http_api/hot_query binaries are excluded:
-      # trawl-server's only no-defaults delta is duckdb linkage (exercised by
-      # the store/engine tests), and double-booting full trawld instances
-      # across two parallel suites starves the wall-clock-sensitive
-      # integration tests into flaking.
+      # Retain the secondary feature-coverage suite. Both suites use the
+      # shared DuckDB runtime; --no-default-features changes application
+      # features such as CLI clipboard support, not DuckDB linkage.
+      # The existing exclusions avoid duplicate full-daemon workloads.
       run: if [ -f "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env"; fi; DATABASE_URL="${TRAWL_TEST_ND_DATABASE_URL:-postgres://fleet:fleet@localhost:5434/fleet_test_nd}" cargo nextest run -p fleet-auth -p trawl-web -p trawl-engine -p trawl-server -p trawl-cli --no-default-features --test-threads="$(( $(nproc 2>/dev/null || sysctl -n hw.ncpu) / 2 ))" -E 'not (binary(http_api) | binary(hot_query) | binary(timestamp_repair))'

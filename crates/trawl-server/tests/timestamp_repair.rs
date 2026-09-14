@@ -39,9 +39,9 @@ async fn trigger_variants_survive_ingest_compact_query() {
     let wal_dir = root.join("wal");
     let data_dir = root.join("data");
     std::fs::create_dir_all(&data_dir).unwrap();
-    let data_glob = format!("{}/**/*.parquet", data_dir.display());
+    let data_path = data_dir.to_str().unwrap().to_owned();
 
-    let server = setup_in_dir_with_data(&root, data_glob, RateLimitConfig::default()).await;
+    let server = setup_in_dir_with_data(&root, data_path, RateLimitConfig::default()).await;
     // Leak the tempdir so it survives the server (cleaned up by OS).
     std::mem::forget(tmp);
 

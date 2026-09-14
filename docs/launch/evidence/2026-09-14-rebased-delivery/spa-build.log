@@ -1,0 +1,29 @@
+2026-09-14T05:39:44.418768Z  INFO 🚀 Starting trunk 0.21.14
+2026-09-14T05:39:44.418945Z  INFO 📦 starting build
+warning: ignoring `resolver.incompatible-publish-age` without `-Zmin-publish-age`
+warning: ignoring `registry.global-min-publish-age` without `-Zmin-publish-age`
+   Compiling web-sys v0.3.103
+   Compiling trawl-core v0.4.0 (/home/jakub/code/trawl/.worktrees/launch-readiness/crates/trawl-core)
+   Compiling trawl-api v0.4.0 (/home/jakub/code/trawl/.worktrees/launch-readiness/crates/trawl-api)
+   Compiling reactive_graph v0.2.14
+   Compiling gloo-utils v0.2.0
+   Compiling gloo-utils v0.3.0
+   Compiling gloo-net v0.6.0
+   Compiling gloo-net v0.7.0
+   Compiling wasm-streams v0.5.0
+   Compiling server_fn v0.8.13
+   Compiling reactive_stores v0.4.3
+   Compiling tachys v0.2.18
+   Compiling leptos_server v0.8.7
+   Compiling leptos_dom v0.8.8
+   Compiling leptos v0.8.20
+   Compiling leptos-use v0.19.0
+   Compiling leptos_router v0.8.15
+   Compiling leptos_meta v0.8.6
+   Compiling fleet-ui v0.4.0 (/home/jakub/code/trawl/.worktrees/launch-readiness/crates/fleet-ui)
+   Compiling trawl-web-ui v0.4.0 (/home/jakub/code/trawl/.worktrees/launch-readiness/crates/trawl-web-ui)
+    Finished `release` profile [optimized] target(s) in 42.30s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-14T05:41:36.351104Z  INFO applying new distribution
+2026-09-14T05:41:36.543004Z  INFO ✅ success

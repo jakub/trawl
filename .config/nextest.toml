@@ -30,6 +30,14 @@
 max-threads = 8
 
 [[profile.default.overrides]]
+# These tests execute the daemon's production connectors to verify main's
+# boot order. Reserve the whole group for its two 8-connection pools, the
+# sole-writer session, two 1-connection fixture pools, and the competing
+# writer's lock session (20 total).
+filter = 'package(trawl-server) & binary(startup_pg)'
+threads-required = 8
+
+[[profile.default.overrides]]
 # The pg-touching set. trawl-server's LIBRARY tests are in it too — the
 # retired config missed them entirely, so `from_saved`'s and `scheduler`'s
 # `#[sqlx::test]` cases ran unbounded — but only those two modules: the
@@ -42,7 +50,7 @@ filter = '''
   | (package(trawl-server) & (binary(auth_pg) | binary(catalog_surface)
     | binary(connection_budget) | binary(dsl_admission) | binary(field_catalog)
     | binary(gc_pins) | binary(hot_query) | binary(http_api)
-    | binary(ingest_publication) | binary(repin) | binary(store_pg)
+    | binary(ingest_publication) | binary(repin) | binary(store_pg) | binary(schema_pg) | binary(startup_pg)
     | binary(scheduler_windows) | binary(timestamp_repair)))
   | (package(fleet-auth) & kind(test))
   | (package(fleet-admin) & kind(test))

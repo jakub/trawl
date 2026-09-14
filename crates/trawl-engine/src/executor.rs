@@ -201,7 +201,7 @@ impl Executor {
     /// Pin the settings a query's answer depends on: currently the session
     /// time zone, which must be UTC on every connection.
     ///
-    /// The bundled `DuckDB` links ICU and defaults `TimeZone` to the host
+    /// The shared `DuckDB` runtime includes ICU and defaults `TimeZone` to the host
     /// zone (probed with the clone behaviour above), and two things read
     /// it: the hot branch's TIMESTAMP conform
     /// (`trawl_core::conform`, which parses through `TIMESTAMPTZ` so an

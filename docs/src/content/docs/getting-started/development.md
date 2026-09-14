@@ -21,11 +21,33 @@ Fleet auth, and creates the `fleet-developer` role and an API key. It then runs
 `trawld`, `trawl-web`, and `trunk serve`. The `trawl-login` pane prints the key.
 Open `http://localhost:8081/login` and paste it.
 
-`bin/dev` is also the fast server build. It compiles with
-`--no-default-features`, so `trawld` links the downloaded DuckDB shared library
-instead of compiling the bundled amalgamation. The download is cached under
-`target/duckdb-download` and reused. Run `cargo build -p trawl-server` when you
-want the bundled production build.
+Native development needs the pinned Rust toolchain, a C toolchain, Python 3.11
+or newer, and curl. Ordinary `cargo build`, `cargo test`, `cargo run`, and
+`bin/dev` verify the official DuckDB archive against
+`scripts/release/duckdb-runtime.json` before linking it. The shared library
+includes ICU, JSON, and Parquet. Cargo profiles reuse a checksum-addressed
+archive cache under `target/duckdb-runtime-cache`; cross builds keep their cache
+under `target/<triple>/duckdb-runtime-cache`. Custom target directories work too.
+The build stages a verified library in its output directory and `profile/deps`.
+Cargo supplies the loader path for runs and tests; `bin/trawld-dev` supplies it
+when Fleet launches the already-built daemon. Keep the library with that build.
+
+Native `trawl-core` builds also prepare the runtime so its standalone parity
+tests work with ordinary Cargo commands. Wasm and other parser-only targets do
+not acquire a native library. An inherited `DUCKDB_DOWNLOAD_LIB=1` is rejected;
+unset it or set it to `0`. Run Cargo from the checkout so it discovers
+`.cargo/config.toml`. Commands started elsewhere, including `cargo build
+--manifest-path /path/to/trawl/Cargo.toml` and `cargo install --path
+/path/to/trawl/crates/trawl-cli`, require `DUCKDB_NO_PKG_CONFIG=1` in their
+environment. The build rejects a missing setting because upstream pkg-config
+lookup can select a host library, even with `DUCKDB_LIB_DIR` set.
+
+An explicit `DUCKDB_LIB_DIR` selects an existing runtime directory prepared
+by the distribution helper, with its verified ZIP. Cargo checks the archive,
+library, header, license, and runtime metadata without changing that directory.
+Missing or mismatched files stop the build. Only the loader copy under the Cargo
+target directory is written; the selected runtime can be read-only.
+For distributable artifacts, use the [shared-runtime source build](/getting-started/#build-from-source).
 
 The interactive database lives in the named `fleet-dev-postgres-data` volume,
 which is separate from the disposable clusters in `docker-compose.dev.yml`. When
@@ -47,17 +69,6 @@ connection, and changes no Tailscale configuration. Under Tailscale exposure it
 does make two read-only queries to the local daemon, for the node's MagicDNS
 name and its tailnet IPv4, so `plan` then needs a running, logged-in
 `tailscaled` unless you pin both values in a profile.
-
-If the bundled DuckDB build artifacts grow too large, preview and then remove
-only the `libduckdb-sys` artifacts:
-
-```bash
-cargo clean -p libduckdb-sys --dry-run
-cargo clean -p libduckdb-sys
-```
-
-The versioned download cache survives that, and the next bundled build compiles
-DuckDB again. `fleet-dev` never runs this cleanup for you.
 
 ## Write a machine profile
 
@@ -210,3 +221,24 @@ backend, and preserves settings such as CSP nonces and `no_redirect`. Both apps'
 browser-facing processes must map
 `FLEET_SESSION_AEAD_KEY = "fleet.session_aead_key"`. Manifest validation rejects
 an app that could drift away from the shared development identity.
+
+## Use an internal development image
+
+The manually dispatched [Dev image workflow](https://github.com/jakub/trawl/actions/workflows/dev-image.yml)
+publishes a `linux/arm64` image for existing internal test installations. This
+channel publishes no matching CLI download, Helm package, or stable release.
+
+Use the completed run's summary for the image tag and full source revision.
+The summary gives commands to create an isolated checkout at that revision and
+build `trawl` for your local host with Rust 1.98.0. Install the
+[source-build prerequisites](/getting-started/#build-from-source) before that
+build. The CLI and image then use the same source revision, even when your CLI
+host uses a different architecture.
+
+Use `chart/trawl` from that same checkout. Select the test Kubernetes context,
+namespace, and existing release explicitly. Review a complete development
+values file against that chart, then use the summary's command with explicit
+image repository and tag. The command resets previous chart values before it
+applies your file, so include all configuration that the test installation
+requires. Do not combine an arbitrary local chart or retained release values
+with a new development image.

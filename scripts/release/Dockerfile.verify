@@ -1,0 +1,7 @@
+# Disposable native artifact verification, not a product image.
+FROM debian:bookworm-slim
+RUN printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d \
+    && chmod 755 /usr/sbin/policy-rc.d \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends python3 libcap2-bin systemd gcc libc6-dev libstdc++6 binutils \
+    && rm -rf /var/lib/apt/lists/*

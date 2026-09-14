@@ -2,424 +2,255 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The ADR-0009 storage-epoch cutover: restartable, filesystem-only.
+//! Current storage-format gate. No storage conversion runs at startup.
 //!
-//! "Legacy data is dropped" needs a mechanism, not an incantation. The
-//! marker is `data/EPOCH`, holding [`CURRENT_EPOCH`]; the epoch-1 layout has
-//! none. The boot decision table, every branch idempotent:
+//! Owned roots require `EPOCH = 3`. A missing or empty root can be initialized;
+//! an interrupted initial marker write can be retried on an otherwise empty
+//! owned root. Any other nonempty root without its marker must be restored
+//! from a complete current backup or replaced with a new empty root selected
+//! by the operator.
+//! Query-only nodes can also read unversioned generic archives without Trawl
+//! ownership markers. They never initialize those archives or inspect unused WAL.
+//! An explicit incompatible epoch refuses in every mode.
 //!
-//! - no `data/` → create `data/` + `EPOCH`, normal boot (fresh install;
-//!   also the crash-resume case)
-//! - `data/EPOCH` == [`CURRENT_EPOCH`] → normal boot; warn if either
-//!   set-aside directory still exists
-//! - `data/EPOCH` == `2` → the envelope reshaped, so set the root aside as
-//!   `data.pre-epoch-3/` and start clean; a query-only node warns and
-//!   serves it instead, and an existing `data.pre-epoch-3/` refuses
-//! - any other `EPOCH` content → refuse to start rather than guess (most
-//!   often the root was written by a newer trawld)
-//! - `data/` without `EPOCH`, ingest disabled → leave it alone entirely:
-//!   this node writes nothing here, so the directory is not ours to move
-//!   (a query-only node pointed at someone else's parquet archive)
-//! - `data/` without `EPOCH` and no evidence trawl wrote it (no `wal/`,
-//!   no `YYYY-MM-DD` partition dir, no parquet) → adopt in place by
-//!   writing `EPOCH`; nothing is renamed. Covers the pre-created empty
-//!   dir, a fresh mount with `lost+found`, and a mistyped `[data] path`
-//! - `data/` without `EPOCH`, legacy-looking, no `data.pre-schema-v2/` →
-//!   legacy root: rename `data/` → `data.pre-schema-v2/` (atomic), create
-//!   fresh `data/` + `EPOCH`, log loudly with counts of what was set
-//!   aside (parquet and WAL move together)
-//! - `data/` without `EPOCH` **and** `data.pre-schema-v2/` exists →
-//!   ambiguous; refuse to start with instructions
-//!
-//! There is no reachable state with a half-migrated root: the fresh root
-//! is assembled as a sibling `data.next` (EPOCH fsynced) and renamed into
-//! place, so a crash between the set-aside rename and the fresh-root
-//! rename leaves *no* `data/`, which resumes via the first branch.
-//! trawl never deletes a set-aside; retention skips it; the operator
-//! removes it at leisure.
-//!
-//! One subtree does not move with the root: `scheduled/`, the report-run
-//! results. Those are not event data but materialized query
-//! results whose *relative* path lives in a postgres `report_runs` row the
-//! cutover deliberately does not touch, so they ride across into the fresh
-//! root (see [`carry_over_report_runs`]) — every boot that sees a
-//! set-aside re-runs that one rename, which is how a crash mid-cutover
-//! still ends with the rows resolving.
+//! The gate precedes repin recovery. Current repin swaps only environment
+//! directories, so it cannot change EPOCH. Recovery still finishes before
+//! readers or conformance inspect the corpus.
 
-use std::path::{Path, PathBuf};
+use std::io::{Read as _, Write as _};
+use std::path::Path;
 
 /// The current storage epoch, written to `data/EPOCH`.
 pub const CURRENT_EPOCH: &str = "3";
-
 /// Marker filename inside the data root.
 pub const EPOCH_FILE: &str = "EPOCH";
-
-/// Suffix of the set-aside directory for a marker-less (epoch-1) root.
-pub const SET_ASIDE_SUFFIX: &str = ".pre-schema-v2";
-
-/// Suffix of the set-aside directory for an epoch-2 root (ADR-0013).
-///
-/// A second name, not a reused one: an install that already carries a
-/// `data.pre-schema-v2/` from the ADR-0009 cutover must not have it
-/// clobbered — trawl never deletes a set-aside, so the operator's copy of
-/// epoch-1 stays exactly where they left it while epoch 2 goes beside it.
-pub const EPOCH_3_SET_ASIDE_SUFFIX: &str = ".pre-epoch-3";
-
-/// Report-run results under the data root (`scheduled/run_{id}.parquet`),
-/// referenced by relative path from postgres `report_runs.result_path`.
-pub const REPORT_RUNS_DIR: &str = "scheduled";
-
-/// Staging suffix for the fresh root assembled before the swap.
+/// Suffix for staged marker files shared with catalog, repin, and rollup.
 const NEXT_SUFFIX: &str = ".next";
 
-/// What the boot gate decided (for logging/tests).
+/// What the boot gate decided, for logging and tests.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
-    /// Fresh install or crash-resume: created `data/` + `EPOCH`.
+    /// Created a missing root and published its current marker.
     FreshRoot,
-    /// Marker present and current: normal boot. `aside_present` warns the
-    /// operator that the set-aside dir is still consuming disk.
-    Current { aside_present: bool },
-    /// Legacy root set aside; fresh root created. Counts are what moved.
-    LegacySetAside {
-        parquet_files: u64,
-        wal_files: u64,
-        external_wal_set_aside: bool,
-    },
-    /// Marker-less root with no evidence trawl wrote it: the marker was
-    /// written in place and nothing was renamed.
-    AdoptedInPlace,
-    /// Marker-less root left completely untouched because ingest is
-    /// disabled — this node writes nothing here, so it does not own the
-    /// directory and must not migrate it.
-    CutoverDeferred,
+    /// The existing marker names the current format.
+    Current,
+    /// Published the current marker in a precreated empty root.
+    InitializedEmpty,
+    /// Unversioned generic archive, left untouched by this query-only node.
+    ReadOnlyArchive,
 }
 
-/// Run the epoch gate. Called after config load, before any component
-/// touches the data root. Returns an error (refusing to start) for the
-/// ambiguous state or an unrecognized epoch.
-///
-/// `wal_dir` is the *effective* WAL directory. When it lies outside the
-/// data root it is not covered by any rename of that root, so every branch
-/// that ends with this node owning `data_root` handles it explicitly: a
-/// set-aside branch always moves it too, under that epoch's own suffix, so
-/// parquet and WAL move together, and the branches that rename nothing set
-/// it aside only if it still holds pre-cutover flat `*.ndjson` files, which
-/// the env-directory-walking compactor could otherwise never see again.
-///
-/// `ingest_enabled` gates the destructive branch: a node that writes no
-/// data does not own the directory `[data] path` points at, so it never
-/// renames it.
-///
-/// Every branch that leaves this node owning `data_root` then finishes the
-/// [`carry_over_report_runs`] step, which is what keeps live postgres
-/// `report_runs` rows resolving across the cutover.
+/// Validate storage before any recovery can mutate the data root or siblings.
+/// All refusal checks run before fresh-root initialization. Filesystem errors
+/// are errors, never evidence of an empty directory or an absent marker.
 pub fn ensure_current_epoch(
     data_root: &Path,
     wal_dir: &Path,
     ingest_enabled: bool,
 ) -> Result<Outcome, String> {
-    let outcome = decide(data_root, wal_dir, ingest_enabled)?;
-    if outcome != Outcome::CutoverDeferred {
-        // Both set-aside names are consulted: an install can hold one
-        // from each cutover, and the report runs ride across from
-        // whichever one this boot (or a crashed earlier one) created.
-        for aside in set_aside_paths(data_root) {
-            carry_over_report_runs(&aside, data_root)?;
-        }
+    if ingest_enabled {
+        validate_wal(wal_dir)?;
     }
-    Ok(outcome)
-}
-
-/// The boot decision table itself. Every branch leaves `data_root` in a
-/// terminal state; only the report-run carry-over is still owed.
-fn decide(data_root: &Path, wal_dir: &Path, ingest_enabled: bool) -> Result<Outcome, String> {
-    let aside = set_aside_path(data_root);
-    let epoch_3_aside = sibling_with_suffix(data_root, EPOCH_3_SET_ASIDE_SUFFIX);
-    let marker = data_root.join(EPOCH_FILE);
-
-    if !data_root.exists() {
-        // Fresh install — or the crash-resume window between the
-        // set-aside rename and the fresh-root rename. An external WAL dir
-        // is not covered by either rename, so it is handled here; only a
-        // node that ingests owns it (same rule as the root itself).
-        if ingest_enabled {
-            set_aside_stranded_external_wal(data_root, wal_dir)?;
+    let Some(meta) = metadata_if_present(data_root)? else {
+        if !ingest_enabled {
+            return Ok(Outcome::ReadOnlyArchive);
         }
-        create_fresh_root(data_root)?;
+        if let Some(parent) = data_root.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("failed to create data parent {}: {e}", parent.display()))?;
+        }
+        // Do not adopt a root another process created after the absence check.
+        std::fs::create_dir(data_root)
+            .map_err(|e| format!("failed to create data root {}: {e}", data_root.display()))?;
+        publish_epoch(data_root)?;
+        if let Some(parent) = data_root.parent() {
+            fsync_dir_best_effort(parent);
+        }
         return Ok(Outcome::FreshRoot);
-    }
-
-    match std::fs::read_to_string(&marker) {
-        Ok(content) => {
-            let content = content.trim();
-            if content == CURRENT_EPOCH {
-                let mut aside_present = false;
-                for path in set_aside_paths(data_root) {
-                    if path.exists() {
-                        aside_present = true;
-                        tracing::warn!(
-                            event_type = "epoch_aside_present",
-                            path = %path.display(),
-                            "pre-cutover data set-aside directory still exists — \
-                             trawl never deletes it; remove it to reclaim disk"
-                        );
-                    }
-                }
-                Ok(Outcome::Current { aside_present })
-            } else if content == "2" {
-                epoch_2_branch(data_root, wal_dir, ingest_enabled, &epoch_3_aside)
-            } else {
-                Err(format!(
-                    "data root {} carries unrecognized storage epoch {content:?} \
-                     (this trawld writes epoch {CURRENT_EPOCH}) — refusing to \
-                     start. This usually means the data dir was written by a \
-                     NEWER trawld; downgrading the binary against it is not \
-                     supported",
-                    data_root.display()
-                ))
-            }
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            if !ingest_enabled {
-                // Query-only node: it writes nothing under the data root,
-                // so the root may be a shared archive or another node's.
-                // Renaming it would be an unconsented move of somebody
-                // else's data with a blast radius set by one config string.
-                tracing::info!(
-                    event_type = "epoch_cutover_deferred",
-                    path = %data_root.display(),
-                    "data root carries no {EPOCH_FILE} marker but ingest is \
-                     disabled — leaving it untouched; enable ingest to run \
-                     the schema-v2 cutover"
-                );
-                return Ok(Outcome::CutoverDeferred);
-            }
-            if !looks_like_trawl_root(data_root) {
-                // Nothing here says trawl wrote this directory: a
-                // pre-created empty root, a fresh mount (`lost+found`), or
-                // a mistyped path. Take the marker, move the root nowhere
-                // — but an external WAL dir is not part of this root, and
-                // pre-cutover files there would be stranded.
-                let external_wal_set_aside = set_aside_stranded_external_wal(data_root, wal_dir)?;
-                adopt_in_place(data_root)?;
-                tracing::info!(
-                    event_type = "epoch_adopted_in_place",
-                    path = %data_root.display(),
-                    external_wal_set_aside,
-                    "data root holds no pre-cutover trawl data (no wal/, \
-                     partition dir or parquet) — marked as epoch \
-                     {CURRENT_EPOCH} in place; the data root itself was \
-                     not renamed"
-                );
-                return Ok(Outcome::AdoptedInPlace);
-            }
-            if aside.exists() {
-                return Err(format!(
-                    "ambiguous storage state: {} has no {EPOCH_FILE} marker AND \
-                     {} already exists — refusing to start rather than guess. \
-                     If the current data root holds pre-cutover (legacy) data \
-                     you want set aside, move it elsewhere manually (the \
-                     standard set-aside name is taken). If it is stray/empty, \
-                     remove it and restart; a fresh epoch-{CURRENT_EPOCH} root \
-                     will be created",
-                    data_root.display(),
-                    aside.display()
-                ));
-            }
-            set_aside_root(data_root, &aside, wal_dir, &LEGACY_SET_ASIDE)
-        }
-        Err(e) => Err(format!(
-            "failed to read epoch marker {}: {e}",
-            marker.display()
-        )),
-    }
-}
-
-/// The epoch 2 → 3 branch of the decision table (ADR-0013).
-///
-/// An epoch-2 corpus carries `severity` and `severity_text` envelope
-/// columns that epoch 3 no longer defines, and there is no back-compat
-/// ruling: set the root aside and start clean.
-fn epoch_2_branch(
-    data_root: &Path,
-    wal_dir: &Path,
-    ingest_enabled: bool,
-    aside: &Path,
-) -> Result<Outcome, String> {
-    if !ingest_enabled {
-        // A query-only node does not own the root, and an epoch-2 corpus
-        // reads fine under epoch-3 semantics (its severity columns are
-        // ordinary bare columns). Warn and serve, the same shape as the
-        // marker-less branch.
-        tracing::warn!(
-            event_type = "epoch_cutover_deferred",
-            path = %data_root.display(),
-            "data root carries storage epoch 2 but ingest is disabled — \
-             leaving it untouched and serving it; its severity columns \
-             read as ordinary sender fields under epoch {CURRENT_EPOCH}. \
-             Enable ingest to run the cutover"
-        );
-        return Ok(Outcome::CutoverDeferred);
-    }
-    if aside.exists() {
+    };
+    if !meta.is_dir() {
         return Err(format!(
-            "ambiguous storage state: {} carries epoch 2 AND {} already \
-             exists — refusing to start rather than guess. Move the \
-             existing set-aside elsewhere and restart",
-            data_root.display(),
-            aside.display()
+            "data root {} is not a directory; refusing to start",
+            data_root.display()
         ));
     }
-    set_aside_root(data_root, aside, wal_dir, &EPOCH_2_SET_ASIDE)
+
+    let marker = data_root.join(EPOCH_FILE);
+    if metadata_if_present(&marker)?.is_some() {
+        let content = std::fs::read_to_string(&marker)
+            .map_err(|e| format!("failed to read epoch marker {}: {e}", marker.display()))?;
+        if content.trim() != CURRENT_EPOCH {
+            return Err(format!(
+                "data root {} carries unsupported storage epoch {:?}; this trawld requires \
+                 epoch {CURRENT_EPOCH}. Refusing to start without changing storage. \
+                 Select new empty data and WAL directories, or restore a complete epoch-{CURRENT_EPOCH} \
+                 backup. Do not relabel an incompatible corpus by editing EPOCH",
+                data_root.display(),
+                content.trim()
+            ));
+        }
+        return Ok(Outcome::Current);
+    }
+
+    let entries = std::fs::read_dir(data_root)
+        .map_err(|e| format!("failed to inspect data root {}: {e}", data_root.display()))?;
+    let mut empty = true;
+    let mut owned = false;
+    let mut staged_epochs = Vec::new();
+    let mut refused_staging = None;
+    for entry in entries {
+        let entry = entry
+            .map_err(|e| format!("failed to inspect data root {}: {e}", data_root.display()))?;
+        // Follow symlinks to detect dangling or inaccessible entries rather
+        // than treating metadata failure as an unowned generic archive.
+        let meta = std::fs::metadata(entry.path())
+            .map_err(|e| format!("failed to inspect {}: {e}", entry.path().display()))?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        owned |= matches!(name.as_ref(), "wal" | "CATALOG" | "REPIN" | "scheduled")
+            || name.starts_with("EPOCH.next.")
+            || (meta.is_dir() && is_date_partition(&name));
+        // A PID name alone is not authority to discard an entry. An initial
+        // publication can leave only a regular file containing a prefix of
+        // the current marker, including zero bytes before its first write.
+        if ingest_enabled && is_staged_epoch(&entry)? {
+            staged_epochs.push(entry.path());
+        } else {
+            empty = false;
+            if name.starts_with("EPOCH.next.") {
+                refused_staging = Some(entry.path());
+            }
+        }
+    }
+    if !ingest_enabled && !owned {
+        return Ok(Outcome::ReadOnlyArchive);
+    }
+    if ingest_enabled && empty {
+        // Inspect the entire root and WAL before removing any staging file.
+        // A crash during cleanup leaves either valid staging or an empty
+        // directory; both can be retried. Unlinking never follows a symlink.
+        for staged in staged_epochs {
+            std::fs::remove_file(&staged)
+                .map_err(|e| format!("failed to remove {}: {e}", staged.display()))?;
+        }
+        publish_epoch(data_root)?;
+        return Ok(Outcome::InitializedEmpty);
+    }
+    let refusal = format!(
+        "data root {} is nonempty but has no EPOCH marker; refusing to start without \
+         changing storage. Select new empty data and WAL directories, or restore a complete \
+         epoch-{CURRENT_EPOCH} backup including EPOCH. Unversioned generic archives require \
+         ingest disabled and must not contain Trawl ownership markers",
+        data_root.display()
+    );
+    if ingest_enabled && let Some(staged) = refused_staging {
+        return Err(format!(
+            "{refusal}. Cannot recover staged epoch entry {} automatically; inspect its type, contents, \
+             and origin along with the data root before choosing a recovery action. Startup \
+             has not removed or relabeled this entry",
+            staged.display()
+        ));
+    }
+    Err(refusal)
 }
 
-/// Move `{aside}/scheduled/` into the current data root.
-///
-/// Report-run results are not epoch-1 event data: they are materialized
-/// query results whose *relative* path (`scheduled/run_{id}.parquet`)
-/// is recorded in a live postgres `report_runs` row, and the cutover
-/// deliberately touches no postgres state. Setting them aside with the
-/// event tree would dangle every one of those rows, and each consumer
-/// degrades quietly rather than loudly — the run-detail endpoint answers
-/// HTTP 200 with `result: null`, `from saved … run=latest|all` splices a
-/// path that no longer exists, and report retention warns about a file it
-/// can never clean up. So the subtree rides across instead.
-///
-/// Restartable by construction: one rename, attempted on every boot that
-/// sees a set-aside. A crash before it lands leaves the source untouched
-/// and the next boot — which takes the `Current` branch, the fresh root
-/// being already published — completes it.
-fn carry_over_report_runs(aside: &Path, data_root: &Path) -> Result<(), String> {
-    let src = aside.join(REPORT_RUNS_DIR);
-    match std::fs::metadata(&src) {
-        // No report-run subtree in this set-aside: nothing to carry.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        // Anything else — a permission wall, an IO fault, a non-directory
-        // planted at the path — is not evidence of absence. Folding it into
-        // "nothing to carry" would boot cleanly while every postgres
-        // report_runs row still pointed under the set-aside.
-        Err(e) => {
-            return Err(format!(
-                "failed to inspect report-run results at {}: {e} — refusing \
-                 to start rather than orphan the postgres report_runs rows \
-                 that reference them by relative path",
-                src.display()
-            ));
-        }
-        Ok(meta) if !meta.is_dir() => {
-            return Err(format!(
-                "{} is not a directory — refusing to start rather than guess \
-                 what it is holding in place of the report-run results",
-                src.display()
-            ));
-        }
-        Ok(_) => {}
+/// Recognize only names and bytes an interrupted current publication writes.
+fn is_staged_epoch(entry: &std::fs::DirEntry) -> Result<bool, String> {
+    let name = entry.file_name();
+    let Some(pid) = name
+        .to_str()
+        .and_then(|name| name.strip_prefix("EPOCH.next."))
+    else {
+        return Ok(false);
+    };
+    if !pid
+        .parse::<u32>()
+        .is_ok_and(|value| value > 0 && value.to_string() == pid)
+    {
+        return Ok(false);
     }
-    let dst = data_root.join(REPORT_RUNS_DIR);
-    if dst.exists() {
-        // Not reachable from the gate's own branches (the fresh root is
-        // empty but for its marker); reachable by hand. Merging two trees
-        // is a judgement call about someone's data — say so, don't guess.
-        tracing::warn!(
-            event_type = "epoch_report_runs_conflict",
-            set_aside = %src.display(),
-            current = %dst.display(),
-            "both the set-aside and the current data root hold report-run \
-             results — leaving both in place; report runs recorded before \
-             the cutover stay unreadable until the two are merged by hand"
-        );
+    let kind = entry
+        .file_type()
+        .map_err(|e| format!("failed to inspect {}: {e}", entry.path().display()))?;
+    if !kind.is_file() {
+        return Ok(false);
+    }
+    let body = format!("{CURRENT_EPOCH}\n");
+    let mut bytes = Vec::new();
+    std::fs::File::open(entry.path())
+        .and_then(|file| file.take(body.len() as u64 + 1).read_to_end(&mut bytes))
+        .map_err(|e| {
+            format!(
+                "failed to read staged epoch {}: {e}",
+                entry.path().display()
+            )
+        })?;
+    Ok(body.as_bytes().starts_with(&bytes))
+}
+
+/// Preserve read errors, including dangling symlinks. Only a genuinely absent
+/// path is `None`; following an existing symlink must succeed.
+fn metadata_if_present(path: &Path) -> Result<Option<std::fs::Metadata>, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => std::fs::metadata(path)
+            .map(Some)
+            .map_err(|e| format!("failed to inspect {}: {e}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("failed to inspect {}: {e}", path.display())),
+    }
+}
+
+/// Current WAL batches live under environment directories. Flat batches must
+/// not be stranded outside the compactor's scan, even beside a current root.
+fn validate_wal(wal_dir: &Path) -> Result<(), String> {
+    if metadata_if_present(wal_dir)?.is_none() {
         return Ok(());
     }
-
-    std::fs::rename(&src, &dst).map_err(|e| {
-        format!(
-            "failed to carry report-run results {} → {}: {e} — refusing to \
-             start rather than orphan the postgres report_runs rows that \
-             reference them by relative path",
-            src.display(),
-            dst.display()
-        )
-    })?;
-    fsync_dir_best_effort(data_root);
-
-    tracing::info!(
-        event_type = "epoch_report_runs_carried_over",
-        from = %src.display(),
-        to = %dst.display(),
-        "report-run results moved into the epoch-{CURRENT_EPOCH} root — \
-         their postgres report_runs rows keep resolving across the cutover"
-    );
+    let entries = std::fs::read_dir(wal_dir)
+        .map_err(|e| format!("failed to inspect WAL directory {}: {e}", wal_dir.display()))?;
+    for entry in entries {
+        let entry = entry
+            .map_err(|e| format!("failed to inspect WAL directory {}: {e}", wal_dir.display()))?;
+        std::fs::metadata(entry.path())
+            .map_err(|e| format!("failed to inspect {}: {e}", entry.path().display()))?;
+        if entry.path().extension().is_some_and(|ext| ext == "ndjson") {
+            return Err(format!(
+                "unsupported flat WAL batch at {}; current WAL requires environment \
+                 directories. Refusing to start without changing storage. Select a new \
+                 empty WAL directory or restore the WAL from a complete epoch-{CURRENT_EPOCH} backup",
+                entry.path().display()
+            ));
+        }
+    }
     Ok(())
 }
 
-/// The sibling set-aside path for a data root (`data.pre-schema-v2`).
-pub fn set_aside_path(data_root: &Path) -> PathBuf {
-    sibling_with_suffix(data_root, SET_ASIDE_SUFFIX)
-}
-
-/// Every set-aside a data root can have, newest cutover first. An install
-/// that has been through both bumps holds one of each, and trawl deletes
-/// neither.
-///
-/// Retention consults these: a set-aside is outside `data/`, so it
-/// contributes no deletion candidates while still occupying the filesystem
-/// free-space measurements are taken from, and the disk-pressure sweep
-/// stands down while one exists.
-pub fn set_aside_paths(data_root: &Path) -> [PathBuf; 2] {
-    [
-        sibling_with_suffix(data_root, EPOCH_3_SET_ASIDE_SUFFIX),
-        set_aside_path(data_root),
-    ]
-}
-
-fn sibling_with_suffix(path: &Path, suffix: &str) -> PathBuf {
-    let name = path
-        .file_name()
-        .map_or_else(|| "data".to_owned(), |n| n.to_string_lossy().into_owned());
-    path.with_file_name(format!("{name}{suffix}"))
-}
-
-/// Is there any evidence trawl wrote this directory?
-///
-/// The legacy branch renames the *whole* root, so it may only fire on
-/// evidence — the `wal/` subdir, a legacy `YYYY-MM-DD` partition dir, or a
-/// parquet file. One cheap top-level `read_dir`, never a walk: the legacy
-/// layout puts all three at depth 0 or 1 (`data/{date}/{hour}/*.parquet`).
-fn looks_like_trawl_root(data_root: &Path) -> bool {
-    let Ok(entries) = std::fs::read_dir(data_root) else {
-        return false;
-    };
-    entries.flatten().any(|entry| {
-        let raw = entry.file_name();
-        let name = raw.to_string_lossy();
-        if name == "wal" || is_legacy_partition_dir(&name) {
-            entry.path().is_dir()
-        } else {
-            Path::new(name.as_ref())
-                .extension()
-                .is_some_and(|e| e == "parquet")
-        }
-    })
-}
-
-/// `YYYY-MM-DD` — the legacy top-level partition directory.
-fn is_legacy_partition_dir(name: &str) -> bool {
-    let b = name.as_bytes();
-    b.len() == 10
-        && b[4] == b'-'
-        && b[7] == b'-'
-        && b.iter()
+/// A top-level date partition is an owned storage layout, not a generic archive.
+fn is_date_partition(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes
+            .iter()
             .enumerate()
             .all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit())
 }
 
-/// Mark an existing, trawl-data-free directory as the current epoch
-/// without moving it: write the marker to a temp name, fsync, rename into
-/// place — so a crash can never publish a half-written marker (which the
-/// next boot would reject as an unrecognized epoch).
-fn adopt_in_place(data_root: &Path) -> Result<(), String> {
-    publish_marker_staged(data_root, EPOCH_FILE, &format!("{CURRENT_EPOCH}\n"))
+fn publish_epoch(data_root: &Path) -> Result<(), String> {
+    let staged = data_root.join(format!("EPOCH.next.{}", std::process::id()));
+    // Admission removed only proven initial-publication remnants. Exclusive
+    // creation refuses any replacement entry, including a symlink, instead
+    // of truncating or following it. Keep the same handle through fsync.
+    let mut file = std::fs::File::create_new(&staged)
+        .map_err(|e| format!("failed to create {}: {e}", staged.display()))?;
+    file.write_all(format!("{CURRENT_EPOCH}\n").as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(|e| format!("failed to write and fsync {}: {e}", staged.display()))?;
+    std::fs::rename(&staged, data_root.join(EPOCH_FILE))
+        .map_err(|e| format!("failed to publish epoch in {}: {e}", data_root.display()))?;
+    fsync_dir_best_effort(data_root);
+    Ok(())
 }
 
 /// Publish a small marker file into a directory via the staged-write
@@ -427,11 +258,10 @@ fn adopt_in_place(data_root: &Path) -> Result<(), String> {
 /// rename → dir fsync. A crash can then never publish a half-written
 /// marker — every reader sees either the previous content or the new one.
 ///
-/// This is the one implementation of that sequence: the epoch marker
-/// ([`EPOCH_FILE`]), the catalog identity marker
-/// (`catalog::conform::publish_marker`) and the repin marker
-/// (`repin::marker::write_marker`) all publish through it, so a future
-/// hardening of the sequence lands on all three at once.
+/// The catalog identity marker (`catalog::conform::publish_marker`) and the
+/// repin marker (`repin::marker::write_marker`) publish through this helper.
+/// Initial epoch publication uses exclusive staging creation in
+/// [`publish_epoch`] after admission validates any interrupted initial write.
 ///
 /// The staged name is PID-unique: concurrent publishers (test harnesses
 /// share a fixture corpus) must not clobber each other's staged file
@@ -474,925 +304,404 @@ pub(crate) fn fsync_dir_best_effort(dir: &Path) {
     }
 }
 
-/// Assemble a fresh epoch-marked root at `data_root` via a staged sibling
-/// rename, so there is never a visible `data/` without its marker.
-fn create_fresh_root(data_root: &Path) -> Result<(), String> {
-    let next = sibling_with_suffix(data_root, NEXT_SUFFIX);
-    // A stale staging dir from an earlier crash is disposable by
-    // construction (it never held ingested data).
-    if next.exists() {
-        std::fs::remove_dir_all(&next)
-            .map_err(|e| format!("failed to remove stale {}: {e}", next.display()))?;
-    }
-    std::fs::create_dir_all(&next)
-        .map_err(|e| format!("failed to create staging root {}: {e}", next.display()))?;
-
-    let marker = next.join(EPOCH_FILE);
-    std::fs::write(&marker, format!("{CURRENT_EPOCH}\n"))
-        .map_err(|e| format!("failed to write {}: {e}", marker.display()))?;
-    // fsync the marker so the rename below cannot publish a root whose
-    // marker reads back empty after a crash.
-    std::fs::File::open(&marker)
-        .and_then(|f| f.sync_all())
-        .map_err(|e| format!("failed to fsync {}: {e}", marker.display()))?;
-
-    std::fs::rename(&next, data_root).map_err(|e| {
-        format!(
-            "failed to move fresh root {} into place at {}: {e}",
-            next.display(),
-            data_root.display()
-        )
-    })?;
-    // Make the rename durable.
-    if let Some(parent) = data_root.parent() {
-        fsync_dir_best_effort(parent);
-    }
-    Ok(())
-}
-
-/// What one set-aside branch of the decision table calls its corpus.
-///
-/// Every epoch bump renames the same way and differs only in these three
-/// strings, so the branches share one body ([`set_aside_root`]) and a new
-/// epoch adds a constant rather than a fourth copy of the rename.
-struct SetAsideKind {
-    /// Suffix for the external WAL dir's own set-aside — one per epoch, so
-    /// one cutover's set-aside cannot clobber another's.
-    wal_suffix: &'static str,
-    /// How the corpus being set aside is named in operator-facing text.
-    label: &'static str,
-    /// Why it is being set aside — the ADR clause in the cutover warning.
-    reason: &'static str,
-}
-
-/// A marker-less (epoch-1) root, set aside by the ADR-0009 cutover.
-const LEGACY_SET_ASIDE: SetAsideKind = SetAsideKind {
-    wal_suffix: SET_ASIDE_SUFFIX,
-    label: "pre-schema-v2",
-    reason: "ADR-0009: legacy data is dropped from queries, not deleted",
-};
-
-/// An epoch-2 root, set aside by the ADR-0013 cutover.
-const EPOCH_2_SET_ASIDE: SetAsideKind = SetAsideKind {
-    wal_suffix: EPOCH_3_SET_ASIDE_SUFFIX,
-    label: "epoch-2",
-    reason: "ADR-0013: the event envelope reshaped, and legacy data is \
-             dropped from queries, not deleted",
-};
-
-/// The set-aside branch: set the whole root (and an external WAL dir)
-/// aside, then create the fresh marked root.
-fn set_aside_root(
-    data_root: &Path,
-    aside: &Path,
-    wal_dir: &Path,
-    kind: &SetAsideKind,
-) -> Result<Outcome, String> {
-    let SetAsideKind {
-        wal_suffix,
-        label,
-        reason,
-    } = *kind;
-
-    // Report-run parquet is carried back into the fresh root, so it is not
-    // part of what the cutover sets aside — don't claim it in the count.
-    let parquet_files = count_files_with_ext(data_root, "parquet").saturating_sub(
-        count_files_with_ext(&data_root.join(REPORT_RUNS_DIR), "parquet"),
-    );
-    let wal_files = count_files_with_ext(wal_dir, "ndjson");
-
-    // An external WAL dir does not move with the root, and every file in
-    // it is a pre-cutover event — set it aside first, so a crash after
-    // this rename still resumes correctly (the data root is untouched,
-    // the branch re-runs, and the WAL set-aside is a no-op because the
-    // source is gone) and the compactor can never drain pre-cutover
-    // events into the fresh corpus.
-    let external_wal_set_aside = set_aside_external_wal_with(data_root, wal_dir, wal_suffix)?;
-
-    std::fs::rename(data_root, aside).map_err(|e| {
-        format!(
-            "failed to set aside {label} data root {} → {}: {e} — the \
-             set-aside parent must be writable for the epoch-{CURRENT_EPOCH} \
-             cutover",
-            data_root.display(),
-            aside.display()
-        )
-    })?;
-
-    // A crash here leaves no data/ with the aside present — resumed by
-    // the fresh-install branch on next boot.
-    create_fresh_root(data_root)?;
-
-    tracing::warn!(
-        event_type = "epoch_cutover",
-        set_aside = %aside.display(),
-        parquet_files,
-        wal_files,
-        external_wal_set_aside,
-        "{label} data root set aside ({reason}) — trawl will never remove \
-         the set-aside directory; delete it manually to reclaim disk"
-    );
-
-    Ok(Outcome::LegacySetAside {
-        parquet_files,
-        wal_files,
-        external_wal_set_aside,
-    })
-}
-
-/// Rename an *external* WAL dir to `{wal_dir}.pre-schema-v2`. Returns
-/// whether anything moved; a WAL dir inside the data root rides the root
-/// rename instead and is left to it.
-fn set_aside_external_wal(data_root: &Path, wal_dir: &Path) -> Result<bool, String> {
-    set_aside_external_wal_with(data_root, wal_dir, SET_ASIDE_SUFFIX)
-}
-
-/// [`set_aside_external_wal`] under a named suffix — each epoch bump uses
-/// its own, so one cutover's set-aside cannot clobber another's.
-fn set_aside_external_wal_with(
-    data_root: &Path,
-    wal_dir: &Path,
-    suffix: &str,
-) -> Result<bool, String> {
-    if wal_dir.starts_with(data_root) || !wal_dir.exists() {
-        return Ok(false);
-    }
-    let wal_aside = sibling_with_suffix(wal_dir, suffix);
-    if wal_aside.exists() {
-        return Err(format!(
-            "ambiguous WAL state: both {} and {} exist — refusing to \
-             start rather than guess; move one aside manually",
-            wal_dir.display(),
-            wal_aside.display()
-        ));
-    }
-    std::fs::rename(wal_dir, &wal_aside).map_err(|e| {
-        format!(
-            "failed to set aside external WAL dir {} → {}: {e}",
-            wal_dir.display(),
-            wal_aside.display()
-        )
-    })?;
-    Ok(true)
-}
-
-/// The branches that rename nothing — fresh root and adopt-in-place — still
-/// owe an answer for an *external* WAL dir: it lives outside the root they
-/// left alone, so no other step of the cutover ever looks at it.
-///
-/// Pre-cutover WAL files sit flat at `{wal_dir}/*.ndjson`, while the current
-/// layout puts every one under `{wal_dir}/{env}/` and the compactor iterates
-/// env directories only. A flat file left in place is therefore invisible
-/// forever: never compacted, never counted, never deleted, which is silent
-/// data loss plus an unbounded disk leak. Set such a dir aside with the same
-/// rename the legacy branch uses; a WAL dir that is empty or already in the
-/// env layout is left exactly as it is.
-fn set_aside_stranded_external_wal(data_root: &Path, wal_dir: &Path) -> Result<bool, String> {
-    if wal_dir.starts_with(data_root) || !has_flat_legacy_wal(wal_dir) {
-        return Ok(false);
-    }
-    let wal_aside = sibling_with_suffix(wal_dir, SET_ASIDE_SUFFIX);
-    let wal_files = count_files_with_ext(wal_dir, "ndjson");
-    set_aside_external_wal(data_root, wal_dir)?;
-    tracing::warn!(
-        event_type = "epoch_external_wal_set_aside",
-        set_aside = %wal_aside.display(),
-        wal_files,
-        "pre-schema-v2 WAL files found in the external WAL directory while \
-         the data root needed no rename — set aside (ADR-0009: legacy data \
-         is dropped from queries, not deleted); delete it manually to \
-         reclaim disk"
-    );
-    Ok(true)
-}
-
-/// Any `*.ndjson` directly under `wal_dir` — the pre-cutover flat layout.
-fn has_flat_legacy_wal(wal_dir: &Path) -> bool {
-    let Ok(entries) = std::fs::read_dir(wal_dir) else {
-        return false;
-    };
-    entries.flatten().any(|entry| {
-        let path = entry.path();
-        path.extension().is_some_and(|e| e == "ndjson") && path.is_file()
-    })
-}
-
-/// Recursively count files with the given extension (for the cutover log).
-fn count_files_with_ext(dir: &Path, ext: &str) -> u64 {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return 0;
-    };
-    let mut count = 0;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            count += count_files_with_ext(&path, ext);
-        } else if path.extension().is_some_and(|e| e == ext) {
-            count += 1;
-        }
-    }
-    count
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
 
-    fn read_marker(root: &Path) -> String {
-        std::fs::read_to_string(root.join(EPOCH_FILE))
-            .expect("marker present")
-            .trim()
-            .to_owned()
-    }
-
-    #[test]
-    fn fresh_install_creates_marked_root() {
-        let tmp = tempfile::tempdir().unwrap();
-        let data = tmp.path().join("data");
-        let wal = data.join("wal");
-
-        let outcome = ensure_current_epoch(&data, &wal, true).expect("fresh install boots");
-        assert_eq!(outcome, Outcome::FreshRoot);
-        assert!(data.is_dir());
-        assert_eq!(read_marker(&data), CURRENT_EPOCH);
-    }
-
-    #[test]
-    fn epoch_3_root_boots_normally() {
-        let tmp = tempfile::tempdir().unwrap();
-        let data = tmp.path().join("data");
-        let wal = data.join("wal");
-        ensure_current_epoch(&data, &wal, true).unwrap();
-
-        // Second boot: no-op, no aside warning.
-        let outcome = ensure_current_epoch(&data, &wal, true).expect("epoch-2 boots");
-        assert_eq!(
-            outcome,
-            Outcome::Current {
-                aside_present: false
-            }
-        );
-    }
-
-    #[test]
-    fn epoch_3_with_lingering_aside_warns_but_boots() {
-        let tmp = tempfile::tempdir().unwrap();
-        let data = tmp.path().join("data");
-        let wal = data.join("wal");
-        ensure_current_epoch(&data, &wal, true).unwrap();
-        std::fs::create_dir_all(tmp.path().join("data.pre-schema-v2")).unwrap();
-
-        let outcome = ensure_current_epoch(&data, &wal, true).expect("must still boot");
-        assert_eq!(
-            outcome,
-            Outcome::Current {
-                aside_present: true
-            }
-        );
-    }
-
-    // --- the epoch 2 → 3 cutover (ADR-0013 §9) ---
-
-    /// Build an epoch-2-shaped root: the marker plus a partitioned
-    /// corpus and WAL under the epoch-2 layout.
-    fn epoch_2_root(tmp: &Path) -> (PathBuf, PathBuf) {
-        let data = tmp.join("data");
-        let hour = data.join("prod").join("2026-01-15").join("10");
-        std::fs::create_dir_all(&hour).unwrap();
-        std::fs::write(hour.join("nginx.parquet"), b"epoch-2 bytes").unwrap();
-        let wal = data.join("wal").join("prod");
-        std::fs::create_dir_all(&wal).unwrap();
-        std::fs::write(wal.join("nginx_1_aa.ndjson"), b"wal bytes").unwrap();
-        std::fs::write(data.join(EPOCH_FILE), "2\n").unwrap();
-        (data.clone(), data.join("wal"))
-    }
-
-    #[test]
-    fn an_epoch_2_root_is_set_aside_under_its_own_suffix() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (data, wal) = epoch_2_root(tmp.path());
-
-        let outcome = ensure_current_epoch(&data, &wal, true).expect("cutover runs");
-        assert_eq!(
-            outcome,
-            Outcome::LegacySetAside {
-                parquet_files: 1,
-                wal_files: 1,
-                external_wal_set_aside: false,
-            }
-        );
-
-        // The fresh root is empty but for its marker…
-        assert_eq!(read_marker(&data), "3");
-        assert!(!data.join("prod").exists(), "no epoch-2 data survives");
-        // …and the epoch-2 root is intact under its own suffix, so an
-        // existing `.pre-schema-v2` from the ADR-0009 cutover is safe.
-        let aside = tmp.path().join("data.pre-epoch-3");
-        assert_eq!(
-            std::fs::read(aside.join("prod/2026-01-15/10/nginx.parquet")).unwrap(),
-            b"epoch-2 bytes"
-        );
-        assert_eq!(
-            std::fs::read_to_string(aside.join(EPOCH_FILE))
-                .unwrap()
-                .trim(),
-            "2"
-        );
-        assert!(!tmp.path().join("data.pre-schema-v2").exists());
-    }
-
-    /// Both set-asides can coexist: trawl deletes neither, and the
-    /// epoch-3 cutover must not clobber the epoch-1 one.
-    #[test]
-    fn an_existing_epoch_1_set_aside_is_left_alone_by_the_epoch_3_cutover() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (data, wal) = epoch_2_root(tmp.path());
-        let old = tmp.path().join("data.pre-schema-v2");
-        std::fs::create_dir_all(&old).unwrap();
-        std::fs::write(old.join("legacy.parquet"), b"epoch-1 bytes").unwrap();
-
-        ensure_current_epoch(&data, &wal, true).expect("cutover runs");
-        assert_eq!(
-            std::fs::read(old.join("legacy.parquet")).unwrap(),
-            b"epoch-1 bytes",
-            "the ADR-0009 set-aside is untouched"
-        );
-        assert!(tmp.path().join("data.pre-epoch-3").exists());
-    }
-
-    /// A query-only node does not own the root, and an epoch-2 corpus
-    /// reads fine under epoch-3 semantics, so it warns and serves.
-    #[test]
-    fn a_query_only_node_serves_an_epoch_2_root_untouched() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (data, wal) = epoch_2_root(tmp.path());
-
-        let outcome = ensure_current_epoch(&data, &wal, false).expect("must serve");
-        assert_eq!(outcome, Outcome::CutoverDeferred);
-        assert_eq!(read_marker(&data), "2", "the marker is not rewritten");
-        assert!(data.join("prod/2026-01-15/10/nginx.parquet").exists());
-        assert!(!tmp.path().join("data.pre-epoch-3").exists());
-    }
-
-    /// An external WAL dir does not ride the root rename, so the
-    /// epoch-3 cutover sets it aside under its own suffix too.
-    #[test]
-    fn an_external_wal_dir_is_set_aside_by_the_epoch_3_cutover() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (data, _) = epoch_2_root(tmp.path());
-        let wal = tmp.path().join("fast-wal").join("prod");
-        std::fs::create_dir_all(&wal).unwrap();
-        std::fs::write(wal.join("nginx_1_aa.ndjson"), b"wal bytes").unwrap();
-        let wal_root = tmp.path().join("fast-wal");
-
-        let outcome = ensure_current_epoch(&data, &wal_root, true).expect("cutover runs");
-        assert!(
-            matches!(
-                outcome,
-                Outcome::LegacySetAside {
-                    external_wal_set_aside: true,
-                    ..
+    fn snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        fn walk(root: &Path, dir: &Path, result: &mut BTreeMap<PathBuf, Vec<u8>>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    result.insert(path.strip_prefix(root).unwrap().to_owned(), vec![]);
+                    walk(root, &path, result);
+                } else {
+                    result.insert(
+                        path.strip_prefix(root).unwrap().to_owned(),
+                        std::fs::read(&path).unwrap(),
+                    );
                 }
-            ),
-            "{outcome:?}"
-        );
-        assert!(
-            !wal_root.exists(),
-            "epoch-2 WAL must not drain into epoch 3"
-        );
-        assert!(
-            tmp.path()
-                .join("fast-wal.pre-epoch-3/prod/nginx_1_aa.ndjson")
-                .exists()
-        );
-    }
-
-    /// A crash between the set-aside rename and the fresh-root rename
-    /// leaves NO `data/`, which the fresh-install branch resumes.
-    #[test]
-    fn a_crash_mid_epoch_3_cutover_resumes_on_the_next_boot() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (data, wal) = epoch_2_root(tmp.path());
-        // Simulate the crash window by hand: the aside exists, data/ does not.
-        std::fs::rename(&data, tmp.path().join("data.pre-epoch-3")).unwrap();
-
-        let outcome = ensure_current_epoch(&data, &wal, true).expect("resumes");
-        assert_eq!(outcome, Outcome::FreshRoot);
-        assert_eq!(read_marker(&data), "3");
-        assert!(tmp.path().join("data.pre-epoch-3").exists());
-    }
-
-    /// Report runs ride across the epoch-3 cutover, exactly as they do
-    /// across the epoch-1 one: their postgres rows name a relative path.
-    #[test]
-    fn report_runs_ride_across_the_epoch_3_cutover() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (data, wal) = epoch_2_root(tmp.path());
-        let runs = data.join(REPORT_RUNS_DIR).join("nightly");
-        std::fs::create_dir_all(&runs).unwrap();
-        std::fs::write(runs.join("run_7.parquet"), b"results").unwrap();
-
-        ensure_current_epoch(&data, &wal, true).expect("cutover runs");
-        assert_eq!(
-            std::fs::read(data.join("scheduled/nightly/run_7.parquet")).unwrap(),
-            b"results",
-            "the run rode into the fresh root"
-        );
-    }
-
-    /// A non-directory planted where the report runs live is not
-    /// evidence that there are none: refuse rather than boot clean with
-    /// every postgres `report_runs` row stranded under the set-aside.
-    #[test]
-    fn a_non_directory_report_runs_path_refuses() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (data, wal) = epoch_2_root(tmp.path());
-        std::fs::write(data.join(REPORT_RUNS_DIR), b"not a directory").unwrap();
-
-        let err = ensure_current_epoch(&data, &wal, true).expect_err("must refuse");
-        assert!(err.contains("not a directory"), "got: {err}");
-    }
-
-    /// An epoch-2 root beside an existing epoch-3 set-aside is
-    /// ambiguous: refuse rather than clobber.
-    #[test]
-    fn an_epoch_2_root_beside_its_own_set_aside_refuses() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (data, wal) = epoch_2_root(tmp.path());
-        std::fs::create_dir_all(tmp.path().join("data.pre-epoch-3")).unwrap();
-
-        let err = ensure_current_epoch(&data, &wal, true).expect_err("must refuse");
-        assert!(err.contains("ambiguous"), "got: {err}");
-        assert!(data.join("prod").exists(), "nothing is touched");
-    }
-
-    #[test]
-    fn legacy_root_is_set_aside_byte_identical() {
-        let tmp = tempfile::tempdir().unwrap();
-        let data = tmp.path().join("data");
-        // Legacy layout: date dirs at top level, wal inside, no marker.
-        let legacy_parquet = data.join("2026-01-15").join("10");
-        std::fs::create_dir_all(&legacy_parquet).unwrap();
-        std::fs::write(legacy_parquet.join("nginx.parquet"), b"legacy bytes").unwrap();
-        let legacy_wal = data.join("wal");
-        std::fs::create_dir_all(&legacy_wal).unwrap();
-        std::fs::write(legacy_wal.join("nginx_1_aa.ndjson"), b"wal bytes").unwrap();
-
-        let outcome = ensure_current_epoch(&data, &legacy_wal, true).expect("cutover applies");
-        assert_eq!(
-            outcome,
-            Outcome::LegacySetAside {
-                parquet_files: 1,
-                wal_files: 1,
-                external_wal_set_aside: false,
             }
-        );
-
-        // Fresh root with marker; legacy content byte-identical in the aside.
-        assert_eq!(read_marker(&data), CURRENT_EPOCH);
-        let aside = tmp.path().join("data.pre-schema-v2");
-        assert_eq!(
-            std::fs::read(aside.join("2026-01-15/10/nginx.parquet")).unwrap(),
-            b"legacy bytes"
-        );
-        assert_eq!(
-            std::fs::read(aside.join("wal/nginx_1_aa.ndjson")).unwrap(),
-            b"wal bytes"
-        );
-        // The fresh root holds nothing but the marker.
-        let entries: Vec<_> = std::fs::read_dir(&data)
-            .unwrap()
-            .filter_map(Result::ok)
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(entries, vec![EPOCH_FILE.to_owned()]);
+        }
+        let mut result = BTreeMap::new();
+        walk(root, root, &mut result);
+        result
     }
 
     #[test]
-    fn report_run_results_ride_across_the_cutover() {
-        // `report_runs.result_path` in postgres is relative and the cutover
-        // touches no postgres state, so the files it names must land under
-        // the fresh root — not in the aside, where every row would dangle.
-        let tmp = tempfile::tempdir().unwrap();
-        let data = tmp.path().join("data");
-        let legacy_parquet = data.join("2026-01-15").join("10");
-        std::fs::create_dir_all(&legacy_parquet).unwrap();
-        std::fs::write(legacy_parquet.join("nginx.parquet"), b"legacy bytes").unwrap();
-        let runs = data.join("scheduled").join("daily_errors");
-        std::fs::create_dir_all(&runs).unwrap();
-        std::fs::write(runs.join("run_42.parquet"), b"report bytes").unwrap();
-        let wal = data.join("wal");
-
-        let outcome = ensure_current_epoch(&data, &wal, true).expect("cutover applies");
-        assert_eq!(
-            outcome,
-            Outcome::LegacySetAside {
-                // The report run is carried over, so it is not "set aside".
-                parquet_files: 1,
-                wal_files: 0,
-                external_wal_set_aside: false,
+    fn fresh_and_empty_roots_initialize_and_restart() {
+        for precreated in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let data = tmp.path().join("data");
+            if precreated {
+                std::fs::create_dir(&data).unwrap();
             }
-        );
-
-        assert_eq!(
-            std::fs::read(data.join("scheduled/daily_errors/run_42.parquet")).unwrap(),
-            b"report bytes",
-            "the DB-stored relative path still resolves"
-        );
-        let aside = tmp.path().join("data.pre-schema-v2");
-        assert!(
-            !aside.join("scheduled").exists(),
-            "report runs are not left in the aside"
-        );
-        assert!(
-            aside.join("2026-01-15/10/nginx.parquet").exists(),
-            "legacy event data is still dropped"
-        );
+            let wal = data.join("wal");
+            let first = ensure_current_epoch(&data, &wal, true).unwrap();
+            assert_eq!(
+                first,
+                if precreated {
+                    Outcome::InitializedEmpty
+                } else {
+                    Outcome::FreshRoot
+                }
+            );
+            assert_eq!(
+                std::fs::read_to_string(data.join(EPOCH_FILE)).unwrap(),
+                "3\n"
+            );
+            let before = snapshot(tmp.path());
+            assert_eq!(
+                ensure_current_epoch(&data, &wal, true).unwrap(),
+                Outcome::Current
+            );
+            assert_eq!(snapshot(tmp.path()), before);
+        }
     }
 
     #[test]
-    fn a_crash_before_the_carry_over_is_finished_on_the_next_boot() {
-        // The fresh root is published but the report runs never moved: the
-        // next boot takes the `Current` branch and must complete the step.
+    fn interrupted_epoch_publication_retries_then_restarts() {
+        for content in [b"".as_slice(), b"3", b"3\n"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let data = tmp.path().join("data");
+            std::fs::create_dir(&data).unwrap();
+            for pid in [123, std::process::id()] {
+                std::fs::write(data.join(format!("EPOCH.next.{pid}")), content).unwrap();
+            }
+            assert_eq!(
+                ensure_current_epoch(&data, &data.join("wal"), true).unwrap(),
+                Outcome::InitializedEmpty
+            );
+            assert_eq!(std::fs::read(data.join(EPOCH_FILE)).unwrap(), b"3\n");
+            assert_eq!(std::fs::read_dir(&data).unwrap().count(), 1);
+            let before = snapshot(tmp.path());
+            assert_eq!(
+                ensure_current_epoch(&data, &data.join("wal"), true).unwrap(),
+                Outcome::Current
+            );
+            assert_eq!(snapshot(tmp.path()), before);
+        }
+    }
+
+    #[test]
+    fn staging_files_never_admit_mixed_or_query_only_roots() {
+        for extra in [
+            None,
+            Some("notes.txt"),
+            Some("prod/events.parquet"),
+            Some("wal/prod/batch.ndjson"),
+        ] {
+            for ingest in [false, true] {
+                if extra.is_none() && ingest {
+                    continue;
+                }
+                let tmp = tempfile::tempdir().unwrap();
+                let data = tmp.path().join("data");
+                std::fs::create_dir(&data).unwrap();
+                std::fs::write(data.join("EPOCH.next.123"), b"3\n").unwrap();
+                if let Some(extra) = extra {
+                    let path = data.join(extra);
+                    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    std::fs::write(path, b"preserve").unwrap();
+                }
+                let before = snapshot(tmp.path());
+                let err = ensure_current_epoch(&data, &data.join("wal"), ingest).unwrap_err();
+                assert!(err.contains("restore a complete epoch-3 backup"), "{err}");
+                assert!(
+                    err.contains("Unversioned generic archives require"),
+                    "{err}"
+                );
+                assert!(!err.contains("Cannot recover staged epoch entry"), "{err}");
+                assert_eq!(snapshot(tmp.path()), before);
+            }
+        }
+    }
+
+    #[test]
+    fn staging_retry_requires_current_bytes_and_generated_name() {
+        for (name, content) in [
+            ("EPOCH.next.123", "2\n"),
+            ("EPOCH.next.123", "garbage"),
+            ("EPOCH.next.123", "3\nextra"),
+            ("EPOCH.next.123", " 3\n"),
+            ("EPOCH.next.", "3\n"),
+            ("EPOCH.next.backup", "3\n"),
+            ("EPOCH.next.0", "3\n"),
+            ("EPOCH.next.0123", "3\n"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let data = tmp.path().join("data");
+            std::fs::create_dir(&data).unwrap();
+            std::fs::write(data.join("EPOCH.next.456"), b"3\n").unwrap();
+            std::fs::write(data.join(name), content).unwrap();
+            let before = snapshot(tmp.path());
+            for ingest in [false, true] {
+                let err = ensure_current_epoch(&data, &data.join("wal"), ingest).unwrap_err();
+                assert!(err.contains("restore a complete epoch-3 backup"), "{err}");
+                if ingest {
+                    assert!(
+                        err.contains(&data.join(name).display().to_string()),
+                        "{err}"
+                    );
+                    assert!(err.contains("inspect"), "{err}");
+                } else {
+                    assert!(!err.contains("Cannot recover staged epoch entry"), "{err}");
+                }
+                assert!(!err.contains("delete"), "{err}");
+                assert_eq!(snapshot(tmp.path()), before);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_epoch_symlinks_and_directories_are_never_retried() {
+        use std::os::unix::fs::symlink;
+        for kind in ["symlink", "dangling", "directory"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let data = tmp.path().join("data");
+            std::fs::create_dir(&data).unwrap();
+            let target = tmp.path().join("target");
+            std::fs::write(&target, b"3\n").unwrap();
+            let stage = data.join(format!("EPOCH.next.{}", std::process::id()));
+            match kind {
+                "directory" => std::fs::create_dir(&stage).unwrap(),
+                "dangling" => symlink(tmp.path().join("absent"), &stage).unwrap(),
+                _ => symlink(&target, &stage).unwrap(),
+            }
+            std::fs::write(data.join("EPOCH.next.123"), b"3\n").unwrap();
+            for ingest in [false, true] {
+                assert!(ensure_current_epoch(&data, &data.join("wal"), ingest).is_err());
+                assert!(std::fs::symlink_metadata(&stage).is_ok());
+                assert_eq!(std::fs::read(&target).unwrap(), b"3\n");
+                assert!(!data.join(EPOCH_FILE).exists());
+                assert!(data.join("EPOCH.next.123").exists());
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn epoch_publication_refuses_a_replacement_staging_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staged = tmp
+            .path()
+            .join(format!("EPOCH.next.{}", std::process::id()));
+        let target = tmp.path().join("target");
+        std::fs::write(&target, b"preserve").unwrap();
+        std::os::unix::fs::symlink(&target, &staged).unwrap();
+        assert!(publish_epoch(tmp.path()).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"preserve");
+        assert!(std::fs::symlink_metadata(&staged).unwrap().is_symlink());
+        assert!(!tmp.path().join(EPOCH_FILE).exists());
+    }
+
+    #[test]
+    fn explicit_noncurrent_epochs_refuse_in_every_mode_without_mutation() {
+        for content in ["1\n", "2\n", "4\n", "", "3 extra", "garbage"] {
+            for ingest in [false, true] {
+                let tmp = tempfile::tempdir().unwrap();
+                let data = tmp.path().join("data");
+                std::fs::create_dir_all(data.join("prod/2026-01-01/10")).unwrap();
+                std::fs::write(data.join("prod/2026-01-01/10/a.parquet"), b"corpus bytes").unwrap();
+                std::fs::write(data.join(EPOCH_FILE), content).unwrap();
+                let before = snapshot(tmp.path());
+                let err = ensure_current_epoch(&data, &data.join("wal"), ingest).unwrap_err();
+                assert!(err.contains("unsupported storage epoch"), "{err}");
+                assert!(err.contains("Do not relabel"), "{err}");
+                assert_eq!(snapshot(tmp.path()), before);
+            }
+        }
+    }
+
+    #[test]
+    fn markerless_nonempty_ingest_roots_refuse_without_mutation() {
+        for path in [
+            "2026-01-01/a.parquet",
+            "prod/2026-01-01/10/a.parquet",
+            "a.parquet",
+            "wal/prod/a.ndjson",
+            "scheduled/run.parquet",
+            "notes.txt",
+            "EPOCH.next.123",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let data = tmp.path().join("data");
+            let file = data.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, b"preserve").unwrap();
+            let before = snapshot(tmp.path());
+            let err = ensure_current_epoch(&data, &data.join("wal"), true).unwrap_err();
+            assert!(err.contains("nonempty but has no EPOCH"), "{err}");
+            assert_eq!(snapshot(tmp.path()), before);
+        }
+    }
+
+    #[test]
+    fn flat_wal_refuses_before_fresh_empty_or_current_root_mutation() {
+        for root_state in ["missing", "empty", "staged", "current"] {
+            for internal in [false, true] {
+                let tmp = tempfile::tempdir().unwrap();
+                let data = tmp.path().join("data");
+                if root_state != "missing" {
+                    std::fs::create_dir(&data).unwrap();
+                }
+                if root_state == "current" {
+                    std::fs::write(data.join(EPOCH_FILE), "3\n").unwrap();
+                }
+                if root_state == "staged" {
+                    std::fs::write(data.join("EPOCH.next.123"), "3\n").unwrap();
+                }
+                let wal = if internal {
+                    data.join("wal")
+                } else {
+                    tmp.path().join("wal")
+                };
+                std::fs::create_dir_all(&wal).unwrap();
+                std::fs::write(wal.join("svc.ndjson"), b"unread batch").unwrap();
+                let before = snapshot(tmp.path());
+                let err = ensure_current_epoch(&data, &wal, true).unwrap_err();
+                assert!(err.contains("unsupported flat WAL"), "{err}");
+                assert_eq!(snapshot(tmp.path()), before);
+            }
+        }
+    }
+
+    #[test]
+    fn current_environment_wal_is_preserved() {
         let tmp = tempfile::tempdir().unwrap();
         let data = tmp.path().join("data");
-        let wal = data.join("wal");
+        let wal = tmp.path().join("wal");
+        std::fs::create_dir_all(wal.join("prod")).unwrap();
+        std::fs::write(wal.join("prod/svc.ndjson"), b"current batch").unwrap();
         ensure_current_epoch(&data, &wal, true).unwrap();
-        let aside_runs = tmp.path().join("data.pre-schema-v2/scheduled/daily");
-        std::fs::create_dir_all(&aside_runs).unwrap();
-        std::fs::write(aside_runs.join("run_1.parquet"), b"report bytes").unwrap();
-
-        let outcome = ensure_current_epoch(&data, &wal, true).expect("boots");
+        let before = snapshot(tmp.path());
         assert_eq!(
-            outcome,
-            Outcome::Current {
-                aside_present: true
-            }
+            ensure_current_epoch(&data, &wal, true).unwrap(),
+            Outcome::Current
         );
-        assert_eq!(
-            std::fs::read(data.join("scheduled/daily/run_1.parquet")).unwrap(),
-            b"report bytes"
-        );
+        assert_eq!(snapshot(tmp.path()), before);
     }
 
     #[test]
-    fn report_runs_in_both_roots_are_left_alone() {
-        // Hand-made state: merging two trees is the operator's call, but it
-        // must never cost a boot.
+    fn query_only_generic_archives_and_unused_wal_are_untouched() {
+        for root_state in ["missing", "empty", "archive", "current"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let data = tmp.path().join("data");
+            let wal = tmp.path().join("wal");
+            // Unused WAL is not even a directory: the read-only gate ignores it.
+            std::fs::write(&wal, b"not in use").unwrap();
+            if root_state != "missing" {
+                std::fs::create_dir(&data).unwrap();
+            }
+            if root_state == "archive" {
+                std::fs::write(data.join("export.parquet"), b"generic bytes").unwrap();
+            }
+            if root_state == "current" {
+                std::fs::write(data.join(EPOCH_FILE), "3\n").unwrap();
+            }
+            let before = snapshot(tmp.path());
+            let result = ensure_current_epoch(&data, &wal, false).unwrap();
+            assert_eq!(
+                result,
+                if root_state == "current" {
+                    Outcome::Current
+                } else {
+                    Outcome::ReadOnlyArchive
+                }
+            );
+            assert_eq!(snapshot(tmp.path()), before);
+        }
+    }
+
+    #[test]
+    fn query_only_owned_roots_still_require_their_epoch_marker() {
+        for name in [
+            "wal",
+            "CATALOG",
+            "REPIN",
+            "scheduled",
+            "2026-01-01",
+            "EPOCH.next.123",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let data = tmp.path().join("data");
+            std::fs::create_dir_all(data.join(name)).unwrap();
+            let before = snapshot(tmp.path());
+            let err = ensure_current_epoch(&data, &data.join("wal"), false).unwrap_err();
+            assert!(err.contains("nonempty but has no EPOCH"), "{err}");
+            assert_eq!(snapshot(tmp.path()), before);
+        }
+    }
+
+    #[test]
+    fn suffix_siblings_and_report_results_are_never_adopted_or_deleted() {
         let tmp = tempfile::tempdir().unwrap();
         let data = tmp.path().join("data");
-        let wal = data.join("wal");
-        ensure_current_epoch(&data, &wal, true).unwrap();
-        let current_runs = data.join("scheduled/fresh");
-        std::fs::create_dir_all(&current_runs).unwrap();
-        std::fs::write(current_runs.join("run_2.parquet"), b"fresh").unwrap();
-        let aside_runs = tmp.path().join("data.pre-schema-v2/scheduled/old");
-        std::fs::create_dir_all(&aside_runs).unwrap();
-        std::fs::write(aside_runs.join("run_1.parquet"), b"old").unwrap();
-
-        let outcome = ensure_current_epoch(&data, &wal, true).expect("still boots");
-        assert_eq!(
-            outcome,
-            Outcome::Current {
-                aside_present: true
-            }
-        );
-        assert_eq!(
-            std::fs::read(current_runs.join("run_2.parquet")).unwrap(),
-            b"fresh"
-        );
-        assert_eq!(
-            std::fs::read(aside_runs.join("run_1.parquet")).unwrap(),
-            b"old"
-        );
-    }
-
-    #[test]
-    fn a_query_only_node_carries_nothing_over() {
-        // Ingest disabled: the node owns neither root, so not even the
-        // report-run subtree may be moved between them.
-        let tmp = tempfile::tempdir().unwrap();
-        let data = tmp.path().join("logs");
-        std::fs::create_dir_all(data.join("2026-01-15")).unwrap();
-        let aside_runs = tmp.path().join("logs.pre-schema-v2/scheduled/daily");
-        std::fs::create_dir_all(&aside_runs).unwrap();
-        std::fs::write(aside_runs.join("run_1.parquet"), b"not ours").unwrap();
-        let wal = data.join("wal");
-
-        let outcome = ensure_current_epoch(&data, &wal, false).expect("boots");
-        assert_eq!(outcome, Outcome::CutoverDeferred);
-        assert!(aside_runs.join("run_1.parquet").exists());
+        for suffix in [".next", ".pre-schema-v2", ".pre-epoch-3"] {
+            let report = tmp
+                .path()
+                .join(format!("data{suffix}/scheduled/run.parquet"));
+            std::fs::create_dir_all(report.parent().unwrap()).unwrap();
+            std::fs::write(report, b"old result").unwrap();
+        }
+        let before = snapshot(tmp.path());
+        ensure_current_epoch(&data, &data.join("wal"), true).unwrap();
         assert!(!data.join("scheduled").exists());
+        for (path, bytes) in before {
+            assert!(tmp.path().join(&path).exists());
+            if tmp.path().join(&path).is_file() {
+                assert_eq!(std::fs::read(tmp.path().join(path)).unwrap(), bytes);
+            }
+        }
+        let initialized = snapshot(tmp.path());
+        ensure_current_epoch(&data, &data.join("wal"), true).unwrap();
+        assert_eq!(snapshot(tmp.path()), initialized);
     }
 
     #[test]
-    fn second_apply_is_a_noop() {
+    fn invalid_path_types_fail_before_initialization() {
         let tmp = tempfile::tempdir().unwrap();
         let data = tmp.path().join("data");
-        std::fs::create_dir_all(data.join("2026-01-15")).unwrap();
-        let wal = data.join("wal");
-
-        let first = ensure_current_epoch(&data, &wal, true).unwrap();
-        assert!(matches!(first, Outcome::LegacySetAside { .. }));
-
-        let second = ensure_current_epoch(&data, &wal, true).unwrap();
-        assert_eq!(
-            second,
-            Outcome::Current {
-                aside_present: true
-            }
-        );
-    }
-
-    #[test]
-    fn query_only_node_never_touches_a_marker_less_root() {
-        // `[data] path = "/mnt/logs/**/*.parquet"` on an ingest-disabled
-        // node: a shared archive trawld does not own. Nothing may move —
-        // not even a marker may be written into it.
-        let tmp = tempfile::tempdir().unwrap();
-        let data = tmp.path().join("logs");
-        let day = data.join("2026-01-15");
-        std::fs::create_dir_all(&day).unwrap();
-        std::fs::write(day.join("nginx.parquet"), b"someone else's bytes").unwrap();
-        let wal = data.join("wal");
-
-        let outcome = ensure_current_epoch(&data, &wal, false).expect("query-only node boots");
-        assert_eq!(outcome, Outcome::CutoverDeferred);
+        let wal = tmp.path().join("wal");
+        std::fs::write(&wal, b"not a directory").unwrap();
         assert!(
-            !tmp.path().join("logs.pre-schema-v2").exists(),
-            "nothing is set aside"
+            ensure_current_epoch(&data, &wal, true)
+                .unwrap_err()
+                .contains("failed to inspect WAL")
         );
-        assert!(!data.join(EPOCH_FILE).exists(), "no marker is written");
-        assert_eq!(
-            std::fs::read(day.join("nginx.parquet")).unwrap(),
-            b"someone else's bytes"
-        );
-    }
-
-    #[test]
-    fn directory_without_trawl_data_is_adopted_not_renamed() {
-        // A mistyped path, or a fresh mount with `lost+found`: no wal/, no
-        // partition dir, no parquet. Take the marker, move nothing.
-        let tmp = tempfile::tempdir().unwrap();
-        let data = tmp.path().join("data");
-        std::fs::create_dir_all(data.join("lost+found")).unwrap();
-        std::fs::write(data.join("notes.txt"), b"not ours").unwrap();
-        let wal = data.join("wal");
-
-        let outcome = ensure_current_epoch(&data, &wal, true).expect("adopts in place");
-        assert_eq!(outcome, Outcome::AdoptedInPlace);
+        assert!(!data.exists());
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(data.join(EPOCH_FILE)).unwrap();
         assert!(
-            !tmp.path().join("data.pre-schema-v2").exists(),
-            "a non-trawl directory is never renamed"
-        );
-        assert_eq!(read_marker(&data), CURRENT_EPOCH);
-        assert_eq!(std::fs::read(data.join("notes.txt")).unwrap(), b"not ours");
-        assert!(data.join("lost+found").is_dir());
-
-        // And the adopted root is a normal current-epoch root from then on.
-        let second = ensure_current_epoch(&data, &wal, true).unwrap();
-        assert_eq!(
-            second,
-            Outcome::Current {
-                aside_present: false
-            }
+            ensure_current_epoch(&data, &wal, false)
+                .unwrap_err()
+                .contains("failed to read epoch marker")
         );
     }
 
+    #[cfg(unix)]
     #[test]
-    fn pre_created_empty_root_is_adopted_in_place() {
-        // The .deb/helm pre-create case: the dir exists, holds nothing.
-        let tmp = tempfile::tempdir().unwrap();
-        let data = tmp.path().join("data");
-        std::fs::create_dir_all(&data).unwrap();
-        let wal = data.join("wal");
-
-        let outcome = ensure_current_epoch(&data, &wal, true).unwrap();
-        assert_eq!(outcome, Outcome::AdoptedInPlace);
-        assert_eq!(read_marker(&data), CURRENT_EPOCH);
-    }
-
-    #[test]
-    fn a_bare_parquet_file_is_evidence_of_a_legacy_root() {
-        let tmp = tempfile::tempdir().unwrap();
-        let data = tmp.path().join("data");
-        std::fs::create_dir_all(&data).unwrap();
-        std::fs::write(data.join("nginx.parquet"), b"legacy").unwrap();
-        let wal = data.join("wal");
-
-        let outcome = ensure_current_epoch(&data, &wal, true).unwrap();
-        assert_eq!(
-            outcome,
-            Outcome::LegacySetAside {
-                parquet_files: 1,
-                wal_files: 0,
-                external_wal_set_aside: false,
-            }
-        );
-    }
-
-    #[test]
-    fn crash_between_set_aside_and_fresh_root_resumes() {
-        // Simulated crash window: the legacy root was renamed aside but the
-        // fresh root never landed — no data/, aside present.
-        let tmp = tempfile::tempdir().unwrap();
-        let data = tmp.path().join("data");
-        let aside = tmp.path().join("data.pre-schema-v2");
-        std::fs::create_dir_all(aside.join("2026-01-15")).unwrap();
-        let wal = data.join("wal");
-
-        let outcome = ensure_current_epoch(&data, &wal, true).expect("crash-resume boots");
-        assert_eq!(outcome, Outcome::FreshRoot);
-        assert_eq!(read_marker(&data), CURRENT_EPOCH);
-        assert!(aside.exists(), "the aside is never touched");
-    }
-
-    #[test]
-    fn stale_staging_dir_is_replaced() {
-        // A crash inside create_fresh_root leaves data.next; the retry
-        // must discard and rebuild it.
-        let tmp = tempfile::tempdir().unwrap();
-        let data = tmp.path().join("data");
-        std::fs::create_dir_all(tmp.path().join("data.next")).unwrap();
-        std::fs::write(tmp.path().join("data.next/garbage"), b"x").unwrap();
-        let wal = data.join("wal");
-
-        let outcome = ensure_current_epoch(&data, &wal, true).unwrap();
-        assert_eq!(outcome, Outcome::FreshRoot);
-        assert!(!tmp.path().join("data.next").exists());
-        assert!(!data.join("garbage").exists());
-    }
-
-    #[test]
-    fn ambiguous_state_refuses_to_start() {
-        let tmp = tempfile::tempdir().unwrap();
-        let data = tmp.path().join("data");
-        std::fs::create_dir_all(data.join("2026-01-15")).unwrap(); // no marker
-        std::fs::create_dir_all(tmp.path().join("data.pre-schema-v2")).unwrap();
-        let wal = data.join("wal");
-
-        let err = ensure_current_epoch(&data, &wal, true).expect_err("must refuse");
-        assert!(err.contains("ambiguous"), "got: {err}");
-        assert!(err.contains("refusing to start"), "got: {err}");
-        assert!(data.join("2026-01-15").exists(), "nothing is touched");
-    }
-
-    #[test]
-    fn unknown_epoch_refuses_to_start() {
-        let tmp = tempfile::tempdir().unwrap();
-        let data = tmp.path().join("data");
-        std::fs::create_dir_all(&data).unwrap();
-        std::fs::write(data.join(EPOCH_FILE), "4\n").unwrap();
-        let wal = data.join("wal");
-
-        let err = ensure_current_epoch(&data, &wal, true).expect_err("must refuse");
-        assert!(err.contains("unrecognized storage epoch"), "got: {err}");
-    }
-
-    #[test]
-    fn external_wal_dir_is_set_aside_with_the_root() {
-        let tmp = tempfile::tempdir().unwrap();
-        let data = tmp.path().join("data");
-        std::fs::create_dir_all(data.join("2026-01-15")).unwrap();
-        let wal = tmp.path().join("fast-wal");
-        std::fs::create_dir_all(&wal).unwrap();
-        std::fs::write(wal.join("svc_1_aa.ndjson"), b"wal bytes").unwrap();
-
-        let outcome = ensure_current_epoch(&data, &wal, true).unwrap();
-        assert_eq!(
-            outcome,
-            Outcome::LegacySetAside {
-                parquet_files: 0,
-                wal_files: 1,
-                external_wal_set_aside: true,
-            }
-        );
-        assert!(!wal.exists(), "external WAL dir moved aside");
-        assert_eq!(
-            std::fs::read(tmp.path().join("fast-wal.pre-schema-v2/svc_1_aa.ndjson")).unwrap(),
-            b"wal bytes"
-        );
-    }
-
-    #[test]
-    fn flat_external_wal_is_set_aside_even_when_the_root_is_fresh() {
-        // The compactor walks `{wal_dir}/{env}/` only, so a pre-cutover
-        // flat `*.ndjson` left in place would never be compacted, counted
-        // or deleted. A missing data root must not excuse leaving it.
-        let tmp = tempfile::tempdir().unwrap();
-        let data = tmp.path().join("data");
-        let wal = tmp.path().join("fast-wal");
-        std::fs::create_dir_all(&wal).unwrap();
-        std::fs::write(wal.join("svc_1_aa.ndjson"), b"wal bytes").unwrap();
-
-        let outcome = ensure_current_epoch(&data, &wal, true).unwrap();
-        assert_eq!(outcome, Outcome::FreshRoot);
-        assert_eq!(read_marker(&data), CURRENT_EPOCH);
-        assert!(!wal.exists(), "the stranded WAL dir moved aside");
-        assert_eq!(
-            std::fs::read(tmp.path().join("fast-wal.pre-schema-v2/svc_1_aa.ndjson")).unwrap(),
-            b"wal bytes"
-        );
-    }
-
-    #[test]
-    fn flat_external_wal_is_set_aside_when_the_root_is_adopted_in_place() {
-        // The narrow but real trigger: external wal_dir plus a data root
-        // whose first compaction never ran, so it carries no evidence.
-        let tmp = tempfile::tempdir().unwrap();
-        let data = tmp.path().join("data");
-        std::fs::create_dir_all(data.join("lost+found")).unwrap();
-        let wal = tmp.path().join("fast-wal");
-        std::fs::create_dir_all(&wal).unwrap();
-        std::fs::write(wal.join("svc_1_aa.ndjson"), b"wal bytes").unwrap();
-
-        let outcome = ensure_current_epoch(&data, &wal, true).unwrap();
-        assert_eq!(outcome, Outcome::AdoptedInPlace);
-        assert_eq!(read_marker(&data), CURRENT_EPOCH);
-        assert!(
-            !tmp.path().join("data.pre-schema-v2").exists(),
-            "the data root itself is still not renamed"
-        );
-        assert_eq!(
-            std::fs::read(tmp.path().join("fast-wal.pre-schema-v2/svc_1_aa.ndjson")).unwrap(),
-            b"wal bytes"
-        );
-
-        // Idempotent: the next boot is an ordinary current-epoch boot.
-        std::fs::create_dir_all(&wal).unwrap();
-        let second = ensure_current_epoch(&data, &wal, true).unwrap();
-        assert_eq!(
-            second,
-            Outcome::Current {
-                aside_present: false
-            }
-        );
-    }
-
-    #[test]
-    fn an_epoch_2_external_wal_dir_is_left_alone() {
-        // Files under `{wal_dir}/{env}/` are live WAL the compactor can
-        // see: a root that needs no rename must not touch them.
-        let tmp = tempfile::tempdir().unwrap();
-        let data = tmp.path().join("data");
-        let wal = tmp.path().join("fast-wal");
-        let env_wal = wal.join("prod");
-        std::fs::create_dir_all(&env_wal).unwrap();
-        std::fs::write(env_wal.join("svc_1_aa.ndjson"), b"live bytes").unwrap();
-
-        let outcome = ensure_current_epoch(&data, &wal, true).unwrap();
-        assert_eq!(outcome, Outcome::FreshRoot);
-        assert!(
-            !tmp.path().join("fast-wal.pre-schema-v2").exists(),
-            "live epoch-2 WAL is never set aside"
-        );
-        assert_eq!(
-            std::fs::read(env_wal.join("svc_1_aa.ndjson")).unwrap(),
-            b"live bytes"
-        );
-    }
-
-    #[test]
-    fn a_query_only_node_never_moves_the_wal_dir() {
-        // Ingest disabled: this node writes no WAL, so the dir is not its
-        // to move — same rule that defers the data-root cutover.
-        let tmp = tempfile::tempdir().unwrap();
-        let data = tmp.path().join("data");
-        let wal = tmp.path().join("fast-wal");
-        std::fs::create_dir_all(&wal).unwrap();
-        std::fs::write(wal.join("svc_1_aa.ndjson"), b"not ours").unwrap();
-
-        let outcome = ensure_current_epoch(&data, &wal, false).unwrap();
-        assert_eq!(outcome, Outcome::FreshRoot);
-        assert_eq!(
-            std::fs::read(wal.join("svc_1_aa.ndjson")).unwrap(),
-            b"not ours"
-        );
-        assert!(!tmp.path().join("fast-wal.pre-schema-v2").exists());
-    }
-
-    #[test]
-    fn internal_wal_dir_moves_with_the_root() {
-        let tmp = tempfile::tempdir().unwrap();
-        let data = tmp.path().join("data");
-        let wal = data.join("wal");
-        std::fs::create_dir_all(&wal).unwrap();
-        std::fs::write(wal.join("svc_1_aa.ndjson"), b"w").unwrap();
-
-        let outcome = ensure_current_epoch(&data, &wal, true).unwrap();
-        assert_eq!(
-            outcome,
-            Outcome::LegacySetAside {
-                parquet_files: 0,
-                wal_files: 1,
-                external_wal_set_aside: false,
-            }
-        );
-        assert!(
-            tmp.path()
-                .join("data.pre-schema-v2/wal/svc_1_aa.ndjson")
-                .exists(),
-            "internal WAL rides the root rename"
-        );
+    fn dangling_symlinks_are_errors_not_absence() {
+        use std::os::unix::fs::symlink;
+        for location in ["data", "data/EPOCH", "data/export.parquet", "wal"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let data = tmp.path().join("data");
+            let wal = tmp.path().join("wal");
+            let link = tmp.path().join(location);
+            std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+            symlink(tmp.path().join("missing"), &link).unwrap();
+            let err = ensure_current_epoch(&data, &wal, true).unwrap_err();
+            assert!(err.contains("failed to inspect"), "{location}: {err}");
+            assert!(
+                std::fs::symlink_metadata(&link)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert!(!data.join("EPOCH").is_file());
+        }
     }
 }

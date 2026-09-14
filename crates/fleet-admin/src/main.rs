@@ -223,10 +223,12 @@ async fn run() -> Result<(), AdminError> {
         }
         Command::Keys { action } => {
             let pool = connect_pool().await?;
+            fleet_auth::validate_schema(&pool).await?;
             dispatch_keys(KeyStore::from_pool(pool), action).await
         }
         Command::Roles { action } => {
             let pool = connect_pool().await?;
+            fleet_auth::validate_schema(&pool).await?;
             dispatch_roles(KeyStore::from_pool(pool), action).await
         }
     }

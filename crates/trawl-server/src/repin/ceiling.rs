@@ -4,14 +4,9 @@
 
 //! Force ceilings: the numbers a forced repin agreed to (issue #111).
 //!
-//! `--force` used to be a blank check. The operator read a plan, accepted
-//! its losses, and the build then ran against a corpus that ingest keeps
-//! growing: whatever the finished shadow turned out to have lost, force
-//! covered it. This module makes force say a number instead. A forced job
-//! carries a ceiling per dimension — values the new pin cannot read at all
-//! (loss), and numerals 1-7 that read as a different severity in each
-//! dialect (ambiguity) — and the gates refuse the cutover when the finished
-//! rewrite is worse than the plan the operator saw.
+//! A forced repin records ceilings for values the new pin cannot read
+//! (loss) and dialect-ambiguous severity numerals. Both the scan and the
+//! finished rewrite must fit those recorded bounds before cutover.
 //!
 //! Nothing here reads the clock, the corpus or postgres. It is the decision
 //! arithmetic only: what ceiling a scan implies, which ceiling wins when the
@@ -50,51 +45,59 @@ pub struct Ceilings {
     pub max_ambiguous: u64,
 }
 
-/// The force half of a repin decision: the flag, and what it accepted.
-///
-/// `ceilings: None` beside `force: true` is the legacy blank check — a job
-/// row written before the ceiling columns existed, which recorded that force
-/// was passed and nothing about what it covered. Those rows keep the old
-/// behaviour (force clears everything) because there is no honest number to
-/// hold them to; every job created after the migration carries resolved
-/// ceilings.
+/// The force terms of a measured repin plan. Forced plans always have bounds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ForceTerms {
-    /// Whether the request passed force at all.
-    pub force: bool,
-    /// The accepted numbers, when the job has them.
-    pub ceilings: Option<Ceilings>,
+pub enum ForceTerms {
+    /// Any loss requires the operator to accept a forced plan.
+    Unforced,
+    /// Force accepts at most these recorded counts.
+    Forced(Ceilings),
 }
 
 impl ForceTerms {
-    /// No force flag. The ceilings are irrelevant and stay absent: an
-    /// unforced job refuses on any loss at all, so there is nothing to hold.
+    /// An unforced plan.
     #[must_use]
     pub fn unforced() -> Self {
-        Self {
-            force: false,
-            ceilings: None,
-        }
+        Self::Unforced
     }
 
-    /// Force, held to these numbers.
+    /// A forced plan held to recorded bounds.
     #[must_use]
     pub fn forced(ceilings: Ceilings) -> Self {
-        Self {
-            force: true,
-            ceilings: Some(ceilings),
+        Self::Forced(ceilings)
+    }
+
+    /// Bounds recorded by a forced plan; unforced plans have none.
+    #[must_use]
+    pub fn ceilings(self) -> Option<Ceilings> {
+        match self {
+            Self::Unforced => None,
+            Self::Forced(ceilings) => Some(ceilings),
         }
     }
 
-    /// A force flag with no recorded ceilings: the pre-migration blank
-    /// check, for a job row that predates the ceiling columns. The wire
-    /// formatter reaches this for legacy rows; the engine's own gates use it
-    /// only until M3 resolves and threads real ceilings.
-    #[must_use]
-    pub fn blank_check(force: bool) -> Self {
-        Self {
-            force,
-            ceilings: None,
+    /// Decode the persisted plan state without inventing accepted bounds.
+    /// An unfinished scan has no terms, regardless of the requested force flag.
+    pub(crate) fn from_record(
+        force: bool,
+        planned: bool,
+        max_nulled: Option<i64>,
+        max_ambiguous: Option<i64>,
+    ) -> Result<Option<Self>, &'static str> {
+        match (force, planned, max_nulled, max_ambiguous) {
+            (_, false, None, None) => Ok(None),
+            (false, true, None, None) => Ok(Some(Self::Unforced)),
+            (true, true, Some(nulled), Some(ambiguous)) => {
+                let max_nulled =
+                    u64::try_from(nulled).map_err(|_| "negative accepted nulled ceiling")?;
+                let max_ambiguous =
+                    u64::try_from(ambiguous).map_err(|_| "negative accepted ambiguity ceiling")?;
+                Ok(Some(Self::Forced(Ceilings {
+                    max_nulled,
+                    max_ambiguous,
+                })))
+            }
+            _ => Err("repin force bounds do not match its recorded plan state"),
         }
     }
 }
@@ -259,6 +262,47 @@ pub fn exceeds(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recorded_force_terms_distinguish_unplanned_and_bounded_plans() {
+        for force in [false, true] {
+            assert_eq!(ForceTerms::from_record(force, false, None, None), Ok(None));
+        }
+        assert_eq!(
+            ForceTerms::from_record(false, true, None, None),
+            Ok(Some(ForceTerms::Unforced))
+        );
+        assert_eq!(
+            ForceTerms::from_record(true, true, Some(0), Some(10)),
+            Ok(Some(ForceTerms::Forced(Ceilings {
+                max_nulled: 0,
+                max_ambiguous: 10
+            })))
+        );
+    }
+
+    #[test]
+    fn recorded_force_terms_reject_every_inconsistent_shape() {
+        for force in [false, true] {
+            for planned in [false, true] {
+                for nulled in [None, Some(-1), Some(0)] {
+                    for ambiguous in [None, Some(-1), Some(0)] {
+                        let valid = matches!(
+                            (force, planned, nulled, ambiguous),
+                            (_, false, None, None)
+                                | (false, true, None, None)
+                                | (true, true, Some(0), Some(0))
+                        );
+                        assert_eq!(
+                            ForceTerms::from_record(force, planned, nulled, ambiguous).is_ok(),
+                            valid,
+                            "force={force}, planned={planned}, nulled={nulled:?}, ambiguous={ambiguous:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     /// The scan-derived ceiling is 10% headroom with a floor of 10 rows,
     /// computed in integers. The crossover at 100/101 is the case worth

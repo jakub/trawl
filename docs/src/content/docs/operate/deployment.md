@@ -161,7 +161,7 @@ cluster.
            - path: /
              pathType: Prefix
      tls:
-       - secretName: trawl-tls
+       - secretName: trawl-browser-tls
          hosts:
            - trawl.example.com
    persistence:
@@ -173,6 +173,19 @@ cluster.
    `https://trawl.trawl.svc.cluster.local:5514`, or outside through a second
    ingress with `ingress.backend: trawld`. The [chart README](https://github.com/jakub/trawl/blob/main/chart/trawl/README.md)
    lists every value.
+
+   Before installation, supply the browser ingress Secret named
+   `trawl-browser-tls` in namespace `trawl`, with a certificate for
+   `trawl.example.com`. Your ingress controller can manage it, or create it
+   from your certificate files:
+
+   ```bash
+   kubectl -n trawl create secret tls trawl-browser-tls \
+     --cert=browser.crt --key=browser.key
+   ```
+
+   Choose the daemon API certificate separately using the section below.
+   The default API certificate is self-signed.
 
 3. Install:
 
@@ -196,6 +209,135 @@ cluster.
    `kubectl -n trawl port-forward svc/trawl 5514:5514` if port 5514 is not
    published.
 
+### Configure the daemon API certificate
+
+The chart defaults to `tls.mode: auto`, which lets trawld generate a self-signed
+certificate. To use a certificate trusted by API clients and collectors, add
+one of the following `tls` blocks to `trawl-values.yaml` before installation.
+These settings require structured chart config values. They cannot be combined
+with `config.raw`, because Helm cannot verify arbitrary TOML TLS paths against
+its Secret mounts.
+
+#### Mount an existing TLS Secret
+
+Obtain a certificate and matching private key for the DNS names or IP addresses
+clients use. Create a TLS Secret in the release namespace:
+
+```bash
+kubectl -n trawl create secret tls trawl-api-tls --cert=api.crt --key=api.key
+```
+
+```yaml
+tls:
+  mode: secret
+  secretName: trawl-api-tls
+```
+
+The chart mounts its `tls.crt` and `tls.key` at `/etc/trawl/tls/` and sets the
+daemon's certificate paths to those files. The chart does not replace or
+populate this Secret.
+
+#### Request a certificate through cert-manager
+
+Your cluster must already have cert-manager and an issuer that can issue the
+requested names. This chart creates neither. The example below uses an
+existing private `ClusterIssuer` named `homelab-ca`. Its policy must permit the
+external API name and the internal Service name. Public ACME issuers generally
+cannot issue certificates for internal cluster DNS names.
+
+```yaml
+tls:
+  mode: certManager
+  certManager:
+    issuerRef:
+      name: homelab-ca
+      kind: ClusterIssuer
+      group: cert-manager.io
+    dnsNames:
+      - api.example.com
+      - trawl.trawl.svc.cluster.local
+```
+
+Replace the issuer and DNS names with yours. An `Issuer` must exist in the
+release namespace; a `ClusterIssuer` is cluster-scoped. There is no
+`issuerRef.namespace` setting. Use `tls.mode: secret` for certificates with IP
+address SANs. DNS wildcards cover one label: `*.example.com` covers
+`api.example.com`, but not `example.com` or `deep.api.example.com`.
+
+For release `trawl`, the chart creates Certificate `trawl-tls` in namespace
+`trawl`. cert-manager creates and renews Secret `trawl-tls`; the daemon mounts
+its `tls.crt` and `tls.key`. Do not use that Secret name for database credentials
+or browser cookies. After the Helm install, wait for issuance:
+
+```bash
+kubectl -n trawl wait certificate/trawl-tls --for=condition=Ready --timeout=120s
+kubectl -n trawl describe certificate trawl-tls
+kubectl -n trawl rollout status statefulset/trawl
+```
+
+A pending Certificate requires investigation of the issuer or its issuance
+policy. The pod cannot start until its TLS Secret exists. The chart checks that
+requested DNS names cover configured API ingress and HTTPRoute hosts. It does
+not publish those names, configure DNS, or install the issuer's CA on clients.
+The [cert-manager Certificate documentation](https://cert-manager.io/docs/usage/certificate/)
+explains issuance and renewal.
+
+#### Verify the requested name and trust
+
+Obtain the CA certificate from your issuer administrator. With the API
+port-forward running, verify the certificate using a requested DNS name:
+
+```bash
+kubectl -n trawl port-forward svc/trawl 5514:5514
+```
+
+In another terminal:
+
+```bash
+curl --fail-with-body --cacert ca.crt \
+  --resolve api.example.com:5514:127.0.0.1 \
+  https://api.example.com:5514/api/v1/health
+```
+
+For a certificate already trusted by the operating system, omit `--cacert`.
+The browser ingress certificate remains configured through `ingress.tls`.
+The browser sidecar keeps its existing HTTPS connection to the daemon over
+pod loopback with verification disabled; external clients must verify the
+certificate normally. Mounted certificate changes are reloaded at
+`config.server.tlsReloadIntervalSecs`, which defaults to 300 seconds.
+
+### Use a local browser
+
+For a local trial through a port-forward, replace the `web` and `ingress`
+sections in `trawl-values.yaml` above with these values. Keep the database
+Secrets and persistence settings:
+
+```yaml
+web:
+  enabled: true
+  publicOrigins:
+    - http://localhost:8090
+  allowInsecureCookies: true
+ingress:
+  enabled: false
+```
+
+Apply the values with the `helm upgrade --install` command above and wait for
+the StatefulSet rollout. Then keep this command running:
+
+```bash
+kubectl port-forward --namespace trawl svc/trawl 5514:5514 8090:8090
+```
+
+Open `http://localhost:8090` on the machine running the port-forward and sign
+in with a personal API key from [Create roles and keys](/operate/access/#create-roles-and-keys).
+Use `localhost` as written: `http://127.0.0.1:8090` is a different browser
+origin. Port 5514 serves the HTTPS API; port 8090 serves the browser.
+
+When you switch to an HTTPS ingress, set `web.publicOrigins` to its HTTPS
+origin, restore the ingress values, and set `web.allowInsecureCookies: false`.
+See [Set the browser origin](/operate/access/#set-the-browser-origin).
+
 ## Install from a tarball
 
 The [release tarball](/getting-started/) holds the five executables and
@@ -213,6 +355,27 @@ nothing else. You supply what the package supplies:
   as `trawl` and `trawl-web --config /etc/trawl/trawld.toml` as `trawl-web`.
   Start from the packaged units in
   [`crates/trawl-server/debian/`](https://github.com/jakub/trawl/tree/main/crates/trawl-server/debian).
+
+## Use a current storage root
+
+An ingesting daemon initializes a missing or empty data directory with
+`EPOCH` set to `3`. A nonempty owned directory must already carry that marker.
+If the marker names another format, restore a complete epoch-3 backup or
+configure new empty data and WAL directories. Do not change the marker to
+relabel existing files. Startup does not convert, rename, or import an older
+root or its scheduled report results.
+
+Current WAL batches live under environment directories. A batch directly
+under the configured WAL directory causes startup to refuse before storage
+recovery. Keep the files intact and select an empty WAL directory or restore
+WAL from a complete current backup.
+
+With ingestion disabled, the daemon can also read a generic unversioned
+Parquet archive without changing its storage markers. That archive must not
+contain Trawl ownership entries such as `wal`, `CATALOG`, `REPIN`, `scheduled`,
+or top-level date partitions. An explicit noncurrent `EPOCH` still refuses.
+For standalone exports or files from other tools, you can also
+[query local Parquet](/start/local-parquet/) without running a daemon.
 
 ## Verify the installation
 

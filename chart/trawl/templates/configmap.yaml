@@ -26,11 +26,7 @@ data:
     {{- if .Values.config.server.corsAllowedOrigins }}
     cors_allowed_origins = [{{ range $i, $o := .Values.config.server.corsAllowedOrigins }}{{ if $i }}, {{ end }}{{ $o | quote }}{{ end }}]
     {{- end }}
-    {{- if eq .Values.tls.mode "secret" }}
-    tls_cert_path = "/etc/trawl/tls/tls.crt"
-    tls_key_path = "/etc/trawl/tls/tls.key"
-    tls_reload_interval_secs = {{ .Values.config.server.tlsReloadIntervalSecs | int }}
-    {{- else if eq .Values.tls.mode "certManager" }}
+    {{- if ne .Values.tls.mode "auto" }}
     tls_cert_path = "/etc/trawl/tls/tls.crt"
     tls_key_path = "/etc/trawl/tls/tls.key"
     tls_reload_interval_secs = {{ .Values.config.server.tlsReloadIntervalSecs | int }}

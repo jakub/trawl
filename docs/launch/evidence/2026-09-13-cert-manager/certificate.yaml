@@ -1,0 +1,20 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  labels:
+    app.kubernetes.io/instance: l06
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: trawl
+    app.kubernetes.io/version: 0.1.18
+    helm.sh/chart: trawl-0.1.0
+  name: l06-trawl-tls
+  namespace: l06-cert-manager
+spec:
+  dnsNames:
+  - l06-trawl.l06-cert-manager.svc
+  - trawl.l06.example.test
+  issuerRef:
+    group: cert-manager.io
+    kind: Issuer
+    name: l06-selfsigned
+  secretName: l06-trawl-tls

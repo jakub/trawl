@@ -69,13 +69,10 @@ If free space stays below the threshold:
 1. Read `trawl_retention_suppressed` on `/metrics`. A value of 1 means a repin
    marker or staging directory is pausing retention. Follow
    [Clear suppressed retention](#clear-suppressed-retention).
-2. Search the journal for `retention_disk_pressure_suppressed`. Its
-   `set_aside_path` names a directory beside `data/` that trawld set aside
-   when it found data in an older format. That directory uses space, is never
-   a deletion candidate, and is never deleted by trawld. Back it up if you
-   need it, then remove it by hand. Disk-pressure deletion resumes on the next
-   tick. Age-based deletion keeps running meanwhile.
-3. Compare the threshold with the filesystem: `df -h /var/lib/trawl`.
+2. Compare the threshold with the filesystem: `df -h /var/lib/trawl`.
+   Files outside the active data root consume space but are not retention
+   candidates. Inspect those files separately if deleting expired partitions
+   does not restore enough free space.
 
 ## Clear suppressed retention
 

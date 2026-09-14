@@ -52,7 +52,28 @@ with the application. Test Helm examples with every documented value. Use the
 which revision and scenario you checked.
 
 The Docs workflow builds and checks every pull request that touches `docs/` or
-`crates/trawl-core/src/ast.rs`. It deploys from `main` only.
+`crates/trawl-core/src/ast.rs`. Main and pull-request builds produce development
+artifacts for review; they do not replace the stable manual.
+
+## Documentation and release scope
+
+The release workflow builds the stable manual from the same resolved product
+commit as the binaries, image, chart, and examples. Its release-tag banner links
+to the matching release. `/release.json` records the product commit, workflow
+commit, release tag, and channel. The site is deployed only after release
+publication succeeds, preserving the APT repository and crash symbols.
+
+Main and pull-request builds use `TRAWL_DOCS_DEVELOPMENT=1` to identify the
+development manual. Their `documentation-site` workflow artifacts can contain
+changes absent from the stable release. They are not deployed to the stable
+site. Local previews use `TRAWL_DOCS_PREVIEW=1` for an unpublished-preview banner.
+Release builds use `TRAWL_DOCS_RELEASE_TAG` and leave the development flag unset.
+
+Keep unpublished launch notes and pending support decisions under `docs/launch/`,
+outside the site's content collection. The repository's `CHANGELOG.md` links to
+the draft initial-release notes and the preserved pre-1.0 journal. The historical
+journal records intermediate changes and does not define current installation
+or upgrade requirements.
 
 ## Put each fact in one place
 

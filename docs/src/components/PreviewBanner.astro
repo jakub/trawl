@@ -1,9 +1,15 @@
 ---
 import Banner from '@astrojs/starlight/components/Banner.astro';
 const preview = import.meta.env.TRAWL_DOCS_PREVIEW === '1';
+const development = import.meta.env.TRAWL_DOCS_DEVELOPMENT === '1';
+const releaseTag = import.meta.env.TRAWL_DOCS_RELEASE_TAG || '';
 ---
 
-{preview ? <aside class="preview-banner">Local documentation preview. Changes here have not been published.</aside> : <Banner />}
+{preview ? <aside class="preview-banner">Local documentation preview. Changes here have not been published.</aside> : <>
+  {development && <aside class="preview-banner">Development manual for main. Downloaded releases can differ. <a href="/contribute/documentation/#documentation-and-release-scope">Documentation scope</a>.</aside>}
+  {releaseTag && !development && <aside class="preview-banner">Manual for <a href={`https://github.com/jakub/trawl/releases/tag/${releaseTag}`}>Trawl {releaseTag}</a>. <a href="/release.json">Build identity</a>.</aside>}
+  <Banner />
+</>}
 
 <style>
   .preview-banner {

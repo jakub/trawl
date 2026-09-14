@@ -291,7 +291,6 @@ mod tests {
         let config = RateLimitConfig {
             default_rpm: 1,
             ingest_rpm: 5,
-            ..RateLimitConfig::default()
         };
         let interactive = RateLimitState::interactive(&config);
         let ingest = RateLimitState::ingest(&config, &interactive);
@@ -322,7 +321,6 @@ mod tests {
         let config = RateLimitConfig {
             default_rpm: 1,
             ingest_rpm: 100,
-            ..RateLimitConfig::default()
         };
         let interactive = RateLimitState::interactive(&config);
         let ingest = RateLimitState::ingest(&config, &interactive);
@@ -348,7 +346,6 @@ mod tests {
         let config = RateLimitConfig {
             default_rpm: 1,
             ingest_rpm: 5,
-            ..RateLimitConfig::default()
         };
         let interactive = RateLimitState::interactive(&config);
         let ingest = RateLimitState::ingest(&config, &interactive);

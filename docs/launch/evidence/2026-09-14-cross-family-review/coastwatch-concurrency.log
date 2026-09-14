@@ -1,0 +1,53 @@
+────────────
+ Nextest run ID f3105fbf-f2aa-492e-a6f2-ef7824a5e50e with nextest profile: default
+    Starting 4 tests across 1 binary
+        PASS [   0.286s] (1/4) coastwatch-web::fleet_schema fixture_cleans_up_after_a_panicking_test
+        PASS [   0.311s] (2/4) coastwatch-web::fleet_schema nonempty_untracked_database_is_refused_without_ledger
+        PASS [   0.311s] (3/4) coastwatch-web::fleet_schema old_history_is_refused_without_mutation_in_both_modes
+        PASS [   0.311s] (4/4) coastwatch-web::fleet_schema fresh_requires_opt_in_then_reopens_without_migration
+────────────
+     Summary [   0.312s] 4 tests run: 4 passed, 0 skipped
+
+────────────
+ Nextest run ID cf6da1af-95b3-41e0-8afa-947e8a8afc36 with nextest profile: default
+    Starting 4 tests across 1 binary
+        PASS [   0.316s] (1/4) coastwatch-web::fleet_schema old_history_is_refused_without_mutation_in_both_modes
+        PASS [   0.317s] (2/4) coastwatch-web::fleet_schema nonempty_untracked_database_is_refused_without_ledger
+        PASS [   0.318s] (3/4) coastwatch-web::fleet_schema fresh_requires_opt_in_then_reopens_without_migration
+        PASS [   0.327s] (4/4) coastwatch-web::fleet_schema fixture_cleans_up_after_a_panicking_test
+────────────
+     Summary [   0.327s] 4 tests run: 4 passed, 0 skipped
+
+CONCURRENCY: both invocations held connections to their owned Fleet databases at once; eight tests passed; no fixture databases remain; base database unchanged.
+
+warning: unused config key `resolver.incompatible-publish-age` in `/home/jakub/.cargo/config.toml`
+warning: unused config key `resolver.incompatible-publish-age` in `/home/jakub/.cargo/config.toml`
+   Compiling coastwatch-web v0.1.0 (/home/jakub/code/trawl/.flow-worktrees/launch-consumer-fixes/coastwatch/crates/web)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.37s
+────────────
+ Nextest run ID ef4c1f60-aaf5-4a20-b40a-6bb86fdb0437 with nextest profile: default
+    Starting 6 tests across 1 binary
+        PASS [   0.680s] (1/6) coastwatch-web::build_with_spa_role_gate valid_operator_cookie_cannot_upload_from_an_unapproved_origin
+        PASS [   0.687s] (2/6) coastwatch-web::build_with_spa_role_gate analyst_cookie_clears_upload_gate_on_post_documents
+        PASS [   0.689s] (3/6) coastwatch-web::build_with_spa_role_gate uploads_route_is_session_guarded_not_upload_gated
+        PASS [   0.706s] (4/6) coastwatch-web::build_with_spa_role_gate operator_cookie_clears_upload_gate_on_post_documents
+        PASS [   0.793s] (5/6) coastwatch-web::build_with_spa_role_gate siem_cookie_is_403_on_post_documents
+        PASS [   0.803s] (6/6) coastwatch-web::build_with_spa_role_gate session_origin_policy_checks_safe_methods_and_preserves_missing_origin
+────────────
+     Summary [   0.803s] 6 tests run: 6 passed, 0 skipped
+
+{
+  "schema_invocations": [
+    0,
+    0
+  ],
+  "schema_tests": 8,
+  "overlap_samples": 5,
+  "unique_created_databases": 8,
+  "cleanup_matched": true,
+  "base_database_unchanged": true,
+  "origin_exit_code": 0,
+  "postgres_image": "pgvector/pgvector:pg18",
+  "app_migration_files": 64
+}
+Owned PostgreSQL container and anonymous volumes removed.

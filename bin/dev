@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Thin compatibility wrapper for the Trawl-owned Fleet development controller.
+# Contributor entrypoint for the Trawl-owned Fleet development controller.
 #
-# Frozen legacy translations:
+# Supported invocations:
 #   bin/dev                    -> fleet-dev dev trawl --app-root <trawl-root>
 #   bin/dev --with-coastwatch  -> fleet-dev all
 #   bin/dev --tailscale        -> add --exposure tailscale

@@ -729,8 +729,8 @@ impl RepinEngine {
                     unmapped_samples: samples,
                     field_last_seen: liveness.as_ref().map(|(at, _)| *at),
                     field_last_service: liveness.map(|(_, service)| service),
-                    accepted_max_nulled_rows: terms.ceilings.map(|c| clamp(c.max_nulled)),
-                    accepted_max_ambiguous_rows: terms.ceilings.map(|c| clamp(c.max_ambiguous)),
+                    accepted_max_nulled_rows: terms.ceilings().map(|c| clamp(c.max_nulled)),
+                    accepted_max_ambiguous_rows: terms.ceilings().map(|c| clamp(c.max_ambiguous)),
                 },
             )
             .await
@@ -1513,7 +1513,7 @@ impl RepinEngine {
             // force there is a plan to re-read; with it there is a number to
             // raise, and telling them to "pass force" when they already did
             // would be advice they have taken.
-            let remedy = if terms.force.force {
+            let remedy = if matches!(terms.force, ForceTerms::Forced(_)) {
                 "re-run the dry run for the current plan and force it with \
                  ceilings that cover it"
             } else {
@@ -1572,7 +1572,7 @@ impl RepinEngine {
         // actually did, so the pair an operator agreed to is legible after
         // the fact without reading a job row that later columns overwrite.
         // Counts only — no sample values, no free text.
-        if terms.force.force {
+        if let ForceTerms::Forced(ceilings) = terms.force {
             tracing::info!(
                 event_type = "repin_force_accepted",
                 job_id,
@@ -1580,8 +1580,8 @@ impl RepinEngine {
                 from = from.as_catalog(),
                 to = to.as_catalog(),
                 dialect = reading.written.raw.token(),
-                accepted_max_nulled_rows = terms.force.ceilings.map(|c| c.max_nulled),
-                accepted_max_ambiguous_rows = terms.force.ceilings.map(|c| c.max_ambiguous),
+                accepted_max_nulled_rows = ceilings.max_nulled,
+                accepted_max_ambiguous_rows = ceilings.max_ambiguous,
                 rows_nulled = totals.nulled,
                 ambiguous_numerals = totals.ambiguous,
                 scanned_projected_nulls = terms.scanned.nulled,
@@ -2085,12 +2085,8 @@ fn run_pass_blocking(
 /// The count is taken whatever the dialect, since the report says what is
 /// there; only the gate is conditional.
 ///
-/// Force is not a blank check (#111): `terms` carries the flag and the
-/// numbers it accepted, so a forced job is still refused when the finished
-/// rewrite is worse than the plan the operator read. A forced job with no
-/// ceilings is a row written before those numbers were persisted, and keeps
-/// the old blank-check behaviour, because there is no honest bound to hold
-/// it to.
+/// A forced plan always carries recorded bounds. Both gates refuse counts
+/// above those bounds; an unforced plan retains the loss rules above.
 pub(crate) fn force_refusal(
     pin: CanonicalType,
     dialect: Option<trawl_core::severity::Dialect>,
@@ -2098,10 +2094,8 @@ pub(crate) fn force_refusal(
     ambiguous: u64,
     terms: ForceTerms,
 ) -> Option<String> {
-    if terms.force {
-        return terms
-            .ceilings
-            .and_then(|c| ceiling::exceeds(pin, dialect, c, nulled, ambiguous))
+    if let ForceTerms::Forced(ceilings) = terms {
+        return ceiling::exceeds(pin, dialect, ceilings, nulled, ambiguous)
             .map(|over| over.to_string());
     }
     if nulled > 0 {
@@ -2357,17 +2351,17 @@ mod tests {
         const SEVERITY: CanonicalType = CanonicalType::Severity;
         const VARCHAR: CanonicalType = CanonicalType::Varchar;
         let unforced = ForceTerms::unforced();
-        let blank_check = ForceTerms {
-            force: true,
-            ceilings: None,
-        };
+        let bounded = ForceTerms::forced(ceiling::Ceilings {
+            max_nulled: 3,
+            max_ambiguous: 2,
+        });
 
         // Loss: any target, any dialect, cleared only by force.
         assert!(
             force_refusal(VARCHAR, None, 3, 0, unforced)
                 .is_some_and(|m| m.contains("cannot be read as VARCHAR")),
         );
-        assert_eq!(force_refusal(VARCHAR, None, 3, 0, blank_check), None);
+        assert_eq!(force_refusal(VARCHAR, None, 3, 0, bounded), None);
         assert!(force_refusal(SEVERITY, Some(Dialect::Syslog), 3, 0, unforced).is_some());
 
         // Ambiguity: refused under OTel, silent under an explicit syslog
@@ -2382,7 +2376,7 @@ mod tests {
             "asserting syslog IS the answer to the ambiguity"
         );
         assert_eq!(
-            force_refusal(SEVERITY, Some(Dialect::Otel), 0, 2, blank_check),
+            force_refusal(SEVERITY, Some(Dialect::Otel), 0, 2, bounded),
             None
         );
         // A row with no recorded dialect at all reads as the OTel default:
@@ -2406,9 +2400,8 @@ mod tests {
 
     /// Force with ceilings is force held to a number (#111): the same one
     /// function decides, so the scan gate, the finished-shadow gate and the
-    /// wire all report the overrun in the same sentence. Ceiling-less force
-    /// stays the pre-migration blank check, and the syslog exemption carries
-    /// into the ceiling arm through the shared `ambiguity_binds` predicate.
+    /// wire all report the overrun in the same sentence. The syslog exemption
+    /// carries into the ceiling arm through `ambiguity_binds`.
     #[test]
     fn a_forced_job_is_held_to_the_ceilings_it_accepted() {
         use crate::repin::ceiling::Ceilings;
@@ -2438,17 +2431,6 @@ mod tests {
         assert!(force_refusal(SEVERITY, Some(Dialect::Otel), 0, 3, terms).is_some());
         assert_eq!(
             force_refusal(SEVERITY, Some(Dialect::Syslog), 0, 3, terms),
-            None
-        );
-
-        // Without ceilings, force covers everything — the shape of a job row
-        // written before the ceilings were persisted.
-        let blank_check = ForceTerms {
-            force: true,
-            ceilings: None,
-        };
-        assert_eq!(
-            force_refusal(SEVERITY, Some(Dialect::Otel), 9_999, 9_999, blank_check),
             None
         );
     }

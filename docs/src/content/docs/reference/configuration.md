@@ -11,6 +11,28 @@ description: Every trawld and trawl client configuration key, with its type, def
 trawld --config /etc/trawl/trawld.toml
 ```
 
+### Validate without starting the daemon
+
+```bash
+trawld --check-config --config /etc/trawl/trawld.toml
+```
+
+Check mode requires an explicit `--config` path or `TRAWL_CONFIG`. It checks
+TOML syntax, supported setting names and types, config constraints, ingest
+derivation settings, and the presence of both database URLs. It exits with
+code 0 for valid configuration or a nonzero code for an error.
+
+Check mode does not connect to databases, bind listeners, generate keys or
+certificates, start crash capture, or write data and log files. It does not
+verify database credentials, network reachability, certificate contents, or
+filesystem permissions. Environment overrides apply as they do at startup.
+
+All typed sections reject unknown settings, including nested sections.
+Dynamic tables such as `retention.env.<name>` and `syslog.source_service_map`
+accept operator-defined names; each retention entry still requires supported
+fields. Error messages identify the setting path without printing its value
+or the surrounding configuration text.
+
 ### Server environment variables
 
 | Variable | Description |
@@ -42,7 +64,7 @@ The HTTPS listener, query limits, TLS, and logging.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `http_addr` | string | `"127.0.0.1:8080"` | HTTPS listen address |
+| `http_addr` | string | `"127.0.0.1:5514"` | HTTPS listen address |
 | `timeout_secs` | integer | `30` | Absolute query deadline in seconds, counted from authentication and including queue waits |
 | `max_concurrent_queries` | integer | *(CPU count)* | DuckDB executor pool size. Must be greater than 0 |
 | `max_result_rows` | integer | `100000` | Rows a query may return before trawld rejects it |
@@ -50,7 +72,7 @@ The HTTPS listener, query limits, TLS, and logging.
 | `max_request_body_bytes` | byte size | `"128K"` | Request body limit on every route except ingest |
 | `max_concurrent_requests` | integer | `256` | Concurrent HTTP requests. Past it trawld answers 503 |
 | `shutdown_drain_secs` | integer | `30` | Graceful shutdown budget for in-flight requests |
-| `log_file` | path | *(none)* | JSON log file. Opened only when `[ingest] internal_telemetry` is false |
+| `log_file` | path | *(none)* | JSON log file. Opened when `[ingest] enabled` or `internal_telemetry` is false. When both are true, server events use the ingest pipeline and this path is not opened. File logging starts after database and storage admission; earlier JSON events go to stderr. Must not name or alias the data root's `EPOCH`, `CATALOG`, or `REPIN` marker |
 | `tls_cert_path` | path | *(generated)* | PEM certificate |
 | `tls_key_path` | path | *(generated)* | PEM private key |
 | `tls_reload_interval_secs` | integer | `300` | How often trawld polls the certificate files for changes. `0` disables reloading |
@@ -97,11 +119,30 @@ source paths, and result samples, so keep the file in a private directory.
 trawld refuses a symlink at the configured path. See
 [enable, inspect, and remove the debug log](/operate/health/#enable-the-query-debug-log).
 
+### Helm TLS selection
+
+The chart's `tls.mode` selects `auto` for a daemon-generated self-signed
+certificate, `secret` for the existing `tls.secretName`, or `certManager` to
+create a Certificate and mount its generated Secret. cert-manager mode requires
+`tls.certManager.issuerRef.name` and `tls.certManager.dnsNames`; issuer kind
+defaults to `ClusterIssuer` and group to `cert-manager.io`. Namespaced `Issuer`
+resources must be in the release namespace.
+
+Both Secret modes mount `tls.crt` and `tls.key` at `/etc/trawl/tls/` and set the
+daemon paths accordingly. They require structured config values;
+`config.raw` is supported only with `tls.mode: auto`, without chart-managed
+TLS Secret mounts. See [configure the daemon API certificate](/operate/deployment/#configure-the-daemon-api-certificate)
+for complete setup and verification instructions. Browser-ingress TLS remains
+a separate setting under `ingress.tls`.
+
 ### `[data]`
+
+The daemon owns a directory tree. For local file or glob selection, use the
+CLI's `trawl query --data` option instead.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `path` | string | *(required)* | Parquet data directory. Accepts a bare directory or a glob. Glob characters derive the base directory |
+| `path` | string | *(required)* | Parquet data directory. Glob metacharacters (`*`, `?`, `[`) are not accepted |
 
 Notes:
 

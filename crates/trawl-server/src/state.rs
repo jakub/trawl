@@ -97,8 +97,7 @@ pub struct QueryState {
     /// indexed by whether the retention window applied, because there are
     /// exactly two unscoped request shapes (`?all=true` lifts the window) and
     /// each entry must survive requests of the other shape: this cache is
-    /// the only bound on the whole-table aggregate behind it (migration
-    /// 0003), so one shared slot would let alternating `/schema` and
+    /// the only bound on the whole-table aggregate behind it, so one shared slot would let alternating `/schema` and
     /// `/schema?all=true` traffic evict each other into a 100% miss rate,
     /// every miss running the aggregate while holding the mutex.
     pub schema_columns_cache: Arc<tokio::sync::Mutex<[Option<CachedSchemaColumns>; 2]>>,
@@ -409,7 +408,7 @@ pub struct CachedCorpusFacts {
 /// Only the unscoped listing is cached. `?service=` is client-chosen and
 /// unbounded, so keying a map on it would be an unbounded cache — and the
 /// scoped listing is already bounded by the pin cap through the
-/// `field_services (service, field)` index (migration 0003), while the
+/// `field_services (service, field)` index, while the
 /// unscoped one aggregates every service's observations and is what the
 /// autocomplete polls. The windowed/unwindowed shape lives in which slot
 /// of `schema_columns_cache` holds the entry, not in the entry itself.
@@ -575,12 +574,26 @@ async fn build_storage_state(config: &Config) -> Result<StorageState, crate::err
             }
             other => crate::error::ServerError::ServiceUnavailable(format!(
                 "trawl app-state database unreachable at startup (is postgres up and the \
-                 [storage] database provisioned? see the fleet-auth cutover runbook): {other}"
+                 [storage] database provisioned? Check [storage] database_url or TRAWL_DATABASE_URL): {other}"
             )),
         })
 }
 
 impl AppState {
+    /// Admit both databases without constructing corpus readers or writers.
+    ///
+    /// Fleet validation is read-only. Trawl takes its sole-writer lock before
+    /// schema admission and migration. Keep the returned storage owner alive
+    /// through filesystem recovery and store reconciliation, then pass these
+    /// same backends to [`Self::from_parts`].
+    pub async fn connect_backends(
+        config: &Config,
+    ) -> Result<(AuthState, StorageState), crate::error::ServerError> {
+        let auth = build_auth_state(config).await?;
+        let storage = build_storage_state(config).await?;
+        Ok((auth, storage))
+    }
+
     /// Construct app state from a validated [`Config`].
     ///
     /// Connects to the fleet-auth Postgres keystore and the trawl app-state
@@ -592,8 +605,7 @@ impl AppState {
         metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
         derivation: Arc<crate::ingest::producer::Derivation>,
     ) -> Result<(Self, HttpConfig), crate::error::ServerError> {
-        let auth = build_auth_state(config).await?;
-        let storage = build_storage_state(config).await?;
+        let (auth, storage) = Self::connect_backends(config).await?;
 
         Self::from_parts(config, metrics_handle, derivation, auth, storage).await
     }

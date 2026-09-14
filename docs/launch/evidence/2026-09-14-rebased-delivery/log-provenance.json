@@ -1,0 +1,57 @@
+{
+  "trawl-prepush-initial.log": {
+    "original_sha256": "8f14b65b8c2febd9746f1bdba2c2208431336cb60b16e7c95a1a197ea582c1d1",
+    "stored_sha256": "1b73cb8b0450c1d383b92c01d87243eb01e944613974be89c13bd05d5afc89ba",
+    "transformation": "remove ANSI control sequences and trailing whitespace"
+  },
+  "trawl-prepush-passed.log": {
+    "original_sha256": "844b122df0f5b499bae96bdd6ea0a59354594dd4983fbc067944f3edce58605d",
+    "stored_sha256": "a377f7c30e78d2a1f2838c04917951a327a54a0dbabc0d3b07aeea6675a57f43",
+    "transformation": "remove ANSI control sequences and trailing whitespace"
+  },
+  "provenance-reproduction.log": {
+    "original_sha256": "f0fabb745a442ee639d301b6106a29970592fac68639d1f3c30606312578f6df",
+    "stored_sha256": "f0fabb745a442ee639d301b6106a29970592fac68639d1f3c30606312578f6df",
+    "transformation": "remove ANSI control sequences and trailing whitespace"
+  },
+  "provenance-isolated.log": {
+    "original_sha256": "185a486b13d5fd26d93bcd0e1aa923279f8f4564800d83b95430dd9d63724efc",
+    "stored_sha256": "bf7178196e6c3da5f3527be8e0bbd8ac7a6f407383c6594ce1b31b2018d77254",
+    "transformation": "remove ANSI control sequences and trailing whitespace"
+  },
+  "browser-initial.log": {
+    "original_sha256": "4cc816f72a344d5b76b31b9466c3cbdbfb78f2964c7c199fa07cc6c2d399b862",
+    "stored_sha256": "d36f2fb7ca86f3035c436bdacf277f15e77efa79f9a5bcfafdc15ea8ceebddd6",
+    "transformation": "remove ANSI control sequences and trailing whitespace"
+  },
+  "browser-passed.log": {
+    "original_sha256": "e952108eeef51edc5b7b0a0e4cbda964e406d1eb316f1801998a88e42f3db11e",
+    "stored_sha256": "e952108eeef51edc5b7b0a0e4cbda964e406d1eb316f1801998a88e42f3db11e",
+    "transformation": "remove ANSI control sequences and trailing whitespace"
+  },
+  "spa-build.log": {
+    "original_sha256": "29730dd5e303783f1b826b6e123d5ccf465a9edc1241bf87342f1b0c6280333f",
+    "stored_sha256": "29730dd5e303783f1b826b6e123d5ccf465a9edc1241bf87342f1b0c6280333f",
+    "transformation": "remove ANSI control sequences and trailing whitespace"
+  },
+  "coastwatch-prepush-initial.log": {
+    "original_sha256": "643ef71db8ade886c09e2077b39a396be009234406f7bd39731e4c231d1eb1c5",
+    "stored_sha256": "46a28fe7d393922b95820daf5890c1a39a24eec2a41ee354f7f4f1522123190b",
+    "transformation": "remove ANSI control sequences and trailing whitespace"
+  },
+  "coastwatch-prepush-passed.log": {
+    "original_sha256": "01990d38f952fd001f18d877200fe8a6e45de2ae81c8d435b27d9ef935e5de5b",
+    "stored_sha256": "dd76899e39b84c015db30f2d034f0de56a3402f155fd80b505c2053211f114d6",
+    "transformation": "remove ANSI control sequences and trailing whitespace"
+  },
+  "coastwatch-db-warm.log": {
+    "original_sha256": "0b7e12a57438726572ff847685e74bf0aabd5b00b8520a41197d466189abbac9",
+    "stored_sha256": "0b7e12a57438726572ff847685e74bf0aabd5b00b8520a41197d466189abbac9",
+    "transformation": "remove ANSI control sequences and trailing whitespace"
+  },
+  "docs-check.log": {
+    "original_sha256": "d158d7275bf8b77266c27432f5236b000a5a6cf91f1e919a4820b9ba482b4bbd",
+    "stored_sha256": "9e6539cf7ee9a261c587c663246e2343f48f71e0ce48ea423035d680a1e7cd40",
+    "transformation": "remove ANSI control sequences and trailing whitespace"
+  }
+}

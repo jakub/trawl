@@ -63,7 +63,7 @@ for (const failure of ['server', 'network'] as const) {
 
 test('login validation identifies and focuses the invalid API key', async ({ page }) => {
   await page.goto('/login');
-  const key = page.getByLabel('API key');
+  const key = page.getByLabel('API key', { exact: true });
   await page.getByRole('button', { name: 'Sign In', exact: true }).click();
   await expect(key).toHaveAttribute('aria-invalid', 'true');
   await expect(key).toBeFocused();
@@ -78,7 +78,7 @@ for (const status of [401, 503]) {
   test(`login HTTP ${status} associates the error with the key and distinguishes rejection`, async ({ page }) => {
     await page.route('**/api/auth/login', route => route.fulfill({ status, body: '' }));
     await page.goto('/login');
-    const key = page.getByLabel('API key');
+    const key = page.getByLabel('API key', { exact: true });
     await key.fill('disposable-invalid-key');
     await page.getByRole('button', { name: 'Sign In', exact: true }).click();
     await expect(page.getByRole('alert')).toBeVisible();

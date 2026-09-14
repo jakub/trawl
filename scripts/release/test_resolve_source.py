@@ -1,0 +1,226 @@
+"""Exercise the release resolver against disposable Git remotes, without publishing."""
+
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+
+
+RESOLVER = Path(__file__).with_name("resolve-source.py").resolve()
+
+
+class ReleaseSourceTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name)
+        self.remote = root / "remote"
+        self.checkout = root / "workflow"
+        self.remote.mkdir()
+        self.env = dict(os.environ, GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
+        self.git(self.remote, "init", "-b", "main")
+        self.git(self.remote, "config", "user.name", "Release test")
+        self.git(self.remote, "config", "user.email", "release@example.invalid")
+        for path in ["Cargo.toml", "Dockerfile", "chart/trawl/Chart.yaml"]:
+            target = self.remote / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("release source\n")
+        notes = self.remote / "docs/releases"
+        notes.mkdir(parents=True)
+        (notes / "v1.0.0.md").write_bytes(b"# Curated launch\n\nProduct announcement.\n")
+        (notes / "v1.0.2.md").write_bytes(b"")
+        self.git(self.remote, "add", ".")
+        self.git(self.remote, "commit", "-m", "release source")
+        self.release_sha = self.git(self.remote, "rev-parse", "HEAD")
+        self.git(self.remote, "tag", "v1.0.0")
+        self.git(self.remote, "tag", "-a", "v1.0.1", "-m", "annotated release")
+        self.git(self.remote, "tag", "v1.1.0-rc.1+build.7")
+        for path in ["Cargo.toml", "Dockerfile", "chart/trawl/Chart.yaml"]:
+            (self.remote / path).write_text("workflow branch source\n")
+        (notes / "v1.0.0.md").write_text("Workflow development journal\n")
+        helper = self.remote / "scripts/release/build-apt-index.py"
+        helper.parent.mkdir(parents=True)
+        helper.write_text("print('publisher tooling from workflow')\n")
+        (helper.parent / "package-chart.sh").write_text(
+            RESOLVER.with_name("package-chart.sh").read_text()
+        )
+        self.git(self.remote, "add", ".")
+        self.git(self.remote, "commit", "-m", "workflow source")
+        self.workflow_sha = self.git(self.remote, "rev-parse", "HEAD")
+        # Ambiguous short name must never select this branch.
+        self.git(self.remote, "branch", "v1.0.0")
+        self.git(self.remote, "branch", "v2.0.0")
+        self.git(root, "clone", "--no-tags", str(self.remote), str(self.checkout))
+
+    def git(self, cwd, *args):
+        return subprocess.check_output(
+            ["git", *args], cwd=cwd, env=self.env, text=True, stderr=subprocess.PIPE
+        ).strip()
+
+    def run_resolver(self, tag, event="workflow_dispatch", ref="refs/heads/main"):
+        return subprocess.run(
+            [sys.executable, str(RESOLVER), event, ref, tag],
+            cwd=self.checkout, env=self.env, text=True, capture_output=True,
+        )
+
+    def assert_resolves(self, tag, **kwargs):
+        result = self.run_resolver(tag, **kwargs)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        outputs = dict(line.split("=", 1) for line in result.stdout.splitlines())
+        self.assertEqual(outputs, {"tag": tag, "sha": self.release_sha})
+        return outputs
+
+    def test_manual_dispatch_uses_release_source_for_every_consumer(self):
+        self.assertNotEqual(self.release_sha, self.workflow_sha)
+        outputs = self.assert_resolves("v1.0.0")
+        # The emitted SHA must be usable by fresh, shallow consumer checkouts.
+        for consumer in ["linux", "macos", "docker", "helm"]:
+            checkout = Path(self.temp.name) / consumer
+            checkout.mkdir()
+            self.git(checkout, "init")
+            self.git(checkout, "remote", "add", "origin", str(self.remote))
+            self.git(checkout, "fetch", "--depth=1", "origin", outputs["sha"])
+            self.git(checkout, "checkout", "--detach", "FETCH_HEAD")
+            for path in ["Cargo.toml", "Dockerfile", "chart/trawl/Chart.yaml"]:
+                self.assertEqual((checkout / path).read_text(), "release source\n")
+
+    def test_older_release_uses_publisher_from_workflow_revision(self):
+        self.assert_resolves("v1.0.0")
+        helper = "scripts/release/build-apt-index.py"
+        absent = subprocess.run(
+            ["git", "cat-file", "-e", f"{self.release_sha}:{helper}"],
+            cwd=self.checkout, env=self.env, capture_output=True,
+        )
+        self.assertNotEqual(absent.returncode, 0)
+        # Execute the workflow's actual loading commands. The fixture models
+        # gh-pages as a separate destination checkout without product source.
+        pages = Path(self.temp.name) / "pages"
+        pages.mkdir()
+        self.git(pages, "init")
+        self.git(pages, "remote", "add", "origin", str(self.remote))
+        workflow = RESOLVER.parents[2] / ".github/workflows/release.yml"
+        text = workflow.read_text()
+        step = text.split("      - name: Load APT index builder from workflow source\n", 1)[1]
+        step = step.split("\n      - name:", 1)[0]
+        self.assertIn("WORKFLOW_SHA: ${{ github.sha }}", step)
+        commands = step.split("        run: |\n", 1)[1]
+        commands = "\n".join(line.removeprefix("          ") for line in commands.splitlines())
+        result = subprocess.run(
+            ["bash", "-e", "-c", commands], cwd=pages,
+            env=dict(self.env, WORKFLOW_SHA=self.workflow_sha, RUNNER_TEMP=str(pages)),
+            text=True, capture_output=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((pages / "build-apt-index.py").read_text(),
+                         "print('publisher tooling from workflow')\n")
+        self.assertFalse((pages / "Cargo.toml").exists())
+
+    def test_older_release_uses_chart_packager_from_workflow_revision(self):
+        self.assert_resolves("v1.0.0")
+        self.git(self.checkout, "checkout", "--detach", self.release_sha)
+        self.assertFalse((self.checkout / "scripts/release/package-chart.sh").exists())
+        workflow = (RESOLVER.parents[2] / ".github/workflows/release.yml").read_text()
+        step = workflow.split("      - name: Check out chart tooling at the workflow source\n", 1)[1]
+        step = step.split("\n      - name:", 1)[0]
+        self.assertIn("ref: ${{ github.sha }}", step)
+        self.assertIn("path: .release-tooling", step)
+        self.assertIn("persist-credentials: false", step)
+        # Model the independent checkout action at the selected tooling SHA.
+        # Product source deliberately lacks the helper and remains untouched.
+        tooling = self.checkout / ".release-tooling"
+        self.git(self.checkout, "clone", "--no-tags", str(self.remote), str(tooling))
+        self.git(tooling, "checkout", "--detach", self.workflow_sha)
+        self.assertEqual((tooling / "scripts/release/package-chart.sh").read_text(),
+                         RESOLVER.with_name("package-chart.sh").read_text())
+        self.assertIn(".release-tooling/scripts/release/package-chart.sh", workflow)
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.release_sha)
+        self.assertEqual((self.checkout / "chart/trawl/Chart.yaml").read_text(), "release source\n")
+
+    def test_announcement_uses_exact_product_commit_and_refuses_missing_or_empty_notes(self):
+        self.assert_resolves("v1.0.0")
+        workflow = (RESOLVER.parents[2] / ".github/workflows/release.yml").read_text()
+        step = workflow.split("      - name: Prepare curated announcement from selected product source\n", 1)[1]
+        step = step.split("\n      - name:", 1)[0]
+        commands = step.split("        run: |\n", 1)[1]
+        commands = "\n".join(line.removeprefix("          ") for line in commands.splitlines())
+        for tag, diagnostic in [('v1.0.0', None), ('v1.0.1', 'Missing curated release announcement'),
+                                ('v1.0.2', 'must not be empty')]:
+            with self.subTest(tag=tag):
+                checkout = Path(self.temp.name) / tag
+                self.git(checkout.parent, "clone", "--no-tags", str(self.remote), str(checkout))
+                self.git(checkout, "checkout", "--detach", self.release_sha)
+                # A local edit must not replace the committed announcement.
+                (checkout / "docs/releases/v1.0.0.md").write_text("Uncommitted journal\n")
+                result = subprocess.run(['bash', '-e', '-c', commands], cwd=checkout,
+                                        env=dict(self.env, SOURCE_SHA=self.release_sha, RELEASE_TAG=tag),
+                                        text=True, capture_output=True)
+                artifact = checkout / 'announcement-artifact'
+                if diagnostic:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(diagnostic, result.stderr)
+                    self.assertFalse((artifact / 'SHA256SUMS').exists())
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual((artifact / 'body.md').read_bytes(),
+                                     b"# Curated launch\n\nProduct announcement.\n")
+                    subprocess.run(['sha256sum', '--check', 'SHA256SUMS'], cwd=artifact,
+                                   check=True, capture_output=True)
+                    self.assertEqual(self.git(checkout, 'rev-parse', 'HEAD'), self.release_sha)
+
+    def test_annotated_tag_peels_to_commit(self):
+        self.assert_resolves("v1.0.1")
+
+    def test_prerelease_and_build_metadata(self):
+        self.assert_resolves("v1.1.0-rc.1+build.7")
+
+    def test_tag_push_uses_event_ref(self):
+        result = self.run_resolver("ignored", event="push", ref="refs/tags/v1.0.1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, f"tag=v1.0.1\nsha={self.release_sha}\n")
+
+    def test_missing_tag_and_branch_only_name_fail(self):
+        for tag in ["v9.0.0", "v2.0.0"]:
+            with self.subTest(tag=tag):
+                result = self.run_resolver(tag)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+
+    def test_invalid_input_fails_before_fetch(self):
+        for tag in ["", "main", self.workflow_sha, "refs/tags/v1.0.0", "v1.0",
+                    "v01.0.0", "v1.0.0-01", "v1.0.0+", "v1.0.0\nsha=evil",
+                    "--upload-pack=evil", "v1.0.0;touch injected", "v1.0.0/other"]:
+            with self.subTest(tag=tag):
+                result = self.run_resolver(tag)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("v-prefixed SemVer", result.stderr)
+                self.assertFalse((self.checkout / ".git/FETCH_HEAD").exists())
+
+    def test_non_tag_push_and_unsupported_event_fail(self):
+        for event in ["push", "pull_request"]:
+            result = self.run_resolver("v1.0.0", event=event)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, "")
+
+    def test_stale_local_tag_does_not_override_remote(self):
+        self.git(self.checkout, "tag", "v1.0.0", self.workflow_sha)
+        self.assert_resolves("v1.0.0")
+
+    def test_non_commit_tag_fails(self):
+        blob = self.git(self.remote, "rev-parse", "HEAD:Dockerfile")
+        self.git(self.remote, "tag", "v3.0.0", blob)
+        result = self.run_resolver("v3.0.0")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+
+    def test_resolved_sha_survives_tag_movement(self):
+        outputs = self.assert_resolves("v1.0.0")
+        self.git(self.remote, "tag", "-f", "v1.0.0", self.workflow_sha)
+        self.git(self.checkout, "checkout", "--detach", outputs["sha"])
+        self.assertEqual((self.checkout / "Dockerfile").read_text(), "release source\n")
+
+
+if __name__ == "__main__":
+    unittest.main()

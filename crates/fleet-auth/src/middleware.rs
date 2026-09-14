@@ -360,6 +360,10 @@ pub(crate) fn classify_verify_error(err: AuthError, path: &str) -> Response {
             tracing::error!(target: "auth.backend", %path, ?err, "auth: migration error");
             service_unavailable_json("auth backend unavailable")
         }
+        AuthError::Schema(err) => {
+            tracing::error!(target: "auth.backend", %path, ?err, "auth: schema error");
+            service_unavailable_json("auth backend unavailable")
+        }
         AuthError::Hash(err) => {
             tracing::error!(target: "auth.backend", %path, err, "auth: hash worker failed");
             service_unavailable_json("auth backend unavailable")

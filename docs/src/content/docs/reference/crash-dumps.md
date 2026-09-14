@@ -47,10 +47,14 @@ replaces anything at that path that is not a directory on the next boot.
 ### Enable capture on Helm
 
 1. Set `crashDump.enabled` on the release. `persistence.enabled` must already
-   be `true`, or the chart refuses to render.
+   be `true`, or the chart refuses to render. Set `TRAWL_IMAGE_TAG` to an
+   image built from the same revision as your chart checkout. Pass that tag
+   explicitly when enabling or disabling capture.
 
    ```bash
-   helm upgrade --install "$TRAWL_RELEASE" ./chart/trawl --reuse-values --set crashDump.enabled=true
+   helm upgrade --install "$TRAWL_RELEASE" ./chart/trawl --reuse-values \
+     --set-string image.tag="${TRAWL_IMAGE_TAG:?Set the matching image tag}" \
+     --set crashDump.enabled=true
    ```
 
 2. Confirm the two halves of the grant.
@@ -132,7 +136,9 @@ verdict's `monitor_pid`, holds bit 19.
    On Helm:
 
    ```bash
-   helm upgrade --install "$TRAWL_RELEASE" ./chart/trawl --reuse-values --set crashDump.enabled=false
+   helm upgrade --install "$TRAWL_RELEASE" ./chart/trawl --reuse-values \
+     --set-string image.tag="${TRAWL_IMAGE_TAG:?Set the matching image tag}" \
+     --set crashDump.enabled=false
    ```
 
 2. Delete the dumps. Disabling does not remove them, and nothing prunes them

@@ -1,0 +1,68 @@
+[
+  {
+    "file": "final-development-docs-check.log",
+    "original_sha256": "f366600a410e3263687672624eaefb6da857116936c8c187eeda4a29bfef6980",
+    "recorded_sha256": "cee23d1d0f644496e014a271c3c5be68ad0e3ddedb0beca0963ce02c518081aa",
+    "trailing_whitespace_removed": true
+  },
+  {
+    "file": "final-installed-debian-check.log",
+    "original_sha256": "d3c84fb4512b84fdb639126dbdd0f726d6f35084dfa0532bb8b9c1a2ce276da2",
+    "recorded_sha256": "d3c84fb4512b84fdb639126dbdd0f726d6f35084dfa0532bb8b9c1a2ce276da2",
+    "trailing_whitespace_removed": false
+  },
+  {
+    "file": "final-owned-pg-cleanup.log",
+    "original_sha256": "df6ad0131ca6e12e1e7674c2359894b953eda012507b9002a4900ca9e16c3ed0",
+    "recorded_sha256": "df6ad0131ca6e12e1e7674c2359894b953eda012507b9002a4900ca9e16c3ed0",
+    "trailing_whitespace_removed": false
+  },
+  {
+    "file": "final-packaged-tutorial-check.log",
+    "original_sha256": "ed2dfd4d54ff1edd8183d16040d3d0247e9aeb8f033f030063e335030f69e3ba",
+    "recorded_sha256": "ed2dfd4d54ff1edd8183d16040d3d0247e9aeb8f033f030063e335030f69e3ba",
+    "trailing_whitespace_removed": false
+  },
+  {
+    "file": "final-release-docs-check.log",
+    "original_sha256": "fa3da65992f11f5728f0c800ffead2bf5795cb3f96000aaf4ef68375d068493e",
+    "recorded_sha256": "4a4d7834fcd159c33b2d58c22f10a2492795de1b9a16834383557b64a72dc1f3",
+    "trailing_whitespace_removed": true
+  },
+  {
+    "file": "final-release-helper-check.log",
+    "original_sha256": "891f7711fb94824dc62eaf69e695fb4063c80ff9033e94eb4c842590655e1692",
+    "recorded_sha256": "891f7711fb94824dc62eaf69e695fb4063c80ff9033e94eb4c842590655e1692",
+    "trailing_whitespace_removed": false
+  },
+  {
+    "file": "final-relocated-runtime-check.log",
+    "original_sha256": "a4ef827a1d2576b31a01ec730ca35e18c510b3cb4286758145174a75555b5bea",
+    "recorded_sha256": "a4ef827a1d2576b31a01ec730ca35e18c510b3cb4286758145174a75555b5bea",
+    "trailing_whitespace_removed": false
+  },
+  {
+    "file": "final-spa-compress.log",
+    "original_sha256": "86715a1b82eb6f495db4a974940f721b8357b35cb917007b068cfcb73cd38927",
+    "recorded_sha256": "86715a1b82eb6f495db4a974940f721b8357b35cb917007b068cfcb73cd38927",
+    "trailing_whitespace_removed": false
+  },
+  {
+    "file": "final-symbol-check.log",
+    "original_sha256": "dfae181422ddda5c6855a066d0dd5035f46d413203dc90f067710e697b1b0cde",
+    "recorded_sha256": "dfae181422ddda5c6855a066d0dd5035f46d413203dc90f067710e697b1b0cde",
+    "trailing_whitespace_removed": false
+  },
+  {
+    "file": "final-workspace-default-check.log",
+    "original_sha256": "7cc4980cd34ee04c074b3812d05d2ada76627691452a02efd8b56b59fa2e7bbb",
+    "recorded_sha256": "7cc4980cd34ee04c074b3812d05d2ada76627691452a02efd8b56b59fa2e7bbb",
+    "trailing_whitespace_removed": false
+  },
+  {
+    "file": "final-workspace-no-defaults-check.log",
+    "original_sha256": "144bf858b1d645b3f7da7ab2531569e31227a5033b953cae59096bcb96cc3caa",
+    "recorded_sha256": "144bf858b1d645b3f7da7ab2531569e31227a5033b953cae59096bcb96cc3caa",
+    "trailing_whitespace_removed": false
+  }
+]

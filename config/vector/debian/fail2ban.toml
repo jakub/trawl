@@ -1,7 +1,7 @@
 # trawl drop-in: fail2ban structured parsing
 #
 # extracts jail, action (Ban/Unban/Found), and source IP for queries like:
-#   service:fail2ban action:Ban | stats count() by src_ip
+#   service=fail2ban action=Ban | stats count() by src_ip
 #
 # idles silently if fail2ban is not installed.
 

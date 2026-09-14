@@ -1,0 +1,20 @@
+[
+  {
+    "container_id": "0bd33659b614faa758b5ecc72df3a17c36ca9715c8f3c817d7e262e6160d7c4a",
+    "owner_label": "launch-readiness-push",
+    "removed": true,
+    "absence_verified": true
+  },
+  {
+    "container_id": "d5a53bb97b0d9157ec3dd7360bf73b3d32ee0088dc50a2948dde1121666b0da4",
+    "owner_label": "launch-readiness-push",
+    "removed": true,
+    "absence_verified": true
+  },
+  {
+    "container_id": "9f56bb6487a5a99c82adfb4075010e8ea427665045ac1ac142977080fa08deea",
+    "owner_label": "launch-consumers-coastwatch",
+    "removed": true,
+    "absence_verified": true
+  }
+]

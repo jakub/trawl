@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: l06-cert-manager
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: l06-selfsigned
+  namespace: l06-cert-manager
+spec:
+  selfSigned: {}

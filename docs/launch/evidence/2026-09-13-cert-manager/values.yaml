@@ -1,0 +1,20 @@
+image:
+  tag: source-965d945d-verification-only
+web:
+  enabled: false
+auth:
+  database:
+    existingSecret: unused-fleet-db
+storage:
+  database:
+    existingSecret: unused-trawl-db
+tls:
+  mode: certManager
+  certManager:
+    issuerRef:
+      name: l06-selfsigned
+      kind: Issuer
+      group: cert-manager.io
+    dnsNames:
+      - l06-trawl.l06-cert-manager.svc
+      - trawl.l06.example.test

@@ -76,7 +76,7 @@ pub struct Schedule {
     pub interval_secs: u64,
     pub max_runs: Option<u64>,
     pub enabled: bool,
-    /// The window this schedule covers, or `None` for the legacy shape
+    /// The window this schedule covers, or `None` for query-text timing,
     /// where the saved DSL is executed verbatim (ADR-0018 ruling 6).
     pub window: Option<ScheduleWindow>,
     /// Late-arrival allowance shifting both window bounds back. Zero unless
@@ -472,8 +472,8 @@ pub(crate) fn row_to_schedule_at(row: &PgRow, prefix: &str) -> Result<Schedule, 
 /// The pairing is enforced by `schedules_window_shape`, so an unpaired or
 /// unknown value here means the row was written past the constraint (a
 /// hand-edit, a future kind this binary predates). That is a decode failure,
-/// not a `None` window: silently reading it as "no window" would hand the
-/// scheduler a legacy schedule and execute the DSL verbatim.
+/// not a `None` window: silently reading it as "no window" would make the
+/// scheduler use query-text timing and execute the DSL verbatim.
 pub(crate) fn decode_window(
     row: &PgRow,
     prefix: &str,
@@ -1379,9 +1379,9 @@ impl ScheduleStore {
         // The lock is taken only when there is an advance to make, and the
         // test is the same one the advance itself uses: a run claimed as
         // `since_last`. Everything it reads is written at claim time and
-        // never updated, so the answer cannot change under us. A legacy
-        // finish keeps exactly the lock footprint it always had and never
-        // queues behind a schedule someone else is holding. A
+        // never updated, so the answer cannot change under us. A run without
+        // a since_last window does not lock the schedule and never queues
+        // behind a schedule someone else is holding. A
         // cascade-deleted run matches nothing and skips the lock; the run
         // UPDATE below then reports RunDeleted as it always has.
         if status == RunStatus::Success {
@@ -2290,14 +2290,14 @@ mod tests {
 
     /// The ten-year cap lives in two places that cannot see each other:
     /// this constant, which the duration grammar enforces on every write,
-    /// and migration 0017's CHECK constraints, which enforce it in the
+    /// and the initial schema's CHECK constraints, which enforce it in the
     /// database. Drift either way is a store that accepts what the grammar
     /// refuses or refuses what it accepts, and neither shows up until a
     /// real row hits it, so the test reads the migration and compares the
     /// literal.
     #[test]
-    fn migration_0017_spells_the_same_duration_cap() {
-        let sql = std::fs::read_to_string("migrations/0017_report_windows.sql")
+    fn initial_schema_spells_the_same_duration_cap() {
+        let sql = std::fs::read_to_string("migrations/20260913000001_initial_schema.sql")
             .expect("the crate's own migration file");
 
         for name in [
@@ -2305,23 +2305,29 @@ mod tests {
             "schedules_window_secs_within_cap",
             "schedules_lag_within_cap",
         ] {
-            assert!(sql.contains(name), "0017 no longer declares {name}");
+            assert!(
+                sql.contains(name),
+                "initial schema no longer declares {name}"
+            );
         }
 
         // Every run of digits long enough to be a second count has to BE
         // the cap. Matching on the number rather than on one spelling of
-        // the CHECK means a fourth constraint, or the clamp above them,
+        // the CHECK means another duration constraint
         // cannot introduce a different literal unnoticed.
         let cap = MAX_DURATION_SECS.to_string();
         let literals: Vec<&str> = sql
             .split(|c: char| !c.is_ascii_digit())
             .filter(|run| run.len() >= 6)
             .collect();
-        assert!(!literals.is_empty(), "0017 spells no duration cap at all");
+        assert!(
+            !literals.is_empty(),
+            "initial schema spells no duration cap at all"
+        );
         for literal in literals {
             assert_eq!(
                 literal, cap,
-                "0017 spells {literal}, MAX_DURATION_SECS is {cap}"
+                "initial schema spells {literal}, MAX_DURATION_SECS is {cap}"
             );
         }
     }

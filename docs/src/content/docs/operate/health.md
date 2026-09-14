@@ -168,7 +168,9 @@ rejection event.
 Check: rejections from the targets `fleet_auth`, `auth.backend`,
 `preauth.transport`, and `trawl_server::policy::unmetered` never enter stored
 telemetry, whatever `RUST_LOG` says. They print to stdout, and to `log_file`
-when telemetry is disabled. Read them there, or read
+when file logging is configured and either `[ingest] enabled` or
+`internal_telemetry` is false. With both enabled, `log_file` is not opened.
+Read these events in the daemon output, or read
 `trawl_auth_failures_total` on `/metrics`. Its `reason` label has five values.
 
 | `reason` | Meaning | Fix |

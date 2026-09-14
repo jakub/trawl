@@ -1,12 +1,9 @@
 name: Dev image
 
-# Manual-only lean image build for fast k8s iteration. Unlike release.yml
-# this builds a SINGLE arm64 image and skips all the release ceremony
-# (second arch, macOS, .deb/APT, breakpad symbols, GitHub release, Helm
-# package). The image is tagged with the git short-sha and pushed to ghcr,
-# so `helm upgrade --set image.tag=sha-...` rolls the pod reliably despite
-# the chart's imagePullPolicy: IfNotPresent (a re-pushed *same* tag would
-# not re-pull). Everything runs in one job — no artifact round-trip.
+# Internal development channel, dispatched manually for arm64 Kubernetes testing.
+# Publishes one SHA-tagged linux/arm64 image. It publishes no CLI downloads,
+# release packages, symbols, or Helm package. The summary identifies the source
+# revision to use for a matching CLI build and source chart.
 on:
   workflow_dispatch:
 
@@ -34,38 +31,17 @@ jobs:
           targets: aarch64-unknown-linux-gnu, wasm32-unknown-unknown
 
       # Own cache (shared-key, stable across dev-image runs) so dev churn
-      # doesn't evict release.yml's `release-<target>` entry. First run is a
-      # cold libduckdb C++ build; every run after is the warm rust delta.
+      # doesn't evict release.yml's `release-<target>` entry. The official runtime is
+      # downloaded separately; this cache contains Rust compilation artifacts.
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          shared-key: dev-aarch64-linux
-
-      - name: Install zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
-
-      # arm64 is cross-compiled from the x86_64 runner; pull in the arm64
-      # libc so zig's lld can link. Mirrors release.yml's cross leg.
-      - name: Install cross-arch dpkg libs
-        run: |
-          sudo dpkg --add-architecture arm64
-          for f in /etc/apt/sources.list.d/*.sources; do
-            [ -f "$f" ] && sudo sed -i '/^Architectures:/!s/^Types: deb/Architectures: amd64\nTypes: deb/' "$f"
-          done
-          for f in /etc/apt/sources.list.d/*.list; do
-            [ -f "$f" ] && sudo sed -i '/\[arch=/!s/^deb /deb [arch=amd64] /' "$f"
-          done
-          codename="$(lsb_release -cs)"
-          printf 'deb [arch=arm64] http://ports.ubuntu.com/ %s %s\n' \
-            "$codename"          "main universe" \
-            "$codename-updates"  "main universe" \
-            "$codename-security" "main universe" \
-            | sudo tee /etc/apt/sources.list.d/arm64.list
-          sudo apt-get update
-          sudo apt-get install -y libc6-arm64-cross dpkg-dev
+          shared-key: dev-aarch64-linux-bookworm-gnu
+          workspaces: . -> target/bookworm
+          cache-directories: target/bookworm-home/.cargo/registry
 
       - uses: taiki-e/install-action@d858f8113943481093e02986a7586a4819a3bfd6 # v2
         with:
-          tool: cargo-zigbuild,trunk,wasm-bindgen-cli
+          tool: trunk,wasm-bindgen-cli
 
       # Build the leptos SPA first so rust-embed bakes a populated dist/ into
       # trawl-web (the web sidecar shares this image). Same ordering as release.
@@ -77,19 +53,17 @@ jobs:
 
       # No CARGO_PROFILE_RELEASE_STRIP=false / --build-id override here (unlike
       # release.yml): a dev image publishes no breakpad symbols, so the default
-      # profile's strip = "debuginfo" + zig lld's .symtab strip give lean
-      # binaries straight out of the build — smaller image, faster push.
+      # profile's strip = "debuginfo" removes DWARF without requesting the
+      # release workflow's full debug information.
       - name: Build
-        run: cargo zigbuild --release --workspace --exclude trawl-web-ui --target aarch64-unknown-linux-gnu.2.31
+        run: bash scripts/release/build-arm64.sh "$PWD" "$PWD/runtime"
 
-      # Stage exactly the four binaries the Dockerfile COPYs into
-      # docker-ctx/arm64/ (buildx sets TARGETARCH=arm64 for linux/arm64).
-      - name: Stage binaries for the image
+      - name: Stage binaries and shared runtime for the image
         run: |
-          mkdir -p docker-ctx/arm64
-          bindir="target/aarch64-unknown-linux-gnu/release"
-          cp "${bindir}/trawld" "${bindir}/trawl-admin" "${bindir}/fleet-admin" "${bindir}/trawl-web" docker-ctx/arm64/
-          chmod +x docker-ctx/arm64/trawld docker-ctx/arm64/trawl-admin docker-ctx/arm64/fleet-admin docker-ctx/arm64/trawl-web
+          python3 scripts/release/distribution.py stage --source . \
+            --binaries target/bookworm/aarch64-unknown-linux-gnu/release --runtime runtime \
+            --output docker-ctx/arm64 --target aarch64-unknown-linux-gnu \
+            --source-sha "$(git rev-parse HEAD)" --tooling-sha "$(git rev-parse HEAD)"
 
       # QEMU is needed: the Dockerfile's apt-get/groupadd RUN steps execute in
       # the arm64 target context on this x86_64 host.
@@ -109,21 +83,39 @@ jobs:
           push: true
           tags: ghcr.io/${{ github.repository }}:${{ steps.tag.outputs.value }}
 
-      - name: Deploy hint
+      - name: Internal development usage
         env:
           TAG: ${{ steps.tag.outputs.value }}
           REPO: ${{ github.repository }}
         run: |
           tag="$TAG"
           image="ghcr.io/${REPO}:${tag}"
+          revision="$(git rev-parse HEAD)"
+          checkout="../trawl-dev-${revision}"
           {
-            echo "### Dev image pushed"
+            echo "### Internal arm64 development image"
             echo ""
-            echo "\`${image}\`"
+            echo "Manual development channel for an existing test installation; not a stable release or first-install procedure."
             echo ""
-            echo "Roll it onto the cluster (substitute your release name):"
+            echo "Image: \`${image}\` (linux/arm64 only)."
+            echo "Source revision: \`${revision}\`. No matching CLI download or Helm package is published."
+            echo ""
+            echo "From an existing repository clone with this commit fetched, prepare its source chart and build the CLI for your local host."
+            echo "The source-build prerequisites and Rust 1.98.0 are required."
             echo ""
             echo '```sh'
-            echo "helm upgrade <release> ./chart/trawl --reuse-values --set image.tag=${tag}"
+            echo "git worktree add --detach ${checkout} ${revision}"
+            echo "cd ${checkout}"
+            echo 'TRAWL_TARGET="$(rustc -vV | sed -n "s/^host: //p")"'
+            echo 'bash scripts/release/build-distribution.sh "$PWD" "$TRAWL_TARGET" "$PWD/target/duckdb-runtime" --cli-only'
+            echo 'python3 scripts/release/distribution.py stage --source . --binaries "target/$TRAWL_TARGET/release" --runtime target/duckdb-runtime --output target/package --target "$TRAWL_TARGET" --source-sha "$(git rev-parse HEAD)" --tooling-sha "$(git rev-parse HEAD)" --cli-only'
+            echo 'target/package/bin/trawl --version'
+            echo '```'
+            echo ""
+            echo "For an existing arm64 test release, review a complete development values file for this source chart."
+            echo "Replace the context, namespace, release, and values-file placeholders before running:"
+            echo ""
+            echo '```sh'
+            echo "helm upgrade <release> ${checkout}/chart/trawl --kube-context <test-context> --namespace <namespace> --reset-values --values <development-values.yaml> --set-string image.repository=ghcr.io/${REPO} --set-string image.tag=${tag}"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

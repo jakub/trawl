@@ -4,15 +4,18 @@
 #   1. install vector: https://vector.dev/docs/setup/installation/package-managers/apt/
 #   2. deploy configs to /etc/vector/vector.d/ (base.toml + service drop-ins)
 #   3. set env vars in /etc/default/vector or vector.service override:
+#      VECTOR_CONFIG_DIR=/etc/vector/vector.d
 #      TRAWL_URL=https://trawl.internal:5514
 #      TRAWL_INGEST_TOKEN=<token>
 #      VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION=true
-#      (Vector 0.57 and later do not expand ${VAR} in config files unless
+#      (Vector 0.57 and later do not expand environment variables in config files unless
 #      this is set or vector runs with --dangerously-allow-env-var-interpolation)
 #   4. against the selected Fleet database, create trawl-ingest with trawl:ingest,
 #      then: fleet-admin keys create --name vector --kind service --role trawl-ingest
 #      fleet-admin reads DATABASE_URL; prefer a separate key per collector fleet
-#   5. start: systemctl enable --now vector
+#   5. use a server certificate valid for the TRAWL_URL hostname. For a private
+#      CA, install its PEM certificate and set ca_file in sinks.trawld.tls below.
+#   6. start: systemctl enable --now vector
 #
 # permissions (ansible should handle):
 #   - vector user in: systemd-journal, adm
@@ -46,6 +49,8 @@ current_boot_only = true
 # -- varlog catch-all: everything not handled by dedicated drop-ins -----------
 # anything that writes directly to /var/log and isn't covered by a service-
 # specific config (dpkg, apt, unattended-upgrades, misc application logs).
+# Excluded application files require their service drop-in; base alone skips them.
+# read_from=end collects newly appended lines, not existing file history.
 
 [sources.varlog]
 type = "file"
@@ -87,7 +92,7 @@ exclude = [
 # maps systemd journal fields to trawl's expected schema. includes UFW firewall
 # log enhancement: kernel messages containing [UFW are parsed for src/dst/proto.
 
-[transforms.trawl_journal_enriched]
+[transforms.journal_enriched]
 type = "remap"
 inputs = ["journald"]
 source = '''
@@ -154,7 +159,7 @@ if contains(msg, "[UFW ") {
   if err == null { .dst_port = to_int(dpt_match.dst_port) ?? null }
 
   proto_match, err = parse_regex(msg, r'PROTO=(?P<protocol>\S+)')
-  if err == null { .protocol = downcase(proto_match.protocol) }
+  if err == null { .protocol = downcase(string!(proto_match.protocol)) }
 }
 
 # --- drop internal journal metadata ---
@@ -188,20 +193,22 @@ del(.SYSLOG_IDENTIFIER)
 del(.source_type)
 '''
 
-# -- noise filter: drop high-volume low-signal journald events ----------------
-# serial-getty crash loops on VMs without a real serial console generate ~4.3M
-# events per 15 days. docker container lifecycle causes veth/bridge churn in
-# networkd-dispatcher, NetworkManager, and systemd-networkd.
+# -- optional homelab noise policy ------------------------------------------
+# Default: forward every normalized journal event. To suppress serial-console
+# and container-network messages, explicitly set TRAWL_SUPPRESS_HOMELAB_NOISE=true
+# in /etc/default/vector. Review these rules before opting in.
 
 [transforms.trawl_journal]
 type = "filter"
-inputs = ["trawl_journal_enriched"]
+inputs = ["journal_enriched"]
 condition = '''
+if "${TRAWL_SUPPRESS_HOMELAB_NOISE:-false}" != "true" { return true }
+
 svc = to_string(.service) ?? ""
 msg = to_string(.message) ?? ""
 
 # drop serial-getty crash loop (the service itself + init reporting restarts)
-if svc == "serial-getty-ttyS0" { return false }
+if svc == "serial-getty@ttyS0" { return false }
 if svc == "init" && contains(msg, "serial-getty") { return false }
 
 # drop docker network churn from networkd/NM/systemd-networkd
@@ -233,7 +240,7 @@ if filepath != "" {
     .service = parts[0]
   } else {
     # top-level: strip .log extension (e.g. dpkg.log → dpkg)
-    .service = replace(parts[0], r'\.log$', "")
+    .service = replace(string!(parts[0]), r'\.log$', "")
   }
 } else {
   .service = "varlog"
@@ -260,7 +267,9 @@ del(.source_type)
 # =============================================================================
 
 # -- HTTP sink to trawld ------------------------------------------------------
-# wildcard input "trawl_*" automatically discovers all normalized transforms
+# Reserve "trawl_*" for final outputs only; intermediate stages must use
+# another prefix so they cannot bypass filters or deliver duplicates.
+# Wildcard input "trawl_*" automatically discovers all final transforms
 # from this config AND any drop-in configs loaded via --config-dir.
 # adding a new drop-in requires NO changes to this file.
 
@@ -295,5 +304,8 @@ timeout_secs = 30
 concurrency = "adaptive"
 
 [sinks.trawld.tls]
-# set to true and provide ca_file for production CA verification
-verify_certificate = false
+# Trust the system CA store and verify the hostname in TRAWL_URL.
+# For a private CA, install its PEM certificate readable by the vector user:
+# ca_file = "/etc/vector/trawl-ca.pem"
+verify_certificate = true
+verify_hostname = true
