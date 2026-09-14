@@ -3,6 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 import { test, expect, resetScenario } from '../fixtures';
+import { SEL } from '../selectors';
 import type { Locator, Page } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
 
@@ -30,7 +31,17 @@ for (const width of [320, 720, 1024, 1440]) {
     for (const selector of ['.topbar .jump', '.topbar .user', '.dsl-editor', '.run', '.tabs .save', '.tabs .export']) {
       await insideViewport(page.locator(selector));
     }
-    for (const link of await page.locator('.rail a, .topbar .mode').all()) await insideViewport(link);
+    if (width >= 900) {
+      for (const link of await page.locator(SEL.paletteRailLink).all()) await insideViewport(link);
+    } else {
+      // Below 900px navigation is an overlay the command bar opens.
+      const toggle = page.locator(SEL.navToggle);
+      await insideViewport(toggle);
+      await toggle.click();
+      for (const link of await page.locator(SEL.paletteRailLink).all()) await insideViewport(link);
+      await page.keyboard.press('Escape');
+      await expect(toggle).toBeFocused();
+    }
     await expect(page.locator('.topbar .user')).toHaveAccessibleName('e2e');
     await page.locator('.dr-trigger').click();
     await insideViewport(page.locator('.dr-pop'));

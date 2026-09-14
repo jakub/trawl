@@ -1,7 +1,7 @@
 diff --git a/crates/fleet-ui/src/shell.rs b/crates/fleet-ui/src/shell.rs
 --- a/crates/fleet-ui/src/shell.rs
 +++ b/crates/fleet-ui/src/shell.rs
-@@ -188,7 +188,7 @@
+@@ -339,7 +339,7 @@ fn install_palette_chord(
                      .is_some_and(OverlayLayer::is_topmost)
                  {
                      event.prevent_default();

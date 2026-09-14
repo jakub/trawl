@@ -25,11 +25,16 @@ export const SEL = {
   paletteLabel: '.command-palette-label',
   paletteCurrent: '.command-palette-current',
   paletteEmpty: '.command-palette-empty',
-  paletteModeLink: '.topbar .modes a',
-  paletteRailLink: 'nav.rail > a[title]',
+  paletteRailLink: 'nav.rail .grp > a[title]',
   paletteKbd: '.topbar button.jump .kbd',
   // The external Help link occupies the bottom slot, outside route commands.
   helpLink: 'nav.rail .bot a[title="Help"]',
+  /// crates/fleet-ui/src/topbar.rs — opens the sidebar overlay below 900px.
+  navToggle: '.topbar button.nav-toggle',
+  /// crates/fleet-ui/src/sidebar.rs — the collapse control, below the bottom slot.
+  sidebarCollapse: 'nav.rail .bot button.collapse',
+  /// crates/fleet-ui/src/topbar.rs — the command bar's page title.
+  topbarCrumb: '.topbar .crumb',
 
   historyAwayLink: 'nav.rail a[title="Schema"]',
   historyPage: '.history-page',
@@ -38,7 +43,7 @@ export const SEL = {
 
   /// crates/fleet-ui/src/modal/confirm.rs ConfirmModal.
   healthConfirm: '[role="alertdialog"]',
-  /// crates/fleet-ui/src/rail.rs title, crates/trawl-web-ui/src/state/section.rs Schema label.
+  /// crates/fleet-ui/src/sidebar.rs title, crates/trawl-web-ui/src/state/section.rs Schema label.
   healthAwayLink: 'nav.rail a[title="Schema"]',
   /// crates/trawl-web-ui/src/components/status_bar.rs hot buffer group.
   healthFooterHot: '.statusbar .grp[title="Hot buffer (events / bytes)"]',
@@ -64,7 +69,7 @@ export const SEL = {
   healthRow: 'tr[data-query-id]',
   /// crates/trawl-web-ui/src/pages/health.rs HealthPage and HealthQueries.
   healthOwnRow: 'tr[data-own="true"]',
-  /// crates/fleet-ui/src/rail.rs title, crates/trawl-web-ui/src/state/section.rs Health label and path.
+  /// crates/fleet-ui/src/sidebar.rs title, crates/trawl-web-ui/src/state/section.rs Health label and path.
   railHealthLink: 'nav.rail a[title="Health"]',
 
   /// crates/trawl-web-ui/src/pages/search.rs LiveRawTable.
@@ -74,7 +79,7 @@ export const SEL = {
   /// CodeMirror's own contenteditable content div (standard CM6 class,
   /// not app-owned) — the click target that focuses the editor.
   cmContent: '.dsl-editor .cm-content',
-  /// crates/fleet-ui/src/rail.rs — <A title={label}> per RailItem; trawl's
+  /// crates/fleet-ui/src/sidebar.rs — <A title={label}> per RailItem; trawl's
   /// item list is crates/trawl-web-ui/src/state/section.rs (label "History",
   /// path "/search/history").
   railHistoryLink: 'nav.rail a[title="History"]',

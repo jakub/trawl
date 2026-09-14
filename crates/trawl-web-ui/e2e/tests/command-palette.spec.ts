@@ -25,17 +25,14 @@ async function closed(page: Page) {
 }
 
 async function chromeCommands(page: Page): Promise<Command[]> {
-  await expect(page.locator(SEL.paletteModeLink).first()).toBeVisible();
+  // The sidebar is the whole route inventory now: the palette's options
+  // are its links, in its order, deduped by path.
   await expect(page.locator(SEL.paletteRailLink).first()).toBeVisible();
-  const modes = await page.locator(SEL.paletteModeLink).evaluateAll((links) =>
-    links.map((link) => ({ label: link.textContent!.trim(), path: link.getAttribute('href')! })),
-  );
   const rail = await page.locator(SEL.paletteRailLink).evaluateAll((links) =>
     links.map((link) => ({ label: link.getAttribute('title')!, path: link.getAttribute('href')! })),
   );
-  expect(modes.length).toBeGreaterThan(1);
   expect(rail.length).toBeGreaterThan(1);
-  return [...modes, ...rail].filter((command, index, all) =>
+  return rail.filter((command, index, all) =>
     all.findIndex((candidate) => candidate.path === command.path) === index,
   );
 }

@@ -177,16 +177,28 @@ const CONTRACTS: &[Contract] = &[
         hook: "class=\"command-palette-empty\"",
     },
     Contract {
-        assignment: "paletteModeLink: '.topbar .modes a',",
-        source_path: "../fleet-ui/src/topbar.rs",
-        source: TOPBAR_RS,
-        hook: "class=\"modes\"",
-    },
-    Contract {
-        assignment: "paletteRailLink: 'nav.rail > a[title]',",
+        assignment: "paletteRailLink: 'nav.rail .grp > a[title]',",
         source_path: "../fleet-ui/src/sidebar.rs",
         source: SIDEBAR_RS,
         hook: "attr:title=label_attr",
+    },
+    Contract {
+        assignment: "navToggle: '.topbar button.nav-toggle',",
+        source_path: "../fleet-ui/src/topbar.rs",
+        source: TOPBAR_RS,
+        hook: "class=\"nav-toggle\"",
+    },
+    Contract {
+        assignment: "sidebarCollapse: 'nav.rail .bot button.collapse',",
+        source_path: "../fleet-ui/src/sidebar.rs",
+        source: SIDEBAR_RS,
+        hook: "class=\"it collapse\"",
+    },
+    Contract {
+        assignment: "topbarCrumb: '.topbar .crumb',",
+        source_path: "../fleet-ui/src/topbar.rs",
+        source: TOPBAR_RS,
+        hook: "class=\"crumb\"",
     },
     Contract {
         assignment: "paletteKbd: '.topbar button.jump .kbd',",

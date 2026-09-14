@@ -1,16 +1,16 @@
 diff --git a/crates/fleet-ui/src/shell.rs b/crates/fleet-ui/src/shell.rs
 --- a/crates/fleet-ui/src/shell.rs
 +++ b/crates/fleet-ui/src/shell.rs
-@@ -29,7 +29,7 @@
+@@ -45,7 +45,7 @@ use crate::command_palette::{
      ChordFacts, CommandInput, CommandPalette, commands_from, editable_target, is_palette_chord,
      palette_available, platform_kbd_hint,
  };
--use crate::overlay::{OverlayLayer, has_layers};
-+use crate::overlay::OverlayLayer;
+-use crate::overlay::{FocusPolicy, OverlayLayer, has_layers, use_overlay_layer_with};
++use crate::overlay::{FocusPolicy, OverlayLayer, use_overlay_layer_with};
  
- use crate::rail::{Rail, RailItem};
- use crate::toast::{ToastBus, Toasts};
-@@ -91,7 +91,7 @@
+ use crate::sidebar::{Sidebar, SidebarGroup};
+ use crate::theme::{Sidebar as SidebarPref, UiPrefs};
+@@ -107,7 +107,7 @@ pub fn Shell(
          });
      });
      let open_palette = Callback::new(move |()| {
@@ -19,7 +19,7 @@ diff --git a/crates/fleet-ui/src/shell.rs b/crates/fleet-ui/src/shell.rs
              return;
          }
          // A shortcut from the editor must restore to the visible trigger too.
-@@ -190,7 +190,7 @@
+@@ -341,7 +341,7 @@ fn install_palette_chord(
                      event.prevent_default();
                      close_palette.run(());
                  }
