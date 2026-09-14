@@ -14,7 +14,7 @@ Both builds render the **same live homelab data** (one trawld upstream), so
 only the chrome differs. Captured at a fixed 1600×900 viewport in both the
 light (nord) and dark themes. The `:8080` (before) vs `:8081` (after) host
 label in the status bar is the only benign delta — the two-port capture
-method documented in the [retired visual-parity script](https://github.com/jakub/trawl/blob/8625503c3e3a75436d906fc093bb72a94dbd3939/scripts/web-visual-parity).
+method documented in the [retired visual-parity script](https://github.com/jakub/trawl/blob/723ac5d70834cda4d923652a9797ef0037c43e54/scripts/web-visual-parity).
 
 ## Surfaces
 
@@ -83,7 +83,7 @@ Dark-theme captures for every surface sit alongside each light shot
 
 ## Reproduction
 
-The [retired visual-parity script](https://github.com/jakub/trawl/blob/8625503c3e3a75436d906fc093bb72a94dbd3939/scripts/web-visual-parity) records the two-build capture method.
+The [retired visual-parity script](https://github.com/jakub/trawl/blob/723ac5d70834cda4d923652a9797ef0037c43e54/scripts/web-visual-parity) records the two-build capture method.
 For current checks, use the [full-app experiment workflow](../../docs/src/content/docs/contribute/experiments.md)
 with disposable data. The steps below record this historical run:
 
