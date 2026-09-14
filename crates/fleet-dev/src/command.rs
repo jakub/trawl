@@ -16,9 +16,9 @@ use crate::error::{Error, Result};
 const DEFAULT_TIMEOUT: Duration = Duration::from_mins(5);
 /// Deadline for children that compile code or pull container images.
 ///
-/// A cold `cargo build -p trawl-server` compiles the bundled `DuckDB`
-/// amalgamation and a first `compose up` pulls roughly half a gigabyte;
-/// neither fits inside the default.
+/// A cold Cargo build compiles the Rust workspace and downloads the `DuckDB`
+/// shared library; a first `compose up` also pulls the PostgreSQL image.
+/// These operations can exceed the default deadline.
 pub const BUILD_TIMEOUT: Duration = Duration::from_mins(30);
 const DEFAULT_STDOUT_LIMIT: usize = 1024 * 1024;
 const DEFAULT_STDERR_LIMIT: usize = 256 * 1024;

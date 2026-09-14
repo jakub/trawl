@@ -96,9 +96,10 @@ The Linux server's browser build requires Trunk and the Rust
 
 The build helper downloads the checksum-verified official DuckDB library that
 matches `Cargo.lock`. It includes ICU, JSON, and Parquet support without a
-first-query extension download. The default bundled Cargo build is not the
-supported distribution route: its current DuckDB build lacks the required ICU
-support. Keep UTC and IANA timezone behavior enabled.
+first-query extension download. Ordinary Cargo builds and tests also use the
+shared runtime, with a development library cached under `target/duckdb-download`.
+Use the build helper below to stage relocatable distributions with their library.
+UTC and IANA timezone behavior remain enabled.
 
 On Linux, build the server, browser, and CLI:
 

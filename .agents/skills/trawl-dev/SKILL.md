@@ -32,6 +32,12 @@ Tests use disposable databases, never this interactive data. Use
 | Browser interactions | `env -u NO_COLOR cargo xtask e2e --grep 'scenario'`; see the [E2E guide](../../../crates/trawl-web-ui/e2e/README.md) |
 | Full API, auth, ingest, compaction, and restart | [trawl-experiment](../trawl-experiment/SKILL.md) |
 
+Cargo defaults use the downloaded DuckDB shared runtime, including ICU, JSON,
+and Parquet. Cargo provides its loader path for `cargo run` and tests; an
+already-built development daemon uses `bin/trawld-dev`. For relocatable
+artifacts, use the documented distribution build helper instead of copying a
+Cargo executable alone.
+
 Unset `NO_COLOR` for Trunk because the installed version rejects its inherited
 value of `1`. The Playwright suite uses a stub API. It does not prove real
 authentication or database behavior. Parallel checkouts need distinct `E2E_PORT` values; keep

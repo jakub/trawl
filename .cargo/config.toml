@@ -1,8 +1,7 @@
 [env]
-# Safety net: prevents linker errors when a single-crate build doesn't
-# activate the `bundled` feature (e.g. `cargo test -p trawl-api`).
-# Completely ignored when `bundled` is active — the duckdb-sys build.rs
-# never checks this env var in the bundled code path.
+# Development builds and tests use the official DuckDB shared library,
+# which includes ICU, JSON, and Parquet. Cargo provides its loader path for
+# `cargo run` and tests. Distributions stage a verified library separately.
 DUCKDB_DOWNLOAD_LIB = "1"
 
 # `cargo xtask <cmd>` → workspace task runner. The double-dash separates

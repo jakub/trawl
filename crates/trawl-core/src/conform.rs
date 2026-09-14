@@ -61,7 +61,7 @@ use crate::severity::Dialect;
 /// is APPLIED rather than ignored (ADR-0011), and both halves of that parse
 /// consult the session zone: a text with NO offset is read as the session
 /// zone, and the instant is rendered back to a zoneless `TIMESTAMP` in it.
-/// The bundled `DuckDB` links ICU and defaults `TimeZone` to the HOST zone
+/// The shared `DuckDB` runtime includes ICU and defaults `TimeZone` to the HOST zone
 /// (probed by execution), so without this pin what compaction writes — and
 /// what a query reads out of the hot buffer — would be a function of
 /// `/etc/localtime`.

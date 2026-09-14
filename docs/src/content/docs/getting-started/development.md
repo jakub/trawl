@@ -21,10 +21,11 @@ Fleet auth, and creates the `fleet-developer` role and an API key. It then runs
 `trawld`, `trawl-web`, and `trunk serve`. The `trawl-login` pane prints the key.
 Open `http://localhost:8081/login` and paste it.
 
-`bin/dev` is also the fast server build. It compiles with
-`--no-default-features`, so `trawld` links the downloaded DuckDB shared library
-instead of compiling the bundled amalgamation. The download is cached under
-`target/duckdb-download` and reused. For distributable artifacts, use the
+Ordinary Cargo builds and `bin/dev` link the downloaded DuckDB shared library,
+which includes ICU, JSON, and Parquet. The download is cached under
+`target/duckdb-download` and reused. Cargo supplies the development loader path
+for `cargo run` and tests; `bin/trawld-dev` supplies it when Fleet launches the
+already-built daemon. Keep the library with its development build. For distributable artifacts, use the
 [shared-runtime source build](/getting-started/#build-from-source), which verifies
 the official library and stages it with the executables.
 
@@ -48,17 +49,6 @@ connection, and changes no Tailscale configuration. Under Tailscale exposure it
 does make two read-only queries to the local daemon, for the node's MagicDNS
 name and its tailnet IPv4, so `plan` then needs a running, logged-in
 `tailscaled` unless you pin both values in a profile.
-
-If the bundled DuckDB build artifacts grow too large, preview and then remove
-only the `libduckdb-sys` artifacts:
-
-```bash
-cargo clean -p libduckdb-sys --dry-run
-cargo clean -p libduckdb-sys
-```
-
-The versioned download cache survives that, and the next bundled build compiles
-DuckDB again. `fleet-dev` never runs this cleanup for you.
 
 ## Write a machine profile
 
