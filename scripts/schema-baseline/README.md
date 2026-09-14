@@ -34,11 +34,17 @@ Run only against a disposable PostgreSQL instance owned by the test run. Set
 Never use the persistent development cluster or a production DSN.
 
 ```bash
-DATABASE_URL="$OWNED_POSTGRES_URL" cargo test -p fleet-auth --test migration_pg
-DATABASE_URL="$OWNED_POSTGRES_URL" cargo test -p trawl-server --test schema_pg
+DATABASE_URL="$OWNED_POSTGRES_URL" cargo nextest run -p fleet-auth --test migration_pg
+DATABASE_URL="$OWNED_POSTGRES_URL" cargo nextest run -p trawl-server --test schema_pg
 ```
 
 Fleet runtime tests additionally call `validate_schema` and `KeyStore::connect`
 on old, malformed, and current histories. Validation uses a read-only snapshot
 and never applies migrations. Operational callers use `fleet_auth::migrate`;
 `MIGRATOR` remains available for SQLx test infrastructure.
+
+The catalog uses one completion stamp for file conformance and service
+observations. Trawl's reference amendment explicitly drops
+`catalog_state.services_backfilled_at`; the strict comparison still checks
+all remaining columns and seeds. The current boot-pass test injects a real
+observation write failure and verifies retry before completion is published.

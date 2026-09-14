@@ -150,8 +150,8 @@ CREATE TABLE catalog_state (
         CONSTRAINT catalog_state_pkey PRIMARY KEY
         CONSTRAINT catalog_state_singleton CHECK (singleton),
     catalog_id   UUID        NOT NULL DEFAULT gen_random_uuid(),
-    conformed_at TIMESTAMPTZ,
-    services_backfilled_at TIMESTAMPTZ
+    -- Completion covers file conformance and service observations together.
+    conformed_at TIMESTAMPTZ
 );
 
 -- One job is both the scan report and the rewrite lifecycle. planned_at NULL

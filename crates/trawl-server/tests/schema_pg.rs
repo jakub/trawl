@@ -10,6 +10,7 @@ const NEW_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/migrations");
 // Intentional fresh-schema differences from the immutable historical fixtures.
 // Keep these statements explicit so the remaining catalog comparison is strict.
 const REFERENCE_AMENDMENT: &str = "
+ALTER TABLE catalog_state DROP COLUMN services_backfilled_at;
 ALTER TABLE repin_jobs
     ADD CONSTRAINT repin_jobs_accepted_nulled_plan
     CHECK ((accepted_max_nulled_rows IS NOT NULL) = (force AND planned_at IS NOT NULL)),

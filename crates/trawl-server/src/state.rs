@@ -97,8 +97,7 @@ pub struct QueryState {
     /// indexed by whether the retention window applied, because there are
     /// exactly two unscoped request shapes (`?all=true` lifts the window) and
     /// each entry must survive requests of the other shape: this cache is
-    /// the only bound on the whole-table aggregate behind it (migration
-    /// 0003), so one shared slot would let alternating `/schema` and
+    /// the only bound on the whole-table aggregate behind it, so one shared slot would let alternating `/schema` and
     /// `/schema?all=true` traffic evict each other into a 100% miss rate,
     /// every miss running the aggregate while holding the mutex.
     pub schema_columns_cache: Arc<tokio::sync::Mutex<[Option<CachedSchemaColumns>; 2]>>,
@@ -409,7 +408,7 @@ pub struct CachedCorpusFacts {
 /// Only the unscoped listing is cached. `?service=` is client-chosen and
 /// unbounded, so keying a map on it would be an unbounded cache — and the
 /// scoped listing is already bounded by the pin cap through the
-/// `field_services (service, field)` index (migration 0003), while the
+/// `field_services (service, field)` index, while the
 /// unscoped one aggregates every service's observations and is what the
 /// autocomplete polls. The windowed/unwindowed shape lives in which slot
 /// of `schema_columns_cache` holds the entry, not in the entry itself.

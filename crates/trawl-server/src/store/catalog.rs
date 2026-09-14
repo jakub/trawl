@@ -2453,7 +2453,7 @@ impl CatalogStore {
         Ok(conformed)
     }
 
-    /// Record boot-conformance completion.
+    /// Record completion of boot rewrites and service observation backfill.
     pub async fn mark_conformed(&self) -> Result<(), StoreError> {
         sqlx::query("UPDATE catalog_state SET conformed_at = now()")
             .execute(&self.pool)
@@ -2467,29 +2467,6 @@ impl CatalogStore {
     /// interrupted repin missed.
     pub async fn clear_conformed(&self) -> Result<(), StoreError> {
         sqlx::query("UPDATE catalog_state SET conformed_at = NULL")
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
-    /// Whether the boot pass has backfilled `field_services` from the
-    /// standing corpus for this catalog.
-    ///
-    /// Tracked separately from [`Self::is_conformed`] on purpose: a catalog
-    /// can carry `conformed_at` set while the backfill
-    /// ([`Self::backfill_services`]) has never run, and that is the one
-    /// state where the pass must run again.
-    pub async fn services_backfilled(&self) -> Result<bool, StoreError> {
-        let backfilled: bool =
-            sqlx::query_scalar("SELECT services_backfilled_at IS NOT NULL FROM catalog_state")
-                .fetch_one(&self.pool)
-                .await?;
-        Ok(backfilled)
-    }
-
-    /// Record that the boot pass observed the standing corpus.
-    pub async fn mark_services_backfilled(&self) -> Result<(), StoreError> {
-        sqlx::query("UPDATE catalog_state SET services_backfilled_at = now()")
             .execute(&self.pool)
             .await?;
         Ok(())

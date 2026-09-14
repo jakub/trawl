@@ -3006,20 +3006,22 @@ mod catalog {
     }
 
     /// A baseline rerun preserves sender pins, catalog identity, and completed
-    /// passes. Fresh completion flags remain absent until the passes record them.
+    /// passes. Fresh completion remains absent until the whole pass succeeds.
     #[sqlx::test]
     async fn baseline_restart_preserves_catalog_state_and_sender_pins(pool: PgPool) {
-        let initial: (String, bool, bool) = sqlx::query_as(
-            "SELECT catalog_id::text, conformed_at IS NULL, services_backfilled_at IS NULL FROM catalog_state",
-        ).fetch_one(&pool).await.unwrap();
+        let initial: (String, bool) =
+            sqlx::query_as("SELECT catalog_id::text, conformed_at IS NULL FROM catalog_state")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(initial.0.len(), 36);
-        assert!(initial.1 && initial.2);
+        assert!(initial.1);
         let store = catalog(&pool);
         store
             .pin_missing(&[proposal("severity", CanonicalType::BigInt)])
             .await
             .unwrap();
-        sqlx::query("UPDATE catalog_state SET conformed_at=now(), services_backfilled_at=now()")
+        sqlx::query("UPDATE catalog_state SET conformed_at=now()")
             .execute(&pool)
             .await
             .unwrap();
@@ -5684,9 +5686,8 @@ mod repin_store {
         );
     }
 
-    /// NULL staged columns mean staging never ran — a job from before the
-    /// barrier, or one whose engine died between the Cutover marker and the
-    /// flip. Past that marker the corpus is already the new generation, so
+    /// NULL staged columns mean staging never completed. An engine can die
+    /// between the Cutover marker and the flip. Past that marker the corpus is already the new generation, so
     /// the completion goes forward: the job succeeds with no evidence, and
     /// the operator's signal is a `repin_evidence_unstaged` warn (shape
     /// asserted at the call site, not here — this test proves the forward

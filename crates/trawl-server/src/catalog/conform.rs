@@ -297,16 +297,7 @@ pub async fn ensure_conformance(
         .is_conformed()
         .await
         .map_err(|e| format!("failed to read conformance state: {e}"))?;
-    // The observation backfill has its own flag, and both must be set to
-    // skip the pass. Gating on `conformed_at` alone would leave a corpus
-    // that conformed before its observations were taken with an empty
-    // `field_services` forever, for every service whose data is standing
-    // parquet no live batch re-sends.
-    let backfilled = store
-        .services_backfilled()
-        .await
-        .map_err(|e| format!("failed to read observation backfill state: {e}"))?;
-    if conformed && backfilled && read_marker(data_dir).as_deref() == Some(catalog_id.as_str()) {
+    if conformed && read_marker(data_dir).as_deref() == Some(catalog_id.as_str()) {
         // Still hydrate the cache — skipping the pass must not skip pins.
         hydrate(store, cache).await?;
         return Ok(ConformSummary {
@@ -322,10 +313,8 @@ pub async fn ensure_conformance(
         event_type = "catalog_conform_start",
         data_dir = %data_dir.display(),
         conformed,
-        backfilled,
         "boot conformance pass starting (first boot with this catalog, a \
-         catalog/data-root identity mismatch, or a corpus conformed before \
-         the observation backfill existed)"
+         catalog/data-root identity mismatch, or an incomplete pass)"
     );
 
     // Pins before the scan, not after: they are what makes the scan cheap.
@@ -425,9 +414,8 @@ pub async fn ensure_conformance(
 /// proven conformant, so the identity stays unpublished and the next boot
 /// re-runs the pass rather than declaring victory forever.
 ///
-/// Both completion flags are stamped here, together: a skipped path means
-/// the observations are as incomplete as the rewrites, so neither is
-/// declared done.
+/// The completion stamp covers both rewrites and service observations. A
+/// skipped path leaves both incomplete, so neither is declared done.
 async fn publish_completion(
     store: &CatalogStore,
     data_dir: &Path,
@@ -452,10 +440,6 @@ async fn publish_completion(
         .mark_conformed()
         .await
         .map_err(|e| format!("failed to record conformance completion: {e}"))?;
-    store
-        .mark_services_backfilled()
-        .await
-        .map_err(|e| format!("failed to record observation backfill completion: {e}"))?;
     publish_marker(data_dir, catalog_id)
 }
 
