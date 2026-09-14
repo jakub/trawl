@@ -10,6 +10,18 @@ Vocabulary for the browser SPA. Cross-cutting terms (event, field, pin, lane) li
 The address-bar form of the search page's whole state: `q`, `page`, `mode`, `f` and `r`. One producer writes it, one reader parses it, and bookmarks, Back/Forward and "copy link" are all that one round trip.
 _Avoid_: deep link, permalink, share URL
 
+**Query console**:
+The raised region at the top of the search sheet that holds everything the next query is made of: the label and draft state, the editor well, the range trigger, Haul, the tool row, and the executed-scope strip that closes it. The one lifted surface on the page.
+_Avoid_: editor (that is the CodeMirror mount inside it), search bar, toolbar
+
+**Draft state**:
+The console header's reading of the editor buffer against the executed query: "Editor matches execution" when they agree, "Unsent changes" with the hint to Haul when they do not. Derived text, never a control, and it never navigates.
+_Avoid_: dirty flag, unsaved indicator, status
+
+**Executed-scope strip**:
+The well at the foot of the console reporting what the last query actually ran with: the effective window, the active filter chips, the mode badge and the row count. It describes the executed query only, so typing never changes it, and a malformed link leaves it empty behind the banner.
+_Avoid_: meta strip, summary bar, filter bar
+
 **Structured state**:
 The URL parameters that are not the query text: page, mode, filters and range. They are folded into the DSL at request time; the query text is never rewritten to carry them.
 _Avoid_: URL state (that includes `q`), extras
@@ -50,6 +62,26 @@ _Avoid_: facet sidebar (the code name), facets
 The strip above the snapshot table: the page's rows bucketed over their own time span, captioned with the window the effective query ran. Absent in live. Neither ingest volume nor the full distribution of matches.
 _Avoid_: timeline, chart (that is Visualization)
 
+**Reading mode**:
+One of the two optional presentations of snapshot results, both off by default and persisted in `UiPrefs`: `details` chooses between the inline expanded row and the docked inspector, `rows` between the compact table and message-first rows. Chosen through the "View" disclosure in the result header. Live results and aggregation shapes ignore both.
+_Avoid_: view mode, layout, density
+
+**Docked inspector**:
+The `details = inspector` presentation: a panel beside the results table (below it under 900px) showing every field of the selected event with Include, Exclude and Copy per row. Selecting a row highlights it and leaves the table in place; the selection names an event, not a row position, so sorting does not move it.
+_Avoid_: detail drawer, side panel, preview
+
+**Message-first rows**:
+The `rows = message-first` presentation: time, severity and the message at full width, with service, host and latency as a muted second line. Every other column moves to the inspector or the inline detail.
+_Avoid_: compact mode (that is the default), log view
+
+**Exact table**:
+What the Events tab renders for an aggregation-shaped result: the group and metric columns with no expansion column and no Include control on a generated metric, because a filter on a computed column names a field no event carries. Only the group-by columns offer "search this group".
+_Avoid_: aggregate table, stats table, summary
+
+**Categorical chart**:
+The bar-per-group companion beside the exact table, drawn for the one shape it can state exactly — one group column and one numeric metric — with the value printed on every bar. Any other aggregate shape shows the table alone.
+_Avoid_: bar chart (unqualified), visualization (that is the other tab)
+
 **Count**:
 The Events tab shows rows on screen. The footer names its source: Last (rows the last snapshot returned), Received (events delivered since the stream opened), Updates (aggregation frames since the stream opened).
 _Avoid_: total, matches, hits
@@ -67,6 +99,10 @@ _Avoid_: saved search, report (that is a run's output)
 **Run**:
 One stored execution of a net's schedule: the resolved query text, the window it covered and the result rows the server kept. The drawer pages a fetched result locally; a run is never re-fetched by page.
 _Avoid_: report, execution, job
+
+**Run receipt**:
+The facts panel beside a stored run's result: net, outcome, duration, rows recorded and the query as it ran. It reports what was recorded, so re-running from it produces a new result and never replaces the one on screen.
+_Avoid_: summary, metadata, details
 
 ### List tables
 

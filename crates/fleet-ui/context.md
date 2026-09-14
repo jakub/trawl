@@ -100,6 +100,14 @@ _Avoid_: drawer tabs, sd-tabs
 The right-slide detail inspector: a `Capture` layer with a scrim, a drawer strip and a body the consumer fills. Docked presentation: the same shell rendered in flow beside its list with no scrim and no overlay layer; Escape closes it only while focus is inside it and no layer is open.
 _Avoid_: side panel, sheet, inspector
 
+**Docked panel**:
+A `Drawer` rendered with `docked`: the same header, strip and body, placed in flow beside the list it details instead of over a scrim. It registers no layer, so it captures no focus and leaves the command palette's chord live; a consumer flips the prop on a media query and the panel's children stay mounted across the breakpoint.
+_Avoid_: inline drawer, split view, sidebar (that is the navigation)
+
+**Reading preference**:
+A `UiPrefs` field that chooses a presentation rather than a theme: `sidebar` (expanded or collapsed), `details` (inline or inspector) and `rows` (compact or message-first). fleet-ui stores and persists them beside the theme; what each presentation looks like is the consumer's.
+_Avoid_: setting, layout option, view state
+
 **Toast host**:
 The one mounted `Toasts` component that renders the queue. Its dismiss control is a named native button.
 _Avoid_: toaster, notification area
