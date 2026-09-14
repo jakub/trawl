@@ -286,4 +286,3 @@ jobs:
         run: |
           docker run --rm --network none --cap-add SYS_PTRACE -v "$PWD:/verify:ro" -w /verify \
             trawl-artifact-check bash scripts/release/test-installed-debian.sh debs
-

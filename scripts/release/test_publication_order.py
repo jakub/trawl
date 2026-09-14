@@ -5,6 +5,7 @@ No publishing action or workflow shell command is executed.
 """
 import copy
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -127,6 +128,68 @@ class PublicationOrder(unittest.TestCase):
                 for field in trigger['inputs'].values():
                     self.assertTrue(field['required'])
                     self.assertEqual(field['type'], 'string')
+
+    def test_pr_preflight_calls_both_native_checks_without_publication(self):
+        workflow = parse_workflow(WORKFLOW.with_name('distribution-preflight.yml'))
+        triggers = workflow.get('on') or workflow.get('true')
+        self.assertEqual(set(triggers), {'pull_request'})
+        self.assertEqual(set(triggers['pull_request']['paths']), {
+            '.github/workflows/release.yml', '.github/workflows/linux-distribution.yml',
+            '.github/workflows/macos-cli.yml', '.github/workflows/distribution-preflight.yml',
+            'scripts/release/**', 'Cargo.lock', 'Cargo.toml',
+            'crates/trawl-core/Cargo.toml', 'crates/trawl-engine/Cargo.toml',
+            'crates/trawl-server/Cargo.toml',
+        })
+        self.assertEqual(workflow['permissions'], {'contents': 'read'})
+        jobs = workflow['jobs']
+        self.assertEqual(set(jobs), {'metadata', 'linux', 'macos'})
+        metadata = jobs['metadata']
+        self.assertEqual(metadata['outputs'], {
+            'sha': '${{ steps.source.outputs.sha }}',
+            'release-tag': '${{ steps.source.outputs.release-tag }}',
+        })
+        checkout = metadata['steps'][0]
+        self.assertTrue(checkout['uses'].startswith('actions/checkout@'))
+        self.assertEqual(checkout['with'], {'ref': '${{ github.sha }}', 'persist-credentials': False})
+        self.assertEqual(len(metadata['steps']), 2)
+        for job, filename in [('linux', 'linux-distribution.yml'), ('macos', 'macos-cli.yml')]:
+            self.assertEqual(jobs[job], {
+                'needs': 'metadata', 'uses': './.github/workflows/' + filename,
+                'with': {'source-sha': '${{ needs.metadata.outputs.sha }}',
+                         'tooling-sha': '${{ needs.metadata.outputs.sha }}',
+                         'release-tag': '${{ needs.metadata.outputs.release-tag }}'},
+            })
+        self.assertFalse(any('permissions' in job for job in jobs.values()))
+        self.assertEqual(simulate(jobs, 'metadata'),
+                         {'metadata': 'failure', 'linux': 'skipped', 'macos': 'skipped'})
+
+    def test_pr_metadata_reads_committed_version_and_refuses_wrong_sha(self):
+        workflow = parse_workflow(WORKFLOW.with_name('distribution-preflight.yml'))
+        step = workflow['jobs']['metadata']['steps'][1]
+        self.assertEqual(step['id'], 'source')
+        self.assertEqual(step['env'], {'EXPECTED_SHA': '${{ github.sha }}'})
+        with tempfile.TemporaryDirectory(prefix='trawl-preflight-source-') as directory:
+            root = Path(directory)
+            env = dict(os.environ, GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull)
+            subprocess.run(['git', 'init', '-q', str(root)], env=env, check=True)
+            (root / 'Cargo.toml').write_text('[workspace.package]\nversion = "0.4.0"\n')
+            subprocess.run(['git', 'add', 'Cargo.toml'], cwd=root, env=env, check=True)
+            subprocess.run(['git', '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+                            'commit', '-qm', 'committed source'], cwd=root, env=env, check=True)
+            sha = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, env=env, text=True).strip()
+            output = root / 'outputs'
+            result = subprocess.run(['bash', '-e', '-c', step['run']], cwd=root,
+                                    env=dict(env, EXPECTED_SHA=sha, GITHUB_OUTPUT=str(output)),
+                                    text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(output.read_text(), f'sha={sha}\nrelease-tag=v0.4.0\n')
+            output.unlink()
+            result = subprocess.run(['bash', '-e', '-c', step['run']], cwd=root,
+                                    env=dict(env, EXPECTED_SHA='0' * 40, GITHUB_OUTPUT=str(output)),
+                                    text=True, capture_output=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('does not match the PR commit', result.stderr)
+            self.assertFalse(output.exists())
 
     def test_publisher_consumes_exact_prebuilt_chart_and_metadata(self):
         jobs = self.workflow['jobs']

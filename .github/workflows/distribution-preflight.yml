@@ -1,0 +1,70 @@
+name: Distribution preflight
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/release.yml'
+      - '.github/workflows/linux-distribution.yml'
+      - '.github/workflows/macos-cli.yml'
+      - '.github/workflows/distribution-preflight.yml'
+      - 'scripts/release/**'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'crates/trawl-core/Cargo.toml'
+      - 'crates/trawl-engine/Cargo.toml'
+      - 'crates/trawl-server/Cargo.toml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: distribution-preflight-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  metadata:
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+      release-tag: ${{ steps.source.outputs.release-tag }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Read the checked-out source identity and version
+        id: source
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import subprocess
+          import tomllib
+
+          sha = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          if sha != os.environ['EXPECTED_SHA']:
+              raise SystemExit('preflight checkout does not match the PR commit')
+          version = tomllib.loads(Path('Cargo.toml').read_text())['workspace']['package']['version']
+          if not isinstance(version, str) or not version or any(c.isspace() for c in version):
+              raise SystemExit('invalid committed workspace version')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'sha={sha}\nrelease-tag=v{version}\n')
+          PY
+
+  linux:
+    needs: metadata
+    uses: ./.github/workflows/linux-distribution.yml
+    with:
+      source-sha: ${{ needs.metadata.outputs.sha }}
+      tooling-sha: ${{ needs.metadata.outputs.sha }}
+      release-tag: ${{ needs.metadata.outputs.release-tag }}
+
+  macos:
+    needs: metadata
+    uses: ./.github/workflows/macos-cli.yml
+    with:
+      source-sha: ${{ needs.metadata.outputs.sha }}
+      tooling-sha: ${{ needs.metadata.outputs.sha }}
+      release-tag: ${{ needs.metadata.outputs.release-tag }}

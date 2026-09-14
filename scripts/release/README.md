@@ -65,3 +65,10 @@ as well as reusable workflow calls. Both require full `source-sha` and
 (for example, `v0.4.0`). A manual run creates no tag. Linux completion includes
 both native architecture verification jobs; the release workflow calls this
 same workflow and waits for its verification results.
+
+`distribution-preflight.yml` runs these same native checks for pull requests
+that change distribution workflows, release tooling, or DuckDB dependency
+manifests. It derives the version label from the checked-out PR merge commit
+and uses that full commit SHA for both product and tooling. This caller allows
+verification before the manual workflows are registered on the default branch;
+it has read-only repository permissions and no publication jobs.
