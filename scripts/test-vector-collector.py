@@ -23,6 +23,7 @@ import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / "config/vector/debian"
+FIXTURES = ROOT / "target/vector-collector-tests"
 VECTOR = os.environ.get("VECTOR_BIN", "vector")
 ENV = dict(os.environ, VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION="true",
            TRAWL_URL="http://127.0.0.1:1", TRAWL_INGEST_TOKEN="fixture-token",
@@ -150,7 +151,7 @@ def run(tcp, suppress, tls="http"):
         def log_message(self, *_args):
             pass
 
-    with tempfile.TemporaryDirectory(prefix="trawl-vector-", dir=ROOT / ".tmp") as directory:
+    with tempfile.TemporaryDirectory(prefix="trawl-vector-", dir=FIXTURES) as directory:
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Capture)
         if tls != "http":
             ca, cert, key = certificates(directory)
@@ -268,7 +269,7 @@ if __name__ == "__main__":
     print(version, flush=True)
     subprocess.run([VECTOR, "validate", "--no-environment", "--config-dir", str(CONFIG)],
                    env=ENV, check=True)
-    (ROOT / ".tmp").mkdir(exist_ok=True)
+    FIXTURES.mkdir(parents=True, exist_ok=True)
     for tcp in (False, True):
         for suppress in (False, True):
             run(tcp, suppress)
