@@ -24,8 +24,9 @@ Open `http://localhost:8081/login` and paste it.
 `bin/dev` is also the fast server build. It compiles with
 `--no-default-features`, so `trawld` links the downloaded DuckDB shared library
 instead of compiling the bundled amalgamation. The download is cached under
-`target/duckdb-download` and reused. Run `cargo build -p trawl-server` when you
-want the bundled production build.
+`target/duckdb-download` and reused. For distributable artifacts, use the
+[shared-runtime source build](/getting-started/#build-from-source), which verifies
+the official library and stages it with the executables.
 
 The interactive database lives in the named `fleet-dev-postgres-data` volume,
 which is separate from the disposable clusters in `docker-compose.dev.yml`. When

@@ -1,0 +1,10 @@
+{
+  "version": "1.5.5",
+  "crate_version": "1.10505.0",
+  "archives": {
+    "x86_64-unknown-linux-gnu": ["libduckdb-linux-amd64.zip", "1fb8ce388157d84a25abe685a8a2520bf00c00321821968e4bb398fd766e7abb"],
+    "aarch64-unknown-linux-gnu": ["libduckdb-linux-arm64.zip", "abe4f6f005ee0b448a058322f4263584b4bd1b6faf7ab4637b79eeaf978f8e9c"],
+    "aarch64-apple-darwin": ["libduckdb-osx-universal.zip", "7b5b8915cc382d0708636fe6385c0cdad5a61c9ff8ba2638b3e2141640783155"],
+    "x86_64-apple-darwin": ["libduckdb-osx-universal.zip", "7b5b8915cc382d0708636fe6385c0cdad5a61c9ff8ba2638b3e2141640783155"]
+  }
+}
