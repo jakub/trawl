@@ -87,7 +87,9 @@
 # humans running queries); 0 disables that route class. ingest_rpm is
 # earned by the ingest permission — every other key stays on default_rpm
 # there too.
-# Per-role ceilings return as a role rate_rpm attribute (ADR-0006 slice 1).
+# The highest rate_rpm set by the key's roles replaces the route-class
+# default, including when that default is 0. See
+# docs/src/content/docs/operate/access.md#create-roles-and-keys.
 # [server.rate_limit]
 # default_rpm = 100
 # ingest_rpm = 1000
@@ -98,10 +100,10 @@
 path = "~/.trawl/data"
 
 [auth]
-# Fleet-auth Postgres keystore URL (API keys and roles live here since the
-# ADR-0004 cutover). The FLEET_DATABASE_URL environment variable takes
-# precedence. trawld will NOT start until this database is reachable and
-# migrated (`fleet-admin migrate`) — see the cutover runbook in the docs.
+# Fleet-auth PostgreSQL URL for API keys and roles. The FLEET_DATABASE_URL
+# environment variable takes precedence. Before starting trawld, provision
+# the database and apply its schema with `fleet-admin migrate`. See
+# docs/src/content/docs/operate/deployment.md#provision-the-databases.
 database_url = "postgres://fleet:fleet@localhost:5433/fleet"
 
 # How often to poll the fleet keystore for key changes (seconds).
@@ -111,7 +113,7 @@ database_url = "postgres://fleet:fleet@localhost:5433/fleet"
 
 [storage]
 # Trawl app-state Postgres URL (query history, saved queries, schedules,
-# report runs — ADR-0004 slice 3). A DEDICATED database, auto-migrated by
+# report runs). A separate database, auto-migrated by
 # trawld at boot and advisory-locked (sole writer); no fallback to the
 # [auth] URL. The TRAWL_DATABASE_URL environment variable takes precedence.
 database_url = "postgres://fleet:fleet@localhost:5433/trawl"

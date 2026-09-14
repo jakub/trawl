@@ -54,7 +54,9 @@ http_addr = "0.0.0.0:5514"
 # ingest_rpm on /api/v1/ingest; 0 = disabled for that route class.
 # ingest_rpm is earned by the ingest permission — every other key stays
 # on default_rpm there too.
-# Per-role ceilings return as a role rate_rpm attribute (ADR-0006 slice 1).
+# The highest rate_rpm set by the key's roles replaces the route-class
+# default, including when that default is 0. See
+# docs/src/content/docs/operate/access.md#create-roles-and-keys.
 # [server.rate_limit]
 # default_rpm = 100
 # ingest_rpm = 1000
@@ -64,9 +66,9 @@ http_addr = "0.0.0.0:5514"
 path = "/var/lib/trawl/data"
 
 [auth]
-# Fleet-auth Postgres keystore URL (API keys and roles live here since the
-# ADR-0004 cutover). REQUIRED: trawld will not start until this external
-# postgres database is reachable and migrated (`fleet-admin migrate`).
+# Fleet-auth PostgreSQL URL for API keys and roles. REQUIRED: provision
+# the database and apply its schema with `fleet-admin migrate` before
+# starting trawld. See docs/src/content/docs/operate/deployment.md#provision-the-databases.
 # The FLEET_DATABASE_URL environment variable takes precedence — set it in
 # /etc/default/trawld to keep credentials out of this file.
 database_url = "postgres://fleet:CHANGE_ME@db.example.internal:5432/fleet"
@@ -76,11 +78,12 @@ database_url = "postgres://fleet:CHANGE_ME@db.example.internal:5432/fleet"
 
 [storage]
 # Trawl app-state Postgres URL (query history, saved queries, schedules,
-# report runs — ADR-0004 slice 3). REQUIRED: a DEDICATED database, distinct
+# report runs). REQUIRED: a separate database, distinct
 # from the fleet keystore; trawld migrates it automatically at boot and
 # holds a session advisory lock (sole writer). No fallback to the [auth]
 # URL. The TRAWL_DATABASE_URL environment variable takes precedence.
-# Provision the database + role per the fleet-auth cutover runbook.
+# Provision the database and role as described in
+# docs/src/content/docs/operate/deployment.md#provision-the-databases.
 database_url = "postgres://trawl:CHANGE_ME@db.example.internal:5432/trawl"
 
 [ingest]
@@ -209,8 +212,9 @@ cookie_secret_path = "/var/lib/trawl/web.cookie"
 
 # Fleet SSO: parent domain for the shared fleet_session cookie. Set the
 # SAME value in every fleet app (mirrors coastwatch's session.shared_domain)
-# and provision the SAME session key in all of them — see the fleet-auth
-# cutover runbook, "Fleet SSO" section. The key minted by
+# and provision the SAME session key in all of them. See
+# docs/src/content/docs/operate/access.md#share-a-browser-session-across-fleet-applications.
+# The key minted by
 # `fleet-admin generate-session-key` is base64; cookie_secret_path expects
 # RAW 32 bytes, so decode it when overwriting /var/lib/trawl/web.cookie.
 # Unset/empty = standalone mode (origin-scoped cookie, the self-generated

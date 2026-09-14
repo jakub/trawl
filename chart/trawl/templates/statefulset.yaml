@@ -44,10 +44,9 @@ spec:
       terminationGracePeriodSeconds: {{ .Values.config.server.shutdownDrainSecs }}
       {{- if .Values.initAuth.enabled }}
       initContainers:
-        # Apply fleet-auth keystore schema migrations. Idempotent by
-        # construction (sqlx tracks applied migrations), so it runs on every
-        # pod start — no sentinel file. Key minting moved to the cutover
-        # runbook (fleet-admin against the shared keystore).
+        # Apply Fleet-auth schema migrations on every pod start when enabled.
+        # sqlx tracks applied migrations. Create keys with fleet-admin as
+        # described in docs/src/content/docs/operate/access.md#create-roles-and-keys.
         - name: init-auth
           image: {{ include "trawl.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
@@ -84,10 +83,9 @@ spec:
             - name: HOME
               value: /var/lib/trawl
             # Fleet keystore DSN — from the Secret, never the ConfigMap.
-            # FLEET_DATABASE_URL since ADR-0004 slice 3: the bare
-            # DATABASE_URL override was removed from trawld (that variable
-            # is ceded to the sqlx test harness). fleet-admin (init
-            # container above) still reads DATABASE_URL.
+            # trawld reads FLEET_DATABASE_URL. fleet-admin in the init
+            # container reads DATABASE_URL. See
+            # docs/src/content/docs/operate/deployment.md#provision-the-databases.
             - name: FLEET_DATABASE_URL
               valueFrom:
                 secretKeyRef:

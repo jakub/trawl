@@ -33,6 +33,8 @@ architecture, and symbols. Do not invent an independent packaging recipe.
 ## Prepare and apply the change
 
 Identify the shared Fleet keystore and the dedicated Trawl app-state database.
+Provision both databases using the
+[database procedure](../../../docs/src/content/docs/operate/deployment.md#provision-the-databases).
 Fleet migrations use `fleet-admin`; `trawld` migrates its own database. Preserve
 the single-writer arrangement. Inspect existing service configuration and
 storage before changing them, including the epoch gate in
@@ -46,7 +48,7 @@ values before applying. For Debian, inspect the package's scripts and units.
 
 Preserve installed cookie-key material on ordinary upgrades. Fresh local
 cookie provisioning does not establish shared Fleet SSO. The
-[SSO procedure](../../../docs/src/content/docs/reference/fleet-auth-cutover.md)
+[SSO procedure](../../../docs/src/content/docs/operate/access.md#share-a-browser-session-across-fleet-applications)
 describes shared session material; read that section only when SSO is relevant.
 Account for database migrations and data-root cutovers before promising rollback.
 
