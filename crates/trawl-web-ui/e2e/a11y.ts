@@ -11,11 +11,20 @@ import { expect } from './fixtures';
 type Loc = import('@playwright/test').Locator;
 
 /** The fleet-ui focus ring, as the browser computes it. Two readings:
- * `:focus-visible` is the state, the box-shadow is the pixels. A ring
- * rule that stopped matching leaves the first true and the second
- * `none`. */
+ * `:focus-visible` is the state, the outline is the pixels. A ring rule
+ * that stopped matching leaves the first true and the second `none`.
+ * ADR-0032 moved the ring off box-shadow onto `outline` so it never
+ * competes with the elevation shadow a plane already paints, so the
+ * pixels are read as an outline style and width — a control that paints
+ * an elevation shadow would satisfy a box-shadow reading with no ring at
+ * all. */
 export async function expectFocusRing(control: Loc): Promise<void> {
   await expect(control).toBeFocused();
   expect(await control.evaluate((el) => el.matches(':focus-visible'))).toBe(true);
-  expect(await control.evaluate((el) => getComputedStyle(el).boxShadow)).not.toBe('none');
+  const style = await control.evaluate((el) => {
+    const s = getComputedStyle(el);
+    return { style: s.outlineStyle, width: parseFloat(s.outlineWidth) };
+  });
+  expect(style.style).not.toBe('none');
+  expect(style.width).toBeGreaterThan(0);
 }
