@@ -94,7 +94,7 @@ pub fn StatusBar(
     };
 
     view! {
-        <div class="statusbar">
+        <footer class="statusbar">
             <div class="grp">
                 <span class=status_class></span>
                 <span class="strong status-label">{status_label}</span>
@@ -162,6 +162,6 @@ pub fn StatusBar(
             >
                 <span>{theme_label}</span>
             </button>
-        </div>
+        </footer>
     }
 }

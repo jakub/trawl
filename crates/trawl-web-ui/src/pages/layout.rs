@@ -128,20 +128,24 @@ pub fn AuthShell() -> impl IntoView {
         }
     });
 
-    let sidebar_groups = Signal::derive(move || {
-        vec![SidebarGroup {
-            label: None,
-            items: section::items_for(current_app.get())
-                .iter()
-                .map(|item| RailItem {
-                    id: item.id.to_string(),
-                    label: item.label.to_string(),
-                    icon: item.icon,
-                    path: item.path.to_string(),
-                    badge: None,
-                })
-                .collect(),
-        }]
+    let sidebar_groups = Signal::derive(|| {
+        section::groups()
+            .iter()
+            .map(|group| SidebarGroup {
+                label: group.label.map(String::from),
+                items: group
+                    .items
+                    .iter()
+                    .map(|item| RailItem {
+                        id: item.id.to_string(),
+                        label: item.label.to_string(),
+                        icon: item.icon,
+                        path: item.path.to_string(),
+                        badge: None,
+                    })
+                    .collect(),
+            })
+            .collect::<Vec<_>>()
     });
 
     let user = Signal::derive(move || {
@@ -236,12 +240,12 @@ pub fn RedirectTo(#[prop(into)] path: String) -> impl IntoView {
 #[component]
 pub fn NotFound() -> impl IntoView {
     view! {
-        <div class="login-shell">
+        <main class="login-shell">
             <div class="login-card">
                 <h1>"404"</h1>
                 <p class="subtitle">"That page does not exist."</p>
                 <a href="/search">"Go to Search"</a>
             </div>
-        </div>
+        </main>
     }
 }

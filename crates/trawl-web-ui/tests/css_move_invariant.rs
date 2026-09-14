@@ -77,6 +77,29 @@ fn custom_properties(css: &str) -> BTreeSet<String> {
 /// `fleet-ui/tests/component_class_contract.rs`'s `emits(...)`
 /// assertions.
 const MOVED_SELECTORS: &[&str] = &[
+    // Sidebar and command bar (ADR-0032).
+    ".rail",
+    ".rail .brand",
+    ".rail .brand .accent",
+    ".rail .grp",
+    ".rail .grp + .grp",
+    ".rail .grp-lb",
+    ".rail .it",
+    ".rail .it > svg",
+    ".rail .it .lb",
+    ".rail .it:hover",
+    ".rail .it.active",
+    ".rail .it .badge",
+    ".rail .bot",
+    ".rail.collapsed",
+    ".rail.overlay",
+    ".nav-scrim",
+    ".shell-content",
+    ".topbar .nav-toggle",
+    ".topbar .crumb",
+    ".seg",
+    ".seg .seg-opt",
+    ".seg .seg-opt.on",
     ".daterange",
     ".daterange .dr-trigger",
     ".dr-trigger",
@@ -161,6 +184,16 @@ const MOVED_SELECTORS: &[&str] = &[
 /// not exist in either stylesheet; reappearing anywhere means per-site
 /// drift is growing back.
 const RETIRED_SELECTORS: &[&str] = &[
+    // The command bar's brand, mode tabs and app links left with the
+    // sidebar (ADR-0032). `.rail .it .lb` did not: the sidebar still
+    // renders a label, visible or screen-reader-only.
+    ".topbar .brand",
+    ".topbar .brand .accent",
+    ".topbar .modes",
+    ".topbar .mode",
+    ".topbar .mode:hover",
+    ".topbar .mode.active",
+    ".topbar .app-links",
     ".live-badge",
     ".live-badge.live",
     ".live-badge.lagged",

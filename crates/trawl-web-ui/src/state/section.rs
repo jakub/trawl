@@ -2,12 +2,14 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Per-mode rail section. The valid set depends on which `AppMode` is
-//! active; the active section is derived from the current pathname.
+//! The sidebar's destinations, grouped. Every group ships at once (the
+//! sidebar lists them all); `AppMode` stays the grouping key, and the
+//! active section is derived from the current pathname.
 //!
-//! `RailItem`, `items_for`, and `default_for` are pure `&'static` data
-//! and build on every target so they can be unit-tested natively;
-//! `from_url` (the reactive `Memo`) is wasm32-only.
+//! `RailItem`, `SidebarGroupSpec`, `groups`, `items_for` and
+//! `default_for` are pure `&'static` data and build on every target so
+//! they can be unit-tested natively; `from_url` (the reactive `Memo`)
+//! is wasm32-only.
 
 // On native, only the tests consume `items_for` / `default_for`.
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
@@ -20,10 +22,10 @@ use leptos_router::hooks::use_location;
 
 use crate::state::app_mode::AppMode;
 
-/// Single item rendered in the left rail — a `&'static` descriptor;
-/// the `AuthShell` maps these onto owned `fleet_ui::RailItem`s at the
-/// Shell boundary. Icons are `fleet_ui::Icon` (ADR-0030: apps never
-/// inline raw SVG for chrome).
+/// Single destination in the sidebar — a `&'static` descriptor; the
+/// `AuthShell` maps these onto owned `fleet_ui::RailItem`s at the Shell
+/// boundary. Icons are `fleet_ui::Icon` (ADR-0030: apps never inline
+/// raw SVG for chrome).
 #[derive(Debug, Clone, Copy)]
 pub struct RailItem {
     pub id: &'static str,
@@ -32,62 +34,87 @@ pub struct RailItem {
     pub path: &'static str,
 }
 
-// A flat `&'static` lookup table — splitting the match arms would only
-// obscure the per-mode rail definitions.
-#[allow(clippy::too_many_lines)]
-#[must_use]
-pub fn items_for(mode: AppMode) -> &'static [RailItem] {
-    use Icon::{Chart, Clock, Database, Grid, Search as SearchIcon};
-    match mode {
-        AppMode::Search => &[
+/// One labelled run of destinations. `label: None` renders with no
+/// heading; `mode` is the `AppMode` the run belongs to, which is what
+/// `items_for` matches on.
+#[derive(Debug, Clone, Copy)]
+pub struct SidebarGroupSpec {
+    pub label: Option<&'static str>,
+    pub mode: AppMode,
+    pub items: &'static [RailItem],
+}
+
+/// Every sidebar group, in render order. Schema is listed once, under
+/// Search: the Settings group carries Health alone.
+const GROUPS: &[SidebarGroupSpec] = &[
+    SidebarGroupSpec {
+        label: None,
+        mode: AppMode::Search,
+        items: &[
             RailItem {
                 id: "search",
                 label: "Search",
-                icon: SearchIcon,
+                icon: Icon::Search,
                 path: "/search",
             },
             RailItem {
                 id: "history",
                 label: "History",
-                icon: Clock,
+                icon: Icon::Clock,
                 path: "/search/history",
             },
             RailItem {
                 id: "schema",
                 label: "Schema",
-                icon: Database,
+                icon: Icon::Database,
                 path: "/search/schema",
             },
         ],
-        AppMode::Jobs => &[
+    },
+    SidebarGroupSpec {
+        label: Some("Scheduled work"),
+        mode: AppMode::Jobs,
+        items: &[
             RailItem {
                 id: "nets",
                 label: "Nets",
-                icon: Database,
+                icon: Icon::Database,
                 path: "/jobs/nets",
             },
             RailItem {
                 id: "runs",
                 label: "Runs",
-                icon: Chart,
+                icon: Icon::Chart,
                 path: "/jobs/runs",
             },
         ],
-        AppMode::Settings => &[
-            RailItem {
-                id: "health",
-                label: "Health",
-                icon: Chart,
-                path: "/settings/health",
-            },
-            RailItem {
-                id: "schema",
-                label: "Schema",
-                icon: Grid,
-                path: "/search/schema",
-            },
-        ],
-    }
+    },
+    SidebarGroupSpec {
+        label: Some("Operations"),
+        mode: AppMode::Settings,
+        items: &[RailItem {
+            id: "health",
+            label: "Health",
+            icon: Icon::Chart,
+            path: "/settings/health",
+        }],
+    },
+];
+
+#[must_use]
+pub fn groups() -> &'static [SidebarGroupSpec] {
+    GROUPS
+}
+
+/// The destinations of the group a mode owns. Every mode owns exactly
+/// one group, so the empty fallback is unreachable — and pinned so by
+/// `every_mode_has_a_non_empty_rail_with_a_valid_default`.
+#[must_use]
+pub fn items_for(mode: AppMode) -> &'static [RailItem] {
+    groups()
+        .iter()
+        .find(|group| group.mode == mode)
+        .map_or(&[][..], |group| group.items)
 }
 
 #[must_use]
@@ -131,6 +158,26 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
+
+    #[test]
+    fn groups_carry_the_three_modes_in_order_and_schema_once() {
+        assert_eq!(
+            groups().iter().map(|g| g.label).collect::<Vec<_>>(),
+            vec![None, Some("Scheduled work"), Some("Operations")]
+        );
+        assert_eq!(
+            groups().iter().map(|g| g.mode).collect::<Vec<_>>(),
+            AppMode::ALL.to_vec()
+        );
+        // Schema is one destination, under Search: the Settings group
+        // used to list it a second time.
+        let schema = groups()
+            .iter()
+            .flat_map(|g| g.items.iter())
+            .filter(|item| item.path == "/search/schema")
+            .count();
+        assert_eq!(schema, 1, "/search/schema must appear in exactly one group");
+    }
 
     #[test]
     fn every_mode_has_a_non_empty_rail_with_a_valid_default() {
