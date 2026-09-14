@@ -198,6 +198,9 @@ fn tabs_emits_both_strip_families_with_distinct_active_idioms() {
     emits(TABS, r#"class="t""#, ".tabs .t");
     emits(TABS, "class:active", ".tabs .t.active");
     emits(TABS, r#"class="c""#, ".tabs .t .c");
+    // The trailing slot's wrapper: `.tabs .tabs-actions` is what keeps
+    // the consumer's actions on one line when the strip wraps.
+    emits(TABS, r#"class="tabs-actions""#, ".tabs .tabs-actions");
 
     // Drawer family: `.sd-tabs > span.tb.on`. The active modifier here is
     // `on` (weight-600 `.sd-tabs .tb.on`) — a different idiom from the

@@ -178,7 +178,10 @@ pub fn Tabs(
                     }).collect_view()}
                 </div>
                 <div class="sp"></div>
-                {trailing.map(|t| t())}
+                // One group, not N siblings: at narrow widths the strip
+                // wraps, and loose actions wrapped one at a time — an
+                // "Export" alone on a second line beside an empty first.
+                {trailing.map(|t| view! { <div class="tabs-actions">{t()}</div> })}
             </div>
         }
         .into_any(),

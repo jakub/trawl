@@ -757,6 +757,17 @@ select:focus-visible,
 .tabs .t.active { color: var(--ink); border-bottom-color: var(--accent); font-weight: 500; }
 .tabs .t .c { color: var(--ink-3); font-variant-numeric: tabular-nums; font-size: var(--fs-small); }
 .tabs .sp { flex: 1; }
+/* The trailing slot is one wrapping unit. The strip wraps at narrow
+ * widths, and consumer actions sat in it as loose siblings, so the row
+ * broke between them — "Export" alone on a second line. They move
+ * together now, and never break from each other. */
+.tabs .tabs-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-inline-start: auto;
+  flex-wrap: nowrap;
+}
 /* The role="tablist" node holds ONLY the tabs (ADR-0028); the spacer
  * and the trailing action slot are its siblings, so the strip keeps one
  * flex row and each tab's -1px bottom margin still laps the container's

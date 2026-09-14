@@ -662,11 +662,14 @@
 /* The trailing Save/Export actions and the editor's tool row are real
  * <button>s so a link that cannot be read can disable them (ADR-0027);
  * these two rules put the text-link look back over the button chrome. */
+/* `color` is deliberately NOT reset here: it would outrank the --ink-2
+ * tone the two families set above and paint both rows at the inherited
+ * body colour. The one place the inherited colour is wanted is the
+ * disabled hover below, which restates it there. */
 .tabs button.action, .editor-tools button.tool {
   font: inherit;
   background: none;
   border: 0;
-  color: inherit;
 }
 .tabs .action:disabled, .editor-tools .tool:disabled {
   opacity: .45;
