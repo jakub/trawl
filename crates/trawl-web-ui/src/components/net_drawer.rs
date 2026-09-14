@@ -290,7 +290,7 @@ pub fn NetDrawer(
         >
             {move || missing.get().then(|| view! { <p role="status">"This net no longer exists. Your draft is retained, but it cannot be saved." " " <a href="/jobs/nets">"Back to Nets"</a></p> })}
             <div hidden=move || eff_tab.get() != "runs">
-                <RunsPane net_id=net_for_runs.id bus=bus on_search=on_search mutation=mutation/>
+                <RunsPane net_id=net_for_runs.id bus=bus on_search=on_search mutation=mutation active=Signal::derive(move || eff_tab.get() == "runs")/>
             </div>
             <div hidden=move || eff_tab.get() == "runs">
                 <QuerySchedulePane net=net_for_query saved=saved bus=bus on_refresh=on_refresh/>
@@ -844,22 +844,20 @@ fn RunsPane(
     bus: ToastBus,
     on_search: Callback<String>,
     mutation: RwSignal<u64>,
+    active: Signal<bool>,
 ) -> impl IntoView {
     let table_viewport = NodeRef::<leptos::html::Div>::new();
     let page = RwSignal::new(0usize);
     let expanded_run: RwSignal<Option<i64>> = RwSignal::new(None);
     let expanded_summary = RwSignal::new(None::<trawl_api::ReportRunSummary>);
 
-    let pending = RwSignal::new(false);
-    let (runs, refresh_error, retry) = super::job_refresh::job_refresh(move || {
+    let (runs, refresh_error, retry) = super::job_refresh::job_refresh(active, move || {
         mutation.track();
         let p = page.get();
         async move {
             let offset = PageWindow::checked_offset(p, RUNS_PAGE_SIZE)
                 .map_err(|_| api::ApiError::Refused("This runs page is too large to request."))?;
-            let _ = pending.try_set(true);
             let response = api::list_runs(net_id, RUNS_PAGE_SIZE.get(), offset).await;
-            let _ = pending.try_set(false);
             response.map(|resp| (p, resp))
         }
     });
@@ -875,7 +873,7 @@ fn RunsPane(
             RUNS_PAGE_SIZE,
             returned,
             PageTotal::Known(total),
-            pending.get() || page.get() != fetched,
+            !matches!(runs.get(), Some(Ok(_))) || page.get() != fetched,
         )
         .expect("checked runs page")
     });
@@ -935,7 +933,7 @@ fn RunsPane(
                                 <td class="mono">{move || run.get().row_count.map_or_else(|| "—".to_string(), |n| n.to_string())}</td>
                                 <td class="path">{move || run.get().error_message.unwrap_or_default()}</td>
                             </tr>
-                            <Show when=is_expanded><tr><td colspan="5"><RunResultPreview net_id=net_id run_id=run_id bus=bus on_search=on_search summary=expanded_summary/></td></tr></Show>
+                            <Show when=is_expanded><tr><td colspan="5"><RunResultPreview net_id=net_id run_id=run_id bus=bus on_search=on_search summary=expanded_summary active=active/></td></tr></Show>
                         }
                     }/>
                 </tbody></table>
@@ -955,17 +953,29 @@ fn RunsPane(
 #[component]
 #[allow(unused_variables)]
 fn RunResultPreview(
+    active: Signal<bool>,
     summary: RwSignal<Option<trawl_api::ReportRunSummary>>,
     net_id: i64,
     run_id: i64,
     bus: ToastBus,
     on_search: Callback<String>,
 ) -> impl IntoView {
-    let (result, refresh_error, retry) =
-        super::job_refresh::job_refresh(move || async move { api::get_run(net_id, run_id).await });
+    let terminal = RwSignal::new(false);
+    let (result, refresh_error, retry) = super::job_refresh::job_refresh(
+        Signal::derive(move || active.get() && !terminal.get()),
+        move || async move { api::get_run(net_id, run_id).await },
+    );
     let preview_page = RwSignal::new(0usize);
     Effect::new(move |_| {
         if let Some(Ok(response)) = result.get() {
+            // A running response must not write false back into the poll
+            // gate: that notification would start another read immediately.
+            if matches!(
+                response.summary.status.as_str(),
+                "success" | "error" | "timeout"
+            ) {
+                terminal.set(true);
+            }
             summary.set(Some(response.summary));
         }
     });

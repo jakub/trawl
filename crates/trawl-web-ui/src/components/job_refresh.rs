@@ -13,6 +13,7 @@ use wasm_bindgen::{JsCast, closure::Closure};
 
 #[allow(clippy::type_complexity)]
 pub fn job_refresh<T, F, Fut>(
+    active: Signal<bool>,
     fetch: F,
 ) -> (
     RwSignal<Option<Result<T, ApiError>>>,
@@ -47,7 +48,7 @@ where
     Effect::new(move |_| {
         let busy = timer_busy.clone();
         timer.update_value(|t| {
-            *t = visible.get().then(|| {
+            *t = (visible.get() && active.get()).then(|| {
                 gloo_timers::callback::Interval::new(5_000, move || {
                     if !busy.get() {
                         refresh.run(());
@@ -69,7 +70,7 @@ where
     });
     Effect::new(move |_| {
         revision.track();
-        let visible = visible.get();
+        let visible = visible.get() && active.get();
         // Invoke synchronously so page and mutation dependencies are tracked.
         let future = fetch();
         desired.set(desired.get().wrapping_add(1));
@@ -94,6 +95,12 @@ where
             }
             if generation != desired.get() {
                 refresh.run(());
+                return;
+            }
+            if matches!(result, Err(ApiError::Unauthorized)) {
+                live.set(false);
+                timer.update_value(|t| *t = None);
+                let _ = leptos::prelude::window().location().set_href("/login");
                 return;
             }
             match result {
