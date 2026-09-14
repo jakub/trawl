@@ -40,9 +40,12 @@ use leptos::web_sys;
 use trawl_api::value::QueryResult;
 use wasm_bindgen::JsCast;
 
+use crate::categorical::{CatShape, detect as detect_categorical};
+use crate::components::cat_chart::CatChart;
 use crate::components::chart::Chart;
 use crate::components::degraded_notice::DegradedNotice;
 use crate::components::editor_wrap::EditorWrap;
+use crate::components::exact_table::ExactTable;
 use crate::components::export_modal::ExportModal;
 use crate::components::facet_sidebar::FacetSidebar;
 use crate::components::histogram::Histogram;
@@ -757,6 +760,16 @@ pub fn Search() -> impl IntoView {
     });
     let generation = Signal::derive(move || result_gen.get());
 
+    // The categorical shape of the snapshot aggregate on screen, if it
+    // has one. Read off the executed query and the response together:
+    // only the `stats … by <field>` stage knows which column is the
+    // group, and a chart drawn without it would label the wrong axis.
+    let cat_shape: Memo<Option<CatShape>> = Memo::new(move |_| {
+        rows.get()
+            .and_then(Result::ok)
+            .and_then(|resp| detect_categorical(&effective_q.get(), &resp.result))
+    });
+
     view! {
         <div class="search-layout">
             // Ahead of the rail, whose value controls stay in the tab
@@ -899,6 +912,30 @@ pub fn Search() -> impl IntoView {
                     // link cannot be read.
                     ().into_any()
                 } else { match (active_tab.get(), mode.get()) {
+                    // An aggregation answers in exact numbers, so the
+                    // table drops the expansion column and offers a
+                    // search only on the fields the query grouped by
+                    // (F02). The chart beside it is decoration over the
+                    // same numbers, which is why it is aria-hidden.
+                    (ResultsTab::Events, Mode::Snapshot) if is_chart_query.get() => view! {
+                        <>
+                            <Histogram rows=rows window=window pending=loading/>
+                            <div class="agg-split" class:has-chart=move || cat_shape.get().is_some()>
+                                <ExactTable
+                                    busy=running
+                                    page=page
+                                    rows=rows
+                                    on_paginate=on_paginate
+                                    on_add_filter=on_result_filter
+                                />
+                                {move || {
+                                    let shape = cat_shape.get()?;
+                                    let resp = rows.get()?.ok()?;
+                                    Some(view! { <CatChart shape=shape result=resp.response.result/> })
+                                }}
+                            </div>
+                        </>
+                    }.into_any(),
                     (ResultsTab::Events, Mode::Snapshot) => view! {
                         <>
                             <Histogram rows=rows window=window pending=loading/>

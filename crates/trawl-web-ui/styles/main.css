@@ -1022,6 +1022,82 @@
 }
 
 /* ─────────────────────────────────────────────────────────────────
+ *  Aggregate presentation (ADR-0032): the exact table, and beside it at
+ *  1100px and up a bar per group. The chart is decoration over numbers
+ *  the table already states, so it is aria-hidden and it is the thing
+ *  that yields the narrow column.
+ * ─────────────────────────────────────────────────────────────── */
+.agg-split {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  flex: 1;
+  min-height: 0;
+}
+.agg-split > .results { min-width: 0; }
+/* Stacked, the chart reads first: it is the shape of the answer, and
+ * the table under it is the detail. */
+.cat-chart {
+  padding: 12px 14px;
+  border-top: 1px solid var(--line);
+  overflow: auto;
+  max-height: 480px;
+  order: -1;
+}
+.cat-title {
+  margin: 0 0 8px;
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui);
+  font-weight: 600;
+  color: var(--ink-2);
+}
+.cat-bars { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+.cat-bars li {
+  display: grid;
+  grid-template-columns: minmax(64px, 30%) minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  font-family: var(--font-mono);
+  font-size: var(--fs-dense);
+}
+.cat-lb { color: var(--ink-2); overflow-wrap: anywhere; }
+.cat-track {
+  position: relative;
+  height: 12px;
+  background: var(--well);
+  box-shadow: var(--inset);
+  border-radius: var(--radius-xs);
+  overflow: hidden;
+}
+.cat-track i { position: absolute; top: 0; bottom: 0; left: 0; background: var(--accent); opacity: .85; }
+/* A column with a negative value draws from the middle, with a hairline
+ * marking the zero the bars grow away from. */
+.cat-bars.signed .cat-track::before {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--ink-4);
+}
+.cat-bars.signed .cat-track i { left: 50%; }
+.cat-bars.signed li.neg .cat-track i { left: auto; right: 50%; }
+.cat-val { color: var(--ink); font-variant-numeric: tabular-nums; }
+.cat-bars li.null .cat-val { color: var(--ink-3); }
+/* The only control an aggregate cell carries, and only on a column the
+ * query grouped by: a generated metric names no field to search (F02). */
+.results-table.exact .grp-search {
+  font: inherit;
+  background: none;
+  border: 0;
+  padding: 0;
+  color: var(--accent-ink);
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+/* ─────────────────────────────────────────────────────────────────
  *  Message-first rows (ADR-0032). Time, severity and the message at
  *  full width, with service / host / latency as a muted second line;
  *  every other column is read in the detail or the inspector.
@@ -1939,6 +2015,11 @@
   .health-queries { grid-column: 2; grid-row: 1; }
   .health-capacity { grid-column: 2; grid-row: 2; }
   .health-live { grid-column: 2; grid-row: 3; }
+}
+/* Wide enough for the bars to stand beside the numbers they draw. */
+@media (min-width: 1100px) {
+  .agg-split.has-chart { grid-template-columns: minmax(0, 1fr) minmax(280px, 34%); }
+  .agg-split .cat-chart { order: 0; border-top: 0; border-left: 1px solid var(--line); }
 }
 
 /* The sidebar remains one mounted disclosure so field search and group
