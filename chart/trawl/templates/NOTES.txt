@@ -54,6 +54,6 @@ Open http://localhost:8090 and sign in with your personal API key.
 
 Open a configured browser origin through its ingress or reverse proxy.
 For local HTTP access, follow the chart's port-forward setup:
-  https://trawl.sh/operate/deployment/#install-with-helm
+  https://trawl.sh/operate/deployment/#use-a-local-browser
 {{- end }}
 {{- end }}

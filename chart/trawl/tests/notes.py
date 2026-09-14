@@ -94,7 +94,7 @@ class InstallNotes(unittest.TestCase):
                 else:
                     self.assertNotIn("8090:9090", notes)
                     self.assertNotIn("Open http://localhost:8090", notes)
-                    self.assertIn("/operate/deployment/#install-with-helm", notes)
+                    self.assertIn("/operate/deployment/#use-a-local-browser", notes)
 
     def test_browser_ingress_and_api_route_are_both_reported(self):
         notes, manifest = render(**{

@@ -196,6 +196,38 @@ cluster.
    `kubectl -n trawl port-forward svc/trawl 5514:5514` if port 5514 is not
    published.
 
+### Use a local browser
+
+For a local trial through a port-forward, replace the `web` and `ingress`
+sections in `trawl-values.yaml` above with these values. Keep the database
+Secrets and persistence settings:
+
+```yaml
+web:
+  enabled: true
+  publicOrigins:
+    - http://localhost:8090
+  allowInsecureCookies: true
+ingress:
+  enabled: false
+```
+
+Apply the values with the `helm upgrade --install` command above and wait for
+the StatefulSet rollout. Then keep this command running:
+
+```bash
+kubectl port-forward --namespace trawl svc/trawl 5514:5514 8090:8090
+```
+
+Open `http://localhost:8090` on the machine running the port-forward and sign
+in with a personal API key from [Create roles and keys](/operate/access/#create-roles-and-keys).
+Use `localhost` as written: `http://127.0.0.1:8090` is a different browser
+origin. Port 5514 serves the HTTPS API; port 8090 serves the browser.
+
+When you switch to an HTTPS ingress, set `web.publicOrigins` to its HTTPS
+origin, restore the ingress values, and set `web.allowInsecureCookies: false`.
+See [Set the browser origin](/operate/access/#set-the-browser-origin).
+
 ## Install from a tarball
 
 The [release tarball](/getting-started/) holds the five executables and
