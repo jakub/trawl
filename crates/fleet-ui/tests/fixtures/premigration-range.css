@@ -1,7 +1,19 @@
 /* Captured from trawl-web-ui/styles/main.css at d53ee232.
  * The shared disabled selector is split without changing its declarations.
  * Pre-1.0: update the three trigger sizing rules to keep Haul reachable with
- * long absolute ranges; browser geometry checks cover 320-1440px in both themes. */
+ * long absolute ranges; browser geometry checks cover 320-1440px in both themes.
+ *
+ * 2026-09-13, ADR-0032 planes: .dr-trigger, .dr-trigger span, .dr-pop,
+ * .dr-pop .opt, .dr-pop .opt.on and .dr-pop .cust .fld input re-captured
+ * verbatim from the shipped fleet-ui.css; the other 21 rules are
+ * untouched and the count stays 27. The trigger and the custom From/To
+ * inputs become wells (--well plus the --inset shadow), the popover
+ * takes the --elev-3 overlay step with an --edge-hi highlight, and the
+ * preset options become a raised active option on a --fill track. The
+ * trigger also loses `height: 28px` and `white-space: nowrap` so an
+ * absolute range wraps its whole value instead of ellipsizing it into
+ * the Haul button (F06), and its input rule drops `outline: none`
+ * because :focus-visible now paints a 2px --ring outline. */
 /* Date range — single trigger (grafana-style); all presets live in the
  * popover. The trigger is a <button> (ADR-0029): it already declares its
  * own background, border and colour, so `font: inherit` is the whole
@@ -15,27 +27,33 @@
   align-items: center;
   justify-content: center;
   gap: 6px;
-  height: 28px;
-  padding: 0 10px;
-  background: var(--fill);
+  min-height: 32px;
+  height: auto;
+  width: 100%;
+  padding: 5px 10px;
+  background: var(--well);
+  box-shadow: var(--inset);
   border: 1px solid var(--line);
   border-radius: var(--radius-ctl);
   color: var(--ink-2);
   font: inherit;
   font-family: var(--font-ui);
   font-size: var(--fs-ui);
+  line-height: 1.35;
   margin: 0;
   cursor: pointer;
   user-select: none;
-  white-space: nowrap;
+  white-space: normal;
+  overflow-wrap: anywhere;
   transition: color 120ms, background 120ms, border-color 120ms;
 }
-/* Absolute-range labels ("2026-07-16… → now") can exceed the column —
- * ellipsize instead of blowing the layout out. */
+/* Absolute-range labels ("2026-07-16… → now") exceed the column at
+ * narrow widths: the trigger grows down and wraps the whole value
+ * rather than ellipsizing it into the Haul button (F06). */
 .dr-trigger span {
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 .dr-trigger:hover { color: var(--ink); background: var(--fill-2); }
 .dr-trigger.open {
@@ -60,7 +78,7 @@
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: var(--radius-panel);
-  box-shadow: var(--shadow-3);
+  box-shadow: inset 0 1px 0 var(--edge-hi), var(--elev-3);
   padding: 12px;
   animation: fadeIn 120ms;
 }
@@ -77,8 +95,8 @@
   font-family: var(--font-ui);
   font-size: var(--fs-ui);
   color: var(--ink);
-  background: var(--panel-2);
-  border: 1px solid var(--line-2);
+  background: var(--fill);
+  border: 1px solid transparent;
   border-radius: var(--radius-sm);
   cursor: pointer;
   text-align: center;
@@ -90,9 +108,10 @@
 .dr-pop .opt:hover { background: var(--accent-wash); border-color: var(--accent); }
 .dr-pop .opt:disabled:hover { background: var(--panel-2); border-color: var(--line-2); }
 .dr-pop .opt.on {
-  background: var(--accent-wash);
-  color: var(--accent);
-  border-color: color-mix(in oklab, var(--accent) 45%, transparent);
+  background: var(--panel);
+  color: var(--accent-ink);
+  border-color: var(--line);
+  box-shadow: var(--elev-1);
   font-weight: 600;
 }
 /* From/To stack vertically — a full ISO timestamp at mono --table-fs
@@ -123,11 +142,11 @@
   font-family: var(--font-mono);
   font-size: var(--table-fs);
   padding: 5px 8px;
-  background: var(--panel-2);
+  background: var(--well);
+  box-shadow: var(--inset);
   border: 1px solid var(--line);
   border-radius: var(--radius-ctl);
   color: var(--ink);
-  outline: none;
 }
 .dr-pop .cust .fld input:focus { border-color: var(--accent); }
 .dr-pop .foot {
