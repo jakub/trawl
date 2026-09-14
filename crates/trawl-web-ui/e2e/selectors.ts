@@ -219,6 +219,10 @@ export const SEL = {
   editorTool: '.editor-tools button.tool',
 
   // -- the stretched row control and its neighbours (ADR-0029) -------
+  /// crates/trawl-web-ui/src/pages/schema.rs — the sheet card a list
+  /// page's table sits in. Its header carries the list's title, the
+  /// count of what is shown, and the filter input (ADR-0032).
+  listSheet: '.list-sheet',
   /// One data row of a `.tbl` div table. Every list page mounts exactly
   /// one `.tbl-body`, so this is unambiguous per page: schema services,
   /// nets, runs and history all render the same row shape.

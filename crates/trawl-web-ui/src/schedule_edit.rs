@@ -188,6 +188,26 @@ pub fn validate_max_runs(text: &str) -> Result<Option<u64>, ScheduleEditError> {
         .map_err(|_| ScheduleEditError::InvalidMaxRuns)
 }
 
+/// How a net's schedule reads in a list: its cadence and what each run
+/// covers, in one phrase.
+///
+/// The window half is the wire's own vocabulary said in words — an
+/// absent `window` is query mode, `since_last` is tiling, and anything
+/// else is the span the server parses. Nothing here parses a duration,
+/// so a span is quoted rather than described.
+#[must_use]
+pub fn cadence_sentence(schedule: Option<&ScheduleResponse>) -> String {
+    let Some(schedule) = schedule else {
+        return "No schedule".to_owned();
+    };
+    let covers = match schedule.window.as_deref() {
+        None => "query text".to_owned(),
+        Some("since_last") => "since last run".to_owned(),
+        Some(span) => format!("fixed span {span}"),
+    };
+    format!("Every {} · {covers}", schedule.interval)
+}
+
 /// The line a stored run's preview shows when the run stored more rows
 /// than the response carries, or `None` when paging covers everything.
 ///
@@ -332,6 +352,25 @@ mod tests {
         );
         assert_eq!(preview_cap(Some(45), 45), None);
         assert_eq!(preview_cap(None, 45), None);
+    }
+
+    /// The list's one-line reading of a schedule: no schedule at all,
+    /// and each of the three window shapes.
+    #[test]
+    fn cadence_sentence_reads_every_window_shape() {
+        assert_eq!(cadence_sentence(None), "No schedule");
+        assert_eq!(
+            cadence_sentence(Some(&schedule(None, None))),
+            "Every 1h · query text"
+        );
+        assert_eq!(
+            cadence_sentence(Some(&schedule(Some("since_last"), None))),
+            "Every 1h · since last run"
+        );
+        assert_eq!(
+            cadence_sentence(Some(&schedule(Some("15m"), None))),
+            "Every 1h · fixed span 15m"
+        );
     }
 }
 

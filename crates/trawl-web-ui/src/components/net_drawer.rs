@@ -43,6 +43,11 @@ pub fn NetDrawer(
     on_tab_change: Callback<String>,
     on_search: Callback<String>,
     on_refresh: Callback<()>,
+    /// Render in flow beside the nets list rather than over a scrim
+    /// (ADR-0032). The page feeds its viewport query straight in; the
+    /// panes mount once and stay mounted across the breakpoint.
+    #[prop(into, optional)]
+    docked: Signal<bool>,
 ) -> impl IntoView {
     let bus = expect_context::<ToastBus>();
     let alive = StoredValue::new(true);
@@ -222,6 +227,7 @@ pub fn NetDrawer(
             on_tab_change=on_tab_change
             on_close=on_close
             on_escape=on_escape
+            docked=docked
             title=Box::new(move || view! {
                 <Show
                     when=move || editing_name.get()

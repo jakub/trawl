@@ -30,6 +30,7 @@ use leptos::prelude::*;
 use leptos::web_sys;
 use leptos_router::NavigateOptions;
 use leptos_router::hooks::{use_navigate, use_query_map};
+use leptos_use::use_media_query;
 use trawl_api::ServiceSchema;
 use trawl_core::parser::suggest::quote_dsl_field;
 use wasm_bindgen::JsCast as _;
@@ -41,8 +42,7 @@ use crate::api;
 use crate::components::enc_uri as enc;
 use crate::components::field_case_drawer::FieldCaseDrawer;
 use crate::components::service_card_fmt::{
-    avg_cov_permille, degraded_count, format_avg_coverage, format_bytes, format_count, is_healthy,
-    today_yesterday_utc,
+    degraded_count, format_bytes, format_count, is_healthy, today_yesterday_utc,
 };
 use crate::components::service_drawer::ServiceDrawer;
 use crate::components::sort_th::table_sort_th;
@@ -73,18 +73,29 @@ fn focus_on_next_frame(id: &'static str) {
     });
 }
 
+/// Whether a service survives the list filter: its own name, or any of
+/// the field names it carries. Named once because the sheet header
+/// counts exactly what the table renders.
+fn matches_filter(svc: &ServiceSchema, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    svc.name.to_lowercase().contains(needle)
+        || svc
+            .columns
+            .iter()
+            .any(|c| c.name.to_lowercase().contains(needle))
+}
+
 /// Sort key for the services table. Clicking the active header flips
 /// direction; a fresh key starts at its natural direction (name
 /// ascending, everything else descending).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SvcSort {
     Name,
-    Earliest,
-    Latest,
     Events,
     Storage,
     Fields,
-    Coverage,
 }
 
 impl SvcSort {
@@ -123,6 +134,31 @@ pub fn SchemaPage() -> impl IntoView {
     let sort = RwSignal::new((SvcSort::Name, false));
 
     let services = LocalResource::new(|| async move { api::schema_services().await });
+
+    // The sheet header counts what the table shows, off the same
+    // predicate the rows are filtered by.
+    let visible_count = Signal::derive(move || {
+        let needle = filter.get().to_lowercase();
+        match services.get() {
+            Some(Ok(resp)) => resp
+                .services
+                .iter()
+                .filter(|s| matches_filter(s, &needle))
+                .count(),
+            _ => 0,
+        }
+    });
+    // Past this width the service panel docks in the second column
+    // instead of sliding over a scrim; the field case file stays an
+    // overlay at every width (ADR-0032), so it never claims the column.
+    let wide = use_media_query("(min-width: 1100px)");
+    let panel_open = Signal::derive(move || {
+        field_selected.get().is_none()
+            && svc_selected.get().is_some_and(|name| {
+                matches!(services.get(), Some(Ok(resp))
+                    if resp.services.iter().any(|s| s.name == name))
+            })
+    });
 
     // Captured up-front — `use_navigate()` panics outside the router
     // reactive context (i.e. inside deferred callbacks).
@@ -309,13 +345,18 @@ pub fn SchemaPage() -> impl IntoView {
                     <h1 id=HEADING_ID tabindex="-1">"Schema"</h1>
                     <p class="sub">"Click a service to inspect fields, ingest rate, and tail live."</p>
                 </div>
-                <div class="actions">
-                    <SearchInput value=filter placeholder="Filter services…"/>
-                </div>
             </div>
 
+            <div class="page-split" class:has-panel=move || panel_open.get()>
+            <section class="list-sheet" aria-labelledby="schema-sheet-title">
+                <div class="list-sheet-hd">
+                    <h2 id="schema-sheet-title" class="list-sheet-ttl">
+                        "Services"<span class="cnt">{move || visible_count.get()}</span>
+                    </h2>
+                    <SearchInput value=filter placeholder="Filter services…"/>
+                </div>
             <fleet_ui::OverflowHint viewport=table_viewport/>
-                <div node_ref=table_viewport class="tbl fleet-table-frame tbl-scroll" role="region" aria-label="Services" tabindex="0" style="--list-min-width:1040px">
+                <div node_ref=table_viewport class="tbl fleet-table-frame tbl-scroll" role="region" aria-label="Services" tabindex="0" style="--list-min-width:560px">
                 <div class="tbl-body">
                     <Loaded
                         state=Signal::derive(move || LoadState::from_resource(services.get()))
@@ -324,11 +365,7 @@ pub fn SchemaPage() -> impl IntoView {
                         render=Box::new(move |resp: trawl_api::ServiceSchemaResponse| {
                             let needle = filter.get().to_lowercase();
                             let mut visible: Vec<ServiceSchema> = resp.services.iter()
-                                .filter(|s| {
-                                    if needle.is_empty() { return true; }
-                                    if s.name.to_lowercase().contains(&needle) { return true; }
-                                    s.columns.iter().any(|c| c.name.to_lowercase().contains(&needle))
-                                })
+                                .filter(|s| matches_filter(s, &needle))
                                 .cloned()
                                 .collect();
                             if visible.is_empty() {
@@ -349,15 +386,9 @@ pub fn SchemaPage() -> impl IntoView {
                                     SvcSort::Name => {
                                         a.name.to_lowercase().cmp(&b.name.to_lowercase())
                                     }
-                                    // ISO dates compare correctly as strings;
-                                    // None (no ingest yet) sorts before any date.
-                                    SvcSort::Earliest => a.earliest_date.cmp(&b.earliest_date),
-                                    SvcSort::Latest => a.latest_date.cmp(&b.latest_date),
                                     SvcSort::Events => a.total_events.cmp(&b.total_events),
                                     SvcSort::Storage => a.total_bytes.cmp(&b.total_bytes),
                                     SvcSort::Fields => a.columns.len().cmp(&b.columns.len()),
-                                    SvcSort::Coverage => avg_cov_permille(&a.columns)
-                                        .cmp(&avg_cov_permille(&b.columns)),
                                 };
                                 if desc { ord.reverse() } else { ord }
                             });
@@ -388,18 +419,9 @@ pub fn SchemaPage() -> impl IntoView {
                                     .into_iter()
                                     .rev()
                                     .collect();
-                                let earliest = svc
-                                    .earliest_date
-                                    .clone()
-                                    .unwrap_or_else(|| "—".to_string());
-                                let latest = svc
-                                    .latest_date
-                                    .clone()
-                                    .unwrap_or_else(|| "—".to_string());
                                 let events_label = format_count(svc.total_events);
                                 let storage_label = format_bytes(svc.total_bytes);
                                 let field_count = svc.columns.len();
-                                let coverage_label = format_avg_coverage(&svc.columns);
                                 let degraded = degraded_count(&svc);
 
                                 let name_for_active = name.clone();
@@ -455,12 +477,9 @@ pub fn SchemaPage() -> impl IntoView {
                                             <td>
                                             <Sparkline data=spark_data color=spark_color w=96 h=16/>
                                             </td>
-                                            <td class="mono">{earliest}</td>
-                                            <td class="mono">{latest}</td>
                                             <td class="num">{events_label}</td>
                                             <td class="num">{storage_label}</td>
                                             <td class="num">{field_count}</td>
-                                            <td class="num">{coverage_label}</td>
                                             <td class="row-act">
                                             // Commands, not places: both go
                                             // through the navigator, which
@@ -492,12 +511,9 @@ pub fn SchemaPage() -> impl IntoView {
                                         <thead><tr>
                                             {table_sort_th(sort, SvcSort::Name, SvcSort::Name.default_desc(), "Service", "")}
                                             <th scope="col" class="th" style="width:130px">"Activity"</th>
-                                            {table_sort_th(sort, SvcSort::Earliest, SvcSort::Earliest.default_desc(), "Earliest", "width:108px")}
-                                            {table_sort_th(sort, SvcSort::Latest, SvcSort::Latest.default_desc(), "Latest", "width:108px")}
                                             {table_sort_th(sort, SvcSort::Events, SvcSort::Events.default_desc(), "Events", "width:84px; text-align:right")}
                                             {table_sort_th(sort, SvcSort::Storage, SvcSort::Storage.default_desc(), "Storage", "width:100px; text-align:right")}
                                             {table_sort_th(sort, SvcSort::Fields, SvcSort::Fields.default_desc(), "Fields", "width:76px; text-align:right")}
-                                            {table_sort_th(sort, SvcSort::Coverage, SvcSort::Coverage.default_desc(), "Avg cov", "width:88px; text-align:right")}
                                             <th scope="col" style="width:84px"><span class="sr-only">Actions</span></th>
                                         </tr></thead>
                                         <tbody>{rows}</tbody></table>
@@ -511,6 +527,7 @@ pub fn SchemaPage() -> impl IntoView {
                     />
                 </div>
             </div>
+            </section>
 
             {move || {
                 // `?field=` wins, and mounts without consulting the
@@ -547,9 +564,11 @@ pub fn SchemaPage() -> impl IntoView {
                         on_search=on_search
                         on_use_field=on_use_field
                         on_open_field=on_open_field
+                        docked=wide
                     />
                 }.into_any()
             }}
+            </div>
         </div>
     }
 }

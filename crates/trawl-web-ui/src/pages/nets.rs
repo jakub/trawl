@@ -12,17 +12,28 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos_router::NavigateOptions;
 use leptos_router::hooks::{use_navigate, use_query_map};
+use leptos_use::use_media_query;
 use trawl_api::SavedQueryResponse;
 
 use crate::api;
 use crate::components::net_drawer::NetDrawer;
 use crate::components::sort_th::table_sort_th;
+use crate::schedule_edit::cadence_sentence;
 use crate::state::query::{Mode, RangeSpec, navigator, report_refusal};
 use fleet_ui::time::{time_ago, time_until};
 use fleet_ui::{
-    ActionItem, ActionsMenu, ConfirmModal, ConfirmState, LoadState, Loaded, Pager, SearchInput,
-    StatusDot, ToastBus, ToastKind,
+    ActionItem, ActionsMenu, Badge, ConfirmModal, ConfirmState, LoadState, Loaded, Pager,
+    SearchInput, StatusDot, ToastBus, ToastKind, Tone,
 };
+
+/// Whether a net survives the list filter: its name or its query text.
+/// Named once because the sheet header counts exactly what the table
+/// renders.
+fn matches_filter(net: &SavedQueryResponse, needle: &str) -> bool {
+    needle.is_empty()
+        || net.name.to_lowercase().contains(needle)
+        || net.query.to_lowercase().contains(needle)
+}
 
 /// Sort key for the nets table. Name starts ascending; the two
 /// timestamp keys start descending (most recent first).
@@ -30,7 +41,6 @@ use fleet_ui::{
 enum NetSort {
     Name,
     LastRun,
-    Created,
 }
 
 impl NetSort {
@@ -66,6 +76,12 @@ pub fn NetsPage() -> impl IntoView {
             let _ = refresh.get();
             async move { api::list_saved().await }
         });
+
+    // Past this width the net panel docks in the second column instead
+    // of sliding over a scrim (ADR-0032). The column exists whenever the
+    // URL names a net, so a missing or still-loading one reports there.
+    let wide = use_media_query("(min-width: 1100px)");
+    let panel_open = Signal::derive(move || net_selected.get().is_some());
 
     let nav = use_navigate();
     let goto_search = navigator();
@@ -179,12 +195,13 @@ pub fn NetsPage() -> impl IntoView {
                 // ISO timestamps compare correctly as strings; nets that
                 // never ran ("") sort last under the default descending.
                 NetSort::LastRun => last_run_ts(a).cmp(&last_run_ts(b)),
-                NetSort::Created => a.created_at.cmp(&b.created_at),
             };
             if desc { ord.reverse() } else { ord }
         });
     };
 
+    // The sheet header counts what the table shows, off the same
+    // predicate the rows are filtered by.
     let visible_nets = Signal::derive(move || {
         let Some(Ok(resp)) = nets.get() else {
             return Vec::new();
@@ -193,11 +210,7 @@ pub fn NetsPage() -> impl IntoView {
         let mut visible: Vec<&SavedQueryResponse> = resp
             .queries
             .iter()
-            .filter(|q| {
-                needle.is_empty()
-                    || q.name.to_lowercase().contains(&needle)
-                    || q.query.to_lowercase().contains(&needle)
-            })
+            .filter(|q| matches_filter(q, &needle))
             .collect();
         sort_nets(&mut visible);
         visible.into_iter().cloned().collect::<Vec<_>>()
@@ -210,28 +223,31 @@ pub fn NetsPage() -> impl IntoView {
                     <h1>"Nets"</h1>
                     <p class="sub">"Manage saved queries, attach schedules, and inspect run history."</p>
                 </div>
-                <div class="actions">
-                    <SearchInput value=filter placeholder="Filter nets…"/>
-                </div>
             </div>
 
             {move || refresh_error.get().map(|e| view! { <p role="status">{e}</p> })}
+            <div class="page-split" class:has-panel=move || panel_open.get()>
+            <section class="list-sheet" aria-labelledby="nets-sheet-title">
+                <div class="list-sheet-hd">
+                    <h2 id="nets-sheet-title" class="list-sheet-ttl">
+                        "Your nets"<span class="cnt">{move || visible_nets.get().len()}</span>
+                    </h2>
+                    <SearchInput value=filter placeholder="Filter nets…"/>
+                </div>
             <fleet_ui::OverflowHint viewport=table_viewport/>
-                <div node_ref=table_viewport class="tbl fleet-table-frame tbl-scroll" role="region" aria-label="Saved queries" tabindex="0" style="--list-min-width:760px">
+                <div node_ref=table_viewport class="tbl fleet-table-frame tbl-scroll" role="region" aria-label="Saved queries" tabindex="0" style="--list-min-width:560px">
                 <div class="tbl-body">
                     <Loaded
                         state=Signal::derive(move || LoadState::from_resource(nets.get().map(|r| r.map(|_| ()))))
                         label="nets" retry=retry render=Box::new(|()| ().into_any())
                     />
                     <table class="fleet-table nets-table" aria-label="Saved queries">
-                                        <thead><tr>
-                                            {table_sort_th(sort, NetSort::Name, NetSort::Name.default_desc(), "Name", "")}
-                                            <th scope="col" class="th">"Query"</th>
-                                            <th scope="col" class="th" style="width:100px">"Schedule"</th>
-                                            {table_sort_th(sort, NetSort::LastRun, NetSort::LastRun.default_desc(), "Last run", "width:160px")}
-                                            {table_sort_th(sort, NetSort::Created, NetSort::Created.default_desc(), "Created", "width:110px")}
-                                            <th scope="col" style="width:60px"><span class="sr-only">Actions</span></th>
-                                        </tr></thead>
+                        <thead><tr>
+                            {table_sort_th(sort, NetSort::Name, NetSort::Name.default_desc(), "Name", "")}
+                            <th scope="col" class="th">"Schedule"</th>
+                            {table_sort_th(sort, NetSort::LastRun, NetSort::LastRun.default_desc(), "Last run", "width:180px")}
+                            <th scope="col" style="width:60px"><span class="sr-only">Actions</span></th>
+                        </tr></thead>
                         <tbody>
                             <For each=move || visible_nets.get() key=|net| net.id children=move |initial| {
                                 let id = initial.id;
@@ -254,19 +270,33 @@ pub fn NetsPage() -> impl IntoView {
                                 }));
                                 let regular = StoredValue::new(vec![search.clone(), manual, delete.clone()]);
                                 let windowed = StoredValue::new(vec![search, delete]);
+                                // The drawer is a place with a URL, so the row's one
+                                // control is a link built by the same producer
+                                // `push_net` uses; `prop:replace` is that call's
+                                // `replace: true`.
                                 let href = format!("/jobs/nets?net={id}&ntab=query");
                                 view! {
-                                    <tr class="tbl-row">
+                                    <tr class="tbl-row" class:active=move || net_selected.get() == Some(id)>
                                         <td class="mono"><a class="row-stretch" href=href prop:replace=true>{move || net.get().name}</a></td>
-                                        <td style="min-width:0" class="mono path">{move || net.get().query}</td>
-                                        <td>{move || match net.get().schedule {
-                                            Some(s) if s.enabled => view! { <span class="sched-badge active">{format!("⏰ {}", s.interval)}</span> }.into_any(),
-                                            Some(s) => view! { <span class="sched-badge disabled">{format!("⏸ {}", s.interval)}</span> }.into_any(),
-                                            None => view! { <span style="color:var(--ink-3)">"—"</span> }.into_any(),
-                                        }}</td>
+                                        // The cadence in words, with the enabled/paused
+                                        // judgement beside it as a Badge rather than a
+                                        // glyph the row has to explain.
+                                        <td>
+                                            <span class="cadence">{move || cadence_sentence(net.get().schedule.as_ref())}</span>
+                                            {move || net.get().schedule.map(|s| {
+                                                let (tone, label) = if s.enabled { (Tone::Success, "Enabled") } else { (Tone::Neutral, "Paused") };
+                                                view! { <Badge tone=tone>{label}</Badge> }
+                                            })}
+                                        </td>
                                         <td>{move || {
-                                            let Some(schedule) = net.get().schedule else { return view! { <span>"—"</span> }.into_any(); };
-                                            let Some(run) = schedule.last_run else { return view! { <span>{if schedule.enabled { "Pending…" } else { "—" }}</span> }.into_any(); };
+                                            let Some(schedule) = net.get().schedule else { return view! { <span style="color:var(--ink-3)">"—"</span> }.into_any(); };
+                                            let Some(run) = schedule.last_run else {
+                                                return if schedule.enabled {
+                                                    view! { <span class="mono" style="color:var(--ink-3); font-size:10px">"Pending…"</span> }.into_any()
+                                                } else {
+                                                    view! { <span style="color:var(--ink-3)">"—"</span> }.into_any()
+                                                };
+                                            };
                                             let next_label = schedule.enabled.then(|| {
                                                 #[allow(clippy::cast_possible_truncation)]
                                                 let started_ms = js_sys::Date::parse(&run.started_at) as i64;
@@ -280,8 +310,9 @@ pub fn NetsPage() -> impl IntoView {
                                                 </span>
                                             }.into_any()
                                         }}</td>
-                                        <td class="mono">{move || time_ago(&net.get().created_at, now_ms.get())}</td>
-                                        // Lift the menu above the row's stretched link.
+                                        // `row-menu` lifts the trigger above the row
+                                        // control's stretched pseudo-element; the base
+                                        // `.actions-menu` rule belongs to fleet-ui.
                                         <td class="row-menu">
                                             <Show when=move || net.get().schedule.and_then(|s| s.window).is_none()
                                                 fallback=move || view! { <ActionsMenu items=windowed.get_value()/> }>
@@ -298,12 +329,15 @@ pub fn NetsPage() -> impl IntoView {
                             "No nets yet — save a query from the search page to get started"
                         } else { "No nets match that filter" }}</div>
                     })}
+                    // Summary-only Pager: this table is unpaginated, so no
+                    // prev/next controls.
                     <Pager summary=Signal::derive(move || {
                         let count = visible_nets.get().len();
                         format!("{count} net{}", if count == 1 { "" } else { "s" })
                     })/>
                 </div>
             </div>
+            </section>
 
             // The keyed owner depends only on the requested ID, never the list.
             <For each={move || net_selected.get().into_iter().collect::<Vec<_>>()} key=|id| *id children=move |id| {
@@ -322,10 +356,11 @@ pub fn NetsPage() -> impl IntoView {
                         view! { <div role="status">{message} " " <a href="/jobs/nets">"Back to Nets"</a></div> }
                     }>
                         <NetDrawer net=initial.get_untracked().expect("loaded net") saved=saved tab=tab_sig on_close=on_close
-                            on_tab_change=on_tab_change on_search=on_search on_refresh=on_refresh/>
+                            on_tab_change=on_tab_change on_search=on_search on_refresh=on_refresh docked=wide/>
                     </Show>
                 }
             }/>
+            </div>
 
             // Delete confirmation modal — open/close plumbing via the
             // natively-tested fleet_ui::ConfirmState; the ConfirmModal

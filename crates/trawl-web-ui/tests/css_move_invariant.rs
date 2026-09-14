@@ -149,6 +149,11 @@ const MOVED_SELECTORS: &[&str] = &[
     ".sd-tabs .sp",
     ".sd-tabs .meta",
     ".sd-body",
+    // The docked presentation's two host classes (ADR-0032). App-side
+    // placement rules are written through the layout that placed the
+    // panel (`.page-split > .sd-host …`), never as these bare names.
+    ".sd-host",
+    ".sd-drawer.sd-docked",
     // Small widgets.
     ".sc-spark",
     ".status-dot",
@@ -207,6 +212,12 @@ const RETIRED_SELECTORS: &[&str] = &[
     ".meta .chip.excl .x",
     ".meta .chip.excl .x:hover",
     ".meta .chip.bad",
+    // The nets list says a schedule's cadence in words and leaves the
+    // enabled/paused judgement to fleet_ui::Badge (ADR-0032), so the
+    // glyph pills it used to render are gone.
+    ".sched-badge",
+    ".sched-badge.active",
+    ".sched-badge.disabled",
     ".live-badge",
     ".live-badge.live",
     ".live-badge.lagged",

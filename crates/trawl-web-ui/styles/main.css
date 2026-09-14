@@ -1080,6 +1080,42 @@
 .page p.sub { margin: 4px 0 0; font-size: var(--fs-small); color: var(--ink-3); text-wrap: pretty; }
 .page-hd .actions { display: flex; gap: 8px; align-items: center; flex-shrink: 0; }
 
+/* The list page's two columns (ADR-0032): the sheet that holds the
+ * table, and the panel docked beside it once the viewport is wide
+ * enough to carry both. Below 1100px the grid stays one column and the
+ * panel is the scrim drawer it has always been. */
+.page-split { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; align-items: start; min-height: 0; }
+@media (min-width: 1100px) {
+  .page-split.has-panel { grid-template-columns: minmax(0, 1fr) minmax(420px, 46%); }
+}
+/* The sheet itself: a work surface floating on the page floor, with the
+ * table frame's own border folded into it so the two do not double up. */
+.list-sheet {
+  display: flex; flex-direction: column; min-height: 0; min-width: 0;
+  background: var(--panel);
+  border: 1px solid var(--line); border-radius: var(--radius-panel);
+  box-shadow: inset 0 1px 0 var(--edge-hi), var(--elev-1);
+  overflow: hidden;
+}
+.list-sheet-hd {
+  display: flex; align-items: center; gap: 12px;
+  min-height: 40px; padding: 0 12px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+}
+.list-sheet-ttl { margin: 0; font-family: var(--font-ui); font-size: var(--fs-control); font-weight: 600; color: var(--ink); }
+.list-sheet-ttl .cnt { margin-inline-start: 6px; font-weight: 500; color: var(--ink-3); font-variant-numeric: tabular-nums; }
+/* The filter input moved out of `.page-hd .actions` into the card
+ * header, where it trails the title. */
+.list-sheet-hd .inp-wrap { margin-inline-start: auto; min-width: 160px; }
+.list-sheet .overflow-hint { border-bottom: 1px solid var(--line-2); }
+.list-sheet .fleet-table-frame { border: 0; border-radius: 0; box-shadow: none; }
+/* The docked panel is a grid child of this layout, so it takes the
+ * column instead of the overlay's fixed width. Written through the
+ * placing layout: the `.sd-host` and `.sd-drawer.sd-docked` base rules
+ * are fleet-ui's and stay there. */
+.page-split > .sd-host .sd-drawer.sd-docked { width: 100%; }
+
 /* .inp-wrap moved to fleet-ui.css (issue #31) — fleet_ui::SearchInput
  * emits it. */
 
@@ -1628,13 +1664,9 @@
 /* .status-dot moved to fleet-ui.css (issue #31) — fleet_ui::StatusDot
  * emits it (unified with the retired .sd-dot ring treatment). */
 
-.sched-badge {
-  font-family: var(--font-mono); font-size: var(--fs-dense);
-  padding: 1px 6px; border-radius: var(--radius-sm);
-  background: var(--panel-2); color: var(--ink-2);
-}
-.sched-badge.active { background: var(--accent-wash); color: var(--accent); }
-.sched-badge.disabled { opacity: .5; }
+/* .sched-badge* retired (ADR-0032): the nets list says the cadence in
+ * words and leaves the enabled/paused judgement to fleet_ui::Badge. */
+.cadence { font-size: var(--fs-ui); color: var(--ink-2); margin-inline-end: 6px; }
 
 .stats-row { display: flex; gap: 12px; margin-top: 16px; }
 .stat-card {

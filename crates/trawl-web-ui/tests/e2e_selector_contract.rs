@@ -971,6 +971,12 @@ const CONTRACTS: &[Contract] = &[
     // a page that stops rendering `.tbl-row` would otherwise leave its
     // specs matching nothing and passing their `toHaveCount(0)` half.
     Contract {
+        assignment: "listSheet: '.list-sheet',",
+        source_path: "src/pages/schema.rs",
+        source: SCHEMA_RS,
+        hook: "class=\"list-sheet\"",
+    },
+    Contract {
         assignment: "tableRow: '.tbl-body .tbl-row',",
         source_path: "src/pages/schema.rs",
         source: SCHEMA_RS,
