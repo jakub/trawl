@@ -31,10 +31,21 @@ test('result audit: numeric sorting and only original aggregate group Include', 
   expect(JSON.parse(Buffer.from(filters.slice(3), 'base64url').toString())).toContainEqual({field: 'host',value: 'hundred',op: '+'});
 });
 
+test('result audit: uppercase grouping keeps original lowercase output Include', async ({ page }) => {
+  const query = '* | stats count() by HOST';
+  await page.route(routeQuery, route => route.fulfill({ json: aggregate }));
+  await page.goto('/search?q=' + encodeURIComponent(query));
+  await page.getByRole('button', { name: 'Show details for result 1', exact: true }).click();
+  await page.locator('.results').getByRole('button', { name: 'Include host = hundred', exact: true }).click();
+  const url = new URL(page.url());
+  expect(url.searchParams.get('q')).toBe(query);
+  expect(JSON.parse(Buffer.from(url.searchParams.get('f')!.slice(3), 'base64url').toString())).toContainEqual({ field: 'host', value: 'hundred', op: '+' });
+});
+
 for (const query of [
-  '* | let host = lower(host) | stats count() by host',
-  '* | stats count() by host | let host = lower(host)',
-  '* | stats count() by host | rename host as other',
+  '* | let HOST = lower(host) | stats count() by host',
+  '* | stats count() by HOST | let host = lower(host)',
+  '* | stats count() by host | rename HOST as other',
   '| from saved "example" | stats count() by host',
 ]) {
   test(`result audit: suppress transformed or saved input actions: ${query}`, async ({ page }) => {
@@ -149,15 +160,17 @@ function transformedRaw(query: string) {
   const response = structuredClone(raw);
   response.columns.push({ name: 'service' });
   response.rows.forEach((row: unknown[]) => row.push('nginx'));
-  if (query.includes('let status')) response.rows.forEach((row: unknown[]) => { row[2] = 0; });
-  if (query.includes('rename message')) response.columns[3].name = 'summary';
+  if (query.toLowerCase().includes('let status')) response.rows.forEach((row: unknown[]) => { row[2] = 0; });
+  if (query.toLowerCase().includes('rename message')) response.columns[3].name = 'summary';
   return response;
 }
 
 for (const mode of ['snapshot', 'live']) {
   for (const [query, changed] of [
     ['* | let status = 0', 'status'],
+    ['* | let STATUS = 0', 'status'],
     ['* | rename message as summary', 'summary'],
+    ['* | rename MESSAGE as SUMMARY', 'summary'],
   ]) {
     test(`result facet review: ${mode} ${query} keeps original host and service`, async ({ page }) => {
       const response = transformedRaw(query);

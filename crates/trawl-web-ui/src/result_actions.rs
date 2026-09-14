@@ -6,7 +6,7 @@
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 use std::{cmp::Ordering, collections::HashSet};
 use trawl_api::value::Value;
-use trawl_core::ast::PipeStage;
+use trawl_core::{ast::PipeStage, schema::catalog_key};
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Capabilities {
@@ -34,11 +34,12 @@ impl Capabilities {
                     out.changed.extend(
                         s.aggregations
                             .iter()
-                            .map(trawl_core::projection::agg_output_name),
+                            .map(|a| catalog_key(&trawl_core::projection::agg_output_name(a))),
                     );
                     out.groups = Some(
                         s.group_by
                             .into_iter()
+                            .map(|f| catalog_key(&f))
                             .filter(|f| {
                                 !out.changed.contains(f)
                                     && out.groups.as_ref().is_none_or(|g| g.contains(f))
@@ -48,15 +49,16 @@ impl Capabilities {
                 }
                 PipeStage::Timechart(s) => {
                     out.raw = false;
-                    out.changed.insert("_time".into());
+                    out.changed.insert(catalog_key("_time"));
                     out.changed.extend(
                         s.aggregations
                             .iter()
-                            .map(trawl_core::projection::agg_output_name),
+                            .map(|a| catalog_key(&trawl_core::projection::agg_output_name(a))),
                     );
                     out.groups = Some(
                         s.group_by
                             .into_iter()
+                            .map(|f| catalog_key(&f))
                             .filter(|f| {
                                 !out.changed.contains(f)
                                     && out.groups.as_ref().is_none_or(|g| g.contains(f))
@@ -66,11 +68,11 @@ impl Capabilities {
                 }
                 PipeStage::Let(s) => out
                     .changed
-                    .extend(s.assignments.into_iter().map(|(f, _)| f)),
+                    .extend(s.assignments.into_iter().map(|(f, _)| catalog_key(&f))),
                 PipeStage::Rename(s) => {
                     for (a, b) in s.renames {
-                        out.changed.insert(a);
-                        out.changed.insert(b);
+                        out.changed.insert(catalog_key(&a));
+                        out.changed.insert(catalog_key(&b));
                     }
                 }
                 PipeStage::Where(_)
@@ -93,9 +95,10 @@ impl Capabilities {
     }
     /// Whether this output field still names an unchanged input field.
     pub fn input_field(&self, field: &str) -> bool {
+        let field = catalog_key(field);
         !self.unknown
-            && !self.changed.contains(field)
-            && self.groups.as_ref().is_none_or(|g| g.contains(field))
+            && !self.changed.contains(&field)
+            && self.groups.as_ref().is_none_or(|g| g.contains(&field))
     }
     pub fn include(&self, field: &str, value: &Value) -> bool {
         self.input_field(field) && !matches!(value, Value::Null | Value::Array(_))
@@ -191,6 +194,63 @@ mod tests {
         ] {
             assert!(trawl_core::parser::parse(query).is_ok(), "{query}");
             assert!(!Capabilities::for_query(query).raw_facets(), "{query}");
+        }
+    }
+
+    #[test]
+    fn provenance_uses_ascii_catalog_identity() {
+        for query in [
+            "* | stats count() by HOST",
+            "* | stats count() by HOST | stats sum(count) by HoSt",
+            "* | timechart count() by HOST",
+            "* | stats count() by HOST | timechart sum(count) by HoSt",
+        ] {
+            assert!(trawl_core::parser::parse(query).is_ok(), "{query}");
+            let capability = Capabilities::for_query(query);
+            for field in ["host", "HOST", "HoSt"] {
+                assert!(capability.input_field(field), "{query}: {field}");
+            }
+            assert!(!capability.input_field("COUNT"), "{query}");
+        }
+        for query in [
+            "* | let HOST = lower(host)",
+            "* | rename HOST as Other",
+            "* | rename other as HOST",
+            "* | let HOST = lower(host) | stats count() by host",
+            "* | stats count() by HOST | let host = lower(host)",
+            "* | stats count() by HOST | rename host as Other",
+            "* | stats count() as HOST by host",
+            "* | timechart count() as HOST by host",
+            "* | stats count() as HOST by service | stats count() by host",
+            "* | stats count() as HOST by service | timechart count() by host",
+        ] {
+            assert!(trawl_core::parser::parse(query).is_ok(), "{query}");
+            let capability = Capabilities::for_query(query);
+            for field in ["host", "HOST", "HoSt"] {
+                assert!(!capability.input_field(field), "{query}: {field}");
+            }
+        }
+        let renamed = Capabilities::for_query("* | rename HOST as Other");
+        assert!(!renamed.input_field("OTHER"));
+        assert!(!Capabilities::for_query("* | timechart count()").input_field("_TIME"));
+    }
+
+    #[test]
+    fn provenance_preserves_non_ascii_distinctions() {
+        for query in [
+            "* | stats count() by `CAFÉ`",
+            "* | stats count() by `CAFÉ` | stats sum(count) by `cafÉ`",
+        ] {
+            assert!(trawl_core::parser::parse(query).is_ok(), "{query}");
+            let capability = Capabilities::for_query(query);
+            assert!(capability.input_field("cafÉ"), "{query}");
+            assert!(!capability.input_field("café"), "{query}");
+        }
+        for query in ["* | let `CAFÉ` = 0", "* | rename source as `CAFÉ`"] {
+            assert!(trawl_core::parser::parse(query).is_ok(), "{query}");
+            let capability = Capabilities::for_query(query);
+            assert!(!capability.input_field("cafÉ"), "{query}");
+            assert!(capability.input_field("café"), "{query}");
         }
     }
 
