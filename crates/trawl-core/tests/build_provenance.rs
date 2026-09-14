@@ -2,8 +2,23 @@
 use std::path::Path;
 use std::process::Command;
 
+fn fixture_command(program: &str) -> Command {
+    // Hooks export their repository. Git identifies every local variable that
+    // must be cleared before a child operates on a foreign fixture repository.
+    let local_vars = Command::new("git")
+        .args(["rev-parse", "--local-env-vars"])
+        .output()
+        .unwrap();
+    assert!(local_vars.status.success());
+    let mut command = Command::new(program);
+    for name in String::from_utf8(local_vars.stdout).unwrap().lines() {
+        command.env_remove(name);
+    }
+    command
+}
+
 fn git(root: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
+    let output = fixture_command("git")
         .args([
             "-c",
             "user.name=Fixture",
@@ -16,8 +31,6 @@ fn git(root: &Path, args: &[&str]) -> String {
         .current_dir(root)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
         .output()
         .unwrap();
     assert!(
@@ -29,7 +42,7 @@ fn git(root: &Path, args: &[&str]) -> String {
 }
 
 fn build(root: &Path, target: &Path) -> (String, String) {
-    let output = Command::new(env!("CARGO"))
+    let output = fixture_command(env!("CARGO"))
         .args(["run", "--offline", "--verbose", "--manifest-path"])
         .arg(root.join("core/Cargo.toml"))
         .current_dir(root.join("core"))
