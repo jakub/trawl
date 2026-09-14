@@ -28,9 +28,20 @@ pub fn Login(
     on_submit: Callback<String>,
     #[prop(into)] error: Signal<Option<String>>,
     #[prop(into)] submitting: Signal<bool>,
+    /// Credential rejection, distinct from service or network errors.
+    #[prop(optional, into)]
+    invalid: Signal<bool>,
 ) -> impl IntoView {
     let (api_key, set_api_key) = signal(String::new());
     let (local_error, set_local_error) = signal::<Option<String>>(None);
+    let input_ref = NodeRef::<leptos::html::Input>::new();
+    Effect::new(move |_| {
+        if (local_error.get().is_some() || invalid.get())
+            && let Some(input) = input_ref.get()
+        {
+            let _ = input.focus();
+        }
+    });
 
     let on_form_submit = move |ev: SubmitEvent| {
         ev.prevent_default();
@@ -60,15 +71,21 @@ pub fn Login(
                 // wrap mode renders label.field > span > input, whose
                 // unstyled <span> caption is the point: the default
                 // Field's styled <label> would visibly restyle it.
-                <ErrorBanner error=combined_error/>
+                <ErrorBanner error=combined_error id="fleet-login-error"/>
 
                 <Field label="API key" wrap=true>
                     <input
+                        node_ref=input_ref
                         type="password"
                         autocomplete="off"
                         spellcheck="false"
+                        aria-invalid=move || (local_error.get().is_some() || invalid.get()).to_string()
+                        aria-describedby=move || combined_error.get().map(|_| "fleet-login-error")
                         prop:value=move || api_key.get()
-                        on:input=move |ev| set_api_key.set(event_target_value(&ev))
+                        on:input=move |ev| {
+                            set_api_key.set(event_target_value(&ev));
+                            set_local_error.set(None);
+                        }
                     />
                 </Field>
 

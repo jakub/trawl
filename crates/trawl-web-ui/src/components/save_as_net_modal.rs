@@ -16,6 +16,10 @@
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos::web_sys;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use wasm_bindgen::JsCast;
 
 use crate::api;
@@ -36,6 +40,11 @@ pub fn SaveAsNetModal(
     let suggested = suggest_name(&query);
     let name = RwSignal::new(suggested);
     let submitting = RwSignal::new(false);
+    // Keep a per-open latch outside the reactive arena. A page-owned close
+    // callback can outlive this dialog and must not close its replacement.
+    let alive = Arc::new(AtomicBool::new(true));
+    let cleanup_alive = Arc::clone(&alive);
+    on_cleanup(move || cleanup_alive.store(false, Ordering::Release));
 
     let input_ref = NodeRef::<leptos::html::Input>::new();
     Effect::new(move |_| {
@@ -50,15 +59,20 @@ pub fn SaveAsNetModal(
 
     let q_for_submit = query.clone();
     let do_save = Callback::new(move |()| {
-        let n = name.get_untracked().trim().to_string();
-        if n.is_empty() || submitting.get_untracked() {
+        let draft = name.get_untracked();
+        let Ok(n) = trawl_core::saved_name::normalize(&draft) else {
+            return;
+        };
+        let n = n.to_owned();
+        if submitting.get_untracked() {
             return;
         }
         submitting.set(true);
         let q = q_for_submit.clone();
+        let alive = Arc::clone(&alive);
         spawn_local(async move {
             let result = api::create_saved(&n, &q).await;
-            submitting.set(false);
+            submitting.try_set(false);
             match result {
                 Ok(saved) => {
                     bus.push(
@@ -66,7 +80,9 @@ pub fn SaveAsNetModal(
                         "Saved as net",
                         Some(format!("'{}' cast. You can haul it anytime.", saved.name)),
                     );
-                    on_close.run(true);
+                    if alive.load(Ordering::Acquire) {
+                        on_close.run(true);
+                    }
                 }
                 Err(e) => {
                     bus.push(ToastKind::Error, "Couldn't save", Some(e.to_string()));
@@ -77,7 +93,9 @@ pub fn SaveAsNetModal(
     });
 
     let cancel = Callback::new(move |()| on_close.run(false));
-    let save_disabled = Signal::derive(move || name.get().trim().is_empty() || submitting.get());
+    let save_disabled = Signal::derive(move || {
+        trawl_core::saved_name::normalize(&name.get()).is_err() || submitting.get()
+    });
 
     view! {
         <Modal
@@ -91,9 +109,9 @@ pub fn SaveAsNetModal(
                     " save"
                     <span style="opacity:.5">"·"</span>
                     <Kbd>"Esc"</Kbd>
-                    " cancel"
+                    {move || if submitting.get() { " close" } else { " cancel" }}
                 </div>
-                <Btn variant=Variant::Secondary on_click=cancel>"Cancel"</Btn>
+                <Btn variant=Variant::Secondary on_click=cancel>{move || if submitting.get() { "Close" } else { "Cancel" }}</Btn>
                 <Btn variant=Variant::Primary disabled=save_disabled on_click=do_save>
                     {move || if submitting.get() { "Saving…" } else { "Save as net" }}
                 </Btn>
@@ -110,8 +128,11 @@ pub fn SaveAsNetModal(
                     node_ref=input_ref
                     prop:value=move || name.get()
                     on:input=move |e| name.set(event_target_value(&e))
+                    aria-invalid=move || trawl_core::saved_name::normalize(&name.get()).is_err().to_string()
+                    aria-describedby="netNameError"
                     placeholder="e.g. nginx 5xx by host"
                 />
+                <span id="netNameError" role="status">{move || trawl_core::saved_name::normalize(&name.get()).err().unwrap_or("")}</span>
             </Field>
         </Modal>
     }
@@ -128,7 +149,7 @@ fn suggest_name(q: &str) -> String {
             && !value.is_empty()
         {
             let cleaned = value.trim_matches(|c: char| c == '"' || c == '\'');
-            if !cleaned.is_empty() {
+            if let Ok(cleaned) = trawl_core::saved_name::normalize(cleaned) {
                 return cleaned.to_string();
             }
         }

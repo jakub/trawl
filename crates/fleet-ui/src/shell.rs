@@ -76,6 +76,7 @@ pub fn Shell(
     let palette_open = RwSignal::new(false);
     let palette_mounted = RwSignal::new(false);
     let palette_trigger = NodeRef::<Button>::new();
+    let main_ref = NodeRef::<leptos::html::Main>::new();
     let palette_layer = StoredValue::<Option<OverlayLayer>>::new(None);
     let hint = platform_kbd_hint(&window().navigator().user_agent().unwrap_or_default());
 
@@ -121,6 +122,12 @@ pub fn Shell(
 
     view! {
         <div class="shell">
+            <a class="skip-link" href="#fleet-main-content" on:click=move |event| {
+                event.prevent_default();
+                if let Some(main) = main_ref.get_untracked() {
+                    let _ = main.focus();
+                }
+            }>"Skip to main content"</a>
             <TopBar
                 brand=brand
                 brand_accent=brand_accent
@@ -135,7 +142,7 @@ pub fn Shell(
             />
             <div class="body">
                 <Rail items=rail_items active=rail_active bottom=rail_bottom/>
-                <main class="main">
+                <main class="main" id="fleet-main-content" tabindex="-1" node_ref=main_ref>
                     {children()}
                 </main>
             </div>

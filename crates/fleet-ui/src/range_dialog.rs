@@ -92,6 +92,7 @@ mod component {
                 <button
                     type="button"
                     class="dr-trigger"
+                    title=trigger_label
                     class:open=move || open.get()
                     aria-haspopup="dialog"
                     aria-expanded=move || open.get().to_string()

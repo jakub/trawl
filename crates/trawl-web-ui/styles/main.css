@@ -1573,6 +1573,8 @@
 }
 
 /* One scroll region keeps list headings aligned with wide rows. */
+.auth-notice { padding: 16px 20px; }
+.auth-notice p { margin: 0 0 10px; }
 .tbl-scroll { display: block; min-height: 180px; overflow: auto; }
 .tbl-scroll > .tbl-body { min-width: var(--list-min-width); }
 .tbl-scroll .tbl-body { overflow: visible; }

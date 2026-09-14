@@ -539,7 +539,9 @@ pub fn RepinModal(
                         disabled=primary_disabled
                         on_click=primary
                     >
-                        {primary_label()}
+                        // A probe changes its label without changing the phase.
+                        // Keep this child reactive after Btn mounts.
+                        {primary_label}
                     </Btn>
                 }}
             }.into_any())

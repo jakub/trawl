@@ -25,10 +25,12 @@ pub fn Login() -> impl IntoView {
     let prefs = expect_context::<UiPrefs>();
     let (error, set_error) = signal::<Option<String>>(None);
     let (submitting, set_submitting) = signal(false);
+    let (invalid, set_invalid) = signal(false);
 
     let on_submit = Callback::new(move |key: String| {
         set_submitting.set(true);
         set_error.set(None);
+        set_invalid.set(false);
 
         spawn_local(async move {
             match api::login(&key).await {
@@ -38,12 +40,13 @@ pub fn Login() -> impl IntoView {
                     }
                 }
                 Err(api::ApiError::Unauthorized) => {
-                    set_error.set(Some("Invalid API key".into()));
-                    set_submitting.set(false);
+                    set_error.try_set(Some("Invalid API key".into()));
+                    set_invalid.try_set(true);
+                    set_submitting.try_set(false);
                 }
                 Err(e) => {
-                    set_error.set(Some(format!("Login failed: {e}")));
-                    set_submitting.set(false);
+                    set_error.try_set(Some(format!("Login failed: {e}")));
+                    set_submitting.try_set(false);
                 }
             }
         });
@@ -59,6 +62,7 @@ pub fn Login() -> impl IntoView {
             on_submit=on_submit
             error=error
             submitting=submitting
+            invalid=invalid
         />
     }
 }

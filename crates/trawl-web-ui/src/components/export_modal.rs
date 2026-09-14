@@ -11,6 +11,10 @@
 
 use leptos::prelude::*;
 use leptos::task::spawn_local;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use trawl_api::ExportFormat;
 
 use crate::api;
@@ -29,6 +33,12 @@ pub fn ExportModal(
     let bus = expect_context::<ToastBus>();
     let format = RwSignal::new(ExportFormat::Csv);
     let downloading = RwSignal::new(false);
+    // This latch belongs to this one dialog instance, outside the reactive
+    // arena. A late task may still report its outcome after dismissal, but
+    // must never invoke the parent's callback for a replacement dialog.
+    let alive = Arc::new(AtomicBool::new(true));
+    let cleanup_alive = Arc::clone(&alive);
+    on_cleanup(move || cleanup_alive.store(false, Ordering::Release));
     // What this modal refused, shown in its own body rather than as a
     // toast: the reader is looking at the dialog they just submitted.
     let refusal = RwSignal::new(None::<&'static str>);
@@ -49,8 +59,9 @@ pub fn ExportModal(
         refusal.set(None);
         downloading.set(true);
         let q = q_for_submit.clone();
+        let fmt = format.get_untracked();
+        let alive = Arc::clone(&alive);
         spawn_local(async move {
-            let fmt = format.get_untracked();
             match api::export(&q, &fmt, None).await {
                 Ok((bytes, filename)) => {
                     let mime = mime_for_format(&fmt);
@@ -62,12 +73,15 @@ pub fn ExportModal(
                             "Exported",
                             Some(format!("{filename} ({} bytes)", bytes.len())),
                         );
-                        on_close.run(true);
+                        if alive.load(Ordering::Acquire) {
+                            on_close.run(true);
+                        }
                     }
-                    downloading.set(false);
+                    // The successful close above may dispose this owner.
+                    downloading.try_set(false);
                 }
                 Err(e) => {
-                    downloading.set(false);
+                    downloading.try_set(false);
                     bus.push(ToastKind::Error, "Export failed", Some(e.to_string()));
                 }
             }
@@ -88,9 +102,9 @@ pub fn ExportModal(
                     " download"
                     <span style="opacity:.5">"·"</span>
                     <Kbd>"Esc"</Kbd>
-                    " cancel"
+                    {move || if downloading.get() { " close" } else { " cancel" }}
                 </div>
-                <Btn variant=Variant::Secondary on_click=cancel>"Cancel"</Btn>
+                <Btn variant=Variant::Secondary on_click=cancel>{move || if downloading.get() { "Close" } else { "Cancel" }}</Btn>
                 <Btn variant=Variant::Primary disabled=downloading on_click=do_download>
                     {move || if downloading.get() { "Downloading…" } else { "Download" }}
                 </Btn>
