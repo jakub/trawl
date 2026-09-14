@@ -765,6 +765,14 @@ pub fn Search() -> impl IntoView {
     // only the `stats … by <field>` stage knows which column is the
     // group, and a chart drawn without it would label the wrong axis.
     let cat_shape: Memo<Option<CatShape>> = Memo::new(move |_| {
+        // The resource holds the PREVIOUS response while the next
+        // request is in flight, and `effective_q` follows the URL at
+        // once, so detection would read an old result through a new
+        // query and label the wrong axis. No chart while pending — the
+        // same rule the histogram caption follows.
+        if loading.get() {
+            return None;
+        }
         rows.get()
             .and_then(Result::ok)
             .and_then(|resp| detect_categorical(&effective_q.get(), &resp.result))
@@ -919,7 +927,7 @@ pub fn Search() -> impl IntoView {
                     // same numbers, which is why it is aria-hidden.
                     (ResultsTab::Events, Mode::Snapshot) if is_chart_query.get() => view! {
                         <>
-                            <Histogram rows=rows window=window pending=loading/>
+                            <Histogram rows=rows window=window pending=loading caption_only=true/>
                             <div class="agg-split" class:has-chart=move || cat_shape.get().is_some()>
                                 <ExactTable
                                     busy=running

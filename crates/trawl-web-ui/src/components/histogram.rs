@@ -53,9 +53,17 @@ pub fn Histogram(
     /// completed response or nothing.
     #[prop(into)]
     pending: Signal<bool>,
+    /// Render the caption row alone, with no bar strip and no bucket
+    /// table. An aggregate page has one row per group and no events to
+    /// bucket, so the strip could only ever paint the "No usable
+    /// timestamps in shown events." band — a 64px report of an absence
+    /// nobody asked about. The caption still names the executed window,
+    /// which is the one thing the row above the table has to say.
+    #[prop(optional)]
+    caption_only: bool,
 ) -> impl IntoView {
     view! {
-        <div class="histo">
+        {(!caption_only).then(|| view! { <div class="histo">
             <Loaded
                 state=Signal::derive(move || LoadState::from_resource(rows.get()))
                 // Deliberate quiet-error override: the results table
@@ -113,7 +121,7 @@ pub fn Histogram(
                     }.into_any()
                 })
             />
-        </div>
+        </div> })}
         {move || rows.get().and_then(Result::ok).map(|resp| {
             let series = build_series(&resp);
             view! {
@@ -122,7 +130,7 @@ pub fn Histogram(
                         {move || format!("Current page · window: {}", window_caption(&window.get()))}
                     </p>
                 </Show>
-                {series.map(|series| {
+                {(!caption_only).then_some(series).flatten().map(|series| {
                     let width = series.bucket_width();
                     let min = series.min_secs;
                     view! {

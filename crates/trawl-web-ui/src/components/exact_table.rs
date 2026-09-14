@@ -18,6 +18,11 @@
 //! Which columns those are comes from [`crate::categorical::group_columns`],
 //! read off the query the response was executed for, never the editor
 //! or the URL, so a page that has moved on cannot relabel these rows.
+//!
+//! While a request is in flight the rows on screen belong to the
+//! PREVIOUS query, so every group control would carry that query's
+//! field into this query's filter. The cells go plain until the
+//! response that matches the executed query arrives.
 
 use crate::api::{ApiError, PAGE_SIZE};
 use crate::categorical::group_columns;
@@ -167,7 +172,7 @@ fn ExactTableBody(
                                 let cells = body_rows[i]
                                     .iter()
                                     .enumerate()
-                                    .map(|(ci, v)| cell(ci, v, &body_cols, &group_cols, &executed_query, on_add_filter))
+                                    .map(|(ci, v)| cell(ci, v, &body_cols, &group_cols, &executed_query, on_add_filter, busy))
                                     .collect::<Vec<_>>();
                                 view! { <tr>{cells}</tr> }
                             }).collect::<Vec<_>>()).into_any()
@@ -211,6 +216,7 @@ fn cell(
     group_cols: &[usize],
     executed_query: &ExecutedQuery,
     on_add_filter: Callback<(ExecutedQuery, Filter)>,
+    busy: Signal<bool>,
 ) -> AnyView {
     let text = value_to_string(value);
     if !group_cols.contains(&ci) {
@@ -220,21 +226,29 @@ fn cell(
         return view! { <td>{text}</td> }.into_any();
     };
     let label = format!("Search {field} = {text}");
-    let filter = Filter {
+    let filter = StoredValue::new(Filter {
         field,
         value: text.clone(),
         op: FilterOp::Include,
-    };
+    });
     let query = executed_query.clone();
+    let plain = text.clone();
     view! {
-        <td>
-            <button
-                type="button"
-                class="grp-search"
-                aria-label=label
-                on:click=move |_| on_add_filter.run((query.clone(), filter.clone()))
-            >{text}</button>
-        </td>
+        <td>{move || if busy.get() {
+            plain.clone().into_any()
+        } else {
+            let label = label.clone();
+            let text = text.clone();
+            let query = query.clone();
+            view! {
+                <button
+                    type="button"
+                    class="grp-search"
+                    aria-label=label
+                    on:click=move |_| on_add_filter.run((query.clone(), filter.get_value()))
+                >{text}</button>
+            }.into_any()
+        }}</td>
     }
     .into_any()
 }

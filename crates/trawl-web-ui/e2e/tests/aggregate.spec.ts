@@ -18,7 +18,7 @@
 // gets.
 
 import { test, expect, resetScenario } from '../fixtures';
-import { SEL } from '../selectors';
+import { COPY, SEL } from '../selectors';
 
 // `| stats count() by status` — the harness dispatches the `corpus`
 // scenario on that pipeline shape and answers `wire/query-stats-by.json`:
@@ -123,4 +123,54 @@ test('a non-chartable aggregate renders the exact table alone', async ({ page, r
   await expect(page.locator(SEL.exactTable)).toHaveCount(1);
   await expect(page.locator(SEL.catChart)).toHaveCount(0);
   await expect(page.locator('.agg-split.has-chart')).toHaveCount(0);
+});
+
+test('an aggregate keeps the window caption and drops the bar strip', async ({ page, request }) => {
+  await resetScenario(request, 'corpus');
+
+  // The positive case first, from the same corpus: raw results keep the
+  // strip and the bucket table, so the absences below are the aggregate
+  // arm's doing and not a broken histogram.
+  await page.goto('/search?q=service%3Dnginx&page=0');
+  await expect(page.locator(SEL.histoStrip)).toHaveCount(1);
+  await expect(page.locator('.bucket-data')).toHaveCount(1);
+
+  await page.goto(AGG_URL);
+  // One group per row and no events underneath them: the strip could
+  // only paint "No usable timestamps in shown events." over 64px.
+  await expect(page.locator(SEL.histoStrip)).toHaveCount(0);
+  await expect(page.locator('.bucket-data')).toHaveCount(0);
+  await expect(page.locator(SEL.histoCaption)).toHaveCount(1);
+  await expect(page.locator(SEL.histoCaption)).toContainText(COPY.histoCaptionPrefix);
+});
+
+test('the chart and the group searches wait for the response that matches the query', async ({ page, request }) => {
+  await resetScenario(request, 'corpus');
+  await page.goto(AGG_URL);
+  await expect(page.locator(SEL.catChart)).toHaveCount(1);
+  await expect(page.locator(SEL.groupSearch)).toHaveCount(GROUPS);
+
+  // Hold the next query open. The resource keeps the response already on
+  // screen, so without a gate the chart would be redrawn from those rows
+  // under the NEW executed query, and every group control would carry
+  // the old query's field into the new filter.
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  await page.route('**/api/v1/query*', async (route) => {
+    await held;
+    await route.continue();
+  });
+
+  await page.locator(SEL.groupSearch).first().click();
+  await expect(page).toHaveURL(/[?&]f=v1\./);
+
+  await expect(page.locator(SEL.catChart)).toHaveCount(0);
+  await expect(page.locator(SEL.groupSearch)).toHaveCount(0);
+  // The numbers stay on screen — this is a gate on the controls, not a
+  // blank page.
+  await expect(page.locator(`${SEL.exactTable} tbody tr`)).toHaveCount(GROUPS);
+
+  release();
+  await expect(page.locator(SEL.catChart)).toHaveCount(1);
+  await expect(page.locator(SEL.groupSearch)).toHaveCount(GROUPS);
 });
