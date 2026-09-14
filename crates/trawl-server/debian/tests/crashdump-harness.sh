@@ -100,6 +100,7 @@ readonly NEG_SETTLE_SECS=15
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)
 readonly repo_root
+. "$repo_root/crates/trawl-server/debian/tests/harness-cleanup.sh"
 readonly DOCS_PAGE="$repo_root/docs/src/content/docs/reference/crash-dumps.md"
 
 # The enable command from docs/.../crash-dumps.md, reproduced verbatim. The
@@ -713,8 +714,8 @@ DEB="${package_paths[trawl-server]}"
 
 phase "3 up"
 
-# Anything still holding these names is debris from a run that was killed before
-# its teardown, or from --keep. Clear it rather than reusing it: a container left
+# A stopped container with a prior harness label is debris from an interrupted
+# run or --keep. Clear it rather than reusing it: a container left
 # over from an earlier build would quietly test the wrong .deb, and
 # `docker network create` on an existing network is a hard failure that leaves
 # the operator to clean up by hand.
@@ -726,13 +727,8 @@ phase "3 up"
 # the operator can remove it deliberately.
 preflight=()
 for stale in "$NODE" "$PG"; do
-  if docker inspect "$stale" >/dev/null 2>&1; then
-    if [[ "$(docker inspect -f '{{.State.Running}}' "$stale" 2>/dev/null)" == "true" ]]; then
-      die "container $stale is RUNNING. Another run may own it, or --keep left it behind. Remove it with 'docker rm -f $stale' once you are sure nothing is using it."
-    fi
-    docker rm -f "$stale" >/dev/null 2>&1 || true
-    preflight+=("container $stale (was not running)")
-  fi
+  removed=$(remove_stopped_harness_container "$stale") || die "container preflight refused $stale"
+  [[ -z "$removed" ]] || preflight+=("$removed")
 done
 if docker network inspect "$NET" >/dev/null 2>&1; then
   docker network rm "$NET" >/dev/null 2>&1 || true
