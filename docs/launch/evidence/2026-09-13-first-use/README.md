@@ -52,7 +52,11 @@ and source binaries in the explicit host cache it names. It supervises the two
 commands that a human would run in separate terminals and supplies the built SPA
 through `TRAWL_WEB_SPA_DIR`.
 
-The interactive TUI step (`block-11.sh`) was not executed. This run did not install
+The interactive TUI step (`block-11.sh`) was not executed. The literal cleanup
+blocks (`block-13.sh` and `block-14.sh`) were also not executed; the harness trap
+performed their supervised equivalents, using the owned container ID and a
+checked temporary-directory prefix. The cleanup outcome is recorded above.
+This run did not install
 a Debian package, pull a released image, install a Helm chart, verify macOS, or
 exercise a production TLS/reverse-proxy setup. Collector delivery/trust has a
 separate real Vector fixture, described in the readiness ledger.
@@ -62,3 +66,8 @@ login selector; the first tutorial extension used a server-invalid spaced saved
 name; the second expected terminal table formatting on nonterminal stdout. The
 ledger records their corrections and cleanup. The final report here supersedes
 them only for the tested final paths.
+
+`experiment-brief.md` is preserved from the earlier failed full-app attempt.
+Its "Current run" field names `run-1789350538585-13ac35c7b9` and the planned
+hold for that attempt. The passing report preserved here is the subsequent
+`run-1789350917170-5c84888283`, prepared at `6b3febff`, without that hold.
