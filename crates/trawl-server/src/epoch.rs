@@ -136,23 +136,22 @@ pub fn ensure_current_epoch(
         publish_epoch(data_root)?;
         return Ok(Outcome::InitializedEmpty);
     }
-    if let Some(staged) = refused_staging.as_ref().or_else(|| staged_epochs.first()) {
-        return Err(format!(
-            "data root {} is nonempty but has no EPOCH marker; refusing to start without \
-             changing storage. Cannot recover staged epoch entry {} automatically; inspect \
-             its type, contents, and origin along with the data root before choosing a recovery \
-             action. Startup has not removed or relabeled this entry",
-            data_root.display(),
-            staged.display()
-        ));
-    }
-    Err(format!(
+    let refusal = format!(
         "data root {} is nonempty but has no EPOCH marker; refusing to start without \
          changing storage. Select new empty data and WAL directories, or restore a complete \
          epoch-{CURRENT_EPOCH} backup including EPOCH. Unversioned generic archives require \
          ingest disabled and must not contain Trawl ownership markers",
         data_root.display()
-    ))
+    );
+    if ingest_enabled && let Some(staged) = refused_staging {
+        return Err(format!(
+            "{refusal}. Cannot recover staged epoch entry {} automatically; inspect its type, contents, \
+             and origin along with the data root before choosing a recovery action. Startup \
+             has not removed or relabeled this entry",
+            staged.display()
+        ));
+    }
+    Err(refusal)
 }
 
 /// Recognize only names and bytes an interrupted current publication writes.
@@ -408,7 +407,13 @@ mod tests {
                     std::fs::write(path, b"preserve").unwrap();
                 }
                 let before = snapshot(tmp.path());
-                assert!(ensure_current_epoch(&data, &data.join("wal"), ingest).is_err());
+                let err = ensure_current_epoch(&data, &data.join("wal"), ingest).unwrap_err();
+                assert!(err.contains("restore a complete epoch-3 backup"), "{err}");
+                assert!(
+                    err.contains("Unversioned generic archives require"),
+                    "{err}"
+                );
+                assert!(!err.contains("Cannot recover staged epoch entry"), "{err}");
                 assert_eq!(snapshot(tmp.path()), before);
             }
         }
@@ -432,14 +437,21 @@ mod tests {
             std::fs::write(data.join("EPOCH.next.456"), b"3\n").unwrap();
             std::fs::write(data.join(name), content).unwrap();
             let before = snapshot(tmp.path());
-            let err = ensure_current_epoch(&data, &data.join("wal"), true).unwrap_err();
-            assert!(
-                err.contains(&data.join(name).display().to_string()),
-                "{err}"
-            );
-            assert!(err.contains("inspect"), "{err}");
-            assert!(!err.contains("delete"), "{err}");
-            assert_eq!(snapshot(tmp.path()), before);
+            for ingest in [false, true] {
+                let err = ensure_current_epoch(&data, &data.join("wal"), ingest).unwrap_err();
+                assert!(err.contains("restore a complete epoch-3 backup"), "{err}");
+                if ingest {
+                    assert!(
+                        err.contains(&data.join(name).display().to_string()),
+                        "{err}"
+                    );
+                    assert!(err.contains("inspect"), "{err}");
+                } else {
+                    assert!(!err.contains("Cannot recover staged epoch entry"), "{err}");
+                }
+                assert!(!err.contains("delete"), "{err}");
+                assert_eq!(snapshot(tmp.path()), before);
+            }
         }
     }
 
