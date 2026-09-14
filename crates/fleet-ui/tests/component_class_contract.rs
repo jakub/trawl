@@ -1026,11 +1026,11 @@ fn login_associates_its_error_with_the_input() {
     // One binding feeds the banner's id and the association, so the two
     // cannot drift apart; the test pins the value and both uses.
     assert!(
-        LOGIN.contains(r#""login-error""#)
+        LOGIN.contains(r#""fleet-login-error""#)
             && LOGIN.contains("id=ERROR_ID")
             && LOGIN.contains("then_some(ERROR_ID)"),
         "the banner id and the aria-describedby must be the same \
-         `login-error` binding"
+         `fleet-login-error` binding"
     );
     assert!(
         ERROR_BANNER.contains("id=id"),

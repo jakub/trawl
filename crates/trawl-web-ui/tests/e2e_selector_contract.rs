@@ -1378,16 +1378,16 @@ const CONTRACTS: &[Contract] = &[
     },
     // Two halves, since the class alone reaches both bypasses.
     Contract {
-        assignment: "skipToQuery: 'a.skip[href=\"#search-editor\"]',",
+        assignment: "skipToQuery: 'a.skip-link[href=\"#search-query\"]',",
         source_path: "src/pages/search.rs",
         source: include_str!("../src/pages/search.rs"),
-        hook: "class=\"skip\"",
+        hook: "class=\"skip-link\"",
     },
     Contract {
-        assignment: "skipToQuery: 'a.skip[href=\"#search-editor\"]',",
+        assignment: "skipToQuery: 'a.skip-link[href=\"#search-query\"]',",
         source_path: "src/pages/search.rs",
         source: include_str!("../src/pages/search.rs"),
-        hook: "href=\"#search-editor\"",
+        hook: "href=\"#search-query\"",
     },
     Contract {
         assignment: "filterChip: '.meta-chips .chip',",

@@ -144,7 +144,7 @@ test('an aggregate keeps the window caption and drops the bar strip', async ({ p
   await expect(page.locator(SEL.histoCaption)).toContainText(COPY.histoCaptionPrefix);
 });
 
-test('the chart and the group searches wait for the response that matches the query', async ({ page, request }) => {
+test('the chart waits for the matching response while the group searches keep their own query', async ({ page, request }) => {
   await resetScenario(request, 'corpus');
   await page.goto(AGG_URL);
   await expect(page.locator(SEL.catChart)).toHaveCount(1);
@@ -152,8 +152,9 @@ test('the chart and the group searches wait for the response that matches the qu
 
   // Hold the next query open. The resource keeps the response already on
   // screen, so without a gate the chart would be redrawn from those rows
-  // under the NEW executed query, and every group control would carry
-  // the old query's field into the new filter.
+  // under the NEW executed query. The group controls need no gate: each
+  // carries the query its row was executed for, so a press while the
+  // next response is pending still files the filter against that query.
   let release!: () => void;
   const held = new Promise<void>((resolve) => { release = resolve; });
   await page.route('**/api/v1/query*', async (route) => {
@@ -165,10 +166,10 @@ test('the chart and the group searches wait for the response that matches the qu
   await expect(page).toHaveURL(/[?&]f=v1\./);
 
   await expect(page.locator(SEL.catChart)).toHaveCount(0);
-  await expect(page.locator(SEL.groupSearch)).toHaveCount(0);
-  // The numbers stay on screen — this is a gate on the controls, not a
-  // blank page.
+  // The numbers and their controls stay on screen — this is a gate on
+  // the chart, not a blank page.
   await expect(page.locator(`${SEL.exactTable} tbody tr`)).toHaveCount(GROUPS);
+  await expect(page.locator(SEL.groupSearch)).toHaveCount(GROUPS);
 
   release();
   await expect(page.locator(SEL.catChart)).toHaveCount(1);

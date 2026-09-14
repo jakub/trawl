@@ -364,7 +364,7 @@ export const SEL = {
   /// crates/trawl-web-ui/src/pages/search.rs — the first of the two
   /// keyboard bypasses, ahead of the filter rail in DOM order. Matched
   /// by href because both links share the class.
-  skipToQuery: 'a.skip[href="#search-editor"]',
+  skipToQuery: 'a.skip-link[href="#search-query"]',
   /// crates/trawl-web-ui/src/components/meta_strip.rs — one active
   /// filter's chip. Counting these is how a spec says "exactly one
   /// filter was added": the URL payload is base64 and says nothing on

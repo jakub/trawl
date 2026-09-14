@@ -157,13 +157,14 @@ test('the skip links reach the editor and the results', async ({ page, request }
   const toResults = page.getByRole('link', { name: 'Skip to results' });
   await toResults.focus();
   await page.keyboard.press('Enter');
-  await expect(page.locator(SEL.resultsPane)).toBeFocused();
+  await expect(page.getByRole('tab', { name: /^Events/ })).toBeFocused();
 });
 
 // The bypass used to be inert wherever the results region was not the
 // snapshot table: the handler prevented the anchor's default and then
 // focused nothing at all, so the key press moved neither focus nor the
-// document (A03). Both remaining panes are asserted here.
+// document (A03). The link lands on the active results tab, which every
+// mode renders; both remaining panes are asserted here.
 test('skip to results reaches live mode and the Visualization tab', async ({ page, request }) => {
   await resetScenario(request, 'stream-burst');
   await page.goto('/search?q=service%3Dnginx&mode=live');
@@ -172,7 +173,7 @@ test('skip to results reaches live mode and the Visualization tab', async ({ pag
   const toResults = page.getByRole('link', { name: 'Skip to results' });
   await toResults.focus();
   await page.keyboard.press('Enter');
-  await expect(page.locator(SEL.resultsPane)).toBeFocused();
+  await expect(page.getByRole('tab', { name: /^Events/ })).toBeFocused();
 
   await resetScenario(request, 'corpus');
   await page.goto('/search?q=service%3Dnginx&page=0');
@@ -181,7 +182,7 @@ test('skip to results reaches live mode and the Visualization tab', async ({ pag
 
   await toResults.focus();
   await page.keyboard.press('Enter');
-  await expect(page.locator(SEL.resultsPane)).toBeFocused();
+  await expect(page.getByRole('tab', { name: 'Visualization' })).toBeFocused();
 });
 
 /** The stub's truncated answer: the `pagination` scenario with its

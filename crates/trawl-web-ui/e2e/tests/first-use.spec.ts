@@ -14,7 +14,7 @@ test('login explains personal keys and links operators to provisioning', async (
   await expect(help).toHaveAttribute('rel', 'noopener noreferrer');
   await page.setViewportSize({ width: 375, height: 667 });
   await expect(help).toBeInViewport();
-  await expect(page.getByRole('button', { name: 'Sign In', exact: true })).toBeInViewport();
+  await expect(page.getByRole('button', { name: 'Sign in', exact: true })).toBeInViewport();
 });
 
 for (const [platform, ua, shortcut] of [

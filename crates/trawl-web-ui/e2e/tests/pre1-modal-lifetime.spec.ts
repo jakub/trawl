@@ -25,7 +25,7 @@ for (const origin of ['search', 'history'] as const) {
       });
       await page.goto(origin === 'search' ? '/search?q=service%3Dnginx' : '/search/history');
       const open = async () => {
-        if (origin === 'search') await page.locator('.editor-tools').getByRole('button', { name: 'Save', exact: true }).click();
+        if (origin === 'search') await page.locator('.editor-tools').getByRole('button', { name: 'Save as net', exact: true }).click();
         else await page.getByRole('button', { name: 'Save as net', exact: true }).first().click();
       };
       await open();

@@ -13,7 +13,9 @@ test('Nets keeps its open menu and focused item through polling and a clock tick
     const response = await route.fetch();
     const body = await response.json();
     reads++;
-    body.queries[0].query = `* | limit ${reads}`;
+    // The list shows names, cadence and last run, not query text, so the
+    // live cell under observation is the name link.
+    body.queries[0].name = `polled-net-${reads}`;
     await route.fulfill({ response, json: body });
   });
   await page.goto('/jobs/nets');
@@ -22,12 +24,13 @@ test('Nets keeps its open menu and focused item through polling and a clock tick
   await item.focus();
   const mounted = await item.elementHandle();
   const before = reads;
+  const polled = page.locator('.nets-table .row-stretch', { hasText: /^polled-net-/ });
   await page.clock.fastForward(5_000);
   await expect.poll(() => reads).toBeGreaterThan(before);
-  await expect(page.locator('.nets-table td.path').first()).toHaveText('* | limit 2');
+  await expect(polled).toHaveText('polled-net-2');
   await expect(item).toBeFocused();
   await page.clock.fastForward(25_000);
-  await expect(page.locator('.nets-table td.path').first()).toHaveText('* | limit 3');
+  await expect(polled).toHaveText('polled-net-3');
   await expect(item).toBeFocused();
   expect(await mounted!.evaluate(el => el.isConnected)).toBe(true);
 });

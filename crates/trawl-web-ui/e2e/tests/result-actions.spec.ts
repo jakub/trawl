@@ -17,14 +17,16 @@ test('result audit: numeric sorting and only original aggregate group Include', 
   await expect(page.locator('.results-table tbody tr').first()).toContainText('hundred');
   await page.getByRole('button', { name: 'Sort by count', exact: true }).click();
   await expect(page.locator('.results-table tbody tr').first()).toContainText('null');
-  await page.getByRole('button', { name: 'Show details for result 1', exact: true }).click();
-  await expect(page.getByRole('button', { name: 'Include count = 100', exact: true })).toHaveCount(0);
+  // An aggregate row has no event to reveal, so the exact table offers
+  // no expansion, no raw actions, and a search only on the grouped field.
+  await expect(page.getByRole('button', { name: 'Show details for result 1', exact: true })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Search count = 100', exact: true })).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Show context', exact: true })).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Find similar', exact: true })).toHaveCount(0);
   await page.locator(SEL.cmContent).click();
   await page.keyboard.press('Control+a');
   await page.keyboard.insertText('* | stats count()');
-  await page.locator('.results').getByRole('button', { name: 'Include host = hundred', exact: true }).click();
+  await page.locator('.results').getByRole('button', { name: 'Search host = hundred', exact: true }).click();
   const q = new URL(page.url()).searchParams.get('q')!;
   expect(q).toContain('stats count() by host');
   const filters = new URL(page.url()).searchParams.get('f')!;
@@ -35,8 +37,7 @@ test('result audit: uppercase grouping keeps original lowercase output Include',
   const query = '* | stats count() by HOST';
   await page.route(routeQuery, route => route.fulfill({ json: aggregate }));
   await page.goto('/search?q=' + encodeURIComponent(query));
-  await page.getByRole('button', { name: 'Show details for result 1', exact: true }).click();
-  await page.locator('.results').getByRole('button', { name: 'Include host = hundred', exact: true }).click();
+  await page.locator('.results').getByRole('button', { name: 'Search host = hundred', exact: true }).click();
   const url = new URL(page.url());
   expect(url.searchParams.get('q')).toBe(query);
   expect(JSON.parse(Buffer.from(url.searchParams.get('f')!.slice(3), 'base64url').toString())).toContainEqual({ field: 'host', value: 'hundred', op: '+' });
@@ -51,8 +52,9 @@ for (const query of [
   test(`result audit: suppress transformed or saved input actions: ${query}`, async ({ page }) => {
     await page.route(routeQuery, route => route.fulfill({ json: aggregate }));
     await page.goto('/search?q=' + encodeURIComponent(query));
-    await page.getByRole('button', { name: 'Show details for result 1', exact: true }).click();
-    await expect(page.getByRole('button', { name: /^Include / })).toHaveCount(0);
+    await expect(page.locator('.results-table tbody tr').first()).toBeVisible();
+    await expect(page.getByRole('button', { name: /^(Include|Search) / })).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Show details for result 1', exact: true })).toHaveCount(0);
     await expect(page.getByRole('button', { name: 'Copy _raw', exact: true })).toHaveCount(0);
   });
 }
@@ -135,13 +137,17 @@ test('result audit: pending query cannot retarget retained aggregate row actions
   });
   try {
     await page.goto('/search?q=' + encodeURIComponent('* | stats count() by host') + '&r=1h');
-    await page.getByRole('button', { name: 'Show details for result 1', exact: true }).click();
+    await expect(page.locator('.results').getByRole('button', { name: 'Search host = hundred', exact: true })).toBeVisible();
     await page.locator(SEL.cmContent).click();
     await page.keyboard.press('Control+a');
     await page.keyboard.insertText('service=new');
     await page.keyboard.press('Control+Enter');
     await expect.poll(() => pending).toBe(true);
     await expect(page.locator('.facets').getByRole('button', { name: /^Include / })).toHaveCount(0);
+    // The arm follows the URL, so while the raw query is pending the
+    // retained aggregate rows render in the raw table; its Include tag
+    // still carries the aggregate query the rows came from.
+    await page.getByRole('button', { name: 'Show details for result 1', exact: true }).click();
     await page.locator('.results').getByRole('button', { name: 'Include host = hundred', exact: true }).click();
     const q = new URL(page.url()).searchParams.get('q')!;
     expect(q).toContain('stats count() by host');
