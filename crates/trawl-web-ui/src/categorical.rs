@@ -21,8 +21,12 @@
 
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
+use std::collections::HashSet;
+
 use trawl_api::value::{QueryResult, Value};
-use trawl_core::ast::PipeStage;
+use trawl_core::ast::{PipeStage, Spanned};
+use trawl_core::projection::agg_output_name;
+use trawl_core::schema::{TIME, catalog_key};
 
 /// A `stats <metric> by <field>` result the categorical chart can draw:
 /// one group column, one numeric metric column, and the scale to draw
@@ -121,23 +125,111 @@ pub fn detect(query: &str, result: &QueryResult) -> Option<CatShape> {
     })
 }
 
-/// Indices of the result columns the query actually grouped by.
+/// Indices of the result columns the query actually grouped by AND can
+/// still be searched for.
 ///
 /// These are the only columns the exact table offers a search on: every
 /// other column is a generated metric, and a filter naming one would
 /// advertise a field the corpus has never held (ADR-0025, F02). Any
 /// pipeline whose last stage is not `stats` groups by nothing.
+///
+/// Being grouped by is not enough on its own. A search prepends
+/// `<field>="<value>"` BEFORE the first pipe, so the name has to be one
+/// the corpus holds at that point — and `stats count() as n by service
+/// | stats count() by n` groups by `n`, a number the first aggregation
+/// invented. Provenance is established by walking the stages ahead of
+/// the final `stats`: a name any of them minted is not a field, and a
+/// pipeline that mints names nobody can enumerate ahead of the data
+/// leaves no name searchable at all.
 #[must_use]
 pub fn group_columns(query: &str, columns: &[String]) -> Vec<usize> {
-    let Some(stats) = last_stats(query) else {
+    let Ok(ast) = trawl_core::parser::parse(query) else {
+        return Vec::new();
+    };
+    let Some((last, earlier)) = ast.pipeline.split_last() else {
+        return Vec::new();
+    };
+    let PipeStage::Stats(stats) = &last.node else {
+        return Vec::new();
+    };
+    let Some(minted) = minted_before(earlier) else {
         return Vec::new();
     };
     columns
         .iter()
         .enumerate()
         .filter(|(_, name)| stats.group_by.iter().any(|g| g == *name))
+        .filter(|(_, name)| !minted.contains(&catalog_key(name)))
         .map(|(i, _)| i)
         .collect()
+}
+
+/// Every column name the stages ahead of the final `stats` mint, or
+/// `None` when a stage mints names that cannot be known without the
+/// data.
+///
+/// Names fold through [`catalog_key`], so a `stats count() as Total`
+/// disqualifies a later group by `total`: the two are one column.
+///
+/// `extract`, `pivot` and `from saved` are the unknowable three. An
+/// extraction's fields come out of a regex or a key/value scan of the
+/// message, a pivot's columns are the VALUES of its `on` field, and a
+/// saved run carries whatever schema it was written with. None of them
+/// can be enumerated from the query text, and a name that might have
+/// been minted is a name whose provenance is not established — so the
+/// whole result withholds the search rather than guessing.
+fn minted_before(stages: &[Spanned<PipeStage>]) -> Option<HashSet<String>> {
+    fn mint(set: &mut HashSet<String>, name: &str) {
+        set.insert(catalog_key(name));
+    }
+    let mut minted = HashSet::new();
+    for stage in stages {
+        match &stage.node {
+            PipeStage::Stats(s) => {
+                for agg in &s.aggregations {
+                    mint(&mut minted, &agg_output_name(agg));
+                }
+            }
+            PipeStage::EventStats(s) => {
+                for agg in &s.aggregations {
+                    mint(&mut minted, &agg_output_name(agg));
+                }
+            }
+            PipeStage::Timechart(t) => {
+                mint(&mut minted, TIME);
+                for agg in &t.aggregations {
+                    mint(&mut minted, &agg_output_name(agg));
+                }
+            }
+            // `top`/`rare` desugar to a frequency column they always
+            // spell `count` and can never rename.
+            PipeStage::Top(_) | PipeStage::Rare(_) => mint(&mut minted, "count"),
+            PipeStage::Let(l) => {
+                for (name, _) in &l.assignments {
+                    mint(&mut minted, name);
+                }
+            }
+            // The new name of a rename is the computed one; the old name
+            // is gone from the output either way.
+            PipeStage::Rename(r) => {
+                for (_, to) in &r.renames {
+                    mint(&mut minted, to);
+                }
+            }
+            PipeStage::Extract(_) | PipeStage::Pivot(_) | PipeStage::FromSaved(_) => return None,
+            // Filtering, ordering, projecting and deduplicating stages
+            // pass names through; none of them invents one.
+            PipeStage::Where(_)
+            | PipeStage::Sort(_)
+            | PipeStage::Limit(_)
+            | PipeStage::Table(_)
+            | PipeStage::Drop(_)
+            | PipeStage::Dedup(_)
+            | PipeStage::Tail(_)
+            | PipeStage::Sample(_) => {}
+        }
+    }
+    Some(minted)
 }
 
 /// The query's last `stats` stage, if that is what it ends with.
@@ -171,6 +263,16 @@ mod tests {
     use trawl_api::value::Column;
 
     const BY_STATUS: &str = "* | stats count() by status";
+
+    /// An empty answer only counts as a refusal when the query parsed:
+    /// a syntax error withholds the same way and would prove nothing.
+    fn withheld(query: &str, columns: &[String]) -> bool {
+        assert!(
+            trawl_core::parser::parse(query).is_ok(),
+            "the query must parse: {query}"
+        );
+        group_columns(query, columns).is_empty()
+    }
 
     fn result(names: &[&str], rows: Vec<Vec<Value>>) -> QueryResult {
         QueryResult {
@@ -436,6 +538,73 @@ mod tests {
         assert_eq!(
             group_columns("* | stats count() by status, host", &columns),
             vec![0, 1]
+        );
+    }
+
+    #[test]
+    fn group_columns_withholds_a_group_by_on_an_earlier_metric() {
+        // `n` is a count the first aggregation invented. A search on it
+        // would prepend `n="940"` ahead of the first pipe, where no such
+        // field has ever existed.
+        let columns = vec!["n".to_string(), "count".to_string()];
+        assert!(withheld(
+            "* | stats count() as n by service | stats count() by n",
+            &columns
+        ));
+    }
+
+    #[test]
+    fn group_columns_withholds_an_alias_that_shadows_a_real_field() {
+        // `service` is a real field, but this pipeline's `service`
+        // column holds the first stage's counts, so the values in it
+        // are not service names.
+        let columns = vec!["service".to_string(), "count".to_string()];
+        assert!(withheld(
+            "* | stats count() as service by host | stats count() by service",
+            &columns
+        ));
+    }
+
+    #[test]
+    fn group_columns_folds_case_when_it_matches_a_minted_name() {
+        let columns = vec!["total".to_string(), "count".to_string()];
+        assert!(withheld(
+            "* | stats count() as Total by service | stats count() by total",
+            &columns
+        ));
+    }
+
+    #[test]
+    fn group_columns_withholds_a_computed_field() {
+        let columns = vec!["bucket".to_string(), "count".to_string()];
+        assert!(withheld(
+            "* | let bucket = lower(service) | stats count() by bucket",
+            &columns
+        ));
+    }
+
+    #[test]
+    fn group_columns_withholds_everything_after_an_unenumerable_stage() {
+        // An extraction's field names come out of the data, so no name
+        // after one has established provenance — including a real one.
+        let columns = vec!["service".to_string(), "count".to_string()];
+        assert!(withheld(
+            "* | extract \"(?P<ip>[0-9.]+)\" from message | stats count() by service",
+            &columns
+        ));
+    }
+
+    #[test]
+    fn group_columns_survives_stages_that_only_pass_names_through() {
+        // Filtering and ordering mint nothing, so the field the last
+        // stage groups by is still the corpus's own.
+        let columns = vec!["status".to_string(), "count".to_string()];
+        assert_eq!(
+            group_columns(
+                "service=nginx | sort _time | stats count() by status",
+                &columns
+            ),
+            vec![0]
         );
     }
 
