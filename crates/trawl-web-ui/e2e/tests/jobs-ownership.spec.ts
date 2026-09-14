@@ -156,3 +156,84 @@ for (const path of ['/jobs/nets', '/jobs/runs']) {
     await expect(page.getByText('Retrying automatically.', { exact: false })).toHaveCount(0);
   });
 }
+
+for (const surface of ['nets', 'runs', 'drawer']) {
+  test(`${surface} retains focus when a live refresh moves the focused row`, async ({ page, request }) => {
+    await resetScenario(request, surface === 'drawer' ? 'schedule' : 'corpus');
+    await page.clock.install();
+    let reads = 0;
+    const endpoint = surface === 'nets' ? '**/api/v1/saved'
+      : surface === 'runs' ? '**/api/v1/runs?*' : `**/api/v1/saved/${SCHEDULE.windowedNetId}/runs?*`;
+    await page.route(endpoint, async route => {
+      const response = await route.fetch();
+      const body = await response.json();
+      reads++;
+      if (surface === 'nets') {
+        const first = { ...body.queries[0], name: reads === 1 ? 'A moving net' : 'Z moving net' };
+        const second = { ...first, id: first.id + 1000, name: 'B stationary net' };
+        body.queries = [first, second];
+      } else {
+        const first = { ...body.runs[0], net_name: 'A moving run', error_message: 'A moving run' };
+        const second = { ...first, id: first.id + 1000, net_name: 'B stationary run', error_message: 'B stationary run' };
+        body.runs = reads === 1 ? [first, second] : [second, first];
+        body.total = 2;
+      }
+      await route.fulfill({ response, json: body });
+    });
+    await page.goto(surface === 'drawer' ? `/jobs/nets?net=${SCHEDULE.windowedNetId}&ntab=runs` : `/jobs/${surface}`);
+    const table = page.locator(surface === 'drawer' ? '.run-preview-table' : `.${surface}-table`);
+    await expect(table.locator('tbody tr')).toHaveCount(2);
+    const control = surface === 'nets'
+      ? table.locator(SEL.actionsMenuTrigger).first()
+      : table.locator('.row-stretch').first();
+    await control.focus();
+    const mounted = await control.elementHandle();
+    if (surface === 'nets') {
+      await control.click();
+      await page.locator(SEL.actionsMenuItem).first().focus();
+    }
+    const focused = await page.evaluateHandle(() => document.activeElement);
+    await page.clock.fastForward(5_000);
+    if (surface === 'drawer') await expect(table.locator('tbody tr').first()).toContainText('B stationary run');
+    else await expect(table.locator('.row-stretch').first()).toHaveText(surface === 'nets' ? 'B stationary net' : 'B stationary run');
+    expect(await mounted!.evaluate(el => el.isConnected)).toBe(true);
+    expect(await focused.evaluate(el => el === document.activeElement)).toBe(true);
+    if (surface === 'nets') await expect(page.locator(SEL.actionsMenuItem).first()).toBeVisible();
+  });
+}
+
+for (const behavior of ['remove the focused row', 'retain newer focus']) {
+  test(`a live refresh can ${behavior} without restoring obsolete focus`, async ({ page, request }) => {
+    await resetScenario(request, 'corpus');
+    await page.clock.install();
+    let reads = 0;
+    let release: (() => void) | undefined;
+    await page.route('**/api/v1/saved', async route => {
+      const response = await route.fetch();
+      const body = await response.json();
+      reads++;
+      const first = { ...body.queries[0], name: reads === 1 ? 'A moving net' : 'Z moving net' };
+      const second = { ...first, id: first.id + 1000, name: 'B stationary net' };
+      body.queries = reads > 1 && behavior === 'remove the focused row' ? [second] : [first, second];
+      if (reads === 2) await new Promise<void>(resolve => { release = resolve; });
+      await route.fulfill({ response, json: body });
+    });
+    await page.goto('/jobs/nets');
+    const table = page.locator('.nets-table');
+    await expect(table.locator('tbody tr')).toHaveCount(2);
+    const initial = table.locator('.row-stretch').first();
+    await initial.focus();
+    const mounted = await initial.elementHandle();
+    await page.clock.fastForward(5_000);
+    await expect.poll(() => Boolean(release)).toBe(true);
+    const nextFocus = table.locator('thead button').last();
+    if (behavior === 'retain newer focus') await nextFocus.focus();
+    release!();
+    await expect(table.locator('.row-stretch').first()).toHaveText('B stationary net');
+    if (behavior === 'retain newer focus') await expect(nextFocus).toBeFocused();
+    else {
+      expect(await mounted!.evaluate(el => el.isConnected)).toBe(false);
+      await expect(page.locator('body')).toBeFocused();
+    }
+  });
+}

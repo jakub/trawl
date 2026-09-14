@@ -79,6 +79,7 @@ web-sys = { version = "0.3", features = [
     "Event",
     "EventSource",
     "EventTarget",
+    "FocusOptions",
     # `History` is the Schema page's origin-aware back: an entry the SPA
     # itself pushed is popped, never replaced.
     "History",

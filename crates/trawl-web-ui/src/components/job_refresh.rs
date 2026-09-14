@@ -105,8 +105,13 @@ where
             }
             match result {
                 Ok(value) => {
+                    let focused = leptos::prelude::document()
+                        .active_element()
+                        .filter(|el| el.tag_name() != "BODY")
+                        .and_then(|el| el.dyn_into::<web_sys::HtmlElement>().ok());
                     data.set(Some(Ok(value)));
                     error.set(None);
+                    restore_focus_after_refresh(focused, live, desired, generation, active);
                 }
                 Err(e) => {
                     error.set(Some(if matches!(data.get_untracked(), Some(Ok(_))) {
@@ -122,4 +127,37 @@ where
         });
     });
     (data, error, refresh)
+}
+
+fn restore_focus_after_refresh(
+    focused: Option<web_sys::HtmlElement>,
+    live: Rc<Cell<bool>>,
+    desired: Rc<Cell<u64>>,
+    generation: u64,
+    active: Signal<bool>,
+) {
+    // Keyed rows retain their owners, but insertBefore moves can drop focus.
+    // These lists read data directly, so their DOM update is queued before
+    // this restoration. No browser user-event task can intervene.
+    queue_microtask(move || {
+        if !live.get()
+            || generation != desired.get()
+            || leptos::prelude::document().hidden()
+            || active.try_get_untracked() != Some(true)
+        {
+            return;
+        }
+        if let Some(focused) = focused
+            && focused.is_connected()
+            && (focused.offset_width() > 0 || focused.offset_height() > 0)
+            && focused.closest("[hidden]").ok().flatten().is_none()
+            && leptos::prelude::document()
+                .active_element()
+                .is_some_and(|active| active.tag_name() == "BODY")
+        {
+            let options = web_sys::FocusOptions::new();
+            options.set_prevent_scroll(true);
+            let _ = focused.focus_with_options(&options);
+        }
+    });
 }
