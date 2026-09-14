@@ -1,0 +1,12 @@
+{
+  "status": "passed",
+  "count": 3,
+  "error_row": {
+    "message": "connection refused",
+    "duration": 1500
+  },
+  "text_capture": "120x40",
+  "clean_exit": true,
+  "socket_removed": true,
+  "limits": "No pixel, color, clipboard, or native macOS evidence"
+}

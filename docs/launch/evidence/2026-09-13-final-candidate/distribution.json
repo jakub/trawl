@@ -1,0 +1,9 @@
+{
+    "version": "1.5.5",
+    "archive": "libduckdb-linux-amd64.zip",
+    "sha256": "1fb8ce388157d84a25abe685a8a2520bf00c00321821968e4bb398fd766e7abb",
+    "target": "x86_64-unknown-linux-gnu",
+    "source_sha": "384a28a8fbc2615c3f6de439f1027b115e2c43d5",
+    "tooling_sha": "384a28a8fbc2615c3f6de439f1027b115e2c43d5",
+    "platform_floor": "Debian 12"
+}

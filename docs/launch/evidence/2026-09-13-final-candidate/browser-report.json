@@ -1,0 +1,12 @@
+{
+  "status": "passed",
+  "phases": [
+    "personal-key-login",
+    "bounded-example-three-real-events",
+    "both-exact-tutorial-queries",
+    "true-zero-match-guidance",
+    "save-editor-only-with-real-database",
+    "share-executed-state-roundtrip"
+  ],
+  "errors": []
+}
