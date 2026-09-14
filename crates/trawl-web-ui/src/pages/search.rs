@@ -74,13 +74,26 @@ use crate::state::stream_session::{
     LiveSignals, RingBuffer, StreamLifecycle, ring_to_result, start_stream,
 };
 
-fn focus_search_control(selector: &str) {
-    if let Some(document) = web_sys::window().and_then(|window| window.document())
-        && let Ok(Some(element)) = document.query_selector(selector)
-        && let Ok(element) = element.dyn_into::<web_sys::HtmlElement>()
-    {
-        let _ = element.focus();
-    }
+/// Move keyboard focus to the first element matching `selector`, and
+/// report whether anything took it.
+///
+/// Both skip links are real anchors, so the browser already moves the
+/// document to the target; neither target takes focus from an `href`
+/// alone — `.cm-content` is `CodeMirror`'s own contenteditable, and the
+/// results tab is a `tabindex="0"` control — so the handler supplies it.
+///
+/// The return value is what keeps the link honest. A missing target is
+/// a real case: the results header is absent while the malformed banner
+/// is up (ADR-0027). Swallowing the default there left the link inert —
+/// it prevented the navigation AND focused nothing — so the caller
+/// prevents the default only when the focus landed, and otherwise lets
+/// the browser move the document the way an anchor always does.
+fn focus_search_control(selector: &str) -> bool {
+    web_sys::window()
+        .and_then(|window| window.document())
+        .and_then(|document| document.query_selector(selector).ok().flatten())
+        .and_then(|element| element.dyn_into::<web_sys::HtmlElement>().ok())
+        .is_some_and(|element| element.focus().is_ok())
 }
 
 /// Results-area tab. The typed enum is search-page semantics rather than
@@ -788,12 +801,14 @@ pub fn Search() -> impl IntoView {
             // order by design: the two bypasses are what keeps that from
             // costing 110 tab stops to reach the editor (A03).
             <a class="skip-link" href="#search-query" on:click=move |event: web_sys::MouseEvent| {
-                event.prevent_default();
-                focus_search_control(".dsl-editor [contenteditable=true]");
+                if focus_search_control(".dsl-editor [contenteditable=true]") {
+                    event.prevent_default();
+                }
             }>"Skip to query editor"</a>
             <a class="skip-link" href="#search-results" on:click=move |event: web_sys::MouseEvent| {
-                event.prevent_default();
-                focus_search_control("[role=tablist][aria-label=Results] [role=tab][tabindex='0']");
+                if focus_search_control("[role=tablist][aria-label=Results] [role=tab][tabindex='0']") {
+                    event.prevent_default();
+                }
             }>"Skip to results"</a>
             <FacetSidebar
                 state=active_rows
@@ -973,8 +988,12 @@ pub fn Search() -> impl IntoView {
                     (ResultsTab::Events, Mode::Live) => view! {
                         <LiveRawTable result=ring_result failure=stream_failure/>
                     }.into_any(),
+                    // The Visualization pane IS the results region while
+                    // it is the active tab: only one tab is mounted, so
+                    // the id stays unique and "Skip to results" reaches
+                    // the chart the same way it reaches a table.
                     (ResultsTab::Visualization, Mode::Snapshot) => {
-                        if loading.get() {
+                        let inner = if loading.get() {
                             view! { <p class="results-empty" role="status">"Loading snapshot visualization…"</p> }.into_any()
                         } else {
                             match rows.get() {
@@ -982,15 +1001,20 @@ pub fn Search() -> impl IntoView {
                                 Some(Err(_)) => view! { <div class="results-empty"><p role="alert">"Snapshot query failed. Open Events for the query error."</p><button type="button" class="btn-sec" on:click=move |_| rows.refetch()>"Retry snapshot"</button></div> }.into_any(),
                                 None => view! { <p class="results-empty">"Run a query to visualize its snapshot."</p> }.into_any(),
                             }
-                        }
+                        };
+                        view! { <div id="search-results" class="results" role="region" aria-label="Search results" tabindex="0">{inner}</div> }.into_any()
                     },
                     (ResultsTab::Visualization, Mode::Live) if is_chart_query.get() => view! {
-                        <Chart snapshot=live_snapshot query=effective_q failure=stream_failure on_retry=retry_stream/>
+                        <div id="search-results" class="results" role="region" aria-label="Search results" tabindex="0">
+                            <Chart snapshot=live_snapshot query=effective_q failure=stream_failure on_retry=retry_stream/>
+                        </div>
                     }.into_any(),
                     (ResultsTab::Visualization, Mode::Live) => view! {
-                        <Show when=move || stream_failure.get().is_none()>
-                            <p class="results-empty">"Live event queries appear in Events. Use timechart with a count metric for a live visualization."</p>
-                        </Show>
+                        <div id="search-results" class="results" role="region" aria-label="Search results" tabindex="0">
+                            <Show when=move || stream_failure.get().is_none()>
+                                <p class="results-empty">"Live event queries appear in Events. Use timechart with a count metric for a live visualization."</p>
+                            </Show>
+                        </div>
                     }.into_any(),
                 }}}
             </div>
@@ -1014,10 +1038,12 @@ pub fn Search() -> impl IntoView {
 /// The reading-mode popover behind the result header's "View" button.
 ///
 /// A `FocusPolicy::None` overlay layer (`fleet_ui::overlay`), so it
-/// arbitrates Escape against whatever else is open without taking focus
-/// or silencing the command palette's chord. It closes on Escape while
-/// topmost — returning focus to the trigger — and on any mousedown
-/// outside its wrapper.
+/// arbitrates Escape against whatever else is open without taking focus.
+/// The chord IS silenced while it is open: `has_layers()` counts layers
+/// and ignores their focus policy, so the command palette treats this
+/// popover like any other overlay. It closes on Escape while topmost —
+/// returning focus to the trigger — and on any mousedown outside its
+/// wrapper.
 #[component]
 fn ViewPanel(
     #[prop(into)] details: Signal<Details>,
@@ -1107,7 +1133,10 @@ fn LiveRawTable(
     #[prop(into)] failure: Signal<Option<&'static str>>,
 ) -> impl IntoView {
     view! {
-        <div id="search-results" class="results" tabindex="-1">
+        // Same region contract as the snapshot tables: "Skip to results"
+        // reaches live mode too, so the container must be able to hold
+        // focus and name itself.
+        <div id="search-results" class="results" role="region" aria-label="Search results" tabindex="0">
             {move || {
                 let r = result.get();
                 if r.columns.is_empty() {

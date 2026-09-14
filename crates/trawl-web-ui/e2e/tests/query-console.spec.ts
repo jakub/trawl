@@ -160,6 +160,30 @@ test('the skip links reach the editor and the results', async ({ page, request }
   await expect(page.locator(SEL.resultsPane)).toBeFocused();
 });
 
+// The bypass used to be inert wherever the results region was not the
+// snapshot table: the handler prevented the anchor's default and then
+// focused nothing at all, so the key press moved neither focus nor the
+// document (A03). Both remaining panes are asserted here.
+test('skip to results reaches live mode and the Visualization tab', async ({ page, request }) => {
+  await resetScenario(request, 'stream-burst');
+  await page.goto('/search?q=service%3Dnginx&mode=live');
+  await expect(page.locator(SEL.resultsPane)).toBeVisible();
+
+  const toResults = page.getByRole('link', { name: 'Skip to results' });
+  await toResults.focus();
+  await page.keyboard.press('Enter');
+  await expect(page.locator(SEL.resultsPane)).toBeFocused();
+
+  await resetScenario(request, 'corpus');
+  await page.goto('/search?q=service%3Dnginx&page=0');
+  await page.locator(SEL.workspaceTab).filter({ hasText: 'Visualization' }).click();
+  await expect(page.locator(SEL.resultsPane)).toBeVisible();
+
+  await toResults.focus();
+  await page.keyboard.press('Enter');
+  await expect(page.locator(SEL.resultsPane)).toBeFocused();
+});
+
 /** The stub's truncated answer: the `pagination` scenario with its
  * `truncated` flag set, the same control `pagination.spec.ts` uses. */
 async function truncatedScenario(request: APIRequestContext) {
