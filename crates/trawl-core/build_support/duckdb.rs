@@ -25,6 +25,17 @@ pub fn prepare() {
         }),
         "unchecked DuckDB downloads are disabled; unset DUCKDB_DOWNLOAD_LIB or set it to 0"
     );
+    println!("cargo:rerun-if-env-changed=DUCKDB_NO_PKG_CONFIG");
+    // libduckdb-sys probes pkg-config even with DUCKDB_LIB_DIR set. Its
+    // PKG_CONFIG_PATH override still permits fallback to host .pc files, whose
+    // link search path could precede ours. pkg-config disables that probe on
+    // variable presence, including empty and non-UTF-8 values.
+    assert!(
+        env::var_os("DUCKDB_NO_PKG_CONFIG").is_some(),
+        "host DuckDB pkg-config selection must be disabled; run Cargo from the checkout, \
+         or use DUCKDB_NO_PKG_CONFIG=1 cargo ... when invoking --manifest-path or install --path \
+         from outside it (also required with DUCKDB_LIB_DIR)"
+    );
     println!("cargo:rerun-if-env-changed=DUCKDB_LIB_DIR");
     println!("cargo:rerun-if-env-changed=DUCKDB_STATIC");
     assert!(

@@ -54,7 +54,7 @@ class CargoRuntime(unittest.TestCase):
         bindir.mkdir()
         (bindir / "python3").symlink_to(sys.executable)
         self.env = {**os.environ, "PATH": str(bindir), "CARGO_MANIFEST_DIR": str(self.crate),
-                    "DUCKDB_DOWNLOAD_LIB": "0", "DUCKDB_STATIC": "0"}
+                    "DUCKDB_DOWNLOAD_LIB": "0", "DUCKDB_STATIC": "0", "DUCKDB_NO_PKG_CONFIG": "1"}
         self.env.pop("DUCKDB_LIB_DIR", None)
         self.env.pop("CARGO_TARGET_DIR", None)
 
@@ -181,6 +181,29 @@ class CargoRuntime(unittest.TestCase):
         for target in ("wasm32-unknown-unknown", "x86_64-pc-windows-msvc", "x86_64-unknown-linux-musl"):
             result = self.run_helper({"TARGET": target, "PATH": ""})
             self.assertEqual(result.stdout, "")
+
+    def test_missing_pkg_config_suppression_fails_before_link_for_all_native_inputs(self):
+        for target in TARGETS:
+            for explicit in (False, True):
+                with self.subTest(target=target, explicit=explicit):
+                    env, runtime, deps, _ = self.runtime(target, explicit=explicit)
+                    env.pop("DUCKDB_NO_PKG_CONFIG")
+                    before = self.snapshot(runtime) if explicit else None
+                    result = self.run_helper(env, success=False)
+                    self.assertIn("DUCKDB_NO_PKG_CONFIG=1 cargo", result.stderr)
+                    self.assertIn("also required with DUCKDB_LIB_DIR", result.stderr)
+                    self.assertNotIn("cargo:rustc-link-search", result.stdout)
+                    self.assertFalse(deps.exists())
+                    if explicit:
+                        self.assertEqual(self.snapshot(runtime), before)
+                    else:
+                        self.assertFalse(runtime.exists())
+
+    def test_pkg_config_suppression_uses_presence_like_the_upstream_crate(self):
+        env, _, _, _ = self.runtime("x86_64-unknown-linux-gnu")
+        for value in ("", "0", "1", os.fsdecode(b"\xff")):
+            with self.subTest(value=value):
+                self.run_helper({**env, "DUCKDB_NO_PKG_CONFIG": value})
 
 
 if __name__ == "__main__":

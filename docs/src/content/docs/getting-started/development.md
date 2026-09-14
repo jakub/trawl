@@ -35,7 +35,14 @@ when Fleet launches the already-built daemon. Keep the library with that build.
 Native `trawl-core` builds also prepare the runtime so its standalone parity
 tests work with ordinary Cargo commands. Wasm and other parser-only targets do
 not acquire a native library. An inherited `DUCKDB_DOWNLOAD_LIB=1` is rejected;
-unset it or set it to `0`. An explicit `DUCKDB_LIB_DIR` selects an existing runtime directory prepared
+unset it or set it to `0`. Run Cargo from the checkout so it discovers
+`.cargo/config.toml`. Commands started elsewhere, including `cargo build
+--manifest-path /path/to/trawl/Cargo.toml` and `cargo install --path
+/path/to/trawl/crates/trawl-cli`, require `DUCKDB_NO_PKG_CONFIG=1` in their
+environment. The build rejects a missing setting because upstream pkg-config
+lookup can select a host library, even with `DUCKDB_LIB_DIR` set.
+
+An explicit `DUCKDB_LIB_DIR` selects an existing runtime directory prepared
 by the distribution helper, with its verified ZIP. Cargo checks the archive,
 library, header, license, and runtime metadata without changing that directory.
 Missing or mismatched files stop the build. Only the loader copy under the Cargo

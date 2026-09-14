@@ -42,6 +42,12 @@ Ordinary native Cargo commands use `trawl-core`'s build script to call the same
 The helper checks each cached ZIP before extraction, stages files atomically,
 and serializes writers to the same checksum-addressed archive cache. Each build
 gets a private runtime plus a loader copy in its profile's `deps` directory.
+Run Cargo from the source checkout to load `.cargo/config.toml`. For commands
+started elsewhere, set `DUCKDB_NO_PKG_CONFIG=1`, for example
+`DUCKDB_NO_PKG_CONFIG=1 cargo build --manifest-path /path/to/trawl/Cargo.toml`.
+This also applies to `cargo install --path` and explicit runtime directories:
+upstream still probes pkg-config with `DUCKDB_LIB_DIR` set, so the build rejects
+a missing suppression setting before it can link a host-selected library.
 `DUCKDB_LIB_DIR` selects an existing release runtime directory. Cargo invokes
 `distribution.py verify` to check its ZIP and extracted files without writing to
 that directory or downloading missing inputs. Mismatches stop the build. Only
