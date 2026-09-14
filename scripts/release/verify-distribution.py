@@ -61,7 +61,7 @@ def verify(package, target, source_sha, tooling_sha, expected_version):
                 assert "libduckdb.so" in needed, (path, needed)
     scripts = Path(__file__).parent
     subprocess.run([sys.executable, str(scripts / "check-runtime.py"), str(library), str(scripts / "fixtures/cli.parquet")], check=True)
-    command = [sys.executable, str(scripts / "smoke-cli.py"), str(package / "bin/trawl"), str(scripts / "fixtures/cli.parquet")]
+    command = [sys.executable, str(scripts / "smoke-cli.py"), str(package / "bin/trawl"), str(scripts / "fixtures/cli.parquet"), "--expected-source-sha", source_sha]
     if expected_version:
         command.extend(["--expected-version", expected_version])
     subprocess.run(command, check=True)
