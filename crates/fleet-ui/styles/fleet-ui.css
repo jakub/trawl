@@ -104,7 +104,8 @@
   --panel-3:   oklch(93.5% 0 0);
   --ink:       oklch(14.5% 0 0);
   --ink-2:     oklch(37% 0 0);
-  --ink-3:     oklch(55.6% 0 0);
+  /* Small labels also sit on tinted rows and --panel-3. */
+  --ink-3:     oklch(50% 0 0);
   /* --ink-4 is a TEXT colour, not a hairline: the DEBUG level pill
    * (.lvl-debug, --fs-micro over actual log data), .editor-hd .dim, the
    * DSL editor's gutter line numbers and .divider all read it (so did
@@ -165,7 +166,7 @@
   --red:        oklch(48% .177 27.325);
   --red-2:      oklch(41% .155 27.325);
   --red-wash:   color-mix(in oklab, var(--red) 10%, transparent);
-  --yellow:     #a68210;
+  --yellow:     #80600a;
   --yellow-wash:rgba(166,130,16,.10);
   --green:      #4a7d3f;
   --green-wash: rgba(74,125,63,.10);
@@ -1434,10 +1435,12 @@ textarea:focus-visible,
  * popover. The trigger is a <button> (ADR-0029): it already declares its
  * own background, border and colour, so `font: inherit` is the whole
  * reset the user-agent chrome needs. */
-.daterange { position: relative; display: flex; align-items: stretch; }
+.daterange { position: relative; display: flex; align-items: stretch; min-width: 0; }
 .daterange .dr-trigger { flex: 1; }
 .dr-trigger {
   display: flex;
+  min-width: 0;
+  max-width: 100%;
   align-items: center;
   justify-content: center;
   gap: 6px;
@@ -1459,9 +1462,26 @@ textarea:focus-visible,
 /* Absolute-range labels ("2026-07-16… → now") can exceed the column —
  * ellipsize instead of blowing the layout out. */
 .dr-trigger span {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
 }
+.dr-trigger svg { flex-shrink: 0; }
+
+/* Bypass links stay first in keyboard order without taking layout space. */
+.skip-link {
+  position: fixed;
+  top: 8px;
+  left: 8px;
+  transform: translateY(-200%);
+  z-index: 1000;
+  padding: 8px 12px;
+  background: var(--panel);
+  color: var(--ink);
+  border: 2px solid var(--ring);
+  border-radius: var(--radius-ctl);
+}
+.skip-link:focus { transform: none; }
 .dr-trigger:hover { color: var(--ink); background: var(--fill-2); }
 .dr-trigger.open {
   color: var(--accent);

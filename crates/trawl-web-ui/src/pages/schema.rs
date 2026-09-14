@@ -529,14 +529,14 @@ pub fn SchemaPage() -> impl IntoView {
                         />
                     }.into_any();
                 }
-                // Service drawer mounts only when `?svc=X` is set and the
-                // name resolves to a service in the current snapshot. If
-                // the user lands on a dead `?svc=foo`, we silently ignore
-                // it rather than popping an error modal.
                 let Some(selected) = svc_selected.get() else { return ().into_any(); };
-                let Some(Ok(resp)) = services.get() else { return ().into_any(); };
+                let resp = match services.get() {
+                    None => return view! { <p role="status">"Loading service…"</p> }.into_any(),
+                    Some(Err(_)) => return view! { <p role="alert">"Could not load this service. Please retry." " " <a href="/search/schema">"Back to Schema"</a></p> }.into_any(),
+                    Some(Ok(resp)) => resp,
+                };
                 let Some(svc) = resp.services.iter().find(|s| s.name == selected).cloned()
-                    else { return ().into_any(); };
+                    else { return view! { <p role="status">"Service not found. It may have been deleted." " " <a href="/search/schema">"Back to Schema"</a></p> }.into_any(); };
                 view! {
                     <ServiceDrawer
                         svc=svc

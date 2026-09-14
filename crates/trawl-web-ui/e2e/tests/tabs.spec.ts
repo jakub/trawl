@@ -21,7 +21,7 @@
 // and the drawer strip's metadata live in the outer container, so a
 // screen reader counts two tabs and three tabs, not four and five.
 
-import { test, expect, resetScenario, POPULATED } from '../fixtures';
+import { test, expect, resetScenario, POPULATED, CORPUS } from '../fixtures';
 import { SEL } from '../selectors';
 
 type Loc = import('@playwright/test').Locator;
@@ -140,8 +140,8 @@ test('an unknown drawer tab id still yields one tab stop', async ({ page, reques
   // rendered every tab at tabindex="-1" — no keyboard entry point at
   // all — while the pane below it showed the first tab's content. An
   // unmatched id selects the first tab, so markup and pane agree.
-  await resetScenario(request, 'populated');
-  await page.goto(`/jobs/nets?net=${POPULATED.netId}&ntab=bogus`);
+  await resetScenario(request, 'corpus');
+  await page.goto(`/jobs/nets?net=${CORPUS.netId}&ntab=bogus`);
 
   await expect(page.locator(SEL.drawerPanel)).toBeVisible();
   const strip = page.getByRole('tablist', { name: 'Saved query details' });

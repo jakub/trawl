@@ -83,7 +83,7 @@ pub fn EditorWrap(
     };
 
     view! {
-        <div class="editor-wrap">
+        <div class="editor-wrap" id="search-query" tabindex="-1">
             <div class="editor-row">
                 <DslEditor query=query on_submit=on_submit format_trigger=format_trigger/>
                 <div class="editor-right">

@@ -5,7 +5,7 @@
 //! `<Drawer/>` — right-slide detail inspector over the `sd-*` classes.
 //!
 //! Owns the shell: scrim (outside-click dismissal via `NodeRef`
-//! identity), the sliding `aside` panel, the header row (title slot +
+//! identity), the sliding dialog panel, the header row (title slot +
 //! actions slot + close affordance), the tab strip
 //! ([`Tabs`](crate::tabs::Tabs) in its `Drawer` style), and the
 //! scrolling body. Pane content, tab-switching state, and the title's
@@ -22,7 +22,7 @@
 //! rename.
 
 use leptos::ev;
-use leptos::html::{Aside, Div};
+use leptos::html::Div;
 use leptos::prelude::*;
 use leptos::web_sys;
 use leptos_use::{use_event_listener, use_window};
@@ -68,7 +68,7 @@ pub fn Drawer(
         format!("fleet-drawer-title-{id}")
     });
     let scrim_ref = NodeRef::<Div>::new();
-    let panel_ref = NodeRef::<Aside>::new();
+    let panel_ref = NodeRef::<Div>::new();
 
     // Window-level Escape (see module docs). use_event_listener
     // registers an on_cleanup hook internally; the returned handle is
@@ -79,7 +79,7 @@ pub fn Drawer(
     // FocusPolicy::Capture: the drawer takes initial focus on open and
     // restores the opener on close, but never Tab-traps — it is
     // non-modal by design (the background stays interactive, and a
-    // modal may stack over a live drawer), which is also why the aside
+    // modal may stack over a live drawer), which is also why the panel
     // below renders role="dialog" without aria-modal.
     let layer =
         crate::overlay::use_overlay_layer_with(crate::overlay::FocusPolicy::Capture, move || {
@@ -114,7 +114,7 @@ pub fn Drawer(
             node_ref=scrim_ref
             on:mousedown=on_scrim_mousedown
         >
-            <aside class="sd-drawer" role="dialog" aria-labelledby=title_id.clone() tabindex="-1" node_ref=panel_ref>
+            <div class="sd-drawer" role="dialog" aria-labelledby=title_id.clone() tabindex="-1" node_ref=panel_ref>
                 <div class="sd-hd">
                     <div class="sd-ttl" id=title_id.clone()>{title()}</div>
                     <div class="sd-actions">
@@ -149,7 +149,7 @@ pub fn Drawer(
                 />
 
                 <div class="sd-body">{children()}</div>
-            </aside>
+            </div>
         </div>
     }
 }

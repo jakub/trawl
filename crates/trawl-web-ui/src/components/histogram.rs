@@ -43,7 +43,7 @@ const N_BUCKETS: usize = 48;
 
 #[component]
 pub fn Histogram(
-    rows: LocalResource<Result<QueryResponse, ApiError>>,
+    rows: LocalResource<Result<crate::state::search_session::ExecutedResponse, ApiError>>,
     /// The time restriction the effective query ran under — what the
     /// caption states. Not the picker's range: the two differ whenever
     /// the query carries its own `last=`.
@@ -61,7 +61,7 @@ pub fn Histogram(
                 // Deliberate quiet-error override: the results table
                 // already reports the query failure.
                 error=Box::new(|_| view! { <div class="histo-hint">"—"</div> }.into_any())
-                render=Box::new(move |resp: QueryResponse| {
+                render=Box::new(move |resp: crate::state::search_session::ExecutedResponse| {
                     let Some(series) = build_series(&resp) else {
                         // Two different absences, two different sentences: a
                         // page with no rows at all, and a page whose rows

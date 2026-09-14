@@ -914,3 +914,54 @@ async fn a_materialize_failure_is_loud_and_leaves_the_cursor() {
     assert!(h.runs(sq).await.is_empty());
     assert_eq!(h.cursor(sq).await, (t0(), Some(at(hours(-1)))));
 }
+
+/// Renaming affects lookup only; recorded legacy paths stay readable, while
+/// new runs use their ID and cannot interpret display-name punctuation as a path.
+#[tokio::test]
+async fn readable_name_rename_preserves_legacy_and_new_run_paths() {
+    let h = harness().await;
+    let sq = h
+        .schedule(
+            "legacy",
+            DSL,
+            Some(ScheduleWindow::Fixed { secs: 300 }),
+            3600,
+            0,
+        )
+        .await;
+    h.tick(t0()).await;
+    let first = h.runs(sq).await.remove(0);
+    let legacy = "scheduled/legacy/run_legacy.parquet";
+    std::fs::create_dir_all(h.data_dir.join("scheduled/legacy")).unwrap();
+    std::fs::rename(
+        h.data_dir.join(first.result_path.unwrap()),
+        h.data_dir.join(legacy),
+    )
+    .unwrap();
+    sqlx::query("UPDATE report_runs SET result_path = $1 WHERE id = $2")
+        .bind(legacy)
+        .bind(first.id)
+        .execute(&h.app_pool)
+        .await
+        .unwrap();
+    let renamed = h
+        .saved
+        .update_checked(sq, h.key_id, DSL, Some("  ../雪 \"report\" \\ folder  "))
+        .await
+        .unwrap();
+    assert_eq!(renamed.id, sq);
+    assert_eq!(renamed.name, "../雪 \"report\" \\ folder");
+    // A two-hour fire covers the fixture event just before +2h.
+    h.tick(at(hours(2))).await;
+    let runs = h.runs(sq).await;
+    assert_eq!(runs[0].result_path.as_deref(), Some(legacy));
+    assert_eq!(h.run_rows(&runs[0]), vec![at(micros(-1))]);
+    for run in runs.iter().skip(1).filter(|run| run.result_path.is_some()) {
+        assert_eq!(
+            run.result_path.as_deref(),
+            Some(format!("scheduled/run_{}.parquet", run.id).as_str())
+        );
+        assert!(!h.run_rows(run).is_empty());
+    }
+    assert!(runs.iter().skip(1).any(|run| run.result_path.is_some()));
+}

@@ -18,8 +18,8 @@ use crate::ast::{
 use crate::parser::comment::Spaced;
 use crate::parser::expr::expr;
 use crate::parser::primitives::{
-    ParserExtra, ParserInput, duration, field_name, keyword, plain_name, raw_quoted_string,
-    spanned, uint,
+    ParserExtra, ParserInput, duration, field_name, keyword, plain_name, quoted_string,
+    raw_quoted_string, spanned, uint,
 };
 
 /// Parse an aggregation expression like `count()`, `avg(duration)`,
@@ -590,7 +590,7 @@ fn eventstats_stage<'src>()
 fn from_saved_stage<'src>()
 -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone {
     // A saved-query name is not a field either — no backticks.
-    let name = choice((raw_quoted_string(), plain_name())).labelled("saved query name");
+    let name = choice((quoted_string(), plain_name())).labelled("saved query name");
 
     let run_selector = keyword("run")
         .ignore_then(just('='))

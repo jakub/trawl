@@ -212,7 +212,6 @@ impl App {
         let Some(entry) = saved.queries.get(selected_idx) else {
             return;
         };
-        let name = &entry.name;
 
         // Determine the run ID from the current focus context.
         let run_id = match self.panel.saved_focus {
@@ -225,11 +224,7 @@ impl App {
             SavedFocus::List => None,
         };
 
-        let query_text = if let Some(rid) = run_id {
-            format!("| from saved \"{name}\" run={rid}")
-        } else {
-            format!("| from saved \"{name}\"")
-        };
+        let query_text = saved_run_query(&entry.name, run_id);
 
         let editor = &mut self.tab.editor;
         editor.clear();
@@ -299,6 +294,36 @@ impl App {
                 schema.scroll = 0;
             }
             _ => {}
+        }
+    }
+}
+
+/// The editor must quote display names with the same rules as the DSL formatter.
+fn saved_run_query(name: &str, run_id: Option<i64>) -> String {
+    let name = trawl_core::format::format_saved_name(name);
+    if let Some(id) = run_id {
+        format!("| from saved {name} run={id}")
+    } else {
+        format!("| from saved {name}")
+    }
+}
+
+#[cfg(test)]
+mod name_tests {
+    #[test]
+    fn saved_editor_reference_preserves_name_and_run() {
+        let name = "雪 / \"report\" \\ path";
+        for id in [None, Some(42)] {
+            let query = trawl_core::parser::parse(&super::saved_run_query(name, id)).unwrap();
+            let stage = query.from_saved_stage().unwrap();
+            assert_eq!(stage.name, name);
+            assert_eq!(
+                stage.run,
+                id.map_or(
+                    trawl_core::ast::SavedRunSelector::Latest,
+                    trawl_core::ast::SavedRunSelector::Specific
+                )
+            );
         }
     }
 }

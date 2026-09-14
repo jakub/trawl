@@ -316,7 +316,17 @@ async fn saved_user_isolation_and_name_sort(pool: PgPool) {
 #[sqlx::test]
 async fn saved_name_validation(pool: PgPool) {
     let store = saved(&pool);
-    for bad in ["has spaces", "foo/bar", "foo.bar", ""] {
+    for bad in [
+        "",
+        "   ",
+        "a\nb",
+        "\tname",
+        "name\0",
+        "name\u{7f}",
+        "\u{200b}",
+        "a\u{202e}b",
+        "👩\u{200d}💻",
+    ] {
         assert!(
             matches!(
                 store.create(1, bad, "q").await,
@@ -325,9 +335,56 @@ async fn saved_name_validation(pool: PgPool) {
             "{bad:?} must be rejected"
         );
     }
-    for good in ["daily_ip_rollup", "hourly-error-count", "Auth2", "a"] {
+    for good in [
+        "daily_ip_rollup",
+        "hourly-error-count",
+        "Auth2",
+        "a",
+        "has spaces",
+        "foo/bar",
+        "雪 \"報告\" \\ folder",
+    ] {
         store.create(1, good, "q").await.unwrap();
     }
+    let created = store
+        .create(1, "  A  readable / name  ", "q")
+        .await
+        .unwrap();
+    assert_eq!(created.name, "A  readable / name");
+    assert!(matches!(
+        store.create(1, "A  readable / name", "q").await,
+        Err(StoreError::DuplicateName { .. })
+    ));
+    store.create(2, "A  readable / name", "q").await.unwrap();
+    store.create(1, "a  readable / name", "q").await.unwrap();
+    let renamed = store
+        .update_checked(created.id, 1, "q", Some("  Renamed / 雪  "))
+        .await
+        .unwrap();
+    assert_eq!(renamed.id, created.id);
+    assert_eq!(renamed.name, "Renamed / 雪");
+    assert!(
+        store
+            .get_by_name(1, "A  readable / name")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .get_by_name(1, "Renamed / 雪")
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        created.id
+    );
+    assert!(
+        store
+            .update_checked(created.id, 1, "q", Some("a\nb"))
+            .await
+            .is_err()
+    );
 }
 
 #[sqlx::test]

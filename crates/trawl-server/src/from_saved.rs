@@ -989,6 +989,60 @@ mod pg_tests {
     }
 
     #[sqlx::test]
+    async fn readable_name_resolves_recorded_path_after_rename(pool: PgPool) {
+        let (saved_id, schedules, saved) = seed(&pool, 1, "legacy").await;
+        let sid = schedule_id(&schedules, saved_id).await;
+        run(
+            &schedules,
+            sid,
+            saved_id,
+            RunStatus::Success,
+            Some("scheduled/legacy/run_1.parquet"),
+        )
+        .await;
+        let name = "雪 / \"report\" \\ path";
+        let query = saved.get(saved_id, 1).await.unwrap().unwrap().query;
+        saved
+            .update_checked(saved_id, 1, &query, Some(name))
+            .await
+            .unwrap();
+        let dsl = format!(
+            "| from saved {} | head 1",
+            trawl_core::format::format_saved_name(name)
+        );
+        let ast = trawl_core::parser::parse(&dsl).unwrap();
+        let resolved = resolve(
+            ast.from_saved_stage().unwrap(),
+            &dsl,
+            ast.pipeline[0].span.end,
+            &saved,
+            &schedules,
+            1,
+            "/data",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            resolved.source,
+            parquet_source("/data", "scheduled/legacy/run_1.parquet")
+        );
+        assert_eq!(resolved.remaining_dsl, "* | head 1");
+        assert!(
+            resolve(
+                ast.from_saved_stage().unwrap(),
+                &dsl,
+                ast.pipeline[0].span.end,
+                &saved,
+                &schedules,
+                2,
+                "/data"
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[sqlx::test]
     async fn resolve_strips_stage_and_prepends_wildcard(pool: PgPool) {
         let (saved_id, sched_store, saved_store) = seed(&pool, 1, "rollup").await;
         let sid = schedule_id(&sched_store, saved_id).await;

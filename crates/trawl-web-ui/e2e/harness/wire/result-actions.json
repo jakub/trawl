@@ -1,0 +1,8 @@
+{
+  "columns": [{"name":"host"},{"name":"count"}],
+  "rows": [["hundred",100],["twenty",20],["ten",10],["null",null],["negative",-1.5]],
+  "truncated":false,
+  "pagination":{"limit":50,"offset":0,"returned":5},
+  "degraded_fields":[],
+  "severity_columns":[]
+}

@@ -17,10 +17,15 @@
 use leptos::prelude::*;
 
 #[component]
-pub fn ErrorBanner(#[prop(into)] error: Signal<Option<String>>) -> impl IntoView {
+pub fn ErrorBanner(
+    #[prop(into)] error: Signal<Option<String>>,
+    /// Optional stable target for a field's `aria-describedby`.
+    #[prop(optional, into)]
+    id: Option<String>,
+) -> impl IntoView {
     move || {
         error
             .get()
-            .map(|msg| view! { <div class="error-banner" role="alert">{msg}</div> })
+            .map(|msg| view! { <div id=id.clone() class="error-banner" role="alert">{msg}</div> })
     }
 }

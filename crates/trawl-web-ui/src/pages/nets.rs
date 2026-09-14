@@ -61,10 +61,11 @@ pub fn NetsPage() -> impl IntoView {
     let confirm_delete: RwSignal<ConfirmState<(i64, String)>> =
         RwSignal::new(ConfirmState::default());
 
-    let nets = LocalResource::new(move || {
-        let _ = refresh.get();
-        async move { api::list_saved().await }
-    });
+    let (nets, refresh_error, retry) =
+        crate::components::job_refresh::job_refresh(Signal::stored(true), move || {
+            let _ = refresh.get();
+            async move { api::list_saved().await }
+        });
 
     let nav = use_navigate();
     let goto_search = navigator();
@@ -161,7 +162,7 @@ pub fn NetsPage() -> impl IntoView {
     };
 
     #[allow(clippy::cast_possible_truncation)]
-    let now_ms = move || js_sys::Date::now() as i64;
+    let now_ms = fleet_ui::time::clock::now_ms();
 
     let sort_nets = move |nets: &mut [&SavedQueryResponse]| {
         let (key, desc) = sort.get();
@@ -184,6 +185,24 @@ pub fn NetsPage() -> impl IntoView {
         });
     };
 
+    let visible_nets = Signal::derive(move || {
+        let Some(Ok(resp)) = nets.get() else {
+            return Vec::new();
+        };
+        let needle = filter.get().to_lowercase();
+        let mut visible: Vec<&SavedQueryResponse> = resp
+            .queries
+            .iter()
+            .filter(|q| {
+                needle.is_empty()
+                    || q.name.to_lowercase().contains(&needle)
+                    || q.query.to_lowercase().contains(&needle)
+            })
+            .collect();
+        sort_nets(&mut visible);
+        visible.into_iter().cloned().collect::<Vec<_>>()
+    });
+
     view! {
         <div class="page">
             <div class="page-hd compact">
@@ -196,167 +215,15 @@ pub fn NetsPage() -> impl IntoView {
                 </div>
             </div>
 
+            {move || refresh_error.get().map(|e| view! { <p role="status">{e}</p> })}
             <fleet_ui::OverflowHint viewport=table_viewport/>
                 <div node_ref=table_viewport class="tbl fleet-table-frame tbl-scroll" role="region" aria-label="Saved queries" tabindex="0" style="--list-min-width:760px">
                 <div class="tbl-body">
                     <Loaded
-                        state=Signal::derive(move || LoadState::from_resource(nets.get()))
-                        label="nets"
-                        retry=Callback::new(move |()| { nets.set(None); nets.refetch(); })
-                        render=Box::new(move |resp: trawl_api::ListSavedResponse| {
-                                let now = now_ms();
-                                let needle = filter.get().to_lowercase();
-                                let mut visible: Vec<&SavedQueryResponse> = resp.queries.iter()
-                                    .filter(|q| {
-                                        if needle.is_empty() { return true; }
-                                        q.name.to_lowercase().contains(&needle)
-                                            || q.query.to_lowercase().contains(&needle)
-                                    })
-                                    .collect();
-                                if visible.is_empty() {
-                                    return view! {
-                                        <div class="tbl-empty">
-                                            {if resp.queries.is_empty() {
-                                                "No nets yet — save a query from the search page to get started"
-                                            } else {
-                                                "No nets match that filter"
-                                            }}
-                                        </div>
-                                    }.into_any();
-                                }
-                                sort_nets(&mut visible);
-                                let count = visible.len();
-                                let rows = visible.into_iter().map(|net| {
-                                    let id = net.id;
-                                    let name = net.name.clone();
-                                    let query_text = net.query.clone();
-                                    let created = time_ago(&net.created_at, now);
-                                    let name_for_delete = net.name.clone();
-                                    let name_for_trigger = net.name.clone();
-                                    let query_for_run = net.query.clone();
-                                    let on_run_in_search = on_run_in_search.clone();
-
-                                    let sched_badge = match &net.schedule {
-                                        Some(s) if s.enabled => {
-                                            view! {
-                                                <span class="sched-badge active">{format!("⏰ {}", s.interval)}</span>
-                                            }.into_any()
-                                        }
-                                        Some(s) => {
-                                            view! {
-                                                <span class="sched-badge disabled">{format!("⏸ {}", s.interval)}</span>
-                                            }.into_any()
-                                        }
-                                        None => view! {
-                                            <span style="color:var(--ink-3)">"—"</span>
-                                        }.into_any(),
-                                    };
-
-                                    let last_run_view = match net.schedule.as_ref() {
-                                        Some(sched) => {
-                                            match sched.last_run.as_ref() {
-                                                Some(run) => {
-                                                    let when = time_ago(&run.started_at, now);
-                                                    let tone = crate::components::run_status_tone(&run.status);
-                                                    let next_run_label = if sched.enabled {
-                                                        #[allow(clippy::cast_possible_truncation)]
-                                                        let started_ms = js_sys::Date::parse(&run.started_at) as i64;
-                                                        let next_ms =
-                                                            started_ms + (sched.interval_secs.cast_signed() * 1000);
-                                                        Some(time_until(next_ms, now))
-                                                    } else {
-                                                        None
-                                                    };
-                                                    view! {
-                                                        <span>
-                                                            <StatusDot tone=tone/>
-                                                                <span class="run-status">{run.status.clone()}</span>
-                                                            " "
-                                                            <span class="mono" style="color:var(--ink-2)">{when}</span>
-                                                            {next_run_label.map(|label| view! {
-                                                                <span class="next-run" style="margin-left:6px; font-size:10px; color:var(--ink-3)">{label}</span>
-                                                            })}
-                                                        </span>
-                                                    }.into_any()
-                                                }
-                                                None => {
-                                                    if sched.enabled {
-                                                        view! {
-                                                            <span class="mono" style="color:var(--ink-3); font-size:10px">"Pending…"</span>
-                                                        }.into_any()
-                                                    } else {
-                                                        view! {
-                                                            <span style="color:var(--ink-3)">"—"</span>
-                                                        }.into_any()
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        None => view! {
-                                            <span style="color:var(--ink-3)">"—"</span>
-                                        }.into_any(),
-                                    };
-
-                                    // The drawer is a place with a URL, so
-                                    // the row's one control is a link built
-                                    // by the same producer `push_net` uses;
-                                    // `prop:replace` below is that call's
-                                    // `replace: true`.
-                                    let href = format!("/jobs/nets?net={id}&ntab=query");
-
-                                    // A windowed schedule advances its own
-                                    // coverage point, so a manual run out
-                                    // of band leaves a hole it will not
-                                    // revisit. Same predicate the drawer
-                                    // applies, read off the saved state.
-                                    let mut actions = vec![
-                                        ActionItem::new("▶ Open in search", {
-                                            let q = query_for_run.clone();
-                                            let run = on_run_in_search.clone();
-                                            Callback::new(move |()| run(q.clone()))
-                                        }),
-                                    ];
-                                    if net.schedule.as_ref().and_then(|s| s.window.as_ref()).is_none() {
-                                        actions.push(ActionItem::new("⏱ Trigger run", {
-                                            let name = name_for_trigger.clone();
-                                            let trigger = on_trigger_run;
-                                            Callback::new(move |()| trigger(id, name.clone()))
-                                        }));
-                                    }
-                                    actions.push(ActionItem::danger("Delete", {
-                                        let name = name_for_delete.clone();
-                                        Callback::new(move |()| {
-                                            confirm_delete.update(|c| c.request((id, name.clone())));
-                                        })
-                                    }));
-
-                                    view! {
-                                            <tr class="tbl-row">
-                                                <td class="mono">
-                                                <a class="row-stretch" href=href prop:replace=true>
-                                                    {name.clone()}
-                                                </a>
-                                                </td>
-                                                <td style="min-width:0" class="mono path">{query_text}</td>
-                                                <td>{sched_badge}</td>
-                                                <td>{last_run_view}</td>
-                                                <td class="mono">{created}</td>
-                                            // `row-menu` lifts the trigger above
-                                            // the row control's stretched
-                                            // pseudo-element; the base
-                                            // `.actions-menu` rule belongs to
-                                            // fleet-ui and stays there.
-                                                <td class="row-menu">
-                                                // fleet_ui::ActionsMenu owns the ⋯ trigger, the
-                                                // open state, and Escape/outside-click dismissal
-                                                // via the overlay stack.
-                                                <ActionsMenu items=actions/>
-                                                </td>
-                                            </tr>
-                                    }
-                                }).collect_view();
-                                view! {
-                                    <table class="fleet-table nets-table" aria-label="Saved queries">
+                        state=Signal::derive(move || LoadState::from_resource(nets.get().map(|r| r.map(|_| ()))))
+                        label="nets" retry=retry render=Box::new(|()| ().into_any())
+                    />
+                    <table class="fleet-table nets-table" aria-label="Saved queries">
                                         <thead><tr>
                                             {table_sort_th(sort, NetSort::Name, NetSort::Name.default_desc(), "Name", "")}
                                             <th scope="col" class="th">"Query"</th>
@@ -365,32 +232,100 @@ pub fn NetsPage() -> impl IntoView {
                                             {table_sort_th(sort, NetSort::Created, NetSort::Created.default_desc(), "Created", "width:110px")}
                                             <th scope="col" style="width:60px"><span class="sr-only">Actions</span></th>
                                         </tr></thead>
-                                        <tbody>{rows}</tbody></table>
-                                    // Summary-only Pager: this table is
-                                    // unpaginated, so no prev/next controls.
-                                    <Pager summary=format!("{count} net{}", if count == 1 { "" } else { "s" })/>
-                                }.into_any()
-                        })
-                    />
+                        <tbody>
+                            <For each=move || visible_nets.get() key=|net| net.id children=move |initial| {
+                                let id = initial.id;
+                                let net = Signal::derive(move || nets.get().and_then(Result::ok)
+                                    .and_then(|r| r.queries.into_iter().find(|q| q.id == id)).unwrap_or_else(|| initial.clone()));
+                                // The row owner and its ActionsMenu survive data and clock ticks.
+                                // Read current values when invoking an action, not the mount-time net.
+                                let run = on_run_in_search.clone();
+                                let search = ActionItem::new("▶ Open in search", Callback::new(move |()| run(net.get_untracked().query)));
+                                let delete = ActionItem::danger("Delete", Callback::new(move |()| {
+                                    confirm_delete.update(|c| c.request((id, net.get_untracked().name)));
+                                }));
+                                let manual = ActionItem::new("⏱ Trigger run", Callback::new(move |()| {
+                                    let current = net.get_untracked();
+                                    // A window owns its coverage; never trigger it out of band,
+                                    // including when the schedule changed while the menu was open.
+                                    if current.schedule.and_then(|s| s.window).is_none() {
+                                        on_trigger_run(id, current.name);
+                                    }
+                                }));
+                                let regular = StoredValue::new(vec![search.clone(), manual, delete.clone()]);
+                                let windowed = StoredValue::new(vec![search, delete]);
+                                let href = format!("/jobs/nets?net={id}&ntab=query");
+                                view! {
+                                    <tr class="tbl-row">
+                                        <td class="mono"><a class="row-stretch" href=href prop:replace=true>{move || net.get().name}</a></td>
+                                        <td style="min-width:0" class="mono path">{move || net.get().query}</td>
+                                        <td>{move || match net.get().schedule {
+                                            Some(s) if s.enabled => view! { <span class="sched-badge active">{format!("⏰ {}", s.interval)}</span> }.into_any(),
+                                            Some(s) => view! { <span class="sched-badge disabled">{format!("⏸ {}", s.interval)}</span> }.into_any(),
+                                            None => view! { <span style="color:var(--ink-3)">"—"</span> }.into_any(),
+                                        }}</td>
+                                        <td>{move || {
+                                            let Some(schedule) = net.get().schedule else { return view! { <span>"—"</span> }.into_any(); };
+                                            let Some(run) = schedule.last_run else { return view! { <span>{if schedule.enabled { "Pending…" } else { "—" }}</span> }.into_any(); };
+                                            let next_label = schedule.enabled.then(|| {
+                                                #[allow(clippy::cast_possible_truncation)]
+                                                let started_ms = js_sys::Date::parse(&run.started_at) as i64;
+                                                time_until(started_ms + schedule.interval_secs.cast_signed() * 1000, now_ms.get())
+                                            });
+                                            view! {
+                                                <span><StatusDot tone=crate::components::run_status_tone(&run.status)/>
+                                                    <span class="run-status">{run.status}</span> " "
+                                                    <span class="mono" style="color:var(--ink-2)">{time_ago(&run.started_at, now_ms.get())}</span>
+                                                    {next_label.map(|label| view! { <span class="next-run" style="margin-left:6px; font-size:10px; color:var(--ink-3)">{label}</span> })}
+                                                </span>
+                                            }.into_any()
+                                        }}</td>
+                                        <td class="mono">{move || time_ago(&net.get().created_at, now_ms.get())}</td>
+                                        // Lift the menu above the row's stretched link.
+                                        <td class="row-menu">
+                                            <Show when=move || net.get().schedule.and_then(|s| s.window).is_none()
+                                                fallback=move || view! { <ActionsMenu items=windowed.get_value()/> }>
+                                                <ActionsMenu items=regular.get_value()/>
+                                            </Show>
+                                        </td>
+                                    </tr>
+                                }
+                            }/>
+                        </tbody>
+                    </table>
+                    {move || (matches!(nets.get(), Some(Ok(_))) && visible_nets.get().is_empty()).then(|| view! {
+                        <div class="tbl-empty">{if nets.get().and_then(Result::ok).is_some_and(|r| r.queries.is_empty()) {
+                            "No nets yet — save a query from the search page to get started"
+                        } else { "No nets match that filter" }}</div>
+                    })}
+                    <Pager summary=Signal::derive(move || {
+                        let count = visible_nets.get().len();
+                        format!("{count} net{}", if count == 1 { "" } else { "s" })
+                    })/>
                 </div>
             </div>
 
-            // Drawer — rendered when ?net=<id> is present
-            {move || {
-                let id = net_selected.get()?;
-                let resp = nets.get()?.ok()?;
-                let net = resp.queries.iter().find(|q| q.id == id)?.clone();
-                Some(view! {
-                    <NetDrawer
-                        net=net
-                        tab=tab_sig
-                        on_close=on_close
-                        on_tab_change=on_tab_change
-                        on_search=on_search
-                        on_refresh=on_refresh
-                    />
-                })
-            }}
+            // The keyed owner depends only on the requested ID, never the list.
+            <For each={move || net_selected.get().into_iter().collect::<Vec<_>>()} key=|id| *id children=move |id| {
+                let saved = Signal::derive(move || nets.get().and_then(Result::ok).and_then(|r| r.queries.into_iter().find(|q| q.id == id)));
+                let initial = RwSignal::new(None::<SavedQueryResponse>);
+                Effect::new(move |_| {
+                    if initial.get_untracked().is_none() && let Some(net) = saved.get() { initial.set(Some(net)); }
+                });
+                view! {
+                    <Show when=move || initial.get().is_some() fallback=move || {
+                        let message = match nets.get() {
+                            None => "Loading net…",
+                            Some(Err(_)) => "Could not load this net. Please retry.",
+                            Some(Ok(_)) => "Net not found. It may have been deleted.",
+                        };
+                        view! { <div role="status">{message} " " <a href="/jobs/nets">"Back to Nets"</a></div> }
+                    }>
+                        <NetDrawer net=initial.get_untracked().expect("loaded net") saved=saved tab=tab_sig on_close=on_close
+                            on_tab_change=on_tab_change on_search=on_search on_refresh=on_refresh/>
+                    </Show>
+                }
+            }/>
 
             // Delete confirmation modal — open/close plumbing via the
             // natively-tested fleet_ui::ConfirmState; the ConfirmModal

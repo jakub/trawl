@@ -172,8 +172,7 @@ pub struct ClaimedManualRun {
     pub run_id: i64,
     /// The saved DSL, executed and stored verbatim.
     pub query: String,
-    /// The saved query's name, which names the `scheduled/{name}/` result
-    /// directory.
+    /// The saved query's display name at claim time.
     pub query_name: String,
 }
 
@@ -219,8 +218,7 @@ pub struct ClaimedRun {
     pub run_id: i64,
     /// The saved query this run belongs to.
     pub saved_query_id: i64,
-    /// The saved query's name, which names the `scheduled/{name}/` result
-    /// directory.
+    /// The saved query's display name at claim time.
     pub query_name: String,
     /// The resolved DSL: the saved text with `earliest=`/`latest=` spliced
     /// on, or the saved text verbatim in query mode.
@@ -1846,7 +1844,7 @@ impl ScheduleStore {
 /// The rows one due-run claim reads before it decides anything.
 struct LockedSchedule {
     saved_query_id: i64,
-    /// The saved query's name (its `scheduled/{name}/` result directory).
+    /// The saved query's display name at claim time.
     query_name: String,
     /// The saved DSL, read under the saved-query row lock.
     dsl: String,

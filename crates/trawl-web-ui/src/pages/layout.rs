@@ -39,15 +39,38 @@ pub struct ShellStatus {
 pub fn AuthShell() -> impl IntoView {
     let me = RwSignal::new(None::<api::MeResponse>);
     let redirect_to_login = RwSignal::new(false);
+    let auth_error = RwSignal::new(None::<&'static str>);
+    let checking_session = RwSignal::new(false);
+    let session_attempt = RwSignal::new(0u64);
 
     Effect::new(move |_| {
+        let _ = session_attempt.get();
+        checking_session.set(true);
+        auth_error.set(None);
         spawn_local(async move {
             match api::me().await {
-                Ok(resp) => me.set(Some(resp)),
-                Err(_) => redirect_to_login.set(true),
+                Ok(resp) => {
+                    me.try_set(Some(resp));
+                }
+                Err(api::ApiError::Unauthorized) => {
+                    redirect_to_login.try_set(true);
+                }
+                Err(err) => {
+                    auth_error.try_set(Some(if err.http_status() == Some(403) {
+                        "This account does not have access to Trawl."
+                    } else {
+                        "Unable to check your session. Try again when the service is available."
+                    }));
+                }
             }
+            checking_session.try_set(false);
         });
     });
+    let retry_session = move |_| {
+        if !checking_session.get_untracked() {
+            session_attempt.update(|attempt| *attempt += 1);
+        }
+    };
 
     Effect::new(move |_| {
         if redirect_to_login.get()
@@ -139,14 +162,26 @@ pub fn AuthShell() -> impl IntoView {
         })
     });
 
-    let on_logout = Callback::new(|()| {
+    let signing_out = RwSignal::new(false);
+    let logout_error = RwSignal::new(false);
+    let on_logout = Callback::new(move |()| {
+        if signing_out.get_untracked() {
+            return;
+        }
+        signing_out.set(true);
+        logout_error.set(false);
         spawn_local(async move {
-            if let Err(e) = api::logout().await {
-                web_sys::console::warn_1(&format!("logout request failed: {e}").into());
+            match api::logout().await {
+                Ok(()) => {
+                    if let Some(win) = web_sys::window() {
+                        let _ = win.location().set_href("/login");
+                    }
+                }
+                Err(_) => {
+                    logout_error.try_set(true);
+                }
             }
-            if let Some(win) = web_sys::window() {
-                let _ = win.location().set_href("/login");
-            }
+            signing_out.try_set(false);
         });
     });
 
@@ -174,6 +209,21 @@ pub fn AuthShell() -> impl IntoView {
                 </a>
             }.into_any())
         >
+            <Show when=move || logout_error.get()>
+                <div class="auth-notice">
+                    <p role="alert">"Sign out was not confirmed. Your session may still be active."</p>
+                    <button type="button" class="btn-sec" disabled=move || signing_out.get() on:click=move |_| on_logout.run(())>"Retry sign out"</button>
+                </div>
+            </Show>
+            <Show when=move || me.get().is_none()>
+                <div class="auth-notice">
+                    {move || auth_error.get().map(|message| view! { <p role="alert">{message}</p> })}
+                    <Show when=move || checking_session.get()><p role="status">"Checking your session…"</p></Show>
+                    <Show when=move || auth_error.get().is_some()>
+                        <button type="button" class="btn-sec" disabled=move || checking_session.get() on:click=retry_session>"Retry session check"</button>
+                    </Show>
+                </div>
+            </Show>
             <Show when=move || me.get().is_some() fallback=|| ()>
                 <Outlet/>
             </Show>

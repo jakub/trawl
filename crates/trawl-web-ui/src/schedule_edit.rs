@@ -101,6 +101,19 @@ impl std::fmt::Display for ScheduleEditError {
 impl std::error::Error for ScheduleEditError {}
 
 impl WindowDraft {
+    /// Incorporate a newer server seed without replacing dirty fields.
+    pub fn refresh_clean_from(&mut self, old: &Self, new: Self) {
+        if self.mode == old.mode {
+            self.mode = new.mode;
+        }
+        if self.span == old.span {
+            self.span = new.span;
+        }
+        if self.lag == old.lag {
+            self.lag = new.lag;
+        }
+    }
+
     /// Seed the draft from what the server reports, so an untouched form
     /// sends the pair back unchanged.
     ///
@@ -319,5 +332,36 @@ mod tests {
         );
         assert_eq!(preview_cap(Some(45), 45), None);
         assert_eq!(preview_cap(None, 45), None);
+    }
+}
+
+#[cfg(test)]
+mod live_draft_tests {
+    use super::*;
+
+    #[test]
+    fn refresh_updates_clean_fields_and_keeps_dirty_fields_across_successive_reads() {
+        let old = WindowDraft {
+            mode: WindowMode::Fixed,
+            span: "1h".into(),
+            lag: "2m".into(),
+        };
+        let mut draft = old.clone();
+        draft.span = "3h".into();
+        let next = WindowDraft {
+            mode: WindowMode::Fixed,
+            span: "2h".into(),
+            lag: "5m".into(),
+        };
+        draft.refresh_clean_from(&old, next.clone());
+        assert_eq!(draft.span, "3h");
+        assert_eq!(draft.lag, "5m");
+        let latest = WindowDraft {
+            lag: "7m".into(),
+            ..next.clone()
+        };
+        draft.refresh_clean_from(&next, latest);
+        assert_eq!(draft.span, "3h");
+        assert_eq!(draft.lag, "7m");
     }
 }
