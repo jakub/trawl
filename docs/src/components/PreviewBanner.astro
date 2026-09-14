@@ -1,9 +1,13 @@
 ---
 import Banner from '@astrojs/starlight/components/Banner.astro';
 const preview = import.meta.env.TRAWL_DOCS_PREVIEW === '1';
+const development = import.meta.env.TRAWL_DOCS_DEVELOPMENT === '1';
 ---
 
-{preview ? <aside class="preview-banner">Local documentation preview. Changes here have not been published.</aside> : <Banner />}
+{preview ? <aside class="preview-banner">Local documentation preview. Changes here have not been published.</aside> : <>
+  {development && <aside class="preview-banner">Development manual for main. Downloaded releases can differ. <a href="/contribute/documentation/#documentation-and-release-scope">Documentation scope</a>.</aside>}
+  <Banner />
+</>}
 
 <style>
   .preview-banner {

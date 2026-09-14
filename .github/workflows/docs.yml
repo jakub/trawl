@@ -31,6 +31,8 @@ jobs:
         working-directory: docs
         run: npm ci
       - name: Build and check documentation
+        env:
+          TRAWL_DOCS_DEVELOPMENT: "1"
         working-directory: docs
         run: npm run check
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

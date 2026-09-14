@@ -54,6 +54,25 @@ which revision and scenario you checked.
 The Docs workflow builds and checks every pull request that touches `docs/` or
 `crates/trawl-core/src/ast.rs`. It deploys from `main` only.
 
+## Documentation and release scope
+
+The published manual follows `main` and can describe changes that are absent
+from downloaded releases. The Docs workflow sets
+`TRAWL_DOCS_DEVELOPMENT=1` to label its build with the development-manual banner.
+Other builds do not enable that banner by default. A local preview uses its own
+unpublished-preview banner.
+
+For a stable release, align the manual, binaries, image, chart, and examples to
+one verified release commit. A package version alone does not establish that
+alignment. Keep development documentation separately identified when the stable
+manual is introduced.
+
+Keep unpublished launch notes and pending support decisions under `docs/launch/`,
+outside the site's content collection. The repository's `CHANGELOG.md` links to
+the draft initial-release notes and the preserved pre-1.0 journal. The historical
+journal records intermediate changes and does not define current installation
+or upgrade requirements.
+
 ## Put each fact in one place
 
 | Material | Owner |
