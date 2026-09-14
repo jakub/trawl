@@ -155,10 +155,17 @@ pub fn group_columns(query: &str, columns: &[String]) -> Vec<usize> {
     let Some(minted) = minted_before(earlier) else {
         return Vec::new();
     };
+    // `by HOST` groups the catalog's `host`, and the response names the
+    // column as the catalog does, so both sides fold before they meet.
     columns
         .iter()
         .enumerate()
-        .filter(|(_, name)| stats.group_by.iter().any(|g| g == *name))
+        .filter(|(_, name)| {
+            stats
+                .group_by
+                .iter()
+                .any(|g| catalog_key(g) == catalog_key(name))
+        })
         .filter(|(_, name)| !minted.contains(&catalog_key(name)))
         .map(|(i, _)| i)
         .collect()
@@ -526,6 +533,11 @@ mod tests {
     fn group_columns_names_only_the_grouped_fields() {
         let columns = vec!["status".to_string(), "count".to_string()];
         assert_eq!(group_columns(BY_STATUS, &columns), vec![0]);
+        // The grouping key folds to the catalog name the column carries.
+        assert_eq!(
+            group_columns("* | stats count() by STATUS", &columns),
+            vec![0]
+        );
     }
 
     #[test]

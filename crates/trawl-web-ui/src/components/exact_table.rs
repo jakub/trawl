@@ -20,13 +20,13 @@
 //! or the URL, so a page that has moved on cannot relabel these rows.
 //!
 //! While a request is in flight the rows on screen belong to the
-//! PREVIOUS query, so every group control would carry that query's
-//! field into this query's filter. The cells go plain until the
-//! response that matches the executed query arrives.
+//! PREVIOUS query. Every group control carries that query with it, so a
+//! press files the filter against the query the row came from, never
+//! the one still pending; the cells stay live throughout.
 
 use crate::api::{ApiError, PAGE_SIZE};
 use crate::categorical::group_columns;
-use crate::result_actions::compare;
+use crate::result_actions::{Capabilities, compare};
 use crate::state::query::{Filter, FilterOp};
 use crate::state::search_session::{ExecutedQuery, ExecutedResponse};
 use fleet_ui::{LoadState, Loaded, OffsetPager, PageTotal, PageWindow};
@@ -85,6 +85,7 @@ fn ExactTableBody(
     let returned = resp.pagination.returned;
     let truncated = resp.truncated;
     let group_cols = group_columns(&executed_query.effective, &columns);
+    let capabilities = Capabilities::for_query(&executed_query.effective);
 
     let sort = RwSignal::new(None::<(usize, bool)>);
     let header_cells = columns
@@ -172,7 +173,7 @@ fn ExactTableBody(
                                 let cells = body_rows[i]
                                     .iter()
                                     .enumerate()
-                                    .map(|(ci, v)| cell(ci, v, &body_cols, &group_cols, &executed_query, on_add_filter, busy))
+                                    .map(|(ci, v)| cell(ci, v, &body_cols, &group_cols, &capabilities, &executed_query, on_add_filter))
                                     .collect::<Vec<_>>();
                                 view! { <tr>{cells}</tr> }
                             }).collect::<Vec<_>>()).into_any()
@@ -208,15 +209,17 @@ fn ExactTableBody(
 }
 
 /// One body cell: a search control on a grouped field, plain text on a
-/// generated metric.
+/// generated metric or on a value no filter can name (a null group, an
+/// array).
+#[allow(clippy::too_many_arguments)]
 fn cell(
     ci: usize,
     value: &Value,
     columns: &[String],
     group_cols: &[usize],
+    capabilities: &Capabilities,
     executed_query: &ExecutedQuery,
     on_add_filter: Callback<(ExecutedQuery, Filter)>,
-    busy: Signal<bool>,
 ) -> AnyView {
     let text = value_to_string(value);
     if !group_cols.contains(&ci) {
@@ -225,6 +228,9 @@ fn cell(
     let Some(field) = columns.get(ci).cloned() else {
         return view! { <td>{text}</td> }.into_any();
     };
+    if !capabilities.include(&field, value) {
+        return view! { <td>{text}</td> }.into_any();
+    }
     let label = format!("Search {field} = {text}");
     let filter = StoredValue::new(Filter {
         field,
@@ -232,23 +238,15 @@ fn cell(
         op: FilterOp::Include,
     });
     let query = executed_query.clone();
-    let plain = text.clone();
     view! {
-        <td>{move || if busy.get() {
-            plain.clone().into_any()
-        } else {
-            let label = label.clone();
-            let text = text.clone();
-            let query = query.clone();
-            view! {
-                <button
-                    type="button"
-                    class="grp-search"
-                    aria-label=label
-                    on:click=move |_| on_add_filter.run((query.clone(), filter.get_value()))
-                >{text}</button>
-            }.into_any()
-        }}</td>
+        <td>
+            <button
+                type="button"
+                class="grp-search"
+                aria-label=label
+                on:click=move |_| on_add_filter.run((query.clone(), filter.get_value()))
+            >{text}</button>
+        </td>
     }
     .into_any()
 }
