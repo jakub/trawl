@@ -78,16 +78,15 @@ pub fn Shell(
 
     let commands = Memo::new(move |_| {
         let groups = sidebar_groups.get();
-        commands_from(
-            std::iter::empty::<CommandInput<'_>>(),
-            groups
-                .iter()
-                .flat_map(|group| group.items.iter())
-                .map(|item| CommandInput {
+        commands_from(groups.iter().map(|group| {
+            (
+                group.label.as_deref(),
+                group.items.iter().map(|item| CommandInput {
                     label: &item.label,
                     path: &item.path,
                 }),
-        )
+            )
+        }))
     });
     let available = Signal::derive(move || commands.with(|items| palette_available(items)));
     let palette_open = RwSignal::new(false);
