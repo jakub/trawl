@@ -40,10 +40,12 @@ def prepare(source, target, output):
     (output / "runtime.json").write_text(json.dumps({"version": manifest["version"], "archive": archive, "sha256": checksum}, indent=2) + "\n")
 
 
-def stage(binaries, runtime, output, target, source_sha, tooling_sha, cli_only, source):
+def stage(binaries, runtime, output, target, source_sha, tooling_sha, cli_only, source, image_only=False):
     if output.exists():
         raise SystemExit("staging destination already exists")
     names = ["trawl"] if cli_only else ["trawl", "trawld", "trawl-admin", "fleet-admin", "trawl-web"]
+    if image_only:
+        names.remove("trawl")
     library = "libduckdb.dylib" if "apple" in target else "libduckdb.so"
     for path in [*[binaries / name for name in names], runtime / library, runtime / "LICENSE.duckdb", runtime / "runtime.json", source / "LICENSE"]:
         if not path.is_file():
@@ -89,7 +91,9 @@ if __name__ == "__main__":
     p.add_argument("--target", required=True)
     p.add_argument("--source-sha", required=True)
     p.add_argument("--tooling-sha", required=True)
-    p.add_argument("--cli-only", action="store_true")
+    scope = p.add_mutually_exclusive_group()
+    scope.add_argument("--cli-only", action="store_true")
+    scope.add_argument("--image-only", action="store_true")
     args = vars(parser.parse_args())
     command = args.pop("command")
     globals()[command](**args)

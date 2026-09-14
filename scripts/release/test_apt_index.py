@@ -30,9 +30,10 @@ class AptIndexTests(unittest.TestCase):
         self.pool.mkdir(parents=True)
         self.counter = 0
         for arch in ["amd64", "arm64"]:
-            for name in ["trawl-server", "trawl-cli"]:
+            for name in ["trawl-server", "trawl-cli", "trawl-runtime"]:
                 # Deliberately misleading filenames exercise control metadata.
-                self.deb(self.incoming, name, arch, "1.0.0", f"opaque-{name}-{arch}-not-an-arch.deb")
+                self.deb(self.incoming, name, arch, "1.0.0", f"opaque-{name}-{arch}-not-an-arch.deb",
+                         "trawl-runtime (= 1.0.0)" if name != "trawl-runtime" else None)
         self.deb(self.pool, "trawld", "amd64", "99.0.0", "retired.deb")
         self.deb(self.pool, "trawl-server", "amd64", "0.9.0", "old-server.deb")
         self.deb(self.pool, "unrelated", "all", "1.0.0", "other.deb")
@@ -41,12 +42,13 @@ class AptIndexTests(unittest.TestCase):
         self.symbol.write_bytes(b"historical symbols\n")
         self.old_bytes = {p: p.read_bytes() for p in self.pool.iterdir()}
 
-    def deb(self, destination, name, arch, version, filename):
+    def deb(self, destination, name, arch, version, filename, depends=None):
         self.counter += 1
         staging = self.root / f"package-{self.counter}"
         (staging / "DEBIAN").mkdir(parents=True)
         (staging / "DEBIAN/control").write_text(
             f"Package: {name}\nVersion: {version}\nArchitecture: {arch}\n"
+            + (f"Depends: {depends}\n" if depends else "") +
             "Maintainer: Release test <release@example.invalid>\n"
             "Description: Disposable release fixture\n metadata continuation\n"
         )
@@ -71,10 +73,12 @@ class AptIndexTests(unittest.TestCase):
             content = (directory / "Packages").read_bytes()
             self.assertEqual(gzip.decompress((directory / "Packages.gz").read_bytes()), content)
             entries = stanzas(content.decode())
-            self.assertEqual({e["Package"] for e in entries}, {"trawl-server", "trawl-cli"})
-            self.assertEqual(len(entries), 2)
+            self.assertEqual({e["Package"] for e in entries}, {"trawl-server", "trawl-cli", "trawl-runtime"})
+            self.assertEqual(len(entries), 3)
             for entry in entries:
                 self.assertEqual(entry["Architecture"], arch)
+                if entry["Package"] != "trawl-runtime":
+                    self.assertEqual(entry["Depends"], "trawl-runtime (= 1.0.0)")
                 self.assertEqual(entry["Version"], "1.0.0")
                 self.assertEqual(entry["Filename"], f"pool/opaque-{entry['Package']}-{arch}-not-an-arch.deb")
                 data = (self.repo / entry["Filename"]).read_bytes()
@@ -105,6 +109,16 @@ class AptIndexTests(unittest.TestCase):
         result = self.run_builder()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("missing incoming supported packages", result.stderr)
+        self.assertFalse((self.repo / "dists").exists())
+        self.assertEqual(set(self.pool.iterdir()), set(self.old_bytes))
+        self.assert_history_preserved()
+
+    def test_missing_runtime_fails_before_pool_or_index_changes(self):
+        next(self.incoming.glob('*trawl-runtime-amd64*')).unlink()
+        result = self.run_builder()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing incoming supported packages", result.stderr)
+        self.assertIn("trawl-runtime", result.stderr)
         self.assertFalse((self.repo / "dists").exists())
         self.assertEqual(set(self.pool.iterdir()), set(self.old_bytes))
         self.assert_history_preserved()

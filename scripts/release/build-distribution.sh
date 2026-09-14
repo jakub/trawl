@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SOURCE TARGET RUNTIME [--cli-only]; run from a disposable build checkout.
+# SOURCE TARGET RUNTIME [--cli-only|--image-only]; run from a disposable build checkout.
 set -euo pipefail
 source_dir="$(cd "$1" && pwd)"
 target="$2"
@@ -16,8 +16,12 @@ esac
 # Preserve release build-id flags, but keep the literal loader token intact.
 export RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-Wl,-rpath,$loader"
 cd "$source_dir"
-if [[ "${4:-}" == --cli-only ]]; then
-  "${command[@]}" --locked --release --target "$build_target" --no-default-features --features trawl-cli/clipboard -p trawl-cli --bin trawl
-else
-  "${command[@]}" --locked --release --target "$build_target" --no-default-features --features trawl-cli/clipboard --workspace --exclude trawl-web-ui
-fi
+case "${4:-}" in
+  --cli-only)
+    "${command[@]}" --locked --release --target "$build_target" --no-default-features --features trawl-cli/clipboard -p trawl-cli --bin trawl ;;
+  --image-only)
+    "${command[@]}" --locked --release --target "$build_target" --no-default-features -p trawl-server -p trawl-admin -p fleet-admin -p trawl-web --bins ;;
+  "")
+    "${command[@]}" --locked --release --target "$build_target" --no-default-features --features trawl-cli/clipboard --workspace --exclude trawl-web-ui ;;
+  *) echo 'unsupported distribution build option' >&2; exit 1 ;;
+esac

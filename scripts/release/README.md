@@ -8,9 +8,10 @@ resolved SHA, with workspace and lockfile package versions already matching
 the release tag. Release builds never rewrite version fields. An old tag whose DuckDB lockfile does not match `duckdb-runtime.json` is
 refused. Do not silently use a newer runtime for that tag.
 
-`build-distribution.sh SOURCE TARGET RUNTIME [--cli-only]` verifies the official
+`build-distribution.sh SOURCE TARGET RUNTIME [--cli-only|--image-only]` verifies the official
 DuckDB archive, disables the bundled feature, retains CLI clipboard support,
-and adds a relative runtime search path. Linux uses cargo-zigbuild; macOS uses
+and adds a relative runtime search path. `--image-only` selects the four
+server-image executables without changing their release profile or debug settings. Linux uses cargo-zigbuild; macOS uses
 native Cargo. Build and precompress the SPA before the Linux server build.
 The official shared library includes ICU, JSON, and Parquet. Changing the
 runtime manifest requires repeating the extension and timezone checks.

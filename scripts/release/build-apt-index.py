@@ -8,7 +8,7 @@ import subprocess
 import sys
 
 
-PACKAGES = {"trawl-server", "trawl-cli"}
+PACKAGES = {"trawl-server", "trawl-cli", "trawl-runtime"}
 ARCHITECTURES = ("amd64", "arm64")
 EXPECTED = {(package, arch) for package in PACKAGES for arch in ARCHITECTURES}
 

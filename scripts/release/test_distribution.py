@@ -49,6 +49,21 @@ class Distribution(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 module.stage(*args)
 
+    def test_image_staging_does_not_require_or_ship_the_cli(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            names = {"trawld", "trawl-admin", "fleet-admin", "trawl-web"}
+            for name in names:
+                (root / name).write_bytes(b"image executable fixture")
+            (root / "libduckdb.so").write_bytes(b"library fixture")
+            (root / "LICENSE.duckdb").write_text("runtime license")
+            (root / "LICENSE").write_text("product license")
+            (root / "runtime.json").write_text('{"version":"1.5.5"}')
+            module.stage(root, root, root / "image", "x86_64-unknown-linux-gnu",
+                         "product", "workflow", False, root, image_only=True)
+            self.assertEqual({p.name for p in (root / "image/bin").iterdir()}, names)
+            self.assertTrue((root / "image/lib/trawl/libduckdb.so").is_file())
+
 
 if __name__ == "__main__":
     unittest.main()
