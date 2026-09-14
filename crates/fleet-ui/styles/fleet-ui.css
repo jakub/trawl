@@ -168,7 +168,9 @@
   --accent-wash: color-mix(in oklab, #2a5c8a 9%, transparent);
 
   /* --teal is text in the schema drawer's BOOL/IP type chips (.tp-bool,
-   * .tp-ip, a 12% mix over --panel-2): 4.66:1 there, 6.23:1 on --panel. */
+   * .tp-ip, a 14% mix over --panel-2): 4.66:1 there, 6.23:1 on --panel.
+   * The percentage is the one the rules use; at 18% the BOOL chip
+   * measured 4.38:1 and missed the AA floor. */
   --teal:       #0a6d60;
   --teal-wash:  rgba(10,109,96,.10);
   /* Light --red is toned for the TINTED destructive recipe, not for a
@@ -274,6 +276,8 @@
   --accent-ink:  #6baadd;
   --accent-wash: color-mix(in oklab, #5a9fd4 14%, transparent);
 
+  /* Same chips, same 14% mix over the dark --panel-2: 5.59:1 there,
+   * 8.14:1 on --panel. */
   --teal:       #4ec9b0;
   --teal-wash:  rgba(78,201,176,.12);
   --red:        oklch(70.4% .191 22.216);

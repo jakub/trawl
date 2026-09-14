@@ -231,7 +231,7 @@ pub fn HistoryPage() -> impl IntoView {
             <section class="list-sheet" aria-labelledby="history-sheet-title">
                 <div class="list-sheet-hd">
                     <h2 id="history-sheet-title" class="list-sheet-ttl">
-                        "Recent searches"<span class="cnt">{move || filtered_rows.get().len()}</span>
+                        "Recent searches"<span class="cnt">{move || format!(" {}", filtered_rows.get().len())}</span>
                     </h2>
                     <SearchInput value=filter placeholder="Filter history…"/>
                 </div>

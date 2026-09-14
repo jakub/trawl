@@ -1496,7 +1496,7 @@
 .tp-text      { background: color-mix(in oklab, var(--green)  14%, var(--panel-2)); color: var(--green); }
 .tp-integer   { background: color-mix(in oklab, var(--accent)  14%, var(--panel-2)); color: var(--accent); }
 .tp-bigint    { background: color-mix(in oklab, var(--accent)  14%, var(--panel-2)); color: var(--accent); }
-.tp-bool      { background: color-mix(in oklab, var(--teal)   18%, var(--panel-2)); color: var(--teal); }
+.tp-bool      { background: color-mix(in oklab, var(--teal)   14%, var(--panel-2)); color: var(--teal); }
 .tp-float     { background: color-mix(in oklab, var(--accent)  14%, var(--panel-2)); color: var(--accent); }
 .tp-ip        { background: color-mix(in oklab, var(--teal)   14%, var(--panel-2)); color: var(--teal); }
 .tp-timestamp { background: color-mix(in oklab, var(--ink-3)  18%, var(--panel-2)); color: var(--ink-2); }
@@ -1592,11 +1592,17 @@
 .topfields .tf .bar { display: block; height: 100%; background: var(--accent); }
 .topfields .tf .c { color: var(--ink-3); text-align: right; font-family: var(--font-mono); }
 
-/* Fields tab */
-.sd-fields { display: flex; flex-direction: column; }
+/* Fields tab. The fixed tracks are sized so Sample fits inside the
+ * docked panel at 1440 instead of being pushed past its edge, and
+ * `min-width` states the floor the row cannot go below — so the body's
+ * `overflow: auto` is a declared horizontal scroll on a narrower panel
+ * instead of a clip nobody chose. Cardinality keeps 75px: it is the one
+ * header whose own text needs that much, and 64 put the sort glyph over
+ * Storage beside it. */
+.sd-fields { display: flex; flex-direction: column; min-width: 561px; }
 .sf-hd, .sf-row {
   display: grid;
-  grid-template-columns: minmax(115px, 1.35fr) 70px 105px 75px 60px minmax(65px, 1fr) 28px;
+  grid-template-columns: minmax(115px, 1.35fr) 70px 88px 75px 56px minmax(65px, 1fr) 28px;
   align-items: center; gap: 8px;
   padding: 6px 8px; font-size: var(--table-fs);
 }
@@ -2061,7 +2067,11 @@
 /* Wide enough for the bars to stand beside the numbers they draw. */
 @media (min-width: 1100px) {
   .agg-split.has-chart { grid-template-columns: minmax(0, 1fr) minmax(280px, 34%); }
-  .agg-split .cat-chart { order: 0; border-top: 0; border-left: 1px solid var(--line); }
+  /* The divider belongs to the table's edge, not the chart's: the chart
+   * is capped at 480px tall, so a border on it stopped short of the
+   * sheet's bottom. */
+  .agg-split.has-chart > .results { border-right: 1px solid var(--line); }
+  .agg-split .cat-chart { order: 0; border-top: 0; }
 }
 
 /* The sidebar remains one mounted disclosure so field search and group

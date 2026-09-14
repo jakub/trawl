@@ -351,7 +351,7 @@ pub fn SchemaPage() -> impl IntoView {
             <section class="list-sheet" aria-labelledby="schema-sheet-title">
                 <div class="list-sheet-hd">
                     <h2 id="schema-sheet-title" class="list-sheet-ttl">
-                        "Services"<span class="cnt">{move || visible_count.get()}</span>
+                        "Services"<span class="cnt">{move || format!(" {}", visible_count.get())}</span>
                     </h2>
                     <SearchInput value=filter placeholder="Filter services…"/>
                 </div>

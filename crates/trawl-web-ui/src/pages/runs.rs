@@ -231,7 +231,7 @@ pub fn RunsPage() -> impl IntoView {
             <section class="list-sheet" aria-labelledby="runs-sheet-title">
                 <div class="list-sheet-hd">
                     <h2 id="runs-sheet-title" class="list-sheet-ttl">
-                        "Recent runs"<span class="cnt">{move || visible_count.get()}</span>
+                        "Recent runs"<span class="cnt">{move || format!(" {}", visible_count.get())}</span>
                     </h2>
                     <SearchInput value=filter placeholder="Filter by net…"/>
                 </div>
