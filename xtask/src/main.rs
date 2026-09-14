@@ -42,8 +42,11 @@ const GZIP_BUDGET: u64 = 4 * 1024 * 1024;
 const BROTLI_BUDGET: u64 = 5 * 1024 * 1024 / 2;
 const BROTLI_QUALITY: u32 = 9;
 const BROTLI_WINDOW: u32 = 22;
+// TrueType is on the list because the fleet fonts ship as raw `.ttf`
+// (the pinned upstream bytes, never re-cut to WOFF2); gzip roughly halves
+// them. WOFF2 would not belong here: it is already Brotli inside.
 const COMPRESSIBLE_EXTENSIONS: &[&str] = &[
-    "css", "html", "js", "json", "map", "svg", "txt", "wasm", "xml",
+    "css", "html", "js", "json", "map", "svg", "ttf", "txt", "wasm", "xml",
 ];
 
 #[derive(Parser)]

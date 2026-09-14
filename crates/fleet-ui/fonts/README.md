@@ -42,11 +42,12 @@ WOFF2 files only, and Albert Sans ships no webfont at all. Re-cutting a
 variable WOFF2 locally would break the rule below, so the distributions ship
 the canonical `.ttf` files. `trawl-web` serves the SPA distribution with
 precompressed `.br`/`.gz` sidecars produced by `cargo xtask compress-web`,
-but its `COMPRESSIBLE_EXTENSIONS` list (`xtask/src/main.rs`) covers text and
-wasm only, so the two fonts currently travel uncompressed and carry
-`no-cache` with an ETag (they are not content-hashed filenames). Both are
-inside the wire-size budget; measure with `cargo xtask compress-web`, which
-prints the raw, gzip and Brotli totals against the 4 MiB / 2.5 MiB budgets.
+whose `COMPRESSIBLE_EXTENSIONS` list (`xtask/src/main.rs`) includes `ttf`,
+so a release build ships each face at roughly half its raw size (Brotli a
+little under that). The faces carry `no-cache` with an ETag because they
+are not content-hashed filenames. Both are inside the wire-size budget;
+measure with `cargo xtask compress-web`, which prints the raw, gzip and
+Brotli totals against the 4 MiB / 2.5 MiB budgets.
 
 ## The rule
 
