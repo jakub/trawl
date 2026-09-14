@@ -32,7 +32,7 @@
 # and resolve system dependencies plus the exact trawl-runtime dependency.
 # The systemd assertions run on trixie; this is not the Bookworm portability test.
 # Build tools are pinned so reruns use the same packaging implementation.
-# Packaging copies current Git-tracked files into disposable target storage.
+# Packaging copies current Git-tracked files into the container's /tmp.
 # Stage new source files first, including when using --allow-dirty.
 #
 #   * cargo-deb is pinned to 3.8.0. Updating it requires a full run because its
@@ -666,6 +666,7 @@ EOF
 
   # cargo-deb variants temporarily modify manifests. Keep those writes in a
   # disposable source snapshot even if the builder is killed without cleanup.
+  # The --rm container owns /tmp; interrupted snapshots cannot accumulate in target.
   # Original sources and Git metadata are read-only during this step; the
   # binaries keep the provenance embedded by the original-source build above.
   packager=(docker run --rm --user "$(id -u):$(id -g)"
@@ -674,7 +675,7 @@ EOF
     -v "$CARGO_VOLUME:/usr/local/cargo/registry"
     -e "CARGO_TARGET_DIR=$target_dir" "$BUILDER_IMAGE")
   run "${packager[@]}" python3 crates/trawl-server/debian/tests/package-snapshot.py \
-    --source "$repo_root" --work-dir "$target_dir" \
+    --source "$repo_root" --work-dir /tmp \
     --binaries "$target_dir/$build_target/release" --runtime "$target_dir/runtime" \
     --output "$PACKAGES" --target "$build_target"
 
