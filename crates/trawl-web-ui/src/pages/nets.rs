@@ -61,7 +61,7 @@ pub fn NetsPage() -> impl IntoView {
     let confirm_delete: RwSignal<ConfirmState<(i64, String)>> =
         RwSignal::new(ConfirmState::default());
 
-    let nets = LocalResource::new(move || {
+    let (nets, refresh_error, retry) = crate::components::job_refresh::job_refresh(move || {
         let _ = refresh.get();
         async move { api::list_saved().await }
     });
@@ -161,7 +161,7 @@ pub fn NetsPage() -> impl IntoView {
     };
 
     #[allow(clippy::cast_possible_truncation)]
-    let now_ms = move || js_sys::Date::now() as i64;
+    let now_ms = fleet_ui::time::clock::now_ms();
 
     let sort_nets = move |nets: &mut [&SavedQueryResponse]| {
         let (key, desc) = sort.get();
@@ -196,15 +196,16 @@ pub fn NetsPage() -> impl IntoView {
                 </div>
             </div>
 
+            {move || refresh_error.get().map(|e| view! { <p role="status">{e}</p> })}
             <fleet_ui::OverflowHint viewport=table_viewport/>
                 <div node_ref=table_viewport class="tbl fleet-table-frame tbl-scroll" role="region" aria-label="Saved queries" tabindex="0" style="--list-min-width:760px">
                 <div class="tbl-body">
                     <Loaded
                         state=Signal::derive(move || LoadState::from_resource(nets.get()))
                         label="nets"
-                        retry=Callback::new(move |()| { nets.set(None); nets.refetch(); })
+                        retry=Callback::new(move |()| { retry.run(()); })
                         render=Box::new(move |resp: trawl_api::ListSavedResponse| {
-                                let now = now_ms();
+                                let now = now_ms.get();
                                 let needle = filter.get().to_lowercase();
                                 let mut visible: Vec<&SavedQueryResponse> = resp.queries.iter()
                                     .filter(|q| {
@@ -375,22 +376,27 @@ pub fn NetsPage() -> impl IntoView {
                 </div>
             </div>
 
-            // Drawer — rendered when ?net=<id> is present
-            {move || {
-                let id = net_selected.get()?;
-                let resp = nets.get()?.ok()?;
-                let net = resp.queries.iter().find(|q| q.id == id)?.clone();
-                Some(view! {
-                    <NetDrawer
-                        net=net
-                        tab=tab_sig
-                        on_close=on_close
-                        on_tab_change=on_tab_change
-                        on_search=on_search
-                        on_refresh=on_refresh
-                    />
-                })
-            }}
+            // The keyed owner depends only on the requested ID, never the list.
+            <For each={move || net_selected.get().into_iter().collect::<Vec<_>>()} key=|id| *id children=move |id| {
+                let saved = Signal::derive(move || nets.get().and_then(Result::ok).and_then(|r| r.queries.into_iter().find(|q| q.id == id)));
+                let initial = RwSignal::new(None::<SavedQueryResponse>);
+                Effect::new(move |_| {
+                    if initial.get_untracked().is_none() && let Some(net) = saved.get() { initial.set(Some(net)); }
+                });
+                view! {
+                    <Show when=move || initial.get().is_some() fallback=move || {
+                        let message = match nets.get() {
+                            None => "Loading net…",
+                            Some(Err(_)) => "Could not load this net. Please retry.",
+                            Some(Ok(_)) => "Net not found. It may have been deleted.",
+                        };
+                        view! { <div role="status">{message} " " <a href="/jobs/nets">"Back to Nets"</a></div> }
+                    }>
+                        <NetDrawer net=initial.get_untracked().expect("loaded net") saved=saved tab=tab_sig on_close=on_close
+                            on_tab_change=on_tab_change on_search=on_search on_refresh=on_refresh/>
+                    </Show>
+                }
+            }/>
 
             // Delete confirmation modal — open/close plumbing via the
             // natively-tested fleet_ui::ConfirmState; the ConfirmModal

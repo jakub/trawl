@@ -21,23 +21,27 @@ pub fn RunsPage() -> impl IntoView {
     let filter = RwSignal::new(String::new());
 
     let pending = RwSignal::new(false);
-    let runs = LocalResource::new(move || {
-        let p = page.get();
-        async move {
-            let offset = PageWindow::checked_offset(p, RUNS_PAGE_SIZE)
-                .map_err(|_| api::ApiError::Refused("This runs page is too large to request."))?;
-            let _ = pending.try_set(true);
-            let response = api::list_all_runs(RUNS_PAGE_SIZE.get(), offset).await;
-            let _ = pending.try_set(false);
-            response.map(|resp| (p, resp))
-        }
-    });
+    let (runs, refresh_error, retry_runs) =
+        crate::components::job_refresh::job_refresh(move || {
+            let p = page.get();
+            async move {
+                let offset = PageWindow::checked_offset(p, RUNS_PAGE_SIZE).map_err(|_| {
+                    api::ApiError::Refused("This runs page is too large to request.")
+                })?;
+                let _ = pending.try_set(true);
+                let response = api::list_all_runs(RUNS_PAGE_SIZE.get(), offset).await;
+                let _ = pending.try_set(false);
+                response.map(|resp| (p, resp))
+            }
+        });
 
-    let nets_for_stats = LocalResource::new(|| async move { api::list_saved().await });
-    let stats = LocalResource::new(|| async move { api::runs_stats().await });
+    let (nets_for_stats, nets_error, retry_nets) =
+        crate::components::job_refresh::job_refresh(|| async move { api::list_saved().await });
+    let (stats, stats_error, retry_stats) =
+        crate::components::job_refresh::job_refresh(|| async move { api::runs_stats().await });
 
     #[allow(clippy::cast_possible_truncation)]
-    let now_ms = move || js_sys::Date::now() as i64;
+    let now_ms = fleet_ui::time::clock::now_ms();
 
     view! {
         <div class="page">
@@ -51,6 +55,7 @@ pub fn RunsPage() -> impl IntoView {
                 </div>
             </div>
 
+            {move || refresh_error.get().or(nets_error.get()).or(stats_error.get()).map(|e| view! { <p role="status">{e}</p> })}
             <div class="stats-row">
                 <div class="stat-card">
                     <div class="label">"Active nets"</div>
@@ -58,7 +63,7 @@ pub fn RunsPage() -> impl IntoView {
                         <Loaded
                             state=Signal::derive(move || LoadState::from_resource(nets_for_stats.get()))
                             label="active nets"
-                            retry=Callback::new(move |()| { nets_for_stats.set(None); nets_for_stats.refetch(); })
+                            retry=Callback::new(move |()| { retry_nets.run(()); })
                             render=Box::new(|resp: trawl_api::ListSavedResponse| {
                                 resp.queries.iter().filter(|q| q.schedule.as_ref().is_some_and(|s| s.enabled))
                                     .count().to_string().into_any()
@@ -72,7 +77,7 @@ pub fn RunsPage() -> impl IntoView {
                         <Loaded
                             state=Signal::derive(move || LoadState::from_resource(stats.get()))
                             label="success rate"
-                            retry=Callback::new(move |()| { stats.set(None); stats.refetch(); })
+                            retry=Callback::new(move |()| { retry_stats.run(()); })
                             render=Box::new(|s: trawl_api::RunsStatsResponse| {
                                 (s.success_count * 100).checked_div(s.total_runs)
                                     .map_or_else(|| "—".to_string(), |pct| format!("{pct}%")).into_any()
@@ -86,7 +91,7 @@ pub fn RunsPage() -> impl IntoView {
                         <Loaded
                             state=Signal::derive(move || LoadState::from_resource(stats.get()))
                             label="average duration"
-                            retry=Callback::new(move |()| { stats.set(None); stats.refetch(); })
+                            retry=Callback::new(move |()| { retry_stats.run(()); })
                             render=Box::new(|s: trawl_api::RunsStatsResponse| {
                                 s.avg_duration_ms.map_or_else(|| "—".to_string(), format_duration).into_any()
                             })
@@ -101,9 +106,9 @@ pub fn RunsPage() -> impl IntoView {
                     <Loaded
                         state=Signal::derive(move || LoadState::from_resource(runs.get()))
                         label="runs"
-                        retry=Callback::new(move |()| { runs.set(None); runs.refetch(); })
+                        retry=Callback::new(move |()| { retry_runs.run(()); })
                         render=Box::new(move |(fetched_page, resp): (usize, trawl_api::ListAllRunsResponse)| {
-                                let now = now_ms();
+                                let now = now_ms.get();
                                 let needle = filter.get().to_lowercase();
                                 let visible: Vec<_> = resp.runs.iter()
                                     .filter(|r| {

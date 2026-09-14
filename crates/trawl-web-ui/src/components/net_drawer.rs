@@ -27,7 +27,8 @@ use crate::schedule_edit::{WindowDraft, WindowMode, preview_cap, validate_max_ru
 use crate::api::RUNS_PAGE_SIZE;
 
 /// Rows per page inside an expanded run's stored result. The preview
-/// pages what the response already carries; it never re-fetches.
+/// pages what the response already carries; page turns never re-fetch.
+/// Background refresh can supply a newly completed result.
 const PREVIEW_PAGE_SIZE: std::num::NonZeroUsize = std::num::NonZeroUsize::new(20).unwrap();
 
 const INTERVAL_PRESETS: &[&str] = &["5m", "15m", "1h", "6h", "24h", "1w"];
@@ -36,6 +37,7 @@ const INTERVAL_PRESETS: &[&str] = &["5m", "15m", "1h", "6h", "24h", "1w"];
 #[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
 pub fn NetDrawer(
     net: SavedQueryResponse,
+    saved: Signal<Option<SavedQueryResponse>>,
     tab: Signal<String>,
     on_close: Callback<()>,
     on_tab_change: Callback<String>,
@@ -43,7 +45,16 @@ pub fn NetDrawer(
     on_refresh: Callback<()>,
 ) -> impl IntoView {
     let bus = expect_context::<ToastBus>();
+    let alive = StoredValue::new(true);
+    on_cleanup(move || alive.set_value(false));
     let net_for_query = net.clone();
+    let missing = Signal::derive(move || saved.get().is_none());
+    let mutation = RwSignal::new(0u64);
+    let parent_refresh = on_refresh;
+    let on_refresh = Callback::new(move |()| {
+        mutation.update(|n| *n += 1);
+        parent_refresh.run(());
+    });
     let net_for_runs = net.clone();
     let query_for_run = net.query.clone();
     let net_id_for_trigger = net.id;
@@ -52,11 +63,11 @@ pub fn NetDrawer(
     // it covered, so a manual run out of band moves that point and
     // leaves a hole the schedule will not revisit. The offer is withdrawn
     // from the SAVED state, never from an unsaved draft of it.
-    let manual_run_allowed = net
-        .schedule
-        .as_ref()
-        .and_then(|s| s.window.as_ref())
-        .is_none();
+    let manual_run_allowed = move || {
+        saved
+            .get()
+            .is_some_and(|n| n.schedule.and_then(|s| s.window).is_none())
+    };
 
     // -- inline rename --
     let editing_name = RwSignal::new(false);
@@ -84,27 +95,57 @@ pub fn NetDrawer(
         editing
     });
     let original_name = net.name.clone();
+    Effect::new(move |_| {
+        if let Some(current) = saved.get()
+            && !editing_name.get_untracked()
+        {
+            name_buf.set(current.name);
+        }
+    });
 
     let do_rename = {
         let net_id = net.id;
         let original_query = net.query.clone();
         let orig = original_name.clone();
         move || {
-            let new_name = name_buf.get_untracked().trim().to_string();
-            if new_name.is_empty() || new_name == orig {
-                editing_name.set(false);
-                name_buf.set(orig.clone());
+            if missing.get_untracked() {
                 return;
             }
-            let q = original_query.clone();
+            let draft = name_buf.get_untracked();
+            let Ok(new_name) = trawl_core::saved_name::normalize(&draft) else {
+                return;
+            };
+            let new_name = new_name.to_owned();
+            if new_name
+                == saved
+                    .get_untracked()
+                    .map_or_else(|| orig.clone(), |n| n.name)
+            {
+                editing_name.set(false);
+                name_buf.set(
+                    saved
+                        .get_untracked()
+                        .map_or_else(|| orig.clone(), |n| n.name),
+                );
+                return;
+            }
+            let q = saved
+                .get_untracked()
+                .map_or_else(|| original_query.clone(), |n| n.query);
             spawn_local(async move {
                 match api::update_saved_full(net_id, &q, Some(&new_name)).await {
                     Ok(_) => {
+                        if alive.try_get_value() != Some(true) {
+                            return;
+                        }
                         bus.push(ToastKind::Success, "Renamed", None);
                         editing_name.set(false);
                         on_refresh.run(());
                     }
                     Err(e) => {
+                        if alive.try_get_value() != Some(true) {
+                            return;
+                        }
                         bus.push(ToastKind::Error, "Rename failed", Some(e.to_string()));
                     }
                 }
@@ -119,7 +160,11 @@ pub fn NetDrawer(
         Callback::new(move |()| {
             if editing_name.get_untracked() {
                 editing_name.set(false);
-                name_buf.set(orig.clone());
+                name_buf.set(
+                    saved
+                        .get_untracked()
+                        .map_or_else(|| orig.clone(), |n| n.name),
+                );
             } else {
                 on_close.run(());
             }
@@ -132,15 +177,23 @@ pub fn NetDrawer(
     let on_run_click = {
         let q = query_for_run;
         let cb = on_search;
-        Callback::new(move |()| cb.run(q.clone()))
+        Callback::new(move |()| {
+            cb.run(saved.get_untracked().map_or_else(|| q.clone(), |n| n.query));
+        })
     };
 
     let on_trigger_click = Callback::new(move |()| {
+        if missing.get_untracked() {
+            return;
+        }
         let name = name_for_trigger.clone();
         let id = net_id_for_trigger;
         spawn_local(async move {
             match api::trigger_run(id).await {
                 Ok(_) => {
+                    if alive.try_get_value() != Some(true) {
+                        return;
+                    }
                     bus.push(
                         ToastKind::Success,
                         "Run triggered",
@@ -149,6 +202,9 @@ pub fn NetDrawer(
                     on_refresh.run(());
                 }
                 Err(e) => {
+                    if alive.try_get_value() != Some(true) {
+                        return;
+                    }
                     bus.push(ToastKind::Error, "Trigger failed", Some(e.to_string()));
                 }
             }
@@ -170,19 +226,18 @@ pub fn NetDrawer(
                 <Show
                     when=move || editing_name.get()
                     fallback={
-                        let name = net.name.clone();
                         move || view! {
                             <button
                                 type="button"
                                 class="name"
                                 node_ref=name_btn_ref
-                                aria-label=format!("Rename {name}")
+                                aria-label=move || format!("Rename {}", saved.get().map_or_else(|| "deleted net".to_string(), |n| n.name))
                                 // The title looks like the drawer's
                                 // heading, so nothing but the tooltip
                                 // tells a pointer user it can be edited.
                                 title="Rename"
                                 on:click=move |_| editing_name.set(true)
-                            >{name.clone()}</button>
+                            >{move || saved.get().map_or_else(|| name_buf.get(), |n| n.name)}</button>
                         }
                     }
                 >
@@ -192,12 +247,13 @@ pub fn NetDrawer(
                         // The input REPLACES the heading it edits, so the
                         // name it is editing is nowhere on screen to label
                         // it: without this the field is an unnamed textbox.
-                        let name = net.name.clone();
                         view! {
                             <input
                                 class="name-edit"
+                                aria-invalid=move || trawl_core::saved_name::normalize(&name_buf.get()).is_err().to_string()
+                                aria-describedby="netRenameError"
                                 node_ref=name_input_ref
-                                aria-label=format!("New name for {name}")
+                                aria-label=move || format!("New name for {}", saved.get().map_or_else(|| "deleted net".to_string(), |n| n.name))
                                 prop:value=move || name_buf.get()
                                 on:input=move |e| name_buf.set(event_target_value(&e))
                                 on:blur=move |_| do_rename_blur()
@@ -208,6 +264,7 @@ pub fn NetDrawer(
                                     }
                                 }
                             />
+                            <span id="netRenameError" role="status">{move || trawl_core::saved_name::normalize(&name_buf.get()).err().unwrap_or("")}</span>
                         }
                     }
                 </Show>
@@ -220,7 +277,7 @@ pub fn NetDrawer(
                 >
                     "▶ Search"
                 </Btn>
-                {manual_run_allowed.then(|| view! {
+                {move || manual_run_allowed().then(|| view! {
                     <Btn
                         variant=Variant::Secondary
                         on_click=on_trigger_click
@@ -231,25 +288,13 @@ pub fn NetDrawer(
                 })}
             }.into_any())
         >
-            {move || {
-                if eff_tab.get() == "runs" {
-                    view! {
-                        <RunsPane
-                            net_id=net_for_runs.id
-                            bus=bus
-                            on_search=on_search
-                        />
-                    }.into_any()
-                } else {
-                    view! {
-                        <QuerySchedulePane
-                            net=net_for_query.clone()
-                            bus=bus
-                            on_refresh=on_refresh
-                        />
-                    }.into_any()
-                }
-            }}
+            {move || missing.get().then(|| view! { <p role="status">"This net no longer exists. Your draft is retained, but it cannot be saved." " " <a href="/jobs/nets">"Back to Nets"</a></p> })}
+            <div hidden=move || eff_tab.get() != "runs">
+                <RunsPane net_id=net_for_runs.id bus=bus on_search=on_search mutation=mutation/>
+            </div>
+            <div hidden=move || eff_tab.get() == "runs">
+                <QuerySchedulePane net=net_for_query saved=saved bus=bus on_refresh=on_refresh/>
+            </div>
         </Drawer>
     }
 }
@@ -261,10 +306,14 @@ pub fn NetDrawer(
 #[component]
 fn QuerySchedulePane(
     net: SavedQueryResponse,
+    saved: Signal<Option<SavedQueryResponse>>,
     bus: ToastBus,
     on_refresh: Callback<()>,
 ) -> impl IntoView {
+    let alive = StoredValue::new(true);
+    on_cleanup(move || alive.set_value(false));
     let net_id = net.id;
+    let missing = Signal::derive(move || saved.get().is_none());
 
     // -- query editing --
     let editing = RwSignal::new(false);
@@ -274,16 +323,25 @@ fn QuerySchedulePane(
 
     let do_save_query = {
         move || {
+            if missing.get_untracked() {
+                return;
+            }
             saving_query.set(true);
             let q = query_buf.get_untracked();
             spawn_local(async move {
                 match api::update_saved(net_id, &q).await {
                     Ok(_) => {
+                        if alive.try_get_value() != Some(true) {
+                            return;
+                        }
                         bus.push(ToastKind::Success, "Query updated", None);
                         editing.set(false);
                         on_refresh.run(());
                     }
                     Err(e) => {
+                        if alive.try_get_value() != Some(true) {
+                            return;
+                        }
                         bus.push(ToastKind::Error, "Update failed", Some(e.to_string()));
                     }
                 }
@@ -316,22 +374,80 @@ fn QuerySchedulePane(
     // one draft, so a look at query mode and back does not erase typing.
     let seed = WindowDraft::from_schedule(net.schedule.as_ref());
     let window_draft = RwSignal::new(seed.clone());
-    let saved_window = net.schedule.as_ref().and_then(|s| s.window.clone());
-    let saved_covered = net
-        .schedule
-        .as_ref()
-        .and_then(|s| s.covered_through.clone());
-    let saved_interval = net.schedule.as_ref().map(|s| s.interval.clone());
+    let saved_window =
+        Signal::derive(move || saved.get().and_then(|n| n.schedule).and_then(|s| s.window));
+    let saved_covered = Signal::derive(move || {
+        saved
+            .get()
+            .and_then(|n| n.schedule)
+            .and_then(|s| s.covered_through)
+    });
+    let saved_interval =
+        Signal::derive(move || saved.get().and_then(|n| n.schedule).map(|s| s.interval));
     // A local refusal is not a failed request, so it stays in the form
     // next to the Save button instead of flying past as a toast.
     let save_error: RwSignal<Option<String>> = RwSignal::new(None);
 
+    // Compare each field with the previous server seed. Remote updates only
+    // replace clean fields; edits in another field do not freeze this one.
+    let previous = StoredValue::new(net.clone());
+    Effect::new(move |_| {
+        let Some(current) = saved.get() else {
+            return;
+        };
+        let old = previous.get_value();
+        if query_buf.get_untracked() == old.query {
+            query_buf.set(current.query.clone());
+        }
+        let old_interval = old
+            .schedule
+            .as_ref()
+            .map_or_else(|| "1h".to_string(), |s| s.interval.clone());
+        let max = |n: &SavedQueryResponse| {
+            n.schedule
+                .as_ref()
+                .and_then(|s| s.max_runs)
+                .map_or_else(String::new, |n| n.to_string())
+        };
+        let old_window = WindowDraft::from_schedule(old.schedule.as_ref());
+        let schedule_dirty = interval_buf.get_untracked() != old_interval
+            || max_runs_buf.get_untracked() != max(&old)
+            || enabled_buf.get_untracked() != old.schedule.as_ref().is_none_or(|s| s.enabled)
+            || window_draft.get_untracked() != old_window;
+        if interval_buf.get_untracked() == old_interval {
+            interval_buf.set(
+                current
+                    .schedule
+                    .as_ref()
+                    .map_or_else(|| "1h".to_string(), |s| s.interval.clone()),
+            );
+        }
+        if max_runs_buf.get_untracked() == max(&old) {
+            max_runs_buf.set(max(&current));
+        }
+        if enabled_buf.get_untracked() == old.schedule.as_ref().is_none_or(|s| s.enabled) {
+            enabled_buf.set(current.schedule.as_ref().is_none_or(|s| s.enabled));
+        }
+        let new_window = WindowDraft::from_schedule(current.schedule.as_ref());
+        window_draft.update(|draft| draft.refresh_clean_from(&old_window, new_window));
+        if !schedule_dirty && old.schedule.is_some() != current.schedule.is_some() {
+            show_schedule_form.set(current.schedule.is_some());
+        }
+        previous.set_value(current);
+    });
+
     let do_save_schedule = {
         move || {
+            if missing.get_untracked() {
+                return;
+            }
             save_error.set(None);
             let max_runs = match validate_max_runs(&max_runs_buf.get_untracked()) {
                 Ok(max_runs) => max_runs,
                 Err(e) => {
+                    if alive.try_get_value() != Some(true) {
+                        return;
+                    }
                     save_error.set(Some(e.to_string()));
                     return;
                 }
@@ -339,6 +455,9 @@ fn QuerySchedulePane(
             let (window, lag) = match window_draft.get_untracked().to_request() {
                 Ok(pair) => pair,
                 Err(e) => {
+                    if alive.try_get_value() != Some(true) {
+                        return;
+                    }
                     save_error.set(Some(e.to_string()));
                     return;
                 }
@@ -358,10 +477,16 @@ fn QuerySchedulePane(
                 .await
                 {
                     Ok(_) => {
+                        if alive.try_get_value() != Some(true) {
+                            return;
+                        }
                         bus.push(ToastKind::Success, "Schedule saved", None);
                         on_refresh.run(());
                     }
                     Err(e) => {
+                        if alive.try_get_value() != Some(true) {
+                            return;
+                        }
                         // The draft survives a refusal: the operator's
                         // next move is to fix what the server named.
                         save_error.set(Some(e.to_string()));
@@ -374,14 +499,23 @@ fn QuerySchedulePane(
 
     let do_delete_schedule = {
         move || {
+            if missing.get_untracked() {
+                return;
+            }
             spawn_local(async move {
                 match api::delete_schedule(net_id).await {
                     Ok(_) => {
+                        if alive.try_get_value() != Some(true) {
+                            return;
+                        }
                         bus.push(ToastKind::Success, "Schedule removed", None);
                         show_schedule_form.set(false);
                         on_refresh.run(());
                     }
                     Err(e) => {
+                        if alive.try_get_value() != Some(true) {
+                            return;
+                        }
                         bus.push(ToastKind::Error, "Remove failed", Some(e.to_string()));
                     }
                 }
@@ -406,8 +540,8 @@ fn QuerySchedulePane(
                 <Show
                     when=move || editing.get()
                     fallback={
-                        let q = original_query.clone();
-                        move || view! { <pre class="preview mono">{q.clone()}</pre> }
+                        let q = saved.get_untracked().map_or_else(|| original_query.clone(), |n| n.query);
+                        move || { let q = q.clone(); view! { <pre class="preview mono">{move || saved.get().map_or_else(|| q.clone(), |n| n.query)}</pre> } }
                     }
                 >
                     <textarea
@@ -422,14 +556,14 @@ fn QuerySchedulePane(
                         <Btn
                             variant=Variant::Primary
                             size=Size::Xs
-                            disabled=saving_query
+                            disabled=Signal::derive(move || saving_query.get() || missing.get())
                             on_click=Callback::new(move |()| do_save_query())
                         >{move || if saving_query.get() { "Saving…" } else { "Save" }}</Btn>
                         <Btn variant=Variant::Secondary size=Size::Xs on_click={
                             let reset_q = original_query.clone();
                             Callback::new(move |()| {
                                 editing.set(false);
-                                query_buf.set(reset_q.clone());
+                                query_buf.set(saved.get_untracked().map_or_else(|| reset_q.clone(), |n| n.query));
                             })
                         }>"Cancel"</Btn>
                     </div>
@@ -574,11 +708,11 @@ fn QuerySchedulePane(
                         // costs it: dropping a window is not an edit the
                         // schedule can undo by itself.
                         {
-                            let had_window = saved_window.is_some();
-                            let saved_covered = saved_covered.clone();
+                            let had_window = move || saved_window.get().is_some();
+
                             move || {
-                                (had_window && window_draft.get().mode == WindowMode::Query).then(|| {
-                                    let coverage = saved_covered.clone().map(|t| format!(
+                                (had_window() && window_draft.get().mode == WindowMode::Query).then(|| {
+                                    let coverage = saved_covered.get().map(|t| format!(
                                         " Coverage stops at {t}; switching back resumes from there, within the server's catch-up limit."
                                     ));
                                     view! {
@@ -595,9 +729,8 @@ fn QuerySchedulePane(
                         // run due already, which surprises an operator
                         // who expected to wait for the next tick.
                         {
-                            let seed = seed.clone();
-                            let saved_interval = saved_interval.clone();
                             move || {
+                                let seed = WindowDraft::from_schedule(saved.get().as_ref().and_then(|n| n.schedule.as_ref()));
                                 let draft = window_draft.get();
                                 // Only request-effective fields count: the span
                                 // rides on the PUT in fixed mode alone, and
@@ -605,7 +738,7 @@ fn QuerySchedulePane(
                                 let moved = draft.mode != seed.mode
                                     || (draft.mode == WindowMode::Fixed
                                         && draft.span.trim() != seed.span.trim())
-                                    || saved_interval.as_ref().is_some_and(|i| *i != interval_buf.get());
+                                    || saved_interval.get().as_ref().is_some_and(|i| *i != interval_buf.get());
                                 moved.then(|| view! {
                                     <p style="color:var(--ink-3); font-size:11px; margin:0">
                                         "Changing the window or interval may run the schedule immediately."
@@ -618,10 +751,10 @@ fn QuerySchedulePane(
                             <Btn
                                 variant=Variant::Primary
                                 size=Size::Xs
-                                disabled=saving_schedule
+                                disabled=Signal::derive(move || saving_schedule.get() || missing.get())
                                 on_click=Callback::new(move |()| do_save_schedule())
                             >{move || if saving_schedule.get() { "Saving…" } else { "Save schedule" }}</Btn>
-                            {has_schedule.then(|| {
+                            {move || saved.get().is_some_and(|n| n.schedule.is_some()).then(|| {
                                 view! {
                                     <Btn
                                         variant=Variant::Secondary
@@ -706,13 +839,20 @@ fn DurationChips(
 // ---------------------------------------------------------------------------
 
 #[component]
-fn RunsPane(net_id: i64, bus: ToastBus, on_search: Callback<String>) -> impl IntoView {
+fn RunsPane(
+    net_id: i64,
+    bus: ToastBus,
+    on_search: Callback<String>,
+    mutation: RwSignal<u64>,
+) -> impl IntoView {
     let table_viewport = NodeRef::<leptos::html::Div>::new();
     let page = RwSignal::new(0usize);
     let expanded_run: RwSignal<Option<i64>> = RwSignal::new(None);
+    let expanded_summary = RwSignal::new(None::<trawl_api::ReportRunSummary>);
 
     let pending = RwSignal::new(false);
-    let runs = LocalResource::new(move || {
+    let (runs, refresh_error, retry) = super::job_refresh::job_refresh(move || {
+        mutation.track();
         let p = page.get();
         async move {
             let offset = PageWindow::checked_offset(p, RUNS_PAGE_SIZE)
@@ -724,119 +864,85 @@ fn RunsPane(net_id: i64, bus: ToastBus, on_search: Callback<String>) -> impl Int
         }
     });
 
-    #[allow(clippy::cast_possible_truncation)]
-    let now_ms = move || js_sys::Date::now() as i64;
-
+    let now = fleet_ui::time::clock::now_ms();
+    let window = Signal::derive(move || {
+        let (fetched, returned, total) = runs
+            .get()
+            .and_then(Result::ok)
+            .map_or((0, 0, 0), |(p, r)| (p, r.runs.len(), r.total));
+        PageWindow::new(
+            fetched,
+            RUNS_PAGE_SIZE,
+            returned,
+            PageTotal::Known(total),
+            pending.get() || page.get() != fetched,
+        )
+        .expect("checked runs page")
+    });
     view! {
         <div>
-            {move || {
-                let data = runs.get()
-                    .and_then(Result::ok)
-                    .map(|(_, resp)| {
-                        resp.runs.iter()
-                            .rev()
-                            .map(|r| r.row_count.unwrap_or(0) as u64)
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                if data.len() >= 2 {
-                    view! {
-                        <div style="padding:8px 12px; display:flex; align-items:center; gap:8px">
-                            <span style="font-size:11px; color:var(--ink-3)">"Row count trend"</span>
-                            <Sparkline data=data color="var(--blue)".to_string() w=180 h=28/>
-                        </div>
-                    }.into_any()
-                } else {
-                    view! { <div></div> }.into_any()
-                }
+            {move || refresh_error.get().map(|e| view! { <p role="status">{e}</p> })}
+            {move || match runs.get() {
+                None => Some(view! { <p role="status">"Loading runs…"</p> }.into_any()),
+                Some(Err(_)) => Some(view! { <p role="alert">"Could not load runs." <button on:click=move |_| retry.run(())>"Retry"</button></p> }.into_any()),
+                Some(Ok(_)) => None,
             }}
-
-            <Loaded
-                state=Signal::derive(move || LoadState::from_resource(runs.get()))
-                label="runs"
-                retry=Callback::new(move |()| { runs.set(None); runs.refetch(); })
-                render=Box::new(move |(fetched_page, resp): (usize, trawl_api::ListReportRunsResponse)| {
-                        let now = now_ms();
-                        let returned = resp.runs.len();
-                        let total = resp.total;
-                        let window = Signal::derive(move || PageWindow::new(
-                            fetched_page, RUNS_PAGE_SIZE, returned, PageTotal::Known(total),
-                            pending.get() || page.get() != fetched_page,
-                        ).expect("runs page comes from checked pager navigation"));
-
-                        let rows = resp.runs.iter().map(|run| {
-                            let run_id = run.id;
-                            let when = time_ago(&run.started_at, now);
-                            let dur = run.duration_ms.map_or_else(|| "—".to_string(), format_duration);
-                            let row_ct = run.row_count.map_or_else(|| "—".to_string(), |n| n.to_string());
-                            let status = run.status.clone();
-                            let tone = super::run_status_tone(&status);
-                            let err_msg = run.error_message.clone().unwrap_or_default();
-                            let is_expanded = move || expanded_run.get() == Some(run_id);
-
-                            view! {
-                                <tr class="tbl-row">
-                                    <td class="mono">
-                                        // The row's one control (ADR-0029),
-                                        // stretched over the row: a pointer
-                                        // anywhere on it toggles the run's
-                                        // result preview exactly once.
-                                        <button
-                                            type="button"
-                                            class="row-stretch"
-                                            aria-expanded=move || is_expanded().to_string()
-                                            on:click=move |_| {
-                                                expanded_run.update(|v| {
-                                                    *v = if *v == Some(run_id) { None } else { Some(run_id) };
-                                                });
-                                            }
-                                        >{when}</button>
-                                    </td>
-                                    <td>
-                                        <StatusDot tone=tone/>
-                                        " "
-                                        <span style="font-size:11px">{status}</span>
-                                    </td>
-                                    <td class="mono">{dur}</td>
-                                    <td style="text-align:right" class="mono">{row_ct}</td>
-                                    <td style="min-width:0; color:var(--red); font-size:11px" class="path">{err_msg}</td>
-                                </tr>
-                                <Show when=is_expanded>
-                                    <tr><td colspan="5"><RunResultPreview
-                                        net_id=net_id
-                                        run_id=run_id
-                                        bus=bus
-                                        on_search=on_search
-                                    /></td></tr>
-                                </Show>
-                            }
-                        }).collect_view();
-
-                        view! {
-                            <fleet_ui::OverflowHint viewport=table_viewport/>
-                            <div node_ref=table_viewport class="tbl fleet-table-frame tbl-scroll" role="region" aria-label="Net runs" tabindex="0" style="--list-min-width:480px">
-                                <table class="fleet-table run-preview-table" aria-label="Net runs"><thead><tr>
-                                    <th scope="col" style="width:100px">"When"</th>
-                                    <th scope="col" style="width:90px">"Status"</th>
-                                    <th scope="col" style="width:80px">"Duration"</th>
-                                    <th scope="col" style="width:70px; text-align:right">"Rows"</th>
-                                    <th scope="col">"Error"</th>
-                                </tr></thead><tbody>
-                                    {rows}
-                                </tbody></table>
-                                {if returned == 0 { Some(view! {
-                                    <div class="tbl-empty">{if total == 0 && fetched_page == 0 {
-                                            "No runs yet — attach a schedule to start."
-                                        } else { "No runs on this page" }}</div>
-                                }) } else { None }}
-                                <OffsetPager
-                                    window=window
-                                    on_page=Callback::new(move |p| page.set(p))
-                                />
-                            </div>
-                        }.into_any()
+            {move || {
+                let data = runs.get().and_then(Result::ok).map(|(_, r)| r.runs.iter().rev()
+                    .map(|r| r.row_count.unwrap_or(0) as u64).collect::<Vec<_>>()).unwrap_or_default();
+                (data.len() >= 2).then(|| view! {
+                    <div style="padding:8px 12px; display:flex; align-items:center; gap:8px">
+                        <span style="font-size:11px; color:var(--ink-3)">"Row count trend"</span>
+                        <Sparkline data=data color="var(--blue)".to_string() w=180 h=28/>
+                    </div>
                 })
-            />
+            }}
+            <fleet_ui::OverflowHint viewport=table_viewport/>
+            <div node_ref=table_viewport class="tbl fleet-table-frame tbl-scroll" role="region" aria-label="Net runs" tabindex="0" style="--list-min-width:480px">
+                <table class="fleet-table run-preview-table" aria-label="Net runs"><thead><tr>
+                    <th scope="col">"When"</th><th scope="col">"Status"</th><th scope="col">"Duration"</th>
+                    <th scope="col">"Rows"</th><th scope="col">"Error"</th>
+                </tr></thead><tbody>
+                    <For each=move || {
+                        let mut rows = runs.get().and_then(Result::ok).map(|(_, r)| r.runs).unwrap_or_default();
+                        if let Some(expanded) = expanded_summary.get()
+                            && expanded_run.get() == Some(expanded.id)
+                            && !rows.iter().any(|r| r.id == expanded.id) {
+                            rows.push(expanded);
+                        }
+                        rows
+                    }
+                        key=|run| run.id children=move |initial| {
+                        let run_id = initial.id;
+                        let run = Signal::derive(move || runs.get().and_then(Result::ok)
+                            .and_then(|(_, r)| r.runs.into_iter().find(|r| r.id == run_id)).or_else(|| expanded_summary.get().filter(|r| r.id == run_id)).unwrap_or_else(|| initial.clone()));
+                        let is_expanded = move || expanded_run.get() == Some(run_id);
+                        view! {
+                            <tr class="tbl-row">
+                                <td class="mono"><button type="button" class="row-stretch"
+                                    aria-expanded=move || is_expanded().to_string()
+                                    on:click=move |_| {
+                                        expanded_summary.set(Some(run.get_untracked()));
+                                        expanded_run.update(|v| *v = if *v == Some(run_id) { None } else { Some(run_id) });
+                                    }
+                                >{move || time_ago(&run.get().started_at, now.get())}</button>
+                                    {move || (is_expanded() && runs.get().and_then(Result::ok).is_some_and(|(_, r)| !r.runs.iter().any(|r| r.id == run_id)))
+                                        .then_some("Expanded run outside this page")}
+                                </td>
+                                <td>{move || view! { <StatusDot tone=super::run_status_tone(&run.get().status)/>{run.get().status} }}</td>
+                                <td class="mono">{move || run.get().duration_ms.map_or_else(|| "—".to_string(), format_duration)}</td>
+                                <td class="mono">{move || run.get().row_count.map_or_else(|| "—".to_string(), |n| n.to_string())}</td>
+                                <td class="path">{move || run.get().error_message.unwrap_or_default()}</td>
+                            </tr>
+                            <Show when=is_expanded><tr><td colspan="5"><RunResultPreview net_id=net_id run_id=run_id bus=bus on_search=on_search summary=expanded_summary/></td></tr></Show>
+                        }
+                    }/>
+                </tbody></table>
+                {move || runs.get().and_then(Result::ok).and_then(|(p, r)| r.runs.is_empty().then(|| view! {
+                    <div class="tbl-empty">{if p == 0 && r.total == 0 { "No runs yet — attach a schedule to start." } else { "No runs on this page" }}</div>
+                }))}
+                <OffsetPager window=window on_page=Callback::new(move |p| page.set(p))/>
+            </div>
         </div>
     }
 }
@@ -848,19 +954,28 @@ fn RunsPane(net_id: i64, bus: ToastBus, on_search: Callback<String>) -> impl Int
 #[component]
 #[allow(unused_variables)]
 fn RunResultPreview(
+    summary: RwSignal<Option<trawl_api::ReportRunSummary>>,
     net_id: i64,
     run_id: i64,
     bus: ToastBus,
     on_search: Callback<String>,
 ) -> impl IntoView {
-    let result = LocalResource::new(move || async move { api::get_run(net_id, run_id).await });
+    let (result, refresh_error, retry) =
+        super::job_refresh::job_refresh(move || async move { api::get_run(net_id, run_id).await });
+    let preview_page = RwSignal::new(0usize);
+    Effect::new(move |_| {
+        if let Some(Ok(response)) = result.get() {
+            summary.set(Some(response.summary));
+        }
+    });
 
     view! {
         <div class="run-preview">
+            {move || refresh_error.get().map(|e| view! { <p role="status">{e}</p> })}
             <Loaded
                 state=Signal::derive(move || LoadState::from_resource(result.get()))
                 label="result"
-                retry=Callback::new(move |()| { result.set(None); result.refetch(); })
+                retry=Callback::new(move |()| { retry.run(()); })
                 render=Box::new(move |resp: trawl_api::ReportRunResponse| {
                     match resp.result {
                         None => view! {
@@ -870,7 +985,7 @@ fn RunResultPreview(
                             let query = resp.summary.query.clone();
                             let row_count = resp.summary.row_count;
                             view! {
-                                <ResultPreviewTable result=qr row_count=row_count/>
+                                <ResultPreviewTable result=qr row_count=row_count page=preview_page/>
                                 <Btn
                                     variant=Variant::Secondary
                                     size=Size::Xs
@@ -887,7 +1002,11 @@ fn RunResultPreview(
 }
 
 #[component]
-fn ResultPreviewTable(result: QueryResult, row_count: Option<usize>) -> impl IntoView {
+fn ResultPreviewTable(
+    result: QueryResult,
+    row_count: Option<usize>,
+    page: RwSignal<usize>,
+) -> impl IntoView {
     let cols = result.columns.clone();
     let rows: Vec<Vec<String>> = result
         .rows
@@ -897,7 +1016,6 @@ fn ResultPreviewTable(result: QueryResult, row_count: Option<usize>) -> impl Int
     let total = rows.len();
     // Local to this expansion, so collapsing a run and opening it again
     // starts at page 1 rather than on a page the operator left behind.
-    let page = RwSignal::new(0usize);
     let cap = preview_cap(row_count, total);
 
     let window = Signal::derive(move || {
