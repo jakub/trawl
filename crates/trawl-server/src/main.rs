@@ -178,12 +178,15 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
         })?,
     );
 
-    let telemetry = init_tracing(
+    let Tracing {
+        telemetry,
+        file_log,
+    } = init_tracing(
         &config,
         monitor_active,
         &log_filter.directives,
         Arc::clone(&derivation),
-    )?;
+    );
     if let Some(warning) = &log_filter.warning {
         tracing::warn!(event_type = "config_warning", "{warning}");
     }
@@ -264,6 +267,9 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
         &config.wal_dir(),
         config.ingest.enabled,
     )?;
+    if let Some(file_log) = file_log {
+        file_log.open()?;
+    }
     tracing::info!(
         event_type = "epoch_gate",
         outcome = ?epoch_outcome,
@@ -719,6 +725,45 @@ fn warn_retention_envs_without_dir(config: &Config, on_disk: &[String]) {
     }
 }
 
+type JsonLogLayer = fmt::Layer<
+    tracing_subscriber::Registry,
+    fmt::format::JsonFields,
+    fmt::format::Format<fmt::format::Json>,
+    fmt::writer::BoxMakeWriter,
+>;
+
+struct FileLog {
+    path: PathBuf,
+    writer: tracing_subscriber::reload::Handle<JsonLogLayer, tracing_subscriber::Registry>,
+}
+
+impl FileLog {
+    /// Open only after database and storage admission. Until then, this
+    /// layer sends JSON events to stderr without touching the configured path.
+    fn open(self) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(parent) = self
+            .path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        self.writer.modify(|layer| {
+            *layer.writer_mut() = fmt::writer::BoxMakeWriter::new(file);
+        })?;
+        Ok(())
+    }
+}
+
+struct Tracing {
+    telemetry: Option<(WalHandle, WalLayer)>,
+    file_log: Option<FileLog>,
+}
+
 /// Initialize the tracing subscriber.
 ///
 /// When internal telemetry is enabled, registers a [`WalLayer`] in place of
@@ -727,7 +772,8 @@ fn warn_retention_envs_without_dir(config: &Config, on_disk: &[String]) {
 /// the flush task.
 ///
 /// When telemetry is disabled and `log_file` is configured, falls back
-/// to the JSON file layer.
+/// to a JSON layer that writes to stderr until the caller opens the file
+/// after storage admission.
 ///
 /// When `monitor_active` is true, the stdout `fmt::layer()` is omitted
 /// to avoid corrupting the TUI with interleaved log output.
@@ -736,7 +782,7 @@ fn init_tracing(
     monitor_active: bool,
     filter_directives: &str,
     derivation: Arc<trawl_server::ingest::producer::Derivation>,
-) -> Result<Option<(WalHandle, WalLayer)>, Box<dyn std::error::Error>> {
+) -> Tracing {
     // The directives were resolved (and validated when operator-supplied) by
     // `telemetry::resolve_log_filter`; each layer builds its own EnvFilter
     // from the same string. The WAL layer builds a narrower one
@@ -770,47 +816,45 @@ fn init_tracing(
                 .with(wal_layer.with_filter(telemetry::wal_filter(filter_directives)))
                 .init();
         }
-        Ok(Some((handle, flush_layer)))
+        Tracing {
+            telemetry: Some((handle, flush_layer)),
+            file_log: None,
+        }
     } else if let Some(log_path) = &config.server.log_file {
-        if let Some(parent) = log_path.parent() {
-            std::fs::create_dir_all(parent)?;
+        // Logging must not create occupancy in a fresh root or alter refused
+        // storage. Retain startup diagnostics on stderr until admission succeeds.
+        let file_layer = fmt::layer()
+            .json()
+            .with_ansi(false)
+            .with_writer(fmt::writer::BoxMakeWriter::new(std::io::stderr));
+        let (file_layer, writer) = tracing_subscriber::reload::Layer::new(file_layer);
+        let stdout_layer = (!monitor_active).then(|| fmt::layer().with_filter(make_filter()));
+        tracing_subscriber::registry()
+            .with(file_layer.with_filter(make_filter()))
+            .with(stdout_layer)
+            .init();
+        Tracing {
+            telemetry: None,
+            file_log: Some(FileLog {
+                path: log_path.clone(),
+                writer,
+            }),
         }
-        let open_file = || -> Result<std::fs::File, Box<dyn std::error::Error>> {
-            Ok(std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(log_path)?)
-        };
-
-        if monitor_active {
-            let file_layer = fmt::layer()
-                .json()
-                .with_ansi(false)
-                .with_writer(open_file()?)
-                .with_filter(make_filter());
-            tracing_subscriber::registry().with(file_layer).init();
-        } else {
-            let stdout_layer = fmt::layer().with_filter(make_filter());
-            let file_layer = fmt::layer()
-                .json()
-                .with_ansi(false)
-                .with_writer(open_file()?)
-                .with_filter(make_filter());
-            tracing_subscriber::registry()
-                .with(stdout_layer)
-                .with(file_layer)
-                .init();
-        }
-        Ok(None)
     } else if monitor_active {
         // Monitor active, no telemetry, no file — still need a subscriber
         // but skip stdout to avoid TUI corruption.
         tracing_subscriber::registry().init();
-        Ok(None)
+        Tracing {
+            telemetry: None,
+            file_log: None,
+        }
     } else {
         let stdout_layer = fmt::layer().with_filter(make_filter());
         tracing_subscriber::registry().with(stdout_layer).init();
-        Ok(None)
+        Tracing {
+            telemetry: None,
+            file_log: None,
+        }
     }
 }
 

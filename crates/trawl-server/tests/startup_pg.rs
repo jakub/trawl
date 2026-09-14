@@ -24,6 +24,7 @@ struct Fixture {
     fleet: PgPool,
     app: PgPool,
     internal_telemetry: bool,
+    log_file: Option<PathBuf>,
 }
 
 impl Fixture {
@@ -42,6 +43,7 @@ impl Fixture {
             fleet,
             app,
             internal_telemetry: false,
+            log_file: None,
         }
     }
 
@@ -150,7 +152,7 @@ impl Fixture {
         let (cert, key) = common::ensure_test_cert();
         let config = format!(
             "[server]\nhttp_addr = '127.0.0.1:0'\nshutdown_drain_secs = 1\n\
-             tls_cert_path = {}\ntls_key_path = {}\n\
+             tls_cert_path = {}\ntls_key_path = {}\n{log_file}\n\
              [data]\npath = {}\n[auth]\ndatabase_url = {}\naudit_interval_secs = 0\n\
              [storage]\ndatabase_url = {}\n\
              [ingest]\nenabled = true\ninternal_telemetry = {telemetry}\nwal_dir = {}\n\
@@ -164,6 +166,9 @@ impl Fixture {
             quote(&self.app_url),
             quote(&self.storage_root().join("wal").to_string_lossy()),
             telemetry = self.internal_telemetry,
+            log_file = self.log_file.as_ref().map_or_else(String::new, |path| {
+                format!("log_file = {}", quote(&path.to_string_lossy()))
+            }),
         );
         let path = self.root.path().join("trawld.toml");
         std::fs::write(&path, config).unwrap();
@@ -363,7 +368,8 @@ async fn rows(pool: &PgPool) -> BTreeMap<String, Vec<String>> {
 }
 
 async fn refusal(owner: &str, legacy: bool) {
-    let fixture = Fixture::new().await;
+    let mut fixture = Fixture::new().await;
+    fixture.log_file = Some(fixture.data().join("logs/server.json"));
     if owner == "fleet" {
         fixture.current_app().await;
     } else {
@@ -438,7 +444,8 @@ async fn untracked_trawl_refuses_before_cutover() {
 
 #[tokio::test]
 async fn database_refusal_does_not_initialize_fresh_root() {
-    let fixture = Fixture::new().await;
+    let mut fixture = Fixture::new().await;
+    fixture.log_file = Some(fixture.data().join("logs/server.json"));
     fixture.current_fleet().await;
     fixture.old("trawl").await;
     fixture
@@ -454,7 +461,8 @@ async fn database_refusal_does_not_initialize_fresh_root() {
 
 #[tokio::test]
 async fn epoch_refusal_preserves_storage_and_releases_admitted_lock() {
-    let fixture = Fixture::new().await;
+    let mut fixture = Fixture::new().await;
+    fixture.log_file = Some(fixture.data().join("logs/server.json"));
     fixture.current_fleet().await;
     fixture.current_app().await;
     fixture.cutover(1);
@@ -467,7 +475,8 @@ async fn epoch_refusal_preserves_storage_and_releases_admitted_lock() {
 
 #[tokio::test]
 async fn competing_writer_refuses_before_filesystem_recovery() {
-    let fixture = Fixture::new().await;
+    let mut fixture = Fixture::new().await;
+    fixture.log_file = Some(fixture.data().join("logs/server.json"));
     fixture.current_fleet().await;
     fixture.current_app().await;
     fixture.current_cutover().await;
@@ -491,6 +500,7 @@ async fn competing_writer_refuses_before_filesystem_recovery() {
 async fn admitted_lock_and_fatal_watcher_cover_store_reconciliation() {
     let mut fixture = Fixture::new().await;
     fixture.internal_telemetry = true;
+    fixture.log_file = Some(fixture.data().join("logs/server.json"));
     fixture.current_fleet().await;
     fixture.current_app().await;
     fixture.current_cutover().await;
@@ -564,6 +574,26 @@ async fn admitted_lock_and_fatal_watcher_cover_store_reconciliation() {
     replacement.ready().await;
     replacement.stop().await;
     fixture.assert_lock_free().await;
+    assert!(!fixture.log_file.as_ref().unwrap().exists());
+}
+
+#[tokio::test]
+async fn log_inside_fresh_data_root_starts_and_restarts() {
+    let mut fixture = Fixture::new().await;
+    fixture.log_file = Some(fixture.data().join("logs/server.json"));
+    fixture.current_fleet().await;
+    for _ in 0..2 {
+        let mut daemon = fixture.spawn();
+        daemon.ready().await;
+        daemon.stop().await;
+        fixture.assert_lock_free().await;
+        assert_eq!(std::fs::read(fixture.data().join("EPOCH")).unwrap(), b"3\n");
+        let log = std::fs::read_to_string(fixture.log_file.as_ref().unwrap()).unwrap();
+        assert!(log.contains("HTTPS server listening"), "{log}");
+        for line in log.lines() {
+            serde_json::from_str::<serde_json::Value>(line).unwrap();
+        }
+    }
 }
 
 #[tokio::test]

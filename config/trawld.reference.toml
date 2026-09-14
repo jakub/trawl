@@ -43,6 +43,8 @@
 # JSON log file, opened when ingest or internal_telemetry is disabled.
 # When both are enabled, server events use the ingest pipeline instead and
 # this path is not opened. Stdout remains active unless the TUI monitor owns it.
+# File logging starts after database and storage admission. Earlier JSON events
+# go to stderr, so a refused startup does not create files in the data root.
 # log_file = "/var/log/trawld.log"
 
 # ndjson query debug log (one entry per query execution). SENSITIVE:
