@@ -89,8 +89,9 @@ together.
 ## Build from source
 
 Use the pinned Rust toolchain, a native C toolchain, Python 3.11 or newer,
-and curl. Linux distribution builds also require [Zig](https://ziglang.org/download/)
+and curl. Linux amd64 builds also require [Zig](https://ziglang.org/download/)
 and [cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild).
+Linux arm64 builds use the native GNU compiler and linker.
 The Linux server's browser build requires Trunk and the Rust
 `wasm32-unknown-unknown` target.
 
@@ -101,7 +102,10 @@ shared runtime, with a development library cached under `target/duckdb-download`
 Use the build helper below to stage relocatable distributions with their library.
 UTC and IANA timezone behavior remain enabled.
 
-On Linux, build the server, browser, and CLI:
+On Linux, build the server, browser, and CLI for the current host. An arm64
+build uses that host's system libraries. To build arm64 artifacts for the
+supported Debian 12 baseline, use the container procedure in the
+[distribution helpers](https://github.com/jakub/trawl/blob/main/scripts/release/README.md).
 
 ```bash
 git clone https://github.com/jakub/trawl.git
