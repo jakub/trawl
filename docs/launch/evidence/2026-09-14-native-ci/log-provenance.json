@@ -48,5 +48,20 @@
     "input_sha256": "4a23ec10a46588f78c5b3b612f8cc1d77d6bb4893e766cb6f7073abaaff70aac",
     "stored_sha256": "32b29c2f25ec5eb48a3a446a2d6b5393c6217749c275e403e73c953134417e2a",
     "input_name": "docs-arm-prerequisites.log"
+  },
+  {
+    "file": "docs-npm-ci.txt",
+    "input_sha256": "71691df7f94975fe349bf4d2a7eb9605212055b382542b9091150025e9a08098",
+    "stored_sha256": "71691df7f94975fe349bf4d2a7eb9605212055b382542b9091150025e9a08098"
+  },
+  {
+    "file": "docs-npm-audit.json",
+    "input_sha256": "3e0e1da746405ad5fe48cbbf9ef831d1e83c06e2b13c0f0357fab0fe116a3898",
+    "stored_sha256": "3e0e1da746405ad5fe48cbbf9ef831d1e83c06e2b13c0f0357fab0fe116a3898"
+  },
+  {
+    "file": "docs-dependency-check.txt",
+    "input_sha256": "64e2cfd45d9875568b6dd77adfe28d3635aa8f52e043d7121d82a2fed5c55423",
+    "stored_sha256": "b093b3bf24ebe90879c0f6bea1a726d9ce7de85a01e6c35f83151d79eb9e733e"
   }
 ]

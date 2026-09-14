@@ -71,14 +71,30 @@ this source review did not execute the builds or native verification jobs.
 
 ## Companion consumer and remaining gates
 
-Coastwatch `dac5c096177b149e6a1f677bd1a21e7a2f78d008` still pins Trawl's
+Coastwatch `4b4afbafe3dbbe75d176e2ec3954fa14f9b5583b` still pins Trawl's
 shared application source `335a34dfbcf844dae5cfb91d0bea923fffabacb8`.
 Its later fixes update two patch dependencies and give CI a fresh per-job
 Fleet PostgreSQL service. All 64 Coastwatch application migrations remain
 unchanged. The normal push hook passed 2,754 tests with zero skipped after
-the dependency update; remote tests and dependency checks passed at the final
-consumer head. Its Wasm verification remains unresolved after self-hosted
-runners lost contact during compilation. The PR records subsequent retries.
+the dependency update; remote tests and dependency checks passed at consumer `dac5c096`. Live
+Kubernetes evidence later confirmed that the Wasm runner was OOMKilled at its
+2 GiB memory limit. `4b4afbaf` selects the existing `coastwatch-big` runner
+for this job. Its fresh CI run is pending; no cluster setting changed.
+`coastwatch-wasm-oom.json` retains the bounded termination evidence.
+
+## Documentation dependency follow-up
+
+GitHub reported seven open advisories affecting five dependencies in the
+documentation lockfile. `4037d9a3` updates that lockfile within the existing
+manifest ranges: Astro 7.1.1 to 7.2.8, Sharp 0.35.3 to 0.35.4, smol-toml
+1.7.0 to 1.8.0, js-yaml 4.3.1 to 4.3.2, and SVGO 4.0.2 to 4.1.0, together
+with the required dependency graph changes. No override, advisory suppression,
+or manifest dependency range changed. The author verified fixed versions
+against the official npm registry. Root independently ran `npm ci`,
+`npm audit`, and the development documentation check after integration.
+The audit reports zero vulnerabilities; all 38 pages, 2,947 local links,
+26 TOML blocks, and 18 DSL stages pass. Complete logs are retained here.
+GitHub's default-branch alerts remain separate from this unmerged lockfile.
 
 Required cross-family review remains unavailable after the verified account
 quota failures in the readiness ledger. Native review is supplementary.
