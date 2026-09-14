@@ -20,6 +20,7 @@ use leptos_use::use_media_query;
 use trawl_api::value::QueryResult;
 
 use crate::facets::compute_facets;
+use crate::result_actions::Capabilities;
 use crate::state::query::{Filter, FilterOp};
 
 #[component]
@@ -41,14 +42,14 @@ pub fn FacetSidebar(
     /// clearing filters navigates.
     #[prop(into)]
     suppressed: Signal<bool>,
-    /// True when the active result is aggregation-shaped. The rail then
-    /// computes no groups and offers no value search: `compute_facets`
-    /// keys integer cells, so an aggregation page facets its own
-    /// aggregate column and the include control would build a search
-    /// clause naming a field no event carries (`facets::is_aggregation_shape`).
-    /// The header and "Clear all" stay, so URL filters remain removable.
+    /// Hide row-derived controls for a pending response, an aggregation,
+    /// or an unknown source. URL filter count and Clear all remain usable.
     #[prop(into)]
-    aggregate_shape: Signal<bool>,
+    rows_suppressed: Signal<bool>,
+    /// Provenance of the query that produced the displayed rows. A let or
+    /// rename can change one field while leaving other facets usable.
+    #[prop(into)]
+    capabilities: Signal<Capabilities>,
     /// Called when the user clicks `+` or `⊘` on a facet value.
     on_add: Callback<Filter>,
     /// Called when the user clicks "clear all" in the header.
@@ -109,14 +110,14 @@ pub fn FacetSidebar(
             </div>
             // Both gates hide the value search with the groups: it
             // filters names that are not being computed.
-            <Show when=move || !suppressed.get() && !aggregate_shape.get()>
+            <Show when=move || !suppressed.get() && !rows_suppressed.get()>
                 <SearchInput value=needle placeholder="Filter field values"/>
             </Show>
             // Suppression is total: an unreadable link has no active
             // source, so the rail shows its header and nothing else —
             // not even the loading hint the state would otherwise
             // render (ADR-0027).
-            <Show when=move || !suppressed.get() && !aggregate_shape.get()>
+            <Show when=move || !suppressed.get() && !rows_suppressed.get()>
             <Loaded
                 state=state
                 // Deliberate quiet-error override: the results table
@@ -124,7 +125,9 @@ pub fn FacetSidebar(
                 // the facet rail is noise.
                 error=Box::new(|_| view! { <p class="facets-hint">"—"</p> }.into_any())
                 render=Box::new(move |result: QueryResult| {
-                    let facets = compute_facets(&result);
+                    let provenance = capabilities.get();
+                    let facets: Vec<_> = compute_facets(&result).into_iter()
+                        .filter(|(field, _)| provenance.input_field(field)).collect();
                     if facets.is_empty() {
                         return ().into_any();
                     }

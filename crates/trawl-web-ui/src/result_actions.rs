@@ -91,11 +91,19 @@ impl Capabilities {
         }
         out
     }
-    pub fn include(&self, field: &str, value: &Value) -> bool {
+    /// Whether this output field still names an unchanged input field.
+    pub fn input_field(&self, field: &str) -> bool {
         !self.unknown
             && !self.changed.contains(field)
             && self.groups.as_ref().is_none_or(|g| g.contains(field))
-            && !matches!(value, Value::Null | Value::Array(_))
+    }
+    pub fn include(&self, field: &str, value: &Value) -> bool {
+        self.input_field(field) && !matches!(value, Value::Null | Value::Array(_))
+    }
+    /// Facets summarize original fields of raw rows. Aggregations and
+    /// unknown sources do not offer facet groups, even for grouping keys.
+    pub fn raw_facets(&self) -> bool {
+        self.raw && !self.unknown
     }
     pub fn raw_actions(&self) -> bool {
         self.raw && !self.unknown && self.changed.is_empty()
@@ -158,6 +166,34 @@ fn int_float(i: i64, f: f64) -> Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn raw_mutations_keep_only_unchanged_field_facets() {
+        for (query, changed) in [
+            ("* | let status = 0", vec!["status"]),
+            ("* | rename message as summary", vec!["message", "summary"]),
+        ] {
+            assert!(trawl_core::parser::parse(query).is_ok());
+            let capability = Capabilities::for_query(query);
+            assert!(capability.raw_facets(), "{query}");
+            for field in ["host", "service"] {
+                assert!(capability.input_field(field), "{query}: {field}");
+                assert!(capability.include(field, &Value::String("original".into())));
+            }
+            for field in changed {
+                assert!(!capability.input_field(field), "{query}: {field}");
+                assert!(!capability.include(field, &Value::String("changed".into())));
+            }
+        }
+        for query in [
+            "* | stats count() by host",
+            "| from saved example",
+            "* | extract kv",
+        ] {
+            assert!(trawl_core::parser::parse(query).is_ok(), "{query}");
+            assert!(!Capabilities::for_query(query).raw_facets(), "{query}");
+        }
+    }
+
     #[test]
     fn mixed_numbers_define_a_consistent_order_at_precision_boundaries() {
         let ordered = [

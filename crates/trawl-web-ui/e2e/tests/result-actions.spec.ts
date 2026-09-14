@@ -140,3 +140,95 @@ test('result audit: pending query cannot retarget retained aggregate row actions
     expect(JSON.parse(Buffer.from(filters.slice(3), 'base64url').toString())).toContainEqual({field: 'host',value: 'hundred',op: '+'});
   } finally { release(); }
 });
+
+
+// Derive the response from the native-guarded raw-row fixture. This changes
+// only the fields that the tested let/rename stage changes, and adds a
+// string service field so two untouched facet groups must remain usable.
+function transformedRaw(query: string) {
+  const response = structuredClone(raw);
+  response.columns.push({ name: 'service' });
+  response.rows.forEach((row: unknown[]) => row.push('nginx'));
+  if (query.includes('let status')) response.rows.forEach((row: unknown[]) => { row[2] = 0; });
+  if (query.includes('rename message')) response.columns[3].name = 'summary';
+  return response;
+}
+
+for (const mode of ['snapshot', 'live']) {
+  for (const [query, changed] of [
+    ['* | let status = 0', 'status'],
+    ['* | rename message as summary', 'summary'],
+  ]) {
+    test(`result facet review: ${mode} ${query} keeps original host and service`, async ({ page }) => {
+      const response = transformedRaw(query);
+      if (mode === 'snapshot') {
+        await page.route(routeQuery, route => route.fulfill({ json: response }));
+      } else {
+        const events = response.rows.map((row: unknown[]) => Object.fromEntries(response.columns.map((column: {name: string}, i: number) => [column.name, row[i]])));
+        await page.route('**/api/v1/stream?*', route => route.fulfill({
+          contentType: 'text/event-stream',
+          body: events.map((event: object) => `event: data\ndata: ${JSON.stringify(event)}\n\n`).join(''),
+        }));
+      }
+      await page.goto('/search?q=' + encodeURIComponent(query) + (mode === 'live' ? '&mode=live' : ''));
+      const facets = page.locator('.facets');
+      await expect(facets.getByRole('button', { name: 'Include host = web-01', exact: true })).toBeVisible();
+      await expect(facets.getByRole('button', { name: 'Include service = nginx', exact: true })).toBeVisible();
+      await expect(facets.locator('.g-hd').filter({ hasText: changed })).toHaveCount(0);
+      await expect(facets.getByRole('button', { name: new RegExp(`^Include ${changed} = `) })).toHaveCount(0);
+      await expect(page.locator('.results-table')).toContainText(changed);
+      if (mode === 'snapshot') {
+        await facets.getByRole('button', { name: 'Include host = web-01', exact: true }).click();
+        const url = new URL(page.url());
+        expect(url.searchParams.get('q')).toBe(query);
+        expect(JSON.parse(Buffer.from(url.searchParams.get('f')!.slice(3), 'base64url').toString())).toContainEqual({ op: '+', field: 'host', value: 'web-01' });
+      }
+    });
+  }
+}
+
+test('result facet review: pending Include keeps Clear all and active count, and Clear all preserves the draft', async ({ page }) => {
+  const query = '* | let status = 0';
+  const response = transformedRaw(query);
+  let release!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const queries: string[] = [];
+  let pending = false;
+  await page.route(routeQuery, async route => {
+    const q = route.request().postDataJSON().query as string;
+    queries.push(q);
+    if (q.includes('host="web-01"')) { pending = true; await held; }
+    await route.fulfill({ json: response }).catch(() => {});
+  });
+  try {
+    await page.goto('/search?q=' + encodeURIComponent(query) + '&r=1h');
+    const facets = page.locator('.facets');
+    const include = facets.getByRole('button', { name: 'Include host = web-01', exact: true });
+    await expect(include).toBeVisible();
+    await page.locator(SEL.cmContent).click();
+    await page.keyboard.press('Control+a');
+    const draft = '* | stats count() by service';
+    await page.keyboard.insertText(draft);
+    await include.click();
+    await expect.poll(() => pending).toBe(true);
+    await expect(facets.locator('.g')).toHaveCount(0);
+    await expect(facets.getByPlaceholder('Filter field values')).toHaveCount(0);
+    await expect(page.locator('.facet-count')).toHaveText('1 active');
+    await expect(facets.getByRole('button', { name: 'Clear all', exact: true })).toBeVisible();
+    await facets.getByRole('button', { name: 'Clear all', exact: true }).click();
+    await expect(page).not.toHaveURL(/[?&]f=/);
+    const url = new URL(page.url());
+    expect(url.searchParams.get('f')).toBeNull();
+    expect(url.searchParams.get('q')).toBe(query);
+    expect(url.searchParams.get('r')).toBe('1h');
+    expect(queries[1]).toContain('host="web-01"');
+    // Returning to the already displayed query may reuse its retained
+    // response; a third request is not required for Clear all to succeed.
+    expect(queries[0]).not.toContain('host="web-01"');
+    expect(queries[0]).toContain('let status = 0');
+    await expect(page.locator(SEL.cmContent)).toHaveText(draft);
+    await expect(page.locator('.facet-count')).toHaveText('');
+    release();
+    await expect(facets.getByRole('button', { name: 'Include service = nginx', exact: true })).toBeVisible();
+  } finally { release(); }
+});

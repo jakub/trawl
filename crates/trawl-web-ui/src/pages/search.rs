@@ -654,30 +654,32 @@ pub fn Search() -> impl IntoView {
 
     let filters_sig = Signal::derive(move || filters.get());
     let range_sig = Signal::derive(move || range.get());
-    // What the histogram's caption states: the restriction the effective
-    // query ran under, which is the base query's own time clause when it
-    // carries one — the picker's trigger keeps saying what the URL holds
-    // (ADR-0027, amended 2026-09-12).
-    // Facets read the displayed response too. A pending URL must not turn
-    // retained aggregate cells into input fields for the new query.
-    let facet_suppressed = Signal::derive(move || {
-        unreadable.get()
+    // Field provenance follows the active result source, never the editor.
+    let facet_capabilities = Signal::derive(move || {
+        let query = if live.get() {
+            effective_q.get()
+        } else {
+            rows.get()
+                .and_then(Result::ok)
+                .map_or_else(String::new, |r| r.query.effective)
+        };
+        crate::result_actions::Capabilities::for_query(&query)
+    });
+    // A pending URL can hide stale row-derived groups, but its filter count
+    // and Clear all are URL-owned and remain safe to use.
+    let facet_rows_suppressed = Signal::derive(move || {
+        !facet_capabilities.get().raw_facets()
             || (!live.get()
                 && rows
                     .get()
                     .and_then(Result::ok)
                     .is_some_and(|r| r.query.effective != effective_q.get()))
     });
-    let facet_aggregate = Signal::derive(move || {
-        if live.get() {
-            is_chart_query.get()
-        } else {
-            rows.get().and_then(Result::ok).is_some_and(|r| {
-                !crate::result_actions::Capabilities::for_query(&r.query.effective).raw_actions()
-            })
-        }
-    });
 
+    // What the histogram's caption states: the restriction the effective
+    // query ran under, which is the base query's own time clause when it
+    // carries one — the picker's trigger keeps saying what the URL holds
+    // (ADR-0027, amended 2026-09-12).
     let window = Signal::derive(move || effective_window(&executed_q.get(), &range.get()));
 
     view! {
@@ -693,8 +695,9 @@ pub fn Search() -> impl IntoView {
             <FacetSidebar
                 state=active_rows
                 filters=filters_sig
-                suppressed=facet_suppressed
-                aggregate_shape=facet_aggregate
+                suppressed=unreadable
+                rows_suppressed=facet_rows_suppressed
+                capabilities=facet_capabilities
                 on_add=on_add_filter
                 on_clear=on_clear_filters
             />
