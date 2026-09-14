@@ -33,7 +33,7 @@ _Avoid_: overlay, backdrop, mask
 ### Menus
 
 **Menu**:
-A popup of application commands: `role="menu"` holding only menu items and separators. fleet-ui has two, the topbar's account menu and the table row's actions menu, and they share one contract: a `None` layer, one tab stop, an indexed arrow walk, Tab closes and returns to the trigger, restore by cause. Not a disclosure of links and not a listbox.
+A popup of application commands: `role="menu"` holding only menu items and separators. fleet-ui has two, the command bar's account menu and the table row's actions menu, and they share one contract: a `None` layer, one tab stop, an indexed arrow walk, Tab closes and returns to the trigger, restore by cause. Not a disclosure of links and not a listbox.
 _Avoid_: dropdown, popover, user-menu dropdown
 
 **Trigger**:
@@ -55,6 +55,32 @@ _Avoid_: palette, search box, jump
 **Atmosphere palette**:
 The per-theme colour stops that drive the WebGL backdrop (`atmosphere::palette`). Unrelated to the command palette.
 _Avoid_: palette (unqualified), theme colours
+
+### Chrome and navigation
+
+**Sidebar**:
+The one navigation list, `nav.rail`, rendered by `Shell` down the left of every page: a brand, then groups of destinations, then a bottom slot. It replaced the icon rail and the command bar's mode tabs (ADR-0032); the class name `rail` stayed so the pinned nav selectors did not move.
+_Avoid_: rail, nav rail, menu, drawer
+
+**Sidebar group**:
+One labelled run of destinations the consumer passes as data. A group with no label renders its items with no heading; a labelled group renders a small-caps heading and names the run for assistive technology and for the command palette.
+_Avoid_: section (that is the app's own term for a route), mode, category
+
+**Collapsed sidebar**:
+The icon-only presentation, persisted in `UiPrefs`. Every destination keeps its `title` and its label as screen-reader text, so nothing loses its accessible name. The collapse control lives in the bottom slot and renders only when the consumer persists the state.
+_Avoid_: mini rail, icon mode, hidden sidebar
+
+**Command bar**:
+The `TopBar`: the top strip that names the current page and carries the affordances that are not destinations — the nav toggle, the command palette trigger and the account menu. It holds no navigation of its own.
+_Avoid_: topbar tabs, header nav, toolbar
+
+**Page crumb**:
+The command bar's page title, the label of the sidebar item the consumer marks active. It is text, never a link, and falls back to the brand before routing state resolves.
+_Avoid_: breadcrumb trail (there is one level), heading
+
+**Nav overlay**:
+The sidebar below 900px: a `Capture` layer over a scrim, opened by the command bar's nav toggle, closed by Escape, by a press on the scrim, or by a route change. Focus returns to the toggle, and the palette chord stays inert while it is open.
+_Avoid_: mobile menu, hamburger, off-canvas
 
 ### Strips and controls
 

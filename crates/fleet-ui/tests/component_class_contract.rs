@@ -46,6 +46,7 @@ const ACTIONS_MENU: &str = include_str!("../src/actions_menu.rs");
 const MENU: &str = include_str!("../src/menu.rs");
 const TOPBAR: &str = include_str!("../src/topbar.rs");
 const SHELL: &str = include_str!("../src/shell.rs");
+const SIDEBAR: &str = include_str!("../src/sidebar.rs");
 const COMMAND_PALETTE: &str = include_str!("../src/command_palette.rs");
 const TOAST_RUNTIME: &str = include_str!("../src/toast/runtime.rs");
 const ROVING: &str = include_str!("../src/roving.rs");
@@ -521,6 +522,67 @@ fn topbar_menu_is_native_and_registers_with_the_stack() {
 }
 
 #[test]
+fn sidebar_emits_an_unconditional_group_wrapper_and_names_labelled_groups() {
+    // The wrapper is unconditional so `.rail .grp > a[title]` addresses
+    // every destination, labelled group or not; `role`/`aria-label` ride
+    // only the labelled ones, because a nameless role="group" is an axe
+    // defect (ADR-0032).
+    let sidebar = markup_only(SIDEBAR);
+    for required in [
+        r#"class="grp""#,
+        "role=",
+        "aria-label=",
+        r#"class="grp-lb""#,
+        "attr:title=label_attr",
+        "aria-current=",
+        r#"class="bot""#,
+        r#"class="it collapse""#,
+        r#"id="fleet-sidebar""#,
+        r#"aria-label="Primary""#,
+    ] {
+        assert!(sidebar.contains(required), "Sidebar lost {required}");
+    }
+    emits(SIDEBAR, r#"class="rail""#, "nav.rail");
+    emits(SIDEBAR, r#"class="lb""#, ".rail .it .lb");
+    emits(SIDEBAR, r#"class="badge""#, ".rail .it .badge");
+    assert!(
+        sidebar.contains("<button") && sidebar.contains(TYPE_BUTTON),
+        "the collapse control must be a native <button type=\"button\"> \
+         — it changes presentation, it is not a destination"
+    );
+}
+
+#[test]
+fn shell_mounts_the_nav_overlay_as_a_capture_layer() {
+    // Below 900px navigation is an overlay, not a docked column: same
+    // policy the Drawer uses, so Escape only closes the topmost layer,
+    // the background stays interactive and the palette chord is inert
+    // while it is open.
+    let shell = markup_only(SHELL);
+    for required in [
+        "FocusPolicy::Capture",
+        r#"class="nav-scrim""#,
+        r#"use_media_query("(max-width: 899.98px)")"#,
+        "is_topmost",
+        r#"class="shell-content""#,
+    ] {
+        assert!(
+            shell.contains(required),
+            "Shell nav overlay lost {required}"
+        );
+    }
+    let topbar = markup_only(TOPBAR);
+    for required in [
+        r#"class="nav-toggle""#,
+        r#"aria-controls="fleet-sidebar""#,
+        r#"class="crumb""#,
+        r#"<header class="topbar">"#,
+    ] {
+        assert!(topbar.contains(required), "command bar lost {required}");
+    }
+}
+
+#[test]
 fn command_palette_trigger_is_a_live_native_button() {
     let topbar = markup_only(TOPBAR);
     let start = topbar
@@ -749,9 +811,10 @@ fn drawer_is_an_honest_non_modal_dialog() {
 
 #[test]
 fn icon_ships_the_slice_d_glyphs_and_the_crate_doc_is_honest() {
-    // Document / Upload / Copy belong to the closed enum, each with an
-    // icon_body arm in house style.
-    for glyph in ["Document", "Upload", "Copy"] {
+    // Document / Upload / Copy, and the sidebar's Menu / PanelLeft,
+    // belong to the closed enum, each with an icon_body arm in house
+    // style.
+    for glyph in ["Document", "Upload", "Copy", "Menu", "PanelLeft"] {
         assert!(
             ICON.contains(&format!("    {glyph},\n"))
                 && ICON.contains(&format!("Icon::{glyph} =>")),

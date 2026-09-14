@@ -37,7 +37,7 @@ const TOAST_RUNTIME_RS: &str = include_str!("../../fleet-ui/src/toast/runtime.rs
 const TOAST_KINDS_RS: &str = include_str!("../../fleet-ui/src/toast/kinds.rs");
 const LOADED_COMPONENT_RS: &str = include_str!("../../fleet-ui/src/loaded/component.rs");
 const LOADED_STATE_RS: &str = include_str!("../../fleet-ui/src/loaded/state.rs");
-const RAIL_RS: &str = include_str!("../../fleet-ui/src/rail.rs");
+const SIDEBAR_RS: &str = include_str!("../../fleet-ui/src/sidebar.rs");
 const SECTION_RS: &str = include_str!("../src/state/section.rs");
 const DRAWER_RS: &str = include_str!("../../fleet-ui/src/drawer.rs");
 const FIELD_CASE_DRAWER_RS: &str = include_str!("../src/components/field_case_drawer.rs");
@@ -94,8 +94,8 @@ const CONTRACTS: &[Contract] = &[
     },
     Contract {
         assignment: "helpLink: 'nav.rail .bot a[title=\"Help\"]',",
-        source_path: "../fleet-ui/src/rail.rs",
-        source: RAIL_RS,
+        source_path: "../fleet-ui/src/sidebar.rs",
+        source: SIDEBAR_RS,
         hook: "class=\"bot\"",
     },
     Contract {
@@ -184,8 +184,8 @@ const CONTRACTS: &[Contract] = &[
     },
     Contract {
         assignment: "paletteRailLink: 'nav.rail > a[title]',",
-        source_path: "../fleet-ui/src/rail.rs",
-        source: RAIL_RS,
+        source_path: "../fleet-ui/src/sidebar.rs",
+        source: SIDEBAR_RS,
         hook: "attr:title=label_attr",
     },
     Contract {
@@ -310,8 +310,8 @@ const CONTRACTS: &[Contract] = &[
     },
     Contract {
         assignment: "healthAwayLink: 'nav.rail a[title=\"Schema\"]',",
-        source_path: "../../fleet-ui/src/rail.rs",
-        source: RAIL_RS,
+        source_path: "../../fleet-ui/src/sidebar.rs",
+        source: SIDEBAR_RS,
         hook: "title=",
     },
     Contract {
@@ -382,8 +382,8 @@ const CONTRACTS: &[Contract] = &[
     },
     Contract {
         assignment: "railHealthLink: 'nav.rail a[title=\"Health\"]',",
-        source_path: "../../fleet-ui/src/rail.rs",
-        source: RAIL_RS,
+        source_path: "../../fleet-ui/src/sidebar.rs",
+        source: SIDEBAR_RS,
         hook: "title=",
     },
     Contract {
@@ -407,8 +407,8 @@ const CONTRACTS: &[Contract] = &[
     },
     Contract {
         assignment: "railHistoryLink: 'nav.rail a[title=\"History\"]',",
-        source_path: "../fleet-ui/src/rail.rs",
-        source: RAIL_RS,
+        source_path: "../fleet-ui/src/sidebar.rs",
+        source: SIDEBAR_RS,
         hook: "class=\"rail\"",
     },
     Contract {

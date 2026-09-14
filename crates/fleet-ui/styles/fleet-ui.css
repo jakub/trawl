@@ -943,69 +943,70 @@ select:focus-visible,
 .login-card .error-banner { margin-bottom: 16px; }
 
 /* ─────────────────────────────────────────────────────────────────
- *  App shell — grid (topbar / body / footer)
+ *  App shell — grid (body / footer)
  *
  *  Reserved class names from this point down: .shell, .topbar, .body,
  *  .main, .rail. Apps must NOT redefine these — they're shared chrome.
  * ─────────────────────────────────────────────────────────────── */
-/* Rows: topbar / body / footer. The `auto` footer row collapses to
- * zero for footer-less apps and sizes to the footer's own height
- * (e.g. trawl's .statusbar at var(--statusbar-h)) when the Shell's
- * optional footer slot is filled. */
+/* Columns: sidebar + content. Rows: content / footer. The `auto`
+ * footer row collapses to zero for footer-less apps and sizes to the
+ * footer's own height (e.g. trawl's .statusbar at var(--statusbar-h))
+ * when the Shell's optional footer slot is filled. */
 .shell {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
-  grid-template-rows: auto minmax(0, 1fr) auto;
+  grid-template-rows: minmax(0, 1fr) auto;
   height: 100%;
 }
 
-/* Top bar — application chrome.
-   Order: brand · modes · spacer · jump · env · user. */
+/* The column beside the sidebar: command bar over the page. */
+.shell-content {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+/* Command bar — nav toggle · page title · palette · account (ADR-0032). */
 .topbar {
   display: flex;
   align-items: center;
-  gap: 18px;
+  gap: 12px;
   padding: 0 12px;
+  min-width: 0;
   background: var(--panel);
   border-bottom: 1px solid var(--line);
+  box-shadow: inset 0 1px 0 var(--edge-hi);
   height: var(--topbar-h);
   flex-shrink: 0;
 }
 
-.topbar .brand {
-  display: flex;
+/* Compact widths only: the docked sidebar becomes an overlay this opens. */
+.topbar .nav-toggle {
+  display: none;
   align-items: center;
-  gap: 4px;
-  font-family: var(--font-ui);
-  font-weight: 600;
-  font-size: var(--fs-base);
-  letter-spacing: -.2px;
-  color: var(--ink);
-}
-.topbar .brand .accent {
-  color: var(--accent);
-  text-shadow: 0 0 8px var(--accent-glow);
-}
-
-.topbar .modes { display: flex; gap: 2px; margin-left: 4px; }
-.topbar .mode {
-  padding: 4px 11px;
-  font-size: var(--fs-base);
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  background: none;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-ctl);
   color: var(--ink-2);
   cursor: pointer;
-  border-radius: var(--radius-sm);
-  display: flex;
-  align-items: center;
-  user-select: none;
-  text-decoration: none;
 }
-.topbar .mode:hover { color: var(--ink); background: var(--panel-2); }
-/* Active chip mirrors the rail's active treatment (wash + inset ring). */
-.topbar .mode.active {
-  color: var(--accent);
-  background: var(--accent-wash);
-  box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--accent) 45%, transparent);
-  font-weight: 500;
+
+.topbar .crumb {
+  margin: 0;
+  font-family: var(--font-ui);
+  font-size: var(--fs-base);
+  font-weight: 600;
+  color: var(--ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
 }
 .topbar .sp { flex: 1; }
 
@@ -1178,7 +1179,7 @@ select:focus-visible,
 .user-menu .item.danger { color: var(--red); }
 .user-menu .sep { height: 1px; background: var(--line-2); margin: 4px 0; }
 
-/* Body row: rail + main, fills remaining height after the topbar. */
+/* Body row: sidebar + content column, fills the shell above the footer. */
 .body {
   display: flex;
   flex: 1;
@@ -1195,79 +1196,128 @@ select:focus-visible,
 }
 
 /* ─────────────────────────────────────────────────────────────────
- *  Left nav rail — mode-aware item list
+ *  Sidebar — one labelled destination list. `nav.rail` keeps its class
+ *  so the nav selectors change minimally (ADR-0032).
  * ─────────────────────────────────────────────────────────────── */
 .rail {
-  width: var(--rail-w);
+  width: var(--sidebar-w);
   flex-shrink: 0;
-  background: var(--panel);
+  min-height: 0;
+  overflow-y: auto;
+  background: var(--panel-2);
   border-right: 1px solid var(--line);
   display: flex;
   flex-direction: column;
   align-items: stretch;
-  padding: 8px 6px;
-  gap: 3px;
+  padding: 10px 8px;
+  gap: 2px;
+  transition: width 120ms ease-out;
 }
-.rail .it {
-  /* Sized for the 20px icon + dense label stack with a little air. */
-  height: 50px;
+.rail .brand {
   display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 3px;
-  padding: 0 3px;
+  align-items: baseline;
+  gap: 2px;
+  padding: 4px 10px 14px;
+  font-family: var(--font-ui);
+  font-weight: 600;
+  font-size: var(--fs-section);
+  letter-spacing: -.4px;
+  color: var(--ink);
+  white-space: nowrap;
+  overflow: hidden;
+}
+.rail .brand .accent { color: var(--accent-ink); text-shadow: 0 0 8px var(--accent-glow); }
+.rail .grp { display: flex; flex-direction: column; gap: 2px; }
+.rail .grp + .grp { margin-top: 4px; }
+.rail .grp-lb {
+  padding: 14px 10px 4px;
+  font-family: var(--font-ui);
+  font-size: var(--fs-label);
+  font-variant-caps: all-small-caps;
+  letter-spacing: .04em;
   color: var(--ink-3);
+  white-space: nowrap;
+  overflow: hidden;
+}
+/* One recipe for both element kinds: the destinations are anchors and
+ * the collapse control is a button, so the rule carries the button
+ * reset as well as the anchor underline suppression. */
+.rail .it {
+  height: 32px;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 10px;
+  color: var(--ink-2);
   cursor: pointer;
   border-radius: var(--radius-ctl);
   position: relative;
-  transition: color 120ms, background 120ms;
+  background: none;
+  border: 0;
+  font: inherit;
+  text-align: left;
   text-decoration: none;
+  transition: color 120ms, background 120ms;
 }
-/* Labels use the dense sub-scale, and --rail-w is sized so the widest
- * shipped label ("Users & API", 66px at --fs-dense 12px) fits
- * the item box; anything longer ellipsizes instead of overflowing the
- * highlight. */
+.rail .it > svg { flex-shrink: 0; }
 .rail .it .lb {
   font-family: var(--font-ui);
-  font-size: var(--fs-dense);
+  font-size: var(--fs-control);
   font-weight: 500;
-  max-width: 100%;
+  min-width: 0;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.rail .it:hover { color: var(--ink); background: var(--panel-2); }
-.rail .it.active {
-  color: var(--accent);
-  background: var(--accent-wash);
-  box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--accent) 45%, transparent);
-}
-/* Count chip — RailItem.badge. Anchored to the item's top-right
- * corner (the .it is position: relative). */
+.rail .it:hover { color: var(--ink); background: var(--fill-2); }
+.rail .it.active { color: var(--accent-ink); background: var(--accent-wash); box-shadow: inset 3px 0 0 var(--accent); }
+/* Count chip — RailItem.badge, trailing the label. */
 .rail .it .badge {
-  position: absolute;
-  top: 3px;
-  right: 4px;
-  min-width: 15px;
-  padding: 1px 4px;
+  margin-inline-start: auto;
+  min-width: 18px;
+  padding: 1px 6px;
   border-radius: var(--radius-pill);
   background: var(--accent-wash);
-  color: var(--accent);
+  color: var(--accent-ink);
   font-family: var(--font-mono);
   font-size: var(--fs-tiny);
   font-weight: 600;
-  line-height: 1.3;
+  line-height: 1.4;
   text-align: center;
   font-variant-numeric: tabular-nums;
 }
 .rail .bot {
   margin-top: auto;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
   display: flex;
   flex-direction: column;
-  gap: 3px;
+  gap: 2px;
   align-items: stretch;
 }
+/* Collapsed: icon-only, every label kept for assistive technology. */
+.rail.collapsed { width: var(--sidebar-w-collapsed); padding: 10px 6px; }
+.rail.collapsed .brand { padding: 4px 0 14px; justify-content: center; }
+.rail.collapsed .brand > span:first-child,
+.rail.collapsed .grp-lb,
+.rail.collapsed .it .lb { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.rail.collapsed .grp + .grp { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--line); }
+.rail.collapsed .it { justify-content: center; padding: 0; }
+.rail.collapsed .it .badge {
+  position: absolute; top: 4px; right: 6px;
+  min-width: 0; width: 8px; height: 8px; padding: 0;
+  overflow: hidden; color: transparent; background: var(--accent);
+}
+/* <900px: the sidebar is a Capture overlay behind the command bar's toggle. */
+.nav-scrim { position: fixed; inset: 0; z-index: 50; background: oklch(14.5% 0 0 / .18); animation: sd-fade-in 140ms ease-out; }
+.rail.overlay {
+  position: fixed; top: 0; left: 0; bottom: 0; z-index: 51;
+  width: min(280px, 86vw);
+  box-shadow: var(--elev-3);
+  animation: nav-slide-in 200ms cubic-bezier(.2,.8,.3,1);
+}
+@keyframes nav-slide-in { from { transform: translateX(-20px); opacity: 0; } to { transform: none; opacity: 1; } }
 
 /* ─────────────────────────────────────────────────────────────────
  *  Small widgets (issue #31, ADR-0003 unification)
@@ -1707,24 +1757,14 @@ select:focus-visible,
 /* Compact chrome keeps its original links and focus-return targets. */
 @media (max-width: 900px) {
   .topbar { gap: 10px; }
+  .topbar .nav-toggle { display: inline-flex; }
   .topbar .jump { width: auto; min-width: 32px; min-height: 32px; justify-content: center; padding: 0 8px; }
   .topbar .jump .gh, .topbar .jump .kbd { display: none; }
   .topbar .user .who { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
   .topbar .user { min-height: 32px; }
 }
 @media (max-width: 600px) {
-  .topbar { flex-wrap: wrap; height: auto; min-height: var(--topbar-h); padding-block: 6px; gap: 6px 10px; }
-  .topbar .modes { order: 1; flex-basis: 100%; margin: 0; flex-wrap: wrap; }
-  .topbar .mode { min-height: 32px; }
-  .topbar .app-links { order: 2; flex-basis: 100%; flex-wrap: wrap; }
-  .body { flex-direction: column; }
-  .rail { width: auto; flex-direction: row; flex-wrap: wrap; border-right: 0; border-bottom: 1px solid var(--line); padding: 4px 6px; gap: 4px; }
-  .rail .it { height: auto; min-height: 36px; flex-direction: row; gap: 4px; padding: 4px 6px; }
-  .rail .it .lb { white-space: normal; overflow: visible; }
-  .rail .it > svg { width: 16px; height: 16px; flex-shrink: 0; }
-  .rail .bot { margin-top: 0; margin-inline-start: auto; flex-direction: row; flex-wrap: wrap; }
-  .rail .it .badge { position: static; }
-  .main { flex-direction: column; }
+  .topbar { gap: 8px; padding: 0 8px; }
   .sd-drawer { width: 100%; border-left: 0; }
   .sd-hd { position: relative; padding: 12px; gap: 8px; }
   .sd-ttl { flex-basis: 100%; padding-inline-end: 36px; }

@@ -7,7 +7,7 @@
 //! A thin app-specific wrapper over [`fleet_ui::Shell`]: keeps the
 //! `/me` fetch, the Unauthorized→`/login` redirect, and the
 //! `ShellStatus` + `me` context provision; maps trawl's `AppMode` /
-//! `section` state onto fleet-ui's `ModeTab` / `RailItem` props.
+//! `section` state onto fleet-ui's `SidebarGroup` / `RailItem` props.
 //! The toast bus and `<Toasts/>` host are owned by `fleet_ui::Shell`
 //! (pages reach the bus via `expect_context::<ToastBus>()`).
 
@@ -15,12 +15,12 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos_router::components::Outlet;
 
-use fleet_ui::{Icon, IconView, ModeTab, RailItem, Shell, UserInfo};
+use fleet_ui::{Icon, IconView, RailItem, Shell, SidebarGroup, UserInfo};
 
 use crate::api;
 use crate::components::status_bar::StatusBar;
 use crate::search_status::{FooterCount, StatusKind};
-use crate::state::app_mode::{self, AppMode};
+use crate::state::app_mode;
 use crate::state::section;
 use crate::state::stats_stream::{StatsLifecycle, start_stats_stream};
 
@@ -128,31 +128,20 @@ pub fn AuthShell() -> impl IntoView {
         }
     });
 
-    let rail_items = Signal::derive(move || {
-        section::items_for(current_app.get())
-            .iter()
-            .map(|item| RailItem {
-                id: item.id.to_string(),
-                label: item.label.to_string(),
-                icon: item.icon,
-                path: item.path.to_string(),
-                badge: None,
-            })
-            .collect::<Vec<_>>()
-    });
-
-    let modes = Signal::derive(move || {
-        let cur = current_app.get();
-        AppMode::ALL
-            .iter()
-            .copied()
-            .map(|m| ModeTab {
-                id: m.default_path().to_string(),
-                label: m.label().to_string(),
-                path: m.default_path().to_string(),
-                active: m == cur,
-            })
-            .collect::<Vec<_>>()
+    let sidebar_groups = Signal::derive(move || {
+        vec![SidebarGroup {
+            label: None,
+            items: section::items_for(current_app.get())
+                .iter()
+                .map(|item| RailItem {
+                    id: item.id.to_string(),
+                    label: item.label.to_string(),
+                    icon: item.icon,
+                    path: item.path.to_string(),
+                    badge: None,
+                })
+                .collect(),
+        }]
     });
 
     let user = Signal::derive(move || {
@@ -189,9 +178,8 @@ pub fn AuthShell() -> impl IntoView {
         <Shell
             brand="trawl"
             brand_accent="_"
-            rail_items=rail_items
-            rail_active=Signal::derive(move || current_section.get())
-            modes=modes
+            sidebar_groups=sidebar_groups
+            sidebar_active=Signal::derive(move || current_section.get())
             user=user
             on_logout=on_logout
             footer=Box::new(move || view! {
@@ -202,12 +190,12 @@ pub fn AuthShell() -> impl IntoView {
                     admin=admin_stats
                 />
             }.into_any())
-            rail_bottom=Box::new(|| view! {
+            sidebar_bottom=ViewFn::from(|| view! {
                 <a class="it" title="Help" href="https://trawl.sh" target="_blank" rel="noopener noreferrer">
-                    <IconView icon=Icon::Question size=20 stroke_width=1.4/>
+                    <IconView icon=Icon::Question size=18 stroke_width=1.5/>
                     <span class="lb">"Help"</span>
                 </a>
-            }.into_any())
+            })
         >
             <Show when=move || logout_error.get()>
                 <div class="auth-notice">

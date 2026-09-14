@@ -2,13 +2,20 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `<TopBar/>` — generic application chrome.
+//! `<TopBar/>` — the application command bar.
 //!
-//! brand · mode tabs · spacer · command palette · app links ·
-//! account menu. The theme toggle reads the `UiPrefs` context the
-//! consumer provides from `fleet_ui::install()`. The bar knows nothing
-//! about auth, `/me`, or app-specific endpoints: `on_logout` is a
-//! callback the consumer wires to its own logout flow.
+//! nav toggle · page title · spacer · command palette · account menu.
+//! Navigation itself belongs to [`crate::sidebar`] (ADR-0032); the bar
+//! names the current page and carries the two chrome affordances that
+//! are not destinations. The theme toggle reads the `UiPrefs` context
+//! the consumer provides from `fleet_ui::install()`. The bar knows
+//! nothing about auth, `/me`, or app-specific endpoints: `on_logout` is
+//! a callback the consumer wires to its own logout flow.
+//!
+//! The nav toggle is the compact-width opener for the sidebar overlay.
+//! It is always rendered (CSS shows it below 900px) and always reports
+//! whether the overlay is open, so its state never disagrees with the
+//! shell's.
 //!
 //! The account menu is a native trigger plus the shared menu panel
 //! ([`crate::menu`]), the same contract `ActionsMenu` mounts: the panel
@@ -32,34 +39,12 @@
 
 use leptos::html::{Button, Div};
 use leptos::prelude::*;
-use leptos_router::components::A;
 
 use crate::command_palette::platform_kbd_hint;
 use crate::icon::{Icon, IconView};
 use crate::kbd::Kbd;
 use crate::menu::{MenuEntry, MenuItem, MenuPanel};
 use crate::theme::UiPrefs;
-
-/// A top-bar mode tab. Active state is baked into the struct so the
-/// caller can rebuild the Vec reactively from its routing state
-/// without any wiring inside fleet-ui.
-#[derive(Debug, Clone)]
-pub struct ModeTab {
-    pub id: String,
-    pub label: String,
-    pub path: String,
-    pub active: bool,
-}
-
-/// A cross-app navigation link rendered in the topbar's app-switcher
-/// area. Coastwatch and trawl each ship a small slice so users can hop
-/// between fleet apps without re-authenticating.
-#[derive(Debug, Clone)]
-pub struct AppLink {
-    pub label: String,
-    pub href: String,
-    pub active: bool,
-}
 
 /// User identity for the avatar + dropdown header. `detail` is the
 /// app-supplied secondary line (trawl uses role, coastwatch may use
@@ -72,10 +57,15 @@ pub struct UserInfo {
 
 #[component]
 pub fn TopBar(
-    #[prop(into)] brand: String,
-    #[prop(into)] brand_accent: String,
-    #[prop(into)] modes: Signal<Vec<ModeTab>>,
-    #[prop(into, optional)] app_links: Signal<Vec<AppLink>>,
+    /// The active destination's label, rendered as the page crumb.
+    #[prop(into)]
+    page_title: Signal<String>,
+    /// Whether the compact sidebar overlay is open, reported by the toggle.
+    #[prop(into)]
+    nav_open: Signal<bool>,
+    on_toggle_nav: Callback<()>,
+    /// Focus returns here when the sidebar overlay closes.
+    nav_toggle: NodeRef<Button>,
     #[prop(into)] user: Signal<Option<UserInfo>>,
     on_logout: Callback<()>,
     /// Shell owns the dialog. Required props prevent a decorative dead trigger.
@@ -88,27 +78,20 @@ pub fn TopBar(
     let prefs = use_context::<UiPrefs>();
 
     view! {
-        <div class="topbar">
-            <div class="brand">
-                <span>{brand}</span><span class="accent">{brand_accent}</span>
-            </div>
+        <header class="topbar">
+            <button
+                type="button"
+                class="nav-toggle"
+                aria-label="Open navigation"
+                aria-controls="fleet-sidebar"
+                aria-expanded=move || nav_open.get().to_string()
+                node_ref=nav_toggle
+                on:click=move |_| on_toggle_nav.run(())
+            >
+                <IconView icon=Icon::Menu size=16 stroke_width=1.5/>
+            </button>
 
-            <div class="modes">
-                {move || modes.get().into_iter().map(|tab| {
-                    // Outer move || rebuilds the whole tab list whenever `modes`
-                    // changes, so `tab.active` is fresh per render. The inner
-                    // closure pattern used by Rail (where `active` is a real
-                    // Signal) would silently break here because `tab.active` is
-                    // a plain bool captured by value — there's nothing for a
-                    // reactive re-run to re-read. Keep the class static.
-                    let class = tab_class(tab.active);
-                    view! {
-                        <A href=tab.path attr:class=class>
-                            <span>{tab.label}</span>
-                        </A>
-                    }
-                }).collect::<Vec<_>>()}
-            </div>
+            <h2 class="crumb" aria-live="polite">{move || page_title.get()}</h2>
 
             <div class="sp"></div>
 
@@ -130,22 +113,8 @@ pub fn TopBar(
                 </button>
             </Show>
 
-            {move || {
-                let links = app_links.get();
-                (!links.is_empty()).then(|| view! {
-                    <div class="app-links">
-                        {links.into_iter().map(|link| {
-                            let class = if link.active { "app-link active" } else { "app-link" };
-                            view! {
-                                <a href=link.href class=class>{link.label}</a>
-                            }
-                        }).collect::<Vec<_>>()}
-                    </div>
-                })
-            }}
-
             {account_menu(user, prefs, on_logout)}
-        </div>
+        </header>
     }
 }
 
@@ -256,10 +225,6 @@ fn account_menu(
             </Show>
         </div>
     }
-}
-
-fn tab_class(active: bool) -> &'static str {
-    if active { "mode active" } else { "mode" }
 }
 
 fn avatar_initials(user: Option<&UserInfo>) -> String {

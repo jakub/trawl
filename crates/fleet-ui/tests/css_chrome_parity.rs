@@ -7,17 +7,20 @@
 //!
 //! Each of these is load-bearing and non-obvious:
 //!
-//!   * `.rail .it` and `.topbar .mode` render as `<a>`. Anchors default
-//!     to `text-decoration: underline`; the explicit `none` is the sole
-//!     thing keeping rail items and mode tabs from sprouting underlines.
-//!     Drop it and every nav element silently regresses — invisible to
-//!     the DOM-class contract tests.
+//!   * `.rail .it` renders as `<a>` (and, for the collapse control, as
+//!     `<button>`). Anchors default to `text-decoration: underline`; the
+//!     explicit `none` is the sole thing keeping sidebar items from
+//!     sprouting underlines. Drop it and every nav element silently
+//!     regresses — invisible to the DOM-class contract tests.
 //!   * `.login-card .error-banner` re-establishes the login form's 16px
 //!     error spacing via a *more specific* selector over the base
 //!     `.error-banner`. Lose the override and login spacing shifts.
-//!   * `.shell` grid rows are `auto minmax(0, 1fr) auto` — the `auto`
-//!     row lets a footer-less app collapse the footer to zero while
-//!     trawl's statusbar sizes itself.
+//!   * `.shell` grid rows are `minmax(0, 1fr) auto` — the `auto` row
+//!     lets a footer-less app collapse the footer to zero while trawl's
+//!     statusbar sizes itself — and `.shell-content` carries the command
+//!     bar over the page. `.main` keeps `display: flex` and
+//!     `overflow: hidden`, which coastwatch's `.page` scrolling depends
+//!     on (ADR-0032).
 //!   * The six chrome keyframes ship from fleet-ui.css.
 //!   * `.login-shell` declares no background (ADR-0012): an opaque
 //!     normal-flow block paints above the `z-index: -1` `.atmosphere`
@@ -101,16 +104,7 @@ fn moved_chrome_is_byte_identical_to_premigration() {
 fn rail_items_suppress_anchor_underline() {
     assert!(
         rule_body(".rail .it").contains("text-decoration: none"),
-        "`.rail .it` must keep `text-decoration: none` — rail items are \
-         anchors and would otherwise render underlined (AC3 regression)"
-    );
-}
-
-#[test]
-fn mode_tabs_suppress_anchor_underline() {
-    assert!(
-        rule_body(".topbar .mode").contains("text-decoration: none"),
-        "`.topbar .mode` must keep `text-decoration: none` — mode tabs are \
+        "`.rail .it` must keep `text-decoration: none` — sidebar items are \
          anchors and would otherwise render underlined (AC3 regression)"
     );
 }
@@ -145,9 +139,22 @@ fn login_shell_declares_no_background() {
 #[test]
 fn shell_grid_has_auto_footer_row() {
     assert!(
-        rule_body(".shell").contains("grid-template-rows: auto minmax(0, 1fr) auto"),
-        "`.shell` grid rows must be `auto minmax(0, 1fr) auto` — the `auto` \
+        rule_body(".shell").contains("grid-template-rows: minmax(0, 1fr) auto"),
+        "`.shell` grid rows must be `minmax(0, 1fr) auto` — the `auto` \
          footer row collapses to zero footer-less and sizes trawl's statusbar"
+    );
+    assert!(
+        rule_body(".shell-content").contains("grid-template-rows: auto minmax(0, 1fr)"),
+        "`.shell-content` must stack the command bar over a page row that \
+         can shrink — an `auto` page row lets long content push the \
+         footer off-screen"
+    );
+    let main = rule_body(".main");
+    assert!(
+        main.contains("display: flex") && main.contains("overflow: hidden"),
+        "`.main` must keep `display: flex` and `overflow: hidden` — \
+         coastwatch's `.page` exists precisely to scroll inside them \
+         (ADR-0032 records the delta)"
     );
 }
 
