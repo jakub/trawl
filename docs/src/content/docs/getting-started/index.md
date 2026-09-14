@@ -98,7 +98,8 @@ The Linux server's browser build requires Trunk and the Rust
 The build helper downloads the checksum-verified official DuckDB library that
 matches `Cargo.lock`. It includes ICU, JSON, and Parquet support without a
 first-query extension download. Ordinary Cargo builds and tests also use the
-shared runtime, with a development library cached under `target/duckdb-download`.
+same checksum verification and shared runtime, with a verified archive cache
+under the Cargo target directory.
 Use the build helper below to stage relocatable distributions with their library.
 UTC and IANA timezone behavior remain enabled.
 

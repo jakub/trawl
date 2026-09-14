@@ -78,7 +78,6 @@ jobs:
       - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079 # nextest, version-pinned to match ci.yml
         with:
           tool: nextest@0.9.143
-      - run: cargo clean -p libduckdb-sys 2>/dev/null || true
       - name: Apply fleet-auth schema migrations
         run: cargo run -p fleet-admin -- migrate
         env:
@@ -100,12 +99,10 @@ jobs:
         run: cargo nextest run --workspace ${{ matrix.features }} --no-run
         env:
           CARGO_BUILD_JOBS: "4"
-          DUCKDB_DOWNLOAD_LIB: "1"
       - name: Run suites
         run: cargo nextest run --workspace ${{ matrix.features }} --retries 0 --test-threads 4
         env:
           CARGO_BUILD_JOBS: "4"
-          DUCKDB_DOWNLOAD_LIB: "1"
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       - name: Record suite outcome
         if: always()

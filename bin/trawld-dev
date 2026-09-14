@@ -3,7 +3,7 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-# Launch the fast development build of trawld with the downloaded DuckDB
+# Launch the fast development build of trawld with the verified DuckDB
 # shared library. Cargo injects this loader path for `cargo run`, but
 # fleet-dev deliberately launches the already-built binary so application
 # credentials are never exposed to build scripts or proc macros.

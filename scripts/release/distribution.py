@@ -2,17 +2,37 @@
 """Prepare the locked official DuckDB runtime and stage relocatable artifacts."""
 import argparse
 import hashlib
+import fcntl
+import io
 import json
 from pathlib import Path
 import shutil
 import subprocess
+import tempfile
 import tomllib
 import zipfile
 
 MANIFEST = Path(__file__).with_name("duckdb-runtime.json")
 
 
-def prepare(source, target, output):
+def write_atomic(path, data):
+    """Readers see a complete file even during concurrent builds."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Preserve Cargo fingerprints when another feature/profile build stages
+    # the same runtime, while replacing corrupted files with verified bytes.
+    if path.is_file() and path.read_bytes() == data:
+        return
+    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as temporary:
+        temporary.write(data)
+        temporary_path = Path(temporary.name)
+    try:
+        temporary_path.chmod(0o644)
+        temporary_path.replace(path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def prepare(source, target, output, cache=None, deps=None):
     manifest = json.loads(MANIFEST.read_text())
     lock = tomllib.loads((source / "Cargo.lock").read_text())
     for name in ("duckdb", "libduckdb-sys"):
@@ -20,24 +40,42 @@ def prepare(source, target, output):
         if versions != [manifest["crate_version"]]:
             raise SystemExit(f"unsupported product Cargo.lock {name} version; update the verified runtime manifest")
     archive, checksum = manifest["archives"][target]
-    output.mkdir(parents=True, exist_ok=True)
-    downloaded = output / archive
+    # Cargo profiles share a content-addressed archive cache. Release callers
+    # keep the ZIP alongside their prepared runtime as before.
+    archive_dir = cache / checksum if cache is not None else output
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    downloaded = archive_dir / archive
     url = f'https://github.com/duckdb/duckdb/releases/download/v{manifest["version"]}/{archive}'
-    if not downloaded.exists():
-        temporary = downloaded.with_suffix(".download")
-        subprocess.run(["curl", "--proto", "=https", "--tlsv1.2", "-fLsS", url, "-o", str(temporary)], check=True)
-        temporary.rename(downloaded)
-    if hashlib.sha256(downloaded.read_bytes()).hexdigest() != checksum:
-        raise SystemExit("DuckDB archive checksum mismatch")
-    library = "libduckdb.dylib" if "apple" in target else "libduckdb.so"
-    with zipfile.ZipFile(downloaded) as zipped:
-        # Select known files rather than extracting archive paths.
-        for name in (library, "duckdb.h"):
-            (output / name).write_bytes(zipped.read(name))
-    # DuckDB's release archives do not consistently contain the license.
-    # Store the matching MIT text alongside the verified runtime manifest.
-    shutil.copyfile(Path(__file__).with_name("duckdb-LICENSE"), output / "LICENSE.duckdb")
-    (output / "runtime.json").write_text(json.dumps({"version": manifest["version"], "archive": archive, "sha256": checksum}, indent=2) + "\n")
+    # Build scripts in different target/profile directories can run together.
+    # Serialize download and staging, then read and extract the SAME bytes that
+    # were hashed; reopening the ZIP after hashing would introduce a TOCTOU gap.
+    with (archive_dir / ".prepare.lock").open("a") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        if downloaded.exists():
+            data = downloaded.read_bytes()
+        else:
+            with tempfile.NamedTemporaryFile(dir=archive_dir, suffix=".download") as temporary:
+                subprocess.run(["curl", "--proto", "=https", "--tlsv1.2", "-fLsS", url,
+                                "-o", temporary.name], check=True)
+                data = Path(temporary.name).read_bytes()
+        if hashlib.sha256(data).hexdigest() != checksum:
+            raise SystemExit("DuckDB archive checksum mismatch")
+        if not downloaded.exists():
+            write_atomic(downloaded, data)
+        library = "libduckdb.dylib" if "apple" in target else "libduckdb.so"
+        with zipfile.ZipFile(io.BytesIO(data)) as zipped:
+            # Select known files rather than extracting archive paths. Refresh
+            # extracted files on every prepare, including explicit LIB_DIRs.
+            for name in (library, "duckdb.h"):
+                content = zipped.read(name)
+                write_atomic(output / name, content)
+                if name == library and deps is not None:
+                    write_atomic(deps / library, content)
+        # DuckDB's release archives do not consistently contain the license.
+        write_atomic(output / "LICENSE.duckdb", Path(__file__).with_name("duckdb-LICENSE").read_bytes())
+        metadata = {"version": manifest["version"], "archive": archive, "sha256": checksum}
+        write_atomic(output / "runtime.json", (json.dumps(metadata, indent=2) + "\n").encode())
+    return downloaded
 
 
 def stage(binaries, runtime, output, target, source_sha, tooling_sha, cli_only, source, image_only=False):
@@ -83,6 +121,8 @@ if __name__ == "__main__":
     p.add_argument("--source", type=Path, required=True)
     p.add_argument("--target", required=True)
     p.add_argument("--output", type=Path, required=True)
+    p.add_argument("--cache", type=Path)
+    p.add_argument("--deps", type=Path)
     p = commands.add_parser("stage")
     p.add_argument("--source", type=Path, required=True)
     p.add_argument("--binaries", type=Path, required=True)

@@ -70,7 +70,11 @@ fn exercise(linked: bool) {
         "[package]\nname='provenance-fixture'\nversion='0.0.0'\nedition='2024'\n[workspace]\n",
     )
     .unwrap();
-    std::fs::write(repo.join("core/build.rs"), include_str!("../build.rs")).unwrap();
+    std::fs::write(
+        repo.join("core/build.rs"),
+        include_str!("../build_support/provenance.rs"),
+    )
+    .unwrap();
     std::fs::write(
         repo.join("core/src/main.rs"),
         "fn main() { println!(\"{} {}\", env!(\"TRAWL_GIT_SHA\"), env!(\"TRAWL_GIT_DIRTY\")); }",

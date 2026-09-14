@@ -51,6 +51,11 @@ jobs:
           persist-credentials: false
       - name: Install Debian package test tooling
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends dpkg-dev
+      # Runtime tests compile the actual Cargo helper, then exercise its target
+      # and integrity boundaries with cached fixtures and no downloader on PATH.
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1; pinned via toolchain input
+        with:
+          toolchain: 1.98.0
       # Publication DAG tests use Helm's YAML parser, avoiding another YAML dependency.
       - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
       - run: python3 -m unittest discover -s scripts/release -p 'test_*.py' -v
@@ -101,13 +106,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: clippy
-      # Force build script re-run so it re-downloads the prebuilt library.
-      # rust-cache cleans non-standard target dirs (including duckdb-download/)
-      # but preserves stale build script output, causing linker failures.
-      - run: cargo clean -p libduckdb-sys 2>/dev/null || true
       - run: cargo clippy --workspace --all-targets --no-default-features
-        env:
-          DUCKDB_DOWNLOAD_LIB: "1"
 
   test:
     # The single workspace test job. Postgres backs the pg-based integration
@@ -166,12 +165,10 @@ jobs:
       - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079
         with:
           tool: nextest@0.9.143
-      - run: cargo clean -p libduckdb-sys 2>/dev/null || true
       # Explicit migration step: run the operational `fleet-admin migrate`
       # command against the service container. Spells out AC10's migration
       # step and exercises the exact deploy-time command the helm init
-      # container runs (AC11) against a live postgres. fleet-admin has no
-      # duckdb dependency, so no DUCKDB_DOWNLOAD_LIB is needed here.
+      # container runs (AC11) against a live postgres.
       - name: Apply fleet-auth schema migrations
         run: cargo run -p fleet-admin -- migrate
         env:
@@ -187,8 +184,6 @@ jobs:
       - run: >-
           cargo nextest run --workspace --no-default-features
           --features fleet-auth/keystore,fleet-auth/axum,fleet-auth/fast-hash
-        env:
-          DUCKDB_DOWNLOAD_LIB: "1"
           # DATABASE_URL, not FLEET_DATABASE_URL: trawld's [auth] resolution
           # treats FLEET_DATABASE_URL as its highest-precedence keystore
           # override (ADR-0004 slice 3), so setting it process-wide would
@@ -207,14 +202,10 @@ jobs:
           cargo xtask pg-admission-guard --
           --no-default-features
           --features fleet-auth/keystore,fleet-auth/axum,fleet-auth/fast-hash
-        env:
-          DUCKDB_DOWNLOAD_LIB: "1"
-      - name: Smoke-test downloaded DuckDB development launcher
+      - name: Smoke-test verified DuckDB development launcher
         run: |
           cargo build -p trawl-server --no-default-features
           bin/trawld-dev --version
-        env:
-          DUCKDB_DOWNLOAD_LIB: "1"
 
   msrv:
     name: msrv check
@@ -225,10 +216,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: msrv
-      - run: cargo clean -p libduckdb-sys 2>/dev/null || true
       - run: cargo check --workspace --no-default-features
-        env:
-          DUCKDB_DOWNLOAD_LIB: "1"
 
   deny:
     name: cargo-deny

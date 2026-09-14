@@ -37,6 +37,15 @@ older supported distribution. A direct native arm64 build on a newer system
 does not establish Bookworm compatibility; use `build-arm64.sh` for portable
 artifacts and repeat the fresh native Bookworm checks.
 
+Ordinary native Cargo commands use `trawl-core`'s build script to call the same
+`distribution.py prepare` verifier. They need Python 3.11 or newer and curl.
+The helper checks each cached ZIP before extraction, stages files atomically,
+and serializes writers to the same checksum-addressed archive cache. Each build
+gets a private runtime plus a loader copy in its profile's `deps` directory.
+`DUCKDB_LIB_DIR` selects the release runtime directory and rechecks its ZIP;
+it does not skip verification. The helper does not add an absolute rpath, so
+the distribution build's relative loader path remains the only shipped rpath.
+
 `distribution.py stage` creates `bin/` and `lib/trawl/`, includes the runtime
 license, the product checkout's MPL license, platform floor, and provenance, and normalizes/signs Mach-O loader paths on macOS.
 `verify-distribution.py` checks architecture, dependencies, loader paths and
@@ -64,6 +73,7 @@ Fast helper tests:
 
 ```sh
 python3 scripts/release/test_distribution.py
+python3 scripts/release/test_cargo_runtime.py
 python3 scripts/release/test_release_source.py
 bash -n scripts/release/build-distribution.sh scripts/release/build-arm64.sh scripts/release/test-installed-debian.sh
 ```

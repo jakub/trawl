@@ -21,13 +21,24 @@ Fleet auth, and creates the `fleet-developer` role and an API key. It then runs
 `trawld`, `trawl-web`, and `trunk serve`. The `trawl-login` pane prints the key.
 Open `http://localhost:8081/login` and paste it.
 
-Ordinary Cargo builds and `bin/dev` link the downloaded DuckDB shared library,
-which includes ICU, JSON, and Parquet. The download is cached under
-`target/duckdb-download` and reused. Cargo supplies the development loader path
-for `cargo run` and tests; `bin/trawld-dev` supplies it when Fleet launches the
-already-built daemon. Keep the library with its development build. For distributable artifacts, use the
-[shared-runtime source build](/getting-started/#build-from-source), which verifies
-the official library and stages it with the executables.
+Native development needs the pinned Rust toolchain, a C toolchain, Python 3.11
+or newer, and curl. Ordinary `cargo build`, `cargo test`, `cargo run`, and
+`bin/dev` verify the official DuckDB archive against
+`scripts/release/duckdb-runtime.json` before linking it. The shared library
+includes ICU, JSON, and Parquet. Cargo profiles reuse a checksum-addressed
+archive cache under `target/duckdb-runtime-cache`; cross builds keep their cache
+under `target/<triple>/duckdb-runtime-cache`. Custom target directories work too.
+The build stages a verified library in its output directory and `profile/deps`.
+Cargo supplies the loader path for runs and tests; `bin/trawld-dev` supplies it
+when Fleet launches the already-built daemon. Keep the library with that build.
+
+Native `trawl-core` builds also prepare the runtime so its standalone parity
+tests work with ordinary Cargo commands. Wasm and other parser-only targets do
+not acquire a native library. An inherited `DUCKDB_DOWNLOAD_LIB=1` is rejected;
+unset it or set it to `0`. An explicit `DUCKDB_LIB_DIR` must be a writable
+runtime directory prepared by the distribution helper, with its verified ZIP.
+The build rechecks that archive and replaces the extracted library before linking.
+For distributable artifacts, use the [shared-runtime source build](/getting-started/#build-from-source).
 
 The interactive database lives in the named `fleet-dev-postgres-data` volume,
 which is separate from the disposable clusters in `docker-compose.dev.yml`. When
