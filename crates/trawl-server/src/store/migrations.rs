@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Fresh-schema admission and forward migrations for Fleet database.
+//! Fresh-schema admission and forward migrations for Trawl app-state database.
 
 use sqlx::{
     Connection as _, PgConnection, PgPool,
@@ -11,40 +11,26 @@ use sqlx::{
 
 /// First supported schema. Earlier deployment histories are not adopted.
 pub const BASELINE_VERSION: i64 = 20_260_913_000_001;
-const LEGACY_VERSIONS: &[i64] = &[20_260_515_000_001, 20_260_726_000_001, 20_260_812_000_001];
-
-/// Embedded forward migrations, also available to `SQLx` test infrastructure.
-/// Operational callers use `migrate`, which enforces fresh-schema admission.
-pub static MIGRATOR: Migrator = sqlx::migrate!();
+const LEGACY_VERSIONS: &[i64] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17];
 
 /// Schema admission, validation, and execution failures remain distinguishable.
 #[derive(Debug, thiserror::Error)]
 pub enum SchemaError {
     /// A known pre-baseline installation must be retained, not converted.
     #[error(
-        "Fleet database has unsupported pre-1.0 migration {version}; provision a new dedicated database and retain the old database; do not delete or rewrite its migration history"
+        "Trawl app-state database has unsupported pre-1.0 migration {version}; provision a new dedicated database and retain the old database; do not delete or rewrite its migration history"
     )]
     LegacyHistory { version: i64 },
     /// Tables without a supported history must never be adopted implicitly.
     #[error(
-        "Fleet database is nonempty without a supported baseline; provision a new dedicated database and retain this database"
+        "Trawl app-state database is nonempty without a supported baseline; provision a new dedicated database and retain this database"
     )]
     UntrackedSchema,
-    /// Runtime validation never initializes an empty database.
-    #[error(
-        "Fleet database has no initial schema; apply its migrations to a fresh dedicated database before starting the application"
-    )]
-    Uninitialized,
-    /// Known forward migration has not yet been applied.
-    #[error(
-        "Fleet database needs migration {version}; apply its migrations before starting the application"
-    )]
-    PendingMigration { version: i64 },
     /// Preserve unknown versions, checksum mismatch, and dirty-current errors.
-    #[error("Fleet database migration error: {0}")]
+    #[error("Trawl app-state database migration error: {0}")]
     Migration(#[from] MigrateError),
     /// Database errors are logged locally and redacted at HTTP boundaries.
-    #[error("Fleet database schema check failed: {0}")]
+    #[error("Trawl app-state database schema check failed: {0}")]
     Database(#[from] sqlx::Error),
 }
 
@@ -61,7 +47,7 @@ async fn migrate_with(pool: &PgPool, migrator: &Migrator) -> Result<(), SchemaEr
     let mut conn = pool.acquire().await?.detach();
     let result: Result<(), SchemaError> = async {
         conn.lock().await?;
-        check_history(&mut conn, migrator, false).await?;
+        check_history(&mut conn, migrator).await?;
         migrator.run_direct(None, &mut conn, false).await?;
         Ok(())
     }
@@ -72,29 +58,7 @@ async fn migrate_with(pool: &PgPool, migrator: &Migrator) -> Result<(), SchemaEr
     Ok(())
 }
 
-/// Validate the complete known history without applying migrations or DDL.
-/// One read-only snapshot prevents ledger reads spanning a concurrent commit.
-pub async fn validate_schema(pool: &PgPool) -> Result<(), SchemaError> {
-    let mut conn = pool.acquire().await?.detach();
-    let result: Result<(), SchemaError> = async {
-        sqlx::query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
-            .execute(&mut conn)
-            .await?;
-        check_history(&mut conn, &MIGRATOR, true).await
-    }
-    .await;
-    // Closing rolls back the read-only transaction and never recycles it.
-    let close = conn.close().await;
-    result?;
-    close?;
-    Ok(())
-}
-
-async fn check_history(
-    conn: &mut PgConnection,
-    migrator: &Migrator,
-    require_current: bool,
-) -> Result<(), SchemaError> {
+async fn check_history(conn: &mut PgConnection, migrator: &Migrator) -> Result<(), SchemaError> {
     let has_ledger: bool = sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NOT NULL")
         .fetch_one(&mut *conn)
         .await?;
@@ -132,11 +96,7 @@ async fn check_history(
         if nonempty {
             return Err(SchemaError::UntrackedSchema);
         }
-        return if require_current {
-            Err(SchemaError::Uninitialized)
-        } else {
-            Ok(())
-        };
+        return Ok(());
     }
     for (version, success, checksum) in &history {
         if LEGACY_VERSIONS.contains(version) {
@@ -158,17 +118,6 @@ async fn check_history(
     {
         return Err(SchemaError::UntrackedSchema);
     }
-    if require_current {
-        for migration in migrator.iter() {
-            if !history
-                .iter()
-                .any(|(version, _, _)| *version == migration.version)
-            {
-                return Err(SchemaError::PendingMigration {
-                    version: migration.version,
-                });
-            }
-        }
-    }
+
     Ok(())
 }

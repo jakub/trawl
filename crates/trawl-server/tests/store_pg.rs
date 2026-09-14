@@ -2768,114 +2768,25 @@ async fn boot(url: &str) -> Result<StorageState, StoreError> {
     StorageState::from_pool(common::app_pool(url).await).await
 }
 
-/// 0017's `next_fire_at` backfill multiplies a schedule's `interval_secs`
-/// by one second to extrapolate the next fire, and nothing before this
-/// change bounded that column above 60. `interval * INTERVAL '1 second'`
-/// overflows postgres' interval type far below BIGINT, so one absurd legacy
-/// row would abort the migration and wedge boot for everything behind it.
-///
-/// Surviving the migration is only half of it. A row left above the cap
-/// boots fine and then wedges the SCHEDULER instead: `plan_due_run` cannot
-/// turn `i64::MAX` seconds into a span, so it answers
-/// `PlanError::Arithmetic` and the tick spends a failed transaction on that
-/// schedule every poll, forever, without ever moving its cursor. So the
-/// migration clamps the column, and this test checks the clamp by planning
-/// a run over it.
-///
-/// This drives the real thing: migrate to 0016, plant `i64::MAX`, then
-/// apply 0017 and read back what it wrote.
-#[tokio::test]
-async fn migration_0017_survives_an_absurd_legacy_interval() {
-    let url = common::create_app_database().await;
-    let pool = common::app_pool(&url).await;
-    let migrator = sqlx::migrate::Migrator::new(std::path::Path::new("migrations"))
+/// The fresh schema refuses durations above the grammar cap at the database
+/// boundary. It never repairs or clamps old schedules.
+#[sqlx::test]
+async fn initial_schema_refuses_absurd_intervals(pool: PgPool) {
+    let saved_id = saved(&pool)
+        .create(1, "duration-boundary", "q")
         .await
-        .expect("the crate's own migrations directory");
-
-    migrator.run_to(16, &pool).await.expect("migrate to 0016");
-
-    let saved_id: i64 = sqlx::query_scalar(
-        "INSERT INTO saved_queries (key_id, name, query, created_at, updated_at)
-         VALUES (1, 'legacy', 'q', now(), now()) RETURNING id",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    let schedule_id: i64 = sqlx::query_scalar(
-        "INSERT INTO schedules (saved_query_id, key_id, interval_secs, created_at, updated_at)
-         VALUES ($1, 1, 9223372036854775807, now(), now()) RETURNING id",
-    )
-    .bind(saved_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    // The backfill only extrapolates for a schedule that has run.
-    sqlx::query(
-        "INSERT INTO report_runs (schedule_id, saved_query_id, query, status, started_at)
-         VALUES ($1, $2, 'q', 'success', now())",
-    )
-    .bind(schedule_id)
-    .bind(saved_id)
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    // A second absurd row with NO runs. The backfill gives it now(), so it
-    // is due on the very first tick after upgrade, which is the shape that
-    // makes an unclamped interval a permanent error rather than a problem
-    // ten years out.
-    let due_saved_id: i64 = sqlx::query_scalar(
-        "INSERT INTO saved_queries (key_id, name, query, created_at, updated_at)
-         VALUES (1, 'legacy-due', 'q', now(), now()) RETURNING id",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    let due_schedule_id: i64 = sqlx::query_scalar(
-        "INSERT INTO schedules (saved_query_id, key_id, interval_secs, created_at, updated_at)
-         VALUES ($1, 1, 9223372036854775807, now(), now()) RETURNING id",
-    )
-    .bind(due_saved_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-
-    migrator.run(&pool).await.expect("0017 must not abort");
-
-    let next: chrono::DateTime<chrono::Utc> =
-        sqlx::query_scalar("SELECT next_fire_at FROM schedules WHERE id = $1")
-            .bind(schedule_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    let ten_years = chrono::Duration::seconds(315_360_000);
-    let slack = chrono::Duration::hours(1);
-    let now = chrono::Utc::now();
-    assert!(
-        next > now + ten_years - slack && next < now + ten_years + slack,
-        "the cursor is the capped extrapolation, not an overflow: {next}"
-    );
-
-    let clamped: i64 = sqlx::query_scalar("SELECT interval_secs FROM schedules WHERE id = $1")
-        .bind(schedule_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(
-        clamped, 315_360_000,
-        "the column itself is clamped, not just the arithmetic that read it"
-    );
-
-    // The whole point of the clamp: a due legacy schedule plans. Unclamped
-    // this is Err(Plan(Arithmetic)) on this poll and on every poll after it.
-    let claimed = ScheduleStore::new(pool.clone())
-        .claim_due_run(due_schedule_id, chrono::Utc::now(), 24)
-        .await
-        .expect("a clamped interval must be plannable");
-    assert!(
-        matches!(claimed, DueClaim::Started(_)),
-        "the backfilled cursor is now(), so the schedule is due: got {claimed:?}"
-    );
+        .unwrap()
+        .id;
+    for interval in [315_360_001_i64, i64::MAX] {
+        let error = sqlx::query(
+            "INSERT INTO schedules (saved_query_id, key_id, interval_secs, created_at, updated_at, next_fire_at)
+             VALUES ($1, 1, $2, now(), now(), now())",
+        ).bind(saved_id).bind(interval).execute(&pool).await.unwrap_err();
+        assert_eq!(
+            error.as_database_error().unwrap().constraint(),
+            Some("schedules_interval_within_cap")
+        );
+    }
 }
 
 /// Fresh empty database + the real boot path applies the schema
@@ -3086,7 +2997,7 @@ mod catalog {
             );
         }
         // `_producer` is server-stamped provenance, seeded VARCHAR by
-        // migration 0011 so its closed vocabulary (http | syslog | trawld)
+        // the initial schema so its closed vocabulary (http | syslog | trawld)
         // is never typed by inference.
         assert_eq!(
             pins.iter().find(|(f, _)| f == "_producer").map(|(_, t)| *t),
@@ -3094,365 +3005,44 @@ mod catalog {
         );
     }
 
-    /// Migration 0010's DELETE is scoped to the rows migration 0002
-    /// declared: a sender's own `severity` pin is ordinary data and survives
-    /// the reshape, along with its observations and evidence.
+    /// A baseline rerun preserves sender pins, catalog identity, and completed
+    /// passes. Fresh completion flags remain absent until the passes record them.
     #[sqlx::test]
-    async fn the_seed_reshape_leaves_a_senders_own_severity_pin_standing(pool: PgPool) {
+    async fn baseline_restart_preserves_catalog_state_and_sender_pins(pool: PgPool) {
+        let initial: (String, bool, bool) = sqlx::query_as(
+            "SELECT catalog_id::text, conformed_at IS NULL, services_backfilled_at IS NULL FROM catalog_state",
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(initial.0.len(), 36);
+        assert!(initial.1 && initial.2);
         let store = catalog(&pool);
-        // A sender pins `severity` itself, exactly as any custom field.
-        let pinned = store
+        store
             .pin_missing(&[proposal("severity", CanonicalType::BigInt)])
             .await
             .unwrap();
-        assert_eq!(pinned.get("severity"), Some(&CanonicalType::BigInt));
-
-        // Re-running the reshape's own statements must not touch it.
-        sqlx::query(
-            "DELETE FROM field_types WHERE field IN ('severity', 'severity_text') \
-             AND pinned_from = '_declared'",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
+        sqlx::query("UPDATE catalog_state SET conformed_at=now(), services_backfilled_at=now()")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let before: String =
+            sqlx::query_scalar("SELECT to_jsonb(catalog_state)::text FROM catalog_state")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        trawl_server::store::migrations::migrate(&pool)
+            .await
+            .unwrap();
+        let after: String =
+            sqlx::query_scalar("SELECT to_jsonb(catalog_state)::text FROM catalog_state")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(before, after);
         let pins = store.load_pins().await.unwrap();
         assert_eq!(
             pins.iter().find(|(f, _)| f == "severity").map(|(_, t)| *t),
-            Some(CanonicalType::BigInt),
-            "a sender's pin is not the declared seed"
-        );
-    }
-
-    /// Row counts for `field` in (`field_services`, `field_conflicts`,
-    /// `field_conflict_stats`) — the three tables the reshape prunes.
-    async fn evidence_of(pool: &PgPool, field: &str) -> [i64; 3] {
-        let services = sqlx::query_scalar("SELECT count(*) FROM field_services WHERE field = $1")
-            .bind(field)
-            .fetch_one(pool)
-            .await
-            .unwrap();
-        let conflicts = sqlx::query_scalar("SELECT count(*) FROM field_conflicts WHERE field = $1")
-            .bind(field)
-            .fetch_one(pool)
-            .await
-            .unwrap();
-        let stats =
-            sqlx::query_scalar("SELECT count(*) FROM field_conflict_stats WHERE field = $1")
-                .bind(field)
-                .fetch_one(pool)
-                .await
-                .unwrap();
-        [services, conflicts, stats]
-    }
-
-    /// The declared envelope as of migration 0010, written out.
-    ///
-    /// A migration-boundary assertion has to name the envelope of its own
-    /// moment. Deriving it from today's `ENVELOPE_TYPES`, even minus the
-    /// fields added since, couples the frozen past to the living present:
-    /// retyping an envelope field would silently rewrite what this test
-    /// claims 0010 produced, and every later addition would need another
-    /// subtraction here. sqlx migrations are immutable once merged, so this
-    /// list is too.
-    const ENVELOPE_AT_0010: &[(&str, CanonicalType)] = &[
-        ("_time", CanonicalType::Timestamp),
-        ("_ingested", CanonicalType::Timestamp),
-        ("_raw", CanonicalType::Varchar),
-        ("_repairs", CanonicalType::Varchar),
-        ("_severity", CanonicalType::Severity),
-        ("env", CanonicalType::Varchar),
-        ("service", CanonicalType::Varchar),
-        ("host", CanonicalType::Varchar),
-        ("message", CanonicalType::Varchar),
-    ];
-
-    fn envelope_at_0010() -> impl Iterator<Item = &'static (&'static str, CanonicalType)> {
-        ENVELOPE_AT_0010.iter()
-    }
-
-    /// Migration 0010 applied over a real pre-cutover catalog.
-    ///
-    /// The reshape test above starts from the already-migrated schema and
-    /// replays one of 0010's statements by hand, which can only speak for
-    /// forward behaviour. This one builds the state a live install upgrades
-    /// from (migrations 0001-0009, the declared `severity`/`severity_text`
-    /// seed with observations and conflict evidence, a sender-owned
-    /// `_severity` pin from before the `_` prefix was sealed, an unrelated
-    /// sender field, a stamped `conformed_at`) and then applies 0010 over it.
-    /// sqlx migrations are immutable once merged, so this is the only window
-    /// in which the conditional DELETEs can be proven to scope correctly, and
-    /// the corpus a mis-scoped DELETE unstores is standing data.
-    #[sqlx::test(migrations = false)]
-    async fn applying_0010_over_a_0009_catalog_reshapes_only_the_declared_rows(pool: PgPool) {
-        // The crate's real migration set, the same files
-        // `StorageState::connect` runs, so neither half can drift.
-        static MIGRATIONS: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
-        MIGRATIONS
-            .run_to(9, &pool)
-            .await
-            .expect("apply 0001-0009 (the pre-cutover schema)");
-
-        // Pre-cutover sender state: `_severity` was pinnable from ordinary
-        // sender data, and `duration` is the bystander nothing may touch.
-        sqlx::query(
-            "INSERT INTO field_types (field, duckdb_type, pinned_from, pinned_at) VALUES
-                 ('_severity', 'VARCHAR', 'legacy-svc', now() - interval '30 days'),
-                 ('duration',  'BIGINT',  'svc-a',      now() - interval '30 days')",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO field_services (field, service, row_count) VALUES
-                 ('severity',      'nginx',      10),
-                 ('severity_text', 'nginx',      10),
-                 ('_severity',     'legacy-svc', 10),
-                 ('duration',      'svc-a',      10)",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO field_conflicts
-                 (field, service, observed_type, expected_type, rows_nulled, samples) VALUES
-                 ('severity',      'nginx',      'VARCHAR', 'BIGINT',  3, ARRAY['warn']),
-                 ('severity_text', 'nginx',      'BIGINT',  'VARCHAR', 1, ARRAY['17']),
-                 ('_severity',     'legacy-svc', 'BIGINT',  'VARCHAR', 2, ARRAY['9']),
-                 ('duration',      'svc-a',      'VARCHAR', 'BIGINT',  5, ARRAY['fast'])",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO field_conflict_stats
-                 (field, service, episodes, rows_nulled_total) VALUES
-                 ('severity',      'nginx',      2, 3),
-                 ('severity_text', 'nginx',      1, 1),
-                 ('_severity',     'legacy-svc', 4, 2),
-                 ('duration',      'svc-a',      6, 5)",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        // A node that has already proven its corpus conformant, and already
-        // backfilled its observations.
-        sqlx::query(
-            "UPDATE catalog_state SET conformed_at = now(), services_backfilled_at = now()",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        MIGRATIONS
-            .run_to(10, &pool)
-            .await
-            .expect("apply 0010 over the pre-cutover catalog");
-
-        // The pin table: exactly the envelope 0010 declares (nine fields;
-        // `_producer` is 0011's, proven in the sibling test below) plus the
-        // bystander. `load_pins` parsing at all proves the widened CHECK
-        // constraint and `CanonicalType::from_catalog` agree on SEVERITY.
-        let pins = catalog(&pool).load_pins().await.unwrap();
-        for (field, ty) in envelope_at_0010() {
-            assert_eq!(
-                pins.iter().find(|(f, _)| f == field).map(|(_, t)| *t),
-                Some(*ty),
-                "declared {field} must stand after the reshape"
-            );
-        }
-        assert!(
-            !pins.iter().any(|(f, _)| f == "_producer"),
-            "`_producer` is 0011's, not 0010's: {pins:?}"
-        );
-        assert_eq!(
-            pins.iter().find(|(f, _)| f == "duration").map(|(_, t)| *t),
-            Some(CanonicalType::BigInt),
-            "an unrelated sender pin is untouched"
-        );
-        assert_eq!(
-            pins.len(),
-            envelope_at_0010().count() + 1,
-            "the reshape leaves the declared envelope plus the sender's own pin: {pins:?}"
-        );
-        // `_severity` is replaced, not merely present: the sender's VARCHAR
-        // pin is gone and the row is the declared seed's.
-        let pinned_from: Option<String> =
-            sqlx::query_scalar("SELECT pinned_from FROM field_types WHERE field = '_severity'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(pinned_from.as_deref(), Some("_declared"));
-        let bystander: Option<String> =
-            sqlx::query_scalar("SELECT pinned_from FROM field_types WHERE field = 'duration'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(bystander.as_deref(), Some("svc-a"));
-
-        // Evidence follows the pin it describes: the two retired declared
-        // names and the replaced `_severity` lose theirs, the bystander
-        // keeps all three rows.
-        for gone in ["severity", "severity_text", "_severity"] {
-            assert_eq!(
-                evidence_of(&pool, gone).await,
-                [0, 0, 0],
-                "{gone}'s observations and conflict evidence go with its pin"
-            );
-        }
-        assert_eq!(
-            evidence_of(&pool, "duration").await,
-            [1, 1, 1],
-            "an unrelated field's evidence survives the reshape"
-        );
-
-        // Re-armed for epoch 3's fresh data root, and nothing else in
-        // `catalog_state` is disturbed (a set-aside root has no standing
-        // corpus to backfill observations from).
-        let (conformed, backfilled): (
-            Option<chrono::DateTime<chrono::Utc>>,
-            Option<chrono::DateTime<chrono::Utc>>,
-        ) = sqlx::query_as("SELECT conformed_at, services_backfilled_at FROM catalog_state")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert!(conformed.is_none(), "the conformance pass must be re-armed");
-        assert!(
-            backfilled.is_some(),
-            "the observation backfill flag is not the reshape's business"
-        );
-    }
-
-    /// Migration 0011 (`_producer`) applied over a catalog that already
-    /// carries a sender-owned `_producer` pin.
-    ///
-    /// Such a pin can only date from before the `_` prefix was sealed, which
-    /// is exactly the catalog a live install replays 0010 and 0011 over in one
-    /// boot. 0011's DELETEs claim the name unconditionally, because the column
-    /// is server-stamped and typing it from an old sender's data would misread
-    /// a closed vocabulary. A merged migration is immutable, so this is the
-    /// only window in which that scoping can be proven.
-    #[sqlx::test(migrations = false)]
-    async fn applying_0011_claims_producer_and_leaves_sender_pins_alone(pool: PgPool) {
-        static MIGRATIONS: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
-        MIGRATIONS
-            .run_to(9, &pool)
-            .await
-            .expect("apply 0001-0009 (the pre-cutover schema)");
-
-        // The era when `_` was an ordinary character: a sender pinned
-        // `_producer` from its own data, with observations and evidence.
-        // `duration` is the bystander nothing may touch.
-        sqlx::query(
-            "INSERT INTO field_types (field, duckdb_type, pinned_from, pinned_at) VALUES
-                 ('_producer', 'BIGINT', 'legacy-svc', now() - interval '30 days'),
-                 ('duration',  'BIGINT', 'svc-a',      now() - interval '30 days')",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO field_services (field, service, row_count) VALUES
-                 ('_producer', 'legacy-svc', 10),
-                 ('duration',  'svc-a',      10)",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO field_conflicts
-                 (field, service, observed_type, expected_type, rows_nulled, samples) VALUES
-                 ('_producer', 'legacy-svc', 'VARCHAR', 'BIGINT', 2, ARRAY['edge-1']),
-                 ('duration',  'svc-a',      'VARCHAR', 'BIGINT', 5, ARRAY['fast'])",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO field_conflict_stats (field, service, episodes, rows_nulled_total) VALUES
-                 ('_producer', 'legacy-svc', 4, 2),
-                 ('duration',  'svc-a',      6, 5)",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        MIGRATIONS
-            .run_to(11, &pool)
-            .await
-            .expect("apply 0010 and 0011 over the pre-cutover catalog");
-
-        // The full declared envelope now stands, `_producer` included.
-        let pins = catalog(&pool).load_pins().await.unwrap();
-        for (field, ty) in ENVELOPE_TYPES {
-            assert_eq!(
-                pins.iter().find(|(f, _)| f == field).map(|(_, t)| *t),
-                Some(*ty),
-                "declared {field} must stand after 0011"
-            );
-        }
-        assert_eq!(
-            pins.len(),
-            ENVELOPE_TYPES.len() + 1,
-            "the ten declared fields plus the sender's own pin: {pins:?}"
-        );
-
-        // `_producer` is replaced, not merely present: the sender's BIGINT
-        // pin is gone, the row is the declared seed's, and the evidence
-        // describing the retired pin goes with it.
-        let pinned_from: Option<String> =
-            sqlx::query_scalar("SELECT pinned_from FROM field_types WHERE field = '_producer'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(pinned_from.as_deref(), Some("_declared"));
-        assert_eq!(
-            evidence_of(&pool, "_producer").await,
-            [0, 0, 0],
-            "the retired pin's observations and evidence go with it"
-        );
-
-        // The bystander is untouched in every table.
-        assert_eq!(
-            pins.iter().find(|(f, _)| f == "duration").map(|(_, t)| *t),
             Some(CanonicalType::BigInt)
         );
-        assert_eq!(
-            evidence_of(&pool, "duration").await,
-            [1, 1, 1],
-            "an unrelated field's evidence survives 0011"
-        );
-    }
-
-    /// `_producer` is a new column on a corpus that never held one, so
-    /// 0011 must not re-arm the boot conformance pass: `UNION ALL BY NAME`
-    /// tolerates a column absent from older parquet, and a spurious
-    /// re-arm would make every upgrading node re-walk its whole archive.
-    #[sqlx::test(migrations = false)]
-    async fn migration_0011_leaves_the_conformance_flags_alone(pool: PgPool) {
-        static MIGRATIONS: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
-        MIGRATIONS.run_to(10, &pool).await.expect("apply 0001-0010");
-        sqlx::query(
-            "UPDATE catalog_state SET conformed_at = now(), services_backfilled_at = now()",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        MIGRATIONS.run_to(11, &pool).await.expect("apply 0011");
-
-        let (conformed, backfilled): (
-            Option<chrono::DateTime<chrono::Utc>>,
-            Option<chrono::DateTime<chrono::Utc>>,
-        ) = sqlx::query_as("SELECT conformed_at, services_backfilled_at FROM catalog_state")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert!(
-            conformed.is_some(),
-            "adding a never-before-written column re-arms nothing"
-        );
-        assert!(backfilled.is_some());
+        assert_eq!(pins.len(), ENVELOPE_TYPES.len() + 1);
     }
 
     #[sqlx::test]
@@ -5796,7 +5386,7 @@ mod repin_store {
     async fn finish_cutover_flips_pin_and_job_transactionally_and_idempotently(pool: PgPool) {
         let s = store(&pool);
         let catalog = CatalogStore::new(pool.clone());
-        // `host` is seeded VARCHAR by migration 0002; the flip retypes it.
+        // `host` is seeded VARCHAR by the initial schema; the flip retypes it.
         let id = s
             .claim(RepinClaim {
                 field: "host",
@@ -6325,7 +5915,7 @@ mod repin_store {
         assert_eq!(dry.dialect, None);
     }
 
-    /// The SEVERITY target and its dialect (migration 0012): both type
+    /// The SEVERITY target and its dialect: both type
     /// CHECKs admit the catalog spelling, so a repin away from a severity pin
     /// claims a job whose `from_type` is SEVERITY, and the dialect is stored
     /// exactly for a severity target. The scope CHECK runs both ways, so a
@@ -7026,7 +6616,7 @@ mod repin_store {
         assert_eq!(after_second.finished_at, after_first.finished_at);
     }
 
-    /// The crash state (migration 0014): a job whose cancel was requested
+    /// The crash state: a job whose cancel was requested
     /// but never observed dies `running` and boot reconciliation fails it,
     /// request fields and all. The constraints must admit that row —
     /// `cancelled` is live-process-only, so recovery may not infer it from

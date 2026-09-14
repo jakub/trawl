@@ -209,6 +209,10 @@ impl From<fleet_auth::AuthError> for ServerError {
                 tracing::error!(target: "auth.backend", error = %e, "fleet auth migration error");
                 Self::ServiceUnavailable("auth backend unavailable".into())
             }
+            E::Schema(e) => {
+                tracing::error!(target: "auth.backend", error = %e, "fleet auth schema error");
+                Self::ServiceUnavailable("auth backend unavailable".into())
+            }
             E::Hash(e) | E::TokenGeneration(e) => {
                 tracing::error!(target: "auth.backend", error = %e, "fleet auth worker error");
                 Self::ServiceUnavailable("auth backend unavailable".into())

@@ -1405,16 +1405,14 @@ async fn live_key_by_id_reflects_role_changes(pool: sqlx::PgPool) {
 // connect() — URL-based construction for daemon consumers (ADR-0004)
 // ---------------------------------------------------------------------------
 
-/// `KeyStore::connect` establishes a pool from a database URL and validates
-/// connectivity eagerly (trawld fails fast at startup on a dead backend).
-#[sqlx::test(migrations = false)]
-async fn connect_and_ping_via_url(_pool: sqlx::PgPool) {
-    // DATABASE_URL is guaranteed set here — #[sqlx::test] enforces it
-    // loudly. Ping only touches SELECT 1, so the admin database is fine.
-    let url = std::env::var("DATABASE_URL").expect("#[sqlx::test] enforces DATABASE_URL");
-    let store = KeyStore::connect(&url).await.expect("connect");
+/// `KeyStore::connect` validates both reachability and the migrated schema.
+/// Its URL names the owned per-test database, never the `SQLx` admin database.
+#[sqlx::test]
+async fn connect_and_ping_via_url(pool: sqlx::PgPool) {
+    use sqlx::ConnectOptions as _;
+    let url = pool.connect_options().to_url_lossy();
+    let store = KeyStore::connect(url.as_str()).await.expect("connect");
     store.ping().await.expect("ping");
-    // Close eagerly so nextest doesn't flag the lazy pool teardown as a leak.
     store.pool().close().await;
 }
 

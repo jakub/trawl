@@ -17,6 +17,11 @@ pub enum AuthError {
     #[error("auth migration error: {0}")]
     Migration(#[from] sqlx::migrate::MigrateError),
 
+    /// Fresh-baseline admission or read-only schema validation failed.
+    #[cfg(feature = "keystore")]
+    #[error(transparent)]
+    Schema(#[from] crate::migrations::SchemaError),
+
     /// Argon2id hashing or verification failed.
     #[error("token hashing error: {0}")]
     Hash(String),

@@ -913,15 +913,17 @@ mod tests {
     }
 
     /// The spellings inside the status CHECK's `IN (...)` list, in the
-    /// migration that last re-created it. The extractor is deliberately
-    /// dumb — first `CHECK (status IN (` to the next `)` — which is why
-    /// that list stays on its own lines with nothing but quoted spellings
-    /// in it.
+    /// initial schema's `repin_jobs` table. Scope to the named constraint so
+    /// report/history status checks cannot satisfy the assertion.
     fn migration_status_spellings() -> Vec<String> {
-        const SQL: &str = include_str!("../../migrations/0014_repin_cancel.sql");
+        const SQL: &str = include_str!("../../migrations/20260913000001_initial_schema.sql");
         const OPEN: &str = "CHECK (status IN (";
-        let start = SQL.find(OPEN).expect("0014 re-creates the status CHECK") + OPEN.len();
-        let rest = &SQL[start..];
+        let constraint = SQL
+            .split_once("CONSTRAINT repin_jobs_status_check")
+            .expect("repin status constraint")
+            .1;
+        let start = constraint.find(OPEN).expect("repin status IN list") + OPEN.len();
+        let rest = &constraint[start..];
         let end = rest.find(')').expect("the IN list closes");
         rest[..end]
             .split(',')
