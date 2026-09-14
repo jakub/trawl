@@ -172,7 +172,14 @@ fn drawer_emits_the_sd_shell_hooks_its_css_styles() {
     // The `sd-*` shell css_chrome_parity's `drawer_shell_classes_shipped_
     // with_crate` pins: scrim, panel, header (title + actions + close),
     // body.
-    emits(DRAWER, r#"class="sd-scrim""#, ".sd-scrim");
+    //
+    // The host's two classes are conditional on `docked` (ADR-0032):
+    // the scrim paints the overlay presentation, `.sd-host` collapses
+    // the host to `display: contents` so the docked panel becomes a
+    // child of the layout that placed it.
+    emits(DRAWER, "class:sd-scrim=", ".sd-scrim");
+    emits(DRAWER, "class:sd-host=", ".sd-host");
+    emits(DRAWER, "class:sd-docked=", ".sd-drawer.sd-docked");
     emits(DRAWER, r#"class="sd-drawer""#, ".sd-drawer");
     emits(DRAWER, r#"class="sd-hd""#, ".sd-hd");
     emits(DRAWER, r#"class="sd-ttl""#, ".sd-ttl");
@@ -797,15 +804,28 @@ fn drawer_is_an_honest_non_modal_dialog() {
          users tab straight out (the issue #33 defect)"
     );
     assert!(
-        DRAWER.contains("FocusPolicy::Capture") && DRAWER.contains("use_overlay_layer_with"),
-        "the drawer must register FocusPolicy::Capture via \
-         use_overlay_layer_with — initial focus on open, restore on \
-         close, and no Tab trap"
+        DRAWER.contains("FocusPolicy::Capture") && DRAWER.contains("push_overlay_with"),
+        "the drawer must register a FocusPolicy::Capture layer — initial \
+         focus on open, restore on close, and no Tab trap. It pushes the \
+         layer itself rather than through use_overlay_layer_with because \
+         `docked` releases it at runtime (ADR-0032), so the registration \
+         is pinned on the push, not on the hook"
     );
     assert!(
         DRAWER.contains(r#"tabindex="-1""#),
         "the drawer panel needs tabindex=\"-1\" so the initial-focus \
          fallback can land on the panel itself"
+    );
+    // A05: role="dialog" needs a host element that allows it, and
+    // `<aside>` is a complementary landmark, which does not.
+    assert!(
+        DRAWER.contains(r#"<div class="sd-drawer""#),
+        "the drawer panel must be a <div> host for role=\"dialog\" (A05)"
+    );
+    assert!(
+        !DRAWER.contains("<aside"),
+        "the drawer must render no <aside> — a complementary landmark is \
+         not an allowed host for role=\"dialog\" (A05)"
     );
 }
 

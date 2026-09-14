@@ -828,6 +828,24 @@ select:focus-visible,
 
 .sd-body { flex: 1; min-height: 0; overflow: auto; padding: 16px 18px; background: var(--bg); }
 
+/* Docked presentation (ADR-0032). The host stops being a scrim and
+ * stops being a box at all, so the panel becomes a grid/flex child of
+ * the layout that placed the drawer; the panel drops fixed positioning,
+ * the overlay elevation and the slide-in, and reads as the sheet it now
+ * sits beside. Sticky so a long list scrolls past a panel that stays in
+ * view. Every app-side placement rule (column width, the narrow-width
+ * stack) is written as a descendant of the placing layout, never as a
+ * bare `.sd-host`, so the two stylesheets keep their split. */
+.sd-host { display: contents; }
+.sd-drawer.sd-docked {
+  position: sticky; top: 0; right: auto; bottom: auto;
+  width: 100%;
+  max-height: calc(100dvh - var(--topbar-h) - var(--statusbar-h) - 48px);
+  border-left: 1px solid var(--line); border-radius: var(--radius-panel);
+  box-shadow: inset 0 1px 0 var(--edge-hi), var(--elev-1);
+  animation: none;
+}
+
 /* ─────────────────────────────────────────────────────────────────
  *  Toasts (bottom-right stack)
  * ─────────────────────────────────────────────────────────────── */
