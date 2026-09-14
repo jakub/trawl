@@ -1496,10 +1496,11 @@ fn validate_max_catchup_intervals(intervals: u32) -> Result<(), ConfigError> {
 }
 
 impl Config {
-    /// Parse configuration from a TOML string.
+    /// Parse the current TOML schema with value-free error diagnostics.
     ///
-    /// Resolves paths (tilde expansion) and validates, same as [`from_file`].
-    pub fn from_toml(contents: &str) -> Result<Self, ConfigError> {
+    /// Does not resolve paths, environment overrides, or daemon constraints.
+    /// Consumers such as the browser proxy apply their own runtime validation.
+    pub fn parse_toml(contents: &str) -> Result<Self, ConfigError> {
         let deserializer =
             toml::de::Deserializer::parse(contents).map_err(|e| ConfigError::Parse {
                 path: PathBuf::from("<inline>"),
@@ -1507,26 +1508,30 @@ impl Config {
                 reason: "invalid TOML syntax",
                 offset: e.span().map(|span| span.start),
             })?;
-        let mut config: Self =
-            serde_path_to_error::deserialize(deserializer).map_err(|e| ConfigError::Parse {
-                path: PathBuf::from("<inline>"),
-                setting: if let Some(field) = e
-                    .inner()
-                    .message()
-                    .strip_prefix("missing field `")
-                    .and_then(|s| s.strip_suffix('`'))
-                {
-                    format!("{}.{field}", e.path())
-                } else {
-                    e.path().to_string()
-                },
-                reason: if e.inner().message().starts_with("unknown field") {
-                    "unknown setting"
-                } else {
-                    "invalid or missing setting"
-                },
-                offset: e.inner().span().map(|span| span.start),
-            })?;
+        serde_path_to_error::deserialize(deserializer).map_err(|e| ConfigError::Parse {
+            path: PathBuf::from("<inline>"),
+            setting: if let Some(field) = e
+                .inner()
+                .message()
+                .strip_prefix("missing field `")
+                .and_then(|s| s.strip_suffix('`'))
+            {
+                format!("{}.{field}", e.path())
+            } else {
+                e.path().to_string()
+            },
+            reason: if e.inner().message().starts_with("unknown field") {
+                "unknown setting"
+            } else {
+                "invalid or missing setting"
+            },
+            offset: e.inner().span().map(|span| span.start),
+        })
+    }
+
+    /// Parse configuration, resolve paths and overrides, and validate daemon constraints.
+    pub fn from_toml(contents: &str) -> Result<Self, ConfigError> {
+        let mut config = Self::parse_toml(contents)?;
         config.resolve_paths();
         // Applied before validation so an env-supplied address is held to the
         // same checks as a configured one, and so every downstream reader of
