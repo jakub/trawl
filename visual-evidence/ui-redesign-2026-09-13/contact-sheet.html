@@ -1,0 +1,670 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<title>Trawl UI redesign ui-redesign-2026-09-13 — contact sheet</title>
+<style>
+  :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+  body { margin: 0; padding: 24px; background: Canvas; color: CanvasText; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .provenance { font: 12px/1.6 ui-monospace, monospace; opacity: .75; margin: 0 0 24px; }
+  .scene { border-top: 1px solid rgb(128 128 128 / .35); padding-top: 16px; margin-top: 24px; }
+  .scene h2 { font-size: 15px; margin: 0 0 2px; }
+  .meta { font-weight: 400; opacity: .7; font-size: 12px; }
+  .route { margin: 0 0 12px; font-size: 12px; opacity: .8; }
+  .pair { display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-start; }
+  figure { margin: 0; max-width: 640px; }
+  figcaption { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; opacity: .65; margin-bottom: 4px; }
+  img { max-width: 100%; height: auto; border: 1px solid rgb(128 128 128 / .35); display: block; }
+</style></head>
+<body>
+<h1>Trawl UI redesign — ui-redesign-2026-09-13</h1>
+<p class="provenance">commit 3299e7fa5ca9c70130d073eb2ea1507828b81917 · dist sha256 b3dc0ea2086c4ae026f6e23d1fec64f111c5375a5aacd6b26bf4997f477de548 · port 8131 · captured 2026-09-14T08:02:11.475Z<br>
+Left is this branch through the e2e stub harness; right is the mockup the scene was drawn from (direction-a = the refined baseline, direction-b = the composition prototype).</p>
+
+  <section class="scene">
+    <h2>search-raw <span class="meta">light · 1440×1000 · corpus</span></h2>
+    <p class="route"><code>/search?q=service%3Dnginx&page=0</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="search-raw-light-1440.png"><img src="search-raw-light-1440.png" alt="search-raw light 1440"></a></figure>
+      <figure><figcaption>direction-a mockup</figcaption><a href="mockup-direction-a-search-light-after.png"><img src="mockup-direction-a-search-light-after.png" alt="direction-a mockup"></a></figure>
+      <figure><figcaption>direction-b mockup</figcaption><a href="mockup-direction-b-raw-light-1440.png"><img src="mockup-direction-b-raw-light-1440.png" alt="direction-b mockup"></a></figure>
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>search-raw <span class="meta">dark · 1440×1000 · corpus</span></h2>
+    <p class="route"><code>/search?q=service%3Dnginx&page=0</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="search-raw-dark-1440.png"><img src="search-raw-dark-1440.png" alt="search-raw dark 1440"></a></figure>
+      <figure><figcaption>direction-a mockup</figcaption><a href="mockup-direction-a-search-dark-after.png"><img src="mockup-direction-a-search-dark-after.png" alt="direction-a mockup"></a></figure>
+      <figure><figcaption>direction-b mockup</figcaption><a href="mockup-direction-b-raw-dark-1440.png"><img src="mockup-direction-b-raw-dark-1440.png" alt="direction-b mockup"></a></figure>
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>search-raw <span class="meta">light · 390×1000 · corpus</span></h2>
+    <p class="route"><code>/search?q=service%3Dnginx&page=0</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="search-raw-light-390.png"><img src="search-raw-light-390.png" alt="search-raw light 390"></a></figure>
+      <figure><figcaption>direction-a mockup</figcaption><a href="mockup-direction-a-search-mobile-light-after.png"><img src="mockup-direction-a-search-mobile-light-after.png" alt="direction-a mockup"></a></figure>
+      <figure><figcaption>direction-b mockup</figcaption><a href="mockup-direction-b-raw-light-390.png"><img src="mockup-direction-b-raw-light-390.png" alt="direction-b mockup"></a></figure>
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>search-raw <span class="meta">dark · 390×1000 · corpus</span></h2>
+    <p class="route"><code>/search?q=service%3Dnginx&page=0</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="search-raw-dark-390.png"><img src="search-raw-dark-390.png" alt="search-raw dark 390"></a></figure>
+      <figure><figcaption>direction-a mockup</figcaption><a href="mockup-direction-a-search-mobile-dark-after.png"><img src="mockup-direction-a-search-mobile-dark-after.png" alt="direction-a mockup"></a></figure>
+      <figure><figcaption>direction-b mockup</figcaption><a href="mockup-direction-b-raw-light-390.png"><img src="mockup-direction-b-raw-light-390.png" alt="direction-b mockup"></a></figure>
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>search-filtered <span class="meta">light · 1440×1000 · corpus</span></h2>
+    <p class="route"><code>/search?q=service%3Dnginx&page=0&f=v1.W3sib3AiOiIrIiwiZmllbGQiOiJob3N0IiwidmFsdWUiOiJ3ZWItMDEifV0&r=2026-01-01T00:00:00Z..now</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="search-filtered-light-1440.png"><img src="search-filtered-light-1440.png" alt="search-filtered light 1440"></a></figure>
+      <figure><figcaption>direction-a mockup</figcaption><a href="mockup-direction-a-filtered-light-after.png"><img src="mockup-direction-a-filtered-light-after.png" alt="direction-a mockup"></a></figure>
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>search-filtered <span class="meta">dark · 1440×1000 · corpus</span></h2>
+    <p class="route"><code>/search?q=service%3Dnginx&page=0&f=v1.W3sib3AiOiIrIiwiZmllbGQiOiJob3N0IiwidmFsdWUiOiJ3ZWItMDEifV0&r=2026-01-01T00:00:00Z..now</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="search-filtered-dark-1440.png"><img src="search-filtered-dark-1440.png" alt="search-filtered dark 1440"></a></figure>
+      <figure><figcaption>direction-a mockup</figcaption><a href="mockup-direction-a-filtered-dark-after.png"><img src="mockup-direction-a-filtered-dark-after.png" alt="direction-a mockup"></a></figure>
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>search-filtered <span class="meta">light · 390×1000 · corpus</span></h2>
+    <p class="route"><code>/search?q=service%3Dnginx&page=0&f=v1.W3sib3AiOiIrIiwiZmllbGQiOiJob3N0IiwidmFsdWUiOiJ3ZWItMDEifV0&r=2026-01-01T00:00:00Z..now</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="search-filtered-light-390.png"><img src="search-filtered-light-390.png" alt="search-filtered light 390"></a></figure>
+      
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>search-filtered <span class="meta">dark · 390×1000 · corpus</span></h2>
+    <p class="route"><code>/search?q=service%3Dnginx&page=0&f=v1.W3sib3AiOiIrIiwiZmllbGQiOiJob3N0IiwidmFsdWUiOiJ3ZWItMDEifV0&r=2026-01-01T00:00:00Z..now</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="search-filtered-dark-390.png"><img src="search-filtered-dark-390.png" alt="search-filtered dark 390"></a></figure>
+      
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>search-inspector <span class="meta">light · 1440×1000 · corpus</span></h2>
+    <p class="route"><code>/search?q=service%3Dnginx&page=0</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="search-inspector-light-1440.png"><img src="search-inspector-light-1440.png" alt="search-inspector light 1440"></a></figure>
+      
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>search-inspector <span class="meta">dark · 1440×1000 · corpus</span></h2>
+    <p class="route"><code>/search?q=service%3Dnginx&page=0</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="search-inspector-dark-1440.png"><img src="search-inspector-dark-1440.png" alt="search-inspector dark 1440"></a></figure>
+      
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>search-inspector <span class="meta">light · 390×1000 · corpus</span></h2>
+    <p class="route"><code>/search?q=service%3Dnginx&page=0</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="search-inspector-light-390.png"><img src="search-inspector-light-390.png" alt="search-inspector light 390"></a></figure>
+      
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>search-inspector <span class="meta">dark · 390×1000 · corpus</span></h2>
+    <p class="route"><code>/search?q=service%3Dnginx&page=0</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="search-inspector-dark-390.png"><img src="search-inspector-dark-390.png" alt="search-inspector dark 390"></a></figure>
+      
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>search-message-first <span class="meta">light · 1440×1000 · corpus</span></h2>
+    <p class="route"><code>/search?q=service%3Dnginx&page=0</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="search-message-first-light-1440.png"><img src="search-message-first-light-1440.png" alt="search-message-first light 1440"></a></figure>
+      
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>search-message-first <span class="meta">dark · 1440×1000 · corpus</span></h2>
+    <p class="route"><code>/search?q=service%3Dnginx&page=0</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="search-message-first-dark-1440.png"><img src="search-message-first-dark-1440.png" alt="search-message-first dark 1440"></a></figure>
+      
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>search-message-first <span class="meta">light · 390×1000 · corpus</span></h2>
+    <p class="route"><code>/search?q=service%3Dnginx&page=0</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="search-message-first-light-390.png"><img src="search-message-first-light-390.png" alt="search-message-first light 390"></a></figure>
+      
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>search-message-first <span class="meta">dark · 390×1000 · corpus</span></h2>
+    <p class="route"><code>/search?q=service%3Dnginx&page=0</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="search-message-first-dark-390.png"><img src="search-message-first-dark-390.png" alt="search-message-first dark 390"></a></figure>
+      
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>search-aggregate <span class="meta">light · 1440×1000 · corpus</span></h2>
+    <p class="route"><code>/search?q=service%3Dnginx%20%7C%20stats%20count()%20by%20status</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="search-aggregate-light-1440.png"><img src="search-aggregate-light-1440.png" alt="search-aggregate light 1440"></a></figure>
+      <figure><figcaption>direction-a mockup</figcaption><a href="mockup-direction-a-aggregate-light-after.png"><img src="mockup-direction-a-aggregate-light-after.png" alt="direction-a mockup"></a></figure>
+      <figure><figcaption>direction-b mockup</figcaption><a href="mockup-direction-b-aggregate-dark-1440.png"><img src="mockup-direction-b-aggregate-dark-1440.png" alt="direction-b mockup"></a></figure>
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>search-aggregate <span class="meta">dark · 1440×1000 · corpus</span></h2>
+    <p class="route"><code>/search?q=service%3Dnginx%20%7C%20stats%20count()%20by%20status</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="search-aggregate-dark-1440.png"><img src="search-aggregate-dark-1440.png" alt="search-aggregate dark 1440"></a></figure>
+      <figure><figcaption>direction-a mockup</figcaption><a href="mockup-direction-a-aggregate-dark-after.png"><img src="mockup-direction-a-aggregate-dark-after.png" alt="direction-a mockup"></a></figure>
+      <figure><figcaption>direction-b mockup</figcaption><a href="mockup-direction-b-aggregate-dark-1440.png"><img src="mockup-direction-b-aggregate-dark-1440.png" alt="direction-b mockup"></a></figure>
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>search-aggregate <span class="meta">light · 390×1000 · corpus</span></h2>
+    <p class="route"><code>/search?q=service%3Dnginx%20%7C%20stats%20count()%20by%20status</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="search-aggregate-light-390.png"><img src="search-aggregate-light-390.png" alt="search-aggregate light 390"></a></figure>
+      
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>search-aggregate <span class="meta">dark · 390×1000 · corpus</span></h2>
+    <p class="route"><code>/search?q=service%3Dnginx%20%7C%20stats%20count()%20by%20status</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="search-aggregate-dark-390.png"><img src="search-aggregate-dark-390.png" alt="search-aggregate dark 390"></a></figure>
+      
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>search-live <span class="meta">light · 1440×1000 · stream-burst</span></h2>
+    <p class="route"><code>/search?q=service%3Dnginx&mode=live</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="search-live-light-1440.png"><img src="search-live-light-1440.png" alt="search-live light 1440"></a></figure>
+      <figure><figcaption>direction-b mockup</figcaption><a href="mockup-direction-b-live-dark-1440-full.png"><img src="mockup-direction-b-live-dark-1440-full.png" alt="direction-b mockup"></a></figure>
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>search-live <span class="meta">dark · 1440×1000 · stream-burst</span></h2>
+    <p class="route"><code>/search?q=service%3Dnginx&mode=live</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="search-live-dark-1440.png"><img src="search-live-dark-1440.png" alt="search-live dark 1440"></a></figure>
+      <figure><figcaption>direction-b mockup</figcaption><a href="mockup-direction-b-live-dark-1440-full.png"><img src="mockup-direction-b-live-dark-1440-full.png" alt="direction-b mockup"></a></figure>
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>search-live <span class="meta">light · 390×1000 · stream-burst</span></h2>
+    <p class="route"><code>/search?q=service%3Dnginx&mode=live</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="search-live-light-390.png"><img src="search-live-light-390.png" alt="search-live light 390"></a></figure>
+      
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>search-live <span class="meta">dark · 390×1000 · stream-burst</span></h2>
+    <p class="route"><code>/search?q=service%3Dnginx&mode=live</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="search-live-dark-390.png"><img src="search-live-dark-390.png" alt="search-live dark 390"></a></figure>
+      
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>search-malformed <span class="meta">light · 1440×1000 · corpus</span></h2>
+    <p class="route"><code>/search?q=service%3Dnginx&f=v1.!</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="search-malformed-light-1440.png"><img src="search-malformed-light-1440.png" alt="search-malformed light 1440"></a></figure>
+      
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>search-malformed <span class="meta">dark · 1440×1000 · corpus</span></h2>
+    <p class="route"><code>/search?q=service%3Dnginx&f=v1.!</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="search-malformed-dark-1440.png"><img src="search-malformed-dark-1440.png" alt="search-malformed dark 1440"></a></figure>
+      
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>search-malformed <span class="meta">light · 390×1000 · corpus</span></h2>
+    <p class="route"><code>/search?q=service%3Dnginx&f=v1.!</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="search-malformed-light-390.png"><img src="search-malformed-light-390.png" alt="search-malformed light 390"></a></figure>
+      
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>search-malformed <span class="meta">dark · 390×1000 · corpus</span></h2>
+    <p class="route"><code>/search?q=service%3Dnginx&f=v1.!</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="search-malformed-dark-390.png"><img src="search-malformed-dark-390.png" alt="search-malformed dark 390"></a></figure>
+      
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>schema <span class="meta">light · 1440×1000 · corpus</span></h2>
+    <p class="route"><code>/search/schema?svc=nginx&stab=fields</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="schema-light-1440.png"><img src="schema-light-1440.png" alt="schema light 1440"></a></figure>
+      <figure><figcaption>direction-a mockup</figcaption><a href="mockup-direction-a-fields-light-after.png"><img src="mockup-direction-a-fields-light-after.png" alt="direction-a mockup"></a></figure>
+      <figure><figcaption>direction-b mockup</figcaption><a href="mockup-direction-b-schema-light-1440.png"><img src="mockup-direction-b-schema-light-1440.png" alt="direction-b mockup"></a></figure>
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>schema <span class="meta">dark · 1440×1000 · corpus</span></h2>
+    <p class="route"><code>/search/schema?svc=nginx&stab=fields</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="schema-dark-1440.png"><img src="schema-dark-1440.png" alt="schema dark 1440"></a></figure>
+      <figure><figcaption>direction-a mockup</figcaption><a href="mockup-direction-a-fields-dark-after.png"><img src="mockup-direction-a-fields-dark-after.png" alt="direction-a mockup"></a></figure>
+      <figure><figcaption>direction-b mockup</figcaption><a href="mockup-direction-b-schema-light-1440.png"><img src="mockup-direction-b-schema-light-1440.png" alt="direction-b mockup"></a></figure>
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>schema <span class="meta">light · 390×1000 · corpus</span></h2>
+    <p class="route"><code>/search/schema?svc=nginx&stab=fields</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="schema-light-390.png"><img src="schema-light-390.png" alt="schema light 390"></a></figure>
+      
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>schema <span class="meta">dark · 390×1000 · corpus</span></h2>
+    <p class="route"><code>/search/schema?svc=nginx&stab=fields</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="schema-dark-390.png"><img src="schema-dark-390.png" alt="schema dark 390"></a></figure>
+      
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>nets-schedule <span class="meta">light · 1440×1000 · schedule</span></h2>
+    <p class="route"><code>/jobs/nets?net=2&ntab=query</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="nets-schedule-light-1440.png"><img src="nets-schedule-light-1440.png" alt="nets-schedule light 1440"></a></figure>
+      <figure><figcaption>direction-a mockup</figcaption><a href="mockup-direction-a-schedule-light-after.png"><img src="mockup-direction-a-schedule-light-after.png" alt="direction-a mockup"></a></figure>
+      <figure><figcaption>direction-b mockup</figcaption><a href="mockup-direction-b-schedule-light-1440.png"><img src="mockup-direction-b-schedule-light-1440.png" alt="direction-b mockup"></a></figure>
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>nets-schedule <span class="meta">dark · 1440×1000 · schedule</span></h2>
+    <p class="route"><code>/jobs/nets?net=2&ntab=query</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="nets-schedule-dark-1440.png"><img src="nets-schedule-dark-1440.png" alt="nets-schedule dark 1440"></a></figure>
+      <figure><figcaption>direction-a mockup</figcaption><a href="mockup-direction-a-schedule-dark-after.png"><img src="mockup-direction-a-schedule-dark-after.png" alt="direction-a mockup"></a></figure>
+      <figure><figcaption>direction-b mockup</figcaption><a href="mockup-direction-b-schedule-light-1440.png"><img src="mockup-direction-b-schedule-light-1440.png" alt="direction-b mockup"></a></figure>
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>nets-schedule <span class="meta">light · 390×1000 · schedule</span></h2>
+    <p class="route"><code>/jobs/nets?net=2&ntab=query</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="nets-schedule-light-390.png"><img src="nets-schedule-light-390.png" alt="nets-schedule light 390"></a></figure>
+      <figure><figcaption>direction-b mockup</figcaption><a href="mockup-direction-b-schedule-dark-390.png"><img src="mockup-direction-b-schedule-dark-390.png" alt="direction-b mockup"></a></figure>
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>nets-schedule <span class="meta">dark · 390×1000 · schedule</span></h2>
+    <p class="route"><code>/jobs/nets?net=2&ntab=query</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="nets-schedule-dark-390.png"><img src="nets-schedule-dark-390.png" alt="nets-schedule dark 390"></a></figure>
+      <figure><figcaption>direction-b mockup</figcaption><a href="mockup-direction-b-schedule-dark-390.png"><img src="mockup-direction-b-schedule-dark-390.png" alt="direction-b mockup"></a></figure>
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>runs <span class="meta">light · 1440×1000 · corpus</span></h2>
+    <p class="route"><code>/jobs/runs?run=501&net=1</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="runs-light-1440.png"><img src="runs-light-1440.png" alt="runs light 1440"></a></figure>
+      <figure><figcaption>direction-a mockup</figcaption><a href="mockup-direction-a-run-light-after.png"><img src="mockup-direction-a-run-light-after.png" alt="direction-a mockup"></a></figure>
+      <figure><figcaption>direction-b mockup</figcaption><a href="mockup-direction-b-runs-dark-1440.png"><img src="mockup-direction-b-runs-dark-1440.png" alt="direction-b mockup"></a></figure>
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>runs <span class="meta">dark · 1440×1000 · corpus</span></h2>
+    <p class="route"><code>/jobs/runs?run=501&net=1</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="runs-dark-1440.png"><img src="runs-dark-1440.png" alt="runs dark 1440"></a></figure>
+      <figure><figcaption>direction-a mockup</figcaption><a href="mockup-direction-a-run-dark-after.png"><img src="mockup-direction-a-run-dark-after.png" alt="direction-a mockup"></a></figure>
+      <figure><figcaption>direction-b mockup</figcaption><a href="mockup-direction-b-runs-dark-1440.png"><img src="mockup-direction-b-runs-dark-1440.png" alt="direction-b mockup"></a></figure>
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>runs <span class="meta">light · 390×1000 · corpus</span></h2>
+    <p class="route"><code>/jobs/runs?run=501&net=1</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="runs-light-390.png"><img src="runs-light-390.png" alt="runs light 390"></a></figure>
+      
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>runs <span class="meta">dark · 390×1000 · corpus</span></h2>
+    <p class="route"><code>/jobs/runs?run=501&net=1</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="runs-dark-390.png"><img src="runs-dark-390.png" alt="runs dark 390"></a></figure>
+      
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>history <span class="meta">light · 1440×1000 · corpus</span></h2>
+    <p class="route"><code>/search/history</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="history-light-1440.png"><img src="history-light-1440.png" alt="history light 1440"></a></figure>
+      <figure><figcaption>direction-b mockup</figcaption><a href="mockup-direction-b-history-dark-1440.png"><img src="mockup-direction-b-history-dark-1440.png" alt="direction-b mockup"></a></figure>
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>history <span class="meta">dark · 1440×1000 · corpus</span></h2>
+    <p class="route"><code>/search/history</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="history-dark-1440.png"><img src="history-dark-1440.png" alt="history dark 1440"></a></figure>
+      <figure><figcaption>direction-b mockup</figcaption><a href="mockup-direction-b-history-dark-1440.png"><img src="mockup-direction-b-history-dark-1440.png" alt="direction-b mockup"></a></figure>
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>history <span class="meta">light · 390×1000 · corpus</span></h2>
+    <p class="route"><code>/search/history</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="history-light-390.png"><img src="history-light-390.png" alt="history light 390"></a></figure>
+      
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>history <span class="meta">dark · 390×1000 · corpus</span></h2>
+    <p class="route"><code>/search/history</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="history-dark-390.png"><img src="history-dark-390.png" alt="history dark 390"></a></figure>
+      
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>health-admin <span class="meta">light · 1440×1000 · health-admin</span></h2>
+    <p class="route"><code>/settings/health</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="health-admin-light-1440.png"><img src="health-admin-light-1440.png" alt="health-admin light 1440"></a></figure>
+      <figure><figcaption>direction-a mockup</figcaption><a href="mockup-direction-a-health-light-after.png"><img src="mockup-direction-a-health-light-after.png" alt="direction-a mockup"></a></figure>
+      <figure><figcaption>direction-b mockup</figcaption><a href="mockup-direction-b-health-light-1440.png"><img src="mockup-direction-b-health-light-1440.png" alt="direction-b mockup"></a></figure>
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>health-admin <span class="meta">dark · 1440×1000 · health-admin</span></h2>
+    <p class="route"><code>/settings/health</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="health-admin-dark-1440.png"><img src="health-admin-dark-1440.png" alt="health-admin dark 1440"></a></figure>
+      <figure><figcaption>direction-a mockup</figcaption><a href="mockup-direction-a-health-dark-after.png"><img src="mockup-direction-a-health-dark-after.png" alt="direction-a mockup"></a></figure>
+      <figure><figcaption>direction-b mockup</figcaption><a href="mockup-direction-b-health-light-1440.png"><img src="mockup-direction-b-health-light-1440.png" alt="direction-b mockup"></a></figure>
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>health-admin <span class="meta">light · 390×1000 · health-admin</span></h2>
+    <p class="route"><code>/settings/health</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="health-admin-light-390.png"><img src="health-admin-light-390.png" alt="health-admin light 390"></a></figure>
+      
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>health-admin <span class="meta">dark · 390×1000 · health-admin</span></h2>
+    <p class="route"><code>/settings/health</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="health-admin-dark-390.png"><img src="health-admin-dark-390.png" alt="health-admin dark 390"></a></figure>
+      
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>health-unavailable <span class="meta">light · 1440×1000 · health-degraded</span></h2>
+    <p class="route"><code>/settings/health</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="health-unavailable-light-1440.png"><img src="health-unavailable-light-1440.png" alt="health-unavailable light 1440"></a></figure>
+      
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>health-unavailable <span class="meta">dark · 1440×1000 · health-degraded</span></h2>
+    <p class="route"><code>/settings/health</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="health-unavailable-dark-1440.png"><img src="health-unavailable-dark-1440.png" alt="health-unavailable dark 1440"></a></figure>
+      
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>health-unavailable <span class="meta">light · 390×1000 · health-degraded</span></h2>
+    <p class="route"><code>/settings/health</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="health-unavailable-light-390.png"><img src="health-unavailable-light-390.png" alt="health-unavailable light 390"></a></figure>
+      
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>health-unavailable <span class="meta">dark · 390×1000 · health-degraded</span></h2>
+    <p class="route"><code>/settings/health</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="health-unavailable-dark-390.png"><img src="health-unavailable-dark-390.png" alt="health-unavailable dark 390"></a></figure>
+      
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>login <span class="meta">light · 1440×1000 · unauth</span></h2>
+    <p class="route"><code>/login</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="login-light-1440.png"><img src="login-light-1440.png" alt="login light 1440"></a></figure>
+      <figure><figcaption>direction-a mockup</figcaption><a href="mockup-direction-a-login-light-after.png"><img src="mockup-direction-a-login-light-after.png" alt="direction-a mockup"></a></figure>
+      <figure><figcaption>direction-b mockup</figcaption><a href="mockup-direction-b-login-light-1440.png"><img src="mockup-direction-b-login-light-1440.png" alt="direction-b mockup"></a></figure>
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>login <span class="meta">dark · 1440×1000 · unauth</span></h2>
+    <p class="route"><code>/login</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="login-dark-1440.png"><img src="login-dark-1440.png" alt="login dark 1440"></a></figure>
+      <figure><figcaption>direction-a mockup</figcaption><a href="mockup-direction-a-login-dark-after.png"><img src="mockup-direction-a-login-dark-after.png" alt="direction-a mockup"></a></figure>
+      <figure><figcaption>direction-b mockup</figcaption><a href="mockup-direction-b-login-light-1440.png"><img src="mockup-direction-b-login-light-1440.png" alt="direction-b mockup"></a></figure>
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>login <span class="meta">light · 390×1000 · unauth</span></h2>
+    <p class="route"><code>/login</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="login-light-390.png"><img src="login-light-390.png" alt="login light 390"></a></figure>
+      
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>login <span class="meta">dark · 390×1000 · unauth</span></h2>
+    <p class="route"><code>/login</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="login-dark-390.png"><img src="login-dark-390.png" alt="login dark 390"></a></figure>
+      
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>login-error <span class="meta">light · 1440×1000 · unauth</span></h2>
+    <p class="route"><code>/login</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="login-error-light-1440.png"><img src="login-error-light-1440.png" alt="login-error light 1440"></a></figure>
+      
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>login-error <span class="meta">dark · 1440×1000 · unauth</span></h2>
+    <p class="route"><code>/login</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="login-error-dark-1440.png"><img src="login-error-dark-1440.png" alt="login-error dark 1440"></a></figure>
+      
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>login-error <span class="meta">light · 390×1000 · unauth</span></h2>
+    <p class="route"><code>/login</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="login-error-light-390.png"><img src="login-error-light-390.png" alt="login-error light 390"></a></figure>
+      
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>login-error <span class="meta">dark · 390×1000 · unauth</span></h2>
+    <p class="route"><code>/login</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="login-error-dark-390.png"><img src="login-error-dark-390.png" alt="login-error dark 390"></a></figure>
+      
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>not-found <span class="meta">light · 1440×1000 · default</span></h2>
+    <p class="route"><code>/definitely-not-a-route</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="not-found-light-1440.png"><img src="not-found-light-1440.png" alt="not-found light 1440"></a></figure>
+      
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>not-found <span class="meta">dark · 1440×1000 · default</span></h2>
+    <p class="route"><code>/definitely-not-a-route</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="not-found-dark-1440.png"><img src="not-found-dark-1440.png" alt="not-found dark 1440"></a></figure>
+      
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>not-found <span class="meta">light · 390×1000 · default</span></h2>
+    <p class="route"><code>/definitely-not-a-route</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="not-found-light-390.png"><img src="not-found-light-390.png" alt="not-found light 390"></a></figure>
+      
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>not-found <span class="meta">dark · 390×1000 · default</span></h2>
+    <p class="route"><code>/definitely-not-a-route</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="not-found-dark-390.png"><img src="not-found-dark-390.png" alt="not-found dark 390"></a></figure>
+      
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>palette <span class="meta">light · 1440×1000 · corpus</span></h2>
+    <p class="route"><code>/search</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="palette-light-1440.png"><img src="palette-light-1440.png" alt="palette light 1440"></a></figure>
+      <figure><figcaption>direction-a mockup</figcaption><a href="mockup-direction-a-palette-light-after.png"><img src="mockup-direction-a-palette-light-after.png" alt="direction-a mockup"></a></figure>
+      <figure><figcaption>direction-b mockup</figcaption><a href="mockup-direction-b-palette-dark-1440.png"><img src="mockup-direction-b-palette-dark-1440.png" alt="direction-b mockup"></a></figure>
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>palette <span class="meta">dark · 1440×1000 · corpus</span></h2>
+    <p class="route"><code>/search</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="palette-dark-1440.png"><img src="palette-dark-1440.png" alt="palette dark 1440"></a></figure>
+      <figure><figcaption>direction-a mockup</figcaption><a href="mockup-direction-a-palette-dark-after.png"><img src="mockup-direction-a-palette-dark-after.png" alt="direction-a mockup"></a></figure>
+      <figure><figcaption>direction-b mockup</figcaption><a href="mockup-direction-b-palette-dark-1440.png"><img src="mockup-direction-b-palette-dark-1440.png" alt="direction-b mockup"></a></figure>
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>palette <span class="meta">light · 390×1000 · corpus</span></h2>
+    <p class="route"><code>/search</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="palette-light-390.png"><img src="palette-light-390.png" alt="palette light 390"></a></figure>
+      
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>palette <span class="meta">dark · 390×1000 · corpus</span></h2>
+    <p class="route"><code>/search</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="palette-dark-390.png"><img src="palette-dark-390.png" alt="palette dark 390"></a></figure>
+      
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>mobile-nav <span class="meta">light · 390×1000 · corpus</span></h2>
+    <p class="route"><code>/search</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="mobile-nav-light-390.png"><img src="mobile-nav-light-390.png" alt="mobile-nav light 390"></a></figure>
+      
+    </div>
+  </section>
+
+  <section class="scene">
+    <h2>mobile-nav <span class="meta">dark · 390×1000 · corpus</span></h2>
+    <p class="route"><code>/search</code></p>
+    <div class="pair">
+      <figure><figcaption>capture</figcaption><a href="mobile-nav-dark-390.png"><img src="mobile-nav-dark-390.png" alt="mobile-nav dark 390"></a></figure>
+      
+    </div>
+  </section>
+</body></html>

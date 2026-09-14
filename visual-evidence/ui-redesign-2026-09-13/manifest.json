@@ -1,0 +1,725 @@
+{
+  "stamp": "ui-redesign-2026-09-13",
+  "commit": "3299e7fa5ca9c70130d073eb2ea1507828b81917",
+  "dist_sha256": "b3dc0ea2086c4ae026f6e23d1fec64f111c5375a5aacd6b26bf4997f477de548",
+  "dist_files": [
+    "index.html",
+    "trawl-web-ui-8e8c71152b94e2e7_bg.wasm"
+  ],
+  "port": 8131,
+  "captured_at": "2026-09-14T08:02:11.475Z",
+  "viewports": {
+    "wide": {
+      "width": 1440,
+      "height": 1000
+    },
+    "narrow": {
+      "width": 390,
+      "height": 1000
+    }
+  },
+  "reduced_motion": "reduce",
+  "theme_source": "localStorage['trawl.ui']",
+  "scenes": [
+    {
+      "scene": "search-raw",
+      "theme": "light",
+      "viewport": "1440x1000",
+      "scenario": "corpus",
+      "route": "/search?q=service%3Dnginx&page=0",
+      "file": "search-raw-light-1440.png",
+      "mockups": [
+        "mockup-direction-a-search-light-after.png",
+        "mockup-direction-b-raw-light-1440.png"
+      ]
+    },
+    {
+      "scene": "search-raw",
+      "theme": "dark",
+      "viewport": "1440x1000",
+      "scenario": "corpus",
+      "route": "/search?q=service%3Dnginx&page=0",
+      "file": "search-raw-dark-1440.png",
+      "mockups": [
+        "mockup-direction-a-search-dark-after.png",
+        "mockup-direction-b-raw-dark-1440.png"
+      ]
+    },
+    {
+      "scene": "search-raw",
+      "theme": "light",
+      "viewport": "390x1000",
+      "scenario": "corpus",
+      "route": "/search?q=service%3Dnginx&page=0",
+      "file": "search-raw-light-390.png",
+      "mockups": [
+        "mockup-direction-a-search-mobile-light-after.png",
+        "mockup-direction-b-raw-light-390.png"
+      ]
+    },
+    {
+      "scene": "search-raw",
+      "theme": "dark",
+      "viewport": "390x1000",
+      "scenario": "corpus",
+      "route": "/search?q=service%3Dnginx&page=0",
+      "file": "search-raw-dark-390.png",
+      "mockups": [
+        "mockup-direction-a-search-mobile-dark-after.png",
+        "mockup-direction-b-raw-light-390.png"
+      ]
+    },
+    {
+      "scene": "search-filtered",
+      "theme": "light",
+      "viewport": "1440x1000",
+      "scenario": "corpus",
+      "route": "/search?q=service%3Dnginx&page=0&f=v1.W3sib3AiOiIrIiwiZmllbGQiOiJob3N0IiwidmFsdWUiOiJ3ZWItMDEifV0&r=2026-01-01T00:00:00Z..now",
+      "file": "search-filtered-light-1440.png",
+      "mockups": [
+        "mockup-direction-a-filtered-light-after.png"
+      ]
+    },
+    {
+      "scene": "search-filtered",
+      "theme": "dark",
+      "viewport": "1440x1000",
+      "scenario": "corpus",
+      "route": "/search?q=service%3Dnginx&page=0&f=v1.W3sib3AiOiIrIiwiZmllbGQiOiJob3N0IiwidmFsdWUiOiJ3ZWItMDEifV0&r=2026-01-01T00:00:00Z..now",
+      "file": "search-filtered-dark-1440.png",
+      "mockups": [
+        "mockup-direction-a-filtered-dark-after.png"
+      ]
+    },
+    {
+      "scene": "search-filtered",
+      "theme": "light",
+      "viewport": "390x1000",
+      "scenario": "corpus",
+      "route": "/search?q=service%3Dnginx&page=0&f=v1.W3sib3AiOiIrIiwiZmllbGQiOiJob3N0IiwidmFsdWUiOiJ3ZWItMDEifV0&r=2026-01-01T00:00:00Z..now",
+      "file": "search-filtered-light-390.png",
+      "mockups": []
+    },
+    {
+      "scene": "search-filtered",
+      "theme": "dark",
+      "viewport": "390x1000",
+      "scenario": "corpus",
+      "route": "/search?q=service%3Dnginx&page=0&f=v1.W3sib3AiOiIrIiwiZmllbGQiOiJob3N0IiwidmFsdWUiOiJ3ZWItMDEifV0&r=2026-01-01T00:00:00Z..now",
+      "file": "search-filtered-dark-390.png",
+      "mockups": []
+    },
+    {
+      "scene": "search-inspector",
+      "theme": "light",
+      "viewport": "1440x1000",
+      "scenario": "corpus",
+      "route": "/search?q=service%3Dnginx&page=0",
+      "file": "search-inspector-light-1440.png",
+      "mockups": []
+    },
+    {
+      "scene": "search-inspector",
+      "theme": "dark",
+      "viewport": "1440x1000",
+      "scenario": "corpus",
+      "route": "/search?q=service%3Dnginx&page=0",
+      "file": "search-inspector-dark-1440.png",
+      "mockups": []
+    },
+    {
+      "scene": "search-inspector",
+      "theme": "light",
+      "viewport": "390x1000",
+      "scenario": "corpus",
+      "route": "/search?q=service%3Dnginx&page=0",
+      "file": "search-inspector-light-390.png",
+      "mockups": []
+    },
+    {
+      "scene": "search-inspector",
+      "theme": "dark",
+      "viewport": "390x1000",
+      "scenario": "corpus",
+      "route": "/search?q=service%3Dnginx&page=0",
+      "file": "search-inspector-dark-390.png",
+      "mockups": []
+    },
+    {
+      "scene": "search-message-first",
+      "theme": "light",
+      "viewport": "1440x1000",
+      "scenario": "corpus",
+      "route": "/search?q=service%3Dnginx&page=0",
+      "file": "search-message-first-light-1440.png",
+      "mockups": []
+    },
+    {
+      "scene": "search-message-first",
+      "theme": "dark",
+      "viewport": "1440x1000",
+      "scenario": "corpus",
+      "route": "/search?q=service%3Dnginx&page=0",
+      "file": "search-message-first-dark-1440.png",
+      "mockups": []
+    },
+    {
+      "scene": "search-message-first",
+      "theme": "light",
+      "viewport": "390x1000",
+      "scenario": "corpus",
+      "route": "/search?q=service%3Dnginx&page=0",
+      "file": "search-message-first-light-390.png",
+      "mockups": []
+    },
+    {
+      "scene": "search-message-first",
+      "theme": "dark",
+      "viewport": "390x1000",
+      "scenario": "corpus",
+      "route": "/search?q=service%3Dnginx&page=0",
+      "file": "search-message-first-dark-390.png",
+      "mockups": []
+    },
+    {
+      "scene": "search-aggregate",
+      "theme": "light",
+      "viewport": "1440x1000",
+      "scenario": "corpus",
+      "route": "/search?q=service%3Dnginx%20%7C%20stats%20count()%20by%20status",
+      "file": "search-aggregate-light-1440.png",
+      "mockups": [
+        "mockup-direction-a-aggregate-light-after.png",
+        "mockup-direction-b-aggregate-dark-1440.png"
+      ]
+    },
+    {
+      "scene": "search-aggregate",
+      "theme": "dark",
+      "viewport": "1440x1000",
+      "scenario": "corpus",
+      "route": "/search?q=service%3Dnginx%20%7C%20stats%20count()%20by%20status",
+      "file": "search-aggregate-dark-1440.png",
+      "mockups": [
+        "mockup-direction-a-aggregate-dark-after.png",
+        "mockup-direction-b-aggregate-dark-1440.png"
+      ]
+    },
+    {
+      "scene": "search-aggregate",
+      "theme": "light",
+      "viewport": "390x1000",
+      "scenario": "corpus",
+      "route": "/search?q=service%3Dnginx%20%7C%20stats%20count()%20by%20status",
+      "file": "search-aggregate-light-390.png",
+      "mockups": []
+    },
+    {
+      "scene": "search-aggregate",
+      "theme": "dark",
+      "viewport": "390x1000",
+      "scenario": "corpus",
+      "route": "/search?q=service%3Dnginx%20%7C%20stats%20count()%20by%20status",
+      "file": "search-aggregate-dark-390.png",
+      "mockups": []
+    },
+    {
+      "scene": "search-live",
+      "theme": "light",
+      "viewport": "1440x1000",
+      "scenario": "stream-burst",
+      "route": "/search?q=service%3Dnginx&mode=live",
+      "file": "search-live-light-1440.png",
+      "mockups": [
+        "mockup-direction-b-live-dark-1440-full.png"
+      ]
+    },
+    {
+      "scene": "search-live",
+      "theme": "dark",
+      "viewport": "1440x1000",
+      "scenario": "stream-burst",
+      "route": "/search?q=service%3Dnginx&mode=live",
+      "file": "search-live-dark-1440.png",
+      "mockups": [
+        "mockup-direction-b-live-dark-1440-full.png"
+      ]
+    },
+    {
+      "scene": "search-live",
+      "theme": "light",
+      "viewport": "390x1000",
+      "scenario": "stream-burst",
+      "route": "/search?q=service%3Dnginx&mode=live",
+      "file": "search-live-light-390.png",
+      "mockups": []
+    },
+    {
+      "scene": "search-live",
+      "theme": "dark",
+      "viewport": "390x1000",
+      "scenario": "stream-burst",
+      "route": "/search?q=service%3Dnginx&mode=live",
+      "file": "search-live-dark-390.png",
+      "mockups": []
+    },
+    {
+      "scene": "search-malformed",
+      "theme": "light",
+      "viewport": "1440x1000",
+      "scenario": "corpus",
+      "route": "/search?q=service%3Dnginx&f=v1.!",
+      "file": "search-malformed-light-1440.png",
+      "mockups": []
+    },
+    {
+      "scene": "search-malformed",
+      "theme": "dark",
+      "viewport": "1440x1000",
+      "scenario": "corpus",
+      "route": "/search?q=service%3Dnginx&f=v1.!",
+      "file": "search-malformed-dark-1440.png",
+      "mockups": []
+    },
+    {
+      "scene": "search-malformed",
+      "theme": "light",
+      "viewport": "390x1000",
+      "scenario": "corpus",
+      "route": "/search?q=service%3Dnginx&f=v1.!",
+      "file": "search-malformed-light-390.png",
+      "mockups": []
+    },
+    {
+      "scene": "search-malformed",
+      "theme": "dark",
+      "viewport": "390x1000",
+      "scenario": "corpus",
+      "route": "/search?q=service%3Dnginx&f=v1.!",
+      "file": "search-malformed-dark-390.png",
+      "mockups": []
+    },
+    {
+      "scene": "schema",
+      "theme": "light",
+      "viewport": "1440x1000",
+      "scenario": "corpus",
+      "route": "/search/schema?svc=nginx&stab=fields",
+      "file": "schema-light-1440.png",
+      "mockups": [
+        "mockup-direction-a-fields-light-after.png",
+        "mockup-direction-b-schema-light-1440.png"
+      ]
+    },
+    {
+      "scene": "schema",
+      "theme": "dark",
+      "viewport": "1440x1000",
+      "scenario": "corpus",
+      "route": "/search/schema?svc=nginx&stab=fields",
+      "file": "schema-dark-1440.png",
+      "mockups": [
+        "mockup-direction-a-fields-dark-after.png",
+        "mockup-direction-b-schema-light-1440.png"
+      ]
+    },
+    {
+      "scene": "schema",
+      "theme": "light",
+      "viewport": "390x1000",
+      "scenario": "corpus",
+      "route": "/search/schema?svc=nginx&stab=fields",
+      "file": "schema-light-390.png",
+      "mockups": []
+    },
+    {
+      "scene": "schema",
+      "theme": "dark",
+      "viewport": "390x1000",
+      "scenario": "corpus",
+      "route": "/search/schema?svc=nginx&stab=fields",
+      "file": "schema-dark-390.png",
+      "mockups": []
+    },
+    {
+      "scene": "nets-schedule",
+      "theme": "light",
+      "viewport": "1440x1000",
+      "scenario": "schedule",
+      "route": "/jobs/nets?net=2&ntab=query",
+      "file": "nets-schedule-light-1440.png",
+      "mockups": [
+        "mockup-direction-a-schedule-light-after.png",
+        "mockup-direction-b-schedule-light-1440.png"
+      ]
+    },
+    {
+      "scene": "nets-schedule",
+      "theme": "dark",
+      "viewport": "1440x1000",
+      "scenario": "schedule",
+      "route": "/jobs/nets?net=2&ntab=query",
+      "file": "nets-schedule-dark-1440.png",
+      "mockups": [
+        "mockup-direction-a-schedule-dark-after.png",
+        "mockup-direction-b-schedule-light-1440.png"
+      ]
+    },
+    {
+      "scene": "nets-schedule",
+      "theme": "light",
+      "viewport": "390x1000",
+      "scenario": "schedule",
+      "route": "/jobs/nets?net=2&ntab=query",
+      "file": "nets-schedule-light-390.png",
+      "mockups": [
+        "mockup-direction-b-schedule-dark-390.png"
+      ]
+    },
+    {
+      "scene": "nets-schedule",
+      "theme": "dark",
+      "viewport": "390x1000",
+      "scenario": "schedule",
+      "route": "/jobs/nets?net=2&ntab=query",
+      "file": "nets-schedule-dark-390.png",
+      "mockups": [
+        "mockup-direction-b-schedule-dark-390.png"
+      ]
+    },
+    {
+      "scene": "runs",
+      "theme": "light",
+      "viewport": "1440x1000",
+      "scenario": "corpus",
+      "route": "/jobs/runs?run=501&net=1",
+      "file": "runs-light-1440.png",
+      "mockups": [
+        "mockup-direction-a-run-light-after.png",
+        "mockup-direction-b-runs-dark-1440.png"
+      ]
+    },
+    {
+      "scene": "runs",
+      "theme": "dark",
+      "viewport": "1440x1000",
+      "scenario": "corpus",
+      "route": "/jobs/runs?run=501&net=1",
+      "file": "runs-dark-1440.png",
+      "mockups": [
+        "mockup-direction-a-run-dark-after.png",
+        "mockup-direction-b-runs-dark-1440.png"
+      ]
+    },
+    {
+      "scene": "runs",
+      "theme": "light",
+      "viewport": "390x1000",
+      "scenario": "corpus",
+      "route": "/jobs/runs?run=501&net=1",
+      "file": "runs-light-390.png",
+      "mockups": []
+    },
+    {
+      "scene": "runs",
+      "theme": "dark",
+      "viewport": "390x1000",
+      "scenario": "corpus",
+      "route": "/jobs/runs?run=501&net=1",
+      "file": "runs-dark-390.png",
+      "mockups": []
+    },
+    {
+      "scene": "history",
+      "theme": "light",
+      "viewport": "1440x1000",
+      "scenario": "corpus",
+      "route": "/search/history",
+      "file": "history-light-1440.png",
+      "mockups": [
+        "mockup-direction-b-history-dark-1440.png"
+      ]
+    },
+    {
+      "scene": "history",
+      "theme": "dark",
+      "viewport": "1440x1000",
+      "scenario": "corpus",
+      "route": "/search/history",
+      "file": "history-dark-1440.png",
+      "mockups": [
+        "mockup-direction-b-history-dark-1440.png"
+      ]
+    },
+    {
+      "scene": "history",
+      "theme": "light",
+      "viewport": "390x1000",
+      "scenario": "corpus",
+      "route": "/search/history",
+      "file": "history-light-390.png",
+      "mockups": []
+    },
+    {
+      "scene": "history",
+      "theme": "dark",
+      "viewport": "390x1000",
+      "scenario": "corpus",
+      "route": "/search/history",
+      "file": "history-dark-390.png",
+      "mockups": []
+    },
+    {
+      "scene": "health-admin",
+      "theme": "light",
+      "viewport": "1440x1000",
+      "scenario": "health-admin",
+      "route": "/settings/health",
+      "file": "health-admin-light-1440.png",
+      "mockups": [
+        "mockup-direction-a-health-light-after.png",
+        "mockup-direction-b-health-light-1440.png"
+      ]
+    },
+    {
+      "scene": "health-admin",
+      "theme": "dark",
+      "viewport": "1440x1000",
+      "scenario": "health-admin",
+      "route": "/settings/health",
+      "file": "health-admin-dark-1440.png",
+      "mockups": [
+        "mockup-direction-a-health-dark-after.png",
+        "mockup-direction-b-health-light-1440.png"
+      ]
+    },
+    {
+      "scene": "health-admin",
+      "theme": "light",
+      "viewport": "390x1000",
+      "scenario": "health-admin",
+      "route": "/settings/health",
+      "file": "health-admin-light-390.png",
+      "mockups": []
+    },
+    {
+      "scene": "health-admin",
+      "theme": "dark",
+      "viewport": "390x1000",
+      "scenario": "health-admin",
+      "route": "/settings/health",
+      "file": "health-admin-dark-390.png",
+      "mockups": []
+    },
+    {
+      "scene": "health-unavailable",
+      "theme": "light",
+      "viewport": "1440x1000",
+      "scenario": "health-degraded",
+      "route": "/settings/health",
+      "file": "health-unavailable-light-1440.png",
+      "mockups": []
+    },
+    {
+      "scene": "health-unavailable",
+      "theme": "dark",
+      "viewport": "1440x1000",
+      "scenario": "health-degraded",
+      "route": "/settings/health",
+      "file": "health-unavailable-dark-1440.png",
+      "mockups": []
+    },
+    {
+      "scene": "health-unavailable",
+      "theme": "light",
+      "viewport": "390x1000",
+      "scenario": "health-degraded",
+      "route": "/settings/health",
+      "file": "health-unavailable-light-390.png",
+      "mockups": []
+    },
+    {
+      "scene": "health-unavailable",
+      "theme": "dark",
+      "viewport": "390x1000",
+      "scenario": "health-degraded",
+      "route": "/settings/health",
+      "file": "health-unavailable-dark-390.png",
+      "mockups": []
+    },
+    {
+      "scene": "login",
+      "theme": "light",
+      "viewport": "1440x1000",
+      "scenario": "unauth",
+      "route": "/login",
+      "file": "login-light-1440.png",
+      "mockups": [
+        "mockup-direction-a-login-light-after.png",
+        "mockup-direction-b-login-light-1440.png"
+      ]
+    },
+    {
+      "scene": "login",
+      "theme": "dark",
+      "viewport": "1440x1000",
+      "scenario": "unauth",
+      "route": "/login",
+      "file": "login-dark-1440.png",
+      "mockups": [
+        "mockup-direction-a-login-dark-after.png",
+        "mockup-direction-b-login-light-1440.png"
+      ]
+    },
+    {
+      "scene": "login",
+      "theme": "light",
+      "viewport": "390x1000",
+      "scenario": "unauth",
+      "route": "/login",
+      "file": "login-light-390.png",
+      "mockups": []
+    },
+    {
+      "scene": "login",
+      "theme": "dark",
+      "viewport": "390x1000",
+      "scenario": "unauth",
+      "route": "/login",
+      "file": "login-dark-390.png",
+      "mockups": []
+    },
+    {
+      "scene": "login-error",
+      "theme": "light",
+      "viewport": "1440x1000",
+      "scenario": "unauth",
+      "route": "/login",
+      "file": "login-error-light-1440.png",
+      "mockups": []
+    },
+    {
+      "scene": "login-error",
+      "theme": "dark",
+      "viewport": "1440x1000",
+      "scenario": "unauth",
+      "route": "/login",
+      "file": "login-error-dark-1440.png",
+      "mockups": []
+    },
+    {
+      "scene": "login-error",
+      "theme": "light",
+      "viewport": "390x1000",
+      "scenario": "unauth",
+      "route": "/login",
+      "file": "login-error-light-390.png",
+      "mockups": []
+    },
+    {
+      "scene": "login-error",
+      "theme": "dark",
+      "viewport": "390x1000",
+      "scenario": "unauth",
+      "route": "/login",
+      "file": "login-error-dark-390.png",
+      "mockups": []
+    },
+    {
+      "scene": "not-found",
+      "theme": "light",
+      "viewport": "1440x1000",
+      "scenario": "default",
+      "route": "/definitely-not-a-route",
+      "file": "not-found-light-1440.png",
+      "mockups": []
+    },
+    {
+      "scene": "not-found",
+      "theme": "dark",
+      "viewport": "1440x1000",
+      "scenario": "default",
+      "route": "/definitely-not-a-route",
+      "file": "not-found-dark-1440.png",
+      "mockups": []
+    },
+    {
+      "scene": "not-found",
+      "theme": "light",
+      "viewport": "390x1000",
+      "scenario": "default",
+      "route": "/definitely-not-a-route",
+      "file": "not-found-light-390.png",
+      "mockups": []
+    },
+    {
+      "scene": "not-found",
+      "theme": "dark",
+      "viewport": "390x1000",
+      "scenario": "default",
+      "route": "/definitely-not-a-route",
+      "file": "not-found-dark-390.png",
+      "mockups": []
+    },
+    {
+      "scene": "palette",
+      "theme": "light",
+      "viewport": "1440x1000",
+      "scenario": "corpus",
+      "route": "/search",
+      "file": "palette-light-1440.png",
+      "mockups": [
+        "mockup-direction-a-palette-light-after.png",
+        "mockup-direction-b-palette-dark-1440.png"
+      ]
+    },
+    {
+      "scene": "palette",
+      "theme": "dark",
+      "viewport": "1440x1000",
+      "scenario": "corpus",
+      "route": "/search",
+      "file": "palette-dark-1440.png",
+      "mockups": [
+        "mockup-direction-a-palette-dark-after.png",
+        "mockup-direction-b-palette-dark-1440.png"
+      ]
+    },
+    {
+      "scene": "palette",
+      "theme": "light",
+      "viewport": "390x1000",
+      "scenario": "corpus",
+      "route": "/search",
+      "file": "palette-light-390.png",
+      "mockups": []
+    },
+    {
+      "scene": "palette",
+      "theme": "dark",
+      "viewport": "390x1000",
+      "scenario": "corpus",
+      "route": "/search",
+      "file": "palette-dark-390.png",
+      "mockups": []
+    },
+    {
+      "scene": "mobile-nav",
+      "theme": "light",
+      "viewport": "390x1000",
+      "scenario": "corpus",
+      "route": "/search",
+      "file": "mobile-nav-light-390.png",
+      "mockups": []
+    },
+    {
+      "scene": "mobile-nav",
+      "theme": "dark",
+      "viewport": "390x1000",
+      "scenario": "corpus",
+      "route": "/search",
+      "file": "mobile-nav-dark-390.png",
+      "mockups": []
+    }
+  ]
+}
