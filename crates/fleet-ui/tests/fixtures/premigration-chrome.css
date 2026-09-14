@@ -29,6 +29,23 @@
  * later `border-bottom` still wins. Nothing else in either body moved,
  * and the declared weights (500 active, 600 on) are untouched.
  *
+ * 2026-09-13, ADR-0032 planes: .btn-sm, .btn-sm:hover:not(:disabled),
+ * .tabs, .tabs .t, .modal .m-field input, .modal .m-field input:focus,
+ * .sd-drawer, .sd-hd, .sd-x:hover, .sd-body, .reason-input and
+ * .reason-input:focus re-captured from the shipped fleet-ui.css. The
+ * deltas are the well fill, the elevation ramp and the outline focus
+ * ring: text inputs (.modal .m-field input, .reason-input) move off the
+ * --fill wash onto --well plus the --inset shadow, .btn-sm takes --fill
+ * with an --edge-hi highlight and the --fill-2 hover the outline
+ * treatment used to spell as a panel-3 mix, .sd-drawer and .sd-hd paint
+ * the --elev-3 / --header-shadow steps with the same edge highlight,
+ * .sd-body drops to the --bg floor beneath that sheet header, and the
+ * three focus recipes stop resetting `outline: none` or painting the
+ * retired --shadow-glow, because :focus-visible now carries a 2px
+ * --ring outline at a 2px offset for every control. .tabs and .tabs .t
+ * take the 38px result-header geometry. Nothing else in the 33 rules
+ * moved.
+ *
  * The four DELIBERATE pre-ADR-0005 deltas (rail/mode anchor underline
  * suppression, .login-card .error respacing, .shell auto footer row)
  * are NOT here — they changed on purpose and are pinned individually
@@ -38,7 +55,8 @@
 
 .btn-sm {
   padding: 3px 10px;
-  background: transparent;
+  background: var(--fill);
+  box-shadow: inset 0 1px 0 var(--edge-hi);
   color: var(--ink-2);
   border: 1px solid var(--line);
   border-radius: var(--radius-ctl);
@@ -49,7 +67,7 @@
 }
 
 .btn-sm:hover:not(:disabled) {
-  background: color-mix(in oklab, var(--panel-3) 55%, transparent);
+  background: var(--fill-2);
   color: var(--ink);
 }
 
@@ -60,6 +78,9 @@
 
 .tabs {
   display: flex;
+  align-items: center;
+  min-height: 38px;
+  gap: 6px;
   background: var(--panel);
   border-bottom: 1px solid var(--line);
   padding: 0 12px;
@@ -69,7 +90,8 @@
 .tabs .t {
   background: none;
   border: none;
-  padding: 8px 12px;
+  height: 38px;
+  padding: 0 12px;
   font-size: var(--fs-base);
   color: var(--ink-3);
   cursor: pointer;
@@ -104,14 +126,15 @@
 }
 
 .modal .m-field input {
-  background: var(--fill);
+  background: var(--well);
+  box-shadow: var(--inset);
   border: 1px solid var(--line); border-radius: var(--radius-ctl);
   padding: 6px 10px; font-family: var(--font-ui); font-size: var(--fs-base);
-  color: var(--ink); outline: none; height: 30px;
+  color: var(--ink); height: 30px;
 }
 
 .modal .m-field input:focus {
-  border-color: var(--accent); box-shadow: var(--shadow-glow);
+  border-color: var(--accent);
 }
 
 .sd-scrim {
@@ -124,7 +147,7 @@
   position: fixed; top: 0; right: 0; bottom: 0;
   width: min(720px, 92vw);
   background: var(--panel); border-left: 1px solid var(--line);
-  box-shadow: -8px 0 32px -10px rgba(0,0,0,.25);
+  box-shadow: inset 0 1px 0 var(--edge-hi), var(--elev-3);
   z-index: 51;
   display: flex; flex-direction: column;
   animation: sd-slide-in 200ms cubic-bezier(.2,.8,.3,1);
@@ -138,7 +161,8 @@
   display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap;
   flex-shrink: 0;
   padding: 14px 18px; border-bottom: 1px solid var(--line);
-  gap: 16px; background: var(--panel-2);
+  gap: 16px; background: var(--panel);
+  box-shadow: inset 0 1px 0 var(--edge-hi), var(--header-shadow);
 }
 
 .sd-ttl { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; min-width: 0; overflow-wrap: anywhere; }
@@ -152,7 +176,7 @@
   display: inline-flex; align-items: center; justify-content: center;
 }
 
-.sd-x:hover { background: var(--panel-3); color: var(--ink); border-color: var(--line); }
+.sd-x:hover { background: var(--fill-2); color: var(--ink); border-color: var(--line); }
 
 .sd-tabs {
   display: flex; align-items: center; gap: 4px;
@@ -176,19 +200,18 @@
 
 .sd-tabs .meta { font-size: var(--fs-small); color: var(--ink-3); padding-right: 4px; }
 
-.sd-body { flex: 1; min-height: 0; overflow: auto; padding: 16px 18px; }
+.sd-body { flex: 1; min-height: 0; overflow: auto; padding: 16px 18px; background: var(--bg); }
 
 .btn-xs { font-size: var(--fs-small); padding: 3px 8px; }
 
 .reason-input {
   width: 100%; min-height: 60px; padding: 6px 8px;
-  background: var(--fill); color: var(--ink);
+  background: var(--well); box-shadow: var(--inset); color: var(--ink);
   border: 1px solid var(--line); border-radius: var(--radius-ctl);
   font-family: var(--font-mono); font-size: var(--fs-base);
   resize: vertical;
 }
 
 .reason-input:focus {
-  outline: none; box-shadow: var(--shadow-glow);
   border-color: var(--accent);
 }
