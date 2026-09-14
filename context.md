@@ -67,7 +67,7 @@ A small file at the top of the data directory stating a fact about the whole arc
 _Avoid_: lockfile, flag file
 
 **Epoch**:
-A generation of the stored data's format and meaning. Anything that would make existing files lie under current rules bumps it; boot sets an old-epoch root aside instead of migrating it.
+A generation of the stored data's format and meaning. Files in one epoch share the same interpretation rules.
 _Avoid_: schema version, migration level
 
 **Compaction**:
