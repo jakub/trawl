@@ -1,38 +1,59 @@
-trawl has been installed.
+Trawl has been installed.
 
+Create roles and API keys against the Fleet database:
+  https://trawl.sh/operate/access/#create-roles-and-keys
+Use a personal API key to sign in to the browser and a service key for each collector.
 {{- if .Values.initAuth.enabled }}
-
-Retrieve bootstrap API tokens (first install only):
-
-  kubectl logs {{ include "trawl.fullname" . }}-0 -c init-auth -n {{ .Release.Namespace }}
+The init-auth container initializes the database schema; it does not create API keys.
 {{- end }}
 
-Health check:
+Check the HTTPS API through a local port-forward:
 
-  kubectl exec -n {{ .Release.Namespace }} {{ include "trawl.fullname" . }}-0 -- \
-    wget -qO- --no-check-certificate https://localhost:5514/api/v1/health
+  kubectl port-forward --namespace {{ .Release.Namespace }} svc/{{ include "trawl.fullname" . }} 5514:{{ .Values.service.port }}
+
+Keep the port-forward running. In another terminal on this machine:
+
+  curl --fail-with-body --insecure https://localhost:5514/api/v1/health
+
+Expect status "ok" and every entry in "checks" to be "ok". HTTP 200 alone can
+report degraded dependencies. --insecure is only for this local check.
 
 {{- if .Values.ingress.enabled }}
-{{- range .Values.ingress.hosts }}
+{{- if eq (.Values.ingress.backend | default "web") "web" }}
 
-Web access:  https://{{ .host }}
-{{- end }}
-{{- else if .Values.httpRoute.enabled }}
-{{- range .Values.httpRoute.hostnames }}
-
-Web access:  https://{{ . }}
-{{- end }}
+Browser ingress hosts:
 {{- else }}
 
-Direct API access (port-forward, bearer-token clients):
+API ingress hosts (for bearer-token clients):
+{{- end }}
+{{- range .Values.ingress.hosts }}
+  {{ .host }}
+{{- end }}
+{{- end }}
+{{- if .Values.httpRoute.enabled }}
 
-  kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "trawl.fullname" . }} 5514:{{ .Values.service.port }}
-  curl -k https://localhost:5514/api/v1/health
+API HTTPRoute hosts (for bearer-token clients):
+{{- range .Values.httpRoute.hostnames }}
+  {{ . }}
+{{- end }}
+{{- end }}
 {{- if .Values.web.enabled }}
 
-Web UI (browsers):
+Configured browser origins:
+{{- range .Values.web.publicOrigins }}
+  {{ . }}
+{{- end }}
+{{- if and .Values.web.allowInsecureCookies (has "http://localhost:8090" .Values.web.publicOrigins) }}
 
-  kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "trawl.fullname" . }} 8090:{{ .Values.service.webPort | default 8090 }}
-  open http://localhost:8090
+For the configured local browser origin, keep this port-forward running:
+
+  kubectl port-forward --namespace {{ .Release.Namespace }} svc/{{ include "trawl.fullname" . }} 8090:{{ .Values.service.webPort | default 8090 }}
+
+Open http://localhost:8090 and sign in with your personal API key.
+{{- else }}
+
+Open a configured browser origin through its ingress or reverse proxy.
+For local HTTP access, follow the chart's port-forward setup:
+  https://trawl.sh/operate/deployment/#install-with-helm
 {{- end }}
 {{- end }}

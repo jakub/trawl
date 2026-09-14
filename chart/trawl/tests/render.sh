@@ -264,4 +264,6 @@ if grep -Fq 'public_origins' "$raw_config"; then
   exit 1
 fi
 
+python3 "$chart/tests/notes.py"
+
 echo "helm render assertions passed"
