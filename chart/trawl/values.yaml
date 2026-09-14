@@ -147,7 +147,7 @@ config:
     # ingestRpm on /api/v1/ingest. 0 = disabled for that route class.
     # The highest rate_rpm set by the key's roles replaces the route-class
     # default, including when that default is 0. See
-    # docs/src/content/docs/operate/access.md#create-roles-and-keys.
+    # https://trawl.sh/operate/access/#create-roles-and-keys.
     # Legacy per-role keys (admin/analyst/reader/ingest) fail at render.
     rateLimit:
       defaultRpm: 100
@@ -256,8 +256,8 @@ tls:
 # An existing Secret supplies DATABASE_URL to fleet-admin in the init-auth
 # container and FLEET_DATABASE_URL to trawld. The chart never renders the
 # connection string into the ConfigMap or config.raw. Provision the database
-# using docs/src/content/docs/operate/deployment.md#provision-the-databases and create keys
-# using docs/src/content/docs/operate/access.md#create-roles-and-keys.
+# using https://trawl.sh/operate/deployment/#provision-the-databases and create keys
+# using https://trawl.sh/operate/access/#create-roles-and-keys.
 # Size Vector disk buffers for deployment downtime, for example 1 GiB.
 auth:
   database:
@@ -273,7 +273,7 @@ auth:
 # string is injected as the TRAWL_DATABASE_URL env var from an existing
 # Secret — never rendered into the ConfigMap. There is NO fallback to the
 # auth URL. Provision a separate database whose role owns the schema. See
-# docs/src/content/docs/operate/deployment.md#provision-the-databases.
+# https://trawl.sh/operate/deployment/#provision-the-databases.
 storage:
   database:
     # Name of an existing Secret holding the postgres URL. REQUIRED.
@@ -286,7 +286,7 @@ storage:
 # on every pod start when enabled. sqlx tracks applied migrations.
 # If disabled, apply the Fleet schema before starting trawld.
 # The chart does not create API keys. Use fleet-admin against the shared
-# keystore as described in docs/src/content/docs/operate/access.md#create-roles-and-keys.
+# keystore as described in https://trawl.sh/operate/access/#create-roles-and-keys.
 initAuth:
   enabled: true
   resources:
@@ -354,7 +354,7 @@ web:
   # ".fleet.lab.ktle.net". Set the SAME value in every fleet app (mirrors
   # coastwatch's session.shared_domain) AND point cookieSecret.existingSecret
   # at the shared session key so every app can decrypt the cookie. See
-  # docs/src/content/docs/operate/access.md#share-a-browser-session-across-fleet-applications.
+  # https://trawl.sh/operate/access/#share-a-browser-session-across-fleet-applications.
   # Empty = standalone mode
   # (origin-scoped cookie, chart-generated key keeps working).
   sharedDomain: ""

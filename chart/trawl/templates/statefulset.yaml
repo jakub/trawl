@@ -46,7 +46,7 @@ spec:
       initContainers:
         # Apply Fleet-auth schema migrations on every pod start when enabled.
         # sqlx tracks applied migrations. Create keys with fleet-admin as
-        # described in docs/src/content/docs/operate/access.md#create-roles-and-keys.
+        # described in https://trawl.sh/operate/access/#create-roles-and-keys.
         - name: init-auth
           image: {{ include "trawl.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
@@ -85,7 +85,7 @@ spec:
             # Fleet keystore DSN — from the Secret, never the ConfigMap.
             # trawld reads FLEET_DATABASE_URL. fleet-admin in the init
             # container reads DATABASE_URL. See
-            # docs/src/content/docs/operate/deployment.md#provision-the-databases.
+            # https://trawl.sh/operate/deployment/#provision-the-databases.
             - name: FLEET_DATABASE_URL
               valueFrom:
                 secretKeyRef:

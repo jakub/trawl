@@ -10,7 +10,7 @@ if [ "$1" = "configure" ]; then
   # Preserve any old SQLite file. trawld does not read, migrate, or delete it.
   # An old [auth] db_path in trawld.toml causes a startup error. Package
   # upgrades preserve existing conffiles, so check both database URLs against
-  # docs/src/content/docs/operate/deployment.md#provision-the-databases
+  # https://trawl.sh/operate/deployment/#provision-the-databases
   # before starting trawld.
 
   # Lock down the credential-bearing config files. Both can carry postgres
