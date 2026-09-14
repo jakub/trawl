@@ -1,6 +1,7 @@
-# trawld configuration — installed by the trawld .deb package
-#
-# All fields shown with their defaults. Uncomment and modify as needed.
+# Configuration for trawld and trawl-web, installed by trawl-server.
+# Package location: /etc/trawl/trawld.toml. These deployment settings
+# include package-specific paths and listeners; commented keys are optional.
+# Setup: https://trawl.sh/operate/deployment/#install-the-debian-package
 # Byte sizes accept human-readable suffixes: K, M, G, T (binary/1024-based).
 
 [server]

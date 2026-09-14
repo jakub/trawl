@@ -1,247 +1,37 @@
-# trawld configuration
-#
-# All fields shown with their defaults. Uncomment and modify as needed.
-# Paths support ~ for $HOME expansion.
-# Byte sizes accept human-readable suffixes: K, M, G, T (binary/1024-based).
+# Standalone starter for trawld and trawl-web. See config/README.md.
+# Required: two database URLs, a writable data directory, a persistent
+# browser-session key, and the browser's HTTPS origin. Configure a trusted
+# API certificate for permanent use. Setup: https://trawl.sh/operate/deployment/
+# For a disposable local trial: https://trawl.sh/getting-started/first-query/
+# Optional settings: config/trawld.reference.toml and
+# https://trawl.sh/reference/configuration/
 
 [server]
-# Address to bind the HTTPS listener.
-# http_addr = "127.0.0.1:8080"
-
-# Query execution timeout (seconds).
-# timeout_secs = 30
-
-# Maximum concurrent queries (bounds the DuckDB executor pool).
-# Defaults to the number of available CPUs.
-# max_concurrent_queries = 4
-
-# Maximum rows a single query can return before being rejected.
-# Increase if analysts need larger result sets; decrease to bound memory.
-# max_result_rows = 100000
-
-# Maximum rows allowed in CSV export responses. Exports bypass
-# max_result_rows to support larger downloads.
-# Increase for large report exports; decrease to bound server memory.
-# max_export_rows = 1000000
-
-# Maximum request body size (default: 128K).
-# Increase if POST /query payloads are large (e.g. complex DSL queries).
-# max_request_body_bytes = "128K"
-
-# Maximum concurrent HTTP requests. Returns 503 when exceeded.
-# Increase for high-traffic deployments; decrease to protect resources.
-# max_concurrent_requests = 256
-
-# Graceful shutdown drain timeout (seconds). In-flight requests get
-# this long to finish before being aborted.
-# shutdown_drain_secs = 30
-
-# Maximum concurrent SSE streaming connections. Returns 429 when exceeded.
-# Increase if many clients use live streaming; each holds a connection open.
-# max_sse_connections = 32
-
-# Log file path (JSON format). When set, logs go to both stdout and this file.
-# Deprecated when internal_telemetry is enabled — the WAL layer replaces
-# file logging. Stdout remains active for human consumption.
-# log_file = "/var/log/trawld.log"
-
-# ndjson query debug log (one entry per query execution). SENSITIVE:
-# entries combine identity, raw query text, generated SQL with parameter
-# values, source paths, and result samples. The file is owner-only (0600)
-# on Unix and bounded by query_log_max_bytes. Put it in a directory only
-# trawld can write (NOT /tmp or any other shared-writable directory) —
-# the mode protects the file's contents, not the path leading to it.
-# A symlink at the path is refused, never followed.
-# query_log = "/var/lib/trawl/query-debug.log"
-
-# Size cap for the query debug log. Past it the file rolls over to a
-# single retained <path>.1 (also 0600). 0 disables rollover (unbounded).
-# query_log_max_bytes = "100M"
-
-# TLS certificate and key (PEM format). If omitted, a self-signed
-# certificate is auto-generated at startup. Both must be set or both omitted.
+# HTTPS API for CLI queries, collectors, and the browser proxy.
+http_addr = "127.0.0.1:5514"
+# Without both paths, trawld generates a self-signed localhost certificate.
 # tls_cert_path = "/etc/trawl/cert.pem"
 # tls_key_path = "/etc/trawl/key.pem"
 
-# How often to check cert/key files for changes (seconds). 0 = disabled.
-# Useful with ACME/Let's Encrypt where certs rotate automatically.
-# tls_reload_interval_secs = 300
-
-# CORS allowed origins. Empty list (default) means no CORS headers are
-# sent, so the browser's same-origin policy blocks cross-origin requests.
-# Set this when running the web UI on a different origin than trawld.
-# cors_allowed_origins = ["https://trawl.example.com"]
-
-# Schema cache TTL (seconds). Controls how long GET /schema results are
-# cached before re-introspecting the parquet files.
-# Decrease if schema changes frequently; increase for less disk I/O.
-# schema_cache_ttl_secs = 60
-
-# Maximum completed queries kept in the history ring buffer,
-# visible via GET /queries (admin only).
-# max_query_history = 1000
-
-# Per-key rate limit (requests per minute). Every API key gets an
-# independent token bucket: default_rpm on the interactive API routes,
-# ingest_rpm on /api/v1/ingest (shippers need a far higher ceiling than
-# humans running queries); 0 disables that route class. ingest_rpm is
-# earned by the ingest permission — every other key stays on default_rpm
-# there too.
-# The highest rate_rpm set by the key's roles replaces the route-class
-# default, including when that default is 0. See
-# https://trawl.sh/operate/access/#create-roles-and-keys.
-# [server.rate_limit]
-# default_rpm = 100
-# ingest_rpm = 1000
-
 [data]
-# Directory containing parquet files. Also accepts a glob pattern
-# (e.g. "/var/lib/trawl/data/**/*.parquet") for backwards compatibility.
 path = "~/.trawl/data"
 
 [auth]
-# Fleet-auth PostgreSQL URL for API keys and roles. The FLEET_DATABASE_URL
-# environment variable takes precedence. Before starting trawld, provision
-# the database and apply its schema with `fleet-admin migrate`. See
-# https://trawl.sh/operate/deployment/#provision-the-databases.
-database_url = "postgres://fleet:fleet@localhost:5433/fleet"
-
-# How often to poll the fleet keystore for key changes (seconds).
-# Detects keys created/revoked by fleet-admin and emits audit events.
-# Decrease for faster detection. 0 = disabled.
-# audit_interval_secs = 30
+# Required: FLEET_DATABASE_URL, or uncomment database_url below.
+# Provision the Fleet schema with fleet-admin before starting trawld.
+# database_url = "postgres://fleet:PASSWORD@db.example.com:5432/fleet"
 
 [storage]
-# Trawl app-state Postgres URL (query history, saved queries, schedules,
-# report runs). A separate database, auto-migrated by
-# trawld at boot and advisory-locked (sole writer); no fallback to the
-# [auth] URL. The TRAWL_DATABASE_URL environment variable takes precedence.
-database_url = "postgres://fleet:fleet@localhost:5433/trawl"
+# Required: TRAWL_DATABASE_URL, or uncomment database_url below.
+# Use a separate Trawl database; trawld initializes its schema at startup.
+# database_url = "postgres://trawl:PASSWORD@db.example.com:5432/trawl"
 
-[ingest]
-# Whether the ingest endpoint (POST /api/v1/ingest) is enabled.
-# enabled = true
-
-# Maximum request body size for ingest (default: 16M).
-# Increase for high-volume ingest with large batches; decrease to
-# bound per-request memory.
-# max_body_bytes = "16M"
-
-# WAL directory for buffering ingested events before compaction.
-# Defaults to {data.path}/wal/ when omitted.
-# wal_dir = "~/.trawl/data/wal"
-
-# How often the compaction task runs (seconds). Controls how quickly
-# WAL files are merged into parquet. Lower = fresher data but more I/O.
-# compaction_interval_secs = 10
-
-# Write internal server events (queries, auth, compaction) to the ingest
-# pipeline as service:trawld. Enables self-hosted dashboards.
-# Covers the trawld daemon ONLY: trawl-web and the CLIs log to stdout,
-# and fleet-admin mutations are observed by a 30s polling audit task
-# (coalescing diffs, not a transactional ledger). Default query lifecycle
-# events carry query_id/metadata but not raw query text (that lives in
-# history, the query debug log, and a DEBUG-only query_text event).
-# Requires ingest.enabled = true. Replaces the log_file JSON logger.
-# internal_telemetry = true
-
-# Consolidate per-service hourly parquet files into daily files for
-# dates older than today. Dramatically reduces file count for long
-# lookback queries at the cost of a brief compaction spike.
-# daily_rollup = true
-
-# Capacity of the in-memory event bus broadcast channel. When the
-# channel is full, slow SSE subscribers miss events and get a Lagged
-# notification. Increase if SSE clients report frequent lag.
-# event_bus_capacity = 4096
-
-# Maximum number of events held in the hot buffer across all batches.
-# Oldest batches are evicted when exceeded. Increase for longer hot
-# buffer retention; decrease to reduce memory usage.
-# hot_buffer_max_events = 100000
-
-# Maximum estimated memory usage for the hot buffer (default: 100M).
-# This is the serialized ndjson byte count; actual in-memory usage is
-# ~3-5x larger due to Map<String, Value> overhead. Increase for bursty
-# workloads; decrease on memory-constrained hosts.
-# hot_buffer_max_bytes = "100M"
-
-# How often server stats (pool utilization, SSE connections, hot buffer
-# metrics) are emitted as telemetry events (seconds). Lower values give
-# more granular observability at the cost of telemetry volume.
-# 0 = disabled.
-# stats_interval_secs = 60
-
-# How often buffered tracing events are flushed to WAL (seconds).
-# Lower values reduce latency for self-hosted dashboards but increase
-# disk I/O from more frequent small writes.
-# telemetry_flush_interval_secs = 1
-
-# ONE memory budget for everything internal telemetry holds while the WAL
-# is unhealthy: the active buffer, the retry queue (a failed flush retains
-# its batch instead of dropping it) and the batch in flight through a
-# write. Like hot_buffer_max_bytes this is an estimate: serialized ndjson
-# plus the retained event maps plus per-event overhead. It is enforced as
-# events arrive — over budget, the OLDEST queued batches are shed first
-# and then the incoming event itself is dropped, all counted in
-# trawl_telemetry_events_dropped_total{reason="buffer_cap"}.
-# telemetry_buffer_max_bytes = "16M"
-
-# Wire keys _severity derives from, in precedence order — first MAPPABLE
-# wins. Derivation only READS: every source stays exactly where it is, as
-# an ordinary queryable column under the name its sender chose. An empty
-# list is legal and means "derive nothing".
-# severity_from = ["severity", "severity_text", "level"]
-
-# An entry may also be written in the typed form, whose dialect governs
-# NUMERICS only: "otel" (the default) reads 1-24 straight, "syslog"
-# inverts 0-7. This is the syslog-over-HTTP forwarder knob — a collector
-# that ships the raw PRI numeral as its own field reaches the same
-# inversion the native listener does, because provenance is what licenses
-# it and the config is where provenance is asserted:
-# severity_from = ["severity", "severity_text", "level", { field = "syslog_severity", dialect = "syslog" }]
-
-# Wire keys _time derives from, in precedence order — first PRESENT wins
-# (an unparseable value falls to arrival time rather than reaching past
-# itself). Only _time is consumed; the other sources stay as columns. The
-# list must contain _time, which is also the only reserved name allowed
-# here, and a dialect on an entry is an error — dialects govern severity
-# numerics alone.
-# time_from = ["_time", "timestamp", "@timestamp"]
-
-# Both lists are validated at startup and trawld REFUSES TO START on a
-# bad entry: a source list that silently never matches would be the
-# sharpest footgun in the design. Changes are forward-only — nothing
-# re-derives stored events, so an event keeps the _severity and _time it
-# was written with. A producer profile's own fixed sources (the syslog
-# listener's syslog_severity/syslog_timestamp) prepend these lists and
-# are not configurable.
-
-[retention]
-# Delete date directories older than this many days in every env without a
-# [retention.env.<name>] entry. 0 disables age-based deletion for those
-# envs. An env with its own finite entry still ages out. Disk pressure can
-# delete data in any env, including one with a zero age limit.
-# Adjust based on your storage capacity and compliance requirements.
-# max_age_days = 90
-
-# If free disk space drops below this threshold, delete date
-# directories regardless of age, taking the one that has used up the
-# largest fraction of its env's age limit first. 0 = disabled. Acts as
-# a safety net independent of max_age_days.
-# min_free_disk_bytes = "1G"
-
-# How often the retention task runs (seconds). More frequent checks
-# respond faster to disk pressure but add minor I/O overhead.
-# retention_interval_secs = 3600
-
-# Per-env age override. One table per env, keyed by the env name under
-# the data root; max_age_days is required and 0 disables age-based deletion.
-# That env's data remains eligible for disk-pressure deletion.
-# An env with no table keeps the global max_age_days above. Disk pressure
-# stays install-wide and deletes by expiry ratio (age / that env's
-# max_age_days, highest first), so per-env intent survives the emergency
-# sweep. Keep these tables LAST in [retention]: in TOML a scalar written
-# after this header lands inside it.
-# [retention.env.prod]
-# max_age_days = 365
+[web]
+# Browser proxy: put an HTTPS reverse proxy in front for remote access.
+bind_addr = "127.0.0.1:8090"
+upstream_url = "https://localhost:5514"
+# Required: replace with the exact origin shown by your browser.
+public_origins = ["https://trawl.example.com"]
+# Required: create a private file containing 32 random bytes before startup.
+cookie_secret_path = "~/.trawl/web.cookie"
+allow_insecure_cookies = false
