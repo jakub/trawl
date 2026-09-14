@@ -121,6 +121,22 @@ pub fn RunsPage() -> impl IntoView {
             .map(|gr| gr.net_name.clone())
     });
 
+    // The sheet header counts what the table shows, off the same
+    // predicate the rows are filtered by. It also keeps the sheet's
+    // name distinct from the scroll region's, which is "Recent runs"
+    // on its own.
+    let visible_count = Signal::derive(move || {
+        let needle = filter.get().to_lowercase();
+        match runs.get() {
+            Some(Ok((_, resp))) => resp
+                .runs
+                .iter()
+                .filter(|r| needle.is_empty() || r.net_name.to_lowercase().contains(&needle))
+                .count(),
+            _ => 0,
+        }
+    });
+
     #[allow(clippy::cast_possible_truncation)]
     let now_ms = fleet_ui::time::clock::now_ms();
 
@@ -214,7 +230,9 @@ pub fn RunsPage() -> impl IntoView {
             <div class="page-split" class:has-panel=move || run_selected.get().is_some()>
             <section class="list-sheet" aria-labelledby="runs-sheet-title">
                 <div class="list-sheet-hd">
-                    <h2 id="runs-sheet-title" class="list-sheet-ttl">"Recent runs"</h2>
+                    <h2 id="runs-sheet-title" class="list-sheet-ttl">
+                        "Recent runs"<span class="cnt">{move || visible_count.get()}</span>
+                    </h2>
                     <SearchInput value=filter placeholder="Filter by net…"/>
                 </div>
             <fleet_ui::OverflowHint viewport=table_viewport/>
