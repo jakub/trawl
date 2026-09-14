@@ -44,7 +44,7 @@ pub struct Config {
 /// HTTPS listener settings.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
-    /// Address to bind the HTTPS listener (e.g. "127.0.0.1:8080").
+    /// Address to bind the HTTPS listener (e.g. "127.0.0.1:5514").
     #[serde(default = "default_http_addr")]
     pub http_addr: String,
 
@@ -1060,7 +1060,7 @@ fn deserialize_byte_size_u64<'de, D: serde::Deserializer<'de>>(de: D) -> Result<
 // `#[serde(default = "...")]` requires a function path.
 
 /// Default HTTPS listen address.
-pub const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:8080";
+pub const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:5514";
 /// Default query execution timeout (seconds).
 pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
 /// Default maximum rows a query can return.
@@ -1867,7 +1867,7 @@ path = "/var/lib/trawl/data/**/*.parquet"
 [auth]
 "#;
         let config: Config = toml::from_str(toml).unwrap();
-        assert_eq!(config.server.http_addr, "127.0.0.1:8080");
+        assert_eq!(config.server.http_addr, "127.0.0.1:5514");
         assert_eq!(config.server.timeout_secs, 30);
         assert!(config.server.max_concurrent_queries > 0);
         assert_eq!(config.data.path, "/var/lib/trawl/data/**/*.parquet");

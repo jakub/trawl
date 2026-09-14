@@ -42,7 +42,7 @@ The HTTPS listener, query limits, TLS, and logging.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `http_addr` | string | `"127.0.0.1:8080"` | HTTPS listen address |
+| `http_addr` | string | `"127.0.0.1:5514"` | HTTPS listen address |
 | `timeout_secs` | integer | `30` | Absolute query deadline in seconds, counted from authentication and including queue waits |
 | `max_concurrent_queries` | integer | *(CPU count)* | DuckDB executor pool size. Must be greater than 0 |
 | `max_result_rows` | integer | `100000` | Rows a query may return before trawld rejects it |

@@ -28,7 +28,7 @@ mod tui;
 #[derive(Parser)]
 #[command(name = "trawl", version, long_version = trawl_core::version::long_version(), about)]
 struct Cli {
-    /// Server URL (default: `https://localhost:5514`).
+    /// trawld HTTPS API URL (default: `https://localhost:5514`).
     #[arg(long, env = "TRAWL_URL", global = true)]
     url: Option<String>,
 
