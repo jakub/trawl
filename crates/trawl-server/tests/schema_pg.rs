@@ -7,6 +7,17 @@ const OLD_DIR: &str = concat!(
     "/../../scripts/schema-baseline/fixtures/trawl"
 );
 const NEW_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/migrations");
+// Intentional fresh-schema differences from the immutable historical fixtures.
+// Keep these statements explicit so the remaining catalog comparison is strict.
+const REFERENCE_AMENDMENT: &str = "
+ALTER TABLE repin_jobs
+    ADD CONSTRAINT repin_jobs_accepted_nulled_plan
+    CHECK ((accepted_max_nulled_rows IS NOT NULL) = (force AND planned_at IS NOT NULL)),
+    ADD CONSTRAINT repin_jobs_accepted_ambiguous_plan
+    CHECK ((accepted_max_ambiguous_rows IS NOT NULL) = (force AND planned_at IS NOT NULL)),
+    ADD CONSTRAINT repin_jobs_requested_force
+    CHECK (force OR (max_nulled_rows IS NULL AND max_ambiguous_rows IS NULL));
+";
 async fn seed_old(pool: &PgPool) {
     sqlx::query("INSERT INTO saved_queries(key_id,name,query,created_at,updated_at) VALUES (1,'retained query','service=test',now(),now())")
         .execute(pool).await.unwrap();

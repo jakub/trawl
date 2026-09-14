@@ -1,6 +1,6 @@
 //! Real PostgreSQL checks shared by the two independent schema owners.
 //! Every database here belongs to `sqlx::test` on an explicitly owned instance.
-use super::{BASELINE, NEW_DIR, OLD_DIR, SchemaError, migrate, seed_old};
+use super::{BASELINE, NEW_DIR, OLD_DIR, REFERENCE_AMENDMENT, SchemaError, migrate, seed_old};
 use sqlx::{
     Connection as _, Executor as _, PgConnection, PgPool,
     migrate::{Migrate as _, MigrateError, Migrator},
@@ -130,6 +130,11 @@ async fn initial_schema_matches_final_old_catalog(pool: PgPool) {
         .await
         .unwrap();
     old.run(&mut conn).await.unwrap();
+    // Apply only the owner's explicit fresh-schema amendments. Historical
+    // fixtures remain immutable; all resulting catalog entries still compare.
+    if !REFERENCE_AMENDMENT.is_empty() {
+        conn.execute(REFERENCE_AMENDMENT).await.unwrap();
+    }
     let reference = catalog(&mut conn).await;
     assert!(!reference.is_empty());
     conn.execute("CREATE SCHEMA candidate; SET search_path=candidate")

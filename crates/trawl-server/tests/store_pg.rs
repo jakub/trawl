@@ -6047,12 +6047,9 @@ mod repin_store {
         assert!(planned.planned_at.is_some());
     }
 
-    /// A job that states no ceiling reads back absent on all four columns —
-    /// the same shape a row written before migration 0015 has, which the
-    /// gate reads as the legacy blank check rather than as a ceiling of
-    /// zero.
+    /// A forced claim is valid before planning; a plan must record both bounds.
     #[sqlx::test]
-    async fn a_job_with_no_ceilings_reads_back_absent(pool: PgPool) {
+    async fn a_forced_plan_without_recorded_bounds_is_rejected(pool: PgPool) {
         let s = store(&pool);
         // The claim proves the pin it was prepared against (#110), so the
         // slot has to exist before the job can take it.
@@ -6071,9 +6068,12 @@ mod repin_store {
             })
             .await
             .unwrap();
-        s.record_plan(id, RepinPlan::default()).await.unwrap();
+        s.record_plan(id, RepinPlan::default())
+            .await
+            .expect_err("forced plan needs resolved bounds");
 
         let job = s.get(id).await.unwrap().unwrap();
+        assert!(job.planned_at.is_none(), "failed plan write must be atomic");
         assert_eq!(
             (
                 job.max_nulled_rows,
@@ -6083,6 +6083,122 @@ mod repin_store {
             ),
             (None, None, None, None)
         );
+    }
+
+    /// The fresh schema rejects contradictory force plans without losing the claim.
+    #[sqlx::test]
+    async fn force_plan_shape_constraints_preserve_the_unplanned_claim(pool: PgPool) {
+        let s = store(&pool);
+        pin(&pool, "status", CanonicalType::BigInt).await;
+        let id = s
+            .claim(RepinClaim {
+                field: "status",
+                from_type: CanonicalType::BigInt,
+                to_type: CanonicalType::Varchar,
+                dialect: None,
+                dry_run: true,
+                force: true,
+                max_nulled_rows: None,
+                max_ambiguous_rows: None,
+                requested_by: None,
+            })
+            .await
+            .unwrap();
+        for (force, planned, nulled, ambiguous, requested) in [
+            (true, true, None, None, None),
+            (true, true, Some(0_i64), None, None),
+            (true, true, None, Some(0_i64), None),
+            (true, false, Some(0), Some(0), None),
+            (false, true, Some(0), Some(0), None),
+            (false, false, None, None, Some(0_i64)),
+        ] {
+            let error = sqlx::query(
+                "UPDATE repin_jobs SET force = $2,
+                planned_at = CASE WHEN $3 THEN now() ELSE NULL END,
+                accepted_max_nulled_rows = $4, accepted_max_ambiguous_rows = $5,
+                max_nulled_rows = $6 WHERE id = $1",
+            )
+            .bind(id)
+            .bind(force)
+            .bind(planned)
+            .bind(nulled)
+            .bind(ambiguous)
+            .bind(requested)
+            .execute(&pool)
+            .await
+            .expect_err("invalid force shape must be rejected");
+            assert_eq!(
+                error.as_database_error().unwrap().code().as_deref(),
+                Some("23514")
+            );
+            let job = s.get(id).await.unwrap().unwrap();
+            assert!(job.force);
+            assert!(job.planned_at.is_none());
+            assert!(job.accepted_max_nulled_rows.is_none());
+            assert!(job.accepted_max_ambiguous_rows.is_none());
+        }
+    }
+
+    /// A corrupt row cannot be decoded into an unrestricted force verdict.
+    #[sqlx::test]
+    async fn inconsistent_force_rows_fail_to_decode(pool: PgPool) {
+        let s = store(&pool);
+        pin(&pool, "status", CanonicalType::BigInt).await;
+        let id = s
+            .claim(RepinClaim {
+                field: "status",
+                from_type: CanonicalType::BigInt,
+                to_type: CanonicalType::Varchar,
+                dialect: None,
+                dry_run: true,
+                force: true,
+                max_nulled_rows: None,
+                max_ambiguous_rows: None,
+                requested_by: None,
+            })
+            .await
+            .unwrap();
+        // Deliberately corrupt only this disposable test database, bypassing
+        // schema protection to exercise the independent read boundary.
+        sqlx::raw_sql(
+            "ALTER TABLE repin_jobs
+            DROP CONSTRAINT repin_jobs_accepted_nulled_plan,
+            DROP CONSTRAINT repin_jobs_accepted_ambiguous_plan,
+            DROP CONSTRAINT repin_jobs_requested_force",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for (force, planned, nulled, ambiguous, requested) in [
+            (true, true, None, None, None),
+            (true, true, Some(0_i64), None, None),
+            (true, true, None, Some(0_i64), None),
+            (true, false, Some(0), Some(0), None),
+            (false, true, Some(0), Some(0), None),
+            (false, false, None, None, Some(0_i64)),
+        ] {
+            sqlx::query(
+                "UPDATE repin_jobs SET force = $2,
+                planned_at = CASE WHEN $3 THEN now() ELSE NULL END,
+                accepted_max_nulled_rows = $4, accepted_max_ambiguous_rows = $5,
+                max_nulled_rows = $6 WHERE id = $1",
+            )
+            .bind(id)
+            .bind(force)
+            .bind(planned)
+            .bind(nulled)
+            .bind(ambiguous)
+            .bind(requested)
+            .execute(&pool)
+            .await
+            .unwrap();
+            s.get(id)
+                .await
+                .expect_err("inconsistent force terms must not render");
+            s.latest()
+                .await
+                .expect_err("status must also reject inconsistent terms");
+        }
     }
 
     /// The cutover clears the operator's degraded acknowledgement with the

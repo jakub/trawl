@@ -219,6 +219,14 @@ CREATE TABLE repin_jobs (
     accepted_max_ambiguous_rows BIGINT,
     CONSTRAINT repin_jobs_accepted_max_ambiguous_rows_check
     CHECK (accepted_max_ambiguous_rows >= 0),
+    -- Claimed/interrupted jobs can lack a plan. A measured forced plan
+    -- always records both bounds; unforced plans record neither.
+    CONSTRAINT repin_jobs_accepted_nulled_plan
+    CHECK ((accepted_max_nulled_rows IS NOT NULL) = (force AND planned_at IS NOT NULL)),
+    CONSTRAINT repin_jobs_accepted_ambiguous_plan
+    CHECK ((accepted_max_ambiguous_rows IS NOT NULL) = (force AND planned_at IS NOT NULL)),
+    CONSTRAINT repin_jobs_requested_force
+    CHECK (force OR (max_nulled_rows IS NULL AND max_ambiguous_rows IS NULL)),
     nulled_services     TEXT[],
     nulled_service_rows BIGINT[],
     CONSTRAINT repin_jobs_nulled_tallies_paired_check

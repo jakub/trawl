@@ -8,6 +8,7 @@ const OLD_DIR: &str = concat!(
     "/../../scripts/schema-baseline/fixtures/fleet"
 );
 const NEW_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/migrations");
+const REFERENCE_AMENDMENT: &str = "";
 async fn seed_old(pool: &PgPool) {
     sqlx::query("INSERT INTO api_keys(prefix,name,hash,kind) VALUES ('oldkey01','retained key','$argon2id$fixture','service')")
         .execute(pool).await.unwrap();

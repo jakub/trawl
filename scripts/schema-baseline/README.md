@@ -16,6 +16,13 @@ constraint names and definitions, index definitions and predicates, sequences
 and ownership, and every seed row. Only generated pin timestamps and the
 catalog UUID value are excluded from the seed comparison.
 
+Each owner declares `REFERENCE_AMENDMENT` for deliberate fresh-schema changes.
+The comparator applies these explicit statements to the owned reference schema
+before comparing every catalog entry and seed row. Trawl adds three force-plan
+checks: accepted bounds exist exactly for planned forced jobs, and requested
+ceilings require force. Fleet currently has no amendments. The fixture files
+are never rewritten or filtered to hide differences.
+
 The tests also snapshot schema, ledger, table rows, and sequence state around
 refused migrations. Cases cover partial/full/dirty old histories, nonempty
 untracked databases, tampered checksums, dirty current history, unknown older
