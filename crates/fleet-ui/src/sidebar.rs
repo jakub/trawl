@@ -120,6 +120,13 @@ pub fn Sidebar(
                                 view! {
                                     <A
                                         href=item.path
+                                        // `A` marks itself `aria-current="page"` on a
+                                        // PREFIX match unless this is set, which would
+                                        // put Search and History both on "page" at
+                                        // /search/history. The consumer's `active`
+                                        // signal is the one answer to "where am I"; the
+                                        // router must not contradict it.
+                                        exact=true
                                         attr:class=move || item_class(active.get() == id)
                                         attr:title=label_attr
                                         attr:aria-current=move || {
