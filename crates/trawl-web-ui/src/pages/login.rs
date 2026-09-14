@@ -52,14 +52,16 @@ pub fn Login() -> impl IntoView {
         });
     });
 
-    // Empty accent, unlike the topbar's "_": the login h1 is a plain
-    // "trawl", and the empty accent span renders nothing.
+    // Empty accent, unlike the command bar's "_": the login wordmark is
+    // a plain "trawl", and the empty accent span renders nothing.
     view! {
         <Atmosphere theme=prefs.theme()/>
         <div class="trawl-login">
             <fleet_ui::Login
                 brand="trawl"
                 brand_accent=""
+                heading="Search your logs."
+                subtitle="Sign in with your API key to start."
                 on_submit=on_submit
                 error=error
                 submitting=submitting

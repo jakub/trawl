@@ -13,13 +13,19 @@
 //! `.error-banner`, not bare `.error`, because a bare `.error` selector
 //! leaks padding/border onto every element that uses `error` as a state
 //! token (`.status-dot.error`, `.load-hint.error`, …).
+//!
+//! `id` exists so a control can point `aria-describedby` at the banner:
+//! `role="alert"` announces the message once, the association is what
+//! lets a screen-reader user read it again from the invalid field.
 
 use leptos::prelude::*;
 
 #[component]
 pub fn ErrorBanner(
     #[prop(into)] error: Signal<Option<String>>,
-    /// Optional stable target for a field's `aria-describedby`.
+    /// Optional stable target for a field's `aria-describedby`. The
+    /// caller must only point at it while the error is `Some`, since
+    /// nothing renders otherwise.
     #[prop(optional, into)]
     id: Option<String>,
 ) -> impl IntoView {

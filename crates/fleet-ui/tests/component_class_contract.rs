@@ -26,6 +26,7 @@ const CONFIRM_REASON: &str = include_str!("../src/modal/confirm_reason.rs");
 const DRAWER: &str = include_str!("../src/drawer.rs");
 const TABS: &str = include_str!("../src/tabs.rs");
 const ERROR_BANNER: &str = include_str!("../src/error_banner.rs");
+const LOGIN: &str = include_str!("../src/login/component.rs");
 
 // Small widgets. Their tone/class *composition* is pinned by native
 // unit tests in the pure layers (badge::tone, status_dot::tone,
@@ -1003,6 +1004,46 @@ fn error_banner_emits_error_class_with_alert_role() {
         ERROR_BANNER.contains(r#"role="alert""#),
         "ErrorBanner must keep role=\"alert\" — the one sanctioned DOM \
          delta of the issue #28 migration (attribute-only, zero pixels)"
+    );
+}
+
+#[test]
+fn login_associates_its_error_with_the_input() {
+    // A04: the login error rides a sibling banner, so `role="alert"`
+    // announces it once and nothing associates it with the field it is
+    // about. The input carries aria-invalid and points
+    // aria-describedby at the banner's id, which ErrorBanner renders
+    // from its `id` prop.
+    assert!(
+        LOGIN.contains("aria-invalid=") && LOGIN.contains("aria-describedby="),
+        "the login input must carry aria-invalid and aria-describedby — \
+         without them the alert is announced once and is unreachable \
+         from the invalid field (A04)"
+    );
+    // One binding feeds the banner's id and the association, so the two
+    // cannot drift apart; the test pins the value and both uses.
+    assert!(
+        LOGIN.contains(r#""login-error""#)
+            && LOGIN.contains("id=ERROR_ID")
+            && LOGIN.contains("then_some(ERROR_ID)"),
+        "the banner id and the aria-describedby must be the same \
+         `login-error` binding"
+    );
+    assert!(
+        ERROR_BANNER.contains("id=id"),
+        "ErrorBanner must render its `id` prop — an unrendered id leaves \
+         login's aria-describedby pointing at nothing"
+    );
+    // A05/landmarks: /login routes outside the app shell, so the card
+    // is the page's only chance at a <main>.
+    assert!(
+        LOGIN.contains(r#"<main class="login-shell">"#),
+        "the login card must sit in a <main> landmark — /login never \
+         reaches Shell's <main class=\"main\">"
+    );
+    assert!(
+        !LOGIN.contains("<aside"),
+        "the login card renders no complementary landmark"
     );
 }
 
