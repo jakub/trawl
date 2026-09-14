@@ -76,7 +76,7 @@ pub struct Schedule {
     pub interval_secs: u64,
     pub max_runs: Option<u64>,
     pub enabled: bool,
-    /// The window this schedule covers, or `None` for the legacy shape
+    /// The window this schedule covers, or `None` for query-text timing,
     /// where the saved DSL is executed verbatim (ADR-0018 ruling 6).
     pub window: Option<ScheduleWindow>,
     /// Late-arrival allowance shifting both window bounds back. Zero unless
@@ -472,8 +472,8 @@ pub(crate) fn row_to_schedule_at(row: &PgRow, prefix: &str) -> Result<Schedule, 
 /// The pairing is enforced by `schedules_window_shape`, so an unpaired or
 /// unknown value here means the row was written past the constraint (a
 /// hand-edit, a future kind this binary predates). That is a decode failure,
-/// not a `None` window: silently reading it as "no window" would hand the
-/// scheduler a legacy schedule and execute the DSL verbatim.
+/// not a `None` window: silently reading it as "no window" would make the
+/// scheduler use query-text timing and execute the DSL verbatim.
 pub(crate) fn decode_window(
     row: &PgRow,
     prefix: &str,
@@ -1379,9 +1379,9 @@ impl ScheduleStore {
         // The lock is taken only when there is an advance to make, and the
         // test is the same one the advance itself uses: a run claimed as
         // `since_last`. Everything it reads is written at claim time and
-        // never updated, so the answer cannot change under us. A legacy
-        // finish keeps exactly the lock footprint it always had and never
-        // queues behind a schedule someone else is holding. A
+        // never updated, so the answer cannot change under us. A run without
+        // a since_last window does not lock the schedule and never queues
+        // behind a schedule someone else is holding. A
         // cascade-deleted run matches nothing and skips the lock; the run
         // UPDATE below then reports RunDeleted as it always has.
         if status == RunStatus::Success {

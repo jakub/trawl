@@ -40,9 +40,9 @@
 # Increase if many clients use live streaming; each holds a connection open.
 # max_sse_connections = 32
 
-# Log file path (JSON format). When set, logs go to both stdout and this file.
-# Deprecated when internal_telemetry is enabled — the WAL layer replaces
-# file logging. Stdout remains active for human consumption.
+# JSON log file, opened when ingest or internal_telemetry is disabled.
+# When both are enabled, server events use the ingest pipeline instead and
+# this path is not opened. Stdout remains active unless the TUI monitor owns it.
 # log_file = "/var/log/trawld.log"
 
 # ndjson query debug log (one entry per query execution). SENSITIVE:

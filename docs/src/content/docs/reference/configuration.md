@@ -50,7 +50,7 @@ The HTTPS listener, query limits, TLS, and logging.
 | `max_request_body_bytes` | byte size | `"128K"` | Request body limit on every route except ingest |
 | `max_concurrent_requests` | integer | `256` | Concurrent HTTP requests. Past it trawld answers 503 |
 | `shutdown_drain_secs` | integer | `30` | Graceful shutdown budget for in-flight requests |
-| `log_file` | path | *(none)* | JSON log file. Opened only when `[ingest] internal_telemetry` is false |
+| `log_file` | path | *(none)* | JSON log file. Opened when `[ingest] enabled` or `internal_telemetry` is false. When both are true, server events use the ingest pipeline and this path is not opened |
 | `tls_cert_path` | path | *(generated)* | PEM certificate |
 | `tls_key_path` | path | *(generated)* | PEM private key |
 | `tls_reload_interval_secs` | integer | `300` | How often trawld polls the certificate files for changes. `0` disables reloading |

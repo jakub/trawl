@@ -5,8 +5,8 @@
 //! Report-window domain types (ADR-0018 rulings 6-14).
 //!
 //! The window is a property of the SCHEDULE, not of the saved query text: a
-//! schedule either has no window (the legacy shape, where the DSL is executed
-//! verbatim), tiles `[previous window_end, fire - lag)` under
+//! schedule either uses query-text timing (no scheduler-owned window, so the DSL
+//! is executed verbatim), tiles `[previous window_end, fire - lag)` under
 //! `window = "since_last"`, or takes a fixed trailing span under
 //! `window = "<duration>"`. This module owns the types, the two spellings
 //! of an instant, and the pure policy over them: [`plan_due_run`] turns a
@@ -191,7 +191,7 @@ pub struct PlanInput {
     /// The schedule's period. Also the first `since_last` window's length
     /// (ruling 14) and the unit `max_catchup_intervals` counts.
     pub interval_secs: u64,
-    /// The schedule's window mode, or `None` for the legacy shape where
+    /// The schedule's window mode, or `None` for query-text timing, where
     /// the saved DSL is executed verbatim (ruling 6).
     pub window: Option<ScheduleWindow>,
     /// Late-arrival allowance. Shifts BOTH window bounds back, so it

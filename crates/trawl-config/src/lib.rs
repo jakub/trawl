@@ -81,9 +81,9 @@ pub struct ServerConfig {
     #[serde(default = "default_shutdown_drain_secs")]
     pub shutdown_drain_secs: u64,
 
-    /// Optional JSON log file. Written only when internal telemetry is off;
-    /// with telemetry on the WAL layer takes that slot and this path is never
-    /// opened.
+    /// Optional JSON log file. Opened when either ingest or internal telemetry
+    /// is disabled. When both are enabled, server events use the ingest
+    /// pipeline and this path is not opened.
     pub log_file: Option<PathBuf>,
 
     /// Path to TLS certificate (PEM). If omitted, a self-signed cert is auto-generated.
@@ -1629,10 +1629,10 @@ impl Config {
                     .into(),
             );
         }
-        if self.ingest.internal_telemetry && self.server.log_file.is_some() {
+        if self.internal_telemetry_enabled() && self.server.log_file.is_some() {
             warns.push(
-                "log_file is deprecated when internal_telemetry is enabled — \
-                 server events now flow through the ingest pipeline as service:trawld"
+                "log_file is not opened while ingest and internal_telemetry are enabled; \
+                 server events use the ingest pipeline as service:trawld"
                     .into(),
             );
         }
@@ -2315,7 +2315,7 @@ internal_telemetry = true
     }
 
     #[test]
-    fn internal_telemetry_warns_log_file_deprecated() {
+    fn internal_telemetry_warns_only_when_log_file_is_not_opened() {
         let toml = r#"
 [server]
 log_file = "/var/log/trawld.log"
@@ -2323,9 +2323,31 @@ log_file = "/var/log/trawld.log"
 path = "/data"
 [auth]
 "#;
-        let config: Config = toml::from_str(toml).unwrap();
-        let warns = config.warnings();
-        assert!(warns.iter().any(|w| w.contains("log_file is deprecated")));
+        let mut config: Config = toml::from_str(toml).unwrap();
+        for ingest in [false, true] {
+            for telemetry in [false, true] {
+                for log_file in [None, Some(PathBuf::from("/var/log/trawld.log"))] {
+                    config.ingest.enabled = ingest;
+                    config.ingest.internal_telemetry = telemetry;
+                    config.server.log_file = log_file;
+                    let warns = config.warnings();
+                    let file_warning = warns.iter().find(|w| w.starts_with("log_file"));
+                    assert_eq!(
+                        file_warning.is_some(),
+                        ingest && telemetry && config.server.log_file.is_some(),
+                        "ingest={ingest}, telemetry={telemetry}, log_file={:?}: {warns:?}",
+                        config.server.log_file
+                    );
+                    if let Some(warning) = file_warning {
+                        assert_eq!(
+                            warning,
+                            "log_file is not opened while ingest and internal_telemetry are enabled; \
+                             server events use the ingest pipeline as service:trawld"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
