@@ -590,3 +590,76 @@ For a custom experiment:
 > Treat mixed-corpus latency samples as exploratory unless a fixed-corpus
 > measurement phase is added. Retain commands, changes, and evidence outside
 > the worktree. Report a failed hypothesis if the evidence does not support it.
+
+## Issue 188 real-app evidence
+
+The committed `issue188-evidence.mjs` scenario checks Search execution facts
+against the daemon's lifecycle records and global Runs ordering against
+individual stored receipts. Start a fresh experiment in the candidate
+worktree, with at least 11 events. Keep the default runner supervised.
+
+```bash
+bin/app-experiment --seed 42 --events 1000 --rate 200 --hold-seconds 900
+```
+
+Wait for `Verified instance held` after restart. In another foreground
+session rooted in the same worktree, pass the exact printed artifact directory.
+Replace `run-TIMESTAMP-ID` with that run's name.
+
+```bash
+node scripts/app-experiment/issue188-evidence.mjs \
+  --run "$PWD/target/app-experiments/run-TIMESTAMP-ID"
+```
+
+The custom scenario has a ten-minute deadline. It uses only the selected
+loopback origin and checks its process/config identity before reading the
+private browser credential into Node memory. It logs in with a same-origin
+browser request. It creates its own browser context, closes it on success or
+failure, and leaves infrastructure teardown to the supervised default runner.
+Do not interrupt the default hold. Let its deadline expire.
+
+The scenario requires no existing saved runs and refuses to overwrite an
+existing `issue188-evidence` directory. Use a fresh experiment for a rerun.
+Its assertions cover:
+
+- Nonempty and zero-row Search requests through CodeMirror, with explicit
+  January 1, 2026 bounds. The visible count, duration and full UTC start must
+  match the accepted response.
+- A unique newly appended `query_start` and its `query_complete`, joined by
+  the daemon's internal query ID after matching user, query length, page
+  bounds and browser wall-clock bounds. Duration and returned count must
+  match exactly. Start time must fall within browser send/receive and daemon
+  lifecycle timestamps, allowing two milliseconds for timestamp precision.
+  The script polls appended logs for up to five seconds to allow the runner
+  to flush daemon output. Multiple matching starts or completions fail.
+  No expected start time is calculated by subtracting duration.
+- Three mixed-case net names with independently known counts of 2, 11 and 5.
+  Twenty-one manual runs must succeed, and every individual stored result
+  must contain exactly the expected corpus sequence IDs.
+- All ten global sort/direction combinations across offsets 0 and 20, using
+  individual receipts as the ordering oracle. Every page must match exact
+  identities and receipt fields, with total 21 and no omissions or duplicates.
+- The real Runs UI for Net and Rows, both directions and both pages, checking
+  row identity, name, status, duration, count and active `aria-sort`.
+
+Only `issue188-evidence/report.json` and its PNG captures are custom evidence
+intended for publication. The report includes the source commit, source/build
+hashes, corpus hash, safe lifecycle fields, receipts, expected/observed orders
+and UI cells. The script recomputes the runner's source fingerprint and
+requires it to match preparation. Binary and SPA hashes are explicitly
+labelled as manifest identity; their verification belongs to the default
+runner. It omits credentials, cookies, headers, raw query text, private
+paths from receipts and raw logs. Do not publish `private/`, daemon logs,
+`queries.ndjson`, or the complete run directory. A failed report names the
+phase and assertion source line, with numeric or boolean actual/expected
+values where available. It never copies exception text that might contain
+request data.
+
+Success requires both commands to exit zero, the custom report to say
+`status: passed` with `cleanup.browser: true`, and the default `report.json`
+to say `status: passed` with every cleanup flag true. Compare their run IDs
+and build identities. A custom pass alone does not establish default-scenario
+completion or cleanup. Null values, different terminal statuses and deliberate
+timestamp ties remain covered by disposable PostgreSQL tests; this scenario
+uses successful immutable receipts from real queries. Debug build timings
+are correctness evidence, not a release performance benchmark.
