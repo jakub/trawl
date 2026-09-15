@@ -89,7 +89,12 @@ pub fn detect(query: &str, result: &QueryResult) -> Option<CatShape> {
     if names[0] == names[1] {
         return None;
     }
-    let group = names.iter().position(|n| *n == stats.group_by[0])?;
+    // `by STATUS` groups the catalog's `status`, and the response names
+    // the column as the catalog does; fold both sides, as `group_columns`
+    // does, so the two never disagree about which column is the group.
+    let group = names
+        .iter()
+        .position(|n| catalog_key(n) == catalog_key(&stats.group_by[0]))?;
     let metric = 1 - group;
 
     let mut signed = false;
@@ -309,6 +314,20 @@ mod tests {
         assert_eq!(shape.metric_name, "count");
         assert!(!shape.signed);
         assert!((shape.max_abs - 940.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn detect_folds_the_group_name_like_the_catalog() {
+        let shape = detect(
+            "* | stats count() by STATUS",
+            &result(&["status", "count"], int_rows()),
+        )
+        .unwrap();
+        assert_eq!(
+            shape.group, 0,
+            "the grouping key folds to the column the response carries"
+        );
+        assert_eq!(shape.group_name, "status");
     }
 
     #[test]
