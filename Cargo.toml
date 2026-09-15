@@ -133,11 +133,17 @@ lto = "thin"
 
 # Selected only by the browser's Trunk development build. Keep dev assertions,
 # overflow checks and incremental compilation, but omit browser debug symbols.
-# Native dev builds and release builds keep their existing profiles.
+# Native builds keep their existing profiles.
 [profile.wasm-dev]
 inherits = "dev"
 opt-level = 1
 debug = 0
+strip = "symbols"
+
+# Trunk selects this profile for size-oriented release WASM builds.
+[profile.wasm-release]
+inherits = "release"
+opt-level = "z"
 strip = "symbols"
 
 [workspace.lints.rust]
