@@ -9,7 +9,7 @@ use crate::{
     api, perms,
     service_card_fmt::{format_bytes, format_count, format_exact, format_uptime},
 };
-use fleet_ui::{Badge, ConfirmModal, ConfirmState, StatusDot, StatusTone, Tone};
+use fleet_ui::{Badge, ConfirmModal, ConfirmState, Tone};
 use leptos::{prelude::*, task::spawn_local};
 use std::sync::{
     Arc,
@@ -35,20 +35,20 @@ fn check_name(key: &str) -> Option<&'static str> {
         .map(|(_, name)| *name)
 }
 
-/// The checks card's dot and title.
+/// The checks card's title.
 ///
 /// A report that did not arrive is never called healthy: a transport
 /// failure and a permission refusal both reach here as `Err`, and
 /// claiming health on either would be a state the page cannot see
 /// (ADR-0025).
-fn health_title(report: Option<&Result<HealthResponse, String>>) -> (StatusTone, &'static str) {
+fn health_title(report: Option<&Result<HealthResponse, String>>) -> &'static str {
     match report {
-        None => (StatusTone::Neutral, "Health checks"),
-        Some(Err(_)) => (StatusTone::Error, "Health report unavailable"),
+        None => "Health checks",
+        Some(Err(_)) => "Health report unavailable",
         Some(Ok(report)) => match report.status {
-            HealthStatus::Ok => (StatusTone::Success, "Server is healthy"),
-            HealthStatus::Degraded => (StatusTone::Error, "Server is degraded"),
-            HealthStatus::Unavailable => (StatusTone::Error, "Server is unavailable"),
+            HealthStatus::Ok => "Server is healthy",
+            HealthStatus::Degraded => "Server is degraded",
+            HealthStatus::Unavailable => "Server is unavailable",
         },
     }
 }
@@ -122,10 +122,10 @@ pub fn HealthPage() -> impl IntoView {
             <div class="health-split">
             <section class="health-section" aria-labelledby="health-checks-title">
                 {move || {
-                    let (tone, title) = health_title(health.get().as_ref());
+                    let title = health_title(health.get().as_ref());
                     view! {
                         <h2 id="health-checks-title" class="health-card-ttl">
-                            <StatusDot tone=tone/>{title}
+                            {title}
                         </h2>
                     }
                 }}
