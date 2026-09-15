@@ -82,3 +82,38 @@ total being the rows fetched, never the run's recorded row count. The run
 endpoint stays whole-result; the server's row ceiling is disclosed as a
 separate line when the recorded count exceeds the rows fetched, and it is
 independent of paging.*
+
+## Amendment: global Runs ordering
+
+Accepted 2026-09-14 during the UI follow-up prep.
+
+The global Runs list orders the caller's authorized result set before
+applying limit and offset. All five columns are sortable: Net, Status,
+When, Duration and Rows. The per-net run-history endpoint keeps its
+existing contract. The net-name filter on the global page remains local
+to the fetched page and keeps its "matches on this page" explanation;
+the pager continues to describe the unfiltered server page.
+
+The global endpoint accepts typed sort keys and directions, mapped to
+fixed SQL fragments. Invalid keys or directions return a parameter error.
+Net compares lowercased names using PostgreSQL's lowercase behavior and
+the C collation; Status compares canonical status tokens lexically with
+the C collation. When uses the stored timestamp, Duration and Rows use
+numeric values, and missing numeric values sort last in both directions.
+
+Initial order remains When descending. An inactive Net or Status header
+first selects ascending order; When, Duration and Rows first select
+descending order. Clicking the active header reverses direction. For
+non-time columns, ties use start time descending then run ID descending.
+For When, both start time and ID use the requested direction. These
+rules make each response deterministic; polling and offset pagination
+do not promise a frozen dataset across page requests.
+
+Changing sort resets the page to zero and preserves the selected run.
+Response ownership includes page, sort key, direction and refresh
+generation. During a transition to another page or order, the old body
+is hidden, the frame is busy and the pager is disabled. The headers may
+show the requested order because no old rows claim to match it. A failed
+transition shows its error and retry state. A background refresh of the
+same page and order retains the current rows, including on refresh error.
+Late responses cannot replace a newer selection of page or order.

@@ -139,3 +139,36 @@ ignores is the same lie one level down.
   same-document anchor, since no rendered link points there any more.
 - Trawl's status bar is a `<footer>` and the 404 card sits in a
   `<main>`, so neither falls outside every landmark.
+
+## Amendment: Runs detail and Health arrangement
+
+Accepted 2026-09-14 during the UI follow-up prep.
+
+The Runs detail uses the same Drawer and 1100px docking threshold as
+Schema and Nets. At or above 1100px it occupies the second column; below
+that threshold it opens at the right over a scrim. The shared column
+width and Drawer focus, Escape and close behavior remain unchanged.
+
+The selected net/run pair owns the detail. Sorting, paging and polling
+the list do not change that identity. Resizing changes presentation
+without remounting or refetching the stored result. Changing the selected
+identity creates a fresh detail owner, so a late response for one run
+cannot populate another. A known net name stays attached to its selected
+identity; otherwise the title uses the truthful Run ID fallback. Row
+selection replaces browser history; Open net continues to push history.
+
+Within the detail pane, the stored result precedes the execution receipt
+in one column. A wide viewport does not imply a wide docked pane, so the
+receipt does not take a fixed-width column from the result. Wide result
+columns keep their local horizontal scroll region. An empty tab list
+must not leave an unnamed blank band in the Runs panel.
+
+On Health, the visible Server health, Capacity and Live operations cards
+fill the top row at wide widths and stack in that order when narrow.
+Queries follows them at full width using the standard table frame,
+keyboard-accessible scroll region and native column headers. Permission
+gates determine which cards exist without leaving empty grid slots.
+Detailed card facts, dynamic health headings, request generation checks
+and the shell's single dashboard stream remain unchanged. Cancel stays
+an explicit gated button with its confirmation; the query row does not
+become an action target.

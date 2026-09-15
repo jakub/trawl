@@ -158,3 +158,34 @@ A link whose structured state does not parse is shown, not run.**
   Closing that means publishing the cap on a response, `/api/v1/health`
   being the obvious place, which is its own decision and not a client
   one.
+
+## Amendment: execution facts in the query console
+
+Accepted 2026-09-14 during the UI follow-up prep.
+
+The executed-scope strip keeps its hanging well, removable filter chips
+and Live/Snapshot badge. The old scope label and window caption are
+replaced by rows returned, execution duration and a timestamp labelled
+"Started". Snapshot rows mean rows in this response, including aggregate
+groups; they do not claim a corpus total. Live counts name buffered rows.
+
+Successful query responses carry one optional execution record containing
+an absolute UTC start time and duration in milliseconds. The server
+captures the UTC instant beside its existing monotonic timer and uses
+that timer's existing duration boundary. This includes admission and
+query execution but excludes later history processing, serialization and
+browser transit. An empty placeholder represents no execution and has
+no record. A real execution may measure zero milliseconds.
+
+Execution facts belong to the accepted response and the executed query
+captured with it. Draft edits do not change them. A new pending request,
+failed request or malformed link cannot present facts from a retained
+previous response. A successful zero-row response still has execution
+facts. Live mode presents no snapshot start time or duration. Page
+navigation runs a new query and therefore supplies new execution facts.
+
+The timestamp includes the date, seconds and UTC suffix. The display
+does not substitute the browser's request latency or current clock.
+Existing malformed-link refusal and repair behavior, unreadable-filter
+notice and guarded chip removal remain in force. No query ID is added
+by this decision.
