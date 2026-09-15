@@ -1326,7 +1326,7 @@ const CONTRACTS: &[Contract] = &[
         assignment: "draftState: '.console-hd .draft',",
         source_path: "src/components/editor_wrap.rs",
         source: EDITOR_WRAP_RS,
-        hook: "class=\"draft\"",
+        hook: "class=\"draft dirty\"",
     },
     Contract {
         assignment: "viewControl: '.tabs button.action.view',",
