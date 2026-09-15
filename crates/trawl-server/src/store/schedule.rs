@@ -1758,20 +1758,38 @@ impl ScheduleStore {
     }
 
     /// List runs across every saved query for a user, paginated. Each run is
-    /// paired with its saved query's name, most recent first.
+    /// paired with its saved query's name, ordered before pagination.
     pub async fn list_all_runs(
         &self,
         key_id: i64,
         limit: usize,
         offset: usize,
+        sort: trawl_api::RunsSortKey,
+        dir: trawl_api::RunsSortDir,
     ) -> Result<Vec<(ReportRun, String)>, StoreError> {
+        use trawl_api::{
+            RunsSortDir::{Asc, Desc},
+            RunsSortKey::{Duration, Net, Rows, Started, Status},
+        };
+        let order = match (sort, dir) {
+            (Net, Asc) => r#"lower(sq.name) COLLATE "C" ASC, r.started_at DESC, r.id DESC"#,
+            (Net, Desc) => r#"lower(sq.name) COLLATE "C" DESC, r.started_at DESC, r.id DESC"#,
+            (Status, Asc) => r#"r.status COLLATE "C" ASC, r.started_at DESC, r.id DESC"#,
+            (Status, Desc) => r#"r.status COLLATE "C" DESC, r.started_at DESC, r.id DESC"#,
+            (Started, Asc) => "r.started_at ASC, r.id ASC",
+            (Started, Desc) => "r.started_at DESC, r.id DESC",
+            (Duration, Asc) => "r.duration_ms ASC NULLS LAST, r.started_at DESC, r.id DESC",
+            (Duration, Desc) => "r.duration_ms DESC NULLS LAST, r.started_at DESC, r.id DESC",
+            (Rows, Asc) => "r.row_count ASC NULLS LAST, r.started_at DESC, r.id DESC",
+            (Rows, Desc) => "r.row_count DESC NULLS LAST, r.started_at DESC, r.id DESC",
+        };
         let rows = sqlx::query(AssertSqlSafe(format!(
             "SELECT {cols}, sq.name AS sq_name
              FROM report_runs r
              JOIN schedules s ON s.id = r.schedule_id
              JOIN saved_queries sq ON sq.id = r.saved_query_id
              WHERE s.key_id = $1
-             ORDER BY r.started_at DESC, r.id DESC
+             ORDER BY {order}
              LIMIT $2 OFFSET $3",
             cols = run_cols("r.")
         )))

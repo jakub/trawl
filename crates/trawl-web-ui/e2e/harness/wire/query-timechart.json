@@ -9,5 +9,6 @@
     ["2026-09-01T23:00:00.000000Z", 12]
   ],
   "truncated": false,
-  "pagination": { "limit": 50, "offset": 0, "returned": 6 }
+  "pagination": { "limit": 50, "offset": 0, "returned": 6 },
+  "execution": { "started_at": "2026-09-15T12:34:56Z", "duration_ms": 125 }
 }

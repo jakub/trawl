@@ -20,6 +20,9 @@ import { fileURLToPath } from 'node:url';
 import { snapshotDist } from './dist-snapshot.mjs';
 import {
   wire,
+  globalRunsOrder,
+  sortedGlobalRuns,
+  paginationGlobalRuns,
   meResponse,
   healthResponse,
   queryResponse,
@@ -109,6 +112,7 @@ let scheduleRefusal = null;
 // pages rows the response already carried, so "no second read while
 // paging" is the claim; a counter is what can say it.
 let runDetailReads = [];
+let runListReads = [];
 
 // History scenarios own their held responses and request counters.
 const history = { offsets: [], deletes: 0, cleared: false, pending: null, loadPending: [] };
@@ -178,8 +182,8 @@ function paginationHistory(offset, limit) {
   return { total: pagination.historyTotal, entries: paginationSlice(pagination.historyTotal, offset, limit,
     i => ({ ...seed, id: i + 1, query: `history-row-${i + 1}` })) };
 }
-function paginationRuns(offset, limit, global) {
-  const source = wire(global ? 'pagination-runs-all' : 'pagination-net-runs');
+function paginationRuns(offset, limit) {
+  const source = wire('pagination-net-runs');
   return { total: pagination.runsTotal, runs: paginationSlice(pagination.runsTotal, offset, limit,
     i => ({ ...source.runs[i % source.runs.length], id: 501 + i })) };
 }
@@ -189,6 +193,10 @@ function paginationQuery(offset, limit, query) {
     i => [response.rows[0][0], 'web-01', 200, `query-row-${i + 1} ${query}`]);
   response.pagination = { offset, limit, returned: response.rows.length };
   response.truncated = pagination.truncated;
+  response.execution = {
+    started_at: new Date(Date.parse('2026-09-15T12:34:56Z') + offset * 1000).toISOString(),
+    duration_ms: 125 + offset,
+  };
   return response;
 }
 
@@ -270,6 +278,7 @@ function resetState() {
   scheduleRequests = [];
   scheduleRefusal = null;
   runDetailReads = [];
+  runListReads = [];
   exports_ = [];
   unhandledQueries = [];
   // sse.open/opens/closes deliberately survive a reset — a spec resets
@@ -488,6 +497,7 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
         scheduleRequests,
         scheduleRefusal,
         runDetailReads,
+        runListReads,
       });
       return;
     }
@@ -920,23 +930,35 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
     if ((scenario === 'corpus' || scenario === 'pagination') && req.method === 'GET') {
       if (netRuns) {
         if (scenario === 'pagination') pagination.runs.push({ path: p, offset: Number(url.searchParams.get('offset') ?? 0) });
-        sendJson(res, 200, scenario === 'pagination' ? paginationRuns(Number(url.searchParams.get('offset') ?? 0), Number(url.searchParams.get('limit') ?? 20), false) : corpusNetRunsResponse());
+        sendJson(res, 200, scenario === 'pagination' ? paginationRuns(Number(url.searchParams.get('offset') ?? 0), Number(url.searchParams.get('limit') ?? 20)) : corpusNetRunsResponse());
         return;
       }
       if (netRun) {
+        runDetailReads.push(p);
         sendJson(res, 200, corpusRunResultResponse());
         return;
       }
       if (p === '/api/v1/runs') {
-        if (scenario === 'pagination') pagination.runs.push({ path: p, offset: Number(url.searchParams.get('offset') ?? 0) });
-        sendJson(res, 200, scenario === 'pagination' ? paginationRuns(Number(url.searchParams.get('offset') ?? 0), Number(url.searchParams.get('limit') ?? 20), true) : corpusAllRunsResponse());
+        const order = globalRunsOrder(url.searchParams);
+        if (!order) {
+          sendJson(res, 400, { error: { code: 'bad_request', message: 'Invalid Runs sort or direction' } });
+          return;
+        }
+        const offset = Number(url.searchParams.get('offset') ?? 0);
+        const limit = Number(url.searchParams.get('limit') ?? 20);
+        const read = { path: p, offset, limit, ...order };
+        runListReads.push(read);
+        if (scenario === 'pagination') pagination.runs.push(read);
+        const full = scenario === 'pagination'
+          ? paginationGlobalRuns(pagination.runsTotal) : corpusAllRunsResponse().runs;
+        sendJson(res, 200, { total: full.length, runs: sortedGlobalRuns(full, order).slice(offset, offset + limit) });
         return;
       }
       if (p === '/api/v1/runs/stats') {
         if (scenario === 'pagination' && pagination.runsTotal === 3) {
           sendJson(res, 200, wire('pagination-runs-stats'));
         } else if (scenario === 'pagination') {
-          const runs = paginationRuns(0, pagination.runsTotal, true).runs;
+          const runs = paginationGlobalRuns(pagination.runsTotal);
           const durations = runs.map(r => r.duration_ms).filter(d => d !== null);
           sendJson(res, 200, {
             total_runs: runs.length,

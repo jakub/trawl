@@ -578,10 +578,10 @@
   border-end-start-radius: var(--radius-panel);
   border-end-end-radius: var(--radius-panel);
 }
-.scope-lb { font-weight: 600; }
-/* The window phrase can be two absolute timestamps plus DSL clauses:
- * wrap it rather than push the chips off the row. */
-.scope-window { font-family: var(--font-mono); overflow-wrap: anywhere; }
+/* Keep accepted execution facts together while allowing narrow strips to wrap. */
+.scope-facts { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; min-width: 0; }
+.scope-facts > span { font-variant-numeric: tabular-nums; }
+.scope-started { font-family: var(--font-mono); overflow-wrap: anywhere; }
 .scope .meta-chips { display: flex; flex-wrap: wrap; gap: 6px; }
 
 /* Filter chips — one per active Filter. */
@@ -632,9 +632,10 @@
   border-radius: var(--radius-round);
   background: var(--green);
 }
-/* Pushed to the trailing edge, so the count is where the eye leaves the
- * row whatever the chips did to the middle of it. */
-.scope-count { margin-inline-start: auto; font-variant-numeric: tabular-nums; }
+/* Long filter values must stay inside the hanging strip. */
+.scope .meta-chips, .scope .chip { min-width: 0; max-width: 100%; }
+.scope .chip { overflow-wrap: anywhere; }
+.scope .chip .x { flex-shrink: 0; }
 
 /* ─────────────────────────────────────────────────────────────────
  *  Tabs — base .tabs family moved to fleet-ui.css (issue #28,
@@ -1892,13 +1893,13 @@
   font-variant-numeric: tabular-nums;
 }
 
-/* The selected run: its stored result beside the receipt of how it was
- * produced. The receipt is a well on the sheet, so it reads as a record
- * rather than a second set of controls. */
-.run-detail .result-grid { display: grid; grid-template-columns: minmax(0, 1fr) 280px; min-height: 0; }
+/* The stored result precedes its receipt in both docked and overlay panes. */
+.run-detail .sd-tabs { display: none; }
+.run-detail .result-grid { display: grid; grid-template-columns: minmax(0, 1fr); min-height: 0; }
+.run-detail .data-area .preview-scroll { max-width: 100%; overflow-x: auto; }
 .run-detail .data-area { min-width: 0; padding: 12px; }
 .run-detail .receipt {
-  border-left: 1px solid var(--line); padding: 14px 16px;
+  border-top: 1px solid var(--line); padding: 14px 16px;
   background: var(--well); box-shadow: var(--inset);
 }
 .run-detail .receipt h3 { margin: 0 0 10px; font-family: var(--font-ui); font-size: var(--fs-control); font-weight: 600; }
@@ -1914,12 +1915,6 @@
   font-family: var(--font-mono); font-size: var(--fs-micro); color: var(--ink);
 }
 .run-detail .small { margin: 12px 0 0; font-size: var(--fs-dense); color: var(--ink-3); }
-/* Under 900px the receipt stacks below the rows it describes rather
- * than squeezing both into one column of a narrow viewport. */
-@media (max-width: 899.98px) {
-  .run-detail .result-grid { grid-template-columns: minmax(0, 1fr); }
-  .run-detail .receipt { border-left: 0; border-top: 1px solid var(--line); }
-}
 
 /* Wide enough for the inspector to sit beside the rows it describes. */
 @media (min-width: 900px) {
@@ -2000,12 +1995,10 @@
 
 /* Health reports share the shell's type, color and control tokens. */
 .health-page { flex: 1; min-height: 0; overflow: auto; padding: 24px 32px 48px; background: var(--bg); }
-/* .health-page > section retired (ADR-0032): the reports are cards in
- * the split above, not a stack of hairline-separated bands. */
-/* One column until the checks card can sit beside the operations
- * cards; each section is a sheet on the page's floor. */
-.health-split { display: grid; grid-template-columns: minmax(0, 1fr); gap: 20px; margin-top: 16px; }
-.health-split > section {
+/* Operational reports are cards on the page floor (ADR-0032).
+ * They keep their reading order; Queries follows at full width. */
+.health-cards { display: grid; grid-template-columns: minmax(0, 1fr); gap: 20px; margin-top: 16px; }
+.health-cards > section {
   background: var(--panel); border: 1px solid var(--line);
   border-radius: var(--radius-panel);
   box-shadow: inset 0 1px 0 var(--edge-hi), var(--elev-1);
@@ -2036,22 +2029,20 @@
 .health-checks dd { margin: 0; }
 .health-check-error { color: var(--red); }
 .health-live-state { color: var(--ink-2); }
-.health-query-scroll { overflow-x: auto; }
+.health-queries { min-width: 0; margin-top: 20px; }
+.health-queries .tbl-hd { padding-block: 8px; }
+.health-queries .tbl-hd h2 { margin: 0; font-size: var(--fs-control); }
+.health-cancel-outcome { margin: 0; padding: 12px; }
+.health-queries .overflow-hint { border-bottom: 1px solid var(--line-2); }
+.health-query-scroll { --list-min-width: 800px; overflow-x: auto; }
 .health-query-scroll:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
-.health-query-table { width: 100%; border-collapse: collapse; text-align: left; font-size: 13px; }
-.health-query-table th { color: var(--ink-3); font-weight: 500; }
-.health-query-table th, .health-query-table td { padding: 12px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
-.health-query-table td:first-child { min-width: 240px; max-width: 600px; }
+.health-query-table > tbody > tr > td { vertical-align: top; }
+.health-query-table th:first-child { width: 44%; }
 .health-query-table code { white-space: pre-wrap; overflow-wrap: anywhere; }
 @media (max-width: 640px) { .health-page { padding: 20px 16px; } .health-facts { gap: 16px 24px; } }
-/* Wide enough for the checks card to stand beside the operations
- * cards, which stack in the second column in reading order. */
+/* Implicit columns allocate space only to cards the user can read. */
 @media (min-width: 1100px) {
-  .health-split { grid-template-columns: minmax(280px, .7fr) minmax(0, 1.3fr); }
-  .health-section { grid-column: 1; grid-row: 1 / span 3; }
-  .health-queries { grid-column: 2; grid-row: 1; }
-  .health-capacity { grid-column: 2; grid-row: 2; }
-  .health-live { grid-column: 2; grid-row: 3; }
+  .health-cards { grid-template-columns: none; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); }
 }
 /* Wide enough for the bars to stand beside the numbers they draw. */
 @media (min-width: 1100px) {

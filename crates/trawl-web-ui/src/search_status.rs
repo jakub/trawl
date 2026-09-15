@@ -16,7 +16,21 @@
 
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
-/// What the footer's status dot and label report.
+/// Parse a server start instant before presenting it as a UTC fact.
+/// Invalid timestamps have no truthful display value.
+#[must_use]
+pub fn execution_started(raw: &str) -> Option<String> {
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .map(|started| {
+            started
+                .with_timezone(&chrono::Utc)
+                .format("%Y-%m-%d %H:%M:%S UTC")
+                .to_string()
+        })
+}
+
+/// What the footer's status label reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusKind {
     /// Connected to trawld; idle, ready to run.
@@ -25,7 +39,7 @@ pub enum StatusKind {
     Hauling,
     /// Live SSE stream open.
     Live,
-    /// The active result source is showing an alert; the dot turns red.
+    /// The active result source is showing an alert; the label reports Error.
     Error,
 }
 
@@ -131,6 +145,20 @@ mod tests {
     use super::{
         CountSource, FooterCount, StatusInputs, StatusKind, footer_count_label, search_status,
     };
+
+    #[test]
+    fn execution_start_is_full_utc_seconds() {
+        assert_eq!(
+            super::execution_started("2026-09-15T12:34:56.789Z").as_deref(),
+            Some("2026-09-15 12:34:56 UTC")
+        );
+        assert_eq!(
+            super::execution_started("2026-09-15T05:34:56-07:00").as_deref(),
+            Some("2026-09-15 12:34:56 UTC")
+        );
+        assert_eq!(super::execution_started("not a timestamp"), None);
+        assert_eq!(super::execution_started("2026-09-15 12:34:56"), None);
+    }
 
     /// Everything false — the idle page.
     const IDLE: StatusInputs = StatusInputs {

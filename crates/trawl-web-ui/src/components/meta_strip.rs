@@ -2,35 +2,25 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `<MetaStrip/>` — the executed-scope strip at the foot of the query
-//! console.
-//!
-//! It describes the query the LINK ran, never the editor buffer: the
-//! window comes from `effective_window(&executed_q, &range)`, the chips
-//! from the URL's filters, the mode from `?mode=`, and the count from
-//! the active result source. Typing changes none of them, which is the
-//! executed-query vs editor-buffer distinction ADR-0027 draws, stated in
-//! words instead of left for the reader to infer.
-//!
-//! While the link cannot be read the strip states nothing at all beyond
-//! the "filters unreadable" chip: no window, no badge, no count, no
-//! chips and no remove controls, because nothing ran and removing a chip
-//! navigates (ADR-0027). That holds whichever parameter is the malformed
-//! one — `r` and `page` refuse the link exactly as `f` does, and the
-//! filters would otherwise still parse and render under a banner saying
-//! nothing had run. The truncation notice lives in the result header,
-//! beside the row count it qualifies.
+//! Execution facts at the foot of the query console, with URL filter
+//! chips and mode. Draft edits never change these facts. The caller supplies
+//! timing only for the accepted snapshot response, and counts from the active
+//! result source. Unreadable links show only their unreadable-filter notice.
+//! The truncation notice remains in the result header beside its row count.
 
 use leptos::prelude::*;
 
-use crate::state::query::{EffectiveWindow, Filter, FilterOp, window_caption};
+use crate::search_status::execution_started;
+use crate::state::query::{Filter, FilterOp};
+use fleet_ui::time::format_duration;
 use fleet_ui::{Badge, Tone};
+use trawl_api::QueryExecution;
 
 #[component]
 pub fn MetaStrip(
-    /// The window the executed query ran under.
+    /// Server timing belonging to the accepted snapshot response.
     #[prop(into)]
-    window: Signal<EffectiveWindow>,
+    execution: Signal<Option<QueryExecution>>,
     /// Active filters — rendered as chips. Each chip has an `×` that
     /// calls `on_remove` with its index.
     #[prop(into)]
@@ -66,8 +56,31 @@ pub fn MetaStrip(
     view! {
         <div class="scope" class:blocked=move || blocked.get()>
             <Show when=move || !blocked.get()>
-                <span class="scope-lb">"Executed scope"</span>
-                <span class="scope-window">{move || window_caption(&window.get())}</span>
+                <div class="scope-facts">
+                    <span class="scope-count">
+                        {move || if pending.get() {
+                            "…".to_string()
+                        } else {
+                            count.get().map_or_else(
+                                || "—".to_string(),
+                                |n| if live.get() {
+                                    format!("{n} buffered rows")
+                                } else if n == 1 {
+                                    "1 row returned".to_string()
+                                } else {
+                                    format!("{n} rows returned")
+                                },
+                            )
+                        }}
+                    </span>
+                    {move || execution.get().map(|facts| {
+                        let started = execution_started(&facts.started_at);
+                        view! {
+                            <span class="scope-execution">{format!("Execution {}", format_duration(facts.duration_ms))}</span>
+                            {started.map(|value| view! { <span class="scope-started">{format!("Started {value}")}</span> })}
+                        }
+                    })}
+                </div>
             </Show>
             <div class="meta-chips">
                 // The whole loop, not just the remove control: a chip
@@ -111,16 +124,6 @@ pub fn MetaStrip(
                         }.into_any()
                     } else {
                         view! { <Badge tone=Tone::Neutral>"Snapshot"</Badge> }.into_any()
-                    }}
-                </span>
-                <span class="scope-count">
-                    {move || if pending.get() {
-                        "…".to_string()
-                    } else {
-                        count.get().map_or_else(
-                            || "—".to_string(),
-                            |n| format!("{n} rows"),
-                        )
                     }}
                 </span>
             </Show>

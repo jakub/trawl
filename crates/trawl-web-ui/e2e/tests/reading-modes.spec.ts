@@ -234,3 +234,28 @@ test('message-first rows lead with the message and keep the rest reachable', asy
   await page.locator(SEL.resultsExpandControl).first().click();
   await expect(page.locator(SEL.resultsDetailCell)).toContainText('status');
 });
+
+for (const width of [720, 1100]) {
+  test(`Runs Drawer close and Escape restore its opener at ${width}px`, async ({ page, request }) => {
+    await resetScenario(request, 'corpus');
+    await page.setViewportSize({ width, height: 900 });
+    await page.goto('/jobs/runs');
+    const opener = page.locator('.runs-table .row-stretch').first();
+    await opener.click();
+    const detail = page.locator(SEL.runDetail);
+    await expect(detail).toHaveRole('dialog');
+    await expect(detail).not.toHaveAttribute('aria-modal', 'true');
+    await expect(detail).toHaveAccessibleName(new RegExp(CORPUS.netName));
+    await expect(detail.locator('.sd-tabs')).toBeHidden();
+    await detail.getByRole('button', { name: 'Close', exact: true }).click();
+    await expect(detail).toHaveCount(0);
+    await expect(page).toHaveURL(/\/jobs\/runs$/);
+    await expect(opener).toBeFocused();
+    await opener.press('Enter');
+    await expect(detail).toBeVisible();
+    await detail.getByRole('button', { name: 'Close', exact: true }).focus();
+    await page.keyboard.press('Escape');
+    await expect(detail).toHaveCount(0);
+    await expect(opener).toBeFocused();
+  });
+}

@@ -28,10 +28,7 @@ use leptos::prelude::*;
 use leptos_router::NavigateOptions;
 use leptos_router::hooks::{use_location, use_navigate};
 
-pub use crate::query_merge::{
-    EffectiveWindow, Filter, FilterOp, QUICK_RANGES, RangeSpec, effective_query, effective_window,
-    window_caption,
-};
+pub use crate::query_merge::{Filter, FilterOp, QUICK_RANGES, RangeSpec, effective_query};
 pub use crate::search_url::{Mode, build_search_url};
 
 use crate::search_url::{

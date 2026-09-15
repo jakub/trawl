@@ -247,3 +247,54 @@ test('the nav overlay does not re-open by itself after a wide detour', async ({ 
   await expect(page.locator('nav.rail.overlay')).toHaveCount(0);
   await expect(page.locator('.nav-scrim')).toHaveCount(0);
 });
+
+test('Runs crosses the 1099/1100 docking boundary without remounting or fetching its paged result', async ({ page, request }) => {
+  await resetScenario(request, 'corpus');
+  await page.clock.install();
+  let reads = 0;
+  await page.route('**/api/v1/saved/2/runs/503', async route => {
+    reads++;
+    const body = JSON.parse(await readFile(`${__dirname}/../harness/wire/run-result-paged.json`, 'utf8'));
+    // Wide stored data exercises the preview's own scroll region even in
+    // the wide viewport, where the docked column itself remains narrow.
+    body.result.columns.push({ name: 'wide_value' });
+    body.result.rows.forEach((row: unknown[]) => row.push('stored-column-'.repeat(60)));
+    await route.fulfill({ json: body });
+  });
+  await page.setViewportSize({ width: 1100, height: 900 });
+  await page.goto('/jobs/runs?run=503&net=2');
+  const detail = page.locator(SEL.runDetail);
+  await expect(detail.locator('.results-summary')).toHaveText('1–20 of 45');
+  await detail.locator('.data-area').getByRole('button', { name: 'Next →', exact: true }).click();
+  await expect(detail.locator('.results-summary')).toHaveText('21–40 of 45');
+  const mounted = await detail.elementHandle();
+  const preview = await detail.getByRole('region', { name: 'Stored result rows', exact: true }).elementHandle();
+  for (const width of [1099, 1100, 1440, 720, 320, 1100]) {
+    await page.setViewportSize({ width, height: 900 });
+    if (width >= 1100) {
+      await expect(detail).toHaveClass(/sd-docked/);
+      await expect(page.locator('.page-split > .sd-host')).toHaveCount(1);
+      await expect(page.locator('.page-split > .sd-scrim')).toHaveCount(0);
+      const list = await page.locator('.page-split > .list-sheet').boundingBox();
+      const panel = await detail.boundingBox();
+      expect(panel!.x).toBeGreaterThanOrEqual(list!.x + list!.width);
+    } else {
+      await expect(detail).not.toHaveClass(/sd-docked/);
+      await expect(page.locator('.page-split > .sd-scrim')).toHaveCount(1);
+      await expect(detail).toHaveCSS('position', 'fixed');
+    }
+    await expect(detail.locator('.sd-tabs')).toBeHidden();
+    await expect(detail.locator('.results-summary')).toHaveText('21–40 of 45');
+    const data = await detail.locator('.data-area').boundingBox();
+    const receipt = await detail.locator('.receipt').boundingBox();
+    expect(receipt!.y).toBeGreaterThanOrEqual(data!.y + data!.height - 1);
+    const scroller = detail.getByRole('region', { name: 'Stored result rows' });
+    await expect(scroller).toHaveAttribute('tabindex', '0');
+    expect(await scroller.evaluate(el => el.scrollWidth > el.clientWidth)).toBe(true);
+    await noPageOverflow(page);
+    expect(await mounted!.evaluate(el => el.isConnected)).toBe(true);
+    expect(await preview!.evaluate(el => el.isConnected)).toBe(true);
+    expect(reads).toBe(1);
+    await expect(page).toHaveURL(/run=503&net=2$/);
+  }
+});

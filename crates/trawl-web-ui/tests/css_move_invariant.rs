@@ -203,6 +203,8 @@ const RETIRED_SELECTORS: &[&str] = &[
     // chips kept their `.meta-chips` wrapper and their own classes, but
     // every rule that scoped them under `.meta` is re-homed under
     // `.scope`, and the truncation note left for the result header.
+    ".scope-lb",
+    ".scope-window",
     ".meta",
     ".meta .dim",
     ".meta .chip",

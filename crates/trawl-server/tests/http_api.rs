@@ -3413,3 +3413,211 @@ async fn covered_through_is_reported_only_while_the_schedule_tiles() {
         Some(seeded.as_str())
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn query_execution_timestamp_bounds_include_empty_success() {
+    let server = setup().await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+    for (query, expected_rows) in [("*", 3), ("service=does-not-exist", 0)] {
+        let before = chrono::Utc::now();
+        let response = client.query_paginated(query, None, None).await.unwrap();
+        let after = chrono::Utc::now();
+        assert_eq!(response.result.row_count(), expected_rows);
+        let execution = response.execution.expect("real successful query execution");
+        assert!(execution.started_at.ends_with('Z'));
+        let started = chrono::DateTime::parse_from_rfc3339(&execution.started_at)
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert!(started >= before && started <= after);
+        // No minimum latency: a real execution may take zero whole milliseconds.
+        let roundtrip_ms = u64::try_from((after - before).num_milliseconds()).unwrap();
+        assert!(execution.duration_ms <= roundtrip_ms);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_all_runs_sort_http_contract() {
+    use trawl_api::ListAllRunsResponse;
+    let server = setup().await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+    let raw = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap();
+    let pool = common::app_pool(&server.app_db_url).await;
+    let saved = client.create_saved("sort-contract", "*").await.unwrap();
+    let owner: i64 = sqlx::query_scalar("SELECT key_id FROM saved_queries WHERE id = $1")
+        .bind(saved.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let schedule = server
+        .state
+        .storage
+        .schedule
+        .create_schedule(
+            saved.id,
+            owner,
+            300,
+            None,
+            None,
+            0,
+            chrono::Utc::now() + chrono::Duration::days(1),
+        )
+        .await
+        .unwrap();
+    let mut ids = Vec::new();
+    for (seconds, duration, rows, status) in [
+        (1, 100_i64, 2_i64, "success"),
+        (3, 2, 100, "error"),
+        (2, 10, 10, "timeout"),
+    ] {
+        let id: i64 = sqlx::query_scalar("INSERT INTO report_runs (schedule_id, saved_query_id, query, status, started_at, duration_ms, row_count)
+            VALUES ($1, $2, '*', $3, '2026-09-15T00:00:00Z'::timestamptz + $4 * interval '1 second', $5, $6) RETURNING id")
+            .bind(schedule.id).bind(saved.id).bind(status).bind(f64::from(seconds)).bind(duration).bind(rows)
+            .fetch_one(&pool).await.unwrap();
+        ids.push(id);
+    }
+    for (sort, dir, expected) in [
+        ("net", "asc", [1, 2, 0]),
+        ("net", "desc", [1, 2, 0]),
+        ("status", "asc", [1, 0, 2]),
+        ("status", "desc", [2, 0, 1]),
+        ("started", "asc", [0, 2, 1]),
+        ("started", "desc", [1, 2, 0]),
+        ("duration", "asc", [1, 2, 0]),
+        ("duration", "desc", [0, 2, 1]),
+        ("rows", "asc", [0, 2, 1]),
+        ("rows", "desc", [1, 2, 0]),
+    ] {
+        let mut actual = Vec::new();
+        for offset in [0, 2] {
+            let response = raw
+                .get(format!(
+                    "{}/api/v1/runs?sort={sort}&dir={dir}&limit=2&offset={offset}",
+                    server.url
+                ))
+                .bearer_auth(&server.analyst_token)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200);
+            let page: ListAllRunsResponse = response.json().await.unwrap();
+            assert_eq!(page.total, 3);
+            actual.extend(page.runs.into_iter().map(|r| r.run.id));
+        }
+        assert_eq!(actual, expected.map(|i| ids[i]), "{sort} {dir}");
+    }
+    let default = client.list_all_runs(None, None).await.unwrap();
+    assert_eq!(
+        default.runs.iter().map(|r| r.run.id).collect::<Vec<_>>(),
+        vec![ids[1], ids[2], ids[0]]
+    );
+    // Global ordering parameters do not change the per-net endpoint.
+    let response = raw
+        .get(format!(
+            "{}/api/v1/saved/{}/runs?sort=invalid&dir=asc",
+            server.url, saved.id
+        ))
+        .bearer_auth(&server.analyst_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let per_net: trawl_api::ListReportRunsResponse = response.json().await.unwrap();
+    assert_eq!(
+        per_net.runs.iter().map(|r| r.id).collect::<Vec<_>>(),
+        vec![ids[1], ids[2], ids[0]]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_all_runs_invalid_sort_preserves_json_and_permissions() {
+    let server = setup().await;
+    let raw = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap();
+    for (params, message) in [
+        ("sort=Started", "invalid runs sort key"),
+        ("sort=", "invalid runs sort key"),
+        ("sort=duration%3BDROP", "invalid runs sort key"),
+        ("dir=ASC", "invalid runs sort direction"),
+        ("dir=", "invalid runs sort direction"),
+    ] {
+        let response = raw
+            .get(format!("{}/api/v1/runs?{params}", server.url))
+            .bearer_auth(&server.analyst_token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400);
+        assert!(
+            response.headers()[reqwest::header::CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .starts_with("application/json")
+        );
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "bad_request");
+        assert_eq!(body["error"]["message"], message);
+    }
+    for params in ["sort=started&dir=desc", "sort=invalid&dir=invalid"] {
+        let response = raw
+            .get(format!("{}/api/v1/runs?{params}", server.url))
+            .bearer_auth(&server.reader_token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 403);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_all_runs_extraction_errors_preserve_json_and_permissions() {
+    let server = setup().await;
+    let raw = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap();
+    for params in [
+        "sort=net&sort=rows",
+        "dir=asc&dir=desc",
+        "limit=invalid",
+        "offset=-1",
+        "limit=184467440737095516160",
+    ] {
+        for (token, status, code, message) in [
+            (
+                &server.analyst_token,
+                400,
+                "bad_request",
+                "invalid runs parameters",
+            ),
+            (
+                &server.reader_token,
+                403,
+                "forbidden",
+                "insufficient permissions",
+            ),
+        ] {
+            let response = raw
+                .get(format!("{}/api/v1/runs?{params}", server.url))
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status, "{params}");
+            assert!(
+                response.headers()[reqwest::header::CONTENT_TYPE]
+                    .to_str()
+                    .unwrap()
+                    .starts_with("application/json"),
+                "{params}"
+            );
+            let body: serde_json::Value = response.json().await.unwrap();
+            assert_eq!(body["error"]["code"], code, "{params}");
+            assert_eq!(body["error"]["message"], message, "{params}");
+        }
+    }
+}

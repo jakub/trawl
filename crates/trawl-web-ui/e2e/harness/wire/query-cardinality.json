@@ -2,5 +2,6 @@
   "columns": [{ "name": "c0" }, { "name": "c1" }, { "name": "c2" }],
   "rows": [[1200, 5, null]],
   "truncated": false,
-  "pagination": { "limit": 50, "offset": 0, "returned": 1 }
+  "pagination": { "limit": 50, "offset": 0, "returned": 1 },
+  "execution": { "started_at": "2026-09-15T12:34:56Z", "duration_ms": 125 }
 }

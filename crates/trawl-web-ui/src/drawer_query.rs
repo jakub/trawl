@@ -238,6 +238,7 @@ mod tests {
         rows: Vec<Vec<trawl_api::value::Value>>,
     ) -> trawl_api::QueryResponse {
         trawl_api::QueryResponse {
+            execution: None,
             result: trawl_api::value::QueryResult {
                 columns: columns
                     .iter()

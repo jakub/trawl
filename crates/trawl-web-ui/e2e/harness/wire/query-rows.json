@@ -16,5 +16,6 @@
     ["2026-09-01T10:07:00.000000Z", "web-01", 200, "POST /api/v1/query ok"]
   ],
   "truncated": false,
-  "pagination": { "limit": 50, "offset": 0, "returned": 8 }
+  "pagination": { "limit": 50, "offset": 0, "returned": 8 },
+  "execution": { "started_at": "2026-09-15T12:34:56Z", "duration_ms": 125 }
 }

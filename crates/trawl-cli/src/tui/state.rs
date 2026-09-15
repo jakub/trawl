@@ -1817,6 +1817,7 @@ impl LiveBuffer {
         let returned = rows.len();
 
         QueryResponse {
+            execution: None,
             result: QueryResult { columns, rows },
             truncated: false,
             pagination: PaginationMeta {

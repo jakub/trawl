@@ -197,6 +197,7 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -H "Content-Type: applicatio
 {
   "columns": [{ "name": "service" }, { "name": "count" }],
   "rows": [["nginx", 12], ["api", 3]],
+  "execution": { "started_at": "2026-09-15T12:34:56.123Z", "duration_ms": 80 },
   "truncated": false,
   "pagination": { "limit": 100000, "offset": 0, "returned": 2 },
   "degraded_fields": ["duration"],
@@ -210,8 +211,13 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -H "Content-Type: applicatio
 | `rows` | array | One array per row. Values are JSON null, booleans, numbers, strings, or arrays. |
 | `truncated` | boolean | `true` when the full result reached `max_result_rows` |
 | `pagination` | object | `limit`, `offset`, and `returned` for this page |
+| `execution` | object | Optional execution metadata. Present on successful server query responses, including zero-row results. Absent on synthetic client results. |
+| `execution.started_at` | string | Server start instant in RFC 3339 UTC, with a `Z` suffix. Independent of the request's `timezone`. |
+| `execution.duration_ms` | integer | Server-measured duration in milliseconds. Zero is valid. |
 | `degraded_fields` | array | Fields the query bound whose pin is degraded, including fields filtered on and then projected away. Absent when empty. Stale by at most `schema_cache_ttl_secs`. |
 | `severity_columns` | array | Result columns that hold OTel severity numbers other than `_severity`. Absent when empty. |
+
+The server captures `execution.started_at` beside its monotonic timer. The duration includes admission and execution within that timed section. It excludes subsequent history processing, response serialization, and browser transit. Each page request has its own execution metadata.
 
 **Errors**
 
@@ -1503,7 +1509,7 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" "$TRAWL_URL/api/v1/saved/7/r
 
 Permission: `saved_query`
 
-Lists the key's runs across every saved query, most recent first.
+Lists the key's runs across every saved query. The server filters by owner, sorts the complete authorized set, then applies pagination.
 
 **Parameters**
 
@@ -1511,6 +1517,20 @@ Lists the key's runs across every saved query, most recent first.
 |------|----|------|----------|-------------|
 | `limit` | query | integer | no | Default `20` |
 | `offset` | query | integer | no | Default `0` |
+| `sort` | query | string | no | `net`, `status`, `started`, `duration`, or `rows`. Default `started`. |
+| `dir` | query | string | no | `asc` or `desc`. Default `desc`. |
+
+Sort tokens are case-sensitive. The default order is most recent first.
+
+| Sort key | Primary comparison | Tie-breakers |
+|----------|--------------------|--------------|
+| `net` | PostgreSQL lowercase saved-query name, with C collation | Start time descending, then run ID descending |
+| `status` | Canonical status token, lexical C collation | Start time descending, then run ID descending |
+| `started` | Stored start timestamp | Run ID in the requested direction |
+| `duration` | Numeric duration, with nulls last in both directions | Start time descending, then run ID descending |
+| `rows` | Numeric row count, with nulls last in both directions | Start time descending, then run ID descending |
+
+These sort parameters apply only to the global list. Per-net run history keeps its existing order. Separate page requests do not freeze the dataset against new runs or updates.
 
 **Request**
 
@@ -1532,7 +1552,11 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" "$TRAWL_URL/api/v1/runs"
 
 | Status | Code | When |
 |--------|------|------|
+| 400 | `bad_request` | Invalid `sort` or `dir`, duplicate scalar parameters, or malformed `limit` or `offset` |
+| 403 | `forbidden` | The key lacks `saved_query`, including when the query parameters are invalid |
 | 503 | `service_unavailable` | The app-state store did not answer |
+
+Parameter errors use the normal JSON error envelope. Invalid tokens return `invalid runs sort key` or `invalid runs sort direction`. Extraction failures return `invalid runs parameters` without echoing the submitted values.
 
 ### Run statistics
 

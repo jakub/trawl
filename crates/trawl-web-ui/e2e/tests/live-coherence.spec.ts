@@ -130,6 +130,9 @@ test('live posts no snapshot query, from page load through the whole burst', asy
   // Settle: a request the page was about to make has had its chance by
   // the time 6,000 events have rendered and the footer has caught up.
   await expect(page.locator(SEL.footerCount)).toContainText('Received 6000');
+  await expect(page.locator(SEL.scopeCount)).toHaveText('5000 buffered rows');
+  await expect(page.locator(SEL.scopeExecution)).toHaveCount(0);
+  await expect(page.locator(SEL.scopeStarted)).toHaveCount(0);
   expect(await capturedQueryCount(request)).toBe(0);
 });
 
@@ -229,17 +232,60 @@ test('an aggregation-shaped result computes no groups while Clear all still remo
   await expect(page.locator(SEL.filterChip)).toHaveCount(0);
 });
 
-test('the histogram is absent in live and the scope states the executed window', async ({ page, request }) => {
+test('the histogram and execution timing are absent in live and return with a snapshot', async ({ page, request }) => {
   await resetScenario(request, 'stream-burst');
   await page.goto('/search?q=service%3Dnginx&mode=live');
   await burstArrived(page);
   await expect(page.locator(SEL.histoStrip)).toHaveCount(0);
+  await expect(page.locator(SEL.scopeExecution)).toHaveCount(0);
+  await expect(page.locator(SEL.scopeStarted)).toHaveCount(0);
   await page.locator(SEL.stopLive).click();
   await expect(page.locator(SEL.histoStrip)).toHaveCount(1);
+  await expect(page.locator(SEL.scopeExecution)).toHaveText('Execution 0.125s');
+  await expect(page.locator(SEL.scopeStarted)).toHaveText('Started 2026-09-15 12:34:56 UTC');
 
-  // The DSL's own clause is what ran, so it is what the scope says —
-  // while the picker's trigger keeps reading the URL's `15m`.
+  // An explicit DSL window still reports response timing in the strip.
   await resetScenario(request, 'corpus');
   await page.goto('/search?q=last%3D24h&r=15m');
-  await expect(page.locator(SEL.scopeWindow)).toHaveText('last 24h');
+  await expect(page.locator(SEL.scopeExecution)).toHaveText('Execution 0.125s');
+  await expect(page.locator(SEL.scopeStarted)).toHaveText('Started 2026-09-15 12:34:56 UTC');
+});
+
+test('a snapshot finishing after Live cannot restore timing or complete a later snapshot', async ({ page, request }) => {
+  await resetScenario(request, 'stream-burst');
+  const held: import('@playwright/test').Route[] = [];
+  await page.route('**/api/v1/query', route => { held.push(route); });
+  await page.goto('/search?q=service%3Dnginx');
+  await expect.poll(() => held.length).toBe(1);
+  await page.locator(SEL.dateRangeTrigger).click();
+  await page.locator(SEL.realtimeTab).click();
+  await page.locator(SEL.liveTailButton).click();
+  await burstArrived(page);
+  await expect(page.locator(SEL.scopeCount)).toHaveText('5000 buffered rows');
+  await expect(page.locator(SEL.scopeExecution)).toHaveCount(0);
+  await expect(page.locator(SEL.scopeStarted)).toHaveCount(0);
+
+  await page.locator(SEL.stopLive).click();
+  await expect(page.locator(SEL.scopeCount)).toHaveText('…');
+  await expect(page.locator(SEL.scopeExecution)).toHaveCount(0);
+  await expect(page.locator(SEL.scopeStarted)).toHaveCount(0);
+  const responseBody = (started: string, duration: number) => ({
+    columns: [{ name: 'message' }], rows: [['snapshot']], truncated: false,
+    pagination: { limit: 50, offset: 0, returned: 1 },
+    execution: { started_at: started, duration_ms: duration },
+  });
+  const oldResponse = page.waitForResponse('**/api/v1/query');
+  await held[0].fulfill({ json: responseBody('2026-09-15T10:00:00Z', 100) });
+  await (await oldResponse).finished();
+  await expect.poll(() => held.length).toBe(2);
+  await page.evaluate(() => new Promise<void>(resolve => {
+    requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+  }));
+  await expect(page.locator(SEL.scopeCount)).toHaveText('…');
+  await expect(page.locator(SEL.scopeExecution)).toHaveCount(0);
+  await expect(page.locator(SEL.scopeStarted)).toHaveCount(0);
+  await held[1].fulfill({ json: responseBody('2026-09-15T11:00:00Z', 200) });
+  await expect(page.locator(SEL.scopeExecution)).toHaveText('Execution 0.200s');
+  await expect(page.locator(SEL.scopeStarted)).toHaveText('Started 2026-09-15 11:00:00 UTC');
+  await expect(page.locator(SEL.scopeCount)).toHaveText('1 row returned');
 });

@@ -727,6 +727,7 @@ mod tests {
     /// result row.
     fn mocked_response() -> trawl_client::QueryResponse {
         trawl_client::QueryResponse {
+            execution: None,
             result: QueryResult {
                 columns: vec![trawl_engine::value::Column {
                     name: "host".to_owned(),

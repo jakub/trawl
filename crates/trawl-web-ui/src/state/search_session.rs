@@ -24,6 +24,9 @@ pub struct ExecutedQuery {
 pub struct ExecutedResponse {
     pub query: ExecutedQuery,
     pub response: QueryResponse,
+    pub page: usize,
+    pub generation: u64,
+    pub intent: u64,
 }
 impl std::ops::Deref for ExecutedResponse {
     type Target = QueryResponse;
@@ -47,41 +50,107 @@ impl std::ops::Deref for ExecutedResponse {
 /// result type) because this crate doesn't do SSR hydration.
 /// `pending` tracks the request itself: a resource retains its previous
 /// `Some` response during a reload, so presence cannot report loading.
+/// The returned intent revision advances independently of the serialized
+/// fetcher, including while an older request is still in flight.
 pub fn rows_resource(
     effective_q: Memo<String>,
     page: Memo<usize>,
     pending: WriteSignal<bool>,
+    generation: RwSignal<u64>,
     base: Memo<String>,
     filters: Memo<Vec<Filter>>,
     range: Memo<RangeSpec>,
-) -> LocalResource<Result<ExecutedResponse, ApiError>> {
-    LocalResource::new(move || {
-        let q = effective_q.get();
-        let p = page.get();
+) -> (LocalResource<Result<ExecutedResponse, ApiError>>, Memo<u64>) {
+    // Compare the complete request before advancing its intent. Related URL
+    // memos can notify through several paths for the same captured values.
+    let inputs = Memo::new(move |_| {
+        (
+            effective_q.get(),
+            page.get(),
+            base.get(),
+            filters.get(),
+            range.get(),
+        )
+    });
+    let intent = Memo::new(move |previous: Option<&u64>| {
+        inputs.with(|_| ());
+        previous.map_or(0, |revision| revision.wrapping_add(1))
+    });
+    // LocalResource awaits one request before processing its next dependency
+    // notification. Observe intermediate intents now, so A -> empty -> A
+    // cannot accept the first A or suppress the newly requested execution.
+    Effect::new(move |_| {
+        intent.get();
+    });
+    // A subscriber can consume LocalResource's dependency invalidation while
+    // its old future is waiting. A stale completion must rearm the fetcher
+    // itself so the latest intent still gets its serialized execution.
+    let rearm = RwSignal::new(0_u64);
+    let rows = LocalResource::new(move || {
+        rearm.track();
+        let request_intent = intent.get();
+        // Reading intent first resolves the complete input tuple. Subscribe
+        // only through intent: tracking its inputs too can dirty the resource
+        // during that resolution and execute the same request a second time.
+        let (q, p, base, filters, range) = inputs.get_untracked();
         let query = ExecutedQuery {
             effective: q.clone(),
-            base: base.get(),
-            filters: filters.get(),
-            range: range.get(),
+            base,
+            filters,
+            range,
         };
+        // Capture ownership before polling the future, including synthetic
+        // empty requests. Intent ownership rejects results that the serialized
+        // resource can publish before it starts the latest queued request.
+        let request_generation = generation.get_untracked().wrapping_add(1);
+        generation.set(request_generation);
+        pending.set(!q.trim().is_empty());
         async move {
             if q.trim().is_empty() {
+                rearm_if_stale(intent, request_intent, rearm);
                 return Ok(ExecutedResponse {
                     query,
                     response: empty_response(),
+                    page: p,
+                    generation: request_generation,
+                    intent: request_intent,
                 });
             }
-            let _ = pending.try_set(true);
             let response = api::query(&q, p).await;
             // A response can finish after route teardown disposed the signal.
-            let _ = pending.try_set(false);
-            response.map(|response| ExecutedResponse { query, response })
+            if generation.try_get_untracked() == Some(request_generation)
+                && intent.try_get_untracked() == Some(request_intent)
+            {
+                let _ = pending.try_set(false);
+            }
+            rearm_if_stale(intent, request_intent, rearm);
+            response.map(|response| ExecutedResponse {
+                query,
+                response,
+                page: p,
+                generation: request_generation,
+                intent: request_intent,
+            })
         }
-    })
+    });
+    (rows, intent)
+}
+
+/// Rearm from the completing future, before the resource driver checks its
+/// dependencies again. An eager effect alone can have its invalidation
+/// consumed while the request waits. Signals may be disposed by route teardown.
+fn rearm_if_stale(intent: Memo<u64>, started: u64, rearm: RwSignal<u64>) {
+    if intent
+        .try_get_untracked()
+        .is_some_and(|latest| latest != started)
+    {
+        let _ = rearm.try_update(|revision| *revision = revision.wrapping_add(1));
+    }
 }
 
 fn empty_response() -> QueryResponse {
     QueryResponse {
+        execution: None,
         result: trawl_api::value::QueryResult::empty(),
         truncated: false,
         pagination: trawl_api::PaginationMeta {

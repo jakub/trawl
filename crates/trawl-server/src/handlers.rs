@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 
+use axum::extract::rejection::QueryRejection;
 use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
@@ -21,10 +22,10 @@ use trawl_api::{
     DeleteSavedResponse, DeleteScheduleResponse, ExportRequest, FieldValuesResponse,
     GlobalRunSummary, HealthResponse, HealthStatus, HistoryEntryResponse, HistoryResponse,
     ListAllRunsResponse, ListReportRunsResponse, ListSavedResponse, PaginationMeta,
-    QueriesResponse, QueryRequest, QueryResponse, QueryStatus, ReportRunResponse, ReportRunSummary,
-    RetainedWorkSnapshot, RunsStatsResponse, SavedQueryResponse, ScheduleResponse,
-    SchemaColumnResponse, SchemaResponse, SetScheduleRequest, StatsResponse, UpdateSavedRequest,
-    ValidationResponse, WhoAmIResponse,
+    QueriesResponse, QueryExecution, QueryRequest, QueryResponse, QueryStatus, ReportRunResponse,
+    ReportRunSummary, RetainedWorkSnapshot, RunsSortDir, RunsSortKey, RunsStatsResponse,
+    SavedQueryResponse, ScheduleResponse, SchemaColumnResponse, SchemaResponse, SetScheduleRequest,
+    StatsResponse, UpdateSavedRequest, ValidationResponse, WhoAmIResponse,
 };
 use trawl_engine::value::{QueryResult, Value};
 
@@ -119,6 +120,7 @@ pub async fn query(
         "raw query text (DEBUG-only: never stored under the default filter)"
     );
 
+    let started_at = chrono::Utc::now();
     let start = std::time::Instant::now();
     let capture_debug = state.query.query_log.is_some();
 
@@ -301,6 +303,10 @@ pub async fn query(
             );
 
             Ok(Json(QueryResponse {
+                execution: Some(QueryExecution {
+                    started_at: started_at.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
+                    duration_ms,
+                }),
                 result: paginated,
                 truncated,
                 pagination: PaginationMeta {
@@ -2568,22 +2574,51 @@ pub async fn list_report_runs(
     }))
 }
 
+/// Global Runs parameters, separate from per-net history.
+#[derive(Debug, Deserialize)]
+pub struct ListAllRunsParams {
+    #[serde(default = "default_runs_limit")]
+    pub limit: usize,
+    #[serde(default)]
+    pub offset: usize,
+    pub sort: Option<String>,
+    pub dir: Option<String>,
+}
+
 /// `GET /api/v1/runs` — list report runs across all saved queries for the user.
 pub async fn list_all_runs(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
-    Query(params): Query<ListRunsParams>,
+    params: Result<Query<ListAllRunsParams>, QueryRejection>,
 ) -> Result<Json<ListAllRunsResponse>, ServerError> {
     if !verified.has_permission(Permission::SavedQuery) {
         return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
+
+    let Query(params) =
+        params.map_err(|_| ServerError::BadRequest("invalid runs parameters".into()))?;
+
+    let sort = params
+        .sort
+        .as_deref()
+        .map(str::parse::<RunsSortKey>)
+        .transpose()
+        .map_err(|_| ServerError::BadRequest("invalid runs sort key".into()))?
+        .unwrap_or_default();
+    let dir = params
+        .dir
+        .as_deref()
+        .map(str::parse::<RunsSortDir>)
+        .transpose()
+        .map_err(|_| ServerError::BadRequest("invalid runs sort direction".into()))?
+        .unwrap_or_default();
 
     let key_id = verified.id;
 
     let runs = state
         .storage
         .schedule
-        .list_all_runs(key_id, params.limit, params.offset)
+        .list_all_runs(key_id, params.limit, params.offset, sort, dir)
         .await?;
 
     let total = state.storage.schedule.count_all_runs(key_id).await?;

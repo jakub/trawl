@@ -58,8 +58,8 @@ use crate::pages::layout::ShellStatus;
 use crate::search_status::{CountSource, FooterCount, StatusInputs, StatusKind, search_status};
 use crate::search_url::{Param, admit_filters, refusal_copy};
 use crate::state::query::{
-    Filter, Mode, UrlSignals, effective_query, effective_window, navigator, replace_navigator,
-    report_refusal, url_signals,
+    Filter, Mode, UrlSignals, effective_query, navigator, replace_navigator, report_refusal,
+    url_signals,
 };
 use crate::state::search_session::rows_resource;
 use fleet_ui::overlay::use_overlay_layer;
@@ -205,10 +205,12 @@ pub fn Search() -> impl IntoView {
     });
 
     let (query_pending, set_query_pending) = signal(false);
-    let rows = rows_resource(
+    let request_generation = RwSignal::new(0_u64);
+    let (rows, request_intent) = rows_resource(
         snapshot_q,
         page,
         set_query_pending,
+        request_generation,
         executed_q,
         filters,
         range,
@@ -559,7 +561,31 @@ pub fn Search() -> impl IntoView {
     let ring_result = Memo::new(move |_| ring_to_result(&ring.read()));
 
     let loading = Signal::derive(move || {
-        !snapshot_q.get().trim().is_empty() && (query_pending.get() || rows.get().is_none())
+        !snapshot_q.get().trim().is_empty()
+            && (query_pending.get()
+                || match rows.get() {
+                    None => true,
+                    Some(Ok(response)) => {
+                        response.query.effective != snapshot_q.get()
+                            || response.page != page.get()
+                            || response.generation != request_generation.get()
+                            || response.intent != request_intent.get()
+                    }
+                    Some(Err(_)) => false,
+                })
+    });
+    // Only an accepted response can supply execution facts. The resource
+    // retains its previous value during reloads, including same-query Hauls.
+    let accepted_snapshot = Signal::derive(move || {
+        if unreadable.get() || live.get() || snapshot_q.get().trim().is_empty() || loading.get() {
+            return None;
+        }
+        rows.get().and_then(Result::ok)
+    });
+    let execution = Signal::derive(move || {
+        accepted_snapshot
+            .get()
+            .and_then(|response| response.response.execution)
     });
 
     // The rows on screen, from whichever source the mode makes active:
@@ -582,6 +608,9 @@ pub fn Search() -> impl IntoView {
                 LoadState::Ready(ring_result.get())
             };
         }
+        if loading.get() {
+            return LoadState::Loading;
+        }
         LoadState::from_resource(rows.get().map(|r| r.map(|resp| resp.response.result)))
     });
     // A resource holds its previous response while the next request is
@@ -589,7 +618,9 @@ pub fn Search() -> impl IntoView {
     // the old page's row count under the new executed scope and on the
     // Events tab beside it. No count until the answer matches.
     let active_row_count = Signal::derive(move || match active_rows.get() {
-        LoadState::Ready(result) if !loading.get() => Some(result.rows.len()),
+        LoadState::Ready(result) if live.get() || accepted_snapshot.get().is_some() => {
+            Some(result.rows.len())
+        }
         _ => None,
     });
 
@@ -633,8 +664,8 @@ pub fn Search() -> impl IntoView {
             FooterCount::last(if unreadable.get() || !snapshot_ran.get() {
                 None
             } else {
-                rows.get()
-                    .and_then(Result::ok)
+                accepted_snapshot
+                    .get()
                     .map(|r| u64::try_from(r.pagination.returned).unwrap_or(u64::MAX))
             })
         };
@@ -650,11 +681,7 @@ pub fn Search() -> impl IntoView {
         shell_status.lagged.set(None);
     });
 
-    let truncated = Signal::derive(move || {
-        !unreadable.get()
-            && snapshot_ran.get()
-            && rows.get().and_then(Result::ok).is_some_and(|r| r.truncated)
-    });
+    let truncated = Signal::derive(move || accepted_snapshot.get().is_some_and(|r| r.truncated));
     // The degraded fields this execution reported. Read off the
     // response, never re-derived and never refreshed from the catalog:
     // it describes the answer already on screen.
@@ -662,8 +689,8 @@ pub fn Search() -> impl IntoView {
         if unreadable.get() || !snapshot_ran.get() {
             return Vec::new();
         }
-        rows.get()
-            .and_then(Result::ok)
+        accepted_snapshot
+            .get()
             .map_or_else(Vec::new, |r| r.degraded_fields.clone())
     });
 
@@ -724,12 +751,6 @@ pub fn Search() -> impl IntoView {
                     .and_then(Result::ok)
                     .is_some_and(|r| r.query.effective != effective_q.get()))
     });
-
-    // What the histogram's caption states: the restriction the effective
-    // query ran under, which is the base query's own time clause when it
-    // carries one — the picker's trigger keeps saying what the URL holds
-    // (ADR-0027, amended 2026-09-12).
-    let window = Signal::derive(move || effective_window(&executed_q.get(), &range.get()));
 
     // --- reading modes ------------------------------------------------
     // Both default off (ADR-0032): with the defaults in force the
@@ -836,11 +857,11 @@ pub fn Search() -> impl IntoView {
                         on_live=on_live
                     />
                     // The strip under the editor describes the EXECUTED
-                    // query, not the buffer above it: window, filters,
-                    // mode and row count all come from the URL and the
-                    // active result source (ADR-0027).
+                    // query, not the buffer above it. Timing and row count
+                    // belong to the accepted response; chips and mode come
+                    // from the URL (ADR-0027).
                     <MetaStrip
-                        window=window
+                        execution=execution
                         filters=filters_sig
                         filters_unreadable=filters_unreadable
                         blocked=unreadable
