@@ -1227,6 +1227,11 @@
   gap: 6px;
   padding: 0 4px;
 }
+/* Keep each divider attached to its stat block when the footer wraps. */
+.statusbar > .grp + .grp {
+  border-inline-start: 1px solid var(--line);
+  padding-inline-start: 18px;
+}
 /* The theme control is the one clickable group and it is a <button>
  * (ADR-0029); .statusbar .grp gives it the flex row, this gives it the
  * reset. */
@@ -1239,22 +1244,6 @@
   border-radius: var(--radius-sm);
 }
 .statusbar .grp.clickable:hover { background: var(--panel-2); color: var(--ink-2); }
-.statusbar .dot {
-  width: 6px;
-  height: 6px;
-  border-radius: var(--radius-round);
-  background: var(--green);
-  box-shadow: 0 0 5px color-mix(in oklab, var(--green) 60%, transparent);
-}
-.statusbar .dot.live {
-  background: var(--accent);
-  box-shadow: 0 0 5px var(--accent);
-  animation: blink 1.4s ease-in-out infinite;
-}
-.statusbar .dot.err {
-  background: var(--red);
-  box-shadow: 0 0 5px var(--red);
-}
 .statusbar .grp.lagged .strong { color: var(--yellow); }
 .statusbar .sp { flex: 1; }
 .statusbar .strong { color: var(--ink-2); }
@@ -2138,7 +2127,7 @@
 .stat-card .load-hint { padding: 0; font-size: var(--fs-ui); font-weight: 400; line-height: 1.4; }
 /* Live state and new rows remain readable without repeating motion. */
 @media (prefers-reduced-motion: reduce) {
-  .pulse > span, .tl-row, .statusbar .dot.live, .sf-detail {
+  .pulse > span, .tl-row, .sf-detail {
     animation: none;
   }
 }

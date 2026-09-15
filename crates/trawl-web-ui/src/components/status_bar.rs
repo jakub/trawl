@@ -66,12 +66,6 @@ pub fn StatusBar(
         })
     };
 
-    let status_class = move || match status.get() {
-        StatusKind::Connected => "dot",
-        StatusKind::Hauling | StatusKind::Live => "dot live",
-        StatusKind::Error => "dot err",
-    };
-
     // Host the browser is talking to — shown in the connected-state label
     // next to the server version from /api/v1/health.
     let host = web_sys::window()
@@ -96,12 +90,10 @@ pub fn StatusBar(
     view! {
         <footer class="statusbar">
             <div class="grp">
-                <span class=status_class></span>
                 <span class="strong status-label">{status_label}</span>
             </div>
             {move || lagged.get().map(|n| view! {
                 <>
-                    <span class="divider">"·"</span>
                     <div class="grp lagged">
                         <span class="strong">{format!("Lagged {n}")}</span>
                     </div>
@@ -109,7 +101,6 @@ pub fn StatusBar(
             })}
             {move || admin.get().map(|s| view! {
                 <>
-                    <span class="divider">"·"</span>
                     <div class="grp" title="Hot buffer (events / bytes)">
                         <span>"Hot "</span>
                         <span class="strong">
@@ -119,25 +110,21 @@ pub fn StatusBar(
                             {format!(" / {}", format_bytes(u64::try_from(s.hot_buffer_bytes).unwrap_or_default()))}
                         </span>
                     </div>
-                    <span class="divider">"·"</span>
                     <div class="grp" title="WAL backlog (files / bytes)">
                         <span>"WAL "</span>
                         <span class="strong">{s.wal_files.to_string()}</span>
                         <span>{format!(" / {}", format_bytes(s.wal_bytes))}</span>
                     </div>
-                    <span class="divider">"·"</span>
                     <div class="grp" title="Active queries">
                         <span>"Queries "</span>
                         <span class="strong">{s.active_queries.len().to_string()}</span>
                     </div>
-                    <span class="divider">"·"</span>
                     <div class="grp" title="Server uptime">
                         <span>"Up "</span>
                         <span class="accent">{format_uptime(s.uptime_secs)}</span>
                     </div>
                 </>
             })}
-            <span class="divider">"·"</span>
             // The footer names the source it counted, so the label is
             // data, not markup: `Last` in snapshot, `Received` or
             // `Updates` while the stream is the active source.
