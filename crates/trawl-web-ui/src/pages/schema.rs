@@ -343,7 +343,7 @@ pub fn SchemaPage() -> impl IntoView {
                     <SearchInput value=filter placeholder="Filter services…"/>
                 </div>
             <fleet_ui::OverflowHint viewport=table_viewport/>
-                <div node_ref=table_viewport class="tbl fleet-table-frame tbl-scroll" role="region" aria-label="Services" tabindex="0" style="--list-min-width:560px">
+                <div node_ref=table_viewport class="tbl fleet-table-frame tbl-scroll" role="region" aria-label="Services table" tabindex="0" style="--list-min-width:560px">
                 <div class="tbl-body">
                     <Loaded
                         state=Signal::derive(move || LoadState::from_resource(services.get()))
