@@ -214,7 +214,7 @@ export const SEL = {
   /// crates/fleet-ui/src/toast/runtime.rs — one toast's dismiss button.
   toastDismiss: '.toast button.x',
   /// crates/trawl-web-ui/src/components/editor_wrap.rs — a tool link
-  /// under the editor. Save as net is a plain button; Copy search URL is
+  /// under the editor. Save as Net is a plain button; Copy search URL is
   /// fleet-ui's CopyButton in bare mode, which renders the caller's
   /// class on its own native button. Since ADR-0029 Format is a button
   /// too, so this matches THREE buttons, not two.
@@ -503,7 +503,7 @@ export const COPY = {
   /// crates/trawl-web-ui/src/components/editor_wrap.rs — the visible
   /// names of two of the three editor tools. Both say what they act on,
   /// since "Save" and "Share" named neither the net nor the URL.
-  saveAsNetTool: 'Save as net',
+  saveAsNetTool: 'Save as Net',
   copyUrlTool: 'Copy search URL',
   /// crates/trawl-web-ui/src/search_url.rs Malformed::message + Param::noun.
   urlNoticeFiltersPrefix: "This link's filters could not be read:",

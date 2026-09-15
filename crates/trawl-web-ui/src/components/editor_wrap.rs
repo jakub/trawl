@@ -11,7 +11,7 @@
 //! derived, never stored: it compares the editor buffer against the
 //! executed query in the URL and navigates nothing (ADR-0027).
 //!
-//! The stack order is date range, Haul, then the Save as net / Copy
+//! The stack order is date range, Haul, then the Save as Net / Copy
 //! search URL / Format tool row. Haul mirrors ⌘⏎ in the editor — both
 //! call the parent's submit callback.
 
@@ -161,7 +161,7 @@ pub fn EditorWrap(
                             class="tool"
                             disabled=move || blocked.get()
                             on:click=move |_| on_save.run(())
-                        >"Save as net"</button>
+                        >"Save as Net"</button>
                         <CopyButton
                             class="tool"
                             text=share_text

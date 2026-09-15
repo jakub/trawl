@@ -6,15 +6,15 @@ import { test, expect, resetScenario, capturedSavedRequests, CORPUS } from '../f
 import { SEL, COPY } from '../selectors';
 
 for (const modifier of ['Control', 'Meta']) {
-  test(`named search and save dialog advertise ${modifier}+Enter and submit once`, async ({ page, request }) => {
+  test(`named search and save dialog submit on ${modifier}+Enter`, async ({ page, request }) => {
     await resetScenario(request, 'saved-success');
     await page.goto('/search');
     await expect(page.getByRole('textbox', { name: 'Search query', exact: true })).toBeVisible();
     await page.locator(SEL.saveAction).click();
-    const dialog = page.getByRole('dialog', { name: 'Save query as net', exact: true });
+    const dialog = page.getByRole('dialog', { name: 'Save query as Net', exact: true });
     await expect(dialog).toBeVisible();
-    await expect(dialog.locator('.hint')).toContainText('Ctrl/⌘ + Enter');
-    await expect(dialog.getByRole('button', { name: 'Save as net', exact: true })).toBeVisible();
+    await expect(dialog.locator('.hint')).toHaveCount(0);
+    await expect(dialog.getByRole('button', { name: 'Save as Net', exact: true })).toBeVisible();
     await dialog.getByLabel('Name', { exact: true }).fill('named schedule');
     await page.keyboard.press('Enter');
     await expect(dialog).toBeVisible();

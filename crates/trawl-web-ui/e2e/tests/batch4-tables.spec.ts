@@ -73,7 +73,7 @@ test('long History query keeps metadata and native save action at the start', as
   expect(Math.max(...tops) - Math.min(...tops)).toBeLessThan(5);
   await row.locator('.row-stretch').focus();
   await page.keyboard.press('Tab');
-  const save = row.getByRole('button', { name: 'Save as net' });
+  const save = row.getByRole('button', { name: 'Save as Net' });
   await expect(save).toBeFocused();
   await page.keyboard.press('Enter');
   await expect(page.getByRole('dialog')).toBeVisible();

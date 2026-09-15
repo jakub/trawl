@@ -11,7 +11,7 @@
 //!
 //! `fleet_ui::Modal` owns the scrim, Escape, and Cmd/Ctrl+Enter save;
 //! this component owns the name field (autofocused and pre-selected on
-//! mount, default derived from the query) and the footer hint/buttons.
+//! mount, default derived from the query) and the footer buttons.
 
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -23,7 +23,7 @@ use std::sync::{
 use wasm_bindgen::JsCast;
 
 use crate::api;
-use fleet_ui::{Btn, Field, Icon, Kbd, Modal, ToastBus, ToastKind, Variant};
+use fleet_ui::{Btn, Field, Icon, Modal, ToastBus, ToastKind, Variant};
 
 #[component]
 #[allow(clippy::needless_pass_by_value)] // Leptos component props: easier to pass owned
@@ -102,21 +102,14 @@ pub fn SaveAsNetModal(
 
     view! {
         <Modal
-            title="Save query as net"
+            title="Save query as Net"
             icon=Icon::Pin
             on_cancel=cancel
             on_submit=do_save
             footer=Box::new(move || view! {
-                <div class="hint">
-                    <Kbd>"Ctrl/⌘ + Enter"</Kbd>
-                    " save"
-                    <span style="opacity:.5">"·"</span>
-                    <Kbd>"Esc"</Kbd>
-                    {move || if submitting.get() { " close" } else { " cancel" }}
-                </div>
                 <Btn variant=Variant::Secondary on_click=cancel>{move || if submitting.get() { "Close" } else { "Cancel" }}</Btn>
                 <Btn variant=Variant::Primary disabled=save_disabled on_click=do_save>
-                    {move || if submitting.get() { "Saving…" } else { "Save as net" }}
+                    {move || if submitting.get() { "Saving…" } else { "Save as Net" }}
                 </Btn>
             }.into_any())
         >

@@ -756,10 +756,10 @@ const CONTRACTS: &[Contract] = &[
         hook: "\"Edited\"",
     },
     Contract {
-        assignment: "saveAsNetTool: 'Save as net',",
+        assignment: "saveAsNetTool: 'Save as Net',",
         source_path: "src/components/editor_wrap.rs",
         source: EDITOR_WRAP_RS,
-        hook: ">\"Save as net\"<",
+        hook: ">\"Save as Net\"<",
     },
     Contract {
         assignment: "copyUrlTool: 'Copy search URL',",
