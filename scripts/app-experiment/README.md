@@ -645,8 +645,13 @@ Its assertions cover:
 Only `issue188-evidence/report.json` and its PNG captures are custom evidence
 intended for publication. The report includes the source commit, source/build
 hashes, corpus hash, safe lifecycle fields, receipts, expected/observed orders
-and UI cells. The script recomputes the runner's source fingerprint and
-requires it to match preparation. Binary and SPA hashes are explicitly
+and UI cells. Its command uses a worktree-relative run path. Search report
+fields contain only the parsed visible count, duration and UTC start, without
+filter-chip text. Before login, the script requires its current bytes to match
+`git show HEAD:scripts/app-experiment/issue188-evidence.mjs` and records their
+`scenarioSHA256`. Commit scenario edits before collecting evidence. The script
+also recomputes the runner's source fingerprint and requires it to match
+preparation. Binary and SPA hashes are explicitly
 labelled as manifest identity; their verification belongs to the default
 runner. It omits credentials, cookies, headers, raw query text, private
 paths from receipts and raw logs. Do not publish `private/`, daemon logs,

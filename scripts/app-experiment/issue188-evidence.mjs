@@ -54,6 +54,11 @@ const build = JSON.parse(await fs.readFile(path.join(root, 'target/app-experimen
 const head = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim();
 assert.equal(build.checkout, root);
 assert.equal(build.commit, head, 'build commit differs from current HEAD');
+const scenarioPath = 'scripts/app-experiment/issue188-evidence.mjs';
+const scenarioBytes = await fs.readFile(fileURLToPath(import.meta.url));
+const committedScenario = execFileSync('git', ['show', `HEAD:${scenarioPath}`], { cwd: root });
+assert.ok(scenarioBytes.equals(committedScenario), 'scenario differs from committed HEAD; commit it before collecting evidence');
+const scenarioSHA256 = createHash('sha256').update(scenarioBytes).digest('hex');
 // Keep this filter identical to run.mjs fingerprint(). The commit alone does
 // not detect uncommitted product edits made after preparation.
 const tracked = execFileSync('git', ['ls-files', '--cached', '--others', '--exclude-standard', '-z'], { cwd: root, encoding: 'utf8' }).split('\0').filter(Boolean);
@@ -65,11 +70,11 @@ for (const file of tracked.filter(f => f.startsWith('crates/') || f.startsWith('
 assert.equal(sourceHash.digest('hex'), build.sourceHash, 'source changed since experiment preparation');
 const output = path.join(run, 'issue188-evidence');
 await fs.mkdir(output, { mode: 0o700 }); // Refuse accidental overwrite/reseed.
-const report = { schema: 1, status: 'running', runId: instance.runId, sourceHead: head,
+const report = { schema: 1, status: 'running', runId: instance.runId, sourceHead: head, scenarioSHA256,
   build: { commit: build.commit, sourceHash: build.sourceHash, sourceFingerprintVerified: true,
     manifestArtifacts: { spaHash: build.spaHash, binaries: build.binaries },
     artifactVerification: 'Hashes copied from preparation manifest; default runner owns artifact verification.' },
-  command: `node scripts/app-experiment/issue188-evidence.mjs --run ${run}`,
+  command: `node ${scenarioPath} --run target/app-experiments/${instance.runId}`,
   search: [], receipts: [], orders: [], ui: [], captures: [], cleanup: { browser: false },
   limits: ['Real successful runs; null/status/timestamp tie diversity belongs to PostgreSQL fixture tests.',
     'Custom success must be paired with the default report exit 0, passed, and successful cleanup.'] };
@@ -189,7 +194,17 @@ try {
     await page.locator('.scope-count').filter({ hasText: `${expected} rows returned` }).waitFor();
     await page.locator('.scope-execution').filter({ hasText: duration(result.execution.duration_ms) }).waitFor();
     await page.locator('.scope-started').filter({ hasText: utc }).waitFor();
-    report.search.push({ label, querySha256: createHash('sha256').update(query).digest('hex'), request: { queryLength: Buffer.byteLength(query), limit: request.limit, offset: request.offset ?? 0 }, sent, received, expectedRows: expected, execution: result.execution, observedLifecycleTotal: Number(ends[0].total_rows), returned: result.pagination.returned, lifecycle: [starts[0], ends[0]], strip: await page.locator('.scope').innerText() });
+    // Extract only the three execution facts. The surrounding strip includes
+    // filter chips whose text must not enter the sanitized JSON report.
+    const visibleFacts = {
+      count: (await page.locator('.scope-count').innerText()).match(/\b\d+ rows returned\b/)?.[0],
+      execution: (await page.locator('.scope-execution').innerText()).match(/\b(?:\d+ms|\d+\.\d{3}s)\b/)?.[0],
+      started: (await page.locator('.scope-started').innerText()).match(/\b\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} UTC\b/)?.[0],
+    };
+    assert.equal(visibleFacts.count, `${expected} rows returned`);
+    assert.equal(visibleFacts.execution, duration(result.execution.duration_ms));
+    assert.equal(visibleFacts.started, utc);
+    report.search.push({ label, querySha256: createHash('sha256').update(query).digest('hex'), request: { queryLength: Buffer.byteLength(query), limit: request.limit, offset: request.offset ?? 0 }, sent, received, expectedRows: expected, execution: result.execution, observedLifecycleTotal: Number(ends[0].total_rows), returned: result.pagination.returned, lifecycle: [starts[0], ends[0]], visibleFacts });
     await capture(`search-${label}`);
   }
   phase = 'seed-nets';
