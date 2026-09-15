@@ -61,12 +61,19 @@ pub fn rows_resource(
     filters: Memo<Vec<Filter>>,
     range: Memo<RangeSpec>,
 ) -> (LocalResource<Result<ExecutedResponse, ApiError>>, Memo<u64>) {
+    // Compare the complete request before advancing its intent. Related URL
+    // memos can notify through several paths for the same captured values.
+    let inputs = Memo::new(move |_| {
+        (
+            effective_q.get(),
+            page.get(),
+            base.get(),
+            filters.get(),
+            range.get(),
+        )
+    });
     let intent = Memo::new(move |previous: Option<&u64>| {
-        effective_q.with(|_| ());
-        page.with(|_| ());
-        base.with(|_| ());
-        filters.with(|_| ());
-        range.with(|_| ());
+        inputs.with(|_| ());
         previous.map_or(0, |revision| revision.wrapping_add(1))
     });
     // LocalResource awaits one request before processing its next dependency
@@ -82,13 +89,15 @@ pub fn rows_resource(
     let rows = LocalResource::new(move || {
         rearm.track();
         let request_intent = intent.get();
-        let q = effective_q.get();
-        let p = page.get();
+        // Reading intent first resolves the complete input tuple. Subscribe
+        // only through intent: tracking its inputs too can dirty the resource
+        // during that resolution and execute the same request a second time.
+        let (q, p, base, filters, range) = inputs.get_untracked();
         let query = ExecutedQuery {
             effective: q.clone(),
-            base: base.get(),
-            filters: filters.get(),
-            range: range.get(),
+            base,
+            filters,
+            range,
         };
         // Capture ownership before polling the future, including synthetic
         // empty requests. Intent ownership rejects results that the serialized

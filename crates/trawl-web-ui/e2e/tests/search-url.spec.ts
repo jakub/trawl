@@ -34,13 +34,8 @@ async function sseOpens(request: Ctl): Promise<number> {
 /** Run a query from the editor buffer, replacing whatever is there, and
  * wait for the answer to land.
  *
- * Waiting for the RESPONSE, not just the request, is deliberate and
- * documents a residual outside this slice: while a query is in flight
- * the results resource ignores source changes entirely, so a navigation
- * issued before the answer arrives posts nothing (probed on 275a6094 —
- * with a 1.5s stubbed delay, submitting a second query mid-flight never
- * runs it). That is a defect in how results are fetched, not in the URL
- * contract, and a reader pressing Back has seen results by then. */
+ * Wait for the response before the next URL action. The held-response
+ * tests in query-console cover navigation while a request is pending. */
 async function runInEditor(page: import('@playwright/test').Page, dsl: string) {
   const answered = page.waitForResponse((r) => r.url().includes('/api/v1/query'));
   await page.locator(SEL.cmContent).click();
