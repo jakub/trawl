@@ -95,8 +95,10 @@ Key points:
   skin's `oklch(70.8%)` measures 2.59:1 on `--panel` and 2.48:1 on the
   editor's `--fill` wash — under even the 3:1 non-text floor, and a
   regression on ADR-0005's `#82868e` (3.56:1). Light `--ink-4` therefore
-  holds that tone's luminance as a neutral, `oklch(62%)` (3.64:1 / 3.48:1,
-  and >=3.01:1 on every other light surface). Dark `--ink-4` is bound the
+  uses `oklch(53% .024 253)`: 5.27:1 on `--panel`, 4.82:1 on `--panel-2`,
+  4.68:1 on `--well`, and 4.60:1 on `--bg`. Its 4.35:1 on `--panel-3`
+  is below the normal-text AA floor, so text on that surface must not
+  use this token. Dark `--ink-4` is bound the
   same way: the skin's step (`oklch(50%)`) measures 3.12:1 on `--panel`,
   but the gutter digits actually sit on the `--fill`-composited editor
   surface, where it drops to 2.72:1 — under the floor. Dark `--ink-4`
