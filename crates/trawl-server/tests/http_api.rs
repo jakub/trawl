@@ -3572,3 +3572,52 @@ async fn list_all_runs_invalid_sort_preserves_json_and_permissions() {
         assert_eq!(response.status(), 403);
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_all_runs_extraction_errors_preserve_json_and_permissions() {
+    let server = setup().await;
+    let raw = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap();
+    for params in [
+        "sort=net&sort=rows",
+        "dir=asc&dir=desc",
+        "limit=invalid",
+        "offset=-1",
+        "limit=184467440737095516160",
+    ] {
+        for (token, status, code, message) in [
+            (
+                &server.analyst_token,
+                400,
+                "bad_request",
+                "invalid runs parameters",
+            ),
+            (
+                &server.reader_token,
+                403,
+                "forbidden",
+                "insufficient permissions",
+            ),
+        ] {
+            let response = raw
+                .get(format!("{}/api/v1/runs?{params}", server.url))
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status, "{params}");
+            assert!(
+                response.headers()[reqwest::header::CONTENT_TYPE]
+                    .to_str()
+                    .unwrap()
+                    .starts_with("application/json"),
+                "{params}"
+            );
+            let body: serde_json::Value = response.json().await.unwrap();
+            assert_eq!(body["error"]["code"], code, "{params}");
+            assert_eq!(body["error"]["message"], message, "{params}");
+        }
+    }
+}

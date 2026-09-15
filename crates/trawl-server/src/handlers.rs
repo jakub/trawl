@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 
+use axum::extract::rejection::QueryRejection;
 use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
@@ -2588,11 +2589,14 @@ pub struct ListAllRunsParams {
 pub async fn list_all_runs(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
-    Query(params): Query<ListAllRunsParams>,
+    params: Result<Query<ListAllRunsParams>, QueryRejection>,
 ) -> Result<Json<ListAllRunsResponse>, ServerError> {
     if !verified.has_permission(Permission::SavedQuery) {
         return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
+
+    let Query(params) =
+        params.map_err(|_| ServerError::BadRequest("invalid runs parameters".into()))?;
 
     let sort = params
         .sort
