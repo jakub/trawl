@@ -131,6 +131,15 @@ zstd = "0.13"
 strip = "debuginfo"
 lto = "thin"
 
+# Selected only by the browser's Trunk development build. Keep dev assertions,
+# overflow checks and incremental compilation, but omit browser debug symbols.
+# Native dev builds and release builds keep their existing profiles.
+[profile.wasm-dev]
+inherits = "dev"
+opt-level = 1
+debug = 0
+strip = "symbols"
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_debug_implementations = "warn"

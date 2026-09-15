@@ -15,7 +15,8 @@
       reference-types explicitly for Binaryen version_123 so its validator
       accepts these features in the generated WASM.
     -->
-    <link data-trunk rel="rust" data-bin="trawl-web-ui" data-wasm-opt="z" data-wasm-opt-params="--enable-bulk-memory --enable-reference-types"/>
+    <!-- The dev-only profile omits WASM debug symbols and source-level debugging. -->
+    <link data-trunk rel="rust" data-bin="trawl-web-ui" data-cargo-profile-dev="wasm-dev" data-wasm-opt="z" data-wasm-opt-params="--enable-bulk-memory --enable-reference-types"/>
     <!-- uPlot's own chrome first — it positions the legend, cursor and
          axis layers, and both sheets below need to be able to override
          it. It was previously only `copy-file`d into dist/, i.e. shipped
