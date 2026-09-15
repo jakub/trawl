@@ -140,9 +140,6 @@ export const SEL = {
   /// strip itself. Absent in live, where the ring is the active result
   /// source and a page-scoped strip would describe nothing.
   histoStrip: '.histo',
-  /// crates/trawl-web-ui/src/components/histogram.rs — the one caption
-  /// naming the window the effective query ran under.
-  histoCaption: '.histo-caption',
   /// crates/trawl-web-ui/src/pages/search.rs — the tab strip's trailing
   /// Export action, which opens the export modal.
   exportAction: '.tabs .action.export',
@@ -337,8 +334,7 @@ export const SEL = {
   /// chips, mode badge and row count. It never reads the editor buffer,
   /// so a spec that typed and did not Haul asserts NO change here.
   scopeStrip: '.scope',
-  /// Its window phrase, the same text the histogram caption carries
-  /// after COPY.histoCaptionPrefix.
+  /// The window the executed query ran under.
   scopeWindow: '.scope-window',
   /// crates/trawl-web-ui/src/components/editor_wrap.rs — the console
   /// header's draft state. Text only: it states whether the buffer and
@@ -504,9 +500,6 @@ export const COPY = {
   /// since "Save" and "Share" named neither the net nor the URL.
   saveAsNetTool: 'Save as net',
   copyUrlTool: 'Copy search URL',
-  /// crates/trawl-web-ui/src/components/histogram.rs — the histogram
-  /// caption's lead-in, before the window the query ran under.
-  histoCaptionPrefix: 'Current page · window: ',
   /// crates/trawl-web-ui/src/search_url.rs Malformed::message + Param::noun.
   urlNoticeFiltersPrefix: "This link's filters could not be read:",
   /// crates/trawl-web-ui/src/search_url.rs Malformed::message + Param::noun.

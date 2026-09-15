@@ -10,7 +10,7 @@
 // Typing moves the first and must never move the second — which is the
 // distinction ADR-0027 draws, now said in words on screen. So the
 // evidence is a pair: after an edit the header must flip AND the strip's
-// window must be the one the histogram caption still names. Asserting
+// window must still describe the executed query. Asserting
 // only the header would pass a strip that silently followed the buffer.
 
 import { test, expect, resetScenario, CORPUS } from '../fixtures';
@@ -36,10 +36,8 @@ test('the header states the draft while the strip stays with the executed query'
   const draft = page.locator(SEL.draftState);
   await expect(draft).toHaveCount(0);
 
-  // The strip's window and the histogram caption are the same sentence
-  // about the same execution, so they are asserted together.
+  // The strip describes the executed query, independent of later edits.
   await expect(page.locator(SEL.scopeWindow)).toHaveText('last 15m');
-  await expect(page.locator(SEL.histoCaption)).toHaveText(`${COPY.histoCaptionPrefix}last 15m`);
   await expect(page.locator(SEL.scopeStrip)).toContainText('Executed scope');
   await expect(page.locator(`${SEL.scopeStrip} .mode`)).toHaveText('Snapshot');
   await expect(page.locator('.scope-count')).toHaveText(`${CORPUS.rowCount} rows`);

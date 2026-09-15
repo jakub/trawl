@@ -59,7 +59,7 @@ The sidebar counting field values over the rows on screen: the snapshot page or 
 _Avoid_: facet sidebar (the code name), facets
 
 **Histogram**:
-The strip above the snapshot table: the page's rows bucketed over their own time span, captioned with the window the effective query ran. Absent in live. Neither ingest volume nor the full distribution of matches.
+The strip above the snapshot table: the page's rows bucketed over their own time span. Absent in live. Neither ingest volume nor the full distribution of matches.
 _Avoid_: timeline, chart (that is Visualization)
 
 **Reading mode**:

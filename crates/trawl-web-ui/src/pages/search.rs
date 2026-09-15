@@ -947,7 +947,6 @@ pub fn Search() -> impl IntoView {
                     // same numbers, which is why it is aria-hidden.
                     (ResultsTab::Events, Mode::Snapshot) if is_chart_query.get() => view! {
                         <>
-                            <Histogram rows=rows window=window pending=loading caption_only=true/>
                             <div class="agg-split" class:has-chart=move || cat_shape.get().is_some()>
                                 <ExactTable
                                     busy=running
@@ -966,7 +965,7 @@ pub fn Search() -> impl IntoView {
                     }.into_any(),
                     (ResultsTab::Events, Mode::Snapshot) => view! {
                         <>
-                            <Histogram rows=rows window=window pending=loading/>
+                            <Histogram rows=rows/>
                             <ResultsTable
                                 queried=snapshot_ran
                                 busy=running

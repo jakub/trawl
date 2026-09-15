@@ -28,8 +28,7 @@ use fleet_ui::{Badge, Tone};
 
 #[component]
 pub fn MetaStrip(
-    /// The window the executed query ran under — the same phrase the
-    /// histogram caption carries.
+    /// The window the executed query ran under.
     #[prop(into)]
     window: Signal<EffectiveWindow>,
     /// Active filters — rendered as chips. Each chip has an `×` that

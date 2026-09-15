@@ -10,26 +10,6 @@ const countResult = {
   truncated: false, pagination: { limit: 50, offset: 0, returned: 2 },
 };
 
-test('histogram bucket data has one keyboard disclosure and touch-readable counts', async ({ page, request }) => {
-  await resetScenario(request, 'corpus');
-  await page.goto('/search?q=service%3Dnginx');
-  const summary = page.locator('.bucket-data summary');
-  await expect(summary).toBeVisible();
-  await summary.focus();
-  await page.keyboard.press('Enter');
-  await expect(page.locator('.bucket-data tbody tr')).toHaveCount(48);
-  await expect(page.locator('.bucket-data caption')).toContainText('Times are UTC');
-  expect(await page.locator('.bucket-data tbody [tabindex]').count()).toBe(0);
-  expect(await page.locator('.bucket-data tbody tr').evaluateAll(rows => rows.reduce((sum, row) => sum + Number(row.children[2].textContent), 0))).toBe(8);
-  await page.keyboard.press('Tab');
-  await expect(page.locator('.bucket-scroll')).toBeFocused();
-  await page.setViewportSize({ width: 390, height: 844 });
-  await summary.click();
-  await summary.click();
-  await expect(page.locator('.bucket-data table')).toBeVisible();
-  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
-});
-
 test('snapshot chart handles completed, unsupported, empty and failed responses without stale canvas', async ({ page }) => {
   let body: typeof countResult = countResult;
   let failed = false;
@@ -98,17 +78,6 @@ test('chart refuses lossy metrics and supports multiple integer metrics', async 
   await expect(page.locator('.chart canvas')).toHaveCount(0);
 });
 
-test('touch can open the bucket table', async ({ browser }) => {
-  const context = await browser.newContext({ hasTouch: true, viewport: { width: 390, height: 844 } });
-  const page = await context.newPage();
-  await page.route('**/api/v1/query', route => route.fulfill({ json: countResult }));
-  await page.goto(`http://127.0.0.1:${process.env.E2E_PORT ?? 8123}/search?q=service%3Dnginx`);
-  await page.locator('.bucket-data summary').tap();
-  await expect(page.locator('.bucket-data tbody tr')).toHaveCount(48);
-  await expect(page.locator('.bucket-data tbody tr').first()).toContainText('2026-09-01 00:00:00.000');
-  await context.close();
-});
-
 test('live aggregation waits, charts in Visualization and shows exact rows in Events', async ({ page, request }) => {
   await resetScenario(request, 'stream-chart');
   await page.goto('/search?q=service%3Dnginx%20%7C%20timechart%20count()&mode=live');
@@ -160,12 +129,16 @@ test('supported snapshot chart fits initial narrow viewport and resizes with its
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
 });
 
-test('subsecond events fall inside their disclosed bucket intervals', async ({ page }) => {
+test('subsecond events fall inside their histogram tooltip intervals', async ({ page }) => {
   const events = [['2026-09-01T00:00:00.100Z', 9], ['2026-09-01T00:00:00.900Z', 17]];
   await page.route('**/api/v1/query', route => route.fulfill({ json: { ...countResult, columns: [{ name: '_time' }, { name: '_severity' }], rows: events } }));
   await page.goto('/search?q=service%3Dnginx');
-  await page.locator('.bucket-data summary').click();
-  const populated = await page.locator('.bucket-data tbody tr').evaluateAll(rows => rows.map(row => [...row.children].map(cell => cell.textContent!)).filter(cells => Number(cells[2]) > 0));
+  const tips = page.locator('.histo .bar .tip');
+  await expect(tips).toHaveCount(48);
+  const populated = (await tips.allTextContents())
+    .map(text => text.match(/^(.*?) – (.*?) · (\d+) events(?: · (\d+) errors)?$/))
+    .filter(match => match && Number(match[3]) > 0)
+    .map(match => [match![1], match![2], match![3], match![4] ?? '0']);
   expect(populated).toHaveLength(2);
   for (const [time, severity] of events) {
     const interval = populated.find(cells => Date.parse(cells[0].replace(' ', 'T') + 'Z') <= Date.parse(String(time)) && Date.parse(String(time)) <= Date.parse(cells[1].replace(' ', 'T') + 'Z'));

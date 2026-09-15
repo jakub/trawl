@@ -2160,19 +2160,6 @@
 
 .tl-stream:focus-visible { outline: 2px solid var(--ring); outline-offset: -2px; }
 
-.histo-caption {
-  padding: 6px 14px 0;
-  background: var(--panel);
-  font-family: var(--font-ui);
-  font-size: var(--fs-dense);
-  color: var(--ink-2);
-}
-.bucket-data { padding: 6px 14px; background: var(--panel); }
-.bucket-data summary { cursor: pointer; min-height: 32px; align-content: center; }
-.bucket-scroll { overflow: auto; max-height: 240px; }
-.bucket-data table { width: 100%; border-collapse: collapse; }
-.bucket-data th, .bucket-data td { text-align: start; padding: 6px 10px; white-space: nowrap; }
-.bucket-data caption { text-align: start; padding-block: 8px; }
 .chart-note { padding: 8px 14px; color: var(--ink-2); }
 
 .sd-ttl .service-freshness { flex-basis: 100%; display: flex; align-items: center; gap: 6px; font-size: var(--fs-ui); color: var(--ink-2); }

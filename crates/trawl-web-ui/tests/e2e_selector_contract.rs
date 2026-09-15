@@ -600,18 +600,6 @@ const CONTRACTS: &[Contract] = &[
         hook: "class=\"histo\"",
     },
     Contract {
-        assignment: "histoCaption: '.histo-caption',",
-        source_path: "src/components/histogram.rs",
-        source: HISTOGRAM_RS,
-        hook: "class=\"histo-caption\"",
-    },
-    Contract {
-        assignment: "histoCaptionPrefix: 'Current page · window: ',",
-        source_path: "src/components/histogram.rs",
-        source: HISTOGRAM_RS,
-        hook: "Current page · window: {}",
-    },
-    Contract {
         assignment: "exportAction: '.tabs .action.export',",
         source_path: "src/pages/search.rs",
         source: include_str!("../src/pages/search.rs"),

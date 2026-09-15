@@ -125,23 +125,19 @@ test('a non-chartable aggregate renders the exact table alone', async ({ page, r
   await expect(page.locator('.agg-split.has-chart')).toHaveCount(0);
 });
 
-test('an aggregate keeps the window caption and drops the bar strip', async ({ page, request }) => {
+test('an aggregate drops the histogram', async ({ page, request }) => {
   await resetScenario(request, 'corpus');
 
   // The positive case first, from the same corpus: raw results keep the
-  // strip and the bucket table, so the absences below are the aggregate
+  // strip, so the absence below is the aggregate
   // arm's doing and not a broken histogram.
   await page.goto('/search?q=service%3Dnginx&page=0');
   await expect(page.locator(SEL.histoStrip)).toHaveCount(1);
-  await expect(page.locator('.bucket-data')).toHaveCount(1);
 
   await page.goto(AGG_URL);
   // One group per row and no events underneath them: the strip could
   // only paint "No usable timestamps in shown events." over 64px.
   await expect(page.locator(SEL.histoStrip)).toHaveCount(0);
-  await expect(page.locator('.bucket-data')).toHaveCount(0);
-  await expect(page.locator(SEL.histoCaption)).toHaveCount(1);
-  await expect(page.locator(SEL.histoCaption)).toContainText(COPY.histoCaptionPrefix);
 });
 
 test('the chart waits for the matching response while the group searches keep their own query', async ({ page, request }) => {
