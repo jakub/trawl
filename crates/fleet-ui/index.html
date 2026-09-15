@@ -12,9 +12,9 @@
     <link data-trunk rel="copy-dir" href="fonts" data-target-path="fonts"/>
 
     <!--
-      wasm-opt disabled: trunk 0.21 pins binaryen version_123, which
-      rejects the bulk-memory ops rustc emits by default on wasm32 since
-      rust 1.82 — same workaround as crates/trawl-web-ui/index.html.
+      wasm-opt remains disabled for this standalone Fleet workbench.
+      Trawl enables it with explicit Rust baseline feature flags in
+      crates/trawl-web-ui/index.html.
 
       data-cargo-features="atmosphere": the backdrop is behind a
       default-off feature so its 142 KB vendored snippet stays out of
