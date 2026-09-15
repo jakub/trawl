@@ -136,7 +136,7 @@ lto = "thin"
 # Native builds keep their existing profiles.
 [profile.wasm-dev]
 inherits = "dev"
-opt-level = 1
+opt-level = "z"
 debug = 0
 strip = "symbols"
 
