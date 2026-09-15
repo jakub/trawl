@@ -412,7 +412,7 @@
   padding: 6px 12px 10px;
   flex-shrink: 0;
 }
-/* Save as net / Copy search URL / Format, third row of the right-hand
+/* Save as Net / Copy search URL / Format, third row of the right-hand
  * column. The old `.editor-hd` header band is gone; the console header
  * above carries the label now and the tools sit under Haul. */
 .editor-tools {
@@ -1521,8 +1521,8 @@
 /* Overview tab */
 .sd-overview {
   display: grid;
-  grid-template-columns: 2fr 1fr;
-  grid-template-areas: "chart types" "top top";
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-areas: "chart" "types" "top";
   gap: 12px;
 }
 .sd-card {
@@ -1536,26 +1536,33 @@
   text-transform: uppercase; letter-spacing: .08em; color: var(--ink-3);
   margin-bottom: 10px;
 }
-.sd-card.chart { grid-area: chart; }
+.sd-card.chart { grid-area: chart; min-height: 0; }
 .sd-card.types { grid-area: types; }
 .sd-card.top   { grid-area: top; }
 
 /* Ingest chart — a uPlot column chart. The canvas paints its own axes
- * and grid from tokens read in vendor/src/uplot.ts; what's left here is
- * the surrounding DOM chrome uPlot builds (legend, cursor), which the
- * vendored uPlot.css positions but does not theme. */
+ * and grid from tokens read in vendor/src/uplot.ts. These rules style
+ * its HTML tooltip and theme the cursor positioned by uPlot.css. */
 .ig-chart { width: 100%; }
-.ig-chart .u-legend {
-  margin-top: 2px;
-  font-family: var(--font-mono);
+.ig-chart .ig-tooltip {
+  position: absolute;
+  z-index: 1;
+  pointer-events: none;
+  box-sizing: border-box;
+  width: max-content;
+  max-width: 100%;
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-panel);
+  background: var(--panel);
+  box-shadow: var(--elev-1);
+  font-family: var(--font-ui);
   font-size: var(--fs-tiny);
-  color: var(--ink-3);
+  line-height: 1.4;
+  color: var(--ink-2);
+  font-variant-numeric: tabular-nums;
 }
-/* The series marker doubles as a colour key; uPlot draws it as a bordered
- * box, which reads as an empty checkbox against our fills. */
-.ig-chart .u-legend .u-marker { border-radius: var(--radius-xs); }
-.ig-chart .u-legend .u-label { color: var(--ink-3); }
-.ig-chart .u-legend .u-value { color: var(--ink-2); font-variant-numeric: tabular-nums; }
+.ig-chart .ig-tooltip-time { color: var(--ink-3); }
 /* Hover crosshair — uPlot's default is a hard black hairline. */
 .ig-chart .u-cursor-x,
 .ig-chart .u-cursor-y { border-color: var(--ink-4); }
@@ -2063,7 +2070,6 @@
 .page-hd, .page-hd .actions, .health-heading { flex-wrap: wrap; }
 .page-hd > *, .health-heading > * { min-width: 0; max-width: 100%; }
 .page-hd .actions { flex-shrink: 1; }
-.sd-overview { grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); }
 .sd-card { min-width: 0; }
 .sd-ttl .name, .sd-ttl .sub { overflow-wrap: anywhere; }
 /* 899.98px is the codebase's one spelling of "narrow": FacetSidebar
@@ -2095,7 +2101,6 @@
   .dsl-editor { max-height: 34vh; }
   .search-col { margin: 6px; min-height: 560px; }
   .console { margin: 6px; }
-  .sd-overview { grid-template-columns: minmax(0, 1fr); grid-template-areas: "chart" "types" "top"; }
   .stats-row { flex-wrap: wrap; }
   .stat-card { flex-basis: 120px; min-width: 0; }
   .formcols { grid-template-columns: 1fr; }

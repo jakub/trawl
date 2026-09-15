@@ -167,6 +167,57 @@ export function createChart(
     font: `10px ${mono}`,
   };
 
+  // The service ingest chart uses a hover card instead of a live legend.
+  // Keep it inside the plot so the drawer's scroll container cannot clip it.
+  const tooltip = bars ? document.createElement("div") : null;
+  const tooltipTime = document.createElement("div");
+  const tooltipValue = document.createElement("div");
+  if (tooltip) {
+    tooltip.className = "ig-tooltip";
+    tooltip.hidden = true;
+    tooltip.setAttribute("role", "tooltip");
+    tooltipTime.className = "ig-tooltip-time";
+    tooltip.append(tooltipTime, tooltipValue);
+  }
+  const formatTime = new Intl.DateTimeFormat(undefined, {
+    month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
+    ...(opts.utc ? { timeZone: "UTC" } : {}),
+  });
+  const hideTooltip = () => { if (tooltip) tooltip.hidden = true; };
+  const updateTooltip = (u: uPlot) => {
+    if (!tooltip) return;
+    const { left = -1, top = -1 } = u.cursor;
+    const width = u.over.clientWidth;
+    const height = u.over.clientHeight;
+    const xs = u.data[0];
+    if (left < 0 || top < 0 || left > width || top > height || xs.length < 2) {
+      hideTooltip();
+      return;
+    }
+    // Bars extend right from each bucket start. uPlot's nearest timestamp
+    // can select the next bucket halfway across a bar, so select by interval.
+    const time = u.posToVal(left, "x");
+    let index = xs.length - 1;
+    while (index >= 0 && xs[index] > time) index--;
+    if (index < 0) {
+      hideTooltip();
+      return;
+    }
+    const start = xs[index];
+    const end = xs[index + 1] ?? start + (start - xs[index - 1]);
+    if (time >= end) {
+      hideTooltip();
+      return;
+    }
+    tooltipTime.textContent = `${formatTime.format(start * 1000)} – ${formatTime.format(end * 1000)}`;
+    tooltipValue.textContent = seriesLabels.map((label, i) =>
+      `${Number(u.data[i + 1][index] ?? 0).toLocaleString()} ${label}`
+    ).join(" · ");
+    tooltip.hidden = false;
+    tooltip.style.left = `${Math.max(0, Math.min(left + 12, width - tooltip.offsetWidth))}px`;
+    tooltip.style.top = `${Math.max(0, Math.min(top + 12, height - tooltip.offsetHeight))}px`;
+  };
+
   const options: Options = {
     width: opts.width,
     height: opts.height,
@@ -196,7 +247,22 @@ export function createChart(
       points: { show: !bars },
       y: !bars,
     },
-    legend: { live: true, markers: { show: bars } },
+    legend: { show: !bars, live: true, markers: { show: bars } },
+    ...(tooltip ? {
+      hooks: {
+        ready: [(u: uPlot) => {
+          u.over.append(tooltip);
+          u.over.addEventListener("mouseleave", hideTooltip);
+        }],
+        setCursor: [updateTooltip],
+        setData: [hideTooltip],
+        setSize: [hideTooltip],
+        destroy: [(u: uPlot) => {
+          u.over.removeEventListener("mouseleave", hideTooltip);
+          tooltip.remove();
+        }],
+      },
+    } : {}),
   };
 
   const chart = new uPlot(options, data, parent);
@@ -210,11 +276,6 @@ export function createChart(
     chart.root.querySelectorAll(".series-key line").forEach((line, index) => {
       line.setAttribute("stroke", colors[index % colors.length]);
     });
-    if (bars) {
-      chart.root.querySelectorAll<HTMLElement>(".u-legend .u-marker").forEach((marker, index) => {
-        if (index > 0) marker.style.background = translucent(accent, 0.8);
-      });
-    }
     // Bar paths cache their fill, so rebuild those paths at the current scales.
     // Keep the chart instance, data, native legend listeners and hidden series.
     chart.redraw(bars, true);

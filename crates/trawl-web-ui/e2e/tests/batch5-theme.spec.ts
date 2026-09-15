@@ -81,26 +81,29 @@ test('mounted ingest bars update their palette and retain time semantics', async
   await resetScenario(request, 'corpus');
   await page.goto('/search/schema?svc=nginx');
   await expect(page.locator('.ig-chart canvas')).toHaveCount(1);
-  const marker = page.locator('.ig-chart .u-marker').last();
-  const initial = await marker.evaluate(el => getComputedStyle(el).backgroundColor);
+  const barFill = () => page.evaluate(() => {
+    const accent = getComputedStyle(document.documentElement).getPropertyValue('--accent').trim();
+    const context = document.createElement('canvas').getContext('2d')!;
+    context.fillStyle = /^#[0-9a-f]{6}$/i.test(accent) ? `${accent}cc` : accent;
+    return context.fillStyle;
+  });
+  const initial = await barFill();
   await page.evaluate(() => { (window as any).ingestCanvas = document.querySelector('.ig-chart canvas'); });
   await page.evaluate(() => { (window as any).themeFills = []; });
   // The drawer is modal, so exercise the same root theme attribute directly.
   await page.evaluate(() => document.documentElement.setAttribute("data-theme", "dark"));
-  await expect.poll(() => marker.evaluate(el => getComputedStyle(el).backgroundColor)).not.toBe(initial);
-  await expect.poll(async () => marker.evaluate(el => {
-    const context = document.createElement('canvas').getContext('2d')!;
-    context.fillStyle = getComputedStyle(el).backgroundColor;
-    return (window as any).themeFills.includes(context.fillStyle);
-  })).toBe(true);
-  await expect(page.locator('.ig-chart .u-label').first()).toHaveText('time');
+  await expect.poll(barFill).not.toBe(initial);
+  await expect.poll(async () => page.evaluate(fill => (window as any).themeFills.includes(fill), await barFill())).toBe(true);
+  const plot = (await page.locator('.ig-chart .u-over').boundingBox())!;
+  await page.mouse.move(plot.x + plot.width * 0.9, plot.y + plot.height / 2);
+  const tooltip = page.locator('.ig-tooltip');
+  await expect(tooltip).toBeVisible();
+  await expect(tooltip.locator('.ig-tooltip-time')).toContainText(' – ');
+  const darkBackground = await tooltip.evaluate(el => getComputedStyle(el).backgroundColor);
   await page.evaluate(() => { (window as any).themeFills = []; });
   await page.evaluate(() => document.documentElement.setAttribute("data-theme", "light"));
-  await expect.poll(() => marker.evaluate(el => getComputedStyle(el).backgroundColor)).toBe(initial);
-  await expect.poll(async () => marker.evaluate(el => {
-    const context = document.createElement('canvas').getContext('2d')!;
-    context.fillStyle = getComputedStyle(el).backgroundColor;
-    return (window as any).themeFills.includes(context.fillStyle);
-  })).toBe(true);
+  await expect.poll(barFill).toBe(initial);
+  await expect.poll(async () => page.evaluate(fill => (window as any).themeFills.includes(fill), await barFill())).toBe(true);
+  await expect.poll(() => tooltip.evaluate(el => getComputedStyle(el).backgroundColor)).not.toBe(darkBackground);
   expect(await page.evaluate(() => (window as any).ingestCanvas === document.querySelector('.ig-chart canvas'))).toBe(true);
 });
