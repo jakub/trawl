@@ -51,7 +51,7 @@ test('global run links keep focus while their live cells update', async ({ page,
   await link.focus();
   const mounted = await link.elementHandle();
   await page.clock.fastForward(30_000);
-  await expect(page.locator('.runs-table tbody tr').first()).toContainText('running');
+  await expect(page.locator('.runs-table tbody tr').first()).toContainText('Running');
   await expect(link).toBeFocused();
   expect(await mounted!.evaluate(el => el.isConnected)).toBe(true);
 });
