@@ -337,8 +337,8 @@ export const SEL = {
   /// The window the executed query ran under.
   scopeWindow: '.scope-window',
   /// crates/trawl-web-ui/src/components/editor_wrap.rs — the console
-  /// header's draft state. Text only: it states whether the buffer and
-  /// the executed query agree and navigates nothing.
+  /// header's draft marker, rendered only when the buffer differs from
+  /// the executed query. It navigates nothing.
   draftState: '.console-hd .draft',
   /// crates/trawl-web-ui/src/pages/search.rs — the reading-mode
   /// disclosure in the result header. A button, so it is the thing that

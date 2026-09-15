@@ -135,6 +135,7 @@ test('an aggregate drops the histogram', async ({ page, request }) => {
   await expect(page.locator(SEL.histoStrip)).toHaveCount(1);
 
   await page.goto(AGG_URL);
+  await expect(page.locator(SEL.exactTable)).toHaveCount(1);
   // One group per row and no events underneath them: the strip could
   // only paint "No usable timestamps in shown events." over 64px.
   await expect(page.locator(SEL.histoStrip)).toHaveCount(0);
