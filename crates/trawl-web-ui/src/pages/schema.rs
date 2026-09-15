@@ -406,6 +406,26 @@ pub fn SchemaPage() -> impl IntoView {
                                     .into_iter()
                                     .rev()
                                     .collect();
+                                // One recorded day is a point, not a trend.
+                                // Keep sparse history visible without fabricating samples.
+                                let activity = match svc.daily_event_counts.as_slice() {
+                                    [] => view! {
+                                        <span title="No daily activity recorded">"No daily data"</span>
+                                    }.into_any(),
+                                    [day] => {
+                                        let unit = if day.count == 1 { "event" } else { "events" };
+                                        let label = format!("{} {unit} on {}. One day recorded.", day.count, day.date);
+                                        view! {
+                                            <svg class="sc-spark" width="96" height="16" viewBox="0 0 96 16" role="img" aria-label=label.clone()>
+                                                <title>{label.clone()}</title>
+                                                <circle cx="48" cy="8" r="3" fill=spark_color/>
+                                            </svg>
+                                        }.into_any()
+                                    },
+                                    _ => view! {
+                                        <Sparkline data=spark_data color=spark_color w=96 h=16/>
+                                    }.into_any(),
+                                };
                                 let events_label = format_count(svc.total_events);
                                 let storage_label = format_bytes(svc.total_bytes);
                                 let field_count = svc.columns.len();
@@ -462,7 +482,7 @@ pub fn SchemaPage() -> impl IntoView {
                                             })}
                                             </td>
                                             <td>
-                                            <Sparkline data=spark_data color=spark_color w=96 h=16/>
+                                            {activity}
                                             </td>
                                             <td class="num">{events_label}</td>
                                             <td class="num">{storage_label}</td>
