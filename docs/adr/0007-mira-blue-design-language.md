@@ -98,12 +98,8 @@ Key points:
   uses `oklch(53% .024 253)`: 5.27:1 on `--panel`, 4.82:1 on `--panel-2`,
   4.68:1 on `--well`, and 4.60:1 on `--bg`. Its 4.35:1 on `--panel-3`
   is below the normal-text AA floor, so text on that surface must not
-  use this token. Dark `--ink-4` is bound the
-  same way: the skin's step (`oklch(50%)`) measures 3.12:1 on `--panel`,
-  but the gutter digits actually sit on the `--fill`-composited editor
-  surface, where it drops to 2.72:1 — under the floor. Dark `--ink-4`
-  therefore holds `oklch(56%)` (3.51:1 on the composited fill, higher on
-  every plain panel).
+  use this token. Dark `--ink-4` uses `oklch(70.9% .027 250)`: 6.44:1 on
+  `--panel`, 6.88:1 on `--well`, and 4.89:1 on `--panel-3`.
 - **Accent**: fleet's blues stay — `#2a5c8a` light, `#5a9fd4` dark — with a
   new `--on-accent` token replacing hard-coded `#fff` button text. Dark mode
   keeps Mira's inversion: light-blue accent surfaces carry near-black
