@@ -1254,7 +1254,6 @@
  * ─────────────────────────────────────────────────────────────── */
 .mono { font-family: var(--font-mono); }
 /* .kbd moved to fleet-ui.css (issue #31) — fleet_ui::Kbd emits it. */
-.divider { color: var(--ink-4); }
 
 /* ─────────────────────────────────────────────────────────────────
  *  Full-page chrome (history, schema, settings etc.)
@@ -2087,6 +2086,7 @@
   .facet-panel > .facets { height: auto; max-height: min(45dvh, 360px); border-right: 0; }
   .search-col { flex-shrink: 0; min-height: 480px; }
   .statusbar { height: auto; min-height: var(--statusbar-h); flex-wrap: wrap; gap: 4px 10px; padding-block: 4px; }
+  .statusbar > .grp + .grp { border-inline-start: 0; padding-inline-start: 4px; }
 }
 @media (max-width: 600px) {
   .page { padding: 16px 16px 24px; gap: 16px; }

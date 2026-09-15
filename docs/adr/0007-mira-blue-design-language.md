@@ -91,7 +91,7 @@ Key points:
   lines as white-alpha overlays (10% / 6%) rather than solid greys. The ink
   ramp follows the skin except at light `--ink-4`, which is contrast-bound
   the way `--red` is: it is a TEXT colour (the `--fs-micro` DEBUG level pill,
-  the DSL editor's gutter numbers, `.editor-hd .dim`, `.divider`), and the
+  the DSL editor's gutter numbers, `.editor-hd .dim`), and the
   skin's `oklch(70.8%)` measures 2.59:1 on `--panel` and 2.48:1 on the
   editor's `--fill` wash — under even the 3:1 non-text floor, and a
   regression on ADR-0005's `#82868e` (3.56:1). Light `--ink-4` therefore

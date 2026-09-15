@@ -507,7 +507,7 @@ fn mira_blue_tokens_declared() {
         );
     }
     // Light --ink-4 is contrast-bound: it paints TEXT (the --fs-micro
-    // DEBUG level pill, the DSL editor gutter numbers, .divider), so it
+    // DEBUG level pill and the DSL editor gutter numbers), so it
     // clears AA on every surface that reads it rather than sitting at the
     // 3:1 non-text floor. Re-measure the composited pixels before
     // lightening it.

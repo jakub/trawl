@@ -128,8 +128,8 @@
    * 4.14:1 with the old oklch(55.6%) neutral now clear AA. */
   --ink-3:     oklch(50.5% .029 252);
   /* --ink-4 is a TEXT colour, not a hairline: .lvl-debug (over a --panel
-   * row), the DSL editor gutter numbers (over --well) and .divider (over
-   * --panel) read it. Held one step lighter than --ink-3 so the ramp keeps
+   * row) and the DSL editor gutter numbers (over --well) read it.
+   * Held one step lighter than --ink-3 so the ramp keeps
    * four visible stops: 5.27:1 on --panel, 4.82:1 on --panel-2, 4.68:1 on
    * --well, 4.60:1 on --bg. It measures 4.35:1 on --panel-3, so no text
    * on that surface may read it (none does today). */
@@ -1888,9 +1888,9 @@ select:focus-visible,
     outline: 2px solid Highlight !important;
     outline-offset: 2px;
   }
-  /* Every plane is a box-shadow, which forced colors drops: each one
-   * falls back to a border, and the three selected states keep a
-   * Highlight outline of their own. The raised segmented option is
+  /* Raised panels use borders when forced colors drops their shadows;
+   * selected controls keep a Highlight outline of their own.
+   * The raised segmented option is
    * addressed through aria-pressed so the stylesheet keeps exactly one
    * active-option rule (component_class_contract). */
   .rail .it.active, .sd-drawer, .sd-hd, .sd-host, .scope,
