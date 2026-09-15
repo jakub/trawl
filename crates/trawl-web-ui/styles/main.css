@@ -810,7 +810,7 @@
   width: 100%;
   text-align: center;
   font-family: var(--font-ui);
-  font-size: var(--fs-micro);
+  font-size: var(--fs-ui);
   color: var(--ink-3);
 }
 /* Three hairline gridlines at a third, two thirds and the top of the
