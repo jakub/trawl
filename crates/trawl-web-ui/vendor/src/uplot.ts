@@ -266,6 +266,15 @@ export function createChart(
   };
 
   const chart = new uPlot(options, data, parent);
+  // The service drawer can switch between a docked column and an overlay
+  // without remounting. Follow its host width in either presentation.
+  const resizeObserver = bars ? new ResizeObserver(([entry]) => {
+    const width = Math.round(entry.contentRect.width);
+    if (width > 0 && width !== chart.width) {
+      chart.setSize({ width, height: opts.height });
+    }
+  }) : null;
+  resizeObserver?.observe(parent);
   let destroyed = false;
   const themeObserver = new MutationObserver(() => {
     if (destroyed) return;
@@ -294,6 +303,7 @@ export function createChart(
     destroy() {
       destroyed = true;
       themeObserver.disconnect();
+      resizeObserver?.disconnect();
       chart.destroy();
     },
     resize(w: number, h: number) {

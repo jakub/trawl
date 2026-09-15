@@ -81,6 +81,12 @@ test('ingest charts show the containing hour in a bounded tooltip', async ({ pag
   }
   await page.mouse.move(plot.x - 10, plot.y - 10);
   await expect(tooltip).toBeHidden();
+  for (const width of [1000, 800, 1440]) {
+    await page.setViewportSize({ width, height: 900 });
+    await expect.poll(() => page.locator('.ig-chart').evaluate(el =>
+      Math.abs(el.clientWidth - el.querySelector('.uplot')!.clientWidth)
+    )).toBeLessThanOrEqual(1);
+  }
   await page.goto('/search/schema');
   await expect(tooltip).toHaveCount(0);
   await page.goto('/search/schema?svc=nginx');
