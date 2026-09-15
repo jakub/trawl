@@ -107,6 +107,7 @@ pub fn SaveAsNetModal(
             on_cancel=cancel
             on_submit=do_save
             footer=Box::new(move || view! {
+                <span aria-hidden="true" style="flex: 1"></span>
                 <Btn variant=Variant::Secondary on_click=cancel>{move || if submitting.get() { "Close" } else { "Cancel" }}</Btn>
                 <Btn variant=Variant::Primary disabled=save_disabled on_click=do_save>
                     {move || if submitting.get() { "Saving…" } else { "Save as Net" }}
