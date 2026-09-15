@@ -70,10 +70,21 @@ export function snapshotDist(source, port, { attempts = 5, log = () => {} } = {}
   let missing = [];
   fs.mkdirSync(path.dirname(target), { recursive: true });
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
-    fs.rmSync(target, { recursive: true, force: true });
-    fs.cpSync(source, target, { recursive: true });
+    // The copy runs against a directory trunk may be rewriting: a file
+    // that vanishes between enumeration and copy, or an index.html not
+    // yet written, throws here rather than producing a torn copy, and
+    // is the same rebuild-in-flight case as the torn index below.
     const indexPath = path.join(target, 'index.html');
-    const html = fs.readFileSync(indexPath, 'utf8');
+    let html;
+    try {
+      fs.rmSync(target, { recursive: true, force: true });
+      fs.cpSync(source, target, { recursive: true });
+      html = fs.readFileSync(indexPath, 'utf8');
+    } catch (error) {
+      missing = [`(copy failed: ${error.code ?? error.message})`];
+      log(`e2e harness: dist snapshot attempt ${attempt} caught a rebuild in flight (${error.code ?? error.message}); retaking`);
+      continue;
+    }
     missing = referenced(html).filter((rel) => !fs.existsSync(path.join(target, rel)));
     if (missing.length === 0) {
       const served = withoutAutoreload(html);
