@@ -77,6 +77,29 @@ fn custom_properties(css: &str) -> BTreeSet<String> {
 /// `fleet-ui/tests/component_class_contract.rs`'s `emits(...)`
 /// assertions.
 const MOVED_SELECTORS: &[&str] = &[
+    // Sidebar and command bar (ADR-0032).
+    ".rail",
+    ".rail .brand",
+    ".rail .brand .accent",
+    ".rail .grp",
+    ".rail .grp + .grp",
+    ".rail .grp-lb",
+    ".rail .it",
+    ".rail .it > svg",
+    ".rail .it .lb",
+    ".rail .it:hover",
+    ".rail .it.active",
+    ".rail .it .badge",
+    ".rail .bot",
+    ".rail.collapsed",
+    ".rail.overlay",
+    ".nav-scrim",
+    ".shell-content",
+    ".topbar .nav-toggle",
+    ".topbar .crumb",
+    ".seg",
+    ".seg .seg-opt",
+    ".seg .seg-opt.on",
     ".daterange",
     ".daterange .dr-trigger",
     ".dr-trigger",
@@ -126,6 +149,11 @@ const MOVED_SELECTORS: &[&str] = &[
     ".sd-tabs .sp",
     ".sd-tabs .meta",
     ".sd-body",
+    // The docked presentation's two host classes (ADR-0032). App-side
+    // placement rules are written through the layout that placed the
+    // panel (`.page-split > .sd-host …`), never as these bare names.
+    ".sd-host",
+    ".sd-drawer.sd-docked",
     // Small widgets.
     ".sc-spark",
     ".status-dot",
@@ -161,6 +189,38 @@ const MOVED_SELECTORS: &[&str] = &[
 /// not exist in either stylesheet; reappearing anywhere means per-site
 /// drift is growing back.
 const RETIRED_SELECTORS: &[&str] = &[
+    // The command bar's brand, mode tabs and app links left with the
+    // sidebar (ADR-0032). `.rail .it .lb` did not: the sidebar still
+    // renders a label, visible or screen-reader-only.
+    ".topbar .brand",
+    ".topbar .brand .accent",
+    ".topbar .modes",
+    ".topbar .mode",
+    ".topbar .mode:hover",
+    ".topbar .mode.active",
+    ".topbar .app-links",
+    // The meta strip became the executed-scope strip (ADR-0032): the
+    // chips kept their `.meta-chips` wrapper and their own classes, but
+    // every rule that scoped them under `.meta` is re-homed under
+    // `.scope`, and the truncation note left for the result header.
+    ".meta",
+    ".meta .dim",
+    ".meta .chip",
+    ".meta .chip .x",
+    ".meta .chip .x:hover",
+    ".meta .chip.excl",
+    ".meta .chip.excl .x",
+    ".meta .chip.excl .x:hover",
+    ".meta .chip.bad",
+    // The nets list says a schedule's cadence in words and leaves the
+    // enabled/paused judgement to fleet_ui::Badge (ADR-0032), so the
+    // glyph pills it used to render are gone.
+    ".sched-badge",
+    ".sched-badge.active",
+    ".sched-badge.disabled",
+    // The health reports are cards in a split (ADR-0032), so the stack
+    // of hairline-separated bands they used to be has no markup left.
+    ".health-page > section",
     ".live-badge",
     ".live-badge.live",
     ".live-badge.lagged",
@@ -261,9 +321,12 @@ fn app_control_fills_read_the_fill_token() {
     // fill written as `color-mix(in oklab, var(--line) N%, transparent)`
     // renders at .10 x N in dark mode (a 20% fill lands at 2%). App fills
     // read fleet-ui's per-theme `--fill` / `--fill-2` tokens instead.
+    // Either step of the ramp satisfies the vacuous-pass guard: the
+    // editor well moved onto `--well` with ADR-0032, so the app's
+    // remaining control fill is the `--fill-2` hover step.
     assert!(
-        APP_CSS.contains("var(--fill)"),
-        "expected the app control fills to read fleet-ui's --fill token"
+        APP_CSS.contains("var(--fill)") || APP_CSS.contains("var(--fill-2)"),
+        "expected the app control fills to read fleet-ui's --fill / --fill-2 tokens"
     );
     let strays: Vec<&str> = APP_CSS
         .match_indices("var(--line) ")

@@ -64,7 +64,7 @@ for (const failure of ['server', 'network'] as const) {
 test('login validation identifies and focuses the invalid API key', async ({ page }) => {
   await page.goto('/login');
   const key = page.getByLabel('API key', { exact: true });
-  await page.getByRole('button', { name: 'Sign In', exact: true }).click();
+  await page.getByRole('button', { name: 'Sign in', exact: true }).click();
   await expect(key).toHaveAttribute('aria-invalid', 'true');
   await expect(key).toBeFocused();
   const errorId = await key.getAttribute('aria-describedby');
@@ -80,7 +80,7 @@ for (const status of [401, 503]) {
     await page.goto('/login');
     const key = page.getByLabel('API key', { exact: true });
     await key.fill('disposable-invalid-key');
-    await page.getByRole('button', { name: 'Sign In', exact: true }).click();
+    await page.getByRole('button', { name: 'Sign in', exact: true }).click();
     await expect(page.getByRole('alert')).toBeVisible();
     await expect(key).toHaveAttribute('aria-invalid', String(status === 401));
     await expect(key).toHaveAttribute('aria-describedby', 'fleet-login-error');

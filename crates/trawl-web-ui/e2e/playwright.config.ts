@@ -12,12 +12,25 @@ const PORT = Number(process.env.E2E_PORT ?? 8123);
 // contract) — so specs never run concurrently against it.
 export default defineConfig({
   testDir: './tests',
+  // Scratch output — traces, failure screenshots, `.last-run.json` — lands
+  // at the repository root, not beside the suite. `trunk serve` watches
+  // crates/trawl-web-ui, so a write anywhere below it wakes a running dev
+  // server for a full rebuild, and that rebuild's "applying new
+  // distribution" step clears `dist/.stage` under any concurrent `trunk
+  // build`, which then dies with "error writing JS loader file to stage
+  // dir". Relative paths here resolve against this file's directory.
+  outputDir: '../../../e2e-artifacts/test-results',
   workers: 1,
   fullyParallel: false,
   retries: 0,
   timeout: 20_000,
   expect: { timeout: 5_000 },
-  globalTimeout: 240_000,
+  // The same budget CI passes on the command line (ci.yml's web-ui-e2e
+  // job runs `npm run test -- --global-timeout=720000`). The suite grew
+  // past the old 240s ceiling with the redesign's console, reading-mode,
+  // aggregate and sidebar specs, and a run that is cut off reports the
+  // rest as "did not run" rather than as a failure.
+  globalTimeout: 720_000,
   reporter: process.env.CI ? [['github'], ['list']] : [['list']],
   use: {
     baseURL: `http://127.0.0.1:${PORT}`,

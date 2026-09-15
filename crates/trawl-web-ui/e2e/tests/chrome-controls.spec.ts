@@ -234,6 +234,10 @@ test('detail tag adds a filter', async ({ page, request }) => {
 
 test('net rename opens the editor', async ({ page, request }) => {
   await resetScenario(request, 'corpus');
+  // Below 1100px the net panel is still the overlay drawer that
+  // captures focus; the docked presentation above that width owns no
+  // overlay layer and must not steal focus from the list (ADR-0032).
+  await page.setViewportSize({ width: 1024, height: 900 });
   await page.goto(`/jobs/nets?net=${CORPUS.netId}`);
   const panel = page.locator(SEL.drawerPanel);
   await expect(panel).toBeVisible();

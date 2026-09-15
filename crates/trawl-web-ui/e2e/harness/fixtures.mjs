@@ -151,6 +151,7 @@ export const QUERY_SHAPES = {
   topValues: '| top 10 ',
   cardinality: '| stats dc(',
   timechart: '| timechart span=1h count()',
+  statsBy: '| stats count() by ',
 };
 
 /** `POST /api/v1/query` under `corpus` for a plain search: 8 events over
@@ -160,6 +161,16 @@ export const QUERY_SHAPES = {
  * descending by reading the first row. */
 export function corpusQueryRowsResponse() {
   return wire('query-rows');
+}
+
+/** `POST /api/v1/query` under `corpus` for a `stats count() by <field>`
+ * pipeline: the one shape the categorical chart draws. Five groups over
+ * `status` and `count`, of which one count is NEGATIVE so the signed
+ * (two-sided) track is exercised, and one is NULL so the "no bar, no
+ * value" arm is too. The exact table offers a search on `status` and
+ * nothing on `count`, which is the F02 fix rendered. */
+export function corpusStatsByResponse() {
+  return wire('query-stats-by');
 }
 
 /** The service drawer's cardinality read. Its columns are `c0`, `c1` and

@@ -62,7 +62,11 @@ test('health 503 renders the named failed subsystem', async ({ page, request }) 
     ['storage_db', 'ok'],
     ['data_path', 'ok'],
   ]) {
-    await expect(health.getByText(name, { exact: true }).locator('..').locator('dd')).toHaveText(value);
+    // The key now sits in a span inside the dt, so the row is the
+    // nearest ancestor div rather than the matched node's parent.
+    await expect(
+      health.getByText(name, { exact: true }).locator('xpath=ancestor::div[1]').locator('dd'),
+    ).toHaveText(value);
   }
   await expect(health).toContainText('health-fixture-163');
 });
@@ -160,8 +164,8 @@ for (const identity of ['health-no-query', 'health-admin-no-query']) {
   });
 }
 
-for (const [identity, ids] of [['health-viewer', []], ['health-cancel', [101, 201]], ['health-admin', [101, 102, 201, 202]]] as const) {
-  test(`${identity} cancel authority covers active and recent by own flag`, async ({ page, request }) => {
+for (const [identity, ids] of [['health-viewer', []], ['health-cancel', [101]], ['health-admin', [101, 102]]] as const) {
+  test(`${identity} cancel authority covers only active queries by own flag`, async ({ page, request }) => {
     await setup(request, identity);
     await page.goto('/settings/health');
     await rows(page);

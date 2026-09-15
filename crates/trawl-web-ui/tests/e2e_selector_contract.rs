@@ -24,6 +24,8 @@ const SELECTORS_TS: &str = include_str!("../e2e/selectors.ts");
 
 const EDITOR_RS: &str = include_str!("../src/components/editor.rs");
 const RESULTS_TABLE_RS: &str = include_str!("../src/components/results_table.rs");
+const EXACT_TABLE_RS: &str = include_str!("../src/components/exact_table.rs");
+const CAT_CHART_RS: &str = include_str!("../src/components/cat_chart.rs");
 const HISTORY_RS: &str = include_str!("../src/pages/history.rs");
 const LAYOUT_RS: &str = include_str!("../src/pages/layout.rs");
 const RANGE_DIALOG_RS: &str = include_str!("../../fleet-ui/src/range_dialog.rs");
@@ -37,7 +39,7 @@ const TOAST_RUNTIME_RS: &str = include_str!("../../fleet-ui/src/toast/runtime.rs
 const TOAST_KINDS_RS: &str = include_str!("../../fleet-ui/src/toast/kinds.rs");
 const LOADED_COMPONENT_RS: &str = include_str!("../../fleet-ui/src/loaded/component.rs");
 const LOADED_STATE_RS: &str = include_str!("../../fleet-ui/src/loaded/state.rs");
-const RAIL_RS: &str = include_str!("../../fleet-ui/src/rail.rs");
+const SIDEBAR_RS: &str = include_str!("../../fleet-ui/src/sidebar.rs");
 const SECTION_RS: &str = include_str!("../src/state/section.rs");
 const DRAWER_RS: &str = include_str!("../../fleet-ui/src/drawer.rs");
 const FIELD_CASE_DRAWER_RS: &str = include_str!("../src/components/field_case_drawer.rs");
@@ -94,8 +96,8 @@ const CONTRACTS: &[Contract] = &[
     },
     Contract {
         assignment: "helpLink: 'nav.rail .bot a[title=\"Help\"]',",
-        source_path: "../fleet-ui/src/rail.rs",
-        source: RAIL_RS,
+        source_path: "../fleet-ui/src/sidebar.rs",
+        source: SIDEBAR_RS,
         hook: "class=\"bot\"",
     },
     Contract {
@@ -177,16 +179,28 @@ const CONTRACTS: &[Contract] = &[
         hook: "class=\"command-palette-empty\"",
     },
     Contract {
-        assignment: "paletteModeLink: '.topbar .modes a',",
-        source_path: "../fleet-ui/src/topbar.rs",
-        source: TOPBAR_RS,
-        hook: "class=\"modes\"",
+        assignment: "paletteRailLink: 'nav.rail .grp > a[title]',",
+        source_path: "../fleet-ui/src/sidebar.rs",
+        source: SIDEBAR_RS,
+        hook: "attr:title=label_attr",
     },
     Contract {
-        assignment: "paletteRailLink: 'nav.rail > a[title]',",
-        source_path: "../fleet-ui/src/rail.rs",
-        source: RAIL_RS,
-        hook: "attr:title=label_attr",
+        assignment: "navToggle: '.topbar button.nav-toggle',",
+        source_path: "../fleet-ui/src/topbar.rs",
+        source: TOPBAR_RS,
+        hook: "class=\"nav-toggle\"",
+    },
+    Contract {
+        assignment: "sidebarCollapse: 'nav.rail .bot button.collapse',",
+        source_path: "../fleet-ui/src/sidebar.rs",
+        source: SIDEBAR_RS,
+        hook: "class=\"it collapse\"",
+    },
+    Contract {
+        assignment: "topbarCrumb: '.topbar .crumb',",
+        source_path: "../fleet-ui/src/topbar.rs",
+        source: TOPBAR_RS,
+        hook: "class=\"crumb\"",
     },
     Contract {
         assignment: "paletteKbd: '.topbar button.jump .kbd',",
@@ -279,6 +293,12 @@ const CONTRACTS: &[Contract] = &[
         hook: "Cancel",
     },
     Contract {
+        assignment: "healthCheck: '.health-check',",
+        source_path: "src/pages/health.rs",
+        source: HEALTH_RS,
+        hook: "class=\"health-check\"",
+    },
+    Contract {
         assignment: "healthQueryScroll: '.health-query-scroll',",
         source_path: "src/pages/health.rs",
         source: HEALTH_RS,
@@ -310,8 +330,8 @@ const CONTRACTS: &[Contract] = &[
     },
     Contract {
         assignment: "healthAwayLink: 'nav.rail a[title=\"Schema\"]',",
-        source_path: "../../fleet-ui/src/rail.rs",
-        source: RAIL_RS,
+        source_path: "../../fleet-ui/src/sidebar.rs",
+        source: SIDEBAR_RS,
         hook: "title=",
     },
     Contract {
@@ -382,8 +402,8 @@ const CONTRACTS: &[Contract] = &[
     },
     Contract {
         assignment: "railHealthLink: 'nav.rail a[title=\"Health\"]',",
-        source_path: "../../fleet-ui/src/rail.rs",
-        source: RAIL_RS,
+        source_path: "../../fleet-ui/src/sidebar.rs",
+        source: SIDEBAR_RS,
         hook: "title=",
     },
     Contract {
@@ -407,8 +427,8 @@ const CONTRACTS: &[Contract] = &[
     },
     Contract {
         assignment: "railHistoryLink: 'nav.rail a[title=\"History\"]',",
-        source_path: "../fleet-ui/src/rail.rs",
-        source: RAIL_RS,
+        source_path: "../fleet-ui/src/sidebar.rs",
+        source: SIDEBAR_RS,
         hook: "class=\"rail\"",
     },
     Contract {
@@ -580,18 +600,6 @@ const CONTRACTS: &[Contract] = &[
         hook: "class=\"histo\"",
     },
     Contract {
-        assignment: "histoCaption: '.histo-caption',",
-        source_path: "src/components/histogram.rs",
-        source: HISTOGRAM_RS,
-        hook: "class=\"histo-caption\"",
-    },
-    Contract {
-        assignment: "histoCaptionPrefix: 'Current page · window: ',",
-        source_path: "src/components/histogram.rs",
-        source: HISTOGRAM_RS,
-        hook: "Current page · window: {}",
-    },
-    Contract {
         assignment: "exportAction: '.tabs .action.export',",
         source_path: "src/pages/search.rs",
         source: include_str!("../src/pages/search.rs"),
@@ -728,6 +736,30 @@ const CONTRACTS: &[Contract] = &[
         source_path: "src/pages/search.rs",
         source: include_str!("../src/pages/search.rs"),
         hook: ">\"Stop live\"<",
+    },
+    Contract {
+        assignment: "truncatedBadge: 'Truncated',",
+        source_path: "src/pages/search.rs",
+        source: include_str!("../src/pages/search.rs"),
+        hook: ">\"Truncated\"<",
+    },
+    Contract {
+        assignment: "draftDirty: 'Edited',",
+        source_path: "src/components/editor_wrap.rs",
+        source: EDITOR_WRAP_RS,
+        hook: "\"Edited\"",
+    },
+    Contract {
+        assignment: "saveAsNetTool: 'Save as net',",
+        source_path: "src/components/editor_wrap.rs",
+        source: EDITOR_WRAP_RS,
+        hook: ">\"Save as net\"<",
+    },
+    Contract {
+        assignment: "copyUrlTool: 'Copy search URL',",
+        source_path: "src/components/editor_wrap.rs",
+        source: EDITOR_WRAP_RS,
+        hook: ">\"Copy search URL\"<",
     },
     Contract {
         assignment: "toastAny: '.toast',",
@@ -929,6 +961,24 @@ const CONTRACTS: &[Contract] = &[
     // a page that stops rendering `.tbl-row` would otherwise leave its
     // specs matching nothing and passing their `toHaveCount(0)` half.
     Contract {
+        assignment: "listSheet: '.list-sheet',",
+        source_path: "src/pages/schema.rs",
+        source: SCHEMA_RS,
+        hook: "class=\"list-sheet\"",
+    },
+    Contract {
+        assignment: "runDetail: '.run-detail',",
+        source_path: "src/pages/runs.rs",
+        source: RUNS_RS,
+        hook: "class=\"list-sheet run-detail\"",
+    },
+    Contract {
+        assignment: "runOpenNet: '.run-detail a.open-net',",
+        source_path: "src/pages/runs.rs",
+        source: RUNS_RS,
+        hook: "class=\"open-net btn-sec\"",
+    },
+    Contract {
         assignment: "tableRow: '.tbl-body .tbl-row',",
         source_path: "src/pages/schema.rs",
         source: SCHEMA_RS,
@@ -1068,6 +1118,28 @@ const CONTRACTS: &[Contract] = &[
     },
     Contract {
         assignment: "resultsDetailTag: '.results-table td.detail button.tag',",
+        source_path: "src/components/results_table.rs",
+        source: RESULTS_TABLE_RS,
+        hook: "class=\"tag\"",
+    },
+    Contract {
+        assignment: "resultsSelectedRow: '.results-table tbody tr.selected',",
+        source_path: "src/components/results_table.rs",
+        source: RESULTS_TABLE_RS,
+        hook: "class:selected=",
+    },
+    // The panel id, which is also the target of the caret's
+    // `aria-controls` and of the "Jump to details" link. Pinned in the
+    // table rather than the page: the docked drawer is rendered beside
+    // the rows it describes, not from the page body.
+    Contract {
+        assignment: "inspector: '#search-inspector',",
+        source_path: "src/components/results_table.rs",
+        source: RESULTS_TABLE_RS,
+        hook: "panel_id=\"search-inspector\"",
+    },
+    Contract {
+        assignment: "inspectorTag: '#search-inspector button.tag',",
         source_path: "src/components/results_table.rs",
         source: RESULTS_TABLE_RS,
         hook: "class=\"tag\"",
@@ -1231,6 +1303,73 @@ const CONTRACTS: &[Contract] = &[
         source_path: "../fleet-ui/src/search_input.rs",
         source: SEARCH_INPUT_RS,
         hook: "class=\"inp-wrap\"",
+    },
+    Contract {
+        assignment: "scopeStrip: '.scope',",
+        source_path: "src/components/meta_strip.rs",
+        source: META_STRIP_RS,
+        hook: "class=\"scope\"",
+    },
+    Contract {
+        assignment: "scopeWindow: '.scope-window',",
+        source_path: "src/components/meta_strip.rs",
+        source: META_STRIP_RS,
+        hook: "class=\"scope-window\"",
+    },
+    Contract {
+        assignment: "draftState: '.console-hd .draft',",
+        source_path: "src/components/editor_wrap.rs",
+        source: EDITOR_WRAP_RS,
+        hook: "class=\"console-hd\"",
+    },
+    Contract {
+        assignment: "draftState: '.console-hd .draft',",
+        source_path: "src/components/editor_wrap.rs",
+        source: EDITOR_WRAP_RS,
+        hook: "class=\"draft dirty\"",
+    },
+    Contract {
+        assignment: "viewControl: '.tabs button.action.view',",
+        source_path: "src/pages/search.rs",
+        source: include_str!("../src/pages/search.rs"),
+        hook: "class=\"action view\"",
+    },
+    Contract {
+        assignment: "viewPanel: '#search-view',",
+        source_path: "src/pages/search.rs",
+        source: include_str!("../src/pages/search.rs"),
+        hook: "id=\"search-view\"",
+    },
+    Contract {
+        assignment: "exactTable: '.results-table.exact',",
+        source_path: "src/components/exact_table.rs",
+        source: EXACT_TABLE_RS,
+        hook: "class=\"results-table exact\"",
+    },
+    Contract {
+        assignment: "groupSearch: '.results-table.exact button.grp-search',",
+        source_path: "src/components/exact_table.rs",
+        source: EXACT_TABLE_RS,
+        hook: "class=\"grp-search\"",
+    },
+    Contract {
+        assignment: "catChart: '.cat-chart',",
+        source_path: "src/components/cat_chart.rs",
+        source: CAT_CHART_RS,
+        hook: "class=\"cat-chart\"",
+    },
+    // Two halves, since the class alone reaches both bypasses.
+    Contract {
+        assignment: "skipToQuery: 'a.skip-link[href=\"#search-query\"]',",
+        source_path: "src/pages/search.rs",
+        source: include_str!("../src/pages/search.rs"),
+        hook: "class=\"skip-link\"",
+    },
+    Contract {
+        assignment: "skipToQuery: 'a.skip-link[href=\"#search-query\"]',",
+        source_path: "src/pages/search.rs",
+        source: include_str!("../src/pages/search.rs"),
+        hook: "href=\"#search-query\"",
     },
     Contract {
         assignment: "filterChip: '.meta-chips .chip',",
@@ -1557,18 +1696,10 @@ const CONTRACTS: &[Contract] = &[
         hook: "id=\"net-window-span\"",
     },
     Contract {
-        assignment: "windowSpanChip: '.interval-chips:has(+ #net-window-span) button.interval-chip',",
+        assignment: "windowSpanHint: '#net-window-span-help',",
         source_path: "src/components/net_drawer.rs",
         source: NET_DRAWER_RS,
-        hook: "class=\"interval-chips\"",
-    },
-    // The chips and the box are siblings inside one `DurationChips`, which
-    // is what the `+` combinator above is reading.
-    Contract {
-        assignment: "windowSpanChip: '.interval-chips:has(+ #net-window-span) button.interval-chip',",
-        source_path: "src/components/net_drawer.rs",
-        source: NET_DRAWER_RS,
-        hook: "id=\"net-window-span\"",
+        hook: "id=\"net-window-span-help\"",
     },
     Contract {
         assignment: "windowLagInput: '#net-lag',",
@@ -1605,6 +1736,12 @@ const CONTRACTS: &[Contract] = &[
     // spec reads that footer through `resultsFooter` scoped to the
     // preview rather than through a selector of its own.
     Contract {
+        assignment: "previewScroll: '.preview-scroll',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "class=\"preview-scroll\"",
+    },
+    Contract {
         assignment: "previewCap: '.preview-cap',",
         source_path: "src/components/net_drawer.rs",
         source: NET_DRAWER_RS,
@@ -1612,10 +1749,10 @@ const CONTRACTS: &[Contract] = &[
     },
     // -- the schedule window form's copy --------------------------------
     Contract {
-        assignment: "windowLabel: 'Window',",
+        assignment: "windowLabel: 'Each run covers',",
         source_path: "src/components/net_drawer.rs",
         source: NET_DRAWER_RS,
-        hook: "\"Window\"",
+        hook: "\"Each run covers\"",
     },
     Contract {
         assignment: "windowOptionQuery: 'Query text',",
@@ -1636,16 +1773,34 @@ const CONTRACTS: &[Contract] = &[
         hook: "SegmentedOption::new(\"fixed\", \"Fixed span\")",
     },
     Contract {
-        assignment: "windowSpanLabel: 'Span',",
+        assignment: "intervalLabel: 'Run every',",
         source_path: "src/components/net_drawer.rs",
         source: NET_DRAWER_RS,
-        hook: "label=\"Span\"",
+        hook: "label=\"Run every\"",
     },
     Contract {
-        assignment: "windowLagLabel: 'Lag',",
+        assignment: "maxRunsLabel: 'Keep schedule running for',",
         source_path: "src/components/net_drawer.rs",
         source: NET_DRAWER_RS,
-        hook: "for=\"net-lag\">\"Lag\"",
+        hook: "for=\"net-max-runs\">\"Keep schedule running for\"",
+    },
+    Contract {
+        assignment: "windowSpanLabel: 'Trailing span',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "for=\"net-window-span\">\"Trailing span\"",
+    },
+    Contract {
+        assignment: "windowSpanHint: 'At least 60 seconds.',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "\"At least 60 seconds.\"",
+    },
+    Contract {
+        assignment: "windowLagLabel: 'Late-arrival lag',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "for=\"net-lag\">\"Late-arrival lag\"",
     },
     Contract {
         assignment: "windowQueryHint: 'Runs the saved text as written.',",
@@ -1678,10 +1833,10 @@ const CONTRACTS: &[Contract] = &[
         hook: "Changing the window or interval may run the schedule immediately.",
     },
     Contract {
-        assignment: "windowLagHintText: 'Late-arrival allowance. Both window bounds move back by this much. Blank is none.',",
+        assignment: "windowLagHintText: 'Moves both bounds back by this much. Blank is none.',",
         source_path: "src/components/net_drawer.rs",
         source: NET_DRAWER_RS,
-        hook: "Late-arrival allowance. Both window bounds move back by this much. Blank is none.",
+        hook: "Moves both bounds back by this much. Blank is none.",
     },
     Contract {
         assignment: "netRunAction: '⏱ Run',",
@@ -1885,6 +2040,44 @@ fn every_selectors_ts_entry_is_pinned() {
                 "e2e/selectors.ts entry `{trimmed}` has no drift-guard \
                  contract in e2e_selector_contract.rs — add one pinning \
                  it to the source that renders it.",
+            );
+        }
+    }
+}
+
+/// Every check key the health fixtures carry resolves to a friendly
+/// name in `CHECK_NAMES`.
+///
+/// The page renders an unknown key verbatim, which is the honest
+/// fallback but also a silent one: a daemon check the map never grew a
+/// name for would read as a raw identifier forever. The fixtures are the
+/// set of keys the suite exercises, so they are the set this holds the
+/// map to. Lives here rather than in `pages/health.rs` because that
+/// module is wasm-only and a `#[cfg(test)]` inside it never runs.
+#[test]
+fn every_fixture_check_key_has_a_friendly_name() {
+    for (name, json) in [
+        (
+            "health-ok.json",
+            include_str!("../e2e/harness/wire/health-ok.json"),
+        ),
+        (
+            "health-unavailable.json",
+            include_str!("../e2e/harness/wire/health-unavailable.json"),
+        ),
+    ] {
+        let report: trawl_api::HealthResponse = serde_json::from_str(json)
+            .unwrap_or_else(|e| panic!("{name} is not a HealthResponse: {e}"));
+        let checks = report
+            .checks
+            .unwrap_or_else(|| panic!("{name} carries no checks"));
+        assert!(!checks.is_empty(), "{name} carries no checks");
+        for key in checks.keys() {
+            assert!(
+                HEALTH_RS.contains(&format!("(\"{key}\", \"")),
+                "health fixture {name} carries the check `{key}`, which has no \
+                 entry in CHECK_NAMES in src/pages/health.rs — it would render \
+                 as a raw identifier.",
             );
         }
     }

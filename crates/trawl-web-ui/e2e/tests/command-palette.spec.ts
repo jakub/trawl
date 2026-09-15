@@ -25,17 +25,14 @@ async function closed(page: Page) {
 }
 
 async function chromeCommands(page: Page): Promise<Command[]> {
-  await expect(page.locator(SEL.paletteModeLink).first()).toBeVisible();
+  // The sidebar is the whole route inventory now: the palette's options
+  // are its links, in its order, deduped by path.
   await expect(page.locator(SEL.paletteRailLink).first()).toBeVisible();
-  const modes = await page.locator(SEL.paletteModeLink).evaluateAll((links) =>
-    links.map((link) => ({ label: link.textContent!.trim(), path: link.getAttribute('href')! })),
-  );
   const rail = await page.locator(SEL.paletteRailLink).evaluateAll((links) =>
     links.map((link) => ({ label: link.getAttribute('title')!, path: link.getAttribute('href')! })),
   );
-  expect(modes.length).toBeGreaterThan(1);
   expect(rail.length).toBeGreaterThan(1);
-  return [...modes, ...rail].filter((command, index, all) =>
+  return rail.filter((command, index, all) =>
     all.findIndex((candidate) => candidate.path === command.path) === index,
   );
 }
@@ -130,10 +127,12 @@ for (const route of ['/search/schema', '/settings/health']) {
     await expect(page.locator(SEL.paletteKbd)).toHaveText('Ctrl+K');
     await expect(page.locator(SEL.paletteTrigger)).toHaveAttribute('aria-keyshortcuts', 'Control+K');
     if (route.startsWith('/settings')) {
-      // The Settings mode keeps its entry route. Health and Schema each
-      // contribute their own destination from the Settings rail.
+      // Operations contributes Health and nothing else: with the mode
+      // tabs gone there is no bare /settings destination, and Schema is
+      // listed once, under Search (ADR-0032).
       expect(expected.some((command) => command.path === '/settings/health')).toBe(true);
-      expect(expected.filter((command) => command.path === '/settings')).toHaveLength(1);
+      expect(expected.filter((command) => command.path === '/settings')).toHaveLength(0);
+      expect(expected.filter((command) => command.path === '/search/schema')).toHaveLength(1);
     }
   });
 }

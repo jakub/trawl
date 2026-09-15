@@ -82,8 +82,8 @@ test('schema header: Enter sorts, Space reverses', async ({ page, request }) => 
   );
 
   // Events, reached by Tab from the header before it.
-  const events = controls.nth(3);
-  await controls.nth(2).focus();
+  const events = controls.nth(1);
+  await controls.nth(0).focus();
   await page.keyboard.press('Tab');
   await expectFocusRing(events);
   await expect(events).toHaveJSProperty('tagName', 'BUTTON');

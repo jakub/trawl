@@ -26,6 +26,7 @@ const CONFIRM_REASON: &str = include_str!("../src/modal/confirm_reason.rs");
 const DRAWER: &str = include_str!("../src/drawer.rs");
 const TABS: &str = include_str!("../src/tabs.rs");
 const ERROR_BANNER: &str = include_str!("../src/error_banner.rs");
+const LOGIN: &str = include_str!("../src/login/component.rs");
 
 // Small widgets. Their tone/class *composition* is pinned by native
 // unit tests in the pure layers (badge::tone, status_dot::tone,
@@ -46,6 +47,7 @@ const ACTIONS_MENU: &str = include_str!("../src/actions_menu.rs");
 const MENU: &str = include_str!("../src/menu.rs");
 const TOPBAR: &str = include_str!("../src/topbar.rs");
 const SHELL: &str = include_str!("../src/shell.rs");
+const SIDEBAR: &str = include_str!("../src/sidebar.rs");
 const COMMAND_PALETTE: &str = include_str!("../src/command_palette.rs");
 const TOAST_RUNTIME: &str = include_str!("../src/toast/runtime.rs");
 const ROVING: &str = include_str!("../src/roving.rs");
@@ -171,7 +173,14 @@ fn drawer_emits_the_sd_shell_hooks_its_css_styles() {
     // The `sd-*` shell css_chrome_parity's `drawer_shell_classes_shipped_
     // with_crate` pins: scrim, panel, header (title + actions + close),
     // body.
-    emits(DRAWER, r#"class="sd-scrim""#, ".sd-scrim");
+    //
+    // The host's two classes are conditional on `docked` (ADR-0032):
+    // the scrim paints the overlay presentation, `.sd-host` collapses
+    // the host to `display: contents` so the docked panel becomes a
+    // child of the layout that placed it.
+    emits(DRAWER, "class:sd-scrim=", ".sd-scrim");
+    emits(DRAWER, "class:sd-host=", ".sd-host");
+    emits(DRAWER, "class:sd-docked=", ".sd-drawer.sd-docked");
     emits(DRAWER, r#"class="sd-drawer""#, ".sd-drawer");
     emits(DRAWER, r#"class="sd-hd""#, ".sd-hd");
     emits(DRAWER, r#"class="sd-ttl""#, ".sd-ttl");
@@ -189,6 +198,9 @@ fn tabs_emits_both_strip_families_with_distinct_active_idioms() {
     emits(TABS, r#"class="t""#, ".tabs .t");
     emits(TABS, "class:active", ".tabs .t.active");
     emits(TABS, r#"class="c""#, ".tabs .t .c");
+    // The trailing slot's wrapper: `.tabs .tabs-actions` is what keeps
+    // the consumer's actions on one line when the strip wraps.
+    emits(TABS, r#"class="tabs-actions""#, ".tabs .tabs-actions");
 
     // Drawer family: `.sd-tabs > span.tb.on`. The active modifier here is
     // `on` (weight-600 `.sd-tabs .tb.on`) — a different idiom from the
@@ -521,6 +533,67 @@ fn topbar_menu_is_native_and_registers_with_the_stack() {
 }
 
 #[test]
+fn sidebar_emits_an_unconditional_group_wrapper_and_names_labelled_groups() {
+    // The wrapper is unconditional so `.rail .grp > a[title]` addresses
+    // every destination, labelled group or not; `role`/`aria-label` ride
+    // only the labelled ones, because a nameless role="group" is an axe
+    // defect (ADR-0032).
+    let sidebar = markup_only(SIDEBAR);
+    for required in [
+        r#"class="grp""#,
+        "role=",
+        "aria-label=",
+        r#"class="grp-lb""#,
+        "attr:title=label_attr",
+        "aria-current=",
+        r#"class="bot""#,
+        r#"class="it collapse""#,
+        r#"id="fleet-sidebar""#,
+        r#"aria-label="Primary""#,
+    ] {
+        assert!(sidebar.contains(required), "Sidebar lost {required}");
+    }
+    emits(SIDEBAR, r#"class="rail""#, "nav.rail");
+    emits(SIDEBAR, r#"class="lb""#, ".rail .it .lb");
+    emits(SIDEBAR, r#"class="badge""#, ".rail .it .badge");
+    assert!(
+        sidebar.contains("<button") && sidebar.contains(TYPE_BUTTON),
+        "the collapse control must be a native <button type=\"button\"> \
+         — it changes presentation, it is not a destination"
+    );
+}
+
+#[test]
+fn shell_mounts_the_nav_overlay_as_a_capture_layer() {
+    // Below 900px navigation is an overlay, not a docked column: same
+    // policy the Drawer uses, so Escape only closes the topmost layer,
+    // the background stays interactive and the palette chord is inert
+    // while it is open.
+    let shell = markup_only(SHELL);
+    for required in [
+        "FocusPolicy::Capture",
+        r#"class="nav-scrim""#,
+        r#"use_media_query("(max-width: 899.98px)")"#,
+        "is_topmost",
+        r#"class="shell-content""#,
+    ] {
+        assert!(
+            shell.contains(required),
+            "Shell nav overlay lost {required}"
+        );
+    }
+    let topbar = markup_only(TOPBAR);
+    for required in [
+        r#"class="nav-toggle""#,
+        r#"aria-controls="fleet-sidebar""#,
+        r#"class="crumb""#,
+        r#"<header class="topbar">"#,
+    ] {
+        assert!(topbar.contains(required), "command bar lost {required}");
+    }
+}
+
+#[test]
 fn command_palette_trigger_is_a_live_native_button() {
     let topbar = markup_only(TOPBAR);
     let start = topbar
@@ -735,23 +808,37 @@ fn drawer_is_an_honest_non_modal_dialog() {
          users tab straight out (the issue #33 defect)"
     );
     assert!(
-        DRAWER.contains("FocusPolicy::Capture") && DRAWER.contains("use_overlay_layer_with"),
-        "the drawer must register FocusPolicy::Capture via \
-         use_overlay_layer_with — initial focus on open, restore on \
-         close, and no Tab trap"
+        DRAWER.contains("FocusPolicy::Capture") && DRAWER.contains("push_overlay_with"),
+        "the drawer must register a FocusPolicy::Capture layer — initial \
+         focus on open, restore on close, and no Tab trap. It pushes the \
+         layer itself rather than through use_overlay_layer_with because \
+         `docked` releases it at runtime (ADR-0032), so the registration \
+         is pinned on the push, not on the hook"
     );
     assert!(
         DRAWER.contains(r#"tabindex="-1""#),
         "the drawer panel needs tabindex=\"-1\" so the initial-focus \
          fallback can land on the panel itself"
     );
+    // A05: role="dialog" needs a host element that allows it, and
+    // `<aside>` is a complementary landmark, which does not.
+    assert!(
+        DRAWER.contains(r#"<div class="sd-drawer""#),
+        "the drawer panel must be a <div> host for role=\"dialog\" (A05)"
+    );
+    assert!(
+        !DRAWER.contains("<aside"),
+        "the drawer must render no <aside> — a complementary landmark is \
+         not an allowed host for role=\"dialog\" (A05)"
+    );
 }
 
 #[test]
 fn icon_ships_the_slice_d_glyphs_and_the_crate_doc_is_honest() {
-    // Document / Upload / Copy belong to the closed enum, each with an
-    // icon_body arm in house style.
-    for glyph in ["Document", "Upload", "Copy"] {
+    // Document / Upload / Copy, and the sidebar's Menu / PanelLeft,
+    // belong to the closed enum, each with an icon_body arm in house
+    // style.
+    for glyph in ["Document", "Upload", "Copy", "Menu", "PanelLeft"] {
         assert!(
             ICON.contains(&format!("    {glyph},\n"))
                 && ICON.contains(&format!("Icon::{glyph} =>")),
@@ -920,6 +1007,46 @@ fn error_banner_emits_error_class_with_alert_role() {
         ERROR_BANNER.contains(r#"role="alert""#),
         "ErrorBanner must keep role=\"alert\" — the one sanctioned DOM \
          delta of the issue #28 migration (attribute-only, zero pixels)"
+    );
+}
+
+#[test]
+fn login_associates_its_error_with_the_input() {
+    // A04: the login error rides a sibling banner, so `role="alert"`
+    // announces it once and nothing associates it with the field it is
+    // about. The input carries aria-invalid and points
+    // aria-describedby at the banner's id, which ErrorBanner renders
+    // from its `id` prop.
+    assert!(
+        LOGIN.contains("aria-invalid=") && LOGIN.contains("aria-describedby="),
+        "the login input must carry aria-invalid and aria-describedby — \
+         without them the alert is announced once and is unreachable \
+         from the invalid field (A04)"
+    );
+    // One binding feeds the banner's id and the association, so the two
+    // cannot drift apart; the test pins the value and both uses.
+    assert!(
+        LOGIN.contains(r#""fleet-login-error""#)
+            && LOGIN.contains("id=ERROR_ID")
+            && LOGIN.contains("then_some(ERROR_ID)"),
+        "the banner id and the aria-describedby must be the same \
+         `fleet-login-error` binding"
+    );
+    assert!(
+        ERROR_BANNER.contains("id=id"),
+        "ErrorBanner must render its `id` prop — an unrendered id leaves \
+         login's aria-describedby pointing at nothing"
+    );
+    // A05/landmarks: /login routes outside the app shell, so the card
+    // is the page's only chance at a <main>.
+    assert!(
+        LOGIN.contains(r#"<main class="login-shell">"#),
+        "the login card must sit in a <main> landmark — /login never \
+         reaches Shell's <main class=\"main\">"
+    );
+    assert!(
+        !LOGIN.contains("<aside"),
+        "the login card renders no complementary landmark"
     );
 }
 

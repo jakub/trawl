@@ -22,10 +22,12 @@ pub(crate) fn enc_uri(raw: &str) -> String {
         .unwrap_or_else(|| raw.to_string())
 }
 
+pub mod cat_chart;
 pub mod chart;
 pub mod degraded_notice;
 pub mod editor;
 pub mod editor_wrap;
+pub mod exact_table;
 pub mod export_modal;
 pub mod facet_sidebar;
 pub mod field_case_drawer;

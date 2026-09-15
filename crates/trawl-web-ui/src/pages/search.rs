@@ -4,27 +4,48 @@
 
 //! `/search` — query workspace.
 //!
-//! Layout (top to bottom inside `.search-col`):
-//! editor wrap (header + `DslEditor` + date range + run button)
-//! → meta strip (filter chips — hidden while empty)
-//! → tabs (Events / Visualization · trailing Save/Export actions)
+//! Layout (top to bottom inside `.search-col`, the page's one sheet):
+//! `h1` → query console (header + draft state + `DslEditor` + date
+//! range + Haul + tools + the executed-scope strip)
+//! → tabs (Events / Visualization · trailing Truncated / Stop live /
+//!   Save / Export)
 //! → degraded-field notice (hidden unless the execution reported one)
 //! → tab body (Events: histogram + results table | Visualization: chart)
+//!
+//! Two skip links open the page ahead of the filter rail, because the
+//! rail's value controls stay in the tab order on purpose: one focuses
+//! the editor, one the results region (audit finding A03).
 //!
 //! State split:
 //! - `query_text` — in-progress editor buffer (not URL-synced).
 //! - `executed_q` / `filters` / `range` — URL-driven memos (canonical).
 //! - `effective_q` — derived from the triple; what actually hits the
-//!   server. Filter chips in the meta strip and the date-range popover
+//!   server. Filter chips in the scope strip and the date-range popover
 //!   mutate state by navigating; URL drives memos drives resource.
+//! - `draft_dirty` — the console header's own comparison of the two.
+//!   It reads both and writes neither, so saying "unsent changes"
+//!   cannot itself become a navigation (ADR-0027).
+//! - `selected` / `result_gen` — the docked inspector's selection, a
+//!   `(response generation, ORIGINAL row index)` pair. Sorting re-orders
+//!   the rows on screen but never the pair, so a re-sort keeps the same
+//!   event open; a new response, a page turn or a new effective query
+//!   bumps the generation, which closes the panel.
+//!
+//! Both reading modes (`View`) default off and apply to SNAPSHOT raw
+//! results only: a live ring evicts rows every frame, so a selection in
+//! it would be cleared continuously (ADR-0032).
 
 use leptos::prelude::*;
+use leptos::web_sys;
 use trawl_api::value::QueryResult;
 use wasm_bindgen::JsCast;
 
+use crate::categorical::{CatShape, detect as detect_categorical};
+use crate::components::cat_chart::CatChart;
 use crate::components::chart::Chart;
 use crate::components::degraded_notice::DegradedNotice;
 use crate::components::editor_wrap::EditorWrap;
+use crate::components::exact_table::ExactTable;
 use crate::components::export_modal::ExportModal;
 use crate::components::facet_sidebar::FacetSidebar;
 use crate::components::histogram::Histogram;
@@ -41,19 +62,38 @@ use crate::state::query::{
     report_refusal, url_signals,
 };
 use crate::state::search_session::rows_resource;
-use fleet_ui::{LoadState, TabItem, Tabs, ToastBus, ToastKind};
+use fleet_ui::overlay::use_overlay_layer;
+use fleet_ui::{
+    Badge, Details, LoadState, Rows, Segmented, SegmentedOption, Size, TabItem, Tabs, ToastBus,
+    ToastKind, Tone, UiPrefs,
+};
+use leptos::ev;
+use leptos_use::{use_event_listener, use_window};
 
 use crate::state::stream_session::{
     LiveSignals, RingBuffer, StreamLifecycle, ring_to_result, start_stream,
 };
 
-fn focus_search_control(selector: &str) {
-    if let Some(document) = web_sys::window().and_then(|window| window.document())
-        && let Ok(Some(element)) = document.query_selector(selector)
-        && let Ok(element) = element.dyn_into::<web_sys::HtmlElement>()
-    {
-        let _ = element.focus();
-    }
+/// Move keyboard focus to the first element matching `selector`, and
+/// report whether anything took it.
+///
+/// Both skip links are real anchors, so the browser already moves the
+/// document to the target; neither target takes focus from an `href`
+/// alone — `.cm-content` is `CodeMirror`'s own contenteditable, and the
+/// results tab is a `tabindex="0"` control — so the handler supplies it.
+///
+/// The return value is what keeps the link honest. A missing target is
+/// a real case: the results header is absent while the malformed banner
+/// is up (ADR-0027). Swallowing the default there left the link inert —
+/// it prevented the navigation AND focused nothing — so the caller
+/// prevents the default only when the focus landed, and otherwise lets
+/// the browser move the document the way an anchor always does.
+fn focus_search_control(selector: &str) -> bool {
+    web_sys::window()
+        .and_then(|window| window.document())
+        .and_then(|document| document.query_selector(selector).ok().flatten())
+        .and_then(|element| element.dyn_into::<web_sys::HtmlElement>().ok())
+        .is_some_and(|element| element.focus().is_ok())
 }
 
 /// Results-area tab. The typed enum is search-page semantics rather than
@@ -107,6 +147,11 @@ pub fn Search() -> impl IntoView {
     Effect::new(move |_| {
         query_text.set(executed_q.get());
     });
+
+    // The console header's draft state. Trimmed on both sides: trailing
+    // whitespace the editor adds is not an unsent change, and `Haul`
+    // would produce the same link.
+    let draft_dirty = Memo::new(move |_| query_text.get().trim() != executed_q.get().trim());
 
     // Whether this link's structured state could be read at all.
     //
@@ -513,6 +558,10 @@ pub fn Search() -> impl IntoView {
 
     let ring_result = Memo::new(move |_| ring_to_result(&ring.read()));
 
+    let loading = Signal::derive(move || {
+        !snapshot_q.get().trim().is_empty() && (query_pending.get() || rows.get().is_none())
+    });
+
     // The rows on screen, from whichever source the mode makes active:
     // the snapshot page, the live ring, or the latest aggregation frame.
     // The tab count, the footer count and the filter rail all read this
@@ -535,8 +584,12 @@ pub fn Search() -> impl IntoView {
         }
         LoadState::from_resource(rows.get().map(|r| r.map(|resp| resp.response.result)))
     });
+    // A resource holds its previous response while the next request is
+    // in flight, so a count taken straight off `active_rows` would put
+    // the old page's row count under the new executed scope and on the
+    // Events tab beside it. No count until the answer matches.
     let active_row_count = Signal::derive(move || match active_rows.get() {
-        LoadState::Ready(result) => Some(result.rows.len()),
+        LoadState::Ready(result) if !loading.get() => Some(result.rows.len()),
         _ => None,
     });
 
@@ -545,10 +598,6 @@ pub fn Search() -> impl IntoView {
     // and the notice below must not describe the page live replaced for
     // the frame it takes the empty query to resolve.
     let snapshot_ran = Signal::derive(move || !snapshot_q.get().trim().is_empty());
-
-    let loading = Signal::derive(move || {
-        !snapshot_q.get().trim().is_empty() && (query_pending.get() || rows.get().is_none())
-    });
 
     // Drive the shell's status bar from search-specific state. Both
     // derivations are pure (`search_status.rs`): the footer describes
@@ -682,15 +731,84 @@ pub fn Search() -> impl IntoView {
     // (ADR-0027, amended 2026-09-12).
     let window = Signal::derive(move || effective_window(&executed_q.get(), &range.get()));
 
+    // --- reading modes ------------------------------------------------
+    // Both default off (ADR-0032): with the defaults in force the
+    // results DOM is exactly what it was before this slice.
+    let prefs = use_context::<UiPrefs>();
+    let details = Signal::derive(move || prefs.map_or(Details::Inline, |p| p.details().get()));
+    let rows_mode = Signal::derive(move || prefs.map_or(Rows::Compact, |p| p.rows().get()));
+    let set_details = Callback::new(move |id: String| {
+        if let Some(p) = prefs {
+            p.details().set(if id == "inspector" {
+                Details::Inspector
+            } else {
+                Details::Inline
+            });
+        }
+    });
+    let set_rows = Callback::new(move |id: String| {
+        if let Some(p) = prefs {
+            p.rows().set(if id == "message-first" {
+                Rows::MessageFirst
+            } else {
+                Rows::Compact
+            });
+        }
+    });
+
+    let view_open = RwSignal::new(false);
+    let view_wrap = NodeRef::<leptos::html::Div>::new();
+    let view_btn = NodeRef::<leptos::html::Button>::new();
+    let close_view = Callback::new(move |()| view_open.set(false));
+
+    // The inspector's selection. Owned here rather than in the table,
+    // because only this component sees the three things that invalidate
+    // it: a fresh response, a page turn and a new effective query.
+    let selected = RwSignal::new(None::<(u64, usize)>);
+    let result_gen = RwSignal::new(0_u64);
+    Effect::new(move |_| {
+        let _ = rows.get();
+        result_gen.update(|g| *g = g.wrapping_add(1));
+    });
+    Effect::new(move |_| {
+        snapshot_q.track();
+        page.track();
+        selected.set(None);
+    });
+    let generation = Signal::derive(move || result_gen.get());
+
+    // The categorical shape of the snapshot aggregate on screen, if it
+    // has one. Read off the executed query and the response together:
+    // only the `stats … by <field>` stage knows which column is the
+    // group, and a chart drawn without it would label the wrong axis.
+    let cat_shape: Memo<Option<CatShape>> = Memo::new(move |_| {
+        // The resource holds the PREVIOUS response while the next
+        // request is in flight, and `effective_q` follows the URL at
+        // once, so detection would read an old result through a new
+        // query and label the wrong axis. No chart while pending — the
+        // same rule the histogram caption follows.
+        if loading.get() {
+            return None;
+        }
+        rows.get()
+            .and_then(Result::ok)
+            .and_then(|resp| detect_categorical(&effective_q.get(), &resp.result))
+    });
+
     view! {
         <div class="search-layout">
+            // Ahead of the rail, whose value controls stay in the tab
+            // order by design: the two bypasses are what keeps that from
+            // costing 110 tab stops to reach the editor (A03).
             <a class="skip-link" href="#search-query" on:click=move |event: web_sys::MouseEvent| {
-                event.prevent_default();
-                focus_search_control(".dsl-editor [contenteditable=true]");
+                if focus_search_control(".dsl-editor [contenteditable=true]") {
+                    event.prevent_default();
+                }
             }>"Skip to query editor"</a>
             <a class="skip-link" href="#search-results" on:click=move |event: web_sys::MouseEvent| {
-                event.prevent_default();
-                focus_search_control("[role=tablist][aria-label=Results] [role=tab][tabindex='0']");
+                if focus_search_control("[role=tablist][aria-label=Results] [role=tab][tabindex='0']") {
+                    event.prevent_default();
+                }
             }>"Skip to results"</a>
             <FacetSidebar
                 state=active_rows
@@ -698,28 +816,40 @@ pub fn Search() -> impl IntoView {
                 suppressed=unreadable
                 rows_suppressed=facet_rows_suppressed
                 capabilities=facet_capabilities
+                live=live
                 on_add=on_add_filter
                 on_clear=on_clear_filters
             />
             <div class="search-col">
-                <EditorWrap
-                    query=query_text
-                    on_submit=on_submit
-                    range=range_sig
-                    on_range_change=on_range_change
-                    reset_key=raw_search
-                    running=running
-                    blocked=unreadable
-                    on_save=on_save
-                    on_live=on_live
-                />
-                <MetaStrip
-                    truncated=truncated
-                    filters=filters_sig
-                    filters_unreadable=filters_unreadable
-                    blocked=unreadable
-                    on_remove=on_remove_filter
-                />
+                <h1 class="search-heading">"Search"</h1>
+                <div class="console">
+                    <EditorWrap
+                        query=query_text
+                        on_submit=on_submit
+                        range=range_sig
+                        on_range_change=on_range_change
+                        reset_key=raw_search
+                        running=running
+                        blocked=unreadable
+                        draft_dirty=draft_dirty
+                        on_save=on_save
+                        on_live=on_live
+                    />
+                    // The strip under the editor describes the EXECUTED
+                    // query, not the buffer above it: window, filters,
+                    // mode and row count all come from the URL and the
+                    // active result source (ADR-0027).
+                    <MetaStrip
+                        window=window
+                        filters=filters_sig
+                        filters_unreadable=filters_unreadable
+                        blocked=unreadable
+                        live=live
+                        count=active_row_count
+                        pending=loading
+                        on_remove=on_remove_filter
+                    />
+                </div>
                 <MalformedNotice malformed=malformed_sig repair=repair_sig on_repair=on_repair/>
                 <Tabs
                     items=vec![
@@ -734,6 +864,12 @@ pub fn Search() -> impl IntoView {
                     // the blanked sentinel then, and the server reads
                     // an empty query as every row (ADR-0027).
                     trailing=Box::new(move || view! {
+                        // The truncation notice moved out of the scope
+                        // strip: it qualifies the row count on the tab
+                        // beside it, not the window under the editor.
+                        <Show when=move || truncated.get()>
+                            <Badge tone=Tone::Warn>"Truncated"</Badge>
+                        </Show>
                         <Show when=move || live.get()>
                             <button
                                 type="button"
@@ -743,6 +879,33 @@ pub fn Search() -> impl IntoView {
                                 on:click=move |_| on_stop_live.run(())
                             >"Stop live"</button>
                         </Show>
+                        // The reading-mode disclosure. A button plus a
+                        // popover rather than two segmented strips in the
+                        // header: the header is a 36-40px row and the
+                        // modes are read rarely, so they are one press
+                        // away instead of permanently spending its width.
+                        <div class="view-wrap" node_ref=view_wrap>
+                            <button
+                                type="button"
+                                class="action view"
+                                aria-expanded=move || view_open.get().to_string()
+                                aria-controls="search-view"
+                                node_ref=view_btn
+                                on:click=move |_| view_open.update(|open| *open = !*open)
+                            >"View"</button>
+                            <Show when=move || view_open.get()>
+                                <ViewPanel
+                                    details=details
+                                    rows_mode=rows_mode
+                                    aggregate=is_chart_query
+                                    on_details=set_details
+                                    on_rows=set_rows
+                                    on_close=close_view
+                                    wrap=view_wrap
+                                    trigger=view_btn
+                                />
+                            </Show>
+                        </div>
                         <button
                             type="button"
                             class="action save"
@@ -777,9 +940,32 @@ pub fn Search() -> impl IntoView {
                     // link cannot be read.
                     ().into_any()
                 } else { match (active_tab.get(), mode.get()) {
+                    // An aggregation answers in exact numbers, so the
+                    // table drops the expansion column and offers a
+                    // search only on the fields the query grouped by
+                    // (F02). The chart beside it is decoration over the
+                    // same numbers, which is why it is aria-hidden.
+                    (ResultsTab::Events, Mode::Snapshot) if is_chart_query.get() => view! {
+                        <>
+                            <div class="agg-split" class:has-chart=move || cat_shape.get().is_some()>
+                                <ExactTable
+                                    busy=running
+                                    page=page
+                                    rows=rows
+                                    on_paginate=on_paginate
+                                    on_add_filter=on_result_filter
+                                />
+                                {move || {
+                                    let shape = cat_shape.get()?;
+                                    let resp = rows.get()?.ok()?;
+                                    Some(view! { <CatChart shape=shape result=resp.response.result/> })
+                                }}
+                            </div>
+                        </>
+                    }.into_any(),
                     (ResultsTab::Events, Mode::Snapshot) => view! {
                         <>
-                            <Histogram rows=rows window=window pending=loading/>
+                            <Histogram rows=rows/>
                             <ResultsTable
                                 queried=snapshot_ran
                                 busy=running
@@ -788,6 +974,10 @@ pub fn Search() -> impl IntoView {
                                 on_paginate=on_paginate
                                 on_add_filter=on_result_filter
                                 on_navigate=on_navigate_q
+                                details=details
+                                rows_mode=rows_mode
+                                selected=selected
+                                generation=generation
                             />
                         </>
                     }.into_any(),
@@ -797,8 +987,12 @@ pub fn Search() -> impl IntoView {
                     (ResultsTab::Events, Mode::Live) => view! {
                         <LiveRawTable result=ring_result failure=stream_failure/>
                     }.into_any(),
+                    // The Visualization pane IS the results region while
+                    // it is the active tab: only one tab is mounted, so
+                    // the id stays unique and "Skip to results" reaches
+                    // the chart the same way it reaches a table.
                     (ResultsTab::Visualization, Mode::Snapshot) => {
-                        if loading.get() {
+                        let inner = if loading.get() {
                             view! { <p class="results-empty" role="status">"Loading snapshot visualization…"</p> }.into_any()
                         } else {
                             match rows.get() {
@@ -806,15 +1000,20 @@ pub fn Search() -> impl IntoView {
                                 Some(Err(_)) => view! { <div class="results-empty"><p role="alert">"Snapshot query failed. Open Events for the query error."</p><button type="button" class="btn-sec" on:click=move |_| rows.refetch()>"Retry snapshot"</button></div> }.into_any(),
                                 None => view! { <p class="results-empty">"Run a query to visualize its snapshot."</p> }.into_any(),
                             }
-                        }
+                        };
+                        view! { <div id="search-results" class="results" role="region" aria-label="Search results" tabindex="0">{inner}</div> }.into_any()
                     },
                     (ResultsTab::Visualization, Mode::Live) if is_chart_query.get() => view! {
-                        <Chart snapshot=live_snapshot query=effective_q failure=stream_failure on_retry=retry_stream/>
+                        <div id="search-results" class="results" role="region" aria-label="Search results" tabindex="0">
+                            <Chart snapshot=live_snapshot query=effective_q failure=stream_failure on_retry=retry_stream/>
+                        </div>
                     }.into_any(),
                     (ResultsTab::Visualization, Mode::Live) => view! {
-                        <Show when=move || stream_failure.get().is_none()>
-                            <p class="results-empty">"Live event queries appear in Events. Use timechart with a count metric for a live visualization."</p>
-                        </Show>
+                        <div id="search-results" class="results" role="region" aria-label="Search results" tabindex="0">
+                            <Show when=move || stream_failure.get().is_none()>
+                                <p class="results-empty">"Live event queries appear in Events. Use timechart with a count metric for a live visualization."</p>
+                            </Show>
+                        </div>
                     }.into_any(),
                 }}}
             </div>
@@ -835,6 +1034,96 @@ pub fn Search() -> impl IntoView {
     }
 }
 
+/// The reading-mode popover behind the result header's "View" button.
+///
+/// A `FocusPolicy::None` overlay layer (`fleet_ui::overlay`), so it
+/// arbitrates Escape against whatever else is open without taking focus.
+/// The chord IS silenced while it is open: `has_layers()` counts layers
+/// and ignores their focus policy, so the command palette treats this
+/// popover like any other overlay. It closes on Escape while topmost —
+/// returning focus to the trigger — and on any mousedown outside its
+/// wrapper.
+#[component]
+fn ViewPanel(
+    #[prop(into)] details: Signal<Details>,
+    #[prop(into)] rows_mode: Signal<Rows>,
+    /// Aggregation-shaped results always render the plain table, so the
+    /// Rows group states that instead of offering a choice it would not
+    /// honour (ADR-0025: nothing advertises a capability that does not
+    /// exist).
+    #[prop(into)]
+    aggregate: Signal<bool>,
+    on_details: Callback<String>,
+    on_rows: Callback<String>,
+    on_close: Callback<()>,
+    wrap: NodeRef<leptos::html::Div>,
+    trigger: NodeRef<leptos::html::Button>,
+) -> impl IntoView {
+    let layer = use_overlay_layer();
+
+    let _ = use_event_listener(use_window(), ev::keydown, move |e| {
+        if e.key() != "Escape" || !layer.is_topmost() {
+            return;
+        }
+        e.prevent_default();
+        on_close.run(());
+        if let Some(btn) = trigger.get_untracked() {
+            let _ = btn.focus();
+        }
+    });
+    // Identity through `contains`, the same rule the modal and drawer
+    // scrims use: a press on the trigger is inside the wrapper, so the
+    // button's own click still toggles instead of re-opening.
+    let _ = use_event_listener(use_window(), ev::mousedown, move |e| {
+        let Some(host) = wrap.get_untracked() else {
+            return;
+        };
+        let inside = e
+            .target()
+            .and_then(|t| t.dyn_into::<web_sys::Node>().ok())
+            .is_some_and(|node| host.contains(Some(&node)));
+        if !inside {
+            on_close.run(());
+        }
+    });
+
+    view! {
+        <div id="search-view" class="view-pop">
+            <div role="group" aria-labelledby="view-details-lb">
+                <span id="view-details-lb" class="view-lb">"Details"</span>
+                <Segmented
+                    size=Size::Xs
+                    options=vec![
+                        SegmentedOption::new("inline", "Inline"),
+                        SegmentedOption::new("inspector", "Inspector"),
+                    ]
+                    active=Signal::derive(move || details.get().as_attr().to_string())
+                    on_change=on_details
+                />
+            </div>
+            <div role="group" aria-labelledby="view-rows-lb">
+                <span id="view-rows-lb" class="view-lb">"Rows"</span>
+                <Show
+                    when=move || !aggregate.get()
+                    fallback=move || view! {
+                        <p class="view-note">"Aggregation results always use the plain table"</p>
+                    }
+                >
+                    <Segmented
+                        size=Size::Xs
+                        options=vec![
+                            SegmentedOption::new("compact", "Compact"),
+                            SegmentedOption::new("message-first", "Message first"),
+                        ]
+                        active=Signal::derive(move || rows_mode.get().as_attr().to_string())
+                        on_change=on_rows
+                    />
+                </Show>
+            </div>
+        </div>
+    }
+}
+
 /// Simple table rendering for the ring-buffered raw-event live feed.
 #[component]
 fn LiveRawTable(
@@ -843,7 +1132,10 @@ fn LiveRawTable(
     #[prop(into)] failure: Signal<Option<&'static str>>,
 ) -> impl IntoView {
     view! {
-        <div id="search-results" class="results" tabindex="-1">
+        // Same region contract as the snapshot tables: "Skip to results"
+        // reaches live mode too, so the container must be able to hold
+        // focus and name itself.
+        <div id="search-results" class="results" role="region" aria-label="Search results" tabindex="0">
             {move || {
                 let r = result.get();
                 if r.columns.is_empty() {

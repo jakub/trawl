@@ -31,11 +31,11 @@ fn main() {
 }
 
 #[cfg(target_arch = "wasm32")]
-// TopBar and Rail are exported via fleet-ui but mounted internally by
+// TopBar and Sidebar are exported via fleet-ui but mounted internally by
 // Shell — referencing them here would duplicate the chrome.
 use fleet_ui::{
-    AppLink, Btn, ConfirmWithReasonModal, Drawer, ErrorBanner, Icon, Login, Modal, ModeTab,
-    RailItem, Shell, Size, TabItem, Tabs, Theme, ToastBus, UserInfo, Variant, install,
+    Btn, ConfirmWithReasonModal, Drawer, ErrorBanner, Icon, Login, Modal, RailItem, Shell,
+    SidebarGroup, Size, TabItem, Tabs, Theme, ToastBus, UserInfo, Variant, install,
 };
 #[cfg(target_arch = "wasm32")]
 use leptos::prelude::*;
@@ -65,62 +65,36 @@ fn backdrop(theme: impl Into<Signal<Theme>>) -> impl IntoView {
 fn backdrop(_theme: impl Into<Signal<Theme>>) -> impl IntoView {}
 
 #[cfg(target_arch = "wasm32")]
-fn rail_items() -> Vec<RailItem> {
+fn sidebar_groups() -> Vec<SidebarGroup> {
     vec![
-        RailItem {
-            id: "home".into(),
-            label: "Home".into(),
-            icon: Icon::Grid,
-            path: "/".into(),
-            badge: None,
+        SidebarGroup {
+            label: None,
+            items: vec![
+                RailItem {
+                    id: "home".into(),
+                    label: "Home".into(),
+                    icon: Icon::Grid,
+                    path: "/".into(),
+                    badge: None,
+                },
+                RailItem {
+                    id: "search".into(),
+                    label: "Search".into(),
+                    icon: Icon::Search,
+                    path: "/search".into(),
+                    badge: None,
+                },
+            ],
         },
-        RailItem {
-            id: "search".into(),
-            label: "Search".into(),
-            icon: Icon::Search,
-            path: "/search".into(),
-            badge: None,
-        },
-        RailItem {
-            id: "alerts".into(),
-            label: "Alerts".into(),
-            icon: Icon::Alert,
-            path: "/alerts".into(),
-            badge: Some(3),
-        },
-    ]
-}
-
-#[cfg(target_arch = "wasm32")]
-fn app_links() -> Vec<AppLink> {
-    vec![
-        AppLink {
-            label: "trawl".into(),
-            href: "https://trawl.example/".into(),
-            active: false,
-        },
-        AppLink {
-            label: "demo".into(),
-            href: "/".into(),
-            active: true,
-        },
-    ]
-}
-
-#[cfg(target_arch = "wasm32")]
-fn modes() -> Vec<ModeTab> {
-    vec![
-        ModeTab {
-            id: "logs".into(),
-            label: "Logs".into(),
-            path: "/".into(),
-            active: true,
-        },
-        ModeTab {
-            id: "settings".into(),
-            label: "Settings".into(),
-            path: "/settings".into(),
-            active: false,
+        SidebarGroup {
+            label: Some("Operations".into()),
+            items: vec![RailItem {
+                id: "alerts".into(),
+                label: "Alerts".into(),
+                icon: Icon::Alert,
+                path: "/alerts".into(),
+                badge: Some(3),
+            }],
         },
     ]
 }
@@ -298,10 +272,8 @@ fn DemoApp() -> impl IntoView {
     // `use_context::<UiPrefs>()` and silently no-ops without this.
     provide_context(prefs);
 
-    let rail_items_sig = Signal::derive(rail_items);
-    let app_links_sig = Signal::derive(app_links);
-    let rail_active = Signal::derive(|| "home".to_string());
-    let modes_sig = Signal::derive(modes);
+    let groups = Signal::derive(sidebar_groups);
+    let sidebar_active = Signal::derive(|| "home".to_string());
     let user = Signal::derive(|| {
         Some(UserInfo {
             name: "demo user".into(),
@@ -326,11 +298,9 @@ fn DemoApp() -> impl IntoView {
                     <Shell
                         brand="demo"
                         brand_accent="·"
-                        rail_items=rail_items_sig
-                        rail_active=rail_active
-                        modes=modes_sig
+                        sidebar_groups=groups
+                        sidebar_active=sidebar_active
                         user=user
-                        app_links=app_links_sig
                         on_logout=Callback::new(|()| {})
                         // footer is #[prop(optional)]: a footer-less app simply
                         // omits it. The demo passes one to exercise the slot
@@ -338,12 +308,12 @@ fn DemoApp() -> impl IntoView {
                         footer=Box::new(|| view! {
                             <div class="statusbar">"demo footer"</div>
                         }.into_any())
-                        // Bottom rail slot, used by trawl's Help link.
-                        rail_bottom=Box::new(|| view! {
-                            <div class="it" title="Pinned — demo">
+                        // Bottom sidebar slot, used by trawl's Help link.
+                        sidebar_bottom=ViewFn::from(|| view! {
+                            <a class="it" title="Pinned — demo" href="/">
                                 <span class="lb">"Pinned"</span>
-                            </div>
-                        }.into_any())
+                            </a>
+                        })
                     >
                         // Child rendered inside Shell — reaches the
                         // Shell-owned ToastBus via expect_context and fires
@@ -351,7 +321,7 @@ fn DemoApp() -> impl IntoView {
                         <ToastProbe/>
                         <RangeProbe/>
                         // Hidden export sentinel — proves Icon is in scope
-                        // without re-mounting TopBar/Rail (which Shell
+                        // without re-mounting TopBar/Sidebar (which Shell
                         // already renders internally).
                         <span hidden=true>{format!("{:?}", Icon::Question)}</span>
                     </Shell>

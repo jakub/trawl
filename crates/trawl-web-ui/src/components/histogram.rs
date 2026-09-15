@@ -7,7 +7,7 @@
 //!
 //! Time bucketing leans on `crate::histogram::bucketize_series`, which
 //! also carries the bounds the bars were laid out over: the axis
-//! labels, the bar tooltips and the accessible bucket table all measure
+//! labels and the bar tooltips measure
 //! from that one `Series`, so none of them can disagree about where a
 //! bucket starts. Timestamps come from a `_time` / `time` / `timestamp`
 //! / `@timestamp` column; with none of them there is nothing to bucket
@@ -17,18 +17,7 @@
 //! ADR-0013 §9); a page carrying no `_severity` column draws every bar
 //! as ok.
 //!
-//! The x axis reads real timestamps off the data, and one caption names
-//! the window the effective query ran under — which is the DSL's own
-//! time clause when it carries one, not the range the picker shows
-//! (ADR-0027, amended 2026-09-12).
-//!
-//! The caption is the one part of the strip that does not come from the
-//! response, so it is the one part that can disagree with it: a
-//! resource holds its previous page while the next request is in
-//! flight, while `window` follows the URL at once. `pending` is what
-//! keeps them honest — while a snapshot is running the caption is not
-//! rendered at all, so it never names a window the bars below it were
-//! not drawn over.
+//! The x axis reads real timestamps off the data.
 
 use fleet_ui::{LoadState, Loaded};
 use leptos::prelude::*;
@@ -37,22 +26,12 @@ use trawl_api::value::Value;
 
 use crate::api::ApiError;
 use crate::histogram::{Series, axis_labels, bucket_time, bucketize_series};
-use crate::state::query::{EffectiveWindow, window_caption};
 
 const N_BUCKETS: usize = 48;
 
 #[component]
 pub fn Histogram(
     rows: LocalResource<Result<crate::state::search_session::ExecutedResponse, ApiError>>,
-    /// The time restriction the effective query ran under — what the
-    /// caption states. Not the picker's range: the two differ whenever
-    /// the query carries its own `last=`.
-    #[prop(into)]
-    window: Signal<EffectiveWindow>,
-    /// Whether a snapshot request is in flight. The caption describes a
-    /// completed response or nothing.
-    #[prop(into)]
-    pending: Signal<bool>,
 ) -> impl IntoView {
     view! {
         <div class="histo">
@@ -97,8 +76,8 @@ pub fn Histogram(
                                     if b.err > 0 { format!(" · {} errors", b.err) } else { String::new() }
                                 );
                                 view! {
-                                    <div class="bar">
-                                        <div class="tip">{tip}</div>
+                                    <div class="bar" tabindex="0" role="img" aria-label=tip>
+                                        <div class="tip" aria-hidden="true">{tip.clone()}</div>
                                         <div class="ok" style=format!("height:{ok_h:.1}%")></div>
                                         <div class="err" style=format!("height:{err_h:.1}%")></div>
                                     </div>
@@ -114,35 +93,6 @@ pub fn Histogram(
                 })
             />
         </div>
-        {move || rows.get().and_then(Result::ok).map(|resp| {
-            let series = build_series(&resp);
-            view! {
-                <Show when=move || !pending.get()>
-                    <p class="histo-caption">
-                        {move || format!("Current page · window: {}", window_caption(&window.get()))}
-                    </p>
-                </Show>
-                {series.map(|series| {
-                    let width = series.bucket_width();
-                    let min = series.min_secs;
-                    view! {
-                        <details class="bucket-data">
-                            <summary>"Histogram bucket data"</summary>
-                            <div class="bucket-scroll" tabindex="0" role="region" aria-label="Histogram bucket data">
-                                <table>
-                                    <caption>"Times are UTC, rounded outward to milliseconds. Counts use unrounded intervals."</caption>
-                                    <thead><tr><th scope="col">"Start"</th><th scope="col">"End"</th><th scope="col">"Events"</th><th scope="col">"Errors"</th></tr></thead>
-                                    <tbody>{series.buckets.into_iter().enumerate().map(|(i, b)| {
-                                        let start = bucket_start(min, width, i);
-                                        view! { <tr><td>{bucket_time(start, false)}</td><td>{bucket_time(start + width, true)}</td><td>{b.ok + b.err}</td><td>{b.err}</td></tr> }
-                                    }).collect::<Vec<_>>()}</tbody>
-                                </table>
-                            </div>
-                        </details>
-                    }
-                })}
-            }
-        })}
     }
 }
 

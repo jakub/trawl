@@ -3,7 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 import { test, expect, resetScenario, capturedSavedRequests, CORPUS } from '../fixtures';
-import { SEL } from '../selectors';
+import { SEL, COPY } from '../selectors';
 
 for (const modifier of ['Control', 'Meta']) {
   test(`named search and save dialog advertise ${modifier}+Enter and submit once`, async ({ page, request }) => {
@@ -44,9 +44,9 @@ for (const colorScheme of ['light', 'dark'] as const) {
     // A text box, not a number spinner: a browser reports malformed
     // numeric text as an empty value, which the form would read as
     // "blank = unlimited" (issue #181).
-    const max = drawer.getByRole('textbox', { name: 'Max runs', exact: true });
-    await expect(max).toHaveAccessibleDescription('(blank = unlimited)');
-    await expect(drawer.getByRole('textbox', { name: 'Interval', exact: true })).toBeVisible();
+    const max = drawer.getByRole('textbox', { name: COPY.maxRunsLabel, exact: true });
+    await expect(max).toHaveAccessibleDescription('runs (blank = unlimited)');
+    await expect(drawer.getByRole('textbox', { name: COPY.intervalLabel, exact: true })).toBeVisible();
     await expect(drawer.getByRole('button', { name: 'Save schedule', exact: true })).toBeVisible();
     await max.focus();
     await page.keyboard.press('Tab');
@@ -107,12 +107,17 @@ test('reduced motion stops actual overlays, toasts and live tail pulses', async 
   await page.emulateMedia({ reducedMotion: 'reduce' });
   await resetScenario(request, 'corpus');
   await page.goto('/search');
-  await page.locator(SEL.editorTool).filter({ hasText: /^Share$/ }).click();
+  await page.locator(SEL.editorTool).filter({ hasText: COPY.copyUrlTool }).click();
   await expect(page.locator('.toast').first()).toHaveCSS('animation-name', 'none');
   await page.locator(SEL.saveAction).click();
   await expect(page.locator('.modal')).toHaveCSS('animation-name', 'none');
   await expect(page.locator('.modal-scrim')).toHaveCSS('animation-name', 'none');
   await page.keyboard.press('Escape');
+  // The service panel docks beside the list at 1100px and up, where
+  // there is no scrim and nothing slides in (ADR-0032). The entrance
+  // animations this test is about only exist in the narrow overlay
+  // presentation, so measure them there.
+  await page.setViewportSize({ width: 1024, height: 900 });
   await page.goto(`/search/schema?svc=${CORPUS.service}&stab=tail`);
   await expect(page.locator('.sd-drawer')).toHaveCSS('animation-name', 'none');
   await expect(page.locator('.sd-scrim')).toHaveCSS('animation-name', 'none');
@@ -121,6 +126,17 @@ test('reduced motion stops actual overlays, toasts and live tail pulses', async 
   await expect(page.locator('.pulse > span')).toHaveCSS('animation-name', 'pulse-ring');
   await page.emulateMedia({ reducedMotion: 'reduce' });
   await expect(page.locator('.pulse > span')).toHaveCSS('animation-name', 'none');
+
+  // The nav overlay is the other thing that slides and fades in, and the
+  // test never opened it, so its reduce rules were asserted nowhere.
+  // Off the schema route first: its scrim drawer is over the toggle.
+  await page.setViewportSize({ width: 720, height: 900 });
+  await page.goto('/search');
+  await page.locator(SEL.navToggle).click();
+  await expect(page.locator('nav.rail.overlay')).toHaveCSS('animation-name', 'none');
+  await expect(page.locator('.nav-scrim')).toHaveCSS('animation-name', 'none');
+  await page.keyboard.press('Escape');
+  await expect(page.locator('nav.rail.overlay')).toHaveCount(0);
 });
 
 test('forced colors retains a visible navigation outline', async ({ page }) => {
@@ -140,8 +156,8 @@ test('schedule editor opens without editing the saved query', async ({ page, req
   await drawer.getByRole('button', { name: '+ Add Schedule', exact: true }).click();
   await expect(drawer.getByRole('button', { name: 'Edit', exact: true })).toBeVisible();
   await expect(drawer.getByRole('textbox', { name: 'Query', exact: true })).toHaveCount(0);
-  await drawer.getByRole('textbox', { name: 'Interval', exact: true }).fill('10m');
-  await expect(drawer.getByRole('textbox', { name: 'Interval', exact: true })).toHaveValue('10m');
+  await drawer.getByRole('textbox', { name: COPY.intervalLabel, exact: true }).fill('10m');
+  await expect(drawer.getByRole('textbox', { name: COPY.intervalLabel, exact: true })).toHaveValue('10m');
   await expect(drawer.getByRole('checkbox', { name: 'Schedule enabled', exact: true })).toBeAttached();
   await expect(drawer.locator('.toggle-slider')).toBeVisible();
 });

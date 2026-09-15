@@ -98,12 +98,10 @@ test('a fixed span travels with no lag beside it', async ({ page, request }) => 
   await expect(drawer.locator(SEL.windowLagInput)).toHaveValue(SCHEDULE.lag);
   await drawer.locator(SEL.windowLagInput).fill('');
 
-  const chip = drawer.locator(SEL.windowSpanChip).filter({ hasText: '1h' });
-  await chip.click();
-  await expect(chip).toHaveAttribute('aria-pressed', 'true');
-  // One value shown two ways: a pressed preset leaves the custom box
-  // blank rather than repeating itself.
-  await expect(drawer.locator(SEL.windowSpanInput)).toHaveValue('');
+  // One span is one value in the server's grammar, so it is typed into
+  // one box rather than chosen from a second preset strip.
+  await drawer.locator(SEL.windowSpanInput).fill('1h');
+  await expect(drawer.locator(SEL.windowSpanInput)).toHaveValue('1h');
 
   await drawer.getByRole('button', { name: 'Save schedule', exact: true }).click();
 

@@ -145,6 +145,25 @@ pub(crate) fn push_overlay_with(policy: FocusPolicy) -> OverlayLayer {
     OverlayLayer(id)
 }
 
+/// Register a layer *beneath* every layer already on the stack.
+///
+/// For an overlay that existed before those layers and is only now
+/// taking a layer of its own: a docked drawer undocking under a modal
+/// that opened over it. Pushing on top would hand that drawer focus
+/// and Escape the modal still owns; beneath, it becomes topmost only
+/// once everything stacked over it has released.
+#[cfg(any(target_arch = "wasm32", test))]
+#[must_use]
+pub(crate) fn push_overlay_beneath(policy: FocusPolicy) -> OverlayLayer {
+    let id = NEXT_ID.with_borrow_mut(|n| {
+        let id = *n;
+        *n += 1;
+        id
+    });
+    STACK.with_borrow_mut(|s| s.insert(0, (id, policy)));
+    OverlayLayer(id)
+}
+
 /// Register an overlay layer for the lifetime of the current reactive
 /// owner: pushes on mount and releases via `on_cleanup` on unmount.
 /// Returns the `Copy` handle for the component's Escape guard.
@@ -543,6 +562,30 @@ mod tests {
         modal.release();
         assert!(menu.is_topmost(), "menu regains Escape after the modal");
         menu.release();
+    }
+
+    #[test]
+    fn a_layer_pushed_beneath_a_modal_takes_neither_focus_nor_escape() {
+        // A docked drawer undocks while a modal stands over it: the
+        // drawer's new layer goes in under the modal, which keeps both
+        // Escape and focus ownership until it closes.
+        let modal = push_overlay_with(FocusPolicy::Trap);
+        let drawer = push_overlay_beneath(FocusPolicy::Capture);
+        assert!(modal.is_topmost(), "the modal keeps Escape");
+        assert!(modal.owns_focus(), "the modal keeps focus ownership");
+        assert!(!drawer.is_topmost());
+        assert!(
+            !drawer.owns_focus(),
+            "an undocking drawer must not steal focus"
+        );
+
+        modal.release();
+        assert!(
+            drawer.is_topmost(),
+            "the drawer surfaces once the modal is gone"
+        );
+        assert!(drawer.owns_focus());
+        drawer.release();
     }
 
     #[test]

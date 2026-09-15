@@ -14,16 +14,17 @@ test('Settings opens Health and offers only Health and the existing Schema page'
   await expect(page.locator(SEL.healthPage)).toBeVisible();
 
   const rail = page.locator(SEL.paletteRailLink);
-  await expect(rail).toHaveText(['Health', 'Schema']);
-  await expect(rail.nth(0)).toHaveAttribute('href', '/settings/health');
-  await expect(rail.nth(1)).toHaveAttribute('href', '/search/schema');
-  await expect(rail.nth(0)).toHaveClass(/\bactive\b/);
+  await expect(rail).toHaveText(['Search', 'History', 'Schema', 'Nets', 'Runs', 'Health']);
+  await expect(rail.nth(5)).toHaveAttribute('href', '/settings/health');
+  await expect(rail.nth(2)).toHaveAttribute('href', '/search/schema');
+  await expect(rail.nth(5)).toHaveClass(/\bactive\b/);
 
-  await rail.nth(1).click();
+  await rail.nth(2).click();
   await expect(page).toHaveURL(/\/search\/schema$/);
-  await expect(page.getByRole('heading', { name: 'Schema', exact: true })).toBeVisible();
-  const searchMode = page.locator(SEL.paletteModeLink).filter({ hasText: /^Search$/ });
-  await expect(searchMode).toHaveClass(/\bactive\b/);
+  // Scoped to the page: the command bar's crumb is a heading with the
+  // same name, which is the point of a breadcrumb.
+  await expect(page.getByRole('main').getByRole('heading', { name: 'Schema', exact: true })).toBeVisible();
+  await expect(rail.nth(2)).toHaveClass(/\bactive\b/);
 });
 
 test('Settings replaces its intermediate history entry and preserves the shell stream', async ({ page, request }) => {
@@ -37,9 +38,17 @@ test('Settings replaces its intermediate history entry and preserves the shell s
   await expect.poll(async () => (await state()).dashboard.open).toBe(1);
   await page.evaluate(() => { (window as any).__settingsNavigation = true; });
 
-  const settingsMode = page.locator(SEL.paletteModeLink).filter({ hasText: /^Settings$/ });
-  await expect(settingsMode).toHaveAttribute('href', '/settings');
-  await settingsMode.click();
+  // /settings has no sidebar entry of its own — it redirects to Health.
+  // A same-document anchor is what the router intercepts, so the
+  // __settingsNavigation marker survives the hop.
+  await page.evaluate(() => {
+    const a = document.createElement('a');
+    a.href = '/settings';
+    a.id = '__settings';
+    a.textContent = 'settings';
+    document.body.append(a);
+  });
+  await page.click('#__settings');
   await expect(page).toHaveURL(/\/settings\/health$/);
   await expect(page.locator(SEL.healthLiveState)).toHaveText('Live');
   expect(await page.evaluate(() => (window as any).__settingsNavigation)).toBe(true);
@@ -95,10 +104,10 @@ test('Help is a native keyboard link and stays outside the full Settings palette
 
   await page.locator(SEL.paletteTrigger).click();
   await expect(page.locator(SEL.paletteDialog)).toBeVisible();
-  await expect(page.locator(SEL.paletteLabel)).toHaveText(['Search', 'Jobs', 'Settings', 'Health', 'Schema']);
+  await expect(page.locator(SEL.paletteLabel)).toHaveText(['Search', 'History', 'Schema', 'Nets', 'Runs', 'Health']);
   expect(await page.locator(SEL.paletteOption).evaluateAll((options) =>
     options.map((option) => option.getAttribute('href')),
-  )).toEqual(['/search', '/jobs/nets', '/settings', '/settings/health', '/search/schema']);
+  )).toEqual(['/search', '/search/history', '/search/schema', '/jobs/nets', '/jobs/runs', '/settings/health']);
   await expect(page.locator(SEL.paletteLabel).filter({ hasText: /^Help$/ })).toHaveCount(0);
 });
 
@@ -134,7 +143,7 @@ async function prepareSave(page: Page, request: APIRequestContext, scenario = 's
 
 function saveEntry(page: Page, entry: 'editor' | 'toolbar') {
   return entry === 'editor'
-    ? page.locator(SEL.editorTool).filter({ hasText: /^Save$/ })
+    ? page.locator(SEL.editorTool).filter({ hasText: /^Save as net$/ })
     : page.locator(SEL.saveAction);
 }
 
@@ -148,7 +157,8 @@ async function submitSave(page: Page, status = 200) {
   const answered = page.waitForResponse((response) =>
     response.url().endsWith('/api/v1/saved') && response.request().method() === 'POST',
   );
-  await page.getByRole('button', { name: 'Save as net', exact: true }).click();
+  // Modal-scoped: the editor tool carries the same name now.
+  await page.locator(SEL.modalPanel).getByRole('button', { name: 'Save as net', exact: true }).click();
   const response = await answered;
   expect(response.status()).toBe(status);
   await response.finished();
@@ -227,7 +237,7 @@ test('Save retries an explicit POST failure with the original snapshot', async (
   await submitSave(page, 503);
   await expect(page.locator(SEL.toastError)).toContainText("Couldn't save");
   await expect(page.locator(SEL.modalPanel)).toBeVisible();
-  await expect(page.getByRole('button', { name: 'Save as net', exact: true })).toBeEnabled();
+  await expect(page.locator(SEL.modalPanel).getByRole('button', { name: 'Save as net', exact: true })).toBeEnabled();
   await changeReadableUrl(page);
   await expectExactPreview(page);
   await submitSave(page);

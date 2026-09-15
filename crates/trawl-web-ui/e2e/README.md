@@ -33,6 +33,26 @@ npm run test                          # -- --headed / --grep <pattern>
 `--skip-build` fails loudly at server startup (not silently against a
 stale build) if `dist/index.html` is missing.
 
+The harness serves a private copy of that `dist/`, taken at startup into
+`e2e-artifacts/dist-snapshot-<port>/` and checked against index.html's
+own asset list. A `trunk serve` running from the same checkout writes the
+same directory, so without the copy a rebuild mid-run pulls the hashed
+wasm out from under the browser, and trunk's injected autoreload client
+(whose `{{__TRUNK_ADDRESS__}}` placeholder only trunk's server
+substitutes) logs a WebSocket failure that console-error assertions read
+as the SPA's. The snapshot drops that client; a `trunk build` index.html
+carries none and is copied verbatim.
+
+Everything a run writes — that snapshot, playwright traces, failure
+screenshots, `.last-run.json` — goes to `e2e-artifacts/` at the
+repository root, never under `crates/`. Trunk's watcher covers the whole
+`crates/trawl-web-ui` tree and does not read `.gitignore`, so a run that
+wrote beside the suite woke any live `trunk serve` for a full rebuild;
+about a hundred seconds later that rebuild applied its distribution,
+clearing `dist/.stage` under whatever `trunk build` was staging into it,
+and the build died with `error writing JS loader file to stage dir: No
+such file or directory`. CI uploads the traces from the new path.
+
 ## CI
 
 CI (the `web-ui-e2e` job in `.github/workflows/ci.yml`) does not rebuild
@@ -95,6 +115,20 @@ directory. This override leaves per-test timeouts, assertions and
   `toBeFocused`) and on a tabindex vector across a widget's items — one
   item at `0` is the claim, so asserting the focused item alone would
   pass with every item tabbable.
+- The redesigned chrome (ADR-0032): `sidebar.spec.ts` for the collapse
+  preference through a reload, one `aria-current="page"` per route and
+  the command bar's crumb; `query-console.spec.ts` for the draft state,
+  the executed-scope strip and the skip links; `reading-modes.spec.ts`
+  for the inspector and message-first presentations, both off by
+  default; `aggregate.spec.ts` for the exact table and the categorical
+  chart; `range-wrap.spec.ts` for the range trigger and Haul not
+  overlapping at 320 and 390px.
+- The service and net panels DOCK beside their lists at 1100px and up,
+  where there is neither a scrim nor a focus capture. A spec about
+  either of those two things narrows the viewport first
+  (`batch1-controls.spec.ts`, `chrome-controls.spec.ts`) — an
+  assertion on `.sd-scrim` at the default width is asserting a panel
+  that is not there.
 - No visual regression / screenshot diffing.
 - No real backend — every response is a fixture in `harness/fixtures.mjs`.
   Re-verify those shapes against `crates/trawl-api/src/lib.rs` /
@@ -187,6 +221,40 @@ bug in the spec or the harness (an unawaited async state change, a race
 in `server.mjs`'s SSE bookkeeping, etc.) — fix it or quarantine it loudly
 (skip with a comment linking the issue), never paper over it with
 retries.
+
+`use.reducedMotion: 'reduce'` is declared in `playwright.config.ts` but
+does NOT reach the browser: probe it and
+`matchMedia('(prefers-reduced-motion: reduce)')` is false in a spec, and
+true in a context this repo's own scripts build by hand. Treat entrance
+animations as live: a spec that measures a box right after the control
+that reveals it must wait for that element's own animations to finish
+(`responsive-layout.spec.ts` does, for the nav overlay), or emulate the
+media itself the way `batch1-controls.spec.ts` does.
+
+`globalTimeout` is 720s, the same budget CI passes on the command line.
+A run that exceeds it stops and reports the remainder as "did not run",
+which is not a failure and is easy to read as a pass.
+
+## Visual evidence
+
+`scripts/visual-evidence.mjs` is evidence tooling, not a test, and
+nothing in CI runs it. It drives the built SPA against this harness and
+writes 18 scenes x light/dark x 1440/390 to
+`visual-evidence/<stamp>/`, with a `manifest.json` naming the commit and
+the SHA-256 of the `dist/` it photographed, and a `contact-sheet.html`
+pairing each capture with its mockup.
+
+```sh
+(cd crates/trawl-web-ui && env -u NO_COLOR trunk build)
+env -u NO_COLOR node crates/trawl-web-ui/e2e/scripts/visual-evidence.mjs
+```
+
+Theme and the reading modes are seeded into `localStorage['trawl.ui']`
+with `addInitScript`, because that is where fleet-ui reads them from;
+`colorScheme` alone changes nothing. The shutter waits for every finite
+animation to finish first — the Haul button transitions out of its
+in-flight fill over 120ms, and a frame taken inside that window shows
+near-white on near-white.
 
 ## Mutation-check: proving the suite actually catches regressions
 

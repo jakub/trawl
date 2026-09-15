@@ -373,7 +373,7 @@ async function experiment() {
   try {
     await page.goto(`${browserOrigin}/login`);
     await page.getByLabel('API key', { exact: true }).fill(reader);
-    await page.getByRole('button', { name: 'Sign In', exact: true }).click();
+    await page.getByRole('button', { name: 'Sign in', exact: true }).click();
     await page.waitForURL('**/search');
     // Start tracing only after login; a login trace would retain the API key.
     await context.tracing.start({ screenshots: true, snapshots: true });

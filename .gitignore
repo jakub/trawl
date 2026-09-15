@@ -38,6 +38,12 @@ data/
 # trawl-web-ui trunk build output
 crates/trawl-web-ui/dist/
 
+# the web-ui e2e suite's scratch output: playwright traces and failure
+# screenshots, plus the harness's private dist snapshot. It lives here and
+# not under crates/ because a running `trunk serve` watches that tree
+# (see crates/trawl-web-ui/e2e/playwright.config.ts).
+/e2e-artifacts/
+
 # bin/dev's rewritten trunk config (host/port overrides); removed on exit
 crates/trawl-web-ui/.Trunk.dev.toml
 

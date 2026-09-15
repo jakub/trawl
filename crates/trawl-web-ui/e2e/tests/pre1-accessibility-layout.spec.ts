@@ -59,10 +59,19 @@ for (const theme of ['light', 'dark']) {
           for (let n: Element | null = el; n; n = n.parentElement) ancestors.unshift(n);
           let bg = [255, 255, 255, 1];
           for (const n of ancestors) bg = over(rgba(getComputedStyle(n).backgroundColor), bg);
-          // Facet bars are a painted sibling behind the count. Measure that
-          // tinted surface too, including when a shorter bar stops before it.
+          // The facet meter is a painted sibling. It only counts as a
+          // surface behind the digits when its box actually meets the
+          // count's box (ADR-0032 draws it as a 2px rule along the row's
+          // bottom edge), and it paints at its own opacity.
           const bar = el.closest('.v')?.querySelector('.bar');
-          const backgrounds = bar ? [bg, over(rgba(getComputedStyle(bar).backgroundColor), bg)] : [bg];
+          const meets = (a: DOMRect, b: DOMRect) => a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
+          const barSurface = () => {
+            const style = getComputedStyle(bar!);
+            const color = rgba(style.backgroundColor);
+            color[3] *= parseFloat(style.opacity);
+            return over(color, bg);
+          };
+          const backgrounds = bar && meets(el.getBoundingClientRect(), bar.getBoundingClientRect()) ? [bg, barSurface()] : [bg];
           const color = rgba(getComputedStyle(el).color);
           return Math.min(...backgrounds.map(bg => {
             const l1 = luminance(over(color, bg)), l2 = luminance(bg);

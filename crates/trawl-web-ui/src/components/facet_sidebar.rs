@@ -50,6 +50,11 @@ pub fn FacetSidebar(
     /// rename can change one field while leaving other facets usable.
     #[prop(into)]
     capabilities: Signal<Capabilities>,
+    /// True while the stream is the active result source. The rail is
+    /// page-local either way, so the header names which page: the
+    /// snapshot on screen, or the live ring the stream is filling.
+    #[prop(into)]
+    live: Signal<bool>,
     /// Called when the user clicks `+` or `⊘` on a facet value.
     on_add: Callback<Filter>,
     /// Called when the user clicks "clear all" in the header.
@@ -65,7 +70,10 @@ pub fn FacetSidebar(
 
     // Keep one facet tree mounted across both layouts. Filters themselves
     // remain URL-owned; this disclosure only controls their presentation.
-    let compact = use_media_query("(max-width: 900px)");
+    // 899.98px is the codebase's one spelling of "narrow" (`Shell` and
+    // both stylesheets query it), so the disclosure and the layout it
+    // presents can never disagree by a pixel.
+    let compact = use_media_query("(max-width: 899.98px)");
     let open = RwSignal::new(false);
     let panel = NodeRef::<leptos::html::Details>::new();
     Effect::new(move |_| {
@@ -99,7 +107,12 @@ pub fn FacetSidebar(
         </summary>
         <aside class="facets" aria-label="Search filters">
             <div class="phead">
-                <div class="ttl">"Filters"</div>
+                <div class="ttl">
+                    "Filters"
+                    <span class="ttl-scope">
+                        {move || if live.get() { "in the live ring" } else { "on this page" }}
+                    </span>
+                </div>
                 <Show when=move || !filters.get().is_empty() && !suppressed.get()>
                     <button
                         type="button"

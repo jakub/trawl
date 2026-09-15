@@ -2,13 +2,18 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `<EditorWrap/>` — the DSL editor with the date-range picker, Run
-//! button, and query tools stacked in a column on its right.
+//! `<EditorWrap/>` — the query console's header, the DSL editor, and
+//! the date-range picker, Haul button and query tools stacked in a
+//! column on its right.
 //!
-//! The stack order is date range, Run, then the Save / Share / Format
-//! tool row. There is no header band: the editor frame is its own label,
-//! so the query box gets the full width. Run mirrors ⌘⏎ in the editor —
-//! both call the parent's submit callback.
+//! The console header says what the box is ("Query") and whether the
+//! buffer has been edited since the link ran. That draft state is
+//! derived, never stored: it compares the editor buffer against the
+//! executed query in the URL and navigates nothing (ADR-0027).
+//!
+//! The stack order is date range, Haul, then the Save as net / Copy
+//! search URL / Format tool row. Haul mirrors ⌘⏎ in the editor — both
+//! call the parent's submit callback.
 
 use leptos::prelude::*;
 use leptos::web_sys;
@@ -59,6 +64,11 @@ pub fn EditorWrap(
     /// navigation.
     #[prop(into)]
     blocked: Signal<bool>,
+    /// True while the editor buffer differs from the query the current
+    /// link executed. Read-only here: the header states it, and only
+    /// Haul resolves it.
+    #[prop(into)]
+    draft_dirty: Signal<bool>,
     /// Bubbles "save" click to the parent so it can open the save modal.
     on_save: Callback<()>,
     /// Fired by the date-range popover's Real-time tab — the parent
@@ -100,6 +110,14 @@ pub fn EditorWrap(
     };
 
     view! {
+        // Header and editor are siblings inside the console frame, so the
+        // frame's own padding is not paid twice down the left edge.
+        <div class="console-hd">
+            <span class="console-lb">"Query"</span>
+            <Show when=move || draft_dirty.get()>
+                <span class="draft dirty">"Edited"</span>
+            </Show>
+        </div>
         <div class="editor-wrap" id="search-query" tabindex="-1">
             <div class="editor-row">
                 <DslEditor query=query on_submit=on_submit format_trigger=format_trigger/>
@@ -143,12 +161,12 @@ pub fn EditorWrap(
                             class="tool"
                             disabled=move || blocked.get()
                             on:click=move |_| on_save.run(())
-                        >"Save"</button>
+                        >"Save as net"</button>
                         <CopyButton
                             class="tool"
                             text=share_text
                             success_detail="Search URL copied to clipboard."
-                        >"Share"</CopyButton>
+                        >"Copy search URL"</CopyButton>
                         // Format acts on click, so a native button makes
                         // it keyboard accessible, ADR-0028.
                         <button

@@ -7,17 +7,20 @@
 //!
 //! Each of these is load-bearing and non-obvious:
 //!
-//!   * `.rail .it` and `.topbar .mode` render as `<a>`. Anchors default
-//!     to `text-decoration: underline`; the explicit `none` is the sole
-//!     thing keeping rail items and mode tabs from sprouting underlines.
-//!     Drop it and every nav element silently regresses — invisible to
-//!     the DOM-class contract tests.
+//!   * `.rail .it` renders as `<a>` (and, for the collapse control, as
+//!     `<button>`). Anchors default to `text-decoration: underline`; the
+//!     explicit `none` is the sole thing keeping sidebar items from
+//!     sprouting underlines. Drop it and every nav element silently
+//!     regresses — invisible to the DOM-class contract tests.
 //!   * `.login-card .error-banner` re-establishes the login form's 16px
 //!     error spacing via a *more specific* selector over the base
 //!     `.error-banner`. Lose the override and login spacing shifts.
-//!   * `.shell` grid rows are `auto minmax(0, 1fr) auto` — the `auto`
-//!     row lets a footer-less app collapse the footer to zero while
-//!     trawl's statusbar sizes itself.
+//!   * `.shell` grid rows are `minmax(0, 1fr) auto` — the `auto` row
+//!     lets a footer-less app collapse the footer to zero while trawl's
+//!     statusbar sizes itself — and `.shell-content` carries the command
+//!     bar over the page. `.main` keeps `display: flex` and
+//!     `overflow: hidden`, which coastwatch's `.page` scrolling depends
+//!     on (ADR-0032).
 //!   * The six chrome keyframes ship from fleet-ui.css.
 //!   * `.login-shell` declares no background (ADR-0012): an opaque
 //!     normal-flow block paints above the `z-index: -1` `.atmosphere`
@@ -101,16 +104,7 @@ fn moved_chrome_is_byte_identical_to_premigration() {
 fn rail_items_suppress_anchor_underline() {
     assert!(
         rule_body(".rail .it").contains("text-decoration: none"),
-        "`.rail .it` must keep `text-decoration: none` — rail items are \
-         anchors and would otherwise render underlined (AC3 regression)"
-    );
-}
-
-#[test]
-fn mode_tabs_suppress_anchor_underline() {
-    assert!(
-        rule_body(".topbar .mode").contains("text-decoration: none"),
-        "`.topbar .mode` must keep `text-decoration: none` — mode tabs are \
+        "`.rail .it` must keep `text-decoration: none` — sidebar items are \
          anchors and would otherwise render underlined (AC3 regression)"
     );
 }
@@ -145,9 +139,22 @@ fn login_shell_declares_no_background() {
 #[test]
 fn shell_grid_has_auto_footer_row() {
     assert!(
-        rule_body(".shell").contains("grid-template-rows: auto minmax(0, 1fr) auto"),
-        "`.shell` grid rows must be `auto minmax(0, 1fr) auto` — the `auto` \
+        rule_body(".shell").contains("grid-template-rows: minmax(0, 1fr) auto"),
+        "`.shell` grid rows must be `minmax(0, 1fr) auto` — the `auto` \
          footer row collapses to zero footer-less and sizes trawl's statusbar"
+    );
+    assert!(
+        rule_body(".shell-content").contains("grid-template-rows: auto minmax(0, 1fr)"),
+        "`.shell-content` must stack the command bar over a page row that \
+         can shrink — an `auto` page row lets long content push the \
+         footer off-screen"
+    );
+    let main = rule_body(".main");
+    assert!(
+        main.contains("display: flex") && main.contains("overflow: hidden"),
+        "`.main` must keep `display: flex` and `overflow: hidden` — \
+         coastwatch's `.page` exists precisely to scroll inside them \
+         (ADR-0032 records the delta)"
     );
 }
 
@@ -162,9 +169,9 @@ fn btn_size_classes_shipped_with_crate() {
         ".btn-sm padding moved verbatim"
     );
     assert!(
-        sm.contains("background: transparent"),
-        ".btn-sm is the Mira outline treatment (ADR-0007): transparent \
-         fill, 1px line border — still self-contained, not a modifier"
+        sm.contains("background: var(--fill)"),
+        "the Mira outline treatment is now the --fill plane with an edge \
+         highlight (ADR-0032) — still self-contained, not a modifier"
     );
     assert!(
         rule_body(".btn-sm:disabled").contains("opacity: 0.4"),
@@ -332,8 +339,9 @@ fn drawer_shell_classes_shipped_with_crate() {
         ".sd-drawer moved verbatim"
     );
     assert!(
-        rule_body(".sd-hd").contains("background: var(--panel-2)"),
-        ".sd-hd moved verbatim"
+        rule_body(".sd-hd").contains("background: var(--panel)"),
+        ".sd-hd is the drawer's sheet header (ADR-0032): --panel with an \
+         edge highlight over the floor-toned body, not the support tone"
     );
     assert!(
         rule_body(".sd-x").contains("width: 28px"),
@@ -465,23 +473,49 @@ fn mira_blue_tokens_declared() {
         2,
         "--on-accent must be declared exactly once per theme block"
     );
-    // Focus is the 2px solid ring in both themes.
+    // Focus is the 2px --ring outline in both themes (ADR-0032 retired
+    // --shadow-glow: every focusable element now carries the outline, so
+    // a glow consumer would be a second focus idiom).
     assert_eq!(
-        CSS.matches("--shadow-glow: 0 0 0 2px var(--ring)").count(),
+        CSS.matches("\n  --ring:").count(),
         2,
-        "--shadow-glow must be the 2px var(--ring) ring in both theme blocks"
+        "--ring must be declared exactly once per theme block"
     );
+    // Accent-coloured TEXT reads --accent-ink: the dark brand blue
+    // measures 4.40:1 on --panel-3, the raised segmented option's floor.
+    assert_eq!(
+        CSS.matches("\n  --accent-ink:").count(),
+        2,
+        "--accent-ink must be declared exactly once per theme block"
+    );
+    // The plane and elevation ramp: a well inset, three raised steps and
+    // the 1px edge highlight, one declaration per theme block at the
+    // two-space indent the token blocks use.
+    for token in [
+        "\n  --well:",
+        "\n  --inset:",
+        "\n  --elev-1:",
+        "\n  --elev-2:",
+        "\n  --elev-3:",
+        "\n  --edge-hi:",
+    ] {
+        assert_eq!(
+            CSS.matches(token).count(),
+            2,
+            "`{}` must be declared exactly once per theme block (ADR-0032)",
+            token.trim()
+        );
+    }
     // Light --ink-4 is contrast-bound: it paints TEXT (the --fs-micro
-    // DEBUG level pill, the DSL editor gutter numbers, .editor-hd .dim,
-    // .divider), so it holds the pre-Mira tone's luminance rather than the
-    // skin's oklch(70.8%), which measures 2.59:1 on --panel and 2.48:1 on
-    // the editor's --fill wash. Re-measure the composited pixels before
+    // DEBUG level pill and the DSL editor gutter numbers), so it
+    // clears AA on every surface that reads it rather than sitting at the
+    // 3:1 non-text floor. Re-measure the composited pixels before
     // lightening it.
     assert!(
-        CSS.contains("--ink-4:     oklch(62% 0 0)"),
-        "the light `--ink-4` is toned for the 3:1 floor as a text colour \
-         (3.64:1 on --panel, 3.48:1 on the editor fill) — a lighter step \
-         drops the DEBUG pill and the gutter rule below it"
+        CSS.contains("--ink-4:     oklch(53% .024 253)"),
+        "5.27:1 on --panel, 4.82:1 on --panel-2, 4.68:1 on --well, \
+         4.60:1 on --bg — a lighter step drops the DEBUG pill and the \
+         gutter rule below AA"
     );
 }
 
@@ -547,31 +581,85 @@ fn chrome_keyframes_present() {
 fn the_focus_ring_reaches_anchors() {
     // ADR-0029 makes the one stretched control on a navigating row an
     // `<a href>`, and an anchor outside this group keeps the browser's
-    // own blue outline instead of the accent glow every other control
-    // gets. Pinning the whole selector list also pins its shape: the
-    // anchors have to ride the same rule body, not a copy beside it.
+    // own blue outline instead of the ring every other control gets.
+    // Pinning the whole selector list also pins its shape: the anchors
+    // have to ride the same rule body, not a copy beside it.
     let group = rule_body(
-        "button:focus-visible,\na[href]:focus-visible,\ninput:focus-visible,\ntextarea:focus-visible,\n[tabindex]:focus-visible",
+        "button:focus-visible,\na[href]:focus-visible,\ninput:focus-visible,\ntextarea:focus-visible,\nselect:focus-visible,\n[tabindex]:focus-visible",
     );
     assert!(
-        group.contains("outline: none") && group.contains("box-shadow: var(--shadow-glow)"),
-        "the focus-visible group must trade the UA outline for the accent \
-         glow, got:{group}"
+        group.contains("outline: 2px solid var(--ring)") && group.contains("outline-offset: 2px"),
+        "the focus-visible group must carry the 2px --ring outline at a \
+         2px offset (ADR-0032: an outline never competes with the \
+         elevation box-shadow a plane already paints), got:{group}"
     );
-    // A second `:focus-visible` rule carrying the glow would mean the
-    // anchors were bolted on beside the others, and the two bodies could
-    // drift apart.
-    let glow_groups: Vec<String> = rules(CSS)
+    // The ring is an outline now, so a `:focus-visible` rule that painted
+    // it as a box-shadow would be a second focus idiom — and --shadow-glow
+    // no longer exists to paint it with.
+    let glow_groups: Vec<String> = leaf_rules(CSS)
         .into_iter()
         .filter(|r| {
             let (selector, body) = r.split_once('{').unwrap_or((r.as_str(), ""));
             selector.contains(":focus-visible") && body.contains("box-shadow: var(--shadow-glow)")
         })
         .collect();
-    assert_eq!(
-        glow_groups.len(),
-        1,
-        "exactly one `:focus-visible` rule may carry the accent glow, \
+    assert!(
+        glow_groups.is_empty(),
+        "the accent glow is retired: focus is the --ring outline, \
          found: {glow_groups:#?}"
+    );
+    // And a rule that resets `outline: none` on a focused control erases
+    // the ring outright — `.actions-menu .item:focus-visible`
+    // (fleet-ui.css:1390) did exactly that before ADR-0032.
+    let suppressed: Vec<String> = leaf_rules(CSS)
+        .into_iter()
+        .filter(|r| {
+            let (selector, body) = r.split_once('{').unwrap_or((r.as_str(), ""));
+            selector.contains(":focus-visible") && body.contains("outline: none")
+        })
+        .collect();
+    assert!(
+        suppressed.is_empty(),
+        "no `:focus-visible` rule may reset the outline — that erases the \
+         ring instead of restyling it, found: {suppressed:#?}"
+    );
+}
+
+/// Every style rule in `css` as its own entry, descending into `@media`,
+/// `@supports` and any other block at-rule. [`rules`] hands a whole
+/// `@media` block back as one rule whose "selector" is the at-rule, which
+/// is exactly where a responsive `:focus-visible { outline: none }` would
+/// hide from a scan that only reads the top level.
+fn leaf_rules(css: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for rule in rules(css) {
+        let (head, _) = rule.split_once('{').unwrap_or((rule.as_str(), ""));
+        if head.trim_start().starts_with('@')
+            && let Some(open) = rule.find('{')
+            && let Some(close) = rule.rfind('}')
+            && open < close
+        {
+            let inner = &rule[open + 1..close];
+            if inner.contains('{') {
+                out.extend(leaf_rules(inner));
+                continue;
+            }
+        }
+        out.push(rule);
+    }
+    out
+}
+
+#[test]
+fn leaf_rules_descend_into_media_blocks() {
+    let css = "a:focus-visible { outline: 2px solid red; }\n\
+               @media (max-width: 600px) {\n  b:focus-visible { outline: none; }\n}\n";
+    let leaves = leaf_rules(css);
+    assert_eq!(leaves.len(), 2, "{leaves:#?}");
+    assert!(
+        leaves
+            .iter()
+            .any(|r| r.contains("b:focus-visible") && !r.contains("@media")),
+        "the nested rule surfaces as its own leaf: {leaves:#?}"
     );
 }

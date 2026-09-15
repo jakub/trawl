@@ -3,8 +3,9 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Route inventory, filtering, selection and keyboard rules for ADR-0031.
-//! Browser components project their mode tabs and rail items into borrowed
-//! inputs. These rules need no DOM or consumer routing state.
+//! Browser components project their sidebar groups into borrowed inputs,
+//! so the palette's grouping is the sidebar's grouping (ADR-0032). These
+//! rules need no DOM or consumer routing state.
 
 use std::collections::HashSet;
 
@@ -14,18 +15,16 @@ pub(crate) struct CommandInput<'a> {
     pub path: &'a str,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CommandGroup {
-    Modes,
-    Sections,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Command {
     pub label: String,
     pub path: String,
-    pub group: CommandGroup,
-    /// Position in the original mode-then-rail inventory, before deduplication.
+    /// The sidebar group's heading, absent for an unlabelled group.
+    pub group: Option<String>,
+    /// Position of the owning group in the inventory, so consecutive
+    /// commands can be regrouped without comparing labels.
+    pub group_ordinal: usize,
+    /// Position in the original flattened inventory, before deduplication.
     pub ordinal: usize,
 }
 
@@ -39,29 +38,51 @@ impl Command {
     }
 }
 
-/// Preserve source order and labels. A mode wins over any rail entry with
-/// the same exact path; equal labels at different paths remain separate.
-pub(crate) fn commands_from<'a>(
-    modes: impl IntoIterator<Item = CommandInput<'a>>,
-    rail: impl IntoIterator<Item = CommandInput<'a>>,
-) -> Vec<Command> {
+/// Flatten the groups in source order, keeping their labels. The first
+/// command at a path wins; equal labels at different paths remain
+/// separate.
+pub(crate) fn commands_from<'a, G, I>(groups: G) -> Vec<Command>
+where
+    G: IntoIterator<Item = (Option<&'a str>, I)>,
+    I: IntoIterator<Item = CommandInput<'a>>,
+{
     let mut paths = HashSet::new();
-    modes
+    groups
         .into_iter()
-        .map(|input| (input, CommandGroup::Modes))
-        .chain(
-            rail.into_iter()
-                .map(|input| (input, CommandGroup::Sections)),
-        )
         .enumerate()
-        .filter(|(_, (input, _))| paths.insert(input.path))
-        .map(|(ordinal, (input, group))| Command {
+        .flat_map(|(group_ordinal, (label, items))| {
+            items
+                .into_iter()
+                .map(move |input| (group_ordinal, label, input))
+        })
+        .enumerate()
+        .filter(|(_, (_, _, input))| paths.insert(input.path))
+        .map(|(ordinal, (group_ordinal, label, input))| Command {
             label: input.label.to_owned(),
             path: input.path.to_owned(),
-            group,
+            group: label.map(str::to_owned),
+            group_ordinal,
             ordinal,
         })
         .collect()
+}
+
+/// The consecutive runs one group each, as `(label, indices into
+/// `commands`)`. Filtering drops commands but never reorders them, so a
+/// run is a stretch of equal `group_ordinal`.
+pub(crate) fn group_runs(commands: &[Command]) -> Vec<(Option<&str>, Vec<usize>)> {
+    let mut runs: Vec<(Option<&str>, Vec<usize>)> = Vec::new();
+    let mut open: Option<usize> = None;
+    for (index, command) in commands.iter().enumerate() {
+        if open != Some(command.group_ordinal) {
+            runs.push((command.group.as_deref(), Vec::new()));
+            open = Some(command.group_ordinal);
+        }
+        if let Some(run) = runs.last_mut() {
+            run.1.push(index);
+        }
+    }
+    runs
 }
 
 /// Empty inventories omit the trigger and disable the global chord.
@@ -184,49 +205,66 @@ mod tests {
     }
 
     fn inventory() -> Vec<Command> {
-        commands_from(
-            [input("Search", "/search"), input("Settings", "/settings")],
-            [
-                input("Schema", "/search/schema"),
-                input("Schema", "/settings/schema"),
-            ],
-        )
+        commands_from([
+            (
+                None,
+                vec![input("Search", "/search"), input("Settings", "/settings")],
+            ),
+            (
+                Some("Sections"),
+                vec![
+                    input("Schema", "/search/schema"),
+                    input("Schema", "/settings/schema"),
+                ],
+            ),
+        ])
     }
 
     #[test]
     fn commands_from_deduplicates_exact_paths_first_wins() {
-        let commands = commands_from(
-            [
-                input("Search", "/search"),
-                input("Duplicate mode", "/search"),
-            ],
-            [
-                input("Rail search", "/search"),
-                input("Schema", "/search/schema"),
-                input("Schema", "/settings"),
-                input("Health", "/settings"),
-                input("Case matters", "/Settings"),
-                input("Slash matters", "/settings/"),
-            ],
-        );
+        let commands = commands_from([
+            (
+                None,
+                vec![
+                    input("Search", "/search"),
+                    input("Duplicate mode", "/search"),
+                ],
+            ),
+            (
+                Some("Sections"),
+                vec![
+                    input("Rail search", "/search"),
+                    input("Schema", "/search/schema"),
+                    input("Schema", "/settings"),
+                    input("Health", "/settings"),
+                    input("Case matters", "/Settings"),
+                    input("Slash matters", "/settings/"),
+                ],
+            ),
+        ]);
         assert_eq!(
             commands
                 .iter()
-                .map(|c| (c.label.as_str(), c.path.as_str(), c.group, c.ordinal))
+                .map(|c| (
+                    c.label.as_str(),
+                    c.path.as_str(),
+                    c.group.as_deref(),
+                    c.ordinal
+                ))
                 .collect::<Vec<_>>(),
             vec![
-                ("Search", "/search", CommandGroup::Modes, 0),
-                ("Schema", "/search/schema", CommandGroup::Sections, 3),
-                ("Schema", "/settings", CommandGroup::Sections, 4),
-                ("Case matters", "/Settings", CommandGroup::Sections, 6),
-                ("Slash matters", "/settings/", CommandGroup::Sections, 7),
+                ("Search", "/search", None, 0),
+                ("Schema", "/search/schema", Some("Sections"), 3),
+                ("Schema", "/settings", Some("Sections"), 4),
+                ("Case matters", "/Settings", Some("Sections"), 6),
+                ("Slash matters", "/settings/", Some("Sections"), 7),
             ]
         );
     }
 
     #[test]
     fn filter_requires_every_token_across_label_or_path() {
-        let commands = commands_from([], [input("Schema browser", "/settings/catalog")]);
+        let commands = commands_from([(None, [input("Schema browser", "/settings/catalog")])]);
         for filter in [
             "",
             " \t\n ",
@@ -282,18 +320,38 @@ mod tests {
     }
 
     #[test]
+    fn unlabelled_group_renders_no_header() {
+        // The unlabelled run keeps its options directly under the
+        // listbox; only a labelled run earns a role="group" wrapper.
+        assert_eq!(
+            group_runs(&inventory()),
+            vec![(None, vec![0, 1]), (Some("Sections"), vec![2, 3])]
+        );
+        // Runs follow source order in both directions: an unlabelled
+        // group after a labelled one stays after it.
+        let mixed = commands_from([
+            (Some("Sections"), vec![input("Schema", "/search/schema")]),
+            (None, vec![input("Search", "/search")]),
+        ]);
+        assert_eq!(
+            group_runs(&mixed),
+            vec![(Some("Sections"), vec![0]), (None, vec![1])]
+        );
+    }
+
+    #[test]
     fn empty_inventory_has_no_trigger_chord_or_selection() {
-        let commands = commands_from([], []);
+        let commands = commands_from::<Vec<(Option<&str>, Vec<CommandInput<'_>>)>, _>(vec![]);
         assert!(!palette_available(&commands));
         let mut state = PaletteState::new(&commands);
         state.set_filter(&commands, "search");
         assert!(state.visible.is_empty());
         assert_eq!(state.selected, None);
         assert!(palette_available(&inventory()));
-        assert!(palette_available(&commands_from(
-            [],
+        assert!(palette_available(&commands_from([(
+            None,
             [input("Rail", "/rail")]
-        )));
+        )])));
     }
 
     #[test]
@@ -480,7 +538,7 @@ mod component {
     use leptos_use::{use_event_listener, use_window};
     use wasm_bindgen::JsCast;
 
-    use super::{Command, CommandGroup, PaletteState, text_input_is_editable};
+    use super::{Command, PaletteState, group_runs, text_input_is_editable};
     use crate::icon::{Icon, IconView};
     use crate::overlay::{FocusPolicy, OverlayLayer, use_overlay_layer_with};
     use crate::roving::{Nav, next_index};
@@ -711,54 +769,77 @@ mod component {
         pathname: Memo<String>,
         on_close: Callback<()>,
     ) -> impl IntoView + use<> {
-        [CommandGroup::Modes, CommandGroup::Sections].into_iter().map(|group| {
-            let entries: Vec<_> = commands.iter().enumerate()
-                .filter(|(_, command)| command.group == group)
-                .map(|(index, command)| (index, command.clone()))
-                .collect();
-            let label = match group {
-                CommandGroup::Modes => "Modes",
-                CommandGroup::Sections => "Sections",
-            };
-            (!entries.is_empty()).then(|| view! {
-                <div class="command-palette-group" role="group" aria-label=label>
-                    <div class="command-palette-group-label" aria-hidden="true">{label}</div>
-                    {entries.into_iter().map(|(index, command)| {
-                        let id = command.option_id();
-                        let href = command.path.clone();
-                        let path = command.path.clone();
-                        let label = command.label.clone();
+        group_runs(commands)
+            .into_iter()
+            .map(|(label, indices)| {
+                let options: Vec<_> = indices
+                    .into_iter()
+                    .map(|index| {
+                        render_option(&commands[index], index, selected, pathname, on_close)
+                    })
+                    .collect();
+                // An unlabelled run has no heading and no wrapper: a
+                // role="group" with no accessible name is a defect, and
+                // the options belong to the listbox either way.
+                match label {
+                    Some(label) => {
+                        let heading = label.to_owned();
                         view! {
-                            <A
-                                href=href
-                                exact=true
-                                attr:id=id
-                                attr:class="command-palette-option"
-                                attr:role="option"
-                                attr:tabindex="-1"
-                                attr:aria-selected=move || (selected.get() == Some(index)).to_string()
-                                on:mousedown=move |event: web_sys::MouseEvent| {
-                                    // Every pointer press keeps focus on the combobox.
-                                    // Click and auxclick retain native new-tab behavior.
-                                    event.prevent_default();
-                                }
-                                on:click=move |event: web_sys::MouseEvent| {
-                                    if ordinary_click(&event) && !event.default_prevented() {
-                                        on_close.run(());
-                                    }
-                                }
-                            >
-                                <span class="command-palette-label">{label}</span>
-                                <span class="command-palette-path">{path}</span>
-                                {move || command.is_current(&pathname.get()).then(|| view! {
-                                    <span class="command-palette-current">"current"</span>
-                                })}
-                            </A>
+                            <div class="command-palette-group" role="group" aria-label=label.to_owned()>
+                                <div class="command-palette-group-label" aria-hidden="true">
+                                    {heading}
+                                </div>
+                                {options}
+                            </div>
                         }
-                    }).collect::<Vec<_>>()}
-                </div>
+                        .into_any()
+                    }
+                    None => options.into_any(),
+                }
             })
-        }).collect::<Vec<_>>()
+            .collect::<Vec<_>>()
+    }
+
+    fn render_option(
+        command: &Command,
+        index: usize,
+        selected: Signal<Option<usize>>,
+        pathname: Memo<String>,
+        on_close: Callback<()>,
+    ) -> AnyView {
+        let command = command.clone();
+        let id = command.option_id();
+        let href = command.path.clone();
+        let path = command.path.clone();
+        let label = command.label.clone();
+        view! {
+            <A
+                href=href
+                exact=true
+                attr:id=id
+                attr:class="command-palette-option"
+                attr:role="option"
+                attr:tabindex="-1"
+                attr:aria-selected=move || (selected.get() == Some(index)).to_string()
+                on:mousedown=move |event: web_sys::MouseEvent| {
+                    // Every pointer press keeps focus on the combobox.
+                    // Click and auxclick retain native new-tab behavior.
+                    event.prevent_default();
+                }
+                on:click=move |event: web_sys::MouseEvent| {
+                    if ordinary_click(&event) && !event.default_prevented() {
+                        on_close.run(());
+                    }
+                }
+            >
+                <span class="command-palette-label">{label}</span>
+                <span class="command-palette-path">{path}</span>
+                {move || command.is_current(&pathname.get()).then(|| view! {
+                    <span class="command-palette-current">"current"</span>
+                })}
+            </A>
+        }
+        .into_any()
     }
 
     fn ordinary_click(event: &web_sys::MouseEvent) -> bool {

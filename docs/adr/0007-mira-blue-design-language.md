@@ -12,6 +12,56 @@ Status: accepted (2026-07-27)
 > and its CSP allowances are deleted; source, SHA-256 checksums and OFL-1.1
 > attribution live with the assets in `crates/fleet-ui/fonts/`.
 
+> **amendment (2026-09-14, `t3code/refine-ui-query-console`):** the typefaces
+> become **Albert Sans** (Andreas Rasmussen, geometric Scandinavian-modernist
+> sans) for UI text and **Chivo Mono** (Omnibus-Type / Héctor Gatti,
+> grotesque monospace) for data, replacing Geist and Geist Mono. The human
+> chose the pair after a font-lab comparison of the redesigned chrome.
+> Rationale: the redesign wants warmer chrome over sober data, and Albert
+> Sans carries more warmth at label sizes than Geist's neutral grotesque
+> while Chivo Mono stays plainer than Geist Mono in a dense table. The two
+> share a double-storey `a` and a single-storey `g`, so the pair reads as
+> one voice across a label and the value beside it.
+>
+> The `body` rule now declares `font-feature-settings: "zero"`. Chivo Mono's
+> default zero is an unslashed oval, and a log viewer has to keep `0` and `O`
+> apart; Albert Sans has no `zero` feature, so the declaration is inert for
+> UI text. The property inherits and is independent of the
+> `font-variant-numeric: tabular-nums` declarations, which are left alone.
+>
+> Figures differ between the two, and the CSS is unchanged on purpose.
+> Chivo Mono's GSUB carries `tnum` and `zero`, so every mono column — the
+> `_time` cells, facet values, receipts — keeps tabular figures and now
+> slashes its zero. Albert Sans carries neither: its digits are proportional
+> (a `1` is roughly half the advance of an `8`), so the `tabular-nums`
+> declarations on UI-font numbers — facet counts, tab counts, health values —
+> no longer do anything, and multi-digit numbers stack ragged rather than
+> aligned. Those counts are right-aligned in a reserved box, so the column
+> edge still lines up. If ragged figures ever become a problem, the fix is to
+> put the affected number in `--font-mono`, not to synthesize tabular widths.
+>
+> Sourcing: both families publish through `google/fonts`, and neither
+> publishes a variable WOFF2 — Chivo ships static per-weight WOFF2 only and
+> Albert Sans ships no webfont. fleet-ui therefore commits the canonical
+> variable TrueType files verbatim (`AlbertSans[wght].ttf` at
+> `6b612533e5b14370fea6f524095f4d01cdfee18b`, `ChivoMono[wght].ttf` at
+> `5b62bc464227fcadef4d4acebd73153598d3e05e`), renamed bracket-free for URL
+> safety, with both OFL-1.1 texts and regenerated SHA-256 checksums. Never
+> re-cut, instance or convert them. The type rhythm is untouched: `--fs-*`
+> sizes, weights 400/500/600/700, sentence case and the letter-spacing tokens
+> all hold, and the advertised axis stays `400 700` over 100–900 files.
+>
+> coastwatch: contrary to the assumption that it copies
+> `../trawl/crates/fleet-ui/fonts`, its `crates/web-ui/index.html` declares
+> **no** `copy-dir` for the font directory — it links `fleet-ui.css` by path
+> and still preconnects Google Fonts for Open Sans / Fira Code, which no
+> fleet token names. A read-only grep of the coastwatch checkout found no
+> `Geist` literal anywhere outside `dist/`, and `coastwatch.css` overrides
+> neither `--font-ui` nor `--font-mono`. So its next `TRAWL_REV` bump picks
+> up the new families in the tokens and, as with Geist today, falls back to
+> `ui-sans-serif` / `ui-monospace` until that repo adds the `copy-dir` line.
+> That one-line addition is coastwatch's adoption task; do not edit it here.
+
 ## Context
 
 ADR-0005 established the design-workbench process and the slate/blue palette
@@ -41,17 +91,15 @@ Key points:
   lines as white-alpha overlays (10% / 6%) rather than solid greys. The ink
   ramp follows the skin except at light `--ink-4`, which is contrast-bound
   the way `--red` is: it is a TEXT colour (the `--fs-micro` DEBUG level pill,
-  the DSL editor's gutter numbers, `.editor-hd .dim`, `.divider`), and the
+  the DSL editor's gutter numbers, `.editor-hd .dim`), and the
   skin's `oklch(70.8%)` measures 2.59:1 on `--panel` and 2.48:1 on the
   editor's `--fill` wash — under even the 3:1 non-text floor, and a
   regression on ADR-0005's `#82868e` (3.56:1). Light `--ink-4` therefore
-  holds that tone's luminance as a neutral, `oklch(62%)` (3.64:1 / 3.48:1,
-  and >=3.01:1 on every other light surface). Dark `--ink-4` is bound the
-  same way: the skin's step (`oklch(50%)`) measures 3.12:1 on `--panel`,
-  but the gutter digits actually sit on the `--fill`-composited editor
-  surface, where it drops to 2.72:1 — under the floor. Dark `--ink-4`
-  therefore holds `oklch(56%)` (3.51:1 on the composited fill, higher on
-  every plain panel).
+  uses `oklch(53% .024 253)`: 5.27:1 on `--panel`, 4.82:1 on `--panel-2`,
+  4.68:1 on `--well`, and 4.60:1 on `--bg`. Its 4.35:1 on `--panel-3`
+  is below the normal-text AA floor, so text on that surface must not
+  use this token. Dark `--ink-4` uses `oklch(70.9% .027 250)`: 6.44:1 on
+  `--panel`, 6.88:1 on `--well`, and 4.89:1 on `--panel-3`.
 - **Accent**: fleet's blues stay — `#2a5c8a` light, `#5a9fd4` dark — with a
   new `--on-accent` token replacing hard-coded `#fff` button text. Dark mode
   keeps Mira's inversion: light-blue accent surfaces carry near-black
@@ -89,10 +137,11 @@ Key points:
   3.97:1 on the resting wash and 3.31:1 on the hover wash, under the 4.5:1
   AA floor, so light `--red` is deepened to `oklch(48% .177)` (6.03:1 /
   5.06:1). Dark `--red` sits on dark panels and keeps Mira's lighter tone.
-- **Fonts**: Geist / Geist Mono replace Open Sans / Fira Code. Since the #119
-  amendment, fleet-ui owns pinned self-hosted WOFF2 assets and consumers copy
-  that directory into their Trunk distributions; no runtime font request
-  leaves the application origin.
+- **Fonts**: Geist / Geist Mono replaced Open Sans / Fira Code, and the
+  2026-09-14 amendment replaces them in turn with Albert Sans / Chivo Mono.
+  Since the #119 amendment, fleet-ui owns pinned self-hosted assets and
+  consumers copy that directory into their Trunk distributions; no runtime
+  font request leaves the application origin.
 - **Native widgets**: `color-scheme` is declared per theme and
   `scrollbar-color` set, so Firefox scrollbars and form controls follow the
   theme.

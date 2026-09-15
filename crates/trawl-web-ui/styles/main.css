@@ -29,8 +29,25 @@
   flex: 1;
   min-width: 0;
   min-height: 0;
+  position: relative;
+  background: var(--bg);
 }
 
+/* The page's one h1 (A06). Compact on purpose: the console under it is
+ * the page, and a display heading would cost a row of results. */
+.search-heading {
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui);
+  font-weight: 600;
+  color: var(--ink-2);
+  margin: 0;
+  padding: 8px 12px 0;
+}
+
+/* The work surface is one sheet floating on the layout's floor
+ * (ADR-0032): panel fill, hairline, edge highlight and the first step
+ * of the elevation ramp. `overflow: hidden` keeps the results scroller
+ * inside the rounded corners. */
 .search-col {
   flex: 1;
   display: flex;
@@ -38,7 +55,12 @@
   gap: 0;
   min-width: 0;
   min-height: 0;
-  background: var(--bg);
+  margin: 8px 12px 8px 8px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-panel);
+  box-shadow: inset 0 1px 0 var(--edge-hi), var(--elev-1);
+  overflow: hidden;
 }
 
 /* ─────────────────────────────────────────────────────────────────
@@ -70,17 +92,22 @@
   font-size: var(--table-fs);
 }
 
+/* Header cells are the support plane: the flat --panel-2 strip, a
+ * 1px lip painted as a box-shadow so the sticky cell keeps the hairline
+ * without a border box that scrolls with the body (ADR-0032). */
 .results-table thead th {
   position: sticky;
   top: 0;
+  z-index: 2;
   background: var(--panel-2);
-  color: var(--ink-3);
+  color: var(--ink-2);
   font-family: var(--font-ui);
   font-size: var(--fs-ui);
   font-weight: 500;
   text-align: left;
   padding: 6px var(--row-pad-x);
-  border-bottom: 1px solid var(--line);
+  border-bottom: 0;
+  box-shadow: 0 1px 0 var(--line);
   white-space: nowrap;
 }
 
@@ -116,7 +143,7 @@
 .facets {
   width: var(--facets-w);
   flex-shrink: 0;
-  background: var(--panel);
+  background: var(--bg);
   border-right: 1px solid var(--line);
   overflow: auto;
   display: flex;
@@ -146,6 +173,11 @@
   font-weight: 600;
   color: var(--ink-2);
 }
+.facets .phead .ttl .ttl-scope {
+  margin-inline-start: 6px;
+  font-weight: 400;
+  color: var(--ink-3);
+}
 /* A <button> since ADR-0029, so the rule carries its own reset; there
  * is no bare `button` selector in this sheet (ADR-0028). */
 .facets .phead .clear {
@@ -167,7 +199,7 @@
 }
 
 .facets .g {
-  border-top: 1px solid var(--line-2);
+  border-top: 1px solid var(--line);
   padding: 8px 0 4px;
 }
 /* A <button> since ADR-0029: it keeps its flex row and takes the full
@@ -218,16 +250,24 @@
   gap: 8px;
   font-family: var(--font-mono);
   font-size: var(--fs-dense);
-  min-height: 22px;
+  min-height: 25px;
+  background: transparent;
   border-radius: var(--radius-sm);
 }
 .facets .v:hover { background: var(--panel-2); }
+/* Frequency meter: a 2px accent rule along the bottom edge of the row,
+ * width set inline from the value's share. A full-height wash competes
+ * with the selected row's own wash, so the count reads as a meter and
+ * the selection reads as a state (ADR-0032). */
 .facets .v .bar {
   position: absolute;
   left: 0;
-  top: 2px;
-  bottom: 2px;
-  background: var(--accent-wash);
+  top: auto;
+  bottom: 1px;
+  height: 2px;
+  background: var(--accent);
+  opacity: .30;
+  border-radius: var(--radius-xs);
   pointer-events: none;
 }
 .facets .v > * { position: relative; }
@@ -267,11 +307,12 @@
   padding-left: 6px;
   color: var(--ink-3);
   /* Out of flow, so it carries its own opaque floor and repeats what
-   * the row paints: bare panel at rest and on keyboard focus, the hover
-   * wash on hover, the selected wash over panel when included. Without
-   * it a long value would read through the glyphs; the cost is that the
-   * `.bar` frequency tail is hidden under these 48px while revealed. */
-  background: var(--panel);
+   * the row paints: the rail's floor tone at rest and on keyboard
+   * focus, the hover wash on hover, the selected wash over that floor
+   * when included. Without it a long value would read through the
+   * glyphs; the cost is that the `.bar` frequency meter is hidden under
+   * these 48px while revealed. */
+  background: var(--bg);
 }
 .facets .v:hover .act,
 .facets .v:focus-within .act { opacity: 1; }
@@ -279,7 +320,7 @@
 /* After the hover rule: `.v.selected` beats `.v:hover` for the row's own
  * background on a tie, and the action floor follows the row. */
 .facets .v.selected .act {
-  background-color: var(--panel);
+  background-color: var(--bg);
   background-image: linear-gradient(var(--accent-wash), var(--accent-wash));
 }
 /* `visibility`, not `display: none`: the count's box is what keeps the
@@ -297,8 +338,12 @@
   font-size: var(--fs-micro);
 }
 .facets .v .act .op:hover { background: var(--accent); color: var(--on-accent); }
-.facets .v.selected { background: var(--accent-wash); }
-.facets .v.selected .n { color: var(--accent); font-weight: 600; }
+/* Selection and exclusion are a 3px inset rule down the leading edge,
+ * so the state survives the hover wash and forced colors. */
+.facets .v.selected { background: var(--accent-wash); box-shadow: inset 3px 0 0 var(--accent); }
+.facets .v.selected .bar { opacity: .55; }
+.facets .v.selected .n { color: var(--accent-ink); font-weight: 600; }
+.facets .v.excluded { box-shadow: inset 3px 0 0 var(--red); }
 .facets .v.excluded .n { color: var(--red); text-decoration: line-through; }
 /* A <button> since ADR-0029: full width and left-aligned keeps the row
  * looking like the value rows above it. */
@@ -325,62 +370,105 @@
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: var(--radius-panel);
+  box-shadow: inset 0 1px 0 var(--edge-hi), var(--elev-1);
   padding: 8px;
   overflow: hidden;
 }
 
 /* ─────────────────────────────────────────────────────────────────
- *  Editor wrap (DslEditor + date range + run button + tools)
+ *  Query console (header + DslEditor + date range + Haul + tools,
+ *  closed by the executed-scope strip)
  * ─────────────────────────────────────────────────────────────── */
-.editor-wrap {
+
+/* The one lifted region on the sheet (ADR-0032): everything else on the
+ * page is flush, so the elevation reads as "this is where you type"
+ * rather than as decoration.
+ *
+ * No `overflow` clip here: RangeDialog renders `.dr-pop` absolutely
+ * inside `.daterange`, with no portal, so a clip cut the lower presets,
+ * the Absolute inputs and Apply off at the console's bottom edge. The
+ * closing strip carries the bottom radii instead. */
+.console {
+  margin: 8px 12px;
+  flex-shrink: 0;
   background: var(--panel);
-  border-bottom: 1px solid var(--line);
-  padding: 10px 12px 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-panel);
+  box-shadow: inset 0 1px 0 var(--edge-hi), var(--elev-2);
+}
+.console-hd { display: flex; align-items: center; gap: 10px; padding: 8px 12px 0; }
+.console-lb {
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui);
+  font-weight: 600;
+  color: var(--ink);
+}
+/* Draft state. Not a control and not a warning — a sentence about the
+ * buffer, which turns yellow only when the two have actually diverged. */
+.draft { font-family: var(--font-ui); font-size: var(--fs-dense); color: var(--ink-3); }
+.draft.dirty { color: var(--yellow); }
+
+.editor-wrap {
+  padding: 6px 12px 10px;
   flex-shrink: 0;
 }
-/* Save / Share / Format, third row of the right-hand column. The old
- * `.editor-hd` header band (❯ Query + these tools) is gone so the query
- * box spans the full width; the tools moved under the Run button. */
+/* Save as net / Copy search URL / Format, third row of the right-hand
+ * column. The old `.editor-hd` header band is gone; the console header
+ * above carries the label now and the tools sit under Haul. */
 .editor-tools {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 2px;
+  gap: 0;
   font-family: var(--font-ui);
   font-size: var(--fs-dense);
   color: var(--ink-3);
 }
 .editor-tools .tool {
   cursor: pointer;
+  min-height: 26px;
   padding: 2px 6px;
   border-radius: var(--radius-sm);
+  white-space: nowrap;
   display: flex;
   align-items: center;
   gap: 4px;
+  color: var(--ink-2);
 }
-.editor-tools .tool:hover { background: var(--panel-2); color: var(--ink-2); }
+.editor-tools .tool:hover { background: var(--fill-2); color: var(--ink); }
 
+/* Stretched: the editor well fills the row rather than leaving dead
+ * space beside the taller right-hand column, and in the narrow column
+ * layout it keeps the console's full width instead of shrinking to its
+ * content. */
 .editor-row { display: flex; gap: 10px; align-items: stretch; }
 
-/* Editor mount — grows to fill the row, pinned at 6 lines high. The
- * CodeMirror view defaults to auto-height which makes the frame swell
- * as the user types; we constrain `.cm-editor` to the mount height and
- * let the internal `.cm-scroller` scroll when the doc outgrows it. */
+/* Editor mount — a well that grows with its document from three lines
+ * to 40vh; past that the CodeMirror scroller scrolls. The view defaults
+ * to auto-height, so the clamp lives here: `max-height` on the mount and
+ * on `.cm-scroller`, never `height`, which would collapse the view
+ * against an auto-height parent. */
 .dsl-editor {
   flex: 1 1 auto;
   min-width: 0;
-  height: 140px;
-  background: var(--fill);
+  min-height: 66px;
+  max-height: 40vh;
+  display: flex;
+  background: var(--well);
+  box-shadow: var(--inset);
   border: 1px solid var(--line);
   border-radius: var(--radius-ctl);
   overflow: hidden;
 }
 .dsl-editor:focus-within {
-  border-color: var(--ring);
-  box-shadow: var(--shadow-glow);
+  border-color: var(--accent);
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
 }
 .dsl-editor .cm-editor {
-  height: 100%;
+  flex: 1;
+  min-width: 0;
+  max-height: 100%;
   background: transparent;
   font-family: var(--font-mono);
   font-size: var(--editor-fs);
@@ -389,8 +477,8 @@
 /* CM6's injected base theme puts `font-family: monospace` directly on
  * .cm-scroller, which beats the stack inherited from .cm-editor above
  * (injected <style> comes after this sheet in source order). Re-state
- * the stack at higher specificity so Geist Mono actually renders. */
-.dsl-editor .cm-editor .cm-scroller { overflow: auto; font-family: var(--font-mono); }
+ * the stack at higher specificity so Chivo Mono actually renders. */
+.dsl-editor .cm-editor .cm-scroller { overflow: auto; max-height: 40vh; font-family: var(--font-mono); }
 /* Same story for the gutter. CM6's base theme paints the line-number
  * rail with an unconditional LIGHT palette — `#f5f5f5` rail, `#ddd`
  * divider, `#cceeff44` active-line band, `caret-color: black` — and we
@@ -406,26 +494,29 @@
  * `z-index: 200` inside the horizontally scrollable `.cm-scroller`, and
  * the vendored bundle installs no `lineWrapping`, so a query wider than
  * the frame scrolls its text UNDER the pinned rail. `transparent` would
- * let that text bleed through the digits. Reproduce the frame's own
- * resting surface as an opaque slab instead — `--fill` (translucent) as
- * a gradient layer over the `--panel` the `.editor-wrap` paints — so the
- * rail reads the editor body's colour in both themes and still masks. */
+ * let that text bleed through the digits. The mount paints `--well`,
+ * which is opaque in both themes, so the rail simply repeats it: the
+ * frame's own resting surface, no gradient over a second layer. */
 .dsl-editor .cm-editor .cm-gutters {
-  background: linear-gradient(var(--fill), var(--fill)), var(--panel);
+  background: var(--well);
   border-right: 1px solid var(--line);
   color: var(--ink-4);
 }
-.dsl-editor .cm-editor .cm-activeLine { background: var(--fill); }
+/* Transparent, not a band: on the well tone a filled active line reads
+ * as a selection the user did not make. */
+.dsl-editor .cm-editor .cm-activeLine { background: transparent; }
 .dsl-editor .cm-editor .cm-content { caret-color: var(--ink); }
 
-/* Right column beside the editor: date-range trigger stacked over Run.
- * The old 2×3 pill strip is gone — both rows are plain 28px controls. */
+/* Right column beside the editor: date-range trigger stacked over Haul,
+ * tools under both. Wide enough for an absolute range to wrap onto two
+ * lines inside its own trigger instead of over Haul (F06). */
 .editor-right {
   display: flex;
   flex-direction: column;
   gap: 6px;
   align-items: stretch;
-  width: 172px;
+  width: 248px;
+  min-width: 0;
   flex-shrink: 0;
 }
 
@@ -434,12 +525,13 @@
  * (ADR-0007): on-accent text, flat fill, bg-mix hover, translate
  * press — in dark mode the inversion reads near-black on light blue. */
 .run {
-  height: 28px;
+  min-height: 32px;
   padding: 0 18px;
   background: var(--accent);
   color: var(--on-accent);
   border: 1px solid transparent;
   border-radius: var(--radius-ctl);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / .2), 0 1px 2px rgb(0 0 0 / .15);
   font-family: var(--font-ui);
   font-size: var(--fs-ui);
   font-weight: 500;
@@ -457,6 +549,7 @@
   background: var(--panel-2);
   color: var(--ink-2);
   border-color: var(--line);
+  box-shadow: none;
   cursor: not-allowed;
 }
 /* In flight is the one disabled state that is worth waiting for. */
@@ -465,28 +558,34 @@
  * emits it; the .run scoping was dropped with the generalization. */
 
 /* ─────────────────────────────────────────────────────────────────
- *  Meta strip — under the editor. Chips + truncation note only; the
- *  component renders nothing while both are empty, so no empty band.
+ *  Executed-scope strip — the console's closing row. A well inside the
+ *  raised console, so it reads as a report of what ran rather than a
+ *  second place to type.
  * ─────────────────────────────────────────────────────────────── */
-.meta {
-  display: grid;
-  grid-template-columns: 1fr auto;
-  align-items: start;
-  gap: 0 14px;
-  padding: 6px 14px;
+.scope {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 10px;
   min-height: 30px;
-  flex-shrink: 0;
-  background: var(--panel);
-  border-bottom: 1px solid var(--line);
+  padding: 6px 12px;
+  background: var(--well);
+  box-shadow: var(--inset);
+  border-top: 1px solid var(--line);
   font-family: var(--font-ui);
-  font-size: var(--fs-ui);
+  font-size: var(--fs-dense);
   color: var(--ink-2);
+  border-end-start-radius: var(--radius-panel);
+  border-end-end-radius: var(--radius-panel);
 }
-.meta-chips { display: flex; flex-wrap: wrap; gap: 6px; padding: 2px 0; }
-.meta .dim { color: var(--ink-3); padding: 2px 0; white-space: nowrap; }
+.scope-lb { font-weight: 600; }
+/* The window phrase can be two absolute timestamps plus DSL clauses:
+ * wrap it rather than push the chips off the row. */
+.scope-window { font-family: var(--font-mono); overflow-wrap: anywhere; }
+.scope .meta-chips { display: flex; flex-wrap: wrap; gap: 6px; }
 
 /* Filter chips — one per active Filter. */
-.meta .chip {
+.scope .chip {
   display: inline-flex;
   align-items: center;
   gap: 4px;
@@ -499,7 +598,7 @@
   font-family: var(--font-mono);
 }
 /* A <button> since ADR-0029, hence the per-rule reset (ADR-0028). */
-.meta .chip .x {
+.scope .chip .x {
   background: none;
   border: 0;
   font: inherit;
@@ -508,23 +607,34 @@
   border-radius: var(--radius-sm);
   color: var(--accent);
 }
-.meta .chip .x:hover { background: var(--accent); color: var(--on-accent); }
-.meta .chip.excl {
+.scope .chip .x:hover { background: var(--accent); color: var(--on-accent); }
+.scope .chip.excl {
   background: var(--red-wash);
   border-color: var(--red);
   color: var(--red);
 }
-.meta .chip.excl .x { color: var(--red); }
-.meta .chip.excl .x:hover { background: var(--red); color: var(--on-accent); }
+.scope .chip.excl .x { color: var(--red); }
+.scope .chip.excl .x:hover { background: var(--red); color: var(--on-accent); }
 /* The link's filters could not be read at all — the chips beside this
  * one are the empty fallback, not what the link says. No remove control:
  * there is nothing to remove, only a link to repair. */
-.meta .chip.bad {
+.scope .chip.bad {
   background: var(--red-wash);
   border-color: var(--red);
   color: var(--red);
   padding: 1px 8px;
 }
+.scope .live-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-inline-end: 4px;
+  border-radius: var(--radius-round);
+  background: var(--green);
+}
+/* Pushed to the trailing edge, so the count is where the eye leaves the
+ * row whatever the chips did to the middle of it. */
+.scope-count { margin-inline-start: auto; font-variant-numeric: tabular-nums; }
 
 /* ─────────────────────────────────────────────────────────────────
  *  Tabs — base .tabs family moved to fleet-ui.css (issue #28,
@@ -536,21 +646,30 @@
 .tabs .action {
   cursor: pointer;
   align-self: center;
-  color: var(--ink-3);
+  color: var(--ink-2);
   font-size: var(--fs-ui);
   padding: 3px 6px;
   border-radius: var(--radius-sm);
 }
+/* The truncation badge leads the trailing slot: it qualifies the count
+ * on the tab beside it, so it sits before the actions, not among them. */
+.tabs .bdg { margin-inline-end: 4px; }
+/* Stop live is the one tinted action in the header — it ends the state
+ * the rest of the row is describing. */
+.tabs .action.stop-live { color: var(--accent-ink); background: var(--accent-wash); }
 .tabs .action + .action { margin-left: 4px; }
 .tabs .action:hover { color: var(--ink); background: var(--panel-2); }
 /* The trailing Save/Export actions and the editor's tool row are real
  * <button>s so a link that cannot be read can disable them (ADR-0027);
  * these two rules put the text-link look back over the button chrome. */
+/* `color` is deliberately NOT reset here: it would outrank the --ink-2
+ * tone the two families set above and paint both rows at the inherited
+ * body colour. The one place the inherited colour is wanted is the
+ * disabled hover below, which restates it there. */
 .tabs button.action, .editor-tools button.tool {
   font: inherit;
   background: none;
   border: 0;
-  color: inherit;
 }
 .tabs .action:disabled, .editor-tools .tool:disabled {
   opacity: .45;
@@ -560,6 +679,37 @@
   background: none;
   color: inherit;
 }
+
+/* ─────────────────────────────────────────────────────────────────
+ *  Reading-mode disclosure ("View") in the result header. The wrapper
+ *  is the positioning context AND the identity the outside-mousedown
+ *  test uses, so the popover must stay inside it.
+ * ─────────────────────────────────────────────────────────────── */
+.view-wrap { position: relative; display: inline-flex; }
+.view-pop {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 40;
+  width: 260px;
+  padding: 10px;
+  display: grid;
+  gap: 10px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-panel);
+  box-shadow: inset 0 1px 0 var(--edge-hi), var(--elev-3);
+}
+.view-lb {
+  display: block;
+  margin-bottom: 4px;
+  font-family: var(--font-ui);
+  font-size: var(--fs-dense);
+  color: var(--ink-3);
+}
+/* What the Rows group says instead of a control it would not honour:
+ * aggregation-shaped results always render the plain table. */
+.view-note { margin: 0; font-family: var(--font-ui); font-size: var(--fs-dense); color: var(--ink-3); }
 
 /* ─────────────────────────────────────────────────────────────────
  *  Incomplete-results notice (ADR-0011 C2) — one warn-toned line
@@ -573,7 +723,7 @@
   align-items: flex-start;
   gap: 10px;
   padding: 7px 14px;
-  background: var(--yellow-wash);
+  background: var(--panel);
   border-bottom: 1px solid var(--line);
   font-family: var(--font-ui);
   font-size: var(--fs-dense);
@@ -608,7 +758,7 @@
   align-items: center;
   gap: 10px;
   padding: 7px 14px;
-  background: var(--red-wash);
+  background: var(--panel);
   border-bottom: 1px solid var(--line);
   font-family: var(--font-ui);
   font-size: var(--fs-dense);
@@ -642,11 +792,11 @@
 .url-notice-repair:hover { background: var(--red); color: var(--on-accent); }
 
 /* ─────────────────────────────────────────────────────────────────
- *  Histogram — 78px strip on Events
+ *  Histogram — 64px strip on Events
  * ─────────────────────────────────────────────────────────────── */
 .histo {
-  height: 78px;
-  padding: 8px 14px 6px 40px;
+  height: 64px;
+  padding: 6px 14px 4px 40px;
   background: var(--panel);
   border-bottom: 1px solid var(--line);
   display: flex;
@@ -660,15 +810,26 @@
   width: 100%;
   text-align: center;
   font-family: var(--font-ui);
-  font-size: var(--fs-micro);
+  font-size: var(--fs-ui);
   color: var(--ink-3);
 }
+/* Three hairline gridlines at a third, two thirds and the top of the
+ * bar box, painted as gradients so the strip needs no extra elements.
+ * `content-box` origin and clip keep them above the 14px the x-axis
+ * labels take at the bottom. */
 .histo .bars {
   display: flex;
   gap: 2px;
   align-items: flex-end;
   flex: 1;
   height: 100%;
+  padding-bottom: 14px;
+  background-image:
+    linear-gradient(to top, transparent calc(33.33% - 1px), var(--line-2) calc(33.33% - 1px), var(--line-2) 33.33%, transparent 33.33%),
+    linear-gradient(to top, transparent calc(66.66% - 1px), var(--line-2) calc(66.66% - 1px), var(--line-2) 66.66%, transparent 66.66%),
+    linear-gradient(to top, transparent calc(100% - 1px), var(--line-2) calc(100% - 1px));
+  background-origin: content-box;
+  background-clip: content-box;
 }
 .histo .bar {
   flex: 1;
@@ -679,17 +840,21 @@
   cursor: pointer;
   height: 100%;
 }
+/* The ok band carries a 1px top highlight instead of a heavier fill,
+ * and the error band is solid --red at .85: a glow around an error bar
+ * reads as motion on a static strip (ADR-0032). */
 .histo .bar .ok {
   background: var(--accent);
-  opacity: .38;
+  opacity: .55;
+  box-shadow: inset 0 1px 0 var(--edge-hi);
   transition: opacity 120ms;
 }
 .histo .bar .err {
   background: var(--red);
-  box-shadow: 0 0 3px color-mix(in srgb, var(--red) 30%, transparent);
+  opacity: .85;
 }
-.histo .bar:hover .ok { opacity: .62; }
-.histo .bar:hover::after {
+.histo .bar:is(:hover, :focus-visible) .ok { opacity: .75; }
+.histo .bar:is(:hover, :focus-visible)::after {
   content: "";
   position: absolute;
   inset: 0;
@@ -723,7 +888,6 @@
   color: var(--ink-3);
   pointer-events: none;
 }
-.histo .bars { padding-bottom: 14px; }
 .histo .bar .tip {
   position: absolute;
   bottom: calc(100% + 2px);
@@ -741,7 +905,7 @@
   transition: opacity 120ms;
   z-index: 10;
 }
-.histo .bar:hover .tip { opacity: 1; }
+.histo .bar:is(:hover, :focus-visible) .tip { opacity: 1; }
 
 /* ─────────────────────────────────────────────────────────────────
  *  Results table v2 (sortable + expandable rows + level pills)
@@ -765,11 +929,6 @@
   text-align: center;
   color: var(--ink-3);
 }
-.results-table thead th {
-  position: sticky;
-  top: 0;
-  z-index: 2;
-}
 /* The header cell keeps its sticky box; the button inside it is the
  * control (ADR-0029) and takes the whole cell so the click target is
  * unchanged. The cell's own padding moves onto the button: left on the
@@ -786,13 +945,17 @@
   width: 100%;
   text-align: left;
 }
+/* The glyph is hidden until the column is hovered, focused or sorted:
+ * a column of resting arrows reads as noise across a dense header. */
 .results-table thead th .sort {
-  opacity: .3;
+  opacity: 0;
   margin-left: 6px;
   font-size: var(--fs-tiny);
 }
+.results-table thead th:hover .sort,
+.results-table thead th .th-sort:focus-visible .sort { opacity: .6; }
 .results-table thead th.sorted { color: var(--ink); }
-.results-table thead th.sorted .sort { opacity: 1; color: var(--accent); }
+.results-table thead th.sorted .sort { opacity: 1; color: var(--accent-ink); }
 /* The row is the containing block for its caret button's stretched
  * pseudo-element (ADR-0029). */
 .results-table tbody tr { position: relative; }
@@ -816,13 +979,18 @@
   border-radius: var(--radius-sm);
 }
 .lvl-info  { color: var(--ink-3); }
+/* The two quiet levels take the support tone so every pill in the
+ * column has the same box; only the tint separates them. */
+.lvl-info, .lvl-debug { background: var(--panel-2); }
 .lvl-warn  { color: var(--yellow); background: var(--yellow-wash); }
 .lvl-error { color: var(--red); background: var(--red-wash); }
 .lvl-debug { color: var(--ink-4); }
 
-/* Expanded row detail panel. */
+/* Expanded row detail panel — a well inset into the table with a 2px
+ * accent rule down its leading edge tying it to the row above. */
 .results-table .detail {
-  background: var(--bg) !important;
+  background: var(--well) !important;
+  box-shadow: inset 2px 0 0 var(--accent), var(--inset);
   padding: 10px 14px !important;
   white-space: normal !important;
 }
@@ -865,6 +1033,174 @@
   gap: 8px;
 }
 
+/* ─────────────────────────────────────────────────────────────────
+ *  Aggregate presentation (ADR-0032): the exact table, and beside it at
+ *  1100px and up a bar per group. The chart is decoration over numbers
+ *  the table already states, so it is aria-hidden and it is the thing
+ *  that yields the narrow column.
+ * ─────────────────────────────────────────────────────────────── */
+.agg-split {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  flex: 1;
+  min-height: 0;
+}
+.agg-split > .results { min-width: 0; }
+/* Stacked, the chart reads first: it is the shape of the answer, and
+ * the table under it is the detail. */
+.cat-chart {
+  padding: 12px 14px;
+  border-top: 1px solid var(--line);
+  overflow: auto;
+  max-height: 480px;
+  order: -1;
+}
+.cat-title {
+  margin: 0 0 8px;
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui);
+  font-weight: 600;
+  color: var(--ink-2);
+}
+.cat-bars { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+.cat-bars li {
+  display: grid;
+  grid-template-columns: minmax(64px, 30%) minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  font-family: var(--font-mono);
+  font-size: var(--fs-dense);
+}
+.cat-lb { color: var(--ink-2); overflow-wrap: anywhere; }
+.cat-track {
+  position: relative;
+  height: 12px;
+  background: var(--well);
+  box-shadow: var(--inset);
+  border-radius: var(--radius-xs);
+  overflow: hidden;
+}
+.cat-track i { position: absolute; top: 0; bottom: 0; left: 0; background: var(--accent); opacity: .85; }
+/* A column with a negative value draws from the middle, with a hairline
+ * marking the zero the bars grow away from. */
+.cat-bars.signed .cat-track::before {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--ink-4);
+}
+.cat-bars.signed .cat-track i { left: 50%; }
+.cat-bars.signed li.neg .cat-track i { left: auto; right: 50%; }
+.cat-val { color: var(--ink); font-variant-numeric: tabular-nums; }
+.cat-bars li.null .cat-val { color: var(--ink-3); }
+/* The only control an aggregate cell carries, and only on a column the
+ * query grouped by: a generated metric names no field to search (F02). */
+.results-table.exact .grp-search {
+  font: inherit;
+  background: none;
+  border: 0;
+  padding: 0;
+  color: var(--accent-ink);
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+/* ─────────────────────────────────────────────────────────────────
+ *  Message-first rows (ADR-0032). Time, severity and the message at
+ *  full width, with service / host / latency as a muted second line;
+ *  every other column is read in the detail or the inspector.
+ * ─────────────────────────────────────────────────────────────── */
+.results-table.msg-first tbody td { white-space: normal; vertical-align: top; }
+.results-table.msg-first .mf-time { white-space: nowrap; color: var(--ink-3); width: 1%; }
+/* The message is the row. Below a floor it stops being one and becomes
+ * a column of single words, so the table overflows horizontally instead
+ * — which the scroll hint above it already announces. */
+.results-table.msg-first .mf-msg { min-width: 220px; }
+.results-table.msg-first .mf-msg .msg { color: var(--ink); overflow-wrap: anywhere; }
+.results-table.msg-first .mf-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 2px;
+  font-family: var(--font-ui);
+  font-size: var(--fs-micro);
+  color: var(--ink-3);
+}
+
+/* ─────────────────────────────────────────────────────────────────
+ *  Docked inspector (ADR-0032). The table and the panel are one grid,
+ *  not a scrim over the page: the rows stay put and stay readable while
+ *  a row is open. Below 900px the panel stacks under the table and the
+ *  selected row grows a link down to it.
+ * ─────────────────────────────────────────────────────────────── */
+.results-split {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  /* Two named rows, not two auto ones. With `auto auto` the hint and
+   * the table shared the free space and a ~70px dead band opened
+   * between them; the hint takes its own height and the results take
+   * the rest. */
+  grid-template-rows: max-content minmax(0, 1fr);
+  flex: 1;
+  min-height: 0;
+}
+.results-split > .results { min-width: 0; }
+/* The scroll instruction is a sibling of the region it describes, so it
+ * spans both tracks rather than taking the inspector's column. */
+.results-split > .overflow-hint { grid-row: 1; grid-column: 1 / -1; }
+.results-split > .results, .results-split > .sd-host { grid-row: 2; }
+.jump-details {
+  display: none;
+  margin-inline-start: 4px;
+  font-family: var(--font-ui);
+  font-size: var(--fs-micro);
+  color: var(--accent-ink);
+  position: relative;
+  z-index: 1;
+}
+.inspector .dg {
+  display: grid;
+  grid-template-columns: 96px minmax(0, 1fr) auto;
+  gap: 6px 10px;
+  font-size: var(--fs-dense);
+  align-items: baseline;
+}
+.inspector .k {
+  color: var(--ink-3);
+  font-family: var(--font-mono);
+  font-size: var(--fs-micro);
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  overflow-wrap: anywhere;
+}
+.inspector .v {
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: var(--table-fs);
+  overflow-wrap: anywhere;
+}
+.inspector .kv-act { display: inline-flex; gap: 4px; }
+.inspector .tag {
+  font: inherit;
+  font-size: var(--fs-micro);
+  background: var(--panel-2);
+  border: 1px solid var(--line-2);
+  border-radius: var(--radius-sm);
+  padding: 0 6px;
+  cursor: pointer;
+  color: var(--ink-2);
+}
+.inspector .tag:hover { border-color: var(--accent); color: var(--accent-ink); background: var(--accent-wash); }
+.inspector .actions { margin-top: 12px; display: flex; flex-wrap: wrap; gap: 8px; }
+/* The selected row reads like the expanded one, plus the 3px rule the
+ * list pages already use to say "this is the one on the right". */
+.results-table tbody tr.selected td { background: var(--accent-wash); }
+.results-table tbody tr.selected td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
+
 /* .results-footer moved to fleet-ui.css (issue #31) — fleet_ui::Pager
  * emits it (and supersedes the .tbl-foot mirror). */
 
@@ -891,6 +1227,11 @@
   gap: 6px;
   padding: 0 4px;
 }
+/* Keep each divider attached to its stat block when the footer wraps. */
+.statusbar > .grp + .grp {
+  border-inline-start: 1px solid var(--line);
+  padding-inline-start: 18px;
+}
 /* The theme control is the one clickable group and it is a <button>
  * (ADR-0029); .statusbar .grp gives it the flex row, this gives it the
  * reset. */
@@ -903,22 +1244,6 @@
   border-radius: var(--radius-sm);
 }
 .statusbar .grp.clickable:hover { background: var(--panel-2); color: var(--ink-2); }
-.statusbar .dot {
-  width: 6px;
-  height: 6px;
-  border-radius: var(--radius-round);
-  background: var(--green);
-  box-shadow: 0 0 5px color-mix(in oklab, var(--green) 60%, transparent);
-}
-.statusbar .dot.live {
-  background: var(--accent);
-  box-shadow: 0 0 5px var(--accent);
-  animation: blink 1.4s ease-in-out infinite;
-}
-.statusbar .dot.err {
-  background: var(--red);
-  box-shadow: 0 0 5px var(--red);
-}
 .statusbar .grp.lagged .strong { color: var(--yellow); }
 .statusbar .sp { flex: 1; }
 .statusbar .strong { color: var(--ink-2); }
@@ -929,7 +1254,6 @@
  * ─────────────────────────────────────────────────────────────── */
 .mono { font-family: var(--font-mono); }
 /* .kbd moved to fleet-ui.css (issue #31) — fleet_ui::Kbd emits it. */
-.divider { color: var(--ink-4); }
 
 /* ─────────────────────────────────────────────────────────────────
  *  Full-page chrome (history, schema, settings etc.)
@@ -954,6 +1278,44 @@
 .page h2.subhd { font-family: var(--font-ui); font-size: var(--fs-control); font-weight: 600; color: var(--ink-2); margin: 0 0 8px; }
 .page p.sub { margin: 4px 0 0; font-size: var(--fs-small); color: var(--ink-3); text-wrap: pretty; }
 .page-hd .actions { display: flex; gap: 8px; align-items: center; flex-shrink: 0; }
+
+/* The list page's two columns (ADR-0032): the sheet that holds the
+ * table, and the panel docked beside it once the viewport is wide
+ * enough to carry both. Below 1100px the grid stays one column and the
+ * panel is the scrim drawer it has always been. */
+.page-split { display: grid; flex: 1; grid-template-columns: minmax(0, 1fr); gap: 16px; align-items: start; min-height: 0; }
+.page-split > .list-sheet { align-self: stretch; }
+.page-split > .list-sheet > .tbl-scroll { flex: 1; }
+@media (min-width: 1100px) {
+  .page-split.has-panel { grid-template-columns: minmax(0, 1fr) minmax(420px, 46%); }
+}
+/* The sheet itself: a work surface floating on the page floor, with the
+ * table frame's own border folded into it so the two do not double up. */
+.list-sheet {
+  display: flex; flex-direction: column; min-height: 0; min-width: 0;
+  background: var(--panel);
+  border: 1px solid var(--line); border-radius: var(--radius-panel);
+  box-shadow: inset 0 1px 0 var(--edge-hi), var(--elev-1);
+  overflow: hidden;
+}
+.list-sheet-hd {
+  display: flex; align-items: center; gap: 12px;
+  min-height: 40px; padding: 0 12px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+}
+.list-sheet-ttl { margin: 0; font-family: var(--font-ui); font-size: var(--fs-control); font-weight: 600; color: var(--ink); }
+.list-sheet-ttl .cnt { margin-inline-start: 6px; font-weight: 500; color: var(--ink-3); font-variant-numeric: tabular-nums; }
+/* The filter input moved out of `.page-hd .actions` into the card
+ * header, where it trails the title. */
+.list-sheet-hd .inp-wrap { margin-inline-start: auto; min-width: 160px; }
+.list-sheet .overflow-hint { border-bottom: 1px solid var(--line-2); }
+.list-sheet .fleet-table-frame { border: 0; border-radius: 0; box-shadow: none; }
+/* The docked panel is a grid child of this layout, so it takes the
+ * column instead of the overlay's fixed width. Written through the
+ * placing layout: the `.sd-host` and `.sd-drawer.sd-docked` base rules
+ * are fleet-ui's and stay there. */
+.page-split > .sd-host .sd-drawer.sd-docked { width: 100%; }
 
 /* .inp-wrap moved to fleet-ui.css (issue #31) — fleet_ui::SearchInput
  * emits it. */
@@ -986,6 +1348,7 @@
   color: var(--ink-2); white-space: pre-wrap; word-break: break-all; min-width: 0;
 }
 .tbl-row.active { background: var(--accent-wash); }
+.tbl-row.active > td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
 /* The row control replaced a flex child's content, so it takes the
  * cell's width back; truncation stays on the inner text span. */
 .tbl-row .path .row-stretch, .tbl-row .mono > .row-stretch { display: block; width: 100%; }
@@ -1021,7 +1384,9 @@
 }
 .th.sortable:hover { color: var(--ink-2); }
 .th.sortable.active { color: var(--ink); }
-.th .dir { font-size: var(--fs-micro); color: var(--accent); }
+.th .dir { font-size: var(--fs-micro); color: var(--accent-ink); opacity: 0; }
+.th.sortable:hover .dir, .th.sortable button:focus-visible .dir { opacity: .6; }
+.th.sortable.active .dir { opacity: 1; }
 
 /* Schema services table — name cell. The canonical 7px + 2px-ring
  * StatusDot reads swollen against dense row text; scope it down to
@@ -1121,7 +1486,7 @@
 .tp-text      { background: color-mix(in oklab, var(--green)  14%, var(--panel-2)); color: var(--green); }
 .tp-integer   { background: color-mix(in oklab, var(--accent)  14%, var(--panel-2)); color: var(--accent); }
 .tp-bigint    { background: color-mix(in oklab, var(--accent)  14%, var(--panel-2)); color: var(--accent); }
-.tp-bool      { background: color-mix(in oklab, var(--teal)   18%, var(--panel-2)); color: var(--teal); }
+.tp-bool      { background: color-mix(in oklab, var(--teal)   14%, var(--panel-2)); color: var(--teal); }
 .tp-float     { background: color-mix(in oklab, var(--accent)  14%, var(--panel-2)); color: var(--accent); }
 .tp-ip        { background: color-mix(in oklab, var(--teal)   14%, var(--panel-2)); color: var(--teal); }
 .tp-timestamp { background: color-mix(in oklab, var(--ink-3)  18%, var(--panel-2)); color: var(--ink-2); }
@@ -1160,8 +1525,10 @@
   gap: 12px;
 }
 .sd-card {
-  background: var(--panel-2); border: 1px solid var(--line);
-  border-radius: var(--radius-panel); padding: 12px 14px;
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--radius-panel);
+  box-shadow: inset 0 1px 0 var(--edge-hi), var(--elev-1);
+  padding: 12px 14px; min-width: 0;
 }
 .sd-card .ttl {
   font-family: var(--font-ui); font-size: var(--fs-micro); font-weight: 600;
@@ -1215,17 +1582,23 @@
 .topfields .tf .bar { display: block; height: 100%; background: var(--accent); }
 .topfields .tf .c { color: var(--ink-3); text-align: right; font-family: var(--font-mono); }
 
-/* Fields tab */
-.sd-fields { display: flex; flex-direction: column; }
+/* Fields tab. The fixed tracks are sized so Sample fits inside the
+ * docked panel at 1440 instead of being pushed past its edge, and
+ * `min-width` states the floor the row cannot go below — so the body's
+ * `overflow: auto` is a declared horizontal scroll on a narrower panel
+ * instead of a clip nobody chose. Cardinality keeps 75px: it is the one
+ * header whose own text needs that much, and 64 put the sort glyph over
+ * Storage beside it. */
+.sd-fields { display: flex; flex-direction: column; min-width: 561px; }
 .sf-hd, .sf-row {
   display: grid;
-  grid-template-columns: minmax(160px, 1.4fr) 80px 160px 130px 90px 1.4fr 50px;
-  align-items: center; gap: 12px;
+  grid-template-columns: minmax(115px, 1.35fr) 70px 88px 75px 56px minmax(65px, 1fr) 28px;
+  align-items: center; gap: 8px;
   padding: 6px 8px; font-size: var(--table-fs);
 }
 .sf-hd {
-  font-family: var(--font-ui); font-size: var(--fs-micro); font-weight: 600;
-  text-transform: uppercase; letter-spacing: .08em; color: var(--ink-3);
+  font-family: var(--font-ui); font-size: var(--fs-dense); font-weight: 600;
+  text-transform: none; letter-spacing: 0; color: var(--ink-3);
   border-bottom: 1px solid var(--line); padding-bottom: 8px; margin-bottom: 2px;
 }
 .sf-row {
@@ -1346,7 +1719,7 @@
 }
 .fc-foot { border-top: 1px solid var(--line); padding-top: 12px; }
 .fc-cmd {
-  margin: 0; padding: 8px 10px; background: var(--panel-2);
+  margin: 0; padding: 8px 10px; background: var(--well); box-shadow: var(--inset);
   border: 1px solid var(--line); border-radius: var(--radius-sm);
   font-family: var(--font-mono); font-size: var(--table-fs); color: var(--ink);
   white-space: pre-wrap; word-break: break-all;
@@ -1417,7 +1790,8 @@
 }
 .tl-stream {
   flex: 1; min-height: 0; overflow: auto;
-  background: var(--panel-2); border: 1px solid var(--line); border-radius: var(--radius-panel);
+  background: var(--well); box-shadow: var(--inset);
+  border: 1px solid var(--line); border-radius: var(--radius-panel);
   padding: 8px 12px;
   font-family: var(--font-mono); font-size: var(--fs-dense); line-height: 1.7;
 }
@@ -1440,43 +1814,73 @@
 }
 
 .field-label {
-  font-family: var(--font-ui); font-size: var(--fs-micro); font-weight: 600;
-  text-transform: uppercase; letter-spacing: .06em; color: var(--ink-3);
+  font-family: var(--font-ui); font-size: var(--fs-ui); font-weight: 500;
+  text-transform: none; letter-spacing: 0; color: var(--ink-2);
   display: block; margin-bottom: 4px;
 }
+.field-hint-sm { margin: 4px 0 0; font-size: var(--fs-dense); color: var(--ink-3); }
 
-.interval-chips { display: flex; gap: 6px; flex-wrap: wrap; }
+.formcols { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.formcols input { width: 100%; }
+
+/* Segmented track: the chips sit in a well and the chosen one is the
+ * single raised option, so the choice reads as a switch position rather
+ * than a row of equal buttons (ADR-0032). */
+.interval-chips {
+  display: flex; flex-wrap: wrap; gap: 4px; padding: 4px;
+  background: var(--well); box-shadow: var(--inset);
+  border: 1px solid var(--line); border-radius: var(--radius-ctl);
+}
 /* A <button> since ADR-0029; it already declares its own border,
  * background and font, so the reset it needs is the inherited size. */
 .interval-chip {
-  padding: 4px 10px; font-size: var(--fs-ui); font-family: var(--font-mono);
-  border: 1px solid var(--line); border-radius: var(--radius-sm);
-  cursor: pointer; color: var(--ink-3); background: var(--panel-2);
+  padding: 4px 10px; min-height: 30px;
+  font-size: var(--fs-ui); font-family: var(--font-mono);
+  background: transparent; border: 1px solid transparent; border-radius: var(--radius-sm);
+  color: var(--ink-3); cursor: pointer;
   line-height: inherit;
   user-select: none; transition: background 120ms, border-color 120ms;
 }
-.interval-chip:hover { border-color: var(--ink-3); color: var(--ink-2); }
+.interval-chip:hover { color: var(--ink-2); background: var(--fill-2); }
 .interval-chip.on {
-  background: var(--accent-wash); border-color: var(--accent);
-  color: var(--accent); font-weight: 600;
+  background: var(--panel); border-color: var(--line);
+  color: var(--accent-ink); box-shadow: var(--elev-1); font-weight: 600;
+}
+
+/* The plain-language reading of the schedule, quoted off the accent. */
+.timeline {
+  border-left: 2px solid var(--accent);
+  padding: 8px 12px; background: var(--accent-wash);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  font-size: var(--fs-dense); color: var(--ink);
+}
+.timeline code { display: block; margin-top: 6px; font-family: var(--font-mono); color: var(--ink-2); }
+.timeline .small { margin: 6px 0 0; color: var(--ink-3); }
+
+.savebar {
+  display: flex; justify-content: space-between; align-items: center;
+  gap: 10px; flex-wrap: wrap;
+  padding: 12px 0 0; border-top: 1px solid var(--line);
+}
+.sched-input {
+  width: 100%; font-family: var(--font-mono); font-size: var(--fs-dense);
+  padding: 6px 8px; background: var(--well); box-shadow: var(--inset);
+  border: 1px solid var(--line); border-radius: var(--radius-ctl); color: var(--ink);
 }
 
 /* .status-dot moved to fleet-ui.css (issue #31) — fleet_ui::StatusDot
  * emits it (unified with the retired .sd-dot ring treatment). */
 
-.sched-badge {
-  font-family: var(--font-mono); font-size: var(--fs-dense);
-  padding: 1px 6px; border-radius: var(--radius-sm);
-  background: var(--panel-2); color: var(--ink-2);
-}
-.sched-badge.active { background: var(--accent-wash); color: var(--accent); }
-.sched-badge.disabled { opacity: .5; }
+/* .sched-badge* retired (ADR-0032): the nets list says the cadence in
+ * words and leaves the enabled/paused judgement to fleet_ui::Badge. */
+.cadence { font-size: var(--fs-ui); color: var(--ink-2); margin-inline-end: 6px; }
 
-.stats-row { display: flex; gap: 12px; margin-top: 16px; }
+.stats-row { display: flex; gap: 12px; }
 .stat-card {
   flex: 1; padding: 14px 16px;
   background: var(--panel); border: 1px solid var(--line);
   border-radius: var(--radius-panel);
+  box-shadow: inset 0 1px 0 var(--edge-hi), var(--elev-1);
 }
 .stat-card .label {
   font-size: var(--fs-micro); text-transform: uppercase;
@@ -1488,13 +1892,95 @@
   font-variant-numeric: tabular-nums;
 }
 
+/* The selected run: its stored result beside the receipt of how it was
+ * produced. The receipt is a well on the sheet, so it reads as a record
+ * rather than a second set of controls. */
+.run-detail .result-grid { display: grid; grid-template-columns: minmax(0, 1fr) 280px; min-height: 0; }
+.run-detail .data-area { min-width: 0; padding: 12px; }
+.run-detail .receipt {
+  border-left: 1px solid var(--line); padding: 14px 16px;
+  background: var(--well); box-shadow: var(--inset);
+}
+.run-detail .receipt h3 { margin: 0 0 10px; font-family: var(--font-ui); font-size: var(--fs-control); font-weight: 600; }
+.fieldlist { margin: 0; }
+.fieldlist > div {
+  display: flex; justify-content: space-between; gap: 10px;
+  padding: 8px 0; border-bottom: 1px solid var(--line-2);
+  font-size: var(--fs-dense);
+}
+.fieldlist dt { color: var(--ink-3); font-family: var(--font-mono); font-size: var(--fs-micro); }
+.fieldlist dd {
+  margin: 0; text-align: right; overflow-wrap: anywhere; max-width: 65%;
+  font-family: var(--font-mono); font-size: var(--fs-micro); color: var(--ink);
+}
+.run-detail .small { margin: 12px 0 0; font-size: var(--fs-dense); color: var(--ink-3); }
+/* Under 900px the receipt stacks below the rows it describes rather
+ * than squeezing both into one column of a narrow viewport. */
+@media (max-width: 899.98px) {
+  .run-detail .result-grid { grid-template-columns: minmax(0, 1fr); }
+  .run-detail .receipt { border-left: 0; border-top: 1px solid var(--line); }
+}
+
+/* Wide enough for the inspector to sit beside the rows it describes. */
+@media (min-width: 900px) {
+  .results-split.has-inspector { grid-template-columns: minmax(0, 1fr) var(--inspector-w); }
+}
+/* Below it the panel stacks under the table, so the selected row needs
+ * a way down to it and the panel drops the edge that said "beside". */
+@media (max-width: 899.98px) {
+  .results-split.has-inspector .jump-details { display: inline-flex; }
+  /* The link lives in the 1.6em caret cell, so the column has to make
+   * room for it: unstyled it rendered on top of the timestamp beside
+   * it, which is not a visible link. */
+  .results-split.has-inspector .results-table .exp-col { width: auto; }
+  .results-split.has-inspector .results-table tbody tr.selected .exp-col {
+    white-space: nowrap;
+  }
+  /* The caret gives up its cell-filling width on the selected row: at
+   * 100% it took the whole widened cell and pushed the link out over
+   * the timestamp beside it. The stretched ::after still covers the
+   * row, so the click target is unchanged (ADR-0029). */
+  .results-split.has-inspector .results-table tbody tr.selected .exp-col .row-stretch {
+    width: auto;
+  }
+  /* Stacked, the two rows must grow to their content and let the page
+   * scroll. Sharing one column's height starved the table to a header
+   * and a sliver, so neither the selected row nor its way down to the
+   * panel was on screen. */
+  .search-col:has(> .results-split.has-inspector) { flex: none; }
+  .results-split.has-inspector { grid-template-rows: max-content auto auto; }
+  .results-split.has-inspector > .sd-host { grid-row: 3; }
+  .results-split > .sd-host .sd-drawer.sd-docked {
+    position: static;
+    max-height: none;
+    border-left: 0;
+    border-top: 1px solid var(--line);
+    border-radius: 0;
+    box-shadow: none;
+  }
+}
+
 .run-preview {
-  padding: 8px 12px; background: var(--panel-2);
+  padding: 8px 12px; background: var(--well); box-shadow: var(--inset);
   border-top: 1px solid var(--line-2);
 }
-.run-preview table { width: 100%; font-family: var(--font-mono); font-size: var(--fs-dense); border-collapse: collapse; }
-.run-preview th { text-align: left; color: var(--ink-3); padding: 2px 6px; border-bottom: 1px solid var(--line); }
-.run-preview td { padding: 2px 6px; color: var(--ink-2); }
+/* The rows scroll in their own named region so the pager and the
+ * caption stay put beside it; the table takes its natural width and the
+ * region scrolls, rather than the cells wrapping. */
+.preview-scroll {
+  overflow: auto; max-height: 490px;
+  border: 1px solid var(--line); border-radius: var(--radius-sm);
+  scrollbar-gutter: stable; background: var(--panel);
+}
+.preview-scroll:focus-visible { outline: 2px solid var(--ring); outline-offset: -2px; }
+.run-preview table {
+  table-layout: auto; width: max-content; min-width: 100%;
+  font-family: var(--font-mono); font-size: var(--fs-dense); border-collapse: collapse;
+}
+.run-preview th, .run-preview td { white-space: nowrap; padding: 7px 10px; }
+.run-preview th { text-align: left; color: var(--ink-3); border-bottom: 1px solid var(--line); }
+.run-preview td { color: var(--ink-2); }
+.run-preview .results-footer { margin-top: 8px; }
 /* The preview pages the rows the response carried; this line names the
  * ones it never had. */
 .preview-cap {
@@ -1510,33 +1996,72 @@
 /* .btn-icon moved to fleet-ui.css (issue #31) — the
  * fleet_ui::ActionsMenu trigger emits it (its sole user). */
 .tbl-empty { padding: 24px 16px; color: var(--ink-3); text-align: center; }
-.preview { background: var(--panel-2); padding: 8px 10px; border-radius: var(--radius-sm); font-size: var(--fs-ui); color: var(--ink); white-space: pre-wrap; word-break: break-all; margin: 0; }
+.preview { background: var(--well); box-shadow: var(--inset); padding: 8px 10px; border-radius: var(--radius-sm); font-size: var(--fs-ui); color: var(--ink); white-space: pre-wrap; word-break: break-all; margin: 0; }
 
 /* Health reports share the shell's type, color and control tokens. */
-.health-page { flex: 1; min-height: 0; overflow: auto; padding: 28px 32px; }
-.health-page > section { padding: 24px 0; border-bottom: 1px solid var(--line); }
+.health-page { flex: 1; min-height: 0; overflow: auto; padding: 24px 32px 48px; background: var(--bg); }
+/* .health-page > section retired (ADR-0032): the reports are cards in
+ * the split above, not a stack of hairline-separated bands. */
+/* One column until the checks card can sit beside the operations
+ * cards; each section is a sheet on the page's floor. */
+.health-split { display: grid; grid-template-columns: minmax(0, 1fr); gap: 20px; margin-top: 16px; }
+.health-split > section {
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--radius-panel);
+  box-shadow: inset 0 1px 0 var(--edge-hi), var(--elev-1);
+  padding: 16px 18px; min-width: 0;
+}
+.health-card-ttl { display: flex; align-items: center; gap: 8px; margin: 0 0 12px; font-size: var(--fs-section); }
 .health-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 .health-heading h1 { margin: 0; font-size: 24px; }
 .health-page h2 { margin: 0 0 12px; font-size: 17px; }
 .health-heading p, .health-note { color: var(--ink-3); font-size: 13px; }
-.health-facts { display: flex; flex-wrap: wrap; gap: 20px 40px; margin: 16px 0; }
+.health-facts {
+  display: flex; flex-wrap: wrap; gap: 12px 32px;
+  margin: 14px 0 0; padding-top: 12px; border-top: 1px solid var(--line);
+}
 .health-facts > div { min-width: 135px; }
 .health-page dt { color: var(--ink-3); font-size: 13px; }
 .health-page dd { margin: 6px 0 0; font-variant-numeric: tabular-nums; }
-.health-checks { max-width: 520px; margin: 16px 0 0; }
-.health-checks > div { display: flex; justify-content: space-between; padding: 8px 0; }
+.health-checks { margin: 0; }
+/* One check per row: friendly name over the raw key, outcome badge on
+ * the right. */
+.health-check {
+  display: flex; justify-content: space-between; align-items: center; gap: 12px;
+  padding: 10px 0; border-bottom: 1px solid var(--line-2);
+}
+.health-check dt { display: flex; flex-direction: column; gap: 2px; }
+.health-check-name { font-weight: 500; color: var(--ink); }
+.health-check-key { font-size: var(--fs-dense); color: var(--ink-3); }
 .health-checks dd { margin: 0; }
 .health-check-error { color: var(--red); }
 .health-live-state { color: var(--ink-2); }
 .health-query-scroll { overflow-x: auto; }
-.health-query-scroll:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.health-query-scroll:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
 .health-query-table { width: 100%; border-collapse: collapse; text-align: left; font-size: 13px; }
 .health-query-table th { color: var(--ink-3); font-weight: 500; }
 .health-query-table th, .health-query-table td { padding: 12px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
 .health-query-table td:first-child { min-width: 240px; max-width: 600px; }
 .health-query-table code { white-space: pre-wrap; overflow-wrap: anywhere; }
-.health-query-id { display: block; margin-bottom: 5px; color: var(--ink-3); }
 @media (max-width: 640px) { .health-page { padding: 20px 16px; } .health-facts { gap: 16px 24px; } }
+/* Wide enough for the checks card to stand beside the operations
+ * cards, which stack in the second column in reading order. */
+@media (min-width: 1100px) {
+  .health-split { grid-template-columns: minmax(280px, .7fr) minmax(0, 1.3fr); }
+  .health-section { grid-column: 1; grid-row: 1 / span 3; }
+  .health-queries { grid-column: 2; grid-row: 1; }
+  .health-capacity { grid-column: 2; grid-row: 2; }
+  .health-live { grid-column: 2; grid-row: 3; }
+}
+/* Wide enough for the bars to stand beside the numbers they draw. */
+@media (min-width: 1100px) {
+  .agg-split.has-chart { grid-template-columns: minmax(0, 1fr) minmax(280px, 34%); }
+  /* The divider belongs to the table's edge, not the chart's: the chart
+   * is capped at 480px tall, so a border on it stopped short of the
+   * sheet's bottom. */
+  .agg-split.has-chart > .results { border-right: 1px solid var(--line); }
+  .agg-split .cat-chart { order: 0; border-top: 0; }
+}
 
 /* The sidebar remains one mounted disclosure so field search and group
  * expansion survive viewport changes. Match the media query in FacetSidebar. */
@@ -1550,7 +2075,10 @@
 .sd-overview { grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); }
 .sd-card { min-width: 0; }
 .sd-ttl .name, .sd-ttl .sub { overflow-wrap: anywhere; }
-@media (max-width: 900px) {
+/* 899.98px is the codebase's one spelling of "narrow": FacetSidebar
+ * queries the same width, so the rail's disclosure and its layout can
+ * never disagree by a pixel. */
+@media (max-width: 899.98px) {
   .search-layout { flex-direction: column; overflow-y: auto; }
   .facet-panel { width: auto; border-bottom: 1px solid var(--line); background: var(--panel); }
   .facet-panel > summary { display: list-item; padding: 10px 12px; font-size: var(--fs-ui); font-weight: 500; color: var(--ink-2); cursor: pointer; }
@@ -1558,18 +2086,29 @@
   .facet-panel > .facets { height: auto; max-height: min(45dvh, 360px); border-right: 0; }
   .search-col { flex-shrink: 0; min-height: 480px; }
   .statusbar { height: auto; min-height: var(--statusbar-h); flex-wrap: wrap; gap: 4px 10px; padding-block: 4px; }
+  .statusbar > .grp + .grp { border-inline-start: 0; padding-inline-start: 4px; }
 }
 @media (max-width: 600px) {
   .page { padding: 16px 16px 24px; gap: 16px; }
   .page-hd { gap: 12px; }
-  .editor-row { flex-direction: column; }
-  .editor-right { width: auto; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  .editor-row { flex-direction: column; align-items: stretch; }
+  /* The range trigger owns a flexible track and Haul a fixed one, so a
+   * wrapped absolute range grows its own row instead of covering Haul
+   * (F06). */
+  .editor-right { width: auto; display: grid; grid-template-columns: minmax(0, 1fr) minmax(96px, auto); gap: 6px; }
+  .editor-right .daterange { grid-column: 1; min-width: 0; }
+  .editor-right .run { grid-column: 2; }
   .editor-tools { grid-column: 1 / -1; justify-content: flex-end; flex-wrap: wrap; gap: 8px; }
   .editor-tools .tool { min-height: 28px; }
-  .search-col { min-height: 560px; }
+  .dr-trigger { min-height: 40px; font-size: var(--fs-dense); }
+  .dsl-editor { max-height: 34vh; }
+  .search-col { margin: 6px; min-height: 560px; }
+  .console { margin: 6px; }
   .sd-overview { grid-template-columns: minmax(0, 1fr); grid-template-areas: "chart" "types" "top"; }
   .stats-row { flex-wrap: wrap; }
   .stat-card { flex-basis: 120px; min-width: 0; }
+  .formcols { grid-template-columns: 1fr; }
+  .sd-fields { min-width: 640px; }
 }
 
 /* One scroll region keeps list headings aligned with wide rows. */
@@ -1588,7 +2127,7 @@
 .stat-card .load-hint { padding: 0; font-size: var(--fs-ui); font-weight: 400; line-height: 1.4; }
 /* Live state and new rows remain readable without repeating motion. */
 @media (prefers-reduced-motion: reduce) {
-  .pulse > span, .tl-row, .statusbar .dot.live, .sf-detail {
+  .pulse > span, .tl-row, .sf-detail {
     animation: none;
   }
 }
@@ -1611,19 +2150,6 @@
 
 .tl-stream:focus-visible { outline: 2px solid var(--ring); outline-offset: -2px; }
 
-.histo-caption {
-  padding: 6px 14px 0;
-  background: var(--panel);
-  font-family: var(--font-ui);
-  font-size: var(--fs-micro);
-  color: var(--ink-3);
-}
-.bucket-data { padding: 6px 14px; background: var(--panel); }
-.bucket-data summary { cursor: pointer; min-height: 32px; align-content: center; }
-.bucket-scroll { overflow: auto; max-height: 240px; }
-.bucket-data table { width: 100%; border-collapse: collapse; }
-.bucket-data th, .bucket-data td { text-align: start; padding: 6px 10px; white-space: nowrap; }
-.bucket-data caption { text-align: start; padding-block: 8px; }
 .chart-note { padding: 8px 14px; color: var(--ink-2); }
 
 .sd-ttl .service-freshness { flex-basis: 100%; display: flex; align-items: center; gap: 6px; font-size: var(--fs-ui); color: var(--ink-2); }
@@ -1640,5 +2166,15 @@
   z-index: 1;
 }
 .trawl-login .login-shell { min-height: auto; width: 100%; }
-.trawl-login-help { max-width: 360px; color: var(--muted); font-size: var(--fs-sm); }
+.trawl-login-help { max-width: 360px; color: var(--ink-3); font-size: var(--fs-dense); }
 .trawl-login-help p { margin: 8px 0; }
+
+/* Forced colors: a background wash, an inset rule and an elevation all
+ * disappear, so every state the app paints that way restates itself as
+ * an outline or a border (ADR-0032; fleet-ui.css carries the same block
+ * for the chrome it owns). */
+@media (forced-colors: active) {
+  .results-table tbody tr.selected td, .tbl-row.active > td, .facets .v.selected { outline: 2px solid Highlight; outline-offset: -2px; }
+  .cat-track i { background: Highlight; }
+  .results-table .detail, .list-sheet-hd, .card-hd { border: 1px solid CanvasText; box-shadow: none; }
+}

@@ -409,7 +409,7 @@ jobs:
         if: failure()
         with:
           name: health-mutation-traces
-          path: crates/trawl-web-ui/e2e/test-results/
+          path: e2e-artifacts/test-results/
           retention-days: 7
 
   web-ui-palette-mutations:
@@ -453,7 +453,7 @@ jobs:
         if: failure()
         with:
           name: palette-mutation-traces
-          path: crates/trawl-web-ui/e2e/test-results/
+          path: e2e-artifacts/test-results/
           retention-days: 7
 
   web-ui-save-snapshot-mutation:
@@ -508,7 +508,7 @@ jobs:
         if: failure()
         with:
           name: save-snapshot-mutation-traces
-          path: crates/trawl-web-ui/e2e/test-results/
+          path: e2e-artifacts/test-results/
           retention-days: 7
 
   web-ui-pagination-range-mutations:
@@ -555,7 +555,7 @@ jobs:
         if: failure()
         with:
           name: pagination-range-mutation-traces
-          path: crates/trawl-web-ui/e2e/test-results/
+          path: e2e-artifacts/test-results/
           retention-days: 7
 
   web-ui-live-coherence-mutations:
@@ -602,7 +602,7 @@ jobs:
         if: failure()
         with:
           name: live-coherence-mutation-traces
-          path: crates/trawl-web-ui/e2e/test-results/
+          path: e2e-artifacts/test-results/
           retention-days: 7
 
   web-ui-schedule-preview-mutations:
@@ -648,7 +648,7 @@ jobs:
         if: failure()
         with:
           name: schedule-preview-mutation-traces
-          path: crates/trawl-web-ui/e2e/test-results/
+          path: e2e-artifacts/test-results/
           retention-days: 7
 
   web-ui-e2e:
@@ -701,7 +701,7 @@ jobs:
         if: failure()
         with:
           name: e2e-traces
-          path: crates/trawl-web-ui/e2e/test-results/
+          path: e2e-artifacts/test-results/
           retention-days: 7
 
   atmosphere-mutation:
@@ -748,7 +748,7 @@ jobs:
         if: always()
         with:
           name: atmosphere-mutation-traces
-          path: crates/trawl-web-ui/e2e/test-results/
+          path: e2e-artifacts/test-results/
           retention-days: 7
 
   fuzz-smoke:

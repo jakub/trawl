@@ -15,9 +15,9 @@
 #[cfg(target_arch = "wasm32")]
 use leptos::prelude::*;
 
-/// Every icon shipped by fleet-ui. Used by the rail, the topbar, the
-/// modal family, and app content. Variants are grouped by where they
-/// are used: shared chrome, rail, then app content.
+/// Every icon shipped by fleet-ui. Used by the sidebar, the command
+/// bar, the modal family, and app content. Variants are grouped by
+/// where they are used: shared chrome, sidebar, then app content.
 ///
 /// The enum itself is a pure `&'static` descriptor that builds on every
 /// target (like [`crate::theme::prefs`] and [`crate::toast::kinds`]) so
@@ -30,7 +30,9 @@ pub enum Icon {
     Chevron,
     Bell,
     Close,
-    // rail
+    Menu,
+    PanelLeft,
+    // sidebar
     Clock,
     Database,
     News,
@@ -55,7 +57,7 @@ pub enum Icon {
 }
 
 /// Renders an [`Icon`] as a 16×16 inline SVG. `stroke_width` defaults
-/// to 1.4 (rail-tuned); `size` defaults to 16 so the SVG matches the
+/// to 1.4 (sidebar-tuned); `size` defaults to 16 so the SVG matches the
 /// viewBox 1:1 unless the caller wants something smaller (topbar uses
 /// 10–14, modal close uses 12).
 #[cfg(target_arch = "wasm32")]
@@ -101,6 +103,14 @@ fn icon_body(icon: Icon) -> AnyView {
         .into_any(),
         Icon::Close => view! {
             <g><path d="m4 4 8 8M12 4l-8 8"/></g>
+        }
+        .into_any(),
+        Icon::Menu => view! {
+            <g><path d="M2 4h12M2 8h12M2 12h12"/></g>
+        }
+        .into_any(),
+        Icon::PanelLeft => view! {
+            <g><rect x="1" y="2" width="14" height="12" rx="1"/><path d="M5.5 2v12"/></g>
         }
         .into_any(),
         Icon::Clock => view! {

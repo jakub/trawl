@@ -99,10 +99,8 @@ struct Card {
 pub fn generate(css_path: &Path, fonts_dir: &Path, out_dir: &Path) -> ExitCode {
     let assets = fs::read_to_string(css_path)
         .and_then(|css| inline_fonts(css, fonts_dir))
-        .and_then(|css| {
-            fs::read_to_string(fonts_dir.join("OFL.txt")).map(|license| (css, license))
-        });
-    let (css, font_license) = match assets {
+        .and_then(|css| inline_licenses(fonts_dir).map(|license| (css, license)));
+    let (css, font_licenses) = match assets {
         Ok(assets) => assets,
         Err(e) => {
             eprintln!("xtask: failed to load design assets: {e}");
@@ -129,7 +127,7 @@ pub fn generate(css_path: &Path, fonts_dir: &Path, out_dir: &Path) -> ExitCode {
 
     for card in &cards {
         let path = out_dir.join(format!("{}.html", card.slug));
-        let html = render_card(card, &css, &font_license);
+        let html = render_card(card, &css, &font_licenses);
         if let Err(e) = fs::write(&path, html) {
             eprintln!("xtask: failed to write {}: {e}", path.display());
             return ExitCode::FAILURE;
@@ -143,7 +141,7 @@ pub fn generate(css_path: &Path, fonts_dir: &Path, out_dir: &Path) -> ExitCode {
 /// stylesheet's dist-relative font URLs with data URLs sourced from the exact
 /// committed fleet-ui files. The Trunk consumers copy those same files.
 fn inline_fonts(mut css: String, fonts_dir: &Path) -> std::io::Result<String> {
-    for name in ["Geist-Variable.woff2", "GeistMono-Variable.woff2"] {
+    for name in ["AlbertSans-Variable.ttf", "ChivoMono-Variable.ttf"] {
         let bytes = fs::read(fonts_dir.join(name))?;
         let relative = format!("fonts/{name}");
         if !css.contains(&relative) {
@@ -152,16 +150,33 @@ fn inline_fonts(mut css: String, fonts_dir: &Path) -> std::io::Result<String> {
                 format!("fleet-ui.css has no `{relative}` font URL"),
             ));
         }
-        let data_url = format!("data:font/woff2;base64,{}", Base64::encode_string(&bytes));
+        let data_url = format!("data:font/ttf;base64,{}", Base64::encode_string(&bytes));
         css = css.replace(&relative, &data_url);
     }
     Ok(css)
 }
 
+/// The OFL obliges us to distribute the license with the font software, and
+/// each family carries its own copyright line, so a card embeds both texts.
+fn inline_licenses(fonts_dir: &Path) -> std::io::Result<String> {
+    let mut license = String::new();
+    for name in ["OFL-AlbertSans.txt", "OFL-ChivoMono.txt"] {
+        let text = fs::read_to_string(fonts_dir.join(name))?;
+        if !license.is_empty() {
+            license.push_str("\n\n");
+        }
+        license.push_str("=== ");
+        license.push_str(name);
+        license.push_str(" ===\n\n");
+        license.push_str(&text);
+    }
+    Ok(license)
+}
+
 /// Wrap a card body in the full HTML shell: `@dsCard` marker first
 /// line, inlined fleet CSS, then the same body stamped into a light
 /// pane and a dark pane.
-fn render_card(card: &Card, fleet_css: &str, font_license: &str) -> String {
+fn render_card(card: &Card, fleet_css: &str, font_licenses: &str) -> String {
     format!(
         r#"<!-- @dsCard group="{group}" -->
 <!doctype html>
@@ -169,8 +184,8 @@ fn render_card(card: &Card, fleet_css: &str, font_license: &str) -> String {
 <head>
 <meta charset="utf-8"/>
 <title>{title} — fleet-ui</title>
-<script type="text/plain" id="geist-font-license">
-{font_license}
+<script type="text/plain" id="font-licenses">
+{font_licenses}
 </script>
 <style>
 {fleet_css}
@@ -194,7 +209,7 @@ fn render_card(card: &Card, fleet_css: &str, font_license: &str) -> String {
         group = card.group,
         title = card.title,
         body = card.body,
-        font_license = font_license,
+        font_licenses = font_licenses,
         stacked = if card.stacked { " ds-stacked" } else { "" },
     )
 }
@@ -311,7 +326,7 @@ fn heading(text: &str) -> String {
 // ── cards ───────────────────────────────────────────────────────────
 
 fn tokens_card() -> Card {
-    let surface_tokens = ["--bg", "--panel", "--panel-2", "--panel-3"];
+    let surface_tokens = ["--bg", "--panel", "--panel-2", "--panel-3", "--well"];
     let ink_tokens = ["--ink", "--ink-2", "--ink-3", "--ink-4"];
     let line_tokens = ["--line", "--line-2", "--selection", "--accent-glow"];
     let semantic_tokens = [
@@ -338,14 +353,14 @@ fn tokens_card() -> Card {
     };
 
     let type_specimens = r#"
-<p class="ds-type" style="font-size:var(--fs-title); font-weight:600">Title — Geist 600 / var(--fs-title)</p>
-<p class="ds-type" style="font-size:var(--fs-section); font-weight:600">Section — Geist 600 / var(--fs-section)</p>
-<p class="ds-type" style="font-size:var(--fs-base)">Body — Geist 400 / var(--fs-base)</p>
-<p class="ds-type" style="font-size:var(--fs-control)">Control — Geist 400 / var(--fs-control)</p>
-<p class="ds-type" style="font-size:var(--fs-label)">Label — Geist 400 / var(--fs-label)</p>
-<p class="ds-type" style="font-size:var(--fs-small); color:var(--ink-3)">Small — Geist 400 / var(--fs-small)</p>
-<p class="ds-type" style="font-family:var(--font-mono); font-size:var(--editor-fs)">Editor mono — Geist Mono / var(--editor-fs)</p>
-<p class="ds-type" style="font-family:var(--font-mono); font-size:var(--table-fs)">Table mono — Geist Mono / var(--table-fs)</p>"#;
+<p class="ds-type" style="font-size:var(--fs-title); font-weight:600">Title — Albert Sans 600 / var(--fs-title)</p>
+<p class="ds-type" style="font-size:var(--fs-section); font-weight:600">Section — Albert Sans 600 / var(--fs-section)</p>
+<p class="ds-type" style="font-size:var(--fs-base)">Body — Albert Sans 400 / var(--fs-base)</p>
+<p class="ds-type" style="font-size:var(--fs-control)">Control — Albert Sans 400 / var(--fs-control)</p>
+<p class="ds-type" style="font-size:var(--fs-label)">Label — Albert Sans 400 / var(--fs-label)</p>
+<p class="ds-type" style="font-size:var(--fs-small); color:var(--ink-3)">Small — Albert Sans 400 / var(--fs-small)</p>
+<p class="ds-type" style="font-family:var(--font-mono); font-size:var(--editor-fs)">Editor mono — Chivo Mono / var(--editor-fs)</p>
+<p class="ds-type" style="font-family:var(--font-mono); font-size:var(--table-fs)">Table mono — Chivo Mono / var(--table-fs)</p>"#;
 
     let spacing_bars: String = ["--row-pad-y", "--row-pad-x", "--ui-gap", "--pad", "--row-h"]
         .iter()
@@ -357,7 +372,7 @@ fn tokens_card() -> Card {
         })
         .collect();
 
-    let shadows: String = ["--shadow-1", "--shadow-2", "--shadow-3", "--shadow-glow"]
+    let shadows: String = ["--shadow-1", "--shadow-2", "--shadow-3"]
         .iter()
         .map(|t| format!(r#"<div class="ds-shadowbox" style="box-shadow:var({t})">{t}</div>"#))
         .collect();
@@ -797,7 +812,7 @@ fn reason_modal_card() -> Card {
 }
 
 fn login_card() -> Card {
-    let submit = btn_full(Variant::Form, Size::Default, true, "Sign In", false);
+    let submit = btn_full(Variant::Form, Size::Default, true, "Sign in", false);
     let body = format!(
         r#"{h}<div class="login-shell"><form class="login-card"><h1><span>traw</span><span class="accent">l</span></h1><p class="subtitle">sign in with your API key</p><label class="field"><span>API key</span><input type="password" autocomplete="off" spellcheck="false"/></label>{submit}</form></div>"#,
         h = heading("Login"),
@@ -813,18 +828,14 @@ fn login_card() -> Card {
 }
 
 fn chrome_card() -> Card {
-    let modes = r#"<div class="modes"><a class="mode active"><span class="dot"></span><span>Search</span></a><a class="mode"><span class="dot"></span><span>Dashboards</span></a><a class="mode"><span class="dot"></span><span>Sources</span></a></div>"#;
     let topbar = format!(
-        r#"<div class="topbar"><div class="brand"><span>traw</span><span class="accent">l</span></div>{modes}<div class="sp"></div><div class="jump">{search}<span class="gh">Jump to query, source, dashboard…</span><span class="kbd">⌘K</span></div><div class="env"><span class="pulse"></span><span>session</span></div><div class="iconbtn">{bell}</div><div class="user-wrap"><div class="user"><div class="avatar">JB</div><span class="who">jakub</span>{chevron}</div></div></div>"#,
+        r#"<header class="topbar"><button type="button" class="nav-toggle" style="display:inline-flex">{menu}</button><h2 class="crumb">Search</h2><div class="sp"></div><button type="button" class="jump">{search}<span class="gh">Go to…</span><span class="kbd">⌘K</span></button><div class="user-wrap"><button type="button" class="user"><span class="avatar">JB</span><span class="who">jakub</span>{chevron}</button></div></header>"#,
+        menu = icon_svg(16, r#"<g><path d="M2 4h12M2 8h12M2 12h12"/></g>"#),
         search = search_icon(),
-        bell = icon_svg(
-            14,
-            r#"<g><path d="M3.5 12V7a4.5 4.5 0 1 1 9 0v5l1 1.5h-11l1-1.5z"/><path d="M7 14a1 1 0 0 0 2 0"/></g>"#
-        ),
         chevron = icon_svg(10, r#"<g><path d="m4 6 4 4 4-4"/></g>"#),
     );
 
-    let rail_item = |icon: &str, label: &str, active: bool, badge: Option<u64>| {
+    let item = |icon: &str, label: &str, active: bool, badge: Option<u64>| {
         let class = if active { "it active" } else { "it" };
         let chip = badge.map_or(String::new(), |n| {
             format!(r#"<span class="badge">{n}</span>"#)
@@ -833,52 +844,47 @@ fn chrome_card() -> Card {
             r#"<a class="{class}" title="{label}">{icon}<span class="lb">{label}</span>{chip}</a>"#
         )
     };
-    let rail = format!(
-        r#"<nav class="rail" style="height:280px">{search}{db}{news}{alert}</nav>"#,
-        search = rail_item(
+    let sidebar = format!(
+        r#"<nav class="rail" style="height:320px"><div class="brand"><span>traw</span><span class="accent">l</span></div><div class="grp">{search}{history}</div><div class="grp" role="group" aria-label="Operations"><span class="grp-lb">Operations</span>{alerts}</div><div class="bot"><a class="it" title="Help"><span class="lb">Help</span></a><button type="button" class="it collapse">{panel}<span class="lb">Collapse</span></button></div></nav>"#,
+        search = item(
             &icon_svg(
-                16,
+                18,
                 r#"<g><circle cx="7" cy="7" r="4.5"/><path d="m10.5 10.5 3 3"/></g>"#
             ),
             "Search",
             true,
             None
         ),
-        db = rail_item(
+        history = item(
             &icon_svg(
-                16,
-                r#"<g><ellipse cx="8" cy="3.5" rx="5" ry="1.5"/><path d="M3 3.5v9c0 .8 2.2 1.5 5 1.5s5-.7 5-1.5v-9"/><path d="M3 8c0 .8 2.2 1.5 5 1.5s5-.7 5-1.5"/></g>"#
+                18,
+                r#"<g><circle cx="8" cy="8" r="6"/><path d="M8 5v3l2 1.5"/></g>"#
             ),
-            "Sources",
+            "History",
             false,
             None
         ),
-        news = rail_item(
+        alerts = item(
             &icon_svg(
-                16,
-                r#"<g><rect x="2" y="3" width="11" height="10" rx="1"/><path d="M4.5 6h6M4.5 8.5h6M4.5 11h4"/></g>"#
-            ),
-            "Stories",
-            false,
-            Some(7)
-        ),
-        alert = rail_item(
-            &icon_svg(
-                16,
+                18,
                 r#"<g><path d="M8 2 14 13H2z"/><path d="M8 6.5v3M8 11.5v.01" stroke-linecap="round"/></g>"#
             ),
             "Alerts",
             false,
-            None
+            Some(7)
+        ),
+        panel = icon_svg(
+            18,
+            r#"<g><rect x="1" y="2" width="14" height="12" rx="1"/><path d="M5.5 2v12"/></g>"#
         ),
     );
 
-    let user_menu = r#"<div class="user-wrap" style="display:inline-block"><div class="user-menu" style="position:static; animation:none"><div class="hdr"><div class="name">jakub</div><div class="mail">admin</div></div><div class="item disabled"><span>Profile</span></div><div class="item disabled"><span>API tokens</span></div><div class="item"><span>Switch to dark theme</span><span class="kbd">⌘⇧L</span></div><div class="sep"></div><div class="item danger"><span>Sign Out</span></div></div></div>"#;
+    let user_menu = r#"<div class="user-wrap" style="display:inline-block"><div class="user-menu" style="position:static; animation:none"><div class="hdr"><div class="name">jakub</div><div class="mail">admin</div></div><div class="item"><span>Switch to dark theme</span></div><div class="sep"></div><div class="item danger"><span>Sign Out</span></div></div></div>"#;
 
     let body = format!(
-        "{h_top}{topbar}{h_rail}{rail}{h_menu}{user_menu}",
-        h_top = heading("TopBar"),
-        h_rail = heading("Rail"),
+        "{h_top}{topbar}{h_side}{sidebar}{h_menu}{user_menu}",
+        h_top = heading("Command bar"),
+        h_side = heading("Sidebar"),
         h_menu = heading("User menu (open)"),
     );
 

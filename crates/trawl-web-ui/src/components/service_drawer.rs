@@ -76,6 +76,11 @@ pub fn ServiceDrawer(
     /// Drill into a field's case file. The page owns the navigation; the
     /// drawer only names the field.
     on_open_field: Callback<String>,
+    /// Render in flow beside the services list rather than over a scrim
+    /// (ADR-0032). The page feeds its viewport query straight in; the
+    /// panes mount once and stay mounted across the breakpoint.
+    #[prop(into, optional)]
+    docked: Signal<bool>,
 ) -> impl IntoView {
     let bus = expect_context::<ToastBus>();
     let svc_for_card = svc.clone();
@@ -126,6 +131,7 @@ pub fn ServiceDrawer(
             active_tab=eff_tab
             on_tab_change=on_tab_change
             on_close=on_close
+            docked=docked
             // Deliberately not the 14px default; the `close_size` prop
             // docs in fleet-ui explain why the sizes are not unified.
             close_size=12

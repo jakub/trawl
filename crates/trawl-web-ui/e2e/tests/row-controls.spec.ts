@@ -275,22 +275,26 @@ test('schema drawer: Back skips the replace', async ({ page, request }) => {
   await expect(page).toHaveURL(/\/search\/history$/);
 });
 
-test('runs link: Back returns to runs', async ({ page, request }) => {
+test('runs row selects in place; the receipt opens the net and Back returns to runs', async ({ page, request }) => {
   await resetScenario(request, 'corpus');
   await page.goto('/jobs/runs');
 
   const link = page.locator(SEL.tableRow).first().locator(SEL.rowStretch);
   await expect(link).toHaveJSProperty('tagName', 'A');
   await expect(link).toHaveAccessibleName(CORPUS.netName);
-  // The one row link that PUSHES: the runs list is a page worth
-  // returning to, so no `replace` property is set at all.
-  await expect(link).toHaveJSProperty('replace', undefined);
+  // Selecting a run REPLACES: reading down a list is one history entry,
+  // not one per row glanced at.
+  await expect(link).toHaveJSProperty('replace', true);
 
   await link.click();
+  await expect(page).toHaveURL(/run=\d+&net=\d+/);
+
+  // The receipt's Open net is the one control here that PUSHES.
+  await page.locator(SEL.runOpenNet).click();
   await expect(page).toHaveURL(new RegExp(`net=${CORPUS.netId}&ntab=runs`));
 
   await page.goBack();
-  await expect(page).toHaveURL(/\/jobs\/runs$/);
+  await expect(page).toHaveURL(/\/jobs\/runs\?run=/);
 });
 
 test('history row: over-bound query is refused, not navigated', async ({ page, request }) => {

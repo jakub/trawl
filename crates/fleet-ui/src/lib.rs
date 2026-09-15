@@ -7,7 +7,7 @@
 //! Ships design tokens, reset + base styles, the theme preference
 //! system, and the typed component surface, by category:
 //!
-//! - **chrome** — `Shell`, `TopBar`, `Rail`, `Login`, `Toasts`;
+//! - **chrome** — `Shell`, `TopBar`, `Sidebar`, `Login`, `Toasts`;
 //! - **overlays** — the `Modal` family, `Drawer`, `ActionsMenu`, all
 //!   arbitrated by the [`overlay`] stack (topmost-only Escape + focus
 //!   ownership);
@@ -31,9 +31,9 @@
 //! layers that build on every target — [`theme::prefs`],
 //! [`toast::kinds`], [`toast::stack`], [`button::variant`],
 //! [`login::validate`], [`badge::tone`], [`status_dot::tone`],
-//! [`sparkline::geometry`], [`loaded::state`], [`load_more`]'s phase
-//! resolution, [`copy_button`]'s toast decision,
-//! [`modal::confirm_state`], the [`overlay`] stack, the [`time`]
+//! [`sparkline::geometry`], [`loaded::state`], [`sidebar`]'s group
+//! model, [`load_more`]'s phase resolution, [`copy_button`]'s toast
+//! decision, [`modal::confirm_state`], the [`overlay`] stack, the [`time`]
 //! formatters, [`atmosphere::palette`] (the shader knobs site, its
 //! stops parity-pinned against the stylesheet), and the [`icon::Icon`]
 //! enum — so their contracts (localStorage JSON, CSS-class
@@ -84,8 +84,6 @@ pub(crate) mod menu;
 pub mod overflow_hint;
 #[cfg(target_arch = "wasm32")]
 pub mod pager;
-#[cfg(target_arch = "wasm32")]
-pub mod rail;
 // Roving-tabindex index arithmetic, crate-internal and native-tested
 // for the same reason.
 #[cfg(any(target_arch = "wasm32", test))]
@@ -94,6 +92,7 @@ pub(crate) mod roving;
 pub mod search_input;
 #[cfg(target_arch = "wasm32")]
 pub mod shell;
+pub mod sidebar;
 #[cfg(target_arch = "wasm32")]
 pub mod tabs;
 #[cfg(target_arch = "wasm32")]
@@ -114,9 +113,10 @@ pub use page_window::{PageTotal, PageWindow};
 pub use range_dialog::RangeDialog;
 pub use range_dialog::{RangePreset, RangeValue};
 pub use segmented::{SegmentedOption, segmented_class};
+pub use sidebar::{RailItem, SidebarGroup};
 pub use sparkline::SparkPath;
 pub use status_dot::StatusTone;
-pub use theme::{RowStyle, Theme};
+pub use theme::{Details, RowStyle, Rows, Theme};
 pub use toast::{Toast, ToastKind, ToastStack};
 
 #[cfg(target_arch = "wasm32")]
@@ -154,13 +154,13 @@ pub use overflow_hint::OverflowHint;
 #[cfg(target_arch = "wasm32")]
 pub use pager::Pager;
 #[cfg(target_arch = "wasm32")]
-pub use rail::{Rail, RailItem};
-#[cfg(target_arch = "wasm32")]
 pub use search_input::SearchInput;
 #[cfg(target_arch = "wasm32")]
 pub use segmented::Segmented;
 #[cfg(target_arch = "wasm32")]
 pub use shell::Shell;
+#[cfg(target_arch = "wasm32")]
+pub use sidebar::Sidebar;
 #[cfg(target_arch = "wasm32")]
 pub use sparkline::Sparkline;
 #[cfg(target_arch = "wasm32")]
@@ -176,4 +176,4 @@ pub use toast::{ToastBus, Toasts};
 #[cfg(target_arch = "wasm32")]
 pub use toggle::Toggle;
 #[cfg(target_arch = "wasm32")]
-pub use topbar::{AppLink, ModeTab, TopBar, UserInfo};
+pub use topbar::{TopBar, UserInfo};

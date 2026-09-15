@@ -21,7 +21,7 @@ pub struct ParseThemeError(pub String);
 
 impl fmt::Display for ParseThemeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "unknown theme/rowstyle value: `{}`", self.0)
+        write!(f, "unknown ui pref value: `{}`", self.0)
     }
 }
 
@@ -95,6 +95,102 @@ impl FromStr for RowStyle {
     }
 }
 
+/// Sidebar presentation — expanded is the default; collapsed is
+/// icon-only, with every label kept as screen-reader text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sidebar {
+    Expanded,
+    Collapsed,
+}
+
+impl Sidebar {
+    #[must_use]
+    pub fn as_attr(self) -> &'static str {
+        match self {
+            Self::Expanded => "expanded",
+            Self::Collapsed => "collapsed",
+        }
+    }
+
+    #[must_use]
+    pub fn toggled(self) -> Self {
+        match self {
+            Self::Expanded => Self::Collapsed,
+            Self::Collapsed => Self::Expanded,
+        }
+    }
+}
+
+impl FromStr for Sidebar {
+    type Err = ParseThemeError;
+    fn from_str(s: &str) -> Result<Self, ParseThemeError> {
+        match s {
+            "collapsed" => Ok(Self::Collapsed),
+            "expanded" => Ok(Self::Expanded),
+            _ => Err(ParseThemeError(s.to_owned())),
+        }
+    }
+}
+
+/// How a result row's fields are read — inline is the default (the
+/// row expands in place), inspector docks a panel beside the table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Details {
+    Inline,
+    Inspector,
+}
+
+impl Details {
+    #[must_use]
+    pub fn as_attr(self) -> &'static str {
+        match self {
+            Self::Inline => "inline",
+            Self::Inspector => "inspector",
+        }
+    }
+}
+
+impl FromStr for Details {
+    type Err = ParseThemeError;
+    fn from_str(s: &str) -> Result<Self, ParseThemeError> {
+        match s {
+            "inspector" => Ok(Self::Inspector),
+            "inline" => Ok(Self::Inline),
+            _ => Err(ParseThemeError(s.to_owned())),
+        }
+    }
+}
+
+/// How a result row is laid out — compact is the default column table,
+/// message-first promotes the message to full width with the rest of
+/// the row as a muted secondary line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rows {
+    Compact,
+    MessageFirst,
+}
+
+impl Rows {
+    #[must_use]
+    pub fn as_attr(self) -> &'static str {
+        match self {
+            Self::Compact => "compact",
+            Self::MessageFirst => "message-first",
+        }
+    }
+}
+
+impl FromStr for Rows {
+    type Err = ParseThemeError;
+    fn from_str(s: &str) -> Result<Self, ParseThemeError> {
+        match s {
+            "message-first" => Ok(Self::MessageFirst),
+            "compact" => Ok(Self::Compact),
+            _ => Err(ParseThemeError(s.to_owned())),
+        }
+    }
+}
+
 /// Persisted preference snapshot — the JSON shape on disk in
 /// `localStorage`. `pub(crate)` so the wasm `runtime` layer can build,
 /// read, and write it without leaking the on-disk shape to consumers.
@@ -107,6 +203,9 @@ impl FromStr for RowStyle {
 pub(crate) struct Stored {
     pub(crate) theme: Theme,
     pub(crate) rowstyle: RowStyle,
+    pub(crate) sidebar: Sidebar,
+    pub(crate) details: Details,
+    pub(crate) rows: Rows,
 }
 
 impl Default for Stored {
@@ -114,6 +213,9 @@ impl Default for Stored {
         Self {
             theme: Theme::Light,
             rowstyle: RowStyle::Bordered,
+            sidebar: Sidebar::Expanded,
+            details: Details::Inline,
+            rows: Rows::Compact,
         }
     }
 }
@@ -153,6 +255,9 @@ pub(crate) fn parse_stored(raw: &str) -> ParseOutcome {
     let mut out = Stored::default();
     parse_field(&value, "theme", &mut warnings, |t| out.theme = t);
     parse_field(&value, "rowstyle", &mut warnings, |r| out.rowstyle = r);
+    parse_field(&value, "sidebar", &mut warnings, |s| out.sidebar = s);
+    parse_field(&value, "details", &mut warnings, |d| out.details = d);
+    parse_field(&value, "rows", &mut warnings, |r| out.rows = r);
     ParseOutcome {
         stored: out,
         warnings,
@@ -195,6 +300,28 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_round_trips() {
+        for v in [Sidebar::Expanded, Sidebar::Collapsed] {
+            assert_eq!(Sidebar::from_str(v.as_attr()), Ok(v));
+            assert_eq!(v.toggled().toggled(), v);
+        }
+    }
+
+    #[test]
+    fn details_round_trips() {
+        for v in [Details::Inline, Details::Inspector] {
+            assert_eq!(Details::from_str(v.as_attr()), Ok(v));
+        }
+    }
+
+    #[test]
+    fn rows_round_trips() {
+        for v in [Rows::Compact, Rows::MessageFirst] {
+            assert_eq!(Rows::from_str(v.as_attr()), Ok(v));
+        }
+    }
+
+    #[test]
     fn parse_error_carries_offending_input() {
         let err = Theme::from_str("midnight").unwrap_err();
         assert_eq!(err.0, "midnight");
@@ -223,15 +350,22 @@ mod tests {
 
     #[test]
     fn parse_stored_unknown_variant_warns_and_keeps_default() {
-        let out = parse_stored(r#"{"theme":"midnight"}"#);
-        assert_eq!(
-            out.stored,
-            Stored::default(),
-            "unknown theme value must not mutate the snapshot"
-        );
-        assert_eq!(out.warnings.len(), 1);
-        assert!(out.warnings[0].contains("midnight"));
-        assert!(out.warnings[0].contains("theme"));
+        for (raw, field, value) in [
+            (r#"{"theme":"midnight"}"#, "theme", "midnight"),
+            (r#"{"sidebar":"hidden"}"#, "sidebar", "hidden"),
+            (r#"{"details":"popover"}"#, "details", "popover"),
+            (r#"{"rows":"roomy"}"#, "rows", "roomy"),
+        ] {
+            let out = parse_stored(raw);
+            assert_eq!(
+                out.stored,
+                Stored::default(),
+                "unknown {field} value must not mutate the snapshot"
+            );
+            assert_eq!(out.warnings.len(), 1, "{raw}");
+            assert!(out.warnings[0].contains(value), "{raw}");
+            assert!(out.warnings[0].contains(field), "{raw}");
+        }
     }
 
     #[test]
@@ -256,13 +390,16 @@ mod tests {
 
     #[test]
     fn parse_stored_full_payload_round_trips() {
-        let raw = r#"{"theme":"dark","rowstyle":"plain"}"#;
+        let raw = r#"{"theme":"dark","rowstyle":"plain","sidebar":"collapsed","details":"inspector","rows":"message-first"}"#;
         let out = parse_stored(raw);
         assert_eq!(
             out.stored,
             Stored {
                 theme: Theme::Dark,
                 rowstyle: RowStyle::Plain,
+                sidebar: Sidebar::Collapsed,
+                details: Details::Inspector,
+                rows: Rows::MessageFirst,
             }
         );
         assert!(out.warnings.is_empty());

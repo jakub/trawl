@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Application mode (top-bar tabs): Search / Jobs / Settings.
+//! Application mode: the sidebar group key (Search / Jobs / Settings).
 //!
 //! Distinct from the search-page `Mode` (Snapshot/Live) — that one
 //! lives under `state::query` and only governs the search workspace's
@@ -12,9 +12,10 @@
 //! `section`'s native tests can name modes; `from_url` (the reactive
 //! `Memo`) is wasm32-only.
 
-// On native, only the pure enum feeds `section`'s tests — the label /
-// path accessors are wasm-only consumers.
-#![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+// `ALL` and `mode_from_path` exist for `section`'s native tests and for
+// `from_url`; neither target reaches every item, so the module carries
+// the allowance rather than sprinkling it per item.
+#![allow(dead_code)]
 
 #[cfg(target_arch = "wasm32")]
 use leptos::prelude::*;
@@ -30,24 +31,6 @@ pub enum AppMode {
 
 impl AppMode {
     pub const ALL: [Self; 3] = [Self::Search, Self::Jobs, Self::Settings];
-
-    #[must_use]
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Search => "Search",
-            Self::Jobs => "Jobs",
-            Self::Settings => "Settings",
-        }
-    }
-
-    #[must_use]
-    pub fn default_path(self) -> &'static str {
-        match self {
-            Self::Search => "/search",
-            Self::Jobs => "/jobs/nets",
-            Self::Settings => "/settings",
-        }
-    }
 }
 
 fn mode_from_path(path: &str) -> AppMode {

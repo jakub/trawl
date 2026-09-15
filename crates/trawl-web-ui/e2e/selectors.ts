@@ -25,11 +25,16 @@ export const SEL = {
   paletteLabel: '.command-palette-label',
   paletteCurrent: '.command-palette-current',
   paletteEmpty: '.command-palette-empty',
-  paletteModeLink: '.topbar .modes a',
-  paletteRailLink: 'nav.rail > a[title]',
+  paletteRailLink: 'nav.rail .grp > a[title]',
   paletteKbd: '.topbar button.jump .kbd',
   // The external Help link occupies the bottom slot, outside route commands.
   helpLink: 'nav.rail .bot a[title="Help"]',
+  /// crates/fleet-ui/src/topbar.rs — opens the sidebar overlay below 900px.
+  navToggle: '.topbar button.nav-toggle',
+  /// crates/fleet-ui/src/sidebar.rs — the collapse control, below the bottom slot.
+  sidebarCollapse: 'nav.rail .bot button.collapse',
+  /// crates/fleet-ui/src/topbar.rs — the command bar's page title.
+  topbarCrumb: '.topbar .crumb',
 
   historyAwayLink: 'nav.rail a[title="Schema"]',
   historyPage: '.history-page',
@@ -38,7 +43,7 @@ export const SEL = {
 
   /// crates/fleet-ui/src/modal/confirm.rs ConfirmModal.
   healthConfirm: '[role="alertdialog"]',
-  /// crates/fleet-ui/src/rail.rs title, crates/trawl-web-ui/src/state/section.rs Schema label.
+  /// crates/fleet-ui/src/sidebar.rs title, crates/trawl-web-ui/src/state/section.rs Schema label.
   healthAwayLink: 'nav.rail a[title="Schema"]',
   /// crates/trawl-web-ui/src/components/status_bar.rs hot buffer group.
   healthFooterHot: '.statusbar .grp[title="Hot buffer (events / bytes)"]',
@@ -54,6 +59,9 @@ export const SEL = {
   healthLiveState: '.health-live-state',
   /// crates/trawl-web-ui/src/pages/health.rs HealthPage and HealthQueries.
   healthQueries: '.health-queries',
+  /// crates/trawl-web-ui/src/pages/health.rs — one check row: the
+  /// friendly name over the raw key, with the outcome badge beside it.
+  healthCheck: '.health-check',
   /// crates/trawl-web-ui/src/pages/health.rs named keyboard-scrollable query region.
   healthQueryScroll: '.health-query-scroll',
   /// crates/trawl-web-ui/src/pages/health.rs HealthPage and HealthQueries.
@@ -64,7 +72,7 @@ export const SEL = {
   healthRow: 'tr[data-query-id]',
   /// crates/trawl-web-ui/src/pages/health.rs HealthPage and HealthQueries.
   healthOwnRow: 'tr[data-own="true"]',
-  /// crates/fleet-ui/src/rail.rs title, crates/trawl-web-ui/src/state/section.rs Health label and path.
+  /// crates/fleet-ui/src/sidebar.rs title, crates/trawl-web-ui/src/state/section.rs Health label and path.
   railHealthLink: 'nav.rail a[title="Health"]',
 
   /// crates/trawl-web-ui/src/pages/search.rs LiveRawTable.
@@ -74,7 +82,7 @@ export const SEL = {
   /// CodeMirror's own contenteditable content div (standard CM6 class,
   /// not app-owned) — the click target that focuses the editor.
   cmContent: '.dsl-editor .cm-content',
-  /// crates/fleet-ui/src/rail.rs — <A title={label}> per RailItem; trawl's
+  /// crates/fleet-ui/src/sidebar.rs — <A title={label}> per RailItem; trawl's
   /// item list is crates/trawl-web-ui/src/state/section.rs (label "History",
   /// path "/search/history").
   railHistoryLink: 'nav.rail a[title="History"]',
@@ -132,9 +140,6 @@ export const SEL = {
   /// strip itself. Absent in live, where the ring is the active result
   /// source and a page-scoped strip would describe nothing.
   histoStrip: '.histo',
-  /// crates/trawl-web-ui/src/components/histogram.rs — the one caption
-  /// naming the window the effective query ran under.
-  histoCaption: '.histo-caption',
   /// crates/trawl-web-ui/src/pages/search.rs — the tab strip's trailing
   /// Export action, which opens the export modal.
   exportAction: '.tabs .action.export',
@@ -207,13 +212,23 @@ export const SEL = {
   /// crates/fleet-ui/src/toast/runtime.rs — one toast's dismiss button.
   toastDismiss: '.toast button.x',
   /// crates/trawl-web-ui/src/components/editor_wrap.rs — a tool link
-  /// under the editor. Save is a plain button; Share is fleet-ui's
-  /// CopyButton in bare mode, which renders the caller's class on its
-  /// own native button. Since ADR-0029 Format is a button too, so this
-  /// matches THREE buttons, not two.
+  /// under the editor. Save as net is a plain button; Copy search URL is
+  /// fleet-ui's CopyButton in bare mode, which renders the caller's
+  /// class on its own native button. Since ADR-0029 Format is a button
+  /// too, so this matches THREE buttons, not two.
   editorTool: '.editor-tools button.tool',
 
   // -- the stretched row control and its neighbours (ADR-0029) -------
+  /// crates/trawl-web-ui/src/pages/schema.rs — the sheet card a list
+  /// page's table sits in. Its header carries the list's title, the
+  /// count of what is shown, and the filter input (ADR-0032).
+  listSheet: '.list-sheet',
+  /// crates/trawl-web-ui/src/pages/runs.rs — the selected run's sheet:
+  /// its stored result beside the execution receipt.
+  runDetail: '.run-detail',
+  /// The receipt's one PUSHING control, which opens the net's Runs tab
+  /// so Back returns to the runs page with this run still selected.
+  runOpenNet: '.run-detail a.open-net',
   /// One data row of a `.tbl` div table. Every list page mounts exactly
   /// one `.tbl-body`, so this is unambiguous per page: schema services,
   /// nets, runs and history all render the same row shape.
@@ -248,6 +263,18 @@ export const SEL = {
   /// A key/value tag inside that detail cell, which adds an include
   /// filter for the field it names.
   resultsDetailTag: '.results-table td.detail button.tag',
+  /// The row the docked inspector is describing. Counting these is how
+  /// a spec says "exactly one event is open": the inspector can only
+  /// ever hold one, and the class is the visible half of that claim.
+  resultsSelectedRow: '.results-table tbody tr.selected',
+  /// The docked inspector panel itself. Matched by id because that id
+  /// is also what the caret's `aria-controls` and the "Jump to details"
+  /// link point at.
+  inspector: '#search-inspector',
+  /// One Include / Exclude / Copy control inside the inspector's
+  /// key-value grid. Told apart by accessible name, which carries the
+  /// field and value the press acts on.
+  inspectorTag: '#search-inspector button.tag',
   /// A sortable column header of the real `<table>`. `aria-sort` rides
   /// the CELL, so the assertion target is the th and not its button.
   resultsSortHeader: '.results-table th.sortable',
@@ -302,6 +329,38 @@ export const SEL = {
   facetFilterInput: '.facets .inp-wrap input',
 
   // -- chrome ---------------------------------------------------------
+  /// crates/trawl-web-ui/src/components/meta_strip.rs — the query
+  /// console's closing row, which describes the EXECUTED query: window,
+  /// chips, mode badge and row count. It never reads the editor buffer,
+  /// so a spec that typed and did not Haul asserts NO change here.
+  scopeStrip: '.scope',
+  /// The window the executed query ran under.
+  scopeWindow: '.scope-window',
+  /// crates/trawl-web-ui/src/components/editor_wrap.rs — the console
+  /// header's draft marker, rendered only when the buffer differs from
+  /// the executed query. It navigates nothing.
+  draftState: '.console-hd .draft',
+  /// crates/trawl-web-ui/src/pages/search.rs — the reading-mode
+  /// disclosure in the result header. A button, so it is the thing that
+  /// opens the popover and the thing `aria-expanded` rides.
+  viewControl: '.tabs button.action.view',
+  /// The popover it opens, holding the Details and Rows groups.
+  viewPanel: '#search-view',
+  /// crates/trawl-web-ui/src/components/exact_table.rs — the aggregate
+  /// result's exact numbers. Distinct from the raw table by class: this
+  /// one has no expansion column and no Include on a metric (F02).
+  exactTable: '.results-table.exact',
+  /// Its one control, on a grouped column only. A metric column has
+  /// none, which is the F02 fix a spec can count.
+  groupSearch: '.results-table.exact button.grp-search',
+  /// crates/trawl-web-ui/src/components/cat_chart.rs — the bars beside
+  /// that table. aria-hidden, so a spec reads it by class and reads the
+  /// numbers themselves off the table.
+  catChart: '.cat-chart',
+  /// crates/trawl-web-ui/src/pages/search.rs — the first of the two
+  /// keyboard bypasses, ahead of the filter rail in DOM order. Matched
+  /// by href because both links share the class.
+  skipToQuery: 'a.skip-link[href="#search-query"]',
   /// crates/trawl-web-ui/src/components/meta_strip.rs — one active
   /// filter's chip. Counting these is how a spec says "exactly one
   /// filter was added": the URL payload is base64 and says nothing on
@@ -345,14 +404,12 @@ export const SEL = {
   /// group's own label id: the drawer mounts other Segmented strips and
   /// an unscoped `.seg-opt` would reach them.
   windowOption: '[role="group"][aria-labelledby="net-window-label"] .seg-opt',
-  /// The fixed span's custom box. Its preset chips are the same
-  /// `intervalChip` shape, which is why the id is what tells the two
-  /// strips apart.
+  /// The fixed span's box. One span is one value in the server's
+  /// grammar, so it is a plain input rather than a second preset strip
+  /// beside the interval's.
   windowSpanInput: '#net-window-span',
-  /// The span strip's own chips, found through the box they share a
-  /// parent with: `intervalChip` alone matches the interval strip too,
-  /// and both strips carry a `1h`.
-  windowSpanChip: '.interval-chips:has(+ #net-window-span) button.interval-chip',
+  /// Its helper paragraph, paired to the box by aria-describedby.
+  windowSpanHint: '#net-window-span-help',
   /// The lag box, present only while the window is not query mode.
   windowLagInput: '#net-lag',
   /// Its helper paragraph, paired to the box by aria-describedby.
@@ -371,6 +428,9 @@ export const SEL = {
   /// crates/trawl-web-ui/src/components/net_drawer.rs — one row of the
   /// preview's current page.
   previewRow: 'table tbody tr',
+  /// The named scroll region the preview's rows sit in. The pager, the
+  /// cap line and Run-query-again are siblings of it, never inside.
+  previewScroll: '.preview-scroll',
   /// The line naming rows the response never carried. Absent when paging
   /// covers everything.
   previewCap: '.preview-cap',
@@ -429,9 +489,17 @@ export const COPY = {
   /// crates/trawl-web-ui/src/pages/search.rs — the tab strip's Stop
   /// live button text.
   stopLiveText: 'Stop live',
-  /// crates/trawl-web-ui/src/components/histogram.rs — the histogram
-  /// caption's lead-in, before the window the query ran under.
-  histoCaptionPrefix: 'Current page · window: ',
+  /// crates/trawl-web-ui/src/pages/search.rs — the warn badge the result
+  /// header shows when the server cut the answer short.
+  truncatedBadge: 'Truncated',
+  /// crates/trawl-web-ui/src/components/editor_wrap.rs — the console
+  /// header marks an editor buffer that differs from the executed query.
+  draftDirty: 'Edited',
+  /// crates/trawl-web-ui/src/components/editor_wrap.rs — the visible
+  /// names of two of the three editor tools. Both say what they act on,
+  /// since "Save" and "Share" named neither the net nor the URL.
+  saveAsNetTool: 'Save as net',
+  copyUrlTool: 'Copy search URL',
   /// crates/trawl-web-ui/src/search_url.rs Malformed::message + Param::noun.
   urlNoticeFiltersPrefix: "This link's filters could not be read:",
   /// crates/trawl-web-ui/src/search_url.rs Malformed::message + Param::noun.
@@ -545,13 +613,17 @@ export const COPY = {
   // -- the schedule window form ---------------------------------------
   /// crates/trawl-web-ui/src/components/net_drawer.rs — the window
   /// strip's group label and its three option labels, in strip order.
-  windowLabel: 'Window',
+  windowLabel: 'Each run covers',
   windowOptionQuery: 'Query text',
   windowOptionSinceLast: 'Since last run',
   windowOptionFixed: 'Fixed span',
-  /// The fixed span's field label, and the lag's.
-  windowSpanLabel: 'Span',
-  windowLagLabel: 'Lag',
+  /// The interval strip's field label, and the max-runs box's.
+  intervalLabel: 'Run every',
+  maxRunsLabel: 'Keep schedule running for',
+  /// The fixed span's field label, its helper, and the lag's label.
+  windowSpanLabel: 'Trailing span',
+  windowSpanHint: 'At least 60 seconds.',
+  windowLagLabel: 'Late-arrival lag',
   /// Each mode's hint. The query-mode one continues into a `<code>`
   /// element, so only the sentence before it is pinned.
   windowQueryHint: 'Runs the saved text as written.',
@@ -562,7 +634,7 @@ export const COPY = {
   /// What a changed window or interval warns about.
   windowRescheduleHint: 'Changing the window or interval may run the schedule immediately.',
   /// The lag box's own helper.
-  windowLagHintText: 'Late-arrival allowance. Both window bounds move back by this much. Blank is none.',
+  windowLagHintText: 'Moves both bounds back by this much. Blank is none.',
   /// crates/trawl-web-ui/src/components/net_drawer.rs — the manual run
   /// action, withdrawn when the SAVED schedule carries a window.
   netRunAction: '⏱ Run',

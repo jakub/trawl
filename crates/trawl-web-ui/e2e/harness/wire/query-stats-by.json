@@ -1,0 +1,12 @@
+{
+  "columns": [{ "name": "status" }, { "name": "count" }],
+  "rows": [
+    ["200", 940],
+    ["404", 150],
+    ["500", 60],
+    ["503", -1],
+    ["301", null]
+  ],
+  "truncated": false,
+  "pagination": { "limit": 50, "offset": 0, "returned": 5 }
+}
