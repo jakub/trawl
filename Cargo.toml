@@ -145,6 +145,7 @@ strip = "symbols"
 inherits = "release"
 opt-level = "z"
 strip = "symbols"
+lto = "fat"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
