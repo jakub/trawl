@@ -79,12 +79,14 @@ for (const surface of ['global', 'drawer']) {
     await next.focus();
     const mounted = await next.elementHandle();
     await expect.poll(() => Boolean(release), { timeout: 8000 }).toBe(true);
+    await expect(footer.locator('.results-summary')).toHaveText('1–20 of 43');
     await expect(next).toBeEnabled();
     await expect(next).toBeFocused();
     expect(await mounted!.evaluate(el => el.isConnected)).toBe(true);
     await next.click();
     await expect(next).toBeDisabled();
     expect(reads).toBe(2);
+    if (surface === 'global') await expect(footer.locator('.results-summary')).toHaveText('Loading…');
     release!();
     await expect(footer.locator('.results-summary')).toHaveText('21–40 of 43');
     expect(offsets).toEqual(['0', '0', '20']);
@@ -265,6 +267,7 @@ test('Runs failed page transition exposes Retry over retained success and keeps 
   await footer.getByRole('button', { name: 'Next' }).click();
   await expect(frame.getByRole('button', { name: 'Retry', exact: true })).toBeVisible();
   await expect(frame).toContainText("Couldn't load runs");
+  await expect(footer.locator('.results-summary')).toHaveText('Runs unavailable');
   await expect(rows).toHaveCount(0);
   await expect(footer.getByRole('button', { name: 'Next' })).toBeDisabled();
   await expect(footer.getByRole('button', { name: 'Prev' })).toBeDisabled();
@@ -272,6 +275,7 @@ test('Runs failed page transition exposes Retry over retained success and keeps 
   await expect.poll(() => Boolean(release)).toBe(true);
   await expect(frame).toHaveAttribute('aria-busy', 'true');
   await expect(frame.getByRole('button', { name: 'Retry', exact: true })).toHaveCount(0);
+  await expect(footer.locator('.results-summary')).toHaveText('Loading…');
   await expect(rows).toHaveCount(0);
   release!();
   await expect(footer.locator('.results-summary')).toHaveText('21–40 of 43');
@@ -281,6 +285,7 @@ test('Runs failed page transition exposes Retry over retained success and keeps 
   await expect.poll(() => reads).toBe(4);
   await expect(page.getByRole('status').filter({ hasText: 'Refresh failed' })).toBeVisible();
   expect(await rows.allTextContents()).toEqual(before);
+  await expect(footer.locator('.results-summary')).toHaveText('21–40 of 43');
   await expect(footer.getByRole('button', { name: 'Prev' })).toBeEnabled();
   await expect(frame.getByRole('button', { name: 'Retry', exact: true })).toHaveCount(0);
 });
@@ -302,19 +307,25 @@ test('Runs competing sorts hide old rows and discard the older response before t
   await page.goto('/jobs/runs');
   const frame = page.getByRole('region', { name: 'Recent runs', exact: true });
   const rows = frame.locator('tbody tr');
+  const summary = frame.locator('.results-summary');
   await expect(rows.first()).toContainText('started response');
+  await page.getByPlaceholder('Filter by net…').fill('response');
+  await expect(summary).toHaveText('1–3 of 3 · 3 matches on this page');
   await frame.getByRole('button', { name: 'Sort by Net', exact: true }).click();
   await expect.poll(() => releases.length).toBe(1);
+  await expect(summary).toHaveText('Loading…');
   await frame.getByRole('button', { name: 'Sort by Rows', exact: true }).click();
   await expect(frame).toHaveAttribute('aria-busy', 'true');
   await expect(rows).toHaveCount(0);
   releases[0]();
   await expect.poll(() => releases.length).toBe(2);
   expect(requests).toEqual(['started', 'net', 'rows']);
+  await expect(summary).toHaveText('Loading…');
   await expect(rows).toHaveCount(0);
   await expect(frame).toHaveAttribute('aria-busy', 'true');
   releases[1]();
   await expect(rows.first()).toContainText('rows response');
+  await expect(summary).toHaveText('1–3 of 3 · 3 matches on this page');
   await expect(frame).not.toContainText('net response');
   await expect(frame).toHaveAttribute('aria-busy', 'false');
 });
@@ -373,4 +384,15 @@ test('Runs selection owns its name and result through paging and a delayed A-to-
   await expect(detail.locator('.results-summary')).toHaveText('21–40 of 45');
   expect(await mountedB!.evaluate(el => el.isConnected)).toBe(true);
   expect(detailReads).toBe(2);
+});
+
+test('Runs completed empty response reports zero entries', async ({ page, request }) => {
+  await request.post('/__ctl/reset', { data: { scenario: 'pagination', pagination: { runsTotal: 0 } } });
+  await page.goto('/jobs/runs');
+  const frame = page.getByRole('region', { name: 'Recent runs', exact: true });
+  await expect(frame.locator('.results-summary')).toHaveText('0 entries');
+  await expect(frame).toHaveAttribute('aria-busy', 'false');
+  await expect(frame.locator('tbody tr')).toHaveCount(0);
+  await expect(frame.getByRole('button', { name: 'Prev' })).toBeDisabled();
+  await expect(frame.getByRole('button', { name: 'Next' })).toBeDisabled();
 });

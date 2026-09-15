@@ -29,7 +29,7 @@ use crate::components::sort_th::table_sort_th;
 use crate::state::query::{Mode, RangeSpec, navigator, report_refusal};
 use fleet_ui::time::{format_duration, time_ago};
 use fleet_ui::{
-    Badge, Drawer, LoadState, Loaded, OffsetPager, PageTotal, PageWindow, SearchInput, StatusTone,
+    Badge, Drawer, LoadState, Loaded, PageTotal, PageWindow, Pager, SearchInput, StatusTone,
     ToastBus, Tone,
 };
 
@@ -270,12 +270,19 @@ pub fn RunsPage() -> impl IntoView {
         )
         .expect("runs page comes from checked pager navigation")
     });
-    let suffix = Signal::derive(move || {
-        if filter.get().is_empty() {
+    let summary = Signal::derive(move || {
+        if current_runs.get().is_none() {
+            return match list_state.get() {
+                LoadState::Error(_) => "Runs unavailable".to_string(),
+                _ => "Loading…".to_string(),
+            };
+        }
+        let suffix = if filter.get().is_empty() {
             String::new()
         } else {
             format!(" · {} matches on this page", visible_runs.get().len())
-        }
+        };
+        format!("{}{}", window.get().summary(), suffix)
     });
 
     view! {
@@ -387,7 +394,21 @@ pub fn RunsPage() -> impl IntoView {
                         <div class="tbl-empty">{if r.total == 0 && owner.page == 0 { "No runs yet — attach a schedule to a net to get started" }
                             else { "No runs on this page" }}</div>
                     }))}
-                    <OffsetPager window=window suffix=suffix on_page=Callback::new(move |p| page.set((order.get_untracked().1, p)))/>
+                    <Pager
+                        summary=summary
+                        can_prev=Signal::derive(move || window.get().can_prev())
+                        can_next=Signal::derive(move || window.get().can_next())
+                        on_prev=Callback::new(move |()| {
+                            if let Some(p) = window.get_untracked().prev_page() {
+                                page.set((order.get_untracked().1, p));
+                            }
+                        })
+                        on_next=Callback::new(move |()| {
+                            if let Some(p) = window.get_untracked().next_page() {
+                                page.set((order.get_untracked().1, p));
+                            }
+                        })
+                    />
                 </div>
             </div>
             </section>
