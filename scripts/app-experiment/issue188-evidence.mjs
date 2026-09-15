@@ -254,7 +254,7 @@ try {
   phase = 'runs-ui';
   for (const [label, sort, first] of [['Net', 'net', 'asc'], ['Rows', 'rows', 'desc']]) {
     await page.goto(`${origin.origin}/jobs/runs`);
-    const header = page.getByRole('columnheader', { name: new RegExp(`^${label}`) });
+    const header = page.getByRole('columnheader', { name: new RegExp(`^Sort by ${label}(?:,|$)`) });
     await header.getByRole('button').click();
     for (const dir of [first, first === 'asc' ? 'desc' : 'asc']) {
       if (dir !== first) await header.getByRole('button').click();
