@@ -119,7 +119,7 @@ pub fn HealthPage() -> impl IntoView {
             <header class="health-heading"><div><h1>"Health"</h1></div>
                 <button class="btn health-refresh" on:click=move |_| refresh.update(|n| *n += 1)>"Refresh"</button>
             </header>
-            <div class="health-split">
+            <div class="health-cards">
             <section class="health-section" aria-labelledby="health-checks-title">
                 {move || {
                     let title = health_title(health.get().as_ref());
@@ -197,8 +197,8 @@ pub fn HealthPage() -> impl IntoView {
                     })}
                 </section>
             </Show>
-            <Show when=move || me.get().is_some_and(|m| perms::can_query(&m.permissions))><HealthQueries/></Show>
             </div>
+            <Show when=move || me.get().is_some_and(|m| perms::can_query(&m.permissions))><HealthQueries/></Show>
         </div>
     }
 }
@@ -251,6 +251,7 @@ fn query_rows(response: QueriesResponse) -> Vec<QueryRow> {
 fn HealthQueries() -> impl IntoView {
     let me = expect_context::<RwSignal<Option<api::MeResponse>>>();
     let rows = RwSignal::new(None::<Result<Vec<QueryRow>, String>>);
+    let table_viewport = NodeRef::<leptos::html::Div>::new();
     let refresh = RwSignal::new(0_u64);
     let outcome = RwSignal::new(None::<String>);
     let pending = RwSignal::new(false);
@@ -331,19 +332,23 @@ fn HealthQueries() -> impl IntoView {
         });
     });
     view! {
-        <section class="health-queries" aria-labelledby="health-queries-title">
-            <div class="health-heading"><h2 id="health-queries-title">"Queries"</h2>
+        <section class="health-queries tbl fleet-table-frame" aria-labelledby="health-queries-title">
+            <div class="tbl-hd list-sheet-hd health-heading"><h2 id="health-queries-title" class="list-sheet-ttl">"Queries"</h2>
                 <button class="btn health-queries-refresh" disabled=move || pending.get() on:click=move |_| refresh.update(|n| *n += 1)>"Refresh queries"</button>
             </div>
             {move || outcome.get().map(|text| view! { <p class="health-cancel-outcome" role="status">{text}</p> })}
+            <fleet_ui::OverflowHint viewport=table_viewport/>
+            <div node_ref=table_viewport class="health-query-scroll tbl-scroll" tabindex="0" role="region" aria-label="Queries table">
+            <div class="tbl-body">
             {move || match rows.get() {
-                None => view! { <p role="status">"Loading queries..."</p> }.into_any(),
-                Some(Err(error)) => view! { <p role="alert">{error}</p> }.into_any(),
-                Some(Ok(rows)) if rows.is_empty() => view! { <p>"No active or recent queries."</p> }.into_any(),
+                None => view! { <p class="tbl-empty" role="status">"Loading queries..."</p> }.into_any(),
+                Some(Err(error)) => view! { <p class="tbl-empty" role="alert">{error}</p> }.into_any(),
+                Some(Ok(rows)) if rows.is_empty() => view! { <p class="tbl-empty">"No active or recent queries."</p> }.into_any(),
                 Some(Ok(rows)) => {
                     let epoch = generation.load(Ordering::SeqCst);
-                    view! { <div class="health-query-scroll" tabindex="0" role="region" aria-label="Queries table"><table class="health-query-table">
-                        <thead><tr><th>"Query"</th><th>"User"</th><th>"State"</th><th>"Elapsed"</th><th>"Action"</th></tr></thead>
+                    view! {
+                        <table class="health-query-table fleet-table">
+                        <thead><tr><th scope="col">"Query"</th><th scope="col">"User"</th><th scope="col">"State"</th><th scope="col">"Elapsed"</th><th scope="col">"Action"</th></tr></thead>
                         <tbody>{rows.into_iter().map(|row| {
                             let (id, own) = (row.id, row.own);
                             let active = row.state == "Active";
@@ -354,9 +359,10 @@ fn HealthQueries() -> impl IntoView {
                                 </Show></td>
                             </tr> }
                         }).collect_view()}</tbody>
-                    </table></div> }.into_any()
+                    </table> }.into_any()
                 }
             }}
+            </div></div>
             <Show when=move || confirm.get().is_open()>
                 <ConfirmModal title="Cancel query" message="Request cancellation of this query? Work may already have finished.".to_string() confirm_label="Cancel query"
                     on_confirm=on_confirm on_cancel=Callback::new(move |()| confirm.update(ConfirmState::cancel))/>
