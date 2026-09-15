@@ -263,7 +263,7 @@ for (const intermediate of [false, true]) {
     const newer = [...held].find(([query]) => query.includes('newer'))![1];
     await newer.fulfill({ json: queryResponse('2026-09-15T11:00:00Z', 200, [['newer']]) });
     await expectFacts(page, '0.200s', '2026-09-15 11:00:00 UTC');
-    await expect(page.locator(SEL.scopeCount)).toHaveText('1 rows returned');
+    await expect(page.locator(SEL.scopeCount)).toHaveText('1 row returned');
     await expect(page.locator(SEL.resultsPane)).toContainText('newer');
     await expect(page.locator(SEL.resultsPane)).not.toContainText('older');
   });

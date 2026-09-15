@@ -63,7 +63,13 @@ pub fn MetaStrip(
                         } else {
                             count.get().map_or_else(
                                 || "—".to_string(),
-                                |n| if live.get() { format!("{n} buffered rows") } else { format!("{n} rows returned") },
+                                |n| if live.get() {
+                                    format!("{n} buffered rows")
+                                } else if n == 1 {
+                                    "1 row returned".to_string()
+                                } else {
+                                    format!("{n} rows returned")
+                                },
                             )
                         }}
                     </span>

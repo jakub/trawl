@@ -287,5 +287,5 @@ test('a snapshot finishing after Live cannot restore timing or complete a later 
   await held[1].fulfill({ json: responseBody('2026-09-15T11:00:00Z', 200) });
   await expect(page.locator(SEL.scopeExecution)).toHaveText('Execution 0.200s');
   await expect(page.locator(SEL.scopeStarted)).toHaveText('Started 2026-09-15 11:00:00 UTC');
-  await expect(page.locator(SEL.scopeCount)).toHaveText('1 rows returned');
+  await expect(page.locator(SEL.scopeCount)).toHaveText('1 row returned');
 });
