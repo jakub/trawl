@@ -204,7 +204,7 @@ pub fn HistoryPage() -> impl IntoView {
             <div class="page-hd compact">
                 <div>
                     <h1>"Search history"</h1>
-                    <p class="sub">"Every query you've run. Re-cast the net anytime or create a scheduled search."</p>
+                    <p class="sub">"Click to re-run a previous search, or save as a Net for scheduled runs."</p>
                 </div>
                 <div class="actions">
                     <select
@@ -231,7 +231,7 @@ pub fn HistoryPage() -> impl IntoView {
             <section class="list-sheet" aria-labelledby="history-sheet-title">
                 <div class="list-sheet-hd">
                     <h2 id="history-sheet-title" class="list-sheet-ttl">
-                        "Recent searches"<span class="cnt">{move || format!(" {}", filtered_rows.get().len())}</span>
+                        "Recent searches"
                     </h2>
                     <SearchInput value=filter placeholder="Filter history…"/>
                 </div>
