@@ -1343,7 +1343,8 @@ select:focus-visible,
   text-overflow: ellipsis;
 }
 .rail .it:hover { color: var(--ink); background: var(--fill-2); }
-.rail .it.active { color: var(--accent-ink); background: var(--accent-wash); box-shadow: inset 3px 0 0 var(--accent); }
+.rail .it.active { color: var(--accent-ink); background: var(--accent-wash); }
+.rail .it.active .lb { font-weight: 700; }
 /* Count chip — RailItem.badge, trailing the label. */
 .rail .it .badge {
   margin-inline-start: auto;
