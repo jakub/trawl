@@ -848,6 +848,9 @@ fn HistogramChart(resource: LocalResource<Result<QueryResponse, api::ApiError>>)
 #[component]
 fn IngestChart(slots: Vec<Slot>) -> impl IntoView {
     let node_ref = NodeRef::<leptos::html::Div>::new();
+    let total_events: u128 = slots.iter().map(|slot| u128::from(slot.count)).sum();
+    let chart_label =
+        format!("Hourly ingest chart. Total events in the displayed hours: {total_events}.");
     // `ChartHandle` wraps a JS object — not Send/Sync, so it needs the
     // single-threaded storage, same as the search-page chart.
     let handle: StoredValue<Option<ChartHandle>, LocalStorage> = StoredValue::new_local(None);
@@ -895,7 +898,7 @@ fn IngestChart(slots: Vec<Slot>) -> impl IntoView {
         });
     });
 
-    view! { <div class="ig-chart" node_ref=node_ref></div> }
+    view! { <div class="ig-chart" node_ref=node_ref role="img" aria-label=chart_label></div> }
 }
 
 /// uPlot `AlignedData`: `[xs, ys]`, xs in seconds-since-epoch.

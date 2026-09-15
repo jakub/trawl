@@ -211,7 +211,7 @@ export function createChart(
     }
     tooltipTime.textContent = `${formatTime.format(start * 1000)} – ${formatTime.format(end * 1000)}`;
     tooltipValue.textContent = seriesLabels.map((label, i) =>
-      `${Number(u.data[i + 1][index] ?? 0).toLocaleString()} ${label}`
+      `${label.charAt(0).toUpperCase() + label.slice(1)}: ${Number(u.data[i + 1][index] ?? 0).toLocaleString()}`
     ).join(" · ");
     tooltip.hidden = false;
     tooltip.style.left = `${Math.max(0, Math.min(left + 12, width - tooltip.offsetWidth))}px`;

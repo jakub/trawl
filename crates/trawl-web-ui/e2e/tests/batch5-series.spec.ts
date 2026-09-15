@@ -57,12 +57,13 @@ test('ingest charts show the containing hour in a bounded tooltip', async ({ pag
     if (!route.request().postData()?.includes('timechart')) return route.fallback();
     return route.fulfill({ json: {
       columns: [{ name: '_time' }, { name: 'count' }],
-      rows: [['2026-09-01T00:00:00Z', 2], ['2026-09-01T01:00:00Z', 7]],
+      rows: [['2026-09-01T00:00:00Z', 2], ['2026-09-01T01:00:00Z', 1]],
       truncated: false, pagination: { limit: 50, offset: 0, returned: 2 },
     } });
   });
   await page.goto('/search/schema?svc=nginx');
   await expect(page.locator('.ig-chart canvas')).toHaveCount(1);
+  await expect(page.getByRole('img', { name: 'Hourly ingest chart. Total events in the displayed hours: 3.' })).toBeVisible();
   await expect(page.locator('.ig-chart .u-legend')).toHaveCount(0);
   await expect(page.locator('.ig-chart .series-key')).toHaveCount(0);
   const plot = (await page.locator('.ig-chart .u-over').boundingBox())!;
@@ -70,7 +71,7 @@ test('ingest charts show the containing hour in a bounded tooltip', async ({ pag
   for (const fraction of [23.2 / 24, 23.8 / 24]) {
     await page.mouse.move(plot.x + plot.width * fraction, plot.y + plot.height / 2);
     await expect(tooltip).toBeVisible();
-    await expect(tooltip).toContainText('7 events');
+    await expect(tooltip).toContainText('Events: 1');
     await expect(tooltip.locator('.ig-tooltip-time')).toHaveText('Sep 1, 01:00 AM – Sep 1, 02:00 AM');
   }
   for (const fraction of [0.01, 0.99]) {
