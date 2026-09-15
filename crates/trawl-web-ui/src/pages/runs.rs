@@ -27,7 +27,7 @@ use crate::state::query::{Mode, RangeSpec, navigator, report_refusal};
 use fleet_ui::time::{format_duration, time_ago};
 use fleet_ui::{
     Badge, Icon, IconView, LoadState, Loaded, OffsetPager, PageTotal, PageWindow, SearchInput,
-    StatusDot, StatusTone, ToastBus, Tone,
+    StatusTone, ToastBus, Tone,
 };
 
 /// The `(net_id, run_id)` a `?run=&net=` pair names, or `None`.
@@ -39,8 +39,7 @@ fn parse_run_selection(net: Option<&str>, run: Option<&str>) -> Option<(i64, i64
     Some((net?.parse().ok()?, run?.parse().ok()?))
 }
 
-/// The receipt's outcome badge, off the same status vocabulary the
-/// list's dot reads: one mapping of run statuses, two presentations.
+/// The receipt's outcome badge uses the shared run-status vocabulary.
 fn run_badge_tone(status: &str) -> Tone {
     match crate::components::run_status_tone(status) {
         StatusTone::Success => Tone::Success,
@@ -262,8 +261,13 @@ pub fn RunsPage() -> impl IntoView {
                             view! {
                                 <tr class="tbl-row" class:active=move || run_selected.get() == Some((net_id, run_id))>
                                     <td class="mono"><a class="row-stretch" href=href prop:replace=true>{move || run.get().net_name}</a></td>
-                                    <td>{move || view! { <StatusDot tone=crate::components::run_status_tone(&run.get().run.status)/>
-                                        " " <span style="font-size:11px">{run.get().run.status}</span> }}</td>
+                                    <td><span style="font-size:11px">{move || {
+                                        let mut label = run.get().run.status;
+                                        if let Some(first) = label.get_mut(..1) {
+                                            first.make_ascii_uppercase();
+                                        }
+                                        label
+                                    }}</span></td>
                                     <td class="mono">{move || time_ago(&run.get().run.started_at, now_ms.get())}</td>
                                     <td class="mono">{move || run.get().run.duration_ms.map_or_else(|| "—".to_string(), format_duration)}</td>
                                     <td style="text-align:right" class="mono">{move || run.get().run.row_count.map_or_else(|| "—".to_string(), |n| n.to_string())}</td>
