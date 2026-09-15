@@ -3,6 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Health, capacity and query management over the existing server reports.
+use crate::dashboard_state::DashboardPhase;
 use crate::state::stats_stream::SharedDashboard;
 use crate::{
     api, perms,
@@ -115,7 +116,7 @@ pub fn HealthPage() -> impl IntoView {
     });
     view! {
         <div class="health-page">
-            <header class="health-heading"><div><h1>"Health"</h1><p>"Server checks and operations"</p></div>
+            <header class="health-heading"><div><h1>"Health"</h1></div>
                 <button class="btn health-refresh" on:click=move |_| refresh.update(|n| *n += 1)>"Refresh"</button>
             </header>
             <div class="health-split">
@@ -168,7 +169,7 @@ pub fn HealthPage() -> impl IntoView {
             </section>
             <Show when=move || me.get().is_some_and(|m| perms::is_trawl_admin(&m.permissions))>
                 <section class="health-capacity" aria-labelledby="health-capacity-title">
-                    <h2 id="health-capacity-title">"Capacity"</h2><p class="health-note">"Snapshot at last refresh"</p>
+                    <h2 id="health-capacity-title">"Capacity"</h2>
                     {move || match capacity.get() {
                         None => view! { <p role="status">"Loading capacity..."</p> }.into_any(),
                         Some(Err(error)) => view! { <p role="alert">{error}</p> }.into_any(),
@@ -183,7 +184,7 @@ pub fn HealthPage() -> impl IntoView {
                 </section>
                 <section class="health-live" aria-labelledby="health-live-title">
                     <h2 id="health-live-title">"Live operations"</h2>
-                    <p class="health-live-state" role="status">{move || dashboard.get().phase.label()}</p>
+                    <p class="health-live-state" class:sr-only=move || dashboard.get().phase == DashboardPhase::Live role="status">{move || dashboard.get().phase.label()}</p>
                     {move || dashboard.get().snapshot.map(|s| view! {
                         <dl class="health-facts">
                             <div><dt>"Host"</dt><dd>{s.hostname}</dd></div>
@@ -334,7 +335,6 @@ fn HealthQueries() -> impl IntoView {
             <div class="health-heading"><h2 id="health-queries-title">"Queries"</h2>
                 <button class="btn health-queries-refresh" disabled=move || pending.get() on:click=move |_| refresh.update(|n| *n += 1)>"Refresh queries"</button>
             </div>
-            <p class="health-note">"Active and recent queries at last refresh"</p>
             {move || outcome.get().map(|text| view! { <p class="health-cancel-outcome" role="status">{text}</p> })}
             {move || match rows.get() {
                 None => view! { <p role="status">"Loading queries..."</p> }.into_any(),
@@ -346,9 +346,10 @@ fn HealthQueries() -> impl IntoView {
                         <thead><tr><th>"Query"</th><th>"User"</th><th>"State"</th><th>"Elapsed"</th><th>"Action"</th></tr></thead>
                         <tbody>{rows.into_iter().map(|row| {
                             let (id, own) = (row.id, row.own);
+                            let active = row.state == "Active";
                             view! { <tr data-query-id=id data-own=own.to_string()>
-                                <td><span class="health-query-id">{format!("#{id}")}</span><code>{row.query}</code></td><td>{row.user}</td><td><Badge tone=query_state_tone(&row.state)>{row.state.clone()}</Badge></td><td>{row.elapsed}</td>
-                                <td><Show when=move || me.get().is_some_and(|m| perms::can_cancel_query(&m.permissions, own))>
+                                <td><code>{row.query}</code></td><td>{row.user}</td><td><Badge tone=query_state_tone(&row.state)>{row.state.clone()}</Badge></td><td>{row.elapsed}</td>
+                                <td><Show when=move || active && me.get().is_some_and(|m| perms::can_cancel_query(&m.permissions, own))>
                                     <button class="btn health-query-cancel" disabled=move || pending.get() on:click=move |_| confirm.update(|s| s.request((id, own, epoch)))>"Cancel"</button>
                                 </Show></td>
                             </tr> }

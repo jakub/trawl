@@ -2055,7 +2055,6 @@
 .health-query-table th, .health-query-table td { padding: 12px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
 .health-query-table td:first-child { min-width: 240px; max-width: 600px; }
 .health-query-table code { white-space: pre-wrap; overflow-wrap: anywhere; }
-.health-query-id { display: block; margin-bottom: 5px; color: var(--ink-3); }
 @media (max-width: 640px) { .health-page { padding: 20px 16px; } .health-facts { gap: 16px 24px; } }
 /* Wide enough for the checks card to stand beside the operations
  * cards, which stack in the second column in reading order. */

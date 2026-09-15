@@ -164,8 +164,8 @@ for (const identity of ['health-no-query', 'health-admin-no-query']) {
   });
 }
 
-for (const [identity, ids] of [['health-viewer', []], ['health-cancel', [101, 201]], ['health-admin', [101, 102, 201, 202]]] as const) {
-  test(`${identity} cancel authority covers active and recent by own flag`, async ({ page, request }) => {
+for (const [identity, ids] of [['health-viewer', []], ['health-cancel', [101]], ['health-admin', [101, 102]]] as const) {
+  test(`${identity} cancel authority covers only active queries by own flag`, async ({ page, request }) => {
     await setup(request, identity);
     await page.goto('/settings/health');
     await rows(page);
