@@ -135,19 +135,6 @@ pub fn SchemaPage() -> impl IntoView {
 
     let services = LocalResource::new(|| async move { api::schema_services().await });
 
-    // The sheet header counts what the table shows, off the same
-    // predicate the rows are filtered by.
-    let visible_count = Signal::derive(move || {
-        let needle = filter.get().to_lowercase();
-        match services.get() {
-            Some(Ok(resp)) => resp
-                .services
-                .iter()
-                .filter(|s| matches_filter(s, &needle))
-                .count(),
-            _ => 0,
-        }
-    });
     // Past this width the service panel docks in the second column
     // instead of sliding over a scrim; the field case file stays an
     // overlay at every width (ADR-0032), so it never claims the column.
@@ -343,7 +330,7 @@ pub fn SchemaPage() -> impl IntoView {
                     // `tabindex=-1` so the close handler above can put
                     // focus here — headings are not focusable by default.
                     <h1 id=HEADING_ID tabindex="-1">"Schema"</h1>
-                    <p class="sub">"Click a service to inspect fields, ingest rate, and tail live."</p>
+                    <p class="sub">"Click a service to inspect fields, ingest rate, and view live logs."</p>
                 </div>
             </div>
 
@@ -351,7 +338,7 @@ pub fn SchemaPage() -> impl IntoView {
             <section class="list-sheet" aria-labelledby="schema-sheet-title">
                 <div class="list-sheet-hd">
                     <h2 id="schema-sheet-title" class="list-sheet-ttl">
-                        "Services"<span class="cnt">{move || format!(" {}", visible_count.get())}</span>
+                        "Services"
                     </h2>
                     <SearchInput value=filter placeholder="Filter services…"/>
                 </div>
