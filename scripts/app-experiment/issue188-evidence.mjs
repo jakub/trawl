@@ -11,6 +11,7 @@ import { execFileSync } from 'node:child_process';
 import { randomBytes, createHash } from 'node:crypto';
 import { parseArgs } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
+import { sha256, readRunBuild, verifyRunIdentity } from './identity.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const { values } = parseArgs({ options: { run: { type: 'string' } } });
@@ -40,17 +41,10 @@ const privateDir = await inside(path.join(run, 'private'), run);
 assert.equal(privateDir, path.join(run, 'private'));
 const keyFile = await inside(instance.browserKeyFile, privateDir);
 assert.equal(keyFile, path.join(privateDir, 'browser-key'));
-// A stale descriptor must not authorize sending its key to a reused port.
-for (const [name, config] of [['trawld', 'trawld.toml'], ['web', 'web.toml']]) {
-  const pid = instance.pids[name];
-  assert.ok(Number.isSafeInteger(pid) && pid > 1);
-  const argv = (await fs.readFile(`/proc/${pid}/cmdline`, 'utf8')).split('\0');
-  assert.ok(argv.includes(path.join(privateDir, config)), 'recorded process does not own this run config');
-}
-const config = await fs.readFile(await inside(path.join(privateDir, 'web.toml'), privateDir), 'utf8');
-assert.ok(config.includes(`bind_addr = "127.0.0.1:${origin.port}"`));
-assert.ok(config.includes(`upstream_url = "${upstream.origin}"`));
-const build = JSON.parse(await fs.readFile(path.join(root, 'target/app-experiment-build.json'), 'utf8'));
+// The selected run owns its build record. The checkout-wide preparation cache
+// may belong to a later run, even while these processes remain alive.
+const buildRecord = await readRunBuild(run, instance);
+const build = buildRecord.build;
 const head = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim();
 assert.equal(build.checkout, root);
 assert.equal(build.commit, head, 'build commit differs from current HEAD');
@@ -59,6 +53,12 @@ const scenarioBytes = await fs.readFile(fileURLToPath(import.meta.url));
 const committedScenario = execFileSync('git', ['show', `HEAD:${scenarioPath}`], { cwd: root });
 assert.ok(scenarioBytes.equals(committedScenario), 'scenario differs from committed HEAD; commit it before collecting evidence');
 const scenarioSHA256 = createHash('sha256').update(scenarioBytes).digest('hex');
+const identityPath = 'scripts/app-experiment/identity.mjs';
+const identityBytes = await fs.readFile(new URL('./identity.mjs', import.meta.url));
+const committedIdentity = execFileSync('git', ['show', `HEAD:${identityPath}`], { cwd: root });
+assert.ok(identityBytes.equals(committedIdentity), 'identity helper differs from committed HEAD; commit it before collecting evidence');
+const identityHelperSHA256 = sha256(identityBytes);
+assert.equal(identityHelperSHA256, build.identityHelperSHA256, 'identity helper differs from selected run');
 // Keep this filter identical to run.mjs fingerprint(). The commit alone does
 // not detect uncommitted product edits made after preparation.
 const tracked = execFileSync('git', ['ls-files', '--cached', '--others', '--exclude-standard', '-z'], { cwd: root, encoding: 'utf8' }).split('\0').filter(Boolean);
@@ -68,16 +68,22 @@ for (const file of tracked.filter(f => f.startsWith('crates/') || f.startsWith('
   sourceHash.update(await fs.readFile(path.join(root, file)));
 }
 assert.equal(sourceHash.digest('hex'), build.sourceHash, 'source changed since experiment preparation');
+// Reject wrong build/process/SPA associations before creating evidence or
+// reading a credential. These checks also verify unauthenticated asset bytes.
+await verifyRunIdentity(run, instance, buildRecord);
 const output = path.join(run, 'issue188-evidence');
 await fs.mkdir(output, { mode: 0o700 }); // Refuse accidental overwrite/reseed.
-const report = { schema: 1, status: 'running', runId: instance.runId, sourceHead: head, scenarioSHA256,
+const report = { schema: 1, status: 'running', runId: instance.runId, sourceHead: head, scenarioSHA256, identityHelperSHA256,
   build: { commit: build.commit, sourceHash: build.sourceHash, sourceFingerprintVerified: true,
+    runBuildSHA256: instance.buildSHA256,
     manifestArtifacts: { spaHash: build.spaHash, binaries: build.binaries },
-    artifactVerification: 'Hashes copied from preparation manifest; default runner owns artifact verification.' },
+    artifactVerification: 'Selected run record, running executable bytes, process starts, configs, and owned/served SPA verified before evidence and again before pass.' },
   command: `node ${scenarioPath} --run target/app-experiments/${instance.runId}`,
   search: [], receipts: [], orders: [], ui: [], captures: [], cleanup: { browser: false },
   limits: ['Real successful runs; null/status/timestamp tie diversity belongs to PostgreSQL fixture tests.',
-    'Custom success must be paired with the default report exit 0, passed, and successful cleanup.'] };
+    'Custom success must be paired with the default report exit 0, passed, and successful cleanup.',
+    'Identity checks detect drift and stale processes; they do not isolate against a hostile local user.',
+    'fleet-admin and shared-library hashes describe preparation; live executable checks cover trawld and trawl-web.'] };
 let browser;
 let context;
 let phase = 'initialize';
@@ -119,6 +125,7 @@ try {
   page.setDefaultTimeout(15000);
   await page.goto(`${origin.origin}/login`);
   phase = 'login';
+  await verifyRunIdentity(run, instance, buildRecord, { served: false });
   let key = (await fs.readFile(keyFile, 'utf8')).trim();
   const loginStatus = await page.evaluate(async api_key => (await fetch('/api/auth/login', { method: 'POST', redirect: 'error', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ api_key }) })).status, key);
   key = undefined;
@@ -266,6 +273,8 @@ try {
       }
     }
   }
+  phase = 'final-identity';
+  await verifyRunIdentity(run, instance, buildRecord);
   report.status = 'passed';
 } catch (error) {
   // Browser/assertion errors can embed request data. Publish only the phase.

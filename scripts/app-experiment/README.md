@@ -221,8 +221,16 @@ Vector, syslog transport, repin, scheduled reports, or retention coverage.
 Each run writes a private directory under `target/app-experiments/`:
 
 - `report.json` records phase results, ingest accounting, raw query latency samples and process memory, with timings summarized as p50/p95/max, build identity, and cleanup status.
-- `instance.json` identifies the temporary endpoints, child PIDs, and
-  container. Those endpoints are valid only while that run is alive.
+- `build.json` records this run's build and runner hashes. The runner writes
+  it once after preparation. Its digest is `buildSHA256` in the default report
+  and instance descriptor.
+- `instance.json` identifies the temporary endpoints, child PIDs, container,
+  executable hashes, config hashes, Linux boot ID, and process start ticks.
+  The runner replaces this descriptor atomically after restart. Those
+  endpoints are valid only while that run is alive.
+- `private/spa/` contains a checked copy of the prepared frontend. Each proxy
+  serves its own run's copy, including after restart. Later builds can replace
+  checkout `dist` without changing a held run's frontend.
 - `corpus.ndjson` and phase result files preserve inputs and checked outputs.
 - Phase `.prom` files preserve server metrics.
 - Daemon, Postgres, and build logs explain startup and execution failures.
@@ -236,7 +244,12 @@ still alive.
 `--skip-build` requires the same application-source fingerprint, worktree path, commit, Cargo target, binary
 hashes, and SPA hash as the preparation manifest. A mismatch fails with an
 instruction to rebuild. Normal runs always invoke Cargo and Trunk before
-starting an instance. The server build uses the existing downloaded DuckDB
+starting an instance. The checkout-wide `target/app-experiment-build.json`
+is a preparation cache. Attached scenarios use the selected run's `build.json`.
+The runner checks each daemon's actual `/proc/<pid>/exe` bytes after readiness,
+then checks the owned and served SPA before publishing the instance descriptor.
+It repeats the checks after restart and before reporting success.
+The server build uses the existing downloaded DuckDB
 path and debug profile; these timings establish a working measurement loop,
 not release performance claims.
 
@@ -409,6 +422,15 @@ node scripts/app-experiment/lifecycle.test.mjs
 These start real disposable instances. They check port collisions, SIGTERM
 during a verified hold, compaction polling with a temporarily missing directory,
 a non-retryable filesystem error, and failure to remove the private directory.
+Identity cases share one held instance and restore each test-owned change.
+They replace the global preparation cache and global SPA, corrupt the selected
+run's build record and SPA, and change recorded executable and start identities.
+The custom command must reject invalid identities before reading the browser
+key or creating evidence. A separate test substitutes an alternate executable
+after preparation and requires both its readiness log and an executable-hash
+rejection. Failure to start the alternate executable does not pass that test.
+The attached-scenario cases require committed scenario and identity-helper
+bytes, just as a normal evidence run does. Commit changes before these tests.
 The tests check the final report and Docker's live container inventory. Docker
 inventory checks have a ten-second deadline. A timeout fails verification.
 
@@ -501,6 +523,7 @@ Read source only for the component being changed:
 | File | Responsibility |
 | --- | --- |
 | `scripts/app-experiment/run.mjs` | Preparation, instance ownership, API/browser scenario, measurements, cleanup |
+| `scripts/app-experiment/identity.mjs` | Run build records, process identity, and owned/served SPA hash checks |
 | `scripts/app-experiment/workload.mjs` | Deterministic corpus and independent result/page checks |
 | `scripts/app-experiment/workload.test.mjs` | Loss, duplication, corruption, truncation, short pages, and workload variation |
 | `scripts/app-experiment/lifecycle.test.mjs` | Real lifecycle and filesystem-failure checks |
@@ -611,10 +634,14 @@ node scripts/app-experiment/issue188-evidence.mjs \
   --run "$PWD/target/app-experiments/run-TIMESTAMP-ID"
 ```
 
-The custom scenario has a ten-minute deadline. It uses only the selected
-loopback origin and checks its process/config identity before reading the
-private browser credential into Node memory. It logs in with a same-origin
-browser request. It creates its own browser context, closes it on success or
+The browser scenario has a ten-minute deadline. Its preflight uses bounded
+unauthenticated asset requests to the selected loopback origin. Before creating
+evidence or reading the private browser credential, it checks the selected
+run's build record, actual executable hashes, process start identities, config
+hashes, and owned and served SPA bytes. It checks process and owned-SPA identity
+again before reading the key, then repeats all identity checks before reporting
+success. It logs in with a same-origin browser request. It creates its own
+browser context, closes it on success or
 failure, and leaves infrastructure teardown to the supervised default runner.
 Do not interrupt the default hold. Let its deadline expire.
 
@@ -647,14 +674,17 @@ intended for publication. The report includes the source commit, source/build
 hashes, corpus hash, safe lifecycle fields, receipts, expected/observed orders
 and UI cells. Its command uses a worktree-relative run path. Search report
 fields contain only the parsed visible count, duration and UTC start, without
-filter-chip text. Before login, the script requires its current bytes to match
-`git show HEAD:scripts/app-experiment/issue188-evidence.mjs` and records their
-`scenarioSHA256`. Commit scenario edits before collecting evidence. The script
-also recomputes the runner's source fingerprint and requires it to match
-preparation. Binary and SPA hashes are explicitly
-labelled as manifest identity; their verification belongs to the default
-runner. It omits credentials, cookies, headers, raw query text, private
-paths from receipts and raw logs. Do not publish `private/`, daemon logs,
+filter-chip text. Before preflight, the script requires both its own bytes and
+`identity.mjs` to match their committed files at `HEAD`. The report records
+`scenarioSHA256` and `identityHelperSHA256`. The selected run also records the
+helper hash, and the default `runnerHash` includes the helper. Commit scenario
+and helper edits before collecting evidence. The script recomputes the runner's
+source fingerprint and requires it to match the selected run's preparation.
+Its `build.runBuildSHA256` identifies the selected `build.json`. Live executable
+checks cover `trawld` and `trawl-web`. The `fleet-admin` and shared-library
+hashes remain preparation identities. It omits credentials, cookies, headers,
+raw query text, private paths from receipts, and raw logs. Do not publish
+`private/`, daemon logs,
 `queries.ndjson`, or the complete run directory. A failed report names the
 phase and assertion source line, with numeric or boolean actual/expected
 values where available. It never copies exception text that might contain
@@ -664,7 +694,15 @@ Success requires both commands to exit zero, the custom report to say
 `status: passed` with `cleanup.browser: true`, and the default `report.json`
 to say `status: passed` with every cleanup flag true. Compare their run IDs
 and build identities. A custom pass alone does not establish default-scenario
-completion or cleanup. Null values, different terminal statuses and deliberate
-timestamp ties remain covered by disposable PostgreSQL tests; this scenario
+completion or cleanup. Also require the custom `build.runBuildSHA256` to equal
+the default report's `buildSHA256`.
+
+These checks detect stale descriptors, old processes, changed assets, and
+preparation-to-launch executable changes. They do not isolate a run from a
+hostile local user. The filesystem, process checks, and later browser requests
+are separate operations.
+
+Null values, different terminal statuses and deliberate timestamp ties remain
+covered by disposable PostgreSQL tests; this scenario
 uses successful immutable receipts from real queries. Debug build timings
 are correctness evidence, not a release performance benchmark.

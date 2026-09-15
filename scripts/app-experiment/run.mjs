@@ -16,6 +16,7 @@ import { createRequire } from 'node:module';
 import { parseArgs } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
 import { corpus, verifyRows, verifyBrowserPage, percentile } from './workload.mjs';
+import { sha256, fileHash, spaHash, processIdentity, verifyRunIdentity } from './identity.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const { values: args } = parseArgs({ options: {
@@ -63,12 +64,14 @@ process.umask(0o077);
 await fs.mkdir(runDir, { recursive: true, mode: 0o700 });
 const privateDir = path.join(runDir, 'private');
 await fs.mkdir(privateDir, { mode: 0o700 });
+const spaDirectory = path.join(privateDir, 'spa');
 const browserOrigin = `http://127.0.0.1:${webPort}`;
 const container = `trawl-experiment-${randomBytes(12).toString('hex')}`;
 const report = { schema: 1, runId, status: 'running', seed, count, rate, batchSize,
   host: { platform: os.platform(), architecture: os.arch(), cpuModel: os.cpus()[0]?.model, logicalCpus: os.cpus().length, totalMemoryBytes: os.totalmem() },
   build: {}, phases: [], ingest: { sent: 0, accepted: 0, rejected: 0, ambiguousBatches: 0 },
   cleanup: { processes: false, container: false, secrets: false } };
+let buildRecord;
 let interrupted = false;
 let browser;
 let containerAttempted = false;
@@ -223,27 +226,30 @@ async function prepare() {
     report.build = { sourceHash, target, checkout: root, binaries: await hashes(), profile: 'debug server, release SPA, downloaded DuckDB',
       commit: await command('git', ['rev-parse', 'HEAD']), rustc: await command('rustc', ['--version']), node: process.version };
     await fs.mkdir(path.dirname(stampPath), { recursive: true });
-    await fs.writeFile(stampPath, JSON.stringify(report.build));
   }
   // Record the bytes actually served, including JS/Wasm, so SPA identity is
   // checkable in every result and skip-build cannot silently reuse changed dist.
-  async function treeHash(dir) {
-    const hash = createHash('sha256');
-    for (const entry of (await fs.readdir(dir, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name))) {
-      hash.update(entry.name);
-      hash.update(entry.isDirectory() ? await treeHash(path.join(dir, entry.name)) : await fs.readFile(path.join(dir, entry.name)));
-    }
-    return hash.digest('hex');
-  }
-  const spaHash = await treeHash(path.join(root, 'crates/trawl-web-ui/dist'));
-  if (args['skip-build']) assert.equal(report.build.spaHash, spaHash, 'SPA changed: run without --skip-build');
-  report.build.spaHash = spaHash;
+  const dist = path.join(root, 'crates/trawl-web-ui/dist');
+  const preparedSpaHash = await spaHash(dist);
+  if (args['skip-build']) assert.equal(report.build.spaHash, preparedSpaHash, 'SPA changed: run without --skip-build');
+  report.build.spaHash = preparedSpaHash;
+  report.build.identityHelperSHA256 = await fileHash(new URL('./identity.mjs', import.meta.url));
   await fs.writeFile(stampPath, JSON.stringify(report.build));
+  // Each live proxy serves its own checked copy. A later Trunk build may
+  // replace checkout dist without changing this run's frontend.
+  await fs.cp(dist, spaDirectory, { recursive: true, errorOnExist: true, force: false });
+  assert.equal(await spaHash(spaDirectory), preparedSpaHash, 'SPA changed while copying into the run');
+  buildRecord = { schema: 1, runId, build: report.build, runnerHash: report.runnerHash };
+  const buildBytes = `${JSON.stringify(buildRecord, null, 2)}\n`;
+  await fs.writeFile(path.join(runDir, 'build.json'), buildBytes, { flag: 'wx', mode: 0o600 });
+  report.buildSHA256 = sha256(buildBytes);
 }
 
 async function experiment() {
+  report.runnerHash = createHash('sha256').update(await fs.readFile(fileURLToPath(import.meta.url)))
+    .update(await fs.readFile(path.join(root, 'scripts/app-experiment/workload.mjs')))
+    .update(await fs.readFile(new URL('./identity.mjs', import.meta.url))).digest('hex');
   await prepare();
-  report.runnerHash = createHash('sha256').update(await fs.readFile(fileURLToPath(import.meta.url))).update(await fs.readFile(path.join(root, 'scripts/app-experiment/workload.mjs'))).digest('hex');
   checkInterrupted();
   await command('docker', ['info', '--format', '{{.ServerVersion}}']);
   const password = randomBytes(24).toString('hex');
@@ -293,6 +299,7 @@ async function experiment() {
   async function startServer(name) {
     server = await daemon(path.join(root, 'bin/trawld-dev'), ['--config', configPath], name, daemonEnv,
       /HTTPS server listening[^\n]*addr[=:]\s*"?(127\.0\.0\.1:\d+)/);
+    server.identity = await processIdentity(server.child.pid, configPath, report.build.binaries.trawld);
     upstream = `https://${server.match[1]}`;
     await request(`${upstream}/api/v1/health`);
   }
@@ -300,11 +307,22 @@ async function experiment() {
   const webConfig = path.join(privateDir, 'web.toml');
   async function startWeb(name) {
     await fs.writeFile(webConfig, `${serverConfig}\n[web]\nbind_addr = "127.0.0.1:${webPort}"\nupstream_url = ${toml(upstream)}\nallow_insecure_cookies = true\npublic_origins = [${toml(browserOrigin)}]\ncookie_secret_env = "FLEET_SESSION_AEAD_KEY"\n`);
-    return daemon(path.join(target, 'debug/trawl-web'), ['--config', webConfig], name,
-      { FLEET_SESSION_AEAD_KEY: sessionKey, TRAWL_WEB_INSECURE_UPSTREAM: '1', TRAWL_WEB_SPA_DIR: path.join(root, 'crates/trawl-web-ui/dist') }, /trawl-web listening/);
+    const proxy = await daemon(path.join(target, 'debug/trawl-web'), ['--config', webConfig], name,
+      { FLEET_SESSION_AEAD_KEY: sessionKey, TRAWL_WEB_INSECURE_UPSTREAM: '1', TRAWL_WEB_SPA_DIR: spaDirectory }, /trawl-web listening/);
+    proxy.identity = await processIdentity(proxy.child.pid, webConfig, report.build.binaries['trawl-web'], spaDirectory);
+    return proxy;
   }
   let web = await startWeb('trawl-web');
-  await writeJSON('instance.json', { runId, browserOrigin, upstream, container, pids: { trawld: server.child.pid, web: web.child.pid }, browserKeyFile: path.join(privateDir, 'browser-key') });
+  let instance;
+  async function publishInstance() {
+    instance = { runId, browserOrigin, upstream, container, buildSHA256: report.buildSHA256,
+      pids: { trawld: server.child.pid, web: web.child.pid }, processIdentity: { trawld: server.identity, web: web.identity },
+      browserKeyFile: path.join(privateDir, 'browser-key') };
+    await verifyRunIdentity(runDir, instance, buildRecord);
+    await writeJSON('instance.json.tmp', instance);
+    await fs.rename(path.join(runDir, 'instance.json.tmp'), path.join(runDir, 'instance.json'));
+  }
+  await publishInstance();
   console.log(`Instance ready: ${browserOrigin}. Artifacts: ${runDir}`);
   const events = corpus(seed, count, runId);
   const ndjson = events.map(e => JSON.stringify(e)).join('\n') + '\n';
@@ -460,12 +478,14 @@ async function experiment() {
     assert.deepEqual(pageErrors, [], 'browser JavaScript errors');
     report.phases.push({ name: 'browser-session-after-restart', verifiedEvents: restartedPage.pagination.returned });
     report.queryLatencyMs = { values: latencies, samples: latencies.length, p50: percentile(latencies, 0.5), p95: percentile(latencies, 0.95), max: Math.max(...latencies) };
-    await writeJSON('instance.json', { runId, browserOrigin, upstream, container, pids: { trawld: server.child.pid, web: web.child.pid }, browserKeyFile: path.join(privateDir, 'browser-key') });
+    await publishInstance();
     if (holdSeconds) {
       console.log(`Verified instance held for ${holdSeconds}s at ${browserOrigin}; login key is in ${privateDir}/browser-key.`);
       const until = Date.now() + holdSeconds * 1000;
       while (Date.now() < until) { checkInterrupted(); await delay(200); }
     }
+    await verifyRunIdentity(runDir, instance, buildRecord);
+    report.identityVerified = { runningExecutables: true, processStarts: true, ownedAndServedSpa: true };
   } catch (error) {
     await page.screenshot({ path: path.join(runDir, 'failure.png') }).catch(() => {});
     throw error;
