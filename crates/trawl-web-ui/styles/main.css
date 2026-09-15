@@ -2034,7 +2034,7 @@
 .health-queries .tbl-hd h2 { margin: 0; font-size: var(--fs-control); }
 .health-cancel-outcome { margin: 0; padding: 12px; }
 .health-queries .overflow-hint { border-bottom: 1px solid var(--line-2); }
-.health-query-scroll { --list-min-width: 680px; overflow-x: auto; }
+.health-query-scroll { --list-min-width: 800px; overflow-x: auto; }
 .health-query-scroll:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
 .health-query-table > tbody > tr > td { vertical-align: top; }
 .health-query-table th:first-child { width: 44%; }
