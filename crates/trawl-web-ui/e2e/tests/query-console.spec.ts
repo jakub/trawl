@@ -34,7 +34,7 @@ test('the header states the draft while the strip stays with the executed query'
   await page.goto('/search?q=service%3Dnginx&r=15m');
 
   const draft = page.locator(SEL.draftState);
-  await expect(draft).toHaveText(COPY.draftClean);
+  await expect(draft).toHaveCount(0);
 
   // The strip's window and the histogram caption are the same sentence
   // about the same execution, so they are asserted together.
@@ -53,7 +53,7 @@ test('the header states the draft while the strip stays with the executed query'
 
   await page.locator(SEL.runButton).click();
   await expect(page).toHaveURL(/q=last%3D7d/);
-  await expect(draft).toHaveText(COPY.draftClean);
+  await expect(draft).toHaveCount(0);
   await expect(page.locator(SEL.scopeWindow)).toHaveText('last 7d');
 });
 

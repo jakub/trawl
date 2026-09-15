@@ -114,13 +114,9 @@ pub fn EditorWrap(
         // frame's own padding is not paid twice down the left edge.
         <div class="console-hd">
             <span class="console-lb">"Query"</span>
-            <span class="draft" class:dirty=move || draft_dirty.get()>
-                {move || if draft_dirty.get() {
-                    "Unsent changes · Haul to run them"
-                } else {
-                    "Editor matches execution"
-                }}
-            </span>
+            <Show when=move || draft_dirty.get()>
+                <span class="draft dirty">"Unsent changes · Haul to run them"</span>
+            </Show>
         </div>
         <div class="editor-wrap" id="search-query" tabindex="-1">
             <div class="editor-row">

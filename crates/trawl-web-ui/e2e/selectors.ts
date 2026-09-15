@@ -497,9 +497,8 @@ export const COPY = {
   /// header shows when the server cut the answer short.
   truncatedBadge: 'Truncated',
   /// crates/trawl-web-ui/src/components/editor_wrap.rs — the console
-  /// header's two draft states, in full. The dirty one carries its own
-  /// instruction, so a spec asserting it also asserts the way out.
-  draftClean: 'Editor matches execution',
+  /// header's unsent-changes message carries its own instruction,
+  /// so a spec asserting it also asserts the way out.
   draftDirty: 'Unsent changes · Haul to run them',
   /// crates/trawl-web-ui/src/components/editor_wrap.rs — the visible
   /// names of two of the three editor tools. Both say what they act on,

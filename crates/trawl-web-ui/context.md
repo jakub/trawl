@@ -15,7 +15,7 @@ The raised region at the top of the search sheet that holds everything the next 
 _Avoid_: editor (that is the CodeMirror mount inside it), search bar, toolbar
 
 **Draft state**:
-The console header's reading of the editor buffer against the executed query: "Editor matches execution" when they agree, "Unsent changes" with the hint to Haul when they do not. Derived text, never a control, and it never navigates.
+The console header shows "Unsent changes" with the hint to Haul when the editor buffer differs from the executed query. It shows no draft message when they agree. Derived text, never a control, and it never navigates.
 _Avoid_: dirty flag, unsaved indicator, status
 
 **Executed-scope strip**:

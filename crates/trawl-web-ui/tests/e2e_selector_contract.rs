@@ -756,12 +756,6 @@ const CONTRACTS: &[Contract] = &[
         hook: ">\"Truncated\"<",
     },
     Contract {
-        assignment: "draftClean: 'Editor matches execution',",
-        source_path: "src/components/editor_wrap.rs",
-        source: EDITOR_WRAP_RS,
-        hook: "\"Editor matches execution\"",
-    },
-    Contract {
         assignment: "draftDirty: 'Unsent changes \u{b7} Haul to run them',",
         source_path: "src/components/editor_wrap.rs",
         source: EDITOR_WRAP_RS,
