@@ -115,7 +115,7 @@ pub fn EditorWrap(
         <div class="console-hd">
             <span class="console-lb">"Query"</span>
             <Show when=move || draft_dirty.get()>
-                <span class="draft dirty">"Unsent changes · Haul to run them"</span>
+                <span class="draft dirty">"Edited"</span>
             </Show>
         </div>
         <div class="editor-wrap" id="search-query" tabindex="-1">

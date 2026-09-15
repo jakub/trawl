@@ -756,10 +756,10 @@ const CONTRACTS: &[Contract] = &[
         hook: ">\"Truncated\"<",
     },
     Contract {
-        assignment: "draftDirty: 'Unsent changes \u{b7} Haul to run them',",
+        assignment: "draftDirty: 'Edited',",
         source_path: "src/components/editor_wrap.rs",
         source: EDITOR_WRAP_RS,
-        hook: "\"Unsent changes \u{b7} Haul to run them\"",
+        hook: "\"Edited\"",
     },
     Contract {
         assignment: "saveAsNetTool: 'Save as net',",
