@@ -43,7 +43,9 @@ use leptos_use::{use_event_listener, use_window};
 use wasm_bindgen::JsCast;
 
 use crate::icon::{Icon, IconView};
-use crate::overlay::{FocusPolicy, OverlayLayer, focus_initial, has_layers, push_overlay_with};
+use crate::overlay::{
+    FocusPolicy, OverlayLayer, focus_initial, has_layers, push_overlay_beneath, push_overlay_with,
+};
 use crate::tabs::{TabItem, Tabs, TabsStyle};
 
 /// Drawer shell. `title` fills `.sd-ttl`; `actions` fills `.sd-actions`
@@ -218,6 +220,12 @@ pub fn Drawer(
 /// interactive, and a modal may stack over a live drawer), which is also
 /// why the panel renders `role="dialog"` without `aria-modal`.
 ///
+/// A presentation change is not an open. Undocking registers the layer
+/// beneath whatever is already stacked — a modal opened over the docked
+/// panel keeps focus and Escape — and takes no initial focus; the latch
+/// that guards initial focus is set once and never reset by a flip, so
+/// only a real reopen (a remount) focuses the panel again.
+///
 /// Returns the live layer for the caller's Escape guard.
 fn overlay_presentation(
     docked: Signal<bool>,
@@ -227,20 +235,24 @@ fn overlay_presentation(
     let opener = StoredValue::new(None::<web_sys::Element>);
     let focus_done = StoredValue::new(false);
 
-    let acquire = move || {
+    let acquire = move |at_mount: bool| {
         if layer.get_value().is_some() {
             return;
         }
-        // The opener: whatever was focused when the layer registered.
-        opener.set_value(document().active_element());
-        layer.set_value(Some(push_overlay_with(FocusPolicy::Capture)));
-        focus_done.set_value(false);
+        // At mount the drawer is the newest overlay and goes on top,
+        // where `use_overlay_layer_with` put it. Undocking later goes in
+        // beneath everything stacked since, so an open modal keeps the
+        // page's focus and Escape.
+        layer.set_value(Some(if at_mount {
+            push_overlay_with(FocusPolicy::Capture)
+        } else {
+            push_overlay_beneath(FocusPolicy::Capture)
+        }));
     };
     let release = move || {
         if let Some(live) = layer.get_value() {
             live.release();
             layer.set_value(None);
-            focus_done.set_value(false);
         }
     };
 
@@ -257,19 +269,23 @@ fn overlay_presentation(
     // to match mount order, and `Shell` reads `has_layers()` to leave the
     // palette chord inert from the first keystroke on.
     if !docked.get_untracked() {
-        acquire();
+        acquire(true);
     }
 
     // Reading the panel NodeRef subscribes the effect to it as well as to
     // `docked`, so initial focus lands as soon as the panel exists; the
-    // `focus_done` latch keeps a later re-run from stealing focus back.
+    // `focus_done` latch keeps a later re-run from stealing focus back,
+    // and a presentation flip never resets it.
     Effect::new(move |_| {
         let panel = panel_ref.get();
         if docked.get() {
             release();
+            // A panel that mounts docked takes no initial focus, and an
+            // undock later is a resize, not an open.
+            focus_done.set_value(true);
             return;
         }
-        acquire();
+        acquire(false);
         if !focus_done.get_value()
             && let Some(el) = panel
             && layer.get_value().is_some_and(OverlayLayer::owns_focus)
