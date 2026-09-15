@@ -145,3 +145,41 @@ test('service fields: name header keeps ascending default', async ({ page, reque
     CORPUS.fieldLastAlphabetically,
   );
 });
+
+// Global Runs uses native headers but sends ordering to the server.
+test('Runs headers expose one aria-sort and send each natural direction through keyboard controls', async ({ page, request }) => {
+  await resetScenario(request, 'pagination');
+  await page.clock.install();
+  const requests: Array<{ sort: string | null; dir: string | null; offset: string | null }> = [];
+  await page.route('**/api/v1/runs?*', async route => {
+    const params = new URL(route.request().url()).searchParams;
+    requests.push({ sort: params.get('sort'), dir: params.get('dir'), offset: params.get('offset') });
+    await route.continue();
+  });
+  await page.goto('/jobs/runs');
+  const table = page.locator('.runs-table');
+  const headers = table.locator('thead th');
+  const buttons = headers.getByRole('button');
+  await expect(buttons).toHaveCount(5);
+  await expect(table.locator('tbody tr')).toHaveCount(3);
+  expect(await headers.evaluateAll(els => els.map(el => el.getAttribute('aria-sort'))))
+    .toEqual([null, null, 'descending', null, null]);
+  expect(requests).toEqual([{ sort: 'started', dir: 'desc', offset: '0' }]);
+  // Visit When after another key, proving its inactive default too.
+  for (const [index, key, first] of [[0, 'net', 'asc'], [1, 'status', 'asc'], [2, 'started', 'desc'], [3, 'duration', 'desc'], [4, 'rows', 'desc']] as const) {
+    const control = buttons.nth(index);
+    await control.focus();
+    await expectFocusRing(control);
+    await expect(control).toHaveAttribute('type', 'button');
+    for (const [press, dir] of [['Enter', first], [' ', first === 'asc' ? 'desc' : 'asc']] as const) {
+      const before = requests.length;
+      await page.keyboard.press(press);
+      await expect.poll(() => requests.length).toBe(before + 1);
+      await expect(page.getByRole('region', { name: 'Recent runs', exact: true })).toHaveAttribute('aria-busy', 'false');
+      expect(requests.at(-1)).toEqual({ sort: key, dir, offset: '0' });
+      const expected = Array<string | null>(5).fill(null);
+      expected[index] = dir === 'asc' ? 'ascending' : 'descending';
+      expect(await headers.evaluateAll(els => els.map(el => el.getAttribute('aria-sort')))).toEqual(expected);
+    }
+  }
+});

@@ -6,7 +6,7 @@
 //!
 //! Shows aggregate stats (recorded runs, success rate, average
 //! duration), a paginated table of recent runs across all saved
-//! queries, and the selected run's stored result beside its execution
+//! queries, and the selected run's stored result above its execution
 //! receipt.
 //!
 //! URL params: `run=<id>&net=<id>` names the selected run. Both are
@@ -20,15 +20,36 @@
 use leptos::prelude::*;
 use leptos_router::NavigateOptions;
 use leptos_router::hooks::{use_navigate, use_query_map};
+use leptos_use::use_media_query;
+use trawl_api::{RunsSortDir, RunsSortKey};
 
 use crate::api::{self, RUNS_PAGE_SIZE};
 use crate::components::net_drawer::RunResultPreview;
+use crate::components::sort_th::table_sort_th;
 use crate::state::query::{Mode, RangeSpec, navigator, report_refusal};
 use fleet_ui::time::{format_duration, time_ago};
 use fleet_ui::{
-    Badge, Icon, IconView, LoadState, Loaded, OffsetPager, PageTotal, PageWindow, SearchInput,
-    StatusTone, ToastBus, Tone,
+    Badge, Drawer, LoadState, Loaded, OffsetPager, PageTotal, PageWindow, SearchInput, StatusTone,
+    ToastBus, Tone,
 };
+
+/// A server page under one ordering intent. The revision prevents returning
+/// to an earlier sort from restoring that sort's old page or response.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RunsOwner {
+    page: usize,
+    key: RunsSortKey,
+    dir: RunsSortDir,
+    order_revision: u64,
+}
+
+#[derive(Clone)]
+struct RunsAttempt {
+    generation: u64,
+    owner: RunsOwner,
+    pending: bool,
+    error: Option<String>,
+}
 
 /// The `(net_id, run_id)` a `?run=&net=` pair names, or `None`.
 ///
@@ -53,7 +74,42 @@ fn run_badge_tone(status: &str) -> Tone {
 #[allow(clippy::too_many_lines)]
 pub fn RunsPage() -> impl IntoView {
     let table_viewport = NodeRef::<leptos::html::Div>::new();
-    let page = RwSignal::new(0usize);
+    let sort = RwSignal::new((RunsSortKey::Started, true));
+    let order = Memo::new(move |previous: Option<&((RunsSortKey, bool), u64)>| {
+        let current = sort.get();
+        let revision = previous.map_or(0, |(old, revision)| {
+            if *old == current {
+                *revision
+            } else {
+                revision.wrapping_add(1)
+            }
+        });
+        (current, revision)
+    });
+    // A page belongs to the ordering revision under which it was selected.
+    // Deriving zero here avoids an old-page/new-sort request from an effect
+    // that resets the page after the sort has already changed.
+    let page = RwSignal::new((0u64, 0usize));
+    let requested = Memo::new(move |_| {
+        let ((key, descending), order_revision) = order.get();
+        let (page_revision, page) = page.get();
+        RunsOwner {
+            page: if page_revision == order_revision {
+                page
+            } else {
+                0
+            },
+            key,
+            dir: if descending {
+                RunsSortDir::Desc
+            } else {
+                RunsSortDir::Asc
+            },
+            order_revision,
+        }
+    });
+    let attempt = RwSignal::new(None::<RunsAttempt>);
+    let wide = use_media_query("(min-width: 1100px)");
     let filter = RwSignal::new(String::new());
     let bus = expect_context::<ToastBus>();
     let qm = use_query_map();
@@ -62,23 +118,76 @@ pub fn RunsPage() -> impl IntoView {
         parse_run_selection(params.get("net").as_deref(), params.get("run").as_deref())
     });
 
-    let (runs, refresh_error, retry_runs) =
+    let (runs, refresh_error, refresh_runs) =
         crate::components::job_refresh::job_refresh(Signal::stored(true), move || {
-            let p = page.get();
+            let owner = requested.get();
+            let generation = attempt
+                .get_untracked()
+                .map_or(0, |a| a.generation.wrapping_add(1));
+            // The helper calls fetch synchronously even when a previous read
+            // must finish first. That queued intent already owns the loading
+            // state; the obsolete read cannot complete it.
+            attempt.set(Some(RunsAttempt {
+                generation,
+                owner,
+                pending: true,
+                error: None,
+            }));
             async move {
-                let offset = PageWindow::checked_offset(p, RUNS_PAGE_SIZE).map_err(|_| {
-                    api::ApiError::Refused("This runs page is too large to request.")
-                })?;
-                let response = api::list_all_runs(
-                    RUNS_PAGE_SIZE.get(),
-                    offset,
-                    trawl_api::RunsSortKey::default(),
-                    trawl_api::RunsSortDir::default(),
-                )
-                .await;
-                response.map(|resp| (p, resp))
+                let response = match PageWindow::checked_offset(owner.page, RUNS_PAGE_SIZE) {
+                    Ok(offset) => {
+                        api::list_all_runs(RUNS_PAGE_SIZE.get(), offset, owner.key, owner.dir).await
+                    }
+                    Err(_) => Err(api::ApiError::Refused(
+                        "This runs page is too large to request.",
+                    )),
+                };
+                if requested.try_get_untracked() == Some(owner)
+                    && attempt
+                        .try_get_untracked()
+                        .flatten()
+                        .is_some_and(|a| a.generation == generation)
+                {
+                    attempt.set(Some(RunsAttempt {
+                        generation,
+                        owner,
+                        pending: false,
+                        error: response
+                            .as_ref()
+                            .err()
+                            .map(std::string::ToString::to_string),
+                    }));
+                }
+                response.map(|resp| (owner, resp))
             }
         });
+    let retry_runs = Callback::new(move |()| {
+        // refresh_error remains set in job_refresh while it retains old
+        // success. Clear our completed failure synchronously so Retry shows
+        // loading for the requested owner immediately.
+        attempt.update(|a| {
+            if let Some(a) = a {
+                a.pending = true;
+                a.error = None;
+            }
+        });
+        refresh_runs.run(());
+    });
+    let current_runs = Signal::derive(move || {
+        runs.get()
+            .and_then(Result::ok)
+            .filter(|(owner, _)| *owner == requested.get())
+    });
+    let list_state = Signal::derive(move || {
+        if current_runs.get().is_some() {
+            return LoadState::Ready(());
+        }
+        match attempt.get().filter(|a| a.owner == requested.get()) {
+            Some(a) if !a.pending => a.error.map_or(LoadState::Loading, LoadState::Error),
+            _ => LoadState::Loading,
+        }
+    });
+    let list_busy = Signal::derive(move || matches!(list_state.get(), LoadState::Loading));
 
     let (stats, stats_error, retry_stats) =
         crate::components::job_refresh::job_refresh(Signal::stored(true), || async move {
@@ -114,26 +223,14 @@ pub fn RunsPage() -> impl IntoView {
         );
     });
 
-    // The selected run's net name, off the page the list already
-    // carries. Read as a signal so the detail mounts once per selection
-    // rather than once per list refresh.
-    let selected_net_name = Signal::derive(move || {
-        let (net_id, run_id) = run_selected.get()?;
-        let (_, resp) = runs.get()?.ok()?;
-        resp.runs
-            .iter()
-            .find(|gr| gr.net_id == net_id && gr.run.id == run_id)
-            .map(|gr| gr.net_name.clone())
-    });
-
     // The sheet header counts what the table shows, off the same
     // predicate the rows are filtered by. It also keeps the sheet's
     // name distinct from the scroll region's, which is "Recent runs"
     // on its own.
     let visible_count = Signal::derive(move || {
         let needle = filter.get().to_lowercase();
-        match runs.get() {
-            Some(Ok((_, resp))) => resp
+        match current_runs.get() {
+            Some((_, resp)) => resp
                 .runs
                 .iter()
                 .filter(|r| needle.is_empty() || r.net_name.to_lowercase().contains(&needle))
@@ -147,8 +244,8 @@ pub fn RunsPage() -> impl IntoView {
 
     let visible_runs = Signal::derive(move || {
         let needle = filter.get().to_lowercase();
-        runs.get()
-            .and_then(Result::ok)
+        current_runs
+            .get()
             .map(|(_, r)| {
                 r.runs
                     .into_iter()
@@ -158,16 +255,18 @@ pub fn RunsPage() -> impl IntoView {
             .unwrap_or_default()
     });
     let window = Signal::derive(move || {
-        let data = runs.get().and_then(Result::ok);
+        let data = current_runs.get();
         let (fetched, returned, total) = data
             .as_ref()
-            .map_or((0, 0, 0), |(p, r)| (*p, r.runs.len(), r.total));
+            .map_or((requested.get().page, 0, 0), |(owner, r)| {
+                (owner.page, r.runs.len(), r.total)
+            });
         PageWindow::new(
             fetched,
             RUNS_PAGE_SIZE,
             returned,
             PageTotal::Known(total),
-            data.is_none() || page.get() != fetched,
+            data.is_none(),
         )
         .expect("runs page comes from checked pager navigation")
     });
@@ -188,7 +287,8 @@ pub fn RunsPage() -> impl IntoView {
                 </div>
             </div>
 
-            {move || refresh_error.get().or(stats_error.get()).map(|e| view! { <p role="status">{e}</p> })}
+            {move || stats_error.get().or_else(|| current_runs.get().and_then(|_| refresh_error.get()))
+                .map(|e| view! { <p role="status">{e}</p> })}
             <div class="stats-row">
                 <div class="stat-card">
                     <div class="label">"Recorded runs"</div>
@@ -241,17 +341,19 @@ pub fn RunsPage() -> impl IntoView {
                     <SearchInput value=filter placeholder="Filter by net…"/>
                 </div>
             <fleet_ui::OverflowHint viewport=table_viewport/>
-                <div node_ref=table_viewport class="tbl fleet-table-frame tbl-scroll" role="region" aria-label="Recent runs" tabindex="0" style="--list-min-width:560px">
+                <div node_ref=table_viewport class="tbl fleet-table-frame tbl-scroll" aria-busy=move || list_busy.get().to_string() role="region" aria-label="Recent runs" tabindex="0" style="--list-min-width:560px">
                 <div class="tbl-body">
                     <Loaded
-                        state=Signal::derive(move || LoadState::from_resource(runs.get().map(|r| r.map(|_| ()))))
+                        state=list_state
                         label="runs" retry=retry_runs render=Box::new(|()| ().into_any())
                     />
                     <table class="fleet-table runs-table" aria-label="Recent runs">
                         <thead><tr>
-                            <th scope="col">"Net"</th><th scope="col" style="width:90px">"Status"</th>
-                            <th scope="col" style="width:100px">"When"</th><th scope="col" style="width:80px">"Duration"</th>
-                            <th scope="col" style="width:70px; text-align:right">"Rows"</th>
+                            {table_sort_th(sort, RunsSortKey::Net, false, "Net", "")}
+                            {table_sort_th(sort, RunsSortKey::Status, false, "Status", "width:90px")}
+                            {table_sort_th(sort, RunsSortKey::Started, true, "When", "width:100px")}
+                            {table_sort_th(sort, RunsSortKey::Duration, true, "Duration", "width:80px")}
+                            {table_sort_th(sort, RunsSortKey::Rows, true, "Rows", "width:70px; text-align:right")}
                         </tr></thead>
                         <tbody><For each=move || visible_runs.get() key=|r| (r.net_id, r.run.id) children=move |initial| {
                             let net_id = initial.net_id;
@@ -281,11 +383,11 @@ pub fn RunsPage() -> impl IntoView {
                             }
                         }/></tbody>
                     </table>
-                    {move || runs.get().and_then(Result::ok).and_then(|(p, r)| r.runs.is_empty().then(|| view! {
-                        <div class="tbl-empty">{if r.total == 0 && p == 0 { "No runs yet — attach a schedule to a net to get started" }
+                    {move || current_runs.get().and_then(|(owner, r)| r.runs.is_empty().then(|| view! {
+                        <div class="tbl-empty">{if r.total == 0 && owner.page == 0 { "No runs yet — attach a schedule to a net to get started" }
                             else { "No runs on this page" }}</div>
                     }))}
-                    <OffsetPager window=window suffix=suffix on_page=Callback::new(move |p| page.set(p))/>
+                    <OffsetPager window=window suffix=suffix on_page=Callback::new(move |p| page.set((order.get_untracked().1, p)))/>
                 </div>
             </div>
             </section>
@@ -293,21 +395,24 @@ pub fn RunsPage() -> impl IntoView {
             // A fresh mount per selection: a late response for the run
             // before this one lands in a disposed resource and never
             // paints over the run now on screen.
-            {move || run_selected.get().map(|(net_id, run_id)| view! {
-                <RunDetail
-                    net_id=net_id
-                    run_id=run_id
-                    net_name=selected_net_name
-                    on_close=on_close
-                    on_search=on_search
-                />
-            })}
+            <For each=move || { run_selected.get().into_iter().collect::<Vec<_>>() } key=|identity| *identity
+                children=move |(net_id, run_id)| {
+                    let net_name = Signal::derive(move || runs.get().and_then(Result::ok)
+                        .and_then(|(_, response)| response.runs.into_iter()
+                            .find(|run| run.net_id == net_id && run.run.id == run_id)
+                            .map(|run| run.net_name)));
+                    view! {
+                        <RunDetail net_id=net_id run_id=run_id net_name=net_name
+                            on_close=on_close on_search=on_search docked=wide/>
+                    }
+                }
+            />
             </div>
         </div>
     }
 }
 
-/// The selected run: its stored result beside the receipt of how it was
+/// The selected run: its stored result above the receipt of how it was
 /// produced.
 #[component]
 fn RunDetail(
@@ -318,6 +423,7 @@ fn RunDetail(
     net_name: Signal<Option<String>>,
     on_close: Callback<()>,
     on_search: Callback<String>,
+    docked: Signal<bool>,
 ) -> impl IntoView {
     let bus = expect_context::<ToastBus>();
     // Filled by the preview below out of the one `get_run` response the
@@ -325,7 +431,12 @@ fn RunDetail(
     // still going.
     let summary = RwSignal::new(None::<trawl_api::ReportRunSummary>);
 
-    let title = move || net_name.get().unwrap_or_else(|| format!("Run {run_id}"));
+    // This memo lives under the selected identity's keyed owner. Paging
+    // away retains a correct name, but another selection cannot inherit it.
+    let known_name = Memo::new(move |previous: Option<&Option<String>>| {
+        net_name.get().or_else(|| previous.cloned().flatten())
+    });
+    let title = move || known_name.get().unwrap_or_else(|| format!("Run {run_id}"));
     let status = move || summary.get().map(|s| s.status);
     let duration = move || {
         summary
@@ -341,28 +452,24 @@ fn RunDetail(
     };
 
     view! {
-        <section class="list-sheet run-detail" aria-labelledby="run-detail-title">
-            <div class="list-sheet-hd">
-                <h2 id="run-detail-title" class="list-sheet-ttl">{title}</h2>
+        <Drawer tabs=vec![] tabs_label="Run details" active_tab=Signal::stored(String::new())
+            on_tab_change=Callback::new(|_| {}) on_close=on_close docked=docked
+            panel_class="run-detail" close_size=12
+            title=Box::new(move || view! {
+                <span class="name">{title}</span>
                 {move || status().map(|s| {
                     let tone = run_badge_tone(&s);
                     view! { <Badge tone=tone>{s}</Badge> }
                 })}
-                <span class="cnt">{move || format!("{} recorded rows", row_count())}</span>
-                // The one control here that PUSHES: the net drawer is
-                // somewhere else, so Back comes home to this run.
+            }.into_any())
+            actions=Box::new(move || view! {
+                // The one control here that PUSHES: Back from the net
+                // returns to this selected run.
                 <a class="open-net btn-sec" href=format!("/jobs/nets?net={net_id}&ntab=runs")>
                     "Open net"
                 </a>
-                <button
-                    type="button"
-                    class="sd-x"
-                    aria-label="Close"
-                    on:click=move |_| on_close.run(())
-                >
-                    <IconView icon=Icon::Close size=12 stroke_width=1.5/>
-                </button>
-            </div>
+            }.into_any())
+        >
             <div class="result-grid">
                 <div class="data-area">
                     <RunResultPreview
@@ -390,6 +497,6 @@ fn RunDetail(
                     </p>
                 </aside>
             </div>
-        </section>
+        </Drawer>
     }
 }

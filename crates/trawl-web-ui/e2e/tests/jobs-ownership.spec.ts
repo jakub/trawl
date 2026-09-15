@@ -4,6 +4,7 @@
 
 import { test, expect, resetScenario, SCHEDULE } from '../fixtures';
 import { SEL } from '../selectors';
+import { readFile } from 'node:fs/promises';
 
 test('Nets keeps its open menu and focused item through polling and a clock tick', async ({ page, request }) => {
   await resetScenario(request, 'corpus');
@@ -240,3 +241,136 @@ for (const behavior of ['remove the focused row', 'retain newer focus']) {
     }
   });
 }
+
+test('Runs failed page transition exposes Retry over retained success and keeps same-page rows on poll failure', async ({ page, request }) => {
+  await request.post('/__ctl/reset', { data: { scenario: 'pagination', pagination: { runsTotal: 43 } } });
+  await page.clock.install();
+  let reads = 0;
+  let release: (() => void) | undefined;
+  await page.route('**/api/v1/runs?*', async route => {
+    reads++;
+    if (reads === 2 || reads === 4) {
+      await route.fulfill({ status: 503, json: { error: 'Runs temporarily unavailable' } });
+      return;
+    }
+    const response = await route.fetch();
+    if (reads === 3) await new Promise<void>(resolve => { release = resolve; });
+    await route.fulfill({ response });
+  });
+  await page.goto('/jobs/runs');
+  const frame = page.getByRole('region', { name: 'Recent runs', exact: true });
+  const rows = frame.locator('tbody tr');
+  const footer = frame.locator('.results-footer');
+  await expect(rows).toHaveCount(20);
+  await footer.getByRole('button', { name: 'Next' }).click();
+  await expect(frame.getByRole('button', { name: 'Retry', exact: true })).toBeVisible();
+  await expect(frame).toContainText("Couldn't load runs");
+  await expect(rows).toHaveCount(0);
+  await expect(footer.getByRole('button', { name: 'Next' })).toBeDisabled();
+  await expect(footer.getByRole('button', { name: 'Prev' })).toBeDisabled();
+  await frame.getByRole('button', { name: 'Retry', exact: true }).click();
+  await expect.poll(() => Boolean(release)).toBe(true);
+  await expect(frame).toHaveAttribute('aria-busy', 'true');
+  await expect(frame.getByRole('button', { name: 'Retry', exact: true })).toHaveCount(0);
+  await expect(rows).toHaveCount(0);
+  release!();
+  await expect(footer.locator('.results-summary')).toHaveText('21–40 of 43');
+  await expect(frame).toHaveAttribute('aria-busy', 'false');
+  const before = await rows.allTextContents();
+  await page.clock.fastForward(5_000);
+  await expect.poll(() => reads).toBe(4);
+  await expect(page.getByRole('status').filter({ hasText: 'Refresh failed' })).toBeVisible();
+  expect(await rows.allTextContents()).toEqual(before);
+  await expect(footer.getByRole('button', { name: 'Prev' })).toBeEnabled();
+  await expect(frame.getByRole('button', { name: 'Retry', exact: true })).toHaveCount(0);
+});
+
+test('Runs competing sorts hide old rows and discard the older response before the latest order arrives', async ({ page, request }) => {
+  await resetScenario(request, 'pagination');
+  await page.clock.install();
+  const requests: string[] = [];
+  const releases: Array<() => void> = [];
+  await page.route('**/api/v1/runs?*', async route => {
+    const key = new URL(route.request().url()).searchParams.get('sort')!;
+    requests.push(key);
+    const response = await route.fetch();
+    const body = await response.json();
+    body.runs.forEach((run: { net_name: string }) => { run.net_name = `${key} response`; });
+    if (requests.length > 1) await new Promise<void>(resolve => { releases.push(resolve); });
+    await route.fulfill({ response, json: body });
+  });
+  await page.goto('/jobs/runs');
+  const frame = page.getByRole('region', { name: 'Recent runs', exact: true });
+  const rows = frame.locator('tbody tr');
+  await expect(rows.first()).toContainText('started response');
+  await frame.getByRole('button', { name: 'Sort by Net', exact: true }).click();
+  await expect.poll(() => releases.length).toBe(1);
+  await frame.getByRole('button', { name: 'Sort by Rows', exact: true }).click();
+  await expect(frame).toHaveAttribute('aria-busy', 'true');
+  await expect(rows).toHaveCount(0);
+  releases[0]();
+  await expect.poll(() => releases.length).toBe(2);
+  expect(requests).toEqual(['started', 'net', 'rows']);
+  await expect(rows).toHaveCount(0);
+  await expect(frame).toHaveAttribute('aria-busy', 'true');
+  releases[1]();
+  await expect(rows.first()).toContainText('rows response');
+  await expect(frame).not.toContainText('net response');
+  await expect(frame).toHaveAttribute('aria-busy', 'false');
+});
+
+test('Runs selection owns its name and result through paging and a delayed A-to-B response', async ({ page, request }) => {
+  await resetScenario(request, 'corpus');
+  await page.clock.install();
+  // The corpus endpoint slices before responding, so offset 20 has no
+  // source row. Build every fabricated page from a complete wire record.
+  const run = JSON.parse(await readFile(`${__dirname}/../harness/wire/runs-all.json`, 'utf8')).runs[0];
+  await page.route('**/api/v1/runs?*', async route => {
+    const response = await route.fetch();
+    const body = await response.json();
+    const offset = Number(new URL(route.request().url()).searchParams.get('offset'));
+    body.runs = offset === 0 ? [
+      { ...run, id: 503, net_id: 2, net_name: 'Selected A' },
+      { ...run, id: 502, net_id: 2, net_name: 'Selected B' },
+    ] : [{ ...run, id: 999, net_id: 9, net_name: 'Other page' }];
+    body.total = 21;
+    await route.fulfill({ response, json: body });
+  });
+  let releaseA: (() => void) | undefined;
+  let detailReads = 0;
+  await page.route('**/api/v1/saved/2/runs/*', async route => {
+    detailReads++;
+    const id = Number(new URL(route.request().url()).pathname.split('/').at(-1));
+    const body = JSON.parse(await readFile(`${__dirname}/../harness/wire/run-result-paged.json`, 'utf8'));
+    body.id = id;
+    body.query = id === 503 ? 'query from A' : 'query from B';
+    if (id === 503) await new Promise<void>(resolve => { releaseA = resolve; });
+    await route.fulfill({ json: body });
+  });
+  await page.goto('/jobs/runs');
+  await page.getByRole('link', { name: 'Selected A', exact: true }).click();
+  await expect.poll(() => Boolean(releaseA)).toBe(true);
+  const detail = page.locator(SEL.runDetail);
+  const mountedA = await detail.elementHandle();
+  await page.getByRole('link', { name: 'Selected B', exact: true }).click();
+  await expect(detail.locator('.receipt')).toContainText('query from B');
+  expect(await mountedA!.evaluate(el => el.isConnected)).toBe(false);
+  const completedA = page.waitForResponse(response => new URL(response.url()).pathname === '/api/v1/saved/2/runs/503');
+  releaseA!();
+  await (await completedA).finished();
+  await expect(detail.locator('.receipt')).not.toContainText('query from A');
+  await detail.locator('.data-area').getByRole('button', { name: 'Next →', exact: true }).click();
+  await expect(detail.locator('.results-summary')).toHaveText('21–40 of 45');
+  const mountedB = await detail.elementHandle();
+  await page.getByRole('region', { name: 'Recent runs', exact: true }).getByRole('button', { name: 'Next →', exact: true }).click();
+  await expect(page.locator('.runs-table')).toContainText('Other page');
+  await expect(detail.locator('.sd-ttl')).toContainText('Selected B');
+  await expect(detail.locator('.results-summary')).toHaveText('21–40 of 45');
+  expect(await mountedB!.evaluate(el => el.isConnected)).toBe(true);
+  await page.locator('.runs-table thead').getByRole('button', { name: 'Sort by Net', exact: true }).click();
+  await expect(page.locator('.runs-table')).toContainText('Selected B');
+  await expect(detail.locator('.sd-ttl')).toContainText('Selected B');
+  await expect(detail.locator('.results-summary')).toHaveText('21–40 of 45');
+  expect(await mountedB!.evaluate(el => el.isConnected)).toBe(true);
+  expect(detailReads).toBe(2);
+});

@@ -49,6 +49,8 @@ export const SEL = {
   healthFooterHot: '.statusbar .grp[title="Hot buffer (events / bytes)"]',
   /// crates/trawl-web-ui/src/pages/health.rs HealthPage and HealthQueries.
   healthPage: '.health-page',
+  /// The visible operational cards above Queries.
+  healthCards: '.health-cards',
   /// crates/trawl-web-ui/src/pages/health.rs HealthPage and HealthQueries.
   healthSection: '.health-section',
   /// crates/trawl-web-ui/src/pages/health.rs HealthPage and HealthQueries.
@@ -224,7 +226,7 @@ export const SEL = {
   /// count of what is shown, and the filter input (ADR-0032).
   listSheet: '.list-sheet',
   /// crates/trawl-web-ui/src/pages/runs.rs — the selected run's sheet:
-  /// its stored result beside the execution receipt.
+  /// its stored result above the execution receipt.
   runDetail: '.run-detail',
   /// The receipt's one PUSHING control, which opens the net's Runs tab
   /// so Back returns to the runs page with this run still selected.
@@ -330,12 +332,15 @@ export const SEL = {
 
   // -- chrome ---------------------------------------------------------
   /// crates/trawl-web-ui/src/components/meta_strip.rs — the query
-  /// console's closing row, which describes the EXECUTED query: window,
+  /// console's closing row, which describes the EXECUTED query: facts,
   /// chips, mode badge and row count. It never reads the editor buffer,
   /// so a spec that typed and did not Haul asserts NO change here.
   scopeStrip: '.scope',
-  /// The window the executed query ran under.
-  scopeWindow: '.scope-window',
+  /// Active row count and accepted timing; timing is absent while pending.
+  scopeFacts: '.scope-facts',
+  scopeCount: '.scope-count',
+  scopeExecution: '.scope-execution',
+  scopeStarted: '.scope-started',
   /// crates/trawl-web-ui/src/components/editor_wrap.rs — the console
   /// header's draft marker, rendered only when the buffer differs from
   /// the executed query. It navigates nothing.

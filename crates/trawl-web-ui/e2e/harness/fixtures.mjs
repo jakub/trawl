@@ -97,6 +97,7 @@ export function queryResponse() {
     pagination: { limit: 50, offset: 0, returned: 0 },
     degraded_fields: [],
     severity_columns: [],
+    execution: { started_at: '2026-09-15T12:34:56Z', duration_ms: 125 },
   };
 }
 
@@ -296,4 +297,48 @@ export function scheduleNetRunsResponse() {
  * paging spec can say WHICH rows it is looking at. */
 export function pagedRunResultResponse() {
   return wire('run-result-paged');
+}
+
+/** Global ordering matches the API's closed token set. Fixtures use ASCII
+ * names, so Buffer.compare implements the database's C collation. */
+export function globalRunsOrder(params) {
+  if (params.getAll('sort').length > 1 || params.getAll('dir').length > 1) return null;
+  const sort = params.get('sort') ?? 'started';
+  const dir = params.get('dir') ?? 'desc';
+  if (!['net', 'status', 'started', 'duration', 'rows'].includes(sort) ||
+      !['asc', 'desc'].includes(dir)) return null;
+  return { sort, dir };
+}
+
+export function sortedGlobalRuns(runs, { sort, dir }) {
+  const sign = dir === 'asc' ? 1 : -1;
+  const compare = (a, b) => a < b ? -1 : a > b ? 1 : 0;
+  const text = (a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b));
+  const started = (a, b) => compare(Date.parse(a.started_at), Date.parse(b.started_at));
+  return [...runs].sort((a, b) => {
+    let primary;
+    if (sort === 'net') primary = text(a.net_name.toLowerCase(), b.net_name.toLowerCase());
+    else if (sort === 'status') primary = text(a.status, b.status);
+    else if (sort === 'started') primary = started(a, b);
+    else {
+      const key = sort === 'duration' ? 'duration_ms' : 'row_count';
+      // Nulls stay last in both directions, independently of tie-breakers.
+      if (a[key] == null && b[key] != null) return 1;
+      if (a[key] != null && b[key] == null) return -1;
+      primary = a[key] == null ? 0 : compare(a[key], b[key]);
+    }
+    if (primary) return primary * sign;
+    if (sort === 'started') return compare(a.id, b.id) * sign;
+    return -started(a, b) || -compare(a.id, b.id);
+  });
+}
+
+/** A full authorized fixture set; callers sort this before slicing a page.
+ * The ordinary three-row fixture remains useful for local-filter tests. */
+export function paginationGlobalRuns(total) {
+  const source = wire(total <= 3 ? 'pagination-runs-all' : 'runs-sort').runs;
+  return Array.from({ length: total }, (_, i) => ({
+    ...source[i % source.length],
+    id: source[i % source.length].id + Math.floor(i / source.length) * 1000,
+  }));
 }

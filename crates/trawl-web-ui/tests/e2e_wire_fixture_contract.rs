@@ -912,3 +912,79 @@ fn result_actions_fixture_has_numeric_and_null_aggregate_cells() {
         ]
     );
 }
+
+#[test]
+fn query_fixtures_carry_fixed_server_execution_facts() {
+    for (name, body) in [
+        ("query-rows", QUERY_ROWS),
+        ("query-cardinality", QUERY_CARDINALITY),
+        ("query-top-values", QUERY_TOP_VALUES),
+        ("query-timechart", QUERY_TIMECHART),
+        (
+            "query-stats-by",
+            include_str!("../e2e/harness/wire/query-stats-by.json"),
+        ),
+    ] {
+        let response: QueryResponse = decode(name, body);
+        let execution = response
+            .execution
+            .expect("successful fixture has execution facts");
+        assert_eq!(execution.started_at, "2026-09-15T12:34:56Z");
+        assert_eq!(execution.duration_ms, 125);
+    }
+}
+
+#[test]
+fn global_sort_fixture_has_unique_flat_ids_and_cross_page_comparisons() {
+    let raw = include_str!("../e2e/harness/wire/runs-sort.json");
+    let response: ListAllRunsResponse = decode("runs-sort", raw);
+    assert_eq!(response.total, 43);
+    assert_eq!(response.runs.len(), 43);
+    let ids: std::collections::BTreeSet<_> = response.runs.iter().map(|r| r.run.id).collect();
+    assert_eq!(ids.len(), 43);
+    assert_eq!(ids.first(), Some(&501));
+    assert_eq!(ids.last(), Some(&543));
+    let value: serde_json::Value = serde_json::from_str(raw).unwrap();
+    assert!(
+        value["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r.get("id").is_some() && r.get("run").is_none())
+    );
+    for page in response.runs.chunks(20).take(2) {
+        assert!(page.iter().any(|r| r.run.duration_ms.is_none()));
+        assert!(page.iter().any(|r| r.run.row_count.is_none()));
+        assert!(page.iter().any(|r| r.net_name == "ALPHA digest"));
+        assert!(page.iter().any(|r| r.net_name == "alpha digest"));
+    }
+    // Equal timestamp and primary-value groups are deliberate; IDs settle ties.
+    let first = response.runs.iter().find(|r| r.run.id == 501).unwrap();
+    let second = response.runs.iter().find(|r| r.run.id == 502).unwrap();
+    assert_eq!(first.run.started_at, second.run.started_at);
+    let durations: std::collections::BTreeSet<_> = response
+        .runs
+        .iter()
+        .filter_map(|r| r.run.duration_ms)
+        .collect();
+    assert_eq!(durations, [0, 9, 40, 125, 1000].into_iter().collect());
+}
+
+#[test]
+fn wide_result_capture_fixture_has_full_width_rows_and_local_pages() {
+    let response: ReportRunResponse = decode(
+        "run-result-wide",
+        include_str!("../e2e/harness/wire/run-result-wide.json"),
+    );
+    assert_eq!(response.summary.id, 501);
+    let result = response.result.expect("stored result is available");
+    assert_eq!(result.rows.len(), 45);
+    assert_eq!(result.columns.len(), 8);
+    assert!(
+        result
+            .rows
+            .iter()
+            .all(|row| row.len() == result.columns.len())
+    );
+    assert_eq!(result.columns[6].name, "trace_id");
+}

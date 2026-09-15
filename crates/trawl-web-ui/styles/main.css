@@ -578,10 +578,10 @@
   border-end-start-radius: var(--radius-panel);
   border-end-end-radius: var(--radius-panel);
 }
-.scope-lb { font-weight: 600; }
-/* The window phrase can be two absolute timestamps plus DSL clauses:
- * wrap it rather than push the chips off the row. */
-.scope-window { font-family: var(--font-mono); overflow-wrap: anywhere; }
+/* Keep accepted execution facts together while allowing narrow strips to wrap. */
+.scope-facts { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; min-width: 0; }
+.scope-facts > span { font-variant-numeric: tabular-nums; }
+.scope-started { font-family: var(--font-mono); overflow-wrap: anywhere; }
 .scope .meta-chips { display: flex; flex-wrap: wrap; gap: 6px; }
 
 /* Filter chips — one per active Filter. */
@@ -632,9 +632,10 @@
   border-radius: var(--radius-round);
   background: var(--green);
 }
-/* Pushed to the trailing edge, so the count is where the eye leaves the
- * row whatever the chips did to the middle of it. */
-.scope-count { margin-inline-start: auto; font-variant-numeric: tabular-nums; }
+/* Long filter values must stay inside the hanging strip. */
+.scope .meta-chips, .scope .chip { min-width: 0; max-width: 100%; }
+.scope .chip { overflow-wrap: anywhere; }
+.scope .chip .x { flex-shrink: 0; }
 
 /* ─────────────────────────────────────────────────────────────────
  *  Tabs — base .tabs family moved to fleet-ui.css (issue #28,
@@ -1892,13 +1893,13 @@
   font-variant-numeric: tabular-nums;
 }
 
-/* The selected run: its stored result beside the receipt of how it was
- * produced. The receipt is a well on the sheet, so it reads as a record
- * rather than a second set of controls. */
-.run-detail .result-grid { display: grid; grid-template-columns: minmax(0, 1fr) 280px; min-height: 0; }
+/* The stored result precedes its receipt in both docked and overlay panes. */
+.run-detail .sd-tabs { display: none; }
+.run-detail .result-grid { display: grid; grid-template-columns: minmax(0, 1fr); min-height: 0; }
+.run-detail .data-area .preview-scroll { max-width: 100%; overflow-x: auto; }
 .run-detail .data-area { min-width: 0; padding: 12px; }
 .run-detail .receipt {
-  border-left: 1px solid var(--line); padding: 14px 16px;
+  border-top: 1px solid var(--line); padding: 14px 16px;
   background: var(--well); box-shadow: var(--inset);
 }
 .run-detail .receipt h3 { margin: 0 0 10px; font-family: var(--font-ui); font-size: var(--fs-control); font-weight: 600; }
@@ -1914,12 +1915,6 @@
   font-family: var(--font-mono); font-size: var(--fs-micro); color: var(--ink);
 }
 .run-detail .small { margin: 12px 0 0; font-size: var(--fs-dense); color: var(--ink-3); }
-/* Under 900px the receipt stacks below the rows it describes rather
- * than squeezing both into one column of a narrow viewport. */
-@media (max-width: 899.98px) {
-  .run-detail .result-grid { grid-template-columns: minmax(0, 1fr); }
-  .run-detail .receipt { border-left: 0; border-top: 1px solid var(--line); }
-}
 
 /* Wide enough for the inspector to sit beside the rows it describes. */
 @media (min-width: 900px) {

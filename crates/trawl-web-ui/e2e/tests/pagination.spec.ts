@@ -252,3 +252,51 @@ for (const surface of ['global', 'drawer'] as const) {
     await expect(scope.getByRole('button', { name: 'Next' })).toBeDisabled();
   });
 }
+
+test('global Runs orders across page boundaries for every key and direction', async ({ page, request }) => {
+  test.setTimeout(45_000);
+  await configure(request, { runsTotal: 43 });
+  await page.clock.install();
+  await page.goto('/jobs/runs');
+  const frame = page.getByRole('region', { name: 'Recent runs', exact: true });
+  const footer = frame.locator('.results-footer');
+  const rows = frame.locator('.row-stretch');
+  const idOf = async (row: import('@playwright/test').Locator) =>
+    Number(new URL((await row.getAttribute('href'))!, page.url()).searchParams.get('run'));
+  await expect(rows).toHaveCount(20);
+  // These IDs are independently pinned to the deliberately disordered
+  // 43-run wire fixture. Page-two and last-page checks reject sorting only
+  // the twenty rows the browser already holds.
+  const cases = [
+    ['Net', 'net', 'asc', 502, 521, 543], ['Net', 'net', 'desc', 501, 514, 539],
+    ['Status', 'status', 'asc', 503, 540, 542], ['Status', 'status', 'desc', 502, 537, 543],
+    ['When', 'started', 'desc', 502, 522, 543], ['When', 'started', 'asc', 543, 524, 502],
+    ['Duration', 'duration', 'desc', 503, 514, 539], ['Duration', 'duration', 'asc', 506, 508, 539],
+    ['Rows', 'rows', 'desc', 504, 508, 541], ['Rows', 'rows', 'asc', 507, 509, 541],
+  ] as const;
+  for (const [label, key, dir, first, secondPage, last] of cases) {
+    await frame.locator('thead').getByRole('button', { name: new RegExp(`^Sort by ${label}(,|$)`) }).click();
+    await expect(footer.locator('.results-summary')).toHaveText('1–20 of 43');
+    await expect.poll(() => idOf(rows.first())).toBe(first);
+    const state = await paginationState(request);
+    expect(state.runs.at(-1)).toMatchObject({ sort: key, dir, offset: 0 });
+    await footer.getByRole('button', { name: 'Next' }).click();
+    await expect(footer.locator('.results-summary')).toHaveText('21–40 of 43');
+    expect(await idOf(rows.first())).toBe(secondPage);
+    await footer.getByRole('button', { name: 'Next' }).click();
+    await expect(footer.locator('.results-summary')).toHaveText('41–43 of 43');
+    expect(await idOf(rows.last())).toBe(last);
+  }
+  const calls = (await paginationState(request)).runs as Array<{ sort: string; dir: string; offset: number }>;
+  // Each new ordering starts at zero, including returning to initial When
+  // after visiting other keys. No intermediate old-page/new-sort request.
+  expect(calls.map(({ sort, dir, offset }) => [sort, dir, offset])).toEqual([
+    ['started', 'desc', 0],
+    ...cases.flatMap(([, key, dir]) => [[key, dir, 0], [key, dir, 20], [key, dir, 40]]),
+  ]);
+  await page.getByPlaceholder('Filter by net…').fill('no such net on this page');
+  await expect(rows).toHaveCount(0);
+  await expect(footer.locator('.results-summary')).toContainText('41–43 of 43');
+  await expect(footer).toContainText('0 matches on this page');
+  await expect(footer.getByRole('button', { name: 'Next' })).toBeDisabled();
+});

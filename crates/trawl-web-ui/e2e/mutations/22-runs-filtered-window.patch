@@ -1,12 +1,12 @@
 diff --git a/crates/trawl-web-ui/src/pages/runs.rs b/crates/trawl-web-ui/src/pages/runs.rs
 --- a/crates/trawl-web-ui/src/pages/runs.rs
 +++ b/crates/trawl-web-ui/src/pages/runs.rs
-@@ -60,7 +60,7 @@
-         let data = runs.get().and_then(Result::ok);
+@@ -259,7 +259,7 @@
          let (fetched, returned, total) = data
              .as_ref()
--            .map_or((0, 0, 0), |(p, r)| (*p, r.runs.len(), r.total));
-+            .map_or((0, 0, 0), |(p, r)| (*p, visible_runs.get().len(), r.total));
+             .map_or((requested.get().page, 0, 0), |(owner, r)| {
+-                (owner.page, r.runs.len(), r.total)
++                (owner.page, visible_runs.get().len(), r.total)
+             });
          PageWindow::new(
              fetched,
-             RUNS_PAGE_SIZE,

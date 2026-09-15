@@ -115,6 +115,8 @@ export const CORPUS = {
   netName: 'errors by host',
   /** Rows in `wire/query-rows.json`. */
   rowCount: 8,
+  /** Fixed metadata in every query wire fixture. Pagination adds offset seconds/ms. */
+  execution: { startedAt: '2026-09-15T12:34:56Z', durationMs: 125 },
   /** Its columns, in wire order. */
   columns: ['_time', 'host', 'status', 'message'] as const,
   /** `host`'s distinct values, most frequent first, then alphabetical —
@@ -395,4 +397,11 @@ export async function toastCount(page: Pg): Promise<number> {
  */
 export async function scriptRepinStatus(request: Ctl, field: string): Promise<void> {
   await request.post('/__ctl/reset', { data: { scenario: 'default', repinField: field } });
+}
+
+/** Requests to the global Runs endpoint, including the requested order. */
+export async function capturedRunListRequests(request: Ctl): Promise<Array<{
+  path: string; offset: number; limit: number; sort: string; dir: string;
+}>> {
+  return (await (await request.get('/__ctl/state')).json()).runListReads;
 }

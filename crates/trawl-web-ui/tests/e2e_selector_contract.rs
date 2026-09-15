@@ -341,6 +341,12 @@ const CONTRACTS: &[Contract] = &[
         hook: "title=\"Hot buffer (events / bytes)\"",
     },
     Contract {
+        assignment: "healthCards: '.health-cards',",
+        source_path: "src/pages/health.rs",
+        source: HEALTH_RS,
+        hook: "class=\"health-cards\"",
+    },
+    Contract {
         assignment: "healthPage: '.health-page',",
         source_path: "src/pages/health.rs",
         source: HEALTH_RS,
@@ -970,7 +976,7 @@ const CONTRACTS: &[Contract] = &[
         assignment: "runDetail: '.run-detail',",
         source_path: "src/pages/runs.rs",
         source: RUNS_RS,
-        hook: "class=\"list-sheet run-detail\"",
+        hook: "panel_class=\"run-detail\"",
     },
     Contract {
         assignment: "runOpenNet: '.run-detail a.open-net',",
@@ -1311,10 +1317,28 @@ const CONTRACTS: &[Contract] = &[
         hook: "class=\"scope\"",
     },
     Contract {
-        assignment: "scopeWindow: '.scope-window',",
+        assignment: "scopeFacts: '.scope-facts',",
         source_path: "src/components/meta_strip.rs",
         source: META_STRIP_RS,
-        hook: "class=\"scope-window\"",
+        hook: "class=\"scope-facts\"",
+    },
+    Contract {
+        assignment: "scopeCount: '.scope-count',",
+        source_path: "src/components/meta_strip.rs",
+        source: META_STRIP_RS,
+        hook: "class=\"scope-count\"",
+    },
+    Contract {
+        assignment: "scopeExecution: '.scope-execution',",
+        source_path: "src/components/meta_strip.rs",
+        source: META_STRIP_RS,
+        hook: "class=\"scope-execution\"",
+    },
+    Contract {
+        assignment: "scopeStarted: '.scope-started',",
+        source_path: "src/components/meta_strip.rs",
+        source: META_STRIP_RS,
+        hook: "class=\"scope-started\"",
     },
     Contract {
         assignment: "draftState: '.console-hd .draft',",
