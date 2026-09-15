@@ -150,15 +150,16 @@ test('a delayed refresh cannot restore an active query after a newer empty repor
 
 test('a delayed health failure cannot replace a newer healthy report', async ({ page, request }) => {
   await setup(request, 'health-viewer');
+  let armed = false;
   let reads = 0;
   let release!: () => void;
   const held = new Promise<void>(resolve => { release = resolve; });
   let delivered!: () => void;
   const delivery = new Promise<void>(resolve => { delivered = resolve; });
   await page.route('**/api/v1/health', async route => {
-    const read = ++reads;
+    const read = armed ? ++reads : 0;
     const response = await route.fetch();
-    if (read === 2) {
+    if (read === 1) {
       await held;
       await route.fulfill({ status: 502, json: { error: 'old report failed' } });
       delivered();
@@ -169,10 +170,11 @@ test('a delayed health failure cannot replace a newer healthy report', async ({ 
   await page.goto('/settings/health');
   const health = page.locator(SEL.healthSection);
   await expect(health.getByRole('heading')).toHaveText('Server is healthy');
+  armed = true;
+  await page.locator(SEL.healthRefresh).click();
+  await expect.poll(() => reads).toBe(1);
   await page.locator(SEL.healthRefresh).click();
   await expect.poll(() => reads).toBe(2);
-  await page.locator(SEL.healthRefresh).click();
-  await expect.poll(() => reads).toBe(3);
   await expect(health.getByRole('heading')).toHaveText('Server is healthy');
   release();
   await delivery;

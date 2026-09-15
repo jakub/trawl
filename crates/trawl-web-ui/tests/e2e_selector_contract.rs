@@ -302,7 +302,7 @@ const CONTRACTS: &[Contract] = &[
         assignment: "healthQueryScroll: '.health-query-scroll',",
         source_path: "src/pages/health.rs",
         source: HEALTH_RS,
-        hook: "class=\"health-query-scroll\"",
+        hook: "class=\"health-query-scroll tbl-scroll\"",
     },
     Contract {
         assignment: "healthAwayLink: 'nav.rail a[title=\"Schema\"]',",
@@ -374,7 +374,7 @@ const CONTRACTS: &[Contract] = &[
         assignment: "healthQueries: '.health-queries',",
         source_path: "src/pages/health.rs",
         source: HEALTH_RS,
-        hook: "class=\"health-queries\"",
+        hook: "class=\"health-queries tbl fleet-table-frame\"",
     },
     Contract {
         assignment: "healthRefresh: '.health-refresh',",
