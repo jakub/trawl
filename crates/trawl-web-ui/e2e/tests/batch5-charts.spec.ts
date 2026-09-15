@@ -3,6 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 import { test, expect, resetScenario, trackIntervals, intervalCount } from '../fixtures';
+import { expectFocusRing } from '../a11y';
 
 const countResult = {
   columns: [{ name: '_time' }, { name: 'count' }],
@@ -141,7 +142,7 @@ test('subsecond events fall inside their histogram tooltip intervals', async ({ 
   await first.focus();
   await page.keyboard.press('Shift+Tab');
   await page.keyboard.press('Tab');
-  await expect(first).toBeFocused();
+  await expectFocusRing(first);
   await expect(first).toHaveAccessibleName(await tips.first().innerText());
   await expect(tips.first()).toHaveCSS('opacity', '1');
   await page.keyboard.press('Tab');
@@ -151,6 +152,9 @@ test('subsecond events fall inside their histogram tooltip intervals', async ({ 
   await expect(tips.first()).toHaveCSS('opacity', '0');
   await first.hover();
   await expect(tips.first()).toHaveCSS('opacity', '1');
+  await first.click();
+  await page.mouse.move(0, 0);
+  await expect(tips.first()).toHaveCSS('opacity', '0');
   const populated = (await tips.allTextContents())
     .map(text => text.match(/^(.*?) – (.*?) · (\d+) events(?: · (\d+) errors)?$/))
     .filter(match => match && Number(match[3]) > 0)
