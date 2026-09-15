@@ -76,8 +76,8 @@ pub fn Histogram(
                                     if b.err > 0 { format!(" · {} errors", b.err) } else { String::new() }
                                 );
                                 view! {
-                                    <div class="bar">
-                                        <div class="tip">{tip}</div>
+                                    <div class="bar" tabindex="0" role="img" aria-label=tip>
+                                        <div class="tip" aria-hidden="true">{tip.clone()}</div>
                                         <div class="ok" style=format!("height:{ok_h:.1}%")></div>
                                         <div class="err" style=format!("height:{err_h:.1}%")></div>
                                     </div>

@@ -135,6 +135,22 @@ test('subsecond events fall inside their histogram tooltip intervals', async ({ 
   await page.goto('/search?q=service%3Dnginx');
   const tips = page.locator('.histo .bar .tip');
   await expect(tips).toHaveCount(48);
+  const bars = page.locator('.histo .bar');
+  const first = bars.first();
+  const second = bars.nth(1);
+  await first.focus();
+  await page.keyboard.press('Shift+Tab');
+  await page.keyboard.press('Tab');
+  await expect(first).toBeFocused();
+  await expect(first).toHaveAccessibleName(await tips.first().innerText());
+  await expect(tips.first()).toHaveCSS('opacity', '1');
+  await page.keyboard.press('Tab');
+  await expect(second).toBeFocused();
+  await expect(second).toHaveAccessibleName(await tips.nth(1).innerText());
+  await expect(tips.nth(1)).toHaveCSS('opacity', '1');
+  await expect(tips.first()).toHaveCSS('opacity', '0');
+  await first.hover();
+  await expect(tips.first()).toHaveCSS('opacity', '1');
   const populated = (await tips.allTextContents())
     .map(text => text.match(/^(.*?) – (.*?) · (\d+) events(?: · (\d+) errors)?$/))
     .filter(match => match && Number(match[3]) > 0)
