@@ -596,7 +596,7 @@ fn the_focus_ring_reaches_anchors() {
     // The ring is an outline now, so a `:focus-visible` rule that painted
     // it as a box-shadow would be a second focus idiom — and --shadow-glow
     // no longer exists to paint it with.
-    let glow_groups: Vec<String> = rules(CSS)
+    let glow_groups: Vec<String> = leaf_rules(CSS)
         .into_iter()
         .filter(|r| {
             let (selector, body) = r.split_once('{').unwrap_or((r.as_str(), ""));
@@ -611,7 +611,7 @@ fn the_focus_ring_reaches_anchors() {
     // And a rule that resets `outline: none` on a focused control erases
     // the ring outright — `.actions-menu .item:focus-visible`
     // (fleet-ui.css:1390) did exactly that before ADR-0032.
-    let suppressed: Vec<String> = rules(CSS)
+    let suppressed: Vec<String> = leaf_rules(CSS)
         .into_iter()
         .filter(|r| {
             let (selector, body) = r.split_once('{').unwrap_or((r.as_str(), ""));
@@ -622,5 +622,44 @@ fn the_focus_ring_reaches_anchors() {
         suppressed.is_empty(),
         "no `:focus-visible` rule may reset the outline — that erases the \
          ring instead of restyling it, found: {suppressed:#?}"
+    );
+}
+
+/// Every style rule in `css` as its own entry, descending into `@media`,
+/// `@supports` and any other block at-rule. [`rules`] hands a whole
+/// `@media` block back as one rule whose "selector" is the at-rule, which
+/// is exactly where a responsive `:focus-visible { outline: none }` would
+/// hide from a scan that only reads the top level.
+fn leaf_rules(css: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for rule in rules(css) {
+        let (head, _) = rule.split_once('{').unwrap_or((rule.as_str(), ""));
+        if head.trim_start().starts_with('@')
+            && let Some(open) = rule.find('{')
+            && let Some(close) = rule.rfind('}')
+            && open < close
+        {
+            let inner = &rule[open + 1..close];
+            if inner.contains('{') {
+                out.extend(leaf_rules(inner));
+                continue;
+            }
+        }
+        out.push(rule);
+    }
+    out
+}
+
+#[test]
+fn leaf_rules_descend_into_media_blocks() {
+    let css = "a:focus-visible { outline: 2px solid red; }\n\
+               @media (max-width: 600px) {\n  b:focus-visible { outline: none; }\n}\n";
+    let leaves = leaf_rules(css);
+    assert_eq!(leaves.len(), 2, "{leaves:#?}");
+    assert!(
+        leaves
+            .iter()
+            .any(|r| r.contains("b:focus-visible") && !r.contains("@media")),
+        "the nested rule surfaces as its own leaf: {leaves:#?}"
     );
 }
