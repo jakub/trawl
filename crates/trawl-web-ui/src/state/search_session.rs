@@ -82,6 +82,7 @@ pub fn rows_resource(
 
 fn empty_response() -> QueryResponse {
     QueryResponse {
+        execution: None,
         result: trawl_api::value::QueryResult::empty(),
         truncated: false,
         pagination: trawl_api::PaginationMeta {

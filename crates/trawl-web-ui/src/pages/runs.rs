@@ -69,7 +69,13 @@ pub fn RunsPage() -> impl IntoView {
                 let offset = PageWindow::checked_offset(p, RUNS_PAGE_SIZE).map_err(|_| {
                     api::ApiError::Refused("This runs page is too large to request.")
                 })?;
-                let response = api::list_all_runs(RUNS_PAGE_SIZE.get(), offset).await;
+                let response = api::list_all_runs(
+                    RUNS_PAGE_SIZE.get(),
+                    offset,
+                    trawl_api::RunsSortKey::default(),
+                    trawl_api::RunsSortDir::default(),
+                )
+                .await;
                 response.map(|resp| (p, resp))
             }
         });

@@ -2205,15 +2205,50 @@ async fn list_all_runs_paginated_and_isolated(pool: PgPool) {
         .await
         .unwrap();
 
-    let all = store.list_all_runs(1, 100, 0).await.unwrap();
+    let all = store
+        .list_all_runs(
+            1,
+            100,
+            0,
+            trawl_api::RunsSortKey::default(),
+            trawl_api::RunsSortDir::default(),
+        )
+        .await
+        .unwrap();
     assert_eq!(all.len(), 5);
     let names: Vec<&str> = all.iter().map(|(_, name)| name.as_str()).collect();
     assert!(names.contains(&"alpha"));
     assert!(names.contains(&"beta"));
     assert!(!names.contains(&"other-user"));
 
-    assert_eq!(store.list_all_runs(1, 2, 0).await.unwrap().len(), 2);
-    assert_eq!(store.list_all_runs(1, 2, 2).await.unwrap().len(), 2);
+    assert_eq!(
+        store
+            .list_all_runs(
+                1,
+                2,
+                0,
+                trawl_api::RunsSortKey::default(),
+                trawl_api::RunsSortDir::default()
+            )
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        store
+            .list_all_runs(
+                1,
+                2,
+                2,
+                trawl_api::RunsSortKey::default(),
+                trawl_api::RunsSortDir::default()
+            )
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
     assert_eq!(store.count_all_runs(1).await.unwrap(), 5);
     assert_eq!(store.count_all_runs(2).await.unwrap(), 1);
 }
@@ -7236,4 +7271,76 @@ async fn history_clear_is_scoped_counted_and_preserves_saved(pool: PgPool) {
     assert_eq!(saved_store.list(1).await.unwrap(), vec![saved_query]);
     assert_eq!(store.clear_user_history(1).await.unwrap(), 0);
     assert_eq!(store.get_user_history(2, 10, 0).await.unwrap(), foreign);
+}
+
+/// Deliberately interleave primary values across pages. Expected IDs are fixed
+/// independently of the SQL comparator, including null and timestamp ties.
+#[sqlx::test]
+async fn list_all_runs_every_order_before_pagination(pool: PgPool) {
+    use trawl_api::{
+        RunsSortDir::{Asc, Desc},
+        RunsSortKey::{Duration, Net, Rows, Started, Status},
+    };
+    let store = schedules(&pool);
+    let mut nets = Vec::new();
+    for (owner, name) in [
+        (1, "beta"),
+        (1, "alpha"),
+        (1, "Zulu"),
+        (2, "AAA-other-owner"),
+    ] {
+        let saved_id = seed_saved(&pool, owner, name).await;
+        let schedule = store
+            .create_schedule(saved_id, owner, 300, None, None, 0, chrono::Utc::now())
+            .await
+            .unwrap();
+        nets.push((saved_id, schedule.id));
+    }
+    let fixtures = [
+        (0, "success", 1, Some(10_i64), Some(2_i64)),
+        (1, "error", 3, Some(2), Some(10)),
+        (1, "success", 2, Some(10), Some(2)),
+        (2, "timeout", 3, Some(100), Some(100)),
+        (0, "running", 4, None, None),
+        (1, "error", 3, Some(2), Some(10)),
+        (1, "success", 5, Some(0), Some(0)),
+        (2, "error", 0, None, None),
+        (3, "success", 9, Some(999), Some(999)),
+    ];
+    let mut ids = Vec::new();
+    for (net, status, seconds, duration, rows) in fixtures {
+        let (saved_id, schedule_id) = nets[net];
+        let id: i64 = sqlx::query_scalar("INSERT INTO report_runs
+            (schedule_id, saved_query_id, query, status, started_at, duration_ms, row_count)
+            VALUES ($1, $2, '*', $3, '2026-09-15T00:00:00Z'::timestamptz + $4 * interval '1 second', $5, $6) RETURNING id")
+            .bind(schedule_id).bind(saved_id).bind(status).bind(f64::from(seconds)).bind(duration).bind(rows)
+            .fetch_one(&pool).await.unwrap();
+        ids.push(id);
+    }
+    for (key, dir, expected) in [
+        (Net, Asc, [6, 5, 1, 2, 4, 0, 3, 7]),
+        (Net, Desc, [3, 7, 4, 0, 6, 5, 1, 2]),
+        (Status, Asc, [5, 1, 7, 4, 6, 2, 0, 3]),
+        (Status, Desc, [3, 6, 2, 0, 4, 5, 1, 7]),
+        (Started, Asc, [7, 0, 2, 1, 3, 5, 4, 6]),
+        (Started, Desc, [6, 4, 5, 3, 1, 2, 0, 7]),
+        (Duration, Asc, [6, 5, 1, 2, 0, 3, 4, 7]),
+        (Duration, Desc, [3, 2, 0, 5, 1, 6, 4, 7]),
+        (Rows, Asc, [6, 2, 0, 5, 1, 3, 4, 7]),
+        (Rows, Desc, [3, 5, 1, 2, 0, 6, 4, 7]),
+    ] {
+        let mut actual = Vec::new();
+        for offset in [0, 3, 6, 9] {
+            let page = store.list_all_runs(1, 3, offset, key, dir).await.unwrap();
+            assert!(page.len() <= 3);
+            actual.extend(page.into_iter().map(|(run, _)| run.id));
+        }
+        assert_eq!(actual, expected.map(|i| ids[i]), "{key:?} {dir:?}");
+        let other = store.list_all_runs(2, 3, 0, key, dir).await.unwrap();
+        assert_eq!(
+            other.iter().map(|(run, _)| run.id).collect::<Vec<_>>(),
+            vec![ids[8]]
+        );
+    }
+    assert_eq!(store.count_all_runs(1).await.unwrap(), 8);
 }

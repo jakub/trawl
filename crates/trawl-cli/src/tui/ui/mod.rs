@@ -210,6 +210,7 @@ mod tests {
             .collect();
         let returned = rows.len();
         QueryResponse {
+            execution: None,
             result: trawl_engine::value::QueryResult {
                 columns: cols,
                 rows,

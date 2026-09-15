@@ -317,9 +317,21 @@ impl From<SchemaColumn> for SchemaColumnResponse {
 
 // -- query -------------------------------------------------------------------
 
+/// Server execution across query admission and execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryExecution {
+    /// UTC start instant in RFC 3339 format.
+    pub started_at: String,
+    /// Measured duration in milliseconds. Zero is valid.
+    pub duration_ms: u64,
+}
+
 /// Query response with pagination metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryResponse {
+    /// Execution facts, absent for synthetic results.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<QueryExecution>,
     /// The query result (columns + rows).
     #[serde(flatten)]
     pub result: QueryResult,
@@ -1550,6 +1562,73 @@ pub struct RunsStatsResponse {
     pub avg_duration_ms: Option<u64>,
 }
 
+/// Allowlisted global Runs ordering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RunsSortKey {
+    Net,
+    Status,
+    #[default]
+    Started,
+    Duration,
+    Rows,
+}
+impl RunsSortKey {
+    /// Return the exact lowercase HTTP token.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Net => "net",
+            Self::Status => "status",
+            Self::Started => "started",
+            Self::Duration => "duration",
+            Self::Rows => "rows",
+        }
+    }
+}
+impl std::str::FromStr for RunsSortKey {
+    type Err = &'static str;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "net" => Ok(Self::Net),
+            "status" => Ok(Self::Status),
+            "started" => Ok(Self::Started),
+            "duration" => Ok(Self::Duration),
+            "rows" => Ok(Self::Rows),
+            _ => Err("invalid runs sort key"),
+        }
+    }
+}
+
+/// Allowlisted global Runs ordering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RunsSortDir {
+    Asc,
+    #[default]
+    Desc,
+}
+impl RunsSortDir {
+    /// Return the exact lowercase HTTP token.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Asc => "asc",
+            Self::Desc => "desc",
+        }
+    }
+}
+impl std::str::FromStr for RunsSortDir {
+    type Err = &'static str;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "asc" => Ok(Self::Asc),
+            "desc" => Ok(Self::Desc),
+            _ => Err("invalid runs sort direction"),
+        }
+    }
+}
+
 // -- ingest ------------------------------------------------------------------
 
 /// A per-event error from the ingest endpoint.
@@ -1588,6 +1667,64 @@ fn is_zero(n: &usize) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn query_execution_serialization() {
+        let wire = serde_json::json!({"columns": [], "rows": [], "truncated": false,
+            "pagination": {"limit": 10, "offset": 0, "returned": 0}});
+        let mut response: super::QueryResponse = serde_json::from_value(wire.clone()).unwrap();
+        assert!(response.execution.is_none());
+        assert_eq!(serde_json::to_value(&response).unwrap(), wire);
+        response.execution = Some(super::QueryExecution {
+            started_at: "2026-09-15T12:34:56Z".into(),
+            duration_ms: 0,
+        });
+        let encoded = serde_json::to_value(&response).unwrap();
+        assert_eq!(encoded["execution"]["duration_ms"], 0);
+        let decoded: super::QueryResponse = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.execution, response.execution);
+    }
+
+    #[test]
+    fn runs_sort_tokens_are_closed() {
+        use super::{RunsSortDir, RunsSortKey};
+        for (key, token) in [
+            (RunsSortKey::Net, "net"),
+            (RunsSortKey::Status, "status"),
+            (RunsSortKey::Started, "started"),
+            (RunsSortKey::Duration, "duration"),
+            (RunsSortKey::Rows, "rows"),
+        ] {
+            assert_eq!(key.as_str(), token);
+            assert_eq!(token.parse(), Ok(key));
+            assert_eq!(serde_json::to_value(key).unwrap(), token);
+            assert_eq!(
+                serde_json::from_value::<RunsSortKey>(serde_json::json!(token)).unwrap(),
+                key
+            );
+        }
+        for (dir, token) in [(RunsSortDir::Asc, "asc"), (RunsSortDir::Desc, "desc")] {
+            assert_eq!(dir.as_str(), token);
+            assert_eq!(token.parse(), Ok(dir));
+            assert_eq!(serde_json::to_value(dir).unwrap(), token);
+            assert_eq!(
+                serde_json::from_value::<RunsSortDir>(serde_json::json!(token)).unwrap(),
+                dir
+            );
+        }
+        for invalid in [
+            "",
+            "Net",
+            "started desc",
+            "ASC",
+            "desc;drop table report_runs",
+        ] {
+            assert!(invalid.parse::<RunsSortKey>().is_err());
+            assert!(invalid.parse::<RunsSortDir>().is_err());
+        }
+        assert_eq!(RunsSortKey::default(), RunsSortKey::Started);
+        assert_eq!(RunsSortDir::default(), RunsSortDir::Desc);
+    }
+
     use super::*;
 
     /// Round-trip a type through JSON serialization.

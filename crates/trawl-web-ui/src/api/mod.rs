@@ -15,8 +15,9 @@ use trawl_api::{
     DeleteScheduleResponse, ErrorResponse, ExportFormat, ExportRequest, HealthResponse,
     HistoryResponse, ListAllRunsResponse, ListReportRunsResponse, ListSavedResponse, QueryRequest,
     QueryResponse, RepinJobResponse, RepinRequest, RepinResponse, RepinStatusResponse,
-    ReportRunResponse, ReportRunSummary, RunsStatsResponse, SavedQueryResponse, ScheduleResponse,
-    ServiceSchemaResponse, SetScheduleRequest, UpdateSavedRequest,
+    ReportRunResponse, ReportRunSummary, RunsSortDir, RunsSortKey, RunsStatsResponse,
+    SavedQueryResponse, ScheduleResponse, ServiceSchemaResponse, SetScheduleRequest,
+    UpdateSavedRequest,
 };
 
 use crate::repin_flow::{BoundCeilings, ConflictBody, classify_conflict};
@@ -558,8 +559,17 @@ pub async fn get_run(saved_id: i64, run_id: i64) -> Result<ReportRunResponse, Ap
 }
 
 /// GET /api/v1/runs — paginated runs across all saved queries.
-pub async fn list_all_runs(limit: usize, offset: usize) -> Result<ListAllRunsResponse, ApiError> {
-    let url = format!("/api/v1/runs?limit={limit}&offset={offset}");
+pub async fn list_all_runs(
+    limit: usize,
+    offset: usize,
+    key: RunsSortKey,
+    dir: RunsSortDir,
+) -> Result<ListAllRunsResponse, ApiError> {
+    let url = format!(
+        "/api/v1/runs?limit={limit}&offset={offset}&sort={}&dir={}",
+        key.as_str(),
+        dir.as_str()
+    );
     let resp = Request::get(&url).send().await?;
     match resp.status() {
         200 => resp

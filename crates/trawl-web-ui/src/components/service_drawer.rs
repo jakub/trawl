@@ -699,6 +699,7 @@ fn TailPane(svc: ServiceSchema, bus: ToastBus) -> impl IntoView {
 
 fn declined_query_response() -> trawl_api::QueryResponse {
     trawl_api::QueryResponse {
+        execution: None,
         result: trawl_api::value::QueryResult::empty(),
         truncated: false,
         pagination: trawl_api::PaginationMeta {
