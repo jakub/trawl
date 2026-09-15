@@ -19,7 +19,7 @@ The console header shows "Edited" when the editor buffer differs from the execut
 _Avoid_: dirty flag, unsaved indicator, status
 
 **Executed-scope strip**:
-The well attached to the foot of the console, holding removable active filter chips, the mode badge and facts about the active result. A completed snapshot shows rows returned, server execution duration and its absolute UTC start time. Live shows buffered rows without snapshot timing. Typing does not change completed facts; a pending, failed or malformed search cannot display another query's execution facts.
+The well attached to the foot of the console, holding removable active filter chips and facts about the active result. A completed snapshot shows rows returned, server execution duration and its absolute UTC start time, without a mode badge. Live shows a Live badge and buffered rows without snapshot timing. Typing does not change completed facts; a pending, failed or malformed search cannot display another query's execution facts.
 _Avoid_: meta strip, summary bar, filter bar
 
 **Structured state**:

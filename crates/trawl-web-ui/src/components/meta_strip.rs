@@ -113,18 +113,12 @@ pub fn MetaStrip(
                     <span class="chip bad">"filters unreadable"</span>
                 </Show>
             </div>
-            <Show when=move || !blocked.get()>
+            <Show when=move || !blocked.get() && live.get()>
                 <span class="mode">
-                    {move || if live.get() {
-                        view! {
-                            <Badge tone=Tone::Info>
-                                <span class="live-dot" aria-hidden="true"></span>
-                                "Live"
-                            </Badge>
-                        }.into_any()
-                    } else {
-                        view! { <Badge tone=Tone::Neutral>"Snapshot"</Badge> }.into_any()
-                    }}
+                    <Badge tone=Tone::Info>
+                        <span class="live-dot" aria-hidden="true"></span>
+                        "Live"
+                    </Badge>
                 </span>
             </Show>
         </div>

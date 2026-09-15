@@ -83,7 +83,7 @@ test('the header states the draft while the strip stays with the executed query'
   // The strip describes the executed query, independent of later edits.
   await expectFacts(page);
   await expect(page.locator(SEL.scopeStrip)).not.toContainText('Executed scope');
-  await expect(page.locator(`${SEL.scopeStrip} .mode`)).toHaveText('Snapshot');
+  await expect(page.locator(`${SEL.scopeStrip} .mode`)).toHaveCount(0);
   await expect(page.locator(SEL.scopeCount)).toHaveText(`${CORPUS.rowCount} rows returned`);
 
   await expect(draft).toHaveCount(0);
