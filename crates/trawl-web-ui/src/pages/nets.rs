@@ -23,7 +23,7 @@ use crate::state::query::{Mode, RangeSpec, navigator, report_refusal};
 use fleet_ui::time::{time_ago, time_until};
 use fleet_ui::{
     ActionItem, ActionsMenu, Badge, ConfirmModal, ConfirmState, LoadState, Loaded, Pager,
-    SearchInput, StatusDot, ToastBus, ToastKind, Tone,
+    SearchInput, ToastBus, ToastKind, Tone,
 };
 
 /// Whether a net survives the list filter: its name or its query text.
@@ -302,12 +302,16 @@ pub fn NetsPage() -> impl IntoView {
                                                 let started_ms = js_sys::Date::parse(&run.started_at) as i64;
                                                 time_until(started_ms + schedule.interval_secs.cast_signed() * 1000, now_ms.get())
                                             });
+                                            let mut status = run.status;
+                                            if let Some(first) = status.get_mut(..1) {
+                                                first.make_ascii_uppercase();
+                                            }
                                             view! {
-                                                <span><StatusDot tone=crate::components::run_status_tone(&run.status)/>
-                                                    <span class="run-status">{run.status}</span> " "
+                                                <div>
+                                                    <span class="run-status" style="margin-inline-start:0">{status}</span> " "
                                                     <span class="mono" style="color:var(--ink-2)">{time_ago(&run.started_at, now_ms.get())}</span>
-                                                    {next_label.map(|label| view! { <span class="next-run" style="margin-left:6px; font-size:10px; color:var(--ink-3)">{label}</span> })}
-                                                </span>
+                                                    {next_label.map(|label| view! { <div class="next-run" style="font-size:10px; color:var(--ink-3)">"Next: "{label}</div> })}
+                                                </div>
                                             }.into_any()
                                         }}</td>
                                         // `row-menu` lifts the trigger above the row

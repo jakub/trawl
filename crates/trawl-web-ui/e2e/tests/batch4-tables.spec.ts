@@ -93,9 +93,9 @@ test('Nets renders distinct actual statuses at the same timestamp and keeps nati
   })) } }));
   await page.goto('/jobs/nets');
   const table = page.getByRole('table', { name: 'Saved queries' });
-  for (const status of statuses) await expect(table.locator('.run-status').filter({ hasText: new RegExp(`^${status}$`) })).toBeVisible();
-  await expect(table.locator('.status-dot')).toHaveCount(4);
-  for (const dot of await table.locator('.status-dot').all()) await expect(dot).toHaveAttribute('aria-hidden', 'true');
+  for (const status of statuses) await expect(table.locator('.run-status').filter({ hasText: new RegExp(`^${status}$`, 'i') })).toHaveText(status[0].toUpperCase() + status.slice(1));
+  await expect(table.locator('.status-dot')).toHaveCount(0);
+  await expect(table.locator('.next-run')).toHaveText(statuses.map(() => /^Next: /));
   const sort = table.getByRole('button', { name: /^Sort by Name/ });
   await sort.focus();
   await page.keyboard.press('Enter');
