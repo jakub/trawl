@@ -13,7 +13,7 @@
 // execution facts must still describe the accepted response. Asserting
 // only the header would pass a strip that silently followed the buffer.
 
-import { test, expect, resetScenario, CORPUS } from '../fixtures';
+import { test, expect, resetScenario, CORPUS, capturedQueryCount, lastCapturedQuery } from '../fixtures';
 import { SEL, COPY } from '../selectors';
 import type { APIRequestContext, Page } from '@playwright/test';
 
@@ -30,7 +30,7 @@ async function editBuffer(page: Page, text: string) {
 }
 
 async function expectFacts(page: Page, duration = '0.125s', started = '2026-09-15 12:34:56 UTC') {
-  await expect(page.locator(SEL.scopeExecution)).toHaveText(`Execution ${duration}`);
+  await expect(page.locator(SEL.scopeExecution)).toHaveText(`Execution in ${duration}`);
   await expect(page.locator(SEL.scopeStarted)).toHaveText(`Started ${started}`);
 }
 
@@ -83,7 +83,7 @@ test('the header states the draft while the strip stays with the executed query'
   // The strip describes the executed query, independent of later edits.
   await expectFacts(page);
   await expect(page.locator(SEL.scopeStrip)).not.toContainText('Executed scope');
-  await expect(page.locator(`${SEL.scopeStrip} .mode`)).toHaveText('Snapshot');
+  await expect(page.locator(`${SEL.scopeStrip} .mode`)).toHaveCount(0);
   await expect(page.locator(SEL.scopeCount)).toHaveText(`${CORPUS.rowCount} rows returned`);
 
   await expect(draft).toHaveCount(0);
@@ -98,6 +98,29 @@ test('the header states the draft while the strip stays with the executed query'
   await expect(page).toHaveURL(/q=last%3D7d/);
   await expect(draft).toHaveCount(0);
   await expectFacts(page, '0.250s', '2026-09-15 12:35:00 UTC');
+});
+
+test('an unrun search gives both tabs the same guidance and runs the example in Events', async ({ page, request }) => {
+  await page.goto('/search?r=15m');
+  const guidance = page.locator('.search-quick-start');
+  await expect(guidance.getByRole('heading', { name: 'Quick start', exact: true })).toBeVisible();
+  await expect(guidance.locator('.qs-example')).toHaveCount(4);
+  expect(await capturedQueryCount(request)).toBe(0);
+  await page.getByRole('tab', { name: 'Visualization', exact: true }).click();
+  await expect(guidance).toBeVisible();
+  await expect(guidance.locator('.qs-example')).toHaveCount(4);
+  await expect(page.getByText('No events on this page.', { exact: true })).toHaveCount(0);
+  await expect(page.locator('.uplot')).toHaveCount(0);
+  expect(await capturedQueryCount(request)).toBe(0);
+  await page.getByRole('tab', { name: /^Events/ }).click();
+  await expect(guidance).toBeVisible();
+  await page.getByRole('tab', { name: 'Visualization', exact: true }).click();
+  await expect(guidance).toBeVisible();
+  expect(await capturedQueryCount(request)).toBe(0);
+  await guidance.getByRole('button', { name: 'Run Explore events', exact: true }).click();
+  expect((await lastCapturedQuery(request, 1)).query).toBe('last=15m * | head 20');
+  await expect(page.getByRole('tab', { name: /^Events/ })).toHaveAttribute('aria-selected', 'true');
+  await expect(guidance).toHaveCount(0);
 });
 
 test('the strip carries the link\'s filter chips', async ({ page, request }) => {
@@ -174,7 +197,7 @@ test('never-run has no execution, while zero rows and zero duration are valid', 
     await route.fulfill({ json: queryResponse('2026-09-15T12:34:56Z', 0, []) });
   });
   await page.goto('/search');
-  await expect(page.locator(SEL.scopeCount)).toHaveText('—');
+  await expect(page.locator(SEL.scopeCount)).toHaveText('');
   await noTiming(page);
   expect(requests).toBe(0);
   await editBuffer(page, 'service=empty');
@@ -191,7 +214,7 @@ test('aggregate groups count as returned rows and malformed timestamps have no U
   } }));
   await page.goto(`/search?q=${encodeURIComponent('* | stats count() by host')}`);
   await expect(page.locator(SEL.scopeCount)).toHaveText('2 rows returned');
-  await expect(page.locator(SEL.scopeExecution)).toHaveText('Execution 9ms');
+  await expect(page.locator(SEL.scopeExecution)).toHaveText('Execution in 9ms');
   await expect(page.locator(SEL.scopeStarted)).toHaveCount(0);
   await expect(page.locator(SEL.scopeStrip)).not.toContainText('not-a-timestamp');
 });
@@ -224,7 +247,7 @@ test('same-query retry, failed response and malformed link hide accepted executi
   release();
   await expect(page.locator(SEL.resultsPane)).toContainText("Couldn't load results: server returned 500");
   await expect(page.locator(SEL.resultsPane).getByRole('button', { name: 'Retry', exact: true })).toBeVisible();
-  await expect(page.locator(SEL.scopeCount)).toHaveText('—');
+  await expect(page.locator(SEL.scopeCount)).toHaveText('');
   await noTiming(page);
   await page.unroute('**/api/v1/query');
   await page.locator(SEL.runButton).click();
@@ -275,7 +298,7 @@ test('an empty query invalidates pending ownership before the same query runs ag
   await page.goto('/search?q=service%3Dnginx');
   await expect.poll(() => held.length).toBe(1);
   await navigateSearch(page, '');
-  await expect(page.locator(SEL.scopeCount)).toHaveText('—');
+  await expect(page.locator(SEL.scopeCount)).toHaveText('');
   await noTiming(page);
   await navigateSearch(page, '?q=service%3Dnginx');
   await expect(page.locator(SEL.scopeCount)).toHaveText('…');

@@ -211,11 +211,11 @@ test('health 503 renders the named failed subsystem', async ({ page, request }) 
   await healthResponse;
   const health = page.locator(SEL.healthSection);
   for (const [name, value] of [
-    ['Overall state', 'unavailable'],
+    ['Overall state', 'Unavailable'],
     ['duckdb', 'error'],
-    ['auth_db', 'ok'],
-    ['storage_db', 'ok'],
-    ['data_path', 'ok'],
+    ['auth_db', 'Healthy'],
+    ['storage_db', 'Healthy'],
+    ['data_path', 'Healthy'],
   ]) {
     // The key now sits in a span inside the dt, so the row is the
     // nearest ancestor div rather than the matched node's parent.
@@ -326,6 +326,10 @@ for (const [identity, ids] of [['health-viewer', []], ['health-cancel', [101]], 
     await rows(page);
     for (const id of [101, 102, 201, 202]) {
       const row = page.locator(`${SEL.healthRow}[data-query-id="${id}"]`);
+      const [label, tone] = id < 200 ? ['Running', 'info']
+        : id === 201 ? ['Succeeded', 'success'] : ['Timed out', 'danger'];
+      await expect(row.locator('.bdg')).toHaveText(label);
+      await expect(row.locator('.bdg')).toHaveClass(`bdg ${tone}`);
       await expect(row.getByRole('button', { name: 'Cancel', exact: true })).toHaveCount((ids as readonly number[]).includes(id) ? 1 : 0);
     }
   });

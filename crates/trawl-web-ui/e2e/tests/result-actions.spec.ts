@@ -4,7 +4,7 @@
 
 import fs from 'node:fs';
 import { test, expect, resetScenario } from '../fixtures';
-import { SEL } from '../selectors';
+import { SEL, COPY } from '../selectors';
 
 const aggregate = JSON.parse(fs.readFileSync('harness/wire/result-actions.json', 'utf8'));
 const raw = JSON.parse(fs.readFileSync('harness/wire/query-rows.json', 'utf8'));
@@ -76,6 +76,33 @@ test('result audit: historical context owns absolute range and clears facets and
   expect(url.searchParams.get('mode')).toBeNull();
   expect(queries[1]).toContain('host="web-01"');
   expect(queries[1]).not.toContain('last=');
+});
+
+test('a refused context link preserves the expanded row and sort', async ({ page }) => {
+  const response = structuredClone(raw);
+  for (const row of response.rows) row[1] = 'host-' + 'x'.repeat(33 * 1024);
+  let requests = 0;
+  await page.route(routeQuery, async route => {
+    requests++;
+    await route.fulfill({ json: response });
+  });
+  await page.goto('/search?q=*');
+  await page.getByRole('button', { name: 'Sort by status', exact: true }).click();
+  const statusHeader = page.locator(SEL.resultsSortHeader).nth(2);
+  await expect(statusHeader).toHaveAttribute('aria-sort', 'descending');
+  const expand = page.getByRole('button', { name: /^Show details for result / }).first();
+  await expand.click();
+  const before = page.url();
+  await page.getByRole('button', { name: 'Show context', exact: true }).click();
+  await expect(page.locator(SEL.toastError)).toContainText(COPY.linkTooLongToast);
+  // Wait through the reactive update: refusal must leave the retained
+  // table intact, rather than re-mounting it and losing local state.
+  await page.waitForTimeout(100);
+  expect(page.url()).toBe(before);
+  expect(requests).toBe(1);
+  await expect(statusHeader).toHaveAttribute('aria-sort', 'descending');
+  await expect(page.locator('.results-table button[aria-expanded="true"]')).toHaveCount(1);
+  await expect(page.getByRole('button', { name: 'Show context', exact: true })).toBeVisible();
 });
 
 test('result audit: live aggregate Events replaces exact table while Visualization stays separate', async ({ page, request }) => {

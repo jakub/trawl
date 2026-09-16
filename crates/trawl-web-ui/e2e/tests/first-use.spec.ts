@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-import { test, expect, lastCapturedQuery } from '../fixtures';
+import { test, expect, lastCapturedQuery, capturedQueryCount } from '../fixtures';
 import { SEL } from '../selectors';
 
 test('login explains personal keys and links operators to provisioning', async ({ page }) => {
@@ -17,31 +17,105 @@ test('login explains personal keys and links operators to provisioning', async (
   await expect(page.getByRole('button', { name: 'Sign in', exact: true })).toBeInViewport();
 });
 
-for (const [platform, ua, shortcut] of [
-  ['Linux', 'Mozilla/5.0 (X11; Linux x86_64)', 'Ctrl + Enter'],
-  ['Mac', 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)', '⌘ + Enter'],
-]) {
-  test(`first search on ${platform} offers a bounded executable example and platform shortcut`, async ({ page, request }) => {
-    await page.addInitScript((userAgent) => {
-      Object.defineProperty(navigator, 'userAgent', { get: () => userAgent });
-    }, ua);
-    await page.goto('/search');
-    await expect(page.locator('.results-empty')).toContainText(`Or enter a query and press ${shortcut}.`);
-    await expect(page.locator('.run')).toContainText(shortcut);
-    await expect(page.getByRole('link', { name: 'Query guide', exact: true })).toHaveAttribute('href', 'https://trawl.sh/use/query-tutorial/');
-    await page.getByRole('button', { name: 'Run example', exact: true }).click();
-    expect((await lastCapturedQuery(request, 1)).query).toBe('last=1h | head 20');
-    expect(new URL(page.url()).searchParams.get('r')).toBe('1h');
-    await expect(page.locator(SEL.cmContent)).toHaveText('last=1h | head 20');
-    await expect(page.getByText('No events match this query. Check the time range and filters.')).toBeVisible();
-    await expect(page.getByRole('button', { name: 'Run example', exact: true })).toHaveCount(0);
+const EXAMPLES = [
+  ['Explore events', '* | head 20'],
+  ['Compare services', '* | stats count() by service'],
+  ['Rank services by errors', '_severity>=error | stats count() as errors by service | sort -errors | head 10'],
+  ['Chart web warnings and errors', 'service=web _severity>=warn | timechart span=5m count()'],
+] as const;
+
+for (const [title, query] of EXAMPLES) {
+  test(`quick start runs ${title} within the selected relative range`, async ({ page, request }) => {
+    await page.goto('/search?r=1h&page=2');
+    await expect(page.getByRole('heading', { name: 'Quick start', exact: true })).toBeVisible();
+    expect(await capturedQueryCount(request)).toBe(0);
+    const run = page.getByRole('button', { name: `Run ${title}`, exact: true });
+    await run.focus();
+    await page.keyboard.press('Enter');
+    expect((await lastCapturedQuery(request, 1)).query).toBe(`last=1h ${query}`);
+    const params = new URL(page.url()).searchParams;
+    expect(params.get('r')).toBe('1h');
+    expect(params.get('q')).toBe(query);
+    expect(params.get('page')).toBe('0');
+    await expect(page.locator(SEL.cmContent)).toHaveText(query);
+    const results = page.locator('#search-results:not(.search-quick-start)');
+    await expect(results).toBeVisible();
+    await expect(results).toBeFocused();
+    if (title === 'Explore events') {
+      await expect(page.getByText('No events match this query. Check the time range and filters.')).toBeVisible();
+    }
+    await expect(page.locator('.search-quick-start')).toHaveCount(0);
   });
+}
+
+test('quick start preserves an absolute range and active filter', async ({ page, request }) => {
+  const range = '2026-01-01T00:00:00Z..2026-01-01T00:15:00Z';
+  // Literal versioned include filter, independent of the application's encoder.
+  const filter = 'v1.W3sib3AiOiIrIiwiZmllbGQiOiJob3N0IiwidmFsdWUiOiJ3ZWItMDEifV0';
+  await page.goto(`/search?r=${range}&f=${filter}`);
+  await page.getByRole('button', { name: 'Run Explore events', exact: true }).click();
+  expect((await lastCapturedQuery(request, 1)).query).toBe(
+    'host="web-01" _time>="2026-01-01T00:00:00Z" _time<="2026-01-01T00:15:00Z" * | head 20',
+  );
+  const params = new URL(page.url()).searchParams;
+  expect(params.get('r')).toBe(range);
+  expect(params.get('f')).toBe(filter);
+  await expect(page.locator(`${SEL.scopeStrip} ${SEL.filterChip}`)).toContainText('web-01');
+});
+
+for (const theme of ['light', 'dark'] as const) {
+  for (const width of [390, 720, 1440]) {
+    test(`quick start remains usable at ${width}px in ${theme}`, async ({ page }) => {
+      await page.setViewportSize({ width, height: 900 });
+      await page.addInitScript(theme => {
+        localStorage.setItem('trawl.ui', JSON.stringify({ theme }));
+      }, theme);
+      await page.goto('/search');
+      await expect(page.locator('html')).toHaveAttribute('data-theme', theme);
+      const guide = page.locator('.search-quick-start');
+      await expect(guide).toBeVisible();
+      await expect(guide.locator('.qs-example')).toHaveCount(4);
+      for (const [title, query] of EXAMPLES) {
+        const button = guide.getByRole('button', { name: `Run ${title}`, exact: true });
+        await button.scrollIntoViewIfNeeded();
+        await expect(button).toBeInViewport();
+        await expect(button).toBeEnabled();
+        const row = guide.locator('.qs-example').filter({
+          has: page.getByRole('button', { name: `Run ${title}`, exact: true }),
+        });
+        await expect(row.locator('code')).toHaveText(query);
+        const geometry = await row.evaluate(element => {
+          const code = element.querySelector('code')!.getBoundingClientRect();
+          const button = element.querySelector('button')!.getBoundingClientRect();
+          return {
+            fits: element.scrollWidth <= element.clientWidth + 1,
+            buttonInside: button.left >= 0 && button.right <= window.innerWidth,
+            overlaps: code.left < button.right && code.right > button.left &&
+              code.top < button.bottom && code.bottom > button.top,
+          };
+        });
+        expect(geometry).toEqual({ fits: true, buttonInside: true, overlaps: false });
+      }
+      for (const [name, href] of [
+        ['Full query reference', 'https://trawl.sh/reference/dsl/'],
+        ['Event reference', 'https://trawl.sh/reference/events/'],
+      ]) {
+        const link = guide.getByRole('link', { name: new RegExp(name) });
+        await expect(link).toHaveAttribute('href', href);
+        await link.scrollIntoViewIfNeeded();
+        await expect(link).toBeInViewport();
+      }
+      expect(await guide.evaluate(element => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
+    });
+  }
 }
 
 test('a direct zero-match search gives range and filter guidance', async ({ page }) => {
   await page.goto('/search?q=service%3Dmissing');
   await expect(page.getByText('No events match this query. Check the time range and filters.')).toBeVisible();
-  await expect(page.getByRole('button', { name: 'Run example', exact: true })).toHaveCount(0);
+  await expect(page.locator('.search-quick-start')).toHaveCount(0);
+  await page.getByRole('tab', { name: 'Visualization', exact: true }).click();
+  await expect(page.locator('.search-quick-start')).toHaveCount(0);
 });
 
 test('an empty later page does not claim that the query has no matches', async ({ page }) => {

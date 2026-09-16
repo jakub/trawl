@@ -25,12 +25,12 @@ for (const origin of ['search', 'history'] as const) {
       });
       await page.goto(origin === 'search' ? '/search?q=service%3Dnginx' : '/search/history');
       const open = async () => {
-        if (origin === 'search') await page.locator('.editor-tools').getByRole('button', { name: 'Save as net', exact: true }).click();
-        else await page.getByRole('button', { name: 'Save as net', exact: true }).first().click();
+        if (origin === 'search') await page.locator('.editor-tools').getByRole('button', { name: 'Save as Net', exact: true }).click();
+        else await page.getByRole('button', { name: 'Save as Net', exact: true }).first().click();
       };
       await open();
       await page.getByLabel('Name', { exact: true }).fill('first-request');
-      await page.getByRole('dialog').getByRole('button', { name: 'Save as net', exact: true }).click();
+      await page.getByRole('dialog').getByRole('button', { name: 'Save as Net', exact: true }).click();
       await expect.poll(() => calls).toBe(1);
       await page.keyboard.press('Escape');
       await expect(page.getByRole('dialog')).toHaveCount(0);
@@ -87,9 +87,9 @@ test('Save completion survives navigation away from its page', async ({ page, re
     await route.fulfill({ json: { ...created, name: 'navigation-save' } });
   });
   await page.goto('/search/history');
-  await page.getByRole('button', { name: 'Save as net', exact: true }).first().click();
+  await page.getByRole('button', { name: 'Save as Net', exact: true }).first().click();
   await page.getByLabel('Name', { exact: true }).fill('navigation-save');
-  await page.getByRole('dialog').getByRole('button', { name: 'Save as net', exact: true }).click();
+  await page.getByRole('dialog').getByRole('button', { name: 'Save as Net', exact: true }).click();
   await expect.poll(() => calls).toBe(1);
   await page.keyboard.press('Escape');
   await page.locator('.rail a[href="/search"]').click();

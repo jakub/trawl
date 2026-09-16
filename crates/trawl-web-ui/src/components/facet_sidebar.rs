@@ -50,11 +50,6 @@ pub fn FacetSidebar(
     /// rename can change one field while leaving other facets usable.
     #[prop(into)]
     capabilities: Signal<Capabilities>,
-    /// True while the stream is the active result source. The rail is
-    /// page-local either way, so the header names which page: the
-    /// snapshot on screen, or the live ring the stream is filling.
-    #[prop(into)]
-    live: Signal<bool>,
     /// Called when the user clicks `+` or `⊘` on a facet value.
     on_add: Callback<Filter>,
     /// Called when the user clicks "clear all" in the header.
@@ -109,9 +104,6 @@ pub fn FacetSidebar(
             <div class="phead">
                 <div class="ttl">
                     "Filters"
-                    <span class="ttl-scope">
-                        {move || if live.get() { "in the live ring" } else { "on this page" }}
-                    </span>
                 </div>
                 <Show when=move || !filters.get().is_empty() && !suppressed.get()>
                     <button

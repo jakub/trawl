@@ -123,8 +123,9 @@ test('theme item restores the trigger and flips the theme', async ({ page }) => 
   await page.keyboard.press('Enter');
 
   await expect(page.locator(SEL.userMenu)).toHaveCount(0);
-  // Restore happens BEFORE the callback runs, so the trigger holds
-  // focus no matter what the callback did.
+  // Activation returns focus to the trigger. This says nothing about
+  // whether restore runs before or after the item's callback: the theme
+  // callback never moves focus, so the ordering is unobservable here.
   await expect(page.locator(SEL.topbarUser)).toBeFocused();
   await expect.poll(themeAttr).not.toBe(before);
 });

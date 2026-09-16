@@ -22,12 +22,12 @@ use crate::schedule_edit::cadence_sentence;
 use crate::state::query::{Mode, RangeSpec, navigator, report_refusal};
 use fleet_ui::time::{time_ago, time_until};
 use fleet_ui::{
-    ActionItem, ActionsMenu, Badge, ConfirmModal, ConfirmState, LoadState, Loaded, Pager,
-    SearchInput, StatusDot, ToastBus, ToastKind, Tone,
+    Badge, ConfirmModal, ConfirmState, LoadState, Loaded, Pager, SearchInput, ToastBus, ToastKind,
+    Tone,
 };
 
 /// Whether a net survives the list filter: its name or its query text.
-/// Named once because the sheet header counts exactly what the table
+/// Named once because the sheet footer counts exactly what the table
 /// renders.
 fn matches_filter(net: &SavedQueryResponse, needle: &str) -> bool {
     needle.is_empty()
@@ -200,7 +200,7 @@ pub fn NetsPage() -> impl IntoView {
         });
     };
 
-    // The sheet header counts what the table shows, off the same
+    // The sheet footer counts what the table shows, off the same
     // predicate the rows are filtered by.
     let visible_nets = Signal::derive(move || {
         let Some(Ok(resp)) = nets.get() else {
@@ -230,7 +230,7 @@ pub fn NetsPage() -> impl IntoView {
             <section class="list-sheet" aria-labelledby="nets-sheet-title">
                 <div class="list-sheet-hd">
                     <h2 id="nets-sheet-title" class="list-sheet-ttl">
-                        "Your nets"<span class="cnt">{move || format!(" {}", visible_nets.get().len())}</span>
+                        "Your nets"
                     </h2>
                     <SearchInput value=filter placeholder="Filter nets…"/>
                 </div>
@@ -246,30 +246,16 @@ pub fn NetsPage() -> impl IntoView {
                             {table_sort_th(sort, NetSort::Name, NetSort::Name.default_desc(), "Name", "")}
                             <th scope="col" class="th">"Schedule"</th>
                             {table_sort_th(sort, NetSort::LastRun, NetSort::LastRun.default_desc(), "Last run", "width:180px")}
-                            <th scope="col" style="width:60px"><span class="sr-only">Actions</span></th>
+                            <th scope="col" style="width:120px">"Actions"</th>
                         </tr></thead>
                         <tbody>
                             <For each=move || visible_nets.get() key=|net| net.id children=move |initial| {
                                 let id = initial.id;
                                 let net = Signal::derive(move || nets.get().and_then(Result::ok)
                                     .and_then(|r| r.queries.into_iter().find(|q| q.id == id)).unwrap_or_else(|| initial.clone()));
-                                // The row owner and its ActionsMenu survive data and clock ticks.
+                                // The row owner and its controls survive data and clock ticks.
                                 // Read current values when invoking an action, not the mount-time net.
                                 let run = on_run_in_search.clone();
-                                let search = ActionItem::new("▶ Open in search", Callback::new(move |()| run(net.get_untracked().query)));
-                                let delete = ActionItem::danger("Delete", Callback::new(move |()| {
-                                    confirm_delete.update(|c| c.request((id, net.get_untracked().name)));
-                                }));
-                                let manual = ActionItem::new("⏱ Trigger run", Callback::new(move |()| {
-                                    let current = net.get_untracked();
-                                    // A window owns its coverage; never trigger it out of band,
-                                    // including when the schedule changed while the menu was open.
-                                    if current.schedule.and_then(|s| s.window).is_none() {
-                                        on_trigger_run(id, current.name);
-                                    }
-                                }));
-                                let regular = StoredValue::new(vec![search.clone(), manual, delete.clone()]);
-                                let windowed = StoredValue::new(vec![search, delete]);
                                 // The drawer is a place with a URL, so the row's one
                                 // control is a link built by the same producer
                                 // `push_net` uses; `prop:replace` is that call's
@@ -302,22 +288,39 @@ pub fn NetsPage() -> impl IntoView {
                                                 let started_ms = js_sys::Date::parse(&run.started_at) as i64;
                                                 time_until(started_ms + schedule.interval_secs.cast_signed() * 1000, now_ms.get())
                                             });
+                                            let status = crate::tone_vocab::run_status_label(&run.status).to_owned();
                                             view! {
-                                                <span><StatusDot tone=crate::components::run_status_tone(&run.status)/>
-                                                    <span class="run-status">{run.status}</span> " "
+                                                <div>
+                                                    <span class="run-status" style="margin-inline-start:0">{status}</span> " "
                                                     <span class="mono" style="color:var(--ink-2)">{time_ago(&run.started_at, now_ms.get())}</span>
-                                                    {next_label.map(|label| view! { <span class="next-run" style="margin-left:6px; font-size:10px; color:var(--ink-3)">{label}</span> })}
-                                                </span>
+                                                    {next_label.map(|label| view! { <div class="next-run" style="font-size:10px; color:var(--ink-3)">"Next: "{label}</div> })}
+                                                </div>
                                             }.into_any()
                                         }}</td>
-                                        // `row-menu` lifts the trigger above the row
-                                        // control's stretched pseudo-element; the base
-                                        // `.actions-menu` rule belongs to fleet-ui.
-                                        <td class="row-menu">
-                                            <Show when=move || net.get().schedule.and_then(|s| s.window).is_none()
-                                                fallback=move || view! { <ActionsMenu items=windowed.get_value()/> }>
-                                                <ActionsMenu items=regular.get_value()/>
+                                        // Keep direct controls above the stretched row link.
+                                        <td class="row-menu net-actions">
+                                            <button type="button" class="btn-icon" aria-label="Open in search" title="Open in search"
+                                                on:click=move |ev| {
+                                                    ev.stop_propagation();
+                                                    run(net.get_untracked().query);
+                                                }><span aria-hidden="true">"⌕"</span></button>
+                                            <Show when=move || net.get().schedule.and_then(|s| s.window).is_none()>
+                                                <button type="button" class="btn-icon" aria-label="Trigger run" title="Trigger run"
+                                                    on:click=move |ev| {
+                                                        ev.stop_propagation();
+                                                        let current = net.get_untracked();
+                                                        // A window owns its coverage. Recheck saved state
+                                                        // on activation before triggering an out-of-band run.
+                                                        if current.schedule.and_then(|s| s.window).is_none() {
+                                                            on_trigger_run(id, current.name);
+                                                        }
+                                                    }><span aria-hidden="true">"↻"</span></button>
                                             </Show>
+                                            <button type="button" class="btn-icon net-delete" aria-label="Delete Net" title="Delete Net"
+                                                on:click=move |ev| {
+                                                    ev.stop_propagation();
+                                                    confirm_delete.update(|c| c.request((id, net.get_untracked().name)));
+                                                }><span aria-hidden="true">"×"</span></button>
                                         </td>
                                     </tr>
                                 }
@@ -373,7 +376,7 @@ pub fn NetsPage() -> impl IntoView {
                     let msg = format!("Permanently delete '{del_name}' and all its run history?");
                     view! {
                         <ConfirmModal
-                            title="Delete net"
+                            title="Delete Net"
                             message=msg
                             confirm_label="Delete"
                             on_confirm=Callback::new(move |()| {

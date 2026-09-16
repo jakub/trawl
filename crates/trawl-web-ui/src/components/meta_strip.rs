@@ -62,7 +62,7 @@ pub fn MetaStrip(
                             "…".to_string()
                         } else {
                             count.get().map_or_else(
-                                || "—".to_string(),
+                                String::new,
                                 |n| if live.get() {
                                     format!("{n} buffered rows")
                                 } else if n == 1 {
@@ -76,7 +76,7 @@ pub fn MetaStrip(
                     {move || execution.get().map(|facts| {
                         let started = execution_started(&facts.started_at);
                         view! {
-                            <span class="scope-execution">{format!("Execution {}", format_duration(facts.duration_ms))}</span>
+                            <span class="scope-execution">{format!("Execution in {}", format_duration(facts.duration_ms))}</span>
                             {started.map(|value| view! { <span class="scope-started">{format!("Started {value}")}</span> })}
                         }
                     })}
@@ -113,18 +113,12 @@ pub fn MetaStrip(
                     <span class="chip bad">"filters unreadable"</span>
                 </Show>
             </div>
-            <Show when=move || !blocked.get()>
+            <Show when=move || !blocked.get() && live.get()>
                 <span class="mode">
-                    {move || if live.get() {
-                        view! {
-                            <Badge tone=Tone::Info>
-                                <span class="live-dot" aria-hidden="true"></span>
-                                "Live"
-                            </Badge>
-                        }.into_any()
-                    } else {
-                        view! { <Badge tone=Tone::Neutral>"Snapshot"</Badge> }.into_any()
-                    }}
+                    <Badge tone=Tone::Info>
+                        <span class="live-dot" aria-hidden="true"></span>
+                        "Live"
+                    </Badge>
                 </span>
             </Show>
         </div>

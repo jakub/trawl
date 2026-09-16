@@ -53,18 +53,6 @@ fn health_title(report: Option<&Result<HealthResponse, String>>) -> &'static str
     }
 }
 
-/// A query's state as a badge tone. Active work is in progress, not a
-/// judgement, so it takes the informational tone.
-fn query_state_tone(state: &str) -> Tone {
-    match state {
-        "Active" => Tone::Info,
-        "Completed" => Tone::Success,
-        "Failed" => Tone::Danger,
-        "Timed out" => Tone::Warn,
-        _ => Tone::Neutral,
-    }
-}
-
 fn read_error(error: &api::ApiError) -> String {
     match error.http_status() {
         Some(401 | 403) => "You do not have permission to read this report.".into(),
@@ -154,13 +142,13 @@ pub fn HealthPage() -> impl IntoView {
                                         </dt>
                                         <dd class:health-check-error=!ok>
                                             <Badge tone={if ok { Tone::Success } else { Tone::Danger }}>
-                                                {result.clone()}
+                                                {if ok { "Healthy".to_owned() } else { result.clone() }}
                                             </Badge>
                                         </dd>
                                     </div>
                                 }
                             }).collect_view()}</dl>
-                            <dl class="health-facts"><div><dt>"Overall state"</dt><dd>{match report.status { HealthStatus::Ok => "ok", HealthStatus::Degraded => "degraded", HealthStatus::Unavailable => "unavailable" }}</dd></div>
+                            <dl class="health-facts"><div><dt>"Overall state"</dt><dd>{match report.status { HealthStatus::Ok => "Healthy", HealthStatus::Degraded => "Degraded", HealthStatus::Unavailable => "Unavailable" }}</dd></div>
                                 <div><dt>"Version"</dt><dd>{report.version.unwrap_or_else(|| "Not reported".into())}</dd></div>
                             </dl>
                         }.into_any()
@@ -221,18 +209,18 @@ fn query_rows(response: QueriesResponse) -> Vec<QueryRow> {
             own: entry.own,
             user: q.user,
             query: q.query,
-            state: "Active".into(),
+            state: "running".into(),
             elapsed: format!("{} ms", format_exact(q.running_ms)),
         }
     });
     let recent = response.recent.into_iter().map(|entry| {
         let q = entry.snapshot;
         let state = if q.timed_out {
-            "Timed out"
+            "timeout"
         } else if q.error.is_some() {
-            "Failed"
+            "error"
         } else {
-            "Completed"
+            "success"
         };
         QueryRow {
             id: q.id,
@@ -351,9 +339,9 @@ fn HealthQueries() -> impl IntoView {
                         <thead><tr><th scope="col">"Query"</th><th scope="col">"User"</th><th scope="col">"State"</th><th scope="col">"Elapsed"</th><th scope="col">"Action"</th></tr></thead>
                         <tbody>{rows.into_iter().map(|row| {
                             let (id, own) = (row.id, row.own);
-                            let active = row.state == "Active";
+                            let active = row.state == "running";
                             view! { <tr data-query-id=id data-own=own.to_string()>
-                                <td><code>{row.query}</code></td><td>{row.user}</td><td><Badge tone=query_state_tone(&row.state)>{row.state.clone()}</Badge></td><td>{row.elapsed}</td>
+                                <td><code>{row.query}</code></td><td>{row.user}</td><td><Badge tone=crate::tone_vocab::run_badge_tone(&row.state)>{crate::tone_vocab::run_status_label(&row.state).to_owned()}</Badge></td><td>{row.elapsed}</td>
                                 <td><Show when=move || active && me.get().is_some_and(|m| perms::can_cancel_query(&m.permissions, own))>
                                     <button class="btn health-query-cancel" disabled=move || pending.get() on:click=move |_| confirm.update(|s| s.request((id, own, epoch)))>"Cancel"</button>
                                 </Show></td>

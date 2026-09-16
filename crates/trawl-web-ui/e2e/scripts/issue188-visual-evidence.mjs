@@ -91,7 +91,7 @@ async function capture(browser, scene, theme, width) {
     await page.locator(scene.ready).first().waitFor({ state: 'visible' });
     if (scene.name === 'search-filtered') {
       assert.equal(await page.locator('.scope-count').textContent(), '8 rows returned');
-      assert.equal(await page.locator('.scope-execution').textContent(), 'Execution 0.125s');
+      assert.equal(await page.locator('.scope-execution').textContent(), 'Execution in 0.125s');
       assert.equal(await page.locator('.scope-started').textContent(), 'Started 2026-09-15 12:34:56 UTC');
       assert.equal(await page.locator('.scope .chip').count(), 1);
     }

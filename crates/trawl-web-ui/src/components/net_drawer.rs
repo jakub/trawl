@@ -19,7 +19,7 @@ use crate::api;
 use fleet_ui::time::{format_duration, time_ago};
 use fleet_ui::{
     Btn, Drawer, LoadState, Loaded, OffsetPager, PageTotal, PageWindow, Segmented, SegmentedOption,
-    Size, Sparkline, StatusDot, TabItem, ToastBus, ToastKind, Toggle, Variant, effective_active,
+    Size, Sparkline, TabItem, ToastBus, ToastKind, Toggle, Variant, effective_active,
 };
 
 use crate::schedule_edit::{
@@ -978,7 +978,9 @@ fn RunsPane(
                                     {move || (is_expanded() && runs.get().and_then(Result::ok).is_some_and(|(_, r)| !r.runs.iter().any(|r| r.id == run_id)))
                                         .then_some("Expanded run outside this page")}
                                 </td>
-                                <td>{move || view! { <StatusDot tone=super::run_status_tone(&run.get().status)/>{run.get().status} }}</td>
+                                <td>{move || {
+                                    crate::tone_vocab::run_status_label(&run.get().status).to_owned()
+                                }}</td>
                                 <td class="mono">{move || run.get().duration_ms.map_or_else(|| "—".to_string(), format_duration)}</td>
                                 <td class="mono">{move || run.get().row_count.map_or_else(|| "—".to_string(), |n| n.to_string())}</td>
                                 <td class="path">{move || run.get().error_message.unwrap_or_default()}</td>

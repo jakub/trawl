@@ -143,7 +143,7 @@ async function prepareSave(page: Page, request: APIRequestContext, scenario = 's
 
 function saveEntry(page: Page, entry: 'editor' | 'toolbar') {
   return entry === 'editor'
-    ? page.locator(SEL.editorTool).filter({ hasText: /^Save as net$/ })
+    ? page.locator(SEL.editorTool).filter({ hasText: /^Save as Net$/ })
     : page.locator(SEL.saveAction);
 }
 
@@ -158,7 +158,7 @@ async function submitSave(page: Page, status = 200) {
     response.url().endsWith('/api/v1/saved') && response.request().method() === 'POST',
   );
   // Modal-scoped: the editor tool carries the same name now.
-  await page.locator(SEL.modalPanel).getByRole('button', { name: 'Save as net', exact: true }).click();
+  await page.locator(SEL.modalPanel).getByRole('button', { name: 'Save as Net', exact: true }).click();
   const response = await answered;
   expect(response.status()).toBe(status);
   await response.finished();
@@ -171,7 +171,7 @@ for (const entry of ['editor', 'toolbar'] as const) {
     await expectExactPreview(page);
     await expect(page.locator('.save-scope')).toHaveText([
       'Save captures the editor query text shown above. It omits sidebar filters and the time range control.',
-      'To share the full browser search state, cancel and use Share beside the editor. Run any editor changes first.',
+      'To share the full browser search state, cancel and use Copy search URL beside the editor. Run any editor changes first.',
     ]);
     await page.getByLabel('Name', { exact: true }).fill('editor snapshot');
     await submitSave(page);
@@ -237,7 +237,7 @@ test('Save retries an explicit POST failure with the original snapshot', async (
   await submitSave(page, 503);
   await expect(page.locator(SEL.toastError)).toContainText("Couldn't save");
   await expect(page.locator(SEL.modalPanel)).toBeVisible();
-  await expect(page.locator(SEL.modalPanel).getByRole('button', { name: 'Save as net', exact: true })).toBeEnabled();
+  await expect(page.locator(SEL.modalPanel).getByRole('button', { name: 'Save as Net', exact: true })).toBeEnabled();
   await changeReadableUrl(page);
   await expectExactPreview(page);
   await submitSave(page);

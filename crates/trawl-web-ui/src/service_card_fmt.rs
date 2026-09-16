@@ -240,18 +240,6 @@ pub fn type_bucket(data_type: &str) -> (&'static str, &'static str, &'static str
     ("OTHER", "var(--panel-3)", "tp-keyword")
 }
 
-/// Reports the daily count the service freshness dot evaluates.
-#[must_use]
-pub fn freshness_label(svc: &trawl_api::ServiceSchema) -> String {
-    svc.daily_event_counts.last().map_or_else(
-        || "No daily activity recorded".to_owned(),
-        |day| {
-            let unit = if day.count == 1 { "event" } else { "events" };
-            format!("{} {unit} on {}", day.count, day.date)
-        },
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

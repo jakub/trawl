@@ -938,7 +938,7 @@ fn job_block(job: &RepinJobResponse, on_review: Option<Callback<()>>) -> AnyView
         // `failed`, `blocked`, and any status a later server adds.
         Tone::Danger
     };
-    let status = sanitize_display_text(&job.status);
+    let status = sanitize_display_text(crate::tone_vocab::repin_status_label(&job.status));
     let kind = if job.dry_run { "Dry run" } else { "Repin" };
     let route = format!("{} \u{2192} {}", job.from_type, job.to_type);
     let requested_by = job.requested_by.as_deref().map(sanitize_display_text);
@@ -1014,7 +1014,7 @@ fn verdict_block(v: &DegradedVerdict) -> AnyView {
         <div class="fc-sec">
             <div class="fc-lb">
                 "Health "
-                <Badge tone=Tone::Warn>"degraded"</Badge>
+                <Badge tone=Tone::Warn>"Degraded"</Badge>
             </div>
             <div class="sfd-kv"><span>"Shelving since"</span><span>{since}</span></div>
             <div class="sfd-kv">

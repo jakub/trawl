@@ -258,7 +258,7 @@ test('global Runs orders across page boundaries for every key and direction', as
   await configure(request, { runsTotal: 43 });
   await page.clock.install();
   await page.goto('/jobs/runs');
-  const frame = page.getByRole('region', { name: 'Recent runs', exact: true });
+  const frame = page.getByRole('region', { name: 'Recent runs table', exact: true });
   const footer = frame.locator('.results-footer');
   const rows = frame.locator('.row-stretch');
   const idOf = async (row: import('@playwright/test').Locator) =>

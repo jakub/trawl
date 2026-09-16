@@ -6,7 +6,7 @@ import { test, expect, resetScenario, SCHEDULE } from '../fixtures';
 import { SEL } from '../selectors';
 import { readFile } from 'node:fs/promises';
 
-test('Nets keeps its open menu and focused item through polling and a clock tick', async ({ page, request }) => {
+test('Nets keeps its focused action through polling and a clock tick', async ({ page, request }) => {
   await resetScenario(request, 'corpus');
   await page.clock.install();
   let reads = 0;
@@ -20,8 +20,7 @@ test('Nets keeps its open menu and focused item through polling and a clock tick
     await route.fulfill({ response, json: body });
   });
   await page.goto('/jobs/nets');
-  await page.locator(SEL.actionsMenuTrigger).first().click();
-  const item = page.locator(SEL.actionsMenuItem).first();
+  const item = page.locator(SEL.netAction).first();
   await item.focus();
   const mounted = await item.elementHandle();
   const before = reads;
@@ -190,21 +189,17 @@ for (const surface of ['nets', 'runs', 'drawer']) {
     const table = page.locator(surface === 'drawer' ? '.run-preview-table' : `.${surface}-table`);
     await expect(table.locator('tbody tr')).toHaveCount(2);
     const control = surface === 'nets'
-      ? table.locator(SEL.actionsMenuTrigger).first()
+      ? table.locator(SEL.netAction).first()
       : table.locator('.row-stretch').first();
     await control.focus();
     const mounted = await control.elementHandle();
-    if (surface === 'nets') {
-      await control.click();
-      await page.locator(SEL.actionsMenuItem).first().focus();
-    }
     const focused = await page.evaluateHandle(() => document.activeElement);
     await page.clock.fastForward(5_000);
     if (surface === 'drawer') await expect(table.locator('tbody tr').first()).toContainText('B stationary run');
     else await expect(table.locator('.row-stretch').first()).toHaveText(surface === 'nets' ? 'B stationary net' : 'B stationary run');
     expect(await mounted!.evaluate(el => el.isConnected)).toBe(true);
     expect(await focused.evaluate(el => el === document.activeElement)).toBe(true);
-    if (surface === 'nets') await expect(page.locator(SEL.actionsMenuItem).first()).toBeVisible();
+    if (surface === 'nets') await expect(page.locator(SEL.netAction).first()).toBeVisible();
   });
 }
 
@@ -260,7 +255,7 @@ test('Runs failed page transition exposes Retry over retained success and keeps 
     await route.fulfill({ response });
   });
   await page.goto('/jobs/runs');
-  const frame = page.getByRole('region', { name: 'Recent runs', exact: true });
+  const frame = page.getByRole('region', { name: 'Recent runs table', exact: true });
   const rows = frame.locator('tbody tr');
   const footer = frame.locator('.results-footer');
   await expect(rows).toHaveCount(20);
@@ -305,7 +300,7 @@ test('Runs competing sorts hide old rows and discard the older response before t
     await route.fulfill({ response, json: body });
   });
   await page.goto('/jobs/runs');
-  const frame = page.getByRole('region', { name: 'Recent runs', exact: true });
+  const frame = page.getByRole('region', { name: 'Recent runs table', exact: true });
   const rows = frame.locator('tbody tr');
   const summary = frame.locator('.results-summary');
   await expect(rows.first()).toContainText('started response');
@@ -373,7 +368,7 @@ test('Runs selection owns its name and result through paging and a delayed A-to-
   await detail.locator('.data-area').getByRole('button', { name: 'Next →', exact: true }).click();
   await expect(detail.locator('.results-summary')).toHaveText('21–40 of 45');
   const mountedB = await detail.elementHandle();
-  await page.getByRole('region', { name: 'Recent runs', exact: true }).getByRole('button', { name: 'Next →', exact: true }).click();
+  await page.getByRole('region', { name: 'Recent runs table', exact: true }).getByRole('button', { name: 'Next →', exact: true }).click();
   await expect(page.locator('.runs-table')).toContainText('Other page');
   await expect(detail.locator('.sd-ttl')).toContainText('Selected B');
   await expect(detail.locator('.results-summary')).toHaveText('21–40 of 45');
@@ -389,7 +384,7 @@ test('Runs selection owns its name and result through paging and a delayed A-to-
 test('Runs completed empty response reports zero entries', async ({ page, request }) => {
   await request.post('/__ctl/reset', { data: { scenario: 'pagination', pagination: { runsTotal: 0 } } });
   await page.goto('/jobs/runs');
-  const frame = page.getByRole('region', { name: 'Recent runs', exact: true });
+  const frame = page.getByRole('region', { name: 'Recent runs table', exact: true });
   await expect(frame.locator('.results-summary')).toHaveText('0 entries');
   await expect(frame).toHaveAttribute('aria-busy', 'false');
   await expect(frame.locator('tbody tr')).toHaveCount(0);

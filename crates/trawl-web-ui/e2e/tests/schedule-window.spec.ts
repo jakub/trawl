@@ -165,15 +165,13 @@ test('the manual run is offered only where no window owns the coverage', async (
   await expect(plain).toBeVisible();
   await expect(plain.getByRole('button', { name: COPY.netRunAction })).toHaveCount(1);
 
-  // The nets table's row menu reads the same saved state, so the two
+  // The nets table's direct actions reads the same saved state, so the two
   // cannot disagree about whether a run is on offer.
   await page.goto('/jobs/nets');
   const rows = page.locator(SEL.tableRow);
   await expect(rows).toHaveCount(2);
   for (const [name, offered] of [['errors by host', true], [SCHEDULE.windowedNetName, false]] as const) {
-    await rows.filter({ hasText: name }).locator(SEL.actionsMenuTrigger).click();
-    const items = page.locator(SEL.actionsMenuItem);
-    await expect(items.filter({ hasText: COPY.netTriggerAction })).toHaveCount(offered ? 1 : 0);
-    await page.keyboard.press('Escape');
+    const action = rows.filter({ hasText: name }).getByRole('button', { name: COPY.netTriggerAction });
+    await expect(action).toHaveCount(offered ? 1 : 0);
   }
 });

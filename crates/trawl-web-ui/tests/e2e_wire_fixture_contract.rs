@@ -401,8 +401,8 @@ fn the_corpus_run_fixtures_decode() {
     let runs: ListReportRunsResponse = decode("net-runs.json", NET_RUNS);
     assert_eq!(runs.runs.len(), 2);
     assert_eq!(runs.total, 2);
-    // One of each outcome: the run rows render a status tone and an
-    // error cell, and a page of successes would leave both untested.
+    // One of each outcome: the run rows render a status label and an
+    // error cell, and a page of successes would leave failures untested.
     assert_eq!(runs.runs[0].status, "success");
     assert_eq!(runs.runs[1].status, "error");
     assert!(runs.runs[1].error_message.is_some());

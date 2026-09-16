@@ -29,8 +29,7 @@ use crate::components::sort_th::table_sort_th;
 use crate::state::query::{Mode, RangeSpec, navigator, report_refusal};
 use fleet_ui::time::{format_duration, time_ago};
 use fleet_ui::{
-    Badge, Drawer, LoadState, Loaded, PageTotal, PageWindow, Pager, SearchInput, StatusTone,
-    ToastBus, Tone,
+    Badge, Drawer, LoadState, Loaded, PageTotal, PageWindow, Pager, SearchInput, ToastBus,
 };
 
 /// A server page under one ordering intent. The revision prevents returning
@@ -58,16 +57,6 @@ struct RunsAttempt {
 /// rather than half a run.
 fn parse_run_selection(net: Option<&str>, run: Option<&str>) -> Option<(i64, i64)> {
     Some((net?.parse().ok()?, run?.parse().ok()?))
-}
-
-/// The receipt's outcome badge uses the shared run-status vocabulary.
-fn run_badge_tone(status: &str) -> Tone {
-    match crate::components::run_status_tone(status) {
-        StatusTone::Success => Tone::Success,
-        StatusTone::Error => Tone::Danger,
-        StatusTone::Running => Tone::Info,
-        StatusTone::Neutral => Tone::Neutral,
-    }
 }
 
 #[component]
@@ -223,22 +212,6 @@ pub fn RunsPage() -> impl IntoView {
         );
     });
 
-    // The sheet header counts what the table shows, off the same
-    // predicate the rows are filtered by. It also keeps the sheet's
-    // name distinct from the scroll region's, which is "Recent runs"
-    // on its own.
-    let visible_count = Signal::derive(move || {
-        let needle = filter.get().to_lowercase();
-        match current_runs.get() {
-            Some((_, resp)) => resp
-                .runs
-                .iter()
-                .filter(|r| needle.is_empty() || r.net_name.to_lowercase().contains(&needle))
-                .count(),
-            _ => 0,
-        }
-    });
-
     #[allow(clippy::cast_possible_truncation)]
     let now_ms = fleet_ui::time::clock::now_ms();
 
@@ -343,12 +316,12 @@ pub fn RunsPage() -> impl IntoView {
             <section class="list-sheet" aria-labelledby="runs-sheet-title">
                 <div class="list-sheet-hd">
                     <h2 id="runs-sheet-title" class="list-sheet-ttl">
-                        "Recent runs"<span class="cnt">{move || format!(" {}", visible_count.get())}</span>
+                        "Recent runs"
                     </h2>
                     <SearchInput value=filter placeholder="Filter by net…"/>
                 </div>
             <fleet_ui::OverflowHint viewport=table_viewport/>
-                <div node_ref=table_viewport class="tbl fleet-table-frame tbl-scroll" aria-busy=move || list_busy.get().to_string() role="region" aria-label="Recent runs" tabindex="0" style="--list-min-width:560px">
+                <div node_ref=table_viewport class="tbl fleet-table-frame tbl-scroll" aria-busy=move || list_busy.get().to_string() role="region" aria-label="Recent runs table" tabindex="0" style="--list-min-width:560px">
                 <div class="tbl-body">
                     <Loaded
                         state=list_state
@@ -375,17 +348,13 @@ pub fn RunsPage() -> impl IntoView {
                             let href = format!("/jobs/runs?run={run_id}&net={net_id}");
                             view! {
                                 <tr class="tbl-row" class:active=move || run_selected.get() == Some((net_id, run_id))>
-                                    <td class="mono"><a class="row-stretch" href=href prop:replace=true>{move || run.get().net_name}</a></td>
+                                    <td><a class="row-stretch" href=href prop:replace=true>{move || run.get().net_name}</a></td>
                                     <td><span style="font-size:11px">{move || {
-                                        let mut label = run.get().run.status;
-                                        if let Some(first) = label.get_mut(..1) {
-                                            first.make_ascii_uppercase();
-                                        }
-                                        label
+                                        crate::tone_vocab::run_status_label(&run.get().run.status).to_owned()
                                     }}</span></td>
-                                    <td class="mono">{move || time_ago(&run.get().run.started_at, now_ms.get())}</td>
-                                    <td class="mono">{move || run.get().run.duration_ms.map_or_else(|| "—".to_string(), format_duration)}</td>
-                                    <td style="text-align:right" class="mono">{move || run.get().run.row_count.map_or_else(|| "—".to_string(), |n| n.to_string())}</td>
+                                    <td>{move || time_ago(&run.get().run.started_at, now_ms.get())}</td>
+                                    <td>{move || run.get().run.duration_ms.map_or_else(|| "—".to_string(), format_duration)}</td>
+                                    <td style="text-align:right">{move || run.get().run.row_count.map_or_else(|| "—".to_string(), |n| n.to_string())}</td>
                                 </tr>
                             }
                         }/></tbody>
@@ -479,8 +448,9 @@ fn RunDetail(
             title=Box::new(move || view! {
                 <span class="name">{title}</span>
                 {move || status().map(|s| {
-                    let tone = run_badge_tone(&s);
-                    view! { <Badge tone=tone>{s}</Badge> }
+                    let tone = crate::tone_vocab::run_badge_tone(&s);
+                    let label = crate::tone_vocab::run_status_label(&s).to_owned();
+                    view! { <Badge tone=tone>{label}</Badge> }
                 })}
             }.into_any())
             actions=Box::new(move || view! {

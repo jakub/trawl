@@ -53,6 +53,7 @@ use crate::components::malformed_notice::MalformedNotice;
 use crate::components::meta_strip::MetaStrip;
 use crate::components::results_table::ResultsTable;
 use crate::components::save_as_net_modal::SaveAsNetModal;
+use crate::components::search_quick_start::SearchQuickStart;
 use crate::facets::is_aggregation_shape;
 use crate::pages::layout::ShellStatus;
 use crate::search_status::{CountSource, FooterCount, StatusInputs, StatusKind, search_status};
@@ -837,7 +838,6 @@ pub fn Search() -> impl IntoView {
                 suppressed=unreadable
                 rows_suppressed=facet_rows_suppressed
                 capabilities=facet_capabilities
-                live=live
                 on_add=on_add_filter
                 on_clear=on_clear_filters
             />
@@ -960,7 +960,28 @@ pub fn Search() -> impl IntoView {
                     // The banner above IS the results pane while the
                     // link cannot be read.
                     ().into_any()
-                } else { match (active_tab.get(), mode.get()) {
+                } else if mode.get() == Mode::Snapshot && !snapshot_ran.get() {
+                    // Both tabs start here. Examples use the picker and filters
+                    // just like Haul, and only change the editor after admission.
+                    let goto = goto.clone();
+                    view! { <SearchQuickStart on_run=Callback::new(move |query: &'static str| {
+                        if unreadable.get_untracked() {
+                            return;
+                        }
+                        let outcome = goto(query, 0, Mode::Snapshot, &filters.get_untracked(), &range.get_untracked(), false);
+                        if outcome.is_ok() {
+                            query_text.set(query.to_string());
+                            active_tab.set(ResultsTab::Events);
+                            // The Run button leaves the DOM with the guide.
+                            // Focus the replacement region after navigation renders.
+                            request_animation_frame(move || {
+                                focus_search_control("#search-results");
+                            });
+                        }
+                        report_refusal(bus, outcome);
+                    })/> }.into_any()
+                } else {
+                    match (active_tab.get(), mode.get()) {
                     // An aggregation answers in exact numbers, so the
                     // table drops the expansion column and offers a
                     // search only on the fields the query grouped by
@@ -988,7 +1009,6 @@ pub fn Search() -> impl IntoView {
                         <>
                             <Histogram rows=rows/>
                             <ResultsTable
-                                queried=snapshot_ran
                                 busy=running
                                 page=page
                                 rows=rows

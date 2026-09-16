@@ -175,7 +175,7 @@ test('Runs headers expose one aria-sort and send each natural direction through 
       const before = requests.length;
       await page.keyboard.press(press);
       await expect.poll(() => requests.length).toBe(before + 1);
-      await expect(page.getByRole('region', { name: 'Recent runs', exact: true })).toHaveAttribute('aria-busy', 'false');
+      await expect(page.getByRole('region', { name: 'Recent runs table', exact: true })).toHaveAttribute('aria-busy', 'false');
       expect(requests.at(-1)).toEqual({ sort: key, dir, offset: '0' });
       const expected = Array<string | null>(5).fill(null);
       expected[index] = dir === 'asc' ? 'ascending' : 'descending';

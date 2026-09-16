@@ -161,10 +161,12 @@ A link whose structured state does not parse is shown, not run.**
 
 ## Amendment: execution facts in the query console
 
-Accepted 2026-09-14 during the UI follow-up prep.
+Accepted 2026-09-14 during the UI follow-up prep. The mode badge was
+simplified on 2026-09-15.
 
-The executed-scope strip keeps its hanging well, removable filter chips
-and Live/Snapshot badge. The old scope label and window caption are
+The executed-scope strip keeps its hanging well and removable filter chips.
+A Live badge appears only while streaming; snapshot searches have no mode
+badge. The old scope label and window caption are
 replaced by rows returned, execution duration and a timestamp labelled
 "Started". Snapshot rows mean rows in this response, including aggregate
 groups; they do not claim a corpus total. Live counts name buffered rows.

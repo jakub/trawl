@@ -2,12 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-// The pure run-status tone mapper lives in the ungated
-// [`crate::tone_vocab`] module so native `cargo test` exercises it;
-// re-exported here so call sites keep their existing `components::…` path.
-pub(crate) use crate::tone_vocab::run_status_tone;
-
-// Same arrangement for the pure service formatters: they live ungated at
+// The pure service formatters live ungated at
 // [`crate::service_card_fmt`] so their tests run natively, and are
 // re-exported here so `components::service_card_fmt::…` still resolves.
 pub(crate) use crate::service_card_fmt;
@@ -39,6 +34,7 @@ pub mod net_drawer;
 pub mod repin_modal;
 pub mod results_table;
 pub mod save_as_net_modal;
+pub mod search_quick_start;
 pub mod service_drawer;
 pub mod sort_th;
 pub mod status_bar;

@@ -7,7 +7,7 @@
 //! Built on `fleet_ui::Modal`: the shell owns the scrim, Escape,
 //! Cmd/Ctrl+Enter submit, and the header (Download icon chip + close);
 //! this component owns the format picker, the download flow, and the
-//! footer hint/buttons.
+//! footer buttons.
 
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -20,7 +20,7 @@ use trawl_api::ExportFormat;
 use crate::api;
 use crate::download;
 use crate::search_url::{EMPTY_QUERY_REFUSAL, is_executable};
-use fleet_ui::{Btn, Icon, Kbd, Modal, Segmented, SegmentedOption, ToastBus, ToastKind, Variant};
+use fleet_ui::{Btn, Icon, Modal, Segmented, SegmentedOption, ToastBus, ToastKind, Variant};
 
 #[component]
 #[allow(clippy::needless_pass_by_value)]
@@ -97,13 +97,6 @@ pub fn ExportModal(
             on_cancel=cancel
             on_submit=do_download
             footer=Box::new(move || view! {
-                <div class="hint">
-                    <Kbd>"⌘⏎"</Kbd>
-                    " download"
-                    <span style="opacity:.5">"·"</span>
-                    <Kbd>"Esc"</Kbd>
-                    {move || if downloading.get() { " close" } else { " cancel" }}
-                </div>
                 <Btn variant=Variant::Secondary on_click=cancel>{move || if downloading.get() { "Close" } else { "Cancel" }}</Btn>
                 <Btn variant=Variant::Primary disabled=downloading on_click=do_download>
                     {move || if downloading.get() { "Downloading…" } else { "Download" }}

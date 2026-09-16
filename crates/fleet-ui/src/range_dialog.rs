@@ -353,22 +353,29 @@ mod component {
                     Tab::RealTime => view! {
                         <div class="rt-hint">
                             <p>{live_description.get_value()}</p>
-                            <Btn
-                                variant=Variant::Primary
-                                full=true
-                                disabled=disabled
-                                on_click=Callback::new(move |()| {
-                                    if disabled.get_untracked() {
-                                        return;
-                                    }
-                                    if let Some(on_live) = on_live {
-                                        match on_live.run(()) {
-                                            Ok(()) => close(),
-                                            Err(message) => error.set(Some(message)),
+                        </div>
+                        <div class="foot">
+                            <div class="btns">
+                                <Btn
+                                    variant=Variant::Secondary
+                                    on_click=Callback::new(move |()| close())
+                                >"Cancel"</Btn>
+                                <Btn
+                                    variant=Variant::Primary
+                                    disabled=disabled
+                                    on_click=Callback::new(move |()| {
+                                        if disabled.get_untracked() {
+                                            return;
                                         }
-                                    }
-                                })
-                            >{live_label.get_value()}</Btn>
+                                        if let Some(on_live) = on_live {
+                                            match on_live.run(()) {
+                                                Ok(()) => close(),
+                                                Err(message) => error.set(Some(message)),
+                                            }
+                                        }
+                                    })
+                                >{live_label.get_value()}</Btn>
+                            </div>
                         </div>
                     }.into_any(),
                 }}

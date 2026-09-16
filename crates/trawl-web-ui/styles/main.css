@@ -76,6 +76,56 @@
   font-family: var(--font-ui);
 }
 
+/* The shared pre-query guide stays inside the results scroller. Its
+ * columns respond to the sheet width, including when the rail is open. */
+.search-quick-start { container-type: inline-size; }
+.qs-guide { padding: 16px 20px; font-family: var(--font-ui); }
+.qs-guide h2 { margin: 0 0 6px; font-size: 15px; font-weight: 600; }
+.qs-guide h3 { margin: 0 0 5px; font-size: var(--fs-ui); font-weight: 600; }
+.qs-guide code { font-family: var(--font-mono); font-size: var(--fs-dense); overflow-wrap: anywhere; }
+.qs-example {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 31px;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--line);
+}
+.qs-example code { min-width: 0; color: var(--accent); }
+.qs-example button { flex: none; font-size: var(--fs-dense); padding: 3px 12px; }
+.qs-reference {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 24px;
+  margin-top: 14px;
+}
+.qs-fields { margin: 0; }
+.qs-fields > div {
+  display: grid;
+  grid-template-columns: 87px minmax(0, 1fr);
+  gap: 6px;
+  min-height: 31px;
+  align-items: center;
+  border-bottom: 1px solid var(--line);
+}
+.qs-fields dt, .qs-fields dd { margin: 0; font-size: var(--fs-dense); }
+.qs-fields dd { color: var(--ink-3); }
+.qs-field-note { color: var(--ink-3); font-size: var(--fs-dense); margin: 9px 0 0; }
+.qs-severity { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 9px; }
+.qs-bands { display: flex; flex-wrap: wrap; gap: 4px 22px; font-size: var(--fs-ui); }
+.qs-bands > span > span { color: var(--ink-3); margin-left: 4px; }
+.qs-predicates { display: flex; flex-wrap: wrap; gap: 4px 22px; color: var(--ink-3); font-size: var(--fs-dense); margin-top: 5px; }
+.qs-predicates code { color: var(--ink); }
+.qs-links { display: flex; flex-wrap: wrap; gap: 8px 20px; margin-top: 12px; font-size: var(--fs-dense); }
+.qs-links a { color: var(--accent); text-underline-offset: 3px; }
+@container (max-width: 560px) {
+  .qs-guide { padding: 16px 14px; }
+  .qs-reference { grid-template-columns: minmax(0, 1fr); gap: 16px; }
+  .qs-bands { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px 12px; }
+  .qs-predicates { gap: 5px; }
+}
+
 .results-table-wrap {
   flex: 1;
   min-height: 0;
@@ -172,11 +222,6 @@
   font-size: var(--fs-ui);
   font-weight: 600;
   color: var(--ink-2);
-}
-.facets .phead .ttl .ttl-scope {
-  margin-inline-start: 6px;
-  font-weight: 400;
-  color: var(--ink-3);
 }
 /* A <button> since ADR-0029, so the rule carries its own reset; there
  * is no bare `button` selector in this sheet (ADR-0028). */
@@ -412,7 +457,7 @@
   padding: 6px 12px 10px;
   flex-shrink: 0;
 }
-/* Save as net / Copy search URL / Format, third row of the right-hand
+/* Save as Net / Copy search URL / Format, third row of the right-hand
  * column. The old `.editor-hd` header band is gone; the console header
  * above carries the label now and the tools sit under Haul. */
 .editor-tools {
@@ -581,7 +626,7 @@
 /* Keep accepted execution facts together while allowing narrow strips to wrap. */
 .scope-facts { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; min-width: 0; }
 .scope-facts > span { font-variant-numeric: tabular-nums; }
-.scope-started { font-family: var(--font-mono); overflow-wrap: anywhere; }
+.scope-started { overflow-wrap: anywhere; }
 .scope .meta-chips { display: flex; flex-wrap: wrap; gap: 6px; }
 
 /* Filter chips — one per active Filter. */
@@ -1521,8 +1566,8 @@
 /* Overview tab */
 .sd-overview {
   display: grid;
-  grid-template-columns: 2fr 1fr;
-  grid-template-areas: "chart types" "top top";
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-areas: "chart" "types" "top";
   gap: 12px;
 }
 .sd-card {
@@ -1536,26 +1581,33 @@
   text-transform: uppercase; letter-spacing: .08em; color: var(--ink-3);
   margin-bottom: 10px;
 }
-.sd-card.chart { grid-area: chart; }
+.sd-card.chart { grid-area: chart; min-height: 0; }
 .sd-card.types { grid-area: types; }
 .sd-card.top   { grid-area: top; }
 
 /* Ingest chart — a uPlot column chart. The canvas paints its own axes
- * and grid from tokens read in vendor/src/uplot.ts; what's left here is
- * the surrounding DOM chrome uPlot builds (legend, cursor), which the
- * vendored uPlot.css positions but does not theme. */
+ * and grid from tokens read in vendor/src/uplot.ts. These rules style
+ * its HTML tooltip and theme the cursor positioned by uPlot.css. */
 .ig-chart { width: 100%; }
-.ig-chart .u-legend {
-  margin-top: 2px;
-  font-family: var(--font-mono);
+.ig-chart .ig-tooltip {
+  position: absolute;
+  z-index: 1;
+  pointer-events: none;
+  box-sizing: border-box;
+  width: max-content;
+  max-width: 100%;
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-panel);
+  background: var(--panel);
+  box-shadow: var(--elev-1);
+  font-family: var(--font-ui);
   font-size: var(--fs-tiny);
-  color: var(--ink-3);
+  line-height: 1.4;
+  color: var(--ink-2);
+  font-variant-numeric: tabular-nums;
 }
-/* The series marker doubles as a colour key; uPlot draws it as a bordered
- * box, which reads as an empty checkbox against our fills. */
-.ig-chart .u-legend .u-marker { border-radius: var(--radius-xs); }
-.ig-chart .u-legend .u-label { color: var(--ink-3); }
-.ig-chart .u-legend .u-value { color: var(--ink-2); font-variant-numeric: tabular-nums; }
+.ig-chart .ig-tooltip-time { color: var(--ink-3); }
 /* Hover crosshair — uPlot's default is a hard black hairline. */
 .ig-chart .u-cursor-x,
 .ig-chart .u-cursor-y { border-color: var(--ink-4); }
@@ -2016,13 +2068,18 @@
 .health-facts > div { min-width: 135px; }
 .health-page dt { color: var(--ink-3); font-size: 13px; }
 .health-page dd { margin: 6px 0 0; font-variant-numeric: tabular-nums; }
-.health-checks { margin: 0; }
+.health-checks {
+  margin: 14px 0 0;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
 /* One check per row: friendly name over the raw key, outcome badge on
  * the right. */
 .health-check {
   display: flex; justify-content: space-between; align-items: center; gap: 12px;
   padding: 10px 0; border-bottom: 1px solid var(--line-2);
 }
+.health-check:last-child { border-bottom: 0; }
 .health-check dt { display: flex; flex-direction: column; gap: 2px; }
 .health-check-name { font-weight: 500; color: var(--ink); }
 .health-check-key { font-size: var(--fs-dense); color: var(--ink-3); }
@@ -2063,7 +2120,6 @@
 .page-hd, .page-hd .actions, .health-heading { flex-wrap: wrap; }
 .page-hd > *, .health-heading > * { min-width: 0; max-width: 100%; }
 .page-hd .actions { flex-shrink: 1; }
-.sd-overview { grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); }
 .sd-card { min-width: 0; }
 .sd-ttl .name, .sd-ttl .sub { overflow-wrap: anywhere; }
 /* 899.98px is the codebase's one spelling of "narrow": FacetSidebar
@@ -2095,7 +2151,6 @@
   .dsl-editor { max-height: 34vh; }
   .search-col { margin: 6px; min-height: 560px; }
   .console { margin: 6px; }
-  .sd-overview { grid-template-columns: minmax(0, 1fr); grid-template-areas: "chart" "types" "top"; }
   .stats-row { flex-wrap: wrap; }
   .stat-card { flex-basis: 120px; min-width: 0; }
   .formcols { grid-template-columns: 1fr; }
@@ -2128,7 +2183,6 @@
 .fleet-table th.th, .fleet-table td.svc-cell, .fleet-table td.row-act { display: table-cell; }
 .fleet-table .svc-cell .row-stretch { display: block; }
 .fleet-table .svc-cell .name { white-space: normal; overflow-wrap: anywhere; }
-.fleet-table .freshness { display: inline; font-size: var(--fs-ui); color: var(--ink-3); }
 .fleet-table .run-status { margin-inline-start: 4px; }
 .fleet-table.history-table > tbody > tr > td { vertical-align: top; }
 .fleet-table .row-act { white-space: nowrap; }
@@ -2142,8 +2196,6 @@
 .tl-stream:focus-visible { outline: 2px solid var(--ring); outline-offset: -2px; }
 
 .chart-note { padding: 8px 14px; color: var(--ink-2); }
-
-.sd-ttl .service-freshness { flex-basis: 100%; display: flex; align-items: center; gap: 6px; font-size: var(--fs-ui); color: var(--ink-2); }
 
 /* Trawl-specific credential help below the shared Fleet login form. */
 .trawl-login {
@@ -2168,4 +2220,17 @@
   .results-table tbody tr.selected td, .tbl-row.active > td, .facets .v.selected { outline: 2px solid Highlight; outline-offset: -2px; }
   .cat-track i { background: Highlight; }
   .results-table .detail, .list-sheet-hd, .card-hd { border: 1px solid CanvasText; box-shadow: none; }
+}
+
+/* Nets actions remain visible and retain native table-cell layout. */
+.nets-table .net-actions { white-space: nowrap; }
+.nets-table .net-actions .btn-icon { display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 30px; font-size: 18px; }
+.nets-table .net-actions .btn-icon + .btn-icon { margin-inline-start: 4px; }
+
+/* Trawl overrides shared badge typography, including portalled drawers. */
+body .bdg {
+  font-family: var(--font-ui);
+  font-size: var(--fs-dense);
+  text-transform: none;
+  letter-spacing: normal;
 }

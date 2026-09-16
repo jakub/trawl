@@ -43,7 +43,7 @@ for (const [path, label, columns] of [
     await page.screenshot({ path: testInfo.outputPath('desktop.png') });
     for (const width of [390, 320]) {
       await page.setViewportSize({ width, height: 900 });
-      const region = page.getByRole('region', { name: label === 'Services' ? 'Services table' : label, exact: true });
+      const region = page.getByRole('region', { name: ['Services', 'Recent runs'].includes(label) ? `${label} table` : label, exact: true });
       await expect(region).toHaveAttribute('tabindex', '0');
       await expect(page.getByText('Scroll horizontally for more columns.', { exact: true })).toBeVisible();
       expect(await region.evaluate(el => el.scrollWidth > el.clientWidth)).toBe(true);
@@ -73,7 +73,7 @@ test('long History query keeps metadata and native save action at the start', as
   expect(Math.max(...tops) - Math.min(...tops)).toBeLessThan(5);
   await row.locator('.row-stretch').focus();
   await page.keyboard.press('Tab');
-  const save = row.getByRole('button', { name: 'Save as net' });
+  const save = row.getByRole('button', { name: 'Save as Net' });
   await expect(save).toBeFocused();
   await page.keyboard.press('Enter');
   await expect(page.getByRole('dialog')).toBeVisible();
@@ -93,20 +93,20 @@ test('Nets renders distinct actual statuses at the same timestamp and keeps nati
   })) } }));
   await page.goto('/jobs/nets');
   const table = page.getByRole('table', { name: 'Saved queries' });
-  for (const status of statuses) await expect(table.locator('.run-status').filter({ hasText: new RegExp(`^${status}$`) })).toBeVisible();
-  await expect(table.locator('.status-dot')).toHaveCount(4);
-  for (const dot of await table.locator('.status-dot').all()) await expect(dot).toHaveAttribute('aria-hidden', 'true');
+  await expect(table.locator('.run-status')).toHaveText(['Succeeded', 'Failed', 'Timed out', 'unknown']);
+  await expect(table.locator('.status-dot')).toHaveCount(0);
+  await expect(table.locator('.next-run')).toHaveText(statuses.map(() => /^Next: /));
   const sort = table.getByRole('button', { name: /^Sort by Name/ });
   await sort.focus();
   await page.keyboard.press('Enter');
   await expect(sort.locator('xpath=ancestor::th')).toHaveAttribute('aria-sort', 'descending');
   await expect(table.locator('tbody tr').first().getByRole('link')).toHaveText('net 3');
-  await table.locator('tbody tr').first().getByRole('button', { name: 'Actions', exact: true }).click();
-  await expect(page.getByRole('menu')).toBeVisible();
+  await table.locator('tbody tr').first().getByRole('button', { name: 'Delete Net', exact: true }).click();
+  await expect(page.getByRole('alertdialog')).toBeVisible();
   await expect(page).not.toHaveURL(/net=/);
 });
 
-test('service freshness states expose the actual daily count and date', async ({ page, request }) => {
+test('service rows and drilldown omit redundant freshness and summary text', async ({ page, request }) => {
   await resetScenario(request, 'corpus');
   const original = wire('service-schema-corpus').services[0];
   const day = new Date().toISOString().slice(0, 10);
@@ -117,11 +117,13 @@ test('service freshness states expose the actual daily count and date', async ({
   ];
   await page.route('**/api/v1/schema/services', route => route.fulfill({ json: { ...wire('service-schema-corpus'), services } }));
   await page.goto('/search/schema');
-  await expect(page.locator('.freshness').filter({ hasText: `1 event on ${day}` })).toBeVisible();
-  await expect(page.locator('.freshness').filter({ hasText: '2 events on 2020-01-01' })).toBeVisible();
-  await expect(page.locator('.freshness').filter({ hasText: 'No daily activity recorded' })).toBeVisible();
+  const table = page.getByRole('table', { name: 'Services', exact: true });
+  await expect(table.locator('tbody tr')).toHaveCount(3);
+  await expect(table.locator('.freshness, .status-dot')).toHaveCount(0);
   await page.getByRole('link', { name: 'recent', exact: true }).click();
-  await expect(page.locator('.service-freshness')).toHaveText(`1 event on ${day}`);
+  await expect(page.getByRole('tab', { name: 'Overview', exact: true })).toBeVisible();
+  await expect(page.locator('.service-freshness')).toHaveCount(0);
+  await expect(page.getByText(/events · .* · .* fields/)).toHaveCount(0);
 });
 
 test('Net run preview stays a native button and expands into a spanning table cell', async ({ page, request }) => {

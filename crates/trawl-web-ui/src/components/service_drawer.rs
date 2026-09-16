@@ -107,12 +107,6 @@ pub fn ServiceDrawer(
         (Some(a), Some(b)) => format!("{a} → {b}"),
         _ => String::new(),
     };
-    let meta_text = format!(
-        "{} events · {} · {} fields",
-        super::service_card_fmt::format_count(svc.total_events),
-        super::service_card_fmt::format_bytes(svc.total_bytes),
-        svc.columns.len()
-    );
 
     let on_search_click = Callback::new(move |()| on_search.run(name_for_search.clone()));
     let on_tail_click = Callback::new(move |()| on_tab_change.run("tail".to_string()));
@@ -135,13 +129,11 @@ pub fn ServiceDrawer(
             // Deliberately not the 14px default; the `close_size` prop
             // docs in fleet-ui explain why the sizes are not unified.
             close_size=12
-            meta=meta_text
             title=Box::new(move || view! {
                 <span class="name">{svc_for_head.name.clone()}</span>
                 {(!sub_text.is_empty()).then_some(view! {
                     <span class="sub">{sub_text}</span>
                 })}
-                <HealthDot svc=svc_for_head.clone()/>
             }.into_any())
             actions=Box::new(move || view! {
                 <Btn variant=Variant::Secondary on_click=on_search_click>
@@ -454,7 +446,7 @@ fn FieldsPane(
                                                 on_open_field.run(fname_for_open.clone());
                                             }
                                         >
-                                            <Badge tone=Tone::Warn>"degraded"</Badge>
+                                            <Badge tone=Tone::Warn>"Degraded"</Badge>
                                         </button>
                                     })}
                                 </div>
@@ -848,6 +840,9 @@ fn HistogramChart(resource: LocalResource<Result<QueryResponse, api::ApiError>>)
 #[component]
 fn IngestChart(slots: Vec<Slot>) -> impl IntoView {
     let node_ref = NodeRef::<leptos::html::Div>::new();
+    let total_events: u128 = slots.iter().map(|slot| u128::from(slot.count)).sum();
+    let chart_label =
+        format!("Hourly ingest chart. Total events in the displayed hours: {total_events}.");
     // `ChartHandle` wraps a JS object — not Send/Sync, so it needs the
     // single-threaded storage, same as the search-page chart.
     let handle: StoredValue<Option<ChartHandle>, LocalStorage> = StoredValue::new_local(None);
@@ -895,7 +890,7 @@ fn IngestChart(slots: Vec<Slot>) -> impl IntoView {
         });
     });
 
-    view! { <div class="ig-chart" node_ref=node_ref></div> }
+    view! { <div class="ig-chart" node_ref=node_ref role="img" aria-label=chart_label></div> }
 }
 
 /// uPlot `AlignedData`: `[xs, ys]`, xs in seconds-since-epoch.
@@ -1026,19 +1021,4 @@ fn FieldTypeDonut(segments: Vec<DonutSegment>, total: usize) -> impl IntoView {
             </div>
         </div>
     }.into_any()
-}
-
-// ───────────────────────── Status dot ─────────────────────────
-
-#[component]
-#[allow(clippy::needless_pass_by_value)]
-fn HealthDot(svc: ServiceSchema) -> impl IntoView {
-    let (today, yesterday) = super::service_card_fmt::today_yesterday_utc();
-    let tone = if super::service_card_fmt::is_healthy(&svc, &today, &yesterday) {
-        fleet_ui::StatusTone::Success
-    } else {
-        fleet_ui::StatusTone::Error
-    };
-    view! { <span class="service-freshness"><fleet_ui::StatusDot tone=tone/>
-    " "{super::service_card_fmt::freshness_label(&svc)}</span> }
 }

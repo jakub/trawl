@@ -49,7 +49,6 @@ const KBD_RS: &str = include_str!("../../fleet-ui/src/kbd.rs");
 const TOPBAR_RS: &str = include_str!("../../fleet-ui/src/topbar.rs");
 const MENU_RS: &str = include_str!("../../fleet-ui/src/menu.rs");
 const TABS_RS: &str = include_str!("../../fleet-ui/src/tabs.rs");
-const ACTIONS_MENU_RS: &str = include_str!("../../fleet-ui/src/actions_menu.rs");
 const COPY_BUTTON_RS: &str = include_str!("../../fleet-ui/src/copy_button.rs");
 const SCHEMA_RS: &str = include_str!("../src/pages/schema.rs");
 const NETS_RS: &str = include_str!("../src/pages/nets.rs");
@@ -486,7 +485,7 @@ const CONTRACTS: &[Contract] = &[
         hook: "\"Real-time\"",
     },
     Contract {
-        assignment: "liveTailButton: '.rt-hint button',",
+        assignment: "liveTailButton: '.rt-hint + .foot .btn-pri',",
         source_path: "../fleet-ui/src/range_dialog.rs",
         source: RANGE_DIALOG_RS,
         hook: "class=\"rt-hint\"",
@@ -756,10 +755,10 @@ const CONTRACTS: &[Contract] = &[
         hook: "\"Edited\"",
     },
     Contract {
-        assignment: "saveAsNetTool: 'Save as net',",
+        assignment: "saveAsNetTool: 'Save as Net',",
         source_path: "src/components/editor_wrap.rs",
         source: EDITOR_WRAP_RS,
-        hook: ">\"Save as net\"<",
+        hook: ">\"Save as Net\"<",
     },
     Contract {
         assignment: "copyUrlTool: 'Copy search URL',",
@@ -843,28 +842,10 @@ const CONTRACTS: &[Contract] = &[
         hook: "role=\"menuitem\"",
     },
     Contract {
-        assignment: "actionsMenuTrigger: '.actions-wrap button.btn-icon',",
-        source_path: "../fleet-ui/src/actions_menu.rs",
-        source: ACTIONS_MENU_RS,
-        hook: "class=\"actions-wrap\"",
-    },
-    Contract {
-        assignment: "actionsMenuTrigger: '.actions-wrap button.btn-icon',",
-        source_path: "../fleet-ui/src/actions_menu.rs",
-        source: ACTIONS_MENU_RS,
-        hook: "class=\"btn-icon\"",
-    },
-    Contract {
-        assignment: "actionsMenuItem: '.actions-menu [role=\"menuitem\"]',",
-        source_path: "../fleet-ui/src/actions_menu.rs",
-        source: ACTIONS_MENU_RS,
-        hook: "panel_class=\"actions-menu\"",
-    },
-    Contract {
-        assignment: "actionsMenuItem: '.actions-menu [role=\"menuitem\"]',",
-        source_path: "../fleet-ui/src/menu.rs",
-        source: MENU_RS,
-        hook: "role=\"menuitem\"",
+        assignment: "netAction: '.net-actions button',",
+        source_path: "src/pages/nets.rs",
+        source: NETS_RS,
+        hook: "class=\"row-menu net-actions\"",
     },
     Contract {
         assignment: "workspaceTab: '.tabs [role=\"tab\"]',",
@@ -941,20 +922,6 @@ const CONTRACTS: &[Contract] = &[
         source_path: "../fleet-ui/src/toast/runtime.rs",
         source: TOAST_RUNTIME_RS,
         hook: "aria-label=\"Dismiss notification\"",
-    },
-    // One string, two positions: the trigger's own name and the name of
-    // the panel it opens.
-    Contract {
-        assignment: "actionsName: 'Actions',",
-        source_path: "../fleet-ui/src/actions_menu.rs",
-        source: ACTIONS_MENU_RS,
-        hook: "aria-label=\"Actions\"",
-    },
-    Contract {
-        assignment: "actionsName: 'Actions',",
-        source_path: "../fleet-ui/src/actions_menu.rs",
-        source: ACTIONS_MENU_RS,
-        hook: "menu_label=\"Actions\"",
     },
     Contract {
         assignment: "accountMenuName: 'Account',",
@@ -1869,10 +1836,10 @@ const CONTRACTS: &[Contract] = &[
         hook: "\"⏱ Run\"",
     },
     Contract {
-        assignment: "netTriggerAction: '⏱ Trigger run',",
+        assignment: "netTriggerAction: 'Trigger run',",
         source_path: "src/pages/nets.rs",
         source: NETS_RS,
-        hook: "ActionItem::new(\"⏱ Trigger run\"",
+        hook: "aria-label=\"Trigger run\"",
     },
     Contract {
         assignment: "previewCapLine: 'This run stored {n} rows; {fetched} were fetched. Paging covers the fetched rows.',",

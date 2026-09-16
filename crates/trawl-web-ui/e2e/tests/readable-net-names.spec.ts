@@ -6,9 +6,9 @@ test('readable net names preserve punctuation and show bounded refusals', async 
   await resetScenario(request, 'saved-success');
   await page.goto('/search');
   await page.locator(SEL.saveAction).click();
-  const dialog = page.getByRole('dialog', { name: 'Save query as net', exact: true });
+  const dialog = page.getByRole('dialog', { name: 'Save query as Net', exact: true });
   const input = dialog.getByLabel('Name', { exact: true });
-  const save = dialog.getByRole('button', { name: 'Save as net', exact: true });
+  const save = dialog.getByRole('button', { name: 'Save as Net', exact: true });
   await input.fill('   ');
   await expect(input).toHaveAttribute('aria-invalid', 'true');
   await expect(dialog.locator('#netNameError')).toHaveText('Enter a name.');

@@ -8,7 +8,7 @@
 //! Pulls from `GET /api/v1/history` (paginated) and lets the user:
 //! - filter rows client-side by substring on the query text
 //! - click a row to reload the query into the search editor
-//! - "Save as net" via a modal dialog → `POST /api/v1/saved`
+//! - "Save as Net" via a modal dialog → `POST /api/v1/saved`
 //! - export the filtered loaded page as CSV or JSON
 //! - confirm deletion of every history row owned by the current key
 //!
@@ -250,7 +250,7 @@ pub fn HistoryPage() -> impl IntoView {
                         if filtered.is_empty() {
                             return view! {
                                     <div class="tbl-empty">
-                                    <span class="mono" style="color:var(--ink-3)">
+                                    <span style="color:var(--ink-3)">
                                         {if resp.entries.is_empty() {
                                             "No queries yet — run one in /search to see it here"
                                         } else {
@@ -286,10 +286,10 @@ pub fn HistoryPage() -> impl IntoView {
                                             {h.query.clone()}
                                         </button>
                                         </td>
-                                        <td style="color:var(--ink-3)" class="mono">
+                                        <td style="color:var(--ink-3)">
                                         <When ts=executed_at/>
                                         </td>
-                                        <td style="text-align:right" class="mono">
+                                        <td style="text-align:right">
                                         {events}
                                         </td>
                                         <td style="text-align:right">
@@ -297,7 +297,7 @@ pub fn HistoryPage() -> impl IntoView {
                                             type="button"
                                             class="link"
                                             on:click=move |_| on_save_as_net(q_for_save.clone())
-                                        >"Save as net"</button>
+                                        >"Save as Net"</button>
                                         </td>
                                     </tr>
                             }

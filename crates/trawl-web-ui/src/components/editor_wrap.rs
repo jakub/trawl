@@ -11,7 +11,7 @@
 //! derived, never stored: it compares the editor buffer against the
 //! executed query in the URL and navigates nothing (ADR-0027).
 //!
-//! The stack order is date range, Haul, then the Save as net / Copy
+//! The stack order is date range, Haul, then the Save as Net / Copy
 //! search URL / Format tool row. Haul mirrors ⌘⏎ in the editor — both
 //! call the parent's submit callback.
 
@@ -20,24 +20,7 @@ use leptos::web_sys;
 
 use crate::components::editor::DslEditor;
 use crate::state::query::{QUICK_RANGES, RangeSpec};
-use fleet_ui::{CopyButton, Kbd, RangeDialog, RangePreset, RangeValue, ToastBus, ToastKind};
-
-/// Match the editor's primary modifier on Apple and other platforms.
-pub(crate) fn run_shortcut() -> &'static str {
-    let ua = window()
-        .navigator()
-        .user_agent()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if ["macintosh", "mac os x", "iphone", "ipad", "ipod"]
-        .iter()
-        .any(|name| ua.contains(name))
-    {
-        "⌘ + Enter"
-    } else {
-        "Ctrl + Enter"
-    }
-}
+use fleet_ui::{CopyButton, RangeDialog, RangePreset, RangeValue, ToastBus, ToastKind};
 
 #[component]
 pub fn EditorWrap(
@@ -149,7 +132,6 @@ pub fn EditorWrap(
                         } else {
                             view! {
                                 <span>"Haul"</span>
-                                <Kbd inline=true>{run_shortcut()}</Kbd>
                             }.into_any()
                         }}
                     </button>
@@ -161,7 +143,7 @@ pub fn EditorWrap(
                             class="tool"
                             disabled=move || blocked.get()
                             on:click=move |_| on_save.run(())
-                        >"Save as net"</button>
+                        >"Save as Net"</button>
                         <CopyButton
                             class="tool"
                             text=share_text

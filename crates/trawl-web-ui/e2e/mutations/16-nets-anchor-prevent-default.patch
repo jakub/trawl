@@ -1,42 +1,35 @@
 diff --git a/crates/trawl-web-ui/src/pages/nets.rs b/crates/trawl-web-ui/src/pages/nets.rs
-index 8566e82a..81d9733e 100644
+index 0bedf13f..519dccc2 100644
 --- a/crates/trawl-web-ui/src/pages/nets.rs
 +++ b/crates/trawl-web-ui/src/pages/nets.rs
-@@ -331,6 +331,9 @@ pub fn NetsPage() -> impl IntoView {
-                                     // `prop:replace` below is that call's
-                                     // `replace: true`.
-                                     let href = format!("/jobs/nets?net={id}&ntab=query");
-+                                    // MUTANT: the router intercepting the
-+                                    // press again.
-+                                    let mutant_push = push_net.clone();
- 
-                                     // A windowed schedule advances its own
-                                     // coverage point, so a manual run out
-@@ -364,7 +367,26 @@ pub fn NetsPage() -> impl IntoView {
-                                                 class:active=move || net_selected.get() == Some(id)
-                                             >
-                                                 <td class="mono">
--                                                <a class="row-stretch" href=href prop:replace=true>
-+                                                <a
-+                                                    class="row-stretch"
-+                                                    href=href
-+                                                    prop:replace=true
-+                                                    // MUTANT: the anchor
-+                                                    // cancels its own
-+                                                    // default action and
-+                                                    // navigates by hand,
-+                                                    // whatever modifier
-+                                                    // is held. A
-+                                                    // Ctrl-click opens
-+                                                    // the drawer on this
-+                                                    // page instead of
-+                                                    // going wherever the
-+                                                    // browser decides.
-+                                                    on:click=move |e| {
-+                                                        e.prevent_default();
-+                                                        mutant_push(Some(id), "query");
-+                                                    }
-+                                                >
-                                                     {name.clone()}
-                                                 </a>
-                                                 </td>
+@@ -261,9 +261,29 @@ pub fn NetsPage() -> impl IntoView {
+                                 // `push_net` uses; `prop:replace` is that call's
+                                 // `replace: true`.
+                                 let href = format!("/jobs/nets?net={id}&ntab=query");
++                                // MUTANT: a handle for the same navigation the href
++                                // describes, called by hand from the row's anchor.
++                                let mutant_push = push_net.clone();
+                                 view! {
+                                     <tr class="tbl-row" class:active=move || net_selected.get() == Some(id)>
+-                                        <td class="mono"><a class="row-stretch" href=href prop:replace=true>{move || net.get().name}</a></td>
++                                        <td class="mono">
++                                            <a
++                                                class="row-stretch"
++                                                href=href
++                                                prop:replace=true
++                                                // MUTANT: the anchor cancels its own
++                                                // default action and navigates by hand,
++                                                // whatever modifier is held. A Ctrl-click
++                                                // opens the drawer on this page instead of
++                                                // going wherever the browser decides.
++                                                on:click=move |e| {
++                                                    e.prevent_default();
++                                                    mutant_push(Some(id), "query");
++                                                }
++                                            >
++                                                {move || net.get().name}
++                                            </a>
++                                        </td>
+                                         // The cadence in words, with the enabled/paused
+                                         // judgement beside it as a Badge rather than a
+                                         // glyph the row has to explain.
