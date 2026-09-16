@@ -30,9 +30,43 @@ pub(crate) fn run_status_tone(status: &str) -> fleet_ui::StatusTone {
     }
 }
 
+/// Human-readable execution outcome. Unknown server states stay visible verbatim.
+pub(crate) fn run_status_label(status: &str) -> &str {
+    match status {
+        "running" => "Running",
+        "success" => "Succeeded",
+        "error" => "Failed",
+        "timeout" => "Timed out",
+        _ => status,
+    }
+}
+
+/// Badge counterpart of the shared execution status-dot vocabulary.
+pub(crate) fn run_badge_tone(status: &str) -> fleet_ui::Tone {
+    match run_status_tone(status) {
+        fleet_ui::StatusTone::Success => fleet_ui::Tone::Success,
+        fleet_ui::StatusTone::Error => fleet_ui::Tone::Danger,
+        fleet_ui::StatusTone::Running => fleet_ui::Tone::Info,
+        fleet_ui::StatusTone::Neutral => fleet_ui::Tone::Neutral,
+    }
+}
+
+/// Repin refusal and blocking are distinct from execution failure.
+/// Callers sanitize the returned text before displaying unknown wire values.
+pub(crate) fn repin_status_label(status: &str) -> &str {
+    match status {
+        "running" => "Running",
+        "succeeded" => "Succeeded",
+        "refused_needs_force" => "Refused: force required",
+        "failed" => "Failed",
+        "blocked" => "Blocked",
+        _ => status,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::run_status_tone;
+    use super::{repin_status_label, run_badge_tone, run_status_label, run_status_tone};
 
     #[test]
     fn run_status_tone_maps_every_arm() {
@@ -49,5 +83,34 @@ mod tests {
     fn run_status_tone_unknown_falls_back_to_neutral() {
         assert_eq!(run_status_tone("queued"), fleet_ui::StatusTone::Neutral);
         assert_eq!(run_status_tone(""), fleet_ui::StatusTone::Neutral);
+    }
+
+    #[test]
+    fn execution_labels_and_badge_tones_preserve_outcomes() {
+        for (wire, label, tone) in [
+            ("running", "Running", fleet_ui::Tone::Info),
+            ("success", "Succeeded", fleet_ui::Tone::Success),
+            ("error", "Failed", fleet_ui::Tone::Danger),
+            ("timeout", "Timed out", fleet_ui::Tone::Danger),
+            ("queued", "queued", fleet_ui::Tone::Neutral),
+            ("échec", "échec", fleet_ui::Tone::Neutral),
+        ] {
+            assert_eq!(run_status_label(wire), label);
+            assert_eq!(run_badge_tone(wire), tone);
+        }
+    }
+
+    #[test]
+    fn repin_labels_preserve_refusal_and_unknown_states() {
+        for (wire, label) in [
+            ("running", "Running"),
+            ("succeeded", "Succeeded"),
+            ("refused_needs_force", "Refused: force required"),
+            ("failed", "Failed"),
+            ("blocked", "Blocked"),
+            ("future_status", "future_status"),
+        ] {
+            assert_eq!(repin_status_label(wire), label);
+        }
     }
 }

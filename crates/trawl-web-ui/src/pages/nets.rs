@@ -27,7 +27,7 @@ use fleet_ui::{
 };
 
 /// Whether a net survives the list filter: its name or its query text.
-/// Named once because the sheet header counts exactly what the table
+/// Named once because the sheet footer counts exactly what the table
 /// renders.
 fn matches_filter(net: &SavedQueryResponse, needle: &str) -> bool {
     needle.is_empty()
@@ -200,7 +200,7 @@ pub fn NetsPage() -> impl IntoView {
         });
     };
 
-    // The sheet header counts what the table shows, off the same
+    // The sheet footer counts what the table shows, off the same
     // predicate the rows are filtered by.
     let visible_nets = Signal::derive(move || {
         let Some(Ok(resp)) = nets.get() else {
@@ -288,10 +288,7 @@ pub fn NetsPage() -> impl IntoView {
                                                 let started_ms = js_sys::Date::parse(&run.started_at) as i64;
                                                 time_until(started_ms + schedule.interval_secs.cast_signed() * 1000, now_ms.get())
                                             });
-                                            let mut status = run.status;
-                                            if let Some(first) = status.get_mut(..1) {
-                                                first.make_ascii_uppercase();
-                                            }
+                                            let status = crate::tone_vocab::run_status_label(&run.status).to_owned();
                                             view! {
                                                 <div>
                                                     <span class="run-status" style="margin-inline-start:0">{status}</span> " "

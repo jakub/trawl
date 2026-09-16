@@ -979,11 +979,7 @@ fn RunsPane(
                                         .then_some("Expanded run outside this page")}
                                 </td>
                                 <td>{move || {
-                                    let mut status = run.get().status;
-                                    if let Some(first) = status.get_mut(..1) {
-                                        first.make_ascii_uppercase();
-                                    }
-                                    status
+                                    crate::tone_vocab::run_status_label(&run.get().status).to_owned()
                                 }}</td>
                                 <td class="mono">{move || run.get().duration_ms.map_or_else(|| "—".to_string(), format_duration)}</td>
                                 <td class="mono">{move || run.get().row_count.map_or_else(|| "—".to_string(), |n| n.to_string())}</td>

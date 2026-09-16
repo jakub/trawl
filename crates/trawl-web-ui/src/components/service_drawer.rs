@@ -446,7 +446,7 @@ fn FieldsPane(
                                                 on_open_field.run(fname_for_open.clone());
                                             }
                                         >
-                                            <Badge tone=Tone::Warn>"degraded"</Badge>
+                                            <Badge tone=Tone::Warn>"Degraded"</Badge>
                                         </button>
                                     })}
                                 </div>

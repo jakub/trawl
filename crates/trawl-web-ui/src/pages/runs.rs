@@ -29,8 +29,7 @@ use crate::components::sort_th::table_sort_th;
 use crate::state::query::{Mode, RangeSpec, navigator, report_refusal};
 use fleet_ui::time::{format_duration, time_ago};
 use fleet_ui::{
-    Badge, Drawer, LoadState, Loaded, PageTotal, PageWindow, Pager, SearchInput, StatusTone,
-    ToastBus, Tone,
+    Badge, Drawer, LoadState, Loaded, PageTotal, PageWindow, Pager, SearchInput, ToastBus,
 };
 
 /// A server page under one ordering intent. The revision prevents returning
@@ -58,16 +57,6 @@ struct RunsAttempt {
 /// rather than half a run.
 fn parse_run_selection(net: Option<&str>, run: Option<&str>) -> Option<(i64, i64)> {
     Some((net?.parse().ok()?, run?.parse().ok()?))
-}
-
-/// The receipt's outcome badge uses the shared run-status vocabulary.
-fn run_badge_tone(status: &str) -> Tone {
-    match crate::components::run_status_tone(status) {
-        StatusTone::Success => Tone::Success,
-        StatusTone::Error => Tone::Danger,
-        StatusTone::Running => Tone::Info,
-        StatusTone::Neutral => Tone::Neutral,
-    }
 }
 
 #[component]
@@ -361,11 +350,7 @@ pub fn RunsPage() -> impl IntoView {
                                 <tr class="tbl-row" class:active=move || run_selected.get() == Some((net_id, run_id))>
                                     <td><a class="row-stretch" href=href prop:replace=true>{move || run.get().net_name}</a></td>
                                     <td><span style="font-size:11px">{move || {
-                                        let mut label = run.get().run.status;
-                                        if let Some(first) = label.get_mut(..1) {
-                                            first.make_ascii_uppercase();
-                                        }
-                                        label
+                                        crate::tone_vocab::run_status_label(&run.get().run.status).to_owned()
                                     }}</span></td>
                                     <td>{move || time_ago(&run.get().run.started_at, now_ms.get())}</td>
                                     <td>{move || run.get().run.duration_ms.map_or_else(|| "—".to_string(), format_duration)}</td>
@@ -463,8 +448,9 @@ fn RunDetail(
             title=Box::new(move || view! {
                 <span class="name">{title}</span>
                 {move || status().map(|s| {
-                    let tone = run_badge_tone(&s);
-                    view! { <Badge tone=tone>{s}</Badge> }
+                    let tone = crate::tone_vocab::run_badge_tone(&s);
+                    let label = crate::tone_vocab::run_status_label(&s).to_owned();
+                    view! { <Badge tone=tone>{label}</Badge> }
                 })}
             }.into_any())
             actions=Box::new(move || view! {
