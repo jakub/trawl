@@ -18,8 +18,9 @@
 //
 // WHAT THE TABLIST CONTAINS. The `role="tablist"` node wraps the tab
 // buttons and nothing else. The workspace strip's Save/Export actions
-// and the drawer strip's metadata live in the outer container, so a
-// screen reader counts two tabs and three tabs, not four and five.
+// live in the outer container, so a screen reader counts two tabs there
+// and not four; the drawer strip's title and close button sit outside it
+// the same way, leaving three.
 
 import { test, expect, resetScenario, POPULATED, CORPUS } from '../fixtures';
 import { SEL } from '../selectors';
@@ -126,13 +127,10 @@ test('drawer strip is a named tablist', async ({ page, request }) => {
   await expect(tabs.nth(1)).toHaveAttribute('aria-selected', 'true');
   expect(await tabindexes(tabs)).toEqual(['-1', '0', '-1']);
 
-  // The drawer's own furniture is outside the tablist: its title, its
-  // close button and the strip's trailing metadata.
+  // The drawer's own furniture is outside the tablist: its title and
+  // its close button.
   expect(await insideTablist(page.locator(SEL.drawerTitle))).toBe(false);
   expect(await insideTablist(page.locator(SEL.drawerClose))).toBe(false);
-  const meta = page.locator('.sd-tabs .meta');
-  await expect(meta).toHaveCount(1);
-  expect(await insideTablist(meta)).toBe(false);
 });
 
 test('an unknown drawer tab id still yields one tab stop', async ({ page, request }) => {

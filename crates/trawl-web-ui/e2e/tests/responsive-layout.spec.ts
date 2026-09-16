@@ -165,7 +165,9 @@ test('scroll instructions follow actual overflow as the viewport and results cha
   }
   await page.setViewportSize({ width: 320, height: 900 });
   await page.goto('/search');
-  await expect(page.locator('.results-empty')).toBeVisible();
+  // A search that has not run yet is the Quick start guide, which has no
+  // table and so nothing to scroll sideways.
+  await expect(page.locator('.search-quick-start').getByRole('heading', { name: 'Quick start', exact: true })).toBeVisible();
   await expect(page.locator('.overflow-hint')).toHaveCount(0);
   await page.locator('.dsl-editor').getByRole('textbox').fill('service=nginx');
   await page.locator('.run').click();
