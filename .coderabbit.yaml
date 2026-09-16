@@ -1,0 +1,101 @@
+# yaml-language-server: $schema=https://www.coderabbit.ai/integrations/schema.v2.json
+# Preserve parent settings unless this repository explicitly overrides them.
+inheritance: true
+language: en-US
+tone_instructions: >-
+  Use plain, direct English. State the trigger, failure, and consequence.
+  Keep comments concise. Explain uncertainty and avoid praise or filler.
+
+reviews:
+  # Trial for the next 5-10 PRs. Keep test-oracle defects in scope below.
+  profile: chill
+  review_status: true
+  review_details: true
+  high_level_summary_in_walkthrough: true
+  fail_commit_status: true
+  enable_prompt_for_ai_agents: true
+  assess_linked_issues: true
+  poem: false
+  in_progress_fortune: false
+  auto_review:
+    enabled: true
+    auto_incremental_review: true
+    drafts: false
+    # Prevent automatic pauses from silently missing a final repair commit.
+    # Each review still consumes allowance. Batch related fixes before pushing.
+    auto_pause_after_reviewed_commits: 0
+  pre_merge_checks:
+    docstrings:
+      mode: "off"
+    issue_assessment:
+      mode: warning
+  path_instructions:
+    - path: "{**/*,**/.*,.agents/**,.github/**,.claude/**,.cargo/**,.config/**,.flow/**}"
+      instructions: |
+        Prioritize reachable correctness, security, concurrency, data-loss,
+        and user-visible behavior defects. Test assertions that can falsely
+        pass are actionable even if the patch is small.
+        Read the linked issue and applicable current ADRs before claiming
+        a contract violation. A documented contract is context, not immunity:
+        report a concrete security defect even when the behavior is intentional.
+        Trace callers, callees, preceding guards, and the current PR head.
+        State a concrete triggering input or event sequence and its consequence.
+        Do not request speculative fallback paths, compatibility, extra
+        durability, abstractions, or refactors without a demonstrated need.
+    - path: "crates/{trawl-engine,trawl-server}/**/*.rs"
+      instructions: |
+        Follow cancellation and deadlines across every separately started
+        operation, including staging followed by COPY. Distinguish a response
+        timeout from physical work completion. Check permit, publication-guard,
+        and interrupt-handle ownership through cancellation, panic, and cleanup.
+        Read ADR-0024 for query lifetime rules. Best-effort history must not
+        extend a ready response beyond its request deadline. Do not introduce
+        detached history work or a grace period merely to improve persistence.
+    - path: "crates/{trawl-web-ui,fleet-ui}/**/*.{rs,ts,mjs}"
+      instructions: |
+        Trace actions from input normalization through resource execution,
+        requests, and rendering. A button activation is not proof that a query
+        ran. Distinguish unrun, loading, empty results, failure, and cancellation.
+        For async state, inspect request ownership, stale responses, navigation,
+        mode changes, and component teardown. For shortcuts and overlays, inspect
+        default_prevented, IME composition, event bubbling, editable targets,
+        focus restoration, and computed accessible names.
+    - path: "{crates,xtask,scripts,chart,ci}/**/*.{rs,ts,mjs,py,sh}"
+      instructions: |
+        Apply this instruction to test code and test helpers in these files.
+        For each new assertion, identify a plausible broken implementation
+        that would still pass. Verify fixture bytes, owning source files,
+        instrumentation, and exercised execution lanes. Assert presence before
+        ordering. Negative claims such as no request or no prepare call need
+        a positive control proving the observer can see the allowed operation.
+        Prefer a specific false-pass example over generic coverage requests.
+    - path: "crates/fleet-{auth,admin}/**/*.rs"
+      instructions: |
+        Trace authorization decisions through storage and transaction boundaries.
+        Check inactive-key transitions, ownership, role races, and public error
+        redaction. Distinguish credentials and sensitive strings from explicitly
+        permitted bounded diagnostics. Read the linked issue's allowed fields
+        before proposing further redaction, and identify a concrete exposure.
+
+knowledge_base:
+  learnings:
+    scope: local
+  issues:
+    scope: local
+  pull_requests:
+    scope: local
+  code_guidelines:
+    enabled: true
+    # AGENTS.md and CLAUDE.md are already detected by default.
+    filePatterns:
+      - "**/context.md"
+      # Without applyTo, an ADR under docs/ would only govern that subtree.
+      - files: "docs/adr/0024-bind-time-expansion-budget.md"
+        applyTo: "crates/trawl-core/**,crates/trawl-engine/**,crates/trawl-server/**"
+  linked_repositories:
+    - repository: jakub/coastwatch
+      instructions: >-
+        Coastwatch consumes Trawl's fleet-auth and fleet-ui crates and shared admin tooling.
+        When a shared contract changes, inspect its actual consumers and manifest
+        dependencies. Report a concrete incompatibility and the affected caller.
+        A source inspection does not establish a successful consumer build.
