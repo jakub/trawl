@@ -49,8 +49,7 @@ use crate::components::sort_th::table_sort_th;
 use crate::schema_nav::{BackNav, DEFAULT_SCHEMA_TAB, back_nav_stack, sanitize_tab};
 use crate::state::query::{Mode, RangeSpec, navigator, report_refusal};
 use fleet_ui::{
-    Badge, Icon, IconView, LoadState, Loaded, Pager, SearchInput, Sparkline, StatusDot, StatusTone,
-    ToastBus, Tone,
+    Badge, Icon, IconView, LoadState, Loaded, Pager, SearchInput, Sparkline, ToastBus, Tone,
 };
 
 /// Days of `daily_event_counts` history shown in the activity sparkline.
@@ -386,11 +385,6 @@ pub fn SchemaPage() -> impl IntoView {
                             let rows = visible.into_iter().map(|svc| {
                                 let name = svc.name.clone();
                                 let healthy = is_healthy(&svc, &today, &yesterday);
-                                let dot_tone = if healthy {
-                                    StatusTone::Success
-                                } else {
-                                    StatusTone::Error
-                                };
                                 let spark_color = if healthy {
                                     "var(--accent)"
                                 } else {
@@ -471,7 +465,6 @@ pub fn SchemaPage() -> impl IntoView {
                                             >
                                                 <span class="mono name">{name}</span>
                                             </a>
-                                                <span class="freshness"><StatusDot tone=dot_tone/>" "{crate::service_card_fmt::freshness_label(&svc)}</span>
                                             // Count, not colour alone: the badge
                                             // says how many of this service's
                                             // fields the catalog calls degraded.

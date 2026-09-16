@@ -106,7 +106,7 @@ test('Nets renders distinct actual statuses at the same timestamp and keeps nati
   await expect(page).not.toHaveURL(/net=/);
 });
 
-test('service freshness states expose the actual daily count and date', async ({ page, request }) => {
+test('service rows and drilldown omit redundant freshness and summary text', async ({ page, request }) => {
   await resetScenario(request, 'corpus');
   const original = wire('service-schema-corpus').services[0];
   const day = new Date().toISOString().slice(0, 10);
@@ -117,11 +117,13 @@ test('service freshness states expose the actual daily count and date', async ({
   ];
   await page.route('**/api/v1/schema/services', route => route.fulfill({ json: { ...wire('service-schema-corpus'), services } }));
   await page.goto('/search/schema');
-  await expect(page.locator('.freshness').filter({ hasText: `1 event on ${day}` })).toBeVisible();
-  await expect(page.locator('.freshness').filter({ hasText: '2 events on 2020-01-01' })).toBeVisible();
-  await expect(page.locator('.freshness').filter({ hasText: 'No daily activity recorded' })).toBeVisible();
+  const table = page.getByRole('table', { name: 'Services', exact: true });
+  await expect(table.locator('tbody tr')).toHaveCount(3);
+  await expect(table.locator('.freshness, .status-dot')).toHaveCount(0);
   await page.getByRole('link', { name: 'recent', exact: true }).click();
-  await expect(page.locator('.service-freshness')).toHaveText(`1 event on ${day}`);
+  await expect(page.getByRole('tab', { name: 'Overview', exact: true })).toBeVisible();
+  await expect(page.locator('.service-freshness')).toHaveCount(0);
+  await expect(page.getByText(/events · .* · .* fields/)).toHaveCount(0);
 });
 
 test('Net run preview stays a native button and expands into a spanning table cell', async ({ page, request }) => {

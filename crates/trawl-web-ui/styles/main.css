@@ -2138,7 +2138,6 @@
 .fleet-table th.th, .fleet-table td.svc-cell, .fleet-table td.row-act { display: table-cell; }
 .fleet-table .svc-cell .row-stretch { display: block; }
 .fleet-table .svc-cell .name { white-space: normal; overflow-wrap: anywhere; }
-.fleet-table .freshness { display: inline; font-size: var(--fs-ui); color: var(--ink-3); }
 .fleet-table .run-status { margin-inline-start: 4px; }
 .fleet-table.history-table > tbody > tr > td { vertical-align: top; }
 .fleet-table .row-act { white-space: nowrap; }
@@ -2152,8 +2151,6 @@
 .tl-stream:focus-visible { outline: 2px solid var(--ring); outline-offset: -2px; }
 
 .chart-note { padding: 8px 14px; color: var(--ink-2); }
-
-.sd-ttl .service-freshness { flex-basis: 100%; display: flex; align-items: center; gap: 6px; font-size: var(--fs-ui); color: var(--ink-2); }
 
 /* Trawl-specific credential help below the shared Fleet login form. */
 .trawl-login {
