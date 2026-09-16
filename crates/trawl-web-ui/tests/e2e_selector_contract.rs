@@ -486,7 +486,7 @@ const CONTRACTS: &[Contract] = &[
         hook: "\"Real-time\"",
     },
     Contract {
-        assignment: "liveTailButton: '.rt-hint .btn-pri',",
+        assignment: "liveTailButton: '.rt-hint + .foot .btn-pri',",
         source_path: "../fleet-ui/src/range_dialog.rs",
         source: RANGE_DIALOG_RS,
         hook: "class=\"rt-hint\"",
