@@ -107,8 +107,9 @@ directory. This override leaves per-test timeouts, assertions and
 - The native controls and the shared menu contract (ADR-0028): the
   topbar account menu's keyboard lifecycle (open, arrow walk with wrap,
   Home/End, Escape, Tab, activation, outside mousedown, and Escape being
-  topmost-only with a modal above it), the row `ActionsMenu`'s single tab
-  stop and its restore-before-callback ordering, both tab strips as named
+  topmost-only with a modal above it), its single tab stop and focus
+  restoration on activation, direct Nets actions and delete-dialog focus,
+  both tab strips as named
   tablists with manual activation, and the modal close / toast dismiss /
   bare copy button as keyboard-operable named buttons. These are the
   first specs that assert on `document.activeElement` (through
@@ -205,8 +206,8 @@ the specs navigate by (row count, host values, the over-bound length, the
 degraded field) is pinned in `fixtures.ts`'s `CORPUS`.
 
 `populated` answers `/api/v1/saved` and `/api/v1/schema/services` with a
-corpus that has one net and one service in it, which is what makes a row
-`ActionsMenu` and the service drawer's tab strip reachable. It is an
+corpus that has one Net and one service in it, which makes the direct
+Net actions and the service drawer's tab strip reachable. It is an
 addition rather than a change to `default`: specs written before it read
 the empty state deliberately, and repopulating the default would have
 rewritten their meaning silently. Both bodies live under `harness/wire/`
@@ -271,9 +272,9 @@ one thing the suite is supposed to catch:
 | `06-repin-poll-leak.patch` | `on_cleanup` leaks the field case drawer's repin poll `Interval` | `repin-poll-teardown.spec.ts` |
 | `07-repin-alive-latch.patch` | the drawer's `is_alive` latch always answers true, so a status read landing after teardown acts on a dead surface | `repin-poll-teardown.spec.ts` |
 | `08-menu-walk.patch` | `roving::next_index` answers `current` for every navigation, so arrows, Home and End all stand still | `topbar-menu.spec.ts` |
-| `09-menu-roving-tabindex.patch` | every menu item renders `tabindex="0"`, so the menu has as many tab stops as it has items | `actions-menu.spec.ts` |
+| `09-menu-roving-tabindex.patch` | every menu item renders `tabindex="0"`, so the menu has as many tab stops as it has items | `topbar-menu.spec.ts` |
 | `10-menu-topmost-escape.patch` | the menu's Escape listener drops its `is_topmost` guard and answers Escape from under a modal | `topbar-menu.spec.ts` |
-| `11-menu-restore-before-callback.patch` | activating an item closes the menu and runs the callback without restoring the trigger | `actions-menu.spec.ts` |
+| `11-menu-restore-before-callback.patch` | activating an item closes the menu and runs the callback without restoring the trigger | `topbar-menu.spec.ts` |
 | `12-toast-dismiss-span.patch` | the toast dismiss goes back to a `<span class="x">` with the same click and no name | `native-controls.spec.ts` |
 | `13-sort-th-div.patch` | `sort_th` renders the header cell as a bare `<div on:click>` again, so no header on the div tables is focusable or named | `sort-headers.spec.ts` |
 | `14-results-row-handler.patch` | the pre-ADR-0029 whole-row `on:click` returns to the results `<tr>`, beside the caret button whose click bubbles into it: one press expands and collapses | `row-controls.spec.ts` |
