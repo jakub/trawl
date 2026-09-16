@@ -2182,8 +2182,8 @@
 .nets-table .net-actions .btn-icon { display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 30px; font-size: 18px; }
 .nets-table .net-actions .btn-icon + .btn-icon { margin-inline-start: 4px; }
 
-/* Operational badges use the same compact sans text throughout Trawl. */
-.bdg {
+/* Trawl overrides shared badge typography, including portalled drawers. */
+body .bdg {
   font-family: var(--font-ui);
   font-size: var(--fs-dense);
   text-transform: none;
