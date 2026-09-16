@@ -321,7 +321,7 @@ pub fn RunsPage() -> impl IntoView {
                     <SearchInput value=filter placeholder="Filter by net…"/>
                 </div>
             <fleet_ui::OverflowHint viewport=table_viewport/>
-                <div node_ref=table_viewport class="tbl fleet-table-frame tbl-scroll" aria-busy=move || list_busy.get().to_string() role="region" aria-label="Recent runs" tabindex="0" style="--list-min-width:560px">
+                <div node_ref=table_viewport class="tbl fleet-table-frame tbl-scroll" aria-busy=move || list_busy.get().to_string() role="region" aria-label="Recent runs table" tabindex="0" style="--list-min-width:560px">
                 <div class="tbl-body">
                     <Loaded
                         state=list_state

@@ -43,7 +43,7 @@ for (const [path, label, columns] of [
     await page.screenshot({ path: testInfo.outputPath('desktop.png') });
     for (const width of [390, 320]) {
       await page.setViewportSize({ width, height: 900 });
-      const region = page.getByRole('region', { name: label === 'Services' ? 'Services table' : label, exact: true });
+      const region = page.getByRole('region', { name: ['Services', 'Recent runs'].includes(label) ? `${label} table` : label, exact: true });
       await expect(region).toHaveAttribute('tabindex', '0');
       await expect(page.getByText('Scroll horizontally for more columns.', { exact: true })).toBeVisible();
       expect(await region.evaluate(el => el.scrollWidth > el.clientWidth)).toBe(true);

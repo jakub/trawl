@@ -101,7 +101,7 @@ test('the header states the draft while the strip stays with the executed query'
 });
 
 test('an unrun search gives both tabs the same guidance and runs the example in Events', async ({ page, request }) => {
-  await resetScenario(request, 'corpus');
+  await resetScenario(request, 'default');
   await page.goto('/search');
   const guidance = page.getByText('Search your events', { exact: true });
   await expect(guidance).toBeVisible();

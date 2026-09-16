@@ -27,7 +27,7 @@ for (const [platform, ua, shortcut] of [
     }, ua);
     await page.goto('/search');
     await expect(page.locator('.results-empty')).toContainText(`Or enter a query and press ${shortcut}.`);
-    await expect(page.locator('.run')).toContainText(shortcut);
+    await expect(page.locator('.run')).toHaveText('Haul');
     await expect(page.getByRole('link', { name: 'Query guide', exact: true })).toHaveAttribute('href', 'https://trawl.sh/use/query-tutorial/');
     await page.getByRole('button', { name: 'Run example', exact: true }).click();
     expect((await lastCapturedQuery(request, 1)).query).toBe('last=1h | head 20');
