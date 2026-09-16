@@ -13,7 +13,7 @@
 // execution facts must still describe the accepted response. Asserting
 // only the header would pass a strip that silently followed the buffer.
 
-import { test, expect, resetScenario, CORPUS } from '../fixtures';
+import { test, expect, resetScenario, CORPUS, capturedQueryCount, lastCapturedQuery } from '../fixtures';
 import { SEL, COPY } from '../selectors';
 import type { APIRequestContext, Page } from '@playwright/test';
 
@@ -101,19 +101,26 @@ test('the header states the draft while the strip stays with the executed query'
 });
 
 test('an unrun search gives both tabs the same guidance and runs the example in Events', async ({ page, request }) => {
-  await resetScenario(request, 'default');
-  await page.goto('/search');
-  const guidance = page.getByText('Search your events', { exact: true });
-  await expect(guidance).toBeVisible();
-  const eventsPosition = await guidance.boundingBox();
+  await page.goto('/search?r=15m');
+  const guidance = page.locator('.search-quick-start');
+  await expect(guidance.getByRole('heading', { name: 'Quick start', exact: true })).toBeVisible();
+  await expect(guidance.locator('.qs-example')).toHaveCount(4);
+  expect(await capturedQueryCount(request)).toBe(0);
   await page.getByRole('tab', { name: 'Visualization', exact: true }).click();
   await expect(guidance).toBeVisible();
-  await expect(page.getByText('No events on this page.', { exact: true })).toBeVisible();
-  expect(await guidance.boundingBox()).toEqual(eventsPosition);
+  await expect(guidance.locator('.qs-example')).toHaveCount(4);
+  await expect(page.getByText('No events on this page.', { exact: true })).toHaveCount(0);
   await expect(page.locator('.uplot')).toHaveCount(0);
-  await page.getByRole('button', { name: 'Run example', exact: true }).click();
+  expect(await capturedQueryCount(request)).toBe(0);
+  await page.getByRole('tab', { name: /^Events/ }).click();
+  await expect(guidance).toBeVisible();
+  await page.getByRole('tab', { name: 'Visualization', exact: true }).click();
+  await expect(guidance).toBeVisible();
+  expect(await capturedQueryCount(request)).toBe(0);
+  await guidance.getByRole('button', { name: 'Run Explore events', exact: true }).click();
+  expect((await lastCapturedQuery(request, 1)).query).toBe('last=15m * | head 20');
   await expect(page.getByRole('tab', { name: /^Events/ })).toHaveAttribute('aria-selected', 'true');
-  await expect(page).toHaveURL(/q=last%3D1h/);
+  await expect(guidance).toHaveCount(0);
 });
 
 test('the strip carries the link\'s filter chips', async ({ page, request }) => {

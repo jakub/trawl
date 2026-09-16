@@ -76,6 +76,56 @@
   font-family: var(--font-ui);
 }
 
+/* The shared pre-query guide stays inside the results scroller. Its
+ * columns respond to the sheet width, including when the rail is open. */
+.search-quick-start { container-type: inline-size; }
+.qs-guide { padding: 16px 20px; font-family: var(--font-ui); }
+.qs-guide h2 { margin: 0 0 6px; font-size: 15px; font-weight: 600; }
+.qs-guide h3 { margin: 0 0 5px; font-size: var(--fs-ui); font-weight: 600; }
+.qs-guide code { font-family: var(--font-mono); font-size: var(--fs-dense); overflow-wrap: anywhere; }
+.qs-example {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 31px;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--line);
+}
+.qs-example code { min-width: 0; color: var(--accent); }
+.qs-example button { flex: none; font-size: var(--fs-dense); padding: 3px 12px; }
+.qs-reference {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 24px;
+  margin-top: 14px;
+}
+.qs-fields { margin: 0; }
+.qs-fields > div {
+  display: grid;
+  grid-template-columns: 87px minmax(0, 1fr);
+  gap: 6px;
+  min-height: 31px;
+  align-items: center;
+  border-bottom: 1px solid var(--line);
+}
+.qs-fields dt, .qs-fields dd { margin: 0; font-size: var(--fs-dense); }
+.qs-fields dd { color: var(--ink-3); }
+.qs-field-note { color: var(--ink-3); font-size: var(--fs-dense); margin: 9px 0 0; }
+.qs-severity { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 9px; }
+.qs-bands { display: flex; flex-wrap: wrap; gap: 4px 22px; font-size: var(--fs-ui); }
+.qs-bands > span > span { color: var(--ink-3); margin-left: 4px; }
+.qs-predicates { display: flex; flex-wrap: wrap; gap: 4px 22px; color: var(--ink-3); font-size: var(--fs-dense); margin-top: 5px; }
+.qs-predicates code { color: var(--ink); }
+.qs-links { display: flex; flex-wrap: wrap; gap: 8px 20px; margin-top: 12px; font-size: var(--fs-dense); }
+.qs-links a { color: var(--accent); text-underline-offset: 3px; }
+@container (max-width: 560px) {
+  .qs-guide { padding: 16px 14px; }
+  .qs-reference { grid-template-columns: minmax(0, 1fr); gap: 16px; }
+  .qs-bands { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px 12px; }
+  .qs-predicates { gap: 5px; }
+}
+
 .results-table-wrap {
   flex: 1;
   min-height: 0;

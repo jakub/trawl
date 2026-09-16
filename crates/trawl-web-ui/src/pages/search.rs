@@ -53,6 +53,7 @@ use crate::components::malformed_notice::MalformedNotice;
 use crate::components::meta_strip::MetaStrip;
 use crate::components::results_table::ResultsTable;
 use crate::components::save_as_net_modal::SaveAsNetModal;
+use crate::components::search_quick_start::SearchQuickStart;
 use crate::facets::is_aggregation_shape;
 use crate::pages::layout::ShellStatus;
 use crate::search_status::{CountSource, FooterCount, StatusInputs, StatusKind, search_status};
@@ -960,15 +961,23 @@ pub fn Search() -> impl IntoView {
                     // The banner above IS the results pane while the
                     // link cannot be read.
                     ().into_any()
+                } else if mode.get() == Mode::Snapshot && !snapshot_ran.get() {
+                    // Both tabs start here. Examples use the picker and filters
+                    // just like Haul, and only change the editor after admission.
+                    let goto = goto.clone();
+                    view! { <SearchQuickStart on_run=Callback::new(move |query: &'static str| {
+                        if unreadable.get_untracked() {
+                            return;
+                        }
+                        let outcome = goto(query, 0, Mode::Snapshot, &filters.get_untracked(), &range.get_untracked(), false);
+                        if outcome.is_ok() {
+                            query_text.set(query.to_string());
+                            active_tab.set(ResultsTab::Events);
+                        }
+                        report_refusal(bus, outcome);
+                    })/> }.into_any()
                 } else {
-                    // Before a query runs, both tabs share the same starting
-                    // guidance instead of mounting an empty chart frame.
-                    let content_tab = if mode.get() == Mode::Snapshot && !snapshot_ran.get() {
-                        ResultsTab::Events
-                    } else {
-                        active_tab.get()
-                    };
-                    match (content_tab, mode.get()) {
+                    match (active_tab.get(), mode.get()) {
                     // An aggregation answers in exact numbers, so the
                     // table drops the expansion column and offers a
                     // search only on the fields the query grouped by
@@ -996,21 +1005,12 @@ pub fn Search() -> impl IntoView {
                         <>
                             <Histogram rows=rows/>
                             <ResultsTable
-                                queried=snapshot_ran
                                 busy=running
                                 page=page
                                 rows=rows
                                 on_paginate=on_paginate
                                 on_add_filter=on_result_filter
-                                on_navigate=Callback::new(move |nav| {
-                                    // Only the initial Visualization guidance needs
-                                    // to switch tabs. Re-setting Events would remount
-                                    // its table even when navigation is refused.
-                                    if active_tab.get_untracked() != ResultsTab::Events {
-                                        active_tab.set(ResultsTab::Events);
-                                    }
-                                    on_navigate_q.run(nav);
-                                })
+                                on_navigate=on_navigate_q
                                 details=details
                                 rows_mode=rows_mode
                                 selected=selected

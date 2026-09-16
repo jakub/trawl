@@ -34,6 +34,7 @@ pub mod net_drawer;
 pub mod repin_modal;
 pub mod results_table;
 pub mod save_as_net_modal;
+pub mod search_quick_start;
 pub mod service_drawer;
 pub mod sort_th;
 pub mod status_bar;

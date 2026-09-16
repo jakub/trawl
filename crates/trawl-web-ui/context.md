@@ -86,6 +86,9 @@ _Avoid_: bar chart (unqualified), visualization (that is the other tab)
 The Events tab shows rows on screen. The footer names its source: Last (rows the last snapshot returned), Received (events delivered since the stream opened), Updates (aggregation frames since the stream opened).
 _Avoid_: total, matches, hits
 
+**Quick start**:
+The guidance both results tabs show before a snapshot query runs: four executable examples, sender and reserved field references, and severity bands. Examples use the selected range and filters, then open Events. A submitted query with no matches shows its no-results state instead.
+
 **Navigator**:
 The one closure that turns `(query, page, mode, filters, range)` into a search URL and pushes or replaces it on the router's history.
 _Avoid_: router (that is leptos's), goto
