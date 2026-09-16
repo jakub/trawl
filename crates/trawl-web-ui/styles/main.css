@@ -2023,13 +2023,18 @@
 .health-facts > div { min-width: 135px; }
 .health-page dt { color: var(--ink-3); font-size: 13px; }
 .health-page dd { margin: 6px 0 0; font-variant-numeric: tabular-nums; }
-.health-checks { margin: 0; }
+.health-checks {
+  margin: 14px 0 0;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
 /* One check per row: friendly name over the raw key, outcome badge on
  * the right. */
 .health-check {
   display: flex; justify-content: space-between; align-items: center; gap: 12px;
   padding: 10px 0; border-bottom: 1px solid var(--line-2);
 }
+.health-check:last-child { border-bottom: 0; }
 .health-check dt { display: flex; flex-direction: column; gap: 2px; }
 .health-check-name { font-weight: 500; color: var(--ink); }
 .health-check-key { font-size: var(--fs-dense); color: var(--ink-3); }
