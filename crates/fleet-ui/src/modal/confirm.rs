@@ -29,7 +29,6 @@ pub fn ConfirmModal(
             narrow=true
             on_cancel=on_cancel
             footer=Box::new(move || view! {
-                <div></div>
                 <Btn variant=Variant::Secondary on_click=on_cancel>
                     "Cancel"
                 </Btn>

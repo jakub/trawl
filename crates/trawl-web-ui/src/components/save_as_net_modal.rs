@@ -107,7 +107,6 @@ pub fn SaveAsNetModal(
             on_cancel=cancel
             on_submit=do_save
             footer=Box::new(move || view! {
-                <span aria-hidden="true" style="flex: 1"></span>
                 <Btn variant=Variant::Secondary on_click=cancel>{move || if submitting.get() { "Close" } else { "Cancel" }}</Btn>
                 <Btn variant=Variant::Primary disabled=save_disabled on_click=do_save>
                     {move || if submitting.get() { "Saving…" } else { "Save as Net" }}
@@ -121,7 +120,7 @@ pub fn SaveAsNetModal(
 
             <Show when=move || from_editor>
                 <p class="save-scope">"Save captures the editor query text shown above. It omits sidebar filters and the time range control."</p>
-                <p class="save-scope">"To share the full browser search state, cancel and use Share beside the editor. Run any editor changes first."</p>
+                <p class="save-scope">"To share the full browser search state, cancel and use Copy search URL beside the editor. Run any editor changes first."</p>
             </Show>
             <Field id="netName" label="Name" class="m-field">
                 <input

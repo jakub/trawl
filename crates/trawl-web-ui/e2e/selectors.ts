@@ -103,7 +103,7 @@ export const SEL = {
   realtimeTab: '.dr-pop >> text=Real-time',
   /// crates/fleet-ui/src/range_dialog.rs RangePanel —
   /// the Real-time tab's "Live Tail" button, which calls `on_live`.
-  liveTailButton: '.rt-hint button',
+  liveTailButton: '.rt-hint .btn-pri',
   /// crates/fleet-ui/src/loaded/component.rs Loaded's default Error arm.
   loadHintError: '.results .load-hint.error',
   /// crates/fleet-ui/src/range_dialog.rs RangePanel —

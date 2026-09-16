@@ -377,7 +377,7 @@ pub fn NetsPage() -> impl IntoView {
                     let msg = format!("Permanently delete '{del_name}' and all its run history?");
                     view! {
                         <ConfirmModal
-                            title="Delete net"
+                            title="Delete Net"
                             message=msg
                             confirm_label="Delete"
                             on_confirm=Callback::new(move |()| {

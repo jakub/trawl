@@ -171,7 +171,7 @@ for (const entry of ['editor', 'toolbar'] as const) {
     await expectExactPreview(page);
     await expect(page.locator('.save-scope')).toHaveText([
       'Save captures the editor query text shown above. It omits sidebar filters and the time range control.',
-      'To share the full browser search state, cancel and use Share beside the editor. Run any editor changes first.',
+      'To share the full browser search state, cancel and use Copy search URL beside the editor. Run any editor changes first.',
     ]);
     await page.getByLabel('Name', { exact: true }).fill('editor snapshot');
     await submitSave(page);
