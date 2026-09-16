@@ -100,6 +100,22 @@ test('the header states the draft while the strip stays with the executed query'
   await expectFacts(page, '0.250s', '2026-09-15 12:35:00 UTC');
 });
 
+test('an unrun search gives both tabs the same guidance and runs the example in Events', async ({ page, request }) => {
+  await resetScenario(request, 'corpus');
+  await page.goto('/search');
+  const guidance = page.getByText('Search your events', { exact: true });
+  await expect(guidance).toBeVisible();
+  const eventsPosition = await guidance.boundingBox();
+  await page.getByRole('tab', { name: 'Visualization', exact: true }).click();
+  await expect(guidance).toBeVisible();
+  await expect(page.getByText('No events on this page.', { exact: true })).toBeVisible();
+  expect(await guidance.boundingBox()).toEqual(eventsPosition);
+  await expect(page.locator('.uplot')).toHaveCount(0);
+  await page.getByRole('button', { name: 'Run example', exact: true }).click();
+  await expect(page.getByRole('tab', { name: /^Events/ })).toHaveAttribute('aria-selected', 'true');
+  await expect(page).toHaveURL(/q=last%3D1h/);
+});
+
 test('the strip carries the link\'s filter chips', async ({ page, request }) => {
   await resetScenario(request, 'corpus');
   await page.goto(FILTERED_URL);

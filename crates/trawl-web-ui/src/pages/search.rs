@@ -960,7 +960,15 @@ pub fn Search() -> impl IntoView {
                     // The banner above IS the results pane while the
                     // link cannot be read.
                     ().into_any()
-                } else { match (active_tab.get(), mode.get()) {
+                } else {
+                    // Before a query runs, both tabs share the same starting
+                    // guidance instead of mounting an empty chart frame.
+                    let content_tab = if mode.get() == Mode::Snapshot && !snapshot_ran.get() {
+                        ResultsTab::Events
+                    } else {
+                        active_tab.get()
+                    };
+                    match (content_tab, mode.get()) {
                     // An aggregation answers in exact numbers, so the
                     // table drops the expansion column and offers a
                     // search only on the fields the query grouped by
@@ -994,7 +1002,10 @@ pub fn Search() -> impl IntoView {
                                 rows=rows
                                 on_paginate=on_paginate
                                 on_add_filter=on_result_filter
-                                on_navigate=on_navigate_q
+                                on_navigate=Callback::new(move |nav| {
+                                    active_tab.set(ResultsTab::Events);
+                                    on_navigate_q.run(nav);
+                                })
                                 details=details
                                 rows_mode=rows_mode
                                 selected=selected
