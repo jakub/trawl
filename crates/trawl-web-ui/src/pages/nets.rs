@@ -22,8 +22,8 @@ use crate::schedule_edit::cadence_sentence;
 use crate::state::query::{Mode, RangeSpec, navigator, report_refusal};
 use fleet_ui::time::{time_ago, time_until};
 use fleet_ui::{
-    ActionItem, ActionsMenu, Badge, ConfirmModal, ConfirmState, LoadState, Loaded, Pager,
-    SearchInput, ToastBus, ToastKind, Tone,
+    Badge, ConfirmModal, ConfirmState, LoadState, Loaded, Pager, SearchInput, ToastBus, ToastKind,
+    Tone,
 };
 
 /// Whether a net survives the list filter: its name or its query text.
@@ -246,30 +246,16 @@ pub fn NetsPage() -> impl IntoView {
                             {table_sort_th(sort, NetSort::Name, NetSort::Name.default_desc(), "Name", "")}
                             <th scope="col" class="th">"Schedule"</th>
                             {table_sort_th(sort, NetSort::LastRun, NetSort::LastRun.default_desc(), "Last run", "width:180px")}
-                            <th scope="col" style="width:60px"><span class="sr-only">Actions</span></th>
+                            <th scope="col" style="width:120px">"Actions"</th>
                         </tr></thead>
                         <tbody>
                             <For each=move || visible_nets.get() key=|net| net.id children=move |initial| {
                                 let id = initial.id;
                                 let net = Signal::derive(move || nets.get().and_then(Result::ok)
                                     .and_then(|r| r.queries.into_iter().find(|q| q.id == id)).unwrap_or_else(|| initial.clone()));
-                                // The row owner and its ActionsMenu survive data and clock ticks.
+                                // The row owner and its controls survive data and clock ticks.
                                 // Read current values when invoking an action, not the mount-time net.
                                 let run = on_run_in_search.clone();
-                                let search = ActionItem::new("▶ Open in search", Callback::new(move |()| run(net.get_untracked().query)));
-                                let delete = ActionItem::danger("Delete", Callback::new(move |()| {
-                                    confirm_delete.update(|c| c.request((id, net.get_untracked().name)));
-                                }));
-                                let manual = ActionItem::new("⏱ Trigger run", Callback::new(move |()| {
-                                    let current = net.get_untracked();
-                                    // A window owns its coverage; never trigger it out of band,
-                                    // including when the schedule changed while the menu was open.
-                                    if current.schedule.and_then(|s| s.window).is_none() {
-                                        on_trigger_run(id, current.name);
-                                    }
-                                }));
-                                let regular = StoredValue::new(vec![search.clone(), manual, delete.clone()]);
-                                let windowed = StoredValue::new(vec![search, delete]);
                                 // The drawer is a place with a URL, so the row's one
                                 // control is a link built by the same producer
                                 // `push_net` uses; `prop:replace` is that call's
@@ -314,14 +300,30 @@ pub fn NetsPage() -> impl IntoView {
                                                 </div>
                                             }.into_any()
                                         }}</td>
-                                        // `row-menu` lifts the trigger above the row
-                                        // control's stretched pseudo-element; the base
-                                        // `.actions-menu` rule belongs to fleet-ui.
-                                        <td class="row-menu">
-                                            <Show when=move || net.get().schedule.and_then(|s| s.window).is_none()
-                                                fallback=move || view! { <ActionsMenu items=windowed.get_value()/> }>
-                                                <ActionsMenu items=regular.get_value()/>
+                                        // Keep direct controls above the stretched row link.
+                                        <td class="row-menu net-actions">
+                                            <button type="button" class="btn-icon" aria-label="Open in search" title="Open in search"
+                                                on:click=move |ev| {
+                                                    ev.stop_propagation();
+                                                    run(net.get_untracked().query);
+                                                }><span aria-hidden="true">"⌕"</span></button>
+                                            <Show when=move || net.get().schedule.and_then(|s| s.window).is_none()>
+                                                <button type="button" class="btn-icon" aria-label="Trigger run" title="Trigger run"
+                                                    on:click=move |ev| {
+                                                        ev.stop_propagation();
+                                                        let current = net.get_untracked();
+                                                        // A window owns its coverage. Recheck saved state
+                                                        // on activation before triggering an out-of-band run.
+                                                        if current.schedule.and_then(|s| s.window).is_none() {
+                                                            on_trigger_run(id, current.name);
+                                                        }
+                                                    }><span aria-hidden="true">"↻"</span></button>
                                             </Show>
+                                            <button type="button" class="btn-icon net-delete" aria-label="Delete Net" title="Delete Net"
+                                                on:click=move |ev| {
+                                                    ev.stop_propagation();
+                                                    confirm_delete.update(|c| c.request((id, net.get_untracked().name)));
+                                                }><span aria-hidden="true">"×"</span></button>
                                         </td>
                                     </tr>
                                 }

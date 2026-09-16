@@ -2176,3 +2176,8 @@
   .cat-track i { background: Highlight; }
   .results-table .detail, .list-sheet-hd, .card-hd { border: 1px solid CanvasText; box-shadow: none; }
 }
+
+/* Nets actions remain visible and retain native table-cell layout. */
+.nets-table .net-actions { white-space: nowrap; }
+.nets-table .net-actions .btn-icon { display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 30px; font-size: 18px; }
+.nets-table .net-actions .btn-icon + .btn-icon { margin-inline-start: 4px; }

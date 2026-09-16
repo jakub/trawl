@@ -85,28 +85,28 @@ test('schema row: pointer on the query cell opens the drawer once', async ({ pag
   expect(await rowClicks(page)).toBe(1);
 });
 
-test('nets row: ActionsMenu opens without the drawer', async ({ page, request }) => {
+test('nets row: Delete Net opens confirmation without the drawer', async ({ page, request }) => {
   await resetScenario(request, 'corpus');
   await page.goto('/jobs/nets');
 
-  const trigger = page.locator(SEL.actionsMenuTrigger);
+  const trigger = page.locator(SEL.netAction).filter({ hasText: '×' });
   await expect(trigger).toHaveCount(1);
   await countClicksOn(page, SEL.tableRow);
 
   await trigger.click();
 
-  await expect(page.locator(SEL.actionsMenuItem).first()).toBeVisible();
+  await expect(page.locator(SEL.modalPanel)).toBeVisible();
   // The trigger sits above the stretched anchor, so the press never
   // reached it: no drawer, no `?net=` and no navigation at all.
   await expect(page).toHaveURL(/\/jobs\/nets$/);
   await expect(page.locator(SEL.drawerPanel)).toHaveCount(0);
-  // fleet-ui's trigger stops the press at itself (ADR-0028), so the row
+  // The direct action stops the press at itself, so the row
   // never sees it. That zero only means something beside a press the row
   // DOES see, which is the next three lines.
   expect(await rowClicks(page)).toBe(0);
 
   await page.keyboard.press('Escape');
-  await expect(page.locator(SEL.actionsMenuItem)).toHaveCount(0);
+  await expect(page.locator(SEL.modalPanel)).toHaveCount(0);
   const cell = page.locator(SEL.tableRow).first().locator('.mono').last();
   const point = await cell.evaluate((el) => {
     const box = el.getBoundingClientRect();

@@ -101,8 +101,8 @@ test('Nets renders distinct actual statuses at the same timestamp and keeps nati
   await page.keyboard.press('Enter');
   await expect(sort.locator('xpath=ancestor::th')).toHaveAttribute('aria-sort', 'descending');
   await expect(table.locator('tbody tr').first().getByRole('link')).toHaveText('net 3');
-  await table.locator('tbody tr').first().getByRole('button', { name: 'Actions', exact: true }).click();
-  await expect(page.getByRole('menu')).toBeVisible();
+  await table.locator('tbody tr').first().getByRole('button', { name: 'Delete Net', exact: true }).click();
+  await expect(page.getByRole('alertdialog')).toBeVisible();
   await expect(page).not.toHaveURL(/net=/);
 });
 

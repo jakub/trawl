@@ -6,7 +6,7 @@ import { test, expect, resetScenario, SCHEDULE } from '../fixtures';
 import { SEL } from '../selectors';
 import { readFile } from 'node:fs/promises';
 
-test('Nets keeps its open menu and focused item through polling and a clock tick', async ({ page, request }) => {
+test('Nets keeps its focused action through polling and a clock tick', async ({ page, request }) => {
   await resetScenario(request, 'corpus');
   await page.clock.install();
   let reads = 0;
@@ -20,8 +20,7 @@ test('Nets keeps its open menu and focused item through polling and a clock tick
     await route.fulfill({ response, json: body });
   });
   await page.goto('/jobs/nets');
-  await page.locator(SEL.actionsMenuTrigger).first().click();
-  const item = page.locator(SEL.actionsMenuItem).first();
+  const item = page.locator(SEL.netAction).first();
   await item.focus();
   const mounted = await item.elementHandle();
   const before = reads;
@@ -190,21 +189,17 @@ for (const surface of ['nets', 'runs', 'drawer']) {
     const table = page.locator(surface === 'drawer' ? '.run-preview-table' : `.${surface}-table`);
     await expect(table.locator('tbody tr')).toHaveCount(2);
     const control = surface === 'nets'
-      ? table.locator(SEL.actionsMenuTrigger).first()
+      ? table.locator(SEL.netAction).first()
       : table.locator('.row-stretch').first();
     await control.focus();
     const mounted = await control.elementHandle();
-    if (surface === 'nets') {
-      await control.click();
-      await page.locator(SEL.actionsMenuItem).first().focus();
-    }
     const focused = await page.evaluateHandle(() => document.activeElement);
     await page.clock.fastForward(5_000);
     if (surface === 'drawer') await expect(table.locator('tbody tr').first()).toContainText('B stationary run');
     else await expect(table.locator('.row-stretch').first()).toHaveText(surface === 'nets' ? 'B stationary net' : 'B stationary run');
     expect(await mounted!.evaluate(el => el.isConnected)).toBe(true);
     expect(await focused.evaluate(el => el === document.activeElement)).toBe(true);
-    if (surface === 'nets') await expect(page.locator(SEL.actionsMenuItem).first()).toBeVisible();
+    if (surface === 'nets') await expect(page.locator(SEL.netAction).first()).toBeVisible();
   });
 }
 

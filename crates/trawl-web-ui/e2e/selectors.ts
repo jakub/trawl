@@ -195,11 +195,8 @@ export const SEL = {
   /// `.nth(0)` is the theme item and `.nth(1)` Sign Out; the separator
   /// between them is role="separator" and is not matched.
   userMenuItem: '.user-menu [role="menuitem"]',
-  /// crates/fleet-ui/src/actions_menu.rs — the row overflow trigger.
-  actionsMenuTrigger: '.actions-wrap button.btn-icon',
-  /// crates/fleet-ui/src/menu.rs mounted by actions_menu.rs with
-  /// `panel_class="actions-menu"` — the row menu's command buttons.
-  actionsMenuItem: '.actions-menu [role="menuitem"]',
+  /// crates/trawl-web-ui/src/pages/nets.rs direct row controls.
+  netAction: '.net-actions button',
   /// crates/fleet-ui/src/tabs.rs TabsStyle::Workspace — one tab of the
   /// workspace strip. Selecting on the ROLE, not `.t`, is the point: the
   /// trailing Save/Export actions live in `.tabs` too and must not be
@@ -544,10 +541,6 @@ export const COPY = {
   /// crates/fleet-ui/src/toast/runtime.rs — the dismiss button's whole
   /// accessible name; the multiplication sign is aria-hidden.
   toastDismissName: 'Dismiss notification',
-  /// crates/fleet-ui/src/actions_menu.rs — the row trigger's aria-label
-  /// AND the menu panel's aria-label, which are deliberately the same
-  /// string: the trigger names the menu it opens.
-  actionsName: 'Actions',
   /// crates/fleet-ui/src/topbar.rs — the account menu panel's
   /// aria-label. The TRIGGER is named by its visible user name instead,
   /// so this is the panel's name only.
@@ -643,8 +636,8 @@ export const COPY = {
   /// crates/trawl-web-ui/src/components/net_drawer.rs — the manual run
   /// action, withdrawn when the SAVED schedule carries a window.
   netRunAction: '⏱ Run',
-  /// Its twin in the nets table's row menu.
-  netTriggerAction: '⏱ Trigger run',
+  /// Its twin in the nets table's direct actions.
+  netTriggerAction: 'Trigger run',
   /// crates/trawl-web-ui/src/schedule_edit.rs `preview_cap` — the line a
   /// capped preview shows, as the source formats it.
   previewCapLine: 'This run stored {n} rows; {fetched} were fetched. Paging covers the fetched rows.',
