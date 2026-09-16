@@ -20,7 +20,7 @@ use leptos::web_sys;
 
 use crate::components::editor::DslEditor;
 use crate::state::query::{QUICK_RANGES, RangeSpec};
-use fleet_ui::{CopyButton, Kbd, RangeDialog, RangePreset, RangeValue, ToastBus, ToastKind};
+use fleet_ui::{CopyButton, RangeDialog, RangePreset, RangeValue, ToastBus, ToastKind};
 
 /// Match the editor's primary modifier on Apple and other platforms.
 pub(crate) fn run_shortcut() -> &'static str {
@@ -149,7 +149,6 @@ pub fn EditorWrap(
                         } else {
                             view! {
                                 <span>"Haul"</span>
-                                <Kbd inline=true>{run_shortcut()}</Kbd>
                             }.into_any()
                         }}
                     </button>

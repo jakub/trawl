@@ -30,7 +30,7 @@ async function editBuffer(page: Page, text: string) {
 }
 
 async function expectFacts(page: Page, duration = '0.125s', started = '2026-09-15 12:34:56 UTC') {
-  await expect(page.locator(SEL.scopeExecution)).toHaveText(`Execution ${duration}`);
+  await expect(page.locator(SEL.scopeExecution)).toHaveText(`Execution in ${duration}`);
   await expect(page.locator(SEL.scopeStarted)).toHaveText(`Started ${started}`);
 }
 
@@ -174,7 +174,7 @@ test('never-run has no execution, while zero rows and zero duration are valid', 
     await route.fulfill({ json: queryResponse('2026-09-15T12:34:56Z', 0, []) });
   });
   await page.goto('/search');
-  await expect(page.locator(SEL.scopeCount)).toHaveText('—');
+  await expect(page.locator(SEL.scopeCount)).toHaveText('');
   await noTiming(page);
   expect(requests).toBe(0);
   await editBuffer(page, 'service=empty');
@@ -191,7 +191,7 @@ test('aggregate groups count as returned rows and malformed timestamps have no U
   } }));
   await page.goto(`/search?q=${encodeURIComponent('* | stats count() by host')}`);
   await expect(page.locator(SEL.scopeCount)).toHaveText('2 rows returned');
-  await expect(page.locator(SEL.scopeExecution)).toHaveText('Execution 9ms');
+  await expect(page.locator(SEL.scopeExecution)).toHaveText('Execution in 9ms');
   await expect(page.locator(SEL.scopeStarted)).toHaveCount(0);
   await expect(page.locator(SEL.scopeStrip)).not.toContainText('not-a-timestamp');
 });
@@ -224,7 +224,7 @@ test('same-query retry, failed response and malformed link hide accepted executi
   release();
   await expect(page.locator(SEL.resultsPane)).toContainText("Couldn't load results: server returned 500");
   await expect(page.locator(SEL.resultsPane).getByRole('button', { name: 'Retry', exact: true })).toBeVisible();
-  await expect(page.locator(SEL.scopeCount)).toHaveText('—');
+  await expect(page.locator(SEL.scopeCount)).toHaveText('');
   await noTiming(page);
   await page.unroute('**/api/v1/query');
   await page.locator(SEL.runButton).click();
@@ -275,7 +275,7 @@ test('an empty query invalidates pending ownership before the same query runs ag
   await page.goto('/search?q=service%3Dnginx');
   await expect.poll(() => held.length).toBe(1);
   await navigateSearch(page, '');
-  await expect(page.locator(SEL.scopeCount)).toHaveText('—');
+  await expect(page.locator(SEL.scopeCount)).toHaveText('');
   await noTiming(page);
   await navigateSearch(page, '?q=service%3Dnginx');
   await expect(page.locator(SEL.scopeCount)).toHaveText('…');

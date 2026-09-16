@@ -241,13 +241,13 @@ test('the histogram and execution timing are absent in live and return with a sn
   await expect(page.locator(SEL.scopeStarted)).toHaveCount(0);
   await page.locator(SEL.stopLive).click();
   await expect(page.locator(SEL.histoStrip)).toHaveCount(1);
-  await expect(page.locator(SEL.scopeExecution)).toHaveText('Execution 0.125s');
+  await expect(page.locator(SEL.scopeExecution)).toHaveText('Execution in 0.125s');
   await expect(page.locator(SEL.scopeStarted)).toHaveText('Started 2026-09-15 12:34:56 UTC');
 
   // An explicit DSL window still reports response timing in the strip.
   await resetScenario(request, 'corpus');
   await page.goto('/search?q=last%3D24h&r=15m');
-  await expect(page.locator(SEL.scopeExecution)).toHaveText('Execution 0.125s');
+  await expect(page.locator(SEL.scopeExecution)).toHaveText('Execution in 0.125s');
   await expect(page.locator(SEL.scopeStarted)).toHaveText('Started 2026-09-15 12:34:56 UTC');
 });
 
@@ -285,7 +285,7 @@ test('a snapshot finishing after Live cannot restore timing or complete a later 
   await expect(page.locator(SEL.scopeExecution)).toHaveCount(0);
   await expect(page.locator(SEL.scopeStarted)).toHaveCount(0);
   await held[1].fulfill({ json: responseBody('2026-09-15T11:00:00Z', 200) });
-  await expect(page.locator(SEL.scopeExecution)).toHaveText('Execution 0.200s');
+  await expect(page.locator(SEL.scopeExecution)).toHaveText('Execution in 0.200s');
   await expect(page.locator(SEL.scopeStarted)).toHaveText('Started 2026-09-15 11:00:00 UTC');
   await expect(page.locator(SEL.scopeCount)).toHaveText('1 row returned');
 });

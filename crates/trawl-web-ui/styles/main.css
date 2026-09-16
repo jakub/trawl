@@ -581,7 +581,7 @@
 /* Keep accepted execution facts together while allowing narrow strips to wrap. */
 .scope-facts { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; min-width: 0; }
 .scope-facts > span { font-variant-numeric: tabular-nums; }
-.scope-started { font-family: var(--font-mono); overflow-wrap: anywhere; }
+.scope-started { overflow-wrap: anywhere; }
 .scope .meta-chips { display: flex; flex-wrap: wrap; gap: 6px; }
 
 /* Filter chips — one per active Filter. */
