@@ -29,14 +29,18 @@ for (const [title, query] of EXAMPLES) {
     await page.goto('/search?r=1h&page=2');
     await expect(page.getByRole('heading', { name: 'Quick start', exact: true })).toBeVisible();
     expect(await capturedQueryCount(request)).toBe(0);
-    await page.getByRole('button', { name: `Run ${title}`, exact: true }).click();
+    const run = page.getByRole('button', { name: `Run ${title}`, exact: true });
+    await run.focus();
+    await page.keyboard.press('Enter');
     expect((await lastCapturedQuery(request, 1)).query).toBe(`last=1h ${query}`);
     const params = new URL(page.url()).searchParams;
     expect(params.get('r')).toBe('1h');
     expect(params.get('q')).toBe(query);
     expect(params.get('page')).toBe('0');
     await expect(page.locator(SEL.cmContent)).toHaveText(query);
-    await expect(page.locator('#search-results')).toBeVisible();
+    const results = page.locator('#search-results:not(.search-quick-start)');
+    await expect(results).toBeVisible();
+    await expect(results).toBeFocused();
     if (title === 'Explore events') {
       await expect(page.getByText('No events match this query. Check the time range and filters.')).toBeVisible();
     }

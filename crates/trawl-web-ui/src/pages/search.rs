@@ -973,6 +973,11 @@ pub fn Search() -> impl IntoView {
                         if outcome.is_ok() {
                             query_text.set(query.to_string());
                             active_tab.set(ResultsTab::Events);
+                            // The Run button leaves the DOM with the guide.
+                            // Focus the replacement region after navigation renders.
+                            request_animation_frame(move || {
+                                focus_search_control("#search-results");
+                            });
                         }
                         report_refusal(bus, outcome);
                     })/> }.into_any()
