@@ -223,11 +223,6 @@
   font-weight: 600;
   color: var(--ink-2);
 }
-.facets .phead .ttl .ttl-scope {
-  margin-inline-start: 6px;
-  font-weight: 400;
-  color: var(--ink-3);
-}
 /* A <button> since ADR-0029, so the rule carries its own reset; there
  * is no bare `button` selector in this sheet (ADR-0028). */
 .facets .phead .clear {

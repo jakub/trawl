@@ -838,7 +838,6 @@ pub fn Search() -> impl IntoView {
                 suppressed=unreadable
                 rows_suppressed=facet_rows_suppressed
                 capabilities=facet_capabilities
-                live=live
                 on_add=on_add_filter
                 on_clear=on_clear_filters
             />
