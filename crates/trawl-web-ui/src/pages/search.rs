@@ -1003,7 +1003,12 @@ pub fn Search() -> impl IntoView {
                                 on_paginate=on_paginate
                                 on_add_filter=on_result_filter
                                 on_navigate=Callback::new(move |nav| {
-                                    active_tab.set(ResultsTab::Events);
+                                    // Only the initial Visualization guidance needs
+                                    // to switch tabs. Re-setting Events would remount
+                                    // its table even when navigation is refused.
+                                    if active_tab.get_untracked() != ResultsTab::Events {
+                                        active_tab.set(ResultsTab::Events);
+                                    }
                                     on_navigate_q.run(nav);
                                 })
                                 details=details
