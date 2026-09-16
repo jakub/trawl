@@ -223,22 +223,6 @@ pub fn RunsPage() -> impl IntoView {
         );
     });
 
-    // The sheet header counts what the table shows, off the same
-    // predicate the rows are filtered by. It also keeps the sheet's
-    // name distinct from the scroll region's, which is "Recent runs"
-    // on its own.
-    let visible_count = Signal::derive(move || {
-        let needle = filter.get().to_lowercase();
-        match current_runs.get() {
-            Some((_, resp)) => resp
-                .runs
-                .iter()
-                .filter(|r| needle.is_empty() || r.net_name.to_lowercase().contains(&needle))
-                .count(),
-            _ => 0,
-        }
-    });
-
     #[allow(clippy::cast_possible_truncation)]
     let now_ms = fleet_ui::time::clock::now_ms();
 
@@ -343,7 +327,7 @@ pub fn RunsPage() -> impl IntoView {
             <section class="list-sheet" aria-labelledby="runs-sheet-title">
                 <div class="list-sheet-hd">
                     <h2 id="runs-sheet-title" class="list-sheet-ttl">
-                        "Recent runs"<span class="cnt">{move || format!(" {}", visible_count.get())}</span>
+                        "Recent runs"
                     </h2>
                     <SearchInput value=filter placeholder="Filter by net…"/>
                 </div>
@@ -375,7 +359,7 @@ pub fn RunsPage() -> impl IntoView {
                             let href = format!("/jobs/runs?run={run_id}&net={net_id}");
                             view! {
                                 <tr class="tbl-row" class:active=move || run_selected.get() == Some((net_id, run_id))>
-                                    <td class="mono"><a class="row-stretch" href=href prop:replace=true>{move || run.get().net_name}</a></td>
+                                    <td><a class="row-stretch" href=href prop:replace=true>{move || run.get().net_name}</a></td>
                                     <td><span style="font-size:11px">{move || {
                                         let mut label = run.get().run.status;
                                         if let Some(first) = label.get_mut(..1) {
@@ -383,9 +367,9 @@ pub fn RunsPage() -> impl IntoView {
                                         }
                                         label
                                     }}</span></td>
-                                    <td class="mono">{move || time_ago(&run.get().run.started_at, now_ms.get())}</td>
-                                    <td class="mono">{move || run.get().run.duration_ms.map_or_else(|| "—".to_string(), format_duration)}</td>
-                                    <td style="text-align:right" class="mono">{move || run.get().run.row_count.map_or_else(|| "—".to_string(), |n| n.to_string())}</td>
+                                    <td>{move || time_ago(&run.get().run.started_at, now_ms.get())}</td>
+                                    <td>{move || run.get().run.duration_ms.map_or_else(|| "—".to_string(), format_duration)}</td>
+                                    <td style="text-align:right">{move || run.get().run.row_count.map_or_else(|| "—".to_string(), |n| n.to_string())}</td>
                                 </tr>
                             }
                         }/></tbody>

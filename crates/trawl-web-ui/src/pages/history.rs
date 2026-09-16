@@ -250,7 +250,7 @@ pub fn HistoryPage() -> impl IntoView {
                         if filtered.is_empty() {
                             return view! {
                                     <div class="tbl-empty">
-                                    <span class="mono" style="color:var(--ink-3)">
+                                    <span style="color:var(--ink-3)">
                                         {if resp.entries.is_empty() {
                                             "No queries yet — run one in /search to see it here"
                                         } else {
@@ -286,10 +286,10 @@ pub fn HistoryPage() -> impl IntoView {
                                             {h.query.clone()}
                                         </button>
                                         </td>
-                                        <td style="color:var(--ink-3)" class="mono">
+                                        <td style="color:var(--ink-3)">
                                         <When ts=executed_at/>
                                         </td>
-                                        <td style="text-align:right" class="mono">
+                                        <td style="text-align:right">
                                         {events}
                                         </td>
                                         <td style="text-align:right">

@@ -230,7 +230,7 @@ pub fn NetsPage() -> impl IntoView {
             <section class="list-sheet" aria-labelledby="nets-sheet-title">
                 <div class="list-sheet-hd">
                     <h2 id="nets-sheet-title" class="list-sheet-ttl">
-                        "Your nets"<span class="cnt">{move || format!(" {}", visible_nets.get().len())}</span>
+                        "Your nets"
                     </h2>
                     <SearchInput value=filter placeholder="Filter nets…"/>
                 </div>
