@@ -195,6 +195,23 @@ class OperationalAlerts(unittest.TestCase):
                 self.assertIn("prometheusRule.additionalLabels", result.stderr)
                 self.assertIn("invalid Kubernetes label key", result.stderr)
 
+    def test_discovery_label_values_accept_kubernetes_boundaries(self):
+        values = ["", "A", "0", "A_name.with-dashes9", "a" * 63]
+        labels = {f"discovery-{i}": value for i, value in enumerate(values)}
+        result = rule_object(enabled(additionalLabels=labels))
+        for key, value in labels.items():
+            self.assertEqual(result["metadata"]["labels"][key], value)
+        self.assertEqual(result["spec"], self.helm["spec"])
+
+    def test_discovery_label_values_reject_invalid_characters_and_length(self):
+        values = ["not valid!", "a" * 64, "_name", "name.", "a/b", "é", " ",
+                  "name\n", "a\nb", "a:b", "{{ value }}"]
+        for value in values:
+            with self.subTest(value=value):
+                result = render(enabled(additionalLabels={"discovery": value}))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertRegex(result.stderr, r"prometheusRule[/.]additionalLabels[/.]discovery")
+
     def run_promtool(self, pack, tests):
         with tempfile.TemporaryDirectory(prefix="trawl-promtool-") as directory:
             rules = Path(directory) / "rules.yml"
