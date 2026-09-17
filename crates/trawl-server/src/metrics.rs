@@ -321,8 +321,14 @@ pub fn describe_metrics() {
         "Executor-pool permits held by query work whose request already \
          answered (a subset of the permits in use)"
     );
-    describe_gauge!(PARQUET_FILES, "Total number of parquet data files");
-    describe_gauge!(PARQUET_BYTES, "Total byte size of parquet data files");
+    describe_gauge!(
+        PARQUET_FILES,
+        "Ingested Parquet file count from the last complete measurement, excluding saved reports. Retained after collection failure."
+    );
+    describe_gauge!(
+        PARQUET_BYTES,
+        "Ingested Parquet bytes from the last complete measurement, excluding saved reports. Retained after collection failure."
+    );
     describe_gauge!(
         HEALTH_CHECK,
         "Subsystem health (1 = ok, 0 = failed), labeled by subsystem"
@@ -363,8 +369,14 @@ pub fn describe_metrics() {
         SYSLOG_TCP_CONNECTIONS,
         "Current active syslog TCP connections"
     );
-    describe_gauge!(WAL_FILES, "Number of pending WAL (ndjson) files");
-    describe_gauge!(WAL_BYTES, "Total byte size of pending WAL files");
+    describe_gauge!(
+        WAL_FILES,
+        "WAL ndjson file count from the last complete measurement, including active files. Retained after collection failure."
+    );
+    describe_gauge!(
+        WAL_BYTES,
+        "WAL ndjson bytes from the last complete measurement, including active files. Retained after collection failure."
+    );
     describe_counter!(
         CATALOG_CONFLICTS_TOTAL,
         "Field-catalog type conflicts recorded at compaction (a batch column \

@@ -1632,7 +1632,9 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" "$TRAWL_URL/api/v1/stats"
 
 Permission: `server_manage`
 
-Returns the latest snapshot the background collector produced.
+Returns the latest snapshot the background collector produced. GET and the
+[dashboard stream](#dashboard-stream) read the same cache. Neither request
+starts a filesystem scan.
 
 **Request**
 
@@ -1663,10 +1665,56 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" "$TRAWL_URL/api/v1/dashboard
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `query_rate`, `ingest_rate`, `syslog_rate` | number | Smoothed per-second rates computed by the server |
+| `query_rate`, `ingest_rate`, `syslog_rate` | number | Smoothed per-second rates computed by the server. `ingest_rate` covers HTTP only. |
 | `query_errors`, `query_timeouts` | integer | Counts over the recent-query window |
-| `last_compaction_secs` | integer | Seconds since the last successful compaction. `null` when none has run. |
+| `ingest_events`, `ingest_rejected` | integer | HTTP accepted and rejected event counts since process startup. Excludes syslog. |
+| `syslog_enabled` | boolean | Configured syslog enablement. This does not test listener health. |
+| `syslog_events_udp`, `syslog_events_tcp` | integer | Messages received by each transport since process startup. Reception does not prove persistence. |
+| `syslog_parse_errors`, `syslog_dropped` | integer | Parse errors and backpressure drops since process startup |
+| `syslog_tcp_connections` | integer | Current active syslog TCP connections |
+| `wal_files`, `wal_bytes` | integer | Last complete count and byte total of WAL `.ndjson` files, including active files. These are not compaction-eligible totals. |
+| `parquet_files`, `parquet_bytes` | integer | Last complete count and byte total of ingested Parquet files. Excludes saved report files under `scheduled/` directories. |
+| `wal_measurement`, `parquet_measurement` | object | Required measurement metadata for the corresponding totals, as defined below |
+| `compaction_runs` | integer | Successful compaction cycles since process startup. A cycle can succeed with no eligible work. |
+| `compaction_errors` | integer | Error tally since process startup, including failed cycles and loss/error tallies. Can accompany successful cycles and exceed their count. |
+| `last_compaction_secs` | integer or null | Seconds since the last successful cycle. `0` is a reported success with zero elapsed seconds. `null` means no successful cycle reported since startup. |
 | `recent_queries`, `active_queries` | array | The same entries as `/api/v1/queries` without `own` |
+
+A nonzero historical error tally does not establish a current incident.
+`compaction_errors / compaction_runs` is not a failure percentage.
+
+Each storage metadata object has a required `status` and nullable
+`sample_age_secs`. The producer emits both keys.
+
+| Status | Meaning | Totals and `sample_age_secs` |
+| --- | --- | --- |
+| `not_configured` | An optional source is absent, such as no WAL writer | Zero placeholders and `null` age |
+| `not_sampled` | A configured source has not completed an attempt | Zero placeholders and `null` age |
+| `complete` | The latest completed attempt succeeded | Measured totals and an integer age, including measured zero and age `0` |
+| `failed` | The latest completed attempt failed | Last complete totals and their age if a sample exists. Otherwise, zero placeholders and `null` age. |
+
+WAL configuredness comes from actual writer presence. The Parquet archive
+remains configured on a query-only server. A missing, non-directory, or
+unreadable configured root produces `failed`, even if boot accepts that root's
+absence. An absent archive is not a measured empty directory.
+
+WAL and Parquet scans are independent. A complete scan has no unresolved
+coverage error under the collector's policy. After a NotFound error, the
+collector skips a descendant only if it confirms that the descendant is absent.
+Other enumeration, entry inspection, and metadata errors reject the attempt.
+The configured root must remain present and enumerable at completion.
+Failure preserves the prior complete sample rather than publishing partial
+totals. Measurement metadata exposes stable status, never filesystem error messages or paths.
+
+`sample_age_secs` uses monotonic elapsed time since the last successful scan
+completed. The server calculates it when it assembles the dashboard snapshot.
+A failed attempt does not reset that age. Age has no fixed maximum and is not a
+transactional filesystem timestamp. A `failed` measurement can have an age;
+an age alone does not imply `complete`.
+
+A live dashboard stream describes the connection, not the disk measurement.
+Clients display the snapshot's supplied age without a local age ticker.
+A retained snapshot keeps that age unchanged until a new snapshot arrives.
 
 **Errors**
 
@@ -1750,7 +1798,26 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" "$TRAWL_URL/api/v1/whoami"
 
 Permission: none. The route is unauthenticated and outside `/api/v1`.
 
-Renders the Prometheus text exposition format. Each scrape collects process metrics and trawld gauges first.
+Renders the Prometheus text exposition format. Each scrape collects process
+metrics and trawld gauges first. Storage collection shares the stats emitter's
+cached measurements and retry timing.
+
+The following numeric gauges carry the last complete storage totals:
+
+| Gauge | Measurement |
+| --- | --- |
+| `trawl_wal_files` | WAL `.ndjson` file count, including active files |
+| `trawl_wal_bytes` | Byte total for those WAL files |
+| `trawl_parquet_files_total` | Ingested Parquet file count, excluding saved report files |
+| `trawl_parquet_size_bytes` | Byte total for those ingested Parquet files |
+
+Before the first successful measurement, collection does not publish these
+numeric gauges. A complete empty scan publishes zero. A later failed attempt
+retains the last complete totals.
+
+These gauges expose neither measurement status nor sample age. A flat gauge
+cannot establish collector health. Those facts are available in the
+[dashboard measurement metadata](#dashboard-snapshot).
 
 **Request**
 
