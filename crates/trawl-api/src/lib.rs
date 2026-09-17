@@ -1291,9 +1291,9 @@ pub struct ClearHistoryResponse {
 /// Response from the history endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryResponse {
-    /// Query history entries (most recent first).
+    /// Matching history entries, ordered by execution time then ID descending.
     pub entries: Vec<HistoryEntryResponse>,
-    /// Total number of history entries for this user.
+    /// Matching history rows for the current key, before limit and offset.
     pub total: usize,
 }
 

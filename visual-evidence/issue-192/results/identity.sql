@@ -1,0 +1,11 @@
+SELECT current_database(), current_user, version();
+SELECT to_jsonb(d) FROM pg_database d WHERE datname = current_database();
+SHOW default_transaction_isolation;
+SHOW shared_buffers;
+SHOW work_mem;
+SHOW effective_cache_size;
+SHOW random_page_cost;
+SHOW seq_page_cost;
+SHOW max_parallel_workers_per_gather;
+SHOW jit;
+SHOW plan_cache_mode;

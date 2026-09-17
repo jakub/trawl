@@ -1,0 +1,55 @@
+   current_database   | current_user |                                                      version                                                       
+----------------------+--------------+--------------------------------------------------------------------------------------------------------------------
+ trawl_issue_192_cost | fleet        | PostgreSQL 18.6 (Debian 18.6-1.pgdg13+2) on x86_64-pc-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit
+(1 row)
+
+                                                                                                                                                                                                    to_jsonb                                                                                                                                                                                                     
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ {"oid": "35346", "datacl": null, "datdba": "10", "datname": "trawl_issue_192_cost", "datctype": "en_US.utf8", "encoding": 6, "datlocale": null, "datcollate": "en_US.utf8", "datminmxid": "1", "daticurules": null, "datallowconn": true, "datconnlimit": -1, "datfrozenxid": "745", "datistemplate": false, "dattablespace": "1663", "datcollversion": "2.41", "dathasloginevt": false, "datlocprovider": "c"}
+(1 row)
+
+ default_transaction_isolation 
+-------------------------------
+ read committed
+(1 row)
+
+ shared_buffers 
+----------------
+ 128MB
+(1 row)
+
+ work_mem 
+----------
+ 4MB
+(1 row)
+
+ effective_cache_size 
+----------------------
+ 4GB
+(1 row)
+
+ random_page_cost 
+------------------
+ 4
+(1 row)
+
+ seq_page_cost 
+---------------
+ 1
+(1 row)
+
+ max_parallel_workers_per_gather 
+---------------------------------
+ 2
+(1 row)
+
+ jit 
+-----
+ on
+(1 row)
+
+ plan_cache_mode 
+-----------------
+ auto
+(1 row)
+
