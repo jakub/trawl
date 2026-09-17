@@ -108,6 +108,14 @@ _Avoid_: inline drawer, split view, sidebar (that is the navigation)
 A `UiPrefs` field that chooses a presentation rather than a theme: `sidebar` (expanded or collapsed), `details` (inline or inspector) and `rows` (compact or message-first). fleet-ui stores and persists them beside the theme; what each presentation looks like is the consumer's.
 _Avoid_: setting, layout option, view state
 
+**Theme preference**:
+The user's choice of Light, Dark or System. System follows the operating system's appearance; the stored choice remains System when that appearance changes.
+_Avoid_: resolved theme, automatic toggle
+
+**Resolved theme**:
+The Light or Dark appearance selected by the theme preference and, for System, the current operating-system appearance. CSS, charts and Atmosphere render this value.
+_Avoid_: theme preference, system theme
+
 **Toast host**:
 The one mounted `Toasts` component that renders the queue. Its dismiss control is a named native button.
 _Avoid_: toaster, notification area

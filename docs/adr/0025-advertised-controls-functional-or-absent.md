@@ -60,6 +60,7 @@ Per affordance:
   toggle the theme for others, which is the broken promise this ADR bans.
   The hint chip leaves with the two rows; the theme item stays a plain
   menu command; no replacement chord is chosen here.
+  *Amended 2026-09-16 ([ADR-0028 theme preference amendment](0028-native-controls-and-the-menu-contract.md#amendment-explicit-theme-preference-2026-09-16)): Light, Dark and System are explicit menu radio choices. The no-shortcut rule remains.*
 - **Help links to the docs site.** The native link opens `https://trawl.sh`
   in a new tab with `rel="noopener noreferrer"`. It stays in the rail's
   bottom slot, outside the command palette's internal route inventory.

@@ -94,3 +94,14 @@ app-owned popover behind a pointer-blocking scrim is a `Trap` dialog.**
   `Segmented` control's own semantics, toast `aria-live`, the ⌘K box (G4),
   promoting the range dialog into fleet-ui (slice E), and any claim about
   non-Chromium engines or assistive technology.
+
+## Amendment: theme control location, 2026-09-16
+
+For [issue #196](https://github.com/jakub/trawl/issues/196), the user chose
+to remove Trawl's footer theme command and use the account menu's explicit
+Light, Dark and System choices. The [ADR-0028 theme preference
+amendment](0028-native-controls-and-the-menu-contract.md#amendment-explicit-theme-preference-2026-09-16)
+replaces the theme-specific command and accessible-name rule above. Remove
+the footer control, its handler and theme-specific label code while
+preserving the footer's other content and keyboard order. Other command
+names and exclusive-choice controls keep this ADR's existing rules.

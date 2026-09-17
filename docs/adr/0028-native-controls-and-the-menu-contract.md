@@ -112,3 +112,78 @@ tablist with a required name that owns no panes.**
   and declared a residual.
 - Automated proof is Chromium-only through the trawl-web-ui harness; other
   engines and assistive technology are not claimed.
+
+## Amendment: explicit theme preference, 2026-09-16
+
+[Issue #196](https://github.com/jakub/trawl/issues/196) adds System to the
+theme preference. The user chose one selector in the account menu and
+removal of Trawl's footer theme control. The user also chose to preserve
+every valid saved Light or Dark preference. A saved Light value can be
+deliberate or incidental because the old runtime persists all preferences
+together; the format cannot distinguish these cases. Neither is migrated.
+
+The account menu contains a group named "Theme" with Light, Dark and
+System choices, in that order. Each is a native button with
+`role="menuitemradio"`, a visible selected indicator and `aria-checked`
+derived from the preference. System stays checked when its resolved theme
+changes. Sign Out remains a separate command. The group's label and
+separators never take focus. The menu's one roving tab stop and item walk
+include both `menuitem` and `menuitemradio`. Opening the account menu
+focuses the checked theme choice; command-only menus keep their existing
+initial-focus behavior. ArrowUp/Down and Home/End move
+focus only; click, Enter or Space selects the focused choice, closes the
+menu and restores focus through the existing cause-specific contract.
+Escape, Tab, outside dismissal, overlay arbitration and identity-loss
+behavior remain as specified above. No theme shortcut is added. This
+amends the earlier plain-command theme choice, including ADR-0025's rule.
+
+Fleet distinguishes `ThemePreference` with System, Light and Dark from
+the binary `Theme` used by renderers. Consumers read the resolved theme
+and change the preference through its own setter. CSS, charts and
+Atmosphere continue to receive only Light or Dark. The workbench's
+always-visible demonstration control uses explicit preferences so it can
+still exercise a mounted login backdrop without a binary theme writer.
+
+The existing per-consumer storage namespace and JSON `theme` field remain.
+The field accepts `system`, `light` and `dark`. Missing or invalid values
+default to System. Malformed storage does not crash startup or get repaired
+by an initialization write. Parsing a valid theme does not depend on the
+validity of unrelated fields. Initialization, operating-system changes and
+reselecting the current preference write nothing. A real preference change
+persists the preference snapshot, so changing another reading preference
+while in System mode stores `system`, never the resolved color. Storage
+failure leaves the current session usable without claiming persistence.
+
+System resolves from `prefers-color-scheme: dark`; an unavailable media
+query resolves to Light. Fixed Light and Dark ignore media changes. The
+runtime owns one media-query listener per preference installation and
+removes it at cleanup. It registers the listener before its final sample
+of the current query, so a change during startup is not lost. Runtime
+installation re-reads storage and the current query rather than trusting
+the bootstrap's earlier sample.
+
+Trawl and the Fleet workbench load one shared, same-origin, classic script
+before styles and Wasm. Trunk emits a content-hashed asset; it is neither
+async, deferred nor a module. Each consumer supplies its storage namespace
+on the script element. The bootstrap reads only, uses the runtime's parsing
+and fallback rules, and sets the binary `data-theme` on the root element.
+Existing CSS owns `color-scheme`; the bootstrap adds no permanent inline
+override. Equal inputs produce the same styled appearance before Wasm and
+after runtime installation. Later changes to storage availability or OS
+appearance can legitimately change that result. No new theme transition
+is introduced. A missing script or disabled JavaScript leaves the static
+Light fallback visible; correct first paint is not claimed for that case.
+
+This is one Trawl PR, including Fleet, Trawl and the workbench. Verify
+Coastwatch's existing readers against the candidate Fleet revision in a
+disposable copy and record both source revisions. Do not modify Coastwatch
+or its CI pin in this issue. A Trawl-owned adoption guide explains the
+external script, consumer namespace and placement under the existing CSP.
+Coastwatch's unchanged HTML has no first-paint guarantee from this change.
+
+Proof must exercise the shared parsing cases in Rust and the real bootstrap,
+storage write counts, live media changes and listener cleanup, menu keyboard
+behavior, and existing chart/backdrop state retention. First-paint evidence
+must inspect computed styles with Wasm delayed, then compare the runtime
+handoff under production asset serving and CSP. A final DOM attribute alone
+does not establish first-paint behavior.
