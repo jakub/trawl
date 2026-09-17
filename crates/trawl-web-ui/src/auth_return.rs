@@ -132,6 +132,83 @@ std::thread_local! {
     // Explicit logout takes precedence from the user's click until failure
     // or document departure, including while its HTTP response is pending.
     static EXPLICIT_LOGOUT_PENDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static AUTH_DEPARTURE: std::cell::Cell<AuthDeparture> = const { std::cell::Cell::new(AuthDeparture::Idle) };
+    static DEPARTURE_LISTENERS: std::cell::RefCell<Option<DepartureListeners>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AuthDeparture {
+    Idle,
+    Armed,
+    Departed,
+}
+
+/// These callbacks belong to the document, not a Leptos component owner.
+/// The back-forward cache preserves the old identity's DOM and WASM heap. Reload
+/// only a document that actually departed through authentication, leaving its
+/// root hidden until a fresh document performs the normal session check.
+#[cfg(target_arch = "wasm32")]
+struct DepartureListeners {
+    _hide: wasm_bindgen::closure::Closure<dyn FnMut(web_sys::PageTransitionEvent)>,
+    _show: wasm_bindgen::closure::Closure<dyn FnMut(web_sys::PageTransitionEvent)>,
+}
+
+#[cfg(target_arch = "wasm32")]
+fn arm_auth_departure(window: &web_sys::Window) -> Result<(), wasm_bindgen::JsValue> {
+    use wasm_bindgen::{JsCast, closure::Closure};
+
+    DEPARTURE_LISTENERS.with(|listeners| {
+        let mut listeners = listeners.borrow_mut();
+        if listeners.is_none() {
+            let hide = Closure::<dyn FnMut(web_sys::PageTransitionEvent)>::new(|_| {
+                if AUTH_DEPARTURE.with(std::cell::Cell::get) != AuthDeparture::Armed {
+                    return;
+                }
+                AUTH_DEPARTURE.with(|state| state.set(AuthDeparture::Departed));
+                if let Some(root) = web_sys::window()
+                    .and_then(|window| window.document())
+                    .and_then(|document| document.document_element())
+                    .and_then(|root| root.dyn_into::<web_sys::HtmlElement>().ok())
+                {
+                    let _ = root.style().set_property_with_priority(
+                        "visibility",
+                        "hidden",
+                        "important",
+                    );
+                }
+            });
+            let show = Closure::<dyn FnMut(web_sys::PageTransitionEvent)>::new(
+                |event: web_sys::PageTransitionEvent| {
+                    if event.persisted()
+                        && AUTH_DEPARTURE.with(std::cell::Cell::get) == AuthDeparture::Departed
+                        && let Some(window) = web_sys::window()
+                    {
+                        let _ = window.location().reload();
+                    }
+                },
+            );
+            window.add_event_listener_with_callback("pagehide", hide.as_ref().unchecked_ref())?;
+            if let Err(error) =
+                window.add_event_listener_with_callback("pageshow", show.as_ref().unchecked_ref())
+            {
+                let _ = window
+                    .remove_event_listener_with_callback("pagehide", hide.as_ref().unchecked_ref());
+                return Err(error);
+            }
+            *listeners = Some(DepartureListeners {
+                _hide: hide,
+                _show: show,
+            });
+        }
+        AUTH_DEPARTURE.with(|state| state.set(AuthDeparture::Armed));
+        Ok(())
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+fn cancel_auth_departure() {
+    AUTH_DEPARTURE.with(|state| state.set(AuthDeparture::Idle));
 }
 
 /// Claim logout for this document, including across shell remounts.
@@ -144,6 +221,23 @@ pub fn begin_explicit_logout() -> bool {
 #[cfg(target_arch = "wasm32")]
 pub fn cancel_explicit_logout() {
     EXPLICIT_LOGOUT_PENDING.with(|pending| pending.set(false));
+}
+
+/// Depart only after the server confirms logout. Failure leaves the current
+/// document intact; the caller releases logout intent and shows its retry UI.
+#[cfg(target_arch = "wasm32")]
+pub fn finish_explicit_logout() -> bool {
+    let Some(window) = web_sys::window() else {
+        return false;
+    };
+    if arm_auth_departure(&window).is_err() {
+        return false;
+    }
+    if window.location().set_href("/login").is_err() {
+        cancel_auth_departure();
+        return false;
+    }
+    true
 }
 
 /// Replace an interrupted protected page with sign-in, capturing its current
@@ -171,8 +265,12 @@ pub fn redirect_to_login() -> bool {
     .unwrap_or_default();
     let candidate = captured_destination(&raw);
     let destination = browser_destination(&window, candidate);
+    if arm_auth_departure(&window).is_err() {
+        return false;
+    }
     LOGIN_REDIRECT_STARTED.with(|started| started.set(true));
     if location.replace(&login_href(&destination)).is_err() {
+        cancel_auth_departure();
         LOGIN_REDIRECT_STARTED.with(|started| started.set(false));
         return false;
     }

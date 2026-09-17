@@ -714,6 +714,17 @@ jobs:
         env:
           # Preserve browser process exits and stderr alongside test results.
           DEBUG: pw:browser
+      - name: Authentication history restores with BFCache enabled
+        run: npm run test -- --config=playwright.bfcache.config.ts
+        working-directory: crates/trawl-web-ui/e2e
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: auth-bfcache-evidence
+          path: |
+            e2e-artifacts/bfcache/
+            e2e-artifacts/bfcache-report/
+          retention-days: 30
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: failure()
         with:

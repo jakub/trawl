@@ -163,11 +163,7 @@ pub fn AuthShell() -> impl IntoView {
         signing_out.set(true);
         logout_error.set(false);
         spawn_local(async move {
-            if let Ok(()) = api::logout().await {
-                if let Some(win) = web_sys::window() {
-                    let _ = win.location().set_href("/login");
-                }
-            } else {
+            if api::logout().await.is_err() || !crate::auth_return::finish_explicit_logout() {
                 crate::auth_return::cancel_explicit_logout();
                 logout_error.try_set(true);
             }
