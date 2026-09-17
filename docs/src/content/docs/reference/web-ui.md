@@ -137,7 +137,7 @@ grouping, and sorting can omit or combine rows differently from the source data.
 stored query text across
 all retained history for your key before paging. Matching is a literal
 substring using the database's lowercase rules; whitespace, `%`, and `_` remain
-significant. **Save as net** stores a row as a saved query.
+significant. **Save as Net** stores a row as a saved query.
 
 Typing edits a draft. **Search** or Enter outside IME composition applies it.
 A changed filter starts at page one and adds a browser history entry.
