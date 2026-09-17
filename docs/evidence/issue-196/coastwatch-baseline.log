@@ -1,0 +1,232 @@
+warning: unused config key `resolver.incompatible-publish-age` in `<CARGO_HOME>/config.toml`
+   Compiling proc-macro2 v1.0.106
+   Compiling quote v1.0.45
+   Compiling unicode-ident v1.0.24
+   Compiling wasm-bindgen-shared v0.2.121
+    Checking memchr v2.8.0
+   Compiling syn v2.0.117
+    Checking pin-project-lite v0.2.17
+   Compiling version_check v0.9.5
+   Compiling serde_core v1.0.228
+   Compiling rustversion v1.0.22
+    Checking futures-core v0.3.32
+   Compiling semver v1.0.28
+   Compiling bumpalo v3.20.2
+    Checking futures-sink v0.3.32
+    Checking futures-channel v0.3.32
+   Compiling wasm-bindgen-macro-support v0.2.121
+   Compiling futures-macro v0.3.32
+   Compiling rustc_version v0.4.1
+   Compiling wasm-bindgen v0.2.121
+    Checking slab v0.4.12
+    Checking once_cell v1.21.4
+    Checking futures-io v0.3.32
+    Checking futures-task v0.3.32
+    Checking futures-util v0.3.32
+   Compiling wasm-bindgen-macro v0.2.121
+   Compiling serde_derive v1.0.228
+    Checking cfg-if v1.0.4
+   Compiling thiserror v2.0.18
+   Compiling thiserror-impl v2.0.18
+   Compiling serde v1.0.228
+    Checking js-sys v0.3.98
+   Compiling synstructure v0.13.2
+    Checking stable_deref_trait v1.2.1
+   Compiling zerovec-derive v0.11.3
+   Compiling zerofrom-derive v0.1.7
+   Compiling yoke-derive v0.8.2
+    Checking zerofrom v0.1.8
+   Compiling proc-macro-error-attr2 v2.0.0
+   Compiling proc-macro-error2 v2.0.1
+    Checking yoke v0.8.2
+    Checking zerovec v0.11.6
+   Compiling displaydoc v0.2.5
+    Checking web-sys v0.3.98
+   Compiling crossbeam-utils v0.8.21
+   Compiling zmij v1.0.21
+   Compiling unicode-segmentation v1.13.2
+   Compiling convert_case v0.11.0
+    Checking wasm-bindgen-futures v0.4.71
+   Compiling serde_json v1.0.149
+    Checking itoa v1.0.18
+    Checking tinystr v0.8.3
+    Checking futures-executor v0.3.32
+   Compiling proc-macro2-diagnostics v0.10.1
+    Checking writeable v0.6.3
+    Checking litemap v0.8.2
+    Checking icu_locale_core v2.2.0
+    Checking futures v0.3.32
+    Checking concurrent-queue v2.5.0
+    Checking zerotrie v0.2.4
+    Checking potential_utf v0.1.5
+   Compiling generic-array v0.14.7
+    Checking or_poisoned v0.1.0
+   Compiling icu_properties_data v2.2.0
+   Compiling paste v1.0.15
+   Compiling smallvec v1.15.1
+   Compiling icu_normalizer_data v2.2.0
+   Compiling unicode-xid v0.2.6
+    Checking utf8_iter v1.0.4
+    Checking icu_collections v2.2.0
+   Compiling const_format_proc_macros v0.2.34
+   Compiling proc-macro-utils v0.10.0
+    Checking icu_provider v2.2.0
+    Checking event-listener v5.4.1
+   Compiling slotmap v1.1.1
+    Checking throw_error v0.3.1
+   Compiling konst_macro_rules v0.2.19
+   Compiling anyhow v1.0.104
+    Checking equivalent v1.0.2
+   Compiling typenum v1.20.0
+    Checking hashbrown v0.17.1
+   Compiling camino v1.2.2
+    Checking indexmap v2.14.0
+   Compiling konst v0.2.20
+    Checking event-listener-strategy v0.5.4
+   Compiling server_fn_macro v0.8.10
+   Compiling reactive_graph v0.2.14
+   Compiling derive-where v1.6.1
+    Checking send_wrapper v0.6.0
+    Checking icu_normalizer v2.2.0
+    Checking icu_properties v2.2.0
+    Checking async-lock v3.4.2
+   Compiling const_format v0.2.36
+    Checking hydration_context v0.3.0
+    Checking any_spawner v0.3.0
+   Compiling syn_derive v0.2.0
+   Compiling pin-project-internal v1.1.13
+    Checking percent-encoding v2.3.2
+    Checking guardian v1.3.0
+   Compiling libc v0.2.186
+    Checking either v1.15.0
+   Compiling thiserror v1.0.69
+    Checking rustc-hash v2.1.2
+   Compiling xxhash-rust v0.8.15
+    Checking bytes v1.11.1
+    Checking http v1.4.0
+    Checking pin-project v1.1.13
+    Checking itertools v0.14.0
+    Checking idna_adapter v1.2.2
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling quote-use-macros v0.8.4
+   Compiling manyhow-macros v0.11.4
+   Compiling reactive_stores_macro v0.4.2
+   Compiling tachys v0.2.15
+   Compiling thiserror-impl v1.0.69
+   Compiling prettyplease v0.2.37
+   Compiling yansi v1.0.1
+   Compiling getrandom v0.4.2
+    Checking winnow v1.0.3
+    Checking utf8-width v0.1.8
+    Checking html-escape v0.2.13
+    Checking toml_parser v1.1.2+spec-1.1.0
+    Checking reactive_stores v0.4.3
+   Compiling manyhow v0.11.4
+   Compiling quote-use v0.8.4
+   Compiling digest v0.10.7
+    Checking idna v1.1.0
+    Checking form_urlencoded v1.2.2
+    Checking either_of v0.1.9
+    Checking gloo-utils v0.2.0
+    Checking oco_ref v0.2.1
+   Compiling server_fn v0.8.12
+   Compiling async-trait v0.1.89
+    Checking serde_spanned v1.1.1
+    Checking toml_datetime v1.1.1+spec-1.1.0
+    Checking aho-corasick v1.1.4
+   Compiling cpufeatures v0.2.17
+    Checking next_tuple v0.1.0
+    Checking const_str_slice_concat v0.1.0
+    Checking erased v0.1.2
+    Checking regex-syntax v0.8.10
+    Checking drain_filter_polyfill v0.1.3
+   Compiling collection_literals v1.0.3
+   Compiling same-file v1.0.6
+   Compiling interpolator v0.5.0
+   Compiling attribute-derive-macro v0.10.5
+   Compiling walkdir v2.5.0
+    Checking regex-automata v0.4.14
+   Compiling sha2 v0.10.9
+    Checking convert_case v0.6.0
+    Checking toml v1.1.2+spec-1.1.0
+    Checking gloo-net v0.6.0
+    Checking url v2.5.8
+   Compiling rstml v0.12.1
+   Compiling server_fn_macro_default v0.8.5
+    Checking serde_qs v0.15.0
+    Checking wasm-streams v0.5.0
+   Compiling leptos_macro v0.8.16
+   Compiling typed-builder-macro v0.23.2
+    Checking const-str v1.1.0
+   Compiling strsim v0.11.1
+    Checking base64 v0.22.1
+   Compiling ident_case v1.0.1
+   Compiling base16 v0.2.1
+    Checking pathdiff v0.2.3
+   Compiling fnv v1.0.7
+   Compiling autocfg v1.5.0
+   Compiling num-traits v0.2.19
+   Compiling darling_core v0.20.11
+    Checking typed-builder v0.23.2
+    Checking config v0.15.23
+   Compiling leptos_hot_reload v0.8.6
+   Compiling wasm_split_macros v0.2.1
+   Compiling uuid v1.23.1
+    Checking regex v1.12.3
+   Compiling attribute-derive v0.10.5
+    Checking codee v0.3.5
+   Compiling convert_case_extras v0.2.0
+   Compiling leptos v0.8.19
+    Checking async-once-cell v0.5.4
+    Checking wasm_split_helpers v0.2.1
+    Checking leptos_server v0.8.7
+    Checking leptos_config v0.8.10
+   Compiling darling_macro v0.20.11
+    Checking leptos_dom v0.8.8
+   Compiling darling v0.20.11
+   Compiling leptos_router v0.8.13
+   Compiling leptos-use v0.19.0
+   Compiling default-struct-builder v0.5.1
+    Checking chrono v0.4.44
+   Compiling leptos_router_macro v0.8.6
+    Checking lazy_static v1.5.0
+    Checking gloo-utils v0.3.0
+    Checking gloo-timers v0.4.0
+    Checking coastwatch-wire v0.1.0 (<DISPOSABLE_ROOT>/coastwatch/crates/wire)
+    Checking gloo-net v0.7.0
+    Checking gloo-timers v0.3.0
+    Checking console_error_panic_hook v0.1.7
+    Checking fleet-ui v0.4.0 (<DISPOSABLE_ROOT>/trawl/crates/fleet-ui)
+    Checking coastwatch-web-ui v0.1.0 (<DISPOSABLE_ROOT>/coastwatch/crates/web-ui)
+error[E0432]: unresolved import `fleet_ui::AppLink`
+  --> crates/web-ui/src/components/shell.rs:11:16
+   |
+11 | use fleet_ui::{AppLink, Atmosphere, Btn, Shell, UiPrefs, UserInfo, Variant};
+   |                ^^^^^^^ no `AppLink` in the root
+
+error[E0425]: cannot find type `ModeTab` in crate `fleet_ui`
+   --> crates/web-ui/src/components/shell.rs:162:37
+    |
+162 |     let modes: Signal<Vec<fleet_ui::ModeTab>> = Signal::derive(Vec::new);
+    |                                     ^^^^^^^ not found in `fleet_ui`
+
+error[E0599]: no method named `rail_items` found for struct `fleet_ui::shell::ShellPropsBuilder<TypedBuilderFields>` in the current scope
+   --> crates/web-ui/src/components/shell.rs:215:25
+    |
+211 |                   None => view! {
+    |  _________________________-
+212 | |                     <Shell
+213 | |                         brand="coastwatch"
+214 | |                         brand_accent="_"
+215 | |                         rail_items=rail_items
+    | |                        -^^^^^^^^^^ method not found in `ShellPropsBuilder<((String,), (String,), (), (), (), (), (), (), ())>`
+    | |________________________|
+    |
+    |
+    = note: the full name for the type has been written to '<CARGO_TARGET_DIR>/wasm32-unknown-unknown/debug/deps/coastwatch_web_ui-82d9f8631629e469.long-type-8829419006090647847.txt'
+    = note: consider using `--verbose` to print the full type name to the console
+
+Some errors have detailed explanations: E0425, E0432, E0599.
+For more information about an error, try `rustc --explain E0425`.
+error: could not compile `coastwatch-web-ui` (bin "coastwatch-web-ui") due to 3 previous errors

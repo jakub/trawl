@@ -49,6 +49,8 @@ pub struct UiPrefs {
 
 impl UiPrefs {
     /// The resolved Light or Dark appearance for CSS, charts, and backdrops.
+    /// System follows the current OS appearance; fixed preferences ignore it.
+    /// Change the preference with [`Self::select_theme`].
     #[must_use]
     pub fn theme(self) -> Signal<Theme> {
         self.theme
@@ -62,6 +64,8 @@ impl UiPrefs {
 
     /// Select an appearance for this session and attempt to persist a changed
     /// preference. Selecting the current choice performs no storage write.
+    /// A storage failure does not roll back the session choice and is not
+    /// retried by OS changes or by selecting the same preference again.
     pub fn select_theme(self, preference: ThemePreference) {
         if self.theme_preference.get_untracked() != preference {
             self.theme_preference.set(preference);
@@ -93,12 +97,17 @@ impl UiPrefs {
 /// effects that keep `<html>` attributes and persisted preferences in sync.
 /// Reads storage and current media state afresh, independently of the early
 /// bootstrap. Owns one dark-scheme listener until the current owner is disposed.
+/// Initialization and OS changes do not write storage. Missing or invalid
+/// stored themes select System; valid legacy Light/Dark values stay fixed.
 ///
 /// `storage_key` is the localStorage key under which a JSON snapshot
 /// is persisted — pass `"trawl.ui"`, `"coastwatch.ui"`, etc.
 ///
-/// Call once at app boot from inside the `<App/>` body so the effect
-/// runs in the reactive context.
+/// Call once at app boot from inside the `<App/>` body so the effects and
+/// listener belong to that reactive owner. For first styled appearance,
+/// also load `js/theme-bootstrap.js` before styles and Wasm with this same
+/// key in `data-storage-key`. Runtime installation alone makes no first-paint
+/// guarantee. Both paths leave `color-scheme` to CSS.
 #[must_use]
 pub fn install(storage_key: &'static str) -> UiPrefs {
     let stored = load(storage_key);

@@ -11,6 +11,14 @@
 //! - [`runtime`] — wasm-only DOM + `localStorage` glue and the
 //!   [`runtime::install`] entry point that wires reactive signals to
 //!   the persisted state.
+//!
+//! [`ThemePreference`] is the stored System/Light/Dark choice; [`Theme`] is
+//! the binary resolved appearance consumed by CSS, charts, and Atmosphere.
+//! Runtime readers receive a read-only signal and controls select preferences.
+//! Consumers that need the appearance before Wasm starts must also adopt
+//! `js/theme-bootstrap.js` as a same-origin, blocking classic Trunk asset
+//! before styles and Wasm, using the same storage namespace as installation.
+//! The bootstrap only reads storage; CSS owns `color-scheme`.
 
 pub mod prefs;
 

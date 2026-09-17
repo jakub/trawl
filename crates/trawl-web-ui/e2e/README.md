@@ -320,8 +320,17 @@ invocations, and killed all five (transcripts under
 in it and was run once.
 
 Issue #196 retargets 09 and 11 to theme radios and adds the independent command
-mutation 31. Those changes require fresh evidence; the issue-159 transcripts
-do not validate these new targets.
+mutation 31. The issue-159 transcripts do not validate these new targets.
+
+On production-source candidate `ce9dc49e6ecd78d45e3ebd4805f0930da49ade8d`, the
+root validator observed target failure and control success independently for
+08, 09, 10, 11, and 31. After restoring source and rebuilding the pristine SPA,
+the full ordinary Chromium suite passed **437 tests in 6.3 minutes**. These are
+local executed results, not CI results. The
+[durable evidence summary](../../../docs/evidence/issue-196/menu-mutation-validation.md)
+retains the observed mutation outcomes and full-baseline result. This validates
+the changed mutation targets without relying on the earlier focused theme/menu
+passes. Documentation added afterward does not alter production behavior.
 
 13 through 19 follow the same rule, with transcripts under
 `visual-evidence/issue-161/`. 14 and 17 are the timing-sensitive pair and
