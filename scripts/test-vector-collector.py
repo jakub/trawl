@@ -11,6 +11,7 @@ import http.server
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import socket
 import ssl
@@ -204,13 +205,22 @@ def run(tcp, suppress, tls="http"):
                     assert not received and not failures, (received, failures)
                     print("PASS untrusted HTTPS: certificate verification refused the server; zero events")
                     return
+                # Vector's startup message can precede the source tasks' binds.
+                # Wait for every syslog listener before sending any fixture;
+                # a UDP send to an unbound port succeeds but loses the event.
+                listeners = [
+                    re.compile(rf'component_id={re.escape(name)} .*Listening\. '
+                               rf'addr={re.escape(source["address"])}(?:\s|$)')
+                    for name, source in config["sources"].items()
+                    if source["type"] == "syslog"
+                ]
                 deadline = time.monotonic() + 20
                 while True:
                     log.seek(0)
                     output = log.read()
-                    if "Vector has started" in output:
-                        break
                     assert process.poll() is None, output
+                    if "Vector has started" in output and all(p.search(output) for p in listeners):
+                        break
                     assert time.monotonic() < deadline, output
                     time.sleep(0.05)
                 process.stdin.write("".join(json.dumps(e) + "\n" for e in events))
