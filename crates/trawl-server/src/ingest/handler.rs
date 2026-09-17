@@ -711,6 +711,74 @@ mod tests {
         );
     }
 
+    #[test]
+    fn http_wal_failure_rejects_only_failed_group_and_preserves_successes() {
+        use crate::metrics::test_support::sample;
+        let recorder = crate::metrics::prometheus_builder().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            crate::metrics::init_operational_alert_metrics();
+            let tmp = tempfile::tempdir().unwrap();
+            let writer = crate::ingest::wal::WalWriter::new(tmp.path().join("wal"));
+            writer.ensure_dir().unwrap();
+            std::fs::write(writer.dir().join("blocked"), b"keep").unwrap();
+            let mut parsed = ParsedEvents::new();
+            for (env, service, count) in [
+                ("prod", "before", 1),
+                ("blocked", "failed", 3),
+                ("prod", "after", 2),
+            ] {
+                let mut batch = ServiceBatch::default();
+                for id in 0..count {
+                    batch.push(
+                        serde_json::json!({"env":env,"service":service,"id":id})
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    );
+                }
+                parsed
+                    .batches
+                    .insert((env.to_owned(), service.to_owned()), batch);
+            }
+            let written = write_wal_batches(&writer, &mut parsed);
+            assert_eq!(parsed.reject_counts.get(RejectReason::WalFailure), 3);
+            assert_eq!(parsed.errors.len(), 1);
+            assert_eq!(parsed.batches.len(), 2);
+            assert!(
+                !parsed
+                    .batches
+                    .contains_key(&("blocked".to_owned(), "failed".to_owned()))
+            );
+            // finalize_ingest emits this same per-reason accounting once.
+            parsed.reject_counts.emit_metrics();
+            assert_eq!(
+                sample(
+                    &handle,
+                    "trawl_ingest_events_rejected_total{reason=\"wal_failure\"}"
+                ),
+                3
+            );
+            assert_eq!(
+                sample(&handle, crate::metrics::SYSLOG_WAL_EVENTS_DISCARDED_TOTAL),
+                0
+            );
+            assert_eq!(written.len(), 2);
+            for ((env, service), path) in written {
+                assert_eq!(env, "prod");
+                let output = std::fs::read_to_string(path).unwrap();
+                assert_eq!(
+                    output.lines().count(),
+                    if service == "before" { 1 } else { 2 }
+                );
+            }
+            assert_eq!(
+                std::fs::read(writer.dir().join("blocked")).unwrap(),
+                b"keep"
+            );
+        });
+    }
+
     // --- batch-level errors ---
 
     #[test]

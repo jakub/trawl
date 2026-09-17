@@ -95,6 +95,148 @@ pub const TELEMETRY_BYTES_DROPPED_TOTAL: &str = "trawl_telemetry_bytes_dropped_t
 pub const TELEMETRY_BUFFER_EVENTS: &str = "trawl_telemetry_buffer_events";
 pub const TELEMETRY_BUFFER_BYTES: &str = "trawl_telemetry_buffer_bytes";
 
+// -- operational alert measurements -----------------------------------------
+
+pub const SYSLOG_WAL_EVENTS_DISCARDED_TOTAL: &str = "trawl_syslog_wal_events_discarded_total";
+pub const SYSLOG_WRITE_TASKS_FAILED_TOTAL: &str = "trawl_syslog_write_tasks_failed_total";
+pub const WAL_DURABILITY_FAILURES_TOTAL: &str = "trawl_wal_durability_failures_total";
+pub const COMPACTION_OPERATION_FAILURES_TOTAL: &str = "trawl_compaction_operation_failures_total";
+pub const FILES_QUARANTINED_TOTAL: &str = "trawl_files_quarantined_total";
+
+/// Failed durability operations on an already-published WAL file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalDurabilityOperation {
+    ParentDirectorySync,
+}
+
+impl WalDurabilityOperation {
+    pub const ALL: [Self; 1] = [Self::ParentDirectorySync];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::ParentDirectorySync => "parent_directory_sync",
+        }
+    }
+}
+
+/// Independent failed attempts, never the mixed dashboard error tally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionOperation {
+    WalRootScan,
+    WalEnvironmentScan,
+    Chunk,
+    DailyRollupScan,
+    DailyRollupUnit,
+    PendingRollupScan,
+    PendingRollupRecovery,
+    ConsumedWalRemoval,
+}
+
+impl CompactionOperation {
+    pub const ALL: [Self; 8] = [
+        Self::WalRootScan,
+        Self::WalEnvironmentScan,
+        Self::Chunk,
+        Self::DailyRollupScan,
+        Self::DailyRollupUnit,
+        Self::PendingRollupScan,
+        Self::PendingRollupRecovery,
+        Self::ConsumedWalRemoval,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::WalRootScan => "wal_root_scan",
+            Self::WalEnvironmentScan => "wal_environment_scan",
+            Self::Chunk => "chunk",
+            Self::DailyRollupScan => "daily_rollup_scan",
+            Self::DailyRollupUnit => "daily_rollup_unit",
+            Self::PendingRollupScan => "pending_rollup_scan",
+            Self::PendingRollupRecovery => "pending_rollup_recovery",
+            Self::ConsumedWalRemoval => "consumed_wal_removal",
+        }
+    }
+}
+
+/// Successfully isolated files; this is not an event-loss count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuarantineKind {
+    Wal,
+    Parquet,
+    RollupTemporary,
+}
+
+impl QuarantineKind {
+    pub const ALL: [Self; 3] = [Self::Wal, Self::Parquet, Self::RollupTemporary];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Wal => "wal",
+            Self::Parquet => "parquet",
+            Self::RollupTemporary => "rollup_temporary",
+        }
+    }
+}
+
+/// Existing telemetry reasons. A consumed crashed batch may be durable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TelemetryDropReason {
+    PreinitCap,
+    BufferCap,
+    WriteCrashed,
+}
+
+impl TelemetryDropReason {
+    pub const ALL: [Self; 3] = [Self::PreinitCap, Self::BufferCap, Self::WriteCrashed];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::PreinitCap => "preinit_cap",
+            Self::BufferCap => "buffer_cap",
+            Self::WriteCrashed => "write_crashed",
+        }
+    }
+}
+
+/// Production and recorder tests share this configuration. Counter baselines
+/// must survive idle upkeep: do not enable exporter expiry for these counters.
+/// The exporter currently defaults to no expiry; keep that default here.
+pub fn prometheus_builder() -> metrics_exporter_prometheus::PrometheusBuilder {
+    metrics_exporter_prometheus::PrometheusBuilder::new()
+}
+
+/// Publish every series selected by the starter alerts, regardless of which
+/// producers are enabled. Call after recorder installation, before serving.
+/// Repeated calls only register/increment by zero; they never reset counters.
+/// This cannot reconstruct increments made before recorder installation.
+pub fn init_operational_alert_metrics() {
+    for name in [
+        SYSLOG_EVENTS_DROPPED_TOTAL,
+        SYSLOG_WAL_EVENTS_DISCARDED_TOTAL,
+        SYSLOG_WRITE_TASKS_FAILED_TOTAL,
+        TELEMETRY_WAL_WRITE_FAILURES_TOTAL,
+    ] {
+        metrics::counter!(name).increment(0);
+    }
+    for reason in TelemetryDropReason::ALL {
+        metrics::counter!(TELEMETRY_EVENTS_DROPPED_TOTAL, "reason" => reason.label()).increment(0);
+    }
+    metrics::counter!(INGEST_EVENTS_REJECTED_TOTAL,
+        "reason" => crate::ingest::envelope::RejectReason::WalFailure.as_str())
+    .increment(0);
+    for operation in WalDurabilityOperation::ALL {
+        metrics::counter!(WAL_DURABILITY_FAILURES_TOTAL, "operation" => operation.label())
+            .increment(0);
+    }
+    for operation in CompactionOperation::ALL {
+        metrics::counter!(COMPACTION_OPERATION_FAILURES_TOTAL, "operation" => operation.label())
+            .increment(0);
+    }
+    for kind in QuarantineKind::ALL {
+        metrics::counter!(FILES_QUARANTINED_TOTAL, "kind" => kind.label()).increment(0);
+    }
+}
+
 // -- bookkeeping write identity ----------------------------------------------
 
 /// The two catalog bookkeeping writes one compacted batch makes, in the
@@ -189,7 +331,27 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         SYSLOG_EVENTS_DROPPED_TOTAL,
-        "Syslog events dropped due to backpressure"
+        "Syslog events abandoned because the batch queue was full or closed; TCP and UDP combined"
+    );
+    describe_counter!(
+        SYSLOG_WAL_EVENTS_DISCARDED_TOTAL,
+        "Syslog events abandoned from normal ingestion after their group WAL write failed; temporary bytes or sender copies may remain"
+    );
+    describe_counter!(
+        SYSLOG_WRITE_TASKS_FAILED_TOTAL,
+        "Failed syslog flush tasks with uncertain write outcome; earlier groups or the current group may already be durable"
+    );
+    describe_counter!(
+        WAL_DURABILITY_FAILURES_TOTAL,
+        "Failed WAL durability operations after file publication, labelled by operation; the directory entry may not survive a crash, not an event discard"
+    );
+    describe_counter!(
+        COMPACTION_OPERATION_FAILURES_TOTAL,
+        "Failed compaction operation attempts, labelled by operation; excludes successful quarantines, idle work and intentional suppression"
+    );
+    describe_counter!(
+        FILES_QUARANTINED_TOTAL,
+        "Files successfully renamed out of normal processing with bytes retained, labelled by kind; temporary rollup sources may remain intact, not an event-loss count"
     );
     describe_gauge!(
         SYSLOG_TCP_CONNECTIONS,
@@ -331,7 +493,8 @@ pub fn describe_metrics() {
         TELEMETRY_WAL_WRITE_FAILURES_TOTAL,
         "Self-telemetry WAL write failures; an ordinary failed batch is \
          retained for retry, while a panicked or cancelled write task also \
-         records its consumed batch under dropped reason write_crashed"
+         records its consumed batch under dropped reason write_crashed; \
+         that batch may already be durable, so both signals can describe one crash"
     );
     describe_counter!(
         TELEMETRY_EVENTS_DROPPED_TOTAL,
@@ -339,7 +502,8 @@ pub fn describe_metrics() {
          bootstrap buffer overflow before the WAL writer was injected, \
          buffer_cap = the shared active+queue+in-flight memory budget was \
          full during a prolonged WAL outage, write_crashed = a panicked or \
-         cancelled blocking write consumed the batch)"
+         cancelled blocking write consumed the batch, possibly after durable \
+         publication; this reason does not prove permanent event loss)"
     );
     describe_counter!(
         TELEMETRY_BYTES_DROPPED_TOTAL,
@@ -718,8 +882,82 @@ pub fn cached_parquet_stats() -> (u64, u64) {
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    /// Missing series are a failure, never an implicit zero.
+    pub fn sample(handle: &metrics_exporter_prometheus::PrometheusHandle, series: &str) -> u64 {
+        let rendered = handle.render();
+        rendered
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.rsplit_once(' ')?;
+                (name == series).then(|| value.parse().expect("integer counter sample"))
+            })
+            .unwrap_or_else(|| panic!("missing series {series} in {rendered}"))
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn operational_alert_baselines_survive_idle_upkeep_and_reinitialization() {
+        let recorder = prometheus_builder().build_recorder();
+        let handle = recorder.handle();
+        // No ingest state, listeners or telemetry writer is constructed.
+        // These series must exist even when every producer is disabled.
+        metrics::with_local_recorder(&recorder, || {
+            describe_metrics();
+            init_operational_alert_metrics();
+            let selected = [
+                "trawl_syslog_events_dropped_total",
+                "trawl_syslog_wal_events_discarded_total",
+                "trawl_syslog_write_tasks_failed_total",
+                "trawl_telemetry_wal_write_failures_total",
+                "trawl_telemetry_events_dropped_total{reason=\"preinit_cap\"}",
+                "trawl_telemetry_events_dropped_total{reason=\"buffer_cap\"}",
+                "trawl_telemetry_events_dropped_total{reason=\"write_crashed\"}",
+                "trawl_ingest_events_rejected_total{reason=\"wal_failure\"}",
+                "trawl_wal_durability_failures_total{operation=\"parent_directory_sync\"}",
+                "trawl_compaction_operation_failures_total{operation=\"wal_root_scan\"}",
+                "trawl_compaction_operation_failures_total{operation=\"wal_environment_scan\"}",
+                "trawl_compaction_operation_failures_total{operation=\"chunk\"}",
+                "trawl_compaction_operation_failures_total{operation=\"daily_rollup_scan\"}",
+                "trawl_compaction_operation_failures_total{operation=\"daily_rollup_unit\"}",
+                "trawl_compaction_operation_failures_total{operation=\"pending_rollup_scan\"}",
+                "trawl_compaction_operation_failures_total{operation=\"pending_rollup_recovery\"}",
+                "trawl_compaction_operation_failures_total{operation=\"consumed_wal_removal\"}",
+                "trawl_files_quarantined_total{kind=\"wal\"}",
+                "trawl_files_quarantined_total{kind=\"parquet\"}",
+                "trawl_files_quarantined_total{kind=\"rollup_temporary\"}",
+            ];
+            for series in selected {
+                assert_eq!(test_support::sample(&handle, series), 0);
+            }
+            // Exercise idle upkeep with today's production configuration,
+            // which has no exporter expiry. This short wait does not prove
+            // survival past an arbitrary timeout added in a future change.
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            handle.run_upkeep();
+            for series in selected {
+                assert_eq!(test_support::sample(&handle, series), 0);
+            }
+            metrics::counter!(SYSLOG_WAL_EVENTS_DISCARDED_TOTAL).increment(3);
+            metrics::counter!(TELEMETRY_EVENTS_DROPPED_TOTAL,
+                "reason" => TelemetryDropReason::WriteCrashed.label())
+            .increment(2);
+            init_operational_alert_metrics();
+            handle.run_upkeep();
+            for series in selected {
+                let expected = match series {
+                    "trawl_syslog_wal_events_discarded_total" => 3,
+                    "trawl_telemetry_events_dropped_total{reason=\"write_crashed\"}" => 2,
+                    _ => 0,
+                };
+                assert_eq!(test_support::sample(&handle, series), expected);
+            }
+        });
+    }
 
     #[test]
     fn describe_metrics_does_not_panic() {

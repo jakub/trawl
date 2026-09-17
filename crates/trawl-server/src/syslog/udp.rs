@@ -95,11 +95,7 @@ pub async fn run_udp_listener(
                 };
 
                 // Non-blocking send — drop if batcher is overwhelmed
-                if sender.try_send(event).is_err() {
-                    metrics::counter!(crate::metrics::SYSLOG_EVENTS_DROPPED_TOTAL).increment(1);
-                    if let Some(ref s) = stats {
-                        s.dropped.fetch_add(1, Ordering::Relaxed);
-                    }
+                if !super::batch::try_enqueue(&sender, event, stats.as_ref()) {
                     tracing::debug!(
                         event_type = "syslog_event_dropped",
                         source = %source_ip,

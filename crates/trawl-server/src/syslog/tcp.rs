@@ -184,11 +184,9 @@ async fn handle_tcp_connection(
         if let Some(event) =
             door.admit(&line, source_ip, source_service_map, default_service, "tcp")
         {
-            if sender.try_send(event).is_err() {
-                metrics::counter!(crate::metrics::SYSLOG_EVENTS_DROPPED_TOTAL).increment(1);
-                if let Some(s) = stats {
-                    s.dropped.fetch_add(1, Ordering::Relaxed);
-                }
+            if super::batch::try_enqueue(&sender, event, stats) {
+                consecutive_send_failures = 0;
+            } else {
                 consecutive_send_failures += 1;
                 if consecutive_send_failures >= send_failure_limit {
                     tracing::warn!(
@@ -199,8 +197,6 @@ async fn handle_tcp_connection(
                     );
                     break;
                 }
-            } else {
-                consecutive_send_failures = 0;
             }
         }
 

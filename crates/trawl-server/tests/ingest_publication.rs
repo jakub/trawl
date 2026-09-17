@@ -140,6 +140,124 @@ async fn cancelled_http_handler_keeps_wal_and_hot_insert_together() {
     assert_cancelled_caller_finishes_insert(task, &hot, wal.dir(), entered, release).await;
 }
 
+fn counter(handle: &metrics_exporter_prometheus::PrometheusHandle, series: &str) -> u64 {
+    let rendered = handle.render();
+    rendered
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.rsplit_once(' ')?;
+            (name == series).then(|| value.parse().expect("integer counter sample"))
+        })
+        .unwrap_or_else(|| panic!("missing series {series} in {rendered}"))
+}
+
+/// Exercise the actual handler and its blocking finalization, rather than
+/// manually emitting parsed rejection counts. This is not a socket request.
+#[tokio::test]
+async fn http_handler_wal_failure_emits_rejections_and_publishes_only_successful_groups() {
+    let root = tempfile::tempdir().unwrap();
+    let data = root.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let server = common::setup_in_dir_with_data(
+        root.path(),
+        data.to_str().unwrap().to_owned(),
+        trawl_server::config::RateLimitConfig::default(),
+    )
+    .await;
+    let verified = fleet_auth::KeyStore::from_pool(server.fleet_pool.clone())
+        .verify_key(&server.ingest_token)
+        .await
+        .unwrap();
+    let mut state = server.state.clone();
+    // This handler invocation admits both environments. Only the blocked
+    // environment's WAL path fails; the shared fixture needs no new option.
+    state.ingest.envs = vec!["prod".to_owned(), "blocked".to_owned()].into();
+    let hot = state.query.hot_buffer.as_ref().unwrap().clone();
+    let wal = state.ingest.wal_writer.as_ref().unwrap().clone();
+    std::fs::write(wal.dir().join("blocked"), b"retain this obstruction").unwrap();
+    assert_eq!(hot.event_count(), 0);
+
+    let metrics = common::test_metrics_handle();
+    trawl_server::metrics::init_operational_alert_metrics();
+    let rejected_series = "trawl_ingest_events_rejected_total{reason=\"wal_failure\"}";
+    let rejected_before = counter(&metrics, rejected_series);
+    let discarded_before = counter(
+        &metrics,
+        trawl_server::metrics::SYSLOG_WAL_EVENTS_DISCARDED_TOTAL,
+    );
+    let response = trawl_server::ingest::handler::ingest(
+        axum::extract::State(state),
+        axum::Extension(verified),
+        axum::Extension("127.0.0.1:12345".parse().unwrap()),
+        axum::http::HeaderMap::new(),
+        axum::body::Bytes::from_static(
+            b"{\"env\":\"prod\",\"service\":\"before\",\"id\":1}\n\
+              {\"env\":\"blocked\",\"service\":\"failed\",\"id\":2}\n\
+              {\"env\":\"blocked\",\"service\":\"failed\",\"id\":3}\n\
+              {\"env\":\"blocked\",\"service\":\"failed\",\"id\":4}\n\
+              {\"env\":\"prod\",\"service\":\"after\",\"id\":5}\n\
+              {\"env\":\"prod\",\"service\":\"after\",\"id\":6}\n",
+        ),
+    )
+    .await
+    .unwrap()
+    .0;
+    assert_eq!(response.accepted, 3);
+    // Preserve the existing response contract: a failed WAL group adds one
+    // error entry, while its rejection metric records all three events.
+    assert_eq!(response.rejected, 1);
+    assert_eq!(response.errors.len(), 1);
+    assert!(response.errors[0].message.contains("failed"));
+    assert_eq!(counter(&metrics, rejected_series) - rejected_before, 3);
+    assert_eq!(
+        counter(
+            &metrics,
+            trawl_server::metrics::SYSLOG_WAL_EVENTS_DISCARDED_TOTAL
+        ) - discarded_before,
+        0
+    );
+
+    let mut durable = Vec::new();
+    let files: Vec<_> = std::fs::read_dir(wal.dir().join("prod"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(files.len(), 2);
+    for path in files {
+        assert_eq!(path.extension().unwrap(), "ndjson");
+        durable.extend(
+            std::fs::read_to_string(path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()),
+        );
+    }
+    let mut durable_ids: Vec<_> = durable
+        .iter()
+        .map(|event| event["id"].as_u64().unwrap())
+        .collect();
+    durable_ids.sort_unstable();
+    assert_eq!(durable_ids, [1, 5, 6]);
+    assert!(durable.iter().all(|event| event["env"] == "prod"));
+    assert_eq!(hot.event_count(), 3);
+    let snapshot = hot.snapshot().unwrap();
+    let mut hot_ids: Vec<_> = std::fs::read_to_string(snapshot.path())
+        .unwrap()
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line).unwrap()["id"]
+                .as_u64()
+                .unwrap()
+        })
+        .collect();
+    hot_ids.sort_unstable();
+    assert_eq!(hot_ids, durable_ids);
+    assert_eq!(
+        std::fs::read(wal.dir().join("blocked")).unwrap(),
+        b"retain this obstruction"
+    );
+}
+
 #[test]
 fn waiting_http_ingest_leaves_blocking_pool_available() {
     let runtime = tokio::runtime::Builder::new_current_thread()

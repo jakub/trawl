@@ -39,6 +39,23 @@ pub struct SyslogEvent {
 /// Sender half for submitting events to the batcher.
 pub type SyslogSender = mpsc::Sender<SyslogEvent>;
 
+/// The shared TCP/UDP queue boundary. Both full and closed queues abandon
+/// exactly this event; transport-specific logging stays with the listener.
+pub(super) fn try_enqueue(
+    sender: &SyslogSender,
+    event: SyslogEvent,
+    stats: Option<&Arc<SyslogStats>>,
+) -> bool {
+    if sender.try_send(event).is_ok() {
+        return true;
+    }
+    metrics::counter!(crate::metrics::SYSLOG_EVENTS_DROPPED_TOTAL).increment(1);
+    if let Some(stats) = stats {
+        stats.dropped.fetch_add(1, Ordering::Relaxed);
+    }
+    false
+}
+
 /// Accumulates syslog events and flushes to the ingest pipeline.
 #[derive(Debug)]
 pub struct SyslogBatcher {
@@ -164,6 +181,9 @@ impl SyslogBatcher {
         let written = tokio::task::spawn_blocking(move || pipeline.write(batches))
             .await
             .unwrap_or_else(|e| {
+                // The task may have published earlier groups or the current
+                // WAL. Count one uncertain task, never infer batch event loss.
+                metrics::counter!(crate::metrics::SYSLOG_WRITE_TASKS_FAILED_TOTAL).increment(1);
                 tracing::error!(
                     event_type = "syslog_flush_panic",
                     error = %e,
@@ -207,6 +227,105 @@ mod tests {
     use crate::config::SyslogConfig;
     use crate::ingest::wal::WalWriter;
     use serde_json::json;
+
+    #[test]
+    fn queue_full_and_closed_count_each_abandoned_event_once() {
+        use crate::metrics::test_support::sample;
+        let recorder = crate::metrics::prometheus_builder().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            crate::metrics::init_operational_alert_metrics();
+            let stats = Arc::new(SyslogStats::default());
+            let (sender, mut receiver) = mpsc::channel(1);
+            assert!(try_enqueue(&sender, make_event("accepted"), Some(&stats)));
+            assert_eq!(
+                sample(&handle, crate::metrics::SYSLOG_EVENTS_DROPPED_TOTAL),
+                0
+            );
+            for transport in ["tcp", "udp"] {
+                let mut event = make_event("full");
+                event.transport = transport;
+                assert!(!try_enqueue(&sender, event, Some(&stats)));
+            }
+            assert_eq!(
+                sample(&handle, crate::metrics::SYSLOG_EVENTS_DROPPED_TOTAL),
+                2
+            );
+            assert_eq!(receiver.try_recv().unwrap().service, "accepted");
+            assert!(receiver.try_recv().is_err());
+            drop(receiver);
+            for transport in ["tcp", "udp"] {
+                let mut event = make_event("closed");
+                event.transport = transport;
+                assert!(!try_enqueue(&sender, event, Some(&stats)));
+            }
+            assert_eq!(
+                sample(&handle, crate::metrics::SYSLOG_EVENTS_DROPPED_TOTAL),
+                4
+            );
+            assert_eq!(stats.dropped.load(Ordering::Relaxed), 4);
+            assert_eq!(
+                sample(&handle, crate::metrics::SYSLOG_WAL_EVENTS_DISCARDED_TOTAL),
+                0
+            );
+        });
+    }
+
+    #[test]
+    fn flush_task_failure_after_durable_groups_does_not_claim_event_loss() {
+        use crate::metrics::test_support::sample;
+        let recorder = crate::metrics::prometheus_builder().build_recorder();
+        let handle = recorder.handle();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // This local recorder observes the parent JoinError accounting after
+        // the await. Its zero discard assertion excludes invented parent-side
+        // loss accounting, not counters on the blocking child thread. The
+        // synchronous failed-group test covers that child's write boundary.
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                crate::metrics::init_operational_alert_metrics();
+                let (batcher, tmp) = test_batcher(1000, 100);
+                batcher.pipeline.wal_writer().panic_after_writes_for_test(2);
+                let mut pending = IndexMap::new();
+                for service in ["first", "second", "never_started"] {
+                    let event = make_event(service);
+                    let mut batch = ServiceBatch::default();
+                    batch.push(event.map);
+                    pending.insert((event.env, event.service), batch);
+                }
+                let mut count = 3;
+                batcher.flush(&mut pending, &mut count, 3, 0).await;
+                assert!(pending.is_empty());
+                assert_eq!(count, 0);
+                assert_eq!(
+                    sample(&handle, crate::metrics::SYSLOG_WRITE_TASKS_FAILED_TOTAL),
+                    1
+                );
+                assert_eq!(
+                    sample(&handle, crate::metrics::SYSLOG_WAL_EVENTS_DISCARDED_TOTAL),
+                    0
+                );
+                let mut services = Vec::new();
+                for entry in std::fs::read_dir(tmp.path().join("prod")).unwrap() {
+                    let path = entry.unwrap().path();
+                    assert_eq!(path.extension().unwrap(), "ndjson");
+                    let event: serde_json::Value =
+                        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+                    services.push(event["service"].as_str().unwrap().to_owned());
+                }
+                services.sort();
+                assert_eq!(services, ["first", "second"]);
+                batcher.flush(&mut pending, &mut count, 0, 0).await;
+                assert_eq!(
+                    sample(&handle, crate::metrics::SYSLOG_WRITE_TASKS_FAILED_TOTAL),
+                    1
+                );
+            });
+        });
+    }
 
     /// Create a batcher with a real WAL writer pointing at a temp dir.
     fn test_batcher(
