@@ -48,7 +48,7 @@ filter = '''
     & (test(/^from_saved::/) | test(/^scheduler::/)
       | test(/^store::catalog::pg_tests::/)))
   | (package(trawl-server) & (binary(auth_pg) | binary(catalog_surface)
-    | binary(connection_budget) | binary(dsl_admission) | binary(field_catalog)
+    | binary(connection_budget) | binary(dashboard_storage) | binary(dsl_admission) | binary(field_catalog)
     | binary(gc_pins) | binary(hot_query) | binary(http_api)
     | binary(ingest_publication) | binary(repin) | binary(store_pg) | binary(schema_pg) | binary(startup_pg)
     | binary(scheduler_windows) | binary(timestamp_repair)))
