@@ -177,6 +177,8 @@ fn install_system_theme() -> RwSignal<bool> {
         .add_event_listener_with_callback("change", callback.as_ref().unchecked_ref())
         .is_err()
     {
+        // The current query is usable even when live notifications are not.
+        dark.set(query.matches());
         return dark;
     }
     dark.set(query.matches());

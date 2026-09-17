@@ -8,7 +8,7 @@ export interface ProbeOptions {
   key?: string;
   raw?: string | null;
   storage?: 'normal' | 'blocked' | 'read-fails' | 'quota';
-  media?: 'normal' | 'unavailable' | 'throws';
+  media?: 'normal' | 'unavailable' | 'throws' | 'listener-fails';
   changeDuringRegistration?: boolean;
 }
 
@@ -64,6 +64,7 @@ export async function installThemeProbe(page: Page, options: ProbeOptions = {}):
       const wrapped = new Map<EventListenerOrEventListenerObject, EventListener>();
       media.addEventListener = ((type: string, callback: EventListenerOrEventListenerObject, opts?: any) => {
         if (type !== 'change') return add(type, callback, opts);
+        if (options.media === 'listener-fails') throw new Error('media listener unavailable');
         state.registrations++;
         state.active.add(callback);
         const listener: EventListener = event => {

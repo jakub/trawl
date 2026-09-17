@@ -165,6 +165,24 @@ for (const media of ['unavailable', 'throws'] as const) {
   });
 }
 
+test('failed media listener retains the current OS sample and fixed choices remain usable', async ({ page }) => {
+  const errors: Error[] = [];
+  page.on('pageerror', error => errors.push(error));
+  await page.emulateMedia({ colorScheme: 'dark' });
+  await installThemeProbe(page, { raw: null, media: 'listener-fails' });
+  await page.goto('/search');
+  await expect(page.locator(SEL.topbarUser)).toBeEnabled();
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark');
+  expect(await themeProbe(page)).toMatchObject({ registrations: 0, active: 0, writes: [] });
+  await page.emulateMedia({ colorScheme: 'light' });
+  await settleTheme(page);
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark');
+  expect((await themeProbe(page)).writes).toEqual([]);
+  await selectTheme(page, 'Light');
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'light');
+  expect(errors).toEqual([]);
+});
+
 test('runtime samples after registering its listener and preserves malformed storage', async ({ page }) => {
   await installThemeProbe(page, { raw: '{broken', changeDuringRegistration: true });
   await page.goto('/search');
