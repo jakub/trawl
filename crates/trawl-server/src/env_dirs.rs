@@ -21,16 +21,46 @@ use std::path::{Path, PathBuf};
 ///
 /// Sorted by name for deterministic ordering (glob order, compaction order).
 pub(crate) fn try_list_env_dirs(root: &Path) -> std::io::Result<Vec<(String, PathBuf)>> {
+    try_list_env_dirs_observed(root, || {})
+}
+
+/// Preserve the listing policy while observing otherwise skipped errors.
+///
+/// The callback observes non-`NotFound` entry and metadata errors only.
+/// Fatal root-listing errors are returned, without calling the observer.
+/// Callers can combine these observations into one failed scan attempt.
+pub(crate) fn try_list_env_dirs_observed(
+    root: &Path,
+    mut on_skipped_error: impl FnMut(),
+) -> std::io::Result<Vec<(String, PathBuf)>> {
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e),
     };
     let mut dirs: Vec<(String, PathBuf)> = entries
-        .flatten()
-        .filter_map(|e| {
-            let path = e.path();
-            if !path.is_dir() {
+        .filter_map(|entry| {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        on_skipped_error();
+                    }
+                    return None;
+                }
+            };
+            let path = entry.path();
+            // Path::metadata follows symlinks, as the previous is_dir did.
+            let metadata = match path.metadata() {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        on_skipped_error();
+                    }
+                    return None;
+                }
+            };
+            if !metadata.is_dir() {
                 return None;
             }
             let name = path.file_name()?.to_str()?.to_owned();
@@ -92,12 +122,72 @@ mod tests {
         assert_eq!(dirs.len(), 2);
         assert_eq!(dirs[0].1, tmp.path().join("lab"));
         assert_eq!(dirs[1].1, tmp.path().join("prod"));
+
+        let mut skipped_errors = 0;
+        let observed = try_list_env_dirs_observed(tmp.path(), || skipped_errors += 1).unwrap();
+        assert_eq!(observed, dirs);
+        assert_eq!(skipped_errors, 0);
     }
 
     #[test]
     fn missing_root_is_empty() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(list_env_dirs(&tmp.path().join("nope")).is_empty());
+    }
+
+    #[test]
+    fn observed_listing_does_not_callback_for_missing_or_fatal_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let mut skipped_errors = 0;
+        assert!(
+            try_list_env_dirs_observed(&root, || skipped_errors += 1)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(skipped_errors, 0);
+        std::fs::write(&root, b"not a directory").unwrap();
+        assert!(try_list_env_dirs_observed(&root, || skipped_errors += 1).is_err());
+        assert_eq!(
+            skipped_errors, 0,
+            "the returned root error has its own owner"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn observed_listing_follows_symlinks_and_ignores_confirmed_not_found() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let target = tmp.path().join("target");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        symlink(&target, root.join("prod")).unwrap();
+        let missing = tmp.path().join("missing");
+        symlink(&missing, root.join("gone")).unwrap();
+        assert_eq!(
+            root.join("gone").metadata().unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        let expected = vec![("prod".to_owned(), root.join("prod"))];
+        let mut skipped_errors = 0;
+        let observed = try_list_env_dirs_observed(&root, || skipped_errors += 1).unwrap();
+        assert_eq!(observed, expected);
+        assert_eq!(skipped_errors, 0);
+
+        // A symlink loop supplies a deterministic non-NotFound metadata
+        // error without permissions, while preserving the skipped entry.
+        symlink("cycle", root.join("cycle")).unwrap();
+        assert_ne!(
+            root.join("cycle").metadata().unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        let observed = try_list_env_dirs_observed(&root, || skipped_errors += 1).unwrap();
+        assert_eq!(observed, expected);
+        assert_eq!(skipped_errors, 1);
+        assert_eq!(try_list_env_dirs(&root).unwrap(), expected);
     }
 
     /// The fallible listing separates "nothing written yet" from "cannot

@@ -88,6 +88,8 @@ impl PipelineWriter {
     ///
     /// Returns the number of events successfully written. Events from
     /// groups that fail WAL writing are dropped (logged, not published).
+    /// Syslog is the production caller of this method. HTTP writes groups
+    /// separately so it can reject them; telemetry retains failed batches.
     ///
     /// The env comes from the key, never from a writer-held default: a
     /// batcher that grouped by service alone would file every env it
@@ -110,6 +112,8 @@ impl PipelineWriter {
                     self.publish(&env, &svc, batch, &wal_path);
                 }
                 Err(e) => {
+                    metrics::counter!(crate::metrics::SYSLOG_WAL_EVENTS_DISCARDED_TOTAL)
+                        .increment(event_count as u64);
                     tracing::warn!(
                         event_type = "pipeline_wal_write_failed",
                         batch_env = %env,
@@ -182,5 +186,93 @@ impl PipelineWriter {
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         *self.pause_before_insert.lock() = Some((entered_tx, release_rx));
         (entered_rx, release_tx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::metrics::test_support::sample;
+
+    #[test]
+    fn failed_wal_group_discards_only_its_events_between_durable_groups() {
+        let recorder = crate::metrics::prometheus_builder().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            crate::metrics::init_operational_alert_metrics();
+            let tmp = tempfile::tempdir().unwrap();
+            let wal = Arc::new(WalWriter::new(tmp.path().join("wal")));
+            wal.ensure_dir().unwrap();
+            // A regular file in place of this env directory deterministically
+            // fails only the middle group, including when tests run as root.
+            std::fs::write(wal.dir().join("blocked"), b"keep me").unwrap();
+            let hot = Arc::new(HotBuffer::new(crate::hot_buffer::HotBufferConfig {
+                max_events: 100,
+                max_bytes: 1024 * 1024,
+            }));
+            let pipeline = PipelineWriter::new(Arc::clone(&wal), Some(Arc::clone(&hot)), None);
+            let mut batches = IndexMap::new();
+            for (env, service, count) in [
+                ("prod", "before", 1),
+                ("blocked", "failed", 3),
+                ("prod", "after", 2),
+            ] {
+                let mut batch = ServiceBatch::default();
+                for id in 0..count {
+                    batch.push(
+                        serde_json::json!({"env":env, "service":service, "id":id})
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    );
+                }
+                batches.insert((env.to_owned(), service.to_owned()), batch);
+            }
+            assert_eq!(pipeline.write(batches), 3);
+            assert_eq!(
+                sample(&handle, crate::metrics::SYSLOG_WAL_EVENTS_DISCARDED_TOTAL),
+                3
+            );
+            assert_eq!(
+                sample(&handle, crate::metrics::SYSLOG_WRITE_TASKS_FAILED_TOTAL),
+                0
+            );
+            assert_eq!(hot.event_count(), 3);
+            let mut events = Vec::new();
+            for entry in std::fs::read_dir(wal.dir().join("prod")).unwrap() {
+                let path = entry.unwrap().path();
+                assert_eq!(path.extension().unwrap(), "ndjson");
+                events.extend(
+                    std::fs::read_to_string(path)
+                        .unwrap()
+                        .lines()
+                        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()),
+                );
+            }
+            assert_eq!(events.len(), 3);
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event["service"] == "before")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event["service"] == "after")
+                    .count(),
+                2
+            );
+            assert_eq!(
+                std::fs::read(wal.dir().join("blocked")).unwrap(),
+                b"keep me"
+            );
+            assert_eq!(pipeline.write(IndexMap::new()), 0);
+            assert_eq!(
+                sample(&handle, crate::metrics::SYSLOG_WAL_EVENTS_DISCARDED_TOTAL),
+                3
+            );
+        });
     }
 }

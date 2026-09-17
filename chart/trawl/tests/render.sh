@@ -268,5 +268,6 @@ fi
 python3 "$chart/tests/image.py"
 python3 "$chart/tests/notes.py"
 python3 "$chart/tests/tls.py"
+python3 "$chart/tests/operational-alerts.py"
 
 echo "helm render assertions passed"

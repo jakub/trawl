@@ -1,0 +1,242 @@
+[
+  {
+    "name": "idle",
+    "values": "0+0x30",
+    "checks": [
+      [
+        "0m",
+        false
+      ],
+      [
+        "1m",
+        false
+      ],
+      [
+        "15m",
+        false
+      ]
+    ]
+  },
+  {
+    "name": "single increment and expiry",
+    "values": "0 1+0x30",
+    "checks": [
+      [
+        "0m",
+        false
+      ],
+      [
+        "30s",
+        true
+      ],
+      [
+        "9m",
+        true
+      ],
+      [
+        "10m",
+        false
+      ],
+      [
+        "15m",
+        false
+      ]
+    ]
+  },
+  {
+    "name": "repeated increments",
+    "values": "0+1x30",
+    "checks": [
+      [
+        "30s",
+        true
+      ],
+      [
+        "10m",
+        true
+      ],
+      [
+        "15m",
+        true
+      ]
+    ]
+  },
+  {
+    "name": "reset only",
+    "values": "5 0+0x30",
+    "checks": [
+      [
+        "30s",
+        false
+      ],
+      [
+        "5m",
+        false
+      ],
+      [
+        "15m",
+        false
+      ]
+    ]
+  },
+  {
+    "name": "reset then failure",
+    "values": "5 0 1+0x28",
+    "checks": [
+      [
+        "30s",
+        false
+      ],
+      [
+        "1m",
+        true
+      ],
+      [
+        "10m",
+        true
+      ],
+      [
+        "11m",
+        false
+      ]
+    ]
+  },
+  {
+    "name": "failure then reset",
+    "values": "0 1 0+0x28",
+    "checks": [
+      [
+        "1m",
+        true
+      ],
+      [
+        "9m",
+        true
+      ],
+      [
+        "10m",
+        false
+      ]
+    ]
+  },
+  {
+    "name": "stale after observed failure",
+    "values": "0 1 stale",
+    "checks": [
+      [
+        "2m",
+        true
+      ],
+      [
+        "9m",
+        true
+      ],
+      [
+        "10m",
+        false
+      ]
+    ]
+  },
+  {
+    "name": "missing after observed failure",
+    "values": "0 1 _x28",
+    "checks": [
+      [
+        "6m",
+        true
+      ],
+      [
+        "9m",
+        true
+      ],
+      [
+        "10m",
+        false
+      ]
+    ]
+  },
+  {
+    "name": "first nonzero baseline",
+    "values": "5+0x30",
+    "checks": [
+      [
+        "0m",
+        false
+      ],
+      [
+        "1m",
+        false
+      ],
+      [
+        "15m",
+        false
+      ]
+    ]
+  },
+  {
+    "name": "single sample",
+    "values": "5",
+    "checks": [
+      [
+        "0m",
+        false
+      ],
+      [
+        "1m",
+        false
+      ],
+      [
+        "10m",
+        false
+      ]
+    ]
+  },
+  {
+    "name": "entirely unseen",
+    "values": "_x30",
+    "checks": [
+      [
+        "0m",
+        false
+      ],
+      [
+        "5m",
+        false
+      ],
+      [
+        "15m",
+        false
+      ]
+    ]
+  },
+  {
+    "name": "counter plateau after producer stop",
+    "values": "7 9+0x40",
+    "checks": [
+      [
+        "0m",
+        false
+      ],
+      [
+        "30s",
+        true
+      ],
+      [
+        "1m",
+        true
+      ],
+      [
+        "9m",
+        true
+      ],
+      [
+        "10m",
+        false
+      ],
+      [
+        "20m",
+        false
+      ]
+    ]
+  }
+]

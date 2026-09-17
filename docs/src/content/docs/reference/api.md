@@ -408,10 +408,17 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -H "Content-Type: applicatio
 | Field | Type | Description |
 |-------|------|-------------|
 | `accepted` | integer | Events written to the WAL |
-| `rejected` | integer | Events refused by per-event validation. Omitted when `0`. |
-| `errors` | array | One entry per rejected event: `index` is the zero-based array position or line number, counting blank lines. Omitted when empty. |
+| `rejected` | integer | Number of error entries: one per validation rejection or failed WAL group. Omitted when `0`. |
+| `errors` | array | Validation entries identify the rejected event: `index` is the zero-based array position or line number, counting blank lines. A WAL failure contributes one group error. Omitted when empty. |
 
 A rejected event does not stop its siblings. Repairs do not change `accepted` or `rejected`. A body whose first non-blank byte is not `[` is read as newline-delimited JSON, so a single event object is accepted and a line that is not an event object counts as one rejected event with the response still 200. See [connect and verify a sender](/operate/ingestion/) for an end-to-end check.
+
+The `wal_failure` metric counts events in failed WAL groups, whereas the
+response records one error per failed group. A failed group of three events
+therefore adds three to `trawl_ingest_events_rejected_total{reason="wal_failure"}`
+and one to the response's `rejected` field. Successfully written sibling
+groups remain accepted. A persistence rejection does not establish permanent
+loss; the sender may retry.
 
 **Errors**
 
@@ -1765,3 +1772,79 @@ The `Content-Type` is `text/plain; version=0.0.4; charset=utf-8`.
 | Status | Code | When |
 |--------|------|------|
 | none | | The route always answers 200 |
+
+### Operational alert counters
+
+The [operational alert pack](/operate/operational-alerts/) uses the following
+counter selections. Units are distinct: events, task failures, operation
+attempts, and files must not be added into one loss total. New metric labels
+contain no environment, event-service name, path, error text, or request ID.
+Prometheus scrape-target labels are separate and remain on every alert.
+
+| Alert | Counter selection | Unit and observation owner |
+| --- | --- | --- |
+| `TrawlSyslogQueueDiscard` | `trawl_syslog_events_dropped_total` | Events abandoned by the shared TCP/UDP queue when full or closed; no metric labels |
+| `TrawlSyslogWalDiscard` | `trawl_syslog_wal_events_discarded_total` | Events in the failed syslog pipeline WAL group, counted once at group abandonment; no metric labels |
+| `TrawlTelemetryCapacityDiscard` | `trawl_telemetry_events_dropped_total{reason=~"preinit_cap\|buffer_cap"}` | Events abandoned at the pre-sink or active-buffer capacity boundary |
+| `TrawlSyslogWriteOutcomeUncertain` | `trawl_syslog_write_tasks_failed_total` | Failed syslog flush tasks, counted at the handled `JoinError`; no metric labels |
+| `TrawlTelemetryWriteOutcomeUncertain` | `trawl_telemetry_events_dropped_total{reason="write_crashed"}` | Events consumed from the in-memory telemetry batch when its write task fails; WAL bytes may already exist |
+| `TrawlHttpPersistenceRejection` | `trawl_ingest_events_rejected_total{reason="wal_failure"}` | Events in failed HTTP WAL groups, counted during final ingest accounting |
+| `TrawlTelemetryWalWriteFailure` | `trawl_telemetry_wal_write_failures_total` | Failed telemetry write attempts, including retained retries and crashed tasks; no metric labels |
+| `TrawlWalDurabilityDegraded` | `trawl_wal_durability_failures_total{operation="parent_directory_sync"}` | Failed parent-directory sync operations after WAL publication; counted by the WAL writer |
+| `TrawlCompactionOperationFailure` | `trawl_compaction_operation_failures_total{operation}` | Explicit failed attempts, using the eight closed operations below |
+| `TrawlFileQuarantine` | `trawl_files_quarantined_total{kind}` | Files successfully renamed into quarantine; `kind` is `wal`, `parquet`, or `rollup_temporary` |
+
+The telemetry drop counter's closed `reason` set is `preinit_cap`,
+`buffer_cap`, and `write_crashed`. The capacity and uncertain-outcome rules
+select disjoint reasons. A crashed telemetry write also increments the
+inclusive failed-attempt counter; both telemetry failure alerts can fire.
+The WAL durability counter has only `operation="parent_directory_sync"`.
+Existing HTTP rejection reasons other than `wal_failure` remain diagnostic.
+
+All 20 selected finite series are initialized at zero after recorder
+installation and before the first scrape, independently of feature enablement.
+Initialization preserves accumulated values. The exporter has no idle expiry
+for these baselines. Counters reset when the process restarts.
+
+These rules use a fixed ten-minute `increase` window with no `for` delay,
+aggregation, current-value guard, or ingest-enable gate. The window describes
+scraped observations, not an exact event-loss count. A first nonzero sample
+cannot recover a prior baseline; an unseen process lifetime is unobservable.
+Telemetry increments before recorder installation are not recorded at all.
+See the runbooks for [sampling and resolution limits](/operate/operational-alerts/#read-the-observation-window).
+
+### Compaction operation labels
+
+| `operation` | Failed attempt and counting boundary |
+| --- | --- |
+| `wal_root_scan` | Read or enumerate the WAL root; confirmed cold-start absence is excluded |
+| `wal_environment_scan` | Read or enumerate one WAL environment |
+| `chunk` | Compact one chunk, including a handled blocking-task failure; best-effort failure counts even when the cycle returns success |
+| `daily_rollup_scan` | Scan daily-rollup directories; confirmed `NotFound` at directory-scan boundaries is excluded |
+| `daily_rollup_unit` | Roll up one daily unit, including a handled task failure |
+| `pending_rollup_scan` | Initialize the publication gate by scanning pending markers; a latched failure is counted once, not again on each read refusal |
+| `pending_rollup_recovery` | Recover pending rollup markers; the coordinated recovery wrapper owns returned errors, and the caller owns a handled task failure |
+| `consumed_wal_removal` | Remove a consumed WAL file after publication; a best-effort removal failure still counts |
+
+Propagating a returned error through callers does not add another failure.
+At the WAL and daily-rollup root, one scan attempt counts once even if
+several entries cannot be enumerated or inspected. Successfully inspected
+environments remain eligible for the existing processing path.
+Independent attempts remain separate. A daemon without a hot buffer creates
+a fresh publication gate for each cycle, so another failed scan is a new
+attempt. A successful quarantine and a later operation failure are separate
+facts even when they occur in one cycle.
+
+`CompactionStats.total_errors` retains its existing mixed error/quarantine
+meaning. It is not relabelled as failed cycles. Idle work, disabled ingestion,
+and intentional repin suppression or waiting do not emit these operation
+failures. The `wal_root_scan` and `daily_rollup_scan` directory scans ignore
+confirmed missing paths. Pending-rollup recovery also ignores a missing
+directory at its initial directory read. Other recorded scans and later
+file-read, publication, and recovery failures can count `NotFound`, including
+races with retention. The alert
+reports the failed attempt, not its cause. Stale
+temporary-file cleanup and empty-directory housekeeping are outside this
+closed inventory. Retiring a replaced file as `.parquet.merged` is not a
+corrupt-file quarantine. These counters do not measure backlog eligibility
+or prove that compaction is making progress.

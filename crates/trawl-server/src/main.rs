@@ -220,12 +220,13 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
     );
 
     // Install the prometheus metrics recorder before building state.
-    let metrics_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+    let metrics_handle = trawl_server::metrics::prometheus_builder()
         .install_recorder()
         .expect("failed to install prometheus recorder");
     #[cfg(target_os = "linux")]
     metrics_process::Collector::default().describe();
     trawl_server::metrics::describe_metrics();
+    trawl_server::metrics::init_operational_alert_metrics();
     // Publish the salvage profiles' rejection matrix at zero. "Telemetry
     // is rejection-free by construction" is evidenced by an absent
     // increment on a present series; an absent series would leave a scrape

@@ -1,7 +1,7 @@
 # trawl Helm chart
 
 Installs one `trawld` StatefulSet with one replica, a `trawl-web` sidecar for
-the browser UI, a Service, and optional Ingress, HTTPRoute, ServiceMonitor,
+the browser UI, a Service, and optional Ingress, HTTPRoute, ServiceMonitor, PrometheusRule,
 and crash-dump volume. trawld is single-node, and the chart never scales above
 one replica.
 
@@ -75,6 +75,97 @@ for complete values, issuance checks, and client verification. cert-manager's
 [Certificate documentation](https://cert-manager.io/docs/usage/certificate/)
 describes issuance, Secret contents, and renewal. trawld checks mounted
 certificate files every `config.server.tlsReloadIntervalSecs` seconds.
+
+## Operational alerts
+
+The chart can create one `PrometheusRule` for an existing Prometheus Operator.
+It installs no monitoring system or notification routing. Rules are off by
+default and independent of `serviceMonitor.enabled`; no rule CRD is needed
+while rules are disabled.
+
+Merge these options into your existing values:
+
+```yaml
+serviceMonitor:
+  enabled: true
+  interval: 30s
+prometheusRule:
+  enabled: true
+  namespace: ""
+  additionalLabels:
+    monitoring: homelab
+  alerts:
+    TrawlSyslogQueueDiscard:
+      severity: page
+    TrawlTelemetryCapacityDiscard:
+      enabled: false
+```
+
+All ten alerts default to enabled and `severity: warning`. Each entry accepts
+only `enabled` and `severity`. Severity is a nonblank static routing string,
+not an enum; `{{` and `}}` template delimiters are rejected. Unknown alert
+names, unknown fields, invalid types, invalid Kubernetes label keys or values, and
+conflicting overrides of chart resource labels fail rendering.
+`additionalLabels` select the rule resource
+and do not become alert labels. Values may be empty; otherwise they must be at
+most 63 ASCII characters, start and end with an alphanumeric character, and
+contain only alphanumeric characters, `-`, `_`, or `.`.
+
+Accepted alert keys are:
+
+- `TrawlSyslogQueueDiscard`
+- `TrawlSyslogWalDiscard`
+- `TrawlTelemetryCapacityDiscard`
+- `TrawlSyslogWriteOutcomeUncertain`
+- `TrawlTelemetryWriteOutcomeUncertain`
+- `TrawlHttpPersistenceRejection`
+- `TrawlTelemetryWalWriteFailure`
+- `TrawlWalDurabilityDegraded`
+- `TrawlCompactionOperationFailure`
+- `TrawlFileQuarantine`
+
+Rules use a fixed `increase(counter[10m]) > 0`, without a `for` delay. Use
+30-second scrapes and evaluations, no greater than two minutes. Each rule
+retains source-series target labels; none sums failures across targets.
+Resolution does not establish recovery. First-baseline, unseen-process, and
+pre-recorder telemetry limits are covered in the
+[operational runbooks](https://trawl.sh/operate/operational-alerts/).
+
+Expressions always select `namespace=<release namespace>` and
+`service=<rendered Service name>`, including `fullnameOverride`.
+`prometheusRule.namespace` changes only the rule object's namespace.
+With ServiceMonitor creation off, custom scraping must supply the same
+`namespace` and `service` labels. The chart's existing monitor scrapes the
+unauthenticated daemon `/metrics` endpoint over HTTPS with certificate
+verification disabled for generated self-signed certificates. A separately
+managed monitor can provide CA verification while preserving these labels.
+
+Your Prometheus resource's `ruleSelector` must match the rule's resource
+labels, and `ruleNamespaceSelector` must select its namespace. For the
+example label above and rules in namespace `trawl`, the relevant fields are:
+
+```yaml
+spec:
+  evaluationInterval: 30s
+  ruleSelector:
+    matchLabels:
+      monitoring: homelab
+  ruleNamespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: trawl
+```
+
+Preserve selection of your other rules when merging these settings. Configure
+ServiceMonitor discovery separately. If `enforcedNamespaceLabel` is enabled,
+rule or monitor namespace overrides can rewrite selectors and sample labels
+to each monitoring object's namespace. Configure explicit exclusions or
+compatible enforcement before using those overrides. Follow
+[Keep namespace enforcement compatible](https://trawl.sh/operate/operational-alerts/#keep-namespace-enforcement-compatible)
+and inspect both the generated rules and scraped target labels.
+
+Plain Prometheus users can load the ordinary
+[rule file](../../monitoring/prometheus/trawl.rules.yml) with `job="trawl"`.
+The runbook includes a matching `rule_files` and HTTPS scrape configuration.
 
 ## Values
 
@@ -199,6 +290,11 @@ certificate files every `config.server.tlsReloadIntervalSecs` seconds.
 | `serviceMonitor.interval` | string | `30s` | Scrape interval |
 | `serviceMonitor.scrapeTimeout` | string | `10s` | Scrape timeout |
 | `serviceMonitor.namespace` | string | `""` | ServiceMonitor namespace. Empty uses the release namespace |
+| `prometheusRule.enabled` | bool | `false` | Create the ten operational warning rules; independent of ServiceMonitor creation |
+| `prometheusRule.namespace` | string | `""` | Rule object namespace. Empty uses the release namespace; never changes workload selectors |
+| `prometheusRule.additionalLabels` | map of strings | `{}` | Rule-resource discovery labels. Invalid Kubernetes label keys or values and conflicting chart label overrides are rejected |
+| `prometheusRule.alerts.<alert>.enabled` | bool | `true` | Enable one of the ten alert keys listed above |
+| `prometheusRule.alerts.<alert>.severity` | string | `warning` | Nonblank static routing value; template delimiters are rejected |
 | `serviceAccount.create` | bool | `true` | Create a ServiceAccount |
 | `serviceAccount.annotations` | object | `{}` | ServiceAccount annotations |
 | `serviceAccount.name` | string | `""` | ServiceAccount name. Empty derives it from the release |

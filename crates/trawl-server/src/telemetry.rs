@@ -53,9 +53,11 @@
 //! A normal failed write retains the batch for retry (rate-limited stderr +
 //! `trawl_telemetry_wal_write_failures_total`), so a transient storage error
 //! delays events instead of losing them. If the blocking write task itself
-//! panics or is cancelled, its consumed batch is unrecoverable and is counted
-//! once under drop reason `write_crashed` in addition to that one
-//! write-failure count. Total retained memory is capped by
+//! panics or is cancelled, its consumed in-memory batch cannot be requeued
+//! and is counted once under drop reason `write_crashed`, in addition to
+//! that one write-failure count. The WAL may already be durable: the batch
+//! count describes an uncertain outcome, not confirmed permanent loss.
+//! Total retained memory is capped by
 //! `[ingest] telemetry_buffer_max_bytes` — the charge is an estimate
 //! (serialized ndjson counted twice, once for the bytes and once for the
 //! retained maps which hold roughly the same payload, plus a fixed
@@ -748,12 +750,12 @@ impl WalLayerInner {
             .fetch_add(mean_line_bytes, Ordering::Relaxed);
         metrics::counter!(
             crate::metrics::TELEMETRY_EVENTS_DROPPED_TOTAL,
-            "reason" => "preinit_cap"
+            "reason" => crate::metrics::TelemetryDropReason::PreinitCap.label()
         )
         .increment(1);
         metrics::counter!(
             crate::metrics::TELEMETRY_BYTES_DROPPED_TOTAL,
-            "reason" => "preinit_cap"
+            "reason" => crate::metrics::TelemetryDropReason::PreinitCap.label()
         )
         .increment(mean_line_bytes);
         true
@@ -841,19 +843,19 @@ impl WalLayerInner {
         self.dropped.cap_bytes.fetch_add(bytes, Ordering::Relaxed);
         metrics::counter!(
             crate::metrics::TELEMETRY_EVENTS_DROPPED_TOTAL,
-            "reason" => "buffer_cap"
+            "reason" => crate::metrics::TelemetryDropReason::BufferCap.label()
         )
         .increment(events);
         metrics::counter!(
             crate::metrics::TELEMETRY_BYTES_DROPPED_TOTAL,
-            "reason" => "buffer_cap"
+            "reason" => crate::metrics::TelemetryDropReason::BufferCap.label()
         )
         .increment(bytes);
     }
 
-    /// Count a batch irrecoverably consumed by a panicked or cancelled
-    /// blocking write task. This is separate from the one WAL failure count:
-    /// the two metrics describe different facts about the same attempt.
+    /// Count the in-memory batch consumed by a panicked or cancelled task.
+    /// Its WAL may already be durable. This is separate from the one WAL
+    /// failure count: the metrics describe different facts about that attempt.
     fn record_crashed_drop(&self, events: u64, bytes: u64) {
         self.dropped
             .crashed_events
@@ -863,12 +865,12 @@ impl WalLayerInner {
             .fetch_add(bytes, Ordering::Relaxed);
         metrics::counter!(
             crate::metrics::TELEMETRY_EVENTS_DROPPED_TOTAL,
-            "reason" => "write_crashed"
+            "reason" => crate::metrics::TelemetryDropReason::WriteCrashed.label()
         )
         .increment(events);
         metrics::counter!(
             crate::metrics::TELEMETRY_BYTES_DROPPED_TOTAL,
-            "reason" => "write_crashed"
+            "reason" => crate::metrics::TelemetryDropReason::WriteCrashed.label()
         )
         .increment(bytes);
     }
@@ -2425,22 +2427,274 @@ mod tests {
         assert_eq!(events[0]["event_type"], "retry_test");
     }
 
+    #[test]
+    fn alert_counters_keep_retained_retry_distinct_from_discard() {
+        use crate::metrics::test_support::sample;
+        use tracing_subscriber::prelude::*;
+
+        let recorder = crate::metrics::prometheus_builder().build_recorder();
+        let metrics_handle = recorder.handle();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                crate::metrics::init_operational_alert_metrics();
+                let tmp = tempfile::tempdir().unwrap();
+                let wal_root = broken_wal_root(tmp.path());
+                let writer = Arc::new(WalWriter::new(wal_root.clone()));
+                let handle = WalHandle::new();
+                let layer = WalLayer::new(handle.clone(), "prod");
+                // Disabled and idle flushes must not report a failed attempt.
+                layer.flush_cycle().await;
+                assert_eq!(
+                    sample(
+                        &metrics_handle,
+                        crate::metrics::TELEMETRY_WAL_WRITE_FAILURES_TOTAL
+                    ),
+                    0
+                );
+                handle.set(Arc::clone(&writer), "prod");
+                layer.flush_cycle().await;
+                assert_eq!(
+                    sample(
+                        &metrics_handle,
+                        crate::metrics::TELEMETRY_WAL_WRITE_FAILURES_TOTAL
+                    ),
+                    0
+                );
+                let hot = Arc::new(crate::hot_buffer::HotBuffer::new(
+                    crate::hot_buffer::HotBufferConfig {
+                        max_events: 100,
+                        max_bytes: 1024 * 1024,
+                    },
+                ));
+                layer.set_hot_buffer(Arc::clone(&hot));
+                let _guard = tracing::subscriber::set_default(
+                    tracing_subscriber::registry().with(layer.clone()),
+                );
+                tracing::info!(event_type = "alert_retry", id = 1, "first");
+                tracing::info!(event_type = "alert_retry", id = 2, "second");
+                layer.flush_cycle().await;
+                assert_eq!(
+                    sample(
+                        &metrics_handle,
+                        crate::metrics::TELEMETRY_WAL_WRITE_FAILURES_TOTAL
+                    ),
+                    1
+                );
+                assert_eq!(layer.inner.pending.lock().front().unwrap().events.len(), 2);
+                assert_eq!(hot.event_count(), 0);
+                for reason in ["preinit_cap", "buffer_cap", "write_crashed"] {
+                    assert_eq!(
+                        sample(
+                            &metrics_handle,
+                            &format!("trawl_telemetry_events_dropped_total{{reason=\"{reason}\"}}")
+                        ),
+                        0
+                    );
+                }
+                repair_wal_root(&wal_root);
+                layer.flush_cycle().await;
+                assert_eq!(
+                    sample(
+                        &metrics_handle,
+                        crate::metrics::TELEMETRY_WAL_WRITE_FAILURES_TOTAL
+                    ),
+                    1
+                );
+                assert!(layer.inner.pending.lock().is_empty());
+                assert_eq!(hot.event_count(), 2);
+                let events = read_wal_events(&wal_root.join("prod"));
+                assert_eq!(events.len(), 2);
+                assert!(
+                    events
+                        .iter()
+                        .all(|event| event["event_type"] == "alert_retry")
+                );
+                layer.flush_cycle().await;
+                assert_eq!(read_wal_events(&wal_root.join("prod")).len(), 2);
+                assert_eq!(
+                    sample(
+                        &metrics_handle,
+                        crate::metrics::TELEMETRY_WAL_WRITE_FAILURES_TOTAL
+                    ),
+                    1
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn crashed_write_after_durability_counts_uncertain_batch_and_failed_attempt() {
+        use crate::metrics::test_support::sample;
+        use tracing_subscriber::prelude::*;
+
+        let recorder = crate::metrics::prometheus_builder().build_recorder();
+        let metrics_handle = recorder.handle();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                crate::metrics::init_operational_alert_metrics();
+                let tmp = tempfile::tempdir().unwrap();
+                let writer = Arc::new(WalWriter::new(tmp.path().join("wal")));
+                let handle = WalHandle::new();
+                handle.set(Arc::clone(&writer), "prod");
+                let layer = WalLayer::new(handle, "prod");
+                let hot = Arc::new(crate::hot_buffer::HotBuffer::new(
+                    crate::hot_buffer::HotBufferConfig {
+                        max_events: 100,
+                        max_bytes: 1024 * 1024,
+                    },
+                ));
+                layer.set_hot_buffer(Arc::clone(&hot));
+                let _guard = tracing::subscriber::set_default(
+                    tracing_subscriber::registry().with(layer.clone()),
+                );
+                tracing::info!(event_type = "durable_crash", id = 1, "first");
+                tracing::info!(event_type = "durable_crash", id = 2, "second");
+                writer.panic_after_writes_for_test(1);
+                layer.flush_cycle().await;
+                assert_eq!(
+                    sample(
+                        &metrics_handle,
+                        crate::metrics::TELEMETRY_WAL_WRITE_FAILURES_TOTAL
+                    ),
+                    1
+                );
+                assert_eq!(
+                    sample(
+                        &metrics_handle,
+                        "trawl_telemetry_events_dropped_total{reason=\"write_crashed\"}"
+                    ),
+                    2
+                );
+                assert_eq!(
+                    sample(
+                        &metrics_handle,
+                        "trawl_telemetry_events_dropped_total{reason=\"preinit_cap\"}"
+                    ),
+                    0
+                );
+                assert_eq!(
+                    sample(
+                        &metrics_handle,
+                        "trawl_telemetry_events_dropped_total{reason=\"buffer_cap\"}"
+                    ),
+                    0
+                );
+                assert_eq!(hot.event_count(), 0, "panic precedes hot publication");
+                assert!(layer.inner.pending.lock().is_empty());
+                assert_eq!(layer.inner.staged.events.load(Ordering::Relaxed), 0);
+                let events = read_wal_events(&writer.dir().join("prod"));
+                assert_eq!(events.len(), 2, "the consumed batch still exists durably");
+                assert!(
+                    events
+                        .iter()
+                        .all(|event| event["event_type"] == "durable_crash")
+                );
+                layer.flush_cycle().await;
+                assert_eq!(
+                    sample(
+                        &metrics_handle,
+                        crate::metrics::TELEMETRY_WAL_WRITE_FAILURES_TOTAL
+                    ),
+                    1
+                );
+                assert_eq!(
+                    sample(
+                        &metrics_handle,
+                        "trawl_telemetry_events_dropped_total{reason=\"write_crashed\"}"
+                    ),
+                    2
+                );
+                assert_eq!(read_wal_events(&writer.dir().join("prod")).len(), 2);
+            });
+        });
+    }
+
+    #[test]
+    fn capacity_alert_reasons_count_real_admission_drops_without_write_failures() {
+        use crate::metrics::test_support::sample;
+        use tracing_subscriber::prelude::*;
+
+        let recorder = crate::metrics::prometheus_builder().build_recorder();
+        let metrics_handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            crate::metrics::init_operational_alert_metrics();
+            let layer = WalLayer::new(WalHandle::new(), "prod");
+            {
+                let _guard = tracing::subscriber::set_default(
+                    tracing_subscriber::registry().with(layer.clone()),
+                );
+                let filler = "x".repeat(16 * 1024);
+                for _ in 0..128 {
+                    if layer.inner.active.lock().bytes.len() >= 1024 * 1024 {
+                        break;
+                    }
+                    tracing::info!(event_type = "fill_preinit", payload = %filler, "fill");
+                }
+                assert!(layer.inner.active.lock().bytes.len() >= 1024 * 1024);
+                for _ in 0..3 {
+                    tracing::info!(event_type = "preinit_discard", "discard");
+                }
+            }
+            assert_eq!(
+                sample(
+                    &metrics_handle,
+                    "trawl_telemetry_events_dropped_total{reason=\"preinit_cap\"}"
+                ),
+                3
+            );
+            let tmp = tempfile::tempdir().unwrap();
+            let handle = WalHandle::new();
+            handle.set(Arc::new(WalWriter::new(tmp.path().join("wal"))), "prod");
+            let capped = WalLayer::new(handle, "prod");
+            capped.inner.max_buffer_bytes.store(1, Ordering::Relaxed);
+            {
+                let _guard = tracing::subscriber::set_default(
+                    tracing_subscriber::registry().with(capped.clone()),
+                );
+                for _ in 0..2 {
+                    tracing::info!(event_type = "buffer_discard", "too large for cap");
+                }
+            }
+            assert!(capped.inner.active.lock().events.is_empty());
+            assert_eq!(
+                sample(
+                    &metrics_handle,
+                    "trawl_telemetry_events_dropped_total{reason=\"buffer_cap\"}"
+                ),
+                2
+            );
+            assert_eq!(
+                sample(
+                    &metrics_handle,
+                    "trawl_telemetry_events_dropped_total{reason=\"write_crashed\"}"
+                ),
+                0
+            );
+            assert_eq!(
+                sample(
+                    &metrics_handle,
+                    crate::metrics::TELEMETRY_WAL_WRITE_FAILURES_TOTAL
+                ),
+                0
+            );
+        });
+    }
+
     /// A `JoinError` owns no batch to put back: prove the consumed unit is
     /// accounted exactly once as dropped while the existing write-failure
     /// signal remains exactly once and all depth accounting is released.
     #[test]
     fn panicked_blocking_write_accounts_the_lost_batch_exactly_once() {
+        use crate::metrics::test_support::sample;
         use tracing_subscriber::prelude::*;
-
-        fn sample(rendered: &str, series: &str) -> u64 {
-            rendered
-                .lines()
-                .find_map(|line| {
-                    let (name, value) = line.rsplit_once(' ')?;
-                    (name == series).then(|| value.parse::<u64>().unwrap())
-                })
-                .unwrap_or(0)
-        }
 
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
         let metrics_handle = recorder.handle();
@@ -2454,6 +2708,12 @@ mod tests {
         // JoinError is accounted here after the await.
         metrics::with_local_recorder(&recorder, || {
             rt.block_on(async {
+                crate::metrics::init_operational_alert_metrics();
+                // The byte counter is diagnostic rather than selected by the
+                // starter rules. Register its test baseline explicitly too.
+                metrics::counter!(crate::metrics::TELEMETRY_BYTES_DROPPED_TOTAL,
+                    "reason" => crate::metrics::TelemetryDropReason::WriteCrashed.label())
+                .increment(0);
                 let tmp = tempfile::tempdir().unwrap();
                 let writer = Arc::new(WalWriter::new(tmp.path().join("wal")));
                 writer.ensure_dir().unwrap();
@@ -2467,9 +2727,22 @@ mod tests {
                 let _guard = tracing::subscriber::set_default(subscriber);
 
                 layer_ref.inner.update_gauges();
-                let before = metrics_handle.render();
-                let baseline_events = sample(&before, crate::metrics::TELEMETRY_BUFFER_EVENTS);
-                let baseline_bytes = sample(&before, crate::metrics::TELEMETRY_BUFFER_BYTES);
+                let baseline_events =
+                    sample(&metrics_handle, crate::metrics::TELEMETRY_BUFFER_EVENTS);
+                let baseline_bytes =
+                    sample(&metrics_handle, crate::metrics::TELEMETRY_BUFFER_BYTES);
+                let crashed_events_before = sample(
+                    &metrics_handle,
+                    "trawl_telemetry_events_dropped_total{reason=\"write_crashed\"}",
+                );
+                let crashed_bytes_before = sample(
+                    &metrics_handle,
+                    "trawl_telemetry_bytes_dropped_total{reason=\"write_crashed\"}",
+                );
+                let failures_before = sample(
+                    &metrics_handle,
+                    crate::metrics::TELEMETRY_WAL_WRITE_FAILURES_TOTAL,
+                );
 
                 tracing::info!(event_type = "write_crash_test", "lost in blocking task");
                 layer_ref.inner.stage();
@@ -2488,42 +2761,37 @@ mod tests {
 
                 layer_ref.flush_cycle().await;
 
-                let after = metrics_handle.render();
                 assert_eq!(
                     sample(
-                        &after,
+                        &metrics_handle,
                         "trawl_telemetry_events_dropped_total{reason=\"write_crashed\"}"
-                    ) - sample(
-                        &before,
-                        "trawl_telemetry_events_dropped_total{reason=\"write_crashed\"}"
-                    ),
+                    ) - crashed_events_before,
                     expected_events,
                     "the staged event delta is counted once"
                 );
                 assert_eq!(
                     sample(
-                        &after,
+                        &metrics_handle,
                         "trawl_telemetry_bytes_dropped_total{reason=\"write_crashed\"}"
-                    ) - sample(
-                        &before,
-                        "trawl_telemetry_bytes_dropped_total{reason=\"write_crashed\"}"
-                    ),
+                    ) - crashed_bytes_before,
                     expected_bytes,
                     "the staged ndjson-byte delta is counted once"
                 );
                 assert_eq!(
-                    sample(&after, crate::metrics::TELEMETRY_WAL_WRITE_FAILURES_TOTAL)
-                        - sample(&before, crate::metrics::TELEMETRY_WAL_WRITE_FAILURES_TOTAL),
+                    sample(
+                        &metrics_handle,
+                        crate::metrics::TELEMETRY_WAL_WRITE_FAILURES_TOTAL
+                    ) - failures_before,
                     1,
                     "the crashed attempt increments the write-failure counter once"
                 );
                 assert_eq!(
-                    sample(&after, crate::metrics::TELEMETRY_BUFFER_EVENTS),
+                    sample(&metrics_handle, crate::metrics::TELEMETRY_BUFFER_EVENTS),
                     baseline_events,
                     "event-depth gauge returns to baseline"
                 );
                 assert_eq!(
-                    sample(&after, crate::metrics::TELEMETRY_BUFFER_BYTES),
+                    sample(&metrics_handle, crate::metrics::TELEMETRY_BUFFER_BYTES),
                     baseline_bytes,
                     "byte-depth gauge returns to baseline"
                 );

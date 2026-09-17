@@ -4,12 +4,28 @@ on:
   pull_request:
     paths:
       - "docs/**"
+      - "monitoring/prometheus/**"
+      - "chart/trawl/templates/prometheusrule.yaml"
+      - "chart/trawl/templates/servicemonitor.yaml"
+      - "chart/trawl/templates/service.yaml"
+      - "chart/trawl/templates/_helpers.tpl"
+      - "chart/trawl/values.yaml"
+      - "chart/trawl/values.schema.json"
+      - "chart/trawl/README.md"
       - "crates/trawl-core/src/ast.rs"
       - ".github/workflows/docs.yml"
   push:
     branches: [main]
     paths:
       - "docs/**"
+      - "monitoring/prometheus/**"
+      - "chart/trawl/templates/prometheusrule.yaml"
+      - "chart/trawl/templates/servicemonitor.yaml"
+      - "chart/trawl/templates/service.yaml"
+      - "chart/trawl/templates/_helpers.tpl"
+      - "chart/trawl/values.yaml"
+      - "chart/trawl/values.schema.json"
+      - "chart/trawl/README.md"
       - "crates/trawl-core/src/ast.rs"
       - ".github/workflows/docs.yml"
   workflow_dispatch:

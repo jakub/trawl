@@ -117,6 +117,11 @@ only.
 
 ## Confirm delivery over time
 
+Use the [operational alert pack](/operate/operational-alerts/) to distinguish
+queue or WAL abandonment, HTTP persistence rejection, and uncertain task
+outcomes. An uncertain write may already have durable bytes. Preserve sender
+copies and reconcile accepted output before a controlled resend.
+
 - Read the ingest counters on `/metrics`: `trawl_ingest_events_total`,
   `trawl_ingest_events_rejected_total{reason}`,
   `trawl_ingest_repairs_total{code,service}`, and
