@@ -122,7 +122,7 @@ for (const choice of ['Light', 'Dark'] as const) {
     await page.keyboard.press('Enter');
     await settleTheme(page);
     expect((await themeProbe(page)).writes).toEqual([]);
-    await expect(page.getByRole('menu')).toHaveCount(0);
+    await expect(page.locator(SEL.userMenu)).toHaveCount(0);
     await expect(page.locator(SEL.topbarUser)).toBeFocused();
   });
 }
