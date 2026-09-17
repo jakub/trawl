@@ -80,7 +80,7 @@ pub fn StatusBar(
                             {format!(" / {}", format_bytes(u64::try_from(s.hot_buffer_bytes).unwrap_or_default()))}
                         </span>
                     </div>
-                    <div class="grp wal-measurement" title="WAL last complete totals; sample age at dashboard snapshot">
+                    <div class="grp wal-measurement" title=format!("WAL {}; sample age at dashboard snapshot", wal_reading(&s))>
                         <span>"WAL "</span>
                         <span class="strong">{wal_reading(&s)}</span>
                     </div>

@@ -1282,6 +1282,10 @@
 .statusbar .sp { flex: 1; }
 .statusbar .strong { color: var(--ink-2); }
 .statusbar .accent { color: var(--accent); }
+/* Keep measurement detail inside the fixed footer row. The full reading
+ * remains in the slot's title and text for assistive technology. */
+.statusbar .wal-measurement { min-width: 0; white-space: nowrap; }
+.statusbar .wal-measurement .strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 
 /* ─────────────────────────────────────────────────────────────────
  *  Common utility bits

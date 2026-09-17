@@ -618,6 +618,29 @@ for (const age of [null, 0]) {
   });
 }
 
+for (const width of [900, 960]) {
+  test(`retained WAL footer stays within its row at ${width}px`, async ({ page, request }) => {
+    await setup(request, 'health-admin', { dashboardSnapshot: {
+      wal_files: 1234, wal_bytes: 4_200_000_000,
+      wal_measurement: { status: 'failed', sample_age_secs: 3600 },
+    } });
+    await page.setViewportSize({ width, height: 1000 });
+    await page.goto('/settings/health');
+    await diagnosticPhase(page, 'Live');
+    const wal = page.locator(SEL.healthFooterWal);
+    await expect(wal).toContainText('failed; last 1234 / 4.2 GB; age 3600s');
+    await expect(wal).toHaveAttribute('title', 'WAL failed; last 1234 / 4.2 GB; age 3600s; sample age at dashboard snapshot');
+    const footer = (await page.locator('.statusbar').boundingBox())!;
+    const reading = (await wal.boundingBox())!;
+    expect(reading.y).toBeGreaterThanOrEqual(footer.y);
+    expect(reading.y + reading.height).toBeLessThanOrEqual(footer.y + footer.height);
+    const theme = (await page.locator(SEL.themeControl).boundingBox())!;
+    expect(theme.x).toBeGreaterThanOrEqual(0);
+    expect(theme.x + theme.width).toBeLessThanOrEqual(width);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(width);
+  });
+}
+
 for (const sample of [
   { status: 'not_configured', age: null, files: 0, bytes: 0, footer: 'not configured', expected: 'Not configured' },
   { status: 'not_sampled', age: null, files: 0, bytes: 0, footer: 'awaiting measurement', expected: 'Awaiting measurement' },
