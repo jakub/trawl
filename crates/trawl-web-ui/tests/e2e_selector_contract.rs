@@ -377,6 +377,30 @@ const CONTRACTS: &[Contract] = &[
         hook: "class=\"health-live-state\"",
     },
     Contract {
+        assignment: "healthIngestion: '.health-ingestion',",
+        source_path: "src/pages/health.rs",
+        source: HEALTH_RS,
+        hook: "class=\"health-ingestion\"",
+    },
+    Contract {
+        assignment: "healthStorage: '.health-storage',",
+        source_path: "src/pages/health.rs",
+        source: HEALTH_RS,
+        hook: "class=\"health-storage\"",
+    },
+    Contract {
+        assignment: "healthDiagnostics: '.health-diagnostics',",
+        source_path: "src/pages/health.rs",
+        source: HEALTH_RS,
+        hook: "class=\"health-diagnostics\"",
+    },
+    Contract {
+        assignment: "healthDiagnosticState: '.health-diagnostic-state',",
+        source_path: "src/pages/health.rs",
+        source: HEALTH_RS,
+        hook: "class=\"health-diagnostic-state\"",
+    },
+    Contract {
         assignment: "healthQueries: '.health-queries',",
         source_path: "src/pages/health.rs",
         source: HEALTH_RS,

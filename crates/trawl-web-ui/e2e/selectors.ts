@@ -59,6 +59,10 @@ export const SEL = {
   healthLive: '.health-live',
   /// crates/trawl-web-ui/src/pages/health.rs HealthPage and HealthQueries.
   healthLiveState: '.health-live-state',
+  healthIngestion: '.health-ingestion',
+  healthStorage: '.health-storage',
+  healthDiagnostics: '.health-diagnostics',
+  healthDiagnosticState: '.health-diagnostic-state',
   /// crates/trawl-web-ui/src/pages/health.rs HealthPage and HealthQueries.
   healthQueries: '.health-queries',
   /// crates/trawl-web-ui/src/pages/health.rs — one check row: the
