@@ -74,6 +74,100 @@
           }
         }
       }
+    },
+    "prometheusRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enabled",
+        "namespace",
+        "additionalLabels",
+        "alerts"
+      ],
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "namespace": {
+          "type": "string",
+          "maxLength": 63,
+          "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+        },
+        "additionalLabels": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "alerts": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "TrawlSyslogQueueDiscard",
+            "TrawlSyslogWalDiscard",
+            "TrawlTelemetryCapacityDiscard",
+            "TrawlSyslogWriteOutcomeUncertain",
+            "TrawlTelemetryWriteOutcomeUncertain",
+            "TrawlHttpPersistenceRejection",
+            "TrawlTelemetryWalWriteFailure",
+            "TrawlWalDurabilityDegraded",
+            "TrawlCompactionOperationFailure",
+            "TrawlFileQuarantine"
+          ],
+          "properties": {
+            "TrawlSyslogQueueDiscard": {
+              "$ref": "#/definitions/operationalAlert"
+            },
+            "TrawlSyslogWalDiscard": {
+              "$ref": "#/definitions/operationalAlert"
+            },
+            "TrawlTelemetryCapacityDiscard": {
+              "$ref": "#/definitions/operationalAlert"
+            },
+            "TrawlSyslogWriteOutcomeUncertain": {
+              "$ref": "#/definitions/operationalAlert"
+            },
+            "TrawlTelemetryWriteOutcomeUncertain": {
+              "$ref": "#/definitions/operationalAlert"
+            },
+            "TrawlHttpPersistenceRejection": {
+              "$ref": "#/definitions/operationalAlert"
+            },
+            "TrawlTelemetryWalWriteFailure": {
+              "$ref": "#/definitions/operationalAlert"
+            },
+            "TrawlWalDurabilityDegraded": {
+              "$ref": "#/definitions/operationalAlert"
+            },
+            "TrawlCompactionOperationFailure": {
+              "$ref": "#/definitions/operationalAlert"
+            },
+            "TrawlFileQuarantine": {
+              "$ref": "#/definitions/operationalAlert"
+            }
+          }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "operationalAlert": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enabled",
+        "severity"
+      ],
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "severity": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": ".*\\S.*"
+        }
+      }
     }
   }
 }

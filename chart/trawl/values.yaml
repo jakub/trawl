@@ -400,6 +400,46 @@ web:
 # invisible. The trawl-web sidecar has its own filter (see web.logLevel).
 logLevel: "trawl_server=info,trawld=info,fleet_auth=info,auth.backend=info,storage.backend=info,preauth.transport=info"
 
+# -- Operational warnings (requires Prometheus Operator CRDs only when enabled).
+# Independent of serviceMonitor. Targets always use the release namespace and Service name.
+prometheusRule:
+  enabled: false
+  namespace: ""
+  # Discovery labels on the rule resource; never added to alert series.
+  additionalLabels: {}
+  # Only these alert names and enabled/severity fields are accepted.
+  alerts:
+    TrawlSyslogQueueDiscard:
+      enabled: true
+      severity: warning
+    TrawlSyslogWalDiscard:
+      enabled: true
+      severity: warning
+    TrawlTelemetryCapacityDiscard:
+      enabled: true
+      severity: warning
+    TrawlSyslogWriteOutcomeUncertain:
+      enabled: true
+      severity: warning
+    TrawlTelemetryWriteOutcomeUncertain:
+      enabled: true
+      severity: warning
+    TrawlHttpPersistenceRejection:
+      enabled: true
+      severity: warning
+    TrawlTelemetryWalWriteFailure:
+      enabled: true
+      severity: warning
+    TrawlWalDurabilityDegraded:
+      enabled: true
+      severity: warning
+    TrawlCompactionOperationFailure:
+      enabled: true
+      severity: warning
+    TrawlFileQuarantine:
+      enabled: true
+      severity: warning
+
 # -- Prometheus ServiceMonitor (requires prometheus-operator CRDs)
 serviceMonitor:
   enabled: false

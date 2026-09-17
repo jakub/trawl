@@ -1,0 +1,83 @@
+groups:
+  - name: trawl.operational
+    rules:
+      - alert: TrawlSyslogQueueDiscard
+        expr: increase(trawl_syslog_events_dropped_total{job="trawl"}[10m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Syslog queue discarded events on {{ $labels.instance }}"
+          description: "Target {{ $labels.job }}/{{ $labels.instance }}: The receive queue abandoned events. This does not measure packets lost before receipt. An increase was observed in the last 10 minutes; resolution does not establish recovery."
+          runbook_url: "https://trawl.sh/operate/operational-alerts/#syslog-queue-discard"
+      - alert: TrawlSyslogWalDiscard
+        expr: increase(trawl_syslog_wal_events_discarded_total{job="trawl"}[10m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Syslog WAL write abandoned events on {{ $labels.instance }}"
+          description: "Target {{ $labels.job }}/{{ $labels.instance }}: A failed WAL group was abandoned from normal ingestion. Temporary bytes or sender copies may remain. An increase was observed in the last 10 minutes; resolution does not establish recovery."
+          runbook_url: "https://trawl.sh/operate/operational-alerts/#syslog-wal-discard"
+      - alert: TrawlTelemetryCapacityDiscard
+        expr: increase(trawl_telemetry_events_dropped_total{job="trawl",reason=~"preinit_cap|buffer_cap"}[10m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Telemetry capacity discarded events on {{ $labels.instance }}"
+          description: "Target {{ $labels.job }}/{{ $labels.instance }}: Capacity exhausted for reason {{ $labels.reason }}. Drops before recorder installation are not recorded. An increase was observed in the last 10 minutes; resolution does not establish recovery."
+          runbook_url: "https://trawl.sh/operate/operational-alerts/#telemetry-capacity-discard"
+      - alert: TrawlSyslogWriteOutcomeUncertain
+        expr: increase(trawl_syslog_write_tasks_failed_total{job="trawl"}[10m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Syslog write task failed on {{ $labels.instance }}"
+          description: "Target {{ $labels.job }}/{{ $labels.instance }}: A write task failed with uncertain outcome. Earlier groups may already be durable; do not infer batch loss or replay blindly. An increase was observed in the last 10 minutes; resolution does not establish recovery."
+          runbook_url: "https://trawl.sh/operate/operational-alerts/#syslog-write-outcome-uncertain"
+      - alert: TrawlTelemetryWriteOutcomeUncertain
+        expr: increase(trawl_telemetry_events_dropped_total{job="trawl",reason="write_crashed"}[10m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Telemetry write outcome is uncertain on {{ $labels.instance }}"
+          description: "Target {{ $labels.job }}/{{ $labels.instance }}: The in-memory batch was consumed for reason {{ $labels.reason }}. WAL bytes may already exist; this also counts as a failed attempt. An increase was observed in the last 10 minutes; resolution does not establish recovery."
+          runbook_url: "https://trawl.sh/operate/operational-alerts/#telemetry-write-outcome-uncertain"
+      - alert: TrawlHttpPersistenceRejection
+        expr: increase(trawl_ingest_events_rejected_total{job="trawl",reason="wal_failure"}[10m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "HTTP persistence rejected events on {{ $labels.instance }}"
+          description: "Target {{ $labels.job }}/{{ $labels.instance }}: The server rejected persistence for reason {{ $labels.reason }}. The sender may retry; permanent loss is not established. An increase was observed in the last 10 minutes; resolution does not establish recovery."
+          runbook_url: "https://trawl.sh/operate/operational-alerts/#http-persistence-rejection"
+      - alert: TrawlTelemetryWalWriteFailure
+        expr: increase(trawl_telemetry_wal_write_failures_total{job="trawl"}[10m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Telemetry WAL attempt failed on {{ $labels.instance }}"
+          description: "Target {{ $labels.job }}/{{ $labels.instance }}: A WAL attempt failed, including retained retries and crashed tasks. Crashes can also fire the uncertain-outcome alert; attempts are not event losses. An increase was observed in the last 10 minutes; resolution does not establish recovery."
+          runbook_url: "https://trawl.sh/operate/operational-alerts/#telemetry-wal-write-failure"
+      - alert: TrawlWalDurabilityDegraded
+        expr: increase(trawl_wal_durability_failures_total{job="trawl",operation="parent_directory_sync"}[10m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Published WAL durability is uncertain on {{ $labels.instance }}"
+          description: "Target {{ $labels.job }}/{{ $labels.instance }}: Operation {{ $labels.operation }} failed after file publication. The directory entry may not survive a crash; this is not an event discard. An increase was observed in the last 10 minutes; resolution does not establish recovery."
+          runbook_url: "https://trawl.sh/operate/operational-alerts/#wal-durability-degraded"
+      - alert: TrawlCompactionOperationFailure
+        expr: increase(trawl_compaction_operation_failures_total{job="trawl"}[10m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Compaction operation failed on {{ $labels.instance }}"
+          description: "Target {{ $labels.job }}/{{ $labels.instance }}: Operation {{ $labels.operation }} failed. This includes best-effort failures; it does not establish permanent event loss or a stalled backlog. An increase was observed in the last 10 minutes; resolution does not establish recovery."
+          runbook_url: "https://trawl.sh/operate/operational-alerts/#compaction-operation-failure"
+      - alert: TrawlFileQuarantine
+        expr: increase(trawl_files_quarantined_total{job="trawl"}[10m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Files were quarantined on {{ $labels.instance }}"
+          description: "Target {{ $labels.job }}/{{ $labels.instance }}: Files of kind {{ $labels.kind }} were isolated with bytes retained. Source files may remain intact; do not delete or replay automatically. An increase was observed in the last 10 minutes; resolution does not establish recovery."
+          runbook_url: "https://trawl.sh/operate/operational-alerts/#file-quarantine"

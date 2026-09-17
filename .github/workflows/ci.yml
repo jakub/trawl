@@ -70,7 +70,19 @@ jobs:
         with:
           persist-credentials: false
       - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
+      - name: Install checksum-verified promtool 3.14.0 (CI only)
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/prometheus-3.14.0.linux-amd64.tar.gz"
+          curl --fail --location --retry 3 \
+            https://github.com/prometheus/prometheus/releases/download/v3.14.0/prometheus-3.14.0.linux-amd64.tar.gz \
+            --output "$archive"
+          echo "f665c6da19eb7ba399c915d30c7d9793c9b417bf8a749b504bc470678631478d  $archive" | sha256sum --check
+          tar -xzf "$archive" -C "$RUNNER_TEMP" prometheus-3.14.0.linux-amd64/promtool
       - run: bash chart/trawl/tests/render.sh
+        env:
+          PROMTOOL: ${{ runner.temp }}/prometheus-3.14.0.linux-amd64/promtool
 
   deb-packaging:
     name: deb crash-dump packaging assertions
