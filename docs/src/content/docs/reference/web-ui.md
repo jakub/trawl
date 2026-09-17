@@ -12,7 +12,8 @@ default, which is an address on the server, not the URL you open. See
 
 ## Navigation
 
-One sidebar lists all destinations in three groups. The first group has no heading.
+The sidebar groups application pages into three sections and has a bottom
+utility link. The first section has no heading.
 
 | Group | Item | Route | Purpose |
 |-------|------|-------|---------|
@@ -22,6 +23,7 @@ One sidebar lists all destinations in three groups. The first group has no headi
 | Scheduled work | **Nets** | `/jobs/nets` | Manage saved queries and their schedules |
 | Scheduled work | **Runs** | `/jobs/runs` | Inspect scheduled run outcomes |
 | Operations | **Health** | `/settings/health` | Read server health and running queries |
+| Bottom utility | **Help** | [Documentation](https://trawl.sh/) | Open the documentation site in a new tab |
 
 The command bar shows the current page, **Go to…**, and the account menu.
 **Collapse sidebar** reduces the sidebar to icons, and **Expand sidebar**
@@ -29,7 +31,7 @@ restores its labels. In compact navigation, **Open navigation** opens the
 sidebar as an overlay.
 
 **Go to…**, Ctrl+K, or Command+K on macOS opens the command palette. The palette
-lists the same destinations as the sidebar and filters on both label and route.
+lists the application pages and filters on both label and route.
 The sidebar's bottom item, **Help**, opens the documentation site in a new tab.
 
 `/login` takes an API key. A rejected key reports `Invalid API key`, and a
@@ -132,14 +134,17 @@ grouping, and sorting can omit or combine rows differently from the source data.
 
 `/search/history` lists completed queries with **Executed query**, **When**,
 **Rows**, and **Action**. The headers do not sort. The filter box narrows only
-the loaded page. **Save as net** stores a row as a saved query. **Export this page** downloads the visible page as CSV or
+the loaded page. **Save as Net** stores a row as a saved query. **Export this page** downloads the visible page as CSV or
 JSON. **Clear history** asks for confirmation, then deletes every row for your
 key.
 
 ## Schema
 
 `/search/schema` lists services with **Service**, **Activity**, **Events**,
-**Storage**, and **Fields** columns. **Service**, **Events**, **Storage**, and
+**Storage**, and **Fields** columns, followed by icon actions. The actions
+column is named **Actions** for screen readers. Its magnifying-glass **Search**
+button and lightning-bolt **Live tail** button open that service in Search or
+start its live stream. **Service**, **Events**, **Storage**, and
 **Fields** have sorting controls. The filter box matches service names and field names.
 
 Selecting a service opens its drawer: **Overview** for ingest rate and field
