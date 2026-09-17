@@ -363,3 +363,126 @@ test('inner malformed Search filters, relative range and URL-shaped data remain 
   await expect(page.locator(SEL.urlNotice)).toContainText(COPY.urlNoticeFiltersPrefix);
   await expect(page.locator(SEL.urlNoticeRaw)).toHaveText('v1.!');
 });
+
+for (const phase of ['login document pending', 'logout response pending'] as const) {
+  test(`explicit logout wins over a late Jobs 401 with ${phase}`, async ({ page, request }) => {
+    await resetScenario(request, 'corpus');
+    await page.clock.install();
+    let expire = false;
+    let releasePoll: (() => void) | undefined;
+    let pollDelivered = false;
+    await page.route('**/api/v1/saved', async route => {
+      if (!expire) return route.continue();
+      await new Promise<void>(resolve => { releasePoll = resolve; });
+      await route.fulfill({ status: 401, body: '' });
+      pollDelivered = true;
+    });
+
+    let releaseLogout: (() => void) | undefined;
+    await page.route('**/api/auth/logout', async route => {
+      // The server has already completed logout. Optionally withhold its
+      // response from the old document while that document receives a 401.
+      const response = await route.fetch();
+      if (phase === 'logout response pending') {
+        await new Promise<void>(resolve => { releaseLogout = resolve; });
+      }
+      await route.fulfill({ response });
+    });
+
+    const attempts: string[] = [];
+    const releaseDocuments: Array<() => void> = [];
+    page.on('request', req => {
+      const url = new URL(req.url());
+      if (req.isNavigationRequest() && req.frame() === page.mainFrame() && url.pathname === '/login') {
+        attempts.push(relative(url));
+      }
+    });
+    await page.route('**/login*', async route => {
+      if (!route.request().isNavigationRequest()) return route.continue();
+      await new Promise<void>(resolve => { releaseDocuments.push(resolve); });
+      // A competing navigation can cancel this request. Either way, retain
+      // its attempted URL above so cancellation cannot conceal the defect.
+      await route.continue().catch(() => {});
+    });
+    await page.route('**/api/auth/login', route => {
+      expire = false;
+      return route.fulfill({ json: identity });
+    });
+
+    await page.goto('/jobs/nets?note=explicit-logout#receipt');
+    await expect(page.locator('.nets-table')).toBeVisible();
+    expire = true;
+    await page.clock.fastForward(5001);
+    await expect.poll(() => Boolean(releasePoll)).toBe(true);
+    await page.locator(SEL.topbarUser).click();
+    await page.getByRole('menuitem', { name: 'Sign Out', exact: true }).click({ noWaitAfter: true });
+    if (phase === 'login document pending') {
+      await expect.poll(() => releaseDocuments.length).toBe(1);
+      expect(attempts).toEqual(['/login']);
+    } else {
+      await expect.poll(() => Boolean(releaseLogout)).toBe(true);
+      expect(attempts).toEqual([]);
+    }
+
+    releasePoll!();
+    await expect.poll(() => pollDelivered).toBe(true);
+    // An absence assertion needs a bounded quiet window after the response
+    // reaches the browser. All document requests remain held during it.
+    await page.waitForTimeout(250);
+    if (releaseLogout) {
+      releaseLogout();
+      await expect.poll(() => attempts.includes('/login')).toBe(true);
+    }
+    await expect.poll(() => releaseDocuments.length).toBeGreaterThan(0);
+    await expect.poll(() => releaseDocuments.length).toBe(attempts.length);
+    for (const release of releaseDocuments) release();
+    // Settle the real document navigation before checking the complete trace.
+    await expect(page.getByRole('button', { name: 'Sign in', exact: true })).toBeVisible();
+    expect(attempts).toEqual(['/login']);
+    await expect(page).toHaveURL(url => relative(url) === '/login');
+    await signIn(page);
+    await expect(page).toHaveURL(url => relative(url) === '/search');
+  });
+}
+
+for (const failure of ['server', 'network'] as const) {
+  test(`failed explicit logout ${failure} releases suppression and preserves Jobs polling`, async ({ page, request }) => {
+    await resetScenario(request, 'corpus');
+    await page.clock.install();
+    let expire = false;
+    let rejectedReads = 0;
+    await page.route('**/api/v1/saved', route => {
+      if (!expire) return route.continue();
+      rejectedReads++;
+      return route.fulfill({ status: 401, body: '' });
+    });
+    let releaseLogout: (() => void) | undefined;
+    await page.route('**/api/auth/logout', async route => {
+      await new Promise<void>(resolve => { releaseLogout = resolve; });
+      if (failure === 'network') await route.abort('failed');
+      else await route.fulfill({ status: 502, body: '' });
+    });
+    await page.route('**/api/auth/login', route => {
+      expire = false;
+      return route.fulfill({ json: identity });
+    });
+    const destination = '/jobs/nets?note=failed-logout#receipt';
+    await page.goto(destination);
+    await expect(page.locator('.nets-table')).toBeVisible();
+    await page.locator(SEL.topbarUser).click();
+    await page.getByRole('menuitem', { name: 'Sign Out', exact: true }).click();
+    await expect.poll(() => Boolean(releaseLogout)).toBe(true);
+    expire = true;
+    await page.clock.fastForward(5001);
+    await expect.poll(() => rejectedReads).toBe(1);
+    await page.waitForTimeout(250);
+    await expect(page).toHaveURL(url => relative(url) === destination);
+    releaseLogout!();
+    await expect(page.getByRole('alert')).toContainText('Your session may still be active');
+    await page.clock.fastForward(5001);
+    await expect.poll(() => rejectedReads).toBe(2);
+    await expect(page).toHaveURL(url => relative(url) === `/login?return_to=${component(destination)}`);
+    await signIn(page);
+    await expect(page).toHaveURL(url => relative(url) === destination);
+  });
+}

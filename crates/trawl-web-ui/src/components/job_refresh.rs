@@ -100,9 +100,10 @@ where
                 return;
             }
             if matches!(result, Err(ApiError::Unauthorized)) {
-                live.set(false);
-                timer.update_value(|t| *t = None);
-                crate::auth_return::redirect_to_login();
+                if crate::auth_return::redirect_to_login() {
+                    live.set(false);
+                    timer.update_value(|t| *t = None);
+                }
                 return;
             }
             match result {

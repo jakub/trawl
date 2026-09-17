@@ -157,21 +157,19 @@ pub fn AuthShell() -> impl IntoView {
     let signing_out = RwSignal::new(false);
     let logout_error = RwSignal::new(false);
     let on_logout = Callback::new(move |()| {
-        if signing_out.get_untracked() {
+        if signing_out.get_untracked() || !crate::auth_return::begin_explicit_logout() {
             return;
         }
         signing_out.set(true);
         logout_error.set(false);
         spawn_local(async move {
-            match api::logout().await {
-                Ok(()) => {
-                    if let Some(win) = web_sys::window() {
-                        let _ = win.location().set_href("/login");
-                    }
+            if let Ok(()) = api::logout().await {
+                if let Some(win) = web_sys::window() {
+                    let _ = win.location().set_href("/login");
                 }
-                Err(_) => {
-                    logout_error.try_set(true);
-                }
+            } else {
+                crate::auth_return::cancel_explicit_logout();
+                logout_error.try_set(true);
             }
             signing_out.try_set(false);
         });

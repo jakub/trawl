@@ -129,17 +129,35 @@ std::thread_local! {
     // reset the guard: another live Jobs helper or a queued /me response can
     // otherwise replace the first destination before the document unloads.
     static LOGIN_REDIRECT_STARTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    // Explicit logout takes precedence from the user's click until failure
+    // or document departure, including while its HTTP response is pending.
+    static EXPLICIT_LOGOUT_PENDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Claim logout for this document, including across shell remounts.
+#[cfg(target_arch = "wasm32")]
+pub fn begin_explicit_logout() -> bool {
+    EXPLICIT_LOGOUT_PENDING.with(|pending| !pending.replace(true))
+}
+
+/// A failed logout must allow subsequent session expiry to redirect normally.
+#[cfg(target_arch = "wasm32")]
+pub fn cancel_explicit_logout() {
+    EXPLICIT_LOGOUT_PENDING.with(|pending| pending.set(false));
 }
 
 /// Replace an interrupted protected page with sign-in, capturing its current
 /// URL only when the first authorized automatic redirect reaches this call.
+/// Return whether navigation started, so suppressed Jobs reads keep polling.
 #[cfg(target_arch = "wasm32")]
-pub fn redirect_to_login() {
-    if LOGIN_REDIRECT_STARTED.with(std::cell::Cell::get) {
-        return;
+pub fn redirect_to_login() -> bool {
+    if LOGIN_REDIRECT_STARTED.with(std::cell::Cell::get)
+        || EXPLICIT_LOGOUT_PENDING.with(std::cell::Cell::get)
+    {
+        return false;
     }
     let Some(window) = web_sys::window() else {
-        return;
+        return false;
     };
     let location = window.location();
     let raw = (|| {
@@ -154,7 +172,11 @@ pub fn redirect_to_login() {
     let candidate = captured_destination(&raw);
     let destination = browser_destination(&window, candidate);
     LOGIN_REDIRECT_STARTED.with(|started| started.set(true));
-    let _ = location.replace(&login_href(&destination));
+    if location.replace(&login_href(&destination)).is_err() {
+        LOGIN_REDIRECT_STARTED.with(|started| started.set(false));
+        return false;
+    }
+    true
 }
 
 /// Read the current sign-in query after authentication succeeds. Failures do
