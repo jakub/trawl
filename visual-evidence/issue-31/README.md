@@ -37,9 +37,9 @@ dark/inverse `seg-mini` fill. **After**: active segment is the unified
 amber-wash `Segmented` treatment (matching the export-modal format row).
 The service-card **status dots** also unify here — 6px flat → 7px ringed.
 
-| before | after |
-|---|---|
-| ![before](before/schema.light.png) | ![after](after/schema.light.png) |
+The schema images are retired from the current tree. The
+[original comparison](https://github.com/jakub/trawl/blob/6314d432bfecfc85eb30dedb817afd8d0bbde729/visual-evidence/issue-31/README.md#2-schema-density-toggle-schema)
+preserves the captures at their recorded revision.
 
 ### 3. Intel badges (`stories`) — surface retired
 
@@ -63,9 +63,9 @@ the canonical 10px uppercase chip.
 The `.tbl-foot` table footer collapses onto the canonical `Pager`
 (`.results-footer`) — panel bg + 8px pad, Sm buttons.
 
-| before | after |
-|---|---|
-| ![before](before/history.light.png) | ![after](after/history.light.png) |
+The history images are retired from the current tree. The
+[original comparison](https://github.com/jakub/trawl/blob/6314d432bfecfc85eb30dedb817afd8d0bbde729/visual-evidence/issue-31/README.md#4-history-pager-history)
+preserves the captures at their recorded revision.
 
 ### 5. Loading state (`loading`)
 
@@ -78,7 +78,7 @@ treatment (before renders it in the old mono style; after in the proportional
 |---|---|
 | ![before](before/loading.light.png) | ![after](after/loading.light.png) |
 
-Dark-theme captures for every surface sit alongside each light shot
+Dark-theme captures for the retained surfaces sit alongside each light shot
 (`*.dark.png`).
 
 ## Reproduction

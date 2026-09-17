@@ -78,3 +78,5 @@ jobs:
         with:
           name: documentation-site
           path: docs/dist
+          # Development previews expire quickly; release evidence keeps the repository default.
+          retention-days: ${{ inputs.release-tag == '' && 7 || 0 }}
