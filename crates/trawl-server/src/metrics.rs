@@ -156,6 +156,12 @@ impl CompactionOperation {
             Self::ConsumedWalRemoval => "consumed_wal_removal",
         }
     }
+
+    /// Record at the failed attempt's owner, never again during propagation.
+    pub(crate) fn record_failure(self) {
+        metrics::counter!(COMPACTION_OPERATION_FAILURES_TOTAL, "operation" => self.label())
+            .increment(1);
+    }
 }
 
 /// Successfully isolated files; this is not an event-loss count.

@@ -21,7 +21,7 @@ use trawl_core::severity::Dialect;
 use crate::catalog::CatalogContext;
 use crate::env_dirs::{list_env_dirs, try_list_env_dirs};
 use crate::hot_buffer::HotBuffer;
-use crate::metrics::BookkeepingWrite;
+use crate::metrics::{BookkeepingWrite, CompactionOperation, QuarantineKind};
 use crate::publication::PublicationGate;
 use crate::repin::RepinCoordinator;
 use crate::state::CompactionStats;
@@ -194,6 +194,7 @@ pub async fn compact_once_coordinated(
     // empty list silently. Unlike a single unreadable env (isolated and
     // counted), a bad root leaves nothing to carry on with.
     let env_wal_dirs = try_list_env_dirs(wal_dir).map_err(|e| {
+        CompactionOperation::WalRootScan.record_failure();
         format!(
             "failed to list WAL env directories in {}: {e}",
             wal_dir.display()
@@ -286,6 +287,7 @@ pub async fn compact_once_coordinated(
                                 Ok(()) => {}
                                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                                 Err(e) => {
+                                    CompactionOperation::ConsumedWalRemoval.record_failure();
                                     tracing::warn!(
                                         event_type = "compaction_error",
                                         file = %f.display(),
@@ -297,6 +299,9 @@ pub async fn compact_once_coordinated(
                         }
                     }
                     Err(e) => {
+                        // Owns ordinary failures and handled blocking-task
+                        // failures returned in this chunk's outcome.
+                        CompactionOperation::Chunk.record_failure();
                         // Leave remaining WAL files for retry on next tick.
                         tracing::error!(
                             event_type = "compaction_error",
@@ -383,7 +388,10 @@ async fn recover_pending_rollups(
             Ok(())
         })
         .await
-        .map_err(|e| format!("rollup recovery task panicked: {e}"))??;
+        .map_err(|e| {
+            CompactionOperation::PendingRollupRecovery.record_failure();
+            format!("rollup recovery task panicked: {e}")
+        })??;
     }
     // An incomplete bootstrap scan must also stop WAL publication, even if
     // the failed scan did not discover a marker before encountering an error.
@@ -410,7 +418,15 @@ async fn rollup_once(
     publication: Option<Arc<PublicationGate>>,
 ) -> Result<u64, String> {
     let mut total: u64 = 0;
-    for (_env, env_data_dir) in list_env_dirs(data_dir) {
+    // Preserve the existing best-effort empty result and warning. Observe
+    // this rollup scan here rather than changing other env-list consumers.
+    let env_dirs = try_list_env_dirs(data_dir).unwrap_or_else(|e| {
+        CompactionOperation::DailyRollupScan.record_failure();
+        tracing::warn!(dir = %data_dir.display(), error = %e,
+            "failed to list env directories, treating as empty");
+        Vec::new()
+    });
+    for (_env, env_data_dir) in env_dirs {
         if repin.is_some_and(|c| c.rollup_paused()) {
             break;
         }
@@ -451,6 +467,42 @@ fn log_rollup_stand_down() {
     );
 }
 
+/// Read an env's entries, observing scan errors while retaining the existing
+/// root-error and per-entry skip behavior.
+fn read_rollup_env_entries(
+    data_dir: &Path,
+) -> Result<impl Iterator<Item = std::fs::DirEntry>, String> {
+    let date_dirs = std::fs::read_dir(data_dir).map_err(|e| {
+        // Retention can remove a directory after this pass discovered it.
+        // Keep the existing Err, but absence is not failed-operation evidence.
+        if e.kind() != std::io::ErrorKind::NotFound {
+            CompactionOperation::DailyRollupScan.record_failure();
+        }
+        format!("failed to read data_dir: {e}")
+    })?;
+
+    Ok(date_dirs
+        .inspect(|entry| {
+            if entry
+                .as_ref()
+                .is_err_and(|e| e.kind() != std::io::ErrorKind::NotFound)
+            {
+                CompactionOperation::DailyRollupScan.record_failure();
+            }
+        })
+        .flatten())
+}
+
+/// Select historical date directories. Today stays hourly for fast writes;
+/// non-date entries such as `wal` do not participate in daily rollup.
+fn historical_rollup_date(path: &Path, today: &str) -> Option<String> {
+    if !path.is_dir() {
+        return None;
+    }
+    let name = path.file_name()?.to_str()?;
+    (name != today && looks_like_date(name)).then(|| name.to_owned())
+}
+
 /// Roll up one env root (`data_dir/{env}`): consolidate each historical
 /// date's hourly files into per-service daily files. Never crosses envs.
 async fn rollup_env_once(
@@ -463,29 +515,11 @@ async fn rollup_env_once(
     let mut failures: u64 = 0;
     let mut quarantined_total: u64 = 0;
 
-    let date_dirs =
-        std::fs::read_dir(data_dir).map_err(|e| format!("failed to read data_dir: {e}"))?;
-
-    for entry in date_dirs.flatten() {
+    for entry in read_rollup_env_entries(data_dir)? {
         let path = entry.path();
-        if !path.is_dir() {
+        let Some(dir_name) = historical_rollup_date(&path, &today) else {
             continue;
-        }
-
-        let dir_name = match path.file_name().and_then(|n| n.to_str()) {
-            Some(n) => n.to_owned(),
-            None => continue,
         };
-
-        // Skip today — it stays hourly for fast writes.
-        if dir_name == today {
-            continue;
-        }
-
-        // Skip directories that aren't date-formatted (e.g. "wal").
-        if !looks_like_date(&dir_name) {
-            continue;
-        }
 
         // Recover any interrupted rollups from previous runs before
         // starting new ones. This ensures crash-orphaned hourly files
@@ -514,7 +548,10 @@ async fn rollup_env_once(
             recover_rollup_markers_coordinated(&day, recovery_publication.as_deref())
         })
         .await
-        .map_err(|e| format!("rollup recovery task panicked: {e}"))?;
+        .map_err(|e| {
+            CompactionOperation::PendingRollupRecovery.record_failure();
+            format!("rollup recovery task panicked: {e}")
+        })?;
         if let Err(e) = recovery {
             // A wedged recovery is data-loss-adjacent (an interrupted rollup
             // left orphaned hourlies/tmp that couldn't be cleaned up), so count
@@ -567,7 +604,10 @@ async fn rollup_env_once(
                 rollup_day_coordinated(&day_dir, &svc, &files, &mem_limit, publication.as_deref())
             })
             .await
-            .map_err(|e| format!("rollup task panicked: {e}"))?;
+            .map_err(|e| {
+                CompactionOperation::DailyRollupUnit.record_failure();
+                format!("rollup task panicked: {e}")
+            })?;
             drop(unit_guard);
 
             // Quarantined inputs are data-loss whether or not the merge then
@@ -577,6 +617,7 @@ async fn rollup_env_once(
             // a retry can't re-count them).
             quarantined_total += outcome.quarantined;
             if let Err(e) = outcome.result {
+                CompactionOperation::DailyRollupUnit.record_failure();
                 failures += 1;
                 tracing::error!(
                     event_type = "rollup_error",
@@ -611,10 +652,24 @@ fn looks_like_date(name: &str) -> bool {
 
 /// Collect subdirectories that look like hour directories (00-23).
 fn collect_hour_dirs(day_dir: &Path) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(day_dir) else {
-        return Vec::new();
+    let entries = match std::fs::read_dir(day_dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                CompactionOperation::DailyRollupScan.record_failure();
+            }
+            return Vec::new();
+        }
     };
     entries
+        .inspect(|entry| {
+            if entry
+                .as_ref()
+                .is_err_and(|e| e.kind() != std::io::ErrorKind::NotFound)
+            {
+                CompactionOperation::DailyRollupScan.record_failure();
+            }
+        })
         .flatten()
         .filter_map(|e| {
             let p = e.path();
@@ -634,10 +689,26 @@ fn collect_service_files(hour_dirs: &[PathBuf]) -> HashMap<String, Vec<PathBuf>>
     let mut groups: HashMap<String, Vec<PathBuf>> = HashMap::new();
 
     for hour_dir in hour_dirs {
-        let Ok(entries) = std::fs::read_dir(hour_dir) else {
-            continue;
+        let entries = match std::fs::read_dir(hour_dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    CompactionOperation::DailyRollupScan.record_failure();
+                }
+                continue;
+            }
         };
-        for entry in entries.flatten() {
+        for entry in entries
+            .inspect(|entry| {
+                if entry
+                    .as_ref()
+                    .is_err_and(|e| e.kind() != std::io::ErrorKind::NotFound)
+                {
+                    CompactionOperation::DailyRollupScan.record_failure();
+                }
+            })
+            .flatten()
+        {
             let path = entry.path();
             if path.extension().is_some_and(|ext| ext == "parquet")
                 && let Some(service) = path.file_stem().and_then(|s| s.to_str())
@@ -702,8 +773,26 @@ fn recover_rollup_markers_coordinated(
     day_dir: &Path,
     publication: Option<&PublicationGate>,
 ) -> Result<(), String> {
-    let entries =
-        std::fs::read_dir(day_dir).map_err(|e| format!("failed to list rollup markers: {e}"))?;
+    // Classify the actual read error before converting it to the existing
+    // string result. A stat-before-read check would race retention again.
+    let entries = std::fs::read_dir(day_dir).map_err(|e| {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            CompactionOperation::PendingRollupRecovery.record_failure();
+        }
+        format!("failed to list rollup markers: {e}")
+    })?;
+    // Returned errors are owned here, including errors from nested file
+    // operations. Async callers separately own only their JoinError branch.
+    recover_rollup_markers_inner(day_dir, publication, entries).inspect_err(|_| {
+        CompactionOperation::PendingRollupRecovery.record_failure();
+    })
+}
+
+fn recover_rollup_markers_inner(
+    day_dir: &Path,
+    publication: Option<&PublicationGate>,
+    entries: std::fs::ReadDir,
+) -> Result<(), String> {
     for entry in entries {
         let path = entry
             .map_err(|e| format!("failed to read rollup entry: {e}"))?
@@ -770,7 +859,12 @@ fn recover_rollup_markers_coordinated(
                 if let Some(gate) = publication {
                     gate.finish_rollup(&path);
                 }
-                quarantine_file(&tmp, service, "rollup_quarantine")?;
+                quarantine_file(
+                    &tmp,
+                    service,
+                    "rollup_quarantine",
+                    QuarantineKind::RollupTemporary,
+                )?;
                 continue;
             }
         } else {
@@ -950,7 +1044,12 @@ fn quarantine_target(path: &Path) -> Result<PathBuf, String> {
 /// that path so a failure leaves no empty `.corrupt` debris behind.
 ///
 /// Returns the path the file now lives at.
-fn quarantine_file(path: &Path, service: &str, event_type: &str) -> Result<PathBuf, String> {
+fn quarantine_file(
+    path: &Path,
+    service: &str,
+    event_type: &str,
+    kind: QuarantineKind,
+) -> Result<PathBuf, String> {
     let quarantined = quarantine_target(path).inspect_err(|e| {
         tracing::error!(
             event_type,
@@ -962,6 +1061,10 @@ fn quarantine_file(path: &Path, service: &str, event_type: &str) -> Result<PathB
     })?;
     match std::fs::rename(path, &quarantined) {
         Ok(()) => {
+            // Observe the rename now: later work can fail or panic, and a
+            // retry cannot rediscover the original path to count this fact.
+            metrics::counter!(crate::metrics::FILES_QUARANTINED_TOTAL, "kind" => kind.label())
+                .increment(1);
             tracing::warn!(
                 event_type,
                 compact_service = %service,
@@ -1141,7 +1244,7 @@ fn rollup_day_inner(
             // A failed quarantine is a hard error — the bad file still
             // matches `*.parquet` and would wedge the rollup forever.
             let _publication_guard = publication.map(PublicationGate::blocking_write);
-            quarantine_file(f, service, "rollup_quarantine")?;
+            quarantine_file(f, service, "rollup_quarantine", QuarantineKind::Parquet)?;
             *quarantined += 1;
         }
     }
@@ -1150,7 +1253,12 @@ fn rollup_day_inner(
             all_files.push(canonical_path.clone());
         } else {
             let _publication_guard = publication.map(PublicationGate::blocking_write);
-            quarantine_file(&canonical_path, service, "rollup_quarantine")?;
+            quarantine_file(
+                &canonical_path,
+                service,
+                "rollup_quarantine",
+                QuarantineKind::Parquet,
+            )?;
             *quarantined += 1;
         }
     }
@@ -1717,7 +1825,7 @@ fn read_wal_to_table(
         if probe_ndjson(conn, f).is_ok() {
             survivors.push(f.clone());
         } else {
-            quarantine_file(f, service, "compaction_quarantine")?;
+            quarantine_file(f, service, "compaction_quarantine", QuarantineKind::Wal)?;
             *quarantined += 1;
         }
     }
@@ -2054,7 +2162,7 @@ fn prepare_service_batch(
         if is_valid_ndjson(f) {
             valid_files.push(f.clone());
         } else {
-            quarantine_file(f, service, "compaction_quarantine")?;
+            quarantine_file(f, service, "compaction_quarantine", QuarantineKind::Wal)?;
             *quarantined += 1;
         }
     }
@@ -3333,6 +3441,7 @@ fn scan_env_wal_files(env: &str, env_wal_dir: &Path, min_age: Duration) -> Optio
     match scan_wal_files(env_wal_dir, min_age) {
         Ok(files) => Some(files),
         Err(e) => {
+            CompactionOperation::WalEnvironmentScan.record_failure();
             tracing::error!(
                 event_type = "compaction_error",
                 compact_env = %env,
@@ -3406,6 +3515,685 @@ fn extract_service_from_filename(filename: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Async operation tests need the same recorder on their blocking workers.
+    // nextest runs each test in its own process, as for the server's other
+    // global-recorder tests. Read deltas so initialization never resets data.
+    fn operational_metrics() -> metrics_exporter_prometheus::PrometheusHandle {
+        static HANDLE: std::sync::OnceLock<metrics_exporter_prometheus::PrometheusHandle> =
+            std::sync::OnceLock::new();
+        let handle = HANDLE
+            .get_or_init(|| {
+                crate::metrics::prometheus_builder()
+                    .install_recorder()
+                    .unwrap()
+            })
+            .clone();
+        crate::metrics::init_operational_alert_metrics();
+        handle
+    }
+
+    fn operation_count(
+        handle: &metrics_exporter_prometheus::PrometheusHandle,
+        operation: CompactionOperation,
+    ) -> u64 {
+        crate::metrics::test_support::sample(
+            handle,
+            &format!(
+                "trawl_compaction_operation_failures_total{{operation=\"{}\"}}",
+                operation.label()
+            ),
+        )
+    }
+
+    fn quarantine_count(
+        handle: &metrics_exporter_prometheus::PrometheusHandle,
+        kind: QuarantineKind,
+    ) -> u64 {
+        crate::metrics::test_support::sample(
+            handle,
+            &format!("trawl_files_quarantined_total{{kind=\"{}\"}}", kind.label()),
+        )
+    }
+
+    const OPERATIONAL_ROW: &str = r#"{"_time":"2026-01-15T00:00:00Z","_ingested":"2026-01-15T00:00:00Z","service":"svc","message":"retained"}"#;
+
+    #[tokio::test]
+    async fn operational_scan_failures_and_idle_controls() {
+        let recorder = crate::metrics::prometheus_builder().build_recorder();
+        let handle = recorder.handle();
+        // These direct scans and marker-free cycles do not spawn blocking
+        // workers. A thread-local recorder observes every attempted operation.
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        crate::metrics::init_operational_alert_metrics();
+        let tmp = tempfile::tempdir().unwrap();
+        let wal = tmp.path().join("missing-wal");
+        let data = tmp.path().join("missing-data");
+        for rollup in [false, true] {
+            assert_eq!(
+                compact_once(&wal, &data, Duration::ZERO, rollup, None, 1, "2GB", None)
+                    .await
+                    .unwrap(),
+                0
+            );
+        }
+        for operation in CompactionOperation::ALL {
+            assert_eq!(operation_count(&handle, operation), 0);
+        }
+
+        std::fs::write(&wal, b"not a WAL directory").unwrap();
+        assert!(
+            compact_once(&wal, &data, Duration::ZERO, false, None, 1, "2GB", None)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            operation_count(&handle, CompactionOperation::WalRootScan),
+            1
+        );
+        assert!(scan_env_wal_files("prod", &wal, Duration::ZERO).is_none());
+        assert_eq!(
+            operation_count(&handle, CompactionOperation::WalEnvironmentScan),
+            1
+        );
+        assert_eq!(
+            scan_env_wal_files("prod", &tmp.path().join("absent"), Duration::ZERO),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            operation_count(&handle, CompactionOperation::WalEnvironmentScan),
+            1
+        );
+
+        // Exercise each existing daily-rollup scan owner with a regular file
+        // in place of its directory, preserving its return/skip behavior.
+        assert_eq!(rollup_once(&wal, "2GB", None, None).await.unwrap(), 0);
+        assert_eq!(
+            operation_count(&handle, CompactionOperation::DailyRollupScan),
+            1
+        );
+        assert!(rollup_env_once(&wal, "2GB", None, None).await.is_err());
+        assert_eq!(
+            operation_count(&handle, CompactionOperation::DailyRollupScan),
+            2
+        );
+        assert!(collect_hour_dirs(&wal).is_empty());
+        assert_eq!(
+            operation_count(&handle, CompactionOperation::DailyRollupScan),
+            3
+        );
+        assert!(collect_service_files(std::slice::from_ref(&wal)).is_empty());
+        assert_eq!(
+            operation_count(&handle, CompactionOperation::DailyRollupScan),
+            4
+        );
+        for operation in [
+            CompactionOperation::Chunk,
+            CompactionOperation::DailyRollupUnit,
+            CompactionOperation::PendingRollupRecovery,
+        ] {
+            assert_eq!(operation_count(&handle, operation), 0);
+        }
+
+        let broken_data = tmp.path().join("broken-data");
+        std::fs::write(&broken_data, b"not a data directory").unwrap();
+        let hot = Arc::new(HotBuffer::new(crate::hot_buffer::HotBufferConfig {
+            max_events: 100,
+            max_bytes: 100_000,
+        }));
+        for _ in 0..2 {
+            assert!(
+                compact_once(
+                    &tmp.path().join("no-wal"),
+                    &broken_data,
+                    Duration::ZERO,
+                    false,
+                    Some(&hot),
+                    500,
+                    "2GB",
+                    None
+                )
+                .await
+                .is_err()
+            );
+        }
+        assert_eq!(
+            operation_count(&handle, CompactionOperation::PendingRollupScan),
+            1
+        );
+        assert_eq!(
+            operation_count(&handle, CompactionOperation::PendingRollupRecovery),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn operational_deleted_rollup_directories_are_not_failure_evidence() {
+        let recorder = crate::metrics::prometheus_builder().build_recorder();
+        let handle = recorder.handle();
+        // These directory-boundary calls return before any worker is spawned.
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        crate::metrics::init_operational_alert_metrics();
+        let tmp = tempfile::tempdir().unwrap();
+        // Retention can remove a discovered env/day/hour before its scan or
+        // recovery starts. Preserve the original control flow, including the
+        // recovery Err, without manufacturing failed-operation evidence.
+        let removed = tmp.path().join("removed-by-retention");
+        std::fs::create_dir(&removed).unwrap();
+        std::fs::remove_dir(&removed).unwrap();
+        assert!(rollup_env_once(&removed, "2GB", None, None).await.is_err());
+        assert!(collect_hour_dirs(&removed).is_empty());
+        assert!(collect_service_files(std::slice::from_ref(&removed)).is_empty());
+        let recovery = recover_rollup_markers_coordinated(&removed, None);
+        assert!(
+            recovery
+                .unwrap_err()
+                .starts_with("failed to list rollup markers:")
+        );
+        assert_eq!(
+            operation_count(&handle, CompactionOperation::DailyRollupScan),
+            0
+        );
+        assert_eq!(
+            operation_count(&handle, CompactionOperation::PendingRollupRecovery),
+            0
+        );
+
+        // A file in place of those directories must still emit real failures.
+        std::fs::write(&removed, b"not a directory").unwrap();
+        assert!(rollup_env_once(&removed, "2GB", None, None).await.is_err());
+        assert!(collect_hour_dirs(&removed).is_empty());
+        assert!(collect_service_files(std::slice::from_ref(&removed)).is_empty());
+        assert!(recover_rollup_markers_coordinated(&removed, None).is_err());
+        assert_eq!(
+            operation_count(&handle, CompactionOperation::DailyRollupScan),
+            3
+        );
+        assert_eq!(
+            operation_count(&handle, CompactionOperation::PendingRollupRecovery),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn operational_successful_quarantine_and_healthy_work_are_not_operation_failures() {
+        let handle = operational_metrics();
+        let before = quarantine_count(&handle, QuarantineKind::Wal);
+        let tmp = tempfile::tempdir().unwrap();
+        let wal = tmp.path().join("wal");
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(wal.join("prod")).unwrap();
+        let corrupt = wal.join("prod/svc_0_bad.ndjson");
+        std::fs::write(&corrupt, [0; 32]).unwrap();
+        assert_eq!(
+            compact_once(&wal, &data, Duration::ZERO, false, None, 500, "2GB", None)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(quarantine_count(&handle, QuarantineKind::Wal) - before, 1);
+        assert_eq!(
+            std::fs::read(corrupt.with_extension("ndjson.corrupt")).unwrap(),
+            [0; 32]
+        );
+        let healthy = write_wal_file(&wal.join("prod"), "svc", &[OPERATIONAL_ROW]);
+        assert_eq!(
+            compact_once(&wal, &data, Duration::ZERO, true, None, 500, "2GB", None)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(!healthy.exists());
+        let output = find_files_by_ext(&data, "parquet");
+        assert_eq!(output.len(), 1);
+        assert_eq!(read_strings(&output[0], "message"), ["retained"]);
+        for operation in CompactionOperation::ALL {
+            assert_eq!(operation_count(&handle, operation), 0);
+        }
+        assert_eq!(quarantine_count(&handle, QuarantineKind::Wal) - before, 1);
+    }
+
+    #[tokio::test]
+    async fn operational_best_effort_failures_preserve_prior_quarantines() {
+        let handle = operational_metrics();
+        let chunk_before = operation_count(&handle, CompactionOperation::Chunk);
+        let wal_before = quarantine_count(&handle, QuarantineKind::Wal);
+        let tmp = tempfile::tempdir().unwrap();
+        let wal = tmp.path().join("wal");
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(wal.join("prod")).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("prod"), b"output obstruction").unwrap();
+        let good = write_wal_file(&wal.join("prod"), "svc", &[OPERATIONAL_ROW]);
+        let bad = wal.join("prod/svc_0_bad.ndjson");
+        std::fs::write(&bad, [0; 32]).unwrap();
+        let result = compact_once(&wal, &data, Duration::ZERO, false, None, 500, "2GB", None).await;
+        assert!(result.is_ok(), "chunk errors remain best-effort");
+        assert_eq!(
+            operation_count(&handle, CompactionOperation::Chunk) - chunk_before,
+            1
+        );
+        assert_eq!(
+            quarantine_count(&handle, QuarantineKind::Wal) - wal_before,
+            1
+        );
+        assert!(good.exists());
+        assert_eq!(
+            std::fs::read(bad.with_extension("ndjson.corrupt")).unwrap(),
+            [0; 32]
+        );
+        assert!(!bad.exists());
+        assert!(find_files_by_ext(&data, "parquet").is_empty());
+
+        let rollup_before = operation_count(&handle, CompactionOperation::DailyRollupUnit);
+        let parquet_before = quarantine_count(&handle, QuarantineKind::Parquet);
+        let rollup_root = tmp.path().join("rollup-data");
+        let day = rollup_root.join("prod/2026-01-15");
+        std::fs::create_dir_all(day.join("00")).unwrap();
+        std::fs::create_dir_all(day.join("01")).unwrap();
+        let corrupt = day.join("00/svc.parquet");
+        let unreadable = day.join("01/svc.parquet");
+        std::fs::write(&corrupt, b"").unwrap();
+        std::fs::write(&unreadable, b"PAR1\xff\xff\xff\xffPAR1").unwrap();
+        assert!(
+            compact_once(
+                &tmp.path().join("no-wal"),
+                &rollup_root,
+                Duration::ZERO,
+                true,
+                None,
+                500,
+                "2GB",
+                None
+            )
+            .await
+            .is_ok()
+        );
+        assert_eq!(
+            operation_count(&handle, CompactionOperation::DailyRollupUnit) - rollup_before,
+            1
+        );
+        assert_eq!(
+            quarantine_count(&handle, QuarantineKind::Parquet) - parquet_before,
+            1
+        );
+        assert!(!corrupt.exists());
+        assert!(corrupt.with_extension("parquet.corrupt").exists());
+        assert_eq!(
+            std::fs::read(&unreadable).unwrap(),
+            b"PAR1\xff\xff\xff\xffPAR1"
+        );
+        assert!(!day.join("svc.parquet").exists());
+    }
+
+    #[tokio::test]
+    async fn operational_recovery_failure_and_temporary_quarantine_are_separate_facts() {
+        let handle = operational_metrics();
+        let recovery_before = operation_count(&handle, CompactionOperation::PendingRollupRecovery);
+        let quarantine_before = quarantine_count(&handle, QuarantineKind::RollupTemporary);
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let env = data.join("prod");
+        let hourly = write_hourly_parquet(&env, "2026-01-15", "00", "svc", &[OPERATIONAL_ROW]);
+        let hourly_bytes = std::fs::read(&hourly).unwrap();
+        let day = env.join("2026-01-15");
+        let temporary = day.join("svc.parquet.tmp");
+        std::fs::write(&temporary, b"truncated output").unwrap();
+        write_rollup_marker(&day, "svc", std::slice::from_ref(&hourly)).unwrap();
+        assert!(
+            compact_once(
+                &tmp.path().join("no-wal"),
+                &data,
+                Duration::ZERO,
+                false,
+                None,
+                500,
+                "2GB",
+                None
+            )
+            .await
+            .is_ok()
+        );
+        assert_eq!(
+            quarantine_count(&handle, QuarantineKind::RollupTemporary) - quarantine_before,
+            1
+        );
+        assert_eq!(
+            operation_count(&handle, CompactionOperation::PendingRollupRecovery) - recovery_before,
+            0
+        );
+        assert_eq!(std::fs::read(&hourly).unwrap(), hourly_bytes);
+        assert_eq!(
+            std::fs::read(day.join("svc.parquet.tmp.corrupt")).unwrap(),
+            b"truncated output"
+        );
+        assert!(!day.join("svc.parquet").exists());
+
+        // A directory cannot replace quarantine_target's reserved file. The
+        // failed rename retains the source and is one failed recovery attempt.
+        std::fs::create_dir(&temporary).unwrap();
+        write_rollup_marker(&day, "svc", std::slice::from_ref(&hourly)).unwrap();
+        assert!(
+            compact_once(
+                &tmp.path().join("no-wal"),
+                &data,
+                Duration::ZERO,
+                false,
+                None,
+                500,
+                "2GB",
+                None
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            operation_count(&handle, CompactionOperation::PendingRollupRecovery) - recovery_before,
+            1
+        );
+        assert_eq!(
+            quarantine_count(&handle, QuarantineKind::RollupTemporary) - quarantine_before,
+            1
+        );
+        assert_eq!(std::fs::read(&hourly).unwrap(), hourly_bytes);
+        assert!(temporary.is_dir());
+        assert!(
+            !day.join("svc.parquet.tmp.corrupt.1").exists(),
+            "failed rename removes its reservation"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn operational_failed_quarantine_reservation_is_not_a_quarantined_file() {
+        let handle = operational_metrics();
+        let chunk_before = operation_count(&handle, CompactionOperation::Chunk);
+        let wal_before = quarantine_count(&handle, QuarantineKind::Wal);
+        let tmp = tempfile::tempdir().unwrap();
+        let wal = tmp.path().join("wal");
+        std::fs::create_dir_all(wal.join("prod")).unwrap();
+        // The source component fits the filesystem's 255-byte limit, while
+        // its .corrupt reservation does not. No permission-bit assumptions.
+        let source = wal
+            .join("prod")
+            .join(format!("{}_0_0.ndjson", "x".repeat(239)));
+        std::fs::write(&source, [0; 32]).unwrap();
+        assert!(
+            compact_once(
+                &wal,
+                &tmp.path().join("data"),
+                Duration::ZERO,
+                false,
+                None,
+                500,
+                "2GB",
+                None
+            )
+            .await
+            .is_ok()
+        );
+        assert_eq!(
+            operation_count(&handle, CompactionOperation::Chunk) - chunk_before,
+            1
+        );
+        assert_eq!(
+            quarantine_count(&handle, QuarantineKind::Wal) - wal_before,
+            0
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), [0; 32]);
+        assert_eq!(std::fs::read_dir(wal.join("prod")).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn operational_repin_suppression_and_pending_wait_are_not_failures() {
+        let recorder = crate::metrics::prometheus_builder().build_recorder();
+        let handle = recorder.handle();
+        // Both paths stand down before spawning any blocking work, so this
+        // thread-local recorder observes all operation accounting in the test.
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        crate::metrics::init_operational_alert_metrics();
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let day = data.join("prod/2026-01-15");
+        std::fs::create_dir_all(day.join("00")).unwrap();
+        let input = day.join("00/svc.parquet");
+        std::fs::write(&input, b"would be quarantined if rollup ran").unwrap();
+        let coordinator = Arc::new(RepinCoordinator::new());
+        let _pause = coordinator.pause_rollup();
+        let hot = Arc::new(HotBuffer::new(crate::hot_buffer::HotBufferConfig {
+            max_events: 100,
+            max_bytes: 100_000,
+        }));
+        assert_eq!(
+            compact_once_coordinated(
+                &tmp.path().join("no-wal"),
+                &data,
+                Duration::ZERO,
+                true,
+                Some(&hot),
+                500,
+                "2GB",
+                None,
+                Some(&coordinator)
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        let marker = day.join(".rollup-svc");
+        std::fs::write(&marker, input.to_string_lossy().as_bytes()).unwrap();
+        hot.publication().mark_rollup(&marker);
+        assert!(
+            compact_once_coordinated(
+                &tmp.path().join("no-wal"),
+                &data,
+                Duration::ZERO,
+                true,
+                Some(&hot),
+                500,
+                "2GB",
+                None,
+                Some(&coordinator)
+            )
+            .await
+            .is_err()
+        );
+        for operation in CompactionOperation::ALL {
+            assert_eq!(operation_count(&handle, operation), 0);
+        }
+        for kind in QuarantineKind::ALL {
+            assert_eq!(quarantine_count(&handle, kind), 0);
+        }
+        assert_eq!(
+            std::fs::read(&input).unwrap(),
+            b"would be quarantined if rollup ran"
+        );
+        assert!(marker.exists());
+    }
+
+    #[tokio::test]
+    async fn operational_chunk_task_panic_keeps_published_output_and_counts_once() {
+        let handle = operational_metrics();
+        let before = operation_count(&handle, CompactionOperation::Chunk);
+        let tmp = tempfile::tempdir().unwrap();
+        let wal = tmp.path().join("wal");
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(wal.join("prod")).unwrap();
+        let input = write_wal_file(&wal.join("prod"), "svc", &[OPERATIONAL_ROW]);
+        let hot = Arc::new(HotBuffer::new(crate::hot_buffer::HotBufferConfig {
+            max_events: 100,
+            max_bytes: 100_000,
+        }));
+        hot.publication().panic_next_publication_for_test();
+        assert!(
+            compact_once(
+                &wal,
+                &data,
+                Duration::ZERO,
+                false,
+                Some(&hot),
+                500,
+                "2GB",
+                None
+            )
+            .await
+            .is_ok()
+        );
+        assert_eq!(
+            operation_count(&handle, CompactionOperation::Chunk) - before,
+            1
+        );
+        assert!(input.exists(), "a failed chunk does not remove its WAL");
+        let output = find_files_by_ext(&data, "parquet");
+        assert_eq!(
+            output.len(),
+            1,
+            "the handled task failure follows publication"
+        );
+        assert_eq!(read_strings(&output[0], "message"), ["retained"]);
+        assert_eq!(
+            operation_count(&handle, CompactionOperation::ConsumedWalRemoval),
+            0
+        );
+        assert_eq!(quarantine_count(&handle, QuarantineKind::Wal), 0);
+    }
+
+    #[tokio::test]
+    async fn operational_rollup_task_panic_counts_once_without_erasing_output() {
+        let handle = operational_metrics();
+        let before = operation_count(&handle, CompactionOperation::DailyRollupUnit);
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let env = data.join("prod");
+        let input = write_hourly_parquet(&env, "2026-01-15", "00", "svc", &[OPERATIONAL_ROW]);
+        // The outer cycle handles the propagated rollup task error. Only
+        // the per-unit JoinError owner emits the operation increment.
+        let hot = Arc::new(HotBuffer::new(crate::hot_buffer::HotBufferConfig {
+            max_events: 100,
+            max_bytes: 100_000,
+        }));
+        let gate = hot.publication();
+        gate.initialize(&data);
+        gate.panic_next_publication_for_test();
+        assert!(
+            compact_once(
+                &tmp.path().join("no-wal"),
+                &data,
+                Duration::ZERO,
+                true,
+                Some(&hot),
+                500,
+                "2GB",
+                None
+            )
+            .await
+            .is_ok()
+        );
+        assert_eq!(
+            operation_count(&handle, CompactionOperation::DailyRollupUnit) - before,
+            1
+        );
+        let output = env.join("2026-01-15/svc.parquet");
+        assert_eq!(read_strings(&output, "message"), ["retained"]);
+        assert!(input.exists(), "the task panicked before source retirement");
+        assert!(env.join("2026-01-15/.rollup-svc").exists());
+        assert_eq!(
+            operation_count(&handle, CompactionOperation::PendingRollupRecovery),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn operational_recovery_task_panics_count_once_at_each_async_owner() {
+        let handle = operational_metrics();
+        let before = operation_count(&handle, CompactionOperation::PendingRollupRecovery);
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let env = data.join("prod");
+        let input = write_hourly_parquet(&env, "2026-01-15", "00", "svc", &[OPERATIONAL_ROW]);
+        let day = env.join("2026-01-15");
+        let original = std::fs::read(&input).unwrap();
+        write_rollup_marker(&day, "svc", std::slice::from_ref(&input)).unwrap();
+        let gate = Arc::new(PublicationGate::new());
+        gate.initialize(&data);
+        gate.panic_next_publication_for_test();
+        assert!(recover_pending_rollups(&gate, None).await.is_err());
+        assert_eq!(
+            operation_count(&handle, CompactionOperation::PendingRollupRecovery) - before,
+            1
+        );
+        gate.panic_next_publication_for_test();
+        assert!(
+            rollup_env_once(&env, "2GB", None, Some(Arc::clone(&gate)))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            operation_count(&handle, CompactionOperation::PendingRollupRecovery) - before,
+            2
+        );
+        assert_eq!(std::fs::read(&input).unwrap(), original);
+        assert!(day.join(".rollup-svc").exists());
+        assert_eq!(
+            operation_count(&handle, CompactionOperation::DailyRollupUnit),
+            0
+        );
+        assert_eq!(
+            quarantine_count(&handle, QuarantineKind::RollupTemporary),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn operational_consumed_wal_removal_failure_preserves_published_output() {
+        let handle = operational_metrics();
+        let before = operation_count(&handle, CompactionOperation::ConsumedWalRemoval);
+        let tmp = tempfile::tempdir().unwrap();
+        let wal = tmp.path().join("wal");
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(wal.join("prod")).unwrap();
+        let input = write_wal_file(&wal.join("prod"), "svc", &[OPERATIONAL_ROW]);
+        let original = std::fs::read(&input).unwrap();
+        let retained = tmp.path().join("retained-wal");
+        let hot = Arc::new(HotBuffer::new(crate::hot_buffer::HotBufferConfig {
+            max_events: 100,
+            max_bytes: 100_000,
+        }));
+        let (entered, release) = hot.publication().pause_next_publication_for_test();
+        let input_for_thread = input.clone();
+        let retained_for_thread = retained.clone();
+        let obstruction = std::thread::spawn(move || {
+            entered.recv_timeout(Duration::from_secs(10)).unwrap();
+            // The real Parquet output is already published. Retain the WAL
+            // bytes elsewhere, then make only remove_file(original) fail.
+            std::fs::rename(&input_for_thread, retained_for_thread).unwrap();
+            std::fs::create_dir(&input_for_thread).unwrap();
+            release.send(()).unwrap();
+        });
+        let result = compact_once(
+            &wal,
+            &data,
+            Duration::ZERO,
+            false,
+            Some(&hot),
+            500,
+            "2GB",
+            None,
+        )
+        .await;
+        obstruction.join().unwrap();
+        assert!(result.is_ok(), "cleanup remains a best-effort warning");
+        assert_eq!(
+            operation_count(&handle, CompactionOperation::ConsumedWalRemoval) - before,
+            1
+        );
+        assert_eq!(operation_count(&handle, CompactionOperation::Chunk), 0);
+        assert!(input.is_dir());
+        assert_eq!(std::fs::read(retained).unwrap(), original);
+        let output = find_files_by_ext(&data, "parquet");
+        assert_eq!(output.len(), 1);
+        assert_eq!(read_strings(&output[0], "message"), ["retained"]);
+    }
 
     #[test]
     fn recovery_keeps_runtime_responsive_and_guards_after_cancellation() {
@@ -7706,12 +8494,12 @@ mod tests {
         let bad = tmp.path().join("svc.parquet");
 
         std::fs::write(&bad, b"first corruption").unwrap();
-        let first = quarantine_file(&bad, "svc", "rollup_quarantine")
+        let first = quarantine_file(&bad, "svc", "rollup_quarantine", QuarantineKind::Parquet)
             .expect("first quarantine must succeed");
 
         // Same path corrupts again on a later tick.
         std::fs::write(&bad, b"second corruption").unwrap();
-        let second = quarantine_file(&bad, "svc", "rollup_quarantine")
+        let second = quarantine_file(&bad, "svc", "rollup_quarantine", QuarantineKind::Parquet)
             .expect("second quarantine must succeed");
 
         assert_eq!(first, tmp.path().join("svc.parquet.corrupt"));
@@ -7762,7 +8550,7 @@ mod tests {
             return;
         }
 
-        let result = quarantine_file(&bad, "svc", "rollup_quarantine");
+        let result = quarantine_file(&bad, "svc", "rollup_quarantine", QuarantineKind::Parquet);
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         assert!(
@@ -7782,7 +8570,12 @@ mod tests {
         // the rename then fails ENOENT.
         let missing = tmp.path().join("svc.parquet");
 
-        let result = quarantine_file(&missing, "svc", "rollup_quarantine");
+        let result = quarantine_file(
+            &missing,
+            "svc",
+            "rollup_quarantine",
+            QuarantineKind::Parquet,
+        );
         assert!(
             result.is_err(),
             "quarantine must surface a rename failure as Err"

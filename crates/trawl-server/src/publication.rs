@@ -31,6 +31,8 @@ pub struct PublicationGate {
     pending: Mutex<PendingRollups>,
     #[cfg(any(test, feature = "test-support"))]
     pause: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+    #[cfg(test)]
+    panic_next_publication: std::sync::atomic::AtomicBool,
 }
 
 impl PublicationGate {
@@ -50,6 +52,9 @@ impl PublicationGate {
         }
         pending.initialized = true;
         if let Err(error) = scan_markers(root, &mut pending.markers) {
+            // This scan is attempted once. Later read refusals are its
+            // consequences, not new recovery or scan attempts.
+            crate::metrics::CompactionOperation::PendingRollupScan.record_failure();
             tracing::error!(event_type = "publication_scan_failed", %error,
                 "cannot establish rollup publication state; corpus reads refused until restart");
             pending.scan_failed = true;
@@ -127,11 +132,27 @@ impl PublicationGate {
     /// Dropping the release sender also releases the pause.
     #[cfg(any(test, feature = "test-support"))]
     pub fn hold_after_publish_for_test(&self) {
+        #[cfg(test)]
+        assert!(
+            !self
+                .panic_next_publication
+                .swap(false, std::sync::atomic::Ordering::Relaxed),
+            "injected publication task panic"
+        );
         let pause = self.pause.lock().take();
         if let Some((entered, release)) = pause {
             let _ = entered.send(());
             let _ = release.recv();
         }
+    }
+
+    /// Fail one blocking caller at its existing publication checkpoint.
+    /// The next hold site reached consumes this flag. Tests pin the intended
+    /// site by asserting the published output and retained source/marker state.
+    #[cfg(test)]
+    pub(crate) fn panic_next_publication_for_test(&self) {
+        self.panic_next_publication
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -240,13 +261,39 @@ mod tests {
 
     #[tokio::test]
     async fn scan_failure_stays_closed() {
+        use crate::metrics::test_support::sample;
+        let recorder = crate::metrics::prometheus_builder().build_recorder();
+        let handle = recorder.handle();
+        // initialize and read perform their checks on this thread; neither
+        // dispatches a worker whose counters this recorder could miss.
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        crate::metrics::init_operational_alert_metrics();
         let dir = tempfile::tempdir().unwrap();
+        let empty = PublicationGate::new();
+        empty.initialize(&dir.path().join("missing"));
+        assert!(empty.read().await.is_ok());
+        let series = "trawl_compaction_operation_failures_total{operation=\"pending_rollup_scan\"}";
+        assert_eq!(sample(&handle, series), 0);
         let root = dir.path().join("file");
         std::fs::write(&root, "").unwrap();
         let gate = PublicationGate::new();
         gate.initialize(&root);
+        assert_eq!(sample(&handle, series), 1);
         gate.initialize(dir.path());
         assert!(gate.read().await.is_err());
+        assert!(gate.read().await.is_err());
+        assert_eq!(
+            sample(&handle, series),
+            1,
+            "a latched refusal is not a new scan"
+        );
+        assert_eq!(
+            sample(
+                &handle,
+                "trawl_compaction_operation_failures_total{operation=\"pending_rollup_recovery\"}"
+            ),
+            0
+        );
     }
 
     #[cfg(unix)]
