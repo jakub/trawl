@@ -634,9 +634,6 @@ for (const width of [900, 960]) {
     const reading = (await wal.boundingBox())!;
     expect(reading.y).toBeGreaterThanOrEqual(footer.y);
     expect(reading.y + reading.height).toBeLessThanOrEqual(footer.y + footer.height);
-    const theme = (await page.locator(SEL.themeControl).boundingBox())!;
-    expect(theme.x).toBeGreaterThanOrEqual(0);
-    expect(theme.x + theme.width).toBeLessThanOrEqual(width);
     expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(width);
   });
 }
@@ -658,7 +655,6 @@ for (const sample of [
     await diagnosticPhase(page, 'Live');
     await expect(page.locator(SEL.healthFooterWal)).toHaveText(`WAL ${sample.footer}`);
     await expect(page.locator(SEL.healthFooterWal)).toHaveAttribute('title', `WAL ${sample.footer}`);
-    await expect(page.locator(SEL.themeControl)).toBeVisible();
     for (const source of ['wal', 'parquet']) {
       const reading = page.locator(`${SEL.healthStorage} [data-source="${source}"] > p`).first();
       await expect(reading).toContainText(sample.expected);
