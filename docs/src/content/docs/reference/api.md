@@ -1651,8 +1651,10 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" "$TRAWL_URL/api/v1/dashboard
   "ingest_events": 500000, "ingest_rate": 12.5, "ingest_rejected": 3,
   "syslog_enabled": true, "syslog_events_udp": 1000, "syslog_events_tcp": 200, "syslog_rate": 0.1, "syslog_parse_errors": 0, "syslog_dropped": 0, "syslog_tcp_connections": 2,
   "wal_files": 1, "wal_bytes": 8192,
+  "wal_measurement": { "status": "complete", "sample_age_secs": 2 },
   "last_compaction_secs": 4, "compaction_runs": 8640, "compaction_errors": 0,
   "parquet_files": 12, "parquet_bytes": 5242880,
+  "parquet_measurement": { "status": "complete", "sample_age_secs": 5 },
   "sse_active": 0, "sse_max": 32,
   "scheduler_enabled": true, "scheduler_schedules": 1,
   "recent_queries": [], "active_queries": []

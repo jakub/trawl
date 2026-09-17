@@ -591,6 +591,33 @@ pub struct WhoAmIResponse {
 
 // -- dashboard ---------------------------------------------------------------
 
+/// Outcome of the latest completed storage measurement attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageMeasurementStatus {
+    /// An optional source, such as a WAL writer, is absent.
+    NotConfigured,
+    /// The configured source has not completed a measurement attempt.
+    NotSampled,
+    /// The latest completed attempt measured the whole selected tree.
+    Complete,
+    /// The latest completed attempt failed; any complete sample is retained.
+    Failed,
+}
+
+/// Availability of the accompanying last-complete file count and byte total.
+///
+/// Without a complete sample, numeric fields are zero placeholders. A failed
+/// attempt can retain a sample and its age. Raw filesystem errors are private.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageMeasurement {
+    pub status: StorageMeasurementStatus,
+    /// Monotonic seconds since the last successful scan completed, evaluated
+    /// when this dashboard snapshot was assembled. This is not stream freshness
+    /// or a transactional filesystem timestamp. None means no complete sample.
+    pub sample_age_secs: Option<u64>,
+}
+
 /// Full dashboard snapshot returned by the admin-only dashboard endpoint.
 ///
 /// Contains all metrics displayed by the server's live monitor: executor pool,
@@ -643,30 +670,30 @@ pub struct DashboardSnapshot {
     pub query_timeouts: u64,
 
     // -- ingest --
-    /// Total events ingested since startup.
+    /// HTTP events ingested since process startup; excludes syslog.
     pub ingest_events: u64,
-    /// EMA-smoothed ingest rate (events/sec).
+    /// EMA-smoothed HTTP ingest rate (events/sec); excludes syslog.
     pub ingest_rate: f64,
-    /// Total rejected events.
+    /// HTTP rejected events since process startup; excludes syslog.
     pub ingest_rejected: u64,
 
     // -- syslog --
-    /// Whether the syslog listener is enabled.
+    /// Configured syslog enablement; this does not test listener health.
     #[serde(default)]
     pub syslog_enabled: bool,
-    /// Total events received via UDP syslog.
+    /// UDP syslog messages received since process startup, not persistence proof.
     #[serde(default)]
     pub syslog_events_udp: u64,
-    /// Total events received via TCP syslog.
+    /// TCP syslog messages received since process startup, not persistence proof.
     #[serde(default)]
     pub syslog_events_tcp: u64,
     /// EMA-smoothed syslog event rate (events/sec).
     #[serde(default)]
     pub syslog_rate: f64,
-    /// Total unparseable syslog messages.
+    /// Unparseable syslog messages since process startup.
     #[serde(default)]
     pub syslog_parse_errors: u64,
-    /// Total syslog events dropped due to backpressure.
+    /// Syslog events dropped due to backpressure since process startup.
     #[serde(default)]
     pub syslog_dropped: u64,
     /// Current active syslog TCP connections.
@@ -674,31 +701,37 @@ pub struct DashboardSnapshot {
     pub syslog_tcp_connections: u64,
 
     // -- WAL --
-    /// Pending WAL file count.
+    /// Last-complete WAL file count, including active files, not eligible work.
     #[serde(default)]
     pub wal_files: u64,
-    /// Total byte size of pending WAL files.
+    /// Last-complete bytes in selected WAL files, including active files.
     #[serde(default)]
     pub wal_bytes: u64,
+    /// Availability and age of the WAL totals.
+    pub wal_measurement: StorageMeasurement,
 
     // -- compaction --
-    /// Seconds since last successful compaction (None if never run).
+    /// Seconds since the last successful cycle. None means no successful cycle
+    /// reported since startup; a successful cycle may have no eligible work.
     #[serde(default)]
     pub last_compaction_secs: Option<u64>,
     /// Total successful compaction cycles since startup.
     #[serde(default)]
     pub compaction_runs: u64,
-    /// Total failed compaction cycles since startup.
+    /// Compaction error tally since startup, including failed cycles and loss/error
+    /// tallies. Can accompany successful cycles and exceed their count.
     #[serde(default)]
     pub compaction_errors: u64,
 
     // -- storage --
-    /// Total parquet files on disk.
+    /// Last-complete ingested Parquet file count; excludes saved report files.
     #[serde(default)]
     pub parquet_files: u64,
-    /// Total byte size of parquet files.
+    /// Last-complete bytes in ingested Parquet files; excludes saved report files.
     #[serde(default)]
     pub parquet_bytes: u64,
+    /// Availability and age of the ingested Parquet totals.
+    pub parquet_measurement: StorageMeasurement,
 
     // -- SSE --
     /// Active SSE streaming connections.
@@ -2534,11 +2567,19 @@ mod tests {
             syslog_tcp_connections: 2,
             wal_files: 12,
             wal_bytes: 4_404_019,
+            wal_measurement: StorageMeasurement {
+                status: StorageMeasurementStatus::Complete,
+                sample_age_secs: Some(2),
+            },
             last_compaction_secs: Some(3),
             compaction_runs: 1247,
             compaction_errors: 0,
             parquet_files: 847,
             parquet_bytes: 13_312_000_000,
+            parquet_measurement: StorageMeasurement {
+                status: StorageMeasurementStatus::Complete,
+                sample_age_secs: Some(2),
+            },
             sse_active: 2,
             sse_max: 32,
             scheduler_enabled: true,
@@ -2579,6 +2620,44 @@ mod tests {
         assert_eq!(rt.parquet_files, 847);
         assert_eq!(rt.recent_queries.len(), 1);
         assert_eq!(rt.active_queries.len(), 1);
+    }
+
+    #[test]
+    fn dashboard_storage_metadata_and_status_are_required() {
+        let encoded = serde_json::to_value(dashboard_fixture()).unwrap();
+        for field in ["wal_measurement", "parquet_measurement"] {
+            let mut missing = encoded.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<DashboardSnapshot>(missing).is_err());
+            let mut missing_status = encoded.clone();
+            missing_status[field]
+                .as_object_mut()
+                .unwrap()
+                .remove("status");
+            assert!(serde_json::from_value::<DashboardSnapshot>(missing_status).is_err());
+        }
+        for (status, expected) in [
+            (StorageMeasurementStatus::NotConfigured, "not_configured"),
+            (StorageMeasurementStatus::NotSampled, "not_sampled"),
+            (StorageMeasurementStatus::Complete, "complete"),
+            (StorageMeasurementStatus::Failed, "failed"),
+        ] {
+            let measurement = StorageMeasurement {
+                status,
+                sample_age_secs: (status == StorageMeasurementStatus::Complete).then_some(0),
+            };
+            let json = serde_json::to_value(measurement).unwrap();
+            assert_eq!(json["status"], expected);
+            assert!(json.as_object().unwrap().contains_key("sample_age_secs"));
+            assert_eq!(
+                json["sample_age_secs"].is_null(),
+                measurement.sample_age_secs.is_none()
+            );
+            assert_eq!(
+                serde_json::from_value::<StorageMeasurement>(json).unwrap(),
+                measurement
+            );
+        }
     }
 
     /// Retained work is reported explicitly. An omitted measurement must not

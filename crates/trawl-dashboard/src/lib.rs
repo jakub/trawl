@@ -656,11 +656,19 @@ mod tests {
             syslog_tcp_connections: 2,
             wal_files: 12,
             wal_bytes: 4_404_019, // ~4.2 MB
+            wal_measurement: trawl_api::StorageMeasurement {
+                status: trawl_api::StorageMeasurementStatus::Complete,
+                sample_age_secs: Some(2),
+            },
             last_compaction_secs: Some(3),
             compaction_runs: 1247,
             compaction_errors: 0,
             parquet_files: 847,
             parquet_bytes: 13_312_000_000, // ~12.4 GB
+            parquet_measurement: trawl_api::StorageMeasurement {
+                status: trawl_api::StorageMeasurementStatus::Complete,
+                sample_age_secs: Some(2),
+            },
             sse_active: 2,
             sse_max: 32,
             scheduler_enabled: true,

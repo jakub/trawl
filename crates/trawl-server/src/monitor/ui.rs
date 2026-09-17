@@ -54,11 +54,19 @@ mod tests {
             syslog_tcp_connections: 2,
             wal_files: 12,
             wal_bytes: 4_404_019,
+            wal_measurement: trawl_api::StorageMeasurement {
+                status: trawl_api::StorageMeasurementStatus::Complete,
+                sample_age_secs: Some(2),
+            },
             last_compaction_secs: Some(3),
             compaction_runs: 1247,
             compaction_errors: 0,
             parquet_files: 847,
             parquet_bytes: 13_312_000_000,
+            parquet_measurement: trawl_api::StorageMeasurement {
+                status: trawl_api::StorageMeasurementStatus::Complete,
+                sample_age_secs: Some(2),
+            },
             sse_active: 2,
             sse_max: 32,
             scheduler_enabled: true,
@@ -99,6 +107,35 @@ mod tests {
                 query: "service=nginx | timechart span=5m count()".into(),
                 running_ms: 1200,
             }],
+        }
+    }
+
+    #[test]
+    fn monitor_conversion_preserves_storage_availability_and_snapshot_age() {
+        use trawl_api::{StorageMeasurement, StorageMeasurementStatus as Status};
+        for (status, age, files, bytes) in [
+            (Status::NotConfigured, None, 0, 0),
+            (Status::NotSampled, None, 0, 0),
+            (Status::Complete, Some(0), 0, 0),
+            (Status::Failed, None, 0, 0),
+            (Status::Failed, Some(120), 7, 91),
+        ] {
+            let mut monitor = test_snapshot();
+            let measurement = StorageMeasurement {
+                status,
+                sample_age_secs: age,
+            };
+            monitor.wal_files = files;
+            monitor.wal_bytes = bytes;
+            monitor.wal_measurement = measurement;
+            monitor.parquet_files = files;
+            monitor.parquet_bytes = bytes;
+            monitor.parquet_measurement = measurement;
+            let wire = monitor.to_dashboard_snapshot();
+            assert_eq!((wire.wal_files, wire.wal_bytes), (files, bytes));
+            assert_eq!((wire.parquet_files, wire.parquet_bytes), (files, bytes));
+            assert_eq!(wire.wal_measurement, measurement);
+            assert_eq!(wire.parquet_measurement, measurement);
         }
     }
 
