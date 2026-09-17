@@ -32,8 +32,11 @@ def main():
         hostname = parsed.hostname
         port = parsed.port
         database = unquote(parsed.path.removeprefix("/"))
+        username = unquote(parsed.username or "")
+        password = unquote(parsed.password or "")
         valid_url = (parsed.scheme in ("postgres", "postgresql") and hostname
-                     and port and parsed.username and not parsed.query
+                     and port and username and "\0" not in username
+                     and "\0" not in password and not parsed.query
                      and not parsed.fragment
                      and re.fullmatch(r"trawl_issue_192_cost[\w]*", database))
     except ValueError:
@@ -49,8 +52,8 @@ def main():
     # libpq does not expand a connection URI supplied through PGDATABASE.
     # Pass each parsed field explicitly so no default socket can be selected.
     env.update(PGHOST=hostname, PGPORT=str(port),
-               PGUSER=unquote(parsed.username), PGDATABASE=database,
-               PGPASSWORD=unquote(parsed.password or ""),
+               PGUSER=username, PGDATABASE=database,
+               PGPASSWORD=password,
                PGPASSFILE=str(args.output.resolve() / "no-password-file"),
                PGSERVICEFILE="/dev/null", LC_ALL="C", PGTZ="UTC")
 
