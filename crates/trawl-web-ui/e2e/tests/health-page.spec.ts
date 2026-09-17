@@ -692,6 +692,7 @@ for (const sample of [
       for (const source of ['wal', 'parquet']) {
         await expect(page.locator(`${SEL.healthStorage} [data-source="${source}"]`)).toContainText('Complete measurement: 0 files, 0 B. Sample age: 0s at this snapshot');
       }
+      await expect(page.locator(SEL.healthFooterWal)).toHaveText('WAL 0 / 0 B; age 0s');
     }
   });
 }

@@ -555,6 +555,11 @@ fn health_page_fixtures_decode_and_exercise_permissions_and_failures() {
         dashboard.wal_measurement.status,
         trawl_api::StorageMeasurementStatus::Complete
     );
+    assert_eq!(dashboard.wal_measurement.sample_age_secs, Some(2));
+    assert_eq!(
+        dashboard.parquet_measurement.status,
+        trawl_api::StorageMeasurementStatus::Complete
+    );
     assert_eq!(dashboard.parquet_measurement.sample_age_secs, Some(2));
     assert_dashboard_measurement_metadata_is_required(&dashboard);
     assert_eq!(dashboard.hot_buffer_events, 731);
