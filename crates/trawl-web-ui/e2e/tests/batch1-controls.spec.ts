@@ -4,6 +4,7 @@
 
 import { test, expect, resetScenario, capturedSavedRequests, CORPUS } from '../fixtures';
 import { SEL, COPY } from '../selectors';
+import { selectTheme } from '../theme';
 
 for (const modifier of ['Control', 'Meta']) {
   test(`named search and save dialog submit on ${modifier}+Enter`, async ({ page, request }) => {
@@ -31,9 +32,7 @@ for (const colorScheme of ['light', 'dark'] as const) {
     await page.emulateMedia({ colorScheme });
     await resetScenario(request, 'corpus');
     await page.goto('/jobs/nets');
-    if (colorScheme === 'dark') {
-      await page.getByRole('button', { name: 'Theme light: switch to dark theme', exact: true }).click();
-    }
+    await selectTheme(page, colorScheme === 'dark' ? 'Dark' : 'Light');
     await page.goto(`/jobs/nets?net=${CORPUS.netId}&ntab=query`);
     await expect(page.locator('html')).toHaveAttribute('data-theme', colorScheme);
     const drawer = page.getByRole('dialog', { name: /errors by host/ });

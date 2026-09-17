@@ -879,7 +879,7 @@ fn chrome_card() -> Card {
         ),
     );
 
-    let user_menu = r#"<div class="user-wrap" style="display:inline-block"><div class="user-menu" style="position:static; animation:none"><div class="hdr"><div class="name">jakub</div><div class="mail">admin</div></div><div class="item"><span>Switch to dark theme</span></div><div class="sep"></div><div class="item danger"><span>Sign Out</span></div></div></div>"#;
+    let user_menu = r#"<div class="user-wrap" style="display:inline-block"><div class="user-menu" style="position:static; animation:none"><div class="hdr"><div class="name">jakub</div><div class="mail">admin</div></div><div role="menu" aria-label="Account"><div role="group" aria-label="Theme"><div class="menu-group-label">Theme</div><button class="item" type="button" role="menuitemradio" aria-checked="false" tabindex="-1"><span class="menu-choice-mark" aria-hidden="true"></span>Light</button><button class="item" type="button" role="menuitemradio" aria-checked="false" tabindex="-1"><span class="menu-choice-mark" aria-hidden="true"></span>Dark</button><button class="item" type="button" role="menuitemradio" aria-checked="true" tabindex="0"><span class="menu-choice-mark" aria-hidden="true">✓</span>System</button></div><div class="sep" role="separator"></div><button class="item danger" type="button" role="menuitem" tabindex="-1">Sign Out</button></div></div></div>"#;
 
     let body = format!(
         "{h_top}{topbar}{h_side}{sidebar}{h_menu}{user_menu}",

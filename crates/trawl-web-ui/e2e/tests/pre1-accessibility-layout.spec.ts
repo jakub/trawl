@@ -4,13 +4,14 @@
 
 import { test, expect, resetScenario, lastCapturedQuery, capturedQueryCount } from '../fixtures';
 import { SEL } from '../selectors';
+import { selectTheme } from '../theme';
 
 for (const theme of ['light', 'dark']) {
   for (const width of [320, 390, 768, 1440]) {
     test(`absolute range keeps Haul reachable at ${width}px in ${theme}`, async ({ page, request }) => {
       await page.setViewportSize({ width, height: 900 });
       await page.goto('/search');
-      await page.evaluate(theme => document.documentElement.setAttribute('data-theme', theme), theme);
+      await selectTheme(page, theme === 'dark' ? 'Dark' : 'Light');
       await page.locator(SEL.dateRangeTrigger).click();
       await page.locator(SEL.absoluteTab).click();
       await page.locator(SEL.dateRangeFrom).fill('2026-08-01T00:00:00Z');
@@ -37,7 +38,7 @@ for (const theme of ['light', 'dark']) {
   test(`secondary text and degraded badges retain contrast in ${theme}`, async ({ page, request }) => {
     await resetScenario(request, 'corpus');
     await page.goto('/search?q=service%3Dnginx');
-    await page.evaluate(theme => document.documentElement.setAttribute('data-theme', theme), theme);
+    await selectTheme(page, theme === 'dark' ? 'Dark' : 'Light');
     await expect(page.locator('.results-table thead th').first()).toBeVisible();
     await expect(page.locator('.facets .v .c').first()).toBeVisible();
     async function contrast(selector: string) {
@@ -86,7 +87,7 @@ for (const theme of ['light', 'dark']) {
       expect(Math.min(...ratios), selector).toBeGreaterThanOrEqual(4.5);
     }
     await page.goto('/search/schema?svc=nginx');
-    await page.evaluate(theme => document.documentElement.setAttribute('data-theme', theme), theme);
+    await expect(page.locator('html')).toHaveAttribute('data-theme', theme);
     await expect(page.locator('.bdg.warn').first()).toBeVisible();
     const ratios = await contrast('.bdg.warn');
     expect(ratios.length).toBeGreaterThan(0);

@@ -4,6 +4,7 @@
 
 import { test, expect, lastCapturedQuery, capturedQueryCount } from '../fixtures';
 import { SEL } from '../selectors';
+import { selectTheme } from '../theme';
 
 test('login explains personal keys and links operators to provisioning', async ({ page }) => {
   await page.goto('/login');
@@ -67,10 +68,8 @@ for (const theme of ['light', 'dark'] as const) {
   for (const width of [390, 720, 1440]) {
     test(`quick start remains usable at ${width}px in ${theme}`, async ({ page }) => {
       await page.setViewportSize({ width, height: 900 });
-      await page.addInitScript(theme => {
-        localStorage.setItem('trawl.ui', JSON.stringify({ theme }));
-      }, theme);
       await page.goto('/search');
+      await selectTheme(page, theme === 'dark' ? 'Dark' : 'Light');
       await expect(page.locator('html')).toHaveAttribute('data-theme', theme);
       const guide = page.locator('.search-quick-start');
       await expect(guide).toBeVisible();

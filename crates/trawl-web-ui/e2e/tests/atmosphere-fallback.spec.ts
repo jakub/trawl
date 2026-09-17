@@ -207,7 +207,7 @@ test.describe('terminal context loss', () => {
   test('shipped handle rejects theme uniforms and speed after loss or disposal', async ({ page }) => {
     const errors = await instrument(page, 'none');
     await page.goto('/search');
-    await expect(page.getByRole('button', { name: 'Theme light: switch to dark theme' })).toBeVisible();
+    await expect(page.locator('.topbar button.user')).toBeEnabled();
     await expect(page.locator('.atmosphere')).toHaveCount(0);
     // This route loads the same wasm module but mounts no backdrop. Import its
     // unique shipped snippet, then exercise the public handle on a separate

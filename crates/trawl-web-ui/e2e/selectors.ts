@@ -186,6 +186,8 @@ export const SEL = {
   /// native button since ADR-0028; the `.topbar` prefix keeps it away
   /// from any other `.user` a page might carry.
   topbarUser: '.topbar button.user',
+  /// crates/fleet-ui/src/atmosphere/component.rs — mounted backdrop host.
+  atmosphere: '.atmosphere',
   /// crates/fleet-ui/src/menu.rs mounted by topbar.rs with
   /// `panel_class="user-menu"` — the role="menu" node INSIDE the panel
   /// wrapper, so the identity header (which sits outside it) is not part

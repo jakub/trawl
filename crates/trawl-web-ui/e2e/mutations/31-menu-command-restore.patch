@@ -1,0 +1,12 @@
+diff --git a/crates/fleet-ui/src/menu.rs b/crates/fleet-ui/src/menu.rs
+--- a/crates/fleet-ui/src/menu.rs
++++ b/crates/fleet-ui/src/menu.rs
+@@ -361,7 +361,7 @@ mod component {
+                             // Restore BEFORE the callback: a callback
+                             // that opens a dialog must capture the
+                             // trigger as that dialog's opener.
+-                            close(MenuClose::Activate);
++                            close(MenuClose::Outside);
+                             cb.run(());
+                         }
+                     >{move || label.get()}</button>

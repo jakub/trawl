@@ -330,6 +330,11 @@ jobs:
           name: trawl-web-ui-dist
           path: crates/trawl-web-ui/dist/
           retention-days: 7
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fleet-ui-workbench-dist
+          path: crates/fleet-ui/dist/
+          retention-days: 7
 
   trawl-web-tests:
     name: trawl-web tests
@@ -703,6 +708,76 @@ jobs:
           name: e2e-traces
           path: e2e-artifacts/test-results/
           retention-days: 7
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: theme-menu-captures
+          path: e2e-artifacts/test-results/**/system-*.png
+          if-no-files-found: error
+          retention-days: 30
+
+  theme-production:
+    name: theme bootstrap and production browser evidence
+    runs-on: k8s-big
+    needs: trunk-build
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: 1.98.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: theme-production
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: crates/trawl-web-ui/e2e/package-lock.json
+      - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079 # trunk
+        with:
+          tool: trunk
+      - uses: actions/download-artifact@cc203385981b70ca67e1cc392babf9cc229d5806 # v4
+        with:
+          name: trawl-web-ui-dist
+          path: crates/trawl-web-ui/dist
+      - uses: actions/download-artifact@cc203385981b70ca67e1cc392babf9cc229d5806 # v4
+        with:
+          name: fleet-ui-workbench-dist
+          path: crates/fleet-ui/dist
+      - name: Verify both HTMLs and real Trunk hash invalidation
+        run: node crates/trawl-web-ui/e2e/scripts/verify-theme-assets.mjs crates/trawl-web-ui/dist crates/fleet-ui/dist e2e-artifacts/theme-builds
+      - name: Embed the candidate distribution in the production-handler server
+        run: cargo build --release --locked -p trawl-web --example theme_assets
+      - run: npm ci --no-audit --no-fund
+        working-directory: crates/trawl-web-ui/e2e
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('crates/trawl-web-ui/e2e/package-lock.json') }}
+      - run: npx playwright install --with-deps chromium
+        working-directory: crates/trawl-web-ui/e2e
+      - name: Test production asset modes and the workbench lifecycle
+        working-directory: crates/trawl-web-ui/e2e
+        env:
+          THEME_ASSET_SERVER: ${{ github.workspace }}/target/release/examples/theme_assets
+          THEME_TRAWL_DIST: ${{ github.workspace }}/crates/trawl-web-ui/dist
+          THEME_WORKBENCH_DIST: ${{ github.workspace }}/crates/fleet-ui/dist
+        run: npx playwright test --config playwright.theme.config.ts
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: theme-production-evidence
+          path: |
+            e2e-artifacts/theme-builds/
+            e2e-artifacts/theme-production/
+            e2e-artifacts/theme-report/
+          retention-days: 30
 
   atmosphere-mutation:
     name: atmosphere terminal-latch mutation

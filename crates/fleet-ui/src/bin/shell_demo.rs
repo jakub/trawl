@@ -274,8 +274,9 @@ fn DemoApp() -> impl IntoView {
 
     let groups = Signal::derive(sidebar_groups);
     let sidebar_active = Signal::derive(|| "home".to_string());
-    let user = Signal::derive(|| {
-        Some(UserInfo {
+    let identity_present = RwSignal::new(true);
+    let user = Signal::derive(move || {
+        identity_present.get().then(|| UserInfo {
             name: "demo user".into(),
             detail: "admin".into(),
         })
@@ -327,6 +328,12 @@ fn DemoApp() -> impl IntoView {
                     </Shell>
                 }/>
             </Routes>
+            <div role="group" aria-label="Demo identity" style="position:fixed;left:12px;bottom:52px;z-index:10">
+                <button class="btn" type="button" disabled=move || !identity_present.get()
+                    on:click=move |_| identity_present.set(false)>"Clear demo identity"</button>
+                <button class="btn" type="button" disabled=move || identity_present.get()
+                    on:click=move |_| identity_present.set(true)>"Restore demo identity"</button>
+            </div>
             // Always-visible theme choices, outside <Routes> so they stay
             // mounted on /login too (the real Shell's TopBar choices only
             // exist on shell routes). That is what lets a preference change
@@ -356,7 +363,26 @@ fn DemoApp() -> impl IntoView {
 
 #[cfg(target_arch = "wasm32")]
 fn main() {
-    mount_to_body(DemoApp);
+    mount_to_body(DemoHost);
+}
+
+/// Workbench lifecycle controls dispose the sole preference installation with
+/// its child owner. They never mount a second installation beside the first.
+#[cfg(target_arch = "wasm32")]
+#[component]
+fn DemoHost() -> impl IntoView {
+    let installed = RwSignal::new(true);
+    view! {
+        <Show when=move || installed.get()>
+            <DemoApp/>
+        </Show>
+        <div role="group" aria-label="Demo lifecycle" style="position:fixed;left:12px;bottom:12px;z-index:10">
+            <button class="btn" type="button" disabled=move || installed.get()
+                on:click=move |_| installed.set(true)>"Install demo"</button>
+            <button class="btn" type="button" disabled=move || !installed.get()
+                on:click=move |_| installed.set(false)>"Dispose demo"</button>
+        </div>
+    }
 }
 
 /// A second app's presets and refusal policy, with no live mode.

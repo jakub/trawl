@@ -47,6 +47,7 @@ const REPIN_FLOW_RS: &str = include_str!("../src/repin_flow.rs");
 const PALETTE_RS: &str = include_str!("../../fleet-ui/src/command_palette.rs");
 const KBD_RS: &str = include_str!("../../fleet-ui/src/kbd.rs");
 const TOPBAR_RS: &str = include_str!("../../fleet-ui/src/topbar.rs");
+const ATMOSPHERE_RS: &str = include_str!("../../fleet-ui/src/atmosphere/component.rs");
 const MENU_RS: &str = include_str!("../../fleet-ui/src/menu.rs");
 const TABS_RS: &str = include_str!("../../fleet-ui/src/tabs.rs");
 const COPY_BUTTON_RS: &str = include_str!("../../fleet-ui/src/copy_button.rs");
@@ -814,6 +815,12 @@ const CONTRACTS: &[Contract] = &[
         hook: "pub const REPIN_POLL_MS: u32 = 3_000;",
     },
     // -- native controls and the shared menu contract (ADR-0028) ------
+    Contract {
+        assignment: "atmosphere: '.atmosphere',",
+        source_path: "../fleet-ui/src/atmosphere/component.rs",
+        source: ATMOSPHERE_RS,
+        hook: "class=\"atmosphere\"",
+    },
     Contract {
         assignment: "topbarUser: '.topbar button.user',",
         source_path: "../fleet-ui/src/topbar.rs",
