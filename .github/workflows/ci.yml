@@ -668,7 +668,7 @@ jobs:
     runs-on: k8s-small
     needs: trunk-build
     # Include slow browser package installation and the bounded test run.
-    timeout-minutes: 30
+    timeout-minutes: 35
     # This job executes third-party code (npm packages, a CDN-fetched
     # browser): read-only token, and no credentials persisted into
     # .git/config for that code to read.
@@ -704,7 +704,7 @@ jobs:
       # quarantine loudly, never retry past it).
       # The full single-worker suite needs headroom on the shared runner.
       # Per-test timeouts stay unchanged; this bounds the aggregate run.
-      - run: npm run test -- --global-timeout=720000
+      - run: npm run test -- --global-timeout=1500000
         working-directory: crates/trawl-web-ui/e2e
         env:
           # Preserve browser process exits and stderr alongside test results.

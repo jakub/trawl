@@ -256,7 +256,10 @@ for (const surface of ['global', 'drawer'] as const) {
 test('global Runs orders across page boundaries for every key and direction', async ({ page, request }) => {
   test.setTimeout(45_000);
   await configure(request, { runsTotal: 43 });
-  await page.clock.install();
+  // Pause before navigation so a slow initial load cannot start the Jobs poll
+  // during this exact request-order assertion. This route needs no load timer.
+  await page.clock.install({ time: new Date('2026-09-15T12:05:00Z') });
+  await page.clock.pauseAt(new Date('2026-09-15T12:05:01Z'));
   await page.goto('/jobs/runs');
   const frame = page.getByRole('region', { name: 'Recent runs table', exact: true });
   const footer = frame.locator('.results-footer');

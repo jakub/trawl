@@ -149,7 +149,10 @@ test('service fields: name header keeps ascending default', async ({ page, reque
 // Global Runs uses native headers but sends ordering to the server.
 test('Runs headers expose one aria-sort and send each natural direction through keyboard controls', async ({ page, request }) => {
   await resetScenario(request, 'pagination');
-  await page.clock.install();
+  // Pause before navigation so a slow initial load cannot start the Jobs poll
+  // during this exact request-order assertion. This route needs no load timer.
+  await page.clock.install({ time: new Date('2026-09-15T12:05:00Z') });
+  await page.clock.pauseAt(new Date('2026-09-15T12:05:01Z'));
   const requests: Array<{ sort: string | null; dir: string | null; offset: string | null }> = [];
   await page.route('**/api/v1/runs?*', async route => {
     const params = new URL(route.request().url()).searchParams;
