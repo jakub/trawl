@@ -14,11 +14,20 @@ which `dist/` the stub serves.
   none of this is about hairlines, and doubling 58 files buys nothing.
 - theme: light only, `data-theme` untouched.
 
-Reproduce, from `crates/trawl-web-ui/e2e/` with the SPA built:
+This archive records those revisions. Use the script and harness from the
+merged snapshot `0c8c2219` to retain the original shot inventory, including
+its footer-theme shot. Build the recorded SPA revisions separately below.
+The current script omits that shot because #196 moved theme selection into
+the user menu; the archived images and reports retain the original evidence.
+
+Reproduce from `crates/trawl-web-ui/e2e/` in a checkout of `0c8c2219`:
 
 ```sh
+git worktree add /tmp/trawl-161-after 82042b23
+(cd /tmp/trawl-161-after/crates/trawl-web-ui && trunk build)
 node scripts/capture-native-controls-161.mjs --label after \
-  --out ../../../visual-evidence/issue-161/captures/after
+  --out ../../../visual-evidence/issue-161/captures/after \
+  --dist /tmp/trawl-161-after/crates/trawl-web-ui/dist
 
 git worktree add /tmp/trawl-161-before ecce7645
 (cd /tmp/trawl-161-before/crates/trawl-web-ui && trunk build)
