@@ -29,10 +29,13 @@ const result = spawnSync(process.execPath, [require.resolve('@playwright/test/cl
 });
 if (result.error) throw result.error;
 if (result.status !== 0) process.exit(result.status ?? 1);
-const images = [1440, 720].map(width => {
-  const name = `health-diagnostics-${width}.png`;
-  return { name, width, sha256: createHash('sha256').update(fs.readFileSync(path.join(output, name))).digest('hex') };
-});
+const captures = [1440, 720].map(width => JSON.parse(
+  fs.readFileSync(path.join(output, `health-diagnostics-${width}.json`), 'utf8'),
+));
+const images = captures.flatMap(capture => capture.frames.map(frame => ({
+  ...frame,
+  sha256: createHash('sha256').update(fs.readFileSync(path.join(output, frame.name))).digest('hex'),
+})));
 const dist = snapshotPath(port);
 const hash = createHash('sha256');
 for (const file of fs.readdirSync(dist, { recursive: true }).sort()) {
@@ -47,7 +50,7 @@ const manifest = {
   git_status_before: statusBefore,
   captured_at: new Date().toISOString(),
   scope: 'Stub-backed Health rendering and query-control assertions; not real ingest evidence',
-  bundleSha256: hash.digest('hex'), images,
+  bundleSha256: hash.digest('hex'), captures, images,
 };
 fs.writeFileSync(path.join(output, 'manifest.json'), JSON.stringify(manifest, null, 2) + '\n');
 const escapeHtml = value => String(value).replace(/[&<>"']/g, character => ({
@@ -59,10 +62,13 @@ fs.writeFileSync(path.join(output, 'index.html'), `<!doctype html>
 <title>Trawl Health diagnostics evidence</title>
 <style>body{font:16px/1.5 system-ui,sans-serif;max-width:1500px;margin:32px auto;padding:0 20px;color:#18232b;background:#f5f7f8}h1,h2{line-height:1.2}code,pre{overflow-wrap:anywhere;white-space:pre-wrap}img{display:block;max-width:100%;height:auto;border:1px solid #bac5cc}section{margin:32px 0}a{color:#075b8a}</style>
 <h1>Trawl Health diagnostics</h1>
-<p>Wide and narrow browser captures with passing layout, diagnostic-fact, and query-control assertions.</p>
+<p>Wide and narrow browser captures with passing layout, diagnostic-fact, and query-control assertions. Overlapping viewport slices cover the complete Health scroller: original cards, Ingestion, Storage, and Queries. The viewport remains 1440 or 720 pixels wide and 1000 pixels tall.</p>
 <p>${escapeHtml(manifest.scope)}.</p>
 <p>Captured at <time>${escapeHtml(manifest.captured_at)}</time>. Checkout HEAD: <code>${escapeHtml(manifest.head)}</code>.</p>
 <p>${clean ? 'The checkout was clean before and after capture.' : 'The checkout had changes or HEAD changed during capture. HEAD alone does not identify the rendered sources; inspect the recorded Git status.'} The bundle hash identifies the served assets.</p>
-<p><a href="manifest.json">Capture manifest, Git status, and SHA-256 hashes</a></p>
-${images.map(image => `<section><h2>${image.width}px viewport</h2><p><a href="${image.name}">Open full-size PNG</a></p><img src="${image.name}" alt="Trawl Health diagnostics at ${image.width}px with Ingestion, Storage, and Queries"></section>`).join('\n')}
+<details><summary>Capture manifest, Git status, coverage, and SHA-256 hashes</summary><pre>${escapeHtml(JSON.stringify(manifest, null, 2))}</pre></details>
+${images.map(image => {
+  const data = `data:image/png;base64,${fs.readFileSync(path.join(output, image.name)).toString('base64')}`;
+  return `<section><h2>${image.width}px viewport, Health scroll offset ${image.scrollTop}px</h2><p>Coverage: ${image.scrollTop} to ${Math.min(image.scrollHeight, image.scrollTop + image.clientHeight)} of ${image.scrollHeight} content pixels. <a download="${image.name}" href="${data}">Download full-size PNG</a></p><img src="${data}" alt="Health at ${image.width}px viewport width, scroll offset ${image.scrollTop}px"></section>`;
+}).join('\n')}
 </html>\n`);

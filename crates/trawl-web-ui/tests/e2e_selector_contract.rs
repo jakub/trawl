@@ -341,6 +341,12 @@ const CONTRACTS: &[Contract] = &[
         hook: "title=\"Hot buffer (events / bytes)\"",
     },
     Contract {
+        assignment: "healthFooterWal: '.statusbar .wal-measurement',",
+        source_path: "src/components/status_bar.rs",
+        source: STATUS_BAR_RS,
+        hook: "class=\"grp wal-measurement\"",
+    },
+    Contract {
         assignment: "healthCards: '.health-cards',",
         source_path: "src/pages/health.rs",
         source: HEALTH_RS,

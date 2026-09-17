@@ -51,6 +51,7 @@ export const SEL = {
   healthPage: '.health-page',
   /// The visible operational cards above Queries.
   healthCards: '.health-cards',
+  healthFooterWal: '.statusbar .wal-measurement',
   /// crates/trawl-web-ui/src/pages/health.rs HealthPage and HealthQueries.
   healthSection: '.health-section',
   /// crates/trawl-web-ui/src/pages/health.rs HealthPage and HealthQueries.

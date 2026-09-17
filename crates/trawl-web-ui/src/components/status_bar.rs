@@ -5,7 +5,7 @@
 //! `<StatusBar/>` — 26px footer with status, last-search summary,
 //! and admin stats.
 //!
-//! The stats cluster (hot buffer / WAL backlog / active queries /
+//! The stats cluster (hot buffer / WAL measurement / active queries /
 //! uptime) renders only while the `admin` signal carries a
 //! [`DashboardSnapshot`] — `AuthShell` feeds it from the admin-only
 //! `/api/v1/dashboard/stream` SSE stream, so non-admins never see the
@@ -80,10 +80,9 @@ pub fn StatusBar(
                             {format!(" / {}", format_bytes(u64::try_from(s.hot_buffer_bytes).unwrap_or_default()))}
                         </span>
                     </div>
-                    <div class="grp" title="WAL backlog (files / bytes)">
+                    <div class="grp wal-measurement" title="WAL last complete totals; sample age at dashboard snapshot">
                         <span>"WAL "</span>
-                        <span class="strong">{s.wal_files.to_string()}</span>
-                        <span>{format!(" / {}", format_bytes(s.wal_bytes))}</span>
+                        <span class="strong">{wal_reading(&s)}</span>
                     </div>
                     <div class="grp" title="Active queries">
                         <span>"Queries "</span>
@@ -108,5 +107,32 @@ pub fn StatusBar(
             </div>
             <div class="sp"></div>
         </footer>
+    }
+}
+
+/// The footer receives live dashboard snapshots, but a storage measurement can
+/// still have failed. Read its metadata before presenting numeric placeholders.
+fn wal_reading(snapshot: &DashboardSnapshot) -> String {
+    use trawl_api::StorageMeasurementStatus as Status;
+    match (
+        snapshot.wal_measurement.status,
+        snapshot.wal_measurement.sample_age_secs,
+    ) {
+        (Status::NotConfigured, _) => "not configured".into(),
+        (Status::NotSampled, _) => "awaiting measurement".into(),
+        (Status::Failed, None) => "failed; unavailable".into(),
+        (status, Some(age)) => {
+            let prefix = if status == Status::Failed {
+                "failed; last "
+            } else {
+                ""
+            };
+            format!(
+                "{prefix}{} / {}; age {age}s",
+                snapshot.wal_files,
+                format_bytes(snapshot.wal_bytes)
+            )
+        }
+        (Status::Complete, None) => "unavailable".into(),
     }
 }

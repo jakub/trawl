@@ -3,7 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 import type { APIRequestContext, Locator, Page } from '@playwright/test';
-import { mkdir } from 'node:fs/promises';
+import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { test, expect } from '../fixtures';
 import { SEL } from '../selectors';
@@ -204,6 +204,7 @@ test('non-admin request silence: health 200 and queries without admin traffic or
   await expect(page.locator(SEL.healthCapacity)).toHaveCount(0);
   await expect(page.locator(SEL.healthLive)).toHaveCount(0);
   await expect(page.locator(SEL.healthDiagnostics)).toHaveCount(0);
+  await expect(page.locator(SEL.healthFooterWal)).toHaveCount(0);
   await expect(page.locator(SEL.healthQueries).getByRole('button', { name: 'Cancel', exact: true })).toHaveCount(0);
 });
 
@@ -538,13 +539,52 @@ for (const width of [1440, 720]) {
     const dialog = await confirm(page);
     await page.keyboard.press('Escape');
     await expect(dialog).toHaveCount(0);
-    await page.evaluate(() => window.scrollTo(0, 0));
-    const capture = process.env.TRAWL_HEALTH_CAPTURE_DIR
-      ? path.join(process.env.TRAWL_HEALTH_CAPTURE_DIR, `health-diagnostics-${width}.png`)
-      : testInfo.outputPath(`health-diagnostics-${width}.png`);
-    await mkdir(path.dirname(capture), { recursive: true });
-    await page.screenshot({ path: capture, fullPage: true, animations: 'disabled' });
-    await testInfo.attach(`health-diagnostics-${width}`, { path: capture, contentType: 'image/png' });
+    // Health owns its scroll container. Capture overlapping viewport slices
+    // of that actual scroller, without resizing or changing production CSS.
+    const scroller = page.locator(SEL.healthPage);
+    await page.locator(SEL.healthQueryScroll).evaluate(el => { el.scrollLeft = 0; });
+    await scroller.evaluate(el => { el.scrollTop = 0; el.scrollLeft = 0; });
+    const frames: { name: string; width: number; scrollTop: number; clientHeight: number; scrollHeight: number }[] = [];
+    const sections = await scroller.evaluate(el => {
+      const origin = el.getBoundingClientRect().top;
+      return ['.health-cards', '.health-ingestion', '.health-storage', '.health-queries'].map(selector => {
+        const section = el.querySelector(selector)!;
+        const rect = section.getBoundingClientRect();
+        return { selector, top: rect.top - origin + el.scrollTop, bottom: rect.bottom - origin + el.scrollTop };
+      });
+    });
+    for (let part = 1; part <= 20; part++) {
+      await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+      const geometry = await scroller.evaluate(el => ({ scrollTop: el.scrollTop, clientHeight: el.clientHeight, scrollHeight: el.scrollHeight }));
+      const name = `health-diagnostics-${width}-part-${part}.png`;
+      const capture = process.env.TRAWL_HEALTH_CAPTURE_DIR
+        ? path.join(process.env.TRAWL_HEALTH_CAPTURE_DIR, name)
+        : testInfo.outputPath(name);
+      await mkdir(path.dirname(capture), { recursive: true });
+      await page.screenshot({ path: capture, animations: 'disabled' });
+      await testInfo.attach(name, { path: capture, contentType: 'image/png' });
+      frames.push({ name, width, ...geometry });
+      if (geometry.scrollTop + geometry.clientHeight >= geometry.scrollHeight - 1) break;
+      const next = geometry.scrollTop + Math.max(1, geometry.clientHeight - 100);
+      await scroller.evaluate((el, next) => { el.scrollTop = next; }, next);
+    }
+    expect(frames[0].scrollTop).toBe(0);
+    for (let part = 1; part < frames.length; part++) {
+      expect(frames[part].scrollTop).toBeGreaterThan(frames[part - 1].scrollTop);
+      expect(frames[part].scrollTop).toBeLessThanOrEqual(frames[part - 1].scrollTop + frames[part - 1].clientHeight);
+    }
+    const last = frames[frames.length - 1];
+    expect(last.scrollTop + last.clientHeight).toBeGreaterThanOrEqual(last.scrollHeight - 1);
+    for (const section of sections) {
+      expect(section.top).toBeGreaterThanOrEqual(0);
+      expect(section.bottom).toBeLessThanOrEqual(last.scrollTop + last.clientHeight + 1);
+    }
+    expect(page.viewportSize()).toEqual({ width, height: 1000 });
+    const manifestPath = process.env.TRAWL_HEALTH_CAPTURE_DIR
+      ? path.join(process.env.TRAWL_HEALTH_CAPTURE_DIR, `health-diagnostics-${width}.json`)
+      : testInfo.outputPath(`health-diagnostics-${width}.json`);
+    await writeFile(manifestPath, JSON.stringify({ width, viewportHeight: 1000, scroller: SEL.healthPage, sections, frames }, null, 2));
+
   });
 }
 
@@ -579,11 +619,11 @@ for (const age of [null, 0]) {
 }
 
 for (const sample of [
-  { status: 'not_configured', age: null, files: 0, bytes: 0, expected: 'Not configured' },
-  { status: 'not_sampled', age: null, files: 0, bytes: 0, expected: 'Awaiting measurement' },
-  { status: 'complete', age: 0, files: 0, bytes: 0, expected: 'Complete measurement: 0 files' },
-  { status: 'failed', age: null, files: 0, bytes: 0, expected: 'Measurement unavailable; collection failed' },
-  { status: 'failed', age: 123, files: 37, bytes: 913, expected: 'Collection failed; last complete totals: 37 files' },
+  { status: 'not_configured', age: null, files: 0, bytes: 0, footer: 'not configured', expected: 'Not configured' },
+  { status: 'not_sampled', age: null, files: 0, bytes: 0, footer: 'awaiting measurement', expected: 'Awaiting measurement' },
+  { status: 'complete', age: 0, files: 0, bytes: 0, footer: '0 / 0 B; age 0s', expected: 'Complete measurement: 0 files' },
+  { status: 'failed', age: null, files: 0, bytes: 0, footer: 'failed; unavailable', expected: 'Measurement unavailable; collection failed' },
+  { status: 'failed', age: 123, files: 37, bytes: 913, footer: 'failed; last 37 / 913 B; age 123s', expected: 'Collection failed; last complete totals: 37 files' },
 ]) {
   test(`storage ${sample.status} with sample age ${sample.age} renders truthful totals`, async ({ page, request }) => {
     const metadata = { status: sample.status, sample_age_secs: sample.age };
@@ -593,6 +633,8 @@ for (const sample of [
     } });
     await page.goto('/settings/health');
     await diagnosticPhase(page, 'Live');
+    await expect(page.locator(SEL.healthFooterWal)).toHaveText(`WAL ${sample.footer}`);
+    await expect(page.locator(SEL.themeControl)).toBeVisible();
     for (const source of ['wal', 'parquet']) {
       const reading = page.locator(`${SEL.healthStorage} [data-source="${source}"] > p`).first();
       await expect(reading).toContainText(sample.expected);
@@ -608,6 +650,7 @@ for (const sample of [
     const before = await page.locator(`${SEL.healthStorage} .health-storage-source`).allTextContents();
     await request.post('/__ctl/dashboard/drop');
     await diagnosticPhase(page, 'Stale; reconnecting');
+    await expect(page.locator(SEL.healthFooterWal)).toHaveCount(0);
     // Dwell beyond two seconds with the server holding snapshots. An immediate
     // successful poll cannot detect a client-side sample-age ticker.
     await page.waitForTimeout(2200);
@@ -616,6 +659,7 @@ for (const sample of [
     await request.post('/__ctl/dashboard/release');
     await diagnosticPhase(page, 'Live');
     expect(await page.locator(`${SEL.healthStorage} .health-storage-source`).allTextContents()).toEqual(before);
+    await expect(page.locator(SEL.healthFooterWal)).toHaveText(`WAL ${sample.footer}`);
     if (sample.status === 'failed') {
       await request.post('/__ctl/dashboard/release', { data: { snapshot: {
         wal_files: 0, wal_bytes: 0, wal_measurement: { status: 'complete', sample_age_secs: 0 },
@@ -639,6 +683,7 @@ test('WAL failure and complete Parquet readings stay independent', async ({ page
   const parquet = page.locator(`${SEL.healthStorage} [data-source="parquet"] > p`).first();
   await expect(wal).toHaveText('Collection failed; last complete totals: 7 files, 91 B. Sample age: 120s at this snapshot.');
   await expect(parquet).toHaveText('Complete measurement: 8 files, 72 B. Sample age: 3s at this snapshot.');
+  await expect(page.locator(SEL.healthFooterWal)).toHaveText('WAL failed; last 7 / 91 B; age 120s');
   await request.post('/__ctl/dashboard/drop');
   await diagnosticPhase(page, 'Stale; reconnecting');
   // The one existing Live operations status owns announcements; the adjacent
@@ -663,6 +708,7 @@ test('bootstrap totals remain visible after a terminal stream failure', async ({
   await observeDashboardErrors(page);
   await page.goto('/settings/health');
   await diagnosticPhase(page, 'Snapshot; waiting for live updates');
+  await expect(page.locator(SEL.healthFooterWal)).toHaveCount(0);
   await expect(page.locator(SEL.healthStorage)).toContainText('7 files');
   await expect.poll(async () => (await state(request)).dashboard.terminalPending).toBe(1);
   await request.post('/__ctl/dashboard/terminal-release');
