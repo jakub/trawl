@@ -32,6 +32,13 @@ The build stages a verified library in its output directory and `profile/deps`.
 Cargo supplies the loader path for runs and tests; `bin/trawld-dev` supplies it
 when Fleet launches the already-built daemon. Keep the library with that build.
 
+The server and workspace test suites require `cargo-nextest` locally, as in CI.
+Use `cargo nextest run -p trawl-server` or `cargo nextest run --workspace` with
+disposable test infrastructure. Nextest starts each test in its own process.
+This isolates the process-global metric recorders used by tests that observe
+blocking workers. Running these suites together with plain `cargo test` is
+unsupported because a process can install only one global recorder.
+
 Native `trawl-core` builds also prepare the runtime so its standalone parity
 tests work with ordinary Cargo commands. Wasm and other parser-only targets do
 not acquire a native library. An inherited `DUCKDB_DOWNLOAD_LIB=1` is rejected;

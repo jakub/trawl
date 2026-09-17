@@ -274,56 +274,62 @@ mod tests {
     #[test]
     fn flush_task_failure_after_durable_groups_does_not_claim_event_loss() {
         use crate::metrics::test_support::sample;
-        let recorder = crate::metrics::prometheus_builder().build_recorder();
-        let handle = recorder.handle();
+        let handle = crate::metrics::prometheus_builder()
+            .install_recorder()
+            .unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
-        // This local recorder observes the parent JoinError accounting after
-        // the await. Its zero discard assertion excludes invented parent-side
-        // loss accounting, not counters on the blocking child thread. The
-        // synchronous failed-group test covers that child's write boundary.
-        metrics::with_local_recorder(&recorder, || {
-            runtime.block_on(async {
-                crate::metrics::init_operational_alert_metrics();
-                let (batcher, tmp) = test_batcher(1000, 100);
-                batcher.pipeline.wal_writer().panic_after_writes_for_test(2);
-                let mut pending = IndexMap::new();
-                for service in ["first", "second", "never_started"] {
-                    let event = make_event(service);
-                    let mut batch = ServiceBatch::default();
-                    batch.push(event.map);
-                    pending.insert((event.env, event.service), batch);
-                }
-                let mut count = 3;
-                batcher.flush(&mut pending, &mut count, 3, 0).await;
-                assert!(pending.is_empty());
-                assert_eq!(count, 0);
-                assert_eq!(
-                    sample(&handle, crate::metrics::SYSLOG_WRITE_TASKS_FAILED_TOTAL),
-                    1
-                );
-                assert_eq!(
-                    sample(&handle, crate::metrics::SYSLOG_WAL_EVENTS_DISCARDED_TOTAL),
-                    0
-                );
-                let mut services = Vec::new();
-                for entry in std::fs::read_dir(tmp.path().join("prod")).unwrap() {
-                    let path = entry.unwrap().path();
-                    assert_eq!(path.extension().unwrap(), "ndjson");
-                    let event: serde_json::Value =
-                        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-                    services.push(event["service"].as_str().unwrap().to_owned());
-                }
-                services.sort();
-                assert_eq!(services, ["first", "second"]);
-                batcher.flush(&mut pending, &mut count, 0, 0).await;
-                assert_eq!(
-                    sample(&handle, crate::metrics::SYSLOG_WRITE_TASKS_FAILED_TOTAL),
-                    1
-                );
-            });
+        // Observe the parent and every blocking worker. Nextest isolates this
+        // process-global recorder from the other tests' recorder installations.
+        runtime.block_on(async {
+            crate::metrics::init_operational_alert_metrics();
+            // Confirm the blocking worker's discard metric reaches this handle.
+            tokio::task::spawn_blocking(|| {
+                metrics::counter!(crate::metrics::SYSLOG_WAL_EVENTS_DISCARDED_TOTAL).increment(1);
+            })
+            .await
+            .unwrap();
+            let discarded_before =
+                sample(&handle, crate::metrics::SYSLOG_WAL_EVENTS_DISCARDED_TOTAL);
+            assert_eq!(discarded_before, 1);
+            let (batcher, tmp) = test_batcher(1000, 100);
+            batcher.pipeline.wal_writer().panic_after_writes_for_test(2);
+            let mut pending = IndexMap::new();
+            for service in ["first", "second", "never_started"] {
+                let event = make_event(service);
+                let mut batch = ServiceBatch::default();
+                batch.push(event.map);
+                pending.insert((event.env, event.service), batch);
+            }
+            let mut count = 3;
+            batcher.flush(&mut pending, &mut count, 3, 0).await;
+            assert!(pending.is_empty());
+            assert_eq!(count, 0);
+            assert_eq!(
+                sample(&handle, crate::metrics::SYSLOG_WRITE_TASKS_FAILED_TOTAL),
+                1
+            );
+            assert_eq!(
+                sample(&handle, crate::metrics::SYSLOG_WAL_EVENTS_DISCARDED_TOTAL),
+                discarded_before
+            );
+            let mut services = Vec::new();
+            for entry in std::fs::read_dir(tmp.path().join("prod")).unwrap() {
+                let path = entry.unwrap().path();
+                assert_eq!(path.extension().unwrap(), "ndjson");
+                let event: serde_json::Value =
+                    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+                services.push(event["service"].as_str().unwrap().to_owned());
+            }
+            services.sort();
+            assert_eq!(services, ["first", "second"]);
+            batcher.flush(&mut pending, &mut count, 0, 0).await;
+            assert_eq!(
+                sample(&handle, crate::metrics::SYSLOG_WRITE_TASKS_FAILED_TOTAL),
+                1
+            );
         });
     }
 
