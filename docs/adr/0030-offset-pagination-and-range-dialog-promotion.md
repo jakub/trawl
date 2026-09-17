@@ -117,3 +117,71 @@ show the requested order because no old rows claim to match it. A failed
 transition shows its error and retry state. A background refresh of the
 same page and order retains the current rows, including on refresh error.
 Late responses cannot replace a newer selection of page or order.
+
+## Amendment: History search before pagination
+
+Accepted 2026-09-16 during prep for [#192](https://github.com/jakub/trawl/issues/192).
+This amendment replaces the local-filter rule for History. The global
+Runs list and net drawer retain their existing filtering contracts.
+
+History searches the current key's stored query text before applying
+limit and offset. The returned total counts matching entries. Matching is
+a literal substring after PostgreSQL lowercase conversion on both operands.
+Spaces and wildcard-looking characters are literal. Database locale governs
+case conversion; it need not match the browser's former Rust conversion.
+
+The user chose explicit Enter or Search submission because a substring
+search with an exact total can scan retained history. Typing edits a draft
+and leaves the applied result view in place. History storage has no
+configured retention cap; the in-memory query tracker's capacity is not
+a bound on this search.
+
+The user also chose to store the applied filter in `hq`, beside `hpage`.
+Reload, Back/Forward, and bookmarks restore this requested view. The searched
+text appears in the URL. A link does not freeze results or change which
+key's history the server authorizes.
+
+Applying a changed filter pushes one URL history entry and resets the page
+to zero. Submitting unchanged text refreshes the current page. A separate
+Clear filter control applies empty text at page zero. Paging preserves the
+applied filter and replaces the current URL entry, as it already does.
+Paging discards unapplied edits; URL navigation synchronizes the draft to
+the applied filter. Generated URLs omit empty filters and page zero.
+
+The new filter is decoded once from the raw query representation. Duplicate
+filter keys, invalid percent encoding or UTF-8, and NUL are rejected.
+The existing Search decoder and History page-number semantics stay intact.
+History retains its 32 KiB raw URL-query and 64-pair limits. Admission also
+reserves room for the largest supported page number in the canonical
+encoded URL. A failed submission leaves the draft, URL, and current view
+intact with a validation error. A malformed pasted link makes no history
+request and offers a reset to unfiltered page zero. The GET API has its own
+bounded filter admission, specified in the issue.
+
+Count and rows share the key/text predicate and one explicit read-only,
+repeatable-read transaction. They agree within one response even when
+another connection records or clears history. Ordering stays execution
+time descending, then id descending. Separate page requests do not promise
+a frozen dataset, and an empty out-of-range page preserves the existing
+page-window recovery behavior.
+
+Response ownership includes applied filter, page, request generation, and
+component lifetime. A transition to another filter or page hides old rows,
+shows a busy frame, and disables paging and export. Refreshing the same view
+may retain its rows, with refresh state visible and those actions disabled
+while pending. Late responses cannot replace a newer view. Draft edits alone
+leave the loaded view and its actions unchanged.
+
+ADR0025's Export and Clear decisions still apply. Export serializes the
+applied view's loaded page. Clear deletes this key's entire history, including
+entries that do not match the filter; the confirmation says so. A successful
+Clear invalidates older reads, resets draft/filter/page, replaces the URL
+with canonical History, and refreshes even if that URL did not change.
+Pre-clear rows cannot return during a pending or failed refresh. Errors
+preserve the existing failure and component-lifetime rules. Concurrent
+query execution can still add a later history entry.
+
+This decision adds no date filter, all-pages export, retention policy,
+shared Fleet interface, or search dependency. The implementation records
+query plans and measured cost on disposable synthetic history. An index
+or installation-wide latency guarantee is not assumed.
