@@ -14,16 +14,33 @@ which `dist/` the stub serves.
   none of this is about hairlines, and doubling 58 files buys nothing.
 - theme: light only, `data-theme` untouched.
 
-Reproduce, from `crates/trawl-web-ui/e2e/` with the SPA built:
+This is a historical archive, not the current script's screenshot inventory.
+The original script and harness are retained in the merged snapshot
+`0c8c2219`, including the footer-theme shot. The current script omits that
+shot because #196 moved theme selection into the user menu. The images and
+reports below retain the original evidence.
+
+The recorded after revision predates the squash merge. Fetch the retained
+PR #162 head before creating its worktree; ordinary branch checkout does not
+supply that revision. The merged snapshot contains later source changes and
+must not replace the recorded after build.
+
+From `crates/trawl-web-ui/e2e/` in a checkout of `0c8c2219`, use the original
+script and harness with separately built source revisions. Write new output
+under `/tmp` to preserve the committed archive:
 
 ```sh
+git fetch origin refs/pull/162/head
+git worktree add /tmp/trawl-161-after 82042b2315f4f3efa062471351dd09235883e9a0
+(cd /tmp/trawl-161-after/crates/trawl-web-ui && trunk build)
 node scripts/capture-native-controls-161.mjs --label after \
-  --out ../../../visual-evidence/issue-161/captures/after
+  --out /tmp/trawl-161-captures/after \
+  --dist /tmp/trawl-161-after/crates/trawl-web-ui/dist
 
 git worktree add /tmp/trawl-161-before ecce7645
 (cd /tmp/trawl-161-before/crates/trawl-web-ui && trunk build)
 node scripts/capture-native-controls-161.mjs --label before \
-  --out ../../../visual-evidence/issue-161/captures/before \
+  --out /tmp/trawl-161-captures/before \
   --dist /tmp/trawl-161-before/crates/trawl-web-ui/dist
 ```
 

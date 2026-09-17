@@ -347,13 +347,6 @@ async function capture(context) {
     await page.keyboard.press('Escape');
   }
 
-  // ---- status bar -----------------------------------------------------
-  await shot({
-    name: 'status-bar-theme-focused',
-    clip: ['.statusbar'],
-    focus: '.statusbar button.grp.clickable',
-  });
-
   // ---- service drawer -------------------------------------------------
   await page.goto(`${BASE}/search/schema?svc=${SERVICE}&stab=overview`);
   await present(page, '.sd-drawer');

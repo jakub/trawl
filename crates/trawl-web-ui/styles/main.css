@@ -1278,18 +1278,6 @@
   border-inline-start: 1px solid var(--line);
   padding-inline-start: 18px;
 }
-/* The theme control is the one clickable group and it is a <button>
- * (ADR-0029); .statusbar .grp gives it the flex row, this gives it the
- * reset. */
-.statusbar .grp.clickable {
-  background: none;
-  border: 0;
-  font: inherit;
-  color: inherit;
-  cursor: pointer;
-  border-radius: var(--radius-sm);
-}
-.statusbar .grp.clickable:hover { background: var(--panel-2); color: var(--ink-2); }
 .statusbar .grp.lagged .strong { color: var(--yellow); }
 .statusbar .sp { flex: 1; }
 .statusbar .strong { color: var(--ink-2); }

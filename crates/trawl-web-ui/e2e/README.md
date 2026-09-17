@@ -253,7 +253,8 @@ env -u NO_COLOR node crates/trawl-web-ui/e2e/scripts/visual-evidence.mjs
 
 Theme and the reading modes are seeded into `localStorage['trawl.ui']`
 with `addInitScript`, because that is where fleet-ui reads them from;
-`colorScheme` alone changes nothing. The shutter waits for every finite
+fixed Light and Dark preferences override `colorScheme`. With System (the
+default), `colorScheme` selects the resolved appearance. The shutter waits for every finite
 animation to finish first — the Haul button transitions out of its
 in-flight fill over 120ms, and a frame taken inside that window shows
 near-white on near-white.
@@ -273,9 +274,10 @@ one thing the suite is supposed to catch:
 | `06-repin-poll-leak.patch` | `on_cleanup` leaks the field case drawer's repin poll `Interval` | `repin-poll-teardown.spec.ts` |
 | `07-repin-alive-latch.patch` | the drawer's `is_alive` latch always answers true, so a status read landing after teardown acts on a dead surface | `repin-poll-teardown.spec.ts` |
 | `08-menu-walk.patch` | `roving::next_index` answers `current` for every navigation, so arrows, Home and End all stand still | `topbar-menu.spec.ts` |
-| `09-menu-roving-tabindex.patch` | every menu item renders `tabindex="0"`, so the menu has as many tab stops as it has items | `topbar-menu.spec.ts` |
+| `09-menu-roving-tabindex.patch` | every theme radio renders `tabindex="0"`, adding multiple menu tab stops | `topbar-menu.spec.ts` |
 | `10-menu-topmost-escape.patch` | the menu's Escape listener drops its `is_topmost` guard and answers Escape from under a modal | `topbar-menu.spec.ts` |
-| `11-menu-restore-before-callback.patch` | activating an item closes the menu and runs the callback without restoring the trigger | `topbar-menu.spec.ts` |
+| `11-menu-restore-before-callback.patch` | activating a theme radio closes the menu and runs the callback without restoring the trigger | `topbar-menu.spec.ts` |
+| `31-menu-command-restore.patch` | activating the Sign Out command closes the menu without restoring the trigger while logout is pending or after failure | `topbar-menu.spec.ts` |
 | `12-toast-dismiss-span.patch` | the toast dismiss goes back to a `<span class="x">` with the same click and no name | `native-controls.spec.ts` |
 | `13-sort-th-div.patch` | `sort_th` renders the header cell as a bare `<div on:click>` again, so no header on the div tables is focusable or named | `sort-headers.spec.ts` |
 | `14-results-row-handler.patch` | the pre-ADR-0029 whole-row `on:click` returns to the results `<tr>`, beside the caret button whose click bubbles into it: one press expands and collapses | `row-controls.spec.ts` |
@@ -295,7 +297,7 @@ one thing the suite is supposed to catch:
 Run the mechanism:
 
 ```sh
-crates/trawl-web-ui/e2e/scripts/mutation-check.sh                     # all 25 standard mutations (21 has a dedicated runner)
+crates/trawl-web-ui/e2e/scripts/mutation-check.sh                     # all standard mutations (21 has a dedicated runner)
 crates/trawl-web-ui/e2e/scripts/mutation-check.sh 02-editor-onchange.patch  # just one
 ```
 
@@ -310,13 +312,26 @@ cleanly reverted would strand a mutation in your tree. This is evidence
 tooling for reviewing the suite's effectiveness. Dedicated CI jobs run the
 Health, pagination, range-dialog, command-palette, and Save mutations after the same commit's baseline E2E job passes.
 
-08 through 11 are focus-order sensitive: the thing they break is
+08 through 11 and 31 are focus-order sensitive: the thing they break is
 where `document.activeElement` ends up after a keypress, and a browser
 can lose a focus race that a network assertion would never notice. So
-each of the four was run five consecutive times, as five separate
+the original issue-159 versions of 08 through 11 were run five consecutive times, as five separate
 invocations, and killed all five (transcripts under
 `visual-evidence/issue-159/`). 12 is a DOM-shape mutation with no timing
 in it and was run once.
+
+Issue #196 retargets 09 and 11 to theme radios and adds the independent command
+mutation 31. The issue-159 transcripts do not validate these new targets.
+
+On production-source candidate `ce9dc49e6ecd78d45e3ebd4805f0930da49ade8d`, the
+root validator observed target failure and control success independently for
+08, 09, 10, 11, and 31. After restoring source and rebuilding the pristine SPA,
+the full ordinary Chromium suite passed **437 tests in 6.3 minutes**. These are
+local executed results, not CI results. The
+[durable evidence summary](../../../docs/evidence/issue-196/menu-mutation-validation.md)
+retains the observed mutation outcomes and full-baseline result. This validates
+the changed mutation targets without relying on the earlier focused theme/menu
+passes. Documentation added afterward does not alter production behavior.
 
 13 through 19 follow the same rule, with transcripts under
 `visual-evidence/issue-161/`. 14 and 17 are the timing-sensitive pair and

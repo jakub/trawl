@@ -47,6 +47,7 @@ const REPIN_FLOW_RS: &str = include_str!("../src/repin_flow.rs");
 const PALETTE_RS: &str = include_str!("../../fleet-ui/src/command_palette.rs");
 const KBD_RS: &str = include_str!("../../fleet-ui/src/kbd.rs");
 const TOPBAR_RS: &str = include_str!("../../fleet-ui/src/topbar.rs");
+const ATMOSPHERE_RS: &str = include_str!("../../fleet-ui/src/atmosphere/component.rs");
 const MENU_RS: &str = include_str!("../../fleet-ui/src/menu.rs");
 const TABS_RS: &str = include_str!("../../fleet-ui/src/tabs.rs");
 const COPY_BUTTON_RS: &str = include_str!("../../fleet-ui/src/copy_button.rs");
@@ -815,6 +816,12 @@ const CONTRACTS: &[Contract] = &[
     },
     // -- native controls and the shared menu contract (ADR-0028) ------
     Contract {
+        assignment: "atmosphere: '.atmosphere',",
+        source_path: "../fleet-ui/src/atmosphere/component.rs",
+        source: ATMOSPHERE_RS,
+        hook: "class=\"atmosphere\"",
+    },
+    Contract {
         assignment: "topbarUser: '.topbar button.user',",
         source_path: "../fleet-ui/src/topbar.rs",
         source: TOPBAR_RS,
@@ -836,10 +843,16 @@ const CONTRACTS: &[Contract] = &[
         hook: "<div role=\"menu\" aria-label=menu_label",
     },
     Contract {
-        assignment: "userMenuItem: '.user-menu [role=\"menuitem\"]',",
+        assignment: "userMenuItem: '.user-menu [role=\"menuitem\"], .user-menu [role=\"menuitemradio\"]',",
         source_path: "../fleet-ui/src/menu.rs",
         source: MENU_RS,
         hook: "role=\"menuitem\"",
+    },
+    Contract {
+        assignment: "userMenuItem: '.user-menu [role=\"menuitem\"], .user-menu [role=\"menuitemradio\"]',",
+        source_path: "../fleet-ui/src/menu.rs",
+        source: MENU_RS,
+        hook: "role=\"menuitemradio\"",
     },
     Contract {
         assignment: "netAction: '.net-actions button',",
@@ -1400,18 +1413,6 @@ const CONTRACTS: &[Contract] = &[
         hook: "class=\"grp count\"",
     },
     Contract {
-        assignment: "themeControl: '.statusbar button.grp.clickable',",
-        source_path: "src/components/status_bar.rs",
-        source: STATUS_BAR_RS,
-        hook: "class=\"statusbar\"",
-    },
-    Contract {
-        assignment: "themeControl: '.statusbar button.grp.clickable',",
-        source_path: "src/components/status_bar.rs",
-        source: STATUS_BAR_RS,
-        hook: "class=\"grp clickable\"",
-    },
-    Contract {
         assignment: "intervalChip: '.interval-chips button.interval-chip',",
         source_path: "src/components/net_drawer.rs",
         source: NET_DRAWER_RS,
@@ -1636,12 +1637,6 @@ const CONTRACTS: &[Contract] = &[
         source_path: "src/pages/schema.rs",
         source: SCHEMA_RS,
         hook: "format!(\"Live tail {name_label_tail}\")",
-    },
-    Contract {
-        assignment: "themeSwitchName: 'Theme {current}: switch to {next} theme',",
-        source_path: "src/components/status_bar.rs",
-        source: STATUS_BAR_RS,
-        hook: "\"Theme {current}: switch to {next} theme\"",
     },
     Contract {
         assignment: "netRenameName: 'Rename {name}',",

@@ -4,7 +4,8 @@
   "version": "0.0.0",
   "description": "Real-browser Playwright suite for the trawl-web-ui leptos SPA (issue #118).",
   "scripts": {
-    "test": "playwright test"
+    "test": "playwright test",
+    "test:theme": "playwright test --config playwright.theme.config.ts"
   },
   "devDependencies": {
     "@playwright/test": "1.62.1"

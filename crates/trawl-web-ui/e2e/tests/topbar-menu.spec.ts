@@ -46,21 +46,22 @@ async function openByKeyboard(page: Pg): Promise<void> {
   await expect(page.locator(SEL.userMenu)).toBeVisible();
 }
 
-test('keyboard open focuses the first item and arrows walk with wrap', async ({ page }) => {
+test('keyboard open focuses System and arrows walk all choices and commands without selecting', async ({ page }) => {
   await page.goto('/search');
   await openByKeyboard(page);
 
   const items = page.locator(SEL.userMenuItem);
-  await expect(items).toHaveCount(2);
-  const first = items.nth(0);
-  const last = items.nth(1);
+  await expect(items).toHaveCount(4);
+  const first = page.getByRole('menuitemradio', { name: 'Light', exact: true });
+  const last = page.getByRole('menuitem', { name: 'Sign Out', exact: true });
+  const system = page.getByRole('menuitemradio', { name: 'System', exact: true });
 
-  await expect(first).toBeFocused();
-  expect(await itemTabindexes(page)).toEqual(['0', '-1']);
+  await expect(system).toBeFocused();
+  expect(await itemTabindexes(page)).toEqual(['-1', '-1', '0', '-1']);
 
   await page.keyboard.press('ArrowDown');
   await expect(last).toBeFocused();
-  expect(await itemTabindexes(page)).toEqual(['-1', '0']);
+  expect(await itemTabindexes(page)).toEqual(['-1', '-1', '-1', '0']);
 
   // Past the end wraps to the first rather than escaping the menu.
   await page.keyboard.press('ArrowDown');
@@ -72,13 +73,20 @@ test('keyboard open focuses the first item and arrows walk with wrap', async ({ 
 
   await page.keyboard.press('Home');
   await expect(first).toBeFocused();
+  await page.keyboard.press('ArrowDown');
+  await expect(page.getByRole('menuitemradio', { name: 'Dark', exact: true })).toBeFocused();
+  await page.keyboard.press('ArrowDown');
+  await expect(system).toBeFocused();
   await page.keyboard.press('End');
   await expect(last).toBeFocused();
-  expect(await itemTabindexes(page)).toEqual(['-1', '0']);
+  expect(await itemTabindexes(page)).toEqual(['-1', '-1', '-1', '0']);
+  await expect(system).toHaveAttribute('aria-checked', 'true');
+  await expect(first).toHaveAttribute('aria-checked', 'false');
+  expect(await page.evaluate(() => localStorage.getItem('trawl.ui'))).toBeNull();
 
   // The identity header sits before and OUTSIDE role="menu", so the
   // walk cannot land on it: the panel carries a header, the menu node
-  // holds only the two items.
+  // holds the theme group and Sign Out.
   await expect(page.locator('.user-menu .hdr')).toBeVisible();
   expect(
     await page.locator('.user-menu .hdr').evaluate((el) => el.closest('[role="menu"]') !== null),
@@ -113,13 +121,15 @@ test('Tab closes and restores the trigger', async ({ page }) => {
   await expect(page.locator(SEL.topbarUser)).toBeFocused();
 });
 
-test('theme item restores the trigger and flips the theme', async ({ page }) => {
+test('theme choice restores the trigger and selects the explicit preference', async ({ page }) => {
   await page.goto('/search');
   const themeAttr = () => page.evaluate(() => document.documentElement.getAttribute('data-theme'));
   const before = await themeAttr();
 
   await openByKeyboard(page);
-  // The first item IS the theme item, and it already has focus.
+  await page.keyboard.press('Home');
+  await page.keyboard.press('ArrowDown');
+  await expect(page.getByRole('menuitemradio', { name: 'Dark', exact: true })).toBeFocused();
   await page.keyboard.press('Enter');
 
   await expect(page.locator(SEL.userMenu)).toHaveCount(0);
@@ -128,6 +138,31 @@ test('theme item restores the trigger and flips the theme', async ({ page }) => 
   // callback never moves focus, so the ordering is unobservable here.
   await expect(page.locator(SEL.topbarUser)).toBeFocused();
   await expect.poll(themeAttr).not.toBe(before);
+  expect(await page.evaluate(() => JSON.parse(localStorage.getItem('trawl.ui')!).theme)).toBe('dark');
+});
+
+test('command activation restores the trigger while sign out is pending and after failure', async ({ page }) => {
+  let release!: () => void;
+  let requested = false;
+  const pending = new Promise<void>(resolve => { release = resolve; });
+  await page.route('**/api/auth/logout', async route => {
+    requested = true;
+    await pending;
+    await route.fulfill({ status: 503, contentType: 'application/json', body: '{"error":"temporarily unavailable"}' });
+  });
+  try {
+    await page.goto('/search');
+    await openByKeyboard(page);
+    await page.keyboard.press('End');
+    await expect(page.getByRole('menuitem', { name: 'Sign Out', exact: true })).toBeFocused();
+    await page.keyboard.press('Enter');
+    await expect.poll(() => requested).toBe(true);
+    await expect(page.locator(SEL.userMenu)).toHaveCount(0);
+    await expect(page.locator(SEL.topbarUser)).toBeFocused();
+    release();
+    await expect(page.getByRole('alert').filter({ hasText: 'Sign out was not confirmed.' })).toBeVisible();
+    await expect(page.locator(SEL.topbarUser)).toBeFocused();
+  } finally { release(); }
 });
 
 test('outside mousedown leaves focus on the target', async ({ page }) => {

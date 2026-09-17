@@ -4,6 +4,7 @@
 
 import { test, expect, resetScenario } from '../fixtures';
 import { SEL } from '../selectors';
+import { selectTheme } from '../theme';
 
 test('mounted chart recolors through both themes without losing visibility or data', async ({ page }) => {
   await page.addInitScript(() => {
@@ -41,7 +42,7 @@ test('mounted chart recolors through both themes without losing visibility or da
   await expect(beta).toHaveClass(/u-off/);
   for (const theme of ['dark', 'light']) {
     await page.evaluate(() => { (window as any).themeStrokes = []; });
-    await page.locator(SEL.themeControl).click();
+    await selectTheme(page, theme === 'dark' ? 'Dark' : 'Light');
     await expect(page.locator('html')).toHaveAttribute('data-theme', theme);
     await expect.poll(async () => page.evaluate(() => {
       const tokens = ['--accent', '--teal', '--red', '--yellow', '--green', '--ink'];
@@ -90,8 +91,11 @@ test('mounted ingest bars update their palette and retain time semantics', async
   const initial = await barFill();
   await page.evaluate(() => { (window as any).ingestCanvas = document.querySelector('.ig-chart canvas'); });
   await page.evaluate(() => { (window as any).themeFills = []; });
-  // The drawer is modal, so exercise the same root theme attribute directly.
-  await page.evaluate(() => document.documentElement.setAttribute("data-theme", "dark"));
+  // Open the real account menu programmatically while the drawer remains
+  // mounted; pointer interaction outside the drawer would dismiss it.
+  await page.locator(SEL.topbarUser).dispatchEvent('click');
+  await page.getByRole('menuitemradio', { name: 'Dark', exact: true }).dispatchEvent('click');
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark');
   await expect.poll(barFill).not.toBe(initial);
   await expect.poll(async () => page.evaluate(fill => (window as any).themeFills.includes(fill), await barFill())).toBe(true);
   const plot = (await page.locator('.ig-chart .u-over').boundingBox())!;
@@ -101,7 +105,10 @@ test('mounted ingest bars update their palette and retain time semantics', async
   await expect(tooltip.locator('.ig-tooltip-time')).toContainText(' – ');
   const darkBackground = await tooltip.evaluate(el => getComputedStyle(el).backgroundColor);
   await page.evaluate(() => { (window as any).themeFills = []; });
-  await page.evaluate(() => document.documentElement.setAttribute("data-theme", "light"));
+  await page.locator(SEL.topbarUser).dispatchEvent('click');
+  await page.getByRole('menuitemradio', { name: 'Light', exact: true }).dispatchEvent('click');
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'light');
+  await page.mouse.move(plot.x + plot.width * 0.9, plot.y + plot.height / 2);
   await expect.poll(barFill).toBe(initial);
   await expect.poll(async () => page.evaluate(fill => (window as any).themeFills.includes(fill), await barFill())).toBe(true);
   await expect.poll(() => tooltip.evaluate(el => getComputedStyle(el).backgroundColor)).not.toBe(darkBackground);

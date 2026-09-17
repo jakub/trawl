@@ -3,16 +3,14 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! `<StatusBar/>` — 26px footer with status, last-search summary,
-//! admin stats, and a corner theme toggle.
+//! and admin stats.
 //!
 //! The stats cluster (hot buffer / WAL backlog / active queries /
 //! uptime) renders only while the `admin` signal carries a
 //! [`DashboardSnapshot`] — `AuthShell` feeds it from the admin-only
 //! `/api/v1/dashboard/stream` SSE stream, so non-admins never see the
-//! group. The theme toggle calls `UiPrefs::theme()` `.update()` and
-//! fleet-ui's install effect re-projects to `<html data-theme>`.
+//! group.
 
-use fleet_ui::{Theme, UiPrefs};
 use leptos::prelude::*;
 use leptos::web_sys;
 use trawl_api::DashboardSnapshot;
@@ -38,34 +36,6 @@ pub fn StatusBar(
     #[prop(into)]
     admin: Signal<Option<DashboardSnapshot>>,
 ) -> impl IntoView {
-    let prefs = use_context::<UiPrefs>();
-
-    let toggle_theme = move |_| {
-        if let Some(p) = prefs {
-            p.theme().update(|t| *t = t.toggled());
-        }
-    };
-
-    let theme_label = move || {
-        prefs.map_or("light", |p| match p.theme().get() {
-            Theme::Light => "light",
-            Theme::Dark => "dark",
-        })
-    };
-
-    // The visible text is the theme in force; the accessible name says
-    // what pressing the control does (ADR-0028's ruling on its menu
-    // twin). The name OPENS with the visible word because WCAG 2.5.3
-    // asks a name to contain its own label: a control reading "dark"
-    // and named only "Switch to light theme" cannot be activated by
-    // voice with the word on it.
-    let next_theme_label = move || {
-        prefs.map_or("dark", |p| match p.theme().get() {
-            Theme::Light => "dark",
-            Theme::Dark => "light",
-        })
-    };
-
     // Host the browser is talking to — shown in the connected-state label
     // next to the server version from /api/v1/health.
     let host = web_sys::window()
@@ -137,18 +107,6 @@ pub fn StatusBar(
                 </span>
             </div>
             <div class="sp"></div>
-            <button
-                type="button"
-                class="grp clickable"
-                aria-label=move || {
-                    let current = theme_label();
-                    let next = next_theme_label();
-                    format!("Theme {current}: switch to {next} theme")
-                }
-                on:click=toggle_theme
-            >
-                <span>{theme_label}</span>
-            </button>
         </footer>
     }
 }

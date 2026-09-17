@@ -268,14 +268,15 @@ fn DemoApp() -> impl IntoView {
     // calls `fleet_ui::install` in its body.
     let prefs = install("fleet-ui-demo:prefs");
     // …and, like trawl-web-ui's App, the prefs must be provided as
-    // context: TopBar's theme toggle reaches them via
-    // `use_context::<UiPrefs>()` and silently no-ops without this.
+    // context: TopBar's theme choices reach them via
+    // `use_context::<UiPrefs>()`; missing context hides the choices and warns.
     provide_context(prefs);
 
     let groups = Signal::derive(sidebar_groups);
     let sidebar_active = Signal::derive(|| "home".to_string());
-    let user = Signal::derive(|| {
-        Some(UserInfo {
+    let identity_present = RwSignal::new(true);
+    let user = Signal::derive(move || {
+        identity_present.get().then(|| UserInfo {
             name: "demo user".into(),
             detail: "admin".into(),
         })
@@ -327,28 +328,61 @@ fn DemoApp() -> impl IntoView {
                     </Shell>
                 }/>
             </Routes>
-            // Always-visible theme toggle, outside <Routes> so it stays
-            // mounted on /login too (the real Shell's TopBar toggle only
-            // exists on shell routes). That is what lets a theme flip
+            <div role="group" aria-label="Demo identity" style="position:fixed;left:12px;bottom:52px;z-index:10">
+                <button class="btn" type="button" disabled=move || !identity_present.get()
+                    on:click=move |_| identity_present.set(false)>"Clear demo identity"</button>
+                <button class="btn" type="button" disabled=move || identity_present.get()
+                    on:click=move |_| identity_present.set(true)>"Restore demo identity"</button>
+            </div>
+            // Always-visible theme choices, outside <Routes> so they stay
+            // mounted on /login too (the real Shell's TopBar choices only
+            // exist on shell routes). That is what lets a preference change
             // re-color the mounted backdrop canvas in place, without a
             // remount, while /login is on screen.
-            <button
-                class="btn"
+            <div
+                role="group"
+                aria-label="Demo theme"
                 style="position:fixed;right:12px;bottom:12px;z-index:10"
-                on:click=move |_| prefs.theme().update(|t| *t = t.toggled())
             >
-                {move || match prefs.theme().get() {
-                    fleet_ui::theme::Theme::Light => "theme: light",
-                    fleet_ui::theme::Theme::Dark => "theme: dark",
-                }}
-            </button>
+                {[
+                    ("Light", fleet_ui::ThemePreference::Light),
+                    ("Dark", fleet_ui::ThemePreference::Dark),
+                    ("System", fleet_ui::ThemePreference::System),
+                ].into_iter().map(move |(label, preference)| view! {
+                    <button
+                        class="btn"
+                        type="button"
+                        aria-pressed=move || (prefs.theme_preference().get() == preference).to_string()
+                        on:click=move |_| prefs.select_theme(preference)
+                    >{label}</button>
+                }).collect_view()}
+            </div>
         </Router>
     }
 }
 
 #[cfg(target_arch = "wasm32")]
 fn main() {
-    mount_to_body(DemoApp);
+    mount_to_body(DemoHost);
+}
+
+/// Workbench lifecycle controls dispose the sole preference installation with
+/// its child owner. They never mount a second installation beside the first.
+#[cfg(target_arch = "wasm32")]
+#[component]
+fn DemoHost() -> impl IntoView {
+    let installed = RwSignal::new(true);
+    view! {
+        <Show when=move || installed.get()>
+            <DemoApp/>
+        </Show>
+        <div role="group" aria-label="Demo lifecycle" style="position:fixed;left:12px;bottom:12px;z-index:10">
+            <button class="btn" type="button" disabled=move || installed.get()
+                on:click=move |_| installed.set(true)>"Install demo"</button>
+            <button class="btn" type="button" disabled=move || !installed.get()
+                on:click=move |_| installed.set(false)>"Dispose demo"</button>
+        </div>
+    }
 }
 
 /// A second app's presets and refusal policy, with no live mode.

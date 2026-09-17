@@ -116,7 +116,7 @@ pub use segmented::{SegmentedOption, segmented_class};
 pub use sidebar::{RailItem, SidebarGroup};
 pub use sparkline::SparkPath;
 pub use status_dot::StatusTone;
-pub use theme::{Details, RowStyle, Rows, Theme};
+pub use theme::{Details, RowStyle, Rows, Theme, ThemePreference};
 pub use toast::{Toast, ToastKind, ToastStack};
 
 #[cfg(target_arch = "wasm32")]

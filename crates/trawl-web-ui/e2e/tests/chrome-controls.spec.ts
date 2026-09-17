@@ -3,7 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 // The single controls scattered around the chrome (issue #161,
-// ADR-0029): a filter chip's remove, the theme switch, the schedule
+// ADR-0029): a filter chip's remove, the theme choices, the schedule
 // interval presets, the range picker's quick ranges, the service
 // drawer's top-field control and a result detail's tag.
 //
@@ -72,42 +72,34 @@ test('chip remove is named by its filter', async ({ page, request }) => {
   await expect(page).not.toHaveURL(/[?&]f=/);
 });
 
-test('theme control names its result', async ({ page, request }) => {
+test('theme choices are named native radios and the footer control is absent', async ({ page, request }) => {
   await resetScenario(request, 'health-viewer');
   await page.goto('/settings');
   await expect(page.locator(SEL.healthPage)).toBeVisible();
 
-  const theme = page.locator(SEL.themeControl);
-  await expect(theme).toHaveJSProperty('tagName', 'BUTTON');
-  await expect(theme).toHaveAttribute('type', 'button');
-  // No `title`: it duplicated the name and said less.
-  expect(await theme.evaluate((el) => el.hasAttribute('title'))).toBe(false);
-
-  const before = await page.evaluate(() => document.documentElement.getAttribute('data-theme'));
-  const other = before === 'dark' ? 'light' : 'dark';
-  // The visible text is the theme in force; the name opens with that
-  // same word and then says the theme a press produces. Both halves are
-  // asserted: a name that dropped the visible word could not be spoken
-  // by someone reading the button (WCAG 2.5.3).
-  await expect(theme).toHaveText(before ?? '');
-  await expect(theme).toHaveAccessibleName(
-    nameFrom(COPY.themeSwitchName, before ?? '', other),
-  );
-
+  await expect(page.locator('.statusbar button')).toHaveCount(0);
+  await expect(page.locator(SEL.statusLabel)).toBeVisible();
   await page.locator(SEL.topbarUser).focus();
-  await tabUntilFocused(page, theme, 20);
-  await expectFocusRing(theme);
-
   await page.keyboard.press('Enter');
-  await expect
-    .poll(() => page.evaluate(() => document.documentElement.getAttribute('data-theme')))
-    .toBe(other);
-  // And the name follows the theme rather than freezing at load: both
-  // halves swap.
-  await expect(theme).toHaveText(other);
-  await expect(theme).toHaveAccessibleName(
-    nameFrom(COPY.themeSwitchName, other, before ?? ''),
-  );
+  const group = page.getByRole('group', { name: 'Theme', exact: true });
+  await expect(group.getByRole('menuitemradio')).toHaveCount(3);
+  for (const name of ['Light', 'Dark', 'System']) {
+    const radio = group.getByRole('menuitemradio', { name, exact: true });
+    await expect(radio).toHaveJSProperty('tagName', 'BUTTON');
+    await expect(radio).toHaveAttribute('type', 'button');
+    await expect(radio).toHaveAccessibleName(name);
+    await expect(radio).toHaveAttribute('aria-checked', String(name === 'System'));
+  }
+  const selected = group.getByRole('menuitemradio', { name: 'System', exact: true });
+  await expect(selected).toBeFocused();
+  await expectFocusRing(selected);
+  await expect(selected.locator('.menu-choice-mark')).toHaveText('✓');
+  await page.keyboard.press('Home');
+  await page.keyboard.press('ArrowDown');
+  await page.keyboard.press('Space');
+  await expect(page.locator(SEL.userMenu)).toHaveCount(0);
+  await expect(page.locator(SEL.topbarUser)).toBeFocused();
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark');
 });
 
 test('interval presets expose aria-pressed', async ({ page, request }) => {

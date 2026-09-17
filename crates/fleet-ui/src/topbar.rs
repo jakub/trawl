@@ -7,7 +7,7 @@
 //! nav toggle · page title · spacer · command palette · account menu.
 //! Navigation itself belongs to [`crate::sidebar`] (ADR-0032); the bar
 //! names the current page and carries the two chrome affordances that
-//! are not destinations. The theme toggle reads the `UiPrefs` context
+//! are not destinations. The theme choices read the `UiPrefs` context
 //! the consumer provides from `fleet_ui::install()`. The bar knows
 //! nothing about auth, `/me`, or app-specific endpoints: `on_logout` is
 //! a callback the consumer wires to its own logout flow.
@@ -30,11 +30,10 @@
 //! closes the menu rather than leaving it open behind an unmounted
 //! panel.
 //!
-//! Three affordances left with ADR-0025 and ADR-0028: the notifications
-//! bell (never wired), the disabled Profile and API tokens rows, and
-//! the theme item's `⌘⇧L` hint chip (the chord collides with
-//! Bitwarden's autofill and Safari's own binding, so it is not bound
-//! and the hint would be a lie). Shell owns the command palette and
+//! ADR-0025 and ADR-0028 retired the notifications bell, disabled Profile
+//! and API tokens rows, and theme shortcut hint. No theme shortcut is bound.
+//! The Theme group offers explicit Light, Dark and System preferences, with
+//! initial focus on the checked choice. Shell owns the command palette and
 //! supplies its trigger callback, availability and open state here.
 
 use leptos::html::{Button, Div};
@@ -43,8 +42,8 @@ use leptos::prelude::*;
 use crate::command_palette::platform_kbd_hint;
 use crate::icon::{Icon, IconView};
 use crate::kbd::Kbd;
-use crate::menu::{MenuEntry, MenuItem, MenuPanel};
-use crate::theme::UiPrefs;
+use crate::menu::{MenuEntry, MenuItem, MenuPanel, MenuRadioItem};
+use crate::theme::{ThemePreference, UiPrefs};
 
 /// User identity for the avatar + dropdown header. `detail` is the
 /// app-supplied secondary line (trawl uses role, coastwatch may use
@@ -150,35 +149,41 @@ fn account_menu(
         }
     });
 
-    let toggle_theme = Callback::new(move |()| {
-        if let Some(p) = prefs {
-            p.theme.update(|t| *t = t.toggled());
-        } else {
-            // Developer-facing: consumer mounted <TopBar/> without calling
-            // `fleet_ui::install()`, so the theme toggle silently does
-            // nothing. Surface it so it's caught in dev, not QA.
-            leptos::logging::warn!(
-                "fleet-ui TopBar: UiPrefs context missing — did you call fleet_ui::install()?"
-            );
-        }
-    });
+    if prefs.is_none() {
+        leptos::logging::warn!(
+            "fleet-ui TopBar: UiPrefs context missing — did you call fleet_ui::install()?"
+        );
+    }
 
-    // The theme item renames itself with the theme it would switch to,
-    // so its label is a derived signal rather than a snapshot string.
+    // Checked state names the stored preference, even when System resolves to
+    // the same appearance as a fixed choice. Opening does not change it.
     let entries = move || {
-        vec![
-            MenuEntry::Item(MenuItem {
-                label: Signal::derive(move || theme_label(prefs)),
-                danger: false,
-                on_activate: toggle_theme,
-            }),
-            MenuEntry::Separator,
-            MenuEntry::Item(MenuItem {
-                label: Signal::stored("Sign Out".to_string()),
-                danger: true,
-                on_activate: on_logout,
-            }),
-        ]
+        let mut entries = Vec::new();
+        if let Some(prefs) = prefs {
+            let items = [
+                ("Light", ThemePreference::Light),
+                ("Dark", ThemePreference::Dark),
+                ("System", ThemePreference::System),
+            ]
+            .into_iter()
+            .map(|(label, preference)| MenuRadioItem {
+                label,
+                checked: Signal::derive(move || prefs.theme_preference().get() == preference),
+                on_activate: Callback::new(move |()| prefs.select_theme(preference)),
+            })
+            .collect();
+            entries.push(MenuEntry::RadioGroup {
+                label: "Theme",
+                items,
+            });
+            entries.push(MenuEntry::Separator);
+        }
+        entries.push(MenuEntry::Item(MenuItem {
+            label: Signal::stored("Sign Out".to_string()),
+            danger: true,
+            on_activate: on_logout,
+        }));
+        entries
     };
 
     view! {
@@ -245,21 +250,4 @@ fn avatar_initials(user: Option<&UserInfo>) -> String {
             )
         },
     )
-}
-
-fn theme_label(prefs: Option<UiPrefs>) -> String {
-    use crate::theme::Theme;
-    match prefs.map(|p| p.theme.get()) {
-        Some(Theme::Dark) => "Switch to light theme".into(),
-        Some(Theme::Light) => "Switch to dark theme".into(),
-        None => {
-            // Same root cause as the toggle_theme warn above: consumer
-            // forgot `fleet_ui::install()`. The label is meaningless without
-            // prefs, but we still render something so the UI doesn't break.
-            leptos::logging::warn!(
-                "fleet-ui TopBar: UiPrefs context missing — did you call fleet_ui::install()?"
-            );
-            "Theme (unavailable)".into()
-        }
-    }
 }

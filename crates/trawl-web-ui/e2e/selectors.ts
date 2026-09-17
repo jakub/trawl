@@ -186,15 +186,16 @@ export const SEL = {
   /// native button since ADR-0028; the `.topbar` prefix keeps it away
   /// from any other `.user` a page might carry.
   topbarUser: '.topbar button.user',
+  /// crates/fleet-ui/src/atmosphere/component.rs — mounted backdrop host.
+  atmosphere: '.atmosphere',
   /// crates/fleet-ui/src/menu.rs mounted by topbar.rs with
   /// `panel_class="user-menu"` — the role="menu" node INSIDE the panel
   /// wrapper, so the identity header (which sits outside it) is not part
   /// of what this matches.
   userMenu: '.user-menu [role="menu"]',
-  /// The account menu's command buttons. Ordered as rendered, so
-  /// `.nth(0)` is the theme item and `.nth(1)` Sign Out; the separator
-  /// between them is role="separator" and is not matched.
-  userMenuItem: '.user-menu [role="menuitem"]',
+  /// The account menu's radio choices and commands in their shared
+  /// focus order. Labels and separators are excluded.
+  userMenuItem: '.user-menu [role="menuitem"], .user-menu [role="menuitemradio"]',
   /// crates/trawl-web-ui/src/pages/nets.rs direct row controls.
   netAction: '.net-actions button',
   /// crates/fleet-ui/src/tabs.rs TabsStyle::Workspace — one tab of the
@@ -377,10 +378,6 @@ export const SEL = {
   /// crates/trawl-web-ui/src/components/status_bar.rs — the footer's
   /// count group, whose label names the source it counted.
   footerCount: '.statusbar .grp.count',
-  /// crates/trawl-web-ui/src/components/status_bar.rs — the theme
-  /// control. Its visible text is the theme in force and its accessible
-  /// name is the theme a press would produce.
-  themeControl: '.statusbar button.grp.clickable',
   /// crates/trawl-web-ui/src/components/net_drawer.rs — one schedule
   /// interval preset, an exclusive set carrying aria-pressed.
   intervalChip: '.interval-chips button.interval-chip',
@@ -588,11 +585,6 @@ export const COPY = {
   /// crates/trawl-web-ui/src/pages/schema.rs — the row quick actions.
   schemaSearchName: 'Search {name_label_search}',
   schemaTailName: 'Live tail {name_label_tail}',
-  /// crates/trawl-web-ui/src/components/status_bar.rs — the theme
-  /// control. The name opens with the visible word (the theme in force)
-  /// and then says what a press produces, so the label is inside the
-  /// name.
-  themeSwitchName: 'Theme {current}: switch to {next} theme',
   /// crates/trawl-web-ui/src/components/net_drawer.rs — the drawer
   /// title's rename trigger.
   netRenameName: 'Rename {name}',

@@ -7,6 +7,80 @@ description: Run Trawl locally with the Fleet development controller.
 and PostgreSQL, reconciles a persistent development identity, generates private
 per-process configuration, and runs Trawl under an attached `mprocs` supervisor.
 
+## Fleet theme preferences and consumer adoption
+
+`UiPrefs::theme_preference()` returns the selected `ThemePreference`: System,
+Light, or Dark. `UiPrefs::theme()` returns a read-only `Signal<Theme>` containing
+the resolved Light or Dark appearance. CSS, charts, and Atmosphere read the
+resolved value. Controls select a preference with
+`prefs.select_theme(ThemePreference::System)` rather than writing a resolved
+color. Trawl exposes Light, Dark, and System in the account menu's Theme group.
+The footer has no theme control.
+
+System is the default when storage has no valid theme. Every existing valid
+`"light"` or `"dark"` value remains fixed, including values saved by older
+initialization behavior. System follows the current OS appearance; unavailable
+media-query access resolves to Light. Initialization, OS changes, and selecting
+the current preference do not write storage. A changed preference writes the
+complete snapshot with `"theme":"system"`, `"light"`, or `"dark"`. A failed
+write leaves the session usable but does not persist the choice.
+
+Call `fleet_ui::theme::install(storage_key)` once within the app's reactive
+owner. It rereads storage and current OS state, owns one media-query listener,
+and removes that listener when the owner is disposed. It does not depend on
+the early bootstrap having run.
+
+Each consumer owns its existing storage namespace:
+
+| Consumer | Storage key |
+| --- | --- |
+| Trawl | `trawl.ui` |
+| Fleet workbench | `fleet-ui-demo:prefs` |
+| Coastwatch | `coastwatch.ui` |
+
+To apply the appearance before styles and Wasm load, adopt Fleet's shared
+`crates/fleet-ui/js/theme-bootstrap.js` through Trunk. Keep the static
+`<html data-theme="light">` fallback. Put this script before **every** stylesheet
+and Rust asset declaration, including external font stylesheets. For a
+Coastwatch checkout beside Trawl, the input in `crates/web-ui/index.html` is:
+
+```html
+<script data-trunk src="../../../trawl/crates/fleet-ui/js/theme-bootstrap.js" data-storage-key="coastwatch.ui"></script>
+```
+
+Use the consumer's same key for runtime installation. Trunk emits a
+content-hashed JavaScript asset and retains `data-storage-key`; the script reads
+that attribute through `document.currentScript`. Keep it a synchronous classic
+script, without `async`, `defer`, or `type="module"`. Ship the emitted file with
+the whole distribution in both embedded and disk serving modes. Check the
+built HTML, successful JavaScript response, immutable cache header, and ordering
+against the actual stylesheet and Wasm loader nodes.
+
+The external same-origin script fits Coastwatch's existing `script-src 'self'`
+policy. Preserve its per-response nonce handling for the separate inline Wasm
+loader and preserve all existing CSP directives. The theme script needs no
+inline allowance, extra origin, or permanent inline `color-scheme`; CSS owns
+`color-scheme` through the binary `data-theme` attribute.
+
+For unchanged storage and media inputs, the first styled appearance must agree
+with runtime installation. Inputs can change while Wasm loads, so the runtime
+must reread them. Disabled JavaScript or a failed bootstrap leaves the visible
+static Light fallback; correct first paint is not guaranteed in those cases.
+This issue adopts the bootstrap in Trawl and the Fleet workbench only.
+Coastwatch's unchanged HTML has no first-paint guarantee, even when its theme
+readers compile against Fleet. Its source and CI pin require a separate
+consumer change to adopt the script.
+
+The contracts are recorded in
+[ADR-0028's theme amendment](https://github.com/jakub/trawl/blob/main/docs/adr/0028-native-controls-and-the-menu-contract.md#amendment-explicit-theme-preference-2026-09-16),
+[ADR-0029's footer amendment](https://github.com/jakub/trawl/blob/main/docs/adr/0029-list-rows-carry-one-stretched-control.md#amendment-theme-control-location-2026-09-16),
+and the [Fleet glossary](https://github.com/jakub/trawl/blob/main/crates/fleet-ui/context.md).
+The [theme evidence instructions](https://github.com/jakub/trawl/blob/main/crates/trawl-web-ui/e2e/theme-tests/README.md)
+describe production serving, delayed-Wasm appearance checks, and listener
+disposal tests. The
+[consumer validation record](https://github.com/jakub/trawl/blob/main/docs/evidence/issue-196/consumer-validation.md)
+separates the tested revisions and results from the adoption instructions.
+
 ## Start the localhost stack
 
 With no profile, the controller uses Docker and localhost:
