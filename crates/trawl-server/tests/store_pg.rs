@@ -60,7 +60,7 @@ async fn history_record_and_retrieve(pool: PgPool) {
         .unwrap();
     assert!(id > 0);
 
-    let page = store.get_user_history(key_id, 10, 0).await.unwrap();
+    let page = store.get_user_history(key_id, 10, 0, None).await.unwrap();
     assert_eq!(page.total, 1);
     assert_eq!(page.entries.len(), 1);
 
@@ -84,18 +84,18 @@ async fn history_pagination(pool: PgPool) {
             .unwrap();
     }
 
-    let page1 = store.get_user_history(key_id, 2, 0).await.unwrap();
+    let page1 = store.get_user_history(key_id, 2, 0, None).await.unwrap();
     assert_eq!(page1.total, 5);
     assert_eq!(page1.entries.len(), 2);
     // Most recent first (descending order).
     assert_eq!(page1.entries[0].query, "query 4");
     assert_eq!(page1.entries[1].query, "query 3");
 
-    let page2 = store.get_user_history(key_id, 2, 2).await.unwrap();
+    let page2 = store.get_user_history(key_id, 2, 2, None).await.unwrap();
     assert_eq!(page2.entries[0].query, "query 2");
     assert_eq!(page2.entries[1].query, "query 1");
 
-    let page3 = store.get_user_history(key_id, 2, 4).await.unwrap();
+    let page3 = store.get_user_history(key_id, 2, 4, None).await.unwrap();
     assert_eq!(page3.entries.len(), 1);
     assert_eq!(page3.entries[0].query, "query 0");
 }
@@ -116,8 +116,8 @@ async fn history_pagination_tie_breaks_on_id(pool: PgPool) {
     }
 
     let store = history(&pool);
-    let page1 = store.get_user_history(1, 2, 0).await.unwrap();
-    let page2 = store.get_user_history(1, 2, 2).await.unwrap();
+    let page1 = store.get_user_history(1, 2, 0, None).await.unwrap();
+    let page2 = store.get_user_history(1, 2, 2, None).await.unwrap();
     let seen: Vec<&str> = page1
         .entries
         .iter()
@@ -148,11 +148,11 @@ async fn history_user_isolation(pool: PgPool) {
         .await
         .unwrap();
 
-    let user1 = store.get_user_history(1, 10, 0).await.unwrap();
+    let user1 = store.get_user_history(1, 10, 0, None).await.unwrap();
     assert_eq!(user1.total, 2);
     assert_eq!(user1.entries[0].query, "user 1 query 2");
 
-    let user2 = store.get_user_history(2, 10, 0).await.unwrap();
+    let user2 = store.get_user_history(2, 10, 0, None).await.unwrap();
     assert_eq!(user2.total, 1);
     assert_eq!(user2.entries[0].query, "user 2 query");
 }
@@ -160,9 +160,200 @@ async fn history_user_isolation(pool: PgPool) {
 #[sqlx::test]
 async fn history_empty(pool: PgPool) {
     let store = history(&pool);
-    let page = store.get_user_history(999, 10, 0).await.unwrap();
+    let page = store.get_user_history(999, 10, 0, None).await.unwrap();
     assert_eq!(page.total, 0);
     assert_eq!(page.entries.len(), 0);
+}
+
+#[sqlx::test]
+async fn history_filter_counts_and_orders_across_all_key_history(pool: PgPool) {
+    let store = history(&pool);
+    let mut matching_ids = Vec::new();
+    for index in 0..120 {
+        let query = if index % 3 == 0 {
+            format!("unrelated query {index}")
+        } else {
+            format!("address 198.51.100.7 query {index}")
+        };
+        // Every timestamp ties; interleaved foreign ids must not affect pages.
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO query_history (key_id, query, executed_at, duration_ms, row_count, status)
+             VALUES (1, $1, '2026-07-01T00:00:00Z', 1, 1, 'success') RETURNING id",
+        )
+        .bind(&query)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        if index % 3 != 0 {
+            matching_ids.push(id);
+        }
+        sqlx::query(
+            "INSERT INTO query_history (key_id, query, executed_at, duration_ms, row_count, status)
+             VALUES (2, $1, '2026-07-01T00:00:00Z', 1, 1, 'success')",
+        )
+        .bind(&query)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    matching_ids.reverse();
+    let mut observed_ids = Vec::new();
+    for (offset, expected_len) in [(0, 50), (50, 30), (100, 0)] {
+        let page = store
+            .get_user_history(1, 50, offset, Some("198.51.100.7"))
+            .await
+            .unwrap();
+        assert_eq!(page.total, 80);
+        assert_eq!(page.entries.len(), expected_len);
+        assert!(page.entries.iter().all(|entry| entry.key_id == 1));
+        observed_ids.extend(page.entries.iter().map(|entry| entry.id));
+    }
+    assert_eq!(observed_ids, matching_ids);
+    let unfiltered = store.get_user_history(1, 50, 0, None).await.unwrap();
+    assert_eq!(unfiltered.total, 120);
+    assert_eq!(
+        store.get_user_history(1, 50, 0, Some("")).await.unwrap(),
+        unfiltered
+    );
+    assert!(
+        !unfiltered
+            .entries
+            .iter()
+            .any(|entry| entry.id == *matching_ids.last().unwrap())
+    );
+    let absent = store
+        .get_user_history(1, 50, 0, Some("no match anywhere"))
+        .await
+        .unwrap();
+    assert_eq!(absent.total, 0);
+    assert!(absent.entries.is_empty());
+}
+
+#[sqlx::test]
+async fn history_filter_preserves_literal_punctuation_and_spaces(pool: PgPool) {
+    let store = history(&pool);
+    let query = "IP 192.0.2.1 two  spaces %_\\.*[x]$ + apostrophe' END";
+    let id = store
+        .record_query(1, query, 1, 1, RunStatus::Success)
+        .await
+        .unwrap();
+    store
+        .record_query(1, "ordinary other query", 1, 1, RunStatus::Success)
+        .await
+        .unwrap();
+    store
+        .record_query(2, query, 1, 1, RunStatus::Success)
+        .await
+        .unwrap();
+    for needle in [
+        "ip 192.0.2.1",
+        "two  spaces",
+        "%_",
+        "\\",
+        ".*[x]$",
+        "+",
+        "apostrophe'",
+        " END",
+    ] {
+        let page = store
+            .get_user_history(1, 50, 0, Some(needle))
+            .await
+            .unwrap();
+        assert_eq!(page.total, 1, "literal needle {needle:?}");
+        assert_eq!(page.entries[0].id, id);
+    }
+    for needle in [
+        "two spaces",
+        "END ",
+        "' OR 1=1 --",
+        "%ordinary%",
+        "192.0.2._",
+    ] {
+        assert_eq!(
+            store
+                .get_user_history(1, 50, 0, Some(needle))
+                .await
+                .unwrap()
+                .total,
+            0,
+            "literal needle {needle:?}"
+        );
+    }
+}
+
+#[sqlx::test]
+async fn history_filter_non_ascii_follows_reported_postgres_locale(pool: PgPool) {
+    let store = history(&pool);
+    let locale: (String, String, String, Option<String>) = sqlx::query_as(
+        "SELECT datcollate, datctype, datlocprovider::text, datlocale
+                       FROM pg_database WHERE datname = current_database()",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    eprintln!(
+        "History lowercase test: datcollate={}, datctype={}, provider={}, locale={:?}",
+        locale.0, locale.1, locale.2, locale.3
+    );
+    let queries = [
+        "ÄPFEL",
+        "ÉCOLE",
+        "E\u{301}COLE",
+        "東京",
+        "İSTANBUL",
+        "Straße",
+    ];
+    let mut lowered = Vec::new();
+    for query in queries {
+        let id = store
+            .record_query(1, query, 1, 1, RunStatus::Success)
+            .await
+            .unwrap();
+        let text: String = sqlx::query_scalar("SELECT lower($1::text)")
+            .bind(query)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        lowered.push((id, text));
+    }
+    for needle in [
+        "äpfel",
+        "école",
+        "e\u{301}cole",
+        "東京",
+        "istanbul",
+        "STRASSE",
+    ] {
+        // Ask PostgreSQL only for lowercase conversion. Rust's literal byte
+        // substring comparison then supplies the independent expected ids.
+        let lower_needle: String = sqlx::query_scalar("SELECT lower($1::text)")
+            .bind(needle)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let expected: Vec<_> = lowered
+            .iter()
+            .rev()
+            .filter(|(_, text)| text.contains(&lower_needle))
+            .map(|(id, _)| *id)
+            .collect();
+        let page = store
+            .get_user_history(1, 50, 0, Some(needle))
+            .await
+            .unwrap();
+        assert_eq!(
+            page.total,
+            expected.len(),
+            "locale {locale:?}, needle {needle:?}"
+        );
+        assert_eq!(
+            page.entries
+                .iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
 }
 
 /// The `RunStatus` enum keeps the typed write path inside the status domain;
@@ -7255,22 +7446,31 @@ async fn history_clear_is_scoped_counted_and_preserves_saved(pool: PgPool) {
         .record_query(2, "foreign", 45, 6, RunStatus::Error)
         .await
         .unwrap();
-    let foreign = store.get_user_history(2, 10, 0).await.unwrap();
+    let foreign = store.get_user_history(2, 10, 0, None).await.unwrap();
     let saved_store = saved(&pool);
     let saved_query = saved_store.create(1, "keep", "*").await.unwrap();
 
     let deleted = store.clear_user_history(1).await.unwrap();
     assert_eq!(
-        store.get_user_history(2, 10, 0).await.unwrap(),
+        store.get_user_history(2, 10, 0, None).await.unwrap(),
         foreign,
         "history_clear preserves other keys"
     );
     assert_eq!(deleted, 2);
-    assert_eq!(store.get_user_history(1, 10, 0).await.unwrap().total, 0);
-    assert_eq!(store.get_user_history(2, 10, 0).await.unwrap(), foreign);
+    assert_eq!(
+        store.get_user_history(1, 10, 0, None).await.unwrap().total,
+        0
+    );
+    assert_eq!(
+        store.get_user_history(2, 10, 0, None).await.unwrap(),
+        foreign
+    );
     assert_eq!(saved_store.list(1).await.unwrap(), vec![saved_query]);
     assert_eq!(store.clear_user_history(1).await.unwrap(), 0);
-    assert_eq!(store.get_user_history(2, 10, 0).await.unwrap(), foreign);
+    assert_eq!(
+        store.get_user_history(2, 10, 0, None).await.unwrap(),
+        foreign
+    );
 }
 
 /// Deliberately interleave primary values across pages. Expected IDs are fixed
