@@ -1820,13 +1820,16 @@ See the runbooks for [sampling and resolution limits](/operate/operational-alert
 | `wal_root_scan` | Read or enumerate the WAL root; confirmed cold-start absence is excluded |
 | `wal_environment_scan` | Read or enumerate one WAL environment |
 | `chunk` | Compact one chunk, including a handled blocking-task failure; best-effort failure counts even when the cycle returns success |
-| `daily_rollup_scan` | Scan daily-rollup directories; confirmed `NotFound` from concurrent removal is excluded |
+| `daily_rollup_scan` | Scan daily-rollup directories; confirmed `NotFound` at directory-scan boundaries is excluded |
 | `daily_rollup_unit` | Roll up one daily unit, including a handled task failure |
 | `pending_rollup_scan` | Initialize the publication gate by scanning pending markers; a latched failure is counted once, not again on each read refusal |
 | `pending_rollup_recovery` | Recover pending rollup markers; the coordinated recovery wrapper owns returned errors, and the caller owns a handled task failure |
 | `consumed_wal_removal` | Remove a consumed WAL file after publication; a best-effort removal failure still counts |
 
 Propagating a returned error through callers does not add another failure.
+At the WAL and daily-rollup root, one scan attempt counts once even if
+several entries cannot be enumerated or inspected. Successfully inspected
+environments remain eligible for the existing processing path.
 Independent attempts remain separate. A daemon without a hot buffer creates
 a fresh publication gate for each cycle, so another failed scan is a new
 attempt. A successful quarantine and a later operation failure are separate
@@ -1835,7 +1838,10 @@ facts even when they occur in one cycle.
 `CompactionStats.total_errors` retains its existing mixed error/quarantine
 meaning. It is not relabelled as failed cycles. Idle work, disabled ingestion,
 and intentional repin suppression or waiting do not emit these operation
-failures. Confirmed removal of rollup directories is also excluded. Stale
+failures. Confirmed `NotFound` is excluded at directory-scan boundaries.
+Subsequent file-read, publication, and recovery failures still count,
+including `NotFound` caused by a concurrent retention operation. The alert
+reports the failed attempt, not its cause. Stale
 temporary-file cleanup and empty-directory housekeeping are outside this
 closed inventory. Retiring a replaced file as `.parquet.merged` is not a
 corrupt-file quarantine. These counters do not measure backlog eligibility

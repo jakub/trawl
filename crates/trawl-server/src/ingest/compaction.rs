@@ -19,7 +19,7 @@ use trawl_core::schema::{CanonicalType, LADDER, TypeResolution, normalize_duckdb
 use trawl_core::severity::Dialect;
 
 use crate::catalog::CatalogContext;
-use crate::env_dirs::{list_env_dirs, try_list_env_dirs};
+use crate::env_dirs::{list_env_dirs, try_list_env_dirs_observed};
 use crate::hot_buffer::HotBuffer;
 use crate::metrics::{BookkeepingWrite, CompactionOperation, QuarantineKind};
 use crate::publication::PublicationGate;
@@ -193,8 +193,12 @@ pub async fn compact_once_coordinated(
     // un-compacted events. A *missing* root is a cold start and yields an
     // empty list silently. Unlike a single unreadable env (isolated and
     // counted), a bad root leaves nothing to carry on with.
-    let env_wal_dirs = try_list_env_dirs(wal_dir).map_err(|e| {
+    let mut skipped_scan_error = false;
+    let env_wal_dirs = try_list_env_dirs_observed(wal_dir, || skipped_scan_error = true);
+    if skipped_scan_error || env_wal_dirs.is_err() {
         CompactionOperation::WalRootScan.record_failure();
+    }
+    let env_wal_dirs = env_wal_dirs.map_err(|e| {
         format!(
             "failed to list WAL env directories in {}: {e}",
             wal_dir.display()
@@ -420,8 +424,12 @@ async fn rollup_once(
     let mut total: u64 = 0;
     // Preserve the existing best-effort empty result and warning. Observe
     // this rollup scan here rather than changing other env-list consumers.
-    let env_dirs = try_list_env_dirs(data_dir).unwrap_or_else(|e| {
+    let mut skipped_scan_error = false;
+    let env_dirs = try_list_env_dirs_observed(data_dir, || skipped_scan_error = true);
+    if skipped_scan_error || env_dirs.is_err() {
         CompactionOperation::DailyRollupScan.record_failure();
+    }
+    let env_dirs = env_dirs.unwrap_or_else(|e| {
         tracing::warn!(dir = %data_dir.display(), error = %e,
             "failed to list env directories, treating as empty");
         Vec::new()
@@ -3713,6 +3721,127 @@ mod tests {
             operation_count(&handle, CompactionOperation::PendingRollupRecovery),
             1
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn operational_wal_root_skipped_metadata_failure_counts_once_per_scan() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let recorder = crate::metrics::prometheus_builder().build_recorder();
+        let handle = recorder.handle();
+        // The skipped environments never reach blocking compaction workers.
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        crate::metrics::init_operational_alert_metrics();
+        let tmp = tempfile::tempdir().unwrap();
+        let wal = tmp.path().join("wal");
+        let data = tmp.path().join("data");
+        let envs = [wal.join("prod"), wal.join("dev")];
+        for env in &envs {
+            std::fs::create_dir_all(env).unwrap();
+        }
+        let files = envs
+            .each_ref()
+            .map(|env| write_wal_file(env, "svc", &[OPERATIONAL_ROW]));
+        let original = files.each_ref().map(|file| std::fs::read(file).unwrap());
+        let permissions = std::fs::metadata(&wal).unwrap().permissions();
+
+        // Read permission permits enumeration; missing search permission
+        // makes metadata lookup fail for both otherwise valid environments.
+        std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let entries = std::fs::read_dir(&wal).and_then(Iterator::collect::<Result<Vec<_>, _>>);
+        let metadata = envs.each_ref().map(std::fs::metadata);
+        std::fs::set_permissions(&wal, permissions.clone()).unwrap();
+        assert_eq!(entries.unwrap().len(), 2, "root must remain enumerable");
+        if metadata.iter().all(Result::is_ok) {
+            eprintln!(
+                "skipped: privileges bypass directory search permissions; metadata failure was not exercised"
+            );
+            return;
+        }
+        assert!(
+            metadata.iter().all(|result| result
+                .as_ref()
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)),
+            "both environment metadata lookups must fail with PermissionDenied"
+        );
+
+        let root_before = operation_count(&handle, CompactionOperation::WalRootScan);
+        let env_before = operation_count(&handle, CompactionOperation::WalEnvironmentScan);
+        for expected_delta in 1..=2 {
+            std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let result =
+                compact_once(&wal, &data, Duration::ZERO, false, None, 1, "2GB", None).await;
+            // Restore before every assertion and before temporary-directory cleanup.
+            std::fs::set_permissions(&wal, permissions.clone()).unwrap();
+            assert_eq!(
+                result.unwrap(),
+                0,
+                "preserve the existing empty-success result"
+            );
+            assert_eq!(
+                operation_count(&handle, CompactionOperation::WalRootScan) - root_before,
+                expected_delta
+            );
+            assert_eq!(
+                operation_count(&handle, CompactionOperation::WalEnvironmentScan) - env_before,
+                0
+            );
+            for (file, bytes) in files.iter().zip(&original) {
+                assert_eq!(std::fs::read(file).unwrap(), *bytes);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn operational_rollup_root_skipped_metadata_failure_counts_once() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let recorder = crate::metrics::prometheus_builder().build_recorder();
+        let handle = recorder.handle();
+        // No environment reaches a blocking rollup worker in this case.
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        crate::metrics::init_operational_alert_metrics();
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let envs = [data.join("prod"), data.join("dev")];
+        for env in &envs {
+            std::fs::create_dir_all(env).unwrap();
+        }
+        let permissions = std::fs::metadata(&data).unwrap().permissions();
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let entries = std::fs::read_dir(&data).and_then(Iterator::collect::<Result<Vec<_>, _>>);
+        let metadata = envs.each_ref().map(std::fs::metadata);
+        std::fs::set_permissions(&data, permissions.clone()).unwrap();
+        assert_eq!(entries.unwrap().len(), 2, "root must remain enumerable");
+        if metadata.iter().all(Result::is_ok) {
+            eprintln!(
+                "skipped: privileges bypass directory search permissions; metadata failure was not exercised"
+            );
+            return;
+        }
+        assert!(
+            metadata.iter().all(|result| result
+                .as_ref()
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)),
+            "both environment metadata lookups must fail with PermissionDenied"
+        );
+
+        let before = operation_count(&handle, CompactionOperation::DailyRollupScan);
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let result = rollup_once(&data, "2GB", None, None).await;
+        std::fs::set_permissions(&data, permissions).unwrap();
+        assert_eq!(
+            result.unwrap(),
+            0,
+            "preserve the existing empty-success result"
+        );
+        assert_eq!(
+            operation_count(&handle, CompactionOperation::DailyRollupScan) - before,
+            1
+        );
+        assert!(envs.iter().all(|env| env.is_dir()));
     }
 
     #[tokio::test]

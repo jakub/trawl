@@ -379,6 +379,9 @@ The [operation inventory](/reference/api/#compaction-operation-labels) names
 all eight values and their owners. Best-effort failures count even when the
 overall cycle returns success. The dashboard's `CompactionStats.total_errors`
 mixes errors and quarantines; it is not a failed-cycle count.
+At a WAL or daily-rollup root, one scan counts once even if several entries
+cannot be inspected. Other successfully inspected environments still follow
+the existing processing path.
 
 1. Match the operation label to `compaction_error`, `rollup_error`, recovery,
    or consumed-WAL removal messages for the affected target.
@@ -389,9 +392,12 @@ mixes errors and quarantines; it is not a failed-cycle count.
    restart after correcting the cause. Preserve the recovery markers;
    repeated refusals alone do not add failure events.
 
-Successful empty work, a missing cold-start WAL root, confirmed directories
-removed by concurrent retention, and intentional repin suppression or waiting
-are not failures. Stale temporary-file cleanup and empty-directory housekeeping
+Successful empty work, a missing cold-start WAL root, and intentional repin
+suppression or waiting are not failures. Confirmed `NotFound` is excluded at
+directory-scan boundaries. Later file-read, publication, and recovery failures
+still count, including `NotFound` from a concurrent retention operation.
+Inspect the logs to establish the cause; the alert alone does not identify it.
+Stale temporary-file cleanup and empty-directory housekeeping
 are outside this finite operation inventory. A quiet counter is not evidence
 that a backlog is eligible, progressing, or absent.
 
