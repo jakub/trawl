@@ -58,7 +58,7 @@ such file or directory`. CI uploads the traces from the new path.
 CI (the `web-ui-e2e` job in `.github/workflows/ci.yml`) does not rebuild
 the SPA: it downloads the `trawl-web-ui-dist` artifact from the
 `trunk-build` job, then runs `npm ci`, `npx playwright install
---with-deps chromium`, and `npm run test -- --global-timeout=480000` as
+--with-deps chromium`, and `npm run test -- --global-timeout=1500000` as
 discrete steps, so the browser job compiles no Rust. `cargo xtask e2e` is the local entry point
 only (and installs chromium without `--with-deps`; on a dev machine the
 shared libraries are your own problem). `playwright.config.ts` switches
@@ -81,10 +81,10 @@ despite their crash messages. The missing popup event in main CI run
 34440325872 has not been reproduced locally, so its cause remains
 unproven.
 
-The full CI suite gets eight minutes on the shared `k8s-small` runner,
-inside a 15-minute job budget that also covers setup and artifact upload.
-The local default remains four minutes. To reproduce CI's aggregate
-budget locally, run `npm run test -- --global-timeout=480000` from this
+The full CI suite gets 25 minutes on the shared `k8s-small` runner,
+inside a 35-minute job budget that also covers setup and artifact upload.
+The local and focused mutation-run default remains 12 minutes. To reproduce CI's aggregate
+budget locally, run `npm run test -- --global-timeout=1500000` from this
 directory. This override leaves per-test timeouts, assertions and
 `retries: 0` unchanged.
 
@@ -232,9 +232,10 @@ that reveals it must wait for that element's own animations to finish
 (`responsive-layout.spec.ts` does, for the nav overlay), or emulate the
 media itself the way `batch1-controls.spec.ts` does.
 
-`globalTimeout` is 720s, the same budget CI passes on the command line.
-A run that exceeds it stops and reports the remainder as "did not run",
-which is not a failure and is easy to read as a pass.
+`globalTimeout` defaults to 720s. The full CI job overrides it with 1500s;
+focused mutation runs retain the default. A run that exceeds its budget
+stops and reports the remainder as "did not run". Those cases did not pass,
+and the aggregate timeout fails the run.
 
 ## Visual evidence
 

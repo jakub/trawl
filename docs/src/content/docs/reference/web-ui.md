@@ -12,21 +12,27 @@ default, which is an address on the server, not the URL you open. See
 
 ## Navigation
 
-The top bar carries three mode tabs. Each mode has its own left rail.
+The sidebar groups application pages into three sections and has a bottom
+utility link. The first section has no heading.
 
-| Mode | Rail item | Route | What the page does |
-|------|-----------|-------|--------------------|
-| **Search** | **Search** | `/search` | Run a snapshot query or stream live events |
-| **Search** | **History** | `/search/history` | Reopen an earlier query |
-| **Search** | **Schema** | `/search/schema` | Browse services and fields, inspect conflicts |
-| **Jobs** | **Nets** | `/jobs/nets` | Manage saved queries and their schedules |
-| **Jobs** | **Runs** | `/jobs/runs` | Inspect scheduled run outcomes |
-| **Settings** | **Health** | `/settings/health` | Read server health and running queries |
-| **Settings** | **Schema** | `/search/schema` | The same schema page |
+| Group | Item | Route | Purpose |
+|-------|------|-------|---------|
+| No heading | **Search** | `/search` | Run a snapshot query or stream live events |
+| No heading | **History** | `/search/history` | Reopen an earlier query |
+| No heading | **Schema** | `/search/schema` | Browse services and fields, inspect conflicts |
+| Scheduled work | **Nets** | `/jobs/nets` | Manage saved queries and their schedules |
+| Scheduled work | **Runs** | `/jobs/runs` | Inspect scheduled run outcomes |
+| Operations | **Health** | `/settings/health` | Read server health and running queries |
+| Bottom utility | **Help** | [Documentation](https://trawl.sh/) | Open the documentation site in a new tab |
 
-Ctrl+K, or Command+K on macOS, opens the command palette, which lists the mode
-tabs and the rail sections and filters on both label and route. The rail's
-bottom item, **Help**, opens the documentation site in a new tab.
+The command bar shows the current page, **Go to…**, and the account menu.
+**Collapse sidebar** reduces the sidebar to icons, and **Expand sidebar**
+restores its labels. In compact navigation, **Open navigation** opens the
+sidebar as an overlay.
+
+**Go to…**, Ctrl+K, or Command+K on macOS opens the command palette. The palette
+lists the application pages and filters on both label and route.
+The sidebar's bottom item, **Help**, opens the documentation site in a new tab.
 
 `/login` takes an API key. A rejected key reports `Invalid API key`, and a
 successful sign-in lands on `/search`.
@@ -40,15 +46,25 @@ successful sign-in lands on `/search`.
 | **Live Tail** | In the date-range popover. Streams the editor's query over SSE |
 | **Stop live** | Beside the tabs, in live mode only. Closes the stream and runs the same query once, with the filters and the range unchanged |
 | **Haul** | Executes the editor's query. Ctrl+Enter and Command+Enter do the same |
-| **Save** | Names the query and stores it as a net. It does not freeze the rows |
-| **Share** | Copies the current URL to the clipboard |
+| **Save as Net** | In the console. Opens a dialog to name and save the editor text as a net |
+| **Copy search URL** | Beside the editor. Copies the current URL to the clipboard |
 | **Format** | Reformats the editor text. A query with parse errors is left alone |
-| **Filters** sidebar | Field values with counts. **Include** and **Exclude** add a filter, **Clear all** removes every filter |
+| **Filters** sidebar | Field values counted over the snapshot page or live buffer. Aggregate results hide the field-value groups; the active-filter count and **Clear all** remain. **Include** and **Exclude** add a filter, **Clear all** removes every filter |
 | Filter chips | Above the tabs. Selecting a chip removes that filter |
 | **Events** tab | The result table, with the row count in the tab |
 | **Visualization** tab | The chart for a `timechart` or aggregate query |
+| **View** | In the results header. Chooses how snapshot events and their details appear |
+| **Save** | In the results header. Opens the same dialog as **Save as Net** and captures the editor text |
 | **Export** | Downloads the results as CSV, JSON, or Parquet |
 | **← Prev**, **Next →** | Page through snapshot results, 50 rows per page |
+
+Both Save controls omit the range control and sidebar filters. They save the
+editor text, not the effective query or returned rows.
+
+**Edited** appears when the editor differs from the executed query. The strip
+below the console shows the accepted snapshot's rows returned, **Execution in**
+duration, and **Started** time in UTC. Later editor changes do not change those
+execution facts.
 
 Expanding a row shows its fields and raw text, and carries **Copy \_raw**,
 **Show context**, and **Find similar**. Selecting a field tag adds an include
@@ -71,6 +87,15 @@ A live stream has no page count and no incomplete-results notice. See
 [sharing and export](/use/sharing-export/) for the choice between a link, a
 saved query, and a file.
 
+### Result presentations
+
+The results area has these presentations:
+
+- **Quick start** appears in both results tabs before a snapshot query runs. It has four examples, sender and reserved field references, and severity bands. Each example's **Run** executes it with the selected range and filters, then opens **Events**.
+- **View** offers **Inline** or **Inspector** for event details, and **Compact** or **Message first** for rows. Inline expands details in the table. Inspector opens an event panel. Message first leads with time, severity and a wide message column, with service, host and latency below the message when present. Other fields remain in the event details. Without a `message` or `msg` column, the table stays compact. Inline and Compact are the defaults. These choices apply to snapshot events only, not live or aggregate results.
+- The histogram above snapshot events groups the current page's rows over their own time span. It does not count all matches in the selected range or measure ingest volume. It is absent for live and aggregate results.
+- For a snapshot aggregate, **Events** shows an exact table of group and metric columns, without row expansion. Only grouped fields offer a search action. A `stats` result with one group column and one numeric metric also has a chart with one bar per group beside the table. Other aggregate shapes show the table alone.
+
 ### Sharing search links
 
 The page reads five URL parameters and ignores the rest.
@@ -86,8 +111,8 @@ The page reads five URL parameters and ignores the rest.
 Copy the whole URL after the search has run. A malformed `f`, `r`, or `page`
 blocks execution until you apply the offered repair, and the broken URL stays
 intact. While that notice is present, the page also blocks **Haul**,
-**Live Tail**, **Save**, **Export**, pagination, range changes, and the filter
-controls.
+**Live Tail**, **Save as Net**, **Save**, **Export**, pagination, range changes,
+and the filter controls.
 
 A URL larger than 32 KiB, or one with more than 64 parameters, is refused whole,
 with **Start over** as the repair. The same limits apply when the page writes
@@ -107,17 +132,20 @@ grouping, and sorting can omit or combine rows differently from the source data.
 
 ## History
 
-`/search/history` lists completed queries with **When**, **Query**, **Events**,
-and **Duration**, and a filter box narrows the list. **Save as net** stores a
-row as a saved query. **Export this page** downloads the visible page as CSV or
+`/search/history` lists completed queries with **Executed query**, **When**,
+**Rows**, and **Action**. The headers do not sort. The filter box narrows only
+the loaded page. **Save as Net** stores a row as a saved query. **Export this page** downloads the visible page as CSV or
 JSON. **Clear history** asks for confirmation, then deletes every row for your
 key.
 
 ## Schema
 
-`/search/schema` lists services with their activity, earliest and latest dates,
-event count, storage, field count, and average coverage. Column headers sort,
-and the filter box matches service names and field names.
+`/search/schema` lists services with **Service**, **Activity**, **Events**,
+**Storage**, and **Fields** columns, followed by icon actions. The actions
+column is named **Actions** for screen readers. Its magnifying-glass **Search**
+button and lightning-bolt **Live tail** button open that service in Search or
+start its live stream. **Service**, **Events**, **Storage**, and
+**Fields** have sorting controls. The filter box matches service names and field names.
 
 Selecting a service opens its drawer: **Overview** for ingest rate and field
 types, **Fields** for the per-field table of type, non-null share, cardinality,
@@ -161,18 +189,21 @@ Closing the drawer stops its polling, not the server job. See
 
 ## Nets
 
-`/jobs/nets` lists saved queries with **Name**, **Query**, **Schedule**,
-**Last run**, and **Created**. A row's drawer offers **Rename**, **Edit** for the
-query text, **Open query in search**, **Trigger a scheduled run now**, and
-**Runs**. Its schedule block sets **Interval**, **Window**, and **Max runs**,
-switches the schedule between **Active** and **Paused**, and removes it.
-**Delete** asks for confirmation.
+`/jobs/nets` lists saved queries with **Name**, **Schedule**, **Last run**, and
+**Actions**. **Name** and **Last run** have sorting controls. A row's drawer offers
+**Rename**, **Edit** for the query text, **Open query in search**,
+**Trigger a scheduled run now**, and **Runs**. **Delete** asks for confirmation.
 
-**Window** has three modes. **Query text** runs the saved text as written.
+The schedule block sets **Run every**, **Each run covers**, and
+**Keep schedule running for**. The last field is a run count, with blank meaning
+unlimited. **Schedule enabled** switches between **Active** and **Paused**.
+**Save schedule** applies the form, and the schedule can also be removed.
+
+**Each run covers** has three modes. **Query text** runs the saved text as written.
 **Since last run** covers from the previous run's covered point to the run time.
-**Fixed span** covers the trailing **Span** below it, measured from the run time.
-Both windowed modes take a **Lag**, which moves both window bounds back by that
-much so late events can land first; blank is none. A save the server refuses
+**Fixed span** covers the **Trailing span** below it, measured from the run time.
+Both windowed modes take a **Late-arrival lag**, which moves both window bounds
+back by that much so late events can land first; blank is none. A save the server refuses
 appears under **Save schedule** in the server's own words, and the form keeps
 what you entered.
 
@@ -189,14 +220,16 @@ line under the pager gives both counts. See
 
 ## Runs
 
-`/jobs/runs` summarizes **Active nets**, **Success rate**, and **Avg duration**,
+`/jobs/runs` summarizes **Recorded runs**, **Success rate**, and **Average duration**,
 then lists recent runs with **Net**, **Status**, **When**, **Duration**, and
-**Rows**. A filter box narrows the list to one net.
+**Rows**. All five table columns have sorting controls. A filter box narrows
+the list to one net.
 
 ## Health
 
-`/settings/health` reports the server's state and checks. **Refresh** re-reads
-every section on the page.
+`/settings/health` reports the server's state and checks. **Refresh** reloads
+health and capacity. **Refresh queries** reloads the query list. **Live operations**
+uses the dashboard stream shared with the status bar.
 
 | Section | Permission | Contents |
 |---------|------------|----------|

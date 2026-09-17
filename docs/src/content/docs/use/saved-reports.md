@@ -12,8 +12,8 @@ Your key needs the `saved_query` permission.
 ## Save a query
 
 1. Build and run the query in Search.
-2. Select **Save**. The dialog shows the text under **Query**.
-3. Enter a **Name** that states the question, such as `Nginx errors by host`, and select **Save as net**.
+2. Select **Save as Net** in the console or **Save** in the results header. The dialog shows the editor text under **Query**.
+3. Enter a **Name** that states the question, such as `Nginx errors by host`, and select **Save as Net**.
 4. Open **Nets** and select the net to inspect or change it.
 
 Save captures the editor text only, not the **Filters** sidebar or the range
@@ -25,8 +25,9 @@ for everyone.
 ## Add a schedule
 
 Open the net's **Query + Schedule** tab. A new net shows `No schedule
-attached.`, so select **+ Add Schedule** first. Set **Interval** and
-**Max runs**, switch on **Schedule enabled**, and select **Save schedule**. The interval says
+attached.`, so select **+ Add Schedule** first. Set **Run every** to the interval.
+In **Keep schedule running for**, enter a run count or leave it blank for unlimited
+runs. Switch on **Schedule enabled**. Select **Save schedule**. The interval says
 how often the query runs, not how wide the data window is. For an hourly
 error report:
 
@@ -34,7 +35,7 @@ error report:
 service=nginx _severity>=error last=1h | stats count() as errors by host
 ```
 
-**Window** decides what each run reads. Under **Query text**, the run executes
+**Each run covers** decides what each run reads. Under **Query text**, the run executes
 the saved text as written, so the `last=1h` above measures the trailing hour on
 each run. The other two modes give the schedule its own bounds, and a query that
 already sets a time range cannot take one. Remove `last=1h` from the text
@@ -42,17 +43,17 @@ before you save a window, or the server refuses the save and names both sides.
 
 ## Choose the reporting window
 
-Pick a mode in the **Window** control:
+Pick a mode in the **Each run covers** control:
 
 - **Query text** leaves the bounds to the query. Without a time clause in the
   text, the schedule imposes no time limit.
 - **Since last run** covers consecutive periods with no gap. Each run starts
   where the previous one stopped covering.
-- **Fixed span** covers a trailing **Span**, measured again from every run. A
+- **Fixed span** covers the **Trailing span**, measured again from every run. A
   two-hour span on an hourly schedule overlaps between runs.
 
-**Lag** is a late-arrival allowance and applies to both windowed modes. It moves
-both window bounds back by that much, so late events land before the window that
+**Late-arrival lag** applies to both windowed modes. It moves both window bounds
+back by that much, so late events land before the window that
 owes them closes. Leave it blank for none.
 
 A **Since last run** schedule advances its own coverage point, and a manual run
