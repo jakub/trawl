@@ -71,10 +71,14 @@ try {
     .replace(/>$/, ' TYPE="TEXT/JAVASCRIPT">');
   writeFileSync(originalIndex, originalHtml.replace(originalTag, upperTag));
   inspect(path.dirname(originalIndex), 'trawl.ui', 'html-case-control', false);
+  writeFileSync(originalIndex, originalHtml.replace(originalTag, upperTag)
+    .replace('</head>', '<LINK REL="STYLESHEET" HREF="control.css"><SCRIPT TYPE="MODULE" SRC="control.js"></SCRIPT></head>'));
+  inspect(path.dirname(originalIndex), 'trawl.ui', 'html-app-case-control');
   const invalidMarkup = [
     ['duplicate-uppercase', originalHtml.replace('</head>', `${upperTag}</SCRIPT></head>`), /exactly one bootstrap/],
     ['uppercase-async', originalHtml.replace(originalTag, upperTag.replace(/>$/, ' ASYNC>')), /blocking script/],
     ['uppercase-defer', originalHtml.replace(originalTag, upperTag.replace(/>$/, ' DEFER>')), /blocking script/],
+    ['uppercase-module', originalHtml.replace(originalTag, upperTag.replace('TYPE="TEXT/JAVASCRIPT"', 'TYPE="MODULE"')), /classic script/],
     ['uppercase-stylesheet-first', originalHtml.replace(originalTag, `<LINK REL="STYLESHEET" HREF="control.css">${originalTag}`), /bootstrap precedes/],
   ];
   for (const [label, html, expected] of invalidMarkup) {
