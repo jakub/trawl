@@ -40,13 +40,13 @@ threads-required = 8
 [[profile.default.overrides]]
 # The pg-touching set. trawl-server's LIBRARY tests are in it too — the
 # retired config missed them entirely, so `from_saved`'s and `scheduler`'s
-# `#[sqlx::test]` cases ran unbounded — but only those two modules: the
-# other ~600 lib unit tests open no connection and capping them would
+# `#[sqlx::test]` cases ran unbounded. Only the listed Postgres modules belong
+# here: the other library unit tests open no connection and capping them would
 # serialize a suite that has no reason to be serial.
 filter = '''
   (package(trawl-server) & kind(lib)
     & (test(/^from_saved::/) | test(/^scheduler::/)
-      | test(/^store::catalog::pg_tests::/)))
+      | test(/^store::catalog::pg_tests::/) | test(/^store::history::tests::/)))
   | (package(trawl-server) & (binary(auth_pg) | binary(catalog_surface)
     | binary(connection_budget) | binary(dsl_admission) | binary(field_catalog)
     | binary(gc_pins) | binary(hot_query) | binary(http_api)
