@@ -115,8 +115,20 @@ let runDetailReads = [];
 let runListReads = [];
 
 // History scenarios own their held responses and request counters.
-const history = { offsets: [], deletes: 0, cleared: false, pending: null, loadPending: [] };
+const history = { offsets: [], requests: [], deletes: 0, cleared: false, pending: null, loadPending: [], hold: false, nextStatus: 200, entries: null };
 function historyScenario() { return scenario.startsWith('history-'); }
+function historyEntries() {
+  if (history.entries) return history.entries;
+  if (scenario !== 'history-search') return wire('history-export').entries;
+  const seed = wire('history-export').entries[0];
+  return Array.from({ length: 180 }, (_, i) => ({ ...seed, id: 180 - i,
+    query: `${i % 3 ? 'match' : 'other'}-row-${i + 1}${i >= 120 ? ' address=198.51.100.7' : ''}` }));
+}
+function historyPage(filter, offset, limit) {
+  const entries = (history.cleared ? [] : historyEntries())
+    .filter(row => row.query.toLowerCase().includes(filter.toLowerCase()));
+  return { total: entries.length, entries: entries.slice(offset, offset + limit) };
+}
 
 // Dashboard counters survive resets. Resetting a scenario cannot hide a late
 // socket close or turn a leaked connection into a fresh baseline.
@@ -177,10 +189,11 @@ const pagination = {
 function paginationSlice(total, offset, limit, row) {
   return Array.from({ length: Math.max(0, Math.min(limit, total - offset)) }, (_, i) => row(offset + i));
 }
-function paginationHistory(offset, limit) {
+function paginationHistory(offset, limit, filter = '') {
   const seed = wire('history').entries[0];
-  return { total: pagination.historyTotal, entries: paginationSlice(pagination.historyTotal, offset, limit,
-    i => ({ ...seed, id: i + 1, query: `history-row-${i + 1}` })) };
+  const entries = Array.from({ length: pagination.historyTotal }, (_, i) => ({ ...seed, id: i + 1, query: `history-row-${i + 1}` }))
+    .filter(row => row.query.toLowerCase().includes(filter.toLowerCase()));
+  return { total: entries.length, entries: entries.slice(offset, offset + limit) };
 }
 function paginationRuns(offset, limit) {
   const source = wire('pagination-net-runs');
@@ -270,8 +283,8 @@ function resetState() {
   for (const response of dashboard.pending) response.destroy();
   dashboard.pending.clear();
   history.pending?.destroy();
-  for (const response of history.loadPending.splice(0)) response.destroy();
-  Object.assign(history, { offsets: [], deletes: 0, cleared: false, pending: null });
+  for (const held of history.loadPending.splice(0)) held.res.destroy();
+  Object.assign(history, { offsets: [], requests: [], deletes: 0, cleared: false, pending: null, hold: false, nextStatus: 200, entries: null });
   unstubbed = [];
   queries = [];
   savedRequests = [];
@@ -487,7 +500,8 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
         pagination: { history: pagination.history, runs: pagination.runs,
           held: pagination.held !== null, queryHeld: pagination.heldQuery !== null, completed: pagination.completed },
         healthHits,
-        history: { offsets: history.offsets, deletes: history.deletes, pending: !!history.pending, loadPending: history.loadPending.length > 0 },
+        history: { offsets: history.offsets, requests: history.requests, deletes: history.deletes, pending: !!history.pending,
+          loadPending: history.loadPending.length > 0, pendingRequests: history.loadPending.map(({ id, filter, offset, limit }) => ({ id, filter, offset, limit })) },
         cancelRequests,
         unstubbed,
         queries,
@@ -511,6 +525,12 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       sendJson(res, 200, { ok: true, armed: scheduleRefusal });
       return;
     }
+    if (p === '/__ctl/history/configure' && req.method === 'POST') {
+      const values = JSON.parse((await readBody(req)) || '{}');
+      for (const key of ['hold', 'nextStatus', 'entries']) if (key in values) history[key] = values[key];
+      sendJson(res, 200, { ok: true });
+      return;
+    }
     if (p === '/__ctl/history/release' && req.method === 'POST') {
       const pending = history.pending;
       if (!pending) { sendJson(res, 409, { error: 'no pending history clear' }); return; }
@@ -518,21 +538,24 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       if (scenario === 'history-clear-failure' && history.deletes === 1) {
         sendJson(pending, 503, wire('history-error'));
       } else {
-        const repeat = history.cleared;
+        const deleted = history.cleared ? 0 : historyEntries().length;
         history.cleared = true;
         if (scenario === 'history-clear-lost' && history.deletes === 1) pending.destroy();
         else if (scenario === 'history-clear-decode' && history.deletes === 1) {
           pending.writeHead(200, { 'content-type': 'application/json' });
           pending.end('{"deleted":');
-        } else sendJson(pending, 200, wire(repeat ? 'history-clear-repeat' : 'history-clear-success'));
+        } else sendJson(pending, 200, { deleted });
       }
       sendJson(res, 200, { ok: true });
       return;
     }
     if (p === '/__ctl/history/load' && req.method === 'POST') {
-      const pending = history.loadPending.shift();
+      const options = JSON.parse((await readBody(req)) || '{}');
+      const index = options.id == null ? 0 : history.loadPending.findIndex(held => held.id === options.id);
+      const pending = index < 0 ? null : history.loadPending.splice(index, 1)[0];
       if (!pending) { sendJson(res, 409, { error: 'no pending history load' }); return; }
-      sendJson(pending, 200, wire(history.cleared ? 'history-cleared' : 'history-export'));
+      const status = options.status ?? pending.status;
+      sendJson(pending.res, status, status === 200 ? pending.body : wire('history-error'));
       sendJson(res, 200, { ok: true });
       return;
     }
@@ -801,17 +824,26 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
         return;
       }
       if (req.method === 'GET') {
-        history.offsets.push(Number(url.searchParams.get('offset') || 0));
-        if (scenario === 'history-loading' || (scenario === 'history-page-loading' && history.offsets.length > 1)) {
-          history.loadPending.push(res);
+        const offset = Number(url.searchParams.get('offset') || 0);
+        const limit = Number(url.searchParams.get('limit') || 50);
+        const filter = url.searchParams.get('filter') || '';
+        const id = history.requests.length + 1;
+        history.offsets.push(offset);
+        history.requests.push({ id, filter, offset, limit });
+        // Capture a response at request admission, including before a Clear.
+        const body = historyPage(filter, offset, limit);
+        const status = history.nextStatus;
+        history.nextStatus = 200;
+        if (history.hold || scenario === 'history-loading') {
+          const held = { res, body, status, id, filter, offset, limit };
+          history.loadPending.push(held);
           res.once('close', () => {
-            const index = history.loadPending.indexOf(res);
+            const index = history.loadPending.indexOf(held);
             if (index !== -1) history.loadPending.splice(index, 1);
           });
           return;
         }
-        if (scenario === 'history-failure') sendJson(res, 503, wire('history-error'));
-        else sendJson(res, 200, wire(history.cleared ? 'history-cleared' : 'history-export'));
+        sendJson(res, status, status === 200 ? body : wire('history-error'));
         return;
       }
     }
@@ -819,8 +851,9 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       if (scenario === 'pagination') {
         const offset = Number(url.searchParams.get('offset') ?? 0);
         const limit = Number(url.searchParams.get('limit') ?? 50);
-        pagination.history.push({ offset, limit });
-        const body = paginationHistory(offset, limit);
+        const filter = url.searchParams.get('filter') || '';
+        pagination.history.push({ offset, limit, filter });
+        const body = paginationHistory(offset, limit, filter);
         if (offset === pagination.holdHistoryOffset) {
           pagination.holdHistoryOffset = null;
           pagination.held = { res, body, offset };

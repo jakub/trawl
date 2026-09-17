@@ -1343,6 +1343,12 @@
 /* The filter input moved out of `.page-hd .actions` into the card
  * header, where it trails the title. */
 .list-sheet-hd .inp-wrap { margin-inline-start: auto; min-width: 160px; }
+.history-page .list-sheet-hd { align-items: start; flex-wrap: wrap; padding-block: 12px; }
+.history-search { flex: 1 1 320px; min-width: 0; }
+.history-search label { display: block; margin-bottom: 6px; }
+.history-search .actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.history-search input { flex: 1 1 180px; min-width: 0; }
+.history-search .sub { margin: 6px 0 0; }
 .list-sheet .overflow-hint { border-bottom: 1px solid var(--line-2); }
 .list-sheet .fleet-table-frame { border: 0; border-radius: 0; box-shadow: none; }
 /* The docked panel is a grid child of this layout, so it takes the
