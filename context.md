@@ -62,6 +62,10 @@ _Avoid_: archive, on-disk data (the WAL is on disk too)
 The durability log between ingest and compaction. An event recorded in the WAL may also be visible through the hot buffer; WAL storage alone does not make it visible.
 _Avoid_: journal, buffer
 
+**Quarantine**:
+A WAL, Parquet or temporary rollup file removed from normal processing because it is corrupt or unreadable, with its bytes retained for investigation. Quarantine does not establish how many events are lost or whether other copies can recover them.
+_Avoid_: deletion, event loss
+
 **Marker**:
 A small file at the top of the data directory stating a fact about the whole archive: its epoch, which catalog owns it, a repin in progress. After a crash the marker is also the authority — it licenses recovery actions, like deleting a staging root.
 _Avoid_: lockfile, flag file
