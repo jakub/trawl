@@ -34,8 +34,25 @@ sidebar as an overlay.
 lists the application pages and filters on both label and route.
 The sidebar's bottom item, **Help**, opens the documentation site in a new tab.
 
-`/login` takes an API key. A rejected key reports `Invalid API key`, and a
-successful sign-in lands on `/search`.
+`/login` takes an API key. A rejected key reports `Invalid API key`. If the
+initial session check or Jobs polling detects an expired session, sign-in
+carries the requested page in an encoded `return_to` parameter. Successful
+sign-in returns to that protected Trawl page with its query and fragment
+intact. Failed sign-in and reloading the sign-in page retain the destination.
+Both automatic sign-in and the return replace their history entries, so Back
+does not stop at sign-in.
+
+Direct sign-in without a valid destination opens Search. Sign out opens bare
+`/login`, so the next sign-in also opens Search. The destination uses the new
+key's permissions. Only URL state survives: unsaved edits and interrupted
+actions do not return, and relative time expressions remain relative.
+
+The sign-in URL can contain query text and an encoded fragment, including in
+request logs or a copied link. It does not contain the API key. Return
+destinations are limited to 64 KiB; the outer sign-in query is limited to
+three times that size plus 64 bytes. Encoding increases the request URI, so a
+reverse proxy can reject a long sign-in URL even when it accepted the original
+page URL. These client limits do not guarantee acceptance by every deployment.
 
 ## Search
 
