@@ -21,18 +21,18 @@ const decode = value => value.replace(/&#x([\da-f]+);|&#(\d+);|&amp;/gi, (match,
 function inspect(dist, key, label, app = true) {
   const source = readFileSync(path.join(dist, 'index.html'), 'utf8');
   const html = decode(source);
-  const scripts = [...html.matchAll(/<script\b[^>]*>/g)].filter(([tag]) => tag.includes('theme-bootstrap-'));
+  const scripts = [...html.matchAll(/<script\b[^>]*>/gi)].filter(([tag]) => tag.includes('theme-bootstrap-'));
   assert.equal(scripts.length, 1, `${label}: exactly one bootstrap`);
   const tag = scripts[0][0];
-  assert(!/\s(?:async|defer)(?:=|\s|>)/.test(tag), `${label}: blocking script`);
-  assert([undefined, '', 'text/javascript'].includes(tag.match(/\btype="([^"]*)"/)?.[1]), `${label}: classic script`);
-  assert(tag.includes(`data-storage-key="${key}"`), `${label}: namespace`);
-  const src = tag.match(/\bsrc="([^"]+)"/)?.[1];
+  assert(!/\s(?:async|defer)(?:=|\s|>)/i.test(tag), `${label}: blocking script`);
+  assert([undefined, '', 'text/javascript'].includes(tag.match(/\btype="([^"]*)"/i)?.[1]?.toLowerCase()), `${label}: classic script`);
+  assert.equal(tag.match(/\bdata-storage-key="([^"]*)"/i)?.[1], key, `${label}: namespace`);
+  const src = tag.match(/\bsrc="([^"]+)"/i)?.[1];
   assert(src && /^\/?theme-bootstrap-[a-f0-9]{8,}\.js$/.test(src), `${label}: immutable asset filename`);
-  const laterAssets = [...html.matchAll(/<(?:script|link)\b[^>]*(?:type="module"|rel="stylesheet"|rel="modulepreload")[^>]*>/g)];
+  const laterAssets = [...html.matchAll(/<(?:script|link)\b[^>]*(?:type="module"|rel="stylesheet"|rel="modulepreload")[^>]*>/gi)];
   if (app) {
-    assert(laterAssets.some(([tag]) => tag.includes('rel="stylesheet"')), `${label}: stylesheet present`);
-    assert(laterAssets.some(([tag]) => tag.includes('type="module"')), `${label}: Wasm loader present`);
+    assert(laterAssets.some(([tag]) => /\brel="stylesheet"/i.test(tag)), `${label}: stylesheet present`);
+    assert(laterAssets.some(([tag]) => /\btype="module"/i.test(tag)), `${label}: Wasm loader present`);
   }
   for (const node of laterAssets) {
     assert(scripts[0].index < node.index, `${label}: bootstrap precedes styles and Wasm`);
@@ -60,6 +60,28 @@ try {
     return inspect(dist, 'trawl.ui', label, false);
   };
   const original = build('hash-original');
+  // Exercise HTML case semantics against the actual minimal Trunk output.
+  // This inspects known build markup; it is not a general HTML sanitizer.
+  const originalIndex = path.join(scratch, 'hash-original', 'index.html');
+  const originalHtml = readFileSync(originalIndex, 'utf8');
+  const originalTag = originalHtml.match(/<script\b[^>]*>/i)?.[0];
+  assert(originalTag, 'minimal build contains its bootstrap tag');
+  const upperTag = originalTag.replace(/^<script/i, '<SCRIPT')
+    .replace(/\bsrc=/i, 'SRC=').replace(/\bdata-storage-key=/i, 'DATA-STORAGE-KEY=')
+    .replace(/>$/, ' TYPE="TEXT/JAVASCRIPT">');
+  writeFileSync(originalIndex, originalHtml.replace(originalTag, upperTag));
+  inspect(path.dirname(originalIndex), 'trawl.ui', 'html-case-control', false);
+  const invalidMarkup = [
+    ['duplicate-uppercase', originalHtml.replace('</head>', `${upperTag}</SCRIPT></head>`), /exactly one bootstrap/],
+    ['uppercase-async', originalHtml.replace(originalTag, upperTag.replace(/>$/, ' ASYNC>')), /blocking script/],
+    ['uppercase-defer', originalHtml.replace(originalTag, upperTag.replace(/>$/, ' DEFER>')), /blocking script/],
+    ['uppercase-stylesheet-first', originalHtml.replace(originalTag, `<LINK REL="STYLESHEET" HREF="control.css">${originalTag}`), /bootstrap precedes/],
+  ];
+  for (const [label, html, expected] of invalidMarkup) {
+    writeFileSync(originalIndex, html);
+    assert.throws(() => inspect(path.dirname(originalIndex), 'trawl.ui', label, false), expected, label);
+  }
+  writeFileSync(originalIndex, originalHtml);
   // Modify only a temporary pipeline input; the candidate source stays intact.
   writeFileSync(path.join(scratch, 'theme-bootstrap.js'), readFileSync(bootstrap, 'utf8') + '\ndocument.documentElement.dataset.hashEvidence = "changed";\n');
   const changed = build('hash-changed');
