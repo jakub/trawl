@@ -5,6 +5,21 @@
 {{- end }}
 {{- $labels := include "trawl.labels" . | fromYaml }}
 {{- range $key, $value := .Values.prometheusRule.additionalLabels }}
+{{- $parts := splitList "/" $key }}
+{{- if gt (len $parts) 2 }}
+{{- fail (printf "prometheusRule.additionalLabels key %q is an invalid Kubernetes label key: at most one '/' is allowed" $key) }}
+{{- end }}
+{{- $name := last $parts }}
+{{- if or (gt (len $name) 63) (not (regexMatch `^[A-Za-z0-9]([-_.A-Za-z0-9]*[A-Za-z0-9])?$` $name)) }}
+{{- fail (printf "prometheusRule.additionalLabels key %q is an invalid Kubernetes label key: name must be 1-63 ASCII characters, start and end with an alphanumeric character, and contain only alphanumeric characters, '-', '_', or '.'" $key) }}
+{{- end }}
+{{- if eq (len $parts) 2 }}
+{{- $prefix := first $parts }}
+{{- /* Kubernetes IsDNS1123Subdomain limits the whole prefix, not each segment. */}}
+{{- if or (gt (len $prefix) 253) (not (regexMatch `^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$` $prefix)) }}
+{{- fail (printf "prometheusRule.additionalLabels key %q is an invalid Kubernetes label key: prefix must be a nonempty lowercase DNS subdomain of at most 253 bytes" $key) }}
+{{- end }}
+{{- end }}
 {{- if and (hasKey $labels $key) (ne (get $labels $key) $value) }}
 {{- fail (printf "prometheusRule.additionalLabels.%s conflicts with the chart resource label" $key) }}
 {{- end }}

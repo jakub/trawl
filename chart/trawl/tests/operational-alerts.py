@@ -171,6 +171,30 @@ class OperationalAlerts(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(field, result.stderr)
 
+    def test_discovery_label_keys_accept_kubernetes_boundaries(self):
+        keys = ["A", "A_name.with-dashes9", "a" * 63,
+                "monitoring.example.com/Name_0", "1.example/name",
+                "a" * 253 + "/name", "a" * 126 + "." + "b" * 126 + "/name"]
+        # IsDNS1123Subdomain has no separate 63-byte prefix-segment limit.
+        labels = {key: "selected" for key in keys}
+        labels["app.kubernetes.io/instance"] = "launch"
+        result = rule_object(enabled(additionalLabels=labels))
+        for key, value in labels.items():
+            self.assertEqual(result["metadata"]["labels"][key], value)
+        self.assertEqual(result["spec"], self.helm["spec"])
+
+    def test_discovery_label_keys_reject_invalid_names_and_prefixes(self):
+        keys = ["", "/name", "example.com/", "bad/key/extra", "Example.com/name",
+                "a..b/name", "-a/name", "a-/name", ".a/name", "a./name", "a_b/name",
+                "_name", "name.", "na me", "é", "example.com/na:me",
+                "a" * 64, "a" * 254 + "/name"]
+        for key in keys:
+            with self.subTest(key=key):
+                result = render(enabled(additionalLabels={key: "selected"}))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("prometheusRule.additionalLabels", result.stderr)
+                self.assertIn("invalid Kubernetes label key", result.stderr)
+
     def run_promtool(self, pack, tests):
         with tempfile.TemporaryDirectory(prefix="trawl-promtool-") as directory:
             rules = Path(directory) / "rules.yml"
