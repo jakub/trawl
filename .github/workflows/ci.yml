@@ -672,8 +672,8 @@ jobs:
     name: web UI browser tests (playwright)
     runs-on: k8s-small
     needs: trunk-build
-    # Include slow browser package installation and the bounded test run.
-    timeout-minutes: 35
+    # Include package installation, both bounded browser suites and evidence upload.
+    timeout-minutes: 40
     # This job executes third-party code (npm packages, a CDN-fetched
     # browser): read-only token, and no credentials persisted into
     # .git/config for that code to read.
@@ -715,7 +715,7 @@ jobs:
           # Preserve browser process exits and stderr alongside test results.
           DEBUG: pw:browser
       - name: Authentication history restores with BFCache enabled
-        run: npm run test -- --config=playwright.bfcache.config.ts
+        run: npm run test -- --config=playwright.bfcache.config.ts --global-timeout=300000
         working-directory: crates/trawl-web-ui/e2e
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
