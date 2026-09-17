@@ -165,7 +165,10 @@
         "severity": {
           "type": "string",
           "minLength": 1,
-          "pattern": ".*\\S.*"
+          "pattern": ".*\\S.*",
+          "not": {
+            "pattern": "\\{\\{|\\}\\}"
+          }
         }
       }
     }

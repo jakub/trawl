@@ -408,6 +408,7 @@ prometheusRule:
   # Discovery labels on the rule resource; never added to alert series.
   additionalLabels: {}
   # Only these alert names and enabled/severity fields are accepted.
+  # Severity is a nonblank static routing string; template delimiters are rejected.
   alerts:
     TrawlSyslogQueueDiscard:
       enabled: true

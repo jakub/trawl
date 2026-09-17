@@ -210,9 +210,8 @@
     ]
   },
   {
-    "name": "ingest disabled after failure",
+    "name": "counter plateau after producer stop",
     "values": "0 1+0x30",
-    "ingest": "1 0+0x30",
     "checks": [
       [
         "1m",

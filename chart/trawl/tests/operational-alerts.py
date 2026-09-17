@@ -138,16 +138,11 @@ class OperationalAlerts(unittest.TestCase):
         result = rule_object(enabled(alerts={r["alert"]: {"enabled": False} for r in EXPECTED}))
         self.assertEqual(result["spec"]["groups"][0]["rules"], [])
 
-    def test_discovery_labels_namespace_and_literal_strings(self):
+    def test_discovery_labels_and_namespace(self):
         result = rule_object(enabled(namespace="monitoring", additionalLabels={"release": "prometheus"}))
         self.assertEqual(result["metadata"]["namespace"], "monitoring")
         self.assertEqual(result["metadata"]["labels"]["release"], "prometheus")
         self.assertEqual(result["spec"], self.helm["spec"])
-        # A schema-valid string remains literal, including Prometheus/Helm delimiters.
-        name = EXPECTED[0]["alert"]
-        literal = '{{ fail "must not execute" }}'
-        result = rule_object(enabled(alerts={name: {"severity": literal}}))
-        self.assertEqual(result["spec"]["groups"][0]["rules"][0]["labels"]["severity"], literal)
         result = rule_object(enabled(additionalLabels={"app.kubernetes.io/instance": "launch"}))
         self.assertEqual(result["metadata"]["labels"]["app.kubernetes.io/instance"], "launch")
 
@@ -162,6 +157,10 @@ class OperationalAlerts(unittest.TestCase):
             ({"alerts": {name: {"severity": ""}}}, "severity"),
             ({"alerts": {name: {"severity": "   "}}}, "severity"),
             ({"alerts": {name: {"severity": 5}}}, "severity"),
+            ({"alerts": {name: {"severity": '{{ fail "must not execute" }}'}}}, "severity"),
+            ({"alerts": {name: {"severity": '{{ $labels.instance }}'}}}, "severity"),
+            ({"alerts": {name: {"severity": "page{{"}}}, "severity"),
+            ({"alerts": {name: {"severity": "page}}"}}}, "severity"),
             ({"alerts": {name: {"expr": "vector(1)"}}}, "expr"),
             ({"additionalLabels": {"discovery": 1}}, "additionalLabels"),
             ({"additionalLabels": {"app.kubernetes.io/instance": "other"}}, "prometheusRule.additionalLabels"),
@@ -192,9 +191,6 @@ class OperationalAlerts(unittest.TestCase):
             for variant in expected["variants"]:
                 inputs.append({"series": series(expected["metric"], {**labels, **variant}),
                                "values": case["values"]})
-        if "ingest" in case:
-            # Deliberately unreferenced control: stopped producers must not gate observations.
-            inputs.append({"series": series("trawl_ingest_enabled", labels), "values": case["ingest"]})
         checks = []
         for time, firing in case["checks"]:
             for expected in EXPECTED:
@@ -205,11 +201,27 @@ class OperationalAlerts(unittest.TestCase):
         return {"name": case["name"], "interval": "30s", "input_series": inputs, "alert_rule_test": checks}
 
     def test_promtool_timelines_for_both_packs(self):
+        # Counter plateaus model no further observations, not an application setting.
+        # The exact expression oracle above proves these rules contain no ingest gate;
+        # backend idle/disable tests cover the actual producer behavior separately.
         result = command([PROMTOOL, "check", "rules", str(PLAIN)])
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         for name, pack in [("plain", self.plain), ("helm", self.helm["spec"])]:
             with self.subTest(pack=name):
                 self.run_promtool(pack, [self.timeline(case, {}) for case in TIMELINES])
+
+    def test_promtool_static_severity_override(self):
+        helm = rule_object(enabled(alerts={r["alert"]: {"severity": "page"} for r in EXPECTED}))
+        plain = copy.deepcopy(self.plain)
+        for rule in plain["groups"][0]["rules"]:
+            rule["labels"]["severity"] = "page"
+        case = self.timeline({"name": "static page severity", "values": "0 1+0x30",
+                              "checks": [["0m", False], ["30s", True], ["9m", True], ["10m", False]]}, {})
+        for check in case["alert_rule_test"]:
+            for alert in check["exp_alerts"]:
+                alert["exp_labels"]["severity"] = "page"
+        for pack in [plain, helm["spec"]]:
+            self.run_promtool(pack, [case])
 
     def test_promtool_target_isolation_and_rendered_service_identity(self):
         cases = [("launch", "example", None), ("second", "example", None),
