@@ -22,7 +22,7 @@ test('shared fixture table exercises the actual content-hashed bootstrap without
     const result = await page.evaluate(async ({ fixture, src }) => {
       const key = 'trawl.ui';
       fixture.raw === null ? localStorage.removeItem(key) : localStorage.setItem(key, fixture.raw);
-      document.documentElement.dataset.theme = 'light';
+      document.documentElement.dataset.theme = 'unset';
       const match = window.matchMedia;
       const write = Storage.prototype.setItem;
       const remove = Storage.prototype.removeItem;
@@ -70,8 +70,9 @@ for (const colorScheme of ['light', 'dark'] as const) {
     await expect(system).toBeFocused();
     await expect(system).toHaveAttribute('aria-checked', 'true');
     await expect(page.locator('html')).toHaveAttribute('data-theme', colorScheme);
+    await expect(page.locator('.user-menu')).toHaveCSS('opacity', '1');
     const capture = testInfo.outputPath(`system-${colorScheme}.png`);
-    await page.screenshot({ path: capture });
+    await page.screenshot({ path: capture, animations: 'disabled' });
     await testInfo.attach(`system-${colorScheme}`, { path: capture, contentType: 'image/png' });
     await page.keyboard.press('Enter');
     await settleTheme(page);
