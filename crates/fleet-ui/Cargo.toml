@@ -32,7 +32,10 @@ atmosphere = []
 # on wasm32, where Utc::now (the calendar fallback + shared clock tick)
 # needs the js Date bridge (same shape as trawl-web-ui's dep).
 chrono = { workspace = true, features = ["wasmbind"] }
-serde_json = { workspace = true }
+# Reuse the workspace's existing serde package for the preference-key visitor.
+# Raw values preserve unrelated JSON without changing Value's number semantics.
+serde = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 
 [dev-dependencies]
 sha2 = { workspace = true }
@@ -54,6 +57,7 @@ web-sys = { version = "0.3", features = [
     "HtmlInputElement",
     "HtmlTextAreaElement",
     "KeyboardEvent",
+    "MediaQueryList",
     "MouseEvent",
     "Navigator",
     "Node",

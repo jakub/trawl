@@ -17,7 +17,7 @@ pub mod prefs;
 #[cfg(target_arch = "wasm32")]
 pub mod runtime;
 
-pub use prefs::{Details, ParseThemeError, RowStyle, Rows, Sidebar, Theme};
+pub use prefs::{Details, ParseThemeError, RowStyle, Rows, Sidebar, Theme, ThemePreference};
 
 #[cfg(target_arch = "wasm32")]
 pub use runtime::{UiPrefs, install};

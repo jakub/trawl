@@ -17,15 +17,19 @@
 //! for coastwatch-web, and so on.
 
 use leptos::prelude::*;
-use wasm_bindgen::JsValue;
+use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 
-use super::prefs::{Details, ParseOutcome, RowStyle, Rows, Sidebar, Stored, Theme, parse_stored};
+use super::prefs::{
+    Details, ParseOutcome, RowStyle, Rows, Sidebar, Stored, Theme, ThemePreference, parse_stored,
+};
 
-/// Reactive UI preference signals + an effect that mirrors them onto
-/// `<html data-*>` and persists them to `localStorage`.
+/// Reactive UI preferences, a read-only resolved theme, and owner-scoped
+/// effects that project appearance and persist preference changes.
 ///
 /// Construction is sealed: [`install`] is the only way to get a
-/// `UiPrefs`. The signals are exposed via [`UiPrefs::theme`],
+/// `UiPrefs`. [`UiPrefs::theme`] is binary and read-only; select an appearance
+/// through [`UiPrefs::select_theme`] and read that choice through
+/// [`UiPrefs::theme_preference`]. Reading preferences are exposed via
 /// [`UiPrefs::rowstyle`], [`UiPrefs::sidebar`], [`UiPrefs::details`]
 /// and [`UiPrefs::rows`] — each returns the underlying [`RwSignal`] so
 /// consumers can read with `.get()`, write with `.set()`, and feed into
@@ -35,7 +39,8 @@ use super::prefs::{Details, ParseOutcome, RowStyle, Rows, Sidebar, Stored, Theme
 /// component so descendants can pick it up via `use_context`.
 #[derive(Debug, Clone, Copy)]
 pub struct UiPrefs {
-    pub(crate) theme: RwSignal<Theme>,
+    theme: Signal<Theme>,
+    theme_preference: RwSignal<ThemePreference>,
     pub(crate) rowstyle: RwSignal<RowStyle>,
     pub(crate) sidebar: RwSignal<Sidebar>,
     pub(crate) details: RwSignal<Details>,
@@ -43,9 +48,24 @@ pub struct UiPrefs {
 }
 
 impl UiPrefs {
+    /// The resolved Light or Dark appearance for CSS, charts, and backdrops.
     #[must_use]
-    pub fn theme(self) -> RwSignal<Theme> {
+    pub fn theme(self) -> Signal<Theme> {
         self.theme
+    }
+
+    /// The selected preference, independent of System's resolved appearance.
+    #[must_use]
+    pub fn theme_preference(self) -> Signal<ThemePreference> {
+        self.theme_preference.into()
+    }
+
+    /// Select an appearance for this session and attempt to persist a changed
+    /// preference. Selecting the current choice performs no storage write.
+    pub fn select_theme(self, preference: ThemePreference) {
+        if self.theme_preference.get_untracked() != preference {
+            self.theme_preference.set(preference);
+        }
     }
 
     #[must_use]
@@ -70,7 +90,9 @@ impl UiPrefs {
 }
 
 /// Initialize preference signals from `localStorage` + install the
-/// effect that keeps `<html>` attributes in sync.
+/// effects that keep `<html>` attributes and persisted preferences in sync.
+/// Reads storage and current media state afresh, independently of the early
+/// bootstrap. Owns one dark-scheme listener until the current owner is disposed.
 ///
 /// `storage_key` is the localStorage key under which a JSON snapshot
 /// is persisted — pass `"trawl.ui"`, `"coastwatch.ui"`, etc.
@@ -80,37 +102,87 @@ impl UiPrefs {
 #[must_use]
 pub fn install(storage_key: &'static str) -> UiPrefs {
     let stored = load(storage_key);
+    let theme_preference = RwSignal::new(stored.theme);
+    let system_dark = install_system_theme();
+    let theme = Signal::derive(move || {
+        let preference = theme_preference.get();
+        // Fixed choices do not subscribe DOM readers to OS changes.
+        preference.resolve(preference == ThemePreference::System && system_dark.get())
+    });
     let prefs = UiPrefs {
-        theme: RwSignal::new(stored.theme),
+        theme,
+        theme_preference,
         rowstyle: RwSignal::new(stored.rowstyle),
         sidebar: RwSignal::new(stored.sidebar),
         details: RwSignal::new(stored.details),
         rows: RwSignal::new(stored.rows),
     };
 
-    // Track the last value we persisted so we never overwrite storage with
-    // what's already there. For the corruption case (load fell back to
-    // defaults because the blob was malformed) this leaves the corrupt
-    // blob in place — letting the user inspect it and giving the console
-    // warning time to register before any change wipes the evidence.
-    let last_written = StoredValue::new(stored);
+    // Apply the fresh installation sample immediately, including a changed OS
+    // appearance since the bootstrap ran. CSS continues to own color-scheme.
+    apply_to_dom(theme.get_untracked(), stored.rowstyle);
+    Effect::new(move |_| apply_to_dom(prefs.theme.get(), prefs.rowstyle.get()));
+
+    // This tracks observed session preferences, not successful persistence.
+    // Starting at the loaded snapshot preserves malformed raw storage. A failed
+    // write is not retried on reselect or an OS change; only another preference
+    // change attempts a new write.
+    let last_observed = StoredValue::new(stored);
 
     Effect::new(move |_| {
         let snap = Stored {
-            theme: prefs.theme.get(),
+            theme: prefs.theme_preference.get(),
             rowstyle: prefs.rowstyle.get(),
             sidebar: prefs.sidebar.get(),
             details: prefs.details.get(),
             rows: prefs.rows.get(),
         };
-        apply_to_dom(snap);
-        if last_written.with_value(|w| *w != snap) {
+        if last_observed.with_value(|w| *w != snap) {
+            last_observed.set_value(snap);
             write_stored(storage_key, snap);
-            last_written.set_value(snap);
         }
     });
 
     prefs
+}
+
+/// Register before the final sample so a change during installation cannot
+/// leave the runtime stuck on an earlier value. The local handle keeps the
+/// callback alive and removes that exact callback before dropping it.
+fn install_system_theme() -> RwSignal<bool> {
+    let dark = RwSignal::new(false);
+    let Some(query) = web_sys::window().and_then(|window| {
+        window
+            .match_media("(prefers-color-scheme: dark)")
+            .ok()
+            .flatten()
+    }) else {
+        return dark;
+    };
+    let callback_query = query.clone();
+    let callback = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
+        // try_set also makes an already-queued event harmless after disposal.
+        let _ = dark.try_set(callback_query.matches());
+    });
+    if query
+        .add_event_listener_with_callback("change", callback.as_ref().unchecked_ref())
+        .is_err()
+    {
+        return dark;
+    }
+    dark.set(query.matches());
+    let listener = StoredValue::new_local(Some((query, callback)));
+    on_cleanup(move || {
+        listener.update_value(|slot| {
+            if let Some((query, callback)) = slot.take() {
+                let _ = query.remove_event_listener_with_callback(
+                    "change",
+                    callback.as_ref().unchecked_ref(),
+                );
+            }
+        });
+    });
+    dark
 }
 
 fn load(storage_key: &str) -> Stored {
@@ -129,6 +201,7 @@ fn load(storage_key: &str) -> Stored {
 
 fn write_stored(storage_key: &str, s: Stored) {
     let Some(storage) = local_storage() else {
+        warn("fleet-ui: cannot access localStorage; changed preferences apply only this session.");
         return;
     };
     let payload = serde_json::json!({
@@ -149,15 +222,15 @@ fn write_stored(storage_key: &str, s: Stored) {
     }
 }
 
-fn apply_to_dom(s: Stored) {
+fn apply_to_dom(theme: Theme, rowstyle: RowStyle) {
     let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
         return;
     };
     let Some(html) = doc.document_element() else {
         return;
     };
-    let _ = html.set_attribute("data-theme", s.theme.as_attr());
-    let _ = html.set_attribute("data-rowstyle", s.rowstyle.as_attr());
+    let _ = html.set_attribute("data-theme", theme.as_attr());
+    let _ = html.set_attribute("data-rowstyle", rowstyle.as_attr());
 }
 
 fn local_storage() -> Option<web_sys::Storage> {

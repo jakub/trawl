@@ -1251,6 +1251,13 @@ select:focus-visible,
 .user-menu .item:hover { background: var(--panel-2); }
 .user-menu .item.danger { color: var(--red); }
 .user-menu .sep { height: 1px; background: var(--line-2); margin: 4px 0; }
+.user-menu .menu-group-label {
+  padding: 6px 12px;
+  color: var(--ink-3);
+  font-size: var(--fs-small);
+  font-weight: 600;
+}
+.user-menu .menu-choice-mark { width: 1em; flex: 0 0 1em; }
 
 /* Body row: sidebar + content column, fills the shell above the footer. */
 .body {

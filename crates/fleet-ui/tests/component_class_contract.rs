@@ -428,12 +428,13 @@ fn the_menu_contract_is_shared_and_walks_by_index() {
         "menu lifecycle (Escape, outside mousedown) belongs to menu.rs \
          alone — a second listener is a second contract"
     );
-    // The walk indexes the queried [role="menuitem"] list. The element
+    // The walk indexes commands and radio choices in one queried list. The element
     // sibling walk it replaced hopped whatever came next, so a header
     // or a separator could take focus.
     assert!(
-        markup_only(MENU).contains(r#"[role="menuitem"]"#) && MENU.contains("next_index"),
-        "the arrow walk must index the queried menuitem list through \
+        markup_only(MENU).contains(r#"[role="menuitem"], [role="menuitemradio"]"#)
+            && MENU.contains("next_index"),
+        "the arrow walk must index the queried command/radio list through \
          roving::next_index"
     );
     assert!(
@@ -450,6 +451,48 @@ fn the_menu_contract_is_shared_and_walks_by_index() {
         markup_only(MENU).contains(r#"if focused.get() == index { "0" } else { "-1" }"#),
         "menu items carry a true roving tabindex — every item tabbable \
          puts N tab stops in the page and defeats the arrow walk"
+    );
+}
+
+#[test]
+fn theme_group_emits_its_labels_and_radio_contract() {
+    let markup = markup_only(MENU);
+    emits(
+        &markup,
+        r#"class="menu-group-label""#,
+        ".user-menu .menu-group-label",
+    );
+    emits(
+        &markup,
+        r#"class="menu-choice-mark""#,
+        ".user-menu .menu-choice-mark",
+    );
+    assert!(
+        markup.contains(r#"<div role="group" aria-label=label>"#),
+        "radio choices must be contained in a named group"
+    );
+    let radio = markup
+        .split("<button")
+        .skip(1)
+        .filter_map(|tail| tail.split_once("</button>"))
+        .map(|(button, _)| button)
+        .find(|button| button.contains(r#"role="menuitemradio""#))
+        .expect("radio choice must be a native button");
+    assert!(
+        radio.contains(TYPE_BUTTON),
+        "radio choices must not submit forms"
+    );
+    assert!(
+        radio.contains("aria-checked=move || checked.get().to_string()"),
+        "radio checked state must remain reactive"
+    );
+    assert!(
+        radio.contains(r#"if focused.get() == index { "0" } else { "-1" }"#),
+        "radio choices must participate in the menu's single roving tab stop"
+    );
+    assert!(
+        radio.contains(r#"class="menu-choice-mark" aria-hidden="true""#),
+        "the visible indicator must not change the choice's accessible name"
     );
 }
 

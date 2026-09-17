@@ -12,9 +12,9 @@
 //!
 //! The invariants this module owns:
 //!
-//! - **One tab stop.** Items are `<button role="menuitem">` with true
+//! - **One tab stop.** Commands and radio choices are native buttons with true
 //!   roving tabindex: exactly one at `0`, the rest at `-1`. Arrows,
-//!   Home and End walk the queried `[role="menuitem"]` list by index
+//!   Home and End walk the queried command and radio list by index
 //!   ([`crate::roving`]), so a node that is not an item — the account
 //!   menu's identity header — can never take focus. Tab and Shift+Tab close the menu and return to the trigger:
 //!   one deterministic keypress beats scanning the document for the
@@ -80,9 +80,7 @@ mod component {
     use super::{MenuClose, restores_trigger};
     use crate::roving::{next_index, vertical_nav};
 
-    /// One command in a menu. `label` is reactive because the topbar's
-    /// theme item renames itself with the theme it would switch to;
-    /// `danger` renders the destructive treatment.
+    /// One command in a menu. `danger` renders the destructive treatment.
     #[derive(Clone)]
     pub(crate) struct MenuItem {
         pub label: Signal<String>,
@@ -90,14 +88,47 @@ mod component {
         pub on_activate: Callback<()>,
     }
 
-    /// What a menu renders, in order: commands and the rules between
-    /// groups of them. A separator is never focusable and never counts
+    /// One explicit choice in a named radio group. Focus does not select it.
+    #[derive(Clone)]
+    pub(crate) struct MenuRadioItem {
+        pub label: &'static str,
+        pub checked: Signal<bool>,
+        pub on_activate: Callback<()>,
+    }
+
+    /// What a menu renders, in order: commands, named radio groups and rules.
+    /// A separator or group label is never focusable and never counts
     /// toward the roving index, because the walk indexes the queried
-    /// `[role="menuitem"]` list and a separator is not in it.
+    /// command/radio list and a separator is not in it.
     #[derive(Clone)]
     pub(crate) enum MenuEntry {
         Item(MenuItem),
+        RadioGroup {
+            label: &'static str,
+            items: Vec<MenuRadioItem>,
+        },
         Separator,
+    }
+
+    /// The checked radio is the initial tab stop. Menus containing commands
+    /// alone retain their first-item initial focus.
+    fn initial_index(entries: &[MenuEntry]) -> usize {
+        let mut index = 0;
+        for entry in entries {
+            match entry {
+                MenuEntry::Item(_) => index += 1,
+                MenuEntry::RadioGroup { items, .. } => {
+                    for item in items {
+                        if item.checked.get_untracked() {
+                            return index;
+                        }
+                        index += 1;
+                    }
+                }
+                MenuEntry::Separator => {}
+            }
+        }
+        0
     }
 
     /// The open menu panel. Mounted only while `open` is true — a
@@ -126,9 +157,8 @@ mod component {
         let layer = crate::overlay::use_overlay_layer();
         let panel_ref = NodeRef::<Div>::new();
         let menu_ref = NodeRef::<Div>::new();
-        // Which item is the menu's single tab stop. Starts on the first
-        // item, which is also where initial focus lands.
-        let focused = RwSignal::new(0usize);
+        // Seed the roving tab stop before initial focus scans the mounted DOM.
+        let focused = RwSignal::new(initial_index(&entries));
 
         let close = move |cause: MenuClose| {
             open.set(false);
@@ -181,7 +211,8 @@ mod component {
             let Some(menu) = menu_ref.get_untracked() else {
                 return;
             };
-            let Ok(items) = menu.query_selector_all(r#"[role="menuitem"]"#) else {
+            let Ok(items) = menu.query_selector_all(r#"[role="menuitem"], [role="menuitemradio"]"#)
+            else {
                 return;
             };
             let len = usize::try_from(items.length()).unwrap_or(0);
@@ -256,7 +287,7 @@ mod component {
     /// `0`, the rest `-1`) and sync the index on focus, so a pointer
     /// landing on an item leaves the arrows walking from where the user
     /// actually is. Only items are counted: these indices are the
-    /// indices of the queried `[role="menuitem"]` list the walk reads,
+    /// indices of the queried command/radio list the walk reads,
     /// which is why a separator can neither be focused nor be skipped
     /// past by an off-by-one.
     fn render_entries(
@@ -272,6 +303,43 @@ mod component {
                 let item = match entry {
                     MenuEntry::Separator => {
                         return view! { <div class="sep" role="separator"></div> }.into_any();
+                    }
+                    MenuEntry::RadioGroup { label, items } => {
+                        let radios = items.into_iter().map(|item| {
+                            let index = next_item;
+                            next_item += 1;
+                            let checked = item.checked;
+                            let cb = item.on_activate;
+                            view! {
+                                <button
+                                    class="item"
+                                    type="button"
+                                    role="menuitemradio"
+                                    aria-checked=move || checked.get().to_string()
+                                    tabindex=move || if focused.get() == index { "0" } else { "-1" }
+                                    on:focus=move |_| focused.set(index)
+                                    on:click=move |e: web_sys::MouseEvent| {
+                                        if stop_click_propagation {
+                                            e.stop_propagation();
+                                        }
+                                        close(MenuClose::Activate);
+                                        cb.run(());
+                                    }
+                                >
+                                    <span class="menu-choice-mark" aria-hidden="true">
+                                        {move || if checked.get() { "✓" } else { "" }}
+                                    </span>
+                                    {item.label}
+                                </button>
+                            }
+                        }).collect_view();
+                        return view! {
+                            <div role="group" aria-label=label>
+                                <div class="menu-group-label">{label}</div>
+                                {radios}
+                            </div>
+                        }
+                        .into_any();
                     }
                     MenuEntry::Item(item) => item,
                 };
@@ -306,7 +374,7 @@ mod component {
 }
 
 #[cfg(target_arch = "wasm32")]
-pub(crate) use component::{MenuEntry, MenuItem, MenuPanel};
+pub(crate) use component::{MenuEntry, MenuItem, MenuPanel, MenuRadioItem};
 
 #[cfg(test)]
 mod tests {

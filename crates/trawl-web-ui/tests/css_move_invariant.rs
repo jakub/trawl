@@ -189,6 +189,9 @@ const MOVED_SELECTORS: &[&str] = &[
 /// not exist in either stylesheet; reappearing anywhere means per-site
 /// drift is growing back.
 const RETIRED_SELECTORS: &[&str] = &[
+    // Theme choices live in the account menu (ADR-0029's theme amendment).
+    ".statusbar .grp.clickable",
+    ".statusbar .grp.clickable:hover",
     // The command bar's brand, mode tabs and app links left with the
     // sidebar (ADR-0032). `.rail .it .lb` did not: the sidebar still
     // renders a label, visible or screen-reader-only.
@@ -277,9 +280,7 @@ fn retired_selectors_absent_from_both_stylesheets() {
         .collect();
     assert!(
         stray.is_empty(),
-        "these selectors were retired by the issue #31 unification (their \
-         surfaces render fleet-ui components with canonical classes) but \
-         are defined again: {stray:?}"
+        "these retired selectors are defined again: {stray:?}"
     );
 }
 

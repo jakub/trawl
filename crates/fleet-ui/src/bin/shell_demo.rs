@@ -268,8 +268,8 @@ fn DemoApp() -> impl IntoView {
     // calls `fleet_ui::install` in its body.
     let prefs = install("fleet-ui-demo:prefs");
     // …and, like trawl-web-ui's App, the prefs must be provided as
-    // context: TopBar's theme toggle reaches them via
-    // `use_context::<UiPrefs>()` and silently no-ops without this.
+    // context: TopBar's theme choices reach them via
+    // `use_context::<UiPrefs>()`; missing context hides the choices and warns.
     provide_context(prefs);
 
     let groups = Signal::derive(sidebar_groups);
@@ -327,21 +327,29 @@ fn DemoApp() -> impl IntoView {
                     </Shell>
                 }/>
             </Routes>
-            // Always-visible theme toggle, outside <Routes> so it stays
-            // mounted on /login too (the real Shell's TopBar toggle only
-            // exists on shell routes). That is what lets a theme flip
+            // Always-visible theme choices, outside <Routes> so they stay
+            // mounted on /login too (the real Shell's TopBar choices only
+            // exist on shell routes). That is what lets a preference change
             // re-color the mounted backdrop canvas in place, without a
             // remount, while /login is on screen.
-            <button
-                class="btn"
+            <div
+                role="group"
+                aria-label="Demo theme"
                 style="position:fixed;right:12px;bottom:12px;z-index:10"
-                on:click=move |_| prefs.theme().update(|t| *t = t.toggled())
             >
-                {move || match prefs.theme().get() {
-                    fleet_ui::theme::Theme::Light => "theme: light",
-                    fleet_ui::theme::Theme::Dark => "theme: dark",
-                }}
-            </button>
+                {[
+                    ("Light", fleet_ui::ThemePreference::Light),
+                    ("Dark", fleet_ui::ThemePreference::Dark),
+                    ("System", fleet_ui::ThemePreference::System),
+                ].into_iter().map(move |(label, preference)| view! {
+                    <button
+                        class="btn"
+                        type="button"
+                        aria-pressed=move || (prefs.theme_preference().get() == preference).to_string()
+                        on:click=move |_| prefs.select_theme(preference)
+                    >{label}</button>
+                }).collect_view()}
+            </div>
         </Router>
     }
 }

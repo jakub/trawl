@@ -836,10 +836,16 @@ const CONTRACTS: &[Contract] = &[
         hook: "<div role=\"menu\" aria-label=menu_label",
     },
     Contract {
-        assignment: "userMenuItem: '.user-menu [role=\"menuitem\"]',",
+        assignment: "userMenuItem: '.user-menu [role=\"menuitem\"], .user-menu [role=\"menuitemradio\"]',",
         source_path: "../fleet-ui/src/menu.rs",
         source: MENU_RS,
         hook: "role=\"menuitem\"",
+    },
+    Contract {
+        assignment: "userMenuItem: '.user-menu [role=\"menuitem\"], .user-menu [role=\"menuitemradio\"]',",
+        source_path: "../fleet-ui/src/menu.rs",
+        source: MENU_RS,
+        hook: "role=\"menuitemradio\"",
     },
     Contract {
         assignment: "netAction: '.net-actions button',",
@@ -1400,18 +1406,6 @@ const CONTRACTS: &[Contract] = &[
         hook: "class=\"grp count\"",
     },
     Contract {
-        assignment: "themeControl: '.statusbar button.grp.clickable',",
-        source_path: "src/components/status_bar.rs",
-        source: STATUS_BAR_RS,
-        hook: "class=\"statusbar\"",
-    },
-    Contract {
-        assignment: "themeControl: '.statusbar button.grp.clickable',",
-        source_path: "src/components/status_bar.rs",
-        source: STATUS_BAR_RS,
-        hook: "class=\"grp clickable\"",
-    },
-    Contract {
         assignment: "intervalChip: '.interval-chips button.interval-chip',",
         source_path: "src/components/net_drawer.rs",
         source: NET_DRAWER_RS,
@@ -1636,12 +1630,6 @@ const CONTRACTS: &[Contract] = &[
         source_path: "src/pages/schema.rs",
         source: SCHEMA_RS,
         hook: "format!(\"Live tail {name_label_tail}\")",
-    },
-    Contract {
-        assignment: "themeSwitchName: 'Theme {current}: switch to {next} theme',",
-        source_path: "src/components/status_bar.rs",
-        source: STATUS_BAR_RS,
-        hook: "\"Theme {current}: switch to {next} theme\"",
     },
     Contract {
         assignment: "netRenameName: 'Rename {name}',",

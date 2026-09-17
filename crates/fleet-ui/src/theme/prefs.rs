@@ -10,8 +10,12 @@
 //! `cargo nextest run --workspace`, not just deferred to a wasm
 //! integration suite.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
+
+use serde::de::{Deserialize, Deserializer, Visitor};
+use serde_json::value::RawValue;
 
 /// Returned by [`FromStr`] impls when the input doesn't name a known
 /// variant. Carries the offending string so logs / warnings can show
@@ -27,7 +31,7 @@ impl fmt::Display for ParseThemeError {
 
 impl std::error::Error for ParseThemeError {}
 
-/// Color theme — light is canonical, dark is parity.
+/// Resolved appearance for renderers. The user's choice is [`ThemePreference`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Theme {
     Light,
@@ -42,14 +46,6 @@ impl Theme {
             Self::Dark => "dark",
         }
     }
-
-    #[must_use]
-    pub fn toggled(self) -> Self {
-        match self {
-            Self::Light => Self::Dark,
-            Self::Dark => Self::Light,
-        }
-    }
 }
 
 impl FromStr for Theme {
@@ -58,6 +54,51 @@ impl FromStr for Theme {
         match s {
             "dark" => Ok(Self::Dark),
             "light" => Ok(Self::Light),
+            _ => Err(ParseThemeError(s.to_owned())),
+        }
+    }
+}
+
+/// The user's stored appearance choice. System follows the operating system.
+/// Renderers consume the binary [`Theme`] returned by [`Self::resolve`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThemePreference {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+impl ThemePreference {
+    #[must_use]
+    pub const fn as_attr(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Light => "light",
+            Self::Dark => "dark",
+        }
+    }
+
+    /// Resolve against the current dark-scheme media query. Callers pass
+    /// `false` when media-query access is unavailable.
+    #[must_use]
+    pub const fn resolve(self, system_dark: bool) -> Theme {
+        match self {
+            Self::Dark => Theme::Dark,
+            Self::System if system_dark => Theme::Dark,
+            Self::System | Self::Light => Theme::Light,
+        }
+    }
+}
+
+impl FromStr for ThemePreference {
+    type Err = ParseThemeError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "system" => Ok(Self::System),
+            "light" => Ok(Self::Light),
+            "dark" => Ok(Self::Dark),
             _ => Err(ParseThemeError(s.to_owned())),
         }
     }
@@ -201,7 +242,7 @@ impl FromStr for Rows {
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Stored {
-    pub(crate) theme: Theme,
+    pub(crate) theme: ThemePreference,
     pub(crate) rowstyle: RowStyle,
     pub(crate) sidebar: Sidebar,
     pub(crate) details: Details,
@@ -211,7 +252,7 @@ pub(crate) struct Stored {
 impl Default for Stored {
     fn default() -> Self {
         Self {
-            theme: Theme::Light,
+            theme: ThemePreference::System,
             rowstyle: RowStyle::Bordered,
             sidebar: Sidebar::Expanded,
             details: Details::Inline,
@@ -231,6 +272,57 @@ pub(crate) struct ParseOutcome {
     pub(crate) warnings: Vec<String>,
 }
 
+/// Only recognized keys need a Unicode string. JSON permits lone surrogate
+/// escapes that JavaScript accepts but Rust strings cannot represent. Decode
+/// keys through serde's byte visitor so an unknown key cannot discard valid
+/// preferences. Escaped spellings of recognized keys still compare normally.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum PrefKey {
+    Known(&'static str),
+    Unknown,
+}
+
+impl<'de> Deserialize<'de> for PrefKey {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct KeyVisitor;
+
+        impl Visitor<'_> for KeyVisitor {
+            type Value = PrefKey;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a JSON preference key")
+            }
+
+            fn visit_bytes<E: serde::de::Error>(self, value: &[u8]) -> Result<PrefKey, E> {
+                Ok(match value {
+                    b"theme" => PrefKey::Known("theme"),
+                    b"rowstyle" => PrefKey::Known("rowstyle"),
+                    b"sidebar" => PrefKey::Known("sidebar"),
+                    b"details" => PrefKey::Known("details"),
+                    b"rows" => PrefKey::Known("rows"),
+                    _ => PrefKey::Unknown,
+                })
+            }
+        }
+
+        deserializer.deserialize_bytes(KeyVisitor)
+    }
+}
+
+/// Validate all JSON grammar, but do not interpret unrelated values as Rust
+/// numbers or strings. In particular, a valid theme survives an unrelated
+/// `1e400` or lone-surrogate string. `RawValue` leaves `serde_json::Value`'s numeric
+/// behavior unchanged for every other workspace consumer.
+fn stored_fields(raw: &str) -> Result<BTreeMap<PrefKey, &RawValue>, serde_json::Error> {
+    let value = serde_json::from_str::<&RawValue>(raw)?;
+    if value.get().starts_with('{') {
+        // BTreeMap keeps the last duplicate field, as JSON.parse does.
+        serde_json::from_str(value.get())
+    } else {
+        Ok(BTreeMap::new())
+    }
+}
+
 /// Parse a `localStorage` payload. Missing fields fall back to defaults
 /// silently (older blobs predate newer fields); malformed JSON or
 /// unknown values are recorded in `warnings` and the field is left at
@@ -238,7 +330,7 @@ pub(crate) struct ParseOutcome {
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub(crate) fn parse_stored(raw: &str) -> ParseOutcome {
     let mut warnings = Vec::new();
-    let value: serde_json::Value = match serde_json::from_str(raw) {
+    let value = match stored_fields(raw) {
         Ok(v) => v,
         Err(err) => {
             warnings.push(format!(
@@ -264,12 +356,19 @@ pub(crate) fn parse_stored(raw: &str) -> ParseOutcome {
     }
 }
 
-fn parse_field<T, F>(value: &serde_json::Value, field: &str, warnings: &mut Vec<String>, mut set: F)
-where
+fn parse_field<T, F>(
+    value: &BTreeMap<PrefKey, &RawValue>,
+    field: &'static str,
+    warnings: &mut Vec<String>,
+    mut set: F,
+) where
     T: FromStr<Err = ParseThemeError>,
     F: FnMut(T),
 {
-    let Some(s) = value.get(field).and_then(|v| v.as_str()) else {
+    let Some(s) = value
+        .get(&PrefKey::Known(field))
+        .and_then(|raw| serde_json::from_str::<String>(raw.get()).ok())
+    else {
         return;
     };
     match s.parse::<T>() {
@@ -290,6 +389,75 @@ mod tests {
         for v in [Theme::Light, Theme::Dark] {
             assert_eq!(Theme::from_str(v.as_attr()), Ok(v));
         }
+    }
+
+    #[test]
+    fn shared_preference_fixtures() {
+        use std::collections::HashSet;
+
+        let table: serde_json::Value =
+            serde_json::from_str(include_str!("preference-fixtures.json")).unwrap();
+        let rows = table.as_array().expect("fixture table must be an array");
+        assert!(!rows.is_empty(), "fixture table must not be empty");
+        let mut ids = HashSet::new();
+        for row in rows {
+            let fields = row.as_object().expect("fixture must be an object");
+            let expected_keys = ["id", "raw", "preference", "media", "resolved"];
+            assert_eq!(fields.len(), expected_keys.len(), "unknown fixture fields");
+            for key in expected_keys {
+                assert!(fields.contains_key(key), "missing fixture field {key}");
+            }
+            let id = fields["id"].as_str().expect("id must be a string");
+            assert!(!id.is_empty() && ids.insert(id), "empty or duplicate id");
+            let raw = &fields["raw"];
+            assert!(raw.is_null() || raw.is_string(), "{id}: invalid raw value");
+            let expected = fields["preference"]
+                .as_str()
+                .expect("preference must be a string")
+                .parse::<ThemePreference>()
+                .expect("unknown expected preference");
+            let resolved = fields["resolved"]
+                .as_str()
+                .expect("resolved must be a string")
+                .parse::<Theme>()
+                .expect("unknown expected resolved theme");
+            let media = fields["media"].as_str().expect("media must be a string");
+            assert!(matches!(media, "light" | "dark" | "unavailable" | "throws"));
+            let stored = raw
+                .as_str()
+                .map_or_else(Stored::default, |s| parse_stored(s).stored);
+            assert_eq!(stored.theme, expected, "{id}: preference");
+            assert_eq!(
+                stored.theme.resolve(media == "dark"),
+                resolved,
+                "{id}: resolution"
+            );
+        }
+    }
+
+    #[test]
+    fn preference_round_trips() {
+        for preference in [
+            ThemePreference::System,
+            ThemePreference::Light,
+            ThemePreference::Dark,
+        ] {
+            assert_eq!(preference.as_attr().parse(), Ok(preference));
+        }
+    }
+
+    #[test]
+    fn valid_theme_survives_invalid_reading_preferences() {
+        let out = parse_stored(
+            r#"{"theme":"dark","rowstyle":42,"sidebar":"bad","details":[],"rows":false}"#,
+        );
+        assert_eq!(
+            out.stored,
+            Stored {
+                theme: ThemePreference::Dark,
+                ..Stored::default()
+            }
+        );
     }
 
     #[test]
@@ -371,7 +539,11 @@ mod tests {
     #[test]
     fn parse_stored_unknown_variant_preserves_other_fields() {
         let out = parse_stored(r#"{"theme":"midnight","rowstyle":"plain"}"#);
-        assert_eq!(out.stored.theme, Theme::Light, "rejected, default kept");
+        assert_eq!(
+            out.stored.theme,
+            ThemePreference::System,
+            "rejected, default kept"
+        );
         assert_eq!(
             out.stored.rowstyle,
             RowStyle::Plain,
@@ -384,7 +556,7 @@ mod tests {
         // Older blobs carry a `density` field from before the pref was
         // removed; it must be skipped silently, not warned about.
         let out = parse_stored(r#"{"theme":"dark","density":"compact"}"#);
-        assert_eq!(out.stored.theme, Theme::Dark);
+        assert_eq!(out.stored.theme, ThemePreference::Dark);
         assert!(out.warnings.is_empty(), "retired field must not warn");
     }
 
@@ -395,7 +567,7 @@ mod tests {
         assert_eq!(
             out.stored,
             Stored {
-                theme: Theme::Dark,
+                theme: ThemePreference::Dark,
                 rowstyle: RowStyle::Plain,
                 sidebar: Sidebar::Collapsed,
                 details: Details::Inspector,
@@ -407,8 +579,8 @@ mod tests {
 
     #[test]
     fn parse_stored_wrong_field_type_silently_keeps_default() {
-        // theme is a number rather than a string — `as_str()` returns None and
-        // parse_field bails without warning. Same path as missing field.
+        // The recognized field is not a JSON string, so parse_field leaves its
+        // default without warning, as it does for a missing field.
         let out = parse_stored(r#"{"theme": 42}"#);
         assert_eq!(out.stored, Stored::default());
         assert!(out.warnings.is_empty());
