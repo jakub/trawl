@@ -504,7 +504,18 @@ fn read_rollup_env_entries(
 /// Select historical date directories. Today stays hourly for fast writes;
 /// non-date entries such as `wal` do not participate in daily rollup.
 fn historical_rollup_date(path: &Path, today: &str) -> Option<String> {
-    if !path.is_dir() {
+    // Follow symlinks and preserve the previous skip policy, but observe
+    // metadata failures that Path::is_dir would otherwise hide.
+    let metadata = match path.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                CompactionOperation::DailyRollupScan.record_failure();
+            }
+            return None;
+        }
+    };
+    if !metadata.is_dir() {
         return None;
     }
     let name = path.file_name()?.to_str()?;
@@ -681,7 +692,17 @@ fn collect_hour_dirs(day_dir: &Path) -> Vec<PathBuf> {
         .flatten()
         .filter_map(|e| {
             let p = e.path();
-            if p.is_dir() {
+            // Path metadata follows symlinks, matching the previous is_dir.
+            let metadata = match p.metadata() {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        CompactionOperation::DailyRollupScan.record_failure();
+                    }
+                    return None;
+                }
+            };
+            if metadata.is_dir() {
                 let name = p.file_name()?.to_str()?;
                 if name.len() == 2 && name.bytes().all(|b| b.is_ascii_digit()) {
                     return Some(p);
@@ -3844,6 +3865,83 @@ mod tests {
         assert!(envs.iter().all(|env| env.is_dir()));
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn operational_historical_date_metadata_failure_counts_with_initialized_hot_gate() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let recorder = crate::metrics::prometheus_builder().build_recorder();
+        let handle = recorder.handle();
+        // The denied date lookup prevents dispatch to a blocking rollup worker.
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        crate::metrics::init_operational_alert_metrics();
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let env = data.join("prod");
+        let historical_path = env.join("2026-01-15");
+        let input = write_hourly_parquet(&env, "2026-01-15", "00", "svc", &[OPERATIONAL_ROW]);
+        let original = std::fs::read(&input).unwrap();
+        let hot = Arc::new(HotBuffer::new(crate::hot_buffer::HotBufferConfig {
+            max_events: 100,
+            max_bytes: 100_000,
+        }));
+        // Initialize while readable, as production does before later permission
+        // changes. The next cycle reuses this gate instead of rescanning markers.
+        hot.publication().initialize(&data);
+        let permissions = std::fs::metadata(&env).unwrap().permissions();
+        std::fs::set_permissions(&env, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let entries = std::fs::read_dir(&env).and_then(Iterator::collect::<Result<Vec<_>, _>>);
+        let metadata = historical_path.metadata();
+        std::fs::set_permissions(&env, permissions.clone()).unwrap();
+        assert_eq!(
+            entries.unwrap().len(),
+            1,
+            "environment must remain enumerable"
+        );
+        if metadata.is_ok() {
+            eprintln!(
+                "skipped: privileges bypass directory search permissions; historical-date metadata failure was not exercised"
+            );
+            return;
+        }
+        assert_eq!(
+            metadata.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+
+        let before = operation_count(&handle, CompactionOperation::DailyRollupScan);
+        std::fs::set_permissions(&env, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let result = compact_once(
+            &tmp.path().join("no-wal"),
+            &data,
+            Duration::ZERO,
+            true,
+            Some(&hot),
+            500,
+            "2GB",
+            None,
+        )
+        .await;
+        // Restore permissions before assertions and temporary-directory cleanup.
+        std::fs::set_permissions(&env, permissions).unwrap();
+        assert_eq!(
+            result.unwrap(),
+            0,
+            "preserve the existing skipped-date result"
+        );
+        assert_eq!(std::fs::read(&input).unwrap(), original);
+        for operation in CompactionOperation::ALL {
+            if operation != CompactionOperation::DailyRollupScan {
+                assert_eq!(operation_count(&handle, operation), 0);
+            }
+        }
+        assert_eq!(quarantine_count(&handle, QuarantineKind::Parquet), 0);
+        assert_eq!(
+            operation_count(&handle, CompactionOperation::DailyRollupScan) - before,
+            1
+        );
+    }
+
     #[tokio::test]
     async fn operational_successful_quarantine_and_healthy_work_are_not_operation_failures() {
         let handle = operational_metrics();
@@ -6968,6 +7066,61 @@ mod tests {
 
         let dirs = collect_hour_dirs(&day);
         assert_eq!(dirs.len(), 3, "should find 3 hour directories");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn operational_hour_metadata_controls_preserve_selection_and_count_each_error() {
+        use std::os::unix::fs::symlink;
+
+        let recorder = crate::metrics::prometheus_builder().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        crate::metrics::init_operational_alert_metrics();
+        let tmp = tempfile::tempdir().unwrap();
+        let day = tmp.path().join("2026-01-15");
+        assert!(collect_hour_dirs(&day).is_empty());
+        std::fs::create_dir_all(day.join("00")).unwrap();
+        std::fs::create_dir(day.join("invalid")).unwrap();
+        std::fs::write(day.join("01"), b"ordinary file").unwrap();
+        let target = tmp.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        symlink(&target, day.join("02")).unwrap();
+        symlink(tmp.path().join("missing"), day.join("03")).unwrap();
+        assert_eq!(
+            day.join("03").metadata().unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        let expected = vec![day.join("00"), day.join("02")];
+        let mut selected = collect_hour_dirs(&day);
+        selected.sort();
+        assert_eq!(selected, expected);
+        assert_eq!(
+            operation_count(&handle, CompactionOperation::DailyRollupScan),
+            0
+        );
+
+        // Each independently failed metadata lookup is observed, unlike the
+        // once-per-root aggregation used by the outer environment listing.
+        for hour in ["04", "05"] {
+            symlink(hour, day.join(hour)).unwrap();
+            assert_ne!(
+                day.join(hour).metadata().unwrap_err().kind(),
+                std::io::ErrorKind::NotFound
+            );
+        }
+        let mut selected = collect_hour_dirs(&day);
+        selected.sort();
+        assert_eq!(selected, expected);
+        assert_eq!(
+            operation_count(&handle, CompactionOperation::DailyRollupScan),
+            2
+        );
+        for operation in CompactionOperation::ALL {
+            if operation != CompactionOperation::DailyRollupScan {
+                assert_eq!(operation_count(&handle, operation), 0);
+            }
+        }
     }
 
     #[test]
