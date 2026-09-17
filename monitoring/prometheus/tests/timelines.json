@@ -211,8 +211,16 @@
   },
   {
     "name": "counter plateau after producer stop",
-    "values": "0 1+0x30",
+    "values": "7 9+0x40",
     "checks": [
+      [
+        "0m",
+        false
+      ],
+      [
+        "30s",
+        true
+      ],
       [
         "1m",
         true
@@ -223,6 +231,10 @@
       ],
       [
         "10m",
+        false
+      ],
+      [
+        "20m",
         false
       ]
     ]

@@ -211,15 +211,16 @@ class OperationalAlerts(unittest.TestCase):
                 self.run_promtool(pack, [self.timeline(case, {}) for case in TIMELINES])
 
     def test_promtool_static_severity_override(self):
-        helm = rule_object(enabled(alerts={r["alert"]: {"severity": "page"} for r in EXPECTED}))
+        severity = 'page "ops"\nteam: logs #triage'
+        helm = rule_object(enabled(alerts={r["alert"]: {"severity": severity} for r in EXPECTED}))
         plain = copy.deepcopy(self.plain)
         for rule in plain["groups"][0]["rules"]:
-            rule["labels"]["severity"] = "page"
-        case = self.timeline({"name": "static page severity", "values": "0 1+0x30",
+            rule["labels"]["severity"] = severity
+        case = self.timeline({"name": "escaped static severity", "values": "0 1+0x30",
                               "checks": [["0m", False], ["30s", True], ["9m", True], ["10m", False]]}, {})
         for check in case["alert_rule_test"]:
             for alert in check["exp_alerts"]:
-                alert["exp_labels"]["severity"] = "page"
+                alert["exp_labels"]["severity"] = severity
         for pack in [plain, helm["spec"]]:
             self.run_promtool(pack, [case])
 
