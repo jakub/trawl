@@ -9,7 +9,7 @@ exact interval, or the data you saw.
 
 ## Share a browser search
 
-Run the search, then select **Share**. Expect `Search URL copied to clipboard.`
+Run the search, then select **Copy search URL**. Expect `Search URL copied to clipboard.`
 The link carries the query, range, page, mode, and sidebar state, but no API
 key, so the recipient needs their own sign-in and permissions on the same
 server.
