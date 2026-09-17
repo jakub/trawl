@@ -48,8 +48,10 @@ async fn assert_dashboard_storage_configuration(ingest_enabled: bool) {
         assert_eq!((snapshot.parquet_files, snapshot.parquet_bytes), (0, 0));
     };
     assert_measurements(&snapshot);
+    let (cert_path, _) = common::ensure_test_cert();
+    let certificate = reqwest::Certificate::from_pem(&std::fs::read(cert_path).unwrap()).unwrap();
     let mut response = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
+        .add_root_certificate(certificate)
         .build()
         .unwrap()
         .get(format!("{}/api/v1/dashboard/stream", server.url))
