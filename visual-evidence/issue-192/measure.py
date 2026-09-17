@@ -27,11 +27,18 @@ def main():
                         help="New directory for raw logs, generated SQL, and timings")
     args = parser.parse_args()
     url = os.environ.get("TRAWL_ISSUE_192_COST_DATABASE_URL", "")
-    parsed = urlparse(url)
-    database = unquote(parsed.path.removeprefix("/"))
-    if (parsed.scheme not in ("postgres", "postgresql") or not parsed.hostname
-            or not parsed.port or not parsed.username or parsed.query
-            or parsed.fragment or not re.fullmatch(r"trawl_issue_192_cost[\w]*", database)):
+    try:
+        parsed = urlparse(url)
+        hostname = parsed.hostname
+        port = parsed.port
+        database = unquote(parsed.path.removeprefix("/"))
+        valid_url = (parsed.scheme in ("postgres", "postgresql") and hostname
+                     and port and parsed.username and not parsed.query
+                     and not parsed.fragment
+                     and re.fullmatch(r"trawl_issue_192_cost[\w]*", database))
+    except ValueError:
+        valid_url = False
+    if not valid_url:
         parser.error("Set TRAWL_ISSUE_192_COST_DATABASE_URL with explicit user, host, "
                      "port, and disposable database trawl_issue_192_cost (optional suffix); "
                      "URL query parameters are not accepted")
@@ -41,7 +48,7 @@ def main():
     env = {key: value for key, value in os.environ.items() if not key.startswith("PG")}
     # libpq does not expand a connection URI supplied through PGDATABASE.
     # Pass each parsed field explicitly so no default socket can be selected.
-    env.update(PGHOST=parsed.hostname, PGPORT=str(parsed.port),
+    env.update(PGHOST=hostname, PGPORT=str(port),
                PGUSER=unquote(parsed.username), PGDATABASE=database,
                PGPASSWORD=unquote(parsed.password or ""),
                PGPASSFILE=str(args.output.resolve() / "no-password-file"),

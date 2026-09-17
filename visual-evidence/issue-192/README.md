@@ -1,5 +1,11 @@
 # History count and page cost
 
+The recorded measurements used `measure.py` at commit
+`71dd9661a71d71575fa141bce9372d1248979a8b`. A later input-validation fix
+rejects malformed URLs without a traceback. SQL and measurement behavior
+are unchanged, and these measurements were not rerun. `provenance.json`
+records the measured runner revision/hash separately from current artifact hashes.
+
 This fixture measures the SQL shipped by `HistoryStore::get_user_history` with
 the existing history index. It uses Python's standard library and installed
 `psql`. It does not start a server, use a saved Trawl profile, or alter server

@@ -1,5 +1,11 @@
 # History cost results
 
+The recorded measurements used `measure.py` at commit
+`71dd9661a71d71575fa141bce9372d1248979a8b`. A later input-validation fix
+rejects malformed URLs without a traceback. SQL and measurement behavior
+are unchanged, and these measurements were not rerun. `provenance.json`
+records the measured runner revision/hash separately from current artifact hashes.
+
 The 200,000-row fixture completed all 16 cases and 80 measured transactions.
 With default planning, median statement sums were 8.873–9.070 ms unfiltered,
 47.237–48.355 ms for common matches, 106.622–166.259 ms for sparse matches,
