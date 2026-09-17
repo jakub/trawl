@@ -157,7 +157,8 @@ for (const path of ['/jobs/nets', '/jobs/runs']) {
     const endpoint = path === '/jobs/nets' ? '**/api/v1/saved' : '**/api/v1/runs?*';
     await page.route(endpoint, route => route.fulfill({ status: 401, json: { error: 'Unauthorized' } }));
     await page.goto(path);
-    await expect(page).toHaveURL(/\/login$/);
+    await expect(page).toHaveURL(url => url.pathname === '/login'
+      && url.search === `?return_to=${encodeURIComponent(path)}`);
     await expect(page.getByText('Retrying automatically.', { exact: false })).toHaveCount(0);
   });
 }

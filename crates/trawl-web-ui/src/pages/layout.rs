@@ -5,7 +5,8 @@
 //! `<AuthShell/>` — authenticated layout wrapping all non-login routes.
 //!
 //! A thin app-specific wrapper over [`fleet_ui::Shell`]: keeps the
-//! `/me` fetch, the Unauthorized→`/login` redirect, and the
+//! `/me` fetch, the Unauthorized redirect to sign-in carrying the requested
+//! URL, and the
 //! `ShellStatus` + `me` context provision; maps trawl's `AppMode` /
 //! `section` state onto fleet-ui's `SidebarGroup` / `RailItem` props.
 //! The toast bus and `<Toasts/>` host are owned by `fleet_ui::Shell`
@@ -73,10 +74,8 @@ pub fn AuthShell() -> impl IntoView {
     };
 
     Effect::new(move |_| {
-        if redirect_to_login.get()
-            && let Some(win) = web_sys::window()
-        {
-            let _ = win.location().set_href("/login");
+        if redirect_to_login.get() {
+            crate::auth_return::redirect_to_login();
         }
     });
 
