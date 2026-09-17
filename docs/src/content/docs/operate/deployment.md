@@ -379,6 +379,11 @@ For standalone exports or files from other tools, you can also
 
 ## Verify the installation
 
+After verification, [load the operational alert pack](/operate/operational-alerts/)
+into your existing Prometheus installation. Plain rules include a matching
+HTTPS scrape example. Helm rule creation is opt-in and independent of
+ServiceMonitor creation; neither option installs a monitoring system.
+
 1. Check health. The route needs no token:
 
    ```bash

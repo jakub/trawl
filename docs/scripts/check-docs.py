@@ -51,6 +51,43 @@ for path, page in pages.items():
                 errors.append(f'{relative}: missing fragment {href}')
         links += 1
 
+# These source-owned URLs are literals in both packs, including the Helm
+# template. Validate every annotation without needing Helm or a YAML package
+# in the docs job. A different source shape must fail rather than skip links.
+rule_links = 0
+rule_inventories = []
+for relative in ('monitoring/prometheus/trawl.rules.yml',
+                 'chart/trawl/templates/prometheusrule.yaml'):
+    source = (ROOT / relative).read_text()
+    starts = list(re.finditer(r'^\s*- alert:\s*(\w+)\s*$', source, re.M))
+    alerts = [match[1] for match in starts]
+    urls = []
+    if not starts:
+        errors.append(f'{relative}: alert inventory not found; update the checker for the source shape')
+    for index, start in enumerate(starts):
+        end = starts[index + 1].start() if index + 1 < len(starts) else len(source)
+        block = source[start.end():end]
+        fields = re.findall(r'^\s*runbook_url:', block, re.M)
+        found = re.findall(r'^\s*runbook_url:\s*"(https://trawl\.sh/[^"\s]+)"\s*$', block, re.M)
+        if len(fields) != 1 or len(found) != 1:
+            errors.append(f'{relative}: {start[1]} must have one literal absolute trawl.sh runbook_url')
+        urls.extend(found)
+    if len(set(alerts)) != len(alerts):
+        errors.append(f'{relative}: duplicate alert names')
+    rule_inventories.append(list(zip(alerts, urls)))
+    for href in urls:
+        target = urlsplit(href)
+        destination = DIST / unquote(target.path).lstrip('/')
+        if destination.is_dir() or not destination.suffix:
+            destination /= 'index.html'
+        if destination not in pages:
+            errors.append(f'{relative}: runbook page is not built: {href}')
+        elif not target.fragment or unquote(target.fragment) not in pages[destination].ids:
+            errors.append(f'{relative}: runbook anchor is missing: {href}')
+        rule_links += 1
+if rule_inventories[0] != rule_inventories[1]:
+    errors.append('Plain and Helm alert/runbook inventories differ')
+
 toml_blocks = 0
 for path in (DOCS / 'src/content/docs').rglob('*'):
     if path.suffix not in ('.md', '.mdx'):
@@ -83,4 +120,4 @@ if errors:
     print('\n'.join(sorted(set(errors))), file=sys.stderr)
     sys.exit(1)
 print(f'Checked {len(pages)} HTML pages, {links} local links, {toml_blocks} TOML blocks, '
-      f'and {len(stage_names)} DSL stages.')
+      f'{rule_links} rule runbook links, and {len(stage_names)} DSL stages.')

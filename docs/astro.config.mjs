@@ -31,7 +31,7 @@ export default defineConfig({
         },
         {
           label: 'Operate Trawl', collapsed: true,
-          items: ['operate/deployment', 'operate/ingestion', 'getting-started/vector-integration', 'operate/access', 'operate/health', 'operate/catalog', 'operate/retention', 'operate/backup-restore', 'reference/crash-dumps'].map((slug) => ({ slug })),
+          items: ['operate/deployment', 'operate/ingestion', 'getting-started/vector-integration', 'operate/access', 'operate/health', 'operate/operational-alerts', 'operate/catalog', 'operate/retention', 'operate/backup-restore', 'reference/crash-dumps'].map((slug) => ({ slug })),
         },
         {
           label: 'Reference', collapsed: true,

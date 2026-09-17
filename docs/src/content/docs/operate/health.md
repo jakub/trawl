@@ -10,6 +10,11 @@ that file, not on the command line, and do not print the file.
 
 ## Check the server
 
+For warnings about reported discards, persistence failures, compaction
+failures, and quarantined files, use [Respond to operational alerts](/operate/operational-alerts/).
+Those rules complement serving checks; they do not detect silent stalls or
+establish recovery when an alert resolves.
+
 1. Ask for health. `/api/v1/health` needs no key.
 
    ```bash
