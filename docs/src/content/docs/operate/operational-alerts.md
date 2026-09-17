@@ -393,9 +393,11 @@ the existing processing path.
    repeated refusals alone do not add failure events.
 
 Successful empty work, a missing cold-start WAL root, and intentional repin
-suppression or waiting are not failures. Confirmed `NotFound` is excluded at
-directory-scan boundaries. Later file-read, publication, and recovery failures
-still count, including `NotFound` from a concurrent retention operation.
+suppression or waiting are not failures. The `wal_root_scan` and
+`daily_rollup_scan` directory scans ignore confirmed missing paths.
+Pending-rollup recovery also ignores a missing directory at its initial
+directory read. Other recorded scans and later file-read, publication, and
+recovery failures can count `NotFound`, including races with retention.
 Inspect the logs to establish the cause; the alert alone does not identify it.
 Stale temporary-file cleanup and empty-directory housekeeping
 are outside this finite operation inventory. A quiet counter is not evidence

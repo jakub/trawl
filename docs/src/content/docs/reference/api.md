@@ -1838,9 +1838,11 @@ facts even when they occur in one cycle.
 `CompactionStats.total_errors` retains its existing mixed error/quarantine
 meaning. It is not relabelled as failed cycles. Idle work, disabled ingestion,
 and intentional repin suppression or waiting do not emit these operation
-failures. Confirmed `NotFound` is excluded at directory-scan boundaries.
-Subsequent file-read, publication, and recovery failures still count,
-including `NotFound` caused by a concurrent retention operation. The alert
+failures. The `wal_root_scan` and `daily_rollup_scan` directory scans ignore
+confirmed missing paths. Pending-rollup recovery also ignores a missing
+directory at its initial directory read. Other recorded scans and later
+file-read, publication, and recovery failures can count `NotFound`, including
+races with retention. The alert
 reports the failed attempt, not its cause. Stale
 temporary-file cleanup and empty-directory housekeeping are outside this
 closed inventory. Retiring a replaced file as `.parquet.merged` is not a
