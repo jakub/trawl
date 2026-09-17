@@ -118,7 +118,8 @@ Use the exact alert names in the [metric mapping](/reference/api/#operational-al
 as keys under `prometheusRule.alerts`. Each entry accepts only `enabled` and
 `severity`. Severity is a nonblank static string, with no severity enum;
 template delimiters `{{` and `}}` are rejected. Unknown keys, invalid types,
-and conflicting chart resource-label overrides fail rendering.
+invalid Kubernetes label keys, and conflicting chart resource-label overrides
+fail rendering.
 
 The example's `monitoring: homelab` is a label on the rule resource for
 discovery. It is not added to alert series. Configure your existing
