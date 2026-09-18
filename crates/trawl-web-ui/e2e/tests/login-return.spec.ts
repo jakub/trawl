@@ -61,6 +61,10 @@ for (const failure of ['rejection', 'server', 'network'] as const) {
 test('canonical routes, aliases and one trailing slash retain their complete suffix', async ({ page, request }) => {
   test.setTimeout(90000);
   await resetScenario(request, 'corpus');
+  // Health reads queries on mount; the corpus scenario covers Search and Jobs.
+  await page.route('**/api/v1/queries', route => route.request().method() === 'GET'
+    ? route.fulfill({ json: { active: [], recent: [], retained: [] } })
+    : route.fallback());
   await page.route('**/api/auth/login', route => route.fulfill({ json: identity }));
   const suffix = '?note=%252F+a%2Bb&next=https%3A%2F%2Fexample.com%2Fa#row?value';
   for (const [path, canonical] of [
@@ -73,6 +77,10 @@ test('canonical routes, aliases and one trailing slash retain their complete suf
       await page.goto(`/login?return_to=${component(path + ending + suffix)}`);
       await signIn(page);
       await expect(page).toHaveURL(url => relative(url) === canonical + suffix);
+      if (canonical === '/settings/health') {
+        // Observe the mounted page before the next iteration navigates away.
+        await expect(page.locator(SEL.healthQueries)).toContainText('No active or recent queries.');
+      }
     }
   }
 });
