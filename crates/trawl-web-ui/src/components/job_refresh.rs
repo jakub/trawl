@@ -5,6 +5,8 @@
 //! Visible-page polling for Jobs. Reads are serialized; a newer intent makes
 //! the pending response obsolete and queues one fresh read. Last good data
 //! remains available through transport failures.
+//! An eligible 401 replaces the page with sign-in carrying its current URL;
+//! disposed or superseded reads must pass the lifetime checks first.
 use crate::api::ApiError;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -98,9 +100,10 @@ where
                 return;
             }
             if matches!(result, Err(ApiError::Unauthorized)) {
-                live.set(false);
-                timer.update_value(|t| *t = None);
-                let _ = leptos::prelude::window().location().set_href("/login");
+                if crate::auth_return::redirect_to_login() {
+                    live.set(false);
+                    timer.update_value(|t| *t = None);
+                }
                 return;
             }
             match result {

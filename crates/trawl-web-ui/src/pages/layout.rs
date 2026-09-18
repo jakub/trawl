@@ -5,7 +5,8 @@
 //! `<AuthShell/>` — authenticated layout wrapping all non-login routes.
 //!
 //! A thin app-specific wrapper over [`fleet_ui::Shell`]: keeps the
-//! `/me` fetch, the Unauthorized→`/login` redirect, and the
+//! `/me` fetch, the Unauthorized redirect to sign-in carrying the requested
+//! URL, and the
 //! `ShellStatus` + `me` context provision; maps trawl's `AppMode` /
 //! `section` state onto fleet-ui's `SidebarGroup` / `RailItem` props.
 //! The toast bus and `<Toasts/>` host are owned by `fleet_ui::Shell`
@@ -73,10 +74,8 @@ pub fn AuthShell() -> impl IntoView {
     };
 
     Effect::new(move |_| {
-        if redirect_to_login.get()
-            && let Some(win) = web_sys::window()
-        {
-            let _ = win.location().set_href("/login");
+        if redirect_to_login.get() {
+            crate::auth_return::redirect_to_login();
         }
     });
 
@@ -158,21 +157,15 @@ pub fn AuthShell() -> impl IntoView {
     let signing_out = RwSignal::new(false);
     let logout_error = RwSignal::new(false);
     let on_logout = Callback::new(move |()| {
-        if signing_out.get_untracked() {
+        if signing_out.get_untracked() || !crate::auth_return::begin_explicit_logout() {
             return;
         }
         signing_out.set(true);
         logout_error.set(false);
         spawn_local(async move {
-            match api::logout().await {
-                Ok(()) => {
-                    if let Some(win) = web_sys::window() {
-                        let _ = win.location().set_href("/login");
-                    }
-                }
-                Err(_) => {
-                    logout_error.try_set(true);
-                }
+            if api::logout().await.is_err() || !crate::auth_return::finish_explicit_logout() {
+                crate::auth_return::cancel_explicit_logout();
+                logout_error.try_set(true);
             }
             signing_out.try_set(false);
         });

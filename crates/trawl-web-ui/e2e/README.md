@@ -82,7 +82,9 @@ despite their crash messages. The missing popup event in main CI run
 unproven.
 
 The full CI suite gets 25 minutes on the shared `k8s-small` runner,
-inside a 35-minute job budget that also covers setup and artifact upload.
+inside a 40-minute job budget that also covers setup, the separate BFCache
+suite and artifact upload. The BFCache CI step has a five-minute aggregate
+budget; its individual test timeouts and zero-retry policy are unchanged.
 The local and focused mutation-run default remains 12 minutes. To reproduce CI's aggregate
 budget locally, run `npm run test -- --global-timeout=1500000` from this
 directory. This override leaves per-test timeouts, assertions and

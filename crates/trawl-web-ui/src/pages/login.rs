@@ -3,8 +3,12 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! `/login` — thin wrapper over [`fleet_ui::Login`]: error mapping +
-//! hard redirect to `/search` on success. The empty-key check lives in
-//! the fleet component.
+//! full-document replacement with the validated return destination on success.
+//! Initial session and Jobs polling redirects carry URL state in `return_to`;
+//! absent or invalid destinations fall back to `/search`. Explicit logout
+//! opens bare `/login`, so its next sign-in also opens Search. Failed sign-in
+//! retains the destination, but no unsaved state or interrupted action returns.
+//! The empty-key check lives in the fleet component.
 //!
 //! The `Atmosphere` mesh-gradient backdrop (ADR-0012) mounts as a
 //! sibling above `<Login/>`, matching the fleet-ui workbench
@@ -35,9 +39,7 @@ pub fn Login() -> impl IntoView {
         spawn_local(async move {
             match api::login(&key).await {
                 Ok(_) => {
-                    if let Some(win) = web_sys::window() {
-                        let _ = win.location().set_href("/search");
-                    }
+                    crate::auth_return::finish_login();
                 }
                 Err(api::ApiError::Unauthorized) => {
                     set_error.try_set(Some("Invalid API key".into()));

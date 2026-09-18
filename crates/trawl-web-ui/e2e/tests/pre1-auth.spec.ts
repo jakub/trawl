@@ -33,7 +33,9 @@ test('auth rejection redirects, while lack of permission has its own state', asy
   await page.unroute('**/api/auth/me');
   await page.route('**/api/auth/me', route => route.fulfill({ status: 401, body: '' }));
   await page.getByRole('button', { name: 'Retry session check' }).click();
-  await expect(page).toHaveURL(/\/login$/);
+  await expect(page).toHaveURL(url =>
+    url.pathname === '/login' && url.search === '?return_to=%2Fsearch%2Fhistory'
+  );
 });
 
 for (const failure of ['server', 'network'] as const) {
