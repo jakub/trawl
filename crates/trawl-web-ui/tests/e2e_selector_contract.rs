@@ -341,6 +341,12 @@ const CONTRACTS: &[Contract] = &[
         hook: "title=\"Hot buffer (events / bytes)\"",
     },
     Contract {
+        assignment: "healthFooterWal: '.statusbar .wal-measurement',",
+        source_path: "src/components/status_bar.rs",
+        source: STATUS_BAR_RS,
+        hook: "class=\"grp wal-measurement\"",
+    },
+    Contract {
         assignment: "healthCards: '.health-cards',",
         source_path: "src/pages/health.rs",
         source: HEALTH_RS,
@@ -375,6 +381,30 @@ const CONTRACTS: &[Contract] = &[
         source_path: "src/pages/health.rs",
         source: HEALTH_RS,
         hook: "class=\"health-live-state\"",
+    },
+    Contract {
+        assignment: "healthIngestion: '.health-ingestion',",
+        source_path: "src/pages/health.rs",
+        source: HEALTH_RS,
+        hook: "class=\"health-ingestion\"",
+    },
+    Contract {
+        assignment: "healthStorage: '.health-storage',",
+        source_path: "src/pages/health.rs",
+        source: HEALTH_RS,
+        hook: "class=\"health-storage\"",
+    },
+    Contract {
+        assignment: "healthDiagnostics: '.health-diagnostics',",
+        source_path: "src/pages/health.rs",
+        source: HEALTH_RS,
+        hook: "class=\"health-diagnostics\"",
+    },
+    Contract {
+        assignment: "healthDiagnosticState: '.health-diagnostic-state',",
+        source_path: "src/pages/health.rs",
+        source: HEALTH_RS,
+        hook: "class=\"health-diagnostic-state\"",
     },
     Contract {
         assignment: "healthQueries: '.health-queries',",

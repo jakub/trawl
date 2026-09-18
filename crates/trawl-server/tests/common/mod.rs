@@ -1283,6 +1283,30 @@ pub async fn setup_in_dir_with_data_and_timeout(
     rate_limit: RateLimitConfig,
     timeout_secs: u64,
 ) -> TestServer {
+    setup_with_ingest_config(dir, data_path, rate_limit, timeout_secs, true).await
+}
+
+/// Exercise configured WAL presence through real `AppState` construction, without
+/// replacing the writer or preconstructing dashboard metadata in the test.
+pub async fn setup_in_dir_with_ingest(dir: &std::path::Path, enabled: bool) -> TestServer {
+    setup_with_ingest_config(
+        dir,
+        seed_data_root(dir),
+        RateLimitConfig::default(),
+        DEFAULT_TEST_TIMEOUT_SECS,
+        enabled,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_lines)] // linear assembly: two databases, two pools, one config
+async fn setup_with_ingest_config(
+    dir: &std::path::Path,
+    data_path: String,
+    rate_limit: RateLimitConfig,
+    timeout_secs: u64,
+    ingest_enabled: bool,
+) -> TestServer {
     assert!(
         std::path::Path::new(&data_path).is_dir(),
         "the fixture data path must be an existing directory: {data_path}"
@@ -1362,6 +1386,7 @@ pub async fn setup_in_dir_with_data_and_timeout(
             let wal_dir = dir.join("wal");
             std::fs::create_dir_all(&wal_dir).unwrap();
             IngestConfig {
+                enabled: ingest_enabled,
                 wal_dir: Some(wal_dir),
                 ..IngestConfig::default()
             }

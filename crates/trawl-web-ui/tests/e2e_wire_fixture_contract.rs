@@ -511,6 +511,21 @@ fn the_query_shapes_match_the_dsl_the_drawer_builds() {
     assert!(!collision.dsl.contains(cardinality));
 }
 
+fn assert_dashboard_measurement_metadata_is_required(dashboard: &trawl_api::DashboardSnapshot) {
+    let dashboard_json = serde_json::to_value(dashboard).unwrap();
+    for field in ["wal_measurement", "parquet_measurement"] {
+        let mut missing = dashboard_json.clone();
+        missing.as_object_mut().unwrap().remove(field);
+        assert!(serde_json::from_value::<trawl_api::DashboardSnapshot>(missing).is_err());
+        let mut missing_status = dashboard_json.clone();
+        missing_status[field]
+            .as_object_mut()
+            .unwrap()
+            .remove("status");
+        assert!(serde_json::from_value::<trawl_api::DashboardSnapshot>(missing_status).is_err());
+    }
+}
+
 #[test]
 fn health_page_fixtures_decode_and_exercise_permissions_and_failures() {
     let ok: trawl_api::HealthResponse = decode(
@@ -536,6 +551,17 @@ fn health_page_fixtures_decode_and_exercise_permissions_and_failures() {
         "health-dashboard.json",
         include_str!("../e2e/harness/wire/health-dashboard.json"),
     );
+    assert_eq!(
+        dashboard.wal_measurement.status,
+        trawl_api::StorageMeasurementStatus::Complete
+    );
+    assert_eq!(dashboard.wal_measurement.sample_age_secs, Some(2));
+    assert_eq!(
+        dashboard.parquet_measurement.status,
+        trawl_api::StorageMeasurementStatus::Complete
+    );
+    assert_eq!(dashboard.parquet_measurement.sample_age_secs, Some(2));
+    assert_dashboard_measurement_metadata_is_required(&dashboard);
     assert_eq!(dashboard.hot_buffer_events, 731);
     assert_eq!(dashboard.pool_active, 3);
     assert_eq!(dashboard.pool_retained, stats.pool_retained);

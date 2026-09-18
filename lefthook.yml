@@ -61,4 +61,4 @@ pre-push:
       # shared DuckDB runtime; --no-default-features changes application
       # features such as CLI clipboard support, not DuckDB linkage.
       # The existing exclusions avoid duplicate full-daemon workloads.
-      run: if [ -f "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env"; fi; DATABASE_URL="${TRAWL_TEST_ND_DATABASE_URL:-postgres://fleet:fleet@localhost:5434/fleet_test_nd}" cargo nextest run -p fleet-auth -p trawl-web -p trawl-engine -p trawl-server -p trawl-cli --no-default-features --test-threads="$(( $(nproc 2>/dev/null || sysctl -n hw.ncpu) / 2 ))" -E 'not (binary(http_api) | binary(hot_query) | binary(timestamp_repair))'
+      run: if [ -f "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env"; fi; DATABASE_URL="${TRAWL_TEST_ND_DATABASE_URL:-postgres://fleet:fleet@localhost:5434/fleet_test_nd}" cargo nextest run -p fleet-auth -p trawl-web -p trawl-engine -p trawl-server -p trawl-cli --no-default-features --test-threads="$(( $(nproc 2>/dev/null || sysctl -n hw.ncpu) / 2 ))" -E 'not (binary(http_api) | binary(dashboard_storage) | binary(hot_query) | binary(timestamp_repair))'

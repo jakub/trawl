@@ -134,7 +134,7 @@ function historyPage(filter, offset, limit) {
 // socket close or turn a leaked connection into a fresh baseline.
 const dashboard = {
   open: 0, opens: 0, closes: 0, max: 0, responses: new Set(),
-  hold: false, bootstrap: 'ok', pending: new Set(), cancel: 'accepted',
+  hold: false, bootstrap: 'ok', pending: new Set(), cancel: 'accepted', snapshot: {},
   terminalHold: false, terminalPending: new Set(),
 };
 let healthHits = {};
@@ -148,7 +148,7 @@ function healthIdentity() {
   return { ...meResponse(), name: 'same-name', permissions };
 }
 function dashboardBody(bootstrap = false) {
-  const body = wire('health-dashboard');
+  const body = { ...wire('health-dashboard'), ...dashboard.snapshot };
   if (bootstrap) { body.hostname = 'old-bootstrap-host'; body.hot_buffer_events = 111; }
   return body;
 }
@@ -276,6 +276,7 @@ function resetState() {
   cancelRequests = [];
   dashboard.hold = false;
   dashboard.bootstrap = 'ok';
+  dashboard.snapshot = {};
   dashboard.cancel = 'accepted';
   dashboard.terminalHold = false;
   for (const response of dashboard.terminalPending) response.destroy();
@@ -477,6 +478,7 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       repin.field = parsed.repinField || null;
       dashboard.hold = parsed.dashboardHold ?? false;
       dashboard.bootstrap = parsed.dashboardBootstrap ?? 'ok';
+      dashboard.snapshot = parsed.dashboardSnapshot ?? {};
       dashboard.cancel = parsed.cancelOutcome ?? 'accepted';
       dashboard.terminalHold = parsed.dashboardTerminalHold ?? false;
       sendJson(res, 200, { ok: true, scenario, repinField: repin.field });
@@ -612,6 +614,8 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
     }
 
     if (p === '/__ctl/dashboard/release' && req.method === 'POST') {
+      const body = await readBody(req);
+      if (body) Object.assign(dashboard.snapshot, JSON.parse(body).snapshot ?? {});
       dashboard.hold = false;
       pushDashboard();
       sendJson(res, 200, { ok: true, open: dashboard.open });

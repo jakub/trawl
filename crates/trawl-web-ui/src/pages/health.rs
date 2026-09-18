@@ -15,7 +15,10 @@ use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
-use trawl_api::{HealthResponse, HealthStatus, QueriesResponse, StatsResponse};
+use trawl_api::{
+    HealthResponse, HealthStatus, QueriesResponse, StatsResponse, StorageMeasurement,
+    StorageMeasurementStatus,
+};
 
 /// Human names for the checks the daemon ships. A key with no entry
 /// renders verbatim: the page does not invent a name for a subsystem it
@@ -176,7 +179,7 @@ pub fn HealthPage() -> impl IntoView {
                     {move || dashboard.get().snapshot.map(|s| view! {
                         <dl class="health-facts">
                             <div><dt>"Host"</dt><dd>{s.hostname}</dd></div>
-                            <div><dt>"Ingest rate"</dt><dd>{format!("{:.1} events/s", s.ingest_rate)}</dd></div>
+                            <div><dt>"HTTP ingest rate"</dt><dd>{format!("{:.1} events/s", s.ingest_rate)}</dd></div>
                             <div><dt>"Query rate"</dt><dd>{format!("{:.1} queries/s", s.query_rate)}</dd></div>
                             <div><dt>"Hot buffer events"</dt><dd>{format!("{} / {}", format_count(s.hot_buffer_events as u64), format_count(s.hot_buffer_max_events as u64))}</dd></div>
                             <div><dt>"Hot buffer memory"</dt><dd>{format!("{} / {}", format_bytes(s.hot_buffer_bytes as u64), format_bytes(s.hot_buffer_max_bytes as u64))}</dd></div>
@@ -186,7 +189,89 @@ pub fn HealthPage() -> impl IntoView {
                 </section>
             </Show>
             </div>
+            <Show when=move || me.get().is_some_and(|m| perms::is_trawl_admin(&m.permissions))><HealthDiagnostics/></Show>
             <Show when=move || me.get().is_some_and(|m| perms::can_query(&m.permissions))><HealthQueries/></Show>
+        </div>
+    }
+}
+
+/// Render the server's sample age unchanged, including when the stream stops.
+fn storage_reading(files: u64, bytes: u64, measurement: StorageMeasurement) -> String {
+    match (measurement.status, measurement.sample_age_secs) {
+        (StorageMeasurementStatus::NotConfigured, _) => "Not configured".into(),
+        (StorageMeasurementStatus::NotSampled, _) => "Awaiting measurement".into(),
+        (StorageMeasurementStatus::Failed, None) => {
+            "Measurement unavailable; collection failed".into()
+        }
+        (status, Some(age)) => {
+            let state = if status == StorageMeasurementStatus::Failed {
+                "Collection failed; last complete totals"
+            } else {
+                "Complete measurement"
+            };
+            format!(
+                "{state}: {} files, {}. Sample age: {age}s at this snapshot.",
+                format_exact(files),
+                format_bytes(bytes)
+            )
+        }
+        // The producer requires an age on complete samples. Do not display
+        // numeric placeholders as measured if a malformed response violates it.
+        (StorageMeasurementStatus::Complete, None) => "Measurement unavailable".into(),
+    }
+}
+
+#[component]
+fn HealthDiagnostics() -> impl IntoView {
+    let dashboard = expect_context::<SharedDashboard>();
+    view! {
+        <div class="health-diagnostics">
+            <section class="health-ingestion" aria-labelledby="health-ingestion-title">
+                <h2 id="health-ingestion-title">"Ingestion"</h2>
+                <p class="health-diagnostic-state" class:sr-only=move || dashboard.get().phase == DashboardPhase::Live>{move || dashboard.get().phase.label()}</p>
+                {move || dashboard.get().snapshot.map(|s| view! {
+                    <p class="health-note">"Counters are since process startup. HTTP counters exclude syslog."</p>
+                    <dl class="health-facts">
+                        <div><dt>"HTTP rejected events"</dt><dd>{format_exact(s.ingest_rejected)}</dd></div>
+                        <div><dt>"Syslog configuration"</dt><dd>{if s.syslog_enabled { "Enabled" } else { "Disabled" }}</dd></div>
+                    </dl>
+                    {s.syslog_enabled.then(|| view! {
+                        <dl class="health-facts">
+                            <div><dt>"UDP received"</dt><dd>{format_exact(s.syslog_events_udp)}</dd></div>
+                            <div><dt>"TCP received"</dt><dd>{format_exact(s.syslog_events_tcp)}</dd></div>
+                            <div><dt>"Syslog rate"</dt><dd>{format!("{:.1} events/s", s.syslog_rate)}</dd></div>
+                            <div><dt>"Parse errors"</dt><dd>{format_exact(s.syslog_parse_errors)}</dd></div>
+                            <div><dt>"Backpressure drops"</dt><dd>{format_exact(s.syslog_dropped)}</dd></div>
+                            <div><dt>"Active TCP connections"</dt><dd>{format_exact(s.syslog_tcp_connections)}</dd></div>
+                        </dl>
+                    })}
+                    <p class="health-note">"Configured enablement does not test listener health. Received messages do not prove persistence."</p>
+                })}
+                <p class="health-note"><a href="https://trawl.sh/operate/ingestion/" target="_blank" rel="noopener noreferrer">"Ingestion guidance"</a></p>
+            </section>
+            <section class="health-storage" aria-labelledby="health-storage-title">
+                <h2 id="health-storage-title">"Storage"</h2>
+                <p class="health-diagnostic-state" class:sr-only=move || dashboard.get().phase == DashboardPhase::Live>{move || dashboard.get().phase.label()}</p>
+                {move || dashboard.get().snapshot.map(|s| view! {
+                    <div class="health-storage-source" data-source="wal">
+                        <h3>"WAL"</h3>
+                        <p>{storage_reading(s.wal_files, s.wal_bytes, s.wal_measurement)}</p>
+                        <p class="health-note">"Includes active WAL files; these are not counts of compaction-eligible files."</p>
+                    </div>
+                    <div class="health-storage-source" data-source="parquet">
+                        <h3>"Ingested Parquet"</h3>
+                        <p>{storage_reading(s.parquet_files, s.parquet_bytes, s.parquet_measurement)}</p>
+                        <p class="health-note">"Excludes saved report files. Sample age is relative to this dashboard snapshot, separate from live-update status."</p>
+                    </div>
+                    <dl class="health-facts">
+                        <div><dt>"Successful compaction cycles"</dt><dd>{format_exact(s.compaction_runs)}</dd></div>
+                        <div><dt>"Compaction error tally"</dt><dd>{format_exact(s.compaction_errors)}</dd></div>
+                        <div><dt>"Last successful cycle"</dt><dd>{s.last_compaction_secs.map_or_else(|| "No successful cycle reported since startup".to_owned(), |age| format!("{age}s ago"))}</dd></div>
+                    </dl>
+                    <p class="health-note">"Compaction counters are since process startup. The error tally includes failed cycles and loss/error tallies; it can accompany successful cycles and exceed their count. A successful cycle can have no eligible work."</p>
+                })}
+                <p class="health-note"><a href="https://trawl.sh/architecture/recovery/" target="_blank" rel="noopener noreferrer">"Storage recovery"</a>" · "<a href="https://trawl.sh/operate/retention/" target="_blank" rel="noopener noreferrer">"Retention guidance"</a></p>
+            </section>
         </div>
     }
 }

@@ -62,6 +62,7 @@ pub struct MonitorSnapshot {
     // -- WAL --
     pub wal_files: u64,
     pub wal_bytes: u64,
+    pub wal_measurement: trawl_api::StorageMeasurement,
 
     // -- compaction --
     pub last_compaction_secs: Option<u64>,
@@ -71,6 +72,7 @@ pub struct MonitorSnapshot {
     // -- storage --
     pub parquet_files: u64,
     pub parquet_bytes: u64,
+    pub parquet_measurement: trawl_api::StorageMeasurement,
 
     // -- SSE --
     pub sse_active: usize,
@@ -118,11 +120,13 @@ impl MonitorSnapshot {
             syslog_tcp_connections: self.syslog_tcp_connections,
             wal_files: self.wal_files,
             wal_bytes: self.wal_bytes,
+            wal_measurement: self.wal_measurement,
             last_compaction_secs: self.last_compaction_secs,
             compaction_runs: self.compaction_runs,
             compaction_errors: self.compaction_errors,
             parquet_files: self.parquet_files,
             parquet_bytes: self.parquet_bytes,
+            parquet_measurement: self.parquet_measurement,
             sse_active: self.sse_active,
             sse_max: self.sse_max,
             scheduler_enabled: self.scheduler_enabled,
@@ -336,9 +340,11 @@ impl MonitorState {
                 (None, 0, 0)
             };
 
-        // WAL and parquet stats from cached gauge values.
-        let (wal_files, wal_bytes) = crate::metrics::cached_wal_stats();
-        let (parquet_files, parquet_bytes) = crate::metrics::cached_parquet_stats();
+        // These short cache reads assemble each count/bytes/status/age tuple.
+        // WAL configuredness comes from the same writer used by collection,
+        // including before the first stats-emitter tick or scrape.
+        let wal = crate::metrics::cached_wal_stats(self.state.ingest.wal_writer.is_some());
+        let parquet = crate::metrics::cached_parquet_stats();
 
         MonitorSnapshot {
             hostname: self.hostname.clone(),
@@ -368,13 +374,15 @@ impl MonitorState {
             syslog_parse_errors: syslog_parse,
             syslog_dropped: syslog_drop,
             syslog_tcp_connections: syslog_conns,
-            wal_files,
-            wal_bytes,
+            wal_files: wal.files,
+            wal_bytes: wal.bytes,
+            wal_measurement: wal.measurement,
             last_compaction_secs,
             compaction_runs,
             compaction_errors,
-            parquet_files,
-            parquet_bytes,
+            parquet_files: parquet.files,
+            parquet_bytes: parquet.bytes,
+            parquet_measurement: parquet.measurement,
             sse_active,
             sse_max: self.sse_max,
             scheduler_enabled: self.scheduler_enabled,

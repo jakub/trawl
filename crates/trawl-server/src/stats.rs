@@ -55,12 +55,23 @@ pub fn spawn_stats_emitter(
                         &sse_semaphore,
                         hot_buffer.as_ref(),
                     );
-                    crate::metrics::collect_gauges(
-                        hot_buffer.as_ref(),
-                        &fallback_glob,
-                        wal_dir.as_deref(),
-                        pool.retained(),
-                    );
+                    let hot_buffer = hot_buffer.clone();
+                    let fallback_glob = fallback_glob.clone();
+                    let wal_dir = wal_dir.clone();
+                    let retained_permits = pool.retained();
+                    // Storage scans and competing collection attempts can block.
+                    // Await completion so ticks never overlap and shutdown still
+                    // waits for the current collection before leaving the loop.
+                    tokio::task::spawn_blocking(move || {
+                        crate::metrics::collect_gauges(
+                            hot_buffer.as_ref(),
+                            &fallback_glob,
+                            wal_dir.as_deref(),
+                            retained_permits,
+                        );
+                    })
+                    .await
+                    .expect("stats gauge collection task failed");
                 }
                 _ = shutdown_rx.changed() => {
                     tracing::info!(

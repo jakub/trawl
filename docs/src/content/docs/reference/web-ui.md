@@ -262,16 +262,65 @@ the list to one net.
 
 ## Health
 
-`/settings/health` reports the server's state and checks. **Refresh** reloads
-health and capacity. **Refresh queries** reloads the query list. **Live operations**
-uses the dashboard stream shared with the status bar.
+`/settings/health` reports server checks, capacity, ingestion, storage, and
+queries. **Refresh** re-reads server health and capacity. **Refresh queries**
+re-reads Queries. The diagnostic cards receive the shell's shared dashboard
+stream; those buttons do not trigger a storage scan or open another stream.
 
 | Section | Permission | Contents |
 |---------|------------|----------|
-| Health | any signed-in key | Overall state, version, and each named check |
+| Server health | any signed-in key | Overall state, version, and each named check |
 | Capacity | `server_manage` | Uptime, queries since startup, active queries, executors available, and retained work |
-| Live operations | `server_manage` | A streamed snapshot: host, ingest rate, query rate, hot buffer events and memory, and executors occupied |
-| Queries | `query` | Running and recent queries with user, state, and elapsed time. **Cancel** stops one you may cancel |
+| Live operations | `server_manage` | Host, HTTP ingest rate, query rate, hot buffer events and memory, and executors occupied |
+| Ingestion | `server_manage` | HTTP rejected events, syslog configuration, transport receive counts, syslog rate, parse errors, backpressure drops, and active TCP connections |
+| Storage | `server_manage` | WAL and ingested Parquet totals with measurement status and age, successful compaction cycles, error tally, and last successful cycle age |
+| Queries | `query` | Running and recent queries with user, state, and elapsed time, plus authorized cancellation controls |
+
+Server health, Capacity, and Live operations precede Ingestion and Storage.
+Ingestion and Storage use two columns on wide screens and stack on narrow screens.
+Queries follows at full width.
+
+### Ingestion and compaction facts
+
+HTTP counts and rates exclude syslog. Cumulative ingestion and compaction
+counters are since process startup. **Syslog configuration** reports configured
+enablement, not listener health. **Disabled** hides the syslog readings;
+enabled but idle syslog shows zero readings. Transport receive counts do not
+prove that the messages reached persistent storage.
+
+WAL totals include active files and do not count only compaction-eligible work.
+Ingested Parquet totals exclude saved report files. **Successful compaction
+cycles** can include cycles with no eligible work. **Compaction error tally**
+includes failed cycles and loss/error tallies, can accompany successful cycles,
+and can exceed their count. These historical totals do not establish an active
+incident or a failure percentage.
+
+**Last successful cycle** displays `0s ago` when the reported age is zero.
+A missing age displays **No successful cycle reported since startup**.
+
+### Measurement status and stream freshness
+
+Storage displays **Not configured** for an absent optional source and
+**Awaiting measurement** before a configured source completes its first attempt.
+A complete scan displays its totals, including a measured zero. A failed scan
+shows the last complete totals and their sample age if a sample exists.
+Otherwise, it shows **Measurement unavailable; collection failed**.
+The precise wire contract is in the
+[dashboard API reference](/reference/api/#dashboard-snapshot).
+
+Sample age is relative to the displayed dashboard snapshot. The page does not
+advance that age with a client timer. Non-live stream labels appear beside both
+sections. **Waiting for first snapshot** has no fabricated readings.
+**Snapshot; waiting for live updates** identifies bootstrap data.
+**Stale; reconnecting** and **Live updates failed** retain available readings.
+**Forbidden** has no readings. An identity change clears the prior dashboard
+state and invalidates its pending callbacks.
+
+A live stream does not prove a recent disk measurement. Collection failure and
+stream failure are separate facts. The cards link to
+[ingestion guidance](/operate/ingestion/),
+[storage recovery](/architecture/recovery/), and
+[retention guidance](/operate/retention/).
 
 Retained work occupies executors and counts toward pool usage. A cancellation
 that reports no work cancelled means the query had already finished.

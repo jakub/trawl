@@ -345,9 +345,12 @@ fn render_data_pipeline(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, are
         None => "compacted: never".to_owned(),
     };
     let wal_line = format!(
-        " wal: {} files ({})  {}",
-        snapshot.wal_files,
-        format_bytes(snapshot.wal_bytes),
+        " wal: {}  {}",
+        storage_reading(
+            snapshot.wal_files,
+            snapshot.wal_bytes,
+            snapshot.wal_measurement
+        ),
         compacted_ago,
     );
     frame.render_widget(Paragraph::new(wal_line), wal_row);
@@ -358,13 +361,40 @@ fn render_data_pipeline(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, are
         String::new()
     };
     let parquet_line = format!(
-        " parquet: {} files ({})  runs: {}{}",
-        format_number(snapshot.parquet_files),
-        format_bytes(snapshot.parquet_bytes),
+        " parquet: {}  runs: {}{}",
+        storage_reading(
+            snapshot.parquet_files,
+            snapshot.parquet_bytes,
+            snapshot.parquet_measurement
+        ),
         format_number(snapshot.compaction_runs),
         errors_suffix,
     );
     frame.render_widget(Paragraph::new(parquet_line), parquet_row);
+}
+
+/// Keep status and snapshot sample age ahead of totals and compaction suffixes
+/// so the existing narrow panel cannot turn retained totals into fresh ones.
+fn storage_reading(files: u64, bytes: u64, measurement: trawl_api::StorageMeasurement) -> String {
+    use trawl_api::StorageMeasurementStatus as Status;
+    match (measurement.status, measurement.sample_age_secs) {
+        (Status::NotConfigured, _) => "not configured".into(),
+        (Status::NotSampled, _) => "awaiting measurement".into(),
+        (Status::Failed, None) => "failed; unavailable".into(),
+        (status, Some(age)) => {
+            let prefix = if status == Status::Failed {
+                "failed "
+            } else {
+                ""
+            };
+            format!(
+                "{prefix}age {age}s {}f/{}",
+                format_number(files),
+                format_bytes(bytes)
+            )
+        }
+        (Status::Complete, None) => "unavailable".into(),
+    }
 }
 
 /// SSE connections panel.
@@ -656,11 +686,19 @@ mod tests {
             syslog_tcp_connections: 2,
             wal_files: 12,
             wal_bytes: 4_404_019, // ~4.2 MB
+            wal_measurement: trawl_api::StorageMeasurement {
+                status: trawl_api::StorageMeasurementStatus::Complete,
+                sample_age_secs: Some(2),
+            },
             last_compaction_secs: Some(3),
             compaction_runs: 1247,
             compaction_errors: 0,
             parquet_files: 847,
             parquet_bytes: 13_312_000_000, // ~12.4 GB
+            parquet_measurement: trawl_api::StorageMeasurement {
+                status: trawl_api::StorageMeasurementStatus::Complete,
+                sample_age_secs: Some(2),
+            },
             sse_active: 2,
             sse_max: 32,
             scheduler_enabled: true,
@@ -702,6 +740,124 @@ mod tests {
                 running_ms: 1200,
             }],
         }
+    }
+
+    #[test]
+    fn storage_rows_show_availability_retained_totals_and_snapshot_age() {
+        use trawl_api::{StorageMeasurement, StorageMeasurementStatus as Status};
+        for (status, age, files, bytes, expected) in [
+            (Status::NotConfigured, None, 0, 0, "not configured"),
+            (Status::NotSampled, None, 0, 0, "awaiting measurement"),
+            (Status::Complete, Some(0), 0, 0, "age 0s 0f/0 B"),
+            (Status::Failed, None, 0, 0, "failed; unavailable"),
+            (Status::Failed, Some(120), 7, 91, "failed age 120s 7f/91 B"),
+        ] {
+            for (width, height) in [(60, 24), (80, 30), (120, 40)] {
+                let mut snapshot = test_snapshot();
+                let measurement = StorageMeasurement {
+                    status,
+                    sample_age_secs: age,
+                };
+                snapshot.wal_measurement = measurement;
+                snapshot.parquet_measurement = measurement;
+                snapshot.wal_files = files;
+                snapshot.parquet_files = files;
+                snapshot.wal_bytes = bytes;
+                snapshot.parquet_bytes = bytes;
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal
+                    .draw(|frame| {
+                        render_dashboard(
+                            &snapshot,
+                            frame,
+                            frame.area(),
+                            &DashboardOptions::default(),
+                        );
+                    })
+                    .unwrap();
+                let rendered = terminal.backend().to_string();
+                assert!(
+                    rendered.contains(&format!("wal: {expected}")),
+                    "{width}x{height}: {rendered}"
+                );
+                assert!(
+                    rendered.contains(&format!("parquet: {expected}")),
+                    "{width}x{height}: {rendered}"
+                );
+                if age.is_none() {
+                    assert!(
+                        !rendered.contains("0f/0 B"),
+                        "placeholders are not measured zero"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn storage_rows_keep_independent_source_states_and_totals() {
+        use trawl_api::{StorageMeasurement, StorageMeasurementStatus as Status};
+        let mut snapshot = test_snapshot();
+        snapshot.wal_measurement = StorageMeasurement {
+            status: Status::Failed,
+            sample_age_secs: Some(120),
+        };
+        snapshot.wal_files = 7;
+        snapshot.wal_bytes = 91;
+        snapshot.parquet_measurement = StorageMeasurement {
+            status: Status::Complete,
+            sample_age_secs: Some(3),
+        };
+        snapshot.parquet_files = 8;
+        snapshot.parquet_bytes = 72;
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_dashboard(&snapshot, frame, frame.area(), &DashboardOptions::default());
+            })
+            .unwrap();
+        let rendered = terminal.backend().to_string();
+        assert!(
+            rendered.contains("wal: failed age 120s 7f/91 B"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("parquet: age 3s 8f/72 B"), "{rendered}");
+    }
+
+    #[test]
+    fn large_storage_totals_clip_after_status_and_age_at_60_columns() {
+        use trawl_api::{StorageMeasurement, StorageMeasurementStatus as Status};
+        let mut snapshot = test_snapshot();
+        let measurement = StorageMeasurement {
+            status: Status::Failed,
+            sample_age_secs: Some(123_456_789),
+        };
+        snapshot.wal_measurement = measurement;
+        snapshot.parquet_measurement = measurement;
+        snapshot.wal_files = u64::MAX;
+        snapshot.parquet_files = u64::MAX;
+        snapshot.wal_bytes = u64::MAX;
+        snapshot.parquet_bytes = u64::MAX;
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_dashboard(&snapshot, frame, frame.area(), &DashboardOptions::default());
+            })
+            .unwrap();
+        let rendered = terminal.backend().to_string();
+        assert!(
+            rendered.contains("wal: failed age 123456789s"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("parquet: failed age 123456789s"),
+            "{rendered}"
+        );
+        let full = storage_reading(u64::MAX, u64::MAX, measurement);
+        assert!(
+            !rendered.contains(&full),
+            "large totals should exceed the existing narrow panel"
+        );
     }
 
     #[test]

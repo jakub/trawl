@@ -321,8 +321,14 @@ pub fn describe_metrics() {
         "Executor-pool permits held by query work whose request already \
          answered (a subset of the permits in use)"
     );
-    describe_gauge!(PARQUET_FILES, "Total number of parquet data files");
-    describe_gauge!(PARQUET_BYTES, "Total byte size of parquet data files");
+    describe_gauge!(
+        PARQUET_FILES,
+        "Ingested Parquet file count from the last complete measurement, excluding saved reports. Retained after collection failure."
+    );
+    describe_gauge!(
+        PARQUET_BYTES,
+        "Ingested Parquet bytes from the last complete measurement, excluding saved reports. Retained after collection failure."
+    );
     describe_gauge!(
         HEALTH_CHECK,
         "Subsystem health (1 = ok, 0 = failed), labeled by subsystem"
@@ -363,8 +369,14 @@ pub fn describe_metrics() {
         SYSLOG_TCP_CONNECTIONS,
         "Current active syslog TCP connections"
     );
-    describe_gauge!(WAL_FILES, "Number of pending WAL (ndjson) files");
-    describe_gauge!(WAL_BYTES, "Total byte size of pending WAL files");
+    describe_gauge!(
+        WAL_FILES,
+        "WAL ndjson file count from the last complete measurement, including active files. Retained after collection failure."
+    );
+    describe_gauge!(
+        WAL_BYTES,
+        "WAL ndjson bytes from the last complete measurement, including active files. Retained after collection failure."
+    );
     describe_counter!(
         CATALOG_CONFLICTS_TOTAL,
         "Field-catalog type conflicts recorded at compaction (a batch column \
@@ -605,33 +617,123 @@ fn bounded_label(admitted: &mut HashSet<String>, service: &str, cap: usize) -> S
 
 // -- gauge collection --------------------------------------------------------
 
-/// TTL for the parquet stats cache. At most one filesystem walk per this interval,
-/// regardless of scrape frequency or stats emitter cadence.
-const PARQUET_CACHE_TTL_SECS: u64 = 30;
+/// Preserve the existing storage collection cadence, including failed attempts.
+const STORAGE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Cached parquet file statistics to avoid repeated filesystem walks.
-struct CachedParquetStats {
-    file_count: u64,
-    total_bytes: u64,
-    /// `None` means never cached — first call always triggers a walk.
-    last_updated: Option<Instant>,
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct StorageTotals {
+    files: u64,
+    bytes: u64,
 }
 
-/// Module-level cache for parquet gauge values.
-fn parquet_cache() -> &'static Mutex<CachedParquetStats> {
-    static CACHE: OnceLock<Mutex<CachedParquetStats>> = OnceLock::new();
-    CACHE.get_or_init(|| {
-        Mutex::new(CachedParquetStats {
-            file_count: 0,
-            total_bytes: 0,
-            last_updated: None,
-        })
-    })
+#[derive(Clone, Copy)]
+struct CompleteStorageSample {
+    totals: StorageTotals,
+    completed_at: Instant,
+}
+
+#[derive(Default)]
+struct StorageState {
+    complete: Option<CompleteStorageSample>,
+    /// Completion of any attempt throttles retries independently of sample age.
+    attempt_finished_at: Option<Instant>,
+    failed: bool,
+}
+
+/// One source's attempts and gauge publication share ownership. Dashboard reads
+/// only lock `state`, which is never held over a scan or gauge publication.
+#[derive(Default)]
+struct StorageCache {
+    attempt: Mutex<()>,
+    state: Mutex<StorageState>,
+}
+
+/// A coherent view assembled under one short cache lock.
+pub(crate) struct StorageSnapshot {
+    pub files: u64,
+    pub bytes: u64,
+    pub measurement: trawl_api::StorageMeasurement,
+}
+
+impl StorageCache {
+    fn snapshot(&self, configured: bool, now: Instant) -> StorageSnapshot {
+        use trawl_api::StorageMeasurementStatus as Status;
+        let state = self.state.lock().expect("storage cache poisoned");
+        let (status, sample) = if !configured {
+            (Status::NotConfigured, None)
+        } else if state.failed {
+            (Status::Failed, state.complete)
+        } else if state.complete.is_some() {
+            (Status::Complete, state.complete)
+        } else {
+            (Status::NotSampled, None)
+        };
+        let totals = sample.map_or_else(StorageTotals::default, |s| s.totals);
+        StorageSnapshot {
+            files: totals.files,
+            bytes: totals.bytes,
+            measurement: trawl_api::StorageMeasurement {
+                status,
+                sample_age_secs: sample
+                    .map(|s| now.saturating_duration_since(s.completed_at).as_secs()),
+            },
+        }
+    }
+
+    /// `clock`, `scan`, and `publish` are instance-scoped seams: tests control
+    /// completion times, filesystem failures, and publication barriers without
+    /// changing process-global caches or the metrics recorder.
+    fn collect(
+        &self,
+        clock: impl Fn() -> Instant,
+        scan: impl FnOnce() -> std::io::Result<StorageTotals>,
+        mut publish: impl FnMut(StorageTotals),
+    ) {
+        let _owner = self.attempt.lock().expect("storage attempt poisoned");
+        // Recheck after ownership: another emitter or scrape may have finished
+        // while this caller waited. Never publish gauges outside this owner.
+        let due = {
+            let state = self.state.lock().expect("storage cache poisoned");
+            state
+                .attempt_finished_at
+                .is_none_or(|at| clock().saturating_duration_since(at) >= STORAGE_CACHE_TTL)
+        };
+        if due {
+            let result = scan();
+            let completed_at = clock();
+            let mut state = self.state.lock().expect("storage cache poisoned");
+            state.attempt_finished_at = Some(completed_at);
+            state.failed = result.is_err();
+            if let Ok(totals) = result {
+                state.complete = Some(CompleteStorageSample {
+                    totals,
+                    completed_at,
+                });
+            }
+        }
+        let sample = self.state.lock().expect("storage cache poisoned").complete;
+        if let Some(sample) = sample {
+            // No first-success sample means no invented numeric gauge. A failed
+            // attempt retains complete totals, including genuinely measured zero.
+            publish(sample.totals);
+        }
+    }
+}
+
+fn parquet_cache() -> &'static StorageCache {
+    static CACHE: OnceLock<StorageCache> = OnceLock::new();
+    CACHE.get_or_init(StorageCache::default)
+}
+
+fn wal_cache() -> &'static StorageCache {
+    static CACHE: OnceLock<StorageCache> = OnceLock::new();
+    CACHE.get_or_init(StorageCache::default)
 }
 
 /// Update gauges that require periodic polling (hot buffer + parquet + WAL files).
 ///
-/// Cheap enough to call on every prometheus scrape and in the stats emitter.
+/// Called by Prometheus scrapes and the stats emitter. Filesystem scans and
+/// competing attempts may block; dashboard readers only read the short cache.
 #[allow(clippy::cast_precision_loss)] // gauge values are f64; precision loss beyond 2^52 is fine
 pub fn collect_gauges(
     hot_buffer: Option<&Arc<HotBuffer>>,
@@ -639,10 +741,8 @@ pub fn collect_gauges(
     wal_dir: Option<&Path>,
     retained_permits: usize,
 ) {
-    // The caller reads the pool on its own thread and passes the number
-    // in: this function runs on the blocking pool and holds no server
-    // state, which is what keeps a filesystem walk off the reactor
-    // without dragging a lock across it.
+    // Callers snapshot the pool count before collection. No pool registry lock
+    // travels with this number through a storage scan or attempt-owner wait.
     metrics::gauge!(QUERY_PERMITS_RETAINED).set(retained_permits as f64);
 
     if let Some(buf) = hot_buffer {
@@ -658,55 +758,24 @@ pub fn collect_gauges(
     }
 }
 
-/// Scan parquet files on disk and update the file count / byte size gauges.
-///
-/// Uses a 30s TTL cache to avoid repeated filesystem walks. If the cache is
-/// fresh, sets gauges from cached values and returns immediately.
-#[allow(clippy::cast_precision_loss)]
+/// Collect the ingested Parquet totals with the shared attempt/cache policy.
 fn collect_parquet_gauges(fallback_glob: &str) {
-    let cache = parquet_cache();
-
-    // Fast path: serve from cache if fresh.
-    {
-        let cached = cache.lock().expect("parquet cache poisoned");
-        let is_fresh = cached
-            .last_updated
-            .is_some_and(|t| t.elapsed().as_secs() < PARQUET_CACHE_TTL_SECS);
-        if is_fresh {
-            metrics::gauge!(PARQUET_FILES).set(cached.file_count as f64);
-            metrics::gauge!(PARQUET_BYTES).set(cached.total_bytes as f64);
-            return;
-        }
-    }
-
-    // The fallback glob looks like "/path/to/data/**/*.parquet". Extract the
-    // base directory (everything before the first glob wildcard).
+    // Preserve the fallback glob's existing root selection.
     let base = fallback_glob
         .find('*')
         .map_or(fallback_glob, |pos| &fallback_glob[..pos]);
-    let base = Path::new(base.trim_end_matches('/'));
-
-    if !base.is_dir() {
-        return;
-    }
-
-    let mut file_count: u64 = 0;
-    let mut total_bytes: u64 = 0;
-
-    if let Ok(entries) = walk_parquet_files(base) {
-        for (_, size) in entries {
-            file_count += 1;
-            total_bytes += size;
-        }
-    }
-
-    metrics::gauge!(PARQUET_FILES).set(file_count as f64);
-    metrics::gauge!(PARQUET_BYTES).set(total_bytes as f64);
-
-    let mut cached = cache.lock().expect("parquet cache poisoned");
-    cached.file_count = file_count;
-    cached.total_bytes = total_bytes;
-    cached.last_updated = Some(Instant::now());
+    // Preserve `/` itself rather than turning an absolute root into an empty path.
+    let trimmed = base.trim_end_matches('/');
+    let base = Path::new(if trimmed.is_empty() && base.starts_with('/') {
+        "/"
+    } else {
+        trimmed
+    });
+    parquet_cache().collect(
+        Instant::now,
+        || scan_storage(base, StorageKind::Parquet),
+        |totals| publish_storage_gauges(StorageKind::Parquet, totals),
+    );
 }
 
 /// One walked `.parquet` file and its size on disk.
@@ -783,108 +852,148 @@ fn walk_dir_recursive(dir: &Path, results: &mut Vec<ParquetEntry>, errors: &mut 
     }
 }
 
-// -- WAL gauge collection ----------------------------------------------------
+// -- storage measurement walking --------------------------------------------
 
-/// TTL for the WAL stats cache (same cadence as parquet).
-const WAL_CACHE_TTL_SECS: u64 = 30;
-
-/// Cached WAL file statistics.
-struct CachedWalStats {
-    file_count: u64,
-    total_bytes: u64,
-    last_updated: Option<Instant>,
+#[derive(Clone, Copy)]
+enum StorageKind {
+    Wal,
+    Parquet,
 }
 
-/// Module-level cache for WAL gauge values.
-fn wal_cache() -> &'static Mutex<CachedWalStats> {
-    static CACHE: OnceLock<Mutex<CachedWalStats>> = OnceLock::new();
-    CACHE.get_or_init(|| {
-        Mutex::new(CachedWalStats {
-            file_count: 0,
-            total_bytes: 0,
-            last_updated: None,
-        })
-    })
-}
-
-/// Recursively tally `.ndjson` files under `dir` into `file_count`/`total_bytes`.
-///
-/// Recursive by necessity: WAL files live one level down in `wal_dir/{env}/`
-/// (ADR-0009), so a flat scan of `wal_dir` sees only directories and reports
-/// 0/0 forever — blinding the operator's only stalled-compaction signal.
-/// Unreadable directories and entries are skipped rather than aborting the
-/// walk, so one bad env still yields the rest of the fleet's numbers.
-fn walk_wal_files(dir: &Path, file_count: &mut u64, total_bytes: &mut u64) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-
-    for entry in entries.filter_map(Result::ok) {
-        let Ok(ft) = entry.file_type() else { continue };
-        if ft.is_dir() {
-            walk_wal_files(&entry.path(), file_count, total_bytes);
-        } else if ft.is_file() && entry.path().extension().is_some_and(|ext| ext == "ndjson") {
-            *file_count += 1;
-            if let Ok(meta) = entry.metadata() {
-                *total_bytes += meta.len();
+impl StorageKind {
+    fn selected(self, path: &Path) -> bool {
+        path.extension().is_some_and(|ext| {
+            ext == match self {
+                Self::Wal => "ndjson",
+                Self::Parquet => "parquet",
             }
-        }
+        })
+    }
+
+    fn excluded_dir(self, path: &Path) -> bool {
+        matches!(self, Self::Parquet) && path.file_name().is_some_and(|name| name == "scheduled")
     }
 }
 
-/// Scan WAL directory for `.ndjson` files and update gauge metrics.
-///
-/// Uses a 30s TTL cache to avoid repeated directory scans.
-#[allow(clippy::cast_precision_loss)]
+/// Operations at which tests can inject faults or remove real descendants.
+/// Production still uses the same filesystem calls and error policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StorageWalkOp {
+    ReadDir,
+    Entry,
+    FileType,
+    Metadata,
+    ConfirmAbsent,
+    CompleteRoot,
+}
+
+fn scan_storage(root: &Path, kind: StorageKind) -> std::io::Result<StorageTotals> {
+    scan_storage_with(root, kind, &mut |_, _| Ok(()))
+}
+
+fn scan_storage_with(
+    root: &Path,
+    kind: StorageKind,
+    before: &mut impl FnMut(StorageWalkOp, &Path) -> std::io::Result<()>,
+) -> std::io::Result<StorageTotals> {
+    let totals = scan_storage_dir(root, root, kind, before)?;
+    // Even a successful empty traversal must finish with an enumerable root.
+    // Consume entries as read_dir can succeed and subsequently yield an error.
+    before(StorageWalkOp::CompleteRoot, root)?;
+    for entry in std::fs::read_dir(root)? {
+        before(StorageWalkOp::Entry, root)?;
+        entry?;
+    }
+    Ok(totals)
+}
+
+fn confirmed_absent(
+    root: &Path,
+    path: &Path,
+    error: &std::io::Error,
+    before: &mut impl FnMut(StorageWalkOp, &Path) -> std::io::Result<()>,
+) -> bool {
+    path != root
+        && error.kind() == std::io::ErrorKind::NotFound
+        && before(StorageWalkOp::ConfirmAbsent, path)
+            .and_then(|()| std::fs::symlink_metadata(path))
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+}
+
+fn scan_storage_dir(
+    root: &Path,
+    dir: &Path,
+    kind: StorageKind,
+    before: &mut impl FnMut(StorageWalkOp, &Path) -> std::io::Result<()>,
+) -> std::io::Result<StorageTotals> {
+    let entries = match before(StorageWalkOp::ReadDir, dir).and_then(|()| std::fs::read_dir(dir)) {
+        Ok(entries) => entries,
+        Err(error) if confirmed_absent(root, dir, &error, before) => {
+            return Ok(StorageTotals::default());
+        }
+        Err(error) => return Err(error),
+    };
+    let mut totals = StorageTotals::default();
+    for entry in entries {
+        // An iterator failure has no trustworthy descendant path. Never excuse
+        // it as a disappearing file, even when its error kind is NotFound.
+        before(StorageWalkOp::Entry, dir)?;
+        let entry = entry?;
+        let path = entry.path();
+        let file_type =
+            match before(StorageWalkOp::FileType, &path).and_then(|()| entry.file_type()) {
+                Ok(file_type) => file_type,
+                Err(error) if confirmed_absent(root, &path, &error, before) => continue,
+                Err(error) => return Err(error),
+            };
+        if file_type.is_dir() && !kind.excluded_dir(&path) {
+            let child = scan_storage_dir(root, &path, kind, before)?;
+            totals.files += child.files;
+            totals.bytes += child.bytes;
+        } else if file_type.is_file() && kind.selected(&path) {
+            let metadata =
+                match before(StorageWalkOp::Metadata, &path).and_then(|()| entry.metadata()) {
+                    Ok(metadata) => metadata,
+                    Err(error) if confirmed_absent(root, &path, &error, before) => continue,
+                    Err(error) => return Err(error),
+                };
+            totals.files += 1;
+            totals.bytes += metadata.len();
+        }
+    }
+    Ok(totals)
+}
+
+/// WAL and Parquet use separate owners, but the same invariant implementation.
 fn collect_wal_gauges(wal_dir: &Path) {
-    let cache = wal_cache();
-
-    // Fast path: serve from cache if fresh.
-    {
-        let cached = cache.lock().expect("wal cache poisoned");
-        let is_fresh = cached
-            .last_updated
-            .is_some_and(|t| t.elapsed().as_secs() < WAL_CACHE_TTL_SECS);
-        if is_fresh {
-            metrics::gauge!(WAL_FILES).set(cached.file_count as f64);
-            metrics::gauge!(WAL_BYTES).set(cached.total_bytes as f64);
-            return;
-        }
-    }
-
-    if !wal_dir.is_dir() {
-        return;
-    }
-
-    let mut file_count: u64 = 0;
-    let mut total_bytes: u64 = 0;
-
-    walk_wal_files(wal_dir, &mut file_count, &mut total_bytes);
-
-    metrics::gauge!(WAL_FILES).set(file_count as f64);
-    metrics::gauge!(WAL_BYTES).set(total_bytes as f64);
-
-    let mut cached = cache.lock().expect("wal cache poisoned");
-    cached.file_count = file_count;
-    cached.total_bytes = total_bytes;
-    cached.last_updated = Some(Instant::now());
+    wal_cache().collect(
+        Instant::now,
+        || scan_storage(wal_dir, StorageKind::Wal),
+        |totals| publish_storage_gauges(StorageKind::Wal, totals),
+    );
 }
 
-// -- public cache accessors (for dashboard monitor) --------------------------
-
-/// Read the cached WAL file stats. Returns `(file_count, total_bytes)`.
-///
-/// Returns `(0, 0)` if the cache has never been populated (no prometheus
-/// scrape or stats-emit has run yet).
-pub fn cached_wal_stats() -> (u64, u64) {
-    let cached = wal_cache().lock().expect("wal cache poisoned");
-    (cached.file_count, cached.total_bytes)
+/// Called only while the source's attempt owner is held, for both cache hits
+/// and fresh attempts. Dashboard-only availability is not exported as gauges.
+#[allow(clippy::cast_precision_loss)]
+fn publish_storage_gauges(kind: StorageKind, totals: StorageTotals) {
+    let (files, bytes) = match kind {
+        StorageKind::Wal => (WAL_FILES, WAL_BYTES),
+        StorageKind::Parquet => (PARQUET_FILES, PARQUET_BYTES),
+    };
+    metrics::gauge!(files).set(totals.files as f64);
+    metrics::gauge!(bytes).set(totals.bytes as f64);
 }
 
-/// Read the cached parquet file stats. Returns `(file_count, total_bytes)`.
-pub fn cached_parquet_stats() -> (u64, u64) {
-    let cached = parquet_cache().lock().expect("parquet cache poisoned");
-    (cached.file_count, cached.total_bytes)
+/// Read a coherent WAL tuple, using actual writer presence even before collection.
+pub(crate) fn cached_wal_stats(configured: bool) -> StorageSnapshot {
+    wal_cache().snapshot(configured, Instant::now())
+}
+
+/// The fallback archive is configured even on a query-only cold start. An absent
+/// directory is a failed measurement, never a measured empty directory.
+pub(crate) fn cached_parquet_stats() -> StorageSnapshot {
+    parquet_cache().snapshot(true, Instant::now())
 }
 
 #[cfg(test)]
@@ -905,6 +1014,523 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn io_failure() -> std::io::Error {
+        std::io::Error::other("injected storage failure")
+    }
+
+    fn assert_storage(
+        cache: &StorageCache,
+        now: Instant,
+        status: trawl_api::StorageMeasurementStatus,
+        totals: StorageTotals,
+        age: Option<u64>,
+    ) {
+        let snapshot = cache.snapshot(true, now);
+        assert_eq!(
+            (snapshot.files, snapshot.bytes),
+            (totals.files, totals.bytes)
+        );
+        assert_eq!(snapshot.measurement.status, status);
+        assert_eq!(snapshot.measurement.sample_age_secs, age);
+    }
+
+    #[test]
+    fn storage_attempts_retain_samples_and_throttle_failures_separately() {
+        use std::time::Duration;
+        use trawl_api::StorageMeasurementStatus as Status;
+        let cache = StorageCache::default();
+        let start = Instant::now();
+        let empty = StorageTotals::default();
+        let totals = StorageTotals {
+            files: 2,
+            bytes: 17,
+        };
+        let absent = cache.snapshot(false, start);
+        assert_eq!(absent.measurement.status, Status::NotConfigured);
+        assert_eq!(absent.measurement.sample_age_secs, None);
+        assert_eq!((absent.files, absent.bytes), (0, 0));
+        assert_storage(&cache, start, Status::NotSampled, empty, None);
+        cache.collect(
+            || start,
+            || Err(io_failure()),
+            |_| panic!("no sample to publish"),
+        );
+        assert_storage(&cache, start, Status::Failed, empty, None);
+        cache.collect(
+            || start + Duration::from_secs(29),
+            || panic!("failure retry too soon"),
+            |_| panic!("invented zero"),
+        );
+        let completed = start + Duration::from_secs(30);
+        cache.collect(
+            || completed,
+            || Ok(totals),
+            |sample| assert_eq!(sample, totals),
+        );
+        assert_storage(&cache, completed, Status::Complete, totals, Some(0));
+        let failed = completed + Duration::from_secs(30);
+        cache.collect(
+            || failed,
+            || Err(io_failure()),
+            |sample| assert_eq!(sample, totals),
+        );
+        assert_storage(&cache, failed, Status::Failed, totals, Some(30));
+        cache.collect(
+            || failed + Duration::from_secs(29),
+            || panic!("last success must not control retries"),
+            |sample| assert_eq!(sample, totals),
+        );
+        assert_storage(
+            &cache,
+            failed + Duration::from_secs(29),
+            Status::Failed,
+            totals,
+            Some(59),
+        );
+        let recovered = failed + Duration::from_secs(30);
+        cache.collect(
+            || recovered,
+            || Ok(empty),
+            |sample| assert_eq!(sample, empty),
+        );
+        assert_storage(&cache, recovered, Status::Complete, empty, Some(0));
+    }
+
+    #[test]
+    fn storage_age_and_retry_start_at_scan_completion() {
+        use std::{cell::Cell, time::Duration};
+        let cache = StorageCache::default();
+        let start = Instant::now();
+        let now = Cell::new(start);
+        cache.collect(
+            || now.get(),
+            || {
+                now.set(start + Duration::from_secs(80));
+                Ok(StorageTotals::default())
+            },
+            |_| {},
+        );
+        assert_storage(
+            &cache,
+            now.get(),
+            trawl_api::StorageMeasurementStatus::Complete,
+            StorageTotals::default(),
+            Some(0),
+        );
+        cache.collect(
+            || start + Duration::from_secs(109),
+            || panic!("completion controls TTL"),
+            |_| {},
+        );
+    }
+
+    #[test]
+    fn storage_readers_do_not_wait_for_scans_and_waiters_recheck_due() {
+        use std::sync::mpsc;
+        let cache = Arc::new(StorageCache::default());
+        let start = Instant::now();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let first = cache.clone();
+        let thread = std::thread::spawn(move || {
+            first.collect(
+                || start,
+                || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(StorageTotals {
+                        files: 4,
+                        bytes: 44,
+                    })
+                },
+                |_| {},
+            );
+        });
+        entered_rx.recv().unwrap();
+        assert_storage(
+            &cache,
+            start,
+            trawl_api::StorageMeasurementStatus::NotSampled,
+            StorageTotals::default(),
+            None,
+        );
+        assert!(cache.attempt.try_lock().is_err(), "scan owns attempt mutex");
+        let second = cache.clone();
+        let (waiting_tx, waiting_rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            waiting_tx.send(()).unwrap();
+            second.collect(
+                || start,
+                || panic!("waiter must recheck due"),
+                |sample| assert_eq!(sample.files, 4),
+            );
+        });
+        waiting_rx.recv().unwrap();
+        release_tx.send(()).unwrap();
+        thread.join().unwrap();
+        waiter.join().unwrap();
+        assert_storage(
+            &cache,
+            start,
+            trawl_api::StorageMeasurementStatus::Complete,
+            StorageTotals {
+                files: 4,
+                bytes: 44,
+            },
+            Some(0),
+        );
+    }
+
+    #[test]
+    fn storage_gauge_publication_remains_inside_attempt_ownership() {
+        use std::{sync::mpsc, time::Duration};
+        let cache = Arc::new(StorageCache::default());
+        let start = Instant::now();
+        let published = Arc::new(Mutex::new(Vec::new()));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let first = cache.clone();
+        let values = published.clone();
+        let thread = std::thread::spawn(move || {
+            first.collect(
+                || start,
+                || {
+                    Ok(StorageTotals {
+                        files: 1,
+                        bytes: 10,
+                    })
+                },
+                |totals| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    values.lock().unwrap().push(totals.files);
+                },
+            );
+        });
+        entered_rx.recv().unwrap();
+        assert!(
+            cache.attempt.try_lock().is_err(),
+            "publication must retain ownership"
+        );
+        assert_eq!(
+            cache.snapshot(true, start).files,
+            1,
+            "cache reads remain available during publication"
+        );
+        let second = cache.clone();
+        let values = published.clone();
+        let waiter = std::thread::spawn(move || {
+            second.collect(
+                || start + Duration::from_secs(31),
+                || {
+                    Ok(StorageTotals {
+                        files: 2,
+                        bytes: 20,
+                    })
+                },
+                |totals| values.lock().unwrap().push(totals.files),
+            );
+        });
+        release_tx.send(()).unwrap();
+        thread.join().unwrap();
+        waiter.join().unwrap();
+        assert_eq!(*published.lock().unwrap(), [1, 2]);
+        assert_eq!(
+            cache.snapshot(true, start + Duration::from_secs(31)).files,
+            2
+        );
+    }
+
+    #[test]
+    fn storage_prometheus_gauges_require_success_and_retain_complete_totals() {
+        use std::time::Duration;
+        for kind in [StorageKind::Wal, StorageKind::Parquet] {
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let handle = recorder.handle();
+            let cache = StorageCache::default();
+            let now = Instant::now();
+            let (files, bytes) = match kind {
+                StorageKind::Wal => (WAL_FILES, WAL_BYTES),
+                StorageKind::Parquet => (PARQUET_FILES, PARQUET_BYTES),
+            };
+            metrics::with_local_recorder(&recorder, || {
+                cache.collect(
+                    || now,
+                    || Err(io_failure()),
+                    |totals| publish_storage_gauges(kind, totals),
+                );
+                assert!(!handle.render().contains(files));
+                cache.collect(
+                    || now + Duration::from_secs(30),
+                    || {
+                        Ok(StorageTotals {
+                            files: 3,
+                            bytes: 19,
+                        })
+                    },
+                    |totals| publish_storage_gauges(kind, totals),
+                );
+                cache.collect(
+                    || now + Duration::from_secs(60),
+                    || Err(io_failure()),
+                    |totals| publish_storage_gauges(kind, totals),
+                );
+                let output = handle.render();
+                assert!(output.contains(&format!("{files} 3\n")), "{output}");
+                assert!(output.contains(&format!("{bytes} 19\n")), "{output}");
+                cache.collect(
+                    || now + Duration::from_secs(90),
+                    || Ok(StorageTotals::default()),
+                    |totals| publish_storage_gauges(kind, totals),
+                );
+                assert!(handle.render().contains(&format!("{files} 0\n")));
+            });
+        }
+    }
+
+    #[test]
+    fn storage_walk_empty_selection_and_missing_roots() {
+        for (kind, extension) in [
+            (StorageKind::Wal, "ndjson"),
+            (StorageKind::Parquet, "parquet"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            assert_eq!(
+                scan_storage(tmp.path(), kind).unwrap(),
+                StorageTotals::default()
+            );
+            let env = tmp.path().join("prod");
+            std::fs::create_dir(&env).unwrap();
+            std::fs::write(env.join(format!("selected.{extension}")), "123").unwrap();
+            std::fs::write(env.join("ignored.tmp"), "12345").unwrap();
+            assert_eq!(
+                scan_storage(tmp.path(), kind).unwrap(),
+                StorageTotals { files: 1, bytes: 3 }
+            );
+            let absent = tmp.path().join("query-only-archive-not-created");
+            assert!(scan_storage(&absent, kind).is_err());
+            let file = env.join(format!("selected.{extension}"));
+            assert!(scan_storage(&file, kind).is_err());
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("scheduled")).unwrap();
+        std::fs::write(tmp.path().join("scheduled/report.parquet"), "123").unwrap();
+        assert_eq!(
+            scan_storage(tmp.path(), StorageKind::Parquet).unwrap(),
+            StorageTotals::default()
+        );
+    }
+
+    #[test]
+    fn storage_walk_rejects_coverage_errors_without_replacing_complete_sample() {
+        use std::time::Duration;
+        for (kind, extension) in [
+            (StorageKind::Wal, "ndjson"),
+            (StorageKind::Parquet, "parquet"),
+        ] {
+            for operation in [
+                StorageWalkOp::ReadDir,
+                StorageWalkOp::Entry,
+                StorageWalkOp::FileType,
+                StorageWalkOp::Metadata,
+                StorageWalkOp::CompleteRoot,
+            ] {
+                let tmp = tempfile::tempdir().unwrap();
+                let nested = tmp.path().join("prod");
+                std::fs::create_dir(&nested).unwrap();
+                std::fs::write(nested.join(format!("events.{extension}")), "12345").unwrap();
+                let cache = StorageCache::default();
+                let now = Instant::now();
+                cache.collect(|| now, || scan_storage(tmp.path(), kind), |_| {});
+                cache.collect(
+                    || now + Duration::from_secs(30),
+                    || {
+                        scan_storage_with(tmp.path(), kind, &mut |op, path| {
+                            if op == operation && (op != StorageWalkOp::ReadDir || path == nested) {
+                                Err(io_failure())
+                            } else {
+                                Ok(())
+                            }
+                        })
+                    },
+                    |totals| assert_eq!(totals, StorageTotals { files: 1, bytes: 5 }),
+                );
+                assert_storage(
+                    &cache,
+                    now + Duration::from_secs(30),
+                    trawl_api::StorageMeasurementStatus::Failed,
+                    StorageTotals { files: 1, bytes: 5 },
+                    Some(30),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn storage_walk_only_skips_confirmed_absent_descendants() {
+        for (kind, extension) in [
+            (StorageKind::Wal, "ndjson"),
+            (StorageKind::Parquet, "parquet"),
+        ] {
+            for operation in [
+                StorageWalkOp::ReadDir,
+                StorageWalkOp::FileType,
+                StorageWalkOp::Metadata,
+            ] {
+                let tmp = tempfile::tempdir().unwrap();
+                let nested = tmp.path().join("prod");
+                std::fs::create_dir(&nested).unwrap();
+                let file = nested.join(format!("events.{extension}"));
+                std::fs::write(&file, "123").unwrap();
+                let target = if operation == StorageWalkOp::ReadDir {
+                    &nested
+                } else {
+                    &file
+                };
+                let totals = scan_storage_with(tmp.path(), kind, &mut |op, path| {
+                    if op == operation && path == target {
+                        if path.is_dir() {
+                            std::fs::remove_dir_all(path)?;
+                        } else {
+                            std::fs::remove_file(path)?;
+                        }
+                        return Err(std::io::ErrorKind::NotFound.into());
+                    }
+                    Ok(())
+                })
+                .unwrap();
+                assert_eq!(totals, StorageTotals::default());
+            }
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join(format!("events.{extension}")), "123").unwrap();
+            for operation in [
+                StorageWalkOp::Entry,
+                StorageWalkOp::FileType,
+                StorageWalkOp::Metadata,
+            ] {
+                assert!(
+                    scan_storage_with(tmp.path(), kind, &mut |op, _| {
+                        if op == operation {
+                            Err(std::io::ErrorKind::NotFound.into())
+                        } else {
+                            Ok(())
+                        }
+                    })
+                    .is_err(),
+                    "NotFound alone is not confirmed absence"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn storage_walk_rejects_root_removed_at_completion_and_recovers() {
+        for kind in [StorageKind::Wal, StorageKind::Parquet] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("archive");
+            std::fs::create_dir(&root).unwrap();
+            assert!(
+                scan_storage_with(&root, kind, &mut |operation, path| {
+                    if operation == StorageWalkOp::CompleteRoot {
+                        std::fs::remove_dir(path)?;
+                    }
+                    Ok(())
+                })
+                .is_err()
+            );
+            std::fs::create_dir(&root).unwrap();
+            assert_eq!(scan_storage(&root, kind).unwrap(), StorageTotals::default());
+        }
+    }
+
+    #[test]
+    fn query_only_boot_acceptance_is_not_a_complete_empty_measurement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("archive");
+        crate::epoch::ensure_current_epoch(&root, &tmp.path().join("wal"), false).unwrap();
+        let cache = StorageCache::default();
+        let now = Instant::now();
+        cache.collect(
+            || now,
+            || scan_storage(&root, StorageKind::Parquet),
+            |_| panic!("absent archive was not measured"),
+        );
+        assert_storage(
+            &cache,
+            now,
+            trawl_api::StorageMeasurementStatus::Failed,
+            StorageTotals::default(),
+            None,
+        );
+        assert_eq!(
+            cache.snapshot(false, now).measurement.status,
+            trawl_api::StorageMeasurementStatus::NotConfigured
+        );
+    }
+
+    #[test]
+    fn anonymous_entry_failure_after_partial_progress_rejects_the_attempt() {
+        for (kind, extension) in [
+            (StorageKind::Wal, "ndjson"),
+            (StorageKind::Parquet, "parquet"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            for name in ["one", "two"] {
+                std::fs::write(tmp.path().join(format!("{name}.{extension}")), "123").unwrap();
+            }
+            let mut entries = 0;
+            let mut measured = 0;
+            let result = scan_storage_with(tmp.path(), kind, &mut |operation, _| {
+                if operation == StorageWalkOp::Metadata {
+                    measured += 1;
+                }
+                if operation == StorageWalkOp::Entry {
+                    entries += 1;
+                    if entries == 2 {
+                        return Err(std::io::ErrorKind::NotFound.into());
+                    }
+                }
+                Ok(())
+            });
+            assert_eq!(measured, 1, "one file was already counted");
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn absence_confirmation_errors_and_completion_entry_errors_fail() {
+        for (kind, extension) in [
+            (StorageKind::Wal, "ndjson"),
+            (StorageKind::Parquet, "parquet"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join(format!("one.{extension}")), "123").unwrap();
+            assert!(
+                scan_storage_with(tmp.path(), kind, &mut |operation, _| match operation {
+                    StorageWalkOp::Metadata => Err(std::io::ErrorKind::NotFound.into()),
+                    StorageWalkOp::ConfirmAbsent =>
+                        Err(std::io::ErrorKind::PermissionDenied.into()),
+                    _ => Ok(()),
+                })
+                .is_err()
+            );
+            let mut completing = false;
+            assert!(
+                scan_storage_with(tmp.path(), kind, &mut |operation, _| {
+                    if operation == StorageWalkOp::CompleteRoot {
+                        completing = true;
+                    }
+                    if completing && operation == StorageWalkOp::Entry {
+                        Err(io_failure())
+                    } else {
+                        Ok(())
+                    }
+                })
+                .is_err()
+            );
+        }
+    }
 
     #[test]
     fn operational_alert_baselines_survive_idle_upkeep_and_reinitialization() {
@@ -992,12 +1618,9 @@ mod tests {
                 .expect("write corrupt file");
         }
 
-        let mut file_count = 0;
-        let mut total_bytes = 0;
-        walk_wal_files(wal_dir, &mut file_count, &mut total_bytes);
-
-        assert_eq!(file_count, 2);
-        assert_eq!(total_bytes, 6);
+        let totals = scan_storage(wal_dir, StorageKind::Wal).unwrap();
+        assert_eq!(totals.files, 2);
+        assert_eq!(totals.bytes, 6);
     }
 
     #[test]

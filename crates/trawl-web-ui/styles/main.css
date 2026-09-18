@@ -1282,6 +1282,10 @@
 .statusbar .sp { flex: 1; }
 .statusbar .strong { color: var(--ink-2); }
 .statusbar .accent { color: var(--accent); }
+/* Keep measurement detail inside the fixed footer row. The full reading
+ * remains in the slot's title and text for assistive technology. */
+.statusbar .wal-measurement { min-width: 0; white-space: nowrap; }
+.statusbar .wal-measurement .strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 
 /* ─────────────────────────────────────────────────────────────────
  *  Common utility bits
@@ -2044,7 +2048,7 @@
 /* Operational reports are cards on the page floor (ADR-0032).
  * They keep their reading order; Queries follows at full width. */
 .health-cards { display: grid; grid-template-columns: minmax(0, 1fr); gap: 20px; margin-top: 16px; }
-.health-cards > section {
+.health-cards > section, .health-diagnostics > section {
   background: var(--panel); border: 1px solid var(--line);
   border-radius: var(--radius-panel);
   box-shadow: inset 0 1px 0 var(--edge-hi), var(--elev-1);
@@ -2080,6 +2084,14 @@
 .health-checks dd { margin: 0; }
 .health-check-error { color: var(--red); }
 .health-live-state { color: var(--ink-2); }
+.health-diagnostics { display: grid; grid-template-columns: minmax(0, 1fr); gap: 20px; margin-top: 20px; }
+.health-diagnostic-state { color: var(--ink-2); }
+.health-storage-source { border-top: 1px solid var(--line); margin-top: 14px; padding-top: 12px; }
+.health-storage-source h3 { margin: 0; font-size: var(--fs-control); }
+.health-storage-source p { line-height: 1.5; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+@media (min-width: 1100px) {
+  .health-diagnostics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
 .health-queries { min-width: 0; margin-top: 20px; }
 .health-queries .tbl-hd { padding-block: 8px; }
 .health-queries .tbl-hd h2 { margin: 0; font-size: var(--fs-control); }

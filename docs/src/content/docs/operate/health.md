@@ -99,6 +99,55 @@ retained interval in the trawld log. They carry metadata, never DSL. Field
 details are in the API reference under [Running queries](/reference/api/#running-queries)
 and [Server info](/reference/api/#server-info).
 
+## Inspect ingestion and storage
+
+1. Open **Health** with a key that has `server_manage`, or read the
+   shared dashboard snapshot:
+
+   ```bash
+   curl --fail-with-body --config "$TRAWL_CURL_CONFIG" "$TRAWL_URL/api/v1/dashboard"
+   ```
+
+2. Check the stream label before using the browser readings. If it reports
+   **Stale; reconnecting** or **Live updates failed**, treat the displayed values
+   as a retained snapshot. Wait for a new stream snapshot to clear that label.
+   A live connection does not prove that a storage measurement succeeded.
+
+3. Read **Syslog configuration** before interpreting its counters. If syslog is
+   disabled, use the [syslog setup guidance](/operate/ingestion/#receive-syslog)
+   to check the intended configuration. If received counts increase, confirm
+   persistence with a bounded query as described in
+   [Confirm delivery over time](/operate/ingestion/#confirm-delivery-over-time).
+   HTTP readings exclude syslog, and receive counts alone do not prove persistence.
+
+4. Read each storage measurement's status and age before using its totals.
+   Treat **Awaiting measurement** and **Measurement unavailable** as unknown
+   storage usage. If collection failed after a successful scan, use the retained
+   totals only with their displayed age. Check the configured root and its mount
+   using [the data-path guidance](#read-the-checks). An absent query-only archive
+   is not a measured empty directory.
+
+5. Compare compaction readings across new snapshots. Use
+   [storage recovery](/architecture/recovery/) and
+   [retention guidance](/operate/retention/) when investigating storage behavior.
+   Do not infer a current incident from an error tally accumulated since startup.
+   Successful cycles can contain no eligible work, and error tallies can accompany
+   successful cycles. A missing last-success age means no successful cycle
+   reported since startup; an age of zero is a reported success.
+
+The [dashboard reference](/reference/api/#dashboard-snapshot) defines the four
+measurement states and the scope of each count. In the terminal's **DATA
+PIPELINE** panel, `failed age 120s 7f/91 B` means seven files and 91 bytes from
+the last complete sample, aged 120 seconds at the displayed snapshot.
+`not configured`, `awaiting measurement`, and `failed; unavailable` do not
+represent measured zero. The browser and terminal keep the supplied sample age
+unchanged until they receive another dashboard snapshot.
+
+If you use Prometheus, read the dashboard metadata when you need storage sample
+status or age. The four [storage gauges](/reference/api/#prometheus-metrics)
+retain last complete totals after collection failure and have no status or age
+signal. Flat values alone cannot confirm collector health.
+
 ## Diagnose a 503 or 504 from a query
 
 `timeout_secs`, 30 seconds by default, starts one deadline right after
