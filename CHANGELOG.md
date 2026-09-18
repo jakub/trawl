@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.9.0
+
+See the [0.9.0 release notes](docs/releases/v0.9.0.md) for shipped capabilities,
+installation choices, and the fresh-state requirement for existing deployments.
+
 ## Initial release preparation
 
 The [prepared 1.0 announcement](docs/releases/v1.0.0.md) introduces the product,
