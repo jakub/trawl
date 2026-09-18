@@ -1,0 +1,233 @@
+SET
+PREPARE
+PREPARE
+BEGIN
+SET
+ transaction_isolation 
+-----------------------
+ repeatable read
+(1 row)
+
+ transaction_read_only 
+-----------------------
+ on
+(1 row)
+
+ pg_backend_pid 
+----------------
+          41388
+(1 row)
+
+COMMIT
+BEGIN
+SET
+ count 
+-------
+     0
+(1 row)
+
+ id | key_id | query | executed_at | duration_ms | row_count | status 
+----+--------+-------+-------------+-------------+-----------+--------
+(0 rows)
+
+COMMIT
+BEGIN
+SET
+ count 
+-------
+     0
+(1 row)
+
+ id | key_id | query | executed_at | duration_ms | row_count | status 
+----+--------+-------+-------------+-------------+-----------+--------
+(0 rows)
+
+COMMIT
+BEGIN
+SET
+ count 
+-------
+     0
+(1 row)
+
+ id | key_id | query | executed_at | duration_ms | row_count | status 
+----+--------+-------+-------------+-------------+-----------+--------
+(0 rows)
+
+COMMIT
+BEGIN
+SET
+ count 
+-------
+     0
+(1 row)
+
+ id | key_id | query | executed_at | duration_ms | row_count | status 
+----+--------+-------+-------------+-------------+-----------+--------
+(0 rows)
+
+COMMIT
+BEGIN
+SET
+ count 
+-------
+     0
+(1 row)
+
+ id | key_id | query | executed_at | duration_ms | row_count | status 
+----+--------+-------+-------------+-------------+-----------+--------
+(0 rows)
+
+COMMIT
+BEGIN
+SET
+ count 
+-------
+     0
+(1 row)
+
+ id | key_id | query | executed_at | duration_ms | row_count | status 
+----+--------+-------+-------------+-------------+-----------+--------
+(0 rows)
+
+COMMIT
+Timing is on.
+SAMPLE 1
+BEGIN
+Time: 0.039 ms
+SET
+Time: 0.044 ms
+ count 
+-------
+     0
+(1 row)
+
+Time: 53.654 ms
+ id | key_id | query | executed_at | duration_ms | row_count | status 
+----+--------+-------+-------------+-------------+-----------+--------
+(0 rows)
+
+Time: 124.227 ms
+COMMIT
+Time: 0.091 ms
+SAMPLE 2
+BEGIN
+Time: 0.050 ms
+SET
+Time: 0.054 ms
+ count 
+-------
+     0
+(1 row)
+
+Time: 54.107 ms
+ id | key_id | query | executed_at | duration_ms | row_count | status 
+----+--------+-------+-------------+-------------+-----------+--------
+(0 rows)
+
+Time: 122.484 ms
+COMMIT
+Time: 0.081 ms
+SAMPLE 3
+BEGIN
+Time: 0.038 ms
+SET
+Time: 0.040 ms
+ count 
+-------
+     0
+(1 row)
+
+Time: 50.136 ms
+ id | key_id | query | executed_at | duration_ms | row_count | status 
+----+--------+-------+-------------+-------------+-----------+--------
+(0 rows)
+
+Time: 119.095 ms
+COMMIT
+Time: 0.083 ms
+SAMPLE 4
+BEGIN
+Time: 0.045 ms
+SET
+Time: 0.047 ms
+ count 
+-------
+     0
+(1 row)
+
+Time: 48.699 ms
+ id | key_id | query | executed_at | duration_ms | row_count | status 
+----+--------+-------+-------------+-------------+-----------+--------
+(0 rows)
+
+Time: 120.810 ms
+COMMIT
+Time: 0.084 ms
+SAMPLE 5
+BEGIN
+Time: 0.043 ms
+SET
+Time: 0.044 ms
+ count 
+-------
+     0
+(1 row)
+
+Time: 49.327 ms
+ id | key_id | query | executed_at | duration_ms | row_count | status 
+----+--------+-------+-------------+-------------+-----------+--------
+(0 rows)
+
+Time: 118.905 ms
+COMMIT
+Time: 0.078 ms
+Timing is off.
+END_SAMPLES
+     name      | generic_plans | custom_plans 
+---------------+---------------+--------------
+ history_count |             0 |           11
+ history_page  |             0 |           11
+(2 rows)
+
+BEGIN
+SET
+                                                                  QUERY PLAN                                                                   
+-----------------------------------------------------------------------------------------------------------------------------------------------
+ Finalize Aggregate  (cost=12225.93..12225.94 rows=1 width=8) (actual time=45.912..49.237 rows=1.00 loops=1)
+   Buffers: shared hit=9524
+   ->  Gather  (cost=12225.72..12225.93 rows=2 width=8) (actual time=45.877..49.234 rows=3.00 loops=1)
+         Workers Planned: 2
+         Workers Launched: 2
+         Buffers: shared hit=9524
+         ->  Partial Aggregate  (cost=11225.72..11225.73 rows=1 width=8) (actual time=44.222..44.222 rows=1.00 loops=3)
+               Buffers: shared hit=9524
+               ->  Parallel Seq Scan on query_history  (cost=0.00..11190.67 rows=14021 width=0) (actual time=44.219..44.219 rows=0.00 loops=3)
+                     Filter: ((key_id = '19201'::bigint) AND (strpos(lower(query), 'marker_absent_192'::text) > 0))
+                     Rows Removed by Filter: 66667
+                     Buffers: shared hit=9524
+ Planning Time: 0.046 ms
+ Execution Time: 49.248 ms
+(14 rows)
+
+                                                                             QUERY PLAN                                                                              
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=0.42..59.04 rows=50 width=349) (actual time=124.555..124.555 rows=0.00 loops=1)
+   Buffers: shared hit=10404
+   ->  Index Scan using query_history_key_executed_idx on query_history  (cost=0.42..39449.82 rows=33651 width=349) (actual time=124.554..124.554 rows=0.00 loops=1)
+         Index Cond: (key_id = '19201'::bigint)
+         Filter: (strpos(lower(query), 'marker_absent_192'::text) > 0)
+         Rows Removed by Filter: 100000
+         Index Searches: 1
+         Buffers: shared hit=10404
+ Planning Time: 0.073 ms
+ Execution Time: 124.562 ms
+(10 rows)
+
+COMMIT
+     name      | generic_plans | custom_plans 
+---------------+---------------+--------------
+ history_count |             0 |           12
+ history_page  |             0 |           12
+(2 rows)
+

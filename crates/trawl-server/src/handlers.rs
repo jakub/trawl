@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 
 use axum::extract::rejection::QueryRejection;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, RawQuery, State};
 use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
 use axum::response::sse::{Event, KeepAlive, KeepAliveStream, Sse};
@@ -1791,11 +1791,11 @@ pub struct FieldValuesParams {
     pub service: Option<String>,
 }
 
-/// `GET /api/v1/history` — retrieve user's query history with pagination.
+/// `GET /api/v1/history` — filter the key's stored query text before pagination.
 pub async fn history(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
-    Query(params): Query<HistoryParams>,
+    RawQuery(raw): RawQuery,
 ) -> Result<Json<HistoryResponse>, ServerError> {
     if !verified.has_permission(Permission::Query) {
         return Err(ServerError::Forbidden("insufficient permissions".into()));
@@ -1804,13 +1804,16 @@ pub async fn history(
     // The verified key carries the authoritative fleet keystore id.
     let key_id = verified.id;
 
+    // RawQuery does not decode. Permission must win over parameter errors, and
+    // strict admission must see duplicate/encoding evidence before any decoder.
+    let params = crate::history_params::parse(raw.as_deref().unwrap_or_default())?;
     let limit = params.limit.unwrap_or(100).min(1000);
     let offset = params.offset.unwrap_or(0);
 
     let page = state
         .storage
         .history
-        .get_user_history(key_id, limit, offset)
+        .get_user_history(key_id, limit, offset, params.filter.as_deref())
         .await?;
 
     Ok(Json(HistoryResponse {
@@ -1846,7 +1849,9 @@ pub async fn clear_history(
     Ok(Json(ClearHistoryResponse { deleted }))
 }
 
-/// Query parameters for the history endpoint.
+/// Numeric query parameters for History's existing Axum/Serde admission.
+///
+/// Raw History admission selects only these pairs before invoking this schema.
 #[derive(Debug, Deserialize)]
 pub struct HistoryParams {
     pub limit: Option<usize>,
@@ -3499,6 +3504,42 @@ pub struct StreamParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_numeric_extractor_characterization() {
+        for (raw, expected) in [
+            ("", Some((None, None))),
+            ("?limit=5", Some((None, None))),
+            ("?filter=x", Some((None, None))),
+            ("%3Flimit=5", Some((None, None))),
+            ("%3Ffilter=x", Some((None, None))),
+            ("?%6cimit=5", Some((None, None))),
+            ("limit=0&offset=001", Some((Some(0), Some(1)))),
+            ("%6cimit=%31&off%73et=2", Some((Some(1), Some(2)))),
+            ("limit=%2B1", Some((Some(1), None))),
+            ("limit=+1", None),
+            ("limit=", None),
+            ("limit", None),
+            ("offset=-1", None),
+            ("offset=%201", None),
+            ("offset=1%20", None),
+            ("limit=1&limit=2", None),
+            ("limit=1&%6cimit=1", None),
+            ("offset=1&offset=1", None),
+            ("limit=%2531", None),
+            ("limit=%GG", None),
+            ("limit=%FF", None),
+            ("offset=184467440737095516160", None),
+            ("unknown=%FF&limit=2", Some((Some(2), None))),
+            ("filter=ignored&offset=3", Some((None, Some(3)))),
+        ] {
+            let uri = format!("/api/v1/history?{raw}").parse().unwrap();
+            let actual = Query::<HistoryParams>::try_from_uri(&uri)
+                .ok()
+                .map(|Query(params)| (params.limit, params.offset));
+            assert_eq!(actual, expected, "legacy numeric admission for {raw:?}");
+        }
+    }
 
     /// A key holding exactly `permissions`, under a display name two
     /// keys are free to share.

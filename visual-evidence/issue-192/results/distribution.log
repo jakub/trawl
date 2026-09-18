@@ -1,0 +1,17 @@
+ key_id |  rows  | min_bytes | max_bytes | common | sparse | absent 
+--------+--------+-----------+-----------+--------+--------+--------
+  19201 | 100000 |       284 |       326 |  50000 |    100 |      0
+  19202 | 100000 |       284 |       326 |  50000 |    100 |      0
+(2 rows)
+
+           indexname            |                                                      indexdef                                                       
+--------------------------------+---------------------------------------------------------------------------------------------------------------------
+ query_history_pkey             | CREATE UNIQUE INDEX query_history_pkey ON public.query_history USING btree (id)
+ query_history_key_executed_idx | CREATE INDEX query_history_key_executed_idx ON public.query_history USING btree (key_id, executed_at DESC, id DESC)
+(2 rows)
+
+ heap_bytes | index_bytes 
+------------+-------------
+   78020608 |    18997248
+(1 row)
+

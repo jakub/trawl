@@ -173,8 +173,16 @@ pub async fn health() -> Result<HealthResponse, ApiError> {
 }
 
 /// GET /api/v1/history — paginated query history for the current session.
-pub async fn history(limit: usize, offset: usize) -> Result<HistoryResponse, ApiError> {
-    let url = format!("/api/v1/history?limit={limit}&offset={offset}");
+pub async fn history(
+    limit: usize,
+    offset: usize,
+    filter: &str,
+) -> Result<HistoryResponse, ApiError> {
+    let mut url = format!("/api/v1/history?limit={limit}&offset={offset}");
+    if !filter.is_empty() {
+        url.push_str("&filter=");
+        url.push_str(&crate::search_url::percent_encode(filter));
+    }
     let resp = Request::get(&url).send().await?;
     match resp.status() {
         200 => resp

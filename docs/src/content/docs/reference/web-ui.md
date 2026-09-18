@@ -132,11 +132,46 @@ grouping, and sorting can omit or combine rows differently from the source data.
 
 ## History
 
-`/search/history` lists completed queries with **Executed query**, **When**,
-**Rows**, and **Action**. The headers do not sort. The filter box narrows only
-the loaded page. **Save as Net** stores a row as a saved query. **Export this page** downloads the visible page as CSV or
-JSON. **Clear history** asks for confirmation, then deletes every row for your
-key.
+`/search/history` lists your key's completed queries with **Executed query**,
+**When**, **Rows**, and **Action**. The headers do not sort. The filter searches
+stored query text across
+all retained history for your key before paging. Matching is a literal
+substring using the database's lowercase rules; whitespace, `%`, and `_` remain
+significant. **Save as Net** stores a row as a saved query.
+
+Typing edits a draft. **Search** or Enter outside IME composition applies it.
+A changed filter starts at page one and adds a browser history entry.
+Submitting unchanged text refreshes the current page. **Clear filter** applies
+an empty filter at page one. Paging keeps the applied filter, discards an unsubmitted
+draft, and replaces the URL's page number.
+
+The applied filter is visible in the URL as `hq`; `hpage` is the zero-based
+page number. Generated URLs omit an empty filter and page zero. Bookmarks,
+reload, Back, and Forward restore that view over the current key's changing
+history. They do not preserve a result snapshot. Filter text in the URL is
+also present in browser history and any copied link.
+
+History accepts at most 32768 bytes of URL query payload and 64 nonempty
+parameter pairs, with strict percent and UTF-8 decoding. Generated filter
+URLs reserve room for the largest admitted page number. An oversized draft
+stays editable and sends no request. A malformed History link shows an error
+and recovery action without fetching history. These browser URL bounds are
+separate from the API's decoded filter limit.
+
+A new filter or page hides previous rows while loading. Refreshing the same
+view can retain its rows, but paging and export stay disabled until that
+refresh succeeds. Empty history, no filter matches, and a page beyond the
+matches have separate messages. **Export this page** downloads only the
+successfully loaded applied page as CSV or JSON; an unsubmitted draft does
+not change the export.
+
+**Clear history** asks for confirmation, then deletes every history row for
+your key, including unmatched rows and other pages. Saved queries remain.
+While deletion is pending, filter input, Search, Clear filter, paging, export,
+and duplicate Clear are disabled. Success resets the filter and page, replaces
+the URL with `/search/history`, and refreshes without restoring old rows if
+that refresh fails. A failed or unknown deletion outcome preserves the view
+and reports failure. Queries completed concurrently can add new history.
 
 ## Schema
 

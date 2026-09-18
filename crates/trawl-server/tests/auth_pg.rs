@@ -51,7 +51,13 @@ async fn request(
     req = req
         .header("content-type", "application/json")
         .body(r#"{"query":"* | head 1","name":"x","interval":"1h"}"#);
-    let resp = req.send().await.unwrap();
+    let resp = req.send().await.unwrap_or_else(|error| {
+        panic!(
+            "request with {} path bytes failed: {}",
+            path.len(),
+            error.without_url()
+        )
+    });
     let status = resp.status().as_u16();
     let body = resp.json::<serde_json::Value>().await.unwrap_or_default();
     (status, body)
@@ -1193,6 +1199,247 @@ async fn dashboard_reports_schedule_count_from_pg() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn history_filter_scopes_matching_total_and_pages_to_authenticated_key() {
+    let server = setup().await;
+    let keys = KeyStore::from_pool(server.fleet_pool.clone());
+    let reader = keys.verify_key(&server.reader_token).await.unwrap();
+    let analyst = keys.verify_key(&server.analyst_token).await.unwrap();
+    for (key, query) in [
+        (reader.id, "old IP 192.0.2.1 two  spaces %_\\+'"),
+        (reader.id, "unrelated"),
+        (reader.id, "new ip 192.0.2.1 two  spaces %_\\+'"),
+        (analyst.id, "foreign ip 192.0.2.1 two  spaces %_\\+'"),
+    ] {
+        server
+            .state
+            .storage
+            .history
+            .record_query(key, query, 1, 1, trawl_server::store::RunStatus::Success)
+            .await
+            .unwrap();
+    }
+    for (offset, expected) in [(0, Some("new ip")), (1, Some("old IP")), (2, None)] {
+        let path = format!(
+            "/api/v1/history?filter=ip+192.0.2.1&limit=1&offset={offset}&key_id={}",
+            analyst.id
+        );
+        let (status, body) = request(
+            &server.url,
+            reqwest::Method::GET,
+            &path,
+            Some(&server.reader_token),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["total"], 2);
+        let entries = body["entries"].as_array().unwrap();
+        if let Some(prefix) = expected {
+            assert_eq!(entries.len(), 1);
+            assert!(entries[0]["query"].as_str().unwrap().starts_with(prefix));
+        } else {
+            assert!(entries.is_empty());
+        }
+    }
+    let (status, body) = request(
+        &server.url,
+        reqwest::Method::GET,
+        "/api/v1/history?filter=%25_%5C%2B%27&limit=0",
+        Some(&server.reader_token),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body["total"], 2);
+    assert_eq!(body["entries"], serde_json::json!([]));
+    let (status, _) = request(
+        &server.url,
+        reqwest::Method::GET,
+        "/api/v1/history?filter=ip",
+        None,
+    )
+    .await;
+    assert_eq!(status, 401);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn history_filter_http_admits_decoded_byte_and_pair_boundaries() {
+    let server = setup().await;
+    let admitted = [
+        String::new(),
+        "filter=".into(),
+        "filter=%2B%25%27%E6%97%A5&unknown=%FF%00%GG".into(),
+        "filter=%2531".into(),
+        "filter=two++spaces".into(),
+        format!("filter={}", "x".repeat(32_768)),
+        // Keep these wire requests under http::Uri's 65534-byte transport
+        // ceiling while still testing UTF-8 decoded-byte admission at 32768.
+        format!("filter={}%E6%97%A5", "x".repeat(32_765)),
+        vec!["unknown=%FF"; 64].join("&"),
+    ];
+    for raw in admitted {
+        let (status, body) = request(
+            &server.url,
+            reqwest::Method::GET,
+            &format!("/api/v1/history?{raw}"),
+            Some(&server.reader_token),
+        )
+        .await;
+        assert_eq!(status, 200, "admitted {} byte query: {body}", raw.len());
+        assert_eq!(body["total"], 0);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn history_filter_permission_and_raw_refusal_precede_history_sql() {
+    let server = setup().await;
+    server.kill_app_database().await;
+    let mut refused: Vec<String> = [
+        "filter=private-marker&filter=b",
+        "filter=&%66ilter=b",
+        "filter=%",
+        "filter=%1",
+        "filter=%GG",
+        "filter=%FF",
+        "filter=%E6%97",
+        "filter=%00",
+        "%GG=ignored",
+        "%FF=ignored",
+        "%00=ignored",
+        "limit=1&%6cimit=2",
+        "limit=%GG",
+        "offset=-1",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    refused.push(format!("filter={}", "x".repeat(32_769)));
+    refused.push(format!("filter={}%E6%97%A5", "x".repeat(32_766)));
+    refused.push(vec!["unknown=x"; 65].join("&"));
+    for raw in refused {
+        let path = format!("/api/v1/history?{raw}");
+        let (status, body) = request(
+            &server.url,
+            reqwest::Method::GET,
+            &path,
+            Some(&server.reader_token),
+        )
+        .await;
+        assert_eq!(status, 400, "invalid {} byte query", raw.len());
+        assert_eq!(
+            body,
+            serde_json::json!({"error": {
+                "code": "bad_request", "message": "invalid history parameters"
+            }})
+        );
+        // The same malformed representation must not override authorization.
+        let (status, body) = request(
+            &server.url,
+            reqwest::Method::GET,
+            &path,
+            Some(&server.ingest_token),
+        )
+        .await;
+        assert_eq!(status, 403);
+        assert_eq!(body["error"]["code"], "forbidden");
+    }
+    // A valid filter reaches the unavailable store. This distinguishes raw
+    // refusal from a test that never exercised a functioning History route.
+    let (status, body) = request(
+        &server.url,
+        reqwest::Method::GET,
+        "/api/v1/history?filter=private-marker",
+        Some(&server.reader_token),
+    )
+    .await;
+    assert_eq!(status, 503);
+    assert_eq!(
+        body,
+        serde_json::json!({"error": {
+            "code": "service_unavailable", "message": "app-state store unavailable"
+        }})
+    );
+    let (status, _) = request(
+        &server.url,
+        reqwest::Method::GET,
+        "/api/v1/history?filter=valid",
+        Some(&server.ingest_token),
+    )
+    .await;
+    assert_eq!(status, 403);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn history_filter_handler_admits_raw_cap_before_store_and_after_permission() {
+    use axum::response::IntoResponse as _;
+
+    // http::Uri limits a transport URI to 65534 bytes. Exercise the larger
+    // application raw-query cap through the actual handler, without pretending
+    // that these constructed RawQuery values traversed the HTTP transport.
+    async fn invoke(
+        server: &common::TestServer,
+        key: &fleet_auth::VerifiedKey,
+        raw: &str,
+    ) -> (u16, serde_json::Value) {
+        let response = trawl_server::handlers::history(
+            axum::extract::State(server.state.clone()),
+            axum::Extension(key.clone()),
+            axum::extract::RawQuery(Some(raw.to_owned())),
+        )
+        .await
+        .into_response();
+        let status = response.status().as_u16();
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    let server = setup().await;
+    let keys = KeyStore::from_pool(server.fleet_pool.clone());
+    let reader = keys.verify_key(&server.reader_token).await.unwrap();
+    let ingest = keys.verify_key(&server.ingest_token).await.unwrap();
+    let raw_boundary = format!("unknown={}", "x".repeat(98_432 - "unknown=".len()));
+    let admitted = [
+        format!("filter={}", "%61".repeat(32_768)),
+        raw_boundary.clone(),
+        format!("?{}", &raw_boundary[..raw_boundary.len() - 1]),
+    ];
+    for raw in &admitted {
+        let (status, body) = invoke(&server, &reader, raw).await;
+        assert_eq!(status, 200, "admitted {} raw bytes", raw.len());
+        assert_eq!(body, serde_json::json!({"entries": [], "total": 0}));
+    }
+
+    server.kill_app_database().await;
+    for raw in &admitted {
+        let (status, body) = invoke(&server, &reader, raw).await;
+        assert_eq!(status, 503);
+        assert_eq!(
+            body,
+            serde_json::json!({"error": {
+                "code": "service_unavailable", "message": "app-state store unavailable"
+            }})
+        );
+        assert_eq!(invoke(&server, &ingest, raw).await.0, 403);
+    }
+    for raw in [
+        format!("{raw_boundary}x"),
+        format!("?{raw_boundary}"),
+        format!("?{raw_boundary}x"),
+        format!("filter={}", "%61".repeat(32_769)),
+    ] {
+        let (status, body) = invoke(&server, &reader, &raw).await;
+        assert_eq!(status, 400, "refused {} raw bytes", raw.len());
+        assert_eq!(
+            body,
+            serde_json::json!({"error": {
+                "code": "bad_request", "message": "invalid history parameters"
+            }})
+        );
+        assert_eq!(invoke(&server, &ingest, &raw).await.0, 403);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn history_clear_requires_query_and_scopes_to_caller() {
     let server = setup().await;
     let reader = trawl_client::HttpClient::new_insecure(&server.url, &server.reader_token).unwrap();
@@ -1225,7 +1472,10 @@ async fn history_clear_requires_query_and_scopes_to_caller() {
 
     // Client-supplied actor identifiers have no authority.
     let response = raw_client()
-        .delete(format!("{}/api/v1/history?key_id=0", server.url))
+        .delete(format!(
+            "{}/api/v1/history?key_id=0&filter=does-not-match",
+            server.url
+        ))
         .bearer_auth(&server.reader_token)
         .json(&serde_json::json!({"key_id": 0}))
         .send()

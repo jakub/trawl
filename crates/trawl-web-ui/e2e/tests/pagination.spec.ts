@@ -51,7 +51,7 @@ async function paginationState(request: import('@playwright/test').APIRequestCon
   return (await (await request.get('/__ctl/state')).json()).pagination;
 }
 
-test('history reads hpage once, replaces on Next, and filters only rendered rows', async ({ page, request }) => {
+test('history reads hpage once, replaces on Next, and keeps draft edits unapplied', async ({ page, request }) => {
   await configure(request);
   await page.goto('/search/history?hpage=%31');
   const footer = page.locator('.results-footer');
@@ -60,7 +60,7 @@ test('history reads hpage once, replaces on Next, and filters only rendered rows
   await expect(page.locator('.tbl-body .row-stretch').first()).toHaveText('history-row-51');
   const length = await page.evaluate(() => history.length);
   await page.getByPlaceholder('Filter history…').fill('history-row-51');
-  await expect(page.locator('.tbl-body .row-stretch')).toHaveCount(1);
+  await expect(page.locator('.tbl-body .row-stretch')).toHaveCount(50);
   await expect(footer.locator('.results-summary')).toHaveText('51–100 of 103');
   await page.getByPlaceholder('Filter history…').clear();
   await footer.getByRole('button', { name: 'Next' }).click();
@@ -72,6 +72,7 @@ test('history reads hpage once, replaces on Next, and filters only rendered rows
   await expect(footer.locator('.results-summary')).toHaveText('51–100 of 103');
   await footer.getByRole('button', { name: 'Prev' }).click();
   await expect(footer.locator('.results-summary')).toHaveText('1–50 of 103');
+  await expect(page).toHaveURL(/\/search\/history$/);
   await expect(footer.getByRole('button', { name: 'Prev' })).toBeDisabled();
   // A distinct raw URL refetches even when its single-decoded page is zero.
   const decodedPage = page.waitForResponse(r => new URL(r.url()).pathname === '/api/v1/history'
@@ -149,7 +150,7 @@ for (const surface of ['global', 'drawer']) {
   });
 }
 
-test('history keeps fetched rows while busy and completes the latest queued page', async ({ page, request }) => {
+test('history hides stale rows and completes a newer page before the older request', async ({ page, request }) => {
   await configure(request, { holdHistoryOffset: 50 });
   await page.goto('/search/history');
   const footer = page.locator('.results-footer');
@@ -158,20 +159,18 @@ test('history keeps fetched rows while busy and completes the latest queued page
   const mountedInput = await page.getByPlaceholder('Filter history…').elementHandle();
   await footer.getByRole('button', { name: 'Next' }).click();
   await expect.poll(async () => (await paginationState(request)).held).toBe(true);
-  await expect(footer.getByRole('button', { name: 'Prev' })).toBeDisabled();
-  await expect(footer.getByRole('button', { name: 'Next' })).toBeDisabled();
-  await expect(footer.locator('.results-summary')).toHaveText('1–50 of 103');
-  await expect(page.locator('.tbl-body .row-stretch').first()).toHaveText('history-row-1');
+  await expect(footer).toHaveCount(0);
+  await expect(page.locator('.tbl-body .row-stretch')).toHaveCount(0);
 
-  // The pager is disabled, but browser URL navigation still changes the page.
-  // LocalResource serializes fetches: page 2 starts only after page 1 resolves.
+  // Page controls are unavailable, but browser navigation can change the page.
+  // The newer page starts and completes while the older response remains held.
   await navigateHistory(page, '2');
   await expect(page).toHaveURL(/hpage=2$/);
   expect(await mountedInput!.evaluate(el => el.isConnected)).toBe(true);
-  await expect(footer.locator('.results-summary')).toHaveText('1–50 of 103');
-  await expect(footer.getByRole('button', { name: 'Prev' })).toBeDisabled();
+  await expect(footer.locator('.results-summary')).toHaveText('101–103 of 103');
+  await expect(footer.getByRole('button', { name: 'Prev' })).toBeEnabled();
   await expect(footer.getByRole('button', { name: 'Next' })).toBeDisabled();
-  expect((await paginationState(request)).completed).toEqual([0]);
+  expect((await paginationState(request)).completed).toEqual([0, 100]);
 
   const oldResponse = page.waitForResponse(r => new URL(r.url()).pathname === '/api/v1/history'
     && new URL(r.url()).searchParams.get('offset') === '50');
@@ -199,7 +198,7 @@ test('history keeps fetched rows while busy and completes the latest queued page
   await expect(page).toHaveURL(/hpage=2$/);
   expect(await mountedInput!.evaluate(el => el.isConnected)).toBe(true);
   expect((await paginationState(request)).history.map((r: { offset: number }) => r.offset)).toEqual([0, 50, 100]);
-  expect((await paginationState(request)).completed).toEqual([0, 50, 100]);
+  expect((await paginationState(request)).completed).toEqual([0, 100, 50]);
 });
 
 test('Probe returned range overflow is visible without a wasm panic', async ({ page, request }) => {

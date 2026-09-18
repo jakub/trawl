@@ -1073,7 +1073,9 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -X DELETE "$TRAWL_URL/api/v1
 
 Permission: `query`
 
-Lists the key's own completed queries, most recent first.
+Lists the key's own completed queries, ordered by execution time descending,
+then history ID descending for tied timestamps. An optional filter searches
+the stored query text across the key's complete retained history before paging.
 
 **Parameters**
 
@@ -1081,6 +1083,21 @@ Lists the key's own completed queries, most recent first.
 |------|----|------|----------|-------------|
 | `limit` | query | integer | no | Default `100`, maximum `1000` |
 | `offset` | query | integer | no | Default `0` |
+| `filter` | query | string | no | Literal substring of query text; absent or empty selects all rows. Maximum 32768 decoded UTF-8 bytes. |
+
+Matching uses PostgreSQL `lower()` on both text and filter, with the database's
+locale rules. Whitespace remains significant. `%`, `_`, quotes, and backslashes
+are literal characters, not wildcard or query syntax. Send values with normal
+URL form encoding (`+` decodes to a space).
+
+The raw query payload is limited to 98432 bytes and 64 nonempty
+ampersand-separated pairs. The separating `?` is outside this payload; an
+additional literal `?` is parameter-name data. Parameter names and the filter
+must have valid percent escapes and UTF-8, with no decoded NUL. Repeated decoded
+`filter` names are rejected. Unknown parameter values are ignored without
+decoding. Existing numeric admission for `limit` and `offset` still applies.
+These application bounds do not enlarge HTTP transport limits; the current
+URI parser has a 65534-byte limit for the complete URI.
 
 **Request**
 
@@ -1100,12 +1117,19 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" "$TRAWL_URL/api/v1/history?l
 | Field | Type | Description |
 |-------|------|-------------|
 | `entries[].status` | string | `success`, `error`, or `timeout` |
-| `total` | integer | All history rows for this key |
+| `total` | integer | Matching rows for this key before `limit` and `offset` |
+
+Count and entries use one read-only repeatable-read transaction, so they
+describe the same snapshot for this response. A later request can see new or
+deleted history. A page beyond the matches returns empty `entries` and keeps
+the matching `total`.
 
 **Errors**
 
 | Status | Code | When |
 |--------|------|------|
+| 400 | `bad_request` | Invalid or oversized history parameters |
+| 403 | `forbidden` | The key lacks `query`; permission is checked before parameter parsing |
 | 503 | `service_unavailable` | The app-state store did not answer |
 
 ### Clear query history
@@ -1114,7 +1138,9 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" "$TRAWL_URL/api/v1/history?l
 
 Permission: `query`
 
-Deletes the key's own history rows.
+Deletes all history rows for the key, including rows outside the current page
+or filter. Saved queries and other keys' history remain. Queries completed
+concurrently can add new history after deletion.
 
 **Request**
 

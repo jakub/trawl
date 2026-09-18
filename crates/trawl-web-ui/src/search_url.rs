@@ -6,7 +6,8 @@
 //!
 //! The search page keeps its whole state in the address bar — `q` (the
 //! executed DSL), `page`, `mode`, `f` (filters) and `r` (range). This
-//! module owns every encode and decode of that state and nothing else:
+//! module owns every encode and decode of that state. History's separate
+//! `hq` and `hpage` contract also lives here, with its own strict filter reader:
 //! no leptos, no `js_sys`, no `web_sys`, so `cargo nextest` on the host
 //! exercises the same functions the browser runs. `state::query` keeps
 //! only the router memos and the navigator closure on top.
@@ -1060,23 +1061,124 @@ pub fn normalize_dialog_range(picked: fleet_ui::RangeValue) -> Result<RangeSpec,
     }
 }
 
-/// Read History's page through the same bounded, single-decode parser.
-/// Numeric values too large even for `u64` are refused before any fetch.
-pub fn read_history_page(raw_search: &str) -> Result<usize, &'static str> {
+/// The applied History view. Draft input never changes this value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryView {
+    pub filter: String,
+    pub page: usize,
+}
+
+const HISTORY_ENCODING_ERROR: &str = "This history link has invalid parameter encoding.";
+const HISTORY_FILTER_TOO_LONG: &str = "This history filter is too long to keep in a pageable link.";
+
+/// Read the browser's raw query once. History's names and filter are strict;
+/// Search's deliberately forgiving decoder and History's page grammar remain.
+pub fn read_history_view(raw_search: &str) -> Result<HistoryView, &'static str> {
+    let raw_search = raw_search.strip_prefix('?').unwrap_or(raw_search);
     if raw_search.len() > MAX_SEARCH_BYTES {
         return Err("This history link is too long to read.");
     }
-    let params = query_params(raw_search, &["hpage"])
-        .map_err(|_| "This history link has too many parameters to read.")?;
-    let Some((_, raw)) = params.first() else {
-        return Ok(0);
-    };
+    if raw_search
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .count()
+        > MAX_SEARCH_PAIRS
+    {
+        return Err("This history link has too many parameters to read.");
+    }
+    let mut filter = None;
+    let mut page = None;
+    for pair in raw_search.split('&').filter(|pair| !pair.is_empty()) {
+        let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+        match history_form_decode(name)?.as_str() {
+            "hq" => {
+                if filter.is_some() {
+                    return Err("This history link repeats its filter.");
+                }
+                filter = Some(history_form_decode(value)?);
+            }
+            "hpage" if page.is_none() => page = Some(form_decode(value)),
+            _ => {} // Unknown values are ignored without decoding.
+        }
+    }
+    let raw = page.as_deref().unwrap_or_default();
     if !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit()) && raw.parse::<u64>().is_err() {
         return Err("This history page is too large to request.");
     }
-    match parse_page(raw) {
-        Verdict::Valid(page) => Ok(page),
-        _ => Err("This history page is too large to request."),
+    let Verdict::Valid(page) = parse_page(raw) else {
+        return Err("This history page is too large to request.");
+    };
+    admit_history_view(filter.as_deref().unwrap_or_default(), page)
+}
+
+fn history_form_decode(raw: &str) -> Result<String, &'static str> {
+    let mut output = Vec::with_capacity(raw.len());
+    let mut bytes = raw.bytes();
+    while let Some(byte) = bytes.next() {
+        let byte = match byte {
+            b'+' => b' ',
+            b'%' => {
+                let hi = bytes
+                    .next()
+                    .and_then(hex_digit)
+                    .ok_or(HISTORY_ENCODING_ERROR)?;
+                let lo = bytes
+                    .next()
+                    .and_then(hex_digit)
+                    .ok_or(HISTORY_ENCODING_ERROR)?;
+                (hi << 4) | lo
+            }
+            byte => byte,
+        };
+        if byte == 0 {
+            return Err(HISTORY_ENCODING_ERROR);
+        }
+        output.push(byte);
+    }
+    String::from_utf8(output).map_err(|_| HISTORY_ENCODING_ERROR)
+}
+
+/// Admit both submissions and pasted filters with room for the largest page.
+pub fn admit_history_view(filter: &str, page: usize) -> Result<HistoryView, &'static str> {
+    if filter.contains('\0') {
+        return Err(HISTORY_ENCODING_ERROR);
+    }
+    if (page as u64) > MAX_OFFSET / PAGE_SIZE_U64 {
+        return Err("This history page is too large to request.");
+    }
+    if !filter.is_empty() {
+        // Bound before percent encoding can allocate up to three times input.
+        if filter.len() > MAX_SEARCH_BYTES {
+            return Err(HISTORY_FILTER_TOO_LONG);
+        }
+        let reservation = format!(
+            "hq={}&hpage={}",
+            percent_encode(filter),
+            MAX_OFFSET / PAGE_SIZE_U64
+        );
+        if reservation.len() > MAX_SEARCH_BYTES {
+            return Err(HISTORY_FILTER_TOO_LONG);
+        }
+    }
+    Ok(HistoryView {
+        filter: filter.to_owned(),
+        page,
+    })
+}
+
+/// Canonical History URL. Call admission before navigating to this URL.
+pub fn build_history_url(view: &HistoryView) -> String {
+    let mut params = Vec::new();
+    if !view.filter.is_empty() {
+        params.push(format!("hq={}", percent_encode(&view.filter)));
+    }
+    if view.page != 0 {
+        params.push(format!("hpage={}", view.page));
+    }
+    if params.is_empty() {
+        "/search/history".to_owned()
+    } else {
+        format!("/search/history?{}", params.join("&"))
     }
 }
 
@@ -1148,6 +1250,7 @@ mod tests {
 
     #[test]
     fn history_page_uses_single_decode_and_checked_offset() {
+        let read_history_page = |raw: &str| read_history_view(raw).map(|view| view.page);
         assert_eq!(read_history_page("?hpage=%31"), Ok(1));
         assert_eq!(read_history_page("?%68%70%61%67%65=1"), Ok(1));
         assert_eq!(read_history_page("?hpage=%2531"), Ok(0));
@@ -1156,6 +1259,81 @@ mod tests {
         assert!(read_history_page("?hpage=85899346").is_err());
         assert!(read_history_page("?hpage=184467440737095516160").is_err());
         assert!(read_history_page(&format!("?{}", "a&".repeat(MAX_SEARCH_PAIRS + 1))).is_err());
+    }
+
+    #[test]
+    fn history_filter_codec_is_strict_and_single_decode() {
+        for (raw, expected) in [
+            ("", ""),
+            ("?hq=", ""),
+            ("?hq=a++b", "a  b"),
+            ("?%68q=%2B%25%27%5C", "+%'\\"),
+            ("?hq=%2531", "%31"),
+            ("?hq=%E6%97%A5%E6%9C%AC%E8%AA%9E", "日本語"),
+            ("?junk=%FF%GG%00&hq=ok", "ok"),
+        ] {
+            let view = read_history_view(raw).unwrap();
+            assert_eq!(view.filter, expected);
+            let url = build_history_url(&view);
+            assert_eq!(
+                read_history_view(url.split_once('?').map_or("", |(_, query)| query)).unwrap(),
+                view
+            );
+        }
+        for raw in [
+            "?hq=a&%68q=b",
+            "?hq=&hq=",
+            "?hq=%",
+            "?hq=%GG",
+            "?hq=%FF",
+            "?hq=%E6%97",
+            "?hq=%00",
+            "?%FF=x",
+            "?%=x",
+            "?%00=x",
+        ] {
+            assert!(read_history_view(raw).is_err(), "{raw}");
+        }
+        for raw in ["?hpage=%GG", "?hpage=%FF", "?hpage=%00", "?hpage=1&hpage=2"] {
+            assert!(
+                read_history_view(raw).is_ok(),
+                "legacy hpage semantics: {raw}"
+            );
+        }
+        assert_eq!(
+            build_history_url(&admit_history_view("", 0).unwrap()),
+            "/search/history"
+        );
+        assert_eq!(
+            build_history_url(&admit_history_view("+%'", 0).unwrap()),
+            "/search/history?hq=%2B%25%27"
+        );
+    }
+
+    #[test]
+    fn history_filter_admission_reserves_every_page_with_exact_byte_bounds() {
+        let max_page = usize::try_from(MAX_OFFSET / PAGE_SIZE_U64).unwrap();
+        assert_eq!(max_page, 85_899_345);
+        let overhead = "hq=&hpage=85899345".len();
+        let text = "x".repeat(MAX_SEARCH_BYTES - overhead);
+        let view = admit_history_view(&text, max_page).unwrap();
+        let url = build_history_url(&view);
+        let raw = url.split_once('?').unwrap().1;
+        assert_eq!(raw.len(), MAX_SEARCH_BYTES);
+        assert_eq!(read_history_view(raw).unwrap(), view);
+        assert_eq!(read_history_view(&format!("?{raw}")).unwrap(), view);
+        assert!(admit_history_view(&format!("{text}x"), 0).is_err());
+        assert!(read_history_view(&format!("hq={text}x")).is_err());
+        // Encoding expansion, including Unicode, governs admission too.
+        let text = format!("{}日本語+%'", "x".repeat(MAX_SEARCH_BYTES - overhead - 36));
+        assert!(admit_history_view(&text, max_page).is_ok());
+        assert!(admit_history_view(&format!("{text}x"), 0).is_err());
+        let unknown = format!("ignored={}", "x".repeat(MAX_SEARCH_BYTES - 8));
+        assert!(read_history_view(&format!("?{unknown}")).is_ok());
+        assert!(read_history_view(&format!("?{unknown}x")).is_err());
+        assert!(read_history_view(&vec!["ignored=%FF"; 64].join("&")).is_ok());
+        assert!(read_history_view(&vec!["ignored=%FF"; 65].join("&")).is_err());
+        assert!(admit_history_view("\0", 0).is_err());
     }
 
     /// The pairs a readable search string carries.

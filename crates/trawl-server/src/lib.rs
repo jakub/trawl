@@ -19,6 +19,7 @@ pub mod epoch;
 pub mod error;
 pub(crate) mod from_saved;
 pub mod handlers;
+mod history_params;
 pub mod hot_buffer;
 pub mod ingest;
 pub mod metrics;

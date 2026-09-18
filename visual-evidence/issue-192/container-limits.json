@@ -1,0 +1,17 @@
+{
+  "NanoCpus": 0,
+  "CpuQuota": 0,
+  "CpuPeriod": 0,
+  "CpuShares": 0,
+  "CpusetCpus": "",
+  "Memory": 0,
+  "MemorySwap": 0,
+  "ShmSize": 67108864,
+  "Tmpfs": {
+    "/var/lib/postgresql": ""
+  },
+  "effective_capacity_bytes": {
+    "/var/lib/postgresql": 16670978048,
+    "/dev/shm": 67108864
+  }
+}
