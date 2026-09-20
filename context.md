@@ -127,8 +127,8 @@ To cast a value to its pin under the lossless round-trip guard — one operation
 _Avoid_: coerce, normalize
 
 **Field**:
-The logical name and value: what a sender wrote or trawl guarantees, what the DSL references, what the catalog pins.
-_Avoid_: column (that is its storage form), key, attribute
+The logical name and value of an event: what a sender wrote or trawl guarantees, what the DSL references, what the catalog pins. Only events have fields; a table has columns and an analysis declares output columns.
+_Avoid_: column (that is its storage form), key, attribute, output field (an analysis declares output columns)
 
 **Column**:
 A field's physical form in a parquet file or a DuckDB result. You pin a field; you read a column.
@@ -159,6 +159,50 @@ _Avoid_: range (that is the search page's control), period, report window (the w
 **Lag**:
 The late-arrival allowance that moves both bounds of a window back. It exists only beside a window; zero is spelled as absence.
 _Avoid_: delay, grace period, offset
+
+### Tables and analyses
+
+Objects added in 1.1 (ADR-0035). They belong to the installation and share one namespace; access comes from grants, never from ownership.
+
+**Table**:
+Editable rows with declared, typed, immutable columns and an optional key, stored as one parquet file per revision under a definition Postgres owns. A table is written by people and by nets alike; whoever writes it, it has one definition.
+_Avoid_: lookup file, kv store, saved run (that is a run's result), `| table` (that is a projection stage)
+
+**Table key**:
+The columns declared at creation that identify a row: a uniqueness and non-null constraint on every write, and the only columns `upsert … on` may name. A keyless table accepts append and replace only.
+_Avoid_: primary key, match columns, index
+
+**Revision**:
+One version of a table's rows: an immutable file, numbered, made by one write and made visible by one Postgres commit. `from <table>` reads the current one; every write names the revision it saw and fails if it moved.
+_Avoid_: snapshot (unqualified), version, epoch (that is the stored format's generation), generation
+
+**Citation**:
+A retained run's record of the revision it read. A citation holds the file against retention for the run's lifetime and names bytes, not a type; whether the cited revision still exists is a separate, named fact.
+_Avoid_: pin (that is the catalog's type), anchor (that is a link in the runs page), snapshot, reference
+
+**Net**:
+A saved query the installation owns: its optional schedule, its retained runs, and the analyses it triggers by version. A net that ends in a save writes a table like any other writer and does not own it.
+_Avoid_: saved search, report (that is a run's output), job
+
+**Run**:
+One execution of a net: the resolved query text, the window it covered, its retained result, its citations, and a separate outcome for each analysis and save. `run=latest` is the newest run whose query succeeded, never an older one.
+_Avoid_: report, execution, receipt (a run carries facts, and there are no write receipts)
+
+**Analysis**:
+An installation-owned object that runs a model over rows: instructions, declared output columns, a closed read-only tool set, and an optional save. A net triggers one by version; a person runs one by hand. Its output is data, validated against its declared columns, and can never choose a destination.
+_Avoid_: agent, llm call (one analysis makes several), prompt (that is one of its parts)
+
+**Save**:
+The terminal write stages, one verb per behaviour: `append`, `upsert … on <key>`, `replace … [key=]`. A save is the last stage, at most one per query, refused in read-only lanes, and one write is one revision is one transaction.
+_Avoid_: publish (that is durable file publication, ADR-0026), export, `save mode=`
+
+**Lookup**:
+The stage that left-joins a table onto the pipeline on equality: no match keeps the row with NULLs, more than one match fails the query naming the value, and a lookup on the key can never match twice.
+_Avoid_: join (the SQL word), enrich (the outcome, not the stage)
+
+**Automation key**:
+The one installation-wide key under which scheduled runs execute, checked live at every gate and never an administrator. Revoking it stops all unattended work; disabling a net stops one. It grants nothing to whoever edits a net.
+_Avoid_: owner key, service account, the scheduler's key (it is the installation's)
 
 ### Outcome verbs
 

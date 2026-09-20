@@ -96,11 +96,11 @@ _Avoid_: router (that is leptos's), goto
 ### Nets
 
 **Net**:
-A saved query as the browser names it, with its optional schedule and its recorded runs.
+The browser's surface for a net (defined in the root `context.md`): the nets page, the net drawer and the save-as-net modal.
 _Avoid_: saved search, report (that is a run's output)
 
 **Run**:
-One stored execution of a net's schedule: the resolved query text, the window it covered and the result rows the server kept. The drawer pages a fetched result locally; a run is never re-fetched by page.
+The drawer's view of one run (defined in the root `context.md`). The drawer pages a fetched result locally; a run is never re-fetched by page.
 _Avoid_: report, execution, job
 
 **Run receipt**:
