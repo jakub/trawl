@@ -65,7 +65,7 @@
       "crates/trawl-web/src/config.rs",
       "crates/trawl-web/tests/log_filter_contract.rs",
       "crates/trawl-web/tests/public_origins_packaging_contract.rs",
-      "docs/adr/0032-fresh-state-launch-baseline.md",
+      "docs/adr/0036-fresh-state-launch-baseline.md",
       "scripts/schema-baseline/README.md",
       "scripts/schema-baseline/cases.rs",
       "scripts/schema-baseline/fixtures/fleet/20260515000001_create_api_key_keystore.sql",
