@@ -1,0 +1,12 @@
+# Checks the land gates may merge through when red. One entry per line: a
+# bare check name excuses that whole check; `check-name:test_name` names one
+# flaky test inside a suite check and only marks its job log worth reading.
+# Blank lines and # comments are not entries. Read by the flow land gates
+# from THIS file on the base branch: an entry added on a PR excuses nothing.
+
+# GitHub's Copilot code-scanning "AI findings" (Autofind) job. It opens its
+# session with a model Copilot's API refuses (`400 The requested model is not
+# supported`), on every pull request head since 2026-09-18, before it has read
+# a line of the diff. GitHub-side; nothing in this repository configures it.
+# Remove this line once the job passes on a head again.
+github-advanced-security
