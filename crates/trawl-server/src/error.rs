@@ -109,7 +109,11 @@ impl ServerError {
     /// Return a sanitized error message safe for logs and tracker history.
     ///
     /// Database internals and internal error details are redacted to prevent
-    /// information disclosure. Parse/emit errors (client mistakes) are preserved.
+    /// information disclosure. Parse, emit and refusal messages (client
+    /// mistakes, every one of them trawl-authored or quoting the caller's own
+    /// tokens) are preserved by the catch-all below: a redacted refusal would
+    /// leave the tracker, the scheduler's run rows and the client response
+    /// unable to say what was refused.
     pub fn safe_message(&self) -> String {
         match self {
             Self::Engine(EngineError::Database(_)) => "query execution failed".to_owned(),
@@ -596,6 +600,12 @@ mod tests {
             message: message.to_string(),
         });
         assert_eq!(err.error_class(), "refused");
+        assert_eq!(
+            err.safe_message(),
+            message,
+            "there is nothing in it to redact, and the tracker's history row \
+             would otherwise say a query failed without saying why"
+        );
 
         let response = err.into_response();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);

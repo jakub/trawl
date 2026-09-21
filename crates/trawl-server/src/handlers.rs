@@ -363,9 +363,18 @@ pub async fn query(
             // tracker, the opt-in query debug log, and the DEBUG event below.
             let error_class = e.error_class();
             match &e {
+                // Every 400-class engine answer, including the refusal
+                // the engine proved by asking `DuckDB` about the
+                // caller's own column: a query nobody could have
+                // answered is the caller's mistake, and logging it at
+                // ERROR as the server's own failure buries the ones
+                // that are. `error_type` is the coarse lane label the
+                // three have shared since the emitter joined the
+                // parser here; `error_class` tells them apart.
                 ServerError::Engine(
                     trawl_engine::error::EngineError::Parse(_)
-                    | trawl_engine::error::EngineError::Emit(_),
+                    | trawl_engine::error::EngineError::Emit(_)
+                    | trawl_engine::error::EngineError::Refused { .. },
                 ) => {
                     tracing::warn!(
                         event_type = "query_failed",

@@ -1258,8 +1258,10 @@ fn validate_timechart_inputs(
 /// unknown field read the same), this asks for evidence: re-run with the
 /// `_raw` side bound to a typed NULL, and take that result only if it binds.
 /// If it fails too, the missing column was the user's, so the original error
-/// is what they see. The parameter list is identical between the two SQL
-/// strings (ADR-0009).
+/// is what they see — unless the retry came back with something only it could
+/// know: a cancellation, or a refusal it proved against the relation the
+/// caller meant. The parameter list is identical between the two SQL strings
+/// (ADR-0009).
 ///
 /// Costs nothing on the success path, and nothing for queries without a text
 /// search — `raw_free_sql` is `None` there.
@@ -1287,7 +1289,15 @@ fn with_raw_fallback<T>(
         // A cancellation the retry hit is its own answer: reporting the
         // first attempt's missing-column error would tell the caller its
         // query was wrong when the caller is the one who stopped it.
-        EngineError::Cancelled => e,
+        //
+        // So is a refusal, and for the same reason one level down: the
+        // retry is the attempt that bound the relation the caller meant,
+        // and it asked `DuckDB` about the column the caller named. The
+        // first attempt's error is about `_raw`, which is trawl's column
+        // and not theirs — and it is an `Emit`, so handing it back would
+        // also route a proven-wrong query into the hot lanes' benign
+        // binder policy.
+        EngineError::Cancelled | EngineError::Refused { .. } => e,
         _ => err,
     })
 }
@@ -1299,6 +1309,11 @@ fn with_raw_fallback<T>(
 /// The trigger for the `_raw`-free retry (see [`with_raw_fallback`]), which
 /// then decides from evidence — does the raw-free SQL bind? — rather than
 /// from which column the message names.
+///
+/// [`EngineError::Refused`] is deliberately not a trigger: the engine
+/// already asked `DuckDB` about the column the caller named and got an
+/// answer, and no substitution on the `_raw` side changes that column's
+/// type. Retrying would pay a second bind to reach the same sentence.
 fn is_missing_column_failure(e: &EngineError) -> bool {
     match e {
         EngineError::Emit(_) => true,
@@ -2406,6 +2421,208 @@ fn missing_column_still_benign_with_hot() {
         )
         .expect("a missing column with a hot buffer keeps the empty-result UX");
     assert!(result.rows.is_empty(), "{:?}", result.rows);
+}
+
+/// A source with no `_raw` column at all: user-owned parquet read in
+/// embedded mode, the shape the `_raw`-free retry exists for. Bare-word
+/// search degrades to `message` there, so the retry's relation binds
+/// and its probe has a `hostname` to ask `DuckDB` about.
+#[cfg(test)]
+fn raw_free_fixture(dir: &tempfile::TempDir) -> String {
+    let path = dir
+        .path()
+        .join("raw_free.parquet")
+        .to_str()
+        .expect("temp path is valid UTF-8")
+        .to_string();
+    Connection::open_in_memory()
+        .expect("in-memory duckdb")
+        .execute_batch(&format!(
+            "COPY (SELECT * FROM (VALUES ('needle', 'web-1'), ('haystack', 'web-2')) \
+             AS t(message, hostname)) TO '{path}' (FORMAT PARQUET)"
+        ))
+        .expect("fixture writes");
+    path
+}
+
+/// A refusal the `_raw`-free retry proved is the caller's answer.
+///
+/// The primary attempt's probe fails on `_raw` — which is the whole
+/// reason the retry exists — and the retry binds the same stage with
+/// `_raw` replaced by a typed NULL, where `DuckDB` reports the bucket
+/// source as the VARCHAR it is. Substituting the first attempt's
+/// missing-`_raw` error there sends the reader after a column they
+/// never typed, and, because that error is an `Emit`, hands the hot
+/// lanes a benign-binder verdict for a query no source can answer.
+#[cfg(test)]
+#[test]
+fn refusal_survives_raw_free_retry() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source = raw_free_fixture(&dir);
+
+    assert_eq!(
+        timechart_refusal(&source, "needle | timechart on hostname count()"),
+        "timechart on 'hostname' is not a timestamp: VARCHAR",
+        "the retry's own refusal, not the missing `_raw` that provoked it"
+    );
+}
+
+/// And the retry keeps its place for the failure it was built around: a
+/// column neither pass can bind still answers with the first attempt's
+/// error, because the retry's copy of it names `_raw` — a column of
+/// trawl's, not of the reader's query.
+#[cfg(test)]
+#[test]
+fn raw_free_retry_still_reports_the_original_missing_column() {
+    let emitted = raw_fallback_query();
+    let attempts = std::cell::Cell::new(0_u32);
+    let outcome: Result<(), EngineError> = with_raw_fallback(&emitted, |_| {
+        attempts.set(attempts.get() + 1);
+        Err(EngineError::Emit(
+            trawl_core::emitter::EmitError::UnsupportedOperation {
+                message: format!("unknown field: attempt {}", attempts.get()),
+            },
+        ))
+    });
+
+    assert_eq!(attempts.get(), 2, "both passes must have been attempted");
+    match outcome {
+        Err(EngineError::Emit(e)) => assert_eq!(
+            e.to_string(),
+            "unsupported operation: unknown field: attempt 1",
+            "the original error, not the retry's copy of it"
+        ),
+        other => panic!("expected the first attempt's error, got {other:?}"),
+    }
+}
+
+/// A refusal does not provoke the retry in the first place.
+///
+/// The retry asks a question about evidence — does this query bind
+/// without `_raw`? — and a refusal has already answered it: `DuckDB`
+/// typed the column the reader named, and no substitution on the
+/// `_raw` side changes that type. Re-running the whole statement would
+/// cost a second bind to reach the same sentence.
+#[cfg(test)]
+#[test]
+fn refusal_never_triggers_the_raw_free_retry() {
+    let emitted = raw_fallback_query();
+    let attempts = std::cell::Cell::new(0_u32);
+    let outcome: Result<(), EngineError> = with_raw_fallback(&emitted, |_| {
+        attempts.set(attempts.get() + 1);
+        Err(EngineError::Refused {
+            message: "timechart on 'hostname' is not a timestamp: VARCHAR".to_string(),
+        })
+    });
+
+    assert_eq!(attempts.get(), 1, "a refusal is not evidence to re-gather");
+    match outcome {
+        Err(EngineError::Refused { message }) => assert_eq!(
+            message,
+            "timechart on 'hostname' is not a timestamp: VARCHAR"
+        ),
+        other => panic!("expected the refusal, got {other:?}"),
+    }
+}
+
+/// An emitted query carrying a `_raw`-free twin, for the two policy
+/// tests above: a bare-word search is what binds `_raw`.
+#[cfg(test)]
+fn raw_fallback_query() -> EmittedQuery {
+    let query = parser::parse("needle").expect("dsl parses");
+    let emitted = emitter::emit(&query, "/data/**/*.parquet", EvalContext::capture())
+        .expect("the query emits");
+    assert!(
+        emitted.raw_free_sql.is_some(),
+        "a bare-word search must bind `_raw` and produce the fallback"
+    );
+    emitted
+}
+
+/// The hot-only retry runs its own probes, against its own relation.
+///
+/// A cold start routes the whole query to the hot buffer, and the
+/// re-emission it reads carries the bucket checks for the relation it
+/// actually binds. Without them the one lane with no cold data to hide
+/// would be the one lane that never checks the bucket source — and
+/// `time_bucket(INTERVAL, <untyped NULL>)` binds happily, so the answer
+/// would be a chart of every row in one NULL bucket.
+#[cfg(test)]
+#[test]
+fn refusal_survives_hot_only_retry() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let hot = dir.path().join("hot.ndjson");
+    std::fs::write(
+        &hot,
+        "{\"_time\":\"2026-01-03T00:05:00Z\",\"_ingested\":\"2026-01-03T00:05:01Z\",\
+         \"hostname\":\"web-3\"}\n",
+    )
+    .expect("hot buffer writes");
+    // No parquet behind it: the cold read matches no files, so the
+    // outcome policy answers `HotOnly`.
+    let cold = format!("{}/nothing/*.parquet", dir.path().display());
+
+    let outcome = Executor::new().expect("executor").run_query_with_hot(
+        "* | let t = null | timechart on t count()",
+        &cold,
+        hot.to_str().expect("temp path is valid UTF-8"),
+        &FieldTypes::new(),
+        &FieldTypes::new(),
+        usize::MAX,
+        0,
+    );
+    match outcome {
+        Err(EngineError::Refused { message }) => assert_eq!(
+            message, "timechart on 't' is not a timestamp: INTEGER",
+            "the hot-only retry refuses what the union attempt never got to see"
+        ),
+        Err(other) => panic!("expected the bucket-type refusal, got {other:?}"),
+        Ok(result) => panic!(
+            "expected a refusal, got {} rows over {} columns",
+            result.rows.len(),
+            result.columns.len()
+        ),
+    }
+}
+
+/// The export lane's hot-only retry, for the same reason — with a file
+/// on disk as the consequence.
+#[cfg(test)]
+#[test]
+fn export_refusal_survives_hot_only_retry() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let hot = dir.path().join("hot.ndjson");
+    std::fs::write(
+        &hot,
+        "{\"_time\":\"2026-01-03T00:05:00Z\",\"_ingested\":\"2026-01-03T00:05:01Z\",\
+         \"hostname\":\"web-3\"}\n",
+    )
+    .expect("hot buffer writes");
+    let cold = format!("{}/nothing/*.parquet", dir.path().display());
+    let out = dir.path().join("export.parquet");
+
+    let outcome = Executor::new()
+        .expect("executor")
+        .export_parquet_with_hot(
+            "* | let t = null | timechart on t count()",
+            &cold,
+            hot.to_str().expect("temp path is valid UTF-8"),
+            &FieldTypes::new(),
+            &FieldTypes::new(),
+            &out,
+            usize::MAX,
+        )
+        .expect_err("the hot-only export refuses the bucket source too");
+    match outcome {
+        EngineError::Refused { message } => {
+            assert_eq!(message, "timechart on 't' is not a timestamp: INTEGER");
+        }
+        other => panic!("expected the bucket-type refusal, got {other:?}"),
+    }
+    assert!(
+        !out.exists(),
+        "a refused export must not leave a file behind"
+    );
 }
 
 /// The bucket-source accept-list and the type names a refusal reports,

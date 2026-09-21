@@ -2467,6 +2467,67 @@ mod tests {
         );
     }
 
+    /// An engine refusal crosses the pool intact, sentence and all.
+    ///
+    /// Nothing between the blocking worker and the caller classifies an
+    /// `EngineError` — the worker converts and the async side only
+    /// replaces the outcome when the deadline beat it — so what the
+    /// engine refused is what the handler answers with. The hot buffer
+    /// is the interesting half: with no parquet under the base dir the
+    /// query is answered hot-only, which is the retry that has no cold
+    /// data to hide and so used to be the one with nothing to stop it.
+    #[tokio::test]
+    async fn an_engine_refusal_crosses_the_pool_intact() {
+        use crate::bus::IngestBatch;
+        use crate::hot_buffer::HotBufferConfig;
+
+        let hot = Arc::new(HotBuffer::new(HotBufferConfig {
+            max_events: 100,
+            max_bytes: 1 << 20,
+        }));
+        // The envelope columns a snapshot carries by contract: written
+        // here by hand because this buffer is filled directly, not
+        // through ingest.
+        let mut event = serde_json::Map::new();
+        event.insert("_time".into(), "2026-01-03T00:05:00Z".into());
+        event.insert("_ingested".into(), "2026-01-03T00:05:01Z".into());
+        event.insert("service".into(), "svc".into());
+        event.insert("hostname".into(), "web-1".into());
+        hot.insert(Arc::new(IngestBatch {
+            batch_id: "b1".into(),
+            service: "svc".into(),
+            byte_size: 64,
+            events: vec![event],
+        }));
+
+        let pool = ExecutorPool::new("/nonexistent".into(), 2, 100_000, Some(hot));
+        let outcome = pool
+            .execute(
+                pool.allocate_query_id(),
+                "* | let t = null | timechart on t count()",
+                Deadline::after(Duration::from_secs(30)),
+                false,
+                0,
+                TEST_WORK,
+            )
+            .await;
+
+        let expected = "timechart on 't' is not a timestamp: INTEGER";
+        match outcome.result {
+            Err(err @ ServerError::Engine(trawl_engine::error::EngineError::Refused { .. })) => {
+                assert_eq!(err.error_class(), "refused");
+                assert_eq!(
+                    err.safe_message(),
+                    expected,
+                    "the refusal is trawl-authored and quotes the caller's own \
+                     tokens, so redaction has nothing to take"
+                );
+            }
+            Err(other) => panic!("expected the bucket-type refusal, got {other:?}"),
+            Ok(result) => panic!("expected a refusal, got {} rows", result.row_count()),
+        }
+    }
+
     /// A run that produced no rows carries no presentation metadata: an
     /// error and a timeout both stamp nothing, because there is nothing to
     /// present and the walk's answer would describe a result the caller
