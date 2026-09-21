@@ -464,6 +464,16 @@ export const TIMING = {
   repinPollMs: 3000,
 } as const;
 
+/// Limits the specs share with the app, mirrored the way `TIMING` is: a
+/// spec that counts the rows an aggregation fetch asks for has to count
+/// the SAME ceiling the app asks for, and `e2e_selector_contract.rs`
+/// pins each value against the Rust constant it copies.
+export const LIMITS = {
+  /// crates/trawl-web-ui/src/fetch_plan.rs AGGREGATE_FETCH_ROWS — the
+  /// ceiling one aggregation fetch asks for.
+  aggregateFetchRows: 20000,
+} as const;
+
 export const COPY = {
   historyExport: 'Export this page',
   historyClear: 'Clear history',

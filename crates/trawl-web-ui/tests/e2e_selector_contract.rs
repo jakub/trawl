@@ -1867,6 +1867,12 @@ const CONTRACTS: &[Contract] = &[
         hook: "\"This run stored {n} rows; {fetched} were fetched. Paging covers the fetched rows.\"",
     },
     Contract {
+        assignment: "aggregateFetchRows: 20000,",
+        source_path: "src/fetch_plan.rs",
+        source: include_str!("../src/fetch_plan.rs"),
+        hook: "pub const AGGREGATE_FETCH_ROWS: usize = 20_000;",
+    },
+    Contract {
         assignment: "apiStatusText: 'server returned {0}',",
         source_path: "src/api/mod.rs",
         source: API_MOD_RS,
