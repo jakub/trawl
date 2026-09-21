@@ -327,7 +327,9 @@ fn compare_cells(a: Option<&EvalValue>, b: Option<&EvalValue>) -> std::cmp::Orde
 ///
 /// These are the rules `result_actions::compare` already encodes for the
 /// results table in `trawl-web-ui`, so a column sorted by the browser and
-/// the same column sorted by `| sort` read the same way. Every integer is
+/// the same column sorted by `| sort` read the same way for every value the
+/// JSON hop can carry (a non-finite DOUBLE lands as null there; only the
+/// in-memory NaN sign rule differs, see `int_float`). Every integer is
 /// a point on one line, so the signed and unsigned variants compare as the
 /// numbers they are through `i128` — the narrowest type holding both
 /// ranges — rather than by variant rank. Nothing but a pair that already
