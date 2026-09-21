@@ -1230,15 +1230,17 @@ fn validate_timechart_inputs(
                 )))?;
         let id = bound.column_logical_type(0).id();
         if !bucket_input_is_timestamp(id) {
-            return Err(EngineError::Emit(
-                trawl_core::emitter::EmitError::UnsupportedOperation {
-                    message: format!(
-                        "timechart on '{}' is not a timestamp: {}",
-                        check.column,
-                        duckdb_type_name(id)
-                    ),
-                },
-            ));
+            // `Refused`, not `Emit`: the hot lanes read an `Emit` as a
+            // column the cold source lacks and answer it with an empty
+            // result once the hot-only retry fails the same way. There
+            // is nothing for a narrower source to fix here.
+            return Err(EngineError::Refused {
+                message: format!(
+                    "timechart on '{}' is not a timestamp: {}",
+                    check.column,
+                    duckdb_type_name(id)
+                ),
+            });
         }
     }
     // A cancellation that landed during the last probe's bind stops the
@@ -1479,10 +1481,14 @@ fn classify_query_outcome(
         // No columns: `execute_emitted` substituted an empty result for a
         // "no files match the pattern" read error.
         Ok(_) => HotColdOutcome::NoColumns,
-        // A binder error the query path remapped to Emit.
+        // A binder error the query path remapped to Emit. A refusal is
+        // deliberately NOT this: it wears its own variant precisely so
+        // it falls through to `Fatal` below, because no narrower source
+        // would make the query mean something else and answering it
+        // with the empty-result UX would hide it behind a 200.
         Err(EngineError::Emit(_)) => HotColdOutcome::BenignBinder,
         Err(EngineError::Database(_)) => HotColdOutcome::Recoverable,
-        // ResultTooLarge, parse, IO — propagate.
+        // Refused, ResultTooLarge, parse, IO — propagate.
         Err(_) => HotColdOutcome::Fatal,
     }
 }
@@ -1498,6 +1504,9 @@ fn classify_export_outcome(outcome: &Result<(), EngineError>) -> HotColdOutcome 
         Ok(()) => HotColdOutcome::Columns,
         Err(EngineError::Database(e)) if is_no_files_error(e) => HotColdOutcome::NoColumns,
         Err(EngineError::Database(e)) if is_binder_column_error(e) => HotColdOutcome::BenignBinder,
+        // Same carve-out as the query lane: an emitter refusal keeps the
+        // empty-result UX, while `Refused` falls through to `Fatal`
+        // below — an export that swallowed it would write the file.
         Err(EngineError::Emit(_)) => HotColdOutcome::BenignBinder,
         Err(EngineError::Database(_)) => HotColdOutcome::Recoverable,
         Err(_) => HotColdOutcome::Fatal,
@@ -2021,24 +2030,23 @@ fn timechart_fixture(dir: &tempfile::TempDir) -> String {
     path
 }
 
-/// The message of the 400-class refusal `dsl` earns, or a panic naming
-/// what came back instead.
+/// The message of the bucket-type refusal `dsl` earns, or a panic
+/// naming what came back instead.
 #[cfg(test)]
 fn timechart_refusal(source: &str, dsl: &str) -> String {
-    let outcome = Executor::new().expect("executor").run_query(
-        dsl,
-        source,
-        &FieldTypes::new(),
-        usize::MAX,
-        0,
-    );
-    match outcome {
-        Err(EngineError::Emit(trawl_core::emitter::EmitError::UnsupportedOperation {
-            message,
-        })) => message,
-        Err(other) => panic!("expected the 400-class refusal, got {other:?}"),
+    match timechart_outcome(source, dsl) {
+        Err(EngineError::Refused { message }) => message,
+        Err(other) => panic!("expected the bucket-type refusal, got {other:?}"),
         Ok(result) => panic!("expected a refusal, got {} rows", result.rows.len()),
     }
+}
+
+/// What the cold query lane answers `dsl` with.
+#[cfg(test)]
+fn timechart_outcome(source: &str, dsl: &str) -> Result<QueryResult, EngineError> {
+    Executor::new()
+        .expect("executor")
+        .run_query(dsl, source, &FieldTypes::new(), usize::MAX, 0)
 }
 
 /// Every bucket source that is not a timestamp is refused, naming the
@@ -2141,10 +2149,8 @@ fn export_refuses_bad_timechart_input() {
 
     for outcome in [cold, with_hot] {
         match outcome {
-            EngineError::Emit(trawl_core::emitter::EmitError::UnsupportedOperation { message }) => {
-                assert_eq!(message, expected);
-            }
-            other => panic!("expected the 400-class refusal, got {other:?}"),
+            EngineError::Refused { message } => assert_eq!(message, expected),
+            other => panic!("expected the bucket-type refusal, got {other:?}"),
         }
     }
     assert!(
@@ -2267,7 +2273,14 @@ fn failed_probe_is_not_silence() {
     let source = timechart_fixture(&dir);
     let dsl = "last=10000d * | timechart on d span=1d count()";
 
-    let message = timechart_refusal(&source, dsl);
+    let message = match timechart_outcome(&source, dsl) {
+        // Either shape is a refusal: the probe's own filter fails to
+        // bind (a missing column, remapped) before it can report the
+        // DATE it would have refused anyway.
+        Err(e @ (EngineError::Emit(_) | EngineError::Refused { .. })) => e.to_string(),
+        Err(other) => panic!("expected a refusal, got {other:?}"),
+        Ok(result) => panic!("expected a refusal, got {} rows", result.rows.len()),
+    };
     assert!(
         message.contains("_time") || message.contains("timechart on 'd'"),
         "either the probe's unbindable filter or the DATE bucket, never a \
@@ -2296,6 +2309,102 @@ fn empty_glob_probe_stays_silent() {
             0,
         )
         .expect("an empty window is an empty result, probe or no probe");
+    assert!(result.rows.is_empty(), "{:?}", result.rows);
+}
+
+/// A hot buffer does not turn a refusal into an empty 200.
+///
+/// The hot lanes answer a missing column with the empty-result UX: the
+/// cold read could not bind it, so they retry hot-only, and when that
+/// fails the same way they hand back no rows rather than an error.
+/// While the refusal wore `EngineError::Emit` it was caught by that
+/// policy too — a server with a hot buffer answered
+/// `| let t = null | timechart on t count()` with 200 and zero rows,
+/// which is the one outcome worse than the wrong buckets, because
+/// nothing on the wire says the query was refused.
+#[cfg(test)]
+#[test]
+fn type_refusal_survives_hot_fallback() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source = timechart_fixture(&dir);
+    let hot = dir.path().join("hot.ndjson");
+    std::fs::write(
+        &hot,
+        "{\"_time\":\"2026-01-03T00:05:00Z\",\"_ingested\":\"2026-01-03T00:05:01Z\",\
+         \"hostname\":\"web-3\"}\n",
+    )
+    .expect("hot buffer writes");
+
+    let outcome = Executor::new().expect("executor").run_query_with_hot(
+        "* | let t = null | timechart on t count()",
+        &source,
+        hot.to_str().expect("temp path is valid UTF-8"),
+        &FieldTypes::new(),
+        &FieldTypes::new(),
+        usize::MAX,
+        0,
+    );
+    match outcome {
+        Err(EngineError::Refused { message }) => assert_eq!(
+            message, "timechart on 't' is not a timestamp: INTEGER",
+            "the refusal reaches the caller intact"
+        ),
+        Err(other) => panic!("expected the bucket-type refusal, got {other:?}"),
+        Ok(result) => panic!(
+            "expected a refusal, got {} rows over {} columns",
+            result.rows.len(),
+            result.columns.len()
+        ),
+    }
+
+    // And it is hard at the policy, not merely unmatched by the arm
+    // that turns a failed hot-only retry into an empty result: a
+    // `BenignBinder` verdict here would send the lane off to re-emit and
+    // re-run the whole query hot-only before landing back on the same
+    // refusal.
+    let refused = || EngineError::Refused {
+        message: "timechart on 'x' is not a timestamp: VARCHAR".to_string(),
+    };
+    assert_eq!(
+        classify_query_outcome(&Err(refused())),
+        HotColdOutcome::Fatal,
+        "the query lane must not treat a refusal as a missing column"
+    );
+    assert_eq!(
+        classify_export_outcome(&Err(refused())),
+        HotColdOutcome::Fatal,
+        "nor the export lane"
+    );
+}
+
+/// And the policy it is carved out of is untouched: a column neither
+/// source has still answers with the hot lane's empty result, not with
+/// a refusal.
+#[cfg(test)]
+#[test]
+fn missing_column_still_benign_with_hot() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source = timechart_fixture(&dir);
+    let hot = dir.path().join("hot.ndjson");
+    std::fs::write(
+        &hot,
+        "{\"_time\":\"2026-01-03T00:05:00Z\",\"_ingested\":\"2026-01-03T00:05:01Z\",\
+         \"hostname\":\"web-3\"}\n",
+    )
+    .expect("hot buffer writes");
+
+    let result = Executor::new()
+        .expect("executor")
+        .run_query_with_hot(
+            "* | where nosuchcolumn == 1",
+            &source,
+            hot.to_str().expect("temp path is valid UTF-8"),
+            &FieldTypes::new(),
+            &FieldTypes::new(),
+            usize::MAX,
+            0,
+        )
+        .expect("a missing column with a hot buffer keeps the empty-result UX");
     assert!(result.rows.is_empty(), "{:?}", result.rows);
 }
 

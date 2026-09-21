@@ -154,6 +154,7 @@ impl ServerError {
         match self {
             Self::Engine(EngineError::Parse(_)) => "parse",
             Self::Engine(EngineError::Emit(_)) => "emit",
+            Self::Engine(EngineError::Refused { .. }) => "refused",
             Self::Engine(EngineError::Database(_)) => "database",
             Self::Engine(EngineError::ResultTooLarge(_)) => "result_too_large",
             Self::Engine(EngineError::ColdDataUnread) => "cold_data_unread",
@@ -260,6 +261,15 @@ impl IntoResponse for ServerError {
             Self::Engine(EngineError::Emit(e)) => (
                 StatusCode::BAD_REQUEST,
                 ErrorEnvelope::simple(ErrorCode::ValidationError, e.to_string()),
+            ),
+            // The engine proved the query wrong by asking `DuckDB` a
+            // question of its own, which makes it the caller's mistake
+            // and not the server's: same 400 class as an emitter
+            // refusal, and the same sentence, which is trawl-authored
+            // and quotes only the caller's own tokens.
+            Self::Engine(EngineError::Refused { message }) => (
+                StatusCode::BAD_REQUEST,
+                ErrorEnvelope::simple(ErrorCode::ValidationError, message.clone()),
             ),
             Self::Engine(EngineError::ResultTooLarge(n)) => (
                 StatusCode::BAD_REQUEST,
@@ -568,6 +578,33 @@ mod tests {
         let err = ServerError::ServiceUnavailable("not ready".into());
         let response = err.into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// An engine refusal is the caller's mistake, not the server's: 400,
+    /// with the sentence intact.
+    ///
+    /// The engine raises it after proving the query wrong against
+    /// `DuckDB` — a `timechart` bucketing a column that is not a
+    /// timestamp — so the text is trawl-authored and quotes only the
+    /// caller's own tokens. Redacting it would leave a 400 that says
+    /// nothing, and classing it 500 would blame the server for a query
+    /// no source could have answered.
+    #[tokio::test]
+    async fn engine_refusal_is_a_bad_request_with_its_message() {
+        let message = "timechart on 'hostname' is not a timestamp: VARCHAR";
+        let err = ServerError::Engine(EngineError::Refused {
+            message: message.to_string(),
+        });
+        assert_eq!(err.error_class(), "refused");
+
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = body_string(response).await;
+        assert!(body.contains(message), "got: {body}");
+        assert!(
+            body.contains("validation_error"),
+            "the same code an emitter refusal carries: {body}"
+        );
     }
 
     // -- StoreError → HTTP table (ADR-0004: 503 / 409 / 404 / 400) ─────────
