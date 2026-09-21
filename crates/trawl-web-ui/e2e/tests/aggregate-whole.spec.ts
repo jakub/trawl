@@ -116,6 +116,15 @@ test('above the ceiling the chart refuses with the measured count', async ({ pag
   // claim to an opaque canvas.
   await expect(page.locator(SEL.chartHost)).not.toHaveAttribute('data-points', /.*/);
   await expect(page.locator(`${SEL.chartHost} canvas`)).toHaveCount(0);
+
+  // The refusal sends the reader to Events, so Events has to say the
+  // same thing about the same numbers: the table pages 20,000 of the
+  // 43,210 rows the execution produced, and the cap line under it is
+  // the only place that gap is written down.
+  await page.getByRole('tab', { name: 'Events' }).click();
+  const cap = page.locator(SEL.resultsCap);
+  await expect(cap).toContainText('43,210');
+  await expect(cap).toContainText('20,000');
 });
 
 test('a complete result at the ceiling draws', async ({ page, request }) => {
@@ -126,6 +135,13 @@ test('a complete result at the ceiling draws', async ({ page, request }) => {
   await page.getByRole('tab', { name: 'Visualization', exact: true }).click();
 
   await expect(page.locator(SEL.chartHost)).toHaveAttribute('data-points', String(LIMITS.aggregateFetchRows));
+
+  // Nothing was left behind, so Events has nothing to cap. The line is
+  // absent, not empty: a cap line that always rendered would make the
+  // assertion above it meaningless.
+  await page.getByRole('tab', { name: 'Events' }).click();
+  await expect(page.locator(SEL.exactTable)).toHaveCount(1);
+  await expect(page.locator(SEL.resultsCap)).toHaveCount(0);
 });
 
 test('a cut grouped result keeps the grouped refusal', async ({ page, request }) => {
