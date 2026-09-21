@@ -359,9 +359,18 @@ const AGGREGATE_EPOCH = Date.parse('2026-09-01T00:00:00Z');
 const AGGREGATE_BUCKET_MS = 2 * 60 * 1000;
 
 /** Deterministic, non-negative and not constant: a flat line would hide
- * a chart that plotted the same point N times. */
+ * a chart that plotted the same point N times.
+ *
+ * Row 0 is a deliberate spike, well above the 13 the cycle reaches. It
+ * puts the result's largest count on the FIRST page only, which is what
+ * lets a width assertion tell the two scales apart: a bar measured
+ * against the whole result keeps its width on page 2, while one
+ * measured against its own page stretches against a page maximum of 13.
+ * Without the spike both scales read 13 and the assertion passes on the
+ * defect (ADR-0037). Every count stays positive so the track is
+ * one-sided and the largest fills it. */
 function aggregateCount(i) {
-  return ((i * 7) % 13) + 1;
+  return i === 0 ? 47 : ((i * 7) % 13) + 1;
 }
 
 /** `POST /api/v1/query` under `aggregate` for a `| timechart` pipeline:

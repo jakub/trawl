@@ -196,7 +196,17 @@ test('bar widths do not change with the page', async ({ page, request }) => {
     value: li.querySelector('.cat-val')!.textContent ?? '',
     width: li.querySelector('.cat-track i')?.getAttribute('style') ?? null,
   })));
-  const first = (await read())[0];
+  // The generator spikes row 0 above every other count, so the result's
+  // maximum is on page 1 and page 1 alone. That is what makes the two
+  // scales give different answers below: with the counts merely cycling,
+  // page 1, page 2 and the whole result all peak at the same 13 and a
+  // page-scoped scale would draw exactly the widths a whole-result scale
+  // does.
+  const onPageOne = await read();
+  expect(onPageOne[0].width, 'the spiked row fills its track').toBe('width:100.00%');
+  // The reference bar is therefore row 1, not the spike: an ordinary
+  // count, one that recurs on page 2.
+  const first = onPageOne[1];
   expect(first.width).not.toBeNull();
 
   await page.getByRole('button', { name: 'Next' }).click();
@@ -207,6 +217,9 @@ test('bar widths do not change with the page', async ({ page, request }) => {
   const twin = onPageTwo.find((bar) => bar.value === first.value);
   expect(twin, `no group on page 2 shares the count ${first.value}`).toBeDefined();
   expect(twin!.width).toBe(first.width);
+  // And page 2's own largest count fills nothing: the scale it is drawn
+  // against left the page with row 0.
+  expect(onPageTwo.map((bar) => bar.width)).not.toContain('width:100.00%');
 
   // Sorting re-orders the whole result, so it changes WHICH groups this
   // page holds — and the table and the bars have to agree on the answer.
