@@ -386,6 +386,116 @@ mod tests {
     }
 }
 
+/// `run=all` feeds a relation whose only timestamp is `_run_time`, so
+/// `timechart on _run_time` is the stage that makes it chartable: real
+/// runs, real parquet, real `DuckDB`, one bucket per hour of run time.
+///
+/// Module-level rather than inside `pg_tests` so its path is
+/// `from_saved::timechart_on_run_time`.
+#[cfg(test)]
+#[sqlx::test]
+async fn timechart_on_run_time(pool: sqlx::PgPool) {
+    use crate::store::RunStatus;
+    use pg_tests::{run, schedule_id, seed};
+
+    /// A one-row parquet result carrying the `count` column a report's
+    /// `stats count()` would have written.
+    fn write_count_parquet(data_dir: &str, rel: &str, count: i64) {
+        let full = format!("{data_dir}/{rel}");
+        std::fs::create_dir_all(std::path::Path::new(&full).parent().unwrap()).unwrap();
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT {count}::BIGINT AS \"count\") TO '{full}' (FORMAT PARQUET)"
+        ))
+        .unwrap();
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().to_str().unwrap();
+
+    let (saved_id, sched_store, saved_store) = seed(&pool, 1, "timechart_runs").await;
+    let sid = schedule_id(&sched_store, saved_id).await;
+
+    write_count_parquet(data_dir, "scheduled/timechart_runs/run_1.parquet", 4);
+    write_count_parquet(data_dir, "scheduled/timechart_runs/run_2.parquet", 6);
+    let r1 = run(
+        &sched_store,
+        sid,
+        saved_id,
+        RunStatus::Success,
+        Some("scheduled/timechart_runs/run_1.parquet"),
+    )
+    .await;
+    let r2 = run(
+        &sched_store,
+        sid,
+        saved_id,
+        RunStatus::Success,
+        Some("scheduled/timechart_runs/run_2.parquet"),
+    )
+    .await;
+
+    // Both runs happen inside this test, so their real `started_at`
+    // values land in the same hour — and, once an hour, in two. Plant
+    // the instants instead, so the bucketing is asserted, not sampled.
+    for (id, at) in [(r1, "2026-01-01T00:17:00Z"), (r2, "2026-01-01T02:41:00Z")] {
+        sqlx::query("UPDATE report_runs SET started_at = $1 WHERE id = $2")
+            .bind(at.parse::<chrono::DateTime<chrono::Utc>>().unwrap())
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    let dsl = "| from saved timechart_runs run=all | timechart on _run_time span=1h sum(count)";
+    let ast = trawl_core::parser::parse(dsl).expect("dsl parses");
+    let stage = ast
+        .from_saved_stage()
+        .expect("the first stage is from saved");
+    let resolved = resolve(
+        stage,
+        dsl,
+        ast.pipeline[0].span.end,
+        &saved_store,
+        &sched_store,
+        1,
+        data_dir,
+    )
+    .await
+    .expect("run=all resolves");
+
+    let remaining = trawl_core::parser::parse(&resolved.remaining_dsl).expect("the tail parses");
+    let emitted = trawl_core::emitter::emit(
+        &remaining,
+        &resolved.source,
+        trawl_core::context::EvalContext::capture(),
+    )
+    .expect("emit succeeds");
+
+    let conn = duckdb::Connection::open_in_memory().unwrap();
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT strftime(\"_time\", '%Y-%m-%d %H:%M:%S') AS b, \
+             CAST(\"sum_count\" AS BIGINT) FROM ({}) ORDER BY b",
+            emitted.sql
+        ))
+        .expect("the emitted SQL binds over the run union");
+    let rows: Vec<(String, i64)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("the emitted SQL runs")
+        .collect::<Result<_, _>>()
+        .expect("rows read");
+
+    assert_eq!(
+        rows,
+        vec![
+            ("2026-01-01 00:00:00".to_string(), 4),
+            ("2026-01-01 02:00:00".to_string(), 6),
+        ],
+        "one bucket per hour of run time, carrying that run's count"
+    );
+}
+
 /// Store-backed coverage for the run-selector resolution path.
 ///
 /// These exercise the branch logic against a real `#[sqlx::test]` database
@@ -405,7 +515,11 @@ mod pg_tests {
     use crate::store::{RunClaim, RunStatus, SavedQueryStore, ScheduleStore};
 
     /// Create a saved query and its schedule, returning both ids.
-    async fn seed(pool: &PgPool, key_id: i64, name: &str) -> (i64, ScheduleStore, SavedQueryStore) {
+    pub(super) async fn seed(
+        pool: &PgPool,
+        key_id: i64,
+        name: &str,
+    ) -> (i64, ScheduleStore, SavedQueryStore) {
         let saved_store = SavedQueryStore::new(pool.clone());
         let sched_store = ScheduleStore::new(pool.clone());
         let saved = saved_store
@@ -421,7 +535,7 @@ mod pg_tests {
 
     /// Start then finish a run, returning its id. `path`/`status` let callers
     /// build success-with-parquet, success-without-parquet, and error rows.
-    async fn run(
+    pub(super) async fn run(
         store: &ScheduleStore,
         schedule_id: i64,
         saved_id: i64,
@@ -487,7 +601,7 @@ mod pg_tests {
     }
 
     /// Schedule id for a saved query (seed always creates exactly one).
-    async fn schedule_id(store: &ScheduleStore, saved_id: i64) -> i64 {
+    pub(super) async fn schedule_id(store: &ScheduleStore, saved_id: i64) -> i64 {
         store
             .get_schedule_for_saved_query(saved_id, 1)
             .await

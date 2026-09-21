@@ -67,6 +67,15 @@ pub struct EmittedQuery {
     /// raw-free pass pushes the same parameters in the same order — so the
     /// executor can retry with this SQL against a source that has no `_raw`.
     pub raw_free_sql: Option<String>,
+    /// The column an explicit `timechart on <field>` buckets — `Some`
+    /// only when the reader named a column other than `_time`.
+    ///
+    /// A metadata hint, not an input to the SQL: the bucket expression in
+    /// [`sql`](Self::sql) already names the column. It exists so the
+    /// executor can recognise `DuckDB`'s refusal to bucket a
+    /// non-timestamp column as this stage's fault and answer with a
+    /// sentence naming the column, instead of a bare binder error.
+    pub timechart_on: Option<String>,
     /// The instant this statement's `now()` reads (ADR-0017 §3).
     ///
     /// The caller captures it once per logical query and stamps it here,
@@ -444,6 +453,7 @@ fn emit_from_state(
 
     let needs_column_reorder = state.needs_column_reorder();
     let referenced_raw = state.bound_raw_column();
+    let timechart_on = state.timechart_on.clone();
     let anchor = state.anchor();
     let sql = state.finalize()?;
     let params = state.into_params();
@@ -456,6 +466,7 @@ fn emit_from_state(
             rust_stage_pins,
             needs_column_reorder,
             raw_free_sql: None,
+            timechart_on,
             anchor,
         },
         referenced_raw,

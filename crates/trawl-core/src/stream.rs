@@ -1436,6 +1436,19 @@ fn compile_aggregation(stage: &PipeStage) -> Result<CompiledAggregation, StreamP
             })
         }
         PipeStage::Timechart(s) => {
+            // The live lane buckets arrival-ordered events by their
+            // envelope time; it has no equivalent of the SQL lane's
+            // arbitrary bucket column, and answering with `_time`
+            // buckets anyway would make the two lanes disagree about
+            // what the query means (ADR-0013 ruling 8).
+            if let Some(col) = s.on.as_deref().filter(|c| *c != crate::schema::TIME) {
+                return Err(StreamPlanError::UnsupportedStage {
+                    stage: "timechart".to_string(),
+                    reason: format!(
+                        "bucketing on '{col}' is not supported in streaming mode;                          only _time can be bucketed live"
+                    ),
+                });
+            }
             let span_secs = s
                 .span
                 .as_ref()
@@ -1887,6 +1900,42 @@ fn snapshot_percentile(values: &[f64], target: f64) -> EvalValue {
     let sorted = sort_sample(values);
     let idx = (target * (sorted.len() - 1) as f64).round() as usize;
     EvalValue::Float(sorted[idx.min(sorted.len() - 1)])
+}
+
+/// The live lane buckets by arrival-time envelope, so a `timechart`
+/// that names another bucket column is refused rather than answered
+/// with `_time` buckets under the reader's column name.
+///
+/// Both doors into the lane are checked. `compile_stream_plan` is the
+/// SSE stream's door; the same compiler is also what the batch tail
+/// behind `extract kv` goes through (`trawl-engine`'s
+/// `post_process::apply_rust_stages`, whose own refusal is pinned by
+/// `post_process::timechart_on_refused_in_batch_tail` there — it cannot
+/// be called from this crate, which trawl-engine depends on).
+#[cfg(test)]
+#[test]
+fn timechart_on_refused_in_live_lane() {
+    let pins = PinScope::unpinned();
+    let pipeline = |dsl: &str| crate::parser::parse(dsl).expect("dsl parses").pipeline;
+
+    let refusal = compile_stream_plan(
+        &pipeline("* | extract kv | timechart on hostname span=5m count()"),
+        &pins,
+    )
+    .expect_err("a bucket column other than _time has no live meaning")
+    .to_string();
+    assert!(
+        refusal.contains("timechart")
+            && refusal.contains("'hostname'")
+            && refusal.contains("streaming mode"),
+        "the refusal must name the stage, the column and the lane: {refusal}"
+    );
+
+    compile_stream_plan(
+        &pipeline("* | extract kv | timechart on _time span=5m count()"),
+        &pins,
+    )
+    .expect("`on _time` is the default spelled out, not a new bucket source");
 }
 
 #[cfg(test)]

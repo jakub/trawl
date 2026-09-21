@@ -678,7 +678,7 @@ Bare `dedup` keeps distinct whole rows. With fields, `dedup` keeps the row with 
 ### timechart
 
 ```text
-timechart [span=<duration>] <agg>[ as <name>][, <agg> ...] [by <field>[, <field> ...]]
+timechart [on <field>] [span=<duration>] <agg>[ as <name>][, <agg> ...] [by <field>[, <field> ...]]
 ```
 
 ```
@@ -686,9 +686,11 @@ timechart [span=<duration>] <agg>[ as <name>][, <agg> ...] [by <field>[, <field>
 timechart span=5m count()
 # one series per service
 timechart span=1h count() by service
+# buckets cut from each run's start time
+| from saved daily_errors run=all | timechart on _run_time span=1h sum(count)
 ```
 
-The bucket column is always named `_time`, and rows come back in bucket order. Without `span=`, trawl derives the bucket from the `last=` window.
+The bucket column is always named `_time`, and rows come back in bucket order. The buckets are cut from `_time` unless `on` names another column, which must already hold timestamps: trawl buckets it as stored and refuses a column of any other type. Without `span=`, trawl derives the bucket from the `last=` window.
 
 | `last=` window | Bucket |
 | --- | --- |

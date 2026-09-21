@@ -424,12 +424,29 @@ fn dedup_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, Parser
         .labelled("dedup stage")
 }
 
-/// Parse a `timechart` stage: `timechart [span=DURATION] agg(, agg)* [by field(, field)*]`
+/// Parse a `timechart` stage:
+/// `timechart [on field] [span=DURATION] agg(, agg)* [by field(, field)*]`
+///
+/// The clause order is canonical, not free: `on` precedes `span=`, so
+/// `timechart span=1h on x` is a parse error rather than a second spelling
+/// of the same stage.
 fn timechart_stage<'src>()
 -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone {
     keyword("timechart")
         .spaced()
+        // `.spaced()` wraps the whole clause, not just the keyword:
+        // `field_name()` consumes no padding of its own, and what follows
+        // it here — the optional `span=`, or the first aggregate — is the
+        // one position in this stage that is not introduced by a padded
+        // keyword.
         .ignore_then(
+            keyword("on")
+                .spaced()
+                .ignore_then(field_name())
+                .spaced()
+                .or_not(),
+        )
+        .then(
             keyword("span")
                 .then_ignore(just('='))
                 .ignore_then(duration())
@@ -454,8 +471,9 @@ fn timechart_stage<'src>()
                 .or_not()
                 .map(Option::unwrap_or_default),
         )
-        .map(|((span, aggregations), group_by)| {
+        .map(|(((on, span), aggregations), group_by)| {
             PipeStage::Timechart(TimechartStage {
+                on,
                 span,
                 aggregations,
                 group_by,

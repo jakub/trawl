@@ -479,7 +479,7 @@ impl Executor {
                 return Ok((QueryResult::empty(), TimestampColumns::new()));
             }
             Err(e) if is_binder_column_error(&e) => return Err(remap_binder_error(&e)),
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(classify_execution_error(query, e)),
         };
 
         let params = bind_params(&query.params);
@@ -499,7 +499,7 @@ impl Executor {
                 return Ok((QueryResult::empty(), TimestampColumns::new()));
             }
             Err(e) if is_binder_column_error(&e) => return Err(remap_binder_error(&e)),
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(classify_execution_error(query, e)),
         };
 
         let stmt_ref =
@@ -1107,6 +1107,19 @@ fn value_to_json(v: &Value) -> serde_json::Value {
 const DUCKDB_NO_FILES_MSG: &str = "No files found that match the pattern";
 /// `DuckDB`'s binder-error class prefix, matched as text for the same reason.
 const DUCKDB_BINDER_ERROR_MSG: &str = "Binder Error";
+/// `DuckDB`'s overload-resolution message when `time_bucket` is handed a
+/// bucket source it has no signature for — what an explicit
+/// `timechart on <column>` produces over a column that is not a
+/// timestamp. Matched as text, so a `DuckDB` upgrade has to re-check it;
+/// `timechart_on::refuses_varchar_naming_type` in trawl-core pins the
+/// sentence against the bundled build, and `timechart_on_names_column`
+/// below provokes the real error through this lane.
+///
+/// The function name and the leading argument are inside the matched
+/// text, so no other overload failure and no other binder error can
+/// answer to it.
+const DUCKDB_TIME_BUCKET_TYPE_MSG: &str =
+    "No function matches the given name and argument types 'time_bucket(";
 
 /// Check if a `DuckDB` error is the "No files found" error from `read_parquet()`
 /// when a glob matches zero files. Semantically this means "no data" — not a
@@ -1120,6 +1133,43 @@ fn is_no_files_error(e: &duckdb::Error) -> bool {
 fn is_binder_column_error(e: &duckdb::Error) -> bool {
     let msg = e.to_string();
     msg.contains(DUCKDB_BINDER_ERROR_MSG) && (msg.contains("column") || msg.contains("not found"))
+}
+
+/// Check if a `DuckDB` error is the binder refusing to bucket a
+/// non-timestamp column.
+fn is_time_bucket_type_error(e: &duckdb::Error) -> bool {
+    let msg = e.to_string();
+    msg.contains(DUCKDB_BINDER_ERROR_MSG) && msg.contains(DUCKDB_TIME_BUCKET_TYPE_MSG)
+}
+
+/// Classify a `DuckDB` failure that is neither "no files" nor a missing
+/// column: an explicit `timechart on <column>` over a column `DuckDB`
+/// will not bucket is the reader's mistake, so it answers 400 naming the
+/// column instead of 500 naming a SQL function the reader never wrote.
+///
+/// Everything else keeps its current class, including a bucket-type
+/// error under a query that named no column — which the emitter cannot
+/// produce, `_time` being cast — so the carve-out is exactly as wide as
+/// the stage that earns it.
+fn classify_execution_error(query: &EmittedQuery, e: duckdb::Error) -> EngineError {
+    match query.timechart_on.as_deref() {
+        Some(column) if is_time_bucket_type_error(&e) => {
+            // `DuckDB`'s first line is the sentence; the candidate
+            // overloads it lists after it are solver detail. The class
+            // prefix is dropped because the sentence around it already
+            // says what the reader got wrong.
+            let msg = e.to_string();
+            let sentence = msg.lines().next().unwrap_or(&msg);
+            let sentence = sentence
+                .strip_prefix("Binder Error: ")
+                .unwrap_or(sentence)
+                .trim();
+            EngineError::Emit(trawl_core::emitter::EmitError::UnsupportedOperation {
+                message: format!("timechart on '{column}' is not a timestamp: {sentence}"),
+            })
+        }
+        _ => e.into(),
+    }
 }
 
 /// Retry `attempt` with the query's `_raw`-free SQL when the first try failed
@@ -1864,6 +1914,60 @@ fn days_to_ymd(days: i32) -> (i32, u32, u32) {
     let y = if m <= 2 { y + 1 } else { y };
 
     (y as i32, m, d)
+}
+
+/// `timechart on <column>` over a column `DuckDB` will not bucket is the
+/// reader's error, so it answers in the 400 class naming the column,
+/// instead of a 500 carrying a binder error about a SQL function the
+/// reader never typed.
+///
+/// Runs the real refusal against the bundled `DuckDB`: the message this
+/// carve-out keys off is matched as text
+/// (`DUCKDB_TIME_BUCKET_TYPE_MSG`), so an upgrade that rewords it has to
+/// fail here rather than silently reclassify the refusal.
+#[cfg(test)]
+#[test]
+fn timechart_on_names_column() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("hosts.parquet");
+    let setup = Connection::open_in_memory().expect("in-memory duckdb");
+    setup
+        .execute_batch(&format!(
+            "COPY (SELECT 'web-1' AS hostname, \
+             TIMESTAMP '2026-01-01 00:05:00' AS \"_time\") \
+             TO '{}' (FORMAT PARQUET)",
+            path.display()
+        ))
+        .expect("fixture writes");
+
+    let exec = Executor::new().expect("executor");
+    let err = exec
+        .run_query(
+            "* | timechart on hostname count()",
+            path.to_str().expect("temp path is valid UTF-8"),
+            &FieldTypes::new(),
+            usize::MAX,
+            0,
+        )
+        .expect_err("DuckDB will not bucket a VARCHAR");
+
+    match err {
+        EngineError::Emit(trawl_core::emitter::EmitError::UnsupportedOperation { message }) => {
+            assert!(
+                message.starts_with("timechart on 'hostname' is not a timestamp: "),
+                "the refusal must name the stage and the column: {message}"
+            );
+            assert!(
+                message.contains("time_bucket("),
+                "DuckDB's own sentence is preserved: {message}"
+            );
+            assert!(
+                !message.contains('\n'),
+                "one sentence, not DuckDB's candidate-overload list: {message}"
+            );
+        }
+        other => panic!("expected the 400-class refusal, got {other:?}"),
+    }
 }
 
 #[cfg(test)]

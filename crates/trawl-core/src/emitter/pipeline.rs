@@ -384,12 +384,32 @@ fn process_timechart(
         None => auto_bucket_interval(ctx.time_filter.as_ref()),
     };
 
+    // What the buckets are cut from. The default — and an explicit
+    // `on _time` — is the envelope timestamp, which carries the
+    // unconditional `TRY_CAST` every `_time` read does (ADR-0008). Any
+    // other column is bucketed as stored: no cast, so a column that is
+    // not a timestamp fails to bind instead of coercing to NULL and
+    // collapsing every row into one empty bucket.
+    let bucket_source = match tc.on.as_deref() {
+        None | Some(crate::schema::TIME) => {
+            format!("TRY_CAST({} AS TIMESTAMP)", quote_field("_time"))
+        }
+        Some(col) => {
+            // The hint the executor reads to turn a bucket-type binder
+            // error into a sentence naming this column.
+            if ctx.timechart_on.is_none() {
+                ctx.timechart_on = Some(col.to_string());
+            }
+            quote_field(col)
+        }
+    };
+
     // The bucket is aliased AS "_time", which is also the name of the
     // physical event-time column it buckets. GROUP BY / ORDER BY must
     // therefore reference the full expression, not the name: a bare
     // "_time" would bind to the source column and silently break the
     // aggregation (one group per input row).
-    let bucket = format!("time_bucket(INTERVAL '{interval}', TRY_CAST(\"_time\" AS TIMESTAMP))");
+    let bucket = format!("time_bucket(INTERVAL '{interval}', {bucket_source})");
 
     // Same ordering guard as `stats`, for the same reason: the
     // aggregations are the only parameter-pushing part of this stage,

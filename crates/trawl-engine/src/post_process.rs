@@ -312,6 +312,49 @@ fn numeric_cell(cell: &EvalValue) -> Option<f64> {
     }
 }
 
+/// The batch tail behind `extract kv` goes through the same streaming
+/// compiler the live lane does, so a `timechart` naming a bucket column
+/// is refused there too — and the refusal reaches the caller as the
+/// 400-class `Emit` error, naming the lane and the column.
+///
+/// The other door into that compiler,
+/// `compile_stream_plan`, is pinned by
+/// `stream::timechart_on_refused_in_live_lane` in trawl-core, which
+/// cannot reach this function: trawl-engine depends on that crate, not
+/// the other way round.
+#[cfg(test)]
+#[test]
+fn timechart_on_refused_in_batch_tail() {
+    let tail = trawl_core::parser::parse("* | extract kv | timechart on hostname span=5m count()")
+        .expect("dsl parses")
+        .pipeline;
+    let result = QueryResult {
+        columns: vec![Column {
+            name: "_raw".to_string(),
+        }],
+        rows: Vec::new(),
+    };
+    let anchor = EvalContext::at(
+        chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .expect("a valid RFC 3339 instant")
+            .into(),
+    );
+
+    let err = apply_rust_stages(result, &tail, &PinScope::unpinned(), anchor)
+        .expect_err("a bucket column other than _time has no meaning in the tail");
+    match err {
+        EngineError::Emit(trawl_core::emitter::EmitError::UnsupportedOperation { message }) => {
+            assert!(
+                message.contains("timechart")
+                    && message.contains("'hostname'")
+                    && message.contains("streaming mode"),
+                "the refusal must name the stage, the column and the lane: {message}"
+            );
+        }
+        other => panic!("expected the 400-class refusal, got {other:?}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
