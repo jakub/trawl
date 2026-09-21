@@ -3986,4 +3986,119 @@ mod tests {
             HealthStatus::Unavailable
         );
     }
+
+    // -- the post-execution vanished-run guard ───────────────────────────
+
+    /// Only the two shapes the vanishing window can produce are
+    /// re-decided, and only when the file really is gone: a zero-column
+    /// success or an engine error becomes the named 409, while every
+    /// other outcome keeps the answer it earned.
+    #[test]
+    fn guard_vanished_run_result_relabels_only_absence_after_a_suspect_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let present = dir.path().join("here.parquet");
+        std::fs::write(&present, b"parquet").unwrap();
+        let gone = dir.path().join("gone.parquet");
+        let run_file = |path: &std::path::Path| crate::from_saved::RunFile {
+            run_id: 7,
+            absolute_path: path.to_path_buf(),
+        };
+        let outcome = |result: Result<QueryResult, ServerError>| crate::pool::ExecuteOutcome {
+            result,
+            debug: None,
+            severity_columns: vec![],
+        };
+        let one_column = || QueryResult {
+            columns: vec![trawl_engine::value::Column {
+                name: "host".to_owned(),
+            }],
+            rows: vec![vec![Value::String("web-01".to_owned())]],
+        };
+        let expected = crate::from_saved::unavailable_run_message(7);
+
+        // (a) Zero columns is a shape no SELECT can produce, so over a
+        // file that is gone it is the vanishing window, not an answer.
+        // The passthrough of everything beside `result` rides along here.
+        let mut suspect = outcome(Ok(QueryResult::empty()));
+        suspect.severity_columns = vec!["severity".to_owned()];
+        let guarded = guard_vanished_run_result(suspect, &[run_file(&gone)]);
+        match &guarded.result {
+            Err(ServerError::Conflict(msg)) => {
+                assert_eq!(
+                    *msg, expected,
+                    "a zero-column success over a vanished file is the named refusal"
+                );
+                assert!(
+                    !msg.contains(dir.path().to_str().unwrap()),
+                    "the refusal never says where the file was: {msg}"
+                );
+            }
+            other => panic!("expected the unavailable-run Conflict, got: {other:?}"),
+        }
+        assert!(
+            guarded.debug.is_none(),
+            "the relabel carries the debug slot through untouched"
+        );
+        assert_eq!(
+            guarded.severity_columns,
+            ["severity"],
+            "the relabel carries the severity columns through untouched"
+        );
+
+        // (b) An engine error is the window's other face.
+        let failed = outcome(Err(ServerError::Engine(
+            trawl_engine::error::EngineError::ColdDataUnread,
+        )));
+        match &guard_vanished_run_result(failed, &[run_file(&gone)]).result {
+            Err(ServerError::Conflict(msg)) => assert_eq!(
+                *msg, expected,
+                "an engine error over a vanished file is the same refusal"
+            ),
+            other => panic!("expected the unavailable-run Conflict, got: {other:?}"),
+        }
+
+        // (c) Columns mean rows were read before the file went. The
+        // answer stands even though the file is no longer there.
+        let read = outcome(Ok(one_column()));
+        match &guard_vanished_run_result(read, &[run_file(&gone)]).result {
+            Ok(qr) => assert_eq!(
+                *qr,
+                one_column(),
+                "a result that has columns was read, and a later absence does not unsay it"
+            ),
+            other => panic!("expected the result to stand, got: {other:?}"),
+        }
+
+        // (d) The same suspect shape over a file still on disk is a real
+        // empty answer, not a refusal.
+        let empty = outcome(Ok(QueryResult::empty()));
+        match &guard_vanished_run_result(empty, &[run_file(&present)]).result {
+            Ok(qr) => assert!(
+                qr.columns.is_empty() && qr.rows.is_empty(),
+                "a file that is there keeps its empty answer"
+            ),
+            other => panic!("expected the empty answer to stand, got: {other:?}"),
+        }
+
+        // (e) Only an engine error is suspect; a refusal the request
+        // earned itself is never re-decided.
+        let rejected = outcome(Err(ServerError::BadRequest("offset too large".to_owned())));
+        match &guard_vanished_run_result(rejected, &[run_file(&gone)]).result {
+            Err(ServerError::BadRequest(msg)) => assert_eq!(
+                msg, "offset too large",
+                "a non-engine error keeps its own message"
+            ),
+            other => panic!("expected the BadRequest to stand, got: {other:?}"),
+        }
+
+        // (f) A query that reads no stored run has nothing to re-decide.
+        let unrelated = outcome(Ok(QueryResult::empty()));
+        match &guard_vanished_run_result(unrelated, &[]).result {
+            Ok(qr) => assert!(
+                qr.columns.is_empty(),
+                "with no run files the outcome is returned as it came"
+            ),
+            other => panic!("expected the outcome to pass through, got: {other:?}"),
+        }
+    }
 }
