@@ -431,7 +431,7 @@ pub struct ParquetColumnStats {
 /// the reader's ability to sort or chart it.
 #[cfg(test)]
 #[test]
-fn large_unsigned_lands_as_exact_string() {
+fn large_unsigned_lands_as_uint() {
     let parse = |text: &str| serde_json::from_str::<Value>(text).expect("valid JSON");
 
     // The last magnitude the signed variant holds stays signed.

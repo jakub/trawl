@@ -52,7 +52,7 @@ pub(crate) fn json_to_value(value: serde_json::Value) -> Value {
 /// place it can silently become a float.
 #[cfg(test)]
 #[test]
-fn large_unsigned_is_exact_string() {
+fn large_unsigned_is_exact_uint() {
     assert_eq!(
         json_to_value(serde_json::json!(18_446_744_073_709_551_615_u64)),
         Value::UInt(u64::MAX)
