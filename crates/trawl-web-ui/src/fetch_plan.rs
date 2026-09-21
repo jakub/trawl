@@ -68,17 +68,6 @@ impl FetchPlan {
             Self::Whole => (AGGREGATE_FETCH_ROWS, 0),
         }
     }
-
-    /// Whether this plan asks for the whole result.
-    ///
-    /// Still compiled for its tests only: the request path decides with
-    /// `for_query` and `window` alone, and the surfaces that adopted
-    /// this module read the measured `PaginationMeta`, never the plan.
-    #[cfg(test)]
-    #[must_use]
-    pub const fn is_whole(self) -> bool {
-        matches!(self, Self::Whole)
-    }
 }
 
 /// The shared opening both lines are built from: what the execution
@@ -141,7 +130,6 @@ mod tests {
             let plan = FetchPlan::for_query("service=web status=500", page);
             assert_eq!(plan, FetchPlan::Page { page });
             assert_eq!(plan.window(), (50, page * 50));
-            assert!(!plan.is_whole());
         }
     }
 
@@ -155,7 +143,6 @@ mod tests {
                 let plan = FetchPlan::for_query(query, page);
                 assert_eq!(plan, FetchPlan::Whole, "{query} at page {page}");
                 assert_eq!(plan.window(), (20_000, 0));
-                assert!(plan.is_whole());
             }
             // The page cannot move the request, which is what lets one
             // fetch serve every page of one effective query.
