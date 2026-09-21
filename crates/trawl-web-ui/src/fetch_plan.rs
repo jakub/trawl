@@ -71,8 +71,9 @@ impl FetchPlan {
 
     /// Whether this plan asks for the whole result.
     ///
-    /// Compiled for its tests only until a surface reads it: the
-    /// request path decides with `for_query` and `window` alone.
+    /// Still compiled for its tests only: the request path decides with
+    /// `for_query` and `window` alone, and the surfaces that adopted
+    /// this module read the measured `PaginationMeta`, never the plan.
     #[cfg(test)]
     #[must_use]
     pub const fn is_whole(self) -> bool {
@@ -96,9 +97,6 @@ fn preamble(total: usize, fetched: usize) -> String {
 /// it starts at the beginning and nothing was left behind. A window cut
 /// from a larger result is a page, and a chart of a page reads as a
 /// chart of the result.
-///
-/// Compiled for its tests only until the chart adopts it.
-#[cfg(test)]
 #[must_use]
 pub fn coverage_refusal(meta: &trawl_api::PaginationMeta) -> Option<String> {
     (meta.offset != 0 || meta.returned != meta.total).then(|| {

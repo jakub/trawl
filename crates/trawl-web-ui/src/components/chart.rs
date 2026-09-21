@@ -9,7 +9,9 @@ use trawl_api::display::extract_series;
 use trawl_api::value::{QueryResult, Value};
 use wasm_bindgen::JsValue;
 
+use crate::fetch_plan::coverage_refusal;
 use crate::interop::uplot::{ChartHandle, Opts, create_chart};
+use trawl_api::PaginationMeta;
 
 /// uPlot `AlignedData` is `[xs, ys1, ys2, ...]` where every inner array
 /// is equal length and all values are `f64`. xs are row indices, not
@@ -62,14 +64,28 @@ fn snapshot_to_aligned(result: &QueryResult) -> (JsValue, Vec<String>, usize) {
 pub fn Chart(
     #[prop(into)] snapshot: Signal<Option<QueryResult>>,
     #[prop(into)] query: Signal<String>,
+    /// How much of the result this snapshot carries, where the answer is
+    /// measured: `None` for a live stream, which owns no window.
+    ///
+    /// Required, not optional. The chart draws a whole result or says
+    /// why not (ADR-0037), and a default would let the next caller skip
+    /// that gate by saying nothing.
+    #[prop(into)]
+    coverage: Signal<Option<PaginationMeta>>,
     #[prop(optional, into)] failure: Signal<Option<&'static str>>,
     #[prop(optional)] on_retry: Option<Callback<()>>,
 ) -> impl IntoView {
     let hint = Memo::new(move |_| {
-        failure.get().or_else(|| match snapshot.get() {
-            None => Some("Waiting for the first live aggregation snapshot."),
-            Some(result) => chart_hint(&result, &query.get()),
-        })
+        failure
+            .get()
+            .map(ToOwned::to_owned)
+            .or_else(|| match snapshot.get() {
+                None => Some("Waiting for the first live aggregation snapshot.".to_owned()),
+                Some(result) => {
+                    let coverage = coverage.get();
+                    chart_hint(&result, &query.get(), coverage.as_ref())
+                }
+            })
     });
     let node_ref = NodeRef::<leptos::html::Div>::new();
     let handle: StoredValue<Option<ChartHandle>, leptos::prelude::LocalStorage> =
@@ -179,7 +195,16 @@ use wasm_bindgen::JsCast;
 
 // The shared extractor converts metrics to unsigned counts. Refuse values
 // that conversion would truncate or replace with zero.
-fn chart_hint(result: &QueryResult, query: &str) -> Option<&'static str> {
+//
+// The rungs are ordered, and the coverage one comes LAST on purpose. A
+// grouped or lossy result has something actionable to say about its own
+// shape; "this is only part of the result" is the answer only once the
+// shape itself is chartable.
+fn chart_hint(
+    result: &QueryResult,
+    query: &str,
+    coverage: Option<&PaginationMeta>,
+) -> Option<String> {
     // Column values cannot identify numeric group keys. Use parsed query
     // stages before interpreting any numeric column as a metric. Refuse
     // grouped results until this chart can align groups by actual time.
@@ -196,15 +221,17 @@ fn chart_hint(result: &QueryResult, query: &str) -> Option<&'static str> {
     });
     if grouped {
         return Some(
-            "Grouped results are not supported by this chart. Use timechart without by, or open Events for exact group times and values.",
+            "Grouped results are not supported by this chart. Use timechart without by, or open Events for exact group times and values."
+                .to_owned(),
         );
     }
     if result.rows.is_empty() {
-        return Some("No rows returned for this visualization.");
+        return Some("No rows returned for this visualization.".to_owned());
     }
     if !result.columns.iter().any(|c| c.name == "_time") {
         return Some(
-            "Visualization requires a _time column and non-negative integer metrics. Use timechart count() or open Events for these results.",
+            "Visualization requires a _time column and non-negative integer metrics. Use timechart count() or open Events for these results."
+                .to_owned(),
         );
     }
     let mut groups = 0;
@@ -227,13 +254,15 @@ fn chart_hint(result: &QueryResult, query: &str) -> Option<&'static str> {
             metrics += 1;
         } else {
             return Some(
-                "This chart supports non-negative integer metrics only. Open Events for fractional, negative, null, or mixed values.",
+                "This chart supports non-negative integer metrics only. Open Events for fractional, negative, null, or mixed values."
+                    .to_owned(),
             );
         }
     }
     if groups > 0 {
         return Some(
-            "This result includes non-metric columns. Use an ungrouped timechart query, or open Events for these rows.",
+            "This result includes non-metric columns. Use an ungrouped timechart query, or open Events for these rows."
+                .to_owned(),
         );
     }
     let timechart = parsed.as_ref().is_some_and(|ast| ast.pipeline.iter().any(|stage| {
@@ -241,13 +270,15 @@ fn chart_hint(result: &QueryResult, query: &str) -> Option<&'static str> {
     }));
     if metrics > 1 && !timechart {
         return Some(
-            "These numeric columns may include group keys. Use an ungrouped timechart query, or open Events for the exact values.",
+            "These numeric columns may include group keys. Use an ungrouped timechart query, or open Events for the exact values."
+                .to_owned(),
         );
     }
     if metrics == 0 {
         return Some(
-            "Visualization requires _time and non-negative integer metrics. Open Events for these results.",
+            "Visualization requires _time and non-negative integer metrics. Open Events for these results."
+                .to_owned(),
         );
     }
-    None
+    coverage.and_then(coverage_refusal)
 }

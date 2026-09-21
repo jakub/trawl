@@ -81,13 +81,20 @@ test('chart refuses lossy metrics and supports multiple integer metrics', async 
 
 test('live aggregation waits, charts in Visualization and shows exact rows in Events', async ({ page, request }) => {
   await resetScenario(request, 'stream-chart');
+  // A live stream asks for no window at all, so there is no coverage to
+  // judge and the chart has nothing to refuse (ADR-0037).
+  const streamRequest = page.waitForRequest(/\/api\/v1\/stream\?/);
   await page.goto('/search?q=service%3Dnginx%20%7C%20timechart%20count()&mode=live');
+  const streamParams = new URL((await streamRequest).url()).searchParams;
+  expect(streamParams.get('limit')).toBeNull();
+  expect(streamParams.get('offset')).toBeNull();
   await expect(page.getByText('Waiting for the first live aggregation snapshot.')).toBeVisible();
   await page.getByRole('tab', { name: 'Visualization' }).click();
   await expect(page.getByText('Waiting for the first live aggregation snapshot.')).toBeVisible();
   await expect.poll(async () => (await (await request.get('/__ctl/state')).json()).sse.open).toBe(1);
   expect((await request.post('/__ctl/stream/frame', { data: { data: JSON.stringify({ columns: ['_time', 'count'], rows: [{ _time: '2026-09-01T00:00:00Z', count: 2 }, { _time: '2026-09-01T00:01:00Z', count: 4 }] }) } })).ok()).toBe(true);
   await expect(page.locator('.chart canvas')).toHaveCount(1);
+  await expect(page.locator('.visualization')).not.toContainText('were fetched');
   await page.getByRole('tab', { name: /^Events/ }).click();
   await expect(page.locator('.chart canvas')).toHaveCount(0);
   await expect(page.locator('.results-table tbody tr')).toHaveCount(2);

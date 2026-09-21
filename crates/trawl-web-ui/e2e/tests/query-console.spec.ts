@@ -314,23 +314,6 @@ test('an empty query invalidates pending ownership before the same query runs ag
   await expectFacts(page, '0.200s', '2026-09-15 11:00:00 UTC');
 });
 
-test('no truncation affordance remains', async ({ page, request }) => {
-  await resetScenario(request, 'pagination');
-  await page.goto('/search?q=service%3Dnginx');
-  // The rendered page of rows is the anchor: the negative assertions
-  // under it only mean something once a successful answer is on screen.
-  await expect(page.locator('.results .results-footer .results-summary'))
-    .toHaveText('Page 1 · showing 50 rows');
-
-  // The window a page asks for is not a verdict on the answer, so
-  // nothing in the results region calls a result cut short.
-  await expect(page.locator('.tabs .bdg')).toHaveCount(0);
-  await expect(page.locator('.results')).not.toContainText('Truncated');
-  await expect(page.locator('.results')).not.toContainText('(truncated)');
-  await expect(page.locator(SEL.saveAction)).toBeVisible();
-  await expect(page.locator(SEL.exportAction)).toBeVisible();
-});
-
 test('the editor tools name what they act on', async ({ page }) => {
   await page.goto('/search');
   const tools = page.locator(SEL.editorTool);

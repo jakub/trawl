@@ -1079,7 +1079,16 @@ pub fn Search() -> impl IntoView {
                             view! { <p class="results-empty" role="status">"Loading snapshot visualization…"</p> }.into_any()
                         } else {
                             match rows.get() {
-                                Some(Ok(resp)) => view! { <Chart snapshot=Signal::derive(move || Some(resp.result.clone())) query=effective_q/> }.into_any(),
+                                Some(Ok(resp)) => {
+                                    // The measured window this response
+                                    // arrived in. The chart draws a whole
+                                    // result or says why not (ADR-0037),
+                                    // and only these three numbers can
+                                    // tell it which it has.
+                                    let coverage = resp.pagination.clone();
+                                    let result = resp.result.clone();
+                                    view! { <Chart snapshot=Signal::derive(move || Some(result.clone())) query=effective_q coverage=Signal::derive(move || Some(coverage.clone()))/> }.into_any()
+                                }
                                 Some(Err(_)) => view! { <div class="results-empty"><p role="alert">"Snapshot query failed. Open Events for the query error."</p><button type="button" class="btn-sec" on:click=move |_| rows.refetch()>"Retry snapshot"</button></div> }.into_any(),
                                 None => view! { <p class="results-empty">"Run a query to visualize its snapshot."</p> }.into_any(),
                             }
@@ -1088,7 +1097,10 @@ pub fn Search() -> impl IntoView {
                     },
                     (ResultsTab::Visualization, Mode::Live) if is_chart_query.get() => view! {
                         <div id="search-results" class="results" role="region" aria-label="Search results" tabindex="0">
-                            <Chart snapshot=live_snapshot query=effective_q failure=stream_failure on_retry=retry_stream/>
+                            // A live stream asks for no window, so there
+                            // is no coverage to judge: every frame is the
+                            // whole of what the server aggregated.
+                            <Chart snapshot=live_snapshot query=effective_q coverage=Signal::derive(|| None) failure=stream_failure on_retry=retry_stream/>
                         </div>
                     }.into_any(),
                     (ResultsTab::Visualization, Mode::Live) => view! {

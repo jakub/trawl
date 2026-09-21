@@ -12,7 +12,7 @@
 // browser drew, the other is what it asked for; a fetch that stopped at
 // 50 rows fails both.
 
-import { test, expect } from '../fixtures';
+import { test, expect, resetScenario } from '../fixtures';
 import { LIMITS, SEL } from '../selectors';
 
 /** 59 buckets: more than one page, so "whole" and "the first page" are
@@ -93,4 +93,67 @@ test('an out-of-range local page recovers', async ({ page, request }) => {
   // already in hand, the same as any other.
   const windows = await capturedWindows(request);
   expect(windows).toHaveLength(1);
+});
+
+// `* | stats count() by status` over the same generated scenario: a
+// grouped shape, which the chart refuses for a reason of its own.
+const STATS_URL = `/search?q=${encodeURIComponent('level=error | stats count() by status')}`;
+
+test('above the ceiling the chart refuses with the measured count', async ({ page, request }) => {
+  // The execution produced 43,210 rows and one fetch carried 20,000 of
+  // them. What is on screen is a window, and a chart of a window reads
+  // as a chart of the result.
+  await configure(request, { buckets: LIMITS.aggregateFetchRows, total: 43210 });
+  await page.goto(AGG_URL);
+  await page.getByRole('tab', { name: 'Visualization', exact: true }).click();
+
+  const refusal = page.locator('.visualization .results-empty');
+  await expect(refusal).toContainText('43,210');
+  await expect(refusal).toContainText('20,000');
+  await expect(refusal).toContainText('whole result only');
+
+  // Nothing was drawn, and the host says so rather than leaving the
+  // claim to an opaque canvas.
+  await expect(page.locator(SEL.chartHost)).not.toHaveAttribute('data-points', /.*/);
+  await expect(page.locator(`${SEL.chartHost} canvas`)).toHaveCount(0);
+});
+
+test('a complete result at the ceiling draws', async ({ page, request }) => {
+  // Every row the execution produced, and exactly as many as one fetch
+  // can carry: whole, so there is nothing to refuse.
+  await configure(request, { buckets: LIMITS.aggregateFetchRows, total: LIMITS.aggregateFetchRows });
+  await page.goto(AGG_URL);
+  await page.getByRole('tab', { name: 'Visualization', exact: true }).click();
+
+  await expect(page.locator(SEL.chartHost)).toHaveAttribute('data-points', String(LIMITS.aggregateFetchRows));
+});
+
+test('a cut grouped result keeps the grouped refusal', async ({ page, request }) => {
+  // Cut AND grouped. The shape refusal names something the operator can
+  // act on, so it stays ahead of the coverage sentence.
+  await configure(request, { groups: 60, total: 90 });
+  await page.goto(STATS_URL);
+  await page.getByRole('tab', { name: 'Visualization', exact: true }).click();
+
+  const refusal = page.locator('.visualization .results-empty');
+  await expect(refusal).toContainText('Grouped results are not supported by this chart');
+  await expect(refusal).not.toContainText('were fetched');
+  await expect(page.locator(SEL.chartHost)).not.toHaveAttribute('data-points', /.*/);
+});
+
+test('no truncation affordance remains', async ({ page, request }) => {
+  await resetScenario(request, 'pagination');
+  await page.goto('/search?q=service%3Dnginx');
+  // The rendered page of rows is the anchor: the negative assertions
+  // under it only mean something once a successful answer is on screen.
+  await expect(page.locator('.results .results-footer .results-summary'))
+    .toHaveText('Page 1 · showing 50 rows');
+
+  // The window a page asks for is not a verdict on the answer, so
+  // nothing in the results region calls a result cut short.
+  await expect(page.locator('.tabs .bdg')).toHaveCount(0);
+  await expect(page.locator('.results')).not.toContainText('Truncated');
+  await expect(page.locator('.results')).not.toContainText('(truncated)');
+  await expect(page.locator(SEL.saveAction)).toBeVisible();
+  await expect(page.locator(SEL.exportAction)).toBeVisible();
 });
