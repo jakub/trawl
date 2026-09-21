@@ -131,6 +131,7 @@ fn build_series(resp: &QueryResponse) -> Option<Series> {
 fn value_to_seconds(v: &Value) -> Option<f64> {
     match v {
         Value::Integer(n) => Some(*n as f64),
+        Value::UInt(u) => Some(*u as f64),
         Value::Float(f) => Some(*f),
         Value::String(s) => {
             // Accept seconds as a numeric string, or an RFC3339-ish

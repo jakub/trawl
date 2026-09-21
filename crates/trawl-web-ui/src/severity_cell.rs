@@ -70,8 +70,9 @@ pub fn severity_columns<'a>(
 /// (`trawl_core::severity::reading_*`, ADR-0013 ruling 9), so a cell
 /// displays exactly the number ingest would have derived and `sev()`
 /// would compute — no surface has its own severity vocabulary. Every
-/// other shape (a float, a bool, an array) names no rung and has no
-/// reading, exactly as the kernel says.
+/// other shape (a float, a bool, an array, an unsigned past `i64::MAX`)
+/// names no rung and has no reading, exactly as the kernel says: every
+/// dialect's ladder ends well inside `i64`.
 #[must_use]
 pub fn severity_number(v: &Value) -> Option<u8> {
     use trawl_core::severity::Dialect;

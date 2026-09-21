@@ -105,6 +105,16 @@ pub(crate) struct EmitterState {
     /// The time filter from the search stage, used by `timechart` auto-bucketing.
     /// Not reset on CTE flush — this is query-wide context.
     pub(crate) time_filter: Option<TrawlDuration>,
+    /// One probe per explicit `timechart on <field>`, in pipeline order,
+    /// excluding `_time` — see [`super::TimechartInputCheck`]. Captured
+    /// as each timechart is processed, because the relation a stage
+    /// reads exists only while that stage is being emitted: by the end
+    /// of the pipeline it has been folded into a CTE, projected away, or
+    /// overwritten by a later stage's own `_time`.
+    ///
+    /// Query-wide context like `time_filter`, so a CTE flush does not
+    /// clear it.
+    pub(crate) timechart_input_checks: Vec<super::TimechartInputCheck>,
     /// `USING SAMPLE` clause set by `sample` stage.
     pub(crate) sample: Option<String>,
     /// Set by `pivot` stage — overrides normal `build_select()` in `finalize()`.
@@ -154,6 +164,13 @@ pub(crate) enum RawBinding {
 ///
 /// `DuckDB`'s `read_parquet()`/`read_json_auto()` don't support parameterized
 /// paths, so the path must be sanitized before interpolation into SQL.
+///
+/// The refusals say what is wrong and nothing about where. The path is
+/// server-minted and embeds `data_dir`, so a daemon whose data directory
+/// holds a space or a non-ASCII byte would otherwise hand its own absolute
+/// filesystem layout back to any `Query` holder in a 400. The path goes to
+/// the operator's log at `debug` instead, which is where the answer to
+/// "which path" belongs.
 pub fn validate_source_path(source: &str) -> Result<(), super::EmitError> {
     if source.is_empty() {
         return Err(super::EmitError::UnsupportedOperation {
@@ -164,16 +181,43 @@ pub fn validate_source_path(source: &str) -> Result<(), super::EmitError> {
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || b"/_.*?{}[]-".contains(&b))
     {
+        tracing::debug!(source, "source path contains invalid characters");
         return Err(super::EmitError::UnsupportedOperation {
-            message: format!("source path contains invalid characters: {source}"),
+            message: "source path contains invalid characters".to_string(),
         });
     }
     if source.split('/').any(|component| component == "..") {
+        tracing::debug!(source, "source path contains path traversal");
         return Err(super::EmitError::UnsupportedOperation {
-            message: format!("source path contains path traversal: {source}"),
+            message: "source path contains path traversal".to_string(),
         });
     }
     Ok(())
+}
+
+/// A refused source path never travels in the refusal.
+///
+/// Both arms are reachable from a plain `Query` holder on a daemon whose
+/// `data_dir` carries a space or a non-ASCII byte, and the path they are
+/// handed is the server-minted glob with that directory inside it. No `/`
+/// in either message is the cheap whole-class check: the leak was an
+/// absolute path, and an absolute path cannot hide from it.
+#[cfg(test)]
+#[test]
+fn source_path_errors_carry_no_path() {
+    for source in [
+        "/var/lib/trawl data/logs/*.parquet",
+        "/var/lib/trawl/../etc",
+    ] {
+        let message = match validate_source_path(source) {
+            Err(super::EmitError::UnsupportedOperation { message }) => message,
+            other => panic!("expected a refusal for {source}, got {other:?}"),
+        };
+        assert!(
+            !message.contains('/'),
+            "the refusal must not carry the path: {message}"
+        );
+    }
 }
 
 /// Validate a list-format source for `read_parquet()`.
@@ -423,6 +467,7 @@ impl EmitterState {
             has_projection: false,
             had_explicit_columns: false,
             time_filter: None,
+            timechart_input_checks: Vec::new(),
             sample: None,
             pivot: None,
             ctes: Vec::new(),
@@ -635,6 +680,55 @@ impl EmitterState {
         build(self)
     }
 
+    /// A statement that reads one column of the relation a stage is
+    /// about to read, and returns no rows.
+    ///
+    /// The whole point is WHEN it is taken. `SELECT <col> FROM (<the
+    /// relation as built so far>) LIMIT 0` renders the current level and
+    /// every CTE behind it, so the `from`, `let`, `rename`, `stats` and
+    /// search filters that precede the stage are all in force — the
+    /// probe sees exactly the column the stage will read, typed exactly
+    /// as the stage will see it, which is a question nothing about the
+    /// finished query can answer any more.
+    ///
+    /// `LIMIT 0` because only the column's declared type is wanted.
+    /// `DuckDB` still binds the relation, so the probe costs one bind
+    /// and no scan.
+    ///
+    /// The caller pairs this with [`Self::params`] as they stand now:
+    /// the placeholders in the returned text are exactly those pushed so
+    /// far, in push order, by the same invariant the finished statement
+    /// relies on ([`Self::emit_ordered_select`]).
+    pub(crate) fn stage_input_probe(&self, column: &str) -> String {
+        let body = format!(
+            "SELECT {} FROM (\n{}\n) LIMIT 0",
+            super::fields::quote_field(column),
+            self.build_select()
+        );
+        if self.ctes.is_empty() {
+            return body;
+        }
+        self.with_ctes(&body)
+    }
+
+    /// Prefix `body` with the accumulated CTEs. Callers with no CTEs to
+    /// render skip it; the loop is the one rendering of a `WITH` list.
+    fn with_ctes(&self, body: &str) -> String {
+        let mut sql = String::from("WITH ");
+        for (i, cte) in self.ctes.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            sql.push_str(&cte.name);
+            sql.push_str(" AS (\n");
+            Self::push_indented_cte(&mut sql, &cte.sql);
+            sql.push(')');
+        }
+        sql.push('\n');
+        sql.push_str(body);
+        sql
+    }
+
     /// Build a SELECT statement from the current accumulated state.
     fn build_select(&self) -> String {
         let mut sql = String::new();
@@ -782,18 +876,7 @@ impl EmitterState {
             return Ok(body);
         }
 
-        let mut sql = String::from("WITH ");
-        for (i, cte) in self.ctes.iter().enumerate() {
-            if i > 0 {
-                sql.push_str(", ");
-            }
-            sql.push_str(&cte.name);
-            sql.push_str(" AS (\n");
-            Self::push_indented_cte(&mut sql, &cte.sql);
-            sql.push(')');
-        }
-        sql.push('\n');
-        sql.push_str(&body);
+        let sql = self.with_ctes(&body);
 
         if self.pivot.is_some() {
             let (inlined, consumed) = Self::inline_params_counted(&sql, &self.params, 0);
@@ -928,6 +1011,12 @@ impl EmitterState {
     /// Consume the state and return the accumulated parameters.
     pub(crate) fn into_params(self) -> Vec<SqlValue> {
         self.params
+    }
+
+    /// The parameters pushed up to this point, in push order — what a
+    /// probe taken now has to bind ([`Self::stage_input_probe`]).
+    pub(crate) fn params_so_far(&self) -> Vec<SqlValue> {
+        self.params.clone()
     }
 
     /// Whether the result columns should be reordered to put well-known fields first.

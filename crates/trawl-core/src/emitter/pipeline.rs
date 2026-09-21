@@ -384,12 +384,39 @@ fn process_timechart(
         None => auto_bucket_interval(ctx.time_filter.as_ref()),
     };
 
+    // What the buckets are cut from. The default — and an explicit
+    // `on _time`, however it is spelled — is the envelope timestamp,
+    // which carries the unconditional `TRY_CAST` every `_time` read does
+    // (ADR-0008). Any other column is bucketed as stored: no cast, so
+    // nothing here can coerce a column that is not a timestamp into one
+    // empty bucket. What that column IS gets asked separately, by the
+    // probe captured below.
+    let bucket_source = match tc.on.as_deref() {
+        Some(col) if !crate::schema::is_event_time(col) => {
+            // Taken here, and only here: the relation this stage reads
+            // is the state as it stands at this moment, and the stage
+            // about to be emitted is what replaces it. Appended, never
+            // replaced — each timechart in the pipeline contributes its
+            // own probe, in the order the reader wrote them.
+            let probe = crate::emitter::TimechartInputCheck {
+                column: col.to_string(),
+                sql: ctx.stage_input_probe(col),
+                params: ctx.params_so_far(),
+            };
+            ctx.timechart_input_checks.push(probe);
+            quote_field(col)
+        }
+        // No clause, or the envelope timestamp named explicitly in any
+        // spelling.
+        None | Some(_) => format!("TRY_CAST({} AS TIMESTAMP)", quote_field("_time")),
+    };
+
     // The bucket is aliased AS "_time", which is also the name of the
     // physical event-time column it buckets. GROUP BY / ORDER BY must
     // therefore reference the full expression, not the name: a bare
     // "_time" would bind to the source column and silently break the
     // aggregation (one group per input row).
-    let bucket = format!("time_bucket(INTERVAL '{interval}', TRY_CAST(\"_time\" AS TIMESTAMP))");
+    let bucket = format!("time_bucket(INTERVAL '{interval}', {bucket_source})");
 
     // Same ordering guard as `stats`, for the same reason: the
     // aggregations are the only parameter-pushing part of this stage,

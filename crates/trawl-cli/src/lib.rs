@@ -911,4 +911,19 @@ mod arg_tests {
             "--clear and --note must not be accepted together"
         );
     }
+
+    /// Embedded mode prints an engine refusal as its own sentence.
+    ///
+    /// `CliError` renders every engine failure through `{0}`, and the
+    /// refusal is trawl-authored and quotes only the tokens the reader
+    /// typed, so the one thing the exit path must not do is dress it up:
+    /// "trawl: " and the sentence, with no "query failed" in front of it.
+    #[test]
+    fn an_engine_refusal_prints_as_its_own_sentence() {
+        let message = "timechart on 'hostname' is not a timestamp: VARCHAR";
+        let err = CliError::Engine(trawl_engine::error::EngineError::Refused {
+            message: message.to_string(),
+        });
+        assert_eq!(err.to_string(), message);
+    }
 }

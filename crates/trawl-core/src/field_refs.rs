@@ -111,6 +111,13 @@ fn collect_stage(stage: &PipeStage, out: &mut BTreeSet<String>) {
             collect_aggs(&s.aggregations, out);
         }
         PipeStage::Timechart(s) => {
+            // Only an explicitly named bucket source is a field
+            // reference. The default is `_time`, which the envelope
+            // always carries, so a plain `timechart` collects nothing
+            // it did not collect before this clause existed.
+            if let Some(on) = s.on.as_deref().filter(|c| !crate::schema::is_event_time(c)) {
+                insert(on, out);
+            }
             insert_all(&s.group_by, out);
             collect_aggs(&s.aggregations, out);
         }

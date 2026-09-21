@@ -499,6 +499,16 @@ pub fn is_valid_env_name(name: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
 }
 
+/// The characters `DuckDB` reads as a glob pattern in a path it is handed.
+///
+/// The daemon's data directory (`data.path`) is refused if it holds one of
+/// these, because the path has two readers that would disagree about it:
+/// `read_parquet` expands it as a pattern, while the filesystem presence
+/// check at startup resolves the literal name. A directory called
+/// `trawl*data` passes the literal check and then reads the files of
+/// `trawlXdata` next door.
+const GLOB_METACHARACTERS: &[char] = &['*', '?', '[', ']', '{', '}'];
+
 /// Maximum service name length (ADR-0009 path segment cap).
 pub const MAX_SERVICE_NAME_LEN: usize = 128;
 
@@ -1617,10 +1627,22 @@ impl Config {
             return Err(ConfigError::Validation("data.path cannot be empty".into()));
         }
 
-        if self.data.path.contains(['*', '?', '[']) {
-            return Err(ConfigError::Validation(
-                "data.path must be a directory path without glob metacharacters (*, ?, [)".into(),
-            ));
+        // `read_parquet` reads the data directory's path as a pattern while
+        // the filesystem presence check resolves it literally. A daemon
+        // pointed at `trawl*data` therefore passes startup against a
+        // directory of that exact name and then reads the parquet files of
+        // every neighbour the glob matches, `trawlXdata` included. Refusing
+        // the characters is the only place the two readings can be held
+        // together.
+        if let Some(found) = self
+            .data
+            .path
+            .chars()
+            .find(|c| GLOB_METACHARACTERS.contains(c))
+        {
+            return Err(ConfigError::Validation(format!(
+                "data.path must be a directory path without glob metacharacters; found '{found}'"
+            )));
         }
 
         if self.server.max_concurrent_queries == 0 {
@@ -2020,25 +2042,34 @@ path = "/data"
         assert!(config.server.cors_allowed_origins.is_empty());
     }
 
+    /// Every glob metacharacter is refused, and the refusal names the one
+    /// it found without echoing the path it found it in.
     #[test]
-    fn daemon_data_path_rejects_glob_metacharacters() {
+    fn data_dir_refuses_glob_metacharacters() {
+        for metacharacter in GLOB_METACHARACTERS {
+            let path = format!("/data/private-secret{metacharacter}unfinished");
+            let document = format!("[server]\n[data]\npath = '{path}'");
+            let error = Config::from_toml(&document).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "config validation error: data.path must be a directory path \
+                     without glob metacharacters; found '{metacharacter}'"
+                )
+            );
+            assert!(!format!("{error:?}").contains("private-secret"));
+        }
+
         for path in [
             "/data/*.parquet",
             "/data/**/*.parquet",
             "data?",
             "/data/[ab]",
-            "[",
-            "*",
-            "?",
-            "/data/private-secret[unfinished",
+            "/data/{a,b}",
         ] {
             let document = format!("[server]\n[data]\npath = '{path}'");
-            let error = Config::from_toml(&document).unwrap_err();
-            assert_eq!(
-                error.to_string(),
-                "config validation error: data.path must be a directory path without glob metacharacters (*, ?, [)"
-            );
-            assert!(!format!("{error:?}").contains("private-secret"));
+            Config::from_toml(&document)
+                .expect_err("a path DuckDB would read as a pattern is not a directory");
         }
     }
 

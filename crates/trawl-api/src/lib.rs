@@ -1487,7 +1487,7 @@ fn default_true() -> bool {
 }
 
 /// Summary of a single report run (no result data).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReportRunSummary {
     /// Run ID.
     pub id: i64,

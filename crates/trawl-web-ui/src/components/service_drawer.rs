@@ -759,6 +759,7 @@ fn value_as_display(v: &Value) -> String {
         Value::Null => "(null)".to_string(),
         Value::Boolean(b) => b.to_string(),
         Value::Integer(i) => i.to_string(),
+        Value::UInt(u) => u.to_string(),
         Value::Float(f) => format!("{f}"),
         Value::String(s) => s.clone(),
         Value::Array(_) => "[array]".to_string(),

@@ -46,8 +46,10 @@ fn snapshot_to_aligned(result: &QueryResult) -> (JsValue, Vec<String>, usize) {
         labels.push(label.clone());
         let ys = js_sys::Array::new_with_length(u32::try_from(values.len()).unwrap_or(u32::MAX));
         for (i, v) in values.iter().enumerate() {
-            // Aggregation values are counts/sums/averages produced by
-            // DuckDB — also well below 2^53 in practice.
+            // uPlot plots f64, so the cast is the format, not a choice.
+            // A metric past 2^53 — an id, a byte count — loses its low
+            // bits here and nowhere else: the exact value still reaches
+            // the results table, and a plotted point is a pixel.
             #[allow(clippy::cast_precision_loss)]
             ys.set(
                 u32::try_from(i).unwrap_or(u32::MAX),
@@ -246,11 +248,12 @@ fn chart_hint(
             .all(|r| matches!(r.get(i), Some(Value::String(_))))
         {
             groups += 1;
-        } else if result
-            .rows
-            .iter()
-            .all(|r| matches!(r.get(i), Some(Value::Integer(n)) if *n >= 0))
-        {
+        } else if result.rows.iter().all(|r| {
+            // An unsigned cell is a non-negative integer by construction,
+            // so it is a metric on the same terms as a signed one.
+            matches!(r.get(i), Some(Value::UInt(_)))
+                || matches!(r.get(i), Some(Value::Integer(n)) if *n >= 0)
+        }) {
             metrics += 1;
         } else {
             return Some(

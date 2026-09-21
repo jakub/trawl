@@ -164,6 +164,8 @@ pub fn value_as_u64(v: &trawl_api::value::Value) -> Option<u64> {
     match v {
         #[allow(clippy::cast_sign_loss)]
         Value::Integer(i) if *i >= 0 => Some(*i as u64),
+        // Already this function's own width, so it needs no conversion.
+        Value::UInt(u) => Some(*u),
         Value::Float(f) if *f >= 0.0 =>
         {
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]

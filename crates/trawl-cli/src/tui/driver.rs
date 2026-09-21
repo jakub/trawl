@@ -184,6 +184,7 @@ fn value_to_json(v: &trawl_engine::value::Value) -> serde_json::Value {
         trawl_engine::value::Value::Null => serde_json::Value::Null,
         trawl_engine::value::Value::Boolean(b) => serde_json::Value::Bool(*b),
         trawl_engine::value::Value::Integer(i) => serde_json::json!(i),
+        trawl_engine::value::Value::UInt(u) => serde_json::json!(u),
         trawl_engine::value::Value::Float(f) => serde_json::json!(f),
         trawl_engine::value::Value::String(s) => serde_json::Value::String(s.clone()),
         trawl_engine::value::Value::Array(arr) => {

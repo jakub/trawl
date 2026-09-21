@@ -899,7 +899,7 @@ fn RunsPane(
     let table_viewport = NodeRef::<leptos::html::Div>::new();
     let page = RwSignal::new(0usize);
     let expanded_run: RwSignal<Option<i64>> = RwSignal::new(None);
-    let expanded_summary = RwSignal::new(None::<trawl_api::ReportRunSummary>);
+    let expanded_read = RwSignal::new(None::<RunRead>);
 
     let (runs, refresh_error, retry) = super::job_refresh::job_refresh(active, move || {
         mutation.track();
@@ -911,6 +911,35 @@ fn RunsPane(
             response.map(|resp| (p, resp))
         }
     });
+
+    // The summary the expanded run's row shows, which is not the same
+    // as the last read: a 409 answers with none, and this table needs
+    // one whatever the read said. It is what holds the row on screen
+    // after the list has moved past the run — the `For` below re-adds
+    // it from here, and the row's own cells read it — so letting a
+    // refusal empty it would take an expanded run off the table for
+    // having lost its result file.
+    //
+    // Keyed on the expansion: collapsing drops it, and no later
+    // expansion can inherit it. `expanded_read` belongs to the current
+    // expansion too — the control below clears it as it toggles — so
+    // the read needs no identity check of its own here.
+    let expanded_summary = Memo::new(
+        move |previous: Option<&Option<trawl_api::ReportRunSummary>>| {
+            let expanded = expanded_run.get()?;
+            // What the list says about the run now, or failing that the
+            // last thing this table held for it.
+            let held = runs
+                .get()
+                .and_then(Result::ok)
+                .and_then(|(_, r)| r.runs.into_iter().find(|r| r.id == expanded))
+                .or_else(|| previous.cloned().flatten().filter(|s| s.id == expanded));
+            match expanded_read.get() {
+                Some(read) => read.settle(held),
+                None => held,
+            }
+        },
+    );
 
     let now = fleet_ui::time::clock::now_ms();
     let window = Signal::derive(move || {
@@ -971,7 +1000,11 @@ fn RunsPane(
                                 <td class="mono"><button type="button" class="row-stretch"
                                     aria-expanded=move || is_expanded().to_string()
                                     on:click=move |_| {
-                                        expanded_summary.set(Some(run.get_untracked()));
+                                        // The read belongs to the expansion it
+                                        // was made under. Clearing it here is
+                                        // what lets the memo above trust it
+                                        // without re-checking whose run it was.
+                                        expanded_read.set(None);
                                         expanded_run.update(|v| *v = if *v == Some(run_id) { None } else { Some(run_id) });
                                     }
                                 >{move || time_ago(&run.get().started_at, now.get())}</button>
@@ -985,7 +1018,7 @@ fn RunsPane(
                                 <td class="mono">{move || run.get().row_count.map_or_else(|| "—".to_string(), |n| n.to_string())}</td>
                                 <td class="path">{move || run.get().error_message.unwrap_or_default()}</td>
                             </tr>
-                            <Show when=is_expanded><tr><td colspan="5"><RunResultPreview net_id=net_id run_id=run_id bus=bus on_search=on_search summary=expanded_summary active=active/></td></tr></Show>
+                            <Show when=is_expanded><tr><td colspan="5"><RunResultPreview net_id=net_id run_id=run_id bus=bus on_search=on_search read=expanded_read active=active/></td></tr></Show>
                         }
                     }/>
                 </tbody></table>
@@ -1002,16 +1035,40 @@ fn RunsPane(
 // Expanded run result preview
 // ---------------------------------------------------------------------------
 
+/// What one read of a stored run can come back as.
+///
+/// A run whose stored result file is gone answers 409 (issue #227). That is
+/// not a failed read — the run succeeded and the server said so in a
+/// sentence — so it travels as a successful outcome of its own rather than
+/// as an `ApiError`. The refresh helper keeps prior data through errors and
+/// replaces it through successes, and this state must replace: a preview
+/// still showing rows the server has just said it cannot serve would be the
+/// same lie in a slower form.
+use crate::run_read::RunRead;
+
+#[derive(Clone)]
+enum RunPreview {
+    /// The run's response, whatever it carries.
+    Available(Box<trawl_api::ReportRunResponse>),
+    /// The server's sentence about a run whose stored result is gone.
+    Unavailable(String),
+}
+
 /// One stored run's result, with the rerun control beneath it.
 ///
-/// Shared with the runs page, which mounts it beside its own execution
-/// receipt: the receipt reads `summary`, filled from the same response
+/// Shared with the runs page and the net drawer, which both show
+/// something of their own beside it out of the one `get_run` response
 /// this already fetches, rather than asking for the run a second time.
 #[component]
 #[allow(unused_variables)]
 pub(crate) fn RunResultPreview(
     active: Signal<bool>,
-    summary: RwSignal<Option<trawl_api::ReportRunSummary>>,
+    /// What the LAST read said, and nothing more: [`None`] until one
+    /// lands, then whichever [`RunRead`] it answered with, replaced by
+    /// every read after it. Each caller derives what it needs from
+    /// that; this component holds no opinion about what a refusal owes
+    /// whatever a caller was showing before it.
+    read: RwSignal<Option<RunRead>>,
     net_id: i64,
     run_id: i64,
     bus: ToastBus,
@@ -1020,11 +1077,20 @@ pub(crate) fn RunResultPreview(
     let terminal = RwSignal::new(false);
     let (result, refresh_error, retry) = super::job_refresh::job_refresh(
         Signal::derive(move || active.get() && !terminal.get()),
-        move || async move { api::get_run(net_id, run_id).await },
+        move || async move {
+            match api::get_run(net_id, run_id).await {
+                Ok(response) => Ok(RunPreview::Available(Box::new(response))),
+                Err(api::ApiError::Server {
+                    status: 409,
+                    message,
+                }) => Ok(RunPreview::Unavailable(message)),
+                Err(e) => Err(e),
+            }
+        },
     );
     let preview_page = RwSignal::new(0usize);
-    Effect::new(move |_| {
-        if let Some(Ok(response)) = result.get() {
+    Effect::new(move |_| match result.get() {
+        Some(Ok(RunPreview::Available(response))) => {
             // A running response must not write false back into the poll
             // gate: that notification would start another read immediately.
             if matches!(
@@ -1033,8 +1099,15 @@ pub(crate) fn RunResultPreview(
             ) {
                 terminal.set(true);
             }
-            summary.set(Some(response.summary));
+            read.set(Some(RunRead::Available(Box::new(response.summary))));
         }
+        // Nothing about a run this old changes on its own, so polling it
+        // again would only repeat the sentence. The control below asks.
+        Some(Ok(RunPreview::Unavailable(_))) => {
+            read.set(Some(RunRead::Unavailable));
+            terminal.set(true);
+        }
+        Some(Err(_)) | None => {}
     });
 
     view! {
@@ -1044,7 +1117,25 @@ pub(crate) fn RunResultPreview(
                 state=Signal::derive(move || LoadState::from_resource(result.get()))
                 label="result"
                 retry=Callback::new(move |()| { retry.run(()); })
-                render=Box::new(move |resp: trawl_api::ReportRunResponse| {
+                render=Box::new(move |preview: RunPreview| {
+                    let resp = match preview {
+                        // The run succeeded; only its stored file is gone.
+                        // Said in the server's own words, and not wrapped in
+                        // "Couldn't load" copy that would call the run a
+                        // failure it was not.
+                        RunPreview::Unavailable(message) => return view! {
+                            <p class="run-unavailable" role="status">{message}</p>
+                            <Btn
+                                variant=Variant::Secondary
+                                size=Size::Xs
+                                on_click=Callback::new(move |()| {
+                                    terminal.set(false);
+                                    retry.run(());
+                                })
+                            >"Check again"</Btn>
+                        }.into_any(),
+                        RunPreview::Available(resp) => *resp,
+                    };
                     match resp.result {
                         None => view! {
                             <span style="color:var(--ink-3)">"No result data (error or still running)"</span>

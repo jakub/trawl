@@ -161,8 +161,14 @@ export const CORPUS = {
   topCardinalityField: '_time',
   /** Runs of the net, newest first (`wire/net-runs.json`). */
   runIds: [501, 502] as const,
-  /** The run whose expansion has a result body. */
+  /** The run whose expansion has a result body. It is also the newest
+   * row of the global runs list (`wire/runs-all.json`). */
   runWithResult: 501,
+  /** That row's recorded rows and query, as the global list carries
+   * them — what the runs page's execution receipt has to print when the
+   * run's stored result is gone and the read carries no summary. */
+  runWithResultRows: 3,
+  runWithResultQuery: '_severity>=error last=1h | stats count() by host',
 } as const;
 
 /** What the `schedule` scenario's two nets are.
@@ -226,6 +232,15 @@ export async function capturedScheduleRequests(
 export async function runDetailReadCount(request: Ctl): Promise<number> {
   const state = await (await request.get('/__ctl/state')).json();
   return state.runDetailReads.length;
+}
+
+/** Point the run-detail route at a run whose stored result file is gone,
+ * so `GET .../runs/{id}` answers the server's 409 envelope for it — what
+ * trawld does once `data_dir` is repointed out from under a recorded run
+ * (issue #227). Every read of that run answers the same way. */
+export async function armRunUnavailable(request: Ctl, runId: number): Promise<void> {
+  const response = await request.post(`/__ctl/run-unavailable/${runId}`);
+  expect(response.ok(), `arm run ${runId} unavailable: HTTP ${response.status()}`).toBe(true);
 }
 
 /** Arm the next schedule PUT to be refused: `'refuse'` answers the

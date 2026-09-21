@@ -35,6 +35,25 @@ pub enum EngineError {
     #[error("query matched no files while cold data exists on disk; retry the query")]
     ColdDataUnread,
 
+    /// The query is wrong in a way the engine proved by asking `DuckDB`
+    /// a question of its own, and no fallback can make it right.
+    ///
+    /// Distinct from [`Self::Emit`], which the hot lanes treat as a
+    /// missing column: a column absent from cold parquet but present in
+    /// a hot snapshot is a real query the cold read could not answer,
+    /// so those lanes retry hot-only and answer an unanswerable one with
+    /// an empty result (ADR-0009). A refusal is not that. Retrying it
+    /// against a narrower source produces the same refusal, and turning
+    /// it into an empty result would answer 200 with zero rows to a
+    /// query that was never going to mean anything — which is how a
+    /// `timechart` over a non-timestamp column escaped its own check.
+    ///
+    /// The message is trawl-authored and names the reader's own tokens,
+    /// so it crosses the trust boundary intact, like a parse or emit
+    /// refusal.
+    #[error("{message}")]
+    Refused { message: String },
+
     /// Filesystem I/O error (e.g. writing temp files for parquet export).
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

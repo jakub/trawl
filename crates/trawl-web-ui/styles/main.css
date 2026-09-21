@@ -2026,6 +2026,12 @@
 .run-preview th { text-align: left; color: var(--ink-3); border-bottom: 1px solid var(--line); }
 .run-preview td { color: var(--ink-2); }
 .run-preview .results-footer { margin-top: 8px; }
+/* A run that succeeded but whose stored result file is gone (issue #227).
+ * Its own line, not the generic load error: the read did not fail, the
+ * file did. */
+.run-unavailable {
+  margin: 0 0 8px; font-size: var(--fs-ui); color: var(--ink-2);
+}
 /* The two cap lines, one rule: each pages the rows its response
  * carried and names the ones it never had — the stored-run preview's,
  * and the exact table's under an aggregation the fetch ceiling cut

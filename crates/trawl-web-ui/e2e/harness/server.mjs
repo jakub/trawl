@@ -54,6 +54,7 @@ import {
   pagedRunResultResponse,
   aggregateTimechartResponse,
   aggregateStatsByResponse,
+  unavailableRunResponse,
 } from './fixtures.mjs';
 
 const HOST = '127.0.0.1';
@@ -110,6 +111,11 @@ let savedRequests = [];
 let scheduleRequests = [];
 /** @type {null|'conflict'|'fail'} */
 let scheduleRefusal = null;
+// The run whose stored result file is gone: `GET .../runs/{id}` answers
+// the server's 409 envelope for it, the way trawld does once the operator
+// repoints `data_dir` out from under a recorded run (issue #227).
+/** @type {null|number} */
+let unavailableRunId = null;
 // Every `GET /api/v1/saved/{id}/runs/{run_id}`, in order. The preview
 // pages rows the response already carried, so "no second read while
 // paging" is the claim; a counter is what can say it.
@@ -302,6 +308,7 @@ function resetState() {
   savedRequests = [];
   scheduleRequests = [];
   scheduleRefusal = null;
+  unavailableRunId = null;
   runDetailReads = [];
   runListReads = [];
   exports_ = [];
@@ -541,6 +548,15 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
     if ((p === '/__ctl/schedule/refuse' || p === '/__ctl/schedule/fail') && req.method === 'POST') {
       scheduleRefusal = p.endsWith('refuse') ? 'conflict' : 'fail';
       sendJson(res, 200, { ok: true, armed: scheduleRefusal });
+      return;
+    }
+    // Point the run-detail route at a run whose stored result is gone.
+    // One door, set once per spec: the state is a property of the RUN, so
+    // a repeated read answers the same 409 rather than a one-shot.
+    const unavailableRun = p.match(/^\/__ctl\/run-unavailable\/(\d+)$/);
+    if (unavailableRun && req.method === 'POST') {
+      unavailableRunId = Number(unavailableRun[1]);
+      sendJson(res, 200, { ok: true, unavailableRunId });
       return;
     }
     if (p === '/__ctl/history/configure' && req.method === 'POST') {
@@ -997,9 +1013,13 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
         sendJson(res, 200, scheduleNetRunsResponse());
       } else {
         runDetailReads.push(p);
-        // Run 503 is the long one; the other two keep the `corpus` body,
-        // so an expansion spec can tell a capped preview from a short one.
-        sendJson(res, 200, p.endsWith('/503') ? pagedRunResultResponse() : corpusRunResultResponse());
+        if (unavailableRunId !== null && p.endsWith(`/${unavailableRunId}`)) {
+          sendJson(res, 409, unavailableRunResponse(unavailableRunId));
+        } else {
+          // Run 503 is the long one; the other two keep the `corpus` body,
+          // so an expansion spec can tell a capped preview from a short one.
+          sendJson(res, 200, p.endsWith('/503') ? pagedRunResultResponse() : corpusRunResultResponse());
+        }
       }
       return;
     }
@@ -1011,6 +1031,12 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       }
       if (netRun) {
         runDetailReads.push(p);
+        // Arming reaches this scenario too: the global runs page, and so
+        // its execution receipt, is only stubbed under `corpus`.
+        if (unavailableRunId !== null && p.endsWith(`/${unavailableRunId}`)) {
+          sendJson(res, 409, unavailableRunResponse(unavailableRunId));
+          return;
+        }
         sendJson(res, 200, corpusRunResultResponse());
         return;
       }

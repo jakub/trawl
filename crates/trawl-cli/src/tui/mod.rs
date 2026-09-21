@@ -382,7 +382,7 @@ impl App {
                 Err(e) => {
                     tracing::error!("failed to fetch run result: {e}");
                     MutationResult::Error {
-                        message: format!("Failed to fetch run result: {e}"),
+                        message: run_result_error_message(&e),
                     }
                 }
             };
@@ -939,6 +939,90 @@ where
     }
 
     Ok(())
+}
+
+/// A live event carrying a number past `i64::MAX` reaches the results
+/// buffer as that exact number.
+///
+/// The buffer decodes each field with `serde_json::from_value::<Value>`,
+/// so this is `trawl_api::value`'s landing rule seen from the TUI: before
+/// it existed the cell arrived as a rounded double. The `unwrap_or` on
+/// that call is the other half — a number the decoder refused would have
+/// shown the reader an empty cell instead of a wrong one.
+#[cfg(test)]
+#[test]
+fn live_event_large_unsigned_exact() {
+    let event: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(r#"{"service":"nginx","request_id":18446744073709551615}"#)
+            .expect("valid event JSON");
+    let mut buffer = state::LiveBuffer::new(10);
+    buffer.push_event(&event);
+
+    let response = buffer.to_query_response();
+    let idx = response
+        .result
+        .columns
+        .iter()
+        .position(|c| c.name == "request_id")
+        .expect("request_id column");
+    assert_eq!(
+        response.result.rows[0][idx],
+        trawl_engine::value::Value::UInt(u64::MAX),
+        "a live cell must carry the number, never a rounded double or a null"
+    );
+}
+
+/// The same rule on the aggregation lane: a snapshot row's oversized
+/// unsigned is stored as the number it is.
+#[cfg(test)]
+#[test]
+fn snapshot_large_unsigned_exact() {
+    let rows: Vec<serde_json::Map<String, serde_json::Value>> =
+        serde_json::from_str(r#"[{"service":"nginx","total":18446744073709551615}]"#)
+            .expect("valid snapshot JSON");
+    let mut buffer = state::LiveBuffer::new(10);
+    buffer.replace_with_snapshot(&["service".to_owned(), "total".to_owned()], &rows);
+
+    let response = buffer.to_query_response();
+    assert_eq!(
+        response.result.rows[0][1],
+        trawl_engine::value::Value::UInt(u64::MAX),
+        "a snapshot cell must carry the number, never a rounded double or a null"
+    );
+}
+
+/// The toast a failed run-result fetch shows.
+///
+/// A 409 is the server saying the run succeeded and its stored result is
+/// gone (issue #227). That sentence is already the whole answer, so it is
+/// shown verbatim: prefixing it with "Failed to fetch run result" would
+/// re-assert a failure the run did not have.
+fn run_result_error_message(e: &ClientError) -> String {
+    match e {
+        ClientError::Server { status: 409, error } => error.message.clone(),
+        other => format!("Failed to fetch run result: {other}"),
+    }
+}
+
+/// A 409 reaches the operator as the server's own sentence, unadorned.
+#[cfg(test)]
+#[test]
+fn unavailable_result_toast() {
+    const SENTENCE: &str = "report run 42 succeeded, but its stored result is unavailable; \
+                            no older run was substituted";
+
+    let conflict = ClientError::Server {
+        status: 409,
+        error: trawl_api::ErrorEnvelope::simple(trawl_api::ErrorCode::BadRequest, SENTENCE),
+    };
+    assert_eq!(run_result_error_message(&conflict), SENTENCE);
+
+    // Everything else still says what went wrong with the fetch.
+    let network = ClientError::Network("connection refused".to_owned());
+    assert!(
+        run_result_error_message(&network).starts_with("Failed to fetch run result:"),
+        "a transport failure is a failure to fetch"
+    );
 }
 
 #[cfg(test)]

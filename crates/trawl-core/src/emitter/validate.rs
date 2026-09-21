@@ -170,6 +170,7 @@ mod tests {
                 group_by: vec!["service".to_string()],
             })),
             stage(PipeStage::Timechart(TimechartStage {
+                on: None,
                 span: None,
                 aggregations: vec![agg("_time")],
                 group_by: vec![],

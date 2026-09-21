@@ -11,17 +11,18 @@ use std::path::Path;
 use std::sync::Arc;
 
 use duckdb::Connection;
+use duckdb::core::LogicalTypeId;
 use duckdb::types::{TimeUnit, ValueRef};
 use trawl_core::ast::{PipeStage, Query, Spanned};
 use trawl_core::context::EvalContext;
-use trawl_core::emitter::{self, EmittedQuery, SqlValue};
+use trawl_core::emitter::{self, EmittedQuery, SqlValue, TimechartInputCheck};
 use trawl_core::parser;
 use trawl_core::pin_scope::PinScope;
 use trawl_core::schema::{CanonicalType, FieldTypes};
 
 use crate::cancel::CancelLatch;
 use crate::error::EngineError;
-use crate::value::{Column, QueryResult, SchemaColumn, SchemaResult, Value};
+use crate::value::{Column, QueryResult, SchemaColumn, SchemaResult, Value, land_i128, land_u64};
 
 /// Names of the result columns `DuckDB` returned as TIMESTAMP.
 type TimestampColumns = Vec<String>;
@@ -472,6 +473,10 @@ impl Executor {
         // attempt's bind stops the `_raw`-free retry and the hot-only
         // fallback from starting a second one.
         cancel.check()?;
+        validate_timechart_inputs(&self.conn, &query.timechart_input_checks, cancel)?;
+        // Re-read after the probes: each one is a bind of its own, and
+        // this is the last moment before the statement's.
+        cancel.check()?;
         record_prepare();
         let mut stmt = match self.conn.prepare(&query.sql) {
             Ok(s) => s,
@@ -899,6 +904,10 @@ impl Executor {
         // Same rule as the query lane: no second bind starts once the
         // caller has asked for this work to stop.
         cancel.check()?;
+        // And the same bucket-source refusal, for the same reason: an
+        // export writes its answer to a file, where a wrong bucket is
+        // harder to notice than on screen, not easier.
+        validate_timechart_inputs(&self.conn, &emitted.timechart_input_checks, cancel)?;
         if !emitted.rust_stages.is_empty() {
             return Err(EngineError::Emit(
                 trawl_core::emitter::EmitError::UnsupportedOperation {
@@ -934,6 +943,10 @@ impl Executor {
             let _ = conn.execute_batch("DROP TABLE IF EXISTS __trawl_export");
         };
 
+        // Same re-read as the query lane, for the same reason: the
+        // probes above each bound a statement, and the staging SELECT
+        // is about to bind another.
+        cancel.check()?;
         record_prepare();
         match self.conn.prepare(&create_sql) {
             Ok(mut stmt) => {
@@ -1095,6 +1108,9 @@ fn value_to_json(v: &Value) -> serde_json::Value {
         Value::Null => serde_json::Value::Null,
         Value::Boolean(b) => serde_json::Value::Bool(*b),
         Value::Integer(n) => serde_json::json!(n),
+        // A JSON number, like every other integer: ndjson export must
+        // spell an oversized unsigned the way the wire does.
+        Value::UInt(u) => serde_json::json!(u),
         Value::Float(f) => serde_json::json!(f),
         Value::String(s) => serde_json::Value::String(s.clone()),
         Value::Array(arr) => serde_json::Value::Array(arr.iter().map(value_to_json).collect()),
@@ -1122,6 +1138,120 @@ fn is_binder_column_error(e: &duckdb::Error) -> bool {
     msg.contains(DUCKDB_BINDER_ERROR_MSG) && (msg.contains("column") || msg.contains("not found"))
 }
 
+/// The `DuckDB` types a `timechart` bucket source may have: the
+/// timestamp family and nothing else.
+///
+/// `DATE` is deliberately absent. `DuckDB` resolves
+/// `time_bucket(INTERVAL, <untyped NULL>)` to the `DATE` overload, so a
+/// bucket source that is nothing at all buckets happily and charts every
+/// row into one NULL bucket; and a real date column cannot be told from
+/// that one by its type. Refusing both costs a reader with a date column
+/// one cast, and says so.
+fn bucket_input_is_timestamp(id: LogicalTypeId) -> bool {
+    matches!(
+        id,
+        LogicalTypeId::Timestamp
+            | LogicalTypeId::TimestampS
+            | LogicalTypeId::TimestampMs
+            | LogicalTypeId::TimestampNs
+            | LogicalTypeId::TimestampTZ
+    )
+}
+
+/// The `DuckDB` SQL name for a bucket type a refusal reports.
+///
+/// Trawl-authored, so what the reader sees does not depend on `DuckDB`'s
+/// error wording. The three spellings that differ from the enum are
+/// given outright; the rest are the enum's own names, which are
+/// `DuckDB`'s SQL names in every case a bucket source can take.
+fn duckdb_type_name(id: LogicalTypeId) -> String {
+    match id {
+        LogicalTypeId::SqlNull => "NULL".to_string(),
+        LogicalTypeId::Varchar | LogicalTypeId::StringLiteral => "VARCHAR".to_string(),
+        LogicalTypeId::IntegerLiteral => "INTEGER".to_string(),
+        other => format!("{other:?}").to_uppercase(),
+    }
+}
+
+/// Refuse a `timechart on <column>` whose bucket source is not a
+/// timestamp, before the statement it belongs to is bound.
+///
+/// One probe per timechart, each reading its own stage's input
+/// relation ([`trawl_core::emitter::TimechartInputCheck`]), so the
+/// answer is about the column that stage buckets and not about
+/// whatever the finished query happens to call `_time`. That makes
+/// the refusal the same on every lane that runs a statement — query
+/// and export alike — and immune to a later stage dropping the
+/// bucket, re-typing it, or manufacturing a column of that name.
+///
+/// A probe that fails is an answer too, and only one failure is
+/// silence: the no-files case, which the query lane answers with an
+/// empty result rather than an error, so the probe must not turn an
+/// empty window into a refusal. Every other failure propagates, with
+/// the same classification the main statement would get. It has to:
+/// a probe carries the search predicate, and a `_time` filter over a
+/// source with no `_time` column fails HERE while the main statement
+/// survives it — `time_bucket(…, "d") AS "_time"` gives `DuckDB` an
+/// output alias to resolve that filter against, and the query comes
+/// back with buckets nobody checked.
+fn validate_timechart_inputs(
+    conn: &Connection,
+    checks: &[TimechartInputCheck],
+    cancel: &CancelLatch,
+) -> Result<(), EngineError> {
+    for check in checks {
+        // Same rule as the lanes below: no bind starts once the
+        // caller has asked for this work to stop.
+        cancel.check()?;
+        record_prepare();
+        let mut stmt = match conn.prepare(&check.sql) {
+            Ok(stmt) => stmt,
+            Err(e) if is_no_files_error(&e) => continue,
+            Err(e) if is_binder_column_error(&e) => return Err(remap_binder_error(&e)),
+            Err(e) => return Err(e.into()),
+        };
+
+        // The probe's own bind-to-execute boundary, for the reason the
+        // lanes below have one: a long bind is where a cancellation is
+        // most likely to land, and the next thing this does is ask
+        // `DuckDB` to execute.
+        cancel.check()?;
+
+        let params = bind_params(&check.params);
+        let param_refs: Vec<&dyn duckdb::ToSql> = params.iter().map(AsRef::as_ref).collect();
+        let rows = match stmt.query(param_refs.as_slice()) {
+            Ok(rows) => rows,
+            Err(e) if is_no_files_error(&e) => continue,
+            Err(e) if is_binder_column_error(&e) => return Err(remap_binder_error(&e)),
+            Err(e) => return Err(e.into()),
+        };
+
+        let bound =
+            rows.as_ref()
+                .ok_or(EngineError::Database(duckdb::Error::InvalidColumnName(
+                    "statement unavailable after query execution".into(),
+                )))?;
+        let id = bound.column_logical_type(0).id();
+        if !bucket_input_is_timestamp(id) {
+            // `Refused`, not `Emit`: the hot lanes read an `Emit` as a
+            // column the cold source lacks and answer it with an empty
+            // result once the hot-only retry fails the same way. There
+            // is nothing for a narrower source to fix here.
+            return Err(EngineError::Refused {
+                message: format!(
+                    "timechart on '{}' is not a timestamp: {}",
+                    check.column,
+                    duckdb_type_name(id)
+                ),
+            });
+        }
+    }
+    // A cancellation that landed during the last probe's bind stops the
+    // caller before it binds the statement these probes were about.
+    cancel.check()?;
+    Ok(())
+}
+
 /// Retry `attempt` with the query's `_raw`-free SQL when the first try failed
 /// to bind a column.
 ///
@@ -1131,8 +1261,10 @@ fn is_binder_column_error(e: &duckdb::Error) -> bool {
 /// unknown field read the same), this asks for evidence: re-run with the
 /// `_raw` side bound to a typed NULL, and take that result only if it binds.
 /// If it fails too, the missing column was the user's, so the original error
-/// is what they see. The parameter list is identical between the two SQL
-/// strings (ADR-0009).
+/// is what they see — unless the retry came back with something only it could
+/// know: a cancellation, or a refusal it proved against the relation the
+/// caller meant. The parameter list is identical between the two SQL strings
+/// (ADR-0009).
 ///
 /// Costs nothing on the success path, and nothing for queries without a text
 /// search — `raw_free_sql` is `None` there.
@@ -1150,13 +1282,25 @@ fn with_raw_fallback<T>(
     let fallback = EmittedQuery {
         sql: raw_free.clone(),
         raw_free_sql: None,
+        // The probes follow their statement. The primary's bind `_raw`,
+        // and this retry exists because the source may not have it.
+        timechart_input_checks: query.raw_free_timechart_input_checks.clone(),
+        raw_free_timechart_input_checks: Vec::new(),
         ..query.clone()
     };
     attempt(&fallback).map_err(|e| match e {
         // A cancellation the retry hit is its own answer: reporting the
         // first attempt's missing-column error would tell the caller its
         // query was wrong when the caller is the one who stopped it.
-        EngineError::Cancelled => e,
+        //
+        // So is a refusal, and for the same reason one level down: the
+        // retry is the attempt that bound the relation the caller meant,
+        // and it asked `DuckDB` about the column the caller named. The
+        // first attempt's error is about `_raw`, which is trawl's column
+        // and not theirs — and it is an `Emit`, so handing it back would
+        // also route a proven-wrong query into the hot lanes' benign
+        // binder policy.
+        EngineError::Cancelled | EngineError::Refused { .. } => e,
         _ => err,
     })
 }
@@ -1168,6 +1312,11 @@ fn with_raw_fallback<T>(
 /// The trigger for the `_raw`-free retry (see [`with_raw_fallback`]), which
 /// then decides from evidence — does the raw-free SQL bind? — rather than
 /// from which column the message names.
+///
+/// [`EngineError::Refused`] is deliberately not a trigger: the engine
+/// already asked `DuckDB` about the column the caller named and got an
+/// answer, and no substitution on the `_raw` side changes that column's
+/// type. Retrying would pay a second bind to reach the same sentence.
 fn is_missing_column_failure(e: &EngineError) -> bool {
     match e {
         EngineError::Emit(_) => true,
@@ -1350,10 +1499,14 @@ fn classify_query_outcome(
         // No columns: `execute_emitted` substituted an empty result for a
         // "no files match the pattern" read error.
         Ok(_) => HotColdOutcome::NoColumns,
-        // A binder error the query path remapped to Emit.
+        // A binder error the query path remapped to Emit. A refusal is
+        // deliberately NOT this: it wears its own variant precisely so
+        // it falls through to `Fatal` below, because no narrower source
+        // would make the query mean something else and answering it
+        // with the empty-result UX would hide it behind a 200.
         Err(EngineError::Emit(_)) => HotColdOutcome::BenignBinder,
         Err(EngineError::Database(_)) => HotColdOutcome::Recoverable,
-        // ResultTooLarge, parse, IO — propagate.
+        // Refused, ResultTooLarge, parse, IO — propagate.
         Err(_) => HotColdOutcome::Fatal,
     }
 }
@@ -1369,6 +1522,9 @@ fn classify_export_outcome(outcome: &Result<(), EngineError>) -> HotColdOutcome 
         Ok(()) => HotColdOutcome::Columns,
         Err(EngineError::Database(e)) if is_no_files_error(e) => HotColdOutcome::NoColumns,
         Err(EngineError::Database(e)) if is_binder_column_error(e) => HotColdOutcome::BenignBinder,
+        // Same carve-out as the query lane: an emitter refusal keeps the
+        // empty-result UX, while `Refused` falls through to `Fatal`
+        // below — an export that swallowed it would write the file.
         Err(EngineError::Emit(_)) => HotColdOutcome::BenignBinder,
         Err(EngineError::Database(_)) => HotColdOutcome::Recoverable,
         Err(_) => HotColdOutcome::Fatal,
@@ -1634,16 +1790,14 @@ fn extract_value(row: &duckdb::Row<'_>, idx: usize, utc_offset_secs: i32) -> Val
         ValueRef::SmallInt(i) => Value::Integer(i64::from(i)),
         ValueRef::Int(i) => Value::Integer(i64::from(i)),
         ValueRef::BigInt(i) => Value::Integer(i),
-        // log data shouldn't exceed i64 range; stringify if it does
-        ValueRef::HugeInt(i) => {
-            i64::try_from(i).map_or_else(|_| Value::String(i.to_string()), Value::Integer)
-        }
+        // Past `i64::MAX` the magnitude lands in `Value::UInt` —
+        // `trawl_api::value` owns that rule for every decoder, this one
+        // included.
+        ValueRef::HugeInt(i) => land_i128(i),
         ValueRef::UTinyInt(i) => Value::Integer(i64::from(i)),
         ValueRef::USmallInt(i) => Value::Integer(i64::from(i)),
         ValueRef::UInt(i) => Value::Integer(i64::from(i)),
-        ValueRef::UBigInt(i) => {
-            i64::try_from(i).map_or_else(|_| Value::String(i.to_string()), Value::Integer)
-        }
+        ValueRef::UBigInt(i) => land_u64(i),
         ValueRef::Float(f) => Value::Float(f64::from(f)),
         ValueRef::Double(f) => Value::Float(f),
         ValueRef::Text(bytes) => Value::String(String::from_utf8_lossy(bytes).into_owned()),
@@ -1663,6 +1817,12 @@ fn extract_value(row: &duckdb::Row<'_>, idx: usize, utc_offset_secs: i32) -> Val
 }
 
 /// Recursively convert a `duckdb::types::Value` to our `Value`.
+///
+/// This is the nested twin of [`extract_value`] — a `list()` aggregate
+/// arrives here element by element — so it lands the same integer widths
+/// the same way. Without the unsigned arms a `UBIGINT` inside a list fell
+/// through to the debug-text fallback below and reached the reader as
+/// `UBigInt(18446744073709551615)`.
 fn convert_duckdb_value(v: duckdb::types::Value) -> Value {
     match v {
         duckdb::types::Value::Null => Value::Null,
@@ -1671,6 +1831,11 @@ fn convert_duckdb_value(v: duckdb::types::Value) -> Value {
         duckdb::types::Value::SmallInt(i) => Value::Integer(i64::from(i)),
         duckdb::types::Value::Int(i) => Value::Integer(i64::from(i)),
         duckdb::types::Value::BigInt(i) => Value::Integer(i),
+        duckdb::types::Value::HugeInt(i) => land_i128(i),
+        duckdb::types::Value::UTinyInt(i) => Value::Integer(i64::from(i)),
+        duckdb::types::Value::USmallInt(i) => Value::Integer(i64::from(i)),
+        duckdb::types::Value::UInt(i) => Value::Integer(i64::from(i)),
+        duckdb::types::Value::UBigInt(i) => land_u64(i),
         duckdb::types::Value::Float(f) => Value::Float(f64::from(f)),
         duckdb::types::Value::Double(f) => Value::Float(f),
         duckdb::types::Value::Text(s) => Value::String(s),
@@ -1679,6 +1844,43 @@ fn convert_duckdb_value(v: duckdb::types::Value) -> Value {
         }
         other => Value::String(format!("{other:?}")),
     }
+}
+
+/// A `UBIGINT` inside a `list()` reaches the reader as a number,
+/// including the ones past `i64::MAX` that only `Value::UInt` holds.
+///
+/// Driven through a real `DuckDB` list so the element type is whatever the
+/// driver actually hands back, not whatever this module assumes: the arm
+/// this guards was missing, and the cell rendered Rust debug text.
+#[cfg(test)]
+#[test]
+fn list_ubigint_renders_digits() {
+    let conn = Connection::open_in_memory().expect("in-memory duckdb");
+    let mut stmt = conn
+        .prepare(
+            "SELECT list(v ORDER BY v) FROM (VALUES \
+             (1::UBIGINT), (9223372036854775808::UBIGINT), \
+             (18446744073709551615::UBIGINT)) t(v)",
+        )
+        .expect("prepare");
+    let mut rows = stmt.query([]).expect("query");
+    let row = rows.next().expect("step").expect("one row");
+    let cell = extract_value(row, 0, 0);
+
+    assert_eq!(
+        cell,
+        Value::Array(vec![
+            Value::Integer(1),
+            Value::UInt(9_223_372_036_854_775_808),
+            Value::UInt(u64::MAX),
+        ]),
+        "every element must be a number, never debug text"
+    );
+    let rendered = cell.to_string();
+    assert!(
+        !rendered.contains("UBigInt"),
+        "debug text leaked into the cell: {rendered}"
+    );
 }
 
 /// Convert a temporal value to microseconds based on its `TimeUnit`.
@@ -1864,6 +2066,645 @@ fn days_to_ymd(days: i32) -> (i32, u32, u32) {
     let y = if m <= 2 { y + 1 } else { y };
 
     (y as i32, m, d)
+}
+
+/// One parquet fixture for the `timechart on` lane, two rows, one
+/// column per bucket-source type worth refusing — plus `label`, whose
+/// values include the literal string `_time`, for the pivot case.
+#[cfg(test)]
+fn timechart_fixture(dir: &tempfile::TempDir) -> String {
+    let path = dir
+        .path()
+        .join("buckets.parquet")
+        .to_str()
+        .expect("temp path is valid UTF-8")
+        .to_string();
+    Connection::open_in_memory()
+        .expect("in-memory duckdb")
+        .execute_batch(&format!(
+            "COPY (SELECT * FROM (VALUES \
+             ('web-1', 'c1', 1::BIGINT, 1.5::DOUBLE, TRUE, DATE '2026-01-01', \
+              TIMESTAMP '2026-01-01 00:05:00', TIMESTAMPTZ '2026-01-01 00:05:00+00', '_time'), \
+             ('web-2', 'c2', 2::BIGINT, 2.5::DOUBLE, FALSE, DATE '2026-01-02', \
+              TIMESTAMP '2026-01-02 00:05:00', TIMESTAMPTZ '2026-01-02 00:05:00+00', 'other')) \
+             AS t(hostname, column_name, n, f, bo, d, good, tz, label)) \
+             TO '{path}' (FORMAT PARQUET)"
+        ))
+        .expect("fixture writes");
+    path
+}
+
+/// The message of the bucket-type refusal `dsl` earns, or a panic
+/// naming what came back instead.
+#[cfg(test)]
+fn timechart_refusal(source: &str, dsl: &str) -> String {
+    match timechart_outcome(source, dsl) {
+        Err(EngineError::Refused { message }) => message,
+        Err(other) => panic!("expected the bucket-type refusal, got {other:?}"),
+        Ok(result) => panic!("expected a refusal, got {} rows", result.rows.len()),
+    }
+}
+
+/// What the cold query lane answers `dsl` with.
+#[cfg(test)]
+fn timechart_outcome(source: &str, dsl: &str) -> Result<QueryResult, EngineError> {
+    Executor::new()
+        .expect("executor")
+        .run_query(dsl, source, &FieldTypes::new(), usize::MAX, 0)
+}
+
+/// Every bucket source that is not a timestamp is refused, naming the
+/// column the reader wrote and the type `DuckDB` reports for it — and
+/// the timestamps are not.
+///
+/// `DATE` and the untyped NULL are the two that bind: `time_bucket` has
+/// a DATE overload and `DuckDB` resolves an untyped NULL onto it, so
+/// without this check `| let t = null | timechart on t count()` charts
+/// every row into one NULL bucket and says nothing. The rest fail in
+/// the binder, which would answer with a sentence about a SQL function
+/// the reader never typed.
+#[cfg(test)]
+#[test]
+fn timechart_input_refuses_each_non_timestamp() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source = timechart_fixture(&dir);
+
+    for (column, type_name) in [
+        ("hostname", "VARCHAR"),
+        ("n", "BIGINT"),
+        ("f", "DOUBLE"),
+        ("bo", "BOOLEAN"),
+        ("d", "DATE"),
+    ] {
+        assert_eq!(
+            timechart_refusal(&source, &format!("* | timechart on {column} count()")),
+            format!("timechart on '{column}' is not a timestamp: {type_name}"),
+        );
+    }
+
+    // A column the pipeline itself minted out of nothing. The type is
+    // INTEGER because that is what `DuckDB` declares a bare NULL column
+    // to be in a relation — while the same NULL inside the bucket call
+    // resolves onto the DATE overload, which is exactly why the bound
+    // output could not tell this from a date column and the stage's
+    // input can.
+    assert_eq!(
+        timechart_refusal(&source, "* | let t = null | timechart on t count()"),
+        "timechart on 't' is not a timestamp: INTEGER",
+        "an untyped NULL binds, so only the input check can catch it"
+    );
+
+    // And the two that are bucket sources.
+    for column in ["good", "tz"] {
+        let result = Executor::new()
+            .expect("executor")
+            .run_query(
+                &format!("* | timechart on {column} span=1d count()"),
+                &source,
+                &FieldTypes::new(),
+                usize::MAX,
+                0,
+            )
+            .unwrap_or_else(|e| panic!("{column} is a bucket source: {e:?}"));
+        assert_eq!(result.rows.len(), 2, "one bucket per day, on {column}");
+    }
+}
+
+/// The export lanes refuse what the query lane refuses.
+///
+/// They run their own statement and never touch the query lane's
+/// checks, so before this the same pipeline was refused on screen and
+/// written to a file — a DATE-typed NULL bucket, in a parquet nobody
+/// would look at twice.
+#[cfg(test)]
+#[test]
+fn export_refuses_bad_timechart_input() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source = timechart_fixture(&dir);
+    let out = dir.path().join("export.parquet");
+    let hot = dir.path().join("hot.ndjson");
+    // The envelope columns the hot branch conforms are part of the
+    // buffer's contract, `_ingested` included.
+    std::fs::write(
+        &hot,
+        "{\"_time\":\"2026-01-03T00:05:00Z\",\"_ingested\":\"2026-01-03T00:05:01Z\",\
+         \"hostname\":\"web-3\"}\n",
+    )
+    .expect("hot buffer writes");
+
+    let dsl = "* | let t = null | timechart on t count()";
+    let expected = "timechart on 't' is not a timestamp: INTEGER";
+    let exec = Executor::new().expect("executor");
+
+    let cold = exec
+        .export_parquet(dsl, &source, &FieldTypes::new(), &out, usize::MAX)
+        .expect_err("the cold export lane refuses it");
+    let with_hot = exec
+        .export_parquet_with_hot(
+            dsl,
+            &source,
+            hot.to_str().expect("temp path is valid UTF-8"),
+            &FieldTypes::new(),
+            &FieldTypes::new(),
+            &out,
+            usize::MAX,
+        )
+        .expect_err("and so does the hot+cold one");
+
+    for outcome in [cold, with_hot] {
+        match outcome {
+            EngineError::Refused { message } => assert_eq!(message, expected),
+            other => panic!("expected the bucket-type refusal, got {other:?}"),
+        }
+    }
+    assert!(
+        !out.exists(),
+        "a refused export must not leave a file behind"
+    );
+}
+
+/// A later `stats` drops `_time` from the output, and the bad bucket is
+/// still refused: the check reads the stage's input, not the query's
+/// result.
+#[cfg(test)]
+#[test]
+fn timechart_input_checked_before_stats_hides_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source = timechart_fixture(&dir);
+
+    assert_eq!(
+        timechart_refusal(
+            &source,
+            "* | let t = null | timechart on t count() | stats count()"
+        ),
+        "timechart on 't' is not a timestamp: INTEGER"
+    );
+}
+
+/// A later plain `timechart` re-types `_time` through its own
+/// `TRY_CAST`, and the bad bucket underneath it is still refused.
+#[cfg(test)]
+#[test]
+fn timechart_input_checked_before_default_timechart_retypes_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source = timechart_fixture(&dir);
+
+    assert_eq!(
+        timechart_refusal(
+            &source,
+            "* | let t = null | timechart on t count() | timechart count()"
+        ),
+        "timechart on 't' is not a timestamp: INTEGER"
+    );
+}
+
+/// A `pivot` can name a column after a data value, so a query whose
+/// output carries a HUGEINT called `_time` is perfectly valid. The
+/// bucket it actually charted was a TIMESTAMP, and the query succeeds.
+#[cfg(test)]
+#[test]
+fn pivot_made_time_column_is_not_the_bucket() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source = timechart_fixture(&dir);
+
+    let result = Executor::new()
+        .expect("executor")
+        .run_query(
+            "* | timechart on good span=1d count() by label | pivot count() on label",
+            &source,
+            &FieldTypes::new(),
+            usize::MAX,
+            0,
+        )
+        .expect("a pivot-made _time column is not this query's bucket");
+    assert!(
+        result.columns.iter().any(|c| c.name == "_time"),
+        "the pivot names a column after the `_time` label value: {:?}",
+        result.columns
+    );
+}
+
+/// Two timecharts, and the refusal names the stage that failed: each
+/// stage carries its own probe, so there is nothing to guess between.
+#[cfg(test)]
+#[test]
+fn two_timecharts_attribute_the_failing_stage() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source = timechart_fixture(&dir);
+
+    assert_eq!(
+        timechart_refusal(
+            &source,
+            "* | timechart on good count() by hostname | timechart on hostname count()"
+        ),
+        "timechart on 'hostname' is not a timestamp: VARCHAR",
+        "the column that failed, never the one that bucketed fine"
+    );
+}
+
+/// A bucket column called `column_name` is named as itself.
+///
+/// The refusal used to come from `DuckDB`'s binder, whose message
+/// quotes the offending SQL line back — and the missing-column guard
+/// matches the word "column" anywhere in a binder message, so this
+/// query answered `unknown field: column_name` and sent the reader
+/// after a field that exists. Nothing reads that message now.
+#[cfg(test)]
+#[test]
+fn on_column_named_column_name_is_named() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source = timechart_fixture(&dir);
+
+    assert_eq!(
+        timechart_refusal(&source, "* | timechart on column_name count()"),
+        "timechart on 'column_name' is not a timestamp: VARCHAR"
+    );
+}
+
+/// A probe that fails to bind is not permission to run the statement.
+///
+/// The fixture has a DATE column and NO `_time`, so the probe's own
+/// search predicate cannot bind — while the statement it guards can:
+/// `time_bucket(…, "d") AS "_time"` gives `DuckDB` an output alias to
+/// resolve that same `_time` filter against, and the query comes back
+/// with DATE buckets nobody ever checked. Skipping a failed probe made
+/// the check optional exactly where the relation is strange enough to
+/// need it.
+#[cfg(test)]
+#[test]
+fn failed_probe_is_not_silence() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source = timechart_fixture(&dir);
+    let dsl = "last=10000d * | timechart on d span=1d count()";
+
+    let message = match timechart_outcome(&source, dsl) {
+        // Either shape is a refusal: the probe's own filter fails to
+        // bind (a missing column, remapped) before it can report the
+        // DATE it would have refused anyway.
+        Err(e @ (EngineError::Emit(_) | EngineError::Refused { .. })) => e.to_string(),
+        Err(other) => panic!("expected a refusal, got {other:?}"),
+        Ok(result) => panic!("expected a refusal, got {} rows", result.rows.len()),
+    };
+    assert!(
+        message.contains("_time") || message.contains("timechart on 'd'"),
+        "either the probe's unbindable filter or the DATE bucket, never a \
+         successful chart: {message}"
+    );
+}
+
+/// The one failure that stays silent: an empty glob.
+///
+/// The query lane answers a window that matched no files with an empty
+/// result, not an error, and a probe that fails the same way must not
+/// turn that into a refusal.
+#[cfg(test)]
+#[test]
+fn empty_glob_probe_stays_silent() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let empty = format!("{}/nothing/*.parquet", dir.path().display());
+
+    let result = Executor::new()
+        .expect("executor")
+        .run_query(
+            "* | timechart on good count()",
+            &empty,
+            &FieldTypes::new(),
+            usize::MAX,
+            0,
+        )
+        .expect("an empty window is an empty result, probe or no probe");
+    assert!(result.rows.is_empty(), "{:?}", result.rows);
+}
+
+/// A hot buffer does not turn a refusal into an empty 200.
+///
+/// The hot lanes answer a missing column with the empty-result UX: the
+/// cold read could not bind it, so they retry hot-only, and when that
+/// fails the same way they hand back no rows rather than an error.
+/// While the refusal wore `EngineError::Emit` it was caught by that
+/// policy too — a server with a hot buffer answered
+/// `| let t = null | timechart on t count()` with 200 and zero rows,
+/// which is the one outcome worse than the wrong buckets, because
+/// nothing on the wire says the query was refused.
+#[cfg(test)]
+#[test]
+fn type_refusal_survives_hot_fallback() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source = timechart_fixture(&dir);
+    let hot = dir.path().join("hot.ndjson");
+    std::fs::write(
+        &hot,
+        "{\"_time\":\"2026-01-03T00:05:00Z\",\"_ingested\":\"2026-01-03T00:05:01Z\",\
+         \"hostname\":\"web-3\"}\n",
+    )
+    .expect("hot buffer writes");
+
+    let outcome = Executor::new().expect("executor").run_query_with_hot(
+        "* | let t = null | timechart on t count()",
+        &source,
+        hot.to_str().expect("temp path is valid UTF-8"),
+        &FieldTypes::new(),
+        &FieldTypes::new(),
+        usize::MAX,
+        0,
+    );
+    match outcome {
+        Err(EngineError::Refused { message }) => assert_eq!(
+            message, "timechart on 't' is not a timestamp: INTEGER",
+            "the refusal reaches the caller intact"
+        ),
+        Err(other) => panic!("expected the bucket-type refusal, got {other:?}"),
+        Ok(result) => panic!(
+            "expected a refusal, got {} rows over {} columns",
+            result.rows.len(),
+            result.columns.len()
+        ),
+    }
+
+    // And it is hard at the policy, not merely unmatched by the arm
+    // that turns a failed hot-only retry into an empty result: a
+    // `BenignBinder` verdict here would send the lane off to re-emit and
+    // re-run the whole query hot-only before landing back on the same
+    // refusal.
+    let refused = || EngineError::Refused {
+        message: "timechart on 'x' is not a timestamp: VARCHAR".to_string(),
+    };
+    assert_eq!(
+        classify_query_outcome(&Err(refused())),
+        HotColdOutcome::Fatal,
+        "the query lane must not treat a refusal as a missing column"
+    );
+    assert_eq!(
+        classify_export_outcome(&Err(refused())),
+        HotColdOutcome::Fatal,
+        "nor the export lane"
+    );
+}
+
+/// And the policy it is carved out of is untouched: a column neither
+/// source has still answers with the hot lane's empty result, not with
+/// a refusal.
+#[cfg(test)]
+#[test]
+fn missing_column_still_benign_with_hot() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source = timechart_fixture(&dir);
+    let hot = dir.path().join("hot.ndjson");
+    std::fs::write(
+        &hot,
+        "{\"_time\":\"2026-01-03T00:05:00Z\",\"_ingested\":\"2026-01-03T00:05:01Z\",\
+         \"hostname\":\"web-3\"}\n",
+    )
+    .expect("hot buffer writes");
+
+    let result = Executor::new()
+        .expect("executor")
+        .run_query_with_hot(
+            "* | where nosuchcolumn == 1",
+            &source,
+            hot.to_str().expect("temp path is valid UTF-8"),
+            &FieldTypes::new(),
+            &FieldTypes::new(),
+            usize::MAX,
+            0,
+        )
+        .expect("a missing column with a hot buffer keeps the empty-result UX");
+    assert!(result.rows.is_empty(), "{:?}", result.rows);
+}
+
+/// A source with no `_raw` column at all: user-owned parquet read in
+/// embedded mode, the shape the `_raw`-free retry exists for. Bare-word
+/// search degrades to `message` there, so the retry's relation binds
+/// and its probe has a `hostname` to ask `DuckDB` about.
+#[cfg(test)]
+fn raw_free_fixture(dir: &tempfile::TempDir) -> String {
+    let path = dir
+        .path()
+        .join("raw_free.parquet")
+        .to_str()
+        .expect("temp path is valid UTF-8")
+        .to_string();
+    Connection::open_in_memory()
+        .expect("in-memory duckdb")
+        .execute_batch(&format!(
+            "COPY (SELECT * FROM (VALUES ('needle', 'web-1'), ('haystack', 'web-2')) \
+             AS t(message, hostname)) TO '{path}' (FORMAT PARQUET)"
+        ))
+        .expect("fixture writes");
+    path
+}
+
+/// A refusal the `_raw`-free retry proved is the caller's answer.
+///
+/// The primary attempt's probe fails on `_raw` — which is the whole
+/// reason the retry exists — and the retry binds the same stage with
+/// `_raw` replaced by a typed NULL, where `DuckDB` reports the bucket
+/// source as the VARCHAR it is. Substituting the first attempt's
+/// missing-`_raw` error there sends the reader after a column they
+/// never typed, and, because that error is an `Emit`, hands the hot
+/// lanes a benign-binder verdict for a query no source can answer.
+#[cfg(test)]
+#[test]
+fn refusal_survives_raw_free_retry() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source = raw_free_fixture(&dir);
+
+    assert_eq!(
+        timechart_refusal(&source, "needle | timechart on hostname count()"),
+        "timechart on 'hostname' is not a timestamp: VARCHAR",
+        "the retry's own refusal, not the missing `_raw` that provoked it"
+    );
+}
+
+/// And the retry keeps its place for the failure it was built around: a
+/// column neither pass can bind still answers with the first attempt's
+/// error, because the retry's copy of it names `_raw` — a column of
+/// trawl's, not of the reader's query.
+#[cfg(test)]
+#[test]
+fn raw_free_retry_still_reports_the_original_missing_column() {
+    let emitted = raw_fallback_query();
+    let attempts = std::cell::Cell::new(0_u32);
+    let outcome: Result<(), EngineError> = with_raw_fallback(&emitted, |_| {
+        attempts.set(attempts.get() + 1);
+        Err(EngineError::Emit(
+            trawl_core::emitter::EmitError::UnsupportedOperation {
+                message: format!("unknown field: attempt {}", attempts.get()),
+            },
+        ))
+    });
+
+    assert_eq!(attempts.get(), 2, "both passes must have been attempted");
+    match outcome {
+        Err(EngineError::Emit(e)) => assert_eq!(
+            e.to_string(),
+            "unsupported operation: unknown field: attempt 1",
+            "the original error, not the retry's copy of it"
+        ),
+        other => panic!("expected the first attempt's error, got {other:?}"),
+    }
+}
+
+/// A refusal does not provoke the retry in the first place.
+///
+/// The retry asks a question about evidence — does this query bind
+/// without `_raw`? — and a refusal has already answered it: `DuckDB`
+/// typed the column the reader named, and no substitution on the
+/// `_raw` side changes that type. Re-running the whole statement would
+/// cost a second bind to reach the same sentence.
+#[cfg(test)]
+#[test]
+fn refusal_never_triggers_the_raw_free_retry() {
+    let emitted = raw_fallback_query();
+    let attempts = std::cell::Cell::new(0_u32);
+    let outcome: Result<(), EngineError> = with_raw_fallback(&emitted, |_| {
+        attempts.set(attempts.get() + 1);
+        Err(EngineError::Refused {
+            message: "timechart on 'hostname' is not a timestamp: VARCHAR".to_string(),
+        })
+    });
+
+    assert_eq!(attempts.get(), 1, "a refusal is not evidence to re-gather");
+    match outcome {
+        Err(EngineError::Refused { message }) => assert_eq!(
+            message,
+            "timechart on 'hostname' is not a timestamp: VARCHAR"
+        ),
+        other => panic!("expected the refusal, got {other:?}"),
+    }
+}
+
+/// An emitted query carrying a `_raw`-free twin, for the two policy
+/// tests above: a bare-word search is what binds `_raw`.
+#[cfg(test)]
+fn raw_fallback_query() -> EmittedQuery {
+    let query = parser::parse("needle").expect("dsl parses");
+    let emitted = emitter::emit(&query, "/data/**/*.parquet", EvalContext::capture())
+        .expect("the query emits");
+    assert!(
+        emitted.raw_free_sql.is_some(),
+        "a bare-word search must bind `_raw` and produce the fallback"
+    );
+    emitted
+}
+
+/// The hot-only retry runs its own probes, against its own relation.
+///
+/// A cold start routes the whole query to the hot buffer, and the
+/// re-emission it reads carries the bucket checks for the relation it
+/// actually binds. Without them the one lane with no cold data to hide
+/// would be the one lane that never checks the bucket source — and
+/// `time_bucket(INTERVAL, <untyped NULL>)` binds happily, so the answer
+/// would be a chart of every row in one NULL bucket.
+#[cfg(test)]
+#[test]
+fn refusal_survives_hot_only_retry() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let hot = dir.path().join("hot.ndjson");
+    std::fs::write(
+        &hot,
+        "{\"_time\":\"2026-01-03T00:05:00Z\",\"_ingested\":\"2026-01-03T00:05:01Z\",\
+         \"hostname\":\"web-3\"}\n",
+    )
+    .expect("hot buffer writes");
+    // No parquet behind it: the cold read matches no files, so the
+    // outcome policy answers `HotOnly`.
+    let cold = format!("{}/nothing/*.parquet", dir.path().display());
+
+    let outcome = Executor::new().expect("executor").run_query_with_hot(
+        "* | let t = null | timechart on t count()",
+        &cold,
+        hot.to_str().expect("temp path is valid UTF-8"),
+        &FieldTypes::new(),
+        &FieldTypes::new(),
+        usize::MAX,
+        0,
+    );
+    match outcome {
+        Err(EngineError::Refused { message }) => assert_eq!(
+            message, "timechart on 't' is not a timestamp: INTEGER",
+            "the hot-only retry refuses what the union attempt never got to see"
+        ),
+        Err(other) => panic!("expected the bucket-type refusal, got {other:?}"),
+        Ok(result) => panic!(
+            "expected a refusal, got {} rows over {} columns",
+            result.rows.len(),
+            result.columns.len()
+        ),
+    }
+}
+
+/// The export lane's hot-only retry, for the same reason — with a file
+/// on disk as the consequence.
+#[cfg(test)]
+#[test]
+fn export_refusal_survives_hot_only_retry() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let hot = dir.path().join("hot.ndjson");
+    std::fs::write(
+        &hot,
+        "{\"_time\":\"2026-01-03T00:05:00Z\",\"_ingested\":\"2026-01-03T00:05:01Z\",\
+         \"hostname\":\"web-3\"}\n",
+    )
+    .expect("hot buffer writes");
+    let cold = format!("{}/nothing/*.parquet", dir.path().display());
+    let out = dir.path().join("export.parquet");
+
+    let outcome = Executor::new()
+        .expect("executor")
+        .export_parquet_with_hot(
+            "* | let t = null | timechart on t count()",
+            &cold,
+            hot.to_str().expect("temp path is valid UTF-8"),
+            &FieldTypes::new(),
+            &FieldTypes::new(),
+            &out,
+            usize::MAX,
+        )
+        .expect_err("the hot-only export refuses the bucket source too");
+    match outcome {
+        EngineError::Refused { message } => {
+            assert_eq!(message, "timechart on 't' is not a timestamp: INTEGER");
+        }
+        other => panic!("expected the bucket-type refusal, got {other:?}"),
+    }
+    assert!(
+        !out.exists(),
+        "a refused export must not leave a file behind"
+    );
+}
+
+/// The bucket-source accept-list and the type names a refusal reports,
+/// exercised directly: `bucket_input_is_timestamp` decides what the
+/// lanes above refuse, and a `DuckDB` type the enum spells differently
+/// from SQL would otherwise reach a reader unnoticed.
+#[cfg(test)]
+#[test]
+fn bucket_types_accepted_and_named() {
+    for id in [
+        LogicalTypeId::Timestamp,
+        LogicalTypeId::TimestampS,
+        LogicalTypeId::TimestampMs,
+        LogicalTypeId::TimestampNs,
+        LogicalTypeId::TimestampTZ,
+    ] {
+        assert!(bucket_input_is_timestamp(id), "{id:?} must chart");
+    }
+    for (id, name) in [
+        (LogicalTypeId::Date, "DATE"),
+        (LogicalTypeId::SqlNull, "NULL"),
+        (LogicalTypeId::Varchar, "VARCHAR"),
+        (LogicalTypeId::StringLiteral, "VARCHAR"),
+        (LogicalTypeId::IntegerLiteral, "INTEGER"),
+        (LogicalTypeId::Bigint, "BIGINT"),
+        (LogicalTypeId::Double, "DOUBLE"),
+        (LogicalTypeId::Time, "TIME"),
+        (LogicalTypeId::Interval, "INTERVAL"),
+        (LogicalTypeId::Boolean, "BOOLEAN"),
+    ] {
+        assert!(!bucket_input_is_timestamp(id), "{id:?} must not chart");
+        assert_eq!(duckdb_type_name(id), name, "{id:?}");
+    }
 }
 
 #[cfg(test)]

@@ -9,6 +9,8 @@
 //! (`latest`, `all`, or a specific run ID) to parquet file paths,
 //! and rewrites the DSL string with the `from saved` stage stripped.
 
+use std::path::PathBuf;
+
 use trawl_core::ast::{FromSavedStage, SavedRunSelector};
 
 use crate::error::ServerError;
@@ -31,6 +33,73 @@ pub(crate) struct ResolvedFromSaved {
     /// the stages the caller typed. Nothing stamps report runs at write
     /// time, so the walk happens here, over both texts.
     pub saved_dsl: String,
+    /// The stored result files [`source`](Self::source) reads, in selected-run
+    /// order. Empty when the selected run has no file at all (a zero-row
+    /// success resolves to a literal relation, not a read).
+    ///
+    /// Carried out of resolution so the handler can ask whether those files
+    /// are still there: `result_path` is relative to `data_dir`, and an
+    /// operator who repoints `data_dir` (an epoch bump) leaves every stored
+    /// path naming a file under the abandoned root. That is a named
+    /// unavailable state, never an empty result (ADR-0035).
+    pub run_files: Vec<RunFile>,
+}
+
+/// One selected run's stored result file, resolved against `data_dir`.
+#[derive(Debug, Clone)]
+pub(crate) struct RunFile {
+    /// The run whose result this file is — what a refusal names.
+    pub run_id: i64,
+    /// Where that file is on this node right now. Never returned to a
+    /// caller: it is an internal path.
+    pub absolute_path: PathBuf,
+}
+
+/// The sentence every read surface answers a vanished result with.
+///
+/// Names the run, says the run itself succeeded, and says outright that
+/// nothing older was read in its place — `run=latest` selects the newest
+/// success and never falls back (ADR-0018 ruling 13), so a caller who sees
+/// this has not quietly been handed an older window. It carries no
+/// filesystem path: where the file was supposed to be is the operator's
+/// business, in the log, not the caller's.
+pub(crate) fn unavailable_run_message(run_id: i64) -> String {
+    format!(
+        "report run {run_id} succeeded, but its stored result is unavailable; \
+         no older run was substituted"
+    )
+}
+
+/// The single place a missing result file becomes an answer.
+///
+/// One `stat` per file, in selected-run order; the FIRST file that is not
+/// there names the refusal, so `run=all` fails naming the missing member
+/// rather than skipping it or reporting a partial union.
+///
+/// Only [`std::io::ErrorKind::NotFound`] maps. A permission error, an I/O
+/// error, or anything else means the file's presence is unknown, not
+/// established as absent — relabelling those as "unavailable" would tell an
+/// operator a file is gone when it is sitting right there unreadable. Those
+/// return `None` and the read reports them as what they are.
+pub(crate) fn unavailable_run_conflict(files: &[RunFile]) -> Option<ServerError> {
+    files.iter().find_map(|file| {
+        match std::fs::metadata(&file.absolute_path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Some(ServerError::Conflict(unavailable_run_message(file.run_id)))
+            }
+            // Present, or present-but-unreadable: not this refusal's case.
+            Ok(_) | Err(_) => None,
+        }
+    })
+}
+
+/// The [`RunFile`] a run's stored `result_path` names, for callers that
+/// hold one run rather than a resolved selector.
+pub(crate) fn run_file(run_id: i64, data_dir: &str, result_path: &str) -> RunFile {
+    RunFile {
+        run_id,
+        absolute_path: PathBuf::from(result_file_path(data_dir, result_path)),
+    }
 }
 
 /// Resolve a `FromSavedStage` to a parquet source and remaining DSL.
@@ -53,7 +122,7 @@ pub(crate) async fn resolve(
         .await?
         .ok_or_else(|| ServerError::NotFound(format!("saved query '{}' not found", stage.name)))?;
 
-    let source = match stage.run {
+    let (source, run_files) = match stage.run {
         SavedRunSelector::Latest => {
             resolve_latest(schedule_store, saved.id, key_id, data_dir).await?
         }
@@ -77,6 +146,7 @@ pub(crate) async fn resolve(
         source,
         remaining_dsl,
         saved_dsl: saved.query,
+        run_files,
     })
 }
 
@@ -99,14 +169,21 @@ pub(crate) async fn resolve(
 ///   it, but there is no file to point a query at, so this is a 409 naming
 ///   the run. For `run=latest` the next scheduled run clears it, which is
 ///   what makes 409 the right status rather than 404 or 500.
+///
+/// Whether the first shape's file is still THERE is not decided here.
+/// Resolution reads the catalog row; the [`RunFile`] it returns beside the
+/// source is what lets the handler ask the filesystem, once, at the read
+/// (see [`unavailable_run_conflict`]).
 async fn source_for_run(
     run: &ReportRun,
     schedule_store: &ScheduleStore,
     key_id: i64,
     data_dir: &str,
-) -> Result<String, ServerError> {
+) -> Result<(String, Option<RunFile>), ServerError> {
     if let Some(ref result_path) = run.result_path {
-        return Ok(parquet_source(data_dir, result_path));
+        let file = run_file(run.id, data_dir, result_path);
+        let source = run_source(data_dir, result_path);
+        return Ok((source, Some(file)));
     }
 
     // `get_run_result` scopes the blob by the schedule's owning key, the
@@ -123,7 +200,7 @@ async fn source_for_run(
     };
 
     if result.rows.is_empty() {
-        return Ok(empty_typed_source(&result.columns));
+        return Ok((empty_typed_source(&result.columns), None));
     }
 
     Err(ServerError::Conflict(format!(
@@ -148,13 +225,14 @@ async fn resolve_latest(
     saved_query_id: i64,
     key_id: i64,
     data_dir: &str,
-) -> Result<String, ServerError> {
+) -> Result<(String, Vec<RunFile>), ServerError> {
     let run = schedule_store
         .latest_successful_run(saved_query_id)
         .await?
         .ok_or_else(|| ServerError::NotFound("no successful runs".to_string()))?;
 
-    source_for_run(&run, schedule_store, key_id, data_dir).await
+    let (source, file) = source_for_run(&run, schedule_store, key_id, data_dir).await?;
+    Ok((source, file.into_iter().collect()))
 }
 
 /// Resolve `run=N` — a specific run by ID.
@@ -172,7 +250,7 @@ async fn resolve_specific(
     run_id: i64,
     key_id: i64,
     data_dir: &str,
-) -> Result<String, ServerError> {
+) -> Result<(String, Vec<RunFile>), ServerError> {
     let run = schedule_store
         .get_run(run_id, key_id)
         .await?
@@ -185,7 +263,8 @@ async fn resolve_specific(
         )));
     }
 
-    source_for_run(&run, schedule_store, key_id, data_dir).await
+    let (source, file) = source_for_run(&run, schedule_store, key_id, data_dir).await?;
+    Ok((source, file.into_iter().collect()))
 }
 
 /// Resolve `run=all` — all successful runs, unioned with `_run_id` and `_run_time` metadata.
@@ -202,7 +281,7 @@ async fn resolve_all(
     schedule_store: &ScheduleStore,
     saved_query_id: i64,
     data_dir: &str,
-) -> Result<String, ServerError> {
+) -> Result<(String, Vec<RunFile>), ServerError> {
     let runs = schedule_store.list_successful_runs(saved_query_id).await?;
 
     if runs.is_empty() {
@@ -212,12 +291,14 @@ async fn resolve_all(
     }
 
     let mut parts = Vec::with_capacity(runs.len());
+    let mut files = Vec::with_capacity(runs.len());
     for run in &runs {
         let Some(ref result_path) = run.result_path else {
             // The store already filters `result_path IS NOT NULL`; this arm
             // only unwraps the Option.
             continue;
         };
+        files.push(run_file(run.id, data_dir, result_path));
         let source = parquet_source(data_dir, result_path);
         let safe_time = run.started_at.to_rfc3339().replace('\'', "''");
         parts.push(format!(
@@ -233,7 +314,7 @@ async fn resolve_all(
     }
 
     // Wrap in parentheses so it can be used as a DuckDB subquery source.
-    Ok(format!("({})", parts.join(" UNION ALL BY NAME ")))
+    Ok((format!("({})", parts.join(" UNION ALL BY NAME ")), files))
 }
 
 /// Build a zero-row source that still carries a run's column NAMES.
@@ -268,13 +349,42 @@ fn empty_typed_source(columns: &[trawl_api::value::Column]) -> String {
     format!("(SELECT {projected} WHERE FALSE)")
 }
 
-/// Build a `read_parquet()` expression for a single result file.
+/// Resolve a run's stored `result_path` against `data_dir`.
 ///
-/// `result_path` is relative to `data_dir` (e.g. `scheduled/my_query/run_42.parquet`).
+/// `result_path` is relative to `data_dir` (e.g. `scheduled/run_42.parquet`).
+/// The join is all this does: escaping belongs to whoever puts the path in
+/// SQL ([`parquet_source`]), and the filesystem wants it unescaped
+/// ([`RunFile::absolute_path`]).
+fn result_file_path(data_dir: &str, result_path: &str) -> String {
+    format!("{}/{result_path}", data_dir.trim_end_matches('/'))
+}
+
+/// Build a `read_parquet()` expression for one run's result file.
+///
+/// The one place a stored result path becomes SQL, so there is one escaping
+/// rule for it: single quotes doubled, the SQL string literal escape, and
+/// nothing else. `data_dir` is operator configuration and may hold spaces or
+/// non-ASCII characters (`daemon_data_directory_is_preserved_and_drives_wal_location`
+/// configures `/data with spaces`), which is exactly what an escape is for.
 fn parquet_source(data_dir: &str, result_path: &str) -> String {
-    let base = data_dir.trim_end_matches('/');
-    let safe_path = format!("{base}/{result_path}").replace('\'', "''");
+    let safe_path = result_file_path(data_dir, result_path).replace('\'', "''");
     format!("read_parquet('{safe_path}', union_by_name=true)")
+}
+
+/// The source a SINGLE selected run resolves to.
+///
+/// A parenthesised subquery, the shape `resolve_all`'s union and
+/// [`empty_typed_source`] already resolve to. [`trawl_core::emitter`] passes
+/// a `(`-prefixed source through untouched by design, because the server
+/// built it and owns its escaping; everything else it treats as a path and
+/// sends through `validate_source_path`. That validator exists for the
+/// server-minted EVENT globs, whose alphabet is deliberately narrow, and it
+/// refuses a space or a non-ASCII character on sight — so a bare path here
+/// would make `run=N` and `run=latest` answer 400 under any `data_dir` an
+/// operator is allowed to configure, with the whole internal path in the
+/// message.
+fn run_source(data_dir: &str, result_path: &str) -> String {
+    format!("(SELECT * FROM {})", parquet_source(data_dir, result_path))
 }
 
 #[cfg(test)]
@@ -358,6 +468,98 @@ mod tests {
         );
     }
 
+    /// A single run resolves to a subquery the server escaped, not to a
+    /// path the emitter has to validate. The emitter's path validator is
+    /// for event globs: it refuses a space or a non-ASCII character, both
+    /// of which a configured `data_dir` may contain.
+    #[test]
+    fn run_source_is_an_escaped_subquery() {
+        assert_eq!(
+            run_source("/var/lib/trawl/data/", "scheduled/run_42.parquet"),
+            "(SELECT * FROM read_parquet('/var/lib/trawl/data/scheduled/run_42.parquet', \
+             union_by_name=true))"
+        );
+        // A quote in the path is doubled, the SQL string literal escape.
+        assert_eq!(
+            run_source("/data", "scheduled/it's/run.parquet"),
+            "(SELECT * FROM read_parquet('/data/scheduled/it''s/run.parquet', \
+             union_by_name=true))"
+        );
+        // A configured data_dir the glob validator refuses still resolves.
+        for odd in ["/data with spaces", "/données", "/データ"] {
+            let source = run_source(odd, "scheduled/run_42.parquet");
+            assert!(source.starts_with('('), "{source}");
+            assert!(
+                trawl_core::emitter::validate_source_path(odd).is_err(),
+                "this test is pointless if the glob validator accepts {odd}"
+            );
+        }
+        // The filesystem gets the path unescaped, quote and all.
+        assert_eq!(
+            result_file_path("/data", "scheduled/it's/run.parquet"),
+            "/data/scheduled/it's/run.parquet"
+        );
+    }
+
+    /// The subquery is a source `DuckDB` actually reads, over a directory
+    /// whose name the glob validator would refuse.
+    #[test]
+    fn run_source_reads_a_file_under_an_odd_data_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("données et data with spaces");
+        std::fs::create_dir_all(data_dir.join("scheduled")).unwrap();
+        let full = data_dir.join("scheduled/run_1.parquet");
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT 7::BIGINT AS n) TO '{}' (FORMAT PARQUET)",
+            full.display()
+        ))
+        .unwrap();
+
+        let source = run_source(data_dir.to_str().unwrap(), "scheduled/run_1.parquet");
+        let counted = trawl_engine::executor::Executor::new()
+            .unwrap()
+            .run_query(
+                "* | stats count()",
+                &source,
+                &trawl_core::schema::FieldTypes::new(),
+                100,
+                0,
+            )
+            .expect("the emitter accepts the subquery and DuckDB reads the file");
+        assert_eq!(counted.rows[0][0].to_string(), "1");
+    }
+
+    /// Only a file that is NOT THERE is the unavailable answer, and the
+    /// answer names the first missing run in selector order, without
+    /// saying where the file was.
+    #[test]
+    fn unavailable_run_conflict_maps_only_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        let present = dir.path().join("here.parquet");
+        std::fs::write(&present, b"parquet").unwrap();
+        let file = |id: i64, path: &std::path::Path| RunFile {
+            run_id: id,
+            absolute_path: path.to_path_buf(),
+        };
+
+        assert!(unavailable_run_conflict(&[]).is_none(), "nothing to check");
+        assert!(
+            unavailable_run_conflict(&[file(1, &present)]).is_none(),
+            "a file that is there is not a refusal"
+        );
+
+        let gone = dir.path().join("gone.parquet");
+        let members = [file(1, &present), file(7, &gone), file(9, &gone)];
+        match unavailable_run_conflict(&members) {
+            Some(ServerError::Conflict(msg)) => {
+                assert_eq!(msg, unavailable_run_message(7), "the FIRST absent member");
+                assert!(!msg.contains(dir.path().to_str().unwrap()), "{msg}");
+            }
+            other => panic!("expected a Conflict naming run 7, got: {other:?}"),
+        }
+    }
+
     #[test]
     fn parquet_source_basic() {
         let src = parquet_source("/var/lib/trawl/data", "scheduled/daily/run_1.parquet");
@@ -386,6 +588,116 @@ mod tests {
     }
 }
 
+/// `run=all` feeds a relation whose only timestamp is `_run_time`, so
+/// `timechart on _run_time` is the stage that makes it chartable: real
+/// runs, real parquet, real `DuckDB`, one bucket per hour of run time.
+///
+/// Module-level rather than inside `pg_tests` so its path is
+/// `from_saved::timechart_on_run_time`.
+#[cfg(test)]
+#[sqlx::test]
+async fn timechart_on_run_time(pool: sqlx::PgPool) {
+    use crate::store::RunStatus;
+    use pg_tests::{run, schedule_id, seed};
+
+    /// A one-row parquet result carrying the `count` column a report's
+    /// `stats count()` would have written.
+    fn write_count_parquet(data_dir: &str, rel: &str, count: i64) {
+        let full = format!("{data_dir}/{rel}");
+        std::fs::create_dir_all(std::path::Path::new(&full).parent().unwrap()).unwrap();
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT {count}::BIGINT AS \"count\") TO '{full}' (FORMAT PARQUET)"
+        ))
+        .unwrap();
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().to_str().unwrap();
+
+    let (saved_id, sched_store, saved_store) = seed(&pool, 1, "timechart_runs").await;
+    let sid = schedule_id(&sched_store, saved_id).await;
+
+    write_count_parquet(data_dir, "scheduled/timechart_runs/run_1.parquet", 4);
+    write_count_parquet(data_dir, "scheduled/timechart_runs/run_2.parquet", 6);
+    let r1 = run(
+        &sched_store,
+        sid,
+        saved_id,
+        RunStatus::Success,
+        Some("scheduled/timechart_runs/run_1.parquet"),
+    )
+    .await;
+    let r2 = run(
+        &sched_store,
+        sid,
+        saved_id,
+        RunStatus::Success,
+        Some("scheduled/timechart_runs/run_2.parquet"),
+    )
+    .await;
+
+    // Both runs happen inside this test, so their real `started_at`
+    // values land in the same hour — and, once an hour, in two. Plant
+    // the instants instead, so the bucketing is asserted, not sampled.
+    for (id, at) in [(r1, "2026-01-01T00:17:00Z"), (r2, "2026-01-01T02:41:00Z")] {
+        sqlx::query("UPDATE report_runs SET started_at = $1 WHERE id = $2")
+            .bind(at.parse::<chrono::DateTime<chrono::Utc>>().unwrap())
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    let dsl = "| from saved timechart_runs run=all | timechart on _run_time span=1h sum(count)";
+    let ast = trawl_core::parser::parse(dsl).expect("dsl parses");
+    let stage = ast
+        .from_saved_stage()
+        .expect("the first stage is from saved");
+    let resolved = resolve(
+        stage,
+        dsl,
+        ast.pipeline[0].span.end,
+        &saved_store,
+        &sched_store,
+        1,
+        data_dir,
+    )
+    .await
+    .expect("run=all resolves");
+
+    let remaining = trawl_core::parser::parse(&resolved.remaining_dsl).expect("the tail parses");
+    let emitted = trawl_core::emitter::emit(
+        &remaining,
+        &resolved.source,
+        trawl_core::context::EvalContext::capture(),
+    )
+    .expect("emit succeeds");
+
+    let conn = duckdb::Connection::open_in_memory().unwrap();
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT strftime(\"_time\", '%Y-%m-%d %H:%M:%S') AS b, \
+             CAST(\"sum_count\" AS BIGINT) FROM ({}) ORDER BY b",
+            emitted.sql
+        ))
+        .expect("the emitted SQL binds over the run union");
+    let rows: Vec<(String, i64)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("the emitted SQL runs")
+        .collect::<Result<_, _>>()
+        .expect("rows read");
+
+    assert_eq!(
+        rows,
+        vec![
+            ("2026-01-01 00:00:00".to_string(), 4),
+            ("2026-01-01 02:00:00".to_string(), 6),
+        ],
+        "one bucket per hour of run time, carrying that run's count"
+    );
+}
+
 /// Store-backed coverage for the run-selector resolution path.
 ///
 /// These exercise the branch logic against a real `#[sqlx::test]` database
@@ -399,13 +711,17 @@ mod pg_tests {
     use trawl_core::ast::{FromSavedStage, SavedRunSelector};
 
     use super::{
-        ResolvedFromSaved, parquet_source, resolve, resolve_all, resolve_latest, resolve_specific,
+        ResolvedFromSaved, resolve, resolve_all, resolve_latest, resolve_specific, run_source,
     };
     use crate::error::ServerError;
     use crate::store::{RunClaim, RunStatus, SavedQueryStore, ScheduleStore};
 
     /// Create a saved query and its schedule, returning both ids.
-    async fn seed(pool: &PgPool, key_id: i64, name: &str) -> (i64, ScheduleStore, SavedQueryStore) {
+    pub(super) async fn seed(
+        pool: &PgPool,
+        key_id: i64,
+        name: &str,
+    ) -> (i64, ScheduleStore, SavedQueryStore) {
         let saved_store = SavedQueryStore::new(pool.clone());
         let sched_store = ScheduleStore::new(pool.clone());
         let saved = saved_store
@@ -421,7 +737,7 @@ mod pg_tests {
 
     /// Start then finish a run, returning its id. `path`/`status` let callers
     /// build success-with-parquet, success-without-parquet, and error rows.
-    async fn run(
+    pub(super) async fn run(
         store: &ScheduleStore,
         schedule_id: i64,
         saved_id: i64,
@@ -487,7 +803,7 @@ mod pg_tests {
     }
 
     /// Schedule id for a saved query (seed always creates exactly one).
-    async fn schedule_id(store: &ScheduleStore, saved_id: i64) -> i64 {
+    pub(super) async fn schedule_id(store: &ScheduleStore, saved_id: i64) -> i64 {
         store
             .get_schedule_for_saved_query(saved_id, 1)
             .await
@@ -531,11 +847,16 @@ mod pg_tests {
         )
         .await;
 
-        let source = resolve_latest(&sched_store, saved_id, 1, "/data")
+        let (source, files) = resolve_latest(&sched_store, saved_id, 1, "/data")
             .await
             .unwrap();
         // Newest wins (started_at DESC, id DESC).
-        assert_eq!(source, parquet_source("/data", "p/run_2.parquet"));
+        assert_eq!(source, run_source("/data", "p/run_2.parquet"));
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            files[0].absolute_path,
+            std::path::Path::new("/data/p/run_2.parquet")
+        );
     }
 
     #[sqlx::test]
@@ -602,10 +923,14 @@ mod pg_tests {
         .await;
         run_with_blob(&sched_store, sid, saved_id, &zero_row_result(&["n", "msg"])).await;
 
-        let source = resolve_latest(&sched_store, saved_id, 1, data_dir)
+        let (source, files) = resolve_latest(&sched_store, saved_id, 1, data_dir)
             .await
             .expect("a zero-row success resolves to its own empty source");
         assert_eq!(source, r#"(SELECT NULL AS "n", NULL AS "msg" WHERE FALSE)"#);
+        assert!(
+            files.is_empty(),
+            "a literal relation reads no file: {files:?}"
+        );
 
         // Executed, because the assertion that matters is the ANSWER: the
         // older run holds one row, and reading it here would count 1.
@@ -691,7 +1016,7 @@ mod pg_tests {
         .await;
         let empty = run_with_blob(&sched_store, sid, saved_id, &zero_row_result(&["n"])).await;
 
-        let source = resolve_all(&sched_store, saved_id, data_dir).await.unwrap();
+        let (source, _files) = resolve_all(&sched_store, saved_id, data_dir).await.unwrap();
         assert!(
             !source.contains(&format!("{empty} AS _run_id")),
             "the zero-row run is not a member: {source}"
@@ -727,10 +1052,12 @@ mod pg_tests {
         )
         .await;
 
-        let source = resolve_specific(&sched_store, rid, 1, "/data")
+        let (source, files) = resolve_specific(&sched_store, rid, 1, "/data")
             .await
             .unwrap();
-        assert_eq!(source, parquet_source("/data", "p/run_7.parquet"));
+        assert_eq!(source, run_source("/data", "p/run_7.parquet"));
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].run_id, rid);
     }
 
     #[sqlx::test]
@@ -792,10 +1119,11 @@ mod pg_tests {
         let sid = schedule_id(&sched_store, saved_id).await;
         let rid = run_with_blob(&sched_store, sid, saved_id, &zero_row_result(&["n", "msg"])).await;
 
-        let source = resolve_specific(&sched_store, rid, 1, "/data")
+        let (source, files) = resolve_specific(&sched_store, rid, 1, "/data")
             .await
             .expect("a zero-row run resolves by id");
         assert_eq!(source, r#"(SELECT NULL AS "n", NULL AS "msg" WHERE FALSE)"#);
+        assert!(files.is_empty(), "no file is read: {files:?}");
 
         let counted = trawl_engine::executor::Executor::new()
             .unwrap()
@@ -936,7 +1264,7 @@ mod pg_tests {
         run(&sched_store, sid, saved_id, RunStatus::Error, None).await;
         run(&sched_store, sid, saved_id, RunStatus::Success, None).await;
 
-        let source = resolve_all(&sched_store, saved_id, data_dir).await.unwrap();
+        let (source, _files) = resolve_all(&sched_store, saved_id, data_dir).await.unwrap();
         assert!(source.contains("UNION ALL BY NAME"), "source: {source}");
         assert!(source.contains("TIMESTAMP '"), "source: {source}");
 
@@ -1024,7 +1352,7 @@ mod pg_tests {
         .unwrap();
         assert_eq!(
             resolved.source,
-            parquet_source("/data", "scheduled/legacy/run_1.parquet")
+            run_source("/data", "scheduled/legacy/run_1.parquet")
         );
         assert_eq!(resolved.remaining_dsl, "* | head 1");
         assert!(
@@ -1073,7 +1401,7 @@ mod pg_tests {
         )
         .await
         .unwrap();
-        assert_eq!(source, parquet_source("/data", "p/run_1.parquet"));
+        assert_eq!(source, run_source("/data", "p/run_1.parquet"));
         assert_eq!(remaining_dsl, "* | stats count() by host");
 
         // No trailing pipeline collapses to a bare `*`.

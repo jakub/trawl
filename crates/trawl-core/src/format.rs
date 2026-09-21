@@ -350,6 +350,9 @@ fn format_dedup(s: &crate::ast::DedupStage, out: &mut String) {
 
 fn format_timechart(s: &crate::ast::TimechartStage, out: &mut String) {
     out.push_str("timechart");
+    if let Some(on) = &s.on {
+        let _ = write!(out, " on {}", dsl_field(on));
+    }
     if let Some(span) = s.span {
         let _ = write!(out, " span={span}");
     }

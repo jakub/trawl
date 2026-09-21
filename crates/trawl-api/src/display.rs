@@ -23,6 +23,7 @@ pub fn value_to_string(value: &Value) -> String {
         Value::Null => "NULL".to_owned(),
         Value::Boolean(b) => b.to_string(),
         Value::Integer(i) => i.to_string(),
+        Value::UInt(u) => u.to_string(),
         Value::Float(f) => format!("{f:.2}"),
         Value::String(s) => s.clone(),
         Value::Array(_) => value.to_string(),
@@ -73,15 +74,38 @@ pub fn downsample(values: &[u64], target_width: usize) -> Vec<u64> {
 /// Convert a [`Value`] to `u64` for chart rendering.
 ///
 /// Negative numbers clamp to 0; strings are parsed as floats (best
-/// effort); nulls, booleans, and arrays return 0.
+/// effort); nulls, booleans, and arrays return 0. A [`Value::UInt`] is
+/// already this function's own width, so it passes through exactly.
 #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 fn value_to_u64(value: &Value) -> u64 {
     match value {
         Value::Integer(i) => (*i).max(0) as u64,
+        Value::UInt(u) => *u,
         Value::Float(f) => f.max(0.0) as u64,
         Value::String(s) => s.parse::<f64>().unwrap_or(0.0).max(0.0) as u64,
         _ => 0,
     }
+}
+
+/// Whether a cell reads as a group label rather than a measurement.
+///
+/// Text is a label. A number is a measurement whatever its width, which
+/// is why an oversized unsigned carries the [`Value::UInt`] variant
+/// rather than its digits as a string: classified by variant, a 20-digit
+/// `VARCHAR` label and a 20-digit measurement never trade places.
+fn is_group_label(cell: Option<&Value>) -> bool {
+    matches!(cell, Some(Value::String(_)))
+}
+
+/// A series' total, for ranking the top six only.
+///
+/// Wider than the points it adds: a metric column can hold values near
+/// `u64::MAX` (an id, a byte count), and two of them overflow a `u64`
+/// accumulator — a panic under overflow checks, and a wrap to zero
+/// without them, which ranks the largest series last and drops it. The
+/// total is never displayed, so its width costs nothing.
+fn series_total(values: &[u64]) -> u128 {
+    values.iter().copied().map(u128::from).sum()
 }
 
 /// Extract `(label, values)` tuples from a timechart [`QueryResult`].
@@ -92,6 +116,10 @@ fn value_to_u64(value: &Value) -> u64 {
 ///   distinct group label
 /// - **Multi-agg**: `[_time, metric_a, metric_b, ...]` (all numeric) →
 ///   one series per metric column
+///
+/// "Numeric" is decided by variant, so a [`Value::UInt`] measurement
+/// charts like any other number and a digit string of any width stays a
+/// label.
 ///
 /// Series are capped to the top 6 by total value, then sorted
 /// alphabetically by label for stable rendering. Returns
@@ -126,12 +154,7 @@ pub fn extract_series(result: &QueryResult) -> (Vec<(String, Vec<u64>)>, usize) 
         let string_cols: Vec<usize> = other_cols
             .iter()
             .copied()
-            .filter(|&i| {
-                result
-                    .rows
-                    .iter()
-                    .any(|row| matches!(row.get(i), Some(Value::String(_))))
-            })
+            .filter(|&i| result.rows.iter().any(|row| is_group_label(row.get(i))))
             .collect();
         let numeric_cols: Vec<usize> = other_cols
             .iter()
@@ -153,11 +176,7 @@ pub fn extract_series(result: &QueryResult) -> (Vec<(String, Vec<u64>)>, usize) 
             let mut series: Vec<(String, Vec<u64>)> = series_map.into_iter().collect();
             let total = series.len();
             if series.len() > MAX_SERIES {
-                series.sort_by(|a, b| {
-                    let sum_b: u64 = b.1.iter().sum();
-                    let sum_a: u64 = a.1.iter().sum();
-                    sum_b.cmp(&sum_a)
-                });
+                series.sort_by_key(|s| std::cmp::Reverse(series_total(&s.1)));
                 series.truncate(MAX_SERIES);
             }
             series.sort_by(|a, b| a.0.cmp(&b.0));
@@ -177,11 +196,7 @@ pub fn extract_series(result: &QueryResult) -> (Vec<(String, Vec<u64>)>, usize) 
                 .collect();
             let total = series.len();
             if series.len() > MAX_SERIES {
-                series.sort_by(|a, b| {
-                    let sum_b: u64 = b.1.iter().sum();
-                    let sum_a: u64 = a.1.iter().sum();
-                    sum_b.cmp(&sum_a)
-                });
+                series.sort_by_key(|s| std::cmp::Reverse(series_total(&s.1)));
                 series.truncate(MAX_SERIES);
             }
             series.sort_by(|a, b| a.0.cmp(&b.0));
@@ -190,6 +205,138 @@ pub fn extract_series(result: &QueryResult) -> (Vec<(String, Vec<u64>)>, usize) 
             (vec![], 0)
         }
     }
+}
+
+/// Ranking the top six survives a series whose points sum past
+/// `u64::MAX`.
+///
+/// Seven metric columns force the cap, and two `UInt` points at
+/// `2^63` sum to `2^64` — one past what a `u64` accumulator holds. Under
+/// overflow checks that panicked; without them it wrapped to zero, so
+/// the largest series ranked last and was the one dropped. The ranking
+/// total is not a measurement anyone reads, so it is free to be wider
+/// than the values it adds up.
+#[cfg(test)]
+#[test]
+fn series_ranking_survives_unsigned_totals() {
+    let mut columns = vec![crate::value::Column {
+        name: "_time".to_owned(),
+    }];
+    columns.extend((0..7).map(|i| crate::value::Column {
+        name: format!("m{i}"),
+    }));
+
+    // Six small metrics and one enormous one, twice over.
+    let row = |t: &str| {
+        let mut cells = vec![Value::String(t.to_owned())];
+        cells.extend((0..6).map(|i| Value::Integer(i64::from(i) + 1)));
+        cells.push(Value::UInt(9_223_372_036_854_775_808));
+        cells
+    };
+    let result = QueryResult {
+        columns,
+        rows: vec![row("2026-01-01 00:00:00"), row("2026-01-01 00:05:00")],
+    };
+
+    let (series, total) = extract_series(&result);
+    assert_eq!(total, 7, "every metric column counts before the cap");
+    assert_eq!(series.len(), 6, "the cap keeps six");
+    let labels: Vec<&str> = series.iter().map(|s| s.0.as_str()).collect();
+    assert!(
+        labels.contains(&"m6"),
+        "the largest series must survive the cap, not be dropped by it: {labels:?}"
+    );
+    assert_eq!(
+        series.iter().find(|s| s.0 == "m6").expect("m6 survives").1,
+        vec![9_223_372_036_854_775_808, 9_223_372_036_854_775_808]
+    );
+}
+
+/// An oversized unsigned measurement is still a measurement.
+///
+/// `| timechart first(request_id), count()` over a `request_id` past
+/// `i64::MAX` puts a [`Value::UInt`] in a measurement column. Classified
+/// as a label it would collapse the whole chart into one series named
+/// after the number and drop the second metric — a plausible chart of the
+/// wrong thing. The variant is what keeps that from happening.
+#[cfg(test)]
+#[test]
+fn uint_metric_is_not_a_group() {
+    let result = QueryResult {
+        columns: vec![
+            crate::value::Column {
+                name: "_time".to_owned(),
+            },
+            crate::value::Column {
+                name: "first_request_id".to_owned(),
+            },
+            crate::value::Column {
+                name: "count".to_owned(),
+            },
+        ],
+        rows: vec![vec![
+            Value::String("2026-01-01 00:00:00".to_owned()),
+            Value::UInt(u64::MAX),
+            Value::Integer(1),
+        ]],
+    };
+
+    let (series, total) = extract_series(&result);
+    assert_eq!(total, 2, "both measurement columns must chart");
+    let labels: Vec<&str> = series.iter().map(|s| s.0.as_str()).collect();
+    assert_eq!(labels, vec!["count", "first_request_id"]);
+    assert_eq!(series[0].1, vec![1]);
+    assert_eq!(series[1].1, vec![u64::MAX]);
+}
+
+/// A digit string is a genuine label whatever its width.
+///
+/// Text is text: a `VARCHAR` status code and a 20-digit `VARCHAR`
+/// identifier both group the chart. Reading either as a measurement — the
+/// heuristic a string landing forces — would silently drop the grouping.
+#[cfg(test)]
+#[test]
+fn digit_string_label_stays_a_group() {
+    let grouped_by = |label: &str| {
+        let result = QueryResult {
+            columns: vec![
+                crate::value::Column {
+                    name: "_time".to_owned(),
+                },
+                crate::value::Column {
+                    name: "status".to_owned(),
+                },
+                crate::value::Column {
+                    name: "count".to_owned(),
+                },
+            ],
+            rows: vec![
+                vec![
+                    Value::String("2026-01-01 00:00:00".to_owned()),
+                    Value::String(label.to_owned()),
+                    Value::Integer(7),
+                ],
+                vec![
+                    Value::String("2026-01-01 00:05:00".to_owned()),
+                    Value::String(label.to_owned()),
+                    Value::Integer(9),
+                ],
+            ],
+        };
+        extract_series(&result)
+    };
+
+    let (series, total) = grouped_by("404");
+    assert_eq!(total, 1, "the grouped branch must still select");
+    assert_eq!(series[0].0, "404");
+    assert_eq!(series[0].1, vec![7, 9]);
+
+    // Twenty digits, past `i64::MAX`, and still a label — the case the
+    // variant settles and a digit-shape heuristic could not.
+    let (series, total) = grouped_by("10000000000000000000");
+    assert_eq!(total, 1, "a wide VARCHAR label is still a label");
+    assert_eq!(series[0].0, "10000000000000000000");
+    assert_eq!(series[0].1, vec![7, 9]);
 }
 
 #[cfg(test)]

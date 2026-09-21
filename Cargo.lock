@@ -6338,6 +6338,7 @@ dependencies = [
  "regex",
  "serde_json",
  "tempfile",
+ "tracing",
 ]
 
 [[package]]

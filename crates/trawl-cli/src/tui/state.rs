@@ -79,6 +79,7 @@ impl ResultsSearch {
                     Value::Null => "NULL".to_owned(),
                     Value::Boolean(b) => b.to_string(),
                     Value::Integer(i) => i.to_string(),
+                    Value::UInt(u) => u.to_string(),
                     Value::Float(f) => format!("{f:.2}"),
                     Value::String(s) => s.clone(),
                     Value::Array(_) => value.to_string(),

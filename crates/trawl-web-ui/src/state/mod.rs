@@ -13,6 +13,11 @@
 // native-testable; the rest of `state` pulls leptos and is wasm32-only.
 pub mod app_mode;
 pub mod section;
+// `stream_session_value` is the SSE lane's cell decoder, split out of the
+// wasm32-only `stream_session` for the same reason: it has no browser
+// dependency, and behind the gate its number-landing rule could not be
+// tested against the executor's.
+pub mod stream_session_value;
 
 #[cfg(target_arch = "wasm32")]
 pub mod query;

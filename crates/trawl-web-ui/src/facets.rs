@@ -4,8 +4,9 @@
 
 //! Client-side facet aggregation from the current result page.
 //!
-//! For each column whose cells are `String`, `Integer`, or `Boolean`
-//! values we compute the top N distinct values and their counts.
+//! For each column whose cells are `String`, `Integer`, `UInt`, or
+//! `Boolean` values we compute the top N distinct values and their
+//! counts.
 //! `Float` is skipped (usually continuous — facets would be noise),
 //! `Array` can't be keyed, and `Null`-only columns are dropped.
 //!
@@ -66,9 +67,12 @@ fn facet_column(rows: &[Vec<Value>], idx: usize) -> Option<Vec<(String, u32)>> {
         let key = match cell {
             Value::String(s) => s.clone(),
             Value::Integer(i) => i.to_string(),
+            // A discrete value like any other integer: an id column past
+            // `i64::MAX` keeps its facet and its include/exclude control.
+            Value::UInt(u) => u.to_string(),
             Value::Boolean(b) => b.to_string(),
             // Null, Float, Array are intentionally skipped (see module docs).
-            _ => continue,
+            Value::Null | Value::Float(_) | Value::Array(_) => continue,
         };
         *counts.entry(key).or_insert(0) += 1;
     }
@@ -81,6 +85,57 @@ fn facet_column(rows: &[Vec<Value>], idx: usize) -> Option<Vec<(String, u32)>> {
     sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     sorted.truncate(FACET_TOP_N);
     Some(sorted)
+}
+
+/// An oversized unsigned is a discrete value, so it keeps its facet.
+///
+/// Skipped, a column of ids past `i64::MAX` stayed in the results table
+/// but vanished from the filter rail, and a column mixing widths showed
+/// only half its values — a rail that quietly under-reports is worse
+/// than no rail, because the reader reads it as the whole answer.
+#[cfg(test)]
+#[test]
+fn uint_values_are_faceted() {
+    use crate::result_actions::Capabilities;
+    use trawl_api::value::Column;
+
+    let col = |name: &str| Column {
+        name: name.to_owned(),
+    };
+
+    // A column mixing the two integer widths facets both of them.
+    let mixed = QueryResult {
+        columns: vec![col("request_id")],
+        rows: vec![
+            vec![Value::Integer(5)],
+            vec![Value::UInt(u64::MAX)],
+            vec![Value::Integer(5)],
+        ],
+    };
+    let facets = compute_facets(&mixed);
+    assert_eq!(facets.len(), 1);
+    assert_eq!(facets[0].0, "request_id");
+    assert_eq!(
+        facets[0].1,
+        vec![("5".to_owned(), 2), ("18446744073709551615".to_owned(), 1)]
+    );
+
+    // An all-unsigned column still earns a facet…
+    let all_uint = QueryResult {
+        columns: vec![col("request_id")],
+        rows: vec![
+            vec![Value::UInt(u64::MAX)],
+            vec![Value::UInt(9_223_372_036_854_775_808)],
+        ],
+    };
+    let facets = compute_facets(&all_uint);
+    assert_eq!(facets.len(), 1, "an all-unsigned column must still facet");
+    assert_eq!(facets[0].1.len(), 2);
+
+    // …and its values carry the include/exclude control, as any other
+    // discrete cell does.
+    let capabilities = Capabilities::for_query("*");
+    assert!(capabilities.include("request_id", &Value::UInt(u64::MAX)));
 }
 
 #[cfg(test)]

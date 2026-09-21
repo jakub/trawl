@@ -21,7 +21,7 @@ use trawl_core::row::{self, Row};
 use trawl_core::stream::{self, CompiledStage, StageResult, StreamPlan};
 
 use crate::error::EngineError;
-use crate::value::{Column, QueryResult};
+use crate::value::{Column, QueryResult, land_u64};
 
 /// Apply Rust pipeline stages to a SQL result set.
 ///
@@ -117,6 +117,7 @@ fn cell_to_eval(cell: &crate::value::Value) -> EvalValue {
         crate::value::Value::Null => EvalValue::Null,
         crate::value::Value::Boolean(b) => EvalValue::Bool(*b),
         crate::value::Value::Integer(i) => EvalValue::Int(*i),
+        crate::value::Value::UInt(u) => EvalValue::UInt(*u),
         crate::value::Value::Float(f) => EvalValue::Float(*f),
         crate::value::Value::String(s) => EvalValue::Str(s.clone()),
         crate::value::Value::Array(arr) => EvalValue::Array(arr.iter().map(cell_to_eval).collect()),
@@ -138,17 +139,32 @@ fn eval_to_cell(cell: &EvalValue) -> crate::value::Value {
         EvalValue::Null => crate::value::Value::Null,
         EvalValue::Bool(b) => crate::value::Value::Boolean(*b),
         EvalValue::Int(i) => crate::value::Value::Integer(*i),
-        // `crate::value::Value::Integer` is signed, so a number above
-        // `i64::MAX` degrades to a double. Unreachable from this bridge in
-        // practice — a result cell has no unsigned shape to arrive as — but
-        // stated rather than assumed.
-        #[allow(clippy::cast_precision_loss)]
-        EvalValue::UInt(u) => crate::value::Value::Float(*u as f64),
+        // `Value::Integer` is signed, so a magnitude above `i64::MAX`
+        // lands in `Value::UInt` instead — the rule `trawl_api::value`
+        // owns for every decoder on this wire. A kv tail must not answer
+        // with a rounded reading of a number the SQL prefix would have
+        // spelled exactly.
+        EvalValue::UInt(u) => land_u64(*u),
         EvalValue::Float(f) => crate::value::Value::Float(*f),
         EvalValue::Str(s) => crate::value::Value::String(s.clone()),
         EvalValue::Timestamp(instant) => crate::value::Value::String(instant.cast_text()),
         EvalValue::Array(arr) => crate::value::Value::Array(arr.iter().map(eval_to_cell).collect()),
     }
+}
+
+/// The unsigned bridge arm lands the number, not a rounded double, and
+/// picks the narrower signed variant when that holds the value.
+#[cfg(test)]
+#[test]
+fn unsigned_arm() {
+    assert_eq!(
+        eval_to_cell(&EvalValue::UInt(u64::MAX)),
+        crate::value::Value::UInt(u64::MAX)
+    );
+    assert_eq!(
+        eval_to_cell(&EvalValue::UInt(5)),
+        crate::value::Value::Integer(5)
+    );
 }
 
 /// Convert pipeline rows back to a columnar `QueryResult`.
@@ -280,8 +296,12 @@ fn apply_sorts(mut events: Vec<Row>, sort_stages: &[Spanned<PipeStage>]) -> Vec<
 
 /// Compare two optional cells for sorting purposes.
 ///
-/// NULLs sort last. Two numbers compare numerically, through the probed
-/// DOUBLE order (`compare::double_total_cmp`) rather than
+/// NULLs sort last. Two numbers compare numerically and exactly: an
+/// integer pair never becomes a pair of doubles, so `u64::MAX` and
+/// `u64::MAX - 1` keep their order instead of rounding to the same
+/// reading. Only a pair that already holds a DOUBLE reaches floating
+/// point, and a DOUBLE pair goes through the probed DOUBLE order
+/// (`compare::double_total_cmp`) rather than
 /// `partial_cmp(…).unwrap_or(Equal)`, which would leave a NaN wherever
 /// arrival order happened to put it. Everything else compares as the text
 /// the cell shows (`row::cell_text`, the same renderer the live lane groups
@@ -293,8 +313,8 @@ fn compare_cells(a: Option<&EvalValue>, b: Option<&EvalValue>) -> std::cmp::Orde
         (_, None | Some(EvalValue::Null)) => std::cmp::Ordering::Less,
         (Some(a), Some(b)) => {
             // Try numeric comparison first.
-            if let (Some(na), Some(nb)) = (numeric_cell(a), numeric_cell(b)) {
-                return trawl_core::compare::double_total_cmp(na, nb);
+            if let Some(ordering) = compare_numeric(a, b) {
+                return ordering;
             }
             // Fall back to the cell's own text.
             row::cell_text(a).cmp(&row::cell_text(b))
@@ -302,13 +322,169 @@ fn compare_cells(a: Option<&EvalValue>, b: Option<&EvalValue>) -> std::cmp::Orde
     }
 }
 
-#[allow(clippy::cast_precision_loss)]
-fn numeric_cell(cell: &EvalValue) -> Option<f64> {
-    match cell {
-        EvalValue::Int(i) => Some(*i as f64),
-        EvalValue::UInt(u) => Some(*u as f64),
-        EvalValue::Float(f) => Some(*f),
-        _ => None,
+/// Order two numeric cells, or answer `None` when either side is not a
+/// number.
+///
+/// These are the rules `result_actions::compare` already encodes for the
+/// results table in `trawl-web-ui`, so a column sorted by the browser and
+/// the same column sorted by `| sort` read the same way for every value the
+/// JSON hop can carry (a non-finite DOUBLE lands as null there; only the
+/// in-memory NaN sign rule differs, see `int_float`). Every integer is
+/// a point on one line, so the signed and unsigned variants compare as the
+/// numbers they are through `i128` — the narrowest type holding both
+/// ranges — rather than by variant rank. Nothing but a pair that already
+/// holds a DOUBLE is allowed near `f64`.
+fn compare_numeric(a: &EvalValue, b: &EvalValue) -> Option<std::cmp::Ordering> {
+    use EvalValue::{Float, Int, UInt};
+    Some(match (a, b) {
+        (Int(a), Int(b)) => a.cmp(b),
+        (UInt(a), UInt(b)) => a.cmp(b),
+        (Int(a), UInt(b)) => i128::from(*a).cmp(&i128::from(*b)),
+        (UInt(a), Int(b)) => i128::from(*a).cmp(&i128::from(*b)),
+        (Float(a), Float(b)) => trawl_core::compare::double_total_cmp(*a, *b),
+        (Int(a), Float(b)) => int_float(*a, *b),
+        (Float(a), Int(b)) => int_float(*b, *a).reverse(),
+        (UInt(a), Float(b)) => uint_float(*a, *b),
+        (Float(a), UInt(b)) => uint_float(*b, *a).reverse(),
+        _ => return None,
+    })
+}
+
+/// Order an `i64` against an `f64` without rounding the integer.
+///
+/// The shape is `result_actions::int_float`'s: bound the double against
+/// the integer's range, truncate it, then refine on the fraction the
+/// truncation dropped. NaN sorts last whatever its sign bit says, which is
+/// where `compare::double_total_cmp` puts it for a DOUBLE pair; a
+/// comparator that answered differently depending on which pairing it was
+/// asked about would not be an ordering at all.
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+fn int_float(i: i64, f: f64) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    if f.is_nan() || f >= 9_223_372_036_854_775_808.0 {
+        return Ordering::Less;
+    }
+    if f < -9_223_372_036_854_775_808.0 {
+        return Ordering::Greater;
+    }
+    let whole = f as i64;
+    i.cmp(&whole)
+        .then_with(|| (whole as f64).partial_cmp(&f).unwrap_or(Ordering::Equal))
+}
+
+/// The unsigned twin of [`int_float`], for the range above `i64::MAX`.
+///
+/// Same shape, same NaN placement, same truncate-then-refine tie-break;
+/// only the bounds move, because a `u64` cannot be negative and reaches
+/// twice as far up.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn uint_float(u: u64, f: f64) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    if f.is_nan() || f >= 18_446_744_073_709_551_616.0 {
+        return Ordering::Less;
+    }
+    if f < 0.0 {
+        return Ordering::Greater;
+    }
+    let whole = f as u64;
+    u.cmp(&whole)
+        .then_with(|| (whole as f64).partial_cmp(&f).unwrap_or(Ordering::Equal))
+}
+
+/// A `sort` in the Rust tail orders an oversized unsigned by value.
+///
+/// `u64::MAX` and `u64::MAX - 1` are the same `f64`, so a comparator that
+/// read every number as a double called the two rows equal and left them
+/// in whatever order they arrived in. The four rows here span both
+/// integer variants and a DOUBLE, so they only come back in this order if
+/// each pair took its own exact arm.
+#[cfg(test)]
+#[test]
+fn rust_tail_sort_orders_large_unsigned_exactly() {
+    use crate::value::Value;
+
+    let tail = trawl_core::parser::parse("* | extract kv | sort bytes")
+        .expect("dsl parses")
+        .pipeline;
+    let result = QueryResult {
+        columns: vec![Column {
+            name: "bytes".to_string(),
+        }],
+        rows: vec![
+            vec![Value::UInt(u64::MAX)],
+            vec![Value::UInt(u64::MAX - 1)],
+            vec![Value::Integer(-1)],
+            vec![Value::Float(1.5)],
+        ],
+    };
+    let anchor = EvalContext::at(
+        chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .expect("a valid RFC 3339 instant")
+            .into(),
+    );
+
+    let sorted = apply_rust_stages(result, &tail, &PinScope::unpinned(), anchor)
+        .expect("the tail runs a bare sort over a kv split");
+
+    assert_eq!(
+        sorted.rows,
+        vec![
+            vec![Value::Integer(-1)],
+            vec![Value::Float(1.5)],
+            vec![Value::UInt(u64::MAX - 1)],
+            vec![Value::UInt(u64::MAX)],
+        ],
+        "the two neighbouring unsigned maxima must not collapse into one reading"
+    );
+}
+
+/// The batch tail behind `extract kv` goes through the same streaming
+/// compiler the live lane does, so a `timechart` naming a bucket column
+/// is refused there too — and the refusal reaches the caller as the
+/// 400-class `Emit` error, naming the lane and the column.
+///
+/// The other door into that compiler,
+/// `compile_stream_plan`, is pinned by
+/// `stream::timechart_on_refused_in_live_lane` in trawl-core, which
+/// cannot reach this function: trawl-engine depends on that crate, not
+/// the other way round.
+#[cfg(test)]
+#[test]
+fn timechart_on_refused_in_batch_tail() {
+    let tail = trawl_core::parser::parse("* | extract kv | timechart on hostname span=5m count()")
+        .expect("dsl parses")
+        .pipeline;
+    let result = QueryResult {
+        columns: vec![Column {
+            name: "_raw".to_string(),
+        }],
+        rows: Vec::new(),
+    };
+    let anchor = EvalContext::at(
+        chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .expect("a valid RFC 3339 instant")
+            .into(),
+    );
+
+    let err = apply_rust_stages(result, &tail, &PinScope::unpinned(), anchor)
+        .expect_err("a bucket column other than _time has no meaning in the tail");
+    match err {
+        EngineError::Emit(trawl_core::emitter::EmitError::UnsupportedOperation { message }) => {
+            // Pinned whole: a `contains` on one fragment hides both a
+            // doubled clause and a run of stray spaces inside the
+            // sentence.
+            assert_eq!(
+                message,
+                "post-processing: timechart is not supported in streaming mode: \
+                 bucketing on 'hostname' is not supported here; \
+                 only _time can be bucketed live"
+            );
+        }
+        other => panic!("expected the 400-class refusal, got {other:?}"),
     }
 }
 

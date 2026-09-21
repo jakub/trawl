@@ -21,18 +21,65 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 /// Serializes as plain JSON: `null`, `true`, `42`, `3.14`, `"hello"`, or an
 /// array of those (a `list()`/`values()` aggregate).
 ///
-/// Integers are `i64`; unsigned values exceeding `i64::MAX` promote to `f64`
-/// with potential precision loss beyond 2^53. A JSON object encountered
-/// during deserialization is stringified (`DuckDB` result sets do not
-/// produce one).
+/// Integers land in the narrowest variant that holds them exactly:
+/// [`Integer`](Self::Integer) up to `i64::MAX`, then [`UInt`](Self::UInt)
+/// for the unsigned range above it. Both serialize as JSON numbers, so a
+/// magnitude no `i64` can hold still reaches a reader as a number it can
+/// sort, chart and compare — see [`land_u64`] and [`land_i128`], the one
+/// rule every decoder on this wire applies. Nothing rounds to `f64` on
+/// the way: a rounded reading and an exact one are different answers.
+///
+/// The residual is `DuckDB`'s `HUGEINT` past `u64::MAX`, which has no
+/// variant and lands as [`String`](Self::String) digits — parked until
+/// the typed-metadata slice, not a shape a consumer should classify on.
+///
+/// A JSON object encountered during deserialization is stringified
+/// (`DuckDB` result sets do not produce one).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Null,
     Boolean(bool),
     Integer(i64),
+    /// An integer above `i64::MAX`. Never holds a magnitude
+    /// [`Integer`](Self::Integer) could carry: [`land_u64`] picks the
+    /// narrower variant first, so the two never spell the same number.
+    UInt(u64),
     Float(f64),
     String(String),
     Array(Vec<Value>),
+}
+
+/// Land a `u64` on the wire without rounding it.
+///
+/// Up to `i64::MAX` the value is a [`Value::Integer`]; above that it is a
+/// [`Value::UInt`], which serializes as a JSON number just the same — the
+/// rule `trawl-engine`'s executor applies to a `DuckDB` `UBIGINT`. Never
+/// a float and never text: a reader sorts, charts and compares a number
+/// by its variant, and a rounded reading is a different answer from an
+/// exact one.
+#[must_use]
+pub fn land_u64(v: u64) -> Value {
+    i64::try_from(v).map_or(Value::UInt(v), Value::Integer)
+}
+
+/// Land an `i128` on the wire without rounding it, the signed twin of
+/// [`land_u64`] (`DuckDB`'s `HUGEINT`).
+///
+/// Inside `i64` range the value is a [`Value::Integer`], and inside the
+/// unsigned range above it a [`Value::UInt`] — both JSON numbers. A
+/// magnitude past `u64::MAX`, or any negative past `i64::MIN`, has no
+/// variant to hold it and lands as [`Value::String`] digits: exact, but
+/// not a number a consumer can classify. That residual is parked for the
+/// typed-metadata slice; `HUGEINT` is the only column that reaches it.
+#[must_use]
+pub fn land_i128(v: i128) -> Value {
+    if let Ok(i) = i64::try_from(v) {
+        Value::Integer(i)
+    } else if let Ok(u) = u64::try_from(v) {
+        Value::UInt(u)
+    } else {
+        Value::String(v.to_string())
+    }
 }
 
 impl Serialize for Value {
@@ -41,6 +88,7 @@ impl Serialize for Value {
             Self::Null => serializer.serialize_unit(),
             Self::Boolean(b) => serializer.serialize_bool(*b),
             Self::Integer(i) => serializer.serialize_i64(*i),
+            Self::UInt(u) => serializer.serialize_u64(*u),
             Self::Float(f) => serializer.serialize_f64(*f),
             Self::String(s) => serializer.serialize_str(s),
             Self::Array(arr) => {
@@ -111,12 +159,7 @@ impl<'de> Visitor<'de> for ValueVisitor {
     }
 
     fn visit_u64<E: de::Error>(self, v: u64) -> Result<Value, E> {
-        if let Ok(i) = i64::try_from(v) {
-            Ok(Value::Integer(i))
-        } else {
-            #[allow(clippy::cast_precision_loss)]
-            Ok(Value::Float(v as f64))
-        }
+        Ok(land_u64(v))
     }
 
     fn visit_f32<E: de::Error>(self, v: f32) -> Result<Value, E> {
@@ -156,6 +199,7 @@ impl fmt::Display for Value {
             Self::Null => Ok(()),
             Self::Boolean(b) => write!(f, "{b}"),
             Self::Integer(i) => write!(f, "{i}"),
+            Self::UInt(u) => write!(f, "{u}"),
             Self::Float(v) => write!(f, "{v}"),
             Self::String(s) => write!(f, "{s}"),
             Self::Array(arr) => {
@@ -378,6 +422,81 @@ pub struct ParquetColumnStats {
     pub max_value: Option<String>,
     /// Total compressed size in bytes.
     pub compressed_bytes: u64,
+}
+
+/// A magnitude past `i64::MAX` reaches a reader as a number, from
+/// whichever direction it arrives: a raw JSON number off the SSE lane, an
+/// array cell, or a direct landing call. A float would hand back a
+/// different number than the one that was logged, and text would strip
+/// the reader's ability to sort or chart it.
+#[cfg(test)]
+#[test]
+fn large_unsigned_lands_as_uint() {
+    let parse = |text: &str| serde_json::from_str::<Value>(text).expect("valid JSON");
+
+    // The last magnitude the signed variant holds stays signed.
+    assert_eq!(parse("9223372036854775807"), Value::Integer(i64::MAX));
+    // One past it, and the widest u64, carry their exact value unsigned.
+    assert_eq!(
+        parse("9223372036854775808"),
+        Value::UInt(9_223_372_036_854_775_808)
+    );
+    assert_eq!(parse("18446744073709551615"), Value::UInt(u64::MAX));
+
+    // An array cell (a `list()` aggregate) lands element by element.
+    assert_eq!(
+        parse("[18446744073709551615]"),
+        Value::Array(vec![Value::UInt(u64::MAX)])
+    );
+
+    // The landing calls themselves, at every boundary.
+    assert_eq!(land_u64(u64::from(u32::MAX)), Value::Integer(4_294_967_295));
+    assert_eq!(
+        land_u64(9_223_372_036_854_775_807),
+        Value::Integer(i64::MAX)
+    );
+    assert_eq!(
+        land_u64(9_223_372_036_854_775_808),
+        Value::UInt(9_223_372_036_854_775_808)
+    );
+    assert_eq!(land_u64(u64::MAX), Value::UInt(u64::MAX));
+    assert_eq!(land_i128(i128::from(i64::MAX)), Value::Integer(i64::MAX));
+    assert_eq!(land_i128(i128::from(i64::MIN)), Value::Integer(i64::MIN));
+    assert_eq!(
+        land_i128(i128::from(i64::MAX) + 1),
+        Value::UInt(9_223_372_036_854_775_808)
+    );
+    assert_eq!(land_i128(i128::from(u64::MAX)), Value::UInt(u64::MAX));
+
+    // The parked `HUGEINT` residual: no variant holds it, so it keeps its
+    // exact digits as text rather than rounding.
+    assert_eq!(
+        land_i128(i128::from(u64::MAX) + 1),
+        Value::String("18446744073709551616".to_owned())
+    );
+    assert_eq!(
+        land_i128(i128::from(i64::MIN) - 1),
+        Value::String("-9223372036854775809".to_owned())
+    );
+}
+
+/// `UInt` is a JSON number on the wire, in both directions.
+///
+/// The variant exists so an oversized unsigned stays a number for every
+/// consumer; a serializer that spelled it as text, or a reader that took
+/// it back as a float, would undo that at the one place it matters.
+#[cfg(test)]
+#[test]
+fn uint_round_trips_as_json_number() {
+    let json = serde_json::to_string(&Value::UInt(u64::MAX)).expect("serializes");
+    assert_eq!(json, "18446744073709551615");
+    assert_eq!(
+        serde_json::from_str::<Value>(&json).expect("valid JSON"),
+        Value::UInt(u64::MAX)
+    );
+
+    // …and it renders as its digits, not as a debug shape.
+    assert_eq!(Value::UInt(u64::MAX).to_string(), "18446744073709551615");
 }
 
 #[cfg(test)]

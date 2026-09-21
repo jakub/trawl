@@ -116,7 +116,7 @@ impl Capabilities {
 /// Missing cells and null sort first. Numbers compare by value, preserving
 /// integer precision even when the other operand is a floating-point value.
 pub(crate) fn compare(a: Option<&Value>, b: Option<&Value>) -> Ordering {
-    use Value::{Array, Boolean, Float, Integer, Null, String};
+    use Value::{Array, Boolean, Float, Integer, Null, String, UInt};
     let a = a.unwrap_or(&Null);
     let b = b.unwrap_or(&Null);
     match (a, b) {
@@ -124,9 +124,17 @@ pub(crate) fn compare(a: Option<&Value>, b: Option<&Value>) -> Ordering {
         (Null, _) => Ordering::Less,
         (_, Null) => Ordering::Greater,
         (Integer(a), Integer(b)) => a.cmp(b),
+        (UInt(a), UInt(b)) => a.cmp(b),
+        // Every integer is a point on one line, so the two integer
+        // variants compare as the numbers they are, not by variant rank:
+        // `i128` is the narrowest type holding both ranges.
+        (Integer(a), UInt(b)) => i128::from(*a).cmp(&i128::from(*b)),
+        (UInt(a), Integer(b)) => i128::from(*a).cmp(&i128::from(*b)),
         (Float(a), Float(b)) => a.partial_cmp(b).unwrap_or_else(|| a.total_cmp(b)),
         (Integer(a), Float(b)) => int_float(*a, *b),
         (Float(a), Integer(b)) => int_float(*b, *a).reverse(),
+        (UInt(a), Float(b)) => uint_float(*a, *b),
+        (Float(a), UInt(b)) => uint_float(*b, *a).reverse(),
         (Boolean(a), Boolean(b)) => a.cmp(b),
         (String(a), String(b)) => a.cmp(b),
         (Array(a), Array(b)) => a
@@ -142,7 +150,7 @@ fn rank(v: &Value) -> u8 {
     match v {
         Value::Null => 0,
         Value::Boolean(_) => 1,
-        Value::Integer(_) | Value::Float(_) => 2,
+        Value::Integer(_) | Value::UInt(_) | Value::Float(_) => 2,
         Value::String(_) => 3,
         Value::Array(_) => 4,
     }
@@ -198,6 +206,99 @@ fn int_float(i: i64, f: f64) -> Ordering {
     i.cmp(&whole)
         .then_with(|| (whole as f64).partial_cmp(&f).unwrap_or(Ordering::Equal))
 }
+/// The unsigned twin of [`int_float`], for the range above `i64::MAX`.
+///
+/// Same shape, same NaN placement, same truncate-then-refine tie-break;
+/// only the bounds move, because a `u64` cannot be negative and reaches
+/// twice as far up.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn uint_float(u: u64, f: f64) -> Ordering {
+    if f.is_nan() {
+        return if f.is_sign_negative() {
+            Ordering::Greater
+        } else {
+            Ordering::Less
+        };
+    }
+    if f >= 18_446_744_073_709_551_616.0 {
+        return Ordering::Less;
+    }
+    if f < 0.0 {
+        return Ordering::Greater;
+    }
+    let whole = f as u64;
+    u.cmp(&whole)
+        .then_with(|| (whole as f64).partial_cmp(&f).unwrap_or(Ordering::Equal))
+}
+/// The results table sorts an oversized unsigned by value, not by text.
+///
+/// This is why the variant exists. Spelled as a string, `10000000000000000000`
+/// sorts before `9223372036854775808` — the shorter number last — and a
+/// column of ids reads as shuffled. Spelled as a number, both compare on
+/// one line with every other integer.
+#[cfg(test)]
+#[test]
+fn uint_sorts_numerically() {
+    let lo = Value::UInt(9_223_372_036_854_775_808);
+    let hi = Value::UInt(10_000_000_000_000_000_000);
+    assert_eq!(compare(Some(&lo), Some(&hi)), Ordering::Less);
+    assert_eq!(compare(Some(&hi), Some(&lo)), Ordering::Greater);
+    assert_eq!(compare(Some(&hi), Some(&hi)), Ordering::Equal);
+
+    // Across the variant boundary: one number line, not two ranks.
+    assert_eq!(
+        compare(Some(&Value::Integer(5)), Some(&Value::UInt(u64::MAX))),
+        Ordering::Less
+    );
+    assert_eq!(
+        compare(Some(&Value::UInt(u64::MAX)), Some(&Value::Integer(5))),
+        Ordering::Greater
+    );
+    assert_eq!(
+        compare(Some(&Value::Integer(-1)), Some(&lo)),
+        Ordering::Less
+    );
+
+    // …and against floats, the way the signed variant already does.
+    assert_eq!(
+        compare(Some(&lo), Some(&Value::Float(1.0))),
+        Ordering::Greater
+    );
+    assert_eq!(
+        compare(
+            Some(&Value::Float(f64::INFINITY)),
+            Some(&Value::UInt(u64::MAX))
+        ),
+        Ordering::Greater
+    );
+    assert_eq!(
+        compare(Some(&Value::Float(-1.0)), Some(&lo)),
+        Ordering::Less
+    );
+    // A fractional float sits between the integers on either side of it:
+    // a comparison that truncated the float first would call 1 and 1.5
+    // equal.
+    assert_eq!(
+        compare(Some(&Value::UInt(1)), Some(&Value::Float(1.5))),
+        Ordering::Less
+    );
+    assert_eq!(
+        compare(Some(&Value::Float(1.5)), Some(&Value::UInt(1))),
+        Ordering::Greater
+    );
+    assert_eq!(
+        compare(Some(&Value::UInt(2)), Some(&Value::Float(1.5))),
+        Ordering::Greater
+    );
+
+    // Null still sorts first, whatever the number's width.
+    assert_eq!(compare(None, Some(&hi)), Ordering::Less);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

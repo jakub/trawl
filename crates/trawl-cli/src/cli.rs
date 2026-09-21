@@ -403,6 +403,10 @@ fn render_table(
 /// The one in-crate door onto `trawl_core::severity::token_text` — the
 /// table renderer here and the TUI results grid share the rule but not
 /// their fallback formatting.
+///
+/// An unsigned past `i64::MAX` reads like every other shape the ladder
+/// has no rung for: no token, and the cell shows its digits. Every
+/// dialect's ladder ends well inside `i64`.
 pub(crate) fn severity_token(v: &Value) -> Option<&'static str> {
     match v {
         Value::Integer(n) => trawl_core::severity::token_text(*n),
@@ -454,6 +458,7 @@ fn csv_escape_value(val: &Value) -> String {
         Value::Null => String::new(),
         Value::Boolean(b) => b.to_string(),
         Value::Integer(i) => i.to_string(),
+        Value::UInt(u) => u.to_string(),
         // full precision for data fidelity (TUI display uses 2dp for readability)
         Value::Float(f) => f.to_string(),
         Value::String(s) => csv_escape_string(s),

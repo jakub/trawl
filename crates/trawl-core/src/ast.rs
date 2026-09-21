@@ -529,6 +529,12 @@ pub struct DedupStage {
 /// `timechart span=5m count() by service` — time-bucketed aggregation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TimechartStage {
+    /// The column the buckets are cut from. `None` is `_time`, which the
+    /// emitter buckets through the envelope's `TRY_CAST` (ADR-0008).
+    /// An explicit name is bucketed as stored, with no cast, so a column
+    /// that is not already a timestamp is refused by the engine rather
+    /// than silently coerced.
+    pub on: Option<String>,
     pub span: Option<TrawlDuration>,
     pub aggregations: Vec<AggExpr>,
     pub group_by: Vec<String>,

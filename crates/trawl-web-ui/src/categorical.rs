@@ -264,6 +264,7 @@ fn numeric(value: &Value) -> Option<f64> {
         // Bar length is a ratio a few hundred pixels wide, so losing the
         // low bits of an i64 past 2^53 cannot move a bar by a pixel.
         Value::Integer(i) => Some(*i as f64),
+        Value::UInt(u) => Some(*u as f64),
         Value::Float(f) => Some(*f),
         _ => None,
     }
