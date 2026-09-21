@@ -86,7 +86,7 @@ export function healthResponse() {
 }
 
 /** Minimal valid QueryResponse: zero rows, zero columns — the results
- * table renders its "No fish in this net yet" empty state, which is
+ * table renders its "No events match this query" empty state, which is
  * fine for specs that only care about the request being made and the
  * page not crashing. */
 export function queryResponse() {
