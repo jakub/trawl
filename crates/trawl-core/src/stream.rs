@@ -1441,7 +1441,7 @@ fn compile_aggregation(stage: &PipeStage) -> Result<CompiledAggregation, StreamP
             // arbitrary bucket column, and answering with `_time`
             // buckets anyway would make the two lanes disagree about
             // what the query means (ADR-0013 ruling 8).
-            if let Some(col) = s.on.as_deref().filter(|c| *c != crate::schema::TIME) {
+            if let Some(col) = s.on.as_deref().filter(|c| !crate::schema::is_event_time(c)) {
                 return Err(StreamPlanError::UnsupportedStage {
                     stage: "timechart".to_string(),
                     reason: format!(
@@ -1931,11 +1931,17 @@ fn timechart_on_refused_in_live_lane() {
         "the refusal must name the stage, the column and the lane: {refusal}"
     );
 
-    compile_stream_plan(
-        &pipeline("* | extract kv | timechart on _time span=5m count()"),
-        &pins,
-    )
-    .expect("`on _time` is the default spelled out, not a new bucket source");
+    for spelling in ["_time", "_TIME", "_Time"] {
+        compile_stream_plan(
+            &pipeline(&format!(
+                "* | extract kv | timechart on {spelling} span=5m count()"
+            )),
+            &pins,
+        )
+        .unwrap_or_else(|e| {
+            panic!("`on {spelling}` is the default spelled out, not a new bucket source: {e}")
+        });
+    }
 }
 
 #[cfg(test)]

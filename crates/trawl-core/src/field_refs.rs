@@ -115,7 +115,7 @@ fn collect_stage(stage: &PipeStage, out: &mut BTreeSet<String>) {
             // reference. The default is `_time`, which the envelope
             // always carries, so a plain `timechart` collects nothing
             // it did not collect before this clause existed.
-            if let Some(on) = s.on.as_deref().filter(|c| *c != crate::schema::TIME) {
+            if let Some(on) = s.on.as_deref().filter(|c| !crate::schema::is_event_time(c)) {
                 insert(on, out);
             }
             insert_all(&s.group_by, out);

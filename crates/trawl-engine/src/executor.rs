@@ -474,6 +474,9 @@ impl Executor {
         // fallback from starting a second one.
         cancel.check()?;
         validate_timechart_inputs(&self.conn, &query.timechart_input_checks, cancel)?;
+        // Re-read after the probes: each one is a bind of its own, and
+        // this is the last moment before the statement's.
+        cancel.check()?;
         record_prepare();
         let mut stmt = match self.conn.prepare(&query.sql) {
             Ok(s) => s,
@@ -940,6 +943,10 @@ impl Executor {
             let _ = conn.execute_batch("DROP TABLE IF EXISTS __trawl_export");
         };
 
+        // Same re-read as the query lane, for the same reason: the
+        // probes above each bound a statement, and the staging SELECT
+        // is about to bind another.
+        cancel.check()?;
         record_prepare();
         match self.conn.prepare(&create_sql) {
             Ok(mut stmt) => {
@@ -1174,10 +1181,16 @@ fn duckdb_type_name(id: LogicalTypeId) -> String {
 /// and export alike — and immune to a later stage dropping the
 /// bucket, re-typing it, or manufacturing a column of that name.
 ///
-/// A probe that will not bind or run is not an answer: the relation
-/// itself is broken (a missing file, a column that does not exist),
-/// and the statement that follows gives the authoritative error for
-/// that. So a failed probe is silence, never a refusal of its own.
+/// A probe that fails is an answer too, and only one failure is
+/// silence: the no-files case, which the query lane answers with an
+/// empty result rather than an error, so the probe must not turn an
+/// empty window into a refusal. Every other failure propagates, with
+/// the same classification the main statement would get. It has to:
+/// a probe carries the search predicate, and a `_time` filter over a
+/// source with no `_time` column fails HERE while the main statement
+/// survives it — `time_bucket(…, "d") AS "_time"` gives `DuckDB` an
+/// output alias to resolve that filter against, and the query comes
+/// back with buckets nobody checked.
 fn validate_timechart_inputs(
     conn: &Connection,
     checks: &[TimechartInputCheck],
@@ -1188,17 +1201,33 @@ fn validate_timechart_inputs(
         // caller has asked for this work to stop.
         cancel.check()?;
         record_prepare();
-        let Ok(mut stmt) = conn.prepare(&check.sql) else {
-            continue;
+        let mut stmt = match conn.prepare(&check.sql) {
+            Ok(stmt) => stmt,
+            Err(e) if is_no_files_error(&e) => continue,
+            Err(e) if is_binder_column_error(&e) => return Err(remap_binder_error(&e)),
+            Err(e) => return Err(e.into()),
         };
+
+        // The probe's own bind-to-execute boundary, for the reason the
+        // lanes below have one: a long bind is where a cancellation is
+        // most likely to land, and the next thing this does is ask
+        // `DuckDB` to execute.
+        cancel.check()?;
+
         let params = bind_params(&check.params);
         let param_refs: Vec<&dyn duckdb::ToSql> = params.iter().map(AsRef::as_ref).collect();
-        let Ok(rows) = stmt.query(param_refs.as_slice()) else {
-            continue;
+        let rows = match stmt.query(param_refs.as_slice()) {
+            Ok(rows) => rows,
+            Err(e) if is_no_files_error(&e) => continue,
+            Err(e) if is_binder_column_error(&e) => return Err(remap_binder_error(&e)),
+            Err(e) => return Err(e.into()),
         };
-        let Some(bound) = rows.as_ref() else {
-            continue;
-        };
+
+        let bound =
+            rows.as_ref()
+                .ok_or(EngineError::Database(duckdb::Error::InvalidColumnName(
+                    "statement unavailable after query execution".into(),
+                )))?;
         let id = bound.column_logical_type(0).id();
         if !bucket_input_is_timestamp(id) {
             return Err(EngineError::Emit(
@@ -1212,6 +1241,9 @@ fn validate_timechart_inputs(
             ));
         }
     }
+    // A cancellation that landed during the last probe's bind stops the
+    // caller before it binds the statement these probes were about.
+    cancel.check()?;
     Ok(())
 }
 
@@ -2217,6 +2249,54 @@ fn on_column_named_column_name_is_named() {
         timechart_refusal(&source, "* | timechart on column_name count()"),
         "timechart on 'column_name' is not a timestamp: VARCHAR"
     );
+}
+
+/// A probe that fails to bind is not permission to run the statement.
+///
+/// The fixture has a DATE column and NO `_time`, so the probe's own
+/// search predicate cannot bind — while the statement it guards can:
+/// `time_bucket(…, "d") AS "_time"` gives `DuckDB` an output alias to
+/// resolve that same `_time` filter against, and the query comes back
+/// with DATE buckets nobody ever checked. Skipping a failed probe made
+/// the check optional exactly where the relation is strange enough to
+/// need it.
+#[cfg(test)]
+#[test]
+fn failed_probe_is_not_silence() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source = timechart_fixture(&dir);
+    let dsl = "last=10000d * | timechart on d span=1d count()";
+
+    let message = timechart_refusal(&source, dsl);
+    assert!(
+        message.contains("_time") || message.contains("timechart on 'd'"),
+        "either the probe's unbindable filter or the DATE bucket, never a \
+         successful chart: {message}"
+    );
+}
+
+/// The one failure that stays silent: an empty glob.
+///
+/// The query lane answers a window that matched no files with an empty
+/// result, not an error, and a probe that fails the same way must not
+/// turn that into a refusal.
+#[cfg(test)]
+#[test]
+fn empty_glob_probe_stays_silent() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let empty = format!("{}/nothing/*.parquet", dir.path().display());
+
+    let result = Executor::new()
+        .expect("executor")
+        .run_query(
+            "* | timechart on good count()",
+            &empty,
+            &FieldTypes::new(),
+            usize::MAX,
+            0,
+        )
+        .expect("an empty window is an empty result, probe or no probe");
+    assert!(result.rows.is_empty(), "{:?}", result.rows);
 }
 
 /// The bucket-source accept-list and the type names a refusal reports,

@@ -170,6 +170,19 @@ pub fn catalog_key(dsl_name: &str) -> String {
     dsl_name.to_ascii_lowercase()
 }
 
+/// Whether a DSL field reference names the envelope timestamp.
+///
+/// The fold is [`catalog_key`]'s, because a reference resolves to a
+/// column the same way everywhere: `_TIME` and `_Time` are the column
+/// `_time`, to `DuckDB` and to the catalog alike. Stages that treat the
+/// envelope timestamp as a special case ask here rather than comparing
+/// against [`TIME`] directly, so none of them can disagree about what
+/// counts as it.
+#[must_use]
+pub fn is_event_time(dsl_name: &str) -> bool {
+    catalog_key(dsl_name) == TIME
+}
+
 // ---------------------------------------------------------------------------
 // Field-catalog type vocabulary (ADR-0009)
 // ---------------------------------------------------------------------------

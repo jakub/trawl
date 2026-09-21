@@ -230,13 +230,19 @@ mod timechart_on {
         );
 
         // `on _time` is the same bucket source spelled out, so it emits
-        // the same SQL — and still names no column, because `_time` is
-        // the default the executor needs no help with.
-        let explicit = emit(
-            "* | timechart on _time span=5m count()",
-            "/data/**/*.parquet",
-        );
-        assert_eq!(explicit.sql, BEFORE);
-        assert!(explicit.timechart_input_checks.is_empty());
+        // the same SQL and probes nothing — the envelope timestamp is
+        // the default, and `DuckDB` folds an identifier over ASCII, so
+        // every spelling of it is that same column.
+        for spelling in ["_time", "_TIME", "_Time"] {
+            let explicit = emit(
+                &format!("* | timechart on {spelling} span=5m count()"),
+                "/data/**/*.parquet",
+            );
+            assert_eq!(explicit.sql, BEFORE, "on {spelling}");
+            assert!(
+                explicit.timechart_input_checks.is_empty(),
+                "on {spelling} probes nothing"
+            );
+        }
     }
 }

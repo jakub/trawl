@@ -385,16 +385,14 @@ fn process_timechart(
     };
 
     // What the buckets are cut from. The default — and an explicit
-    // `on _time` — is the envelope timestamp, which carries the
-    // unconditional `TRY_CAST` every `_time` read does (ADR-0008). Any
-    // other column is bucketed as stored: no cast, so a column that is
-    // not a timestamp fails to bind instead of coercing to NULL and
-    // collapsing every row into one empty bucket.
+    // `on _time`, however it is spelled — is the envelope timestamp,
+    // which carries the unconditional `TRY_CAST` every `_time` read does
+    // (ADR-0008). Any other column is bucketed as stored: no cast, so
+    // nothing here can coerce a column that is not a timestamp into one
+    // empty bucket. What that column IS gets asked separately, by the
+    // probe captured below.
     let bucket_source = match tc.on.as_deref() {
-        None | Some(crate::schema::TIME) => {
-            format!("TRY_CAST({} AS TIMESTAMP)", quote_field("_time"))
-        }
-        Some(col) => {
+        Some(col) if !crate::schema::is_event_time(col) => {
             // Taken here, and only here: the relation this stage reads
             // is the state as it stands at this moment, and the stage
             // about to be emitted is what replaces it. Appended, never
@@ -408,6 +406,9 @@ fn process_timechart(
             ctx.timechart_input_checks.push(probe);
             quote_field(col)
         }
+        // No clause, or the envelope timestamp named explicitly in any
+        // spelling.
+        None | Some(_) => format!("TRY_CAST({} AS TIMESTAMP)", quote_field("_time")),
     };
 
     // The bucket is aliased AS "_time", which is also the name of the
