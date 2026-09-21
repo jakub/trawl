@@ -83,6 +83,13 @@ endpoint stays whole-result; the server's row ceiling is disclosed as a
 separate line when the recorded count exceeds the rows fetched, and it is
 independent of paging.*
 
+*Amended 2026-09-20 (Visualization pagination prep, ADR-0037): the
+surface inventory above gains one. The exact table pages an
+aggregation's fetched result locally with `PageTotal::Known`, on the
+stored-run preview's rule and with its cap line; the raw results table
+keeps `Probe`. The `" (truncated)"` suffix both tables appended is
+removed with the flag behind it.*
+
 ## Amendment: global Runs ordering
 
 Accepted 2026-09-14 during the UI follow-up prep.

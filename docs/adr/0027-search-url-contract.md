@@ -130,6 +130,14 @@ A link whose structured state does not parse is shown, not run.**
   a lie about what ran, and the router exposes no Back-versus-push signal
   to do better with.
 
+  *Amended 2026-09-20 (Visualization pagination prep, ADR-0037): the DSL
+  sequence is unchanged, but a `page` change on an aggregation-shaped
+  query posts nothing — that shape is fetched whole once and sliced in
+  the browser. The browser's 20,000-row ceiling is a `limit` the server
+  may clamp, not a mirror of `max_result_rows`, which still appears on no
+  response. `QueryResponse.truncated` is removed, and the window's row
+  count arrives as `pagination.total`.*
+
   *Amended 2026-09-12 (UI-audit remainder prep, Search live-mode
   coherence): `mode=live` is a claim the page keeps true. Leaving live is
   a push navigation to the same `q`, `f` and `r` with `mode` elided, from

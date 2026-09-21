@@ -47,7 +47,7 @@ A search URL whose structured state does not parse or makes a false claim. It is
 _Avoid_: invalid URL, broken link (too broad), stale link
 
 **Mode**:
-Snapshot (a paginated one-shot query) or live (an SSE stream). The URL carries `mode=live` or nothing. Live Tail enters live; Stop live or any range selection leaves it, always by navigation. Nothing pauses it: a URL that says live streams, or shows why it cannot. While live, no snapshot query runs.
+Snapshot (a one-shot query, paged by the server for events and in the browser for an aggregation) or live (an SSE stream). The URL carries `mode=live` or nothing. Live Tail enters live; Stop live or any range selection leaves it, always by navigation. Nothing pauses it: a URL that says live streams, or shows why it cannot. While live, no snapshot query runs.
 _Avoid_: view, tab, pause
 
 **Live ring**:
@@ -79,11 +79,15 @@ What the Events tab renders for an aggregation-shaped result: the group and metr
 _Avoid_: aggregate table, stats table, summary
 
 **Categorical chart**:
-The bar-per-group companion beside the exact table, drawn for the one shape it can state exactly — one group column and one numeric metric — with the value printed on every bar. Any other aggregate shape shows the table alone.
+The bar-per-group companion beside the exact table, drawn for the one shape it can state exactly — one group column and one numeric metric — with the value printed on every bar. It draws the bars the table beside it shows, and scales them against the whole fetched result, so a value's bar is the same length on every page. Any other aggregate shape shows the table alone.
 _Avoid_: bar chart (unqualified), visualization (that is the other tab)
 
+**Visualization**:
+The results tab that draws an ungrouped `timechart` snapshot as a line chart, and a live aggregation as it updates. It draws the whole result or nothing: an aggregation snapshot is fetched whole, up to 20,000 rows, and a response that is not the whole result is refused with the count the server measured, never drawn in part. It has no pager, because the chart of one page is a different picture from the chart of the result.
+_Avoid_: chart (unqualified; the categorical chart is the other one), graph, plot
+
 **Count**:
-The Events tab shows rows on screen. The footer names its source: Last (rows the last snapshot returned), Received (events delivered since the stream opened), Updates (aggregation frames since the stream opened).
+The Events tab shows rows on screen. For an aggregation that is the rows fetched, and the pager under the exact table names the slice on screen. The footer names its source: Last (rows the last snapshot returned), Received (events delivered since the stream opened), Updates (aggregation frames since the stream opened).
 _Avoid_: total, matches, hits
 
 **Quick start**:
