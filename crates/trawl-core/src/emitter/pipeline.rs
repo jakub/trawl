@@ -395,11 +395,17 @@ fn process_timechart(
             format!("TRY_CAST({} AS TIMESTAMP)", quote_field("_time"))
         }
         Some(col) => {
-            // The hint the executor reads to turn a bucket-type refusal
-            // into a sentence naming this column. Appended, never
-            // replaced: each timechart in the pipeline contributes its
-            // own, in the order the reader wrote them.
-            ctx.timechart_on.push(col.to_string());
+            // Taken here, and only here: the relation this stage reads
+            // is the state as it stands at this moment, and the stage
+            // about to be emitted is what replaces it. Appended, never
+            // replaced — each timechart in the pipeline contributes its
+            // own probe, in the order the reader wrote them.
+            let probe = crate::emitter::TimechartInputCheck {
+                column: col.to_string(),
+                sql: ctx.stage_input_probe(col),
+                params: ctx.params_so_far(),
+            };
+            ctx.timechart_input_checks.push(probe);
             quote_field(col)
         }
     };

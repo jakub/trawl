@@ -146,10 +146,12 @@ mod timechart_on {
         );
     }
 
-    /// A column that is not a timestamp is bucketed as stored, so
-    /// `DuckDB` refuses it. The emission carries the column name out so
-    /// the executor can say which one (`executor::timechart_on_names_column`
-    /// in trawl-engine asserts the 400 that refusal composes).
+    /// A column that is not a timestamp is bucketed as stored, and the
+    /// emission carries a probe that reads that column, with that
+    /// stage's own prefix in force, so the executor can say which
+    /// column and which type
+    /// (`executor::timechart_input_refuses_each_non_timestamp` in
+    /// trawl-engine asserts the 400 the probe composes).
     #[test]
     fn refuses_varchar_naming_type() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -172,24 +174,41 @@ mod timechart_on {
             "no cast may rescue a non-timestamp column: {}",
             emitted.sql
         );
-        assert_eq!(
-            emitted.timechart_on,
-            ["hostname"],
-            "the emission names the column it buckets"
+
+        let [check] = emitted.timechart_input_checks.as_slice() else {
+            panic!(
+                "one timechart, one probe: {:?}",
+                emitted.timechart_input_checks
+            );
+        };
+        assert_eq!(check.column, "hostname");
+        assert!(
+            check.sql.starts_with("SELECT \"hostname\" FROM (") && check.sql.ends_with("LIMIT 0"),
+            "the probe reads the named column and no rows: {}",
+            check.sql
+        );
+        assert!(
+            check.sql.contains(&source),
+            "and reads it from this stage's own relation: {}",
+            check.sql
+        );
+        assert!(
+            !check.sql.contains("time_bucket("),
+            "the probe is the stage's input, not the stage: {}",
+            check.sql
         );
 
+        // And it is a statement DuckDB answers, with the type the
+        // executor refuses on.
         let conn = Connection::open_in_memory().expect("in-memory duckdb");
-        let err = conn
-            .prepare(&emitted.sql)
-            .map(|_| ())
-            .expect_err("DuckDB refuses to bucket a VARCHAR")
-            .to_string();
-        assert!(
-            err.contains("Binder Error")
-                && err.contains(
-                    "No function matches the given name and argument types 'time_bucket("
-                ),
-            "the pinned binder sentence, re-check on a DuckDB upgrade: {err}"
+        let mut stmt = conn.prepare(&check.sql).expect("the probe binds");
+        assert!(check.params.is_empty(), "no parameters in this prefix");
+        let rows = stmt.query([]).expect("the probe runs");
+        let bound = rows.as_ref().expect("statement outlives the rows");
+        assert_eq!(
+            bound.column_logical_type(0).id(),
+            duckdb::core::LogicalTypeId::Varchar,
+            "the probe reports the stored type"
         );
     }
 
@@ -206,8 +225,8 @@ mod timechart_on {
         let emitted = emit("* | timechart span=5m count()", "/data/**/*.parquet");
         assert_eq!(emitted.sql, BEFORE);
         assert!(
-            emitted.timechart_on.is_empty(),
-            "an omitted clause names no column"
+            emitted.timechart_input_checks.is_empty(),
+            "an omitted clause probes nothing"
         );
 
         // `on _time` is the same bucket source spelled out, so it emits
@@ -218,6 +237,6 @@ mod timechart_on {
             "/data/**/*.parquet",
         );
         assert_eq!(explicit.sql, BEFORE);
-        assert!(explicit.timechart_on.is_empty());
+        assert!(explicit.timechart_input_checks.is_empty());
     }
 }

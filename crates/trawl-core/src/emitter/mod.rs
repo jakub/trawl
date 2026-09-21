@@ -31,6 +31,32 @@ pub use validate::validate_pipeline;
 
 use std::fmt;
 
+/// A statement that answers "what type is this timechart's bucket
+/// source, where that timechart reads it?".
+///
+/// `timechart on <column>` buckets the named column as stored, so a
+/// column that is not a timestamp has to be refused. Neither of the two
+/// obvious places can answer that. The binder only speaks when no
+/// overload matches, and `DuckDB` resolves an untyped NULL to the `DATE`
+/// overload, so silence is not proof. The finished statement's own
+/// `_time` column is a different question: a later `stats` removes it, a
+/// later plain `timechart` re-types it through its `TRY_CAST`, and a
+/// `pivot` can manufacture a column of that name out of a data value.
+///
+/// So the question is asked where and when it is well posed: one probe
+/// per timechart, built from the relation entering that stage, carrying
+/// the parameters that relation's placeholders need
+/// ([`crate::emitter::state::EmitterState::stage_input_probe`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TimechartInputCheck {
+    /// The column the stage buckets, as the reader spelled it.
+    pub column: String,
+    /// `SELECT "<column>" FROM (<the stage's input relation>) LIMIT 0`.
+    pub sql: String,
+    /// The values [`sql`](Self::sql)'s placeholders bind, in order.
+    pub params: Vec<SqlValue>,
+}
+
 /// The result of emitting SQL from a parsed query.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EmittedQuery {
@@ -67,22 +93,25 @@ pub struct EmittedQuery {
     /// raw-free pass pushes the same parameters in the same order — so the
     /// executor can retry with this SQL against a source that has no `_raw`.
     pub raw_free_sql: Option<String>,
-    /// Every column an explicit `timechart on <field>` buckets, in
-    /// pipeline order — empty when no stage named one, or named only
+    /// [`timechart_input_checks`](Self::timechart_input_checks) for the
+    /// `_raw`-free emission, and empty whenever
+    /// [`raw_free_sql`](Self::raw_free_sql) is `None`.
+    ///
+    /// A probe renders the search predicate that precedes its stage, so
+    /// the two emissions do not share probes: the primary's bind `_raw`,
+    /// and running those against a source without that column would fail
+    /// the retry that exists precisely to survive it. The executor
+    /// swaps SQL and probes together or not at all.
+    pub raw_free_timechart_input_checks: Vec<TimechartInputCheck>,
+    /// One probe per explicit `timechart on <field>`, in pipeline order
+    /// — empty when no stage named a bucket column, or named only
     /// `_time`.
     ///
-    /// A metadata hint, not an input to the SQL: the bucket expression in
-    /// [`sql`](Self::sql) already names each column. It exists so the
-    /// executor can recognise a refusal to bucket a non-timestamp column
-    /// as this stage's fault and answer with a sentence naming the
-    /// column, instead of a bare binder error.
-    ///
-    /// A list because a pipeline can hold several timecharts and the two
-    /// refusal paths attribute differently: a bind-time binder error does
-    /// not say which stage it came from, so every candidate is listed,
-    /// while the bound `_time` output column belongs to the last
-    /// timechart alone.
-    pub timechart_on: Vec<String>,
+    /// The executor runs these before [`sql`](Self::sql) and refuses the
+    /// query when one of them reports a type no chart can bucket. They
+    /// are not an input to the statement: the bucket expressions in
+    /// `sql` already name their columns.
+    pub timechart_input_checks: Vec<TimechartInputCheck>,
     /// The instant this statement's `now()` reads (ADR-0017 §3).
     ///
     /// The caller captures it once per logical query and stamps it here,
@@ -374,6 +403,7 @@ fn emit_with_raw_fallback(
             emitted.params
         );
         emitted.raw_free_sql = Some(raw_free.sql);
+        emitted.raw_free_timechart_input_checks = raw_free.timechart_input_checks;
     }
     Ok(emitted)
 }
@@ -460,7 +490,7 @@ fn emit_from_state(
 
     let needs_column_reorder = state.needs_column_reorder();
     let referenced_raw = state.bound_raw_column();
-    let timechart_on = std::mem::take(&mut state.timechart_on);
+    let timechart_input_checks = std::mem::take(&mut state.timechart_input_checks);
     let anchor = state.anchor();
     let sql = state.finalize()?;
     let params = state.into_params();
@@ -473,7 +503,8 @@ fn emit_from_state(
             rust_stage_pins,
             needs_column_reorder,
             raw_free_sql: None,
-            timechart_on,
+            raw_free_timechart_input_checks: Vec::new(),
+            timechart_input_checks,
             anchor,
         },
         referenced_raw,

@@ -105,16 +105,16 @@ pub(crate) struct EmitterState {
     /// The time filter from the search stage, used by `timechart` auto-bucketing.
     /// Not reset on CTE flush — this is query-wide context.
     pub(crate) time_filter: Option<TrawlDuration>,
-    /// Every column an explicit `timechart on <field>` buckets, in
-    /// pipeline order, excluding `_time`. Query-wide context like
-    /// `time_filter`, and carried out on
-    /// [`super::EmittedQuery::timechart_on`] so the executor can name the
-    /// column in a bucket-type refusal.
+    /// One probe per explicit `timechart on <field>`, in pipeline order,
+    /// excluding `_time` — see [`super::TimechartInputCheck`]. Captured
+    /// as each timechart is processed, because the relation a stage
+    /// reads exists only while that stage is being emitted: by the end
+    /// of the pipeline it has been folded into a CTE, projected away, or
+    /// overwritten by a later stage's own `_time`.
     ///
-    /// A list, not one name: a pipeline can hold several timecharts, and
-    /// a bind-time refusal cannot tell which of them `DuckDB` choked on,
-    /// while the bound `_time` output belongs to the last one.
-    pub(crate) timechart_on: Vec<String>,
+    /// Query-wide context like `time_filter`, so a CTE flush does not
+    /// clear it.
+    pub(crate) timechart_input_checks: Vec<super::TimechartInputCheck>,
     /// `USING SAMPLE` clause set by `sample` stage.
     pub(crate) sample: Option<String>,
     /// Set by `pivot` stage — overrides normal `build_select()` in `finalize()`.
@@ -433,7 +433,7 @@ impl EmitterState {
             has_projection: false,
             had_explicit_columns: false,
             time_filter: None,
-            timechart_on: Vec::new(),
+            timechart_input_checks: Vec::new(),
             sample: None,
             pivot: None,
             ctes: Vec::new(),
@@ -646,6 +646,55 @@ impl EmitterState {
         build(self)
     }
 
+    /// A statement that reads one column of the relation a stage is
+    /// about to read, and returns no rows.
+    ///
+    /// The whole point is WHEN it is taken. `SELECT <col> FROM (<the
+    /// relation as built so far>) LIMIT 0` renders the current level and
+    /// every CTE behind it, so the `from`, `let`, `rename`, `stats` and
+    /// search filters that precede the stage are all in force — the
+    /// probe sees exactly the column the stage will read, typed exactly
+    /// as the stage will see it, which is a question nothing about the
+    /// finished query can answer any more.
+    ///
+    /// `LIMIT 0` because only the column's declared type is wanted.
+    /// `DuckDB` still binds the relation, so the probe costs one bind
+    /// and no scan.
+    ///
+    /// The caller pairs this with [`Self::params`] as they stand now:
+    /// the placeholders in the returned text are exactly those pushed so
+    /// far, in push order, by the same invariant the finished statement
+    /// relies on ([`Self::emit_ordered_select`]).
+    pub(crate) fn stage_input_probe(&self, column: &str) -> String {
+        let body = format!(
+            "SELECT {} FROM (\n{}\n) LIMIT 0",
+            super::fields::quote_field(column),
+            self.build_select()
+        );
+        if self.ctes.is_empty() {
+            return body;
+        }
+        self.with_ctes(&body)
+    }
+
+    /// Prefix `body` with the accumulated CTEs. Callers with no CTEs to
+    /// render skip it; the loop is the one rendering of a `WITH` list.
+    fn with_ctes(&self, body: &str) -> String {
+        let mut sql = String::from("WITH ");
+        for (i, cte) in self.ctes.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            sql.push_str(&cte.name);
+            sql.push_str(" AS (\n");
+            Self::push_indented_cte(&mut sql, &cte.sql);
+            sql.push(')');
+        }
+        sql.push('\n');
+        sql.push_str(body);
+        sql
+    }
+
     /// Build a SELECT statement from the current accumulated state.
     fn build_select(&self) -> String {
         let mut sql = String::new();
@@ -793,18 +842,7 @@ impl EmitterState {
             return Ok(body);
         }
 
-        let mut sql = String::from("WITH ");
-        for (i, cte) in self.ctes.iter().enumerate() {
-            if i > 0 {
-                sql.push_str(", ");
-            }
-            sql.push_str(&cte.name);
-            sql.push_str(" AS (\n");
-            Self::push_indented_cte(&mut sql, &cte.sql);
-            sql.push(')');
-        }
-        sql.push('\n');
-        sql.push_str(&body);
+        let sql = self.with_ctes(&body);
 
         if self.pivot.is_some() {
             let (inlined, consumed) = Self::inline_params_counted(&sql, &self.params, 0);
@@ -939,6 +977,12 @@ impl EmitterState {
     /// Consume the state and return the accumulated parameters.
     pub(crate) fn into_params(self) -> Vec<SqlValue> {
         self.params
+    }
+
+    /// The parameters pushed up to this point, in push order — what a
+    /// probe taken now has to bind ([`Self::stage_input_probe`]).
+    pub(crate) fn params_so_far(&self) -> Vec<SqlValue> {
+        self.params.clone()
     }
 
     /// Whether the result columns should be reordered to put well-known fields first.
