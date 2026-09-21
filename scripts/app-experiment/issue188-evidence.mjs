@@ -164,7 +164,7 @@ try {
     const request = response.request().postDataJSON();
     assert.equal(result.rows.length, expected);
     assert.equal(result.pagination.returned, expected);
-    assert.ok(result.pagination.total >= expected, 'measured total is below the page it returned');
+    assert.equal(result.pagination.total, expected, 'measured total disagrees with the whole result it returned');
     assert.ok(result.execution);
     const started = Number(instant(result.execution.started_at) / 1000000n);
     assert.ok(started >= sent - 2 && started <= received + 2, 'execution start outside browser request bounds');
