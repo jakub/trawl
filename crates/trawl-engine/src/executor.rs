@@ -22,7 +22,7 @@ use trawl_core::schema::{CanonicalType, FieldTypes};
 
 use crate::cancel::CancelLatch;
 use crate::error::EngineError;
-use crate::value::{Column, QueryResult, SchemaColumn, SchemaResult, Value};
+use crate::value::{Column, QueryResult, SchemaColumn, SchemaResult, Value, land_i128, land_u64};
 
 /// Names of the result columns `DuckDB` returned as TIMESTAMP.
 type TimestampColumns = Vec<String>;
@@ -1787,16 +1787,14 @@ fn extract_value(row: &duckdb::Row<'_>, idx: usize, utc_offset_secs: i32) -> Val
         ValueRef::SmallInt(i) => Value::Integer(i64::from(i)),
         ValueRef::Int(i) => Value::Integer(i64::from(i)),
         ValueRef::BigInt(i) => Value::Integer(i),
-        // log data shouldn't exceed i64 range; stringify if it does
-        ValueRef::HugeInt(i) => {
-            i64::try_from(i).map_or_else(|_| Value::String(i.to_string()), Value::Integer)
-        }
+        // Past `i64::MAX` the wire has no integer variant to hold the
+        // magnitude, so it lands as its exact digits — `trawl_api::value`
+        // owns that rule for every decoder, this one included.
+        ValueRef::HugeInt(i) => land_i128(i),
         ValueRef::UTinyInt(i) => Value::Integer(i64::from(i)),
         ValueRef::USmallInt(i) => Value::Integer(i64::from(i)),
         ValueRef::UInt(i) => Value::Integer(i64::from(i)),
-        ValueRef::UBigInt(i) => {
-            i64::try_from(i).map_or_else(|_| Value::String(i.to_string()), Value::Integer)
-        }
+        ValueRef::UBigInt(i) => land_u64(i),
         ValueRef::Float(f) => Value::Float(f64::from(f)),
         ValueRef::Double(f) => Value::Float(f),
         ValueRef::Text(bytes) => Value::String(String::from_utf8_lossy(bytes).into_owned()),
@@ -1816,6 +1814,12 @@ fn extract_value(row: &duckdb::Row<'_>, idx: usize, utc_offset_secs: i32) -> Val
 }
 
 /// Recursively convert a `duckdb::types::Value` to our `Value`.
+///
+/// This is the nested twin of [`extract_value`] — a `list()` aggregate
+/// arrives here element by element — so it lands the same integer widths
+/// the same way. Without the unsigned arms a `UBIGINT` inside a list fell
+/// through to the debug-text fallback below and reached the reader as
+/// `UBigInt(18446744073709551615)`.
 fn convert_duckdb_value(v: duckdb::types::Value) -> Value {
     match v {
         duckdb::types::Value::Null => Value::Null,
@@ -1824,6 +1828,11 @@ fn convert_duckdb_value(v: duckdb::types::Value) -> Value {
         duckdb::types::Value::SmallInt(i) => Value::Integer(i64::from(i)),
         duckdb::types::Value::Int(i) => Value::Integer(i64::from(i)),
         duckdb::types::Value::BigInt(i) => Value::Integer(i),
+        duckdb::types::Value::HugeInt(i) => land_i128(i),
+        duckdb::types::Value::UTinyInt(i) => Value::Integer(i64::from(i)),
+        duckdb::types::Value::USmallInt(i) => Value::Integer(i64::from(i)),
+        duckdb::types::Value::UInt(i) => Value::Integer(i64::from(i)),
+        duckdb::types::Value::UBigInt(i) => land_u64(i),
         duckdb::types::Value::Float(f) => Value::Float(f64::from(f)),
         duckdb::types::Value::Double(f) => Value::Float(f),
         duckdb::types::Value::Text(s) => Value::String(s),
@@ -1832,6 +1841,43 @@ fn convert_duckdb_value(v: duckdb::types::Value) -> Value {
         }
         other => Value::String(format!("{other:?}")),
     }
+}
+
+/// A `UBIGINT` inside a `list()` reaches the reader as digits, including
+/// the one past `i64::MAX` that no integer variant holds.
+///
+/// Driven through a real `DuckDB` list so the element type is whatever the
+/// driver actually hands back, not whatever this module assumes: the arm
+/// this guards was missing, and the cell rendered Rust debug text.
+#[cfg(test)]
+#[test]
+fn list_ubigint_renders_digits() {
+    let conn = Connection::open_in_memory().expect("in-memory duckdb");
+    let mut stmt = conn
+        .prepare(
+            "SELECT list(v ORDER BY v) FROM (VALUES \
+             (1::UBIGINT), (9223372036854775808::UBIGINT), \
+             (18446744073709551615::UBIGINT)) t(v)",
+        )
+        .expect("prepare");
+    let mut rows = stmt.query([]).expect("query");
+    let row = rows.next().expect("step").expect("one row");
+    let cell = extract_value(row, 0, 0);
+
+    assert_eq!(
+        cell,
+        Value::Array(vec![
+            Value::Integer(1),
+            Value::String("9223372036854775808".to_owned()),
+            Value::String("18446744073709551615".to_owned()),
+        ]),
+        "every element must be digits, never debug text"
+    );
+    let rendered = cell.to_string();
+    assert!(
+        !rendered.contains("UBigInt"),
+        "debug text leaked into the cell: {rendered}"
+    );
 }
 
 /// Convert a temporal value to microseconds based on its `TimeUnit`.

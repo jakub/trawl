@@ -941,6 +941,56 @@ where
     Ok(())
 }
 
+/// A live event carrying a number past `i64::MAX` reaches the results
+/// buffer as its exact digits.
+///
+/// The buffer decodes each field with `serde_json::from_value::<Value>`,
+/// so this is `trawl_api::value`'s landing rule seen from the TUI: before
+/// it existed the cell arrived as a rounded double. The `unwrap_or` on
+/// that call is the other half — a number the decoder refused would have
+/// shown the reader an empty cell instead of a wrong one.
+#[cfg(test)]
+#[test]
+fn live_event_large_unsigned_exact() {
+    let event: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(r#"{"service":"nginx","request_id":18446744073709551615}"#)
+            .expect("valid event JSON");
+    let mut buffer = state::LiveBuffer::new(10);
+    buffer.push_event(&event);
+
+    let response = buffer.to_query_response();
+    let idx = response
+        .result
+        .columns
+        .iter()
+        .position(|c| c.name == "request_id")
+        .expect("request_id column");
+    assert_eq!(
+        response.result.rows[0][idx],
+        trawl_engine::value::Value::String("18446744073709551615".to_owned()),
+        "a live cell must be digits, never a rounded double or a null"
+    );
+}
+
+/// The same rule on the aggregation lane: a snapshot row's oversized
+/// unsigned is stored as digits.
+#[cfg(test)]
+#[test]
+fn snapshot_large_unsigned_exact() {
+    let rows: Vec<serde_json::Map<String, serde_json::Value>> =
+        serde_json::from_str(r#"[{"service":"nginx","total":18446744073709551615}]"#)
+            .expect("valid snapshot JSON");
+    let mut buffer = state::LiveBuffer::new(10);
+    buffer.replace_with_snapshot(&["service".to_owned(), "total".to_owned()], &rows);
+
+    let response = buffer.to_query_response();
+    assert_eq!(
+        response.result.rows[0][1],
+        trawl_engine::value::Value::String("18446744073709551615".to_owned()),
+        "a snapshot cell must be digits, never a rounded double or a null"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

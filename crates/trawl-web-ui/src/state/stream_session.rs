@@ -26,6 +26,8 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use web_sys::{EventSource, MessageEvent};
 
+use super::stream_session_value::json_to_value;
+
 /// Max raw events retained in the ring — older events roll off.
 pub const LIVE_RING_CAPACITY: usize = 5000;
 
@@ -288,25 +290,6 @@ struct SnapshotWire {
 #[derive(Deserialize)]
 struct LaggedWire {
     missed: u64,
-}
-
-/// Convert a JSON value into a `trawl_api::value::Value`.
-fn json_to_value(value: serde_json::Value) -> Value {
-    match value {
-        serde_json::Value::Null => Value::Null,
-        serde_json::Value::Bool(b) => Value::Boolean(b),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Value::Integer(i)
-            } else if let Some(f) = n.as_f64() {
-                Value::Float(f)
-            } else {
-                Value::Null
-            }
-        }
-        serde_json::Value::String(s) => Value::String(s),
-        other => Value::String(other.to_string()),
-    }
 }
 
 /// Convert a ring buffer into a `QueryResult` suitable for

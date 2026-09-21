@@ -21,7 +21,7 @@ use trawl_core::row::{self, Row};
 use trawl_core::stream::{self, CompiledStage, StageResult, StreamPlan};
 
 use crate::error::EngineError;
-use crate::value::{Column, QueryResult};
+use crate::value::{Column, QueryResult, land_u64};
 
 /// Apply Rust pipeline stages to a SQL result set.
 ///
@@ -138,17 +138,31 @@ fn eval_to_cell(cell: &EvalValue) -> crate::value::Value {
         EvalValue::Null => crate::value::Value::Null,
         EvalValue::Bool(b) => crate::value::Value::Boolean(*b),
         EvalValue::Int(i) => crate::value::Value::Integer(*i),
-        // `crate::value::Value::Integer` is signed, so a number above
-        // `i64::MAX` degrades to a double. Unreachable from this bridge in
-        // practice — a result cell has no unsigned shape to arrive as — but
-        // stated rather than assumed.
-        #[allow(clippy::cast_precision_loss)]
-        EvalValue::UInt(u) => crate::value::Value::Float(*u as f64),
+        // `crate::value::Value::Integer` is signed, so a magnitude above
+        // `i64::MAX` has no integer variant to land in. It lands as its
+        // exact digits instead, the rule `trawl_api::value` owns for every
+        // decoder on this wire — a kv tail must not answer with a rounded
+        // reading of a number the SQL prefix would have spelled exactly.
+        EvalValue::UInt(u) => land_u64(*u),
         EvalValue::Float(f) => crate::value::Value::Float(*f),
         EvalValue::Str(s) => crate::value::Value::String(s.clone()),
         EvalValue::Timestamp(instant) => crate::value::Value::String(instant.cast_text()),
         EvalValue::Array(arr) => crate::value::Value::Array(arr.iter().map(eval_to_cell).collect()),
     }
+}
+
+/// The unsigned bridge arm lands digits, not a rounded double.
+#[cfg(test)]
+#[test]
+fn unsigned_arm() {
+    assert_eq!(
+        eval_to_cell(&EvalValue::UInt(u64::MAX)),
+        crate::value::Value::String("18446744073709551615".to_owned())
+    );
+    assert_eq!(
+        eval_to_cell(&EvalValue::UInt(5)),
+        crate::value::Value::Integer(5)
+    );
 }
 
 /// Convert pipeline rows back to a columnar `QueryResult`.

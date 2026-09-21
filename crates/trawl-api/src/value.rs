@@ -21,10 +21,11 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 /// Serializes as plain JSON: `null`, `true`, `42`, `3.14`, `"hello"`, or an
 /// array of those (a `list()`/`values()` aggregate).
 ///
-/// Integers are `i64`; unsigned values exceeding `i64::MAX` promote to `f64`
-/// with potential precision loss beyond 2^53. A JSON object encountered
-/// during deserialization is stringified (`DuckDB` result sets do not
-/// produce one).
+/// Integers are `i64`. A magnitude above `i64::MAX` has no integer variant
+/// to hold it, so it lands as [`Value::String`] carrying its exact decimal
+/// digits — see [`land_u64`] and [`land_i128`], the one rule every decoder
+/// on this wire applies. A JSON object encountered during deserialization
+/// is stringified (`DuckDB` result sets do not produce one).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Null,
@@ -33,6 +34,29 @@ pub enum Value {
     Float(f64),
     String(String),
     Array(Vec<Value>),
+}
+
+/// Land a `u64` on the wire without rounding it.
+///
+/// Up to `i64::MAX` the value is a [`Value::Integer`]. Above that there is
+/// no integer variant wide enough to hold it, so it lands as a
+/// [`Value::String`] of its exact decimal digits — the same rule
+/// `trawl-engine`'s executor applies to a `DuckDB` `UBIGINT`. Never a
+/// float: a rounded reading and an exact one are different answers, and a
+/// result cell must not quietly become the first.
+#[must_use]
+pub fn land_u64(v: u64) -> Value {
+    i64::try_from(v).map_or_else(|_| Value::String(v.to_string()), Value::Integer)
+}
+
+/// Land an `i128` on the wire without rounding it, the signed twin of
+/// [`land_u64`] (`DuckDB`'s `HUGEINT`).
+///
+/// Inside `i64` range the value is a [`Value::Integer`]; past either bound
+/// it lands as a [`Value::String`] of its exact decimal digits.
+#[must_use]
+pub fn land_i128(v: i128) -> Value {
+    i64::try_from(v).map_or_else(|_| Value::String(v.to_string()), Value::Integer)
 }
 
 impl Serialize for Value {
@@ -111,12 +135,7 @@ impl<'de> Visitor<'de> for ValueVisitor {
     }
 
     fn visit_u64<E: de::Error>(self, v: u64) -> Result<Value, E> {
-        if let Ok(i) = i64::try_from(v) {
-            Ok(Value::Integer(i))
-        } else {
-            #[allow(clippy::cast_precision_loss)]
-            Ok(Value::Float(v as f64))
-        }
+        Ok(land_u64(v))
     }
 
     fn visit_f32<E: de::Error>(self, v: f32) -> Result<Value, E> {
@@ -378,6 +397,55 @@ pub struct ParquetColumnStats {
     pub max_value: Option<String>,
     /// Total compressed size in bytes.
     pub compressed_bytes: u64,
+}
+
+/// A magnitude past `i64::MAX` reaches a reader as its exact digits, from
+/// whichever direction it arrives: a raw JSON number off the SSE lane, an
+/// array cell, or a direct landing call. A float here would hand back a
+/// different number than the one that was logged.
+#[cfg(test)]
+#[test]
+fn large_unsigned_lands_as_exact_string() {
+    let parse = |text: &str| serde_json::from_str::<Value>(text).expect("valid JSON");
+
+    // The last magnitude the integer variant holds stays an integer.
+    assert_eq!(parse("9223372036854775807"), Value::Integer(i64::MAX));
+    // One past it, and the widest u64, land as their exact digits.
+    assert_eq!(
+        parse("9223372036854775808"),
+        Value::String("9223372036854775808".to_owned())
+    );
+    assert_eq!(
+        parse("18446744073709551615"),
+        Value::String("18446744073709551615".to_owned())
+    );
+
+    // An array cell (a `list()` aggregate) lands element by element.
+    assert_eq!(
+        parse("[18446744073709551615]"),
+        Value::Array(vec![Value::String("18446744073709551615".to_owned())])
+    );
+
+    // The landing calls themselves, at both bounds.
+    assert_eq!(land_u64(u64::from(u32::MAX)), Value::Integer(4_294_967_295));
+    assert_eq!(
+        land_u64(9_223_372_036_854_775_807),
+        Value::Integer(i64::MAX)
+    );
+    assert_eq!(
+        land_u64(9_223_372_036_854_775_808),
+        Value::String("9223372036854775808".to_owned())
+    );
+    assert_eq!(land_i128(i128::from(i64::MAX)), Value::Integer(i64::MAX));
+    assert_eq!(land_i128(i128::from(i64::MIN)), Value::Integer(i64::MIN));
+    assert_eq!(
+        land_i128(i128::from(i64::MAX) + 1),
+        Value::String("9223372036854775808".to_owned())
+    );
+    assert_eq!(
+        land_i128(i128::from(i64::MIN) - 1),
+        Value::String("-9223372036854775809".to_owned())
+    );
 }
 
 #[cfg(test)]
