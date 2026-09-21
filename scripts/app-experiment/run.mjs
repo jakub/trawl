@@ -15,7 +15,7 @@ import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { parseArgs } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
-import { corpus, verifyRows, verifyBrowserPage, percentile } from './workload.mjs';
+import { corpus, verifyWholeResult, verifyBrowserPage, percentile } from './workload.mjs';
 import { sha256, fileHash, spaHash, processIdentity, verifyRunIdentity } from './identity.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -339,7 +339,7 @@ async function experiment() {
   async function verify(label, expected) {
     const response = await query();
     await writeJSON(`${label}.json`, response);
-    verifyRows(response, expected);
+    verifyWholeResult(response, expected);
     const digest = createHash('sha256').update(JSON.stringify({ columns: response.columns, rows: response.rows })).digest('hex');
     const procStatus = await fs.readFile(`/proc/${server.child.pid}/status`, 'utf8');
     const memory = Object.fromEntries(procStatus.split('\n').filter(line => /^(VmRSS|VmHWM|Threads):/.test(line)).map(line => line.split(':').map(s => s.trim())));
@@ -426,7 +426,7 @@ async function experiment() {
       await pacedWait(Math.max(0, due - (performance.now() - ingestStart)));
       await send(events.slice(offset, offset + batchSize));
       // Concurrent query work checks the partial corpus while ingest continues.
-      verifyRows(await query(), events.slice(0, Math.min(offset + batchSize, count)));
+      verifyWholeResult(await query(), events.slice(0, Math.min(offset + batchSize, count)));
     }
     report.ingest.durationMs = performance.now() - ingestStart;
     report.ingest.pacedEvents = count - firstCount;
