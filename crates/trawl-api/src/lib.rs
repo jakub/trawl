@@ -1703,10 +1703,14 @@ fn is_zero(n: &usize) -> bool {
 mod tests {
     #[test]
     fn query_execution_serialization() {
+        // A cut window: `total` must survive the round trip as the number the
+        // execution produced, not be rebuilt from the rows on the wire.
         let wire = serde_json::json!({"columns": [], "rows": [],
-            "pagination": {"limit": 10, "offset": 0, "returned": 0, "total": 0}});
+            "pagination": {"limit": 10, "offset": 0, "returned": 10, "total": 59}});
         let mut response: super::QueryResponse = serde_json::from_value(wire.clone()).unwrap();
         assert!(response.execution.is_none());
+        assert_eq!(response.pagination.total, 59);
+        assert_eq!(response.pagination.returned, 10);
         assert_eq!(serde_json::to_value(&response).unwrap(), wire);
         response.execution = Some(super::QueryExecution {
             started_at: "2026-09-15T12:34:56Z".into(),
