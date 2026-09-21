@@ -1248,6 +1248,10 @@ fn render_stacked_sparklines(
         // Downsample to fit available width (preserves peaks via max-per-bucket)
         let display_data = downsample(values, sparkline_area.width as usize);
 
+        // Both bounds come from this slice, so `max - min` and `v - min`
+        // cannot underflow however wide the values are — a full-`u64`
+        // metric rebases to a full-`u64` range, and ratatui scales that
+        // through `u128`.
         let max_val = display_data.iter().max().copied().unwrap_or(0);
         let min_val = display_data.iter().min().copied().unwrap_or(0);
         let range = (max_val - min_val).max(1);
@@ -1458,6 +1462,64 @@ fn format_duration(secs: u64) -> String {
 /// grid's ordinary rendering where the ladder has no reading for the value.
 fn severity_cell_text(value: &trawl_engine::value::Value) -> String {
     crate::cli::severity_token(value).map_or_else(|| value_to_string(value), str::to_owned)
+}
+
+/// Both timechart views survive metrics at the top of the `u64` range.
+///
+/// The stacked sparkline rebases each series by subtracting its own
+/// minimum and hands the range to ratatui as a scale. Run under the
+/// debug profile's overflow checks, this pins that arithmetic — and the
+/// shared `extract_series` ranking behind it — against a metric column
+/// holding `u64::MAX`.
+#[cfg(test)]
+#[test]
+fn timechart_sparklines_survive_unsigned_magnitudes() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use trawl_engine::value::{Column, QueryResult};
+
+    let col = |name: &str| Column {
+        name: name.to_owned(),
+    };
+    let result = QueryResult {
+        columns: vec![col("_time"), col("m0"), col("m1")],
+        rows: vec![
+            vec![
+                Value::String("2026-01-01 00:00:00".to_owned()),
+                Value::Integer(0),
+                Value::UInt(u64::MAX),
+            ],
+            vec![
+                Value::String("2026-01-01 00:05:00".to_owned()),
+                Value::UInt(u64::MAX),
+                Value::Integer(0),
+            ],
+        ],
+    };
+
+    for view in [ChartView::Sparkline, ChartView::LineChart] {
+        let mut app = crate::tui::tests::test_app();
+        let returned = result.rows.len();
+        app.tab.result = Some(trawl_client::QueryResponse {
+            execution: None,
+            result: result.clone(),
+            truncated: false,
+            pagination: trawl_client::PaginationMeta {
+                limit: 10_000,
+                offset: 0,
+                returned,
+            },
+            degraded_fields: Vec::new(),
+            severity_columns: Vec::new(),
+        });
+        app.tab.chart_view = view;
+
+        let backend = TestBackend::new(120, 20);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| crate::tui::ui::render(&mut app, f))
+            .unwrap_or_else(|e| panic!("{view:?} must render: {e}"));
+    }
 }
 
 /// A `stats first(request_id) by service` over an id past `i64::MAX`

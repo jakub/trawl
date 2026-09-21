@@ -97,6 +97,17 @@ fn is_group_label(cell: Option<&Value>) -> bool {
     matches!(cell, Some(Value::String(_)))
 }
 
+/// A series' total, for ranking the top six only.
+///
+/// Wider than the points it adds: a metric column can hold values near
+/// `u64::MAX` (an id, a byte count), and two of them overflow a `u64`
+/// accumulator — a panic under overflow checks, and a wrap to zero
+/// without them, which ranks the largest series last and drops it. The
+/// total is never displayed, so its width costs nothing.
+fn series_total(values: &[u64]) -> u128 {
+    values.iter().copied().map(u128::from).sum()
+}
+
 /// Extract `(label, values)` tuples from a timechart [`QueryResult`].
 ///
 /// Three shapes are recognized:
@@ -165,11 +176,7 @@ pub fn extract_series(result: &QueryResult) -> (Vec<(String, Vec<u64>)>, usize) 
             let mut series: Vec<(String, Vec<u64>)> = series_map.into_iter().collect();
             let total = series.len();
             if series.len() > MAX_SERIES {
-                series.sort_by(|a, b| {
-                    let sum_b: u64 = b.1.iter().sum();
-                    let sum_a: u64 = a.1.iter().sum();
-                    sum_b.cmp(&sum_a)
-                });
+                series.sort_by_key(|s| std::cmp::Reverse(series_total(&s.1)));
                 series.truncate(MAX_SERIES);
             }
             series.sort_by(|a, b| a.0.cmp(&b.0));
@@ -189,11 +196,7 @@ pub fn extract_series(result: &QueryResult) -> (Vec<(String, Vec<u64>)>, usize) 
                 .collect();
             let total = series.len();
             if series.len() > MAX_SERIES {
-                series.sort_by(|a, b| {
-                    let sum_b: u64 = b.1.iter().sum();
-                    let sum_a: u64 = a.1.iter().sum();
-                    sum_b.cmp(&sum_a)
-                });
+                series.sort_by_key(|s| std::cmp::Reverse(series_total(&s.1)));
                 series.truncate(MAX_SERIES);
             }
             series.sort_by(|a, b| a.0.cmp(&b.0));
@@ -202,6 +205,51 @@ pub fn extract_series(result: &QueryResult) -> (Vec<(String, Vec<u64>)>, usize) 
             (vec![], 0)
         }
     }
+}
+
+/// Ranking the top six survives a series whose points sum past
+/// `u64::MAX`.
+///
+/// Seven metric columns force the cap, and two `UInt` points at
+/// `2^63` sum to `2^64` — one past what a `u64` accumulator holds. Under
+/// overflow checks that panicked; without them it wrapped to zero, so
+/// the largest series ranked last and was the one dropped. The ranking
+/// total is not a measurement anyone reads, so it is free to be wider
+/// than the values it adds up.
+#[cfg(test)]
+#[test]
+fn series_ranking_survives_unsigned_totals() {
+    let mut columns = vec![crate::value::Column {
+        name: "_time".to_owned(),
+    }];
+    columns.extend((0..7).map(|i| crate::value::Column {
+        name: format!("m{i}"),
+    }));
+
+    // Six small metrics and one enormous one, twice over.
+    let row = |t: &str| {
+        let mut cells = vec![Value::String(t.to_owned())];
+        cells.extend((0..6).map(|i| Value::Integer(i64::from(i) + 1)));
+        cells.push(Value::UInt(9_223_372_036_854_775_808));
+        cells
+    };
+    let result = QueryResult {
+        columns,
+        rows: vec![row("2026-01-01 00:00:00"), row("2026-01-01 00:05:00")],
+    };
+
+    let (series, total) = extract_series(&result);
+    assert_eq!(total, 7, "every metric column counts before the cap");
+    assert_eq!(series.len(), 6, "the cap keeps six");
+    let labels: Vec<&str> = series.iter().map(|s| s.0.as_str()).collect();
+    assert!(
+        labels.contains(&"m6"),
+        "the largest series must survive the cap, not be dropped by it: {labels:?}"
+    );
+    assert_eq!(
+        series.iter().find(|s| s.0 == "m6").expect("m6 survives").1,
+        vec![9_223_372_036_854_775_808, 9_223_372_036_854_775_808]
+    );
 }
 
 /// An oversized unsigned measurement is still a measurement.
