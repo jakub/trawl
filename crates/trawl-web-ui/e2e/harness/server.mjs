@@ -1031,6 +1031,12 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       }
       if (netRun) {
         runDetailReads.push(p);
+        // Arming reaches this scenario too: the global runs page, and so
+        // its execution receipt, is only stubbed under `corpus`.
+        if (unavailableRunId !== null && p.endsWith(`/${unavailableRunId}`)) {
+          sendJson(res, 409, unavailableRunResponse(unavailableRunId));
+          return;
+        }
         sendJson(res, 200, corpusRunResultResponse());
         return;
       }

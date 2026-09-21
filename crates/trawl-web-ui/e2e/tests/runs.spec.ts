@@ -15,13 +15,16 @@ import {
   resetScenario,
   armRunUnavailable,
   runDetailReadCount,
+  CORPUS,
   SCHEDULE,
 } from '../fixtures';
 import { SEL } from '../selectors';
 
-const SENTENCE =
-  `report run ${SCHEDULE.pagedRunId} succeeded, but its stored result is unavailable; `
+const sentenceFor = (runId: number) =>
+  `report run ${runId} succeeded, but its stored result is unavailable; `
   + 'no older run was substituted';
+
+const SENTENCE = sentenceFor(SCHEDULE.pagedRunId);
 
 test('unavailable result names the run', async ({ page, request }) => {
   await resetScenario(request, 'schedule');
@@ -54,4 +57,31 @@ test('unavailable result names the run', async ({ page, request }) => {
   await preview.getByRole('button', { name: 'Check again' }).click();
   await expect.poll(() => runDetailReadCount(request)).toBeGreaterThan(before);
   await expect(preview.locator(SEL.runUnavailable)).toHaveText(SENTENCE);
+});
+
+// The runs page mounts the same preview beside its own execution
+// receipt. The 409 carries no summary, so a receipt fed only by that
+// read would go blank exactly when the page has to say what the run
+// was — while the list the page already holds knows all of it.
+test('unavailable result keeps the receipt', async ({ page, request }) => {
+  await resetScenario(request, 'corpus');
+  await armRunUnavailable(request, CORPUS.runWithResult);
+
+  await page.goto(`/jobs/runs?run=${CORPUS.runWithResult}&net=${CORPUS.netId}`);
+  const detail = page.locator(SEL.runDetail);
+  await expect(detail.locator(SEL.runUnavailable)).toHaveText(sentenceFor(CORPUS.runWithResult));
+
+  // `tone_vocab::run_status_label("success")`, which is what the title
+  // badge calls a run that finished.
+  await expect(detail.locator('.sd-ttl')).toContainText('Succeeded');
+
+  // The receipt prints the recorded status verbatim; the badge above is
+  // where the reader-facing label lives.
+  const field = (name: string) => detail.locator('.receipt .fieldlist > div')
+    .filter({ has: page.getByText(name, { exact: true }) })
+    .locator('dd');
+  await expect(field('Outcome')).toHaveText('success');
+  await expect(field('Rows recorded')).toHaveText(String(CORPUS.runWithResultRows));
+  await expect(field('Query')).toHaveText(CORPUS.runWithResultQuery);
+  await expect(field('Duration')).not.toHaveText('—');
 });

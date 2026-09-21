@@ -161,8 +161,14 @@ export const CORPUS = {
   topCardinalityField: '_time',
   /** Runs of the net, newest first (`wire/net-runs.json`). */
   runIds: [501, 502] as const,
-  /** The run whose expansion has a result body. */
+  /** The run whose expansion has a result body. It is also the newest
+   * row of the global runs list (`wire/runs-all.json`). */
   runWithResult: 501,
+  /** That row's recorded rows and query, as the global list carries
+   * them — what the runs page's execution receipt has to print when the
+   * run's stored result is gone and the read carries no summary. */
+  runWithResultRows: 3,
+  runWithResultQuery: '_severity>=error last=1h | stats count() by host',
 } as const;
 
 /** What the `schedule` scenario's two nets are.

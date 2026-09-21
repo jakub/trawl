@@ -421,6 +421,15 @@ fn the_corpus_run_fixtures_decode() {
     let saved: ListSavedResponse = decode("saved-queries.json", SAVED_QUERIES);
     assert_eq!(all.runs[0].net_id, saved.queries[0].id);
     assert_eq!(all.runs[0].net_name, saved.queries[0].name);
+    // A run whose stored result is gone answers 409 with no summary, so
+    // the runs page's receipt prints this row instead (`CORPUS
+    // .runWithResultRows` and `.runWithResultQuery` in `e2e/fixtures.ts`).
+    assert_eq!(all.runs[0].run.id, 501);
+    assert_eq!(all.runs[0].run.row_count, Some(3));
+    assert_eq!(
+        all.runs[0].run.query,
+        "_severity>=error last=1h | stats count() by host"
+    );
 
     let stats: RunsStatsResponse = decode("runs-stats.json", RUNS_STATS);
     assert_eq!(stats.total_runs, all.runs.len() as u64);

@@ -387,12 +387,13 @@ pub fn RunsPage() -> impl IntoView {
             // paints over the run now on screen.
             <For each=move || { run_selected.get().into_iter().collect::<Vec<_>>() } key=|identity| *identity
                 children=move |(net_id, run_id)| {
-                    let net_name = Signal::derive(move || runs.get().and_then(Result::ok)
+                    let found = Signal::derive(move || runs.get().and_then(Result::ok)
                         .and_then(|(_, response)| response.runs.into_iter()
-                            .find(|run| run.net_id == net_id && run.run.id == run_id)
-                            .map(|run| run.net_name)));
+                            .find(|run| run.net_id == net_id && run.run.id == run_id)));
+                    let net_name = Signal::derive(move || found.get().map(|run| run.net_name));
+                    let listed = Signal::derive(move || found.get().map(|run| run.run));
                     view! {
-                        <RunDetail net_id=net_id run_id=run_id net_name=net_name
+                        <RunDetail net_id=net_id run_id=run_id net_name=net_name listed=listed
                             on_close=on_close on_search=on_search docked=wide/>
                     }
                 }
@@ -411,6 +412,11 @@ fn RunDetail(
     /// The net's name off the list, which the run summary does not
     /// carry.
     net_name: Signal<Option<String>>,
+    /// The same run off the page's list. A run whose stored result file
+    /// is gone answers 409 (issue #227), which carries no summary at
+    /// all, and the receipt is about how the run went rather than about
+    /// what is left of it — so the list answers when the read cannot.
+    listed: Signal<Option<trawl_api::ReportRunSummary>>,
     on_close: Callback<()>,
     on_search: Callback<String>,
     docked: Signal<bool>,
@@ -418,8 +424,13 @@ fn RunDetail(
     let bus = expect_context::<ToastBus>();
     // Filled by the preview below out of the one `get_run` response the
     // two of them share; the preview keeps it current while the run is
-    // still going.
+    // still going. Empty until that read lands, and permanently empty
+    // when it answers the unavailable-result 409.
     let summary = RwSignal::new(None::<trawl_api::ReportRunSummary>);
+    // The fresh read wins while there is one: a running run's duration
+    // and row count move, and the list is a page old. `listed` only
+    // fills the gap.
+    let shown = Signal::derive(move || summary.get().or_else(|| listed.get()));
 
     // This memo lives under the selected identity's keyed owner. Paging
     // away retains a correct name, but another selection cannot inherit it.
@@ -427,15 +438,15 @@ fn RunDetail(
         net_name.get().or_else(|| previous.cloned().flatten())
     });
     let title = move || known_name.get().unwrap_or_else(|| format!("Run {run_id}"));
-    let status = move || summary.get().map(|s| s.status);
+    let status = move || shown.get().map(|s| s.status);
     let duration = move || {
-        summary
+        shown
             .get()
             .and_then(|s| s.duration_ms)
             .map_or_else(|| "—".to_string(), format_duration)
     };
     let row_count = move || {
-        summary
+        shown
             .get()
             .and_then(|s| s.row_count)
             .map_or_else(|| "—".to_string(), |n| n.to_string())
@@ -480,7 +491,7 @@ fn RunDetail(
                         <div><dt>"Duration"</dt><dd>{duration}</dd></div>
                         <div><dt>"Rows recorded"</dt><dd>{row_count}</dd></div>
                         <div><dt>"Query"</dt><dd class="mono">
-                            {move || summary.get().map_or_else(|| "—".to_string(), |s| s.query)}
+                            {move || shown.get().map_or_else(|| "—".to_string(), |s| s.query)}
                         </dd></div>
                     </dl>
                     <p class="small">
