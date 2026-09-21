@@ -18,10 +18,15 @@ by [`capture.mjs`](capture.mjs) in this directory.
 which had to follow the button into the range dialog's footer before the runner
 could hold an instance at all. No crate changed between the two.
 
-Both captures ran with `capture.mjs` at SHA-256
+Both captures ran with the `capture.mjs` committed at `29299f5b`, SHA-256
 `f97584ae8b5be2973b937981578edef62abeb8be27c3e7feca1c8088cff3a41c`, which each
-transcript repeats as `captureSha256`. A transcript whose hash does not match
-the file beside it came from a different script.
+transcript repeats as `captureSha256`. The file beside them has since changed
+in one respect: it now pins the daemon's certificate through `TRAWL_CA_FILE`
+where the captured revision accepted any certificate. `git show
+29299f5b:visual-evidence/visualization-whole-result/capture.mjs | sha256sum`
+reproduces the recorded hash; the seeding, queries, screenshots and transcript
+fields are the same in both revisions. A transcript whose hash matches neither
+came from a different script.
 
 ## What was measured, and how
 
@@ -171,8 +176,14 @@ TRAWL_URL=http://127.0.0.1:PORT \
 TRAWL_API_URL=https://127.0.0.1:PORT \
 TRAWL_BROWSER_KEY_FILE=/path/to/run/private/browser-key \
 TRAWL_INGEST_KEY=THE_MINTED_KEY \
+TRAWL_CA_FILE=/path/to/run/private/tls/cert.pem \
   node visual-evidence/visualization-whole-result/capture.mjs
 ```
+
+`TRAWL_CA_FILE` is the self-signed certificate the daemon minted for this run
+and persisted under its state dir; the script trusts that file and nothing
+else, so the reader and ingest keys it sends cannot be answered by another
+server.
 
 `TRAWL_URL` is the browser origin the runner printed; `TRAWL_API_URL` is the
 daemon's own `upstream` from `instance.json`, used for seeding and for one

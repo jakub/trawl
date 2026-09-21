@@ -32,6 +32,8 @@
 //   TRAWL_API_URL          the daemon's own API base, for seeding and probing
 //   TRAWL_BROWSER_KEY_FILE path to a file holding a reader API key
 //   TRAWL_INGEST_KEY       an API key with `trawl:ingest`
+//   TRAWL_CA_FILE          the daemon's own certificate, `private/tls/cert.pem`
+//                          under the run: the only issuer this script trusts
 // Optional:
 //   TRAWL_EVIDENCE_OUT     results root (default: ./results beside this file)
 //
@@ -57,6 +59,10 @@ const origin = new URL(required('TRAWL_URL')).origin;
 const apiBase = required('TRAWL_API_URL').replace(/\/+$/, '');
 const readerKey = (await fs.readFile(required('TRAWL_BROWSER_KEY_FILE'), 'utf8')).trim();
 const ingestKey = required('TRAWL_INGEST_KEY').trim();
+// The disposable daemon mints a self-signed certificate and persists it under
+// its state dir. Trusting that one file, rather than any issuer or none, is
+// what keeps the bearer tokens below from reaching an impostor.
+const ca = await fs.readFile(required('TRAWL_CA_FILE'));
 const outDir = path.join(process.env.TRAWL_EVIDENCE_OUT || path.join(here, 'results'), label);
 
 function required(name) {
@@ -121,7 +127,7 @@ function post(url, { token, body, contentType }) {
   const encoded = typeof body === 'string' ? body : JSON.stringify(body);
   const transport = url.startsWith('https:') ? https : http;
   return new Promise((resolve, reject) => {
-    const req = transport.request(url, { method: 'POST', rejectUnauthorized: false,
+    const req = transport.request(url, { method: 'POST', ca,
       headers: { authorization: `Bearer ${token}`, 'content-type': contentType,
         'content-length': Buffer.byteLength(encoded) } }, res => {
       let text = '';
