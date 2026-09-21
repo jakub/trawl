@@ -15,10 +15,12 @@ use crate::interop::uplot::{ChartHandle, Opts, create_chart};
 /// is equal length and all values are `f64`. xs are row indices, not
 /// instants: the server emits `_time` as a string, snapshot rows arrive
 /// in order, and the chart only has to show relative shape.
-fn snapshot_to_aligned(result: &QueryResult) -> (JsValue, Vec<String>) {
+/// The third element is the number of plotted points per series: what
+/// the chart actually drew, which the canvas itself does not say.
+fn snapshot_to_aligned(result: &QueryResult) -> (JsValue, Vec<String>, usize) {
     let (series, _total) = extract_series(result);
     if series.is_empty() {
-        return (js_sys::Array::new().into(), vec![]);
+        return (js_sys::Array::new().into(), vec![], 0);
     }
 
     let series_len = series[0].1.len();
@@ -53,7 +55,7 @@ fn snapshot_to_aligned(result: &QueryResult) -> (JsValue, Vec<String>) {
         aligned.push(&ys);
     }
 
-    (aligned.into(), labels)
+    (aligned.into(), labels, series_len)
 }
 
 #[component]
@@ -74,6 +76,10 @@ pub fn Chart(
         StoredValue::new_local(None);
 
     let mounted_labels = StoredValue::new(Vec::<String>::new());
+    // The plotted series length, published on the host element. A canvas
+    // is opaque: without this, "the chart drew every row" is a claim no
+    // test can read back from the DOM.
+    let points = RwSignal::new(None::<usize>);
     let width = RwSignal::new(0.0_f64);
     // Measure the content box, excluding the chart host's padding. The
     // observer disconnects with the component through leptos-use.
@@ -99,12 +105,13 @@ pub fn Chart(
                 }
             });
             mounted_labels.set_value(Vec::new());
+            points.set(None);
             return;
         };
         if measured_width <= 0.0 {
             return;
         }
-        let (data, labels) = snapshot_to_aligned(&result);
+        let (data, labels, plotted) = snapshot_to_aligned(&result);
         let html_el: web_sys::HtmlElement = (*element).clone().unchecked_into();
 
         handle.update_value(|slot| {
@@ -136,6 +143,7 @@ pub fn Chart(
                 *slot = Some(h);
             }
         });
+        points.set(Some(plotted));
     });
 
     on_cleanup(move || {
@@ -159,7 +167,7 @@ pub fn Chart(
             {move || failure.get().and(on_retry).map(|retry| view! {
                 <button type="button" class="btn-sec" on:click=move |_| retry.run(())>"Retry live stream"</button>
             })}
-            <div class="chart" node_ref=node_ref></div>
+            <div class="chart" node_ref=node_ref data-points=move || points.get().map(|n| n.to_string())></div>
             {move || hint.get().is_none().then(|| view! {
                 <p class="chart-note">"Count metrics by result position, up to six series. Open Events for exact times and values."</p>
             })}

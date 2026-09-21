@@ -161,7 +161,7 @@ failed when it ran after another file and passed when run alone.
 `default` is what the auto fixture resets to. The others are named in
 `harness/server.mjs` and selected with `resetScenario(request, name)` at
 the top of a test body: `unauth` (a 401 from `/api/auth/me`),
-`query-500`, `stream-burst`, `populated`, and `corpus`.
+`query-500`, `stream-burst`, `populated`, `corpus`, and `aggregate`.
 
 `corpus` is `populated` plus data: it answers everything `populated`
 does, with the same service (`nginx`) and the same net (id `1`), and adds
@@ -206,6 +206,19 @@ Every one of those bodies decodes into its `trawl-api` struct in
 `crates/trawl-web-ui/tests/e2e_wire_fixture_contract.rs`, and the content
 the specs navigate by (row count, host values, the over-bound length, the
 degraded field) is pinned in `fixtures.ts`'s `CORPUS`.
+
+`aggregate` answers one aggregation at the size the test asks for:
+`{ scenario: 'aggregate', aggregate: { buckets, groups, total } }` on the
+reset. A `| timechart` pipeline gets `buckets` rows of `_time, count`,
+two minutes apart from a fixed epoch; a `| stats count() by` pipeline
+gets `groups` rows of `status, count`. Both honour the posted `limit`
+and `offset` when slicing, and `pagination.total` is measured BEFORE the
+slice (`total` overrides it, for a result larger than what came back).
+Any other pipeline is a 500 recorded in `unhandledQueries`, the `corpus`
+rule. The rows are generated rather than pinned under `wire/` because
+what these specs read is how MANY rows arrived and which window was
+asked for — `/__ctl/state`'s `queries` carries each request's `limit` and
+`offset` alongside its DSL.
 
 `populated` answers `/api/v1/saved` and `/api/v1/schema/services` with a
 corpus that has one Net and one service in it, which makes the direct

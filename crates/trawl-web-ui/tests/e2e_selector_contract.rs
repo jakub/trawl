@@ -1381,6 +1381,12 @@ const CONTRACTS: &[Contract] = &[
         hook: "class=\"grp-search\"",
     },
     Contract {
+        assignment: "chartHost: '.chart',",
+        source_path: "src/components/chart.rs",
+        source: include_str!("../src/components/chart.rs"),
+        hook: "<div class=\"chart\" node_ref=node_ref data-points=",
+    },
+    Contract {
         assignment: "catChart: '.cat-chart',",
         source_path: "src/components/cat_chart.rs",
         source: CAT_CHART_RS,

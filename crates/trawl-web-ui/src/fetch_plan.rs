@@ -25,13 +25,15 @@
 //! `cargo nextest run -p trawl-web-ui` — the `categorical.rs` /
 //! `facets.rs` pattern.
 
-// Unconditional, unlike the `not(target_arch = "wasm32")` form those
-// modules use: the request path adopts this one in the following slice,
-// so right now the tests are its only caller on either target. Narrow
-// it back to the native-only form once a wasm caller exists.
-#![allow(dead_code)]
+// The `not(target_arch = "wasm32")` form those modules use: the request
+// path calls this on wasm, and the native build compiles the surfaces
+// that read the refusal and the cap line out entirely.
+#![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
 use crate::search_url::PAGE_SIZE;
+// Only the test-gated preamble below formats a count today, so the
+// import rides with it rather than standing unused off wasm.
+#[cfg(test)]
 use crate::service_card_fmt::format_exact;
 
 /// The ceiling one aggregation fetch asks for. A `limit` the server may clamp.
@@ -71,6 +73,10 @@ impl FetchPlan {
     }
 
     /// Whether this plan asks for the whole result.
+    ///
+    /// Compiled for its tests only until a surface reads it: the
+    /// request path decides with `for_query` and `window` alone.
+    #[cfg(test)]
     #[must_use]
     pub const fn is_whole(self) -> bool {
         matches!(self, Self::Whole)
@@ -79,6 +85,7 @@ impl FetchPlan {
 
 /// The shared opening both lines are built from: what the execution
 /// produced, and how much of it arrived.
+#[cfg(test)]
 fn preamble(total: usize, fetched: usize) -> String {
     format!(
         "This query produced {} rows; {} were fetched.",
@@ -93,6 +100,9 @@ fn preamble(total: usize, fetched: usize) -> String {
 /// it starts at the beginning and nothing was left behind. A window cut
 /// from a larger result is a page, and a chart of a page reads as a
 /// chart of the result.
+///
+/// Compiled for its tests only until the chart adopts it.
+#[cfg(test)]
 #[must_use]
 pub fn coverage_refusal(meta: &trawl_api::PaginationMeta) -> Option<String> {
     (meta.offset != 0 || meta.returned != meta.total).then(|| {
@@ -105,6 +115,9 @@ pub fn coverage_refusal(meta: &trawl_api::PaginationMeta) -> Option<String> {
 
 /// The line under the exact table when the result exceeds what was
 /// fetched, or `None` when the table holds everything.
+///
+/// Compiled for its tests only until the exact table adopts it.
+#[cfg(test)]
 #[must_use]
 pub fn cap_line(total: usize, fetched: usize) -> Option<String> {
     (total > fetched).then(|| {
@@ -158,6 +171,27 @@ mod tests {
             assert_eq!(
                 FetchPlan::for_query(query, 0),
                 FetchPlan::for_query(query, 2)
+            );
+        }
+    }
+
+    /// The rail never faces the 20,000 rows a `Whole` fetch can bring
+    /// back: `compute_facets` runs only where `raw_facets()` holds, and
+    /// it holds for no shape `for_query` answers `Whole` for.
+    #[test]
+    fn no_whole_fetched_shape_offers_row_facets() {
+        for query in [
+            "service=web | timechart span=2m count()",
+            "* | stats count() by status",
+            "* | stats count()",
+            "* | top 10 host",
+            "* | rare 5 status",
+            "* | pivot count() on status by host",
+        ] {
+            assert_eq!(FetchPlan::for_query(query, 0), FetchPlan::Whole, "{query}");
+            assert!(
+                !crate::result_actions::Capabilities::for_query(query).raw_facets(),
+                "{query}"
             );
         }
     }

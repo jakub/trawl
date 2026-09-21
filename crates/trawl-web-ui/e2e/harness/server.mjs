@@ -52,6 +52,8 @@ import {
   scheduleConflictResponse,
   scheduleNetRunsResponse,
   pagedRunResultResponse,
+  aggregateTimechartResponse,
+  aggregateStatsByResponse,
 } from './fixtures.mjs';
 
 const HOST = '127.0.0.1';
@@ -180,6 +182,11 @@ function hasCorpus() {
   return scenario === 'populated' || scenario === 'corpus' || scenario === 'pagination';
 }
 
+// Only the `aggregate` scenario reads these. `total` is the count the
+// execution produced before any window was cut from it: `null` means the
+// generated rows ARE the whole result, which is the ordinary case.
+const aggregate = { buckets: 12, groups: 5, total: null };
+
 // Only the pagination scenario uses these counts and held reads.
 const pagination = {
   historyTotal: 103, runsTotal: 3, queryTotal: 53,
@@ -275,6 +282,7 @@ function resetState() {
     holdHistoryOffset: null, held: null, history: [], runs: [], completed: [],
     holdQueryNumber: null, heldQuery: null,
   });
+  Object.assign(aggregate, { buckets: 12, groups: 5, total: null });
   healthHits = {};
   cancelRequests = [];
   dashboard.hold = false;
@@ -473,6 +481,11 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       if (scenario === 'pagination' && parsed.pagination) {
         for (const key of ['historyTotal', 'runsTotal', 'queryTotal', 'holdHistoryOffset', 'holdQueryNumber']) {
           if (key in parsed.pagination) pagination[key] = parsed.pagination[key];
+        }
+      }
+      if (scenario === 'aggregate' && parsed.aggregate) {
+        for (const key of ['buckets', 'groups', 'total']) {
+          if (key in parsed.aggregate) aggregate[key] = parsed.aggregate[key];
         }
       }
       // The ONE door that arms the repin script. Everything else reads
@@ -742,6 +755,29 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
           return;
         }
         sendJson(res, 200, body);
+        return;
+      }
+      // One aggregation at the size the test asked for. Dispatched by
+      // DSL shape like `corpus`, and for the same reason: a body that
+      // says nothing about the query it answers is worse than an error.
+      if (scenario === 'aggregate') {
+        const dsl = typeof parsedBody.query === 'string' ? parsedBody.query : '';
+        const limit = parsedBody.limit ?? 50;
+        const offset = parsedBody.offset ?? 0;
+        if (dsl.includes('| timechart')) {
+          sendJson(res, 200, aggregateTimechartResponse(aggregate.buckets, aggregate.total, offset, limit));
+          return;
+        }
+        if (dsl.includes('| stats count() by')) {
+          sendJson(res, 200, aggregateStatsByResponse(aggregate.groups, aggregate.total, offset, limit));
+          return;
+        }
+        if (dsl.includes('|')) {
+          unhandledQueries.push(dsl);
+          sendJson(res, 500, errorEnvelope(`no aggregate fixture for this pipeline shape: ${dsl}`));
+          return;
+        }
+        sendJson(res, 200, queryResponse());
         return;
       }
       if (scenario === 'query-500') {

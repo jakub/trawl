@@ -2,12 +2,13 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Snapshot query resource: re-fetches on `(effective_q, page)` tuple change.
+//! Snapshot query resource: re-fetches on `(effective_q, plan)` tuple change.
 
 use leptos::prelude::*;
 use trawl_api::QueryResponse;
 
 use crate::api::{self, ApiError};
+use crate::fetch_plan::FetchPlan;
 use crate::query_merge::{Filter, RangeSpec};
 
 /// Query provenance captured with one response. Keep structured URL state
@@ -24,7 +25,10 @@ pub struct ExecutedQuery {
 pub struct ExecutedResponse {
     pub query: ExecutedQuery,
     pub response: QueryResponse,
-    pub page: usize,
+    /// How much of the result this response was asked for. Under
+    /// `Whole` it is the same value on every page of one effective
+    /// query, which is what makes a page turn post nothing.
+    pub plan: FetchPlan,
     pub generation: u64,
     pub intent: u64,
 }
@@ -35,13 +39,18 @@ impl std::ops::Deref for ExecutedResponse {
     }
 }
 
-/// Build a Leptos `LocalResource` that runs `api::query(q, page)` whenever
-/// the effective-query or page signals change.
+/// Build a Leptos `LocalResource` that runs `api::query(q, plan)` whenever
+/// the effective-query or fetch-plan signals change.
 ///
 /// Callers should feed an "effective" query (base DSL + filters + range
 /// merged via `state::query::effective_query`), not the user's raw editor
 /// buffer. The resource doesn't care where the string came from — it just
 /// re-fires on value changes.
+///
+/// The request is the plan, not the page (ADR-0037): an aggregation's
+/// plan is `Whole` on every page, so turning a page under one leaves
+/// the input tuple unchanged, the intent where it was, and sends no
+/// POST. The `inputs` memo below is the only owner of that rule.
 ///
 /// Empty `q` short-circuits to an `Ok(empty result)` without a network
 /// round-trip so the first page load doesn't fire a POST with `?q=`.
@@ -54,7 +63,7 @@ impl std::ops::Deref for ExecutedResponse {
 /// fetcher, including while an older request is still in flight.
 pub fn rows_resource(
     effective_q: Memo<String>,
-    page: Memo<usize>,
+    plan: Memo<FetchPlan>,
     pending: WriteSignal<bool>,
     generation: RwSignal<u64>,
     base: Memo<String>,
@@ -66,7 +75,7 @@ pub fn rows_resource(
     let inputs = Memo::new(move |_| {
         (
             effective_q.get(),
-            page.get(),
+            plan.get(),
             base.get(),
             filters.get(),
             range.get(),
@@ -92,7 +101,7 @@ pub fn rows_resource(
         // Reading intent first resolves the complete input tuple. Subscribe
         // only through intent: tracking its inputs too can dirty the resource
         // during that resolution and execute the same request a second time.
-        let (q, p, base, filters, range) = inputs.get_untracked();
+        let (q, plan, base, filters, range) = inputs.get_untracked();
         let query = ExecutedQuery {
             effective: q.clone(),
             base,
@@ -111,12 +120,12 @@ pub fn rows_resource(
                 return Ok(ExecutedResponse {
                     query,
                     response: empty_response(),
-                    page: p,
+                    plan,
                     generation: request_generation,
                     intent: request_intent,
                 });
             }
-            let response = api::query(&q, p).await;
+            let response = api::query(&q, plan).await;
             // A response can finish after route teardown disposed the signal.
             if generation.try_get_untracked() == Some(request_generation)
                 && intent.try_get_untracked() == Some(request_intent)
@@ -127,7 +136,7 @@ pub fn rows_resource(
             response.map(|response| ExecutedResponse {
                 query,
                 response,
-                page: p,
+                plan,
                 generation: request_generation,
                 intent: request_intent,
             })

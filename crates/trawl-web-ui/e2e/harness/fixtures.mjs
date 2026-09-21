@@ -341,3 +341,57 @@ export function paginationGlobalRuns(total) {
     id: source[i % source.length].id + Math.floor(i / source.length) * 1000,
   }));
 }
+
+// ---- the `aggregate` scenario ---------------------------------------------
+//
+// One aggregation, answered at whatever size the test asks for, so a
+// spec can watch the whole-result fetch (ADR-0037) without a fixture per
+// size. The rows are generated rather than pinned in `wire/` for that
+// reason: what these specs read is the COUNT of rows and the window the
+// request asked for, never a particular bucket's value.
+//
+// `total` is what the execution produced, measured BEFORE the window was
+// cut from it — a slice never renames itself the result.
+
+/** Bucket instants, two minutes apart from a fixed epoch. Fixed so a
+ * chart of N buckets is the same picture on every run. */
+const AGGREGATE_EPOCH = Date.parse('2026-09-01T00:00:00Z');
+const AGGREGATE_BUCKET_MS = 2 * 60 * 1000;
+
+/** Deterministic, non-negative and not constant: a flat line would hide
+ * a chart that plotted the same point N times. */
+function aggregateCount(i) {
+  return ((i * 7) % 13) + 1;
+}
+
+/** `POST /api/v1/query` under `aggregate` for a `| timechart` pipeline:
+ * `buckets` rows of `_time, count`, sliced to the posted window. */
+export function aggregateTimechartResponse(buckets, total, offset, limit) {
+  const rows = Array.from({ length: buckets }, (_, i) => [
+    // The server's own spelling: RFC 3339 with microseconds.
+    `${new Date(AGGREGATE_EPOCH + i * AGGREGATE_BUCKET_MS).toISOString().replace('Z', '000Z')}`,
+    aggregateCount(i),
+  ]);
+  return aggregateBody([{ name: '_time' }, { name: 'count' }], rows, total, offset, limit);
+}
+
+/** `POST /api/v1/query` under `aggregate` for a `| stats count() by`
+ * pipeline: `groups` rows of `status, count`, sliced the same way. */
+export function aggregateStatsByResponse(groups, total, offset, limit) {
+  const rows = Array.from({ length: groups }, (_, i) => [`${200 + i}`, aggregateCount(i)]);
+  return aggregateBody([{ name: 'status' }, { name: 'count' }], rows, total, offset, limit);
+}
+
+function aggregateBody(columns, rows, total, offset, limit) {
+  // `total` before the slice, `returned` after it.
+  const produced = total ?? rows.length;
+  const window = rows.slice(offset, offset + limit);
+  return {
+    columns,
+    rows: window,
+    pagination: { limit, offset, returned: window.length, total: produced },
+    degraded_fields: [],
+    severity_columns: [],
+    execution: { started_at: '2026-09-15T12:34:56Z', duration_ms: 125 },
+  };
+}

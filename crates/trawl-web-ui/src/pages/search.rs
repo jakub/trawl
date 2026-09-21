@@ -55,6 +55,7 @@ use crate::components::results_table::ResultsTable;
 use crate::components::save_as_net_modal::SaveAsNetModal;
 use crate::components::search_quick_start::SearchQuickStart;
 use crate::facets::is_aggregation_shape;
+use crate::fetch_plan::FetchPlan;
 use crate::pages::layout::ShellStatus;
 use crate::search_status::{CountSource, FooterCount, StatusInputs, StatusKind, search_status};
 use crate::search_url::{Param, admit_filters, refusal_copy};
@@ -205,11 +206,17 @@ pub fn Search() -> impl IntoView {
         }
     });
 
+    // How much of the result one request asks for (ADR-0037): one page
+    // of a raw-event query, the whole of an aggregation. The page is an
+    // input, so a page turn under `Whole` produces the same plan and the
+    // resource below does not re-fire.
+    let fetch_plan = Memo::new(move |_| FetchPlan::for_query(&snapshot_q.get(), page.get()));
+
     let (query_pending, set_query_pending) = signal(false);
     let request_generation = RwSignal::new(0_u64);
     let (rows, request_intent) = rows_resource(
         snapshot_q,
-        page,
+        fetch_plan,
         set_query_pending,
         request_generation,
         executed_q,
@@ -240,8 +247,15 @@ pub fn Search() -> impl IntoView {
             // the resource itself in that case. In live the same Haul is
             // a no-op: no snapshot runs, and the stream's own key
             // (retry, mode, effective query) has not moved.
+            // Plan equality, not `page == 0`: the navigation below goes
+            // to page 0, and the resource re-fires only when that moves
+            // the request. It does not when the plan is already the
+            // page-0 plan — either the page is 0, or the query is an
+            // aggregation whose plan is `Whole` on every page — and
+            // those are exactly the cases this Haul must refetch.
             let rerun = !live.get_untracked()
-                && page.get_untracked() == 0
+                && fetch_plan.get_untracked()
+                    == FetchPlan::for_query(&snapshot_q.get_untracked(), 0)
                 && query_text.get_untracked() == executed_q.get_untracked();
             let outcome = goto(
                 &query_text.get_untracked(),
@@ -567,8 +581,12 @@ pub fn Search() -> impl IntoView {
                 || match rows.get() {
                     None => true,
                     Some(Ok(response)) => {
+                        // The plan, not the page: under `Whole` the
+                        // response answers every page of this query, so
+                        // comparing pages would leave the spinner up for
+                        // a page turn that posts nothing.
                         response.query.effective != snapshot_q.get()
-                            || response.page != page.get()
+                            || response.plan != fetch_plan.get()
                             || response.generation != request_generation.get()
                             || response.intent != request_intent.get()
                     }
