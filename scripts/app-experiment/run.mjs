@@ -418,7 +418,9 @@ async function experiment() {
     await page.locator('.daterange .dr-trigger').click();
     await page.locator('.dr-pop').getByText('Real-time', { exact: true }).click();
     const streamReady = page.waitForResponse(r => new URL(r.url()).pathname === '/api/v1/stream');
-    await page.locator('.rt-hint button').click();
+    // The Live Tail button sits in the dialog's footer, not in the hint
+    // beside it. Same hook the browser suite pins as `SEL.liveTailButton`.
+    await page.locator('.rt-hint + .foot .btn-pri').click();
     assert.equal((await streamReady).status(), 200);
     const ingestStart = performance.now();
     for (let offset = firstCount; offset < count; offset += batchSize) {
