@@ -1,7 +1,10 @@
 diff --git a/crates/trawl-web-ui/src/pages/search.rs b/crates/trawl-web-ui/src/pages/search.rs
 --- a/crates/trawl-web-ui/src/pages/search.rs
 +++ b/crates/trawl-web-ui/src/pages/search.rs
-@@ -395,7 +395,7 @@ pub fn Search() -> impl IntoView {
+@@ -504,13 +504,13 @@ pub fn Search() -> impl IntoView {
+                 goto(
+                     &executed_q.get_untracked(),
+                     0,
                      Mode::Snapshot,
                      &filters.get_untracked(),
                      &range.get_untracked(),
@@ -10,3 +13,6 @@ diff --git a/crates/trawl-web-ui/src/pages/search.rs b/crates/trawl-web-ui/src/p
                  ),
              );
          })
+     };
+ 
+     // --- live-tail state ----------------------------------------------
