@@ -269,6 +269,69 @@ fn numeric(value: &Value) -> Option<f64> {
     }
 }
 
+/// The bars are measured against the WHOLE fetched result, not the page
+/// on screen.
+///
+/// `detect` builds `max_abs` from every row it is handed, and under
+/// `FetchPlan::Whole` that is every group the execution produced. So a
+/// row's width is a property of the result, and paging cannot change it.
+/// Detecting over a page instead would rescale the bars on every turn,
+/// which is the defect this pins.
+///
+/// At module scope rather than inside `mod tests`, so
+/// `cargo nextest run -p trawl-web-ui categorical::scale_is_taken_from_the_fetched_result`
+/// selects this one test by its path.
+#[cfg(test)]
+#[test]
+fn scale_is_taken_from_the_fetched_result() {
+    use trawl_api::value::Column;
+
+    let query = "* | stats count() by status";
+    let columns: Vec<Column> = ["status", "count"]
+        .iter()
+        .map(|n| Column {
+            name: (*n).to_string(),
+        })
+        .collect();
+    // 60 groups, the largest on row 55 — past the first page, which is
+    // exactly the row a page-scoped scale would never see.
+    let rows: Vec<Vec<Value>> = (0..60)
+        .map(|i| {
+            vec![
+                Value::String(format!("{}", 200 + i)),
+                Value::Integer(if i == 55 { 900 } else { 9 }),
+            ]
+        })
+        .collect();
+    let whole = QueryResult {
+        columns: columns.clone(),
+        rows: rows.clone(),
+    };
+    let first_page = QueryResult {
+        columns,
+        rows: rows[..50].to_vec(),
+    };
+
+    let shape = detect(query, &whole).expect("a stats-by result with one numeric metric");
+    assert!((shape.max_abs - 900.0).abs() < 1e-9);
+
+    // One scale, read once, answering for rows on either page: row 0 is
+    // drawn on page 0 and row 55 on page 1, and neither width depends on
+    // which slice was handed to the chart.
+    let row_0 = shape.percent(&rows[0][shape.metric]);
+    let row_55 = shape.percent(&rows[55][shape.metric]);
+    assert!((row_0 - 1.0).abs() < 1e-9, "row 0 is 9 of 900: {row_0}");
+    assert!((row_55 - 100.0).abs() < 1e-9, "row 55 fills the track");
+
+    // The contrast: a scale detected over the first page alone makes the
+    // same row-0 value fill the whole track.
+    let page_shape = detect(query, &first_page).expect("the page is a stats-by result too");
+    assert!((page_shape.max_abs - 9.0).abs() < 1e-9);
+    let page_row_0 = page_shape.percent(&rows[0][page_shape.metric]);
+    assert!((page_row_0 - 100.0).abs() < 1e-9, "{page_row_0}");
+    assert!((page_row_0 - row_0).abs() > 1.0, "{page_row_0} vs {row_0}");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

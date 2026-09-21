@@ -147,6 +147,38 @@ fn rank(v: &Value) -> u8 {
         Value::Array(_) => 4,
     }
 }
+/// The row indices of one locally-paged window, sorted WHOLE first.
+///
+/// Sorting happens over every row the response carried, and only then is
+/// the page cut from it. The other order — page, then sort — would make
+/// page 2 the second 50 rows of the response re-ordered among
+/// themselves, which is not the second 50 rows of the sorted result.
+///
+/// The underlying sort is stable, so the same arguments answer the same
+/// list every time. That determinism is the contract: the exact table
+/// and the bars drawn beside it each call this for themselves, and they
+/// describe the same groups only because both calls agree.
+pub fn sorted_page(
+    rows: &[Vec<Value>],
+    sort: Option<(usize, bool)>,
+    page: usize,
+    size: usize,
+) -> Vec<usize> {
+    let mut indices: Vec<usize> = (0..rows.len()).collect();
+    if let Some((col, asc)) = sort {
+        indices.sort_by(|&a, &b| {
+            let ord = compare(rows[a].get(col), rows[b].get(col));
+            if asc { ord } else { ord.reverse() }
+        });
+    }
+    let start = page.saturating_mul(size);
+    if start >= indices.len() {
+        return Vec::new();
+    }
+    let end = start.saturating_add(size).min(indices.len());
+    indices[start..end].to_vec()
+}
+
 #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 fn int_float(i: i64, f: f64) -> Ordering {
     if f.is_nan() {
@@ -352,5 +384,73 @@ mod tests {
         assert!(
             !Capabilities::for_query("* | stats count() by host").include("host", &Value::Null)
         );
+    }
+
+    /// 59 rows whose sort column counts DOWN, so ascending order is the
+    /// exact reverse of response order and a page cut before the sort
+    /// would be visibly wrong.
+    fn descending_rows() -> Vec<Vec<Value>> {
+        (0..59)
+            .map(|i| vec![Value::Integer(59 - i), Value::String(format!("r{i}"))])
+            .collect()
+    }
+
+    #[test]
+    fn an_unsorted_page_is_the_response_order() {
+        let rows = descending_rows();
+        assert_eq!(sorted_page(&rows, None, 0, 50), (0..50).collect::<Vec<_>>());
+        assert_eq!(
+            sorted_page(&rows, None, 1, 50),
+            (50..59).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_sorted_page_holds_the_rows_that_follow_the_sort() {
+        let rows = descending_rows();
+        // Ascending on the counting-down column: the whole result in
+        // reverse, so page 1 is the first nine rows of the response,
+        // largest last.
+        let ascending: Vec<usize> = (0..59).rev().collect();
+        assert_eq!(sorted_page(&rows, Some((0, true)), 0, 50), ascending[..50]);
+        assert_eq!(sorted_page(&rows, Some((0, true)), 1, 50), ascending[50..]);
+        // Not the unsorted page 1 re-ordered among itself, which is what
+        // sorting a slice would have produced.
+        assert_ne!(
+            sorted_page(&rows, Some((0, true)), 1, 50),
+            vec![58, 57, 56, 55, 54, 53, 52, 51, 50]
+        );
+    }
+
+    #[test]
+    fn a_page_past_the_end_is_empty() {
+        let rows = descending_rows();
+        for page in [2, 9, usize::MAX] {
+            assert!(sorted_page(&rows, None, page, 50).is_empty(), "page {page}");
+            assert!(
+                sorted_page(&rows, Some((0, false)), page, 50).is_empty(),
+                "page {page}"
+            );
+        }
+    }
+
+    /// What lets the exact table and the bars agree without sharing a
+    /// computation: two calls, one answer.
+    #[test]
+    fn the_same_call_answers_the_same_page_twice() {
+        // A column with ties, so a comparator that left equal rows to
+        // chance would show it here.
+        let rows: Vec<Vec<Value>> = (0..59)
+            .map(|i| vec![Value::Integer(i % 3), Value::String(format!("r{i}"))])
+            .collect();
+        for sort in [None, Some((0, true)), Some((0, false))] {
+            for page in [0, 1] {
+                assert_eq!(
+                    sorted_page(&rows, sort, page, 50),
+                    sorted_page(&rows, sort, page, 50),
+                    "{sort:?} page {page}"
+                );
+            }
+        }
     }
 }

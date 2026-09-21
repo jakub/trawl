@@ -361,6 +361,10 @@ export const SEL = {
   /// Its one control, on a grouped column only. A metric column has
   /// none, which is the F02 fix a spec can count.
   groupSearch: '.results-table.exact button.grp-search',
+  /// The line under that table's pager when the execution produced more
+  /// rows than one fetch carried. Outside the page slice on purpose: it
+  /// describes the whole result, not the rows on screen.
+  resultsCap: '.results-cap',
   /// crates/trawl-web-ui/src/components/chart.rs — the Visualization
   /// tab's chart host. It carries `data-points`, the plotted series
   /// length: the canvas says nothing about what it drew, so that

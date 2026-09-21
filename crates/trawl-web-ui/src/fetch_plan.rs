@@ -31,9 +31,6 @@
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
 use crate::search_url::PAGE_SIZE;
-// Only the test-gated preamble below formats a count today, so the
-// import rides with it rather than standing unused off wasm.
-#[cfg(test)]
 use crate::service_card_fmt::format_exact;
 
 /// The ceiling one aggregation fetch asks for. A `limit` the server may clamp.
@@ -85,7 +82,6 @@ impl FetchPlan {
 
 /// The shared opening both lines are built from: what the execution
 /// produced, and how much of it arrived.
-#[cfg(test)]
 fn preamble(total: usize, fetched: usize) -> String {
     format!(
         "This query produced {} rows; {} were fetched.",
@@ -115,9 +111,6 @@ pub fn coverage_refusal(meta: &trawl_api::PaginationMeta) -> Option<String> {
 
 /// The line under the exact table when the result exceeds what was
 /// fetched, or `None` when the table holds everything.
-///
-/// Compiled for its tests only until the exact table adopts it.
-#[cfg(test)]
 #[must_use]
 pub fn cap_line(total: usize, fetched: usize) -> Option<String> {
     (total > fetched).then(|| {

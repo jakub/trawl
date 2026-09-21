@@ -57,8 +57,9 @@ use crate::components::search_quick_start::SearchQuickStart;
 use crate::facets::is_aggregation_shape;
 use crate::fetch_plan::FetchPlan;
 use crate::pages::layout::ShellStatus;
+use crate::result_actions::sorted_page;
 use crate::search_status::{CountSource, FooterCount, StatusInputs, StatusKind, search_status};
-use crate::search_url::{Param, admit_filters, refusal_copy};
+use crate::search_url::{PAGE_SIZE, Param, admit_filters, refusal_copy};
 use crate::state::query::{
     Filter, Mode, UrlSignals, effective_query, navigator, replace_navigator, report_refusal,
     url_signals,
@@ -571,6 +572,19 @@ pub fn Search() -> impl IntoView {
     let tabs_active = Signal::derive(move || active_tab.get().id().to_string());
     let on_tab_change = Callback::new(move |id: String| active_tab.set(ResultsTab::from_id(&id)));
 
+    // The exact table's sort column and direction, owned here rather
+    // than inside the table: the bars beside it slice the SAME sorted
+    // list, and a sort that lived privately in the table would put the
+    // two on different orders the moment a page turned. Reset when the
+    // executed query moves, which is what re-creating the table used to
+    // do; a page turn under a fetched-whole aggregation keeps it, since
+    // the rows on screen are still that result.
+    let sort = RwSignal::new(None::<(usize, bool)>);
+    Effect::new(move |_| {
+        snapshot_q.track();
+        sort.set(None);
+    });
+
     let is_chart_query = Memo::new(move |_| is_aggregation_shape(&effective_q.get()));
 
     let ring_result = Memo::new(move |_| ring_to_result(&ring.read()));
@@ -1005,13 +1019,30 @@ pub fn Search() -> impl IntoView {
                                     busy=running
                                     page=page
                                     rows=rows
+                                    sort=sort
                                     on_paginate=on_paginate
                                     on_add_filter=on_result_filter
                                 />
                                 {move || {
+                                    // The shape — and with it the scale every
+                                    // bar is measured against — is detected
+                                    // over the WHOLE fetched result, so a bar
+                                    // keeps its width from page to page. The
+                                    // bars themselves draw the page the table
+                                    // is showing, through the same sorted
+                                    // index list the table cut it with.
                                     let shape = cat_shape.get()?;
                                     let resp = rows.get()?.ok()?;
-                                    Some(view! { <CatChart shape=shape result=resp.response.result/> })
+                                    let whole = resp.response.result;
+                                    let indices = sorted_page(&whole.rows, sort.get(), page.get(), PAGE_SIZE);
+                                    let drawn = QueryResult {
+                                        columns: whole.columns.clone(),
+                                        rows: indices
+                                            .into_iter()
+                                            .filter_map(|i| whole.rows.get(i).cloned())
+                                            .collect(),
+                                    };
+                                    Some(view! { <CatChart shape=shape result=drawn/> })
                                 }}
                             </div>
                         </>

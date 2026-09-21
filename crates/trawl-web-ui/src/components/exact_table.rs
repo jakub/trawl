@@ -26,7 +26,8 @@
 
 use crate::api::{ApiError, PAGE_SIZE};
 use crate::categorical::group_columns;
-use crate::result_actions::{Capabilities, compare};
+use crate::fetch_plan::cap_line;
+use crate::result_actions::{Capabilities, sorted_page};
 use crate::state::query::{Filter, FilterOp};
 use crate::state::search_session::{ExecutedQuery, ExecutedResponse};
 use fleet_ui::{LoadState, Loaded, OffsetPager, PageTotal, PageWindow};
@@ -40,6 +41,10 @@ pub fn ExactTable(
     #[prop(into)] page: Signal<usize>,
     rows: LocalResource<Result<ExecutedResponse, ApiError>>,
     #[prop(into)] busy: Signal<bool>,
+    /// The column the reader sorted on, owned by the page: the bars
+    /// beside this table slice the same sorted list, so the order
+    /// cannot live privately in here.
+    sort: RwSignal<Option<(usize, bool)>>,
     on_paginate: Callback<usize>,
     /// Called by a group column's "search this group" control, with the
     /// query the row came from.
@@ -60,6 +65,7 @@ pub fn ExactTable(
                         executed_query=resp.query
                         page=page
                         busy=busy
+                        sort=sort
                         on_paginate=on_paginate
                         on_add_filter=on_add_filter
                     />
@@ -77,16 +83,21 @@ fn ExactTableBody(
     executed_query: ExecutedQuery,
     page: Signal<usize>,
     busy: Signal<bool>,
+    sort: RwSignal<Option<(usize, bool)>>,
     on_paginate: Callback<usize>,
     on_add_filter: Callback<(ExecutedQuery, Filter)>,
 ) -> impl IntoView {
     let columns: Vec<String> = resp.result.columns.iter().map(|c| c.name.clone()).collect();
     let rows_data = resp.result.rows.clone();
-    let returned = resp.pagination.returned;
+    // Every row the fetch brought back. Under `FetchPlan::Whole` this is
+    // the whole result up to the fetch ceiling, and it is what the pager
+    // counts: above the ceiling the pager describes the rows in hand and
+    // the gap between them and `total` is the cap line's to say.
+    let fetched = resp.result.rows.len();
+    let cap = cap_line(resp.pagination.total, fetched);
     let group_cols = group_columns(&executed_query.effective, &columns);
     let capabilities = Capabilities::for_query(&executed_query.effective);
 
-    let sort = RwSignal::new(None::<(usize, bool)>);
     let header_cells = columns
         .iter()
         .cloned()
@@ -130,30 +141,26 @@ fn ExactTableBody(
         })
         .collect::<Vec<_>>();
 
+    // The page is cut here, not by the request: an aggregation arrives
+    // whole and the reader walks it in the browser. Sorted whole first,
+    // so a re-sort changes WHICH rows this page holds rather than
+    // shuffling the ones already on it.
     let snapshot = rows_data.clone();
-    let indices = Memo::new(move |_| {
-        let mut idx: Vec<usize> = (0..snapshot.len()).collect();
-        if let Some((col, asc)) = sort.get() {
-            idx.sort_by(|&a, &b| {
-                let ord = compare(snapshot[a].get(col), snapshot[b].get(col));
-                if asc { ord } else { ord.reverse() }
-            });
-        }
-        idx
-    });
+    let indices = Memo::new(move |_| sorted_page(&snapshot, sort.get(), page.get(), PAGE_SIZE));
 
-    let has_rows = !rows_data.is_empty();
     let col_count = columns.len();
     let body_rows = rows_data.clone();
     let body_cols = columns.clone();
-    let fetched_page = resp.pagination.offset / PAGE_SIZE;
     let window = Signal::derive(move || {
+        let page = page.get();
         PageWindow::new(
-            fetched_page,
+            page,
             std::num::NonZeroUsize::new(PAGE_SIZE).expect("query page size is nonzero"),
-            returned,
-            PageTotal::Probe,
-            busy.get() || page.get() != fetched_page,
+            fetched
+                .saturating_sub(page.saturating_mul(PAGE_SIZE))
+                .min(PAGE_SIZE),
+            PageTotal::Known(fetched),
+            busy.get(),
         )
     });
 
@@ -165,25 +172,30 @@ fn ExactTableBody(
                         <tr>{header_cells}</tr>
                     </thead>
                     <tbody>
-                        {if has_rows {
-                            // Closure, not a bare block: rows must re-run
-                            // when the sort memo changes.
-                            (move || indices.get().into_iter().map(|i| {
+                        // Closure, not a bare block: the rows must
+                        // re-run when the sort or the page moves.
+                        {move || {
+                            let indices = indices.get();
+                            if indices.is_empty() {
+                                // An empty result, or a link naming a page
+                                // past the fetched rows: either way there
+                                // is nothing on this page to draw.
+                                return view! {
+                                    <tr>
+                                        <td class="results-empty-cell" colspan=col_count>
+                                            "No fish in this net yet"
+                                        </td>
+                                    </tr>
+                                }.into_any();
+                            }
+                            indices.into_iter().map(|i| {
                                 let cells = body_rows[i]
                                     .iter()
                                     .enumerate()
                                     .map(|(ci, v)| cell(ci, v, &body_cols, &group_cols, &capabilities, &executed_query, on_add_filter))
                                     .collect::<Vec<_>>();
                                 view! { <tr>{cells}</tr> }
-                            }).collect::<Vec<_>>()).into_any()
-                        } else {
-                            view! {
-                                <tr>
-                                    <td class="results-empty-cell" colspan=col_count>
-                                        "No fish in this net yet"
-                                    </td>
-                                </tr>
-                            }.into_any()
+                            }).collect::<Vec<_>>().into_any()
                         }}
                     </tbody>
                 </table>
@@ -201,6 +213,10 @@ fn ExactTableBody(
                     />
                 }.into_any())
             />
+            // Outside the slice on purpose: this line describes the
+            // whole result, not the page. It appears only when the
+            // execution produced more rows than one fetch could carry.
+            {cap.map(|line| view! { <p class="results-cap">{line}</p> })}
         </>
     }
     .into_any()

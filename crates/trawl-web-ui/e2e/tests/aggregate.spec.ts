@@ -20,6 +20,11 @@
 import { test, expect, resetScenario } from '../fixtures';
 import { COPY, SEL } from '../selectors';
 
+// The generated `aggregate` scenario, for the one case that needs more
+// groups than a page holds. `corpus` is pinned at five.
+const WIDE_GROUPS = 60;
+const WIDE_URL = '/search?q=' + encodeURIComponent('service=nginx | stats count() by status');
+
 // `| stats count() by status` — the harness dispatches the `corpus`
 // scenario on that pipeline shape and answers `wire/query-stats-by.json`:
 // five groups, one negative count and one null one.
@@ -171,4 +176,42 @@ test('the chart waits for the matching response while the group searches keep th
   release();
   await expect(page.locator(SEL.catChart)).toHaveCount(1);
   await expect(page.locator(SEL.groupSearch)).toHaveCount(GROUPS);
+});
+
+test('bar widths do not change with the page', async ({ page, request }) => {
+  // 60 groups: more than one page, so the same result is read in two
+  // slices and a bar can be compared across them.
+  expect((await request.post('/__ctl/reset', { data: { scenario: 'aggregate', aggregate: { groups: WIDE_GROUPS } } })).ok()).toBe(true);
+  await page.goto(WIDE_URL);
+
+  const bars = page.locator(`${SEL.catChart} .cat-bars li`);
+  await expect(bars).toHaveCount(50);
+
+  // A bar's width is its count measured against the largest count in
+  // the WHOLE result, so two groups with the same count draw the same
+  // width wherever they are paged to. A scale taken from the page would
+  // move under this assertion.
+  const read = () => bars.evaluateAll((items) => items.map((li) => ({
+    label: li.querySelector('.cat-lb')!.textContent ?? '',
+    value: li.querySelector('.cat-val')!.textContent ?? '',
+    width: li.querySelector('.cat-track i')?.getAttribute('style') ?? null,
+  })));
+  const first = (await read())[0];
+  expect(first.width).not.toBeNull();
+
+  await page.getByRole('button', { name: 'Next' }).click();
+  await expect(page).toHaveURL(/[?&]page=1/);
+  await expect(bars).toHaveCount(WIDE_GROUPS - 50);
+
+  const onPageTwo = await read();
+  const twin = onPageTwo.find((bar) => bar.value === first.value);
+  expect(twin, `no group on page 2 shares the count ${first.value}`).toBeDefined();
+  expect(twin!.width).toBe(first.width);
+
+  // Sorting re-orders the whole result, so it changes WHICH groups this
+  // page holds — and the table and the bars have to agree on the answer.
+  await page.locator(`${SEL.exactTable} thead th`).first().locator('button').click();
+  const labels = await page.locator(`${SEL.exactTable} tbody tr td:first-child`).allInnerTexts();
+  const barLabels = (await read()).map((bar) => bar.label);
+  expect(barLabels).toEqual(labels);
 });

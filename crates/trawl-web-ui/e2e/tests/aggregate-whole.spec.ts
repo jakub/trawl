@@ -58,10 +58,7 @@ test('an aggregation is fetched whole and charted whole', async ({ page, request
   expect(windows[0]).toMatchObject({ limit: LIMITS.aggregateFetchRows, offset: 0 });
 });
 
-// FIXME: the exact table still pages with `PageTotal::Probe`, so the
-// footer reads "Page 1 · showing 50 rows"; a later seat switches it to
-// `Known` over the fetched rows (ADR-0037).
-test.fixme('paging an aggregation posts nothing', async ({ page, request }) => {
+test('paging an aggregation posts nothing', async ({ page, request }) => {
   await configure(request, { buckets: BUCKETS });
   await page.goto(AGG_URL);
 
@@ -76,4 +73,24 @@ test.fixme('paging an aggregation posts nothing', async ({ page, request }) => {
   const windows = await capturedWindows(request);
   expect(windows).toHaveLength(1);
   expect(windows.map((w: { offset: number }) => w.offset)).toEqual([0]);
+});
+
+test('an out-of-range local page recovers', async ({ page, request }) => {
+  await configure(request, { buckets: BUCKETS });
+  // A link naming a page past the fetched rows. The pager counts the
+  // rows in hand, so it says what it has and offers the way back rather
+  // than inventing a page (ADR-0030).
+  await page.goto(`${AGG_URL}&page=9`);
+
+  const summary = page.locator(SEL.resultsSummary);
+  await expect(summary).toHaveText(`0–0 of ${BUCKETS}`);
+
+  await page.getByRole('button', { name: 'Prev' }).click();
+  await expect(page).toHaveURL(/[?&]page=1/);
+  await expect(summary).toHaveText(`51–${BUCKETS} of ${BUCKETS}`);
+
+  // Still one fetch: an out-of-range page is a slice of the result
+  // already in hand, the same as any other.
+  const windows = await capturedWindows(request);
+  expect(windows).toHaveLength(1);
 });

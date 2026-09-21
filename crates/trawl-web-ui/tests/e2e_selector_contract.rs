@@ -1381,6 +1381,12 @@ const CONTRACTS: &[Contract] = &[
         hook: "class=\"grp-search\"",
     },
     Contract {
+        assignment: "resultsCap: '.results-cap',",
+        source_path: "src/components/exact_table.rs",
+        source: EXACT_TABLE_RS,
+        hook: "class=\"results-cap\"",
+    },
+    Contract {
         assignment: "chartHost: '.chart',",
         source_path: "src/components/chart.rs",
         source: include_str!("../src/components/chart.rs"),
