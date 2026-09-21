@@ -1503,11 +1503,11 @@ fn timechart_sparklines_survive_unsigned_magnitudes() {
         app.tab.result = Some(trawl_client::QueryResponse {
             execution: None,
             result: result.clone(),
-            truncated: false,
             pagination: trawl_client::PaginationMeta {
                 limit: 10_000,
                 offset: 0,
                 returned,
+                total: returned,
             },
             degraded_fields: Vec::new(),
             severity_columns: Vec::new(),
@@ -1561,11 +1561,11 @@ fn bar_chart_renders_uint_metric() {
     app.tab.result = Some(trawl_client::QueryResponse {
         execution: None,
         result,
-        truncated: false,
         pagination: trawl_client::PaginationMeta {
             limit: 10_000,
             offset: 0,
             returned,
+            total: returned,
         },
         degraded_fields: Vec::new(),
         severity_columns: Vec::new(),
