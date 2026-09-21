@@ -543,20 +543,35 @@ pub(crate) async fn recover_ambiguous_finish(
 ///
 /// `relative` is a DB-stored path like `scheduled/foo/run_1.parquet`; it is
 /// resolved against the executor's `base_dir`. Returns `true` if the file was
-/// removed, `false` (with a logged warning) on failure. Shared by retention
-/// cleanup, mid-flight orphan cleanup, and the run-deletion handler.
+/// removed, `false` on anything else. Shared by retention cleanup,
+/// mid-flight orphan cleanup, and the run-deletion handler.
+///
+/// A file that was already gone is not a failure and does not log like one:
+/// it is the ordinary state after a `data_dir` repoint, and it is the same
+/// absence every read surface answers as a named unavailable result. A
+/// permission or I/O error keeps the warning, because that one is the
+/// operator's to fix.
 pub(crate) fn remove_result_file(base_dir: &str, relative: &str) -> bool {
     let full = format!("{}/{relative}", base_dir.trim_end_matches('/'));
-    if let Err(e) = std::fs::remove_file(&full) {
-        tracing::warn!(
-            event_type = "result_file_cleanup_error",
-            path = %full,
-            error = %e,
-            "failed to delete parquet result file"
-        );
-        false
-    } else {
-        true
+    match std::fs::remove_file(&full) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::info!(
+                event_type = "result_file_already_absent",
+                path = %full,
+                "no parquet result file to delete: it is already gone"
+            );
+            false
+        }
+        Err(e) => {
+            tracing::warn!(
+                event_type = "result_file_cleanup_error",
+                path = %full,
+                error = %e,
+                "failed to delete parquet result file"
+            );
+            false
+        }
     }
 }
 

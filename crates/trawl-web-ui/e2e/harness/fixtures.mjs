@@ -298,6 +298,20 @@ export function pagedRunResultResponse() {
   return wire('run-result-paged');
 }
 
+/** `GET /api/v1/saved/{id}/runs/{run_id}` for a run whose stored result
+ * file is gone: trawld's 409 envelope, carrying the sentence
+ * `from_saved::unavailable_run_message` writes (issue #227). Built rather
+ * than filed, because the sentence names the run. */
+export function unavailableRunResponse(runId) {
+  return {
+    error: {
+      code: 'bad_request',
+      message: `report run ${runId} succeeded, but its stored result is unavailable; `
+        + 'no older run was substituted',
+    },
+  };
+}
+
 /** Global ordering matches the API's closed token set. Fixtures use ASCII
  * names, so Buffer.compare implements the database's C collation. */
 export function globalRunsOrder(params) {

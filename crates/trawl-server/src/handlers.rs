@@ -46,6 +46,35 @@ use crate::store::{
 
 // -- handlers ----------------------------------------------------------------
 
+/// Re-decide a `from saved` read whose stored files may have gone during
+/// execution.
+///
+/// `DuckDB` answers a `read_parquet()` over a pattern that matches nothing
+/// by substituting an empty relation (`is_no_files_error` in the executor),
+/// so a file deleted between the pre-execution check and the open comes back
+/// as a success with NO columns at all — a shape no SELECT can otherwise
+/// produce, since every projection has at least one column. An engine error
+/// is the other way that window can show itself. In both cases the files are
+/// asked about once more, and only a `NotFound` turns the outcome into the
+/// named 409; anything still on disk keeps the answer it earned.
+fn guard_vanished_run_result(
+    mut outcome: crate::pool::ExecuteOutcome,
+    run_files: &[crate::from_saved::RunFile],
+) -> crate::pool::ExecuteOutcome {
+    if run_files.is_empty() {
+        return outcome;
+    }
+    let suspect = match &outcome.result {
+        Ok(qr) => qr.columns.is_empty(),
+        Err(ServerError::Engine(_)) => true,
+        Err(_) => false,
+    };
+    if suspect && let Some(conflict) = crate::from_saved::unavailable_run_conflict(run_files) {
+        outcome.result = Err(conflict);
+    }
+    outcome
+}
+
 /// `POST /api/v1/query` — execute a DSL query against the configured data source.
 ///
 /// Requires a valid bearer token (injected by auth middleware).
@@ -154,6 +183,12 @@ pub async fn query(
         },
     };
 
+    // The stored result files this read depends on, kept past resolution so
+    // their presence can be asked again after execution (see
+    // [`guard_vanished_run_result`]). Empty for every query that is not a
+    // `from saved` read of a run with a file.
+    let mut run_files: Vec<crate::from_saved::RunFile> = Vec::new();
+
     let (outcome, degraded_fields) = match admitted {
         Err(refusal) => (
             crate::pool::ExecuteOutcome {
@@ -163,34 +198,51 @@ pub async fn query(
             },
             Vec::new(),
         ),
-        Ok(Some(resolved)) => {
-            // Both halves of what the caller is actually reading: the
-            // stages they typed, and the saved query whose recorded run
-            // produced the rows those stages run over. Nothing stamps a
-            // report run at write time, so a degraded pin the saved query
-            // bound would otherwise go unmentioned.
-            let halves = [resolved.saved_dsl.as_str(), resolved.remaining_dsl.as_str()];
-            let degraded = degraded_fields_for(&state, halves);
-            (
-                state
-                    .query
-                    .pool
-                    .execute_with_source(
-                        query_id,
-                        &resolved.remaining_dsl,
-                        &resolved.source,
-                        deadline,
-                        capture_debug,
-                        utc_offset_secs,
-                        crate::pool::WorkContext::key(
-                            crate::pool::WorkKind::FromSaved,
-                            verified.id,
+        Ok(Some(mut resolved)) => {
+            run_files = std::mem::take(&mut resolved.run_files);
+            // Absence is an answer, not an empty result (ADR-0035): a
+            // stored path that no longer resolves refuses here, naming the
+            // run, before any of it reaches `DuckDB` — where a missing file
+            // is substituted with an empty relation and would read as "the
+            // report found nothing".
+            if let Some(conflict) = crate::from_saved::unavailable_run_conflict(&run_files) {
+                (
+                    crate::pool::ExecuteOutcome {
+                        result: Err(conflict),
+                        debug: None,
+                        severity_columns: Vec::new(),
+                    },
+                    Vec::new(),
+                )
+            } else {
+                // Both halves of what the caller is actually reading: the
+                // stages they typed, and the saved query whose recorded run
+                // produced the rows those stages run over. Nothing stamps a
+                // report run at write time, so a degraded pin the saved query
+                // bound would otherwise go unmentioned.
+                let halves = [resolved.saved_dsl.as_str(), resolved.remaining_dsl.as_str()];
+                let degraded = degraded_fields_for(&state, halves);
+                (
+                    state
+                        .query
+                        .pool
+                        .execute_with_source(
+                            query_id,
+                            &resolved.remaining_dsl,
+                            &resolved.source,
+                            deadline,
+                            capture_debug,
+                            utc_offset_secs,
+                            crate::pool::WorkContext::key(
+                                crate::pool::WorkKind::FromSaved,
+                                verified.id,
+                            )
+                            .with_user(&verified.name),
                         )
-                        .with_user(&verified.name),
-                    )
-                    .await,
-                degraded,
-            )
+                        .await,
+                    degraded,
+                )
+            }
         }
         Ok(None) => {
             let degraded = degraded_fields_for(&state, [req.query.as_str()]);
@@ -212,6 +264,10 @@ pub async fn query(
             )
         }
     };
+
+    // Between the check above and `DuckDB`'s open there is a window a
+    // delete can land in. This closes it on the way out.
+    let outcome = guard_vanished_run_result(outcome, &run_files);
 
     let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
     let duration_secs = start.elapsed().as_secs_f64();
@@ -2778,12 +2834,18 @@ pub async fn trigger_run(
 
 /// `GET /api/v1/saved/{id}/runs/{run_id}` — get a single report run with result data.
 ///
-/// Prefers parquet result files (via `result_path`) over the zstd JSON blob.
-/// A run has a blob instead of a file in two cases: its result had no rows
-/// (there is no schema to write a parquet from), or the parquet write failed
-/// and the scheduler fell back. Either way the blob carries the column names,
-/// so a zero-row run answers with its columns and an empty row list rather
-/// than a null result.
+/// A run records its result EITHER as a parquet file (via `result_path`) or
+/// as a zstd JSON blob, never both. It has a blob in two cases: its result
+/// had no rows (there is no schema to write a parquet from), or the parquet
+/// write failed and the scheduler fell back. Either way the blob carries the
+/// column names, so a zero-row run answers with its columns and an empty row
+/// list rather than a null result.
+///
+/// A run that names a file answers from that file or not at all. A file that
+/// is gone is a 409 naming the run (ADR-0035); any other read failure is the
+/// failure it is. Falling back to the blob here would answer 200 with
+/// `result: null` beside a non-zero `row_count`, which every client then has
+/// to describe as "no result data" for a run that succeeded.
 pub async fn get_report_run(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
@@ -2816,13 +2878,16 @@ pub async fn get_report_run(
         .get_run_result(run_id, key_id)
         .await?;
 
-    // Try parquet result first, fall back to the zstd blob.
     let result = if let Some(ref result_path) = run.result_path {
-        let base_dir = state.query.pool.base_dir().to_owned();
         let max_rows = state.query.pool.max_result_rows();
-        let full_path = format!("{}/{}", base_dir.trim_end_matches('/'), result_path);
-        let path = std::path::PathBuf::from(full_path);
+        let file = crate::from_saved::run_file(run.id, state.query.pool.base_dir(), result_path);
+        if let Some(conflict) =
+            crate::from_saved::unavailable_run_conflict(std::slice::from_ref(&file))
+        {
+            return Err(conflict);
+        }
 
+        let path = file.absolute_path.clone();
         match tokio::task::spawn_blocking(move || {
             let executor = trawl_engine::executor::Executor::new()?;
             executor.read_parquet_to_result(&path, max_rows)
@@ -2834,19 +2899,26 @@ pub async fn get_report_run(
                 tracing::warn!(
                     event_type = "report_run_parquet_read_failed",
                     run_id,
+                    path = %file.absolute_path.display(),
                     error = %e,
-                    "failed to read parquet result, trying the result blob"
+                    "failed to read the stored parquet result"
                 );
-                crate::scheduler::decode_result_blob(result_blob)
+                // The delete may have landed while the read was in flight.
+                return Err(
+                    crate::from_saved::unavailable_run_conflict(std::slice::from_ref(&file))
+                        .unwrap_or(ServerError::Engine(e)),
+                );
             }
             Err(e) => {
-                tracing::warn!(
+                tracing::error!(
                     event_type = "report_run_parquet_task_failed",
                     run_id,
                     error = %e,
-                    "parquet read task panicked, trying the result blob"
+                    "the parquet read task did not complete"
                 );
-                crate::scheduler::decode_result_blob(result_blob)
+                return Err(ServerError::Internal(
+                    "failed to read the stored report result".into(),
+                ));
             }
         }
     } else {

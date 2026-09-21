@@ -382,7 +382,7 @@ impl App {
                 Err(e) => {
                     tracing::error!("failed to fetch run result: {e}");
                     MutationResult::Error {
-                        message: format!("Failed to fetch run result: {e}"),
+                        message: run_result_error_message(&e),
                     }
                 }
             };
@@ -988,6 +988,40 @@ fn snapshot_large_unsigned_exact() {
         response.result.rows[0][1],
         trawl_engine::value::Value::UInt(u64::MAX),
         "a snapshot cell must carry the number, never a rounded double or a null"
+    );
+}
+
+/// The toast a failed run-result fetch shows.
+///
+/// A 409 is the server saying the run succeeded and its stored result is
+/// gone (issue #227). That sentence is already the whole answer, so it is
+/// shown verbatim: prefixing it with "Failed to fetch run result" would
+/// re-assert a failure the run did not have.
+fn run_result_error_message(e: &ClientError) -> String {
+    match e {
+        ClientError::Server { status: 409, error } => error.message.clone(),
+        other => format!("Failed to fetch run result: {other}"),
+    }
+}
+
+/// A 409 reaches the operator as the server's own sentence, unadorned.
+#[cfg(test)]
+#[test]
+fn unavailable_result_toast() {
+    const SENTENCE: &str = "report run 42 succeeded, but its stored result is unavailable; \
+                            no older run was substituted";
+
+    let conflict = ClientError::Server {
+        status: 409,
+        error: trawl_api::ErrorEnvelope::simple(trawl_api::ErrorCode::BadRequest, SENTENCE),
+    };
+    assert_eq!(run_result_error_message(&conflict), SENTENCE);
+
+    // Everything else still says what went wrong with the fetch.
+    let network = ClientError::Network("connection refused".to_owned());
+    assert!(
+        run_result_error_message(&network).starts_with("Failed to fetch run result:"),
+        "a transport failure is a failure to fetch"
     );
 }
 

@@ -444,6 +444,10 @@ export const SEL = {
   /// The named scroll region the preview's rows sit in. The pager, the
   /// cap line and Run-query-again are siblings of it, never inside.
   previewScroll: '.preview-scroll',
+  /// The line a run whose stored result file is gone shows instead of a
+  /// table: the server's own sentence, in its own element rather than
+  /// the generic load-error wrapper (issue #227).
+  runUnavailable: '.run-unavailable',
   /// The line naming rows the response never carried. Absent when paging
   /// covers everything.
   previewCap: '.preview-cap',

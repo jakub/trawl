@@ -561,6 +561,10 @@ pub async fn list_runs(
 }
 
 /// GET `/api/v1/saved/{id}/runs/{run_id}` — single run with result data.
+///
+/// A non-2xx keeps its envelope: a run whose stored result file is gone
+/// answers 409 with a sentence naming the run (issue #227), and the drawer
+/// shows that sentence rather than inventing copy from a bare status.
 pub async fn get_run(saved_id: i64, run_id: i64) -> Result<ReportRunResponse, ApiError> {
     let url = format!("/api/v1/saved/{saved_id}/runs/{run_id}");
     let resp = Request::get(&url).send().await?;
@@ -570,7 +574,7 @@ pub async fn get_run(saved_id: i64, run_id: i64) -> Result<ReportRunResponse, Ap
             .await
             .map_err(|e| ApiError::Decode(e.to_string())),
         401 => Err(ApiError::Unauthorized),
-        s => Err(ApiError::Status(s)),
+        s => Err(server_error(&resp, s).await),
     }
 }
 

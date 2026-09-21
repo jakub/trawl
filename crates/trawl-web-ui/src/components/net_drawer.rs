@@ -1002,6 +1002,23 @@ fn RunsPane(
 // Expanded run result preview
 // ---------------------------------------------------------------------------
 
+/// What one read of a stored run can come back as.
+///
+/// A run whose stored result file is gone answers 409 (issue #227). That is
+/// not a failed read — the run succeeded and the server said so in a
+/// sentence — so it travels as a successful outcome of its own rather than
+/// as an `ApiError`. The refresh helper keeps prior data through errors and
+/// replaces it through successes, and this state must replace: a preview
+/// still showing rows the server has just said it cannot serve would be the
+/// same lie in a slower form.
+#[derive(Clone)]
+enum RunPreview {
+    /// The run's response, whatever it carries.
+    Available(Box<trawl_api::ReportRunResponse>),
+    /// The server's sentence about a run whose stored result is gone.
+    Unavailable(String),
+}
+
 /// One stored run's result, with the rerun control beneath it.
 ///
 /// Shared with the runs page, which mounts it beside its own execution
@@ -1020,11 +1037,20 @@ pub(crate) fn RunResultPreview(
     let terminal = RwSignal::new(false);
     let (result, refresh_error, retry) = super::job_refresh::job_refresh(
         Signal::derive(move || active.get() && !terminal.get()),
-        move || async move { api::get_run(net_id, run_id).await },
+        move || async move {
+            match api::get_run(net_id, run_id).await {
+                Ok(response) => Ok(RunPreview::Available(Box::new(response))),
+                Err(api::ApiError::Server {
+                    status: 409,
+                    message,
+                }) => Ok(RunPreview::Unavailable(message)),
+                Err(e) => Err(e),
+            }
+        },
     );
     let preview_page = RwSignal::new(0usize);
-    Effect::new(move |_| {
-        if let Some(Ok(response)) = result.get() {
+    Effect::new(move |_| match result.get() {
+        Some(Ok(RunPreview::Available(response))) => {
             // A running response must not write false back into the poll
             // gate: that notification would start another read immediately.
             if matches!(
@@ -1035,6 +1061,10 @@ pub(crate) fn RunResultPreview(
             }
             summary.set(Some(response.summary));
         }
+        // Nothing about a run this old changes on its own, so polling it
+        // again would only repeat the sentence. The control below asks.
+        Some(Ok(RunPreview::Unavailable(_))) => terminal.set(true),
+        Some(Err(_)) | None => {}
     });
 
     view! {
@@ -1044,7 +1074,25 @@ pub(crate) fn RunResultPreview(
                 state=Signal::derive(move || LoadState::from_resource(result.get()))
                 label="result"
                 retry=Callback::new(move |()| { retry.run(()); })
-                render=Box::new(move |resp: trawl_api::ReportRunResponse| {
+                render=Box::new(move |preview: RunPreview| {
+                    let resp = match preview {
+                        // The run succeeded; only its stored file is gone.
+                        // Said in the server's own words, and not wrapped in
+                        // "Couldn't load" copy that would call the run a
+                        // failure it was not.
+                        RunPreview::Unavailable(message) => return view! {
+                            <p class="run-unavailable" role="status">{message}</p>
+                            <Btn
+                                variant=Variant::Secondary
+                                size=Size::Xs
+                                on_click=Callback::new(move |()| {
+                                    terminal.set(false);
+                                    retry.run(());
+                                })
+                            >"Check again"</Btn>
+                        }.into_any(),
+                        RunPreview::Available(resp) => *resp,
+                    };
                     match resp.result {
                         None => view! {
                             <span style="color:var(--ink-3)">"No result data (error or still running)"</span>

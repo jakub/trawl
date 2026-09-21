@@ -228,6 +228,15 @@ export async function runDetailReadCount(request: Ctl): Promise<number> {
   return state.runDetailReads.length;
 }
 
+/** Point the run-detail route at a run whose stored result file is gone,
+ * so `GET .../runs/{id}` answers the server's 409 envelope for it — what
+ * trawld does once `data_dir` is repointed out from under a recorded run
+ * (issue #227). Every read of that run answers the same way. */
+export async function armRunUnavailable(request: Ctl, runId: number): Promise<void> {
+  const response = await request.post(`/__ctl/run-unavailable/${runId}`);
+  expect(response.ok(), `arm run ${runId} unavailable: HTTP ${response.status()}`).toBe(true);
+}
+
 /** Arm the next schedule PUT to be refused: `'refuse'` answers the
  * server's own 400 envelope, `'fail'` a 500 with no envelope at all. */
 export async function armScheduleRefusal(request: Ctl, kind: 'refuse' | 'fail'): Promise<void> {

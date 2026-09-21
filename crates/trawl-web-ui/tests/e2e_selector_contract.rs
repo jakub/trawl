@@ -1764,6 +1764,12 @@ const CONTRACTS: &[Contract] = &[
         hook: "class=\"preview-scroll\"",
     },
     Contract {
+        assignment: "runUnavailable: '.run-unavailable',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "class=\"run-unavailable\"",
+    },
+    Contract {
         assignment: "previewCap: '.preview-cap',",
         source_path: "src/components/net_drawer.rs",
         source: NET_DRAWER_RS,
