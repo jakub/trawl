@@ -1030,7 +1030,7 @@ pub(crate) fn RunResultPreview(
     active: Signal<bool>,
     summary: RwSignal<Option<trawl_api::ReportRunSummary>>,
     /// Whether the last read answered the unavailable-result 409, which
-    /// leaves `summary` empty however long it waits. A receipt beside
+    /// empties `summary` and leaves it empty however long it waits. A receipt beside
     /// this preview needs the verdict itself, because "not read yet"
     /// and "read, and the stored result is gone" are the same empty
     /// `summary` and call for opposite behaviour. The net drawer's rows
@@ -1077,6 +1077,13 @@ pub(crate) fn RunResultPreview(
         // Nothing about a run this old changes on its own, so polling it
         // again would only repeat the sentence. The control below asks.
         Some(Ok(RunPreview::Unavailable(_))) => {
+            // A run selected while it was still going left a `running`
+            // summary here, and this read has just superseded it. The
+            // refusal carries no summary of its own, so the eviction
+            // has to be explicit: leaving the old one is how a receipt
+            // reading from it ends up saying Running beside a sentence
+            // that says the run succeeded.
+            summary.set(None);
             if let Some(verdict) = unavailable {
                 verdict.set(true);
             }

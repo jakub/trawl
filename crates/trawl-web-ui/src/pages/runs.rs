@@ -425,8 +425,9 @@ fn RunDetail(
     let bus = expect_context::<ToastBus>();
     // Filled by the preview below out of the one `get_run` response the
     // two of them share; the preview keeps it current while the run is
-    // still going. Empty until that read lands, and permanently empty
-    // when it answers the unavailable-result 409.
+    // still going. Empty until that read lands, and emptied again — a
+    // `running` answer and all — the moment one answers the
+    // unavailable-result 409, which has no summary to put in its place.
     let summary = RwSignal::new(None::<trawl_api::ReportRunSummary>);
     // Set by that same read once it has ANSWERED the 409. An empty
     // `summary` alone cannot be read as a refusal: it is also what a
@@ -447,7 +448,8 @@ fn RunDetail(
     );
     // The read wins whenever it has an answer: a running run's duration
     // and row count move, and the list is a page old. It has no answer
-    // to give once it has refused, and only then does the list's own
+    // to give once it has refused — the refusal evicts whatever it held
+    // before — and only then does the list's own
     // record of the run become the receipt — with the outcome corrected.
     // The server answers this 409 only for a run whose query SUCCEEDED
     // and wrote a result file it can no longer find

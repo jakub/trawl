@@ -184,3 +184,67 @@ test('unavailable result reconciles a stale running row', async ({ page, request
   await expect(field('Rows recorded')).toHaveText('—');
   await expect(field('Query')).toHaveText(CORPUS.runWithResultQuery);
 });
+
+// The other order: the run was selected while it was STILL GOING, so the
+// first read is a 200 that records `running` here, and only the next poll
+// finds the file gone. The refusal carries no summary of its own, so it
+// has to evict the one it supersedes — a receipt still reading the older
+// answer says Running beside a sentence that says the run succeeded, and
+// nothing later repairs it because the 409 ends the polling.
+test('unavailable result replaces a running summary', async ({ page, request }) => {
+  await resetScenario(request, 'corpus');
+  await armRunUnavailable(request, CORPUS.runWithResult);
+  await page.clock.install();
+
+  await page.route('**/api/v1/runs?*', async route => {
+    if (new URL(route.request().url()).pathname !== '/api/v1/runs') {
+      await route.fallback();
+      return;
+    }
+    const response = await route.fetch();
+    const body = await response.json();
+    const row = body.runs.find((run: { id: number }) => run.id === CORPUS.runWithResult);
+    row.status = 'running';
+    row.finished_at = null;
+    row.duration_ms = null;
+    row.row_count = null;
+    await route.fulfill({ response, json: body });
+  });
+
+  // Hit one is the run still going; from hit two the harness's own armed
+  // 409 answers, so the sentence stays the server's.
+  const running = JSON.parse(await readFile(`${__dirname}/../harness/wire/run-result.json`, 'utf8'));
+  running.status = 'running';
+  running.finished_at = null;
+  running.duration_ms = null;
+  running.row_count = null;
+  delete running.result;
+  let reads = 0;
+  await page.route(`**/api/v1/saved/${CORPUS.netId}/runs/${CORPUS.runWithResult}`, async route => {
+    reads++;
+    if (reads === 1) {
+      await route.fulfill({ json: running });
+      return;
+    }
+    await route.fulfill({ response: await route.fetch() });
+  });
+
+  await page.goto(`/jobs/runs?run=${CORPUS.runWithResult}&net=${CORPUS.netId}`);
+  const detail = page.locator(SEL.runDetail);
+  const field = receiptOf(page, detail);
+  await expect(detail.locator('.sd-ttl .bdg')).toHaveText('Running');
+  await expect(field('Outcome')).toHaveText('running');
+  await expect(field('Query')).toHaveText(CORPUS.runWithResultQuery);
+
+  // The five-second poll of the same mounted drawer, not a new selection.
+  await page.clock.fastForward(5_000);
+  await expect.poll(() => reads).toBeGreaterThan(1);
+  await expect(detail.locator(SEL.runUnavailable)).toHaveText(sentenceFor(CORPUS.runWithResult));
+  const badge = detail.locator('.sd-ttl .bdg');
+  await expect(badge).toHaveText(SUCCEEDED);
+  await expect(badge).toHaveClass(/success/);
+  await expect(field('Outcome')).toHaveText('success');
+  await expect(field('Duration')).toHaveText('—');
+  await expect(field('Rows recorded')).toHaveText('—');
+  await expect(field('Query')).toHaveText(CORPUS.runWithResultQuery);
+});
