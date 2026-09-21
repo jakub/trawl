@@ -279,6 +279,21 @@ fn uint_sorts_numerically() {
         compare(Some(&Value::Float(-1.0)), Some(&lo)),
         Ordering::Less
     );
+    // A fractional float sits between the integers on either side of it:
+    // a comparison that truncated the float first would call 1 and 1.5
+    // equal.
+    assert_eq!(
+        compare(Some(&Value::UInt(1)), Some(&Value::Float(1.5))),
+        Ordering::Less
+    );
+    assert_eq!(
+        compare(Some(&Value::Float(1.5)), Some(&Value::UInt(1))),
+        Ordering::Greater
+    );
+    assert_eq!(
+        compare(Some(&Value::UInt(2)), Some(&Value::Float(1.5))),
+        Ordering::Greater
+    );
 
     // Null still sorts first, whatever the number's width.
     assert_eq!(compare(None, Some(&hi)), Ordering::Less);

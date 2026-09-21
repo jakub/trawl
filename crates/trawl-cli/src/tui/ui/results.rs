@@ -1497,6 +1497,17 @@ fn timechart_sparklines_survive_unsigned_magnitudes() {
         ],
     };
 
+    // The samples reach the renderers intact: a conversion that dropped
+    // or zeroed the unsigned cells would still leave non-empty series
+    // (the fixture carries integers too), and both draws below would
+    // succeed over zeros.
+    let (series, _) = extract_series(&result);
+    assert!(
+        series.contains(&("m0".to_owned(), vec![0, u64::MAX]))
+            && series.contains(&("m1".to_owned(), vec![u64::MAX, 0])),
+        "extract_series must preserve both unsigned samples: {series:?}"
+    );
+
     for view in [ChartView::Sparkline, ChartView::LineChart] {
         let mut app = crate::tui::tests::test_app();
         let returned = result.rows.len();
