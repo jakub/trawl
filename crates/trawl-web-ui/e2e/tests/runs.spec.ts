@@ -19,12 +19,24 @@ import {
   SCHEDULE,
 } from '../fixtures';
 import { SEL } from '../selectors';
+import type { Locator, Page } from '@playwright/test';
+import { readFile } from 'node:fs/promises';
 
 const sentenceFor = (runId: number) =>
   `report run ${runId} succeeded, but its stored result is unavailable; `
   + 'no older run was substituted';
 
 const SENTENCE = sentenceFor(SCHEDULE.pagedRunId);
+
+/** One named row of a run drawer's execution receipt, by its term. */
+const receiptOf = (page: Page, detail: Locator) => (name: string) =>
+  detail.locator('.receipt .fieldlist > div')
+    .filter({ has: page.getByText(name, { exact: true }) })
+    .locator('dd');
+
+/** The `tone_vocab::run_status_label` the title badge prints for a run
+ * the server says succeeded. */
+const SUCCEEDED = 'Succeeded';
 
 test('unavailable result names the run', async ({ page, request }) => {
   await resetScenario(request, 'schedule');
@@ -62,26 +74,113 @@ test('unavailable result names the run', async ({ page, request }) => {
 // The runs page mounts the same preview beside its own execution
 // receipt. The 409 carries no summary, so a receipt fed only by that
 // read would go blank exactly when the page has to say what the run
-// was — while the list the page already holds knows all of it.
+// was — while the list the page already holds knows all of it. The
+// list is a LOADED PAGE, though: reading on past the selected run has
+// to leave the drawer beside it intact.
 test('unavailable result keeps the receipt', async ({ page, request }) => {
   await resetScenario(request, 'corpus');
   await armRunUnavailable(request, CORPUS.runWithResult);
 
+  // Two pages over one complete wire record, so the selected run can be
+  // paged away from. The corpus list is two rows and cannot page.
+  const listed = JSON.parse(await readFile(`${__dirname}/../harness/wire/runs-all.json`, 'utf8')).runs[0];
+  await page.route('**/api/v1/runs?*', async route => {
+    if (new URL(route.request().url()).pathname !== '/api/v1/runs') {
+      await route.fallback();
+      return;
+    }
+    const response = await route.fetch();
+    const body = await response.json();
+    const offset = Number(new URL(route.request().url()).searchParams.get('offset'));
+    body.runs = offset === 0 ? [listed] : [{ ...listed, id: 999, net_id: 9, net_name: 'Other page' }];
+    body.total = 21;
+    await route.fulfill({ response, json: body });
+  });
+
   await page.goto(`/jobs/runs?run=${CORPUS.runWithResult}&net=${CORPUS.netId}`);
   const detail = page.locator(SEL.runDetail);
+  const field = receiptOf(page, detail);
   await expect(detail.locator(SEL.runUnavailable)).toHaveText(sentenceFor(CORPUS.runWithResult));
 
-  // `tone_vocab::run_status_label("success")`, which is what the title
-  // badge calls a run that finished.
-  await expect(detail.locator('.sd-ttl')).toContainText('Succeeded');
+  // The title badge speaks `tone_vocab`; the receipt prints the recorded
+  // status verbatim.
+  const filled = async () => {
+    await expect(detail.locator('.sd-ttl .bdg')).toHaveText(SUCCEEDED);
+    await expect(field('Outcome')).toHaveText('success');
+    await expect(field('Rows recorded')).toHaveText(String(CORPUS.runWithResultRows));
+    await expect(field('Query')).toHaveText(CORPUS.runWithResultQuery);
+    await expect(field('Duration')).not.toHaveText('—');
+  };
+  await filled();
 
-  // The receipt prints the recorded status verbatim; the badge above is
-  // where the reader-facing label lives.
-  const field = (name: string) => detail.locator('.receipt .fieldlist > div')
-    .filter({ has: page.getByText(name, { exact: true }) })
-    .locator('dd');
+  // Reading on: the run leaves the loaded page, and the drawer keeps the
+  // last listing it saw under this selection — the same retention the
+  // net name has always had.
+  const list = page.getByRole('region', { name: 'Recent runs table', exact: true });
+  await list.getByRole('button', { name: 'Next →', exact: true }).click();
+  await expect(page.locator('.runs-table')).toContainText('Other page');
+  await expect(page.locator('.runs-table')).not.toContainText(CORPUS.netName);
+  await filled();
+
+  await list.getByRole('button', { name: '← Prev', exact: true }).click();
+  await expect(page.locator('.runs-table')).toContainText(CORPUS.netName);
+  await filled();
+});
+
+// The list is a snapshot, and a row read while the run was still going
+// says `running`. The server answers this 409 only for a run whose query
+// SUCCEEDED and wrote a file it can no longer find, so pairing that row
+// with the refusal unreconciled would print "report run N succeeded,
+// but…" beside a Running badge. Until the read has answered at all, the
+// receipt has nothing confirmed to print and prints nothing.
+test('unavailable result reconciles a stale running row', async ({ page, request }) => {
+  await resetScenario(request, 'corpus');
+  await armRunUnavailable(request, CORPUS.runWithResult);
+
+  await page.route('**/api/v1/runs?*', async route => {
+    if (new URL(route.request().url()).pathname !== '/api/v1/runs') {
+      await route.fallback();
+      return;
+    }
+    const response = await route.fetch();
+    const body = await response.json();
+    const row = body.runs.find((run: { id: number }) => run.id === CORPUS.runWithResult);
+    row.status = 'running';
+    row.finished_at = null;
+    row.duration_ms = null;
+    row.row_count = null;
+    await route.fulfill({ response, json: body });
+  });
+
+  let reads = 0;
+  let release: (() => void) | undefined;
+  await page.route(`**/api/v1/saved/${CORPUS.netId}/runs/${CORPUS.runWithResult}`, async route => {
+    const response = await route.fetch();
+    reads++;
+    await new Promise<void>(resolve => { release = resolve; });
+    await route.fulfill({ response });
+  });
+
+  await page.goto(`/jobs/runs?run=${CORPUS.runWithResult}&net=${CORPUS.netId}`);
+  const detail = page.locator(SEL.runDetail);
+  const field = receiptOf(page, detail);
+
+  // The stale row is on screen and the run's own read is still open.
+  await expect(page.locator('.runs-table')).toContainText('Running');
+  await expect.poll(() => reads).toBeGreaterThan(0);
+  await expect(field('Outcome')).toHaveText('—');
+  await expect(field('Query')).toHaveText('—');
+  await expect(detail.locator('.sd-ttl .bdg')).toHaveCount(0);
+
+  release!();
+  await expect(detail.locator(SEL.runUnavailable)).toHaveText(sentenceFor(CORPUS.runWithResult));
+  const badge = detail.locator('.sd-ttl .bdg');
+  await expect(badge).toHaveText(SUCCEEDED);
+  await expect(badge).toHaveClass(/success/);
   await expect(field('Outcome')).toHaveText('success');
-  await expect(field('Rows recorded')).toHaveText(String(CORPUS.runWithResultRows));
+  // Only the outcome was stale. A run still going had recorded no
+  // duration and no rows, and the receipt does not invent either.
+  await expect(field('Duration')).toHaveText('—');
+  await expect(field('Rows recorded')).toHaveText('—');
   await expect(field('Query')).toHaveText(CORPUS.runWithResultQuery);
-  await expect(field('Duration')).not.toHaveText('—');
 });

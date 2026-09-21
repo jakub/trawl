@@ -412,10 +412,11 @@ fn RunDetail(
     /// The net's name off the list, which the run summary does not
     /// carry.
     net_name: Signal<Option<String>>,
-    /// The same run off the page's list. A run whose stored result file
-    /// is gone answers 409 (issue #227), which carries no summary at
-    /// all, and the receipt is about how the run went rather than about
-    /// what is left of it — so the list answers when the read cannot.
+    /// The same run off the page's list, for as long as the loaded page
+    /// still holds it. A run whose stored result file is gone answers
+    /// 409 (issue #227), which carries no summary at all, and the
+    /// receipt is about how the run went rather than about what is left
+    /// of it — so the list answers when the read cannot.
     listed: Signal<Option<trawl_api::ReportRunSummary>>,
     on_close: Callback<()>,
     on_search: Callback<String>,
@@ -427,15 +428,45 @@ fn RunDetail(
     // still going. Empty until that read lands, and permanently empty
     // when it answers the unavailable-result 409.
     let summary = RwSignal::new(None::<trawl_api::ReportRunSummary>);
-    // The fresh read wins while there is one: a running run's duration
-    // and row count move, and the list is a page old. `listed` only
-    // fills the gap.
-    let shown = Signal::derive(move || summary.get().or_else(|| listed.get()));
+    // Set by that same read once it has ANSWERED the 409. An empty
+    // `summary` alone cannot be read as a refusal: it is also what a
+    // read still in flight looks like, and falling back then would
+    // print the list's snapshot as if the server had confirmed it.
+    let unavailable = RwSignal::new(false);
 
-    // This memo lives under the selected identity's keyed owner. Paging
-    // away retains a correct name, but another selection cannot inherit it.
+    // These memos live under the selected identity's keyed owner. Paging
+    // the list away from the selected run retains a correct name and a
+    // correct listing, and no later selection can inherit either.
     let known_name = Memo::new(move |previous: Option<&Option<String>>| {
         net_name.get().or_else(|| previous.cloned().flatten())
+    });
+    let known_listing = Memo::new(
+        move |previous: Option<&Option<trawl_api::ReportRunSummary>>| {
+            listed.get().or_else(|| previous.cloned().flatten())
+        },
+    );
+    // The read wins whenever it has an answer: a running run's duration
+    // and row count move, and the list is a page old. It has no answer
+    // to give once it has refused, and only then does the list's own
+    // record of the run become the receipt — with the outcome corrected.
+    // The server answers this 409 only for a run whose query SUCCEEDED
+    // and wrote a result file it can no longer find
+    // (`from_saved::unavailable_run_conflict`), so a row snapshotted
+    // while the run was still going is stale about the outcome and about
+    // nothing else: its empty duration and row count are honest.
+    let shown = Signal::derive(move || {
+        if let Some(fresh) = summary.get() {
+            return Some(fresh);
+        }
+        if !unavailable.get() {
+            return None;
+        }
+        known_listing
+            .get()
+            .map(|listing| trawl_api::ReportRunSummary {
+                status: "success".to_owned(),
+                ..listing
+            })
     });
     let title = move || known_name.get().unwrap_or_else(|| format!("Run {run_id}"));
     let status = move || shown.get().map(|s| s.status);
@@ -477,6 +508,7 @@ fn RunDetail(
                     <RunResultPreview
                         active=Signal::stored(true)
                         summary=summary
+                        unavailable=unavailable
                         net_id=net_id
                         run_id=run_id
                         bus=bus

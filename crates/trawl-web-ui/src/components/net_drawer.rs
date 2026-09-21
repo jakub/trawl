@@ -1029,6 +1029,14 @@ enum RunPreview {
 pub(crate) fn RunResultPreview(
     active: Signal<bool>,
     summary: RwSignal<Option<trawl_api::ReportRunSummary>>,
+    /// Whether the last read answered the unavailable-result 409, which
+    /// leaves `summary` empty however long it waits. A receipt beside
+    /// this preview needs the verdict itself, because "not read yet"
+    /// and "read, and the stored result is gone" are the same empty
+    /// `summary` and call for opposite behaviour. The net drawer's rows
+    /// are list-fed already and leave it unset.
+    #[prop(optional)]
+    unavailable: Option<RwSignal<bool>>,
     net_id: i64,
     run_id: i64,
     bus: ToastBus,
@@ -1059,11 +1067,21 @@ pub(crate) fn RunResultPreview(
             ) {
                 terminal.set(true);
             }
+            // "Check again" can find a file that has come back, and the
+            // verdict has to be able to travel in that direction too.
+            if let Some(verdict) = unavailable {
+                verdict.set(false);
+            }
             summary.set(Some(response.summary));
         }
         // Nothing about a run this old changes on its own, so polling it
         // again would only repeat the sentence. The control below asks.
-        Some(Ok(RunPreview::Unavailable(_))) => terminal.set(true),
+        Some(Ok(RunPreview::Unavailable(_))) => {
+            if let Some(verdict) = unavailable {
+                verdict.set(true);
+            }
+            terminal.set(true);
+        }
         Some(Err(_)) | None => {}
     });
 
