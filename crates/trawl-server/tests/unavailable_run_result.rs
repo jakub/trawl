@@ -14,13 +14,15 @@
 
 mod common;
 
-use common::setup;
+use common::{seed_data_root, setup, setup_in_dir_with_data};
 use std::time::Duration;
 use trawl_client::{ClientError, HttpClient};
 
 mod unavailable_run_result {
     use super::common::{TestServer, app_pool};
-    use super::{ClientError, Duration, HttpClient, setup};
+    use super::{ClientError, Duration, HttpClient, seed_data_root, setup, setup_in_dir_with_data};
+    use trawl_server::config::RateLimitConfig;
+    use trawl_server::store::{RunClaim, RunStatus};
 
     /// Finished runs for a saved query, newest first.
     async fn finished_runs(
@@ -403,5 +405,155 @@ mod unavailable_run_result {
 
         // Restore, so the tempdir teardown is not fighting the mode.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    /// A `data_dir` the emitter's glob validator refuses.
+    ///
+    /// `[data] path` is operator configuration, and the config layer keeps a
+    /// directory with spaces verbatim
+    /// (`daemon_data_directory_is_preserved_and_drives_wal_location`). A
+    /// single selected run reads through a source the SERVER escapes, so the
+    /// glob validator's narrow alphabet never applies to it.
+    ///
+    /// Returns the server and its data root. The run is PLANTED rather than
+    /// triggered: an ordinary event query cannot run under this `data_dir`
+    /// at all (see the commit body's parked finding), so a real report run
+    /// here would record zero rows and no parquet file. What is under test
+    /// is the read of a stored result, and that is real: a real parquet file
+    /// at a real odd path, read by a real `DuckDB` through the real handler.
+    async fn server_on_odd_data_dir(leaf: &str) -> (TestServer, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        let seeded = seed_data_root(&root);
+        let data_dir = root.join(leaf);
+        std::fs::rename(&seeded, &data_dir).expect("rename the seeded data root");
+        let server = setup_in_dir_with_data(
+            &root,
+            data_dir.to_str().expect("utf-8 path").to_owned(),
+            RateLimitConfig::default(),
+        )
+        .await;
+        std::mem::forget(tmp); // outlives the server; the OS cleans up
+        (server, data_dir)
+    }
+
+    /// Plant a successful run carrying a real three-row parquet file, and
+    /// return its id and that file's absolute path.
+    async fn plant_run(
+        server: &TestServer,
+        data_dir: &std::path::Path,
+        saved_id: i64,
+        query: &str,
+    ) -> (i64, std::path::PathBuf) {
+        let pool = app_pool(&server.app_db_url).await;
+        let schedule_id: i64 =
+            sqlx::query_scalar("SELECT id FROM schedules WHERE saved_query_id = $1")
+                .bind(saved_id)
+                .fetch_one(&pool)
+                .await
+                .expect("the schedule the API just attached");
+
+        let store = &server.state.storage.schedule;
+        let run_id = match store
+            .claim_run(schedule_id, saved_id, query, None, None)
+            .await
+            .expect("claim a run")
+        {
+            RunClaim::Started(id) => id,
+            other => panic!("expected a started run, got {other:?}"),
+        };
+
+        let relative = format!("scheduled/run_{run_id}.parquet");
+        let full = data_dir.join(&relative);
+        std::fs::create_dir_all(full.parent().expect("a parent")).expect("mkdir scheduled");
+        duckdb::Connection::open_in_memory()
+            .expect("duckdb")
+            .execute_batch(&format!(
+                "COPY (SELECT * FROM (VALUES (1, 'a'), (2, 'b'), (3, 'c')) t(n, msg)) \
+                 TO '{}' (FORMAT PARQUET)",
+                full.display().to_string().replace('\'', "''")
+            ))
+            .expect("write the run's parquet result");
+
+        store
+            .finish_run(
+                run_id,
+                RunStatus::Success,
+                5,
+                Some(3),
+                None,
+                None,
+                Some(&relative),
+            )
+            .await
+            .expect("finish the run");
+        (run_id, full)
+    }
+
+    /// The whole read path over an odd `data_dir`: the stored run reads, and
+    /// once its file is gone both single-run selectors answer the 409 —
+    /// which, unlike the 400 a rejected path produced, carries no path.
+    async fn reads_under_odd_data_dir(leaf: &str, net: &str) {
+        let (server, data_dir) = server_on_odd_data_dir(leaf).await;
+        let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+        let saved = client
+            .create_saved(net, "service=nginx | table service")
+            .await
+            .expect("create the net");
+        client
+            .set_schedule(saved.id, "1h", None, true, None, None)
+            .await
+            .expect("attach a schedule");
+        let (run_id, file) = plant_run(&server, &data_dir, saved.id, "service=nginx").await;
+
+        for dsl in [
+            format!("| from saved {net} run={run_id} | stats count()"),
+            format!("| from saved {net} run=latest | stats count()"),
+        ] {
+            let counted = client
+                .query_paginated(&dsl, None, None)
+                .await
+                .unwrap_or_else(|e| panic!("{dsl} over {} failed: {e}", data_dir.display()));
+            assert_eq!(
+                counted.result.rows[0][0].to_string(),
+                "3",
+                "{dsl}: {:?}",
+                counted.result
+            );
+        }
+        let listed = client
+            .query_paginated(
+                &format!("| from saved {net} run={run_id} | table msg"),
+                None,
+                None,
+            )
+            .await
+            .expect("the rows themselves read too");
+        assert_eq!(listed.result.rows.len(), 3, "{:?}", listed.result);
+
+        std::fs::remove_file(&file).expect("delete the stored result");
+
+        for dsl in [
+            format!("| from saved {net} run={run_id} | stats count()"),
+            format!("| from saved {net} run=latest | stats count()"),
+        ] {
+            assert_unavailable(
+                refusal(client.query_paginated(&dsl, None, None).await),
+                run_id,
+            );
+        }
+        assert_unavailable(
+            refusal(client.get_report_run(saved.id, run_id).await),
+            run_id,
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn single_run_reads_under_a_spaced_data_dir() {
+        reads_under_odd_data_dir("data with spaces", "spaced_net").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn single_run_reads_under_a_unicode_data_dir() {
+        reads_under_odd_data_dir("données", "unicode_net").await;
     }
 }

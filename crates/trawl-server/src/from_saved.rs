@@ -98,7 +98,7 @@ pub(crate) fn unavailable_run_conflict(files: &[RunFile]) -> Option<ServerError>
 pub(crate) fn run_file(run_id: i64, data_dir: &str, result_path: &str) -> RunFile {
     RunFile {
         run_id,
-        absolute_path: PathBuf::from(run_source_path(data_dir, result_path)),
+        absolute_path: PathBuf::from(result_file_path(data_dir, result_path)),
     }
 }
 
@@ -182,7 +182,7 @@ async fn source_for_run(
 ) -> Result<(String, Option<RunFile>), ServerError> {
     if let Some(ref result_path) = run.result_path {
         let file = run_file(run.id, data_dir, result_path);
-        let source = run_source_path(data_dir, result_path);
+        let source = run_source(data_dir, result_path);
         return Ok((source, Some(file)));
     }
 
@@ -351,24 +351,40 @@ fn empty_typed_source(columns: &[trawl_api::value::Column]) -> String {
 
 /// Resolve a run's stored `result_path` against `data_dir`.
 ///
-/// `result_path` is relative to `data_dir` (e.g. `scheduled/run_42.parquet`),
-/// and this is the source a SINGLE selected run resolves to: a plain path,
-/// which the emitter turns into `read_parquet('…', union_by_name=true)`
-/// itself. Handing the emitter a built reader instead makes it treat the
-/// whole expression as a path and refuse the quotes and parentheses in it,
-/// so `run=N` and `run=latest` never reach `DuckDB` at all.
-fn run_source_path(data_dir: &str, result_path: &str) -> String {
+/// `result_path` is relative to `data_dir` (e.g. `scheduled/run_42.parquet`).
+/// The join is all this does: escaping belongs to whoever puts the path in
+/// SQL ([`parquet_source`]), and the filesystem wants it unescaped
+/// ([`RunFile::absolute_path`]).
+fn result_file_path(data_dir: &str, result_path: &str) -> String {
     format!("{}/{result_path}", data_dir.trim_end_matches('/'))
 }
 
-/// Build a `read_parquet()` expression for one member of a `run=all` union.
+/// Build a `read_parquet()` expression for one run's result file.
 ///
-/// The union is raw SQL the emitter passes through verbatim, so its branches
-/// carry their own readers — unlike the single-run source above, which the
-/// emitter builds.
+/// The one place a stored result path becomes SQL, so there is one escaping
+/// rule for it: single quotes doubled, the SQL string literal escape, and
+/// nothing else. `data_dir` is operator configuration and may hold spaces or
+/// non-ASCII characters (`daemon_data_directory_is_preserved_and_drives_wal_location`
+/// configures `/data with spaces`), which is exactly what an escape is for.
 fn parquet_source(data_dir: &str, result_path: &str) -> String {
-    let safe_path = run_source_path(data_dir, result_path).replace('\'', "''");
+    let safe_path = result_file_path(data_dir, result_path).replace('\'', "''");
     format!("read_parquet('{safe_path}', union_by_name=true)")
+}
+
+/// The source a SINGLE selected run resolves to.
+///
+/// A parenthesised subquery, the shape `resolve_all`'s union and
+/// [`empty_typed_source`] already resolve to. [`trawl_core::emitter`] passes
+/// a `(`-prefixed source through untouched by design, because the server
+/// built it and owns its escaping; everything else it treats as a path and
+/// sends through `validate_source_path`. That validator exists for the
+/// server-minted EVENT globs, whose alphabet is deliberately narrow, and it
+/// refuses a space or a non-ASCII character on sight — so a bare path here
+/// would make `run=N` and `run=latest` answer 400 under any `data_dir` an
+/// operator is allowed to configure, with the whole internal path in the
+/// message.
+fn run_source(data_dir: &str, result_path: &str) -> String {
+    format!("(SELECT * FROM {})", parquet_source(data_dir, result_path))
 }
 
 #[cfg(test)]
@@ -452,20 +468,66 @@ mod tests {
         );
     }
 
-    /// A single run's source is the PATH, not a built reader: the emitter
-    /// builds the reader, and handing it one instead makes it validate the
-    /// whole expression as a path and refuse the quotes in it.
+    /// A single run resolves to a subquery the server escaped, not to a
+    /// path the emitter has to validate. The emitter's path validator is
+    /// for event globs: it refuses a space or a non-ASCII character, both
+    /// of which a configured `data_dir` may contain.
     #[test]
-    fn run_source_path_is_a_bare_path() {
+    fn run_source_is_an_escaped_subquery() {
         assert_eq!(
-            run_source_path("/var/lib/trawl/data/", "scheduled/run_42.parquet"),
-            "/var/lib/trawl/data/scheduled/run_42.parquet"
+            run_source("/var/lib/trawl/data/", "scheduled/run_42.parquet"),
+            "(SELECT * FROM read_parquet('/var/lib/trawl/data/scheduled/run_42.parquet', \
+             union_by_name=true))"
         );
-        trawl_core::emitter::validate_source_path(&run_source_path(
-            "/var/lib/trawl/data",
-            "scheduled/run_42.parquet",
+        // A quote in the path is doubled, the SQL string literal escape.
+        assert_eq!(
+            run_source("/data", "scheduled/it's/run.parquet"),
+            "(SELECT * FROM read_parquet('/data/scheduled/it''s/run.parquet', \
+             union_by_name=true))"
+        );
+        // A configured data_dir the glob validator refuses still resolves.
+        for odd in ["/data with spaces", "/données", "/データ"] {
+            let source = run_source(odd, "scheduled/run_42.parquet");
+            assert!(source.starts_with('('), "{source}");
+            assert!(
+                trawl_core::emitter::validate_source_path(odd).is_err(),
+                "this test is pointless if the glob validator accepts {odd}"
+            );
+        }
+        // The filesystem gets the path unescaped, quote and all.
+        assert_eq!(
+            result_file_path("/data", "scheduled/it's/run.parquet"),
+            "/data/scheduled/it's/run.parquet"
+        );
+    }
+
+    /// The subquery is a source `DuckDB` actually reads, over a directory
+    /// whose name the glob validator would refuse.
+    #[test]
+    fn run_source_reads_a_file_under_an_odd_data_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("données et data with spaces");
+        std::fs::create_dir_all(data_dir.join("scheduled")).unwrap();
+        let full = data_dir.join("scheduled/run_1.parquet");
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT 7::BIGINT AS n) TO '{}' (FORMAT PARQUET)",
+            full.display()
         ))
-        .expect("the emitter must accept what a single run resolves to");
+        .unwrap();
+
+        let source = run_source(data_dir.to_str().unwrap(), "scheduled/run_1.parquet");
+        let counted = trawl_engine::executor::Executor::new()
+            .unwrap()
+            .run_query(
+                "* | stats count()",
+                &source,
+                &trawl_core::schema::FieldTypes::new(),
+                100,
+                0,
+            )
+            .expect("the emitter accepts the subquery and DuckDB reads the file");
+        assert_eq!(counted.rows[0][0].to_string(), "1");
     }
 
     /// Only a file that is NOT THERE is the unavailable answer, and the
@@ -649,7 +711,7 @@ mod pg_tests {
     use trawl_core::ast::{FromSavedStage, SavedRunSelector};
 
     use super::{
-        ResolvedFromSaved, resolve, resolve_all, resolve_latest, resolve_specific, run_source_path,
+        ResolvedFromSaved, resolve, resolve_all, resolve_latest, resolve_specific, run_source,
     };
     use crate::error::ServerError;
     use crate::store::{RunClaim, RunStatus, SavedQueryStore, ScheduleStore};
@@ -789,7 +851,7 @@ mod pg_tests {
             .await
             .unwrap();
         // Newest wins (started_at DESC, id DESC).
-        assert_eq!(source, run_source_path("/data", "p/run_2.parquet"));
+        assert_eq!(source, run_source("/data", "p/run_2.parquet"));
         assert_eq!(files.len(), 1);
         assert_eq!(
             files[0].absolute_path,
@@ -993,7 +1055,7 @@ mod pg_tests {
         let (source, files) = resolve_specific(&sched_store, rid, 1, "/data")
             .await
             .unwrap();
-        assert_eq!(source, run_source_path("/data", "p/run_7.parquet"));
+        assert_eq!(source, run_source("/data", "p/run_7.parquet"));
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].run_id, rid);
     }
@@ -1290,7 +1352,7 @@ mod pg_tests {
         .unwrap();
         assert_eq!(
             resolved.source,
-            run_source_path("/data", "scheduled/legacy/run_1.parquet")
+            run_source("/data", "scheduled/legacy/run_1.parquet")
         );
         assert_eq!(resolved.remaining_dsl, "* | head 1");
         assert!(
@@ -1339,7 +1401,7 @@ mod pg_tests {
         )
         .await
         .unwrap();
-        assert_eq!(source, run_source_path("/data", "p/run_1.parquet"));
+        assert_eq!(source, run_source("/data", "p/run_1.parquet"));
         assert_eq!(remaining_dsl, "* | stats count() by host");
 
         // No trailing pipeline collapses to a bare `*`.
