@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use crate::value::{QueryResult, Value};
+use crate::value::{QueryResult, Value, is_landed_integer};
 
 /// Convert a [`Value`] to a string for display.
 ///
@@ -74,14 +74,34 @@ pub fn downsample(values: &[u64], target_width: usize) -> Vec<u64> {
 ///
 /// Negative numbers clamp to 0; strings are parsed as floats (best
 /// effort); nulls, booleans, and arrays return 0.
+///
+/// A landed integer ([`is_landed_integer`]) reads back through `i128`
+/// rather than `f64`, so every magnitude a `u64` can hold plots exactly.
+/// A `HUGEINT` beyond that clamps to the top of the axis: the chart's own
+/// cell is a `u64`, and a bar's height is a pixel, not an answer — the
+/// exact digits still reach the results table.
 #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 fn value_to_u64(value: &Value) -> u64 {
     match value {
         Value::Integer(i) => (*i).max(0) as u64,
         Value::Float(f) => f.max(0.0) as u64,
+        Value::String(s) if is_landed_integer(s) => {
+            u64::try_from(s.parse::<i128>().unwrap_or(0).max(0)).unwrap_or(u64::MAX)
+        }
         Value::String(s) => s.parse::<f64>().unwrap_or(0.0).max(0.0) as u64,
         _ => 0,
     }
+}
+
+/// Whether a cell reads as a group label rather than a measurement.
+///
+/// Text is a label, with one exception: [`land_u64`](crate::value::land_u64)
+/// and [`land_i128`](crate::value::land_i128) spell a magnitude past
+/// `i64::MAX` as exact digits, so a measurement column can hold a string.
+/// Read as a label it names the whole chart after that one number and
+/// drops every other metric — a plausible chart of the wrong thing.
+fn is_group_label(cell: Option<&Value>) -> bool {
+    matches!(cell, Some(Value::String(s)) if !is_landed_integer(s))
 }
 
 /// Extract `(label, values)` tuples from a timechart [`QueryResult`].
@@ -92,6 +112,10 @@ fn value_to_u64(value: &Value) -> u64 {
 ///   distinct group label
 /// - **Multi-agg**: `[_time, metric_a, metric_b, ...]` (all numeric) →
 ///   one series per metric column
+///
+/// "Numeric" includes a cell that landed as exact digits because no
+/// integer variant could hold it ([`is_landed_integer`]); a digit string
+/// inside `i64` range is a label like any other text.
 ///
 /// Series are capped to the top 6 by total value, then sorted
 /// alphabetically by label for stable rendering. Returns
@@ -126,12 +150,7 @@ pub fn extract_series(result: &QueryResult) -> (Vec<(String, Vec<u64>)>, usize) 
         let string_cols: Vec<usize> = other_cols
             .iter()
             .copied()
-            .filter(|&i| {
-                result
-                    .rows
-                    .iter()
-                    .any(|row| matches!(row.get(i), Some(Value::String(_))))
-            })
+            .filter(|&i| result.rows.iter().any(|row| is_group_label(row.get(i))))
             .collect();
         let numeric_cols: Vec<usize> = other_cols
             .iter()
@@ -190,6 +209,83 @@ pub fn extract_series(result: &QueryResult) -> (Vec<(String, Vec<u64>)>, usize) 
             (vec![], 0)
         }
     }
+}
+
+/// A metric that landed as exact digits is still a metric.
+///
+/// `| timechart first(request_id), count()` over a `request_id` past
+/// `i64::MAX` puts a [`Value::String`] in a measurement column. Read as a
+/// label it collapses the whole chart into one series named after the
+/// number, and the second metric disappears entirely — the reader sees a
+/// plausible chart of the wrong thing.
+#[cfg(test)]
+#[test]
+fn landed_integer_metric_is_not_a_group() {
+    let result = QueryResult {
+        columns: vec![
+            crate::value::Column {
+                name: "_time".to_owned(),
+            },
+            crate::value::Column {
+                name: "first_request_id".to_owned(),
+            },
+            crate::value::Column {
+                name: "count".to_owned(),
+            },
+        ],
+        rows: vec![vec![
+            Value::String("2026-01-01 00:00:00".to_owned()),
+            crate::value::land_u64(u64::MAX),
+            Value::Integer(1),
+        ]],
+    };
+
+    let (series, total) = extract_series(&result);
+    assert_eq!(total, 2, "both measurement columns must chart");
+    let labels: Vec<&str> = series.iter().map(|s| s.0.as_str()).collect();
+    assert_eq!(labels, vec!["count", "first_request_id"]);
+    assert_eq!(series[0].1, vec![1]);
+    assert_eq!(series[1].1, vec![u64::MAX]);
+}
+
+/// A digit string that fits `i64` is a genuine label, not a measurement.
+///
+/// The landing rule only ever produces digits no `Value::Integer` could
+/// hold, so an in-range one — a `VARCHAR` status code, a string user id —
+/// arrived as text and must keep grouping the chart.
+#[cfg(test)]
+#[test]
+fn digit_string_label_stays_a_group() {
+    let result = QueryResult {
+        columns: vec![
+            crate::value::Column {
+                name: "_time".to_owned(),
+            },
+            crate::value::Column {
+                name: "status".to_owned(),
+            },
+            crate::value::Column {
+                name: "count".to_owned(),
+            },
+        ],
+        rows: vec![
+            vec![
+                Value::String("2026-01-01 00:00:00".to_owned()),
+                Value::String("404".to_owned()),
+                Value::Integer(7),
+            ],
+            vec![
+                Value::String("2026-01-01 00:05:00".to_owned()),
+                Value::String("404".to_owned()),
+                Value::Integer(9),
+            ],
+        ],
+    };
+
+    let (series, total) = extract_series(&result);
+    assert_eq!(total, 1, "the grouped branch must still select");
+    assert_eq!(series[0].0, "404");
+    assert_eq!(series[0].1, vec![7, 9]);
 }
 
 #[cfg(test)]

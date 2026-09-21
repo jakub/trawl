@@ -59,6 +59,21 @@ pub fn land_i128(v: i128) -> Value {
     i64::try_from(v).map_or_else(|_| Value::String(v.to_string()), Value::Integer)
 }
 
+/// Whether `s` is a decimal integer the landing rule produced, rather than
+/// text a reader wrote.
+///
+/// True only when the digits parse as an `i128` **and** that value does
+/// not fit an `i64`. An integer inside `i64` range always arrives as
+/// [`Value::Integer`], so a digit string in range can only be a genuine
+/// `VARCHAR` — a status code, a string user id — and must keep reading as
+/// text. Ask this before classifying a cell as a label or a measurement:
+/// [`land_u64`] and [`land_i128`] are the only producers of the other
+/// case, and their output is a number that lost its variant, not a name.
+#[must_use]
+pub fn is_landed_integer(s: &str) -> bool {
+    s.parse::<i128>().is_ok_and(|v| i64::try_from(v).is_err())
+}
+
 impl Serialize for Value {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
@@ -397,6 +412,31 @@ pub struct ParquetColumnStats {
     pub max_value: Option<String>,
     /// Total compressed size in bytes.
     pub compressed_bytes: u64,
+}
+
+/// The predicate admits exactly what the landing rule emits, and nothing
+/// a reader could have typed into a `VARCHAR`.
+#[cfg(test)]
+#[test]
+fn is_landed_integer_bounds() {
+    // Only the landing rule can produce these.
+    assert!(is_landed_integer("9223372036854775808"));
+    assert!(is_landed_integer("18446744073709551615"));
+    assert!(is_landed_integer("-9223372036854775809"));
+
+    // In-range digits arrived as `Value::Integer`, so a string holding
+    // them is text the reader stored.
+    assert!(!is_landed_integer("404"));
+    assert!(!is_landed_integer("-5"));
+    assert!(!is_landed_integer("0"));
+    assert!(!is_landed_integer("9223372036854775807"));
+    assert!(!is_landed_integer("-9223372036854775808"));
+
+    // Not a decimal integer at all.
+    assert!(!is_landed_integer("12abc"));
+    assert!(!is_landed_integer(""));
+    assert!(!is_landed_integer("1.8446744073709552e19"));
+    assert!(!is_landed_integer(" 9223372036854775808"));
 }
 
 /// A magnitude past `i64::MAX` reaches a reader as its exact digits, from
