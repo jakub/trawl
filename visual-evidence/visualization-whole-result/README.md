@@ -129,13 +129,27 @@ Two instances are needed, one per revision, and each capture must run against a
 freshly held instance: the seed is not idempotent, and a second capture against
 the same instance would double every count.
 
-Create a worktree at the revision, then hold an instance from it:
+Create a worktree at the revision, then hold an instance from it. Export the
+build directory once: the runner, the key-minting step and the capture all
+read it.
 
 ```bash
+export CARGO_TARGET_DIR=/path/to/a/disk-backed/cache
 git -C /path/to/trawl worktree add --detach /path/to/wt 9ed451cc   # or c1e82824
 cd /path/to/wt
-CARGO_TARGET_DIR=/path/to/a/disk-backed/cache \
-  bin/app-experiment --events 20 --batch-size 10 --rate 20 --hold-seconds 1200
+bin/app-experiment --events 20 --batch-size 10 --rate 20 --hold-seconds 1200
+```
+
+At `9ed451cc` the runner cannot reach its hold: its live-tail phase clicks
+`.rt-hint button`, which the range dialog no longer renders there, and the
+uncaught timeout ends the run before the hold. The `before` capture used the
+runner from `c1e82824`, which differs from `9ed451cc` only in that selector
+(`scripts/app-experiment/run.mjs`). Copy it into the base worktree before
+starting the runner; the product under test is unchanged by it:
+
+```bash
+git -C /path/to/trawl show c1e82824:scripts/app-experiment/run.mjs \
+  > /path/to/wt/scripts/app-experiment/run.mjs
 ```
 
 The runner prints the browser origin and the path of `private/browser-key`. It
