@@ -690,7 +690,7 @@ timechart span=1h count() by service
 | from saved daily_errors run=all | timechart on _run_time span=1h sum(count)
 ```
 
-The bucket column is always named `_time`, and rows come back in bucket order. The buckets are cut from `_time` unless `on` names another column. That column must already be a `TIMESTAMP`, because trawl buckets it as stored and refuses a column of any other type. A `DATE` column is refused too: cast it to a timestamp first, or bucket the event time with `span=1d` instead. Without `span=`, trawl derives the bucket from the `last=` window.
+The bucket column is always named `_time`, and rows come back in bucket order. The buckets are cut from `_time` unless `on` names another column. That column must already be a `TIMESTAMP`, because trawl buckets it as stored and refuses a column of any other type. A `DATE` column is refused too: cast it to a timestamp first, or bucket the event time with `span=1d` instead. `on` with a column other than `_time` is a batch-lane feature: the live stream and the `extract kv` tail refuse it, naming the column. Without `span=`, trawl derives the bucket from the `last=` window.
 
 | `last=` window | Bucket |
 | --- | --- |
@@ -1042,7 +1042,8 @@ Four lanes answer a query: batch SQL, the live stream (SSE), the kv batch tail b
 | Stage | Live stream | kv batch tail |
 | --- | --- | --- |
 | `where`, `let`, `table`, `fields`, `drop`, `rename`, `limit`, `head`, `tail`, `dedup`, `extract` | Supported | Supported |
-| `stats`, `timechart`, `top`, `rare` | One aggregation stage per query | Supported |
+| `stats`, `top`, `rare` | One aggregation stage per query | Supported |
+| `timechart` | One aggregation stage per query. `on` a column other than `_time` is refused. | Supported, except `on` a column other than `_time` |
 | `sort` | Refused: `contradicts real-time arrival order` | Supported |
 | `pivot` | Refused: `dynamic column structure breaks progressive rendering` | Refused |
 | `sample` | Refused: `statistical sampling requires the full dataset` | Refused |

@@ -1444,8 +1444,12 @@ fn compile_aggregation(stage: &PipeStage) -> Result<CompiledAggregation, StreamP
             if let Some(col) = s.on.as_deref().filter(|c| !crate::schema::is_event_time(c)) {
                 return Err(StreamPlanError::UnsupportedStage {
                     stage: "timechart".to_string(),
+                    // `UnsupportedStage`'s Display already opens with
+                    // "timechart is not supported in streaming mode:", so
+                    // the reason says where and why, not that again.
                     reason: format!(
-                        "bucketing on '{col}' is not supported in streaming mode;                          only _time can be bucketed live"
+                        "bucketing on '{col}' is not supported here; \
+                         only _time can be bucketed live"
                     ),
                 });
             }
@@ -1924,11 +1928,12 @@ fn timechart_on_refused_in_live_lane() {
     )
     .expect_err("a bucket column other than _time has no live meaning")
     .to_string();
-    assert!(
-        refusal.contains("timechart")
-            && refusal.contains("'hostname'")
-            && refusal.contains("streaming mode"),
-        "the refusal must name the stage, the column and the lane: {refusal}"
+    // Pinned whole: a `contains` on one fragment hides both a doubled
+    // clause and a run of stray spaces inside the sentence.
+    assert_eq!(
+        refusal,
+        "timechart is not supported in streaming mode: bucketing on 'hostname' \
+         is not supported here; only _time can be bucketed live"
     );
 
     for spelling in ["_time", "_TIME", "_Time"] {

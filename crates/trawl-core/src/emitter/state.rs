@@ -164,6 +164,13 @@ pub(crate) enum RawBinding {
 ///
 /// `DuckDB`'s `read_parquet()`/`read_json_auto()` don't support parameterized
 /// paths, so the path must be sanitized before interpolation into SQL.
+///
+/// The refusals say what is wrong and nothing about where. The path is
+/// server-minted and embeds `data_dir`, so a daemon whose data directory
+/// holds a space or a non-ASCII byte would otherwise hand its own absolute
+/// filesystem layout back to any `Query` holder in a 400. The path goes to
+/// the operator's log at `debug` instead, which is where the answer to
+/// "which path" belongs.
 pub fn validate_source_path(source: &str) -> Result<(), super::EmitError> {
     if source.is_empty() {
         return Err(super::EmitError::UnsupportedOperation {
@@ -174,16 +181,43 @@ pub fn validate_source_path(source: &str) -> Result<(), super::EmitError> {
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || b"/_.*?{}[]-".contains(&b))
     {
+        tracing::debug!(source, "source path contains invalid characters");
         return Err(super::EmitError::UnsupportedOperation {
-            message: format!("source path contains invalid characters: {source}"),
+            message: "source path contains invalid characters".to_string(),
         });
     }
     if source.split('/').any(|component| component == "..") {
+        tracing::debug!(source, "source path contains path traversal");
         return Err(super::EmitError::UnsupportedOperation {
-            message: format!("source path contains path traversal: {source}"),
+            message: "source path contains path traversal".to_string(),
         });
     }
     Ok(())
+}
+
+/// A refused source path never travels in the refusal.
+///
+/// Both arms are reachable from a plain `Query` holder on a daemon whose
+/// `data_dir` carries a space or a non-ASCII byte, and the path they are
+/// handed is the server-minted glob with that directory inside it. No `/`
+/// in either message is the cheap whole-class check: the leak was an
+/// absolute path, and an absolute path cannot hide from it.
+#[cfg(test)]
+#[test]
+fn source_path_errors_carry_no_path() {
+    for source in [
+        "/var/lib/trawl data/logs/*.parquet",
+        "/var/lib/trawl/../etc",
+    ] {
+        let message = match validate_source_path(source) {
+            Err(super::EmitError::UnsupportedOperation { message }) => message,
+            other => panic!("expected a refusal for {source}, got {other:?}"),
+        };
+        assert!(
+            !message.contains('/'),
+            "the refusal must not carry the path: {message}"
+        );
+    }
 }
 
 /// Validate a list-format source for `read_parquet()`.
