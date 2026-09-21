@@ -288,3 +288,72 @@ test('unavailable result keeps the expanded row after the list moves on', async 
   await expect(page.locator(SEL.netRunRow)).toHaveCount(3);
   await expect(preview.locator(SEL.runUnavailable)).toHaveText(SENTENCE);
 });
+
+// The same row, reached the other way round: expanded while the run was
+// STILL GOING, so both the list and the first read say `running`. The
+// list then moves past it and the next read answers the 409 — and the
+// row, now living on the last summary the drawer saw, has to take the
+// outcome that refusal settles rather than keep printing Running.
+test('unavailable result settles the expanded row of a running run', async ({ page, request }) => {
+  await resetScenario(request, 'schedule');
+  await armRunUnavailable(request, SCHEDULE.pagedRunId);
+  await page.clock.install();
+
+  let lists = 0;
+  let listed = true;
+  await page.route(`**/api/v1/saved/${SCHEDULE.windowedNetId}/runs?*`, async route => {
+    if (new URL(route.request().url()).pathname !== `/api/v1/saved/${SCHEDULE.windowedNetId}/runs`) {
+      await route.fallback();
+      return;
+    }
+    const response = await route.fetch();
+    const body = await response.json();
+    lists++;
+    body.runs = listed
+      ? body.runs.map((run: { id: number; status: string; finished_at: unknown; duration_ms: unknown; row_count: unknown }) =>
+          run.id === SCHEDULE.pagedRunId
+            ? { ...run, status: 'running', finished_at: null, duration_ms: null, row_count: null }
+            : run)
+      : body.runs.filter((run: { id: number }) => run.id !== SCHEDULE.pagedRunId);
+    await route.fulfill({ response, json: body });
+  });
+
+  // Hit one is the run still going; from hit two the harness's own armed
+  // 409 answers.
+  const running = JSON.parse(await readFile(`${__dirname}/../harness/wire/run-result-paged.json`, 'utf8'));
+  running.status = 'running';
+  running.finished_at = null;
+  running.duration_ms = null;
+  running.row_count = null;
+  delete running.result;
+  let reads = 0;
+  await page.route(`**/api/v1/saved/${SCHEDULE.windowedNetId}/runs/${SCHEDULE.pagedRunId}`, async route => {
+    reads++;
+    if (reads === 1) {
+      await route.fulfill({ json: running });
+      return;
+    }
+    await route.fulfill({ response: await route.fetch() });
+  });
+
+  await page.goto(`/jobs/nets?net=${SCHEDULE.windowedNetId}&ntab=runs`);
+  await page.locator(SEL.netRunRow).first().locator(SEL.rowStretch).click();
+  // Whichever row is open, wherever the list has since put it.
+  const row = page.locator(SEL.netRunRow).filter({ has: page.locator('[aria-expanded="true"]') });
+  await expect(row.locator('td').nth(1)).toHaveText('Running');
+  // The FIRST read has to have landed and been rendered before the clock
+  // moves: the poll below skips a tick while a read is still in flight,
+  // and the row's cell above is the list's word, not the read's.
+  await expect(page.locator(SEL.netRunPreview))
+    .toContainText('No result data (error or still running)');
+
+  listed = false;
+  const before = lists;
+  // Two periods, so neither poll can land on the far edge of the jump.
+  await page.clock.fastForward(11_000);
+  await expect.poll(() => lists).toBeGreaterThan(before);
+  await expect.poll(() => reads).toBeGreaterThan(1);
+  await expect(page.locator(SEL.netRunPreview).locator(SEL.runUnavailable)).toHaveText(SENTENCE);
+  await expect(page.getByText('Expanded run outside this page')).toHaveCount(1);
+  await expect(row.locator('td').nth(1)).toHaveText(SUCCEEDED);
+});

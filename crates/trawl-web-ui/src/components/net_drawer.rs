@@ -912,7 +912,7 @@ fn RunsPane(
         }
     });
 
-    // The last summary SEEN for the expanded run, which is not the same
+    // The summary the expanded run's row shows, which is not the same
     // as the last read: a 409 answers with none, and this table needs
     // one whatever the read said. It is what holds the row on screen
     // after the list has moved past the run — the `For` below re-adds
@@ -921,19 +921,23 @@ fn RunsPane(
     // having lost its result file.
     //
     // Keyed on the expansion: collapsing drops it, and no later
-    // expansion can inherit it.
+    // expansion can inherit it. `expanded_read` belongs to the current
+    // expansion too — the control below clears it as it toggles — so
+    // the read needs no identity check of its own here.
     let expanded_summary = Memo::new(
         move |previous: Option<&Option<trawl_api::ReportRunSummary>>| {
             let expanded = expanded_run.get()?;
-            if let Some(RunRead::Available(summary)) = expanded_read.get()
-                && summary.id == expanded
-            {
-                return Some(summary);
-            }
-            runs.get()
+            // What the list says about the run now, or failing that the
+            // last thing this table held for it.
+            let held = runs
+                .get()
                 .and_then(Result::ok)
                 .and_then(|(_, r)| r.runs.into_iter().find(|r| r.id == expanded))
-                .or_else(|| previous.cloned().flatten().filter(|s| s.id == expanded))
+                .or_else(|| previous.cloned().flatten().filter(|s| s.id == expanded));
+            match expanded_read.get() {
+                Some(read) => read.settle(held),
+                None => held,
+            }
         },
     );
 
@@ -996,6 +1000,11 @@ fn RunsPane(
                                 <td class="mono"><button type="button" class="row-stretch"
                                     aria-expanded=move || is_expanded().to_string()
                                     on:click=move |_| {
+                                        // The read belongs to the expansion it
+                                        // was made under. Clearing it here is
+                                        // what lets the memo above trust it
+                                        // without re-checking whose run it was.
+                                        expanded_read.set(None);
                                         expanded_run.update(|v| *v = if *v == Some(run_id) { None } else { Some(run_id) });
                                     }
                                 >{move || time_ago(&run.get().started_at, now.get())}</button>
@@ -1035,23 +1044,7 @@ fn RunsPane(
 /// replaces it through successes, and this state must replace: a preview
 /// still showing rows the server has just said it cannot serve would be the
 /// same lie in a slower form.
-/// What the last read of a stored run said, for a caller that shows
-/// something of its own beside the preview.
-///
-/// `None` in the signal that carries it means NO read has landed yet,
-/// which is a third state and not a quiet [`Self::Unavailable`]: a
-/// caller that cannot tell the two apart either prints its own guess as
-/// though the server had confirmed it, or prints nothing once the
-/// server has spoken. [`Self::Unavailable`] carries no summary because
-/// the 409 has none to give, and what belongs in its place is the
-/// caller's question rather than this component's.
-#[derive(Clone, PartialEq)]
-pub(crate) enum RunRead {
-    /// The summary that read returned.
-    Available(trawl_api::ReportRunSummary),
-    /// The run succeeded and its stored result is gone (issue #227).
-    Unavailable,
-}
+use crate::run_read::RunRead;
 
 #[derive(Clone)]
 enum RunPreview {
@@ -1106,7 +1099,7 @@ pub(crate) fn RunResultPreview(
             ) {
                 terminal.set(true);
             }
-            read.set(Some(RunRead::Available(response.summary)));
+            read.set(Some(RunRead::Available(Box::new(response.summary))));
         }
         // Nothing about a run this old changes on its own, so polling it
         // again would only repeat the sentence. The control below asks.

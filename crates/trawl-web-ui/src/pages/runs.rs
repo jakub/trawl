@@ -24,8 +24,9 @@ use leptos_use::use_media_query;
 use trawl_api::{RunsSortDir, RunsSortKey};
 
 use crate::api::{self, RUNS_PAGE_SIZE};
-use crate::components::net_drawer::{RunRead, RunResultPreview};
+use crate::components::net_drawer::RunResultPreview;
 use crate::components::sort_th::table_sort_th;
+use crate::run_read::RunRead;
 use crate::state::query::{Mode, RangeSpec, navigator, report_refusal};
 use fleet_ui::time::{format_duration, time_ago};
 use fleet_ui::{
@@ -444,27 +445,12 @@ fn RunDetail(
     // and row count move, and the list is a page old. It has none to
     // give once it has refused — a refusal supersedes whatever it said
     // before, `running` included — and only then does the list's own
-    // record of the run become the receipt, with the outcome corrected.
-    // The server answers this 409 only for a run whose query SUCCEEDED
-    // and wrote a result file it can no longer find
-    // (`from_saved::unavailable_run_conflict`), so a row snapshotted
-    // while the run was still going is stale about the outcome and about
-    // nothing else: its empty duration and row count are honest.
+    // record of the run stand in, under `RunRead::settle`'s reading of
+    // what that refusal confirms.
     //
     // Until a read has landed there is nothing the server has confirmed,
     // and the receipt says so by staying empty.
-    let shown = Signal::derive(move || match read.get() {
-        Some(RunRead::Available(summary)) => Some(summary),
-        Some(RunRead::Unavailable) => {
-            known_listing
-                .get()
-                .map(|listing| trawl_api::ReportRunSummary {
-                    status: "success".to_owned(),
-                    ..listing
-                })
-        }
-        None => None,
-    });
+    let shown = Signal::derive(move || read.get().and_then(|r| r.settle(known_listing.get())));
     let title = move || known_name.get().unwrap_or_else(|| format!("Run {run_id}"));
     let status = move || shown.get().map(|s| s.status);
     let duration = move || {
