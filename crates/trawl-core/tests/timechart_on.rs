@@ -173,8 +173,8 @@ mod timechart_on {
             emitted.sql
         );
         assert_eq!(
-            emitted.timechart_on.as_deref(),
-            Some("hostname"),
+            emitted.timechart_on,
+            ["hostname"],
             "the emission names the column it buckets"
         );
 
@@ -205,8 +205,8 @@ mod timechart_on {
 
         let emitted = emit("* | timechart span=5m count()", "/data/**/*.parquet");
         assert_eq!(emitted.sql, BEFORE);
-        assert_eq!(
-            emitted.timechart_on, None,
+        assert!(
+            emitted.timechart_on.is_empty(),
             "an omitted clause names no column"
         );
 
@@ -218,6 +218,6 @@ mod timechart_on {
             "/data/**/*.parquet",
         );
         assert_eq!(explicit.sql, BEFORE);
-        assert_eq!(explicit.timechart_on, None);
+        assert!(explicit.timechart_on.is_empty());
     }
 }

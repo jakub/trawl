@@ -395,11 +395,11 @@ fn process_timechart(
             format!("TRY_CAST({} AS TIMESTAMP)", quote_field("_time"))
         }
         Some(col) => {
-            // The hint the executor reads to turn a bucket-type binder
-            // error into a sentence naming this column.
-            if ctx.timechart_on.is_none() {
-                ctx.timechart_on = Some(col.to_string());
-            }
+            // The hint the executor reads to turn a bucket-type refusal
+            // into a sentence naming this column. Appended, never
+            // replaced: each timechart in the pipeline contributes its
+            // own, in the order the reader wrote them.
+            ctx.timechart_on.push(col.to_string());
             quote_field(col)
         }
     };

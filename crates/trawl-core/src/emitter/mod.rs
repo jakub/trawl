@@ -67,15 +67,22 @@ pub struct EmittedQuery {
     /// raw-free pass pushes the same parameters in the same order — so the
     /// executor can retry with this SQL against a source that has no `_raw`.
     pub raw_free_sql: Option<String>,
-    /// The column an explicit `timechart on <field>` buckets — `Some`
-    /// only when the reader named a column other than `_time`.
+    /// Every column an explicit `timechart on <field>` buckets, in
+    /// pipeline order — empty when no stage named one, or named only
+    /// `_time`.
     ///
     /// A metadata hint, not an input to the SQL: the bucket expression in
-    /// [`sql`](Self::sql) already names the column. It exists so the
-    /// executor can recognise `DuckDB`'s refusal to bucket a
-    /// non-timestamp column as this stage's fault and answer with a
-    /// sentence naming the column, instead of a bare binder error.
-    pub timechart_on: Option<String>,
+    /// [`sql`](Self::sql) already names each column. It exists so the
+    /// executor can recognise a refusal to bucket a non-timestamp column
+    /// as this stage's fault and answer with a sentence naming the
+    /// column, instead of a bare binder error.
+    ///
+    /// A list because a pipeline can hold several timecharts and the two
+    /// refusal paths attribute differently: a bind-time binder error does
+    /// not say which stage it came from, so every candidate is listed,
+    /// while the bound `_time` output column belongs to the last
+    /// timechart alone.
+    pub timechart_on: Vec<String>,
     /// The instant this statement's `now()` reads (ADR-0017 §3).
     ///
     /// The caller captures it once per logical query and stamps it here,
@@ -453,7 +460,7 @@ fn emit_from_state(
 
     let needs_column_reorder = state.needs_column_reorder();
     let referenced_raw = state.bound_raw_column();
-    let timechart_on = state.timechart_on.clone();
+    let timechart_on = std::mem::take(&mut state.timechart_on);
     let anchor = state.anchor();
     let sql = state.finalize()?;
     let params = state.into_params();

@@ -105,13 +105,16 @@ pub(crate) struct EmitterState {
     /// The time filter from the search stage, used by `timechart` auto-bucketing.
     /// Not reset on CTE flush — this is query-wide context.
     pub(crate) time_filter: Option<TrawlDuration>,
-    /// The column an explicit `timechart on <field>` buckets, when it is
-    /// not `_time`. Query-wide context like `time_filter`, and carried
-    /// out on [`super::EmittedQuery::timechart_on`] so the executor can
-    /// name the column in a bucket-type refusal. The first explicit
-    /// column wins: a pipeline with two timecharts names the one the
-    /// reader wrote first.
-    pub(crate) timechart_on: Option<String>,
+    /// Every column an explicit `timechart on <field>` buckets, in
+    /// pipeline order, excluding `_time`. Query-wide context like
+    /// `time_filter`, and carried out on
+    /// [`super::EmittedQuery::timechart_on`] so the executor can name the
+    /// column in a bucket-type refusal.
+    ///
+    /// A list, not one name: a pipeline can hold several timecharts, and
+    /// a bind-time refusal cannot tell which of them `DuckDB` choked on,
+    /// while the bound `_time` output belongs to the last one.
+    pub(crate) timechart_on: Vec<String>,
     /// `USING SAMPLE` clause set by `sample` stage.
     pub(crate) sample: Option<String>,
     /// Set by `pivot` stage — overrides normal `build_select()` in `finalize()`.
@@ -430,7 +433,7 @@ impl EmitterState {
             has_projection: false,
             had_explicit_columns: false,
             time_filter: None,
-            timechart_on: None,
+            timechart_on: Vec::new(),
             sample: None,
             pivot: None,
             ctes: Vec::new(),
