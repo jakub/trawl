@@ -202,11 +202,25 @@ test('history hides stale rows and completes a newer page before the older reque
 });
 
 // The largest page the search URL admits: its offset is one page short of
-// `MAX_OFFSET` (u32::MAX), the ceiling a wasm32 `usize` can address. The
-// range the table reports can no longer run past that ceiling, because
-// `pagination.total` is a `usize` too and bounds `offset + returned`. So
-// what this proves is the surviving half: the extreme page renders its
-// empty state instead of panicking the module.
+// `MAX_OFFSET` (u32::MAX), the ceiling a wasm32 `usize` can address.
+//
+// This case used to reach the overflow branch by asking the harness for
+// `queryTotal: 4_294_967_300` — 50 rows at that offset, and
+// `offset + returned` past `usize::MAX`. It cannot any more, and not
+// because the range is bounded: the raw table passes `PageTotal::Probe`,
+// under which `PageWindow::new` clamps `returned` to the page size and
+// the total bounds nothing. It is because the harness now stamps that
+// number on the wire as `pagination.total`, and 4,294,967,300 does not
+// decode into a wasm32 `usize` — the response fails to parse before any
+// window is computed.
+//
+// So `PageWindowOverflow` → "This result page extends past the supported
+// row range.", in both tables, is no longer exercised from a browser. The
+// arithmetic it guards is covered natively by fleet-ui's
+// `page_window_checked_arithmetic_at_usize_limits`, which drives both
+// `checked_add` sites in `PageWindow::new`. What this case proves is the
+// surviving half: the extreme page renders its empty state instead of
+// panicking the module.
 test('Probe last addressable page renders without a wasm panic', async ({ page, request }) => {
   await configure(request);
   await page.goto('/search?q=service%3Dnginx&page=85899345');
