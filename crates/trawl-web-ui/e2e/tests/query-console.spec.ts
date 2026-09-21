@@ -15,7 +15,7 @@
 
 import { test, expect, resetScenario, CORPUS, capturedQueryCount, lastCapturedQuery } from '../fixtures';
 import { SEL, COPY } from '../selectors';
-import type { APIRequestContext, Page } from '@playwright/test';
+import type { Page } from '@playwright/test';
 
 // Literal link, independent of the app's own encoder: `q` is the
 // executed query, `r` the 15-minute window, and the base64url `f`
@@ -61,7 +61,7 @@ async function navigateSearch(page: Page, query: string) {
 function queryResponse(started: string, duration: number, rows: unknown[][] = [['accepted']]) {
   return {
     columns: [{ name: 'message' }], rows,
-    pagination: { limit: 50, offset: 0, returned: rows.length }, truncated: false,
+    pagination: { limit: 50, offset: 0, returned: rows.length, total: rows.length },
     execution: { started_at: started, duration_ms: duration },
   };
 }
@@ -314,17 +314,6 @@ test('an empty query invalidates pending ownership before the same query runs ag
   await expectFacts(page, '0.200s', '2026-09-15 11:00:00 UTC');
 });
 
-test('the result header badges a truncated answer', async ({ page, request }) => {
-  await truncatedScenario(request);
-  await page.goto('/search?q=service%3Dnginx');
-
-  // `.tabs .bdg` is the trailing slot's one badge; the actions beside it
-  // are buttons.
-  await expect(page.locator('.tabs .bdg')).toHaveText(COPY.truncatedBadge);
-  await expect(page.locator(SEL.saveAction)).toBeVisible();
-  await expect(page.locator(SEL.exportAction)).toBeVisible();
-});
-
 test('the editor tools name what they act on', async ({ page }) => {
   await page.goto('/search');
   const tools = page.locator(SEL.editorTool);
@@ -376,11 +365,3 @@ test('skip to results reaches live mode and the Visualization tab', async ({ pag
   await expect(page.getByRole('tab', { name: 'Visualization' })).toBeFocused();
 });
 
-/** The stub's truncated answer: the `pagination` scenario with its
- * `truncated` flag set, the same control `pagination.spec.ts` uses. */
-async function truncatedScenario(request: APIRequestContext) {
-  const response = await request.post('/__ctl/reset', {
-    data: { scenario: 'pagination', pagination: { truncated: true } },
-  });
-  expect(response.ok()).toBeTruthy();
-}

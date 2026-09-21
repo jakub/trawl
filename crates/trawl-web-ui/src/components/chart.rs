@@ -9,16 +9,20 @@ use trawl_api::display::extract_series;
 use trawl_api::value::{QueryResult, Value};
 use wasm_bindgen::JsValue;
 
+use crate::fetch_plan::coverage_refusal;
 use crate::interop::uplot::{ChartHandle, Opts, create_chart};
+use trawl_api::PaginationMeta;
 
 /// uPlot `AlignedData` is `[xs, ys1, ys2, ...]` where every inner array
 /// is equal length and all values are `f64`. xs are row indices, not
 /// instants: the server emits `_time` as a string, snapshot rows arrive
 /// in order, and the chart only has to show relative shape.
-fn snapshot_to_aligned(result: &QueryResult) -> (JsValue, Vec<String>) {
+/// The third element is the number of plotted points per series: what
+/// the chart actually drew, which the canvas itself does not say.
+fn snapshot_to_aligned(result: &QueryResult) -> (JsValue, Vec<String>, usize) {
     let (series, _total) = extract_series(result);
     if series.is_empty() {
-        return (js_sys::Array::new().into(), vec![]);
+        return (js_sys::Array::new().into(), vec![], 0);
     }
 
     let series_len = series[0].1.len();
@@ -53,27 +57,45 @@ fn snapshot_to_aligned(result: &QueryResult) -> (JsValue, Vec<String>) {
         aligned.push(&ys);
     }
 
-    (aligned.into(), labels)
+    (aligned.into(), labels, series_len)
 }
 
 #[component]
 pub fn Chart(
     #[prop(into)] snapshot: Signal<Option<QueryResult>>,
     #[prop(into)] query: Signal<String>,
+    /// How much of the result this snapshot carries, where the answer is
+    /// measured: `None` for a live stream, which owns no window.
+    ///
+    /// Required, not optional. The chart draws a whole result or says
+    /// why not (ADR-0037), and a default would let the next caller skip
+    /// that gate by saying nothing.
+    #[prop(into)]
+    coverage: Signal<Option<PaginationMeta>>,
     #[prop(optional, into)] failure: Signal<Option<&'static str>>,
     #[prop(optional)] on_retry: Option<Callback<()>>,
 ) -> impl IntoView {
     let hint = Memo::new(move |_| {
-        failure.get().or_else(|| match snapshot.get() {
-            None => Some("Waiting for the first live aggregation snapshot."),
-            Some(result) => chart_hint(&result, &query.get()),
-        })
+        failure
+            .get()
+            .map(ToOwned::to_owned)
+            .or_else(|| match snapshot.get() {
+                None => Some("Waiting for the first live aggregation snapshot.".to_owned()),
+                Some(result) => {
+                    let coverage = coverage.get();
+                    chart_hint(&result, &query.get(), coverage.as_ref())
+                }
+            })
     });
     let node_ref = NodeRef::<leptos::html::Div>::new();
     let handle: StoredValue<Option<ChartHandle>, leptos::prelude::LocalStorage> =
         StoredValue::new_local(None);
 
     let mounted_labels = StoredValue::new(Vec::<String>::new());
+    // The plotted series length, published on the host element. A canvas
+    // is opaque: without this, "the chart drew every row" is a claim no
+    // test can read back from the DOM.
+    let points = RwSignal::new(None::<usize>);
     let width = RwSignal::new(0.0_f64);
     // Measure the content box, excluding the chart host's padding. The
     // observer disconnects with the component through leptos-use.
@@ -99,12 +121,13 @@ pub fn Chart(
                 }
             });
             mounted_labels.set_value(Vec::new());
+            points.set(None);
             return;
         };
         if measured_width <= 0.0 {
             return;
         }
-        let (data, labels) = snapshot_to_aligned(&result);
+        let (data, labels, plotted) = snapshot_to_aligned(&result);
         let html_el: web_sys::HtmlElement = (*element).clone().unchecked_into();
 
         handle.update_value(|slot| {
@@ -136,6 +159,7 @@ pub fn Chart(
                 *slot = Some(h);
             }
         });
+        points.set(Some(plotted));
     });
 
     on_cleanup(move || {
@@ -159,7 +183,7 @@ pub fn Chart(
             {move || failure.get().and(on_retry).map(|retry| view! {
                 <button type="button" class="btn-sec" on:click=move |_| retry.run(())>"Retry live stream"</button>
             })}
-            <div class="chart" node_ref=node_ref></div>
+            <div class="chart" node_ref=node_ref data-points=move || points.get().map(|n| n.to_string())></div>
             {move || hint.get().is_none().then(|| view! {
                 <p class="chart-note">"Count metrics by result position, up to six series. Open Events for exact times and values."</p>
             })}
@@ -171,7 +195,16 @@ use wasm_bindgen::JsCast;
 
 // The shared extractor converts metrics to unsigned counts. Refuse values
 // that conversion would truncate or replace with zero.
-fn chart_hint(result: &QueryResult, query: &str) -> Option<&'static str> {
+//
+// The rungs are ordered, and the coverage one comes LAST on purpose. A
+// grouped or lossy result has something actionable to say about its own
+// shape; "this is only part of the result" is the answer only once the
+// shape itself is chartable.
+fn chart_hint(
+    result: &QueryResult,
+    query: &str,
+    coverage: Option<&PaginationMeta>,
+) -> Option<String> {
     // Column values cannot identify numeric group keys. Use parsed query
     // stages before interpreting any numeric column as a metric. Refuse
     // grouped results until this chart can align groups by actual time.
@@ -188,15 +221,17 @@ fn chart_hint(result: &QueryResult, query: &str) -> Option<&'static str> {
     });
     if grouped {
         return Some(
-            "Grouped results are not supported by this chart. Use timechart without by, or open Events for exact group times and values.",
+            "Grouped results are not supported by this chart. Use timechart without by, or open Events for exact group times and values."
+                .to_owned(),
         );
     }
     if result.rows.is_empty() {
-        return Some("No rows returned for this visualization.");
+        return Some("No rows returned for this visualization.".to_owned());
     }
     if !result.columns.iter().any(|c| c.name == "_time") {
         return Some(
-            "Visualization requires a _time column and non-negative integer metrics. Use timechart count() or open Events for these results.",
+            "Visualization requires a _time column and non-negative integer metrics. Use timechart count() or open Events for these results."
+                .to_owned(),
         );
     }
     let mut groups = 0;
@@ -219,13 +254,15 @@ fn chart_hint(result: &QueryResult, query: &str) -> Option<&'static str> {
             metrics += 1;
         } else {
             return Some(
-                "This chart supports non-negative integer metrics only. Open Events for fractional, negative, null, or mixed values.",
+                "This chart supports non-negative integer metrics only. Open Events for fractional, negative, null, or mixed values."
+                    .to_owned(),
             );
         }
     }
     if groups > 0 {
         return Some(
-            "This result includes non-metric columns. Use an ungrouped timechart query, or open Events for these rows.",
+            "This result includes non-metric columns. Use an ungrouped timechart query, or open Events for these rows."
+                .to_owned(),
         );
     }
     let timechart = parsed.as_ref().is_some_and(|ast| ast.pipeline.iter().any(|stage| {
@@ -233,13 +270,15 @@ fn chart_hint(result: &QueryResult, query: &str) -> Option<&'static str> {
     }));
     if metrics > 1 && !timechart {
         return Some(
-            "These numeric columns may include group keys. Use an ungrouped timechart query, or open Events for the exact values.",
+            "These numeric columns may include group keys. Use an ungrouped timechart query, or open Events for the exact values."
+                .to_owned(),
         );
     }
     if metrics == 0 {
         return Some(
-            "Visualization requires _time and non-negative integer metrics. Open Events for these results.",
+            "Visualization requires _time and non-negative integer metrics. Open Events for these results."
+                .to_owned(),
         );
     }
-    None
+    coverage.and_then(coverage_refusal)
 }

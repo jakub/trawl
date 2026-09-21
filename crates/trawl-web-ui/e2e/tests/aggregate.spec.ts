@@ -20,6 +20,11 @@
 import { test, expect, resetScenario } from '../fixtures';
 import { COPY, SEL } from '../selectors';
 
+// The generated `aggregate` scenario, for the one case that needs more
+// groups than a page holds. `corpus` is pinned at five.
+const WIDE_GROUPS = 60;
+const WIDE_URL = '/search?q=' + encodeURIComponent('service=nginx | stats count() by status');
+
 // `| stats count() by status` — the harness dispatches the `corpus`
 // scenario on that pipeline shape and answers `wire/query-stats-by.json`:
 // five groups, one negative count and one null one.
@@ -171,4 +176,85 @@ test('the chart waits for the matching response while the group searches keep th
   release();
   await expect(page.locator(SEL.catChart)).toHaveCount(1);
   await expect(page.locator(SEL.groupSearch)).toHaveCount(GROUPS);
+});
+
+test('a sorted table keeps its order until the next response lands', async ({ page, request }) => {
+  await resetScenario(request, 'corpus');
+  await page.goto(AGG_URL);
+
+  // Sort on the metric, so the order on screen is nothing like the one
+  // the response arrived in.
+  const header = page.locator(`${SEL.exactTable} thead th`).nth(1);
+  await header.locator('button').click();
+  await expect(header).toHaveAttribute('aria-sort', 'descending');
+  const labels = page.locator(`${SEL.exactTable} tbody tr td:first-child`);
+  const sorted = await labels.allInnerTexts();
+
+  // Hold the next query open. The rows under it are still the previous
+  // response's, so they keep the order the reader put them in: the sort
+  // belongs to the response on screen, not to the query in flight.
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  await page.route('**/api/v1/query*', async (route) => { await held; await route.continue(); });
+
+  await page.locator(SEL.groupSearch).first().click();
+  await expect(page).toHaveURL(/[?&]f=v1\./);
+  await expect(header).toHaveAttribute('aria-sort', 'descending');
+  expect(await labels.allInnerTexts()).toEqual(sorted);
+
+  // The replacement lands and takes the order with it: these are
+  // different rows, executed for a different query.
+  release();
+  await expect(header).not.toHaveAttribute('aria-sort', /.*/);
+});
+
+test('bar widths do not change with the page', async ({ page, request }) => {
+  // 60 groups: more than one page, so the same result is read in two
+  // slices and a bar can be compared across them.
+  expect((await request.post('/__ctl/reset', { data: { scenario: 'aggregate', aggregate: { groups: WIDE_GROUPS } } })).ok()).toBe(true);
+  await page.goto(WIDE_URL);
+
+  const bars = page.locator(`${SEL.catChart} .cat-bars li`);
+  await expect(bars).toHaveCount(50);
+
+  // A bar's width is its count measured against the largest count in
+  // the WHOLE result, so two groups with the same count draw the same
+  // width wherever they are paged to. A scale taken from the page would
+  // move under this assertion.
+  const read = () => bars.evaluateAll((items) => items.map((li) => ({
+    label: li.querySelector('.cat-lb')!.textContent ?? '',
+    value: li.querySelector('.cat-val')!.textContent ?? '',
+    width: li.querySelector('.cat-track i')?.getAttribute('style') ?? null,
+  })));
+  // The generator spikes row 0 above every other count, so the result's
+  // maximum is on page 1 and page 1 alone. That is what makes the two
+  // scales give different answers below: with the counts merely cycling,
+  // page 1, page 2 and the whole result all peak at the same 13 and a
+  // page-scoped scale would draw exactly the widths a whole-result scale
+  // does.
+  const onPageOne = await read();
+  expect(onPageOne[0].width, 'the spiked row fills its track').toBe('width:100.00%');
+  // The reference bar is therefore row 1, not the spike: an ordinary
+  // count, one that recurs on page 2.
+  const first = onPageOne[1];
+  expect(first.width).not.toBeNull();
+
+  await page.getByRole('button', { name: 'Next' }).click();
+  await expect(page).toHaveURL(/[?&]page=1/);
+  await expect(bars).toHaveCount(WIDE_GROUPS - 50);
+
+  const onPageTwo = await read();
+  const twin = onPageTwo.find((bar) => bar.value === first.value);
+  expect(twin, `no group on page 2 shares the count ${first.value}`).toBeDefined();
+  expect(twin!.width).toBe(first.width);
+  // And page 2's own largest count fills nothing: the scale it is drawn
+  // against left the page with row 0.
+  expect(onPageTwo.map((bar) => bar.width)).not.toContain('width:100.00%');
+
+  // Sorting re-orders the whole result, so it changes WHICH groups this
+  // page holds — and the table and the bars have to agree on the answer.
+  await page.locator(`${SEL.exactTable} thead th`).first().locator('button').click();
+  const labels = await page.locator(`${SEL.exactTable} tbody tr td:first-child`).allInnerTexts();
+  const barLabels = (await read()).map((bar) => bar.label);
+  expect(barLabels).toEqual(labels);
 });

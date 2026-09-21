@@ -101,7 +101,7 @@ A key without `ingest` spends its interactive bucket when it posts to `/api/v1/i
 
 ### Pagination
 
-Query results page with `limit` and `offset` in the request. The response echoes them in `pagination` with `returned`, the number of rows in this page, and sets `truncated` when the full result reached `max_result_rows`. History and run listings take `limit` and `offset` as query parameters and return `total`. Catalog listings take `limit` and return `truncated`. The field detail route pages its service rows with an opaque `services_cursor`.
+Query results page with `limit` and `offset` in the request. The response echoes them in `pagination` with `returned`, the number of rows in this page, and `total`, the number of rows the execution produced before the page was cut from them. History and run listings take `limit` and `offset` as query parameters and return `total`. Catalog listings take `limit` and return `truncated`. The field detail route pages its service rows with an opaque `services_cursor`.
 
 ### Timestamps
 
@@ -198,8 +198,7 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -H "Content-Type: applicatio
   "columns": [{ "name": "service" }, { "name": "count" }],
   "rows": [["nginx", 12], ["api", 3]],
   "execution": { "started_at": "2026-09-15T12:34:56.123Z", "duration_ms": 80 },
-  "truncated": false,
-  "pagination": { "limit": 100000, "offset": 0, "returned": 2 },
+  "pagination": { "limit": 100000, "offset": 0, "returned": 2, "total": 2 },
   "degraded_fields": ["duration"],
   "severity_columns": ["sev"]
 }
@@ -209,8 +208,8 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -H "Content-Type: applicatio
 |-------|------|-------------|
 | `columns` | array | Column names in result order |
 | `rows` | array | One array per row. Values are JSON null, booleans, numbers, strings, or arrays. |
-| `truncated` | boolean | `true` when the full result reached `max_result_rows` |
-| `pagination` | object | `limit`, `offset`, and `returned` for this page |
+| `pagination` | object | `limit`, `offset`, `returned`, and `total` for this page |
+| `pagination.total` | integer | Rows this execution produced, before the response window was cut from them. Compare it with `returned` to tell a whole result from a page of one. |
 | `execution` | object | Optional execution metadata. Present on successful server query responses, including zero-row results. Absent on synthetic client results. |
 | `execution.started_at` | string | Server start instant in RFC 3339 UTC, with a `Z` suffix. Independent of the request's `timezone`. |
 | `execution.duration_ms` | integer | Server-measured duration in milliseconds. Zero is valid. |

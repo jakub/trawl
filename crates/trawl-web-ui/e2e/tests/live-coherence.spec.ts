@@ -213,8 +213,7 @@ test('an aggregation-shaped result computes no groups while Clear all still remo
   const aggregation = {
     columns: [{ name: 'status' }, { name: 'count' }],
     rows: [['200', 2], ['404', 2]],
-    truncated: false,
-    pagination: { limit: 50, offset: 0, returned: 2 },
+    pagination: { limit: 50, offset: 0, returned: 2, total: 2 },
   };
   await page.route('**/api/v1/query', route => route.fulfill({ json: aggregation }));
 
@@ -270,8 +269,8 @@ test('a snapshot finishing after Live cannot restore timing or complete a later 
   await expect(page.locator(SEL.scopeExecution)).toHaveCount(0);
   await expect(page.locator(SEL.scopeStarted)).toHaveCount(0);
   const responseBody = (started: string, duration: number) => ({
-    columns: [{ name: 'message' }], rows: [['snapshot']], truncated: false,
-    pagination: { limit: 50, offset: 0, returned: 1 },
+    columns: [{ name: 'message' }], rows: [['snapshot']],
+    pagination: { limit: 50, offset: 0, returned: 1, total: 1 },
     execution: { started_at: started, duration_ms: duration },
   });
   const oldResponse = page.waitForResponse('**/api/v1/query');

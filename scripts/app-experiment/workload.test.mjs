@@ -3,7 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { corpus, verifyRows, verifyBrowserPage } from './workload.mjs';
+import { corpus, verifyWholeResult, verifyBrowserPage } from './workload.mjs';
 
 test('seeded traffic is stable, varied, and carries consecutive IDs', () => {
   const rows = corpus(42, 1000, 'test');
@@ -14,22 +14,22 @@ test('seeded traffic is stable, varied, and carries consecutive IDs', () => {
   assert.equal(rows.at(-1).experiment_seq, 999);
 });
 
-test('the oracle detects loss, duplication, value corruption, and truncation', () => {
+test('the oracle detects loss, duplication, value corruption, and a cut result', () => {
   const events = corpus(42, 3, 'test');
-  const result = { truncated: false,
+  const result = { pagination: { total: 3 },
     columns: [{ name: 'status' }, { name: 'experiment_seq' }],
     rows: events.map(e => [e.status, e.experiment_seq]).reverse(),
   };
-  verifyRows(result, events);
+  verifyWholeResult(result, events);
   for (const mutate of [
     r => r.rows.pop(),
     r => r.rows.push(r.rows[0]),
     r => { r.rows[0][0] = 999; },
-    r => { r.truncated = true; },
+    r => { r.pagination.total = r.rows.length + 1; },
   ]) {
     const broken = structuredClone(result);
     mutate(broken);
-    assert.throws(() => verifyRows(broken, events));
+    assert.throws(() => verifyWholeResult(broken, events));
   }
 });
 
@@ -43,7 +43,7 @@ test('traffic avoids fixed eight-event host cycles and single-parity errors', ()
 
 test('browser oracle refuses a short page even when returned count agrees with it', () => {
   const events = corpus(42, 100, 'test');
-  const response = { truncated: false, pagination: { returned: 50 },
+  const response = { pagination: { returned: 50, total: 100 },
     columns: [{ name: 'experiment_seq' }, { name: 'status' }],
     rows: events.slice(0, 50).map(e => [e.experiment_seq, e.status]),
   };

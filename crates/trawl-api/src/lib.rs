@@ -335,8 +335,6 @@ pub struct QueryResponse {
     /// The query result (columns + rows).
     #[serde(flatten)]
     pub result: QueryResult,
-    /// Whether results were truncated due to `max_result_rows`.
-    pub truncated: bool,
     /// Pagination metadata.
     pub pagination: PaginationMeta,
     /// Fields the query bound whose catalog pin the analyzer calls degraded
@@ -372,6 +370,9 @@ pub struct PaginationMeta {
     pub offset: usize,
     /// The number of rows actually returned.
     pub returned: usize,
+    /// Rows this successful execution produced, before the response window was
+    /// cut from them.
+    pub total: usize,
 }
 
 // -- validation --------------------------------------------------------------
@@ -1702,10 +1703,14 @@ fn is_zero(n: &usize) -> bool {
 mod tests {
     #[test]
     fn query_execution_serialization() {
-        let wire = serde_json::json!({"columns": [], "rows": [], "truncated": false,
-            "pagination": {"limit": 10, "offset": 0, "returned": 0}});
+        // A cut window: `total` must survive the round trip as the number the
+        // execution produced, not be rebuilt from the rows on the wire.
+        let wire = serde_json::json!({"columns": [], "rows": [],
+            "pagination": {"limit": 10, "offset": 0, "returned": 10, "total": 59}});
         let mut response: super::QueryResponse = serde_json::from_value(wire.clone()).unwrap();
         assert!(response.execution.is_none());
+        assert_eq!(response.pagination.total, 59);
+        assert_eq!(response.pagination.returned, 10);
         assert_eq!(serde_json::to_value(&response).unwrap(), wire);
         response.execution = Some(super::QueryExecution {
             started_at: "2026-09-15T12:34:56Z".into(),
@@ -1715,6 +1720,17 @@ mod tests {
         assert_eq!(encoded["execution"]["duration_ms"], 0);
         let decoded: super::QueryResponse = serde_json::from_value(encoded).unwrap();
         assert_eq!(decoded.execution, response.execution);
+    }
+
+    #[test]
+    fn pagination_total_is_required_on_the_wire() {
+        let wire = serde_json::json!({"columns": [], "rows": [],
+            "pagination": {"limit": 10, "offset": 0, "returned": 0}});
+        let err = serde_json::from_value::<super::QueryResponse>(wire).unwrap_err();
+        assert!(
+            err.to_string().contains("total"),
+            "a body without the pre-window count must not decode: {err}"
+        );
     }
 
     #[test]

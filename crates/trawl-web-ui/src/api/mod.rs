@@ -20,6 +20,7 @@ use trawl_api::{
     UpdateSavedRequest,
 };
 
+use crate::fetch_plan::FetchPlan;
 use crate::repin_flow::{BoundCeilings, ConflictBody, classify_conflict};
 
 /// Rows per page for the snapshot results table. Defined by the search
@@ -405,12 +406,19 @@ fn encode(raw: &str) -> String {
         .unwrap_or_else(|| raw.to_string())
 }
 
-/// POST /api/v1/query — execute a DSL query with fixed [`PAGE_SIZE`] paging.
-pub async fn query(q: &str, page: usize) -> Result<QueryResponse, ApiError> {
+/// POST /api/v1/query — execute a DSL query over the window its
+/// [`FetchPlan`] asks for.
+///
+/// The plan owns the arithmetic (ADR-0037): a raw-event query reads one
+/// [`PAGE_SIZE`] page, an aggregation reads the whole result once. This
+/// transport does none of its own, so there is a single place where a
+/// page number becomes a `(limit, offset)` pair.
+pub async fn query(q: &str, plan: FetchPlan) -> Result<QueryResponse, ApiError> {
+    let (limit, offset) = plan.window();
     let body = QueryRequest {
         query: q.to_owned(),
-        limit: Some(PAGE_SIZE),
-        offset: Some(page * PAGE_SIZE),
+        limit: Some(limit),
+        offset: Some(offset),
         timezone: None,
     };
     let resp = Request::post("/api/v1/query")

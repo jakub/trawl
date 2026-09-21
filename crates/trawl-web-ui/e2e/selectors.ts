@@ -361,6 +361,15 @@ export const SEL = {
   /// Its one control, on a grouped column only. A metric column has
   /// none, which is the F02 fix a spec can count.
   groupSearch: '.results-table.exact button.grp-search',
+  /// The line under that table's pager when the execution produced more
+  /// rows than one fetch carried. Outside the page slice on purpose: it
+  /// describes the whole result, not the rows on screen.
+  resultsCap: '.results-cap',
+  /// crates/trawl-web-ui/src/components/chart.rs — the Visualization
+  /// tab's chart host. It carries `data-points`, the plotted series
+  /// length: the canvas says nothing about what it drew, so that
+  /// attribute is the only way to assert the chart drew every row.
+  chartHost: '.chart',
   /// crates/trawl-web-ui/src/components/cat_chart.rs — the bars beside
   /// that table. aria-hidden, so a spec reads it by class and reads the
   /// numbers themselves off the table.
@@ -464,6 +473,16 @@ export const TIMING = {
   repinPollMs: 3000,
 } as const;
 
+/// Limits the specs share with the app, mirrored the way `TIMING` is: a
+/// spec that counts the rows an aggregation fetch asks for has to count
+/// the SAME ceiling the app asks for, and `e2e_selector_contract.rs`
+/// pins each value against the Rust constant it copies.
+export const LIMITS = {
+  /// crates/trawl-web-ui/src/fetch_plan.rs AGGREGATE_FETCH_ROWS — the
+  /// ceiling one aggregation fetch asks for.
+  aggregateFetchRows: 20000,
+} as const;
+
 export const COPY = {
   historyExport: 'Export this page',
   historyClear: 'Clear history',
@@ -493,9 +512,6 @@ export const COPY = {
   /// crates/trawl-web-ui/src/pages/search.rs — the tab strip's Stop
   /// live button text.
   stopLiveText: 'Stop live',
-  /// crates/trawl-web-ui/src/pages/search.rs — the warn badge the result
-  /// header shows when the server cut the answer short.
-  truncatedBadge: 'Truncated',
   /// crates/trawl-web-ui/src/components/editor_wrap.rs — the console
   /// header marks an editor buffer that differs from the executed query.
   draftDirty: 'Edited',

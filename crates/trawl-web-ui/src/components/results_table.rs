@@ -379,7 +379,6 @@ fn ResultsTableBody(
     let columns: Vec<String> = resp.result.columns.iter().map(|c| c.name.clone()).collect();
     let rows_data = resp.result.rows.clone();
     let returned = resp.pagination.returned;
-    let truncated = resp.truncated;
     let empty_message = if resp.pagination.offset == 0 {
         "No events match this query. Check the time range and filters."
     } else {
@@ -545,7 +544,6 @@ fn ResultsTableBody(
                 render=Box::new(move |window: PageWindow| view! {
                     <OffsetPager
                         window=Signal::from(window)
-                        suffix=if truncated { " (truncated)".to_string() } else { String::new() }
                         on_page=on_paginate
                     />
                 }.into_any())

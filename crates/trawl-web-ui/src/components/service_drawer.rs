@@ -33,6 +33,7 @@ use wasm_bindgen::{JsCast, JsValue};
 use crate::api;
 use crate::components::sort_th::sort_th;
 use crate::drawer_query::{decode_cardinality, value_as_u64};
+use crate::fetch_plan::FetchPlan;
 use crate::histogram::{Slot, align_buckets, parse_bucket_ms};
 use crate::interop::uplot::{ChartHandle, Opts, create_chart};
 use crate::state::stream_session::{LiveSignals, RingBuffer, StreamLifecycle, start_stream};
@@ -191,7 +192,7 @@ fn OverviewPane(
             r#"service="{}" last=24h | timechart span=1h count()"#,
             svc_name.replace('"', "")
         );
-        async move { api::query(&q, 0).await }
+        async move { api::query(&q, FetchPlan::for_query(&q, 0)).await }
     });
 
     // Field-type donut is pure — derive from columns synchronously.
@@ -502,7 +503,7 @@ fn FieldDetail(
         let q = top_dsl.clone();
         async move {
             match q {
-                Some(q) => api::query(&q, 0).await,
+                Some(q) => api::query(&q, FetchPlan::for_query(&q, 0)).await,
                 None => Ok(declined_query_response()),
             }
         }
@@ -693,11 +694,11 @@ fn declined_query_response() -> trawl_api::QueryResponse {
     trawl_api::QueryResponse {
         execution: None,
         result: trawl_api::value::QueryResult::empty(),
-        truncated: false,
         pagination: trawl_api::PaginationMeta {
             limit: 0,
             offset: 0,
             returned: 0,
+            total: 0,
         },
         degraded_fields: Vec::new(),
         severity_columns: Vec::new(),
@@ -716,7 +717,7 @@ fn cardinality_resource(
             let Some(q) = crate::drawer_query::cardinality_query(&svc_name, &fields) else {
                 return Ok(HashMap::new());
             };
-            let resp = api::query(&q.dsl, 0).await?;
+            let resp = api::query(&q.dsl, FetchPlan::for_query(&q.dsl, 0)).await?;
             // Read back against the fields the BUILDER emitted, not the
             // service's whole column list: a name it could not render is
             // absent from the response and from `q.fields` alike

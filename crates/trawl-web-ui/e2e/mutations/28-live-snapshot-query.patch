@@ -1,7 +1,7 @@
 diff --git a/crates/trawl-web-ui/src/pages/search.rs b/crates/trawl-web-ui/src/pages/search.rs
 --- a/crates/trawl-web-ui/src/pages/search.rs
 +++ b/crates/trawl-web-ui/src/pages/search.rs
-@@ -196,14 +196,8 @@
+@@ -199,13 +199,7 @@ pub fn Search() -> impl IntoView {
      // reader of `rows` below reads the "no query yet" placeholder
      // instead of the page the previous mode left behind. `effective_q`
      // still drives the stream, the export modal and the notice.
@@ -14,6 +14,5 @@ diff --git a/crates/trawl-web-ui/src/pages/search.rs b/crates/trawl-web-ui/src/p
 -    });
 +    let snapshot_q = Memo::new(move |_| effective_q.get());
  
-     let (query_pending, set_query_pending) = signal(false);
-     let request_generation = RwSignal::new(0_u64);
-     let (rows, request_intent) = rows_resource(
+     // How much of the result one request asks for (ADR-0037): one page
+     // of a raw-event query, the whole of an aggregation. The page is an

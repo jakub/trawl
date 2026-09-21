@@ -734,11 +734,11 @@ mod tests {
                 }],
                 rows: vec![vec![Value::String("db1".to_owned())]],
             },
-            truncated: false,
             pagination: trawl_client::PaginationMeta {
                 limit: 100,
                 offset: 0,
                 returned: 1,
+                total: 1,
             },
             degraded_fields: vec!["duration".to_owned()],
             severity_columns: Vec::new(),

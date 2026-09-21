@@ -68,12 +68,23 @@ page URL. These client limits do not guarantee acceptance by every deployment.
 | **Format** | Reformats the editor text. A query with parse errors is left alone |
 | **Filters** sidebar | Field values counted over the snapshot page or live buffer. Aggregate results hide the field-value groups; the active-filter count and **Clear all** remain. **Include** and **Exclude** add a filter, **Clear all** removes every filter |
 | Filter chips | Above the tabs. Selecting a chip removes that filter |
-| **Events** tab | The result table, with the row count in the tab |
-| **Visualization** tab | The chart for a `timechart` or aggregate query |
+| **Events** tab | The result table, with the row count in the tab. An aggregation renders the exact table and, where the shape allows it, the categorical chart beside it |
+| **Visualization** tab | The chart for a `timechart` or aggregate query. It has no pager: it draws a whole result or states why it cannot |
 | **View** | In the results header. Chooses how snapshot events and their details appear |
 | **Save** | In the results header. Opens the same dialog as **Save as Net** and captures the editor text |
 | **Export** | Downloads the results as CSV, JSON, or Parquet |
-| **← Prev**, **Next →** | Page through snapshot results, 50 rows per page |
+| **← Prev**, **Next →** | Under the Events tab's table. Page through results, 50 rows per page |
+
+An aggregation is fetched whole, up to 20,000 rows, and paged in the browser.
+**← Prev** and **Next →** slice the result already in hand, so turning one of
+its pages sends no request. When the execution produced more rows than one
+fetch carries, a line under the pager states both counts. Raw event results
+page the other way: each page is its own request.
+
+The Visualization tab draws the whole result or nothing. A response that is
+not the whole result is refused with the counts the server measured, because
+the chart of one page is a different picture from the chart of the result. See
+[ADR-0037](https://github.com/jakub/trawl/blob/main/docs/adr/0037-the-chart-draws-the-whole-result-or-nothing.md).
 
 Both Save controls omit the range control and sidebar filters. They save the
 editor text, not the effective query or returned rows.

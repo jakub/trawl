@@ -774,12 +774,6 @@ const CONTRACTS: &[Contract] = &[
         hook: ">\"Stop live\"<",
     },
     Contract {
-        assignment: "truncatedBadge: 'Truncated',",
-        source_path: "src/pages/search.rs",
-        source: include_str!("../src/pages/search.rs"),
-        hook: ">\"Truncated\"<",
-    },
-    Contract {
         assignment: "draftDirty: 'Edited',",
         source_path: "src/components/editor_wrap.rs",
         source: EDITOR_WRAP_RS,
@@ -1387,6 +1381,18 @@ const CONTRACTS: &[Contract] = &[
         hook: "class=\"grp-search\"",
     },
     Contract {
+        assignment: "resultsCap: '.results-cap',",
+        source_path: "src/components/exact_table.rs",
+        source: EXACT_TABLE_RS,
+        hook: "class=\"results-cap\"",
+    },
+    Contract {
+        assignment: "chartHost: '.chart',",
+        source_path: "src/components/chart.rs",
+        source: include_str!("../src/components/chart.rs"),
+        hook: "<div class=\"chart\" node_ref=node_ref data-points=",
+    },
+    Contract {
         assignment: "catChart: '.cat-chart',",
         source_path: "src/components/cat_chart.rs",
         source: CAT_CHART_RS,
@@ -1871,6 +1877,12 @@ const CONTRACTS: &[Contract] = &[
         source_path: "src/schedule_edit.rs",
         source: SCHEDULE_EDIT_RS,
         hook: "\"This run stored {n} rows; {fetched} were fetched. Paging covers the fetched rows.\"",
+    },
+    Contract {
+        assignment: "aggregateFetchRows: 20000,",
+        source_path: "src/fetch_plan.rs",
+        source: include_str!("../src/fetch_plan.rs"),
+        hook: "pub const AGGREGATE_FETCH_ROWS: usize = 20_000;",
     },
     Contract {
         assignment: "apiStatusText: 'server returned {0}',",

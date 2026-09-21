@@ -55,9 +55,11 @@ use crate::components::results_table::ResultsTable;
 use crate::components::save_as_net_modal::SaveAsNetModal;
 use crate::components::search_quick_start::SearchQuickStart;
 use crate::facets::is_aggregation_shape;
+use crate::fetch_plan::FetchPlan;
 use crate::pages::layout::ShellStatus;
+use crate::result_actions::sorted_page;
 use crate::search_status::{CountSource, FooterCount, StatusInputs, StatusKind, search_status};
-use crate::search_url::{Param, admit_filters, refusal_copy};
+use crate::search_url::{PAGE_SIZE, Param, admit_filters, refusal_copy};
 use crate::state::query::{
     Filter, Mode, UrlSignals, effective_query, navigator, replace_navigator, report_refusal,
     url_signals,
@@ -65,8 +67,8 @@ use crate::state::query::{
 use crate::state::search_session::rows_resource;
 use fleet_ui::overlay::use_overlay_layer;
 use fleet_ui::{
-    Badge, Details, LoadState, Rows, Segmented, SegmentedOption, Size, TabItem, Tabs, ToastBus,
-    ToastKind, Tone, UiPrefs,
+    Details, LoadState, Rows, Segmented, SegmentedOption, Size, TabItem, Tabs, ToastBus, ToastKind,
+    UiPrefs,
 };
 use leptos::ev;
 use leptos_use::{use_event_listener, use_window};
@@ -205,11 +207,17 @@ pub fn Search() -> impl IntoView {
         }
     });
 
+    // How much of the result one request asks for (ADR-0037): one page
+    // of a raw-event query, the whole of an aggregation. The page is an
+    // input, so a page turn under `Whole` produces the same plan and the
+    // resource below does not re-fire.
+    let fetch_plan = Memo::new(move |_| FetchPlan::for_query(&snapshot_q.get(), page.get()));
+
     let (query_pending, set_query_pending) = signal(false);
     let request_generation = RwSignal::new(0_u64);
     let (rows, request_intent) = rows_resource(
         snapshot_q,
-        page,
+        fetch_plan,
         set_query_pending,
         request_generation,
         executed_q,
@@ -240,8 +248,15 @@ pub fn Search() -> impl IntoView {
             // the resource itself in that case. In live the same Haul is
             // a no-op: no snapshot runs, and the stream's own key
             // (retry, mode, effective query) has not moved.
+            // Plan equality, not `page == 0`: the navigation below goes
+            // to page 0, and the resource re-fires only when that moves
+            // the request. It does not when the plan is already the
+            // page-0 plan — either the page is 0, or the query is an
+            // aggregation whose plan is `Whole` on every page — and
+            // those are exactly the cases this Haul must refetch.
             let rerun = !live.get_untracked()
-                && page.get_untracked() == 0
+                && fetch_plan.get_untracked()
+                    == FetchPlan::for_query(&snapshot_q.get_untracked(), 0)
                 && query_text.get_untracked() == executed_q.get_untracked();
             let outcome = goto(
                 &query_text.get_untracked(),
@@ -557,6 +572,38 @@ pub fn Search() -> impl IntoView {
     let tabs_active = Signal::derive(move || active_tab.get().id().to_string());
     let on_tab_change = Callback::new(move |id: String| active_tab.set(ResultsTab::from_id(&id)));
 
+    // The exact table's sort column and direction, owned here rather
+    // than inside the table: the bars beside it slice the SAME sorted
+    // list, and a sort that lived privately in the table would put the
+    // two on different orders the moment a page turned. A page turn
+    // under a fetched-whole aggregation keeps it, since the rows on
+    // screen are still that result.
+    //
+    // Reset on the RESPONSE's identity, not on the pending query. The
+    // rows on screen during a round trip belong to the previous
+    // response, and resetting when the next query is submitted made
+    // them visibly shuffle back to server order for the whole flight,
+    // under a sort control that still claimed the old column. They hold
+    // their order until their replacement lands.
+    //
+    // The executed query alone, not the response generation: a
+    // same-query Haul re-runs the identical query, so its rows are the
+    // same rows and the sort survives it (the C4 contract). Keying on
+    // the generation would reset on every refetch instead.
+    let sort = RwSignal::new(None::<(usize, bool)>);
+    Effect::new(move |prev: Option<Option<String>>| {
+        let previous = prev.flatten();
+        // Nothing landed — a first request in flight, or a failure.
+        // Hold the last answer rather than reading the gap as a change.
+        let Some(landed) = rows.get().and_then(Result::ok).map(|r| r.query.effective) else {
+            return previous;
+        };
+        if previous.is_some_and(|before| before != landed) {
+            sort.set(None);
+        }
+        Some(landed)
+    });
+
     let is_chart_query = Memo::new(move |_| is_aggregation_shape(&effective_q.get()));
 
     let ring_result = Memo::new(move |_| ring_to_result(&ring.read()));
@@ -567,8 +614,12 @@ pub fn Search() -> impl IntoView {
                 || match rows.get() {
                     None => true,
                     Some(Ok(response)) => {
+                        // The plan, not the page: under `Whole` the
+                        // response answers every page of this query, so
+                        // comparing pages would leave the spinner up for
+                        // a page turn that posts nothing.
                         response.query.effective != snapshot_q.get()
-                            || response.page != page.get()
+                            || response.plan != fetch_plan.get()
                             || response.generation != request_generation.get()
                             || response.intent != request_intent.get()
                     }
@@ -682,7 +733,6 @@ pub fn Search() -> impl IntoView {
         shell_status.lagged.set(None);
     });
 
-    let truncated = Signal::derive(move || accepted_snapshot.get().is_some_and(|r| r.truncated));
     // The degraded fields this execution reported. Read off the
     // response, never re-derived and never refreshed from the catalog:
     // it describes the answer already on screen.
@@ -885,12 +935,6 @@ pub fn Search() -> impl IntoView {
                     // the blanked sentinel then, and the server reads
                     // an empty query as every row (ADR-0027).
                     trailing=Box::new(move || view! {
-                        // The truncation notice moved out of the scope
-                        // strip: it qualifies the row count on the tab
-                        // beside it, not the window under the editor.
-                        <Show when=move || truncated.get()>
-                            <Badge tone=Tone::Warn>"Truncated"</Badge>
-                        </Show>
                         <Show when=move || live.get()>
                             <button
                                 type="button"
@@ -994,13 +1038,30 @@ pub fn Search() -> impl IntoView {
                                     busy=running
                                     page=page
                                     rows=rows
+                                    sort=sort
                                     on_paginate=on_paginate
                                     on_add_filter=on_result_filter
                                 />
                                 {move || {
+                                    // The shape — and with it the scale every
+                                    // bar is measured against — is detected
+                                    // over the WHOLE fetched result, so a bar
+                                    // keeps its width from page to page. The
+                                    // bars themselves draw the page the table
+                                    // is showing, through the same sorted
+                                    // index list the table cut it with.
                                     let shape = cat_shape.get()?;
                                     let resp = rows.get()?.ok()?;
-                                    Some(view! { <CatChart shape=shape result=resp.response.result/> })
+                                    let whole = resp.response.result;
+                                    let indices = sorted_page(&whole.rows, sort.get(), page.get(), PAGE_SIZE);
+                                    let drawn = QueryResult {
+                                        columns: whole.columns.clone(),
+                                        rows: indices
+                                            .into_iter()
+                                            .filter_map(|i| whole.rows.get(i).cloned())
+                                            .collect(),
+                                    };
+                                    Some(view! { <CatChart shape=shape result=drawn/> })
                                 }}
                             </div>
                         </>
@@ -1037,7 +1098,16 @@ pub fn Search() -> impl IntoView {
                             view! { <p class="results-empty" role="status">"Loading snapshot visualization…"</p> }.into_any()
                         } else {
                             match rows.get() {
-                                Some(Ok(resp)) => view! { <Chart snapshot=Signal::derive(move || Some(resp.result.clone())) query=effective_q/> }.into_any(),
+                                Some(Ok(resp)) => {
+                                    // The measured window this response
+                                    // arrived in. The chart draws a whole
+                                    // result or says why not (ADR-0037),
+                                    // and only these three numbers can
+                                    // tell it which it has.
+                                    let coverage = resp.pagination.clone();
+                                    let result = resp.result.clone();
+                                    view! { <Chart snapshot=Signal::derive(move || Some(result.clone())) query=effective_q coverage=Signal::derive(move || Some(coverage.clone()))/> }.into_any()
+                                }
                                 Some(Err(_)) => view! { <div class="results-empty"><p role="alert">"Snapshot query failed. Open Events for the query error."</p><button type="button" class="btn-sec" on:click=move |_| rows.refetch()>"Retry snapshot"</button></div> }.into_any(),
                                 None => view! { <p class="results-empty">"Run a query to visualize its snapshot."</p> }.into_any(),
                             }
@@ -1046,7 +1116,10 @@ pub fn Search() -> impl IntoView {
                     },
                     (ResultsTab::Visualization, Mode::Live) if is_chart_query.get() => view! {
                         <div id="search-results" class="results" role="region" aria-label="Search results" tabindex="0">
-                            <Chart snapshot=live_snapshot query=effective_q failure=stream_failure on_retry=retry_stream/>
+                            // A live stream asks for no window, so there
+                            // is no coverage to judge: every frame is the
+                            // whole of what the server aggregated.
+                            <Chart snapshot=live_snapshot query=effective_q coverage=Signal::derive(|| None) failure=stream_failure on_retry=retry_stream/>
                         </div>
                     }.into_any(),
                     (ResultsTab::Visualization, Mode::Live) => view! {

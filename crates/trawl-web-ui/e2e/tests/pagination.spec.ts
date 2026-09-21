@@ -103,15 +103,15 @@ test('history empty out-of-range page offers the last real page without inventin
   await expect(footer.locator('.results-summary')).toHaveText('101–103 of 103');
 });
 
-test('Probe results use response offsets, full and partial pages, and truncated suffix', async ({ page, request }) => {
-  await configure(request, { truncated: true });
+test('Probe results use response offsets, full and partial pages', async ({ page, request }) => {
+  await configure(request);
   await page.goto('/search?q=service%3Dnginx');
   const footer = page.locator('.results .results-footer');
-  await expect(footer.locator('.results-summary')).toHaveText('Page 1 · showing 50 rows (truncated)');
+  await expect(footer.locator('.results-summary')).toHaveText('Page 1 · showing 50 rows');
   await expect(footer.getByRole('button', { name: 'Prev' })).toBeDisabled();
   await footer.getByRole('button', { name: 'Next' }).click();
   await expect(page).toHaveURL(/[?&]page=1(?:&|$)/);
-  await expect(footer.locator('.results-summary')).toHaveText('Page 2 · showing 3 rows (truncated)');
+  await expect(footer.locator('.results-summary')).toHaveText('Page 2 · showing 3 rows');
   await expect(page.locator('.results-table tbody')).toContainText('query-row-51');
   await expect(footer.getByRole('button', { name: 'Next' })).toBeDisabled();
   const state = await (await request.get('/__ctl/state')).json();
@@ -201,10 +201,32 @@ test('history hides stale rows and completes a newer page before the older reque
   expect((await paginationState(request)).completed).toEqual([0, 100, 50]);
 });
 
-test('Probe returned range overflow is visible without a wasm panic', async ({ page, request }) => {
-  await configure(request, { queryTotal: 4_294_967_300 });
+// The largest page the search URL admits: its offset is one page short of
+// `MAX_OFFSET` (u32::MAX), the ceiling a wasm32 `usize` can address.
+//
+// This case used to reach the overflow branch by asking the harness for
+// `queryTotal: 4_294_967_300` — 50 rows at that offset, and
+// `offset + returned` past `usize::MAX`. It cannot any more, and not
+// because the range is bounded: the raw table passes `PageTotal::Probe`,
+// under which `PageWindow::new` clamps `returned` to the page size and
+// the total bounds nothing. It is because the harness now stamps that
+// number on the wire as `pagination.total`, and 4,294,967,300 does not
+// decode into a wasm32 `usize` — the response fails to parse before any
+// window is computed.
+//
+// So `PageWindowOverflow` → "This result page extends past the supported
+// row range.", in both tables, is no longer exercised from a browser. The
+// arithmetic it guards is covered natively by fleet-ui's
+// `page_window_checked_arithmetic_at_usize_limits`, which drives both
+// `checked_add` sites in `PageWindow::new`. What this case proves is the
+// surviving half: the extreme page renders its empty state instead of
+// panicking the module.
+test('Probe last addressable page renders without a wasm panic', async ({ page, request }) => {
+  await configure(request);
   await page.goto('/search?q=service%3Dnginx&page=85899345');
-  await expect(page.getByText('This result page extends past the supported row range.', { exact: false })).toBeVisible();
+  const footer = page.locator('.results .results-footer');
+  await expect(footer.locator('.results-summary')).toHaveText('Page 85899346 · showing 0 rows');
+  await expect(page.locator('.results-table tbody')).toContainText('No events on this page.');
 });
 
 

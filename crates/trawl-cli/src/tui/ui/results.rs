@@ -334,12 +334,7 @@ fn render_table(
             let scroll_start = pinned_count + h_scroll + 1;
             let scroll_end = (pinned_count + h_scroll + visible_scrollable).min(visible_count);
             Line::from(format!(
-                " Results ({total_rows} rows, cols {scroll_start}-{scroll_end}/{visible_count}{pinned_info}{hidden_info}{}) ",
-                if response.truncated {
-                    ", truncated"
-                } else {
-                    ""
-                }
+                " Results ({total_rows} rows, cols {scroll_start}-{scroll_end}/{visible_count}{pinned_info}{hidden_info}) "
             ))
         }
     };

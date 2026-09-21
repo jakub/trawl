@@ -31,7 +31,7 @@ test('mounted chart recolors through both themes without losing visibility or da
   await page.route('**/api/v1/query', route => route.fulfill({ json: {
     columns: [{ name: '_time' }, ...labels.map(name => ({ name }))],
     rows: [['2026-09-01T00:00:00Z', 1, 9, 2, 8, 5, 3], ['2026-09-01T00:01:00Z', 9, 1, 8, 2, 5, 7], ['2026-09-01T00:02:00Z', 1, 9, 2, 8, 5, 3]],
-    truncated: false, pagination: { limit: 50, offset: 0, returned: 3 },
+    pagination: { limit: 50, offset: 0, returned: 3, total: 3 },
   } }));
   await page.goto('/search?q=' + encodeURIComponent('service=nginx | timechart ' + labels.map(label => `count() as ${label}`).join(', ')));
   await page.getByRole('tab', { name: 'Visualization' }).click();

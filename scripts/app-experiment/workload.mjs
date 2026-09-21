@@ -23,8 +23,8 @@ export function corpus(seed, count, run) {
   });
 }
 
+// The rows of one response, whether it is a whole result or one browser page.
 export function verifyRows(response, events) {
-  assert.equal(response.truncated, false, 'query was truncated');
   const columns = response.columns.map(c => c.name);
   const seq = columns.indexOf('experiment_seq');
   const status = columns.indexOf('status');
@@ -36,6 +36,13 @@ export function verifyRows(response, events) {
 export function percentile(values, fraction) {
   const sorted = [...values].sort((a, b) => a - b);
   return sorted[Math.max(0, Math.ceil(sorted.length * fraction) - 1)] ?? null;
+}
+
+// A whole-result read: the server measured `total` before cutting the window,
+// so a response that carries fewer rows than it measured was cut.
+export function verifyWholeResult(response, events) {
+  assert.equal(response.pagination.total, response.rows.length, 'query result was cut before the response window');
+  verifyRows(response, events);
 }
 
 export function verifyBrowserPage(response, events) {

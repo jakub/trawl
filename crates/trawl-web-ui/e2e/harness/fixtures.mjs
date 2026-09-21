@@ -86,15 +86,14 @@ export function healthResponse() {
 }
 
 /** Minimal valid QueryResponse: zero rows, zero columns — the results
- * table renders its "No fish in this net yet" empty state, which is
+ * table renders its "No events match this query" empty state, which is
  * fine for specs that only care about the request being made and the
  * page not crashing. */
 export function queryResponse() {
   return {
     columns: [],
     rows: [],
-    truncated: false,
-    pagination: { limit: 50, offset: 0, returned: 0 },
+    pagination: { limit: 50, offset: 0, returned: 0, total: 0 },
     degraded_fields: [],
     severity_columns: [],
     execution: { started_at: '2026-09-15T12:34:56Z', duration_ms: 125 },
@@ -341,4 +340,67 @@ export function paginationGlobalRuns(total) {
     ...source[i % source.length],
     id: source[i % source.length].id + Math.floor(i / source.length) * 1000,
   }));
+}
+
+// ---- the `aggregate` scenario ---------------------------------------------
+//
+// One aggregation, answered at whatever size the test asks for, so a
+// spec can watch the whole-result fetch (ADR-0037) without a fixture per
+// size. The rows are generated rather than pinned in `wire/` for that
+// reason: what these specs read is the COUNT of rows and the window the
+// request asked for, never a particular bucket's value.
+//
+// `total` is what the execution produced, measured BEFORE the window was
+// cut from it — a slice never renames itself the result.
+
+/** Bucket instants, two minutes apart from a fixed epoch. Fixed so a
+ * chart of N buckets is the same picture on every run. */
+const AGGREGATE_EPOCH = Date.parse('2026-09-01T00:00:00Z');
+const AGGREGATE_BUCKET_MS = 2 * 60 * 1000;
+
+/** Deterministic, non-negative and not constant: a flat line would hide
+ * a chart that plotted the same point N times.
+ *
+ * Row 0 is a deliberate spike, well above the 13 the cycle reaches. It
+ * puts the result's largest count on the FIRST page only, which is what
+ * lets a width assertion tell the two scales apart: a bar measured
+ * against the whole result keeps its width on page 2, while one
+ * measured against its own page stretches against a page maximum of 13.
+ * Without the spike both scales read 13 and the assertion passes on the
+ * defect (ADR-0037). Every count stays positive so the track is
+ * one-sided and the largest fills it. */
+function aggregateCount(i) {
+  return i === 0 ? 47 : ((i * 7) % 13) + 1;
+}
+
+/** `POST /api/v1/query` under `aggregate` for a `| timechart` pipeline:
+ * `buckets` rows of `_time, count`, sliced to the posted window. */
+export function aggregateTimechartResponse(buckets, total, offset, limit) {
+  const rows = Array.from({ length: buckets }, (_, i) => [
+    // The server's own spelling: RFC 3339 with microseconds.
+    `${new Date(AGGREGATE_EPOCH + i * AGGREGATE_BUCKET_MS).toISOString().replace('Z', '000Z')}`,
+    aggregateCount(i),
+  ]);
+  return aggregateBody([{ name: '_time' }, { name: 'count' }], rows, total, offset, limit);
+}
+
+/** `POST /api/v1/query` under `aggregate` for a `| stats count() by`
+ * pipeline: `groups` rows of `status, count`, sliced the same way. */
+export function aggregateStatsByResponse(groups, total, offset, limit) {
+  const rows = Array.from({ length: groups }, (_, i) => [`${200 + i}`, aggregateCount(i)]);
+  return aggregateBody([{ name: 'status' }, { name: 'count' }], rows, total, offset, limit);
+}
+
+function aggregateBody(columns, rows, total, offset, limit) {
+  // `total` before the slice, `returned` after it.
+  const produced = total ?? rows.length;
+  const window = rows.slice(offset, offset + limit);
+  return {
+    columns,
+    rows: window,
+    pagination: { limit, offset, returned: window.length, total: produced },
+    degraded_fields: [],
+    severity_columns: [],
+    execution: { started_at: '2026-09-15T12:34:56Z', duration_ms: 125 },
+  };
 }

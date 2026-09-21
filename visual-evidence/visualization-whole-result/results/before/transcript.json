@@ -1,0 +1,477 @@
+{
+  "schema": 1,
+  "label": "before",
+  "status": "captured",
+  "capturedAt": "2026-09-21T05:54:44.472Z",
+  "captureSha256": "f97584ae8b5be2973b937981578edef62abeb8be27c3e7feca1c8088cff3a41c",
+  "corpus": {
+    "window": {
+      "from": "2026-01-01T02:00:00Z",
+      "to": "2026-01-01T06:00:00Z"
+    },
+    "buckets": 59,
+    "groups": 60,
+    "peakCount": 15,
+    "namedPeak": "group-00",
+    "singletonGroups": 59,
+    "events": 304
+  },
+  "queries": {
+    "timechart": "level=error | timechart span=2m count()",
+    "stats": "level=info | stats count() by message",
+    "range": "2026-01-01T02:00:00Z..2026-01-01T06:00:00Z"
+  },
+  "probe": {
+    "note": "Read from the daemon API with an explicit whole-result limit, independent of the browser.",
+    "timechartRows": 59,
+    "statsRows": 60,
+    "statsMaxCount": 15,
+    "statsSingletons": 59
+  },
+  "observations": [
+    {
+      "name": "timechart",
+      "query": "level=error | timechart span=2m count()",
+      "requests": [
+        {
+          "limit": 50,
+          "offset": 0,
+          "status": 200,
+          "pagination": {
+            "limit": 50,
+            "offset": 0,
+            "returned": 50
+          }
+        },
+        {
+          "limit": 50,
+          "offset": 50,
+          "status": 200,
+          "pagination": {
+            "limit": 50,
+            "offset": 50,
+            "returned": 9
+          }
+        }
+      ],
+      "pages": [
+        {
+          "page": 1,
+          "urlPage": 0,
+          "summary": "Page 1 · showing 50 rows",
+          "capLine": null,
+          "postedSoFar": 1,
+          "chart": {
+            "points": 50,
+            "source": "response pagination.returned; this revision publishes no data-points attribute and a canvas cannot be read back"
+          },
+          "chartRefusal": null
+        },
+        {
+          "page": 2,
+          "urlPage": 1,
+          "summary": "Page 2 · showing 9 rows",
+          "capLine": null,
+          "postedSoFar": 2,
+          "chart": {
+            "points": 9,
+            "source": "response pagination.returned; this revision publishes no data-points attribute and a canvas cannot be read back"
+          },
+          "chartRefusal": null
+        }
+      ]
+    },
+    {
+      "name": "stats",
+      "query": "level=info | stats count() by message",
+      "requests": [
+        {
+          "limit": 50,
+          "offset": 0,
+          "status": 200,
+          "pagination": {
+            "limit": 50,
+            "offset": 0,
+            "returned": 50
+          }
+        },
+        {
+          "limit": 50,
+          "offset": 50,
+          "status": 200,
+          "pagination": {
+            "limit": 50,
+            "offset": 50,
+            "returned": 10
+          }
+        }
+      ],
+      "pages": [
+        {
+          "page": 1,
+          "urlPage": 0,
+          "summary": "Page 1 · showing 50 rows",
+          "capLine": null,
+          "postedSoFar": 1,
+          "bars": [
+            {
+              "group": "group-08",
+              "value": "1",
+              "width": "width:6.67%"
+            },
+            {
+              "group": "group-24",
+              "value": "1",
+              "width": "width:6.67%"
+            },
+            {
+              "group": "group-41",
+              "value": "1",
+              "width": "width:6.67%"
+            },
+            {
+              "group": "group-43",
+              "value": "1",
+              "width": "width:6.67%"
+            },
+            {
+              "group": "group-44",
+              "value": "1",
+              "width": "width:6.67%"
+            },
+            {
+              "group": "group-02",
+              "value": "1",
+              "width": "width:6.67%"
+            },
+            {
+              "group": "group-37",
+              "value": "1",
+              "width": "width:6.67%"
+            },
+            {
+              "group": "group-51",
+              "value": "1",
+              "width": "width:6.67%"
+            },
+            {
+              "group": "group-03",
+              "value": "1",
+              "width": "width:6.67%"
+            },
+            {
+              "group": "group-38",
+              "value": "1",
+              "width": "width:6.67%"
+            },
+            {
+              "group": "group-52",
+              "value": "1",
+              "width": "width:6.67%"
+            },
+            {
+              "group": "group-12",
+              "value": "1",
+              "width": "width:6.67%"
+            },
+            {
+              "group": "group-15",
+              "value": "1",
+              "width": "width:6.67%"
+            },
+            {
+              "group": "group-18",
+              "value": "1",
+              "width": "width:6.67%"
+            },
+            {
+              "group": "group-19",
+              "value": "1",
+              "width": "width:6.67%"
+            },
+            {
+              "group": "group-06",
+              "value": "1",
+              "width": "width:6.67%"
+            },
+            {
+              "group": "group-11",
+              "value": "1",
+              "width": "width:6.67%"
+            },
+            {
+              "group": "group-22",
+              "value": "1",
+              "width": "width:6.67%"
+            },
+            {
+              "group": "group-39",
+              "value": "1",
+              "width": "width:6.67%"
+            },
+            {
+              "group": "group-56",
+              "value": "1",
+              "width": "width:6.67%"
+            },
+            {
+              "group": "group-59",
+              "value": "1",
+              "width": "width:6.67%"
+            },
+            {
+              "group": "group-01",
+              "value": "1",
+              "width": "width:6.67%"
+            },
+            {
+              "group": "group-10",
+              "value": "1",
+              "width": "width:6.67%"
+            },
+            {
+              "group": "group-54",
+              "value": "1",
+              "width": "width:6.67%"
+            },
+            {
+              "group": "group-26",
+              "value": "1",
+              "width": "width:6.67%"
+            },
+            {
+              "group": "group-29",
+              "value": "1",
+              "width": "width:6.67%"
+            },
+            {
+              "group": "group-31",
+              "value": "1",
+              "width": "width:6.67%"
+            },
+            {
+              "group": "group-35",
+              "value": "1",
+              "width": "width:6.67%"
+            },
+            {
+              "group": "group-40",
+              "value": "1",
+              "width": "width:6.67%"
+            },
+            {
+              "group": "group-58",
+              "value": "1",
+              "width": "width:6.67%"
+            },
+            {
+              "group": "group-14",
+              "value": "1",
+              "width": "width:6.67%"
+            },
+            {
+              "group": "group-21",
+              "value": "1",
+              "width": "width:6.67%"
+            },
+            {
+              "group": "group-25",
+              "value": "1",
+              "width": "width:6.67%"
+            },
+            {
+              "group": "group-13",
+              "value": "1",
+              "width": "width:6.67%"
+            },
+            {
+              "group": "group-16",
+              "value": "1",
+              "width": "width:6.67%"
+            },
+            {
+              "group": "group-36",
+              "value": "1",
+              "width": "width:6.67%"
+            },
+            {
+              "group": "group-04",
+              "value": "1",
+              "width": "width:6.67%"
+            },
+            {
+              "group": "group-07",
+              "value": "1",
+              "width": "width:6.67%"
+            },
+            {
+              "group": "group-28",
+              "value": "1",
+              "width": "width:6.67%"
+            },
+            {
+              "group": "group-42",
+              "value": "1",
+              "width": "width:6.67%"
+            },
+            {
+              "group": "group-47",
+              "value": "1",
+              "width": "width:6.67%"
+            },
+            {
+              "group": "group-55",
+              "value": "1",
+              "width": "width:6.67%"
+            },
+            {
+              "group": "group-20",
+              "value": "1",
+              "width": "width:6.67%"
+            },
+            {
+              "group": "group-27",
+              "value": "1",
+              "width": "width:6.67%"
+            },
+            {
+              "group": "group-50",
+              "value": "1",
+              "width": "width:6.67%"
+            },
+            {
+              "group": "group-00",
+              "value": "15",
+              "width": "width:100.00%"
+            },
+            {
+              "group": "group-32",
+              "value": "1",
+              "width": "width:6.67%"
+            },
+            {
+              "group": "group-33",
+              "value": "1",
+              "width": "width:6.67%"
+            },
+            {
+              "group": "group-57",
+              "value": "1",
+              "width": "width:6.67%"
+            },
+            {
+              "group": "group-09",
+              "value": "1",
+              "width": "width:6.67%"
+            }
+          ],
+          "peakBar": {
+            "group": "group-00",
+            "value": "15",
+            "width": "width:100.00%"
+          },
+          "singletons": {
+            "count": 49,
+            "distinctWidths": [
+              "width:6.67%"
+            ],
+            "example": {
+              "group": "group-08",
+              "value": "1",
+              "width": "width:6.67%"
+            }
+          }
+        },
+        {
+          "page": 2,
+          "urlPage": 1,
+          "summary": "Page 2 · showing 10 rows",
+          "capLine": null,
+          "postedSoFar": 2,
+          "bars": [
+            {
+              "group": "group-52",
+              "value": "1",
+              "width": "width:100.00%"
+            },
+            {
+              "group": "group-13",
+              "value": "1",
+              "width": "width:100.00%"
+            },
+            {
+              "group": "group-16",
+              "value": "1",
+              "width": "width:100.00%"
+            },
+            {
+              "group": "group-36",
+              "value": "1",
+              "width": "width:100.00%"
+            },
+            {
+              "group": "group-14",
+              "value": "1",
+              "width": "width:100.00%"
+            },
+            {
+              "group": "group-21",
+              "value": "1",
+              "width": "width:100.00%"
+            },
+            {
+              "group": "group-25",
+              "value": "1",
+              "width": "width:100.00%"
+            },
+            {
+              "group": "group-02",
+              "value": "1",
+              "width": "width:100.00%"
+            },
+            {
+              "group": "group-37",
+              "value": "1",
+              "width": "width:100.00%"
+            },
+            {
+              "group": "group-51",
+              "value": "1",
+              "width": "width:100.00%"
+            }
+          ],
+          "peakBar": null,
+          "singletons": {
+            "count": 10,
+            "distinctWidths": [
+              "width:100.00%"
+            ],
+            "example": {
+              "group": "group-52",
+              "value": "1",
+              "width": "width:100.00%"
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "screenshots": [
+    "timechart-visualization-page1.png",
+    "timechart-visualization-page2.png",
+    "stats-events-page1.png",
+    "stats-events-page2.png"
+  ],
+  "notes": [
+    "The two table pages held 50 of 60 distinct groups: 10 appeared on both and as many were never shown. Two server-side pages of an aggregation with no ordering stage are two executions, and nothing makes them agree on an order.",
+    "The peak group group-00 was on page 1."
+  ],
+  "coverage": {
+    "groupsInResult": 60,
+    "rowsOnTheTwoPages": 60,
+    "distinctGroups": 50,
+    "onBothPages": 10,
+    "neverShown": 10,
+    "peakOnPage": 1
+  }
+}

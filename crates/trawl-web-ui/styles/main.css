@@ -2026,9 +2026,11 @@
 .run-preview th { text-align: left; color: var(--ink-3); border-bottom: 1px solid var(--line); }
 .run-preview td { color: var(--ink-2); }
 .run-preview .results-footer { margin-top: 8px; }
-/* The preview pages the rows the response carried; this line names the
- * ones it never had. */
-.preview-cap {
+/* The two cap lines, one rule: each pages the rows its response
+ * carried and names the ones it never had — the stored-run preview's,
+ * and the exact table's under an aggregation the fetch ceiling cut
+ * (ADR-0037). Same sentence, same treatment. */
+.preview-cap, .results-cap {
   margin: 6px 0 0; font-size: var(--fs-small); color: var(--ink-3);
 }
 
