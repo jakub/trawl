@@ -1230,18 +1230,25 @@ fn bucket_subject(columns: &[String]) -> String {
     }
 }
 
-/// The `DuckDB` types a `timechart` bucket may come back as.
+/// The `DuckDB` types a `timechart` bucket may come back as: the
+/// timestamp family and nothing else.
 ///
 /// `time_bucket` returns the type it bucketed, so this is also the set
-/// of bucket sources the stage accepts, read off the bound output: the
-/// four timestamp widths, the zoned timestamp, and `DATE` — a date
-/// column buckets to whole days, which is a chart, not an accident.
+/// of bucket sources the stage accepts, read off the bound output.
 ///
-/// Nothing reaches the refusal on `DuckDB` 1.5.5: every other input type
-/// fails to bind first (pinned by `bucket_input_types_that_bind`). It is
-/// the guard for the day an implicit cast makes one of them bind, which
-/// is exactly how an untyped NULL gets through today
-/// (`untyped_null_bucket_takes_the_date_overload`).
+/// `DATE` is deliberately absent, and that is the whole reason this
+/// check earns its keep. `DuckDB` resolves
+/// `time_bucket(INTERVAL, <untyped NULL>)` to the `DATE` overload, so a
+/// bucket source that is nothing at all binds and declares `DATE` —
+/// indistinguishable here from a real date column
+/// (`null_column_refuses_naming_type`). Accepting `DATE` would therefore
+/// mean accepting a pipeline that charts every row into one NULL bucket.
+/// Refusing it costs a reader who really has a date column one cast, and
+/// tells them so.
+///
+/// Every other input type fails in the binder before reaching this
+/// (pinned by `bucket_input_types_that_bind`), so `DATE` — reached by a
+/// real date column or by an untyped NULL — is this check's live path.
 fn bucket_type_is_chartable(id: LogicalTypeId) -> bool {
     matches!(
         id,
@@ -1250,7 +1257,6 @@ fn bucket_type_is_chartable(id: LogicalTypeId) -> bool {
             | LogicalTypeId::TimestampMs
             | LogicalTypeId::TimestampNs
             | LogicalTypeId::TimestampTZ
-            | LogicalTypeId::Date
     )
 }
 
@@ -2160,35 +2166,31 @@ fn attribution_with_two_timecharts() {
     );
 }
 
-/// A DATE column buckets to whole days. `time_bucket` returns the type
-/// it bucketed, so the bound `_time` comes back DATE, and the
-/// bucket-type check accepts it.
+/// A DATE column binds — `time_bucket` has a DATE overload — and comes
+/// back declared DATE, which the bucket-type check refuses.
+///
+/// Not because a date is a nonsensical bucket source, but because
+/// `DuckDB` gives an untyped NULL the very same overload and the very
+/// same declared type (`null_column_refuses_naming_type`), so a `DATE`
+/// this check accepts is a NULL it also accepts. The reader is told
+/// which column and which type, and can cast it.
 #[cfg(test)]
 #[test]
-fn date_column_is_accepted() {
+fn date_column_refuses_naming_type() {
     let dir = tempfile::tempdir().expect("tempdir");
     let source = timechart_fixture(&dir);
 
-    let result = Executor::new()
-        .expect("executor")
-        .run_query(
-            "* | timechart on d span=1d count()",
-            &source,
-            &FieldTypes::new(),
-            usize::MAX,
-            0,
-        )
-        .expect("a DATE column is a bucket source");
     assert_eq!(
-        result.rows.len(),
-        2,
-        "one bucket per day present in the DATE column: {:?}",
-        result.rows
+        timechart_refusal(&source, "* | timechart on d span=1d count()"),
+        "timechart on 'd' is not a timestamp: DATE",
+        "a date column is named, with the type it came back as"
     );
 }
 
-/// The bucket-type check's refusal arm, exercised directly because no
-/// query reaches it on `DuckDB` 1.5.5 (see `bucket_input_types_that_bind`).
+/// The bucket-type check's accept-list and its type names, exercised
+/// directly: a query reaches the refusal only through `DATE`, every
+/// other refused type failing in the binder first (see
+/// `bucket_input_types_that_bind`).
 #[cfg(test)]
 #[test]
 fn bucket_types_accepted_and_named() {
@@ -2198,11 +2200,13 @@ fn bucket_types_accepted_and_named() {
         LogicalTypeId::TimestampMs,
         LogicalTypeId::TimestampNs,
         LogicalTypeId::TimestampTZ,
-        LogicalTypeId::Date,
     ] {
         assert!(bucket_type_is_chartable(id), "{id:?} must chart");
     }
     for (id, name) in [
+        // DATE leads the refused list: it is the one a query actually
+        // reaches, by a date column or by an untyped NULL.
+        (LogicalTypeId::Date, "DATE"),
         (LogicalTypeId::SqlNull, "NULL"),
         (LogicalTypeId::Varchar, "VARCHAR"),
         (LogicalTypeId::StringLiteral, "VARCHAR"),
@@ -2231,12 +2235,12 @@ fn bucket_types_accepted_and_named() {
 
 /// Which bucket source types `DuckDB` 1.5.5 binds at all.
 ///
-/// The evidence behind the bucket-type check being a guard rather than a
-/// live path: everything the check would refuse already fails in the
-/// binder, EXCEPT an untyped NULL, which `DuckDB` resolves to the DATE
-/// overload (`untyped_null_bucket_takes_the_date_overload`). A `DuckDB`
-/// upgrade that adds an implicit cast fails here, which is the signal to
-/// re-read both.
+/// The division of labour between the two refusal paths: everything
+/// below that does not bind is the binder's to refuse, and what binds is
+/// the bucket-type check's. `DATE` binds, which is why that check has a
+/// live path at all (`date_column_refuses_naming_type`,
+/// `null_column_refuses_naming_type`). A `DuckDB` upgrade that adds an
+/// implicit cast fails here, which is the signal to re-read both.
 #[cfg(test)]
 #[test]
 fn bucket_input_types_that_bind() {
@@ -2268,24 +2272,26 @@ fn bucket_input_types_that_bind() {
     }
 }
 
-/// `DuckDB` resolves `time_bucket(INTERVAL, <untyped NULL>)` to the DATE
-/// overload, so a bucket source that is nothing at all binds and comes
-/// back declared DATE — indistinguishable, at the bound output, from a
-/// real DATE column.
+/// A bucket source that is nothing at all is refused — and refusing it
+/// is why `DATE` is not an accepted bucket type.
 ///
-/// The consequence is visible and unfixed: `| let t = null | timechart on
-/// t count()` charts every row into one NULL bucket. The bucket-type
-/// check cannot separate the two cases while DATE is an accepted bucket
-/// source, so this pins the behaviour rather than asserting the one we
-/// want. A `DuckDB` upgrade that types the NULL as NULL fails here, and
-/// at that point the check refuses it with no further change.
+/// `DuckDB` resolves `time_bucket(INTERVAL, <untyped NULL>)` to the
+/// `DATE` overload, so `| let t = null | timechart on t count()` binds,
+/// declares its `_time` column `DATE`, and charts every row into one
+/// NULL bucket. At the bound output that is indistinguishable from a
+/// real date column (`date_column_refuses_naming_type`), so the two
+/// cases cannot be separated: accepting `DATE` would accept this. The
+/// first half below pins the `DuckDB` fact the decision rests on, so an
+/// upgrade that changes the overload resolution says so here.
 #[cfg(test)]
 #[test]
-fn untyped_null_bucket_takes_the_date_overload() {
+fn null_column_refuses_naming_type() {
     let dir = tempfile::tempdir().expect("tempdir");
     let source = timechart_fixture(&dir);
+    let dsl = "* | let t = null | timechart on t count()";
 
-    let query = parser::parse("* | let t = null | timechart on t count()").expect("dsl parses");
+    // The premise: it binds, and it binds as DATE.
+    let query = parser::parse(dsl).expect("dsl parses");
     let emitted = emitter::emit(&query, &source, EvalContext::capture()).expect("emit succeeds");
     let conn = Connection::open_in_memory().expect("in-memory duckdb");
     let mut stmt = conn.prepare(&emitted.sql).expect("an untyped NULL binds");
@@ -2294,20 +2300,16 @@ fn untyped_null_bucket_takes_the_date_overload() {
     assert_eq!(
         bound.column_logical_type(0).id(),
         LogicalTypeId::Date,
-        "an untyped NULL bucket still declares DATE"
+        "an untyped NULL bucket declares DATE"
     );
 
-    let result = Executor::new()
-        .expect("executor")
-        .run_query(
-            "* | let t = null | timechart on t count()",
-            &source,
-            &FieldTypes::new(),
-            usize::MAX,
-            0,
-        )
-        .expect("and is not refused today");
-    assert_eq!(result.rows.len(), 1, "every row lands in one NULL bucket");
+    // The consequence: the query lane refuses it, over a source with
+    // more than one row, rather than answering one NULL bucket.
+    assert_eq!(
+        timechart_refusal(&source, dsl),
+        "timechart on 't' is not a timestamp: DATE",
+        "the column the reader named, and the type it bound as"
+    );
 }
 
 #[cfg(test)]

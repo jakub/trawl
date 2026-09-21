@@ -690,7 +690,7 @@ timechart span=1h count() by service
 | from saved daily_errors run=all | timechart on _run_time span=1h sum(count)
 ```
 
-The bucket column is always named `_time`, and rows come back in bucket order. The buckets are cut from `_time` unless `on` names another column. That column must already hold timestamps or dates, because trawl buckets it as stored and refuses a column of any other type. A date column cannot bucket finer than one day, whatever `span=` asks for. Without `span=`, trawl derives the bucket from the `last=` window.
+The bucket column is always named `_time`, and rows come back in bucket order. The buckets are cut from `_time` unless `on` names another column. That column must already be a `TIMESTAMP`, because trawl buckets it as stored and refuses a column of any other type. A `DATE` column is refused too: cast it to a timestamp first, or bucket the event time with `span=1d` instead. Without `span=`, trawl derives the bucket from the `last=` window.
 
 | `last=` window | Bucket |
 | --- | --- |
