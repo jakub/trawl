@@ -177,13 +177,22 @@ fn ExactTableBody(
                         {move || {
                             let indices = indices.get();
                             if indices.is_empty() {
-                                // An empty result, or a link naming a page
-                                // past the fetched rows: either way there
-                                // is nothing on this page to draw.
+                                // Two different absences, told apart the
+                                // way the raw table tells them apart. An
+                                // empty result holds no rows anywhere; a
+                                // link naming a page past the fetched rows
+                                // holds plenty, just not here — and calling
+                                // that result empty is a claim about the
+                                // query the reader never made.
+                                let message = if page.get() > 0 && fetched > 0 {
+                                    "No rows on this page. Try the previous page."
+                                } else {
+                                    "No fish in this net yet"
+                                };
                                 return view! {
                                     <tr>
                                         <td class="results-empty-cell" colspan=col_count>
-                                            "No fish in this net yet"
+                                            {message}
                                         </td>
                                     </tr>
                                 }.into_any();

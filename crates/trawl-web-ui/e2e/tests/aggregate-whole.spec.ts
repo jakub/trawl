@@ -84,6 +84,10 @@ test('an out-of-range local page recovers', async ({ page, request }) => {
 
   const summary = page.locator(SEL.resultsSummary);
   await expect(summary).toHaveText(`0–0 of ${BUCKETS}`);
+  // And the table says which absence this is. The result has 59 rows;
+  // this page has none of them, which is not the same thing as an empty
+  // net.
+  await expect(page.locator(SEL.exactTable)).toContainText('No rows on this page.');
 
   await page.getByRole('button', { name: 'Prev' }).click();
   await expect(page).toHaveURL(/[?&]page=1/);
