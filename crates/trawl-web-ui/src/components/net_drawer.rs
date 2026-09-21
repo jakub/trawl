@@ -899,7 +899,7 @@ fn RunsPane(
     let table_viewport = NodeRef::<leptos::html::Div>::new();
     let page = RwSignal::new(0usize);
     let expanded_run: RwSignal<Option<i64>> = RwSignal::new(None);
-    let expanded_summary = RwSignal::new(None::<trawl_api::ReportRunSummary>);
+    let expanded_read = RwSignal::new(None::<RunRead>);
 
     let (runs, refresh_error, retry) = super::job_refresh::job_refresh(active, move || {
         mutation.track();
@@ -911,6 +911,31 @@ fn RunsPane(
             response.map(|resp| (p, resp))
         }
     });
+
+    // The last summary SEEN for the expanded run, which is not the same
+    // as the last read: a 409 answers with none, and this table needs
+    // one whatever the read said. It is what holds the row on screen
+    // after the list has moved past the run — the `For` below re-adds
+    // it from here, and the row's own cells read it — so letting a
+    // refusal empty it would take an expanded run off the table for
+    // having lost its result file.
+    //
+    // Keyed on the expansion: collapsing drops it, and no later
+    // expansion can inherit it.
+    let expanded_summary = Memo::new(
+        move |previous: Option<&Option<trawl_api::ReportRunSummary>>| {
+            let expanded = expanded_run.get()?;
+            if let Some(RunRead::Available(summary)) = expanded_read.get()
+                && summary.id == expanded
+            {
+                return Some(summary);
+            }
+            runs.get()
+                .and_then(Result::ok)
+                .and_then(|(_, r)| r.runs.into_iter().find(|r| r.id == expanded))
+                .or_else(|| previous.cloned().flatten().filter(|s| s.id == expanded))
+        },
+    );
 
     let now = fleet_ui::time::clock::now_ms();
     let window = Signal::derive(move || {
@@ -971,7 +996,6 @@ fn RunsPane(
                                 <td class="mono"><button type="button" class="row-stretch"
                                     aria-expanded=move || is_expanded().to_string()
                                     on:click=move |_| {
-                                        expanded_summary.set(Some(run.get_untracked()));
                                         expanded_run.update(|v| *v = if *v == Some(run_id) { None } else { Some(run_id) });
                                     }
                                 >{move || time_ago(&run.get().started_at, now.get())}</button>
@@ -985,7 +1009,7 @@ fn RunsPane(
                                 <td class="mono">{move || run.get().row_count.map_or_else(|| "—".to_string(), |n| n.to_string())}</td>
                                 <td class="path">{move || run.get().error_message.unwrap_or_default()}</td>
                             </tr>
-                            <Show when=is_expanded><tr><td colspan="5"><RunResultPreview net_id=net_id run_id=run_id bus=bus on_search=on_search summary=expanded_summary active=active/></td></tr></Show>
+                            <Show when=is_expanded><tr><td colspan="5"><RunResultPreview net_id=net_id run_id=run_id bus=bus on_search=on_search read=expanded_read active=active/></td></tr></Show>
                         }
                     }/>
                 </tbody></table>
@@ -1011,6 +1035,24 @@ fn RunsPane(
 /// replaces it through successes, and this state must replace: a preview
 /// still showing rows the server has just said it cannot serve would be the
 /// same lie in a slower form.
+/// What the last read of a stored run said, for a caller that shows
+/// something of its own beside the preview.
+///
+/// `None` in the signal that carries it means NO read has landed yet,
+/// which is a third state and not a quiet [`Self::Unavailable`]: a
+/// caller that cannot tell the two apart either prints its own guess as
+/// though the server had confirmed it, or prints nothing once the
+/// server has spoken. [`Self::Unavailable`] carries no summary because
+/// the 409 has none to give, and what belongs in its place is the
+/// caller's question rather than this component's.
+#[derive(Clone, PartialEq)]
+pub(crate) enum RunRead {
+    /// The summary that read returned.
+    Available(trawl_api::ReportRunSummary),
+    /// The run succeeded and its stored result is gone (issue #227).
+    Unavailable,
+}
+
 #[derive(Clone)]
 enum RunPreview {
     /// The run's response, whatever it carries.
@@ -1021,22 +1063,19 @@ enum RunPreview {
 
 /// One stored run's result, with the rerun control beneath it.
 ///
-/// Shared with the runs page, which mounts it beside its own execution
-/// receipt: the receipt reads `summary`, filled from the same response
+/// Shared with the runs page and the net drawer, which both show
+/// something of their own beside it out of the one `get_run` response
 /// this already fetches, rather than asking for the run a second time.
 #[component]
 #[allow(unused_variables)]
 pub(crate) fn RunResultPreview(
     active: Signal<bool>,
-    summary: RwSignal<Option<trawl_api::ReportRunSummary>>,
-    /// Whether the last read answered the unavailable-result 409, which
-    /// empties `summary` and leaves it empty however long it waits. A receipt beside
-    /// this preview needs the verdict itself, because "not read yet"
-    /// and "read, and the stored result is gone" are the same empty
-    /// `summary` and call for opposite behaviour. The net drawer's rows
-    /// are list-fed already and leave it unset.
-    #[prop(optional)]
-    unavailable: Option<RwSignal<bool>>,
+    /// What the LAST read said, and nothing more: [`None`] until one
+    /// lands, then whichever [`RunRead`] it answered with, replaced by
+    /// every read after it. Each caller derives what it needs from
+    /// that; this component holds no opinion about what a refusal owes
+    /// whatever a caller was showing before it.
+    read: RwSignal<Option<RunRead>>,
     net_id: i64,
     run_id: i64,
     bus: ToastBus,
@@ -1067,26 +1106,12 @@ pub(crate) fn RunResultPreview(
             ) {
                 terminal.set(true);
             }
-            // "Check again" can find a file that has come back, and the
-            // verdict has to be able to travel in that direction too.
-            if let Some(verdict) = unavailable {
-                verdict.set(false);
-            }
-            summary.set(Some(response.summary));
+            read.set(Some(RunRead::Available(response.summary)));
         }
         // Nothing about a run this old changes on its own, so polling it
         // again would only repeat the sentence. The control below asks.
         Some(Ok(RunPreview::Unavailable(_))) => {
-            // A run selected while it was still going left a `running`
-            // summary here, and this read has just superseded it. The
-            // refusal carries no summary of its own, so the eviction
-            // has to be explicit: leaving the old one is how a receipt
-            // reading from it ends up saying Running beside a sentence
-            // that says the run succeeded.
-            summary.set(None);
-            if let Some(verdict) = unavailable {
-                verdict.set(true);
-            }
+            read.set(Some(RunRead::Unavailable));
             terminal.set(true);
         }
         Some(Err(_)) | None => {}

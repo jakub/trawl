@@ -248,3 +248,43 @@ test('unavailable result replaces a running summary', async ({ page, request }) 
   await expect(field('Rows recorded')).toHaveText('—');
   await expect(field('Query')).toHaveText(CORPUS.runWithResultQuery);
 });
+
+// The net drawer keeps an expanded run on screen after its list has
+// moved past it, out of the last summary it saw for that run. A run
+// whose stored result is gone has a 409 for its last READ, and a 409
+// carries no summary — so the row has to survive one.
+test('unavailable result keeps the expanded row after the list moves on', async ({ page, request }) => {
+  await resetScenario(request, 'schedule');
+  await armRunUnavailable(request, SCHEDULE.pagedRunId);
+  await page.clock.install();
+
+  let lists = 0;
+  let listed = true;
+  await page.route(`**/api/v1/saved/${SCHEDULE.windowedNetId}/runs?*`, async route => {
+    if (new URL(route.request().url()).pathname !== `/api/v1/saved/${SCHEDULE.windowedNetId}/runs`) {
+      await route.fallback();
+      return;
+    }
+    const response = await route.fetch();
+    const body = await response.json();
+    lists++;
+    if (!listed) body.runs = body.runs.filter((run: { id: number }) => run.id !== SCHEDULE.pagedRunId);
+    await route.fulfill({ response, json: body });
+  });
+
+  await page.goto(`/jobs/nets?net=${SCHEDULE.windowedNetId}&ntab=runs`);
+  await expect(page.locator(SEL.netRunRow)).toHaveCount(3);
+  await page.locator(SEL.netRunRow).first().locator(SEL.rowStretch).click();
+  const preview = page.locator(SEL.netRunPreview);
+  await expect(preview.locator(SEL.runUnavailable)).toHaveText(SENTENCE);
+
+  // The list moves past the expanded run. The row is the drawer's now,
+  // not the page's, and the refusal is not a reason to drop it.
+  listed = false;
+  const before = lists;
+  await page.clock.fastForward(5_000);
+  await expect.poll(() => lists).toBeGreaterThan(before);
+  await expect(page.getByText('Expanded run outside this page')).toHaveCount(1);
+  await expect(page.locator(SEL.netRunRow)).toHaveCount(3);
+  await expect(preview.locator(SEL.runUnavailable)).toHaveText(SENTENCE);
+});

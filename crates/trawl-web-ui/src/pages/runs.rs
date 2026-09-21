@@ -24,7 +24,7 @@ use leptos_use::use_media_query;
 use trawl_api::{RunsSortDir, RunsSortKey};
 
 use crate::api::{self, RUNS_PAGE_SIZE};
-use crate::components::net_drawer::RunResultPreview;
+use crate::components::net_drawer::{RunRead, RunResultPreview};
 use crate::components::sort_th::table_sort_th;
 use crate::state::query::{Mode, RangeSpec, navigator, report_refusal};
 use fleet_ui::time::{format_duration, time_ago};
@@ -423,17 +423,11 @@ fn RunDetail(
     docked: Signal<bool>,
 ) -> impl IntoView {
     let bus = expect_context::<ToastBus>();
-    // Filled by the preview below out of the one `get_run` response the
-    // two of them share; the preview keeps it current while the run is
-    // still going. Empty until that read lands, and emptied again — a
-    // `running` answer and all — the moment one answers the
-    // unavailable-result 409, which has no summary to put in its place.
-    let summary = RwSignal::new(None::<trawl_api::ReportRunSummary>);
-    // Set by that same read once it has ANSWERED the 409. An empty
-    // `summary` alone cannot be read as a refusal: it is also what a
-    // read still in flight looks like, and falling back then would
-    // print the list's snapshot as if the server had confirmed it.
-    let unavailable = RwSignal::new(false);
+    // What the preview's last read of this run said, whatever it said:
+    // the two of them share one `get_run` response rather than asking
+    // twice. `None` until a read lands, which is why the receipt can
+    // tell a read still in flight from one that has refused.
+    let read = RwSignal::new(None::<RunRead>);
 
     // These memos live under the selected identity's keyed owner. Paging
     // the list away from the selected run retains a correct name and a
@@ -446,29 +440,30 @@ fn RunDetail(
             listed.get().or_else(|| previous.cloned().flatten())
         },
     );
-    // The read wins whenever it has an answer: a running run's duration
-    // and row count move, and the list is a page old. It has no answer
-    // to give once it has refused — the refusal evicts whatever it held
-    // before — and only then does the list's own
-    // record of the run become the receipt — with the outcome corrected.
+    // The read wins whenever it has a summary: a running run's duration
+    // and row count move, and the list is a page old. It has none to
+    // give once it has refused — a refusal supersedes whatever it said
+    // before, `running` included — and only then does the list's own
+    // record of the run become the receipt, with the outcome corrected.
     // The server answers this 409 only for a run whose query SUCCEEDED
     // and wrote a result file it can no longer find
     // (`from_saved::unavailable_run_conflict`), so a row snapshotted
     // while the run was still going is stale about the outcome and about
     // nothing else: its empty duration and row count are honest.
-    let shown = Signal::derive(move || {
-        if let Some(fresh) = summary.get() {
-            return Some(fresh);
+    //
+    // Until a read has landed there is nothing the server has confirmed,
+    // and the receipt says so by staying empty.
+    let shown = Signal::derive(move || match read.get() {
+        Some(RunRead::Available(summary)) => Some(summary),
+        Some(RunRead::Unavailable) => {
+            known_listing
+                .get()
+                .map(|listing| trawl_api::ReportRunSummary {
+                    status: "success".to_owned(),
+                    ..listing
+                })
         }
-        if !unavailable.get() {
-            return None;
-        }
-        known_listing
-            .get()
-            .map(|listing| trawl_api::ReportRunSummary {
-                status: "success".to_owned(),
-                ..listing
-            })
+        None => None,
     });
     let title = move || known_name.get().unwrap_or_else(|| format!("Run {run_id}"));
     let status = move || shown.get().map(|s| s.status);
@@ -509,8 +504,7 @@ fn RunDetail(
                 <div class="data-area">
                     <RunResultPreview
                         active=Signal::stored(true)
-                        summary=summary
-                        unavailable=unavailable
+                        read=read
                         net_id=net_id
                         run_id=run_id
                         bus=bus
