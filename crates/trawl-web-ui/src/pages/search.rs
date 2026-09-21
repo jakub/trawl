@@ -575,14 +575,33 @@ pub fn Search() -> impl IntoView {
     // The exact table's sort column and direction, owned here rather
     // than inside the table: the bars beside it slice the SAME sorted
     // list, and a sort that lived privately in the table would put the
-    // two on different orders the moment a page turned. Reset when the
-    // executed query moves, which is what re-creating the table used to
-    // do; a page turn under a fetched-whole aggregation keeps it, since
-    // the rows on screen are still that result.
+    // two on different orders the moment a page turned. A page turn
+    // under a fetched-whole aggregation keeps it, since the rows on
+    // screen are still that result.
+    //
+    // Reset on the RESPONSE's identity, not on the pending query. The
+    // rows on screen during a round trip belong to the previous
+    // response, and resetting when the next query is submitted made
+    // them visibly shuffle back to server order for the whole flight,
+    // under a sort control that still claimed the old column. They hold
+    // their order until their replacement lands.
+    //
+    // The executed query alone, not the response generation: a
+    // same-query Haul re-runs the identical query, so its rows are the
+    // same rows and the sort survives it (the C4 contract). Keying on
+    // the generation would reset on every refetch instead.
     let sort = RwSignal::new(None::<(usize, bool)>);
-    Effect::new(move |_| {
-        snapshot_q.track();
-        sort.set(None);
+    Effect::new(move |prev: Option<Option<String>>| {
+        let previous = prev.flatten();
+        // Nothing landed — a first request in flight, or a failure.
+        // Hold the last answer rather than reading the gap as a change.
+        let Some(landed) = rows.get().and_then(Result::ok).map(|r| r.query.effective) else {
+            return previous;
+        };
+        if previous.is_some_and(|before| before != landed) {
+            sort.set(None);
+        }
+        Some(landed)
     });
 
     let is_chart_query = Memo::new(move |_| is_aggregation_shape(&effective_q.get()));

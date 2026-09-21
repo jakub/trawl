@@ -178,6 +178,36 @@ test('the chart waits for the matching response while the group searches keep th
   await expect(page.locator(SEL.groupSearch)).toHaveCount(GROUPS);
 });
 
+test('a sorted table keeps its order until the next response lands', async ({ page, request }) => {
+  await resetScenario(request, 'corpus');
+  await page.goto(AGG_URL);
+
+  // Sort on the metric, so the order on screen is nothing like the one
+  // the response arrived in.
+  const header = page.locator(`${SEL.exactTable} thead th`).nth(1);
+  await header.locator('button').click();
+  await expect(header).toHaveAttribute('aria-sort', 'descending');
+  const labels = page.locator(`${SEL.exactTable} tbody tr td:first-child`);
+  const sorted = await labels.allInnerTexts();
+
+  // Hold the next query open. The rows under it are still the previous
+  // response's, so they keep the order the reader put them in: the sort
+  // belongs to the response on screen, not to the query in flight.
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  await page.route('**/api/v1/query*', async (route) => { await held; await route.continue(); });
+
+  await page.locator(SEL.groupSearch).first().click();
+  await expect(page).toHaveURL(/[?&]f=v1\./);
+  await expect(header).toHaveAttribute('aria-sort', 'descending');
+  expect(await labels.allInnerTexts()).toEqual(sorted);
+
+  // The replacement lands and takes the order with it: these are
+  // different rows, executed for a different query.
+  release();
+  await expect(header).not.toHaveAttribute('aria-sort', /.*/);
+});
+
 test('bar widths do not change with the page', async ({ page, request }) => {
   // 60 groups: more than one page, so the same result is read in two
   // slices and a bar can be compared across them.
