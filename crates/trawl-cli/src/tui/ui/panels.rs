@@ -1121,6 +1121,7 @@ fn format_value(val: &trawl_api::value::Value) -> String {
         trawl_api::value::Value::Null => "NULL".to_owned(),
         trawl_api::value::Value::Boolean(b) => b.to_string(),
         trawl_api::value::Value::Integer(i) => i.to_string(),
+        trawl_api::value::Value::UInt(u) => u.to_string(),
         trawl_api::value::Value::Float(f) => format!("{f:.2}"),
         trawl_api::value::Value::String(s) => s.clone(),
         trawl_api::value::Value::Array(arr) => {

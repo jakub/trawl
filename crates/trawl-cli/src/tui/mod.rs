@@ -942,7 +942,7 @@ where
 }
 
 /// A live event carrying a number past `i64::MAX` reaches the results
-/// buffer as its exact digits.
+/// buffer as that exact number.
 ///
 /// The buffer decodes each field with `serde_json::from_value::<Value>`,
 /// so this is `trawl_api::value`'s landing rule seen from the TUI: before
@@ -967,13 +967,13 @@ fn live_event_large_unsigned_exact() {
         .expect("request_id column");
     assert_eq!(
         response.result.rows[0][idx],
-        trawl_engine::value::Value::String("18446744073709551615".to_owned()),
-        "a live cell must be digits, never a rounded double or a null"
+        trawl_engine::value::Value::UInt(u64::MAX),
+        "a live cell must carry the number, never a rounded double or a null"
     );
 }
 
 /// The same rule on the aggregation lane: a snapshot row's oversized
-/// unsigned is stored as digits.
+/// unsigned is stored as the number it is.
 #[cfg(test)]
 #[test]
 fn snapshot_large_unsigned_exact() {
@@ -986,8 +986,8 @@ fn snapshot_large_unsigned_exact() {
     let response = buffer.to_query_response();
     assert_eq!(
         response.result.rows[0][1],
-        trawl_engine::value::Value::String("18446744073709551615".to_owned()),
-        "a snapshot cell must be digits, never a rounded double or a null"
+        trawl_engine::value::Value::UInt(u64::MAX),
+        "a snapshot cell must carry the number, never a rounded double or a null"
     );
 }
 

@@ -3142,6 +3142,7 @@ fn value_to_json(value: &Value) -> serde_json::Value {
         Value::Null => serde_json::Value::Null,
         Value::Boolean(b) => serde_json::Value::Bool(*b),
         Value::Integer(i) => serde_json::json!(i),
+        Value::UInt(u) => serde_json::json!(u),
         Value::Float(f) => serde_json::json!(f),
         Value::String(s) => serde_json::Value::String(s.clone()),
         Value::Array(arr) => serde_json::Value::Array(arr.iter().map(value_to_json).collect()),
@@ -3226,6 +3227,9 @@ fn value_to_string(value: &Value) -> Cow<'_, str> {
         Value::Null => Cow::Borrowed(""),
         Value::Boolean(b) => Cow::Owned(b.to_string()),
         Value::Integer(i) => Cow::Owned(i.to_string()),
+        // Digits, at full width: a CSV export is the one place a reader
+        // takes the number away, so it must not round.
+        Value::UInt(u) => Cow::Owned(u.to_string()),
         Value::Float(f) => Cow::Owned(f.to_string()),
         Value::String(s) => sanitize_csv_formula(s),
         Value::Array(_) => {

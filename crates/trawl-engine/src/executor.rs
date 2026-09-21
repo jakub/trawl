@@ -1108,6 +1108,9 @@ fn value_to_json(v: &Value) -> serde_json::Value {
         Value::Null => serde_json::Value::Null,
         Value::Boolean(b) => serde_json::Value::Bool(*b),
         Value::Integer(n) => serde_json::json!(n),
+        // A JSON number, like every other integer: ndjson export must
+        // spell an oversized unsigned the way the wire does.
+        Value::UInt(u) => serde_json::json!(u),
         Value::Float(f) => serde_json::json!(f),
         Value::String(s) => serde_json::Value::String(s.clone()),
         Value::Array(arr) => serde_json::Value::Array(arr.iter().map(value_to_json).collect()),
@@ -1787,9 +1790,9 @@ fn extract_value(row: &duckdb::Row<'_>, idx: usize, utc_offset_secs: i32) -> Val
         ValueRef::SmallInt(i) => Value::Integer(i64::from(i)),
         ValueRef::Int(i) => Value::Integer(i64::from(i)),
         ValueRef::BigInt(i) => Value::Integer(i),
-        // Past `i64::MAX` the wire has no integer variant to hold the
-        // magnitude, so it lands as its exact digits — `trawl_api::value`
-        // owns that rule for every decoder, this one included.
+        // Past `i64::MAX` the magnitude lands in `Value::UInt` —
+        // `trawl_api::value` owns that rule for every decoder, this one
+        // included.
         ValueRef::HugeInt(i) => land_i128(i),
         ValueRef::UTinyInt(i) => Value::Integer(i64::from(i)),
         ValueRef::USmallInt(i) => Value::Integer(i64::from(i)),
@@ -1843,8 +1846,8 @@ fn convert_duckdb_value(v: duckdb::types::Value) -> Value {
     }
 }
 
-/// A `UBIGINT` inside a `list()` reaches the reader as digits, including
-/// the one past `i64::MAX` that no integer variant holds.
+/// A `UBIGINT` inside a `list()` reaches the reader as a number,
+/// including the ones past `i64::MAX` that only `Value::UInt` holds.
 ///
 /// Driven through a real `DuckDB` list so the element type is whatever the
 /// driver actually hands back, not whatever this module assumes: the arm
@@ -1868,10 +1871,10 @@ fn list_ubigint_renders_digits() {
         cell,
         Value::Array(vec![
             Value::Integer(1),
-            Value::String("9223372036854775808".to_owned()),
-            Value::String("18446744073709551615".to_owned()),
+            Value::UInt(9_223_372_036_854_775_808),
+            Value::UInt(u64::MAX),
         ]),
-        "every element must be digits, never debug text"
+        "every element must be a number, never debug text"
     );
     let rendered = cell.to_string();
     assert!(

@@ -20,9 +20,9 @@ use trawl_api::value::{Value, land_u64};
 
 /// Convert a JSON value into a `trawl_api::value::Value`.
 ///
-/// A number that fits `i64` is an integer. Above that there is no integer
-/// variant to hold it, so it lands as its exact decimal digits
-/// ([`land_u64`]) rather than as a rounded double. Anything else with a
+/// A number that fits `i64` is an integer; above that [`land_u64`] gives
+/// it the unsigned variant, which is still a number the results table can
+/// sort and chart, rather than a rounded double. Anything with a
 /// fractional or out-of-range magnitude is a float; a number `serde_json`
 /// can describe as none of those is null.
 pub(crate) fn json_to_value(value: serde_json::Value) -> Value {
@@ -45,7 +45,7 @@ pub(crate) fn json_to_value(value: serde_json::Value) -> Value {
     }
 }
 
-/// A live event's oversized unsigned reaches the results table as digits.
+/// A live event's oversized unsigned reaches the results table intact.
 ///
 /// Ingest keeps such a value as an unsigned integer and the SSE lane
 /// re-serializes it as a raw JSON number, so this decoder is the last
@@ -55,11 +55,11 @@ pub(crate) fn json_to_value(value: serde_json::Value) -> Value {
 fn large_unsigned_is_exact_string() {
     assert_eq!(
         json_to_value(serde_json::json!(18_446_744_073_709_551_615_u64)),
-        Value::String("18446744073709551615".to_owned())
+        Value::UInt(u64::MAX)
     );
     assert_eq!(
         json_to_value(serde_json::json!(9_223_372_036_854_775_808_u64)),
-        Value::String("9223372036854775808".to_owned())
+        Value::UInt(9_223_372_036_854_775_808)
     );
     assert_eq!(json_to_value(serde_json::json!(42)), Value::Integer(42));
     assert_eq!(json_to_value(serde_json::json!(-42)), Value::Integer(-42));

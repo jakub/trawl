@@ -117,6 +117,7 @@ fn cell_to_eval(cell: &crate::value::Value) -> EvalValue {
         crate::value::Value::Null => EvalValue::Null,
         crate::value::Value::Boolean(b) => EvalValue::Bool(*b),
         crate::value::Value::Integer(i) => EvalValue::Int(*i),
+        crate::value::Value::UInt(u) => EvalValue::UInt(*u),
         crate::value::Value::Float(f) => EvalValue::Float(*f),
         crate::value::Value::String(s) => EvalValue::Str(s.clone()),
         crate::value::Value::Array(arr) => EvalValue::Array(arr.iter().map(cell_to_eval).collect()),
@@ -138,11 +139,11 @@ fn eval_to_cell(cell: &EvalValue) -> crate::value::Value {
         EvalValue::Null => crate::value::Value::Null,
         EvalValue::Bool(b) => crate::value::Value::Boolean(*b),
         EvalValue::Int(i) => crate::value::Value::Integer(*i),
-        // `crate::value::Value::Integer` is signed, so a magnitude above
-        // `i64::MAX` has no integer variant to land in. It lands as its
-        // exact digits instead, the rule `trawl_api::value` owns for every
-        // decoder on this wire — a kv tail must not answer with a rounded
-        // reading of a number the SQL prefix would have spelled exactly.
+        // `Value::Integer` is signed, so a magnitude above `i64::MAX`
+        // lands in `Value::UInt` instead — the rule `trawl_api::value`
+        // owns for every decoder on this wire. A kv tail must not answer
+        // with a rounded reading of a number the SQL prefix would have
+        // spelled exactly.
         EvalValue::UInt(u) => land_u64(*u),
         EvalValue::Float(f) => crate::value::Value::Float(*f),
         EvalValue::Str(s) => crate::value::Value::String(s.clone()),
@@ -151,13 +152,14 @@ fn eval_to_cell(cell: &EvalValue) -> crate::value::Value {
     }
 }
 
-/// The unsigned bridge arm lands digits, not a rounded double.
+/// The unsigned bridge arm lands the number, not a rounded double, and
+/// picks the narrower signed variant when that holds the value.
 #[cfg(test)]
 #[test]
 fn unsigned_arm() {
     assert_eq!(
         eval_to_cell(&EvalValue::UInt(u64::MAX)),
-        crate::value::Value::String("18446744073709551615".to_owned())
+        crate::value::Value::UInt(u64::MAX)
     );
     assert_eq!(
         eval_to_cell(&EvalValue::UInt(5)),

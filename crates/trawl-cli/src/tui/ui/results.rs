@@ -680,6 +680,11 @@ fn render_error_display(
 ///
 /// Requires at least one string column (label) and one numeric column (value),
 /// and must not be a timechart result (those get line charts).
+///
+/// Numeric is decided by variant, `Value::UInt` included: a
+/// `stats first(request_id) by service` over an id past `i64::MAX` is a
+/// metric like any other, and reading it as text would leave the view
+/// with no value column and refuse to draw.
 pub fn is_bar_chartable(result: &trawl_engine::value::QueryResult) -> bool {
     if is_timechart_result(result) || result.rows.is_empty() {
         return false;
@@ -688,7 +693,7 @@ pub fn is_bar_chartable(result: &trawl_engine::value::QueryResult) -> bool {
     let has_string = first_row.iter().any(|v| matches!(v, Value::String(_)));
     let has_numeric = first_row
         .iter()
-        .any(|v| matches!(v, Value::Integer(_) | Value::Float(_)));
+        .any(|v| matches!(v, Value::Integer(_) | Value::UInt(_) | Value::Float(_)));
     has_string && has_numeric
 }
 
@@ -918,7 +923,7 @@ fn render_bar_chart(
         .unwrap_or(0);
     let value_col = first_row
         .iter()
-        .position(|v| matches!(v, Value::Integer(_) | Value::Float(_)))
+        .position(|v| matches!(v, Value::Integer(_) | Value::UInt(_) | Value::Float(_)))
         .unwrap_or(1);
 
     let metric_name = &result.columns[value_col].name;
@@ -942,8 +947,13 @@ fn render_bar_chart(
         .enumerate()
         .map(|(idx, row)| {
             let label = value_to_string(&row[label_col]);
+            // A bar's height is a `u64`, which is `Value::UInt`'s own
+            // width, so an oversized unsigned draws at its real
+            // magnitude. A negative or a NaN clamps to the bottom of the
+            // axis, as it always has.
             let value = match &row[value_col] {
                 Value::Integer(i) => (*i).max(0) as u64,
+                Value::UInt(u) => *u,
                 Value::Float(f) => f.max(0.0) as u64,
                 _ => 0,
             };
@@ -1448,6 +1458,73 @@ fn format_duration(secs: u64) -> String {
 /// grid's ordinary rendering where the ladder has no reading for the value.
 fn severity_cell_text(value: &trawl_engine::value::Value) -> String {
     crate::cli::severity_token(value).map_or_else(|| value_to_string(value), str::to_owned)
+}
+
+/// A `stats first(request_id) by service` over an id past `i64::MAX`
+/// draws a real bar.
+///
+/// Two ways it used to go wrong at once: the classifier saw no numeric
+/// column and refused to draw at all, or the per-row conversion fell
+/// through its wildcard and drew every bar at zero. Rendered through the
+/// whole UI, because the view is chosen by `is_bar_chartable` and drawn
+/// by `render_bar_chart` — the bug lived in the seam between them.
+#[cfg(test)]
+#[test]
+fn bar_chart_renders_uint_metric() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use trawl_engine::value::{Column, QueryResult};
+
+    let result = QueryResult {
+        columns: vec![
+            Column {
+                name: "service".to_owned(),
+            },
+            Column {
+                name: "first_request_id".to_owned(),
+            },
+        ],
+        rows: vec![vec![
+            Value::String("nginx".to_owned()),
+            Value::UInt(u64::MAX),
+        ]],
+    };
+    assert!(
+        is_bar_chartable(&result),
+        "an unsigned metric column must still offer a bar chart"
+    );
+
+    let mut app = crate::tui::tests::test_app();
+    let returned = result.rows.len();
+    app.tab.result = Some(trawl_client::QueryResponse {
+        execution: None,
+        result,
+        truncated: false,
+        pagination: trawl_client::PaginationMeta {
+            limit: 10_000,
+            offset: 0,
+            returned,
+        },
+        degraded_fields: Vec::new(),
+        severity_columns: Vec::new(),
+    });
+    app.tab.chart_view = ChartView::BarChart;
+
+    let backend = TestBackend::new(120, 20);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|f| crate::tui::ui::render(&mut app, f))
+        .expect("render");
+    let screen = terminal.backend().to_string();
+
+    assert!(
+        screen.contains("18446744073709551615"),
+        "the bar label must carry the whole number:\n{screen}"
+    );
+    assert!(
+        screen.contains('\u{2588}'),
+        "the bar must have a height, not sit at zero:\n{screen}"
+    );
 }
 
 #[cfg(test)]
