@@ -479,10 +479,9 @@ changes Rust signal access or framework callback lifetimes.
 The `pagination` scenario supplies offset-aware History, query results and
 report-run pages. Its three-run wire bodies and matching statistics are decoded
 by the native wire contract; larger pages are generated from those same row
-shapes. Query responses stamp the requested offset and returned row count.
-Configurable totals cover full, short and empty pages, and `truncated` is
-independent of the offset paging protocol. No real database or auth service is
-involved.
+shapes. Query responses stamp the requested offset, the returned row count and
+the pre-window total the execution produced. Configurable totals cover full,
+short and empty pages. No real database or auth service is involved.
 
 `pagination.spec.ts` checks History's single-decode reader, URL replacement,
 filters, offset refusal, Known totals and Probe Next behavior; global Runs and

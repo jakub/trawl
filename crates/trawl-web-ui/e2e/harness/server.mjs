@@ -182,7 +182,7 @@ function hasCorpus() {
 
 // Only the pagination scenario uses these counts and held reads.
 const pagination = {
-  historyTotal: 103, runsTotal: 3, queryTotal: 53, truncated: false,
+  historyTotal: 103, runsTotal: 3, queryTotal: 53,
   holdHistoryOffset: null, held: null, history: [], runs: [], completed: [],
   holdQueryNumber: null, heldQuery: null,
 };
@@ -204,8 +204,11 @@ function paginationQuery(offset, limit, query) {
   const response = wire('query-rows');
   response.rows = paginationSlice(pagination.queryTotal, offset, limit,
     i => [response.rows[0][0], 'web-01', 200, `query-row-${i + 1} ${query}`]);
-  response.pagination = { offset, limit, returned: response.rows.length };
-  response.truncated = pagination.truncated;
+  // `total` is what the execution produced, measured before the window
+  // was cut from it — never the length of the slice that went back.
+  response.pagination = {
+    offset, limit, returned: response.rows.length, total: pagination.queryTotal,
+  };
   response.execution = {
     started_at: new Date(Date.parse('2026-09-15T12:34:56Z') + offset * 1000).toISOString(),
     duration_ms: 125 + offset,
@@ -268,7 +271,7 @@ function resetState() {
   if (pagination.held) pagination.held.res.destroy();
   if (pagination.heldQuery) pagination.heldQuery.res.destroy();
   Object.assign(pagination, {
-    historyTotal: 103, runsTotal: 3, queryTotal: 53, truncated: false,
+    historyTotal: 103, runsTotal: 3, queryTotal: 53,
     holdHistoryOffset: null, held: null, history: [], runs: [], completed: [],
     holdQueryNumber: null, heldQuery: null,
   });
@@ -468,7 +471,7 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       scenario = parsed.scenario || 'default';
       resetState();
       if (scenario === 'pagination' && parsed.pagination) {
-        for (const key of ['historyTotal', 'runsTotal', 'queryTotal', 'holdHistoryOffset', 'holdQueryNumber', 'truncated']) {
+        for (const key of ['historyTotal', 'runsTotal', 'queryTotal', 'holdHistoryOffset', 'holdQueryNumber']) {
           if (key in parsed.pagination) pagination[key] = parsed.pagination[key];
         }
       }

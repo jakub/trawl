@@ -774,12 +774,6 @@ const CONTRACTS: &[Contract] = &[
         hook: ">\"Stop live\"<",
     },
     Contract {
-        assignment: "truncatedBadge: 'Truncated',",
-        source_path: "src/pages/search.rs",
-        source: include_str!("../src/pages/search.rs"),
-        hook: ">\"Truncated\"<",
-    },
-    Contract {
         assignment: "draftDirty: 'Edited',",
         source_path: "src/components/editor_wrap.rs",
         source: EDITOR_WRAP_RS,

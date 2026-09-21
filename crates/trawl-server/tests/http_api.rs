@@ -1773,6 +1773,7 @@ async fn query_pagination_limit_offset() {
     assert_eq!(resp.pagination.limit, 2);
     assert_eq!(resp.pagination.offset, 1);
     assert_eq!(resp.pagination.returned, 2);
+    assert_eq!(resp.pagination.total, 3);
     assert_eq!(resp.result.row_count(), 2);
 }
 
@@ -1787,6 +1788,7 @@ async fn query_pagination_offset_beyond_results() {
         .unwrap();
     assert_eq!(resp.pagination.offset, 100);
     assert_eq!(resp.pagination.returned, 0);
+    assert_eq!(resp.pagination.total, 3);
     assert_eq!(resp.result.row_count(), 0);
 }
 
@@ -1819,6 +1821,32 @@ async fn query_pagination_defaults() {
     let resp = client.query_paginated("*", None, None).await.unwrap();
     assert_eq!(resp.pagination.offset, 0);
     assert_eq!(resp.pagination.returned, 3);
+    assert_eq!(resp.pagination.total, 3);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn query_pagination_total_is_prewindow_count() {
+    let server = setup().await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+
+    // The fixture holds 3 rows. `total` counts what the execution produced,
+    // so every window over the same result reports the same number.
+    for (limit, offset, returned) in [(2, 0, 2), (2, 1, 2), (2, 2, 1), (2, 9, 0)] {
+        let resp = client
+            .query_paginated("*", Some(limit), Some(offset))
+            .await
+            .unwrap();
+        assert_eq!(resp.pagination.limit, limit);
+        assert_eq!(resp.pagination.offset, offset);
+        assert_eq!(
+            resp.pagination.returned, returned,
+            "window limit={limit} offset={offset}"
+        );
+        assert_eq!(
+            resp.pagination.total, 3,
+            "the pre-window count at limit={limit} offset={offset}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

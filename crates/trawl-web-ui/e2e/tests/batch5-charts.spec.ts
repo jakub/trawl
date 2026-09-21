@@ -8,7 +8,7 @@ import { expectFocusRing } from '../a11y';
 const countResult = {
   columns: [{ name: '_time' }, { name: 'count' }],
   rows: [['2026-09-01T00:00:00Z', 2], ['2026-09-01T00:01:00Z', 4]],
-  truncated: false, pagination: { limit: 50, offset: 0, returned: 2 },
+  pagination: { limit: 50, offset: 0, returned: 2, total: 2 },
 };
 
 test('snapshot chart handles completed, unsupported, empty and failed responses without stale canvas', async ({ page }) => {

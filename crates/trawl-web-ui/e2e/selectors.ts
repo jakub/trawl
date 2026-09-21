@@ -493,9 +493,6 @@ export const COPY = {
   /// crates/trawl-web-ui/src/pages/search.rs — the tab strip's Stop
   /// live button text.
   stopLiveText: 'Stop live',
-  /// crates/trawl-web-ui/src/pages/search.rs — the warn badge the result
-  /// header shows when the server cut the answer short.
-  truncatedBadge: 'Truncated',
   /// crates/trawl-web-ui/src/components/editor_wrap.rs — the console
   /// header marks an editor buffer that differs from the executed query.
   draftDirty: 'Edited',

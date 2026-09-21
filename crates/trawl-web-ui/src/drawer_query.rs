@@ -248,11 +248,11 @@ mod tests {
                     .collect(),
                 rows,
             },
-            truncated: false,
             pagination: trawl_api::PaginationMeta {
                 limit: 50,
                 offset: 0,
                 returned: 1,
+                total: 1,
             },
             degraded_fields: Vec::new(),
             severity_columns: Vec::new(),

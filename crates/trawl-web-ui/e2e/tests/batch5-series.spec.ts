@@ -21,7 +21,7 @@ for (const deviceScaleFactor of [1, 2]) {
       await page.route('**/api/v1/query', route => route.fulfill({ json: {
         columns: [{ name: '_time' }, ...labels.map(name => ({ name }))],
         rows: values.map((row, i) => [`2026-09-01T00:0${i}:00Z`, ...row]),
-        truncated: false, pagination: { limit: 50, offset: 0, returned: 3 },
+        pagination: { limit: 50, offset: 0, returned: 3, total: 3 },
       } }));
       await page.goto('/search?q=' + encodeURIComponent('service=nginx | timechart ' + labels.map(label => `count() as ${label}`).join(', ')));
       await page.getByRole('tab', { name: 'Visualization' }).click();
@@ -58,7 +58,7 @@ test('ingest charts show the containing hour in a bounded tooltip', async ({ pag
     return route.fulfill({ json: {
       columns: [{ name: '_time' }, { name: 'count' }],
       rows: [['2026-09-01T00:00:00Z', 2], ['2026-09-01T01:00:00Z', 1]],
-      truncated: false, pagination: { limit: 50, offset: 0, returned: 2 },
+      pagination: { limit: 50, offset: 0, returned: 2, total: 2 },
     } });
   });
   await page.goto('/search/schema?svc=nginx');

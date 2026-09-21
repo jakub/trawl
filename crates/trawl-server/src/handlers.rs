@@ -229,7 +229,6 @@ pub async fn query(
     match outcome.result {
         Ok(qr) => {
             let total = qr.row_count();
-            let truncated = total >= max_rows;
             let paginated = qr.paginate(offset, limit);
             let returned = paginated.row_count();
 
@@ -308,11 +307,11 @@ pub async fn query(
                     duration_ms,
                 }),
                 result: paginated,
-                truncated,
                 pagination: PaginationMeta {
                     limit,
                     offset,
                     returned,
+                    total,
                 },
                 degraded_fields,
                 severity_columns,

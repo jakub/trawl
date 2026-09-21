@@ -205,7 +205,7 @@ const RETIRED_SELECTORS: &[&str] = &[
     // The meta strip became the executed-scope strip (ADR-0032): the
     // chips kept their `.meta-chips` wrapper and their own classes, but
     // every rule that scoped them under `.meta` is re-homed under
-    // `.scope`, and the truncation note left for the result header.
+    // `.scope`, and the truncation note that sat there is gone.
     ".scope-lb",
     ".scope-window",
     ".meta",

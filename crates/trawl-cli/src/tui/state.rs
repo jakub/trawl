@@ -1819,11 +1819,11 @@ impl LiveBuffer {
         QueryResponse {
             execution: None,
             result: QueryResult { columns, rows },
-            truncated: false,
             pagination: PaginationMeta {
                 limit: self.max_rows,
                 offset: 0,
                 returned,
+                total: returned,
             },
             // The SSE lane carries no incomplete-results notice (ADR-0011 slice C1).
             degraded_fields: Vec::new(),

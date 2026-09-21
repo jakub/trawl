@@ -65,8 +65,8 @@ use crate::state::query::{
 use crate::state::search_session::rows_resource;
 use fleet_ui::overlay::use_overlay_layer;
 use fleet_ui::{
-    Badge, Details, LoadState, Rows, Segmented, SegmentedOption, Size, TabItem, Tabs, ToastBus,
-    ToastKind, Tone, UiPrefs,
+    Details, LoadState, Rows, Segmented, SegmentedOption, Size, TabItem, Tabs, ToastBus, ToastKind,
+    UiPrefs,
 };
 use leptos::ev;
 use leptos_use::{use_event_listener, use_window};
@@ -682,7 +682,6 @@ pub fn Search() -> impl IntoView {
         shell_status.lagged.set(None);
     });
 
-    let truncated = Signal::derive(move || accepted_snapshot.get().is_some_and(|r| r.truncated));
     // The degraded fields this execution reported. Read off the
     // response, never re-derived and never refreshed from the catalog:
     // it describes the answer already on screen.
@@ -885,12 +884,6 @@ pub fn Search() -> impl IntoView {
                     // the blanked sentinel then, and the server reads
                     // an empty query as every row (ADR-0027).
                     trailing=Box::new(move || view! {
-                        // The truncation notice moved out of the scope
-                        // strip: it qualifies the row count on the tab
-                        // beside it, not the window under the editor.
-                        <Show when=move || truncated.get()>
-                            <Badge tone=Tone::Warn>"Truncated"</Badge>
-                        </Show>
                         <Show when=move || live.get()>
                             <button
                                 type="button"

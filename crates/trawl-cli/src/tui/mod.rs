@@ -979,11 +979,11 @@ mod tests {
                 columns: cols,
                 rows,
             },
-            truncated: false,
             pagination: trawl_client::PaginationMeta {
                 limit: 10000,
                 offset: 0,
                 returned,
+                total: returned,
             },
             degraded_fields: Vec::new(),
             severity_columns: Vec::new(),

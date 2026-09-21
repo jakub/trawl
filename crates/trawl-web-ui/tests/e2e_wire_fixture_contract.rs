@@ -925,18 +925,53 @@ fn result_actions_fixture_has_numeric_and_null_aggregate_cells() {
     );
 }
 
+/// Every query fixture the stub serves, decoded as the wire type.
+const QUERY_FIXTURES: [(&str, &str); 6] = [
+    ("query-rows", QUERY_ROWS),
+    ("query-cardinality", QUERY_CARDINALITY),
+    ("query-top-values", QUERY_TOP_VALUES),
+    ("query-timechart", QUERY_TIMECHART),
+    (
+        "query-stats-by",
+        include_str!("../e2e/harness/wire/query-stats-by.json"),
+    ),
+    (
+        "result-actions",
+        include_str!("../e2e/harness/wire/result-actions.json"),
+    ),
+];
+
+/// Each fixture is a whole result: its `total` is the count the
+/// execution produced, and no window was cut from it.
+#[test]
+fn query_fixtures_report_the_whole_result_they_carry() {
+    for (name, body) in QUERY_FIXTURES {
+        let response: QueryResponse = decode(name, body);
+        assert_eq!(
+            response.pagination.offset, 0,
+            "{name} is a first window, so its offset is zero"
+        );
+        assert_eq!(
+            response.pagination.returned,
+            response.result.rows.len(),
+            "{name} must count the rows it carries"
+        );
+        assert_eq!(
+            response.pagination.total,
+            response.result.rows.len(),
+            "{name} carries its whole result, so `total` is that row count"
+        );
+    }
+}
+
 #[test]
 fn query_fixtures_carry_fixed_server_execution_facts() {
-    for (name, body) in [
-        ("query-rows", QUERY_ROWS),
-        ("query-cardinality", QUERY_CARDINALITY),
-        ("query-top-values", QUERY_TOP_VALUES),
-        ("query-timechart", QUERY_TIMECHART),
-        (
-            "query-stats-by",
-            include_str!("../e2e/harness/wire/query-stats-by.json"),
-        ),
-    ] {
+    // `result-actions.json` is excluded: it carries no execution facts,
+    // which is the synthetic-result shape the wire type also allows.
+    for (name, body) in QUERY_FIXTURES
+        .into_iter()
+        .filter(|(name, _)| *name != "result-actions")
+    {
         let response: QueryResponse = decode(name, body);
         let execution = response
             .execution

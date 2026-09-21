@@ -95,8 +95,6 @@ pub struct DriverData {
     pub columns: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rows: Option<Vec<Vec<serde_json::Value>>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub truncated: Option<bool>,
 
     // capture fields
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -177,7 +175,6 @@ pub fn query_response_to_data(response: &QueryResponse) -> DriverData {
         row_count: Some(rows.len()),
         columns: Some(columns),
         rows: Some(rows),
-        truncated: Some(response.truncated),
         ..DriverData::default()
     }
 }
@@ -615,7 +612,6 @@ impl App {
                 row_count: Some(0),
                 columns: Some(Vec::new()),
                 rows: Some(Vec::new()),
-                truncated: Some(false),
                 ..DriverData::default()
             }),
         }

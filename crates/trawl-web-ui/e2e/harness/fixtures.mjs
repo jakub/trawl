@@ -93,8 +93,7 @@ export function queryResponse() {
   return {
     columns: [],
     rows: [],
-    truncated: false,
-    pagination: { limit: 50, offset: 0, returned: 0 },
+    pagination: { limit: 50, offset: 0, returned: 0, total: 0 },
     degraded_fields: [],
     severity_columns: [],
     execution: { started_at: '2026-09-15T12:34:56Z', duration_ms: 125 },

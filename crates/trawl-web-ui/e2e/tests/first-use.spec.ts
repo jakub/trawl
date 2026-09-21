@@ -120,8 +120,8 @@ test('a direct zero-match search gives range and filter guidance', async ({ page
 test('an empty later page does not claim that the query has no matches', async ({ page }) => {
   await page.route('**/api/v1/query', async (route) => {
     await route.fulfill({ json: {
-      columns: [{ name: '_raw' }], rows: [], truncated: false,
-      pagination: { limit: 50, offset: 50, returned: 0 },
+      columns: [{ name: '_raw' }], rows: [],
+      pagination: { limit: 50, offset: 50, returned: 0, total: 0 },
       degraded_fields: [], severity_columns: [],
     } });
   });

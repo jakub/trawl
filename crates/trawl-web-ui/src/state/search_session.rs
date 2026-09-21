@@ -152,11 +152,11 @@ fn empty_response() -> QueryResponse {
     QueryResponse {
         execution: None,
         result: trawl_api::value::QueryResult::empty(),
-        truncated: false,
         pagination: trawl_api::PaginationMeta {
             limit: api::PAGE_SIZE,
             offset: 0,
             returned: 0,
+            total: 0,
         },
         // A placeholder for "no query yet" — no execution, no notice,
         // and no columns to render as anything.
