@@ -4,8 +4,8 @@ Captured by `visual-evidence/issue-227/capture-unavailable-run.sh` against a
 disposable full-app stack (`bin/app-experiment`: its own Postgres container,
 keys, TLS, `trawld` and `trawl-web`). This file is that script's stdout.
 
-- commit: `5052ef85d0307a3faf23574dc623aeb3175c4578`
-- experiment run: `run-1789969960550-d9f879d59c`
+- commit: `fdf38915c152afe5e4e1e021f8574f59fb04141d`
+- experiment run: `run-1790010770915-7a1a8dafc8`
 - `$UP` is the disposable daemon's loopback HTTPS origin, `$KEY` its
   browser key. Neither is printed: the key is a credential, and the instance
   is gone by the time you read this.
@@ -34,11 +34,11 @@ $ curl -sS -k "$UP/api/v1/saved/1/runs/2" -H "Authorization: Bearer $KEY"
 HTTP 200
 {
   "id": 2,
-  "query": "experiment_run=\"run-1789969960550-d9f879d59c\" earliest=\"2026-01-01T00:00:00Z\" latest=\"2026-01-02T00:00:00Z\" experiment_seq<3 | fields experiment_seq, status | sort experiment_seq",
+  "query": "experiment_run=\"run-1790010770915-7a1a8dafc8\" earliest=\"2026-01-01T00:00:00Z\" latest=\"2026-01-02T00:00:00Z\" experiment_seq<3 | fields experiment_seq, status | sort experiment_seq",
   "status": "success",
-  "started_at": "2026-09-21T05:54:30.013381+00:00",
-  "finished_at": "2026-09-21T05:54:30.023835+00:00",
-  "duration_ms": 3,
+  "started_at": "2026-09-21T17:16:20.617040+00:00",
+  "finished_at": "2026-09-21T17:16:20.628598+00:00",
+  "duration_ms": 2,
   "row_count": 3,
   "result_path": "scheduled/run_2.parquet",
   "result": {
@@ -75,8 +75,8 @@ $ curl -sS -k -X POST "$UP/api/v1/query" \
 HTTP 200
 {
   "execution": {
-    "started_at": "2026-09-21T05:54:30.352936694Z",
-    "duration_ms": 3
+    "started_at": "2026-09-21T17:16:20.948971696Z",
+    "duration_ms": 2
   },
   "columns": [
     {
@@ -104,8 +104,8 @@ $ curl -sS -k -X POST "$UP/api/v1/query" \
 HTTP 200
 {
   "execution": {
-    "started_at": "2026-09-21T05:54:30.403585431Z",
-    "duration_ms": 3
+    "started_at": "2026-09-21T17:16:20.998358771Z",
+    "duration_ms": 2
   },
   "columns": [
     {
@@ -207,7 +207,7 @@ $ curl -sS -k -X POST "$UP/api/v1/query" \
 HTTP 200
 {
   "execution": {
-    "started_at": "2026-09-21T05:54:30.671458352Z",
+    "started_at": "2026-09-21T17:16:21.255641616Z",
     "duration_ms": 2
   },
   "columns": [
@@ -240,10 +240,10 @@ $ curl -sS -k "$UP/api/v1/saved/2/runs/3" -H "Authorization: Bearer $KEY"
 HTTP 200
 {
   "id": 3,
-  "query": "experiment_run=\"run-1789969960550-d9f879d59c\" earliest=\"2026-01-01T00:00:00Z\" latest=\"2026-01-02T00:00:00Z\" experiment_seq<0 | fields experiment_seq, status",
+  "query": "experiment_run=\"run-1790010770915-7a1a8dafc8\" earliest=\"2026-01-01T00:00:00Z\" latest=\"2026-01-02T00:00:00Z\" experiment_seq<0 | fields experiment_seq, status",
   "status": "success",
-  "started_at": "2026-09-21T05:54:30.110070+00:00",
-  "finished_at": "2026-09-21T05:54:30.114391+00:00",
+  "started_at": "2026-09-21T17:16:20.710208+00:00",
+  "finished_at": "2026-09-21T17:16:20.713623+00:00",
   "duration_ms": 2,
   "row_count": 0,
   "result": {
@@ -267,7 +267,7 @@ $ curl -sS -k -X POST "$UP/api/v1/query" \
 HTTP 200
 {
   "execution": {
-    "started_at": "2026-09-21T05:54:30.772239102Z",
+    "started_at": "2026-09-21T17:16:21.354432968Z",
     "duration_ms": 2
   },
   "columns": [
@@ -303,11 +303,11 @@ $ curl -sS -k "$UP/api/v1/saved/1/runs/2" -H "Authorization: Bearer $KEY"
 HTTP 200
 {
   "id": 2,
-  "query": "experiment_run=\"run-1789969960550-d9f879d59c\" earliest=\"2026-01-01T00:00:00Z\" latest=\"2026-01-02T00:00:00Z\" experiment_seq<3 | fields experiment_seq, status | sort experiment_seq",
+  "query": "experiment_run=\"run-1790010770915-7a1a8dafc8\" earliest=\"2026-01-01T00:00:00Z\" latest=\"2026-01-02T00:00:00Z\" experiment_seq<3 | fields experiment_seq, status | sort experiment_seq",
   "status": "success",
-  "started_at": "2026-09-21T05:54:30.013381+00:00",
-  "finished_at": "2026-09-21T05:54:30.023835+00:00",
-  "duration_ms": 3,
+  "started_at": "2026-09-21T17:16:20.617040+00:00",
+  "finished_at": "2026-09-21T17:16:20.628598+00:00",
+  "duration_ms": 2,
   "row_count": 3,
   "result_path": "scheduled/run_2.parquet",
   "result": {
@@ -344,7 +344,7 @@ $ curl -sS -k -X POST "$UP/api/v1/query" \
 HTTP 200
 {
   "execution": {
-    "started_at": "2026-09-21T05:54:30.874730602Z",
+    "started_at": "2026-09-21T17:16:21.452629109Z",
     "duration_ms": 2
   },
   "columns": [
@@ -385,7 +385,7 @@ $ curl -sS -k -X POST "$UP/api/v1/query" \
 HTTP 200
 {
   "execution": {
-    "started_at": "2026-09-21T05:54:30.926032042Z",
+    "started_at": "2026-09-21T17:16:21.502403402Z",
     "duration_ms": 2
   },
   "columns": [
