@@ -246,11 +246,12 @@ fn chart_hint(
             .all(|r| matches!(r.get(i), Some(Value::String(_))))
         {
             groups += 1;
-        } else if result
-            .rows
-            .iter()
-            .all(|r| matches!(r.get(i), Some(Value::Integer(n)) if *n >= 0))
-        {
+        } else if result.rows.iter().all(|r| {
+            // An unsigned cell is a non-negative integer by construction,
+            // so it is a metric on the same terms as a signed one.
+            matches!(r.get(i), Some(Value::UInt(_)))
+                || matches!(r.get(i), Some(Value::Integer(n)) if *n >= 0)
+        }) {
             metrics += 1;
         } else {
             return Some(
