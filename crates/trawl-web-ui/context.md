@@ -31,7 +31,7 @@ The DSL text the URL carries in `q` and the app last ran or will run. Distinct f
 _Avoid_: current query, query text (that is the buffer)
 
 **Effective query**:
-The DSL the current mode runs: the executed query with the structured state merged in as the mode folds it. Export always uses the snapshot form, with the range, because a download is bounded.
+The DSL the current mode runs: the executed query with the structured state merged in as the mode folds it. Export always uses the snapshot form, folded the way a snapshot folds it, because a download is bounded.
 _Avoid_: wire query, final query
 
 **Filter**:
