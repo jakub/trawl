@@ -90,6 +90,10 @@ pub enum Refusal {
     /// The grid would hold this many instants, more than
     /// [`MAX_INSTANTS`].
     GridTooLarge(usize),
+    /// A `by` field, carried through every later `rename`, that the
+    /// result has no column for: projected away, or renamed to a name
+    /// the response does not carry. Holds the name that was looked for.
+    GroupMissing(String),
 }
 
 impl Refusal {
@@ -126,6 +130,9 @@ impl Refusal {
                 "This result spans {n} time buckets; the chart draws up to {}. Use a larger span or a shorter range.",
                 format_exact(MAX_INSTANTS as u64)
             ),
+            Self::GroupMissing(name) => {
+                format!("The group column {name} is not in the result. Open Events for the table.")
+            }
         }
     }
 
@@ -145,7 +152,8 @@ impl Refusal {
             | Self::BadMetric(_)
             | Self::UnparsedTime(_)
             | Self::DuplicateCell { .. }
-            | Self::GridTooLarge(_) => true,
+            | Self::GridTooLarge(_)
+            | Self::GroupMissing(_) => true,
         }
     }
 }
@@ -295,17 +303,17 @@ pub fn align_series(query: &str, result: &QueryResult, lane: Lane) -> Result<Ser
     // A query that does not parse cannot have produced this result; it
     // has no time axis anyone can read off it.
     let ast = trawl_core::parser::parse(query).map_err(|_| Refusal::NoTime)?;
-    let mut tc: Option<&TimechartStage> = None;
-    for stage in &ast.pipeline {
+    let mut tc: Option<(usize, &TimechartStage)> = None;
+    for (i, stage) in ast.pipeline.iter().enumerate() {
         match &stage.node {
             PipeStage::Pivot(_) => return Err(Refusal::Pivot),
             PipeStage::Top(_) => return Err(Refusal::Top),
             PipeStage::Rare(_) => return Err(Refusal::Rare),
-            PipeStage::Timechart(t) => tc = Some(t),
+            PipeStage::Timechart(t) => tc = Some((i, t)),
             _ => {}
         }
     }
-    let tc = tc.ok_or(Refusal::NoTime)?;
+    let (tc_idx, tc) = tc.ok_or(Refusal::NoTime)?;
 
     let names: Vec<String> = result
         .columns
@@ -317,18 +325,44 @@ pub fn align_series(query: &str, result: &QueryResult, lane: Lane) -> Result<Ser
         .position(|n| n == TIME)
         .ok_or(Refusal::NoTime)?;
 
-    // `by HOST` groups the catalog's `host`, and the response names the
-    // column as the catalog does; fold both sides before they meet, as
-    // `categorical::detect` does. A `by` field the response no longer
-    // carries (projected away) is not a role anything can play.
-    let mut group_cols: Vec<usize> = Vec::new();
-    let mut group_fields: Vec<String> = Vec::new();
-    for field in &tc.group_by {
-        if let Some(ci) = names.iter().position(|n| *n == catalog_key(field)) {
-            group_cols.push(ci);
-            group_fields.push(field.clone());
+    // The group columns are the `by` fields under whatever name the
+    // result carries them: every `rename` after the timechart is applied
+    // to the names first, in pipeline order. Within one stage the
+    // renames are parallel — `rename a as b, b as c` gives `b` the
+    // original `a` and `c` the original `b` — as the SQL emitter and the
+    // pin scope read it, so each source is matched against the names as
+    // they stood before the stage.
+    let mut group_names: Vec<String> = tc.group_by.clone();
+    for stage in &ast.pipeline[tc_idx + 1..] {
+        if let PipeStage::Rename(r) = &stage.node {
+            let before = group_names.clone();
+            for (from, to) in &r.renames {
+                let from = catalog_key(from);
+                for (name, was) in group_names.iter_mut().zip(&before) {
+                    if catalog_key(was) == from {
+                        name.clone_from(to);
+                    }
+                }
+            }
         }
     }
+
+    // `by HOST` groups the catalog's `host`, and the response names the
+    // column as the catalog does; fold both sides before they meet, as
+    // `categorical::detect` does. A group the response no longer carries
+    // — projected away, or renamed to a name that is not there — cannot
+    // be told apart from a metric, so the draw is refused rather than
+    // guessed. `group_fields` keeps the `by` names as written, because
+    // the caption's "Narrow …" hint is what the reader would type.
+    let mut group_cols: Vec<usize> = Vec::with_capacity(group_names.len());
+    for name in &group_names {
+        let ci = names
+            .iter()
+            .position(|n| *n == catalog_key(name))
+            .ok_or_else(|| Refusal::GroupMissing(name.clone()))?;
+        group_cols.push(ci);
+    }
+    let group_fields: Vec<String> = tc.group_by.clone();
 
     // Metrics: every column that is neither `_time` nor a group. Not the
     // names the stage declares — a later `rename` may have changed any
@@ -1341,6 +1375,52 @@ mod align_series_tests {
         ];
         let set = align(BY_HOST, &result(cols, rows)).unwrap();
         assert_eq!(set.total_series, 2);
+    }
+
+    #[test]
+    fn a_renamed_group_column_is_still_a_group() {
+        let query = "* | timechart span=1m count() by status | rename status as code";
+        let cols = &["_time", "count", "code"];
+        let rows = vec![
+            vec![at(0), Value::Integer(7), Value::Integer(200)],
+            vec![at(0), Value::Integer(1), Value::Integer(500)],
+        ];
+        let set = align(query, &result(cols, rows.clone())).unwrap();
+        assert_eq!(set.total_series, 2);
+        assert_eq!(series(&set, "200"), &[Some(7.0)]);
+        assert_eq!(series(&set, "500"), &[Some(1.0)]);
+        // The caption hint names the field as the reader wrote it.
+        assert_eq!(set.group_fields, vec!["status"]);
+
+        // A chain of renames follows the name through every stage, and
+        // the renames inside one stage are parallel.
+        let query = "* | timechart span=1m count() by status \
+                     | rename status as code | rename code as c, count as n";
+        let set = align(query, &result(&["_time", "n", "c"], rows.clone())).unwrap();
+        assert_eq!(set.total_series, 2);
+        assert_eq!(series(&set, "200"), &[Some(7.0)]);
+        let query = "* | timechart span=1m count() by status | rename status as code, code as x";
+        let set = align(query, &result(cols, rows)).unwrap();
+        assert_eq!(set.total_series, 2);
+    }
+
+    #[test]
+    fn a_dropped_group_column_refuses() {
+        let rows = vec![vec![at(0), Value::Integer(7)]];
+        // Projected away.
+        let query = "* | timechart span=1m count() by status | fields _time, count";
+        let err = align(query, &result(&["_time", "count"], rows.clone())).unwrap_err();
+        assert_eq!(err, Refusal::GroupMissing("status".into()));
+        assert_eq!(
+            err.message(),
+            "The group column status is not in the result. Open Events for the table."
+        );
+        assert!(err.offers_events());
+        // Renamed to a name the result does not carry: the looked-for
+        // name is the renamed one.
+        let query = "* | timechart span=1m count() by status | rename status as code";
+        let err = align(query, &result(&["_time", "count", "status"], rows)).unwrap_err();
+        assert_eq!(err, Refusal::GroupMissing("code".into()));
     }
 
     /// The bridge's palette and dash list are the other half of
