@@ -6,6 +6,7 @@
 
 // Pure modules that don't touch Leptos/web-sys — keep them ungated so
 // their tests run under plain `cargo test` on native.
+mod api_error;
 mod auth_return;
 mod categorical;
 mod chart_hint;

@@ -660,7 +660,7 @@ export const COPY = {
   /// crates/trawl-web-ui/src/schedule_edit.rs `preview_cap` — the line a
   /// capped preview shows, as the source formats it.
   previewCapLine: 'This run stored {n} rows; {fetched} were fetched. Paging covers the fetched rows.',
-  /// crates/trawl-web-ui/src/api/mod.rs ApiError::Status — what a non-2xx
+  /// crates/trawl-web-ui/src/api_error.rs ApiError::Status — what a non-2xx
   /// with no error envelope collapses to.
   apiStatusText: 'server returned {0}',
 

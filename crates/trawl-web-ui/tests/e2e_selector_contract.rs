@@ -65,7 +65,7 @@ const DRAWER_QUERY_RS: &str = include_str!("../src/drawer_query.rs");
 const SEARCH_INPUT_RS: &str = include_str!("../../fleet-ui/src/search_input.rs");
 const SEGMENTED_COMPONENT_RS: &str = include_str!("../../fleet-ui/src/segmented/component.rs");
 const SCHEDULE_EDIT_RS: &str = include_str!("../src/schedule_edit.rs");
-const API_MOD_RS: &str = include_str!("../src/api/mod.rs");
+const API_ERROR_RS: &str = include_str!("../src/api_error.rs");
 
 /// One (assignment, source file, hook) triple: `assignment` is the full
 /// `key: 'value',` line as it appears in `selectors.ts`, and `hook` must
@@ -1892,8 +1892,8 @@ const CONTRACTS: &[Contract] = &[
     },
     Contract {
         assignment: "apiStatusText: 'server returned {0}',",
-        source_path: "src/api/mod.rs",
-        source: API_MOD_RS,
+        source_path: "src/api_error.rs",
+        source: API_ERROR_RS,
         hook: "#[error(\"server returned {0}\")]",
     },
     // -- the DSL shapes the stub dispatches on --------------------------

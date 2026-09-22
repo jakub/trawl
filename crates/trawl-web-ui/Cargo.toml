@@ -44,6 +44,10 @@ serde_json = { workspace = true }
 # column name it emits are pinned by native tests. `wasmbind` only kicks
 # in on wasm32 (same shape as fleet-ui's dep).
 chrono = { workspace = true, features = ["wasmbind"] }
+# Unconditional so `api_error` can be: the `ApiError` type and its pure
+# body decoder are pinned by native tests, and the derive has to build
+# where they do.
+thiserror = { workspace = true }
 
 # Wasm-only deps — leptos, web-sys, gloo-net, etc. `cargo check --workspace`
 # on native skips these entirely, but the binary compiles against them when
@@ -67,7 +71,6 @@ gloo-net = "0.7"
 gloo-timers = { version = "0.4", features = ["futures"] }
 js-sys = "0.3"
 serde-wasm-bindgen = "0.6"
-thiserror = { workspace = true }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = [
