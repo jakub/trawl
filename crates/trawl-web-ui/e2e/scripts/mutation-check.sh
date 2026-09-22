@@ -33,6 +33,13 @@ MUTATIONS_DIR="$E2E_DIR/mutations"
 
 cd "$ROOT_DIR"
 
+# Every mutant and the restore rebuild the same crates, and trawl-core's
+# provenance build script watches every tracked file, so each patch
+# recompiles trawl-core, fleet-ui and trawl-web-ui. Incremental compilation
+# lets those rebuilds reuse most of the previous compile. CI needs it set
+# here because rust-cache exports CARGO_INCREMENTAL=0 for the whole job.
+export CARGO_INCREMENTAL=1
+
 if [[ -n "$(git status --porcelain)" ]]; then
   echo "mutation-check: working tree is dirty — commit or stash first." >&2
   git status --short >&2
