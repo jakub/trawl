@@ -22,15 +22,10 @@
 
 use trawl_api::{ErrorDetail, ErrorSpan};
 
+use crate::api_error::ApiError;
+
 /// A span resolved against the text it indexes: the one line that holds
 /// its start, and where on that line it sits.
-#[cfg_attr(
-    target_arch = "wasm32",
-    expect(
-        dead_code,
-        reason = "the search page's notice wiring (#233) is its first reader; drop this then"
-    )
-)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Located {
     /// 1-based line number.
@@ -59,13 +54,6 @@ pub struct Located {
 /// A zero-width span, including one at the end of the text, gets one
 /// caret where it sits. A span running past the end of its line is cut
 /// there. `\r\n` is one line ending.
-#[cfg_attr(
-    target_arch = "wasm32",
-    expect(
-        dead_code,
-        reason = "the search page's notice wiring (#233) is its first reader; drop this then"
-    )
-)]
 #[must_use]
 pub fn locate(text: &str, span: &ErrorSpan) -> Option<Located> {
     let (start, end) = (span.start, span.end);
@@ -144,13 +132,6 @@ pub struct Excerpt {
 }
 
 impl Excerpt {
-    #[cfg_attr(
-        target_arch = "wasm32",
-        expect(
-            dead_code,
-            reason = "the search page's notice wiring (#233) is its first reader; drop this then"
-        )
-    )]
     fn at(sent: &str, span: &ErrorSpan) -> Option<Self> {
         let located = locate(sent, span)?;
         let prefix = if located.multi_line {
@@ -198,13 +179,6 @@ impl NoticeModel {
     /// and gives each its own message and excerpt, in server order. The
     /// parser's "(N earlier errors omitted)" rides on the last message
     /// and so renders as it arrived.
-    #[cfg_attr(
-        target_arch = "wasm32",
-        expect(
-            dead_code,
-            reason = "the search page's notice wiring (#233) is its first reader; drop this then"
-        )
-    )]
     #[must_use]
     pub fn build(lead: Lead, details: &[ErrorDetail], summary: &str, sent: &str) -> Self {
         let excerpt = |d: &ErrorDetail| d.span.as_ref().and_then(|s| Excerpt::at(sent, s));
@@ -244,14 +218,24 @@ impl NoticeModel {
     }
 }
 
+/// The notice for a snapshot request that failed with `error` after
+/// sending `sent`. `None` unless the server refused the text itself: every
+/// other failure keeps its generic copy and its Retry (ADR-0039).
+///
+/// `sent` must be the effective query that request carried, never the
+/// draft or the URL's current query, because the spans index it.
+#[must_use]
+pub fn refusal_notice(error: &ApiError, sent: &str) -> Option<NoticeModel> {
+    let envelope = error.query_error()?;
+    Some(NoticeModel::build(
+        Lead::Query,
+        &envelope.details,
+        &envelope.message,
+        sent,
+    ))
+}
+
 /// The headline for one message.
-#[cfg_attr(
-    target_arch = "wasm32",
-    expect(
-        dead_code,
-        reason = "the search page's notice wiring (#233) is its first reader; drop this then"
-    )
-)]
 fn single(lead: Lead, message: &str) -> String {
     match lead {
         Lead::Query => format!("Couldn't run the query: {message}"),
@@ -616,5 +600,58 @@ mod tests {
         assert_eq!(diagnostic.rest.len(), errors.len() - 1);
         assert!(diagnostic.first.starts_with("Line 1:"));
         assert!(diagnostic.rest.iter().all(|r| r.starts_with("Line 1:")));
+    }
+
+    fn envelope(code: trawl_api::ErrorCode, details: Vec<ErrorDetail>) -> trawl_api::ErrorEnvelope {
+        trawl_api::ErrorEnvelope {
+            code,
+            message: "the summary".to_owned(),
+            details,
+        }
+    }
+
+    /// A refusal quotes the text the request sent, whatever the caller
+    /// holds now: the excerpt is built against `sent` alone.
+    #[test]
+    fn a_refusal_quotes_the_text_it_was_sent_with() {
+        let error = ApiError::Query {
+            status: 400,
+            envelope: envelope(
+                trawl_api::ErrorCode::ParseError,
+                vec![detail("found 'h', expected '('", Some((43, 44)), None)],
+            ),
+        };
+        let model = refusal_notice(&error, SAMPLE).expect("a parse error is a query error");
+        assert_eq!(
+            model.headline,
+            "Couldn't run the query: found 'h', expected '('"
+        );
+        let excerpt = model.blocks[0]
+            .excerpt
+            .as_ref()
+            .expect("the span indexes SAMPLE");
+        assert_eq!(excerpt.text, SAMPLE);
+
+        // The same failure read against a shorter, newer draft cannot
+        // place its caret, and drops the excerpt rather than misplace it.
+        let model = refusal_notice(&error, "service=kubelet").expect("still a query error");
+        assert!(model.blocks.is_empty());
+    }
+
+    /// Every failure that is not a query error keeps the generic copy
+    /// and its Retry, so it builds no notice.
+    #[test]
+    fn only_a_query_error_builds_a_refusal_notice() {
+        for error in [
+            ApiError::Status(500),
+            ApiError::Unauthorized,
+            ApiError::Network("offline".to_owned()),
+            ApiError::Server {
+                status: 500,
+                message: "execution failed".to_owned(),
+            },
+        ] {
+            assert_eq!(refusal_notice(&error, SAMPLE), None, "{error}");
+        }
     }
 }

@@ -11,6 +11,8 @@
 //!   Save / Export)
 //! → degraded-field notice (hidden unless the execution reported one)
 //! → tab body (Events: histogram + results table | Visualization: chart)
+//!   — or, on either tab, the query error notice when the server refused
+//!   the text the current request sent (ADR-0039)
 //!
 //! Two skip links open the page ahead of the filter rail, because the
 //! rail's value controls stay in the tab order on purpose: one focuses
@@ -55,12 +57,14 @@ use crate::components::facet_sidebar::FacetSidebar;
 use crate::components::histogram::Histogram;
 use crate::components::malformed_notice::MalformedNotice;
 use crate::components::meta_strip::MetaStrip;
+use crate::components::query_error_notice::QueryErrorNotice;
 use crate::components::results_table::ResultsTable;
 use crate::components::save_as_net_modal::SaveAsNetModal;
 use crate::components::search_quick_start::SearchQuickStart;
 use crate::facets::is_aggregation_shape;
 use crate::fetch_plan::FetchPlan;
 use crate::pages::layout::ShellStatus;
+use crate::query_error::{NoticeModel, refusal_notice};
 use crate::result_actions::sorted_page;
 use crate::search_status::{CountSource, FooterCount, StatusInputs, StatusKind, search_status};
 use crate::search_url::{PAGE_SIZE, Param, admit_filters, refusal_copy};
@@ -654,6 +658,42 @@ pub fn Search() -> impl IntoView {
         }
         rows.get().and_then(Result::ok)
     });
+    // The query error notice, when the failure on screen is the server
+    // refusing the text of the CURRENT request (ADR-0039). The resource
+    // keeps a failure while the next request is in flight, so identity
+    // decides, not presence: a failure whose intent or generation is not
+    // the latest is an older request's verdict — the query before an
+    // edit, or the same text before a Haul re-sent it — and quoting it
+    // would describe text that is not what ran last. The excerpt is the
+    // text that request sent, never the draft or today's `effective_q`.
+    let query_notice = Memo::new(move |_| -> Option<NoticeModel> {
+        if unreadable.get() || live.get() || snapshot_q.get().trim().is_empty() || loading.get() {
+            return None;
+        }
+        rows.with(|result| match result {
+            Some(Err(failure))
+                if failure.intent == request_intent.get()
+                    && failure.generation == request_generation.get() =>
+            {
+                refusal_notice(&failure.error, &failure.query.effective)
+            }
+            _ => None,
+        })
+    });
+    // A query error the resource still holds after a newer request
+    // superseded it: the same text re-sent, or new text not yet answered.
+    // The tables would render it as "Couldn't load results" with a Retry,
+    // which is the one thing a query error never offers, so the region
+    // waits for the new answer instead.
+    let refusal_superseded = Signal::derive(move || {
+        query_notice.get().is_none()
+            && !unreadable.get()
+            && !live.get()
+            && !snapshot_q.get().trim().is_empty()
+            && rows.with(|result| {
+                matches!(result, Some(Err(failure)) if failure.error.query_error().is_some())
+            })
+    });
     let execution = Signal::derive(move || {
         accepted_snapshot
             .get()
@@ -1066,6 +1106,30 @@ pub fn Search() -> impl IntoView {
                         }
                         report_refusal(bus, outcome);
                     })/> }.into_any()
+                } else if let Some(model) = query_notice.get() {
+                    // A query error takes the region on either tab, in
+                    // place of the table or the chart: neither the
+                    // tables' "Couldn't load results" nor the chart's
+                    // failure copy mounts, and neither Retry does, since
+                    // the same text earns the same verdict (ADR-0039).
+                    view! {
+                        <div id="search-results" class="results" role="region" aria-label="Search results" tabindex="0">
+                            <QueryErrorNotice model=model/>
+                        </div>
+                    }.into_any()
+                } else if refusal_superseded.get() {
+                    // Each tab's own waiting copy, without the table or
+                    // chart that would read the superseded failure.
+                    let waiting = if active_tab.get() == ResultsTab::Visualization {
+                        view! { <p class="results-empty" role="status">"Loading snapshot visualization…"</p> }.into_any()
+                    } else {
+                        view! { <div class="load-hint">{fleet_ui::loaded::loading_copy(Some("results"))}</div> }.into_any()
+                    };
+                    view! {
+                        <div id="search-results" class="results" role="region" aria-label="Search results" tabindex="0">
+                            {waiting}
+                        </div>
+                    }.into_any()
                 } else {
                     match (active_tab.get(), mode.get()) {
                     // An aggregation answers in exact numbers, so the

@@ -16,13 +16,6 @@
 //! caret line under it is decoration for sighted readers and hidden from
 //! assistive technology, which reads the message instead.
 
-// Nothing mounts the notice until the search page does; the expectation
-// fails the build the moment it does, which is when this goes.
-#![expect(
-    dead_code,
-    reason = "the search page's notice wiring (#233) mounts it first; drop this then"
-)]
-
 use leptos::prelude::*;
 
 use crate::query_error::{Block, Excerpt, NoticeModel};

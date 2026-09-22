@@ -25,13 +25,13 @@
 //! - `rows == MessageFirst` reduces the columns to time, severity and
 //!   message, with the rest of the row as a muted secondary line.
 
-use crate::api::{ApiError, PAGE_SIZE};
+use crate::api::PAGE_SIZE;
 use crate::context_query::SearchNavigation;
 use crate::context_query::{build_context_query, escape_dq, find_col};
 use crate::result_actions::{Capabilities, compare};
 use crate::results_layout::{MessageFirst, inspector_selection, message_first};
 use crate::state::query::{Filter, FilterOp};
-use crate::state::search_session::{ExecutedQuery, ExecutedResponse};
+use crate::state::search_session::{ExecutedFailure, ExecutedQuery, ExecutedResponse};
 use fleet_ui::overlay::has_layers;
 use fleet_ui::{
     Btn, CopyButton, Details, Drawer, LoadState, Loaded, OffsetPager, PageTotal, PageWindow, Rows,
@@ -49,7 +49,7 @@ use trawl_api::value::Value;
 #[component]
 pub fn ResultsTable(
     #[prop(into)] page: Signal<usize>,
-    rows: LocalResource<Result<ExecutedResponse, ApiError>>,
+    rows: LocalResource<Result<ExecutedResponse, ExecutedFailure>>,
     #[prop(into)] busy: Signal<bool>,
     /// Called with the new page index when prev/next is clicked. Parent
     /// captures a router navigator and translates to URL navigation.

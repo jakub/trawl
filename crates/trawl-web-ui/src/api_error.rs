@@ -90,13 +90,6 @@ impl ApiError {
     /// The server's envelope when this failure is a query error, else
     /// `None`.
     #[must_use]
-    #[cfg_attr(
-        target_arch = "wasm32",
-        expect(
-            dead_code,
-            reason = "the search page's notice wiring (#233) is its first reader; drop this then"
-        )
-    )]
     pub fn query_error(&self) -> Option<&ErrorEnvelope> {
         match self {
             Self::Query { envelope, .. } => Some(envelope),
