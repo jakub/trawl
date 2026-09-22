@@ -58,8 +58,14 @@ such file or directory`. CI uploads the traces from the new path.
 CI (the `web-ui-e2e` job in `.github/workflows/ci.yml`) does not rebuild
 the SPA: it downloads the `trawl-web-ui-dist` artifact from the
 `trunk-build` job, then runs `npm ci`, `npx playwright install
---with-deps chromium`, and `npm run test -- --global-timeout=1500000` as
-discrete steps, so the browser job compiles no Rust. `cargo xtask e2e` is the local entry point
+--with-deps chromium`, and `npm run test -- --shard=N/4
+--global-timeout=1500000` as discrete steps, so the browser job compiles
+no Rust. The job is a four-shard matrix. Each shard is a separate job with
+its own stub server, so the suite stays single-worker inside each shard.
+Shard 1 also runs the BFCache suite. Each shard uploads its own
+`e2e-traces-N` on failure. The shard that runs `theme-preference.spec.ts`
+uploads the System screenshots as `theme-menu-captures-N`, and the
+`theme-menu-captures` job fails when no shard uploaded them. `cargo xtask e2e` is the local entry point
 only (and installs chromium without `--with-deps`; on a dev machine the
 shared libraries are your own problem). `playwright.config.ts` switches
 its reporter to `['github', 'list']` under `CI=true` so failures annotate

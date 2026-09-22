@@ -676,9 +676,17 @@ jobs:
           retention-days: 7
 
   web-ui-e2e:
-    name: web UI browser tests (playwright)
+    name: web UI browser tests (playwright ${{ matrix.shard }}/4)
     runs-on: k8s-small
     needs: trunk-build
+    # The suite runs on one worker against one stub server (see
+    # playwright.config.ts), so it is split across jobs instead: each shard
+    # starts its own server. fail-fast is off so one red shard still lets
+    # the others report their results.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     # Include package installation, both bounded browser suites and evidence upload.
     timeout-minutes: 40
     # This job executes third-party code (npm packages, a CDN-fetched
@@ -714,18 +722,20 @@ jobs:
         working-directory: crates/trawl-web-ui/e2e
       # retries=0 lives in playwright.config.ts (flake policy: fix or
       # quarantine loudly, never retry past it).
-      # The full single-worker suite needs headroom on the shared runner.
-      # Per-test timeouts stay unchanged; this bounds the aggregate run.
-      - run: npm run test -- --global-timeout=1500000
+      # A shard runs about a quarter of the suite. The aggregate bound keeps
+      # the full-suite headroom, so an unbalanced shard on a busy shared
+      # runner is not cut off. Per-test timeouts stay unchanged.
+      - run: npm run test -- --shard=${{ matrix.shard }}/4 --global-timeout=1500000
         working-directory: crates/trawl-web-ui/e2e
         env:
           # Preserve browser process exits and stderr alongside test results.
           DEBUG: pw:browser
       - name: Authentication history restores with BFCache enabled
+        if: matrix.shard == 1
         run: npm run test -- --config=playwright.bfcache.config.ts --global-timeout=300000
         working-directory: crates/trawl-web-ui/e2e
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        if: always()
+        if: always() && matrix.shard == 1
         with:
           name: auth-bfcache-evidence
           path: |
@@ -735,17 +745,44 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: failure()
         with:
-          name: e2e-traces
+          name: e2e-traces-${{ matrix.shard }}
           path: e2e-artifacts/test-results/
           retention-days: 7
 
+      # Only the shard that runs theme-preference.spec.ts writes captures.
+      # The theme-menu-captures job fails when no shard uploaded any.
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
-          name: theme-menu-captures
+          name: theme-menu-captures-${{ matrix.shard }}
           path: e2e-artifacts/test-results/**/system-*.png
-          if-no-files-found: error
+          if-no-files-found: ignore
           retention-days: 30
+
+  theme-menu-captures:
+    name: theme menu captures
+    runs-on: k8s-small
+    needs: web-ui-e2e
+    # Runs even when a shard fails, so a missing capture is reported next to
+    # the failure. It only reads the shards' artifacts and uploads nothing,
+    # so a re-run of failed jobs repeats the same check without an artifact
+    # name conflict.
+    if: always()
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@cc203385981b70ca67e1cc392babf9cc229d5806 # v4
+        with:
+          pattern: theme-menu-captures-*
+          path: theme-menu-captures
+          merge-multiple: true
+      - name: Require the selected-System captures
+        run: |
+          find theme-menu-captures -name 'system-*.png' -print | grep -q . || {
+            echo "no shard uploaded a theme-menu-captures-N artifact with system-*.png" >&2
+            exit 1
+          }
 
   theme-production:
     name: theme bootstrap and production browser evidence
