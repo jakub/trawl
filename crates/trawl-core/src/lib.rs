@@ -79,6 +79,9 @@ pub mod severity;
 /// Streaming pipeline compiler and executor.
 pub mod stream;
 
+/// The one bucket-width resolver every timechart consumer calls (ADR-0038).
+pub mod timechart;
+
 /// Build-time version metadata.
 pub mod version;
 

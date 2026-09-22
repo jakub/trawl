@@ -1453,10 +1453,11 @@ fn compile_aggregation(stage: &PipeStage) -> Result<CompiledAggregation, StreamP
                     ),
                 });
             }
-            let span_secs = s
-                .span
-                .as_ref()
-                .map_or(60, crate::ast::TrawlDuration::to_seconds);
+            // A live stream carries no past window, so the automatic
+            // band always answers for "no filter", which is the 60 s
+            // this line used to hard-code (ADR-0038 records that
+            // equality).
+            let span_secs = crate::timechart::resolve_span(s.span, None).to_seconds();
             let accumulators = s
                 .aggregations
                 .iter()
@@ -1916,6 +1917,36 @@ fn snapshot_percentile(values: &[f64], target: f64) -> EvalValue {
 /// `post_process::apply_rust_stages`, whose own refusal is pinned by
 /// `post_process::timechart_on_refused_in_batch_tail` there — it cannot
 /// be called from this crate, which trawl-engine depends on).
+/// The live compiler asks [`crate::timechart::resolve_span`] the same
+/// question the emitter and the web chart ask (ADR-0038): no span falls
+/// back to the automatic "no filter" band (60 s), an explicit `span=`
+/// wins unchanged.
+#[cfg(test)]
+#[test]
+fn stream_timechart_span_uses_the_resolver() {
+    let pins = PinScope::unpinned();
+    let pipeline = |dsl: &str| crate::parser::parse(dsl).expect("dsl parses").pipeline;
+
+    let plan = compile_stream_plan(&pipeline("* | timechart count()"), &pins).expect("compiles");
+    let StreamPlan::Aggregate { aggregation, .. } = plan else {
+        panic!("timechart compiles to an aggregate plan");
+    };
+    let CompiledAggregation::Timechart { span_secs, .. } = aggregation else {
+        panic!("timechart compiles to a Timechart aggregation");
+    };
+    assert_eq!(span_secs, 60);
+
+    let plan =
+        compile_stream_plan(&pipeline("* | timechart span=2m count()"), &pins).expect("compiles");
+    let StreamPlan::Aggregate { aggregation, .. } = plan else {
+        panic!("timechart compiles to an aggregate plan");
+    };
+    let CompiledAggregation::Timechart { span_secs, .. } = aggregation else {
+        panic!("timechart compiles to a Timechart aggregation");
+    };
+    assert_eq!(span_secs, 120);
+}
+
 #[cfg(test)]
 #[test]
 fn timechart_on_refused_in_live_lane() {
