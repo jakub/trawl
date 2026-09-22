@@ -201,6 +201,11 @@ pub fn align_buckets(rows: &[(i64, u64)], slot_ms: i64, n: usize) -> Vec<Slot> {
 /// fractional part is ignored, since the grid resolution is whole
 /// buckets. Returns `None` on anything it can't read, which the caller
 /// treats as "fall back to unpositioned bars".
+///
+/// Deliberately lenient, unlike `series::parse_instant_secs`: the ingest
+/// grid only needs the hour a row belongs to, so a zone or a fraction
+/// can be dropped, whereas the Visualization chart must place a point
+/// exactly and refuses any form ADR-0038 does not admit.
 #[must_use]
 pub fn parse_bucket_ms(s: &str) -> Option<i64> {
     let (date, rest) = s.trim().split_once(['T', ' '])?;
@@ -232,7 +237,11 @@ pub fn parse_bucket_ms(s: &str) -> Option<i64> {
 
 /// Days since the Unix epoch for a proleptic-Gregorian date.
 /// Hinnant's `days_from_civil`.
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+///
+/// Shared with the strict `_time` parser in `series::parse_instant_secs`,
+/// which validates the date before calling this and refuses what
+/// [`parse_bucket_ms`] above tolerates.
+pub(crate) fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = y - era * 400;

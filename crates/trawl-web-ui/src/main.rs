@@ -30,6 +30,7 @@ mod schedule_edit;
 mod schema_nav;
 mod search_status;
 mod search_url;
+mod series;
 mod service_card_fmt;
 mod severity_cell;
 mod sort_label;
