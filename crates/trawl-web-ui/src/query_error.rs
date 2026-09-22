@@ -102,13 +102,6 @@ pub fn join_hint(message: &str, hint: Option<&str>) -> String {
 }
 
 /// Which failure the notice reports.
-#[cfg_attr(
-    target_arch = "wasm32",
-    expect(
-        dead_code,
-        reason = "the search page's notice wiring (#233) is its first reader; drop this then"
-    )
-)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lead {
     /// The server refused a snapshot query.
@@ -235,6 +228,25 @@ pub fn refusal_notice(error: &ApiError, sent: &str) -> Option<NoticeModel> {
     ))
 }
 
+/// The notice for a live stream that closed before it opened, when the
+/// local parser also refuses `sent`, the exact text the stream was
+/// opened with. `None` when that text parses: then nothing says the
+/// query is at fault, and the generic copy with its Retry stands.
+///
+/// The browser cannot read why the stream closed (ADR-0039), so this
+/// never claims the syntax error was the reason; its lead says two
+/// things that are each true on their own.
+#[must_use]
+pub fn live_syntax_notice(sent: &str) -> Option<NoticeModel> {
+    let errors = trawl_core::parser::parse(sent).err()?;
+    Some(NoticeModel::build(
+        Lead::LiveSyntax,
+        &local_details(&errors),
+        "",
+        sent,
+    ))
+}
+
 /// The headline for one message.
 fn single(lead: Lead, message: &str) -> String {
     match lead {
@@ -248,13 +260,6 @@ fn single(lead: Lead, message: &str) -> String {
 /// The local parser's errors in the wire's detail shape, so the live
 /// syntax notice renders through the same [`NoticeModel`] as a server
 /// refusal.
-#[cfg_attr(
-    target_arch = "wasm32",
-    expect(
-        dead_code,
-        reason = "live mode's syntax notice (#233) is its first reader; drop this then"
-    )
-)]
 #[must_use]
 pub fn local_details(errors: &[trawl_core::parser::ParseError]) -> Vec<ErrorDetail> {
     errors
@@ -653,5 +658,50 @@ mod tests {
         ] {
             assert_eq!(refusal_notice(&error, SAMPLE), None, "{error}");
         }
+    }
+
+    /// The issue's sample, sent as a live stream, reads as the live lead
+    /// with the caret under the `h` of `host` in the sent text.
+    #[test]
+    fn a_stream_text_that_does_not_parse_builds_the_syntax_notice() {
+        let model = live_syntax_notice(SAMPLE).expect("the sample does not parse");
+        assert!(
+            model.headline.starts_with(
+                "Couldn't start the live stream. The query has a syntax error: found 'h', expected"
+            ),
+            "{}",
+            model.headline
+        );
+        let excerpt = model.blocks[0]
+            .excerpt
+            .as_ref()
+            .expect("the span indexes SAMPLE");
+        assert_eq!(excerpt.text, SAMPLE);
+        assert_eq!(excerpt.caret, format!("{}^", " ".repeat(43)));
+    }
+
+    #[test]
+    fn a_stream_text_with_several_errors_counts_them() {
+        let sent = "f=#a,#b";
+        let errors = trawl_core::parser::parse(sent).expect_err("two bad elements");
+        let model = live_syntax_notice(sent).expect("the text does not parse");
+        assert_eq!(
+            model.headline,
+            format!(
+                "Couldn't start the live stream. The query has {} syntax errors.",
+                errors.len()
+            )
+        );
+        assert_eq!(model.blocks.len(), errors.len());
+    }
+
+    /// A text that parses says nothing about the query: the stream's
+    /// generic copy and its Retry stand.
+    #[test]
+    fn a_stream_text_that_parses_builds_no_notice() {
+        assert_eq!(
+            live_syntax_notice("service=kubelet | stats count() by host"),
+            None
+        );
     }
 }

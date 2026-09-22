@@ -31,6 +31,42 @@ use super::stream_session_value::json_to_value;
 /// Max raw events retained in the ring — older events roll off.
 pub const LIVE_RING_CAPACITY: usize = 5000;
 
+/// The failure copy for a stream the browser has given up on: closed,
+/// not reconnecting. Search reads it back to tell this failure from the
+/// others, so every writer of it names this constant.
+pub const STREAM_UNAVAILABLE: &str = "Live stream unavailable. Retry or switch to Snapshot.";
+
+/// Which stream session last proved it opened: the connection opened or
+/// the server delivered an event on it.
+///
+/// A refused live query closes before it opens (ADR-0039), so "never
+/// opened" is what lets Search read a closed stream as a possible query
+/// error rather than a dropped connection. The mark only ever moves
+/// forward, so a callback from an older session cannot claim, or
+/// retract, an opening for the current one.
+#[derive(Clone, Copy)]
+pub struct OpenedMark {
+    /// The latest session that opened, shared by every session.
+    pub latest: RwSignal<Option<u64>>,
+    /// This stream's session, higher than every earlier one.
+    pub session: u64,
+}
+
+impl OpenedMark {
+    fn mark(self) {
+        // Untracked read, and a write only when the mark moves: a stream
+        // delivering events must not notify on every one of them. The
+        // signal may be gone after route teardown.
+        let moves = self
+            .latest
+            .try_get_untracked()
+            .is_some_and(|latest| latest.is_none_or(|seen| seen < self.session));
+        if moves {
+            let _ = self.latest.try_set(Some(self.session));
+        }
+    }
+}
+
 /// Bundle of the `EventSource` handle + all its registered closures.
 /// Dropping this calls `close()` on the `EventSource` first (so no more
 /// callbacks fire) and then releases the closures.
@@ -74,6 +110,8 @@ pub struct LiveSignals {
     /// validation, so a malformed one raises the failure without
     /// claiming an update. Callers without a count may omit it.
     pub frames: Option<RwSignal<u64>>,
+    /// Records that this stream opened. Callers that never ask may omit it.
+    pub opened: Option<OpenedMark>,
 }
 
 /// Bounded, append-only-from-the-tail ring of raw events.
@@ -121,8 +159,14 @@ pub fn start_stream(query: &str, signals: LiveSignals) -> Option<StreamLifecycle
         snapshot,
         lagged,
         failure,
+        opened,
         ..
     } = signals;
+    let mark_opened = move || {
+        if let Some(opened) = opened {
+            opened.mark();
+        }
+    };
 
     // Lagged signal auto-clear: set(Some(n)) then schedule a set(None)
     // ~3s later so the badge fades from the UI without the user having
@@ -141,6 +185,7 @@ pub fn start_stream(query: &str, signals: LiveSignals) -> Option<StreamLifecycle
     });
     let event_dirty = Rc::clone(&dirty);
     let on_data = Closure::<dyn FnMut(MessageEvent)>::new(move |ev: MessageEvent| {
+        mark_opened();
         let Some(data_str) = ev.data().as_string() else {
             return;
         };
@@ -155,6 +200,7 @@ pub fn start_stream(query: &str, signals: LiveSignals) -> Option<StreamLifecycle
     let on_snapshot = snapshot_listener(signals);
 
     let on_lagged = Closure::<dyn FnMut(MessageEvent)>::new(move |ev: MessageEvent| {
+        mark_opened();
         let Some(data_str) = ev.data().as_string() else {
             return;
         };
@@ -173,6 +219,7 @@ pub fn start_stream(query: &str, signals: LiveSignals) -> Option<StreamLifecycle
     });
 
     let on_open = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
+        mark_opened();
         if let Some(failure) = failure {
             failure.set(None);
         }
@@ -184,7 +231,7 @@ pub fn start_stream(query: &str, signals: LiveSignals) -> Option<StreamLifecycle
             let message = if error_source.ready_state() == EventSource::CONNECTING {
                 "Live stream disconnected. Reconnecting; retry or switch to Snapshot if this persists."
             } else {
-                "Live stream unavailable. Retry or switch to Snapshot."
+                STREAM_UNAVAILABLE
             };
             failure.set(Some(message));
         }
@@ -219,9 +266,14 @@ fn snapshot_listener(signals: LiveSignals) -> Closure<dyn FnMut(MessageEvent)> {
         snapshot,
         failure,
         frames,
+        opened,
         ..
     } = signals;
     Closure::<dyn FnMut(MessageEvent)>::new(move |ev: MessageEvent| {
+        // Any frame, readable or not, means the stream opened.
+        if let Some(opened) = opened {
+            opened.mark();
+        }
         let wire = ev
             .data()
             .as_string()
