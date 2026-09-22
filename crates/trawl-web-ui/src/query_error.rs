@@ -72,9 +72,13 @@ pub fn locate(text: &str, span: &ErrorSpan) -> Option<Located> {
         .strip_suffix('\r')
         .unwrap_or(&text[line_start..line_end]);
 
-    let before = &text[line_start..start];
-    let covered_end = end.min(line_start + line_text.len()).max(start);
-    let width = text[start..covered_end].chars().count().max(1);
+    // Measure on the line as displayed: a span starting on the dropped
+    // `\r` (or the `\n` after it) sits just past the displayed text.
+    let displayed_end = line_start + line_text.len();
+    let start_on_line = start.min(displayed_end);
+    let before = &text[line_start..start_on_line];
+    let covered_end = end.min(displayed_end).max(start_on_line);
+    let width = text[start_on_line..covered_end].chars().count().max(1);
 
     let mut caret: String = before
         .chars()
@@ -430,6 +434,31 @@ mod tests {
             first.caret,
             format!("{}{}", " ".repeat(8 + 8), "^".repeat(7))
         );
+    }
+
+    /// A span that starts on a line ending the excerpt drops sits just
+    /// past the displayed line, never a column further for the `\r`.
+    #[test]
+    fn a_span_on_a_dropped_carriage_return_sits_at_the_end_of_the_displayed_line() {
+        // The `\n` of a `\r\n`.
+        let at = locate("x\r\nnext", &span(2, 3)).expect("in bounds");
+        assert_eq!(at.line, 1);
+        assert_eq!(at.line_text, "x");
+        assert_eq!(at.column, 2);
+        assert_eq!(at.caret, " ^");
+
+        // The `\r` itself.
+        let at = locate("x\r\nnext", &span(1, 2)).expect("in bounds");
+        assert_eq!(at.column, 2);
+        assert_eq!(at.caret, " ^");
+
+        // A lone trailing `\r`, and the end of the text after it.
+        for (start, end) in [(1, 2), (2, 2)] {
+            let at = locate("x\r", &span(start, end)).expect("in bounds");
+            assert_eq!(at.line_text, "x");
+            assert_eq!(at.column, 2, "span {start}..{end}");
+            assert_eq!(at.caret, " ^", "span {start}..{end}");
+        }
     }
 
     #[test]
