@@ -46,7 +46,7 @@ use wasm_bindgen::JsCast;
 
 use crate::categorical::{CatShape, detect as detect_categorical};
 use crate::components::cat_chart::CatChart;
-use crate::components::chart::Chart;
+use crate::components::chart::{Chart, ChartType};
 use crate::components::degraded_notice::DegradedNotice;
 use crate::components::editor_wrap::EditorWrap;
 use crate::components::exact_table::ExactTable;
@@ -864,6 +864,12 @@ pub fn Search() -> impl IntoView {
         }
     });
 
+    // The reader's chart type, shared by both lanes and kept for the
+    // session only — never in the search URL (ADR-0027, ADR-0038).
+    // `None` follows the result's shape; a stored choice that does not
+    // fit the result on screen is kept, not overwritten.
+    let chart_type = RwSignal::new(None::<ChartType>);
+
     let view_open = RwSignal::new(false);
     let view_wrap = NodeRef::<leptos::html::Div>::new();
     let view_btn = NodeRef::<leptos::html::Button>::new();
@@ -1154,6 +1160,7 @@ pub fn Search() -> impl IntoView {
                                             query=Signal::derive(move || executed.clone())
                                             coverage=Signal::derive(move || Some(coverage.clone()))
                                             lane=Lane::Snapshot
+                                            chart_type=chart_type
                                             on_events=open_events
                                         />
                                     }.into_any()
@@ -1174,6 +1181,7 @@ pub fn Search() -> impl IntoView {
                                 query=live_query
                                 coverage=Signal::derive(|| None)
                                 lane=Lane::Live
+                                chart_type=chart_type
                                 on_events=open_events
                                 failure=stream_failure
                                 on_retry=retry_stream

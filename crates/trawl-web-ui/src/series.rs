@@ -21,13 +21,11 @@
 //!
 //! On native, only the tests consume these items — `#[allow(dead_code)]`
 //! at module scope silences the bin-crate dead-code warning, as in
-//! `categorical.rs`. The allow is unconditional for now because the
-//! Visualization component that consumes this module lands in the next
-//! commit; once `components/chart.rs` calls [`align_series`], narrow it
-//! back to `cfg_attr(not(target_arch = "wasm32"), allow(dead_code))` so
-//! the wasm build catches anything the component stops using.
+//! `categorical.rs`. Gated on the target, so the wasm build — where
+//! `components/chart.rs` is the consumer — still fails on an item the
+//! component stopped using.
 
-#![allow(dead_code)]
+#![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
 use std::collections::{BTreeSet, HashMap};
 

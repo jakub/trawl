@@ -420,6 +420,17 @@
   overflow: hidden;
 }
 
+/* Chart type picker — the Visualization tab's exclusive choice, on the
+ * shared segmented treatment (`.seg` / `.seg-opt`, ADR-0003) so it reads
+ * as the same control as the reading-mode toggles. It is a radiogroup
+ * rather than a set of toggle buttons because the types are exclusive
+ * and one is always effective, so `aria-checked` rides each option and
+ * a type that does not fit the result is disabled with the reason. */
+.chart-types { margin: 0 0 8px; }
+.chart-types .seg-opt[aria-checked="true"] { font-weight: 600; }
+.chart-types .seg-opt:disabled { opacity: .5; cursor: not-allowed; }
+.chart-types .seg-opt:disabled:hover { color: var(--ink-3); }
+
 /* The caption under a chart that drew fewer series or groups than the
  * result holds, and beside it the control to the rows it left out. That
  * control is a button in fact and a link in appearance: it switches the

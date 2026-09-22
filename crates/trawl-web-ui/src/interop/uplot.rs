@@ -20,11 +20,6 @@ pub enum ChartKind {
     /// Vertical bars: one per x value.
     Column,
     /// Horizontal bars: Column rotated, categories down the left edge.
-    // The Visualization chart type picker is the caller; until it lands
-    // this variant only exists for the bridge contract. `expect` fails
-    // the build once the caller arrives, so the attribute cannot outlive
-    // its reason.
-    #[expect(dead_code, reason = "wired by the Visualization chart rewrite")]
     Bar,
 }
 
