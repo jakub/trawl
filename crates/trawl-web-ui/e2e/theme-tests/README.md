@@ -60,7 +60,8 @@ demo's existing user signal and add no production API or second installation.
 
 CI retains the emitted assets, HTTP headers, computed appearance values,
 screenshots, traces, and HTML report in `theme-production-evidence`. The ordinary
-suite retains its selected-System screenshots in `theme-menu-captures`.
+suite retains its selected-System screenshots in the `theme-menu-captures-N`
+artifact of the shard that ran them.
 These expiring CI artifacts are an evidence handoff; acceptance requires the
 selected-System captures to be committed or published privately with durable
 retention when the final evidence is assembled.
