@@ -10,9 +10,12 @@
 //! a stream again, and the stream lane would drop every event older than
 //! that window while the page still said Live.
 //!
-//! Comments are stripped first, with the same idiom
-//! `native_control_contract.rs` uses, so prose about the merge is still
-//! allowed to name the functions it describes.
+//! Line comments are dropped first, so prose about the merge is still
+//! allowed to name the functions it describes. Nothing else is: a
+//! stripper that tracked `/*` would read one inside a string literal or
+//! a line comment as an opener and hide every call after it, so this
+//! guard fails closed instead. A name inside a block comment trips it,
+//! loudly, and the reader moves the prose to a `//` line.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -64,7 +67,7 @@ fn a_forbidden_name_in_a_comment_is_prose() {
     for src in [
         "// merged via effective_query\n",
         "/// The `live_query` a stream runs.\n",
-        "/* effective_query */\n",
+        "    //! `effective_query` folds the range in.\n",
     ] {
         let stripped = comment_stripped(src);
         assert!(
@@ -72,7 +75,25 @@ fn a_forbidden_name_in_a_comment_is_prose() {
             "a name in a comment is prose, not a call: {src}",
         );
     }
-    assert!(comment_stripped("let q = live_query(b, f);\n").contains("live_query"));
+}
+
+#[test]
+fn a_call_is_never_hidden_by_what_precedes_it() {
+    // Each of these once slipped past a stripper that tracked `/*`: an
+    // opener inside a line comment or a string literal swallowed the
+    // rest of the file. The call after it must still trip the guard.
+    for src in [
+        "let q = live_query(b, f);\n",
+        "// treat /* as literal log text.\nlet q = crate::query_merge::live_query(b, f);\n",
+        "let _literal = \"/*\";\nlet q = crate::query_merge::effective_query(b, f, r);\n",
+        "/* prose */ let q = live_query(b, f);\n",
+    ] {
+        let stripped = comment_stripped(src);
+        assert!(
+            FORBIDDEN.iter().any(|name| stripped.contains(name)),
+            "a call must survive the strip: {src}",
+        );
+    }
 }
 
 /// Every `.rs` file under the shell's source trees, sorted so a failure
@@ -99,32 +120,11 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// `src` with its comments removed. Same idiom as
-/// `native_control_contract.rs`: nested block comments go first, then any
-/// line whose first non-space characters are `//`.
+/// `src` without the lines whose first non-space characters are `//`.
+/// That is the whole rule: it cannot be fooled by a `/*` inside a
+/// string or a comment, because it never looks for one.
 fn comment_stripped(src: &str) -> String {
-    let bytes = src.as_bytes();
-    let mut kept: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut depth = 0usize;
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if bytes[i..].starts_with(b"/*") {
-            depth += 1;
-            i += 2;
-        } else if depth > 0 && bytes[i..].starts_with(b"*/") {
-            depth -= 1;
-            i += 2;
-        } else {
-            if depth == 0 {
-                kept.push(bytes[i]);
-            } else if bytes[i] == b'\n' {
-                kept.push(b'\n');
-            }
-            i += 1;
-        }
-    }
-    let out = String::from_utf8(kept).expect("dropping whole comment spans keeps the rest valid");
-    out.lines()
+    src.lines()
         .filter(|line| !line.trim_start().starts_with("//"))
         .collect::<Vec<_>>()
         .join("\n")
