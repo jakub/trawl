@@ -397,11 +397,13 @@ pub fn align_series(query: &str, result: &QueryResult, lane: Lane) -> Result<Ser
 
     // Pass 2: sparse fill. Ungrouped: one series per metric column, keyed
     // and named by the column. Grouped: one per distinct group TUPLE —
-    // the key is the vector of rendered cells, never their joined label,
-    // so `("a · b", "c")` and `("a", "b · c")` stay two series even
-    // though they print alike. Every (slot, series) visit is recorded
-    // whether or not the cell holds a number, so two null rows on one
-    // bucket are a duplicate too.
+    // the key is the vector of cell identities, never their joined label
+    // nor their printed forms, so `("a · b", "c")` and `("a", "b · c")`
+    // stay two series even though they print alike, and so do `1.001`
+    // and `1.002` (both printed `1.00`) and a null beside the string
+    // `NULL`. Every (slot, series) visit is recorded whether or not the
+    // cell holds a number, so two null rows on one bucket are a duplicate
+    // too.
     let mut series: Vec<Sparse> = Vec::new();
     let mut index: HashMap<Vec<String>, usize> = HashMap::new();
     for (row, instant) in result.rows.iter().zip(&instants) {
@@ -413,11 +415,16 @@ pub fn align_series(query: &str, result: &QueryResult, lane: Lane) -> Result<Ser
                 series[si].visit(x, row.get(*ci), || value_to_string(&row[time_col]))?;
             }
         } else {
-            let key: Vec<String> = group_cols
+            let cells: Vec<&Value> = group_cols
                 .iter()
-                .map(|ci| value_to_string(row.get(*ci).unwrap_or(&Value::Null)))
+                .map(|ci| row.get(*ci).unwrap_or(&Value::Null))
                 .collect();
-            let label = key.join(" · ");
+            let key: Vec<String> = cells.iter().map(|v| identity(v)).collect();
+            let label = cells
+                .iter()
+                .map(|v| value_to_string(v))
+                .collect::<Vec<_>>()
+                .join(" · ");
             let si = series_index(&mut index, &mut series, key, label);
             series[si].visit(x, row.get(metric_cols[0]), || {
                 value_to_string(&row[time_col])
@@ -525,6 +532,31 @@ fn series_index(
         });
         series.len() - 1
     })
+}
+
+/// A group cell as a key that no other cell shares.
+///
+/// The label is the cell as the table prints it, and that printing is
+/// lossy: a float is rounded to two decimals, a null prints as `NULL`.
+/// Keying groups by the label would merge `1.001` with `1.002` and a
+/// null with the string `NULL` — a false duplicate inside one bucket, a
+/// silent merge across buckets. This encoding tags the variant and
+/// writes the value in full: `{:?}` on an `f64` is the shortest text
+/// that round-trips, and a string is length-prefixed so that an array's
+/// joined elements cannot re-spell another array.
+fn identity(value: &Value) -> String {
+    match value {
+        Value::Null => "null".to_owned(),
+        Value::Boolean(b) => format!("b:{b}"),
+        Value::Integer(i) => format!("i:{i}"),
+        Value::UInt(u) => format!("u:{u}"),
+        Value::Float(f) => format!("f:{f:?}"),
+        Value::String(s) => format!("s:{}:{s}", s.len()),
+        Value::Array(items) => {
+            let inner: Vec<String> = items.iter().map(identity).collect();
+            format!("a:{}:[{}]", items.len(), inner.join(","))
+        }
+    }
 }
 
 /// A metric cell as an `f64`, or `None` when it is not a number.
@@ -1257,6 +1289,58 @@ mod align_series_tests {
             let err = align(BY_HOST, &result(&["_time", "host", "count"], rows)).unwrap_err();
             assert_eq!(err, dup, "{pair:?}");
         }
+    }
+
+    #[test]
+    fn float_groups_that_render_alike_stay_distinct() {
+        let query = "* | timechart span=1m count() by latency_ms";
+        let cols = &["_time", "latency_ms", "count"];
+        // Same bucket: `1.001` and `1.002` both print `1.00`, yet they are
+        // two groups, not a duplicate row.
+        let rows = vec![
+            vec![at(0), Value::Float(1.001), Value::Integer(1)],
+            vec![at(0), Value::Float(1.002), Value::Integer(2)],
+        ];
+        let set = align(query, &result(cols, rows)).unwrap();
+        assert_eq!(set.total_series, 2);
+        assert_eq!(set.series.len(), 2);
+        assert_eq!(set.series[0].0, "1.00");
+        assert_eq!(set.series[1].0, "1.00");
+        let mut firsts: Vec<Option<f64>> = set.series.iter().map(|(_, v)| v[0]).collect();
+        firsts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(firsts, vec![Some(1.0), Some(2.0)]);
+        // Different buckets: still two series with a gap each, never one
+        // merged line.
+        let rows = vec![
+            vec![at(0), Value::Float(1.001), Value::Integer(1)],
+            vec![at(1), Value::Float(1.002), Value::Integer(2)],
+        ];
+        let set = align(query, &result(cols, rows)).unwrap();
+        assert_eq!(set.total_series, 2);
+        let mut values: Vec<&[Option<f64>]> =
+            set.series.iter().map(|(_, v)| v.as_slice()).collect();
+        values.sort_by(|a, b| a[0].partial_cmp(&b[0]).unwrap());
+        assert_eq!(values, vec![&[None, Some(2.0)][..], &[Some(1.0), None][..]]);
+    }
+
+    #[test]
+    fn null_and_the_string_null_stay_distinct() {
+        let cols = &["_time", "host", "count"];
+        let rows = vec![
+            vec![at(0), Value::Null, Value::Integer(1)],
+            vec![at(0), s("NULL"), Value::Integer(2)],
+        ];
+        let set = align(BY_HOST, &result(cols, rows)).unwrap();
+        assert_eq!(set.total_series, 2);
+        assert_eq!(set.series.len(), 2);
+        assert!(set.series.iter().all(|(label, _)| label == "NULL"));
+        // And the same for a number beside its own spelling.
+        let rows = vec![
+            vec![at(0), Value::Integer(200), Value::Integer(1)],
+            vec![at(0), s("200"), Value::Integer(2)],
+        ];
+        let set = align(BY_HOST, &result(cols, rows)).unwrap();
+        assert_eq!(set.total_series, 2);
     }
 
     /// The bridge's palette and dash list are the other half of
