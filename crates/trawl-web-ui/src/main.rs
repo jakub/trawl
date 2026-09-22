@@ -22,6 +22,7 @@ pub mod history_export;
 mod notice_key;
 mod offset;
 mod perms;
+mod query_error;
 mod query_merge;
 mod repin_flow;
 mod repin_hint;
