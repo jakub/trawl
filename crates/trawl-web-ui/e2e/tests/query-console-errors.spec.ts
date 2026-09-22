@@ -79,18 +79,42 @@ async function answerQueries(page: Page, status: number, body: unknown) {
   return sent;
 }
 
-/// Assert one excerpt block quotes `sent` with its caret under byte
-/// `start` (ASCII text, so bytes are characters) and nothing else.
-async function expectExcerpt(block: ReturnType<Page['locator']>, sent: string, start: number) {
+/// How far, in CSS pixels, the caret line's first `^` sits from the
+/// quoted line's glyph at string index `at`. Both are measured as laid
+/// out, through a Range over each text node.
+async function caretDrift(excerpt: ReturnType<Page['locator']>, at: number) {
+  return excerpt.locator(SEL.queryErrorText).evaluate((pre, at) => {
+    const textChild = (parent: Node, match: (t: string) => boolean) =>
+      Array.from(parent.childNodes).find(n => n.nodeType === Node.TEXT_NODE && match(n.textContent ?? '')) as Text;
+    const x = (node: Text, from: number) => {
+      const range = document.createRange();
+      range.setStart(node, from);
+      range.setEnd(node, from + 1);
+      return range.getBoundingClientRect().x;
+    };
+    const quoted = textChild(pre, t => t !== '\n');
+    const carets = textChild(pre.querySelector('.query-error-caret')!, t => t.startsWith('^'));
+    return x(carets, 0) - x(quoted, at);
+  }, at);
+}
+
+/// Assert one excerpt block quotes `sent` with its caret under the
+/// character at string index `at`, and nothing else.
+async function expectExcerpt(block: ReturnType<Page['locator']>, sent: string, at: number) {
   const excerpt = block.locator(SEL.queryErrorExcerpt);
   await expect(excerpt).toHaveCount(1);
   await expect(excerpt.locator(SEL.queryErrorCaption)).toHaveText(COPY.queryErrorCaption);
   const caret = excerpt.locator(SEL.queryErrorCaret);
-  await expect(caret).toHaveText(`${' '.repeat(start)}^`);
   await expect(caret).toHaveAttribute('aria-hidden', 'true');
+  // The caret line opens with the text before the span, laid out and
+  // not shown, then the carets.
+  const pad = excerpt.locator(SEL.queryErrorCaretPad);
+  expect(await pad.evaluate(el => el.textContent)).toBe(sent.slice(0, at));
+  await expect(pad).toHaveCSS('visibility', 'hidden');
   // The quoted line is the sent text, then the caret line under it.
   const text = await excerpt.locator(SEL.queryErrorText).evaluate(pre => pre.textContent);
-  expect(text).toBe(`${sent}\n${' '.repeat(start)}^`);
+  expect(text).toBe(`${sent}\n${sent.slice(0, at)}^`);
+  expect(Math.abs(await caretDrift(excerpt, at))).toBeLessThanOrEqual(1);
 }
 
 async function settled(page: Page) {
@@ -306,6 +330,37 @@ test.describe('query error notice', () => {
     await expect(blocks.nth(1).locator(SEL.queryErrorMessage)).toContainText('"#b"');
     await expectExcerpt(blocks.nth(0), 'last=15m f=#a,#b', 11);
     await expectExcerpt(blocks.nth(1), 'last=15m f=#a,#b', 14);
+  });
+
+  test('a wide glyph before the error keeps the caret under the h of host', async ({ page }) => {
+    const draft = 'service=雪 | stats count( by host';
+    const sentText = `last=15m ${draft}`;
+    const at = sentText.lastIndexOf('h');
+    // The server's span is in UTF-8 bytes; `雪` is three of them.
+    const start = Buffer.byteLength(sentText.slice(0, at));
+    expect(start).toBe(at + 2);
+    const body = wire('query-parse-error');
+    body.error.details[0].span = { start, end: start + 1 };
+    const sent = await answerQueries(page, 400, body);
+    await page.goto(`/search?q=${encodeURIComponent(draft)}&r=15m`);
+
+    const alert = notice(page);
+    await expect(alert).toBeVisible();
+    expect(sent).toEqual([sentText]);
+    // The glyph really is wider than a cell of the monospace face, so a
+    // caret placed by counting characters would land off the `h`.
+    const [wide, cell] = await alert.locator(SEL.queryErrorText).evaluate((pre, i) => {
+      const quoted = Array.from(pre.childNodes).find(n => n.nodeType === Node.TEXT_NODE && n.textContent !== '\n')!;
+      const width = (from: number) => {
+        const range = document.createRange();
+        range.setStart(quoted, from);
+        range.setEnd(quoted, from + 1);
+        return range.getBoundingClientRect().width;
+      };
+      return [width(i), width(0)];
+    }, sentText.indexOf('雪'));
+    expect(Math.abs(wide - cell)).toBeGreaterThan(1);
+    await expectExcerpt(alert.locator(SEL.queryErrorBlock), sentText, at);
   });
 
   test('a detail whose span does not index the sent text keeps its message and drops its caret', async ({ page }) => {

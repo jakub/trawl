@@ -14,7 +14,9 @@
 //! all of it renders as text nodes, never as markup. The excerpt quotes
 //! the text that was sent, which [`NoticeModel`] was built against; the
 //! caret line under it is decoration for sighted readers and hidden from
-//! assistive technology, which reads the message instead.
+//! assistive technology, which reads the message instead. That line opens
+//! with the quoted text before the span, laid out but invisible, so the
+//! carets start under the span however wide the glyphs before it are.
 
 use leptos::prelude::*;
 
@@ -51,6 +53,7 @@ fn excerpt_view(
     Excerpt {
         prefix,
         text,
+        pad,
         caret,
     }: Excerpt,
 ) -> impl IntoView {
@@ -62,7 +65,10 @@ fn excerpt_view(
                     .then(|| view! { <span class="query-error-line">{prefix}</span> })}
                 {text}
                 "\n"
-                <span class="query-error-caret" aria-hidden="true">{caret}</span>
+                <span class="query-error-caret" aria-hidden="true">
+                    <span class="query-error-caret-pad">{pad}</span>
+                    {caret}
+                </span>
             </pre>
         </figure>
     }

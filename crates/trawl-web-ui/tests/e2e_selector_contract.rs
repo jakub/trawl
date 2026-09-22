@@ -1990,6 +1990,12 @@ const CONTRACTS: &[Contract] = &[
         hook: "class=\"query-error-caret\"",
     },
     Contract {
+        assignment: "queryErrorCaretPad: '.query-error-caret .query-error-caret-pad',",
+        source_path: "src/components/query_error_notice.rs",
+        source: QUERY_ERROR_NOTICE_RS,
+        hook: "class=\"query-error-caret-pad\"",
+    },
+    Contract {
         assignment: "queryErrorCaption: 'Query sent to server',",
         source_path: "src/components/query_error_notice.rs",
         source: QUERY_ERROR_NOTICE_RS,

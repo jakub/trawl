@@ -13,8 +13,9 @@
 //! Everything below is text in, text out: the notice component renders a
 //! [`NoticeModel`] as text nodes and the draft diagnostic line renders a
 //! [`DraftDiagnostic`]. Spans are UTF-8 byte offsets; columns are
-//! character counts, which is what lines a caret up under a monospace
-//! glyph for everything but wide and combining glyphs.
+//! character counts. A caret is not placed by counting: its line repeats
+//! the text before the span, hidden, so the browser lays it out exactly as
+//! it laid out the quoted line, wide and combining glyphs and tabs alike.
 //!
 //! Only the wasm32 build consumes these helpers outside the tests.
 
@@ -37,11 +38,10 @@ pub struct Located {
     pub multi_line: bool,
     /// The line holding the span's start, without its line ending.
     pub line_text: String,
-    /// Blank padding up to the span's start, then one `^` per character
-    /// the span covers on that line (at least one). A tab in the line
-    /// before the span pads with a tab, so the caret lands where the
-    /// line's own tab stop put the text above it.
-    pub caret: String,
+    /// The line's text before the span's start.
+    pub before: String,
+    /// How many characters of the line the span covers, at least one.
+    pub width: usize,
 }
 
 /// Resolve a byte span against `text`.
@@ -80,18 +80,13 @@ pub fn locate(text: &str, span: &ErrorSpan) -> Option<Located> {
     let covered_end = end.min(displayed_end).max(start_on_line);
     let width = text[start_on_line..covered_end].chars().count().max(1);
 
-    let mut caret: String = before
-        .chars()
-        .map(|c| if c == '\t' { '\t' } else { ' ' })
-        .collect();
-    caret.extend(std::iter::repeat_n('^', width));
-
     Some(Located {
         line,
         column: before.chars().count() + 1,
         multi_line: text.contains('\n'),
         line_text: line_text.to_owned(),
-        caret,
+        before: before.to_owned(),
+        width,
     })
 }
 
@@ -124,7 +119,11 @@ pub struct Excerpt {
     pub prefix: String,
     /// The quoted line.
     pub text: String,
-    /// The caret line, padded past the prefix so it sits under `text`.
+    /// What the caret line holds before its carets: the prefix and the
+    /// quoted line up to the span, rendered hidden so the carets start
+    /// where the span's first glyph was laid out above them.
+    pub pad: String,
+    /// One `^` per character the span covers on that line (at least one).
     pub caret: String,
 }
 
@@ -136,11 +135,12 @@ impl Excerpt {
         } else {
             String::new()
         };
-        let caret = " ".repeat(prefix.chars().count()) + &located.caret;
+        let pad = format!("{prefix}{}", located.before);
         Some(Self {
             prefix,
             text: located.line_text,
-            caret,
+            pad,
+            caret: "^".repeat(located.width),
         })
     }
 }
@@ -345,12 +345,12 @@ mod tests {
         assert_eq!(at.column, 44);
         assert!(!at.multi_line);
         assert_eq!(at.line_text, SAMPLE);
-        assert_eq!(at.caret, format!("{}^", " ".repeat(43)));
-        assert_eq!(&SAMPLE[at.caret.len() - 1..=43], "h");
+        assert_eq!(at.before, &SAMPLE[..43]);
+        assert_eq!(at.width, 1);
     }
 
     /// Columns count characters, not bytes: `é` is two bytes and `🌊`
-    /// four, and each pads the caret by one.
+    /// four, and each is one column.
     #[test]
     fn columns_count_characters_not_bytes() {
         let text = "a=é b=🌊 x";
@@ -358,12 +358,39 @@ mod tests {
         assert_eq!(x, 12);
         let at = locate(text, &span(x, x + 1)).expect("x is on a boundary");
         assert_eq!(at.column, 9);
-        assert_eq!(at.caret, format!("{}^", " ".repeat(8)));
+        assert_eq!(at.before, "a=é b=🌊 ");
 
         let wave = text.find('🌊').expect("the wave is in the text");
         let at = locate(text, &span(wave, wave + '🌊'.len_utf8())).expect("whole glyph");
         assert_eq!(at.column, 7);
-        assert_eq!(at.caret, format!("{}^", " ".repeat(6)));
+        assert_eq!(at.before, "a=é b=");
+        assert_eq!(at.width, 1);
+    }
+
+    /// A wide glyph before the span is one column but two cells on
+    /// screen. The caret line pads with the glyph itself, so the browser
+    /// gives the pad the width it gave the line above.
+    #[test]
+    fn a_wide_glyph_before_the_span_pads_with_itself() {
+        let text = "last=15m service=雪 | stats count( by host";
+        let h = text.rfind('h').expect("host is in the text");
+        let excerpt = Excerpt::at(text, &span(h, h + 1)).expect("in bounds");
+        assert_eq!(excerpt.pad, "last=15m service=雪 | stats count( by ");
+        assert_eq!(excerpt.caret, "^");
+        assert_eq!(locate(text, &span(h, h + 1)).expect("in bounds").column, 38);
+    }
+
+    /// A combining mark is a column of its own to `locate`, and no width
+    /// at all on screen; the pad carries it on its base letter.
+    #[test]
+    fn a_combining_mark_before_the_span_pads_with_itself() {
+        let text = "a=e\u{301} x";
+        let x = text.find('x').expect("x is in the text");
+        let at = locate(text, &span(x, x + 1)).expect("in bounds");
+        assert_eq!(at.column, 6);
+        let excerpt = Excerpt::at(text, &span(x, x + 1)).expect("in bounds");
+        assert_eq!(excerpt.pad, "a=e\u{301} ");
+        assert_eq!(excerpt.caret, "^");
     }
 
     #[test]
@@ -382,7 +409,8 @@ mod tests {
     #[test]
     fn a_zero_width_span_gets_one_caret() {
         let at = locate("abc def", &span(4, 4)).expect("in bounds");
-        assert_eq!(at.caret, "    ^");
+        assert_eq!(at.before, "abc ");
+        assert_eq!(at.width, 1);
         assert_eq!(at.column, 5);
     }
 
@@ -390,7 +418,8 @@ mod tests {
     fn a_span_at_the_end_of_the_text_sits_after_the_last_character() {
         let text = "service=kubelet | stats count(";
         let at = locate(text, &span(text.len(), text.len())).expect("EOF is in bounds");
-        assert_eq!(at.caret, format!("{}^", " ".repeat(text.len())));
+        assert_eq!(at.before, text);
+        assert_eq!(at.width, 1);
         assert_eq!(at.line_text, text);
     }
 
@@ -404,22 +433,22 @@ mod tests {
         assert_eq!(at.line, 2);
         assert!(at.multi_line);
         assert_eq!(at.line_text, "| stats count( by host");
-        assert_eq!(at.caret, format!("{}^^^^", " ".repeat(18)));
+        assert_eq!(at.before, "| stats count( by ");
+        assert_eq!(at.width, 4);
 
         let excerpt = Excerpt::at(text, &span(h, h + 4)).expect("in bounds");
         assert_eq!(excerpt.prefix, "line 2: ");
         assert_eq!(excerpt.text, "| stats count( by host");
-        assert_eq!(excerpt.caret, format!("{}^^^^", " ".repeat(8 + 18)));
+        assert_eq!(excerpt.pad, "line 2: | stats count( by ");
+        assert_eq!(excerpt.caret, "^^^^");
 
         // The first line of a multi-line text is named too, and loses its
         // `\r`; a span running into the line ending is cut at the line.
         let first = Excerpt::at(text, &span(8, 17)).expect("in bounds");
         assert_eq!(first.prefix, "line 1: ");
         assert_eq!(first.text, "service=kubelet");
-        assert_eq!(
-            first.caret,
-            format!("{}{}", " ".repeat(8 + 8), "^".repeat(7))
-        );
+        assert_eq!(first.pad, "line 1: service=");
+        assert_eq!(first.caret, "^".repeat(7));
     }
 
     /// A span that starts on a line ending the excerpt drops sits just
@@ -431,27 +460,34 @@ mod tests {
         assert_eq!(at.line, 1);
         assert_eq!(at.line_text, "x");
         assert_eq!(at.column, 2);
-        assert_eq!(at.caret, " ^");
+        assert_eq!((at.before.as_str(), at.width), ("x", 1));
 
         // The `\r` itself.
         let at = locate("x\r\nnext", &span(1, 2)).expect("in bounds");
         assert_eq!(at.column, 2);
-        assert_eq!(at.caret, " ^");
+        assert_eq!((at.before.as_str(), at.width), ("x", 1));
 
         // A lone trailing `\r`, and the end of the text after it.
         for (start, end) in [(1, 2), (2, 2)] {
             let at = locate("x\r", &span(start, end)).expect("in bounds");
             assert_eq!(at.line_text, "x");
             assert_eq!(at.column, 2, "span {start}..{end}");
-            assert_eq!(at.caret, " ^", "span {start}..{end}");
+            assert_eq!(
+                (at.before.as_str(), at.width),
+                ("x", 1),
+                "span {start}..{end}"
+            );
         }
     }
 
+    /// A tab before the span is in the pad as itself, so it reaches the
+    /// same tab stop it reached in the line above.
     #[test]
-    fn a_tab_before_the_span_pads_with_a_tab() {
+    fn a_tab_before_the_span_pads_with_itself() {
         let text = "a=1\t| x";
-        let at = locate(text, &span(6, 7)).expect("in bounds");
-        assert_eq!(at.caret, "   \t  ^");
+        let excerpt = Excerpt::at(text, &span(6, 7)).expect("in bounds");
+        assert_eq!(excerpt.pad, "a=1\t| ");
+        assert_eq!(excerpt.caret, "^");
     }
 
     #[test]
@@ -495,7 +531,8 @@ mod tests {
                 excerpt: Some(Excerpt {
                     prefix: String::new(),
                     text: SAMPLE.to_owned(),
-                    caret: format!("{}^", " ".repeat(43)),
+                    pad: SAMPLE[..43].to_owned(),
+                    caret: "^".to_owned(),
                 }),
             }]
         );
@@ -545,8 +582,11 @@ mod tests {
         assert_eq!(model.blocks.len(), 2);
         assert_eq!(model.blocks[0].message.as_deref(), Some("first — try this"));
         assert_eq!(
-            model.blocks[0].excerpt.as_ref().map(|e| e.caret.as_str()),
-            Some("^^^^")
+            model.blocks[0]
+                .excerpt
+                .as_ref()
+                .map(|e| (e.pad.as_str(), e.caret.as_str())),
+            Some(("", "^^^^"))
         );
         assert_eq!(model.blocks[1].message.as_deref(), Some("second"));
         assert_eq!(model.blocks[1].excerpt, None);
@@ -692,7 +732,8 @@ mod tests {
             .as_ref()
             .expect("the span indexes SAMPLE");
         assert_eq!(excerpt.text, SAMPLE);
-        assert_eq!(excerpt.caret, format!("{}^", " ".repeat(43)));
+        assert_eq!(excerpt.pad, &SAMPLE[..43]);
+        assert_eq!(excerpt.caret, "^");
     }
 
     #[test]

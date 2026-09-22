@@ -120,6 +120,10 @@
 }
 .query-error-line { color: var(--ink-3); }
 .query-error-caret { color: var(--red); }
+/* The caret line's copy of the text before the span: it takes the
+ * width that text took above it and shows nothing, and a copy of the
+ * excerpt does not pick it up twice. */
+.query-error-caret-pad { visibility: hidden; user-select: none; }
 
 /* The shared pre-query guide stays inside the results scroller. Its
  * columns respond to the sheet width, including when the rail is open. */

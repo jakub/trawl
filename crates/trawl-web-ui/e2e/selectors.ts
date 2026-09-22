@@ -123,6 +123,7 @@ export const SEL = {
   queryErrorCaption: 'figcaption.query-error-caption',
   queryErrorText: 'pre.query-error-text',
   queryErrorCaret: '.query-error-caret',
+  queryErrorCaretPad: '.query-error-caret .query-error-caret-pad',
   /// crates/fleet-ui/src/range_dialog.rs RangePanel —
   /// the Segmented tab strip's "Absolute" option.
   absoluteTab: '.dr-pop >> text=Absolute',
