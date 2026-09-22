@@ -113,15 +113,16 @@ export const SEL = {
   loadHintError: '.results .load-hint.error',
   /// crates/trawl-web-ui/src/components/query_error_notice.rs — the query
   /// error notice, which search.rs mounts in the results region in place
-  /// of the table or chart.
+  /// of the table or chart. The parts below it are chained off the
+  /// notice (or one of its blocks), so they carry no ancestor of their own.
   queryErrorNotice: '#search-results .query-error[role="alert"]',
-  queryErrorLead: '.query-error .query-error-lead',
-  queryErrorBlock: '.query-error .query-error-block',
-  queryErrorMessage: '.query-error-block .query-error-message',
-  queryErrorExcerpt: '.query-error-block figure.query-error-excerpt',
-  queryErrorCaption: '.query-error-excerpt figcaption.query-error-caption',
-  queryErrorText: '.query-error-excerpt pre.query-error-text',
-  queryErrorCaret: '.query-error-text .query-error-caret',
+  queryErrorLead: '.query-error-lead',
+  queryErrorBlock: '.query-error-block',
+  queryErrorMessage: '.query-error-message',
+  queryErrorExcerpt: 'figure.query-error-excerpt',
+  queryErrorCaption: 'figcaption.query-error-caption',
+  queryErrorText: 'pre.query-error-text',
+  queryErrorCaret: '.query-error-caret',
   /// crates/fleet-ui/src/range_dialog.rs RangePanel —
   /// the Segmented tab strip's "Absolute" option.
   absoluteTab: '.dr-pop >> text=Absolute',
@@ -541,6 +542,11 @@ export const COPY = {
   /// crates/trawl-web-ui/vendor/src/codemirror.ts LINT_MARKER_NAME — the
   /// accessible name of every lint gutter marker.
   lintMarkerName: 'Query syntax error',
+  /// crates/trawl-web-ui/src/components/query_error_notice.rs — the label
+  /// over each excerpt.
+  queryErrorCaption: 'Query sent to server',
+  /// crates/trawl-web-ui/src/state/stream_session.rs STREAM_UNAVAILABLE.
+  streamUnavailable: 'Live stream unavailable. Retry or switch to Snapshot.',
   /// crates/trawl-web-ui/src/components/editor_wrap.rs — the visible
   /// names of two of the three editor tools. Both say what they act on,
   /// since "Save" and "Share" named neither the net nor the URL.
