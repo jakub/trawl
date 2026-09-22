@@ -87,6 +87,8 @@ mod tests {
             &nav.range,
         );
         assert!(!effective.contains("last="));
+        assert!(effective.contains(r#"_time>="2026-01-01T11:59:30+00:00""#));
+        assert!(effective.contains(r#"_time<="2026-01-01T12:00:30+00:00""#));
         assert!(trawl_core::parser::parse(&effective).is_ok());
         assert!(nav.query.starts_with("host="));
     }
