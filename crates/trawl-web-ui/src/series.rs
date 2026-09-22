@@ -677,10 +677,14 @@ pub fn caption(drawn: usize, total: usize, noun: &str, narrow: Option<&str>) -> 
         return None;
     }
     let omitted = total - drawn;
-    let line = if noun == "series" {
-        format!("{drawn} of {total} series drawn; the {omitted} smallest by total are not.")
-    } else {
-        format!("{drawn} of {total} {noun} drawn; the {omitted} smallest are not.")
+    // One omission reads as a singular; the plural keeps the count.
+    let line = match (noun == "series", omitted) {
+        (true, 1) => format!("{drawn} of {total} series drawn; the smallest by total is not."),
+        (true, _) => {
+            format!("{drawn} of {total} series drawn; the {omitted} smallest by total are not.")
+        }
+        (false, 1) => format!("{drawn} of {total} {noun} drawn; the smallest is not."),
+        (false, _) => format!("{drawn} of {total} {noun} drawn; the {omitted} smallest are not."),
     };
     Some(match narrow {
         Some(fields) => format!("{line} Narrow {fields}, or open Events."),
@@ -1224,11 +1228,15 @@ mod align_series_tests {
         );
         assert_eq!(
             caption(6, 7, "series", None).as_deref(),
-            Some("6 of 7 series drawn; the 1 smallest by total are not.")
+            Some("6 of 7 series drawn; the smallest by total is not.")
         );
         assert_eq!(
             caption(20, 26, "groups", None).as_deref(),
             Some("20 of 26 groups drawn; the 6 smallest are not.")
+        );
+        assert_eq!(
+            caption(20, 21, "groups", None).as_deref(),
+            Some("20 of 21 groups drawn; the smallest is not.")
         );
     }
 
