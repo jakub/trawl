@@ -27,7 +27,7 @@ for (const tab of ['Events', 'Visualization']) {
     await expect(page.getByRole('button', { name: 'Retry live stream' })).toHaveCount(0);
     await page.getByRole('tab', { name: /^Events/ }).click();
     await expect(page.getByText('burst-5999', { exact: true })).toBeVisible();
-    expect(queries).toEqual(['host="web-01" last=15m service=nginx', 'host="web-01" last=15m service=nginx']);
+    expect(queries).toEqual(['host="web-01" service=nginx', 'host="web-01" service=nginx']);
     expect(page.url()).toBe(url);
     await expect(editor).toHaveText('service=postgres');
     expect(await intervalCount(page, 16)).toBe(1);
