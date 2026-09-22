@@ -1715,10 +1715,14 @@ fn make_group_key(group_by: &[String], event: &Row) -> GroupKey {
 /// string (RFC 3339) on a live stream, and `DuckDB`'s zoneless UTC
 /// timestamp text (`YYYY-MM-DD HH:MM:SS[.ffffff]`) from the SQL prefix
 /// on the batch tail behind `extract kv`, which renders at offset zero
-/// and shifts for display only after the tail. Both are read through
+/// and shifts for display only after the tail. The wire string is read
+/// by the same RFC 3339 parse ingest accepted it with, so every instant
+/// ingest keeps — a leap second such as `2016-12-31T23:59:60Z`, which
+/// `derive_time` preserves on the bus — buckets here too. Only a text
+/// that parse refuses is read through
 /// [`crate::compare::conformed_timestamp`], the mirror of the conform a
-/// stored `_time` gets, so this lane buckets an event where the SQL lane
-/// would.
+/// stored `_time` gets, so the zoneless SQL text buckets where the SQL
+/// lane would.
 ///
 /// The fallback for a row with no readable `_time` is `now()`, and
 /// `now()` here is the event's context, the same instant its filter
@@ -1732,10 +1736,13 @@ fn event_time_bucket(event: &Row, span_secs: u64, ctx: &EvalContext) -> i64 {
     // lane uses: ingest folds every name to lowercase and the pipeline
     // cannot mint a reserved one, so a trawl-written row has no case
     // variant to bind.
-    if let Some(EvalValue::Str(ts)) = event.get("_time")
-        && let Some(crate::compare::Instant::At(at)) = crate::compare::conformed_timestamp(ts)
-    {
-        return at.and_utc().timestamp() / span_secs as i64;
+    if let Some(EvalValue::Str(ts)) = event.get("_time") {
+        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) {
+            return dt.timestamp() / span_secs as i64;
+        }
+        if let Some(crate::compare::Instant::At(at)) = crate::compare::conformed_timestamp(ts) {
+            return at.and_utc().timestamp() / span_secs as i64;
+        }
     }
     // Fallback: the context's instant, never a fresh clock read.
     ctx.now_utc().timestamp() / span_secs as i64
@@ -2159,6 +2166,25 @@ mod tests {
             let ev = event(&json!({"_time": text, "service": "nginx"}));
             assert_eq!(event_time_bucket(&ev, span, &ctx()), expected, "{text}");
         }
+
+        // A leap second is a wire string ingest accepts and `derive_time`
+        // preserves; the conform mirror refuses seconds past 59, so the
+        // RFC 3339 parse must stay first or the event would fall back to
+        // `now()`. The expected bucket is whatever chrono reads, computed
+        // here rather than typed, because how it lands the 60th second
+        // is chrono's to decide.
+        let leap = "2016-12-31T23:59:60Z";
+        let leap_expected = chrono::DateTime::parse_from_rfc3339(leap)
+            .expect("chrono reads a leap second")
+            .timestamp()
+            / i64::try_from(span).unwrap();
+        let ev = event(&json!({"_time": leap, "service": "nginx"}));
+        assert_eq!(event_time_bucket(&ev, span, &ctx()), leap_expected);
+        assert_ne!(
+            leap_expected,
+            ctx().now_utc().timestamp() / i64::try_from(span).unwrap(),
+            "the fixture must not coincide with the fallback"
+        );
 
         // …and an event with no `_time` falls back to the context's
         // instant, a different bucket — the failure mode the assertion
