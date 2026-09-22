@@ -9,9 +9,10 @@
 // Serves the built trawl-web-ui `dist/` (SPA fallback on extensionless
 // paths) and stands in for trawl-web's `/api/*` surface with canned,
 // wire-shape-accurate responses (see fixtures.mjs). Single mutable
-// "current scenario" — set via POST /__ctl/reset — because
-// playwright.config.ts pins workers:1 so exactly one spec talks to this
-// process at a time.
+// "current scenario" — set via POST /__ctl/reset — because each
+// Playwright worker starts its own process (the `stubOrigin` fixture in
+// fixtures.ts) and a worker runs one test at a time, so exactly one spec
+// talks to this process at a time.
 
 import http from 'node:http';
 import fs from 'node:fs';
@@ -60,8 +61,9 @@ import {
 } from './fixtures.mjs';
 
 const HOST = '127.0.0.1';
-// E2E_PORT lets parallel worktrees run without colliding; the Playwright
-// config reads the same variable, so server and baseURL can't disagree.
+// E2E_PORT lets parallel worktrees and workers run without colliding.
+// fixtures.ts sets it per worker and derives `baseURL` from the same
+// number, so server and baseURL can't disagree.
 const PORT = Number(process.env.E2E_PORT ?? 8123);
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));

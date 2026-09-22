@@ -37,8 +37,8 @@ const REPO_ROOT = path.resolve(HARNESS_DIR, '..', '..', '..', '..');
  * rebuilds on any write below it, and a rebuild applying its distribution
  * clears `dist/.stage` under a concurrent `trunk build` — so copying a
  * dist into the source tree breaks the very builds this suite runs
- * against. Keyed by port so parallel suites in one worktree (E2E_PORT)
- * own separate copies. */
+ * against. Keyed by port so parallel suites in one worktree (E2E_PORT),
+ * and the per-worker servers of one suite, own separate copies. */
 export function snapshotPath(port) {
   return path.join(REPO_ROOT, 'e2e-artifacts', `dist-snapshot-${port}`);
 }
