@@ -1,0 +1,15 @@
+{
+  "error": {
+    "code": "parse_error",
+    "message": "found 'h', expected '(' or '*' or '/' or '%' or '+' or '-' or matches or ilike or like or '=' or '!' or '>' or '<' or in or and or or or ',' or ')'",
+    "details": [
+      {
+        "message": "found 'h', expected '(' or '*' or '/' or '%' or '+' or '-' or matches or ilike or like or '=' or '!' or '>' or '<' or in or and or or or ',' or ')'",
+        "span": {
+          "start": 43,
+          "end": 44
+        }
+      }
+    ]
+  }
+}

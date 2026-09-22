@@ -1044,3 +1044,114 @@ fn wide_result_capture_fixture_has_full_width_rows_and_local_pages() {
     );
     assert_eq!(result.columns[6].name, "trace_id");
 }
+
+// ---- query errors (ADR-0039) ---------------------------------------------
+//
+// The query error bodies the notice specs fulfil the query route with.
+// Each is the envelope the server writes for the text the spec sends: the
+// parse fixtures carry exactly the details the parser reports for that
+// effective text (the server's parse arm copies them one for one), and the
+// validation fixtures carry the emitter's own message, hint and summary.
+// A parser message that moves fails here, not as a spec asserting on a
+// message the server no longer writes.
+
+const QUERY_PARSE_ERROR: &str = include_str!("../e2e/harness/wire/query-parse-error.json");
+const QUERY_PARSE_ERRORS_TWO: &str =
+    include_str!("../e2e/harness/wire/query-parse-errors-two.json");
+const QUERY_VALIDATION_HINT: &str = include_str!("../e2e/harness/wire/query-validation-hint.json");
+const QUERY_VALIDATION_NO_HINT: &str =
+    include_str!("../e2e/harness/wire/query-validation-no-hint.json");
+const QUERY_EXECUTION_ERROR: &str = include_str!("../e2e/harness/wire/query-execution-error.json");
+
+/// `ErrorDetail` has no `PartialEq`; compare the wire form instead.
+fn json(details: &[trawl_api::ErrorDetail]) -> serde_json::Value {
+    serde_json::to_value(details).expect("details serialize")
+}
+
+/// The details the server's parse arm writes for `effective`.
+fn parse_details(effective: &str) -> Vec<trawl_api::ErrorDetail> {
+    trawl_core::parser::parse(effective)
+        .expect_err("the fixture's text does not parse")
+        .iter()
+        .map(|e| trawl_api::ErrorDetail {
+            message: e.message.clone(),
+            span: Some(trawl_api::ErrorSpan {
+                start: e.span.start,
+                end: e.span.end,
+            }),
+            label: e.label.clone(),
+            hint: e.hint.clone(),
+        })
+        .collect()
+}
+
+#[test]
+fn the_parse_error_fixtures_are_what_the_parser_reports() {
+    for (name, text, effective) in [
+        (
+            "query-parse-error.json",
+            QUERY_PARSE_ERROR,
+            "last=15m service=kubelet | stats count( by host",
+        ),
+        (
+            "query-parse-errors-two.json",
+            QUERY_PARSE_ERRORS_TWO,
+            "last=15m f=#a,#b",
+        ),
+    ] {
+        let body: trawl_api::ErrorResponse = decode(name, text);
+        let expected = parse_details(effective);
+        assert_eq!(body.error.code, trawl_api::ErrorCode::ParseError, "{name}");
+        assert_eq!(body.error.message, expected[0].message, "{name}");
+        assert_eq!(json(&body.error.details), json(&expected), "{name}");
+    }
+}
+
+#[test]
+fn the_validation_fixtures_are_what_the_emitter_reports() {
+    use trawl_core::emitter::EmitError;
+    for (name, text, error) in [
+        (
+            "query-validation-hint.json",
+            QUERY_VALIDATION_HINT,
+            EmitError::UnknownFunction {
+                name: "countt".into(),
+                suggestion: Some("count".into()),
+            },
+        ),
+        (
+            "query-validation-no-hint.json",
+            QUERY_VALIDATION_NO_HINT,
+            EmitError::UnknownFunction {
+                name: "nosuchfunc".into(),
+                suggestion: None,
+            },
+        ),
+    ] {
+        let body: trawl_api::ErrorResponse = decode(name, text);
+        assert_eq!(
+            body.error.code,
+            trawl_api::ErrorCode::ValidationError,
+            "{name}"
+        );
+        assert_eq!(body.error.message, error.to_string(), "{name}");
+        assert_eq!(
+            json(&body.error.details),
+            json(&[trawl_api::ErrorDetail {
+                message: error.message(),
+                span: None,
+                label: None,
+                hint: error.hint(),
+            }]),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn the_execution_error_fixture_is_not_a_query_error() {
+    let body: trawl_api::ErrorResponse =
+        decode("query-execution-error.json", QUERY_EXECUTION_ERROR);
+    assert_eq!(body.error.code, trawl_api::ErrorCode::ExecutionError);
+    assert!(body.error.details.is_empty());
+}
