@@ -329,6 +329,11 @@ async function experiment() {
   await fs.writeFile(path.join(runDir, 'corpus.ndjson'), ndjson);
   report.corpusHash = createHash('sha256').update(ndjson).digest('hex');
   const queryText = `experiment_run="${runId}" earliest="2026-01-01T00:00:00Z" latest="2026-01-02T00:00:00Z" | fields experiment_seq, status | sort experiment_seq`;
+  // A live stream carries no time window (ADR-0027, amended 2026-09-21).
+  // The run filter ALONE, so the default 15m range is the thing under
+  // test: the corpus is stamped 2026-01-01 (workload.mjs), so a folded
+  // `last=15m` yields a healthy, permanently empty stream.
+  const liveQueryText = `experiment_run="${runId}"`;
   const latencies = [];
   async function query() {
     const start = performance.now();
@@ -414,7 +419,7 @@ async function experiment() {
     // Drive real UI controls to open live tail, then stream the remainder.
     await editor.click();
     await page.keyboard.press('Control+a');
-    await page.keyboard.insertText(queryText.split(' | ')[0]);
+    await page.keyboard.insertText(liveQueryText);
     await page.locator('.daterange .dr-trigger').click();
     await page.locator('.dr-pop').getByText('Real-time', { exact: true }).click();
     const streamReady = page.waitForResponse(r => new URL(r.url()).pathname === '/api/v1/stream');
@@ -422,6 +427,13 @@ async function experiment() {
     // beside it. Same hook the browser suite pins as `SEL.liveTailButton`.
     await page.locator('.rt-hint + .foot .btn-pri').click();
     assert.equal((await streamReady).status(), 200);
+    // Live entry must leave the range out of the URL as well as the stream.
+    await page.waitForURL(url => url.searchParams.get('mode') === 'live');
+    {
+      const live = new URL(page.url());
+      assert.equal(live.searchParams.get('mode'), 'live', 'live tail should be in live mode');
+      assert.equal(live.searchParams.get('r'), null, 'live tail should run under the default range, which the URL elides');
+    }
     const ingestStart = performance.now();
     for (let offset = firstCount; offset < count; offset += batchSize) {
       const due = (Math.min(offset + batchSize, count) - firstCount) * 1000 / rate;
@@ -437,6 +449,7 @@ async function experiment() {
     await page.screenshot({ path: path.join(runDir, 'live-tail.png') });
     const streams = await page.evaluate(() => window.experimentStreams.filter(s => s.url.includes('/api/v1/stream')));
     assert.equal(streams.length, 1, 'expected exactly one live-tail stream');
+    assert.equal(new URL(streams[0].url, browserOrigin).searchParams.get('query'), liveQueryText, 'live tail stream must carry the bare run filter and no range');
     assert.equal(streams[0].lagged, false, 'live tail lagged');
     assert.deepEqual(streams[0].ids.sort((a, b) => a - b), events.slice(firstCount).map(e => e.experiment_seq), 'live tail lost or duplicated events');
     report.phases.push({ name: 'browser-live-tail', verifiedEvents: count - firstCount });
