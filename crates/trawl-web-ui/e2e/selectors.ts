@@ -111,6 +111,17 @@ export const SEL = {
   liveTailButton: '.rt-hint + .foot .btn-pri',
   /// crates/fleet-ui/src/loaded/component.rs Loaded's default Error arm.
   loadHintError: '.results .load-hint.error',
+  /// crates/trawl-web-ui/src/components/query_error_notice.rs — the query
+  /// error notice, which search.rs mounts in the results region in place
+  /// of the table or chart.
+  queryErrorNotice: '#search-results .query-error[role="alert"]',
+  queryErrorLead: '.query-error .query-error-lead',
+  queryErrorBlock: '.query-error .query-error-block',
+  queryErrorMessage: '.query-error-block .query-error-message',
+  queryErrorExcerpt: '.query-error-block figure.query-error-excerpt',
+  queryErrorCaption: '.query-error-excerpt figcaption.query-error-caption',
+  queryErrorText: '.query-error-excerpt pre.query-error-text',
+  queryErrorCaret: '.query-error-text .query-error-caret',
   /// crates/fleet-ui/src/range_dialog.rs RangePanel —
   /// the Segmented tab strip's "Absolute" option.
   absoluteTab: '.dr-pop >> text=Absolute',

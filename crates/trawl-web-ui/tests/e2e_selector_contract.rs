@@ -67,6 +67,8 @@ const SEGMENTED_COMPONENT_RS: &str = include_str!("../../fleet-ui/src/segmented/
 const SCHEDULE_EDIT_RS: &str = include_str!("../src/schedule_edit.rs");
 const API_ERROR_RS: &str = include_str!("../src/api_error.rs");
 const CODEMIRROR_TS: &str = include_str!("../vendor/src/codemirror.ts");
+const QUERY_ERROR_NOTICE_RS: &str = include_str!("../src/components/query_error_notice.rs");
+const SEARCH_RS: &str = include_str!("../src/pages/search.rs");
 
 /// One (assignment, source file, hook) triple: `assignment` is the full
 /// `key: 'value',` line as it appears in `selectors.ts`, and `hook` must
@@ -1926,6 +1928,66 @@ const CONTRACTS: &[Contract] = &[
         source_path: "vendor/src/codemirror.ts",
         source: CODEMIRROR_TS,
         hook: "const LINT_MARKER_NAME = \"Query syntax error\";",
+    },
+    Contract {
+        assignment: "queryErrorNotice: '#search-results .query-error[role=\"alert\"]',",
+        source_path: "src/pages/search.rs",
+        source: SEARCH_RS,
+        hook: "<QueryErrorNotice model=model/>",
+    },
+    Contract {
+        assignment: "queryErrorNotice: '#search-results .query-error[role=\"alert\"]',",
+        source_path: "src/pages/search.rs",
+        source: SEARCH_RS,
+        hook: "<div id=\"search-results\" class=\"results\"",
+    },
+    Contract {
+        assignment: "queryErrorNotice: '#search-results .query-error[role=\"alert\"]',",
+        source_path: "src/components/query_error_notice.rs",
+        source: QUERY_ERROR_NOTICE_RS,
+        hook: "<div class=\"query-error\" role=\"alert\">",
+    },
+    Contract {
+        assignment: "queryErrorLead: '.query-error .query-error-lead',",
+        source_path: "src/components/query_error_notice.rs",
+        source: QUERY_ERROR_NOTICE_RS,
+        hook: "class=\"query-error-lead\"",
+    },
+    Contract {
+        assignment: "queryErrorBlock: '.query-error .query-error-block',",
+        source_path: "src/components/query_error_notice.rs",
+        source: QUERY_ERROR_NOTICE_RS,
+        hook: "class=\"query-error-block\"",
+    },
+    Contract {
+        assignment: "queryErrorMessage: '.query-error-block .query-error-message',",
+        source_path: "src/components/query_error_notice.rs",
+        source: QUERY_ERROR_NOTICE_RS,
+        hook: "class=\"query-error-message\"",
+    },
+    Contract {
+        assignment: "queryErrorExcerpt: '.query-error-block figure.query-error-excerpt',",
+        source_path: "src/components/query_error_notice.rs",
+        source: QUERY_ERROR_NOTICE_RS,
+        hook: "<figure class=\"query-error-excerpt\">",
+    },
+    Contract {
+        assignment: "queryErrorCaption: '.query-error-excerpt figcaption.query-error-caption',",
+        source_path: "src/components/query_error_notice.rs",
+        source: QUERY_ERROR_NOTICE_RS,
+        hook: "<figcaption class=\"query-error-caption\">",
+    },
+    Contract {
+        assignment: "queryErrorText: '.query-error-excerpt pre.query-error-text',",
+        source_path: "src/components/query_error_notice.rs",
+        source: QUERY_ERROR_NOTICE_RS,
+        hook: "<pre class=\"query-error-text\">",
+    },
+    Contract {
+        assignment: "queryErrorCaret: '.query-error-text .query-error-caret',",
+        source_path: "src/components/query_error_notice.rs",
+        source: QUERY_ERROR_NOTICE_RS,
+        hook: "class=\"query-error-caret\"",
     },
     // -- the DSL shapes the stub dispatches on --------------------------
     // `e2e_wire_fixture_contract.rs` proves these against the builders by

@@ -11,13 +11,59 @@
 // the two, and the identity cases assert the notice never quotes a text
 // other than the one the failing request sent.
 
+import { readFileSync } from 'node:fs';
 import { test, expect } from '../fixtures';
 import { SEL, COPY } from '../selectors';
-import type { Page } from '@playwright/test';
+import type { Page, Route } from '@playwright/test';
+
+/// A query error body under harness/wire/. Each is the envelope the server
+/// writes for the text its case sends; e2e_wire_fixture_contract.rs checks
+/// the parse bodies against the parser and the validation bodies against
+/// the emitter.
+const wire = (name: string) =>
+  JSON.parse(readFileSync(`${__dirname}/../harness/wire/${name}.json`, 'utf8'));
 
 /// The issue's sample, as typed into the editor. The local parser's first
 /// error is at byte 34, the `h` of `host`.
 const SAMPLE = 'service=kubelet | stats count( by host';
+/// What the page sends for SAMPLE under the 15-minute range: the text the
+/// server's span indexes.
+const SAMPLE_SENT = 'last=15m service=kubelet | stats count( by host';
+const SAMPLE_URL = `/search?q=${encodeURIComponent(SAMPLE)}&r=15m`;
+
+/// Park every POST /api/v1/query until the case releases it, recording
+/// the text each carried. `release(i, body)` answers the i-th request.
+async function holdQueries(page: Page) {
+  const parked: { route: Route; sent: string }[] = [];
+  await page.route('**/api/v1/query', route => {
+    parked.push({ route, sent: route.request().postDataJSON().query });
+  });
+  return {
+    count: () => parked.length,
+    sent: (i: number) => parked[i].sent,
+    release: (i: number, status: number, json: unknown) => parked[i].route.fulfill({ status, json }),
+  };
+}
+
+/// Record, from now on, whether a query error notice was ever put in the
+/// page, however briefly. A notice that renders and is replaced within a
+/// frame is still a notice the reader was shown.
+async function watchForNotice(page: Page) {
+  await page.evaluate(() => {
+    const w = window as unknown as { __noticeSeen: boolean };
+    w.__noticeSeen = document.querySelector('.query-error') !== null;
+    new MutationObserver(() => {
+      if (document.querySelector('.query-error')) w.__noticeSeen = true;
+    }).observe(document.body, { childList: true, subtree: true });
+  });
+  return () => page.evaluate(() => (window as unknown as { __noticeSeen: boolean }).__noticeSeen);
+}
+
+async function settled(page: Page) {
+  await page.evaluate(() => new Promise<void>(resolve => {
+    requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+  }));
+}
 
 async function typeDraft(page: Page, text: string) {
   await page.locator(SEL.cmContent).click();
@@ -97,5 +143,33 @@ test.describe('draft diagnostic', () => {
     await expect.poll(() => page.evaluate(() => window.getSelection()?.toString())).toBe('');
     await page.keyboard.press('F8');
     await expect.poll(() => page.evaluate(() => window.getSelection()?.toString())).toBe('h');
+  });
+});
+
+test.describe('query error identity', () => {
+  test('a Haul of the same query while it is pending waits for its own verdict', async ({ page }) => {
+    const queries = await holdQueries(page);
+    await page.goto(SAMPLE_URL);
+    await expect.poll(queries.count).toBe(1);
+    expect(queries.sent(0)).toBe(SAMPLE_SENT);
+
+    // Re-send the same text while the first request is still out. The
+    // Haul button is disabled while a query runs; the editor's own
+    // submit is not, and it is the path a repeated Haul takes.
+    await page.locator(SEL.cmContent).click();
+    await page.keyboard.press('Control+Enter');
+    const noticeSeen = await watchForNotice(page);
+
+    // The first answer lands after the second Haul was asked for, so it
+    // is not the second Haul's verdict and must not be shown as one.
+    await queries.release(0, 400, wire('query-parse-error'));
+    await expect.poll(queries.count).toBe(2);
+    expect(queries.sent(1)).toBe(SAMPLE_SENT);
+    await settled(page);
+    expect(await noticeSeen()).toBe(false);
+    await expect(page.locator(SEL.queryErrorNotice)).toHaveCount(0);
+
+    await queries.release(1, 400, wire('query-parse-error'));
+    await expect(page.locator(SEL.queryErrorNotice)).toBeVisible();
   });
 });

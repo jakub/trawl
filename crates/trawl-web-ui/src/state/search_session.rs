@@ -84,6 +84,17 @@ impl std::fmt::Display for ExecutedFailure {
 /// `Some` response during a reload, so presence cannot report loading.
 /// The returned intent revision advances independently of the serialized
 /// fetcher, including while an older request is still in flight.
+///
+/// `resubmit` is the one way to send an unchanged request again: a
+/// same-query Haul or Retry bumps it, and it advances the intent the way
+/// a changed input does. `LocalResource::refetch` is not that way. Its
+/// invalidation is consumed while a request is in flight, so a re-Haul
+/// of a pending query sent nothing, and the older request's answer then
+/// landed as the current intent's verdict. Moving the intent the moment
+/// the resubmission is asked for supersedes that answer at once: it
+/// leaves `pending` set, rearms the fetcher, and matches no reader's
+/// intent. The same holds for a success as for a failure.
+#[allow(clippy::too_many_arguments)]
 pub fn rows_resource(
     effective_q: Memo<String>,
     plan: Memo<FetchPlan>,
@@ -92,6 +103,7 @@ pub fn rows_resource(
     base: Memo<String>,
     filters: Memo<Vec<Filter>>,
     range: Memo<RangeSpec>,
+    resubmit: ReadSignal<u64>,
 ) -> (
     LocalResource<Result<ExecutedResponse, ExecutedFailure>>,
     Memo<u64>,
@@ -109,6 +121,7 @@ pub fn rows_resource(
     });
     let intent = Memo::new(move |previous: Option<&u64>| {
         inputs.with(|_| ());
+        resubmit.track();
         previous.map_or(0, |revision| revision.wrapping_add(1))
     });
     // LocalResource awaits one request before processing its next dependency

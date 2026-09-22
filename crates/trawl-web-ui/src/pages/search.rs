@@ -228,6 +228,10 @@ pub fn Search() -> impl IntoView {
 
     let (query_pending, set_query_pending) = signal(false);
     let request_generation = RwSignal::new(0_u64);
+    // Sends the current request again (a same-query Haul, Retry
+    // snapshot). See `rows_resource` for why this, not `refetch`.
+    let resubmit = RwSignal::new(0_u64);
+    let rerun_request = move || resubmit.update(|n| *n = n.wrapping_add(1));
     let (rows, request_intent) = rows_resource(
         snapshot_q,
         fetch_plan,
@@ -236,6 +240,7 @@ pub fn Search() -> impl IntoView {
         executed_q,
         filters,
         range,
+        resubmit.read_only(),
     );
 
     let goto = navigator();
@@ -257,8 +262,9 @@ pub fn Search() -> impl IntoView {
             // Hauling the query the URL already carries writes the same
             // link, and the memos behind the resource do not notify on an
             // unchanged value — so a snapshot Haul would be silent just
-            // when it is the only way to retry a page that failed. Ask
-            // the resource itself in that case. In live the same Haul is
+            // when it is the only way to retry a page that failed.
+            // Resubmit in that case, which also supersedes a request for
+            // the same text still in flight. In live the same Haul is
             // a no-op: no snapshot runs, and the stream's own key
             // (retry, mode, effective query) has not moved.
             // Plan equality, not `page == 0`: the navigation below goes
@@ -280,7 +286,7 @@ pub fn Search() -> impl IntoView {
                 false,
             );
             if rerun && outcome.is_ok() {
-                rows.refetch();
+                rerun_request();
             }
             report_refusal(bus, outcome);
         })
@@ -1258,7 +1264,7 @@ pub fn Search() -> impl IntoView {
                                         />
                                     }.into_any()
                                 }
-                                Some(Err(_)) => view! { <div class="results-empty"><p role="alert">"Snapshot query failed. Open Events for the query error."</p><button type="button" class="btn-sec" on:click=move |_| rows.refetch()>"Retry snapshot"</button></div> }.into_any(),
+                                Some(Err(_)) => view! { <div class="results-empty"><p role="alert">"Snapshot query failed. Open Events for the query error."</p><button type="button" class="btn-sec" on:click=move |_| rerun_request()>"Retry snapshot"</button></div> }.into_any(),
                                 None => view! { <p class="results-empty">"Run a query to visualize its snapshot."</p> }.into_any(),
                             }
                         };
