@@ -50,6 +50,14 @@ _Avoid_: invalid URL, broken link (too broad), stale link
 Snapshot (a one-shot query, paged by the server for events and in the browser for an aggregation) or live (an SSE stream). The URL carries `mode=live` or nothing. Live Tail enters live; Stop live or any range selection leaves it, always by navigation. Nothing pauses it: a URL that says live streams, or shows why it cannot. While live, no snapshot query runs. A live stream carries the query text and the filter chips, never the range. The range in `r` is what Stop live returns to.
 _Avoid_: view, tab, pause
 
+**Query error**:
+A snapshot or live submission the server refused as a parse or validation failure. It renders in the results region on both results tabs as a notice quoting the server's message and, for each detail with a span, an excerpt of the query as sent with a caret under the span. It offers no Retry. Any other failure is a load error and keeps its Retry.
+_Avoid_: 400, bad request, syntax banner
+
+**Draft diagnostic**:
+What the local parser says about the editor buffer while you type: the gutter marker and the visible line under the editor that carries the first message in full, with the rest behind a disclosure. Advisory only: it never blocks Haul and never speaks for the server.
+_Avoid_: lint, squiggle (that is one rendering of it), validation
+
 **Live ring**:
 The newest raw events the stream delivered, up to a fixed size. In live it is what the Events tab, its count and the filter rail show; the footer's Received count is everything delivered since the stream opened, including what rolled off.
 _Avoid_: buffer (unqualified), tail rows, history
