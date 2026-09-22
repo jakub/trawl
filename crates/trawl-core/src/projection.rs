@@ -490,6 +490,7 @@ mod tests {
             let plan = crate::stream::compile_stream_plan(
                 &query.pipeline,
                 &crate::pin_scope::PinScope::unpinned(),
+                None,
             );
             if streams {
                 let Ok(crate::stream::StreamPlan::Aggregate { aggregation, .. }) = plan else {
@@ -536,6 +537,7 @@ mod tests {
                 crate::stream::compile_stream_plan(
                     &query.pipeline,
                     &crate::pin_scope::PinScope::unpinned(),
+                    None,
                 )
                 .is_err(),
                 "{dsl} must remain refused"
@@ -556,6 +558,7 @@ mod tests {
             let stream = crate::stream::compile_stream_plan(
                 &query.pipeline,
                 &crate::pin_scope::PinScope::unpinned(),
+                None,
             )
             .expect_err("the stream lane must refuse")
             .to_string();
@@ -576,6 +579,7 @@ mod tests {
         crate::stream::compile_stream_plan(
             &query.pipeline,
             &crate::pin_scope::PinScope::unpinned(),
+            None,
         )
         .expect("stream lane accepts");
     }

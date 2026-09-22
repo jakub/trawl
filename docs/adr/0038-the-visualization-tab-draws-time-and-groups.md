@@ -34,11 +34,13 @@ with the count the server measured, whatever the type.
 web UI sends `timezone: None` and the server defaults the offset to zero
 (`crates/trawl-web-ui/src/api/mod.rs:422`,
 `crates/trawl-server/src/handlers.rs:116-121`), so a snapshot `_time` is
-UTC wall clock without a suffix and a live `_time` is RFC 3339 with `Z`.
+UTC wall clock without a suffix and a live `_time` is RFC 3339 with a zero offset.
 The chart parses exactly those two forms, strictly, and refuses any other
 text in `_time`. The axis is labelled `UTC` and its ticks print the digits
 the Events table prints. uPlot gets `utc: true` so the browser does not
-shift them. Browser-local time is a separate product question.
+shift them. Browser-local time is a separate product question. The live
+stream spells the zero offset `+00:00` (chrono's `to_rfc3339`), so the
+strict parser admits both `Z` and `+00:00`.
 
 **Series come from the query, not from cell types.** The ladder reads the
 `by` fields and the metric columns from the parsed query that produced
@@ -61,7 +63,11 @@ cadence from the data and the response carries no new field. With the
 span known, the chart lays a grid from the earliest to the latest
 returned bucket, at most 20,000 instants, and a (bucket, series) with no
 row is a null drawn as a gap, never a zero. Above 20,000 instants the
-chart refuses and says so.
+chart refuses and says so. A snapshot timechart that runs as a rust
+stage after `extract kv` is bucketed by the same resolver with the same
+`last=` filter, so its buckets match the SQL lane's and the chart's; only
+the live stream resolves with no filter, because a stream has no past
+window.
 
 **More than six series draws the six largest by total over the fetched
 rows, with a caption under the chart that names what was left out.** The
@@ -72,12 +78,13 @@ in the caption is measured over the fetched rows, so a cut result never
 claims a total it does not have.
 
 **Column and Bar draw the shape the Events tab's categorical chart
-already admits**: one `by` field, one metric, `stats` as the last stage
-before an optional `sort` or `head`, numbers including floats and
-negatives, nulls tolerated (`crates/trawl-web-ui/src/categorical.rs:76-131`).
-Both types use uPlot with an ordinal x scale and the group labels passed
-through the bridge. Bar is Column rotated. The Events tab and its inline
-bars do not change.
+already admits**: one `by` field, one metric, `stats` as the last stage,
+numbers including floats and negatives, nulls tolerated
+(`crates/trawl-web-ui/src/categorical.rs:76-131`). A trailing `sort` or
+`head` after that `stats` is not admitted today, which the detector's
+own comment (`last_stats`) already explains. Both types use uPlot with
+an ordinal x scale and the group labels passed through the bridge. Bar
+is Column rotated. The Events tab and its inline bars do not change.
 
 **Live feeds the same component.** The live snapshot goes through the
 same ladder, the same resolver, and the same detector. A grouped live

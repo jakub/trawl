@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::ast::{
     AggExpr, DedupStage, DropStage, Expr, ExtractMode, ExtractStage, LetStage, LimitStage,
-    LiteralValue, PipeStage, RenameStage, Spanned, TableStage, WhereStage,
+    LiteralValue, PipeStage, RenameStage, Spanned, TableStage, TrawlDuration, WhereStage,
 };
 use crate::context::EvalContext;
 use crate::emitter::{
@@ -128,9 +128,19 @@ impl std::error::Error for StreamPlanError {}
 /// emitter consumes (`crate::pin_scope`), stamping each `where`/`let`
 /// with the scope it must evaluate under. There is no default, so
 /// pin-blindness is explicit at the call site (`&PinScope::unpinned()`).
+///
+/// `last` is the query's `last=` window, which only a `timechart` with
+/// no `span=` reads: it picks the automatic bucket width from the same
+/// band table the SQL emitter uses (ADR-0038). A live stream passes
+/// `None`, because a stream has no past window and the band's answer for
+/// "no filter" is the one-minute bucket it always cut. A snapshot
+/// `rust_stages` tail passes the parsed query's filter, so its buckets
+/// match the ones the emitter would have cut for the same query in SQL,
+/// and the width the web chart derives from the query text.
 pub fn compile_stream_plan(
     pipeline: &[Spanned<PipeStage>],
     pins: &PinScope,
+    last: Option<TrawlDuration>,
 ) -> Result<StreamPlan, StreamPlanError> {
     // The bind-time expansion budget first, over the whole pipeline
     // (ADR-0024) — ahead of the projection check and of every
@@ -168,7 +178,7 @@ pub fn compile_stream_plan(
             scope.advance(&spanned.node);
         }
 
-        let aggregation = compile_aggregation(&pipeline[idx].node)?;
+        let aggregation = compile_aggregation(&pipeline[idx].node, last)?;
         scope.advance(&pipeline[idx].node);
 
         let mut post_stages = Vec::new();
@@ -1416,7 +1426,10 @@ fn compile_agg_expr(agg: &AggExpr, stage: &str) -> Result<CompiledAcc, StreamPla
     })
 }
 
-fn compile_aggregation(stage: &PipeStage) -> Result<CompiledAggregation, StreamPlanError> {
+fn compile_aggregation(
+    stage: &PipeStage,
+    last: Option<TrawlDuration>,
+) -> Result<CompiledAggregation, StreamPlanError> {
     match stage {
         PipeStage::Stats(s) => {
             let accumulators = s
@@ -1453,10 +1466,15 @@ fn compile_aggregation(stage: &PipeStage) -> Result<CompiledAggregation, StreamP
                     ),
                 });
             }
-            let span_secs = s
-                .span
-                .as_ref()
-                .map_or(60, crate::ast::TrawlDuration::to_seconds);
+            // The executor follows the query. A live stream passes no
+            // filter, because a stream has no past window, and the
+            // automatic band answers for "no filter" with the 60 s this
+            // line used to hard-code (ADR-0038 records that equality).
+            // A snapshot `rust_stages` tail passes the query's `last=`
+            // filter, so its buckets match the SQL emitter's for the
+            // same query and the `query_span` the chart lays its grid
+            // with.
+            let span_secs = crate::timechart::resolve_span(s.span, last).to_seconds();
             let accumulators = s
                 .aggregations
                 .iter()
@@ -1693,6 +1711,19 @@ fn make_group_key(group_by: &[String], event: &Row) -> GroupKey {
 
 /// The span bucket an event lands in.
 ///
+/// `_time` reaches this lane as text in two spellings: the ingest wire
+/// string (RFC 3339) on a live stream, and `DuckDB`'s zoneless UTC
+/// timestamp text (`YYYY-MM-DD HH:MM:SS[.ffffff]`) from the SQL prefix
+/// on the batch tail behind `extract kv`, which renders at offset zero
+/// and shifts for display only after the tail. The wire string is read
+/// by the same RFC 3339 parse ingest accepted it with, so every instant
+/// ingest keeps — a leap second such as `2016-12-31T23:59:60Z`, which
+/// `derive_time` preserves on the bus — buckets here too. Only a text
+/// that parse refuses is read through
+/// [`crate::compare::conformed_timestamp`], the mirror of the conform a
+/// stored `_time` gets, so the zoneless SQL text buckets where the SQL
+/// lane would.
+///
 /// The fallback for a row with no readable `_time` is `now()`, and
 /// `now()` here is the event's context, the same instant its filter
 /// window and its `| where` read. Sampling a clock of its own would
@@ -1705,10 +1736,13 @@ fn event_time_bucket(event: &Row, span_secs: u64, ctx: &EvalContext) -> i64 {
     // lane uses: ingest folds every name to lowercase and the pipeline
     // cannot mint a reserved one, so a trawl-written row has no case
     // variant to bind.
-    if let Some(EvalValue::Str(ts)) = event.get("_time")
-        && let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts)
-    {
-        return dt.timestamp() / span_secs as i64;
+    if let Some(EvalValue::Str(ts)) = event.get("_time") {
+        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) {
+            return dt.timestamp() / span_secs as i64;
+        }
+        if let Some(crate::compare::Instant::At(at)) = crate::compare::conformed_timestamp(ts) {
+            return at.and_utc().timestamp() / span_secs as i64;
+        }
     }
     // Fallback: the context's instant, never a fresh clock read.
     ctx.now_utc().timestamp() / span_secs as i64
@@ -1916,6 +1950,82 @@ fn snapshot_percentile(values: &[f64], target: f64) -> EvalValue {
 /// `post_process::apply_rust_stages`, whose own refusal is pinned by
 /// `post_process::timechart_on_refused_in_batch_tail` there — it cannot
 /// be called from this crate, which trawl-engine depends on).
+/// The live compiler asks [`crate::timechart::resolve_span`] the same
+/// question the emitter and the web chart ask (ADR-0038): no span falls
+/// back to the automatic "no filter" band (60 s), an explicit `span=`
+/// wins unchanged.
+#[cfg(test)]
+#[test]
+fn stream_timechart_span_uses_the_resolver() {
+    let pins = PinScope::unpinned();
+    let pipeline = |dsl: &str| crate::parser::parse(dsl).expect("dsl parses").pipeline;
+
+    let plan =
+        compile_stream_plan(&pipeline("* | timechart count()"), &pins, None).expect("compiles");
+    let StreamPlan::Aggregate { aggregation, .. } = plan else {
+        panic!("timechart compiles to an aggregate plan");
+    };
+    let CompiledAggregation::Timechart { span_secs, .. } = aggregation else {
+        panic!("timechart compiles to a Timechart aggregation");
+    };
+    assert_eq!(span_secs, 60);
+
+    let plan = compile_stream_plan(&pipeline("* | timechart span=2m count()"), &pins, None)
+        .expect("compiles");
+    let StreamPlan::Aggregate { aggregation, .. } = plan else {
+        panic!("timechart compiles to an aggregate plan");
+    };
+    let CompiledAggregation::Timechart { span_secs, .. } = aggregation else {
+        panic!("timechart compiles to a Timechart aggregation");
+    };
+    assert_eq!(span_secs, 120);
+}
+
+/// The third argument is the query's `last=` window: with no `span=`,
+/// the automatic band follows it exactly as the SQL emitter's does, so a
+/// snapshot tail behind `extract kv` cuts the same buckets the same
+/// query cuts in SQL. `None` is the live stream's answer and stays at
+/// one minute.
+#[cfg(test)]
+#[test]
+fn stream_timechart_span_follows_the_filter_when_given() {
+    let pins = PinScope::unpinned();
+    let query = crate::parser::parse("last=4h | extract kv | timechart count()").expect("parses");
+    let last = query.search.time_filter.as_ref().map(|tf| tf.node.duration);
+    assert_eq!(last.map(|d| d.to_seconds()), Some(4 * 3600));
+
+    let span_of = |last: Option<TrawlDuration>| {
+        let plan = compile_stream_plan(&query.pipeline, &pins, last).expect("compiles");
+        let StreamPlan::Aggregate { aggregation, .. } = plan else {
+            panic!("timechart compiles to an aggregate plan");
+        };
+        let CompiledAggregation::Timechart { span_secs, .. } = aggregation else {
+            panic!("timechart compiles to a Timechart aggregation");
+        };
+        span_secs
+    };
+    assert_eq!(span_of(last), 300, "last=4h sits in the five-minute band");
+    assert_eq!(span_of(None), 60, "no window is the one-minute band");
+    // Matches the answer the SQL emitter and the chart get from the same
+    // resolver for the same query.
+    assert_eq!(
+        crate::timechart::query_span(&query).map(|d| d.to_seconds()),
+        Some(300)
+    );
+
+    // An explicit span= still wins over the window.
+    let query =
+        crate::parser::parse("last=4h | extract kv | timechart span=2m count()").expect("parses");
+    let plan = compile_stream_plan(&query.pipeline, &pins, last).expect("compiles");
+    let StreamPlan::Aggregate { aggregation, .. } = plan else {
+        panic!("timechart compiles to an aggregate plan");
+    };
+    let CompiledAggregation::Timechart { span_secs, .. } = aggregation else {
+        panic!("timechart compiles to a Timechart aggregation");
+    };
+    assert_eq!(span_secs, 120);
+}
+
 #[cfg(test)]
 #[test]
 fn timechart_on_refused_in_live_lane() {
@@ -1925,6 +2035,7 @@ fn timechart_on_refused_in_live_lane() {
     let refusal = compile_stream_plan(
         &pipeline("* | extract kv | timechart on hostname span=5m count()"),
         &pins,
+        None,
     )
     .expect_err("a bucket column other than _time has no live meaning")
     .to_string();
@@ -1942,6 +2053,7 @@ fn timechart_on_refused_in_live_lane() {
                 "* | extract kv | timechart on {spelling} span=5m count()"
             )),
             &pins,
+            None,
         )
         .unwrap_or_else(|e| {
             panic!("`on {spelling}` is the default spelled out, not a new bucket source: {e}")
@@ -2004,7 +2116,7 @@ mod tests {
                 direction: crate::ast::SortDirection::Desc,
             }],
         }))];
-        let err = compile_stream_plan(&pipeline, &PinScope::unpinned()).unwrap_err();
+        let err = compile_stream_plan(&pipeline, &PinScope::unpinned(), None).unwrap_err();
         assert!(err.to_string().contains("sort"));
         assert!(err.to_string().contains("arrival order"));
     }
@@ -2020,13 +2132,13 @@ mod tests {
             on_field: "status".into(),
             by: vec![],
         }))];
-        let err = compile_stream_plan(&pipeline, &PinScope::unpinned()).unwrap_err();
+        let err = compile_stream_plan(&pipeline, &PinScope::unpinned(), None).unwrap_err();
         assert!(err.to_string().contains("pivot"));
     }
 
     #[test]
     fn accepts_empty_pipeline() {
-        let plan = compile_stream_plan(&[], &PinScope::unpinned()).unwrap();
+        let plan = compile_stream_plan(&[], &PinScope::unpinned(), None).unwrap();
         assert!(matches!(plan, StreamPlan::PassThrough(stages) if stages.is_empty()));
     }
 
@@ -2046,6 +2158,33 @@ mod tests {
             .timestamp()
             / i64::try_from(span).unwrap();
         assert_eq!(bucket, expected);
+
+        // The batch tail behind `extract kv` receives the SQL prefix's
+        // `_time` as DuckDB's zoneless UTC text, with or without a
+        // fraction; the same instant lands in the same bucket.
+        for text in ["2026-01-15 09:07:00", "2026-01-15 09:07:00.25"] {
+            let ev = event(&json!({"_time": text, "service": "nginx"}));
+            assert_eq!(event_time_bucket(&ev, span, &ctx()), expected, "{text}");
+        }
+
+        // A leap second is a wire string ingest accepts and `derive_time`
+        // preserves; the conform mirror refuses seconds past 59, so the
+        // RFC 3339 parse must stay first or the event would fall back to
+        // `now()`. The expected bucket is whatever chrono reads, computed
+        // here rather than typed, because how it lands the 60th second
+        // is chrono's to decide.
+        let leap = "2016-12-31T23:59:60Z";
+        let leap_expected = chrono::DateTime::parse_from_rfc3339(leap)
+            .expect("chrono reads a leap second")
+            .timestamp()
+            / i64::try_from(span).unwrap();
+        let ev = event(&json!({"_time": leap, "service": "nginx"}));
+        assert_eq!(event_time_bucket(&ev, span, &ctx()), leap_expected);
+        assert_ne!(
+            leap_expected,
+            ctx().now_utc().timestamp() / i64::try_from(span).unwrap(),
+            "the fixture must not coincide with the fallback"
+        );
 
         // …and an event with no `_time` falls back to the context's
         // instant, a different bucket — the failure mode the assertion
@@ -2376,7 +2515,7 @@ mod tests {
         ] {
             let pipeline = crate::parser::parse(dsl).expect("parses").pipeline;
             assert!(
-                compile_stream_plan(&pipeline, &PinScope::unpinned()).is_ok(),
+                compile_stream_plan(&pipeline, &PinScope::unpinned(), None).is_ok(),
                 "{dsl} must compile as ordinary field usage"
             );
         }
@@ -2411,7 +2550,7 @@ mod tests {
                 "{dsl} must be refused by the SQL lane"
             );
             assert!(
-                compile_stream_plan(&query.pipeline, &PinScope::unpinned()).is_err(),
+                compile_stream_plan(&query.pipeline, &PinScope::unpinned(), None).is_err(),
                 "{dsl} must be refused by the stream lane"
             );
         }
@@ -2435,7 +2574,7 @@ mod tests {
             r#"* | let hot = _severity == "spicy""#,
         ] {
             let pipeline = crate::parser::parse(dsl).expect("parses").pipeline;
-            let err = compile_stream_plan(&pipeline, &scope).unwrap_err();
+            let err = compile_stream_plan(&pipeline, &scope, None).unwrap_err();
             assert!(
                 matches!(err, StreamPlanError::InvalidComparison(_)),
                 "{dsl}: expected InvalidComparison, got {err:?}"
@@ -2457,7 +2596,7 @@ mod tests {
         ] {
             let pipeline = crate::parser::parse(dsl).expect("parses").pipeline;
             assert!(
-                compile_stream_plan(&pipeline, &scope).is_ok(),
+                compile_stream_plan(&pipeline, &scope, None).is_ok(),
                 "{dsl} must compile"
             );
         }
@@ -2475,7 +2614,7 @@ mod tests {
             r#"* | let s = sev(level, "bogus")"#,
         ] {
             let pipeline = crate::parser::parse(dsl).expect("parses").pipeline;
-            let err = compile_stream_plan(&pipeline, &scope).unwrap_err();
+            let err = compile_stream_plan(&pipeline, &scope, None).unwrap_err();
             assert!(
                 err.to_string().contains("otel, syslog"),
                 "{dsl}: {err} must name the vocabulary"
@@ -2484,7 +2623,7 @@ mod tests {
         let pipeline = crate::parser::parse("* | let s = sev(level, other)")
             .expect("parses")
             .pipeline;
-        let err = compile_stream_plan(&pipeline, &scope).unwrap_err();
+        let err = compile_stream_plan(&pipeline, &scope, None).unwrap_err();
         assert!(
             err.to_string()
                 .contains("must be a string literal dialect name"),
@@ -2498,7 +2637,7 @@ mod tests {
         ] {
             let pipeline = crate::parser::parse(dsl).expect("parses").pipeline;
             assert!(
-                compile_stream_plan(&pipeline, &scope).is_ok(),
+                compile_stream_plan(&pipeline, &scope, None).is_ok(),
                 "{dsl} must compile"
             );
         }
@@ -2525,7 +2664,7 @@ mod tests {
             ("* | let s = now(a)", "now() requires exactly 0 argument(s)"),
         ] {
             let pipeline = crate::parser::parse(dsl).expect("parses").pipeline;
-            let err = compile_stream_plan(&pipeline, &scope)
+            let err = compile_stream_plan(&pipeline, &scope, None)
                 .unwrap_err()
                 .to_string();
             assert!(err.contains(sentence), "{dsl}: {err}");
@@ -2540,7 +2679,7 @@ mod tests {
         let pipeline = crate::parser::parse("* | let s = sevv(level)")
             .expect("parses")
             .pipeline;
-        let err = compile_stream_plan(&pipeline, &scope)
+        let err = compile_stream_plan(&pipeline, &scope, None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("sevv"), "{err}");
@@ -3070,7 +3209,7 @@ mod tests {
                 renames: vec![("service".into(), "svc".into())],
             })),
         ];
-        let plan = compile_stream_plan(&pipeline, &PinScope::unpinned()).unwrap();
+        let plan = compile_stream_plan(&pipeline, &PinScope::unpinned(), None).unwrap();
         let StreamPlan::PassThrough(mut stages) = plan else {
             panic!("expected PassThrough");
         };
@@ -3100,7 +3239,7 @@ mod tests {
                 keyword: "limit",
             })),
         ];
-        let plan = compile_stream_plan(&pipeline, &PinScope::unpinned()).unwrap();
+        let plan = compile_stream_plan(&pipeline, &PinScope::unpinned(), None).unwrap();
         let StreamPlan::PassThrough(mut stages) = plan else {
             panic!("expected PassThrough");
         };
@@ -3162,7 +3301,7 @@ mod tests {
             }],
             group_by: vec![],
         }))];
-        let plan = compile_stream_plan(&pipeline, &PinScope::unpinned()).unwrap();
+        let plan = compile_stream_plan(&pipeline, &PinScope::unpinned(), None).unwrap();
         assert!(matches!(plan, StreamPlan::Aggregate { .. }));
     }
 
@@ -3187,7 +3326,7 @@ mod tests {
                 keyword: "limit",
             })),
         ];
-        let plan = compile_stream_plan(&pipeline, &PinScope::unpinned()).unwrap();
+        let plan = compile_stream_plan(&pipeline, &PinScope::unpinned(), None).unwrap();
         let StreamPlan::Aggregate {
             pre_stages,
             post_stages,
@@ -3212,7 +3351,7 @@ mod tests {
             }],
             group_by: vec![],
         }))];
-        let plan = compile_stream_plan(&pipeline, &PinScope::unpinned()).unwrap();
+        let plan = compile_stream_plan(&pipeline, &PinScope::unpinned(), None).unwrap();
         let StreamPlan::Aggregate {
             mut aggregation, ..
         } = plan
@@ -3240,7 +3379,7 @@ mod tests {
             }],
             group_by: vec!["host".into()],
         }))];
-        let plan = compile_stream_plan(&pipeline, &PinScope::unpinned()).unwrap();
+        let plan = compile_stream_plan(&pipeline, &PinScope::unpinned(), None).unwrap();
         let StreamPlan::Aggregate {
             mut aggregation, ..
         } = plan
@@ -3288,7 +3427,7 @@ mod tests {
             ],
             group_by: vec![],
         }))];
-        let plan = compile_stream_plan(&pipeline, &PinScope::unpinned()).unwrap();
+        let plan = compile_stream_plan(&pipeline, &PinScope::unpinned(), None).unwrap();
         let StreamPlan::Aggregate {
             mut aggregation, ..
         } = plan
@@ -3327,7 +3466,7 @@ mod tests {
             ],
             group_by: vec![],
         }))];
-        let plan = compile_stream_plan(&pipeline, &PinScope::unpinned()).unwrap();
+        let plan = compile_stream_plan(&pipeline, &PinScope::unpinned(), None).unwrap();
         let StreamPlan::Aggregate {
             mut aggregation, ..
         } = plan
@@ -3364,7 +3503,7 @@ mod tests {
             ],
             group_by: vec![],
         }))];
-        let plan = compile_stream_plan(&pipeline, &PinScope::unpinned()).unwrap();
+        let plan = compile_stream_plan(&pipeline, &PinScope::unpinned(), None).unwrap();
         let StreamPlan::Aggregate {
             mut aggregation, ..
         } = plan
@@ -3392,7 +3531,7 @@ mod tests {
             }],
             group_by: vec![],
         }))];
-        let plan = compile_stream_plan(&pipeline, &PinScope::unpinned()).unwrap();
+        let plan = compile_stream_plan(&pipeline, &PinScope::unpinned(), None).unwrap();
         let StreamPlan::Aggregate {
             mut aggregation, ..
         } = plan
@@ -3418,7 +3557,7 @@ mod tests {
             }],
             group_by: vec![],
         }))];
-        let plan = compile_stream_plan(&pipeline, &PinScope::unpinned()).unwrap();
+        let plan = compile_stream_plan(&pipeline, &PinScope::unpinned(), None).unwrap();
         let StreamPlan::Aggregate {
             mut aggregation, ..
         } = plan
@@ -3443,7 +3582,7 @@ mod tests {
             }],
             group_by: vec![],
         }))];
-        let plan = compile_stream_plan(&pipeline, &PinScope::unpinned()).unwrap();
+        let plan = compile_stream_plan(&pipeline, &PinScope::unpinned(), None).unwrap();
         let StreamPlan::Aggregate {
             mut aggregation, ..
         } = plan
@@ -3471,7 +3610,7 @@ mod tests {
             }],
             group_by: vec![],
         }))];
-        let plan = compile_stream_plan(&pipeline, &PinScope::unpinned()).unwrap();
+        let plan = compile_stream_plan(&pipeline, &PinScope::unpinned(), None).unwrap();
         let StreamPlan::Aggregate {
             mut aggregation, ..
         } = plan
@@ -3498,7 +3637,7 @@ mod tests {
             }],
             group_by: vec![],
         }))];
-        let plan = compile_stream_plan(&pipeline, &PinScope::unpinned()).unwrap();
+        let plan = compile_stream_plan(&pipeline, &PinScope::unpinned(), None).unwrap();
         let StreamPlan::Aggregate {
             mut aggregation, ..
         } = plan
@@ -3521,7 +3660,7 @@ mod tests {
             field: "host".into(),
             by: vec![],
         }))];
-        let plan = compile_stream_plan(&pipeline, &PinScope::unpinned()).unwrap();
+        let plan = compile_stream_plan(&pipeline, &PinScope::unpinned(), None).unwrap();
         let StreamPlan::Aggregate {
             mut aggregation, ..
         } = plan
@@ -3552,7 +3691,7 @@ mod tests {
             field: "host".into(),
             by: vec![],
         }))];
-        let plan = compile_stream_plan(&pipeline, &PinScope::unpinned()).unwrap();
+        let plan = compile_stream_plan(&pipeline, &PinScope::unpinned(), None).unwrap();
         let StreamPlan::Aggregate {
             mut aggregation, ..
         } = plan
@@ -3581,7 +3720,7 @@ mod tests {
             }],
             group_by: vec!["host".into()],
         }))];
-        let plan = compile_stream_plan(&pipeline, &PinScope::unpinned()).unwrap();
+        let plan = compile_stream_plan(&pipeline, &PinScope::unpinned(), None).unwrap();
         let StreamPlan::Aggregate { aggregation, .. } = plan else {
             panic!("expected Aggregate");
         };
@@ -3631,7 +3770,7 @@ mod tests {
         ] {
             let pipeline = vec![make_date_part_stage(unit)];
             assert!(
-                compile_stream_plan(&pipeline, &PinScope::unpinned()).is_ok(),
+                compile_stream_plan(&pipeline, &PinScope::unpinned(), None).is_ok(),
                 "date_part should accept unit {unit:?} in streaming path"
             );
         }
@@ -3644,7 +3783,7 @@ mod tests {
         ] {
             let pipeline = vec![make_date_trunc_stage(unit)];
             assert!(
-                compile_stream_plan(&pipeline, &PinScope::unpinned()).is_ok(),
+                compile_stream_plan(&pipeline, &PinScope::unpinned(), None).is_ok(),
                 "date_trunc should accept unit {unit:?} in streaming path"
             );
         }
@@ -3653,7 +3792,7 @@ mod tests {
     #[test]
     fn stream_date_part_rejects_unknown_unit() {
         let pipeline = vec![make_date_part_stage("nanosecond")];
-        let err = compile_stream_plan(&pipeline, &PinScope::unpinned()).unwrap_err();
+        let err = compile_stream_plan(&pipeline, &PinScope::unpinned(), None).unwrap_err();
         assert!(
             matches!(err, StreamPlanError::InvalidUnit(ref msg) if msg.contains("nanosecond")),
             "unexpected error: {err}"
@@ -3664,7 +3803,7 @@ mod tests {
     fn stream_date_trunc_rejects_dow() {
         // dow is in DATE_PART_UNITS but not in DATE_UNITS (date_trunc allowlist)
         let pipeline = vec![make_date_trunc_stage("dow")];
-        let err = compile_stream_plan(&pipeline, &PinScope::unpinned()).unwrap_err();
+        let err = compile_stream_plan(&pipeline, &PinScope::unpinned(), None).unwrap_err();
         assert!(
             matches!(err, StreamPlanError::InvalidUnit(_)),
             "unexpected: {err}"
@@ -3689,7 +3828,7 @@ mod tests {
             )],
             keyword: "let",
         }))];
-        let err = compile_stream_plan(&pipeline, &PinScope::unpinned()).unwrap_err();
+        let err = compile_stream_plan(&pipeline, &PinScope::unpinned(), None).unwrap_err();
         assert!(
             matches!(err, StreamPlanError::InvalidUnit(ref msg) if msg.contains("literal")),
             "unexpected: {err}"
@@ -3711,7 +3850,7 @@ mod tests {
             rhs: Box::new(span(Expr::Literal(LiteralValue::Int(0)))),
         });
         let pipeline = vec![span(PipeStage::Where(WhereStage { condition }))];
-        let err = compile_stream_plan(&pipeline, &PinScope::unpinned()).unwrap_err();
+        let err = compile_stream_plan(&pipeline, &PinScope::unpinned(), None).unwrap_err();
         assert!(matches!(err, StreamPlanError::InvalidUnit(_)));
     }
 
@@ -3752,13 +3891,13 @@ mod tests {
     #[test]
     fn stream_strftime_accepts_standard_format() {
         let pipeline = vec![make_strftime_stage("%Y-%m-%d %H:%M:%S")];
-        assert!(compile_stream_plan(&pipeline, &PinScope::unpinned()).is_ok());
+        assert!(compile_stream_plan(&pipeline, &PinScope::unpinned(), None).is_ok());
     }
 
     #[test]
     fn stream_strftime_rejects_invalid_format() {
         let pipeline = vec![make_strftime_stage("%Q")];
-        let err = compile_stream_plan(&pipeline, &PinScope::unpinned()).unwrap_err();
+        let err = compile_stream_plan(&pipeline, &PinScope::unpinned(), None).unwrap_err();
         assert!(
             matches!(err, StreamPlanError::InvalidFormat(ref msg) if msg.contains("%Q")),
             "unexpected error: {err}"
@@ -3768,7 +3907,7 @@ mod tests {
     #[test]
     fn stream_strptime_rejects_invalid_format() {
         let pipeline = vec![make_strptime_stage("%Q")];
-        let err = compile_stream_plan(&pipeline, &PinScope::unpinned()).unwrap_err();
+        let err = compile_stream_plan(&pipeline, &PinScope::unpinned(), None).unwrap_err();
         assert!(matches!(err, StreamPlanError::InvalidFormat(_)), "{err}");
     }
 
@@ -3787,7 +3926,7 @@ mod tests {
             rhs: Box::new(span(Expr::Literal(LiteralValue::String("x".to_string())))),
         });
         let pipeline = vec![span(PipeStage::Where(WhereStage { condition }))];
-        let err = compile_stream_plan(&pipeline, &PinScope::unpinned()).unwrap_err();
+        let err = compile_stream_plan(&pipeline, &PinScope::unpinned(), None).unwrap_err();
         assert!(matches!(err, StreamPlanError::InvalidFormat(_)), "{err}");
     }
 }

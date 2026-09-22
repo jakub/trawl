@@ -1266,6 +1266,15 @@ mod tests {
     }
 
     #[test]
+    fn emitter_timechart_span_uses_the_resolver() {
+        let sql = emit_dsl("service=x last=3h | timechart count()");
+        assert!(sql.contains("5 minutes"), "{sql}");
+
+        let sql = emit_dsl("last=3h | timechart span=2m count()");
+        assert!(sql.contains("2 minutes"), "{sql}");
+    }
+
+    #[test]
     fn pipe_timechart_multiple_aggs() {
         assert_snapshot!(emit_dsl(
             "* | timechart span=5m count(), avg(duration) by service"

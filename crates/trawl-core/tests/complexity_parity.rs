@@ -89,11 +89,11 @@ fn sql_sentence(dsl: &str, pins: &FieldTypes) -> String {
 /// The refusal the streaming lane carries.
 fn stream_sentence(dsl: &str, pins: &FieldTypes) -> String {
     let stages = pipeline(dsl);
-    let text = trawl_core::stream::compile_stream_plan(&stages, &PinScope::root(pins))
+    let text = trawl_core::stream::compile_stream_plan(&stages, &PinScope::root(pins), None)
         .expect_err("the stream lane must refuse")
         .to_string();
     // Pin-blindness must not change the answer either.
-    let blind = trawl_core::stream::compile_stream_plan(&stages, &PinScope::unpinned())
+    let blind = trawl_core::stream::compile_stream_plan(&stages, &PinScope::unpinned(), None)
         .expect_err("the stream lane must refuse pin-blind too")
         .to_string();
     assert_eq!(text, blind, "{dsl}: the stream lane read the catalog");
@@ -181,14 +181,14 @@ fn the_same_pipelines_are_admitted_one_reference_short() {
     let stages = pipeline(&over_budget_let(512));
     // The stream lane's own refusal for this pipeline is about the STAGE,
     // never the budget: `let` streams, so this one compiles outright.
-    trawl_core::stream::compile_stream_plan(&stages, &PinScope::root(&pins))
+    trawl_core::stream::compile_stream_plan(&stages, &PinScope::root(&pins), None)
         .expect("512 references are admitted by the stream lane");
 
     let long = format!("*{}", " | head 1".repeat(MAX_PIPELINE_STAGES));
     let query = parser::parse(&long).expect("dsl parses");
     trawl_core::emitter::emit_with_pins(&query, "src", &pins, anchor())
         .expect("128 stages are admitted");
-    trawl_core::stream::compile_stream_plan(&pipeline(&long), &PinScope::unpinned())
+    trawl_core::stream::compile_stream_plan(&pipeline(&long), &PinScope::unpinned(), None)
         .expect("128 stages are admitted");
 }
 
@@ -200,7 +200,7 @@ fn admission_does_not_make_a_stage_streamable() {
     let dsl = "* | pivot count() on status by host";
     trawl_core::emitter::emit(&parser::parse(dsl).expect("parses"), "src", anchor())
         .expect("the SQL lane runs pivot");
-    let err = trawl_core::stream::compile_stream_plan(&pipeline(dsl), &PinScope::unpinned())
+    let err = trawl_core::stream::compile_stream_plan(&pipeline(dsl), &PinScope::unpinned(), None)
         .expect_err("pivot does not stream");
     assert!(
         matches!(
@@ -221,10 +221,10 @@ fn the_verdict_never_depends_on_the_catalog() {
     let pins = populated_pins();
     for dsl in matrix() {
         let stages = pipeline(&dsl);
-        let a = trawl_core::stream::compile_stream_plan(&stages, &PinScope::root(&empty))
+        let a = trawl_core::stream::compile_stream_plan(&stages, &PinScope::root(&empty), None)
             .expect_err("refused")
             .to_string();
-        let b = trawl_core::stream::compile_stream_plan(&stages, &PinScope::root(&pins))
+        let b = trawl_core::stream::compile_stream_plan(&stages, &PinScope::root(&pins), None)
             .expect_err("refused")
             .to_string();
         assert_eq!(a, b, "{dsl}");
@@ -242,7 +242,7 @@ fn the_verdict_never_depends_on_the_catalog() {
     // where the line is.
     let dsl = "* | let s = sev(level), t = s";
     for scope in [PinScope::unpinned(), PinScope::root(&pins)] {
-        trawl_core::stream::compile_stream_plan(&pipeline(dsl), &scope)
+        trawl_core::stream::compile_stream_plan(&pipeline(dsl), &scope, None)
             .expect("an in-budget severity chain streams under any catalog");
     }
     let query = parser::parse(dsl).expect("parses");

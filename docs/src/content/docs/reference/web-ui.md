@@ -69,7 +69,7 @@ page URL. These client limits do not guarantee acceptance by every deployment.
 | **Filters** sidebar | Field values counted over the snapshot page or live buffer. Aggregate results hide the field-value groups; the active-filter count and **Clear all** remain. **Include** and **Exclude** add a filter, **Clear all** removes every filter |
 | Filter chips | Above the tabs. Selecting a chip removes that filter |
 | **Events** tab | The result table, with the row count in the tab. An aggregation renders the exact table and, where the shape allows it, the categorical chart beside it |
-| **Visualization** tab | The chart for a `timechart` or aggregate query. It has no pager: it draws a whole result or states why it cannot |
+| **Visualization** tab | The chart for a `timechart` or `stats … by` result, as Line, Column, or Bar. It has no pager: it draws a whole result or states why it cannot |
 | **View** | In the results header. Chooses how snapshot events and their details appear |
 | **Save** | In the results header. Opens the same dialog as **Save as Net** and captures the editor text |
 | **Export** | Downloads the results as CSV, JSON, or Parquet |
@@ -81,10 +81,28 @@ its pages sends no request. When the execution produced more rows than one
 fetch carries, a line under the pager states both counts. Raw event results
 page the other way: each page is its own request.
 
+A control on the Visualization tab picks the chart type: Line, Column, or
+Bar. The default follows the query: Line for a `timechart`, Column for a
+`stats … by`. A type that does not fit the current result is disabled.
+
+Line draws the x axis as the bucket instant parsed from `_time`, in UTC. It
+draws one line per metric column, or one line per group value when the
+query groups with `by` fields and has one metric. A bucket with no row for a
+series is a gap, not a zero. A result with more than six series draws the
+six largest by total, with a caption stating how many series it left out.
+
+Column and Bar each draw one bar per group. A result with more than twenty
+groups draws the twenty largest by value, with a caption stating how many
+groups it left out.
+
+Every refusal names the fix or offers to open Events instead.
+
 The Visualization tab draws the whole result or nothing. A response that is
 not the whole result is refused with the counts the server measured, because
 the chart of one page is a different picture from the chart of the result. See
-[ADR-0037](https://github.com/jakub/trawl/blob/main/docs/adr/0037-the-chart-draws-the-whole-result-or-nothing.md).
+[ADR-0037](https://github.com/jakub/trawl/blob/main/docs/adr/0037-the-chart-draws-the-whole-result-or-nothing.md)
+and
+[ADR-0038](https://github.com/jakub/trawl/blob/main/docs/adr/0038-the-visualization-tab-draws-time-and-groups.md).
 
 Both Save controls omit the range control and sidebar filters. They save the
 editor text, not the effective query or returned rows.

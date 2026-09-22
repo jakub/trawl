@@ -1390,7 +1390,7 @@ const CONTRACTS: &[Contract] = &[
         assignment: "chartHost: '.chart',",
         source_path: "src/components/chart.rs",
         source: include_str!("../src/components/chart.rs"),
-        hook: "<div class=\"chart\" node_ref=node_ref data-points=",
+        hook: "class=\"chart\"",
     },
     Contract {
         assignment: "catChart: '.cat-chart',",

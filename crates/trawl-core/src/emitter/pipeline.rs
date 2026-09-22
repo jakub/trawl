@@ -2,9 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use crate::ast::{
-    EventStatsStage, ExtractMode, PipeStage, SampleMode, SortDirection, TrawlDuration,
-};
+use crate::ast::{EventStatsStage, ExtractMode, PipeStage, SampleMode, SortDirection};
 
 use super::EmitError;
 use super::SqlValue;
@@ -379,10 +377,7 @@ fn process_timechart(
     // Same placement rule as `stats` above.
     ctx.flush_if(FlushCondition::IfModifiedOrderedOrLimited);
 
-    let interval = match &tc.span {
-        Some(d) => d.to_interval_string(),
-        None => auto_bucket_interval(ctx.time_filter.as_ref()),
-    };
+    let interval = crate::timechart::resolve_span(tc.span, ctx.time_filter).to_interval_string();
 
     // What the buckets are cut from. The default — and an explicit
     // `on _time`, however it is spelled — is the envelope timestamp,
@@ -460,26 +455,6 @@ fn process_timechart(
     ctx.had_explicit_columns = true;
 
     Ok(())
-}
-
-/// Auto-bucketing heuristic: map time filter duration to a reasonable bucket span.
-fn auto_bucket_interval(time_filter: Option<&crate::ast::TrawlDuration>) -> String {
-    let seconds = time_filter.map_or(3600, TrawlDuration::to_seconds);
-
-    if seconds <= 3600 {
-        "1 minutes"
-    } else if seconds <= 21_600 {
-        "5 minutes"
-    } else if seconds <= 86_400 {
-        "15 minutes"
-    } else if seconds <= 604_800 {
-        "1 hours"
-    } else if seconds <= 2_592_000 {
-        "6 hours"
-    } else {
-        "1 days"
-    }
-    .to_string()
 }
 
 fn process_tail(tail: &crate::ast::TailStage, ctx: &mut EmitterState) {

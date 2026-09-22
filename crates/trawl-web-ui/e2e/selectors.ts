@@ -366,9 +366,11 @@ export const SEL = {
   /// describes the whole result, not the rows on screen.
   resultsCap: '.results-cap',
   /// crates/trawl-web-ui/src/components/chart.rs — the Visualization
-  /// tab's chart host. It carries `data-points`, the plotted series
-  /// length: the canvas says nothing about what it drew, so that
-  /// attribute is the only way to assert the chart drew every row.
+  /// tab's chart host. The canvas says nothing about what it drew, so
+  /// three attributes publish it: `data-points` (grid instants, or
+  /// groups for Column and Bar), `data-series` (series drawn, after the
+  /// cap) and `data-chart-type` (`line` | `column` | `bar`). All three
+  /// are absent when the chart is refused.
   chartHost: '.chart',
   /// crates/trawl-web-ui/src/components/cat_chart.rs — the bars beside
   /// that table. aria-hidden, so a spec reads it by class and reads the

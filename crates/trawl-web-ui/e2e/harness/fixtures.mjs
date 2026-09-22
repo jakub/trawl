@@ -387,15 +387,64 @@ function aggregateCount(i) {
   return i === 0 ? 47 : ((i * 7) % 13) + 1;
 }
 
+/** A `_time` cell as a snapshot response actually spells it: UTC wall
+ * clock, a space between the date and the time, and no zone suffix. The
+ * web UI sends `timezone: None` and the server defaults the offset to
+ * zero, so there is nothing for the cell to carry (ADR-0038). The LIVE
+ * lane is the one that writes RFC 3339 with a `+00:00` offset. */
+function aggregateInstant(i) {
+  return new Date(AGGREGATE_EPOCH + i * AGGREGATE_BUCKET_MS)
+    .toISOString()
+    .replace('T', ' ')
+    .replace('.000Z', '');
+}
+
 /** `POST /api/v1/query` under `aggregate` for a `| timechart` pipeline:
  * `buckets` rows of `_time, count`, sliced to the posted window. */
 export function aggregateTimechartResponse(buckets, total, offset, limit) {
-  const rows = Array.from({ length: buckets }, (_, i) => [
-    // The server's own spelling: RFC 3339 with microseconds.
-    `${new Date(AGGREGATE_EPOCH + i * AGGREGATE_BUCKET_MS).toISOString().replace('Z', '000Z')}`,
-    aggregateCount(i),
-  ]);
+  const rows = Array.from({ length: buckets }, (_, i) => [aggregateInstant(i), aggregateCount(i)]);
   return aggregateBody([{ name: '_time' }, { name: 'count' }], rows, total, offset, limit);
+}
+
+/** The same pipeline with a `by host`: `buckets` × `hosts` rows of
+ * `_time, host, count`, one series per host on the same bucket grid.
+ * Rows come out bucket-major, the order the server's ORDER BY produces.
+ *
+ * The window is cut from the flattened rows, so a `total` larger than
+ * what one fetch carries is a cut GROUPED result — the shape that
+ * draws, and so the one whose coverage rung is worth a test. */
+export function aggregateGroupedTimechartResponse(buckets, hosts, total, offset, limit) {
+  const rows = [];
+  for (let i = 0; i < buckets; i++) {
+    for (let h = 0; h < hosts; h++) {
+      rows.push([aggregateInstant(i), `web-${String(h + 1).padStart(2, '0')}`, aggregateCount(i + h)]);
+    }
+  }
+  return aggregateBody(
+    [{ name: '_time' }, { name: 'host' }, { name: 'count' }],
+    rows,
+    total,
+    offset,
+    limit,
+  );
+}
+
+/** `POST /api/v1/query` under `aggregate` for a `| pivot` pipeline: a
+ * shape the chart refuses whatever the window, which is what makes it
+ * the case for "the shape sentence comes before the coverage one". */
+export function aggregatePivotResponse(groups, total, offset, limit) {
+  const rows = Array.from({ length: groups }, (_, i) => [
+    `web-${String(i + 1).padStart(2, '0')}`,
+    aggregateCount(i),
+    aggregateCount(i + 1),
+  ]);
+  return aggregateBody(
+    [{ name: 'host' }, { name: '200' }, { name: '500' }],
+    rows,
+    total,
+    offset,
+    limit,
+  );
 }
 
 /** `POST /api/v1/query` under `aggregate` for a `| stats count() by`

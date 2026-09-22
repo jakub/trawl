@@ -3,6 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 import { test, expect, resetScenario } from '../fixtures';
+import { SEL } from '../selectors';
 
 for (const deviceScaleFactor of [1, 2]) {
   test.describe(`series at ${deviceScaleFactor}x`, () => {
@@ -25,7 +26,9 @@ for (const deviceScaleFactor of [1, 2]) {
       } }));
       await page.goto('/search?q=' + encodeURIComponent('service=nginx | timechart ' + labels.map(label => `count() as ${label}`).join(', ')));
       await page.getByRole('tab', { name: 'Visualization' }).click();
-      await expect(page.locator('.chart .u-legend')).toContainText('Result position');
+      // x is the bucket instant, in UTC, and the legend's x row names
+      // the zone the ticks are printed in (ADR-0038).
+      await expect(page.locator('.chart .u-legend')).toContainText('UTC');
       await expect(page.locator('.chart .series-key line')).toHaveCount(6);
       const indicators = await page.locator('.chart .series-key line').evaluateAll(lines => lines.map(line => ({
         color: line.getAttribute('stroke'), dash: line.getAttribute('stroke-dasharray') || '',
@@ -50,6 +53,38 @@ for (const deviceScaleFactor of [1, 2]) {
 
   });
 }
+
+test('a wide grouped result draws the six largest and says what it left out', async ({ page }) => {
+  // Fourteen hosts, ranked by their total over the fetched rows. Six
+  // draw; the caption is what keeps the other eight from being a lie by
+  // omission (ADR-0038). `_time` here is the snapshot wire spelling:
+  // UTC wall clock, a space, no zone.
+  const hosts = Array.from({ length: 14 }, (_, i) => `host-${String(i + 1).padStart(2, '0')}`);
+  const rows = hosts.flatMap((host, i) => [
+    ['2026-09-01 00:00:00', host, i + 1],
+    ['2026-09-01 00:01:00', host, i + 1],
+  ]);
+  await page.route('**/api/v1/query', route => route.fulfill({ json: {
+    columns: [{ name: '_time' }, { name: 'host' }, { name: 'count' }],
+    rows,
+    pagination: { limit: 20000, offset: 0, returned: rows.length, total: rows.length },
+  } }));
+  await page.goto('/search?q=' + encodeURIComponent('service=nginx | timechart span=1m count() by host'));
+  await page.getByRole('tab', { name: 'Visualization' }).click();
+
+  await expect(page.locator(`${SEL.chartHost} canvas`)).toHaveCount(1);
+  await expect(page.locator(`${SEL.chartHost} .series-key`)).toHaveCount(6);
+  await expect(page.locator(SEL.chartHost)).toHaveAttribute('data-series', '6');
+  // The six largest, in label order, and nothing from the tail.
+  await expect(page.locator(`${SEL.chartHost} .series-key`))
+    .toHaveText(hosts.slice(8));
+  await expect(page.locator('.visualization .chart-caption'))
+    .toHaveText('6 of 14 series drawn; the 8 smallest by total are not. Narrow host, or open Events.');
+
+  // And the caption's own way to the rows it is talking about.
+  await page.locator('.visualization button.btn-lnk').click();
+  await expect(page.getByRole('tab', { name: /^Events/ })).toHaveAttribute('aria-selected', 'true');
+});
 
 test('ingest charts show the containing hour in a bounded tooltip', async ({ page, request }) => {
   await resetScenario(request, 'corpus');

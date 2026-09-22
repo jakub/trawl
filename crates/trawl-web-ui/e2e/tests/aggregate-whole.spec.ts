@@ -99,16 +99,24 @@ test('an out-of-range local page recovers', async ({ page, request }) => {
   expect(windows).toHaveLength(1);
 });
 
-// `* | stats count() by status` over the same generated scenario: a
-// grouped shape, which the chart refuses for a reason of its own.
+// `* | stats count() by status` over the same generated scenario: no
+// time axis, so Column is the type that fits it and Line is the one the
+// picker has to disable.
 const STATS_URL = `/search?q=${encodeURIComponent('level=error | stats count() by status')}`;
+
+// The same timechart with a `by`: a grouped shape, which now DRAWS, so
+// the coverage rung is the only thing standing between a cut window and
+// a line that ends early with nothing to say it did.
+const GROUPED_URL = `/search?q=${encodeURIComponent('level=error | timechart span=2m count() by host')}&r=4h`;
 
 test('above the ceiling the chart refuses with the measured count', async ({ page, request }) => {
   // The execution produced 43,210 rows and one fetch carried 20,000 of
   // them. What is on screen is a window, and a chart of a window reads
-  // as a chart of the result.
-  await configure(request, { buckets: LIMITS.aggregateFetchRows, total: 43210 });
-  await page.goto(AGG_URL);
+  // as a chart of the result. Grouped, and so a shape the ladder is
+  // otherwise happy to draw: the refusal here is the coverage rung and
+  // nothing else.
+  await configure(request, { buckets: LIMITS.aggregateFetchRows / 2, hosts: 2, total: 43210 });
+  await page.goto(GROUPED_URL);
   await page.getByRole('tab', { name: 'Visualization', exact: true }).click();
 
   const refusal = page.locator('.visualization .results-empty');
@@ -148,17 +156,87 @@ test('a complete result at the ceiling draws', async ({ page, request }) => {
   await expect(page.locator(SEL.resultsCap)).toHaveCount(0);
 });
 
-test('a cut grouped result keeps the grouped refusal', async ({ page, request }) => {
-  // Cut AND grouped. The shape refusal names something the operator can
-  // act on, so it stays ahead of the coverage sentence.
+test('a cut result whose shape cannot be drawn says so first', async ({ page, request }) => {
+  // Cut AND unchartable. The shape refusal names something the operator
+  // can act on in the query, so it stays ahead of the coverage sentence
+  // (ADR-0038).
   await configure(request, { groups: 60, total: 90 });
-  await page.goto(STATS_URL);
+  await page.goto(`/search?q=${encodeURIComponent('level=error | pivot count() on status by host')}`);
   await page.getByRole('tab', { name: 'Visualization', exact: true }).click();
 
   const refusal = page.locator('.visualization .results-empty');
-  await expect(refusal).toContainText('Grouped results are not supported by this chart');
+  await expect(refusal).toHaveText('Pivot results are not drawn as lines. Open Events for the table.');
   await expect(refusal).not.toContainText('were fetched');
   await expect(page.locator(SEL.chartHost)).not.toHaveAttribute('data-points', /.*/);
+});
+
+test('a stats by result draws columns, and the picker disables the type that does not fit', async ({ page, request }) => {
+  // No `_time` column at all, so the default follows the shape: Column,
+  // one series over the groups, with Line disabled and saying why.
+  await configure(request, { groups: 6 });
+  await page.goto(STATS_URL);
+  await page.getByRole('tab', { name: 'Visualization', exact: true }).click();
+
+  const host = page.locator(SEL.chartHost);
+  await expect(host).toHaveAttribute('data-chart-type', 'column');
+  await expect(page.locator(`${SEL.chartHost} canvas`)).toHaveCount(1);
+  await expect(host).toHaveAttribute('data-points', '6');
+  await expect(host).toHaveAttribute('data-series', '1');
+
+  const radio = (type: string) => page.locator(`.chart-types input[value="${type}"]`);
+  await expect(radio('column')).toBeChecked();
+  await expect(radio('line')).toBeDisabled();
+  await expect(radio('line')).toHaveAttribute('title', 'Line needs a timechart result.');
+  await expect(radio('bar')).toBeEnabled();
+
+  // The label is the part a pointer can hit: the input itself is clipped.
+  await page.locator('.chart-types label', { hasText: 'Bar' }).click();
+  await expect(host).toHaveAttribute('data-chart-type', 'bar');
+  await expect(radio('bar')).toBeChecked();
+});
+
+test('a wide stats by result draws the twenty largest groups and says what it left out', async ({ page, request }) => {
+  await configure(request, { groups: 200 });
+  await page.goto(STATS_URL);
+  await page.getByRole('tab', { name: 'Visualization', exact: true }).click();
+
+  await expect(page.locator(SEL.chartHost)).toHaveAttribute('data-points', '20');
+  await expect(page.locator('.visualization .chart-caption'))
+    .toHaveText('20 of 200 groups drawn; the 180 smallest are not.');
+  // A bar canvas has no legend, so the note is the chart's only text
+  // representation: the type, the metric, the group field and the count.
+  await expect(page.locator('.visualization .chart-note'))
+    .toHaveText('Column: count by status, 20 groups. Hover a bar for its value. Open Events for the exact table.');
+});
+
+test('a chart type is session state, kept across tabs and queries and out of the URL', async ({ page, request }) => {
+  // The reader's choice is not part of the search URL (ADR-0027), so it
+  // has to survive both the tab it lives on and the next result.
+  await configure(request, { groups: 6 });
+  await page.goto(STATS_URL);
+  await page.getByRole('tab', { name: 'Visualization', exact: true }).click();
+  await page.locator('.chart-types label', { hasText: 'Bar' }).click();
+  await expect(page.locator(SEL.chartHost)).toHaveAttribute('data-chart-type', 'bar');
+
+  await page.getByRole('tab', { name: 'Events' }).click();
+  await expect(page.locator(SEL.chartHost)).toHaveCount(0);
+  await page.getByRole('tab', { name: 'Visualization', exact: true }).click();
+  await expect(page.locator('.chart-types input[value="bar"]')).toBeChecked();
+
+  // A new result of the same shape: still Bar, because that is what the
+  // reader asked for.
+  await page.locator(SEL.cmContent).click();
+  await page.keyboard.press('Control+a');
+  await page.keyboard.insertText('level=warn | stats count() by status');
+  await page.keyboard.press('Control+Enter');
+  await expect(page).toHaveURL(/level%3Dwarn/);
+  await expect(page.locator('.chart-types input[value="bar"]')).toBeChecked();
+  await expect(page.locator(SEL.chartHost)).toHaveAttribute('data-chart-type', 'bar');
+
+  // And the URL carries no chart-type parameter — only the search
+  // parameters the page has always owned.
+  const params = [...new URL(page.url()).searchParams.keys()];
+  expect(params.every(key => ['q', 'page', 'mode', 'f', 'r'].includes(key)), params.join(',')).toBe(true);
 });
 
 test('no truncation affordance remains', async ({ page, request }) => {

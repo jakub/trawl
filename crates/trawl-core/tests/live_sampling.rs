@@ -61,7 +61,8 @@ fn compile(dsl: &str) -> (CompiledFilter, StreamPlan) {
     let query = trawl_core::parser::parse(dsl).expect("dsl parses");
     let filter =
         CompiledFilter::compile(&query.search, &FieldTypes::new()).expect("filter compiles");
-    let plan = compile_stream_plan(&query.pipeline, &PinScope::unpinned()).expect("plan compiles");
+    let plan =
+        compile_stream_plan(&query.pipeline, &PinScope::unpinned(), None).expect("plan compiles");
     (filter, plan)
 }
 

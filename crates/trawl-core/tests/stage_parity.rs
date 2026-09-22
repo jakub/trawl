@@ -152,7 +152,8 @@ fn live_rows(dsl: &str, events: &[Value]) -> TextRows {
     // (ADR-0017 §3).
     let anchor = trawl_core::context::EvalContext::capture();
     let query = trawl_core::parser::parse(dsl).expect("dsl parses");
-    let plan = compile_stream_plan(&query.pipeline, &PinScope::unpinned()).expect("plan compiles");
+    let plan =
+        compile_stream_plan(&query.pipeline, &PinScope::unpinned(), None).expect("plan compiles");
     let rows: Vec<Row> = events
         .iter()
         .map(|event| row::from_json(event.as_object().unwrap()))

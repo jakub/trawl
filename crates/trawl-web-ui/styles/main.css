@@ -420,6 +420,80 @@
   overflow: hidden;
 }
 
+/* Chart type picker — the Visualization tab's exclusive choice, on the
+ * shared segmented treatment (`.seg` / `.seg-opt`, ADR-0003) so it reads
+ * as the same control as the reading-mode toggles. The types are
+ * exclusive and one is always effective, so the picker is a group of
+ * native radio inputs: the checked state, the single tab stop and the
+ * arrow keys all come from the input, and a type that does not fit the
+ * result is a disabled input with the reason. Each label is the visible
+ * segment, so every rule below styles it from the input's state. */
+.chart-types {
+  position: relative;
+  margin: 0 0 8px;
+  min-inline-size: 0;
+}
+/* The radio itself is clipped, not hidden: `display: none` takes it out
+ * of the tab order and off the accessibility tree, which is the whole
+ * reason for using a native radio here. */
+.chart-types .chart-type-input {
+  position: absolute;
+  width: 1px; height: 1px;
+  margin: -1px; padding: 0;
+  overflow: hidden; clip-path: inset(50%);
+  border: 0;
+}
+.chart-types .seg-opt { cursor: pointer; }
+/* The one active treatment, matching `.seg .seg-opt.on`: the checked
+ * option is raised out of the well track (ADR-0032). */
+.chart-types .chart-type-input:checked + .seg-opt {
+  background: var(--panel);
+  color: var(--accent-ink);
+  border-color: var(--line);
+  box-shadow: var(--elev-1);
+  font-weight: 600;
+}
+.chart-types .chart-type-input:disabled + .seg-opt {
+  opacity: .5;
+  cursor: not-allowed;
+  color: var(--ink-3);
+}
+/* The focus ring lands on the label, since the input carrying focus is
+ * the clipped one. */
+.chart-types .chart-type-input:focus-visible + .seg-opt {
+  outline: 2px solid var(--ring);
+  outline-offset: 1px;
+}
+
+/* The caption under a chart that drew fewer series or groups than the
+ * result holds, and beside it the control to the rows it left out. That
+ * control is a button in fact and a link in appearance: it switches the
+ * results tab, it does not navigate. */
+.chart-caption {
+  padding: 8px 14px 0;
+  margin: 0;
+  color: var(--ink-2);
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui);
+}
+.visualization .btn-lnk {
+  margin: 2px 0 0 14px;
+  padding: 0;
+  background: none;
+  border: 0;
+  color: var(--accent-ink);
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui);
+  text-decoration: underline;
+  cursor: pointer;
+}
+.visualization .btn-lnk:hover { color: var(--accent); }
+.visualization .btn-lnk:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
 /* ─────────────────────────────────────────────────────────────────
  *  Query console (header + DslEditor + date range + Haul + tools,
  *  closed by the executed-scope strip)

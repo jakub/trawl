@@ -4,12 +4,48 @@
 
 import { test, expect, resetScenario, trackIntervals, intervalCount } from '../fixtures';
 import { expectFocusRing } from '../a11y';
+import { SEL } from '../selectors';
+
+type Pg = import('@playwright/test').Page;
+
+// The refusal sentences, copied verbatim from `Refusal::message` in
+// crates/trawl-web-ui/src/series.rs (ADR-0038). Every one of them names
+// a fix or the place to look instead, which is the property that makes
+// them worth asserting whole rather than by substring.
+const REFUSES = {
+  pivot: 'Pivot results are not drawn as lines. Open Events for the table.',
+  top: 'Top results are not drawn as lines. Open Events for the table.',
+  rare: 'Rare results are not drawn as lines. Open Events for the table.',
+  twoMetrics: 'Grouped charts draw one metric. Chart one metric, or open Events.',
+  noTime: 'This result has no time axis. Choose Column for stats by, or open Events.',
+  empty: 'No rows to draw.',
+  badMetric: 'Visualization draws numeric metrics. Open Events for these values.',
+};
+
+// A snapshot `_time` cell as the server actually writes it: UTC wall
+// clock, a space, no zone. The web UI sends `timezone: None` and the
+// server defaults the offset to zero, so there is no suffix to carry
+// (ADR-0038). The live lane spells the same instant `…T00:00:00+00:00`,
+// and the chart's parser admits `Z` as well — the tests below cover all
+// three spellings between them.
+const snapshotTime = (minute: number) => `2026-09-01 00:0${minute}:00`;
 
 const countResult = {
   columns: [{ name: '_time' }, { name: 'count' }],
   rows: [['2026-09-01T00:00:00Z', 2], ['2026-09-01T00:01:00Z', 4]],
   pagination: { limit: 50, offset: 0, returned: 2, total: 2 },
 };
+
+/** A refused chart: the sentence in place of the canvas, nothing drawn,
+ * and the Events tab one click away — the alternative every refusal
+ * offers (`Refusal::offers_events`). */
+async function refusalOffersEvents(page: Pg, sentence: string) {
+  await expect(page.locator('.visualization .results-empty')).toHaveText(sentence);
+  await expect(page.locator(`${SEL.chartHost} canvas`)).toHaveCount(0);
+  await expect(page.locator(SEL.chartHost)).not.toHaveAttribute('data-points', /.*/);
+  await page.getByRole('button', { name: 'Open Events', exact: true }).click();
+  await expect(page.getByRole('tab', { name: /^Events/ })).toHaveAttribute('aria-selected', 'true');
+}
 
 test('snapshot chart handles completed, unsupported, empty and failed responses without stale canvas', async ({ page }) => {
   let body: typeof countResult = countResult;
@@ -37,10 +73,10 @@ test('snapshot chart handles completed, unsupported, empty and failed responses 
   body = { ...countResult, columns: [{ name: 'host' }, { name: 'count' }] };
   held = false;
   release?.();
-  await expect(page.getByText('Visualization requires a _time column', { exact: false })).toBeVisible();
-  body = { ...countResult, rows: [] };
+  await expect(page.locator('.visualization .results-empty')).toHaveText(REFUSES.noTime);
+  body = { ...countResult, rows: [], pagination: { limit: 50, offset: 0, returned: 0, total: 0 } };
   await submit('service=empty | timechart count()');
-  await expect(page.getByText('No rows returned for this visualization.')).toBeVisible();
+  await expect(page.locator('.visualization .results-empty')).toHaveText(REFUSES.empty);
   body = countResult;
   await submit('service=again | timechart count()');
   await expect(page.locator('.chart canvas')).toHaveCount(1);
@@ -63,20 +99,44 @@ test('live raw visualization explains its supported query and preserves live con
   await expect.poll(async () => (await (await request.get('/__ctl/state')).json()).sse.opens).toBe(opensBefore + 1);
 });
 
-test('chart refuses lossy metrics and supports multiple integer metrics', async ({ page }) => {
-  let body = { ...countResult, rows: [['2026-09-01T00:00:00Z', -2], ['2026-09-01T00:01:00Z', 1.5]] };
+test('floats and negatives draw, a text metric does not, and metrics draw one series each', async ({ page }) => {
+  // Any number draws: integer, float, negative (ADR-0038). Only a cell
+  // that is not a number at all stops the chart.
+  let body: Record<string, unknown> = {
+    ...countResult,
+    rows: [[snapshotTime(0), -2], [snapshotTime(1), 1.5]],
+  };
   await page.route('**/api/v1/query', route => route.fulfill({ json: body }));
-  await page.goto('/search?q=service%3Dnginx');
+  await page.goto('/search?q=' + encodeURIComponent('service=nginx | timechart span=1m count()'));
   await page.getByRole('tab', { name: 'Visualization' }).click();
-  await expect(page.getByText('This chart supports non-negative integer metrics only.', { exact: false })).toBeVisible();
-  await expect(page.locator('.chart canvas')).toHaveCount(0);
-  body = { ...countResult, columns: [{ name: '_time' }, { name: 'count' }, { name: 'total' }], rows: [['2026-09-01T00:00:00Z', 2, 3], ['2026-09-01T00:01:00Z', 4, 5]] };
-  await page.goto('/search?q=' + encodeURIComponent('service=other | timechart count() as count, count() as total'));
+  await expect(page.locator(`${SEL.chartHost} canvas`)).toHaveCount(1);
+  await expect(page.locator(SEL.chartHost)).toHaveAttribute('data-points', '2');
+  await expect(page.locator(SEL.chartHost)).toHaveAttribute('data-series', '1');
+  await expect(page.locator(SEL.chartHost)).toHaveAttribute('data-chart-type', 'line');
+
+  // A metric column holding text: no magnitude, so nothing to draw, and
+  // the sentence sends the reader to the values themselves.
+  body = {
+    ...countResult,
+    rows: [[snapshotTime(0), 'many'], [snapshotTime(1), 'more']],
+  };
+  await page.goto('/search?q=' + encodeURIComponent('service=text | timechart span=1m count()'));
   await page.getByRole('tab', { name: 'Visualization' }).click();
-  await expect(page.locator('.chart canvas')).toHaveCount(1);
+  await refusalOffersEvents(page, REFUSES.badMetric);
+
+  // An ungrouped timechart draws one series per metric column.
+  body = {
+    columns: [{ name: '_time' }, { name: 'count' }, { name: 'total' }],
+    rows: [[snapshotTime(0), 2, 3], [snapshotTime(1), 4, 5]],
+    pagination: { limit: 50, offset: 0, returned: 2, total: 2 },
+  };
+  await page.goto('/search?q=' + encodeURIComponent('service=other | timechart span=1m count() as count, count() as total'));
+  await page.getByRole('tab', { name: 'Visualization' }).click();
+  await expect(page.locator(`${SEL.chartHost} canvas`)).toHaveCount(1);
+  await expect(page.locator(SEL.chartHost)).toHaveAttribute('data-series', '2');
   await expect(page.locator('.u-legend')).toContainText('total');
   await page.getByRole('tab', { name: /^Events/ }).click();
-  await expect(page.locator('.chart canvas')).toHaveCount(0);
+  await expect(page.locator(`${SEL.chartHost} canvas`)).toHaveCount(0);
 });
 
 test('live aggregation waits, charts in Visualization and shows exact rows in Events', async ({ page, request }) => {
@@ -101,27 +161,74 @@ test('live aggregation waits, charts in Visualization and shows exact rows in Ev
   await expect(page.locator('.results-table tbody tr').first()).toContainText('2026-09-01T00:00:00Z');
 });
 
-test('grouped snapshots explain the unsupported shape for equal or unequal series', async ({ page }) => {
+test('a grouped snapshot draws one series per group on the union of their buckets', async ({ page }) => {
+  // Two hosts over the same two minutes, then the same query with one
+  // host's rows dropped: the second host's series is shorter, which is
+  // exactly what a shared bucket axis exists to align (ADR-0038).
   let rows: (string | number)[][] = [
-    ['2026-09-01T00:00:00Z', 'a', 2], ['2026-09-01T00:01:00Z', 'a', 3],
-    ['2026-09-01T00:00:00Z', 'b', 4], ['2026-09-01T00:01:00Z', 'b', 5],
+    [snapshotTime(0), 'a', 2], [snapshotTime(1), 'a', 3],
+    [snapshotTime(0), 'b', 4], [snapshotTime(1), 'b', 5],
   ];
-  await page.route('**/api/v1/query', route => route.fulfill({ json: { ...countResult, columns: [{ name: '_time' }, { name: 'host' }, { name: 'count' }], rows } }));
-  await page.goto('/search?q=service%3Dnginx%20%7C%20timechart%20count()%20by%20host');
+  await page.route('**/api/v1/query', route => route.fulfill({ json: {
+    columns: [{ name: '_time' }, { name: 'host' }, { name: 'count' }],
+    rows,
+    pagination: { limit: 50, offset: 0, returned: rows.length, total: rows.length },
+  } }));
+  const GROUPED = '/search?q=' + encodeURIComponent('service=nginx | timechart span=1m count() by host');
+  await page.goto(GROUPED);
   await page.getByRole('tab', { name: 'Visualization' }).click();
-  await expect(page.locator('.chart canvas')).toHaveCount(0);
-  await expect(page.getByText('Grouped results are not supported by this chart.', { exact: false })).toBeVisible();
-  rows = rows.slice(0, 3);
-  await page.goto('/search?q=service%3Dother%20%7C%20timechart%20count()%20by%20host');
+  await expect(page.locator(`${SEL.chartHost} canvas`)).toHaveCount(1);
+  await expect(page.locator(`${SEL.chartHost} .series-key`)).toHaveCount(2);
+  await expect(page.locator(SEL.chartHost)).toHaveAttribute('data-series', '2');
+  // Two minutes, the union of both hosts' buckets.
+  await expect(page.locator(SEL.chartHost)).toHaveAttribute('data-points', '2');
+  // The axis is UTC, and the legend says so where the reader is.
+  await expect(page.locator(`${SEL.chartHost} .u-legend`)).toContainText('UTC');
+
+  rows = [[snapshotTime(0), 'a', 2], [snapshotTime(1), 'a', 3], [snapshotTime(0), 'b', 4]];
+  await page.goto('/search?q=' + encodeURIComponent('service=other | timechart span=1m count() by host'));
   await page.getByRole('tab', { name: 'Visualization' }).click();
-  await expect(page.getByText('Grouped results are not supported by this chart.', { exact: false })).toBeVisible();
-  await expect(page.locator('.chart canvas')).toHaveCount(0);
+  await expect(page.locator(`${SEL.chartHost} canvas`)).toHaveCount(1);
+  await expect(page.locator(SEL.chartHost)).toHaveAttribute('data-series', '2');
+  await expect(page.locator(SEL.chartHost)).toHaveAttribute('data-points', '2');
+});
+
+test('disjoint grouped times keep their own instants and a missing bucket is a gap', async ({ page }) => {
+  // `a` at 00:00 and 00:03, `b` at 00:01. Paired by occurrence these
+  // would be three positions; laid on the minute grid they are four
+  // instants, and `a` has no value at two of them.
+  await page.route('**/api/v1/query', route => route.fulfill({ json: {
+    columns: [{ name: '_time' }, { name: 'host' }, { name: 'count' }],
+    rows: [[snapshotTime(0), 'a', 1], [snapshotTime(1), 'b', 10], [snapshotTime(3), 'a', 2]],
+    pagination: { limit: 50, offset: 0, returned: 3, total: 3 },
+  } }));
+  await page.goto('/search?q=' + encodeURIComponent('service=nginx | timechart span=1m count() by host'));
+  await page.getByRole('tab', { name: 'Visualization' }).click();
+  await expect(page.locator(`${SEL.chartHost} canvas`)).toHaveCount(1);
+  await expect(page.locator(SEL.chartHost)).toHaveAttribute('data-series', '2');
+  // The GRID, not the row count: three rows, four minutes.
+  await expect(page.locator(SEL.chartHost)).toHaveAttribute('data-points', '4');
+
+  // And the gap is a null, not a zero. Over the SECOND instant the live
+  // legend reads 10 for `b` and nothing at all for `a`: one cursor
+  // position, two answers, which is the distinction a zero would erase.
+  // (uPlot's legend prints an empty cell for a null, not a placeholder,
+  // so `b`'s value is what makes the empty one mean "no value here".)
+  const plot = (await page.locator(`${SEL.chartHost} .u-over`).boundingBox())!;
+  await page.mouse.move(plot.x + plot.width / 3, plot.y + plot.height / 2);
+  const value = (label: string) => page.locator(`${SEL.chartHost} .u-series`)
+    .filter({ has: page.locator('.u-label', { hasText: label }) })
+    .locator('.u-value');
+  await expect(value('b')).toHaveText('10');
+  await expect(value('a')).toHaveText('');
 });
 
 test('supported snapshot chart fits initial narrow viewport and resizes with its pane', async ({ page }) => {
   await page.route('**/api/v1/query', route => route.fulfill({ json: countResult }));
   await page.setViewportSize({ width: 320, height: 800 });
-  await page.goto('/search?q=service%3Dnginx');
+  // The roles come from the query, so a chart needs one that ends in a
+  // timechart to have anything to draw.
+  await page.goto('/search?q=' + encodeURIComponent('service=nginx | timechart count()'));
   await page.getByRole('tab', { name: 'Visualization' }).click();
   const fits = async () => page.locator('.chart').evaluate(host => {
     const plot = host.querySelector('.uplot')!;
@@ -175,22 +282,100 @@ test('subsecond events fall inside their histogram tooltip intervals', async ({ 
   }
 });
 
-test('disjoint grouped times are explicitly refused instead of paired by occurrence', async ({ page }) => {
-  await page.route('**/api/v1/query', route => route.fulfill({ json: { ...countResult, columns: [{ name: '_time' }, { name: 'host' }, { name: 'count' }], rows: [
-    ['2026-09-01T00:00:00Z', 'a', 1], ['2026-09-01T00:01:00Z', 'b', 10], ['2026-09-01T00:02:00Z', 'a', 2], ['2026-09-01T00:03:00Z', 'b', 20],
-  ] } }));
-  await page.goto('/search?q=service%3Dnginx%20%7C%20timechart%20count()%20by%20host');
+test('numeric group keys are series, labelled by their own digits', async ({ page }) => {
+  // `by status` over 200 and 500: the roles come from the query, so the
+  // numbers in the group column are two series and not two metrics.
+  await page.route('**/api/v1/query', route => route.fulfill({ json: {
+    columns: [{ name: '_time' }, { name: 'status' }, { name: 'count' }],
+    rows: [[snapshotTime(0), 200, 1], [snapshotTime(0), 500, 2]],
+    pagination: { limit: 50, offset: 0, returned: 2, total: 2 },
+  } }));
+  await page.goto('/search?q=' + encodeURIComponent('service=nginx | timechart span=1m count() by status'));
   await page.getByRole('tab', { name: 'Visualization' }).click();
-  await expect(page.getByText('Grouped results are not supported by this chart.', { exact: false })).toBeVisible();
-  await expect(page.locator('.chart canvas')).toHaveCount(0);
+  await expect(page.locator(`${SEL.chartHost} canvas`)).toHaveCount(1);
+  await expect(page.locator(SEL.chartHost)).toHaveAttribute('data-series', '2');
+  await expect(page.locator(SEL.chartHost)).toHaveAttribute('data-points', '1');
+  await expect(page.locator(`${SEL.chartHost} .series-key`)).toHaveText(['200', '500']);
 });
 
-test('numeric group keys are never plotted as metrics', async ({ page }) => {
-  await page.route('**/api/v1/query', route => route.fulfill({ json: { ...countResult, columns: [{ name: '_time' }, { name: 'status' }, { name: 'count' }], rows: [['2026-09-01T00:00:00Z', 200, 1], ['2026-09-01T00:00:00Z', 500, 2]] } }));
-  await page.goto('/search?q=service%3Dnginx%20%7C%20timechart%20count()%20by%20status');
+test('a grouped average with a null cell draws the gap', async ({ page }) => {
+  // A null metric cell is "no measurement": a gap in the line, and a
+  // grid instant all the same.
+  await page.route('**/api/v1/query', route => route.fulfill({ json: {
+    columns: [{ name: '_time' }, { name: 'pod' }, { name: 'avg_latency_ms' }],
+    rows: [
+      [snapshotTime(0), 'api-1', 1.5], [snapshotTime(1), 'api-1', null], [snapshotTime(2), 'api-1', 3.5],
+      [snapshotTime(0), 'api-2', 2.0],
+    ],
+    pagination: { limit: 50, offset: 0, returned: 4, total: 4 },
+  } }));
+  await page.goto('/search?q=' + encodeURIComponent('service=nginx | timechart span=1m avg(latency_ms) by pod'));
   await page.getByRole('tab', { name: 'Visualization' }).click();
-  await expect(page.getByText('Grouped results are not supported by this chart.', { exact: false })).toBeVisible();
-  await expect(page.locator('.chart canvas')).toHaveCount(0);
+  await expect(page.locator(`${SEL.chartHost} canvas`)).toHaveCount(1);
+  await expect(page.locator(SEL.chartHost)).toHaveAttribute('data-series', '2');
+  await expect(page.locator(SEL.chartHost)).toHaveAttribute('data-points', '3');
+  // The middle instant: `api-1` returned a null there, so its legend
+  // cell is empty while `api-2`'s first bucket still reads 2.
+  const plot = (await page.locator(`${SEL.chartHost} .u-over`).boundingBox())!;
+  const value = (label: string) => page.locator(`${SEL.chartHost} .u-series`)
+    .filter({ has: page.locator('.u-label', { hasText: label }) })
+    .locator('.u-value');
+  await page.mouse.move(plot.x + 2, plot.y + plot.height / 2);
+  await expect(value('api-1')).toHaveText('1.5');
+  await page.mouse.move(plot.x + plot.width / 2, plot.y + plot.height / 2);
+  await expect(value('api-1')).toHaveText('');
+});
+
+test('every unchartable shape refuses with its own sentence and offers Events', async ({ page }) => {
+  // One mock body per shape: what the ladder reads is the QUERY that
+  // produced the rows, so the rows themselves only have to be a
+  // plausible answer to it.
+  const cases: { query: string; json: Record<string, unknown>; sentence: string }[] = [
+    {
+      query: 'service=nginx | pivot count() on status by host',
+      json: {
+        columns: [{ name: 'host' }, { name: '200' }, { name: '500' }],
+        rows: [['web-01', 4, 1]],
+        pagination: { limit: 50, offset: 0, returned: 1, total: 1 },
+      },
+      sentence: REFUSES.pivot,
+    },
+    {
+      query: 'service=nginx | top 5 host',
+      json: {
+        columns: [{ name: 'host' }, { name: 'count' }],
+        rows: [['web-01', 4], ['web-02', 1]],
+        pagination: { limit: 50, offset: 0, returned: 2, total: 2 },
+      },
+      sentence: REFUSES.top,
+    },
+    {
+      query: 'service=nginx | rare 5 host',
+      json: {
+        columns: [{ name: 'host' }, { name: 'count' }],
+        rows: [['web-09', 1], ['web-08', 2]],
+        pagination: { limit: 50, offset: 0, returned: 2, total: 2 },
+      },
+      sentence: REFUSES.rare,
+    },
+    {
+      query: 'service=nginx | timechart span=1m count(), avg(bytes) by host',
+      json: {
+        columns: [{ name: '_time' }, { name: 'host' }, { name: 'count' }, { name: 'avg_bytes' }],
+        rows: [[snapshotTime(0), 'web-01', 4, 1200.5]],
+        pagination: { limit: 50, offset: 0, returned: 1, total: 1 },
+      },
+      sentence: REFUSES.twoMetrics,
+    },
+  ];
+  let json: Record<string, unknown> = cases[0].json;
+  await page.route('**/api/v1/query', route => route.fulfill({ json }));
+  for (const shape of cases) {
+    json = shape.json;
+    await page.goto('/search?q=' + encodeURIComponent(shape.query));
+    await page.getByRole('tab', { name: 'Visualization' }).click();
+    await refusalOffersEvents(page, shape.sentence);
+  }
 });
 
 test('rejected live aggregation reports failure and can retry', async ({ page, request }) => {
