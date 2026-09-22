@@ -48,12 +48,19 @@ async function holdQueries(page: Page) {
 /// Record, from now on, whether a query error notice was ever put in the
 /// page, however briefly. A notice that renders and is replaced within a
 /// frame is still a notice the reader was shown.
+///
+/// The observer reads each record's added nodes, not the document: by the
+/// time its callback runs, a notice mounted and removed in the same task
+/// is no longer in the page, but the record still holds the node and its
+/// subtree, attached or not.
 async function watchForNotice(page: Page) {
   await page.evaluate(() => {
     const w = window as unknown as { __noticeSeen: boolean };
     w.__noticeSeen = document.querySelector('.query-error') !== null;
-    new MutationObserver(() => {
-      if (document.querySelector('.query-error')) w.__noticeSeen = true;
+    const isNotice = (node: Node) =>
+      node instanceof Element && (node.matches('.query-error') || node.querySelector('.query-error') !== null);
+    new MutationObserver(records => {
+      if (records.some(r => Array.from(r.addedNodes).some(isNotice))) w.__noticeSeen = true;
     }).observe(document.body, { childList: true, subtree: true });
   });
   return () => page.evaluate(() => (window as unknown as { __noticeSeen: boolean }).__noticeSeen);
@@ -180,6 +187,46 @@ test.describe('draft diagnostic', () => {
 });
 
 test.describe('query error identity', () => {
+  // The guard the next case leans on. A notice mounted and removed before
+  // the observer's callback runs is gone from the document by then, so
+  // the guard has to read what each mutation added, not the page as it
+  // stands afterwards.
+  test('the notice guard sees a notice mounted and removed before it looks', async ({ page }) => {
+    await page.goto('/search?r=15m');
+
+    const bare = await watchForNotice(page);
+    await page.evaluate(() => {
+      const el = document.createElement('div');
+      el.className = 'query-error';
+      document.body.append(el);
+      el.remove();
+    });
+    await settled(page);
+    expect(await bare()).toBe(true);
+
+    // The notice inside a subtree mounted as one node.
+    const nested = await watchForNotice(page);
+    await page.evaluate(() => {
+      const wrap = document.createElement('div');
+      wrap.innerHTML = '<section><div class="query-error"></div></section>';
+      document.body.append(wrap);
+      wrap.remove();
+    });
+    await settled(page);
+    expect(await nested()).toBe(true);
+
+    // And nothing mounted reads as nothing seen.
+    const quiet = await watchForNotice(page);
+    await page.evaluate(() => {
+      const el = document.createElement('div');
+      el.className = 'not-a-notice';
+      document.body.append(el);
+      el.remove();
+    });
+    await settled(page);
+    expect(await quiet()).toBe(false);
+  });
+
   test('a Haul of the same query while it is pending waits for its own verdict', async ({ page }) => {
     const queries = await holdQueries(page);
     await page.goto(SAMPLE_URL);
