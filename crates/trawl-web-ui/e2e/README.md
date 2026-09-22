@@ -419,8 +419,8 @@ env -u NO_COLOR E2E_PORT=8168 crates/trawl-web-ui/e2e/scripts/mutation-check.sh 
 `NO_COLOR` is unset because the installed Trunk parses it as a boolean and rejects
 an inherited value of `1`. The runner builds each mutant, requires its target spec
 to fail and the routing control to pass, reverses the patch, and finally rebuilds
-the pristine SPA. The `web-ui-palette-mutations` CI job runs these two patches only
-after `web-ui-e2e` passes and uploads browser traces on failure. A failed build or
+the pristine SPA. The `web-ui-palette-mutations` CI job runs these two patches alongside
+`web-ui-e2e` and uploads browser traces on failure. A failed build or
 control is not a killed mutation.
 
 ### Health page acceptance and gate mutation
@@ -439,9 +439,9 @@ release, and drop stream data, and release a delayed bootstrap response.
 Run `e2e/scripts/mutation-check.sh 20-health-admin-gate.patch` from a clean
 checkout. The script reads the named test's JSON result and requires the
 request-counter assertion itself to fail. A rendering failure elsewhere in
-the spec is not a kill. The `web-ui-health-mutation` CI job depends on the
-same commit's passing `web-ui-e2e` job and builds both the mutant and restored
-SPA. Browser traces remain available on job failure.
+the spec is not a kill. The `web-ui-health-mutation` CI job runs alongside
+`web-ui-e2e` on the same commit, and the workflow is green only when both pass.
+It builds both the mutant and restored SPA. Browser traces remain available on job failure.
 
 Health cases cover health 200 and structured 503, permission-gated network
 silence and DOM, independent query permission, one shared stream across
@@ -470,7 +470,7 @@ It accepts only the loss test's
 `ATMOSPHERE_NO_RESTART` assertion as the failure, then requires the unaffected
 compile-failure control to pass. Exit and signal traps restore and byte-check
 the source, bundle, dist snippet and index. CI's `atmosphere-mutation` job downloads
-the same dist as the passing `web-ui-e2e` job and needs no Rust rebuild.
+the same `trunk-build` dist that `web-ui-e2e` tests and needs no Rust rebuild.
 
 The atmosphere spec forces no-WebGL, compile, link and late constructor failures.
 Its loss test overrides reduced motion, requires real rendered frames and a real
@@ -521,7 +521,7 @@ E2E_PORT=8166 crates/trawl-web-ui/e2e/scripts/mutation-check.sh \
 ```
 
 Each uses `routing.spec.ts` as an independent passing control. The
-`web-ui-pagination-range-mutations` CI job waits for the full `web-ui-e2e`
+`web-ui-pagination-range-mutations` CI job runs alongside the full `web-ui-e2e`
 baseline, runs these three mutations and uploads failure traces. Apply or build
 failure is not a kill; the target must execute and fail, the control must pass,
 and the runner must restore both clean source and pristine app dist. Mutation
@@ -554,6 +554,6 @@ env -u NO_COLOR crates/trawl-web-ui/e2e/scripts/mutation-check.sh 26-save-editor
 
 The mutation runner reverses the patch and rebuilds the pristine SPA before it
 returns. The final browser command verifies that restored build. The explicit
-`web-ui-save-snapshot-mutation` CI job runs this sequence after `web-ui-e2e`,
+`web-ui-save-snapshot-mutation` CI job runs this sequence alongside `web-ui-e2e`,
 with separate steps for the pristine and restored assertions. A failed build,
 unattributed target failure, failed control, or dirty restored tree fails the job.
