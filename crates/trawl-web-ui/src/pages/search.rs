@@ -529,7 +529,7 @@ pub fn Search() -> impl IntoView {
     // `effective_q` follows the URL at once, so a new query would be
     // read against the frames of the old stream until the first frame
     // of the new one landed.
-    let live_query = RwSignal::new(String::new());
+    let stream_query = RwSignal::new(String::new());
     let lagged = RwSignal::new(None::<u64>);
     let stream_failure = RwSignal::new(None::<&'static str>);
     // Aggregation frames this session accepted — the footer's `Updates`
@@ -562,7 +562,7 @@ pub fn Search() -> impl IntoView {
         if current_mode != Mode::Live || q.trim().is_empty() {
             return;
         }
-        live_query.set(q.clone());
+        stream_query.set(q.clone());
 
         let signals = LiveSignals {
             ring,
@@ -1178,7 +1178,7 @@ pub fn Search() -> impl IntoView {
                             // whole of what the server aggregated.
                             <Chart
                                 snapshot=live_snapshot
-                                query=live_query
+                                query=stream_query
                                 coverage=Signal::derive(|| None)
                                 lane=Lane::Live
                                 chart_type=chart_type
