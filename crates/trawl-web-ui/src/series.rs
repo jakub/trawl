@@ -37,6 +37,7 @@ use trawl_core::timechart::{query_span, resolve_span};
 
 use crate::categorical::CatShape;
 use crate::histogram::days_from_civil;
+use crate::service_card_fmt::format_exact;
 
 /// The most series a Line chart draws. Must be ≤ the palette in
 /// `vendor/src/uplot.ts` (`readColors`, `lineDashes`): a seventh series
@@ -122,7 +123,8 @@ impl Refusal {
                 "Two rows share the {bucket} bucket for {series}. Open Events for the exact rows."
             ),
             Self::GridTooLarge(n) => format!(
-                "This result spans {n} time buckets; the chart draws up to 20,000. Use a larger span or a shorter range."
+                "This result spans {n} time buckets; the chart draws up to {}. Use a larger span or a shorter range.",
+                format_exact(MAX_INSTANTS as u64)
             ),
         }
     }

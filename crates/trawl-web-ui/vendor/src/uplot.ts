@@ -42,6 +42,13 @@ export interface ChartOpts {
   xLabels?: string[];
   /** Bridge explicit nulls with a line segment. Off unless asked. */
   spanGaps?: boolean;
+  /**
+   * Let the chart follow its host's width itself, through its own
+   * ResizeObserver. Off by default: a caller that already measures the
+   * host and calls `resize()` owns the redraw, and two observers on one
+   * layout change redraw the same chart twice.
+   */
+  observeResize?: boolean;
 }
 
 export interface ChartHandle {
@@ -369,9 +376,10 @@ export function createChart(
   };
 
   const chart = new uPlot(options, data, parent);
-  // The service drawer can switch between a docked column and an overlay
-  // without remounting. Follow its host width in either presentation.
-  const resizeObserver = bars ? new ResizeObserver(([entry]) => {
+  // Only for a caller that does not resize the chart itself: the service
+  // drawer switches between a docked column and an overlay without
+  // remounting, and never calls `resize()`.
+  const resizeObserver = opts.observeResize ? new ResizeObserver(([entry]) => {
     const width = Math.round(entry.contentRect.width);
     if (width > 0 && width !== chart.width) {
       chart.setSize({ width, height: opts.height });

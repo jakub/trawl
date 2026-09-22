@@ -422,10 +422,12 @@
 
 /* Chart type picker — the Visualization tab's exclusive choice, on the
  * shared segmented treatment (`.seg` / `.seg-opt`, ADR-0003) so it reads
- * as the same control as the reading-mode toggles. It is a radiogroup
- * rather than a set of toggle buttons because the types are exclusive
- * and one is always effective, so `aria-checked` rides each option and
- * a type that does not fit the result is disabled with the reason. */
+ * as the same control as the reading-mode toggles. The types are
+ * exclusive and one is always effective, so the picker is a group of
+ * native radio inputs: the checked state, the single tab stop and the
+ * arrow keys all come from the input, and a type that does not fit the
+ * result is a disabled input with the reason. Each label is the visible
+ * segment, so every rule below styles it from the input's state. */
 .chart-types {
   position: relative;
   margin: 0 0 8px;

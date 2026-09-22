@@ -203,6 +203,10 @@ test('a wide stats by result draws the twenty largest groups and says what it le
   await expect(page.locator(SEL.chartHost)).toHaveAttribute('data-points', '20');
   await expect(page.locator('.visualization .chart-caption'))
     .toHaveText('20 of 200 groups drawn; the 180 smallest are not.');
+  // A bar canvas has no legend, so the note is the chart's only text
+  // representation: the type, the metric, the group field and the count.
+  await expect(page.locator('.visualization .chart-note'))
+    .toHaveText('Column: count by status, 20 groups. Hover a bar for its value. Open Events for the exact table.');
 });
 
 test('a chart type is session state, kept across tabs and queries and out of the URL', async ({ page, request }) => {

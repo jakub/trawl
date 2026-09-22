@@ -53,6 +53,10 @@ pub struct Opts<'a> {
     pub x_labels: Option<&'a [String]>,
     /// Draw a line across explicit nulls instead of leaving a gap.
     pub span_gaps: bool,
+    /// Let the bridge install its own `ResizeObserver` on the host. Set
+    /// only by a caller that never calls [`ChartHandle::resize`]: one
+    /// owner per redraw, or a layout change draws the chart twice.
+    pub observe_resize: bool,
 }
 
 impl Opts<'_> {
@@ -86,6 +90,7 @@ impl Opts<'_> {
             set("xLabels", &x_labels.into());
         }
         set("spanGaps", &JsValue::from_bool(self.span_gaps));
+        set("observeResize", &JsValue::from_bool(self.observe_resize));
         obj.into()
     }
 }

@@ -880,6 +880,9 @@ fn IngestChart(slots: Vec<Slot>) -> impl IntoView {
                     utc: true,
                     x_labels: None,
                     span_gaps: false,
+                    // The drawer never resizes the chart from Rust, so
+                    // the bridge follows the host width itself.
+                    observe_resize: true,
                 };
                 *stored = Some(create_chart(&html_el, data, opts.to_js()));
             }

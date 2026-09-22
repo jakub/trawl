@@ -107,8 +107,28 @@ enum Outcome {
     /// Series aligned on the bucket grid, for Line.
     Lines(SeriesSet),
     /// One value per group on an ordinal axis, with the metric column's
-    /// name, for Column and Bar.
-    Groups(CatPoints, String),
+    /// name and the `by` field it groups, for Column and Bar. Both names
+    /// are the note's words as well as the series label.
+    Groups {
+        points: CatPoints,
+        metric: String,
+        group: String,
+    },
+}
+
+/// The sentence under a Column or Bar chart: the type, the metric
+/// column, the `by` field, and how many bars were drawn.
+///
+/// Line has a live legend; a bar canvas does not (`legend: { show:
+/// !bars }` in `vendor/src/uplot.ts`), so without this the chart is a
+/// picture with no text representation at all. It stays short: what the
+/// chart left out is the caption's job, not this one's.
+fn groups_note(ty: ChartType, metric: &str, group: &str, drawn: usize) -> String {
+    let noun = if drawn == 1 { "group" } else { "groups" };
+    format!(
+        "{}: {metric} by {group}, {drawn} {noun}. Hover a bar for its value. Open Events for the exact table.",
+        ty.label()
+    )
 }
 
 /// A JS array index. Lengths here are bounded by
@@ -313,7 +333,11 @@ pub fn Chart(
                 message,
                 offers_events: true,
             }),
-            None => Outcome::Groups(points, shape.metric_name),
+            None => Outcome::Groups {
+                points,
+                metric: shape.metric_name,
+                group: shape.group_name,
+            },
         }
     });
 
@@ -330,7 +354,7 @@ pub fn Chart(
                 narrow.as_deref(),
             )
         }
-        Outcome::Groups(points, _) => {
+        Outcome::Groups { points, .. } => {
             caption(points.labels.len(), points.total_groups, "groups", None)
         }
         Outcome::Note(_) | Outcome::Refused(_) => None,
@@ -371,7 +395,7 @@ pub fn Chart(
                 set.xs.len(),
                 set.series.len(),
             )),
-            Outcome::Groups(points, metric) => Some((
+            Outcome::Groups { points, metric, .. } => Some((
                 groups_data(&points),
                 vec![metric],
                 Some(points.labels.clone()),
@@ -420,6 +444,9 @@ pub fn Chart(
                     utc: x_labels.is_none(),
                     x_labels: x_labels.as_deref(),
                     span_gaps: false,
+                    // This component measures the host with its own
+                    // Leptos resize observer and calls `resize()`.
+                    observe_resize: false,
                 };
                 let options = opts.to_js();
                 let h = create_chart(&html_el, data, options);
@@ -455,7 +482,7 @@ pub fn Chart(
                         <button type="button" class="btn-sec" on:click=move |_| on_events.run(())>"Open Events"</button>
                     })}
                 }.into_any(),
-                Outcome::Lines(_) | Outcome::Groups(..) => ().into_any(),
+                Outcome::Lines(_) | Outcome::Groups { .. } => ().into_any(),
             }}
             {move || failure.get().and(on_retry).map(|retry| view! {
                 <button type="button" class="btn-sec" on:click=move |_| retry.run(())>"Retry live stream"</button>
@@ -471,9 +498,17 @@ pub fn Chart(
                 <p class="chart-caption" role="status">{text}</p>
                 <button type="button" class="btn-lnk" on:click=move |_| on_events.run(())>"Open Events"</button>
             })}
-            {move || matches!(outcome.get(), Outcome::Lines(_)).then(|| view! {
-                <p class="chart-note">"Metrics over time on a UTC axis, up to six series. Gaps mean no value was returned. Open Events for exact times and values."</p>
-            })}
+            // Every drawn chart carries a note, because a canvas is not
+            // a text representation of itself.
+            {move || match outcome.get() {
+                Outcome::Lines(_) => Some(
+                    "Metrics over time on a UTC axis, up to six series. Gaps mean no value was returned. Open Events for exact times and values.".to_owned()
+                ),
+                Outcome::Groups { points, metric, group } => Some(
+                    groups_note(effective.get(), &metric, &group, points.labels.len())
+                ),
+                Outcome::Note(_) | Outcome::Refused(_) => None,
+            }.map(|text| view! { <p class="chart-note">{text}</p> })}
         </div>
     }
 }
