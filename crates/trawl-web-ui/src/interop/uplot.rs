@@ -12,21 +12,52 @@
 
 use wasm_bindgen::prelude::*;
 
-/// Rust mirror of `ChartOpts` in `vendor/src/uplot.ts`. Built here rather
-/// than at each call site so the two chart surfaces (the search-page
-/// snapshot line and the service drawer's ingest bars) can't drift on
-/// field names the JS side reads by string key.
+/// How the bridge draws the y-series. Serialised as `ChartOpts.kind`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChartKind {
+    /// One line per series over a time x axis.
+    Line,
+    /// Vertical bars: one per x value.
+    Column,
+    /// Horizontal bars: Column rotated, categories down the left edge.
+    // The Visualization chart type picker is the caller; until it lands
+    // this variant only exists for the bridge contract. `expect` fails
+    // the build once the caller arrives, so the attribute cannot outlive
+    // its reason.
+    #[expect(dead_code, reason = "wired by the Visualization chart rewrite")]
+    Bar,
+}
+
+impl ChartKind {
+    fn as_js(self) -> &'static str {
+        match self {
+            Self::Line => "line",
+            Self::Column => "column",
+            Self::Bar => "bar",
+        }
+    }
+}
+
+/// Rust mirror of `ChartOpts` in `vendor/src/uplot.ts`; that interface's
+/// doc comment points back here. Built here rather than at each call
+/// site so the chart surfaces (the Visualization tab and the service
+/// drawer's ingest columns) can't drift on field names the JS side reads
+/// by string key.
 pub struct Opts<'a> {
     pub width: f64,
     pub height: f64,
     /// One label per y-series; the x-series is named by the wrapper.
     pub series: &'a [String],
     pub y_label: Option<&'a str>,
-    /// Column chart instead of a line.
-    pub bars: bool,
+    pub kind: ChartKind,
     /// Format the time axis as UTC. Set when x values were derived from
     /// trawld's already-timezone-shifted `_time` strings.
     pub utc: bool,
+    /// `Some` switches the x scale to ordinal: one label per category and
+    /// xs are `0..n-1`. `None` keeps a time x scale.
+    pub x_labels: Option<&'a [String]>,
+    /// Draw a line across explicit nulls instead of leaving a gap.
+    pub span_gaps: bool,
 }
 
 impl Opts<'_> {
@@ -48,12 +79,18 @@ impl Opts<'_> {
         if let Some(label) = self.y_label {
             set("yLabel", &JsValue::from_str(label));
         }
-        if self.bars {
-            set("kind", &JsValue::from_str("bars"));
-        }
+        set("kind", &JsValue::from_str(self.kind.as_js()));
         if self.utc {
             set("utc", &JsValue::TRUE);
         }
+        if let Some(labels) = self.x_labels {
+            let x_labels = js_sys::Array::new();
+            for label in labels {
+                x_labels.push(&JsValue::from_str(label));
+            }
+            set("xLabels", &x_labels.into());
+        }
+        set("spanGaps", &JsValue::from_bool(self.span_gaps));
         obj.into()
     }
 }

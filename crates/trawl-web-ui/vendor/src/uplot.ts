@@ -6,6 +6,14 @@
 
 import uPlot, { AlignedData, Options } from "uplot";
 
+/**
+ * Chart options as the Rust side hands them over.
+ *
+ * Mirrored field-for-field by `Opts` in
+ * `crates/trawl-web-ui/src/interop/uplot.rs`; that struct's `to_js` is
+ * the only writer of this object, so a field added here is a field added
+ * there.
+ */
 export interface ChartOpts {
   width: number;
   height: number;
@@ -13,8 +21,11 @@ export interface ChartOpts {
   series?: string[];
   /** Optional y-axis label. */
   yLabel?: string;
-  /** Render style. Defaults to "line". */
-  kind?: "line" | "bars";
+  /**
+   * Render style. Defaults to "line". "column" draws vertical bars,
+   * "bar" the same data as horizontal bars (Column rotated).
+   */
+  kind?: "line" | "column" | "bar";
   /**
    * Treat x values as UTC rather than browser-local when formatting the
    * time axis. trawld emits `_time` already shifted into its configured
@@ -23,8 +34,14 @@ export interface ChartOpts {
    * label by the viewer's own offset.
    */
   utc?: boolean;
-  /** Search snapshots use result positions instead of epoch seconds. */
-  rowIndex?: boolean;
+  /**
+   * Ordinal x scale: one label per category, xs are `0..n-1`. When set,
+   * the x axis prints these labels instead of times and the hover card
+   * names the category, not an interval.
+   */
+  xLabels?: string[];
+  /** Bridge explicit nulls with a line segment. Off unless asked. */
+  spanGaps?: boolean;
 }
 
 export interface ChartHandle {
@@ -72,6 +89,10 @@ function translucent(color: string, alpha: number): string {
 
 // Canvas and legend use the same CSS-pixel patterns. A CSS border marker
 // cannot represent dash-dot patterns, so each line gets an SVG legend key.
+//
+// Six patterns, six colours (`readColors` below): together they must cover
+// `SERIES_CAP` in `crates/trawl-web-ui/src/series.rs`, the most series the
+// Rust side ever hands this bridge. Raise all three together.
 const lineDashes = [[], [6, 4], [2, 4], [12, 4], [8, 3, 2, 3], [8, 3, 2, 3, 2, 3]];
 
 function lineLabel(label: string, color: string, dash: number[]): HTMLElement {
@@ -108,16 +129,25 @@ export function createChart(
   let line2 = token("--line-2", "rgba(128,128,128,.2)");
   const mono = token("--font-mono", "monospace");
 
-  const bars = opts.kind === "bars";
+  const kind = opts.kind ?? "line";
+  const bars = kind !== "line";
+  // Bar is Column rotated: uPlot draws the x scale vertically and the
+  // value scale horizontally. Orientation is a scale property, not a
+  // path option — the bars builder, cursor and posToVal all read it
+  // from `scales.x.ori` (upstream demo `scales-dir-ori.html`).
+  const horizontal = kind === "bar";
+  const xLabels = opts.xLabels;
+  const ordinal = xLabels !== undefined;
   const seriesLabels = opts.series ?? [];
 
-  // Bucketed bars sit to the RIGHT of their timestamp: a bar labelled
-  // 13:00 covers [13:00, 14:00), matching how `timechart` buckets.
-  // `gap` keeps neighbours legible — at 24 buckets in ~320px the columns
+  // Time-bucketed bars sit to the RIGHT of their timestamp: a bar
+  // labelled 13:00 covers [13:00, 14:00), matching how `timechart`
+  // buckets. Ordinal bars are centred on their integer position. `gap`
+  // keeps neighbours legible — at 24 buckets in ~320px the columns
   // otherwise anti-alias into each other and read as one solid block.
   const barPath = bars
     ? uPlot.paths.bars?.({
-        align: 1,
+        align: ordinal ? 0 : 1,
         size: [0.9, Infinity],
         gap: 2,
         radius: 0.15,
@@ -136,11 +166,26 @@ export function createChart(
     return [min, max + step];
   };
 
+  /**
+   * The value scale keeps zero in view together with the data's own
+   * extent: a flat-ish count series must not look dramatic because
+   * uPlot auto-ranged the floor, and a negative metric must not vanish
+   * below a zero floor. An all-zero result still gets a unit of room.
+   */
+  const valueRange = (_u: uPlot, min: number, max: number): [number, number] => {
+    const lo = Math.min(0, min);
+    let hi = Math.max(0, max);
+    if (hi === lo) hi = lo + 1;
+    return [lo, hi];
+  };
+
+  // Six colours, six dash patterns (`lineDashes` above): together they
+  // must cover `SERIES_CAP` in `crates/trawl-web-ui/src/series.rs`.
   const readColors = () => [accent, token("--teal", accent), token("--red", accent),
     token("--yellow", accent), token("--green", accent), token("--ink", accent)];
   let colors = readColors();
   const series = [
-    { label: opts.rowIndex ? "Result position" : "time" },
+    { label: ordinal ? "group" : opts.utc ? "UTC" : "time" },
     ...seriesLabels.map((label, index) => ({
       label: bars ? label : lineLabel(label, colors[index % colors.length], lineDashes[index % lineDashes.length]),
       stroke: () => bars ? accent : colors[index % colors.length],
@@ -156,7 +201,11 @@ export function createChart(
             paths: barPath,
             points: { show: false },
           }
-        : {}),
+        : {
+            // A null bucket is a gap in the line unless the caller asks
+            // otherwise; never let uPlot's default decide.
+            spanGaps: opts.spanGaps ?? false,
+          }),
     })),
   ];
 
@@ -167,8 +216,8 @@ export function createChart(
     font: `10px ${mono}`,
   };
 
-  // The service ingest chart uses a hover card instead of a live legend.
-  // Keep it inside the plot so the drawer's scroll container cannot clip it.
+  // The bar charts use a hover card instead of a live legend. Keep it
+  // inside the plot so a scroll container cannot clip it.
   const tooltip = bars ? document.createElement("div") : null;
   const tooltipTime = document.createElement("div");
   const tooltipValue = document.createElement("div");
@@ -184,39 +233,76 @@ export function createChart(
     ...(opts.utc ? { timeZone: "UTC" } : {}),
   });
   const hideTooltip = () => { if (tooltip) tooltip.hidden = true; };
+  /** Which data row the cursor is over, or -1 when it is over none. */
+  const hoveredIndex = (u: uPlot, left: number, top: number): number => {
+    const xs = u.data[0];
+    if (xLabels) {
+      // Ordinal bars are centred on integers, so the nearest integer is
+      // the hovered category. Along the vertical x scale of a Bar chart
+      // the cursor's `top` is the x position.
+      const at = u.posToVal(horizontal ? top : left, "x");
+      const index = Math.round(at);
+      return index >= 0 && index < xLabels.length && Math.abs(at - index) <= 0.5 ? index : -1;
+    }
+    if (xs.length < 2) return -1;
+    // Time bars extend right from each bucket start. uPlot's nearest
+    // timestamp can select the next bucket halfway across a bar, so
+    // select by interval.
+    const time = u.posToVal(left, "x");
+    let index = xs.length - 1;
+    while (index >= 0 && xs[index] > time) index--;
+    if (index < 0) return -1;
+    const start = xs[index];
+    const end = xs[index + 1] ?? start + (start - xs[index - 1]);
+    return time >= end ? -1 : index;
+  };
   const updateTooltip = (u: uPlot) => {
     if (!tooltip) return;
     const { left = -1, top = -1 } = u.cursor;
     const width = u.over.clientWidth;
     const height = u.over.clientHeight;
-    const xs = u.data[0];
-    if (left < 0 || top < 0 || left > width || top > height || xs.length < 2) {
+    if (left < 0 || top < 0 || left > width || top > height) {
       hideTooltip();
       return;
     }
-    // Bars extend right from each bucket start. uPlot's nearest timestamp
-    // can select the next bucket halfway across a bar, so select by interval.
-    const time = u.posToVal(left, "x");
-    let index = xs.length - 1;
-    while (index >= 0 && xs[index] > time) index--;
+    const index = hoveredIndex(u, left, top);
     if (index < 0) {
       hideTooltip();
       return;
     }
-    const start = xs[index];
-    const end = xs[index + 1] ?? start + (start - xs[index - 1]);
-    if (time >= end) {
-      hideTooltip();
-      return;
+    if (xLabels) {
+      tooltipTime.textContent = xLabels[index] ?? "";
+    } else {
+      const xs = u.data[0];
+      const start = xs[index];
+      const end = xs[index + 1] ?? start + (start - xs[index - 1]);
+      tooltipTime.textContent = `${formatTime.format(start * 1000)} – ${formatTime.format(end * 1000)}`;
     }
-    tooltipTime.textContent = `${formatTime.format(start * 1000)} – ${formatTime.format(end * 1000)}`;
-    tooltipValue.textContent = seriesLabels.map((label, i) =>
-      `${label.charAt(0).toUpperCase() + label.slice(1)}: ${Number(u.data[i + 1][index] ?? 0).toLocaleString()}`
-    ).join(" · ");
+    tooltipValue.textContent = seriesLabels.map((label, i) => {
+      const value = u.data[i + 1][index];
+      const shown = value == null ? "null" : Number(value).toLocaleString();
+      return `${label.charAt(0).toUpperCase() + label.slice(1)}: ${shown}`;
+    }).join(" · ");
     tooltip.hidden = false;
     tooltip.style.left = `${Math.max(0, Math.min(left + 12, width - tooltip.offsetWidth))}px`;
     tooltip.style.top = `${Math.max(0, Math.min(top + 12, height - tooltip.offsetHeight))}px`;
   };
+
+  // Ordinal x: half a slot of padding either side so the first and last
+  // bars are drawn whole, one split per category, the label as its text.
+  const ordinalX = xLabels
+    ? {
+        scale: { time: false as const, range: [-0.5, xLabels.length - 0.5] as [number, number] },
+        axis: {
+          splits: () => xLabels.map((_, i) => i),
+          values: (_u: uPlot, splits: number[]) => splits.map((v) => xLabels[v] ?? ""),
+        },
+      }
+    : undefined;
+
+  const xScale = ordinalX
+    ? ordinalX.scale
+    : { time: true as const, ...(bars ? { range: barRange } : {}) };
 
   const options: Options = {
     width: opts.width,
@@ -226,21 +312,38 @@ export function createChart(
       ? { tzDate: (ts: number) => uPlot.tzDate(new Date(ts * 1000), "Etc/UTC") }
       : {}),
     scales: {
-      x: { time: !opts.rowIndex, ...(bars ? { range: barRange } : {}) },
-      // Counts start at zero — letting uPlot auto-range the floor makes a
-      // flat-ish series look far more dramatic than it is.
-      y: { range: (_u, _min, max) => [0, Math.max(max, 1)] },
+      // Horizontal bars: x runs down the left edge (`ori: 1`), first
+      // category at the top (`dir: -1`), values along the bottom.
+      x: { ...xScale, ...(horizontal ? { ori: 1, dir: -1 } : {}) },
+      y: { range: valueRange, ...(horizontal ? { ori: 0, dir: 1 } : {}) },
     },
     axes: [
-      { ...axisBase },
       {
         ...axisBase,
+        ...(ordinalX ? ordinalX.axis : {}),
+        // Left-side category labels need more room than uPlot's default
+        // axis gutter; size to the longest label, within reason.
+        ...(horizontal
+          ? {
+              side: 3,
+              size: Math.min(160, 16 + 6.5 * Math.max(0, ...(xLabels ?? []).map((l) => l.length))),
+            }
+          : {}),
+      },
+      {
+        ...axisBase,
+        ...(horizontal ? { side: 2 } : {}),
         ...(opts.yLabel
           ? { label: opts.yLabel, labelFont: `11px ${mono}` }
           : {}),
-        // Counts are integers; suppress uPlot's fractional ticks.
-        values: (_u, splits) =>
-          splits.map((v) => (Number.isInteger(v) ? String(v) : "")),
+        // Time columns are counts: suppress uPlot's fractional ticks.
+        // Line and ordinal values may be fractional, so they keep them.
+        ...(bars && !ordinal
+          ? {
+              values: (_u: uPlot, splits: number[]) =>
+                splits.map((v) => (Number.isInteger(v) ? String(v) : "")),
+            }
+          : {}),
       },
     ],
     cursor: {

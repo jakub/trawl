@@ -35,7 +35,7 @@ use crate::components::sort_th::sort_th;
 use crate::drawer_query::{decode_cardinality, value_as_u64};
 use crate::fetch_plan::FetchPlan;
 use crate::histogram::{Slot, align_buckets, parse_bucket_ms};
-use crate::interop::uplot::{ChartHandle, Opts, create_chart};
+use crate::interop::uplot::{ChartHandle, ChartKind, Opts, create_chart};
 use crate::state::stream_session::{LiveSignals, RingBuffer, StreamLifecycle, start_stream};
 use fleet_ui::{
     Badge, Btn, Drawer, Icon, IconView, LoadState, Loaded, TabItem, ToastBus, ToastKind, Tone,
@@ -874,10 +874,12 @@ fn IngestChart(slots: Vec<Slot>) -> impl IntoView {
                     height: INGEST_CHART_H,
                     series: &labels,
                     y_label: None,
-                    bars: true,
+                    kind: ChartKind::Column,
                     // x values were built from trawld's already-shifted
                     // display timestamps — see `align_buckets`.
                     utc: true,
+                    x_labels: None,
+                    span_gaps: false,
                 };
                 *stored = Some(create_chart(&html_el, data, opts.to_js()));
             }

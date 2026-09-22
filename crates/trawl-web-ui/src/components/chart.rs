@@ -145,18 +145,20 @@ pub fn Chart(
                 h.set_data(data);
                 h.resize(measured_width, 320.0);
             } else {
-                // First snapshot — construct the chart. x values here are
-                // row indices, not real instants, so `utc` stays off.
+                // First snapshot — construct the chart. x values are
+                // epoch seconds built from trawld's already-shifted
+                // display timestamps, so the axis formats them as UTC.
                 let opts = Opts {
                     width: measured_width,
                     height: 320.0,
                     series: &labels,
                     y_label: None,
-                    bars: false,
-                    utc: false,
+                    kind: crate::interop::uplot::ChartKind::Line,
+                    utc: true,
+                    x_labels: None,
+                    span_gaps: false,
                 };
                 let options = opts.to_js();
-                let _ = js_sys::Reflect::set(&options, &"rowIndex".into(), &JsValue::TRUE);
                 let h = create_chart(&html_el, data, options);
                 *slot = Some(h);
             }
