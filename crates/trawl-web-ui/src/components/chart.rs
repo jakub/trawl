@@ -16,7 +16,7 @@ use trawl_api::value::QueryResult;
 use wasm_bindgen::{JsCast, JsValue};
 
 use crate::categorical::detect;
-use crate::chart_hint::{Hint, chart_hint};
+use crate::chart_hint::{Hint, chart_hint, final_stage_is_timechart};
 use crate::fetch_plan::coverage_refusal;
 use crate::interop::uplot::{ChartHandle, ChartKind, Opts, create_chart};
 use crate::series::{CatPoints, Lane, SeriesSet, caption, cat_points};
@@ -160,35 +160,60 @@ fn groups_data(points: &CatPoints) -> JsValue {
     aligned.into()
 }
 
+/// One radio group per mounted picker. A `name` shared by two groups
+/// would make them one group, so the counter hands each instance its
+/// own — cheaper and more certain than reasoning about which tab bodies
+/// can be mounted together.
+static PICKER_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// The three chart types, with the reasons the ones that do not fit the
 /// result on screen are disabled.
+///
+/// Native `input type=radio` rather than `role="radio"` buttons: the
+/// browser then owns arrow-key movement inside the group, the single tab
+/// stop, and the checked state, none of which this component would get
+/// for free otherwise. The segmented look rides the labels
+/// (`input:checked + .seg-opt` in main.css).
 #[component]
 fn ChartTypePicker(
     selected: RwSignal<Option<ChartType>>,
     #[prop(into)] default: Signal<ChartType>,
     #[prop(into)] fits: Signal<[Option<&'static str>; 3]>,
 ) -> impl IntoView {
+    let group = format!(
+        "chart-type-{}",
+        PICKER_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
     view! {
-        <div class="chart-types seg seg-sm" role="radiogroup" aria-label="Chart type">
+        // `role` overrides the fieldset's own `group`, so the control
+        // announces the exclusive choice it is; the legend names it for
+        // a reader who turns styles off.
+        <fieldset class="chart-types seg seg-sm" role="radiogroup" aria-label="Chart type">
+            <legend class="sr-only">"Chart type"</legend>
             {TYPES.iter().copied().map(|ty| {
                 // The checked option is the type the chart DRAWS, which
                 // is the default while the stored choice does not fit.
                 let checked = move || effective_type(selected.get(), default.get(), &fits.get()) == ty;
                 let reason = move || fits.get()[ty.slot()];
+                let id = format!("{group}-{}", ty.as_str());
                 view! {
-                    <button
-                        type="button"
-                        class="seg-opt"
-                        role="radio"
-                        class:on=checked
-                        aria-checked=move || if checked() { "true" } else { "false" }
+                    <input
+                        type="radio"
+                        class="chart-type-input"
+                        id=id.clone()
+                        name=group.clone()
+                        value=ty.as_str()
+                        prop:checked=checked
                         disabled=move || reason().is_some()
                         title=reason
-                        on:click=move |_| selected.set(Some(ty))
-                    >{ty.label()}</button>
+                        on:change=move |_| selected.set(Some(ty))
+                    />
+                    // The reason again on the label, which is the part
+                    // a pointer can hover: the input itself is clipped.
+                    <label class="seg-opt" for=id title=reason>{ty.label()}</label>
                 }
             }).collect_view()}
-        </div>
+        </fieldset>
     }
 }
 
@@ -221,23 +246,19 @@ pub fn Chart(
     #[prop(optional, into)] failure: Signal<Option<&'static str>>,
     #[prop(optional)] on_retry: Option<Callback<()>>,
 ) -> impl IntoView {
-    // Which types the result on screen admits. Line wants a
-    // `timechart`; Column and Bar want the shape the Events tab's
-    // categorical chart already draws.
-    let has_timechart = Memo::new(move |_| {
-        trawl_core::parser::parse(&query.get()).is_ok_and(|ast| {
-            ast.pipeline
-                .iter()
-                .any(|stage| matches!(&stage.node, trawl_core::ast::PipeStage::Timechart(_)))
-        })
-    });
+    // Which types the result on screen admits. Line wants a result the
+    // query left on a bucket axis — the LAST aggregation must be the
+    // timechart, or there is no `_time` column to draw on; Column and
+    // Bar want the shape the Events tab's categorical chart already
+    // draws.
+    let line_fits = Memo::new(move |_| final_stage_is_timechart(&query.get()));
     let cat_shape = Memo::new(move |_| {
         snapshot
             .get()
             .and_then(|result| detect(&query.get(), &result))
     });
     let fits = Memo::new(move |_| {
-        let lines = (!has_timechart.get()).then_some(LINE_NEEDS);
+        let lines = (!line_fits.get()).then_some(LINE_NEEDS);
         let bars = cat_shape.get().is_none().then_some(BARS_NEED);
         [lines, bars, bars]
     });
@@ -245,7 +266,7 @@ pub fn Chart(
     // Column for a `stats … by`, and Line for anything else — whose
     // refusal is the one that names a fix.
     let default_type = Memo::new(move |_| {
-        if has_timechart.get() {
+        if line_fits.get() {
             ChartType::Line
         } else if cat_shape.get().is_some() {
             ChartType::Column

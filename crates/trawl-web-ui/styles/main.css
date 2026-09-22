@@ -426,10 +426,42 @@
  * rather than a set of toggle buttons because the types are exclusive
  * and one is always effective, so `aria-checked` rides each option and
  * a type that does not fit the result is disabled with the reason. */
-.chart-types { margin: 0 0 8px; }
-.chart-types .seg-opt[aria-checked="true"] { font-weight: 600; }
-.chart-types .seg-opt:disabled { opacity: .5; cursor: not-allowed; }
-.chart-types .seg-opt:disabled:hover { color: var(--ink-3); }
+.chart-types {
+  position: relative;
+  margin: 0 0 8px;
+  min-inline-size: 0;
+}
+/* The radio itself is clipped, not hidden: `display: none` takes it out
+ * of the tab order and off the accessibility tree, which is the whole
+ * reason for using a native radio here. */
+.chart-types .chart-type-input {
+  position: absolute;
+  width: 1px; height: 1px;
+  margin: -1px; padding: 0;
+  overflow: hidden; clip-path: inset(50%);
+  border: 0;
+}
+.chart-types .seg-opt { cursor: pointer; }
+/* The one active treatment, matching `.seg .seg-opt.on`: the checked
+ * option is raised out of the well track (ADR-0032). */
+.chart-types .chart-type-input:checked + .seg-opt {
+  background: var(--panel);
+  color: var(--accent-ink);
+  border-color: var(--line);
+  box-shadow: var(--elev-1);
+  font-weight: 600;
+}
+.chart-types .chart-type-input:disabled + .seg-opt {
+  opacity: .5;
+  cursor: not-allowed;
+  color: var(--ink-3);
+}
+/* The focus ring lands on the label, since the input carrying focus is
+ * the clipped one. */
+.chart-types .chart-type-input:focus-visible + .seg-opt {
+  outline: 2px solid var(--ring);
+  outline-offset: 1px;
+}
 
 /* The caption under a chart that drew fewer series or groups than the
  * result holds, and beside it the control to the rows it left out. That

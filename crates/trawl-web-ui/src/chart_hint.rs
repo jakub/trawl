@@ -15,9 +15,41 @@
 
 use trawl_api::PaginationMeta;
 use trawl_api::value::QueryResult;
+use trawl_core::ast::PipeStage;
 
 use crate::fetch_plan::coverage_refusal;
 use crate::series::{Lane, Refusal, SeriesSet, align_series};
+
+/// Whether the LAST aggregation-bearing stage of `query` is a
+/// `timechart`, which is what makes a result drawable as lines.
+///
+/// Not "the pipeline mentions a timechart anywhere": a later
+/// aggregation re-aggregates the buckets away.
+/// `… | timechart span=1m count() by host | stats sum(count) as total by
+/// host` is a `stats … by` result with no `_time` column at all, which
+/// Column draws and [`align_series`] refuses. `top`, `rare` and `pivot`
+/// end a timechart the same way — and each of those has its own rung, so
+/// the answer here only has to be "no".
+///
+/// A query that does not parse cannot have produced a result whose axis
+/// anyone can read off it, so it is `false` as well.
+#[must_use]
+pub fn final_stage_is_timechart(query: &str) -> bool {
+    let Ok(ast) = trawl_core::parser::parse(query) else {
+        return false;
+    };
+    ast.pipeline
+        .iter()
+        .rev()
+        .find_map(|stage| match &stage.node {
+            PipeStage::Timechart(_) => Some(true),
+            PipeStage::Stats(_) | PipeStage::Top(_) | PipeStage::Rare(_) | PipeStage::Pivot(_) => {
+                Some(false)
+            }
+            _ => None,
+        })
+        .unwrap_or(false)
+}
 
 /// A chart that was not drawn: the sentence shown in its place, and
 /// whether a control to the Events tab belongs beside it.
@@ -147,6 +179,58 @@ mod chart_hint_tests {
             set
         );
         assert_eq!(hint(UNGROUPED, &rows, None), other);
+    }
+
+    #[test]
+    fn line_fits_only_when_the_final_stage_is_a_timechart() {
+        // A timechart re-aggregated by a later `stats … by`: the result
+        // is one row per host with no `_time` column, so Line does not
+        // fit it and Column does.
+        let rolled_up = "* | timechart span=1m count() by host | stats sum(count) as total by host";
+        assert!(!final_stage_is_timechart(rolled_up));
+        let totals = result(
+            &["host", "total"],
+            vec![
+                vec![s("a"), Value::Integer(12)],
+                vec![s("b"), Value::Integer(3)],
+            ],
+        );
+        assert!(
+            crate::categorical::detect(rolled_up, &totals).is_some(),
+            "the categorical detector admits the final shape"
+        );
+        // And the Line ladder refuses it, which is why the picker must
+        // not offer Line for it.
+        assert_eq!(
+            hint(rolled_up, &totals, None).message,
+            "This result has no time axis. Choose Column for stats by, or open Events."
+        );
+
+        // A plain timechart: Line fits, and the categorical detector
+        // does not admit a bucketed result.
+        assert!(final_stage_is_timechart(GROUPED));
+        assert!(final_stage_is_timechart(UNGROUPED));
+        assert!(crate::categorical::detect(GROUPED, &grouped_result()).is_none());
+
+        // The other aggregations end a timechart the same way, and a
+        // query that does not parse has no axis either.
+        for query in [
+            "* | timechart span=1m count() | top 5 host",
+            "* | timechart span=1m count() | rare 5 host",
+            "* | stats count() by status",
+            "| | |",
+        ] {
+            assert!(!final_stage_is_timechart(query), "{query}");
+        }
+
+        // A stage that carries no aggregation does not end the
+        // timechart: a sort or a head still leaves the buckets.
+        for query in [
+            "* | timechart span=1m count() | sort _time",
+            "* | timechart span=1m count() | head 10",
+        ] {
+            assert!(final_stage_is_timechart(query), "{query}");
+        }
     }
 
     #[test]
