@@ -19,12 +19,14 @@
 //!
 //! Every encode and decode of that state lives in the pure
 //! [`crate::search_url`] module, and the merging rules in
-//! [`crate::query_merge`], so native tests cover both. This module is the
-//! wasm-only layer over them: the navigator closure and the router memos,
-//! including the one memo that says a parameter could not be read at all.
-//! The reading itself starts from the router's RAW query string, because
-//! the decode is the pure module's job and doing it twice changes what a
-//! link means (see [`url_signals`]).
+//! [`crate::query_merge`], so native tests cover both; the mode selector
+//! [`mode_query`] sits in [`crate::search_url`] as well, because that
+//! module owns `Mode`. This module is the wasm-only layer over them: the
+//! navigator closure and the router memos, including the one memo that
+//! says a parameter could not be read at all. The reading itself starts
+//! from the router's RAW query string, because the decode is the pure
+//! module's job and doing it twice changes what a link means (see
+//! [`url_signals`]).
 
 use leptos::prelude::*;
 use leptos_router::NavigateOptions;

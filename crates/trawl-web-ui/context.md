@@ -23,7 +23,7 @@ The well attached to the foot of the console, holding removable active filter ch
 _Avoid_: meta strip, summary bar, filter bar
 
 **Structured state**:
-The URL parameters that are not the query text: page, mode, filters and range. They are folded into the DSL at request time; the query text is never rewritten to carry them.
+The URL parameters that are not the query text: page, mode, filters and range. A snapshot folds them into the DSL at request time; a live stream folds the filters and never the range (see Mode). The query text is never rewritten to carry them.
 _Avoid_: URL state (that includes `q`), extras
 
 **Executed query**:
@@ -31,7 +31,7 @@ The DSL text the URL carries in `q` and the app last ran or will run. Distinct f
 _Avoid_: current query, query text (that is the buffer)
 
 **Effective query**:
-The DSL string that actually goes to the server: the executed query with the structured state merged in.
+The DSL the current mode runs: the executed query with the structured state merged in as the mode folds it. Export always uses the snapshot form, with the range, because a download is bounded.
 _Avoid_: wire query, final query
 
 **Filter**:

@@ -22,7 +22,7 @@
 //! - `effective_q` — derived from the triple AND the mode; what actually
 //!   hits the server. A snapshot folds the range in, a live stream never
 //!   does (ADR-0027, amended 2026-09-21), and `mode_query` is the one
-//!   place that decides. `export_q` is its snapshot-only twin, because a
+//!   place that decides. `export_q` is its always-snapshot twin, because a
 //!   download from a live page is still asking for the URL's range.
 //!   Filter chips in the scope strip and the date-range popover mutate
 //!   state by navigating; URL drives memos drives resource.

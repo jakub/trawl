@@ -16,8 +16,8 @@ arrived, not that nothing is stored.
 4. Watch **Events**. Expect the event within seconds and **Live** in the status bar.
 
 A live stream has no time window. The range control shows the range that
-**Stop live** returns to. It does not limit the stream. A time clause you type
-into the query, such as `last=1h`, still applies.
+**Stop live** returns to. The range does not limit the stream. A time clause
+you type into the query, such as `last=1h`, still applies.
 
 Add filters only after a known event has arrived:
 
@@ -67,8 +67,9 @@ change the query, and both survive a reconnect.
 
 Select **Stop live**, above the results. Trawl closes the stream and runs the
 same query once, with your filters and the range unchanged. The bounded query
-applies that range. The stream did not. The browser Back button returns to the
-stream.
+applies that range in the same way as any snapshot. A time clause in the query
+text still replaces a quick range. The stream applies no range. The browser
+Back button returns to the stream.
 
 To leave live mode on a different window, open the range control, select a
 range such as **Last 15m** or an **Absolute** interval with **From** and

@@ -6,11 +6,13 @@
 //!
 //! The search page keeps its whole state in the address bar — `q` (the
 //! executed DSL), `page`, `mode`, `f` (filters) and `r` (range). This
-//! module owns every encode and decode of that state. History's separate
-//! `hq` and `hpage` contract also lives here, with its own strict filter reader:
-//! no leptos, no `js_sys`, no `web_sys`, so `cargo nextest` on the host
-//! exercises the same functions the browser runs. `state::query` keeps
-//! only the router memos and the navigator closure on top.
+//! module owns every encode and decode of that state. It also owns
+//! `mode_query`, the one selector that says which DSL a mode runs, because
+//! `Mode` lives here. History's separate `hq` and `hpage` contract also
+//! lives here, with its own strict filter reader: no leptos, no `js_sys`,
+//! no `web_sys`, so `cargo nextest` on the host exercises the same
+//! functions the browser runs. `state::query` keeps only the router memos
+//! and the navigator closure on top.
 //!
 //! Two halves of the contract are worth naming here:
 //!

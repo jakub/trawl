@@ -4,11 +4,12 @@
 
 //! Regression guard for ADR-0027 as amended 2026-09-21: a live stream
 //! carries no range. `search_url::mode_query` is the ONE place either
-//! DSL is produced, so the wasm shell — pages, components, state — never
-//! names `effective_query` or `live_query` itself. A component that
-//! reached for one of them directly could fold the popover's range into
-//! a stream again, and the stream lane would drop every event older than
-//! that window while the page still said Live.
+//! DSL is produced, so the three shell source trees the guard walks,
+//! `pages`, `components` and `state`, never name `effective_query` or
+//! `live_query` themselves. A component that reached for one of them
+//! directly could fold the popover's range into a stream again, and the
+//! stream lane would drop every event older than that window while the
+//! page still said Live.
 //!
 //! Line comments are dropped first, so prose about the merge is still
 //! allowed to name the functions it describes. Nothing else is: a

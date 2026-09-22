@@ -159,7 +159,11 @@ A link whose structured state does not parse is shown, not run.**
   an event whose `_time` sat more than the range behind the server clock
   was dropped while the page still said Streaming, the false-claim class
   this ADR refuses. The Schema drawer's Live Tail and `/api/v1/stream`
-  never had a window, and now the three agree.*
+  never had a window, and now the three agree. Export from a live page
+  runs the snapshot DSL, range included: a download is bounded, and the
+  range the URL carries is what it asks for. A range-free export from a
+  live page would pull the whole corpus, the door the empty-query rule
+  above guards.*
 
 ## Consequences
 

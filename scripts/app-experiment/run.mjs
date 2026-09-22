@@ -432,7 +432,7 @@ async function experiment() {
     {
       const live = new URL(page.url());
       assert.equal(live.searchParams.get('mode'), 'live', 'live tail should be in live mode');
-      assert.equal(live.searchParams.get('r'), null, 'live tail should run under the default range, which the URL elides');
+      assert.equal(live.searchParams.get('r'), null, 'live tail is entered from the default range, which the URL elides, so the bare stream query below is the fold under test');
     }
     const ingestStart = performance.now();
     for (let offset = firstCount; offset < count; offset += batchSize) {
