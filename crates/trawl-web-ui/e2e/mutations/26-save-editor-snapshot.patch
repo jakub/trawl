@@ -1,12 +1,12 @@
 diff --git a/crates/trawl-web-ui/src/pages/search.rs b/crates/trawl-web-ui/src/pages/search.rs
 --- a/crates/trawl-web-ui/src/pages/search.rs
 +++ b/crates/trawl-web-ui/src/pages/search.rs
-@@ -459,7 +459,7 @@
+@@ -758,7 +758,7 @@ pub fn Search() -> impl IntoView {
          if unreadable.get_untracked() {
              return;
          }
 -        save_query.set(Some(query_text.get_untracked()));
 +        save_query.set(Some(effective_q.get_untracked()));
      });
-     let show_export_modal = RwSignal::new(false);
-     let on_export = Callback::new(move |()| {
+     // Export is a bounded one-shot download, never the stream, so it runs
+     // the snapshot DSL in BOTH modes: the range the URL carries is exactly

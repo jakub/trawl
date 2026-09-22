@@ -13,23 +13,27 @@
 //! On top of `executed_q`, the URL also carries structured state that gets
 //! folded into the wire query at request time: filters (`?f=`, opaque and
 //! versioned) and the range (`?r=15m` or `?r=<from>..<to>`), plus `page`
-//! and `mode`.
+//! and `mode`. How much of it folds in depends on the mode: a snapshot
+//! takes the range, a live stream never does, and [`mode_query`] is the
+//! one place that decides (ADR-0027 as amended 2026-09-21).
 //!
 //! Every encode and decode of that state lives in the pure
 //! [`crate::search_url`] module, and the merging rules in
-//! [`crate::query_merge`], so native tests cover both. This module is the
-//! wasm-only layer over them: the navigator closure and the router memos,
-//! including the one memo that says a parameter could not be read at all.
-//! The reading itself starts from the router's RAW query string, because
-//! the decode is the pure module's job and doing it twice changes what a
-//! link means (see [`url_signals`]).
+//! [`crate::query_merge`], so native tests cover both; the mode selector
+//! [`mode_query`] sits in [`crate::search_url`] as well, because that
+//! module owns `Mode`. This module is the wasm-only layer over them: the
+//! navigator closure and the router memos, including the one memo that
+//! says a parameter could not be read at all. The reading itself starts
+//! from the router's RAW query string, because the decode is the pure
+//! module's job and doing it twice changes what a link means (see
+//! [`url_signals`]).
 
 use leptos::prelude::*;
 use leptos_router::NavigateOptions;
 use leptos_router::hooks::{use_location, use_navigate};
 
-pub use crate::query_merge::{Filter, FilterOp, QUICK_RANGES, RangeSpec, effective_query};
-pub use crate::search_url::{Mode, build_search_url};
+pub use crate::query_merge::{Filter, FilterOp, QUICK_RANGES, RangeSpec};
+pub use crate::search_url::{Mode, build_search_url, mode_query};
 
 use crate::search_url::{
     Malformed, Reason, Repair, Verdict, admit_search, decode_filters, decode_range, first_value,

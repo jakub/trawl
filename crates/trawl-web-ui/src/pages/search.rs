@@ -19,9 +19,13 @@
 //! State split:
 //! - `query_text` — in-progress editor buffer (not URL-synced).
 //! - `executed_q` / `filters` / `range` — URL-driven memos (canonical).
-//! - `effective_q` — derived from the triple; what actually hits the
-//!   server. Filter chips in the scope strip and the date-range popover
-//!   mutate state by navigating; URL drives memos drives resource.
+//! - `effective_q` — derived from the triple AND the mode; what actually
+//!   hits the server. A snapshot folds the range in, a live stream never
+//!   does (ADR-0027, amended 2026-09-21), and `mode_query` is the one
+//!   place that decides. `export_q` is its always-snapshot twin, because a
+//!   download from a live page is still asking for the URL's range.
+//!   Filter chips in the scope strip and the date-range popover mutate
+//!   state by navigating; URL drives memos drives resource.
 //! - `draft_dirty` — the console header's own comparison of the two.
 //!   It reads both and writes neither, so saying "unsent changes"
 //!   cannot itself become a navigation (ADR-0027).
@@ -61,8 +65,7 @@ use crate::result_actions::sorted_page;
 use crate::search_status::{CountSource, FooterCount, StatusInputs, StatusKind, search_status};
 use crate::search_url::{PAGE_SIZE, Param, admit_filters, refusal_copy};
 use crate::state::query::{
-    Filter, Mode, UrlSignals, effective_query, navigator, replace_navigator, report_refusal,
-    url_signals,
+    Filter, Mode, UrlSignals, mode_query, navigator, replace_navigator, report_refusal, url_signals,
 };
 use crate::state::search_session::rows_resource;
 use fleet_ui::overlay::use_overlay_layer;
@@ -178,14 +181,17 @@ pub fn Search() -> impl IntoView {
     // this slice; what it shows is not.
     let unreadable = Signal::derive(move || malformed.with(Option::is_some));
 
+    // The DSL this MODE runs. A snapshot folds the URL's range in; a live
+    // stream never does (ADR-0027, amended 2026-09-21): the stream lane
+    // evaluates `last=` per event against the server clock, so a folded
+    // range silently dropped every event older than the window while the
+    // page still said Live. `mode.get()` is read here, not outside: the
+    // mode flip alone is what changes this value when q, f and r all stand.
     let effective_q = Memo::new(move |_| {
         if unreadable.get() {
             return String::new();
         }
-        let base = executed_q.get();
-        let fs = filters.get();
-        let r = range.get();
-        effective_query(&base, &fs, &r)
+        mode_query(mode.get(), &executed_q.get(), &filters.get(), &range.get())
     });
 
     // Whether the stream, not the snapshot resource, is the active
@@ -198,7 +204,8 @@ pub fn Search() -> impl IntoView {
     // no `/api/v1/query` leaves the page behind a stream, and every
     // reader of `rows` below reads the "no query yet" placeholder
     // instead of the page the previous mode left behind. `effective_q`
-    // still drives the stream, the export modal and the notice.
+    // still drives the stream and the notice; the export modal reads
+    // `export_q`, which is the snapshot DSL in either mode.
     let snapshot_q = Memo::new(move |_| {
         if live.get() {
             String::new()
@@ -753,6 +760,22 @@ pub fn Search() -> impl IntoView {
         }
         save_query.set(Some(query_text.get_untracked()));
     });
+    // Export is a bounded one-shot download, never the stream, so it runs
+    // the snapshot DSL in BOTH modes: the range the URL carries is exactly
+    // what a download from a live page is asking for, and a range-free
+    // export would pull the whole corpus into a file, the door ADR-0027's
+    // empty-query rule guards.
+    let export_q = Memo::new(move |_| {
+        if unreadable.get() {
+            return String::new();
+        }
+        mode_query(
+            Mode::Snapshot,
+            &executed_q.get(),
+            &filters.get(),
+            &range.get(),
+        )
+    });
     let show_export_modal = RwSignal::new(false);
     let on_export = Callback::new(move |()| {
         if unreadable.get_untracked() {
@@ -1141,7 +1164,7 @@ pub fn Search() -> impl IntoView {
         })}
         <Show when=move || show_export_modal.get()>
             <ExportModal
-                query=effective_q.get_untracked()
+                query=export_q.get_untracked()
                 on_close=Callback::new(move |_| show_export_modal.set(false))
             />
         </Show>

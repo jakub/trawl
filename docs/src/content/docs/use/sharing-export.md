@@ -33,8 +33,10 @@ for the sender.
 2. Select **Export** and check the query in the dialog.
 3. Choose **CSV**, **JSON**, or **Parquet** and download.
 
-Export runs the effective query again, so the file can differ from the screen
-if events arrived in between. Set a fixed range and a `head` limit when the
+Export runs the query again as a bounded snapshot, with your filters and the
+range a snapshot applies. A time clause in the query text still replaces a
+quick range. This applies in live mode too. The file can differ from the
+screen if events arrived in between. Set a fixed range and a `head` limit when the
 file must stay bounded. The export row limit can differ from the query limit.
 A failed download is not a complete dataset.
 

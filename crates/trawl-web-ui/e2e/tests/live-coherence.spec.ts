@@ -14,7 +14,7 @@
 // pushes (so Back returns to the stream), and the snapshot resource is
 // gated on the mode (so live posts no query at all).
 
-import { test, expect, resetScenario, capturedQueryCount } from '../fixtures';
+import { test, expect, resetScenario, capturedQueryCount, lastCapturedQuery } from '../fixtures';
 import { SEL, COPY } from '../selectors';
 
 type Pg = import('@playwright/test').Page;
@@ -134,6 +134,67 @@ test('live posts no snapshot query, from page load through the whole burst', asy
   await expect(page.locator(SEL.scopeExecution)).toHaveCount(0);
   await expect(page.locator(SEL.scopeStarted)).toHaveCount(0);
   expect(await capturedQueryCount(request)).toBe(0);
+});
+
+// The two tests below are about the REQUEST the page builds, not the
+// events that come back. The stub never evaluates the DSL: `stream-burst`
+// writes its 6,000 events whatever the query asks for, so a stream still
+// carrying `last=15m` would look identical on screen here. What they read
+// is the `query` parameter on the wire and the DSL the snapshot runs on
+// either side of it. That the server then DELIVERS under a range-free
+// query is issue #232's real-stack check, which no stub can answer.
+
+test('the live stream carries the query with no range, and Stop live returns to the ranged snapshot', async ({ page, request }) => {
+  await resetScenario(request, 'stream-burst');
+  // Collected in the browser rather than at the stub, because the claim
+  // is about what the page ASKED for — including a second ask the stub
+  // would happily serve.
+  const streamUrls: string[] = [];
+  page.on('request', r => {
+    if (new URL(r.url()).pathname === '/api/v1/stream') streamUrls.push(r.url());
+  });
+  const opened = page.waitForRequest(r => new URL(r.url()).pathname === '/api/v1/stream');
+
+  await page.goto('/search?q=service%3Dnginx&mode=live');
+  // Equality, not merely "no last=": a stream that folded the range in
+  // under some other spelling would still pass an absence check.
+  expect(new URL((await opened).url()).searchParams.get('query')).toBe('service=nginx');
+
+  await burstArrived(page);
+  expect(streamUrls).toHaveLength(1);
+  expect(await capturedQueryCount(request)).toBe(0);
+
+  // The range never went anywhere: it is what the snapshot on the way
+  // out runs, which is the whole reason `r` stays in the URL while live.
+  await page.locator(SEL.stopLive).click();
+  expect((await lastCapturedQuery(request, 1)).query).toBe('last=15m service=nginx');
+  await expect(page).not.toHaveURL(/mode=live/);
+  expect(new URL(page.url()).searchParams.get('mode')).toBeNull();
+});
+
+test('entering live from the range dialog keeps r=1h out of the stream and back in the snapshot', async ({ page, request }) => {
+  await resetScenario(request, 'stream-burst');
+  await page.goto(`/search?q=service%3Dnginx&r=${RANGE}`);
+  expect((await lastCapturedQuery(request, 1)).query).toBe(`last=${RANGE} service=nginx`);
+
+  const opened = page.waitForRequest(r => new URL(r.url()).pathname === '/api/v1/stream');
+  await page.locator(SEL.dateRangeTrigger).click();
+  await page.locator(SEL.realtimeTab).click();
+  await page.locator(SEL.liveTailButton).click();
+
+  // The router writes the URL through an effect, so wait for it rather
+  // than reading whichever tick `page.url()` is answering from.
+  await page.waitForURL(url => url.searchParams.get('mode') === 'live');
+  expect(new URL(page.url()).searchParams.get('r')).toBe(RANGE);
+  expect(new URL((await opened).url()).searchParams.get('query')).toBe('service=nginx');
+
+  await burstArrived(page);
+  await page.locator(SEL.stopLive).click();
+  expect((await lastCapturedQuery(request, 2)).query).toBe(`last=${RANGE} service=nginx`);
+  await expect(page).not.toHaveURL(/mode=live/);
+  const url = new URL(page.url());
+  expect(url.searchParams.get('r')).toBe(RANGE);
+  expect(url.searchParams.get('mode')).toBeNull();
 });
 
 test('the burst footer counts what the ring accepted, survives a drop, and restarts on retry', async ({ page, request }) => {

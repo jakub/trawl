@@ -2,7 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Pure-Rust merge logic for `(base_q, filters, range)` → effective DSL.
+//! Pure-Rust merge logic for `(base_q, filters[, range])` → the DSL that
+//! runs. Two faces over one merge: [`effective_query`] folds the range in
+//! for a snapshot, [`live_query`] leaves it out for a live stream
+//! (ADR-0027 as amended 2026-09-21).
 //!
 //! Kept ungated (no leptos / js-sys / wasm) so it compiles on native and
 //! its tests run under plain `cargo test` / `cargo nextest`. The wasm-only
@@ -46,9 +49,11 @@ pub struct Filter {
     pub op: FilterOp,
 }
 
-/// Range window driven by the date-range popover. Merged into the wire
-/// query at request time unless the user's base query already carries a
-/// `last=`, `earliest=`, or `latest=` clause (user intent wins).
+/// Range window driven by the date-range popover. Merged into a SNAPSHOT
+/// wire query at request time unless the user's base query already carries
+/// a `last=`, `earliest=`, or `latest=` clause (user intent wins). A live
+/// stream merges no range at all (ADR-0027 as amended 2026-09-21), so it
+/// never reaches [`live_query`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RangeSpec {
     /// Relative window: `5m|15m|1h|4h|24h|7d`. Emitted as `last=<label>`.
@@ -67,7 +72,7 @@ impl Default for RangeSpec {
 /// Quick-range presets offered by the date-range popover.
 pub const QUICK_RANGES: &[&str] = &["5m", "15m", "1h", "4h", "24h", "7d"];
 
-/// Merge `(base_q, filters, range)` into the DSL string that actually runs.
+/// Merge `(base_q, filters, range)` into the DSL a SNAPSHOT runs.
 ///
 /// Rules:
 /// - empty `base_q` → empty result (filters/range no-op without a query to
@@ -81,6 +86,22 @@ pub const QUICK_RANGES: &[&str] = &["5m", "15m", "1h", "4h", "24h", "7d"];
 ///   preceding the filter + range clauses.
 #[must_use]
 pub fn effective_query(base_q: &str, filters: &[Filter], range: &RangeSpec) -> String {
+    merge(base_q, filters, Some(range))
+}
+
+/// Merge `(base_q, filters)` into the DSL a LIVE stream runs: the query
+/// text and the filter clauses, and no range clause at all (ADR-0027 as
+/// amended 2026-09-21). A `last=`/`earliest=`/`latest=` the reader typed
+/// into `base_q` is part of the query and is carried through untouched.
+#[must_use]
+pub fn live_query(base_q: &str, filters: &[Filter]) -> String {
+    merge(base_q, filters, None)
+}
+
+/// The one merge both faces run. Everything but the range clause is
+/// shared: an absent `range` is the only difference between the DSL a
+/// live stream runs and the DSL a snapshot runs.
+fn merge(base_q: &str, filters: &[Filter], range: Option<&RangeSpec>) -> String {
     let trimmed = base_q.trim();
     if trimmed.is_empty() {
         return String::new();
@@ -104,9 +125,11 @@ pub fn effective_query(base_q: &str, filters: &[Filter], range: &RangeSpec) -> S
     }
 
     let range_clause = match range {
-        RangeSpec::Quick(q) if !has_time => Some(format!("last={q}")),
-        RangeSpec::Absolute { from, to } => Some(format_absolute_range(from, to)),
-        RangeSpec::Quick(_) => None, // suppressed by an existing time clause
+        Some(RangeSpec::Quick(q)) if !has_time => Some(format!("last={q}")),
+        Some(RangeSpec::Absolute { from, to }) => Some(format_absolute_range(from, to)),
+        // suppressed by an existing time clause, or a live stream that
+        // carries no range in the first place
+        Some(RangeSpec::Quick(_)) | None => None,
     };
     if let Some(clause) = range_clause {
         if !prefix.is_empty() {
@@ -706,5 +729,72 @@ mod tests {
         let clauses = find_time_clauses(r#"earliest="2026-01-01T00:00:00Z\" x" service=web"#);
         assert_eq!(clauses.len(), 1);
         assert_eq!(clauses[0].value, r#"2026-01-01T00:00:00Z" x"#);
+    }
+
+    /// A live stream carries the query text and nothing the popover
+    /// picked: the stream lane evaluates a `last=` per event against the
+    /// server clock, so a folded range drops every event older than the
+    /// window while the page still says Live.
+    #[test]
+    fn live_query_merges_no_range() {
+        assert_eq!(live_query("_severity=error", &[]), "_severity=error");
+        assert_eq!(
+            effective_query("_severity=error", &[], &quick("15m")),
+            "last=15m _severity=error",
+        );
+    }
+
+    #[test]
+    fn live_query_folds_filters_in_written_order() {
+        assert_eq!(
+            live_query(
+                "_severity=error",
+                &[inc("host", "web-01"), exc("source", "auth.log")],
+            ),
+            "host=\"web-01\" source!=\"auth.log\" _severity=error",
+        );
+        // …through the same escaper and the same DSL name renderer
+        assert_eq!(
+            live_query("*", &[inc("x-forwarded-for", "10.0.0.1")]),
+            "`x-forwarded-for`=\"10.0.0.1\" *",
+        );
+        assert_eq!(
+            live_query("*", &[inc("msg", "he said \"hi\"")]),
+            "msg=\"he said \\\"hi\\\"\" *",
+        );
+    }
+
+    /// A time clause the reader typed is part of the query, not the
+    /// range, so it survives into the stream untouched. The ADR names
+    /// all three keywords.
+    #[test]
+    fn a_typed_time_clause_survives_into_the_live_query() {
+        for base in [
+            "last=1h service=web",
+            r#"earliest="2026-01-01T00:00:00Z" service=web"#,
+            r#"latest="2026-01-02T00:00:00Z" service=web"#,
+        ] {
+            assert_eq!(live_query(base, &[]), base, "{base}");
+        }
+    }
+
+    /// The stream-start effect refuses to open on an empty query, and
+    /// reads this function's answer to decide.
+    #[test]
+    fn live_query_on_an_empty_base_is_empty() {
+        assert_eq!(live_query("", &[inc("host", "web-01")]), "");
+        assert_eq!(live_query("   ", &[]), "");
+    }
+
+    #[test]
+    fn live_query_gives_a_pipeline_only_base_a_search_stage() {
+        assert_eq!(
+            live_query("| stats count() by host", &[]),
+            "* | stats count() by host",
+        );
+        assert_eq!(
+            live_query("| stats count() by host", &[inc("host", "web-01")]),
+            "host=\"web-01\" | stats count() by host",
+        );
     }
 }

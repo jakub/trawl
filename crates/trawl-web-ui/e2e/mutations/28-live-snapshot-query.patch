@@ -1,10 +1,10 @@
 diff --git a/crates/trawl-web-ui/src/pages/search.rs b/crates/trawl-web-ui/src/pages/search.rs
 --- a/crates/trawl-web-ui/src/pages/search.rs
 +++ b/crates/trawl-web-ui/src/pages/search.rs
-@@ -199,13 +199,7 @@ pub fn Search() -> impl IntoView {
-     // reader of `rows` below reads the "no query yet" placeholder
+@@ -206,13 +206,7 @@ pub fn Search() -> impl IntoView {
      // instead of the page the previous mode left behind. `effective_q`
-     // still drives the stream, the export modal and the notice.
+     // still drives the stream and the notice; the export modal reads
+     // `export_q`, which is the snapshot DSL in either mode.
 -    let snapshot_q = Memo::new(move |_| {
 -        if live.get() {
 -            String::new()

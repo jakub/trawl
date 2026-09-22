@@ -42,10 +42,10 @@ impl std::ops::Deref for ExecutedResponse {
 /// Build a Leptos `LocalResource` that runs `api::query(q, plan)` whenever
 /// the effective-query or fetch-plan signals change.
 ///
-/// Callers should feed an "effective" query (base DSL + filters + range
-/// merged via `state::query::effective_query`), not the user's raw editor
-/// buffer. The resource doesn't care where the string came from — it just
-/// re-fires on value changes.
+/// Callers should feed the DSL the snapshot runs, not the user's raw editor
+/// buffer: `search_url::mode_query` with `Mode::Snapshot`, which is the base
+/// DSL with the filters and the range merged in. The resource doesn't care
+/// where the string came from — it just re-fires on value changes.
 ///
 /// The request is the plan, not the page (ADR-0037): an aggregation's
 /// plan is `Whole` on every page, so turning a page under one leaves
