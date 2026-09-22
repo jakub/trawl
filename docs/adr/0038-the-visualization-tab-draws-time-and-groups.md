@@ -34,7 +34,7 @@ with the count the server measured, whatever the type.
 web UI sends `timezone: None` and the server defaults the offset to zero
 (`crates/trawl-web-ui/src/api/mod.rs:422`,
 `crates/trawl-server/src/handlers.rs:116-121`), so a snapshot `_time` is
-UTC wall clock without a suffix and a live `_time` is RFC 3339 with `Z`.
+UTC wall clock without a suffix and a live `_time` is RFC 3339 with a zero offset.
 The chart parses exactly those two forms, strictly, and refuses any other
 text in `_time`. The axis is labelled `UTC` and its ticks print the digits
 the Events table prints. uPlot gets `utc: true` so the browser does not
