@@ -63,7 +63,11 @@ cadence from the data and the response carries no new field. With the
 span known, the chart lays a grid from the earliest to the latest
 returned bucket, at most 20,000 instants, and a (bucket, series) with no
 row is a null drawn as a gap, never a zero. Above 20,000 instants the
-chart refuses and says so.
+chart refuses and says so. A snapshot timechart that runs as a rust
+stage after `extract kv` is bucketed by the same resolver with the same
+`last=` filter, so its buckets match the SQL lane's and the chart's; only
+the live stream resolves with no filter, because a stream has no past
+window.
 
 **More than six series draws the six largest by total over the fetched
 rows, with a caption under the chart that names what was left out.** The
