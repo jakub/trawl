@@ -542,6 +542,33 @@ mod tests {
         insta::assert_snapshot!(terminal.backend().to_string());
     }
 
+    /// A validation error's one detail has no span and restates the
+    /// message, so the pane renders exactly what it renders with no
+    /// details at all: the message once, and no stray detail line.
+    #[test]
+    fn a_spanless_detail_renders_like_no_details() {
+        let render = |details: Vec<trawl_client::ErrorDetail>| {
+            let mut app = test_app();
+            app.tab.editor.insert_text("* | stats countt(x) by host");
+            app.tab.status = TabStatus::Error {
+                message: "unknown function: countt (did you mean 'count'?)".to_owned(),
+                details,
+            };
+            let backend = TestBackend::new(80, 24);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|f| super::render(&mut app, f)).unwrap();
+            terminal.backend().to_string()
+        };
+        let spanless = render(vec![trawl_client::ErrorDetail {
+            message: "unknown function: countt".to_owned(),
+            span: None,
+            label: None,
+            hint: Some("did you mean 'count'?".to_owned()),
+        }]);
+        assert_eq!(spanless, render(Vec::new()));
+        assert!(!spanless.contains("hint"));
+    }
+
     #[test]
     fn render_with_help_popup() {
         let mut app = test_app();

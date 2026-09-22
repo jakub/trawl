@@ -262,9 +262,25 @@ impl IntoResponse for ServerError {
                     },
                 )
             }
+            // The summary keeps the whole sentence, hint included, for a
+            // client that reads only `message`. The one detail carries the
+            // sentence and the hint apart, so a client that renders details
+            // shows the hint once. No span: the emitter knows which
+            // function is wrong but not where it sits in the text, and a
+            // span over the whole query would put a caret under everything
+            // (ADR-0039).
             Self::Engine(EngineError::Emit(e)) => (
                 StatusCode::BAD_REQUEST,
-                ErrorEnvelope::simple(ErrorCode::ValidationError, e.to_string()),
+                ErrorEnvelope {
+                    code: ErrorCode::ValidationError,
+                    message: e.to_string(),
+                    details: vec![trawl_api::ErrorDetail {
+                        message: e.message(),
+                        span: None,
+                        label: None,
+                        hint: e.hint(),
+                    }],
+                },
             ),
             // The engine proved the query wrong by asking `DuckDB` a
             // question of its own, which makes it the caller's mistake
@@ -472,6 +488,99 @@ mod tests {
             assert_eq!(body["error"]["message"], "authentication failed");
             assert!(!String::from_utf8_lossy(&bytes).contains("private-"));
         }
+    }
+
+    /// Parse and emit a query the emitter refuses, and read the envelope
+    /// the server answers with.
+    async fn emit_refusal(query: &str) -> (StatusCode, serde_json::Value) {
+        let parsed = trawl_core::parser::parse(query).expect("the query parses");
+        let err = trawl_core::emitter::emit(
+            &parsed,
+            "/data/**/*.parquet",
+            trawl_core::context::EvalContext::capture(),
+        )
+        .expect_err("the emitter refuses the query");
+        let response = ServerError::Engine(EngineError::Emit(err)).into_response();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    /// A validation error carries one spanless detail: the sentence and
+    /// the did-you-mean apart, so a client shows the hint once. The
+    /// summary `message` is the sentence it always was, hint included.
+    #[tokio::test]
+    async fn an_unknown_function_with_a_near_miss_details_its_message_and_hint() {
+        let (status, body) = emit_refusal("* | stats countt(x) by host").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let error = &body["error"];
+        assert_eq!(error["code"], "validation_error");
+        assert_eq!(
+            error["message"],
+            "unknown function: countt (did you mean 'count'?)"
+        );
+        let details = error["details"].as_array().expect("details is an array");
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0]["message"], "unknown function: countt");
+        assert_eq!(details[0]["hint"], "did you mean 'count'?");
+        assert!(
+            details[0]
+                .get("span")
+                .is_none_or(serde_json::Value::is_null)
+        );
+        assert!(
+            details[0]
+                .get("label")
+                .is_none_or(serde_json::Value::is_null)
+        );
+    }
+
+    /// With no suggestion within reach the detail still carries the
+    /// sentence, and no hint.
+    #[tokio::test]
+    async fn an_unknown_function_without_a_near_miss_details_only_its_message() {
+        let (status, body) = emit_refusal("* | stats nosuchfunc(x) by host").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let error = &body["error"];
+        assert_eq!(error["code"], "validation_error");
+        assert_eq!(error["message"], "unknown function: nosuchfunc");
+        let details = error["details"].as_array().expect("details is an array");
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0]["message"], "unknown function: nosuchfunc");
+        assert!(
+            details[0]
+                .get("hint")
+                .is_none_or(serde_json::Value::is_null)
+        );
+        assert!(
+            details[0]
+                .get("span")
+                .is_none_or(serde_json::Value::is_null)
+        );
+    }
+
+    /// A refusal from `DuckDB`'s own verdict stays a bare summary: the
+    /// engine's sentence names no function the client could point at.
+    #[tokio::test]
+    async fn a_refused_query_keeps_an_empty_details_list() {
+        let response = ServerError::Engine(EngineError::Refused {
+            message: "no such column".into(),
+        })
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["code"], "validation_error");
+        assert_eq!(body["error"]["message"], "no such column");
+        assert!(
+            body["error"]
+                .get("details")
+                .is_none_or(|d| d.as_array().is_some_and(Vec::is_empty))
+        );
     }
 
     #[test]

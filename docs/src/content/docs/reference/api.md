@@ -65,7 +65,7 @@ Every error that trawld itself produces has this body:
 |-------|------|-------------|
 | `code` | string | One of the codes below |
 | `message` | string | Human-readable summary |
-| `details` | array | Present only for `parse_error`. Each entry has `message`, a `span` of byte offsets into the query text, and optional `label` and `hint`. |
+| `details` | array | Present for `parse_error` and `validation_error`. Each entry has `message` and optional `span`, `label` and `hint`. A `span` holds byte offsets into the query text. A `parse_error` entry always has one. A `validation_error` entry has none, and a `validation_error` that trawld finds only while it runs the query, such as a `timechart` over a column that is not a timestamp, has no entries. |
 
 | Code | Status | Meaning |
 |------|--------|---------|
