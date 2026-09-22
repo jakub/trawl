@@ -39,7 +39,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use trawl_core::parser::suggest::quote_dsl_field;
 
 use crate::filter_codec::{self, PayloadError};
-use crate::query_merge::{Filter, FilterOp, QUICK_RANGES, RangeSpec};
+use crate::query_merge::{Filter, FilterOp, QUICK_RANGES, RangeSpec, effective_query, live_query};
 
 /// Rows per page for the snapshot results table. Lives here because the
 /// page parameter's overflow check is part of the URL contract; `api`
@@ -169,6 +169,22 @@ impl Mode {
             Self::Snapshot => None,
             Self::Live => Some("live"),
         }
+    }
+}
+
+/// The DSL one mode actually runs.
+///
+/// The ONE place either DSL is produced. A snapshot folds the range in;
+/// a live stream never does — the `r` the URL carries while live is the
+/// range Stop live returns to, not a window on the stream (ADR-0027 as
+/// amended 2026-09-21). `range` is taken in both arms on purpose: the
+/// caller hands over the URL's range and this function decides, so no
+/// caller can decide it differently.
+#[must_use]
+pub fn mode_query(mode: Mode, base_q: &str, filters: &[Filter], range: &RangeSpec) -> String {
+    match mode {
+        Mode::Snapshot => effective_query(base_q, filters, range),
+        Mode::Live => live_query(base_q, filters),
     }
 }
 
@@ -1212,6 +1228,46 @@ pub fn parse_page(raw: &str) -> Verdict<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One case per mode the page can be in: a live stream runs the
+    /// query text and the chips and no range, whatever `r` the URL
+    /// carries; a snapshot folds `r` in (ADR-0027 as amended
+    /// 2026-09-21).
+    #[test]
+    fn mode_query_selects_the_dsl_each_mode_runs() {
+        let q = "service=nginx";
+        assert_eq!(
+            mode_query(Mode::Live, q, &[], &RangeSpec::default()),
+            "service=nginx"
+        );
+        assert_eq!(
+            mode_query(Mode::Snapshot, q, &[], &RangeSpec::default()),
+            "last=15m service=nginx"
+        );
+        let abs = RangeSpec::Absolute {
+            from: "2026-01-01T00:00:00Z".into(),
+            to: "now".into(),
+        };
+        assert_eq!(mode_query(Mode::Live, q, &[], &abs), "service=nginx");
+        let f = [Filter {
+            field: "host".into(),
+            value: "web-01".into(),
+            op: FilterOp::Include,
+        }];
+        assert_eq!(
+            mode_query(Mode::Live, q, &f, &RangeSpec::default()),
+            "host=\"web-01\" service=nginx"
+        );
+        assert_eq!(
+            mode_query(
+                Mode::Live,
+                "last=1h service=nginx",
+                &[],
+                &RangeSpec::default()
+            ),
+            "last=1h service=nginx"
+        );
+    }
 
     #[test]
     fn dialog_range_admission_keeps_app_policy_and_canonical_bounds() {
