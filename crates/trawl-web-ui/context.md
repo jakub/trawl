@@ -51,11 +51,11 @@ Snapshot (a one-shot query, paged by the server for events and in the browser fo
 _Avoid_: view, tab, pause
 
 **Query error**:
-A snapshot or live submission the server refused as a parse or validation failure. It renders in the results region on both results tabs as a notice quoting the server's message and, for each detail with a span, an excerpt of the query as sent with a caret under the span. It offers no Retry. Any other failure is a load error and keeps its Retry.
+A snapshot the server refused as a parse or validation failure. It renders in the results region on both results tabs as a notice quoting the server's message and, for each detail with a span, an excerpt of the query as sent with a caret under the span. It offers no Retry. Any other failure is a load error and keeps its Retry. In live the browser cannot read why a stream closed, so only one live case is a query error: a stream that closed before it opened, on text the local parser also refuses. That notice carries the local parser's errors on the sent text under a lead saying the stream did not start. A live validation error, or any stream that opened, keeps the generic unavailable copy and its Retry.
 _Avoid_: 400, bad request, syntax banner
 
 **Draft diagnostic**:
-What the local parser says about the editor buffer while you type: the gutter marker and the visible line under the editor that carries the first message in full, with the rest behind a disclosure. Advisory only: it never blocks Haul and never speaks for the server.
+What the local parser says about the editor buffer while you type: the gutter marker, named "Query syntax error", and the visible line under the editor that carries the first message in full as `Line L:C — message`, with the rest behind a `+N more` disclosure that any edit closes. Advisory only: it never blocks Haul and never speaks for the server.
 _Avoid_: lint, squiggle (that is one rendering of it), validation
 
 **Live ring**:

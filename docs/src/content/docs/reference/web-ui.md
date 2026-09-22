@@ -133,6 +133,45 @@ A live stream has no page count and no incomplete-results notice. See
 [sharing and export](/use/sharing-export/) for the choice between a link, a
 saved query, and a file.
 
+### Query errors
+
+Two sources report a wrong query, and neither speaks for the other.
+
+The **draft diagnostic** is the browser's own parser reading the editor text
+as you type. The first error appears in full on a line under the editor, as
+`Line 1:35 — found 'h', expected …`. When the text has more errors, a
+**+N more** disclosure under that line lists them. It starts closed and closes
+again when the text changes. A red marker in the editor gutter marks each line
+with an error. Screen readers name the marker "Query syntax error". F8 moves the
+cursor to the next error. The draft diagnostic never blocks **Haul**.
+
+The **query error notice** is the server's answer to a query it refused as a
+parse error or a validation error. It replaces the table on **Events** and the
+chart on **Visualization**. Its first line reads `Couldn't run the query:`
+followed by the server's message, with any hint after an em dash. Under a
+**Query sent to server** label, it quotes the query text the server received,
+with a caret under the part the error names. That text includes the range and
+filters folded into the query, so it can differ from the editor text. A
+multi-line query shows only the line with the error, numbered. When the server
+reports more than one error, the first line counts them and each error gets
+its own message and excerpt, in the server's order. A validation error, such
+as an unknown function, names no position and shows no excerpt. The notice
+has no **Retry**: sending the same text again gets the same answer.
+
+For every other failure, **Events** shows `Couldn't load results:` with the
+server's message or status, and a **Retry** button. **Visualization** shows
+**Snapshot query failed. Open Events for the query error.** with **Retry
+snapshot**.
+
+In live mode the browser cannot read why the server refused a stream. When a
+stream closes before it opens and the browser's parser also rejects the text
+it sent, the notice reads `Couldn't start the live stream. The query has a
+syntax error:` followed by the parser's message and excerpt, with no
+**Retry**. Any other live failure, including a validation error and a stream
+that closes after it opened, shows **Live stream unavailable. Retry or switch to
+Snapshot.** with **Retry live stream**. See
+[ADR-0039](https://github.com/jakub/trawl/blob/main/docs/adr/0039-query-errors-server-verdict-on-the-sent-text-local-marks-on-the-draft.md).
+
 ### Result presentations
 
 The results area has these presentations:
