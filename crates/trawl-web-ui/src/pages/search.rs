@@ -1264,7 +1264,7 @@ pub fn Search() -> impl IntoView {
                                         />
                                     }.into_any()
                                 }
-                                Some(Err(_)) => view! { <div class="results-empty"><p role="alert">"Snapshot query failed. Open Events for the query error."</p><button type="button" class="btn-sec" on:click=move |_| rerun_request()>"Retry snapshot"</button></div> }.into_any(),
+                                Some(Err(_)) => view! { <div class="results-empty"><p role="alert">"Snapshot query failed. Open Events for the error."</p><button type="button" class="btn-sec" on:click=move |_| rerun_request()>"Retry snapshot"</button></div> }.into_any(),
                                 None => view! { <p class="results-empty">"Run a query to visualize its snapshot."</p> }.into_any(),
                             }
                         };

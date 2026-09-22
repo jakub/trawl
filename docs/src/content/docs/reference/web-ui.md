@@ -160,7 +160,7 @@ has no **Retry**: sending the same text again gets the same answer.
 
 For every other failure, **Events** shows `Couldn't load results:` with the
 server's message or status, and a **Retry** button. **Visualization** shows
-**Snapshot query failed. Open Events for the query error.** with **Retry
+**Snapshot query failed. Open Events for the error.** with **Retry
 snapshot**.
 
 In live mode the browser cannot read why the server refused a stream. When a
