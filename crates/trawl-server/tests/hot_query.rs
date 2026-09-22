@@ -719,8 +719,8 @@ async fn pinned_where_let_hot_cold_and_stream_agree() {
         let ast = trawl_core::parser::parse(dsl).expect("parses");
         let pins = catalog.all();
         let filter = CompiledFilter::compile(&ast.search, &pins).expect("filter compiles");
-        let plan =
-            compile_stream_plan(&ast.pipeline, &PinScope::root(&pins)).expect("plan compiles");
+        let plan = compile_stream_plan(&ast.pipeline, &PinScope::root(&pins), None)
+            .expect("plan compiles");
         let StreamPlan::PassThrough(mut stages) = plan else {
             panic!("pass-through pipelines only in this test");
         };

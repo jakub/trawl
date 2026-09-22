@@ -13,7 +13,7 @@
 //! the streaming engine's per-event transforms and aggregation machinery.
 
 use indexmap::IndexSet;
-use trawl_core::ast::{PipeStage, SortDirection, Spanned};
+use trawl_core::ast::{PipeStage, SortDirection, Spanned, TrawlDuration};
 use trawl_core::context::EvalContext;
 use trawl_core::eval::EvalValue;
 use trawl_core::pin_scope::PinScope;
@@ -39,11 +39,20 @@ use crate::value::{Column, QueryResult, land_u64};
 /// post-stage — evaluates under this one instant, because the tail is
 /// part of one unit of output with the SQL prefix that bound it. Nothing
 /// here samples a clock.
+///
+/// `last` is the query's `last=` window (`ast.search.time_filter`). A
+/// `timechart` in the tail with no `span=` picks its automatic bucket
+/// width from it, through the resolver the SQL emitter uses for the same
+/// stage (ADR-0038), so `last=4h | extract kv | timechart count()` cuts
+/// the five-minute buckets the same query without the kv split cuts in
+/// SQL — and that the web chart lays its grid with — rather than the
+/// live stream's one-minute default.
 pub fn apply_rust_stages(
     result: QueryResult,
     stages: &[Spanned<PipeStage>],
     pins: &PinScope,
     anchor: EvalContext,
+    last: Option<TrawlDuration>,
 ) -> Result<QueryResult, EngineError> {
     if stages.is_empty() {
         return Ok(result);
@@ -59,7 +68,7 @@ pub fn apply_rust_stages(
         .cloned()
         .partition(|s| !matches!(s.node, PipeStage::Sort(_)));
 
-    let plan = stream::compile_stream_plan(&plan_stages, pins).map_err(|e| {
+    let plan = stream::compile_stream_plan(&plan_stages, pins, last).map_err(|e| {
         EngineError::Emit(trawl_core::emitter::EmitError::UnsupportedOperation {
             message: format!("post-processing: {e}"),
         })
@@ -427,7 +436,7 @@ fn rust_tail_sort_orders_large_unsigned_exactly() {
             .into(),
     );
 
-    let sorted = apply_rust_stages(result, &tail, &PinScope::unpinned(), anchor)
+    let sorted = apply_rust_stages(result, &tail, &PinScope::unpinned(), anchor, None)
         .expect("the tail runs a bare sort over a kv split");
 
     assert_eq!(
@@ -470,7 +479,7 @@ fn timechart_on_refused_in_batch_tail() {
             .into(),
     );
 
-    let err = apply_rust_stages(result, &tail, &PinScope::unpinned(), anchor)
+    let err = apply_rust_stages(result, &tail, &PinScope::unpinned(), anchor, None)
         .expect_err("a bucket column other than _time has no meaning in the tail");
     match err {
         EngineError::Emit(trawl_core::emitter::EmitError::UnsupportedOperation { message }) => {
@@ -486,6 +495,65 @@ fn timechart_on_refused_in_batch_tail() {
         }
         other => panic!("expected the 400-class refusal, got {other:?}"),
     }
+}
+
+/// A `timechart` with no `span=` in the tail cuts its buckets from the
+/// query's `last=` window, as the SQL emitter would for the same stage:
+/// `last=4h` is the five-minute band, so two rows a minute apart share a
+/// bucket that the live default of one minute would split.
+#[cfg(test)]
+#[test]
+fn tail_timechart_span_follows_the_query_window() {
+    use crate::value::Value;
+
+    let query =
+        trawl_core::parser::parse("last=4h | extract kv | timechart count()").expect("dsl parses");
+    let tail = &query.pipeline;
+    let last = query.search.time_filter.as_ref().map(|tf| tf.node.duration);
+    let rows = || QueryResult {
+        columns: vec![
+            Column {
+                name: "_time".to_string(),
+            },
+            Column {
+                name: "message".to_string(),
+            },
+        ],
+        rows: vec![
+            vec![
+                Value::String("2026-01-01T00:01:00+00:00".into()),
+                Value::String("k=v".into()),
+            ],
+            vec![
+                Value::String("2026-01-01T00:02:00+00:00".into()),
+                Value::String("k=v".into()),
+            ],
+        ],
+    };
+    let anchor = || {
+        EvalContext::at(
+            chrono::DateTime::parse_from_rfc3339("2026-01-01T00:10:00Z")
+                .expect("a valid RFC 3339 instant")
+                .into(),
+        )
+    };
+
+    let windowed = apply_rust_stages(rows(), tail, &PinScope::unpinned(), anchor(), last)
+        .expect("the tail runs a timechart over a kv split");
+    let time = |out: &QueryResult, row: usize| {
+        let idx = out.columns.iter().position(|c| c.name == "_time").unwrap();
+        out.rows[row][idx].clone()
+    };
+    assert_eq!(windowed.rows.len(), 1, "{:?}", windowed.rows);
+    assert_eq!(
+        time(&windowed, 0),
+        Value::String("2026-01-01T00:00:00+00:00".into())
+    );
+
+    // The live answer for the same stages: no window, one-minute buckets.
+    let live = apply_rust_stages(rows(), tail, &PinScope::unpinned(), anchor(), None)
+        .expect("the tail runs a timechart over a kv split");
+    assert_eq!(live.rows.len(), 2, "{:?}", live.rows);
 }
 
 #[cfg(test)]
@@ -592,6 +660,7 @@ mod tests {
             &stages,
             &PinScope::unpinned(),
             EvalContext::capture(),
+            None,
         )
         .unwrap();
         assert_eq!(out.columns.len(), 3); // message, user, status
@@ -640,6 +709,7 @@ mod tests {
             &stages,
             &PinScope::unpinned(),
             EvalContext::capture(),
+            None,
         )
         .unwrap();
         assert_eq!(out.rows.len(), 1);
@@ -690,6 +760,7 @@ mod tests {
             &stages,
             &PinScope::unpinned(),
             EvalContext::capture(),
+            None,
         )
         .unwrap();
         let col_idx = |name: &str| out.columns.iter().position(|c| c.name == name).unwrap();
@@ -731,6 +802,7 @@ mod tests {
             &stages,
             &PinScope::unpinned(),
             EvalContext::capture(),
+            None,
         )
         .unwrap();
         assert_eq!(out.rows.len(), 2);
@@ -775,6 +847,7 @@ mod tests {
             &stages,
             &PinScope::unpinned(),
             EvalContext::capture(),
+            None,
         )
         .unwrap();
         let col_idx = |name: &str| out.columns.iter().position(|c| c.name == name).unwrap();
@@ -809,6 +882,7 @@ mod tests {
             &stages,
             &PinScope::unpinned(),
             EvalContext::capture(),
+            None,
         )
         .unwrap();
         let col_idx = |name: &str| out.columns.iter().position(|c| c.name == name).unwrap();
@@ -842,6 +916,7 @@ mod tests {
             &stages,
             &PinScope::unpinned(),
             EvalContext::capture(),
+            None,
         )
         .unwrap();
         let col_idx = |name: &str| out.columns.iter().position(|c| c.name == name).unwrap();
@@ -876,6 +951,7 @@ mod tests {
             &stages,
             &PinScope::unpinned(),
             EvalContext::capture(),
+            None,
         )
         .unwrap();
         assert!(out.is_empty());

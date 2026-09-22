@@ -431,3 +431,55 @@ fn a_post_stage_limit_caps_the_kv_tails_one_snapshot() {
         "the kv split may not change the row count"
     );
 }
+
+/// A `timechart` in the kv tail cuts the buckets the SQL emitter cuts for
+/// the same query: `last=4h` is the five-minute band in both, so the tail
+/// and the split-free query return the same bucket, not a one-minute
+/// grid the chart would then lay on a five-minute lattice (ADR-0038).
+#[test]
+fn the_kv_tail_timechart_cuts_the_buckets_the_sql_lane_cuts() {
+    use chrono::{DateTime, Utc};
+
+    // Two events in the same five-minute bucket but different minutes,
+    // both safely inside `last=4h` and in the past.
+    let now = Utc::now().timestamp();
+    let floor = now - now.rem_euclid(300);
+    let bucket = floor - 300;
+    let event = |secs: i64| {
+        format!(
+            r#"{{"_time":"{}","message":"k=v","service":"nginx"}}"#,
+            DateTime::from_timestamp(secs, 0).unwrap().to_rfc3339()
+        )
+    };
+    let (_dir, glob) = source(&[&event(bucket + 60), &event(bucket + 120)]);
+    let exec = Executor::new().unwrap();
+
+    // A `_time` cell as epoch seconds, in either lane's spelling: the
+    // tail writes RFC 3339, the SQL lane a zoneless wall clock.
+    let instant = |cell: &Value| -> i64 {
+        let Value::String(text) = cell else {
+            panic!("_time must be text: {cell:?}");
+        };
+        DateTime::parse_from_rfc3339(text)
+            .map(|dt| dt.timestamp())
+            .or_else(|_| {
+                chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f")
+                    .map(|naive| naive.and_utc().timestamp())
+            })
+            .unwrap_or_else(|e| panic!("_time {text:?} did not parse: {e}"))
+    };
+
+    let with_tail = run(
+        &exec,
+        "last=4h | extract kv from message | timechart count()",
+        &glob,
+    );
+    assert_eq!(with_tail.rows.len(), 1, "{:?}", with_tail.rows);
+    assert_eq!(instant(cell(&with_tail, 0, "_time")), bucket);
+    assert_eq!(cell(&with_tail, 0, "count"), &Value::Integer(2));
+
+    let without_tail = run(&exec, "last=4h | timechart count()", &glob);
+    assert_eq!(without_tail.rows.len(), 1, "{:?}", without_tail.rows);
+    assert_eq!(instant(cell(&without_tail, 0, "_time")), bucket);
+    assert_eq!(cell(&without_tail, 0, "count"), &Value::Integer(2));
+}

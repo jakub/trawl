@@ -3420,6 +3420,7 @@ pub async fn stream_query(
     let stream_plan = trawl_core::stream::compile_stream_plan(
         &ast.pipeline,
         &trawl_core::pin_scope::PinScope::root(&pin_snapshot),
+        None,
     )
     .map_err(|e| ServerError::BadRequest(e.to_string()))?;
 

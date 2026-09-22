@@ -305,6 +305,7 @@ impl Executor {
                 &emitted.rust_stages,
                 &emitted.rust_stage_pins,
                 emitted.anchor,
+                ast.search.time_filter.as_ref().map(|tf| tf.node.duration),
             )?;
             let tracked = tail_timestamp_scope(&timestamp_columns, &emitted.rust_stages);
             shift_timestamp_columns(&mut result, &tracked, utc_offset_secs);
@@ -418,6 +419,7 @@ impl Executor {
                 &emitted.rust_stages,
                 &emitted.rust_stage_pins,
                 emitted.anchor,
+                ast.search.time_filter.as_ref().map(|tf| tf.node.duration),
             )?;
             let tracked = tail_timestamp_scope(&timestamp_columns, &emitted.rust_stages);
             shift_timestamp_columns(&mut result, &tracked, utc_offset_secs);

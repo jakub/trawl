@@ -147,7 +147,8 @@ fn run_pipeline_cell(
 ) -> bool {
     let query = parser::parse(dsl).expect("dsl parses");
 
-    let plan = compile_stream_plan(&query.pipeline, &PinScope::root(ft)).expect("plan compiles");
+    let plan =
+        compile_stream_plan(&query.pipeline, &PinScope::root(ft), None).expect("plan compiles");
     let StreamPlan::PassThrough(mut stages) = plan else {
         panic!("{dsl:?} must compile to a per-event plan");
     };
@@ -214,7 +215,8 @@ fn run_let_cell(
     let query = parser::parse(dsl).expect("dsl parses");
 
     // live lane: compile the plan under the catalog root and apply it.
-    let plan = compile_stream_plan(&query.pipeline, &PinScope::root(ft)).expect("plan compiles");
+    let plan =
+        compile_stream_plan(&query.pipeline, &PinScope::root(ft), None).expect("plan compiles");
     let StreamPlan::PassThrough(mut stages) = plan else {
         panic!("{dsl:?} must compile to a per-event plan");
     };
@@ -1203,7 +1205,7 @@ fn live_rows(
     field_types: &FieldTypes,
     dsl: &str,
 ) -> Vec<Map<String, Value>> {
-    let plan = compile_stream_plan(&query.pipeline, &PinScope::root(field_types))
+    let plan = compile_stream_plan(&query.pipeline, &PinScope::root(field_types), None)
         .unwrap_or_else(|error| panic!("{dsl}: plan must compile: {error}"));
     // One anchor for the whole lane comparison (ADR-0017 §3): these
     // cases are about pins, so the clock is held still.
@@ -1327,7 +1329,7 @@ fn sev_subject_refuses_an_unknown_token_in_both_lanes() {
             trawl_core::context::EvalContext::capture(),
         )
         .expect_err("batch must refuse");
-        let stream_err = compile_stream_plan(&query.pipeline, &PinScope::unpinned())
+        let stream_err = compile_stream_plan(&query.pipeline, &PinScope::unpinned(), None)
             .expect_err("live must refuse");
         assert!(
             emit_err.to_string().contains("unknown severity value"),

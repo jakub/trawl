@@ -123,7 +123,7 @@ fn both_lanes_refuse_a_collision_with_the_identical_sentence() {
             "{dsl}: SQL lane sentence drifted: {sql_err}"
         );
 
-        let stream_err = compile_stream_plan(&pipeline, &PinScope::unpinned())
+        let stream_err = compile_stream_plan(&pipeline, &PinScope::unpinned(), None)
             .expect_err(&format!("{dsl}: the stream lane must refuse it"))
             .to_string();
         assert_eq!(
@@ -150,7 +150,7 @@ fn eventstats_without_an_alias_is_refused_in_both_lanes() {
         .to_string();
     assert!(sql_err.contains(&message), "{sql_err}");
 
-    let stream_err = compile_stream_plan(&pipeline, &PinScope::unpinned())
+    let stream_err = compile_stream_plan(&pipeline, &PinScope::unpinned(), None)
         .expect_err("the stream lane must refuse it")
         .to_string();
     assert_eq!(stream_err, message);
@@ -168,7 +168,7 @@ fn the_shared_check_precedes_the_stream_lanes_own_refusals() {
     ] {
         let pipeline = stages(dsl);
         let message = check_projection(&pipeline[0].node).expect_err("refused");
-        let stream_err = compile_stream_plan(&pipeline, &PinScope::unpinned())
+        let stream_err = compile_stream_plan(&pipeline, &PinScope::unpinned(), None)
             .expect_err("the stream lane must refuse it")
             .to_string();
         assert_eq!(stream_err, message, "{dsl}");
@@ -192,7 +192,7 @@ fn clean_projections_stay_clean_in_both_lanes() {
         assert!(validate_pipeline(&pipeline).is_ok(), "{dsl}: SQL lane");
         // The stream lane may still refuse the stage (pivot, eventstats,
         // sort), but never for a projection collision.
-        if let Err(err) = compile_stream_plan(&pipeline, &PinScope::unpinned()) {
+        if let Err(err) = compile_stream_plan(&pipeline, &PinScope::unpinned(), None) {
             let text = err.to_string();
             assert!(
                 text.contains("not supported in streaming mode"),
