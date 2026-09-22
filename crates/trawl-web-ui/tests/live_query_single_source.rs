@@ -4,12 +4,14 @@
 
 //! Regression guard for ADR-0027 as amended 2026-09-21: a live stream
 //! carries no range. `search_url::mode_query` is the ONE place either
-//! DSL is produced, so the three shell source trees the guard walks,
-//! `pages`, `components` and `state`, never name `effective_query` or
-//! `live_query` themselves. A component that reached for one of them
-//! directly could fold the popover's range into a stream again, and the
-//! stream lane would drop every event older than that window while the
-//! page still said Live.
+//! DSL is produced, so nothing else under `src` names `effective_query`
+//! or `live_query`: not the pages, components and state that make up the
+//! wasm shell, and not a crate-root helper a component could call
+//! instead. Only the two pure modules that define and dispatch them are
+//! allowed to. A caller that reached for one of them directly could fold
+//! the popover's range into a stream again, and the stream lane would
+//! drop every event older than that window while the page still said
+//! Live.
 //!
 //! Line comments are dropped first, so prose about the merge is still
 //! allowed to name the functions it describes. Nothing else is: a
@@ -24,19 +26,19 @@ use std::path::{Path, PathBuf};
 /// The DSL producers only `mode_query` may call.
 const FORBIDDEN: &[&str] = &["effective_query", "live_query"];
 
-/// Source trees that make up the wasm shell.
-const SHELL_DIRS: &[&str] = &["pages", "components", "state"];
+/// The two pure modules allowed to name them: the one that defines the
+/// producers and the one that owns `Mode` and dispatches on it.
+const ALLOWED: &[&str] = &["src/query_merge.rs", "src/search_url.rs"];
 
 #[test]
 fn the_shell_reaches_a_dsl_only_through_mode_query() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut offenders = Vec::new();
-    let files = shell_files();
+    let files = source_files();
     assert!(
         files.len() > 10,
-        "only {} files found under {:?} — the walk is looking in the wrong place",
+        "only {} files found under src — the walk is looking in the wrong place",
         files.len(),
-        SHELL_DIRS,
     );
     for path in files {
         let rel = path
@@ -44,6 +46,9 @@ fn the_shell_reaches_a_dsl_only_through_mode_query() {
             .unwrap_or(&path)
             .to_string_lossy()
             .into_owned();
+        if ALLOWED.contains(&rel.as_str()) {
+            continue;
+        }
         let src = comment_stripped(
             &fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {rel}: {e}")),
         );
@@ -56,7 +61,7 @@ fn the_shell_reaches_a_dsl_only_through_mode_query() {
 
     assert!(
         offenders.is_empty(),
-        "the wasm shell produces a DSL itself instead of asking \
+        "a module produces a DSL itself instead of asking \
          `search_url::mode_query` which one this mode runs (ADR-0027, \
          amended 2026-09-21): {}",
         offenders.join(", "),
@@ -97,19 +102,16 @@ fn a_call_is_never_hidden_by_what_precedes_it() {
     }
 }
 
-/// Every `.rs` file under the shell's source trees, sorted so a failure
-/// reads the same way twice.
-fn shell_files() -> Vec<PathBuf> {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+/// Every `.rs` file under `src`, sorted so a failure reads the same way
+/// twice.
+fn source_files() -> Vec<PathBuf> {
     let mut out = Vec::new();
-    for dir in SHELL_DIRS {
-        collect(&src.join(dir), &mut out);
-    }
+    collect(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut out);
     out.sort();
     out
 }
 
-/// Recursive half of [`shell_files`].
+/// Recursive half of [`source_files`].
 fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in fs::read_dir(dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display())) {
         let path = entry.expect("a readable directory entry").path();
