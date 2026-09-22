@@ -1694,6 +1694,15 @@ fn make_group_key(group_by: &[String], event: &Row) -> GroupKey {
 
 /// The span bucket an event lands in.
 ///
+/// `_time` reaches this lane as text in two spellings: the ingest wire
+/// string (RFC 3339) on a live stream, and `DuckDB`'s zoneless UTC
+/// timestamp text (`YYYY-MM-DD HH:MM:SS[.ffffff]`) from the SQL prefix
+/// on the batch tail behind `extract kv`, which renders at offset zero
+/// and shifts for display only after the tail. Both are read through
+/// [`crate::compare::conformed_timestamp`], the mirror of the conform a
+/// stored `_time` gets, so this lane buckets an event where the SQL lane
+/// would.
+///
 /// The fallback for a row with no readable `_time` is `now()`, and
 /// `now()` here is the event's context, the same instant its filter
 /// window and its `| where` read. Sampling a clock of its own would
@@ -1707,9 +1716,9 @@ fn event_time_bucket(event: &Row, span_secs: u64, ctx: &EvalContext) -> i64 {
     // cannot mint a reserved one, so a trawl-written row has no case
     // variant to bind.
     if let Some(EvalValue::Str(ts)) = event.get("_time")
-        && let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts)
+        && let Some(crate::compare::Instant::At(at)) = crate::compare::conformed_timestamp(ts)
     {
-        return dt.timestamp() / span_secs as i64;
+        return at.and_utc().timestamp() / span_secs as i64;
     }
     // Fallback: the context's instant, never a fresh clock read.
     ctx.now_utc().timestamp() / span_secs as i64
@@ -2077,6 +2086,14 @@ mod tests {
             .timestamp()
             / i64::try_from(span).unwrap();
         assert_eq!(bucket, expected);
+
+        // The batch tail behind `extract kv` receives the SQL prefix's
+        // `_time` as DuckDB's zoneless UTC text, with or without a
+        // fraction; the same instant lands in the same bucket.
+        for text in ["2026-01-15 09:07:00", "2026-01-15 09:07:00.25"] {
+            let ev = event(&json!({"_time": text, "service": "nginx"}));
+            assert_eq!(event_time_bucket(&ev, span, &ctx()), expected, "{text}");
+        }
 
         // …and an event with no `_time` falls back to the context's
         // instant, a different bucket — the failure mode the assertion
