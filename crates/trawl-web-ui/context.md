@@ -79,12 +79,20 @@ What the Events tab renders for an aggregation-shaped result: the group and metr
 _Avoid_: aggregate table, stats table, summary
 
 **Categorical chart**:
-The bar-per-group companion beside the exact table, drawn for the one shape it can state exactly — one group column and one numeric metric — with the value printed on every bar. It draws the bars the table beside it shows, and scales them against the whole fetched result, so a value's bar is the same length on every page. Any other aggregate shape shows the table alone.
-_Avoid_: bar chart (unqualified), visualization (that is the other tab)
+The bar-per-group companion beside the exact table on the Events tab, drawn for the one shape it can state exactly — one group column and one numeric metric — with the value printed on every bar. It draws the bars the table beside it shows, and scales them against the whole fetched result, so a value's bar is the same length on every page. Any other aggregate shape shows the table alone.
+_Avoid_: bar chart (unqualified), visualization (that is the other tab), Column, Bar (those are chart types)
 
 **Visualization**:
-The results tab that draws an ungrouped `timechart` snapshot as a line chart, and a live aggregation as it updates. It draws the whole result or nothing: an aggregation snapshot is fetched whole, up to 20,000 rows, and a response that is not the whole result is refused with the count the server measured, never drawn in part. It has no pager, because the chart of one page is a different picture from the chart of the result.
+The results tab that draws a whole aggregation result, snapshot or live, as the selected chart type. It draws the whole result or nothing: an aggregation snapshot is fetched whole, up to 20,000 rows, and a response that is not the whole result is refused with the count the server measured, never drawn in part. It has no pager, because the chart of one page is a different picture from the chart of the result. Every refusal names the fix or opens Events.
 _Avoid_: chart (unqualified; the categorical chart is the other one), graph, plot
+
+**Chart type**:
+One of Line, Column, or Bar, picked by a control on the Visualization tab and kept for the session, never in the search URL. Line draws a `timechart` on a UTC time axis; Column and Bar draw a `stats … by` as one bar per group, upright or rotated. The default follows the result's shape, and a type that does not fit the result is shown disabled.
+_Avoid_: chart mode, view, renderer
+
+**Series**:
+One line on a Line chart: a metric column of an ungrouped `timechart`, or one group value of a grouped one, labelled by its group values joined with ` · `. A bucket with no row for a series is a gap, never a zero. The chart draws at most six, the largest by total, and a caption under it names how many it left out.
+_Avoid_: line (that is the chart type), trace, group (a group value names a series; the series is the line)
 
 **Count**:
 The Events tab shows rows on screen. For an aggregation that is the rows fetched, and the pager under the exact table names the slice on screen. The footer names its source: Last (rows the last snapshot returned), Received (events delivered since the stream opened), Updates (aggregation frames since the stream opened).

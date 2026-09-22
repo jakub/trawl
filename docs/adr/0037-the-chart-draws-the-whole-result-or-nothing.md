@@ -1,7 +1,9 @@
 # The chart draws the whole result or nothing: an aggregation snapshot is fetched whole, paged in the browser, and the response names its total
 
 status: accepted (2026-09-20) — prep ruling record for the Visualization
-pagination defect
+pagination defect. Amended 2026-09-21 by ADR-0038: the chart's x axis is
+now the bucket instant, and grouped results draw. The coverage rule and
+its place last in the ladder are unchanged.
 
 `api::query` sends `limit: PAGE_SIZE` with `offset: page * PAGE_SIZE` for
 every snapshot query (`crates/trawl-web-ui/src/api/mod.rs:408-417`), and
@@ -78,8 +80,10 @@ exist. The `Truncated` badge (`pages/search.rs:891`) and the
 **Coverage is read from the response, and the chart is where it is
 enforced.** A chart draws only when `offset == 0 && returned == total`.
 The rung sits after the existing shape ladder in `chart_hint`, so a
-grouped or lossy result keeps the refusal that tells the operator
-something actionable. Above the ceiling the chart does not draw and says
+result the ladder refuses for its shape keeps the refusal that tells the
+operator something actionable. *Amended 2026-09-21 (ADR-0038): a grouped
+result is no longer a shape the ladder refuses; the rung still comes
+last.* Above the ceiling the chart does not draw and says
 so with the number the server measured; a complete 20,000-row result
 does draw.
 
