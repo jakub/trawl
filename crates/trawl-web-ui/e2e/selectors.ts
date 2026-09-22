@@ -348,6 +348,12 @@ export const SEL = {
   /// header's draft marker, rendered only when the buffer differs from
   /// the executed query. It navigates nothing.
   draftState: '.console-hd .draft',
+  /// crates/trawl-web-ui/src/components/editor_wrap.rs DraftDiagnosticLine
+  /// — the local parser's verdict on the buffer, under the editor row:
+  /// the first error as a visible line, the rest behind a disclosure.
+  draftDiagnostic: '.editor-wrap .draft-diagnostic',
+  draftDiagnosticFirst: '.draft-diagnostic .draft-diagnostic-first',
+  draftDiagnosticMore: '.draft-diagnostic details.draft-diagnostic-more',
   /// crates/trawl-web-ui/src/pages/search.rs — the reading-mode
   /// disclosure in the result header. A button, so it is the thing that
   /// opens the popover and the thing `aria-expanded` rides.
@@ -521,6 +527,9 @@ export const COPY = {
   /// crates/trawl-web-ui/src/components/editor_wrap.rs — the console
   /// header marks an editor buffer that differs from the executed query.
   draftDirty: 'Edited',
+  /// crates/trawl-web-ui/vendor/src/codemirror.ts LINT_MARKER_NAME — the
+  /// accessible name of every lint gutter marker.
+  lintMarkerName: 'Query syntax error',
   /// crates/trawl-web-ui/src/components/editor_wrap.rs — the visible
   /// names of two of the three editor tools. Both say what they act on,
   /// since "Save" and "Share" named neither the net nor the URL.

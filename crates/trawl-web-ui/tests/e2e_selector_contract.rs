@@ -66,6 +66,7 @@ const SEARCH_INPUT_RS: &str = include_str!("../../fleet-ui/src/search_input.rs")
 const SEGMENTED_COMPONENT_RS: &str = include_str!("../../fleet-ui/src/segmented/component.rs");
 const SCHEDULE_EDIT_RS: &str = include_str!("../src/schedule_edit.rs");
 const API_ERROR_RS: &str = include_str!("../src/api_error.rs");
+const CODEMIRROR_TS: &str = include_str!("../vendor/src/codemirror.ts");
 
 /// One (assignment, source file, hook) triple: `assignment` is the full
 /// `key: 'value',` line as it appears in `selectors.ts`, and `hook` must
@@ -1895,6 +1896,36 @@ const CONTRACTS: &[Contract] = &[
         source_path: "src/api_error.rs",
         source: API_ERROR_RS,
         hook: "#[error(\"server returned {0}\")]",
+    },
+    Contract {
+        assignment: "draftDiagnostic: '.editor-wrap .draft-diagnostic',",
+        source_path: "src/components/editor_wrap.rs",
+        source: EDITOR_WRAP_RS,
+        hook: "<DraftDiagnosticLine query=query/>",
+    },
+    Contract {
+        assignment: "draftDiagnostic: '.editor-wrap .draft-diagnostic',",
+        source_path: "src/components/editor_wrap.rs",
+        source: EDITOR_WRAP_RS,
+        hook: "class=\"draft-diagnostic\"",
+    },
+    Contract {
+        assignment: "draftDiagnosticFirst: '.draft-diagnostic .draft-diagnostic-first',",
+        source_path: "src/components/editor_wrap.rs",
+        source: EDITOR_WRAP_RS,
+        hook: "class=\"draft-diagnostic-first\"",
+    },
+    Contract {
+        assignment: "draftDiagnosticMore: '.draft-diagnostic details.draft-diagnostic-more',",
+        source_path: "src/components/editor_wrap.rs",
+        source: EDITOR_WRAP_RS,
+        hook: "<details class=\"draft-diagnostic-more\"",
+    },
+    Contract {
+        assignment: "lintMarkerName: 'Query syntax error',",
+        source_path: "vendor/src/codemirror.ts",
+        source: CODEMIRROR_TS,
+        hook: "const LINT_MARKER_NAME = \"Query syntax error\";",
     },
     // -- the DSL shapes the stub dispatches on --------------------------
     // `e2e_wire_fixture_contract.rs` proves these against the builders by
