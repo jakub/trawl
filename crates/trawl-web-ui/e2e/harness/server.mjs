@@ -53,6 +53,8 @@ import {
   scheduleNetRunsResponse,
   pagedRunResultResponse,
   aggregateTimechartResponse,
+  aggregateGroupedTimechartResponse,
+  aggregatePivotResponse,
   aggregateStatsByResponse,
   unavailableRunResponse,
 } from './fixtures.mjs';
@@ -191,7 +193,9 @@ function hasCorpus() {
 // Only the `aggregate` scenario reads these. `total` is the count the
 // execution produced before any window was cut from it: `null` means the
 // generated rows ARE the whole result, which is the ordinary case.
-const aggregate = { buckets: 12, groups: 5, total: null };
+// `hosts` is how many series a `by`-grouped timechart carries, so a
+// grouped request answers `buckets` × `hosts` rows.
+const aggregate = { buckets: 12, groups: 5, hosts: 2, total: null };
 
 // Only the pagination scenario uses these counts and held reads.
 const pagination = {
@@ -288,7 +292,7 @@ function resetState() {
     holdHistoryOffset: null, held: null, history: [], runs: [], completed: [],
     holdQueryNumber: null, heldQuery: null,
   });
-  Object.assign(aggregate, { buckets: 12, groups: 5, total: null });
+  Object.assign(aggregate, { buckets: 12, groups: 5, hosts: 2, total: null });
   healthHits = {};
   cancelRequests = [];
   dashboard.hold = false;
@@ -491,7 +495,7 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
         }
       }
       if (scenario === 'aggregate' && parsed.aggregate) {
-        for (const key of ['buckets', 'groups', 'total']) {
+        for (const key of ['buckets', 'groups', 'hosts', 'total']) {
           if (key in parsed.aggregate) aggregate[key] = parsed.aggregate[key];
         }
       }
@@ -781,7 +785,17 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
         const limit = parsedBody.limit ?? 50;
         const offset = parsedBody.offset ?? 0;
         if (dsl.includes('| timechart')) {
-          sendJson(res, 200, aggregateTimechartResponse(aggregate.buckets, aggregate.total, offset, limit));
+          // A `by` on the timechart is a different shape, not a
+          // different size: answering it with the ungrouped rows would
+          // hand the chart a response its own query says has a group
+          // column.
+          sendJson(res, 200, / by \w/.test(dsl)
+            ? aggregateGroupedTimechartResponse(aggregate.buckets, aggregate.hosts, aggregate.total, offset, limit)
+            : aggregateTimechartResponse(aggregate.buckets, aggregate.total, offset, limit));
+          return;
+        }
+        if (dsl.includes('| pivot')) {
+          sendJson(res, 200, aggregatePivotResponse(aggregate.groups, aggregate.total, offset, limit));
           return;
         }
         if (dsl.includes('| stats count() by')) {
