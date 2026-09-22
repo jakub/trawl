@@ -607,6 +607,34 @@
  * content. */
 .editor-row { display: flex; gap: 10px; align-items: stretch; }
 
+/* Draft diagnostic: the local parser's verdict on the buffer, under the
+ * editor row. A sentence, like the draft state, in the error tone. It
+ * wraps and is never ellipsized: the whole message is the point. */
+.draft-diagnostic {
+  margin-top: 6px;
+  font-family: var(--font-ui);
+  font-size: var(--fs-dense);
+  line-height: 1.45;
+  color: var(--ink-2);
+}
+.draft-diagnostic-first {
+  margin: 0;
+  color: var(--red);
+  overflow-wrap: anywhere;
+}
+.draft-diagnostic-more { margin-top: 2px; }
+.draft-diagnostic-more > summary {
+  cursor: pointer;
+  width: fit-content;
+  color: var(--ink-3);
+}
+.draft-diagnostic-more > summary:hover { color: var(--ink); }
+.draft-diagnostic-more ul {
+  margin: 2px 0 0;
+  padding-left: 18px;
+}
+.draft-diagnostic-more li { overflow-wrap: anywhere; }
+
 /* Editor mount — a well that grows with its document from three lines
  * to 40vh; past that the CodeMirror scroller scrolls. The view defaults
  * to auto-height, so the clamp lives here: `max-height` on the mount and

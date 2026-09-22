@@ -282,13 +282,6 @@ pub fn local_details(errors: &[trawl_core::parser::ParseError]) -> Vec<ErrorDeta
 
 /// The draft diagnostic: the local parser's verdict on the draft, as
 /// visible text under the editor.
-#[cfg_attr(
-    target_arch = "wasm32",
-    expect(
-        dead_code,
-        reason = "the editor's draft diagnostic line (#233) is its first reader; drop this then"
-    )
-)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DraftDiagnostic {
     /// The first error, in full.
@@ -299,13 +292,6 @@ pub struct DraftDiagnostic {
 
 /// Parse `doc` locally and describe each error as `Line L:C — message`,
 /// with the hint joined on. `None` when the draft parses.
-#[cfg_attr(
-    target_arch = "wasm32",
-    expect(
-        dead_code,
-        reason = "the editor's draft diagnostic line (#233) is its first reader; drop this then"
-    )
-)]
 #[must_use]
 pub fn draft_diagnostic(doc: &str) -> Option<DraftDiagnostic> {
     let errors = trawl_core::parser::parse(doc).err()?;
