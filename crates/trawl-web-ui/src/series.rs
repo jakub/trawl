@@ -8,11 +8,12 @@
 //! [`align_series`] turns a `timechart` result into one x vector of
 //! bucket instants and one y vector per series, every y the same length
 //! as x, with a `None` wherever a (bucket, series) has no row. The roles
-//! come from the executed query — which columns are `by` fields and
-//! which are metrics — never from cell types, the same way
-//! [`crate::categorical`] reads a `stats … by`. [`cat_points`] is the
-//! ordinal-axis twin for a categorical shape that module already
-//! detected.
+//! come from the executed query — the `by` fields are the group columns
+//! and every other non-`_time` column is a metric — never from cell
+//! types, the same way [`crate::categorical`] reads a `stats … by`. The
+//! bucket width comes from the query too, through the [`Lane`] that
+//! produced the result. [`cat_points`] is the ordinal-axis twin for a
+//! categorical shape that module already detected.
 //!
 //! At the crate root rather than under `components/`, which is
 //! wasm-gated, so the ladder is tested on native
@@ -33,8 +34,8 @@ use std::collections::{BTreeSet, HashMap};
 use trawl_api::display::value_to_string;
 use trawl_api::value::{QueryResult, Value};
 use trawl_core::ast::{PipeStage, TimechartStage};
-use trawl_core::projection::agg_output_name;
 use trawl_core::schema::{TIME, catalog_key};
+use trawl_core::timechart::{query_span, resolve_span};
 
 use crate::categorical::CatShape;
 use crate::histogram::days_from_civil;
@@ -255,6 +256,21 @@ fn days_in_month(year: i64, month: i64) -> i64 {
     }
 }
 
+/// Which execution produced a result, and so which bucket width it was
+/// cut with.
+///
+/// The snapshot emitter resolves the automatic span from the query's
+/// `last=` filter; the live compiler has no filter and always resolves as
+/// if there were none (`resolve_span(span, None)`). A live
+/// `last=4h | timechart count()` is therefore bucketed at one minute,
+/// and aligning it on the five-minute grid the snapshot would use would
+/// scatter its rows as off-lattice instants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lane {
+    Snapshot,
+    Live,
+}
+
 /// Align a `timechart` result on its bucket grid, or say why it cannot
 /// be drawn as lines.
 ///
@@ -264,11 +280,18 @@ fn days_in_month(year: i64, month: i64) -> i64 {
 /// identically — because the grid is the sorted set of instants and the
 /// legend is sorted by label.
 ///
+/// Memory is bounded by the cap, not by the result: every group is read
+/// into a sparse map first, and a dense `xs.len()` vector is allocated
+/// only for the [`SERIES_CAP`] groups that survive ranking. Twenty
+/// thousand rows in twenty thousand groups over twenty thousand instants
+/// is twenty thousand small maps and six dense vectors, not 400 million
+/// cells.
+///
 /// # Errors
 ///
 /// A [`Refusal`] naming the rung of the ladder that stopped the draw.
 #[allow(clippy::too_many_lines)]
-pub fn align_series(query: &str, result: &QueryResult) -> Result<SeriesSet, Refusal> {
+pub fn align_series(query: &str, result: &QueryResult, lane: Lane) -> Result<SeriesSet, Refusal> {
     // A query that does not parse cannot have produced this result; it
     // has no time axis anyone can read off it.
     let ast = trawl_core::parser::parse(query).map_err(|_| Refusal::NoTime)?;
@@ -307,27 +330,13 @@ pub fn align_series(query: &str, result: &QueryResult) -> Result<SeriesSet, Refu
         }
     }
 
-    // Metrics: the aggregation output names the stage declares, when the
-    // response still carries any of them; otherwise every column that is
-    // neither `_time` nor a group, which is what a later `rename` leaves.
-    let others: Vec<usize> = (0..names.len())
+    // Metrics: every column that is neither `_time` nor a group. Not the
+    // names the stage declares — a later `rename` may have changed any
+    // of them, and a metric that lost its declared name is still the
+    // number the reader asked for.
+    let metric_cols: Vec<usize> = (0..names.len())
         .filter(|ci| *ci != time_col && !group_cols.contains(ci))
         .collect();
-    let declared: Vec<String> = tc
-        .aggregations
-        .iter()
-        .map(|a| catalog_key(&agg_output_name(a)))
-        .collect();
-    let declared_present: Vec<usize> = others
-        .iter()
-        .copied()
-        .filter(|ci| declared.contains(&names[*ci]))
-        .collect();
-    let metric_cols = if declared_present.is_empty() {
-        others
-    } else {
-        declared_present
-    };
 
     if metric_cols.is_empty() {
         return Err(Refusal::NoMetric);
@@ -339,9 +348,12 @@ pub fn align_series(query: &str, result: &QueryResult) -> Result<SeriesSet, Refu
         return Err(Refusal::Empty);
     }
 
-    let span = trawl_core::timechart::query_span(&ast)
-        .map_or(60, |d| d.to_seconds())
-        .max(1);
+    // The width the lane's executor cut the buckets with (see `Lane`).
+    let span = match lane {
+        Lane::Snapshot => query_span(&ast).map_or(60, |d| d.to_seconds()),
+        Lane::Live => resolve_span(tc.span, None).to_seconds(),
+    }
+    .max(1);
     let span = i64::try_from(span).unwrap_or(i64::MAX);
 
     // Pass 1: every `_time` cell, so that an unreadable one refuses
@@ -383,102 +395,136 @@ pub fn align_series(query: &str, result: &QueryResult) -> Result<SeriesSet, Refu
     let xs: Vec<i64> = grid.into_iter().collect();
     let slot: HashMap<i64, usize> = xs.iter().enumerate().map(|(i, t)| (*t, i)).collect();
 
-    // Pass 2: fill. Ungrouped: one series per metric column, named by the
-    // column. Grouped: one per distinct group tuple, labelled as the
-    // table prints the cells, joined with " · " in `by` order.
-    let mut labels: Vec<String> = Vec::new();
-    let mut index: HashMap<String, usize> = HashMap::new();
-    let mut cells: Vec<Vec<Option<f64>>> = Vec::new();
-    let mut series_of = |label: String| -> usize {
-        *index.entry(label.clone()).or_insert_with(|| {
-            labels.push(label);
-            cells.push(vec![None; xs.len()]);
-            cells.len() - 1
-        })
-    };
-    // Resolve every row's series before filling, so the closure's
-    // borrows end before the labels are read back for a refusal.
-    let mut placements: Vec<(usize, usize, usize)> = Vec::new(); // (series, slot, metric column)
-    let mut row_of: Vec<usize> = Vec::new();
-    let metric_names: Vec<&str> = metric_cols
-        .iter()
-        .map(|ci| result.columns[*ci].name.as_str())
-        .collect();
-    for (ri, (row, instant)) in result.rows.iter().zip(&instants).enumerate() {
+    // Pass 2: sparse fill. Ungrouped: one series per metric column, keyed
+    // and named by the column. Grouped: one per distinct group TUPLE —
+    // the key is the vector of rendered cells, never their joined label,
+    // so `("a · b", "c")` and `("a", "b · c")` stay two series even
+    // though they print alike. Every (slot, series) visit is recorded
+    // whether or not the cell holds a number, so two null rows on one
+    // bucket are a duplicate too.
+    let mut series: Vec<Sparse> = Vec::new();
+    let mut index: HashMap<Vec<String>, usize> = HashMap::new();
+    for (row, instant) in result.rows.iter().zip(&instants) {
         let x = slot[instant];
         if group_cols.is_empty() {
-            for (ci, name) in metric_cols.iter().zip(&metric_names) {
-                let si = series_of((*name).to_owned());
-                placements.push((si, x, *ci));
-                row_of.push(ri);
+            for ci in &metric_cols {
+                let name = result.columns[*ci].name.clone();
+                let si = series_index(&mut index, &mut series, vec![name.clone()], name);
+                series[si].visit(x, row.get(*ci), || value_to_string(&row[time_col]))?;
             }
         } else {
-            let label = group_cols
+            let key: Vec<String> = group_cols
                 .iter()
                 .map(|ci| value_to_string(row.get(*ci).unwrap_or(&Value::Null)))
-                .collect::<Vec<_>>()
-                .join(" · ");
-            let si = series_of(label);
-            placements.push((si, x, metric_cols[0]));
-            row_of.push(ri);
+                .collect();
+            let label = key.join(" · ");
+            let si = series_index(&mut index, &mut series, key, label);
+            series[si].visit(x, row.get(metric_cols[0]), || {
+                value_to_string(&row[time_col])
+            })?;
         }
-    }
-    for ((si, x, ci), ri) in placements.into_iter().zip(row_of) {
-        let row = &result.rows[ri];
-        place(
-            &mut cells[si][x],
-            row.get(ci),
-            || value_to_string(&row[time_col]),
-            &labels[si],
-        )?;
     }
 
     // Rank by total descending, ties by label, keep the cap, then order
     // the survivors by label so the legend is stable across refreshes.
-    let total_series = labels.len();
-    let mut ranked: Vec<(String, Vec<Option<f64>>)> = labels.into_iter().zip(cells).collect();
-    ranked.sort_by(|(la, va), (lb, vb)| total(vb).total_cmp(&total(va)).then_with(|| la.cmp(lb)));
-    ranked.truncate(SERIES_CAP);
-    ranked.sort_by(|(la, _), (lb, _)| la.cmp(lb));
+    // Only the survivors are made dense.
+    let total_series = series.len();
+    series.sort_by(|a, b| {
+        b.total
+            .total_cmp(&a.total)
+            .then_with(|| a.label.cmp(&b.label))
+    });
+    series.truncate(SERIES_CAP);
+    series.sort_by(|a, b| a.label.cmp(&b.label));
+    let series = series
+        .into_iter()
+        .map(|Sparse { label, points, .. }| (label, dense(points, xs.len())))
+        .collect();
 
     #[allow(clippy::cast_precision_loss)]
     // epoch seconds fit in 2^53 for the next 285 million years
     let xs = xs.into_iter().map(|t| t as f64).collect();
     Ok(SeriesSet {
         xs,
-        series: ranked,
+        series,
         total_series,
         group_fields,
     })
 }
 
-/// Write one metric cell into its grid slot, refusing a second row on
-/// the same (bucket, series) or a cell that is not a number.
-fn place(
-    slot: &mut Option<f64>,
-    cell: Option<&Value>,
-    bucket: impl Fn() -> String,
-    series: &str,
-) -> Result<(), Refusal> {
-    let value = match cell {
-        // An absent cell (a short row) and an explicit null are both
-        // "no measurement": a gap, never a zero.
-        None | Some(Value::Null) => return Ok(()),
-        Some(v) => numeric(v).ok_or_else(|| Refusal::BadMetric(value_to_string(v)))?,
-    };
-    if slot.is_some() {
-        return Err(Refusal::DuplicateCell {
-            bucket: bucket(),
-            series: series.to_owned(),
-        });
-    }
-    *slot = Some(value);
-    Ok(())
+/// One series before ranking: its visited slots and their values, and
+/// the running total the ranking sorts on.
+struct Sparse {
+    label: String,
+    /// Grid slot → value; a `None` value is a visited null.
+    points: HashMap<usize, Option<f64>>,
+    total: f64,
 }
 
-/// Sum of the drawn values of one series; the ranking key.
-fn total(values: &[Option<f64>]) -> f64 {
-    values.iter().flatten().sum()
+impl Sparse {
+    /// Record the row at `slot`, refusing a second visit or a cell that
+    /// is not a number.
+    fn visit(
+        &mut self,
+        slot: usize,
+        cell: Option<&Value>,
+        bucket: impl Fn() -> String,
+    ) -> Result<(), Refusal> {
+        let value = match cell {
+            // An absent cell (a short row) and an explicit null are both
+            // "no measurement": a gap, never a zero — but still a visit.
+            None | Some(Value::Null) => None,
+            Some(v) => Some(numeric(v).ok_or_else(|| Refusal::BadMetric(value_to_string(v)))?),
+        };
+        if self.points.insert(slot, value).is_some() {
+            return Err(Refusal::DuplicateCell {
+                bucket: bucket(),
+                series: self.label.clone(),
+            });
+        }
+        if let Some(v) = value {
+            self.total += v;
+        }
+        Ok(())
+    }
+}
+
+/// The dense vector the chart draws from one series' sparse points, one
+/// entry per grid instant.
+fn dense(points: HashMap<usize, Option<f64>>, len: usize) -> Vec<Option<f64>> {
+    #[cfg(test)]
+    DENSE_ALLOCATIONS.with(|n| n.set(n.get() + 1));
+    let mut values = vec![None; len];
+    for (slot, value) in points {
+        values[slot] = value;
+    }
+    values
+}
+
+// How many dense vectors `align_series` allocated on this thread; the
+// bound-by-cap test reads it. Tests run one per thread, so a
+// thread-local is not shared between them.
+#[cfg(test)]
+thread_local! {
+    static DENSE_ALLOCATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The index of the series under `key`, creating it with `label` on
+/// first sight.
+fn series_index(
+    index: &mut HashMap<Vec<String>, usize>,
+    series: &mut Vec<Sparse>,
+    key: Vec<String>,
+    label: String,
+) -> usize {
+    *index.entry(key).or_insert_with(|| {
+        series.push(Sparse {
+            label,
+            points: HashMap::new(),
+            total: 0.0,
+        });
+        series.len() - 1
+    })
 }
 
 /// A metric cell as an `f64`, or `None` when it is not a number.
@@ -584,6 +630,11 @@ mod align_series_tests {
                 .collect(),
             rows,
         }
+    }
+
+    /// The snapshot lane, which most tests exercise.
+    fn align(query: &str, result: &QueryResult) -> Result<SeriesSet, Refusal> {
+        align_series(query, result, Lane::Snapshot)
     }
 
     fn s(text: &str) -> Value {
@@ -698,7 +749,7 @@ mod align_series_tests {
             vec![at(2), s("a"), Value::Integer(7)],
             vec![at(1), s("b"), Value::Integer(3)],
         ];
-        let set = align_series(BY_HOST, &result(&["_time", "host", "count"], rows)).unwrap();
+        let set = align(BY_HOST, &result(&["_time", "host", "count"], rows)).unwrap();
         assert_eq!(set.xs, vec![T0 as f64, (T0 + 60) as f64, (T0 + 120) as f64]);
         assert_eq!(series(&set, "a"), &[Some(5.0), None, Some(7.0)]);
         assert_eq!(series(&set, "b"), &[None, Some(3.0), None]);
@@ -715,7 +766,7 @@ mod align_series_tests {
             vec![at(0), s("b"), Value::Integer(1)],
             vec![at(2), s("b"), Value::Integer(1)],
         ];
-        let set = align_series(BY_HOST, &result(&["_time", "host", "count"], rows)).unwrap();
+        let set = align(BY_HOST, &result(&["_time", "host", "count"], rows)).unwrap();
         assert_eq!(set.xs, vec![T0 as f64, (T0 + 60) as f64, (T0 + 120) as f64]);
         for (_, values) in &set.series {
             assert_eq!(values[1], None);
@@ -729,7 +780,7 @@ mod align_series_tests {
             vec![at(1), s("a"), Value::Null],
             vec![at(2), s("a"), Value::Float(-1.5)],
         ];
-        let set = align_series(BY_HOST, &result(&["_time", "host", "count"], rows)).unwrap();
+        let set = align(BY_HOST, &result(&["_time", "host", "count"], rows)).unwrap();
         assert_eq!(series(&set, "a"), &[Some(4.0), None, Some(-1.5)]);
     }
 
@@ -742,15 +793,13 @@ mod align_series_tests {
             vec![at(1), s("a"), Value::Integer(4)],
             vec![at(5), s("c"), Value::Integer(9)],
         ];
-        let forward =
-            align_series(BY_HOST, &result(&["_time", "host", "count"], rows.clone())).unwrap();
+        let forward = align(BY_HOST, &result(&["_time", "host", "count"], rows.clone())).unwrap();
         let mut reversed = rows.clone();
         reversed.reverse();
-        let backward =
-            align_series(BY_HOST, &result(&["_time", "host", "count"], reversed)).unwrap();
+        let backward = align(BY_HOST, &result(&["_time", "host", "count"], reversed)).unwrap();
         let mut rotated = rows;
         rotated.rotate_left(2);
-        let turned = align_series(BY_HOST, &result(&["_time", "host", "count"], rotated)).unwrap();
+        let turned = align(BY_HOST, &result(&["_time", "host", "count"], rotated)).unwrap();
         assert_eq!(forward, backward);
         assert_eq!(forward, turned);
         // Minute 4 is nobody's row and sits on the grid regardless.
@@ -765,8 +814,7 @@ mod align_series_tests {
             vec![at(0), s("web"), Value::Null, Value::Integer(1)],
             vec![at(0), s("db"), Value::Float(1.5), Value::Integer(2)],
         ];
-        let set =
-            align_series(query, &result(&["_time", "host", "status", "count"], rows)).unwrap();
+        let set = align(query, &result(&["_time", "host", "status", "count"], rows)).unwrap();
         let labels: Vec<&str> = set.series.iter().map(|(l, _)| l.as_str()).collect();
         // As the table prints them: NULL for a null, two decimals for a
         // float; legend in label order.
@@ -783,7 +831,7 @@ mod align_series_tests {
             vec![at(0), s("a"), Value::Integer(1)],
             vec![at(0), s("a"), Value::Integer(2)],
         ];
-        let err = align_series(BY_HOST, &result(&["_time", "host", "count"], rows)).unwrap_err();
+        let err = align(BY_HOST, &result(&["_time", "host", "count"], rows)).unwrap_err();
         assert_eq!(
             err,
             Refusal::DuplicateCell {
@@ -810,12 +858,12 @@ mod align_series_tests {
                 ],
             )
         };
-        let ok = align_series(query, &far(19_999)).unwrap();
+        let ok = align(query, &far(19_999)).unwrap();
         assert_eq!(ok.xs.len(), 20_000);
         assert_eq!(ok.series[0].1.len(), 20_000);
         assert_eq!(ok.series[0].1.iter().flatten().count(), 2);
 
-        let err = align_series(query, &far(20_000)).unwrap_err();
+        let err = align(query, &far(20_000)).unwrap_err();
         assert_eq!(err, Refusal::GridTooLarge(20_001));
         assert_eq!(
             err.message(),
@@ -833,7 +881,7 @@ mod align_series_tests {
             vec![s("2026-09-01 00:01:30"), Value::Integer(2)],
             vec![at(2), Value::Integer(3)],
         ];
-        let set = align_series(query, &result(&["_time", "count"], rows)).unwrap();
+        let set = align(query, &result(&["_time", "count"], rows)).unwrap();
         assert_eq!(
             set.xs,
             vec![
@@ -855,7 +903,7 @@ mod align_series_tests {
             rows.push(vec![at(0), s(&format!("g{g:02}")), Value::Integer(g)]);
             rows.push(vec![at(1), s(&format!("g{g:02}")), Value::Integer(0)]);
         }
-        let set = align_series(BY_HOST, &result(&["_time", "host", "count"], rows)).unwrap();
+        let set = align(BY_HOST, &result(&["_time", "host", "count"], rows)).unwrap();
         assert_eq!(set.total_series, 14);
         assert_eq!(set.series.len(), SERIES_CAP);
         let labels: Vec<&str> = set.series.iter().map(|(l, _)| l.as_str()).collect();
@@ -873,7 +921,7 @@ mod align_series_tests {
             .iter()
             .map(|g| vec![at(0), s(g), Value::Integer(1)])
             .collect();
-        let set = align_series(BY_HOST, &result(&["_time", "host", "count"], rows)).unwrap();
+        let set = align(BY_HOST, &result(&["_time", "host", "count"], rows)).unwrap();
         let labels: Vec<&str> = set.series.iter().map(|(l, _)| l.as_str()).collect();
         assert_eq!(labels, vec!["t", "u", "v", "w", "x", "y"]);
     }
@@ -890,7 +938,7 @@ mod align_series_tests {
             ],
             vec![at(1), Value::Integer(4), Value::Null, Value::Integer(-2)],
         ];
-        let set = align_series(
+        let set = align(
             query,
             &result(&["_time", "count", "mean", "max_bytes"], rows),
         )
@@ -906,7 +954,7 @@ mod align_series_tests {
         // still draws: the fallback is every non-time column.
         let renamed = "* | timechart span=1m count() | rename count as n";
         let rows = vec![vec![at(0), Value::Integer(3)]];
-        let set = align_series(renamed, &result(&["_time", "n"], rows)).unwrap();
+        let set = align(renamed, &result(&["_time", "n"], rows)).unwrap();
         assert_eq!(set.series[0].0, "n");
     }
 
@@ -914,7 +962,7 @@ mod align_series_tests {
     fn grouped_two_metrics_refuses() {
         let query = "* | timechart span=1m count(), avg(bytes) by host";
         let rows = vec![vec![at(0), s("a"), Value::Integer(1), Value::Float(2.0)]];
-        let err = align_series(
+        let err = align(
             query,
             &result(&["_time", "host", "count", "avg_bytes"], rows),
         )
@@ -946,7 +994,7 @@ mod align_series_tests {
             ),
         ];
         for (query, want, word) in cases {
-            let err = align_series(query, &r).unwrap_err();
+            let err = align(query, &r).unwrap_err();
             assert_eq!(err, want, "{query}");
             assert_eq!(
                 err.message(),
@@ -958,7 +1006,7 @@ mod align_series_tests {
     #[test]
     fn no_time_axis_refuses_toward_column() {
         let rows = vec![vec![s("200"), Value::Integer(1)]];
-        let err = align_series(
+        let err = align(
             "* | stats count() by status",
             &result(&["status", "count"], rows),
         )
@@ -970,7 +1018,7 @@ mod align_series_tests {
         );
         // A timechart whose `_time` was projected away has no axis either.
         let rows = vec![vec![Value::Integer(1)]];
-        let err = align_series(
+        let err = align(
             "* | timechart span=1m count() | table count",
             &result(&["count"], rows),
         )
@@ -982,19 +1030,19 @@ mod align_series_tests {
     fn the_remaining_rungs_refuse_with_their_sentences() {
         let query = "* | timechart span=1m count()";
         // No metric column at all.
-        let err = align_series(query, &result(&["_time"], vec![vec![at(0)]])).unwrap_err();
+        let err = align(query, &result(&["_time"], vec![vec![at(0)]])).unwrap_err();
         assert_eq!(err, Refusal::NoMetric);
         assert_eq!(
             err.message(),
             "Visualization needs a metric column. Use timechart count(), or open Events."
         );
         // No rows.
-        let err = align_series(query, &result(&["_time", "count"], vec![])).unwrap_err();
+        let err = align(query, &result(&["_time", "count"], vec![])).unwrap_err();
         assert_eq!(err, Refusal::Empty);
         assert_eq!(err.message(), "No rows to draw.");
         // A `_time` cell in neither form.
         let rows = vec![vec![s("2026-09-01T00:00:00+02:00"), Value::Integer(1)]];
-        let err = align_series(query, &result(&["_time", "count"], rows)).unwrap_err();
+        let err = align(query, &result(&["_time", "count"], rows)).unwrap_err();
         assert_eq!(
             err,
             Refusal::UnparsedTime("2026-09-01T00:00:00+02:00".into())
@@ -1005,7 +1053,7 @@ mod align_series_tests {
         );
         // A metric that is text.
         let rows = vec![vec![at(0), s("many")]];
-        let err = align_series(query, &result(&["_time", "count"], rows)).unwrap_err();
+        let err = align(query, &result(&["_time", "count"], rows)).unwrap_err();
         assert_eq!(err, Refusal::BadMetric("many".into()));
         assert_eq!(
             err.message(),
@@ -1022,7 +1070,7 @@ mod align_series_tests {
             vec![at(0), Value::Integer(1)],
             vec![at(5), Value::Integer(1)],
         ];
-        let set = align_series(
+        let set = align(
             "* | timechart count()",
             &result(&["_time", "count"], rows.clone()),
         )
@@ -1030,7 +1078,7 @@ mod align_series_tests {
         assert_eq!(set.xs.len(), 6);
         // `last=7d` resolves to one hour, so the same two rows are two
         // off-lattice instants on a grid of one hour.
-        let set = align_series(
+        let set = align(
             "last=7d | timechart count()",
             &result(&["_time", "count"], rows),
         )
@@ -1095,6 +1143,120 @@ mod align_series_tests {
             caption(20, 26, "groups", None).as_deref(),
             Some("20 of 26 groups drawn; the 6 smallest are not.")
         );
+    }
+
+    #[test]
+    fn dense_storage_is_bounded_by_the_cap() {
+        // 5,000 distinct groups, one row each, spread over a grid of
+        // 5,000 minutes. A dense-per-group layout would be 25 million
+        // cells; the sparse pass keeps one point per group and only the
+        // six survivors are made dense, which the allocation counter
+        // observes directly.
+        let rows: Vec<Vec<Value>> = (0..5_000_i64)
+            .map(|g| vec![at(g), s(&format!("g{g:04}")), Value::Integer(g)])
+            .collect();
+        DENSE_ALLOCATIONS.with(|n| n.set(0));
+        let set = align(BY_HOST, &result(&["_time", "host", "count"], rows)).unwrap();
+        assert_eq!(set.total_series, 5_000);
+        assert_eq!(set.series.len(), SERIES_CAP);
+        assert_eq!(set.xs.len(), 5_000);
+        assert_eq!(DENSE_ALLOCATIONS.with(std::cell::Cell::get), SERIES_CAP);
+        // The largest survive: g4999 down to g4994.
+        assert_eq!(set.series[0].0, "g4994");
+        assert_eq!(set.series[5].0, "g4999");
+        assert_eq!(set.series[5].1[4_999], Some(4_999.0));
+    }
+
+    #[test]
+    fn distinct_tuples_with_colliding_labels_stay_distinct() {
+        let query = "* | timechart span=1m count() by host, service";
+        let cols = &["_time", "host", "service", "count"];
+        // Same instant: two tuples, one printed label, NOT a duplicate.
+        let rows = vec![
+            vec![at(0), s("a · b"), s("c"), Value::Integer(1)],
+            vec![at(0), s("a"), s("b · c"), Value::Integer(2)],
+        ];
+        let set = align(query, &result(cols, rows)).unwrap();
+        assert_eq!(set.total_series, 2);
+        assert_eq!(set.series.len(), 2);
+        assert_eq!(set.series[0].0, "a · b · c");
+        assert_eq!(set.series[1].0, "a · b · c");
+        let mut firsts: Vec<Option<f64>> = set.series.iter().map(|(_, v)| v[0]).collect();
+        firsts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(firsts, vec![Some(1.0), Some(2.0)]);
+        // Different instants: still two series, each with its own gap.
+        let rows = vec![
+            vec![at(0), s("a · b"), s("c"), Value::Integer(1)],
+            vec![at(1), s("a"), s("b · c"), Value::Integer(2)],
+        ];
+        let set = align(query, &result(cols, rows)).unwrap();
+        assert_eq!(set.total_series, 2);
+        let mut values: Vec<&[Option<f64>]> =
+            set.series.iter().map(|(_, v)| v.as_slice()).collect();
+        values.sort_by(|a, b| a[0].partial_cmp(&b[0]).unwrap());
+        assert_eq!(values, vec![&[None, Some(2.0)][..], &[Some(1.0), None][..]]);
+    }
+
+    #[test]
+    fn live_lane_uses_the_no_filter_span() {
+        let query = "last=4h | timechart count()";
+        let rows = vec![
+            vec![at(0), Value::Integer(1)],
+            vec![at(2), Value::Integer(1)],
+        ];
+        // Live buckets at one minute whatever `last=` says: minute 1 is
+        // a gap between the two rows.
+        let live = align_series(
+            query,
+            &result(&["_time", "count"], rows.clone()),
+            Lane::Live,
+        )
+        .unwrap();
+        assert_eq!(live.xs.len(), 3);
+        assert_eq!(live.series[0].1, vec![Some(1.0), None, Some(1.0)]);
+        // The snapshot emitter resolves `last=4h` to five minutes, so the
+        // same rows are two instants on a five-minute grid.
+        let snap = align(query, &result(&["_time", "count"], rows)).unwrap();
+        assert_eq!(snap.xs.len(), 2);
+        assert_eq!(snap.series[0].1, vec![Some(1.0), Some(1.0)]);
+    }
+
+    #[test]
+    fn a_renamed_metric_is_still_a_metric() {
+        let query = "* | timechart span=1m count(), avg(bytes) | rename count as n";
+        let rows = vec![vec![at(0), Value::Integer(3), Value::Float(1.5)]];
+        let set = align(query, &result(&["_time", "n", "avg_bytes"], rows)).unwrap();
+        assert_eq!(set.total_series, 2);
+        assert_eq!(series(&set, "n"), &[Some(3.0)]);
+        assert_eq!(series(&set, "avg_bytes"), &[Some(1.5)]);
+    }
+
+    #[test]
+    fn a_renamed_second_metric_still_refuses_when_grouped() {
+        let query = "* | timechart span=1m count(), avg(bytes) by host | rename avg_bytes as mean";
+        let rows = vec![vec![at(0), s("a"), Value::Integer(3), Value::Float(1.5)]];
+        let err = align(query, &result(&["_time", "host", "count", "mean"], rows)).unwrap_err();
+        assert_eq!(err, Refusal::GroupedTwoMetrics);
+    }
+
+    #[test]
+    fn a_null_row_still_counts_toward_a_duplicate() {
+        let dup = Refusal::DuplicateCell {
+            bucket: "2026-09-01 00:00:00".into(),
+            series: "a".into(),
+        };
+        for pair in [
+            (Value::Null, Value::Integer(1)),
+            (Value::Integer(1), Value::Null),
+            (Value::Null, Value::Null),
+        ] {
+            let rows = vec![
+                vec![at(0), s("a"), pair.0.clone()],
+                vec![at(0), s("a"), pair.1.clone()],
+            ];
+            let err = align(BY_HOST, &result(&["_time", "host", "count"], rows)).unwrap_err();
+            assert_eq!(err, dup, "{pair:?}");
+        }
     }
 
     /// The bridge's palette and dash list are the other half of
