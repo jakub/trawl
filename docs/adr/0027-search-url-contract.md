@@ -150,6 +150,17 @@ A link whose structured state does not parse is shown, not run.**
   keyed on the executed query, so an unsubmitted edit survives Stop live
   the way it survives a page change.*
 
+  *Amended 2026-09-21 (#232 prep, a live stream carries no range): a live
+  stream carries the query text and the filter chips, never the range.
+  The `r` the URL carries while live is the range that Stop live returns
+  to, not a window on the stream. A time clause the reader typed into the
+  query text (`last=`, `earliest=`, `latest=`) is part of the query and
+  stays. Folding the range gave the stream a hidden window on event time:
+  an event whose `_time` sat more than the range behind the server clock
+  was dropped while the page still said Streaming, the false-claim class
+  this ADR refuses. The Schema drawer's Live Tail and `/api/v1/stream`
+  never had a window, and now the three agree.*
+
 ## Consequences
 
 - `state/query.rs` splits into a pure, natively tested URL module and a

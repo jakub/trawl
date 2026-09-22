@@ -47,7 +47,7 @@ A search URL whose structured state does not parse or makes a false claim. It is
 _Avoid_: invalid URL, broken link (too broad), stale link
 
 **Mode**:
-Snapshot (a one-shot query, paged by the server for events and in the browser for an aggregation) or live (an SSE stream). The URL carries `mode=live` or nothing. Live Tail enters live; Stop live or any range selection leaves it, always by navigation. Nothing pauses it: a URL that says live streams, or shows why it cannot. While live, no snapshot query runs.
+Snapshot (a one-shot query, paged by the server for events and in the browser for an aggregation) or live (an SSE stream). The URL carries `mode=live` or nothing. Live Tail enters live; Stop live or any range selection leaves it, always by navigation. Nothing pauses it: a URL that says live streams, or shows why it cannot. While live, no snapshot query runs. A live stream carries the query text and the filter chips, never the range. The range in `r` is what Stop live returns to.
 _Avoid_: view, tab, pause
 
 **Live ring**:
