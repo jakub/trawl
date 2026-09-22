@@ -420,6 +420,35 @@
   overflow: hidden;
 }
 
+/* The caption under a chart that drew fewer series or groups than the
+ * result holds, and beside it the control to the rows it left out. That
+ * control is a button in fact and a link in appearance: it switches the
+ * results tab, it does not navigate. */
+.chart-caption {
+  padding: 8px 14px 0;
+  margin: 0;
+  color: var(--ink-2);
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui);
+}
+.visualization .btn-lnk {
+  margin: 2px 0 0 14px;
+  padding: 0;
+  background: none;
+  border: 0;
+  color: var(--accent-ink);
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui);
+  text-decoration: underline;
+  cursor: pointer;
+}
+.visualization .btn-lnk:hover { color: var(--accent); }
+.visualization .btn-lnk:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
 /* ─────────────────────────────────────────────────────────────────
  *  Query console (header + DslEditor + date range + Haul + tools,
  *  closed by the executed-scope strip)

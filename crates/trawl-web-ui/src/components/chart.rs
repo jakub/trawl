@@ -2,70 +2,76 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `<Chart/>` — uPlot line chart driven by aggregation snapshots.
+//! `<Chart/>` — the Visualization tab's uPlot chart (ADR-0038).
+//!
+//! Every decision about WHAT to draw lives in [`crate::chart_hint`] and
+//! [`crate::series`], which are native-testable; this module is the
+//! wasm half: the uPlot data arrays, the mount/update/destroy lifecycle,
+//! and the sentences around the canvas.
 
 use leptos::prelude::*;
-use trawl_api::display::extract_series;
-use trawl_api::value::{QueryResult, Value};
-use wasm_bindgen::JsValue;
-
-use crate::fetch_plan::coverage_refusal;
-use crate::interop::uplot::{ChartHandle, Opts, create_chart};
 use trawl_api::PaginationMeta;
+use trawl_api::value::QueryResult;
+use wasm_bindgen::{JsCast, JsValue};
 
-/// uPlot `AlignedData` is `[xs, ys1, ys2, ...]` where every inner array
-/// is equal length and all values are `f64`. xs are row indices, not
-/// instants: the server emits `_time` as a string, snapshot rows arrive
-/// in order, and the chart only has to show relative shape.
-/// The third element is the number of plotted points per series: what
-/// the chart actually drew, which the canvas itself does not say.
-fn snapshot_to_aligned(result: &QueryResult) -> (JsValue, Vec<String>, usize) {
-    let (series, _total) = extract_series(result);
-    if series.is_empty() {
-        return (js_sys::Array::new().into(), vec![], 0);
+use crate::chart_hint::{Hint, chart_hint};
+use crate::interop::uplot::{ChartHandle, ChartKind, Opts, create_chart};
+use crate::series::{Lane, SeriesSet, caption};
+
+/// What the tab shows for the current snapshot.
+#[derive(Clone, PartialEq)]
+enum Outcome {
+    /// Neither a result nor a refusal: no frame has arrived, or the
+    /// stream died. The sentence is the component's own.
+    Note(String),
+    /// A result the ladder will not draw, and why.
+    Refused(Hint),
+    /// The aligned series to draw.
+    Draw(SeriesSet),
+}
+
+/// A JS array index. Lengths here are bounded by
+/// [`crate::series::MAX_INSTANTS`], far below `u32::MAX`.
+fn idx(i: usize) -> u32 {
+    u32::try_from(i).unwrap_or(u32::MAX)
+}
+
+/// One y column for uPlot. A gap is JS `null`: never `NaN`, which uPlot
+/// folds into the y scale, and never a hole left by `new_with_length`,
+/// which reads back as `undefined`.
+fn column(values: &[Option<f64>]) -> js_sys::Array {
+    let array = js_sys::Array::new_with_length(idx(values.len()));
+    for (i, value) in values.iter().enumerate() {
+        array.set(idx(i), value.map_or(JsValue::NULL, JsValue::from_f64));
     }
+    array
+}
 
-    let series_len = series[0].1.len();
+/// uPlot `AlignedData` for a line chart: `[xs, ys1, ys2, …]`, every
+/// inner array the same length. xs are epoch seconds, drawn on a UTC
+/// axis.
+fn lines_data(set: &SeriesSet) -> JsValue {
     let aligned = js_sys::Array::new();
-
-    let xs = js_sys::Array::new_with_length(u32::try_from(series_len).unwrap_or(u32::MAX));
-    for (i, x) in (0..series_len).enumerate() {
-        // Snapshot lengths come from live-aggregated rows — bounded by
-        // the server's snapshot cadence in the small thousands, so the
-        // f64 precision loss at 2^53 boundary is not reachable here.
-        #[allow(clippy::cast_precision_loss)]
-        xs.set(
-            u32::try_from(i).unwrap_or(u32::MAX),
-            JsValue::from_f64(x as f64),
-        );
+    let xs = js_sys::Array::new_with_length(idx(set.xs.len()));
+    for (i, x) in set.xs.iter().enumerate() {
+        xs.set(idx(i), JsValue::from_f64(*x));
     }
     aligned.push(&xs);
-
-    let mut labels = Vec::with_capacity(series.len());
-    for (label, values) in &series {
-        labels.push(label.clone());
-        let ys = js_sys::Array::new_with_length(u32::try_from(values.len()).unwrap_or(u32::MAX));
-        for (i, v) in values.iter().enumerate() {
-            // uPlot plots f64, so the cast is the format, not a choice.
-            // A metric past 2^53 — an id, a byte count — loses its low
-            // bits here and nowhere else: the exact value still reaches
-            // the results table, and a plotted point is a pixel.
-            #[allow(clippy::cast_precision_loss)]
-            ys.set(
-                u32::try_from(i).unwrap_or(u32::MAX),
-                JsValue::from_f64(*v as f64),
-            );
-        }
-        aligned.push(&ys);
+    for (_, values) in &set.series {
+        aligned.push(&column(values));
     }
-
-    (aligned.into(), labels, series_len)
+    aligned.into()
 }
 
 #[component]
+#[allow(clippy::too_many_lines)] // one component: the ladder's verdict, the canvas lifecycle, the sentences
 pub fn Chart(
     #[prop(into)] snapshot: Signal<Option<QueryResult>>,
-    #[prop(into)] query: Signal<String>,
+    /// The DSL that produced `snapshot`, never the text being typed: the
+    /// series, the group fields and the bucket width are all read off
+    /// it, so a stale pair draws a labelled lie.
+    #[prop(into)]
+    query: Signal<String>,
     /// How much of the result this snapshot carries, where the answer is
     /// measured: `None` for a live stream, which owns no window.
     ///
@@ -74,30 +80,53 @@ pub fn Chart(
     /// that gate by saying nothing.
     #[prop(into)]
     coverage: Signal<Option<PaginationMeta>>,
+    /// Which execution produced the snapshot, and so which bucket width
+    /// its rows were cut with.
+    lane: Lane,
+    /// Open the Events tab: the refusal's alternative, and the caption's
+    /// route to what the chart left out.
+    on_events: Callback<()>,
     #[prop(optional, into)] failure: Signal<Option<&'static str>>,
     #[prop(optional)] on_retry: Option<Callback<()>>,
 ) -> impl IntoView {
-    let hint = Memo::new(move |_| {
-        failure
-            .get()
-            .map(ToOwned::to_owned)
-            .or_else(|| match snapshot.get() {
-                None => Some("Waiting for the first live aggregation snapshot.".to_owned()),
-                Some(result) => {
-                    let coverage = coverage.get();
-                    chart_hint(&result, &query.get(), coverage.as_ref())
-                }
-            })
+    let outcome = Memo::new(move |_| {
+        if let Some(message) = failure.get() {
+            return Outcome::Note(message.to_owned());
+        }
+        let Some(result) = snapshot.get() else {
+            return Outcome::Note("Waiting for the first live aggregation snapshot.".to_owned());
+        };
+        match chart_hint(&query.get(), &result, lane, coverage.get().as_ref()) {
+            Ok(set) => Outcome::Draw(set),
+            Err(hint) => Outcome::Refused(hint),
+        }
     });
+
+    // The line under a chart that drew fewer series than the result
+    // holds. A legend of six over a result of fourteen is a picture that
+    // lies by omission without it (ADR-0038).
+    let caption_line = Memo::new(move |_| match outcome.get() {
+        Outcome::Draw(set) => {
+            let narrow = (!set.group_fields.is_empty()).then(|| set.group_fields.join(", "));
+            caption(
+                set.series.len(),
+                set.total_series,
+                "series",
+                narrow.as_deref(),
+            )
+        }
+        Outcome::Note(_) | Outcome::Refused(_) => None,
+    });
+
     let node_ref = NodeRef::<leptos::html::Div>::new();
     let handle: StoredValue<Option<ChartHandle>, leptos::prelude::LocalStorage> =
         StoredValue::new_local(None);
 
     let mounted_labels = StoredValue::new(Vec::<String>::new());
-    // The plotted series length, published on the host element. A canvas
-    // is opaque: without this, "the chart drew every row" is a claim no
-    // test can read back from the DOM.
-    let points = RwSignal::new(None::<usize>);
+    // What the canvas drew, published on the host element. A canvas is
+    // opaque: without these, "the chart drew every bucket of all four
+    // series" is a claim no test can read back from the DOM.
+    let drawn = RwSignal::new(None::<(usize, usize, &'static str)>);
     let width = RwSignal::new(0.0_f64);
     // Measure the content box, excluding the chart host's padding. The
     // observer disconnects with the component through leptos-use.
@@ -115,21 +144,21 @@ pub fn Chart(
             return;
         };
         let measured_width = width.get();
-        let result = snapshot.get();
-        let Some(result) = result.filter(|_| hint.get().is_none()) else {
+        let Outcome::Draw(set) = outcome.get() else {
             handle.update_value(|slot| {
                 if let Some(h) = slot.take() {
                     h.destroy();
                 }
             });
             mounted_labels.set_value(Vec::new());
-            points.set(None);
+            drawn.set(None);
             return;
         };
         if measured_width <= 0.0 {
             return;
         }
-        let (data, labels, plotted) = snapshot_to_aligned(&result);
+        let labels: Vec<String> = set.series.iter().map(|(label, _)| label.clone()).collect();
+        let data = lines_data(&set);
         let html_el: web_sys::HtmlElement = (*element).clone().unchecked_into();
 
         handle.update_value(|slot| {
@@ -145,15 +174,15 @@ pub fn Chart(
                 h.set_data(data);
                 h.resize(measured_width, 320.0);
             } else {
-                // First snapshot — construct the chart. x values are
-                // epoch seconds built from trawld's already-shifted
-                // display timestamps, so the axis formats them as UTC.
+                // First frame — construct the chart. x values are epoch
+                // seconds parsed from `_time`, which the server wrote at
+                // a zero offset, so the axis formats them as UTC.
                 let opts = Opts {
                     width: measured_width,
                     height: 320.0,
                     series: &labels,
                     y_label: None,
-                    kind: crate::interop::uplot::ChartKind::Line,
+                    kind: ChartKind::Line,
                     utc: true,
                     x_labels: None,
                     span_gaps: false,
@@ -163,7 +192,7 @@ pub fn Chart(
                 *slot = Some(h);
             }
         });
-        points.set(Some(plotted));
+        drawn.set(Some((set.xs.len(), labels.len(), "line")));
     });
 
     on_cleanup(move || {
@@ -176,114 +205,40 @@ pub fn Chart(
 
     view! {
         <div class="visualization">
-            // A failure is an alert, a waiting-for-data hint is a
+            // A failure is an alert, a waiting-for-data note is a
             // status: the live stream's error must announce itself here
             // the way it does over the raw table.
-            {move || hint.get().map(|hint| if failure.get().is_some() {
-                view! { <p class="results-empty" role="alert">{hint}</p> }.into_any()
-            } else {
-                view! { <p class="results-empty" role="status">{hint}</p> }.into_any()
-            })}
+            {move || match outcome.get() {
+                Outcome::Note(message) => if failure.get().is_some() {
+                    view! { <p class="results-empty" role="alert">{message}</p> }.into_any()
+                } else {
+                    view! { <p class="results-empty" role="status">{message}</p> }.into_any()
+                },
+                Outcome::Refused(hint) => view! {
+                    <p class="results-empty" role="status">{hint.message}</p>
+                    {hint.offers_events.then(|| view! {
+                        <button type="button" class="btn-sec" on:click=move |_| on_events.run(())>"Open Events"</button>
+                    })}
+                }.into_any(),
+                Outcome::Draw(_) => ().into_any(),
+            }}
             {move || failure.get().and(on_retry).map(|retry| view! {
                 <button type="button" class="btn-sec" on:click=move |_| retry.run(())>"Retry live stream"</button>
             })}
-            <div class="chart" node_ref=node_ref data-points=move || points.get().map(|n| n.to_string())></div>
-            {move || hint.get().is_none().then(|| view! {
-                <p class="chart-note">"Count metrics by result position, up to six series. Open Events for exact times and values."</p>
+            <div
+                class="chart"
+                node_ref=node_ref
+                data-points=move || drawn.get().map(|(points, _, _)| points.to_string())
+                data-series=move || drawn.get().map(|(_, series, _)| series.to_string())
+                data-chart-type=move || drawn.get().map(|(_, _, kind)| kind)
+            ></div>
+            {move || caption_line.get().map(|text| view! {
+                <p class="chart-caption" role="status">{text}</p>
+                <button type="button" class="btn-lnk" on:click=move |_| on_events.run(())>"Open Events"</button>
+            })}
+            {move || matches!(outcome.get(), Outcome::Draw(_)).then(|| view! {
+                <p class="chart-note">"Metrics over time on a UTC axis, up to six series. Gaps mean no value was returned. Open Events for exact times and values."</p>
             })}
         </div>
     }
-}
-
-use wasm_bindgen::JsCast;
-
-// The shared extractor converts metrics to unsigned counts. Refuse values
-// that conversion would truncate or replace with zero.
-//
-// The rungs are ordered, and the coverage one comes LAST on purpose. A
-// grouped or lossy result has something actionable to say about its own
-// shape; "this is only part of the result" is the answer only once the
-// shape itself is chartable.
-fn chart_hint(
-    result: &QueryResult,
-    query: &str,
-    coverage: Option<&PaginationMeta>,
-) -> Option<String> {
-    // Column values cannot identify numeric group keys. Use parsed query
-    // stages before interpreting any numeric column as a metric. Refuse
-    // grouped results until this chart can align groups by actual time.
-    let parsed = trawl_core::parser::parse(query).ok();
-    let grouped = parsed.as_ref().is_some_and(|ast| {
-        ast.pipeline.iter().any(|stage| match &stage.node {
-            trawl_core::ast::PipeStage::Timechart(stage) => !stage.group_by.is_empty(),
-            trawl_core::ast::PipeStage::Stats(stage) => !stage.group_by.is_empty(),
-            trawl_core::ast::PipeStage::Pivot(_)
-            | trawl_core::ast::PipeStage::Top(_)
-            | trawl_core::ast::PipeStage::Rare(_) => true,
-            _ => false,
-        })
-    });
-    if grouped {
-        return Some(
-            "Grouped results are not supported by this chart. Use timechart without by, or open Events for exact group times and values."
-                .to_owned(),
-        );
-    }
-    if result.rows.is_empty() {
-        return Some("No rows returned for this visualization.".to_owned());
-    }
-    if !result.columns.iter().any(|c| c.name == "_time") {
-        return Some(
-            "Visualization requires a _time column and non-negative integer metrics. Use timechart count() or open Events for these results."
-                .to_owned(),
-        );
-    }
-    let mut groups = 0;
-    let mut metrics = 0;
-    for (i, col) in result.columns.iter().enumerate() {
-        if col.name == "_time" {
-            continue;
-        }
-        if result
-            .rows
-            .iter()
-            .all(|r| matches!(r.get(i), Some(Value::String(_))))
-        {
-            groups += 1;
-        } else if result.rows.iter().all(|r| {
-            // An unsigned cell is a non-negative integer by construction,
-            // so it is a metric on the same terms as a signed one.
-            matches!(r.get(i), Some(Value::UInt(_)))
-                || matches!(r.get(i), Some(Value::Integer(n)) if *n >= 0)
-        }) {
-            metrics += 1;
-        } else {
-            return Some(
-                "This chart supports non-negative integer metrics only. Open Events for fractional, negative, null, or mixed values."
-                    .to_owned(),
-            );
-        }
-    }
-    if groups > 0 {
-        return Some(
-            "This result includes non-metric columns. Use an ungrouped timechart query, or open Events for these rows."
-                .to_owned(),
-        );
-    }
-    let timechart = parsed.as_ref().is_some_and(|ast| ast.pipeline.iter().any(|stage| {
-        matches!(&stage.node, trawl_core::ast::PipeStage::Timechart(chart) if chart.group_by.is_empty())
-    }));
-    if metrics > 1 && !timechart {
-        return Some(
-            "These numeric columns may include group keys. Use an ungrouped timechart query, or open Events for the exact values."
-                .to_owned(),
-        );
-    }
-    if metrics == 0 {
-        return Some(
-            "Visualization requires _time and non-negative integer metrics. Open Events for these results."
-                .to_owned(),
-        );
-    }
-    coverage.and_then(coverage_refusal)
 }

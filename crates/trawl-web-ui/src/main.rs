@@ -8,6 +8,7 @@
 // their tests run under plain `cargo test` on native.
 mod auth_return;
 mod categorical;
+mod chart_hint;
 mod completion;
 mod context_query;
 mod dashboard_state;

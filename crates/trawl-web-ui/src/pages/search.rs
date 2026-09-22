@@ -64,6 +64,7 @@ use crate::pages::layout::ShellStatus;
 use crate::result_actions::sorted_page;
 use crate::search_status::{CountSource, FooterCount, StatusInputs, StatusKind, search_status};
 use crate::search_url::{PAGE_SIZE, Param, admit_filters, refusal_copy};
+use crate::series::Lane;
 use crate::state::query::{
     Filter, Mode, UrlSignals, mode_query, navigator, replace_navigator, report_refusal, url_signals,
 };
@@ -523,6 +524,12 @@ pub fn Search() -> impl IntoView {
     // --- live-tail state ----------------------------------------------
     let ring = RwSignal::new(RingBuffer::default());
     let live_snapshot = RwSignal::new(None::<QueryResult>);
+    // The query the OPEN stream was started with. The chart reads its
+    // series, groups and bucket width off the executed query, and
+    // `effective_q` follows the URL at once, so a new query would be
+    // read against the frames of the old stream until the first frame
+    // of the new one landed.
+    let live_query = RwSignal::new(String::new());
     let lagged = RwSignal::new(None::<u64>);
     let stream_failure = RwSignal::new(None::<&'static str>);
     // Aggregation frames this session accepted — the footer's `Updates`
@@ -555,6 +562,7 @@ pub fn Search() -> impl IntoView {
         if current_mode != Mode::Live || q.trim().is_empty() {
             return;
         }
+        live_query.set(q.clone());
 
         let signals = LiveSignals {
             ring,
@@ -578,6 +586,11 @@ pub fn Search() -> impl IntoView {
     // stays app-side (ADR-0002) with a two-line id <-> enum map here.
     let tabs_active = Signal::derive(move || active_tab.get().id().to_string());
     let on_tab_change = Callback::new(move |id: String| active_tab.set(ResultsTab::from_id(&id)));
+    // Every "open Events" control on the Visualization tab — a
+    // refusal's alternative and the caption's route to the rows the
+    // chart left out — goes through the tablist's own setter.
+    let open_events =
+        Callback::new(move |()| on_tab_change.run(ResultsTab::Events.id().to_string()));
 
     // The exact table's sort column and direction, owned here rather
     // than inside the table: the bars beside it slice the SAME sorted
@@ -1129,7 +1142,21 @@ pub fn Search() -> impl IntoView {
                                     // tell it which it has.
                                     let coverage = resp.pagination.clone();
                                     let result = resp.result.clone();
-                                    view! { <Chart snapshot=Signal::derive(move || Some(result.clone())) query=effective_q coverage=Signal::derive(move || Some(coverage.clone()))/> }.into_any()
+                                    // The query THIS response was run
+                                    // with, not the one in the URL: the
+                                    // resource holds the previous
+                                    // response while the next request
+                                    // is in flight.
+                                    let executed = resp.query.effective.clone();
+                                    view! {
+                                        <Chart
+                                            snapshot=Signal::derive(move || Some(result.clone()))
+                                            query=Signal::derive(move || executed.clone())
+                                            coverage=Signal::derive(move || Some(coverage.clone()))
+                                            lane=Lane::Snapshot
+                                            on_events=open_events
+                                        />
+                                    }.into_any()
                                 }
                                 Some(Err(_)) => view! { <div class="results-empty"><p role="alert">"Snapshot query failed. Open Events for the query error."</p><button type="button" class="btn-sec" on:click=move |_| rows.refetch()>"Retry snapshot"</button></div> }.into_any(),
                                 None => view! { <p class="results-empty">"Run a query to visualize its snapshot."</p> }.into_any(),
@@ -1142,7 +1169,15 @@ pub fn Search() -> impl IntoView {
                             // A live stream asks for no window, so there
                             // is no coverage to judge: every frame is the
                             // whole of what the server aggregated.
-                            <Chart snapshot=live_snapshot query=effective_q coverage=Signal::derive(|| None) failure=stream_failure on_retry=retry_stream/>
+                            <Chart
+                                snapshot=live_snapshot
+                                query=live_query
+                                coverage=Signal::derive(|| None)
+                                lane=Lane::Live
+                                on_events=open_events
+                                failure=stream_failure
+                                on_retry=retry_stream
+                            />
                         </div>
                     }.into_any(),
                     (ResultsTab::Visualization, Mode::Live) => view! {
