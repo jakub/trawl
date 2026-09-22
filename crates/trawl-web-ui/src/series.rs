@@ -303,13 +303,24 @@ pub fn align_series(query: &str, result: &QueryResult, lane: Lane) -> Result<Ser
     // A query that does not parse cannot have produced this result; it
     // has no time axis anyone can read off it.
     let ast = trawl_core::parser::parse(query).map_err(|_| Refusal::NoTime)?;
+    // The last timechart is the shape this result carries. A `pivot`,
+    // `top` or `rare` AFTER it supersedes it and is refused by name; one
+    // before it is an input the timechart already consumed, and the
+    // picker's `final_stage_is_timechart` reads the pipeline the same
+    // way, so the two never disagree about whether Line fits. With no
+    // timechart at all, every such stage is "after" it.
     let mut tc: Option<(usize, &TimechartStage)> = None;
     for (i, stage) in ast.pipeline.iter().enumerate() {
+        if let PipeStage::Timechart(t) = &stage.node {
+            tc = Some((i, t));
+        }
+    }
+    let after = tc.map_or(0, |(i, _)| i + 1);
+    for stage in &ast.pipeline[after..] {
         match &stage.node {
             PipeStage::Pivot(_) => return Err(Refusal::Pivot),
             PipeStage::Top(_) => return Err(Refusal::Top),
             PipeStage::Rare(_) => return Err(Refusal::Rare),
-            PipeStage::Timechart(t) => tc = Some((i, t)),
             _ => {}
         }
     }
@@ -1041,6 +1052,16 @@ mod align_series_tests {
     }
 
     #[test]
+    fn an_earlier_top_does_not_refuse_a_final_timechart() {
+        // The picker enables Line when the final aggregation stage is a
+        // timechart; the ladder must agree, whatever fed that timechart.
+        let rows = vec![vec![at(0), Value::Integer(1)]];
+        let r = result(&["_time", "count"], rows);
+        let set = align("* | top 5 host | timechart span=1m count()", &r).expect("drawn");
+        assert_eq!(set.series.len(), 1);
+    }
+
+    #[test]
     fn pivot_top_rare_refuse() {
         let rows = vec![vec![at(0), Value::Integer(1)]];
         let r = result(&["_time", "count"], rows);
@@ -1052,9 +1073,9 @@ mod align_series_tests {
             ),
             ("* | top 5 host", Refusal::Top, "Top"),
             ("* | rare 5 host", Refusal::Rare, "Rare"),
-            // Anywhere in the pipeline, not only last.
+            // After the last timechart it supersedes the shape.
             (
-                "* | top 5 host | timechart span=1m count()",
+                "* | timechart span=1m count() by host | top 5 host",
                 Refusal::Top,
                 "Top",
             ),
