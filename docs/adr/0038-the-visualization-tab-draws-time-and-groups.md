@@ -38,7 +38,9 @@ UTC wall clock without a suffix and a live `_time` is RFC 3339 with `Z`.
 The chart parses exactly those two forms, strictly, and refuses any other
 text in `_time`. The axis is labelled `UTC` and its ticks print the digits
 the Events table prints. uPlot gets `utc: true` so the browser does not
-shift them. Browser-local time is a separate product question.
+shift them. Browser-local time is a separate product question. The live
+stream spells the zero offset `+00:00` (chrono's `to_rfc3339`), so the
+strict parser admits both `Z` and `+00:00`.
 
 **Series come from the query, not from cell types.** The ladder reads the
 `by` fields and the metric columns from the parsed query that produced
@@ -72,12 +74,13 @@ in the caption is measured over the fetched rows, so a cut result never
 claims a total it does not have.
 
 **Column and Bar draw the shape the Events tab's categorical chart
-already admits**: one `by` field, one metric, `stats` as the last stage
-before an optional `sort` or `head`, numbers including floats and
-negatives, nulls tolerated (`crates/trawl-web-ui/src/categorical.rs:76-131`).
-Both types use uPlot with an ordinal x scale and the group labels passed
-through the bridge. Bar is Column rotated. The Events tab and its inline
-bars do not change.
+already admits**: one `by` field, one metric, `stats` as the last stage,
+numbers including floats and negatives, nulls tolerated
+(`crates/trawl-web-ui/src/categorical.rs:76-131`). A trailing `sort` or
+`head` after that `stats` is not admitted today, which the detector's
+own comment (`last_stats`) already explains. Both types use uPlot with
+an ordinal x scale and the group labels passed through the bridge. Bar
+is Column rotated. The Events tab and its inline bars do not change.
 
 **Live feeds the same component.** The live snapshot goes through the
 same ladder, the same resolver, and the same detector. A grouped live

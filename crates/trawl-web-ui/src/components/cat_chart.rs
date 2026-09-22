@@ -7,10 +7,11 @@
 //!
 //! Plain divs, not uPlot. uPlot's category axis would need an
 //! `xLabels` callback plumbed through the opts bridge and a draw hook
-//! for the per-bar value labels, and its refusal ladder exists to keep
-//! grouped shapes OFF the Visualization tab — relaxing it to admit this
-//! one shape would weaken the guard that tab depends on. A list of divs
-//! costs no dependency and reads the same tokens.
+//! for the per-bar value labels. The Visualization tab draws the same
+//! shape as Column or Bar through uPlot instead (ADR-0038); this list
+//! stays beside the exact table because it is the table's companion,
+//! not a chart of its own. A list of divs costs no dependency and reads
+//! the same tokens.
 //!
 //! The chart is `aria-hidden`: every number in it is already in the
 //! exact table beside it, which is the accessible representation. A
