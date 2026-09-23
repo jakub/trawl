@@ -244,7 +244,7 @@ pub async fn ingest(
         ))
     })
     .await
-    .map_err(|e| ServerError::Internal(format!("ingest task panicked: {e}")))??;
+    .map_err(|e| ServerError::from_join("ingest", e))??;
 
     Ok(Json(result))
 }

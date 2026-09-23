@@ -556,6 +556,11 @@ pub mod seam {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex as StdMutex};
 
+    /// The payload a [`Table::panic_at`] gate panics with. A distinctive
+    /// string, so a test can prove it reached nowhere a client or a log
+    /// field can see.
+    pub const INJECTED_PANIC_PAYLOAD: &str = "zz-test-injected-panic-payload";
+
     /// A point in the blocking worker a test can hold or fail.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub enum Seam {
@@ -606,7 +611,7 @@ pub mod seam {
                     .0;
             }
             drop(open);
-            assert!(!self.panics, "test-injected panic at a worker seam");
+            assert!(!self.panics, "{INJECTED_PANIC_PAYLOAD}");
         }
     }
 
@@ -980,26 +985,12 @@ fn run_query_blocking(
     // hot_snapshot drops here → temp file auto-deleted
     let result = match result {
         Ok(r) => r,
-        Err(payload) => Err(ServerError::Internal(format!(
-            "query panicked: {}",
-            panic_text(payload.as_ref())
-        ))),
+        // The payload is dropped unread: it can quote anything DuckDB or
+        // the executor had in hand (ADR-0040).
+        Err(_payload) => Err(ServerError::Panicked("query")),
     };
 
     (result, debug)
-}
-
-/// The message a caught panic carried, for an internal-error string.
-fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
-    payload.downcast_ref::<&str>().map_or_else(
-        || {
-            payload
-                .downcast_ref::<String>()
-                .cloned()
-                .unwrap_or_else(|| "unknown panic".to_owned())
-        },
-        |s| (*s).to_owned(),
-    )
 }
 
 /// Capture debug info about source selection, hot buffer state, and SQL generation.
@@ -1509,11 +1500,8 @@ impl ExecutorPool {
                         severity_columns,
                     }
                 }));
-                outcome.unwrap_or_else(|payload| ExecuteOutcome {
-                    result: Err(ServerError::Internal(format!(
-                        "query worker panicked: {}",
-                        panic_text(payload.as_ref())
-                    ))),
+                outcome.unwrap_or_else(|_payload| ExecuteOutcome {
+                    result: Err(ServerError::Panicked("query worker")),
                     debug: None,
                     severity_columns: Vec::new(),
                 })
@@ -1532,7 +1520,7 @@ impl ExecutorPool {
                 match join_result {
                     Ok(outcome) => outcome,
                     Err(e) => ExecuteOutcome {
-                        result: Err(ServerError::Internal(format!("query task panicked: {e}"))),
+                        result: Err(ServerError::from_join("query", e)),
                         debug: None,
                         severity_columns: Vec::new(),
                     },
@@ -1692,11 +1680,8 @@ impl ExecutorPool {
                         severity_columns,
                     }
                 }));
-                outcome.unwrap_or_else(|payload| ExecuteOutcome {
-                    result: Err(ServerError::Internal(format!(
-                        "query worker panicked: {}",
-                        panic_text(payload.as_ref())
-                    ))),
+                outcome.unwrap_or_else(|_payload| ExecuteOutcome {
+                    result: Err(ServerError::Panicked("query worker")),
                     debug: None,
                     severity_columns: Vec::new(),
                 })
@@ -1710,7 +1695,7 @@ impl ExecutorPool {
                 match join_result {
                     Ok(outcome) => outcome,
                     Err(e) => ExecuteOutcome {
-                        result: Err(ServerError::Internal(format!("query task panicked: {e}"))),
+                        result: Err(ServerError::from_join("query", e)),
                         debug: None,
                         severity_columns: Vec::new(),
                     },
@@ -1875,7 +1860,7 @@ impl ExecutorPool {
                     worker_seam!(seams, Finished);
                     result
                 }));
-                outcome.unwrap_or_else(|_| Err(ServerError::Internal("ping panicked".into())))
+                outcome.unwrap_or_else(|_payload| Err(ServerError::Panicked("ping")))
             }
         });
 
@@ -1883,7 +1868,7 @@ impl ExecutorPool {
         tokio::select! {
             joined = &mut task => {
                 request.disarm();
-                joined.map_err(|e| ServerError::Internal(format!("ping task panicked: {e}")))?
+                joined.map_err(|e| ServerError::from_join("ping", e))?
             }
             () = tokio::time::sleep_until(deadline.instant()) => {
                 if request.abandon() {
@@ -1975,9 +1960,7 @@ impl ExecutorPool {
                     worker_seam!(seams, Finished);
                     result
                 }));
-                outcome.unwrap_or_else(|_| {
-                    Err(ServerError::Internal("field values sample panicked".into()))
-                })
+                outcome.unwrap_or_else(|_payload| Err(ServerError::Panicked("field values sample")))
             }
         });
 
@@ -1990,9 +1973,7 @@ impl ExecutorPool {
         tokio::select! {
             joined = &mut task => {
                 request.disarm();
-                joined.map_err(|e| {
-                    ServerError::Internal(format!("field values task panicked: {e}"))
-                })?
+                joined.map_err(|e| ServerError::from_join("field values sample", e))?
             }
             () = tokio::time::sleep_until(deadline.instant()) => {
                 if request.abandon() {
@@ -2103,12 +2084,7 @@ impl ExecutorPool {
                     worker_seam!(seams, Finished);
                     bytes
                 }));
-                outcome.unwrap_or_else(|payload| {
-                    Err(ServerError::Internal(format!(
-                        "export panicked: {}",
-                        panic_text(payload.as_ref())
-                    )))
-                })
+                outcome.unwrap_or_else(|_payload| Err(ServerError::Panicked("export")))
             }
         });
 
@@ -2118,7 +2094,7 @@ impl ExecutorPool {
                 request.disarm();
                 match join_result {
                     Ok(result) => result,
-                    Err(e) => Err(ServerError::Internal(format!("export task panicked: {e}"))),
+                    Err(e) => Err(ServerError::from_join("export", e)),
                 }
             }
             () = tokio::time::sleep_until(deadline.instant()) => {
@@ -3511,8 +3487,8 @@ mod tests {
                 )
                 .await;
             assert!(
-                matches!(outcome.result, Err(ServerError::Internal(_))),
-                "a panic at {seam_point:?} reports an internal error, got {:?}",
+                matches!(outcome.result, Err(ServerError::Panicked(_))),
+                "a panic at {seam_point:?} reports a panic, got {:?}",
                 outcome.result
             );
             until("cleanup after the panic", || {
@@ -3525,6 +3501,84 @@ mod tests {
             );
             assert_eq!(pool.retained(), 0);
         }
+    }
+
+    /// A panic in the worker answers `Panicked`, and the panic's payload
+    /// reaches neither the error's own renderings, the log line the
+    /// response writes, nor the response body (ADR-0040): a payload can
+    /// quote anything the panicking code had in hand.
+    #[tokio::test]
+    async fn a_pool_panic_answers_panicked_without_its_payload() {
+        use axum::response::IntoResponse;
+        use std::io::Write;
+
+        #[derive(Clone, Default)]
+        struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("capture poisoned")
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let pool = hot_pool(1);
+        let seams = pool.seams();
+        let _gate = seams.panic_at(Seam::Started);
+        let id = pool.allocate_query_id();
+        let err = pool
+            .execute(
+                id,
+                "*",
+                Deadline::after(Duration::from_secs(60)),
+                false,
+                0,
+                TEST_WORK,
+            )
+            .await
+            .result
+            .expect_err("the worker panics");
+
+        assert!(matches!(err, ServerError::Panicked(_)), "got {err:?}");
+        assert_eq!(err.error_class(), "panic");
+        let sentinel = seam::INJECTED_PANIC_PAYLOAD;
+        for rendered in [err.to_string(), format!("{err:?}"), err.safe_message()] {
+            assert!(!rendered.contains(sentinel), "payload leaked: {rendered}");
+        }
+
+        let log = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer({
+                let log = log.clone();
+                move || log.clone()
+            })
+            .finish();
+        let response = {
+            let _default = tracing::subscriber::set_default(subscriber);
+            err.into_response()
+        };
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the body reads");
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(body.contains("internal server error"), "got: {body}");
+        assert!(!body.contains(sentinel), "payload leaked: {body}");
+
+        let log =
+            String::from_utf8(log.0.lock().expect("capture poisoned").clone()).expect("utf-8 log");
+        assert!(log.contains("panic"), "the response logs the panic: {log}");
+        assert!(!log.contains(sentinel), "payload leaked: {log}");
     }
 
     /// A completion landing on the same instant as the timeout produces

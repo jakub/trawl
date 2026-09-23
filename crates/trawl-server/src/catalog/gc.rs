@@ -564,7 +564,7 @@ impl PinGc {
         let data_dir = self.data_dir.clone();
         let walk = tokio::task::spawn_blocking(move || prove_carriers(&data_dir, candidates))
             .await
-            .map_err(|e| ServerError::Internal(format!("pin gc scan task failed: {e}")))?
+            .map_err(|e| ServerError::from_join("pin gc scan", e))?
             .map_err(ServerError::Conflict)?;
 
         if dry_run || walk.dead.is_empty() {

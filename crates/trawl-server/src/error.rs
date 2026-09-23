@@ -107,9 +107,19 @@ pub enum ServerError {
     #[error("service unavailable: auth backend unavailable")]
     AuthBackend(CauseKind),
 
-    /// Internal server error (task panics, unexpected failures).
+    /// Internal server error (unexpected failures).
     #[error("internal error: {0}")]
     Internal(String),
+
+    /// Work on the request path panicked and the panic was caught (500).
+    ///
+    /// Carries a fixed label for what panicked and nothing else: a panic's
+    /// payload can quote anything the panicking code had in hand, so it
+    /// reaches no error, no log field and no response (ADR-0040). Build it
+    /// from a caught unwind by dropping the payload, or from a joined task
+    /// with [`ServerError::from_join`].
+    #[error("{0} panicked")]
+    Panicked(&'static str),
 }
 
 /// What sat underneath a server failure, read off a typed source.
@@ -347,7 +357,7 @@ impl ServerError {
             Self::Store(StoreError::Unavailable(_) | StoreError::Migration(_)) => {
                 "app-state store unavailable".to_owned()
             }
-            Self::Internal(_) => "internal error".to_owned(),
+            Self::Internal(_) | Self::Panicked(_) => "internal error".to_owned(),
             // The two 500-class window errors can quote the saved DSL and
             // the parser's message; the policy refusal below them is the
             // operator's own input and keeps its text.
@@ -408,6 +418,7 @@ impl ServerError {
             // driver's kind rode along; `cause_kind` tells it apart.
             Self::ServiceUnavailable(_) | Self::AuthBackend(_) => "service_unavailable",
             Self::Internal(_) => "internal",
+            Self::Panicked(_) => "panic",
         }
     }
 
@@ -441,7 +452,21 @@ impl ServerError {
             | Self::Timeout
             | Self::Ingest(_)
             | Self::RateLimited
-            | Self::TooManyStreams => CauseKind::None,
+            | Self::TooManyStreams
+            | Self::Panicked(_) => CauseKind::None,
+        }
+    }
+
+    /// Answer for a blocking or spawned task that did not return.
+    ///
+    /// A panic becomes [`ServerError::Panicked`] labelled `what`, and the
+    /// payload is dropped unread: `JoinError`'s `Display` quotes it, so
+    /// the error is never formatted. A cancellation is an ordinary
+    /// internal error, since nothing panicked.
+    pub(crate) fn from_join(what: &'static str, e: tokio::task::JoinError) -> Self {
+        match e.try_into_panic() {
+            Ok(_payload) => Self::Panicked(what),
+            Err(_cancelled) => Self::Internal(format!("{what} task was cancelled")),
         }
     }
 }
@@ -723,8 +748,15 @@ impl IntoResponse for ServerError {
                 StatusCode::SERVICE_UNAVAILABLE,
                 ErrorEnvelope::simple(ErrorCode::ServiceUnavailable, "auth backend unavailable"),
             ),
-            Self::Internal(_) => {
-                tracing::error!(event_type = "internal_error", error = %self, "internal server error");
+            // `self` renders as the fixed label only: a panic's payload
+            // never made it into the variant.
+            Self::Internal(_) | Self::Panicked(_) => {
+                tracing::error!(
+                    event_type = "internal_error",
+                    error_class = self.error_class(),
+                    error = %self,
+                    "internal server error"
+                );
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     ErrorEnvelope::simple(ErrorCode::InternalError, "internal server error"),
@@ -888,6 +920,7 @@ mod tests {
             ServerError::Internal("dsn leaked".into()).error_class(),
             "internal"
         );
+        assert_eq!(ServerError::Panicked("query worker").error_class(), "panic");
     }
 
     /// The cause kind is persisted beside the class, so it is held to the
@@ -997,6 +1030,7 @@ mod tests {
             ),
             (ServerError::Timeout, CauseKind::None),
             (ServerError::Engine(EngineError::Cancelled), CauseKind::None),
+            (ServerError::Panicked("query worker"), CauseKind::None),
             (
                 ServerError::ServiceUnavailable(CAPACITY_NOT_STARTED.to_owned()),
                 CauseKind::None,
@@ -1023,6 +1057,39 @@ mod tests {
         let body = body_string(response).await;
         assert!(body.contains("auth backend unavailable"), "got: {body}");
         assert!(!body.to_lowercase().contains("pool"), "got: {body}");
+    }
+
+    /// A caught panic is a 500 with the same redacted body an internal
+    /// error gets, and its own class.
+    #[tokio::test]
+    async fn a_panic_is_a_redacted_500_with_its_own_class() {
+        let err = ServerError::Panicked("query worker");
+        assert_eq!(err.error_class(), "panic");
+        assert_eq!(err.safe_message(), "internal error");
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = body_string(response).await;
+        assert!(body.contains("\"internal_error\""), "got: {body}");
+        assert!(body.contains("internal server error"), "got: {body}");
+    }
+
+    /// A joined task that panicked answers Panicked and drops the payload;
+    /// one that was cancelled is an ordinary internal error.
+    #[tokio::test]
+    async fn from_join_splits_a_panic_from_a_cancellation() {
+        let panicked = tokio::task::spawn(async { panic!("zz_join_payload_sentinel") })
+            .await
+            .expect_err("the task panics");
+        let err = ServerError::from_join("probe", panicked);
+        assert!(matches!(err, ServerError::Panicked("probe")), "got {err:?}");
+        assert!(!format!("{err} {err:?}").contains("zz_join_payload_sentinel"));
+
+        let pending = tokio::task::spawn(std::future::pending::<()>());
+        pending.abort();
+        let cancelled = pending.await.expect_err("the task is cancelled");
+        let err = ServerError::from_join("probe", cancelled);
+        assert!(matches!(err, ServerError::Internal(_)), "got {err:?}");
+        assert_eq!(err.error_class(), "internal");
     }
 
     #[test]
