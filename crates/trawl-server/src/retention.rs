@@ -86,7 +86,7 @@ pub fn spawn_retention(
                         Err(e) => {
                             tracing::error!(
                                 event_type = "retention_error",
-                                error = %e,
+                                error = %crate::error::join_failure_text("retention", e),
                                 "retention task panicked"
                             );
                         }

@@ -277,7 +277,9 @@ establish that earlier events were recovered.
 events. `preinit_cap` is the capacity boundary before the telemetry sink is
 ready; `buffer_cap` is the shared active-buffer, retry-queue, and in-flight
 memory budget's capacity boundary.
-The rule excludes `write_crashed`.
+The rule excludes `write_crashed` and `unmetered_cap`. An `unmetered_cap`
+drop is an unmetered server-failure event past the fixed cap of 60 persisted
+per minute; it still reached stdout.
 
 Metric increments emitted **before recorder installation are lost**. A
 zero-valued `preinit_cap` series after startup does not prove that no earlier

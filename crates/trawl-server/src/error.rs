@@ -100,9 +100,246 @@ pub enum ServerError {
     #[error("service unavailable: {0}")]
     ServiceUnavailable(String),
 
-    /// Internal server error (task panics, unexpected failures).
+    /// The auth backend could not answer a keystore call (503). The
+    /// driver's typed kind rides along for [`ServerError::cause_kind`]; the
+    /// postgres detail itself is logged where the error is converted and
+    /// never reaches the wire.
+    #[error("service unavailable: auth backend unavailable")]
+    AuthBackend(CauseKind),
+
+    /// Internal server error (unexpected failures).
     #[error("internal error: {0}")]
     Internal(String),
+
+    /// Work on the request path panicked and the panic was caught (500).
+    ///
+    /// Carries a fixed label for what panicked and nothing else: a panic's
+    /// payload can quote anything the panicking code had in hand, so it
+    /// reaches no error, no log field and no response (ADR-0040). Build it
+    /// from a caught unwind by dropping the payload, or from a joined task
+    /// with [`ServerError::from_join`].
+    #[error("{0} panicked")]
+    Panicked(&'static str),
+}
+
+/// What sat underneath a server failure, read off a typed source.
+///
+/// [`ServerError::error_class`] says which failure the server produced;
+/// this says what it came from, when a typed source is there to say so:
+/// an I/O error kind, a `DuckDB` error variant, a database driver error.
+/// It is built only from those types and never from display text, which
+/// can hold generated SQL, event values, the user's DSL and file paths
+/// (ADR-0040). A closed set of literals, so it is as safe to persist as
+/// the class beside it.
+///
+/// Two values carry no source. [`CauseKind::None`] means the class already
+/// names the whole cause: a timeout, a refusal, a caller's mistake.
+/// [`CauseKind::Unknown`] means a server fault whose producer kept no typed
+/// kind, and so points at a producer that should.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CauseKind {
+    /// The class is the whole cause; nothing typed lies beneath it.
+    None,
+    /// A server fault whose source kept no typed kind.
+    Unknown,
+    /// [`std::io::ErrorKind::NotFound`].
+    IoNotFound,
+    /// [`std::io::ErrorKind::PermissionDenied`].
+    IoPermissionDenied,
+    /// [`std::io::ErrorKind::AlreadyExists`].
+    IoAlreadyExists,
+    /// [`std::io::ErrorKind::StorageFull`].
+    IoStorageFull,
+    /// [`std::io::ErrorKind::ReadOnlyFilesystem`].
+    IoReadOnlyFilesystem,
+    /// [`std::io::ErrorKind::TimedOut`].
+    IoTimedOut,
+    /// [`std::io::ErrorKind::Interrupted`].
+    IoInterrupted,
+    /// [`std::io::ErrorKind::UnexpectedEof`].
+    IoUnexpectedEof,
+    /// [`std::io::ErrorKind::InvalidData`].
+    IoInvalidData,
+    /// [`std::io::ErrorKind::OutOfMemory`].
+    IoOutOfMemory,
+    /// Any other I/O error kind.
+    IoOther,
+    /// `DuckDB` itself reported the failure (`duckdb::Error::DuckDBFailure`).
+    /// Its error code is not typed reliably by the driver, so it stops here.
+    DuckdbFailure,
+    /// A value could not be converted between `DuckDB` and Rust types.
+    DuckdbConversion,
+    /// Any other `duckdb::Error` variant: a misuse of the driver's API.
+    DuckdbOther,
+    /// The postgres pool had no connection to give within its timeout.
+    PostgresPoolTimedOut,
+    /// The postgres pool was closed.
+    PostgresPoolClosed,
+    /// Postgres answered with an error of its own.
+    PgServer,
+    /// The connection to postgres failed at the I/O layer.
+    PgIo,
+    /// The connection to postgres failed at the TLS layer.
+    PgTls,
+    /// The postgres wire protocol went wrong.
+    PgProtocol,
+    /// A value or row could not be encoded or decoded.
+    PgDecode,
+    /// A background worker of the driver crashed.
+    PgWorkerCrashed,
+    /// A migration failed to apply.
+    PgMigrate,
+    /// The database's schema history is not one this binary can run on.
+    PgSchema,
+    /// Any other driver error.
+    PgOther,
+    /// The auth keystore's hashing or token-generation worker failed.
+    AuthWorker,
+}
+
+impl CauseKind {
+    /// Every kind, for closed-set checks and for consumers that enumerate.
+    pub const ALL: [Self; 28] = [
+        Self::None,
+        Self::Unknown,
+        Self::IoNotFound,
+        Self::IoPermissionDenied,
+        Self::IoAlreadyExists,
+        Self::IoStorageFull,
+        Self::IoReadOnlyFilesystem,
+        Self::IoTimedOut,
+        Self::IoInterrupted,
+        Self::IoUnexpectedEof,
+        Self::IoInvalidData,
+        Self::IoOutOfMemory,
+        Self::IoOther,
+        Self::DuckdbFailure,
+        Self::DuckdbConversion,
+        Self::DuckdbOther,
+        Self::PostgresPoolTimedOut,
+        Self::PostgresPoolClosed,
+        Self::PgServer,
+        Self::PgIo,
+        Self::PgTls,
+        Self::PgProtocol,
+        Self::PgDecode,
+        Self::PgWorkerCrashed,
+        Self::PgMigrate,
+        Self::PgSchema,
+        Self::PgOther,
+        Self::AuthWorker,
+    ];
+
+    /// The fixed `snake_case` literal this kind is recorded as.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Unknown => "unknown",
+            Self::IoNotFound => "io_not_found",
+            Self::IoPermissionDenied => "io_permission_denied",
+            Self::IoAlreadyExists => "io_already_exists",
+            Self::IoStorageFull => "io_storage_full",
+            Self::IoReadOnlyFilesystem => "io_read_only_filesystem",
+            Self::IoTimedOut => "io_timed_out",
+            Self::IoInterrupted => "io_interrupted",
+            Self::IoUnexpectedEof => "io_unexpected_eof",
+            Self::IoInvalidData => "io_invalid_data",
+            Self::IoOutOfMemory => "io_out_of_memory",
+            Self::IoOther => "io_other",
+            Self::DuckdbFailure => "duckdb_failure",
+            Self::DuckdbConversion => "duckdb_conversion",
+            Self::DuckdbOther => "duckdb_other",
+            Self::PostgresPoolTimedOut => "pg_pool_timed_out",
+            Self::PostgresPoolClosed => "pg_pool_closed",
+            Self::PgServer => "pg_server",
+            Self::PgIo => "pg_io",
+            Self::PgTls => "pg_tls",
+            Self::PgProtocol => "pg_protocol",
+            Self::PgDecode => "pg_decode",
+            Self::PgWorkerCrashed => "pg_worker_crashed",
+            Self::PgMigrate => "pg_migrate",
+            Self::PgSchema => "pg_schema",
+            Self::PgOther => "pg_other",
+            Self::AuthWorker => "auth_worker",
+        }
+    }
+
+    /// The kind of an I/O error, from its [`std::io::ErrorKind`] alone.
+    fn of_io(err: &std::io::Error) -> Self {
+        use std::io::ErrorKind as K;
+        match err.kind() {
+            K::NotFound => Self::IoNotFound,
+            K::PermissionDenied => Self::IoPermissionDenied,
+            K::AlreadyExists => Self::IoAlreadyExists,
+            K::StorageFull => Self::IoStorageFull,
+            K::ReadOnlyFilesystem => Self::IoReadOnlyFilesystem,
+            K::TimedOut => Self::IoTimedOut,
+            K::Interrupted => Self::IoInterrupted,
+            K::UnexpectedEof => Self::IoUnexpectedEof,
+            K::InvalidData => Self::IoInvalidData,
+            K::OutOfMemory => Self::IoOutOfMemory,
+            _ => Self::IoOther,
+        }
+    }
+
+    /// The kind of a `DuckDB` driver error, from its variant alone.
+    fn of_duckdb(err: &duckdb::Error) -> Self {
+        use duckdb::Error as E;
+        match err {
+            E::DuckDBFailure(..) => Self::DuckdbFailure,
+            E::FromSqlConversionFailure(..)
+            | E::ToSqlConversionFailure(_)
+            | E::IntegralValueOutOfRange(..)
+            | E::UnsignedIntegralValueOutOfRange(..)
+            | E::Utf8Error(_)
+            | E::InvalidColumnType(..)
+            | E::ArrowTypeToDuckdbType(..) => Self::DuckdbConversion,
+            _ => Self::DuckdbOther,
+        }
+    }
+
+    /// The kind of a database driver error, from its variant alone.
+    fn of_sqlx(err: &sqlx::Error) -> Self {
+        use sqlx::Error as E;
+        match err {
+            E::PoolTimedOut => Self::PostgresPoolTimedOut,
+            E::PoolClosed => Self::PostgresPoolClosed,
+            E::Database(_) => Self::PgServer,
+            E::Io(_) => Self::PgIo,
+            E::Tls(_) => Self::PgTls,
+            E::Protocol(_) => Self::PgProtocol,
+            E::TypeNotFound { .. }
+            | E::ColumnIndexOutOfBounds { .. }
+            | E::ColumnNotFound(_)
+            | E::ColumnDecode { .. }
+            | E::Encode(_)
+            | E::Decode(_) => Self::PgDecode,
+            E::WorkerCrashed => Self::PgWorkerCrashed,
+            E::Migrate(_) => Self::PgMigrate,
+            _ => Self::PgOther,
+        }
+    }
+
+    /// The kind of a fleet-auth schema check failure.
+    fn of_auth_schema(err: &fleet_auth::SchemaError) -> Self {
+        use fleet_auth::SchemaError as E;
+        match err {
+            E::Migration(_) => Self::PgMigrate,
+            E::Database(e) => Self::of_sqlx(e),
+            _ => Self::PgSchema,
+        }
+    }
+
+    /// The kind of a trawl app-state schema check failure.
+    fn of_store_schema(err: &crate::store::migrations::SchemaError) -> Self {
+        use crate::store::migrations::SchemaError as E;
+        match err {
+            E::LegacyHistory { .. } | E::UntrackedSchema => Self::PgSchema,
+            E::Migration(_) => Self::PgMigrate,
+            E::Database(e) => Self::of_sqlx(e),
+        }
+    }
 }
 
 impl ServerError {
@@ -120,7 +357,7 @@ impl ServerError {
             Self::Store(StoreError::Unavailable(_) | StoreError::Migration(_)) => {
                 "app-state store unavailable".to_owned()
             }
-            Self::Internal(_) => "internal error".to_owned(),
+            Self::Internal(_) | Self::Panicked(_) => "internal error".to_owned(),
             // The two 500-class window errors can quote the saved DSL and
             // the parser's message; the policy refusal below them is the
             // operator's own input and keeps its text.
@@ -139,7 +376,7 @@ impl ServerError {
             // would leave the scheduler's run row and the query tracker
             // unable to tell a capacity refusal from any other 503.
             Self::ServiceUnavailable(msg) if msg == CAPACITY_NOT_STARTED => msg.clone(),
-            Self::ServiceUnavailable(_) => "service unavailable".to_owned(),
+            Self::ServiceUnavailable(_) | Self::AuthBackend(_) => "service unavailable".to_owned(),
             other => other.to_string(),
         }
     }
@@ -177,9 +414,72 @@ impl ServerError {
             Self::Ingest(_) => "ingest",
             Self::RateLimited => "rate_limited",
             Self::TooManyStreams => "too_many_streams",
-            Self::ServiceUnavailable(_) => "service_unavailable",
+            // An auth backend outage is the same 503 it was before the
+            // driver's kind rode along; `cause_kind` tells it apart.
+            Self::ServiceUnavailable(_) | Self::AuthBackend(_) => "service_unavailable",
             Self::Internal(_) => "internal",
+            Self::Panicked(_) => "panic",
         }
+    }
+
+    /// Return what this failure came from, read off its typed source.
+    ///
+    /// SECURITY: like [`error_class`](Self::error_class), this is a closed
+    /// set of literals ([`CauseKind`]) and never a rendering of the error.
+    /// It inspects only enum variants and I/O error kinds.
+    pub fn cause_kind(&self) -> CauseKind {
+        match self {
+            Self::Engine(EngineError::Database(e)) => CauseKind::of_duckdb(e),
+            Self::Engine(EngineError::Io(e)) => CauseKind::of_io(e),
+            Self::Store(StoreError::Unavailable(e)) => CauseKind::of_sqlx(e),
+            Self::Store(StoreError::Migration(e)) => CauseKind::of_store_schema(e),
+            Self::AuthBackend(kind) => *kind,
+            // A pre-start capacity refusal is a pressure outcome the class
+            // names in full. Every other 503 was built from a string and
+            // kept no typed source.
+            Self::ServiceUnavailable(msg) if msg == CAPACITY_NOT_STARTED => CauseKind::None,
+            Self::ServiceUnavailable(_) | Self::Internal(_) => CauseKind::Unknown,
+            Self::Engine(_)
+            | Self::Store(_)
+            | Self::Unauthorized(_)
+            | Self::Forbidden(_)
+            | Self::BadRequest(_)
+            | Self::NotFound(_)
+            | Self::Conflict(_)
+            | Self::WindowPolicy(_)
+            | Self::WindowPlan(_)
+            | Self::WindowMaterialize(_)
+            | Self::Timeout
+            | Self::Ingest(_)
+            | Self::RateLimited
+            | Self::TooManyStreams
+            | Self::Panicked(_) => CauseKind::None,
+        }
+    }
+
+    /// Answer for a blocking or spawned task that did not return.
+    ///
+    /// A panic becomes [`ServerError::Panicked`] labelled `what`, and the
+    /// payload is dropped unread: `JoinError`'s `Display` quotes it, so
+    /// the error is never formatted. A cancellation is an ordinary
+    /// internal error, since nothing panicked.
+    pub(crate) fn from_join(what: &'static str, e: tokio::task::JoinError) -> Self {
+        match e.try_into_panic() {
+            Ok(_payload) => Self::Panicked(what),
+            Err(_cancelled) => Self::Internal(format!("{what} task was cancelled")),
+        }
+    }
+}
+
+/// Fixed text for a background task that did not return, for callers that
+/// carry or log the failure as a string on a persisted target (compaction,
+/// boot conformance, the periodic and shutdown task owners). The payload is
+/// dropped unread, as in [`ServerError::from_join`]: it can quote event
+/// values.
+pub fn join_failure_text(what: &str, e: tokio::task::JoinError) -> String {
+    match e.try_into_panic() {
+        Ok(_payload) => format!("{what} task panicked"),
+        Err(_cancelled) => format!("{what} task was cancelled"),
     }
 }
 
@@ -202,25 +502,27 @@ impl From<fleet_auth::AuthError> for ServerError {
     ///
     /// Backend trouble (pg down, migration state, hash-worker panics) is a
     /// 503 without postgres detail; credential failures stay an opaque 401.
-    /// Anything else in this path is a bug — surface as 500.
+    /// Anything else in this path is a bug — surface as 500. The backend
+    /// 503 keeps the driver's typed kind, so the failure record can say
+    /// which trouble it was without quoting it.
     fn from(err: fleet_auth::AuthError) -> Self {
         use fleet_auth::AuthError as E;
         match err {
             E::Database(e) => {
                 tracing::error!(target: "auth.backend", error = %e, "fleet auth backend error");
-                Self::ServiceUnavailable("auth backend unavailable".into())
+                Self::AuthBackend(CauseKind::of_sqlx(&e))
             }
             E::Migration(e) => {
                 tracing::error!(target: "auth.backend", error = %e, "fleet auth migration error");
-                Self::ServiceUnavailable("auth backend unavailable".into())
+                Self::AuthBackend(CauseKind::PgMigrate)
             }
             E::Schema(e) => {
                 tracing::error!(target: "auth.backend", error = %e, "fleet auth schema error");
-                Self::ServiceUnavailable("auth backend unavailable".into())
+                Self::AuthBackend(CauseKind::of_auth_schema(&e))
             }
             E::Hash(e) | E::TokenGeneration(e) => {
                 tracing::error!(target: "auth.backend", error = %e, "fleet auth worker error");
-                Self::ServiceUnavailable("auth backend unavailable".into())
+                Self::AuthBackend(CauseKind::AuthWorker)
             }
             E::InvalidKey(_) | E::MalformedToken(_) => {
                 Self::Unauthorized("authentication failed".into())
@@ -246,6 +548,10 @@ impl IntoResponse for ServerError {
     #[allow(clippy::too_many_lines)] // exhaustive error table is cohesive
     fn into_response(self) -> Response {
         use trawl_api::{ErrorCode, ErrorEnvelope};
+
+        // The request's failure record takes the class and cause kind,
+        // never this error's text (ADR-0040).
+        crate::transport::failure::record_error(&self);
 
         let (status, envelope) = match &self {
             Self::Engine(EngineError::Parse(errors)) => {
@@ -454,8 +760,19 @@ impl IntoResponse for ServerError {
                 StatusCode::SERVICE_UNAVAILABLE,
                 ErrorEnvelope::simple(ErrorCode::ServiceUnavailable, msg.clone()),
             ),
-            Self::Internal(_) => {
-                tracing::error!(event_type = "internal_error", error = %self, "internal server error");
+            Self::AuthBackend(_) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorEnvelope::simple(ErrorCode::ServiceUnavailable, "auth backend unavailable"),
+            ),
+            // `self` renders as the fixed label only: a panic's payload
+            // never made it into the variant.
+            Self::Internal(_) | Self::Panicked(_) => {
+                tracing::error!(
+                    event_type = "internal_error",
+                    error_class = self.error_class(),
+                    error = %self,
+                    "internal server error"
+                );
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     ErrorEnvelope::simple(ErrorCode::InternalError, "internal server error"),
@@ -619,6 +936,176 @@ mod tests {
             ServerError::Internal("dsn leaked".into()).error_class(),
             "internal"
         );
+        assert_eq!(ServerError::Panicked("query worker").error_class(), "panic");
+    }
+
+    /// The cause kind is persisted beside the class, so it is held to the
+    /// same standard: a closed set of fixed `snake_case` literals, one per
+    /// variant, and `ALL` names every variant exactly once.
+    #[test]
+    fn cause_kind_is_a_closed_snake_case_set() {
+        // Exhaustive on purpose: a new variant fails to compile here until
+        // it is counted, and the count below then holds `ALL` to it.
+        let variants = CauseKind::ALL
+            .iter()
+            .filter(|kind| match kind {
+                CauseKind::None
+                | CauseKind::Unknown
+                | CauseKind::IoNotFound
+                | CauseKind::IoPermissionDenied
+                | CauseKind::IoAlreadyExists
+                | CauseKind::IoStorageFull
+                | CauseKind::IoReadOnlyFilesystem
+                | CauseKind::IoTimedOut
+                | CauseKind::IoInterrupted
+                | CauseKind::IoUnexpectedEof
+                | CauseKind::IoInvalidData
+                | CauseKind::IoOutOfMemory
+                | CauseKind::IoOther
+                | CauseKind::DuckdbFailure
+                | CauseKind::DuckdbConversion
+                | CauseKind::DuckdbOther
+                | CauseKind::PostgresPoolTimedOut
+                | CauseKind::PostgresPoolClosed
+                | CauseKind::PgServer
+                | CauseKind::PgIo
+                | CauseKind::PgTls
+                | CauseKind::PgProtocol
+                | CauseKind::PgDecode
+                | CauseKind::PgWorkerCrashed
+                | CauseKind::PgMigrate
+                | CauseKind::PgSchema
+                | CauseKind::PgOther
+                | CauseKind::AuthWorker => true,
+            })
+            .count();
+        assert_eq!(variants, 28, "ALL lists every variant");
+
+        let mut seen = std::collections::HashSet::new();
+        for kind in CauseKind::ALL {
+            let s = kind.as_str();
+            assert!(!s.is_empty(), "{kind:?} has an empty literal");
+            assert!(
+                s.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+                    && !s.starts_with('_')
+                    && !s.ends_with('_'),
+                "{kind:?} renders as {s:?}, not snake_case"
+            );
+            assert!(seen.insert(s), "{s:?} is used twice");
+        }
+    }
+
+    /// Representative typed sources land on their kinds, and a failure
+    /// with nothing typed beneath it says so instead of guessing.
+    #[test]
+    fn cause_kind_reads_typed_sources() {
+        use std::io::{Error as IoError, ErrorKind};
+        let cases: Vec<(ServerError, CauseKind)> = vec![
+            (
+                ServerError::Engine(EngineError::Io(IoError::from(ErrorKind::NotFound))),
+                CauseKind::IoNotFound,
+            ),
+            (
+                ServerError::Engine(EngineError::Io(IoError::from(ErrorKind::StorageFull))),
+                CauseKind::IoStorageFull,
+            ),
+            (
+                ServerError::Engine(EngineError::Io(IoError::from(ErrorKind::WouldBlock))),
+                CauseKind::IoOther,
+            ),
+            (
+                ServerError::Engine(EngineError::Database(duckdb::Error::InvalidColumnName(
+                    "zz_secret_column".into(),
+                ))),
+                CauseKind::DuckdbOther,
+            ),
+            (
+                ServerError::Engine(EngineError::Database(duckdb::Error::DuckDBFailure(
+                    duckdb::ffi::Error::new(1),
+                    Some("zz_secret_sql".into()),
+                ))),
+                CauseKind::DuckdbFailure,
+            ),
+            (
+                ServerError::Store(StoreError::Unavailable(sqlx::Error::PoolTimedOut)),
+                CauseKind::PostgresPoolTimedOut,
+            ),
+            (
+                ServerError::Store(StoreError::Unavailable(sqlx::Error::Io(IoError::from(
+                    ErrorKind::ConnectionRefused,
+                )))),
+                CauseKind::PgIo,
+            ),
+            (
+                ServerError::from(fleet_auth::AuthError::Database(sqlx::Error::PoolClosed)),
+                CauseKind::PostgresPoolClosed,
+            ),
+            (
+                ServerError::from(fleet_auth::AuthError::Hash("zz_worker".into())),
+                CauseKind::AuthWorker,
+            ),
+            (ServerError::Timeout, CauseKind::None),
+            (ServerError::Engine(EngineError::Cancelled), CauseKind::None),
+            (ServerError::Panicked("query worker"), CauseKind::None),
+            (
+                ServerError::ServiceUnavailable(CAPACITY_NOT_STARTED.to_owned()),
+                CauseKind::None,
+            ),
+            (
+                ServerError::Internal("zz_detail".into()),
+                CauseKind::Unknown,
+            ),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(err.cause_kind(), expected, "wrong cause kind for {err:?}");
+        }
+    }
+
+    /// The auth backend's 503 keeps the answer it always gave while the
+    /// driver's kind rides along for the failure record.
+    #[tokio::test]
+    async fn an_auth_backend_failure_answers_the_same_redacted_503() {
+        let err = ServerError::from(fleet_auth::AuthError::Database(sqlx::Error::PoolTimedOut));
+        assert_eq!(err.error_class(), "service_unavailable");
+        assert_eq!(err.safe_message(), "service unavailable");
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = body_string(response).await;
+        assert!(body.contains("auth backend unavailable"), "got: {body}");
+        assert!(!body.to_lowercase().contains("pool"), "got: {body}");
+    }
+
+    /// A caught panic is a 500 with the same redacted body an internal
+    /// error gets, and its own class.
+    #[tokio::test]
+    async fn a_panic_is_a_redacted_500_with_its_own_class() {
+        let err = ServerError::Panicked("query worker");
+        assert_eq!(err.error_class(), "panic");
+        assert_eq!(err.safe_message(), "internal error");
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = body_string(response).await;
+        assert!(body.contains("\"internal_error\""), "got: {body}");
+        assert!(body.contains("internal server error"), "got: {body}");
+    }
+
+    /// A joined task that panicked answers Panicked and drops the payload;
+    /// one that was cancelled is an ordinary internal error.
+    #[tokio::test]
+    async fn from_join_splits_a_panic_from_a_cancellation() {
+        let panicked = tokio::task::spawn(async { panic!("zz_join_payload_sentinel") })
+            .await
+            .expect_err("the task panics");
+        let err = ServerError::from_join("probe", panicked);
+        assert!(matches!(err, ServerError::Panicked("probe")), "got {err:?}");
+        assert!(!format!("{err} {err:?}").contains("zz_join_payload_sentinel"));
+
+        let pending = tokio::task::spawn(std::future::pending::<()>());
+        pending.abort();
+        let cancelled = pending.await.expect_err("the task is cancelled");
+        let err = ServerError::from_join("probe", cancelled);
+        assert!(matches!(err, ServerError::Internal(_)), "got {err:?}");
+        assert_eq!(err.error_class(), "internal");
     }
 
     #[test]

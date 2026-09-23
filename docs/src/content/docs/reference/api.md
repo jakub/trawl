@@ -1889,8 +1889,11 @@ Prometheus scrape-target labels are separate and remain on every alert.
 | `TrawlFileQuarantine` | `trawl_files_quarantined_total{kind}` | Files successfully renamed into quarantine; `kind` is `wal`, `parquet`, or `rollup_temporary` |
 
 The telemetry drop counter's closed `reason` set is `preinit_cap`,
-`buffer_cap`, and `write_crashed`. The capacity and uncertain-outcome rules
-select disjoint reasons. A crashed telemetry write also increments the
+`buffer_cap`, `write_crashed`, and `unmetered_cap`. The capacity and
+uncertain-outcome rules select disjoint reasons. No rule selects
+`unmetered_cap`: it counts unmetered server-failure events past the fixed
+cap of 60 persisted per minute, and each of those events still reaches
+stdout. A crashed telemetry write also increments the
 inclusive failed-attempt counter; both telemetry failure alerts can fire.
 The WAL durability counter has only `operation="parent_directory_sync"`.
 Existing HTTP rejection reasons other than `wal_failure` remain diagnostic.

@@ -1,0 +1,72 @@
+{
+  "id": "e",
+  "title": "scheduled nets on a shortened interval",
+  "config": {
+    "compaction_interval_secs": 300,
+    "coredns_ev_per_s": 0,
+    "machined_ev_per_s": 0,
+    "sse": null,
+    "nets": true,
+    "pg_pause": false,
+    "query_concurrency": 3,
+    "bound_minutes": 30,
+    "bound_queries": 10000
+  },
+  "started": "2026-09-23T04:57:14.772Z",
+  "queries": 10000,
+  "statuses": {
+    "200": 10000
+  },
+  "fiveXX": [],
+  "contentFailures": 0,
+  "owedFull": 6519,
+  "contentSamples": [],
+  "transportErrors": 0,
+  "startupVisibility": {
+    "window": [
+      "2026-09-23T04:43:33.000Z",
+      "2026-09-23T04:58:00.000Z"
+    ],
+    "owed": 1210,
+    "firstCount": 602,
+    "waitedMs": 252888,
+    "satisfied": true
+  },
+  "ended": "2026-09-23T05:17:24.397Z",
+  "persistedHttpFailures": 0,
+  "netRuns": {
+    "runs": 101,
+    "byStatus": {
+      "success": 101
+    }
+  },
+  "latency": {
+    "p50": 253,
+    "p95": 499,
+    "p99": 599,
+    "max": 705
+  },
+  "durationS": 1210,
+  "ingest": {
+    "accepted": 0,
+    "failed": 0,
+    "statuses": {}
+  },
+  "compaction": {
+    "trawld": {
+      "runs": 4,
+      "merged": 3,
+      "maxRows": 32729,
+      "maxMs": 1031
+    },
+    "coredns": {
+      "runs": 1,
+      "merged": 0,
+      "maxRows": 608,
+      "maxMs": 81
+    }
+  },
+  "httpFailureEvents": 0,
+  "httpFailureShapes": {},
+  "queryFiveXXMatched": 0
+}

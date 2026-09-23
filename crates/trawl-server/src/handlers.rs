@@ -126,6 +126,7 @@ pub async fn query(
     // sees. Allocated before query_start so every lifecycle event correlates
     // on query_id without carrying the query text.
     let query_id = state.query.pool.allocate_query_id();
+    crate::transport::failure::record_query_id(query_id);
     state.query.tracker.start(query_id, &verified, &req.query);
 
     // Default-filter lifecycle events carry metadata only — never the raw
@@ -554,12 +555,19 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthRe
             |_| Ok(()),
         );
 
-    let duckdb_ok = duckdb_join
-        .map_err(|e| format!("task join error: {e}"))
-        .and_then(|r| r.map_err(|e| e.to_string()));
+    // The `DuckDB` probe is the one whose failure answers 503, and the 503
+    // below is built directly rather than through `ServerError`'s response,
+    // so its typed error is recorded here: the request's `http_failure`
+    // names the probe's class and cause, and a caught panic its stage.
+    let duckdb_result = duckdb_join
+        .map_err(|e| ServerError::from_join("ping", e))
+        .and_then(|probe| probe);
+    if let Err(err) = &duckdb_result {
+        crate::transport::failure::record_error(err);
+    }
 
     let mut checks = HashMap::with_capacity(4);
-    let duckdb_healthy = duckdb_ok.is_ok();
+    let duckdb_healthy = duckdb_result.is_ok();
     let auth_healthy = auth_result.is_ok();
     let storage_healthy = storage_result.is_ok();
     let data_healthy = data_result.is_ok();
@@ -2910,15 +2918,17 @@ pub async fn get_report_run(
                 );
             }
             Err(e) => {
+                // A panicked read's JoinError quotes the panic's payload in
+                // its Display, so it is classified, never formatted
+                // (ADR-0040).
+                let err = ServerError::from_join("report run parquet read", e);
                 tracing::error!(
                     event_type = "report_run_parquet_task_failed",
                     run_id,
-                    error = %e,
+                    error_class = err.error_class(),
                     "the parquet read task did not complete"
                 );
-                return Err(ServerError::Internal(
-                    "failed to read the stored report result".into(),
-                ));
+                return Err(err);
             }
         }
     } else {
@@ -2958,6 +2968,7 @@ pub async fn export(
     // One id keys the whole export lifecycle and the pool's interrupt map,
     // so the events correlate without carrying the query text.
     let query_id = state.query.pool.allocate_query_id();
+    crate::transport::failure::record_query_id(query_id);
 
     tracing::info!(
         event_type = "export_start",
@@ -3381,6 +3392,7 @@ pub async fn stream_query(
     // on the DSL, which can carry customer identifiers or incident
     // indicators.
     let query_id = state.query.pool.allocate_query_id();
+    crate::transport::failure::record_query_id(query_id);
 
     tracing::info!(
         event_type = "stream_start",

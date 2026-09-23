@@ -1,0 +1,88 @@
+{
+  "id": "f",
+  "title": "all together",
+  "config": {
+    "compaction_interval_secs": 5,
+    "coredns_ev_per_s": 120,
+    "machined_ev_per_s": 60,
+    "sse": "service=coredns rcode=SERVFAIL",
+    "nets": true,
+    "pg_pause": false,
+    "query_concurrency": 3,
+    "bound_minutes": 30,
+    "bound_queries": 10000
+  },
+  "started": "2026-09-23T05:17:25.070Z",
+  "queries": 10000,
+  "statuses": {
+    "200": 10000
+  },
+  "fiveXX": [],
+  "contentFailures": 0,
+  "owedFull": 9832,
+  "contentSamples": [],
+  "transportErrors": 0,
+  "startupVisibility": {
+    "window": [
+      "2026-09-23T05:02:56.000Z",
+      "2026-09-23T05:17:23.000Z"
+    ],
+    "owed": 0,
+    "firstCount": 0,
+    "waitedMs": 176,
+    "satisfied": true
+  },
+  "ended": "2026-09-23T05:21:58.071Z",
+  "persistedHttpFailures": 0,
+  "netRuns": {
+    "runs": 23,
+    "byStatus": {
+      "success": 23
+    }
+  },
+  "latency": {
+    "p50": 78,
+    "p95": 109,
+    "p99": 168,
+    "max": 363
+  },
+  "durationS": 273,
+  "ingest": {
+    "accepted": 49140,
+    "failed": 0,
+    "statuses": {}
+  },
+  "sse": {
+    "connects": 1,
+    "statuses": {
+      "200": 1
+    },
+    "events": 479,
+    "byName": {
+      "data": 479
+    }
+  },
+  "compaction": {
+    "trawld": {
+      "runs": 48,
+      "merged": 48,
+      "maxRows": 73090,
+      "maxMs": 1077
+    },
+    "coredns": {
+      "runs": 47,
+      "merged": 47,
+      "maxRows": 32768,
+      "maxMs": 429
+    },
+    "machined": {
+      "runs": 47,
+      "merged": 46,
+      "maxRows": 16080,
+      "maxMs": 224
+    }
+  },
+  "httpFailureEvents": 0,
+  "httpFailureShapes": {},
+  "queryFiveXXMatched": 0
+}

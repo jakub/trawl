@@ -1,0 +1,24 @@
+{
+  "accepted": 520000,
+  "retriedStatuses": {},
+  "compaction": {
+    "coredns": {
+      "runs": 1,
+      "merged": 0,
+      "maxRows": 370000,
+      "maxMs": 1507
+    },
+    "trawld": {
+      "runs": 1,
+      "merged": 0,
+      "maxRows": 180,
+      "maxMs": 30
+    },
+    "machined": {
+      "runs": 1,
+      "merged": 0,
+      "maxRows": 150000,
+      "maxMs": 561
+    }
+  }
+}

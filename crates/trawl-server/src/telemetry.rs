@@ -22,9 +22,9 @@
 //!
 //! ## What is persisted (the stdout/telemetry split)
 //!
-//! The stdout logger and this layer build their filters from the same
-//! resolved directive string, but they are not the same filter: the WAL
-//! layer additionally refuses the targets in
+//! The stdout logger and this layer share one filter built from the
+//! resolved directive string, but they do not persist the same events:
+//! the WAL layer additionally refuses the targets in
 //! [`UNMETERED_TARGETS`]. Those events are emitted from request handling
 //! that no per-key rate limiter has metered yet — fleet-auth's bearer
 //! shell, which runs before the limiter; the accept loop, which runs
@@ -33,6 +33,17 @@
 //! would let a client the limiter cannot slow turn a connection or
 //! request flood into durable corpus growth. They stay on stdout, where
 //! retention is the operator's log pipeline rather than trawl's own disk.
+//!
+//! One unmetered event does persist, under a cap: the failure event of a
+//! server 5xx no limiter metered
+//! ([`UNMETERED_FAILURE_TARGET`]).
+//! A server fault before admission, the auth backend down say, is the
+//! incident an operator searches for afterwards, so the layer admits those
+//! events under one process-wide fixed window of
+//! [`UNMETERED_FAILURE_CAP_PER_MINUTE`] (ADR-0040). Past the cap they stay
+//! on stdout only and are counted under drop reason `unmetered_cap`. Only
+//! that exact target is capped: a target beneath it is excluded like any
+//! other unmetered descendant.
 //!
 //! ## Buffering and the bounded retry queue
 //!
@@ -136,6 +147,7 @@ use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::LookupSpan;
 
 use crate::ingest::wal::WalWriter;
+use crate::transport::failure::UNMETERED_FAILURE_TARGET;
 
 // ---------------------------------------------------------------------------
 // Default log filter: the cross-packaging contract
@@ -161,8 +173,8 @@ use crate::ingest::wal::WalWriter;
 ///   persistence, and therefore needing their own directive to stay
 ///   visible on stdout at all.
 ///
-/// This is the stdout filter. Persistence is narrower: see
-/// [`UNMETERED_TARGETS`] and [`wal_filter`].
+/// This is the filter every sink shares. Persistence is narrower: see
+/// [`UNMETERED_TARGETS`] and [`is_persisted_target`].
 pub const DEFAULT_LOG_FILTER: &str = "trawl_server=info,trawld=info,fleet_auth=info,auth.backend=info,storage.backend=info,preauth.transport=info";
 
 /// Target for accept-loop diagnostics that fire before any request — and
@@ -194,7 +206,8 @@ pub const PREAUTH_TRANSPORT_TARGET: &str = "preauth.transport";
 pub const UNMETERED_POLICY_TARGET: &str = "trawl_server::policy::unmetered";
 
 /// Targets emitted from request handling that no per-key rate limiter has
-/// metered: logged, never persisted as `service=trawld` telemetry.
+/// metered, and the panic diagnostic: logged, never persisted as
+/// `service=trawld` telemetry.
 ///
 /// fleet-auth's bearer shell warns on every missing or malformed header and
 /// every invalid or revoked key, and reports keystore trouble under
@@ -222,48 +235,174 @@ pub const UNMETERED_POLICY_TARGET: &str = "trawl_server::policy::unmetered";
 /// stay alarmable. Everything trawld emits behind the limiter still
 /// persists, the rest of `trawl_server` and `storage.backend` included.
 ///
+/// [`UNMETERED_FAILURE_TARGET`], the failure event of a 5xx no limiter
+/// metered, is in this list for its descendants only. A 401 or 403 is the
+/// caller's fault; a 5xx before admission is the server's, the auth backend
+/// down say, and it is the incident an operator searches for afterwards.
+/// The same amplifier argument still holds, so [`is_persisted_target`]
+/// exempts that exact target and [`WalLayer`] admits it under
+/// [`UNMETERED_FAILURE_CAP_PER_MINUTE`] instead of without a bound
+/// (ADR-0040). A target beneath it has no cap and stays excluded.
+///
+/// [`PANIC_TARGET`] is here for a different reason. The panic diagnostic
+/// says where a panic happened, on stdout only; the caught request's own
+/// failure event is the persisted record (ADR-0040).
+///
 /// Matching is by target segment, so `fleet_auth` covers
 /// `fleet_auth::middleware` but never a `fleet_authority` target — and
 /// `trawl_server::policy::unmetered` excludes only itself and its own
 /// descendants, never `trawl_server::policy`.
-pub const UNMETERED_TARGETS: [&str; 4] = [
+pub const UNMETERED_TARGETS: [&str; 6] = [
     "fleet_auth",
     "auth.backend",
     PREAUTH_TRANSPORT_TARGET,
     UNMETERED_POLICY_TARGET,
+    UNMETERED_FAILURE_TARGET,
+    PANIC_TARGET,
 ];
 
-/// Whether events on `target` may be persisted as telemetry — false for
-/// every [`UNMETERED_TARGETS`] entry and its module descendants.
-#[must_use]
-pub fn is_persisted_target(target: &str) -> bool {
-    !UNMETERED_TARGETS.iter().any(|excluded| {
-        target == *excluded
-            || target
-                .strip_prefix(excluded)
-                .is_some_and(|rest| rest.starts_with("::"))
-    })
+/// Target of the panic diagnostic [`install_panic_hook`] emits. A
+/// sub-target of `trawl_server`, so [`DEFAULT_LOG_FILTER`] keeps it on
+/// stdout with no directive of its own, and in [`UNMETERED_TARGETS`], so
+/// it never reaches the WAL.
+pub const PANIC_TARGET: &str = "trawl_server::panic";
+
+/// Replace the process panic hook with one that logs where a panic
+/// happened and never what it said (ADR-0040).
+///
+/// The default hook prints the payload to stderr, and a payload can hold
+/// anything its format string was given: generated SQL, event values, the
+/// caller's DSL, file paths. This hook emits one ERROR event on
+/// [`PANIC_TARGET`] with the source file, line and column and the thread's
+/// name, and nothing else. It does not chain the previous hook, which
+/// would print the payload after all. Call it once the subscriber is
+/// installed, so the event has somewhere to go.
+///
+/// `text_sink` says whether the subscriber has a stdout or file logger to
+/// record that event. The WAL refuses [`PANIC_TARGET`], so the event
+/// reaches nothing without one (the monitor TUI owns stdout and no
+/// `log_file` is configured), or when the log filter disables the target
+/// (`RUST_LOG=trawld=debug` names no `trawl_server` directive). In either
+/// case the hook also writes one line to `stderr`, directly rather than
+/// through tracing: `trawld: panicked at FILE:LINE:COLUMN on thread
+/// 'NAME'`, with no payload. When a text sink records the event it writes
+/// nothing there, so the location is never printed twice.
+///
+/// The event is a root (`parent: None`): the request span it may fire
+/// inside would lend it the raw path and user agent. The WAL layer refuses
+/// the target before taking any lock of its own, so a panic inside that
+/// layer cannot deadlock on its way out.
+pub fn install_panic_hook<W>(text_sink: bool, stderr: W)
+where
+    W: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + Send + Sync + 'static,
+{
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info.location();
+        let thread = std::thread::current();
+        let thread = thread.name().unwrap_or("<unnamed>");
+        // Asked before the event, of the same dispatcher and filter.
+        let recorded = text_sink && tracing::enabled!(target: PANIC_TARGET, tracing::Level::ERROR);
+        tracing::error!(
+            target: PANIC_TARGET,
+            parent: None,
+            event_type = "panic",
+            file = location.map(std::panic::Location::file),
+            line = location.map(std::panic::Location::line),
+            column = location.map(std::panic::Location::column),
+            thread,
+            "panicked"
+        );
+        if !recorded {
+            let at = location.map_or_else(
+                || "<unknown>".to_owned(),
+                |location| {
+                    format!(
+                        "{}:{}:{}",
+                        location.file(),
+                        location.line(),
+                        location.column()
+                    )
+                },
+            );
+            // One write of the whole line, so concurrent panics do not
+            // interleave mid-line. A failed write has nowhere to report.
+            let line = format!("trawld: panicked at {at} on thread '{thread}'\n");
+            let _ = std::io::Write::write_all(&mut stderr.make_writer(), line.as_bytes());
+        }
+    }));
 }
 
-/// The [`WalLayer`]'s filter: the resolved directives and
-/// [`is_persisted_target`].
-///
-/// A second, non-configurable predicate rather than an appended
-/// `fleet_auth=off` directive: `EnvFilter` resolves by specificity, so an
-/// operator `RUST_LOG` naming `fleet_auth::middleware=info` would outrank
-/// an appended target-level `off` and quietly restore the amplifier. The
-/// unmetered exclusion is an invariant of what trawl writes to its own
-/// disk, not a log level — which is also why the grant rejection keeps its
-/// INFO level and loses its target instead of being demoted to DEBUG.
-pub fn wal_filter<S>(directives: &str) -> impl tracing_subscriber::layer::Filter<S> + 'static
-where
-    S: Subscriber + for<'a> LookupSpan<'a>,
-{
-    use tracing_subscriber::filter::FilterExt;
+/// How many unmetered failure events ([`UNMETERED_FAILURE_TARGET`]) the WAL
+/// layer persists per fixed one-minute window, across the whole process
+/// (ADR-0040). A constant with no operator setting: it bounds the durable
+/// writes a client the rate limiter cannot slow can cause, at 60 rows a
+/// minute. Events past it go to stdout only and are counted under drop
+/// reason `unmetered_cap`.
+pub const UNMETERED_FAILURE_CAP_PER_MINUTE: u32 = 60;
 
-    tracing_subscriber::EnvFilter::new(directives).and(tracing_subscriber::filter::filter_fn(
-        |meta: &tracing::Metadata<'_>| is_persisted_target(meta.target()),
-    ))
+/// The fixed window [`UNMETERED_FAILURE_CAP_PER_MINUTE`] counts over.
+const UNMETERED_FAILURE_WINDOW: Duration = Duration::from_mins(1);
+
+/// The one fixed-window cap on persisted unmetered failures.
+///
+/// A window opens at the first event after the previous one closed and
+/// admits [`UNMETERED_FAILURE_CAP_PER_MINUTE`] events. The decision and the
+/// count update happen under one lock, so concurrent events on any number
+/// of threads never admit more than the cap. Fixed memory: no per-peer
+/// state, nothing to evict.
+#[derive(Default)]
+struct UnmeteredFailureCap {
+    /// Start of the open window and the events admitted in it.
+    window: Mutex<Option<(Instant, u32)>>,
+}
+
+impl UnmeteredFailureCap {
+    /// Whether an event at `now` may be persisted, counting it if so.
+    fn admit(&self, now: Instant) -> bool {
+        let mut window = self.window.lock();
+        match window.as_mut() {
+            Some((start, admitted))
+                if now.saturating_duration_since(*start) < UNMETERED_FAILURE_WINDOW =>
+            {
+                if *admitted < UNMETERED_FAILURE_CAP_PER_MINUTE {
+                    *admitted += 1;
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => {
+                *window = Some((now, 1));
+                true
+            }
+        }
+    }
+}
+
+/// Whether events on `target` may be persisted as telemetry — false for
+/// every [`UNMETERED_TARGETS`] entry and its module descendants. True for
+/// the exact unmetered failure target ([`UNMETERED_FAILURE_TARGET`]),
+/// which [`WalLayer`] persists under its own cap; its descendants stay
+/// false, because nothing caps them.
+///
+/// [`WalLayer`] applies it on top of the resolved directives, which every
+/// sink shares. A second, non-configurable predicate rather than an
+/// appended `fleet_auth=off` directive: `EnvFilter` resolves by
+/// specificity, so an operator `RUST_LOG` naming
+/// `fleet_auth::middleware=info` would outrank an appended target-level
+/// `off` and quietly restore the amplifier. The unmetered exclusion is an
+/// invariant of what trawl writes to its own disk, not a log level — which
+/// is also why the grant rejection keeps its INFO level and loses its
+/// target instead of being demoted to DEBUG.
+#[must_use]
+pub fn is_persisted_target(target: &str) -> bool {
+    target == UNMETERED_FAILURE_TARGET
+        || !UNMETERED_TARGETS.iter().any(|excluded| {
+            target == *excluded
+                || target
+                    .strip_prefix(excluded)
+                    .is_some_and(|rest| rest.starts_with("::"))
+        })
 }
 
 /// A resolved log filter: the directive string to install plus an optional
@@ -308,6 +447,100 @@ pub fn resolve_log_filter(env_value: Option<&str>) -> ResolvedLogFilter {
             },
         },
     }
+}
+
+// ---------------------------------------------------------------------------
+// Subscriber construction
+// ---------------------------------------------------------------------------
+
+/// The JSON file logger's layer, as the reload handle in [`FileLogHandle`]
+/// names it.
+pub type JsonLogLayer = tracing_subscriber::fmt::Layer<
+    tracing_subscriber::Registry,
+    tracing_subscriber::fmt::format::JsonFields,
+    tracing_subscriber::fmt::format::Format<tracing_subscriber::fmt::format::Json>,
+    tracing_subscriber::fmt::writer::BoxMakeWriter,
+>;
+
+/// Swaps the JSON file logger's writer from stderr to the configured file
+/// once storage admission has succeeded.
+pub type FileLogHandle =
+    tracing_subscriber::reload::Handle<JsonLogLayer, tracing_subscriber::Registry>;
+
+/// Where trawld's own events go. Each sink is optional, so every startup
+/// shape (monitor or not, telemetry or file log or neither) is one call to
+/// [`build_subscriber`].
+pub struct LogSinks<W> {
+    /// Human-readable lines. `None` while the monitor TUI owns the terminal:
+    /// interleaved log output would corrupt it.
+    pub stdout: Option<W>,
+    /// Self-telemetry into the ingest WAL. Production registers it in place
+    /// of the JSON file logger.
+    pub wal: Option<WalLayer>,
+    /// A JSON logger that writes to stderr until [`FileLogHandle`] points it
+    /// at the configured file. Logging must not create occupancy in a fresh
+    /// root or alter refused storage, so the file opens only after
+    /// admission.
+    pub file_log: bool,
+}
+
+impl<W> std::fmt::Debug for LogSinks<W> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LogSinks")
+            .field("stdout", &self.stdout.is_some())
+            .field("wal", &self.wal)
+            .field("file_log", &self.file_log)
+            .finish()
+    }
+}
+
+/// Build trawld's tracing subscriber from the resolved directives and the
+/// selected sinks. `main` installs the result with `.init()`, which also
+/// installs the `log` bridge.
+///
+/// Returns the file logger's reload handle when [`LogSinks::file_log`] is
+/// set.
+pub fn build_subscriber<W>(
+    directives: &str,
+    sinks: LogSinks<W>,
+) -> (tracing::Dispatch, Option<FileLogHandle>)
+where
+    W: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + Send + Sync + 'static,
+{
+    use tracing_subscriber::fmt;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let (file_layer, file_handle) = if sinks.file_log {
+        let file_layer = fmt::layer()
+            .json()
+            .with_ansi(false)
+            .with_writer(fmt::writer::BoxMakeWriter::new(std::io::stderr));
+        let (file_layer, handle) = tracing_subscriber::reload::Layer::new(file_layer);
+        (Some(file_layer), Some(handle))
+    } else {
+        (None, None)
+    };
+
+    // One global filter from the directives `resolve_log_filter` resolved
+    // (and validated when operator-supplied), shared by every sink. The WAL
+    // layer narrows it with `is_persisted_target` itself.
+    //
+    // Never a per-layer filter per sink. tracing-subscriber keeps per-layer
+    // verdicts in a thread-local bitmap that only a dispatched span or event
+    // consumes. An `enabled()` query that every per-layer filter refuses
+    // still answers true (the registry reports "any enabled" unless all 64
+    // filter bits are set), so sqlx's slow-statement `log_enabled!` probe
+    // goes on to a `tracing::event!` callsite whose interest is `never` and
+    // dispatches nothing. The refusals stay in the bitmap, and the next
+    // span or event on that worker thread inherits them: a request span
+    // vanished from stdout and the WAL alike, and an event was dropped.
+    let filter = tracing_subscriber::EnvFilter::new(directives);
+    let subscriber = tracing_subscriber::registry()
+        .with(file_layer)
+        .with(sinks.stdout.map(|writer| fmt::layer().with_writer(writer)))
+        .with(sinks.wal)
+        .with(filter);
+    (subscriber.into(), file_handle)
 }
 
 // ---------------------------------------------------------------------------
@@ -455,8 +688,16 @@ impl StagedCharge {
     }
 }
 
-/// Drop accounting, reset when the `telemetry_dropped` recovery event is
-/// emitted after a successful write.
+/// Which accumulated losses a `telemetry_dropped` record reports now; see
+/// [`WalLayerInner::report_drops`].
+#[derive(Clone, Copy)]
+enum DropReport {
+    Due,
+    Final,
+}
+
+/// Drop accounting, reset when the `telemetry_dropped` recovery event
+/// reports it ([`WalLayerInner::report_drops`]).
 #[derive(Default)]
 struct DropCounters {
     /// Events dropped by the pre-init 1 MiB cap (exact).
@@ -472,6 +713,9 @@ struct DropCounters {
     crashed_events: AtomicU64,
     /// ndjson bytes consumed by a panicked or cancelled write (exact).
     crashed_bytes: AtomicU64,
+    /// Unmetered failure events past [`UNMETERED_FAILURE_CAP_PER_MINUTE`]
+    /// (exact). No byte count: the event is refused before serialization.
+    unmetered_cap_events: AtomicU64,
 }
 
 struct WalLayerInner {
@@ -504,6 +748,21 @@ struct WalLayerInner {
     host: Option<String>,
     /// Loss accounting for the recovery event and metrics.
     dropped: DropCounters,
+    /// The process-wide cap on persisted unmetered failures. One per
+    /// process because `trawld` builds one layer and every clone shares
+    /// this inner.
+    unmetered_failures: UnmeteredFailureCap,
+    /// When the last `telemetry_dropped` record whose only loss was
+    /// `unmetered_cap` was emitted. Such a record is emitted at most once
+    /// per [`UNMETERED_FAILURE_WINDOW`]: its own write publishes, and a
+    /// client forcing one capped failure per flush tick would otherwise buy
+    /// one durable record per tick. Held-back counts accumulate for the next
+    /// permitted record.
+    last_unmetered_report: Mutex<Option<Instant>>,
+    /// Test-only clock offset, so a test can move the cap's window without
+    /// waiting a minute.
+    #[cfg(test)]
+    clock_offset: Mutex<Duration>,
     /// Last time a WAL failure was reported to stderr (rate limit).
     last_stderr: Mutex<Option<Instant>>,
     /// Deferred event bus for real-time fanout (SSE streaming).
@@ -590,6 +849,10 @@ impl WalLayer {
                 envs: envs.into(),
                 derivation,
                 dropped: DropCounters::default(),
+                unmetered_failures: UnmeteredFailureCap::default(),
+                last_unmetered_report: Mutex::new(None),
+                #[cfg(test)]
+                clock_offset: Mutex::new(Duration::ZERO),
                 last_stderr: Mutex::new(None),
                 bus: OnceLock::new(),
                 hot_buffer: OnceLock::new(),
@@ -643,6 +906,7 @@ impl WalLayer {
                 }
             }
         }
+        self.inner.report_idle_drops();
         self.inner.update_gauges();
     }
 
@@ -706,19 +970,51 @@ impl WalLayer {
                     self.inner.staged.release(in_flight.0, in_flight.1);
                     self.inner
                         .record_crashed_drop(in_flight.0 as u64, in_flight.2 as u64);
+                    // Fixed text: the join error's Display quotes the
+                    // panic payload, which can hold event values.
                     self.inner.record_write_failure(
-                        &std::io::Error::other(join_err),
+                        &std::io::Error::other(crate::error::join_failure_text(
+                            "telemetry WAL write",
+                            join_err,
+                        )),
                         WriteFailureDisposition::Dropped,
                     );
                     break;
                 }
             }
         }
+        self.inner.report_idle_drops();
         self.inner.update_gauges();
     }
 }
 
 impl WalLayerInner {
+    /// The unmetered cap's clock: monotonic, and movable by tests.
+    #[cfg_attr(not(test), allow(clippy::unused_self))]
+    fn cap_clock(&self) -> Instant {
+        let now = Instant::now();
+        #[cfg(test)]
+        let now = now + *self.clock_offset.lock();
+        now
+    }
+
+    /// Whether an unmetered failure event may be persisted. Past the cap,
+    /// counts it as dropped under reason `unmetered_cap`.
+    fn admit_unmetered_failure(&self) -> bool {
+        if self.unmetered_failures.admit(self.cap_clock()) {
+            return true;
+        }
+        self.dropped
+            .unmetered_cap_events
+            .fetch_add(1, Ordering::Relaxed);
+        metrics::counter!(
+            crate::metrics::TELEMETRY_EVENTS_DROPPED_TOTAL,
+            "reason" => crate::metrics::TelemetryDropReason::UnmeteredCap.label()
+        )
+        .increment(1);
+        false
+    }
+
     /// The pre-init cap: while the writer is not yet set, the active
     /// buffer is the only place events can go, so it is bounded on its
     /// own. Returns whether this event must be dropped.
@@ -917,8 +1213,8 @@ impl WalLayerInner {
 
     /// Publish a durably-written batch to the hot buffer and event bus —
     /// strictly after WAL success, exactly once (the batch was popped).
-    /// Then emit the `telemetry_dropped` recovery record if any loss
-    /// accumulated (safe from recursion: `on_event` only buffers).
+    /// Then emit the `telemetry_dropped` recovery record if any loss is
+    /// due ([`Self::report_drops`]).
     /// The caller holds the publication read guard from before WAL writing.
     fn publish(&self, env: &str, wal_path: &std::path::Path, batch: Batch) {
         #[cfg(test)]
@@ -961,16 +1257,51 @@ impl WalLayerInner {
             }
         }
 
+        self.report_drops(DropReport::Due);
+    }
+
+    /// Report due losses at the end of a flush cycle, once the retry queue
+    /// is empty. No write follows then to report them from `publish` (a
+    /// crashed write, a deferred `unmetered_cap` count whose window has
+    /// opened, no traffic), and the active buffer has just been drained,
+    /// so the record is admitted rather than refused by a nearly full
+    /// buffer; the next cycle writes it. While the queue holds a failed
+    /// batch the counts wait for the write that drains it.
+    fn report_idle_drops(&self) {
+        if self.pending.lock().is_empty() {
+            self.report_drops(DropReport::Due);
+        }
+    }
+
+    /// Emit the `telemetry_dropped` recovery record if any loss has
+    /// accumulated (safe from recursion: `on_event` only buffers, and the
+    /// next write carries the record). `when` picks which losses are due:
+    ///
+    /// - [`DropReport::Due`]: every reason, except that a record reporting
+    ///   only `unmetered_cap` waits for its window
+    ///   ([`Self::take_unmetered_only_drops`]). Asked after each write and
+    ///   at the end of an idle cycle ([`Self::report_idle_drops`]).
+    /// - [`DropReport::Final`]: everything, regardless of the window. The
+    ///   shutdown drain's one last record.
+    fn report_drops(&self, when: DropReport) {
         let preinit_events = self.dropped.preinit_events.swap(0, Ordering::Relaxed);
         let preinit_bytes = self.dropped.preinit_bytes.swap(0, Ordering::Relaxed);
         let cap_events = self.dropped.cap_events.swap(0, Ordering::Relaxed);
         let cap_bytes = self.dropped.cap_bytes.swap(0, Ordering::Relaxed);
         let crashed_events = self.dropped.crashed_events.swap(0, Ordering::Relaxed);
         let crashed_bytes = self.dropped.crashed_bytes.swap(0, Ordering::Relaxed);
-        if preinit_events + cap_events + crashed_events > 0 {
+        let unmetered_cap_events = if matches!(when, DropReport::Final)
+            || preinit_events + cap_events + crashed_events > 0
+        {
+            self.dropped.unmetered_cap_events.swap(0, Ordering::Relaxed)
+        } else {
+            self.take_unmetered_only_drops()
+        };
+        if preinit_events + cap_events + crashed_events + unmetered_cap_events > 0 {
             tracing::warn!(
                 event_type = "telemetry_dropped",
-                dropped_events = preinit_events + cap_events + crashed_events,
+                dropped_events =
+                    preinit_events + cap_events + crashed_events + unmetered_cap_events,
                 dropped_bytes = preinit_bytes + cap_bytes + crashed_bytes,
                 dropped_events_preinit_cap = preinit_events,
                 dropped_bytes_preinit_cap = preinit_bytes,
@@ -978,10 +1309,34 @@ impl WalLayerInner {
                 dropped_bytes_buffer_cap = cap_bytes,
                 dropped_events_write_crashed = crashed_events,
                 dropped_bytes_write_crashed = crashed_bytes,
+                dropped_events_unmetered_cap = unmetered_cap_events,
                 "telemetry events were lost (see reason totals; \
-                 preinit_cap bytes are a mean-line-size estimate)"
+                 preinit_cap bytes are a mean-line-size estimate; \
+                 unmetered_cap counts no bytes)"
             );
         }
+    }
+
+    /// The `unmetered_cap` count for a recovery record that would report
+    /// nothing else: all of it when no such record was emitted within the
+    /// last [`UNMETERED_FAILURE_WINDOW`], otherwise zero, leaving the count
+    /// to accumulate. Unmetered failures are client-driven, and the record's
+    /// own write publishes, so without this a client forcing one capped
+    /// failure per flush tick buys one durable row and WAL file per tick. With
+    /// it, the capped failures and their drop records persist at most the cap
+    /// plus one row per window. Decided under the lock, so concurrent
+    /// publishes cannot both take a window's one record.
+    fn take_unmetered_only_drops(&self) -> u64 {
+        let mut last = self.last_unmetered_report.lock();
+        if self.dropped.unmetered_cap_events.load(Ordering::Relaxed) == 0 {
+            return 0;
+        }
+        let now = self.cap_clock();
+        if last.is_some_and(|at| now.saturating_duration_since(at) < UNMETERED_FAILURE_WINDOW) {
+            return 0;
+        }
+        *last = Some(now);
+        self.dropped.unmetered_cap_events.swap(0, Ordering::Relaxed)
     }
 
     /// Record a WAL write failure: scrapeable counter plus rate-limited
@@ -1099,6 +1454,10 @@ where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
     fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
+        // An unmetered span lends no fields to the events inside it.
+        if !is_persisted_target(attrs.metadata().target()) {
+            return;
+        }
         let mut visitor = JsonVisitor::new();
         attrs.record(&mut visitor);
         if let Some(span) = ctx.span(id) {
@@ -1118,7 +1477,20 @@ where
     }
 
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
-        // The pre-init cap runs first, before any work this event would
+        // Unmetered events are logged, never persisted (UNMETERED_TARGETS),
+        // except the exact unmetered failure target, which persists under
+        // its own process-wide cap (ADR-0040). Its descendants fall through
+        // to the exclusion and never reach the cap.
+        let target = event.metadata().target();
+        if target == UNMETERED_FAILURE_TARGET {
+            if !self.inner.admit_unmetered_failure() {
+                return;
+            }
+        } else if !is_persisted_target(target) {
+            return;
+        }
+
+        // The pre-init cap runs next, before any work this event would
         // otherwise cost — canonicalization included.
         if self.inner.shed_at_preinit_cap() {
             return;
@@ -1336,7 +1708,15 @@ pub fn spawn_flush_task(
 /// inside the flush path, and the layer's buffer is about to be abandoned
 /// anyway, so a tracing event would be both re-entrant risk and invisible.
 async fn final_flush(layer: &WalLayer) {
-    if tokio::time::timeout(SHUTDOWN_FLUSH_BUDGET, layer.flush_cycle())
+    // Drain, then report every loss still pending, whatever its window,
+    // and write that one last record. Anything the last write's publish
+    // buffers after it is abandoned with the rest of the buffer.
+    let drain = async {
+        layer.flush_cycle().await;
+        layer.inner.report_drops(DropReport::Final);
+        layer.flush_cycle().await;
+    };
+    if tokio::time::timeout(SHUTDOWN_FLUSH_BUDGET, drain)
         .await
         .is_err()
     {
@@ -1434,6 +1814,15 @@ mod tests {
         // request forever.
         assert!(!is_persisted_target(UNMETERED_POLICY_TARGET));
         assert!(!is_persisted_target("trawl_server::policy::unmetered::x"));
+        // The panic diagnostic is stdout-only; the caught request's failure
+        // event is the persisted record.
+        assert!(!is_persisted_target(PANIC_TARGET));
+        // The unmetered failure target itself persists under its cap; its
+        // descendants have no cap, so they stay excluded.
+        assert!(is_persisted_target(UNMETERED_FAILURE_TARGET));
+        assert!(!is_persisted_target(
+            "trawl_server::transport::failure::unmetered::x"
+        ));
         // Prefix matching is per segment, not per byte.
         assert!(is_persisted_target("fleet_authority"));
         assert!(is_persisted_target("fleet_auth_shim::x"));
@@ -1450,16 +1839,20 @@ mod tests {
     /// the WAL layer: fleet-auth's bearer shell and trawl's own grant check
     /// both run outside the rate limiter, so persisting them would let a
     /// client the limiter cannot slow grow the corpus one durable record per
-    /// rejected request.
+    /// rejected request. An unmetered span lends no fields either. Drives
+    /// the subscriber `trawld` installs.
     #[test]
-    fn wal_filter_drops_unmetered_targets_the_stdout_filter_keeps() {
-        use tracing_subscriber::prelude::*;
-
-        let capture = CaptureLayer::default();
-        let events = Arc::clone(&capture.events);
-        let subscriber = tracing_subscriber::registry()
-            .with(capture.with_filter(wal_filter(DEFAULT_LOG_FILTER)));
-        let _guard = tracing::subscriber::set_default(subscriber);
+    fn wal_layer_drops_unmetered_targets_the_stdout_filter_keeps() {
+        let layer = WalLayer::new(WalHandle::new(), "prod");
+        let (subscriber, _) = build_subscriber::<fn() -> std::io::Sink>(
+            DEFAULT_LOG_FILTER,
+            LogSinks {
+                stdout: None,
+                wal: Some(layer.clone()),
+                file_log: false,
+            },
+        );
+        let _guard = tracing::dispatcher::set_default(&subscriber);
 
         tracing::warn!(target: "fleet_auth::middleware", "auth: missing or malformed bearer header");
         tracing::warn!(target: "fleet_auth::middleware", "auth: invalid or revoked key");
@@ -1469,26 +1862,482 @@ mod tests {
         tracing::info!(target: "trawl_server::policy", "policy: metered event");
         tracing::error!(target: "storage.backend", "app-state store error");
         tracing::info!(target: "trawld", "starting trawld");
+        tracing::info!(target: "hyper::proto", "dependency noise");
+        tracing::info_span!(target: "fleet_auth::middleware", "authn", key_hint = "unmetered")
+            .in_scope(
+                || tracing::info!(target: "trawl_server::handlers", "inside an unmetered span"),
+            );
 
-        let seen = events.lock();
-        let targets: Vec<&str> = seen.iter().map(|(t, _)| t.as_str()).collect();
+        let events = layer.inner.active.lock().events.clone();
+        let targets: Vec<&str> = events
+            .iter()
+            .map(|event| event["target"].as_str().unwrap())
+            .collect();
         for excluded in [
             "fleet_auth::middleware",
             "auth.backend",
             PREAUTH_TRANSPORT_TARGET,
             UNMETERED_POLICY_TARGET,
+            "hyper::proto",
         ] {
             assert!(
                 !targets.contains(&excluded),
-                "unmetered target {excluded} must not be persisted; saw {targets:?}"
+                "target {excluded} must not be persisted; saw {targets:?}"
             );
         }
-        for kept in ["trawl_server::policy", "storage.backend", "trawld"] {
+        for kept in [
+            "trawl_server::policy",
+            "storage.backend",
+            "trawld",
+            "trawl_server::handlers",
+        ] {
             assert!(
                 targets.contains(&kept),
                 "target {kept} must still be persisted; saw {targets:?}"
             );
         }
+        let inside = events
+            .iter()
+            .find(|event| event["target"] == "trawl_server::handlers")
+            .unwrap();
+        assert!(
+            !inside.contains_key("key_hint"),
+            "an unmetered span must lend no fields to a persisted event: {inside:?}"
+        );
+    }
+
+    /// Everything a test subscriber writes to stdout.
+    #[derive(Clone, Default)]
+    struct StdoutCapture(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for StdoutCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for StdoutCapture {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl StdoutCapture {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().clone()).unwrap()
+        }
+    }
+
+    /// The window opens at its first event and admits exactly the cap, and
+    /// concurrent callers share that one decision.
+    #[test]
+    fn the_unmetered_failure_cap_is_one_decision_across_threads() {
+        let cap = UnmeteredFailureCap::default();
+        let opened = Instant::now();
+        let admitted = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for _ in 0..50 {
+                        if cap.admit(opened) {
+                            admitted.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            admitted.load(Ordering::Relaxed),
+            UNMETERED_FAILURE_CAP_PER_MINUTE as usize
+        );
+        let almost = UNMETERED_FAILURE_WINDOW.saturating_sub(Duration::from_millis(1));
+        assert!(!cap.admit(opened + almost), "the window is still full");
+        assert!(
+            cap.admit(opened + UNMETERED_FAILURE_WINDOW),
+            "a new window admits again"
+        );
+    }
+
+    /// 61 unmetered failures in one window: the first 60 persist, the 61st
+    /// reaches stdout only and is counted under `unmetered_cap`, on the
+    /// metric and in the `telemetry_dropped` recovery record. Once the
+    /// window rolls over, the next one persists again. A target beneath the
+    /// capped one persists neither before nor after the cap fills, and never
+    /// counts against it or under `unmetered_cap`.
+    #[test]
+    fn unmetered_5xx_persist_until_the_cap_then_count_as_dropped() {
+        use crate::metrics::test_support::sample;
+        const DROPPED: &str = "trawl_telemetry_events_dropped_total{reason=\"unmetered_cap\"}";
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let metrics_handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            crate::metrics::init_operational_alert_metrics();
+            let tmp = tempfile::tempdir().unwrap();
+            let writer = Arc::new(WalWriter::new(tmp.path().to_path_buf()));
+            writer.ensure_dir().unwrap();
+            let handle = WalHandle::new();
+            handle.set(writer, "prod");
+            let layer = WalLayer::new(handle, "prod");
+            let stdout = StdoutCapture::default();
+            let (subscriber, _) = build_subscriber(
+                DEFAULT_LOG_FILTER,
+                LogSinks {
+                    stdout: Some(stdout.clone()),
+                    wal: Some(layer.clone()),
+                    file_log: false,
+                },
+            );
+            let _guard = tracing::dispatcher::set_default(&subscriber);
+            let fail = |n: u32| {
+                let request_id = format!("zz-cap-{n:03}");
+                tracing::error!(
+                    target: UNMETERED_FAILURE_TARGET,
+                    event_type = "http_failure",
+                    request_id = request_id.as_str(),
+                    "request failed"
+                );
+            };
+            let fail_child = |id: &str| {
+                tracing::error!(
+                    target: "trawl_server::transport::failure::unmetered::x",
+                    event_type = "http_failure",
+                    request_id = id,
+                    "request failed"
+                );
+            };
+            let persisted = || -> Vec<String> {
+                layer.flush();
+                read_wal_events(&tmp.path().join("prod"))
+                    .into_iter()
+                    .filter(|event| event["event_type"] == "http_failure")
+                    .map(|event| event["request_id"].as_str().unwrap().to_owned())
+                    .collect()
+            };
+
+            fail_child("zz-child-before");
+            for n in 0..=UNMETERED_FAILURE_CAP_PER_MINUTE {
+                fail(n);
+            }
+            fail_child("zz-child-after");
+            let ids = persisted();
+            let expected: Vec<String> = (0..UNMETERED_FAILURE_CAP_PER_MINUTE)
+                .map(|n| format!("zz-cap-{n:03}"))
+                .collect();
+            assert_eq!(
+                ids, expected,
+                "exactly the first 60 persist, and no child-target event"
+            );
+            assert!(
+                stdout.text().contains("zz-cap-060"),
+                "the 61st still reaches stdout"
+            );
+            assert_eq!(sample(&metrics_handle, DROPPED), 1);
+
+            // The recovery record is buffered by the write that published
+            // the batch, and reaches the WAL with the next one.
+            layer.flush();
+            let reports: Vec<_> = read_wal_events(&tmp.path().join("prod"))
+                .into_iter()
+                .filter(|event| event["event_type"] == "telemetry_dropped")
+                .collect();
+            assert_eq!(reports.len(), 1, "{reports:?}");
+            assert_eq!(reports[0]["dropped_events"], 1);
+            assert_eq!(reports[0]["dropped_events_unmetered_cap"], 1);
+
+            *layer.inner.clock_offset.lock() += UNMETERED_FAILURE_WINDOW;
+            fail(61);
+            assert!(
+                persisted().contains(&"zz-cap-061".to_owned()),
+                "a new window admits again"
+            );
+            assert_eq!(sample(&metrics_handle, DROPPED), 1);
+        });
+    }
+
+    /// A client forcing one unmetered failure per flush tick after the cap
+    /// fills must not buy one durable row per tick through the recovery
+    /// record: each record's write would publish while a new cap drop is
+    /// pending and buffer the next record, forever. Within one cap window the
+    /// unmetered failures and their drop records persist at most the cap plus
+    /// one row, and the drops held back are reported, exactly, on the first
+    /// record the next window permits.
+    #[test]
+    fn cap_drops_cannot_drive_an_unbounded_run_of_drop_records() {
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = Arc::new(WalWriter::new(tmp.path().to_path_buf()));
+        writer.ensure_dir().unwrap();
+        let handle = WalHandle::new();
+        handle.set(writer, "prod");
+        let layer = WalLayer::new(handle, "prod");
+        let (subscriber, _) = build_subscriber::<fn() -> std::io::Sink>(
+            DEFAULT_LOG_FILTER,
+            LogSinks {
+                stdout: None,
+                wal: Some(layer.clone()),
+                file_log: false,
+            },
+        );
+        let _guard = tracing::dispatcher::set_default(&subscriber);
+        let fail = |n: u32| {
+            tracing::error!(
+                target: UNMETERED_FAILURE_TARGET,
+                event_type = "http_failure",
+                n,
+                "request failed"
+            );
+        };
+        let cap = UNMETERED_FAILURE_CAP_PER_MINUTE;
+        let overflow = 2 * cap;
+
+        // Fill the cap, then one overflow while an ordinary persisted event
+        // kicks the recovery record off, then one overflow per flush tick.
+        for n in 0..cap {
+            fail(n);
+        }
+        layer.flush();
+        fail(cap);
+        tracing::info!(target: "trawld", "one ordinary event");
+        layer.flush();
+        for n in cap + 1..cap + overflow {
+            fail(n);
+            layer.flush();
+        }
+        layer.flush();
+
+        let events = read_wal_events(&tmp.path().join("prod"));
+        let count = |event_type: &str| {
+            events
+                .iter()
+                .filter(|event| event["event_type"] == event_type)
+                .count()
+        };
+        assert_eq!(count("http_failure"), cap as usize);
+        assert!(
+            count("http_failure") + count("telemetry_dropped") <= cap as usize + 1,
+            "one cap window persisted {} unmetered failures and {} drop records",
+            count("http_failure"),
+            count("telemetry_dropped")
+        );
+
+        // The next window permits a record again: the first write in it
+        // reports every drop held back, and nothing is lost or counted twice.
+        *layer.inner.clock_offset.lock() += UNMETERED_FAILURE_WINDOW;
+        tracing::info!(target: "trawld", "an ordinary event in the next window");
+        layer.flush();
+        layer.flush();
+        let reported: u64 = read_wal_events(&tmp.path().join("prod"))
+            .iter()
+            .filter(|event| event["event_type"] == "telemetry_dropped")
+            .map(|event| event["dropped_events_unmetered_cap"].as_u64().unwrap())
+            .sum();
+        assert_eq!(reported, u64::from(overflow));
+    }
+
+    /// A WAL layer writing under a fresh directory, installed as the
+    /// thread's default subscriber, for the deferred-summary tests.
+    fn deferred_summary_fixture() -> (
+        tempfile::TempDir,
+        WalLayer,
+        tracing::subscriber::DefaultGuard,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = Arc::new(WalWriter::new(tmp.path().to_path_buf()));
+        writer.ensure_dir().unwrap();
+        let handle = WalHandle::new();
+        handle.set(writer, "prod");
+        let layer = WalLayer::new(handle, "prod");
+        let (subscriber, _) = build_subscriber::<fn() -> std::io::Sink>(
+            DEFAULT_LOG_FILTER,
+            LogSinks {
+                stdout: None,
+                wal: Some(layer.clone()),
+                file_log: false,
+            },
+        );
+        let guard = tracing::dispatcher::set_default(&subscriber);
+        (tmp, layer, guard)
+    }
+
+    fn unmetered_failure() {
+        tracing::error!(
+            target: UNMETERED_FAILURE_TARGET,
+            event_type = "http_failure",
+            "request failed"
+        );
+    }
+
+    /// The `dropped_events_unmetered_cap` total across stored drop records.
+    fn reported_unmetered_drops(env_dir: &std::path::Path) -> u64 {
+        read_wal_events(env_dir)
+            .iter()
+            .filter(|event| event["event_type"] == "telemetry_dropped")
+            .map(|event| event["dropped_events_unmetered_cap"].as_u64().unwrap())
+            .sum()
+    }
+
+    /// Fill the cap, get the window's one drop record written, then drop
+    /// `deferred` more while that record's window is closed. Returns the
+    /// total dropped.
+    fn defer_unmetered_drops(layer: &WalLayer, deferred: u64) -> u64 {
+        for _ in 0..=UNMETERED_FAILURE_CAP_PER_MINUTE {
+            unmetered_failure();
+        }
+        tracing::info!(target: "trawld", "one ordinary event");
+        layer.flush();
+        layer.flush();
+        for _ in 0..deferred {
+            unmetered_failure();
+        }
+        layer.flush();
+        1 + deferred
+    }
+
+    /// Drops deferred past the window's one record reach the WAL once the
+    /// next window opens, on the periodic flush alone: no other event
+    /// arrives to publish a batch.
+    #[tokio::test]
+    async fn deferred_cap_drops_reach_the_wal_without_traffic() {
+        let (tmp, layer, _guard) = deferred_summary_fixture();
+        let env_dir = tmp.path().join("prod");
+        let dropped = defer_unmetered_drops(&layer, 5);
+        assert_eq!(
+            reported_unmetered_drops(&env_dir),
+            1,
+            "the window's one record"
+        );
+
+        layer.flush_cycle().await;
+        assert_eq!(
+            reported_unmetered_drops(&env_dir),
+            1,
+            "no second record while the window is closed"
+        );
+
+        *layer.inner.clock_offset.lock() += UNMETERED_FAILURE_WINDOW;
+        layer.flush_cycle().await;
+        layer.flush_cycle().await;
+        assert_eq!(reported_unmetered_drops(&env_dir), dropped);
+        let failures = read_wal_events(&env_dir)
+            .iter()
+            .filter(|event| event["event_type"] == "http_failure")
+            .count();
+        assert_eq!(failures, UNMETERED_FAILURE_CAP_PER_MINUTE as usize);
+    }
+
+    /// A due summary is buffered where the flush has just drained the
+    /// active buffer, never ahead of a nearly full one: refused admission
+    /// there would lose the deferred count along with the record.
+    #[tokio::test]
+    async fn a_due_summary_is_not_refused_by_a_nearly_full_buffer() {
+        let (tmp, layer, _guard) = deferred_summary_fixture();
+        let env_dir = tmp.path().join("prod");
+        let dropped = defer_unmetered_drops(&layer, 5);
+        *layer.inner.clock_offset.lock() += UNMETERED_FAILURE_WINDOW;
+
+        for n in 0..20 {
+            tracing::info!(target: "trawld", n, "ordinary traffic");
+        }
+        let charge = layer.inner.active.lock().charge();
+        layer
+            .inner
+            .max_buffer_bytes
+            .store(charge + 100, Ordering::Relaxed);
+        layer.flush_cycle().await;
+        layer.flush_cycle().await;
+        assert_eq!(reported_unmetered_drops(&env_dir), dropped);
+    }
+
+    /// A crashed write with no traffic after it: the flush has nothing
+    /// left to write, so the idle report carries every due count, the
+    /// crash and the deferred `unmetered_cap` drops alike, exactly.
+    #[tokio::test]
+    async fn a_crashed_write_does_not_hold_back_the_idle_report() {
+        let (tmp, layer, _guard) = deferred_summary_fixture();
+        let env_dir = tmp.path().join("prod");
+        let dropped = defer_unmetered_drops(&layer, 5);
+        assert_eq!(reported_unmetered_drops(&env_dir), 1);
+        tracing::info!(target: "trawld", "lost to the crashed write");
+        layer.inner.panic_next_write.store(true, Ordering::Relaxed);
+        layer.flush_cycle().await;
+        *layer.inner.clock_offset.lock() += UNMETERED_FAILURE_WINDOW;
+        for _ in 0..5 {
+            layer.flush_cycle().await;
+        }
+        let events = read_wal_events(&env_dir);
+        let crashed: u64 = events
+            .iter()
+            .filter(|event| event["event_type"] == "telemetry_dropped")
+            .map(|event| event["dropped_events_write_crashed"].as_u64().unwrap())
+            .sum();
+        assert_eq!(crashed, 1);
+        assert_eq!(reported_unmetered_drops(&env_dir), dropped);
+    }
+
+    /// Unmetered-only records waiting behind a WAL outage are neither lost
+    /// nor double-counted, and the outage buys at most one per window.
+    #[tokio::test]
+    async fn an_outage_keeps_idle_records_exact_and_bounded() {
+        const WINDOWS: u32 = 5;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = broken_wal_root(tmp.path());
+        let writer = Arc::new(WalWriter::new(root.clone()));
+        let handle = WalHandle::new();
+        handle.set(writer, "prod");
+        let layer = WalLayer::new(handle, "prod");
+        let (subscriber, _) = build_subscriber::<fn() -> std::io::Sink>(
+            DEFAULT_LOG_FILTER,
+            LogSinks {
+                stdout: None,
+                wal: Some(layer.clone()),
+                file_log: false,
+            },
+        );
+        let _guard = tracing::dispatcher::set_default(&subscriber);
+        let mut dropped = 0u64;
+        for _ in 0..WINDOWS {
+            for _ in 0..UNMETERED_FAILURE_CAP_PER_MINUTE + 3 {
+                unmetered_failure();
+            }
+            dropped += 3;
+            for _ in 0..10 {
+                layer.flush_cycle().await;
+            }
+            *layer.inner.clock_offset.lock() += UNMETERED_FAILURE_WINDOW;
+        }
+        repair_wal_root(&root);
+        for _ in 0..10 {
+            layer.flush_cycle().await;
+        }
+        let env_dir = root.join("prod");
+        let records = read_wal_events(&env_dir)
+            .iter()
+            .filter(|event| event["event_type"] == "telemetry_dropped")
+            .count();
+        assert_eq!(reported_unmetered_drops(&env_dir), dropped);
+        assert!(records <= WINDOWS as usize + 1, "{records} drop records");
+    }
+
+    /// Shutdown inside the closed window still stores the deferred drops:
+    /// the final drain reports all pending accounting in one last record.
+    #[tokio::test]
+    async fn the_shutdown_drain_reports_deferred_cap_drops() {
+        let (tmp, layer, _guard) = deferred_summary_fixture();
+        let env_dir = tmp.path().join("prod");
+        let dropped = defer_unmetered_drops(&layer, 5);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let join = spawn_flush_task(layer, Duration::from_hours(1), shutdown_rx);
+        shutdown_tx.send(true).unwrap();
+        join.await.unwrap();
+        assert_eq!(reported_unmetered_drops(&env_dir), dropped);
     }
 
     #[test]
@@ -2612,7 +3461,12 @@ mod tests {
                     ),
                     2
                 );
-                assert_eq!(read_wal_events(&writer.dir().join("prod")).len(), 2);
+                // Nothing is written twice. The one new row is the crash's
+                // recovery record, reported with no traffic after it.
+                let events = read_wal_events(&writer.dir().join("prod"));
+                assert_eq!(events.len(), 3, "{events:?}");
+                assert_eq!(events[2]["event_type"], "telemetry_dropped");
+                assert_eq!(events[2]["dropped_events_write_crashed"], 2);
             });
         });
     }
@@ -2785,15 +3639,22 @@ mod tests {
                     1,
                     "the crashed attempt increments the write-failure counter once"
                 );
+                // The lost batch leaves the gauges. What remains is the
+                // crash's recovery record, buffered for the next write.
+                let (record_events, record_charge) = {
+                    let active = layer_ref.inner.active.lock();
+                    (active.events.len() as u64, active.charge() as u64)
+                };
+                assert_eq!(record_events, 1, "the buffered recovery record");
                 assert_eq!(
                     sample(&metrics_handle, crate::metrics::TELEMETRY_BUFFER_EVENTS),
-                    baseline_events,
-                    "event-depth gauge returns to baseline"
+                    baseline_events + record_events,
+                    "event-depth gauge returns to baseline plus the record"
                 );
                 assert_eq!(
                     sample(&metrics_handle, crate::metrics::TELEMETRY_BUFFER_BYTES),
-                    baseline_bytes,
-                    "byte-depth gauge returns to baseline"
+                    baseline_bytes + record_charge,
+                    "byte-depth gauge returns to baseline plus the record"
                 );
                 assert!(layer_ref.inner.pending.lock().is_empty());
                 assert_eq!(layer_ref.inner.staged.events.load(Ordering::Relaxed), 0);

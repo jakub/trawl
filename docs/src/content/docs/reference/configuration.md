@@ -189,7 +189,7 @@ Notes:
 | `hot_buffer_max_bytes` | byte size | `"100M"` | Estimated memory budget for the hot buffer |
 | `stats_interval_secs` | integer | `60` | How often server stats are emitted as telemetry. `0` disables |
 | `telemetry_flush_interval_secs` | integer | `1` | How often buffered tracing events are flushed to the WAL |
-| `telemetry_buffer_max_bytes` | byte size | `"16M"` | One estimated memory budget for everything self-telemetry holds while the WAL is unhealthy: active buffer, retry queue, and the batch in flight |
+| `telemetry_buffer_max_bytes` | byte size | `"16M"` | One estimated memory budget for everything self-telemetry holds while the WAL is unhealthy: active buffer, retry queue, and the batch in flight. Minimum `"64K"` |
 | `compaction_chunk_size` | integer | `500` | Maximum WAL files merged per compaction chunk. A larger backlog is split into chunks |
 | `compaction_memory_limit` | string | `"2GB"` | DuckDB memory limit for compaction connections, as a DuckDB memory string |
 | `default_env` | string | `"prod"` | Fills a missing `env`, recorded as the `env.defaulted` repair. Must pass the env charset and belong to `envs` |
@@ -208,7 +208,7 @@ envs = ["prod", "lab"]
 
 Notes:
 
-- `telemetry_buffer_max_bytes` must be a positive byte count, and `0` fails the load. To turn self-telemetry off, set `internal_telemetry = false`. Over the budget, trawld sheds the oldest queued batches first and then the incoming event, counted in `trawl_telemetry_events_dropped_total{reason="buffer_cap"}`.
+- `telemetry_buffer_max_bytes` must be at least `64K` (65536 bytes), and a smaller value, including `0`, fails the load. The floor leaves room for the `telemetry_dropped` record that reports buffer drops. To turn self-telemetry off, set `internal_telemetry = false`. Over the budget, trawld sheds the oldest queued batches first and then the incoming event, counted in `trawl_telemetry_events_dropped_total{reason="buffer_cap"}`.
 - An event whose `env` is not in the allowlist is rejected. The allowlist gates writes only: removing an env stops new ingest for it while its directories stay queryable and age out normally. trawld validates the list at load and refuses to start on a bad entry.
 - A host-less event from a `trusted_relays` peer is rejected on HTTP, and kept with `host` omitted on syslog. An invalid CIDR entry is fatal at boot. Peer addresses canonicalize before matching, so an IPv4-mapped peer such as `::ffff:192.0.2.7` matches a plain v4 entry.
 

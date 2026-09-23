@@ -9,10 +9,10 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use clap::Parser;
-use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::fmt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{EnvFilter, Layer, fmt};
 use trawl_server::config::Config;
+use trawl_server::error::join_failure_text;
 use trawl_server::state::AppState;
 use trawl_server::telemetry::{self, WalHandle, WalLayer};
 use trawl_server::transport::http;
@@ -551,7 +551,7 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
         let _ = shutdown_tx.send(true);
         for handle in handles {
             if let Err(e) = handle.await {
-                tracing::warn!(event_type = "task_panic", task = "syslog", error = %e, "syslog task panicked during shutdown");
+                tracing::warn!(event_type = "task_panic", task = "syslog", error = %join_failure_text("syslog", e), "syslog task panicked during shutdown");
             }
         }
     }
@@ -589,7 +589,7 @@ async fn shutdown_task(task: Option<(JoinHandle<()>, watch::Sender<bool>)>, name
     if let Some((handle, shutdown_tx)) = task {
         let _ = shutdown_tx.send(true);
         if let Err(e) = handle.await {
-            tracing::warn!(event_type = "task_panic", task = name, error = %e, "task panicked during shutdown");
+            tracing::warn!(event_type = "task_panic", task = name, error = %join_failure_text(name, e), "task panicked during shutdown");
         }
     }
 }
@@ -862,17 +862,10 @@ fn validate_log_identity(
     Ok(())
 }
 
-type JsonLogLayer = fmt::Layer<
-    tracing_subscriber::Registry,
-    fmt::format::JsonFields,
-    fmt::format::Format<fmt::format::Json>,
-    fmt::writer::BoxMakeWriter,
->;
-
 struct FileLog {
     path: PathBuf,
     data_root: PathBuf,
-    writer: tracing_subscriber::reload::Handle<JsonLogLayer, tracing_subscriber::Registry>,
+    writer: telemetry::FileLogHandle,
 }
 
 impl FileLog {
@@ -916,23 +909,20 @@ struct Tracing {
 ///
 /// When `monitor_active` is true, the stdout `fmt::layer()` is omitted
 /// to avoid corrupting the TUI with interleaved log output.
+///
+/// Once the subscriber is installed, replaces the panic hook with one that
+/// logs a panic's location and never its payload
+/// ([`telemetry::install_panic_hook`]). In monitor mode with no `log_file`
+/// logger, or when the filter disables the panic target, no sink records
+/// that event, so the hook also writes the location to stderr; the TUI draws
+/// on stdout.
 fn init_tracing(
     config: &Config,
     monitor_active: bool,
     filter_directives: &str,
     derivation: Arc<trawl_server::ingest::producer::Derivation>,
 ) -> Tracing {
-    // The directives were resolved (and validated when operator-supplied) by
-    // `telemetry::resolve_log_filter`; each layer builds its own EnvFilter
-    // from the same string. The WAL layer builds a narrower one
-    // (`telemetry::wal_filter`): pre-authn auth and transport events are
-    // logged but never persisted, so an unauthenticated connection or
-    // request flood cannot grow the corpus.
-    let make_filter = || EnvFilter::new(filter_directives);
-
-    let use_telemetry = config.internal_telemetry_enabled();
-
-    if use_telemetry {
+    let telemetry = config.internal_telemetry_enabled().then(|| {
         let handle = WalHandle::new();
         let wal_layer = WalLayer::new_with_buffer_cap(
             handle.clone(),
@@ -941,60 +931,43 @@ fn init_tracing(
             derivation,
             config.ingest.telemetry_buffer_max_bytes,
         );
-        let flush_layer = wal_layer.clone(); // same Arc<WalLayerInner>
+        (handle, wal_layer)
+    });
+    // The WAL layer replaces the JSON file logger when telemetry is on.
+    let file_log_path = config
+        .server
+        .log_file
+        .as_ref()
+        .filter(|_| telemetry.is_none());
 
-        if monitor_active {
-            // Skip stdout layer — TUI owns the terminal.
-            tracing_subscriber::registry()
-                .with(wal_layer.with_filter(telemetry::wal_filter(filter_directives)))
-                .init();
-        } else {
-            let stdout_layer = fmt::layer().with_filter(make_filter());
-            tracing_subscriber::registry()
-                .with(stdout_layer)
-                .with(wal_layer.with_filter(telemetry::wal_filter(filter_directives)))
-                .init();
-        }
-        Tracing {
-            telemetry: Some((handle, flush_layer)),
-            file_log: None,
-        }
-    } else if let Some(log_path) = &config.server.log_file {
-        // Logging must not create occupancy in a fresh root or alter refused
-        // storage. Retain startup diagnostics on stderr until admission succeeds.
-        let file_layer = fmt::layer()
-            .json()
-            .with_ansi(false)
-            .with_writer(fmt::writer::BoxMakeWriter::new(std::io::stderr));
-        let (file_layer, writer) = tracing_subscriber::reload::Layer::new(file_layer);
-        let stdout_layer = (!monitor_active).then(|| fmt::layer().with_filter(make_filter()));
-        tracing_subscriber::registry()
-            .with(file_layer.with_filter(make_filter()))
-            .with(stdout_layer)
-            .init();
-        Tracing {
-            telemetry: None,
-            file_log: Some(FileLog {
-                path: log_path.clone(),
+    // Skip stdout while the monitor TUI owns the terminal.
+    let stdout = (!monitor_active).then_some(std::io::stdout);
+    // Whether a text logger exists to record the panic diagnostic. Without
+    // one, or when the filter disables its target, the panic hook writes its
+    // location line to stderr itself.
+    let text_sink = stdout.is_some() || file_log_path.is_some();
+
+    let (subscriber, file_handle) = telemetry::build_subscriber(
+        filter_directives,
+        telemetry::LogSinks {
+            stdout,
+            // Same Arc<WalLayerInner> as the flush task's clone.
+            wal: telemetry.as_ref().map(|(_, layer)| layer.clone()),
+            file_log: file_log_path.is_some(),
+        },
+    );
+    subscriber.init();
+    telemetry::install_panic_hook(text_sink, std::io::stderr);
+
+    Tracing {
+        file_log: file_log_path
+            .zip(file_handle)
+            .map(|(path, writer)| FileLog {
+                path: path.clone(),
                 data_root: config.data.base_dir(),
                 writer,
             }),
-        }
-    } else if monitor_active {
-        // Monitor active, no telemetry, no file — still need a subscriber
-        // but skip stdout to avoid TUI corruption.
-        tracing_subscriber::registry().init();
-        Tracing {
-            telemetry: None,
-            file_log: None,
-        }
-    } else {
-        let stdout_layer = fmt::layer().with_filter(make_filter());
-        tracing_subscriber::registry().with(stdout_layer).init();
-        Tracing {
-            telemetry: None,
-            file_log: None,
-        }
+        telemetry,
     }
 }
 

@@ -96,7 +96,7 @@ pub fn spawn_schema_refresh(state: AppState) -> JoinHandle<()> {
                 Err(e) => {
                     tracing::warn!(
                         event_type = "schema_refresh_panic",
-                        error = %e,
+                        error = %crate::error::join_failure_text("service schema refresh", e),
                         "service schema refresh task panicked"
                     );
                 }

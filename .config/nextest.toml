@@ -51,7 +51,7 @@ filter = '''
     | binary(connection_budget) | binary(dashboard_storage) | binary(dsl_admission) | binary(field_catalog)
     | binary(gc_pins) | binary(hot_query) | binary(http_api)
     | binary(ingest_publication) | binary(repin) | binary(store_pg) | binary(schema_pg) | binary(startup_pg)
-    | binary(scheduler_windows) | binary(timestamp_repair) | binary(unavailable_run_result)))
+    | binary(scheduler_windows) | binary(span_context) | binary(http_failure) | binary(timestamp_repair) | binary(unavailable_run_result)))
   | (package(fleet-auth) & kind(test))
   | (package(fleet-admin) & kind(test))
 '''

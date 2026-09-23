@@ -394,7 +394,7 @@ async fn recover_pending_rollups(
         .await
         .map_err(|e| {
             CompactionOperation::PendingRollupRecovery.record_failure();
-            format!("rollup recovery task panicked: {e}")
+            crate::error::join_failure_text("rollup recovery", e)
         })??;
     }
     // An incomplete bootstrap scan must also stop WAL publication, even if
@@ -569,7 +569,7 @@ async fn rollup_env_once(
         .await
         .map_err(|e| {
             CompactionOperation::PendingRollupRecovery.record_failure();
-            format!("rollup recovery task panicked: {e}")
+            crate::error::join_failure_text("rollup recovery", e)
         })?;
         if let Err(e) = recovery {
             // A wedged recovery is data-loss-adjacent (an interrupted rollup
@@ -625,7 +625,7 @@ async fn rollup_env_once(
             .await
             .map_err(|e| {
                 CompactionOperation::DailyRollupUnit.record_failure();
-                format!("rollup task panicked: {e}")
+                crate::error::join_failure_text("rollup", e)
             })?;
             drop(unit_guard);
 
@@ -1472,7 +1472,7 @@ async fn compact_service_batch(
         Err(e) => {
             return CompactOutcome {
                 quarantined: 0,
-                result: Err(format!("compaction task panicked: {e}")),
+                result: Err(crate::error::join_failure_text("compaction", e)),
             };
         }
     };
@@ -1540,7 +1540,7 @@ async fn compact_service_batch(
         Err(e) => {
             return CompactOutcome {
                 quarantined,
-                result: Err(format!("compaction task panicked: {e}")),
+                result: Err(crate::error::join_failure_text("compaction", e)),
             };
         }
     };
@@ -4236,6 +4236,38 @@ mod tests {
             b"would be quarantined if rollup ran"
         );
         assert!(marker.exists());
+    }
+
+    /// A panicked conform-and-publish task fails the batch with fixed text.
+    /// The panic payload can quote event values, and this error is logged
+    /// as `compaction_error` on a persisted target, so it never carries it.
+    #[tokio::test]
+    async fn a_compaction_task_panic_never_carries_its_payload() {
+        // The payload of the publication seam's injected panic.
+        const PAYLOAD: &str = "injected publication task panic";
+        let tmp = tempfile::tempdir().unwrap();
+        let wal = tmp.path().join("wal");
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(wal.join("prod")).unwrap();
+        let input = write_wal_file(&wal.join("prod"), "svc", &[OPERATIONAL_ROW]);
+        let hot = Arc::new(HotBuffer::new(crate::hot_buffer::HotBufferConfig {
+            max_events: 100,
+            max_bytes: 100_000,
+        }));
+        hot.publication().panic_next_publication_for_test();
+        let outcome = compact_service_batch(
+            &[input],
+            &data.join("prod"),
+            "svc",
+            "2GB",
+            None,
+            Some(hot),
+            Vec::new(),
+        )
+        .await;
+        let error = outcome.result.expect_err("the task panicked");
+        assert_eq!(error, "compaction task panicked");
+        assert!(!error.contains(PAYLOAD), "{error}");
     }
 
     #[tokio::test]

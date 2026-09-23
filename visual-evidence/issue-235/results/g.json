@@ -1,0 +1,76 @@
+{
+  "id": "g",
+  "title": "postgres paused (docker pause) for 2-8 s intervals",
+  "config": {
+    "compaction_interval_secs": 5,
+    "coredns_ev_per_s": 120,
+    "machined_ev_per_s": 0,
+    "sse": null,
+    "nets": false,
+    "pg_pause": true,
+    "query_concurrency": 3,
+    "bound_minutes": 30,
+    "bound_queries": 10000
+  },
+  "started": "2026-09-23T05:21:59.093Z",
+  "queries": 10000,
+  "statuses": {
+    "200": 10000
+  },
+  "fiveXX": [],
+  "contentFailures": 0,
+  "owedFull": 10000,
+  "contentSamples": [],
+  "transportErrors": 0,
+  "startupVisibility": {
+    "window": [
+      "2026-09-23T05:07:30.000Z",
+      "2026-09-23T05:21:57.000Z"
+    ],
+    "owed": 32751,
+    "firstCount": 32160,
+    "waitedMs": 10273,
+    "satisfied": true
+  },
+  "ended": "2026-09-23T05:32:15.701Z",
+  "persistedHttpFailures": 0,
+  "latency": {
+    "p50": 91,
+    "p95": 234,
+    "p99": 4588,
+    "max": 7922
+  },
+  "durationS": 617,
+  "ingest": {
+    "accepted": 73680,
+    "failed": 0,
+    "statuses": {}
+  },
+  "pauses": {
+    "count": 46,
+    "totalMs": 250799
+  },
+  "compaction": {
+    "trawld": {
+      "runs": 85,
+      "merged": 85,
+      "maxRows": 104003,
+      "maxMs": 1561
+    },
+    "machined": {
+      "runs": 1,
+      "merged": 1,
+      "maxRows": 16380,
+      "maxMs": 46
+    },
+    "coredns": {
+      "runs": 85,
+      "merged": 85,
+      "maxRows": 105968,
+      "maxMs": 874
+    }
+  },
+  "httpFailureEvents": 0,
+  "httpFailureShapes": {},
+  "queryFiveXXMatched": 0
+}

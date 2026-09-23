@@ -1,0 +1,60 @@
+{
+  "id": "a",
+  "title": "baseline: queries only",
+  "config": {
+    "compaction_interval_secs": 300,
+    "coredns_ev_per_s": 0,
+    "machined_ev_per_s": 0,
+    "sse": null,
+    "nets": false,
+    "pg_pause": false,
+    "query_concurrency": 3,
+    "bound_minutes": 30,
+    "bound_queries": 10000
+  },
+  "started": "2026-09-23T04:28:41.712Z",
+  "queries": 10000,
+  "statuses": {
+    "200": 10000
+  },
+  "fiveXX": [],
+  "contentFailures": 0,
+  "owedFull": 10000,
+  "contentSamples": [],
+  "transportErrors": 0,
+  "startupVisibility": {
+    "window": [
+      "2026-09-23T04:14:12.000Z",
+      "2026-09-23T04:28:39.000Z"
+    ],
+    "owed": 363465,
+    "firstCount": 363465,
+    "waitedMs": 112,
+    "satisfied": true
+  },
+  "ended": "2026-09-23T04:38:22.088Z",
+  "persistedHttpFailures": 0,
+  "latency": {
+    "p50": 180,
+    "p95": 282,
+    "p99": 311,
+    "max": 421
+  },
+  "durationS": 580,
+  "ingest": {
+    "accepted": 0,
+    "failed": 0,
+    "statuses": {}
+  },
+  "compaction": {
+    "trawld": {
+      "runs": 1,
+      "merged": 1,
+      "maxRows": 352,
+      "maxMs": 188
+    }
+  },
+  "httpFailureEvents": 0,
+  "httpFailureShapes": {},
+  "queryFiveXXMatched": 0
+}

@@ -35,18 +35,34 @@ use crate::validation::{validate_app_namespace, validate_permission, validate_ro
 /// pool sized for blocking I/O.
 async fn hash_token_async(plaintext: &str) -> Result<String, AuthError> {
     let plaintext = plaintext.to_owned();
-    tokio::task::spawn_blocking(move || token::hash_token(&plaintext))
-        .await
-        .map_err(|e| AuthError::Hash(format!("argon2 worker panicked: {e}")))?
+    on_blocking_pool(move || token::hash_token(&plaintext)).await
 }
 
 /// Run argon2id verification on the tokio blocking pool. See `hash_token_async`.
 async fn verify_token_async(plaintext: &str, hash: &str) -> Result<bool, AuthError> {
     let plaintext = plaintext.to_owned();
     let hash = hash.to_owned();
-    tokio::task::spawn_blocking(move || token::verify_token(&plaintext, &hash))
-        .await
-        .map_err(|e| AuthError::Hash(format!("argon2 worker panicked: {e}")))?
+    on_blocking_pool(move || token::verify_token(&plaintext, &hash)).await
+}
+
+/// Run one argon2id step on the blocking pool.
+///
+/// A worker that did not return answers fixed text. `JoinError`'s
+/// `Display` quotes a panic payload, and the middleware logs this error on
+/// the bearer request path, so the join error is never formatted.
+async fn on_blocking_pool<T, F>(f: F) -> Result<T, AuthError>
+where
+    F: FnOnce() -> Result<T, AuthError> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f).await.map_err(|e| {
+        let what = if e.is_panic() {
+            "argon2 worker panicked"
+        } else {
+            "argon2 worker was cancelled"
+        };
+        AuthError::Hash(what.to_owned())
+    })?
 }
 
 /// Postgres + argon2id-cache backed API key store.
@@ -1029,4 +1045,24 @@ fn row_to_api_key_info_no_roles(row: &PgRow) -> Result<ApiKeyInfo, AuthError> {
         last_used: row.try_get("last_used")?,
         revoked_at: row.try_get("revoked_at")?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A panicking worker answers `AuthError::Hash` with fixed text. The
+    /// payload never enters the string: `JoinError`'s `Display` quotes it,
+    /// and the middleware logs this error on the bearer request path.
+    #[tokio::test]
+    async fn a_panicking_worker_never_carries_its_payload() {
+        let err =
+            on_blocking_pool(|| -> Result<(), AuthError> { panic!("zz_argon2_payload_sentinel") })
+                .await
+                .expect_err("the worker panics");
+        assert!(matches!(err, AuthError::Hash(_)), "got {err:?}");
+        let shown = format!("{err} {err:?}");
+        assert!(!shown.contains("zz_argon2_payload_sentinel"), "{shown}");
+        assert!(shown.contains("argon2 worker panicked"), "{shown}");
+    }
 }

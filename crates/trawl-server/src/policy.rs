@@ -294,6 +294,8 @@ pub async fn normalize_auth_errors(req: Request, next: Next) -> Response {
     use axum::http::StatusCode;
     use trawl_api::ErrorCode;
 
+    use crate::error::CauseKind;
+
     let resp = next.run(req).await;
     if resp.extensions().get::<TrawlPolicyApplied>().is_some() {
         return resp;
@@ -319,6 +321,18 @@ pub async fn normalize_auth_errors(req: Request, next: Next) -> Response {
         _ => return resp,
     };
     count_auth_failure(reason);
+    // The bearer shell is fleet-auth's and keeps its own error, so a 5xx
+    // it answered reaches the request's failure record here, with the
+    // class trawl answers it under and no typed cause (ADR-0040).
+    match resp.status() {
+        StatusCode::INTERNAL_SERVER_ERROR => {
+            crate::transport::failure::record_class("internal", CauseKind::Unknown);
+        }
+        StatusCode::SERVICE_UNAVAILABLE => {
+            crate::transport::failure::record_class("service_unavailable", CauseKind::Unknown);
+        }
+        _ => {}
+    }
 
     let envelope = trawl_api::ErrorResponse {
         error: trawl_api::ErrorEnvelope::simple(code, message),
@@ -541,46 +555,50 @@ mod tests {
     /// stdout-only: a valid fleet key resolving zero trawl permissions is a
     /// supported thing to hold, and a persisted event would let its holder
     /// grow the corpus one durable record per request, unmetered. Drives the
-    /// real middleware through the real WAL filter.
+    /// real middleware through the subscriber `trawld` installs.
     #[tokio::test]
     async fn grantless_403_event_is_logged_but_never_persisted() {
         use std::sync::{Arc, Mutex};
 
-        use tracing_subscriber::prelude::*;
+        use crate::telemetry::{LogSinks, WalHandle, WalLayer, build_subscriber};
 
+        /// Stdout, captured.
         #[derive(Clone, Default)]
-        struct Capture(Arc<Mutex<Vec<String>>>);
+        struct Capture(Arc<Mutex<Vec<u8>>>);
 
-        impl<S> tracing_subscriber::Layer<S> for Capture
-        where
-            S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
-        {
-            fn on_event(
-                &self,
-                event: &tracing::Event<'_>,
-                _ctx: tracing_subscriber::layer::Context<'_, S>,
-            ) {
-                self.0
-                    .lock()
-                    .unwrap()
-                    .push(event.metadata().target().to_owned());
+        impl std::io::Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
             }
         }
 
         let stdout = Capture::default();
-        let wal = Capture::default();
-        let subscriber = tracing_subscriber::registry()
-            .with(
-                stdout
-                    .clone()
-                    .with_filter(tracing_subscriber::EnvFilter::new(
-                        crate::telemetry::DEFAULT_LOG_FILTER,
-                    )),
-            )
-            .with(wal.clone().with_filter(crate::telemetry::wal_filter(
-                crate::telemetry::DEFAULT_LOG_FILTER,
-            )));
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let wal_dir = tempfile::tempdir().unwrap();
+        let handle = WalHandle::new();
+        handle.set(
+            Arc::new(crate::ingest::wal::WalWriter::new(
+                wal_dir.path().to_path_buf(),
+            )),
+            "prod",
+        );
+        let wal = WalLayer::new(handle, "prod");
+        let (subscriber, _) = build_subscriber(
+            crate::telemetry::DEFAULT_LOG_FILTER,
+            LogSinks {
+                stdout: Some({
+                    let stdout = stdout.clone();
+                    move || stdout.clone()
+                }),
+                wal: Some(wal.clone()),
+                file_log: false,
+            },
+        );
+        let _guard = tracing::dispatcher::set_default(&subscriber);
 
         let resp = run_policy(Some(key_with(vec![role(
             "coastwatch-viewer",
@@ -589,18 +607,47 @@ mod tests {
         .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
-        let logged = stdout.0.lock().unwrap().clone();
+        let logged = String::from_utf8(stdout.0.lock().unwrap().clone()).unwrap();
         assert!(
-            logged
-                .iter()
-                .any(|t| t == crate::telemetry::UNMETERED_POLICY_TARGET),
+            logged.contains(crate::telemetry::UNMETERED_POLICY_TARGET),
             "the rejection must still be visible on stdout under the default \
              filter; saw {logged:?}"
         );
-        let persisted = wal.0.lock().unwrap().clone();
+        // Positive control: an event on the policy module's own target
+        // persists under the same subscriber, so the rejection's absence
+        // below is the filter's doing and not a dead WAL.
+        tracing::info!(
+            target: "trawl_server::policy",
+            event_type = "wal_probe",
+            "policy: wal probe"
+        );
+        wal.flush();
+        let records: Vec<serde_json::Value> = std::fs::read_dir(wal_dir.path().join("prod"))
+            .map(|entries| {
+                entries
+                    .map(|entry| entry.unwrap().path())
+                    .filter(|path| path.extension().is_some_and(|ext| ext == "ndjson"))
+                    .flat_map(|path| {
+                        std::fs::read_to_string(path)
+                            .unwrap()
+                            .lines()
+                            .map(|line| serde_json::from_str(line).unwrap())
+                            .collect::<Vec<_>>()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         assert!(
-            persisted.is_empty(),
-            "an unmetered rejection must never reach the WAL layer; saw {persisted:?}"
+            records
+                .iter()
+                .any(|record| record["event_type"] == "wal_probe"),
+            "the WAL is live: {records:#?}"
+        );
+        assert!(
+            records
+                .iter()
+                .all(|record| record["target"] != crate::telemetry::UNMETERED_POLICY_TARGET),
+            "an unmetered rejection must never reach the WAL layer: {records:#?}"
         );
     }
 

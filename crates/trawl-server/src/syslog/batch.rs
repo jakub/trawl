@@ -186,7 +186,7 @@ impl SyslogBatcher {
                 metrics::counter!(crate::metrics::SYSLOG_WRITE_TASKS_FAILED_TOTAL).increment(1);
                 tracing::error!(
                     event_type = "syslog_flush_panic",
-                    error = %e,
+                    error = %crate::error::join_failure_text("syslog pipeline flush", e),
                     "syslog pipeline flush task panicked"
                 );
                 0

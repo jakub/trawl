@@ -1,0 +1,1 @@
+These results were recorded by the harness at `471ee86e`. Later harness fixes (cut-response accounting, single-hour seeding, verified teardown, and a report derived only from the records) changed no recorded count; this README was regenerated from the same `results/*.json`.
