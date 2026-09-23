@@ -189,7 +189,7 @@ generated SQL, event values, and the caller's DSL.
 | `stage` | How far the request got. See the next table. |
 | `reached` | On `stage=unrecorded` only: `pre_admission`, `admitted`, or `handler`, the last point the request passed. |
 | `error_class` | The server's closed error class. `panic` for a caught panic, `unknown` when nothing was recorded. |
-| `cause_kind` | A closed kind taken from the typed error beneath the class: an I/O error kind such as `io_storage_full`, a DuckDB kind such as `duckdb_failure`, a Postgres kind such as `pg_pool_timed_out`, or `auth_worker`. `none` when no cause was recorded. |
+| `cause_kind` | A closed kind taken from the typed error beneath the class: an I/O error kind such as `io_storage_full`, a DuckDB kind such as `duckdb_failure`, a Postgres kind such as `pg_pool_timed_out`, or `auth_worker`. `unknown` when a server fault kept no typed source: an `internal` error or a `service_unavailable` other than a capacity refusal, including the 500 and 503 that the authentication layer answers, such as the auth backend being down. `none` when the class is the whole cause, as for `timeout`, `panic`, or a capacity refusal, and when nothing was recorded. |
 | `query_id` | Present when the request allocated a query ID. |
 | `key_id` | Present when a rate limiter metered the request. Names the key it metered. |
 | `peer_addr` | Present when no rate limiter metered the request. The client address, the only lead when no key is known. |
