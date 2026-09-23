@@ -617,6 +617,8 @@ async fn exactly_one_http_failure_per_5xx() {
 
 /// `/api/v1/health` is in scope: a 503 from it is one WARN failure on the
 /// unmetered target, carrying the peer address, since no key was metered.
+/// A panic the pool caught under the `DuckDB` probe is recorded as one: the
+/// panic stage and class, the payload nowhere.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_health_503_is_one_unmetered_warn_failure() {
     sinks();
@@ -638,8 +640,14 @@ async fn a_health_503_is_one_unmetered_warn_failure() {
     assert_eq!(level(line), "WARN", "{line}");
     assert!(line.contains(UNMETERED_FAILURE_TARGET), "{line}");
     assert_eq!(field(line, "route").as_deref(), Some("/api/v1/health"));
-    assert_eq!(field(line, "stage").as_deref(), Some("unrecorded"));
-    assert_eq!(field(line, "reached").as_deref(), Some("handler"));
+    assert_eq!(field(line, "stage").as_deref(), Some("panicked"), "{line}");
+    assert_eq!(field(line, "reached"), None, "{line}");
+    assert_eq!(
+        field(line, "error_class").as_deref(),
+        Some("panic"),
+        "{line}"
+    );
+    assert_eq!(field(line, "cause_kind").as_deref(), Some("none"), "{line}");
     let peer = field(line, "peer_addr").expect("an unmetered failure names its peer");
     assert!(peer.starts_with("127.0.0.1:"), "{line}");
 
@@ -648,7 +656,56 @@ async fn a_health_503_is_one_unmetered_warn_failure() {
     assert_eq!(records.len(), 1, "{records:?}");
     assert_eq!(records[0]["target"], UNMETERED_FAILURE_TARGET);
     assert_eq!(records[0]["level"], "warn");
+    assert_eq!(records[0]["stage"], "panicked");
+    assert_eq!(records[0]["error_class"], "panic");
     assert_eq!(records[0]["peer_addr"], peer.as_str());
+
+    assert!(
+        stdout_lines()
+            .iter()
+            .all(|line| !line.contains(INJECTED_PANIC_PAYLOAD)),
+        "the panic payload reached stdout"
+    );
+    assert!(
+        wal_records()
+            .iter()
+            .all(|record| !record.to_string().contains(INJECTED_PANIC_PAYLOAD)),
+        "the panic payload reached the WAL"
+    );
+}
+
+/// A `DuckDB` probe that outlives its budget answers the same 503, and the
+/// failure names what the probe returned: a timeout in the handler.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_health_probe_timeout_records_its_class() {
+    sinks();
+    let server = common::setup().await;
+    let seams = server.state.query.pool.seams();
+    let _held = seams.hold(Seam::Started);
+
+    let response = raw_client()
+        .get(format!("{}/api/v1/health", server.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 503);
+    let request_id = request_id_of(response.headers());
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["status"], "unavailable", "{body}");
+    assert_eq!(body["checks"]["duckdb"], "error", "{body}");
+
+    let records = wal_failures_for(&request_id);
+    assert_eq!(records.len(), 1, "{records:?}");
+    let record = &records[0];
+    assert_eq!(record["target"], UNMETERED_FAILURE_TARGET);
+    assert_eq!(record["level"], "warn");
+    assert_eq!(record["route"], "/api/v1/health");
+    assert_eq!(record["status"], 503);
+    assert_eq!(record["stage"], "handler_error");
+    assert!(record.get("reached").is_none(), "{record}");
+    assert_eq!(record["error_class"], "timeout");
+    assert_eq!(record["cause_kind"], "none");
+    assert_eq!(stdout_failures_for(&request_id).len(), 1);
 }
 
 // -- AC4 ------------------------------------------------------------------------
