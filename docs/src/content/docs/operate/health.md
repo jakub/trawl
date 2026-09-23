@@ -247,12 +247,12 @@ A panic also produces one ERROR event with `event_type=panic` on the target
 when file logging is active. It never persists. The failure event of the caught request is the stored
 record, with `stage=panicked`.
 
-When trawld runs its terminal monitor, which is when you start it without
-`--no-monitor`, stdout carries no log lines. If trawld also writes no
-`log_file`, nothing records the panic event. Nothing records it either when
-`RUST_LOG` filters out the `trawl_server::panic` target, for example
-`RUST_LOG=trawld=debug`. In either case trawld also writes one line to stderr,
-with the location and no message:
+trawld runs its terminal monitor when stdout is a terminal and you start it
+without `--no-monitor`. The monitor owns stdout, so stdout carries no log
+lines. If trawld also writes no `log_file`, nothing records the panic event.
+Nothing records it either when `RUST_LOG` filters out the
+`trawl_server::panic` target, for example `RUST_LOG=trawld=debug`. In either
+case trawld also writes one line to stderr, with the location and no message:
 
 ```text
 trawld: panicked at FILE:LINE:COLUMN on thread 'NAME'
