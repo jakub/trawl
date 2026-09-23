@@ -970,8 +970,13 @@ impl WalLayer {
                     self.inner.staged.release(in_flight.0, in_flight.1);
                     self.inner
                         .record_crashed_drop(in_flight.0 as u64, in_flight.2 as u64);
+                    // Fixed text: the join error's Display quotes the
+                    // panic payload, which can hold event values.
                     self.inner.record_write_failure(
-                        &std::io::Error::other(join_err),
+                        &std::io::Error::other(crate::error::join_failure_text(
+                            "telemetry WAL write",
+                            join_err,
+                        )),
                         WriteFailureDisposition::Dropped,
                     );
                     break;
