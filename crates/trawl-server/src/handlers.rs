@@ -126,6 +126,7 @@ pub async fn query(
     // sees. Allocated before query_start so every lifecycle event correlates
     // on query_id without carrying the query text.
     let query_id = state.query.pool.allocate_query_id();
+    crate::transport::failure::record_query_id(query_id);
     state.query.tracker.start(query_id, &verified, &req.query);
 
     // Default-filter lifecycle events carry metadata only — never the raw
@@ -2958,6 +2959,7 @@ pub async fn export(
     // One id keys the whole export lifecycle and the pool's interrupt map,
     // so the events correlate without carrying the query text.
     let query_id = state.query.pool.allocate_query_id();
+    crate::transport::failure::record_query_id(query_id);
 
     tracing::info!(
         event_type = "export_start",
@@ -3381,6 +3383,7 @@ pub async fn stream_query(
     // on the DSL, which can carry customer identifiers or incident
     // indicators.
     let query_id = state.query.pool.allocate_query_id();
+    crate::transport::failure::record_query_id(query_id);
 
     tracing::info!(
         event_type = "stream_start",

@@ -537,6 +537,10 @@ impl IntoResponse for ServerError {
     fn into_response(self) -> Response {
         use trawl_api::{ErrorCode, ErrorEnvelope};
 
+        // The request's failure record takes the class and cause kind,
+        // never this error's text (ADR-0040).
+        crate::transport::failure::record_error(&self);
+
         let (status, envelope) = match &self {
             Self::Engine(EngineError::Parse(errors)) => {
                 let details: Vec<_> = errors.iter().map(parse_error_to_detail).collect();

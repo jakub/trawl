@@ -294,6 +294,8 @@ pub async fn normalize_auth_errors(req: Request, next: Next) -> Response {
     use axum::http::StatusCode;
     use trawl_api::ErrorCode;
 
+    use crate::error::CauseKind;
+
     let resp = next.run(req).await;
     if resp.extensions().get::<TrawlPolicyApplied>().is_some() {
         return resp;
@@ -319,6 +321,18 @@ pub async fn normalize_auth_errors(req: Request, next: Next) -> Response {
         _ => return resp,
     };
     count_auth_failure(reason);
+    // The bearer shell is fleet-auth's and keeps its own error, so a 5xx
+    // it answered reaches the request's failure record here, with the
+    // class trawl answers it under and no typed cause (ADR-0040).
+    match resp.status() {
+        StatusCode::INTERNAL_SERVER_ERROR => {
+            crate::transport::failure::record_class("internal", CauseKind::Unknown);
+        }
+        StatusCode::SERVICE_UNAVAILABLE => {
+            crate::transport::failure::record_class("service_unavailable", CauseKind::Unknown);
+        }
+        _ => {}
+    }
 
     let envelope = trawl_api::ErrorResponse {
         error: trawl_api::ErrorEnvelope::simple(code, message),

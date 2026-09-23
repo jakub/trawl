@@ -205,6 +205,10 @@ pub async fn rate_limit_middleware(request: Request, next: Next) -> Result<Respo
         return Err(ServerError::RateLimited);
     }
 
+    // Metered: the limiter passed this verified key, a disabled limit
+    // (`rpm` 0) included, since that bound is the operator's to lift.
+    crate::transport::failure::record_metered(verified.id);
+
     Ok(next.run(request).await)
 }
 

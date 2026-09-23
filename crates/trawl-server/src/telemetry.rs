@@ -208,7 +208,9 @@ pub const UNMETERED_POLICY_TARGET: &str = "trawl_server::policy::unmetered";
 /// unmetered too. Persisting any of it would hand a client the limiter
 /// cannot slow a durable-write amplifier: one ~400-byte record per rejected
 /// connection or request, compacted into the corpus and competing with real
-/// log data for retention.
+/// log data for retention. [`UNMETERED_FAILURE_TARGET`] is the failure event
+/// of a 5xx no limiter metered: a server fault before any key was checked,
+/// or on `/api/v1/health` or `/metrics`.
 ///
 /// Excluding them from the corpus does not lose the signal. They keep
 /// flowing to stdout under the same directives, where retention is the
@@ -226,11 +228,14 @@ pub const UNMETERED_POLICY_TARGET: &str = "trawl_server::policy::unmetered";
 /// `fleet_auth::middleware` but never a `fleet_authority` target — and
 /// `trawl_server::policy::unmetered` excludes only itself and its own
 /// descendants, never `trawl_server::policy`.
-pub const UNMETERED_TARGETS: [&str; 4] = [
+///
+/// [`UNMETERED_FAILURE_TARGET`]: crate::transport::failure::UNMETERED_FAILURE_TARGET
+pub const UNMETERED_TARGETS: [&str; 5] = [
     "fleet_auth",
     "auth.backend",
     PREAUTH_TRANSPORT_TARGET,
     UNMETERED_POLICY_TARGET,
+    crate::transport::failure::UNMETERED_FAILURE_TARGET,
 ];
 
 /// Whether events on `target` may be persisted as telemetry — false for

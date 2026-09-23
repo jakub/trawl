@@ -4,4 +4,5 @@
 
 //! Transport layer: HTTPS via axum over `tokio-rustls`.
 
+pub mod failure;
 pub mod http;

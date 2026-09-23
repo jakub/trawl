@@ -10,13 +10,14 @@
 //! `graceful_shutdown` per connection so idle keep-alives close instead of
 //! waiting out the drain timeout.
 
+use std::any::Any;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 
 use axum::Router;
 use axum::extract::Request;
-use axum::http::{HeaderValue, Method, header};
+use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::middleware;
 use axum::response::Response;
 use axum::routing::{delete, get, post, put};
@@ -36,8 +37,9 @@ use ulid::Ulid;
 
 /// ULID-based request ID stored in request extensions for tracing and response headers.
 #[derive(Clone, Debug)]
-struct RequestId(String);
+pub(crate) struct RequestId(pub(crate) String);
 
+use super::failure;
 use crate::config::{DEFAULT_INGEST_MAX_BODY_BYTES, ServerConfig};
 use crate::handlers;
 use crate::ingest;
@@ -51,8 +53,6 @@ use crate::tls;
 #[allow(clippy::too_many_lines)]
 pub fn router(state: AppState, http: &HttpConfig) -> Router {
     let max_body = http.max_request_body_bytes;
-    let max_conns = http.max_concurrent_requests;
-    let cors_origins = &http.cors_allowed_origins;
     let ingest_enabled = state.ingest.wal_writer.is_some();
     let interactive_rate_state = RateLimitState::interactive(&http.rate_limit);
     let ingest_rate_state = RateLimitState::ingest(&http.rate_limit, &interactive_rate_state);
@@ -108,6 +108,8 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
         .route("/saved/{id}/runs/{run_id}", get(handlers::get_report_run))
         .route("/export", post(handlers::export))
         .route("/stream", get(handlers::stream_query))
+        // Innermost, so a failure recorded after it is the handler's.
+        .route_layer(middleware::from_fn(failure::mark_handler))
         .layer(middleware::from_fn(rate_limit_middleware))
         // Outside the rate limit middleware, so the state is in extensions
         // before it runs: interactive routes get the `default_rpm` buckets.
@@ -127,6 +129,7 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
             .unwrap_or(DEFAULT_INGEST_MAX_BODY_BYTES);
         Router::new()
             .route("/ingest", post(ingest::handler::ingest))
+            .route_layer(middleware::from_fn(failure::mark_handler))
             .layer(middleware::from_fn(rate_limit_middleware))
             // Ingest gets the shipper-sized `ingest_rpm` buckets — a separate
             // bucket map, so the ceiling never applies to the query routes,
@@ -145,14 +148,42 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
         Router::new()
     };
 
-    let mut app = Router::new()
-        .nest("/api/v1", authenticated)
-        .nest("/api/v1", ingest_routes)
+    let app = Router::new()
         .route("/api/v1/health", get(handlers::health))
         .route("/metrics", get(handlers::prometheus_metrics))
+        // Only the two routes above: the nested routers mark their own
+        // handlers, inside their rate limiters.
+        .route_layer(middleware::from_fn(failure::mark_handler))
+        .nest("/api/v1", authenticated)
+        .nest("/api/v1", ingest_routes);
+
+    with_edge_layers(app, http).with_state(state)
+}
+
+/// Wrap `app` in trawld's edge layers, the ones every route shares.
+///
+/// Onion, innermost first: panic catcher → concurrency limit → `nosniff`
+/// and HSTS headers → CORS (only with configured origins) → request span
+/// (`TraceLayer`) → failure observer → request id → connection gauge.
+///
+/// The failure observer sits directly inside `request_id_middleware`: the
+/// request id exists when it starts, and every other layer runs inside the
+/// record it scopes. It is outside the `TraceLayer` on purpose, so its one
+/// event per 5xx is emitted after the request span has closed and carries
+/// only the fields it names (ADR-0040). The `TraceLayer` therefore logs no
+/// failure of its own.
+///
+/// Public so a test can mount a route of its own under exactly the layers
+/// production uses; [`router`] is the one production caller.
+pub fn with_edge_layers<S>(app: Router<S>, http: &HttpConfig) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    let cors_origins = &http.cors_allowed_origins;
+    let mut app = app
         // -- security hardening layers (first .layer() = innermost) --
-        .layer(CatchPanicLayer::new())
-        .layer(ConcurrencyLimitLayer::new(max_conns))
+        .layer(CatchPanicLayer::custom(panic_response))
+        .layer(ConcurrencyLimitLayer::new(http.max_concurrent_requests))
         .layer(SetResponseHeaderLayer::overriding(
             header::X_CONTENT_TYPE_OPTIONS,
             HeaderValue::from_static("nosniff"),
@@ -211,22 +242,31 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
                     );
                 },
             )
-            .on_failure(
-                |error: tower_http::classify::ServerErrorsFailureClass,
-                 latency: Duration,
-                 _span: &tracing::Span| {
-                    tracing::error!(
-                        event_type = "http_failure",
-                        error = %error,
-                        latency_ms = latency.as_millis(),
-                        "request failed"
-                    );
-                },
-            ),
+            // The failure observer outside this layer owns the one
+            // `http_failure` per 5xx.
+            .on_failure(()),
     )
+    .layer(middleware::from_fn(failure::failure_observer))
     .layer(middleware::from_fn(request_id_middleware))
     .layer(middleware::from_fn(connection_gauge_middleware))
-    .with_state(state)
+}
+
+/// The response for a panic the outer catcher caught: the same 500 and
+/// plain-text body `CatchPanicLayer`'s default gives, minus the default's
+/// log line, which quotes the panic's payload.
+///
+/// The payload is dropped unread; it can quote anything the panicking code
+/// had in hand (ADR-0040). What the request's failure event needs, that a
+/// panic was caught, goes into its record instead.
+fn panic_response(_payload: Box<dyn Any + Send + 'static>) -> Response {
+    failure::record_panic();
+    let mut response = Response::new(axum::body::Body::from("Service panicked"));
+    *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response
 }
 
 /// Generate a ULID request ID, stash it in extensions, and set `X-Request-Id` on the response.
