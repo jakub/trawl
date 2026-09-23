@@ -688,8 +688,17 @@ impl StagedCharge {
     }
 }
 
-/// Drop accounting, reset when the `telemetry_dropped` recovery event is
-/// emitted after a successful write.
+/// Which accumulated losses a `telemetry_dropped` record reports now; see
+/// [`WalLayerInner::report_drops`].
+#[derive(Clone, Copy)]
+enum DropReport {
+    AfterWrite,
+    Idle,
+    Final,
+}
+
+/// Drop accounting, reset when the `telemetry_dropped` recovery event
+/// reports it ([`WalLayerInner::report_drops`]).
 #[derive(Default)]
 struct DropCounters {
     /// Events dropped by the pre-init 1 MiB cap (exact).
@@ -880,6 +889,7 @@ impl WalLayer {
         let Some((writer, env)) = self.inner.handle.get() else {
             return;
         };
+        self.inner.report_drops(DropReport::Idle);
         self.inner.stage();
         let mut coalesce = false;
         while let Some(batch) = self.inner.pop_drain_unit(coalesce) {
@@ -914,6 +924,9 @@ impl WalLayer {
         let Some((writer, env)) = self.inner.handle.get() else {
             return;
         };
+        // A deferred `unmetered_cap` summary whose window has opened is
+        // buffered first, so this cycle writes it even with no other batch.
+        self.inner.report_drops(DropReport::Idle);
         self.inner.stage();
         let mut coalesce = false;
         while let Some(batch) = self.inner.pop_drain_unit(coalesce) {
@@ -1198,8 +1211,8 @@ impl WalLayerInner {
 
     /// Publish a durably-written batch to the hot buffer and event bus —
     /// strictly after WAL success, exactly once (the batch was popped).
-    /// Then emit the `telemetry_dropped` recovery record if any loss
-    /// accumulated (safe from recursion: `on_event` only buffers).
+    /// Then emit the `telemetry_dropped` recovery record if any loss is
+    /// due ([`Self::report_drops`]).
     /// The caller holds the publication read guard from before WAL writing.
     fn publish(&self, env: &str, wal_path: &std::path::Path, batch: Batch) {
         #[cfg(test)]
@@ -1242,13 +1255,40 @@ impl WalLayerInner {
             }
         }
 
+        self.report_drops(DropReport::AfterWrite);
+    }
+
+    /// Emit the `telemetry_dropped` recovery record if any loss has
+    /// accumulated (safe from recursion: `on_event` only buffers, and the
+    /// next write carries the record). `when` picks which losses are due:
+    ///
+    /// - [`DropReport::AfterWrite`]: every reason, except that a record
+    ///   reporting only `unmetered_cap` waits for its window
+    ///   ([`Self::take_unmetered_only_drops`]).
+    /// - [`DropReport::Idle`]: only such a waiting `unmetered_cap` count,
+    ///   once its window has opened. The periodic flush asks every cycle,
+    ///   so the count reaches the WAL without other traffic. Other reasons
+    ///   are left for the write that follows.
+    /// - [`DropReport::Final`]: everything, regardless of the window. The
+    ///   shutdown drain's one last record.
+    fn report_drops(&self, when: DropReport) {
+        if matches!(when, DropReport::Idle)
+            && self.dropped.preinit_events.load(Ordering::Relaxed)
+                + self.dropped.cap_events.load(Ordering::Relaxed)
+                + self.dropped.crashed_events.load(Ordering::Relaxed)
+                > 0
+        {
+            return;
+        }
         let preinit_events = self.dropped.preinit_events.swap(0, Ordering::Relaxed);
         let preinit_bytes = self.dropped.preinit_bytes.swap(0, Ordering::Relaxed);
         let cap_events = self.dropped.cap_events.swap(0, Ordering::Relaxed);
         let cap_bytes = self.dropped.cap_bytes.swap(0, Ordering::Relaxed);
         let crashed_events = self.dropped.crashed_events.swap(0, Ordering::Relaxed);
         let crashed_bytes = self.dropped.crashed_bytes.swap(0, Ordering::Relaxed);
-        let unmetered_cap_events = if preinit_events + cap_events + crashed_events > 0 {
+        let unmetered_cap_events = if matches!(when, DropReport::Final)
+            || preinit_events + cap_events + crashed_events > 0
+        {
             self.dropped.unmetered_cap_events.swap(0, Ordering::Relaxed)
         } else {
             self.take_unmetered_only_drops()
@@ -1664,7 +1704,15 @@ pub fn spawn_flush_task(
 /// inside the flush path, and the layer's buffer is about to be abandoned
 /// anyway, so a tracing event would be both re-entrant risk and invisible.
 async fn final_flush(layer: &WalLayer) {
-    if tokio::time::timeout(SHUTDOWN_FLUSH_BUDGET, layer.flush_cycle())
+    // Drain, then report every loss still pending, whatever its window,
+    // and write that one last record. Anything the last write's publish
+    // buffers after it is abandoned with the rest of the buffer.
+    let drain = async {
+        layer.flush_cycle().await;
+        layer.inner.report_drops(DropReport::Final);
+        layer.flush_cycle().await;
+    };
+    if tokio::time::timeout(SHUTDOWN_FLUSH_BUDGET, drain)
         .await
         .is_err()
     {
@@ -2087,6 +2135,112 @@ mod tests {
             .map(|event| event["dropped_events_unmetered_cap"].as_u64().unwrap())
             .sum();
         assert_eq!(reported, u64::from(overflow));
+    }
+
+    /// A WAL layer writing under a fresh directory, installed as the
+    /// thread's default subscriber, for the deferred-summary tests.
+    fn deferred_summary_fixture() -> (
+        tempfile::TempDir,
+        WalLayer,
+        tracing::subscriber::DefaultGuard,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = Arc::new(WalWriter::new(tmp.path().to_path_buf()));
+        writer.ensure_dir().unwrap();
+        let handle = WalHandle::new();
+        handle.set(writer, "prod");
+        let layer = WalLayer::new(handle, "prod");
+        let (subscriber, _) = build_subscriber::<fn() -> std::io::Sink>(
+            DEFAULT_LOG_FILTER,
+            LogSinks {
+                stdout: None,
+                wal: Some(layer.clone()),
+                file_log: false,
+            },
+        );
+        let guard = tracing::dispatcher::set_default(&subscriber);
+        (tmp, layer, guard)
+    }
+
+    fn unmetered_failure() {
+        tracing::error!(
+            target: UNMETERED_FAILURE_TARGET,
+            event_type = "http_failure",
+            "request failed"
+        );
+    }
+
+    /// The `dropped_events_unmetered_cap` total across stored drop records.
+    fn reported_unmetered_drops(env_dir: &std::path::Path) -> u64 {
+        read_wal_events(env_dir)
+            .iter()
+            .filter(|event| event["event_type"] == "telemetry_dropped")
+            .map(|event| event["dropped_events_unmetered_cap"].as_u64().unwrap())
+            .sum()
+    }
+
+    /// Fill the cap, get the window's one drop record written, then drop
+    /// `deferred` more while that record's window is closed. Returns the
+    /// total dropped.
+    fn defer_unmetered_drops(layer: &WalLayer, deferred: u64) -> u64 {
+        for _ in 0..=UNMETERED_FAILURE_CAP_PER_MINUTE {
+            unmetered_failure();
+        }
+        tracing::info!(target: "trawld", "one ordinary event");
+        layer.flush();
+        layer.flush();
+        for _ in 0..deferred {
+            unmetered_failure();
+        }
+        layer.flush();
+        1 + deferred
+    }
+
+    /// Drops deferred past the window's one record reach the WAL once the
+    /// next window opens, on the periodic flush alone: no other event
+    /// arrives to publish a batch.
+    #[tokio::test]
+    async fn deferred_cap_drops_reach_the_wal_without_traffic() {
+        let (tmp, layer, _guard) = deferred_summary_fixture();
+        let env_dir = tmp.path().join("prod");
+        let dropped = defer_unmetered_drops(&layer, 5);
+        assert_eq!(
+            reported_unmetered_drops(&env_dir),
+            1,
+            "the window's one record"
+        );
+
+        layer.flush_cycle().await;
+        assert_eq!(
+            reported_unmetered_drops(&env_dir),
+            1,
+            "no second record while the window is closed"
+        );
+
+        *layer.inner.clock_offset.lock() += UNMETERED_FAILURE_WINDOW;
+        layer.flush_cycle().await;
+        layer.flush_cycle().await;
+        assert_eq!(reported_unmetered_drops(&env_dir), dropped);
+        let failures = read_wal_events(&env_dir)
+            .iter()
+            .filter(|event| event["event_type"] == "http_failure")
+            .count();
+        assert_eq!(failures, UNMETERED_FAILURE_CAP_PER_MINUTE as usize);
+    }
+
+    /// Shutdown inside the closed window still stores the deferred drops:
+    /// the final drain reports all pending accounting in one last record.
+    #[tokio::test]
+    async fn the_shutdown_drain_reports_deferred_cap_drops() {
+        let (tmp, layer, _guard) = deferred_summary_fixture();
+        let env_dir = tmp.path().join("prod");
+        let dropped = defer_unmetered_drops(&layer, 5);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let join = spawn_flush_task(layer, Duration::from_hours(1), shutdown_rx);
+        shutdown_tx.send(true).unwrap();
+        join.await.unwrap();
+        assert_eq!(reported_unmetered_drops(&env_dir), dropped);
     }
 
     #[test]
