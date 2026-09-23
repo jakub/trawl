@@ -241,9 +241,18 @@ Not every failure event persists:
 
 A panic also produces one ERROR event with `event_type=panic` on the target
 `trawl_server::panic`. It carries the source `file`, `line`, `column`, and the
-`thread` name, never the panic message. It goes to stdout only and never
-persists. The failure event of the caught request is the stored record, with
-`stage=panicked`.
+`thread` name, never the panic message. It goes to stdout, and to `log_file`
+when file logging is active. It never persists. The failure event of the caught request is the stored
+record, with `stage=panicked`.
+
+When trawld runs its terminal monitor, which is when you start it without
+`--no-monitor`, stdout carries no log lines. If trawld also writes no
+`log_file`, nothing records the panic event. In that case trawld also writes
+one line to stderr, with the location and no message:
+
+```text
+trawld: panicked at FILE:LINE:COLUMN on thread 'NAME'
+```
 
 ## Restore missing log lines
 
@@ -299,10 +308,10 @@ rejection event.
 Check: events from the targets `fleet_auth`, `auth.backend`,
 `preauth.transport`, `trawl_server::policy::unmetered`, and
 `trawl_server::panic` never enter stored telemetry, whatever `RUST_LOG` says.
-The unmetered failure target `trawl_server::transport::failure::unmetered` is
-not in this list. It persists under a cap, as
-[Trace a server failure](#trace-a-server-failure) describes. The excluded
-events print to stdout, and to `log_file`
+Targets beneath `trawl_server::transport::failure::unmetered` never enter
+stored telemetry either. That exact target is the one exception. It persists
+under a cap, as [Trace a server failure](#trace-a-server-failure) describes.
+The excluded events print to stdout, and to `log_file`
 when file logging is configured and either `[ingest] enabled` or
 `internal_telemetry` is false. With both enabled, `log_file` is not opened.
 Read these events in the daemon output, or read
