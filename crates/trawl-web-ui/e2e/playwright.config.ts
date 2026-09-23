@@ -11,9 +11,11 @@ import { defineConfig, devices } from '@playwright/test';
 // `/__ctl/reset` contract), so it must never serve two tests at once; a
 // server per worker gives that at any worker count.
 //
-// `workers: 1` stays the default, so a plain `npx playwright test` (and
-// the mutation scripts) run one server on E2E_PORT exactly as before.
-// `--workers=N` runs N servers on E2E_PORT .. E2E_PORT + N - 1. A port
+// Local runs use four workers, so N servers listen on E2E_PORT ..
+// E2E_PORT + 3; the full suite then fits well inside a ten-minute window
+// (measured 9.4 min on one worker, 3.4 min on four, five clean runs in a
+// row). CI keeps one worker per job: it splits the suite across shard jobs
+// instead, each on its own runner. `--workers=N` overrides either. A port
 // already in use fails the worker loudly rather than reusing a server
 // that may be serving another worktree's dist.
 export default defineConfig({
@@ -26,7 +28,7 @@ export default defineConfig({
   // build`, which then dies with "error writing JS loader file to stage
   // dir". Relative paths here resolve against this file's directory.
   outputDir: '../../../e2e-artifacts/test-results',
-  workers: 1,
+  workers: process.env.CI ? 1 : 4,
   fullyParallel: false,
   retries: 0,
   timeout: 20_000,

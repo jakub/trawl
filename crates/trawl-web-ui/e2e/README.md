@@ -42,9 +42,10 @@ to 8123), and every test's `baseURL` points at its own worker's server.
 A stub server keeps one mutable scenario, so it must never serve two
 tests at once. A server per worker gives that at any worker count.
 
-The config keeps `workers: 1`, so `npm run test` and the mutation scripts
-run one server on `E2E_PORT`. `npx playwright test --workers=4` runs four
-servers on `E2E_PORT` through `E2E_PORT + 3`. Suites running side by side
+Local runs default to four workers, so `npm run test` runs four servers
+on `E2E_PORT` through `E2E_PORT + 3` and the full suite takes about three
+and a half minutes instead of nine. Under `CI=true` the default is one
+worker. `--workers=N` overrides either. Suites running side by side
 need port ranges that do not overlap. A port already in use fails the
 worker with the server's own output. The suite never reuses a server
 that is already listening, because that server may serve another
@@ -78,7 +79,7 @@ the SPA: it downloads the `trawl-web-ui-dist` artifact from the
 --with-deps chromium`, and `npm run test -- --shard=N/4
 --global-timeout=1500000` as discrete steps, so the browser job compiles
 no Rust. The job is a four-shard matrix. Each shard is a separate job that runs
-the default single worker, so each shard runs one stub server.
+one worker (the `CI=true` default), so each shard runs one stub server.
 Shard 1 also runs the BFCache suite. Each shard uploads its own
 `e2e-traces-N` on failure. The shard that runs `theme-preference.spec.ts`
 uploads the System screenshots as `theme-menu-captures-N`, and the
