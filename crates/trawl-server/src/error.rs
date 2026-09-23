@@ -172,9 +172,9 @@ pub enum CauseKind {
     /// Any other `duckdb::Error` variant: a misuse of the driver's API.
     DuckdbOther,
     /// The postgres pool had no connection to give within its timeout.
-    PgPoolTimedOut,
+    PostgresPoolTimedOut,
     /// The postgres pool was closed.
-    PgPoolClosed,
+    PostgresPoolClosed,
     /// Postgres answered with an error of its own.
     PgServer,
     /// The connection to postgres failed at the I/O layer.
@@ -216,8 +216,8 @@ impl CauseKind {
         Self::DuckdbFailure,
         Self::DuckdbConversion,
         Self::DuckdbOther,
-        Self::PgPoolTimedOut,
-        Self::PgPoolClosed,
+        Self::PostgresPoolTimedOut,
+        Self::PostgresPoolClosed,
         Self::PgServer,
         Self::PgIo,
         Self::PgTls,
@@ -250,8 +250,8 @@ impl CauseKind {
             Self::DuckdbFailure => "duckdb_failure",
             Self::DuckdbConversion => "duckdb_conversion",
             Self::DuckdbOther => "duckdb_other",
-            Self::PgPoolTimedOut => "pg_pool_timed_out",
-            Self::PgPoolClosed => "pg_pool_closed",
+            Self::PostgresPoolTimedOut => "pg_pool_timed_out",
+            Self::PostgresPoolClosed => "pg_pool_closed",
             Self::PgServer => "pg_server",
             Self::PgIo => "pg_io",
             Self::PgTls => "pg_tls",
@@ -303,8 +303,8 @@ impl CauseKind {
     fn of_sqlx(err: &sqlx::Error) -> Self {
         use sqlx::Error as E;
         match err {
-            E::PoolTimedOut => Self::PgPoolTimedOut,
-            E::PoolClosed => Self::PgPoolClosed,
+            E::PoolTimedOut => Self::PostgresPoolTimedOut,
+            E::PoolClosed => Self::PostgresPoolClosed,
             E::Database(_) => Self::PgServer,
             E::Io(_) => Self::PgIo,
             E::Tls(_) => Self::PgTls,
@@ -949,8 +949,8 @@ mod tests {
                 | CauseKind::DuckdbFailure
                 | CauseKind::DuckdbConversion
                 | CauseKind::DuckdbOther
-                | CauseKind::PgPoolTimedOut
-                | CauseKind::PgPoolClosed
+                | CauseKind::PostgresPoolTimedOut
+                | CauseKind::PostgresPoolClosed
                 | CauseKind::PgServer
                 | CauseKind::PgIo
                 | CauseKind::PgTls
@@ -1012,7 +1012,7 @@ mod tests {
             ),
             (
                 ServerError::Store(StoreError::Unavailable(sqlx::Error::PoolTimedOut)),
-                CauseKind::PgPoolTimedOut,
+                CauseKind::PostgresPoolTimedOut,
             ),
             (
                 ServerError::Store(StoreError::Unavailable(sqlx::Error::Io(IoError::from(
@@ -1022,7 +1022,7 @@ mod tests {
             ),
             (
                 ServerError::from(fleet_auth::AuthError::Database(sqlx::Error::PoolClosed)),
-                CauseKind::PgPoolClosed,
+                CauseKind::PostgresPoolClosed,
             ),
             (
                 ServerError::from(fleet_auth::AuthError::Hash("zz_worker".into())),
