@@ -235,7 +235,9 @@ Not every failure event persists:
   minute. The cap is fixed in code and has no setting. Past the cap, the event
   goes to stdout only, and `trawl_telemetry_events_dropped_total` counts it under
   `reason="unmetered_cap"`. The `telemetry_dropped` event in stored telemetry
-  reports the same count as `dropped_events_unmetered_cap`.
+  reports the same count as `dropped_events_unmetered_cap`. When that is its
+  only loss, at most one such event is stored per minute, and it reports every
+  drop since the previous one.
 - An unmetered 401, 403, or TLS rejection never persists. See
   [Find authentication failures](#find-authentication-failures).
 

@@ -740,6 +740,13 @@ struct WalLayerInner {
     /// process because `trawld` builds one layer and every clone shares
     /// this inner.
     unmetered_failures: UnmeteredFailureCap,
+    /// When the last `telemetry_dropped` record whose only loss was
+    /// `unmetered_cap` was emitted. Such a record is emitted at most once
+    /// per [`UNMETERED_FAILURE_WINDOW`]: its own write publishes, and a
+    /// client forcing one capped failure per flush tick would otherwise buy
+    /// one durable record per tick. Held-back counts accumulate for the next
+    /// permitted record.
+    last_unmetered_report: Mutex<Option<Instant>>,
     /// Test-only clock offset, so a test can move the cap's window without
     /// waiting a minute.
     #[cfg(test)]
@@ -831,6 +838,7 @@ impl WalLayer {
                 derivation,
                 dropped: DropCounters::default(),
                 unmetered_failures: UnmeteredFailureCap::default(),
+                last_unmetered_report: Mutex::new(None),
                 #[cfg(test)]
                 clock_offset: Mutex::new(Duration::ZERO),
                 last_stderr: Mutex::new(None),
@@ -962,14 +970,19 @@ impl WalLayer {
 }
 
 impl WalLayerInner {
-    /// Whether an unmetered failure event may be persisted. Past the cap,
-    /// counts it as dropped under reason `unmetered_cap`.
-    fn admit_unmetered_failure(&self) -> bool {
-        // The cap's clock: monotonic, and movable by tests.
+    /// The unmetered cap's clock: monotonic, and movable by tests.
+    #[cfg_attr(not(test), allow(clippy::unused_self))]
+    fn cap_clock(&self) -> Instant {
         let now = Instant::now();
         #[cfg(test)]
         let now = now + *self.clock_offset.lock();
-        if self.unmetered_failures.admit(now) {
+        now
+    }
+
+    /// Whether an unmetered failure event may be persisted. Past the cap,
+    /// counts it as dropped under reason `unmetered_cap`.
+    fn admit_unmetered_failure(&self) -> bool {
+        if self.unmetered_failures.admit(self.cap_clock()) {
             return true;
         }
         self.dropped
@@ -1231,7 +1244,11 @@ impl WalLayerInner {
         let cap_bytes = self.dropped.cap_bytes.swap(0, Ordering::Relaxed);
         let crashed_events = self.dropped.crashed_events.swap(0, Ordering::Relaxed);
         let crashed_bytes = self.dropped.crashed_bytes.swap(0, Ordering::Relaxed);
-        let unmetered_cap_events = self.dropped.unmetered_cap_events.swap(0, Ordering::Relaxed);
+        let unmetered_cap_events = if preinit_events + cap_events + crashed_events > 0 {
+            self.dropped.unmetered_cap_events.swap(0, Ordering::Relaxed)
+        } else {
+            self.take_unmetered_only_drops()
+        };
         if preinit_events + cap_events + crashed_events + unmetered_cap_events > 0 {
             tracing::warn!(
                 event_type = "telemetry_dropped",
@@ -1250,6 +1267,28 @@ impl WalLayerInner {
                  unmetered_cap counts no bytes)"
             );
         }
+    }
+
+    /// The `unmetered_cap` count for a recovery record that would report
+    /// nothing else: all of it when no such record was emitted within the
+    /// last [`UNMETERED_FAILURE_WINDOW`], otherwise zero, leaving the count
+    /// to accumulate. Unmetered failures are client-driven, and the record's
+    /// own write publishes, so without this a client forcing one capped
+    /// failure per flush tick buys one durable row and WAL file per tick. With
+    /// it, the capped failures and their drop records persist at most the cap
+    /// plus one row per window. Decided under the lock, so concurrent
+    /// publishes cannot both take a window's one record.
+    fn take_unmetered_only_drops(&self) -> u64 {
+        let mut last = self.last_unmetered_report.lock();
+        if self.dropped.unmetered_cap_events.load(Ordering::Relaxed) == 0 {
+            return 0;
+        }
+        let now = self.cap_clock();
+        if last.is_some_and(|at| now.saturating_duration_since(at) < UNMETERED_FAILURE_WINDOW) {
+            return 0;
+        }
+        *last = Some(now);
+        self.dropped.unmetered_cap_events.swap(0, Ordering::Relaxed)
     }
 
     /// Record a WAL write failure: scrapeable counter plus rate-limited
@@ -1965,6 +2004,85 @@ mod tests {
             );
             assert_eq!(sample(&metrics_handle, DROPPED), 1);
         });
+    }
+
+    /// A client forcing one unmetered failure per flush tick after the cap
+    /// fills must not buy one durable row per tick through the recovery
+    /// record: each record's write would publish while a new cap drop is
+    /// pending and buffer the next record, forever. Within one cap window the
+    /// unmetered failures and their drop records persist at most the cap plus
+    /// one row, and the drops held back are reported, exactly, on the first
+    /// record the next window permits.
+    #[test]
+    fn cap_drops_cannot_drive_an_unbounded_run_of_drop_records() {
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = Arc::new(WalWriter::new(tmp.path().to_path_buf()));
+        writer.ensure_dir().unwrap();
+        let handle = WalHandle::new();
+        handle.set(writer, "prod");
+        let layer = WalLayer::new(handle, "prod");
+        let (subscriber, _) = build_subscriber::<fn() -> std::io::Sink>(
+            DEFAULT_LOG_FILTER,
+            LogSinks {
+                stdout: None,
+                wal: Some(layer.clone()),
+                file_log: false,
+            },
+        );
+        let _guard = tracing::dispatcher::set_default(&subscriber);
+        let fail = |n: u32| {
+            tracing::error!(
+                target: UNMETERED_FAILURE_TARGET,
+                event_type = "http_failure",
+                n,
+                "request failed"
+            );
+        };
+        let cap = UNMETERED_FAILURE_CAP_PER_MINUTE;
+        let overflow = 2 * cap;
+
+        // Fill the cap, then one overflow while an ordinary persisted event
+        // kicks the recovery record off, then one overflow per flush tick.
+        for n in 0..cap {
+            fail(n);
+        }
+        layer.flush();
+        fail(cap);
+        tracing::info!(target: "trawld", "one ordinary event");
+        layer.flush();
+        for n in cap + 1..cap + overflow {
+            fail(n);
+            layer.flush();
+        }
+        layer.flush();
+
+        let events = read_wal_events(&tmp.path().join("prod"));
+        let count = |event_type: &str| {
+            events
+                .iter()
+                .filter(|event| event["event_type"] == event_type)
+                .count()
+        };
+        assert_eq!(count("http_failure"), cap as usize);
+        assert!(
+            count("http_failure") + count("telemetry_dropped") <= cap as usize + 1,
+            "one cap window persisted {} unmetered failures and {} drop records",
+            count("http_failure"),
+            count("telemetry_dropped")
+        );
+
+        // The next window permits a record again: the first write in it
+        // reports every drop held back, and nothing is lost or counted twice.
+        *layer.inner.clock_offset.lock() += UNMETERED_FAILURE_WINDOW;
+        tracing::info!(target: "trawld", "an ordinary event in the next window");
+        layer.flush();
+        layer.flush();
+        let reported: u64 = read_wal_events(&tmp.path().join("prod"))
+            .iter()
+            .filter(|event| event["event_type"] == "telemetry_dropped")
+            .map(|event| event["dropped_events_unmetered_cap"].as_u64().unwrap())
+            .sum();
+        assert_eq!(reported, u64::from(overflow));
     }
 
     #[test]
