@@ -70,6 +70,10 @@ _Avoid_: deletion, event loss
 A small file at the top of the data directory stating a fact about the whole archive: its epoch, which catalog owns it, a repin in progress. After a crash the marker is also the authority — it licenses recovery actions, like deleting a staging root.
 _Avoid_: lockfile, flag file
 
+**Publication marker**:
+The durable record of one compaction publishing its WAL batches into a parquet file: which WAL files it consumes and which output it installs. While it exists, recovery decides from it whether the publish happened, and nothing else may compact, hydrate, retire or delete the files it names.
+_Avoid_: lock, journal entry
+
 **Epoch**:
 A generation of the stored data's format and meaning. Files in one epoch share the same interpretation rules.
 _Avoid_: schema version, migration level
