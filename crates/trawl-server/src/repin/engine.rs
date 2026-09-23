@@ -521,10 +521,10 @@ impl RepinEngine {
                         );
                     }
                 }
-                let msg = format!("repin job task failed: {e}");
+                let msg = join_failure("job", &e);
                 self.finish(job_id, RepinJobStatus::Failed, Some(&msg), None)
                     .await;
-                Err(ServerError::Internal(msg))
+                Err(ServerError::from_join("repin job", e))
             }
         };
         // The registry stays armed for exactly as long as a job is doing
@@ -891,11 +891,11 @@ impl RepinEngine {
         let memory_limit = self.memory_limit.clone();
         let field = field.to_owned();
         let cancel = cancel.clone();
-        tokio::task::spawn_blocking(move || {
+        on_blocking_pool("scan", move || {
             scan(&data_dir, &memory_limit, &field, reading, &cancel)
         })
         .await
-        .map_err(|e| PassStop::Failed(format!("repin scan task panicked: {e}")))?
+        .map_err(PassStop::Failed)?
     }
 
     /// Is anything still writing this field? The newest observation inside
@@ -1734,7 +1734,7 @@ impl RepinEngine {
         let mut taken = std::mem::take(state);
         // A cancelled pass returns its state like any other, so the work
         // already staged is still described when the sweep runs.
-        let (returned, changed) = tokio::task::spawn_blocking(move || {
+        let (returned, changed) = on_blocking_pool("pass", move || {
             let changed = run_pass_blocking(
                 &data_dir,
                 &shadow,
@@ -1749,7 +1749,7 @@ impl RepinEngine {
             (taken, changed)
         })
         .await
-        .map_err(|e| JobAbort::Failed(format!("repin pass task panicked: {e}")))?;
+        .map_err(JobAbort::Failed)?;
         *state = returned;
         Ok(changed?)
     }
@@ -1804,7 +1804,20 @@ where
 {
     tokio::task::spawn_blocking(f)
         .await
-        .map_err(|e| format!("repin {what} task panicked: {e}"))
+        .map_err(|e| join_failure(what, &e))
+}
+
+/// The fixed text for a repin task that did not return, naming the step.
+///
+/// This text becomes the stored job error that the status route serves,
+/// and `JoinError`'s `Display` quotes a panic payload, so the join error
+/// itself is never formatted.
+fn join_failure(what: &'static str, e: &tokio::task::JoinError) -> String {
+    if e.is_panic() {
+        format!("repin {what} task panicked")
+    } else {
+        format!("repin {what} task was cancelled")
+    }
 }
 
 /// The store's shape for what the build has tallied so far. Saturating
@@ -2215,6 +2228,38 @@ fn parse_target(to: &str) -> Result<CanonicalType, ServerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A panicked blocking step answers fixed text naming the step. Its
+    /// payload never enters the string, because that string becomes the
+    /// stored job error the status route serves.
+    #[tokio::test]
+    async fn a_panicked_blocking_step_never_carries_its_payload() {
+        let msg = on_blocking_pool::<(), _>("probe", || panic!("zz_repin_payload_sentinel"))
+            .await
+            .expect_err("the step panics");
+        assert!(!msg.contains("zz_repin_payload_sentinel"), "{msg}");
+        assert_eq!(msg, "repin probe task panicked");
+    }
+
+    /// The same for the detached decision task, whose join failure is both
+    /// the stored job error and the start response's error.
+    #[tokio::test]
+    async fn a_panicked_decision_task_never_carries_its_payload() {
+        let panicked = tokio::spawn(async { panic!("zz_repin_payload_sentinel") })
+            .await
+            .expect_err("the task panics");
+        let msg = join_failure("job", &panicked);
+        assert!(!msg.contains("zz_repin_payload_sentinel"), "{msg}");
+        assert_eq!(msg, "repin job task panicked");
+
+        let pending = tokio::spawn(std::future::pending::<()>());
+        pending.abort();
+        let cancelled = pending.await.expect_err("the task is cancelled");
+        assert_eq!(
+            join_failure("job", &cancelled),
+            "repin job task was cancelled"
+        );
+    }
 
     async fn assert_rollup_admission_waits_for_unit(failed: bool) {
         let coordinator = Arc::new(RepinCoordinator::new());

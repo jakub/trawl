@@ -420,7 +420,7 @@ impl PinGc {
     /// when a repin owns the data root, when the corpus cannot be proved
     /// (unreadable path, foreign parquet), or when a gated store call times
     /// out; [`ServerError::Store`] for a postgres failure;
-    /// [`ServerError::Internal`] if the scan task panics.
+    /// [`ServerError::Panicked`] if the run or its scan task panics.
     pub async fn run(
         self: &Arc<Self>,
         older_than: Option<Duration>,
@@ -431,7 +431,7 @@ impl PinGc {
         match tokio::spawn(async move { engine.run_owned(older_than, dry_run, actor).await }).await
         {
             Ok(outcome) => outcome,
-            Err(e) => Err(ServerError::Internal(format!("pin gc task failed: {e}"))),
+            Err(e) => Err(ServerError::from_join("pin gc", e)),
         }
     }
 
