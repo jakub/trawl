@@ -165,11 +165,10 @@ struct Recorded {
 
 /// What the layers a request passes have recorded about it.
 ///
-/// Created by [`failure_observer`] at entry, and reachable two ways: as a
-/// request extension (`Arc<RequestRecord>`), and through the task-local the
-/// observer scopes around the rest of the request, which is how the
-/// producers below write to it. Every field holds a closed-set literal or a
-/// number, never text from the request or from an error.
+/// Created by [`failure_observer`] at entry and reachable only through the
+/// task-local the observer scopes around the rest of the request, which is
+/// how the producers below write to it. Every field holds a closed-set
+/// literal or a number, never text from the request or from an error.
 #[derive(Debug)]
 pub struct RequestRecord {
     progress: AtomicU8,
@@ -347,7 +346,7 @@ struct Failure {
 /// request id already exists and every other layer, the panic catcher,
 /// authentication, the rate limiter and the handlers, runs inside the
 /// record's scope.
-pub async fn failure_observer(mut request: Request, next: Next) -> Response {
+pub async fn failure_observer(request: Request, next: Next) -> Response {
     let started = Instant::now();
     let record = Arc::new(RequestRecord::new());
     let request_id = request
@@ -360,7 +359,6 @@ pub async fn failure_observer(mut request: Request, next: Next) -> Response {
     );
     let method = method_label(request.method());
     let peer_addr = request.extensions().get::<SocketAddr>().copied();
-    request.extensions_mut().insert(Arc::clone(&record));
 
     let response = RECORD.scope(Arc::clone(&record), next.run(request)).await;
 
