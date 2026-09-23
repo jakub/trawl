@@ -2911,15 +2911,17 @@ pub async fn get_report_run(
                 );
             }
             Err(e) => {
+                // A panicked read's JoinError quotes the panic's payload in
+                // its Display, so it is classified, never formatted
+                // (ADR-0040).
+                let err = ServerError::from_join("report run parquet read", e);
                 tracing::error!(
                     event_type = "report_run_parquet_task_failed",
                     run_id,
-                    error = %e,
+                    error_class = err.error_class(),
                     "the parquet read task did not complete"
                 );
-                return Err(ServerError::Internal(
-                    "failed to read the stored report result".into(),
-                ));
+                return Err(err);
             }
         }
     } else {
