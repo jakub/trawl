@@ -621,6 +621,7 @@ async function smoke() {
       const req = https.request(`${base}/api/v1/stream?query=${encodeURIComponent('service=coredns')}`, { headers: { authorization: `Bearer ${st.reader}`, accept: 'text/event-stream' }, agent: false, ca: ca(), rejectUnauthorized: true }, r => {
         resolve({ status: r.statusCode, type: r.headers['content-type'] }); req.destroy();
       });
+      req.setTimeout(40000, () => req.destroy(new Error('client deadline')));
       req.on('error', e => resolve({ status: 0, error: e.message }));
       req.end();
     });
@@ -628,6 +629,8 @@ async function smoke() {
     // Negative control: the same server without the pinned CA.
     const unpinned = await new Promise(resolve => {
       const req = https.request(`${base}/api/v1/health`, { agent: false, rejectUnauthorized: true }, r => { resolve({ response: r.statusCode }); req.destroy(); });
+      // A stall is not a certificate refusal, so a deadline fails the check.
+      req.setTimeout(40000, () => req.destroy(new Error('client deadline')));
       req.on('error', e => resolve({ code: e.code, message: e.message }));
       req.end();
     });
