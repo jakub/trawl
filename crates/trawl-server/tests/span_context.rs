@@ -227,19 +227,37 @@ fn a_log_enabled_probe_does_not_drop_the_next_event() {
 /// runtime workers across awaits must still enter and exit its span on
 /// one thread per poll, so every event it emits carries its own span and
 /// no other request's.
+///
+/// Migration is forced rather than hoped for. After its first poll each
+/// future spawns a blocker, then wakes itself and returns `Pending`
+/// ([`requeue_now`]). The blocker takes the worker's LIFO slot, which no
+/// other worker can steal, and holds that worker until the future has been
+/// polled again. The requeued future waits in the worker's stealable run
+/// queue, so an idle worker steals it and polls it on another thread. A
+/// semaphore keeps at most `MAX_BLOCKED` workers held, so idle workers
+/// remain to steal. Every future records the thread of each poll. The test
+/// fails, rather than passing vacuously, unless at least one future moved
+/// threads while inside its span.
 #[test]
 fn a_request_future_keeps_its_span_across_worker_threads() {
+    const WORKERS: usize = 4;
+    const MAX_BLOCKED: usize = 2;
+    /// How long a blocker holds its worker waiting for the re-poll. Only a
+    /// run where work stealing never happened waits this long.
+    const HOLD: std::time::Duration = std::time::Duration::from_secs(2);
+
     sinks();
     let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
+        .worker_threads(WORKERS)
         .enable_all()
         .build()
         .unwrap();
     let requests: Vec<(String, String)> = (0..64)
         .map(|i| (format!("01K5SPANMIGRATE{i:011}"), format!("migrate-{i:03}")))
         .collect();
+    let blocking = Arc::new(tokio::sync::Semaphore::new(MAX_BLOCKED));
 
-    runtime.block_on(async {
+    let threads: Vec<Vec<std::thread::ThreadId>> = runtime.block_on(async {
         let tasks: Vec<_> = requests
             .iter()
             .cloned()
@@ -249,10 +267,23 @@ fn a_request_future_keeps_its_span_across_worker_threads() {
                     "http_request",
                     request_id = %request_id,
                 );
+                let blocking = Arc::clone(&blocking);
                 tokio::spawn(
                     async move {
+                        let permit = blocking.acquire_owned().await.unwrap();
+                        let mut threads = vec![std::thread::current().id()];
+                        let (repolled, wait) = std::sync::mpsc::channel::<()>();
+                        let blocker = tokio::spawn(async move {
+                            let _ = wait.recv_timeout(HOLD);
+                        });
+                        requeue_now().await;
+                        threads.push(std::thread::current().id());
+                        let _ = repolled.send(());
+                        blocker.await.unwrap();
+                        drop(permit);
                         for _ in 0..4 {
                             tokio::task::yield_now().await;
+                            threads.push(std::thread::current().id());
                         }
                         tracing::warn!(
                             target: HANDLER_TARGET,
@@ -260,16 +291,28 @@ fn a_request_future_keeps_its_span_across_worker_threads() {
                             marker = %marker,
                             "query failed: bad request"
                         );
+                        threads
                     }
                     .instrument(span),
                 )
             })
             .collect();
+        let mut threads = Vec::with_capacity(tasks.len());
         for task in tasks {
-            task.await.unwrap();
+            threads.push(task.await.unwrap());
         }
+        threads
     });
 
+    let migrated = threads
+        .iter()
+        .filter(|polls| polls.iter().any(|thread| *thread != polls[0]))
+        .count();
+    assert!(
+        migrated > 0,
+        "no future changed worker threads, so this run proves nothing about \
+         migration: {threads:?}"
+    );
     for (request_id, marker) in &requests {
         let line = stdout_line(marker)
             .unwrap_or_else(|| panic!("stdout never received the event marked {marker}"));
@@ -281,6 +324,24 @@ fn a_request_future_keeps_its_span_across_worker_threads() {
             .unwrap_or_else(|| panic!("the WAL never received the event marked {marker}"));
         assert_eq!(record["request_id"], request_id.as_str(), "{record}");
     }
+}
+
+/// Wake the current task and return `Pending` once, so tokio puts it at
+/// the back of its worker's run queue, where other workers can steal it.
+/// Not `tokio::task::yield_now`: that defers the wake until the worker
+/// parks, and a worker held by a blocker never parks.
+async fn requeue_now() {
+    let mut requeued = false;
+    std::future::poll_fn(|cx| {
+        if requeued {
+            std::task::Poll::Ready(())
+        } else {
+            requeued = true;
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+    })
+    .await;
 }
 
 /// The same failure end to end: real sqlx connections whose every
