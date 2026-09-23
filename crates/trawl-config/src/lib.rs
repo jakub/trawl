@@ -299,8 +299,8 @@ pub struct IngestConfig {
     /// overhead. Enforced as events arrive: over budget the oldest queued
     /// batches are shed first and then the incoming event itself, counted
     /// in `trawl_telemetry_events_dropped_total{reason="buffer_cap"}`. Must
-    /// be positive: set `internal_telemetry = false` to turn self-telemetry
-    /// off.
+    /// be at least [`MIN_TELEMETRY_BUFFER_MAX_BYTES`] (64 KiB): set
+    /// `internal_telemetry = false` to turn self-telemetry off.
     #[serde(
         default = "default_telemetry_buffer_max_bytes",
         deserialize_with = "deserialize_byte_size"
@@ -1150,6 +1150,16 @@ fn default_telemetry_flush_interval_secs() -> u64 {
 /// Default telemetry retry-queue memory cap (16 MiB, estimated charge).
 pub const DEFAULT_TELEMETRY_BUFFER_MAX_BYTES: usize = 16 * 1024 * 1024;
 
+/// Smallest accepted telemetry buffer budget (64 KiB, estimated charge).
+///
+/// The budget must hold at least one `telemetry_dropped` recovery record,
+/// which charges about 2 KB. Below that, the record that reports a
+/// `buffer_cap` drop is itself refused, which counts a new drop that the
+/// next idle flush reports again, so the capacity alert never clears.
+/// 64 KiB holds dozens of recovery records or ordinary self-telemetry
+/// events, and it is still negligible next to the 16 MiB default.
+pub const MIN_TELEMETRY_BUFFER_MAX_BYTES: usize = 64 * 1024;
+
 fn default_telemetry_buffer_max_bytes() -> usize {
     DEFAULT_TELEMETRY_BUFFER_MAX_BYTES
 }
@@ -1439,18 +1449,21 @@ fn expand_tilde(path: &str) -> String {
     shellexpand::tilde(path).into_owned()
 }
 
-/// Validate the one safety budget whose zero value is deliberately invalid.
+/// Validate the one safety budget with a floor instead of a zero off switch.
 ///
 /// Other caps use zero as an explicit off switch, but an unbounded telemetry
 /// buffer can grow indefinitely behind a wedged WAL write. Self-telemetry has
-/// its own boolean off switch, so zero has no valid interpretation.
+/// its own boolean off switch, so zero has no valid interpretation, and a
+/// budget below [`MIN_TELEMETRY_BUFFER_MAX_BYTES`] cannot hold the record
+/// that reports its own drops.
 fn validate_telemetry_buffer_max_bytes(bytes: usize) -> Result<(), ConfigError> {
-    if bytes == 0 {
-        return Err(ConfigError::Validation(
-            "ingest.telemetry_buffer_max_bytes must be a positive byte count; set \
-             ingest.internal_telemetry = false to disable internal telemetry"
-                .into(),
-        ));
+    if bytes < MIN_TELEMETRY_BUFFER_MAX_BYTES {
+        return Err(ConfigError::Validation(format!(
+            "ingest.telemetry_buffer_max_bytes must be at least {}K ({} bytes); set \
+             ingest.internal_telemetry = false to disable internal telemetry",
+            MIN_TELEMETRY_BUFFER_MAX_BYTES / 1024,
+            MIN_TELEMETRY_BUFFER_MAX_BYTES
+        )));
     }
     Ok(())
 }
@@ -2200,8 +2213,50 @@ telemetry_buffer_max_bytes = 0
 
         assert_eq!(
             err.to_string(),
-            "config validation error: ingest.telemetry_buffer_max_bytes must be a positive byte \
-             count; set ingest.internal_telemetry = false to disable internal telemetry"
+            "config validation error: ingest.telemetry_buffer_max_bytes must be at least 64K \
+             (65536 bytes); set ingest.internal_telemetry = false to disable internal telemetry"
+        );
+    }
+
+    #[test]
+    fn telemetry_buffer_below_the_floor_is_boot_fatal() {
+        let err = Config::from_toml(&format!(
+            r#"
+[server]
+[data]
+path = "/data"
+[auth]
+[ingest]
+telemetry_buffer_max_bytes = {}
+"#,
+            MIN_TELEMETRY_BUFFER_MAX_BYTES - 1
+        ))
+        .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "config validation error: ingest.telemetry_buffer_max_bytes must be at least 64K \
+             (65536 bytes); set ingest.internal_telemetry = false to disable internal telemetry"
+        );
+    }
+
+    #[test]
+    fn telemetry_buffer_at_the_floor_loads() {
+        let config = Config::from_toml(
+            r#"
+[server]
+[data]
+path = "/data"
+[auth]
+[ingest]
+telemetry_buffer_max_bytes = "64K"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.ingest.telemetry_buffer_max_bytes,
+            MIN_TELEMETRY_BUFFER_MAX_BYTES
         );
     }
 

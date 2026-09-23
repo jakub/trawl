@@ -186,7 +186,9 @@ path = "~/.trawl/data"
 # plus the retained event maps plus per-event overhead. It is enforced as
 # events arrive — over budget, the OLDEST queued batches are shed first
 # and then the incoming event itself is dropped, all counted in
-# trawl_telemetry_events_dropped_total{reason="buffer_cap"}.
+# trawl_telemetry_events_dropped_total{reason="buffer_cap"}. The floor is
+# 64K, enough to hold the record that reports these drops; to turn internal
+# telemetry off, set internal_telemetry = false instead.
 # telemetry_buffer_max_bytes = "16M"
 
 # Wire keys _severity derives from, in precedence order — first MAPPABLE
