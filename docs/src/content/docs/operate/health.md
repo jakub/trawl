@@ -168,6 +168,83 @@ that arrives during the bind and checks it again before execution. A bind
 already inside DuckDB cannot be interrupted, so its permit returns only when the
 bind returns.
 
+## Trace a server failure
+
+Symptom: a client received a 5xx, and you need to know which request failed,
+where, and why.
+
+Every 5xx that trawld returns, `/api/v1/health` included, emits one event with
+`event_type=http_failure`. The event names its request with explicit fields. It
+does not inherit them from the request span, so it never carries the raw path or
+the user agent. It never carries error text either, because that text can hold
+generated SQL, event values, and the caller's DSL.
+
+| Field | Value |
+| --- | --- |
+| `request_id` | The ULID that the response returned in its `X-Request-Id` header. |
+| `method` | A standard HTTP method name, or `OTHER`. |
+| `route` | The matched route template, such as `/api/v1/query`. `<unmatched>` when no route matched. Never the raw path. |
+| `status` | The status code sent. |
+| `latency_ms` | Time from the start of the request to the response. |
+| `stage` | How far the request got. See the next table. |
+| `reached` | On `stage=unrecorded` only: `pre_admission`, `admitted`, or `handler`, the last point the request passed. |
+| `error_class` | The server's closed error class. `panic` for a caught panic, `unknown` when nothing was recorded. |
+| `cause_kind` | A closed kind taken from the typed error beneath the class: an I/O error kind such as `io_storage_full`, a DuckDB kind such as `duckdb_failure`, a Postgres kind such as `pg_pool_timed_out`, or `auth_worker`. `none` when no cause was recorded. |
+| `query_id` | Present when the request allocated a query ID. |
+| `key_id` | Present when a rate limiter metered the request. Names the key it metered. |
+| `peer_addr` | Present when no rate limiter metered the request. The client address, the only lead when no key is known. |
+
+| `stage` | Meaning |
+| --- | --- |
+| `pre_admission` | The request failed before any rate limiter admitted it, for example with the auth backend down. |
+| `admitted` | The request failed after the rate limiter admitted it, before the handler. |
+| `handler_error` | The handler returned a typed error. |
+| `panicked` | trawld caught a panic while it served the request. |
+| `unrecorded` | The response is a 5xx, but its producer recorded no failure. `reached` points at that producer. |
+
+A 503 or 504 logs at WARN, because both are expected pressure outcomes. See
+[Diagnose a 503 or 504 from a query](#diagnose-a-503-or-504-from-a-query).
+Every other 5xx logs at ERROR.
+
+To trace one failure:
+
+1. Read the `X-Request-Id` header of the failed response, or ask the client
+   for it.
+2. Find the failure event and the events logged inside the same request.
+
+   ```bash
+   trawl -p "$TRAWL_PROFILE" query 'service=trawld request_id=01K5EXAMPLE0000000000000000 last=24h | table _time, event_type, _severity, route, stage, reached, error_class, cause_kind, query_id'
+   ```
+
+3. If the failure event carries a `query_id`, find the query lifecycle events
+   for that ID. `query_failed` names the query ID and its own `error_class`.
+
+   ```bash
+   trawl -p "$TRAWL_PROFILE" query 'service=trawld query_id=4182 last=24h | table _time, event_type, _severity, error_class, duration_ms'
+   ```
+
+4. For a failure with `stage=unrecorded`, read `reached`. The producer that
+   sent the 5xx without recording why sits after that point, and that
+   producer is the bug to report.
+
+Not every failure event persists:
+
+- A metered failure event always persists. The per-key rate limiter already
+  bounds how many of them one client can cause.
+- An unmetered 5xx persists under one process-wide cap of 60 events per
+  minute. The cap is fixed in code and has no setting. Past the cap, the event
+  goes to stdout only, and `trawl_telemetry_events_dropped_total` counts it under
+  `reason="unmetered_cap"`. The `telemetry_dropped` event in stored telemetry
+  reports the same count as `dropped_events_unmetered_cap`.
+- An unmetered 401, 403, or TLS rejection never persists. See
+  [Find authentication failures](#find-authentication-failures).
+
+A panic also produces one ERROR event with `event_type=panic` on the target
+`trawl_server::panic`. It carries the source `file`, `line`, `column`, and the
+`thread` name, never the panic message. It goes to stdout only and never
+persists. The failure event of the caught request is the stored record, with
+`stage=panicked`.
+
 ## Restore missing log lines
 
 Symptom: expected `trawl_server` or `fleet_auth` lines are absent from the
@@ -219,9 +296,13 @@ stderr with the resolved config path and never in stored telemetry.
 Symptom: a client reports 401 or 403, and a query for `service=trawld` shows no
 rejection event.
 
-Check: rejections from the targets `fleet_auth`, `auth.backend`,
-`preauth.transport`, and `trawl_server::policy::unmetered` never enter stored
-telemetry, whatever `RUST_LOG` says. They print to stdout, and to `log_file`
+Check: events from the targets `fleet_auth`, `auth.backend`,
+`preauth.transport`, `trawl_server::policy::unmetered`, and
+`trawl_server::panic` never enter stored telemetry, whatever `RUST_LOG` says.
+The unmetered failure target `trawl_server::transport::failure::unmetered` is
+not in this list. It persists under a cap, as
+[Trace a server failure](#trace-a-server-failure) describes. The excluded
+events print to stdout, and to `log_file`
 when file logging is configured and either `[ingest] enabled` or
 `internal_telemetry` is false. With both enabled, `log_file` is not opened.
 Read these events in the daemon output, or read
