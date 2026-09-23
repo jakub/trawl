@@ -591,7 +591,9 @@ fn render_error_display(
     )));
     lines.push(Line::from(""));
 
-    if details.is_empty() || query_text.is_empty() {
+    // A validation error's one detail has no span and repeats the message
+    // above, so a list with no span renders the message alone.
+    if !details.iter().any(|d| d.span.is_some()) || query_text.is_empty() {
         // No span info — just show the message.
         let paragraph = Paragraph::new(lines);
         frame.render_widget(paragraph, inner);

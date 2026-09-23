@@ -31,61 +31,10 @@ pub use crate::search_url::PAGE_SIZE;
 /// Rows per page in both run browsers.
 pub const RUNS_PAGE_SIZE: std::num::NonZeroUsize = std::num::NonZeroUsize::new(20).unwrap();
 
-#[derive(Debug, Clone, thiserror::Error)]
-pub enum ApiError {
-    #[error("network: {0}")]
-    Network(String),
-
-    #[error("unauthorized")]
-    Unauthorized,
-
-    #[error("server returned {0}")]
-    Status(u16),
-
-    /// A non-2xx whose body carried the server's own error envelope. The
-    /// message is server-written and safe by construction (trawld's
-    /// envelope never quotes DSL or generated SQL), and the repin modal
-    /// renders it verbatim rather than inventing copy for a 400/403/503
-    /// it cannot classify.
-    #[error("{message}")]
-    Server {
-        /// The HTTP status the message came with.
-        status: u16,
-        /// The envelope's human-readable summary.
-        message: String,
-    },
-
-    #[error("decode: {0}")]
-    Decode(String),
-
-    /// The client refused to send the request at all — nothing left the
-    /// browser. The empty query is the case that matters: the server
-    /// reads it as every row (ADR-0027), so a door that would post it
-    /// answers this instead.
-    #[error("{0}")]
-    Refused(&'static str),
-}
-
-impl ApiError {
-    /// The HTTP status this failure carries, when it carries one at all.
-    ///
-    /// `None` is not a status class: a network or decode failure means
-    /// the request's fate is unknown, which is exactly what callers who
-    /// branch on definitiveness (`repin_flow::is_pre_claim_failure`)
-    /// have to tell apart from a server that answered.
-    #[must_use]
-    pub fn http_status(&self) -> Option<u16> {
-        match self {
-            Self::Status(status) | Self::Server { status, .. } => Some(*status),
-            // The one status this enum spells as a word rather than a
-            // number.
-            Self::Unauthorized => Some(401),
-            // A refusal never reached the network, so its fate is not
-            // unknown — but it carries no status either.
-            Self::Network(_) | Self::Decode(_) | Self::Refused(_) => None,
-        }
-    }
-}
+/// The failure type lives in a pure module so its body decoder is tested
+/// natively; the transport below is the only part that needs a browser.
+pub use crate::api_error::ApiError;
+use crate::api_error::decode_error_body;
 
 impl From<gloo_net::Error> for ApiError {
     fn from(e: gloo_net::Error) -> Self {
@@ -385,18 +334,14 @@ async fn repin_job(resp: &gloo_net::http::Response) -> Result<RepinJobResponse, 
         .map_err(|e| ApiError::Decode(e.to_string()))
 }
 
-/// A non-2xx as [`ApiError::Server`] when the body carries the error
-/// envelope, else the bare status.
+/// A non-2xx read through [`decode_error_body`]: a query error keeps its
+/// whole envelope, any other envelope its summary, and an unreadable body
+/// the bare status.
 async fn server_error(resp: &gloo_net::http::Response, status: u16) -> ApiError {
     let Ok(body) = resp.text().await else {
         return ApiError::Status(status);
     };
-    serde_json::from_str::<ErrorResponse>(&body).map_or(ApiError::Status(status), |env| {
-        ApiError::Server {
-            status,
-            message: env.error.message,
-        }
-    })
+    decode_error_body(status, &body)
 }
 
 /// One URL query-parameter value.
@@ -433,7 +378,11 @@ pub async fn query(q: &str, plan: FetchPlan) -> Result<QueryResponse, ApiError> 
             .await
             .map_err(|e| ApiError::Decode(e.to_string())),
         401 => Err(ApiError::Unauthorized),
-        s => Err(ApiError::Status(s)),
+        // A refusal of the query text arrives as the whole envelope, spans
+        // and all, for the query error notice (ADR-0039); any other
+        // envelope keeps its summary. 401 above keeps its own meaning:
+        // the session, not the query, is what failed.
+        s => Err(server_error(&resp, s).await),
     }
 }
 

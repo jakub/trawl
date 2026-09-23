@@ -21,6 +21,7 @@ use wasm_bindgen::prelude::*;
 use crate::completion::complete_at;
 use crate::interop::codemirror::{EditorHandle, create_editor};
 use crate::offset::utf8_to_utf16;
+use crate::query_error::join_hint;
 
 /// JS-side `Diagnostic` shape expected by the codemirror bundle.
 #[derive(Serialize)]
@@ -42,17 +43,11 @@ fn lint_document(doc: &str) -> Vec<Diagnostic> {
         Ok(_) => Vec::new(),
         Err(errors) => errors
             .into_iter()
-            .map(|e| {
-                let message = match e.hint {
-                    Some(hint) => format!("{} — {}", e.message, hint),
-                    None => e.message,
-                };
-                Diagnostic {
-                    from: utf8_to_utf16(doc, e.span.start),
-                    to: utf8_to_utf16(doc, e.span.end),
-                    severity: "error",
-                    message,
-                }
+            .map(|e| Diagnostic {
+                from: utf8_to_utf16(doc, e.span.start),
+                to: utf8_to_utf16(doc, e.span.end),
+                severity: "error",
+                message: join_hint(&e.message, e.hint.as_deref()),
             })
             .collect(),
     }

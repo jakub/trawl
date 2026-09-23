@@ -569,13 +569,15 @@ fn render_span_error(query: &str, start: usize, end: usize, message: &str, hint:
 /// Render a `ClientError` with span details (if available) for CLI output.
 pub fn render_client_error(query: &str, err: &trawl_client::ClientError) {
     let details = err.error_details();
-    if details.is_empty() {
-        eprintln!("trawl: {err}");
-    } else {
+    // A validation error's one detail has no span and repeats the summary
+    // the error already prints, so only a span earns the detailed form.
+    if details.iter().any(|d| d.span.is_some()) {
         if let Some(envelope) = err.error_envelope() {
             eprintln!("trawl: {:?}: {}", envelope.code, envelope.message);
         }
         render_error_details(query, details);
+    } else {
+        eprintln!("trawl: {err}");
     }
 }
 

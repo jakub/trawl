@@ -7,9 +7,15 @@
 // single source of truth.
 
 import { EditorState } from "@codemirror/state";
-import { EditorView, keymap, lineNumbers, highlightActiveLine } from "@codemirror/view";
+import {
+  EditorView,
+  ViewPlugin,
+  keymap,
+  lineNumbers,
+  highlightActiveLine,
+} from "@codemirror/view";
 import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
-import { linter, lintGutter, Diagnostic } from "@codemirror/lint";
+import { linter, lintGutter, lintKeymap, Diagnostic } from "@codemirror/lint";
 import {
   autocompletion,
   CompletionContext,
@@ -32,6 +38,49 @@ export interface EditorHandle {
   setDoc: (text: string) => void;
 }
 
+/** The accessible name of every lint gutter marker. The marker's DOM
+ * does not carry its diagnostics, and the draft diagnostic line under the
+ * editor already reads them out in full, so the name says what the mark
+ * is rather than repeating the message. */
+const LINT_MARKER_NAME = "Query syntax error";
+
+// CodeMirror hides the whole gutter column from assistive technology
+// (`aria-hidden` on `.cm-gutters`), and its lint markers are bare divs.
+// Lift the hiding onto each gutter except the lint one, so line numbers
+// stay silent, and name each marker as an image. Runs in the write phase
+// of a measure, after the gutter view has synced its DOM for the update
+// that produced the markers.
+const lintMarkerNames = ViewPlugin.fromClass(
+  class {
+    constructor(readonly view: EditorView) {
+      this.schedule();
+    }
+    update() {
+      this.schedule();
+    }
+    schedule() {
+      this.view.requestMeasure({
+        key: this,
+        read: () => null,
+        write: () => this.label(),
+      });
+    }
+    label() {
+      const dom = this.view.dom;
+      for (const el of dom.querySelectorAll(".cm-gutters")) {
+        el.removeAttribute("aria-hidden");
+      }
+      for (const el of dom.querySelectorAll(".cm-gutter:not(.cm-gutter-lint)")) {
+        el.setAttribute("aria-hidden", "true");
+      }
+      for (const el of dom.querySelectorAll(".cm-lint-marker")) {
+        el.setAttribute("role", "img");
+        el.setAttribute("aria-label", LINT_MARKER_NAME);
+      }
+    }
+  }
+);
+
 export function createEditor(
   parent: HTMLElement,
   initial: string,
@@ -53,9 +102,13 @@ export function createEditor(
       lineNumbers(),
       highlightActiveLine(),
       history(),
-      keymap.of([submitKey, ...defaultKeymap, ...historyKeymap]),
+      // lintKeymap: F8 moves to the next diagnostic, Mod-Shift-m opens
+      // the lint panel. Neither key is bound by the default, history or
+      // completion keymaps.
+      keymap.of([submitKey, ...defaultKeymap, ...historyKeymap, ...lintKeymap]),
       linter((view) => opts.lint(view.state.doc.toString())),
       lintGutter(),
+      lintMarkerNames,
       autocompletion({
         override: [(ctx) => opts.complete(ctx)],
       }),

@@ -11,6 +11,8 @@
 //!   Save / Export)
 //! → degraded-field notice (hidden unless the execution reported one)
 //! → tab body (Events: histogram + results table | Visualization: chart)
+//!   — or, on either tab, the query error notice when the server refused
+//!   the text the current request sent (ADR-0039)
 //!
 //! Two skip links open the page ahead of the filter rail, because the
 //! rail's value controls stay in the tab order on purpose: one focuses
@@ -55,12 +57,14 @@ use crate::components::facet_sidebar::FacetSidebar;
 use crate::components::histogram::Histogram;
 use crate::components::malformed_notice::MalformedNotice;
 use crate::components::meta_strip::MetaStrip;
+use crate::components::query_error_notice::QueryErrorNotice;
 use crate::components::results_table::ResultsTable;
 use crate::components::save_as_net_modal::SaveAsNetModal;
 use crate::components::search_quick_start::SearchQuickStart;
 use crate::facets::is_aggregation_shape;
 use crate::fetch_plan::FetchPlan;
 use crate::pages::layout::ShellStatus;
+use crate::query_error::{NoticeModel, live_syntax_notice, refusal_notice};
 use crate::result_actions::sorted_page;
 use crate::search_status::{CountSource, FooterCount, StatusInputs, StatusKind, search_status};
 use crate::search_url::{PAGE_SIZE, Param, admit_filters, refusal_copy};
@@ -78,7 +82,8 @@ use leptos::ev;
 use leptos_use::{use_event_listener, use_window};
 
 use crate::state::stream_session::{
-    LiveSignals, RingBuffer, StreamLifecycle, ring_to_result, start_stream,
+    LiveSignals, OpenedMark, RingBuffer, STREAM_UNAVAILABLE, StreamLifecycle, ring_to_result,
+    start_stream,
 };
 
 /// Move keyboard focus to the first element matching `selector`, and
@@ -223,6 +228,10 @@ pub fn Search() -> impl IntoView {
 
     let (query_pending, set_query_pending) = signal(false);
     let request_generation = RwSignal::new(0_u64);
+    // Sends the current request again (a same-query Haul, Retry
+    // snapshot). See `rows_resource` for why this, not `refetch`.
+    let resubmit = RwSignal::new(0_u64);
+    let rerun_request = move || resubmit.update(|n| *n = n.wrapping_add(1));
     let (rows, request_intent) = rows_resource(
         snapshot_q,
         fetch_plan,
@@ -231,6 +240,7 @@ pub fn Search() -> impl IntoView {
         executed_q,
         filters,
         range,
+        resubmit.read_only(),
     );
 
     let goto = navigator();
@@ -252,8 +262,9 @@ pub fn Search() -> impl IntoView {
             // Hauling the query the URL already carries writes the same
             // link, and the memos behind the resource do not notify on an
             // unchanged value — so a snapshot Haul would be silent just
-            // when it is the only way to retry a page that failed. Ask
-            // the resource itself in that case. In live the same Haul is
+            // when it is the only way to retry a page that failed.
+            // Resubmit in that case, which also supersedes a request for
+            // the same text still in flight. In live the same Haul is
             // a no-op: no snapshot runs, and the stream's own key
             // (retry, mode, effective query) has not moved.
             // Plan equality, not `page == 0`: the navigation below goes
@@ -275,7 +286,7 @@ pub fn Search() -> impl IntoView {
                 false,
             );
             if rerun && outcome.is_ok() {
-                rows.refetch();
+                rerun_request();
             }
             report_refusal(bus, outcome);
         })
@@ -535,6 +546,14 @@ pub fn Search() -> impl IntoView {
     // Aggregation frames this session accepted — the footer's `Updates`
     // count. The ring's own `epoch` is the raw twin (`Received`).
     let frames = RwSignal::new(0_u64);
+    // Each stream this page opens gets a session number, and the stream
+    // marks `stream_opened_at` with it once it opens or delivers an event.
+    // The current stream has opened exactly when the two agree, and an
+    // older stream's late callback can only mark an older number.
+    let stream_session = RwSignal::new(0_u64);
+    let stream_opened_at = RwSignal::new(None::<u64>);
+    let stream_opened =
+        Signal::derive(move || stream_opened_at.get() == Some(stream_session.get()));
     let stream_retry = RwSignal::new(0_u64);
     let retry_stream = Callback::new(move |()| stream_retry.update(|n| *n = n.wrapping_add(1)));
     let stream_handle: StoredValue<Option<StreamLifecycle>, LocalStorage> =
@@ -563,6 +582,8 @@ pub fn Search() -> impl IntoView {
             return;
         }
         stream_query.set(q.clone());
+        let session = stream_session.get_untracked().wrapping_add(1);
+        stream_session.set(session);
 
         let signals = LiveSignals {
             ring,
@@ -570,13 +591,15 @@ pub fn Search() -> impl IntoView {
             lagged,
             failure: Some(stream_failure),
             frames: Some(frames),
+            opened: Some(OpenedMark {
+                latest: stream_opened_at,
+                session,
+            }),
         };
         if let Some(handle) = start_stream(&q, signals) {
             stream_handle.update_value(|slot| *slot = Some(handle));
         } else {
-            stream_failure.set(Some(
-                "Live stream unavailable. Retry or switch to Snapshot.",
-            ));
+            stream_failure.set(Some(STREAM_UNAVAILABLE));
         }
     });
 
@@ -653,6 +676,57 @@ pub fn Search() -> impl IntoView {
             return None;
         }
         rows.get().and_then(Result::ok)
+    });
+    // The query error notice, when the failure on screen is the server
+    // refusing the text of the CURRENT request (ADR-0039). The resource
+    // keeps a failure while the next request is in flight, so identity
+    // decides, not presence: a failure whose intent or generation is not
+    // the latest is an older request's verdict — the query before an
+    // edit, or the same text before a Haul re-sent it — and quoting it
+    // would describe text that is not what ran last. The excerpt is the
+    // text that request sent, never the draft or today's `effective_q`.
+    //
+    // In live, the browser cannot read why a stream closed. A stream that
+    // closed before it ever opened, on text the local parser also refuses,
+    // gets the live syntax notice, quoting the text that stream was opened
+    // with. Any other live failure — a stream that opened and then closed,
+    // or a text that parses — keeps the generic copy and its Retry.
+    let query_notice = Memo::new(move |_| -> Option<NoticeModel> {
+        if unreadable.get() {
+            return None;
+        }
+        if live.get() {
+            if stream_failure.get() != Some(STREAM_UNAVAILABLE) || stream_opened.get() {
+                return None;
+            }
+            return stream_query.with(|sent| live_syntax_notice(sent));
+        }
+        if snapshot_q.get().trim().is_empty() || loading.get() {
+            return None;
+        }
+        rows.with(|result| match result {
+            Some(Err(failure))
+                if failure.intent == request_intent.get()
+                    && failure.generation == request_generation.get() =>
+            {
+                refusal_notice(&failure.error, &failure.query.effective)
+            }
+            _ => None,
+        })
+    });
+    // A query error the resource still holds after a newer request
+    // superseded it: the same text re-sent, or new text not yet answered.
+    // The tables would render it as "Couldn't load results" with a Retry,
+    // which is the one thing a query error never offers, so the region
+    // waits for the new answer instead.
+    let refusal_superseded = Signal::derive(move || {
+        query_notice.get().is_none()
+            && !unreadable.get()
+            && !live.get()
+            && !snapshot_q.get().trim().is_empty()
+            && rows.with(|result| {
+                matches!(result, Some(Err(failure)) if failure.error.query_error().is_some())
+            })
     });
     let execution = Signal::derive(move || {
         accepted_snapshot
@@ -1036,6 +1110,7 @@ pub fn Search() -> impl IntoView {
                     && mode.get() == Mode::Live
                     && (active_tab.get() == ResultsTab::Events || !is_chart_query.get())
                     && stream_failure.get().is_some()
+                    && query_notice.get().is_none()
                 >
                     <div class="results-empty">
                         <p role="alert">{move || stream_failure.get()}</p>
@@ -1066,6 +1141,30 @@ pub fn Search() -> impl IntoView {
                         }
                         report_refusal(bus, outcome);
                     })/> }.into_any()
+                } else if let Some(model) = query_notice.get() {
+                    // A query error takes the region on either tab, in
+                    // place of the table or the chart: neither the
+                    // tables' "Couldn't load results" nor the chart's
+                    // failure copy mounts, and neither Retry does, since
+                    // the same text earns the same verdict (ADR-0039).
+                    view! {
+                        <div id="search-results" class="results" role="region" aria-label="Search results" tabindex="0">
+                            <QueryErrorNotice model=model/>
+                        </div>
+                    }.into_any()
+                } else if refusal_superseded.get() {
+                    // Each tab's own waiting copy, without the table or
+                    // chart that would read the superseded failure.
+                    let waiting = if active_tab.get() == ResultsTab::Visualization {
+                        view! { <p class="results-empty" role="status">"Loading snapshot visualization…"</p> }.into_any()
+                    } else {
+                        view! { <div class="load-hint">{fleet_ui::loaded::loading_copy(Some("results"))}</div> }.into_any()
+                    };
+                    view! {
+                        <div id="search-results" class="results" role="region" aria-label="Search results" tabindex="0">
+                            {waiting}
+                        </div>
+                    }.into_any()
                 } else {
                     match (active_tab.get(), mode.get()) {
                     // An aggregation answers in exact numbers, so the
@@ -1165,7 +1264,7 @@ pub fn Search() -> impl IntoView {
                                         />
                                     }.into_any()
                                 }
-                                Some(Err(_)) => view! { <div class="results-empty"><p role="alert">"Snapshot query failed. Open Events for the query error."</p><button type="button" class="btn-sec" on:click=move |_| rows.refetch()>"Retry snapshot"</button></div> }.into_any(),
+                                Some(Err(_)) => view! { <div class="results-empty"><p role="alert">"Snapshot query failed. Open Events for the error."</p><button type="button" class="btn-sec" on:click=move |_| rerun_request()>"Retry snapshot"</button></div> }.into_any(),
                                 None => view! { <p class="results-empty">"Run a query to visualize its snapshot."</p> }.into_any(),
                             }
                         };

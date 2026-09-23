@@ -1,0 +1,12 @@
+{
+  "error": {
+    "code": "validation_error",
+    "message": "unknown function: countt (did you mean 'count'?)",
+    "details": [
+      {
+        "message": "unknown function: countt",
+        "hint": "did you mean 'count'?"
+      }
+    ]
+  }
+}

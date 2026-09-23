@@ -39,6 +39,29 @@ impl std::ops::Deref for ExecutedResponse {
     }
 }
 
+/// A request that failed, with the same identity a success carries.
+///
+/// The query error notice quotes the text a refusal's spans index, which
+/// is the effective query this request sent, not whatever the URL or the
+/// editor holds by the time the answer lands (ADR-0039). The intent and
+/// generation let the page tell this failure from a newer request for
+/// the same text: a resubmitted query must not show the old verdict.
+#[derive(Clone)]
+pub struct ExecutedFailure {
+    pub query: ExecutedQuery,
+    pub error: ApiError,
+    pub generation: u64,
+    pub intent: u64,
+}
+
+/// A failure prints as its error, so every reader that only renders the
+/// message (the tables' `Loaded`) reads what it read before.
+impl std::fmt::Display for ExecutedFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
 /// Build a Leptos `LocalResource` that runs `api::query(q, plan)` whenever
 /// the effective-query or fetch-plan signals change.
 ///
@@ -61,6 +84,17 @@ impl std::ops::Deref for ExecutedResponse {
 /// `Some` response during a reload, so presence cannot report loading.
 /// The returned intent revision advances independently of the serialized
 /// fetcher, including while an older request is still in flight.
+///
+/// `resubmit` is the one way to send an unchanged request again: a
+/// same-query Haul or Retry bumps it, and it advances the intent the way
+/// a changed input does. `LocalResource::refetch` is not that way. Its
+/// invalidation is consumed while a request is in flight, so a re-Haul
+/// of a pending query sent nothing, and the older request's answer then
+/// landed as the current intent's verdict. Moving the intent the moment
+/// the resubmission is asked for supersedes that answer at once: it
+/// leaves `pending` set, rearms the fetcher, and matches no reader's
+/// intent. The same holds for a success as for a failure.
+#[allow(clippy::too_many_arguments)]
 pub fn rows_resource(
     effective_q: Memo<String>,
     plan: Memo<FetchPlan>,
@@ -69,7 +103,11 @@ pub fn rows_resource(
     base: Memo<String>,
     filters: Memo<Vec<Filter>>,
     range: Memo<RangeSpec>,
-) -> (LocalResource<Result<ExecutedResponse, ApiError>>, Memo<u64>) {
+    resubmit: ReadSignal<u64>,
+) -> (
+    LocalResource<Result<ExecutedResponse, ExecutedFailure>>,
+    Memo<u64>,
+) {
     // Compare the complete request before advancing its intent. Related URL
     // memos can notify through several paths for the same captured values.
     let inputs = Memo::new(move |_| {
@@ -83,6 +121,7 @@ pub fn rows_resource(
     });
     let intent = Memo::new(move |previous: Option<&u64>| {
         inputs.with(|_| ());
+        resubmit.track();
         previous.map_or(0, |revision| revision.wrapping_add(1))
     });
     // LocalResource awaits one request before processing its next dependency
@@ -133,13 +172,21 @@ pub fn rows_resource(
                 let _ = pending.try_set(false);
             }
             rearm_if_stale(intent, request_intent, rearm);
-            response.map(|response| ExecutedResponse {
-                query,
-                response,
-                plan,
-                generation: request_generation,
-                intent: request_intent,
-            })
+            match response {
+                Ok(response) => Ok(ExecutedResponse {
+                    query,
+                    response,
+                    plan,
+                    generation: request_generation,
+                    intent: request_intent,
+                }),
+                Err(error) => Err(ExecutedFailure {
+                    query,
+                    error,
+                    generation: request_generation,
+                    intent: request_intent,
+                }),
+            }
         }
     });
     (rows, intent)

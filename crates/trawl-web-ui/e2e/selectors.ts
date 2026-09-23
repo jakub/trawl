@@ -111,6 +111,19 @@ export const SEL = {
   liveTailButton: '.rt-hint + .foot .btn-pri',
   /// crates/fleet-ui/src/loaded/component.rs Loaded's default Error arm.
   loadHintError: '.results .load-hint.error',
+  /// crates/trawl-web-ui/src/components/query_error_notice.rs — the query
+  /// error notice, which search.rs mounts in the results region in place
+  /// of the table or chart. The parts below it are chained off the
+  /// notice (or one of its blocks), so they carry no ancestor of their own.
+  queryErrorNotice: '#search-results .query-error[role="alert"]',
+  queryErrorLead: '.query-error-lead',
+  queryErrorBlock: '.query-error-block',
+  queryErrorMessage: '.query-error-message',
+  queryErrorExcerpt: 'figure.query-error-excerpt',
+  queryErrorCaption: 'figcaption.query-error-caption',
+  queryErrorText: 'pre.query-error-text',
+  queryErrorCaret: '.query-error-caret',
+  queryErrorCaretPad: '.query-error-caret .query-error-caret-pad',
   /// crates/fleet-ui/src/range_dialog.rs RangePanel —
   /// the Segmented tab strip's "Absolute" option.
   absoluteTab: '.dr-pop >> text=Absolute',
@@ -348,6 +361,12 @@ export const SEL = {
   /// header's draft marker, rendered only when the buffer differs from
   /// the executed query. It navigates nothing.
   draftState: '.console-hd .draft',
+  /// crates/trawl-web-ui/src/components/editor_wrap.rs DraftDiagnosticLine
+  /// — the local parser's verdict on the buffer, under the editor row:
+  /// the first error as a visible line, the rest behind a disclosure.
+  draftDiagnostic: '.editor-wrap .draft-diagnostic',
+  draftDiagnosticFirst: '.draft-diagnostic .draft-diagnostic-first',
+  draftDiagnosticMore: '.draft-diagnostic details.draft-diagnostic-more',
   /// crates/trawl-web-ui/src/pages/search.rs — the reading-mode
   /// disclosure in the result header. A button, so it is the thing that
   /// opens the popover and the thing `aria-expanded` rides.
@@ -521,6 +540,14 @@ export const COPY = {
   /// crates/trawl-web-ui/src/components/editor_wrap.rs — the console
   /// header marks an editor buffer that differs from the executed query.
   draftDirty: 'Edited',
+  /// crates/trawl-web-ui/vendor/src/codemirror.ts LINT_MARKER_NAME — the
+  /// accessible name of every lint gutter marker.
+  lintMarkerName: 'Query syntax error',
+  /// crates/trawl-web-ui/src/components/query_error_notice.rs — the label
+  /// over each excerpt.
+  queryErrorCaption: 'Query sent to server',
+  /// crates/trawl-web-ui/src/state/stream_session.rs STREAM_UNAVAILABLE.
+  streamUnavailable: 'Live stream unavailable. Retry or switch to Snapshot.',
   /// crates/trawl-web-ui/src/components/editor_wrap.rs — the visible
   /// names of two of the three editor tools. Both say what they act on,
   /// since "Save" and "Share" named neither the net nor the URL.
@@ -660,7 +687,7 @@ export const COPY = {
   /// crates/trawl-web-ui/src/schedule_edit.rs `preview_cap` — the line a
   /// capped preview shows, as the source formats it.
   previewCapLine: 'This run stored {n} rows; {fetched} were fetched. Paging covers the fetched rows.',
-  /// crates/trawl-web-ui/src/api/mod.rs ApiError::Status — what a non-2xx
+  /// crates/trawl-web-ui/src/api_error.rs ApiError::Status — what a non-2xx
   /// with no error envelope collapses to.
   apiStatusText: 'server returned {0}',
 

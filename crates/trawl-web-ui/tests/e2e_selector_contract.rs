@@ -65,7 +65,10 @@ const DRAWER_QUERY_RS: &str = include_str!("../src/drawer_query.rs");
 const SEARCH_INPUT_RS: &str = include_str!("../../fleet-ui/src/search_input.rs");
 const SEGMENTED_COMPONENT_RS: &str = include_str!("../../fleet-ui/src/segmented/component.rs");
 const SCHEDULE_EDIT_RS: &str = include_str!("../src/schedule_edit.rs");
-const API_MOD_RS: &str = include_str!("../src/api/mod.rs");
+const API_ERROR_RS: &str = include_str!("../src/api_error.rs");
+const CODEMIRROR_TS: &str = include_str!("../vendor/src/codemirror.ts");
+const QUERY_ERROR_NOTICE_RS: &str = include_str!("../src/components/query_error_notice.rs");
+const SEARCH_RS: &str = include_str!("../src/pages/search.rs");
 
 /// One (assignment, source file, hook) triple: `assignment` is the full
 /// `key: 'value',` line as it appears in `selectors.ts`, and `hook` must
@@ -1892,9 +1895,117 @@ const CONTRACTS: &[Contract] = &[
     },
     Contract {
         assignment: "apiStatusText: 'server returned {0}',",
-        source_path: "src/api/mod.rs",
-        source: API_MOD_RS,
+        source_path: "src/api_error.rs",
+        source: API_ERROR_RS,
         hook: "#[error(\"server returned {0}\")]",
+    },
+    Contract {
+        assignment: "draftDiagnostic: '.editor-wrap .draft-diagnostic',",
+        source_path: "src/components/editor_wrap.rs",
+        source: EDITOR_WRAP_RS,
+        hook: "<DraftDiagnosticLine query=query/>",
+    },
+    Contract {
+        assignment: "draftDiagnostic: '.editor-wrap .draft-diagnostic',",
+        source_path: "src/components/editor_wrap.rs",
+        source: EDITOR_WRAP_RS,
+        hook: "class=\"draft-diagnostic\"",
+    },
+    Contract {
+        assignment: "draftDiagnosticFirst: '.draft-diagnostic .draft-diagnostic-first',",
+        source_path: "src/components/editor_wrap.rs",
+        source: EDITOR_WRAP_RS,
+        hook: "class=\"draft-diagnostic-first\"",
+    },
+    Contract {
+        assignment: "draftDiagnosticMore: '.draft-diagnostic details.draft-diagnostic-more',",
+        source_path: "src/components/editor_wrap.rs",
+        source: EDITOR_WRAP_RS,
+        hook: "<details class=\"draft-diagnostic-more\"",
+    },
+    Contract {
+        assignment: "lintMarkerName: 'Query syntax error',",
+        source_path: "vendor/src/codemirror.ts",
+        source: CODEMIRROR_TS,
+        hook: "const LINT_MARKER_NAME = \"Query syntax error\";",
+    },
+    Contract {
+        assignment: "queryErrorNotice: '#search-results .query-error[role=\"alert\"]',",
+        source_path: "src/pages/search.rs",
+        source: SEARCH_RS,
+        hook: "<QueryErrorNotice model=model/>",
+    },
+    Contract {
+        assignment: "queryErrorNotice: '#search-results .query-error[role=\"alert\"]',",
+        source_path: "src/pages/search.rs",
+        source: SEARCH_RS,
+        hook: "<div id=\"search-results\" class=\"results\"",
+    },
+    Contract {
+        assignment: "queryErrorNotice: '#search-results .query-error[role=\"alert\"]',",
+        source_path: "src/components/query_error_notice.rs",
+        source: QUERY_ERROR_NOTICE_RS,
+        hook: "<div class=\"query-error\" role=\"alert\">",
+    },
+    Contract {
+        assignment: "queryErrorLead: '.query-error-lead',",
+        source_path: "src/components/query_error_notice.rs",
+        source: QUERY_ERROR_NOTICE_RS,
+        hook: "class=\"query-error-lead\"",
+    },
+    Contract {
+        assignment: "queryErrorBlock: '.query-error-block',",
+        source_path: "src/components/query_error_notice.rs",
+        source: QUERY_ERROR_NOTICE_RS,
+        hook: "class=\"query-error-block\"",
+    },
+    Contract {
+        assignment: "queryErrorMessage: '.query-error-message',",
+        source_path: "src/components/query_error_notice.rs",
+        source: QUERY_ERROR_NOTICE_RS,
+        hook: "class=\"query-error-message\"",
+    },
+    Contract {
+        assignment: "queryErrorExcerpt: 'figure.query-error-excerpt',",
+        source_path: "src/components/query_error_notice.rs",
+        source: QUERY_ERROR_NOTICE_RS,
+        hook: "<figure class=\"query-error-excerpt\">",
+    },
+    Contract {
+        assignment: "queryErrorCaption: 'figcaption.query-error-caption',",
+        source_path: "src/components/query_error_notice.rs",
+        source: QUERY_ERROR_NOTICE_RS,
+        hook: "<figcaption class=\"query-error-caption\">",
+    },
+    Contract {
+        assignment: "queryErrorText: 'pre.query-error-text',",
+        source_path: "src/components/query_error_notice.rs",
+        source: QUERY_ERROR_NOTICE_RS,
+        hook: "<pre class=\"query-error-text\">",
+    },
+    Contract {
+        assignment: "queryErrorCaret: '.query-error-caret',",
+        source_path: "src/components/query_error_notice.rs",
+        source: QUERY_ERROR_NOTICE_RS,
+        hook: "class=\"query-error-caret\"",
+    },
+    Contract {
+        assignment: "queryErrorCaretPad: '.query-error-caret .query-error-caret-pad',",
+        source_path: "src/components/query_error_notice.rs",
+        source: QUERY_ERROR_NOTICE_RS,
+        hook: "class=\"query-error-caret-pad\"",
+    },
+    Contract {
+        assignment: "queryErrorCaption: 'Query sent to server',",
+        source_path: "src/components/query_error_notice.rs",
+        source: QUERY_ERROR_NOTICE_RS,
+        hook: "\"Query sent to server\"",
+    },
+    Contract {
+        assignment: "streamUnavailable: 'Live stream unavailable. Retry or switch to Snapshot.',",
+        source_path: "src/state/stream_session.rs",
+        source: include_str!("../src/state/stream_session.rs"),
+        hook: "pub const STREAM_UNAVAILABLE: &str = \"Live stream unavailable. Retry or switch to Snapshot.\";",
     },
     // -- the DSL shapes the stub dispatches on --------------------------
     // `e2e_wire_fixture_contract.rs` proves these against the builders by

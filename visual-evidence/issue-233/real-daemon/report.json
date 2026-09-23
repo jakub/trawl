@@ -1,0 +1,156 @@
+{
+  "schema": 1,
+  "status": "passed",
+  "runId": "run-1790111575611-465b7d09a7",
+  "sourceHead": "dc83596230d0d195b1dcadd53c2a9ed3dd689844",
+  "scenarioSHA256": "ebb98edaea8eff2284d4475879c5f34b7676b011ca78ef62828d9042d37668d7",
+  "identityHelperSHA256": "df5048349fd0c755334005bcd01f0a3fa8566bceedd519e8bb5912e613844e79",
+  "build": {
+    "commit": "dc83596230d0d195b1dcadd53c2a9ed3dd689844",
+    "sourceHash": "660f72d41ca7668e021e77aa09cf1f52cff4d42019803f373adb8eb3736da69f",
+    "sourceFingerprintVerified": true,
+    "runBuildSHA256": "3212bdc83661bb18fd47ed29b015b29e4f02d5e9e28ff2878da77a57699706c6",
+    "manifestArtifacts": {
+      "spaHash": "1925b4c0020e52db767f52c506d36bf5a06018ca6de02d4266886852429e1c54",
+      "binaries": {
+        "trawld": "9e5514db18dd457d4087c5153e16542e03b5b80fe6924b5a3066be1c5eea5ff4",
+        "trawl-web": "c8c19d381cc6a1769d58fa9421716a1996a3c4dfd8740168b66d5edc9dd96a49",
+        "fleet-admin": "13053ff71c92f66006f90808908f3730ef89b5d4c2f8b7437e44c8376f11e008",
+        "deps/libduckdb.so": "fc23f12e376c47be520f75221288281906e7942e8fd6f6ce4849198ba60d0405"
+      }
+    },
+    "artifactVerification": "Selected run record, running executable bytes, process starts, configs, and owned/served SPA verified before evidence and again before pass."
+  },
+  "command": "node scripts/app-experiment/issue233-evidence.mjs --run target/app-experiments/run-1790111575611-465b7d09a7",
+  "cases": [
+    {
+      "label": "parse-error",
+      "sent": "last=15m service=kubelet | stats count( by host",
+      "status": 400,
+      "body": {
+        "error": {
+          "code": "parse_error",
+          "message": "found 'h', expected '(' or '*' or '/' or '%' or '+' or '-' or matches or ilike or like or '=' or '!' or '>' or '<' or in or and or or or ',' or ')'",
+          "details": [
+            {
+              "message": "found 'h', expected '(' or '*' or '/' or '%' or '+' or '-' or matches or ilike or like or '=' or '!' or '>' or '<' or in or and or or or ',' or ')'",
+              "span": {
+                "start": 43,
+                "end": 44
+              }
+            }
+          ]
+        }
+      },
+      "wireFixture": "query-parse-error.json",
+      "wireFixtureEqual": true,
+      "notice": {
+        "lead": "Couldn't run the query: found 'h', expected '(' or '*' or '/' or '%' or '+' or '-' or matches or ilike or like or '=' or '!' or '>' or '<' or in or and or or or ',' or ')'",
+        "excerpts": 1,
+        "quoted": [
+          "last=15m service=kubelet | stats count( by host"
+        ]
+      }
+    },
+    {
+      "label": "parse-errors-two",
+      "sent": "last=15m f=#a,#b",
+      "status": 400,
+      "body": {
+        "error": {
+          "code": "parse_error",
+          "message": "'#' inside an unquoted value",
+          "details": [
+            {
+              "message": "'#' inside an unquoted value",
+              "span": {
+                "start": 11,
+                "end": 12
+              },
+              "hint": "quote the value (\"#a\"), or put whitespace before the '#' to start a comment"
+            },
+            {
+              "message": "'#' inside an unquoted value",
+              "span": {
+                "start": 14,
+                "end": 15
+              },
+              "hint": "quote the value (\"#b\"), or put whitespace before the '#' to start a comment"
+            }
+          ]
+        }
+      },
+      "wireFixture": "query-parse-errors-two.json",
+      "wireFixtureEqual": true,
+      "notice": {
+        "lead": "Couldn't run the query: 2 errors",
+        "excerpts": 2,
+        "quoted": [
+          "last=15m f=#a,#b",
+          "last=15m f=#a,#b"
+        ]
+      }
+    },
+    {
+      "label": "validation-hint",
+      "sent": "last=15m * | stats countt(x) by host",
+      "status": 400,
+      "body": {
+        "error": {
+          "code": "validation_error",
+          "message": "unknown function: countt (did you mean 'count'?)",
+          "details": [
+            {
+              "message": "unknown function: countt",
+              "hint": "did you mean 'count'?"
+            }
+          ]
+        }
+      },
+      "wireFixture": "query-validation-hint.json",
+      "wireFixtureEqual": true,
+      "notice": {
+        "lead": "Couldn't run the query: unknown function: countt — did you mean 'count'?",
+        "excerpts": 0,
+        "quoted": []
+      }
+    },
+    {
+      "label": "validation-no-hint",
+      "sent": "last=15m * | stats nosuchfunc(x) by host",
+      "status": 400,
+      "body": {
+        "error": {
+          "code": "validation_error",
+          "message": "unknown function: nosuchfunc",
+          "details": [
+            {
+              "message": "unknown function: nosuchfunc"
+            }
+          ]
+        }
+      },
+      "wireFixture": "query-validation-no-hint.json",
+      "wireFixtureEqual": true,
+      "notice": {
+        "lead": "Couldn't run the query: unknown function: nosuchfunc",
+        "excerpts": 0,
+        "quoted": []
+      }
+    }
+  ],
+  "captures": [
+    "parse-error.png",
+    "parse-errors-two.png",
+    "validation-hint.png",
+    "validation-no-hint.png"
+  ],
+  "cleanup": {
+    "browser": true
+  },
+  "limits": [
+    "Refusals only: parse and validation errors are decided before DuckDB runs, so no corpus row is read.",
+    "Live mode is not exercised: EventSource cannot read a refusal body, and the stub suite covers the live notice.",
+    "Identity checks detect drift and stale processes; they do not isolate against a hostile local user."
+  ]
+}

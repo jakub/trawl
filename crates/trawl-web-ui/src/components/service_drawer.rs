@@ -613,6 +613,7 @@ fn TailPane(svc: ServiceSchema, bus: ToastBus) -> impl IntoView {
             lagged,
             failure: Some(failure),
             frames: None,
+            opened: None,
         };
         if let Some(lc) = start_stream(&q, sig) {
             lifecycle.set_value(Some(lc));

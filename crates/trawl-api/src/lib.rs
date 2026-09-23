@@ -176,7 +176,10 @@ pub struct ErrorEnvelope {
     pub code: ErrorCode,
     /// Human-readable summary message.
     pub message: String,
-    /// Detailed diagnostics (spans, sub-errors). Empty for spanless errors.
+    /// Detailed diagnostics. Set for `parse_error`, where each detail has a
+    /// span, and for a `validation_error` the emitter reports, whose one
+    /// detail has no span. Empty for every other error, including a
+    /// `validation_error` found while the query runs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub details: Vec<ErrorDetail>,
 }

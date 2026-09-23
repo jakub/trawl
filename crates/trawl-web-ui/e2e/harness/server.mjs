@@ -811,7 +811,9 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
         return;
       }
       if (scenario === 'query-500') {
-        sendJson(res, 500, errorEnvelope('Couldn’t load results: stub query failure'));
+        // The message only: the page adds its own "Couldn't load
+        // results:" lead to an execution error it now reads.
+        sendJson(res, 500, errorEnvelope('stub query failure'));
         return;
       }
       if (scenario === 'corpus') {

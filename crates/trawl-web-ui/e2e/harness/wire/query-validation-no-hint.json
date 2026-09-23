@@ -1,0 +1,11 @@
+{
+  "error": {
+    "code": "validation_error",
+    "message": "unknown function: nosuchfunc",
+    "details": [
+      {
+        "message": "unknown function: nosuchfunc"
+      }
+    ]
+  }
+}

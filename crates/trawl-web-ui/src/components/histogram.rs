@@ -24,14 +24,18 @@ use leptos::prelude::*;
 use trawl_api::QueryResponse;
 use trawl_api::value::Value;
 
-use crate::api::ApiError;
 use crate::histogram::{Series, axis_labels, bucket_time, bucketize_series};
 
 const N_BUCKETS: usize = 48;
 
 #[component]
 pub fn Histogram(
-    rows: LocalResource<Result<crate::state::search_session::ExecutedResponse, ApiError>>,
+    rows: LocalResource<
+        Result<
+            crate::state::search_session::ExecutedResponse,
+            crate::state::search_session::ExecutedFailure,
+        >,
+    >,
 ) -> impl IntoView {
     view! {
         <div class="histo">

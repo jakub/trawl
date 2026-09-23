@@ -199,25 +199,16 @@ pub enum EmitError {
     Comparison(crate::compare::CompareError),
 }
 
+/// The message, then the hint in parentheses when there is one. A caller
+/// that carries the hint in its own field reads [`EmitError::message`]
+/// instead, so the hint is not said twice.
 impl fmt::Display for EmitError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::UnknownFunction { name, .. } => {
-                write!(f, "unknown function: {name}")?;
-                if let Some(hint) = self.hint() {
-                    write!(f, " ({hint})")?;
-                }
-                Ok(())
-            }
-            Self::InvalidAggregation { message } => write!(f, "invalid aggregation: {message}"),
-            Self::UnsupportedOperation { message } => {
-                write!(f, "unsupported operation: {message}")
-            }
-            Self::Comparison(err) => write!(f, "unsupported operation: {err}"),
-            Self::InvalidFormat { func_name, format } => {
-                write!(f, "{func_name}(): invalid format string {format:?}")
-            }
+        f.write_str(&self.message())?;
+        if let Some(hint) = self.hint() {
+            write!(f, " ({hint})")?;
         }
+        Ok(())
     }
 }
 
@@ -241,6 +232,21 @@ impl From<crate::compare::CompareError> for EmitError {
 }
 
 impl EmitError {
+    /// The user-facing sentence without the hint: what `Display` prints
+    /// before its parenthesized hint. The server's error envelope carries
+    /// this as a detail's `message` beside the detail's own `hint`.
+    pub fn message(&self) -> String {
+        match self {
+            Self::UnknownFunction { name, .. } => format!("unknown function: {name}"),
+            Self::InvalidAggregation { message } => format!("invalid aggregation: {message}"),
+            Self::UnsupportedOperation { message } => format!("unsupported operation: {message}"),
+            Self::Comparison(err) => format!("unsupported operation: {err}"),
+            Self::InvalidFormat { func_name, format } => {
+                format!("{func_name}(): invalid format string {format:?}")
+            }
+        }
+    }
+
     /// Produce a user-facing hint string, if applicable.
     pub fn hint(&self) -> Option<String> {
         match self {
@@ -3068,6 +3074,75 @@ mod tests {
         // appending ` [comparison refusal]` to the `Display` impl would
         // sail straight through it.
         assert_eq!(err.to_string(), format!("unsupported operation: {cause}"));
+    }
+
+    /// `message()` is `Display` without the hint, and `Display` still
+    /// prints exactly what it printed before `message()` existed: the CLI,
+    /// the telemetry row and the envelope's summary `message` all read the
+    /// `Display` text, so each variant's rendering is pinned byte for byte.
+    #[test]
+    fn message_is_display_without_the_hint_and_display_is_unchanged() {
+        let cases = [
+            (
+                EmitError::UnknownFunction {
+                    name: "countt".into(),
+                    suggestion: Some("count".into()),
+                },
+                "unknown function: countt (did you mean 'count'?)",
+                "unknown function: countt",
+            ),
+            (
+                EmitError::UnknownFunction {
+                    name: "nosuchfunc".into(),
+                    suggestion: None,
+                },
+                "unknown function: nosuchfunc",
+                "unknown function: nosuchfunc",
+            ),
+            (
+                EmitError::InvalidAggregation {
+                    message: "x".into(),
+                },
+                "invalid aggregation: x",
+                "invalid aggregation: x",
+            ),
+            (
+                EmitError::UnsupportedOperation {
+                    message: "y".into(),
+                },
+                "unsupported operation: y",
+                "unsupported operation: y",
+            ),
+            (
+                EmitError::InvalidFormat {
+                    func_name: "strftime".into(),
+                    format: "%Q".into(),
+                },
+                "strftime(): invalid format string \"%Q\"",
+                "strftime(): invalid format string \"%Q\"",
+            ),
+        ];
+        for (err, display, message) in cases {
+            assert_eq!(err.to_string(), display);
+            assert_eq!(err.message(), message);
+        }
+
+        let cause = crate::compare::CompareError::UnknownSeverityToken {
+            token: "nosuchlevel".into(),
+        };
+        let err = EmitError::Comparison(cause.clone());
+        assert_eq!(err.to_string(), format!("unsupported operation: {cause}"));
+        assert_eq!(err.message(), err.to_string());
+    }
+
+    /// The emitter's own did-you-mean reaches `Display` from a real query,
+    /// so the pinned rendering above is the one a user sees.
+    #[test]
+    fn an_unknown_function_with_a_near_miss_displays_its_hint_once() {
+        assert_eq!(
+            emit_dsl_err("* | stats countt(x) by host"),
+            "unknown function: countt (did you mean 'count'?)"
+        );
     }
 
     /// A NaN parameter is an ordinary value, and the raw-free identity

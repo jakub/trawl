@@ -14,11 +14,20 @@
 //! The stack order is date range, Haul, then the Save as Net / Copy
 //! search URL / Format tool row. Haul mirrors ⌘⏎ in the editor — both
 //! call the parent's submit callback.
+//!
+//! Under the editor row sits the draft diagnostic: the local parser's
+//! first error on the buffer as a visible line, `Line L:C — message`,
+//! with any further errors behind a `+N more` disclosure (ADR-0039). Like
+//! the draft state it is derived from the buffer and announces nothing:
+//! no live region, no control of its own, and it never gates Haul. The
+//! server's verdict on a sent query is the results region's notice, not
+//! this line.
 
 use leptos::prelude::*;
 use leptos::web_sys;
 
 use crate::components::editor::DslEditor;
+use crate::query_error::{DraftDiagnostic, draft_diagnostic};
 use crate::state::query::{QUICK_RANGES, RangeSpec};
 use fleet_ui::{CopyButton, RangeDialog, RangePreset, RangeValue, ToastBus, ToastKind};
 
@@ -159,6 +168,42 @@ pub fn EditorWrap(
                     </div>
                 </div>
             </div>
+            <DraftDiagnosticLine query=query/>
         </div>
+    }
+}
+
+/// The local parser's verdict on the buffer: nothing while it parses,
+/// else the first error in full and the rest behind a disclosure.
+#[component]
+fn DraftDiagnosticLine(query: RwSignal<String>) -> impl IntoView {
+    let diagnostic = Memo::new(move |_| draft_diagnostic(&query.get()));
+    // The disclosure answers for the draft it was opened on: any edit
+    // closes it, even one that leaves the diagnostic text unchanged.
+    let more = NodeRef::<leptos::html::Details>::new();
+    Effect::new(move |_| {
+        query.track();
+        if let Some(more) = more.get_untracked() {
+            // Removing an attribute from a live element cannot fail.
+            let _ = more.remove_attribute("open");
+        }
+    });
+
+    move || {
+        diagnostic.get().map(|DraftDiagnostic { first, rest }| {
+            view! {
+                <div class="draft-diagnostic">
+                    <p class="draft-diagnostic-first">{first}</p>
+                    {(!rest.is_empty()).then(|| view! {
+                        <details class="draft-diagnostic-more" node_ref=more>
+                            <summary>{format!("+{} more", rest.len())}</summary>
+                            <ul>
+                                {rest.into_iter().map(|line| view! { <li>{line}</li> }).collect_view()}
+                            </ul>
+                        </details>
+                    })}
+                </div>
+            }
+        })
     }
 }

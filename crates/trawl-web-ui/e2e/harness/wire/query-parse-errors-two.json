@@ -1,0 +1,24 @@
+{
+  "error": {
+    "code": "parse_error",
+    "message": "'#' inside an unquoted value",
+    "details": [
+      {
+        "message": "'#' inside an unquoted value",
+        "span": {
+          "start": 11,
+          "end": 12
+        },
+        "hint": "quote the value (\"#a\"), or put whitespace before the '#' to start a comment"
+      },
+      {
+        "message": "'#' inside an unquoted value",
+        "span": {
+          "start": 14,
+          "end": 15
+        },
+        "hint": "quote the value (\"#b\"), or put whitespace before the '#' to start a comment"
+      }
+    ]
+  }
+}

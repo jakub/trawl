@@ -24,12 +24,12 @@
 //! press files the filter against the query the row came from, never
 //! the one still pending; the cells stay live throughout.
 
-use crate::api::{ApiError, PAGE_SIZE};
+use crate::api::PAGE_SIZE;
 use crate::categorical::group_columns;
 use crate::fetch_plan::cap_line;
 use crate::result_actions::{Capabilities, sorted_page};
 use crate::state::query::{Filter, FilterOp};
-use crate::state::search_session::{ExecutedQuery, ExecutedResponse};
+use crate::state::search_session::{ExecutedFailure, ExecutedQuery, ExecutedResponse};
 use fleet_ui::{LoadState, Loaded, OffsetPager, PageTotal, PageWindow};
 use leptos::prelude::*;
 use trawl_api::QueryResponse;
@@ -39,7 +39,7 @@ use trawl_api::value::Value;
 #[component]
 pub fn ExactTable(
     #[prop(into)] page: Signal<usize>,
-    rows: LocalResource<Result<ExecutedResponse, ApiError>>,
+    rows: LocalResource<Result<ExecutedResponse, ExecutedFailure>>,
     #[prop(into)] busy: Signal<bool>,
     /// The column the reader sorted on, owned by the page: the bars
     /// beside this table slice the same sorted list, so the order
