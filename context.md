@@ -146,6 +146,10 @@ _Avoid_: query complexity, bind cost, node count
 An executor-pool permit still held by physical work after its request has ended. Request completion and permit reclamation are separate events.
 _Avoid_: leaked permit, stuck query (the permit is the thing named)
 
+**Metered**:
+Counted by the per-key rate limiter. A metered request is attributable to a verified key and bounded by that key's rate; an unmetered one reached the server before any key was counted.
+_Avoid_: authenticated (a request can be authenticated and still refused before metering)
+
 ### Schedules
 
 **Schedule**:
