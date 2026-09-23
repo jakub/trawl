@@ -93,18 +93,22 @@ function request(base, route, { token, method = 'GET', body, ndjson, timeout = 4
       headers['content-length'] = Buffer.byteLength(encoded);
     }
     // A response whose headers arrived keeps its status and request id
-    // even when its body is cut: `incomplete` marks it, and `status` 0
-    // means no response arrived at all.
+    // even when its body is cut, whichever of the response or request
+    // error handlers sees the failure first (a timeout destroys the
+    // request): `incomplete` marks it, and `status` 0 means no response
+    // arrived at all.
+    let got = null;
+    const cut = error => (got ? { ...got(), incomplete: true, error } : { status: 0, error });
     const req = https.request(base + route, { method, headers, agent }, res => {
       const chunks = [];
-      const got = () => ({ status: res.statusCode, requestId: res.headers['x-request-id'], text: Buffer.concat(chunks).toString() });
+      got = () => ({ status: res.statusCode, requestId: res.headers['x-request-id'], text: Buffer.concat(chunks).toString() });
       res.on('data', c => chunks.push(c));
-      res.on('error', e => resolve({ ...got(), incomplete: true, error: e.message }));
-      res.on('aborted', () => resolve({ ...got(), incomplete: true, error: 'response aborted' }));
-      res.on('end', () => resolve(res.complete ? got() : { ...got(), incomplete: true, error: 'response ended early' }));
+      res.on('error', e => resolve(cut(e.message)));
+      res.on('aborted', () => resolve(cut('response aborted')));
+      res.on('end', () => resolve(res.complete ? got() : cut('response ended early')));
     });
     req.setTimeout(timeout, () => req.destroy(new Error('client deadline')));
-    req.on('error', e => resolve({ status: 0, error: e.message }));
+    req.on('error', e => resolve(cut(e.message)));
     if (encoded !== undefined) req.write(encoded);
     req.end();
   });

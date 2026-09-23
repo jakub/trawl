@@ -36,7 +36,10 @@ if [[ -z "$first" ]]; then
     fi
     (cd "$root" && cargo build --release --locked -p trawl-server -p fleet-admin)
     mkdir -p "$here/results"
-    rm -f "$here"/results/[a-g].json "$here"/results/[a-g]-http_failure.jsonl "$here"/results/restart-probe.json
+    # A fresh collection: drop the previous results, including the note
+    # that attributes committed results to the harness that recorded them.
+    rm -f "$here"/results/[a-g].json "$here"/results/[a-g]-http_failure.jsonl "$here"/results/restart-probe.json \
+        "$here"/results/provenance.md
     git -C "$root" rev-parse HEAD > "$here/results/commit.txt"
     node "$harness" setup
     node "$harness" restart-probe
