@@ -30,7 +30,9 @@ async function startStub(port: number): Promise<{ origin: string; stop: () => Pr
   const child = spawn(process.execPath, [path.join(__dirname, 'harness', 'server.mjs')], {
     cwd: __dirname,
     env: { ...process.env, E2E_PORT: String(port) },
-    stdio: ['ignore', 'pipe', 'pipe'],
+    // The IPC channel ties the server's lifetime to this worker; see the
+    // `disconnect` handler in harness/server.mjs.
+    stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
   });
   const exited = new Promise<void>((resolve) => child.once('exit', () => resolve()));
   let output = '';

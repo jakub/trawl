@@ -1200,3 +1200,11 @@ function shutdown() {
 }
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
+// fixtures.ts starts this server with an IPC channel to its Playwright
+// worker. A worker that dies without running teardown (an OOM kill, say)
+// closes the channel, and the server exits with it instead of keeping the
+// port that the replacement worker needs. A worker that died while this
+// module was still loading has already disconnected: `process.connected`
+// is then false, where a standalone launch leaves it undefined.
+if (process.connected === false) shutdown();
+else if (process.channel) process.on('disconnect', shutdown);
