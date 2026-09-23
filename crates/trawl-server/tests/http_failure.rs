@@ -756,6 +756,24 @@ async fn unmetered_401_403_never_reach_the_wal() {
     sinks();
     let server = common::setup().await;
 
+    // Positive control: a metered request's own record persists, so the
+    // absences below are the filter's doing and not a dead WAL.
+    let metered = raw_client()
+        .post(format!("{}/api/v1/query", server.url))
+        .bearer_auth(&server.analyst_token)
+        .json(&serde_json::json!({ "query": "*" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(metered.status(), 200);
+    let metered_request = request_id_of(metered.headers());
+    let completed: Vec<_> = wal_records()
+        .into_iter()
+        .filter(|record| record["event_type"] == "query_complete")
+        .filter(|record| record["request_id"] == metered_request.as_str())
+        .collect();
+    assert_eq!(completed.len(), 1, "the WAL is live: {completed:?}");
+
     let unauthorized = raw_client()
         .post(format!("{}/api/v1/query", server.url))
         .bearer_auth("zz-not-a-key")

@@ -613,11 +613,41 @@ mod tests {
             "the rejection must still be visible on stdout under the default \
              filter; saw {logged:?}"
         );
+        // Positive control: an event on the policy module's own target
+        // persists under the same subscriber, so the rejection's absence
+        // below is the filter's doing and not a dead WAL.
+        tracing::info!(
+            target: "trawl_server::policy",
+            event_type = "wal_probe",
+            "policy: wal probe"
+        );
         wal.flush();
-        let persisted = std::fs::read_dir(wal_dir.path().join("prod")).map_or(0, Iterator::count);
-        assert_eq!(
-            persisted, 0,
-            "an unmetered rejection must never reach the WAL layer"
+        let records: Vec<serde_json::Value> = std::fs::read_dir(wal_dir.path().join("prod"))
+            .map(|entries| {
+                entries
+                    .map(|entry| entry.unwrap().path())
+                    .filter(|path| path.extension().is_some_and(|ext| ext == "ndjson"))
+                    .flat_map(|path| {
+                        std::fs::read_to_string(path)
+                            .unwrap()
+                            .lines()
+                            .map(|line| serde_json::from_str(line).unwrap())
+                            .collect::<Vec<_>>()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            records
+                .iter()
+                .any(|record| record["event_type"] == "wal_probe"),
+            "the WAL is live: {records:#?}"
+        );
+        assert!(
+            records
+                .iter()
+                .all(|record| record["target"] != crate::telemetry::UNMETERED_POLICY_TARGET),
+            "an unmetered rejection must never reach the WAL layer: {records:#?}"
         );
     }
 
