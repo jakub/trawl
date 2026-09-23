@@ -692,8 +692,7 @@ impl StagedCharge {
 /// [`WalLayerInner::report_drops`].
 #[derive(Clone, Copy)]
 enum DropReport {
-    AfterWrite,
-    Idle,
+    Due,
     Final,
 }
 
@@ -1253,17 +1252,19 @@ impl WalLayerInner {
             }
         }
 
-        self.report_drops(DropReport::AfterWrite);
+        self.report_drops(DropReport::Due);
     }
 
-    /// Ask for an Idle report at the end of a flush cycle, once the retry
-    /// queue is empty: the active buffer has just been drained, so the
-    /// record is admitted rather than refused by a nearly full buffer, and
-    /// the next cycle writes it with no other traffic. While the queue
-    /// holds a failed batch the counts wait for the write that drains it.
+    /// Report due losses at the end of a flush cycle, once the retry queue
+    /// is empty. No write follows then to report them from `publish` (a
+    /// crashed write, a deferred `unmetered_cap` count whose window has
+    /// opened, no traffic), and the active buffer has just been drained,
+    /// so the record is admitted rather than refused by a nearly full
+    /// buffer; the next cycle writes it. While the queue holds a failed
+    /// batch the counts wait for the write that drains it.
     fn report_idle_drops(&self) {
         if self.pending.lock().is_empty() {
-            self.report_drops(DropReport::Idle);
+            self.report_drops(DropReport::Due);
         }
     }
 
@@ -1271,23 +1272,13 @@ impl WalLayerInner {
     /// accumulated (safe from recursion: `on_event` only buffers, and the
     /// next write carries the record). `when` picks which losses are due:
     ///
-    /// - [`DropReport::AfterWrite`]: every reason, except that a record
-    ///   reporting only `unmetered_cap` waits for its window
-    ///   ([`Self::take_unmetered_only_drops`]).
-    /// - [`DropReport::Idle`]: only such a waiting `unmetered_cap` count,
-    ///   once its window has opened ([`Self::report_idle_drops`]). Other
-    ///   reasons are left for the write that follows.
+    /// - [`DropReport::Due`]: every reason, except that a record reporting
+    ///   only `unmetered_cap` waits for its window
+    ///   ([`Self::take_unmetered_only_drops`]). Asked after each write and
+    ///   at the end of an idle cycle ([`Self::report_idle_drops`]).
     /// - [`DropReport::Final`]: everything, regardless of the window. The
     ///   shutdown drain's one last record.
     fn report_drops(&self, when: DropReport) {
-        if matches!(when, DropReport::Idle)
-            && self.dropped.preinit_events.load(Ordering::Relaxed)
-                + self.dropped.cap_events.load(Ordering::Relaxed)
-                + self.dropped.crashed_events.load(Ordering::Relaxed)
-                > 0
-        {
-            return;
-        }
         let preinit_events = self.dropped.preinit_events.swap(0, Ordering::Relaxed);
         let preinit_bytes = self.dropped.preinit_bytes.swap(0, Ordering::Relaxed);
         let cap_events = self.dropped.cap_events.swap(0, Ordering::Relaxed);
@@ -2257,6 +2248,76 @@ mod tests {
         layer.flush_cycle().await;
         layer.flush_cycle().await;
         assert_eq!(reported_unmetered_drops(&env_dir), dropped);
+    }
+
+    /// A crashed write with no traffic after it: the flush has nothing
+    /// left to write, so the idle report carries every due count, the
+    /// crash and the deferred `unmetered_cap` drops alike, exactly.
+    #[tokio::test]
+    async fn a_crashed_write_does_not_hold_back_the_idle_report() {
+        let (tmp, layer, _guard) = deferred_summary_fixture();
+        let env_dir = tmp.path().join("prod");
+        let dropped = defer_unmetered_drops(&layer, 5);
+        assert_eq!(reported_unmetered_drops(&env_dir), 1);
+        tracing::info!(target: "trawld", "lost to the crashed write");
+        layer.inner.panic_next_write.store(true, Ordering::Relaxed);
+        layer.flush_cycle().await;
+        *layer.inner.clock_offset.lock() += UNMETERED_FAILURE_WINDOW;
+        for _ in 0..5 {
+            layer.flush_cycle().await;
+        }
+        let events = read_wal_events(&env_dir);
+        let crashed: u64 = events
+            .iter()
+            .filter(|event| event["event_type"] == "telemetry_dropped")
+            .map(|event| event["dropped_events_write_crashed"].as_u64().unwrap())
+            .sum();
+        assert_eq!(crashed, 1);
+        assert_eq!(reported_unmetered_drops(&env_dir), dropped);
+    }
+
+    /// Unmetered-only records waiting behind a WAL outage are neither lost
+    /// nor double-counted, and the outage buys at most one per window.
+    #[tokio::test]
+    async fn an_outage_keeps_idle_records_exact_and_bounded() {
+        const WINDOWS: u32 = 5;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = broken_wal_root(tmp.path());
+        let writer = Arc::new(WalWriter::new(root.clone()));
+        let handle = WalHandle::new();
+        handle.set(writer, "prod");
+        let layer = WalLayer::new(handle, "prod");
+        let (subscriber, _) = build_subscriber::<fn() -> std::io::Sink>(
+            DEFAULT_LOG_FILTER,
+            LogSinks {
+                stdout: None,
+                wal: Some(layer.clone()),
+                file_log: false,
+            },
+        );
+        let _guard = tracing::dispatcher::set_default(&subscriber);
+        let mut dropped = 0u64;
+        for _ in 0..WINDOWS {
+            for _ in 0..UNMETERED_FAILURE_CAP_PER_MINUTE + 3 {
+                unmetered_failure();
+            }
+            dropped += 3;
+            for _ in 0..10 {
+                layer.flush_cycle().await;
+            }
+            *layer.inner.clock_offset.lock() += UNMETERED_FAILURE_WINDOW;
+        }
+        repair_wal_root(&root);
+        for _ in 0..10 {
+            layer.flush_cycle().await;
+        }
+        let env_dir = root.join("prod");
+        let records = read_wal_events(&env_dir)
+            .iter()
+            .filter(|event| event["event_type"] == "telemetry_dropped")
+            .count();
+        assert_eq!(reported_unmetered_drops(&env_dir), dropped);
+        assert!(records <= WINDOWS as usize + 1, "{records} drop records");
     }
 
     /// Shutdown inside the closed window still stores the deferred drops:
@@ -3395,7 +3456,12 @@ mod tests {
                     ),
                     2
                 );
-                assert_eq!(read_wal_events(&writer.dir().join("prod")).len(), 2);
+                // Nothing is written twice. The one new row is the crash's
+                // recovery record, reported with no traffic after it.
+                let events = read_wal_events(&writer.dir().join("prod"));
+                assert_eq!(events.len(), 3, "{events:?}");
+                assert_eq!(events[2]["event_type"], "telemetry_dropped");
+                assert_eq!(events[2]["dropped_events_write_crashed"], 2);
             });
         });
     }
@@ -3568,15 +3634,22 @@ mod tests {
                     1,
                     "the crashed attempt increments the write-failure counter once"
                 );
+                // The lost batch leaves the gauges. What remains is the
+                // crash's recovery record, buffered for the next write.
+                let (record_events, record_charge) = {
+                    let active = layer_ref.inner.active.lock();
+                    (active.events.len() as u64, active.charge() as u64)
+                };
+                assert_eq!(record_events, 1, "the buffered recovery record");
                 assert_eq!(
                     sample(&metrics_handle, crate::metrics::TELEMETRY_BUFFER_EVENTS),
-                    baseline_events,
-                    "event-depth gauge returns to baseline"
+                    baseline_events + record_events,
+                    "event-depth gauge returns to baseline plus the record"
                 );
                 assert_eq!(
                     sample(&metrics_handle, crate::metrics::TELEMETRY_BUFFER_BYTES),
-                    baseline_bytes,
-                    "byte-depth gauge returns to baseline"
+                    baseline_bytes + record_charge,
+                    "byte-depth gauge returns to baseline plus the record"
                 );
                 assert!(layer_ref.inner.pending.lock().is_empty());
                 assert_eq!(layer_ref.inner.staged.events.load(Ordering::Relaxed), 0);
