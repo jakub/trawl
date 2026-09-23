@@ -22,9 +22,9 @@
 //!
 //! ## What is persisted (the stdout/telemetry split)
 //!
-//! The stdout logger and this layer build their filters from the same
-//! resolved directive string, but they are not the same filter: the WAL
-//! layer additionally refuses the targets in
+//! The stdout logger and this layer share one filter built from the
+//! resolved directive string, but they do not persist the same events:
+//! the WAL layer additionally refuses the targets in
 //! [`UNMETERED_TARGETS`]. Those events are emitted from request handling
 //! that no per-key rate limiter has metered yet — fleet-auth's bearer
 //! shell, which runs before the limiter; the accept loop, which runs
@@ -161,8 +161,8 @@ use crate::ingest::wal::WalWriter;
 ///   persistence, and therefore needing their own directive to stay
 ///   visible on stdout at all.
 ///
-/// This is the stdout filter. Persistence is narrower: see
-/// [`UNMETERED_TARGETS`] and [`wal_filter`].
+/// This is the filter every sink shares. Persistence is narrower: see
+/// [`UNMETERED_TARGETS`] and [`is_persisted_target`].
 pub const DEFAULT_LOG_FILTER: &str = "trawl_server=info,trawld=info,fleet_auth=info,auth.backend=info,storage.backend=info,preauth.transport=info";
 
 /// Target for accept-loop diagnostics that fire before any request — and
@@ -235,6 +235,16 @@ pub const UNMETERED_TARGETS: [&str; 4] = [
 
 /// Whether events on `target` may be persisted as telemetry — false for
 /// every [`UNMETERED_TARGETS`] entry and its module descendants.
+///
+/// [`WalLayer`] applies it on top of the resolved directives, which every
+/// sink shares. A second, non-configurable predicate rather than an
+/// appended `fleet_auth=off` directive: `EnvFilter` resolves by
+/// specificity, so an operator `RUST_LOG` naming
+/// `fleet_auth::middleware=info` would outrank an appended target-level
+/// `off` and quietly restore the amplifier. The unmetered exclusion is an
+/// invariant of what trawl writes to its own disk, not a log level — which
+/// is also why the grant rejection keeps its INFO level and loses its
+/// target instead of being demoted to DEBUG.
 #[must_use]
 pub fn is_persisted_target(target: &str) -> bool {
     !UNMETERED_TARGETS.iter().any(|excluded| {
@@ -243,27 +253,6 @@ pub fn is_persisted_target(target: &str) -> bool {
                 .strip_prefix(excluded)
                 .is_some_and(|rest| rest.starts_with("::"))
     })
-}
-
-/// The [`WalLayer`]'s filter: the resolved directives and
-/// [`is_persisted_target`].
-///
-/// A second, non-configurable predicate rather than an appended
-/// `fleet_auth=off` directive: `EnvFilter` resolves by specificity, so an
-/// operator `RUST_LOG` naming `fleet_auth::middleware=info` would outrank
-/// an appended target-level `off` and quietly restore the amplifier. The
-/// unmetered exclusion is an invariant of what trawl writes to its own
-/// disk, not a log level — which is also why the grant rejection keeps its
-/// INFO level and loses its target instead of being demoted to DEBUG.
-pub fn wal_filter<S>(directives: &str) -> impl tracing_subscriber::layer::Filter<S> + 'static
-where
-    S: Subscriber + for<'a> LookupSpan<'a>,
-{
-    use tracing_subscriber::filter::FilterExt;
-
-    tracing_subscriber::EnvFilter::new(directives).and(tracing_subscriber::filter::filter_fn(
-        |meta: &tracing::Metadata<'_>| is_persisted_target(meta.target()),
-    ))
 }
 
 /// A resolved log filter: the directive string to install plus an optional
@@ -361,12 +350,6 @@ impl<W> std::fmt::Debug for LogSinks<W> {
 ///
 /// Returns the file logger's reload handle when [`LogSinks::file_log`] is
 /// set.
-///
-/// Each sink combination gets its own stack rather than one stack of
-/// `Option` layers: an absent `Option` layer is not a filtered layer, so
-/// stacking one over per-layer-filtered layers would turn every callsite
-/// they all refuse from `never` into `sometimes` and change what the
-/// subscriber is asked, and when.
 pub fn build_subscriber<W>(
     directives: &str,
     sinks: LogSinks<W>,
@@ -377,65 +360,37 @@ where
     use tracing_subscriber::fmt;
     use tracing_subscriber::layer::SubscriberExt;
 
-    // The directives were resolved (and validated when operator-supplied) by
-    // `resolve_log_filter`; each layer builds its own EnvFilter from the
-    // same string. The WAL layer builds a narrower one (`wal_filter`):
-    // pre-authn auth and transport events are logged but never persisted,
-    // so an unauthenticated connection or request flood cannot grow the
-    // corpus.
-    let make_filter = || tracing_subscriber::EnvFilter::new(directives);
+    let (file_layer, file_handle) = if sinks.file_log {
+        let file_layer = fmt::layer()
+            .json()
+            .with_ansi(false)
+            .with_writer(fmt::writer::BoxMakeWriter::new(std::io::stderr));
+        let (file_layer, handle) = tracing_subscriber::reload::Layer::new(file_layer);
+        (Some(file_layer), Some(handle))
+    } else {
+        (None, None)
+    };
 
-    match sinks {
-        LogSinks {
-            stdout,
-            wal: Some(wal_layer),
-            ..
-        } => {
-            let dispatch = match stdout {
-                Some(writer) => tracing_subscriber::registry()
-                    .with(fmt::layer().with_writer(writer).with_filter(make_filter()))
-                    .with(wal_layer.with_filter(wal_filter(directives)))
-                    .into(),
-                None => tracing_subscriber::registry()
-                    .with(wal_layer.with_filter(wal_filter(directives)))
-                    .into(),
-            };
-            (dispatch, None)
-        }
-        LogSinks {
-            stdout,
-            wal: None,
-            file_log: true,
-        } => {
-            let file_layer = fmt::layer()
-                .json()
-                .with_ansi(false)
-                .with_writer(fmt::writer::BoxMakeWriter::new(std::io::stderr));
-            let (file_layer, handle) = tracing_subscriber::reload::Layer::new(file_layer);
-            let stdout_layer =
-                stdout.map(|writer| fmt::layer().with_writer(writer).with_filter(make_filter()));
-            let dispatch = tracing_subscriber::registry()
-                .with(file_layer.with_filter(make_filter()))
-                .with(stdout_layer)
-                .into();
-            (dispatch, Some(handle))
-        }
-        LogSinks {
-            stdout: Some(writer),
-            wal: None,
-            file_log: false,
-        } => (
-            tracing_subscriber::registry()
-                .with(fmt::layer().with_writer(writer).with_filter(make_filter()))
-                .into(),
-            None,
-        ),
-        LogSinks {
-            stdout: None,
-            wal: None,
-            file_log: false,
-        } => (tracing_subscriber::registry().into(), None),
-    }
+    // One global filter from the directives `resolve_log_filter` resolved
+    // (and validated when operator-supplied), shared by every sink. The WAL
+    // layer narrows it with `is_persisted_target` itself.
+    //
+    // Never a per-layer filter per sink. tracing-subscriber keeps per-layer
+    // verdicts in a thread-local bitmap that only a dispatched span or event
+    // consumes. An `enabled()` query that every per-layer filter refuses
+    // still answers true (the registry reports "any enabled" unless all 64
+    // filter bits are set), so sqlx's slow-statement `log_enabled!` probe
+    // goes on to a `tracing::event!` callsite whose interest is `never` and
+    // dispatches nothing. The refusals stay in the bitmap, and the next
+    // span or event on that worker thread inherits them: a request span
+    // vanished from stdout and the WAL alike, and an event was dropped.
+    let filter = tracing_subscriber::EnvFilter::new(directives);
+    let subscriber = tracing_subscriber::registry()
+        .with(file_layer)
+        .with(sinks.stdout.map(|writer| fmt::layer().with_writer(writer)))
+        .with(sinks.wal)
+        .with(filter);
+    (subscriber.into(), file_handle)
 }
 
 // ---------------------------------------------------------------------------
@@ -1227,6 +1182,10 @@ where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
     fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
+        // An unmetered span lends no fields to the events inside it.
+        if !is_persisted_target(attrs.metadata().target()) {
+            return;
+        }
         let mut visitor = JsonVisitor::new();
         attrs.record(&mut visitor);
         if let Some(span) = ctx.span(id) {
@@ -1246,7 +1205,12 @@ where
     }
 
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
-        // The pre-init cap runs first, before any work this event would
+        // Unmetered events are logged, never persisted (UNMETERED_TARGETS).
+        if !is_persisted_target(event.metadata().target()) {
+            return;
+        }
+
+        // The pre-init cap runs next, before any work this event would
         // otherwise cost — canonicalization included.
         if self.inner.shed_at_preinit_cap() {
             return;
@@ -1578,16 +1542,20 @@ mod tests {
     /// the WAL layer: fleet-auth's bearer shell and trawl's own grant check
     /// both run outside the rate limiter, so persisting them would let a
     /// client the limiter cannot slow grow the corpus one durable record per
-    /// rejected request.
+    /// rejected request. An unmetered span lends no fields either. Drives
+    /// the subscriber `trawld` installs.
     #[test]
-    fn wal_filter_drops_unmetered_targets_the_stdout_filter_keeps() {
-        use tracing_subscriber::prelude::*;
-
-        let capture = CaptureLayer::default();
-        let events = Arc::clone(&capture.events);
-        let subscriber = tracing_subscriber::registry()
-            .with(capture.with_filter(wal_filter(DEFAULT_LOG_FILTER)));
-        let _guard = tracing::subscriber::set_default(subscriber);
+    fn wal_layer_drops_unmetered_targets_the_stdout_filter_keeps() {
+        let layer = WalLayer::new(WalHandle::new(), "prod");
+        let (subscriber, _) = build_subscriber::<fn() -> std::io::Sink>(
+            DEFAULT_LOG_FILTER,
+            LogSinks {
+                stdout: None,
+                wal: Some(layer.clone()),
+                file_log: false,
+            },
+        );
+        let _guard = tracing::dispatcher::set_default(&subscriber);
 
         tracing::warn!(target: "fleet_auth::middleware", "auth: missing or malformed bearer header");
         tracing::warn!(target: "fleet_auth::middleware", "auth: invalid or revoked key");
@@ -1597,26 +1565,48 @@ mod tests {
         tracing::info!(target: "trawl_server::policy", "policy: metered event");
         tracing::error!(target: "storage.backend", "app-state store error");
         tracing::info!(target: "trawld", "starting trawld");
+        tracing::info!(target: "hyper::proto", "dependency noise");
+        tracing::info_span!(target: "fleet_auth::middleware", "authn", key_hint = "unmetered")
+            .in_scope(
+                || tracing::info!(target: "trawl_server::handlers", "inside an unmetered span"),
+            );
 
-        let seen = events.lock();
-        let targets: Vec<&str> = seen.iter().map(|(t, _)| t.as_str()).collect();
+        let events = layer.inner.active.lock().events.clone();
+        let targets: Vec<&str> = events
+            .iter()
+            .map(|event| event["target"].as_str().unwrap())
+            .collect();
         for excluded in [
             "fleet_auth::middleware",
             "auth.backend",
             PREAUTH_TRANSPORT_TARGET,
             UNMETERED_POLICY_TARGET,
+            "hyper::proto",
         ] {
             assert!(
                 !targets.contains(&excluded),
-                "unmetered target {excluded} must not be persisted; saw {targets:?}"
+                "target {excluded} must not be persisted; saw {targets:?}"
             );
         }
-        for kept in ["trawl_server::policy", "storage.backend", "trawld"] {
+        for kept in [
+            "trawl_server::policy",
+            "storage.backend",
+            "trawld",
+            "trawl_server::handlers",
+        ] {
             assert!(
                 targets.contains(&kept),
                 "target {kept} must still be persisted; saw {targets:?}"
             );
         }
+        let inside = events
+            .iter()
+            .find(|event| event["target"] == "trawl_server::handlers")
+            .unwrap();
+        assert!(
+            !inside.contains_key("key_hint"),
+            "an unmetered span must lend no fields to a persisted event: {inside:?}"
+        );
     }
 
     #[test]

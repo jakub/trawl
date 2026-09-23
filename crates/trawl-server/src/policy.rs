@@ -541,46 +541,50 @@ mod tests {
     /// stdout-only: a valid fleet key resolving zero trawl permissions is a
     /// supported thing to hold, and a persisted event would let its holder
     /// grow the corpus one durable record per request, unmetered. Drives the
-    /// real middleware through the real WAL filter.
+    /// real middleware through the subscriber `trawld` installs.
     #[tokio::test]
     async fn grantless_403_event_is_logged_but_never_persisted() {
         use std::sync::{Arc, Mutex};
 
-        use tracing_subscriber::prelude::*;
+        use crate::telemetry::{LogSinks, WalHandle, WalLayer, build_subscriber};
 
+        /// Stdout, captured.
         #[derive(Clone, Default)]
-        struct Capture(Arc<Mutex<Vec<String>>>);
+        struct Capture(Arc<Mutex<Vec<u8>>>);
 
-        impl<S> tracing_subscriber::Layer<S> for Capture
-        where
-            S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
-        {
-            fn on_event(
-                &self,
-                event: &tracing::Event<'_>,
-                _ctx: tracing_subscriber::layer::Context<'_, S>,
-            ) {
-                self.0
-                    .lock()
-                    .unwrap()
-                    .push(event.metadata().target().to_owned());
+        impl std::io::Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
             }
         }
 
         let stdout = Capture::default();
-        let wal = Capture::default();
-        let subscriber = tracing_subscriber::registry()
-            .with(
-                stdout
-                    .clone()
-                    .with_filter(tracing_subscriber::EnvFilter::new(
-                        crate::telemetry::DEFAULT_LOG_FILTER,
-                    )),
-            )
-            .with(wal.clone().with_filter(crate::telemetry::wal_filter(
-                crate::telemetry::DEFAULT_LOG_FILTER,
-            )));
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let wal_dir = tempfile::tempdir().unwrap();
+        let handle = WalHandle::new();
+        handle.set(
+            Arc::new(crate::ingest::wal::WalWriter::new(
+                wal_dir.path().to_path_buf(),
+            )),
+            "prod",
+        );
+        let wal = WalLayer::new(handle, "prod");
+        let (subscriber, _) = build_subscriber(
+            crate::telemetry::DEFAULT_LOG_FILTER,
+            LogSinks {
+                stdout: Some({
+                    let stdout = stdout.clone();
+                    move || stdout.clone()
+                }),
+                wal: Some(wal.clone()),
+                file_log: false,
+            },
+        );
+        let _guard = tracing::dispatcher::set_default(&subscriber);
 
         let resp = run_policy(Some(key_with(vec![role(
             "coastwatch-viewer",
@@ -589,18 +593,17 @@ mod tests {
         .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
-        let logged = stdout.0.lock().unwrap().clone();
+        let logged = String::from_utf8(stdout.0.lock().unwrap().clone()).unwrap();
         assert!(
-            logged
-                .iter()
-                .any(|t| t == crate::telemetry::UNMETERED_POLICY_TARGET),
+            logged.contains(crate::telemetry::UNMETERED_POLICY_TARGET),
             "the rejection must still be visible on stdout under the default \
              filter; saw {logged:?}"
         );
-        let persisted = wal.0.lock().unwrap().clone();
-        assert!(
-            persisted.is_empty(),
-            "an unmetered rejection must never reach the WAL layer; saw {persisted:?}"
+        wal.flush();
+        let persisted = std::fs::read_dir(wal_dir.path().join("prod")).map_or(0, Iterator::count);
+        assert_eq!(
+            persisted, 0,
+            "an unmetered rejection must never reach the WAL layer"
         );
     }
 

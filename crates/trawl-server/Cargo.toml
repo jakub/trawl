@@ -84,6 +84,9 @@ trawl-client = { workspace = true }
 trawl-cli = { workspace = true }
 insta = { workspace = true }
 reqwest = { workspace = true }
+# `tests/span_context.rs` probes the `log` bridge the way sqlx's statement
+# logger does. Already in the graph through sqlx and tracing-log.
+log = { workspace = true }
 
 [package.metadata.deb]
 name = "trawl-server"

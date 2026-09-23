@@ -6399,6 +6399,7 @@ dependencies = [
  "hyper-util",
  "indexmap",
  "insta",
+ "log",
  "metrics",
  "metrics-exporter-prometheus",
  "metrics-process",
