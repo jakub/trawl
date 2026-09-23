@@ -249,8 +249,10 @@ record, with `stage=panicked`.
 
 When trawld runs its terminal monitor, which is when you start it without
 `--no-monitor`, stdout carries no log lines. If trawld also writes no
-`log_file`, nothing records the panic event. In that case trawld also writes
-one line to stderr, with the location and no message:
+`log_file`, nothing records the panic event. Nothing records it either when
+`RUST_LOG` filters out the `trawl_server::panic` target, for example
+`RUST_LOG=trawld=debug`. In either case trawld also writes one line to stderr,
+with the location and no message:
 
 ```text
 trawld: panicked at FILE:LINE:COLUMN on thread 'NAME'

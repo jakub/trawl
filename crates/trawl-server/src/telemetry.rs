@@ -279,12 +279,14 @@ pub const PANIC_TARGET: &str = "trawl_server::panic";
 /// installed, so the event has somewhere to go.
 ///
 /// `text_sink` says whether the subscriber has a stdout or file logger to
-/// record that event. The WAL refuses [`PANIC_TARGET`], so without one
-/// (the monitor TUI owns stdout and no `log_file` is configured) the event
-/// reaches nothing. The hook then also writes one line to `stderr`,
-/// directly rather than through tracing: `trawld: panicked at
-/// FILE:LINE:COLUMN on thread 'NAME'`, with no payload. With a text sink
-/// it writes nothing there, so the location is never printed twice.
+/// record that event. The WAL refuses [`PANIC_TARGET`], so the event
+/// reaches nothing without one (the monitor TUI owns stdout and no
+/// `log_file` is configured), or when the log filter disables the target
+/// (`RUST_LOG=trawld=debug` names no `trawl_server` directive). In either
+/// case the hook also writes one line to `stderr`, directly rather than
+/// through tracing: `trawld: panicked at FILE:LINE:COLUMN on thread
+/// 'NAME'`, with no payload. When a text sink records the event it writes
+/// nothing there, so the location is never printed twice.
 ///
 /// The event is a root (`parent: None`): the request span it may fire
 /// inside would lend it the raw path and user agent. The WAL layer refuses
@@ -298,6 +300,8 @@ where
         let location = info.location();
         let thread = std::thread::current();
         let thread = thread.name().unwrap_or("<unnamed>");
+        // Asked before the event, of the same dispatcher and filter.
+        let recorded = text_sink && tracing::enabled!(target: PANIC_TARGET, tracing::Level::ERROR);
         tracing::error!(
             target: PANIC_TARGET,
             parent: None,
@@ -308,7 +312,7 @@ where
             thread,
             "panicked"
         );
-        if !text_sink {
+        if !recorded {
             let at = location.map_or_else(
                 || "<unknown>".to_owned(),
                 |location| {

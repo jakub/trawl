@@ -912,8 +912,9 @@ struct Tracing {
 /// Once the subscriber is installed, replaces the panic hook with one that
 /// logs a panic's location and never its payload
 /// ([`telemetry::install_panic_hook`]). In monitor mode with no `log_file`
-/// logger, no sink records that event, so the hook also writes the location
-/// to stderr; the TUI draws on stdout.
+/// logger, or when the filter disables the panic target, no sink records
+/// that event, so the hook also writes the location to stderr; the TUI draws
+/// on stdout.
 fn init_tracing(
     config: &Config,
     monitor_active: bool,
@@ -940,8 +941,9 @@ fn init_tracing(
 
     // Skip stdout while the monitor TUI owns the terminal.
     let stdout = (!monitor_active).then_some(std::io::stdout);
-    // Whether a text logger records the panic diagnostic. Without one the
-    // panic hook writes its location line to stderr itself.
+    // Whether a text logger exists to record the panic diagnostic. Without
+    // one, or when the filter disables its target, the panic hook writes its
+    // location line to stderr itself.
     let text_sink = stdout.is_some() || file_log_path.is_some();
 
     let (subscriber, file_handle) = telemetry::build_subscriber(

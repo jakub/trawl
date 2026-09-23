@@ -114,16 +114,18 @@ fn wal_layer() -> (WalLayer, tempfile::TempDir) {
 
 /// Install trawld's subscriber and panic hook, panic once with the payload
 /// sentinel on a thread named [`THREAD`], and return the line of the
-/// `panic!`. `text_sink` is what `init_tracing` passes: whether `stdout`
-/// (or a file logger) records the diagnostic.
+/// `panic!`. `directives` is the resolved log filter. `text_sink` is what
+/// `init_tracing` passes: whether `stdout` (or a file logger) exists to
+/// record the diagnostic.
 fn install_and_panic(
+    directives: &str,
     stdout: Option<Capture>,
     wal: &WalLayer,
     text_sink: bool,
     stderr: &Capture,
 ) -> u32 {
     let (subscriber, _) = telemetry::build_subscriber(
-        telemetry::DEFAULT_LOG_FILTER,
+        directives,
         LogSinks {
             stdout,
             wal: Some(wal.clone()),
@@ -162,7 +164,13 @@ fn panic_diagnostic_carries_location_not_payload_and_never_persists() {
     let (wal, wal_dir) = wal_layer();
     let stdout = Capture::default();
     let stderr = Capture::default();
-    let panic_line = install_and_panic(Some(stdout.clone()), &wal, true, &stderr);
+    let panic_line = install_and_panic(
+        telemetry::DEFAULT_LOG_FILTER,
+        Some(stdout.clone()),
+        &wal,
+        true,
+        &stderr,
+    );
 
     assert_eq!(
         stderr.text(),
@@ -227,8 +235,30 @@ fn panic_diagnostic_carries_location_not_payload_and_never_persists() {
 fn a_panic_without_a_text_sink_writes_its_location_to_stderr() {
     let (wal, _wal_dir) = wal_layer();
     let stderr = Capture::default();
-    let panic_line = install_and_panic(None, &wal, false, &stderr);
+    let panic_line = install_and_panic(telemetry::DEFAULT_LOG_FILTER, None, &wal, false, &stderr);
+    assert_one_location_line(&stderr, panic_line);
+}
 
+/// A text sink exists, but `RUST_LOG` names only `trawld`, so the filter
+/// drops the diagnostic's target and the sink records nothing. The hook
+/// writes the location line to stderr as it does without a sink.
+#[test]
+fn a_filtered_out_panic_event_still_leaves_its_location_on_stderr() {
+    let (wal, _wal_dir) = wal_layer();
+    let stdout = Capture::default();
+    let stderr = Capture::default();
+    let panic_line = install_and_panic("trawld=debug", Some(stdout.clone()), &wal, true, &stderr);
+    let text = stdout.text();
+    assert!(
+        !text.contains(PANIC_TARGET),
+        "the filter was meant to drop the diagnostic: {text}"
+    );
+    assert_one_location_line(&stderr, panic_line);
+}
+
+/// `stderr` holds exactly one line: the location of the `panic!` on
+/// `panic_line` and the thread, never the payload.
+fn assert_one_location_line(stderr: &Capture, panic_line: u32) {
     let text = stderr.text();
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(lines.len(), 1, "one stderr line: {text}");
