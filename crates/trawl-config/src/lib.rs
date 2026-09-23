@@ -1453,9 +1453,9 @@ fn expand_tilde(path: &str) -> String {
 ///
 /// Other caps use zero as an explicit off switch, but an unbounded telemetry
 /// buffer can grow indefinitely behind a wedged WAL write. Self-telemetry has
-/// its own boolean off switch, so zero has no valid interpretation, and a
-/// budget below [`MIN_TELEMETRY_BUFFER_MAX_BYTES`] cannot hold the record
-/// that reports its own drops.
+/// its own boolean off switch, so zero has no valid interpretation. The
+/// floor [`MIN_TELEMETRY_BUFFER_MAX_BYTES`] keeps the budget well clear of
+/// the size at which the record that reports its own drops is refused.
 fn validate_telemetry_buffer_max_bytes(bytes: usize) -> Result<(), ConfigError> {
     if bytes < MIN_TELEMETRY_BUFFER_MAX_BYTES {
         return Err(ConfigError::Validation(format!(
