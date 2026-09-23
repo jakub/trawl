@@ -1,0 +1,22 @@
+{
+  "compaction_interval_secs": 30,
+  "service": "probea7d41af8",
+  "events": 50,
+  "beforeRestart": 50,
+  "walFilesAfterStop": 1,
+  "restartMs": 243,
+  "series": [
+    [
+      0,
+      0
+    ],
+    [
+      31,
+      50
+    ]
+  ],
+  "visibleAfterS": 31,
+  "compactionAfterRestart": [
+    "2026-09-23T04:28:40.391047Z"
+  ]
+}

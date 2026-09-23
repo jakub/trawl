@@ -1,0 +1,583 @@
+#!/usr/bin/env node
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Bounded search for the #235 500 (`last=15m service=coredns | head 20`).
+//
+// Disposable infrastructure only: one owned postgres:18 container on a
+// loopback port, a release trawld from this checkout, a private data
+// directory. Never reads a saved CLI profile or touches a live server.
+//
+//   node harness.mjs setup                 # pg + keys + seeded corpus
+//   node harness.mjs scenario <a..g> [--minutes 30] [--max-queries 10000]
+//   node harness.mjs report                # README markdown on stdout
+//   node harness.mjs teardown              # stop trawld, remove pg + secrets
+//
+// Build first:  CARGO_TARGET_DIR=... cargo build --release --locked \
+//                 -p trawl-server -p fleet-admin
+// HARNESS_DIR (default <target>/issue-235-harness) holds keys, DSNs, data
+// and raw logs; it is private and removed by teardown. Result summaries
+// (no secrets) land in results/ beside this script.
+import assert from 'node:assert/strict';
+import { spawn, execFileSync } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
+import fs from 'node:fs';
+import https from 'node:https';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { setTimeout as delay } from 'node:timers/promises';
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const root = path.resolve(here, '../..');
+const target = path.resolve(root, process.env.CARGO_TARGET_DIR || 'target');
+const release = path.join(target, 'release');
+const stateDir = process.env.HARNESS_DIR || path.join(target, 'issue-235-harness');
+const statePath = path.join(stateDir, 'state.json');
+const resultsDir = path.join(here, 'results');
+const QUERY = 'last=15m service=coredns | head 20';
+const WINDOW_MS = 15 * 60 * 1000;
+const docker = (...argv) => execFileSync('docker', ['--host', 'unix:///var/run/docker.sock', ...argv], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+
+// ---------------------------------------------------------------- scenarios
+// Every scenario runs the same query loop. The knobs below are the whole
+// difference between them; `compaction` is ingest.compaction_interval_secs.
+const SCENARIOS = {
+  a: { title: 'baseline: queries only', compaction: 300 },
+  b: { title: 'coredns hour-file merge compaction publishing during queries', compaction: 5, coredns: 120 },
+  c: { title: 'concurrent compaction of another service (machined)', compaction: 5, machined: 60 },
+  d: { title: 'SSE live tail on service=coredns at ~100 ev/min', compaction: 300, coredns: 100 / 60, sse: 'service=coredns' },
+  e: { title: 'scheduled nets on a shortened interval', compaction: 300, nets: true },
+  f: { title: 'all together', compaction: 5, coredns: 120, machined: 60, sse: 'service=coredns rcode=SERVFAIL', nets: true },
+  g: { title: 'postgres paused (docker pause) for 2-8 s intervals', compaction: 5, coredns: 120, pause: true },
+};
+const CONCURRENCY = 3;
+const SERVFAIL_FRACTION = 1 / 72; // 120 ev/s * 1/72 = 100 ev/min on the f tail
+
+function config(s, name) {
+  const t = JSON.stringify;
+  return `[server]
+http_addr = "127.0.0.1:0"
+max_result_rows = 25000
+shutdown_drain_secs = 3
+[server.rate_limit]
+default_rpm = 0
+ingest_rpm = 0
+[data]
+path = ${t(path.join(stateDir, 'data'))}
+[ingest]
+enabled = true
+internal_telemetry = true
+compaction_interval_secs = ${s.compaction}
+default_env = "lab"
+envs = ["lab"]
+[retention]
+max_age_days = 0
+min_free_disk_bytes = 0
+[scheduler]
+enabled = ${s.nets ? 'true' : 'false'}
+poll_interval_secs = 1
+[syslog]
+enabled = false
+`;
+}
+
+// ---------------------------------------------------------------- plumbing
+const agent = new https.Agent({ keepAlive: true, rejectUnauthorized: false, maxSockets: 32 });
+function request(base, route, { token, method = 'GET', body, ndjson, timeout = 40000 } = {}) {
+  const encoded = ndjson ?? (body === undefined ? undefined : JSON.stringify(body));
+  return new Promise((resolve) => {
+    const headers = { authorization: `Bearer ${token}` };
+    if (encoded !== undefined) {
+      headers['content-type'] = ndjson ? 'application/x-ndjson' : 'application/json';
+      headers['content-length'] = Buffer.byteLength(encoded);
+    }
+    const req = https.request(base + route, { method, headers, agent }, res => {
+      const chunks = [];
+      res.on('data', c => chunks.push(c));
+      res.on('error', e => resolve({ status: 0, error: e.message }));
+      res.on('end', () => resolve({ status: res.statusCode, requestId: res.headers['x-request-id'], text: Buffer.concat(chunks).toString() }));
+    });
+    req.setTimeout(timeout, () => req.destroy(new Error('client deadline')));
+    req.on('error', e => resolve({ status: 0, error: e.message }));
+    if (encoded !== undefined) req.write(encoded);
+    req.end();
+  });
+}
+const loadState = () => JSON.parse(fs.readFileSync(statePath, 'utf8'));
+const saveState = s => fs.writeFileSync(statePath, JSON.stringify(s, null, 2), { mode: 0o600 });
+function pctl(values, f) { const s = [...values].sort((x, y) => x - y); return s.length ? Math.round(s[Math.max(0, Math.ceil(s.length * f) - 1)]) : null; }
+
+async function startTrawld(st, name, s) {
+  const cfg = path.join(stateDir, `${name}.toml`);
+  fs.writeFileSync(cfg, config(s, name), { mode: 0o600 });
+  const out = fs.openSync(path.join(stateDir, 'logs', `${name}.stdout`), 'a', 0o600);
+  const child = spawn(path.join(release, 'trawld'), ['--config', cfg, '--no-monitor'], {
+    env: { PATH: process.env.PATH, HOME: process.env.HOME, NO_COLOR: '1', LD_LIBRARY_PATH: path.join(release, 'deps'),
+      FLEET_DATABASE_URL: st.fleetDsn, TRAWL_DATABASE_URL: st.appDsn },
+    detached: true, stdio: ['ignore', out, out] });
+  st.trawldPid = child.pid; saveState(st);
+  const log = path.join(stateDir, 'logs', `${name}.stdout`);
+  for (let i = 0; i < 600; i++) {
+    await delay(100);
+    assert.ok(child.exitCode === null, `trawld exited during startup; see ${log}`);
+    const m = fs.readFileSync(log, 'utf8').replace(/\x1b\[[0-9;]*m/g, '').match(/HTTPS server listening[^\n]*addr[=:]\s*"?(127\.0\.0\.1:\d+)/g);
+    if (m) {
+      const addr = m[m.length - 1].match(/127\.0\.0\.1:\d+/)[0];
+      const base = `https://${addr}`;
+      const h = await request(base, '/api/v1/health', { token: 'none' });
+      if (h.status === 200) return { child, base };
+    }
+  }
+  throw new Error('trawld readiness deadline');
+}
+async function stopTrawld(st, child) {
+  if (!st.trawldPid) return;
+  const pid = st.trawldPid;
+  const alive = () => { try { process.kill(pid, 0); return fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').includes('trawld'); } catch { return false; } };
+  if (alive()) process.kill(pid, 'SIGTERM');
+  for (let i = 0; i < 200 && alive(); i++) await delay(100);
+  if (alive()) process.kill(pid, 'SIGKILL');
+  for (let i = 0; i < 50 && alive(); i++) await delay(100);
+  if (child && child.exitCode === null) await new Promise(r => child.once('exit', r));
+  delete st.trawldPid; saveState(st);
+}
+
+// ---------------------------------------------------------------- workload
+let seq = 0;
+const RUN = randomBytes(4).toString('hex');
+const QTYPES = ['A', 'AAAA', 'PTR', 'SRV', 'TXT', 'HTTPS'];
+function coredns(ts, servfail) {
+  const n = seq++;
+  const rcode = servfail ? 'SERVFAIL' : (n % 9 === 0 ? 'NXDOMAIN' : 'NOERROR');
+  return { timestamp: new Date(ts).toISOString(), env: 'lab', service: 'coredns', host: `dns-${n % 3}`, level: rcode === 'SERVFAIL' ? 'error' : 'info',
+    qname: `svc-${n % 211}.lab.internal.`, qtype: QTYPES[n % 6], rcode, duration_ms: (n * 37) % 250, client: `10.0.${n % 7}.${n % 250}`,
+    harness_run: RUN, harness_seq: n, message: `[INFO] 10.0.${n % 7}.${n % 250} - ${n} "${QTYPES[n % 6]} IN svc-${n % 211}.lab.internal. udp" ${rcode}` };
+}
+function machined(ts) {
+  const n = seq++;
+  return { timestamp: new Date(ts).toISOString(), env: 'lab', service: 'machined', host: `node-${n % 4}`, level: 'info',
+    controller: `ctrl-${n % 13}`, phase: n % 5, harness_run: RUN, harness_seq: n, message: `controller ctrl-${n % 13} reconciled resource ${n}` };
+}
+// Accepted coredns timestamps, per second, for the lower-bound content check.
+const sentPerSec = new Map();
+function noteSent(events) { for (const e of events) if (e.service === 'coredns') { const s = Math.floor(Date.parse(e.timestamp) / 1000); sentPerSec.set(s, (sentPerSec.get(s) || 0) + 1); } }
+function sentBetween(fromMs, toMs) { let n = 0; for (const [s, c] of sentPerSec) if (s * 1000 >= fromMs && s * 1000 + 999 <= toMs) n += c; return n; }
+
+async function ingest(base, st, events, stats, retry = false) {
+  for (let attempt = 0; ; attempt++) {
+    const r = await request(base, '/api/v1/ingest', { token: st.writer, method: 'POST', ndjson: events.map(e => JSON.stringify(e)).join('\n') + '\n' });
+    if (r.status === 200) { noteSent(events); if (stats) stats.accepted += events.length; return r; }
+    if (stats) { stats.failed++; stats.statuses[r.status] = (stats.statuses[r.status] || 0) + 1; }
+    if (!retry || attempt > 20) return r;
+    await delay(500 * (attempt + 1));
+  }
+}
+function ingestLoop(base, st, rate, make, stats, stop) {
+  // One batch per second (or one event per 1/rate s when rate < 1/s).
+  return (async () => {
+    const period = rate >= 1 ? 1000 : 1000 / rate;
+    let next = performance.now();
+    while (!stop.done) {
+      const now = Date.now();
+      const n = rate >= 1 ? Math.round(rate) : 1;
+      const batch = Array.from({ length: n }, (_, i) => make(now - (n > 1 ? Math.floor(1000 * i / n) : 0), i));
+      await ingest(base, st, batch, stats);
+      next += period;
+      await delay(Math.max(0, next - performance.now()));
+    }
+  })();
+}
+
+// ---------------------------------------------------------------- checks
+function checkResult(r, sentAt, recvAt) {
+  const problems = [];
+  let body;
+  try { body = JSON.parse(r.text); } catch { return { problems: ['unparseable body'], owed: 0 }; }
+  const cols = (body.result?.columns ?? body.columns ?? []).map(c => c.name);
+  const rows = body.result?.rows ?? body.rows;
+  if (!Array.isArray(rows)) return { problems: ['no rows array'], owed: 0 };
+  if (rows.length > 20) problems.push(`rows ${rows.length} > 20`);
+  if (body.pagination && body.pagination.returned !== rows.length) problems.push('pagination.returned != rows.length');
+  const si = cols.indexOf('service'), ti = cols.indexOf('_time');
+  if (rows.length && si < 0) problems.push('no service column');
+  if (rows.length && ti < 0) problems.push('no _time column');
+  for (const row of rows) {
+    if (si >= 0 && row[si] !== 'coredns') { problems.push(`service ${JSON.stringify(row[si])}`); break; }
+    if (ti >= 0) {
+      // DuckDB renders UTC as `YYYY-MM-DD HH:MM:SS.fff` with no zone.
+      const t = Date.parse(/[zZ]|[+-]\d\d:?\d\d$/.test(row[ti]) ? row[ti] : `${String(row[ti]).replace(' ', 'T')}Z`);
+      if (!Number.isFinite(t)) { problems.push(`_time unparseable ${JSON.stringify(row[ti])}`); break; }
+      if (t < sentAt - WINDOW_MS - 5000 || t > recvAt + 5000) { problems.push(`_time ${row[ti]} outside window`); break; }
+    }
+  }
+  // Events this harness had accepted, strictly inside the window, before
+  // the query was sent: the answer owes min(20, that many) rows.
+  const owed = Math.min(20, sentBetween(recvAt - WINDOW_MS + 10000, sentAt - 2000));
+  if (rows.length < owed) problems.push(`rows ${rows.length} < ${owed} owed`);
+  return { problems, owed };
+}
+
+// ---------------------------------------------------------------- commands
+async function setup() {
+  assert.ok(!fs.existsSync(statePath), `${statePath} exists: run teardown first`);
+  for (const bin of ['trawld', 'fleet-admin', 'deps/libduckdb.so']) assert.ok(fs.existsSync(path.join(release, bin)), `missing ${release}/${bin}: build first`);
+  fs.mkdirSync(path.join(stateDir, 'logs'), { recursive: true, mode: 0o700 });
+  fs.chmodSync(stateDir, 0o700);
+  const container = `trawl-i235-${randomBytes(6).toString('hex')}`;
+  const password = randomBytes(24).toString('hex');
+  const st = { container, created: new Date().toISOString() };
+  saveState(st);
+  const envFile = path.join(stateDir, 'pg.env');
+  fs.writeFileSync(envFile, `POSTGRES_USER=h\nPOSTGRES_PASSWORD=${password}\nPOSTGRES_DB=fleet\n`, { mode: 0o600 });
+  docker('run', '--detach', '--name', container, '--label', 'trawl.issue-235-harness=1', '--publish', '127.0.0.1::5432',
+    '--env-file', envFile, '--memory', '2g', '--tmpfs', '/var/lib/postgresql:size=1g', 'postgres:18');
+  fs.rmSync(envFile);
+  const mapping = docker('port', container, '5432/tcp').split('\n')[0];
+  st.fleetDsn = `postgres://h:${password}@${mapping}/fleet`;
+  st.appDsn = `postgres://h:${password}@${mapping}/trawl`;
+  saveState(st);
+  for (let i = 0; ; i++) {
+    try { docker('exec', container, 'pg_isready', '-h', '127.0.0.1', '-U', 'h', '-d', 'fleet'); break; } catch { assert.ok(i < 120, 'pg readiness'); await delay(500); }
+  }
+  docker('exec', container, 'createdb', '-U', 'h', 'trawl');
+  const admin = (...a) => execFileSync(path.join(release, 'fleet-admin'), a, { env: { PATH: process.env.PATH, DATABASE_URL: st.fleetDsn }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+  admin('migrate');
+  admin('roles', 'create', '--name', 'h-reader', '--rate-rpm', '1000000', ...['query', 'schema_read', 'validate', 'saved_query', 'stream', 'query_cancel'].flatMap(p => ['--perm', `trawl:${p}`]));
+  admin('roles', 'create', '--name', 'h-ingest', '--rate-rpm', '1000000', '--perm', 'trawl:ingest');
+  st.reader = admin('keys', 'create', '--name', 'h-reader', '--kind', 'human', '--role', 'h-reader', '--expires', '12h');
+  st.writer = admin('keys', 'create', '--name', 'h-ingest', '--kind', 'service', '--role', 'h-ingest', '--expires', '12h');
+  saveState(st);
+  // Seed: a coredns hour file near the incident's 370,488 rows and a
+  // machined one, compacted with the 5 s interval.
+  const { child, base } = await startTrawld(st, 'seed', { compaction: 5 });
+  const stats = { accepted: 0, failed: 0, statuses: {} };
+  const now = Date.now();
+  for (const [service, total] of [['coredns', 370000], ['machined', 150000]]) {
+    for (let done = 0; done < total; done += 5000) {
+      const batch = Array.from({ length: 5000 }, (_, i) => {
+        const ts = now - 14 * 60 * 1000 + Math.floor((done + i) * (14 * 60 * 1000) / total);
+        return service === 'coredns' ? coredns(ts, false) : machined(ts);
+      });
+      const r = await ingest(base, st, batch, stats, true);
+      assert.equal(r.status, 200, `seed ingest failed: ${r.status} ${r.text?.slice(0, 200)}`);
+    }
+  }
+  // Wait for both hour files to exist and the hot buffer to drain.
+  const logFile = path.join(stateDir, 'logs', 'seed.stdout');
+  for (let i = 0; i < 600; i++) {
+    await delay(1000);
+    const done = compactionStats(logFile);
+    if ((done.coredns?.maxRows ?? 0) >= 370000 && (done.machined?.maxRows ?? 0) >= 150000) break;
+    assert.ok(i < 599, 'seed compaction deadline');
+  }
+  await stopTrawld(st, child);
+  st.sentPerSec = Object.fromEntries(sentPerSec);
+  st.seed = { accepted: stats.accepted, retriedStatuses: stats.statuses, compaction: compactionStats(logFile) };
+  saveState(st);
+  console.log(JSON.stringify(st.seed));
+}
+
+// trawld's stdout, in tracing-subscriber's default text format (log_file
+// is not opened while internal telemetry is on). Fields only, parsed
+// from `key=value` pairs; quoted values are unquoted.
+function readLog(file) {
+  if (!fs.existsSync(file)) return [];
+  const out = [];
+  for (const raw of fs.readFileSync(file, 'utf8').split('\n')) {
+    const line = raw.replace(/\x1b\[[0-9;]*m/g, '');
+    const m = line.match(/^(\S+)\s+(TRACE|DEBUG|INFO|WARN|ERROR)\s+(.*)$/);
+    if (!m) continue;
+    const fields = {};
+    for (const f of m[3].matchAll(/(\w+)=("(?:[^"\\]|\\.)*"|\S+)/g)) {
+      let v = f[2];
+      if (v.startsWith('"')) { try { v = JSON.parse(v); } catch { v = v.slice(1, -1); } }
+      fields[f[1]] = v;
+    }
+    const tm = m[3].match(/^(?:\S+\{.*?\}:\s*)*([\w:.]+): /);
+    out.push({ timestamp: m[1], level: m[2], target: tm ? tm[1] : null, fields, line });
+  }
+  return out;
+}
+function compactionStats(file) {
+  const out = {};
+  for (const e of readLog(file)) {
+    const f = e.fields || {};
+    if (f.event_type !== 'compaction_complete') continue;
+    const s = (out[f.compact_service] ??= { runs: 0, merged: 0, maxRows: 0, maxMs: 0 });
+    s.runs++; if (f.merged === true || f.merged === 'true') s.merged++;
+    s.maxRows = Math.max(s.maxRows, Number(f.rows) || 0);
+    s.maxMs = Math.max(s.maxMs, Number(f.duration_ms) || 0);
+  }
+  return out;
+}
+
+async function scenario(id, minutes, maxQueries) {
+  const s = SCENARIOS[id];
+  assert.ok(s, `unknown scenario ${id}`);
+  const st = loadState();
+  // Coredns events accepted by setup and earlier scenarios still count
+  // toward what a window owes.
+  for (const [k, v] of Object.entries(st.sentPerSec ?? {})) sentPerSec.set(Number(k), v);
+  const name = `scenario-${id}`;
+  const logFile = path.join(stateDir, 'logs', `${name}.stdout`);
+  fs.rmSync(logFile, { force: true });
+  const { child, base } = await startTrawld(st, name, s);
+  const stop = { done: false };
+  const started = Date.now();
+  const res = { id, title: s.title, config: { compaction_interval_secs: s.compaction, coredns_ev_per_s: s.coredns ?? 0, machined_ev_per_s: s.machined ?? 0,
+    sse: s.sse ?? null, nets: !!s.nets, pg_pause: !!s.pause, query_concurrency: CONCURRENCY, bound_minutes: minutes, bound_queries: maxQueries },
+    started: new Date(started).toISOString(), queries: 0, statuses: {}, fiveXX: [], contentFailures: 0, owedFull: 0, contentSamples: [], transportErrors: 0, latencyMs: [] };
+  const ingestStats = { accepted: 0, failed: 0, statuses: {} };
+  const bg = [];
+  if (s.coredns) bg.push(ingestLoop(base, st, s.coredns, (ts) => coredns(ts, s.sse === 'service=coredns rcode=SERVFAIL' ? Math.random() < SERVFAIL_FRACTION : false), ingestStats, stop));
+  if (s.machined) bg.push(ingestLoop(base, st, s.machined, ts => machined(ts), ingestStats, stop));
+  // SSE live tail: count data events; reconnect if the stream ends.
+  const sse = { connects: 0, statuses: {}, events: 0, byName: {} };
+  if (s.sse) bg.push((async () => {
+    while (!stop.done) {
+      sse.connects++;
+      await new Promise(resolve => {
+        const req = https.request(`${base}/api/v1/stream?query=${encodeURIComponent(s.sse)}`, { headers: { authorization: `Bearer ${st.reader}`, accept: 'text/event-stream' }, agent: false, rejectUnauthorized: false }, r => {
+          sse.statuses[r.statusCode] = (sse.statuses[r.statusCode] || 0) + 1;
+          let buf = '';
+          r.on('data', c => { buf += c; let i; while ((i = buf.indexOf('\n\n')) >= 0) { const frame = buf.slice(0, i); buf = buf.slice(i + 2); const name = frame.match(/^event:[ \t]*(\S+)/m)?.[1] ?? 'message'; sse.byName[name] = (sse.byName[name] || 0) + 1; if (name === 'data' && /^data:/m.test(frame)) sse.events++; } });
+          r.on('end', resolve); r.on('error', resolve);
+        });
+        req.on('error', resolve);
+        const t = setInterval(() => { if (stop.done) { req.destroy(); clearInterval(t); } }, 200);
+        req.end();
+      });
+      if (!stop.done) await delay(1000);
+    }
+  })());
+  // Nets: five saved queries on the 60 s floor, created 12 s apart, so a
+  // scheduled run lands about every 12 s.
+  if (s.nets) {
+    st.nets ??= [];
+    for (let i = st.nets.length; i < 5; i++) {
+      const c = await request(base, '/api/v1/saved', { token: st.reader, method: 'POST', body: { name: `coredns-net-${i}`, query: 'last=15m service=coredns | stats count() by rcode' } });
+      assert.equal(c.status, 200, `create net: ${c.status} ${c.text?.slice(0, 200)}`);
+      const idn = JSON.parse(c.text).id;
+      const sc = await request(base, `/api/v1/saved/${idn}/schedule`, { token: st.reader, method: 'PUT', body: { interval: '1m' } });
+      assert.equal(sc.status, 200, `schedule net: ${sc.status} ${sc.text?.slice(0, 200)}`);
+      st.nets.push(idn); saveState(st);
+      if (i < 4) await delay(12000);
+    }
+  }
+  const pauses = { count: 0, totalMs: 0 };
+  if (s.pause) bg.push((async () => {
+    while (!stop.done) {
+      await delay(5000 + Math.floor(Math.random() * 5000));
+      if (stop.done) break;
+      const hold = 2000 + Math.floor(Math.random() * 6000);
+      docker('pause', st.container);
+      try { await delay(hold); } finally { docker('unpause', st.container); }
+      pauses.count++; pauses.totalMs += hold;
+    }
+  })());
+  if (s.coredns && s.coredns < 1) await delay(3000);
+  // Events a previous trawld accepted but never compacted sit in the WAL
+  // and are not visible again until this process's first compaction tick
+  // (see restart-probe). Measure that gap by exact count over the window,
+  // then start the loop, so the loop tests only this scenario.
+  {
+    const t0 = Date.now();
+    const bound = t0 + (2 * s.compaction + 30) * 1000;
+    const from = Math.ceil((t0 - WINDOW_MS + 30000) / 1000) * 1000, to = Math.floor((t0 - 2000) / 1000) * 1000;
+    const iso = ms => new Date(ms).toISOString();
+    const sv = { window: [iso(from), iso(to)], owed: sentBetween(from, to), firstCount: null, waitedMs: 0, satisfied: false };
+    for (;;) {
+      const r = await request(base, '/api/v1/query', { token: st.reader, method: 'POST', body: { query: `service=coredns earliest="${iso(from)}" latest="${iso(to)}" | stats count() as n` } });
+      let n = -r.status;
+      if (r.status === 200) { const b = JSON.parse(r.text); const rows = b.result?.rows ?? b.rows; n = rows.length ? Number(rows[0][0]) : 0; }
+      sv.firstCount ??= n;
+      if (n >= sv.owed) { sv.satisfied = true; break; }
+      if (Date.now() > bound) break;
+      await delay(1000);
+    }
+    sv.waitedMs = Date.now() - t0;
+    res.startupVisibility = sv;
+  }
+  // The query loop.
+  const deadline = started + minutes * 60000;
+  async function worker() {
+    while (Date.now() < deadline && res.queries < maxQueries) {
+      res.queries++;
+      const sentAt = Date.now();
+      const t0 = performance.now();
+      const r = await request(base, '/api/v1/query', { token: st.reader, method: 'POST', body: { query: QUERY } });
+      const recvAt = Date.now();
+      res.latencyMs.push(performance.now() - t0);
+      res.statuses[r.status] = (res.statuses[r.status] || 0) + 1;
+      if (r.status === 0) { res.transportErrors++; continue; }
+      if (r.status >= 500) { res.fiveXX.push({ at: new Date(sentAt).toISOString(), status: r.status, requestId: r.requestId, latencyMs: recvAt - sentAt, body: r.text.slice(0, 300) }); continue; }
+      if (r.status !== 200) continue;
+      const { problems: p, owed } = checkResult(r, sentAt, recvAt);
+      if (owed === 20) res.owedFull++;
+      if (p.length) { res.contentFailures++; if (res.contentSamples.length < 10) res.contentSamples.push({ at: new Date(sentAt).toISOString(), requestId: r.requestId, problems: p }); }
+    }
+  }
+  try {
+    await Promise.all(Array.from({ length: CONCURRENCY }, worker));
+  } finally {
+    stop.done = true;
+    await Promise.allSettled(bg);
+    res.ended = new Date().toISOString();
+    // Persisted http_failure count for the run, read back through the API.
+    const pq = await request(base, '/api/v1/query', { token: st.reader, method: 'POST', body: { query: `service=trawld event_type="http_failure" earliest="${res.started}" latest="${new Date(Date.now() + 60000).toISOString()}" | stats count() as n` } });
+    try { assert.equal(pq.status, 200); const b = JSON.parse(pq.text); const rows = b.result?.rows ?? b.rows; res.persistedHttpFailures = rows.length ? Number(rows[0][0]) : 0; } catch { res.persistedHttpFailures = `read-back query ${pq.status}`; }
+    if (s.nets) {
+      let runs = 0; const byStatus = {};
+      for (const idn of st.nets) {
+        const r = await request(base, `/api/v1/saved/${idn}/runs?limit=500`, { token: st.reader });
+        if (r.status !== 200) { byStatus[`list_${r.status}`] = (byStatus[`list_${r.status}`] || 0) + 1; continue; }
+        for (const run of JSON.parse(r.text).runs) if (Date.parse(run.started_at) >= started) { runs++; byStatus[run.status] = (byStatus[run.status] || 0) + 1; }
+      }
+      res.netRuns = { runs, byStatus };
+    }
+    await stopTrawld(st, child);
+    st.sentPerSec = Object.fromEntries([...sentPerSec].filter(([k]) => k * 1000 > Date.now() - 2 * WINDOW_MS));
+    saveState(st);
+  }
+  const lat = res.latencyMs; delete res.latencyMs;
+  res.latency = { p50: pctl(lat, 0.5), p95: pctl(lat, 0.95), p99: pctl(lat, 0.99), max: pctl(lat, 1) };
+  res.durationS = Math.round((Date.parse(res.ended) - started) / 1000);
+  res.ingest = ingestStats;
+  if (s.sse) res.sse = sse;
+  if (s.pause) res.pauses = pauses;
+  res.compaction = compactionStats(logFile);
+  // Every http_failure trawld logged (explicit fields only, no secrets).
+  const failures = readLog(logFile).filter(e => e.fields?.event_type === 'http_failure').map(e => ({ timestamp: e.timestamp, level: e.level, target: e.target, ...e.fields }));
+  res.httpFailureEvents = failures.length;
+  const byKey = {};
+  for (const f of failures) { const k = `${f.route} ${f.status} ${f.stage}${f.reached ? `/${f.reached}` : ''} ${f.error_class}/${f.cause_kind}`; byKey[k] = (byKey[k] || 0) + 1; }
+  res.httpFailureShapes = byKey;
+  const queryFailures = failures.filter(f => f.route === '/api/v1/query');
+  res.queryFiveXXMatched = res.fiveXX.filter(x => queryFailures.some(f => f.request_id === x.requestId)).length;
+  fs.mkdirSync(resultsDir, { recursive: true });
+  fs.writeFileSync(path.join(resultsDir, `${id}.json`), JSON.stringify(res, null, 2) + '\n');
+  if (failures.length) fs.writeFileSync(path.join(resultsDir, `${id}-http_failure.jsonl`), failures.map(f => JSON.stringify(f)).join('\n') + '\n');
+  console.log(JSON.stringify({ id, queries: res.queries, statuses: res.statuses, fiveXX: res.fiveXX.length, contentFailures: res.contentFailures, httpFailureShapes: byKey }));
+}
+
+// Minimal reproduction of the restart visibility gap: accepted events that
+// are still in the WAL at shutdown are missing from search after restart
+// until the new process's first compaction tick.
+async function restartProbe() {
+  const st = loadState();
+  const probe = { compaction: 30 };
+  const svc = `probe${RUN}`;
+  const q = { query: `service=${svc} last=15m | stats count() as n` };
+  const count = async base => { const r = await request(base, '/api/v1/query', { token: st.reader, method: 'POST', body: q }); if (r.status !== 200) return -r.status; const rows = JSON.parse(r.text).result?.rows ?? JSON.parse(r.text).rows; return rows.length ? Number(rows[0][0]) : 0; };
+  const out = { compaction_interval_secs: probe.compaction, service: svc, events: 50 };
+  let { child, base } = await startTrawld(st, 'probe-1', probe);
+  const r = await ingest(base, st, Array.from({ length: 50 }, (_, i) => ({ ...coredns(Date.now() - i * 100, false), service: svc })));
+  assert.equal(r.status, 200);
+  out.beforeRestart = await count(base);
+  const stoppedAt = Date.now();
+  await stopTrawld(st, child);
+  out.walFilesAfterStop = fs.readdirSync(path.join(stateDir, 'data', 'wal'), { recursive: true }).filter(f => String(f).includes(svc)).length;
+  ({ child, base } = await startTrawld(st, 'probe-2', probe));
+  const up = Date.now();
+  out.restartMs = up - stoppedAt;
+  out.series = [];
+  for (let i = 0; i < 120; i++) {
+    const n = await count(base);
+    out.series.push([Math.round((Date.now() - up) / 1000), n]);
+    if (n === 50) break;
+    await delay(1000);
+  }
+  out.visibleAfterS = out.series.at(-1)[1] === 50 ? out.series.at(-1)[0] : null;
+  const comp = readLog(path.join(stateDir, 'logs', 'probe-2.stdout')).filter(e => e.fields.event_type === 'compaction_complete' && e.fields.compact_service === svc);
+  out.compactionAfterRestart = comp.map(e => e.timestamp);
+  await stopTrawld(st, child);
+  // Compress the series to its transitions.
+  out.series = out.series.filter((p, i, a) => i === 0 || i === a.length - 1 || p[1] !== a[i - 1][1]);
+  fs.mkdirSync(resultsDir, { recursive: true });
+  fs.writeFileSync(path.join(resultsDir, 'restart-probe.json'), JSON.stringify(out, null, 2) + '\n');
+  console.log(JSON.stringify(out));
+}
+
+async function teardown() {
+  if (!fs.existsSync(statePath)) { console.log('no state'); return; }
+  const st = loadState();
+  await stopTrawld(st);
+  try { docker('unpause', st.container); } catch { /* not paused */ }
+  try { docker('rm', '--force', '--volumes', st.container); } catch (e) { console.log(`container: ${e.message.split('\n')[0]}`); }
+  fs.rmSync(stateDir, { recursive: true, force: true });
+  console.log(`removed ${st.container} and ${stateDir}`);
+}
+
+function report() {
+  const commit = fs.existsSync(path.join(resultsDir, 'commit.txt')) ? fs.readFileSync(path.join(resultsDir, 'commit.txt'), 'utf8').trim() : '(unrecorded)';
+  const seed = fs.existsSync(path.join(resultsDir, 'seed.json')) ? JSON.parse(fs.readFileSync(path.join(resultsDir, 'seed.json'), 'utf8')) : null;
+  const out = [];
+  out.push('# #235: bounded search for the original 500', '');
+  out.push(`Generated by \`node visual-evidence/issue-235/harness.mjs report\` from \`results/*.json\`. The runs used a release \`trawld\` built from commit \`${commit}\`, with disposable \`postgres:18\` in Docker and a private data directory.`, '');
+  out.push(`Query: \`${QUERY}\`, ${CONCURRENCY} concurrent loops, back to back. Bound per scenario: 30 minutes or 10,000 queries, whichever comes first.`, '');
+  out.push('A content failure is a 200 whose body does not parse, has more than 20 rows, has a non-`coredns` row or a `_time` outside the window, or has fewer rows than the harness had accepted inside the window before it sent the query (capped at 20).', '');
+  if (seed) out.push(`Seed: ${seed.accepted} events accepted. The seed built a coredns hour file of ${seed.compaction.coredns?.maxRows} rows and a machined hour file of ${seed.compaction.machined?.maxRows} rows. The incident's hour file had 370,488 rows.`, '');
+  out.push('Common config: `internal_telemetry = true`, `daily_rollup` default (true), `max_concurrent_queries` default (nproc), scheduler `poll_interval_secs = 1`, rate limits off (role rpm 1,000,000). Per-scenario knobs are in the table.', '');
+  out.push('| Scenario | Knobs | Queries | Duration | 5xx | Content failures | p50/p95/max ms | Compactions (coredns merged / machined) | Outcome |');
+  out.push('| --- | --- | ---: | ---: | ---: | ---: | --- | --- | --- |');
+  const files = fs.existsSync(resultsDir) ? fs.readdirSync(resultsDir).filter(f => /^[a-g]\.json$/.test(f)).sort() : [];
+  for (const f of files) {
+    const r = JSON.parse(fs.readFileSync(path.join(resultsDir, f), 'utf8'));
+    const k = r.config;
+    const knobs = [`compaction ${k.compaction_interval_secs}s`, k.coredns_ev_per_s && `coredns ${+k.coredns_ev_per_s.toFixed(2)}/s`, k.machined_ev_per_s && `machined ${k.machined_ev_per_s}/s`,
+      k.sse && `SSE \`${k.sse}\``, k.nets && '5 nets @1m', k.pg_pause && 'pg pause'].filter(Boolean).join(', ');
+    const c = r.compaction || {};
+    const comp = `${c.coredns ? `${c.coredns.merged}/${c.coredns.runs} (max ${c.coredns.maxRows} rows, ${c.coredns.maxMs} ms)` : '0'} / ${c.machined ? `${c.machined.runs} (max ${c.machined.maxMs} ms)` : '0'}`;
+    const outcome = r.fiveXX.length || r.contentFailures ? `**${r.fiveXX.length} 5xx, ${r.contentFailures} content failures**` : 'no 5xx, content clean';
+    out.push(`| ${r.id}: ${r.title} | ${knobs} | ${r.queries} | ${r.durationS}s | ${r.fiveXX.length} | ${r.contentFailures} | ${r.latency.p50}/${r.latency.p95}/${r.latency.max} | ${comp} | ${outcome} |`);
+  }
+  out.push('');
+  for (const f of files) {
+    const r = JSON.parse(fs.readFileSync(path.join(resultsDir, f), 'utf8'));
+    const extra = [];
+    extra.push(`statuses ${JSON.stringify(r.statuses)}`);
+    extra.push(`200s that owed the full 20 rows: ${r.owedFull}`);
+    if (r.startupVisibility) extra.push(`carried-over coredns events visible at start: ${r.startupVisibility.firstCount}/${r.startupVisibility.owed}, all visible after ${Math.round(r.startupVisibility.waitedMs / 1000)} s`);
+    extra.push(`http_failure events logged: ${r.httpFailureEvents}, persisted (read back through the API): ${r.persistedHttpFailures}`);
+    if (Object.keys(r.httpFailureShapes).length) extra.push(`http_failure shapes (route status stage class/cause): ${JSON.stringify(r.httpFailureShapes)}`);
+    if (r.fiveXX.length) extra.push(`query 5xx matched to an http_failure by request_id: ${r.queryFiveXXMatched}/${r.fiveXX.length}`);
+    if (r.ingest.accepted || r.ingest.failed) extra.push(`ingest accepted ${r.ingest.accepted}, failed batches ${r.ingest.failed} ${JSON.stringify(r.ingest.statuses)}`);
+    if (r.sse) extra.push(`SSE connects ${r.sse.connects}, statuses ${JSON.stringify(r.sse.statuses)}, data events ${r.sse.events} (${(r.sse.events / (r.durationS / 60)).toFixed(0)}/min)`);
+    if (r.netRuns) extra.push(`net runs in window: ${r.netRuns.runs} ${JSON.stringify(r.netRuns.byStatus)}`);
+    if (r.pauses) extra.push(`pg pauses: ${r.pauses.count}, ${Math.round(r.pauses.totalMs / 1000)} s total`);
+    if (r.contentSamples.length) extra.push(`content failure samples: ${JSON.stringify(r.contentSamples.slice(0, 3))}`);
+    out.push(`- **${r.id}**: ${extra.join('; ')}.`);
+  }
+  out.push('');
+  const all = files.map(f => JSON.parse(fs.readFileSync(path.join(resultsDir, f), 'utf8')));
+  const total = k => all.reduce((n, r) => n + k(r), 0);
+  const fives = total(r => r.fiveXX.length), content = total(r => r.contentFailures);
+  out.push(`**Outcome: ${total(r => r.queries)} queries across ${all.length} scenarios, ${fives} 5xx, ${content} content failures.** ${fives === 0 ? 'The original 500 did not reproduce: original 500 unresolved.' : 'See the per-scenario 5xx records in results/.'}`, '');
+  out.push('Limits of this record:', '');
+  out.push('- The compactions column shows the largest coredns hour file merged in each scenario. The hour file restarts at each UTC hour, so f and g merged smaller files than the incident\'s 370,488 rows. b merged a file of that size, 48 times, while it ran its queries.');
+  out.push('- The 2-8 s pauses in g slowed queries (see the max latency) but never exhausted a pool wait, so g produced no auth-backend 503. The harness counts 5xx from HTTP status, not from logs, so a missed log line could not hide a 5xx. It parses `http_failure` from stdout with the same parser that reads `compaction_complete`.');
+  out.push('- Duration includes the wait for events carried over from the previous scenario (see the finding below).', '');
+  out.push('<details><summary>trawld config (scenario f; other scenarios change only the knobs above)</summary>', '', '```toml', config(SCENARIOS.f, 'scenario-f').replaceAll(stateDir, '$HARNESS_DIR').trimEnd(), '```', '', '</details>', '');
+  const probePath = path.join(resultsDir, 'restart-probe.json');
+  if (fs.existsSync(probePath)) {
+    const p = JSON.parse(fs.readFileSync(probePath, 'utf8'));
+    out.push('## Finding: accepted events are missing from search after a restart', '');
+    out.push(`\`harness.mjs restart-probe\` sets \`compaction_interval_secs = ${p.compaction_interval_secs}\`. It ingests ${p.events} events for a fresh service and counts them with \`service=<probe> last=15m | stats count()\`. Before the restart the count is ${p.beforeRestart}. After SIGTERM, ${p.walFilesAfterStop} WAL file still holds the events. After the restart, the count by seconds since startup is ${p.series.map(([t, n]) => `${n} at ${t} s`).join(', ')}. All events are visible after ${p.visibleAfterS} s, when the first compaction completes (${p.compactionAfterRestart.join(', ')}).`, '');
+    out.push('Cause: the hot buffer starts empty (`crates/trawl-server/src/state.rs:645`) and nothing loads the WAL into it. The compaction loop sleeps one interval before its first tick (`crates/trawl-server/src/ingest/compaction.rs:71`), and shutdown stops the loop without a final compaction (`compaction.rs:97-99`). A query in that window gets a 200 with rows missing, not an error. The default interval is 10 s. The same code is at base `ed3a2516`. This is not the #235 500, but the harness hit it: in the first two passes, scenario e returned 3,753 short 200s each time after scenario d restarted trawld. Each scenario now waits until the events carried over from the previous scenario are visible before it starts its loop, and records that wait.', '');
+  }
+  const producers = path.join(here, 'producers.md');
+  if (fs.existsSync(producers)) out.push(fs.readFileSync(producers, 'utf8').trimEnd(), '');
+  process.stdout.write(out.join('\n') + '\n');
+}
+
+const [cmd, ...rest] = process.argv.slice(2);
+const opt = (n, d) => { const i = rest.indexOf(`--${n}`); return i >= 0 ? Number(rest[i + 1]) : d; };
+try {
+  if (cmd === 'setup') { await setup(); const st = loadState(); fs.mkdirSync(resultsDir, { recursive: true }); fs.writeFileSync(path.join(resultsDir, 'seed.json'), JSON.stringify(st.seed, null, 2) + '\n'); }
+  else if (cmd === 'scenario') await scenario(rest[0], opt('minutes', 30), opt('max-queries', 10000));
+  else if (cmd === 'teardown') await teardown();
+  else if (cmd === 'restart-probe') await restartProbe();
+  else if (cmd === 'report') report();
+  else { console.error('usage: harness.mjs setup | scenario <a..g> [--minutes N] [--max-queries N] | report | teardown'); process.exit(2); }
+} finally { agent.destroy(); }
