@@ -52,6 +52,8 @@ const SCENARIOS = {
   g: { title: 'postgres paused (docker pause) for 2-8 s intervals', compaction: 5, coredns: 120, pause: true },
 };
 const CONCURRENCY = 3;
+// The event type the persisted read-back is controlled with (see scenario).
+const READ_BACK_CONTROL = 'pool_acquired';
 const SERVFAIL_FRACTION = 1 / 72; // 120 ev/s * 1/72 = 100 ev/min on the f tail
 
 function config(s, name) {
@@ -473,6 +475,7 @@ async function scenario(id, minutes, maxQueries) {
       let n = -r.status;
       if (r.status === 200 && !r.incomplete) { const b = JSON.parse(r.text); const rows = b.result?.rows ?? b.rows; n = rows.length ? Number(rows[0][0]) : 0; }
       sv.firstCount ??= n;
+      sv.lastCount = n;
       if (n >= sv.owed) { sv.satisfied = true; break; }
       if (Date.now() > bound) break;
       await delay(1000);
@@ -508,9 +511,19 @@ async function scenario(id, minutes, maxQueries) {
     stop.done = true;
     await Promise.allSettled(bg);
     res.ended = new Date().toISOString();
-    // Persisted http_failure count for the run, read back through the API.
-    const pq = await request(base, '/api/v1/query', { token: st.reader, method: 'POST', body: { query: `service=trawld event_type="http_failure" earliest="${res.started}" latest="${new Date(Date.now() + 60000).toISOString()}" | stats count() as n` } });
-    try { assert.equal(pq.status, 200); const b = JSON.parse(pq.text); const rows = b.result?.rows ?? b.rows; res.persistedHttpFailures = rows.length ? Number(rows[0][0]) : 0; } catch { res.persistedHttpFailures = `read-back query ${pq.status}`; }
+    // Persisted http_failure count for the run, read back through the API,
+    // after a few telemetry flushes (1 s by default). A zero means nothing
+    // unless the same filter shape finds an event type that is persisted
+    // in the same window: every query this run sent logged pool_acquired.
+    await delay(3000);
+    const latest = new Date(Date.now() + 60000).toISOString();
+    const readBack = async eventType => {
+      const pq = await request(base, '/api/v1/query', { token: st.reader, method: 'POST', body: { query: `service=trawld event_type="${eventType}" earliest="${res.started}" latest="${latest}" | stats count() as n` } });
+      try { assert.equal(pq.status, 200); assert.ok(!pq.incomplete); const b = JSON.parse(pq.text); const rows = b.result?.rows ?? b.rows; return rows.length ? Number(rows[0][0]) : 0; } catch { return `read-back query ${pq.status}`; }
+    };
+    res.persistedHttpFailures = await readBack('http_failure');
+    const control = await readBack(READ_BACK_CONTROL);
+    res.persistedControl = { eventType: READ_BACK_CONTROL, count: control };
     if (s.nets) {
       let runs = 0; const byStatus = {};
       for (const idn of st.nets) {
@@ -650,6 +663,24 @@ const INCIDENT_ROWS = 370488;
 // transport error or content-checked its partial body, so none was left
 // unclassified: an absent field means zero.
 const inconclusive = r => r.inconclusive ?? 0;
+// How far the persisted http_failure read-back can be trusted.
+function readBackState(r) {
+  if (r.persistedControl === undefined) return 'uncontrolled';
+  const c = r.persistedControl.count;
+  return typeof c === 'number' && c > 0 && typeof r.persistedHttpFailures === 'number' ? 'controlled' : 'inconclusive';
+}
+function readBackText(r) {
+  const state = readBackState(r);
+  if (state === 'uncontrolled') return `${r.persistedHttpFailures}, uncontrolled (recorded before the control existed)`;
+  const control = `control: ${r.persistedControl.count} ${r.persistedControl.eventType} events read back with the same filter`;
+  return state === 'controlled' ? `${r.persistedHttpFailures} (${control})` : `inconclusive: ${r.persistedHttpFailures} (${control})`;
+}
+// The startup wait either saw every carried-over event or hit its bound.
+function visibilityText(sv, lead) {
+  const s = Math.round(sv.waitedMs / 1000);
+  return sv.satisfied ? `${lead} after ${s} s` : `the wait hit its bound after ${s} s with ${sv.lastCount ?? 'an unrecorded number'} of ${sv.owed} visible`;
+}
+
 function outcomeOf(r) {
   const bad = [r.fiveXX.length && `${r.fiveXX.length} 5xx`, r.contentFailures && `${r.contentFailures} content failures`,
     r.transportErrors && `${r.transportErrors} transport errors`, inconclusive(r) && `${inconclusive(r)} inconclusive`].filter(Boolean);
@@ -687,8 +718,8 @@ function report() {
     const extra = [];
     extra.push(`statuses ${JSON.stringify(r.statuses)}`);
     extra.push(`200s that owed the full 20 rows: ${r.owedFull}`);
-    if (r.startupVisibility) extra.push(`carried-over coredns events visible at start: ${r.startupVisibility.firstCount}/${r.startupVisibility.owed}, all visible after ${Math.round(r.startupVisibility.waitedMs / 1000)} s`);
-    extra.push(`http_failure events logged: ${r.httpFailureEvents}, persisted (read back through the API): ${r.persistedHttpFailures}`);
+    if (r.startupVisibility) extra.push(`carried-over coredns events visible at start: ${r.startupVisibility.firstCount}/${r.startupVisibility.owed}, ${visibilityText(r.startupVisibility, 'all visible')}`);
+    extra.push(`http_failure events logged: ${r.httpFailureEvents}, persisted (read back through the API): ${readBackText(r)}`);
     if (Object.keys(r.httpFailureShapes).length) extra.push(`http_failure shapes (route status stage class/cause): ${JSON.stringify(r.httpFailureShapes)}`);
     if (r.fiveXX.length) extra.push(`query 5xx matched to an http_failure by request_id: ${r.queryFiveXXMatched}/${r.fiveXX.length}`);
     if (r.ingest.accepted || r.ingest.failed) extra.push(`ingest accepted ${r.ingest.accepted}, failed batches ${r.ingest.failed} ${JSON.stringify(r.ingest.statuses)}`);
@@ -727,6 +758,13 @@ function report() {
     limits.push(`- ${r.id} paused postgres ${r.pauses.count} times, ${Math.round(r.pauses.totalMs / 1000)} s in total; the longest query took ${fmt(r.latency.max)} ms. It returned ${r.fiveXX.length ? `these 5xx: ${JSON.stringify(by)}` : 'no 5xx'}, and ${shapes.length ? `logged pre-admission failures: ${shapes.join('; ')}` : 'logged no pre-admission (auth backend) failure'}.`);
   }
   limits.push('- The harness counts 5xx from HTTP status, not from logs, so a missed log line cannot hide a 5xx. It parses `http_failure` from stdout with the same parser that reads `compaction_complete`.');
+  const byState = st => all.filter(r => readBackState(r) === st).map(r => r.id);
+  const rbParts = [['uncontrolled', 'uncontrolled (recorded before the control existed), so its zeros are not evidence that nothing was persisted'],
+    ['inconclusive', 'inconclusive (the control read back nothing)'], ['controlled', 'controlled by a nonzero read-back of the control event']]
+    .filter(([k]) => byState(k).length).map(([k, text]) => `${byState(k).join(', ')}: ${text}`);
+  if (rbParts.length) limits.push(`- The persisted http_failure read-back is ${rbParts.join('; ')}. The 5xx counts do not depend on it.`);
+  const unsatisfied = all.filter(r => r.startupVisibility && !r.startupVisibility.satisfied).map(r => r.id);
+  if (unsatisfied.length) limits.push(`- The carried-over events never all became visible before the startup wait hit its bound in: ${unsatisfied.join(', ')}. Their content checks count those events as owed.`);
   const waited = all.filter(r => (r.startupVisibility?.waitedMs ?? 0) >= 1000);
   if (waited.length) limits.push(`- Duration includes the wait for events carried over from the previous scenario (see the finding below): ${waited.map(r => `${r.id} ${Math.round(r.startupVisibility.waitedMs / 1000)} s`).join(', ')}.`);
   out.push('Limits of this record:', '', ...limits, '');
@@ -741,7 +779,7 @@ function report() {
     out.push(`\`harness.mjs restart-probe\` sets \`compaction_interval_secs = ${p.compaction_interval_secs}\`. It ingests ${p.events} events for a fresh service and counts them with \`service=<probe> last=15m | stats count()\`. Before the restart the count is ${p.beforeRestart}. After SIGTERM, ${p.walFilesAfterStop} WAL file still holds the events. After the restart, the count by seconds since startup is ${p.series.map(([t, n]) => `${n} at ${t} s`).join(', ')}. All events are visible after ${p.visibleAfterS} s, when the first compaction completes (${p.compactionAfterRestart.join(', ')}).`, '');
     out.push('Cause: the hot buffer starts empty (`crates/trawl-server/src/state.rs:645`) and nothing loads the WAL into it. The compaction loop sleeps one interval before its first tick (`crates/trawl-server/src/ingest/compaction.rs:71`), and shutdown stops the loop without a final compaction (`compaction.rs:97-99`). A query in that window gets a 200 with rows missing, not an error. The default interval is 10 s. The same code is at base `ed3a2516`. This is not the #235 500. Each scenario waits until the events carried over from the previous scenario are visible before it starts its loop, and records that wait.', '');
     const gaps = all.filter(r => r.startupVisibility && r.startupVisibility.firstCount < r.startupVisibility.owed);
-    if (gaps.length) out.push(`The scenario runs show the same gap: ${gaps.map(r => `${r.id} started with ${fmt(r.startupVisibility.firstCount)} of ${fmt(r.startupVisibility.owed)} carried-over events visible, all after ${Math.round(r.startupVisibility.waitedMs / 1000)} s (compaction interval ${r.config.compaction_interval_secs} s)`).join('; ')}.`, '');
+    if (gaps.length) out.push(`The scenario runs show the same gap: ${gaps.map(r => `${r.id} started with ${fmt(r.startupVisibility.firstCount)} of ${fmt(r.startupVisibility.owed)} carried-over events visible, ${visibilityText(r.startupVisibility, 'all')} (compaction interval ${r.config.compaction_interval_secs} s)`).join('; ')}.`, '');
   }
   const producers = path.join(here, 'producers.md');
   if (fs.existsSync(producers)) out.push(fs.readFileSync(producers, 'utf8').trimEnd(), '');
