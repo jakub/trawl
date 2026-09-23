@@ -36,12 +36,14 @@
 //!
 //! One unmetered event does persist, under a cap: the failure event of a
 //! server 5xx no limiter metered
-//! ([`UNMETERED_FAILURE_TARGET`](crate::transport::failure::UNMETERED_FAILURE_TARGET)).
+//! ([`UNMETERED_FAILURE_TARGET`]).
 //! A server fault before admission, the auth backend down say, is the
 //! incident an operator searches for afterwards, so the layer admits those
 //! events under one process-wide fixed window of
 //! [`UNMETERED_FAILURE_CAP_PER_MINUTE`] (ADR-0040). Past the cap they stay
-//! on stdout only and are counted under drop reason `unmetered_cap`.
+//! on stdout only and are counted under drop reason `unmetered_cap`. Only
+//! that exact target is capped: a target beneath it is excluded like any
+//! other unmetered descendant.
 //!
 //! ## Buffering and the bounded retry queue
 //!
@@ -145,6 +147,7 @@ use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::LookupSpan;
 
 use crate::ingest::wal::WalWriter;
+use crate::transport::failure::UNMETERED_FAILURE_TARGET;
 
 // ---------------------------------------------------------------------------
 // Default log filter: the cross-packaging contract
@@ -233,12 +236,13 @@ pub const UNMETERED_POLICY_TARGET: &str = "trawl_server::policy::unmetered";
 /// persists, the rest of `trawl_server` and `storage.backend` included.
 ///
 /// [`UNMETERED_FAILURE_TARGET`], the failure event of a 5xx no limiter
-/// metered, is deliberately not in this list. A 401 or 403 is the caller's
-/// fault; a 5xx before admission is the server's, the auth backend down
-/// say, and it is the incident an operator searches for afterwards. The
-/// same amplifier argument still holds, so [`WalLayer`] admits that target
-/// under [`UNMETERED_FAILURE_CAP_PER_MINUTE`] instead of without a bound
-/// (ADR-0040).
+/// metered, is in this list for its descendants only. A 401 or 403 is the
+/// caller's fault; a 5xx before admission is the server's, the auth backend
+/// down say, and it is the incident an operator searches for afterwards.
+/// The same amplifier argument still holds, so [`is_persisted_target`]
+/// exempts that exact target and [`WalLayer`] admits it under
+/// [`UNMETERED_FAILURE_CAP_PER_MINUTE`] instead of without a bound
+/// (ADR-0040). A target beneath it has no cap and stays excluded.
 ///
 /// [`PANIC_TARGET`] is here for a different reason. The panic diagnostic
 /// says where a panic happened, on stdout only; the caught request's own
@@ -248,13 +252,12 @@ pub const UNMETERED_POLICY_TARGET: &str = "trawl_server::policy::unmetered";
 /// `fleet_auth::middleware` but never a `fleet_authority` target — and
 /// `trawl_server::policy::unmetered` excludes only itself and its own
 /// descendants, never `trawl_server::policy`.
-///
-/// [`UNMETERED_FAILURE_TARGET`]: crate::transport::failure::UNMETERED_FAILURE_TARGET
-pub const UNMETERED_TARGETS: [&str; 5] = [
+pub const UNMETERED_TARGETS: [&str; 6] = [
     "fleet_auth",
     "auth.backend",
     PREAUTH_TRANSPORT_TARGET,
     UNMETERED_POLICY_TARGET,
+    UNMETERED_FAILURE_TARGET,
     PANIC_TARGET,
 ];
 
@@ -302,8 +305,6 @@ pub fn install_panic_hook() {
 /// writes a client the rate limiter cannot slow can cause, at 60 rows a
 /// minute. Events past it go to stdout only and are counted under drop
 /// reason `unmetered_cap`.
-///
-/// [`UNMETERED_FAILURE_TARGET`]: crate::transport::failure::UNMETERED_FAILURE_TARGET
 pub const UNMETERED_FAILURE_CAP_PER_MINUTE: u32 = 60;
 
 /// The fixed window [`UNMETERED_FAILURE_CAP_PER_MINUTE`] counts over.
@@ -347,8 +348,9 @@ impl UnmeteredFailureCap {
 
 /// Whether events on `target` may be persisted as telemetry — false for
 /// every [`UNMETERED_TARGETS`] entry and its module descendants. True for
-/// the unmetered failure target, which [`WalLayer`] persists under its own
-/// cap.
+/// the exact unmetered failure target ([`UNMETERED_FAILURE_TARGET`]),
+/// which [`WalLayer`] persists under its own cap; its descendants stay
+/// false, because nothing caps them.
 ///
 /// [`WalLayer`] applies it on top of the resolved directives, which every
 /// sink shares. A second, non-configurable predicate rather than an
@@ -361,12 +363,13 @@ impl UnmeteredFailureCap {
 /// target instead of being demoted to DEBUG.
 #[must_use]
 pub fn is_persisted_target(target: &str) -> bool {
-    !UNMETERED_TARGETS.iter().any(|excluded| {
-        target == *excluded
-            || target
-                .strip_prefix(excluded)
-                .is_some_and(|rest| rest.starts_with("::"))
-    })
+    target == UNMETERED_FAILURE_TARGET
+        || !UNMETERED_TARGETS.iter().any(|excluded| {
+            target == *excluded
+                || target
+                    .strip_prefix(excluded)
+                    .is_some_and(|rest| rest.starts_with("::"))
+        })
 }
 
 /// A resolved log filter: the directive string to install plus an optional
@@ -1359,10 +1362,11 @@ where
 
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
         // Unmetered events are logged, never persisted (UNMETERED_TARGETS),
-        // except the unmetered failure event, which persists under its own
-        // process-wide cap (ADR-0040).
+        // except the exact unmetered failure target, which persists under
+        // its own process-wide cap (ADR-0040). Its descendants fall through
+        // to the exclusion and never reach the cap.
         let target = event.metadata().target();
-        if target == crate::transport::failure::UNMETERED_FAILURE_TARGET {
+        if target == UNMETERED_FAILURE_TARGET {
             if !self.inner.admit_unmetered_failure() {
                 return;
             }
@@ -1689,6 +1693,12 @@ mod tests {
         // The panic diagnostic is stdout-only; the caught request's failure
         // event is the persisted record.
         assert!(!is_persisted_target(PANIC_TARGET));
+        // The unmetered failure target itself persists under its cap; its
+        // descendants have no cap, so they stay excluded.
+        assert!(is_persisted_target(UNMETERED_FAILURE_TARGET));
+        assert!(!is_persisted_target(
+            "trawl_server::transport::failure::unmetered::x"
+        ));
         // Prefix matching is per segment, not per byte.
         assert!(is_persisted_target("fleet_authority"));
         assert!(is_persisted_target("fleet_auth_shim::x"));
@@ -1834,11 +1844,12 @@ mod tests {
     /// 61 unmetered failures in one window: the first 60 persist, the 61st
     /// reaches stdout only and is counted under `unmetered_cap`, on the
     /// metric and in the `telemetry_dropped` recovery record. Once the
-    /// window rolls over, the next one persists again.
+    /// window rolls over, the next one persists again. A target beneath the
+    /// capped one persists neither before nor after the cap fills, and never
+    /// counts against it or under `unmetered_cap`.
     #[test]
     fn unmetered_5xx_persist_until_the_cap_then_count_as_dropped() {
         use crate::metrics::test_support::sample;
-        use crate::transport::failure::UNMETERED_FAILURE_TARGET;
         const DROPPED: &str = "trawl_telemetry_events_dropped_total{reason=\"unmetered_cap\"}";
 
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
@@ -1870,6 +1881,14 @@ mod tests {
                     "request failed"
                 );
             };
+            let fail_child = |id: &str| {
+                tracing::error!(
+                    target: "trawl_server::transport::failure::unmetered::x",
+                    event_type = "http_failure",
+                    request_id = id,
+                    "request failed"
+                );
+            };
             let persisted = || -> Vec<String> {
                 layer.flush();
                 read_wal_events(&tmp.path().join("prod"))
@@ -1879,14 +1898,19 @@ mod tests {
                     .collect()
             };
 
+            fail_child("zz-child-before");
             for n in 0..=UNMETERED_FAILURE_CAP_PER_MINUTE {
                 fail(n);
             }
+            fail_child("zz-child-after");
             let ids = persisted();
             let expected: Vec<String> = (0..UNMETERED_FAILURE_CAP_PER_MINUTE)
                 .map(|n| format!("zz-cap-{n:03}"))
                 .collect();
-            assert_eq!(ids, expected, "exactly the first 60 persist");
+            assert_eq!(
+                ids, expected,
+                "exactly the first 60 persist, and no child-target event"
+            );
             assert!(
                 stdout.text().contains("zz-cap-060"),
                 "the 61st still reaches stdout"
