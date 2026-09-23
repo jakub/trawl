@@ -311,6 +311,134 @@ pub fn resolve_log_filter(env_value: Option<&str>) -> ResolvedLogFilter {
 }
 
 // ---------------------------------------------------------------------------
+// Subscriber construction
+// ---------------------------------------------------------------------------
+
+/// The JSON file logger's layer, as the reload handle in [`FileLogHandle`]
+/// names it.
+pub type JsonLogLayer = tracing_subscriber::fmt::Layer<
+    tracing_subscriber::Registry,
+    tracing_subscriber::fmt::format::JsonFields,
+    tracing_subscriber::fmt::format::Format<tracing_subscriber::fmt::format::Json>,
+    tracing_subscriber::fmt::writer::BoxMakeWriter,
+>;
+
+/// Swaps the JSON file logger's writer from stderr to the configured file
+/// once storage admission has succeeded.
+pub type FileLogHandle =
+    tracing_subscriber::reload::Handle<JsonLogLayer, tracing_subscriber::Registry>;
+
+/// Where trawld's own events go. Each sink is optional, so every startup
+/// shape (monitor or not, telemetry or file log or neither) is one call to
+/// [`build_subscriber`].
+pub struct LogSinks<W> {
+    /// Human-readable lines. `None` while the monitor TUI owns the terminal:
+    /// interleaved log output would corrupt it.
+    pub stdout: Option<W>,
+    /// Self-telemetry into the ingest WAL. Production registers it in place
+    /// of the JSON file logger.
+    pub wal: Option<WalLayer>,
+    /// A JSON logger that writes to stderr until [`FileLogHandle`] points it
+    /// at the configured file. Logging must not create occupancy in a fresh
+    /// root or alter refused storage, so the file opens only after
+    /// admission.
+    pub file_log: bool,
+}
+
+impl<W> std::fmt::Debug for LogSinks<W> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LogSinks")
+            .field("stdout", &self.stdout.is_some())
+            .field("wal", &self.wal)
+            .field("file_log", &self.file_log)
+            .finish()
+    }
+}
+
+/// Build trawld's tracing subscriber from the resolved directives and the
+/// selected sinks. `main` installs the result with `.init()`, which also
+/// installs the `log` bridge.
+///
+/// Returns the file logger's reload handle when [`LogSinks::file_log`] is
+/// set.
+///
+/// Each sink combination gets its own stack rather than one stack of
+/// `Option` layers: an absent `Option` layer is not a filtered layer, so
+/// stacking one over per-layer-filtered layers would turn every callsite
+/// they all refuse from `never` into `sometimes` and change what the
+/// subscriber is asked, and when.
+pub fn build_subscriber<W>(
+    directives: &str,
+    sinks: LogSinks<W>,
+) -> (tracing::Dispatch, Option<FileLogHandle>)
+where
+    W: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + Send + Sync + 'static,
+{
+    use tracing_subscriber::fmt;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    // The directives were resolved (and validated when operator-supplied) by
+    // `resolve_log_filter`; each layer builds its own EnvFilter from the
+    // same string. The WAL layer builds a narrower one (`wal_filter`):
+    // pre-authn auth and transport events are logged but never persisted,
+    // so an unauthenticated connection or request flood cannot grow the
+    // corpus.
+    let make_filter = || tracing_subscriber::EnvFilter::new(directives);
+
+    match sinks {
+        LogSinks {
+            stdout,
+            wal: Some(wal_layer),
+            ..
+        } => {
+            let dispatch = match stdout {
+                Some(writer) => tracing_subscriber::registry()
+                    .with(fmt::layer().with_writer(writer).with_filter(make_filter()))
+                    .with(wal_layer.with_filter(wal_filter(directives)))
+                    .into(),
+                None => tracing_subscriber::registry()
+                    .with(wal_layer.with_filter(wal_filter(directives)))
+                    .into(),
+            };
+            (dispatch, None)
+        }
+        LogSinks {
+            stdout,
+            wal: None,
+            file_log: true,
+        } => {
+            let file_layer = fmt::layer()
+                .json()
+                .with_ansi(false)
+                .with_writer(fmt::writer::BoxMakeWriter::new(std::io::stderr));
+            let (file_layer, handle) = tracing_subscriber::reload::Layer::new(file_layer);
+            let stdout_layer =
+                stdout.map(|writer| fmt::layer().with_writer(writer).with_filter(make_filter()));
+            let dispatch = tracing_subscriber::registry()
+                .with(file_layer.with_filter(make_filter()))
+                .with(stdout_layer)
+                .into();
+            (dispatch, Some(handle))
+        }
+        LogSinks {
+            stdout: Some(writer),
+            wal: None,
+            file_log: false,
+        } => (
+            tracing_subscriber::registry()
+                .with(fmt::layer().with_writer(writer).with_filter(make_filter()))
+                .into(),
+            None,
+        ),
+        LogSinks {
+            stdout: None,
+            wal: None,
+            file_log: false,
+        } => (tracing_subscriber::registry().into(), None),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // WalHandle: deferred writer injection
 // ---------------------------------------------------------------------------
 
