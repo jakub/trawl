@@ -75,8 +75,9 @@ pub enum FailureStage {
     /// catch on a blocking worker.
     Panicked,
     /// The response is a 5xx, but its producer recorded nothing. The event
-    /// still names the request and the route; the producer is the thing to
-    /// fix.
+    /// still names the request and the route, and carries `reached`, the
+    /// furthest [`Progress`] mark the request passed; the producer is the
+    /// thing to fix.
     Unrecorded,
 }
 
@@ -104,9 +105,13 @@ impl FailureStage {
 }
 
 /// How far a request has got. Only ever moves forward.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+///
+/// A closed set of literals. A [`FailureStage::Unrecorded`] event carries
+/// it as `reached`: its producer recorded nothing, so how far the request
+/// got is the only lead to that producer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
-enum Progress {
+pub enum Progress {
     /// No rate limiter has admitted the request yet.
     PreAdmission = 0,
     /// A rate limiter admitted the request for a verified key.
@@ -116,6 +121,19 @@ enum Progress {
 }
 
 impl Progress {
+    /// Every mark, for closed-set checks and for consumers that enumerate.
+    pub const ALL: [Self; 3] = [Self::PreAdmission, Self::Admitted, Self::Handler];
+
+    /// The fixed `snake_case` literal this mark is recorded as.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PreAdmission => "pre_admission",
+            Self::Admitted => "admitted",
+            Self::Handler => "handler",
+        }
+    }
+
     const fn from_u8(value: u8) -> Self {
         match value {
             0 => Self::PreAdmission,
@@ -312,6 +330,8 @@ struct Failure {
     status: u16,
     latency_ms: u64,
     stage: &'static str,
+    /// How far the request got, on an unrecorded failure only.
+    reached: Option<&'static str>,
     error_class: &'static str,
     cause_kind: &'static str,
     query_id: Option<u64>,
@@ -344,6 +364,7 @@ pub async fn failure_observer(mut request: Request, next: Next) -> Response {
 
     let status = response.status();
     if status.is_server_error() {
+        let stage = record.stage();
         let (error_class, cause_kind) = record
             .cause()
             .map_or(("unknown", "none"), |(class, cause)| {
@@ -355,7 +376,8 @@ pub async fn failure_observer(mut request: Request, next: Next) -> Response {
             route,
             status: status.as_u16(),
             latency_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-            stage: record.stage().as_str(),
+            stage: stage.as_str(),
+            reached: (stage == FailureStage::Unrecorded).then(|| record.progress().as_str()),
             error_class,
             cause_kind,
             query_id: record.query_id.get().copied(),
@@ -388,6 +410,7 @@ fn emit(f: &Failure) {
             status = f.status,
             latency_ms = f.latency_ms,
             stage = f.stage,
+            reached = f.reached,
             error_class = f.error_class,
             cause_kind = f.cause_kind,
             query_id = f.query_id,
@@ -404,6 +427,7 @@ fn emit(f: &Failure) {
             status = f.status,
             latency_ms = f.latency_ms,
             stage = f.stage,
+            reached = f.reached,
             error_class = f.error_class,
             cause_kind = f.cause_kind,
             query_id = f.query_id,
@@ -420,6 +444,7 @@ fn emit(f: &Failure) {
             status = f.status,
             latency_ms = f.latency_ms,
             stage = f.stage,
+            reached = f.reached,
             error_class = f.error_class,
             cause_kind = f.cause_kind,
             query_id = f.query_id,
@@ -436,6 +461,7 @@ fn emit(f: &Failure) {
             status = f.status,
             latency_ms = f.latency_ms,
             stage = f.stage,
+            reached = f.reached,
             error_class = f.error_class,
             cause_kind = f.cause_kind,
             query_id = f.query_id,
@@ -459,6 +485,22 @@ mod tests {
                 literal.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
                 "{literal} is not snake_case"
             );
+        }
+    }
+
+    #[test]
+    fn progress_marks_are_a_closed_snake_case_set() {
+        let literals: Vec<_> = Progress::ALL.iter().map(|p| p.as_str()).collect();
+        let unique: std::collections::HashSet<_> = literals.iter().collect();
+        assert_eq!(unique.len(), literals.len(), "duplicate progress literal");
+        for literal in literals {
+            assert!(
+                literal.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "{literal} is not snake_case"
+            );
+        }
+        for progress in Progress::ALL {
+            assert_eq!(Progress::from_u8(progress as u8), progress);
         }
     }
 

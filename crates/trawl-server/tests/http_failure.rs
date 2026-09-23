@@ -35,7 +35,7 @@ use trawl_server::ingest::wal::WalWriter;
 use trawl_server::pool::seam::{INJECTED_PANIC_PAYLOAD, Seam};
 use trawl_server::state::HttpConfig;
 use trawl_server::telemetry::{self, LogSinks, WalHandle, WalLayer};
-use trawl_server::transport::failure::{FAILURE_TARGET, UNMETERED_FAILURE_TARGET};
+use trawl_server::transport::failure::{FAILURE_TARGET, UNMETERED_FAILURE_TARGET, mark_handler};
 use trawl_server::transport::http::with_edge_layers;
 
 const ENV: &str = "default";
@@ -263,7 +263,10 @@ async fn panicking_handler() -> StatusCode {
     panic!("{HANDLER_PANIC_SENTINEL}")
 }
 
-/// Test routes under the production edge layers.
+/// Test routes under the production edge layers. Every route but
+/// `/bare-unmarked` is marked the way production marks its handlers;
+/// `/bare-unmarked` is added after the marker, so a 5xx from it never got
+/// past admission.
 fn edge_app() -> Router {
     let app = Router::new()
         .route("/bare", any(|| async { StatusCode::INTERNAL_SERVER_ERROR }))
@@ -279,7 +282,12 @@ fn edge_app() -> Router {
             "/items/{id}",
             get(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
         )
-        .route("/panic", get(panicking_handler));
+        .route("/panic", get(panicking_handler))
+        .route_layer(axum::middleware::from_fn(mark_handler))
+        .route(
+            "/bare-unmarked",
+            get(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+        );
     with_edge_layers(app, &http_config())
 }
 
@@ -352,6 +360,7 @@ async fn duckdb_failure_names_request_route_stage_cause_and_query_id() {
     assert_eq!(failure["route"], "/api/v1/query");
     assert_eq!(failure["status"], 500);
     assert_eq!(failure["stage"], "handler_error");
+    assert!(failure.get("reached").is_none(), "{failure}");
     assert_eq!(failure["error_class"], "database");
     assert_eq!(failure["cause_kind"], "duckdb_failure");
     assert!(failure["latency_ms"].is_number(), "{failure}");
@@ -380,7 +389,8 @@ async fn duckdb_failure_names_request_route_stage_cause_and_query_id() {
 // -- AC2 ------------------------------------------------------------------------
 
 /// A 5xx whose producer recorded nothing still emits one `http_failure`,
-/// with the request id, the route template, and the stage that says so.
+/// with the request id, the route template, the stage that says so, and
+/// how far the request got: here, the handler.
 #[tokio::test]
 async fn a_bare_500_is_logged_as_unrecorded() {
     let response = edge_call(Request::get("/bare").body(Body::empty()).unwrap()).await;
@@ -406,10 +416,34 @@ async fn a_bare_500_is_logged_as_unrecorded() {
         "{line}"
     );
     assert_eq!(field(line, "cause_kind").as_deref(), Some("none"), "{line}");
+    assert_eq!(field(line, "reached").as_deref(), Some("handler"), "{line}");
     assert_eq!(field(line, "query_id"), None, "{line}");
 
     // Unmetered: logged, not persisted (the cap is a later concern).
     assert!(wal_failures_for(&request_id).is_empty());
+}
+
+/// An unrecorded 5xx from a route no marker reached says so: it never got
+/// past admission.
+#[tokio::test]
+async fn an_unrecorded_500_before_the_handler_reached_pre_admission() {
+    let response = edge_call(Request::get("/bare-unmarked").body(Body::empty()).unwrap()).await;
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let request_id = edge_request_id(&response);
+
+    let lines = stdout_failures_for(&request_id);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    let line = &lines[0];
+    assert_eq!(
+        field(line, "stage").as_deref(),
+        Some("unrecorded"),
+        "{line}"
+    );
+    assert_eq!(
+        field(line, "reached").as_deref(),
+        Some("pre_admission"),
+        "{line}"
+    );
 }
 
 // -- AC3 ------------------------------------------------------------------------
@@ -437,6 +471,11 @@ async fn a_caught_handler_panic_records_the_panic_stage() {
     assert_eq!(level(line), "ERROR", "{line}");
     assert_eq!(field(line, "route").as_deref(), Some("/panic"), "{line}");
     assert_eq!(field(line, "stage").as_deref(), Some("panicked"), "{line}");
+    assert_eq!(
+        field(line, "reached"),
+        None,
+        "only unrecorded events: {line}"
+    );
     assert_eq!(
         field(line, "error_class").as_deref(),
         Some("panic"),
@@ -592,6 +631,7 @@ async fn a_health_503_is_one_unmetered_warn_failure() {
     assert!(line.contains(UNMETERED_FAILURE_TARGET), "{line}");
     assert_eq!(field(line, "route").as_deref(), Some("/api/v1/health"));
     assert_eq!(field(line, "stage").as_deref(), Some("unrecorded"));
+    assert_eq!(field(line, "reached").as_deref(), Some("handler"));
     let peer = field(line, "peer_addr").expect("an unmetered failure names its peer");
     assert!(peer.starts_with("127.0.0.1:"), "{line}");
     assert!(wal_failures_for(&request_id).is_empty());
