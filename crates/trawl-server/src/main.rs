@@ -908,6 +908,10 @@ struct Tracing {
 ///
 /// When `monitor_active` is true, the stdout `fmt::layer()` is omitted
 /// to avoid corrupting the TUI with interleaved log output.
+///
+/// Once the subscriber is installed, replaces the panic hook with one that
+/// logs a panic's location and never its payload
+/// ([`telemetry::install_panic_hook`]).
 fn init_tracing(
     config: &Config,
     monitor_active: bool,
@@ -943,6 +947,7 @@ fn init_tracing(
         },
     );
     subscriber.init();
+    telemetry::install_panic_hook();
 
     Tracing {
         file_log: file_log_path

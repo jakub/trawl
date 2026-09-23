@@ -203,7 +203,8 @@ pub const PREAUTH_TRANSPORT_TARGET: &str = "preauth.transport";
 pub const UNMETERED_POLICY_TARGET: &str = "trawl_server::policy::unmetered";
 
 /// Targets emitted from request handling that no per-key rate limiter has
-/// metered: logged, never persisted as `service=trawld` telemetry.
+/// metered, and the panic diagnostic: logged, never persisted as
+/// `service=trawld` telemetry.
 ///
 /// fleet-auth's bearer shell warns on every missing or malformed header and
 /// every invalid or revoked key, and reports keystore trouble under
@@ -239,18 +240,61 @@ pub const UNMETERED_POLICY_TARGET: &str = "trawl_server::policy::unmetered";
 /// under [`UNMETERED_FAILURE_CAP_PER_MINUTE`] instead of without a bound
 /// (ADR-0040).
 ///
+/// [`PANIC_TARGET`] is here for a different reason. The panic diagnostic
+/// says where a panic happened, on stdout only; the caught request's own
+/// failure event is the persisted record (ADR-0040).
+///
 /// Matching is by target segment, so `fleet_auth` covers
 /// `fleet_auth::middleware` but never a `fleet_authority` target — and
 /// `trawl_server::policy::unmetered` excludes only itself and its own
 /// descendants, never `trawl_server::policy`.
 ///
 /// [`UNMETERED_FAILURE_TARGET`]: crate::transport::failure::UNMETERED_FAILURE_TARGET
-pub const UNMETERED_TARGETS: [&str; 4] = [
+pub const UNMETERED_TARGETS: [&str; 5] = [
     "fleet_auth",
     "auth.backend",
     PREAUTH_TRANSPORT_TARGET,
     UNMETERED_POLICY_TARGET,
+    PANIC_TARGET,
 ];
+
+/// Target of the panic diagnostic [`install_panic_hook`] emits. A
+/// sub-target of `trawl_server`, so [`DEFAULT_LOG_FILTER`] keeps it on
+/// stdout with no directive of its own, and in [`UNMETERED_TARGETS`], so
+/// it never reaches the WAL.
+pub const PANIC_TARGET: &str = "trawl_server::panic";
+
+/// Replace the process panic hook with one that logs where a panic
+/// happened and never what it said (ADR-0040).
+///
+/// The default hook prints the payload to stderr, and a payload can hold
+/// anything its format string was given: generated SQL, event values, the
+/// caller's DSL, file paths. This hook emits one ERROR event on
+/// [`PANIC_TARGET`] with the source file, line and column and the thread's
+/// name, and nothing else. It does not chain the previous hook, which
+/// would print the payload after all. Call it once the subscriber is
+/// installed, so the event has somewhere to go.
+///
+/// The event is a root (`parent: None`): the request span it may fire
+/// inside would lend it the raw path and user agent. The WAL layer refuses
+/// the target before taking any lock of its own, so a panic inside that
+/// layer cannot deadlock on its way out.
+pub fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let location = info.location();
+        let thread = std::thread::current();
+        tracing::error!(
+            target: PANIC_TARGET,
+            parent: None,
+            event_type = "panic",
+            file = location.map(std::panic::Location::file),
+            line = location.map(std::panic::Location::line),
+            column = location.map(std::panic::Location::column),
+            thread = thread.name().unwrap_or("<unnamed>"),
+            "panicked"
+        );
+    }));
+}
 
 /// How many unmetered failure events ([`UNMETERED_FAILURE_TARGET`]) the WAL
 /// layer persists per fixed one-minute window, across the whole process
@@ -1642,6 +1686,9 @@ mod tests {
         // request forever.
         assert!(!is_persisted_target(UNMETERED_POLICY_TARGET));
         assert!(!is_persisted_target("trawl_server::policy::unmetered::x"));
+        // The panic diagnostic is stdout-only; the caught request's failure
+        // event is the persisted record.
+        assert!(!is_persisted_target(PANIC_TARGET));
         // Prefix matching is per segment, not per byte.
         assert!(is_persisted_target("fleet_authority"));
         assert!(is_persisted_target("fleet_auth_shim::x"));
