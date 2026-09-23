@@ -101,7 +101,7 @@ function makeServerCert() {
 let pinnedCa;
 const ca = () => (pinnedCa ??= fs.readFileSync(tlsCert));
 let sharedAgent;
-const agent = () => (sharedAgent ??= new https.Agent({ keepAlive: true, maxSockets: 32, ca: ca() }));
+const agent = () => (sharedAgent ??= new https.Agent({ keepAlive: true, maxSockets: 32, ca: ca(), rejectUnauthorized: true }));
 function request(base, route, { token, method = 'GET', body, ndjson, timeout = 40000 } = {}) {
   const encoded = ndjson ?? (body === undefined ? undefined : JSON.stringify(body));
   return new Promise((resolve) => {
@@ -252,11 +252,13 @@ async function setup({ seed = true } = {}) {
   for (const bin of ['trawld', 'fleet-admin', 'deps/libduckdb.so']) assert.ok(fs.existsSync(path.join(release, bin)), `missing ${release}/${bin}: build first`);
   fs.mkdirSync(path.join(stateDir, 'logs'), { recursive: true, mode: 0o700 });
   fs.chmodSync(stateDir, 0o700);
-  makeServerCert();
   const container = `trawl-i235-${randomBytes(6).toString('hex')}`;
   const password = randomBytes(24).toString('hex');
   const st = { container, created: new Date().toISOString() };
+  // State first, so teardown can find and remove everything after this,
+  // the generated key included.
   saveState(st);
+  try { makeServerCert(); } catch (e) { fs.rmSync(tlsDir, { recursive: true, force: true }); throw e; }
   const envFile = path.join(stateDir, 'pg.env');
   fs.writeFileSync(envFile, `POSTGRES_USER=h\nPOSTGRES_PASSWORD=${password}\nPOSTGRES_DB=fleet\n`, { mode: 0o600 });
   docker('run', '--detach', '--name', container, '--label', 'trawl.issue-235-harness=1', '--publish', '127.0.0.1::5432',
@@ -322,7 +324,8 @@ async function setup({ seed = true } = {}) {
 
 // The target of one formatted event: after zero or more `name{fields}:`
 // span segments (each optionally followed by whitespace) comes
-// `target: `. Linear: each segment is found with indexOf, and the target
+// `target: `. Linear: each character of a segment is scanned once, a `}:`
+// inside a quoted field value does not end the segment, and the target
 // is tried once at each segment boundary, preferring the most segments.
 const TARGET = /[\w:.]+: /y;
 function eventTarget(rest) {
@@ -336,7 +339,14 @@ function eventTarget(rest) {
     let k = pos;
     while (k < open && !/\s/.test(rest[k])) k++;
     if (k < open) break;
-    const close = rest.indexOf('}:', open + 1);
+    // The first `}:` after it that is not inside a quoted field value
+    // (tracing quotes Debug strings, with backslash escapes).
+    let close = -1;
+    for (let j = open + 1; j < rest.length - 1; j++) {
+      if (rest[j] === '"') {
+        for (j++; j < rest.length && rest[j] !== '"'; j++) if (rest[j] === '\\') j++;
+      } else if (rest[j] === '}' && rest[j + 1] === ':') { close = j; break; }
+    }
     if (close < 0) break;
     pos = close + 2;
     while (pos < rest.length && /\s/.test(rest[pos])) pos++;
@@ -409,7 +419,7 @@ async function scenario(id, minutes, maxQueries) {
     while (!stop.done) {
       sse.connects++;
       await new Promise(resolve => {
-        const req = https.request(`${base}/api/v1/stream?query=${encodeURIComponent(s.sse)}`, { headers: { authorization: `Bearer ${st.reader}`, accept: 'text/event-stream' }, agent: false, ca: ca() }, r => {
+        const req = https.request(`${base}/api/v1/stream?query=${encodeURIComponent(s.sse)}`, { headers: { authorization: `Bearer ${st.reader}`, accept: 'text/event-stream' }, agent: false, ca: ca(), rejectUnauthorized: true }, r => {
           sse.statuses[r.statusCode] = (sse.statuses[r.statusCode] || 0) + 1;
           let buf = '';
           r.on('data', c => { buf += c; let i; while ((i = buf.indexOf('\n\n')) >= 0) { const frame = buf.slice(0, i); buf = buf.slice(i + 2); const name = frame.match(/^event:[ \t]*(\S+)/m)?.[1] ?? 'message'; sse.byName[name] = (sse.byName[name] || 0) + 1; if (name === 'data' && /^data:/m.test(frame)) sse.events++; } });
@@ -575,30 +585,43 @@ async function restartProbe() {
 
 // A short check of the plumbing against a real trawld: a few authenticated
 // queries through request() and one SSE connect, both on the pinned CA.
+// Node's codes for a certificate chain it could not verify: what the
+// negative control must fail with, rather than any connection error.
+const CERT_VERIFY_CODES = new Set(['DEPTH_ZERO_SELF_SIGNED_CERT', 'SELF_SIGNED_CERT_IN_CHAIN', 'UNABLE_TO_VERIFY_LEAF_SIGNATURE',
+  'UNABLE_TO_GET_ISSUER_CERT', 'UNABLE_TO_GET_ISSUER_CERT_LOCALLY', 'CERT_UNTRUSTED', 'CERT_SIGNATURE_FAILURE']);
+
+// A short check of the plumbing against a real trawld: a few authenticated
+// queries through request() and one SSE connect, both on the pinned CA,
+// and a control request without the CA that must fail verification.
+// Exits non-zero when any check fails.
 async function smoke() {
   const st = loadState();
+  const failures = [];
+  const check = (ok, line) => { console.log(`${ok ? 'ok  ' : 'FAIL'} ${line}`); if (!ok) failures.push(line); };
   const { child, base } = await startTrawld(st, 'smoke', { compaction: 300 });
   try {
     for (const q of ['last=15m service=coredns | head 20', 'service=trawld last=15m | stats count() as n', 'last=1h | head 1']) {
       const r = await request(base, '/api/v1/query', { token: st.reader, method: 'POST', body: { query: q } });
-      console.log(`query ${JSON.stringify(q)}: ${r.status}${r.incomplete ? ' incomplete' : ''}${r.error ? ` ${r.error}` : ''}`);
+      check(r.status === 200 && !r.incomplete, `query ${JSON.stringify(q)}: ${r.status}${r.incomplete ? ' incomplete' : ''}${r.error ? ` ${r.error}` : ''}`);
     }
     const sse = await new Promise(resolve => {
-      const req = https.request(`${base}/api/v1/stream?query=${encodeURIComponent('service=coredns')}`, { headers: { authorization: `Bearer ${st.reader}`, accept: 'text/event-stream' }, agent: false, ca: ca() }, r => {
-        resolve(`${r.statusCode} ${r.headers['content-type']}`); req.destroy();
+      const req = https.request(`${base}/api/v1/stream?query=${encodeURIComponent('service=coredns')}`, { headers: { authorization: `Bearer ${st.reader}`, accept: 'text/event-stream' }, agent: false, ca: ca(), rejectUnauthorized: true }, r => {
+        resolve({ status: r.statusCode, type: r.headers['content-type'] }); req.destroy();
       });
-      req.on('error', e => resolve(`error ${e.message}`));
+      req.on('error', e => resolve({ status: 0, error: e.message }));
       req.end();
     });
-    console.log(`sse: ${sse}`);
-    // Negative control: without the pinned CA the handshake must fail.
+    check(sse.status === 200 && /^text\/event-stream\b/.test(sse.type ?? ''), `sse: ${sse.status} ${sse.type ?? sse.error}`);
+    // Negative control: the same server without the pinned CA.
     const unpinned = await new Promise(resolve => {
-      const req = https.request(`${base}/api/v1/health`, { agent: false }, r => { resolve(`${r.statusCode} (validation did not run)`); req.destroy(); });
-      req.on('error', e => resolve(`refused: ${e.code || e.message}`));
+      const req = https.request(`${base}/api/v1/health`, { agent: false, rejectUnauthorized: true }, r => { resolve({ response: r.statusCode }); req.destroy(); });
+      req.on('error', e => resolve({ code: e.code, message: e.message }));
       req.end();
     });
-    console.log(`without the pinned CA: ${unpinned}`);
+    check(CERT_VERIFY_CODES.has(unpinned.code), `without the pinned CA: ${unpinned.response !== undefined ? `HTTP ${unpinned.response} (validation did not refuse)` : `refused: ${unpinned.code ?? unpinned.message}`}`);
   } finally { await stopTrawld(st, child); }
+  if (failures.length) throw new Error(`smoke failed ${failures.length} check(s)`);
+  console.log('smoke passed');
 }
 
 async function teardown() {
@@ -710,7 +733,7 @@ function report() {
   // The certificate paths are harness plumbing, and the recorded run
   // predates them (trawld generated its own certificate then), so the
   // printed config leaves them out.
-  out.push('<details><summary>trawld config (scenario f; other scenarios change only the knobs above)</summary>', '', '```toml', config(SCENARIOS.f, 'scenario-f').replaceAll(stateDir, '$HARNESS_DIR').split('\n').filter(l => !l.startsWith('tls_')).join('\n').trimEnd(), '```', '', '</details>', '');
+  out.push('<details><summary>trawld config excerpt (scenario f, TLS certificate paths omitted; other scenarios change only the knobs above)</summary>', '', '```toml', config(SCENARIOS.f, 'scenario-f').replaceAll(stateDir, '$HARNESS_DIR').split('\n').filter(l => !l.startsWith('tls_')).join('\n').trimEnd(), '```', '', '</details>', '');
   const probePath = path.join(resultsDir, 'restart-probe.json');
   if (fs.existsSync(probePath)) {
     const p = JSON.parse(fs.readFileSync(probePath, 'utf8'));
@@ -726,6 +749,10 @@ function report() {
 }
 
 const [cmd, ...rest] = process.argv.slice(2);
+if (cmd !== 'report' && process.env.NODE_TLS_REJECT_UNAUTHORIZED === '0') {
+  console.error('NODE_TLS_REJECT_UNAUTHORIZED=0 would disable certificate validation: unset it');
+  process.exit(2);
+}
 const opt = (n, d) => { const i = rest.indexOf(`--${n}`); return i >= 0 ? Number(rest[i + 1]) : d; };
 try {
   if (cmd === 'setup' && rest.includes('--no-seed')) await setup({ seed: false });

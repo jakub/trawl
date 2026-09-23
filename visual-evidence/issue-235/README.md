@@ -41,7 +41,7 @@ Limits of this record:
 - The harness counts 5xx from HTTP status, not from logs, so a missed log line cannot hide a 5xx. It parses `http_failure` from stdout with the same parser that reads `compaction_complete`.
 - Duration includes the wait for events carried over from the previous scenario (see the finding below): c 5 s, e 253 s, g 10 s.
 
-<details><summary>trawld config (scenario f; other scenarios change only the knobs above)</summary>
+<details><summary>trawld config excerpt (scenario f, TLS certificate paths omitted; other scenarios change only the knobs above)</summary>
 
 ```toml
 [server]
