@@ -229,8 +229,10 @@ To trace one failure:
 
 Not every failure event persists:
 
-- A metered failure event always persists. The per-key rate limiter already
-  bounds how many of them one client can cause.
+- A metered failure event has no rate cap of its own. The per-key rate limiter
+  already bounds how many of them one client can cause. Like every
+  self-telemetry event, it persists only if the log filter keeps it and the
+  telemetry buffer budget has room for it.
 - An unmetered 5xx persists under one process-wide cap of 60 events per
   minute. The cap is fixed in code and has no setting. Past the cap, the event
   goes to stdout only, and `trawl_telemetry_events_dropped_total` counts it under
