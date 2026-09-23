@@ -15,7 +15,17 @@ set -euo pipefail
 here="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
 root="$(CDPATH= cd -- "$here/../.." && pwd -P)"
 harness="$here/harness.mjs"
-trap 'node "$harness" teardown' EXIT
+# A teardown that cannot verify removal keeps its state and fails the run,
+# so a retry of `node harness.mjs teardown` can finish the cleanup.
+finish() {
+    local rc=$?
+    if ! node "$harness" teardown; then
+        echo "teardown failed: rerun node $harness teardown" >&2
+        rc=1
+    fi
+    exit "$rc"
+}
+trap finish EXIT
 
 first="${1:-}"
 if [[ -z "$first" ]]; then

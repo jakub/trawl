@@ -92,11 +92,16 @@ function request(base, route, { token, method = 'GET', body, ndjson, timeout = 4
       headers['content-type'] = ndjson ? 'application/x-ndjson' : 'application/json';
       headers['content-length'] = Buffer.byteLength(encoded);
     }
+    // A response whose headers arrived keeps its status and request id
+    // even when its body is cut: `incomplete` marks it, and `status` 0
+    // means no response arrived at all.
     const req = https.request(base + route, { method, headers, agent }, res => {
       const chunks = [];
+      const got = () => ({ status: res.statusCode, requestId: res.headers['x-request-id'], text: Buffer.concat(chunks).toString() });
       res.on('data', c => chunks.push(c));
-      res.on('error', e => resolve({ status: 0, error: e.message }));
-      res.on('end', () => resolve({ status: res.statusCode, requestId: res.headers['x-request-id'], text: Buffer.concat(chunks).toString() }));
+      res.on('error', e => resolve({ ...got(), incomplete: true, error: e.message }));
+      res.on('aborted', () => resolve({ ...got(), incomplete: true, error: 'response aborted' }));
+      res.on('end', () => resolve(res.complete ? got() : { ...got(), incomplete: true, error: 'response ended early' }));
     });
     req.setTimeout(timeout, () => req.destroy(new Error('client deadline')));
     req.on('error', e => resolve({ status: 0, error: e.message }));
@@ -139,6 +144,7 @@ async function stopTrawld(st, child) {
   for (let i = 0; i < 200 && alive(); i++) await delay(100);
   if (alive()) process.kill(pid, 'SIGKILL');
   for (let i = 0; i < 50 && alive(); i++) await delay(100);
+  if (alive()) return; // leave the pid recorded so teardown can report it
   if (child && child.exitCode === null) await new Promise(r => child.once('exit', r));
   delete st.trawldPid; saveState(st);
 }
@@ -167,7 +173,7 @@ function sentBetween(fromMs, toMs) { let n = 0; for (const [s, c] of sentPerSec)
 async function ingest(base, st, events, stats, retry = false) {
   for (let attempt = 0; ; attempt++) {
     const r = await request(base, '/api/v1/ingest', { token: st.writer, method: 'POST', ndjson: events.map(e => JSON.stringify(e)).join('\n') + '\n' });
-    if (r.status === 200) { noteSent(events); if (stats) stats.accepted += events.length; return r; }
+    if (r.status === 200 && !r.incomplete) { noteSent(events); if (stats) stats.accepted += events.length; return r; }
     if (stats) { stats.failed++; stats.statuses[r.status] = (stats.statuses[r.status] || 0) + 1; }
     if (!retry || attempt > 20) return r;
     await delay(500 * (attempt + 1));
@@ -249,7 +255,18 @@ async function setup() {
   st.writer = admin('keys', 'create', '--name', 'h-ingest', '--kind', 'service', '--role', 'h-ingest', '--expires', '12h');
   saveState(st);
   // Seed: a coredns hour file near the incident's 370,488 rows and a
-  // machined one, compacted with the 5 s interval.
+  // machined one, compacted with the 5 s interval. Compaction names the
+  // output hour by wall clock, so a seed that straddles a UTC hour splits
+  // into two files and never reaches the thresholds below. Start with at
+  // least SEED_MARGIN_MS left in the hour, and fail fast on a split.
+  const SEED_MARGIN_MS = 8 * 60 * 1000;
+  const hourMs = 3600 * 1000;
+  const left = hourMs - (Date.now() % hourMs);
+  if (left < SEED_MARGIN_MS) {
+    console.error(`waiting ${Math.ceil(left / 1000) + 5} s for the next UTC hour so the seed lands in one hour file`);
+    await delay(left + 5000);
+  }
+  const seedHour = Math.floor(Date.now() / hourMs);
   const { child, base } = await startTrawld(st, 'seed', { compaction: 5 });
   const stats = { accepted: 0, failed: 0, statuses: {} };
   const now = Date.now();
@@ -269,6 +286,7 @@ async function setup() {
     await delay(1000);
     const done = compactionStats(logFile);
     if ((done.coredns?.maxRows ?? 0) >= 370000 && (done.machined?.maxRows ?? 0) >= 150000) break;
+    assert.equal(Math.floor(Date.now() / hourMs), seedHour, 'the seed crossed a UTC hour boundary and split its hour files: run teardown, then setup again');
     assert.ok(i < 599, 'seed compaction deadline');
   }
   await stopTrawld(st, child);
@@ -327,7 +345,7 @@ async function scenario(id, minutes, maxQueries) {
   const started = Date.now();
   const res = { id, title: s.title, config: { compaction_interval_secs: s.compaction, coredns_ev_per_s: s.coredns ?? 0, machined_ev_per_s: s.machined ?? 0,
     sse: s.sse ?? null, nets: !!s.nets, pg_pause: !!s.pause, query_concurrency: CONCURRENCY, bound_minutes: minutes, bound_queries: maxQueries },
-    started: new Date(started).toISOString(), queries: 0, statuses: {}, fiveXX: [], contentFailures: 0, owedFull: 0, contentSamples: [], transportErrors: 0, latencyMs: [] };
+    started: new Date(started).toISOString(), queries: 0, statuses: {}, fiveXX: [], contentFailures: 0, owedFull: 0, contentSamples: [], transportErrors: 0, inconclusive: 0, inconclusiveSamples: [], latencyMs: [] };
   const ingestStats = { accepted: 0, failed: 0, statuses: {} };
   const bg = [];
   if (s.coredns) bg.push(ingestLoop(base, st, s.coredns, (ts) => coredns(ts, s.sse === 'service=coredns rcode=SERVFAIL' ? Math.random() < SERVFAIL_FRACTION : false), ingestStats, stop));
@@ -390,7 +408,7 @@ async function scenario(id, minutes, maxQueries) {
     for (;;) {
       const r = await request(base, '/api/v1/query', { token: st.reader, method: 'POST', body: { query: `service=coredns earliest="${iso(from)}" latest="${iso(to)}" | stats count() as n` } });
       let n = -r.status;
-      if (r.status === 200) { const b = JSON.parse(r.text); const rows = b.result?.rows ?? b.rows; n = rows.length ? Number(rows[0][0]) : 0; }
+      if (r.status === 200 && !r.incomplete) { const b = JSON.parse(r.text); const rows = b.result?.rows ?? b.rows; n = rows.length ? Number(rows[0][0]) : 0; }
       sv.firstCount ??= n;
       if (n >= sv.owed) { sv.satisfied = true; break; }
       if (Date.now() > bound) break;
@@ -410,8 +428,11 @@ async function scenario(id, minutes, maxQueries) {
       const recvAt = Date.now();
       res.latencyMs.push(performance.now() - t0);
       res.statuses[r.status] = (res.statuses[r.status] || 0) + 1;
+      // A known 5xx counts even with a cut body. Anything else without a
+      // complete response is inconclusive: its content was never checked.
+      if (r.status >= 500) { res.fiveXX.push({ at: new Date(sentAt).toISOString(), status: r.status, requestId: r.requestId, latencyMs: recvAt - sentAt, incomplete: !!r.incomplete, body: r.text.slice(0, 300) }); continue; }
       if (r.status === 0) { res.transportErrors++; continue; }
-      if (r.status >= 500) { res.fiveXX.push({ at: new Date(sentAt).toISOString(), status: r.status, requestId: r.requestId, latencyMs: recvAt - sentAt, body: r.text.slice(0, 300) }); continue; }
+      if (r.incomplete) { res.inconclusive++; if (res.inconclusiveSamples.length < 10) res.inconclusiveSamples.push({ at: new Date(sentAt).toISOString(), status: r.status, requestId: r.requestId, error: r.error }); continue; }
       if (r.status !== 200) continue;
       const { problems: p, owed } = checkResult(r, sentAt, recvAt);
       if (owed === 20) res.owedFull++;
@@ -502,11 +523,33 @@ async function restartProbe() {
 async function teardown() {
   if (!fs.existsSync(statePath)) { console.log('no state'); return; }
   const st = loadState();
+  const pid = st.trawldPid;
   await stopTrawld(st);
+  const problems = [];
+  if (pid) { try { if (fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').includes('trawld')) problems.push(`trawld ${pid} still running`); } catch { /* gone */ } }
   try { docker('unpause', st.container); } catch { /* not paused */ }
-  try { docker('rm', '--force', '--volumes', st.container); } catch (e) { console.log(`container: ${e.message.split('\n')[0]}`); }
+  try { docker('rm', '--force', '--volumes', st.container); } catch (e) { problems.push(`docker rm: ${e.message.split('\n')[0]}`); }
+  let remaining;
+  try { remaining = docker('ps', '--all', '--quiet', '--filter', `name=^${st.container}$`); } catch (e) { remaining = `docker ps failed: ${e.message.split('\n')[0]}`; }
+  if (remaining) problems.push(`container ${st.container} still present`);
+  if (problems.length) {
+    // Keep the state (container name, pid) so a retry can finish.
+    throw new Error(`teardown incomplete, state kept in ${stateDir}: ${problems.join('; ')}`);
+  }
   fs.rmSync(stateDir, { recursive: true, force: true });
   console.log(`removed ${st.container} and ${stateDir}`);
+}
+
+const INCIDENT_ROWS = 370488;
+// Records written before the harness split cut bodies out carry no
+// `inconclusive` field; that harness counted a cut response as a
+// transport error or content-checked its partial body, so none was left
+// unclassified: an absent field means zero.
+const inconclusive = r => r.inconclusive ?? 0;
+function outcomeOf(r) {
+  const bad = [r.fiveXX.length && `${r.fiveXX.length} 5xx`, r.contentFailures && `${r.contentFailures} content failures`,
+    r.transportErrors && `${r.transportErrors} transport errors`, inconclusive(r) && `${inconclusive(r)} inconclusive`].filter(Boolean);
+  return bad.length ? `**${bad.join(', ')}**` : 'clean';
 }
 
 function report() {
@@ -515,12 +558,15 @@ function report() {
   const out = [];
   out.push('# #235: bounded search for the original 500', '');
   out.push(`Generated by \`node visual-evidence/issue-235/harness.mjs report\` from \`results/*.json\`. The runs used a release \`trawld\` built from commit \`${commit}\`, with disposable \`postgres:18\` in Docker and a private data directory.`, '');
+  const provenance = path.join(resultsDir, 'provenance.md');
+  if (fs.existsSync(provenance)) out.push(fs.readFileSync(provenance, 'utf8').trim(), '');
   out.push(`Query: \`${QUERY}\`, ${CONCURRENCY} concurrent loops, back to back. Bound per scenario: 30 minutes or 10,000 queries, whichever comes first.`, '');
   out.push('A content failure is a 200 whose body does not parse, has more than 20 rows, has a non-`coredns` row or a `_time` outside the window, or has fewer rows than the harness had accepted inside the window before it sent the query (capped at 20).', '');
   if (seed) out.push(`Seed: ${seed.accepted} events accepted. The seed built a coredns hour file of ${seed.compaction.coredns?.maxRows} rows and a machined hour file of ${seed.compaction.machined?.maxRows} rows. The incident's hour file had 370,488 rows.`, '');
   out.push('Common config: `internal_telemetry = true`, `daily_rollup` default (true), `max_concurrent_queries` default (nproc), scheduler `poll_interval_secs = 1`, rate limits off (role rpm 1,000,000). Per-scenario knobs are in the table.', '');
-  out.push('| Scenario | Knobs | Queries | Duration | 5xx | Content failures | p50/p95/max ms | Compactions (coredns merged / machined) | Outcome |');
-  out.push('| --- | --- | ---: | ---: | ---: | ---: | --- | --- | --- |');
+  out.push('A response with no status is a transport error. A non-5xx response whose body was cut is inconclusive: its content was never checked. A scenario with either is not clean.', '');
+  out.push('| Scenario | Knobs | Queries | Duration | 5xx | Content failures | Transport errors / inconclusive | p50/p95/max ms | Compactions (coredns merged / machined) | Outcome |');
+  out.push('| --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |');
   const files = fs.existsSync(resultsDir) ? fs.readdirSync(resultsDir).filter(f => /^[a-g]\.json$/.test(f)).sort() : [];
   for (const f of files) {
     const r = JSON.parse(fs.readFileSync(path.join(resultsDir, f), 'utf8'));
@@ -529,8 +575,7 @@ function report() {
       k.sse && `SSE \`${k.sse}\``, k.nets && '5 nets @1m', k.pg_pause && 'pg pause'].filter(Boolean).join(', ');
     const c = r.compaction || {};
     const comp = `${c.coredns ? `${c.coredns.merged}/${c.coredns.runs} (max ${c.coredns.maxRows} rows, ${c.coredns.maxMs} ms)` : '0'} / ${c.machined ? `${c.machined.runs} (max ${c.machined.maxMs} ms)` : '0'}`;
-    const outcome = r.fiveXX.length || r.contentFailures ? `**${r.fiveXX.length} 5xx, ${r.contentFailures} content failures**` : 'no 5xx, content clean';
-    out.push(`| ${r.id}: ${r.title} | ${knobs} | ${r.queries} | ${r.durationS}s | ${r.fiveXX.length} | ${r.contentFailures} | ${r.latency.p50}/${r.latency.p95}/${r.latency.max} | ${comp} | ${outcome} |`);
+    out.push(`| ${r.id}: ${r.title} | ${knobs} | ${r.queries} | ${r.durationS}s | ${r.fiveXX.length} | ${r.contentFailures} | ${r.transportErrors} / ${inconclusive(r)} | ${r.latency.p50}/${r.latency.p95}/${r.latency.max} | ${comp} | ${outcomeOf(r)} |`);
   }
   out.push('');
   for (const f of files) {
@@ -546,6 +591,7 @@ function report() {
     if (r.sse) extra.push(`SSE connects ${r.sse.connects}, statuses ${JSON.stringify(r.sse.statuses)}, data events ${r.sse.events} (${(r.sse.events / (r.durationS / 60)).toFixed(0)}/min)`);
     if (r.netRuns) extra.push(`net runs in window: ${r.netRuns.runs} ${JSON.stringify(r.netRuns.byStatus)}`);
     if (r.pauses) extra.push(`pg pauses: ${r.pauses.count}, ${Math.round(r.pauses.totalMs / 1000)} s total`);
+    if (r.inconclusiveSamples?.length) extra.push(`inconclusive samples: ${JSON.stringify(r.inconclusiveSamples.slice(0, 3))}`);
     if (r.contentSamples.length) extra.push(`content failure samples: ${JSON.stringify(r.contentSamples.slice(0, 3))}`);
     out.push(`- **${r.id}**: ${extra.join('; ')}.`);
   }
@@ -553,18 +599,42 @@ function report() {
   const all = files.map(f => JSON.parse(fs.readFileSync(path.join(resultsDir, f), 'utf8')));
   const total = k => all.reduce((n, r) => n + k(r), 0);
   const fives = total(r => r.fiveXX.length), content = total(r => r.contentFailures);
-  out.push(`**Outcome: ${total(r => r.queries)} queries across ${all.length} scenarios, ${fives} 5xx, ${content} content failures.** ${fives === 0 ? 'The original 500 did not reproduce: original 500 unresolved.' : 'See the per-scenario 5xx records in results/.'}`, '');
-  out.push('Limits of this record:', '');
-  out.push('- The compactions column shows the largest coredns hour file merged in each scenario. The hour file restarts at each UTC hour, so f and g merged smaller files than the incident\'s 370,488 rows. b merged a file of that size, 48 times, while it ran its queries.');
-  out.push('- The 2-8 s pauses in g slowed queries (see the max latency) but never exhausted a pool wait, so g produced no auth-backend 503. The harness counts 5xx from HTTP status, not from logs, so a missed log line could not hide a 5xx. It parses `http_failure` from stdout with the same parser that reads `compaction_complete`.');
-  out.push('- Duration includes the wait for events carried over from the previous scenario (see the finding below).', '');
+  const transport = total(r => r.transportErrors), unsure = total(inconclusive);
+  const clean = all.filter(r => outcomeOf(r) === 'clean').map(r => r.id);
+  let verdict;
+  if (!all.length) verdict = 'No scenario has run.';
+  else if (all.some(r => r.fiveXX.some(x => x.status === 500))) verdict = 'A 500 reproduced: see the per-scenario 5xx records in results/.';
+  else if (fives) verdict = 'No 500 reproduced, but other 5xx did: see the per-scenario 5xx records in results/.';
+  else if (transport || unsure) verdict = 'No 5xx was returned, but some responses were incomplete, so the search is not conclusive for those requests.';
+  else verdict = 'The original 500 did not reproduce: original 500 unresolved.';
+  out.push(`**Outcome: ${total(r => r.queries)} queries across ${all.length} scenarios (${all.map(r => r.id).join(', ') || 'none'}), ${fives} 5xx, ${content} content failures, ${transport} transport errors, ${unsure} inconclusive. Clean: ${clean.join(', ') || 'none'}.** ${verdict}`, '');
+  const limits = [];
+  const fmt = n => n.toLocaleString('en-US');
+  const merged = all.filter(r => r.compaction?.coredns?.merged);
+  if (merged.length) {
+    const at = merged.filter(r => r.compaction.coredns.maxRows >= INCIDENT_ROWS), below = merged.filter(r => r.compaction.coredns.maxRows < INCIDENT_ROWS);
+    const list = rs => rs.map(r => `${r.id} (${fmt(r.compaction.coredns.maxRows)} rows, ${r.compaction.coredns.merged} merge${r.compaction.coredns.merged === 1 ? "" : "s"})`).join(', ');
+    limits.push(`- The compactions column shows the largest coredns hour file merged in each scenario; the file restarts at each UTC hour. At or above the incident's ${fmt(INCIDENT_ROWS)} rows: ${list(at) || 'none'}. Below it: ${list(below) || 'none'}.${all.length > merged.length ? ` No coredns merge: ${all.filter(r => !r.compaction?.coredns?.merged).map(r => r.id).join(', ')}.` : ''}`);
+  }
+  for (const r of all.filter(x => x.pauses)) {
+    const by = {};
+    for (const x of r.fiveXX) by[x.status] = (by[x.status] || 0) + 1;
+    const shapes = Object.keys(r.httpFailureShapes || {}).filter(k => / pre_admission /.test(k));
+    limits.push(`- ${r.id} paused postgres ${r.pauses.count} times, ${Math.round(r.pauses.totalMs / 1000)} s in total; the longest query took ${fmt(r.latency.max)} ms. It returned ${r.fiveXX.length ? `these 5xx: ${JSON.stringify(by)}` : 'no 5xx'}, and ${shapes.length ? `logged pre-admission failures: ${shapes.join('; ')}` : 'logged no pre-admission (auth backend) failure'}.`);
+  }
+  limits.push('- The harness counts 5xx from HTTP status, not from logs, so a missed log line cannot hide a 5xx. It parses `http_failure` from stdout with the same parser that reads `compaction_complete`.');
+  const waited = all.filter(r => (r.startupVisibility?.waitedMs ?? 0) >= 1000);
+  if (waited.length) limits.push(`- Duration includes the wait for events carried over from the previous scenario (see the finding below): ${waited.map(r => `${r.id} ${Math.round(r.startupVisibility.waitedMs / 1000)} s`).join(', ')}.`);
+  out.push('Limits of this record:', '', ...limits, '');
   out.push('<details><summary>trawld config (scenario f; other scenarios change only the knobs above)</summary>', '', '```toml', config(SCENARIOS.f, 'scenario-f').replaceAll(stateDir, '$HARNESS_DIR').trimEnd(), '```', '', '</details>', '');
   const probePath = path.join(resultsDir, 'restart-probe.json');
   if (fs.existsSync(probePath)) {
     const p = JSON.parse(fs.readFileSync(probePath, 'utf8'));
     out.push('## Finding: accepted events are missing from search after a restart', '');
     out.push(`\`harness.mjs restart-probe\` sets \`compaction_interval_secs = ${p.compaction_interval_secs}\`. It ingests ${p.events} events for a fresh service and counts them with \`service=<probe> last=15m | stats count()\`. Before the restart the count is ${p.beforeRestart}. After SIGTERM, ${p.walFilesAfterStop} WAL file still holds the events. After the restart, the count by seconds since startup is ${p.series.map(([t, n]) => `${n} at ${t} s`).join(', ')}. All events are visible after ${p.visibleAfterS} s, when the first compaction completes (${p.compactionAfterRestart.join(', ')}).`, '');
-    out.push('Cause: the hot buffer starts empty (`crates/trawl-server/src/state.rs:645`) and nothing loads the WAL into it. The compaction loop sleeps one interval before its first tick (`crates/trawl-server/src/ingest/compaction.rs:71`), and shutdown stops the loop without a final compaction (`compaction.rs:97-99`). A query in that window gets a 200 with rows missing, not an error. The default interval is 10 s. The same code is at base `ed3a2516`. This is not the #235 500, but the harness hit it: in the first two passes, scenario e returned 3,753 short 200s each time after scenario d restarted trawld. Each scenario now waits until the events carried over from the previous scenario are visible before it starts its loop, and records that wait.', '');
+    out.push('Cause: the hot buffer starts empty (`crates/trawl-server/src/state.rs:645`) and nothing loads the WAL into it. The compaction loop sleeps one interval before its first tick (`crates/trawl-server/src/ingest/compaction.rs:71`), and shutdown stops the loop without a final compaction (`compaction.rs:97-99`). A query in that window gets a 200 with rows missing, not an error. The default interval is 10 s. The same code is at base `ed3a2516`. This is not the #235 500. Each scenario waits until the events carried over from the previous scenario are visible before it starts its loop, and records that wait.', '');
+    const gaps = all.filter(r => r.startupVisibility && r.startupVisibility.firstCount < r.startupVisibility.owed);
+    if (gaps.length) out.push(`The scenario runs show the same gap: ${gaps.map(r => `${r.id} started with ${fmt(r.startupVisibility.firstCount)} of ${fmt(r.startupVisibility.owed)} carried-over events visible, all after ${Math.round(r.startupVisibility.waitedMs / 1000)} s (compaction interval ${r.config.compaction_interval_secs} s)`).join('; ')}.`, '');
   }
   const producers = path.join(here, 'producers.md');
   if (fs.existsSync(producers)) out.push(fs.readFileSync(producers, 'utf8').trimEnd(), '');
