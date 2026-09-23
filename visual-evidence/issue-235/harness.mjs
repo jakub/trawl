@@ -58,6 +58,8 @@ function config(s, name) {
   const t = JSON.stringify;
   return `[server]
 http_addr = "127.0.0.1:0"
+tls_cert_path = ${t(tlsCert)}
+tls_key_path = ${t(tlsKey)}
 max_result_rows = 25000
 shutdown_drain_secs = 3
 [server.rate_limit]
@@ -83,7 +85,23 @@ enabled = false
 }
 
 // ---------------------------------------------------------------- plumbing
-const agent = new https.Agent({ keepAlive: true, rejectUnauthorized: false, maxSockets: 32 });
+// The disposable trawld serves a certificate this harness generates at
+// setup (IP SAN 127.0.0.1, the only host it connects to). Every request
+// trusts exactly that certificate, with validation on.
+const tlsDir = path.join(stateDir, 'tls');
+const tlsCert = path.join(tlsDir, 'cert.pem');
+const tlsKey = path.join(tlsDir, 'key.pem');
+function makeServerCert() {
+  fs.mkdirSync(tlsDir, { recursive: true, mode: 0o700 });
+  execFileSync('openssl', ['req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:prime256v1', '-nodes',
+    '-keyout', tlsKey, '-out', tlsCert, '-days', '2', '-subj', '/CN=trawl-i235-harness',
+    '-addext', 'subjectAltName=IP:127.0.0.1'], { stdio: ['ignore', 'ignore', 'pipe'] });
+  fs.chmodSync(tlsKey, 0o600);
+}
+let pinnedCa;
+const ca = () => (pinnedCa ??= fs.readFileSync(tlsCert));
+let sharedAgent;
+const agent = () => (sharedAgent ??= new https.Agent({ keepAlive: true, maxSockets: 32, ca: ca() }));
 function request(base, route, { token, method = 'GET', body, ndjson, timeout = 40000 } = {}) {
   const encoded = ndjson ?? (body === undefined ? undefined : JSON.stringify(body));
   return new Promise((resolve) => {
@@ -99,7 +117,7 @@ function request(base, route, { token, method = 'GET', body, ndjson, timeout = 4
     // arrived at all.
     let got = null;
     const cut = error => (got ? { ...got(), incomplete: true, error } : { status: 0, error });
-    const req = https.request(base + route, { method, headers, agent }, res => {
+    const req = https.request(base + route, { method, headers, agent: agent() }, res => {
       const chunks = [];
       got = () => ({ status: res.statusCode, requestId: res.headers['x-request-id'], text: Buffer.concat(chunks).toString() });
       res.on('data', c => chunks.push(c));
@@ -229,11 +247,12 @@ function checkResult(r, sentAt, recvAt) {
 }
 
 // ---------------------------------------------------------------- commands
-async function setup() {
+async function setup({ seed = true } = {}) {
   assert.ok(!fs.existsSync(statePath), `${statePath} exists: run teardown first`);
   for (const bin of ['trawld', 'fleet-admin', 'deps/libduckdb.so']) assert.ok(fs.existsSync(path.join(release, bin)), `missing ${release}/${bin}: build first`);
   fs.mkdirSync(path.join(stateDir, 'logs'), { recursive: true, mode: 0o700 });
   fs.chmodSync(stateDir, 0o700);
+  makeServerCert();
   const container = `trawl-i235-${randomBytes(6).toString('hex')}`;
   const password = randomBytes(24).toString('hex');
   const st = { container, created: new Date().toISOString() };
@@ -258,6 +277,7 @@ async function setup() {
   st.reader = admin('keys', 'create', '--name', 'h-reader', '--kind', 'human', '--role', 'h-reader', '--expires', '12h');
   st.writer = admin('keys', 'create', '--name', 'h-ingest', '--kind', 'service', '--role', 'h-ingest', '--expires', '12h');
   saveState(st);
+  if (!seed) { console.log('setup done without a seed'); return; }
   // Seed: a coredns hour file near the incident's 370,488 rows and a
   // machined one, compacted with the 5 s interval. Compaction names the
   // output hour by wall clock, so a seed that straddles a UTC hour splits
@@ -300,6 +320,36 @@ async function setup() {
   console.log(JSON.stringify(st.seed));
 }
 
+// The target of one formatted event: after zero or more `name{fields}:`
+// span segments (each optionally followed by whitespace) comes
+// `target: `. Linear: each segment is found with indexOf, and the target
+// is tried once at each segment boundary, preferring the most segments.
+const TARGET = /[\w:.]+: /y;
+function eventTarget(rest) {
+  const starts = [0];
+  let pos = 0;
+  for (;;) {
+    // `name{`: at least one non-space character, then the first `{`, with
+    // no whitespace between. Each character is scanned once.
+    const open = rest.indexOf('{', pos + 1);
+    if (open < 0) break;
+    let k = pos;
+    while (k < open && !/\s/.test(rest[k])) k++;
+    if (k < open) break;
+    const close = rest.indexOf('}:', open + 1);
+    if (close < 0) break;
+    pos = close + 2;
+    while (pos < rest.length && /\s/.test(rest[pos])) pos++;
+    starts.push(pos);
+  }
+  for (let i = starts.length - 1; i >= 0; i--) {
+    TARGET.lastIndex = starts[i];
+    const m = TARGET.exec(rest);
+    if (m) return m[0].slice(0, -2);
+  }
+  return null;
+}
+
 // trawld's stdout, in tracing-subscriber's default text format (log_file
 // is not opened while internal telemetry is on). Fields only, parsed
 // from `key=value` pairs; quoted values are unquoted.
@@ -316,8 +366,7 @@ function readLog(file) {
       if (v.startsWith('"')) { try { v = JSON.parse(v); } catch { v = v.slice(1, -1); } }
       fields[f[1]] = v;
     }
-    const tm = m[3].match(/^(?:\S+\{.*?\}:\s*)*([\w:.]+): /);
-    out.push({ timestamp: m[1], level: m[2], target: tm ? tm[1] : null, fields, line });
+    out.push({ timestamp: m[1], level: m[2], target: eventTarget(m[3]), fields, line });
   }
   return out;
 }
@@ -360,7 +409,7 @@ async function scenario(id, minutes, maxQueries) {
     while (!stop.done) {
       sse.connects++;
       await new Promise(resolve => {
-        const req = https.request(`${base}/api/v1/stream?query=${encodeURIComponent(s.sse)}`, { headers: { authorization: `Bearer ${st.reader}`, accept: 'text/event-stream' }, agent: false, rejectUnauthorized: false }, r => {
+        const req = https.request(`${base}/api/v1/stream?query=${encodeURIComponent(s.sse)}`, { headers: { authorization: `Bearer ${st.reader}`, accept: 'text/event-stream' }, agent: false, ca: ca() }, r => {
           sse.statuses[r.statusCode] = (sse.statuses[r.statusCode] || 0) + 1;
           let buf = '';
           r.on('data', c => { buf += c; let i; while ((i = buf.indexOf('\n\n')) >= 0) { const frame = buf.slice(0, i); buf = buf.slice(i + 2); const name = frame.match(/^event:[ \t]*(\S+)/m)?.[1] ?? 'message'; sse.byName[name] = (sse.byName[name] || 0) + 1; if (name === 'data' && /^data:/m.test(frame)) sse.events++; } });
@@ -524,6 +573,34 @@ async function restartProbe() {
   console.log(JSON.stringify(out));
 }
 
+// A short check of the plumbing against a real trawld: a few authenticated
+// queries through request() and one SSE connect, both on the pinned CA.
+async function smoke() {
+  const st = loadState();
+  const { child, base } = await startTrawld(st, 'smoke', { compaction: 300 });
+  try {
+    for (const q of ['last=15m service=coredns | head 20', 'service=trawld last=15m | stats count() as n', 'last=1h | head 1']) {
+      const r = await request(base, '/api/v1/query', { token: st.reader, method: 'POST', body: { query: q } });
+      console.log(`query ${JSON.stringify(q)}: ${r.status}${r.incomplete ? ' incomplete' : ''}${r.error ? ` ${r.error}` : ''}`);
+    }
+    const sse = await new Promise(resolve => {
+      const req = https.request(`${base}/api/v1/stream?query=${encodeURIComponent('service=coredns')}`, { headers: { authorization: `Bearer ${st.reader}`, accept: 'text/event-stream' }, agent: false, ca: ca() }, r => {
+        resolve(`${r.statusCode} ${r.headers['content-type']}`); req.destroy();
+      });
+      req.on('error', e => resolve(`error ${e.message}`));
+      req.end();
+    });
+    console.log(`sse: ${sse}`);
+    // Negative control: without the pinned CA the handshake must fail.
+    const unpinned = await new Promise(resolve => {
+      const req = https.request(`${base}/api/v1/health`, { agent: false }, r => { resolve(`${r.statusCode} (validation did not run)`); req.destroy(); });
+      req.on('error', e => resolve(`refused: ${e.code || e.message}`));
+      req.end();
+    });
+    console.log(`without the pinned CA: ${unpinned}`);
+  } finally { await stopTrawld(st, child); }
+}
+
 async function teardown() {
   if (!fs.existsSync(statePath)) { console.log('no state'); return; }
   const st = loadState();
@@ -630,7 +707,10 @@ function report() {
   const waited = all.filter(r => (r.startupVisibility?.waitedMs ?? 0) >= 1000);
   if (waited.length) limits.push(`- Duration includes the wait for events carried over from the previous scenario (see the finding below): ${waited.map(r => `${r.id} ${Math.round(r.startupVisibility.waitedMs / 1000)} s`).join(', ')}.`);
   out.push('Limits of this record:', '', ...limits, '');
-  out.push('<details><summary>trawld config (scenario f; other scenarios change only the knobs above)</summary>', '', '```toml', config(SCENARIOS.f, 'scenario-f').replaceAll(stateDir, '$HARNESS_DIR').trimEnd(), '```', '', '</details>', '');
+  // The certificate paths are harness plumbing, and the recorded run
+  // predates them (trawld generated its own certificate then), so the
+  // printed config leaves them out.
+  out.push('<details><summary>trawld config (scenario f; other scenarios change only the knobs above)</summary>', '', '```toml', config(SCENARIOS.f, 'scenario-f').replaceAll(stateDir, '$HARNESS_DIR').split('\n').filter(l => !l.startsWith('tls_')).join('\n').trimEnd(), '```', '', '</details>', '');
   const probePath = path.join(resultsDir, 'restart-probe.json');
   if (fs.existsSync(probePath)) {
     const p = JSON.parse(fs.readFileSync(probePath, 'utf8'));
@@ -648,10 +728,12 @@ function report() {
 const [cmd, ...rest] = process.argv.slice(2);
 const opt = (n, d) => { const i = rest.indexOf(`--${n}`); return i >= 0 ? Number(rest[i + 1]) : d; };
 try {
-  if (cmd === 'setup') { await setup(); const st = loadState(); fs.mkdirSync(resultsDir, { recursive: true }); fs.writeFileSync(path.join(resultsDir, 'seed.json'), JSON.stringify(st.seed, null, 2) + '\n'); }
+  if (cmd === 'setup' && rest.includes('--no-seed')) await setup({ seed: false });
+  else if (cmd === 'smoke') await smoke();
+  else if (cmd === 'setup') { await setup(); const st = loadState(); fs.mkdirSync(resultsDir, { recursive: true }); fs.writeFileSync(path.join(resultsDir, 'seed.json'), JSON.stringify(st.seed, null, 2) + '\n'); }
   else if (cmd === 'scenario') await scenario(rest[0], opt('minutes', 30), opt('max-queries', 10000));
   else if (cmd === 'teardown') await teardown();
   else if (cmd === 'restart-probe') await restartProbe();
   else if (cmd === 'report') report();
-  else { console.error('usage: harness.mjs setup | scenario <a..g> [--minutes N] [--max-queries N] | report | teardown'); process.exit(2); }
-} finally { agent.destroy(); }
+  else { console.error('usage: harness.mjs setup [--no-seed] | smoke | scenario <a..g> [--minutes N] [--max-queries N] | report | teardown'); process.exit(2); }
+} finally { sharedAgent?.destroy(); }
