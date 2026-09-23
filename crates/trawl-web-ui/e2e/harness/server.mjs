@@ -81,8 +81,11 @@ if (!fs.existsSync(path.join(BUILD_DIST, 'index.html'))) {
 }
 
 // Serve a private copy, so a `trunk serve` sharing this checkout's dist
-// cannot rewrite the SPA mid-run — see harness/dist-snapshot.mjs.
-const DIST = snapshotDist(BUILD_DIST, PORT, { log: (line) => console.log(line) });
+// cannot rewrite the SPA mid-run — see harness/dist-snapshot.mjs. The copy
+// is taken after the port is bound (see `server.listen` below): snapshots
+// are keyed by port, so a second server launched on a port already in use
+// must fail with EADDRINUSE before it replaces the running server's copy.
+let DIST;
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -1157,6 +1160,8 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
 });
 
 server.listen(PORT, HOST, () => {
+  DIST = snapshotDist(BUILD_DIST, PORT, { log: (line) => console.log(line) });
+  // fixtures.ts treats this line as readiness, so it follows the snapshot.
   console.log(`e2e stub server listening on http://${HOST}:${PORT} (dist: ${DIST})`);
 });
 
