@@ -7,8 +7,13 @@
 //!
 //! Its own test binary because the panic hook and the subscriber are both
 //! process-global: the production subscriber from
-//! `telemetry::build_subscriber`, with a stdout capture and a WAL layer, is
-//! installed with `.init()` exactly as `trawld` does.
+//! `telemetry::build_subscriber`, with a WAL layer and, outside monitor
+//! mode, a stdout capture, is installed with `.init()` exactly as `trawld`
+//! does. nextest runs each test in its own process, so each installs its
+//! own.
+//!
+//! In monitor mode no text sink records the diagnostic, so the hook writes
+//! one location line to stderr itself; with a text sink it writes none.
 
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,11 +32,17 @@ const THREAD: &str = "zz-panicking-worker";
 /// Set by the hook the test installs before trawld's.
 static PREVIOUS_RAN: AtomicBool = AtomicBool::new(false);
 
-/// Everything the global subscriber writes to stdout.
+/// Everything written to a captured stdout or stderr.
 #[derive(Clone, Default)]
-struct Stdout(Arc<Mutex<Vec<u8>>>);
+struct Capture(Arc<Mutex<Vec<u8>>>);
 
-impl Write for Stdout {
+impl Capture {
+    fn text(&self) -> String {
+        strip_ansi(&String::from_utf8(self.0.lock().unwrap().clone()).unwrap())
+    }
+}
+
+impl Write for Capture {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.0.lock().unwrap().extend_from_slice(buf);
         Ok(buf.len())
@@ -42,7 +53,7 @@ impl Write for Stdout {
     }
 }
 
-impl<'a> MakeWriter<'a> for Stdout {
+impl<'a> MakeWriter<'a> for Capture {
     type Writer = Self;
 
     fn make_writer(&'a self) -> Self::Writer {
@@ -86,8 +97,8 @@ fn read_wal(dir: &std::path::Path) -> Vec<serde_json::Value> {
         .collect()
 }
 
-#[test]
-fn panic_diagnostic_carries_location_not_payload_and_never_persists() {
+/// A WAL layer writing under a fresh directory, and the directory.
+fn wal_layer() -> (WalLayer, tempfile::TempDir) {
     let wal_dir = tempfile::tempdir().unwrap();
     let handle = WalHandle::new();
     handle.set(Arc::new(WalWriter::new(wal_dir.path().to_path_buf())), ENV);
@@ -98,11 +109,23 @@ fn panic_diagnostic_carries_location_not_payload_and_never_persists() {
         Arc::new(Derivation::defaults()),
         trawl_config::DEFAULT_TELEMETRY_BUFFER_MAX_BYTES,
     );
-    let stdout = Stdout::default();
+    (wal, wal_dir)
+}
+
+/// Install trawld's subscriber and panic hook, panic once with the payload
+/// sentinel on a thread named [`THREAD`], and return the line of the
+/// `panic!`. `text_sink` is what `init_tracing` passes: whether `stdout`
+/// (or a file logger) records the diagnostic.
+fn install_and_panic(
+    stdout: Option<Capture>,
+    wal: &WalLayer,
+    text_sink: bool,
+    stderr: &Capture,
+) -> u32 {
     let (subscriber, _) = telemetry::build_subscriber(
         telemetry::DEFAULT_LOG_FILTER,
         LogSinks {
-            stdout: Some(stdout.clone()),
+            stdout,
             wal: Some(wal.clone()),
             file_log: false,
         },
@@ -113,7 +136,7 @@ fn panic_diagnostic_carries_location_not_payload_and_never_persists() {
     // payload-printing default: chaining either would defeat the
     // replacement.
     std::panic::set_hook(Box::new(|_| PREVIOUS_RAN.store(true, Ordering::SeqCst)));
-    telemetry::install_panic_hook();
+    telemetry::install_panic_hook(text_sink, stderr.clone());
 
     let (tx, rx) = std::sync::mpsc::channel();
     let joined = std::thread::Builder::new()
@@ -125,13 +148,28 @@ fn panic_diagnostic_carries_location_not_payload_and_never_persists() {
         .unwrap()
         .join();
     assert!(joined.is_err(), "the thread panicked");
-    let panic_line = rx.recv().unwrap();
     assert!(
         !PREVIOUS_RAN.load(Ordering::SeqCst),
         "the previous hook was chained, not replaced"
     );
+    rx.recv().unwrap()
+}
 
-    let text = strip_ansi(&String::from_utf8(stdout.0.lock().unwrap().clone()).unwrap());
+/// With a stdout sink the diagnostic is one tracing event there, and the
+/// hook writes nothing to stderr.
+#[test]
+fn panic_diagnostic_carries_location_not_payload_and_never_persists() {
+    let (wal, wal_dir) = wal_layer();
+    let stdout = Capture::default();
+    let stderr = Capture::default();
+    let panic_line = install_and_panic(Some(stdout.clone()), &wal, true, &stderr);
+
+    assert_eq!(
+        stderr.text(),
+        "",
+        "a text sink records the panic, so stderr gets no second line"
+    );
+    let text = stdout.text();
     let diagnostics: Vec<&str> = text
         .lines()
         .filter(|line| line.contains(PANIC_TARGET))
@@ -180,4 +218,29 @@ fn panic_diagnostic_carries_location_not_payload_and_never_persists() {
             "the payload reached the WAL: {serialized}"
         );
     }
+}
+
+/// In monitor mode no text sink records the diagnostic, so the hook writes
+/// exactly one line to stderr: the location and the thread, never the
+/// payload.
+#[test]
+fn a_panic_without_a_text_sink_writes_its_location_to_stderr() {
+    let (wal, _wal_dir) = wal_layer();
+    let stderr = Capture::default();
+    let panic_line = install_and_panic(None, &wal, false, &stderr);
+
+    let text = stderr.text();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 1, "one stderr line: {text}");
+    let prefix = format!("trawld: panicked at {}:{panic_line}:", file!());
+    let suffix = format!(" on thread '{THREAD}'");
+    let line = lines[0];
+    assert!(line.starts_with(&prefix), "{line}");
+    assert!(line.ends_with(&suffix), "{line}");
+    let column = &line[prefix.len()..line.len() - suffix.len()];
+    assert!(column.parse::<u32>().is_ok(), "a column: {line}");
+    assert!(
+        !text.contains(PAYLOAD_SENTINEL),
+        "the payload reached stderr: {text}"
+    );
 }

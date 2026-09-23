@@ -278,14 +278,26 @@ pub const PANIC_TARGET: &str = "trawl_server::panic";
 /// would print the payload after all. Call it once the subscriber is
 /// installed, so the event has somewhere to go.
 ///
+/// `text_sink` says whether the subscriber has a stdout or file logger to
+/// record that event. The WAL refuses [`PANIC_TARGET`], so without one
+/// (the monitor TUI owns stdout and no `log_file` is configured) the event
+/// reaches nothing. The hook then also writes one line to `stderr`,
+/// directly rather than through tracing: `trawld: panicked at
+/// FILE:LINE:COLUMN on thread 'NAME'`, with no payload. With a text sink
+/// it writes nothing there, so the location is never printed twice.
+///
 /// The event is a root (`parent: None`): the request span it may fire
 /// inside would lend it the raw path and user agent. The WAL layer refuses
 /// the target before taking any lock of its own, so a panic inside that
 /// layer cannot deadlock on its way out.
-pub fn install_panic_hook() {
-    std::panic::set_hook(Box::new(|info| {
+pub fn install_panic_hook<W>(text_sink: bool, stderr: W)
+where
+    W: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + Send + Sync + 'static,
+{
+    std::panic::set_hook(Box::new(move |info| {
         let location = info.location();
         let thread = std::thread::current();
+        let thread = thread.name().unwrap_or("<unnamed>");
         tracing::error!(
             target: PANIC_TARGET,
             parent: None,
@@ -293,9 +305,26 @@ pub fn install_panic_hook() {
             file = location.map(std::panic::Location::file),
             line = location.map(std::panic::Location::line),
             column = location.map(std::panic::Location::column),
-            thread = thread.name().unwrap_or("<unnamed>"),
+            thread,
             "panicked"
         );
+        if !text_sink {
+            let at = location.map_or_else(
+                || "<unknown>".to_owned(),
+                |location| {
+                    format!(
+                        "{}:{}:{}",
+                        location.file(),
+                        location.line(),
+                        location.column()
+                    )
+                },
+            );
+            // One write of the whole line, so concurrent panics do not
+            // interleave mid-line. A failed write has nowhere to report.
+            let line = format!("trawld: panicked at {at} on thread '{thread}'\n");
+            let _ = std::io::Write::write_all(&mut stderr.make_writer(), line.as_bytes());
+        }
     }));
 }
 

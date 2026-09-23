@@ -911,7 +911,9 @@ struct Tracing {
 ///
 /// Once the subscriber is installed, replaces the panic hook with one that
 /// logs a panic's location and never its payload
-/// ([`telemetry::install_panic_hook`]).
+/// ([`telemetry::install_panic_hook`]). In monitor mode with no `log_file`
+/// logger, no sink records that event, so the hook also writes the location
+/// to stderr; the TUI draws on stdout.
 fn init_tracing(
     config: &Config,
     monitor_active: bool,
@@ -936,18 +938,23 @@ fn init_tracing(
         .as_ref()
         .filter(|_| telemetry.is_none());
 
+    // Skip stdout while the monitor TUI owns the terminal.
+    let stdout = (!monitor_active).then_some(std::io::stdout);
+    // Whether a text logger records the panic diagnostic. Without one the
+    // panic hook writes its location line to stderr itself.
+    let text_sink = stdout.is_some() || file_log_path.is_some();
+
     let (subscriber, file_handle) = telemetry::build_subscriber(
         filter_directives,
         telemetry::LogSinks {
-            // Skip stdout while the monitor TUI owns the terminal.
-            stdout: (!monitor_active).then_some(std::io::stdout),
+            stdout,
             // Same Arc<WalLayerInner> as the flush task's clone.
             wal: telemetry.as_ref().map(|(_, layer)| layer.clone()),
             file_log: file_log_path.is_some(),
         },
     );
     subscriber.init();
-    telemetry::install_panic_hook();
+    telemetry::install_panic_hook(text_sink, std::io::stderr);
 
     Tracing {
         file_log: file_log_path
