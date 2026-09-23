@@ -293,7 +293,7 @@ class OperationalAlerts(unittest.TestCase):
     def test_promtool_telemetry_disjoint_reasons_and_attempt_overlap(self):
         for pack in [self.plain, self.helm["spec"]]:
             tests = []
-            for reason in ["preinit_cap", "buffer_cap", "write_crashed", "other"]:
+            for reason in ["preinit_cap", "buffer_cap", "write_crashed", "unmetered_cap", "other"]:
                 case = self.timeline({"name": reason, "values": "0 1", "checks": [["30s", False]]}, {})
                 labels = {"job": "trawl", "instance": "10.0.0.1:5514", "namespace": "example",
                           "service": "launch-trawl", "pod": "launch-trawl-0", "cluster": "home"}

@@ -419,8 +419,12 @@ async fn a_bare_500_is_logged_as_unrecorded() {
     assert_eq!(field(line, "reached").as_deref(), Some("handler"), "{line}");
     assert_eq!(field(line, "query_id"), None, "{line}");
 
-    // Unmetered: logged, not persisted (the cap is a later concern).
-    assert!(wal_failures_for(&request_id).is_empty());
+    // Unmetered, and well under the cap: persisted with the same fields.
+    let records = wal_failures_for(&request_id);
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0]["target"], UNMETERED_FAILURE_TARGET);
+    assert_eq!(records[0]["stage"], "unrecorded");
+    assert_eq!(records[0]["reached"], "handler");
 }
 
 /// An unrecorded 5xx from a route no marker reached says so: it never got
@@ -634,7 +638,104 @@ async fn a_health_503_is_one_unmetered_warn_failure() {
     assert_eq!(field(line, "reached").as_deref(), Some("handler"));
     let peer = field(line, "peer_addr").expect("an unmetered failure names its peer");
     assert!(peer.starts_with("127.0.0.1:"), "{line}");
-    assert!(wal_failures_for(&request_id).is_empty());
+
+    // Unmetered, and well under the cap: persisted, peer included.
+    let records = wal_failures_for(&request_id);
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0]["target"], UNMETERED_FAILURE_TARGET);
+    assert_eq!(records[0]["level"], "warn");
+    assert_eq!(records[0]["peer_addr"], peer.as_str());
+}
+
+// -- AC4 ------------------------------------------------------------------------
+
+/// The auth backend down is a server fault before any key was metered: the
+/// 503 persists on the unmetered target, staged before admission, with the
+/// peer address as its only lead.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_auth_backend_503_persists_before_admission_with_its_peer() {
+    sinks();
+    let server = common::setup().await;
+    server.kill_fleet_database().await;
+
+    let response = raw_client()
+        .post(format!("{}/api/v1/query", server.url))
+        .bearer_auth(&server.analyst_token)
+        .json(&serde_json::json!({ "query": "*" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 503);
+    let request_id = request_id_of(response.headers());
+
+    let records = wal_failures_for(&request_id);
+    assert_eq!(records.len(), 1, "{records:?}");
+    let record = &records[0];
+    assert_eq!(record["target"], UNMETERED_FAILURE_TARGET);
+    assert_eq!(record["level"], "warn");
+    assert_eq!(record["route"], "/api/v1/query");
+    assert_eq!(record["status"], 503);
+    assert_eq!(record["stage"], "pre_admission");
+    assert_eq!(record["error_class"], "service_unavailable");
+    assert!(record.get("key_id").is_none(), "{record}");
+    assert!(
+        record["peer_addr"]
+            .as_str()
+            .is_some_and(|peer| peer.starts_with("127.0.0.1:")),
+        "{record}"
+    );
+    assert_eq!(stdout_failures_for(&request_id).len(), 1);
+}
+
+/// A 401 and a 403 are the caller's fault, decided before any limiter: the
+/// rejections reach stdout, and nothing on an unmetered target reaches the
+/// WAL.
+#[tokio::test(flavor = "multi_thread")]
+async fn unmetered_401_403_never_reach_the_wal() {
+    sinks();
+    let server = common::setup().await;
+
+    let unauthorized = raw_client()
+        .post(format!("{}/api/v1/query", server.url))
+        .bearer_auth("zz-not-a-key")
+        .json(&serde_json::json!({ "query": "*" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), 401);
+    let forbidden = raw_client()
+        .post(format!("{}/api/v1/query", server.url))
+        .bearer_auth(&server.coastwatch_only_token)
+        .json(&serde_json::json!({ "query": "*" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(forbidden.status(), 403);
+
+    let lines = stdout_lines();
+    for target in ["fleet_auth", telemetry::UNMETERED_POLICY_TARGET] {
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains(&format!(" {target}"))),
+            "the {target} rejection reaches stdout: {lines:#?}"
+        );
+    }
+    let unmetered: Vec<_> = wal_records()
+        .into_iter()
+        .filter(|record| {
+            record["target"]
+                .as_str()
+                .is_some_and(|target| !telemetry::is_persisted_target(target))
+        })
+        .collect();
+    assert!(unmetered.is_empty(), "{unmetered:#?}");
+    for request_id in [
+        request_id_of(unauthorized.headers()),
+        request_id_of(forbidden.headers()),
+    ] {
+        assert!(wal_failures_for(&request_id).is_empty());
+    }
 }
 
 // -- AC5 ------------------------------------------------------------------------

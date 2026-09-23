@@ -48,9 +48,11 @@ pub const FAILURE_TARGET: &str = "trawl_server::transport::failure";
 /// Target of the failure events for requests no limiter metered: a server
 /// fault before any key was checked, or on a route without a limiter
 /// (`/api/v1/health`, `/metrics`). They carry `peer_addr`, the only lead
-/// when no key is known. [`crate::telemetry::UNMETERED_TARGETS`] keeps them
-/// off the WAL, so a client the limiter cannot slow gets no durable-write
-/// amplifier out of them.
+/// when no key is known. A client the limiter cannot slow must get no
+/// durable-write amplifier out of them, so the WAL layer persists them only
+/// under the process-wide
+/// [`UNMETERED_FAILURE_CAP_PER_MINUTE`](crate::telemetry::UNMETERED_FAILURE_CAP_PER_MINUTE);
+/// past it they reach stdout only (ADR-0040).
 pub const UNMETERED_FAILURE_TARGET: &str = "trawl_server::transport::failure::unmetered";
 
 /// The `route` a failure event carries when no route matched. Never the raw

@@ -34,6 +34,15 @@
 //! request flood into durable corpus growth. They stay on stdout, where
 //! retention is the operator's log pipeline rather than trawl's own disk.
 //!
+//! One unmetered event does persist, under a cap: the failure event of a
+//! server 5xx no limiter metered
+//! ([`UNMETERED_FAILURE_TARGET`](crate::transport::failure::UNMETERED_FAILURE_TARGET)).
+//! A server fault before admission, the auth backend down say, is the
+//! incident an operator searches for afterwards, so the layer admits those
+//! events under one process-wide fixed window of
+//! [`UNMETERED_FAILURE_CAP_PER_MINUTE`] (ADR-0040). Past the cap they stay
+//! on stdout only and are counted under drop reason `unmetered_cap`.
+//!
 //! ## Buffering and the bounded retry queue
 //!
 //! Events are serialized to ndjson and accumulated in an active buffer
@@ -208,9 +217,7 @@ pub const UNMETERED_POLICY_TARGET: &str = "trawl_server::policy::unmetered";
 /// unmetered too. Persisting any of it would hand a client the limiter
 /// cannot slow a durable-write amplifier: one ~400-byte record per rejected
 /// connection or request, compacted into the corpus and competing with real
-/// log data for retention. [`UNMETERED_FAILURE_TARGET`] is the failure event
-/// of a 5xx no limiter metered: a server fault before any key was checked,
-/// or on `/api/v1/health` or `/metrics`.
+/// log data for retention.
 ///
 /// Excluding them from the corpus does not lose the signal. They keep
 /// flowing to stdout under the same directives, where retention is the
@@ -224,22 +231,80 @@ pub const UNMETERED_POLICY_TARGET: &str = "trawl_server::policy::unmetered";
 /// stay alarmable. Everything trawld emits behind the limiter still
 /// persists, the rest of `trawl_server` and `storage.backend` included.
 ///
+/// [`UNMETERED_FAILURE_TARGET`], the failure event of a 5xx no limiter
+/// metered, is deliberately not in this list. A 401 or 403 is the caller's
+/// fault; a 5xx before admission is the server's, the auth backend down
+/// say, and it is the incident an operator searches for afterwards. The
+/// same amplifier argument still holds, so [`WalLayer`] admits that target
+/// under [`UNMETERED_FAILURE_CAP_PER_MINUTE`] instead of without a bound
+/// (ADR-0040).
+///
 /// Matching is by target segment, so `fleet_auth` covers
 /// `fleet_auth::middleware` but never a `fleet_authority` target — and
 /// `trawl_server::policy::unmetered` excludes only itself and its own
 /// descendants, never `trawl_server::policy`.
 ///
 /// [`UNMETERED_FAILURE_TARGET`]: crate::transport::failure::UNMETERED_FAILURE_TARGET
-pub const UNMETERED_TARGETS: [&str; 5] = [
+pub const UNMETERED_TARGETS: [&str; 4] = [
     "fleet_auth",
     "auth.backend",
     PREAUTH_TRANSPORT_TARGET,
     UNMETERED_POLICY_TARGET,
-    crate::transport::failure::UNMETERED_FAILURE_TARGET,
 ];
 
+/// How many unmetered failure events ([`UNMETERED_FAILURE_TARGET`]) the WAL
+/// layer persists per fixed one-minute window, across the whole process
+/// (ADR-0040). A constant with no operator setting: it bounds the durable
+/// writes a client the rate limiter cannot slow can cause, at 60 rows a
+/// minute. Events past it go to stdout only and are counted under drop
+/// reason `unmetered_cap`.
+///
+/// [`UNMETERED_FAILURE_TARGET`]: crate::transport::failure::UNMETERED_FAILURE_TARGET
+pub const UNMETERED_FAILURE_CAP_PER_MINUTE: u32 = 60;
+
+/// The fixed window [`UNMETERED_FAILURE_CAP_PER_MINUTE`] counts over.
+const UNMETERED_FAILURE_WINDOW: Duration = Duration::from_mins(1);
+
+/// The one fixed-window cap on persisted unmetered failures.
+///
+/// A window opens at the first event after the previous one closed and
+/// admits [`UNMETERED_FAILURE_CAP_PER_MINUTE`] events. The decision and the
+/// count update happen under one lock, so concurrent events on any number
+/// of threads never admit more than the cap. Fixed memory: no per-peer
+/// state, nothing to evict.
+#[derive(Default)]
+struct UnmeteredFailureCap {
+    /// Start of the open window and the events admitted in it.
+    window: Mutex<Option<(Instant, u32)>>,
+}
+
+impl UnmeteredFailureCap {
+    /// Whether an event at `now` may be persisted, counting it if so.
+    fn admit(&self, now: Instant) -> bool {
+        let mut window = self.window.lock();
+        match window.as_mut() {
+            Some((start, admitted))
+                if now.saturating_duration_since(*start) < UNMETERED_FAILURE_WINDOW =>
+            {
+                if *admitted < UNMETERED_FAILURE_CAP_PER_MINUTE {
+                    *admitted += 1;
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => {
+                *window = Some((now, 1));
+                true
+            }
+        }
+    }
+}
+
 /// Whether events on `target` may be persisted as telemetry — false for
-/// every [`UNMETERED_TARGETS`] entry and its module descendants.
+/// every [`UNMETERED_TARGETS`] entry and its module descendants. True for
+/// the unmetered failure target, which [`WalLayer`] persists under its own
+/// cap.
 ///
 /// [`WalLayer`] applies it on top of the resolved directives, which every
 /// sink shares. A second, non-configurable predicate rather than an
@@ -560,6 +625,9 @@ struct DropCounters {
     crashed_events: AtomicU64,
     /// ndjson bytes consumed by a panicked or cancelled write (exact).
     crashed_bytes: AtomicU64,
+    /// Unmetered failure events past [`UNMETERED_FAILURE_CAP_PER_MINUTE`]
+    /// (exact). No byte count: the event is refused before serialization.
+    unmetered_cap_events: AtomicU64,
 }
 
 struct WalLayerInner {
@@ -592,6 +660,14 @@ struct WalLayerInner {
     host: Option<String>,
     /// Loss accounting for the recovery event and metrics.
     dropped: DropCounters,
+    /// The process-wide cap on persisted unmetered failures. One per
+    /// process because `trawld` builds one layer and every clone shares
+    /// this inner.
+    unmetered_failures: UnmeteredFailureCap,
+    /// Test-only clock offset, so a test can move the cap's window without
+    /// waiting a minute.
+    #[cfg(test)]
+    clock_offset: Mutex<Duration>,
     /// Last time a WAL failure was reported to stderr (rate limit).
     last_stderr: Mutex<Option<Instant>>,
     /// Deferred event bus for real-time fanout (SSE streaming).
@@ -678,6 +754,9 @@ impl WalLayer {
                 envs: envs.into(),
                 derivation,
                 dropped: DropCounters::default(),
+                unmetered_failures: UnmeteredFailureCap::default(),
+                #[cfg(test)]
+                clock_offset: Mutex::new(Duration::ZERO),
                 last_stderr: Mutex::new(None),
                 bus: OnceLock::new(),
                 hot_buffer: OnceLock::new(),
@@ -807,6 +886,27 @@ impl WalLayer {
 }
 
 impl WalLayerInner {
+    /// Whether an unmetered failure event may be persisted. Past the cap,
+    /// counts it as dropped under reason `unmetered_cap`.
+    fn admit_unmetered_failure(&self) -> bool {
+        // The cap's clock: monotonic, and movable by tests.
+        let now = Instant::now();
+        #[cfg(test)]
+        let now = now + *self.clock_offset.lock();
+        if self.unmetered_failures.admit(now) {
+            return true;
+        }
+        self.dropped
+            .unmetered_cap_events
+            .fetch_add(1, Ordering::Relaxed);
+        metrics::counter!(
+            crate::metrics::TELEMETRY_EVENTS_DROPPED_TOTAL,
+            "reason" => crate::metrics::TelemetryDropReason::UnmeteredCap.label()
+        )
+        .increment(1);
+        false
+    }
+
     /// The pre-init cap: while the writer is not yet set, the active
     /// buffer is the only place events can go, so it is bounded on its
     /// own. Returns whether this event must be dropped.
@@ -1055,10 +1155,12 @@ impl WalLayerInner {
         let cap_bytes = self.dropped.cap_bytes.swap(0, Ordering::Relaxed);
         let crashed_events = self.dropped.crashed_events.swap(0, Ordering::Relaxed);
         let crashed_bytes = self.dropped.crashed_bytes.swap(0, Ordering::Relaxed);
-        if preinit_events + cap_events + crashed_events > 0 {
+        let unmetered_cap_events = self.dropped.unmetered_cap_events.swap(0, Ordering::Relaxed);
+        if preinit_events + cap_events + crashed_events + unmetered_cap_events > 0 {
             tracing::warn!(
                 event_type = "telemetry_dropped",
-                dropped_events = preinit_events + cap_events + crashed_events,
+                dropped_events =
+                    preinit_events + cap_events + crashed_events + unmetered_cap_events,
                 dropped_bytes = preinit_bytes + cap_bytes + crashed_bytes,
                 dropped_events_preinit_cap = preinit_events,
                 dropped_bytes_preinit_cap = preinit_bytes,
@@ -1066,8 +1168,10 @@ impl WalLayerInner {
                 dropped_bytes_buffer_cap = cap_bytes,
                 dropped_events_write_crashed = crashed_events,
                 dropped_bytes_write_crashed = crashed_bytes,
+                dropped_events_unmetered_cap = unmetered_cap_events,
                 "telemetry events were lost (see reason totals; \
-                 preinit_cap bytes are a mean-line-size estimate)"
+                 preinit_cap bytes are a mean-line-size estimate; \
+                 unmetered_cap counts no bytes)"
             );
         }
     }
@@ -1210,8 +1314,15 @@ where
     }
 
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
-        // Unmetered events are logged, never persisted (UNMETERED_TARGETS).
-        if !is_persisted_target(event.metadata().target()) {
+        // Unmetered events are logged, never persisted (UNMETERED_TARGETS),
+        // except the unmetered failure event, which persists under its own
+        // process-wide cap (ADR-0040).
+        let target = event.metadata().target();
+        if target == crate::transport::failure::UNMETERED_FAILURE_TARGET {
+            if !self.inner.admit_unmetered_failure() {
+                return;
+            }
+        } else if !is_persisted_target(target) {
             return;
         }
 
@@ -1612,6 +1723,148 @@ mod tests {
             !inside.contains_key("key_hint"),
             "an unmetered span must lend no fields to a persisted event: {inside:?}"
         );
+    }
+
+    /// Everything a test subscriber writes to stdout.
+    #[derive(Clone, Default)]
+    struct StdoutCapture(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for StdoutCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for StdoutCapture {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl StdoutCapture {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().clone()).unwrap()
+        }
+    }
+
+    /// The window opens at its first event and admits exactly the cap, and
+    /// concurrent callers share that one decision.
+    #[test]
+    fn the_unmetered_failure_cap_is_one_decision_across_threads() {
+        let cap = UnmeteredFailureCap::default();
+        let opened = Instant::now();
+        let admitted = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for _ in 0..50 {
+                        if cap.admit(opened) {
+                            admitted.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            admitted.load(Ordering::Relaxed),
+            UNMETERED_FAILURE_CAP_PER_MINUTE as usize
+        );
+        let almost = UNMETERED_FAILURE_WINDOW.saturating_sub(Duration::from_millis(1));
+        assert!(!cap.admit(opened + almost), "the window is still full");
+        assert!(
+            cap.admit(opened + UNMETERED_FAILURE_WINDOW),
+            "a new window admits again"
+        );
+    }
+
+    /// 61 unmetered failures in one window: the first 60 persist, the 61st
+    /// reaches stdout only and is counted under `unmetered_cap`, on the
+    /// metric and in the `telemetry_dropped` recovery record. Once the
+    /// window rolls over, the next one persists again.
+    #[test]
+    fn unmetered_5xx_persist_until_the_cap_then_count_as_dropped() {
+        use crate::metrics::test_support::sample;
+        use crate::transport::failure::UNMETERED_FAILURE_TARGET;
+        const DROPPED: &str = "trawl_telemetry_events_dropped_total{reason=\"unmetered_cap\"}";
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let metrics_handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            crate::metrics::init_operational_alert_metrics();
+            let tmp = tempfile::tempdir().unwrap();
+            let writer = Arc::new(WalWriter::new(tmp.path().to_path_buf()));
+            writer.ensure_dir().unwrap();
+            let handle = WalHandle::new();
+            handle.set(writer, "prod");
+            let layer = WalLayer::new(handle, "prod");
+            let stdout = StdoutCapture::default();
+            let (subscriber, _) = build_subscriber(
+                DEFAULT_LOG_FILTER,
+                LogSinks {
+                    stdout: Some(stdout.clone()),
+                    wal: Some(layer.clone()),
+                    file_log: false,
+                },
+            );
+            let _guard = tracing::dispatcher::set_default(&subscriber);
+            let fail = |n: u32| {
+                let request_id = format!("zz-cap-{n:03}");
+                tracing::error!(
+                    target: UNMETERED_FAILURE_TARGET,
+                    event_type = "http_failure",
+                    request_id = request_id.as_str(),
+                    "request failed"
+                );
+            };
+            let persisted = || -> Vec<String> {
+                layer.flush();
+                read_wal_events(&tmp.path().join("prod"))
+                    .into_iter()
+                    .filter(|event| event["event_type"] == "http_failure")
+                    .map(|event| event["request_id"].as_str().unwrap().to_owned())
+                    .collect()
+            };
+
+            for n in 0..=UNMETERED_FAILURE_CAP_PER_MINUTE {
+                fail(n);
+            }
+            let ids = persisted();
+            let expected: Vec<String> = (0..UNMETERED_FAILURE_CAP_PER_MINUTE)
+                .map(|n| format!("zz-cap-{n:03}"))
+                .collect();
+            assert_eq!(ids, expected, "exactly the first 60 persist");
+            assert!(
+                stdout.text().contains("zz-cap-060"),
+                "the 61st still reaches stdout"
+            );
+            assert_eq!(sample(&metrics_handle, DROPPED), 1);
+
+            // The recovery record is buffered by the write that published
+            // the batch, and reaches the WAL with the next one.
+            layer.flush();
+            let reports: Vec<_> = read_wal_events(&tmp.path().join("prod"))
+                .into_iter()
+                .filter(|event| event["event_type"] == "telemetry_dropped")
+                .collect();
+            assert_eq!(reports.len(), 1, "{reports:?}");
+            assert_eq!(reports[0]["dropped_events"], 1);
+            assert_eq!(reports[0]["dropped_events_unmetered_cap"], 1);
+
+            *layer.inner.clock_offset.lock() += UNMETERED_FAILURE_WINDOW;
+            fail(61);
+            assert!(
+                persisted().contains(&"zz-cap-061".to_owned()),
+                "a new window admits again"
+            );
+            assert_eq!(sample(&metrics_handle, DROPPED), 1);
+        });
     }
 
     #[test]

@@ -190,16 +190,25 @@ pub enum TelemetryDropReason {
     PreinitCap,
     BufferCap,
     WriteCrashed,
+    /// An unmetered failure event past the per-minute persistence cap
+    /// (ADR-0040). It still reached stdout; no alert selects it.
+    UnmeteredCap,
 }
 
 impl TelemetryDropReason {
-    pub const ALL: [Self; 3] = [Self::PreinitCap, Self::BufferCap, Self::WriteCrashed];
+    pub const ALL: [Self; 4] = [
+        Self::PreinitCap,
+        Self::BufferCap,
+        Self::WriteCrashed,
+        Self::UnmeteredCap,
+    ];
 
     pub const fn label(self) -> &'static str {
         match self {
             Self::PreinitCap => "preinit_cap",
             Self::BufferCap => "buffer_cap",
             Self::WriteCrashed => "write_crashed",
+            Self::UnmeteredCap => "unmetered_cap",
         }
     }
 }
@@ -521,7 +530,9 @@ pub fn describe_metrics() {
          buffer_cap = the shared active+queue+in-flight memory budget was \
          full during a prolonged WAL outage, write_crashed = a panicked or \
          cancelled blocking write consumed the batch, possibly after durable \
-         publication; this reason does not prove permanent event loss)"
+         publication; this reason does not prove permanent event loss; \
+         unmetered_cap = an unmetered server-failure event past the fixed \
+         60-per-minute persistence cap, still written to stdout)"
     );
     describe_counter!(
         TELEMETRY_BYTES_DROPPED_TOTAL,
@@ -1549,6 +1560,7 @@ mod tests {
                 "trawl_telemetry_events_dropped_total{reason=\"preinit_cap\"}",
                 "trawl_telemetry_events_dropped_total{reason=\"buffer_cap\"}",
                 "trawl_telemetry_events_dropped_total{reason=\"write_crashed\"}",
+                "trawl_telemetry_events_dropped_total{reason=\"unmetered_cap\"}",
                 "trawl_ingest_events_rejected_total{reason=\"wal_failure\"}",
                 "trawl_wal_durability_failures_total{operation=\"parent_directory_sync\"}",
                 "trawl_compaction_operation_failures_total{operation=\"wal_root_scan\"}",
