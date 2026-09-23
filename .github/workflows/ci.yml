@@ -388,7 +388,9 @@ jobs:
 
   web-ui-health-mutation:
     name: Health page request-gate mutation
-    runs-on: k8s-big
+    runs-on: k8s-small
+    # Mutation jobs run on k8s-small: k8s-big holds three jobs at once, and
+    # the test, trunk and theme jobs need those slots.
     # Mutation jobs start once trunk-build is done and run alongside the
     # web-ui-e2e shards. They build their own mutant and pristine SPAs (the
     # atmosphere job downloads trunk-build's dist). They do not wait for the
@@ -438,7 +440,7 @@ jobs:
 
   web-ui-palette-mutations:
     name: Command palette admission and toggle mutations
-    runs-on: k8s-big
+    runs-on: k8s-small
     needs: trunk-build
     # Browser system packages can take 15 minutes before the SPA rebuilds.
     timeout-minutes: 30
@@ -482,7 +484,7 @@ jobs:
 
   web-ui-save-snapshot-mutation:
     name: Save editor snapshot mutation
-    runs-on: k8s-big
+    runs-on: k8s-small
     needs: trunk-build
     # Allow package setup plus pristine, mutated, and restored SPA checks.
     timeout-minutes: 30
@@ -539,7 +541,7 @@ jobs:
 
   web-ui-pagination-range-mutations:
     name: Pagination and range dialog mutations
-    runs-on: k8s-big
+    runs-on: k8s-small
     needs: trunk-build
     timeout-minutes: 35
     permissions:
@@ -586,7 +588,7 @@ jobs:
 
   web-ui-live-coherence-mutations:
     name: Live-mode coherence mutations
-    runs-on: k8s-big
+    runs-on: k8s-small
     needs: trunk-build
     # Two apply/build/run cycles plus the pristine restore build.
     timeout-minutes: 35
@@ -633,7 +635,7 @@ jobs:
 
   web-ui-schedule-preview-mutations:
     name: Schedule window and preview paging mutations
-    runs-on: k8s-big
+    runs-on: k8s-small
     needs: trunk-build
     timeout-minutes: 35
     permissions:
