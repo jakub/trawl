@@ -518,7 +518,9 @@ jobs:
       - name: Validate Save mutation report attribution
         run: node --test crates/trawl-web-ui/e2e/scripts/check-save-mutation.test.mjs
       - name: Build pristine SPA
-        run: env -u NO_COLOR trunk build
+        # Incremental, like mutation-check.sh, so the mutant build that
+        # follows reuses this build's compiled crates.
+        run: env -u NO_COLOR CARGO_INCREMENTAL=1 trunk build
         working-directory: crates/trawl-web-ui
       - name: Verify pristine Settings and Save behavior
         run: npx playwright test tests/settings-disposition.spec.ts
@@ -679,9 +681,9 @@ jobs:
     name: web UI browser tests (playwright ${{ matrix.shard }}/4)
     runs-on: k8s-small
     needs: trunk-build
-    # The suite runs on one worker against one stub server (see
-    # playwright.config.ts), so it is split across jobs instead: each shard
-    # starts its own server. fail-fast is off so one red shard still lets
+    # CI runs one worker per job (see playwright.config.ts), so the suite
+    # is split across jobs instead, each with its own stub server.
+    # fullyParallel lets the split fall between tests of one file. fail-fast is off so one red shard still lets
     # the others report their results.
     strategy:
       fail-fast: false

@@ -254,8 +254,8 @@ async function capture(browser, theme) {
 // the default port) answers /__ctl/health just as happily, and the
 // script would then photograph THAT checkout's dist and reset THAT
 // run's scenario while our own child had already died with
-// EADDRINUSE. Same rule as playwright.config.ts's
-// `reuseExistingServer: false` — a port collision fails loudly.
+// EADDRINUSE. Same rule as the `stubOrigin` fixture in fixtures.ts,
+// which waits for the same line — a port collision fails loudly.
 function waitForOwnedListener(child) {
   return new Promise((resolve, reject) => {
     let settled = false;

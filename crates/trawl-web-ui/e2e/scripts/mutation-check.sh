@@ -33,12 +33,23 @@ MUTATIONS_DIR="$E2E_DIR/mutations"
 
 cd "$ROOT_DIR"
 
+# Every mutant and the restore rebuild the same crates, and trawl-core's
+# provenance build script watches every tracked file, so each patch
+# recompiles trawl-core, fleet-ui and trawl-web-ui. Incremental compilation
+# lets those rebuilds reuse most of the previous compile. CI needs it set
+# here because rust-cache exports CARGO_INCREMENTAL=0 for the whole job.
+export CARGO_INCREMENTAL=1
+
 if [[ -n "$(git status --porcelain)" ]]; then
   echo "mutation-check: working tree is dirty — commit or stash first." >&2
   git status --short >&2
   exit 1
 fi
 
+# Every run below pins --workers=1, so the target and its control each use
+# exactly one stub server on E2E_PORT. With more workers a target could use
+# a port its control never touches, and a busy port there would fail the
+# target alone and read as a kill.
 # patch-file -> the spec FILE whose subject the mutation breaks (keeping
 # this narrow means an unrelated spec failure doesn't get miscounted as
 # this mutation's signal).
@@ -224,7 +235,7 @@ for name in "${PATCHES[@]}"; do
     # Require this assertion, not any failure elsewhere in the health spec.
     # Keep the report outside test-results, which Playwright cleans on run.
     health_report="$E2E_DIR/health-mutation-report.json"
-    (cd "$E2E_DIR" && npx playwright test "tests/$spec" --grep 'non-admin request silence:' --reporter=json) > "$health_report"
+    (cd "$E2E_DIR" && npx playwright test --workers=1 "tests/$spec" --grep 'non-admin request silence:' --reporter=json) > "$health_report"
     status=$?
     node - "$health_report" <<'JS'
 const fs = require('node:fs');
@@ -247,14 +258,14 @@ JS
     # The shared callback must break both controls at the snapshot assertion.
     # Keep the JSON outside test-results, which Playwright cleans on each run.
     save_report="$E2E_DIR/save-mutation-report.json"
-    (cd "$E2E_DIR" && npx playwright test "tests/$spec" --grep 'Save captures editor buffer:' --reporter=json) > "$save_report"
+    (cd "$E2E_DIR" && npx playwright test --workers=1 "tests/$spec" --grep 'Save captures editor buffer:' --reporter=json) > "$save_report"
     status=$?
     node "$SCRIPT_DIR/check-save-mutation.mjs" "$save_report"
     save_assertion=$?
     rm -f "$save_report"
     if [[ $save_assertion -ne 0 ]]; then status=0; fi
   else
-    (cd "$E2E_DIR" && npx playwright test "tests/$spec")
+    (cd "$E2E_DIR" && npx playwright test --workers=1 "tests/$spec")
     status=$?
   fi
   set -e
@@ -265,9 +276,9 @@ JS
   if [[ $name == 20-health-admin-gate.patch ]]; then
     # The 404 route is outside AuthShell. Authenticated routing tests
     # would correctly fail the same disabled admin gate as the target.
-    (cd "$E2E_DIR" && npx playwright test "tests/$control" --grep 'an unknown route renders the 404 page$')
+    (cd "$E2E_DIR" && npx playwright test --workers=1 "tests/$control" --grep 'an unknown route renders the 404 page$')
   else
-    (cd "$E2E_DIR" && npx playwright test "tests/$control")
+    (cd "$E2E_DIR" && npx playwright test --workers=1 "tests/$control")
   fi
   control_status=$?
   set -e

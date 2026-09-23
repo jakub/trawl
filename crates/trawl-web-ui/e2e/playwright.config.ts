@@ -4,12 +4,20 @@
 
 import { defineConfig, devices } from '@playwright/test';
 
-// Same variable harness/server.mjs reads — one owner for the port.
-const PORT = Number(process.env.E2E_PORT ?? 8123);
-
-// One stub server, one scenario in flight at a time (harness/server.mjs
-// keeps a single mutable "current scenario" — see its `/__ctl/reset`
-// contract) — so specs never run concurrently against it.
+// No `webServer`: every worker starts its own harness/server.mjs on
+// E2E_PORT + its parallelIndex (the worker-scoped `stubOrigin` fixture in
+// fixtures.ts), and `baseURL` comes from that fixture, not from here. A
+// stub server keeps one mutable "current scenario" (see its
+// `/__ctl/reset` contract), so it must never serve two tests at once; a
+// server per worker gives that at any worker count.
+//
+// Local runs use four workers, so N servers listen on E2E_PORT ..
+// E2E_PORT + 3; the full suite then fits well inside a ten-minute window
+// (measured 9.4 min on one worker, 3.4 min on four, five clean runs in a
+// row). CI keeps one worker per job: it splits the suite across shard jobs
+// instead, each on its own runner. `--workers=N` overrides either. A port
+// already in use fails the worker loudly rather than reusing a server
+// that may be serving another worktree's dist.
 export default defineConfig({
   testDir: './tests',
   // Scratch output — traces, failure screenshots, `.last-run.json` — lands
@@ -20,8 +28,12 @@ export default defineConfig({
   // build`, which then dies with "error writing JS loader file to stage
   // dir". Relative paths here resolve against this file's directory.
   outputDir: '../../../e2e-artifacts/test-results',
-  workers: 1,
-  fullyParallel: false,
+  workers: process.env.CI ? 1 : 4,
+  // Tests are independent (the contract fixture resets the scenario before
+  // each one), so a file's tests may run on different workers and shards.
+  // Without this, CI's --shard split whole files, and login-return.spec.ts
+  // alone kept one shard busy for twice as long as the others.
+  fullyParallel: true,
   retries: 0,
   timeout: 20_000,
   expect: { timeout: 5_000 },
@@ -31,7 +43,6 @@ export default defineConfig({
   globalTimeout: 720_000,
   reporter: process.env.CI ? [['github'], ['list']] : [['list']],
   use: {
-    baseURL: `http://127.0.0.1:${PORT}`,
     trace: 'retain-on-failure',
     screenshot: 'only-on-failure',
     viewport: { width: 1440, height: 900 },
@@ -48,14 +59,4 @@ export default defineConfig({
       use: { ...devices['Desktop Chrome'], channel: 'chromium' },
     },
   ],
-  webServer: {
-    command: 'node harness/server.mjs',
-    url: `http://127.0.0.1:${PORT}/__ctl/health`,
-    // Never reuse: a server left by another worktree would serve THAT
-    // checkout's dist and this run would silently test the wrong SPA.
-    // A port collision must fail loudly instead (set E2E_PORT to run
-    // suites in parallel).
-    reuseExistingServer: false,
-    stdout: 'pipe',
-  },
 });

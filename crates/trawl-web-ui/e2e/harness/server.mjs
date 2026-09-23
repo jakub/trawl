@@ -9,9 +9,10 @@
 // Serves the built trawl-web-ui `dist/` (SPA fallback on extensionless
 // paths) and stands in for trawl-web's `/api/*` surface with canned,
 // wire-shape-accurate responses (see fixtures.mjs). Single mutable
-// "current scenario" — set via POST /__ctl/reset — because
-// playwright.config.ts pins workers:1 so exactly one spec talks to this
-// process at a time.
+// "current scenario" — set via POST /__ctl/reset — because each
+// Playwright worker starts its own process (the `stubOrigin` fixture in
+// fixtures.ts) and a worker runs one test at a time, so exactly one spec
+// talks to this process at a time.
 
 import http from 'node:http';
 import fs from 'node:fs';
@@ -60,8 +61,9 @@ import {
 } from './fixtures.mjs';
 
 const HOST = '127.0.0.1';
-// E2E_PORT lets parallel worktrees run without colliding; the Playwright
-// config reads the same variable, so server and baseURL can't disagree.
+// E2E_PORT lets parallel worktrees and workers run without colliding.
+// fixtures.ts sets it per worker and derives `baseURL` from the same
+// number, so server and baseURL can't disagree.
 const PORT = Number(process.env.E2E_PORT ?? 8123);
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -79,8 +81,11 @@ if (!fs.existsSync(path.join(BUILD_DIST, 'index.html'))) {
 }
 
 // Serve a private copy, so a `trunk serve` sharing this checkout's dist
-// cannot rewrite the SPA mid-run — see harness/dist-snapshot.mjs.
-const DIST = snapshotDist(BUILD_DIST, PORT, { log: (line) => console.log(line) });
+// cannot rewrite the SPA mid-run — see harness/dist-snapshot.mjs. The copy
+// is taken after the port is bound (see `server.listen` below): snapshots
+// are keyed by port, so a second server launched on a port already in use
+// must fail with EADDRINUSE before it replaces the running server's copy.
+let DIST;
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -1155,6 +1160,8 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
 });
 
 server.listen(PORT, HOST, () => {
+  DIST = snapshotDist(BUILD_DIST, PORT, { log: (line) => console.log(line) });
+  // fixtures.ts treats this line as readiness, so it follows the snapshot.
   console.log(`e2e stub server listening on http://${HOST}:${PORT} (dist: ${DIST})`);
 });
 
@@ -1193,3 +1200,11 @@ function shutdown() {
 }
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
+// fixtures.ts starts this server with an IPC channel to its Playwright
+// worker. A worker that dies without running teardown (an OOM kill, say)
+// closes the channel, and the server exits with it instead of keeping the
+// port that the replacement worker needs. A worker that died while this
+// module was still loading has already disconnected: `process.connected`
+// is then false, where a standalone launch leaves it undefined.
+if (process.connected === false) shutdown();
+else if (process.channel) process.on('disconnect', shutdown);

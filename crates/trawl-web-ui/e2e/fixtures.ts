@@ -7,13 +7,88 @@
 // -independence / pageerror / unstubbed-call contract applies uniformly
 // without being re-typed per file.
 
+import { spawn } from 'node:child_process';
+import path from 'node:path';
 import { test as base, expect } from '@playwright/test';
 
-// Same variable playwright.config.ts and harness/server.mjs read, so the
-// network guard below can never disagree with where the stub actually is.
-const E2E_ORIGIN = `http://127.0.0.1:${Number(process.env.E2E_PORT ?? 8123)}`;
-
 type PageErrors = { errors: Error[] };
+
+// How long a stub server may take to snapshot the dist and bind. Matches
+// the webServer default the suite used before servers became per worker.
+const STUB_START_TIMEOUT_MS = 60_000;
+
+/** Start `harness/server.mjs` for one worker and resolve with its origin.
+ *
+ * Readiness is the server's own "listening" line, not a health probe
+ * alone: that line is printed from its `listen` callback, so only a
+ * process that bound the port itself can print it. A stray server left on
+ * the port by another worktree would answer `/__ctl/health` just as well
+ * and silently serve THAT checkout's dist; here our child dies with
+ * EADDRINUSE instead, and the worker fails with the child's output. */
+async function startStub(port: number): Promise<{ origin: string; stop: () => Promise<void> }> {
+  const origin = `http://127.0.0.1:${port}`;
+  const child = spawn(process.execPath, [path.join(__dirname, 'harness', 'server.mjs')], {
+    cwd: __dirname,
+    env: { ...process.env, E2E_PORT: String(port) },
+    // The IPC channel ties the server's lifetime to this worker; see the
+    // `disconnect` handler in harness/server.mjs.
+    stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+  });
+  const exited = new Promise<void>((resolve) => child.once('exit', () => resolve()));
+  let output = '';
+  const collect = (chunk: Buffer) => { output += chunk.toString(); };
+  child.stdout.on('data', collect);
+  child.stderr.on('data', collect);
+
+  const stop = async () => {
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill('SIGTERM');
+      // The server force-exits 500ms after SIGTERM on its own; SIGKILL is
+      // for a process too wedged to run its handler at all.
+      const killer = setTimeout(() => child.kill('SIGKILL'), 5_000);
+      await exited;
+      clearTimeout(killer);
+    }
+  };
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error(`did not start within ${STUB_START_TIMEOUT_MS}ms`)),
+        STUB_START_TIMEOUT_MS,
+      );
+      const onExit = (code: number | null, signal: string | null) => {
+        clearTimeout(timer);
+        reject(new Error(`exited before listening (code ${code}, signal ${signal})`));
+      };
+      child.once('exit', onExit);
+      child.stdout.on('data', () => {
+        if (output.includes(`listening on ${origin} `)) {
+          clearTimeout(timer);
+          child.off('exit', onExit);
+          resolve();
+        }
+      });
+    });
+    const health = await fetch(`${origin}/__ctl/health`);
+    if (!health.ok) throw new Error(`/__ctl/health answered HTTP ${health.status}`);
+  } catch (error) {
+    await stop();
+    throw new Error(
+      `e2e stub server on port ${port}: ${(error as Error).message}\n` +
+        `A port already in use fails here on purpose: set E2E_PORT to a free range.\n` +
+        `--- server output ---\n${output}`,
+    );
+  }
+
+  // Startup output has served its purpose; from here on, whatever the
+  // server says (a crash stack, say) goes to the worker's own streams.
+  child.stdout.off('data', collect);
+  child.stderr.off('data', collect);
+  child.stdout.pipe(process.stdout, { end: false });
+  child.stderr.pipe(process.stderr, { end: false });
+  return { origin, stop };
+}
 
 // The reset / network-guard / pageerror / unstubbed contract rides an
 // AUTO FIXTURE, not `test.beforeEach`. This module is loaded once per
@@ -24,7 +99,33 @@ type PageErrors = { errors: Error[] };
 // homelab-independence guard and no pageerror check. An auto fixture is
 // attached to the `test` object itself, so it runs for every test that
 // imports it, whatever the file.
-export const test = base.extend<{ pageErrors: PageErrors; contract: void }>({
+//
+// The stub server is per WORKER. harness/server.mjs holds one mutable
+// "current scenario" (see its `/__ctl/reset` contract), so two tests may
+// never share a server; a worker runs one test at a time, so one server
+// per worker is exactly enough. Worker N listens on E2E_PORT + N (its
+// `parallelIndex`), and `baseURL` points `page` and `request` at it. A
+// worker that Playwright replaces after a failure reuses the index, and
+// the runner waits for the old worker's teardown, so the old server has
+// released the port before the new one binds it.
+export const test = base.extend<{ pageErrors: PageErrors; contract: void }, { stubOrigin: string }>({
+  stubOrigin: [
+    async ({}, use, workerInfo) => {
+      const port = Number(process.env.E2E_PORT ?? 8123) + workerInfo.parallelIndex;
+      const stub = await startStub(port);
+      try {
+        await use(stub.origin);
+      } finally {
+        await stub.stop();
+      }
+    },
+    { scope: 'worker', timeout: STUB_START_TIMEOUT_MS + 10_000 },
+  ],
+
+  baseURL: async ({ stubOrigin }, use) => {
+    await use(stubOrigin);
+  },
+
   pageErrors: async ({ page }, use) => {
     const bucket: PageErrors = { errors: [] };
     page.on('pageerror', (err) => bucket.errors.push(err));
@@ -32,7 +133,7 @@ export const test = base.extend<{ pageErrors: PageErrors; contract: void }>({
   },
 
   contract: [
-    async ({ page, request, pageErrors }, use) => {
+    async ({ page, request, pageErrors, stubOrigin }, use) => {
       // Default scenario; a spec that needs a different one calls
       // `resetScenario(request, name)` itself at the top of the test
       // body — simpler than threading it through a hook, since
@@ -41,12 +142,13 @@ export const test = base.extend<{ pageErrors: PageErrors; contract: void }>({
       await request.post('/__ctl/reset', { data: { scenario: 'default' } });
 
       // Homelab-independence contract: abort any request whose origin
-      // isn't our own stub server. `data:`/`blob:` are allowed (inline
-      // fonts, blob-backed workers).
+      // isn't this worker's own stub server — the same origin `baseURL`
+      // carries, so the guard can never disagree with where the stub is.
+      // `data:`/`blob:` are allowed (inline fonts, blob-backed workers).
       await page.context().route('**/*', (route) => {
         const url = new URL(route.request().url());
         const ok =
-          url.origin === E2E_ORIGIN ||
+          url.origin === stubOrigin ||
           url.protocol === 'data:' ||
           url.protocol === 'blob:';
         if (ok) {
