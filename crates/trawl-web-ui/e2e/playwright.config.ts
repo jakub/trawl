@@ -44,7 +44,9 @@ export default defineConfig({
   reporter: process.env.CI ? [['github'], ['list']] : [['list']],
   use: {
     trace: 'retain-on-failure',
-    screenshot: 'only-on-failure',
+    // The contract fixture in fixtures.ts takes the failure screenshot
+    // while routes still answer; see the comment there.
+    screenshot: 'off',
     viewport: { width: 1440, height: 900 },
     locale: 'en-US',
     timezoneId: 'UTC',

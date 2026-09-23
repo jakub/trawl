@@ -133,7 +133,7 @@ export const test = base.extend<{ pageErrors: PageErrors; contract: void }, { st
   },
 
   contract: [
-    async ({ page, request, pageErrors, stubOrigin }, use) => {
+    async ({ page, request, pageErrors, stubOrigin }, use, testInfo) => {
       // Default scenario; a spec that needs a different one calls
       // `resetScenario(request, name)` itself at the top of the test
       // body — simpler than threading it through a hook, since
@@ -160,26 +160,54 @@ export const test = base.extend<{ pageErrors: PageErrors; contract: void }, { st
 
       await use();
 
-      // console.error is deliberately NOT checked — headless-GL / wasm
-      // warmup noise is expected and not a test failure. A JS exception
-      // (pageerror) is a real bug and does fail the test.
-      if (pageErrors.errors.length > 0) {
-        throw pageErrors.errors[0];
+      // The failure screenshot is taken here, not by Playwright's `screenshot`
+      // option (off in playwright.config.ts). Playwright takes that one while
+      // closing the context, and a closing context no longer dispatches
+      // routes, so every request the page starts then hangs on the guard
+      // above. The screenshot waits for web fonts, so a test that ended
+      // while a new document was loading paid a flat 5 s timeout, and every
+      // passing test paid for a screenshot that was thrown away. Here the
+      // routes still answer, and only a failure pays.
+      let failed = testInfo.status !== testInfo.expectedStatus;
+      try {
+        // console.error is deliberately NOT checked — headless-GL / wasm
+        // warmup noise is expected and not a test failure. A JS exception
+        // (pageerror) is a real bug and does fail the test.
+        if (pageErrors.errors.length > 0) {
+          throw pageErrors.errors[0];
+        }
+        const state = await (await request.get('/__ctl/state')).json();
+        expect(state.unstubbed, `unstubbed /api/* calls: ${JSON.stringify(state.unstubbed)}`).toEqual(
+          [],
+        );
+        // The same claim one level down. Under `corpus` a pipeline with no
+        // fixture is answered with a 500 and recorded here, and the page
+        // renders that as an ordinary query error — which no assertion in
+        // any spec would notice. Recording it and never reading it made
+        // the record decoration. A hit here is a fixture gap: add the
+        // shape to harness/server.mjs, never loosen this.
+        expect(
+          state.unhandledQueries ?? [],
+          `corpus queries with no fixture: ${JSON.stringify(state.unhandledQueries)}`,
+        ).toEqual([]);
+      } catch (error) {
+        failed = true;
+        throw error;
+      } finally {
+        if (failed) {
+          // Every open page, as Playwright's own option did (a test may leave
+          // a second tab open when it fails), with its file names, in the
+          // test's output directory, which CI uploads on failure. A page that
+          // closes meanwhile has nothing to capture.
+          let index = 0;
+          for (const open of page.context().pages()) {
+            const path = testInfo.outputPath(`test-failed-${++index}.png`);
+            if (await open.screenshot({ path, timeout: 5_000 }).then(() => true, () => false)) {
+              await testInfo.attach('screenshot', { path, contentType: 'image/png' });
+            }
+          }
+        }
       }
-      const state = await (await request.get('/__ctl/state')).json();
-      expect(state.unstubbed, `unstubbed /api/* calls: ${JSON.stringify(state.unstubbed)}`).toEqual(
-        [],
-      );
-      // The same claim one level down. Under `corpus` a pipeline with no
-      // fixture is answered with a 500 and recorded here, and the page
-      // renders that as an ordinary query error — which no assertion in
-      // any spec would notice. Recording it and never reading it made
-      // the record decoration. A hit here is a fixture gap: add the
-      // shape to harness/server.mjs, never loosen this.
-      expect(
-        state.unhandledQueries ?? [],
-        `corpus queries with no fixture: ${JSON.stringify(state.unhandledQueries)}`,
-      ).toEqual([]);
     },
     { auto: true },
   ],
