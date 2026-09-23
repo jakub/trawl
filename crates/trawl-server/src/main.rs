@@ -12,6 +12,7 @@ use clap::Parser;
 use tracing_subscriber::fmt;
 use tracing_subscriber::util::SubscriberInitExt;
 use trawl_server::config::Config;
+use trawl_server::error::join_failure_text;
 use trawl_server::state::AppState;
 use trawl_server::telemetry::{self, WalHandle, WalLayer};
 use trawl_server::transport::http;
@@ -550,7 +551,7 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
         let _ = shutdown_tx.send(true);
         for handle in handles {
             if let Err(e) = handle.await {
-                tracing::warn!(event_type = "task_panic", task = "syslog", error = %e, "syslog task panicked during shutdown");
+                tracing::warn!(event_type = "task_panic", task = "syslog", error = %join_failure_text("syslog", e), "syslog task panicked during shutdown");
             }
         }
     }
@@ -588,7 +589,7 @@ async fn shutdown_task(task: Option<(JoinHandle<()>, watch::Sender<bool>)>, name
     if let Some((handle, shutdown_tx)) = task {
         let _ = shutdown_tx.send(true);
         if let Err(e) = handle.await {
-            tracing::warn!(event_type = "task_panic", task = name, error = %e, "task panicked during shutdown");
+            tracing::warn!(event_type = "task_panic", task = name, error = %join_failure_text(name, e), "task panicked during shutdown");
         }
     }
 }

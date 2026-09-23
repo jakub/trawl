@@ -334,7 +334,7 @@ pub async fn ensure_conformance(
         let pinned = existing.clone();
         tokio::task::spawn_blocking(move || scan_corpus(&data_dir, &memory_limit, &pinned))
             .await
-            .map_err(|e| format!("conformance scan task panicked: {e}"))??
+            .map_err(|e| crate::error::join_failure_text("conformance scan", e))??
     };
 
     // Seed pins: declared fields came with the migration; custom fields by
@@ -366,7 +366,7 @@ pub async fn ensure_conformance(
             rewrite_nonconforming(&scan, &pins, &data_dir, &memory_limit)
         })
         .await
-        .map_err(|e| format!("conformance rewrite task panicked: {e}"))??
+        .map_err(|e| crate::error::join_failure_text("conformance rewrite", e))??
     };
     let skipped = scan_skipped + rewrite_skipped;
 

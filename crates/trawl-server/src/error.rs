@@ -471,6 +471,18 @@ impl ServerError {
     }
 }
 
+/// Fixed text for a background task that did not return, for callers that
+/// carry or log the failure as a string on a persisted target (compaction,
+/// boot conformance, the periodic and shutdown task owners). The payload is
+/// dropped unread, as in [`ServerError::from_join`]: it can quote event
+/// values.
+pub fn join_failure_text(what: &str, e: tokio::task::JoinError) -> String {
+    match e.try_into_panic() {
+        Ok(_payload) => format!("{what} task panicked"),
+        Err(_cancelled) => format!("{what} task was cancelled"),
+    }
+}
+
 impl From<crate::store::WindowWriteError> for ServerError {
     /// Split a checked window write back into the two answers it already
     /// carries. Neither half gains or loses anything here: the store fault
