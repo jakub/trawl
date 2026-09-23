@@ -889,7 +889,6 @@ impl WalLayer {
         let Some((writer, env)) = self.inner.handle.get() else {
             return;
         };
-        self.inner.report_drops(DropReport::Idle);
         self.inner.stage();
         let mut coalesce = false;
         while let Some(batch) = self.inner.pop_drain_unit(coalesce) {
@@ -908,6 +907,7 @@ impl WalLayer {
                 }
             }
         }
+        self.inner.report_idle_drops();
         self.inner.update_gauges();
     }
 
@@ -924,9 +924,6 @@ impl WalLayer {
         let Some((writer, env)) = self.inner.handle.get() else {
             return;
         };
-        // A deferred `unmetered_cap` summary whose window has opened is
-        // buffered first, so this cycle writes it even with no other batch.
-        self.inner.report_drops(DropReport::Idle);
         self.inner.stage();
         let mut coalesce = false;
         while let Some(batch) = self.inner.pop_drain_unit(coalesce) {
@@ -982,6 +979,7 @@ impl WalLayer {
                 }
             }
         }
+        self.inner.report_idle_drops();
         self.inner.update_gauges();
     }
 }
@@ -1258,6 +1256,17 @@ impl WalLayerInner {
         self.report_drops(DropReport::AfterWrite);
     }
 
+    /// Ask for an Idle report at the end of a flush cycle, once the retry
+    /// queue is empty: the active buffer has just been drained, so the
+    /// record is admitted rather than refused by a nearly full buffer, and
+    /// the next cycle writes it with no other traffic. While the queue
+    /// holds a failed batch the counts wait for the write that drains it.
+    fn report_idle_drops(&self) {
+        if self.pending.lock().is_empty() {
+            self.report_drops(DropReport::Idle);
+        }
+    }
+
     /// Emit the `telemetry_dropped` recovery record if any loss has
     /// accumulated (safe from recursion: `on_event` only buffers, and the
     /// next write carries the record). `when` picks which losses are due:
@@ -1266,9 +1275,8 @@ impl WalLayerInner {
     ///   reporting only `unmetered_cap` waits for its window
     ///   ([`Self::take_unmetered_only_drops`]).
     /// - [`DropReport::Idle`]: only such a waiting `unmetered_cap` count,
-    ///   once its window has opened. The periodic flush asks every cycle,
-    ///   so the count reaches the WAL without other traffic. Other reasons
-    ///   are left for the write that follows.
+    ///   once its window has opened ([`Self::report_idle_drops`]). Other
+    ///   reasons are left for the write that follows.
     /// - [`DropReport::Final`]: everything, regardless of the window. The
     ///   shutdown drain's one last record.
     fn report_drops(&self, when: DropReport) {
@@ -2226,6 +2234,29 @@ mod tests {
             .filter(|event| event["event_type"] == "http_failure")
             .count();
         assert_eq!(failures, UNMETERED_FAILURE_CAP_PER_MINUTE as usize);
+    }
+
+    /// A due summary is buffered where the flush has just drained the
+    /// active buffer, never ahead of a nearly full one: refused admission
+    /// there would lose the deferred count along with the record.
+    #[tokio::test]
+    async fn a_due_summary_is_not_refused_by_a_nearly_full_buffer() {
+        let (tmp, layer, _guard) = deferred_summary_fixture();
+        let env_dir = tmp.path().join("prod");
+        let dropped = defer_unmetered_drops(&layer, 5);
+        *layer.inner.clock_offset.lock() += UNMETERED_FAILURE_WINDOW;
+
+        for n in 0..20 {
+            tracing::info!(target: "trawld", n, "ordinary traffic");
+        }
+        let charge = layer.inner.active.lock().charge();
+        layer
+            .inner
+            .max_buffer_bytes
+            .store(charge + 100, Ordering::Relaxed);
+        layer.flush_cycle().await;
+        layer.flush_cycle().await;
+        assert_eq!(reported_unmetered_drops(&env_dir), dropped);
     }
 
     /// Shutdown inside the closed window still stores the deferred drops:
