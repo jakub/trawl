@@ -681,9 +681,9 @@ jobs:
     name: web UI browser tests (playwright ${{ matrix.shard }}/4)
     runs-on: k8s-small
     needs: trunk-build
-    # The suite runs on one worker against one stub server (see
-    # playwright.config.ts), so it is split across jobs instead: each shard
-    # starts its own server. fail-fast is off so one red shard still lets
+    # CI runs one worker per job (see playwright.config.ts), so the suite
+    # is split across jobs instead, each with its own stub server.
+    # fullyParallel lets the split fall between tests of one file. fail-fast is off so one red shard still lets
     # the others report their results.
     strategy:
       fail-fast: false

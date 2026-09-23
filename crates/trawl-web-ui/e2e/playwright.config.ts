@@ -29,7 +29,11 @@ export default defineConfig({
   // dir". Relative paths here resolve against this file's directory.
   outputDir: '../../../e2e-artifacts/test-results',
   workers: process.env.CI ? 1 : 4,
-  fullyParallel: false,
+  // Tests are independent (the contract fixture resets the scenario before
+  // each one), so a file's tests may run on different workers and shards.
+  // Without this, CI's --shard split whole files, and login-return.spec.ts
+  // alone kept one shard busy for twice as long as the others.
+  fullyParallel: true,
   retries: 0,
   timeout: 20_000,
   expect: { timeout: 5_000 },
