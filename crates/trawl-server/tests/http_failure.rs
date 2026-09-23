@@ -228,9 +228,13 @@ fn assert_no_failure_carries(sentinels: &[&str]) {
 
 // -- requests -----------------------------------------------------------------
 
+/// A client that trusts exactly the shared test certificate, whose SAN
+/// covers `127.0.0.1` and `localhost`, with validation on.
 fn raw_client() -> reqwest::Client {
+    let (cert_path, _) = common::ensure_test_cert();
+    let certificate = reqwest::Certificate::from_pem(&std::fs::read(cert_path).unwrap()).unwrap();
     reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
+        .add_root_certificate(certificate)
         .build()
         .unwrap()
 }
