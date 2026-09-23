@@ -58,73 +58,85 @@ for (const failure of ['rejection', 'server', 'network'] as const) {
   });
 }
 
-test('canonical routes, aliases and one trailing slash retain their complete suffix', async ({ page, request }) => {
-  test.setTimeout(90000);
-  await resetScenario(request, 'corpus');
-  // Health reads queries on mount; the corpus scenario covers Search and Jobs.
-  await page.route('**/api/v1/queries', route => route.request().method() === 'GET'
-    ? route.fulfill({ json: { active: [], recent: [], retained: [] } })
-    : route.fallback());
-  await page.route('**/api/auth/login', route => route.fulfill({ json: identity }));
-  const suffix = '?note=%252F+a%2Bb&next=https%3A%2F%2Fexample.com%2Fa#row?value';
-  for (const [path, canonical] of [
-    ['/search', '/search'], ['/search/history', '/search/history'],
-    ['/search/schema', '/search/schema'], ['/jobs/nets', '/jobs/nets'],
-    ['/jobs/runs', '/jobs/runs'], ['/settings/health', '/settings/health'],
-    ['/', '/search'], ['/jobs', '/jobs/nets'], ['/settings', '/settings/health'],
-  ]) {
-    for (const ending of path === '/' ? [''] : ['', '/']) {
-      await page.goto(`/login?return_to=${component(path + ending + suffix)}`);
+// One test per case, not one loop per test: each sign-in round trip gets
+// its own time budget, and the cases spread across workers and CI shards.
+// As loops, these two tests ran up to 27 sign-ins against one budget and
+// timed out whenever a shard's runner was busy.
+const returnSuffix = '?note=%252F+a%2Bb&next=https%3A%2F%2Fexample.com%2Fa#row?value';
+const canonicalRoutes: [string, string][] = [
+  ['/search', '/search'], ['/search/history', '/search/history'],
+  ['/search/schema', '/search/schema'], ['/jobs/nets', '/jobs/nets'],
+  ['/jobs/runs', '/jobs/runs'], ['/settings/health', '/settings/health'],
+  ['/', '/search'], ['/jobs', '/jobs/nets'], ['/settings', '/settings/health'],
+];
+for (const [path, canonical] of canonicalRoutes) {
+  for (const ending of path === '/' ? [''] : ['', '/']) {
+    test(`${path}${ending} returns to ${canonical} with its complete suffix`, async ({ page, request }) => {
+      await resetScenario(request, 'corpus');
+      // Health reads queries on mount; the corpus scenario covers Search and Jobs.
+      await page.route('**/api/v1/queries', route => route.request().method() === 'GET'
+        ? route.fulfill({ json: { active: [], recent: [], retained: [] } })
+        : route.fallback());
+      await page.route('**/api/auth/login', route => route.fulfill({ json: identity }));
+      await page.goto(`/login?return_to=${component(path + ending + returnSuffix)}`);
       await signIn(page);
-      await expect(page).toHaveURL(url => relative(url) === canonical + suffix);
+      await expect(page).toHaveURL(url => relative(url) === canonical + returnSuffix);
+      // The URL changes before the SPA boots. Wait for the mounted shell:
+      // closing a context mid-boot stalls for Chromium's renderer shutdown.
+      await expect(page.getByRole('main')).toBeVisible();
       if (canonical === '/settings/health') {
-        // Observe the mounted page before the next iteration navigates away.
+        // Observe the mounted page, as the rest of this file does for Health.
         await expect(page.locator(SEL.healthQueries)).toContainText('No active or recent queries.');
       }
-    }
+    });
   }
-});
+}
 
-test('hostile return values fall back without attempting foreign or forbidden document requests', async ({ page, baseURL }) => {
-  test.setTimeout(120000);
-  const attempted: string[] = [];
-  // Record before aborting: the global fixture also blocks foreign origins,
-  // so a final-URL assertion alone cannot prove no unsafe attempt occurred.
-  await page.route('**/*', route => {
-    const req = route.request();
-    const url = new URL(req.url());
-    if (req.isNavigationRequest() && req.frame() === page.mainFrame()) {
-      attempted.push(req.url());
-      if (url.origin !== new URL(baseURL!).origin || !['/login', '/search'].includes(url.pathname)) {
-        return route.abort();
-      }
-    }
-    return route.fallback();
-  });
-  await page.route('**/api/auth/login', route => route.fulfill({ json: identity }));
-  const values = [
-    `${baseURL}/search`, 'https://outside.invalid/search', '//outside.invalid/search',
-    '//', '/search\\evil', '/search/../login', '/%73earch', '/search%2f',
-    'javascript:alert(1)', 'https://user:pass@outside.invalid/search',
-    '/api/auth/me', '/unknown', '/login', '/search//', '/search?x=\u0000', '/search#\u007f',
-  ];
-  const queries = [
-    ...values.map(value => `return_to=${component(value)}`),
-    '', 'return_to=', 'return_to=%', 'return_to=%GG', 'return_to=%FF',
+const hostileReturnValues = [
+  'BASE/search', 'https://outside.invalid/search', '//outside.invalid/search',
+  '//', '/search\\evil', '/search/../login', '/%73earch', '/search%2f',
+  'javascript:alert(1)', 'https://user:pass@outside.invalid/search',
+  '/api/auth/me', '/unknown', '/login', '/search//', '/search?x=\u0000', '/search#\u007f',
+];
+const hostileQueries = [
+  ...hostileReturnValues.map(value => ({ value })),
+  ...['', 'return_to=', 'return_to=%', 'return_to=%GG', 'return_to=%FF',
     'return_to=%ED%A0%80', 'return_to=%252Fsearch',
     'return_to=/jobs/runs&%72eturn_to=/jobs/nets',
     'return_to=/jobs/runs&return_to=/jobs/runs',
     'return_to=/jobs/runs&other=%FF', '%FF=x&return_to=/jobs/runs',
-  ];
-  for (const query of queries) {
-    attempted.length = 0;
+  ].map(raw => ({ raw })),
+];
+for (const hostile of hostileQueries) {
+  const label = 'value' in hostile ? `return_to ${JSON.stringify(hostile.value)}` : `query ${JSON.stringify(hostile.raw)}`;
+  test(`hostile ${label} falls back without a foreign or forbidden document request`, async ({ page, baseURL }) => {
+    const attempted: string[] = [];
+    // Record before aborting: the global fixture also blocks foreign origins,
+    // so a final-URL assertion alone cannot prove no unsafe attempt occurred.
+    await page.route('**/*', route => {
+      const req = route.request();
+      const url = new URL(req.url());
+      if (req.isNavigationRequest() && req.frame() === page.mainFrame()) {
+        attempted.push(req.url());
+        if (url.origin !== new URL(baseURL!).origin || !['/login', '/search'].includes(url.pathname)) {
+          return route.abort();
+        }
+      }
+      return route.fallback();
+    });
+    await page.route('**/api/auth/login', route => route.fulfill({ json: identity }));
+    // The first value is this worker's own origin, known only at run time.
+    const query = 'value' in hostile
+      ? `return_to=${component(hostile.value.replace(/^BASE/, baseURL!))}`
+      : hostile.raw;
     await page.goto(`/login?${query}`);
     await signIn(page);
     await expect(page).toHaveURL(url => relative(url) === '/search');
+    await expect(page.getByRole('main')).toBeVisible();
     expect(attempted.map(value => new URL(value).pathname), query).toEqual(['/login', '/search']);
     expect(attempted.every(value => new URL(value).origin === new URL(baseURL!).origin)).toBe(true);
-  }
-});
+  });
+}
 
 test('direct sign-in stays open with an existing session, empty validation retains its destination, and Unicode survives', async ({ page }) => {
   let loginCalls = 0;

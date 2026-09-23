@@ -33,8 +33,26 @@ npm run test                          # -- --headed / --grep <pattern>
 `--skip-build` fails loudly at server startup (not silently against a
 stale build) if `dist/index.html` is missing.
 
+### Workers and ports
+
+There is no Playwright `webServer`. Each worker starts its own
+`harness/server.mjs` from the worker-scoped `stubOrigin` fixture in
+`fixtures.ts`, on port `E2E_PORT + parallelIndex` (`E2E_PORT` defaults
+to 8123), and every test's `baseURL` points at its own worker's server.
+A stub server keeps one mutable scenario, so it must never serve two
+tests at once. A server per worker gives that at any worker count.
+
+Local runs default to four workers, so `npm run test` runs four servers
+on `E2E_PORT` through `E2E_PORT + 3` and the full suite takes about three
+and a half minutes instead of nine. Under `CI=true` the default is one
+worker. `--workers=N` overrides either. Suites running side by side
+need port ranges that do not overlap. A port already in use fails the
+worker with the server's own output. The suite never reuses a server
+that is already listening, because that server may serve another
+worktree's dist.
+
 The harness serves a private copy of that `dist/`, taken at startup into
-`e2e-artifacts/dist-snapshot-<port>/` and checked against index.html's
+`e2e-artifacts/dist-snapshot-<port>/` (one per worker's port) and checked against index.html's
 own asset list. A `trunk serve` running from the same checkout writes the
 same directory, so without the copy a rebuild mid-run pulls the hashed
 wasm out from under the browser, and trunk's injected autoreload client
@@ -60,8 +78,8 @@ the SPA: it downloads the `trawl-web-ui-dist` artifact from the
 `trunk-build` job, then runs `npm ci`, `npx playwright install
 --with-deps chromium`, and `npm run test -- --shard=N/4
 --global-timeout=1500000` as discrete steps, so the browser job compiles
-no Rust. The job is a four-shard matrix. Each shard is a separate job with
-its own stub server, so the suite stays single-worker inside each shard.
+no Rust. The job is a four-shard matrix. Each shard is a separate job that runs
+one worker (the `CI=true` default), so each shard runs one stub server.
 Shard 1 also runs the BFCache suite. Each shard uploads its own
 `e2e-traces-N` on failure. The shard that runs `theme-preference.spec.ts`
 uploads the System screenshots as `theme-menu-captures-N`, and the
@@ -154,8 +172,9 @@ directory. This override leaves per-test timeouts, assertions and
 Every spec imports `test` from `fixtures.ts`, and that object carries an
 **auto fixture** that resets the stub to the `default` scenario, installs
 the homelab-independence network guard, and afterwards fails the test on
-any `pageerror` or unstubbed `/api/*` call. It is an auto fixture rather
-than a `test.beforeEach` on purpose: this module is loaded once per
+any `pageerror` or unstubbed `/api/*` call. The guard allows exactly the
+worker's own `stubOrigin`, the same origin `baseURL` carries. It is an
+auto fixture rather than a `test.beforeEach` on purpose: this module is loaded once per
 worker, so a hook written here is registered against whichever spec file
 imported it first and silently never runs for the others. That is what
 was happening — only `api-failure.spec.ts` was getting the reset and the
