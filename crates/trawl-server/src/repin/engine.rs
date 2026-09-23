@@ -222,6 +222,15 @@ pub static TEST_SCAN_HELD: std::sync::atomic::AtomicBool =
 pub static TEST_RELEASE_SCAN: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Test-only panic at the start of the scan (`plan::scan`), armed once.
+///
+/// A panic on the blocking pool is the one scan failure no corpus can
+/// produce on demand, and the request must answer it as a panic, not as
+/// an ordinary internal error (ADR-0040).
+#[cfg(any(test, feature = "test-support"))]
+pub static TEST_PANIC_IN_SCAN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Test-only hold at the finished-shadow force refusal, after the gate has
 /// decided to refuse and before the job settles that verdict against a
 /// pending cancel (#109).
@@ -521,7 +530,7 @@ impl RepinEngine {
                         );
                     }
                 }
-                let msg = join_failure("job", &e);
+                let msg = StepDied::from_join("repin job", &e).to_string();
                 self.finish(job_id, RepinJobStatus::Failed, Some(&msg), None)
                     .await;
                 Err(ServerError::from_join("repin job", e))
@@ -651,7 +660,7 @@ impl RepinEngine {
         // Post-claim, so the refusal is a terminal job row the status
         // surface reports rather than a stranded running slot.
         let data_dir = self.data_dir.clone();
-        match on_blocking_pool("staging pre-flight", move || {
+        match on_blocking_pool("repin staging pre-flight", move || {
             crate::repin::marker::check_staging_filesystem(&data_dir)
         })
         .await
@@ -666,28 +675,35 @@ impl RepinEngine {
                 }
                 return Err(ServerError::BadRequest(msg));
             }
-            Err(msg) => {
+            // The row gets the fixed text; the request gets the typed
+            // failure, so a panic answers as one.
+            Err(died) => {
                 if self
-                    .settle_pre_cutover(job_id, STAGE_SCAN, RepinJobStatus::Failed, Some(&msg))
+                    .settle_pre_cutover(
+                        job_id,
+                        STAGE_SCAN,
+                        RepinJobStatus::Failed,
+                        Some(&died.to_string()),
+                    )
                     .await
                 {
                     return self.cancelled_outcome(job_id).await;
                 }
-                return Err(ServerError::Internal(msg));
+                return Err(died.into());
             }
         }
 
         let (counts, tallies, samples) = match self.run_scan(&field, reading, &cancel).await {
-            Ok(measured) => measured,
+            Ok(Ok(measured)) => measured,
             // A cancel observed inside the scan: nothing has been staged
             // and no marker exists, so the whole unwind is the terminal
             // write.
-            Err(PassStop::Cancelled { stage }) => {
+            Ok(Err(PassStop::Cancelled { stage })) => {
                 let actor = self.settle_cancel(job_id, stage);
                 self.finish_cancelled(job_id, stage, actor).await;
                 return self.cancelled_outcome(job_id).await;
             }
-            Err(PassStop::Failed(e)) => {
+            Ok(Err(PassStop::Failed(e))) => {
                 if self
                     .settle_pre_cutover(job_id, STAGE_SCAN, RepinJobStatus::Failed, Some(&e))
                     .await
@@ -695,6 +711,22 @@ impl RepinEngine {
                     return self.cancelled_outcome(job_id).await;
                 }
                 return Err(ServerError::Internal(format!("repin scan failed: {e}")));
+            }
+            // As the pre-flight: fixed text for the row, the typed failure
+            // for the request.
+            Err(died) => {
+                if self
+                    .settle_pre_cutover(
+                        job_id,
+                        STAGE_SCAN,
+                        RepinJobStatus::Failed,
+                        Some(&died.to_string()),
+                    )
+                    .await
+                {
+                    return self.cancelled_outcome(job_id).await;
+                }
+                return Err(died.into());
             }
         };
         let liveness = self.field_liveness(&field).await;
@@ -886,16 +918,15 @@ impl RepinEngine {
         field: &str,
         reading: RepinReading,
         cancel: &CancelHandle,
-    ) -> Result<(ScanCounts, ScanTallies, Vec<String>), PassStop> {
+    ) -> Result<Result<(ScanCounts, ScanTallies, Vec<String>), PassStop>, StepDied> {
         let data_dir = self.data_dir.clone();
         let memory_limit = self.memory_limit.clone();
         let field = field.to_owned();
         let cancel = cancel.clone();
-        on_blocking_pool("scan", move || {
+        on_blocking_pool("repin scan", move || {
             scan(&data_dir, &memory_limit, &field, reading, &cancel)
         })
         .await
-        .map_err(PassStop::Failed)?
     }
 
     /// Is anything still writing this field? The newest observation inside
@@ -1309,12 +1340,14 @@ impl RepinEngine {
         // sweep strands whichever root survived, which suppresses
         // retention forever. Keep it and let the replay retry.
         let data_dir = self.data_dir.clone();
-        let swept = on_blocking_pool("abandon sweep", move || sweep_pre_swap_staging(&data_dir))
+        let swept = on_blocking_pool("repin abandon sweep", move || {
+            sweep_pre_swap_staging(&data_dir)
+        })
             .await
-            .unwrap_or_else(|msg| {
+            .unwrap_or_else(|died| {
                 // A panicked sweep is a sweep that did not finish: keep the
                 // marker, exactly as a failed one does.
-                tracing::warn!(event_type = "repin_sweep_failed", error = %msg, "abandon sweep task failed");
+                tracing::warn!(event_type = "repin_sweep_failed", error = %died, "abandon sweep task failed");
                 false
             });
         if swept {
@@ -1357,10 +1390,12 @@ impl RepinEngine {
         // files into the live corpus at the swap, including rows retention
         // has since deleted. Refuse rather than layer.
         let data_dir = self.data_dir.clone();
-        let shadow = on_blocking_pool("shadow prepare", move || prepare_shadow_root(&data_dir))
-            .await
-            .map_err(JobAbort::Failed)?
-            .map_err(JobAbort::Failed)?;
+        let shadow = on_blocking_pool("repin shadow prepare", move || {
+            prepare_shadow_root(&data_dir)
+        })
+        .await
+        .map_err(|died| JobAbort::Failed(died.to_string()))?
+        .map_err(JobAbort::Failed)?;
 
         // The one-entry-flipped pin map every rewrite conforms against.
         let mut flipped = self.cache.snapshot();
@@ -1702,12 +1737,12 @@ impl RepinEngine {
         // pin is flipped, so an undeletable marker is leftover disk, not a
         // repin that "left the corpus untouched".
         let data_dir = self.data_dir.clone();
-        if let Err(msg) = on_blocking_pool("post-swap sweep", move || {
+        if let Err(died) = on_blocking_pool("repin post-swap sweep", move || {
             finish_post_swap_staging(&data_dir);
         })
         .await
         {
-            tracing::warn!(event_type = "repin_sweep_failed", error = %msg, "post-swap sweep task failed");
+            tracing::warn!(event_type = "repin_sweep_failed", error = %died, "post-swap sweep task failed");
         }
         Ok(())
     }
@@ -1734,7 +1769,7 @@ impl RepinEngine {
         let mut taken = std::mem::take(state);
         // A cancelled pass returns its state like any other, so the work
         // already staged is still described when the sweep runs.
-        let (returned, changed) = on_blocking_pool("pass", move || {
+        let (returned, changed) = on_blocking_pool("repin pass", move || {
             let changed = run_pass_blocking(
                 &data_dir,
                 &shadow,
@@ -1749,7 +1784,7 @@ impl RepinEngine {
             (taken, changed)
         })
         .await
-        .map_err(JobAbort::Failed)?;
+        .map_err(|died| JobAbort::Failed(died.to_string()))?;
         *state = returned;
         Ok(changed?)
     }
@@ -1797,26 +1832,57 @@ impl RepinEngine {
 /// same reason the scan and every build pass already go through
 /// `spawn_blocking`. A panicked task surfaces as an `Err` here so the
 /// caller decides, rather than vanishing into a dropped `JoinHandle`.
-async fn on_blocking_pool<T, F>(what: &'static str, f: F) -> Result<T, String>
+async fn on_blocking_pool<T, F>(what: &'static str, f: F) -> Result<T, StepDied>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
     tokio::task::spawn_blocking(f)
         .await
-        .map_err(|e| join_failure(what, &e))
+        .map_err(|e| StepDied::from_join(what, &e))
 }
 
-/// The fixed text for a repin task that did not return, naming the step.
+/// A repin task that did not return, named by a fixed label.
 ///
-/// This text becomes the stored job error that the status route serves,
-/// and `JoinError`'s `Display` quotes a panic payload, so the join error
-/// itself is never formatted.
-fn join_failure(what: &'static str, e: &tokio::task::JoinError) -> String {
-    if e.is_panic() {
-        format!("repin {what} task panicked")
-    } else {
-        format!("repin {what} task was cancelled")
+/// Typed rather than text so a request-facing step can answer a panic as
+/// [`ServerError::Panicked`]: the detached decision task completes normally
+/// around a panicked blocking step, so its own join never reports one.
+/// `Display` is the fixed text the stored job error and the logs carry.
+/// Neither variant holds the payload: `JoinError`'s `Display` quotes it,
+/// so the join error is read for its kind and dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StepDied {
+    Panicked(&'static str),
+    Cancelled(&'static str),
+}
+
+impl StepDied {
+    fn from_join(what: &'static str, e: &tokio::task::JoinError) -> Self {
+        if e.is_panic() {
+            Self::Panicked(what)
+        } else {
+            Self::Cancelled(what)
+        }
+    }
+}
+
+impl std::fmt::Display for StepDied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Panicked(what) => write!(f, "{what} task panicked"),
+            Self::Cancelled(what) => write!(f, "{what} task was cancelled"),
+        }
+    }
+}
+
+impl From<StepDied> for ServerError {
+    /// The same split [`ServerError::from_join`] makes: a panic keeps its
+    /// class, a cancellation is an ordinary internal error.
+    fn from(died: StepDied) -> Self {
+        match died {
+            StepDied::Panicked(what) => Self::Panicked(what),
+            StepDied::Cancelled(_) => Self::Internal(died.to_string()),
+        }
     }
 }
 
@@ -2229,35 +2295,42 @@ fn parse_target(to: &str) -> Result<CanonicalType, ServerError> {
 mod tests {
     use super::*;
 
-    /// A panicked blocking step answers fixed text naming the step. Its
-    /// payload never enters the string, because that string becomes the
-    /// stored job error the status route serves.
+    /// A panicked blocking step answers a typed failure naming the step.
+    /// Its fixed text becomes the stored job error the status route serves,
+    /// and it reaches the request as a panic; the payload enters neither.
     #[tokio::test]
     async fn a_panicked_blocking_step_never_carries_its_payload() {
-        let msg = on_blocking_pool::<(), _>("probe", || panic!("zz_repin_payload_sentinel"))
+        let died = on_blocking_pool::<(), _>("repin probe", || panic!("zz_repin_payload_sentinel"))
             .await
             .expect_err("the step panics");
-        assert!(!msg.contains("zz_repin_payload_sentinel"), "{msg}");
-        assert_eq!(msg, "repin probe task panicked");
+        assert_eq!(died, StepDied::Panicked("repin probe"));
+        assert_eq!(died.to_string(), "repin probe task panicked");
+        let err = ServerError::from(died);
+        assert!(
+            matches!(err, ServerError::Panicked("repin probe")),
+            "got {err:?}"
+        );
+        assert!(!format!("{died:?} {err} {err:?}").contains("zz_repin_payload_sentinel"));
     }
 
-    /// The same for the detached decision task, whose join failure is both
-    /// the stored job error and the start response's error.
+    /// The same for the detached decision task, whose join failure is the
+    /// stored job error. A cancelled step is an ordinary internal error.
     #[tokio::test]
     async fn a_panicked_decision_task_never_carries_its_payload() {
         let panicked = tokio::spawn(async { panic!("zz_repin_payload_sentinel") })
             .await
             .expect_err("the task panics");
-        let msg = join_failure("job", &panicked);
+        let msg = StepDied::from_join("repin job", &panicked).to_string();
         assert!(!msg.contains("zz_repin_payload_sentinel"), "{msg}");
         assert_eq!(msg, "repin job task panicked");
 
         let pending = tokio::spawn(std::future::pending::<()>());
         pending.abort();
         let cancelled = pending.await.expect_err("the task is cancelled");
-        assert_eq!(
-            join_failure("job", &cancelled),
-            "repin job task was cancelled"
+        let died = StepDied::from_join("repin job", &cancelled);
+        assert_eq!(died.to_string(), "repin job task was cancelled");
+        assert!(
+            matches!(ServerError::from(died), ServerError::Internal(msg) if msg == "repin job task was cancelled")
         );
     }
 

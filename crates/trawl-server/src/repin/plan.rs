@@ -93,6 +93,13 @@ pub(crate) fn scan(
     reading: RepinReading,
     cancel: &CancelHandle,
 ) -> Result<(ScanCounts, ScanTallies, Vec<String>), PassStop> {
+    // Test-only panic (see `crate::repin::engine::TEST_PANIC_IN_SCAN`); the
+    // message is the payload the request must never see.
+    #[cfg(any(test, feature = "test-support"))]
+    assert!(
+        !crate::repin::engine::TEST_PANIC_IN_SCAN.swap(false, std::sync::atomic::Ordering::SeqCst),
+        "zz_repin_scan_payload_sentinel"
+    );
     let sources = crate::repin::rewrite::snapshot_env_files(data_dir)?;
     let conn = open_bounded_connection(data_dir, memory_limit)?;
 

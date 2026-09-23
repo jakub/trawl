@@ -2682,6 +2682,81 @@ async fn a_cancel_during_the_scan_stops_before_any_plan_is_published() {
     }
 }
 
+/// A scan that panics answers the request as a panic, not as an ordinary
+/// internal error (ADR-0040). The decision task itself completes normally
+/// around the panicked blocking step, so the request only hears "panic"
+/// if the step's failure stays typed up to it. The stored job error keeps
+/// its fixed text, the wire keeps the redacted 500 every internal error
+/// gets, and the payload reaches none of them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_scan_panic_reaches_the_request_as_a_panic() {
+    use trawl_server::error::ServerError;
+    use trawl_server::repin::engine::TEST_PANIC_IN_SCAN;
+
+    const SENTINEL: &str = "zz_repin_scan_payload_sentinel";
+    let h = harness().await;
+    h.ingest_and_compact(&[event("api", &json!({"status": 200}))])
+        .await;
+    let engine = h.engine();
+
+    // Both halves of the ladder share the scan. The second pass also
+    // proves the first freed the running slot.
+    for dry_run in [true, false] {
+        TEST_PANIC_IN_SCAN.store(true, Ordering::SeqCst);
+        let err = engine
+            .start(
+                "status",
+                "VARCHAR",
+                None,
+                dry_run,
+                false,
+                RequestedCeilings::default(),
+                Some("op"),
+            )
+            .await
+            .expect_err("a panicked scan fails the request");
+        assert!(
+            matches!(err, ServerError::Panicked("repin scan")),
+            "dry_run={dry_run}: got {err:?}"
+        );
+        assert_eq!(err.error_class(), "panic");
+        assert!(!format!("{err} {err:?}").contains(SENTINEL));
+
+        let job = engine.store().latest().await.unwrap().unwrap();
+        assert_eq!(job.status, RepinJobStatus::Failed);
+        assert_eq!(job.error.as_deref(), Some("repin scan task panicked"));
+        assert_eq!(job.planned_at, None, "a panicked scan publishes no plan");
+        assert!(!trawl_server::repin::marker_path(&h.data_dir).exists());
+        assert!(!trawl_server::repin::shadow_root(&h.data_dir).exists());
+    }
+
+    // The wire answer is the redacted 500 an internal error gets.
+    TEST_PANIC_IN_SCAN.store(true, Ordering::SeqCst);
+    match h
+        .schema_admin
+        .schema_repin(
+            "status",
+            "VARCHAR",
+            None,
+            true,
+            false,
+            RepinCeilings::default(),
+        )
+        .await
+    {
+        Err(trawl_client::ClientError::Server { status, error }) => {
+            assert_eq!(status, 500);
+            assert_eq!(error.message, "internal server error");
+            assert!(error.details.is_empty());
+            assert!(!format!("{error:?}").contains(SENTINEL));
+        }
+        other => panic!("expected a 500, got {other:?}"),
+    }
+    let job = engine.store().latest().await.unwrap().unwrap();
+    assert_eq!(job.error.as_deref(), Some("repin scan task panicked"));
+    assert_eq!(h.pinned_type("status").await, "BIGINT");
+}
+
 /// AC3: past the point of no return a cancel is refused, not queued. The
 /// job latched before the Cutover marker went down, so there is nothing
 /// left to unwind, and the refusal writes nothing to the row, because a
