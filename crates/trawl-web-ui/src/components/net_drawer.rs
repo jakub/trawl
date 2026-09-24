@@ -207,7 +207,8 @@ pub fn NetDrawer(
             // server claimed (or refused) the run regardless, and the
             // Shell's bus outlives the drawer, so the toast still reports
             // it; only the drawer's own state waits on `alive`, and the
-            // page's refresh stands in for the drawer's.
+            // page's refresh stands in for the drawer's. The page may be
+            // gone too (navigated away), so that refresh is a `try_run`.
             let open = alive.try_get_value() == Some(true);
             if open {
                 run_in_flight.set(false);
@@ -223,7 +224,7 @@ pub fn NetDrawer(
                     if open {
                         on_refresh.run(());
                     } else {
-                        parent_refresh.run(());
+                        let _ = parent_refresh.try_run(());
                     }
                 }
                 Err(e) => {

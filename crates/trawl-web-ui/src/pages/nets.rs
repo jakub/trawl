@@ -165,8 +165,10 @@ pub fn NetsPage() -> impl IntoView {
         in_flight.set(true);
         spawn_local(async move {
             let outcome = api::trigger_run(id).await;
-            // The row may have unmounted (deleted, filtered away) while
-            // the request was out; the toast still reports it.
+            // The row may have unmounted (deleted, filtered away), or the
+            // whole page with it (navigated away), while the request was
+            // out; the toast still reports it, and the page's own signals
+            // are only touched if they still exist.
             let _ = in_flight.try_set(false);
             match outcome {
                 Ok(run) => {
@@ -176,7 +178,7 @@ pub fn NetsPage() -> impl IntoView {
                         Some(name),
                         ToastLink::new(format!("/jobs/runs?run={}&net={id}", run.id), VIEW_RUN),
                     );
-                    refresh.update(|n| *n += 1);
+                    let _ = refresh.try_update(|n| *n += 1);
                 }
                 Err(e) => {
                     bus.push(ToastKind::Error, RUN_NOT_STARTED, Some(e.to_string()));

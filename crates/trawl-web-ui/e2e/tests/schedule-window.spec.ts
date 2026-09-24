@@ -293,6 +293,39 @@ test('Run now from the drawer still reports when the drawer closed mid-request',
   expect(await capturedRunRequests(request)).toEqual([SCHEDULE.windowedNetId]);
 });
 
+test('Run now still reports without panicking when the Nets page is gone', async ({ page, request }) => {
+  await resetScenario(request, 'schedule');
+  const panics: string[] = [];
+  page.on('console', (msg) => {
+    if (msg.type() === 'error' && msg.text().includes('panicked')) panics.push(msg.text());
+  });
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  await page.route('**/api/v1/saved/*/run', async (route) => {
+    await held;
+    await route.continue();
+  });
+
+  // One request from the drawer, one from a row, both answered after an
+  // in-app navigation has disposed the Nets page and everything it owns.
+  await page.goto(`/jobs/nets?net=${SCHEDULE.windowedNetId}&ntab=query`);
+  await page
+    .locator(SEL.drawerPanel)
+    .getByRole('button', { name: COPY.netRunNow, exact: true })
+    .click();
+  await page
+    .locator(SEL.tableRow)
+    .filter({ hasText: 'paused error sweep' })
+    .getByRole('button', { name: COPY.netRunNow, exact: true })
+    .click();
+  await page.locator(SEL.railHistoryLink).click();
+  await expect(page.locator('h1')).toHaveText('Search history');
+
+  release();
+  await expect(page.locator(SEL.toastSuccess)).toHaveCount(2);
+  expect(panics).toEqual([]);
+});
+
 test('Run now of a query-mode schedule claims no window', async ({ page, request }) => {
   await resetScenario(request, 'schedule');
   await page.goto('/jobs/nets');
