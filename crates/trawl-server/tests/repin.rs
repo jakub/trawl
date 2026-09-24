@@ -622,6 +622,77 @@ async fn a_cutover_retypes_the_schema_endpoint_immediately() {
     );
 }
 
+/// AC7 (#252): a pending publication marker refuses the cutover. The
+/// marker proves its publish by the canonical output's identity, and the
+/// swap would replace that output. The job ends `blocked` with the named
+/// reason and the corpus untouched; once the marker is gone, the same repin
+/// cuts over.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pending_publication_marker_refuses_the_cutover() {
+    use trawl_server::ingest::publication_marker::{
+        OutputIdentity, ValidatedMarker, remove_marker_durably, write_marker,
+    };
+
+    let h = harness().await;
+    h.ingest_and_compact(&[
+        event("api", &json!({"status": 200})),
+        event("api", &json!({"status": 404})),
+    ])
+    .await;
+    let marker = ValidatedMarker::new(
+        "prod",
+        "api",
+        chrono::Utc::now().date_naive(),
+        7,
+        vec!["api_1730000000000_0001.ndjson".to_owned()],
+        OutputIdentity {
+            size: 4,
+            hash: blake3::hash(b"PAR1"),
+        },
+    )
+    .unwrap();
+    write_marker(&h.wal_dir, &marker).unwrap();
+    let before = corpus_digest(&h.data_dir);
+
+    let start = || async {
+        match h
+            .schema_admin
+            .schema_repin(
+                "status",
+                "VARCHAR",
+                None,
+                false,
+                false,
+                RepinCeilings::default(),
+            )
+            .await
+            .expect("execute")
+        {
+            RepinStart::Started(job) => job,
+            other => panic!("expected started, got {other:?}"),
+        }
+    };
+
+    let refused = h.wait_terminal(start().await.id).await;
+    assert_eq!(refused.status, "blocked", "error: {:?}", refused.error);
+    let error = refused.error.unwrap_or_default();
+    assert!(error.contains("publication_marker_pending"), "{error}");
+    assert!(
+        !error.contains(&h.wal_dir.display().to_string()),
+        "no paths on the wire: {error}"
+    );
+    assert_eq!(h.pinned_type("status").await, "BIGINT");
+    assert_eq!(corpus_digest(&h.data_dir), before, "corpus untouched");
+    assert!(!trawl_server::repin::shadow_root(&h.data_dir).exists());
+    assert!(!trawl_server::repin::aside_root(&h.data_dir).exists());
+    assert!(!trawl_server::repin::marker_path(&h.data_dir).exists());
+
+    remove_marker_durably(&marker.marker_path(&h.wal_dir)).unwrap();
+    let done = h.wait_terminal(start().await.id).await;
+    assert_eq!(done.status, "succeeded", "error: {:?}", done.error);
+    assert_eq!(h.pinned_type("status").await, "VARCHAR");
+}
+
 fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
@@ -2429,6 +2500,7 @@ impl Harness {
         let (_tx, rx) = tokio::sync::watch::channel(false);
         let _retention = trawl_server::retention::spawn_retention(
             self.data_dir.clone(),
+            self.wal_dir.clone(),
             trawl_server::config::RetentionConfig {
                 max_age_days: 90,
                 min_free_disk_bytes: 0,

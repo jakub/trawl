@@ -62,6 +62,16 @@
 //! corpus is proven conformant) and stamped from each file's partition
 //! directory, never `now()`.
 //!
+//! A file a pending publication marker claims (ADR-0041) is skipped the same
+//! way. Boot recovery keeps a marker it cannot resolve, and the marker proves
+//! its publish by the canonical file's exact bytes. Rewriting that canonical,
+//! or deleting its `.parquet.tmp` after a failed rewrite, would turn a
+//! recoverable publish into a permanent identity contradiction. The claims
+//! are read once, before the scan: nothing writes a marker while the pass
+//! runs, because compaction starts after it. A WAL root that cannot be read
+//! fails closed, and the pass skips every file. Either skip withholds
+//! completion, so the next boot conforms the file once its marker resolves.
+//!
 //! The repin engine reuses this machinery: `layout_path`, `Progress` and
 //! `open_bounded_connection`.
 
@@ -75,6 +85,7 @@ use crate::ingest::compaction::{
     AGG_CHUNK_COLS, ColInfo, ConformPlan, ConformPolicy, describe_source, is_valid_parquet,
     quote_ident,
 };
+use crate::ingest::publication_marker::{PublicationClaims, scan_claims};
 use crate::store::{CatalogStore, FieldConflict, PinProposal, ServiceObservation};
 
 /// Marker file mirroring `catalog_state.catalog_id` into the data root.
@@ -92,8 +103,9 @@ pub struct ConformSummary {
     pub scanned: usize,
     /// Files rewritten to conform.
     pub rewritten: usize,
-    /// Files skipped as unreadable or foreign (nonzero = the corpus was not
-    /// proven conformant, so completion is withheld and the next boot re-runs).
+    /// Files skipped as unreadable, foreign or claimed by a pending
+    /// publication marker (nonzero = the corpus was not proven conformant,
+    /// so completion is withheld and the next boot re-runs).
     pub skipped: usize,
     /// `(field, service)` observations backfilled from the standing corpus.
     pub observed: usize,
@@ -283,10 +295,14 @@ fn archive_is_empty(data_dir: &Path) -> bool {
 
 /// Run the boot conformance pass unless the dual-sided identity says it
 /// already ran for exactly this (catalog, data root) pair.
+///
+/// `wal_dir` holds the publication markers. Every file a pending marker
+/// claims is left untouched and counts as skipped.
 pub async fn ensure_conformance(
     store: &CatalogStore,
     cache: &FieldCatalog,
     data_dir: &Path,
+    wal_dir: &Path,
     memory_limit: &str,
 ) -> Result<ConformSummary, String> {
     let catalog_id = store
@@ -327,14 +343,19 @@ pub async fn ensure_conformance(
         .into_iter()
         .collect();
 
-    // Phase A (blocking): enumerate + describe the corpus.
+    // Phase A (blocking): read the publication claims, then enumerate +
+    // describe the corpus.
     let (scan, scan_skipped) = {
         let data_dir = data_dir.to_path_buf();
+        let wal_dir = wal_dir.to_path_buf();
         let memory_limit = memory_limit.to_owned();
         let pinned = existing.clone();
-        tokio::task::spawn_blocking(move || scan_corpus(&data_dir, &memory_limit, &pinned))
-            .await
-            .map_err(|e| crate::error::join_failure_text("conformance scan", e))??
+        tokio::task::spawn_blocking(move || {
+            let claims = scan_claims(&wal_dir);
+            scan_corpus(&data_dir, &memory_limit, &pinned, claims.as_ref())
+        })
+        .await
+        .map_err(|e| crate::error::join_failure_text("conformance scan", e))??
     };
 
     // Seed pins: declared fields came with the migration; custom fields by
@@ -430,9 +451,10 @@ async fn publish_completion(
             scanned,
             rewritten,
             skipped,
-            "boot conformance pass skipped unreadable or foreign paths; the \
-             corpus is not proven conformant and the pass will re-run on the \
-             next boot — inspect the skipped paths (queries touching them error)"
+            "boot conformance pass skipped unreadable, foreign or \
+             publication-claimed paths; the corpus is not proven conformant \
+             and the pass will re-run on the next boot — inspect the skipped \
+             paths (queries touching them error)"
         );
         return Ok(());
     }
@@ -457,8 +479,9 @@ fn skip_file(path: &Path, phase: &str, error: &str) {
         file = %path.display(),
         phase,
         error,
-        "unreadable or foreign path skipped by the boot conformance pass; it \
-         is left untouched and remains outside the catalog invariant"
+        "unreadable, foreign or publication-claimed path skipped by the boot \
+         conformance pass; it is left untouched and remains outside the \
+         catalog invariant"
     );
 }
 
@@ -533,13 +556,17 @@ pub(crate) fn open_bounded_connection(
 
 /// Enumerate every parquet file under the data root (hourly + daily
 /// rollups, skipping `scheduled/`) and describe each. Returns the readable
-/// files plus the count of paths skipped as unreadable or foreign — one bad
-/// file, or one unreadable directory, must never take the daemon's boot down
-/// with it.
+/// files plus the count of paths skipped as unreadable, foreign or claimed by
+/// a pending publication marker — one bad file, or one unreadable directory,
+/// must never take the daemon's boot down with it.
+///
+/// `claims` is the publication marker scan. An `Err` means the markers could
+/// not be read, so every file may be claimed and none is scanned.
 fn scan_corpus(
     data_dir: &Path,
     memory_limit: &str,
     pinned: &HashMap<String, CanonicalType>,
+    claims: Result<&PublicationClaims, &String>,
 ) -> Result<(Vec<FileScan>, usize), String> {
     // A root that was never created is a cold start, not a failure: there is
     // no corpus to prove anything about.
@@ -560,6 +587,24 @@ fn scan_corpus(
     if files.is_empty() {
         return Ok((Vec::new(), skipped));
     }
+    let claims = match claims {
+        Ok(claims) => claims,
+        Err(e) => {
+            // Fail closed: any file may be a marker's canonical output. One
+            // warning for the whole corpus, not one per file.
+            metrics::counter!(crate::metrics::CATALOG_CONFORM_SKIPPED_TOTAL)
+                .increment(files.len() as u64);
+            tracing::warn!(
+                event_type = "catalog_conform_claims_unreadable",
+                files = files.len(),
+                error = %e,
+                "cannot read the publication markers, so any standing file may \
+                 be a pending publish; the boot conformance pass skips every \
+                 file and will re-run on the next boot"
+            );
+            return Ok((Vec::new(), skipped + files.len()));
+        }
+    };
     let conn = open_bounded_connection(data_dir, memory_limit)?;
 
     // Announce the corpus size up front: the one number that tells an
@@ -588,6 +633,19 @@ fn scan_corpus(
             progress.tick();
             continue;
         };
+        // Before the file is opened, like the layout gate: a claimed file is
+        // never rewritten, and a file that is not scanned is never rewritten.
+        if publication_claimed(claims, &layout) {
+            skipped += 1;
+            skip_file(
+                &path,
+                "publication",
+                "claimed by a pending publication marker — the boot pass \
+                 conforms it after the marker resolves",
+            );
+            progress.tick();
+            continue;
+        }
         match scan_file(&conn, path.clone(), &layout, pinned) {
             Ok(scan) => out.push(scan),
             Err(e) => {
@@ -600,8 +658,29 @@ fn scan_corpus(
     Ok((out, skipped))
 }
 
+/// Whether a pending publication marker claims the file at `layout`.
+///
+/// A marker names only an hourly canonical output and its `.parquet.tmp`
+/// sibling, so a daily rollup is never claimed. The tmp needs no check of its
+/// own: the pass deletes a tmp only after a failed rewrite of its canonical,
+/// and a claimed canonical is never rewritten.
+fn publication_claimed(claims: &PublicationClaims, layout: &LayoutPath) -> bool {
+    layout.hour.is_some_and(|hour| {
+        claims.claims_output(
+            &layout.env,
+            layout.instant.date_naive(),
+            hour,
+            &layout.service,
+        )
+    })
+}
+
 /// Where one standing file sits in trawl's own storage layout.
 pub(crate) struct LayoutPath {
+    /// The env directory the path sits under.
+    pub(crate) env: String,
+    /// The hour directory, or `None` for a daily rollup.
+    pub(crate) hour: Option<u8>,
     /// The service the path names — read off the layout, not guessed from a
     /// file stem, so it is the same string ingest wrote verbatim.
     pub(crate) service: String,
@@ -655,13 +734,18 @@ pub(crate) fn layout_path(data_dir: &Path, path: &Path) -> Option<LayoutPath> {
         return None;
     }
     let day = chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d").ok()?;
-    let instant = match hour {
+    let hour = match hour {
         // Two digits, and an hour that exists: `and_hms_opt` rejects 24+.
-        Some(hh) if hh.len() == 2 => day.and_hms_opt(hh.parse::<u32>().ok()?, 0, 0)?.and_utc(),
+        Some(hh) if hh.len() == 2 => Some(hh.parse::<u8>().ok()?),
         Some(_) => return None,
-        None => day.and_hms_opt(0, 0, 0)?.and_utc(),
+        None => None,
     };
+    let instant = day
+        .and_hms_opt(u32::from(hour.unwrap_or(0)), 0, 0)?
+        .and_utc();
     Some(LayoutPath {
+        env: env.to_owned(),
+        hour,
         service: service.to_owned(),
         instant,
     })
@@ -1247,10 +1331,12 @@ mod tests {
             super::layout_path(&root, &root.join("prod/2026-08-01/10/api.v2.parquet")).unwrap();
         assert_eq!(hourly.service, "api.v2");
         assert_eq!(hourly.instant.to_rfc3339(), "2026-08-01T10:00:00+00:00");
+        assert_eq!((hourly.env.as_str(), hourly.hour), ("prod", Some(10)));
 
         let daily = super::layout_path(&root, &root.join("prod/2026-08-01/svc-a.parquet")).unwrap();
         assert_eq!(daily.service, "svc-a");
         assert_eq!(daily.instant.to_rfc3339(), "2026-08-01T00:00:00+00:00");
+        assert_eq!((daily.env.as_str(), daily.hour), ("prod", None));
     }
 
     /// The gate on an in-place, lossy, irreversible rewrite: anything the

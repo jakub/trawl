@@ -79,6 +79,12 @@ impl RepinCoordinator {
         self.corpus_gate.read().await
     }
 
+    /// [`Self::compaction_guard`], owned so a blocking task (publication
+    /// marker recovery) keeps it after cancellation of its async caller.
+    pub(crate) async fn compaction_guard_owned(&self) -> OwnedRwLockReadGuard<()> {
+        Arc::clone(&self.corpus_gate).read_owned().await
+    }
+
     /// The cutover's side: exclusive against every compaction batch. WAL
     /// draining pauses only while this is held — seconds, bounded by the
     /// final catch-up increment — and the hot buffer keeps the undrained

@@ -329,12 +329,16 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
     // conformant must not serve queries. A per-path failure is not that:
     // an unreadable or foreign parquet file, or a subdirectory the walk
     // cannot enumerate, is skipped and counted inside the pass, so one bad
-    // path cannot keep the daemon down.
+    // path cannot keep the daemon down. So is every file a publication
+    // marker still claims after boot recovery (ADR-0041): the pass leaves it
+    // untouched and withholds completion, so the next boot conforms it once
+    // the marker resolves.
     if config.ingest.enabled {
         let summary = trawl_server::catalog::conform::ensure_conformance(
             &state.storage.catalog,
             &state.query.field_catalog,
             &config.data.base_dir(),
+            &config.wal_dir(),
             &config.ingest.compaction_memory_limit,
         )
         .await?;
@@ -438,6 +442,7 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let handle = trawl_server::retention::spawn_retention(
             config.data.base_dir(),
+            config.wal_dir(),
             config.retention.clone(),
             shutdown_rx,
         );
@@ -542,8 +547,10 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
     // Shutdown ordering: flush telemetry first so final events reach WAL,
     // then stats emitter, then scheduler (stop issuing new queries),
     // then syslog (flush final events to WAL before compaction),
-    // then compaction (may compact final files and drain hot buffer),
-    // then retention, then audit.
+    // then compaction, then retention, then audit. Compaction stops
+    // without a final pass: WAL it has not merged stays for the next run,
+    // and the next boot's publication recovery finishes or rolls back any
+    // publish it left behind.
     shutdown_task(telemetry_handle, "telemetry").await;
     shutdown_task(Some(stats_handle), "stats_emitter").await;
     shutdown_task(scheduler_handle, "scheduler").await;
@@ -568,6 +575,11 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
 /// storage. Repin swaps environment directories only; EPOCH stays in the live
 /// root throughout. The caller retains the admitted sole-writer lock.
 /// Finish recovery before state construction or any corpus reader starts.
+///
+/// Publication recovery (ADR-0041) runs last, on ingest-enabled nodes only:
+/// after the repin replay has settled which generation is live, and before
+/// the boot conformance pass can rewrite a canonical file whose identity a
+/// marker records.
 fn prepare_data_root(
     data_root: &std::path::Path,
     wal_dir: &std::path::Path,
@@ -581,7 +593,36 @@ fn prepare_data_root(
 > {
     let epoch = trawl_server::epoch::ensure_current_epoch(data_root, wal_dir, ingest_enabled)?;
     let recovered = trawl_server::repin::recover::recover_filesystem(data_root, ingest_enabled)?;
+    if ingest_enabled {
+        recover_publications_at_boot(wal_dir, data_root)?;
+    }
     Ok((epoch, recovered))
+}
+
+/// Finish or roll back every compaction publish a crash interrupted, before
+/// any reader, producer or compaction tick exists.
+///
+/// No hot buffer exists yet, so a published marker has no batches to drain.
+/// A marker recovery cannot resolve is logged and counted on
+/// `trawl_publication_recovery_total` by outcome, and keeps its service out
+/// of compaction; each tick retries it. The boot conformance pass then
+/// leaves the files it claims alone. Only an unreadable WAL root is
+/// fatal, as it is for the epoch gate's WAL validation.
+fn recover_publications_at_boot(
+    wal_dir: &std::path::Path,
+    data_root: &std::path::Path,
+) -> Result<(), String> {
+    let report = trawl_server::ingest::publication_marker::recover(wal_dir, data_root, |_| Ok(()))
+        .map_err(|e| format!("publication recovery failed: {e}"))?;
+    let blocked = report.record();
+    tracing::info!(
+        event_type = "publication_recovery",
+        markers = report.entries.len(),
+        blocked,
+        unlisted_envs = report.unlisted_envs.len(),
+        "boot publication recovery finished"
+    );
+    Ok(())
 }
 
 /// Signal a background task to shut down and await its completion.

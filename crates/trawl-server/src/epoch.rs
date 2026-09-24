@@ -43,7 +43,28 @@ pub enum Outcome {
 /// Validate storage before any recovery can mutate the data root or siblings.
 /// All refusal checks run before fresh-root initialization. Filesystem errors
 /// are errors, never evidence of an empty directory or an absent marker.
+///
+/// With ingest enabled, an admitted root's ancestor chain is then synced
+/// ([`sync_ancestor_chain`]) before compaction can retire WAL into it, and
+/// a failed sync is a boot error.
 pub fn ensure_current_epoch(
+    data_root: &Path,
+    wal_dir: &Path,
+    ingest_enabled: bool,
+) -> Result<Outcome, String> {
+    let outcome = admit_data_root(data_root, wal_dir, ingest_enabled)?;
+    if ingest_enabled {
+        sync_ancestor_chain(data_root, mount_root, fsync_dir).map_err(|e| {
+            format!(
+                "failed to fsync the directories holding data root {}: {e}",
+                data_root.display()
+            )
+        })?;
+    }
+    Ok(outcome)
+}
+
+fn admit_data_root(
     data_root: &Path,
     wal_dir: &Path,
     ingest_enabled: bool,
@@ -55,17 +76,16 @@ pub fn ensure_current_epoch(
         if !ingest_enabled {
             return Ok(Outcome::ReadOnlyArchive);
         }
-        if let Some(parent) = data_root.parent().filter(|p| !p.as_os_str().is_empty()) {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("failed to create data parent {}: {e}", parent.display()))?;
-        }
-        // Do not adopt a root another process created after the absence check.
-        std::fs::create_dir(data_root)
+        // Compaction retires acknowledged WAL once its output is durable
+        // inside the root, so the root's own entry, and that of every
+        // ancestor created for it, must be durable first: without them a
+        // power loss drops the whole tree. A failed sync removes what it
+        // created, so the next boot creates and syncs it again. Exclusive
+        // creation does not adopt a root another process created after the
+        // absence check.
+        create_dir_all_durably(data_root, fsync_dir)
             .map_err(|e| format!("failed to create data root {}: {e}", data_root.display()))?;
         publish_epoch(data_root)?;
-        if let Some(parent) = data_root.parent() {
-            fsync_dir_best_effort(parent);
-        }
         return Ok(Outcome::FreshRoot);
     };
     if !meta.is_dir() {
@@ -267,14 +287,59 @@ fn publish_epoch(data_root: &Path) -> Result<(), String> {
 /// share a fixture corpus) must not clobber each other's staged file
 /// between the write and the rename.
 pub(crate) fn publish_marker_staged(dir: &Path, name: &str, body: &str) -> Result<(), String> {
+    stage_and_rename(dir, name, body)?;
+    fsync_dir_best_effort(dir);
+    Ok(())
+}
+
+/// [`publish_marker_staged`] for a marker whose durability is part of a
+/// correctness argument: a failed directory fsync is an error, not a warning.
+///
+/// The compaction publication marker (`ingest::publication_marker`) must be
+/// on disk before its output is renamed into place, so the caller has to
+/// learn that the rename entry may not survive a crash. The marker stays
+/// visible after such a failure; recovery treats it like any other marker.
+///
+/// The staged name is predictable, so this writer never opens it by path:
+/// it removes any leftover entry (a crashed earlier attempt, or a planted
+/// symlink), creates the file exclusively, and writes and fsyncs that one
+/// handle. A symlink planted between the removal and the create makes the
+/// create fail instead of redirecting the write.
+pub(crate) fn publish_marker_durable(dir: &Path, name: &str, body: &str) -> Result<(), String> {
+    let staged = staged_path(dir, name);
+    match std::fs::remove_file(&staged) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("failed to remove stale {}: {e}", staged.display())),
+    }
+    let mut file = std::fs::File::create_new(&staged)
+        .map_err(|e| format!("failed to create {}: {e}", staged.display()))?;
+    file.write_all(body.as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(|e| format!("failed to write and fsync {}: {e}", staged.display()))?;
+    drop(file);
+    let marker = dir.join(name);
+    std::fs::rename(&staged, &marker)
+        .map_err(|e| format!("failed to publish {}: {e}", marker.display()))?;
+    fsync_dir(dir).map_err(|e| format!("failed to fsync directory {}: {e}", dir.display()))
+}
+
+/// The PID-unique staged name a marker is written under before its rename.
+fn staged_path(dir: &Path, name: &str) -> std::path::PathBuf {
     // A hidden marker's staged file must not share its discovery prefix.
     // In particular, rollup recovery recognizes `.rollup-*`; it must never
     // read a partially written `..rollup-*.next.<pid>` as a complete marker.
     let prefix = if name.starts_with('.') { "." } else { "" };
-    let staged = dir.join(format!(
+    dir.join(format!(
         "{prefix}{name}{NEXT_SUFFIX}.{}",
         std::process::id()
-    ));
+    ))
+}
+
+/// Staged temp name, write, fsync, atomic rename. The caller owns the
+/// directory fsync that makes the rename durable.
+fn stage_and_rename(dir: &Path, name: &str, body: &str) -> Result<(), String> {
+    let staged = staged_path(dir, name);
     std::fs::write(&staged, body)
         .map_err(|e| format!("failed to write {}: {e}", staged.display()))?;
     std::fs::File::open(&staged)
@@ -283,9 +348,165 @@ pub(crate) fn publish_marker_staged(dir: &Path, name: &str, body: &str) -> Resul
 
     let marker = dir.join(name);
     std::fs::rename(&staged, &marker)
-        .map_err(|e| format!("failed to publish {}: {e}", marker.display()))?;
-    fsync_dir_best_effort(dir);
+        .map_err(|e| format!("failed to publish {}: {e}", marker.display()))
+}
+
+/// fsync a directory so entries created, renamed or removed inside it
+/// survive a crash. Unlike [`fsync_dir_best_effort`], the error reaches the
+/// caller.
+pub(crate) fn fsync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if fail_dir_fsync::matches(dir) {
+        return Err(std::io::Error::other("injected directory fsync failure"));
+    }
+    std::fs::File::open(dir).and_then(|d| d.sync_all())
+}
+
+/// Create `dir` and any missing ancestors, then fsync the parent of each
+/// directory created, top down, so every new entry survives a power loss.
+/// The first sync is of the nearest ancestor that already existed.
+///
+/// A directory that already exists costs one `stat` and no fsync. Every
+/// missing directory is created exclusively, so one that another process
+/// creates first is an `AlreadyExists` error rather than adopted. On any
+/// error the directories this call created are removed again, deepest
+/// first and only while empty, so a retry finds them missing and repeats
+/// the syncs instead of trusting entries that may not be durable.
+pub(crate) fn create_dir_all_durably(
+    dir: &Path,
+    mut sync: impl FnMut(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let mut missing = Vec::new();
+    let mut current = dir;
+    loop {
+        match std::fs::metadata(current) {
+            Ok(_) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => missing.push(current),
+            Err(e) => return Err(e),
+        }
+        match current.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => current = parent,
+            _ => break,
+        }
+    }
+    missing.reverse();
+    let mut created = 0;
+    let result = missing.iter().try_for_each(|&new| {
+        std::fs::create_dir(new)?;
+        created += 1;
+        Ok(())
+    });
+    let result = result.and_then(|()| {
+        missing.iter().try_for_each(|new| {
+            sync(
+                new.parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or(Path::new(".")),
+            )
+        })
+    });
+    if result.is_err() {
+        for new in missing[..created].iter().rev() {
+            if std::fs::remove_dir(new).is_err() {
+                break;
+            }
+        }
+    }
+    result
+}
+
+/// fsync every ancestor of `dir` on `dir`'s mount, from its parent up to
+/// the mount root, so the entry of each directory on the way to `dir` is
+/// durable. Boot runs this once per root whether or not this process
+/// created it: a process killed between creating a directory and syncing
+/// its parent leaves an entry that only a later sync makes durable, and no
+/// process can tell which entries those are. The walk follows `dir`'s
+/// canonical path, the chain that physically holds its entries.
+///
+/// Before it syncs a parent, the walk asks `mount_root` about the child
+/// whose entry that sync would make durable, starting with `dir` itself.
+/// A child that is a mount root ends the walk: its entry lives on the
+/// parent mount, which is not Trawl's storage, so syncing it adds no
+/// durability and can fail on a read-only root filesystem. The mount root
+/// itself is synced, as the parent of the directory below it. A device
+/// change alone does not stop the walk, since a btrfs subvolume has its
+/// own device inside one mount and its entry is still on that mount. When
+/// `mount_root` cannot tell (`None`), the walk continues, so without
+/// kernel support it syncs every ancestor up to `/`.
+///
+/// An ancestor that cannot be opened or inspected fails the walk like a
+/// failed sync: its entries cannot be proven durable.
+pub(crate) fn sync_ancestor_chain(
+    dir: &Path,
+    mut mount_root: impl FnMut(&Path) -> std::io::Result<Option<bool>>,
+    mut sync: impl FnMut(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let dir = std::fs::canonicalize(dir)?;
+    let mut child = dir.as_path();
+    while let Some(parent) = child.parent() {
+        if mount_root(child)? == Some(true) {
+            break;
+        }
+        sync(parent)?;
+        child = parent;
+    }
     Ok(())
+}
+
+/// Whether `dir` is the root of a mount, from `statx`'s
+/// `STATX_ATTR_MOUNT_ROOT` (Linux 5.8+). `None` when the kernel has no
+/// `statx` or does not report the attribute; the boundary is then unknown
+/// and [`sync_ancestor_chain`] keeps walking.
+#[cfg(target_os = "linux")]
+pub(crate) fn mount_root(dir: &Path) -> std::io::Result<Option<bool>> {
+    use rustix::fs::{AtFlags, CWD, StatxAttributes, StatxFlags};
+    match rustix::fs::statx(CWD, dir, AtFlags::NO_AUTOMOUNT, StatxFlags::empty()) {
+        Ok(st) => Ok(st
+            .stx_attributes_mask
+            .contains(StatxAttributes::MOUNT_ROOT)
+            .then(|| st.stx_attributes.contains(StatxAttributes::MOUNT_ROOT))),
+        // ENOSYS: no statx. EPERM: a seccomp profile blocks statx. Either
+        // way the boundary is unknown and the walk falls back to `/`.
+        Err(rustix::io::Errno::NOSYS | rustix::io::Errno::PERM) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// No mount-root query off Linux: [`sync_ancestor_chain`] walks up to `/`.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn mount_root(_dir: &Path) -> std::io::Result<Option<bool>> {
+    Ok(None)
+}
+
+/// Unit-test injection for [`fsync_dir`]: fail every fsync of one directory
+/// on the current thread. Real filesystems give no portable way to make a
+/// directory fsync fail on demand.
+#[cfg(test)]
+pub(crate) mod fail_dir_fsync {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    thread_local! {
+        static TARGET: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    /// Fail fsyncs of `dir` until the returned guard drops.
+    pub(crate) fn set(dir: &Path) -> Guard {
+        TARGET.with(|t| *t.borrow_mut() = Some(dir.to_path_buf()));
+        Guard
+    }
+
+    pub(super) fn matches(dir: &Path) -> bool {
+        TARGET.with(|t| t.borrow().as_deref() == Some(dir))
+    }
+
+    pub(crate) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            TARGET.with(|t| *t.borrow_mut() = None);
+        }
+    }
 }
 
 /// fsync a directory so the rename entry inside it survives a crash. Never
@@ -703,5 +924,213 @@ mod tests {
             );
             assert!(!data.join("EPOCH").is_file());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_marker_writer_does_not_follow_a_planted_staged_symlink() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("dir");
+        std::fs::create_dir(&dir).unwrap();
+        let sentinel = tmp.path().join("sentinel");
+        std::fs::write(&sentinel, b"keep me").unwrap();
+        let staged = staged_path(&dir, ".marker");
+        symlink(&sentinel, &staged).unwrap();
+
+        publish_marker_durable(&dir, ".marker", "body").unwrap();
+
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep me");
+        let marker = dir.join(".marker");
+        assert!(std::fs::symlink_metadata(&marker).unwrap().is_file());
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "body");
+        assert!(
+            std::fs::symlink_metadata(&staged).is_err(),
+            "staged name consumed"
+        );
+    }
+
+    #[test]
+    fn durable_marker_writer_replaces_a_stale_staged_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::write(staged_path(dir, ".marker"), "a much longer stale body").unwrap();
+        publish_marker_durable(dir, ".marker", "body").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".marker")).unwrap(),
+            "body"
+        );
+    }
+
+    #[test]
+    fn a_fresh_data_root_fails_boot_until_every_new_entry_is_durable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        let data = state.join("data");
+        let wal = data.join("wal");
+        // The first ancestor that already existed holds `state`'s entry,
+        // and `state` holds the data root's.
+        for failing in [tmp.path().to_path_buf(), state.clone()] {
+            let _fail = fail_dir_fsync::set(&failing);
+            let err = ensure_current_epoch(&data, &wal, true).unwrap_err();
+            assert!(err.contains("injected directory fsync failure"), "{err}");
+            assert!(
+                !state.exists(),
+                "a failed barrier removes what it created, so the next boot \
+                 syncs it again ({})",
+                failing.display()
+            );
+        }
+        assert_eq!(
+            ensure_current_epoch(&data, &wal, true).unwrap(),
+            Outcome::FreshRoot
+        );
+    }
+
+    #[test]
+    fn boot_fails_until_an_existing_data_roots_ancestor_chain_is_synced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("state").join("data");
+        let wal = data.join("wal");
+        assert_eq!(
+            ensure_current_epoch(&data, &wal, true).unwrap(),
+            Outcome::FreshRoot
+        );
+        // The root now exists, as after a process killed before syncing
+        // its parent. Every boot syncs the chain again, and the tempdir
+        // is on the data root's mount.
+        let canonical = std::fs::canonicalize(&data).unwrap();
+        let tmp_dir = std::fs::canonicalize(tmp.path()).unwrap();
+        for failing in [canonical.parent().unwrap(), tmp_dir.as_path()] {
+            let _fail = fail_dir_fsync::set(failing);
+            let err = ensure_current_epoch(&data, &wal, true).unwrap_err();
+            assert!(err.contains("injected directory fsync failure"), "{err}");
+        }
+        assert_eq!(
+            ensure_current_epoch(&data, &wal, true).unwrap(),
+            Outcome::Current
+        );
+        // A query-only node writes nothing into the root and syncs nothing.
+        let _fail = fail_dir_fsync::set(canonical.parent().unwrap());
+        assert_eq!(
+            ensure_current_epoch(&data, &wal, false).unwrap(),
+            Outcome::Current
+        );
+    }
+
+    /// Record every directory `sync_ancestor_chain` syncs for `dir`.
+    fn synced_chain(
+        dir: &Path,
+        mount_root: impl FnMut(&Path) -> std::io::Result<Option<bool>>,
+    ) -> Vec<PathBuf> {
+        let mut synced = Vec::new();
+        sync_ancestor_chain(dir, mount_root, |p| {
+            synced.push(p.to_path_buf());
+            Ok(())
+        })
+        .unwrap();
+        synced
+    }
+
+    /// `a/b/c` under a canonical tempdir.
+    fn abc() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = std::fs::canonicalize(tmp.path()).unwrap().join("a");
+        let b = a.join("b");
+        let c = b.join("c");
+        std::fs::create_dir_all(&c).unwrap();
+        (tmp, a, b, c)
+    }
+
+    #[test]
+    fn the_ancestor_sync_stops_at_the_mount_root() {
+        let (_tmp, _a, b, c) = abc();
+        // `b` is the root of the storage mount: `b` itself is on it, and
+        // `a` holds `b`'s entry on the parent mount.
+        let mount_root = |p: &Path| Ok(Some(p == b));
+        assert_eq!(synced_chain(&c, mount_root), [b.as_path()]);
+
+        // A failed sync of an ancestor on the mount still fails the walk.
+        let err = sync_ancestor_chain(&c, mount_root, |p| {
+            if p == b {
+                Err(std::io::Error::other("sync failed"))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+        assert_eq!(err.to_string(), "sync failed");
+
+        // So does a directory the mount-root query cannot inspect.
+        let err = sync_ancestor_chain(
+            &c,
+            |p| {
+                if p == b {
+                    Err(std::io::Error::other("statx failed"))
+                } else {
+                    Ok(Some(false))
+                }
+            },
+            |_| Ok(()),
+        )
+        .unwrap_err();
+        assert_eq!(err.to_string(), "statx failed");
+    }
+
+    #[test]
+    fn a_root_that_is_its_own_mount_root_syncs_no_ancestor() {
+        let (_tmp, _a, _b, c) = abc();
+        assert!(synced_chain(&c, |p| Ok(Some(p == c))).is_empty());
+    }
+
+    #[test]
+    fn a_nested_subvolume_that_is_not_a_mount_root_does_not_stop_the_walk() {
+        // `b` is a btrfs subvolume: its own device, inside the mount of
+        // its parent. Its entry lives in `a`, so `a` is synced too, and
+        // the walk goes on to the mount root, here `/`.
+        let (_tmp, _a, _b, c) = abc();
+        let mount_root = |p: &Path| Ok(Some(p == Path::new("/")));
+        let all: Vec<_> = c.ancestors().skip(1).collect();
+        assert_eq!(synced_chain(&c, mount_root), all);
+    }
+
+    #[test]
+    fn without_mount_root_support_the_walk_reaches_slash() {
+        let (_tmp, _a, _b, c) = abc();
+        let synced = synced_chain(&c, |_| Ok(None));
+        assert_eq!(synced.last().map(PathBuf::as_path), Some(Path::new("/")));
+        assert_eq!(synced, c.ancestors().skip(1).collect::<Vec<_>>());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_host_reports_slash_as_a_mount_root() {
+        // `None` is the supported answer on a kernel without the attribute
+        // or under a seccomp profile that blocks statx; the walk then falls
+        // back to `/`. Where the attribute is known, `/` must be a mount root.
+        assert_ne!(mount_root(Path::new("/")).unwrap(), Some(false));
+    }
+
+    #[test]
+    fn durable_marker_writer_reports_directory_fsync_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        {
+            let _fail = fail_dir_fsync::set(dir);
+            let err = publish_marker_durable(dir, ".marker", "body").unwrap_err();
+            assert!(err.contains("failed to fsync directory"), "{err}");
+            // The existing writer keeps its best-effort contract.
+            publish_marker_staged(dir, ".other", "body").unwrap();
+        }
+        // The rename happened; only its durability is unknown.
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".marker")).unwrap(),
+            "body"
+        );
+        publish_marker_durable(dir, ".marker", "next").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".marker")).unwrap(),
+            "next"
+        );
     }
 }

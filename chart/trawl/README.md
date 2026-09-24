@@ -101,7 +101,7 @@ prometheusRule:
       enabled: false
 ```
 
-All ten alerts default to enabled and `severity: warning`. Each entry accepts
+All eleven alerts default to enabled and `severity: warning`. Each entry accepts
 only `enabled` and `severity`. Severity is a nonblank static routing string,
 not an enum; `{{` and `}}` template delimiters are rejected. Unknown alert
 names, unknown fields, invalid types, invalid Kubernetes label keys or values, and
@@ -123,6 +123,7 @@ Accepted alert keys are:
 - `TrawlWalDurabilityDegraded`
 - `TrawlCompactionOperationFailure`
 - `TrawlFileQuarantine`
+- `TrawlPublicationRecoveryBlocked`
 
 Rules use a fixed `increase(counter[10m]) > 0`, without a `for` delay. Use
 30-second scrapes and evaluations, no greater than two minutes. Each rule
@@ -293,7 +294,7 @@ The runbook includes a matching `rule_files` and HTTPS scrape configuration.
 | `prometheusRule.enabled` | bool | `false` | Create the ten operational warning rules; independent of ServiceMonitor creation |
 | `prometheusRule.namespace` | string | `""` | Rule object namespace. Empty uses the release namespace; never changes workload selectors |
 | `prometheusRule.additionalLabels` | map of strings | `{}` | Rule-resource discovery labels. Invalid Kubernetes label keys or values and conflicting chart label overrides are rejected |
-| `prometheusRule.alerts.<alert>.enabled` | bool | `true` | Enable one of the ten alert keys listed above |
+| `prometheusRule.alerts.<alert>.enabled` | bool | `true` | Enable one of the eleven alert keys listed above |
 | `prometheusRule.alerts.<alert>.severity` | string | `warning` | Nonblank static routing value; template delimiters are rejected |
 | `serviceAccount.create` | bool | `true` | Create a ServiceAccount |
 | `serviceAccount.annotations` | object | `{}` | ServiceAccount annotations |

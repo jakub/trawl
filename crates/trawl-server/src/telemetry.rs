@@ -63,7 +63,12 @@
 //!
 //! A normal failed write retains the batch for retry (rate-limited stderr +
 //! `trawl_telemetry_wal_write_failures_total`), so a transient storage error
-//! delays events instead of losing them. If the blocking write task itself
+//! delays events instead of losing them. A failed directory fsync is a
+//! failed write: `WalWriter::write` withdraws the file, and the batch is
+//! retained. If that withdrawal also fails, the file stays where compaction
+//! will merge it, so the batch is released instead of retried (a retry
+//! would duplicate it) and is not published to the hot buffer or bus,
+//! because the write was never acknowledged. If the blocking write task itself
 //! panics or is cancelled, its consumed in-memory batch cannot be requeued
 //! and is counted once under drop reason `write_crashed`, in addition to
 //! that one write-failure count. The WAL may already be durable: the batch
@@ -118,7 +123,7 @@
 //! because `on_event` only buffers (it takes the active-buffer lock,
 //! which the flush path never holds while emitting): the
 //! `telemetry_dropped` recovery event after a successful write, and
-//! `WalWriter::write`'s own best-effort dir-fsync warning. The invariant
+//! `WalWriter::write`'s own dir-fsync failure warning. The invariant
 //! is: **no locks are held across `writer.write`, and flush-path tracing
 //! may only buffer.**
 //!
@@ -782,6 +787,9 @@ struct WalLayerInner {
 enum WriteFailureDisposition {
     Retained,
     Dropped,
+    /// The write failed but its file could not be withdrawn, so compaction
+    /// will merge it. Retrying would duplicate it.
+    LeftInWal,
 }
 
 impl std::fmt::Debug for WalLayer {
@@ -899,9 +907,7 @@ impl WalLayer {
                     self.inner.publish(env, &wal_path, batch);
                 }
                 Err(e) => {
-                    self.inner
-                        .record_write_failure(&e, WriteFailureDisposition::Retained);
-                    self.inner.requeue_front(batch);
+                    self.inner.retain_or_release_failed(&e, batch);
                     break;
                 }
             }
@@ -958,9 +964,7 @@ impl WalLayer {
                     coalesce = true;
                 }
                 Ok(Err((e, batch))) => {
-                    self.inner
-                        .record_write_failure(&e, WriteFailureDisposition::Retained);
-                    self.inner.requeue_front(batch);
+                    self.inner.retain_or_release_failed(&e, batch);
                     break;
                 }
                 Err(join_err) => {
@@ -1211,6 +1215,22 @@ impl WalLayerInner {
         self.pending.lock().push_front(batch);
     }
 
+    /// Handle a WAL write that returned an error. A batch with no file
+    /// left behind goes back to the queue front for retry. A batch whose
+    /// file stayed visible after a failed withdrawal is released from the
+    /// accounting instead: compaction will merge that file, so a retry
+    /// would write the same events twice.
+    fn retain_or_release_failed(&self, e: &crate::ingest::wal::WalWriteError, batch: Batch) {
+        if e.left_visible() {
+            self.staged
+                .release(batch.events.len(), batch_charge(&batch));
+            self.record_write_failure(e, WriteFailureDisposition::LeftInWal);
+        } else {
+            self.record_write_failure(e, WriteFailureDisposition::Retained);
+            self.requeue_front(batch);
+        }
+    }
+
     /// Publish a durably-written batch to the hot buffer and event bus —
     /// strictly after WAL success, exactly once (the batch was popped).
     /// Then emit the `telemetry_dropped` recovery record if any loss is
@@ -1342,7 +1362,11 @@ impl WalLayerInner {
     /// Record a WAL write failure: scrapeable counter plus rate-limited
     /// stderr (the independent last-resort channel while self-ingestion
     /// is unavailable). Must not use tracing — see the module docs.
-    fn record_write_failure(&self, e: &std::io::Error, disposition: WriteFailureDisposition) {
+    fn record_write_failure(
+        &self,
+        e: &dyn std::fmt::Display,
+        disposition: WriteFailureDisposition,
+    ) {
         metrics::counter!(crate::metrics::TELEMETRY_WAL_WRITE_FAILURES_TOTAL).increment(1);
         let mut last = self.last_stderr.lock();
         let due = last.is_none_or(|t| t.elapsed() >= Duration::from_mins(1));
@@ -1350,6 +1374,9 @@ impl WalLayerInner {
             let outcome = match disposition {
                 WriteFailureDisposition::Retained => "batch retained for retry",
                 WriteFailureDisposition::Dropped => "write task crashed; batch counted as dropped",
+                WriteFailureDisposition::LeftInWal => {
+                    "file could not be withdrawn; batch left for compaction, not retried"
+                }
             };
             eprintln!("[trawl-telemetry] WAL write failed ({outcome}): {e}");
             *last = Some(Instant::now());
@@ -3081,26 +3108,29 @@ mod tests {
     }
 
     fn read_wal_events(env_dir: &std::path::Path) -> Vec<serde_json::Value> {
-        let mut files: Vec<_> = std::fs::read_dir(env_dir)
+        let mut files: Vec<(u64, Vec<serde_json::Value>)> = std::fs::read_dir(env_dir)
             .unwrap()
             .filter_map(Result::ok)
             .map(|e| e.path())
             .filter(|p| p.extension().is_some_and(|ext| ext == "ndjson"))
-            .collect();
-        // WAL filenames embed unix millis but same-millisecond writes tie;
-        // mtime has nanosecond resolution and each write fsyncs, so it
-        // reflects write order.
-        files.sort_by_key(|p| std::fs::metadata(p).unwrap().modified().unwrap());
-        files
-            .iter()
-            .flat_map(|p| {
-                std::fs::read_to_string(p)
+            .map(|p| {
+                let sequence = crate::ingest::wal::ack_sequence_for_test(&p)
+                    .unwrap_or_else(|| panic!("{} was not written by a WalWriter", p.display()));
+                let events = std::fs::read_to_string(p)
                     .unwrap()
                     .lines()
                     .map(|l| serde_json::from_str(l).unwrap())
-                    .collect::<Vec<_>>()
+                    .collect();
+                (sequence, events)
             })
-            .collect()
+            .collect();
+        // Order files by when the writer acknowledged them, so a test sees
+        // the on-disk write order. Filenames embed unix millis, and
+        // same-millisecond writes tie. mtime ties too: tmpfs stamps files
+        // from a coarse clock, and its directory listing runs newest first.
+        // Event timestamps would hide a reordered write.
+        files.sort_by_key(|(sequence, _)| *sequence);
+        files.into_iter().flat_map(|(_, events)| events).collect()
     }
 
     use std::path::PathBuf;
@@ -3274,6 +3304,162 @@ mod tests {
         let events = read_wal_events(&wal_root.join("prod"));
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["event_type"], "retry_test");
+    }
+
+    /// WAL files under `env_dir` holding at least one event of `event_type`,
+    /// and the total count of those events across every file.
+    fn wal_files_holding(env_dir: &std::path::Path, event_type: &str) -> (usize, usize) {
+        let mut files = 0;
+        let mut events = 0;
+        for entry in std::fs::read_dir(env_dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|ext| ext != "ndjson") {
+                continue;
+            }
+            let held = std::fs::read_to_string(&path)
+                .unwrap()
+                .lines()
+                .filter(|line| {
+                    serde_json::from_str::<serde_json::Value>(line).unwrap()["event_type"]
+                        == event_type
+                })
+                .count();
+            files += usize::from(held > 0);
+            events += held;
+        }
+        (files, events)
+    }
+
+    /// A writer whose `prod` env directory is already durable, so the next
+    /// injected directory-sync failure hits the sync after the rename.
+    fn warmed_writer(wal_root: &std::path::Path) -> Arc<WalWriter> {
+        let writer = Arc::new(WalWriter::new(wal_root.to_path_buf()));
+        let warm = writer.write("prod", "warm", b"{}\n").unwrap();
+        std::fs::remove_file(warm).unwrap();
+        writer
+    }
+
+    #[tokio::test]
+    async fn directory_sync_failure_retains_batch_then_one_wal_file_holds_it() {
+        use tracing_subscriber::prelude::*;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_root = tmp.path().join("wal");
+        let writer = warmed_writer(&wal_root);
+        let handle = WalHandle::new();
+        handle.set(Arc::clone(&writer), "prod");
+        let hot = Arc::new(crate::hot_buffer::HotBuffer::new(
+            crate::hot_buffer::HotBufferConfig {
+                max_events: 1000,
+                max_bytes: 1024 * 1024,
+            },
+        ));
+        let layer = WalLayer::new(handle, "prod");
+        layer.set_hot_buffer(Arc::clone(&hot));
+        let layer_ref = layer.clone();
+        let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
+
+        tracing::info!(
+            event_type = "dir_sync_retry",
+            "event before the failed sync"
+        );
+        writer.fail_next_directory_sync_for_test();
+        layer_ref.flush_cycle().await;
+        assert_eq!(hot.event_count(), 0, "no hot insert before the ack");
+        assert_eq!(
+            layer_ref.inner.pending.lock().len(),
+            1,
+            "the withdrawn batch is retained for retry"
+        );
+        assert_eq!(
+            wal_files_holding(&wal_root.join("prod"), "dir_sync_retry"),
+            (0, 0),
+            "the withdrawn file is gone"
+        );
+
+        layer_ref.flush_cycle().await;
+        assert!(layer_ref.inner.pending.lock().is_empty());
+        assert_eq!(
+            wal_files_holding(&wal_root.join("prod"), "dir_sync_retry"),
+            (1, 1),
+            "after the retry exactly one WAL file holds the event, once"
+        );
+    }
+
+    #[test]
+    fn unwithdrawn_file_is_left_for_compaction_and_not_retried() {
+        use crate::metrics::test_support::sample;
+        use tracing_subscriber::prelude::*;
+
+        let recorder = crate::metrics::prometheus_builder().build_recorder();
+        let metrics_handle = recorder.handle();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                crate::metrics::init_operational_alert_metrics();
+                let tmp = tempfile::tempdir().unwrap();
+                let wal_root = tmp.path().join("wal");
+                let writer = warmed_writer(&wal_root);
+                let handle = WalHandle::new();
+                handle.set(Arc::clone(&writer), "prod");
+                let hot = Arc::new(crate::hot_buffer::HotBuffer::new(
+                    crate::hot_buffer::HotBufferConfig {
+                        max_events: 1000,
+                        max_bytes: 1024 * 1024,
+                    },
+                ));
+                let layer = WalLayer::new(handle, "prod");
+                layer.set_hot_buffer(Arc::clone(&hot));
+                let layer_ref = layer.clone();
+                let _guard =
+                    tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
+
+                tracing::info!(event_type = "left_in_wal", "event whose file stays");
+                writer.fail_next_directory_sync_for_test();
+                writer.fail_next_withdraw_for_test();
+                layer_ref.flush_cycle().await;
+                assert!(
+                    layer_ref.inner.pending.lock().is_empty(),
+                    "a retry would duplicate the visible file"
+                );
+                assert_eq!(
+                    layer_ref.inner.staged.events.load(Ordering::Relaxed),
+                    0,
+                    "the released batch leaves the memory accounting"
+                );
+                assert_eq!(
+                    hot.event_count(),
+                    0,
+                    "an unacknowledged batch is not published"
+                );
+                assert_eq!(
+                    sample(
+                        &metrics_handle,
+                        crate::metrics::TELEMETRY_WAL_WRITE_FAILURES_TOTAL
+                    ),
+                    1
+                );
+                for reason in ["preinit_cap", "buffer_cap", "write_crashed"] {
+                    assert_eq!(
+                        sample(
+                            &metrics_handle,
+                            &format!("trawl_telemetry_events_dropped_total{{reason=\"{reason}\"}}")
+                        ),
+                        0
+                    );
+                }
+
+                layer_ref.flush_cycle().await;
+                assert_eq!(
+                    wal_files_holding(&wal_root.join("prod"), "left_in_wal"),
+                    (1, 1),
+                    "the file compaction will merge is the only copy"
+                );
+            });
+        });
     }
 
     #[test]

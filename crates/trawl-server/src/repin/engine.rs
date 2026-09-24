@@ -314,6 +314,8 @@ pub struct RepinEngine {
     coordinator: Arc<RepinCoordinator>,
     pool: ExecutorPool,
     data_dir: PathBuf,
+    /// The WAL root, read for pending publication markers at cutover.
+    wal_dir: PathBuf,
     memory_limit: String,
     min_free_disk_bytes: u64,
     /// The one armed job's cancel state (#109). In-process by design: a
@@ -332,6 +334,7 @@ impl RepinEngine {
         coordinator: Arc<RepinCoordinator>,
         pool: ExecutorPool,
         data_dir: PathBuf,
+        wal_dir: PathBuf,
         memory_limit: String,
         min_free_disk_bytes: u64,
     ) -> Self {
@@ -342,6 +345,7 @@ impl RepinEngine {
             coordinator,
             pool,
             data_dir,
+            wal_dir,
             memory_limit,
             min_free_disk_bytes,
             cancel: Arc::new(CancelRegistry::default()),
@@ -1451,6 +1455,10 @@ impl RepinEngine {
         // The narrow pause: exclusive against compaction batches and every
         // parquet-reading query lane, bounded.
         let corpus_gate = self.coordinator.cutover_guard().await;
+        if let Some(reason) = self.pending_publication(job_id).await {
+            drop(corpus_gate);
+            return Err(JobAbort::Blocked(reason));
+        }
         let pool_guard = match self.pool.exclusive(CUTOVER_DRAIN_TIMEOUT).await {
             Ok(guard) => guard,
             Err(ServerError::Timeout) => {
@@ -1897,6 +1905,65 @@ fn job_totals(totals: BuildTotals) -> JobTotals {
         rows_nulled: clamp(totals.nulled),
         rows_resurrected: clamp(totals.resurrected),
         ambiguous_numerals: clamp(totals.ambiguous),
+    }
+}
+
+impl RepinEngine {
+    /// Why the cutover must not swap while publication markers are pending
+    /// (ADR-0041), or `None` when there are none. Call under the cutover
+    /// guard.
+    ///
+    /// A marker proves its publish by the canonical output's identity. The
+    /// swap replaces every canonical file with its rewritten copy, so after
+    /// it recovery could no longer tell a finished publish from an
+    /// unfinished one and would block the service as a contradiction.
+    /// Compaction publishes and recovers under the corpus read guard, so a
+    /// marker seen here is one that recovery left: a failed retirement or a
+    /// contradiction, which the next compaction tick or an operator resolves.
+    /// Markers that cannot be read count as pending. The returned text is
+    /// stored on the job row and served to schema readers, so it names the
+    /// reason without paths or error text; the log carries those.
+    async fn pending_publication(&self, job_id: i64) -> Option<String> {
+        let wal_dir = self.wal_dir.clone();
+        let scan = on_blocking_pool("repin publication claims", move || {
+            crate::ingest::publication_marker::scan_claims(&wal_dir)
+        })
+        .await;
+        let refusal = match scan {
+            Ok(Ok(claims)) if !claims.any() => return None,
+            Ok(Ok(_)) => "publication_marker_pending",
+            Ok(Err(e)) => {
+                tracing::error!(
+                    event_type = "repin_publication_claims_unreadable",
+                    job_id,
+                    error = %e,
+                    "cannot read publication markers at cutover"
+                );
+                "publication_markers_unreadable"
+            }
+            Err(died) => {
+                tracing::error!(
+                    event_type = "repin_publication_claims_unreadable",
+                    job_id,
+                    error = %died,
+                    "the publication marker scan did not return at cutover"
+                );
+                "publication_markers_unreadable"
+            }
+        };
+        tracing::warn!(
+            event_type = "repin_cutover_refused",
+            job_id,
+            reason = refusal,
+            "cutover refused while publication markers are pending or unreadable"
+        );
+        Some(format!(
+            "cutover refused ({refusal}): a compaction publish may be waiting \
+             for recovery, and swapping the corpus now would leave it \
+             unprovable. The corpus stands at its pre-repin generation; check \
+             trawl_publication_recovery_total and the publication_recovery_failed \
+             log, then retry the repin once recovery completes"
+        ))
     }
 }
 

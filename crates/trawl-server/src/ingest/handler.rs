@@ -146,6 +146,10 @@ impl ParsedEvents {
 ///
 /// Expects `Content-Type: application/x-ndjson` (or `application/json`).
 /// Supports `Content-Encoding: gzip` for compressed payloads.
+///
+/// If any `(env, service)` group's WAL write fails, the request answers a
+/// redacted 500. The groups that did write are still published and
+/// counted first: they are durable, and compaction will merge them.
 pub async fn ingest(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
@@ -227,10 +231,12 @@ pub async fn ingest(
         let parse_ms = t1.elapsed().as_millis();
 
         let t2 = std::time::Instant::now();
-        let wal_paths = write_wal_batches(&wal_writer, &mut parsed);
+        let (wal_paths, wal_failed) = write_wal_batches(&wal_writer, &mut parsed);
         let wal_ms = t2.elapsed().as_millis();
 
-        Ok(finalize_ingest(
+        // Groups that did reach the WAL are acknowledged on disk, so they
+        // are published and counted before any failure answers the request.
+        let response = finalize_ingest(
             &state,
             &mut parsed,
             &wal_paths,
@@ -241,7 +247,14 @@ pub async fn ingest(
             decompress_ms,
             parse_ms,
             wal_ms,
-        ))
+        );
+        if wal_failed {
+            // A failed group was never acknowledged, so the request fails
+            // as a whole and the sender retries it. The filesystem error
+            // stays in the `wal_write_failed` log, never in the response.
+            return Err(ServerError::Internal("WAL write failed".into()));
+        }
+        Ok(response)
     })
     .await
     .map_err(|e| ServerError::from_join("ingest", e))??;
@@ -249,13 +262,15 @@ pub async fn ingest(
     Ok(Json(result))
 }
 
-/// Write one WAL file per `(env, service)` group. Partial failures are
-/// reported as per-event errors — successful groups are durable. Failed
-/// groups are removed from `parsed.batches` so they are never published.
+/// Write one WAL file per `(env, service)` group. Every group is attempted,
+/// and successful groups are durable. Failed groups are counted as
+/// `wal_failure` rejections and removed from `parsed.batches` so they are
+/// never published. The returned flag is true when any group failed, which
+/// fails the request after the successful groups are finalized.
 fn write_wal_batches(
     wal_writer: &crate::ingest::wal::WalWriter,
     parsed: &mut ParsedEvents,
-) -> Vec<(BatchKey, PathBuf)> {
+) -> (Vec<(BatchKey, PathBuf)>, bool) {
     let mut wal_paths: Vec<(BatchKey, PathBuf)> = Vec::new();
     let mut wal_failures: Vec<BatchKey> = Vec::new();
 
@@ -269,6 +284,7 @@ fn write_wal_batches(
                     batch_env = %env,
                     batch_service = %svc,
                     events_lost = batch.maps.len(),
+                    left_visible = e.left_visible(),
                     error = %e,
                     "WAL write failed for service group"
                 );
@@ -291,7 +307,7 @@ fn write_wal_batches(
         parsed.batches.shift_remove(key);
     }
 
-    wal_paths
+    (wal_paths, !wal_failures.is_empty())
 }
 
 /// Finish within the blocking task while its publication read guard is held.
@@ -741,7 +757,8 @@ mod tests {
                     .batches
                     .insert((env.to_owned(), service.to_owned()), batch);
             }
-            let written = write_wal_batches(&writer, &mut parsed);
+            let (written, failed) = write_wal_batches(&writer, &mut parsed);
+            assert!(failed, "a failed group fails the request");
             assert_eq!(parsed.reject_counts.get(RejectReason::WalFailure), 3);
             assert_eq!(parsed.errors.len(), 1);
             assert_eq!(parsed.batches.len(), 2);

@@ -408,17 +408,19 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -H "Content-Type: applicatio
 | Field | Type | Description |
 |-------|------|-------------|
 | `accepted` | integer | Events written to the WAL |
-| `rejected` | integer | Number of error entries: one per validation rejection or failed WAL group. Omitted when `0`. |
-| `errors` | array | Validation entries identify the rejected event: `index` is the zero-based array position or line number, counting blank lines. A WAL failure contributes one group error. Omitted when empty. |
+| `rejected` | integer | Number of error entries, one per validation rejection. Omitted when `0`. |
+| `errors` | array | Validation entries identify the rejected event: `index` is the zero-based array position or line number, counting blank lines. Omitted when empty. |
 
 A rejected event does not stop its siblings. Repairs do not change `accepted` or `rejected`. A body whose first non-blank byte is not `[` is read as newline-delimited JSON, so a single event object is accepted and a line that is not an event object counts as one rejected event with the response still 200. See [connect and verify a sender](/operate/ingestion/) for an end-to-end check.
 
-The `wal_failure` metric counts events in failed WAL groups, whereas the
-response records one error per failed group. A failed group of three events
-therefore adds three to `trawl_ingest_events_rejected_total{reason="wal_failure"}`
-and one to the response's `rejected` field. Successfully written sibling
-groups remain accepted. A persistence rejection does not establish permanent
-loss; the sender may retry.
+trawld writes one WAL file per environment and service group. If any group's
+WAL write fails, including its directory fsync, the whole request answers
+500 `internal_error` and the body carries no filesystem detail. Groups that
+wrote before or after the failed one are still accepted and published, so a
+retry of the whole request duplicates them. The events of each failed group
+are counted in `trawl_ingest_events_rejected_total{reason="wal_failure"}`.
+A persistence rejection does not establish permanent loss; the sender may
+retry.
 
 **Errors**
 
@@ -427,6 +429,7 @@ loss; the sender may retry.
 | 400 | `ingest_error` | Empty body, invalid UTF-8, an unparseable or empty JSON array, a gzip body that fails to decode, or a gzip body that expands past 10 times its wire size |
 | 413 | none | The body exceeds `[ingest] max_body_bytes` |
 | 429 | `rate_limited` | The key's ingest bucket is empty |
+| 500 | `internal_error` | A group's WAL write failed. Other groups in the request may still have been accepted. |
 
 ## Schema
 
@@ -1885,9 +1888,10 @@ Prometheus scrape-target labels are separate and remain on every alert.
 | `TrawlTelemetryWriteOutcomeUncertain` | `trawl_telemetry_events_dropped_total{reason="write_crashed"}` | Events consumed from the in-memory telemetry batch when its write task fails; WAL bytes may already exist |
 | `TrawlHttpPersistenceRejection` | `trawl_ingest_events_rejected_total{reason="wal_failure"}` | Events in failed HTTP WAL groups, counted during final ingest accounting |
 | `TrawlTelemetryWalWriteFailure` | `trawl_telemetry_wal_write_failures_total` | Failed telemetry write attempts, including retained retries and crashed tasks; no metric labels |
-| `TrawlWalDurabilityDegraded` | `trawl_wal_durability_failures_total{operation="parent_directory_sync"}` | Failed parent-directory sync operations after WAL publication; counted by the WAL writer |
+| `TrawlWalDurabilityDegraded` | `trawl_wal_durability_failures_total{operation="parent_directory_sync"}` | Failed WAL directory sync operations, each of which rejected its write; counted by the WAL writer |
 | `TrawlCompactionOperationFailure` | `trawl_compaction_operation_failures_total{operation}` | Explicit failed attempts, using the eight closed operations below |
 | `TrawlFileQuarantine` | `trawl_files_quarantined_total{kind}` | Files successfully renamed into quarantine; `kind` is `wal`, `parquet`, or `rollup_temporary` |
+| `TrawlPublicationRecoveryBlocked` | `trawl_publication_recovery_total{outcome=~"contradictory\|failed"}` | Publication markers that recovery left blocking their service, counted once per marker per recovery pass |
 
 The telemetry drop counter's closed `reason` set is `preinit_cap`,
 `buffer_cap`, `write_crashed`, and `unmetered_cap`. The capacity and
@@ -1899,7 +1903,7 @@ inclusive failed-attempt counter; both telemetry failure alerts can fire.
 The WAL durability counter has only `operation="parent_directory_sync"`.
 Existing HTTP rejection reasons other than `wal_failure` remain diagnostic.
 
-All 20 selected finite series are initialized at zero after recorder
+All 22 selected finite series are initialized at zero after recorder
 installation and before the first scrape, independently of feature enablement.
 Initialization preserves accumulated values. The exporter has no idle expiry
 for these baselines. Counters reset when the process restarts.
@@ -1922,7 +1926,7 @@ See the runbooks for [sampling and resolution limits](/operate/operational-alert
 | `daily_rollup_unit` | Roll up one daily unit, including a handled task failure |
 | `pending_rollup_scan` | Initialize the publication gate by scanning pending markers; a latched failure is counted once, not again on each read refusal |
 | `pending_rollup_recovery` | Recover pending rollup markers; the coordinated recovery wrapper owns returned errors, and the caller owns a handled task failure |
-| `consumed_wal_removal` | Remove a consumed WAL file after publication; a best-effort removal failure still counts |
+| `consumed_wal_removal` | Delete or rename aside a consumed WAL file after publication. On failure, the publication marker stays and blocks the service until recovery retires the file |
 
 Propagating a returned error through callers does not add another failure.
 At the WAL and daily-rollup root, one scan attempt counts once even if
@@ -1946,3 +1950,31 @@ temporary-file cleanup and empty-directory housekeeping are outside this
 closed inventory. Retiring a replaced file as `.parquet.merged` is not a
 corrupt-file quarantine. These counters do not measure backlog eligibility
 or prove that compaction is making progress.
+
+### Publication recovery outcomes
+
+`trawl_publication_recovery_total{outcome}` counts the publication markers
+that recovery examined. Recovery runs once at boot, before the daemon
+serves, and again at the start of each compaction tick.
+`TrawlPublicationRecoveryBlocked` selects the `contradictory` and
+`failed` outcomes. All four outcomes are initialized at zero after recorder
+installation.
+
+| `outcome` | Meaning |
+| --- | --- |
+| `published` | The canonical output carries the recorded identity. Recovery retired the consumed WAL files and removed the marker |
+| `unpublished` | The output was never renamed into place. Recovery removed the marker and the temporary output, and kept the WAL for the next compaction |
+| `contradictory` | The evidence contradicts itself, for example a canonical output with another identity and no temporary output. Recovery touched nothing, and the service stays blocked |
+| `failed` | A filesystem error stopped recovery of one marker. While the marker remains, the service stays blocked and the next tick retries. Recovery removes a marker only after its outcome is settled, so an error after that leaves nothing to retry: the rows are already published, or still in the WAL for the next compaction |
+
+Each `contradictory` or `failed` outcome also counts once in
+`CompactionStats.total_errors` for that tick. A `contradictory` marker
+repeats on every tick until an operator resolves it. The
+`publication_recovery_failed` log event for one marker names the env, the
+service, the marker path, and the `reason` or `error`. When recovery cannot
+list an env's WAL directory, the event carries only the env and the error,
+and nothing counts on this metric. A compaction tick lists the WAL root
+before recovery runs, and a failure of that listing counts under
+`wal_root_scan` and ends the tick before recovery. When that listing
+succeeds and recovery's own listing of the root fails, the event carries
+only the error and counts one `failed`.

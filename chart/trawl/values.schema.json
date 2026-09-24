@@ -114,7 +114,8 @@
             "TrawlTelemetryWalWriteFailure",
             "TrawlWalDurabilityDegraded",
             "TrawlCompactionOperationFailure",
-            "TrawlFileQuarantine"
+            "TrawlFileQuarantine",
+            "TrawlPublicationRecoveryBlocked"
           ],
           "properties": {
             "TrawlSyslogQueueDiscard": {
@@ -145,6 +146,9 @@
               "$ref": "#/definitions/operationalAlert"
             },
             "TrawlFileQuarantine": {
+              "$ref": "#/definitions/operationalAlert"
+            },
+            "TrawlPublicationRecoveryBlocked": {
               "$ref": "#/definitions/operationalAlert"
             }
           }

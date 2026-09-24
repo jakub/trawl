@@ -81,7 +81,7 @@ backlog eligibility, every network loss, or every disk failure.
 3. Check the rule file with `promtool check rules /etc/prometheus/rules/trawl.rules.yml`.
 4. Reload Prometheus through your existing configuration process.
 5. Check that its Targets page shows the `trawl` job as up and its Rules page
-   lists all ten Trawl alerts without evaluation errors.
+   lists all eleven Trawl alerts without evaluation errors.
 
 The plain expressions select `job="trawl"`. If you choose another job name,
 replace that matcher in every rule. Edit ordinary rule fields to change
@@ -113,7 +113,7 @@ prometheusRule:
       enabled: false
 ```
 
-All ten alerts are enabled with severity `warning` when the pack is enabled.
+All eleven alerts are enabled with severity `warning` when the pack is enabled.
 Use the exact alert names in the [metric mapping](/reference/api/#operational-alert-counters)
 as keys under `prometheusRule.alerts`. Each entry accepts only `enabled` and
 `severity`. Severity is a nonblank static string, with no severity enum;
@@ -334,9 +334,10 @@ sender may retry; this is not confirmed permanent loss. Malformed input,
 producer policy rejections, and field-conformance outcomes are excluded.
 
 1. Read daemon WAL errors and the sender's response, retry, and buffer state.
-2. Check `accepted` and `errors` even when the response is HTTP 200. A failed
-   three-event group increments this metric by three but contributes one
-   group error to the response's `rejected` count.
+2. A request with any failed group answers a redacted HTTP 500. Groups that
+   did write in the same request are still accepted and published, so a
+   retry of the whole request duplicates them. A failed three-event group
+   increments this metric by three.
 3. Correct the storage problem and reconcile accepted siblings before a
    controlled retry. Preserve sender copies and any temporary WAL bytes.
 
@@ -364,17 +365,36 @@ failure alerts; never subtract attempt counts from event counts.
 
 `TrawlWalDurabilityDegraded` observes
 `trawl_wal_durability_failures_total{operation="parent_directory_sync"}`, in
-failed operations. `WalWriter::write` has published the file, then failed to
-sync its parent directory. The directory entry may not survive a crash.
-The write remains accepted; this is neither rejection nor event discard.
+failed operations. `WalWriter::write` failed to sync a WAL directory: the
+environment directory after a rename, or the WAL root before the first write
+into an environment. A write is acknowledged only after that sync, so the
+write is rejected. Before it returns the error, the writer tries to remove the
+renamed file. A file it cannot remove stays in the WAL, as step 2 describes.
+Each lane then follows its own failure path:
 
-1. Find `wal_dir_fsync_failed` and the filesystem error it carries.
-2. Inspect filesystem and storage health while preserving the published WAL.
-3. Address the reported sync failure. Avoid an unnecessary restart or blind
-   resend as a repair for this warning; a resend can duplicate visible data.
+- HTTP ingest answers a redacted 500 and counts the failed group under
+  `TrawlHttpPersistenceRejection`. The sender retries.
+- Syslog discards the group and counts it under `TrawlSyslogWalDiscard`.
+- Telemetry counts the attempt under `TrawlTelemetryWalWriteFailure`. It
+  retains the batch for retry, unless the file stayed in the WAL.
 
-Resolution means no new parent-directory sync failure was observed. It does
-not retroactively prove crash durability for the earlier directory entry.
+1. Find `wal_dir_fsync_failed` and the filesystem error it carries. The
+   `withdrawn` field says whether the renamed file was removed.
+2. If `withdrawn` is `false`, the file stays in the WAL and compaction merges
+   it, although the write was rejected. A sender that retries that batch
+   duplicates it. Telemetry does not retry such a batch.
+3. If `withdrawn` is `true`, read `withdrawal_durable`. The writer syncs the
+   directory again after it removes the file. `true` means that the removal
+   is durable. `false` means that the second sync failed too, and
+   `withdrawal_sync_error` carries its error. The file is gone now, but a
+   power loss before the next successful sync of that directory can restore
+   it, and compaction then merges a batch whose write was rejected. That
+   second failure increments the counter again.
+4. Inspect filesystem and storage health, and address the reported sync
+   failure.
+
+Resolution means no new directory sync failure was observed. It does not
+prove that rejected writes were retried.
 
 ## Compaction operation failure
 
@@ -432,3 +452,56 @@ followed by a different failure can legitimately emit both facts.
 Resolution means no new file isolation was observed. It does not mean that
 quarantined files disappeared, that their contents were restored, or that a
 number of events was permanently lost.
+
+## Publication recovery blocked
+
+`TrawlPublicationRecoveryBlocked` observes
+`trawl_publication_recovery_total{outcome=~"contradictory|failed"}`, in
+publication markers. Compaction writes a marker before it publishes a
+parquet file and removes it after the consumed WAL files are retired.
+Recovery runs at boot and at the start of every compaction tick, and it
+finishes or rolls back each marker it finds. While a marker stays, its
+environment and service are out of compaction, stale temporary-file cleanup,
+daily rollup of that day, and retention of that date. A repin cutover is
+refused. [Crash recovery](/architecture/recovery/) describes the protocol.
+
+- `failed`: a filesystem error stopped recovery of one marker, for example a
+  WAL directory where the consumed files cannot be removed. Check whether
+  the marker still exists: while it does, the service stays blocked and the
+  next tick retries it, and each retry that fails counts again. Recovery
+  removes a marker only after its outcome is settled, so if the marker is
+  gone nothing is retried: the rows are already published, or still in the
+  WAL for the next compaction.
+- `contradictory`: the evidence contradicts itself. For example, the
+  canonical parquet file does not carry the identity the marker recorded,
+  and the temporary output is gone. Recovery touches nothing and counts the
+  marker on every tick until an operator resolves it.
+
+1. Find `publication_recovery_failed` in the daemon log. An event about one
+   marker names the environment, the service, and the marker path. A
+   contradiction carries a `reason`: `invalid_marker`, `not_regular_file`,
+   `output_missing`, or `output_mismatch`. A failure carries the filesystem
+   error. Recovery can also fail before it reaches a marker. If recovery
+   cannot list an environment's WAL directory, the event carries only the
+   environment and the error, and every service in that environment stays
+   blocked. This case does not count toward this alert; compaction counts
+   it under `wal_environment_scan`. A compaction tick lists the WAL root
+   before recovery runs. If that first listing fails, compaction counts it
+   under `wal_root_scan` and the tick stops before recovery. If the first
+   listing succeeds and recovery's own listing of the root then fails, the
+   event carries only the error and counts as `failed`.
+2. For a failure, correct the reported permission or storage problem. When
+   the event has no service or marker path, investigate the directory that
+   its error names. The next tick completes the marker, and the service
+   compacts again.
+3. For a contradiction, stop trawld and preserve the marker, the WAL files it
+   lists, and the parquet and temporary files at its partition. Find out what
+   changed the canonical file or removed the temporary output, such as a
+   manual edit, a restore from backup, or an interrupted disk. Keep the
+   marker until you know whether the listed WAL rows are in the canonical
+   file. Removing it makes compaction merge those WAL files again, which
+   duplicates their rows if they were published.
+
+Resolution means that no recovery outcome of either kind was observed in the
+window. A contradictory marker repeats on every tick, so the alert keeps
+firing while that marker stays.

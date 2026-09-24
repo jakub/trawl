@@ -27,7 +27,7 @@ The syslog listener publishes its frame values as ordinary `syslog_*` and `sd_*`
 
 ## WAL writer
 
-A batch writes one file per environment and service group under `wal/{env}/`. The filename carries the validated service, the arrival milliseconds, and a random suffix. The writer creates a `.tmp` file, fsyncs its data, renames it to `.ndjson`, then fsyncs the parent directory. A successful write is durable before its events reach the hot buffer. Service names are validated, not rewritten, so two legal names never share a path.
+A batch writes one file per environment and service group under `wal/{env}/`. The filename carries the validated service, the arrival milliseconds, and a random suffix. The writer creates a `.tmp` file, fsyncs its data, renames it to `.ndjson`, then fsyncs the parent directory. The first write into an environment also fsyncs the WAL root, which holds the environment directory's entry. A write is acknowledged only after every fsync succeeds, so a successful write is durable before its events reach the hot buffer. If a directory fsync fails, the write fails and the writer tries to remove the renamed file. If the removal fails too, the file stays in the WAL and compaction merges it, so an HTTP sender that retries the batch duplicates its rows. Telemetry does not retry such a batch. Service names are validated, not rewritten, so two legal names never share a path.
 
 ## Hot buffer and the publication guard
 
@@ -41,7 +41,7 @@ A bounded Tokio broadcast channel shares each batch with live subscribers. A slo
 
 ## Compaction
 
-The compactor finds eligible WAL files, groups them by service and environment, takes catalog pins, conforms the batch, and merges it into the existing hourly file. Publication and hot drain happen together under the write guard, then bookkeeping runs and the processed WAL files are removed. Failed work keeps its inputs for diagnosis. Read [catalog conformance](/architecture/catalog/#write-time-conformance) for the cast rules.
+The compactor finds eligible WAL files, groups them by service and environment, takes catalog pins, conforms the batch, and merges it into the existing hourly file. A [publication marker](/architecture/recovery/#publication-markers) records each publish before the output is renamed into place. Publication and hot drain happen together under the write guard. The consumed WAL files are then retired, the marker is removed, and bookkeeping runs. Failed work keeps its inputs for diagnosis. Read [catalog conformance](/architecture/catalog/#write-time-conformance) for the cast rules.
 
 Compaction reads each row's `_time` and `_ingested` with `TRY_CAST`. If a value is unusable, it falls back to the arrival instant in that row's own WAL filename, then to the compaction instant. The fallback is per row. Canonicalized events already have valid timestamps.
 

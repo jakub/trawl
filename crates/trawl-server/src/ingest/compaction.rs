@@ -21,6 +21,9 @@ use trawl_core::severity::Dialect;
 use crate::catalog::CatalogContext;
 use crate::env_dirs::{list_env_dirs, try_list_env_dirs_observed};
 use crate::hot_buffer::HotBuffer;
+use crate::ingest::publication_marker::{
+    self, PublicationClaims, RecoveryOutcomeKind, ValidatedMarker,
+};
 use crate::metrics::{BookkeepingWrite, CompactionOperation, QuarantineKind};
 use crate::publication::PublicationGate;
 use crate::repin::RepinCoordinator;
@@ -74,8 +77,9 @@ pub fn spawn_compaction(
                             if let Some(ref stats) = compaction_stats {
                                 stats.total_runs.fetch_add(1, Ordering::Relaxed);
                                 // compact_once returns the combined data-loss
-                                // tally: best-effort daily-rollup failures plus
-                                // WAL files quarantined this cycle. Surface it
+                                // tally: best-effort daily-rollup failures,
+                                // WAL files quarantined this cycle and
+                                // publication markers left blocking. Surface it
                                 // on the dashboard counter, not just in logs.
                                 if data_loss > 0 {
                                     stats.total_errors.fetch_add(data_loss, Ordering::Relaxed);
@@ -106,9 +110,10 @@ pub fn spawn_compaction(
 /// Run one compaction cycle.
 ///
 /// Returns the number of failures this cycle (0 on a clean run): per-service
-/// daily rollups that failed, WAL files quarantined, and env WAL directories
-/// that could not be scanned. All of these are best-effort and reported via
-/// the count so the caller can track them without failing the whole cycle.
+/// daily rollups that failed, WAL files quarantined, env WAL directories
+/// that could not be scanned, and publication markers recovery left
+/// blocking. All of these are best-effort and reported via the count so the
+/// caller can track them without failing the whole cycle.
 ///
 /// Public for integration tests only — not part of the external API.
 /// Called internally by [`spawn_compaction`].
@@ -151,6 +156,11 @@ pub async fn compact_once(
 /// flight from continuing past the cutover. WAL draining waits for cutover.
 /// It also waits when pending rollup recovery needs to relocate files during
 /// a repin pause, because those hourly inputs must remain unchanged.
+///
+/// Each tick first recovers interrupted compaction publishes from their
+/// publication markers (ADR-0041) under the corpus gate, and skips every
+/// `(env, service)` a marker still claims. Each chunk then publishes under
+/// its own marker: see [`publish_output`].
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // internal API, config struct is overkill here
 pub async fn compact_once_coordinated(
     wal_dir: &Path,
@@ -170,11 +180,6 @@ pub async fn compact_once_coordinated(
         hot_buffer.map_or_else(|| Arc::new(PublicationGate::new()), |buf| buf.publication());
     publication.initialize(data_dir);
     recover_pending_rollups(&publication, repin).await?;
-
-    // Remove orphaned .parquet.tmp files from interrupted compaction runs.
-    for (_env, env_data_dir) in list_env_dirs(data_dir) {
-        cleanup_stale_tmp_files(&env_data_dir, min_age * 2);
-    }
 
     // Tally of corrupt WAL files quarantined this cycle. Folded into the
     // return value so it lands on `CompactionStats.total_errors` as a
@@ -205,6 +210,20 @@ pub async fn compact_once_coordinated(
         )
     })?;
 
+    // Finish or roll back every interrupted publish (ADR-0041) before this
+    // tick can merge a WAL file a marker names or clean up a claimed tmp.
+    // Markers recovery could not resolve count as errors and keep their
+    // service out of this tick.
+    let (recovery_blocked, claims) =
+        recover_publications(wal_dir, data_dir, hot_buffer, repin).await?;
+
+    // Remove orphaned .parquet.tmp files from interrupted compaction runs,
+    // except any a pending marker still claims: recovery needs that tmp to
+    // roll its publish back.
+    for (env, env_data_dir) in list_env_dirs(data_dir) {
+        cleanup_stale_tmp_files(&env, &env_data_dir, min_age * 2, &claims);
+    }
+
     for (env, env_wal_dir) in env_wal_dirs {
         let env_data_dir = data_dir.join(&env);
         let Some(files) = scan_env_wal_files(&env, &env_wal_dir, min_age) else {
@@ -219,6 +238,15 @@ pub async fn compact_once_coordinated(
         let groups = group_by_service(files);
 
         for (service, wal_files) in &groups {
+            if claims.blocks_service(&env, service) {
+                tracing::debug!(
+                    event_type = "compaction_blocked",
+                    env = %env,
+                    compact_service = %service,
+                    "a pending publication marker blocks this service until recovery resolves it"
+                );
+                continue;
+            }
             tracing::debug!(
                 event_type = "compaction_start",
                 compact_service = %service,
@@ -229,8 +257,10 @@ pub async fn compact_once_coordinated(
             // Process WAL files in chunks to avoid OOM on large backlogs.
             // Each chunk independently compacts to parquet (merging with
             // the canonical file if it exists), drains the hot buffer, and
-            // cleans up consumed WAL files. If a chunk fails, remaining
-            // chunks are skipped and retried on the next tick.
+            // retires its consumed WAL files, all inside one marker-bracketed
+            // publish. If a chunk fails, remaining chunks are skipped and
+            // retried on the next tick: a failed publish may have left its
+            // marker, and the next chunk must not overwrite it.
             let safe_chunk_size = chunk_size.max(1);
             let chunks: Vec<&[PathBuf]> = wal_files.chunks(safe_chunk_size).collect();
             let total_chunks = chunks.len();
@@ -264,6 +294,8 @@ pub async fn compact_once_coordinated(
                 let outcome = compact_service_batch(
                     chunk,
                     &env_data_dir,
+                    wal_dir,
+                    &env,
                     service,
                     memory_limit,
                     catalog,
@@ -281,26 +313,24 @@ pub async fn compact_once_coordinated(
                 wal_quarantined += outcome.quarantined;
 
                 match outcome.result {
-                    Ok(()) => {
-                        // Clean up consumed WAL files. A file that was
-                        // quarantined (renamed to `.corrupt`) is already gone
-                        // from its original path — NotFound means the goal
-                        // (no longer a re-compactable WAL file) is satisfied.
-                        for f in chunk {
-                            match std::fs::remove_file(f) {
-                                Ok(()) => {}
-                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                                Err(e) => {
-                                    CompactionOperation::ConsumedWalRemoval.record_failure();
-                                    tracing::warn!(
-                                        event_type = "compaction_error",
-                                        file = %f.display(),
-                                        error = %e,
-                                        "failed to delete consumed WAL file"
-                                    );
-                                }
-                            }
-                        }
+                    Ok(None) => {}
+                    Ok(Some(incomplete)) => {
+                        // The output is published and its rows drained; the
+                        // marker still names the consumed WAL, so no later
+                        // pass can merge it again. Recovery at the start of
+                        // a later tick finishes the publish.
+                        incomplete.operation.record_failure();
+                        tracing::error!(
+                            event_type = "compaction_error",
+                            compact_service = %service,
+                            chunk = chunk_idx + 1,
+                            total_chunks,
+                            error = %incomplete.error,
+                            "published, but finishing the publish failed; its \
+                             publication marker blocks this service until recovery \
+                             completes it"
+                        );
+                        break;
                     }
                     Err(e) => {
                         // Owns ordinary failures and handled blocking-task
@@ -336,17 +366,33 @@ pub async fn compact_once_coordinated(
         );
     }
     let rollup_failures = if daily_rollup && !rollup_suppressed {
-        match rollup_once(
-            data_dir,
-            memory_limit,
-            repin,
-            hot_buffer.map(|buf| buf.publication()),
-        )
-        .await
-        {
-            Ok(n) => n,
+        // Scan again: a publish that failed during this tick left a marker
+        // the scan before compaction could not see, and rollup must not
+        // move the hourly file it names.
+        match scan_claims_blocking(wal_dir).await {
+            Ok(claims) => {
+                match rollup_once(
+                    data_dir,
+                    &claims,
+                    memory_limit,
+                    repin,
+                    hot_buffer.map(|buf| buf.publication()),
+                )
+                .await
+                {
+                    Ok(n) => n,
+                    Err(e) => {
+                        tracing::error!(event_type = "rollup_error", error = %e, "daily rollup failed");
+                        1
+                    }
+                }
+            }
             Err(e) => {
-                tracing::error!(event_type = "rollup_error", error = %e, "daily rollup failed");
+                tracing::error!(
+                    event_type = "rollup_error",
+                    error = %e,
+                    "cannot read publication markers; daily rollup skipped this tick"
+                );
                 1
             }
         }
@@ -354,7 +400,74 @@ pub async fn compact_once_coordinated(
         0
     };
 
-    Ok(rollup_failures + wal_quarantined + scan_failures)
+    Ok(rollup_failures + wal_quarantined + scan_failures + recovery_blocked)
+}
+
+/// Finish or roll back every interrupted compaction publish (ADR-0041), then
+/// report what the markers left behind still claim.
+///
+/// Runs on a blocking thread under the repin corpus read guard, which the
+/// task owns so cancelling the tick cannot release it mid-recovery. A
+/// published marker drains its batches from the hot buffer under the
+/// publication write guard, taken inside the corpus guard (ADR-0026 lock
+/// order: corpus, then publication).
+///
+/// Returns how many markers stay blocking (contradictions and failed
+/// recoveries, each also counted on `trawl_publication_recovery_total`) and
+/// the claims compaction must skip. An unreadable WAL root is an error.
+async fn recover_publications(
+    wal_dir: &Path,
+    data_dir: &Path,
+    hot_buffer: Option<&Arc<HotBuffer>>,
+    repin: Option<&Arc<RepinCoordinator>>,
+) -> Result<(u64, PublicationClaims), String> {
+    let corpus_guard = match repin {
+        Some(c) => Some(c.compaction_guard_owned().await),
+        None => None,
+    };
+    let wal_dir = wal_dir.to_path_buf();
+    let data_dir = data_dir.to_path_buf();
+    let hot_buffer = hot_buffer.cloned();
+    tokio::task::spawn_blocking(move || {
+        let _corpus_guard = corpus_guard;
+        let report = publication_marker::recover(&wal_dir, &data_dir, |marker| {
+            if let Some(buf) = &hot_buffer {
+                let gate = buf.publication();
+                let _publication_guard = gate.blocking_write();
+                let ids = marker.batch_ids();
+                let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+                buf.drain(&ids);
+            }
+            Ok(())
+        });
+        let blocked = match report {
+            Ok(report) => report.record(),
+            Err(error) => {
+                RecoveryOutcomeKind::Failed.record();
+                tracing::error!(
+                    event_type = "publication_recovery_failed",
+                    error = %error,
+                    "cannot list publication markers; no WAL is compacted this tick"
+                );
+                return Err(error);
+            }
+        };
+        let claims = publication_marker::scan_claims(&wal_dir)?;
+        Ok((blocked, claims))
+    })
+    .await
+    .map_err(|e| {
+        RecoveryOutcomeKind::Failed.record();
+        crate::error::join_failure_text("publication recovery", e)
+    })?
+}
+
+/// [`publication_marker::scan_claims`] on a blocking thread.
+async fn scan_claims_blocking(wal_dir: &Path) -> Result<PublicationClaims, String> {
+    let wal_dir = wal_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || publication_marker::scan_claims(&wal_dir))
+        .await
+        .map_err(|e| crate::error::join_failure_text("publication claims scan", e))?
 }
 
 async fn recover_pending_rollups(
@@ -417,6 +530,7 @@ async fn recover_pending_rollups(
 /// stands down instead of moving files across a cutover.
 async fn rollup_once(
     data_dir: &Path,
+    claims: &PublicationClaims,
     memory_limit: &str,
     repin: Option<&Arc<RepinCoordinator>>,
     publication: Option<Arc<PublicationGate>>,
@@ -434,11 +548,19 @@ async fn rollup_once(
             "failed to list env directories, treating as empty");
         Vec::new()
     });
-    for (_env, env_data_dir) in env_dirs {
+    for (env, env_data_dir) in env_dirs {
         if repin.is_some_and(|c| c.rollup_paused()) {
             break;
         }
-        total += rollup_env_once(&env_data_dir, memory_limit, repin, publication.clone()).await?;
+        total += rollup_env_once(
+            &env,
+            &env_data_dir,
+            claims,
+            memory_limit,
+            repin,
+            publication.clone(),
+        )
+        .await?;
     }
     Ok(total)
 }
@@ -472,6 +594,19 @@ fn log_rollup_stand_down() {
         "daily rollup stood down mid-pass: a repin job claimed the corpus \
          while this pass was running; hourly files consolidate on the first \
          tick after the job ends"
+    );
+}
+
+/// Log a `(date, service)` the rollup skips because a publication marker
+/// claims one of its hourly files.
+fn log_rollup_blocked(env: &str, date: &str, service: &str) {
+    tracing::info!(
+        event_type = "rollup_blocked",
+        env = %env,
+        date = %date,
+        compact_service = %service,
+        "a pending publication marker claims an hourly file of this service; \
+         its daily rollup waits until recovery resolves it"
     );
 }
 
@@ -524,8 +659,14 @@ fn historical_rollup_date(path: &Path, today: &str) -> Option<String> {
 
 /// Roll up one env root (`data_dir/{env}`): consolidate each historical
 /// date's hourly files into per-service daily files. Never crosses envs.
+///
+/// A `(date, service)` with any hourly output a publication marker claims
+/// is skipped: rolling it up would delete the canonical file whose identity
+/// recovery checks, and the marker would then read as a contradiction.
 async fn rollup_env_once(
+    env: &str,
     data_dir: &Path,
+    claims: &PublicationClaims,
     memory_limit: &str,
     repin: Option<&Arc<RepinCoordinator>>,
     publication: Option<Arc<PublicationGate>>,
@@ -597,7 +738,12 @@ async fn rollup_env_once(
             continue;
         }
 
+        let date = chrono::NaiveDate::parse_from_str(&dir_name, "%Y-%m-%d").ok();
         for (service, files) in &service_files {
+            if date.is_some_and(|date| claims.claims_service_day(env, date, service)) {
+                log_rollup_blocked(env, &dir_name, service);
+                continue;
+            }
             // One merge = one gated unit: it reads the day's hourlies,
             // renames the merged daily into place and deletes the sources,
             // so a cutover swapping the shadow in between those steps would
@@ -865,7 +1011,7 @@ fn recover_rollup_markers_inner(
                 std::fs::rename(&tmp, &canonical)
                     .map_err(|e| format!("rollup recovery rename failed: {e}"))?;
                 for file in &hourly_files {
-                    retire_merged_hourly(file)?;
+                    retire_merged_input(file)?;
                 }
             } else {
                 // Keep the old daily and hourly sources for a fresh merge.
@@ -909,7 +1055,7 @@ fn recover_rollup_markers_inner(
                     "recovering rollup: canonical exists, deleting hourly files"
                 );
                 for file in &hourly_files {
-                    retire_merged_hourly(file)?;
+                    retire_merged_input(file)?;
                 }
             } else {
                 tracing::warn!(
@@ -1127,21 +1273,25 @@ fn quarantine_file(
     }
 }
 
-/// Make a merged hourly file inert when it can't be deleted.
+/// Retire a merge input whose rows now live in a published output: a
+/// merged hourly parquet file after a daily rollup, or a consumed WAL file
+/// after a compaction publish. Deletes it, or makes it inert when it can't
+/// be deleted.
 ///
 /// Renames it aside with a `.merged` suffix so it no longer matches the
-/// `*.parquet`/`*.tmp` compaction globs and can never be re-merged into a
-/// later rollup (which would duplicate its rows — the merge path has no
-/// dedup by design, since two identical log lines are distinct events).
+/// `*.parquet`/`*.tmp` rollup globs or the `*.ndjson` WAL scan, and can
+/// never be merged again (which would duplicate its rows — the merge path
+/// has no dedup by design, since two identical log lines are distinct
+/// events).
 ///
 /// A missing source is success: the goal — "this file is no longer present as
-/// a re-mergeable hourly" — is already satisfied if it's gone. This keeps the
+/// a re-mergeable input" — is already satisfied if it's gone. This keeps the
 /// op idempotent so a recovery pass that replays a marker after a partial
-/// cleanup loop (some hourlies already deleted) doesn't wedge on a phantom.
+/// retirement loop (some inputs already deleted) doesn't wedge on a phantom.
 /// A failed rename whose source vanished from under us (lost a delete race) is
 /// likewise fine; only a genuine non-`NotFound` rename failure is a hard error,
-/// because then the file still matches `*.parquet` and would be re-merged.
-fn retire_merged_hourly(path: &Path) -> Result<(), String> {
+/// because then the file still matches its glob and would be merged again.
+pub(crate) fn retire_merged_input(path: &Path) -> Result<(), String> {
     match std::fs::remove_file(path) {
         Ok(()) => return Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -1153,7 +1303,7 @@ fn retire_merged_hourly(path: &Path) -> Result<(), String> {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(format!(
-            "failed to retire merged hourly {}: {e}",
+            "failed to retire merged input {}: {e}",
             path.display()
         )),
     }
@@ -1372,7 +1522,7 @@ fn rollup_day_inner(
     // silently duplicate every one of its rows on the next tick. A failed
     // rename-aside is a hard error: the file still matches `*.parquet`.
     for f in &merged_hourly {
-        retire_merged_hourly(f)?;
+        retire_merged_input(f)?;
     }
 
     // Remove marker — rollup fully complete.
@@ -1410,8 +1560,21 @@ struct CompactOutcome {
     /// data-loss whether or not the rest of the batch then compacted.
     quarantined: u64,
     /// Whether the batch compacted to parquet (`Ok`) or failed and must retry
-    /// next tick (`Err`).
-    result: Result<(), String>,
+    /// next tick (`Err`). `Ok(Some(_))` is a published batch whose marker
+    /// could not be removed: see [`PublishIncomplete`].
+    result: Result<Option<PublishIncomplete>, String>,
+}
+
+/// A publish whose output is renamed into place and whose hot batches are
+/// drained, but whose publication marker stays: a later step (output
+/// directory fsync, WAL retirement, WAL directory fsync or marker removal)
+/// failed. The marker blocks the service until recovery completes the
+/// publish, so the consumed WAL is never merged again.
+#[derive(Debug)]
+struct PublishIncomplete {
+    /// The failed attempt's owner on the operation-failure counter.
+    operation: CompactionOperation,
+    error: String,
 }
 
 /// Compact a batch of WAL files for a single service into parquet,
@@ -1427,8 +1590,9 @@ struct CompactOutcome {
 ///    the WAL is retained and retried next tick — never an unconformant
 ///    parquet write.
 /// 3. blocking — conform `wal_batch` to the pins (`TRY_CAST` on mismatch,
-///    drop deferred all-null unpinned columns), then merge/sort/COPY/
-///    atomic-rename.
+///    drop deferred all-null unpinned columns), then merge/sort/COPY, and
+///    publish under a publication marker: rename, drain, retire the consumed
+///    WAL (see [`publish_output`]).
 /// 4. async, best-effort — record `field_conflicts`, touch
 ///    `field_services`, bump metrics. A failure here warns and moves on
 ///    (the data is already durable and conformant).
@@ -1436,9 +1600,12 @@ struct CompactOutcome {
 /// With `catalog: None` (tests, embedded-style callers) the pins are the
 /// envelope seed plus this batch's own proposals — same conform algebra,
 /// no persistence and no invariant across processes.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // internal API, config struct is overkill here
 async fn compact_service_batch(
     wal_files: &[PathBuf],
     data_dir: &Path,
+    wal_dir: &Path,
+    env: &str,
     service: &str,
     memory_limit: &str,
     catalog: Option<&CatalogContext>,
@@ -1488,7 +1655,7 @@ async fn compact_service_batch(
             }
             return CompactOutcome {
                 quarantined,
-                result: Ok(()),
+                result: Ok(None),
             };
         }
         Err(e) => {
@@ -1515,22 +1682,28 @@ async fn compact_service_batch(
         None => local_pins(&prep.proposals),
     };
 
-    // Phase 3: conform + write (blocking).
+    // Phase 3: conform + write + publish (blocking).
     let data_dir_owned = data_dir.to_path_buf();
+    let wal_dir_owned = wal_dir.to_path_buf();
+    let env_owned = env.to_owned();
     let service_owned = service.to_owned();
     let phase3 = tokio::task::spawn_blocking(move || {
         conform_and_publish(
             prep,
             &pins,
-            &data_dir_owned,
+            &PublishTarget {
+                data_dir: &data_dir_owned,
+                wal_dir: &wal_dir_owned,
+                env: &env_owned,
+            },
             &service_owned,
             hot_buffer.as_deref(),
             &batch_ids,
         )
     })
     .await;
-    let report = match phase3 {
-        Ok(Ok(report)) => report,
+    let (report, incomplete) = match phase3 {
+        Ok(Ok(published)) => published,
         Ok(Err(e)) => {
             return CompactOutcome {
                 quarantined,
@@ -1546,6 +1719,8 @@ async fn compact_service_batch(
     };
 
     // Phase 4: bookkeeping (best-effort — the parquet is already durable).
+    // Runs for an incomplete publish too: its rows are published, and
+    // recovery finishing it later does not repeat the bookkeeping.
     record_conflict_metrics(service, &report.conflicts);
     if let Some(cat) = catalog {
         record_batch_bookkeeping(cat, service, &report).await;
@@ -1553,7 +1728,7 @@ async fn compact_service_batch(
 
     CompactOutcome {
         quarantined,
-        result: Ok(()),
+        result: Ok(incomplete),
     }
 }
 
@@ -1817,8 +1992,8 @@ fn count_rows(conn: &duckdb::Connection, table: &str) -> Result<u64, String> {
 /// the ones that throw, and rebuild from the survivors. This makes a single
 /// poison-pill file unable to wedge the whole batch (the residual the byte
 /// sniff alone could not close). `*quarantined` is incremented for each file
-/// set aside. Returns `Ok(0)` when every file turned out corrupt (the caller
-/// treats that as data-loss, not error).
+/// set aside. Returns the files that contributed rows, empty when every file
+/// turned out corrupt (the caller treats that as data-loss, not error).
 ///
 /// Complex-typed columns cannot arise here: ingest canonicalization
 /// stringifies top-level object/array values before the WAL is written, and
@@ -1829,10 +2004,10 @@ fn read_wal_to_table(
     wal_files: &[PathBuf],
     service: &str,
     quarantined: &mut u64,
-) -> Result<usize, String> {
+) -> Result<Vec<PathBuf>, String> {
     // Fast path: read the whole batch in one scan. The common case.
     match build_wal_batch(conn, wal_files, service) {
-        Ok(()) => return Ok(wal_files.len()),
+        Ok(()) => return Ok(wal_files.to_vec()),
         Err(e) => {
             // A non-"Duplicate name" read error means at least one file is
             // malformed-but-textual. Without isolation that one file fails
@@ -1860,7 +2035,7 @@ fn read_wal_to_table(
     }
 
     if survivors.is_empty() {
-        return Ok(0);
+        return Ok(survivors);
     }
 
     // Rebuild from the survivors. Each parsed cleanly alone, so a residual
@@ -1868,7 +2043,7 @@ fn read_wal_to_table(
     // poison pill — surface it as Err to retry next tick.
     build_wal_batch(conn, &survivors, service)
         .map_err(|e| format!("{e} (after isolating corrupt files)"))?;
-    Ok(survivors.len())
+    Ok(survivors)
 }
 
 /// Synthetic column carrying each row's source WAL file path
@@ -2139,13 +2314,16 @@ struct PreparedBatch {
     schema: Vec<ColInfo>,
     /// Pin proposals for columns absent from the known-pin set.
     proposals: Vec<PinProposal>,
-    /// WAL files that contributed rows.
-    survivors: usize,
+    /// WAL files that contributed rows, in input order: the inputs minus
+    /// any quarantined as corrupt. The publication marker lists exactly
+    /// these, and the publish retires exactly these.
+    survivors: Vec<PathBuf>,
     /// Start instant for the completion log.
     compact_start: std::time::Instant,
 }
 
 /// Outcome of a conformant write, carried to the bookkeeping phase.
+#[derive(Debug)]
 struct WriteReport {
     /// Rows this batch contributed, deliberately not the merged file's
     /// total: `field_services.row_count` accumulates this value, so a
@@ -2237,7 +2415,7 @@ fn prepare_service_batch(
         .map_err(|e| format!("SET TimeZone failed: {e}"))?;
 
     let survivors = read_wal_to_table(&conn, &valid_files, service, quarantined)?;
-    if survivors == 0 {
+    if survivors.is_empty() {
         // Every sniff-passing file turned out malformed and was quarantined
         // during read isolation — data loss, not error (nothing to retry).
         tracing::error!(
@@ -3183,10 +3361,38 @@ pub(crate) fn sanitize_sample(value: &str) -> String {
     cleaned
 }
 
-/// Blocking phase 3: conform `wal_batch` to the authoritative pins, then
-/// write parquet: canonical `{service}.parquet` per hour-directory, merged
-/// with the existing file when present, `.tmp` + atomic `rename()` for
-/// crash safety.
+/// Where a batch publishes: its env's data directory, and the WAL root and
+/// env its inputs came from. The publication marker names paths relative to
+/// these, so recovery rebuilds exactly the paths the publish used.
+struct PublishTarget<'a> {
+    /// `data_root/{env}`.
+    data_dir: &'a Path,
+    /// The WAL root. The batch's inputs live in `wal_dir/{env}`.
+    wal_dir: &'a Path,
+    env: &'a str,
+}
+
+/// A conformed batch written to `{service}.parquet.tmp` and not yet
+/// published.
+struct StagedOutput {
+    output_dir: PathBuf,
+    tmp_path: PathBuf,
+    canonical_path: PathBuf,
+    date: chrono::NaiveDate,
+    hour: u8,
+    /// Whether the output merged an existing canonical file.
+    merged: bool,
+    /// Rows in the output file.
+    rows: u64,
+    survivors: Vec<PathBuf>,
+    compact_start: std::time::Instant,
+    report: WriteReport,
+}
+
+/// Blocking phase 3, test-only form: [`write_output`] and a bare rename,
+/// with no publication marker and no WAL retirement. Unit tests of conform
+/// and merge semantics use it with WAL files outside any `wal_dir/{env}`;
+/// the bracketed publish is exercised through [`compact_once`].
 #[cfg(test)]
 fn conform_and_write(
     prep: PreparedBatch,
@@ -3194,17 +3400,46 @@ fn conform_and_write(
     data_dir: &Path,
     service: &str,
 ) -> Result<WriteReport, String> {
-    conform_and_publish(prep, pins, data_dir, service, None, &[])
+    let staged = write_output(prep, pins, data_dir, service)?;
+    std::fs::rename(&staged.tmp_path, &staged.canonical_path)
+        .map_err(|e| format!("atomic rename failed: {e}"))?;
+    log_compaction_complete(&staged, service);
+    Ok(staged.report)
 }
 
+/// Blocking phase 3: conform `wal_batch` to the authoritative pins, write
+/// the canonical `{service}.parquet` for the current hour (merged with the
+/// existing file when present) to a `.tmp`, and publish it through
+/// [`publish_output`].
+///
+/// `Err` means the output was not published; the WAL stays for the next
+/// tick, and a marker may stay for recovery. `Ok` carries the write report
+/// and, when the output is published but its marker could not be removed,
+/// the [`PublishIncomplete`] failure.
 fn conform_and_publish(
+    prep: PreparedBatch,
+    pins: &HashMap<String, CanonicalType>,
+    target: &PublishTarget<'_>,
+    service: &str,
+    hot_buffer: Option<&HotBuffer>,
+    batch_ids: &[String],
+) -> Result<(WriteReport, Option<PublishIncomplete>), String> {
+    let staged = write_output(prep, pins, target.data_dir, service)?;
+    let incomplete = publish_output(&staged, target, service, hot_buffer, batch_ids)?;
+    log_compaction_complete(&staged, service);
+    Ok((staged.report, incomplete))
+}
+
+/// Conform `wal_batch` and COPY it, merged with any existing canonical
+/// file, to `{service}.parquet.tmp` in the current hour's directory.
+fn write_output(
     prep: PreparedBatch,
     pins: &HashMap<String, CanonicalType>,
     data_dir: &Path,
     service: &str,
-    hot_buffer: Option<&HotBuffer>,
-    batch_ids: &[String],
-) -> Result<WriteReport, String> {
+) -> Result<StagedOutput, String> {
+    use chrono::Timelike as _;
+
     let PreparedBatch {
         conn,
         schema,
@@ -3225,9 +3460,10 @@ fn conform_and_publish(
 
     // Determine output directory from current time.
     let now = chrono::Utc::now();
-    let day_part = now.format("%Y-%m-%d").to_string();
-    let hour_part = now.format("%H").to_string();
-    let output_dir = data_dir.join(&day_part).join(&hour_part);
+    let date = now.date_naive();
+    let hour = u8::try_from(now.hour()).map_err(|e| format!("hour out of range: {e}"))?;
+    let day_dir = data_dir.join(date.format("%Y-%m-%d").to_string());
+    let output_dir = day_dir.join(format!("{hour:02}"));
 
     std::fs::create_dir_all(&output_dir)
         .map_err(|e| format!("failed to create output dir: {e}"))?;
@@ -3280,43 +3516,219 @@ fn conform_and_publish(
     conn.execute_batch("DROP TABLE IF EXISTS wal_batch")
         .map_err(|e| format!("DROP TABLE failed: {e}"))?;
 
-    // A reader sees either the old cold file plus these hot batches, or
-    // the replacement cold file with those batches drained.
-    let publication = hot_buffer.map(HotBuffer::publication);
-    let publication_guard = publication.as_ref().map(|gate| gate.blocking_write());
-    std::fs::rename(&tmp_path, &canonical_path)
-        .map_err(|e| format!("atomic rename failed: {e}"))?;
-    #[cfg(any(test, feature = "test-support"))]
-    if let Some(gate) = &publication {
-        gate.hold_after_publish_for_test();
-    }
-    if let Some(buf) = hot_buffer {
-        let ids: Vec<&str> = batch_ids.iter().map(String::as_str).collect();
-        buf.drain(&ids);
-    }
-    drop(publication_guard);
+    Ok(StagedOutput {
+        output_dir,
+        tmp_path,
+        canonical_path,
+        date,
+        hour,
+        merged,
+        rows,
+        survivors,
+        compact_start,
+        report: WriteReport {
+            batch_rows,
+            conflicts,
+            observed_fields,
+        },
+    })
+}
 
-    let output_bytes = std::fs::metadata(&canonical_path).map_or(0, |m| m.len());
+/// Publish a staged output exactly once (ADR-0041): bracket the rename with
+/// a publication marker that names the output's identity and the consumed
+/// WAL, so a crash or failure at any step leaves a record recovery can
+/// finish or roll back without merging the WAL twice.
+///
+/// 1. fsync the tmp and every directory entry leading to it, then hash it
+///    ([`durable_marker_for`]).
+/// 2. Write the marker durably.
+/// 3. Under the publication write guard: confirm every consumed WAL file is
+///    still there, rename, drain the hot batches, fsync the output
+///    directory.
+/// 4. Retire the consumed WAL files and fsync their directory.
+/// 5. Remove the marker durably.
+///
+/// Runs inside the caller's repin corpus read guard. `Err` means the output
+/// was not published: a failure before the marker leaves only an orphan tmp
+/// that the next COPY overwrites; a failure after it leaves the marker for
+/// recovery, which rolls the publish back. Once the rename has happened,
+/// every failure is `Ok(Some(_))`: the output is published and the marker
+/// stays until recovery completes the publish.
+fn publish_output(
+    staged: &StagedOutput,
+    target: &PublishTarget<'_>,
+    service: &str,
+    hot_buffer: Option<&HotBuffer>,
+    batch_ids: &[String],
+) -> Result<Option<PublishIncomplete>, String> {
+    let incomplete = |operation, error| -> Result<Option<PublishIncomplete>, String> {
+        Ok(Some(PublishIncomplete { operation, error }))
+    };
+    let marker = durable_marker_for(staged, target, service)?;
+    let marker_path = marker.marker_path(target.wal_dir);
+    let wal_env_dir = marker.wal_env_dir(target.wal_dir);
 
-    let duration_ms = compact_start.elapsed().as_millis();
+    // 2. From here on a failure before the rename leaves the marker, and
+    //    recovery rolls back: the canonical lacks the identity and the tmp
+    //    is present.
+    publication_marker::write_marker(target.wal_dir, &marker)?;
+    publication_marker::crash_point("publish:after_marker").map_err(|e| e.to_string())?;
+
+    // 3. A reader sees either the old cold file plus these hot batches, or
+    //    the replacement cold file with those batches drained.
+    {
+        let publication = hot_buffer.map(HotBuffer::publication);
+        let publication_guard = publication.as_ref().map(|gate| gate.blocking_write());
+        // A WAL writer holds the ingest side of this gate from its rename
+        // until it has fsynced or withdrawn the file, so under the write
+        // guard a consumed file that is gone was withdrawn: its write was
+        // rejected and its sender may retry. Publishing its rows would
+        // count them twice. Roll back; the next tick reads what remains.
+        if let Some(withdrawn) = staged.survivors.iter().find(|path| {
+            !std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file())
+        }) {
+            drop(publication_guard);
+            publication_marker::roll_back_unpublished(&marker_path, &staged.tmp_path)?;
+            return Err(format!(
+                "consumed WAL file {} disappeared before publication (a rejected write \
+                 was withdrawn); nothing published, the batch is read again next tick",
+                withdrawn.display()
+            ));
+        }
+        std::fs::rename(&staged.tmp_path, &staged.canonical_path)
+            .map_err(|e| format!("atomic rename failed: {e}"))?;
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(gate) = &publication {
+            gate.hold_after_publish_for_test();
+        }
+        if let Some(buf) = hot_buffer {
+            let ids: Vec<&str> = batch_ids.iter().map(String::as_str).collect();
+            buf.drain(&ids);
+        }
+        if let Err(e) = crate::epoch::fsync_dir(&staged.output_dir) {
+            return incomplete(
+                CompactionOperation::Chunk,
+                format!(
+                    "failed to fsync directory {}: {e}",
+                    staged.output_dir.display()
+                ),
+            );
+        }
+        drop(publication_guard);
+    }
+    if let Err(e) = publication_marker::crash_point("publish:after_rename") {
+        return incomplete(CompactionOperation::Chunk, e.to_string());
+    }
+
+    // 4. Delete each consumed WAL file, or rename it aside out of the scan.
+    //    A failure keeps the marker, which keeps the file from being merged
+    //    again while it stays.
+    for path in marker.wal_paths(target.wal_dir) {
+        if let Err(e) = retire_merged_input(&path) {
+            return incomplete(CompactionOperation::ConsumedWalRemoval, e);
+        }
+    }
+    if let Err(e) = crate::epoch::fsync_dir(&wal_env_dir) {
+        return incomplete(
+            CompactionOperation::Chunk,
+            format!("failed to fsync directory {}: {e}", wal_env_dir.display()),
+        );
+    }
+    if let Err(e) = publication_marker::crash_point("publish:after_retire") {
+        return incomplete(CompactionOperation::Chunk, e.to_string());
+    }
+
+    // 5. Durable before the next publish of this service writes its own
+    //    marker: a resurrected marker would read as a contradiction.
+    if let Err(e) = publication_marker::remove_marker_durably(&marker_path) {
+        return incomplete(CompactionOperation::Chunk, e);
+    }
+    Ok(None)
+}
+
+/// Step 1 of [`publish_output`]: make the tmp's bytes and every directory
+/// entry leading to it durable, hash it, and build the marker naming it and
+/// the consumed WAL. Touches nothing a marker claims.
+fn durable_marker_for(
+    staged: &StagedOutput,
+    target: &PublishTarget<'_>,
+    service: &str,
+) -> Result<ValidatedMarker, String> {
+    let wal_env_dir = target.wal_dir.join(target.env);
+    let mut wal_names = Vec::with_capacity(staged.survivors.len());
+    for path in &staged.survivors {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| wal_env_dir.join(name) == *path)
+            .ok_or_else(|| {
+                format!(
+                    "WAL input {} is not in {}",
+                    path.display(),
+                    wal_env_dir.display()
+                )
+            })?;
+        wal_names.push(name.to_owned());
+    }
+    std::fs::File::open(&staged.tmp_path)
+        .and_then(|file| file.sync_all())
+        .map_err(|e| format!("failed to fsync {}: {e}", staged.tmp_path.display()))?;
+    let identity = publication_marker::identity_of(&staged.tmp_path)
+        .map_err(|e| format!("failed to hash {}: {e}", staged.tmp_path.display()))?;
+    // Sync the whole chain on every publish: the hour directory for the
+    // tmp's entry, then the date, env and data root directories for each
+    // directory's entry in its parent. Syncing only the directories this
+    // attempt created would skip one an earlier, failed attempt created, so
+    // a retry could retire WAL under an output path that is not durable.
+    // Directory fsyncs cost little next to the COPY and the tmp's own
+    // fsync, and a per-process "already durable" cache would go stale when
+    // retention deletes a date directory and a publish recreates it.
+    let entry_dirs = [
+        Some(staged.output_dir.as_path()),
+        staged.output_dir.parent(),
+        Some(target.data_dir),
+        target.data_dir.parent(),
+    ];
+    for dir in entry_dirs.into_iter().flatten() {
+        crate::epoch::fsync_dir(dir)
+            .map_err(|e| format!("failed to fsync directory {}: {e}", dir.display()))?;
+    }
+    let marker = ValidatedMarker::new(
+        target.env,
+        service,
+        staged.date,
+        staged.hour,
+        wal_names,
+        identity,
+    )?;
+    // Recovery rebuilds every path from the marker; refuse a publish whose
+    // paths it would not rebuild.
+    let data_root = target.data_dir.parent().unwrap_or(target.data_dir);
+    if marker.canonical(data_root) != staged.canonical_path {
+        return Err(format!(
+            "output {} is not where a publication marker for env {:?} points",
+            staged.canonical_path.display(),
+            target.env
+        ));
+    }
+    Ok(marker)
+}
+
+fn log_compaction_complete(staged: &StagedOutput, service: &str) {
+    let output_bytes = std::fs::metadata(&staged.canonical_path).map_or(0, |m| m.len());
+    let duration_ms = staged.compact_start.elapsed().as_millis();
     tracing::info!(
         event_type = "compaction_complete",
         compact_service = %service,
-        output = %canonical_path.display(),
-        wal_files = survivors,
-        merged,
-        rows,
-        conflicts = conflicts.len(),
+        output = %staged.canonical_path.display(),
+        wal_files = staged.survivors.len(),
+        merged = staged.merged,
+        rows = staged.rows,
+        conflicts = staged.report.conflicts.len(),
         output_bytes,
         duration_ms,
         "compaction complete"
     );
-
-    Ok(WriteReport {
-        batch_rows,
-        conflicts,
-        observed_fields,
-    })
 }
 
 /// Conform `wal_batch` to the pins in place, per [`ConformPolicy::WalBatch`].
@@ -3398,7 +3810,16 @@ fn compact_service_blocking(
 /// (hourly compaction) and `{date}/` (daily rollup) for `.tmp` files older
 /// than `max_age`. These are inert (don't match `*.parquet` globs) but
 /// should be cleaned up to avoid disk waste.
-fn cleanup_stale_tmp_files(data_dir: &Path, max_age: Duration) {
+///
+/// An hourly tmp that a publication marker claims is kept however old it
+/// is: recovery decides "unpublished" from its presence, and without it
+/// the marker would read as a contradiction and block the service.
+fn cleanup_stale_tmp_files(
+    env: &str,
+    data_dir: &Path,
+    max_age: Duration,
+    claims: &PublicationClaims,
+) {
     let Ok(days) = std::fs::read_dir(data_dir) else {
         return;
     };
@@ -3410,11 +3831,25 @@ fn cleanup_stale_tmp_files(data_dir: &Path, max_age: Duration) {
         let Ok(entries) = std::fs::read_dir(&day_path) else {
             continue;
         };
+        let date = day_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| chrono::NaiveDate::parse_from_str(name, "%Y-%m-%d").ok());
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
                 // Hour subdirectory — check its contents.
-                cleanup_tmp_in_dir(&path, max_age);
+                let hour = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .filter(|name| name.len() == 2)
+                    .and_then(|name| name.parse::<u8>().ok());
+                let claimed = |service: &str| match (date, hour) {
+                    (Some(date), Some(hour)) => claims.claims_output(env, date, hour, service),
+                    // A marker only ever names a valid date and hour.
+                    _ => false,
+                };
+                cleanup_tmp_in_dir(&path, max_age, claimed);
             } else {
                 // Day-level file (from rollup).
                 remove_stale_tmp(&path, max_age);
@@ -3423,13 +3858,23 @@ fn cleanup_stale_tmp_files(data_dir: &Path, max_age: Duration) {
     }
 }
 
-/// Remove `.tmp` files in a single directory that are older than `max_age`.
-fn cleanup_tmp_in_dir(dir: &Path, max_age: Duration) {
+/// Remove `.tmp` files in a single hour directory that are older than
+/// `max_age`, except those `claimed` names by service.
+fn cleanup_tmp_in_dir(dir: &Path, max_age: Duration, claimed: impl Fn(&str) -> bool) {
     let Ok(files) = std::fs::read_dir(dir) else {
         return;
     };
     for file in files.flatten() {
-        remove_stale_tmp(&file.path(), max_age);
+        let path = file.path();
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix(".parquet.tmp"))
+            .is_some_and(&claimed)
+        {
+            continue;
+        }
+        remove_stale_tmp(&path, max_age);
     }
 }
 
@@ -3484,7 +3929,7 @@ fn scan_env_wal_files(env: &str, env_wal_dir: &Path, min_age: Duration) -> Optio
 }
 
 /// Scan the WAL directory for `.ndjson` files older than `min_age`.
-fn scan_wal_files(wal_dir: &Path, min_age: Duration) -> std::io::Result<Vec<PathBuf>> {
+pub(crate) fn scan_wal_files(wal_dir: &Path, min_age: Duration) -> std::io::Result<Vec<PathBuf>> {
     let now = SystemTime::now();
     let mut files = Vec::new();
 
@@ -3532,7 +3977,7 @@ fn group_by_service(files: Vec<PathBuf>) -> HashMap<String, Vec<PathBuf>> {
 ///
 /// Filename format: `{service}_{unix_millis}_{hex_random}`
 /// The millis and hex segments are always the last two `_`-delimited parts.
-fn extract_service_from_filename(filename: &str) -> String {
+pub(crate) fn extract_service_from_filename(filename: &str) -> String {
     let parts: Vec<&str> = filename.rsplitn(3, '_').collect();
     if parts.len() == 3 {
         parts[2].to_owned()
@@ -3559,6 +4004,7 @@ mod tests {
             })
             .clone();
         crate::metrics::init_operational_alert_metrics();
+        crate::metrics::init_publication_recovery_metrics();
         handle
     }
 
@@ -3583,6 +4029,25 @@ mod tests {
             handle,
             &format!("trawl_files_quarantined_total{{kind=\"{}\"}}", kind.label()),
         )
+    }
+
+    /// [`rollup_once`] with no publication claims and no repin or gate.
+    async fn rollup_unclaimed(data: &Path) -> Result<u64, String> {
+        rollup_once(data, &PublicationClaims::default(), "2GB", None, None).await
+    }
+
+    /// [`rollup_env_once`] for `prod` with no publication claims and no
+    /// repin or gate.
+    async fn rollup_env_unclaimed(env_data: &Path) -> Result<u64, String> {
+        rollup_env_once(
+            "prod",
+            env_data,
+            &PublicationClaims::default(),
+            "2GB",
+            None,
+            None,
+        )
+        .await
     }
 
     const OPERATIONAL_ROW: &str = r#"{"_time":"2026-01-15T00:00:00Z","_ingested":"2026-01-15T00:00:00Z","service":"svc","message":"retained"}"#;
@@ -3636,12 +4101,12 @@ mod tests {
 
         // Exercise each existing daily-rollup scan owner with a regular file
         // in place of its directory, preserving its return/skip behavior.
-        assert_eq!(rollup_once(&wal, "2GB", None, None).await.unwrap(), 0);
+        assert_eq!(rollup_unclaimed(&wal).await.unwrap(), 0);
         assert_eq!(
             operation_count(&handle, CompactionOperation::DailyRollupScan),
             1
         );
-        assert!(rollup_env_once(&wal, "2GB", None, None).await.is_err());
+        assert!(rollup_env_unclaimed(&wal).await.is_err());
         assert_eq!(
             operation_count(&handle, CompactionOperation::DailyRollupScan),
             2
@@ -3710,7 +4175,7 @@ mod tests {
         let removed = tmp.path().join("removed-by-retention");
         std::fs::create_dir(&removed).unwrap();
         std::fs::remove_dir(&removed).unwrap();
-        assert!(rollup_env_once(&removed, "2GB", None, None).await.is_err());
+        assert!(rollup_env_unclaimed(&removed).await.is_err());
         assert!(collect_hour_dirs(&removed).is_empty());
         assert!(collect_service_files(std::slice::from_ref(&removed)).is_empty());
         let recovery = recover_rollup_markers_coordinated(&removed, None);
@@ -3730,7 +4195,7 @@ mod tests {
 
         // A file in place of those directories must still emit real failures.
         std::fs::write(&removed, b"not a directory").unwrap();
-        assert!(rollup_env_once(&removed, "2GB", None, None).await.is_err());
+        assert!(rollup_env_unclaimed(&removed).await.is_err());
         assert!(collect_hour_dirs(&removed).is_empty());
         assert!(collect_service_files(std::slice::from_ref(&removed)).is_empty());
         assert!(recover_rollup_markers_coordinated(&removed, None).is_err());
@@ -3851,7 +4316,7 @@ mod tests {
 
         let before = operation_count(&handle, CompactionOperation::DailyRollupScan);
         std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let result = rollup_once(&data, "2GB", None, None).await;
+        let result = rollup_unclaimed(&data).await;
         std::fs::set_permissions(&data, permissions).unwrap();
         assert_eq!(
             result.unwrap(),
@@ -4258,6 +4723,8 @@ mod tests {
         let outcome = compact_service_batch(
             &[input],
             &data.join("prod"),
+            &wal,
+            "prod",
             "svc",
             "2GB",
             None,
@@ -4383,9 +4850,16 @@ mod tests {
         );
         gate.panic_next_publication_for_test();
         assert!(
-            rollup_env_once(&env, "2GB", None, Some(Arc::clone(&gate)))
-                .await
-                .is_err()
+            rollup_env_once(
+                "prod",
+                &env,
+                &PublicationClaims::default(),
+                "2GB",
+                None,
+                Some(Arc::clone(&gate))
+            )
+            .await
+            .is_err()
         );
         assert_eq!(
             operation_count(&handle, CompactionOperation::PendingRollupRecovery) - before,
@@ -4403,55 +4877,843 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn operational_consumed_wal_removal_failure_preserves_published_output() {
-        let handle = operational_metrics();
-        let before = operation_count(&handle, CompactionOperation::ConsumedWalRemoval);
-        let tmp = tempfile::tempdir().unwrap();
-        let wal = tmp.path().join("wal");
-        let data = tmp.path().join("data");
-        std::fs::create_dir_all(wal.join("prod")).unwrap();
-        let input = write_wal_file(&wal.join("prod"), "svc", &[OPERATIONAL_ROW]);
-        let original = std::fs::read(&input).unwrap();
-        let retained = tmp.path().join("retained-wal");
-        let hot = Arc::new(HotBuffer::new(crate::hot_buffer::HotBufferConfig {
-            max_events: 100,
-            max_bytes: 100_000,
+    // ---- publication markers (ADR-0041, #252) -----------------------------
+
+    fn recovery_count(
+        handle: &metrics_exporter_prometheus::PrometheusHandle,
+        outcome: RecoveryOutcomeKind,
+    ) -> u64 {
+        crate::metrics::test_support::sample(
+            handle,
+            &format!(
+                "trawl_publication_recovery_total{{outcome=\"{}\"}}",
+                outcome.label()
+            ),
+        )
+    }
+
+    /// Everything logged in this test process. Compaction logs from blocking
+    /// threads, so a thread-local subscriber would miss it; nextest runs each
+    /// test in its own process, as for [`operational_metrics`].
+    fn captured_logs() -> Arc<std::sync::Mutex<Vec<u8>>> {
+        #[derive(Clone)]
+        struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        static LOGS: std::sync::OnceLock<Arc<std::sync::Mutex<Vec<u8>>>> =
+            std::sync::OnceLock::new();
+        Arc::clone(LOGS.get_or_init(|| {
+            let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let sink = Sink(Arc::clone(&logs));
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .with_writer(move || sink.clone())
+                .finish();
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("one global subscriber per test process");
+            logs
+        }))
+    }
+
+    fn logged(logs: &std::sync::Mutex<Vec<u8>>) -> String {
+        String::from_utf8_lossy(&logs.lock().unwrap()).into_owned()
+    }
+
+    /// One tagged event per message, in a WAL file with a unique name.
+    fn tagged_wal(env_wal: &Path, service: &str, tags: &[&str]) -> PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = env_wal.join(format!(
+            "{service}_{}_{seq:04x}.ndjson",
+            1_730_000_000_000u64 + seq
+        ));
+        let rows: Vec<String> = tags
+            .iter()
+            .map(|tag| {
+                format!(
+                    r#"{{"_time":"2026-01-15T00:00:00Z","_ingested":"2026-01-15T00:00:00Z","service":"{service}","message":"{tag}"}}"#
+                )
+            })
+            .collect();
+        std::fs::write(&path, rows.join("\n")).unwrap();
+        path
+    }
+
+    /// Put a WAL file's events in the hot buffer under its batch id, as
+    /// ingest does after the WAL write.
+    fn insert_hot(hot: &HotBuffer, env: &str, wal: &Path, service: &str) {
+        let body = std::fs::read_to_string(wal).unwrap();
+        let events: Vec<serde_json::Map<String, serde_json::Value>> = body
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        hot.insert(Arc::new(crate::bus::IngestBatch {
+            batch_id: format!("{env}/{}", wal.file_stem().unwrap().to_str().unwrap()).into(),
+            service: service.into(),
+            events,
+            byte_size: body.len(),
         }));
-        let (entered, release) = hot.publication().pause_next_publication_for_test();
-        let input_for_thread = input.clone();
-        let retained_for_thread = retained.clone();
-        let obstruction = std::thread::spawn(move || {
-            entered.recv_timeout(Duration::from_secs(10)).unwrap();
-            // The real Parquet output is already published. Retain the WAL
-            // bytes elsewhere, then make only remove_file(original) fail.
-            std::fs::rename(&input_for_thread, retained_for_thread).unwrap();
-            std::fs::create_dir(&input_for_thread).unwrap();
-            release.send(()).unwrap();
-        });
-        let result = compact_once(
-            &wal,
-            &data,
+    }
+
+    fn hot_buffer() -> Arc<HotBuffer> {
+        Arc::new(HotBuffer::new(crate::hot_buffer::HotBufferConfig {
+            max_events: 1000,
+            max_bytes: 1_000_000,
+        }))
+    }
+
+    /// Every `message` in every published parquet file, sorted.
+    fn published_messages(data: &Path) -> Vec<String> {
+        let mut rows: Vec<String> = find_files_by_ext(data, "parquet")
+            .iter()
+            .flat_map(|file| read_strings(file, "message"))
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    fn sorted(tags: &[&str]) -> Vec<String> {
+        let mut tags: Vec<String> = tags.iter().map(|t| (*t).to_owned()).collect();
+        tags.sort();
+        tags
+    }
+
+    fn marker_file(wal: &Path, env: &str, service: &str) -> PathBuf {
+        wal.join(env).join(format!(".publish-{service}.json"))
+    }
+
+    async fn tick(wal: &Path, data: &Path, hot: &Arc<HotBuffer>) -> Result<u64, String> {
+        compact_once(
+            wal,
+            data,
             Duration::ZERO,
             false,
-            Some(&hot),
-            500,
+            Some(hot),
+            DEFAULT_CHUNK_SIZE,
             "2GB",
             None,
         )
-        .await;
-        obstruction.join().unwrap();
-        assert!(result.is_ok(), "cleanup remains a best-effort warning");
+        .await
+    }
+
+    /// Run phase 1 and phase 3 of one `prod`/`svc` batch on a blocking
+    /// thread, as compaction does. `stop_at` interrupts the publish at that
+    /// crash point ([`publication_marker::interrupt`] is per thread), and
+    /// `between` runs after the WAL read and before the publish.
+    async fn publish_batch(
+        wal: &Path,
+        data: &Path,
+        files: &[PathBuf],
+        hot: Option<&Arc<HotBuffer>>,
+        stop_at: Option<&'static str>,
+        between: impl FnOnce() + Send + 'static,
+    ) -> Result<(WriteReport, Option<PublishIncomplete>), String> {
+        let wal = wal.to_path_buf();
+        let env_data = data.join("prod");
+        let files = files.to_vec();
+        let hot = hot.cloned();
+        tokio::task::spawn_blocking(move || {
+            let _stop = stop_at.map(publication_marker::interrupt::at);
+            let mut quarantined = 0;
+            let prep = prepare_service_batch(
+                &files,
+                &env_data,
+                "svc",
+                "2GB",
+                &mut quarantined,
+                &HashMap::new(),
+            )?
+            .expect("a readable batch");
+            between();
+            let pins = local_pins(&prep.proposals);
+            let batch_ids: Vec<String> = files
+                .iter()
+                .map(|f| format!("prod/{}", f.file_stem().unwrap().to_str().unwrap()))
+                .collect();
+            conform_and_publish(
+                prep,
+                &pins,
+                &PublishTarget {
+                    data_dir: &env_data,
+                    wal_dir: &wal,
+                    env: "prod",
+                },
+                "svc",
+                hot.as_deref(),
+                &batch_ids,
+            )
+        })
+        .await
+        .unwrap()
+    }
+
+    /// Restores a directory's mode on drop, so a failed assertion cannot
+    /// leave the temporary directory undeletable.
+    #[cfg(unix)]
+    struct ModeGuard(PathBuf);
+
+    #[cfg(unix)]
+    impl ModeGuard {
+        fn read_only(dir: &Path) -> Self {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+            Self(dir.to_path_buf())
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ModeGuard {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    #[cfg(unix)]
+    fn running_as_root(dir: &Path) -> bool {
+        use std::os::unix::fs::MetadataExt as _;
+        std::fs::metadata(dir).unwrap().uid() == 0
+    }
+
+    /// A consumed WAL file that can be neither deleted nor renamed aside
+    /// after the publish: the failure is counted once as the removal
+    /// operation, the published output and its drained batches stand, and
+    /// the marker keeps the WAL from being merged again. Before ADR-0041
+    /// this failure was a warning after the publish and the next tick merged
+    /// the WAL a second time.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn operational_consumed_wal_removal_failure_preserves_published_output() {
+        let handle = operational_metrics();
+        let removal_before = operation_count(&handle, CompactionOperation::ConsumedWalRemoval);
+        let chunk_before = operation_count(&handle, CompactionOperation::Chunk);
+        let tmp = tempfile::tempdir().unwrap();
+        let wal = tmp.path().join("wal");
+        let data = tmp.path().join("data");
+        let env_wal = wal.join("prod");
+        std::fs::create_dir_all(&env_wal).unwrap();
+        if running_as_root(&env_wal) {
+            eprintln!("skipped: root ignores directory permissions");
+            return;
+        }
+        let input = write_wal_file(&env_wal, "svc", &[OPERATIONAL_ROW]);
+        let original = std::fs::read(&input).unwrap();
+        let hot = hot_buffer();
+        let (entered, release) = hot.publication().pause_next_publication_for_test();
+        let obstruct_dir = env_wal.clone();
+        let obstruction = std::thread::spawn(move || {
+            entered.recv_timeout(Duration::from_secs(10)).unwrap();
+            // The output is renamed into place and the marker written. Make
+            // both the delete and the rename-aside of the input fail.
+            let guard = ModeGuard::read_only(&obstruct_dir);
+            release.send(()).unwrap();
+            guard
+        });
+        let result = tick(&wal, &data, &hot).await;
+        let guard = obstruction.join().unwrap();
+        assert!(
+            result.is_ok(),
+            "an incomplete publish is a chunk-level failure"
+        );
         assert_eq!(
-            operation_count(&handle, CompactionOperation::ConsumedWalRemoval) - before,
+            operation_count(&handle, CompactionOperation::ConsumedWalRemoval) - removal_before,
             1
         );
-        assert_eq!(operation_count(&handle, CompactionOperation::Chunk), 0);
-        assert!(input.is_dir());
-        assert_eq!(std::fs::read(retained).unwrap(), original);
+        assert_eq!(
+            operation_count(&handle, CompactionOperation::Chunk) - chunk_before,
+            0
+        );
+        assert_eq!(std::fs::read(&input).unwrap(), original);
+        assert!(marker_file(&wal, "prod", "svc").is_file());
         let output = find_files_by_ext(&data, "parquet");
         assert_eq!(output.len(), 1);
         assert_eq!(read_strings(&output[0], "message"), ["retained"]);
+
+        drop(guard);
+        assert_eq!(tick(&wal, &data, &hot).await.unwrap(), 0);
+        assert!(!input.exists(), "recovery retires the WAL");
+        assert!(!marker_file(&wal, "prod", "svc").exists());
+        assert_eq!(published_messages(&data), ["retained"]);
+    }
+
+    /// AC4: a consumed WAL that cannot be deleted never duplicates. Several
+    /// ticks leave exactly one copy of every event, the marker blocks the
+    /// re-merge, and each failure is logged and counted. Once the WAL can be
+    /// retired again, one tick finishes the publish.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn compaction_undeletable_wal_never_duplicates() {
+        let handle = operational_metrics();
+        let logs = captured_logs();
+        let removal_before = operation_count(&handle, CompactionOperation::ConsumedWalRemoval);
+        let failed_before = recovery_count(&handle, RecoveryOutcomeKind::Failed);
+        let published_before = recovery_count(&handle, RecoveryOutcomeKind::Published);
+        let tmp = tempfile::tempdir().unwrap();
+        let wal = tmp.path().join("wal");
+        let data = tmp.path().join("data");
+        let env_wal = wal.join("prod");
+        std::fs::create_dir_all(&env_wal).unwrap();
+        if running_as_root(&env_wal) {
+            eprintln!("skipped: root ignores directory permissions");
+            return;
+        }
+        let hot = hot_buffer();
+        let tags = ["ac4-a0", "ac4-a1", "ac4-b0", "ac4-b1", "ac4-b2"];
+        let first = tagged_wal(&env_wal, "svc", &tags[..2]);
+        let second = tagged_wal(&env_wal, "svc", &tags[2..]);
+        insert_hot(&hot, "prod", &first, "svc");
+        insert_hot(&hot, "prod", &second, "svc");
+
+        let (entered, release) = hot.publication().pause_next_publication_for_test();
+        let obstruct_dir = env_wal.clone();
+        let obstruction = std::thread::spawn(move || {
+            entered.recv_timeout(Duration::from_secs(10)).unwrap();
+            let guard = ModeGuard::read_only(&obstruct_dir);
+            release.send(()).unwrap();
+            guard
+        });
+        tick(&wal, &data, &hot).await.unwrap();
+        let guard = obstruction.join().unwrap();
+        assert_eq!(
+            operation_count(&handle, CompactionOperation::ConsumedWalRemoval) - removal_before,
+            1
+        );
+        assert_eq!(hot.event_count(), 0, "published batches are drained");
+
+        // The marker keeps the service out of compaction: no chunk even
+        // starts, so none can fail on the read-only directory either.
+        let chunk_before = operation_count(&handle, CompactionOperation::Chunk);
+        for round in 1..=3u64 {
+            let errors = tick(&wal, &data, &hot).await.unwrap();
+            assert_eq!(errors, 1, "round {round}: the stuck marker is a tick error");
+            assert_eq!(published_messages(&data), sorted(&tags), "round {round}");
+            assert!(marker_file(&wal, "prod", "svc").is_file(), "round {round}");
+            assert!(first.is_file() && second.is_file(), "round {round}");
+            assert_eq!(
+                recovery_count(&handle, RecoveryOutcomeKind::Failed) - failed_before,
+                round
+            );
+            assert_eq!(
+                operation_count(&handle, CompactionOperation::Chunk),
+                chunk_before
+            );
+        }
+        let log = logged(&logs);
+        assert!(log.contains("finishing the publish failed"), "{log}");
+        assert!(log.contains("publication_recovery_failed"), "{log}");
+        assert!(log.contains("failed to retire merged input"), "{log}");
+
+        drop(guard);
+        assert_eq!(tick(&wal, &data, &hot).await.unwrap(), 0);
+        assert_eq!(published_messages(&data), sorted(&tags));
+        assert!(!marker_file(&wal, "prod", "svc").exists());
+        assert!(!first.exists() && !second.exists());
+        assert_eq!(
+            recovery_count(&handle, RecoveryOutcomeKind::Published) - published_before,
+            1
+        );
+        assert_eq!(tick(&wal, &data, &hot).await.unwrap(), 0);
+        assert_eq!(published_messages(&data), sorted(&tags));
+    }
+
+    /// AC5 at tick level: a marker whose canonical output carries another
+    /// identity and whose tmp is gone is a named, counted failure. Nothing
+    /// under the WAL or data root changes, and the service stays blocked on
+    /// every later tick although its WAL is ready to compact.
+    #[tokio::test]
+    async fn publication_recovery_contradiction_touches_nothing() {
+        fn snapshot(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+            let mut out = std::collections::BTreeMap::new();
+            let mut stack = vec![root.to_path_buf()];
+            while let Some(dir) = stack.pop() {
+                for entry in std::fs::read_dir(&dir).unwrap() {
+                    let path = entry.unwrap().path();
+                    let rel = path.strip_prefix(root).unwrap().to_path_buf();
+                    if path.is_dir() {
+                        out.insert(rel, b"<dir>".to_vec());
+                        stack.push(path);
+                    } else {
+                        out.insert(rel, std::fs::read(&path).unwrap());
+                    }
+                }
+            }
+            out
+        }
+
+        let handle = operational_metrics();
+        let logs = captured_logs();
+        let before = recovery_count(&handle, RecoveryOutcomeKind::Contradictory);
+        let tmp = tempfile::tempdir().unwrap();
+        let wal = tmp.path().join("wal");
+        let data = tmp.path().join("data");
+        let env_wal = wal.join("prod");
+        std::fs::create_dir_all(&env_wal).unwrap();
+        let canonical = write_hourly_parquet(
+            &data.join("prod"),
+            "2026-01-15",
+            "07",
+            "svc",
+            &[OPERATIONAL_ROW],
+        );
+        let pending = tagged_wal(&env_wal, "svc", &["ac5-pending"]);
+        let marker = ValidatedMarker::new(
+            "prod",
+            "svc",
+            chrono::NaiveDate::from_ymd_opt(2026, 1, 15).unwrap(),
+            7,
+            vec![pending.file_name().unwrap().to_str().unwrap().to_owned()],
+            publication_marker::OutputIdentity {
+                size: 4,
+                hash: blake3::hash(b"PAR1"),
+            },
+        )
+        .unwrap();
+        publication_marker::write_marker(&wal, &marker).unwrap();
+        assert_eq!(marker.canonical(&data), canonical);
+        assert!(!marker.tmp(&data).exists());
+        let hot = hot_buffer();
+        insert_hot(&hot, "prod", &pending, "svc");
+        let before_bytes = snapshot(tmp.path());
+
+        for round in 1..=3u64 {
+            assert_eq!(tick(&wal, &data, &hot).await.unwrap(), 1, "round {round}");
+            assert_eq!(
+                recovery_count(&handle, RecoveryOutcomeKind::Contradictory) - before,
+                round
+            );
+            assert_eq!(snapshot(tmp.path()), before_bytes, "round {round}");
+            assert_eq!(hot.event_count(), 1, "round {round}: nothing drained");
+        }
+        let log = logged(&logs);
+        assert!(log.contains("publication_recovery_failed"), "{log}");
+        assert!(log.contains("reason=\"output_mismatch\""), "{log}");
+    }
+
+    /// A crash after the marker and before the rename: the next tick rolls
+    /// the publish back (marker and tmp removed, WAL and hot batches kept)
+    /// and then publishes the batch exactly once, merged with the canonical
+    /// that was already there.
+    #[tokio::test]
+    async fn publish_interrupted_after_marker_rolls_back_and_publishes_once() {
+        let handle = operational_metrics();
+        let unpublished_before = recovery_count(&handle, RecoveryOutcomeKind::Unpublished);
+        let tmp = tempfile::tempdir().unwrap();
+        let wal = tmp.path().join("wal");
+        let data = tmp.path().join("data");
+        let env_wal = wal.join("prod");
+        std::fs::create_dir_all(&env_wal).unwrap();
+        let hot = hot_buffer();
+
+        // An earlier batch is already published in this hour.
+        let earlier = tagged_wal(&env_wal, "svc", &["cam-earlier"]);
+        insert_hot(&hot, "prod", &earlier, "svc");
+        assert_eq!(tick(&wal, &data, &hot).await.unwrap(), 0);
+        let canonical = find_files_by_ext(&data, "parquet");
+        assert_eq!(canonical.len(), 1);
+        let canonical = canonical[0].clone();
+        let canonical_before = std::fs::read(&canonical).unwrap();
+
+        let files = vec![
+            tagged_wal(&env_wal, "svc", &["cam-a0", "cam-a1"]),
+            tagged_wal(&env_wal, "svc", &["cam-b0"]),
+        ];
+        for file in &files {
+            insert_hot(&hot, "prod", file, "svc");
+        }
+        let err = publish_batch(
+            &wal,
+            &data,
+            &files,
+            Some(&hot),
+            Some("publish:after_marker"),
+            || {},
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("publish:after_marker"), "{err}");
+        let marker = publication_marker::read_marker(&marker_file(&wal, "prod", "svc")).unwrap();
+        assert!(marker.tmp(&data).is_file());
+        assert_eq!(std::fs::read(&canonical).unwrap(), canonical_before);
+        assert_eq!(hot.event_count(), 3, "nothing drained before the rename");
+
+        assert_eq!(tick(&wal, &data, &hot).await.unwrap(), 0);
+        assert_eq!(
+            recovery_count(&handle, RecoveryOutcomeKind::Unpublished) - unpublished_before,
+            1
+        );
+        let expected = sorted(&["cam-earlier", "cam-a0", "cam-a1", "cam-b0"]);
+        assert_eq!(published_messages(&data), expected);
+        assert!(!marker_file(&wal, "prod", "svc").exists());
+        assert!(!marker.tmp(&data).exists());
+        assert!(files.iter().all(|f| !f.exists()));
+        assert_eq!(hot.event_count(), 0);
+        assert_eq!(tick(&wal, &data, &hot).await.unwrap(), 0);
+        assert_eq!(published_messages(&data), expected);
+    }
+
+    /// A crash after the rename and before retirement: the output and the
+    /// drain stand, and the next tick retires the WAL instead of merging it
+    /// again.
+    #[tokio::test]
+    async fn publish_interrupted_after_rename_retires_without_duplicating() {
+        let handle = operational_metrics();
+        let published_before = recovery_count(&handle, RecoveryOutcomeKind::Published);
+        let tmp = tempfile::tempdir().unwrap();
+        let wal = tmp.path().join("wal");
+        let data = tmp.path().join("data");
+        let env_wal = wal.join("prod");
+        std::fs::create_dir_all(&env_wal).unwrap();
+        let hot = hot_buffer();
+        let files = vec![
+            tagged_wal(&env_wal, "svc", &["car-a0", "car-a1"]),
+            tagged_wal(&env_wal, "svc", &["car-b0"]),
+        ];
+        for file in &files {
+            insert_hot(&hot, "prod", file, "svc");
+        }
+        let (_report, incomplete) = publish_batch(
+            &wal,
+            &data,
+            &files,
+            Some(&hot),
+            Some("publish:after_rename"),
+            || {},
+        )
+        .await
+        .unwrap();
+        let incomplete = incomplete.expect("the publish stopped after the rename");
+        assert!(
+            incomplete.error.contains("publish:after_rename"),
+            "{incomplete:?}"
+        );
+        let expected = sorted(&["car-a0", "car-a1", "car-b0"]);
+        assert_eq!(published_messages(&data), expected);
+        assert_eq!(hot.event_count(), 0, "drained with the rename");
+        assert!(files.iter().all(|f| f.is_file()));
+        assert!(marker_file(&wal, "prod", "svc").is_file());
+
+        for _ in 0..2 {
+            assert_eq!(tick(&wal, &data, &hot).await.unwrap(), 0);
+            assert_eq!(published_messages(&data), expected);
+            assert!(files.iter().all(|f| !f.exists()));
+            assert!(!marker_file(&wal, "prod", "svc").exists());
+        }
+        assert_eq!(
+            recovery_count(&handle, RecoveryOutcomeKind::Published) - published_before,
+            1
+        );
+    }
+
+    /// AC7: stale-tmp cleanup keeps a tmp that a pending marker claims. A
+    /// publish stops after its marker, and the read-only WAL env directory
+    /// keeps recovery from removing that marker, so its claim stands while
+    /// the tmp ages past the cleanup threshold. Deleting the tmp there would
+    /// leave a marker with neither output, a contradiction that blocks the
+    /// service for good. Once recovery can run, the batch publishes once.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stale_tmp_cleanup_keeps_a_tmp_a_marker_claims() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal = tmp.path().join("wal");
+        let data = tmp.path().join("data");
+        let env_wal = wal.join("prod");
+        std::fs::create_dir_all(&env_wal).unwrap();
+        if running_as_root(&env_wal) {
+            eprintln!("skipped: root ignores directory permissions");
+            return;
+        }
+        let hot = hot_buffer();
+        let tags = ["claimed-tmp-a0", "claimed-tmp-a1"];
+        let files = vec![tagged_wal(&env_wal, "svc", &tags)];
+        insert_hot(&hot, "prod", &files[0], "svc");
+        let err = publish_batch(
+            &wal,
+            &data,
+            &files,
+            Some(&hot),
+            Some("publish:after_marker"),
+            || {},
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("publish:after_marker"), "{err}");
+        let marker = publication_marker::read_marker(&marker_file(&wal, "prod", "svc")).unwrap();
+        let staged = marker.tmp(&data);
+        assert!(staged.is_file());
+
+        let guard = ModeGuard::read_only(&env_wal);
+        // `tick` compacts with a zero minimum age, so cleanup takes any tmp
+        // older than zero.
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(
+            tick(&wal, &data, &hot).await.unwrap(),
+            1,
+            "the marker recovery could not remove is a tick error"
+        );
+        assert!(staged.is_file(), "cleanup keeps the claimed tmp");
+        assert!(marker_file(&wal, "prod", "svc").is_file());
+        assert!(published_messages(&data).is_empty());
+
+        drop(guard);
+        assert_eq!(tick(&wal, &data, &hot).await.unwrap(), 0);
+        assert_eq!(published_messages(&data), sorted(&tags));
+        assert!(!marker_file(&wal, "prod", "svc").exists());
+        assert!(!staged.exists());
+        assert!(!files[0].exists());
+        assert_eq!(hot.event_count(), 0);
+        assert_eq!(tick(&wal, &data, &hot).await.unwrap(), 0);
+        assert_eq!(published_messages(&data), sorted(&tags));
+    }
+
+    /// AC7: the daily rollup leaves alone every hourly file of a
+    /// `(date, service)` a pending marker claims. A published marker whose
+    /// WAL cannot be retired stays after recovery, and rolling its hourly
+    /// file into the daily one would delete the canonical output whose
+    /// identity recovery checks. Another service on the same day rolls up
+    /// as usual. Once retirement works, recovery finishes and the next
+    /// rollup takes the file.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rollup_leaves_a_claimed_hourly_file_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal = tmp.path().join("wal");
+        let data = tmp.path().join("data");
+        let env_wal = wal.join("prod");
+        std::fs::create_dir_all(&env_wal).unwrap();
+        if running_as_root(&env_wal) {
+            eprintln!("skipped: root ignores directory permissions");
+            return;
+        }
+        let yesterday = (chrono::Utc::now() - chrono::Duration::days(1)).date_naive();
+        let day = yesterday.format("%Y-%m-%d").to_string();
+        let row = |service: &str, message: &str| {
+            format!(
+                r#"{{"_time":"{day}T07:00:00Z","_ingested":"{day}T07:00:00Z","service":"{service}","message":"{message}"}}"#
+            )
+        };
+        let env_data = data.join("prod");
+        let claimed = write_hourly_parquet(
+            &env_data,
+            &day,
+            "07",
+            "svc",
+            &[&row("svc", "rollup-claimed")],
+        );
+        let unclaimed = write_hourly_parquet(
+            &env_data,
+            &day,
+            "07",
+            "other",
+            &[&row("other", "rollup-unclaimed")],
+        );
+        let consumed = tagged_wal(&env_wal, "svc", &["rollup-claimed"]);
+        let marker = ValidatedMarker::new(
+            "prod",
+            "svc",
+            yesterday,
+            7,
+            vec![consumed.file_name().unwrap().to_str().unwrap().to_owned()],
+            publication_marker::identity_of(&claimed).unwrap(),
+        )
+        .unwrap();
+        publication_marker::write_marker(&wal, &marker).unwrap();
+        assert_eq!(marker.canonical(&data), claimed);
+        let claimed_bytes = std::fs::read(&claimed).unwrap();
+        let hot = hot_buffer();
+        let rollup_tick = || {
+            compact_once(
+                &wal,
+                &data,
+                Duration::ZERO,
+                true,
+                Some(&hot),
+                DEFAULT_CHUNK_SIZE,
+                "2GB",
+                None,
+            )
+        };
+
+        let guard = ModeGuard::read_only(&env_wal);
+        assert_eq!(
+            rollup_tick().await.unwrap(),
+            1,
+            "the unretired marker is a tick error"
+        );
+        assert_eq!(std::fs::read(&claimed).unwrap(), claimed_bytes);
+        assert!(!env_data.join(&day).join("svc.parquet").exists());
+        assert!(!unclaimed.exists(), "an unclaimed service rolls up");
+        assert_eq!(
+            read_strings(&env_data.join(&day).join("other.parquet"), "message"),
+            ["rollup-unclaimed"]
+        );
+        assert!(marker_file(&wal, "prod", "svc").is_file());
+
+        drop(guard);
+        assert_eq!(rollup_tick().await.unwrap(), 0);
+        assert!(!marker_file(&wal, "prod", "svc").exists());
+        assert!(!consumed.exists(), "recovery retires the WAL");
+        assert!(!claimed.exists(), "the next rollup takes the hourly file");
+        assert_eq!(
+            published_messages(&data),
+            sorted(&["rollup-claimed", "rollup-unclaimed"])
+        );
+    }
+
+    /// Every publish syncs the whole output directory chain before its
+    /// marker, not only the directories that attempt created. The first
+    /// attempt creates `data/prod/{date}/{HH}` and fails on the sync of
+    /// `data/prod`. A retry finds every directory in place, but it must
+    /// still sync `data/prod`, so while that sync fails it may neither
+    /// publish nor retire the WAL.
+    #[test]
+    fn a_retried_publish_syncs_directories_an_earlier_attempt_created() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal = tmp.path().join("wal");
+        let data = tmp.path().join("data");
+        let env_wal = wal.join("prod");
+        let env_data = data.join("prod");
+        std::fs::create_dir_all(&env_wal).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        let tags = ["chain-a0", "chain-a1"];
+        let files = vec![tagged_wal(&env_wal, "svc", &tags)];
+        let attempt = || {
+            let mut quarantined = 0;
+            let prep = prepare_service_batch(
+                &files,
+                &env_data,
+                "svc",
+                "2GB",
+                &mut quarantined,
+                &HashMap::new(),
+            )?
+            .expect("a readable batch");
+            let pins = local_pins(&prep.proposals);
+            let batch_ids = vec![format!(
+                "prod/{}",
+                files[0].file_stem().unwrap().to_str().unwrap()
+            )];
+            conform_and_publish(
+                prep,
+                &pins,
+                &PublishTarget {
+                    data_dir: &env_data,
+                    wal_dir: &wal,
+                    env: "prod",
+                },
+                "svc",
+                None,
+                &batch_ids,
+            )
+        };
+
+        let failing = crate::epoch::fail_dir_fsync::set(&env_data);
+        for round in 1..=2 {
+            let err = attempt().unwrap_err();
+            assert!(
+                err.contains("failed to fsync directory"),
+                "round {round}: {err}"
+            );
+            assert!(files[0].is_file(), "round {round}: the WAL is kept");
+            assert!(!marker_file(&wal, "prod", "svc").exists(), "round {round}");
+            assert!(published_messages(&data).is_empty(), "round {round}");
+        }
+
+        drop(failing);
+        let (_report, incomplete) = attempt().unwrap();
+        assert!(incomplete.is_none(), "{incomplete:?}");
+        assert_eq!(published_messages(&data), sorted(&tags));
+        assert!(!files[0].exists());
+        assert!(!marker_file(&wal, "prod", "svc").exists());
+    }
+
+    /// A consumed WAL file withdrawn after compaction read it (its writer's
+    /// directory fsync failed and it rejected the write) must not publish:
+    /// the sender retries that batch. The publish rolls back, keeps the
+    /// other inputs, and the next tick publishes them exactly once.
+    #[tokio::test]
+    async fn a_withdrawn_wal_file_rolls_the_publish_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal = tmp.path().join("wal");
+        let data = tmp.path().join("data");
+        let env_wal = wal.join("prod");
+        std::fs::create_dir_all(&env_wal).unwrap();
+        let hot = hot_buffer();
+        let kept = tagged_wal(&env_wal, "svc", &["wd-kept"]);
+        let withdrawn = tagged_wal(&env_wal, "svc", &["wd-withdrawn"]);
+        insert_hot(&hot, "prod", &kept, "svc");
+        let withdraw = withdrawn.clone();
+        let err = publish_batch(
+            &wal,
+            &data,
+            &[kept.clone(), withdrawn.clone()],
+            Some(&hot),
+            None,
+            // The writer withdraws its file after compaction read it.
+            move || std::fs::remove_file(withdraw).unwrap(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("disappeared before publication"), "{err}");
+        assert!(published_messages(&data).is_empty());
+        assert!(find_files_by_ext(&data, "tmp").is_empty(), "tmp removed");
+        assert!(!marker_file(&wal, "prod", "svc").exists());
+        assert!(kept.is_file());
+        assert_eq!(hot.event_count(), 1, "nothing drained");
+
+        assert_eq!(tick(&wal, &data, &hot).await.unwrap(), 0);
+        assert_eq!(published_messages(&data), ["wd-kept"]);
+        assert!(!kept.exists());
+        assert_eq!(hot.event_count(), 0);
+    }
+
+    /// The marker lists only the inputs that contributed rows. A corrupt
+    /// input is quarantined and never named, and a chunk whose every input
+    /// is corrupt writes no marker at all.
+    #[tokio::test]
+    async fn the_marker_names_only_surviving_inputs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal = tmp.path().join("wal");
+        let data = tmp.path().join("data");
+        let env_wal = wal.join("prod");
+        std::fs::create_dir_all(&env_wal).unwrap();
+        let good = tagged_wal(&env_wal, "svc", &["surv-good"]);
+        let corrupt = env_wal.join("svc_1729999999999_dead.ndjson");
+        std::fs::write(&corrupt, [0; 32]).unwrap();
+        let err = publish_batch(
+            &wal,
+            &data,
+            &[corrupt.clone(), good.clone()],
+            None,
+            Some("publish:after_marker"),
+            || {},
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("publish:after_marker"), "{err}");
+        let marker = publication_marker::read_marker(&marker_file(&wal, "prod", "svc")).unwrap();
+        assert_eq!(
+            marker.wal_names(),
+            [good.file_name().unwrap().to_str().unwrap()]
+        );
+        assert!(corrupt.with_extension("ndjson.corrupt").is_file());
+
+        let hot = hot_buffer();
+        assert_eq!(tick(&wal, &data, &hot).await.unwrap(), 0);
+        assert_eq!(published_messages(&data), ["surv-good"]);
+
+        let all_corrupt = env_wal.join("svc_1729999999998_beef.ndjson");
+        std::fs::write(&all_corrupt, [0; 32]).unwrap();
+        assert_eq!(tick(&wal, &data, &hot).await.unwrap(), 1, "one quarantine");
+        assert!(!marker_file(&wal, "prod", "svc").exists());
+        assert_eq!(published_messages(&data), ["surv-good"]);
     }
 
     #[test]
@@ -4490,7 +5752,9 @@ mod tests {
                                 .await
                         } else {
                             rollup_env_once(
+                                "prod",
                                 &env,
+                                &PublicationClaims::default(),
                                 "2GB",
                                 Some(&recovery_coordinator),
                                 Some(recovery_gate),
@@ -4687,9 +5951,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let wal = tmp.path().join("wal");
         let data = tmp.path().join("data");
-        std::fs::create_dir_all(&wal).unwrap();
+        std::fs::create_dir_all(wal.join("prod")).unwrap();
         let record = r#"{"_time":"2026-01-01T00:00:00Z","_ingested":"2026-01-01T00:00:00Z","service":"nginx","message":"one"}"#;
-        let file = write_wal_file(&wal, "nginx", &[record]);
+        let file = write_wal_file(&wal.join("prod"), "nginx", &[record]);
         let hot = Arc::new(HotBuffer::new(crate::hot_buffer::HotBufferConfig {
             max_events: 100,
             max_bytes: 100_000,
@@ -4704,6 +5968,7 @@ mod tests {
         let (entered, release) = gate.pause_next_publication_for_test();
         let writer_hot = Arc::clone(&hot);
         let writer_data = data.clone();
+        let writer_wal = wal.clone();
         let writer = std::thread::spawn(move || {
             let mut quarantined = 0;
             let prep = prepare_service_batch(
@@ -4720,7 +5985,11 @@ mod tests {
             conform_and_publish(
                 prep,
                 &pins,
-                &writer_data,
+                &PublishTarget {
+                    data_dir: &writer_data.join("prod"),
+                    wal_dir: &writer_wal,
+                    env: "prod",
+                },
                 "nginx",
                 Some(&writer_hot),
                 &["prod/batch".to_owned()],
@@ -6819,7 +8088,12 @@ mod tests {
         std::fs::write(&fresh, b"fresh").unwrap();
 
         // Threshold between stale (50ms+ old) and fresh (~0ms old).
-        cleanup_stale_tmp_files(&data_dir, Duration::from_millis(25));
+        cleanup_stale_tmp_files(
+            "prod",
+            &data_dir,
+            Duration::from_millis(25),
+            &PublicationClaims::default(),
+        );
 
         assert!(!stale.exists(), "stale .tmp should be removed");
         assert!(fresh.exists(), "fresh .tmp should be kept");
@@ -6838,7 +8112,12 @@ mod tests {
 
         std::thread::sleep(Duration::from_millis(50));
 
-        cleanup_stale_tmp_files(&data_dir, Duration::from_millis(25));
+        cleanup_stale_tmp_files(
+            "prod",
+            &data_dir,
+            Duration::from_millis(25),
+            &PublicationClaims::default(),
+        );
         assert!(!stale.exists(), "day-level stale .tmp should be removed");
     }
 
@@ -7921,12 +9200,12 @@ mod tests {
     }
 
     #[test]
-    fn retire_merged_hourly_deletes_when_possible() {
+    fn retire_merged_input_deletes_when_possible() {
         let tmp = tempfile::tempdir().unwrap();
         let f = tmp.path().join("nginx.parquet");
         std::fs::write(&f, b"data").unwrap();
 
-        retire_merged_hourly(&f).unwrap();
+        retire_merged_input(&f).unwrap();
 
         assert!(!f.exists(), "file should be deleted on the happy path");
         let mut aside = f.into_os_string();
@@ -7938,13 +9217,13 @@ mod tests {
     }
 
     #[test]
-    fn retire_merged_hourly_renames_aside_when_delete_fails() {
+    fn retire_merged_input_renames_aside_when_delete_fails() {
         // remove_file on a directory fails → fall through to rename-aside.
         let tmp = tempfile::tempdir().unwrap();
         let dir_path = tmp.path().join("nginx.parquet");
         std::fs::create_dir(&dir_path).unwrap();
 
-        retire_merged_hourly(&dir_path).unwrap();
+        retire_merged_input(&dir_path).unwrap();
 
         assert!(!dir_path.exists(), "original should be renamed away");
         let mut aside = dir_path.into_os_string();
@@ -8002,7 +9281,7 @@ mod tests {
         assert!(daily.exists());
 
         // Simulate a "delete failed → retired aside" hourly that survived as
-        // `.merged` (what retire_merged_hourly leaves behind on a bad delete).
+        // `.merged` (what retire_merged_input leaves behind on a bad delete).
         // It must not be re-collected nor re-merged.
         let stranded = day_dir.join("01").join("nginx.parquet.merged");
         std::fs::create_dir_all(stranded.parent().unwrap()).unwrap();
@@ -8076,7 +9355,7 @@ mod tests {
     }
 
     #[test]
-    fn retire_merged_hourly_is_idempotent_on_missing_file() {
+    fn retire_merged_input_is_idempotent_on_missing_file() {
         // Retiring an already-gone hourly is a no-op success. The goal
         // ("this file is no longer a re-mergeable hourly") is already met, so a
         // missing source must not propagate as Err (which would wedge recovery).
@@ -8084,7 +9363,7 @@ mod tests {
         let gone = tmp.path().join("never-existed.parquet");
         assert!(!gone.exists());
 
-        retire_merged_hourly(&gone).expect("missing hourly should retire as Ok");
+        retire_merged_input(&gone).expect("missing hourly should retire as Ok");
 
         let mut aside = gone.into_os_string();
         aside.push(".merged");
