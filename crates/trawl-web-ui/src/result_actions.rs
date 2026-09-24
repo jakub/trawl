@@ -8,6 +8,37 @@ use std::{cmp::Ordering, collections::HashSet};
 use trawl_api::value::Value;
 use trawl_core::{ast::PipeStage, schema::catalog_key};
 
+/// Whether a stage leaves every column name it receives meaning what it
+/// meant: stages that filter, order, project or deduplicate mint no name.
+///
+/// This is the only list of that set. Result provenance
+/// ([`Capabilities::for_query`]) and the categorical chart and group links
+/// (`crate::categorical`) all read it, so a stage added to the DSL is
+/// classified here once, and the exhaustive match makes that a compile error
+/// rather than a silent default.
+pub(crate) fn passes_names_through(stage: &PipeStage) -> bool {
+    match stage {
+        PipeStage::Where(_)
+        | PipeStage::Sort(_)
+        | PipeStage::Limit(_)
+        | PipeStage::Table(_)
+        | PipeStage::Drop(_)
+        | PipeStage::Dedup(_)
+        | PipeStage::Tail(_)
+        | PipeStage::Sample(_) => true,
+        PipeStage::Stats(_)
+        | PipeStage::Top(_)
+        | PipeStage::Rare(_)
+        | PipeStage::Let(_)
+        | PipeStage::Extract(_)
+        | PipeStage::Timechart(_)
+        | PipeStage::Pivot(_)
+        | PipeStage::Rename(_)
+        | PipeStage::EventStats(_)
+        | PipeStage::FromSaved(_) => false,
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Capabilities {
     pub raw: bool,
@@ -28,6 +59,9 @@ impl Capabilities {
             ..Self::default()
         };
         for stage in parsed.pipeline {
+            if passes_names_through(&stage.node) {
+                continue;
+            }
             match stage.node {
                 PipeStage::Stats(s) => {
                     out.raw = false;
@@ -75,14 +109,6 @@ impl Capabilities {
                         out.changed.insert(catalog_key(&b));
                     }
                 }
-                PipeStage::Where(_)
-                | PipeStage::Sort(_)
-                | PipeStage::Limit(_)
-                | PipeStage::Table(_)
-                | PipeStage::Drop(_)
-                | PipeStage::Dedup(_)
-                | PipeStage::Tail(_)
-                | PipeStage::Sample(_) => (),
                 // Extraction can overwrite unknown fields; saved input and other
                 // shaping stages do not prove input-field provenance.
                 _ => {
@@ -332,6 +358,41 @@ mod tests {
         assert!(capabilities.include("_time", &value));
         let grouped = Capabilities::for_query("* | stats count() by _time");
         assert!(grouped.include("_time", &value));
+    }
+    #[test]
+    fn passes_names_through_holds_for_exactly_the_non_minting_stages() {
+        for (stage, passes) in [
+            ("where status == 200", true),
+            ("sort -count", true),
+            ("head 10", true),
+            ("limit 10", true),
+            ("table host", true),
+            ("fields host", true),
+            ("drop host", true),
+            ("dedup host", true),
+            ("tail 10", true),
+            ("sample 10", true),
+            ("stats count() by host", false),
+            ("eventstats count() by host", false),
+            ("timechart count()", false),
+            ("top 10 host", false),
+            ("rare 5 host", false),
+            ("let x = 1", false),
+            ("eval x = 1", false),
+            ("rename host as h", false),
+            ("extract kv", false),
+            ("pivot count() on host by service", false),
+        ] {
+            let query = format!("* | {stage}");
+            let parsed =
+                trawl_core::parser::parse(&query).unwrap_or_else(|e| panic!("{query}: {e:?}"));
+            let [only] = parsed.pipeline.as_slice() else {
+                panic!("{query}: expected one stage");
+            };
+            assert_eq!(passes_names_through(&only.node), passes, "{stage}");
+        }
+        let saved = trawl_core::parser::parse("| from saved example").unwrap();
+        assert!(!passes_names_through(&saved.pipeline[0].node));
     }
     #[test]
     fn raw_mutations_keep_only_unchanged_field_facets() {
