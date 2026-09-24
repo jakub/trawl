@@ -121,7 +121,7 @@ pub enum TabsStyle {
 ///
 /// `trailing` is the workspace family's right-aligned action slot,
 /// rendered after the flex spacer and outside the tablist (trawl's
-/// results Save/Export links); ignored by the drawer family, which has
+/// results View/Export links); ignored by the drawer family, which has
 /// `meta` in that position.
 #[component]
 pub fn Tabs(
