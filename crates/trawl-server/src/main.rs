@@ -329,12 +329,16 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
     // conformant must not serve queries. A per-path failure is not that:
     // an unreadable or foreign parquet file, or a subdirectory the walk
     // cannot enumerate, is skipped and counted inside the pass, so one bad
-    // path cannot keep the daemon down.
+    // path cannot keep the daemon down. So is every file a publication
+    // marker still claims after boot recovery (ADR-0041): the pass leaves it
+    // untouched and withholds completion, so the next boot conforms it once
+    // the marker resolves.
     if config.ingest.enabled {
         let summary = trawl_server::catalog::conform::ensure_conformance(
             &state.storage.catalog,
             &state.query.field_catalog,
             &config.data.base_dir(),
+            &config.wal_dir(),
             &config.ingest.compaction_memory_limit,
         )
         .await?;
@@ -601,7 +605,8 @@ fn prepare_data_root(
 /// No hot buffer exists yet, so a published marker has no batches to drain.
 /// A marker recovery cannot resolve is logged and counted on
 /// `trawl_publication_recovery_total` by outcome, and keeps its service out
-/// of compaction; each tick retries it. Only an unreadable WAL root is
+/// of compaction; each tick retries it. The boot conformance pass then
+/// leaves the files it claims alone. Only an unreadable WAL root is
 /// fatal, as it is for the epoch gate's WAL validation.
 fn recover_publications_at_boot(
     wal_dir: &std::path::Path,

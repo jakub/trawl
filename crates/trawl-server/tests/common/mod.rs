@@ -1488,6 +1488,7 @@ async fn boot_conformance_pass(state: &trawl_server::state::AppState, config: &C
             &state.storage.catalog,
             &state.query.field_catalog,
             &config.data.base_dir(),
+            &config.wal_dir(),
             &config.ingest.compaction_memory_limit,
         )
         .await
