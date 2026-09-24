@@ -10,17 +10,18 @@
 # builds again, and requires the spec to pass. Prints both outcomes and
 # exits 0 only if both legs behave.
 #
-# A leg is INCONCLUSIVE, and the script exits nonzero, unless the JSON report
-# shows the one test ran with the expected outcome. A mutant failure counts
-# only if its error is located at the spec's health-count assertion and its
-# message header is that assertion's failure (issue241-negative-leg.verdict.mjs),
-# so a port collision, launch failure, timeout, crash, or an error on a
-# neighbouring line never reads as a kill.
+# Each leg's outcome comes from the JSON report
+# (issue241-negative-leg.verdict.mjs): pass, fail, or INCONCLUSIVE. A failure
+# counts only if its error is located at the spec's health-count assertion
+# and its message header is that assertion's failure, so a port collision,
+# launch failure, timeout, crash, unreadable report, or an error on a
+# neighbouring line is INCONCLUSIVE (exit 3), never a kill. A surviving
+# mutant, or a gated build that fails, is RESULT: FAIL (exit 1).
 #
 # Both builds go to script-owned dist directories under target/, served
 # through TRAWL_E2E_DIST, so crates/trawl-web-ui/dist is never written and no
-# exit path can leave the ungated app there. The exit trap restores layout.rs
-# and removes those directories.
+# exit path can leave the ungated app there. The exit and signal traps
+# restore layout.rs and remove those directories.
 #
 # Usage: e2e/scripts/issue241-negative-leg.sh   (E2E_PORT defaults to 8123)
 #        e2e/scripts/issue241-negative-leg.sh --self-test   (verdict parser only)
@@ -53,6 +54,10 @@ cleanup() {
   rm -rf "$WORK"
 }
 trap cleanup EXIT
+# Turn INT and TERM into an exit, so the EXIT trap restores layout.rs even
+# when the run is killed mid-build.
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # build DIST: trunk build into a script-owned directory.
 build() {
@@ -69,7 +74,7 @@ run_spec() {
     npx playwright test "$SPEC" --workers=1 --reporter=line,json 2>&1)" || status=$?
   printf '%s\n' "$out" | grep -E '^\s+[0-9]+ (passed|failed)|Error:|Expected:|Received:' || true
   echo "playwright exit: $status"
-  node "$SCRIPT_DIR/issue241-negative-leg.verdict.mjs" "$report" "$expect" "$status" "$WORK/verdict-$expect"
+  node "$SCRIPT_DIR/issue241-negative-leg.verdict.mjs" "$report" "$status" "$WORK/verdict-$expect"
 }
 
 echo "== issue #241 negative leg at $(git -C "$WEB_UI_DIR" rev-parse HEAD)"
@@ -103,12 +108,4 @@ run_spec "$WORK/dist-gated" pass
 leg2="$(cat "$WORK/verdict-pass")"
 echo "leg 2 outcome: $leg2 (expected pass)"
 echo
-if [ "$leg1" = fail ] && [ "$leg2" = pass ]; then
-  echo "RESULT: PASS (the spec fails on its health assertion without the gate and passes with it)"
-elif [ "$leg1" = inconclusive ] || [ "$leg2" = inconclusive ]; then
-  echo "RESULT: INCONCLUSIVE"
-  exit 3
-else
-  echo "RESULT: FAIL"
-  exit 1
-fi
+node "$SCRIPT_DIR/issue241-negative-leg.verdict.mjs" --result "$leg1" "$leg2"
