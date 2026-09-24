@@ -76,6 +76,7 @@ Per affordance:
   open modal under ADR-0027. This does not cancel a request already
   submitted or change the server's saved-query permissions and DSL
   admission rules.
+  *Amended 2026-09-23 ([one save control](#amendment-one-save-control-2026-09-23)): the results-toolbar Save is removed. The console's Save as Net is the one entry to this flow, and its capture rules stay as written.*
 - **History Export is client-side.** It serialises the loaded rows under the
   current filter as CSV or JSON through the existing download helper. It is
   not a second server export lane.
@@ -96,3 +97,22 @@ Per affordance:
   and its `from_url` first-match rule stops hiding four dead entries.
 - Each disposition lands through a #100 child slice with browser evidence;
   this ADR records the product decision so no child re-opens it.
+
+## Amendment: one save control, 2026-09-23
+
+[Issue #239](https://github.com/jakub/trawl/issues/239) found two labels
+for one action: **Save** in the results toolbar and **Save as Net** in the
+console both open the save-as-net modal on the editor buffer. The user
+chose to remove the results-toolbar Save.
+
+The results toolbar acts on the displayed result: View changes how it is
+drawn and Export downloads it. Save did not act on that result. It saved
+the editor text, which differs from the displayed result as soon as the
+query is edited without a Haul. The word also collides with **Save** in the
+root `context.md`, which names the terminal table-write stages.
+
+The console's **Save as Net** is the one control that opens the modal from
+the Search page. The History page keeps its per-row Save as Net. The
+capture, retarget, close and malformed-link rules above apply unchanged to
+the remaining control. The results toolbar keeps View and Export. No
+shortcut or menu item replaces the removed button.
