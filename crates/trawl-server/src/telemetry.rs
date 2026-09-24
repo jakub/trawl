@@ -94,6 +94,23 @@
 //! and `trawl_telemetry_buffer_{events,bytes}` gauge the whole charge, not
 //! just the queue.
 //!
+//! ## Hot-buffer admission (ADR-0043)
+//!
+//! Each drain unit reserves its exact hot-buffer charge (events, ndjson
+//! bytes) as [`ProducerKind::Trawld`](crate::ingest::producer::ProducerKind),
+//! whose ceiling is the full caps, before any WAL write: on the async side
+//! before `spawn_blocking`, and before the publication gate in both flush
+//! paths. A refused unit goes back to the queue front and the cycle ends.
+//! Nothing was attempted, so a refusal is not a write failure: no failure
+//! count, no stderr, no trace. The unit is retried next tick under the same
+//! shared memory budget, and the ledger's refusal counter records it.
+//! Coalescing stops at the full caps on both dimensions, and a queued batch
+//! over them is split at an event boundary. An event larger than the full
+//! caps alone can never fit, so it is dropped as a `buffer_cap` loss. The
+//! reservation travels into the write task and the insert consumes it; a
+//! failed write (a withdrawn file or one left visible for compaction)
+//! releases it and inserts nothing. `on_event` never touches the ledger.
+//!
 //! ## Durability before visibility
 //!
 //! A batch is inserted into the hot buffer and published to the event bus
@@ -618,7 +635,8 @@ struct Batch {
 /// Coalescing bounds the recovery drain by queued bytes instead: with the
 /// default 16 MiB budget the entire queue leaves in a handful of writes.
 /// A unit whose first batch alone exceeds this is still written (a drain
-/// must never stall), so the ceiling is a target, not a hard limit.
+/// must never stall), so the ceiling is a target, not a hard limit. The
+/// hot buffer's full caps are the hard limit ([`WalLayerInner::fit_front`]).
 const MAX_DRAIN_UNIT_BYTES: usize = 4 * 1024 * 1024;
 
 /// Documented per-event overhead estimate charged on top of the serialized
@@ -641,6 +659,16 @@ fn charge_of(bytes: usize, events: usize) -> usize {
 /// [`charge_of`] for one staged batch.
 fn batch_charge(batch: &Batch) -> usize {
     charge_of(batch.bytes.len(), batch.events.len())
+}
+
+/// What one staged batch charges the hot buffer once published: its event
+/// count and exact ndjson bytes, the `(events.len(), byte_size)` of the
+/// `IngestBatch` it becomes.
+fn hot_charge(batch: &Batch) -> crate::hot_buffer::Charge {
+    crate::hot_buffer::Charge {
+        events: batch.events.len(),
+        bytes: batch.bytes.len(),
+    }
 }
 
 /// The active (not yet staged) buffer: ndjson bytes and their event maps,
@@ -899,14 +927,21 @@ impl WalLayer {
         self.inner.stage();
         let mut coalesce = false;
         while let Some(batch) = self.inner.pop_drain_unit(coalesce) {
+            // Admission before the publication gate: a refusal never
+            // touches it.
+            let Ok(reservation) = self.inner.reserve_hot(&batch) else {
+                self.inner.requeue_front(batch);
+                break;
+            };
             let publication = self.inner.hot_buffer.get().map(|buf| buf.publication());
             let _ingest = publication.as_ref().map(|gate| gate.blocking_ingest());
             match writer.write(env, TELEMETRY_SERVICE, &batch.bytes) {
                 Ok(wal_path) => {
                     coalesce = true;
-                    self.inner.publish(env, &wal_path, batch);
+                    self.inner.publish(env, &wal_path, batch, reservation);
                 }
                 Err(e) => {
+                    drop(reservation);
                     self.inner.retain_or_release_failed(&e, batch);
                     break;
                 }
@@ -932,6 +967,15 @@ impl WalLayer {
         self.inner.stage();
         let mut coalesce = false;
         while let Some(batch) = self.inner.pop_drain_unit(coalesce) {
+            // Admission on the async side, before the blocking task exists:
+            // a refused unit goes back to the queue front untouched, and the
+            // cycle ends. That is no write failure (nothing was attempted),
+            // so it leaves no failure count, stderr line or trace; the
+            // ledger counts the refusal.
+            let Ok(reservation) = self.inner.reserve_hot(&batch) else {
+                self.inner.requeue_front(batch);
+                break;
+            };
             let w = Arc::clone(writer);
             let batch_env = Arc::clone(env);
             let inner = Arc::clone(&self.inner);
@@ -949,13 +993,18 @@ impl WalLayer {
                 // async caller is cancelled while the WAL write runs.
                 let publication = inner.hot_buffer.get().map(|buf| buf.publication());
                 let _ingest = publication.as_ref().map(|gate| gate.blocking_ingest());
+                // The reservation is owned here: a failed write, a panic or
+                // a dropped task releases it; only publish inserts it.
                 match w.write(&batch_env, TELEMETRY_SERVICE, &batch.bytes) {
                     Ok(wal_path) => {
-                        inner.publish(&batch_env, &wal_path, batch);
+                        inner.publish(&batch_env, &wal_path, batch, reservation);
                         inner.update_gauges();
                         Ok(())
                     }
-                    Err(e) => Err((e, batch)),
+                    Err(e) => {
+                        drop(reservation);
+                        Err((e, batch))
+                    }
                 }
             })
             .await;
@@ -1193,14 +1242,24 @@ impl WalLayerInner {
     /// still resident memory, and a wedged write must not make it invisible
     /// to the cap. [`charge_of`] is linear in bytes and events, so merging
     /// moves no charge and the shared budget is unaffected.
+    ///
+    /// Every unit fits the hot buffer's full caps ([`Self::hot_ceiling`]) on
+    /// both dimensions, so its reservation can be refused for lack of space
+    /// but never as oversized: coalescing stops at the ceiling, and a front
+    /// batch over it is split at event boundaries ([`Self::fit_front`]).
     fn pop_drain_unit(&self, coalesce: bool) -> Option<Batch> {
+        let ceiling = self.hot_ceiling();
         let mut pending = self.pending.lock();
-        let mut unit = pending.pop_front()?;
+        let mut unit = self.fit_front(&mut pending, ceiling)?;
         if !coalesce {
             return Some(unit);
         }
         while let Some(next) = pending.front() {
-            if unit.bytes.len() + next.bytes.len() > MAX_DRAIN_UNIT_BYTES {
+            if unit.bytes.len() + next.bytes.len() > MAX_DRAIN_UNIT_BYTES
+                || !hot_charge(&unit)
+                    .checked_add(hot_charge(next))
+                    .is_some_and(|merged| merged.fits(ceiling))
+            {
                 break;
             }
             let mut next = pending.pop_front().expect("peeked front exists");
@@ -1208,6 +1267,91 @@ impl WalLayerInner {
             unit.events.append(&mut next.events);
         }
         Some(unit)
+    }
+
+    /// The most one drain unit may charge the hot buffer: its full caps
+    /// (self-telemetry's ceiling), or no limit while no hot buffer is set.
+    fn hot_ceiling(&self) -> crate::hot_buffer::Charge {
+        self.hot_buffer.get().map_or(
+            crate::hot_buffer::Charge {
+                events: usize::MAX,
+                bytes: usize::MAX,
+            },
+            |buf| buf.ceiling(crate::ingest::producer::ProducerKind::Trawld),
+        )
+    }
+
+    /// Pop the front batch, cut to fit `ceiling`. A front batch over the
+    /// ceiling is split at an event boundary (every event is one ndjson
+    /// line, and serialized JSON holds no raw newline); the remainder stays
+    /// at the front. An event that alone exceeds the ceiling can never be
+    /// admitted, so it is dropped as a `buffer_cap` loss rather than left to
+    /// wedge the queue. Splitting and dropping move or release staged charge
+    /// exactly: [`charge_of`] is linear.
+    fn fit_front(
+        &self,
+        pending: &mut VecDeque<Batch>,
+        ceiling: crate::hot_buffer::Charge,
+    ) -> Option<Batch> {
+        loop {
+            let mut batch = pending.pop_front()?;
+            if hot_charge(&batch).fits(ceiling) {
+                return Some(batch);
+            }
+            let mut fit = crate::hot_buffer::Charge::ZERO;
+            for line in batch.bytes.split_inclusive(|&b| b == b'\n') {
+                let next = crate::hot_buffer::Charge {
+                    events: fit.events + 1,
+                    bytes: fit.bytes + line.len(),
+                };
+                if !next.fits(ceiling) {
+                    break;
+                }
+                fit = next;
+            }
+            if fit.events == 0 {
+                let line_len = batch
+                    .bytes
+                    .iter()
+                    .position(|&b| b == b'\n')
+                    .map_or(batch.bytes.len(), |end| end + 1);
+                batch.bytes.drain(..line_len);
+                batch.events.remove(0);
+                self.staged.release(1, charge_of(line_len, 1));
+                self.record_cap_drop(1, line_len as u64);
+                if !batch.events.is_empty() {
+                    pending.push_front(batch);
+                }
+                continue;
+            }
+            let rest = Batch {
+                bytes: batch.bytes.split_off(fit.bytes),
+                events: batch.events.split_off(fit.events),
+            };
+            pending.push_front(rest);
+            return Some(batch);
+        }
+    }
+
+    /// Reserve hot-buffer space for one drain unit, as self-telemetry
+    /// (the full caps). `Ok(None)` while no hot buffer is set.
+    ///
+    /// A refusal leaves the caller to requeue the unit and end the cycle.
+    /// [`Self::pop_drain_unit`] shapes every unit to the ceiling, so
+    /// [`Refusal::Oversized`](crate::hot_buffer::Refusal::Oversized) is
+    /// reachable only if the hot buffer was set between popping and
+    /// reserving; the next cycle reshapes the requeued unit against it.
+    fn reserve_hot(
+        &self,
+        batch: &Batch,
+    ) -> Result<Option<crate::hot_buffer::Reservation>, crate::hot_buffer::Refusal> {
+        self.hot_buffer.get().map_or(Ok(None), |buf| {
+            buf.reserve(
+                crate::ingest::producer::ProducerKind::Trawld,
+                hot_charge(batch),
+            )
+            .map(Some)
+        })
     }
 
     /// Put a failed batch back at the queue front, preserving FIFO order.
@@ -1235,8 +1379,16 @@ impl WalLayerInner {
     /// strictly after WAL success, exactly once (the batch was popped).
     /// Then emit the `telemetry_dropped` recovery record if any loss is
     /// due ([`Self::report_drops`]).
-    /// The caller holds the publication read guard from before WAL writing.
-    fn publish(&self, env: &str, wal_path: &std::path::Path, batch: Batch) {
+    /// The caller holds the publication read guard from before WAL writing,
+    /// and `reservation` is the hot-buffer space admitted for this exact
+    /// batch ([`Self::reserve_hot`]); the insert consumes it.
+    fn publish(
+        &self,
+        env: &str,
+        wal_path: &std::path::Path,
+        batch: Batch,
+        reservation: Option<crate::hot_buffer::Reservation>,
+    ) {
         #[cfg(test)]
         {
             let pause = self.pause_before_insert.lock().take();
@@ -1246,7 +1398,7 @@ impl WalLayerInner {
             }
         }
         // The batch leaves the layer's accounting here: the hot buffer
-        // takes ownership under its own `hot_buffer_max_bytes` budget.
+        // takes ownership under the space its reservation admitted.
         self.staged
             .release(batch.events.len(), batch_charge(&batch));
 
@@ -1269,8 +1421,10 @@ impl WalLayerInner {
                 events: batch.events,
                 byte_size,
             });
-            if let Some(buf) = self.hot_buffer.get() {
-                buf.insert_evicting(Arc::clone(&batch));
+            if let Some(reservation) = reservation
+                && let Some(buf) = self.hot_buffer.get()
+            {
+                buf.insert(reservation, Arc::clone(&batch));
             }
             if let Some(bus) = self.bus.get() {
                 let _ = bus.publish(batch);
@@ -3436,6 +3590,11 @@ mod tests {
                     "an unacknowledged batch is not published"
                 );
                 assert_eq!(
+                    hot.charged(),
+                    crate::hot_buffer::Charge::ZERO,
+                    "the failed write released its hot-buffer reservation"
+                );
+                assert_eq!(
                     sample(
                         &metrics_handle,
                         crate::metrics::TELEMETRY_WAL_WRITE_FAILURES_TOTAL
@@ -4015,6 +4174,316 @@ mod tests {
                 .await
                 .is_err(),
             "the coalesced remainder published once"
+        );
+    }
+
+    /// Events of `event_type` in the hot buffer's current snapshot.
+    fn hot_events_of(hot: &crate::hot_buffer::HotBuffer, event_type: &str) -> usize {
+        let Some(snapshot) = hot.snapshot() else {
+            return 0;
+        };
+        std::fs::read_to_string(snapshot.path())
+            .unwrap()
+            .lines()
+            .filter(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap()["event_type"] == event_type
+            })
+            .count()
+    }
+
+    fn admission_hot(max_events: usize, max_bytes: usize) -> Arc<crate::hot_buffer::HotBuffer> {
+        Arc::new(crate::hot_buffer::HotBuffer::new(
+            crate::hot_buffer::HotBufferConfig {
+                max_events,
+                max_bytes,
+            },
+        ))
+    }
+
+    /// Flush through the async cycle, or through the synchronous `flush`
+    /// on a blocking thread.
+    async fn flush_via(layer: &WalLayer, synchronous: bool) {
+        if synchronous {
+            let flushing = layer.clone();
+            tokio::task::spawn_blocking(move || flushing.flush())
+                .await
+                .unwrap();
+        } else {
+            layer.flush_cycle().await;
+        }
+    }
+
+    /// AC10: a full hot buffer refuses the unit before any write. The unit
+    /// stays at the queue front with no write-failure record, `on_event`
+    /// keeps buffering, and once space is released the unit lands exactly
+    /// once: one WAL file, one hot-buffer copy, still first in FIFO order.
+    async fn assert_refused_flush_keeps_unit_at_front(synchronous: bool) {
+        use crate::hot_buffer::Charge;
+        use crate::ingest::producer::ProducerKind;
+        use tracing_subscriber::prelude::*;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = Arc::new(WalWriter::new(tmp.path().join("wal")));
+        writer.ensure_dir().unwrap();
+        let env_dir = writer.dir().join("prod");
+        std::fs::create_dir_all(&env_dir).unwrap();
+        let handle = WalHandle::new();
+        handle.set(Arc::clone(&writer), "prod");
+        let hot = admission_hot(10_000, 10 * 1024 * 1024);
+        let layer = WalLayer::new(handle, "prod");
+        layer.set_hot_buffer(Arc::clone(&hot));
+        let layer_ref = layer.clone();
+        let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
+
+        let full = hot
+            .reserve(ProducerKind::Trawld, hot.ceiling(ProducerKind::Trawld))
+            .unwrap();
+        tracing::info!(event_type = "refused_unit", "refused while full");
+        flush_via(&layer_ref, synchronous).await;
+
+        {
+            let pending = layer_ref.inner.pending.lock();
+            assert_eq!(pending.len(), 1, "the refused unit is retained");
+            assert_eq!(pending[0].events.len(), 1);
+            assert_eq!(pending[0].events[0]["event_type"], "refused_unit");
+        }
+        assert_eq!(
+            wal_files_holding(&env_dir, "refused_unit"),
+            (0, 0),
+            "a refused unit is never written"
+        );
+        assert_eq!(hot.event_count(), 0);
+        assert_eq!(
+            hot.admission_state(),
+            crate::hot_buffer::AdmissionState::Refusing
+        );
+        assert!(
+            layer_ref.inner.last_stderr.lock().is_none(),
+            "a refusal is not a write failure"
+        );
+
+        let started = Instant::now();
+        for i in 0..500 {
+            tracing::info!(event_type = "refusal_burst", seq = i, "burst while refused");
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "on_event must not wait on hot-buffer capacity"
+        );
+        assert_eq!(layer_ref.inner.active.lock().events.len(), 500);
+
+        drop(full);
+        assert_eq!(hot.charged(), Charge::ZERO);
+        flush_via(&layer_ref, synchronous).await;
+
+        assert!(layer_ref.inner.pending.lock().is_empty());
+        assert_eq!(
+            wal_files_holding(&env_dir, "refused_unit"),
+            (1, 1),
+            "the unit lands in exactly one WAL file, once"
+        );
+        assert_eq!(hot_events_of(&hot, "refused_unit"), 1);
+        assert_eq!(hot_events_of(&hot, "refusal_burst"), 500);
+        let events = read_wal_events(&env_dir);
+        assert_eq!(
+            events[0]["event_type"], "refused_unit",
+            "the retained unit keeps its place at the front"
+        );
+        assert!(layer_ref.inner.last_stderr.lock().is_none());
+    }
+
+    #[tokio::test]
+    async fn refused_flush_keeps_unit_at_front_and_lands_once_after_drain() {
+        assert_refused_flush_keeps_unit_at_front(false).await;
+    }
+
+    #[tokio::test]
+    async fn refused_synchronous_flush_keeps_unit_at_front_and_lands_once_after_drain() {
+        assert_refused_flush_keeps_unit_at_front(true).await;
+    }
+
+    /// AC9, telemetry half: external producers filling their whole ceiling
+    /// leave self-telemetry its reserve, so its flush is admitted.
+    #[tokio::test]
+    async fn telemetry_flush_is_admitted_while_http_fills_the_external_ceiling() {
+        use crate::hot_buffer::{Charge, Refusal};
+        use crate::ingest::producer::ProducerKind;
+        use tracing_subscriber::prelude::*;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = Arc::new(WalWriter::new(tmp.path().join("wal")));
+        let handle = WalHandle::new();
+        handle.set(Arc::clone(&writer), "prod");
+        let hot = admission_hot(1600, 1_600_000);
+        let layer = WalLayer::new(handle, "prod");
+        layer.set_hot_buffer(Arc::clone(&hot));
+        let layer_ref = layer.clone();
+        let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
+
+        let external = hot.ceiling(ProducerKind::Http);
+        let http = hot.reserve(ProducerKind::Http, external).unwrap();
+        assert_eq!(
+            hot.reserve(
+                ProducerKind::Http,
+                Charge {
+                    events: 1,
+                    bytes: 1
+                }
+            )
+            .unwrap_err(),
+            Refusal::Full,
+            "external producers are at their ceiling"
+        );
+
+        tracing::info!(
+            event_type = "reserve_floor",
+            "telemetry during an ingest flood"
+        );
+        layer_ref.flush_cycle().await;
+
+        assert!(layer_ref.inner.pending.lock().is_empty());
+        assert_eq!(hot_events_of(&hot, "reserve_floor"), 1);
+        assert_eq!(
+            wal_files_holding(&writer.dir().join("prod"), "reserve_floor"),
+            (1, 1)
+        );
+        drop(http);
+    }
+
+    /// Drain units never exceed the hot buffer's full caps: a front batch
+    /// over the event cap is split at event boundaries, coalescing stops at
+    /// the byte cap, and FIFO order and exact staged charge survive both.
+    #[test]
+    fn drain_units_fit_the_full_caps_on_both_dimensions() {
+        use tracing_subscriber::prelude::*;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let handle = WalHandle::new();
+        handle.set(Arc::new(WalWriter::new(tmp.path().join("wal"))), "prod");
+
+        // Event dimension: five events staged in one tick, cap of two.
+        let layer = WalLayer::new(handle.clone(), "prod");
+        layer.set_hot_buffer(admission_hot(2, 1024 * 1024));
+        {
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::registry().with(layer.clone()),
+            );
+            for i in 0..5 {
+                tracing::info!(event_type = "split", seq = i, "split");
+            }
+        }
+        layer.inner.stage();
+        let staged_before = layer.inner.staged.bytes.load(Ordering::Relaxed);
+        let mut seqs = Vec::new();
+        let mut sizes = Vec::new();
+        while let Some(unit) = layer.inner.pop_drain_unit(true) {
+            assert_eq!(
+                unit.bytes.split_inclusive(|&b| b == b'\n').count(),
+                unit.events.len(),
+                "bytes and maps split together"
+            );
+            sizes.push(unit.events.len());
+            seqs.extend(unit.events.iter().map(|e| e["seq"].as_i64().unwrap()));
+        }
+        assert_eq!(sizes, vec![2, 2, 1]);
+        assert_eq!(seqs, (0..5).collect::<Vec<_>>());
+        assert_eq!(
+            layer.inner.staged.bytes.load(Ordering::Relaxed),
+            staged_before,
+            "splitting moves no staged charge"
+        );
+
+        // Byte dimension: three one-event ticks, cap of two lines.
+        let layer = WalLayer::new(handle, "prod");
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(layer.clone()));
+        let mut line_lens = Vec::new();
+        for i in 0..3 {
+            tracing::info!(event_type = "coalesce", seq = i, "coalesce");
+            layer.inner.stage();
+            line_lens.push(layer.inner.pending.lock().back().unwrap().bytes.len());
+        }
+        let two_lines = line_lens[0] + line_lens[1];
+        layer.set_hot_buffer(admission_hot(1000, two_lines));
+        let sizes: Vec<usize> = std::iter::from_fn(|| layer.inner.pop_drain_unit(true))
+            .map(|unit| {
+                assert!(unit.bytes.len() <= two_lines);
+                unit.events.len()
+            })
+            .collect();
+        assert_eq!(sizes, vec![2, 1], "coalescing stops at the byte cap");
+    }
+
+    /// An event larger than the full caps can never be admitted. It is
+    /// dropped as a `buffer_cap` loss instead of wedging the queue, and the
+    /// events around it still land in order.
+    #[tokio::test]
+    async fn a_lone_event_over_the_full_caps_is_dropped_as_buffer_cap() {
+        use crate::hot_buffer::Charge;
+        use tracing_subscriber::prelude::*;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = Arc::new(WalWriter::new(tmp.path().join("wal")));
+        let handle = WalHandle::new();
+        handle.set(Arc::clone(&writer), "prod");
+        let hot = admission_hot(1000, 6000);
+        let layer = WalLayer::new(handle, "prod");
+        layer.set_hot_buffer(Arc::clone(&hot));
+        let layer_ref = layer.clone();
+        let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
+
+        let huge = "x".repeat(8000);
+        tracing::info!(event_type = "around", seq = 0, "before");
+        tracing::info!(event_type = "oversized", payload = %huge, "too big");
+        tracing::info!(event_type = "around", seq = 1, "after");
+        layer_ref.inner.stage();
+        let oversized_len = {
+            let pending = layer_ref.inner.pending.lock();
+            let lines: Vec<usize> = pending[0]
+                .bytes
+                .split_inclusive(|&b| b == b'\n')
+                .map(<[u8]>::len)
+                .collect();
+            assert_eq!(lines.len(), 3);
+            assert!(lines[1] > 6000 && lines[0] + lines[2] <= 6000);
+            lines[1]
+        };
+
+        layer_ref.flush_cycle().await;
+        assert!(
+            layer_ref.inner.pending.lock().is_empty(),
+            "the queue is not wedged"
+        );
+        assert_eq!(hot_events_of(&hot, "around"), 2);
+        assert_eq!(hot_events_of(&hot, "oversized"), 0);
+        // The dropped event left the staged accounting with its unit.
+        assert_eq!(layer_ref.inner.staged.events.load(Ordering::Relaxed), 0);
+        assert_eq!(layer_ref.inner.staged.bytes.load(Ordering::Relaxed), 0);
+
+        // The recovery record reaches the WAL on the next cycle.
+        layer_ref.flush_cycle().await;
+        let events = read_wal_events(&writer.dir().join("prod"));
+        let seqs: Vec<i64> = events
+            .iter()
+            .filter(|e| e["event_type"] == "around")
+            .map(|e| e["seq"].as_i64().unwrap())
+            .collect();
+        assert_eq!(seqs, vec![0, 1]);
+        assert!(events.iter().all(|e| e["event_type"] != "oversized"));
+        let report: Vec<_> = events
+            .iter()
+            .filter(|e| e["event_type"] == "telemetry_dropped")
+            .collect();
+        assert_eq!(report.len(), 1, "one recovery record: {events:?}");
+        assert_eq!(report[0]["dropped_events_buffer_cap"], 1);
+        assert_eq!(report[0]["dropped_bytes_buffer_cap"], oversized_len as u64);
+        assert_eq!(
+            hot.charged(),
+            Charge {
+                events: hot.event_count(),
+                bytes: hot.byte_count()
+            },
+            "no reservation outlives its unit"
         );
     }
 

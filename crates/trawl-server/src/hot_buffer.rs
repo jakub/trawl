@@ -686,10 +686,6 @@ impl HotBuffer {
     /// Synchronous, O(1), no I/O, no tracing. A zero charge is admitted
     /// without taking the lock. [`Refusal::Oversized`] is decided from the
     /// producer's ceiling alone, before occupancy is consulted.
-    #[allow(
-        dead_code,
-        reason = "#253 transition: producers adopt admission in later checkpoints"
-    )]
     pub(crate) fn reserve(
         &self,
         producer: ProducerKind,
@@ -717,10 +713,6 @@ impl HotBuffer {
 
     /// The most `producer` may have charged at once: the full caps for
     /// self-telemetry, [`external_ceiling`] for everything else.
-    #[allow(
-        dead_code,
-        reason = "#253 transition: producers adopt admission in later checkpoints"
-    )]
     pub(crate) fn ceiling(&self, producer: ProducerKind) -> Charge {
         self.ledger.ceiling(producer)
     }
