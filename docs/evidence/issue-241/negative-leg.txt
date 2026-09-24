@@ -1,4 +1,4 @@
-== issue #241 negative leg at 0ffd461ca6f2fda31b263cecffae6cc1fc393d00
+== issue #241 negative leg at 47173ff5758e136bd22fa7d6c70e495983e48526
 
 == leg 1: footer session gate removed
 diff --git i/crates/trawl-web-ui/src/pages/layout.rs w/crates/trawl-web-ui/src/pages/layout.rs
@@ -25,7 +25,7 @@ index 9b6fb391..a8f369c0 100644
     Received: 1
   1 failed
 playwright exit: 1
-verdict basis: one test failed on "harness counted a health request"
+verdict basis: one test failed at line 28 on "harness counted a health request" (received 1)
 leg 1 outcome: fail (expected fail)
 
 == leg 2: footer session gate restored
