@@ -1270,7 +1270,7 @@ impl WalLayerInner {
                 byte_size,
             });
             if let Some(buf) = self.hot_buffer.get() {
-                buf.insert(Arc::clone(&batch));
+                buf.insert_evicting(Arc::clone(&batch));
             }
             if let Some(bus) = self.bus.get() {
                 let _ = bus.publish(batch);

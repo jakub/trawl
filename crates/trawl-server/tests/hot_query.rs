@@ -85,7 +85,7 @@ async fn hot_buffer_makes_events_immediately_queryable() {
         byte_size: ndjson_bytes,
         events: events.clone(),
     });
-    hot_buffer.insert(batch);
+    hot_buffer.insert_evicting(batch);
 
     // --- query BEFORE compaction → events should be visible from hot buffer ---
 
@@ -196,7 +196,7 @@ async fn hot_buffer_and_parquet_produce_no_duplicates() {
         byte_size: ndjson1.len(),
         events: batch1_events,
     });
-    hot_buffer.insert(batch1);
+    hot_buffer.insert_evicting(batch1);
 
     // Compact batch 1 → parquet.
     trawl_server::ingest::compaction::compact_once(
@@ -224,7 +224,7 @@ async fn hot_buffer_and_parquet_produce_no_duplicates() {
         byte_size: ndjson2.len(),
         events: batch2_events,
     });
-    hot_buffer.insert(batch2);
+    hot_buffer.insert_evicting(batch2);
 
     // --- query → should see both batches without duplicates ---
 
@@ -317,7 +317,7 @@ async fn hot_conflict_after_pin_seeding_keeps_all_cold_rows(pool: sqlx::PgPool) 
     // Conflicting hot event — never compacted.
     let mut hot = make_event("nginx", "hot-conflict");
     hot.insert("duration".into(), json!("n/a"));
-    hot_buffer.insert(Arc::new(IngestBatch {
+    hot_buffer.insert_evicting(Arc::new(IngestBatch {
         batch_id: "hot_manual".into(),
         service: "nginx".into(),
         byte_size: 64,
@@ -669,7 +669,7 @@ async fn pinned_where_let_hot_cold_and_stream_agree() {
     wal_writer.ensure_dir().unwrap();
     let ndjson = events_to_ndjson(&events);
     let wal_path = wal_writer.write("prod", "nginx", &ndjson).unwrap();
-    hot_buffer.insert(Arc::new(IngestBatch {
+    hot_buffer.insert_evicting(Arc::new(IngestBatch {
         batch_id: format!("prod/{}", wal_path.file_stem().unwrap().to_str().unwrap()).into(),
         service: "nginx".into(),
         byte_size: ndjson.len(),
@@ -837,7 +837,7 @@ async fn severity_pin_agrees_hot_cold_and_stream() {
     wal_writer.ensure_dir().unwrap();
     let ndjson = events_to_ndjson(&events);
     let wal_path = wal_writer.write("prod", "nginx", &ndjson).unwrap();
-    hot_buffer.insert(Arc::new(IngestBatch {
+    hot_buffer.insert_evicting(Arc::new(IngestBatch {
         batch_id: format!("prod/{}", wal_path.file_stem().unwrap().to_str().unwrap()).into(),
         service: "nginx".into(),
         byte_size: ndjson.len(),

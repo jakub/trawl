@@ -49,7 +49,9 @@ pub(super) fn try_enqueue(
     if sender.try_send(event).is_ok() {
         return true;
     }
-    metrics::counter!(crate::metrics::SYSLOG_EVENTS_DROPPED_TOTAL).increment(1);
+    metrics::counter!(crate::metrics::SYSLOG_EVENTS_DROPPED_TOTAL,
+        "reason" => crate::metrics::SyslogDropReason::QueueFull.label())
+    .increment(1);
     if let Some(stats) = stats {
         stats.dropped.fetch_add(1, Ordering::Relaxed);
     }
@@ -231,6 +233,7 @@ mod tests {
     #[test]
     fn queue_full_and_closed_count_each_abandoned_event_once() {
         use crate::metrics::test_support::sample;
+        const QUEUE_FULL_DROPS: &str = "trawl_syslog_events_dropped_total{reason=\"queue_full\"}";
         let recorder = crate::metrics::prometheus_builder().build_recorder();
         let handle = recorder.handle();
         metrics::with_local_recorder(&recorder, || {
@@ -238,19 +241,13 @@ mod tests {
             let stats = Arc::new(SyslogStats::default());
             let (sender, mut receiver) = mpsc::channel(1);
             assert!(try_enqueue(&sender, make_event("accepted"), Some(&stats)));
-            assert_eq!(
-                sample(&handle, crate::metrics::SYSLOG_EVENTS_DROPPED_TOTAL),
-                0
-            );
+            assert_eq!(sample(&handle, QUEUE_FULL_DROPS), 0);
             for transport in ["tcp", "udp"] {
                 let mut event = make_event("full");
                 event.transport = transport;
                 assert!(!try_enqueue(&sender, event, Some(&stats)));
             }
-            assert_eq!(
-                sample(&handle, crate::metrics::SYSLOG_EVENTS_DROPPED_TOTAL),
-                2
-            );
+            assert_eq!(sample(&handle, QUEUE_FULL_DROPS), 2);
             assert_eq!(receiver.try_recv().unwrap().service, "accepted");
             assert!(receiver.try_recv().is_err());
             drop(receiver);
@@ -259,10 +256,7 @@ mod tests {
                 event.transport = transport;
                 assert!(!try_enqueue(&sender, event, Some(&stats)));
             }
-            assert_eq!(
-                sample(&handle, crate::metrics::SYSLOG_EVENTS_DROPPED_TOTAL),
-                4
-            );
+            assert_eq!(sample(&handle, QUEUE_FULL_DROPS), 4);
             assert_eq!(stats.dropped.load(Ordering::Relaxed), 4);
             assert_eq!(
                 sample(&handle, crate::metrics::SYSLOG_WAL_EVENTS_DISCARDED_TOTAL),
