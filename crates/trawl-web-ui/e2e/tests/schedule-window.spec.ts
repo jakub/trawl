@@ -244,6 +244,30 @@ test('Run now in a row is disabled while its request is in flight', async ({ pag
   expect(await capturedRunRequests(request)).toEqual([SCHEDULE.fixedNetId]);
 });
 
+test('Run now in the drawer is disabled while its request is in flight', async ({ page, request }) => {
+  await resetScenario(request, 'schedule');
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  await page.route(`**/api/v1/saved/${SCHEDULE.windowedNetId}/run`, async (route) => {
+    await held;
+    await route.continue();
+  });
+
+  await page.goto(`/jobs/nets?net=${SCHEDULE.windowedNetId}&ntab=query`);
+  const action = page
+    .locator(SEL.drawerPanel)
+    .getByRole('button', { name: COPY.netRunNow, exact: true });
+  await action.click();
+  await expect(action).toBeDisabled();
+
+  release();
+  await expect(action).toBeEnabled();
+  await expect(page.locator(SEL.toastSuccess).locator('.title')).toHaveText(
+    nameFrom(COPY.runStartedToast, '09:55', '11:15'),
+  );
+  expect(await capturedRunRequests(request)).toEqual([SCHEDULE.windowedNetId]);
+});
+
 test('Run now of a query-mode schedule claims no window', async ({ page, request }) => {
   await resetScenario(request, 'schedule');
   await page.goto('/jobs/nets');
