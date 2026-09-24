@@ -373,6 +373,61 @@ mod tests {
         conn.execute_batch(&sql).unwrap();
     }
 
+    /// What the pinned `DuckDB` writes for each of its timestamp types. The
+    /// timestamp sample tests below rest on these annotations: every naive
+    /// type is written NOT adjusted to UTC (so its sample has no `Z`), only
+    /// `TIMESTAMPTZ` is adjusted, `TIMESTAMP_S` is widened to microseconds,
+    /// and there is no UTC-adjusted milli or nano type to write.
+    #[test]
+    fn duckdb_timestamp_types_carry_these_parquet_annotations() {
+        use parquet::basic::{ConvertedType, LogicalType, TimeUnit};
+        const LEGACY_MICROS: ConvertedType = ConvertedType::TIMESTAMP_MICROS;
+        const LEGACY_MILLIS: ConvertedType = ConvertedType::TIMESTAMP_MILLIS;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("types.parquet");
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        write_parquet(
+            &conn,
+            &path,
+            "SELECT TIMESTAMP '2026-01-02 03:04:05' AS ts, \
+                    TIMESTAMPTZ '2026-01-02 03:04:05+00' AS tstz, \
+                    TIMESTAMP_MS '2026-01-02 03:04:05' AS tms, \
+                    TIMESTAMP_NS '2026-01-02 03:04:05' AS tns, \
+                    TIMESTAMP_S '2026-01-02 03:04:05' AS tsec",
+        );
+
+        let file = File::open(&path).unwrap();
+        let reader = SerializedFileReader::new(file).unwrap();
+        let schema = reader.metadata().file_metadata().schema_descr();
+        let seen: Vec<_> = schema
+            .columns()
+            .iter()
+            .map(|c| {
+                let Some(LogicalType::Timestamp(ts)) = c.logical_type_ref() else {
+                    panic!("{} carries no timestamp logical type", c.name());
+                };
+                (
+                    c.name().to_owned(),
+                    ts.unit,
+                    ts.is_adjusted_to_u_t_c,
+                    c.converted_type(),
+                )
+            })
+            .collect();
+        let want = |name: &str, unit, utc, converted| (name.to_owned(), unit, utc, converted);
+        assert_eq!(
+            seen,
+            vec![
+                want("ts", TimeUnit::MICROS, false, LEGACY_MICROS),
+                want("tstz", TimeUnit::MICROS, true, LEGACY_MICROS),
+                want("tms", TimeUnit::MILLIS, false, LEGACY_MILLIS),
+                want("tns", TimeUnit::NANOS, false, ConvertedType::NONE),
+                want("tsec", TimeUnit::MICROS, false, LEGACY_MICROS),
+            ]
+        );
+    }
+
     #[test]
     fn reads_counts_and_typed_minmax_from_duckdb_parquet() {
         let dir = tempfile::tempdir().unwrap();
