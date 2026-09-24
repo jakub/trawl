@@ -4132,9 +4132,10 @@ async fn schedule_response_carries_window_fields() {
 /// Ruling 11: a run records the window it covered, and a run that had none
 /// omits all four fields rather than claiming a complete window of nothing.
 #[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // one listing, every run shape it carries
 async fn run_listing_carries_window_and_truncated_flag() {
     use trawl_server::report_window::{ReportWindow, WindowKind};
-    use trawl_server::store::{RunClaim, RunStatus, ScheduleStore};
+    use trawl_server::store::{DueClaim, RunClaim, RunStatus, ScheduleStore};
 
     let server = setup().await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
@@ -4148,9 +4149,29 @@ async fn run_listing_carries_window_and_truncated_flag() {
         .await
         .unwrap();
 
-    // Seed the runs through the store: the point here is the read surface,
-    // and driving a tick would put a clock between the test and its
-    // assertions.
+    // One run through the scheduler's own claim, so the origin it writes
+    // is the one the wire reports.
+    let DueClaim::Started(ticked) = tick(&server, schedule.id, now_micros() + minutes(120)).await
+    else {
+        panic!("a tick two hours past the anchor must start a run");
+    };
+    tick_store(&server)
+        .await
+        .finish_run(
+            ticked.run_id,
+            RunStatus::Success,
+            5,
+            Some(0),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Seed the fixed-window runs through the store's test door: the point
+    // here is the read surface, and a tick plans its window from the clock,
+    // which would put a clock between the test and its assertions.
     let store = ScheduleStore::new(common::app_pool(&server.app_db_url).await);
     let instant = |text: &str| {
         chrono::DateTime::parse_from_rfc3339(text)
@@ -4219,11 +4240,14 @@ async fn run_listing_carries_window_and_truncated_flag() {
         "false is the positive claim that the run covers everything it owed"
     );
     assert_eq!(complete.window_kind.as_deref(), Some("since_last"));
+
+    let ticked = row(ticked.run_id);
     assert_eq!(
-        complete.origin.as_deref(),
+        ticked.origin.as_deref(),
         Some("scheduled"),
         "a run claimed through the scheduler's door says so on the wire"
     );
+    assert_eq!(ticked.window_kind.as_deref(), Some("since_last"));
 
     assert_eq!(row(truncated).window_truncated, Some(true));
 

@@ -25,8 +25,9 @@
 //! implicit lock in order.
 //!
 //! - the no-concurrent-run guard is the partial unique index
-//!   `report_runs_one_running`; [`ScheduleStore::claim_run`] maps the named
-//!   23505 to [`RunClaim::AlreadyRunning`];
+//!   `report_runs_one_running`; every claim maps the named 23505 to its own
+//!   already-running answer ([`DueClaim::AlreadyRunning`],
+//!   [`ManualRunClaim::AlreadyRunning`], [`RunClaim::AlreadyRunning`]);
 //! - every claim's `max_runs` check joins the run insert in one
 //!   transaction (`FOR UPDATE` on the schedule row), manual runs included
 //!   ([`ScheduleStore::claim_manual_run`]);
@@ -871,8 +872,8 @@ impl ScheduleStore {
     /// Delete a schedule by its saved query id, collecting the parquet paths
     /// of its runs in the same transaction (cascade wipes the rows).
     ///
-    /// Lock the schedule before its runs, as [`Self::claim_run`] does after
-    /// locking the saved query. `FOR UPDATE` also blocks a concurrent run
+    /// Lock the schedule before its runs, as every claim does after locking
+    /// the saved query. `FOR UPDATE` also blocks a concurrent run
     /// INSERT via its FK `FOR KEY SHARE`. Then lock every one of its
     /// `report_runs`. Locking all run rows, not
     /// just those with a non-null `result_path`, forces a concurrent
@@ -1009,17 +1010,22 @@ impl ScheduleStore {
         Ok(u64::try_from(count).unwrap_or_default())
     }
 
-    /// Claim a run in one transaction. Lock the saved query, then the schedule,
-    /// enforce `max_runs`, and insert the running row. Concurrent claims cannot
+    /// Claim a run with a caller-chosen query and window, in one
+    /// transaction. Lock the saved query, then the schedule, enforce
+    /// `max_runs`, and insert the running row. Concurrent claims cannot
     /// exceed the cap.
     ///
-    /// `window` is the interval the run is about to cover, recorded on the
-    /// row at claim time because that is when it is decided. `None` writes
-    /// all three bound columns NULL: the query owns its own time clause and
-    /// trawl claims no coverage for it.
+    /// No production path calls this. It is the seeding door for tests
+    /// that need a run row with exact contents: the scheduler claims
+    /// through [`Self::claim_due_run`], which plans its window from the
+    /// fire cursor, and an operator through [`Self::claim_manual_run`].
+    /// It shares their lock order, their cap check and their insert, so a
+    /// row it writes is shaped like theirs.
     ///
-    /// The row records origin `scheduled`. An operator's run goes through
-    /// [`Self::claim_manual_run`], which plans its own window.
+    /// `window` is recorded on the row as given. `None` writes all the
+    /// window columns NULL, the shape of a query-mode run. The row records
+    /// origin `scheduled` and an application-clock `started_at`, like a
+    /// scheduler claim.
     pub async fn claim_run(
         &self,
         schedule_id: i64,
@@ -1292,7 +1298,8 @@ impl ScheduleStore {
     /// that passed mid-poll. The run row's `started_at` is the one clock
     /// reading this claim takes, from the application clock once the locks
     /// are held, because it records when the run started rather than what
-    /// the tick planned against (see [`insert_running_run`]).
+    /// the tick planned against; the module docs say why runs share one
+    /// clock.
     ///
     /// LOCK ORDER: `saved_queries` -> `schedules` -> `report_runs`, the
     /// order every multi-row path in this module takes, extended one level
@@ -1473,9 +1480,9 @@ impl ScheduleStore {
         let mut tx = self.pool.begin().await?;
 
         // Schedule before run, the order every multi-row path here takes:
-        // `claim_run` and `delete_schedule` both lock the schedule before runs, so
-        // updating the run first and reaching for the schedule afterwards
-        // would let this transaction deadlock against either of them.
+        // every claim and `delete_schedule` lock the schedule before runs,
+        // so updating the run first and reaching for the schedule afterwards
+        // would let this transaction deadlock against any of them.
         // `FOR UPDATE OF s` locks the schedule alone — the join reads the
         // run without locking it, which is what keeps the order intact.
         //
