@@ -1964,7 +1964,7 @@ installation.
 | `published` | The canonical output carries the recorded identity. Recovery retired the consumed WAL files and removed the marker |
 | `unpublished` | The output was never renamed into place. Recovery removed the marker and the temporary output, and kept the WAL for the next compaction |
 | `contradictory` | The evidence contradicts itself, for example a canonical output with another identity and no temporary output. Recovery touched nothing, and the service stays blocked |
-| `failed` | A filesystem error stopped recovery of one marker. The marker stays, the service stays blocked, and the next tick retries |
+| `failed` | A filesystem error stopped recovery of one marker. While the marker remains, the service stays blocked and the next tick retries. An error after recovery already removed the marker, such as a failed delete of the temporary output, leaves nothing to retry: the WAL is kept for the next compaction and stale temporary-file cleanup removes the output |
 
 Each `contradictory` or `failed` outcome also counts once in
 `CompactionStats.total_errors` for that tick. A `contradictory` marker

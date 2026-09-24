@@ -466,8 +466,12 @@ daily rollup of that day, and retention of that date. A repin cutover is
 refused. [Crash recovery](/architecture/recovery/) describes the protocol.
 
 - `failed`: a filesystem error stopped recovery of one marker, for example a
-  WAL directory where the consumed files cannot be removed. The next tick
-  retries it. Each retry that fails counts again.
+  WAL directory where the consumed files cannot be removed. Check whether
+  the marker still exists: while it does, the service stays blocked and the
+  next tick retries it, and each retry that fails counts again. If recovery
+  had already removed the marker, for example before a failed delete of the
+  temporary output, nothing is retried; the WAL is kept for the next
+  compaction and stale temporary-file cleanup removes the output.
 - `contradictory`: the evidence contradicts itself. For example, the
   canonical parquet file does not carry the identity the marker recorded,
   and the temporary output is gone. Recovery touches nothing and counts the
