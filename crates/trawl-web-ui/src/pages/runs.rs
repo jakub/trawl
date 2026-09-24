@@ -452,6 +452,14 @@ fn RunDetail(
     // and the receipt says so by staying empty.
     let shown = Signal::derive(move || read.get().and_then(|r| r.settle(known_listing.get())));
     let title = move || known_name.get().unwrap_or_else(|| format!("Run {run_id}"));
+    // The dialog's name is the run and its net, never the status badge
+    // the title slot carries beside the heading.
+    let label = Signal::derive(move || {
+        known_name.get().map_or_else(
+            || format!("Run {run_id}"),
+            |net| format!("Run {run_id}, {net}"),
+        )
+    });
     let status = move || shown.get().map(|s| s.status);
     let duration = move || {
         shown
@@ -467,7 +475,7 @@ fn RunDetail(
     };
 
     view! {
-        <Drawer tabs=vec![] tabs_label="Run details" active_tab=Signal::stored(String::new())
+        <Drawer tabs=vec![] tabs_label="Run details" label=label active_tab=Signal::stored(String::new())
             on_tab_change=Callback::new(|_| {}) on_close=on_close docked=docked
             panel_class="run-detail" close_size=12
             title=Box::new(move || view! {

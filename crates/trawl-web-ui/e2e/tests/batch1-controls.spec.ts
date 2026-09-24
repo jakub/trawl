@@ -35,7 +35,7 @@ for (const colorScheme of ['light', 'dark'] as const) {
     await selectTheme(page, colorScheme === 'dark' ? 'Dark' : 'Light');
     await page.goto(`/jobs/nets?net=${CORPUS.netId}&ntab=query`);
     await expect(page.locator('html')).toHaveAttribute('data-theme', colorScheme);
-    const drawer = page.getByRole('dialog', { name: /errors by host/ });
+    const drawer = page.getByRole('dialog', { name: CORPUS.netName, exact: true });
     await expect(drawer).toBeVisible();
     await drawer.getByRole('button', { name: 'Edit', exact: true }).click();
     await expect(drawer.getByRole('textbox', { name: 'Query', exact: true })).toBeVisible();

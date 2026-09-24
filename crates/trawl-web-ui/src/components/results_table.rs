@@ -248,12 +248,14 @@ fn InspectorPanel(
     let raw_actions = capabilities.raw_actions();
     let row_for_actions = row.clone();
     let columns_for_actions = columns.clone();
+    let heading = format!("Event {}", idx + 1);
 
     view! {
         <Drawer
             docked=true
             tabs=vec![]
             tabs_label="Event details"
+            label=heading.clone()
             active_tab=Signal::derive(String::new)
             on_tab_change=Callback::new(|_: String| ())
             on_close=on_close
@@ -261,7 +263,7 @@ fn InspectorPanel(
             panel_id="search-inspector"
             panel_class="inspector"
             title=Box::new(move || view! {
-                <span class="name">{format!("Event {}", idx + 1)}</span>
+                <span class="name">{heading}</span>
                 {time_text.map(|t| view! { <span class="sub">{t}</span> })}
             }.into_any())
         >

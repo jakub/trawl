@@ -1,0 +1,13 @@
+# probe of 93c96a4a03a08059f28d23a9b20aa857a536e79f:crates/trawl-web-ui/e2e/tests/drawer-names.spec.ts against e2e-artifacts/main-dist
+PROBE expected "errors by host" -> dialog "Rename errors by host":
+PROBE expected "errors by host" -> dialog "Rename errors by host":
+PROBE expected "errors by host" -> dialog "errors by service":
+PROBE expected "errors by service" -> dialog "Rename errors by service":
+PROBE expected "errors by host" -> dialog "Rename errors by host":
+PROBE expected "Deleted net" -> dialog "Rename deleted net":
+PROBE expected "Run 501, errors by host" -> dialog "errors by host Succeeded":
+PROBE expected "Run 9999" -> dialog "Run 9999 Succeeded":
+PROBE expected "duration" -> dialog "Back to nginx duration":
+PROBE expected "nginx" -> dialog "nginx 2026-09-01":
+PROBE expected "Event 2" -> dialog "Event 2 2026-09-01T10:01:00.000000Z":
+  8 passed (7.7s)

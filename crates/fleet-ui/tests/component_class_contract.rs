@@ -877,6 +877,47 @@ fn drawer_is_an_honest_non_modal_dialog() {
 }
 
 #[test]
+fn drawer_names_its_dialog_from_a_required_label() {
+    // The dialog's name is the bare entity name the consumer passes, not
+    // the text of the title slot: consumers put rename buttons, status
+    // badges and Back links there, and each one leaked into the name
+    // ("Rename errors by host", "errors by host success"). ADR-0028.
+    let markup = markup_only(DRAWER);
+    let signature = markup
+        .split_once("pub fn Drawer(")
+        .expect("Drawer is a component function")
+        .1
+        .split_once(") -> impl IntoView")
+        .expect("Drawer's parameter list closes")
+        .0;
+    let lines: Vec<&str> = signature.lines().map(str::trim).collect();
+    let at = lines
+        .iter()
+        .position(|line| *line == "label: Signal<String>,")
+        .expect("Drawer must declare `label: Signal<String>` — reactive, so a landed rename renames the dialog");
+    assert_eq!(
+        lines.get(at.wrapping_sub(1)).copied(),
+        Some("#[prop(into)]"),
+        "Drawer's `label` must be required: `#[prop(into)]` alone, with no \
+         optional or default — the compiler is what stops the next drawer \
+         from naming its dialog from the title slot"
+    );
+    assert!(
+        markup.contains("aria-label=move || label.get()"),
+        "the panel must take its aria-label from the `label` prop"
+    );
+    assert!(
+        !markup.contains("aria-labelledby"),
+        "the drawer must not point aria-labelledby anywhere — the title \
+         slot is visual and never names the dialog"
+    );
+    assert!(
+        !markup.contains("title_id") && markup.contains(r#"<div class="sd-ttl">{title()}</div>"#),
+        "the title slot carries no id: it existed only to name the dialog"
+    );
+}
+
+#[test]
 fn icon_ships_the_slice_d_glyphs_and_the_crate_doc_is_honest() {
     // Document / Upload / Copy, and the sidebar's Menu / PanelLeft,
     // belong to the closed enum, each with an icon_body arm in house

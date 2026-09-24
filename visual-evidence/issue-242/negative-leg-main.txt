@@ -1,0 +1,429 @@
+# Issue #242 negative leg: this branch's drawer-name assertions against a build of main
+#
+# SPA under test: 656e7622d82e86e3f18d5542ae76e8a01046059a (origin/main when this branch started),
+#   built before any edit, from crates/trawl-web-ui: env -u NO_COLOR trunk build --release --dist $WT/e2e-artifacts/main-dist
+# Specs run: from branch commit 93c96a4a03a08059f28d23a9b20aa857a536e79f (test(web-ui): pin each drawer's accessible name)
+# Browser: chromium from @playwright/test 1.62.1, stub harness e2e/harness/server.mjs, scenario corpus
+# Command, from crates/trawl-web-ui/e2e:
+#   TRAWL_E2E_DIST=$WT/e2e-artifacts/main-dist E2E_PORT=8172 npx playwright test tests/drawer-names.spec.ts tests/batch1-controls.spec.ts:31 --workers=1 --reporter=list
+# Date: 2026-09-24T03:42:24Z
+
+
+Running 10 tests using 1 worker
+
+  ✘   1 [chromium] › tests/batch1-controls.spec.ts:31:7 › schedule names, helper and visible switch focus in light (5.5s)
+  ✘   2 [chromium] › tests/batch1-controls.spec.ts:31:7 › schedule names, helper and visible switch focus in dark (5.5s)
+  ✘   3 [chromium] › tests/drawer-names.spec.ts:23:5 › the net drawer is named after the net while viewing (5.4s)
+  ✘   4 [chromium] › tests/drawer-names.spec.ts:30:5 › the net drawer keeps the saved name while renaming and follows a landed rename (5.3s)
+  ✘   5 [chromium] › tests/drawer-names.spec.ts:77:5 › a net deleted under an open drawer names it Deleted net (5.3s)
+  ✘   6 [chromium] › tests/drawer-names.spec.ts:96:5 › the run drawer is named after the run and its net, not its status (5.4s)
+  ✘   7 [chromium] › tests/drawer-names.spec.ts:105:5 › a run whose net name is unknown is named by its id alone (5.4s)
+  ✘   8 [chromium] › tests/drawer-names.spec.ts:117:5 › a field case opened from a service is named after the field alone (5.4s)
+  ✘   9 [chromium] › tests/drawer-names.spec.ts:124:5 › the service drawer is named after the service (5.4s)
+  ✘  10 [chromium] › tests/drawer-names.spec.ts:131:5 › the event inspector is named after the event (5.8s)
+
+
+  1) [chromium] › tests/batch1-controls.spec.ts:31:7 › schedule names, helper and visible switch focus in light 
+
+    Error: expect(locator).toBeVisible() failed
+
+    Locator: getByRole('dialog', { name: 'errors by host', exact: true })
+    Expected: visible
+    Timeout: 5000ms
+    Error: element(s) not found
+
+    Call log:
+      - Expect "toBeVisible" with timeout 5000ms
+      - waiting for getByRole('dialog', { name: 'errors by host', exact: true })
+
+
+      37 |     await expect(page.locator('html')).toHaveAttribute('data-theme', colorScheme);
+      38 |     const drawer = page.getByRole('dialog', { name: CORPUS.netName, exact: true });
+    > 39 |     await expect(drawer).toBeVisible();
+         |                          ^
+      40 |     await drawer.getByRole('button', { name: 'Edit', exact: true }).click();
+      41 |     await expect(drawer.getByRole('textbox', { name: 'Query', exact: true })).toBeVisible();
+      42 |     await drawer.getByRole('button', { name: '+ Add Schedule', exact: true }).click();
+        at $WT/crates/trawl-web-ui/e2e/tests/batch1-controls.spec.ts:39:26
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    ../../../e2e-artifacts/test-results/batch1-controls-schedule-n-1c1d7-sible-switch-focus-in-light-chromium/attachments/screenshot-f7f3a7fa00e74be2fc0cfe0cdb9d98de16a277a7.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: ../../../e2e-artifacts/test-results/batch1-controls-schedule-n-1c1d7-sible-switch-focus-in-light-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    ../../../e2e-artifacts/test-results/batch1-controls-schedule-n-1c1d7-sible-switch-focus-in-light-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace ../../../e2e-artifacts/test-results/batch1-controls-schedule-n-1c1d7-sible-switch-focus-in-light-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  2) [chromium] › tests/batch1-controls.spec.ts:31:7 › schedule names, helper and visible switch focus in dark 
+
+    Error: expect(locator).toBeVisible() failed
+
+    Locator: getByRole('dialog', { name: 'errors by host', exact: true })
+    Expected: visible
+    Timeout: 5000ms
+    Error: element(s) not found
+
+    Call log:
+      - Expect "toBeVisible" with timeout 5000ms
+      - waiting for getByRole('dialog', { name: 'errors by host', exact: true })
+
+
+      37 |     await expect(page.locator('html')).toHaveAttribute('data-theme', colorScheme);
+      38 |     const drawer = page.getByRole('dialog', { name: CORPUS.netName, exact: true });
+    > 39 |     await expect(drawer).toBeVisible();
+         |                          ^
+      40 |     await drawer.getByRole('button', { name: 'Edit', exact: true }).click();
+      41 |     await expect(drawer.getByRole('textbox', { name: 'Query', exact: true })).toBeVisible();
+      42 |     await drawer.getByRole('button', { name: '+ Add Schedule', exact: true }).click();
+        at $WT/crates/trawl-web-ui/e2e/tests/batch1-controls.spec.ts:39:26
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    ../../../e2e-artifacts/test-results/batch1-controls-schedule-n-be344-isible-switch-focus-in-dark-chromium/attachments/screenshot-3f9b8e81fe9b3a1a71a102a81e7d4c583061e784.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: ../../../e2e-artifacts/test-results/batch1-controls-schedule-n-be344-isible-switch-focus-in-dark-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    ../../../e2e-artifacts/test-results/batch1-controls-schedule-n-be344-isible-switch-focus-in-dark-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace ../../../e2e-artifacts/test-results/batch1-controls-schedule-n-be344-isible-switch-focus-in-dark-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  3) [chromium] › tests/drawer-names.spec.ts:23:5 › the net drawer is named after the net while viewing 
+
+    Error: expect(locator).toBeVisible() failed
+
+    Locator: getByRole('dialog', { name: 'errors by host', exact: true })
+    Expected: visible
+    Timeout: 5000ms
+    Error: element(s) not found
+
+    Call log:
+      - Expect "toBeVisible" with timeout 5000ms
+      - waiting for getByRole('dialog', { name: 'errors by host', exact: true })
+
+
+      25 |   await page.goto(`/jobs/nets?net=${CORPUS.netId}`);
+      26 |   await expect(page.locator(SEL.netRename)).toBeVisible();
+    > 27 |   await expect(dialogNamed(page, CORPUS.netName)).toBeVisible();
+         |                                                   ^
+      28 | });
+      29 |
+      30 | test('the net drawer keeps the saved name while renaming and follows a landed rename', async ({ page, request }) => {
+        at $WT/crates/trawl-web-ui/e2e/tests/drawer-names.spec.ts:27:51
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    ../../../e2e-artifacts/test-results/drawer-names-the-net-drawe-1ed5b-after-the-net-while-viewing-chromium/attachments/screenshot-e73d3ab3c3331893984463eed003cc20b9b3bf9a.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: ../../../e2e-artifacts/test-results/drawer-names-the-net-drawe-1ed5b-after-the-net-while-viewing-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    ../../../e2e-artifacts/test-results/drawer-names-the-net-drawe-1ed5b-after-the-net-while-viewing-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace ../../../e2e-artifacts/test-results/drawer-names-the-net-drawe-1ed5b-after-the-net-while-viewing-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  4) [chromium] › tests/drawer-names.spec.ts:30:5 › the net drawer keeps the saved name while renaming and follows a landed rename 
+
+    Error: expect(locator).toBeVisible() failed
+
+    Locator: getByRole('dialog', { name: 'errors by host', exact: true })
+    Expected: visible
+    Timeout: 5000ms
+    Error: element(s) not found
+
+    Call log:
+      - Expect "toBeVisible" with timeout 5000ms
+      - waiting for getByRole('dialog', { name: 'errors by host', exact: true })
+
+
+      59 |
+      60 |   await page.goto(`/jobs/nets?net=${CORPUS.netId}`);
+    > 61 |   await expect(dialogNamed(page, CORPUS.netName)).toBeVisible();
+         |                                                   ^
+      62 |
+      63 |   await page.locator(SEL.netRename).click();
+      64 |   const input = page.locator(SEL.netRenameInput);
+        at $WT/crates/trawl-web-ui/e2e/tests/drawer-names.spec.ts:61:51
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    ../../../e2e-artifacts/test-results/drawer-names-the-net-drawe-f0d7d-and-follows-a-landed-rename-chromium/attachments/screenshot-ec1e66a7ea07d8966ac0dd1fde6cbe4a95a0fc32.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: ../../../e2e-artifacts/test-results/drawer-names-the-net-drawe-f0d7d-and-follows-a-landed-rename-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    ../../../e2e-artifacts/test-results/drawer-names-the-net-drawe-f0d7d-and-follows-a-landed-rename-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace ../../../e2e-artifacts/test-results/drawer-names-the-net-drawe-f0d7d-and-follows-a-landed-rename-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  5) [chromium] › tests/drawer-names.spec.ts:77:5 › a net deleted under an open drawer names it Deleted net 
+
+    Error: expect(locator).toBeVisible() failed
+
+    Locator: getByRole('dialog', { name: 'errors by host', exact: true })
+    Expected: visible
+    Timeout: 5000ms
+    Error: element(s) not found
+
+    Call log:
+      - Expect "toBeVisible" with timeout 5000ms
+      - waiting for getByRole('dialog', { name: 'errors by host', exact: true })
+
+
+      86 |   });
+      87 |   await page.goto(`/jobs/nets?net=${CORPUS.netId}`);
+    > 88 |   await expect(dialogNamed(page, CORPUS.netName)).toBeVisible();
+         |                                                   ^
+      89 |
+      90 |   deleted = true;
+      91 |   const drawer = page.locator(SEL.drawerPanel);
+        at $WT/crates/trawl-web-ui/e2e/tests/drawer-names.spec.ts:88:51
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    ../../../e2e-artifacts/test-results/drawer-names-a-net-deleted-e6897-drawer-names-it-Deleted-net-chromium/attachments/screenshot-facc598b0e92223713c4235fcc82fd04b146c50c.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: ../../../e2e-artifacts/test-results/drawer-names-a-net-deleted-e6897-drawer-names-it-Deleted-net-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    ../../../e2e-artifacts/test-results/drawer-names-a-net-deleted-e6897-drawer-names-it-Deleted-net-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace ../../../e2e-artifacts/test-results/drawer-names-a-net-deleted-e6897-drawer-names-it-Deleted-net-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  6) [chromium] › tests/drawer-names.spec.ts:96:5 › the run drawer is named after the run and its net, not its status 
+
+    Error: expect(locator).toBeVisible() failed
+
+    Locator: getByRole('dialog', { name: 'Run 501, errors by host', exact: true })
+    Expected: visible
+    Timeout: 5000ms
+    Error: element(s) not found
+
+    Call log:
+      - Expect "toBeVisible" with timeout 5000ms
+      - waiting for getByRole('dialog', { name: 'Run 501, errors by host', exact: true })
+
+
+      100 |   // there: the badge must be beside the name, not inside it.
+      101 |   await expect(page.locator(`${SEL.runDetail} ${SEL.drawerTitle} .bdg`)).toBeVisible();
+    > 102 |   await expect(dialogNamed(page, `Run ${CORPUS.runWithResult}, ${CORPUS.netName}`)).toBeVisible();
+          |                                                                                     ^
+      103 | });
+      104 |
+      105 | test('a run whose net name is unknown is named by its id alone', async ({ page, request }) => {
+        at $WT/crates/trawl-web-ui/e2e/tests/drawer-names.spec.ts:102:85
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    ../../../e2e-artifacts/test-results/drawer-names-the-run-drawe-1506a--and-its-net-not-its-status-chromium/attachments/screenshot-7ad84deb17d44e5d1dac427fc1c6b3329b5d96e4.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: ../../../e2e-artifacts/test-results/drawer-names-the-run-drawe-1506a--and-its-net-not-its-status-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    ../../../e2e-artifacts/test-results/drawer-names-the-run-drawe-1506a--and-its-net-not-its-status-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace ../../../e2e-artifacts/test-results/drawer-names-the-run-drawe-1506a--and-its-net-not-its-status-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  7) [chromium] › tests/drawer-names.spec.ts:105:5 › a run whose net name is unknown is named by its id alone 
+
+    Error: expect(locator).toBeVisible() failed
+
+    Locator: getByRole('dialog', { name: 'Run 9999', exact: true })
+    Expected: visible
+    Timeout: 5000ms
+    Error: element(s) not found
+
+    Call log:
+      - Expect "toBeVisible" with timeout 5000ms
+      - waiting for getByRole('dialog', { name: 'Run 9999', exact: true })
+
+
+      112 |   await expect(detail.locator(`${SEL.drawerTitle} .bdg`)).toBeVisible();
+      113 |   await expect(detail.locator(`${SEL.drawerTitle} .name`)).toHaveText(`Run ${runId}`);
+    > 114 |   await expect(dialogNamed(page, `Run ${runId}`)).toBeVisible();
+          |                                                   ^
+      115 | });
+      116 |
+      117 | test('a field case opened from a service is named after the field alone', async ({ page, request }) => {
+        at $WT/crates/trawl-web-ui/e2e/tests/drawer-names.spec.ts:114:51
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    ../../../e2e-artifacts/test-results/drawer-names-a-run-whose-n-8588e-wn-is-named-by-its-id-alone-chromium/attachments/screenshot-d26eb4c84be54401c6c8aab24ca949b86c58a6c9.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: ../../../e2e-artifacts/test-results/drawer-names-a-run-whose-n-8588e-wn-is-named-by-its-id-alone-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    ../../../e2e-artifacts/test-results/drawer-names-a-run-whose-n-8588e-wn-is-named-by-its-id-alone-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace ../../../e2e-artifacts/test-results/drawer-names-a-run-whose-n-8588e-wn-is-named-by-its-id-alone-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  8) [chromium] › tests/drawer-names.spec.ts:117:5 › a field case opened from a service is named after the field alone 
+
+    Error: expect(locator).toBeVisible() failed
+
+    Locator: getByRole('dialog', { name: 'duration', exact: true })
+    Expected: visible
+    Timeout: 5000ms
+    Error: element(s) not found
+
+    Call log:
+      - Expect "toBeVisible" with timeout 5000ms
+      - waiting for getByRole('dialog', { name: 'duration', exact: true })
+
+
+      119 |   await page.goto(`/search/schema?field=duration&svc=${CORPUS.service}&stab=fields`);
+      120 |   await expect(page.getByRole('button', { name: `Back to ${CORPUS.service}`, exact: true })).toBeVisible();
+    > 121 |   await expect(dialogNamed(page, 'duration')).toBeVisible();
+          |                                               ^
+      122 | });
+      123 |
+      124 | test('the service drawer is named after the service', async ({ page, request }) => {
+        at $WT/crates/trawl-web-ui/e2e/tests/drawer-names.spec.ts:121:47
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    ../../../e2e-artifacts/test-results/drawer-names-a-field-case--312f4-named-after-the-field-alone-chromium/attachments/screenshot-83f4ba35be0c3155f5ce340dea9fce4d61174fe0.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: ../../../e2e-artifacts/test-results/drawer-names-a-field-case--312f4-named-after-the-field-alone-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    ../../../e2e-artifacts/test-results/drawer-names-a-field-case--312f4-named-after-the-field-alone-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace ../../../e2e-artifacts/test-results/drawer-names-a-field-case--312f4-named-after-the-field-alone-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  9) [chromium] › tests/drawer-names.spec.ts:124:5 › the service drawer is named after the service ─
+
+    Error: expect(locator).toBeVisible() failed
+
+    Locator: getByRole('dialog', { name: 'nginx', exact: true })
+    Expected: visible
+    Timeout: 5000ms
+    Error: element(s) not found
+
+    Call log:
+      - Expect "toBeVisible" with timeout 5000ms
+      - waiting for getByRole('dialog', { name: 'nginx', exact: true })
+
+
+      126 |   await page.goto(`/search/schema?svc=${CORPUS.service}`);
+      127 |   await expect(page.locator(`${SEL.drawerTitle} .sub`)).toBeVisible();
+    > 128 |   await expect(dialogNamed(page, CORPUS.service)).toBeVisible();
+          |                                                   ^
+      129 | });
+      130 |
+      131 | test('the event inspector is named after the event', async ({ page, request }) => {
+        at $WT/crates/trawl-web-ui/e2e/tests/drawer-names.spec.ts:128:51
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    ../../../e2e-artifacts/test-results/drawer-names-the-service-drawer-is-named-after-the-service-chromium/attachments/screenshot-fea492870ff4174a983a24f9285f7d004ae20e88.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: ../../../e2e-artifacts/test-results/drawer-names-the-service-drawer-is-named-after-the-service-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    ../../../e2e-artifacts/test-results/drawer-names-the-service-drawer-is-named-after-the-service-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace ../../../e2e-artifacts/test-results/drawer-names-the-service-drawer-is-named-after-the-service-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  10) [chromium] › tests/drawer-names.spec.ts:131:5 › the event inspector is named after the event ─
+
+    Error: expect(locator).toBeVisible() failed
+
+    Locator: getByRole('dialog', { name: 'Event 2', exact: true })
+    Expected: visible
+    Timeout: 5000ms
+    Error: element(s) not found
+
+    Call log:
+      - Expect "toBeVisible" with timeout 5000ms
+      - waiting for getByRole('dialog', { name: 'Event 2', exact: true })
+
+
+      139 |   await page.locator(SEL.resultsExpandControl).nth(1).click();
+      140 |   await expect(page.locator(`${SEL.inspector} ${SEL.drawerTitle} .sub`)).toBeVisible();
+    > 141 |   await expect(dialogNamed(page, 'Event 2')).toBeVisible();
+          |                                              ^
+      142 | });
+      143 |
+        at $WT/crates/trawl-web-ui/e2e/tests/drawer-names.spec.ts:141:46
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    ../../../e2e-artifacts/test-results/drawer-names-the-event-inspector-is-named-after-the-event-chromium/attachments/screenshot-e403ce84a31bd8d3a9bf9dc3c4ae81157cbb9b29.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: ../../../e2e-artifacts/test-results/drawer-names-the-event-inspector-is-named-after-the-event-chromium/error-context.md
+
+    attachment #3: trace (application/zip) ─────────────────────────────────────────────────────────
+    ../../../e2e-artifacts/test-results/drawer-names-the-event-inspector-is-named-after-the-event-chromium/trace.zip
+    Usage:
+
+        npx playwright show-trace ../../../e2e-artifacts/test-results/drawer-names-the-event-inspector-is-named-after-the-event-chromium/trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+  10 failed
+    [chromium] › tests/batch1-controls.spec.ts:31:7 › schedule names, helper and visible switch focus in light 
+    [chromium] › tests/batch1-controls.spec.ts:31:7 › schedule names, helper and visible switch focus in dark 
+    [chromium] › tests/drawer-names.spec.ts:23:5 › the net drawer is named after the net while viewing 
+    [chromium] › tests/drawer-names.spec.ts:30:5 › the net drawer keeps the saved name while renaming and follows a landed rename 
+    [chromium] › tests/drawer-names.spec.ts:77:5 › a net deleted under an open drawer names it Deleted net 
+    [chromium] › tests/drawer-names.spec.ts:96:5 › the run drawer is named after the run and its net, not its status 
+    [chromium] › tests/drawer-names.spec.ts:105:5 › a run whose net name is unknown is named by its id alone 
+    [chromium] › tests/drawer-names.spec.ts:117:5 › a field case opened from a service is named after the field alone 
+    [chromium] › tests/drawer-names.spec.ts:124:5 › the service drawer is named after the service ──
+    [chromium] › tests/drawer-names.spec.ts:131:5 › the event inspector is named after the event ───
+# exit status: 1
+
+# Dialog names observed on main, from each failure's ARIA snapshot:
+#   for d in $WT/e2e-artifacts/test-results/*/; do grep -h 'dialog "' $d/error-context.md; done
+batch1-controls-schedule-n-1c1d7-sible-switch-focus-in-light-chromium
+      - dialog "Rename errors by host":
+batch1-controls-schedule-n-be344-isible-switch-focus-in-dark-chromium
+      - dialog "Rename errors by host":
+drawer-names-a-field-case--312f4-named-after-the-field-alone-chromium
+      - dialog "Back to nginx duration":
+drawer-names-a-net-deleted-e6897-drawer-names-it-Deleted-net-chromium
+      - dialog "Rename errors by host":
+drawer-names-a-run-whose-n-8588e-wn-is-named-by-its-id-alone-chromium
+      - dialog "Run 9999 Succeeded":
+drawer-names-the-event-inspector-is-named-after-the-event-chromium
+      - dialog "Event 2 2026-09-01T10:01:00.000000Z":
+drawer-names-the-net-drawe-1ed5b-after-the-net-while-viewing-chromium
+      - dialog "Rename errors by host":
+drawer-names-the-net-drawe-f0d7d-and-follows-a-landed-rename-chromium
+      - dialog "Rename errors by host":
+drawer-names-the-run-drawe-1506a--and-its-net-not-its-status-chromium
+      - dialog "errors by host Succeeded":
+drawer-names-the-service-drawer-is-named-after-the-service-chromium
+      - dialog "nginx 2026-09-01":

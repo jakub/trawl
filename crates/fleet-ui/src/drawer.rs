@@ -12,6 +12,12 @@
 //! scrolling body. Pane content, tab-switching state, and the title's
 //! inner markup stay app-owned.
 //!
+//! **Name.** The panel is `role="dialog"` in both presentations, and the
+//! required `label` names it: the bare name of the thing the drawer
+//! shows. The title slot is visual only and never names the dialog,
+//! because consumers fill it with buttons, badges and links whose text
+//! would otherwise become part of the name (ADR-0028).
+//!
 //! **Presentation.** `docked` picks it. Undocked (the default) is the
 //! right-slide overlay: a scrim host, a `Capture`
 //! [`overlay`](crate::overlay) layer, initial focus into the panel and
@@ -48,7 +54,8 @@ use crate::overlay::{
 };
 use crate::tabs::{TabItem, Tabs, TabsStyle};
 
-/// Drawer shell. `title` fills `.sd-ttl`; `actions` fills `.sd-actions`
+/// Drawer shell. `label` names the dialog; `title` fills `.sd-ttl`,
+/// which is visual only; `actions` fills `.sd-actions`
 /// ahead of the built-in close button (pass `<Btn>`s); `children` fills
 /// `.sd-body`. Slots use the same boxed-closure idiom as
 /// [`Shell`](crate::Shell)'s footer. `meta` renders trailing text in the
@@ -63,6 +70,13 @@ pub fn Drawer(
     /// that knows what its strip is a list of.
     #[prop(into)]
     tabs_label: String,
+    /// Names the dialog for assistive technology with the bare name of
+    /// the entity it shows ("errors by host", "nginx", "Event 3").
+    /// Required, and the only source of the name: the title slot is
+    /// visual and never names the dialog (ADR-0028). Reactive, so a
+    /// landed rename renames the dialog.
+    #[prop(into)]
+    label: Signal<String>,
     #[prop(into)] active_tab: Signal<String>,
     on_tab_change: Callback<String>,
     on_close: Callback<()>,
@@ -91,12 +105,6 @@ pub fn Drawer(
     #[prop(optional)] actions: Option<Children>,
     children: Children,
 ) -> impl IntoView {
-    thread_local! { static NEXT_TITLE_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
-    let title_id = NEXT_TITLE_ID.with(|next| {
-        let id = next.get();
-        next.set(id + 1);
-        format!("fleet-drawer-title-{id}")
-    });
     let scrim_ref = NodeRef::<Div>::new();
     let panel_ref = NodeRef::<Div>::new();
 
@@ -163,12 +171,12 @@ pub fn Drawer(
                 class=(panel_class.unwrap_or_default(), panel_class.is_some())
                 id=panel_id
                 role="dialog"
-                aria-labelledby=title_id.clone()
+                aria-label=move || label.get()
                 tabindex="-1"
                 node_ref=panel_ref
             >
                 <div class="sd-hd">
-                    <div class="sd-ttl" id=title_id.clone()>{title()}</div>
+                    <div class="sd-ttl">{title()}</div>
                     <div class="sd-actions">
                         {actions.map(|a| a())}
                         // A native button, not a styled span: the close
