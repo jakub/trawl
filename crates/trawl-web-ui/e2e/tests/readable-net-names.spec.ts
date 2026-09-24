@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MPL-2.0
 import { test, expect, resetScenario, capturedSavedRequests, CORPUS } from '../fixtures';
-import { SEL } from '../selectors';
+import { SEL, COPY } from '../selectors';
 
 test('readable net names preserve punctuation and show bounded refusals', async ({ page, request }) => {
   await resetScenario(request, 'saved-success');
   await page.goto('/search');
-  await page.locator(SEL.saveAction).click();
+  await page.locator(SEL.editorTool).filter({ hasText: COPY.saveAsNetTool }).click();
   const dialog = page.getByRole('dialog', { name: 'Save query as Net', exact: true });
   const input = dialog.getByLabel('Name', { exact: true });
   const save = dialog.getByRole('button', { name: 'Save as Net', exact: true });

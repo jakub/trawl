@@ -252,6 +252,5 @@ test('no truncation affordance remains', async ({ page, request }) => {
   await expect(page.locator('.tabs .bdg')).toHaveCount(0);
   await expect(page.locator('.results')).not.toContainText('Truncated');
   await expect(page.locator('.results')).not.toContainText('(truncated)');
-  await expect(page.locator(SEL.saveAction)).toBeVisible();
   await expect(page.locator(SEL.exportAction)).toBeVisible();
 });

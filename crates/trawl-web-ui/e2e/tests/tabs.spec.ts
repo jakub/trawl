@@ -17,7 +17,7 @@
 // looking around.
 //
 // WHAT THE TABLIST CONTAINS. The `role="tablist"` node wraps the tab
-// buttons and nothing else. The workspace strip's Save/Export actions
+// buttons and nothing else. The workspace strip's View/Export actions
 // live in the outer container, so a screen reader counts two tabs there
 // and not four; the drawer strip's title and close button sit outside it
 // the same way, leaving three.
@@ -83,10 +83,14 @@ test('results strip is a named tablist with manual activation', async ({ page })
   expect(await selectedFlags(tabs)).toEqual(['false', 'true']);
   expect(await tabindexes(tabs)).toEqual(['-1', '0']);
 
-  // The trailing actions are in `.tabs`, outside the tablist.
-  await expect(page.locator(SEL.saveAction)).toBeVisible();
-  expect(await insideTablist(page.locator(SEL.saveAction))).toBe(false);
+  // The trailing actions are in `.tabs`, outside the tablist. They are
+  // View and Export: the console's Save as Net is the page's one save
+  // entry, so the results toolbar has no Save control (ADR-0025).
+  await expect(page.locator(SEL.viewControl)).toBeVisible();
+  await expect(page.locator(SEL.exportAction)).toBeVisible();
+  expect(await insideTablist(page.locator(SEL.viewControl))).toBe(false);
   expect(await insideTablist(page.locator(SEL.exportAction))).toBe(false);
+  await expect(page.locator('.tabs').getByRole('button', { name: /save/i })).toHaveCount(0);
 });
 
 test('drawer strip is a named tablist', async ({ page, request }) => {

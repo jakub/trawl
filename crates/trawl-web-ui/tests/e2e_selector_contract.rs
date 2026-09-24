@@ -645,12 +645,6 @@ const CONTRACTS: &[Contract] = &[
         hook: "class=\"action export\"",
     },
     Contract {
-        assignment: "saveAction: '.tabs .action.save',",
-        source_path: "src/pages/search.rs",
-        source: include_str!("../src/pages/search.rs"),
-        hook: "class=\"action save\"",
-    },
-    Contract {
         assignment: "quickRangeOption: '.dr-pop .opt',",
         source_path: "../fleet-ui/src/range_dialog.rs",
         source: RANGE_DIALOG_RS,

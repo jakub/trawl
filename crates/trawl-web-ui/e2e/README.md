@@ -331,7 +331,7 @@ one thing the suite is supposed to catch:
 | `23-range-close-on-refusal.patch` | The shared range commit path closes after the app refuses a selection | `range-dialog.spec.ts`, retained absolute and quick drafts with inline errors |
 | `24-palette-overlay-gate.patch` | removes both closed-state overlay admission checks, in Shell's open callback and global chord listener | `command-palette.spec.ts`, export-modal chord inertness |
 | `25-palette-toggle.patch` | replaces the open palette's chord close callback with a no-op | `command-palette.spec.ts`, chord while open toggles closed |
-| `26-save-editor-snapshot.patch` | captures the executed query with URL filters and range instead of the editor buffer | `settings-disposition.spec.ts`, exact preview and POST assertions for both Save controls |
+| `26-save-editor-snapshot.patch` | captures the executed query with URL filters and range instead of the editor buffer | `settings-disposition.spec.ts`, exact preview and POST assertions for the console's Save as Net |
 
 Run the mechanism:
 
@@ -554,15 +554,16 @@ and the runner must restore both clean source and pristine app dist. Mutation
 
 ### Save editor snapshot mutation
 
-`26-save-editor-snapshot.patch` changes only the shared Save callback's input
-from `query_text.get_untracked()` to `effective_q.get_untracked()`. The editor
-and toolbar tests start with different buffer, executed, and effective queries.
-They compare the preview's exact `textContent` and the captured POST body with
-the editor buffer, including whitespace.
+`26-save-editor-snapshot.patch` changes only the Save callback's input from
+`query_text.get_untracked()` to `effective_q.get_untracked()`. The target test
+opens the console's Save as Net with a buffer that differs from both the
+executed and the effective query. It compares the preview's exact
+`textContent` and the captured POST body with the editor buffer, including
+whitespace.
 
 The runner selects tests whose names start with `Save captures editor buffer:`.
-Its JSON report checker requires both the editor and toolbar tests to have an
-actual `failed` result with the exact snapshot preview or POST assertion.
+Its JSON report checker requires the editor test to have an actual `failed`
+result with the exact snapshot preview or POST assertion.
 Timeouts, missing tests, malformed reports, and unrelated failures do not count.
 The unaffected `routing.spec.ts` must pass. Synthetic report checks run with
 `node --test crates/trawl-web-ui/e2e/scripts/check-save-mutation.test.mjs`.

@@ -5,13 +5,13 @@
 import { readFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 
-const ENTRIES = ['editor', 'toolbar'];
+const ENTRIES = ['editor'];
 const ASSERTIONS = [
   'Save snapshot preview must equal the exact editor buffer',
   'Save snapshot POST must contain the exact editor buffer once',
 ];
 
-/** Both controls must fail their snapshot assertion. A timeout is not a kill. */
+/** Every entry test must fail its snapshot assertion. A timeout is not a kill. */
 export function saveSnapshotMutationKilled(report) {
   if (!Array.isArray(report?.suites)) return false;
   const specs = [];
@@ -38,9 +38,9 @@ export function saveSnapshotMutationKilled(report) {
 if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
   const report = JSON.parse(readFileSync(process.argv[2], 'utf8'));
   if (saveSnapshotMutationKilled(report)) {
-    console.log('Save mutation: editor and toolbar both failed the exact snapshot assertion.');
+    console.log('Save mutation: the editor entry failed the exact snapshot assertion.');
   } else {
-    console.error('Save mutation: both named entry tests must fail a snapshot assertion; report rejected.');
+    console.error('Save mutation: the named editor entry test must fail a snapshot assertion; report rejected.');
     process.exitCode = 1;
   }
 }
