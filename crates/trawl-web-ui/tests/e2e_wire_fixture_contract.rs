@@ -356,6 +356,25 @@ fn the_corpus_service_schema_marks_one_column_degraded() {
     let case: CatalogFieldResponse = decode("catalog-field.json", CATALOG_FIELD);
     assert_eq!(case.name, svc.degraded_fields[0]);
 
+    // `_time`'s sample is what the server writes for compaction's
+    // non-UTC microsecond column (issue 238): fixed-width, six fraction
+    // digits, no `Z`. `field-presentation.spec.ts` reads these back.
+    for schema in [&corpus, &populated] {
+        let time = schema.services[0]
+            .columns
+            .iter()
+            .find(|c| c.name == "_time")
+            .expect("_time column");
+        assert_eq!(
+            time.min_value.as_deref(),
+            Some("2026-09-01T00:00:00.000000")
+        );
+        assert_eq!(
+            time.max_value.as_deref(),
+            Some("2026-09-01T23:59:59.999999")
+        );
+    }
+
     // The split is the point: `populated` stays undegraded, so a spec
     // that wants a badge has to say `corpus` and means it.
     assert!(populated.services[0].degraded_fields.is_empty());
@@ -934,8 +953,95 @@ fn result_actions_fixture_has_numeric_and_null_aggregate_cells() {
     );
 }
 
+const QUERY_FIELD_PRESENTATION: &str =
+    include_str!("../e2e/harness/wire/query-field-presentation.json");
+
+/// `field-presentation.spec.ts` and `facets.spec.ts` read this page as
+/// the cases issue 238 names: one-off `_time` and sender `timestamp`
+/// columns, the raw event and its ingest instant, a repeating `level`, a
+/// distinct `host` that is not a time, an event with no null field, and
+/// a sparse one with seven.
+#[test]
+fn field_presentation_fixture_carries_one_off_times_and_a_sparse_event() {
+    use std::collections::HashSet;
+    use trawl_api::value::Value;
+
+    let resp: QueryResponse = decode("query-field-presentation.json", QUERY_FIELD_PRESENTATION);
+    let columns: Vec<&str> = resp
+        .result
+        .columns
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
+    assert_eq!(
+        columns,
+        [
+            "_time",
+            "service",
+            "host",
+            "level",
+            "message",
+            "timestamp",
+            "user",
+            "trace_id",
+            "span_id",
+            "region",
+            "error_code",
+            "retry_count",
+            "client_ip",
+            "_raw",
+            "_ingested",
+        ]
+    );
+    let rows = &resp.result.rows;
+    assert_eq!(rows.len(), 5);
+    let column = |name: &str| -> Vec<&Value> {
+        let idx = columns.iter().position(|c| *c == name).expect(name);
+        rows.iter().map(|r| &r[idx]).collect()
+    };
+    let text = |name: &str| -> Vec<String> {
+        column(name)
+            .into_iter()
+            .map(|v| match v {
+                Value::String(s) => s.clone(),
+                other => panic!("{name} holds {other:?}, not text"),
+            })
+            .collect()
+    };
+    let distinct = |values: &[String]| values.iter().collect::<HashSet<_>>().len();
+
+    // Every value distinct and a timestamp the browser parses: the rail
+    // drops these.
+    for name in ["_time", "timestamp", "_ingested"] {
+        let values = text(name);
+        assert_eq!(distinct(&values), values.len(), "{name} must be one-off");
+        for value in &values {
+            assert!(
+                fleet_ui::time::parse_timestamp(value).is_some(),
+                "{name} value {value} must parse as a timestamp"
+            );
+        }
+    }
+    // Distinct but not times: the rail keeps it.
+    let hosts = text("host");
+    assert_eq!(distinct(&hosts), hosts.len());
+    assert!(
+        hosts
+            .iter()
+            .all(|h| fleet_ui::time::parse_timestamp(h).is_none())
+    );
+    // A repeat, so `level` is a dimension by any reading.
+    let levels = text("level");
+    assert!(distinct(&levels) < levels.len());
+    assert_eq!(distinct(&text("_raw")), rows.len());
+
+    let nulls = |row: &[Value]| row.iter().filter(|v| matches!(v, Value::Null)).count();
+    assert_eq!(nulls(&rows[0]), 0, "event 1 has no null field");
+    assert_eq!(nulls(&rows[1]), 7, "event 2 is the sparse one");
+}
+
 /// Every query fixture the stub serves, decoded as the wire type.
-const QUERY_FIXTURES: [(&str, &str); 6] = [
+const QUERY_FIXTURES: [(&str, &str); 7] = [
     ("query-rows", QUERY_ROWS),
     ("query-cardinality", QUERY_CARDINALITY),
     ("query-top-values", QUERY_TOP_VALUES),
@@ -948,6 +1054,7 @@ const QUERY_FIXTURES: [(&str, &str); 6] = [
         "result-actions",
         include_str!("../e2e/harness/wire/result-actions.json"),
     ),
+    ("query-field-presentation", QUERY_FIELD_PRESENTATION),
 ];
 
 /// Each fixture is a whole result: its `total` is the count the

@@ -24,12 +24,20 @@
 //!   SORTED order while never changing which event is selected.
 //! - `rows == MessageFirst` reduces the columns to time, severity and
 //!   message, with the rest of the row as a muted secondary line.
+//!
+//! Both detail presentations fold an event's null fields behind one
+//! "Show N null fields" disclosure ([`partition_detail_fields`]). Its
+//! open state is one signal the search page owns and passes in, so it
+//! survives selecting another event, re-mounting the inspector and a new
+//! response, and it is not in the URL.
 
 use crate::api::PAGE_SIZE;
 use crate::context_query::SearchNavigation;
 use crate::context_query::{build_context_query, escape_dq, find_col};
 use crate::result_actions::{Capabilities, compare};
-use crate::results_layout::{MessageFirst, inspector_selection, message_first};
+use crate::results_layout::{
+    MessageFirst, inspector_selection, message_first, null_fields_label, partition_detail_fields,
+};
 use crate::state::query::{Filter, FilterOp};
 use crate::state::search_session::{ExecutedFailure, ExecutedQuery, ExecutedResponse};
 use fleet_ui::overlay::has_layers;
@@ -75,6 +83,10 @@ pub fn ResultsTable(
     /// The response generation that selection is keyed on.
     #[prop(into)]
     generation: Signal<u64>,
+    /// The null-field disclosure's open state, shared by the inline
+    /// expansion and the inspector. Owned by the page, which outlives
+    /// this table: the table is rebuilt for every response.
+    show_nulls: RwSignal<bool>,
 ) -> impl IntoView {
     let bus = expect_context::<ToastBus>();
     let table_viewport = NodeRef::<leptos::html::Div>::new();
@@ -125,6 +137,7 @@ pub fn ResultsTable(
                             selected=selected
                             generation=generation
                             order=order
+                            show_nulls=show_nulls
                         />
                     }.into_any())
                 />
@@ -147,6 +160,7 @@ pub fn ResultsTable(
                         on_navigate=on_navigate
                         on_close=Callback::new(move |()| selected.set(None))
                         bus=bus
+                        show_nulls=show_nulls
                     />
                 })
             }}
@@ -227,9 +241,9 @@ fn inspector_keys(
 /// close affordance and body scroll are the fleet's, not a second
 /// hand-rolled panel. It registers no overlay layer, which is what keeps
 /// the command palette's chord live while a row is open. The same
-/// provenance gates apply as inline: a field the executed query changed
-/// gets no filter buttons, and a row with no raw source gets no raw
-/// actions.
+/// provenance gates apply as inline: a field the executed query changed,
+/// or an instant or the raw event ([`Capabilities::detail_filter`]), gets
+/// no filter buttons, and a row with no raw source gets no raw actions.
 #[component]
 fn InspectorPanel(
     idx: usize,
@@ -241,6 +255,7 @@ fn InspectorPanel(
     on_navigate: Callback<SearchNavigation>,
     on_close: Callback<()>,
     bus: ToastBus,
+    show_nulls: RwSignal<bool>,
 ) -> impl IntoView {
     let time_text = find_col(&columns, &["_time"])
         .and_then(|i| row.get(i))
@@ -249,6 +264,9 @@ fn InspectorPanel(
     let row_for_actions = row.clone();
     let columns_for_actions = columns.clone();
     let heading = format!("Event {}", idx + 1);
+    // `zip` semantics: a short row renders the cells it has, no more.
+    let fields = partition_detail_fields(&row[..row.len().min(columns.len())]);
+    let null_count = fields.null.len();
 
     view! {
         <Drawer
@@ -267,12 +285,13 @@ fn InspectorPanel(
                 {time_text.map(|t| view! { <span class="sub">{t}</span> })}
             }.into_any())
         >
-            <div class="dg">
-                {columns.iter().zip(row.iter()).map(|(name, v)| {
+            <div class="dg" id=INSPECTOR_FIELDS_ID>
+                {move || fields.visible(show_nulls.get()).into_iter().map(|i| {
+                    let (name, v) = (&columns[i], &row[i]);
                     let key = name.clone();
                     let value_text = value_to_string(v);
                     let copy_text = value_text.clone();
-                    let allowed = capabilities.include(name, v);
+                    let allowed = capabilities.detail_filter(name, v);
                     let inc = Filter {
                         field: name.clone(),
                         value: value_text.clone(),
@@ -319,6 +338,7 @@ fn InspectorPanel(
                     }
                 }).collect::<Vec<_>>()}
             </div>
+            <NullFieldsToggle count=null_count open=show_nulls controls=INSPECTOR_FIELDS_ID.to_owned()/>
             {raw_actions.then(|| view! {
                 <div class="actions">
                     <CopyRawButton
@@ -341,6 +361,30 @@ fn InspectorPanel(
             })}
         </Drawer>
     }
+}
+
+/// The inspector's field grid, which its null-field disclosure controls.
+const INSPECTOR_FIELDS_ID: &str = "search-inspector-fields";
+
+/// The "Show N null fields" disclosure under a detail grid: a real button
+/// with `aria-expanded`, so Enter and Space work natively, and nothing at
+/// all when the event has no null field. Hidden null rows are not
+/// rendered, so they are not keyboard stops either.
+#[component]
+fn NullFieldsToggle(count: usize, open: RwSignal<bool>, controls: String) -> impl IntoView {
+    (count > 0).then(|| {
+        view! {
+            <button
+                type="button"
+                class="null-toggle"
+                aria-expanded=move || open.get().to_string()
+                aria-controls=controls
+                on:click=move |_| open.update(|o| *o = !*o)
+            >
+                {move || null_fields_label(open.get(), count)}
+            </button>
+        }
+    })
 }
 
 /// Move focus into the docked inspector, which the "Jump to details"
@@ -376,6 +420,7 @@ fn ResultsTableBody(
     selected: RwSignal<Option<(u64, usize)>>,
     generation: Signal<u64>,
     order: StoredValue<Vec<usize>>,
+    show_nulls: RwSignal<bool>,
 ) -> impl IntoView {
     let capabilities = Capabilities::for_query(&executed_query.effective);
     let columns: Vec<String> = resp.result.columns.iter().map(|c| c.name.clone()).collect();
@@ -502,6 +547,7 @@ fn ResultsTableBody(
         generation,
         executed_query,
         capabilities,
+        show_nulls,
     };
 
     view! {
@@ -631,6 +677,8 @@ struct RowWiring {
     generation: Signal<u64>,
     executed_query: ExecutedQuery,
     capabilities: Capabilities,
+    /// The null-field disclosure's open state, shared with the inspector.
+    show_nulls: RwSignal<bool>,
 }
 
 #[component]
@@ -653,6 +701,7 @@ fn RowFragment(
         generation,
         executed_query,
         capabilities,
+        show_nulls,
     } = wiring;
     let raw_actions = capabilities.raw_actions();
 
@@ -677,6 +726,10 @@ fn RowFragment(
 
     let columns_for_detail = columns.clone();
     let row_for_detail = row.clone();
+    // `zip` semantics: a short row renders the cells it has, no more.
+    let detail_fields = partition_detail_fields(&row[..row.len().min(columns.len())]);
+    let null_count = detail_fields.null.len();
+    let detail_grid_id = format!("result-{idx}-fields");
     let columns_for_actions = columns.clone();
     let row_for_actions = row.clone();
 
@@ -738,15 +791,22 @@ fn RowFragment(
             <Show when=move || !inspecting() && expanded.get() == Some(idx)>
                 <tr>
                     <td class="detail" colspan=move || span.get()>
-                        <div class="dg">
-                            {columns_for_detail.iter().zip(row_for_detail.iter()).map(|(name, v)| {
+                        <div class="dg" id=detail_grid_id.clone()>
+                            {
+                            let columns_for_detail = columns_for_detail.clone();
+                            let row_for_detail = row_for_detail.clone();
+                            let detail_fields = detail_fields.clone();
+                            let executed_query = executed_query.clone();
+                            let capabilities = capabilities.clone();
+                            move || detail_fields.visible(show_nulls.get()).into_iter().map(|i| {
+                                let (name, v) = (&columns_for_detail[i], &row_for_detail[i]);
                                 let key = name.clone();
                                 let value_text = value_to_string(v);
                                 let field_for_click = name.clone();
                                 let value_for_click = value_text.clone();
                                 let field_for_label = name.clone();
                                 let value_for_label = value_text.clone();
-                                let allowed = capabilities.include(name, v);
+                                let allowed = capabilities.detail_filter(name, v);
                                 let query_for_click = executed_query.clone();
                                 view! {
                                     <span class="k">{key}</span>
@@ -767,8 +827,14 @@ fn RowFragment(
                                         >{value_text}</button> }.into_any() } else { view! { <span>{value_text}</span> }.into_any() }}
                                     </span>
                                 }
-                            }).collect::<Vec<_>>()}
+                            }).collect::<Vec<_>>()
+                            }
                         </div>
+                        <NullFieldsToggle
+                            count=null_count
+                            open=show_nulls
+                            controls=detail_grid_id.clone()
+                        />
                         {if raw_actions { view! {
                         <div class="actions">
                             <CopyRawButton

@@ -10,6 +10,19 @@
 //! `Float` is skipped (usually continuous — facets would be noise),
 //! `Array` can't be keyed, and `Null`-only columns are dropped.
 //!
+//! Two kinds of column never earn a facet, because counting their values
+//! groups nothing (the Filter rail in `context.md`):
+//!
+//! - the reserved non-dimensions, [`trawl_core::schema::NON_DIMENSION_FIELDS`]
+//!   (`_time`, `_ingested`, `_raw`);
+//! - a one-off time column: at least two non-null cells on screen, every
+//!   one a string [`fleet_ui::time::parse_timestamp`] accepts, and no two
+//!   equal. A column that is only all-distinct (hosts, request ids) or a
+//!   time column with a repeat (`build_time`) stays.
+//!
+//! The snapshot page and the live ring both reach this module through
+//! [`compute_facets`], so the two lanes cannot disagree about eligibility.
+//!
 //! Only the wasm32 build consumes these helpers — on native they exist
 //! purely so their tests run under plain `cargo test`. Matches the
 //! `offset.rs` pattern.
@@ -26,7 +39,8 @@ pub type FieldFacet = (String, Vec<(String, u32)>);
 
 /// Compute `(field, [(value, count)])` facets from a query result's rows.
 ///
-/// Fields with zero non-null discrete values are filtered out. Output is
+/// Fields with zero non-null discrete values are filtered out, and so are
+/// the columns the module docs name as never a dimension. Output is
 /// ordered by column index (preserves the wire column order). Within a
 /// field, values are sorted by count descending, then alphabetically on
 /// ties for stable rendering.
@@ -34,6 +48,9 @@ pub type FieldFacet = (String, Vec<(String, u32)>);
 pub fn compute_facets(result: &QueryResult) -> Vec<FieldFacet> {
     let mut out = Vec::with_capacity(result.columns.len());
     for (i, col) in result.columns.iter().enumerate() {
+        if trawl_core::schema::is_non_dimension(&col.name) || is_one_off_time(&result.rows, i) {
+            continue;
+        }
         if let Some(top) = facet_column(&result.rows, i) {
             out.push((col.name.clone(), top));
         }
@@ -58,6 +75,29 @@ pub fn is_aggregation_shape(query: &str) -> bool {
         return false;
     }
     trawl_core::parser::parse(query).is_ok_and(|ast| ast.has_aggregation())
+}
+
+/// Whether every non-null cell of the column is a distinct timestamp
+/// string, over at least two such cells.
+///
+/// Reads every row, before counting and the top-N cap, so a repeat that
+/// only a later value exposes still keeps the column. Distinct is exact
+/// string equality; a non-null cell that is not a string, or a string
+/// the browser's timestamp parser refuses, keeps the column.
+fn is_one_off_time(rows: &[Vec<Value>], idx: usize) -> bool {
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for row in rows {
+        match row.get(idx) {
+            None | Some(Value::Null) => {}
+            Some(Value::String(text)) => {
+                if fleet_ui::time::parse_timestamp(text).is_none() || !seen.insert(text) {
+                    return false;
+                }
+            }
+            Some(_) => return false,
+        }
+    }
+    seen.len() >= 2
 }
 
 fn facet_column(rows: &[Vec<Value>], idx: usize) -> Option<Vec<(String, u32)>> {
@@ -275,5 +315,256 @@ mod tests {
                 .any(|(field, values)| field == "count" && values.contains(&("2".to_string(), 2))),
             "{facets:?}"
         );
+    }
+
+    fn s(v: &str) -> Value {
+        Value::String(v.to_owned())
+    }
+
+    fn fields(facets: &[FieldFacet]) -> Vec<&str> {
+        facets.iter().map(|(f, _)| f.as_str()).collect()
+    }
+
+    /// An event instant, an ingest instant and the whole original event
+    /// are never a dimension, even when their values repeat on screen —
+    /// while the other reserved names stay useful facets.
+    #[test]
+    fn reserved_non_dimensions_are_never_faceted() {
+        let row = |sev: i64, repairs: &str| {
+            vec![
+                s("2026-01-01T00:00:00Z"),
+                s("2026-01-01T00:00:01Z"),
+                s(r#"{"msg":"hi"}"#),
+                Value::Integer(sev),
+                s(repairs),
+            ]
+        };
+        let result = QueryResult {
+            columns: vec![
+                col("_time"),
+                col("_ingested"),
+                col("_raw"),
+                col("_severity"),
+                col("_repairs"),
+            ],
+            rows: vec![row(9, "coerce"), row(9, "coerce"), row(17, "strip")],
+        };
+        let facets = compute_facets(&result);
+        assert_eq!(fields(&facets), vec!["_severity", "_repairs"]);
+        assert_eq!(facets[0].1, vec![("9".into(), 2), ("17".into(), 1)]);
+
+        // The set is compared the way the catalog compares names.
+        let shouted = QueryResult {
+            columns: vec![col("_TIME"), col("_Raw")],
+            rows: vec![vec![s("a"), s("b")], vec![s("a"), s("b")]],
+        };
+        assert!(compute_facets(&shouted).is_empty());
+    }
+
+    /// A sender's timestamp that is different on every row counts nothing
+    /// useful, whatever it is called. Null cells neither count toward nor
+    /// against the rule.
+    #[test]
+    fn one_off_time_column_is_dropped() {
+        let result = QueryResult {
+            columns: vec![col("timestamp"), col("level"), col("seen")],
+            rows: vec![
+                vec![
+                    s("2026-01-01T00:00:00.000001Z"),
+                    s("info"),
+                    s("2026-01-01 00:00:00"),
+                ],
+                vec![Value::Null, s("info"), s("2026-01-01 00:00:01.5")],
+                vec![
+                    s("2026-01-01T00:00:00.000002+02:00"),
+                    s("warn"),
+                    Value::Null,
+                ],
+                vec![
+                    s("2026-01-01T00:00:00.000003Z"),
+                    s("info"),
+                    s("2026-01-01 00:00:02"),
+                ],
+            ],
+        };
+        assert_eq!(fields(&compute_facets(&result)), vec!["level"]);
+    }
+
+    /// Ten hosts on ten rows are all different, but they are still hosts.
+    #[test]
+    fn distinct_non_time_column_is_kept() {
+        let result = QueryResult {
+            columns: vec![col("host"), col("request_id")],
+            rows: (0..10)
+                .map(|i| vec![s(&format!("web-{i}")), s(&format!("req-{i:04}"))])
+                .collect(),
+        };
+        let facets = compute_facets(&result);
+        assert_eq!(fields(&facets), vec!["host", "request_id"]);
+        assert_eq!(facets[0].1.len(), FACET_TOP_N);
+
+        // One cell that is not a time keeps an otherwise one-off column.
+        let almost = QueryResult {
+            columns: vec![col("when")],
+            rows: vec![
+                vec![s("2026-01-01T00:00:00Z")],
+                vec![s("2026-01-01T00:00:01Z")],
+                vec![s("yesterday")],
+            ],
+        };
+        assert_eq!(fields(&compute_facets(&almost)), vec!["when"]);
+    }
+
+    /// A time field whose values repeat groups events: two builds.
+    #[test]
+    fn repeating_time_column_is_kept() {
+        let result = QueryResult {
+            columns: vec![col("build_time")],
+            rows: vec![
+                vec![s("2026-01-01T00:00:00Z")],
+                vec![s("2026-02-01T00:00:00Z")],
+                vec![s("2026-01-01T00:00:00Z")],
+            ],
+        };
+        let facets = compute_facets(&result);
+        assert_eq!(
+            facets[0].1,
+            vec![
+                ("2026-01-01T00:00:00Z".into(), 2),
+                ("2026-02-01T00:00:00Z".into(), 1)
+            ]
+        );
+    }
+
+    /// One row cannot show that a value is one-off, so it keeps its
+    /// facets; only the reserved non-dimensions are dropped.
+    #[test]
+    fn single_row_page_keeps_its_facets() {
+        let result = QueryResult {
+            columns: vec![col("_time"), col("timestamp"), col("level")],
+            rows: vec![vec![
+                s("2026-01-01T00:00:00Z"),
+                s("2026-01-01T00:00:00.123Z"),
+                s("info"),
+            ]],
+        };
+        assert_eq!(fields(&compute_facets(&result)), vec!["timestamp", "level"]);
+    }
+
+    /// A number among the times is not a time, so the column is not a
+    /// one-off time column even though every cell differs.
+    #[test]
+    fn a_non_string_cell_defeats_one_off_classification() {
+        for odd in [
+            Value::Integer(1_767_225_602),
+            Value::Float(1.5),
+            Value::Boolean(true),
+            Value::Array(vec![s("2026-01-01T00:00:02Z")]),
+        ] {
+            let result = QueryResult {
+                columns: vec![col("timestamp")],
+                rows: vec![
+                    vec![s("2026-01-01T00:00:00Z")],
+                    vec![s("2026-01-01T00:00:01Z")],
+                    vec![odd.clone()],
+                ],
+            };
+            assert_eq!(
+                fields(&compute_facets(&result)),
+                vec!["timestamp"],
+                "{odd:?}"
+            );
+        }
+    }
+
+    /// The rule reads every row, not the top ten the rail shows: a repeat
+    /// that only the eleventh distinct value exposes still keeps the field.
+    #[test]
+    fn a_repeat_beyond_the_top_ten_keeps_a_time_column() {
+        let mut rows: Vec<Vec<Value>> = (0..11)
+            .map(|i| vec![s(&format!("2026-01-01T00:00:{i:02}Z"))])
+            .collect();
+        rows.push(vec![s("2026-01-01T00:00:10Z")]);
+        let result = QueryResult {
+            columns: vec![col("timestamp")],
+            rows,
+        };
+        let facets = compute_facets(&result);
+        assert_eq!(fields(&facets), vec!["timestamp"]);
+        assert_eq!(facets[0].1.len(), FACET_TOP_N);
+        assert_eq!(facets[0].1[0], ("2026-01-01T00:00:10Z".into(), 2));
+    }
+
+    /// The live ring and the snapshot page decide the rail with one
+    /// function: identical events give identical facets.
+    #[test]
+    fn live_ring_and_snapshot_facet_identically() {
+        use crate::state::stream_session_value::{RingBuffer, ring_to_result};
+
+        let events = [
+            (
+                "2026-01-01T00:00:00.000001Z",
+                "2026-01-01T00:00:00Z",
+                "info",
+                "web-1",
+                200,
+            ),
+            (
+                "2026-01-01T00:00:00.000002Z",
+                "2026-01-01T00:00:01Z",
+                "warn",
+                "web-2",
+                500,
+            ),
+            (
+                "2026-01-01T00:00:00.000003Z",
+                "2026-01-01T00:00:02Z",
+                "info",
+                "web-1",
+                200,
+            ),
+        ];
+        let mut ring = RingBuffer::default();
+        for (time, sender, level, host, status) in events {
+            let serde_json::Value::Object(map) = serde_json::json!({
+                "_time": time,
+                "timestamp": sender,
+                "level": level,
+                "host": host,
+                "status": status,
+                "_raw": format!("{level} {host}"),
+            }) else {
+                unreachable!()
+            };
+            ring.push(map);
+        }
+        let live = ring_to_result(&ring);
+
+        let snapshot = QueryResult {
+            columns: live.columns.clone(),
+            rows: events
+                .iter()
+                .map(|(time, sender, level, host, status)| {
+                    live.columns
+                        .iter()
+                        .map(|c| match c.name.as_str() {
+                            "_time" => s(time),
+                            "timestamp" => s(sender),
+                            "level" => s(level),
+                            "host" => s(host),
+                            "status" => Value::Integer(*status),
+                            "_raw" => s(&format!("{level} {host}")),
+                            other => panic!("unexpected column {other}"),
+                        })
+                        .collect()
+                })
+                .collect(),
+        };
+
+        let live_facets = compute_facets(&live);
+        assert_eq!(live_facets, compute_facets(&snapshot));
+        let mut names = fields(&live_facets);
+        names.sort_unstable();
+        assert_eq!(names, vec!["host", "level", "status"]);
     }
 }

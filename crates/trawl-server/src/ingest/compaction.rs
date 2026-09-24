@@ -6668,6 +6668,66 @@ mod tests {
         assert_ne!(count_ty, "VARCHAR", "scalar field must keep its type");
     }
 
+    /// The envelope instants land in parquet as `DuckDB` `TIMESTAMP`: INT64
+    /// microseconds whose logical type is NOT adjusted to UTC. The schema
+    /// sample renderer keys its `Z` suffix off that flag, so the web UI and
+    /// TUI fixtures depend on this annotation, on the fresh write and on the
+    /// merge write alike.
+    #[test]
+    fn compaction_writes_envelope_instants_as_non_utc_micros() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        let annotations = |parquet: &Path| -> Vec<(String, String, String)> {
+            let conn = duckdb::Connection::open_in_memory().unwrap();
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT name, converted_type, logical_type::VARCHAR \
+                     FROM parquet_schema('{}') \
+                     WHERE name IN ('_time', '_ingested') ORDER BY name",
+                    parquet.display()
+                ))
+                .unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        let expected = |name: &str| {
+            (
+                name.to_owned(),
+                "TIMESTAMP_MICROS".to_owned(),
+                "TimestampType(isAdjustedToUTC=0, unit=TimeUnit(MILLIS=<null>, \
+                 MICROS=MicroSeconds(), NANOS=<null>))"
+                    .to_owned(),
+            )
+        };
+
+        let r1 = r#"{"_time":"2026-01-01T00:00:00Z","_ingested":"2026-01-01T00:00:00Z","service":"nginx","message":"first"}"#;
+        let files1 = vec![write_wal_file(&wal_dir, "nginx", &[r1])];
+        compact_service_blocking(&files1, &data_dir, "nginx", "2GB").unwrap();
+        let parquet = find_files_by_ext(&data_dir, "parquet");
+        assert_eq!(parquet.len(), 1);
+        assert_eq!(
+            annotations(&parquet[0]),
+            vec![expected("_ingested"), expected("_time")],
+            "fresh write"
+        );
+
+        let r2 = r#"{"_time":"2026-01-01T00:00:01Z","_ingested":"2026-01-01T00:00:01Z","service":"nginx","message":"second"}"#;
+        let files2 = vec![write_wal_file(&wal_dir, "nginx", &[r2])];
+        compact_service_blocking(&files2, &data_dir, "nginx", "2GB").unwrap();
+        let parquet = find_files_by_ext(&data_dir, "parquet");
+        assert_eq!(parquet.len(), 1);
+        assert_eq!(
+            annotations(&parquet[0]),
+            vec![expected("_ingested"), expected("_time")],
+            "merge write"
+        );
+    }
+
     /// Read `(column_type, non_null_count, total_count)` for one column of a
     /// parquet file.
     fn column_stats(parquet: &Path, column: &str) -> (String, i64, i64) {

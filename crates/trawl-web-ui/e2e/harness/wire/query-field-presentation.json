@@ -1,0 +1,28 @@
+{
+  "columns": [
+    { "name": "_time" },
+    { "name": "service" },
+    { "name": "host" },
+    { "name": "level" },
+    { "name": "message" },
+    { "name": "timestamp" },
+    { "name": "user" },
+    { "name": "trace_id" },
+    { "name": "span_id" },
+    { "name": "region" },
+    { "name": "error_code" },
+    { "name": "retry_count" },
+    { "name": "client_ip" },
+    { "name": "_raw" },
+    { "name": "_ingested" }
+  ],
+  "rows": [
+    ["2026-09-01T10:00:00.000000Z", "api", "web-01", "info", "GET /health ok", "2026-09-01T10:00:00.123Z", "alice", "4bf92f35", "00f067aa", "us-east", "E0", 0, "10.0.0.1", "{\"timestamp\":\"2026-09-01T10:00:00.123Z\",\"level\":\"info\",\"message\":\"GET /health ok\",\"user\":\"alice\",\"trace_id\":\"4bf92f35\",\"span_id\":\"00f067aa\",\"region\":\"us-east\",\"error_code\":\"E0\",\"retry_count\":0,\"client_ip\":\"10.0.0.1\"}", "2026-09-01T10:00:01.500000Z"],
+    ["2026-09-01T10:01:00.000000Z", "api", "web-02", "info", "cache warm", "2026-09-01T10:01:00.234Z", null, null, null, null, null, null, null, "{\"timestamp\":\"2026-09-01T10:01:00.234Z\",\"level\":\"info\",\"message\":\"cache warm\"}", "2026-09-01T10:01:01.500000Z"],
+    ["2026-09-01T10:02:00.000000Z", "api", "web-03", "warn", "slow upstream", "2026-09-01T10:02:00.345Z", "bob", "a3ce929d", null, "us-west", null, 2, null, "{\"timestamp\":\"2026-09-01T10:02:00.345Z\",\"level\":\"warn\",\"message\":\"slow upstream\",\"user\":\"bob\",\"trace_id\":\"a3ce929d\",\"region\":\"us-west\",\"retry_count\":2}", "2026-09-01T10:02:01.500000Z"],
+    ["2026-09-01T10:03:00.000000Z", "api", "web-04", "info", "GET /login ok", "2026-09-01T10:03:00.456Z", "carol", null, null, "eu-west", null, null, "10.0.0.4", "{\"timestamp\":\"2026-09-01T10:03:00.456Z\",\"level\":\"info\",\"message\":\"GET /login ok\",\"user\":\"carol\",\"region\":\"eu-west\",\"client_ip\":\"10.0.0.4\"}", "2026-09-01T10:03:01.500000Z"],
+    ["2026-09-01T10:04:00.000000Z", "api", "web-05", "error", "upstream timeout", "2026-09-01T10:04:00.567Z", "dave", "1e223ff1", "b7ad6b71", "us-east", "E504", 3, "10.0.0.5", "{\"timestamp\":\"2026-09-01T10:04:00.567Z\",\"level\":\"error\",\"message\":\"upstream timeout\",\"user\":\"dave\",\"trace_id\":\"1e223ff1\",\"span_id\":\"b7ad6b71\",\"region\":\"us-east\",\"error_code\":\"E504\",\"retry_count\":3,\"client_ip\":\"10.0.0.5\"}", "2026-09-01T10:04:01.500000Z"]
+  ],
+  "pagination": { "limit": 50, "offset": 0, "returned": 5, "total": 5 },
+  "execution": { "started_at": "2026-09-15T12:34:56Z", "duration_ms": 125 }
+}

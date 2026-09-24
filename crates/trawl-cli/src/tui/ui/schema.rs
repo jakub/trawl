@@ -552,3 +552,154 @@ fn resample(data: &[u64], target_len: usize) -> Vec<u64> {
 
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::state::compute_common_fields;
+
+    /// A service whose columns are `(name, type, min, max)`.
+    fn service(name: &str, bounds: &[(&str, &str, &str, &str)]) -> trawl_api::ServiceSchema {
+        trawl_api::ServiceSchema {
+            name: name.to_owned(),
+            columns: bounds
+                .iter()
+                .map(|(column, ty, min, max)| trawl_api::ServiceColumnStats {
+                    name: (*column).to_owned(),
+                    data_type: (*ty).to_owned(),
+                    null_count: 0,
+                    total_count: 10,
+                    min_value: Some((*min).to_owned()),
+                    max_value: Some((*max).to_owned()),
+                    compressed_bytes: 0,
+                })
+                .collect(),
+            earliest_date: None,
+            latest_date: None,
+            file_count: 1,
+            total_bytes: 1024,
+            total_events: 10,
+            daily_event_counts: vec![],
+            degraded_fields: Vec::new(),
+        }
+    }
+
+    fn bounds(
+        services: &[trawl_api::ServiceSchema],
+        field: &str,
+    ) -> (Option<String>, Option<String>) {
+        let common = compute_common_fields(services);
+        let f = common
+            .iter()
+            .find(|f| f.name == field)
+            .unwrap_or_else(|| panic!("common field {field}"));
+        (f.min_value.clone(), f.max_value.clone())
+    }
+
+    fn range_lines(min: &str, max: &str) -> Vec<String> {
+        let mut lines = Vec::new();
+        push_range_lines(&mut lines, min, max);
+        lines.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn schema_time_bounds_merge_and_render() {
+        // `_time` as the server now renders it for compacted (local)
+        // TIMESTAMP columns: fixed-width, no `Z`. The pre-epoch bound
+        // must win the min across services, in either service order.
+        let old = service(
+            "old",
+            &[(
+                "_time",
+                "TIMESTAMP",
+                "1969-12-31T23:59:59.500000",
+                "2026-01-02T03:04:05.123000",
+            )],
+        );
+        let new = service(
+            "new",
+            &[(
+                "_time",
+                "TIMESTAMP",
+                "2026-01-01T00:00:00.000000",
+                "2026-09-24T18:25:30.654321",
+            )],
+        );
+        let want = (
+            Some("1969-12-31T23:59:59.500000".to_owned()),
+            Some("2026-09-24T18:25:30.654321".to_owned()),
+        );
+        assert_eq!(bounds(&[old.clone(), new.clone()], "_time"), want);
+        assert_eq!(bounds(&[new.clone(), old.clone()], "_time"), want);
+
+        // Mixed shapes have no common range, whatever the order and
+        // whatever comes after: local beside UTC, and a timestamp beside a
+        // service still holding epoch integers.
+        let utc = service(
+            "utc",
+            &[(
+                "_time",
+                "TIMESTAMP",
+                "2026-01-01T00:00:00.000000Z",
+                "2026-01-01T00:00:01.000000Z",
+            )],
+        );
+        let int = service(
+            "int",
+            &[("_time", "BIGINT", "1767225600000000", "1767225601000000")],
+        );
+        for order in [
+            vec![old.clone(), utc.clone()],
+            vec![utc.clone(), old.clone()],
+            vec![old.clone(), int.clone()],
+            vec![int.clone(), old.clone()],
+            vec![old.clone(), int.clone(), new.clone()],
+        ] {
+            let names: Vec<_> = order.iter().map(|s| s.name.as_str()).collect();
+            assert_eq!(bounds(&order, "_time"), (None, None), "{names:?}");
+        }
+
+        // A field no service types as a timestamp keeps the plain text
+        // comparison, numbers and timestamp-looking strings alike.
+        let a = service("a", &[("_time", "BIGINT", "200", "404")]);
+        let b = service("b", &[("_time", "BIGINT", "1000", "503")]);
+        assert_eq!(
+            bounds(&[a, b], "_time"),
+            (Some("1000".to_owned()), Some("503".to_owned()))
+        );
+        let looks = service(
+            "looks",
+            &[(
+                "note",
+                "VARCHAR",
+                "2026-01-01T00:00:00.000000Z",
+                "2026-01-01T00:00:00.000000Z",
+            )],
+        );
+        let plain = service("plain", &[("note", "VARCHAR", "abc", "abc")]);
+        let want_text = (
+            Some("2026-01-01T00:00:00.000000Z".to_owned()),
+            Some("abc".to_owned()),
+        );
+        assert_eq!(bounds(&[looks.clone(), plain.clone()], "note"), want_text);
+        assert_eq!(bounds(&[plain, looks], "note"), want_text);
+
+        // Rendered: the fixed-width text reads as a time with trailing
+        // fractional zeros trimmed; a `Z` sample renders as sent.
+        let (min, max) = want;
+        assert_eq!(
+            range_lines(&min.unwrap(), &max.unwrap()),
+            [
+                "range:      1969-12-31T23:59:59.5 \u{2013}",
+                "            2026-09-24T18:25:30.654321",
+            ]
+        );
+        assert_eq!(
+            range_lines("2026-01-01T00:00:00.000000Z", "2026-01-01T00:00:01.000000Z"),
+            [
+                "range:      2026-01-01T00:00:00.000000Z \u{2013}",
+                "            2026-01-01T00:00:01.000000Z",
+            ]
+        );
+    }
+}

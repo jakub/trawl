@@ -425,7 +425,7 @@ const WELL_KNOWN_FIELDS: &[&str] = &["_time", "env", "service", "host", "_severi
 /// or present in more than 80% of services. Well-known fields come first, then
 /// threshold-promoted fields alphabetically.
 pub fn compute_common_fields(services: &[trawl_api::ServiceSchema]) -> Vec<CommonField> {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     if services.is_empty() {
         return Vec::new();
@@ -433,6 +433,19 @@ pub fn compute_common_fields(services: &[trawl_api::ServiceSchema]) -> Vec<Commo
 
     // Count field occurrences and aggregate stats.
     let mut field_stats: HashMap<String, CommonField> = HashMap::new();
+    // Per field, whether its min / max bound was dropped for mixing shapes.
+    let mut dropped: HashMap<String, [bool; 2]> = HashMap::new();
+    // Fields some service types as a timestamp. Collected up front so the
+    // shape rule does not depend on which service the merge meets first.
+    let timestamp_typed: HashSet<&str> = services
+        .iter()
+        .flat_map(|svc| &svc.columns)
+        .filter(|col| {
+            trawl_core::schema::CanonicalType::from_catalog(&col.data_type)
+                == Some(trawl_core::schema::CanonicalType::Timestamp)
+        })
+        .map(|col| col.name.as_str())
+        .collect();
     let threshold = (services.len() * 80) / 100;
 
     for svc in services {
@@ -452,16 +465,22 @@ pub fn compute_common_fields(services: &[trawl_api::ServiceSchema]) -> Vec<Commo
             entry.null_count += col.null_count;
             entry.total_count += col.total_count;
             // Update global min/max (lexicographic).
-            if let Some(ref v) = col.min_value
-                && entry.min_value.as_ref().is_none_or(|cur| v < cur)
-            {
-                entry.min_value = Some(v.clone());
-            }
-            if let Some(ref v) = col.max_value
-                && entry.max_value.as_ref().is_none_or(|cur| v > cur)
-            {
-                entry.max_value = Some(v.clone());
-            }
+            let [min_dropped, max_dropped] = dropped.entry(col.name.clone()).or_default();
+            let timestamp = timestamp_typed.contains(col.name.as_str());
+            fold_common_bound(
+                &mut entry.min_value,
+                min_dropped,
+                timestamp,
+                col.min_value.as_ref(),
+                |v, cur| v < cur,
+            );
+            fold_common_bound(
+                &mut entry.max_value,
+                max_dropped,
+                timestamp,
+                col.max_value.as_ref(),
+                |v, cur| v > cur,
+            );
         }
     }
 
@@ -483,6 +502,60 @@ pub fn compute_common_fields(services: &[trawl_api::ServiceSchema]) -> Vec<Commo
     common.extend(promoted);
 
     common
+}
+
+/// Fold one service's sample bound into a common field's bound, keeping
+/// `candidate` when `replaces(candidate, current)`.
+///
+/// The bounds are text. The server renders timestamp samples fixed-width
+/// (`YYYY-MM-DDTHH:MM:SS.ffffff`, plus `Z` when the column is UTC-adjusted),
+/// and text of one such shape orders as the instants do. Text of two shapes
+/// does not: a UTC and a local sample name different instants, and a
+/// timestamp beside an integer (one service mid-repin) is no range at all.
+/// So for a field some service types as a timestamp (`timestamp`), when
+/// either side is timestamp-shaped and the shapes differ, the common bound
+/// is dropped for good (`dropped`) rather than picking one. A field no
+/// service types as a timestamp keeps the plain text comparison, even when
+/// its text happens to look like one.
+fn fold_common_bound(
+    bound: &mut Option<String>,
+    dropped: &mut bool,
+    timestamp: bool,
+    candidate: Option<&String>,
+    replaces: fn(&str, &str) -> bool,
+) {
+    let Some(v) = candidate else { return };
+    if *dropped {
+        return;
+    }
+    match bound {
+        None => *bound = Some(v.clone()),
+        Some(cur) => {
+            let (a, b) = (instant_shape(v), instant_shape(cur));
+            if timestamp && (a.is_some() || b.is_some()) && a != b {
+                *bound = None;
+                *dropped = true;
+            } else if replaces(v, cur) {
+                *bound = Some(v.clone());
+            }
+        }
+    }
+}
+
+/// `Some(utc)` when `text` is a server-rendered timestamp sample:
+/// `YYYY-MM-DDTHH:MM:SS.ffffff`, then `Z` exactly when UTC-adjusted.
+fn instant_shape(text: &str) -> Option<bool> {
+    const SHAPE: &[u8] = b"dddd-dd-ddTdd:dd:dd.dddddd";
+    let (stem, utc) = match text.strip_suffix('Z') {
+        Some(stem) => (stem, true),
+        None => (text, false),
+    };
+    let fits = stem.len() == SHAPE.len()
+        && stem.bytes().zip(SHAPE).all(|(b, &want)| match want {
+            b'd' => b.is_ascii_digit(),
+            _ => b == want,
+        });
+    fits.then_some(utc)
 }
 
 /// Focus state for the Saved tab's two-pane layout.

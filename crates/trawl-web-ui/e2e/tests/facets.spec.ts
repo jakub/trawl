@@ -16,9 +16,19 @@
 // reading through the two glyphs. The last test is that geometry, since
 // nothing else in the suite would notice it going.
 
+import fs from 'node:fs';
 import { test, expect, resetScenario, CORPUS } from '../fixtures';
 import { SEL, COPY, nameFrom } from '../selectors';
 import { expectFocusRing } from '../a11y';
+
+// Issue 238's page: one-off `_time`, `_ingested` and sender `timestamp`
+// columns, the raw event, a repeating `level` and a distinct `host`.
+// Pinned in tests/e2e_wire_fixture_contract.rs and served to these specs
+// alone, so the corpus every other spec counts stays as it is.
+const presentation = JSON.parse(
+  fs.readFileSync('harness/wire/query-field-presentation.json', 'utf8'),
+);
+const PRESENTATION_URL = '/search?q=service%3Dapi&page=0';
 
 type Loc = import('@playwright/test').Locator;
 type Pg = import('@playwright/test').Page;
@@ -103,15 +113,16 @@ test('group header toggles aria-expanded', async ({ page, request }) => {
   await openCorpusSearch(page, request);
 
   // The first group, which is the facet rail's first focusable after
-  // its own filter box.
+  // its own filter box. That is `host`: the corpus's first column,
+  // `_time`, is an event instant and never earns a group.
   const group = page.locator(SEL.facetGroup).first();
   const header = group.locator(SEL.facetGroupHeader);
   await expect(header).toHaveJSProperty('tagName', 'BUTTON');
   await expect(header).toHaveAttribute('type', 'button');
   // The count is a span inside the button, so the name has to say the
-  // two in words or it reads as `_time8`.
+  // two in words or it reads as `host6`.
   await expect(header).toHaveAccessibleName(
-    nameFrom(COPY.facetGroupName, CORPUS.columns[0], String(CORPUS.rowCount)),
+    nameFrom(COPY.facetGroupName, FIELD, String(CORPUS.hosts.length)),
   );
   await expect(header).toHaveAttribute('aria-expanded', 'true');
 
@@ -240,5 +251,79 @@ test('clear all removes every filter', async ({ page, request }) => {
 
   await page.keyboard.press(' ');
   await expect(page.locator(SEL.filterChip)).toHaveCount(0);
+  await expect(page).not.toHaveURL(/[?&]f=/);
+});
+
+/** The fields the rail has a group for, read from each header's name. */
+async function railFields(page: Pg): Promise<string[]> {
+  const names = await page
+    .locator(`${SEL.facetGroup} ${SEL.facetGroupHeader}`)
+    .evaluateAll((els) => els.map((el) => el.getAttribute('aria-label') ?? ''));
+  return names.map((name) => name.replace(/, \d+ values?$/, ''));
+}
+
+test('the rail counts dimensions, not instants, the raw event or one-off times', async ({ page }) => {
+  await page.route('**/api/v1/query', (route) => route.fulfill({ json: presentation }));
+  await page.goto(PRESENTATION_URL);
+
+  // A repeating field earns its group, and so does a distinct one that
+  // is not a time: five hosts on five rows are still hosts.
+  await expect(
+    page.getByRole('button', { name: nameFrom(COPY.facetGroupName, 'level', '3') }),
+  ).toBeVisible();
+  const fields = await railFields(page);
+  expect(fields).toContain('level');
+  expect(fields).toContain('host');
+  for (const field of ['_time', '_ingested', '_raw', 'timestamp']) {
+    expect(fields, `${field} must not earn a group`).not.toContain(field);
+  }
+});
+
+test('filters on a field the rail no longer counts stay visible and removable', async ({ page }) => {
+  await page.route('**/api/v1/query', (route) => route.fulfill({ json: presentation }));
+  await page.goto(PRESENTATION_URL);
+  await expect(page.locator(SEL.resultsRow)).toHaveCount(presentation.rows.length);
+  const ts = presentation.columns.findIndex((c: { name: string }) => c.name === 'timestamp');
+  const first = presentation.rows[0][ts] as string;
+  const second = presentation.rows[1][ts] as string;
+
+  // Both filters come from the detail views' own controls, never from a
+  // hand-written URL (see "clear all" above): the include from the
+  // inline expansion, the exclude from the inspector, which is the only
+  // view that offers one.
+  await page.locator(SEL.resultsExpandControl).nth(0).click();
+  await page
+    .locator(SEL.resultsDetailCell)
+    .getByRole('button', { name: `Include timestamp = ${first}`, exact: true })
+    .click();
+  await expect(page.locator(SEL.filterChip)).toHaveCount(1);
+
+  await page.locator(SEL.viewControl).click();
+  await page.locator(SEL.viewPanel).getByRole('button', { name: 'Inspector', exact: true }).click();
+  await page.keyboard.press('Escape');
+  await expect(page.locator(SEL.viewPanel)).toHaveCount(0);
+  await page.locator(SEL.resultsExpandControl).nth(1).click();
+  await page
+    .locator(SEL.inspector)
+    .getByRole('button', { name: `Exclude timestamp = ${second}`, exact: true })
+    .click();
+
+  // Two chips, one of each kind, while the rail still has no group for
+  // the field they filter.
+  const chips = page.locator(SEL.filterChip);
+  await expect(chips).toHaveCount(2);
+  await expect(chips.filter({ hasText: `timestamp = ${first}` })).not.toHaveClass(/excl/);
+  await expect(chips.filter({ hasText: `timestamp = ${second}` })).toHaveClass(/excl/);
+  await expect(
+    page.getByRole('button', { name: nameFrom(COPY.facetGroupName, 'level', '3') }),
+  ).toBeVisible();
+  expect(await railFields(page)).not.toContain('timestamp');
+
+  // Each one comes off on its own.
+  await page.getByRole('button', { name: `Remove filter timestamp = ${second}`, exact: true }).click();
+  await expect(chips).toHaveCount(1);
+  await expect(chips).toContainText(`timestamp = ${first}`);
+  await page.getByRole('button', { name: `Remove filter timestamp = ${first}`, exact: true }).click();
+  await expect(chips).toHaveCount(0);
   await expect(page).not.toHaveURL(/[?&]f=/);
 });

@@ -1158,6 +1158,30 @@ const CONTRACTS: &[Contract] = &[
         hook: "class=\"tag\"",
     },
     Contract {
+        assignment: "resultsDetailFieldName: '.results-table td.detail .dg .k',",
+        source_path: "src/components/results_table.rs",
+        source: RESULTS_TABLE_RS,
+        hook: "class=\"k\"",
+    },
+    Contract {
+        assignment: "inspectorFieldName: '#search-inspector .dg .k',",
+        source_path: "src/components/results_table.rs",
+        source: RESULTS_TABLE_RS,
+        hook: "class=\"k\"",
+    },
+    Contract {
+        assignment: "resultsDetailNullToggle: '.results-table td.detail button.null-toggle',",
+        source_path: "src/components/results_table.rs",
+        source: RESULTS_TABLE_RS,
+        hook: "class=\"null-toggle\"",
+    },
+    Contract {
+        assignment: "inspectorNullToggle: '#search-inspector button.null-toggle',",
+        source_path: "src/components/results_table.rs",
+        source: RESULTS_TABLE_RS,
+        hook: "class=\"null-toggle\"",
+    },
+    Contract {
         assignment: "resultsSortHeader: '.results-table th.sortable',",
         source_path: "src/components/results_table.rs",
         source: RESULTS_TABLE_RS,
@@ -1192,6 +1216,24 @@ const CONTRACTS: &[Contract] = &[
         source_path: "src/components/service_drawer.rs",
         source: SERVICE_DRAWER_RS,
         hook: "\"sf-row\"",
+    },
+    Contract {
+        assignment: "serviceFieldSample: '.c-sample',",
+        source_path: "src/components/service_drawer.rs",
+        source: SERVICE_DRAWER_RS,
+        hook: "class=\"c-sample\"",
+    },
+    Contract {
+        assignment: "serviceFieldStat: '.sf-detail .sfd-kv',",
+        source_path: "src/components/service_drawer.rs",
+        source: SERVICE_DRAWER_RS,
+        hook: "class=\"sfd-kv\"",
+    },
+    Contract {
+        assignment: "serviceFieldStat: '.sf-detail .sfd-kv',",
+        source_path: "src/components/service_drawer.rs",
+        source: SERVICE_DRAWER_RS,
+        hook: "class=\"sf-detail\"",
     },
     // The service drawer's field row uses the shared `rowStretch`
     // selector, so its own control is pinned here rather than under a

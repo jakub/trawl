@@ -57,6 +57,14 @@ pub const PRODUCER: &str = "_producer";
 /// union-conflict path on every query with a non-empty hot buffer.
 pub const TIMESTAMP_COLUMNS: &[&str] = &[TIME, INGESTED];
 
+/// Envelope columns that hold an instant or the whole original event, never
+/// a dimension of it: counting their values groups nothing, and filtering on
+/// one belongs to the time range or to a text search. Result surfaces offer
+/// no value facet and no value filter on these; every other reserved name
+/// (`_severity`, `_repairs`, …) stays a dimension. Ask
+/// [`is_non_dimension`] rather than comparing against this list.
+pub const NON_DIMENSION_FIELDS: &[&str] = &[TIME, INGESTED, RAW];
+
 /// Maximum length (bytes) of a field name trawl will store.
 ///
 /// The field catalog keys on the name (`field_types.field` is a `TEXT`
@@ -181,6 +189,17 @@ pub fn catalog_key(dsl_name: &str) -> String {
 #[must_use]
 pub fn is_event_time(dsl_name: &str) -> bool {
     catalog_key(dsl_name) == TIME
+}
+
+/// Whether a result column names one of [`NON_DIMENSION_FIELDS`].
+///
+/// Compared through [`catalog_key`], so `_TIME` is `_time` here as it is
+/// to `DuckDB`. A sender's bare `timestamp` or `raw` is an ordinary field
+/// (ADR-0013 §6) and is not matched.
+#[must_use]
+pub fn is_non_dimension(name: &str) -> bool {
+    let key = catalog_key(name);
+    NON_DIMENSION_FIELDS.contains(&key.as_str())
 }
 
 // ---------------------------------------------------------------------------
@@ -789,6 +808,30 @@ mod tests {
         assert_eq!(ty(SEVERITY), CanonicalType::Severity);
         for f in [RAW, REPAIRS, ENV, SERVICE, HOST, MESSAGE, PRODUCER] {
             assert_eq!(ty(f), CanonicalType::Varchar, "{f}");
+        }
+    }
+
+    #[test]
+    fn non_dimension_fields_are_the_instants_and_the_raw_event() {
+        assert_eq!(NON_DIMENSION_FIELDS, &[TIME, INGESTED, RAW]);
+        for name in NON_DIMENSION_FIELDS {
+            assert!(is_reserved_name(name), "{name}");
+            assert!(is_non_dimension(name), "{name}");
+            assert!(is_non_dimension(&name.to_ascii_uppercase()), "{name}");
+        }
+        assert!(is_non_dimension("_Time"));
+        // Reserved but useful as a dimension, and sender fields that
+        // merely look like time or raw text, keep their eligibility.
+        for name in [
+            SEVERITY,
+            REPAIRS,
+            PRODUCER,
+            "timestamp",
+            "time",
+            "raw",
+            "ingested",
+        ] {
+            assert!(!is_non_dimension(name), "{name}");
         }
     }
 

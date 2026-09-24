@@ -16,7 +16,6 @@
 //! stale chart data. A valid event or reopened connection clears the failure.
 
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
 use std::rc::Rc;
 
 use leptos::prelude::*;
@@ -27,9 +26,7 @@ use wasm_bindgen::prelude::*;
 use web_sys::{EventSource, MessageEvent};
 
 use super::stream_session_value::json_to_value;
-
-/// Max raw events retained in the ring — older events roll off.
-pub const LIVE_RING_CAPACITY: usize = 5000;
+pub use super::stream_session_value::{RingBuffer, ring_to_result};
 
 /// The failure copy for a stream the browser has given up on: closed,
 /// not reconnecting. Search reads it back to tell this failure from the
@@ -112,26 +109,6 @@ pub struct LiveSignals {
     pub frames: Option<RwSignal<u64>>,
     /// Records that this stream opened. Callers that never ask may omit it.
     pub opened: Option<OpenedMark>,
-}
-
-/// Bounded, append-only-from-the-tail ring of raw events.
-#[derive(Clone, Default)]
-pub struct RingBuffer {
-    /// Insertion-ordered ring of event objects.
-    pub events: VecDeque<serde_json::Map<String, serde_json::Value>>,
-    /// Monotonic counter — bumped on every push; lets `Memo`s key off a
-    /// cheap `u64` instead of cloning the `VecDeque` for change detection.
-    pub epoch: u64,
-}
-
-impl RingBuffer {
-    fn push(&mut self, event: serde_json::Map<String, serde_json::Value>) {
-        if self.events.len() >= LIVE_RING_CAPACITY {
-            self.events.pop_front();
-        }
-        self.events.push_back(event);
-        self.epoch = self.epoch.wrapping_add(1);
-    }
 }
 
 /// Open an SSE stream for the given query, wiring its three event types
@@ -342,36 +319,4 @@ struct SnapshotWire {
 #[derive(Deserialize)]
 struct LaggedWire {
     missed: u64,
-}
-
-/// Convert a ring buffer into a `QueryResult` suitable for
-/// rendering via `<ResultsTable/>`. Column order is first-seen stable.
-#[must_use]
-pub fn ring_to_result(ring: &RingBuffer) -> QueryResult {
-    // Collect column names in first-seen order.
-    let mut col_order: Vec<String> = Vec::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for ev in &ring.events {
-        for k in ev.keys() {
-            if seen.insert(k.clone()) {
-                col_order.push(k.clone());
-            }
-        }
-    }
-
-    let rows: Vec<Vec<Value>> = ring
-        .events
-        .iter()
-        .map(|ev| {
-            col_order
-                .iter()
-                .map(|col| ev.get(col).cloned().map_or(Value::Null, json_to_value))
-                .collect()
-        })
-        .collect();
-
-    QueryResult {
-        columns: col_order.into_iter().map(|name| Column { name }).collect(),
-        rows,
-    }
 }

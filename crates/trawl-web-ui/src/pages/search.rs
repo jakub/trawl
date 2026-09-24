@@ -953,6 +953,10 @@ pub fn Search() -> impl IntoView {
     // because only this component sees the three things that invalidate
     // it: a fresh response, a page turn and a new effective query.
     let selected = RwSignal::new(None::<(u64, usize)>);
+    // The detail views' null-field disclosure. Owned here, not in the
+    // table: the table is rebuilt for every response, and the choice
+    // lasts for the life of the results view (not stored in the URL).
+    let show_nulls = RwSignal::new(false);
     let result_gen = RwSignal::new(0_u64);
     Effect::new(move |_| {
         let _ = rows.get();
@@ -1221,6 +1225,7 @@ pub fn Search() -> impl IntoView {
                                 rows_mode=rows_mode
                                 selected=selected
                                 generation=generation
+                                show_nulls=show_nulls
                             />
                         </>
                     }.into_any(),

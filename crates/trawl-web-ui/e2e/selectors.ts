@@ -293,6 +293,16 @@ export const SEL = {
   /// key-value grid. Told apart by accessible name, which carries the
   /// field and value the press acts on.
   inspectorTag: '#search-inspector button.tag',
+  /// One field name in the expanded row's key/value grid. Counting these
+  /// counts the detail rows rendered.
+  resultsDetailFieldName: '.results-table td.detail .dg .k',
+  /// One field name in the inspector's key/value grid.
+  inspectorFieldName: '#search-inspector .dg .k',
+  /// The "Show N null fields" disclosure under the expanded row's field
+  /// grid. Absent when the event has no null field.
+  resultsDetailNullToggle: '.results-table td.detail button.null-toggle',
+  /// The same disclosure under the inspector's field grid.
+  inspectorNullToggle: '#search-inspector button.null-toggle',
   /// A sortable column header of the real `<table>`. `aria-sort` rides
   /// the CELL, so the assertion target is the th and not its button.
   resultsSortHeader: '.results-table th.sortable',
@@ -303,6 +313,12 @@ export const SEL = {
   /// crates/trawl-web-ui/src/components/service_drawer.rs — one field
   /// row of the Fields pane.
   serviceFieldRow: '.sd-fields .sf-row',
+  /// That row's Sample cell: the column's min … max from the parquet
+  /// footers, as the server renders them. Row-relative.
+  serviceFieldSample: '.c-sample',
+  /// One labelled stat in an open field row's detail (Cardinality,
+  /// Non-null, Storage, Range). Told apart by its label text.
+  serviceFieldStat: '.sf-detail .sfd-kv',
   /// The degraded badge nested above that row's control, which opens
   /// the field's case file instead of expanding the row. Row-relative;
   /// the row's own control is `rowStretch`.

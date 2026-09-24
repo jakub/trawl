@@ -2,8 +2,8 @@ diff --git a/crates/trawl-web-ui/src/components/results_table.rs b/crates/trawl-
 index 105491a2..ef4d1aa4 100644
 --- a/crates/trawl-web-ui/src/components/results_table.rs
 +++ b/crates/trawl-web-ui/src/components/results_table.rs
-@@ -121,6 +121,7 @@ pub fn ResultsTable(
-                             order=order
+@@ -139,6 +139,7 @@ pub fn ResultsTable(
+                             show_nulls=show_nulls
                          />
                      }.into_any())
 +                    error=Box::new(|_msg: String| view! {}.into_any())
