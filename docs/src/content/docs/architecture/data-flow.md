@@ -27,7 +27,7 @@ The syslog listener publishes its frame values as ordinary `syslog_*` and `sd_*`
 
 ## WAL writer
 
-A batch writes one file per environment and service group under `wal/{env}/`. The filename carries the validated service, the arrival milliseconds, and a random suffix. The writer creates a `.tmp` file, fsyncs its data, renames it to `.ndjson`, then fsyncs the parent directory. The first write into an environment also fsyncs the WAL root, which holds the environment directory's entry. A write is acknowledged only after every fsync succeeds, so a successful write is durable before its events reach the hot buffer. If a directory fsync fails, the writer removes the renamed file and the write fails. Service names are validated, not rewritten, so two legal names never share a path.
+A batch writes one file per environment and service group under `wal/{env}/`. The filename carries the validated service, the arrival milliseconds, and a random suffix. The writer creates a `.tmp` file, fsyncs its data, renames it to `.ndjson`, then fsyncs the parent directory. The first write into an environment also fsyncs the WAL root, which holds the environment directory's entry. A write is acknowledged only after every fsync succeeds, so a successful write is durable before its events reach the hot buffer. If a directory fsync fails, the write fails and the writer tries to remove the renamed file. If the removal fails too, the file stays in the WAL and compaction merges it, so an HTTP sender that retries the batch duplicates its rows. Telemetry does not retry such a batch. Service names are validated, not rewritten, so two legal names never share a path.
 
 ## Hot buffer and the publication guard
 

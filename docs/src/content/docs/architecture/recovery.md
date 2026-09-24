@@ -96,7 +96,7 @@ A marker claims the files it names until recovery removes it. While it exists:
 
 ### Directory fsync is part of the acknowledgement
 
-The marker protocol assumes that an existing WAL file holds rows that are not yet in Parquet. That holds only if every acknowledged WAL file is durable. The WAL writer therefore acknowledges a write only after the WAL directory fsync succeeds. The first write into an environment also fsyncs the WAL root. If a directory fsync fails, the writer removes the renamed file and the write fails. Each producer handles the failure on its existing path:
+The marker protocol assumes that an existing WAL file holds rows that are not yet in Parquet. That holds only if every acknowledged WAL file is durable. The WAL writer therefore acknowledges a write only after the WAL directory fsync succeeds. The first write into an environment also fsyncs the WAL root. If a directory fsync fails, the write fails and the writer tries to remove the renamed file. If the removal fails, the file stays visible and compaction merges it, so an HTTP sender that retries the batch duplicates its rows. Each producer handles the failure on its existing path:
 
 - HTTP ingest answers a redacted HTTP 500.
 - Syslog discards the group and counts it.

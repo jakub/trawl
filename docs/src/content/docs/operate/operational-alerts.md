@@ -368,14 +368,15 @@ failure alerts; never subtract attempt counts from event counts.
 failed operations. `WalWriter::write` failed to sync a WAL directory: the
 environment directory after a rename, or the WAL root before the first write
 into an environment. A write is acknowledged only after that sync, so the
-write is rejected. The writer removes the renamed file before it returns the
-error. Each lane then follows its own failure path:
+write is rejected. Before it returns the error, the writer tries to remove the
+renamed file. A file it cannot remove stays in the WAL, as step 2 describes.
+Each lane then follows its own failure path:
 
 - HTTP ingest answers a redacted 500 and counts the failed group under
   `TrawlHttpPersistenceRejection`. The sender retries.
 - Syslog discards the group and counts it under `TrawlSyslogWalDiscard`.
-- Telemetry retains the batch for retry and counts the attempt under
-  `TrawlTelemetryWalWriteFailure`.
+- Telemetry counts the attempt under `TrawlTelemetryWalWriteFailure`. It
+  retains the batch for retry, unless the file stayed in the WAL.
 
 1. Find `wal_dir_fsync_failed` and the filesystem error it carries. The
    `withdrawn` field says whether the renamed file was removed.
