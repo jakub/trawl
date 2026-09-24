@@ -976,6 +976,13 @@ fn copy_button_reports_through_the_shared_toast_bus() {
 }
 
 #[test]
+fn a_toast_link_is_a_native_anchor_its_css_styles() {
+    // A toast's optional destination is a real `<a href>`: the router
+    // follows it and the ADR-0007 focus ring reaches it by keyboard.
+    emits(TOAST_RUNTIME, "<a class=\"link\" href=", ".toast .link");
+}
+
+#[test]
 fn modal_close_toast_dismiss_and_bare_copy_are_native_buttons() {
     // The last three pseudo-buttons in the crate (ADR-0028). Each has
     // to be reachable by Tab and operable by Enter and Space, which no

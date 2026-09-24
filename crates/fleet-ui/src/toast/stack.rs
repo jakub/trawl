@@ -14,6 +14,34 @@
 
 use super::kinds::ToastKind;
 
+/// A destination a toast offers, such as the record an operation just
+/// created. The host renders it as a native anchor after the detail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToastLink {
+    href: String,
+    label: String,
+}
+
+impl ToastLink {
+    #[must_use]
+    pub fn new(href: impl Into<String>, label: impl Into<String>) -> Self {
+        Self {
+            href: href.into(),
+            label: label.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn href(&self) -> &str {
+        &self.href
+    }
+
+    #[must_use]
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+}
+
 /// A single toast notification. Construction is sealed: instances only
 /// arise from [`ToastStack::push`], so the monotonic `id` allocated by
 /// the stack is the only one in circulation — preventing a third-party
@@ -26,6 +54,7 @@ pub struct Toast {
     pub(crate) kind: ToastKind,
     pub(crate) title: String,
     pub(crate) detail: Option<String>,
+    pub(crate) link: Option<ToastLink>,
 }
 
 impl Toast {
@@ -47,6 +76,11 @@ impl Toast {
     #[must_use]
     pub fn detail(&self) -> Option<&str> {
         self.detail.as_deref()
+    }
+
+    #[must_use]
+    pub fn link(&self) -> Option<&ToastLink> {
+        self.link.as_ref()
     }
 }
 
@@ -75,13 +109,35 @@ impl ToastStack {
         title: impl Into<String>,
         detail: Option<String>,
     ) -> u64 {
+        self.append(kind, title.into(), detail, None)
+    }
+
+    /// [`Self::push`] for a toast that also offers `link`.
+    pub fn push_with_link(
+        &mut self,
+        kind: ToastKind,
+        title: impl Into<String>,
+        detail: Option<String>,
+        link: ToastLink,
+    ) -> u64 {
+        self.append(kind, title.into(), detail, Some(link))
+    }
+
+    fn append(
+        &mut self,
+        kind: ToastKind,
+        title: String,
+        detail: Option<String>,
+        link: Option<ToastLink>,
+    ) -> u64 {
         self.next_id += 1;
         let id = self.next_id;
         self.items.push(Toast {
             id,
             kind,
-            title: title.into(),
+            title,
             detail,
+            link,
         });
         id
     }
@@ -140,6 +196,40 @@ mod tests {
         // A later push does not recycle the dismissed id.
         let c = stack.push(ToastKind::Info, "c", None);
         assert_eq!(c, 3);
+    }
+
+    /// A linked toast carries its destination and label; a plain push
+    /// carries none, so existing callers render exactly as before.
+    #[test]
+    fn a_linked_toast_carries_its_link_and_a_plain_one_none() {
+        let mut stack = ToastStack::new();
+        stack.push(ToastKind::Info, "plain", None);
+        let id = stack.push_with_link(
+            ToastKind::Success,
+            "Run started",
+            Some("covers 14:05–14:21 UTC".into()),
+            ToastLink::new("/jobs/runs?run=7&net=3", "View run"),
+        );
+
+        assert_eq!(stack.items()[0].link(), None);
+        let linked = &stack.items()[1];
+        assert_eq!(linked.id(), id);
+        assert_eq!(linked.kind(), ToastKind::Success);
+        assert_eq!(linked.detail(), Some("covers 14:05–14:21 UTC"));
+        let link = linked.link().expect("the linked toast keeps its link");
+        assert_eq!(link.href(), "/jobs/runs?run=7&net=3");
+        assert_eq!(link.label(), "View run");
+    }
+
+    /// Linked and plain toasts share one id sequence, so `<For>` keys
+    /// stay unique across both kinds of push.
+    #[test]
+    fn linked_and_plain_pushes_share_one_id_sequence() {
+        let mut stack = ToastStack::new();
+        let a = stack.push(ToastKind::Info, "a", None);
+        let b = stack.push_with_link(ToastKind::Info, "b", None, ToastLink::new("/x", "x"));
+        let c = stack.push(ToastKind::Info, "c", None);
+        assert_eq!((a, b, c), (1, 2, 3));
     }
 
     #[test]
