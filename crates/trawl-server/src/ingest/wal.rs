@@ -124,13 +124,13 @@ impl WalWriter {
     }
 
     /// Create `wal_dir` if it is missing, then fsync every ancestor of it
-    /// on its filesystem, once per boot, whether or not this process
+    /// on its mount, once per boot, whether or not this process
     /// created it ([`crate::epoch::sync_ancestor_chain`]). An `Err` means
     /// the root may not survive a power loss, so nothing may be
     /// acknowledged into it.
     pub fn ensure_dir(&self) -> std::io::Result<()> {
         self.create_dir_all_durably(&self.wal_dir)?;
-        crate::epoch::sync_ancestor_chain(&self.wal_dir, crate::epoch::device_id, |dir| {
+        crate::epoch::sync_ancestor_chain(&self.wal_dir, crate::epoch::mount_root, |dir| {
             self.sync_or_count(dir)
         })
     }
@@ -504,17 +504,21 @@ mod tests {
         });
     }
 
-    /// Every ancestor of `dir`'s canonical path on `dir`'s filesystem,
-    /// from its parent up to that filesystem's root. Where that root lies
-    /// depends on the host's mounts.
+    /// Every ancestor of `dir`'s canonical path on `dir`'s mount, from its
+    /// parent up to the mount root. Where that root lies depends on the
+    /// host's mounts.
     fn ancestor_chain(dir: &Path) -> Vec<PathBuf> {
         let dir = std::fs::canonicalize(dir).unwrap();
-        let device = crate::epoch::device_id(&dir).unwrap();
-        dir.ancestors()
-            .skip(1)
-            .take_while(|a| crate::epoch::device_id(a).unwrap() == device)
-            .map(Path::to_path_buf)
-            .collect()
+        let mut chain = Vec::new();
+        let mut child = dir.as_path();
+        while let Some(parent) = child.parent() {
+            if crate::epoch::mount_root(child).unwrap() == Some(true) {
+                break;
+            }
+            chain.push(parent.to_path_buf());
+            child = parent;
+        }
+        chain
     }
 
     #[test]

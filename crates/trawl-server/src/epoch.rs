@@ -54,7 +54,7 @@ pub fn ensure_current_epoch(
 ) -> Result<Outcome, String> {
     let outcome = admit_data_root(data_root, wal_dir, ingest_enabled)?;
     if ingest_enabled {
-        sync_ancestor_chain(data_root, device_id, fsync_dir).map_err(|e| {
+        sync_ancestor_chain(data_root, mount_root, fsync_dir).map_err(|e| {
             format!(
                 "failed to fsync the directories holding data root {}: {e}",
                 data_root.display()
@@ -415,45 +415,65 @@ pub(crate) fn create_dir_all_durably(
     result
 }
 
-/// fsync every ancestor of `dir` on `dir`'s filesystem, from its parent up
-/// to the root of that filesystem, so the entry of each directory on the
-/// way to `dir` is durable. Boot runs this once per root whether or not
-/// this process created it: a process killed between creating a directory
-/// and syncing its parent leaves an entry that only a later sync makes
-/// durable, and no process can tell which entries those are. The walk
-/// follows `dir`'s canonical path, the chain that physically holds its
-/// entries.
+/// fsync every ancestor of `dir` on `dir`'s mount, from its parent up to
+/// the mount root, so the entry of each directory on the way to `dir` is
+/// durable. Boot runs this once per root whether or not this process
+/// created it: a process killed between creating a directory and syncing
+/// its parent leaves an entry that only a later sync makes durable, and no
+/// process can tell which entries those are. The walk follows `dir`'s
+/// canonical path, the chain that physically holds its entries.
 ///
-/// The walk stops at the first ancestor whose `device` differs from
-/// `dir`'s. That ancestor holds the mount point's entry on the parent
-/// filesystem, which is not Trawl's data: syncing it adds no durability
-/// to the storage volume, and can fail on a read-only root filesystem.
-/// Every directory boot could have created lies below the boundary, on
-/// `dir`'s filesystem.
+/// Before it syncs a parent, the walk asks `mount_root` about the child
+/// whose entry that sync would make durable, starting with `dir` itself.
+/// A child that is a mount root ends the walk: its entry lives on the
+/// parent mount, which is not Trawl's storage, so syncing it adds no
+/// durability and can fail on a read-only root filesystem. The mount root
+/// itself is synced, as the parent of the directory below it. A device
+/// change alone does not stop the walk, since a btrfs subvolume has its
+/// own device inside one mount and its entry is still on that mount. When
+/// `mount_root` cannot tell (`None`), the walk continues, so without
+/// kernel support it syncs every ancestor up to `/`.
 ///
-/// An ancestor that cannot be opened or statted fails the walk like a
+/// An ancestor that cannot be opened or inspected fails the walk like a
 /// failed sync: its entries cannot be proven durable.
 pub(crate) fn sync_ancestor_chain(
     dir: &Path,
-    mut device: impl FnMut(&Path) -> std::io::Result<u64>,
+    mut mount_root: impl FnMut(&Path) -> std::io::Result<Option<bool>>,
     mut sync: impl FnMut(&Path) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     let dir = std::fs::canonicalize(dir)?;
-    let dir_device = device(&dir)?;
-    for ancestor in dir.ancestors().skip(1) {
-        if device(ancestor)? != dir_device {
+    let mut child = dir.as_path();
+    while let Some(parent) = child.parent() {
+        if mount_root(child)? == Some(true) {
             break;
         }
-        sync(ancestor)?;
+        sync(parent)?;
+        child = parent;
     }
     Ok(())
 }
 
-/// The ID of the device holding `path`, the boundary
-/// [`sync_ancestor_chain`] stops at.
-pub(crate) fn device_id(path: &Path) -> std::io::Result<u64> {
-    use std::os::unix::fs::MetadataExt;
-    std::fs::metadata(path).map(|m| m.dev())
+/// Whether `dir` is the root of a mount, from `statx`'s
+/// `STATX_ATTR_MOUNT_ROOT` (Linux 5.8+). `None` when the kernel has no
+/// `statx` or does not report the attribute; the boundary is then unknown
+/// and [`sync_ancestor_chain`] keeps walking.
+#[cfg(target_os = "linux")]
+pub(crate) fn mount_root(dir: &Path) -> std::io::Result<Option<bool>> {
+    use rustix::fs::{AtFlags, CWD, StatxAttributes, StatxFlags};
+    match rustix::fs::statx(CWD, dir, AtFlags::NO_AUTOMOUNT, StatxFlags::empty()) {
+        Ok(st) => Ok(st
+            .stx_attributes_mask
+            .contains(StatxAttributes::MOUNT_ROOT)
+            .then(|| st.stx_attributes.contains(StatxAttributes::MOUNT_ROOT))),
+        Err(rustix::io::Errno::NOSYS) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// No mount-root query off Linux: [`sync_ancestor_chain`] walks up to `/`.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn mount_root(_dir: &Path) -> std::io::Result<Option<bool>> {
+    Ok(None)
 }
 
 /// Unit-test injection for [`fsync_dir`]: fail every fsync of one directory
@@ -976,7 +996,7 @@ mod tests {
         );
         // The root now exists, as after a process killed before syncing
         // its parent. Every boot syncs the chain again, and the tempdir
-        // shares the data root's filesystem.
+        // is on the data root's mount.
         let canonical = std::fs::canonicalize(&data).unwrap();
         let tmp_dir = std::fs::canonicalize(tmp.path()).unwrap();
         for failing in [canonical.parent().unwrap(), tmp_dir.as_path()] {
@@ -996,26 +1016,40 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_ancestor_sync_stops_at_the_storage_filesystem_boundary() {
+    /// Record every directory `sync_ancestor_chain` syncs for `dir`.
+    fn synced_chain(
+        dir: &Path,
+        mount_root: impl FnMut(&Path) -> std::io::Result<Option<bool>>,
+    ) -> Vec<PathBuf> {
+        let mut synced = Vec::new();
+        sync_ancestor_chain(dir, mount_root, |p| {
+            synced.push(p.to_path_buf());
+            Ok(())
+        })
+        .unwrap();
+        synced
+    }
+
+    /// `a/b/c` under a canonical tempdir.
+    fn abc() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
         let tmp = tempfile::tempdir().unwrap();
         let a = std::fs::canonicalize(tmp.path()).unwrap().join("a");
         let b = a.join("b");
         let c = b.join("c");
         std::fs::create_dir_all(&c).unwrap();
-        // `b` is the mount point of `c`'s volume: `b` itself reports the
-        // mounted device, and `a` holds `b`'s entry on the parent device.
-        let device = |p: &Path| Ok(if p.starts_with(&b) { 2 } else { 1 });
-        let mut synced = Vec::new();
-        sync_ancestor_chain(&c, device, |p| {
-            synced.push(p.to_path_buf());
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(synced, [b.as_path()]);
+        (tmp, a, b, c)
+    }
 
-        // A failed sync of a same-device ancestor still fails the walk.
-        let err = sync_ancestor_chain(&c, device, |p| {
+    #[test]
+    fn the_ancestor_sync_stops_at_the_mount_root() {
+        let (_tmp, _a, b, c) = abc();
+        // `b` is the root of the storage mount: `b` itself is on it, and
+        // `a` holds `b`'s entry on the parent mount.
+        let mount_root = |p: &Path| Ok(Some(p == b));
+        assert_eq!(synced_chain(&c, mount_root), [b.as_path()]);
+
+        // A failed sync of an ancestor on the mount still fails the walk.
+        let err = sync_ancestor_chain(&c, mount_root, |p| {
             if p == b {
                 Err(std::io::Error::other("sync failed"))
             } else {
@@ -1025,32 +1059,51 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.to_string(), "sync failed");
 
-        // So does an ancestor whose device cannot be read.
+        // So does a directory the mount-root query cannot inspect.
         let err = sync_ancestor_chain(
             &c,
             |p| {
-                if p == a {
-                    Err(std::io::Error::other("stat failed"))
+                if p == b {
+                    Err(std::io::Error::other("statx failed"))
                 } else {
-                    Ok(2)
+                    Ok(Some(false))
                 }
             },
             |_| Ok(()),
         )
         .unwrap_err();
-        assert_eq!(err.to_string(), "stat failed");
+        assert_eq!(err.to_string(), "statx failed");
     }
 
     #[test]
-    fn a_root_that_is_its_own_mount_point_syncs_no_ancestor() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(tmp.path()).unwrap().join("root");
-        std::fs::create_dir(&root).unwrap();
-        let device = |p: &Path| Ok(u64::from(p == root));
-        sync_ancestor_chain(&root, device, |p| {
-            panic!("synced {} across the mount boundary", p.display())
-        })
-        .unwrap();
+    fn a_root_that_is_its_own_mount_root_syncs_no_ancestor() {
+        let (_tmp, _a, _b, c) = abc();
+        assert!(synced_chain(&c, |p| Ok(Some(p == c))).is_empty());
+    }
+
+    #[test]
+    fn a_nested_subvolume_that_is_not_a_mount_root_does_not_stop_the_walk() {
+        // `b` is a btrfs subvolume: its own device, inside the mount of
+        // its parent. Its entry lives in `a`, so `a` is synced too, and
+        // the walk goes on to the mount root, here `/`.
+        let (_tmp, _a, _b, c) = abc();
+        let mount_root = |p: &Path| Ok(Some(p == Path::new("/")));
+        let all: Vec<_> = c.ancestors().skip(1).collect();
+        assert_eq!(synced_chain(&c, mount_root), all);
+    }
+
+    #[test]
+    fn without_mount_root_support_the_walk_reaches_slash() {
+        let (_tmp, _a, _b, c) = abc();
+        let synced = synced_chain(&c, |_| Ok(None));
+        assert_eq!(synced.last().map(PathBuf::as_path), Some(Path::new("/")));
+        assert_eq!(synced, c.ancestors().skip(1).collect::<Vec<_>>());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_host_reports_slash_as_a_mount_root() {
+        assert_eq!(mount_root(Path::new("/")).unwrap(), Some(true));
     }
 
     #[test]

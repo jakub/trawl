@@ -64,6 +64,7 @@ zstd = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 metrics-process = { workspace = true }
+rustix = { workspace = true }
 
 [features]
 # Exposes the pool's query-delay hook (`pool::TEST_QUERY_DELAY_MS`) to this
