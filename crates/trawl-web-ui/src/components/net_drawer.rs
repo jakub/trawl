@@ -67,14 +67,15 @@ pub fn NetDrawer(
     let net_for_runs = net.clone();
     let query_for_run = net.query.clone();
     let net_id_for_run_now = net.id;
-    // Running a windowed net's saved text verbatim would scan with no
-    // time bounds: the window lives in the schedule, not in the text. So
-    // Run now never runs the text as written; it fires the schedule's
-    // next window early, and the server resolves that window at claim
-    // time (ADR-0018 as amended on 2026-09-23). Query mode, which has no
-    // window, runs the text as a scheduled run would. The offer follows
-    // the SAVED state, never an unsaved draft of it: what fires is the
-    // schedule the server holds.
+    // Run now fires the schedule's next run early, and the server
+    // resolves what it runs at claim time (ADR-0018 as amended on
+    // 2026-09-23). For a windowed net that is never the saved text as
+    // written: the window lives in the schedule, not in the text, so
+    // the text alone would scan with no time bounds, and the server
+    // splices the next window onto it. A query-mode net has no window,
+    // so its text runs verbatim, as a scheduled run of it would. The
+    // offer follows the SAVED state, never an unsaved draft of it: what
+    // fires is the schedule the server holds.
     let run_now_allowed = move || saved.get().is_some_and(|n| run_now_offered(&n));
     let run_in_flight = RwSignal::new(false);
 
