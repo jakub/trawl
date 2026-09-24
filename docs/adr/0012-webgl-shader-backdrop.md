@@ -113,8 +113,20 @@ it can't. The contract, each leg guarded:
   `webglcontextrestored` remount. For a decorative backdrop, recovery
   machinery outweighs the pixels; this is a recorded consequence, not a
   bug to file.
+- **Hidden tab or off-screen canvas** → the vendored `ShaderMount`
+  drops its effective speed to 0 while `document.hidden` is true or its
+  `IntersectionObserver` reports the canvas out of the viewport, which
+  stops the rAF loop; it resumes at the set speed when either clears.
+  This is the package's behaviour, not the wrapper's, and the wrapper
+  adds no second pause.
 - **Software-rasterized WebGL2** renders slowly rather than degrading —
-  accepted for a login-page layer.
+  accepted for a login-page layer. Measured under headless Chromium's
+  SwiftShader at 1440×900 (#241): the live shader holds the page's rAF
+  rate near 34 fps against 60 at speed 0, and a screenshot takes about
+  0.2–1.1 s. A 30 s screenshot timeout reported by the 0.9.0 smoke test
+  did not reproduce on the bundled or system Chromium, the persistent
+  profile it used, 2× device scale, full-page capture, or the deployed
+  instance, so no throttle, settle, or renderer probe was added.
 
 Theme flips re-color the mounted mesh in place via `setUniforms`
 (never a remount), which is what makes the backdrop feel continuous
