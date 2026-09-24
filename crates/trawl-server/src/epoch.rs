@@ -54,7 +54,7 @@ pub fn ensure_current_epoch(
 ) -> Result<Outcome, String> {
     let outcome = admit_data_root(data_root, wal_dir, ingest_enabled)?;
     if ingest_enabled {
-        sync_ancestor_chain(data_root, fsync_dir).map_err(|e| {
+        sync_ancestor_chain(data_root, device_id, fsync_dir).map_err(|e| {
             format!(
                 "failed to fsync the directories holding data root {}: {e}",
                 data_root.display()
@@ -415,22 +415,45 @@ pub(crate) fn create_dir_all_durably(
     result
 }
 
-/// fsync every ancestor of `dir`, from its parent up to `/`, so the entry
-/// of each directory on the way to `dir` is durable. Boot runs this once
-/// per root whether or not this process created it: a process killed
-/// between creating a directory and syncing its parent leaves an entry
-/// that only a later sync makes durable, and no process can tell which
-/// entries those are. The walk follows `dir`'s canonical path, the chain
-/// that physically holds its entries.
+/// fsync every ancestor of `dir` on `dir`'s filesystem, from its parent up
+/// to the root of that filesystem, so the entry of each directory on the
+/// way to `dir` is durable. Boot runs this once per root whether or not
+/// this process created it: a process killed between creating a directory
+/// and syncing its parent leaves an entry that only a later sync makes
+/// durable, and no process can tell which entries those are. The walk
+/// follows `dir`'s canonical path, the chain that physically holds its
+/// entries.
 ///
-/// An ancestor that cannot be opened fails the walk like a failed sync:
-/// its entries cannot be proven durable.
+/// The walk stops at the first ancestor whose `device` differs from
+/// `dir`'s. That ancestor holds the mount point's entry on the parent
+/// filesystem, which is not Trawl's data: syncing it adds no durability
+/// to the storage volume, and can fail on a read-only root filesystem.
+/// Every directory boot could have created lies below the boundary, on
+/// `dir`'s filesystem.
+///
+/// An ancestor that cannot be opened or statted fails the walk like a
+/// failed sync: its entries cannot be proven durable.
 pub(crate) fn sync_ancestor_chain(
     dir: &Path,
+    mut device: impl FnMut(&Path) -> std::io::Result<u64>,
     mut sync: impl FnMut(&Path) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     let dir = std::fs::canonicalize(dir)?;
-    dir.ancestors().skip(1).try_for_each(&mut sync)
+    let dir_device = device(&dir)?;
+    for ancestor in dir.ancestors().skip(1) {
+        if device(ancestor)? != dir_device {
+            break;
+        }
+        sync(ancestor)?;
+    }
+    Ok(())
+}
+
+/// The ID of the device holding `path`, the boundary
+/// [`sync_ancestor_chain`] stops at.
+pub(crate) fn device_id(path: &Path) -> std::io::Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).map(|m| m.dev())
 }
 
 /// Unit-test injection for [`fsync_dir`]: fail every fsync of one directory
@@ -952,9 +975,11 @@ mod tests {
             Outcome::FreshRoot
         );
         // The root now exists, as after a process killed before syncing
-        // its parent. Every boot syncs the whole chain, up to `/`.
+        // its parent. Every boot syncs the chain again, and the tempdir
+        // shares the data root's filesystem.
         let canonical = std::fs::canonicalize(&data).unwrap();
-        for failing in [canonical.parent().unwrap(), Path::new("/")] {
+        let tmp_dir = std::fs::canonicalize(tmp.path()).unwrap();
+        for failing in [canonical.parent().unwrap(), tmp_dir.as_path()] {
             let _fail = fail_dir_fsync::set(failing);
             let err = ensure_current_epoch(&data, &wal, true).unwrap_err();
             assert!(err.contains("injected directory fsync failure"), "{err}");
@@ -964,11 +989,68 @@ mod tests {
             Outcome::Current
         );
         // A query-only node writes nothing into the root and syncs nothing.
-        let _fail = fail_dir_fsync::set(Path::new("/"));
+        let _fail = fail_dir_fsync::set(canonical.parent().unwrap());
         assert_eq!(
             ensure_current_epoch(&data, &wal, false).unwrap(),
             Outcome::Current
         );
+    }
+
+    #[test]
+    fn the_ancestor_sync_stops_at_the_storage_filesystem_boundary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = std::fs::canonicalize(tmp.path()).unwrap().join("a");
+        let b = a.join("b");
+        let c = b.join("c");
+        std::fs::create_dir_all(&c).unwrap();
+        // `b` is the mount point of `c`'s volume: `b` itself reports the
+        // mounted device, and `a` holds `b`'s entry on the parent device.
+        let device = |p: &Path| Ok(if p.starts_with(&b) { 2 } else { 1 });
+        let mut synced = Vec::new();
+        sync_ancestor_chain(&c, device, |p| {
+            synced.push(p.to_path_buf());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(synced, [b.as_path()]);
+
+        // A failed sync of a same-device ancestor still fails the walk.
+        let err = sync_ancestor_chain(&c, device, |p| {
+            if p == b {
+                Err(std::io::Error::other("sync failed"))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+        assert_eq!(err.to_string(), "sync failed");
+
+        // So does an ancestor whose device cannot be read.
+        let err = sync_ancestor_chain(
+            &c,
+            |p| {
+                if p == a {
+                    Err(std::io::Error::other("stat failed"))
+                } else {
+                    Ok(2)
+                }
+            },
+            |_| Ok(()),
+        )
+        .unwrap_err();
+        assert_eq!(err.to_string(), "stat failed");
+    }
+
+    #[test]
+    fn a_root_that_is_its_own_mount_point_syncs_no_ancestor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let device = |p: &Path| Ok(u64::from(p == root));
+        sync_ancestor_chain(&root, device, |p| {
+            panic!("synced {} across the mount boundary", p.display())
+        })
+        .unwrap();
     }
 
     #[test]

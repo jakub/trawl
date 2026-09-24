@@ -124,12 +124,15 @@ impl WalWriter {
     }
 
     /// Create `wal_dir` if it is missing, then fsync every ancestor of it
-    /// up to `/`, once per boot, whether or not this process created it
-    /// ([`crate::epoch::sync_ancestor_chain`]). An `Err` means the root may
-    /// not survive a power loss, so nothing may be acknowledged into it.
+    /// on its filesystem, once per boot, whether or not this process
+    /// created it ([`crate::epoch::sync_ancestor_chain`]). An `Err` means
+    /// the root may not survive a power loss, so nothing may be
+    /// acknowledged into it.
     pub fn ensure_dir(&self) -> std::io::Result<()> {
         self.create_dir_all_durably(&self.wal_dir)?;
-        crate::epoch::sync_ancestor_chain(&self.wal_dir, |dir| self.sync_or_count(dir))
+        crate::epoch::sync_ancestor_chain(&self.wal_dir, crate::epoch::device_id, |dir| {
+            self.sync_or_count(dir)
+        })
     }
 
     pub fn dir(&self) -> &Path {
@@ -501,12 +504,15 @@ mod tests {
         });
     }
 
-    /// Every ancestor of `dir`'s canonical path, from its parent up to `/`.
+    /// Every ancestor of `dir`'s canonical path on `dir`'s filesystem,
+    /// from its parent up to that filesystem's root. Where that root lies
+    /// depends on the host's mounts.
     fn ancestor_chain(dir: &Path) -> Vec<PathBuf> {
-        std::fs::canonicalize(dir)
-            .unwrap()
-            .ancestors()
+        let dir = std::fs::canonicalize(dir).unwrap();
+        let device = crate::epoch::device_id(&dir).unwrap();
+        dir.ancestors()
             .skip(1)
+            .take_while(|a| crate::epoch::device_id(a).unwrap() == device)
             .map(Path::to_path_buf)
             .collect()
     }
@@ -546,8 +552,8 @@ mod tests {
         let writer = WalWriter::new(root.clone());
         writer.ensure_dir().unwrap();
         let chain = ancestor_chain(&root);
-        assert_eq!(chain.first(), Some(&tmp.path().join("state")));
-        assert_eq!(chain.last().map(PathBuf::as_path), Some(Path::new("/")));
+        let tmp_dir = std::fs::canonicalize(tmp.path()).unwrap();
+        assert_eq!(chain[..2], [tmp_dir.join("state"), tmp_dir]);
         assert_eq!(writer.take_synced_dirs_for_test(), chain);
 
         // A failed ancestor sync fails `ensure_dir`, which fails boot.
