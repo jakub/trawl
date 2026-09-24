@@ -26,7 +26,7 @@ export default defineConfig({
   workers: 1, fullyParallel: false, retries: 0, timeout: 30_000,
   expect: { timeout: 10_000 },
   reporter: [['list'], ['html', { outputFolder: '../../../e2e-artifacts/theme-report', open: 'never' }]],
-  use: { ...devices['Desktop Chrome'], channel: 'chromium', colorScheme: 'light', reducedMotion: 'reduce', trace: 'on', screenshot: 'on' },
+  use: { ...devices['Desktop Chrome'], channel: 'chromium', colorScheme: 'light', trace: 'on', screenshot: 'on' },
   projects: [
     { name: 'embedded', testMatch: 'production.spec.ts', use: { baseURL: origins[0] } },
     { name: 'disk', testMatch: 'production.spec.ts', use: { baseURL: origins[1] } },

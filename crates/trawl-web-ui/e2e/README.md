@@ -263,14 +263,13 @@ in `server.mjs`'s SSE bookkeeping, etc.) — fix it or quarantine it loudly
 (skip with a comment linking the issue), never paper over it with
 retries.
 
-`use.reducedMotion: 'reduce'` is declared in `playwright.config.ts` but
-does NOT reach the browser: probe it and
-`matchMedia('(prefers-reduced-motion: reduce)')` is false in a spec, and
-true in a context this repo's own scripts build by hand. Treat entrance
-animations as live: a spec that measures a box right after the control
-that reveals it must wait for that element's own animations to finish
-(`responsive-layout.spec.ts` does, for the nav overlay), or emulate the
-media itself the way `batch1-controls.spec.ts` does.
+Motion is live by default: neither Playwright config sets
+`reducedMotion`, so entrance animations and the login backdrop run in
+every spec. A spec that needs reduced motion calls
+`page.emulateMedia({ reducedMotion: 'reduce' })` itself, as
+`batch1-controls.spec.ts` does. A spec that measures a box right after
+the control that reveals it waits for that element's own animations to
+finish, as `responsive-layout.spec.ts` does for the nav overlay.
 
 `globalTimeout` defaults to 720s. The full CI job overrides it with 1500s;
 focused mutation runs retain the default. A run that exceeds its budget
@@ -498,7 +497,8 @@ the source, bundle, dist snippet and index. CI's `atmosphere-mutation` job downl
 the same `trunk-build` dist that `web-ui-e2e` tests and needs no Rust rebuild.
 
 The atmosphere spec forces no-WebGL, compile, link and late constructor failures.
-Its loss test overrides reduced motion, requires real rendered frames and a real
+Its loss test starts with live motion, the default, and toggles reduced motion
+with `page.emulateMedia`. It requires real rendered frames and a real
 `WEBGL_lose_context` event, and counts only callbacks scheduled by the shader
 snippet. It retains the original host through SPA unmount to inspect cleanup.
 Expected shader diagnostics must remain silent, while an unrelated diagnostic

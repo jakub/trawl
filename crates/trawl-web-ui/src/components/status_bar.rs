@@ -37,21 +37,27 @@ pub fn StatusBar(
     admin: Signal<Option<DashboardSnapshot>>,
 ) -> impl IntoView {
     // Host the browser is talking to — shown in the connected-state label
-    // next to the server version from /api/v1/health.
+    // next to the server version from /api/v1/health. The version appears
+    // only once health returns one; while health is pending, has failed, or
+    // reports no version, the label names the host alone.
     let host = web_sys::window()
         .and_then(|w| w.location().host().ok())
         .unwrap_or_default();
     let server = LocalResource::new(api::health);
+    // Where the health probe stands, so a test can wait for a settled
+    // failure instead of a timeout: the host-only label reads the same
+    // while the probe is pending and after it has failed.
+    let health_state = move || match server.get() {
+        None => "pending",
+        Some(Ok(_)) => "ok",
+        Some(Err(_)) => "error",
+    };
 
     let status_label = move || match status.get() {
-        StatusKind::Connected => {
-            let v = server
-                .get()
-                .and_then(Result::ok)
-                .and_then(|h| h.version)
-                .unwrap_or_else(|| "?".to_string());
-            format!("Connected ({host} v{v})")
-        }
+        StatusKind::Connected => match server.get().and_then(Result::ok).and_then(|h| h.version) {
+            Some(v) => format!("Connected ({host} v{v})"),
+            None => format!("Connected ({host})"),
+        },
         StatusKind::Hauling => "Hauling".to_string(),
         StatusKind::Live => "Live".to_string(),
         StatusKind::Error => "Error".to_string(),
@@ -60,7 +66,7 @@ pub fn StatusBar(
     view! {
         <footer class="statusbar">
             <div class="grp">
-                <span class="strong status-label">{status_label}</span>
+                <span class="strong status-label" data-health=health_state>{status_label}</span>
             </div>
             {move || lagged.get().map(|n| view! {
                 <>

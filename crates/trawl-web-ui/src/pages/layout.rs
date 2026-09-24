@@ -179,13 +179,19 @@ pub fn AuthShell() -> impl IntoView {
             sidebar_active=Signal::derive(move || current_section.get())
             user=user
             on_logout=on_logout
+            // `Shell` calls the footer once, so the session gate is a
+            // reactive `Show`, not an `if`. The status bar probes
+            // `/api/v1/health`, which the trawl-web proxy answers 401 without
+            // a session: mount it only once `/me` confirms one, as `Outlet` does.
             footer=Box::new(move || view! {
-                <StatusBar
-                    status=Signal::derive(move || shell_status.kind.get())
-                    count=Signal::derive(move || shell_status.count.get())
-                    lagged=Signal::derive(move || shell_status.lagged.get())
-                    admin=admin_stats
-                />
+                <Show when=move || me.get().is_some()>
+                    <StatusBar
+                        status=Signal::derive(move || shell_status.kind.get())
+                        count=Signal::derive(move || shell_status.count.get())
+                        lagged=Signal::derive(move || shell_status.lagged.get())
+                        admin=admin_stats
+                    />
+                </Show>
             }.into_any())
             sidebar_bottom=ViewFn::from(|| view! {
                 <a class="it" title="Help" href="https://trawl.sh" target="_blank" rel="noopener noreferrer">

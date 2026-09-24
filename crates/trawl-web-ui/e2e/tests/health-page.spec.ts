@@ -807,3 +807,47 @@ test('a late bootstrap from a prior identity cannot replace new diagnostic facts
     releaseOld();
   }
 });
+
+test('the connected label names no version until health returns one', async ({ page, request }) => {
+  await setup(request, 'health-viewer');
+  let release!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  let intercepted!: () => void;
+  const interception = new Promise<void>(resolve => { intercepted = resolve; });
+  await page.route('**/api/v1/health', async route => {
+    // Fetch first so the harness counter still sees the request.
+    const response = await route.fetch();
+    intercepted();
+    await held;
+    await route.fulfill({ response });
+  });
+  try {
+    await page.goto('/search');
+    await interception;
+    const host = new URL(page.url()).host;
+    const label = page.locator(SEL.statusLabel);
+    await expect(label).toHaveText(`Connected (${host})`);
+    release();
+    await expect(label).toHaveText(`Connected (${host} vhealth-fixture-163)`);
+    expect((await state(request)).healthHits.health).toBe(1);
+  } finally {
+    release();
+  }
+});
+
+test('the connected label keeps the host alone when health fails', async ({ page, request }) => {
+  await setup(request, 'health-viewer');
+  let failed = false;
+  // 502, not 503: a 503 body parses as a health report.
+  await page.route('**/api/v1/health', async route => {
+    await route.fulfill({ status: 502, json: { error: 'upstream unavailable' } });
+    failed = true;
+  });
+  await page.goto('/search');
+  await expect.poll(() => failed).toBe(true);
+  const host = new URL(page.url()).host;
+  const label = page.locator(SEL.statusLabel);
+  // The label reads the same while pending, so wait for the settled failure.
+  await expect(label).toHaveAttribute('data-health', 'error');
+  await expect(label).toHaveText(`Connected (${host})`);
+});
