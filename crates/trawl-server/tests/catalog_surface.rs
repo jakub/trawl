@@ -645,6 +645,114 @@ async fn schema_services_badges_only_the_service_that_conflicted() {
     );
 }
 
+/// Acceptance (#238): a compacted service's schema samples show `_time` and
+/// `_ingested` as formatted instants, not epoch microseconds, and a plain
+/// integer column keeps its numeric text.
+///
+/// Compaction writes both envelope instants as local (not UTC-adjusted)
+/// TIMESTAMP columns — pinned by the compaction unit test
+/// `compaction_writes_envelope_instants_as_non_utc_micros` — so their
+/// samples carry no `Z`.
+#[tokio::test(flavor = "multi_thread")]
+async fn service_schema_time_samples_are_formatted() {
+    const SUFFIX: &str = "";
+
+    let h = harness().await;
+    // Two known instants with distinct microsecond fractions, recent enough
+    // to sit inside the retention window.
+    let at = |ago_minutes: i64, micros: i64| {
+        let base = chrono::Utc::now() - chrono::Duration::minutes(ago_minutes);
+        chrono::DateTime::from_timestamp(base.timestamp(), 0).unwrap()
+            + chrono::Duration::microseconds(micros)
+    };
+    let early = at(10, 123_456);
+    let late = at(3, 654_321);
+    let sent =
+        |t: chrono::DateTime<chrono::Utc>| t.to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+    ingest_and_compact(
+        &h,
+        &[
+            event("svc", &json!({"timestamp": sent(late), "status": 503})),
+            event("svc", &json!({"timestamp": sent(early), "status": 200})),
+        ],
+    )
+    .await;
+
+    let _refresh = trawl_server::schema_refresh::spawn_schema_refresh(h.server.state.clone());
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let body = loop {
+        let (status, body) = h.get(&h.server.analyst_token, "/schema/services").await;
+        assert!(
+            std::time::Instant::now() < deadline,
+            "schema refresh never populated the service cache"
+        );
+        if status == 200 {
+            break body;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let column = |name: &str| {
+        body["services"]
+            .as_array()
+            .expect("services array")
+            .iter()
+            .find(|s| s["name"] == "svc")
+            .unwrap_or_else(|| panic!("service svc listed: {body}"))["columns"]
+            .as_array()
+            .expect("columns array")
+            .iter()
+            .find(|c| c["name"] == name)
+            .unwrap_or_else(|| panic!("column {name} listed: {body}"))
+            .clone()
+    };
+    let bounds = |name: &str| {
+        let c = column(name);
+        (
+            c["min_value"].as_str().map(str::to_owned),
+            c["max_value"].as_str().map(str::to_owned),
+        )
+    };
+    let formatted =
+        |t: chrono::DateTime<chrono::Utc>| format!("{}{SUFFIX}", t.format("%Y-%m-%dT%H:%M:%S%.6f"));
+
+    assert_eq!(
+        bounds("_time"),
+        (Some(formatted(early)), Some(formatted(late))),
+        "_time samples are the sent instants, formatted: {body}"
+    );
+
+    // `_ingested` is the arrival instant: its value is the server's, its
+    // shape is fixed-width micros with the same suffix as `_time`.
+    let (min, max) = bounds("_ingested");
+    for sample in [min, max] {
+        let sample = sample.unwrap_or_else(|| panic!("_ingested has samples: {body}"));
+        assert!(
+            is_fixed_width_instant(&sample, SUFFIX),
+            "_ingested sample {sample:?} is YYYY-MM-DDTHH:MM:SS.ffffff{SUFFIX}"
+        );
+    }
+
+    assert_eq!(
+        bounds("status"),
+        (Some("200".to_owned()), Some("503".to_owned())),
+        "a plain integer column keeps its numeric text: {body}"
+    );
+}
+
+/// Whether `text` is exactly `YYYY-MM-DDTHH:MM:SS.ffffff` followed by
+/// `suffix`, digit for digit.
+fn is_fixed_width_instant(text: &str, suffix: &str) -> bool {
+    const SHAPE: &[u8] = b"dddd-dd-ddTdd:dd:dd.dddddd";
+    let Some(stem) = text.strip_suffix(suffix) else {
+        return false;
+    };
+    stem.len() == SHAPE.len()
+        && stem.bytes().zip(SHAPE).all(|(b, &want)| match want {
+            b'd' => b.is_ascii_digit(),
+            _ => b == want,
+        })
+}
+
 /// Acceptance: a type conflict surfaces on `/schema/conflicts`, the field
 /// detail lists both services, and the nulled original stays findable via
 /// `_raw` search.
