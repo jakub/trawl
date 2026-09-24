@@ -123,8 +123,12 @@ impl WalWriter {
         }
     }
 
+    /// Create `wal_dir` if it is missing, and make its entry, and that of
+    /// every ancestor created for it, durable. An `Err` means the root may
+    /// not survive a power loss, so nothing may be acknowledged into it. A
+    /// root that already exists costs no fsync.
     pub fn ensure_dir(&self) -> std::io::Result<()> {
-        std::fs::create_dir_all(&self.wal_dir)
+        self.create_dir_all_durably(&self.wal_dir)
     }
 
     pub fn dir(&self) -> &Path {
@@ -149,7 +153,8 @@ impl WalWriter {
     /// environment directory in this process, including one recreated
     /// after removal, also fsyncs `wal_dir`, which holds the env
     /// directory's own entry, and fails before writing anything if that
-    /// sync fails.
+    /// sync fails. A write that finds `wal_dir` itself gone recreates it
+    /// through the same barrier as [`Self::ensure_dir`].
     ///
     /// Files land in `wal_dir/{env}/` (lazily created), named
     /// `{service}_{unix_millis}_{4_hex}.ndjson` with the service name
@@ -244,8 +249,10 @@ impl WalWriter {
             let created = match std::fs::create_dir(env_dir) {
                 Ok(()) => true,
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+                // `wal_dir` itself is gone, so its entry and those of any
+                // ancestors created with it need syncing too.
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    std::fs::create_dir_all(env_dir)?;
+                    self.create_dir_all_durably(env_dir)?;
                     true
                 }
                 Err(e) => return Err(e),
@@ -281,6 +288,23 @@ impl WalWriter {
         }
         self.durable_envs.lock().insert(env.to_owned(), identity);
         Ok(())
+    }
+
+    /// [`crate::epoch::create_dir_all_durably`] through this writer's
+    /// directory barrier, counting and logging a failed sync.
+    fn create_dir_all_durably(&self, dir: &Path) -> std::io::Result<()> {
+        crate::epoch::create_dir_all_durably(dir, |parent| {
+            self.sync_directory(parent).inspect_err(|e| {
+                Self::count_directory_sync_failure();
+                tracing::warn!(
+                    event_type = "wal_dir_fsync_failed",
+                    dir = %parent.display(),
+                    error = %e,
+                    "WAL directory fsync failed after creating a directory in it; \
+                     nothing is acknowledged into the new directory"
+                );
+            })
+        })
     }
 
     fn dir_identity(dir: &Path) -> std::io::Result<DirIdentity> {
@@ -326,8 +350,9 @@ impl WalWriter {
         std::fs::remove_file(path)
     }
 
-    /// Fail this writer's next directory barrier: the `wal_dir` sync of a
-    /// first write into an env, or the env directory sync after a rename.
+    /// Fail this writer's next directory barrier: the parent sync after
+    /// creating `wal_dir` or an ancestor, the `wal_dir` sync of a first
+    /// write into an env, or the env directory sync after a rename.
     #[cfg(any(test, feature = "test-support"))]
     pub fn fail_next_directory_sync_for_test(&self) {
         self.failing_directory_syncs
@@ -467,6 +492,80 @@ mod tests {
             let next = writer.write("lab", "first", b"{\"id\":2}\n").unwrap();
             assert_eq!(std::fs::read(next).unwrap(), b"{\"id\":2}\n");
             assert_eq!(sample(&handle, DIR_SYNC_FAILURES), 1);
+        });
+    }
+
+    #[test]
+    fn a_new_wal_root_is_durable_in_its_parent_before_the_first_ack() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("state").join("data").join("wal");
+        let writer = WalWriter::new(root.clone());
+        writer.ensure_dir().unwrap();
+        assert_eq!(
+            writer.take_synced_dirs_for_test(),
+            [
+                tmp.path().to_path_buf(),
+                tmp.path().join("state"),
+                tmp.path().join("state").join("data"),
+            ],
+            "each created directory's entry is synced, up to the first \
+             ancestor that already existed"
+        );
+        writer.write("prod", "first", b"{}\n").unwrap();
+        assert_eq!(
+            writer.take_synced_dirs_for_test(),
+            [root.clone(), root.join("prod")]
+        );
+        // A root that already exists costs no fsync.
+        writer.ensure_dir().unwrap();
+        assert_eq!(writer.take_synced_dirs_for_test(), Vec::<PathBuf>::new());
+    }
+
+    #[test]
+    fn a_failed_root_barrier_fails_ensure_dir_and_leaves_the_root_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = WalWriter::new(tmp.path().join("state").join("wal"));
+        writer.fail_next_directory_sync_for_test();
+        writer.ensure_dir().unwrap_err();
+        assert!(
+            !tmp.path().join("state").exists(),
+            "the created directories are removed, so a retry syncs them again"
+        );
+        writer.take_synced_dirs_for_test();
+        writer.ensure_dir().unwrap();
+        assert_eq!(
+            writer.take_synced_dirs_for_test(),
+            [tmp.path().to_path_buf(), tmp.path().join("state")]
+        );
+    }
+
+    #[test]
+    fn a_write_that_recreates_the_wal_root_acks_only_after_its_parent_sync() {
+        use crate::metrics::test_support::sample;
+        let recorder = crate::metrics::prometheus_builder().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            crate::metrics::init_operational_alert_metrics();
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("state").join("wal");
+            // No `ensure_dir`: the write finds the root missing, as after
+            // its removal at runtime.
+            let writer = WalWriter::new(root.clone());
+            writer.fail_next_directory_sync_for_test();
+            let err = writer.write("prod", "first", b"{\"id\":1}\n").unwrap_err();
+            assert!(matches!(err, WalWriteError::NotPublished(_)), "{err:?}");
+            assert_eq!(sample(&handle, DIR_SYNC_FAILURES), 1);
+            assert!(!tmp.path().join("state").exists());
+            writer.take_synced_dirs_for_test();
+
+            let path = writer.write("prod", "first", b"{\"id\":2}\n").unwrap();
+            assert_eq!(std::fs::read(path).unwrap(), b"{\"id\":2}\n");
+            let synced = writer.take_synced_dirs_for_test();
+            assert_eq!(
+                synced[..2],
+                [tmp.path().to_path_buf(), tmp.path().join("state")],
+                "the retry syncs the new root's parent chain before acking: {synced:?}"
+            );
         });
     }
 

@@ -55,17 +55,16 @@ pub fn ensure_current_epoch(
         if !ingest_enabled {
             return Ok(Outcome::ReadOnlyArchive);
         }
-        if let Some(parent) = data_root.parent().filter(|p| !p.as_os_str().is_empty()) {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("failed to create data parent {}: {e}", parent.display()))?;
-        }
-        // Do not adopt a root another process created after the absence check.
-        std::fs::create_dir(data_root)
+        // Compaction retires acknowledged WAL once its output is durable
+        // inside the root, so the root's own entry, and that of every
+        // ancestor created for it, must be durable first: without them a
+        // power loss drops the whole tree. A failed sync removes what it
+        // created, so the next boot creates and syncs it again. Exclusive
+        // creation does not adopt a root another process created after the
+        // absence check.
+        create_dir_all_durably(data_root, fsync_dir)
             .map_err(|e| format!("failed to create data root {}: {e}", data_root.display()))?;
         publish_epoch(data_root)?;
-        if let Some(parent) = data_root.parent() {
-            fsync_dir_best_effort(parent);
-        }
         return Ok(Outcome::FreshRoot);
     };
     if !meta.is_dir() {
@@ -340,6 +339,59 @@ pub(crate) fn fsync_dir(dir: &Path) -> std::io::Result<()> {
         return Err(std::io::Error::other("injected directory fsync failure"));
     }
     std::fs::File::open(dir).and_then(|d| d.sync_all())
+}
+
+/// Create `dir` and any missing ancestors, then fsync the parent of each
+/// directory created, top down, so every new entry survives a power loss.
+/// The first sync is of the nearest ancestor that already existed.
+///
+/// A directory that already exists costs one `stat` and no fsync. Every
+/// missing directory is created exclusively, so one that another process
+/// creates first is an `AlreadyExists` error rather than adopted. On any
+/// error the directories this call created are removed again, deepest
+/// first and only while empty, so a retry finds them missing and repeats
+/// the syncs instead of trusting entries that may not be durable.
+pub(crate) fn create_dir_all_durably(
+    dir: &Path,
+    mut sync: impl FnMut(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let mut missing = Vec::new();
+    let mut current = dir;
+    loop {
+        match std::fs::metadata(current) {
+            Ok(_) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => missing.push(current),
+            Err(e) => return Err(e),
+        }
+        match current.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => current = parent,
+            _ => break,
+        }
+    }
+    missing.reverse();
+    let mut created = 0;
+    let result = missing.iter().try_for_each(|&new| {
+        std::fs::create_dir(new)?;
+        created += 1;
+        Ok(())
+    });
+    let result = result.and_then(|()| {
+        missing.iter().try_for_each(|new| {
+            sync(
+                new.parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or(Path::new(".")),
+            )
+        })
+    });
+    if result.is_err() {
+        for new in missing[..created].iter().rev() {
+            if std::fs::remove_dir(new).is_err() {
+                break;
+            }
+        }
+    }
+    result
 }
 
 /// Unit-test injection for [`fsync_dir`]: fail every fsync of one directory
@@ -823,6 +875,31 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.join(".marker")).unwrap(),
             "body"
+        );
+    }
+
+    #[test]
+    fn a_fresh_data_root_fails_boot_until_every_new_entry_is_durable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        let data = state.join("data");
+        let wal = data.join("wal");
+        // The first ancestor that already existed holds `state`'s entry,
+        // and `state` holds the data root's.
+        for failing in [tmp.path().to_path_buf(), state.clone()] {
+            let _fail = fail_dir_fsync::set(&failing);
+            let err = ensure_current_epoch(&data, &wal, true).unwrap_err();
+            assert!(err.contains("injected directory fsync failure"), "{err}");
+            assert!(
+                !state.exists(),
+                "a failed barrier removes what it created, so the next boot \
+                 syncs it again ({})",
+                failing.display()
+            );
+        }
+        assert_eq!(
+            ensure_current_epoch(&data, &wal, true).unwrap(),
+            Outcome::FreshRoot
         );
     }
 
