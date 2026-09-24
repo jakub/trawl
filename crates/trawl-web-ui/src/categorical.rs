@@ -251,9 +251,9 @@ fn minted_before(stages: &[Spanned<PipeStage>]) -> Option<HashSet<String>> {
 ///
 /// Trailing pass-through stages are skipped: a later `sort` or `head`
 /// does not change what the columns mean. Any other trailing stage does
-/// (a `let`, a `rename`, another aggregation), and so does an earlier
-/// `stats` followed by another one: only the final aggregation names the
-/// columns the response carries, so such a query draws no chart.
+/// (a `let`, a `rename`, a non-`stats` aggregation), so such a query
+/// draws no chart. When a query runs `stats` more than once, only the
+/// last one counts: it names the columns the response carries.
 fn last_stats(query: &str) -> Option<StatsStage> {
     let ast = trawl_core::parser::parse(query).ok()?;
     final_stats(&ast.pipeline).map(|(_, stats)| stats.clone())

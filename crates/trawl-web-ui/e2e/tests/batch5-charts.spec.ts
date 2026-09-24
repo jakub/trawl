@@ -283,8 +283,10 @@ test('subsecond events fall inside their histogram tooltip intervals', async ({ 
 });
 
 test('histogram tooltip stays inside the strip at both edges', async ({ page }) => {
-  // Events in the first and the last bucket, both errors, so the two
-  // edge bars carry the longest tip text this strip draws.
+  // Two error events at .100 and .900 over the one-second minimum span:
+  // they land in buckets 0 and 38, so bar 0 carries the longest tip text
+  // and bar 47 an empty bucket's shorter one. The clamp is measured per
+  // tip, so each edge is checked with whatever text its bar draws.
   const events = [['2026-09-01T00:00:00.100Z', 17], ['2026-09-01T00:00:00.900Z', 17]];
   await page.route('**/api/v1/query', route => route.fulfill({ json: { ...countResult, columns: [{ name: '_time' }, { name: '_severity' }], rows: events } }));
   await page.goto('/search?q=service%3Dnginx');
