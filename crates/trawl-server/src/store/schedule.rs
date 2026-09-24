@@ -50,7 +50,7 @@ use sqlx::{AssertSqlSafe, PgPool, Row as _};
 use super::error::{PgViolation, StoreError, WindowWriteError, classify_violation};
 use super::history::{bind_u64, bind_usize};
 use super::saved::{SavedQuery, row_to_saved_query_at};
-use super::status::{RunStatus, decode_status};
+use super::status::{RunOrigin, RunStatus, decode_origin, decode_status};
 use crate::report_window::{
     Due, MaterializeError, PlanError, PlanInput, ReportWindow, ScheduleWindow, WindowKind,
     WindowPolicyError, materialize_window, plan_due_run, validate_window_compatibility,
@@ -121,6 +121,9 @@ pub struct ReportRun {
     /// current mode wherever finishing the run has to know, so an edit
     /// racing the run cannot change what the run means.
     pub window_kind: Option<WindowKind>,
+    /// Whether the scheduler or an operator started this run. `None` only
+    /// for a run claimed before origins were recorded.
+    pub origin: Option<RunOrigin>,
 }
 
 /// Outcome of a transactional run claim ([`ScheduleStore::claim_run`]).
@@ -533,6 +536,7 @@ pub(crate) fn row_to_report_run_at(row: &PgRow, prefix: &str) -> Result<ReportRu
         window_end: row.try_get(col("window_end").as_str())?,
         window_truncated: row.try_get(col("window_truncated").as_str())?,
         window_kind: decode_run_window_kind(row, prefix)?,
+        origin: decode_origin(row, col("origin").as_str())?,
     })
 }
 
@@ -553,6 +557,7 @@ pub(crate) const LATEST_RUN_COLS: &str = "lr.id             AS r_id,
      lr.saved_query_id AS r_saved_query_id,
      lr.query          AS r_query,
      lr.status         AS r_status,
+     lr.origin         AS r_origin,
      lr.started_at     AS r_started_at,
      lr.finished_at    AS r_finished_at,
      lr.duration_ms    AS r_duration_ms,
@@ -596,7 +601,7 @@ pub(crate) fn latest_run_and_count_from_row(
 const SCHEDULE_COLS: &str = "id, saved_query_id, key_id, interval_secs, max_runs, enabled, \
      window_kind, window_secs, lag_secs, covered_through, next_fire_at, created_at, updated_at";
 
-const RUN_COLS: &str = "id, schedule_id, saved_query_id, query, status, started_at, finished_at, \
+const RUN_COLS: &str = "id, schedule_id, saved_query_id, query, status, origin, started_at, finished_at, \
      duration_ms, row_count, error_message, result_path, window_start, window_end, \
      window_truncated, window_kind";
 
@@ -991,6 +996,9 @@ impl ScheduleStore {
     /// row at claim time because that is when it is decided. `None` writes
     /// all three bound columns NULL: the query owns its own time clause and
     /// trawl claims no coverage for it.
+    ///
+    /// The row records origin `scheduled`. An operator's run goes through
+    /// [`Self::claim_manual_run`], which plans its own window.
     pub async fn claim_run(
         &self,
         schedule_id: i64,
@@ -1043,8 +1051,16 @@ impl ScheduleStore {
             }
         }
 
-        let inserted =
-            insert_running_run(&mut tx, schedule_id, saved_query_id, query, window).await;
+        let inserted = insert_running_run(
+            &mut tx,
+            schedule_id,
+            saved_query_id,
+            query,
+            window,
+            RunOrigin::Scheduled,
+            None,
+        )
+        .await;
 
         match inserted {
             Ok(id) => {
@@ -1158,7 +1174,17 @@ impl ScheduleStore {
 
         // Level 3. A manual run is query mode by definition, so it records
         // no window and nothing is spliced onto the text.
-        match insert_running_run(&mut tx, schedule.id, saved_query_id, &query, None).await {
+        match insert_running_run(
+            &mut tx,
+            schedule.id,
+            saved_query_id,
+            &query,
+            None,
+            RunOrigin::Manual,
+            None,
+        )
+        .await
+        {
             Ok(run_id) => {
                 tx.commit().await?;
                 tracing::info!(
@@ -1301,6 +1327,8 @@ impl ScheduleStore {
             saved_query_id,
             &resolved_query,
             plan.window.as_ref(),
+            RunOrigin::Scheduled,
+            None,
         )
         .await
         {
@@ -2128,9 +2156,15 @@ fn log_schedule_updated(schedule: &Schedule) {
 ///
 /// ONE spelling of the statement for its three claimants:
 /// [`ScheduleStore::claim_run`], [`ScheduleStore::claim_manual_run`] and
-/// [`ScheduleStore::claim_due_run`]. All three write the same nine columns,
-/// and a second copy would be a second place for the window columns to be
-/// forgotten. The raw `sqlx::Error` comes back so each caller classifies
+/// [`ScheduleStore::claim_due_run`]. All three write the same columns, and a
+/// second copy would be a second place for the window columns to be
+/// forgotten. `origin` has no default for the same reason: every claimant
+/// has to say how its run started.
+///
+/// `started_at` is `None` for the database's own `now()`, which is what a
+/// scheduled claim records. A manual claim passes the instant it planned
+/// its window from, so the run's start and the clock its window was
+/// measured against are one reading. The raw `sqlx::Error` comes back so each caller classifies
 /// the `report_runs_one_running` 23505 into its own answer.
 ///
 /// This statement takes a lock it does not name. The `saved_query_id`
@@ -2145,12 +2179,14 @@ async fn insert_running_run(
     saved_query_id: i64,
     query: &str,
     window: Option<&ReportWindow>,
+    origin: RunOrigin,
+    started_at: Option<DateTime<Utc>>,
 ) -> Result<i64, sqlx::Error> {
     sqlx::query_scalar::<_, i64>(
         "INSERT INTO report_runs
              (schedule_id, saved_query_id, query, status, started_at,
-              window_start, window_end, window_truncated, window_kind)
-         VALUES ($1, $2, $3, 'running', now(), $4, $5, $6, $7)
+              window_start, window_end, window_truncated, window_kind, origin)
+         VALUES ($1, $2, $3, 'running', COALESCE($8, now()), $4, $5, $6, $7, $9)
          RETURNING id",
     )
     .bind(schedule_id)
@@ -2160,6 +2196,8 @@ async fn insert_running_run(
     .bind(window.map(|w| w.end))
     .bind(window.map(|w| w.truncated))
     .bind(window.map(|w| w.kind.as_str()))
+    .bind(started_at)
+    .bind(origin.as_str())
     .fetch_one(conn)
     .await
 }

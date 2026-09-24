@@ -1533,6 +1533,11 @@ pub struct ReportRunSummary {
     /// The mode the run was claimed under: `"since_last"` or `"fixed"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window_kind: Option<String>,
+    /// How the run started: `"scheduled"` at a planned fire, or `"manual"`
+    /// when an operator fired the schedule's next window early. Absent for
+    /// a run recorded before origins were.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
 }
 
 /// Paginated list of report runs.

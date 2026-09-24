@@ -33,7 +33,9 @@ use trawl_server::report_window::{
     ScheduleWindow, WindowKind, format_window_bound, truncate_to_micros,
 };
 use trawl_server::scheduler::poll_and_execute;
-use trawl_server::store::{ReportRun, RunStatus, SavedQueryStore, ScheduleStore, StorageState};
+use trawl_server::store::{
+    ReportRun, RunOrigin, RunStatus, SavedQueryStore, ScheduleStore, StorageState,
+};
 
 /// The saved DSL every windowed schedule here runs.
 const DSL: &str = "service=fx | table _time";
@@ -397,6 +399,7 @@ async fn since_last_fires_tile_and_a_boundary_event_lands_once() {
             "windows tile on the planned fires, not on the ticks"
         );
         assert_eq!(run.window_kind, Some(WindowKind::SinceLast));
+        assert_eq!(run.origin, Some(RunOrigin::Scheduled), "a tick's run");
         assert_eq!(
             run.query,
             resolved(start, end),

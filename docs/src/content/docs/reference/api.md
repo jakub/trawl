@@ -1471,6 +1471,7 @@ A run summary has these fields:
 | `window_start`, `window_end` | string | The half-open interval `[start, end)` the run covered |
 | `window_truncated` | boolean | `true` when a `since_last` catch-up gap exceeded `[scheduler] max_catchup_intervals` and the start was moved forward |
 | `window_kind` | string | `since_last` or `fixed`, the mode the run was claimed under |
+| `origin` | string | `scheduled` for a run the scheduler started at a planned fire, `manual` for a run started with `POST /api/v1/saved/{id}/run`. Absent for a run recorded before origins were. |
 
 The four `window_*` fields are absent together for a run without a window: a query-mode run or a manual run.
 

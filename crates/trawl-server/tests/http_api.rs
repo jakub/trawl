@@ -3506,6 +3506,11 @@ async fn run_listing_carries_window_and_truncated_flag() {
         "false is the positive claim that the run covers everything it owed"
     );
     assert_eq!(complete.window_kind.as_deref(), Some("since_last"));
+    assert_eq!(
+        complete.origin.as_deref(),
+        Some("scheduled"),
+        "a run claimed through the scheduler's door says so on the wire"
+    );
 
     assert_eq!(row(truncated).window_truncated, Some(true));
 

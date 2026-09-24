@@ -40,8 +40,8 @@ use crate::report_window::{ScheduleWindow, format_window_bound};
 use crate::scheduler::execute_scheduled_query;
 use crate::state::{AppState, CachedFieldValues};
 use crate::store::{
-    HistoryEntry, ManualRunClaim, ReportRun, RunStatus, SavedQuery, Schedule, ScheduleWithStats,
-    format_interval, parse_duration_secs, parse_interval,
+    HistoryEntry, ManualRunClaim, ReportRun, RunOrigin, RunStatus, SavedQuery, Schedule,
+    ScheduleWithStats, format_interval, parse_duration_secs, parse_interval,
 };
 
 // -- handlers ----------------------------------------------------------------
@@ -2140,6 +2140,7 @@ fn report_run_summary(run: ReportRun) -> ReportRunSummary {
         window_end: run.window_end.map(format_window_bound),
         window_truncated: run.window_truncated,
         window_kind: run.window_kind.map(|k| k.as_str().to_owned()),
+        origin: run.origin.map(|o| o.as_str().to_owned()),
     }
 }
 
@@ -2815,6 +2816,7 @@ pub async fn trigger_run(
         window_end: None,
         window_truncated: None,
         window_kind: None,
+        origin: Some(RunOrigin::Manual.as_str().to_owned()),
     };
 
     let schedule_store = state.storage.schedule.clone();
