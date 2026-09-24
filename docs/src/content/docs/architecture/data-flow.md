@@ -41,7 +41,7 @@ A bounded Tokio broadcast channel shares each batch with live subscribers. A slo
 
 ## Compaction
 
-The compactor finds eligible WAL files, groups them by service and environment, takes catalog pins, conforms the batch, and merges it into the existing hourly file. Publication and hot drain happen together under the write guard, then bookkeeping runs and the processed WAL files are removed. Failed work keeps its inputs for diagnosis. Read [catalog conformance](/architecture/catalog/#write-time-conformance) for the cast rules.
+The compactor finds eligible WAL files, groups them by service and environment, takes catalog pins, conforms the batch, and merges it into the existing hourly file. A [publication marker](/architecture/recovery/#publication-markers) records each publish before the output is renamed into place. Publication and hot drain happen together under the write guard. The consumed WAL files are then retired, the marker is removed, and bookkeeping runs. Failed work keeps its inputs for diagnosis. Read [catalog conformance](/architecture/catalog/#write-time-conformance) for the cast rules.
 
 Compaction reads each row's `_time` and `_ingested` with `TRY_CAST`. If a value is unusable, it falls back to the arrival instant in that row's own WAL filename, then to the compaction instant. The fallback is per row. Canonicalized events already have valid timestamps.
 
