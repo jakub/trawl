@@ -871,9 +871,12 @@ fn the_run_now_fixtures_carry_a_manual_window_and_a_refusal() {
             .as_deref()
             .expect("a windowed run carries its end"),
     );
-    assert!(
-        run.query
-            .starts_with(&format!("earliest=\"{start}\" latest=\"{end}\" ")),
+    assert_eq!(
+        run.query,
+        format!(
+            "earliest=\"{start}\" latest=\"{end}\" {}",
+            saved.queries[1].query
+        ),
         "the stored text is the saved text with the window spliced in front",
     );
     // The spec's toast expectation is written against these two bounds.
