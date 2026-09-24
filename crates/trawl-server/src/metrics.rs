@@ -519,8 +519,8 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         SCHEDULER_WINDOW_TRUNCATED_TOTAL,
-        "Scheduled report runs whose since_last catch-up window was clamped \
-         to max_catchup_intervals"
+        "Report runs, scheduled or manual, whose since_last catch-up window \
+         was clamped to max_catchup_intervals"
     );
     describe_counter!(
         AUTH_FAILURES_TOTAL,

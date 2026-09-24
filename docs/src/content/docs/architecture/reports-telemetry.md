@@ -15,7 +15,7 @@ A saved query plus a schedule produces stored report runs. PostgreSQL holds the 
 
 The scheduler fires on a planned cursor, not on time elapsed since the last run. A slow run, a late poll, and a restart leave the cursor where it was. When several boundaries have passed, the tick takes the latest one at or before now, so missed fires coalesce into one run.
 
-Coalescing has a limit, because a week of downtime would otherwise produce one week-wide query. A gap wider than `max_catchup_intervals` clamps the window start forward, and the run records `window_truncated: true` and increments `trawl_scheduler_window_truncated_total`. Alert on that counter. A truncated run leaves part of the catch-up outside any report, though those events stay in the corpus.
+Coalescing has a limit, because a week of downtime would otherwise produce one week-wide query. A gap wider than `max_catchup_intervals` clamps the window start forward, and the run records `window_truncated: true` and increments `trawl_scheduler_window_truncated_total`. A manual run of a `since_last` schedule is clamped and counted the same way, so the counter sees scheduled and manual runs alike. Alert on that counter. A truncated run leaves part of the catch-up outside any report, though those events stay in the corpus.
 
 ### Why lag delays coverage
 
