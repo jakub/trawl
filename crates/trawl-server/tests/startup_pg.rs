@@ -25,6 +25,7 @@ struct Fixture {
     app: PgPool,
     internal_telemetry: bool,
     log_file: Option<PathBuf>,
+    compaction_interval_secs: Option<u64>,
 }
 
 impl Fixture {
@@ -44,6 +45,7 @@ impl Fixture {
             app,
             internal_telemetry: false,
             log_file: None,
+            compaction_interval_secs: None,
         }
     }
 
@@ -156,7 +158,7 @@ impl Fixture {
              [data]\npath = {}\n[auth]\ndatabase_url = {}\naudit_interval_secs = 0\n\
              [storage]\ndatabase_url = {}\n\
              [ingest]\nenabled = true\ninternal_telemetry = {telemetry}\nwal_dir = {}\n\
-             envs = ['prod']\ndefault_env = 'prod'\n\
+             envs = ['prod']\ndefault_env = 'prod'\n{compaction}\
              [retention]\nmax_age_days = 0\nmin_free_disk_bytes = 0\n\
              [scheduler]\nenabled = false\n",
             quote(&cert.to_string_lossy()),
@@ -166,6 +168,11 @@ impl Fixture {
             quote(&self.app_url),
             quote(&self.storage_root().join("wal").to_string_lossy()),
             telemetry = self.internal_telemetry,
+            compaction = self
+                .compaction_interval_secs
+                .map_or_else(String::new, |secs| {
+                    format!("compaction_interval_secs = {secs}\n")
+                }),
             log_file = self.log_file.as_ref().map_or_else(String::new, |path| {
                 format!("log_file = {}", quote(&path.to_string_lossy()))
             }),
@@ -700,6 +707,121 @@ async fn fresh_boot_restart_and_interrupted_current_cutover() {
     assert!(!aside.exists());
     assert!(!trawl_server::repin::shadow_root(&fixture.data()).exists());
     assert!(!trawl_server::repin::marker_path(&fixture.data()).exists());
+    daemon.stop().await;
+    fixture.assert_lock_free().await;
+}
+
+/// AC8 (#252): publication recovery runs at boot, before the listener and
+/// every producer. One marker records a publish whose output is in place
+/// (canonical identity matches); the other records one that never renamed
+/// (canonical absent, tmp present). After the boot, both markers are gone,
+/// the published WAL is retired, the unpublished WAL is kept and its tmp is
+/// removed, and both outcomes are logged before the listener line. A long
+/// compaction interval keeps the first tick, which would also recover,
+/// out of the picture.
+#[tokio::test]
+async fn boot_recovers_publication_markers_before_serving() {
+    use trawl_server::ingest::publication_marker::{ValidatedMarker, identity_of, write_marker};
+
+    let mut fixture = Fixture::new().await;
+    fixture.current_fleet().await;
+    fixture.compaction_interval_secs = Some(3600);
+    // A first boot initializes the data root and databases, as a daemon
+    // that later crashed mid-publish would have.
+    let mut daemon = fixture.spawn();
+    daemon.ready().await;
+    daemon.stop().await;
+    fixture.assert_lock_free().await;
+
+    let wal = fixture.storage_root().join("wal");
+    let data = fixture.data();
+    let day = chrono::NaiveDate::from_ymd_opt(2026, 9, 22).unwrap();
+    std::fs::create_dir_all(wal.join("prod")).unwrap();
+    let plant = |service: &str, seq: u32| {
+        let name = format!("{service}_1730000000000_{seq:04x}.ndjson");
+        let path = wal.join("prod").join(&name);
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"_time":"2026-09-22T07:00:00Z","_ingested":"2026-09-22T07:00:00Z","service":"{service}","message":"m"}}"#
+            ),
+        )
+        .unwrap();
+        (name, path)
+    };
+
+    // Published: the canonical output carries the recorded identity.
+    let (api_name, api_wal) = plant("api", 1);
+    let canonical = data.join("prod/2026-09-22/07/api.parquet");
+    std::fs::create_dir_all(canonical.parent().unwrap()).unwrap();
+    let conn = duckdb::Connection::open_in_memory().unwrap();
+    conn.execute_batch(&format!(
+        "COPY (SELECT TIMESTAMP '2026-09-22 07:00:00' AS _time,
+         TIMESTAMP '2026-09-22 07:00:01' AS _ingested, 'raw' AS _raw,
+         NULL::VARCHAR AS _repairs, 'prod' AS env, 'api' AS service,
+         'host' AS host, 9::BIGINT AS severity, 'info' AS severity_text)
+         TO '{}' (FORMAT PARQUET)",
+        canonical.to_string_lossy().replace('\'', "''")
+    ))
+    .unwrap();
+    let api_marker = ValidatedMarker::new(
+        "prod",
+        "api",
+        day,
+        7,
+        vec![api_name],
+        identity_of(&canonical).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(api_marker.canonical(&data), canonical);
+    write_marker(&wal, &api_marker).unwrap();
+
+    // Unpublished: the tmp is in place and the canonical output is absent.
+    let (web_name, web_wal) = plant("web", 2);
+    let web_tmp = data.join("prod/2026-09-22/07/web.parquet.tmp");
+    std::fs::write(&web_tmp, b"PAR1 staged output PAR1").unwrap();
+    let web_marker = ValidatedMarker::new(
+        "prod",
+        "web",
+        day,
+        7,
+        vec![web_name],
+        identity_of(&web_tmp).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(web_marker.tmp(&data), web_tmp);
+    write_marker(&wal, &web_marker).unwrap();
+
+    let mut daemon = fixture.spawn();
+    daemon.ready().await;
+    assert!(
+        !api_marker.marker_path(&wal).exists(),
+        "published marker removed"
+    );
+    assert!(
+        !web_marker.marker_path(&wal).exists(),
+        "unpublished marker removed"
+    );
+    assert!(!api_wal.exists(), "published WAL retired");
+    assert!(canonical.is_file(), "published output kept");
+    assert!(web_wal.is_file(), "unpublished WAL kept for compaction");
+    assert!(!web_tmp.exists(), "unpublished tmp removed");
+    assert!(!web_marker.canonical(&data).exists());
+
+    let log = daemon.log();
+    let line_of = |needle: &dyn Fn(&str) -> bool| log.lines().position(needle);
+    let listener = line_of(&|line| line.contains("HTTPS server listening")).expect("listener line");
+    for outcome in ["published", "unpublished"] {
+        let recovered = line_of(&|line| {
+            line.contains("event_type=\"publication_recovered\"")
+                && line.contains(&format!("outcome=\"{outcome}\""))
+        })
+        .unwrap_or_else(|| panic!("no {outcome} recovery line: {log}"));
+        assert!(
+            recovered < listener,
+            "{outcome} recovery must precede the listener: {log}"
+        );
+    }
     daemon.stop().await;
     fixture.assert_lock_free().await;
 }

@@ -1953,8 +1953,9 @@ or prove that compaction is making progress.
 ### Publication recovery outcomes
 
 `trawl_publication_recovery_total{outcome}` counts the publication markers
-that recovery examined. Each compaction tick runs recovery before it
-compacts. `TrawlPublicationRecoveryBlocked` selects the `contradictory` and
+that recovery examined. Recovery runs once at boot, before the daemon
+serves, and again at the start of each compaction tick.
+`TrawlPublicationRecoveryBlocked` selects the `contradictory` and
 `failed` outcomes. All four outcomes are initialized at zero after recorder
 installation.
 
