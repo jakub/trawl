@@ -409,6 +409,59 @@ test('a hovered histogram tooltip is re-placed when new bars render under it', a
   await expect.poll(fits).toBe(true);
 });
 
+test('the deferred tip placement is skipped once the histogram unmounts', async ({ page, pageErrors }) => {
+  // After the bars render, the histogram places every tip in an
+  // animation frame, and nothing cancels that frame when the strip goes
+  // away. Hold every frame the page asks for, unmount the histogram
+  // while its placement is still queued, then run the queue: the late
+  // callback must find the strip gone and do nothing.
+  await page.addInitScript(() => {
+    const native = window.requestAnimationFrame.bind(window);
+    const cancel = window.cancelAnimationFrame.bind(window);
+    const held = new Map<number, FrameRequestCallback>();
+    let next = -1;
+    const w = window as any;
+    w.__holdFrames = true;
+    w.__heldFrames = () => held.size;
+    // Each held callback runs from its own task, as a frame would, so a
+    // throw reaches the page as an uncaught error and not the caller.
+    w.__releaseFrames = () => {
+      w.__holdFrames = false;
+      const queued = [...held.values()];
+      held.clear();
+      for (const cb of queued) setTimeout(() => cb(performance.now()), 0);
+    };
+    window.requestAnimationFrame = (cb: FrameRequestCallback) => {
+      if (!w.__holdFrames) return native(cb);
+      const id = next--;
+      held.set(id, cb);
+      return id;
+    };
+    window.cancelAnimationFrame = (id: number) => {
+      if (id < 0) held.delete(id);
+      else cancel(id);
+    };
+  });
+  const panics: string[] = [];
+  page.on('console', msg => { if (/panicked/.test(msg.text())) panics.push(msg.text()); });
+  const events = [['2026-09-01T00:00:00.100Z', 17], ['2026-09-01T00:00:00.900Z', 17]];
+  await page.route('**/api/v1/query', route => route.fulfill({ json: { ...countResult, columns: [{ name: '_time' }, { name: '_severity' }], rows: events } }));
+  await page.goto('/search?q=service%3Dnginx');
+  await expect(page.locator('.histo .bar')).toHaveCount(48);
+  expect(await page.evaluate(() => (window as any).__heldFrames()), 'the placement is queued').toBeGreaterThan(0);
+
+  // The Visualization tab renders no histogram, so switching disposes it.
+  await page.getByRole('tab', { name: 'Visualization' }).click();
+  await expect(page.locator('.histo')).toHaveCount(0);
+
+  await page.evaluate(() => (window as any).__releaseFrames());
+  // Tasks queued after the released ones run after them, so once this
+  // resolves every held callback has run.
+  await page.evaluate(() => new Promise(resolve => setTimeout(() => resolve(null), 0)));
+  expect(panics).toEqual([]);
+  expect(pageErrors.errors.map(e => e.message)).toEqual([]);
+});
+
 test('numeric group keys are series, labelled by their own digits', async ({ page }) => {
   // `by status` over 200 and 500: the roles come from the query, so the
   // numbers in the group column are two series and not two metrics.

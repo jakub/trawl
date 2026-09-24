@@ -91,9 +91,13 @@ pub fn Histogram(
                     let min = series.min_secs;
                     // New buckets or labels replace every bar, and the
                     // strip keeps its size, so the observer stays quiet.
-                    // Place the new tips once they are laid out.
+                    // Place the new tips once they are laid out. Nothing
+                    // cancels the frame, and switching tab or leaving the
+                    // page can dispose the strip before it runs; a
+                    // disposed ref reads as `None` and the frame does
+                    // nothing.
                     request_animation_frame(move || {
-                        if let Some(strip) = strip.get_untracked() {
+                        if let Some(strip) = strip.try_get_untracked().flatten() {
                             place_all_tips(&strip);
                         }
                     });
