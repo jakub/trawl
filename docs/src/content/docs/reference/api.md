@@ -1890,6 +1890,7 @@ Prometheus scrape-target labels are separate and remain on every alert.
 | `TrawlWalDurabilityDegraded` | `trawl_wal_durability_failures_total{operation="parent_directory_sync"}` | Failed WAL directory sync operations, each of which rejected its write; counted by the WAL writer |
 | `TrawlCompactionOperationFailure` | `trawl_compaction_operation_failures_total{operation}` | Explicit failed attempts, using the eight closed operations below |
 | `TrawlFileQuarantine` | `trawl_files_quarantined_total{kind}` | Files successfully renamed into quarantine; `kind` is `wal`, `parquet`, or `rollup_temporary` |
+| `TrawlPublicationRecoveryBlocked` | `trawl_publication_recovery_total{outcome=~"contradictory\|failed"}` | Publication markers that recovery left blocking their service, counted once per marker per recovery pass |
 
 The telemetry drop counter's closed `reason` set is `preinit_cap`,
 `buffer_cap`, `write_crashed`, and `unmetered_cap`. The capacity and
@@ -1901,7 +1902,7 @@ inclusive failed-attempt counter; both telemetry failure alerts can fire.
 The WAL durability counter has only `operation="parent_directory_sync"`.
 Existing HTTP rejection reasons other than `wal_failure` remain diagnostic.
 
-All 20 selected finite series are initialized at zero after recorder
+All 22 selected finite series are initialized at zero after recorder
 installation and before the first scrape, independently of feature enablement.
 Initialization preserves accumulated values. The exporter has no idle expiry
 for these baselines. Counters reset when the process restarts.
@@ -1953,8 +1954,9 @@ or prove that compaction is making progress.
 
 `trawl_publication_recovery_total{outcome}` counts the publication markers
 that recovery examined. Each compaction tick runs recovery before it
-compacts. No alert selects this counter. All four outcomes are initialized
-at zero after recorder installation.
+compacts. `TrawlPublicationRecoveryBlocked` selects the `contradictory` and
+`failed` outcomes. All four outcomes are initialized at zero after recorder
+installation.
 
 | `outcome` | Meaning |
 | --- | --- |

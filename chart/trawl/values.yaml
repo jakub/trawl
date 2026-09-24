@@ -440,6 +440,9 @@ prometheusRule:
     TrawlFileQuarantine:
       enabled: true
       severity: warning
+    TrawlPublicationRecoveryBlocked:
+      enabled: true
+      severity: warning
 
 # -- Prometheus ServiceMonitor (requires prometheus-operator CRDs)
 serviceMonitor:

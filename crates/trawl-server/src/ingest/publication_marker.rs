@@ -471,6 +471,21 @@ impl PublicationClaims {
                 .outputs
                 .contains(&(env.to_owned(), date, hour, service.to_owned()))
     }
+
+    /// Whether any hourly output of `service` on `date` in `env` is claimed,
+    /// so the daily rollup must leave that day's hourly files of the service
+    /// alone.
+    pub fn claims_service_day(&self, env: &str, date: NaiveDate, service: &str) -> bool {
+        self.unseen(env)
+            || self.unlisted_envs.contains(env)
+            || self
+                .unknown_services
+                .contains(&(env.to_owned(), service.to_owned()))
+            || self
+                .outputs
+                .iter()
+                .any(|(e, d, _, s)| e == env && *d == date && s == service)
+    }
 }
 
 /// Collect the claims of every marker under `wal_dir`. A missing root has no
@@ -1328,6 +1343,10 @@ mod tests {
         assert!(claims.claims_output(ENV, date(), 7, SERVICE));
         assert!(!claims.claims_output(ENV, date(), 8, SERVICE));
         assert!(!claims.claims_output(ENV, date(), 7, "postgres"));
+        assert!(claims.claims_service_day(ENV, date(), SERVICE));
+        assert!(!claims.claims_service_day(ENV, date().pred_opt().unwrap(), SERVICE));
+        assert!(!claims.claims_service_day(ENV, date(), "postgres"));
+        assert!(!claims.claims_service_day("lab", date(), SERVICE));
     }
 
     #[test]
@@ -1346,6 +1365,8 @@ mod tests {
         assert!(!claims.claims_date("lab", date()));
         assert!(claims.claims_output(ENV, date(), 3, SERVICE));
         assert!(!claims.claims_output(ENV, date(), 3, "postgres"));
+        assert!(claims.claims_service_day(ENV, date(), SERVICE));
+        assert!(!claims.claims_service_day(ENV, date(), "postgres"));
     }
 
     #[test]
@@ -1394,6 +1415,7 @@ mod tests {
         assert!(claims.blocks_service("lab", "postgres"));
         assert!(claims.claims_date("lab", date()));
         assert!(claims.claims_output("lab", date(), 7, "postgres"));
+        assert!(claims.claims_service_day("lab", date(), "postgres"));
         let report = report.unwrap();
         assert!(report.root_incomplete);
         assert!(report.entries.is_empty());

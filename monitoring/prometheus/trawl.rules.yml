@@ -81,3 +81,11 @@ groups:
           summary: "Files were quarantined on {{ $labels.instance }}"
           description: "Target {{ $labels.job }}/{{ $labels.instance }}: Files of kind {{ $labels.kind }} were isolated with bytes retained. Source files may remain intact; do not delete or replay automatically. An increase was observed in the last 10 minutes; resolution does not establish recovery."
           runbook_url: "https://trawl.sh/operate/operational-alerts/#file-quarantine"
+      - alert: TrawlPublicationRecoveryBlocked
+        expr: increase(trawl_publication_recovery_total{job="trawl",outcome=~"contradictory|failed"}[10m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Publication recovery left a service blocked on {{ $labels.instance }}"
+          description: "Target {{ $labels.job }}/{{ $labels.instance }}: Recovery reported outcome {{ $labels.outcome }} for a publication marker. The marker keeps its service out of compaction, and a contradictory marker stays until an operator resolves it. An increase was observed in the last 10 minutes; resolution does not establish recovery."
+          runbook_url: "https://trawl.sh/operate/operational-alerts/#publication-recovery-blocked"

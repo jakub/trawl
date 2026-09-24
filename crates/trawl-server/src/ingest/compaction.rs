@@ -217,9 +217,11 @@ pub async fn compact_once_coordinated(
     let (recovery_blocked, claims) =
         recover_publications(wal_dir, data_dir, hot_buffer, repin).await?;
 
-    // Remove orphaned .parquet.tmp files from interrupted compaction runs.
-    for (_env, env_data_dir) in list_env_dirs(data_dir) {
-        cleanup_stale_tmp_files(&env_data_dir, min_age * 2);
+    // Remove orphaned .parquet.tmp files from interrupted compaction runs,
+    // except any a pending marker still claims: recovery needs that tmp to
+    // roll its publish back.
+    for (env, env_data_dir) in list_env_dirs(data_dir) {
+        cleanup_stale_tmp_files(&env, &env_data_dir, min_age * 2, &claims);
     }
 
     for (env, env_wal_dir) in env_wal_dirs {
@@ -364,17 +366,33 @@ pub async fn compact_once_coordinated(
         );
     }
     let rollup_failures = if daily_rollup && !rollup_suppressed {
-        match rollup_once(
-            data_dir,
-            memory_limit,
-            repin,
-            hot_buffer.map(|buf| buf.publication()),
-        )
-        .await
-        {
-            Ok(n) => n,
+        // Scan again: a publish that failed during this tick left a marker
+        // the scan before compaction could not see, and rollup must not
+        // move the hourly file it names.
+        match scan_claims_blocking(wal_dir).await {
+            Ok(claims) => {
+                match rollup_once(
+                    data_dir,
+                    &claims,
+                    memory_limit,
+                    repin,
+                    hot_buffer.map(|buf| buf.publication()),
+                )
+                .await
+                {
+                    Ok(n) => n,
+                    Err(e) => {
+                        tracing::error!(event_type = "rollup_error", error = %e, "daily rollup failed");
+                        1
+                    }
+                }
+            }
             Err(e) => {
-                tracing::error!(event_type = "rollup_error", error = %e, "daily rollup failed");
+                tracing::error!(
+                    event_type = "rollup_error",
+                    error = %e,
+                    "cannot read publication markers; daily rollup skipped this tick"
+                );
                 1
             }
         }
@@ -444,6 +462,14 @@ async fn recover_publications(
     })?
 }
 
+/// [`publication_marker::scan_claims`] on a blocking thread.
+async fn scan_claims_blocking(wal_dir: &Path) -> Result<PublicationClaims, String> {
+    let wal_dir = wal_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || publication_marker::scan_claims(&wal_dir))
+        .await
+        .map_err(|e| crate::error::join_failure_text("publication claims scan", e))?
+}
+
 async fn recover_pending_rollups(
     publication: &Arc<PublicationGate>,
     repin: Option<&Arc<RepinCoordinator>>,
@@ -504,6 +530,7 @@ async fn recover_pending_rollups(
 /// stands down instead of moving files across a cutover.
 async fn rollup_once(
     data_dir: &Path,
+    claims: &PublicationClaims,
     memory_limit: &str,
     repin: Option<&Arc<RepinCoordinator>>,
     publication: Option<Arc<PublicationGate>>,
@@ -521,11 +548,19 @@ async fn rollup_once(
             "failed to list env directories, treating as empty");
         Vec::new()
     });
-    for (_env, env_data_dir) in env_dirs {
+    for (env, env_data_dir) in env_dirs {
         if repin.is_some_and(|c| c.rollup_paused()) {
             break;
         }
-        total += rollup_env_once(&env_data_dir, memory_limit, repin, publication.clone()).await?;
+        total += rollup_env_once(
+            &env,
+            &env_data_dir,
+            claims,
+            memory_limit,
+            repin,
+            publication.clone(),
+        )
+        .await?;
     }
     Ok(total)
 }
@@ -559,6 +594,19 @@ fn log_rollup_stand_down() {
         "daily rollup stood down mid-pass: a repin job claimed the corpus \
          while this pass was running; hourly files consolidate on the first \
          tick after the job ends"
+    );
+}
+
+/// Log a `(date, service)` the rollup skips because a publication marker
+/// claims one of its hourly files.
+fn log_rollup_blocked(env: &str, date: &str, service: &str) {
+    tracing::info!(
+        event_type = "rollup_blocked",
+        env = %env,
+        date = %date,
+        compact_service = %service,
+        "a pending publication marker claims an hourly file of this service; \
+         its daily rollup waits until recovery resolves it"
     );
 }
 
@@ -611,8 +659,14 @@ fn historical_rollup_date(path: &Path, today: &str) -> Option<String> {
 
 /// Roll up one env root (`data_dir/{env}`): consolidate each historical
 /// date's hourly files into per-service daily files. Never crosses envs.
+///
+/// A `(date, service)` with any hourly output a publication marker claims
+/// is skipped: rolling it up would delete the canonical file whose identity
+/// recovery checks, and the marker would then read as a contradiction.
 async fn rollup_env_once(
+    env: &str,
     data_dir: &Path,
+    claims: &PublicationClaims,
     memory_limit: &str,
     repin: Option<&Arc<RepinCoordinator>>,
     publication: Option<Arc<PublicationGate>>,
@@ -684,7 +738,12 @@ async fn rollup_env_once(
             continue;
         }
 
+        let date = chrono::NaiveDate::parse_from_str(&dir_name, "%Y-%m-%d").ok();
         for (service, files) in &service_files {
+            if date.is_some_and(|date| claims.claims_service_day(env, date, service)) {
+                log_rollup_blocked(env, &dir_name, service);
+                continue;
+            }
             // One merge = one gated unit: it reads the day's hourlies,
             // renames the merged daily into place and deletes the sources,
             // so a cutover swapping the shadow in between those steps would
@@ -3751,7 +3810,16 @@ fn compact_service_blocking(
 /// (hourly compaction) and `{date}/` (daily rollup) for `.tmp` files older
 /// than `max_age`. These are inert (don't match `*.parquet` globs) but
 /// should be cleaned up to avoid disk waste.
-fn cleanup_stale_tmp_files(data_dir: &Path, max_age: Duration) {
+///
+/// An hourly tmp that a publication marker claims is kept however old it
+/// is: recovery decides "unpublished" from its presence, and without it
+/// the marker would read as a contradiction and block the service.
+fn cleanup_stale_tmp_files(
+    env: &str,
+    data_dir: &Path,
+    max_age: Duration,
+    claims: &PublicationClaims,
+) {
     let Ok(days) = std::fs::read_dir(data_dir) else {
         return;
     };
@@ -3763,11 +3831,25 @@ fn cleanup_stale_tmp_files(data_dir: &Path, max_age: Duration) {
         let Ok(entries) = std::fs::read_dir(&day_path) else {
             continue;
         };
+        let date = day_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| chrono::NaiveDate::parse_from_str(name, "%Y-%m-%d").ok());
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
                 // Hour subdirectory — check its contents.
-                cleanup_tmp_in_dir(&path, max_age);
+                let hour = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .filter(|name| name.len() == 2)
+                    .and_then(|name| name.parse::<u8>().ok());
+                let claimed = |service: &str| match (date, hour) {
+                    (Some(date), Some(hour)) => claims.claims_output(env, date, hour, service),
+                    // A marker only ever names a valid date and hour.
+                    _ => false,
+                };
+                cleanup_tmp_in_dir(&path, max_age, claimed);
             } else {
                 // Day-level file (from rollup).
                 remove_stale_tmp(&path, max_age);
@@ -3776,13 +3858,23 @@ fn cleanup_stale_tmp_files(data_dir: &Path, max_age: Duration) {
     }
 }
 
-/// Remove `.tmp` files in a single directory that are older than `max_age`.
-fn cleanup_tmp_in_dir(dir: &Path, max_age: Duration) {
+/// Remove `.tmp` files in a single hour directory that are older than
+/// `max_age`, except those `claimed` names by service.
+fn cleanup_tmp_in_dir(dir: &Path, max_age: Duration, claimed: impl Fn(&str) -> bool) {
     let Ok(files) = std::fs::read_dir(dir) else {
         return;
     };
     for file in files.flatten() {
-        remove_stale_tmp(&file.path(), max_age);
+        let path = file.path();
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix(".parquet.tmp"))
+            .is_some_and(&claimed)
+        {
+            continue;
+        }
+        remove_stale_tmp(&path, max_age);
     }
 }
 
@@ -3939,6 +4031,25 @@ mod tests {
         )
     }
 
+    /// [`rollup_once`] with no publication claims and no repin or gate.
+    async fn rollup_unclaimed(data: &Path) -> Result<u64, String> {
+        rollup_once(data, &PublicationClaims::default(), "2GB", None, None).await
+    }
+
+    /// [`rollup_env_once`] for `prod` with no publication claims and no
+    /// repin or gate.
+    async fn rollup_env_unclaimed(env_data: &Path) -> Result<u64, String> {
+        rollup_env_once(
+            "prod",
+            env_data,
+            &PublicationClaims::default(),
+            "2GB",
+            None,
+            None,
+        )
+        .await
+    }
+
     const OPERATIONAL_ROW: &str = r#"{"_time":"2026-01-15T00:00:00Z","_ingested":"2026-01-15T00:00:00Z","service":"svc","message":"retained"}"#;
 
     #[tokio::test]
@@ -3990,12 +4101,12 @@ mod tests {
 
         // Exercise each existing daily-rollup scan owner with a regular file
         // in place of its directory, preserving its return/skip behavior.
-        assert_eq!(rollup_once(&wal, "2GB", None, None).await.unwrap(), 0);
+        assert_eq!(rollup_unclaimed(&wal).await.unwrap(), 0);
         assert_eq!(
             operation_count(&handle, CompactionOperation::DailyRollupScan),
             1
         );
-        assert!(rollup_env_once(&wal, "2GB", None, None).await.is_err());
+        assert!(rollup_env_unclaimed(&wal).await.is_err());
         assert_eq!(
             operation_count(&handle, CompactionOperation::DailyRollupScan),
             2
@@ -4064,7 +4175,7 @@ mod tests {
         let removed = tmp.path().join("removed-by-retention");
         std::fs::create_dir(&removed).unwrap();
         std::fs::remove_dir(&removed).unwrap();
-        assert!(rollup_env_once(&removed, "2GB", None, None).await.is_err());
+        assert!(rollup_env_unclaimed(&removed).await.is_err());
         assert!(collect_hour_dirs(&removed).is_empty());
         assert!(collect_service_files(std::slice::from_ref(&removed)).is_empty());
         let recovery = recover_rollup_markers_coordinated(&removed, None);
@@ -4084,7 +4195,7 @@ mod tests {
 
         // A file in place of those directories must still emit real failures.
         std::fs::write(&removed, b"not a directory").unwrap();
-        assert!(rollup_env_once(&removed, "2GB", None, None).await.is_err());
+        assert!(rollup_env_unclaimed(&removed).await.is_err());
         assert!(collect_hour_dirs(&removed).is_empty());
         assert!(collect_service_files(std::slice::from_ref(&removed)).is_empty());
         assert!(recover_rollup_markers_coordinated(&removed, None).is_err());
@@ -4205,7 +4316,7 @@ mod tests {
 
         let before = operation_count(&handle, CompactionOperation::DailyRollupScan);
         std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let result = rollup_once(&data, "2GB", None, None).await;
+        let result = rollup_unclaimed(&data).await;
         std::fs::set_permissions(&data, permissions).unwrap();
         assert_eq!(
             result.unwrap(),
@@ -4739,9 +4850,16 @@ mod tests {
         );
         gate.panic_next_publication_for_test();
         assert!(
-            rollup_env_once(&env, "2GB", None, Some(Arc::clone(&gate)))
-                .await
-                .is_err()
+            rollup_env_once(
+                "prod",
+                &env,
+                &PublicationClaims::default(),
+                "2GB",
+                None,
+                Some(Arc::clone(&gate))
+            )
+            .await
+            .is_err()
         );
         assert_eq!(
             operation_count(&handle, CompactionOperation::PendingRollupRecovery) - before,
@@ -5294,6 +5412,161 @@ mod tests {
         );
     }
 
+    /// AC7: stale-tmp cleanup keeps a tmp that a pending marker claims. A
+    /// publish stops after its marker, and the read-only WAL env directory
+    /// keeps recovery from removing that marker, so its claim stands while
+    /// the tmp ages past the cleanup threshold. Deleting the tmp there would
+    /// leave a marker with neither output, a contradiction that blocks the
+    /// service for good. Once recovery can run, the batch publishes once.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stale_tmp_cleanup_keeps_a_tmp_a_marker_claims() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal = tmp.path().join("wal");
+        let data = tmp.path().join("data");
+        let env_wal = wal.join("prod");
+        std::fs::create_dir_all(&env_wal).unwrap();
+        if running_as_root(&env_wal) {
+            eprintln!("skipped: root ignores directory permissions");
+            return;
+        }
+        let hot = hot_buffer();
+        let tags = ["claimed-tmp-a0", "claimed-tmp-a1"];
+        let files = vec![tagged_wal(&env_wal, "svc", &tags)];
+        insert_hot(&hot, "prod", &files[0], "svc");
+        let err = publish_batch(
+            &wal,
+            &data,
+            &files,
+            Some(&hot),
+            Some("publish:after_marker"),
+            || {},
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("publish:after_marker"), "{err}");
+        let marker = publication_marker::read_marker(&marker_file(&wal, "prod", "svc")).unwrap();
+        let staged = marker.tmp(&data);
+        assert!(staged.is_file());
+
+        let guard = ModeGuard::read_only(&env_wal);
+        // `tick` compacts with a zero minimum age, so cleanup takes any tmp
+        // older than zero.
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(
+            tick(&wal, &data, &hot).await.unwrap(),
+            1,
+            "the marker recovery could not remove is a tick error"
+        );
+        assert!(staged.is_file(), "cleanup keeps the claimed tmp");
+        assert!(marker_file(&wal, "prod", "svc").is_file());
+        assert!(published_messages(&data).is_empty());
+
+        drop(guard);
+        assert_eq!(tick(&wal, &data, &hot).await.unwrap(), 0);
+        assert_eq!(published_messages(&data), sorted(&tags));
+        assert!(!marker_file(&wal, "prod", "svc").exists());
+        assert!(!staged.exists());
+        assert!(!files[0].exists());
+        assert_eq!(hot.event_count(), 0);
+        assert_eq!(tick(&wal, &data, &hot).await.unwrap(), 0);
+        assert_eq!(published_messages(&data), sorted(&tags));
+    }
+
+    /// AC7: the daily rollup leaves alone every hourly file of a
+    /// `(date, service)` a pending marker claims. A published marker whose
+    /// WAL cannot be retired stays after recovery, and rolling its hourly
+    /// file into the daily one would delete the canonical output whose
+    /// identity recovery checks. Another service on the same day rolls up
+    /// as usual. Once retirement works, recovery finishes and the next
+    /// rollup takes the file.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rollup_leaves_a_claimed_hourly_file_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal = tmp.path().join("wal");
+        let data = tmp.path().join("data");
+        let env_wal = wal.join("prod");
+        std::fs::create_dir_all(&env_wal).unwrap();
+        if running_as_root(&env_wal) {
+            eprintln!("skipped: root ignores directory permissions");
+            return;
+        }
+        let yesterday = (chrono::Utc::now() - chrono::Duration::days(1)).date_naive();
+        let day = yesterday.format("%Y-%m-%d").to_string();
+        let row = |service: &str, message: &str| {
+            format!(
+                r#"{{"_time":"{day}T07:00:00Z","_ingested":"{day}T07:00:00Z","service":"{service}","message":"{message}"}}"#
+            )
+        };
+        let env_data = data.join("prod");
+        let claimed = write_hourly_parquet(
+            &env_data,
+            &day,
+            "07",
+            "svc",
+            &[&row("svc", "rollup-claimed")],
+        );
+        let unclaimed = write_hourly_parquet(
+            &env_data,
+            &day,
+            "07",
+            "other",
+            &[&row("other", "rollup-unclaimed")],
+        );
+        let consumed = tagged_wal(&env_wal, "svc", &["rollup-claimed"]);
+        let marker = ValidatedMarker::new(
+            "prod",
+            "svc",
+            yesterday,
+            7,
+            vec![consumed.file_name().unwrap().to_str().unwrap().to_owned()],
+            publication_marker::identity_of(&claimed).unwrap(),
+        )
+        .unwrap();
+        publication_marker::write_marker(&wal, &marker).unwrap();
+        assert_eq!(marker.canonical(&data), claimed);
+        let claimed_bytes = std::fs::read(&claimed).unwrap();
+        let hot = hot_buffer();
+        let rollup_tick = || {
+            compact_once(
+                &wal,
+                &data,
+                Duration::ZERO,
+                true,
+                Some(&hot),
+                DEFAULT_CHUNK_SIZE,
+                "2GB",
+                None,
+            )
+        };
+
+        let guard = ModeGuard::read_only(&env_wal);
+        assert_eq!(
+            rollup_tick().await.unwrap(),
+            1,
+            "the unretired marker is a tick error"
+        );
+        assert_eq!(std::fs::read(&claimed).unwrap(), claimed_bytes);
+        assert!(!env_data.join(&day).join("svc.parquet").exists());
+        assert!(!unclaimed.exists(), "an unclaimed service rolls up");
+        assert_eq!(
+            read_strings(&env_data.join(&day).join("other.parquet"), "message"),
+            ["rollup-unclaimed"]
+        );
+        assert!(marker_file(&wal, "prod", "svc").is_file());
+
+        drop(guard);
+        assert_eq!(rollup_tick().await.unwrap(), 0);
+        assert!(!marker_file(&wal, "prod", "svc").exists());
+        assert!(!consumed.exists(), "recovery retires the WAL");
+        assert!(!claimed.exists(), "the next rollup takes the hourly file");
+        assert_eq!(
+            published_messages(&data),
+            sorted(&["rollup-claimed", "rollup-unclaimed"])
+        );
+    }
+
     /// A consumed WAL file withdrawn after compaction read it (its writer's
     /// directory fsync failed and it rejected the write) must not publish:
     /// the sender retries that batch. The publish rolls back, keeps the
@@ -5412,7 +5685,9 @@ mod tests {
                                 .await
                         } else {
                             rollup_env_once(
+                                "prod",
                                 &env,
+                                &PublicationClaims::default(),
                                 "2GB",
                                 Some(&recovery_coordinator),
                                 Some(recovery_gate),
@@ -7746,7 +8021,12 @@ mod tests {
         std::fs::write(&fresh, b"fresh").unwrap();
 
         // Threshold between stale (50ms+ old) and fresh (~0ms old).
-        cleanup_stale_tmp_files(&data_dir, Duration::from_millis(25));
+        cleanup_stale_tmp_files(
+            "prod",
+            &data_dir,
+            Duration::from_millis(25),
+            &PublicationClaims::default(),
+        );
 
         assert!(!stale.exists(), "stale .tmp should be removed");
         assert!(fresh.exists(), "fresh .tmp should be kept");
@@ -7765,7 +8045,12 @@ mod tests {
 
         std::thread::sleep(Duration::from_millis(50));
 
-        cleanup_stale_tmp_files(&data_dir, Duration::from_millis(25));
+        cleanup_stale_tmp_files(
+            "prod",
+            &data_dir,
+            Duration::from_millis(25),
+            &PublicationClaims::default(),
+        );
         assert!(!stale.exists(), "day-level stale .tmp should be removed");
     }
 

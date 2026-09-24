@@ -24,6 +24,8 @@
 //! Disk-pressure retention is disabled by setting its threshold to 0.
 //!
 //! A repin in flight suppresses both sweeps (marker or either staging sibling).
+//! A date directory that a pending publication marker claims (ADR-0041) is
+//! kept, and a WAL root whose markers cannot be read suppresses both sweeps.
 //!
 //! The field catalog's `field_services` observations are ever-observed:
 //! retention deleting a partition deliberately never reconciles them, and
@@ -49,6 +51,7 @@ use crate::config::RetentionConfig;
 /// directories eligible for deletion. Stops when `shutdown_rx` fires.
 pub fn spawn_retention(
     data_dir: PathBuf,
+    wal_dir: PathBuf,
     config: RetentionConfig,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
@@ -69,9 +72,10 @@ pub fn spawn_retention(
             tokio::select! {
                 () = tokio::time::sleep(interval) => {
                     let dir = data_dir.clone();
+                    let wal = wal_dir.clone();
                     let cfg = config.clone();
                     let result = tokio::task::spawn_blocking(move || {
-                        retention_tick(&dir, &cfg, |p| fs4::available_space(p))
+                        retention_tick(&dir, &wal, &cfg, |p| fs4::available_space(p))
                     })
                     .await;
 
@@ -248,11 +252,19 @@ fn cmp_priority(a: ExpiryRank, b: ExpiryRank) -> Ordering {
 /// A single retention tick. Samples `today` once and sweeps against it.
 fn retention_tick(
     data_dir: &Path,
+    wal_dir: &Path,
     config: &RetentionConfig,
     free_space_fn: impl Fn(&Path) -> std::io::Result<u64>,
 ) -> Result<(), String> {
     let today = chrono::Utc::now().date_naive();
-    retention_tick_at(data_dir, config, today, free_space_fn, delete_date_dir)
+    retention_tick_at(
+        data_dir,
+        wal_dir,
+        config,
+        today,
+        free_space_fn,
+        delete_date_dir,
+    )
 }
 
 /// The tick body, with the clock and the deletion injected.
@@ -266,6 +278,7 @@ fn retention_tick(
 /// do on its own (deleting a directory can only make evidence vanish).
 fn retention_tick_at(
     data_dir: &Path,
+    wal_dir: &Path,
     config: &RetentionConfig,
     today: NaiveDate,
     free_space_fn: impl Fn(&Path) -> std::io::Result<u64>,
@@ -294,9 +307,53 @@ fn retention_tick_at(
         );
         return Ok(());
     }
+
+    // A pending publication marker (ADR-0041) names a canonical output, its
+    // temporary output, or both, by identity. Deleting either turns the
+    // marker into a contradiction that blocks its service until an operator
+    // acts, so a claimed date directory is kept. Markers that cannot be
+    // read may claim anything, so, as with unreadable repin evidence, the
+    // sweep stands down rather than delete under them.
+    //
+    // One scan per tick, with no lock against compaction. A publish names
+    // the hour compaction read from the clock, and this tick never deletes
+    // the date it reads as today, so a marker written after this scan
+    // normally names a directory the tick keeps. The exception is a publish
+    // that straddles midnight while disk pressure reaches yesterday:
+    // compaction reads the old date, this tick reads the new one, and the
+    // pressure sweep can delete the directory the in-flight publish writes
+    // to. Recovery then finds neither output and reports the marker as
+    // contradictory. The WAL is kept, so no acknowledged event is lost or
+    // counted twice, but the service stays blocked until an operator
+    // resolves the marker.
+    let claims = match crate::ingest::publication_marker::scan_claims(wal_dir) {
+        Ok(claims) => claims,
+        Err(e) => {
+            metrics::gauge!(crate::metrics::RETENTION_SUPPRESSED).set(1.0);
+            tracing::warn!(
+                event_type = "retention_publication_claims_unreadable",
+                error = %e,
+                "could not read the publication markers under the WAL root; \
+                 suppressing this sweep rather than deleting files a marker \
+                 may claim"
+            );
+            return Ok(());
+        }
+    };
     metrics::gauge!(crate::metrics::RETENTION_SUPPRESSED).set(0.0);
 
-    let candidates = enumerate_date_dirs(data_dir, today)?;
+    let (claimed, candidates): (Vec<DateDir>, Vec<DateDir>) = enumerate_date_dirs(data_dir, today)?
+        .into_iter()
+        .partition(|dir| claims.claims_date(&dir.env, dir.date));
+    for dir in &claimed {
+        tracing::info!(
+            event_type = "retention_publication_claimed",
+            retention_env = %dir.env,
+            date = %dir.date,
+            "kept a date directory that a pending publication marker claims; \
+             retention considers it again once recovery resolves the marker"
+        );
+    }
 
     let mut total_bytes_freed: u64 = 0;
     let mut total_dirs_deleted: u64 = 0;
@@ -625,6 +682,32 @@ mod tests {
         today - chrono::Duration::days(days)
     }
 
+    /// A WAL root with no publication markers: a missing root has none.
+    fn no_wal() -> PathBuf {
+        PathBuf::from("/nonexistent/trawl-retention-test/wal")
+    }
+
+    /// Plant a pending publication marker, through the real writer, that
+    /// claims `svc`'s hour 07 output on `date` in `env`.
+    fn plant_publication_marker(wal_dir: &Path, env: &str, date: NaiveDate) -> PathBuf {
+        use crate::ingest::publication_marker::{OutputIdentity, ValidatedMarker, write_marker};
+        let marker = ValidatedMarker::new(
+            env,
+            "svc",
+            date,
+            7,
+            vec!["svc_1730000000000_0001.ndjson".to_owned()],
+            OutputIdentity {
+                size: 4,
+                hash: blake3::hash(b"data"),
+            },
+        )
+        .unwrap();
+        std::fs::create_dir_all(marker.wal_env_dir(wal_dir)).unwrap();
+        write_marker(wal_dir, &marker).unwrap();
+        marker.marker_path(wal_dir)
+    }
+
     /// Create `data_dir/{env}/{date}/svc.parquet` and return the date dir.
     fn plant(data_dir: &Path, env: &str, date: NaiveDate) -> PathBuf {
         let dir = data_dir.join(env).join(date.format("%Y-%m-%d").to_string());
@@ -862,7 +945,7 @@ mod tests {
         // Both envs' old dates age out independently; deleting one is an
         // O(1) directory remove that never touches the sibling env root.
         let config = make_config(90, 0);
-        retention_tick(tmp.path(), &config, |_| Ok(u64::MAX)).unwrap();
+        retention_tick(tmp.path(), &no_wal(), &config, |_| Ok(u64::MAX)).unwrap();
 
         assert!(!lab_old.exists());
         assert!(!prod_old.exists());
@@ -911,7 +994,7 @@ mod tests {
         let recent_dir = plant(tmp.path(), "prod", days_before(today, 30));
 
         let config = make_config(90, 0);
-        retention_tick(tmp.path(), &config, |_| Ok(u64::MAX)).unwrap();
+        retention_tick(tmp.path(), &no_wal(), &config, |_| Ok(u64::MAX)).unwrap();
 
         assert!(!old_dir.exists(), "old dir should be deleted");
         assert!(recent_dir.exists(), "recent dir should survive");
@@ -924,7 +1007,7 @@ mod tests {
         std::fs::create_dir_all(&old_dir).unwrap();
 
         let config = make_config(0, 0);
-        retention_tick(tmp.path(), &config, |_| Ok(u64::MAX)).unwrap();
+        retention_tick(tmp.path(), &no_wal(), &config, |_| Ok(u64::MAX)).unwrap();
 
         assert!(old_dir.exists(), "nothing should be deleted when disabled");
     }
@@ -947,7 +1030,15 @@ mod tests {
         let staging_91 = plant(&data_dir, "staging", days_before(today, 91));
 
         let config = config_with_envs(90, &[("prod", 365), ("lab", 7)]);
-        retention_tick_at(&data_dir, &config, today, |_| Ok(u64::MAX), delete_date_dir).unwrap();
+        retention_tick_at(
+            &data_dir,
+            &no_wal(),
+            &config,
+            today,
+            |_| Ok(u64::MAX),
+            delete_date_dir,
+        )
+        .unwrap();
 
         assert!(!lab_8.exists(), "lab keeps 7 days: 8 is out");
         assert!(lab_7.exists(), "7 days is not older than 7");
@@ -971,7 +1062,15 @@ mod tests {
         let lab_4000 = plant(&data_dir, "lab", days_before(today, 4000));
 
         let config = config_with_envs(0, &[("prod", 30)]);
-        retention_tick_at(&data_dir, &config, today, |_| Ok(u64::MAX), delete_date_dir).unwrap();
+        retention_tick_at(
+            &data_dir,
+            &no_wal(),
+            &config,
+            today,
+            |_| Ok(u64::MAX),
+            delete_date_dir,
+        )
+        .unwrap();
 
         assert!(
             !prod_40.exists(),
@@ -992,7 +1091,15 @@ mod tests {
         let prod_200 = plant(&data_dir, "prod", days_before(today, 200));
 
         let config = config_with_envs(90, &[("archive", 0)]);
-        retention_tick_at(&data_dir, &config, today, |_| Ok(u64::MAX), delete_date_dir).unwrap();
+        retention_tick_at(
+            &data_dir,
+            &no_wal(),
+            &config,
+            today,
+            |_| Ok(u64::MAX),
+            delete_date_dir,
+        )
+        .unwrap();
 
         assert!(archive_4000.exists(), "archive keeps forever");
         assert!(!prod_200.exists(), "prod inherits the global 90");
@@ -1019,8 +1126,15 @@ mod tests {
             );
 
             let config = config_with_envs(huge, &[("lab", huge)]);
-            retention_tick_at(&data_dir, &config, today, |_| Ok(u64::MAX), delete_date_dir)
-                .unwrap();
+            retention_tick_at(
+                &data_dir,
+                &no_wal(),
+                &config,
+                today,
+                |_| Ok(u64::MAX),
+                delete_date_dir,
+            )
+            .unwrap();
             assert!(prod.exists(), "{huge}: age retention deletes nothing");
             assert!(lab.exists(), "{huge}: age retention deletes nothing");
 
@@ -1032,6 +1146,7 @@ mod tests {
             };
             retention_tick_at(
                 &data_dir,
+                &no_wal(),
                 &config,
                 today,
                 always_pressured(),
@@ -1060,7 +1175,7 @@ mod tests {
         // reports enough space.
         let call_count = AtomicU32::new(0);
         let config = make_config(0, 1_000_000);
-        retention_tick(tmp.path(), &config, |_| {
+        retention_tick(tmp.path(), &no_wal(), &config, |_| {
             let n = call_count.fetch_add(1, AtomicOrdering::Relaxed);
             if n == 0 {
                 Ok(500_000) // below threshold
@@ -1106,6 +1221,7 @@ mod tests {
         let log = Mutex::new(Vec::new());
         retention_tick_at(
             &data_dir,
+            &no_wal(),
             &config,
             today,
             |_| {
@@ -1129,6 +1245,7 @@ mod tests {
         // an exemption.
         retention_tick_at(
             &data_dir,
+            &no_wal(),
             &config,
             today,
             always_pressured(),
@@ -1151,6 +1268,7 @@ mod tests {
             let active = plant(&data_dir, "prod", today);
             retention_tick_at(
                 &data_dir,
+                &no_wal(),
                 &make_config(0, 1_000_000),
                 today,
                 always_pressured(),
@@ -1201,6 +1319,7 @@ mod tests {
             };
             retention_tick_at(
                 &data_dir,
+                &no_wal(),
                 &config,
                 today,
                 always_pressured(),
@@ -1237,7 +1356,7 @@ mod tests {
         let call_count = AtomicU32::new(0);
         let marker = crate::repin::marker_path(&data_dir);
         let config = make_config(0, 1_000_000);
-        retention_tick(&data_dir, &config, |_| {
+        retention_tick(&data_dir, &no_wal(), &config, |_| {
             let n = call_count.fetch_add(1, AtomicOrdering::Relaxed);
             if n == 1 {
                 // A job claims the data root while the sweep is running.
@@ -1271,13 +1390,20 @@ mod tests {
         let marker = crate::repin::marker_path(&data_dir);
         let deleted = AtomicU32::new(0);
         let config = make_config(90, 1_000_000);
-        retention_tick_at(&data_dir, &config, today, always_pressured(), |path| {
-            let bytes = delete_date_dir(path)?;
-            if deleted.fetch_add(1, AtomicOrdering::Relaxed) == 0 {
-                std::fs::write(&marker, b"{}").unwrap();
-            }
-            Ok(bytes)
-        })
+        retention_tick_at(
+            &data_dir,
+            &no_wal(),
+            &config,
+            today,
+            always_pressured(),
+            |path| {
+                let bytes = delete_date_dir(path)?;
+                if deleted.fetch_add(1, AtomicOrdering::Relaxed) == 0 {
+                    std::fs::write(&marker, b"{}").unwrap();
+                }
+                Ok(bytes)
+            },
+        )
         .unwrap();
 
         assert!(!first.exists(), "the pre-claim age deletion stands");
@@ -1305,7 +1431,7 @@ mod tests {
         metrics::with_local_recorder(&recorder, || {
             // No job owns this aside — no marker, nothing running.
             std::fs::create_dir_all(tmp.path().join("data.repin-aside")).unwrap();
-            retention_tick(&data_dir, &config, |_| Ok(u64::MAX)).unwrap();
+            retention_tick(&data_dir, &no_wal(), &config, |_| Ok(u64::MAX)).unwrap();
         });
         assert!(
             handle
@@ -1317,13 +1443,97 @@ mod tests {
 
         metrics::with_local_recorder(&recorder, || {
             std::fs::remove_dir_all(tmp.path().join("data.repin-aside")).unwrap();
-            retention_tick(&data_dir, &config, |_| Ok(u64::MAX)).unwrap();
+            retention_tick(&data_dir, &no_wal(), &config, |_| Ok(u64::MAX)).unwrap();
         });
         assert!(
             handle
                 .render()
                 .contains(&format!("{RETENTION_SUPPRESSED} 0")),
             "the tick that sweeps again must clear it: {}",
+            handle.render()
+        );
+    }
+
+    /// A date directory a pending publication marker claims survives both
+    /// sweeps, while an unclaimed one just as old goes. Once the marker is
+    /// resolved, the next tick deletes the directory too.
+    #[test]
+    fn a_date_a_publication_marker_claims_survives_both_sweeps() {
+        let today = fixed_today();
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let wal_dir = tmp.path().join("wal");
+        let claimed = plant(&data_dir, "prod", days_before(today, 200));
+        let unclaimed = plant(&data_dir, "prod", days_before(today, 201));
+        let other_env = plant(&data_dir, "lab", days_before(today, 200));
+        let marker = plant_publication_marker(&wal_dir, "prod", days_before(today, 200));
+
+        // Age and pressure both armed: every candidate is expired and the
+        // disk stays full.
+        let config = RetentionConfig {
+            min_free_disk_bytes: 1_000_000,
+            ..make_config(90, 0)
+        };
+        retention_tick_at(
+            &data_dir,
+            &wal_dir,
+            &config,
+            today,
+            always_pressured(),
+            delete_date_dir,
+        )
+        .unwrap();
+        assert!(claimed.exists(), "the claimed date survives");
+        assert!(!unclaimed.exists(), "an unclaimed date is deleted");
+        assert!(!other_env.exists(), "the claim is per env");
+
+        crate::ingest::publication_marker::remove_marker_durably(&marker).unwrap();
+        retention_tick_at(
+            &data_dir,
+            &wal_dir,
+            &config,
+            today,
+            always_pressured(),
+            delete_date_dir,
+        )
+        .unwrap();
+        assert!(!claimed.exists(), "a resolved marker no longer claims");
+    }
+
+    /// Markers that cannot be read may claim any date, so an unreadable WAL
+    /// root stands both sweeps down and raises the suppression gauge, as
+    /// unreadable repin evidence does.
+    #[test]
+    fn an_unreadable_wal_root_suppresses_both_sweeps() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let today = fixed_today();
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let wal_dir = tmp.path().join("wal");
+        std::fs::write(&wal_dir, b"not a directory").unwrap();
+        let old = plant(&data_dir, "prod", days_before(today, 200));
+        let config = RetentionConfig {
+            min_free_disk_bytes: 1_000_000,
+            ..make_config(90, 0)
+        };
+        metrics::with_local_recorder(&recorder, || {
+            retention_tick_at(
+                &data_dir,
+                &wal_dir,
+                &config,
+                today,
+                always_pressured(),
+                delete_date_dir,
+            )
+            .unwrap();
+        });
+        assert!(old.exists(), "nothing is deleted under unreadable markers");
+        assert!(
+            handle
+                .render()
+                .contains(&format!("{RETENTION_SUPPRESSED} 1")),
+            "{}",
             handle.render()
         );
     }
@@ -1337,7 +1547,7 @@ mod tests {
         let old_dir = plant(&data_dir, "prod", days_before(today, 200));
 
         let config = make_config(90, 0);
-        retention_tick(&data_dir, &config, |_| Ok(u64::MAX)).unwrap();
+        retention_tick(&data_dir, &no_wal(), &config, |_| Ok(u64::MAX)).unwrap();
         assert!(!old_dir.exists(), "age sweep resumes");
     }
 
@@ -1349,7 +1559,7 @@ mod tests {
         std::fs::write(dir.join("data.parquet"), b"old").unwrap();
 
         let config = make_config(0, 0);
-        retention_tick(tmp.path(), &config, |_| Ok(0)).unwrap();
+        retention_tick(tmp.path(), &no_wal(), &config, |_| Ok(0)).unwrap();
 
         assert!(dir.exists());
     }
@@ -1364,7 +1574,7 @@ mod tests {
 
         // Disk pressure with only today's dir — should warn but not delete.
         let config = make_config(0, 1_000_000);
-        retention_tick(tmp.path(), &config, |_| Ok(100)).unwrap();
+        retention_tick(tmp.path(), &no_wal(), &config, |_| Ok(100)).unwrap();
 
         assert!(today_dir.exists(), "today's dir must never be deleted");
     }
@@ -1383,7 +1593,7 @@ mod tests {
         // empty dir, and a permission-denied dir needs setup the suite
         // cannot rely on.
         let config = make_config(30, 0);
-        retention_tick(tmp.path(), &config, |_| Ok(u64::MAX)).unwrap();
+        retention_tick(tmp.path(), &no_wal(), &config, |_| Ok(u64::MAX)).unwrap();
 
         assert!(!dir_a.exists());
         assert!(!dir_b.exists());
@@ -1408,7 +1618,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let config = make_config(90, 1_000_000);
         // Should succeed with no dirs to process.
-        retention_tick(tmp.path(), &config, |_| Ok(u64::MAX)).unwrap();
+        retention_tick(tmp.path(), &no_wal(), &config, |_| Ok(u64::MAX)).unwrap();
     }
 
     /// One planted directory as the oracle sees it. `age` and `max` are
@@ -1551,6 +1761,7 @@ mod tests {
             let log = Mutex::new(Vec::new());
             retention_tick_at(
                 &data_dir,
+                &no_wal(),
                 &config,
                 today,
                 always_pressured(),

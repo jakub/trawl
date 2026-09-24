@@ -99,7 +99,7 @@ class OperationalAlerts(unittest.TestCase):
             self.assertEqual(len(pack["groups"]), 1)
             self.assertEqual(pack["groups"][0]["name"], "trawl.operational")
             rules = pack["groups"][0]["rules"]
-            self.assertEqual(len(rules), 10)
+            self.assertEqual(len(rules), 11)
             for actual, expected in zip(rules, EXPECTED, strict=True):
                 matchers = selector + ("," + expected["matcher"] if expected["matcher"] else "")
                 self.assertEqual(actual, {

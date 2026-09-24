@@ -227,7 +227,6 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
     metrics_process::Collector::default().describe();
     trawl_server::metrics::describe_metrics();
     trawl_server::metrics::init_operational_alert_metrics();
-    trawl_server::metrics::init_publication_recovery_metrics();
     // Publish the salvage profiles' rejection matrix at zero. "Telemetry
     // is rejection-free by construction" is evidenced by an absent
     // increment on a present series; an absent series would leave a scrape
@@ -439,6 +438,7 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let handle = trawl_server::retention::spawn_retention(
             config.data.base_dir(),
+            config.wal_dir(),
             config.retention.clone(),
             shutdown_rx,
         );

@@ -256,6 +256,7 @@ pub fn init_operational_alert_metrics() {
     for kind in QuarantineKind::ALL {
         metrics::counter!(FILES_QUARANTINED_TOTAL, "kind" => kind.label()).increment(0);
     }
+    init_publication_recovery_metrics();
 }
 
 /// Publish the publication-recovery outcome matrix at zero, so a flat
@@ -510,7 +511,8 @@ pub fn describe_metrics() {
     describe_gauge!(
         RETENTION_SUPPRESSED,
         "1 while retention sweeps (age AND disk pressure) stand down for \
-         repin staging on the data root, 0 when they run. Unlike \
+         repin staging on the data root or for publication markers under the \
+         WAL root that cannot be read, 0 when they run. Unlike \
          trawl_catalog_repin_running this stays 1 for staging no job owns \
          — a boot replay whose sweep keeps failing — so alert on it held \
          high across ticks: the archive grows unbounded meanwhile"
@@ -1593,6 +1595,8 @@ mod tests {
                 "trawl_files_quarantined_total{kind=\"wal\"}",
                 "trawl_files_quarantined_total{kind=\"parquet\"}",
                 "trawl_files_quarantined_total{kind=\"rollup_temporary\"}",
+                "trawl_publication_recovery_total{outcome=\"contradictory\"}",
+                "trawl_publication_recovery_total{outcome=\"failed\"}",
             ];
             for series in selected {
                 assert_eq!(test_support::sample(&handle, series), 0);

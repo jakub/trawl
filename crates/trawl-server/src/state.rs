@@ -734,6 +734,7 @@ impl AppState {
                     Arc::clone(coordinator),
                     state.query.pool.clone(),
                     config.data.base_dir(),
+                    config.wal_dir(),
                     config.ingest.compaction_memory_limit.clone(),
                     config.retention.min_free_disk_bytes,
                 ))

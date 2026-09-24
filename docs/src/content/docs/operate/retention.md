@@ -67,7 +67,8 @@ than a longer age limit.
 If free space stays below the threshold:
 
 1. Read `trawl_retention_suppressed` on `/metrics`. A value of 1 means a repin
-   marker or staging directory is pausing retention. Follow
+   marker or staging directory is pausing retention, or the publication
+   markers under the WAL root cannot be read. Follow
    [Clear suppressed retention](#clear-suppressed-retention).
 2. Compare the threshold with the filesystem: `df -h /var/lib/trawl`.
    Files outside the active data root consume space but are not retention
@@ -101,6 +102,18 @@ Retention resumes on the tick after the job or its boot recovery finishes.
 
 `trawl_catalog_repin_running` can be 0 while `trawl_retention_suppressed` is
 1. An abandoned staging directory suppresses retention without a running job.
+So does a WAL root that trawld cannot read: search the journal for
+`retention_publication_claims_unreadable`, then correct the reported
+permission or storage error.
+
+## Dates kept for a pending publish
+
+Compaction writes a publication marker before it publishes a parquet file
+and removes it when the publish is complete. Retention keeps a date
+directory while a marker names a file in it, and logs
+`retention_publication_claimed` on each tick. The directory becomes a
+candidate again once recovery resolves the marker. If it stays, follow
+[Publication recovery blocked](/operate/operational-alerts/#publication-recovery-blocked).
 
 [Back up and restore](/operate/backup-restore/) keeps the data directory and
 the catalog together.

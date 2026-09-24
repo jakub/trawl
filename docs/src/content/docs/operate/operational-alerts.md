@@ -81,7 +81,7 @@ backlog eligibility, every network loss, or every disk failure.
 3. Check the rule file with `promtool check rules /etc/prometheus/rules/trawl.rules.yml`.
 4. Reload Prometheus through your existing configuration process.
 5. Check that its Targets page shows the `trawl` job as up and its Rules page
-   lists all ten Trawl alerts without evaluation errors.
+   lists all eleven Trawl alerts without evaluation errors.
 
 The plain expressions select `job="trawl"`. If you choose another job name,
 replace that matcher in every rule. Edit ordinary rule fields to change
@@ -113,7 +113,7 @@ prometheusRule:
       enabled: false
 ```
 
-All ten alerts are enabled with severity `warning` when the pack is enabled.
+All eleven alerts are enabled with severity `warning` when the pack is enabled.
 Use the exact alert names in the [metric mapping](/reference/api/#operational-alert-counters)
 as keys under `prometheusRule.alerts`. Each entry accepts only `enabled` and
 `severity`. Severity is a nonblank static string, with no severity enum;
@@ -382,7 +382,14 @@ error. Each lane then follows its own failure path:
 2. If `withdrawn` is `false`, the file stays in the WAL and compaction merges
    it, although the write was rejected. A sender that retries that batch
    duplicates it. Telemetry does not retry such a batch.
-3. Inspect filesystem and storage health, and address the reported sync
+3. If `withdrawn` is `true`, read `withdrawal_durable`. The writer syncs the
+   directory again after it removes the file. `true` means that the removal
+   is durable. `false` means that the second sync failed too, and
+   `withdrawal_sync_error` carries its error. The file is gone now, but a
+   power loss before the next successful sync of that directory can restore
+   it, and compaction then merges a batch whose write was rejected. That
+   second failure increments the counter again.
+4. Inspect filesystem and storage health, and address the reported sync
    failure.
 
 Resolution means no new directory sync failure was observed. It does not
@@ -444,3 +451,41 @@ followed by a different failure can legitimately emit both facts.
 Resolution means no new file isolation was observed. It does not mean that
 quarantined files disappeared, that their contents were restored, or that a
 number of events was permanently lost.
+
+## Publication recovery blocked
+
+`TrawlPublicationRecoveryBlocked` observes
+`trawl_publication_recovery_total{outcome=~"contradictory|failed"}`, in
+publication markers. Compaction writes a marker before it publishes a
+parquet file and removes it after the consumed WAL files are retired.
+Recovery runs at boot and at the start of every compaction tick, and it
+finishes or rolls back each marker it finds. While a marker stays, its
+environment and service are out of compaction, stale temporary-file cleanup,
+daily rollup of that day, and retention of that date. A repin cutover is
+refused. [Crash recovery](/architecture/recovery/) describes the protocol.
+
+- `failed`: a filesystem error stopped recovery of one marker, for example a
+  WAL directory where the consumed files cannot be removed. The next tick
+  retries it. Each retry that fails counts again.
+- `contradictory`: the evidence contradicts itself. For example, the
+  canonical parquet file does not carry the identity the marker recorded,
+  and the temporary output is gone. Recovery touches nothing and counts the
+  marker on every tick until an operator resolves it.
+
+1. Find `publication_recovery_failed` in the daemon log. It names the
+   environment, the service, and the marker path. A contradiction carries a
+   `reason`: `invalid_marker`, `not_regular_file`, `output_missing`, or
+   `output_mismatch`. A failure carries the filesystem error.
+2. For a failure, correct the reported permission or storage problem. The
+   next tick completes the marker, and the service compacts again.
+3. For a contradiction, stop trawld and preserve the marker, the WAL files it
+   lists, and the parquet and temporary files at its partition. Find out what
+   changed the canonical file or removed the temporary output, such as a
+   manual edit, a restore from backup, or an interrupted disk. Keep the
+   marker until you know whether the listed WAL rows are in the canonical
+   file. Removing it makes compaction merge those WAL files again, which
+   duplicates their rows if they were published.
+
+Resolution means that no recovery outcome of either kind was observed in the
+window. A contradictory marker repeats on every tick, so the alert keeps
+firing while that marker stays.
