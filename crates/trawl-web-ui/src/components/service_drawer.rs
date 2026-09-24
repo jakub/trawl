@@ -123,6 +123,7 @@ pub fn ServiceDrawer(
                 TabItem::new("tail", "Live Tail"),
             ]
             tabs_label="Service details"
+            label=svc.name.clone()
             active_tab=eff_tab
             on_tab_change=on_tab_change
             on_close=on_close

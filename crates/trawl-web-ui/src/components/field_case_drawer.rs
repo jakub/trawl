@@ -510,6 +510,9 @@ pub fn FieldCaseDrawer(
             // as the meta bar below the header.
             tabs=vec![]
             tabs_label="Field case file"
+            // The field alone: the Back button beside it in the title
+            // slot is a control, not part of the name.
+            label=shown_field.clone()
             active_tab=Signal::derive(String::new)
             on_tab_change=Callback::new(|_: String| {})
             on_close=on_close

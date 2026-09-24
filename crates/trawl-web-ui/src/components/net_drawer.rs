@@ -225,6 +225,10 @@ pub fn NetDrawer(
                 TabItem::new("runs", "Runs"),
             ]
             tabs_label="Saved query details"
+            // The saved record's name, never the edit buffer: the dialog
+            // keeps its name while a rename is typed and follows it once
+            // the rename lands.
+            label=Signal::derive(move || saved.get().map_or_else(|| "Deleted net".to_owned(), |n| n.name))
             active_tab=eff_tab
             on_tab_change=on_tab_change
             on_close=on_close

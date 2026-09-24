@@ -171,6 +171,7 @@ fn DrawerProbe() -> impl IntoView {
                     TabItem::new("fields", "Fields"),
                 ]
                 tabs_label="Demo service"
+                label="demo-service"
                 active_tab=drawer_tab
                 on_tab_change=Callback::new(move |id: String| drawer_tab.set(id))
                 on_close=Callback::new(move |()| show_drawer.set(false))
