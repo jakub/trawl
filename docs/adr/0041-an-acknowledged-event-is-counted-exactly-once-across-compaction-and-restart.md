@@ -48,6 +48,8 @@ Hydration details:
 
 **Steady-state eviction is not solved here.** When the hot buffer fills during normal running, it evicts acknowledged, uncompacted rows. They are counted but not refused. That limit is documented until ingest backpressure replaces eviction, which is a cross-cutting change with its own issue.
 
+_Amended 2026-09-24:_ [ADR-0043](0043-ingest-is-admitted-against-hot-buffer-capacity.md) replaces eviction with admission against the hot-buffer caps. Hydration charges that ledger.
+
 **No epoch bump.** Parquet and WAL formats are unchanged, and the marker is an additional file that older binaries ignore. A WAL file without a marker is treated as unpublished, as it is today. Duplicates left by earlier crashes cannot be told apart and stay as they are.
 
 ## Considered options

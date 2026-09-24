@@ -50,6 +50,10 @@ _Avoid_: queryable, searchable, live
 The in-memory store of freshly ingested events, visible to every query until compaction drains it. "Hot" always means this buffer's contents.
 _Avoid_: cache, staging area
 
+**Admission**:
+A producer reserving hot-buffer space for a batch before writing it to the WAL. A batch that cannot be admitted is refused whole, and nothing is written. Nothing admitted leaves the hot buffer except through compaction.
+_Avoid_: backpressure (that is the sender's experience of a refusal), eviction (removed)
+
 **Hot snapshot**:
 The hot buffer's atomic view handed to one query: one file, plus exactly the pins that apply to the fields in it.
 _Avoid_: snapshot (unqualified)
@@ -96,7 +100,7 @@ _Avoid_: capacity (the Health card of that name is about uptime and pools), disk
 
 **Pressure deletion**:
 Retention deleting date directories because free space fell below the deletion floor, ahead of their age limit. It shortens retention; the disk stays above the floor while it does.
-_Avoid_: cleanup, eviction (that is the hot buffer)
+_Avoid_: cleanup, eviction
 
 **Observed day**:
 One of an environment's recent, stored date partitions that a capacity projection reads for its daily volume. Today and yesterday are never observed days; they are still settling.

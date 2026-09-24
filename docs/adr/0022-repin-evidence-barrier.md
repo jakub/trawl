@@ -51,7 +51,8 @@ lossy repin.
 6. **The compaction bookkeeping budget is untouched and becomes
    observable.** The 2-second `BOOKKEEPING_BUDGET` is a deliberate
    trade (a stalled compactor stops WAL drain until the hot buffer
-   evicts, which is invisible events) and gains no knob — a test
+   evicts, which is invisible events; since ADR-0043 it refuses ingest
+   instead) and gains no knob — a test
    budget knob would hide the contention ADR-0021 removes instead.
    What it gains is the metric the docs already claimed:
    `trawl_catalog_bookkeeping_timeouts_total{write}` with
