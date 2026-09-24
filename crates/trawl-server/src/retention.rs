@@ -274,8 +274,9 @@ fn retention_tick(
 /// and a midnight rollover between the phases would otherwise rank a
 /// directory that survived phase 1 as if it had expired. `delete_fn` is
 /// [`delete_date_dir`] in production; a test injects it to plant a repin
-/// marker after a specific deletion, which no filesystem arrangement can
-/// do on its own (deleting a directory can only make evidence vanish).
+/// or publication marker after a specific deletion, which no filesystem
+/// arrangement can do on its own (deleting a directory can only make
+/// evidence vanish).
 fn retention_tick_at(
     data_dir: &Path,
     wal_dir: &Path,
@@ -315,16 +316,22 @@ fn retention_tick_at(
     // read may claim anything, so, as with unreadable repin evidence, the
     // sweep stands down rather than delete under them.
     //
-    // One scan per tick, with no lock against compaction. A publish names
-    // the hour compaction read from the clock, and this tick never deletes
-    // the date it reads as today, so a marker written after this scan
-    // normally names a directory the tick keeps. The exception is a publish
-    // that straddles midnight while disk pressure reaches yesterday:
-    // compaction reads the old date, this tick reads the new one, and the
-    // pressure sweep can delete the directory the in-flight publish writes
-    // to. Recovery then finds neither output and reports the marker as
-    // contradictory. The WAL is kept, so no acknowledged event is lost or
-    // counted twice, but the service stays blocked until an operator
+    // This scan decides which directories the tick considers at all, and
+    // each deletion re-scans just before it runs (see
+    // `publication_claimed_mid_sweep`). There is no lock against
+    // compaction. A publish names the hour compaction read from the clock,
+    // and this tick never deletes the date it reads as today, so a marker
+    // written during the tick normally names a directory the tick keeps
+    // anyway. The exception is a publish that straddles midnight while a
+    // sweep reaches yesterday: compaction reads the old date and this tick
+    // reads the new one. The re-scan keeps that directory if the marker
+    // exists when the re-scan runs. What remains is the window between the
+    // re-scan and the `remove_dir_all`: a marker written there names a
+    // directory the sweep then deletes. Recovery finds neither output and
+    // reports the marker as contradictory, and
+    // `TrawlPublicationRecoveryBlocked` fires. The WAL files are kept, so
+    // no acknowledged row is lost or counted twice beyond what retention
+    // itself deletes, but the service stays blocked until an operator
     // resolves the marker.
     let claims = match crate::ingest::publication_marker::scan_claims(wal_dir) {
         Ok(claims) => claims,
@@ -372,6 +379,11 @@ fn retention_tick_at(
         if repin_claimed_mid_sweep(data_dir) {
             return Ok(());
         }
+        match publication_claimed_mid_sweep(wal_dir, dir) {
+            MidSweepClaim::None => {}
+            MidSweepClaim::Claimed => continue,
+            MidSweepClaim::Unreadable => return Ok(()),
+        }
         match delete_fn(&dir.path) {
             Ok(bytes) => {
                 tracing::info!(
@@ -402,6 +414,7 @@ fn retention_tick_at(
     if config.min_free_disk_bytes > 0 {
         let (bytes, dirs) = disk_pressure_sweep(
             data_dir,
+            wal_dir,
             config,
             candidates,
             today,
@@ -429,6 +442,7 @@ fn retention_tick_at(
 /// dirs_deleted)`.
 fn disk_pressure_sweep(
     data_dir: &Path,
+    wal_dir: &Path,
     config: &RetentionConfig,
     mut candidates: Vec<DateDir>,
     today: NaiveDate,
@@ -472,8 +486,14 @@ fn disk_pressure_sweep(
             break;
         }
 
-        // Delete the highest-ranked remaining dir.
+        // Delete the highest-ranked remaining dir, unless a publication
+        // marker has claimed it since the tick's scan.
         let dir = candidates.remove(0);
+        match publication_claimed_mid_sweep(wal_dir, &dir) {
+            MidSweepClaim::None => {}
+            MidSweepClaim::Claimed => continue,
+            MidSweepClaim::Unreadable => break,
+        }
         match delete_fn(&dir.path) {
             Ok(bytes) => {
                 tracing::info!(
@@ -526,6 +546,54 @@ fn repin_claimed_mid_sweep(data_dir: &Path) -> bool {
          completes"
     );
     true
+}
+
+/// What a publication-claim re-scan found for one date directory.
+enum MidSweepClaim {
+    /// No pending marker claims the directory.
+    None,
+    /// A marker written since the tick's scan claims it: keep it and move
+    /// on to the next candidate.
+    Claimed,
+    /// The markers could not be read: stand the sweep down.
+    Unreadable,
+}
+
+/// Re-scan the publication markers immediately before deleting `dir`.
+///
+/// The tick's own scan only covers markers that existed when the tick
+/// started. Compaction can publish into yesterday's directory after that
+/// scan when its clock read falls before midnight and this tick's falls
+/// after it. Re-scanning here narrows that race to the time between this
+/// call and the deletion that follows it. An unreadable scan stands the
+/// sweep down and raises the suppression gauge, as the tick's own scan
+/// does.
+fn publication_claimed_mid_sweep(wal_dir: &Path, dir: &DateDir) -> MidSweepClaim {
+    match crate::ingest::publication_marker::scan_claims(wal_dir) {
+        Ok(claims) if claims.claims_date(&dir.env, dir.date) => {
+            tracing::info!(
+                event_type = "retention_publication_claimed",
+                retention_env = %dir.env,
+                date = %dir.date,
+                "kept a date directory that a publication marker claimed \
+                 during this tick; retention considers it again once \
+                 recovery resolves the marker"
+            );
+            MidSweepClaim::Claimed
+        }
+        Ok(_) => MidSweepClaim::None,
+        Err(e) => {
+            metrics::gauge!(crate::metrics::RETENTION_SUPPRESSED).set(1.0);
+            tracing::warn!(
+                event_type = "retention_publication_claims_unreadable",
+                error = %e,
+                "could not re-read the publication markers under the WAL \
+                 root before a deletion; suppressing the rest of this sweep \
+                 rather than deleting files a marker may claim"
+            );
+            MidSweepClaim::Unreadable
+        }
+    }
 }
 
 /// Evidence that a repin job owns this data root right now, if any.
@@ -1498,6 +1566,133 @@ mod tests {
         )
         .unwrap();
         assert!(!claimed.exists(), "a resolved marker no longer claims");
+    }
+
+    /// A marker written after the tick's own scan still keeps its date: the
+    /// sweep re-scans just before each deletion. In the age phase the
+    /// injected deletion plants the marker right after the first target
+    /// goes, naming the second. The second survives and the third, which
+    /// no marker claims, is still deleted.
+    #[test]
+    fn a_publication_marker_written_mid_age_sweep_keeps_its_date() {
+        let today = fixed_today();
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let wal_dir = tmp.path().join("wal");
+        let first = plant(&data_dir, "prod", days_before(today, 202));
+        let second = plant(&data_dir, "prod", days_before(today, 201));
+        let third = plant(&data_dir, "prod", days_before(today, 200));
+
+        let deleted = AtomicU32::new(0);
+        let config = make_config(90, 0);
+        retention_tick_at(
+            &data_dir,
+            &wal_dir,
+            &config,
+            today,
+            always_pressured(),
+            |path| {
+                let bytes = delete_date_dir(path)?;
+                if deleted.fetch_add(1, AtomicOrdering::Relaxed) == 0 {
+                    plant_publication_marker(&wal_dir, "prod", days_before(today, 201));
+                }
+                Ok(bytes)
+            },
+        )
+        .unwrap();
+
+        assert!(!first.exists(), "the deletion before the marker stands");
+        assert!(second.exists(), "the date the new marker claims is kept");
+        assert!(!third.exists(), "the sweep goes on past the claimed date");
+    }
+
+    /// The same re-scan guards the pressure phase, and this is the midnight
+    /// case: compaction read yesterday's date and publishes into it while
+    /// this tick, already on the new date, sweeps under pressure. The
+    /// free-space probe runs after the tick's scan and before each pressure
+    /// deletion, so its first call plants a marker naming yesterday. The
+    /// older date, which no marker claims, is still deleted.
+    #[test]
+    fn a_publication_marker_written_mid_pressure_sweep_keeps_its_date() {
+        let today = fixed_today();
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let wal_dir = tmp.path().join("wal");
+        let yesterday = days_before(today, 1);
+        let older = plant(&data_dir, "prod", days_before(today, 2));
+        let publishing = plant(&data_dir, "prod", yesterday);
+
+        // Keep-forever everywhere, so only pressure deletes, oldest first.
+        let calls = AtomicU32::new(0);
+        let config = make_config(0, 1_000_000);
+        retention_tick_at(
+            &data_dir,
+            &wal_dir,
+            &config,
+            today,
+            |_| {
+                if calls.fetch_add(1, AtomicOrdering::Relaxed) == 0 {
+                    plant_publication_marker(&wal_dir, "prod", yesterday);
+                }
+                Ok(500_000)
+            },
+            delete_date_dir,
+        )
+        .unwrap();
+
+        assert!(!older.exists(), "an unclaimed date is still deleted");
+        assert!(
+            publishing.exists(),
+            "the date the new marker claims is kept"
+        );
+    }
+
+    /// If the re-scan cannot read the markers, the sweep stops before the
+    /// next deletion and raises the suppression gauge.
+    #[test]
+    fn markers_unreadable_mid_sweep_stop_the_next_deletion() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let today = fixed_today();
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let wal_dir = tmp.path().join("wal");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+        let first = plant(&data_dir, "prod", days_before(today, 201));
+        let second = plant(&data_dir, "prod", days_before(today, 200));
+        let recent = plant(&data_dir, "prod", days_before(today, 10));
+
+        let deleted = AtomicU32::new(0);
+        let config = make_config(90, 1_000_000);
+        metrics::with_local_recorder(&recorder, || {
+            retention_tick_at(
+                &data_dir,
+                &wal_dir,
+                &config,
+                today,
+                always_pressured(),
+                |path| {
+                    let bytes = delete_date_dir(path)?;
+                    if deleted.fetch_add(1, AtomicOrdering::Relaxed) == 0 {
+                        std::fs::remove_dir(&wal_dir).unwrap();
+                        std::fs::write(&wal_dir, b"not a directory").unwrap();
+                    }
+                    Ok(bytes)
+                },
+            )
+            .unwrap();
+        });
+
+        assert!(!first.exists(), "the deletion before the failure stands");
+        assert!(second.exists(), "no deletion under unreadable markers");
+        assert!(recent.exists(), "pressure never runs after the stand-down");
+        assert!(
+            handle
+                .render()
+                .contains(&format!("{RETENTION_SUPPRESSED} 1")),
+            "{}",
+            handle.render()
+        );
     }
 
     /// Markers that cannot be read may claim any date, so an unreadable WAL
