@@ -110,7 +110,9 @@ pub async fn logout() -> Result<(), ApiError> {
     }
 }
 
-/// GET /api/v1/health — unauthenticated health/version probe from trawld.
+/// GET /api/v1/health — health/version probe. trawld serves it without
+/// auth, but the browser reaches it through the trawl-web `/api/v1/*` proxy,
+/// which requires a session; `/healthz` is the public probe.
 pub async fn health() -> Result<HealthResponse, ApiError> {
     let resp = Request::get("/api/v1/health").send().await?;
     match resp.status() {

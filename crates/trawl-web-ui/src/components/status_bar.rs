@@ -37,21 +37,19 @@ pub fn StatusBar(
     admin: Signal<Option<DashboardSnapshot>>,
 ) -> impl IntoView {
     // Host the browser is talking to — shown in the connected-state label
-    // next to the server version from /api/v1/health.
+    // next to the server version from /api/v1/health. The version appears
+    // only once health returns one; while health is pending, has failed, or
+    // reports no version, the label names the host alone.
     let host = web_sys::window()
         .and_then(|w| w.location().host().ok())
         .unwrap_or_default();
     let server = LocalResource::new(api::health);
 
     let status_label = move || match status.get() {
-        StatusKind::Connected => {
-            let v = server
-                .get()
-                .and_then(Result::ok)
-                .and_then(|h| h.version)
-                .unwrap_or_else(|| "?".to_string());
-            format!("Connected ({host} v{v})")
-        }
+        StatusKind::Connected => match server.get().and_then(Result::ok).and_then(|h| h.version) {
+            Some(v) => format!("Connected ({host} v{v})"),
+            None => format!("Connected ({host})"),
+        },
         StatusKind::Hauling => "Hauling".to_string(),
         StatusKind::Live => "Live".to_string(),
         StatusKind::Error => "Error".to_string(),
