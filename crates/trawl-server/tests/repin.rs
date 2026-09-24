@@ -108,6 +108,7 @@ impl Harness {
             &self.wal_dir,
             &self.data_dir,
             Duration::ZERO,
+            Duration::ZERO,
             false,
             Some(hot_buffer),
             500,
@@ -1306,6 +1307,7 @@ async fn events_ingested_during_the_final_pause_stay_visible_exactly_once() {
             trawl_server::ingest::compaction::compact_once_coordinated(
                 &wal_dir,
                 &data_dir,
+                Duration::ZERO,
                 Duration::ZERO,
                 false,
                 Some(&hot),

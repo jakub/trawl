@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use tokio::sync::watch;
 use trawl_core::conform::RepinTarget;
@@ -20,7 +20,7 @@ use trawl_core::severity::Dialect;
 
 use crate::catalog::CatalogContext;
 use crate::env_dirs::{list_env_dirs, try_list_env_dirs_observed};
-use crate::hot_buffer::HotBuffer;
+use crate::hot_buffer::{AdmissionState, HotBuffer};
 use crate::ingest::publication_marker::{
     self, PublicationClaims, RecoveryOutcomeKind, ValidatedMarker,
 };
@@ -35,11 +35,129 @@ use crate::store::{FieldConflict, MAX_CONFLICT_SAMPLE_BYTES, MAX_CONFLICT_SAMPLE
 #[cfg(test)]
 const DEFAULT_CHUNK_SIZE: usize = 500;
 
+/// Why a compaction pass runs (ADR-0043).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PassKind {
+    /// The interval deadline fired. Runs the daily rollup.
+    Normal,
+    /// The hot buffer is not `Open`, or its pressure generation advanced.
+    /// Compacts every WAL file whatever its age, and skips the rollup so the
+    /// pass spends its time on draining.
+    Pressure,
+}
+
+/// What one pass does: which WAL files it may take, and whether it rolls up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PassPlan {
+    wal_min_age: Duration,
+    daily_rollup: bool,
+}
+
+impl PassPlan {
+    /// A normal pass under pressure still rolls up, but takes young WAL too:
+    /// the buffer needs every drain it can get.
+    fn new(kind: PassKind, admission: AdmissionState, interval: Duration, rollup: bool) -> Self {
+        match (kind, admission) {
+            (PassKind::Normal, AdmissionState::Open) => Self {
+                wal_min_age: interval,
+                daily_rollup: rollup,
+            },
+            (PassKind::Normal, _) => Self {
+                wal_min_age: Duration::ZERO,
+                daily_rollup: rollup,
+            },
+            (PassKind::Pressure, _) => Self {
+                wal_min_age: Duration::ZERO,
+                daily_rollup: false,
+            },
+        }
+    }
+}
+
+/// When the compaction loop runs its next pass.
+///
+/// The normal deadline is independent of pressure: only a normal pass moves
+/// it, so continuous pressure can never postpone the rollup. Pressure passes
+/// run back to back while they make progress (drain at least one batch) and
+/// the buffer is still not `Open`. A pass that drains nothing while the
+/// buffer is not `Open` starts a cooldown of one interval, during which
+/// pressure is ignored. Under continuous refusals and a stalled drain, the
+/// loop therefore runs at most about one pass per interval, not one per
+/// refusal.
+#[derive(Debug)]
+struct Cadence {
+    interval: Duration,
+    next_normal: Instant,
+    cooldown_until: Option<Instant>,
+}
+
+impl Cadence {
+    fn new(start: Instant, interval: Duration) -> Self {
+        Self {
+            interval,
+            next_normal: start + interval,
+            cooldown_until: None,
+        }
+    }
+
+    fn cooling(&self, now: Instant) -> bool {
+        self.cooldown_until.is_some_and(|until| now < until)
+    }
+
+    /// The pass due at `now` without waiting, if any. The normal deadline
+    /// comes first, so back-to-back pressure passes cannot starve it.
+    fn due(&self, now: Instant, admission: AdmissionState) -> Option<PassKind> {
+        if now >= self.next_normal {
+            Some(PassKind::Normal)
+        } else if admission != AdmissionState::Open && !self.cooling(now) {
+            Some(PassKind::Pressure)
+        } else {
+            None
+        }
+    }
+
+    /// Whether a pressure wake may start a pass at `now`.
+    fn accepts_pressure(&self, now: Instant) -> bool {
+        !self.cooling(now)
+    }
+
+    /// Record a finished pass. `drained` is whether it removed at least one
+    /// hot batch; `admission` is the state after it.
+    fn finished(&mut self, kind: PassKind, now: Instant, drained: bool, admission: AdmissionState) {
+        if kind == PassKind::Normal {
+            self.next_normal = now + self.interval;
+        }
+        self.cooldown_until = if !drained && admission != AdmissionState::Open {
+            Some(now + self.interval)
+        } else {
+            None
+        };
+    }
+}
+
+/// Wait for the next pressure generation, or forever when there is no hot
+/// buffer to watch.
+async fn pressure_changed(
+    rx: &mut Option<watch::Receiver<u64>>,
+) -> Result<(), watch::error::RecvError> {
+    match rx {
+        Some(rx) => rx.changed().await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Spawn the compaction background loop.
 ///
-/// Runs every `interval` seconds, scanning `wal_dir` for `.ndjson` files
-/// whose mtime is older than `interval`. Groups by service and writes
-/// parquet to `data_dir/{env}/{date}/{HH}/{service}.parquet`.
+/// Runs a normal pass every `interval`, compacting `wal_dir` `.ndjson`
+/// files whose mtime is older than `interval`, and then the daily rollup.
+/// Groups by service and writes parquet to
+/// `data_dir/{env}/{date}/{HH}/{service}.parquet`.
+///
+/// Between normal passes, hot-buffer pressure (ADR-0043) starts extra
+/// passes: when the buffer is not `Open` or its pressure generation
+/// advances, a pass compacts every WAL file whatever its age and skips the
+/// rollup. A normal pass that fires while the buffer is not `Open` also
+/// takes young WAL. See [`Cadence`] for how pressure passes stay bounded.
 ///
 /// Stops when `shutdown_rx` receives a signal.
 #[allow(clippy::too_many_arguments)] // internal API, config struct is overkill here
@@ -69,40 +187,106 @@ pub fn spawn_compaction(
             "compaction task started"
         );
 
+        let admission = || {
+            hot_buffer
+                .as_ref()
+                .map_or(AdmissionState::Open, |buf| buf.admission_state())
+        };
+        let drained = || hot_buffer.as_ref().map_or(0, |buf| buf.drained_batches());
+        let mut pressure = hot_buffer.as_ref().map(|buf| buf.subscribe_pressure());
+        let mut cadence = Cadence::new(Instant::now(), interval);
+
         loop {
-            tokio::select! {
-                () = tokio::time::sleep(interval) => {
-                    match compact_once_coordinated(&wal_dir, &data_dir, interval, daily_rollup, hot_buffer.as_ref(), chunk_size, &memory_limit, catalog.as_ref(), repin.as_ref()).await {
-                        Ok(data_loss) => {
-                            if let Some(ref stats) = compaction_stats {
-                                stats.total_runs.fetch_add(1, Ordering::Relaxed);
-                                // compact_once returns the combined data-loss
-                                // tally: best-effort daily-rollup failures,
-                                // WAL files quarantined this cycle and
-                                // publication markers left blocking. Surface it
-                                // on the dashboard counter, not just in logs.
-                                if data_loss > 0 {
-                                    stats.total_errors.fetch_add(data_loss, Ordering::Relaxed);
-                                }
-                                let epoch_secs = SystemTime::now()
-                                    .duration_since(SystemTime::UNIX_EPOCH)
-                                    .map_or(0, |d| d.as_secs());
-                                stats.last_run_epoch_secs.store(epoch_secs, Ordering::Relaxed);
-                            }
+            // A pass that is due now skips the wait below, so check for
+            // shutdown here as well.
+            if shutdown_rx.has_changed().unwrap_or(true) {
+                tracing::info!(
+                    event_type = "lifecycle",
+                    action = "compaction_stop",
+                    "compaction task shutting down"
+                );
+                break;
+            }
+            let kind = if let Some(kind) = cadence.due(Instant::now(), admission()) {
+                kind
+            } else {
+                let next_normal = cadence.next_normal;
+                let accepts_pressure = cadence.accepts_pressure(Instant::now());
+                tokio::select! {
+                    biased;
+                    _ = shutdown_rx.changed() => {
+                        tracing::info!(event_type = "lifecycle", action = "compaction_stop", "compaction task shutting down");
+                        break;
+                    }
+                    () = tokio::time::sleep_until(next_normal.into()) => PassKind::Normal,
+                    changed = pressure_changed(&mut pressure), if accepts_pressure => {
+                        if changed.is_err() {
+                            // The buffer is gone; only the interval remains.
+                            pressure = None;
+                            continue;
                         }
-                        Err(e) => {
-                            if let Some(ref stats) = compaction_stats {
-                                stats.total_errors.fetch_add(1, Ordering::Relaxed);
-                            }
-                            tracing::error!(event_type = "compaction_error", error = %e, "compaction tick failed");
-                        }
+                        PassKind::Pressure
                     }
                 }
-                _ = shutdown_rx.changed() => {
-                    tracing::info!(event_type = "lifecycle", action = "compaction_stop", "compaction task shutting down");
-                    break;
+            };
+
+            // Generations up to here are answered by this pass; one that
+            // advances during it wakes the loop again.
+            if let Some(rx) = pressure.as_mut() {
+                rx.borrow_and_update();
+            }
+            let plan = PassPlan::new(kind, admission(), interval, daily_rollup);
+            if kind == PassKind::Pressure {
+                tracing::debug!(
+                    event_type = "compaction_pressure_pass",
+                    "hot buffer under pressure; compacting all WAL now"
+                );
+            }
+            let drained_before = drained();
+            match compact_once_coordinated(
+                &wal_dir,
+                &data_dir,
+                interval,
+                plan.wal_min_age,
+                plan.daily_rollup,
+                hot_buffer.as_ref(),
+                chunk_size,
+                &memory_limit,
+                catalog.as_ref(),
+                repin.as_ref(),
+            )
+            .await
+            {
+                Ok(data_loss) => {
+                    if let Some(ref stats) = compaction_stats {
+                        stats.total_runs.fetch_add(1, Ordering::Relaxed);
+                        // compact_once returns the combined data-loss
+                        // tally: best-effort daily-rollup failures,
+                        // WAL files quarantined this cycle and
+                        // publication markers left blocking. Surface it
+                        // on the dashboard counter, not just in logs.
+                        if data_loss > 0 {
+                            stats.total_errors.fetch_add(data_loss, Ordering::Relaxed);
+                        }
+                        let epoch_secs = SystemTime::now()
+                            .duration_since(SystemTime::UNIX_EPOCH)
+                            .map_or(0, |d| d.as_secs());
+                        stats
+                            .last_run_epoch_secs
+                            .store(epoch_secs, Ordering::Relaxed);
+                    }
+                }
+                Err(e) => {
+                    if let Some(ref stats) = compaction_stats {
+                        stats.total_errors.fetch_add(1, Ordering::Relaxed);
+                    }
+                    tracing::error!(event_type = "compaction_error", error = %e, "compaction tick failed");
                 }
             }
+            // Progress is batches drained, not occupancy: producers refill
+            // the buffer while a pass runs.
+            let progressed = drained() != drained_before;
+            cadence.finished(kind, Instant::now(), progressed, admission());
         }
     })
 }
@@ -136,6 +320,7 @@ pub async fn compact_once(
         wal_dir,
         data_dir,
         min_age,
+        min_age,
         daily_rollup,
         hot_buffer,
         chunk_size,
@@ -161,11 +346,17 @@ pub async fn compact_once(
 /// publication markers (ADR-0041) under the corpus gate, and skips every
 /// `(env, service)` a marker still claims. Each chunk then publishes under
 /// its own marker: see [`publish_output`].
+///
+/// `min_age` is the compaction interval: orphaned `.parquet.tmp` files
+/// older than twice it are removed. `wal_min_age` selects the WAL files the
+/// pass compacts: those older than it, or every file, a future mtime
+/// included, when it is zero (a pressure pass, ADR-0043).
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // internal API, config struct is overkill here
 pub async fn compact_once_coordinated(
     wal_dir: &Path,
     data_dir: &Path,
     min_age: Duration,
+    wal_min_age: Duration,
     daily_rollup: bool,
     hot_buffer: Option<&Arc<HotBuffer>>,
     chunk_size: usize,
@@ -194,8 +385,8 @@ pub async fn compact_once_coordinated(
     //
     // The root listing is fallible on purpose: an unreadable WAL root is not
     // an empty WAL root. Swallowing it would iterate nothing and report a
-    // clean cycle while the WAL never drains and the hot buffer evicts
-    // un-compacted events. A *missing* root is a cold start and yields an
+    // clean cycle while the WAL never drains and the hot buffer fills until
+    // admission refuses ingest (ADR-0043). A *missing* root is a cold start and yields an
     // empty list silently. Unlike a single unreadable env (isolated and
     // counted), a bad root leaves nothing to carry on with.
     let mut skipped_scan_error = false;
@@ -226,7 +417,7 @@ pub async fn compact_once_coordinated(
 
     for (env, env_wal_dir) in env_wal_dirs {
         let env_data_dir = data_dir.join(&env);
-        let Some(files) = scan_env_wal_files(&env, &env_wal_dir, min_age) else {
+        let Some(files) = scan_env_wal_files(&env, &env_wal_dir, wal_min_age) else {
             scan_failures += 1;
             continue;
         };
@@ -3908,8 +4099,8 @@ fn remove_stale_tmp(path: &Path, max_age: Duration) {
 /// compaction cycle can skip that env and carry on. Propagating instead
 /// would abort the whole cycle — every other env's WAL drain plus the daily
 /// rollup — for as long as the one bad directory stays unreadable, growing
-/// the WAL without bound and letting the hot buffer evict un-compacted
-/// events. A missing directory is not a failure: [`scan_wal_files`] already
+/// the WAL without bound and leaving the hot buffer full, so admission
+/// refuses ingest (ADR-0043). A missing directory is not a failure: [`scan_wal_files`] already
 /// reports `NotFound` as an empty scan.
 fn scan_env_wal_files(env: &str, env_wal_dir: &Path, min_age: Duration) -> Option<Vec<PathBuf>> {
     match scan_wal_files(env_wal_dir, min_age) {
@@ -3929,6 +4120,11 @@ fn scan_env_wal_files(env: &str, env_wal_dir: &Path, min_age: Duration) -> Optio
 }
 
 /// Scan the WAL directory for `.ndjson` files older than `min_age`.
+///
+/// A zero `min_age` takes every file without reading its mtime, so a file
+/// whose mtime is in the future (clock skew, a restored backup) is taken
+/// too. A pressure pass relies on that: its whole point is to drain what
+/// is resident now.
 pub(crate) fn scan_wal_files(wal_dir: &Path, min_age: Duration) -> std::io::Result<Vec<PathBuf>> {
     let now = SystemTime::now();
     let mut files = Vec::new();
@@ -3943,8 +4139,12 @@ pub(crate) fn scan_wal_files(wal_dir: &Path, min_age: Duration) -> std::io::Resu
         let entry = entry?;
         let path = entry.path();
 
-        if path.extension().is_some_and(|ext| ext == "ndjson")
-            && let Ok(mtime) = entry.metadata()?.modified()
+        if path.extension().is_none_or(|ext| ext != "ndjson") {
+            continue;
+        }
+        if min_age.is_zero() {
+            files.push(path);
+        } else if let Ok(mtime) = entry.metadata()?.modified()
             && now.duration_since(mtime).unwrap_or_default() > min_age
         {
             files.push(path);
@@ -4661,6 +4861,7 @@ mod tests {
                 &tmp.path().join("no-wal"),
                 &data,
                 Duration::ZERO,
+                Duration::ZERO,
                 true,
                 Some(&hot),
                 500,
@@ -4679,6 +4880,7 @@ mod tests {
             compact_once_coordinated(
                 &tmp.path().join("no-wal"),
                 &data,
+                Duration::ZERO,
                 Duration::ZERO,
                 true,
                 Some(&hot),
@@ -8576,6 +8778,7 @@ mod tests {
             &wal_dir,
             &data_dir,
             Duration::from_secs(1),
+            Duration::from_secs(1),
             true,
             None,
             DEFAULT_CHUNK_SIZE,
@@ -8595,6 +8798,7 @@ mod tests {
         compact_once_coordinated(
             &wal_dir,
             &data_dir,
+            Duration::from_secs(1),
             Duration::from_secs(1),
             true,
             None,
@@ -8646,6 +8850,7 @@ mod tests {
                 &w,
                 &d,
                 Duration::from_secs(1),
+                Duration::from_secs(1),
                 true,
                 None,
                 DEFAULT_CHUNK_SIZE,
@@ -8677,6 +8882,7 @@ mod tests {
         compact_once_coordinated(
             &wal_dir,
             &data_dir,
+            Duration::from_secs(1),
             Duration::from_secs(1),
             true,
             None,
@@ -10402,5 +10608,403 @@ mod tests {
             !rendered.contains(crate::metrics::CATALOG_BOOKKEEPING_TIMEOUTS_TOTAL),
             "no series at all, on either label: {rendered}"
         );
+    }
+
+    // -- hot-buffer pressure (ADR-0043) ---------------------------------------
+
+    use crate::hot_buffer::{Charge, HotBufferConfig};
+    use crate::ingest::pipeline::{AdmittedGroup, PipelineWriter, ServiceBatch};
+    use crate::ingest::producer::ProducerKind;
+    use crate::ingest::wal::WalWriter;
+
+    /// A hot buffer whose pressure threshold is 50 events.
+    fn pressure_buffer() -> Arc<HotBuffer> {
+        Arc::new(HotBuffer::new(HotBufferConfig {
+            max_events: 100,
+            max_bytes: 1024 * 1024,
+        }))
+    }
+
+    /// Reserve and build one `(prod, service)` group of `count` events.
+    fn admitted_group(
+        pipeline: &PipelineWriter,
+        producer: ProducerKind,
+        service: &str,
+        count: usize,
+    ) -> AdmittedGroup {
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut batch = ServiceBatch::default();
+        for id in 0..count {
+            batch.push(
+                serde_json::json!({
+                    "_time": now,
+                    "_ingested": now,
+                    "env": "prod",
+                    "service": service,
+                    "message": format!("event {id}"),
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            );
+        }
+        let reservation = pipeline
+            .reserve(producer, batch.charge())
+            .expect("the group fits");
+        AdmittedGroup {
+            key: ("prod".to_owned(), service.to_owned()),
+            batch,
+            reservation,
+        }
+    }
+
+    /// Write admitted groups through the real WAL + hot-buffer path.
+    async fn write_groups(pipeline: &Arc<PipelineWriter>, groups: Vec<AdmittedGroup>) -> usize {
+        let pipeline = Arc::clone(pipeline);
+        tokio::task::spawn_blocking(move || pipeline.write_admitted(groups))
+            .await
+            .unwrap()
+    }
+
+    struct Loop {
+        handle: tokio::task::JoinHandle<()>,
+        shutdown: watch::Sender<bool>,
+        stats: Arc<CompactionStats>,
+    }
+
+    impl Loop {
+        fn spawn(tmp: &Path, interval: Duration, daily_rollup: bool, hot: &Arc<HotBuffer>) -> Self {
+            let (shutdown, shutdown_rx) = watch::channel(false);
+            let stats = Arc::new(CompactionStats::default());
+            let handle = spawn_compaction(
+                tmp.join("wal"),
+                tmp.join("data"),
+                interval,
+                daily_rollup,
+                DEFAULT_CHUNK_SIZE,
+                "2GB".to_owned(),
+                Some(Arc::clone(hot)),
+                Some(Arc::clone(&stats)),
+                None,
+                None,
+                shutdown_rx,
+            );
+            Self {
+                handle,
+                shutdown,
+                stats,
+            }
+        }
+
+        async fn stop(self) {
+            self.shutdown.send(true).unwrap();
+            tokio::time::timeout(Duration::from_secs(60), self.handle)
+                .await
+                .expect("compaction stops on shutdown")
+                .unwrap();
+        }
+    }
+
+    /// Poll `done` every 20 ms until it holds or `limit` passes.
+    async fn eventually(limit: Duration, mut done: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + limit;
+        while Instant::now() < deadline {
+            if done() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        done()
+    }
+
+    /// With a one-hour interval, the normal pass never fires during
+    /// the test, and the WAL files are seconds old. Only a pressure pass
+    /// (zero WAL age) can publish them and drain the buffer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pressure_wakes_compaction_and_drains_young_wal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hot = pressure_buffer();
+        let pipeline = Arc::new(PipelineWriter::new(
+            Arc::new(WalWriter::new(tmp.path().join("wal"))),
+            Some(Arc::clone(&hot)),
+            None,
+        ));
+        let compaction = Loop::spawn(tmp.path(), Duration::from_secs(3600), false, &hot);
+
+        let group = admitted_group(&pipeline, ProducerKind::Syslog, "svc", 60);
+        assert_eq!(
+            hot.admission_state(),
+            AdmissionState::Pressure,
+            "60 of 100 events charged is at or above one half"
+        );
+        assert_eq!(write_groups(&pipeline, vec![group]).await, 60);
+
+        let wal_env = tmp.path().join("wal").join("prod");
+        let drained = eventually(Duration::from_secs(30), || {
+            hot.event_count() == 0 && find_files_by_ext(&wal_env, "ndjson").is_empty()
+        })
+        .await;
+        assert!(
+            drained,
+            "a pressure pass must publish the young WAL and drain the buffer; \
+             {} events still resident, {} runs",
+            hot.event_count(),
+            compaction.stats.total_runs.load(Ordering::Relaxed),
+        );
+        assert_eq!(hot.charged(), Charge::ZERO);
+        assert_eq!(hot.admission_state(), AdmissionState::Open);
+        assert_eq!(hot.drained_batches(), 1);
+        let published = find_files_by_ext(&tmp.path().join("data").join("prod"), "parquet");
+        assert_eq!(published.len(), 1, "one hourly parquet: {published:?}");
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let rows: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT count(*)::BIGINT FROM read_parquet('{}')",
+                    published[0].display()
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 60);
+
+        compaction.stop().await;
+    }
+
+    /// Every pass fails to publish (the env data path is a file), so
+    /// none drains anything, while `Full` refusals advance the pressure
+    /// generation every few milliseconds. The cooldown keeps the loop to
+    /// about one pass per interval instead of one per refusal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stalled_pressure_passes_stay_bounded() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("data")).unwrap();
+        std::fs::write(tmp.path().join("data").join("prod"), b"not a directory").unwrap();
+        let hot = pressure_buffer();
+        let pipeline = Arc::new(PipelineWriter::new(
+            Arc::new(WalWriter::new(tmp.path().join("wal"))),
+            Some(Arc::clone(&hot)),
+            None,
+        ));
+        // Self-telemetry may fill the whole cap; external producers now
+        // have no free space at all.
+        let group = admitted_group(&pipeline, ProducerKind::Trawld, "svc", 100);
+        assert_eq!(write_groups(&pipeline, vec![group]).await, 100);
+
+        let refusing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let refusals = {
+            let hot = Arc::clone(&hot);
+            let refusing = Arc::clone(&refusing);
+            std::thread::spawn(move || {
+                let mut count = 0_u64;
+                while refusing.load(Ordering::Relaxed) {
+                    assert_eq!(
+                        hot.ensure_free_space(ProducerKind::Http),
+                        Err(crate::hot_buffer::Refusal::Full)
+                    );
+                    count += 1;
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                count
+            })
+        };
+
+        let interval = Duration::from_secs(1);
+        let start = Instant::now();
+        let compaction = Loop::spawn(tmp.path(), interval, false, &hot);
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        let runs = compaction.stats.total_runs.load(Ordering::Relaxed);
+        let elapsed = start.elapsed();
+        refusing.store(false, Ordering::Relaxed);
+        let refused = refusals.join().unwrap();
+        compaction.stop().await;
+
+        assert_eq!(hot.event_count(), 100, "no pass drained anything");
+        assert_eq!(hot.drained_batches(), 0);
+        assert_eq!(hot.admission_state(), AdmissionState::Refusing);
+        assert!(refused > 100, "refusals kept coming: {refused}");
+        let bound = elapsed.as_secs_f64() / interval.as_secs_f64() + 2.0;
+        assert!(
+            runs >= 2,
+            "the loop kept running passes ({runs} in {elapsed:?})"
+        );
+        #[allow(clippy::cast_precision_loss, reason = "a pass count far below 2^52")]
+        let runs_f = runs as f64;
+        assert!(
+            runs_f <= bound,
+            "{runs} passes in {elapsed:?} under {refused} refusals exceeds {bound}"
+        );
+    }
+
+    #[test]
+    fn zero_age_scan_takes_future_mtime_wal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_wal_file(tmp.path(), "svc", &[OPERATIONAL_ROW]);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(SystemTime::now() + Duration::from_secs(3600))
+            .unwrap();
+
+        assert_eq!(
+            scan_wal_files(tmp.path(), Duration::ZERO).unwrap(),
+            vec![path],
+            "a zero age takes every WAL file, a future mtime included"
+        );
+        assert!(
+            scan_wal_files(tmp.path(), Duration::from_secs(1))
+                .unwrap()
+                .is_empty(),
+            "a positive age still reads a future mtime as too young"
+        );
+    }
+
+    /// Continuous pressure (a reservation held above one half) makes the
+    /// loop run a pressure pass as soon as it starts. That pass must leave
+    /// the historical hourly files alone, and the normal deadline must
+    /// still roll them up while the buffer stays under pressure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pressure_pass_skips_rollup_and_the_normal_deadline_still_rolls_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env_data = tmp.path().join("data").join("prod");
+        let date = "2026-01-15";
+        let row = r#"{"_time":"2026-01-15T01:00:00Z","_ingested":"2026-01-15T01:00:00Z","service":"nginx","msg":"a"}"#;
+        let hourly = [
+            write_hourly_parquet(&env_data, date, "01", "nginx", &[row]),
+            write_hourly_parquet(&env_data, date, "02", "nginx", &[row]),
+        ];
+        let daily = env_data.join(date).join("nginx.parquet");
+
+        let hot = pressure_buffer();
+        let pipeline = Arc::new(PipelineWriter::new(
+            Arc::new(WalWriter::new(tmp.path().join("wal"))),
+            Some(Arc::clone(&hot)),
+            None,
+        ));
+        let hold = pipeline
+            .reserve(
+                ProducerKind::Trawld,
+                Charge {
+                    events: 60,
+                    bytes: 60,
+                },
+            )
+            .unwrap();
+        assert_eq!(hot.admission_state(), AdmissionState::Pressure);
+
+        // Written before the loop starts: a loop that starts under pressure
+        // runs a pressure pass at once, and one that found nothing would
+        // cool down past the normal deadline.
+        let group = admitted_group(&pipeline, ProducerKind::Syslog, "svc", 5);
+        assert_eq!(write_groups(&pipeline, vec![group]).await, 5);
+        let interval = Duration::from_secs(5);
+        let start = Instant::now();
+        let compaction = Loop::spawn(tmp.path(), interval, true, &hot);
+
+        let pressure_ran = eventually(interval, || hot.drained_batches() == 1).await;
+        let observed_at = start.elapsed();
+        assert!(pressure_ran, "the insert under pressure woke a pass");
+        assert!(
+            observed_at < interval,
+            "the pressure pass must finish before the normal deadline for this \
+             test to separate them (took {observed_at:?})"
+        );
+        assert!(
+            hourly.iter().all(|path| path.exists()) && !daily.exists(),
+            "a pressure pass must not roll up"
+        );
+
+        let rolled = eventually(interval + Duration::from_secs(30), || daily.exists()).await;
+        assert!(rolled, "the normal deadline rolls up under pressure");
+        assert!(hourly.iter().all(|path| !path.exists()));
+        assert_ne!(
+            hot.admission_state(),
+            AdmissionState::Open,
+            "the pressure lasted through the rollup"
+        );
+        assert!(start.elapsed() >= interval);
+
+        compaction.stop().await;
+        drop(hold);
+    }
+
+    /// The cadence alone, on a synthetic clock: a stalled drain under a
+    /// pressure wake at every step runs about one pass per interval, and
+    /// the normal deadline moves only with normal passes.
+    #[test]
+    fn cadence_bounds_stalled_pressure_and_keeps_the_normal_deadline() {
+        let interval = Duration::from_secs(10);
+        let t0 = Instant::now();
+        let mut cadence = Cadence::new(t0, interval);
+        let mut passes = 0_u32;
+        let mut normals = 0_u32;
+        for ms in (0..100_000).step_by(100) {
+            let now = t0 + Duration::from_millis(ms);
+            let kind = cadence
+                .due(now, AdmissionState::Refusing)
+                .or_else(|| cadence.accepts_pressure(now).then_some(PassKind::Pressure));
+            if let Some(kind) = kind {
+                passes += 1;
+                normals += u32::from(kind == PassKind::Normal);
+                cadence.finished(kind, now, false, AdmissionState::Refusing);
+            }
+        }
+        assert!(passes <= 100 / 10 + 2, "{passes} passes in 100 s");
+        assert!(normals >= 9, "the normal deadline kept firing: {normals}");
+
+        // Progress under pressure reruns at once, without moving the deadline.
+        let mut cadence = Cadence::new(t0, interval);
+        let now = t0 + Duration::from_secs(1);
+        cadence.finished(PassKind::Pressure, now, true, AdmissionState::Pressure);
+        assert_eq!(
+            cadence.due(now, AdmissionState::Pressure),
+            Some(PassKind::Pressure)
+        );
+        assert_eq!(cadence.next_normal, t0 + interval);
+        // No progress: cooldown, and the normal deadline still fires.
+        cadence.finished(PassKind::Pressure, now, false, AdmissionState::Pressure);
+        assert_eq!(cadence.due(now, AdmissionState::Pressure), None);
+        assert!(!cadence.accepts_pressure(now));
+        assert_eq!(
+            cadence.due(t0 + interval, AdmissionState::Pressure),
+            Some(PassKind::Normal)
+        );
+    }
+
+    #[test]
+    fn pass_plans_split_wal_age_from_rollup() {
+        let interval = Duration::from_secs(60);
+        let plan = |kind, state| PassPlan::new(kind, state, interval, true);
+        assert_eq!(
+            plan(PassKind::Normal, AdmissionState::Open),
+            PassPlan {
+                wal_min_age: interval,
+                daily_rollup: true
+            }
+        );
+        for state in [AdmissionState::Pressure, AdmissionState::Refusing] {
+            assert_eq!(
+                plan(PassKind::Normal, state),
+                PassPlan {
+                    wal_min_age: Duration::ZERO,
+                    daily_rollup: true
+                }
+            );
+        }
+        for state in [
+            AdmissionState::Open,
+            AdmissionState::Pressure,
+            AdmissionState::Refusing,
+        ] {
+            assert_eq!(
+                plan(PassKind::Pressure, state),
+                PassPlan {
+                    wal_min_age: Duration::ZERO,
+                    daily_rollup: false
+                }
+            );
+        }
     }
 }
