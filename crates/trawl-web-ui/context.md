@@ -63,8 +63,12 @@ The newest raw events the stream delivered, up to a fixed size. In live it is wh
 _Avoid_: buffer (unqualified), tail rows, history
 
 **Filter rail**:
-The sidebar counting field values over the rows on screen: the snapshot page or the live ring. Its counts describe what is shown, never the corpus, and it is absent for an aggregation-shaped result because a value filter on an aggregate column names a field no event carries.
+The sidebar counting field values over the rows on screen: the snapshot page or the live ring. Its counts describe what is shown, never the corpus, and it is absent for an aggregation-shaped result because a value filter on an aggregate column names a field no event carries. It never counts an event instant or the raw event (`_time`, `_ingested`, `_raw`), nor a field whose values on screen are all different and all read as times; a field that is merely all different, such as ten hosts on ten rows, stays.
 _Avoid_: facet sidebar (the code name), facets
+
+**Null field**:
+A field whose value in this row is NULL: the event did not carry it, carried an explicit null, or carried a value its pin could not convert. The detail views fold null fields behind one disclosure; an empty string, zero or false is a value, never a null field.
+_Avoid_: empty field, absent field, missing field (each claims one of the three causes)
 
 **Histogram**:
 The strip above the snapshot table: the page's rows bucketed over their own time span. Absent in live. Neither ingest volume nor the full distribution of matches.
@@ -75,7 +79,7 @@ One of the two optional presentations of snapshot results, both off by default a
 _Avoid_: view mode, layout, density
 
 **Docked inspector**:
-The `details = inspector` presentation: a panel beside the results table (below it under 900px) showing every field of the selected event with Include, Exclude and Copy per row. Selecting a row highlights it and leaves the table in place; the selection names an event, not a row position, so sorting does not move it.
+The `details = inspector` presentation: a panel beside the results table (below it under 900px) showing the selected event's fields with Include, Exclude and Copy per row, null fields folded. Selecting a row highlights it and leaves the table in place; the selection names an event, not a row position, so sorting does not move it.
 _Avoid_: detail drawer, side panel, preview
 
 **Message-first rows**:
