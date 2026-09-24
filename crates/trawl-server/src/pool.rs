@@ -42,7 +42,7 @@ use std::time::Duration;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use trawl_engine::cancel::CancelLatch;
-use trawl_engine::executor::Executor;
+use trawl_engine::executor::{Executor, RowCap};
 use trawl_engine::value::QueryResult;
 
 use crate::deadline::Deadline;
@@ -920,7 +920,7 @@ fn run_query_blocking(
     source: &str,
     hot_buffer: Option<&Arc<HotBuffer>>,
     pins: &trawl_core::schema::FieldTypes,
-    max_result_rows: usize,
+    cap: RowCap,
     utc_offset_secs: i32,
     capture_debug: bool,
     pool_wait_ms: u64,
@@ -971,14 +971,14 @@ fn run_query_blocking(
                     hot_path,
                     &hot.field_types,
                     pins,
-                    max_result_rows,
+                    cap,
                     utc_offset_secs,
                 )
                 .map_err(ServerError::from)
         } else {
             executor
                 .cancellable(cancel)
-                .run_query(dsl, source, pins, max_result_rows, utc_offset_secs)
+                .run_query(dsl, source, pins, cap, utc_offset_secs)
                 .map_err(ServerError::from)
         }
     }));
@@ -1303,7 +1303,8 @@ impl ExecutorPool {
     /// Allocate a query id from the pool's counter.
     ///
     /// This is the single id authority: callers pass the returned id to
-    /// [`execute`](Self::execute) / [`execute_with_source`](Self::execute_with_source) /
+    /// [`execute`](Self::execute) / [`execute_capped`](Self::execute_capped) /
+    /// [`execute_with_source`](Self::execute_with_source) /
     /// [`export_parquet`](Self::export_parquet), and — when the query is
     /// user-visible — to `QueryTracker::start`, so `/queries` listings and
     /// [`cancel_by_id`](Self::cancel_by_id) speak the same id space.
@@ -1334,11 +1335,39 @@ impl ExecutorPool {
     /// state, and generated SQL for the query debug log.
     ///
     /// `utc_offset_secs` is applied to all timestamp values in the result.
-    #[allow(clippy::too_many_lines)]
+    ///
+    /// A result past `max_result_rows` is refused. A lane with a cap of its
+    /// own goes through [`execute_capped`](Self::execute_capped).
     pub async fn execute(
         &self,
         query_id: u64,
         dsl: &str,
+        deadline: Deadline,
+        capture_debug: bool,
+        utc_offset_secs: i32,
+        work: WorkContext,
+    ) -> ExecuteOutcome {
+        self.execute_capped(
+            query_id,
+            dsl,
+            RowCap::Refuse(self.max_result_rows),
+            deadline,
+            capture_debug,
+            utc_offset_secs,
+            work,
+        )
+        .await
+    }
+
+    /// [`execute`](Self::execute) under the caller's [`RowCap`] rather
+    /// than the pool's `max_result_rows`: the CSV and JSON exports, which
+    /// cut at their export limit the way the Parquet export does.
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+    pub async fn execute_capped(
+        &self,
+        query_id: u64,
+        dsl: &str,
+        cap: RowCap,
         deadline: Deadline,
         capture_debug: bool,
         utc_offset_secs: i32,
@@ -1419,7 +1448,6 @@ impl ExecutorPool {
 
         let dsl = dsl.to_owned();
         let base_dir = Arc::clone(&self.base_dir);
-        let max_result_rows = self.max_result_rows;
         let hot_buffer = self.hot_buffer.clone();
         let field_catalog = Arc::clone(&self.field_catalog);
 
@@ -1480,7 +1508,7 @@ impl ExecutorPool {
                         &source,
                         hot_buffer.as_ref(),
                         &pins,
-                        max_result_rows,
+                        cap,
                         utc_offset_secs,
                         capture_debug,
                         pool_wait_ms,
@@ -1617,7 +1645,7 @@ impl ExecutorPool {
 
         let dsl = dsl.to_owned();
         let source = source.to_owned();
-        let max_result_rows = self.max_result_rows;
+        let cap = RowCap::Refuse(self.max_result_rows);
         let field_catalog = Arc::clone(&self.field_catalog);
 
         let mut task = tokio::task::spawn_blocking({
@@ -1658,7 +1686,7 @@ impl ExecutorPool {
                         &source,
                         None,
                         &pins,
-                        max_result_rows,
+                        cap,
                         utc_offset_secs,
                         capture_debug,
                         pool_wait_ms,

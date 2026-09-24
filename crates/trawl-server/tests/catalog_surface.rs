@@ -159,10 +159,7 @@ async fn harness() -> Harness {
 
     let ingest = HttpClient::new_insecure(&server.url, &server.ingest_token).unwrap();
     let query = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
-    let raw = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .build()
-        .unwrap();
+    let raw = common::harness_client_builder().build().unwrap();
     Harness {
         server,
         wal_dir,

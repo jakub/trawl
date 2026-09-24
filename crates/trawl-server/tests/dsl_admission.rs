@@ -39,8 +39,7 @@ fn over_budget_dsl() -> String {
 const SENTENCE: &str = "alias-expansion budget";
 
 fn raw_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
+    common::harness_client_builder()
         .build()
         .expect("build the test HTTP client")
 }

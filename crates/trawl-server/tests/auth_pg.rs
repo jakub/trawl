@@ -27,12 +27,9 @@ use parking_lot::Mutex;
 use sqlx::PgPool;
 use trawl_server::config::RateLimitConfig;
 
-/// Raw reqwest client accepting the self-signed test cert.
+/// Raw reqwest client that trusts the self-signed harness cert.
 fn raw_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .build()
-        .unwrap()
+    common::harness_client_builder().build().unwrap()
 }
 
 /// Issue a request with an optional bearer token; return (status, json body).

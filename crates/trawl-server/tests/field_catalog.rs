@@ -190,10 +190,7 @@ async fn cold_cold_conflict_returns_full_history_with_attribution() {
     );
 
     // The conflict increments a metric on /metrics.
-    let metrics_client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .build()
-        .unwrap();
+    let metrics_client = common::harness_client_builder().build().unwrap();
     let body = metrics_client
         .get(format!("{}/metrics", h.server.url))
         .send()
@@ -1830,10 +1827,7 @@ async fn sse_stream_applies_varchar_pin() {
         Some(trawl_core::schema::CanonicalType::Varchar)
     );
 
-    let raw = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .build()
-        .unwrap();
+    let raw = common::harness_client_builder().build().unwrap();
 
     // Ordered-numeric rule live: string "404" matches status>=400.
     let mut stream = raw

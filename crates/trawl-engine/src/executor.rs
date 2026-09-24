@@ -7,6 +7,7 @@
 //! Handles connection management, prepared statements, parameter binding,
 //! and result extraction.
 
+use std::borrow::Cow;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -41,14 +42,28 @@ type TimestampColumns = Vec<String>;
 /// Process-global, so a reader that shares its test binary with binding
 /// tests must serialize against them (see
 /// `tests/complexity_admission.rs`).
+///
+/// It also keeps the text of the last statement each thread bound, which
+/// is the only evidence of what `DuckDB` was asked to run: a row count
+/// cannot tell a `LIMIT` `DuckDB` applied from a cut made after it built
+/// the whole result. Per thread, because the lanes run synchronously on
+/// their caller's thread, so parallel tests cannot read each other's
+/// statements; and only the last one, so a long-lived worker thread holds
+/// one string, not a history.
 #[cfg(any(test, feature = "test-support"))]
 pub mod prepare_probe {
+    use std::cell::RefCell;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static PREPARES: AtomicU64 = AtomicU64::new(0);
 
-    pub(super) fn record() {
+    thread_local! {
+        static LAST_STATEMENT: RefCell<Option<String>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn record(sql: &str) {
         PREPARES.fetch_add(1, Ordering::SeqCst);
+        LAST_STATEMENT.with(|last| *last.borrow_mut() = Some(sql.to_owned()));
     }
 
     /// Binds counted since the process started.
@@ -56,12 +71,78 @@ pub mod prepare_probe {
     pub fn count() -> u64 {
         PREPARES.load(Ordering::SeqCst)
     }
+
+    /// The SQL of the last statement this thread handed `DuckDB` to bind.
+    #[must_use]
+    pub fn last_statement() -> Option<String> {
+        LAST_STATEMENT.with(|last| last.borrow().clone())
+    }
 }
 
-/// One lane bind, counted for the admission tests and nothing else.
-fn record_prepare() {
+/// One lane bind: counted and recorded for the tests, then handed to
+/// `DuckDB`. The probe sees exactly the text `DuckDB` prepares, because
+/// it is the same argument.
+fn prepare_statement<'c>(conn: &'c Connection, sql: &str) -> duckdb::Result<duckdb::Statement<'c>> {
     #[cfg(any(test, feature = "test-support"))]
-    prepare_probe::record();
+    prepare_probe::record(sql);
+    conn.prepare(sql)
+}
+
+/// How a query lane bounds the rows it hands back.
+///
+/// Every lane holds its answer in memory, so every lane has a bound. The
+/// variants differ in what a result past the bound means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowCap {
+    /// Refuse a result longer than this with
+    /// [`EngineError::ResultTooLarge`]. The interactive lanes use it, where
+    /// a cut answer on screen would pass for the whole one.
+    Refuse(usize),
+    /// Keep the first `rows` rows of the answer and drop the rest, as the
+    /// Parquet export's `LIMIT` does. The CSV and JSON exports use it.
+    ///
+    /// A pipeline that runs wholly in SQL stops reading at `rows`. A
+    /// pipeline with a Rust tail cannot: the tail may aggregate, and a
+    /// count over the first `rows` events is a wrong answer, not a short
+    /// one. Its SQL half reads under [`RowCap::Refuse`]`(tail_input)`, and
+    /// the cut applies to what the tail returns.
+    Truncate { rows: usize, tail_input: usize },
+}
+
+impl RowCap {
+    /// The cap the SQL half of a pipeline reads under.
+    fn sql_read(self, rust_tail: bool) -> Self {
+        match self {
+            Self::Truncate { tail_input, .. } if rust_tail => Self::Refuse(tail_input),
+            cap => cap,
+        }
+    }
+
+    /// Cut a finished answer to the rows this cap keeps.
+    fn trim(self, result: &mut QueryResult) {
+        if let Self::Truncate { rows, .. } = self {
+            result.rows.truncate(rows);
+        }
+    }
+
+    /// The statement a SQL read under this cap executes.
+    ///
+    /// `DuckDB` builds a whole result before the first row is handed back,
+    /// so a cut made only while copying rows out still pays for every row
+    /// the query matched. `Truncate` therefore wraps the SQL in a `LIMIT`,
+    /// the same shape and the same [`export_row_limit`] decision the
+    /// Parquet export's staging `SELECT` takes; an unbounded cap adds no
+    /// clause. `Refuse` executes the SQL untouched. Neither adds a
+    /// placeholder, so the emitted parameters bind as they are.
+    fn statement(self, sql: &str) -> Cow<'_, str> {
+        match self {
+            Self::Truncate { rows, .. } => match export_row_limit(rows) {
+                Some(limit) => format!("SELECT * FROM ({sql}) LIMIT {limit}").into(),
+                None => sql.into(),
+            },
+            Self::Refuse(_) => sql.into(),
+        }
+    }
 }
 
 /// The four query and export lanes, bound to a caller's cancellation
@@ -82,21 +163,21 @@ pub struct Cancellable<'a> {
 
 impl Cancellable<'_> {
     /// [`Executor::run_query`], stopping at the bind-to-execute boundary
-    /// once the latch is set.
+    /// once the latch is set, under the caller's [`RowCap`].
     pub fn run_query(
         &self,
         dsl: &str,
         source: &str,
         pins: &FieldTypes,
-        max_rows: usize,
+        cap: RowCap,
         utc_offset_secs: i32,
     ) -> Result<QueryResult, EngineError> {
         self.executor
-            .run_query_latched(dsl, source, pins, max_rows, utc_offset_secs, self.cancel)
+            .run_query_latched(dsl, source, pins, cap, utc_offset_secs, self.cancel)
     }
 
     /// [`Executor::run_query_with_hot`], stopping at the bind-to-execute
-    /// boundary once the latch is set.
+    /// boundary once the latch is set, under the caller's [`RowCap`].
     #[allow(clippy::too_many_arguments)]
     pub fn run_query_with_hot(
         &self,
@@ -105,7 +186,7 @@ impl Cancellable<'_> {
         hot_source: &str,
         hot_pins: &FieldTypes,
         pins: &FieldTypes,
-        max_rows: usize,
+        cap: RowCap,
         utc_offset_secs: i32,
     ) -> Result<QueryResult, EngineError> {
         self.executor.run_query_with_hot_latched(
@@ -114,7 +195,7 @@ impl Cancellable<'_> {
             hot_source,
             hot_pins,
             pins,
-            max_rows,
+            cap,
             utc_offset_secs,
             self.cancel,
         )
@@ -252,6 +333,9 @@ impl Executor {
     /// explicit `FieldTypes::new()`, making its pin-blindness visible at
     /// the call site.
     ///
+    /// A result past `max_rows` is refused ([`RowCap::Refuse`]); a lane
+    /// that cuts instead goes through [`Cancellable::run_query`].
+    ///
     /// `utc_offset_secs` is applied to all timestamp values at format time.
     /// Pass `0` for UTC display.
     pub fn run_query(
@@ -266,7 +350,7 @@ impl Executor {
             dsl,
             source,
             pins,
-            max_rows,
+            RowCap::Refuse(max_rows),
             utc_offset_secs,
             &CancelLatch::never(),
         )
@@ -278,7 +362,7 @@ impl Executor {
         dsl: &str,
         source: &str,
         pins: &FieldTypes,
-        max_rows: usize,
+        cap: RowCap,
         utc_offset_secs: i32,
         cancel: &CancelLatch,
     ) -> Result<QueryResult, EngineError> {
@@ -286,7 +370,8 @@ impl Executor {
         let resolved = self.resolve_source(source);
         let emitted = resolved.emit_cold(&ast, pins, EvalContext::capture())?;
         let sql_offset = sql_render_offset(&emitted, utc_offset_secs);
-        let outcome = self.execute_emitted_tracked(&emitted, max_rows, sql_offset, cancel);
+        let sql_cap = cap.sql_read(!emitted.rust_stages.is_empty());
+        let outcome = self.execute_emitted_tracked(&emitted, sql_cap, sql_offset, cancel);
         // Same gate as the hot lanes, one column over: with no hot buffer to
         // fall back to, `HotOnly` is unreachable (see [`cold_action`]) — but a
         // "no files" answer over a source that still reaches files is the
@@ -310,6 +395,7 @@ impl Executor {
             let tracked = tail_timestamp_scope(&timestamp_columns, &emitted.rust_stages);
             shift_timestamp_columns(&mut result, &tracked, utc_offset_secs);
         }
+        cap.trim(&mut result);
         if emitted.needs_column_reorder {
             result.reorder_log_columns();
         }
@@ -329,7 +415,8 @@ impl Executor {
     /// answering "no files" is a race, not an empty window (ADR-0008).
     /// `hot_pins` conforms the hot branch (pins ∩ snapshot keys); `pins`
     /// is the full catalog snapshot typing the comparisons — one
-    /// interpretation per query (ADR-0011).
+    /// interpretation per query (ADR-0011). `max_rows` refuses as in
+    /// [`Self::run_query`].
     #[allow(clippy::too_many_arguments)]
     pub fn run_query_with_hot(
         &self,
@@ -347,7 +434,7 @@ impl Executor {
             hot_source,
             hot_pins,
             pins,
-            max_rows,
+            RowCap::Refuse(max_rows),
             utc_offset_secs,
             &CancelLatch::never(),
         )
@@ -361,7 +448,7 @@ impl Executor {
         hot_source: &str,
         hot_pins: &FieldTypes,
         pins: &FieldTypes,
-        max_rows: usize,
+        cap: RowCap,
         utc_offset_secs: i32,
         cancel: &CancelLatch,
     ) -> Result<QueryResult, EngineError> {
@@ -370,7 +457,8 @@ impl Executor {
         let emitted =
             resolved.emit_union(&ast, hot_source, hot_pins, pins, EvalContext::capture())?;
         let sql_offset = sql_render_offset(&emitted, utc_offset_secs);
-        let outcome = self.execute_emitted_tracked(&emitted, max_rows, sql_offset, cancel);
+        let sql_cap = cap.sql_read(!emitted.rust_stages.is_empty());
+        let outcome = self.execute_emitted_tracked(&emitted, sql_cap, sql_offset, cancel);
 
         // A hot value disagreeing with a catalog pin is already conformed on
         // the union's hot branch by the emitter (TRY_CAST to NULL), and
@@ -403,7 +491,7 @@ impl Executor {
                 // (ADR-0017 §3).
                 let hot_emitted =
                     emitter::emit_hot_only(&ast, hot_source, hot_pins, pins, emitted.anchor)?;
-                match self.execute_emitted_tracked(&hot_emitted, max_rows, sql_offset, cancel) {
+                match self.execute_emitted_tracked(&hot_emitted, sql_cap, sql_offset, cancel) {
                     // Hot-only also hit a binder/emit error (e.g. empty ndjson
                     // between compaction cycles). Treat as empty, not error.
                     Err(EngineError::Emit(_)) => (QueryResult::empty(), TimestampColumns::new()),
@@ -424,6 +512,7 @@ impl Executor {
             let tracked = tail_timestamp_scope(&timestamp_columns, &emitted.rust_stages);
             shift_timestamp_columns(&mut result, &tracked, utc_offset_secs);
         }
+        cap.trim(&mut result);
         if emitted.needs_column_reorder {
             result.reorder_log_columns();
         }
@@ -442,8 +531,13 @@ impl Executor {
         max_rows: usize,
         utc_offset_secs: i32,
     ) -> Result<QueryResult, EngineError> {
-        self.execute_emitted_tracked(query, max_rows, utc_offset_secs, &CancelLatch::never())
-            .map(|(result, _)| result)
+        self.execute_emitted_tracked(
+            query,
+            RowCap::Refuse(max_rows),
+            utc_offset_secs,
+            &CancelLatch::never(),
+        )
+        .map(|(result, _)| result)
     }
 
     /// [`Self::execute_emitted`], additionally reporting which result
@@ -455,19 +549,19 @@ impl Executor {
     fn execute_emitted_tracked(
         &self,
         query: &EmittedQuery,
-        max_rows: usize,
+        cap: RowCap,
         utc_offset_secs: i32,
         cancel: &CancelLatch,
     ) -> Result<(QueryResult, TimestampColumns), EngineError> {
         with_raw_fallback(query, |q| {
-            self.execute_emitted_once(q, max_rows, utc_offset_secs, cancel)
+            self.execute_emitted_once(q, cap, utc_offset_secs, cancel)
         })
     }
 
     fn execute_emitted_once(
         &self,
         query: &EmittedQuery,
-        max_rows: usize,
+        cap: RowCap,
         utc_offset_secs: i32,
         cancel: &CancelLatch,
     ) -> Result<(QueryResult, TimestampColumns), EngineError> {
@@ -479,8 +573,10 @@ impl Executor {
         // Re-read after the probes: each one is a bind of its own, and
         // this is the last moment before the statement's.
         cancel.check()?;
-        record_prepare();
-        let mut stmt = match self.conn.prepare(&query.sql) {
+        // Every lane's SQL read reaches `DuckDB` here — cold, hot union,
+        // hot-only, and each one's `_raw`-free retry — so this is the one
+        // place a `Truncate` becomes a `LIMIT`.
+        let mut stmt = match prepare_statement(&self.conn, &cap.statement(&query.sql)) {
             Ok(s) => s,
             Err(e) if is_no_files_error(&e) => {
                 return Ok((QueryResult::empty(), TimestampColumns::new()));
@@ -530,8 +626,14 @@ impl Executor {
 
         let mut rows = Vec::new();
         while let Some(row) = result_rows.next()? {
-            if rows.len() >= max_rows {
-                return Err(EngineError::ResultTooLarge(max_rows));
+            match cap {
+                RowCap::Refuse(max_rows) if rows.len() >= max_rows => {
+                    return Err(EngineError::ResultTooLarge(max_rows));
+                }
+                // The `LIMIT` above already stops `DuckDB` here; this
+                // holds the cap for the unbounded shape it leaves off.
+                RowCap::Truncate { rows: keep, .. } if rows.len() >= keep => break,
+                _ => {}
             }
             let mut cells = Vec::with_capacity(col_count);
             for (i, seen) in is_timestamp.iter_mut().enumerate() {
@@ -949,8 +1051,7 @@ impl Executor {
         // probes above each bound a statement, and the staging SELECT
         // is about to bind another.
         cancel.check()?;
-        record_prepare();
-        match self.conn.prepare(&create_sql) {
+        match prepare_statement(&self.conn, &create_sql) {
             Ok(mut stmt) => {
                 // The export's bind-to-execute boundary: the staging
                 // SELECT is the whole query, so this is the same bind the
@@ -1205,8 +1306,7 @@ fn validate_timechart_inputs(
         // Same rule as the lanes below: no bind starts once the
         // caller has asked for this work to stop.
         cancel.check()?;
-        record_prepare();
-        let mut stmt = match conn.prepare(&check.sql) {
+        let mut stmt = match prepare_statement(conn, &check.sql) {
             Ok(stmt) => stmt,
             Err(e) if is_no_files_error(&e) => continue,
             Err(e) if is_binder_column_error(&e) => return Err(remap_binder_error(&e)),
@@ -2717,7 +2817,7 @@ mod tests {
 
     use super::{
         ColdAction, ColdPresence, EngineError, EvalContext, Executor, FieldTypes, HotColdOutcome,
-        HotLane, ListEvidence, cold_action, emitter, error_class, export_row_limit,
+        HotLane, ListEvidence, RowCap, cold_action, emitter, error_class, export_row_limit,
         glob_list_items, has_glob_meta, is_conversion_error, is_no_files_error,
         literal_path_is_file, resolve_list_source, with_raw_fallback,
     };
@@ -3942,5 +4042,52 @@ mod tests {
         if let Ok(above) = usize::try_from(1_u128 << 63) {
             assert_eq!(export_row_limit(above), None);
         }
+    }
+
+    /// A cutting cap pushes its cut into the SQL as the Parquet export's
+    /// `LIMIT`; a refusing cap executes the emitted SQL byte for byte.
+    #[test]
+    fn row_cap_statement_pushes_truncate_into_the_sql() {
+        let sql = "SELECT * FROM read_parquet(?) WHERE \"service\" = ? ORDER BY \"_time\"";
+
+        assert_eq!(
+            RowCap::Truncate {
+                rows: 10,
+                tail_input: 50,
+            }
+            .statement(sql),
+            format!("SELECT * FROM ({sql}) LIMIT 10"),
+        );
+        assert_eq!(
+            RowCap::Truncate {
+                rows: 0,
+                tail_input: 50,
+            }
+            .statement(sql),
+            format!("SELECT * FROM ({sql}) LIMIT 0"),
+        );
+
+        // The interactive lane is untouched, however large its cap.
+        for max_rows in [5, 100_000, usize::MAX] {
+            assert_eq!(RowCap::Refuse(max_rows).statement(sql), sql);
+        }
+
+        // The unbounded sentinel adds no clause, as in the Parquet lane.
+        assert_eq!(
+            RowCap::Truncate {
+                rows: usize::MAX,
+                tail_input: usize::MAX,
+            }
+            .statement(sql),
+            sql
+        );
+
+        // The wrapper adds no placeholder: the emitted params bind as is.
+        let wrapped = RowCap::Truncate {
+            rows: 10,
+            tail_input: 50,
+        }
+        .statement(sql);
+        assert_eq!(wrapped.matches('?').count(), sql.matches('?').count());
     }
 }

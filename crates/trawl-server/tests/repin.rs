@@ -25,8 +25,7 @@ fn now_ts() -> String {
 
 /// One `/metrics` scrape off the running server (unauthenticated route).
 async fn scrape_metrics(url: &str) -> String {
-    reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
+    common::harness_client_builder()
         .build()
         .unwrap()
         .get(format!("{url}/metrics"))

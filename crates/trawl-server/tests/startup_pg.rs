@@ -260,8 +260,7 @@ impl Daemon {
     async fn ready(&mut self) -> String {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let deadline = Instant::now() + Duration::from_secs(30);
-        let client = reqwest::Client::builder()
-            .danger_accept_invalid_certs(true)
+        let client = common::harness_client_builder()
             .timeout(Duration::from_secs(1))
             .build()
             .unwrap();

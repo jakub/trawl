@@ -141,8 +141,7 @@ use trawl_server::transport::http;
 /// across one test's own window is the only part that belongs to it.
 pub async fn bookkeeping_timeouts(url: &str) -> std::collections::BTreeMap<String, f64> {
     let name = trawl_server::metrics::CATALOG_BOOKKEEPING_TIMEOUTS_TOTAL;
-    let body = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
+    let body = harness_client_builder()
         .build()
         .expect("client")
         .get(format!("{url}/metrics"))
@@ -890,6 +889,21 @@ pub fn ensure_test_cert() -> (PathBuf, PathBuf) {
     (dir.join("cert.pem"), dir.join("key.pem"))
 }
 
+/// A reqwest builder that trusts the [`ensure_test_cert`] certificate as a
+/// root, with certificate and hostname verification left on.
+///
+/// Every server these suites start serves that pair: the in-process fixture
+/// passes it as `tls_cert_path`, and `startup_pg` writes it into the spawned
+/// trawld's config. Its SANs cover `localhost` and `127.0.0.1`. Callers add
+/// their own timeout and redirect settings before `build()`.
+pub fn harness_client_builder() -> reqwest::ClientBuilder {
+    let (cert_path, _) = ensure_test_cert();
+    let pem = std::fs::read(&cert_path).expect("read the shared test certificate");
+    let certificate =
+        reqwest::Certificate::from_pem(&pem).expect("parse the shared test certificate");
+    reqwest::Client::builder().add_root_certificate(certificate)
+}
+
 /// What a failing test needs to know about its own fixture (ADR-0021
 /// ruling 8): which two databases it minted, which port it bound, and the
 /// connection ceilings it was sized against.
@@ -1191,8 +1205,7 @@ const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const READY_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
 pub async fn wait_for_ready(addr: &str, serve_task: &tokio::task::JoinHandle<()>) {
-    let poll_client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
+    let poll_client = harness_client_builder()
         .timeout(READY_ATTEMPT_TIMEOUT)
         .build()
         .unwrap();
@@ -1283,7 +1296,48 @@ pub async fn setup_in_dir_with_data_and_timeout(
     rate_limit: RateLimitConfig,
     timeout_secs: u64,
 ) -> TestServer {
-    setup_with_ingest_config(dir, data_path, rate_limit, timeout_secs, true).await
+    setup_with_ingest_config(
+        dir,
+        data_path,
+        rate_limit,
+        timeout_secs,
+        true,
+        RowCaps::DEFAULT,
+    )
+    .await
+}
+
+/// The `[server]` row caps a fixture boots with.
+#[derive(Debug, Clone, Copy)]
+pub struct RowCaps {
+    pub max_result_rows: usize,
+    pub max_export_rows: usize,
+}
+
+impl RowCaps {
+    /// The caps every fixture uses unless a test needs to reach one.
+    pub const DEFAULT: Self = Self {
+        max_result_rows: 100_000,
+        max_export_rows: 1_000_000,
+    };
+}
+
+/// A fixture with its own row caps, for tests that must cross one with a
+/// handful of events rather than a hundred thousand.
+pub async fn setup_with_row_caps(caps: RowCaps) -> TestServer {
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+    let server = setup_with_ingest_config(
+        tmp.path(),
+        seed_data_root(tmp.path()),
+        RateLimitConfig::default(),
+        DEFAULT_TEST_TIMEOUT_SECS,
+        true,
+        caps,
+    )
+    .await;
+    // Leak the tempdir so it survives the test (cleaned up by OS).
+    std::mem::forget(tmp);
+    server
 }
 
 /// Exercise configured WAL presence through real `AppState` construction, without
@@ -1295,6 +1349,7 @@ pub async fn setup_in_dir_with_ingest(dir: &std::path::Path, enabled: bool) -> T
         RateLimitConfig::default(),
         DEFAULT_TEST_TIMEOUT_SECS,
         enabled,
+        RowCaps::DEFAULT,
     )
     .await
 }
@@ -1306,6 +1361,7 @@ async fn setup_with_ingest_config(
     rate_limit: RateLimitConfig,
     timeout_secs: u64,
     ingest_enabled: bool,
+    row_caps: RowCaps,
 ) -> TestServer {
     assert!(
         std::path::Path::new(&data_path).is_dir(),
@@ -1359,8 +1415,8 @@ async fn setup_with_ingest_config(
             http_addr: addr.clone(),
             timeout_secs,
             max_concurrent_queries: 2,
-            max_result_rows: 100_000,
-            max_export_rows: 1_000_000,
+            max_result_rows: row_caps.max_result_rows,
+            max_export_rows: row_caps.max_export_rows,
             max_request_body_bytes: 128 * 1024,
             max_concurrent_requests: 256,
             shutdown_drain_secs: 5,
