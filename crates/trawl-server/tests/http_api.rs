@@ -280,10 +280,7 @@ async fn query_export_and_stream_telemetry_carry_no_user_content() {
     }
 
     // -- an export ---------------------------------------------------------
-    let raw = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .build()
-        .unwrap();
+    let raw = common::harness_client_builder().build().unwrap();
     let export_dsl = "service=nginx zz_export_needle";
     let export_resp = raw
         .post(format!("{}/api/v1/export?format=csv", server.url))
@@ -869,12 +866,9 @@ async fn queries_rejects_ingest_role() {
 
 // -- ingest endpoint tests ---------------------------------------------------
 
-/// Build a raw reqwest client that accepts self-signed certs.
+/// Build a raw reqwest client that trusts the self-signed harness cert.
 fn raw_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .build()
-        .unwrap()
+    common::harness_client_builder().build().unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3468,10 +3462,7 @@ async fn list_all_runs_sort_http_contract() {
     use trawl_api::ListAllRunsResponse;
     let server = setup().await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
-    let raw = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .build()
-        .unwrap();
+    let raw = common::harness_client_builder().build().unwrap();
     let pool = common::app_pool(&server.app_db_url).await;
     let saved = client.create_saved("sort-contract", "*").await.unwrap();
     let owner: i64 = sqlx::query_scalar("SELECT key_id FROM saved_queries WHERE id = $1")
@@ -3562,10 +3553,7 @@ async fn list_all_runs_sort_http_contract() {
 #[tokio::test(flavor = "multi_thread")]
 async fn list_all_runs_invalid_sort_preserves_json_and_permissions() {
     let server = setup().await;
-    let raw = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .build()
-        .unwrap();
+    let raw = common::harness_client_builder().build().unwrap();
     for (params, message) in [
         ("sort=Started", "invalid runs sort key"),
         ("sort=", "invalid runs sort key"),
@@ -3604,10 +3592,7 @@ async fn list_all_runs_invalid_sort_preserves_json_and_permissions() {
 #[tokio::test(flavor = "multi_thread")]
 async fn list_all_runs_extraction_errors_preserve_json_and_permissions() {
     let server = setup().await;
-    let raw = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .build()
-        .unwrap();
+    let raw = common::harness_client_builder().build().unwrap();
     for params in [
         "sort=net&sort=rows",
         "dir=asc&dir=desc",
