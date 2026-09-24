@@ -103,6 +103,14 @@ impl Capabilities {
     pub fn include(&self, field: &str, value: &Value) -> bool {
         self.input_field(field) && !matches!(value, Value::Null | Value::Array(_))
     }
+    /// Whether a detail row (the inline expansion or the inspector) offers
+    /// Include and Exclude: [`Self::include`], minus the reserved
+    /// non-dimensions. The Range picker owns time, and a filter on the
+    /// whole raw event is a text search. The exact table keeps calling
+    /// `include`, so a time group there can still be searched.
+    pub fn detail_filter(&self, field: &str, value: &Value) -> bool {
+        self.include(field, value) && !trawl_core::schema::is_non_dimension(field)
+    }
     /// Facets summarize original fields of raw rows. Aggregations and
     /// unknown sources do not offer facet groups, even for grouping keys.
     pub fn raw_facets(&self) -> bool {
@@ -302,6 +310,29 @@ fn uint_sorts_numerically() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The detail views offer no value filter on an instant or the raw
+    /// event, while the other reserved names keep theirs and the exact
+    /// table's `include` still offers "Search _time=…" for a time group.
+    #[test]
+    fn reserved_fields_offer_no_detail_filter() {
+        let capabilities = Capabilities::for_query("*");
+        let value = Value::String("2026-01-01T00:00:00Z".into());
+        for field in trawl_core::schema::NON_DIMENSION_FIELDS {
+            assert!(!capabilities.detail_filter(field, &value), "{field}");
+            assert!(
+                !capabilities.detail_filter(&field.to_ascii_uppercase(), &value),
+                "{field}"
+            );
+        }
+        for field in ["_severity", "_repairs", "timestamp", "host"] {
+            assert!(capabilities.detail_filter(field, &value), "{field}");
+        }
+        assert!(!capabilities.detail_filter("host", &Value::Null));
+        assert!(capabilities.include("_time", &value));
+        let grouped = Capabilities::for_query("* | stats count() by _time");
+        assert!(grouped.include("_time", &value));
+    }
     #[test]
     fn raw_mutations_keep_only_unchanged_field_facets() {
         for (query, changed) in [

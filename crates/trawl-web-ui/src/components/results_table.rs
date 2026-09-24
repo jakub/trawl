@@ -227,9 +227,9 @@ fn inspector_keys(
 /// close affordance and body scroll are the fleet's, not a second
 /// hand-rolled panel. It registers no overlay layer, which is what keeps
 /// the command palette's chord live while a row is open. The same
-/// provenance gates apply as inline: a field the executed query changed
-/// gets no filter buttons, and a row with no raw source gets no raw
-/// actions.
+/// provenance gates apply as inline: a field the executed query changed,
+/// or an instant or the raw event ([`Capabilities::detail_filter`]), gets
+/// no filter buttons, and a row with no raw source gets no raw actions.
 #[component]
 fn InspectorPanel(
     idx: usize,
@@ -272,7 +272,7 @@ fn InspectorPanel(
                     let key = name.clone();
                     let value_text = value_to_string(v);
                     let copy_text = value_text.clone();
-                    let allowed = capabilities.include(name, v);
+                    let allowed = capabilities.detail_filter(name, v);
                     let inc = Filter {
                         field: name.clone(),
                         value: value_text.clone(),
@@ -746,7 +746,7 @@ fn RowFragment(
                                 let value_for_click = value_text.clone();
                                 let field_for_label = name.clone();
                                 let value_for_label = value_text.clone();
-                                let allowed = capabilities.include(name, v);
+                                let allowed = capabilities.detail_filter(name, v);
                                 let query_for_click = executed_query.clone();
                                 view! {
                                     <span class="k">{key}</span>
