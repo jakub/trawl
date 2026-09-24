@@ -80,6 +80,11 @@ pub fn EditorWrap(
     });
 
     let do_format = move |_| {
+        // Every click is a Format request, whatever Format then does with
+        // the text: the editor closes its completion popup on each one.
+        // Bumped before `query` is set; the editor reads the signal in a
+        // later effect run, after this handler has returned.
+        format_trigger.update(|v| *v += 1);
         let text = query.get_untracked();
         if text.trim().is_empty() {
             return;
@@ -95,7 +100,6 @@ pub fn EditorWrap(
             }
             Some(formatted) => {
                 query.set(formatted);
-                format_trigger.update(|v| *v += 1);
                 bus.push(ToastKind::Success, "Formatted", None);
             }
         }

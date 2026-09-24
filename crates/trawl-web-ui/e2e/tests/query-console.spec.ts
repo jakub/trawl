@@ -323,6 +323,37 @@ test('the editor tools name what they act on', async ({ page }) => {
   await expect(tools.nth(2)).toHaveAccessibleName('Format');
 });
 
+// Clicking Format is a decision to leave the completion popup, whatever
+// Format then does with the buffer. Each case parks the cursor after
+// `cou` inside `count()`, which offers the `count()` completion, then
+// takes one of Format's paths. The empty-buffer path has no case: an
+// empty buffer has no word before the cursor, so completion cannot open.
+test('Format closes the completion popup', async ({ page }) => {
+  await page.goto('/search');
+  const format = page.getByRole('button', { name: 'Format', exact: true });
+  const option = page.getByRole('option', { name: /count\(\)/ });
+  const cases = [
+    { path: 'reformatted', text: '* | stats count() by host', after: '*\n| stats count() by host' },
+    { path: 'already formatted', text: '*\n| stats count() by host', after: '*\n| stats count() by host' },
+    { path: 'parse error', text: '* | bad_stage | stats count() by host', after: '* | bad_stage | stats count() by host' },
+  ];
+  for (const { path, text, after } of cases) {
+    await editBuffer(page, text);
+    // Back from the end over `nt() by host` to just after `cou`.
+    for (let i = 0; i < 'nt() by host'.length; i++) await page.keyboard.press('ArrowLeft');
+    await page.keyboard.press('Control+Space');
+    await expect(option, path).toBeVisible();
+    // A click that does not move focus, as on Safari/iPad, so the
+    // editor's close-on-blur cannot mask a Format that leaves it open.
+    await format.dispatchEvent('click');
+    await expect(option, path).toHaveCount(0);
+    await expect.poll(
+      () => page.locator(SEL.cmContent).evaluate(el => [...el.querySelectorAll('.cm-line')].map(l => l.textContent).join('\n')),
+      { message: path },
+    ).toBe(after);
+  }
+});
+
 test('the skip links reach the editor and the results', async ({ page, request }) => {
   await resetScenario(request, 'corpus');
   await page.goto('/search?q=service%3Dnginx');

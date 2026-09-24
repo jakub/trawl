@@ -104,13 +104,20 @@ impl Drop for EditorLifecycle {
 ///
 /// A keystroke never round-trips: `on_change` records the document
 /// before it sets the signal, so `push` finds them equal and does
-/// nothing. The format trigger is now a second route to the same push —
-/// the parent's contract is to set `query` and then bump the counter,
-/// and the first half alone is enough.
+/// nothing.
+///
+/// The format trigger counts Format requests. Each one pushes `query`
+/// (a second route to the same push, so a reformat that set `query`
+/// lands even if the first effect has not run yet) and then calls
+/// `on_format`. Format paths that leave `query` alone — already
+/// formatted, parse errors, an empty buffer — push the value the first
+/// effect already pushed, which `push` skips as equal, so a request can
+/// never change the document by itself.
 fn follow_query_signal(
     query: RwSignal<String>,
     format_trigger: Option<RwSignal<u64>>,
     push: impl Fn(&str) + Copy + 'static,
+    on_format: impl Fn() + 'static,
 ) {
     Effect::new(move |_| {
         let text = query.get();
@@ -123,6 +130,7 @@ fn follow_query_signal(
                 return;
             }
             push(&query.get_untracked());
+            on_format();
         });
     }
 }
@@ -134,9 +142,12 @@ fn follow_query_signal(
 pub fn DslEditor(
     #[prop(into)] query: RwSignal<String>,
     #[prop(into)] on_submit: Callback<()>,
-    /// Counter signal for external format requests. Parent sets `query`
-    /// to the formatted text and then increments this; the Effect pushes
-    /// the new value into CodeMirror via `set_doc`.
+    /// Counter of Format requests, bumped on every Format click whatever
+    /// its outcome. When the parent reformats it also sets `query` to the
+    /// formatted text. Each bump pushes `query` into `CodeMirror` via
+    /// `set_doc` (a no-op when it already matches the document) and then
+    /// closes the completion popup: clicking Format is a decision to
+    /// leave it.
     #[prop(optional, into)]
     format_trigger: Option<RwSignal<u64>>,
 ) -> impl IntoView {
@@ -252,7 +263,10 @@ pub fn DslEditor(
         }));
     });
 
-    follow_query_signal(query, format_trigger, push_doc);
+    let close_completion = move || {
+        lifecycle.with_value(|slot| slot.as_ref().map(|lc| lc.handle.close_completion()));
+    };
+    follow_query_signal(query, format_trigger, push_doc, close_completion);
 
     on_cleanup(move || {
         // Dropping the `EditorLifecycle` is what tears the view down.
