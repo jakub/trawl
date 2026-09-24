@@ -2,6 +2,24 @@
 
 status: accepted (2026-09-07) — prep ruling record for #100 slice D
 
+> **amendment (2026-09-23, #242):** a `Drawer`'s dialog is named by a
+> REQUIRED `label` prop (a reactive string), not by its title slot. The
+> panel used `aria-labelledby` on `.sd-ttl`, so every control, badge and
+> link a consumer put in the title became part of the dialog's name. A
+> Chromium probe measured `Rename errors by host` (net drawer),
+> `errors by host success` (run drawer, with the status badge appended)
+> and `Back to nginx duration` (field case). The title slot is now visual
+> only. The name is the bare entity name the consumer passes (human
+> ruling): the net's name, `Run <id>, <net>` or `Run <id>` when the net
+> name is unknown, the field's name, the service's name, and `Deleted
+> net` when the net is gone. It stays fixed while the net drawer's
+> inline rename edits, and it follows a successful rename. This matches
+> the rule `Tabs` already follows: a fleet-ui dialog is named from a
+> string the compiler requires, never from markup the consumer fills.
+> `Modal` (a static title) and the command palette and range dialog
+> (fixed `aria-label` strings) already comply. coastwatch's document
+> drawer passes its document title in its next `TRAWL_REV` bump PR.
+
 fleet-ui shipped nine clickable elements that were not buttons: the topbar
 user menu's trigger and its two live rows, both tab-strip families, the
 modal close, the toast dismiss and the copy button's bare mode. None

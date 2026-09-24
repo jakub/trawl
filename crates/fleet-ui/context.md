@@ -97,7 +97,7 @@ The `TabsStyle::Drawer` family: the strip at the top of a drawer with metadata t
 _Avoid_: drawer tabs, sd-tabs
 
 **Drawer**:
-The right-slide detail inspector: a `Capture` layer with a scrim, a drawer strip and a body the consumer fills. Docked presentation: the same shell rendered in flow beside its list with no scrim and no overlay layer; Escape closes it only while focus is inside it and no layer is open.
+The right-slide detail inspector: a `Capture` layer with a scrim, a drawer strip and a body the consumer fills. Its dialog is named by a required `label` string; the title slot is visual only and never names the dialog. Docked presentation: the same shell rendered in flow beside its list with no scrim and no overlay layer; Escape closes it only while focus is inside it and no layer is open.
 _Avoid_: side panel, sheet, inspector
 
 **Docked panel**:
