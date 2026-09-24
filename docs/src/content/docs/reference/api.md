@@ -284,7 +284,7 @@ An invalid query is a 200 with `valid: false`. A pipeline over the expression bu
 
 Permission: `export`
 
-Runs a query and returns the rows as a file. Timestamps are UTC. The row cap is `[server] max_export_rows` (`1000000`) instead of `max_result_rows`.
+Runs a query and returns the rows as a file. Timestamps are UTC. The row cap is `[server] max_export_rows` (`1000000`) instead of `max_result_rows`. Rows past the cap are dropped; the export is not refused.
 
 **Parameters**
 
@@ -318,6 +318,7 @@ The body is the file. The headers name its type:
 |--------|------|------|
 | 400 | `parse_error` | The DSL does not parse |
 | 400 | `validation_error` | Semantic check failed |
+| 400 | `result_too_large` | An `extract kv` pipeline read more than `max_export_rows` input rows |
 | 400 | none | `format` is not `csv`, `json`, or `parquet`. Plain-text body from the framework. |
 | 500 | `execution_error` | DuckDB failed |
 | 503 | `service_unavailable` | The deadline passed before the export started |
