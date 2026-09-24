@@ -910,10 +910,17 @@ async fn assert_recovery_precedes_boot_steps(daemon: &Daemon) {
 /// The service every crash test ingests into, so every publish of the test
 /// lands in one canonical file and a later tick merges into it.
 const CRASH_SERVICE: &str = "crashsvc";
-/// Events per acknowledged ingest request. Two requests make two WAL files,
-/// so a publish usually consumes more than one and recovery retirement has
-/// a step between them.
-const CRASH_BATCHES: [usize; 2] = [40, 60];
+/// Events the crash test acknowledges, in one ingest request to one service.
+///
+/// One request makes one WAL file, renamed into place and acknowledged
+/// before its min-age starts counting down. So the first eligible tick sees
+/// every acknowledged event, and the marker of the killed publish names that
+/// one file. Two requests would let a tick select the first file while the
+/// second is still in flight, and the marker would then cover only part of
+/// the acknowledged events. Retirement order across several consumed WAL
+/// files is covered in-process by the `ac2_*` matrix in
+/// `ingest::publication_marker`.
+const CRASH_EVENTS: usize = 100;
 
 /// A daemon killed mid-publish, with what it had acknowledged.
 struct CrashedPublish {
@@ -923,17 +930,19 @@ struct CrashedPublish {
     time: String,
     tag: String,
     acknowledged: i64,
+    /// The one WAL file the acknowledged request wrote.
+    wal_file: PathBuf,
     marker: trawl_server::ingest::publication_marker::ValidatedMarker,
 }
 
 impl CrashedPublish {
-    /// Ingest the tagged batches into a daemon that parks at `point` on its
+    /// Ingest the tagged events into a daemon that parks at `point` on its
     /// first publish, and SIGKILL it there.
     async fn at(point: &'static str) -> Self {
         let mut fixture = Fixture::new().await;
         fixture.current_fleet().await;
-        // One second between ticks and as the WAL min-age: a batch becomes
-        // eligible a second after it is written.
+        // One second between ticks and as the WAL min-age: the WAL file
+        // becomes eligible a second after it is written.
         fixture.compaction_interval_secs = Some(1);
         let store = fleet_auth::KeyStore::from_pool(fixture.fleet.clone());
         store
@@ -958,14 +967,12 @@ impl CrashedPublish {
         fixture.crash_at = Some(point);
         let mut daemon = fixture.spawn();
         let client = client(&daemon.ready().await, &token);
-        let mut acknowledged = 0;
-        for size in CRASH_BATCHES {
-            acknowledged += ingest(&client, &time, &tag, size).await;
-        }
-        assert_eq!(
-            acknowledged,
-            i64::try_from(CRASH_BATCHES.iter().sum::<usize>()).unwrap()
-        );
+        let acknowledged = ingest(&client, &time, &tag, CRASH_EVENTS).await;
+        // The parked publish never retires its WAL, so the acknowledged
+        // file stays in place until the kill whether or not a tick has
+        // already selected it.
+        let [wal_file] = <[PathBuf; 1]>::try_from(wal_files(&fixture))
+            .unwrap_or_else(|files| panic!("one request, one WAL file: {files:?}"));
         let log = daemon.kill_at(point).await;
         assert!(
             log.contains(&format!("point=\"{point}\"")),
@@ -974,18 +981,20 @@ impl CrashedPublish {
         fixture.crash_at = None;
         let marker = trawl_server::ingest::publication_marker::read_marker(&marker_path(&fixture))
             .expect("the killed publish left its marker");
+        assert_eq!(
+            marker.wal_paths(&fixture.storage_root().join("wal")),
+            vec![wal_file.clone()],
+            "the marker covers the one acknowledged WAL file"
+        );
         Self {
             fixture,
             token,
             time,
             tag,
             acknowledged,
+            wal_file,
             marker,
         }
-    }
-
-    fn wal(&self) -> PathBuf {
-        self.fixture.storage_root().join("wal")
     }
 
     /// Restart without a crash point and assert every acknowledged event is
@@ -1061,10 +1070,7 @@ impl CrashedPublish {
     }
 
     fn assert_wal_kept(&self) {
-        assert!(!self.marker.wal_names().is_empty());
-        for path in self.marker.wal_paths(&self.wal()) {
-            assert!(path.is_file(), "consumed WAL {} kept", path.display());
-        }
+        assert!(self.wal_file.is_file(), "the consumed WAL is kept");
     }
 
     /// Restart with a recovery crash point; boot recovery parks there and is
@@ -1221,7 +1227,9 @@ async fn compaction_crash_after_marker_before_rename_is_exactly_once() {
 
 /// AC2 (#252), real-process complement of the in-process `ac2_*` matrix: a
 /// kill during boot recovery of a published marker, after it retired the
-/// first consumed WAL file, reruns to the same end state.
+/// consumed WAL file and before the WAL directory fsync and the marker
+/// removal, reruns to the same end state. The marker names one file here;
+/// the `ac2_*` matrix covers retirement across several.
 #[tokio::test]
 async fn publication_recovery_crash_in_published_branch_reruns_exactly_once() {
     let mut crashed = CrashedPublish::at("publish:after_rename").await;
@@ -1230,11 +1238,8 @@ async fn publication_recovery_crash_in_published_branch_reruns_exactly_once() {
         .kill_boot_recovery_at("recover:published:after_retire:0")
         .await;
     assert!(marker_path(&crashed.fixture).exists(), "the marker stays");
-    let wal = crashed.marker.wal_paths(&crashed.wal());
-    assert!(!wal[0].exists(), "the first consumed WAL was retired");
-    for path in &wal[1..] {
-        assert!(path.is_file(), "{} not yet retired", path.display());
-    }
+    assert!(!crashed.wal_file.exists(), "the consumed WAL was retired");
+    assert_eq!(wal_files(&crashed.fixture), Vec::<PathBuf>::new());
     crashed.restart_exactly_once(true).await;
 }
 
