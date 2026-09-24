@@ -359,8 +359,10 @@ fn take<const N: usize>(bytes: &[u8]) -> Option<[u8; N]> {
 /// A column's running min/max samples, folded across row groups and files.
 ///
 /// The fold tracks the column's [`SampleKind`] as well as its bounds, and
-/// the kind comes from each file's column descriptor, so a file or row
-/// group without min/max still takes part. Once two observations disagree
+/// the kind comes from each column chunk's descriptor, so a row group whose
+/// chunk carries no min/max still takes part. A file with no row groups
+/// (zero rows) observes nothing: it contributes no values, so its declared
+/// kind cannot make a column mixed. Once two observations disagree
 /// on kind (a BIGINT file beside a TIMESTAMP file during a repin, say) the
 /// column is mixed for good: both bounds are gone for the rest of the fold,
 /// whatever comes after, so the sample never depends on file order. A
