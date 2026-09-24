@@ -3522,6 +3522,337 @@ async fn manual_run_with_empty_window_is_409() {
     );
 }
 
+// -- The fire cursor after a manual run (ADR-0018 amended 2026-09-23) -------
+
+/// Write a schedule's fire cursor directly, to make a tick overdue or
+/// future without waiting for the clock.
+async fn set_next_fire_at(
+    server: &common::TestServer,
+    schedule_id: i64,
+    next_fire_at: chrono::DateTime<chrono::Utc>,
+) {
+    let pool = common::app_pool(&server.app_db_url).await;
+    sqlx::query("UPDATE schedules SET next_fire_at = $1 WHERE id = $2")
+        .bind(next_fire_at)
+        .bind(schedule_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+/// A schedule's stored fire cursor.
+async fn stored_next_fire_at(
+    server: &common::TestServer,
+    schedule_id: i64,
+) -> chrono::DateTime<chrono::Utc> {
+    let pool = common::app_pool(&server.app_db_url).await;
+    sqlx::query_scalar("SELECT next_fire_at FROM schedules WHERE id = $1")
+        .bind(schedule_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+}
+
+/// The store the scheduler tick claims through, on the fixture's database.
+async fn tick_store(server: &common::TestServer) -> trawl_server::store::ScheduleStore {
+    trawl_server::store::ScheduleStore::new(common::app_pool(&server.app_db_url).await)
+}
+
+/// Ask the scheduler's own claim what `schedule_id` owes at `now`, with
+/// the default catch-up bound.
+async fn tick(
+    server: &common::TestServer,
+    schedule_id: i64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> trawl_server::store::DueClaim {
+    tick_store(server)
+        .await
+        .claim_due_run(schedule_id, now, 24)
+        .await
+        .unwrap()
+}
+
+/// A successful manual run consumes every fire boundary at or before its
+/// `t`, in every mode, so the overdue tick does not follow it with an older
+/// window. The cursor lands on the cadence's own next boundary, so the
+/// phase never shifts, and the tick claimed there picks up where the manual
+/// run stopped.
+#[tokio::test(flavor = "multi_thread")]
+async fn successful_manual_run_consumes_overdue_tick() {
+    use trawl_server::store::DueClaim;
+
+    let server = setup().await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+
+    for (mode, window) in [
+        ("since_last", Some("since_last")),
+        ("fixed", Some("2h")),
+        ("query", None),
+    ] {
+        let saved = client
+            .create_saved(&format!("consume-{mode}"), "service=nginx")
+            .await
+            .unwrap();
+        let schedule = client
+            .set_schedule(saved.id, "1h", None, true, window, None)
+            .await
+            .unwrap();
+        // Overdue by an interval and a half: boundaries at -90m and -30m
+        // have passed, the next one is 30 minutes out.
+        let overdue = now_micros() - minutes(90);
+        set_next_fire_at(&server, schedule.id, overdue).await;
+
+        let (summary, t) = trigger_at(&client, saved.id).await;
+        let run = finished(&client, saved.id, &summary).await;
+        assert_eq!(run.status, "success", "{mode}: {run:?}");
+
+        let cursor = stored_next_fire_at(&server, schedule.id).await;
+        assert_eq!(
+            cursor,
+            overdue + minutes(120),
+            "{mode}: the cursor moves to the first boundary after t = {t}, on the cadence's phase"
+        );
+        assert!(cursor > t, "{mode}");
+
+        assert_eq!(
+            tick(&server, schedule.id, now_micros()).await,
+            DueClaim::NotDue,
+            "{mode}: the overdue tick was consumed"
+        );
+        let DueClaim::Started(next) = tick(&server, schedule.id, cursor).await else {
+            panic!("{mode}: the next boundary must still fire");
+        };
+        match mode {
+            "since_last" => assert_eq!(
+                next.window.map(|w| bound(w.start)),
+                summary.window_end,
+                "the next scheduled window starts where the manual run stopped"
+            ),
+            "fixed" => assert_eq!(
+                next.window.map(|w| w.end),
+                Some(cursor),
+                "the next fixed span ends at its own fire"
+            ),
+            _ => assert_eq!(next.window, None),
+        }
+    }
+}
+
+/// A cursor still in the future is left exactly where it is: the manual
+/// run overtook no boundary.
+#[tokio::test(flavor = "multi_thread")]
+async fn manual_run_leaves_future_fire_cursor() {
+    use trawl_server::store::DueClaim;
+
+    let server = setup().await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+
+    let saved = client
+        .create_saved("future-cursor", "service=nginx")
+        .await
+        .unwrap();
+    let schedule = client
+        .set_schedule(saved.id, "1h", None, true, Some("since_last"), None)
+        .await
+        .unwrap();
+    let future = now_micros() + minutes(30);
+    set_next_fire_at(&server, schedule.id, future).await;
+
+    let (summary, _t) = trigger_at(&client, saved.id).await;
+    let run = finished(&client, saved.id, &summary).await;
+    assert_eq!(run.status, "success", "{run:?}");
+
+    assert_eq!(stored_next_fire_at(&server, schedule.id).await, future);
+    assert_eq!(
+        tick(&server, schedule.id, now_micros()).await,
+        DueClaim::NotDue
+    );
+    let DueClaim::Started(next) = tick(&server, schedule.id, future).await else {
+        panic!("the untouched boundary must still fire");
+    };
+    assert_eq!(
+        next.window.map(|w| bound(w.start)),
+        summary.window_end,
+        "and it tiles on from the manual run's end"
+    );
+}
+
+/// A manual run that does not succeed changes no cursor, so the overdue
+/// scheduled run still fires and covers the window the manual run did not.
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_manual_run_leaves_overdue_tick_claimable() {
+    use trawl_server::store::{DueClaim, ManualRunClaim, RunStatus};
+
+    let server = setup().await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+    let store = tick_store(&server).await;
+    let pool = common::app_pool(&server.app_db_url).await;
+
+    for (name, status) in [
+        ("failed-manual-error", RunStatus::Error),
+        ("failed-manual-timeout", RunStatus::Timeout),
+    ] {
+        let saved = client.create_saved(name, "service=nginx").await.unwrap();
+        let schedule = client
+            .set_schedule(saved.id, "1h", None, true, Some("since_last"), None)
+            .await
+            .unwrap();
+        let overdue = now_micros() - minutes(90);
+        set_next_fire_at(&server, schedule.id, overdue).await;
+        let watermark = stored_covered_through(&server, schedule.id).await;
+        let key_id: i64 = sqlx::query_scalar("SELECT key_id FROM saved_queries WHERE id = $1")
+            .bind(saved.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        // The store's own claim, so the run's outcome is the test's choice
+        // rather than whatever the corpus makes of the query.
+        let ManualRunClaim::Started(claimed) =
+            store.claim_manual_run(saved.id, key_id, 24).await.unwrap()
+        else {
+            panic!("{name}: the manual claim must start");
+        };
+        store
+            .finish_run(claimed.run_id, status, 5, None, Some("boom"), None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            stored_next_fire_at(&server, schedule.id).await,
+            overdue,
+            "{name}"
+        );
+        assert_eq!(
+            stored_covered_through(&server, schedule.id).await,
+            watermark,
+            "{name}"
+        );
+
+        let DueClaim::Started(retry) = tick(&server, schedule.id, now_micros()).await else {
+            panic!("{name}: the overdue tick must still be claimable");
+        };
+        let window = retry.window.expect("a since_last tick plans a window");
+        assert_eq!(
+            Some(window.start),
+            watermark,
+            "{name}: and it covers from the watermark the manual run left"
+        );
+    }
+}
+
+/// A finish that lands on a run already terminal is not a transition, so
+/// it moves no cursor, even when it says success.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_finish_of_a_terminal_manual_run_moves_no_cursor() {
+    use trawl_server::store::{ManualRunClaim, RunStatus};
+
+    let server = setup().await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+    let store = tick_store(&server).await;
+    let pool = common::app_pool(&server.app_db_url).await;
+
+    let saved = client
+        .create_saved("terminal-twice", "service=nginx")
+        .await
+        .unwrap();
+    let schedule = client
+        .set_schedule(saved.id, "1h", None, true, None, None)
+        .await
+        .unwrap();
+    let overdue = now_micros() - minutes(90);
+    set_next_fire_at(&server, schedule.id, overdue).await;
+    let key_id: i64 = sqlx::query_scalar("SELECT key_id FROM saved_queries WHERE id = $1")
+        .bind(saved.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    let ManualRunClaim::Started(claimed) =
+        store.claim_manual_run(saved.id, key_id, 24).await.unwrap()
+    else {
+        panic!("the manual claim must start");
+    };
+    store
+        .finish_run(
+            claimed.run_id,
+            RunStatus::Error,
+            5,
+            None,
+            Some("boom"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    store
+        .finish_run(
+            claimed.run_id,
+            RunStatus::Success,
+            5,
+            Some(0),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        stored_next_fire_at(&server, schedule.id).await,
+        overdue,
+        "only a running-to-success finish consumes a boundary"
+    );
+}
+
+/// A manual run ignores `enabled`: it runs on a paused schedule and leaves
+/// it paused. The boundaries it overtook stay consumed, so resuming does
+/// not re-run a window the manual run already covered, while the next
+/// boundary fires as planned.
+#[tokio::test(flavor = "multi_thread")]
+async fn manual_run_of_disabled_schedule_runs_and_resume_skips_consumed_boundary() {
+    use trawl_server::store::DueClaim;
+
+    let server = setup().await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+
+    let saved = client
+        .create_saved("paused-manual", "service=nginx")
+        .await
+        .unwrap();
+    let schedule = client
+        .set_schedule(saved.id, "1h", None, false, Some("since_last"), None)
+        .await
+        .unwrap();
+    let overdue = now_micros() - minutes(90);
+    set_next_fire_at(&server, schedule.id, overdue).await;
+
+    let (summary, _t) = trigger_at(&client, saved.id).await;
+    let run = finished(&client, saved.id, &summary).await;
+    assert_eq!(run.status, "success", "{run:?}");
+    let paused = client.get_schedule(saved.id).await.unwrap();
+    assert!(!paused.enabled, "a manual run leaves the schedule disabled");
+    assert_eq!(paused.covered_through, summary.window_end);
+
+    // Resume with the same cadence, which keeps the cursor where it is.
+    client
+        .set_schedule(saved.id, "1h", None, true, Some("since_last"), None)
+        .await
+        .unwrap();
+    let cursor = stored_next_fire_at(&server, schedule.id).await;
+    assert_eq!(cursor, overdue + minutes(120));
+
+    assert_eq!(
+        tick(&server, schedule.id, now_micros()).await,
+        DueClaim::NotDue,
+        "the replaced boundary does not run again"
+    );
+    let DueClaim::Started(next) = tick(&server, schedule.id, cursor).await else {
+        panic!("the next boundary fires once the schedule is resumed");
+    };
+    assert_eq!(next.window.map(|w| bound(w.start)), summary.window_end);
+}
+
 /// Query mode keeps today's manual run exactly: the saved DSL verbatim, and
 /// a run row that claims no coverage.
 #[tokio::test(flavor = "multi_thread")]

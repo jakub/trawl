@@ -1437,7 +1437,7 @@ Runs the schedule's next window now, as if its next fire came early. Any schedul
 - A fixed window covers the span ending at `t - lag`.
 - Query mode runs the saved text as written.
 
-The run counts against `max_runs` and records `origin: "manual"`. A successful run advances `covered_through` like a scheduled `since_last` run. The response returns at once with status `running`, and the run continues in the background.
+The run counts against `max_runs` and records `origin: "manual"`. A successful run advances `covered_through` like a scheduled `since_last` run. It also moves an overdue `next_fire_at` to the first fire after `t`, so the overdue scheduled run does not follow with an older window. A `next_fire_at` already after `t` stays where it is. A failed, timed-out, or interrupted run moves neither. The response returns at once with status `running`, and the run continues in the background.
 
 **Request**
 

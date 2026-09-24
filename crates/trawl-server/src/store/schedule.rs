@@ -37,8 +37,9 @@
 //! - [`ScheduleStore::finish_run`] reports whether it updated a row so a run
 //!   cascade-deleted mid-flight can have its freshly-written file removed. A
 //!   successful completion also advances the schedule's `since_last`
-//!   watermark in that same transaction, and takes the schedule lock FIRST
-//!   for it — same order as the claim and the delete, so the three can never
+//!   watermark, and a successful manual run moves an overdue fire cursor,
+//!   in that same transaction. It takes the schedule lock FIRST for them —
+//!   same order as the claim and the delete, so the three can never
 //!   deadlock against each other.
 
 use std::collections::HashSet;
@@ -53,8 +54,8 @@ use super::saved::{SavedQuery, row_to_saved_query_at};
 use super::status::{RunOrigin, RunStatus, decode_origin, decode_status};
 use crate::report_window::{
     Due, ManualPlan, MaterializeError, PlanError, PlanInput, ReportWindow, ScheduleWindow,
-    WindowKind, WindowPolicyError, materialize_window, plan_due_run, plan_manual_run,
-    truncate_to_micros, validate_window_compatibility,
+    WindowKind, WindowPolicyError, fire_boundaries, materialize_window, plan_due_run,
+    plan_manual_run, truncate_to_micros, validate_window_compatibility,
 };
 
 const MIN_INTERVAL_SECS: u64 = 60;
@@ -1428,11 +1429,23 @@ impl ScheduleStore {
     /// is covered are one fact, and a crash between two statements would
     /// either re-run a covered window or skip an uncovered one forever.
     ///
+    /// A SUCCESS of a MANUAL run also consumes the fire boundaries it
+    /// overtook (ADR-0018 amended 2026-09-23): a cursor at or before the
+    /// run's `started_at` moves to the first boundary after it, via
+    /// [`fire_boundaries`], so an overdue scheduled run cannot follow with
+    /// an older window. A cursor already past `started_at` is left alone,
+    /// which includes one a cadence edit re-anchored mid-run, and the phase
+    /// never shifts. Only a run that was still `running` gets this: a
+    /// finish landing on a terminal row is not the run succeeding. The
+    /// one-running-row index is what keeps it race-free, since no tick can
+    /// claim while the manual run is in flight.
+    ///
     /// Error and timeout completions update the run alone. That absence is
-    /// how "the watermark advances only on success" is enforced — a failed
-    /// run leaves the gap for the next successful one to cover — and it is
-    /// why [`Self::fail_run_if_running`] and [`Self::cleanup_stale_runs`]
-    /// carry no watermark statement either.
+    /// how "the watermark and the cursor move only on success" is enforced
+    /// — a failed run leaves the gap for the next successful one to cover
+    /// and the overdue tick to retry — and it is why
+    /// [`Self::fail_run_if_running`] and [`Self::cleanup_stale_runs`] carry
+    /// no watermark or cursor statement either.
     #[allow(clippy::too_many_arguments)]
     pub async fn finish_run(
         &self,
@@ -1453,25 +1466,61 @@ impl ScheduleStore {
         // `FOR UPDATE OF s` locks the schedule alone — the join reads the
         // run without locking it, which is what keeps the order intact.
         //
-        // The lock is taken only when there is an advance to make, and the
-        // test is the same one the advance itself uses: a run claimed as
-        // `since_last`. Everything it reads is written at claim time and
-        // never updated, so the answer cannot change under us. A run without
-        // a since_last window does not lock the schedule and never queues
-        // behind a schedule someone else is holding. A
+        // The lock is taken only when there is something to move, and the
+        // test is the one the moves themselves use: a run claimed as
+        // `since_last` (the watermark) or a manual run (the cursor). Both
+        // are written at claim time and never updated, so the answer cannot
+        // change under us. Any other run does not lock the schedule and
+        // never queues behind a schedule someone else is holding. A
         // cascade-deleted run matches nothing and skips the lock; the run
         // UPDATE below then reports RunDeleted as it always has.
+        //
+        // The schedule columns come from the locked row, so they are the
+        // latest committed values; the run's `origin` and `started_at` are
+        // immutable, so reading them unlocked is exact.
+        let mut cursor_move = None;
         if status == RunStatus::Success {
-            sqlx::query_scalar::<_, i64>(
-                "SELECT s.id FROM schedules s
-                 JOIN report_runs r ON r.schedule_id = s.id
-                 WHERE r.id = $1 AND r.window_kind = 'since_last'
-                 FOR UPDATE OF s",
+            let locked = sqlx::query(
+                "SELECT s.id AS schedule_id, s.interval_secs, s.next_fire_at,
+                        r.origin, r.started_at
+                   FROM schedules s
+                   JOIN report_runs r ON r.schedule_id = s.id
+                  WHERE r.id = $1 AND (r.window_kind = 'since_last' OR r.origin = 'manual')
+                  FOR UPDATE OF s",
             )
             .bind(run_id)
             .fetch_optional(&mut *tx)
             .await?;
+            if let Some(locked) = locked
+                && decode_origin(&locked, "origin")? == Some(RunOrigin::Manual)
+            {
+                cursor_move = Some(ManualCursorMove {
+                    schedule_id: locked.try_get("schedule_id")?,
+                    interval_secs: u64::try_from(locked.try_get::<i64, _>("interval_secs")?)
+                        .unwrap_or_default(),
+                    next_fire_at: locked.try_get("next_fire_at")?,
+                    started_at: locked.try_get("started_at")?,
+                });
+            }
         }
+
+        // Whether this finish is the run's transition out of `running`.
+        // Locked, after the schedule and in the module's order, so a finish
+        // queued behind another finish of the same run reads the status that
+        // one committed rather than the one its snapshot began with.
+        let was_running = match cursor_move {
+            Some(_) => {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT status FROM report_runs WHERE id = $1 FOR UPDATE",
+                )
+                .bind(run_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .as_deref()
+                    == Some(RunStatus::Running.as_str())
+            }
+            None => false,
+        };
 
         let updated = sqlx::query(
             "UPDATE report_runs
@@ -1519,6 +1568,12 @@ impl ScheduleStore {
             .bind(run_id)
             .execute(&mut *tx)
             .await?;
+        }
+
+        if let Some(cursor_move) = cursor_move
+            && was_running
+        {
+            cursor_move.apply(&mut tx, run_id).await?;
         }
 
         tx.commit().await?;
@@ -2199,6 +2254,53 @@ fn log_schedule_updated(schedule: &Schedule) {
         enabled = schedule.enabled,
         "Schedule updated"
     );
+}
+
+/// What a successful manual run's finish reads to consume the fire
+/// boundaries the run overtook.
+struct ManualCursorMove {
+    schedule_id: i64,
+    interval_secs: u64,
+    /// The schedule's cursor, read under its lock.
+    next_fire_at: DateTime<Utc>,
+    /// The run's `t`: every boundary at or before it is consumed.
+    started_at: DateTime<Utc>,
+}
+
+impl ManualCursorMove {
+    /// Move the cursor to the first boundary after `started_at`, or leave
+    /// a cursor that is already past it.
+    ///
+    /// The numbers come from a schedule row the store's CHECKs bound and
+    /// from an instant the database wrote, so a planning error here means
+    /// broken stored state. It is logged and the cursor stays: failing the
+    /// finish over it would lose the run's own success, and a cursor left
+    /// alone only lets the overdue tick run, which is the behaviour before
+    /// manual runs consumed anything.
+    async fn apply(self, conn: &mut sqlx::PgConnection, run_id: i64) -> Result<(), sqlx::Error> {
+        match fire_boundaries(self.next_fire_at, self.interval_secs, self.started_at) {
+            Ok(Some(boundaries)) => {
+                set_next_fire_at(conn, self.schedule_id, boundaries.next_fire_at).await?;
+                tracing::info!(
+                    event_type = "schedule_cursor_advanced",
+                    schedule_id = self.schedule_id,
+                    run_id,
+                    "fire cursor advanced past the boundaries a successful manual run overtook"
+                );
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::error!(
+                    event_type = "scheduler_error",
+                    schedule_id = self.schedule_id,
+                    run_id,
+                    error = %e,
+                    "could not place the fire cursor after a manual run; it is unchanged"
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Whether a manual claim is refused for capacity: a run in progress
