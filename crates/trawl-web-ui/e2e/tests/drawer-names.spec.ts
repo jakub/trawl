@@ -60,9 +60,12 @@ test('the net drawer keeps the saved name while renaming and follows a landed re
   await page.goto(`/jobs/nets?net=${CORPUS.netId}`);
   await expect(dialogNamed(page, CORPUS.netName)).toBeVisible();
 
+  // The controls keep their own names; only the dialog's name changed.
+  await expect(page.locator(SEL.netRename)).toHaveAccessibleName(`Rename ${CORPUS.netName}`);
   await page.locator(SEL.netRename).click();
   const input = page.locator(SEL.netRenameInput);
   await expect(input).toBeVisible();
+  await expect(input).toHaveAccessibleName(`New name for ${CORPUS.netName}`);
   // The edit buffer is not the name: typing a new one leaves the dialog
   // named after the saved net until the rename lands.
   await input.fill(RENAMED);
