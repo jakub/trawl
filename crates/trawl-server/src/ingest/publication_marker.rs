@@ -395,24 +395,25 @@ fn list_markers(env_dir: &Path) -> io::Result<Vec<(String, PathBuf)>> {
     Ok(markers)
 }
 
-/// Env directories under the WAL root. Any entry that cannot be inspected
-/// is an error: it may be an env holding markers.
-fn list_wal_envs(wal_dir: &Path) -> Result<Vec<(String, PathBuf)>, String> {
+/// Env directories under the WAL root, and whether every root entry could be
+/// inspected. An entry that cannot be inspected may be an env holding
+/// markers, so an incomplete listing must block every env it did not list.
+/// An unreadable root is an error.
+fn list_wal_envs(wal_dir: &Path) -> Result<(Vec<(String, PathBuf)>, bool), String> {
     let mut skipped = false;
     let envs = crate::env_dirs::try_list_env_dirs_observed(wal_dir, || skipped = true)
         .map_err(|e| format!("failed to list WAL directory {}: {e}", wal_dir.display()))?;
-    if skipped {
-        return Err(format!(
-            "failed to inspect an entry of WAL directory {}",
-            wal_dir.display()
-        ));
-    }
-    Ok(envs)
+    Ok((envs, !skipped))
 }
 
 /// What the pending markers claim, from one scan of the WAL root.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PublicationClaims {
+    /// Some WAL root entry could not be inspected. It may be an env holding
+    /// markers, so every env outside `scanned_envs` counts as claimed.
+    root_incomplete: bool,
+    /// Envs whose directory the scan reached.
+    scanned_envs: BTreeSet<String>,
     /// `(env, service)` pairs with any marker, valid or not.
     services: BTreeSet<(String, String)>,
     /// `(env, service)` pairs whose marker could not be read or validated.
@@ -430,12 +431,18 @@ pub struct PublicationClaims {
 impl PublicationClaims {
     /// Whether any marker, or any unknown, exists.
     pub fn any(&self) -> bool {
-        !self.services.is_empty() || !self.opaque_envs.is_empty()
+        self.root_incomplete || !self.services.is_empty() || !self.opaque_envs.is_empty()
+    }
+
+    /// Whether an env may hold markers this scan could not see.
+    fn unseen(&self, env: &str) -> bool {
+        self.root_incomplete && !self.scanned_envs.contains(env)
     }
 
     /// Whether compaction of `(env, service)` must wait for recovery.
     pub fn blocks_service(&self, env: &str, service: &str) -> bool {
-        self.unlisted_envs.contains(env)
+        self.unseen(env)
+            || self.unlisted_envs.contains(env)
             || self
                 .services
                 .contains(&(env.to_owned(), service.to_owned()))
@@ -443,7 +450,9 @@ impl PublicationClaims {
 
     /// Whether retention must keep the `data_dir/{env}/{date}` directory.
     pub fn claims_date(&self, env: &str, date: NaiveDate) -> bool {
-        self.opaque_envs.contains(env)
+        // An uninspectable root entry has no name, so it may be any env.
+        self.root_incomplete
+            || self.opaque_envs.contains(env)
             || self
                 .outputs
                 .iter()
@@ -453,7 +462,8 @@ impl PublicationClaims {
     /// Whether the canonical or temporary output of `service` in
     /// `data_dir/{env}/{date}/{hour}` is claimed by a marker.
     pub fn claims_output(&self, env: &str, date: NaiveDate, hour: u8, service: &str) -> bool {
-        self.unlisted_envs.contains(env)
+        self.unseen(env)
+            || self.unlisted_envs.contains(env)
             || self
                 .unknown_services
                 .contains(&(env.to_owned(), service.to_owned()))
@@ -464,11 +474,15 @@ impl PublicationClaims {
 }
 
 /// Collect the claims of every marker under `wal_dir`. A missing root has no
-/// claims. An unreadable root, or a root entry that cannot be inspected, is
-/// an error; callers must then assume everything is claimed.
+/// claims. An unreadable root is an error; callers must then assume
+/// everything is claimed. A root entry that cannot be inspected makes every
+/// env the scan did not reach claimed.
 pub fn scan_claims(wal_dir: &Path) -> Result<PublicationClaims, String> {
     let mut claims = PublicationClaims::default();
-    for (env, env_dir) in list_wal_envs(wal_dir)? {
+    let (envs, complete) = list_wal_envs(wal_dir)?;
+    claims.root_incomplete = !complete;
+    for (env, env_dir) in envs {
+        claims.scanned_envs.insert(env.clone());
         let Ok(markers) = list_markers(&env_dir) else {
             claims.unlisted_envs.insert(env.clone());
             claims.opaque_envs.insert(env);
@@ -557,23 +571,39 @@ impl RecoveryOutcome {
     }
 }
 
-/// [`RecoveryOutcome`] without its detail, for a metric label.
+/// [`RecoveryOutcome`] without its detail, for a metric label, plus
+/// `Failed` for a recovery attempt that returned an error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RecoveryOutcomeKind {
     Published,
     Unpublished,
     Contradictory,
+    /// A filesystem error or interruption stopped recovery of one marker,
+    /// or recovery could not start. The next pass retries.
+    Failed,
 }
 
 impl RecoveryOutcomeKind {
-    pub const ALL: [Self; 3] = [Self::Published, Self::Unpublished, Self::Contradictory];
+    pub const ALL: [Self; 4] = [
+        Self::Published,
+        Self::Unpublished,
+        Self::Contradictory,
+        Self::Failed,
+    ];
 
     pub const fn label(self) -> &'static str {
         match self {
             Self::Published => "published",
             Self::Unpublished => "unpublished",
             Self::Contradictory => "contradictory",
+            Self::Failed => "failed",
         }
+    }
+
+    /// Count one outcome on `trawl_publication_recovery_total`.
+    pub fn record(self) {
+        metrics::counter!(crate::metrics::PUBLICATION_RECOVERY_TOTAL, "outcome" => self.label())
+            .increment(1);
     }
 }
 
@@ -587,6 +617,14 @@ pub struct RecoveryEntry {
     pub result: Result<RecoveryOutcome, String>,
 }
 
+impl RecoveryEntry {
+    pub fn kind(&self) -> RecoveryOutcomeKind {
+        self.result
+            .as_ref()
+            .map_or(RecoveryOutcomeKind::Failed, RecoveryOutcome::kind)
+    }
+}
+
 /// Every marker recovery looked at, plus env directories it could not list.
 #[derive(Debug, Default)]
 pub struct RecoveryReport {
@@ -594,6 +632,33 @@ pub struct RecoveryReport {
     /// Env WAL directories that could not be listed. Their markers, if any,
     /// were not recovered.
     pub unlisted_envs: Vec<(String, String)>,
+    /// Some WAL root entry could not be inspected, so recovery may have
+    /// missed an env. The caller that lists the root counts that failure.
+    pub root_incomplete: bool,
+}
+
+impl RecoveryReport {
+    /// Count every marker's outcome on `trawl_publication_recovery_total`.
+    /// Returns how many markers stay blocking their service: contradictions
+    /// and failures.
+    ///
+    /// Unlisted envs and an incomplete root are not counted here. The caller
+    /// that lists the same directories for its own work (the compaction
+    /// tick's WAL scan, boot's WAL validation) owns that failure.
+    pub fn record(&self) -> u64 {
+        let mut blocked = 0;
+        for entry in &self.entries {
+            let kind = entry.kind();
+            kind.record();
+            if matches!(
+                kind,
+                RecoveryOutcomeKind::Contradictory | RecoveryOutcomeKind::Failed
+            ) {
+                blocked += 1;
+            }
+        }
+        blocked
+    }
 }
 
 /// Recover every pending marker under `wal_dir`.
@@ -604,14 +669,17 @@ pub struct RecoveryReport {
 /// It must be idempotent: an earlier attempt may have drained already.
 ///
 /// Returns `Err` only when the WAL root cannot be listed. Each marker's
-/// outcome is logged here; callers count the report.
+/// outcome is logged here; callers count the report with
+/// [`RecoveryReport::record`].
 pub fn recover(
     wal_dir: &Path,
     data_dir: &Path,
     mut drain: impl FnMut(&ValidatedMarker) -> Result<(), String>,
 ) -> Result<RecoveryReport, String> {
     let mut report = RecoveryReport::default();
-    for (env, env_dir) in list_wal_envs(wal_dir)? {
+    let (envs, complete) = list_wal_envs(wal_dir)?;
+    report.root_incomplete = !complete;
+    for (env, env_dir) in envs {
         let markers = match list_markers(&env_dir) {
             Ok(markers) => markers,
             Err(e) => {
@@ -763,7 +831,7 @@ fn recover_published(
     drain(marker)?;
     for (i, path) in wal_paths.iter().enumerate() {
         // Delete, else rename aside out of the WAL scan; already gone is done.
-        super::compaction::retire_merged_hourly(path)?;
+        super::compaction::retire_merged_input(path)?;
         step(&format!("recover:published:after_retire:{i}"))?;
     }
     let env_dir = marker.wal_env_dir(wal_dir);
@@ -773,6 +841,14 @@ fn recover_published(
     remove_marker_durably(marker_path)?;
     step("recover:published:after_marker_unlink")?;
     Ok(RecoveryOutcome::Published)
+}
+
+/// Roll back a publish that never renamed its output: remove the marker
+/// durably, then the tmp. The live publish uses this when a consumed WAL
+/// file vanished before the rename; recovery's unpublished branch is the
+/// same sequence.
+pub fn roll_back_unpublished(marker_path: &Path, tmp: &Path) -> Result<(), String> {
+    recover_unpublished(marker_path, tmp).map(|_| ())
 }
 
 /// Remove the marker durably before the tmp: removing the tmp first and
@@ -1295,6 +1371,43 @@ mod tests {
         assert!(recover(&wal, tmp.path(), |_| Ok(())).is_err());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn an_uninspectable_root_entry_claims_every_env_it_hides() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let f = fixture();
+        std::fs::create_dir_all(f.wal.join("lab")).unwrap();
+        let mode = std::fs::metadata(&f.wal).unwrap().permissions();
+        // Readable but not searchable: entries list, metadata fails.
+        std::fs::set_permissions(&f.wal, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let probe = std::fs::metadata(f.wal.join("lab"));
+        let claims = scan_claims(&f.wal);
+        let report = recover(&f.wal, &f.data, |_| Ok(()));
+        std::fs::set_permissions(&f.wal, mode).unwrap();
+        if probe.is_ok() {
+            eprintln!("skipped: privileges bypass directory search permissions");
+            return;
+        }
+        let claims = claims.unwrap();
+        assert!(claims.any());
+        assert!(claims.blocks_service(ENV, SERVICE));
+        assert!(claims.blocks_service("lab", "postgres"));
+        assert!(claims.claims_date("lab", date()));
+        assert!(claims.claims_output("lab", date(), 7, "postgres"));
+        let report = report.unwrap();
+        assert!(report.root_incomplete);
+        assert!(report.entries.is_empty());
+        assert!(f.marker.marker_path(&f.wal).is_file(), "nothing recovered");
+    }
+
+    #[test]
+    fn a_complete_scan_does_not_claim_other_envs() {
+        let f = fixture();
+        let claims = scan_claims(&f.wal).unwrap();
+        assert!(!claims.blocks_service("lab", SERVICE));
+        assert!(!claims.claims_output("lab", date(), 7, SERVICE));
+    }
+
     // ---- recovery decision table ----
 
     #[test]
@@ -1528,7 +1641,10 @@ mod tests {
     #[test]
     fn outcome_labels_are_stable() {
         let labels: Vec<_> = RecoveryOutcomeKind::ALL.iter().map(|k| k.label()).collect();
-        assert_eq!(labels, ["published", "unpublished", "contradictory"]);
+        assert_eq!(
+            labels,
+            ["published", "unpublished", "contradictory", "failed"]
+        );
         assert_eq!(
             RecoveryOutcome::Contradictory(Contradiction::OutputMissing).kind(),
             RecoveryOutcomeKind::Contradictory

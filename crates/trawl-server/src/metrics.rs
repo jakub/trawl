@@ -102,8 +102,14 @@ pub const SYSLOG_WRITE_TASKS_FAILED_TOTAL: &str = "trawl_syslog_write_tasks_fail
 pub const WAL_DURABILITY_FAILURES_TOTAL: &str = "trawl_wal_durability_failures_total";
 pub const COMPACTION_OPERATION_FAILURES_TOTAL: &str = "trawl_compaction_operation_failures_total";
 pub const FILES_QUARANTINED_TOTAL: &str = "trawl_files_quarantined_total";
+/// Publication markers recovery looked at, by `outcome`
+/// ([`crate::ingest::publication_marker::RecoveryOutcomeKind`]). A
+/// `contradictory` or `failed` outcome leaves the marker blocking its
+/// service's compaction until a later pass or an operator resolves it.
+pub const PUBLICATION_RECOVERY_TOTAL: &str = "trawl_publication_recovery_total";
 
-/// Failed durability operations on an already-published WAL file.
+/// Failed durability operations on an already-published WAL file. Each
+/// failure rejects the write it belonged to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WalDurabilityOperation {
     ParentDirectorySync,
@@ -252,6 +258,15 @@ pub fn init_operational_alert_metrics() {
     }
 }
 
+/// Publish the publication-recovery outcome matrix at zero, so a flat
+/// `contradictory` series reads as "none seen" rather than "never wired up".
+/// Repeated calls never reset counters.
+pub fn init_publication_recovery_metrics() {
+    for outcome in crate::ingest::publication_marker::RecoveryOutcomeKind::ALL {
+        metrics::counter!(PUBLICATION_RECOVERY_TOTAL, "outcome" => outcome.label()).increment(0);
+    }
+}
+
 // -- bookkeeping write identity ----------------------------------------------
 
 /// The two catalog bookkeeping writes one compacted batch makes, in the
@@ -364,11 +379,15 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         WAL_DURABILITY_FAILURES_TOTAL,
-        "Failed WAL durability operations after file publication, labelled by operation; the directory entry may not survive a crash, not an event discard"
+        "Failed WAL durability operations after file publication, labelled by operation; each failure rejects its write, whose file is withdrawn when possible"
     );
     describe_counter!(
         COMPACTION_OPERATION_FAILURES_TOTAL,
         "Failed compaction operation attempts, labelled by operation; excludes successful quarantines, idle work and intentional suppression"
+    );
+    describe_counter!(
+        PUBLICATION_RECOVERY_TOTAL,
+        "Compaction publication markers examined by recovery, labelled by outcome (published, unpublished, contradictory, failed); contradictory and failed markers keep their service's compaction blocked"
     );
     describe_counter!(
         FILES_QUARANTINED_TOTAL,
@@ -1600,6 +1619,23 @@ mod tests {
                 };
                 assert_eq!(test_support::sample(&handle, series), expected);
             }
+        });
+    }
+
+    #[test]
+    fn publication_recovery_outcomes_start_at_zero_and_survive_reinitialization() {
+        let recorder = prometheus_builder().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            init_publication_recovery_metrics();
+            let series =
+                |label: &str| format!("{PUBLICATION_RECOVERY_TOTAL}{{outcome=\"{label}\"}}");
+            for label in ["published", "unpublished", "contradictory", "failed"] {
+                assert_eq!(test_support::sample(&handle, &series(label)), 0);
+            }
+            crate::ingest::publication_marker::RecoveryOutcomeKind::Contradictory.record();
+            init_publication_recovery_metrics();
+            assert_eq!(test_support::sample(&handle, &series("contradictory")), 1);
         });
     }
 

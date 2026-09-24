@@ -1924,7 +1924,7 @@ See the runbooks for [sampling and resolution limits](/operate/operational-alert
 | `daily_rollup_unit` | Roll up one daily unit, including a handled task failure |
 | `pending_rollup_scan` | Initialize the publication gate by scanning pending markers; a latched failure is counted once, not again on each read refusal |
 | `pending_rollup_recovery` | Recover pending rollup markers; the coordinated recovery wrapper owns returned errors, and the caller owns a handled task failure |
-| `consumed_wal_removal` | Remove a consumed WAL file after publication; a best-effort removal failure still counts |
+| `consumed_wal_removal` | Delete or rename aside a consumed WAL file after publication. On failure, the publication marker stays and blocks the service until recovery retires the file |
 
 Propagating a returned error through callers does not add another failure.
 At the WAL and daily-rollup root, one scan attempt counts once even if
@@ -1948,3 +1948,23 @@ temporary-file cleanup and empty-directory housekeeping are outside this
 closed inventory. Retiring a replaced file as `.parquet.merged` is not a
 corrupt-file quarantine. These counters do not measure backlog eligibility
 or prove that compaction is making progress.
+
+### Publication recovery outcomes
+
+`trawl_publication_recovery_total{outcome}` counts the publication markers
+that recovery examined. Each compaction tick runs recovery before it
+compacts. No alert selects this counter. All four outcomes are initialized
+at zero after recorder installation.
+
+| `outcome` | Meaning |
+| --- | --- |
+| `published` | The canonical output carries the recorded identity. Recovery retired the consumed WAL files and removed the marker |
+| `unpublished` | The output was never renamed into place. Recovery removed the marker and the temporary output, and kept the WAL for the next compaction |
+| `contradictory` | The evidence contradicts itself, for example a canonical output with another identity and no temporary output. Recovery touched nothing, and the service stays blocked |
+| `failed` | A filesystem error stopped recovery of one marker. The marker stays, the service stays blocked, and the next tick retries |
+
+Each `contradictory` or `failed` outcome also counts once in
+`CompactionStats.total_errors` for that tick. A `contradictory` marker
+repeats on every tick until an operator resolves it. The
+`publication_recovery_failed` log event names the env, the service and the
+reason.
