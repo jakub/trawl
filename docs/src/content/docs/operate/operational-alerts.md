@@ -481,8 +481,11 @@ refused. [Crash recovery](/architecture/recovery/) describes the protocol.
    cannot list an environment's WAL directory, the event carries only the
    environment and the error, and every service in that environment stays
    blocked. This case does not count toward this alert; compaction counts
-   it under `wal_environment_scan`. If a compaction tick cannot list the WAL
-   root, the event carries only the error and counts as `failed`.
+   it under `wal_environment_scan`. A compaction tick lists the WAL root
+   before recovery runs. If that first listing fails, compaction counts it
+   under `wal_root_scan` and the tick stops before recovery. If the first
+   listing succeeds and recovery's own listing of the root then fails, the
+   event carries only the error and counts as `failed`.
 2. For a failure, correct the reported permission or storage problem. When
    the event has no service or marker path, investigate the directory that
    its error names. The next tick completes the marker, and the service

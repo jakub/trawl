@@ -1972,5 +1972,8 @@ repeats on every tick until an operator resolves it. The
 `publication_recovery_failed` log event for one marker names the env, the
 service, the marker path, and the `reason` or `error`. When recovery cannot
 list an env's WAL directory, the event carries only the env and the error,
-and nothing counts on this metric. When a compaction tick cannot list the
-WAL root, the event carries only the error and counts one `failed`.
+and nothing counts on this metric. A compaction tick lists the WAL root
+before recovery runs, and a failure of that listing counts under
+`wal_root_scan` and ends the tick before recovery. When that listing
+succeeds and recovery's own listing of the root fails, the event carries
+only the error and counts one `failed`.
