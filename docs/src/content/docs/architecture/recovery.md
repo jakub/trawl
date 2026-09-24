@@ -113,11 +113,7 @@ Compaction stops at shutdown without a final pass. WAL files that it has not mer
 The protocol does not cover every failure:
 
 - A successful fsync is the only durability proof that Trawl uses. After a failed fsync, some Linux filesystems drop the unwritten pages and report a later fsync as successful. Recovery fsyncs again and cannot detect that case.
-- Retention re-reads the publication markers immediately before it deletes each date directory. Retention never deletes the date that it reads as today. A publish that starts before midnight can still write into yesterday's directory while retention, already on the new date, deletes that directory. If compaction writes its marker between the re-read and the delete, the publish ends in one of two ways:
-  - The publish fails, or recovery later finds neither output. Recovery reports the marker as `contradictory`, and `TrawlPublicationRecoveryBlocked` fires. The WAL files stay, and the service stays blocked until an operator resolves the marker.
-  - The output is already renamed and its directory fsynced when the directory disappears. Compaction retires the WAL and removes the marker. The published rows are then deleted with the rest of that date, the same way retention expiry deletes rows, and no marker or alert remains.
-
-  In both cases, no acknowledged row is counted twice, and no row is lost that retention was not already deleting with its date.
+- Retention re-reads the publication markers immediately before it deletes each date directory. Retention never deletes the date that it reads as today. A publish that starts before midnight can still write into yesterday's directory while retention, already on the new date, deletes that directory. If compaction writes its marker between the re-read and the delete, each of that publish's rows is either still in the WAL or was published into the deleted date. No acknowledged row is counted twice, and no row is lost that retention was not already deleting with its date. The marker can outlive its output. Recovery then reports it as `contradictory`, `TrawlPublicationRecoveryBlocked` fires, and the service stays blocked until an operator resolves the marker.
 
 ## Recovery is not backup
 
