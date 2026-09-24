@@ -331,6 +331,84 @@ test('histogram tooltip stays inside the strip at both edges', async ({ page }) 
   }
 });
 
+test('a shown histogram tooltip is re-placed when the strip resizes', async ({ page }) => {
+  const events = [['2026-09-01T00:00:00.100Z', 17], ['2026-09-01T00:00:00.900Z', 17]];
+  await page.route('**/api/v1/query', route => route.fulfill({ json: { ...countResult, columns: [{ name: '_time' }, { name: '_severity' }], rows: events } }));
+  const histo = page.locator('.histo');
+  const bars = page.locator('.histo .bar');
+  // Whole-pixel rounding, as in the edge test above.
+  const ROUNDING = 0.5;
+  const fits = (index: number) => async () => {
+    const [t, h] = [await bars.nth(index).locator('.tip').boundingBox(), await histo.boundingBox()];
+    return !!t && !!h && t.x >= h.x - ROUNDING && t.x + t.width <= h.x + h.width + ROUNDING;
+  };
+
+  // The tip is placed when its bar gains focus. Resizing the window
+  // afterwards moves the bar under a tip that is still shown, and focus
+  // never moves, so nothing but the strip's own resize can re-place it.
+  //
+  // Not the edge bars: bar 0 and bar 47 keep their distance from their
+  // own strip edge at any width, so a stale shift happens to stay right
+  // for them. Bars 36 and 9 fit centred in the 1400px strip (about 954px)
+  // and overflow the 800px one (about 778px) by roughly 17px on the right
+  // and 24px on the left, so a shift measured at 1400px is wrong at 800px.
+  for (const [index, from, to] of [[36, 1400, 800], [9, 1400, 800]] as const) {
+    await page.setViewportSize({ width: from, height: 900 });
+    await page.goto('/search?q=service%3Dnginx');
+    await expect(bars).toHaveCount(48);
+    const bar = bars.nth(index);
+    await bar.focus();
+    await page.keyboard.press('Shift+Tab');
+    await page.keyboard.press('Tab');
+    await expect(bar).toBeFocused();
+    await expect(bar.locator('.tip')).toHaveCSS('opacity', '1');
+    await expect.poll(fits(index), `bar ${index} at ${from}px`).toBe(true);
+
+    await page.setViewportSize({ width: to, height: 900 });
+    await expect(bar).toBeFocused();
+    await expect(bar.locator('.tip')).toHaveCSS('opacity', '1');
+    await expect.poll(fits(index), `bar ${index} after ${from}px → ${to}px`).toBe(true);
+  }
+});
+
+test('a hovered histogram tooltip is re-placed when new bars render under it', async ({ page }) => {
+  // The first response has one event at each end; the second adds one
+  // in bucket 36's range, so the rerun draws new bars and new labels.
+  // The pointer stays on bar 36 throughout, and the tip of the bar that
+  // replaces it must still fit. This pins the outcome, not the route:
+  // Chromium sends a mouseenter to the new bar under a still pointer,
+  // which places its tip on its own, and the component also places every
+  // tip after the bars render, which does not rely on that.
+  let responses = 0;
+  await page.route('**/api/v1/query', route => {
+    responses += 1;
+    const rows = [['2026-09-01T00:00:00.100Z', 17], ['2026-09-01T00:00:00.900Z', 17]];
+    if (responses > 1) rows.push(['2026-09-01T00:00:00.860Z', 17]);
+    return route.fulfill({ json: { ...countResult, columns: [{ name: '_time' }, { name: '_severity' }], rows } });
+  });
+  await page.setViewportSize({ width: 800, height: 900 });
+  await page.goto('/search?q=service%3Dnginx');
+  const histo = page.locator('.histo');
+  const bars = page.locator('.histo .bar');
+  await expect(bars).toHaveCount(48);
+  const ROUNDING = 0.5;
+  const fits = async () => {
+    const [t, h] = [await bars.nth(36).locator('.tip').boundingBox(), await histo.boundingBox()];
+    return !!t && !!h && t.x >= h.x - ROUNDING && t.x + t.width <= h.x + h.width + ROUNDING;
+  };
+  await bars.nth(36).hover();
+  await expect(bars.nth(36).locator('.tip')).toHaveCSS('opacity', '1');
+  await expect.poll(fits).toBe(true);
+  const before = await bars.nth(36).getAttribute('aria-label');
+
+  await page.locator(SEL.cmContent).focus();
+  await page.keyboard.press('Control+Enter');
+  await expect.poll(() => responses).toBe(2);
+  await expect(bars.nth(36)).not.toHaveAttribute('aria-label', before!);
+  await expect(bars.nth(36).locator('.tip')).toHaveCSS('opacity', '1');
+  await expect.poll(fits).toBe(true);
+});
+
 test('numeric group keys are series, labelled by their own digits', async ({ page }) => {
   // `by status` over 200 and 500: the roles come from the query, so the
   // numbers in the group column are two series and not two metrics.

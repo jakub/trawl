@@ -19,10 +19,14 @@
 //!
 //! The x axis reads real timestamps off the data.
 //!
-//! A bar's tooltip is centred on it, and on hover or keyboard focus it is
-//! measured against the strip and shifted sideways (`--tip-shift`) so an
-//! edge bar's tip never runs past the strip, where `.search-col` clips
-//! it. The shift is `crate::histogram::tip_shift`.
+//! A bar's tooltip is centred on it, then measured against the strip and
+//! shifted sideways (`--tip-shift`) so an edge bar's tip never runs past
+//! the strip, where `.search-col` clips it. The shift is
+//! `crate::histogram::tip_shift`. A bar's tip is placed when the bar is
+//! hovered or focused, and every tip is placed again after the bars
+//! render and whenever the strip resizes. A tip already on screen then
+//! follows a window resize or a live refresh without the pointer or the
+//! focus having to move.
 
 use fleet_ui::{LoadState, Loaded};
 use leptos::prelude::*;
@@ -52,8 +56,17 @@ pub fn Histogram(
         >,
     >,
 ) -> impl IntoView {
+    let strip = NodeRef::<leptos::html::Div>::new();
+    // Every bar moves when the strip changes width, including the one
+    // whose tip is on screen. The observer disconnects with the
+    // component through leptos-use.
+    let _ = leptos_use::use_resize_observer(strip, move |_, _| {
+        if let Some(strip) = strip.get_untracked() {
+            place_all_tips(&strip);
+        }
+    });
     view! {
-        <div class="histo">
+        <div class="histo" node_ref=strip>
             <Loaded
                 state=Signal::derive(move || LoadState::from_resource(rows.get()))
                 // Deliberate quiet-error override: the results table
@@ -76,6 +89,14 @@ pub fn Histogram(
                     let (x_start, x_mid, x_end) = axis_labels(&series);
                     let width = series.bucket_width();
                     let min = series.min_secs;
+                    // New buckets or labels replace every bar, and the
+                    // strip keeps its size, so the observer stays quiet.
+                    // Place the new tips once they are laid out.
+                    request_animation_frame(move || {
+                        if let Some(strip) = strip.get_untracked() {
+                            place_all_tips(&strip);
+                        }
+                    });
                     view! {
                         <div class="yax">
                             <span>{max}</span>
@@ -138,6 +159,28 @@ fn place_tip(ev: &web_sys::Event) {
     let Some(strip) = bar.closest(".histo").ok().flatten() else {
         return;
     };
+    place_bar_tip(&bar, &strip);
+}
+
+/// Place every bar's tip in `strip`. Placing all of them, rather than
+/// looking for the one on screen, needs no guess about which tips hover
+/// and focus are showing (they can be two different bars), and it costs a
+/// few offset reads for each of 48 bars.
+fn place_all_tips(strip: &web_sys::Element) {
+    let Some(bars) = strip.query_selector(".bars").ok().flatten() else {
+        return;
+    };
+    let mut next = bars.first_element_child();
+    while let Some(bar) = next {
+        next = bar.next_element_sibling();
+        if let Ok(bar) = bar.dyn_into::<HtmlElement>() {
+            place_bar_tip(&bar, strip);
+        }
+    }
+}
+
+/// Measure one bar's tip against the strip and set its `--tip-shift`.
+fn place_bar_tip(bar: &HtmlElement, strip: &web_sys::Element) {
     let Some(tip) = bar
         .query_selector(".tip")
         .ok()
@@ -155,7 +198,7 @@ fn place_tip(ev: &web_sys::Event) {
     loop {
         bar_left += node.offset_left();
         match node.offset_parent() {
-            Some(parent) if parent == strip => break,
+            Some(parent) if parent == *strip => break,
             Some(parent) => match parent.dyn_into::<HtmlElement>() {
                 Ok(parent) => node = parent,
                 Err(_) => return,
