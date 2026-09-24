@@ -4,13 +4,17 @@
 
 //! [`RowCap`] against real `DuckDB`: a refusing cap refuses, a cutting cap
 //! cuts, and a cutting cap never cuts the rows a kv tail aggregates.
+//!
+//! A row count cannot tell a `LIMIT` `DuckDB` applied from a cut made after
+//! it built the whole result, so the pushdown is read off the statement
+//! the lane actually prepared ([`prepare_probe::last_statement`]).
 
 use std::io::Write as _;
 
 use trawl_core::schema::FieldTypes;
 use trawl_engine::cancel::CancelLatch;
 use trawl_engine::error::EngineError;
-use trawl_engine::executor::{Executor, RowCap};
+use trawl_engine::executor::{Executor, RowCap, prepare_probe};
 use trawl_engine::value::{QueryResult, Value};
 
 /// Six events, `k=a` three times and `k=b` three times, where `read_json`
@@ -120,4 +124,62 @@ fn truncate_cuts_a_kv_tail_answer_but_never_its_input() {
         matches!(refused, Err(EngineError::ResultTooLarge(5))),
         "six events past a tail input bound of five: {refused:?}"
     );
+}
+
+/// Run `dsl` under `cap` and return the SQL the lane handed `DuckDB`.
+///
+/// The lane runs on this thread and the probe keeps each thread's last
+/// statement, so nothing another test binds can land in between.
+fn prepared(dsl: &str, glob: &str, cap: RowCap) -> String {
+    run(dsl, glob, cap).unwrap_or_else(|e| panic!("{dsl:?} under {cap:?}: {e}"));
+    prepare_probe::last_statement().expect("the lane prepared a statement")
+}
+
+#[test]
+fn truncate_reaches_duckdb_as_a_limit_and_refuse_does_not() {
+    let (_dir, glob) = six_events();
+    let dsl = "n>=0 | sort n | table n";
+
+    let refused = prepared(dsl, &glob, RowCap::Refuse(6));
+    assert!(
+        !refused.contains("LIMIT"),
+        "the interactive lane runs the emitted SQL untouched: {refused}"
+    );
+
+    // The same emitted SQL, wrapped: the cut happens inside DuckDB, and the
+    // wrapper adds no placeholder to the parameters the search binds.
+    let truncated = prepared(
+        dsl,
+        &glob,
+        RowCap::Truncate {
+            rows: 2,
+            tail_input: 6,
+        },
+    );
+    assert_eq!(truncated, format!("SELECT * FROM ({refused}) LIMIT 2"));
+    assert!(
+        refused.contains('?'),
+        "the search binds a parameter: {refused}"
+    );
+    assert_eq!(truncated.matches('?').count(), refused.matches('?').count());
+}
+
+#[test]
+fn a_kv_tail_under_truncate_prepares_no_limit() {
+    let (_dir, glob) = six_events();
+    let dsl = "* | extract kv | stats count() as c";
+
+    let tail = prepared(
+        dsl,
+        &glob,
+        RowCap::Truncate {
+            rows: 1,
+            tail_input: 6,
+        },
+    );
+    assert!(
+        !tail.contains("LIMIT"),
+        "the tail's input is read whole, never cut in SQL: {tail}"
+    );
+    assert_eq!(tail, prepared(dsl, &glob, RowCap::Refuse(6)));
 }

@@ -42,14 +42,28 @@ type TimestampColumns = Vec<String>;
 /// Process-global, so a reader that shares its test binary with binding
 /// tests must serialize against them (see
 /// `tests/complexity_admission.rs`).
+///
+/// It also keeps the text of the last statement each thread bound, which
+/// is the only evidence of what `DuckDB` was asked to run: a row count
+/// cannot tell a `LIMIT` `DuckDB` applied from a cut made after it built
+/// the whole result. Per thread, because the lanes run synchronously on
+/// their caller's thread, so parallel tests cannot read each other's
+/// statements; and only the last one, so a long-lived worker thread holds
+/// one string, not a history.
 #[cfg(any(test, feature = "test-support"))]
 pub mod prepare_probe {
+    use std::cell::RefCell;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static PREPARES: AtomicU64 = AtomicU64::new(0);
 
-    pub(super) fn record() {
+    thread_local! {
+        static LAST_STATEMENT: RefCell<Option<String>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn record(sql: &str) {
         PREPARES.fetch_add(1, Ordering::SeqCst);
+        LAST_STATEMENT.with(|last| *last.borrow_mut() = Some(sql.to_owned()));
     }
 
     /// Binds counted since the process started.
@@ -57,12 +71,21 @@ pub mod prepare_probe {
     pub fn count() -> u64 {
         PREPARES.load(Ordering::SeqCst)
     }
+
+    /// The SQL of the last statement this thread handed `DuckDB` to bind.
+    #[must_use]
+    pub fn last_statement() -> Option<String> {
+        LAST_STATEMENT.with(|last| last.borrow().clone())
+    }
 }
 
-/// One lane bind, counted for the admission tests and nothing else.
-fn record_prepare() {
+/// One lane bind: counted and recorded for the tests, then handed to
+/// `DuckDB`. The probe sees exactly the text `DuckDB` prepares, because
+/// it is the same argument.
+fn prepare_statement<'c>(conn: &'c Connection, sql: &str) -> duckdb::Result<duckdb::Statement<'c>> {
     #[cfg(any(test, feature = "test-support"))]
-    prepare_probe::record();
+    prepare_probe::record(sql);
+    conn.prepare(sql)
 }
 
 /// How a query lane bounds the rows it hands back.
@@ -550,11 +573,10 @@ impl Executor {
         // Re-read after the probes: each one is a bind of its own, and
         // this is the last moment before the statement's.
         cancel.check()?;
-        record_prepare();
         // Every lane's SQL read reaches `DuckDB` here — cold, hot union,
         // hot-only, and each one's `_raw`-free retry — so this is the one
         // place a `Truncate` becomes a `LIMIT`.
-        let mut stmt = match self.conn.prepare(&cap.statement(&query.sql)) {
+        let mut stmt = match prepare_statement(&self.conn, &cap.statement(&query.sql)) {
             Ok(s) => s,
             Err(e) if is_no_files_error(&e) => {
                 return Ok((QueryResult::empty(), TimestampColumns::new()));
@@ -1029,8 +1051,7 @@ impl Executor {
         // probes above each bound a statement, and the staging SELECT
         // is about to bind another.
         cancel.check()?;
-        record_prepare();
-        match self.conn.prepare(&create_sql) {
+        match prepare_statement(&self.conn, &create_sql) {
             Ok(mut stmt) => {
                 // The export's bind-to-execute boundary: the staging
                 // SELECT is the whole query, so this is the same bind the
@@ -1285,8 +1306,7 @@ fn validate_timechart_inputs(
         // Same rule as the lanes below: no bind starts once the
         // caller has asked for this work to stop.
         cancel.check()?;
-        record_prepare();
-        let mut stmt = match conn.prepare(&check.sql) {
+        let mut stmt = match prepare_statement(conn, &check.sql) {
             Ok(stmt) => stmt,
             Err(e) if is_no_files_error(&e) => continue,
             Err(e) if is_binder_column_error(&e) => return Err(remap_binder_error(&e)),
