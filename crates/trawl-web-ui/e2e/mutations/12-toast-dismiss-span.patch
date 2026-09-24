@@ -1,10 +1,10 @@
-diff --git a/crates/fleet-ui/src/toast/runtime.rs b/crates/fleet-ui/src/toast/runtime.rs
-index 1988bf2f..3cf4888c 100644
---- a/crates/fleet-ui/src/toast/runtime.rs
-+++ b/crates/fleet-ui/src/toast/runtime.rs
-@@ -167,14 +167,12 @@ fn ToastItem(toast: Toast, bus: ToastBus, paused: Signal<bool>) -> impl IntoView
-                 <div class="title">{toast.title}</div>
-                 {toast.detail.map(|d| view! { <div class="detail">{d}</div> })}
+diff --git i/crates/fleet-ui/src/toast/runtime.rs w/crates/fleet-ui/src/toast/runtime.rs
+index 0b38e0d2..87a35883 100644
+--- i/crates/fleet-ui/src/toast/runtime.rs
++++ w/crates/fleet-ui/src/toast/runtime.rs
+@@ -189,14 +189,12 @@ fn ToastItem(toast: Toast, bus: ToastBus, paused: Signal<bool>) -> impl IntoView
+                     <a class="link" href=link.href().to_owned()>{link.label().to_owned()}</a>
+                 })}
              </div>
 -            // The multiplication sign is decoration; the button's name
 -            // comes from aria-label, not a spoken "times" glyph.
