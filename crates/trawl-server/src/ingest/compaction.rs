@@ -1141,7 +1141,7 @@ fn quarantine_file(
 /// A failed rename whose source vanished from under us (lost a delete race) is
 /// likewise fine; only a genuine non-`NotFound` rename failure is a hard error,
 /// because then the file still matches `*.parquet` and would be re-merged.
-fn retire_merged_hourly(path: &Path) -> Result<(), String> {
+pub(crate) fn retire_merged_hourly(path: &Path) -> Result<(), String> {
     match std::fs::remove_file(path) {
         Ok(()) => return Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -3484,7 +3484,7 @@ fn scan_env_wal_files(env: &str, env_wal_dir: &Path, min_age: Duration) -> Optio
 }
 
 /// Scan the WAL directory for `.ndjson` files older than `min_age`.
-fn scan_wal_files(wal_dir: &Path, min_age: Duration) -> std::io::Result<Vec<PathBuf>> {
+pub(crate) fn scan_wal_files(wal_dir: &Path, min_age: Duration) -> std::io::Result<Vec<PathBuf>> {
     let now = SystemTime::now();
     let mut files = Vec::new();
 
@@ -3532,7 +3532,7 @@ fn group_by_service(files: Vec<PathBuf>) -> HashMap<String, Vec<PathBuf>> {
 ///
 /// Filename format: `{service}_{unix_millis}_{hex_random}`
 /// The millis and hex segments are always the last two `_`-delimited parts.
-fn extract_service_from_filename(filename: &str) -> String {
+pub(crate) fn extract_service_from_filename(filename: &str) -> String {
     let parts: Vec<&str> = filename.rsplitn(3, '_').collect();
     if parts.len() == 3 {
         parts[2].to_owned()

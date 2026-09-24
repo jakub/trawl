@@ -10,4 +10,5 @@ pub mod envelope;
 pub mod handler;
 pub mod pipeline;
 pub mod producer;
+pub mod publication_marker;
 pub mod wal;

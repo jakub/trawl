@@ -267,6 +267,26 @@ fn publish_epoch(data_root: &Path) -> Result<(), String> {
 /// share a fixture corpus) must not clobber each other's staged file
 /// between the write and the rename.
 pub(crate) fn publish_marker_staged(dir: &Path, name: &str, body: &str) -> Result<(), String> {
+    stage_and_rename(dir, name, body)?;
+    fsync_dir_best_effort(dir);
+    Ok(())
+}
+
+/// [`publish_marker_staged`] for a marker whose durability is part of a
+/// correctness argument: a failed directory fsync is an error, not a warning.
+///
+/// The compaction publication marker (`ingest::publication_marker`) must be
+/// on disk before its output is renamed into place, so the caller has to
+/// learn that the rename entry may not survive a crash. The marker stays
+/// visible after such a failure; recovery treats it like any other marker.
+pub(crate) fn publish_marker_durable(dir: &Path, name: &str, body: &str) -> Result<(), String> {
+    stage_and_rename(dir, name, body)?;
+    fsync_dir(dir).map_err(|e| format!("failed to fsync directory {}: {e}", dir.display()))
+}
+
+/// Staged temp name, write, fsync, atomic rename. The caller owns the
+/// directory fsync that makes the rename durable.
+fn stage_and_rename(dir: &Path, name: &str, body: &str) -> Result<(), String> {
     // A hidden marker's staged file must not share its discovery prefix.
     // In particular, rollup recovery recognizes `.rollup-*`; it must never
     // read a partially written `..rollup-*.next.<pid>` as a complete marker.
@@ -283,9 +303,49 @@ pub(crate) fn publish_marker_staged(dir: &Path, name: &str, body: &str) -> Resul
 
     let marker = dir.join(name);
     std::fs::rename(&staged, &marker)
-        .map_err(|e| format!("failed to publish {}: {e}", marker.display()))?;
-    fsync_dir_best_effort(dir);
-    Ok(())
+        .map_err(|e| format!("failed to publish {}: {e}", marker.display()))
+}
+
+/// fsync a directory so entries created, renamed or removed inside it
+/// survive a crash. Unlike [`fsync_dir_best_effort`], the error reaches the
+/// caller.
+pub(crate) fn fsync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if fail_dir_fsync::matches(dir) {
+        return Err(std::io::Error::other("injected directory fsync failure"));
+    }
+    std::fs::File::open(dir).and_then(|d| d.sync_all())
+}
+
+/// Unit-test injection for [`fsync_dir`]: fail every fsync of one directory
+/// on the current thread. Real filesystems give no portable way to make a
+/// directory fsync fail on demand.
+#[cfg(test)]
+pub(crate) mod fail_dir_fsync {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    thread_local! {
+        static TARGET: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    /// Fail fsyncs of `dir` until the returned guard drops.
+    pub(crate) fn set(dir: &Path) -> Guard {
+        TARGET.with(|t| *t.borrow_mut() = Some(dir.to_path_buf()));
+        Guard
+    }
+
+    pub(super) fn matches(dir: &Path) -> bool {
+        TARGET.with(|t| t.borrow().as_deref() == Some(dir))
+    }
+
+    pub(crate) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            TARGET.with(|t| *t.borrow_mut() = None);
+        }
+    }
 }
 
 /// fsync a directory so the rename entry inside it survives a crash. Never
@@ -703,5 +763,28 @@ mod tests {
             );
             assert!(!data.join("EPOCH").is_file());
         }
+    }
+
+    #[test]
+    fn durable_marker_writer_reports_directory_fsync_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        {
+            let _fail = fail_dir_fsync::set(dir);
+            let err = publish_marker_durable(dir, ".marker", "body").unwrap_err();
+            assert!(err.contains("failed to fsync directory"), "{err}");
+            // The existing writer keeps its best-effort contract.
+            publish_marker_staged(dir, ".other", "body").unwrap();
+        }
+        // The rename happened; only its durability is unknown.
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".marker")).unwrap(),
+            "body"
+        );
+        publish_marker_durable(dir, ".marker", "next").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".marker")).unwrap(),
+            "next"
+        );
     }
 }
