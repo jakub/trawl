@@ -16,38 +16,38 @@ function target(entry, status = 'failed', message = 'Save snapshot preview must 
 }
 function report(...specs) { return { suites: [{ suites: [{ specs }] }] }; }
 
-test('both preview failures count as a kill through nested suites', () => {
-  assert.equal(saveSnapshotMutationKilled(report(target('editor'), target('toolbar'))), true);
+test('a preview failure counts as a kill through nested suites', () => {
+  assert.equal(saveSnapshotMutationKilled(report(target('editor'))), true);
 });
 
 test('exact POST assertion failures also count as a kill', () => {
   const message = 'Save snapshot POST must contain the exact editor buffer once';
-  assert.equal(saveSnapshotMutationKilled(report(target('editor', 'failed', message), target('toolbar', 'failed', message))), true);
+  assert.equal(saveSnapshotMutationKilled(report(target('editor', 'failed', message))), true);
 });
 
 test('a missing or duplicate entry does not count', () => {
-  assert.equal(saveSnapshotMutationKilled(report(target('editor'))), false);
-  assert.equal(saveSnapshotMutationKilled(report(target('editor'), target('toolbar'), target('toolbar'))), false);
+  assert.equal(saveSnapshotMutationKilled(report()), false);
+  assert.equal(saveSnapshotMutationKilled(report(target('editor'), target('editor'))), false);
 });
 
 test('timeouts, skips and passes cannot supply a failed snapshot assertion', () => {
   for (const status of ['timedOut', 'skipped', 'passed', 'interrupted']) {
-    assert.equal(saveSnapshotMutationKilled(report(target('editor'), target('toolbar', status))), false);
+    assert.equal(saveSnapshotMutationKilled(report(target('editor', status))), false);
   }
 });
 
 test('unrelated failures and wrong test titles do not count', () => {
-  assert.equal(saveSnapshotMutationKilled(report(target('editor'), target('toolbar', 'failed', 'browserType.launch: executable missing'))), false);
-  assert.equal(saveSnapshotMutationKilled(report(target('editor'), target('other'))), false);
+  assert.equal(saveSnapshotMutationKilled(report(target('editor', 'failed', 'browserType.launch: executable missing'))), false);
+  assert.equal(saveSnapshotMutationKilled(report(target('other'))), false);
 });
 
 test('missing report structure or results fail closed', () => {
   for (const value of [null, {}, { suites: [] }, { suites: 'invalid' }]) {
     assert.equal(saveSnapshotMutationKilled(value), false);
   }
-  const missing = target('toolbar');
+  const missing = target('editor');
   missing.tests[0].results = [];
-  assert.equal(saveSnapshotMutationKilled(report(target('editor'), missing)), false);
+  assert.equal(saveSnapshotMutationKilled(report(missing)), false);
 });
 
 test('the CLI rejects missing and malformed JSON reports', () => {

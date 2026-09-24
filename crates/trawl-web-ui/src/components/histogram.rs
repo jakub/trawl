@@ -18,15 +18,34 @@
 //! as ok.
 //!
 //! The x axis reads real timestamps off the data.
+//!
+//! A bar's tooltip is centred on it, then measured against the strip and
+//! shifted sideways (`--tip-shift`) so an edge bar's tip never runs past
+//! the strip, where `.search-col` clips it. The shift is
+//! `crate::histogram::tip_shift`. A bar's tip is placed when the bar is
+//! hovered or focused, and every tip is placed again after the bars
+//! render and whenever the strip resizes. A tip already on screen then
+//! follows a window resize or a live refresh without the pointer or the
+//! focus having to move.
 
 use fleet_ui::{LoadState, Loaded};
 use leptos::prelude::*;
 use trawl_api::QueryResponse;
 use trawl_api::value::Value;
 
-use crate::histogram::{Series, axis_labels, bucket_time, bucketize_series};
+use wasm_bindgen::JsCast;
+use web_sys::HtmlElement;
+
+use crate::histogram::{Series, axis_labels, bucket_time, bucketize_series, tip_shift};
 
 const N_BUCKETS: usize = 48;
+
+/// Pixels a shifted tip keeps clear of each strip edge. Offsets are whole
+/// pixels but the flex layout is fractional: the bar's left and width,
+/// the tip's width and the strip's width can each be half a pixel off,
+/// and the two halvings in `tip_shift` floor. Clamping into a strip inset
+/// by this much on both sides keeps that error inside the real strip.
+const TIP_EDGE: i32 = 3;
 
 #[component]
 pub fn Histogram(
@@ -37,8 +56,17 @@ pub fn Histogram(
         >,
     >,
 ) -> impl IntoView {
+    let strip = NodeRef::<leptos::html::Div>::new();
+    // Every bar moves when the strip changes width, including the one
+    // whose tip is on screen. The observer disconnects with the
+    // component through leptos-use.
+    let _ = leptos_use::use_resize_observer(strip, move |_, _| {
+        if let Some(strip) = strip.get_untracked() {
+            place_all_tips(&strip);
+        }
+    });
     view! {
-        <div class="histo">
+        <div class="histo" node_ref=strip>
             <Loaded
                 state=Signal::derive(move || LoadState::from_resource(rows.get()))
                 // Deliberate quiet-error override: the results table
@@ -61,6 +89,18 @@ pub fn Histogram(
                     let (x_start, x_mid, x_end) = axis_labels(&series);
                     let width = series.bucket_width();
                     let min = series.min_secs;
+                    // New buckets or labels replace every bar, and the
+                    // strip keeps its size, so the observer stays quiet.
+                    // Place the new tips once they are laid out. Nothing
+                    // cancels the frame, and switching tab or leaving the
+                    // page can dispose the strip before it runs; a
+                    // disposed ref reads as `None` and the frame does
+                    // nothing.
+                    request_animation_frame(move || {
+                        if let Some(strip) = strip.try_get_untracked().flatten() {
+                            place_all_tips(&strip);
+                        }
+                    });
                     view! {
                         <div class="yax">
                             <span>{max}</span>
@@ -80,7 +120,14 @@ pub fn Histogram(
                                     if b.err > 0 { format!(" · {} errors", b.err) } else { String::new() }
                                 );
                                 view! {
-                                    <div class="bar" tabindex="0" role="img" aria-label=tip>
+                                    <div
+                                        class="bar"
+                                        tabindex="0"
+                                        role="img"
+                                        aria-label=tip
+                                        on:mouseenter=move |ev| place_tip(&ev)
+                                        on:focus=move |ev| place_tip(&ev)
+                                    >
                                         <div class="tip" aria-hidden="true">{tip.clone()}</div>
                                         <div class="ok" style=format!("height:{ok_h:.1}%")></div>
                                         <div class="err" style=format!("height:{err_h:.1}%")></div>
@@ -98,6 +145,86 @@ pub fn Histogram(
             />
         </div>
     }
+}
+
+/// Measure the entered or focused bar's tip against the strip and set the
+/// tip's `--tip-shift`, which the stylesheet adds to its centring
+/// transform.
+///
+/// Measured at the moment it is shown rather than once at render: the
+/// strip's width follows the viewport and the tip's width its label.
+fn place_tip(ev: &web_sys::Event) {
+    let Some(bar) = ev
+        .current_target()
+        .and_then(|t| t.dyn_into::<HtmlElement>().ok())
+    else {
+        return;
+    };
+    let Some(strip) = bar.closest(".histo").ok().flatten() else {
+        return;
+    };
+    place_bar_tip(&bar, &strip);
+}
+
+/// Place every bar's tip in `strip`. Placing all of them, rather than
+/// looking for the one on screen, needs no guess about which tips hover
+/// and focus are showing (they can be two different bars), and it costs a
+/// few offset reads for each of 48 bars.
+fn place_all_tips(strip: &web_sys::Element) {
+    let Some(bars) = strip.query_selector(".bars").ok().flatten() else {
+        return;
+    };
+    let mut next = bars.first_element_child();
+    while let Some(bar) = next {
+        next = bar.next_element_sibling();
+        if let Ok(bar) = bar.dyn_into::<HtmlElement>() {
+            place_bar_tip(&bar, strip);
+        }
+    }
+}
+
+/// Measure one bar's tip against the strip and set its `--tip-shift`.
+fn place_bar_tip(bar: &HtmlElement, strip: &web_sys::Element) {
+    let Some(tip) = bar
+        .query_selector(".tip")
+        .ok()
+        .flatten()
+        .and_then(|t| t.dyn_into::<HtmlElement>().ok())
+    else {
+        return;
+    };
+    // `.histo` is the nearest positioned ancestor, so it is the bar's
+    // offsetParent and one `offset_left` is the bar's position in the
+    // strip. Walk the chain regardless, so a positioned wrapper added
+    // between them later still measures from the strip.
+    let mut bar_left = 0;
+    let mut node = bar.clone();
+    loop {
+        bar_left += node.offset_left();
+        match node.offset_parent() {
+            Some(parent) if parent == *strip => break,
+            Some(parent) => match parent.dyn_into::<HtmlElement>() {
+                Ok(parent) => node = parent,
+                Err(_) => return,
+            },
+            // Not laid out, or the strip is not an ancestor that
+            // positions it: nothing to measure against.
+            None => return,
+        }
+    }
+    // Bound the tip to the strip first, so a label longer than the strip
+    // wraps instead of overflowing. Reading `offset_width` after setting
+    // it forces layout, so the width measured below is the wrapped one.
+    let room = strip.client_width() - 2 * TIP_EDGE;
+    let style = tip.style();
+    let _ = style.set_property("--tip-max", &format!("{room}px"));
+    let shift = tip_shift(
+        bar_left - TIP_EDGE,
+        bar.offset_width(),
+        tip.offset_width(),
+        room,
+    );
+    let _ = style.set_property("--tip-shift", &format!("{shift}px"));
 }
 
 #[allow(clippy::cast_precision_loss)] // bucket index is at most N_BUCKETS

@@ -23,8 +23,9 @@
 
 use std::collections::HashSet;
 
+use crate::result_actions::passes_names_through;
 use trawl_api::value::{QueryResult, Value};
-use trawl_core::ast::{PipeStage, Spanned};
+use trawl_core::ast::{PipeStage, Spanned, StatsStage};
 use trawl_core::projection::agg_output_name;
 use trawl_core::schema::{TIME, catalog_key};
 
@@ -135,8 +136,11 @@ pub fn detect(query: &str, result: &QueryResult) -> Option<CatShape> {
 ///
 /// These are the only columns the exact table offers a search on: every
 /// other column is a generated metric, and a filter naming one would
-/// advertise a field the corpus has never held (ADR-0025, F02). Any
-/// pipeline whose last stage is not `stats` groups by nothing.
+/// advertise a field the corpus has never held (ADR-0025, F02). The
+/// grouping is the final `stats`, read past any trailing stages that only
+/// pass names through (a `sort -errors | head 10` ranking the groups); a
+/// pipeline with any other stage after it, or no `stats` at all, groups by
+/// nothing.
 ///
 /// Being grouped by is not enough on its own. A search prepends
 /// `<field>="<value>"` BEFORE the first pipe, so the name has to be one
@@ -151,17 +155,16 @@ pub fn group_columns(query: &str, columns: &[String]) -> Vec<usize> {
     let Ok(ast) = trawl_core::parser::parse(query) else {
         return Vec::new();
     };
-    let Some((last, earlier)) = ast.pipeline.split_last() else {
+    let Some((at, stats)) = final_stats(&ast.pipeline) else {
         return Vec::new();
     };
-    let PipeStage::Stats(stats) = &last.node else {
-        return Vec::new();
-    };
-    let Some(minted) = minted_before(earlier) else {
+    let Some(minted) = minted_before(&ast.pipeline[..at]) else {
         return Vec::new();
     };
     // `by HOST` groups the catalog's `host`, and the response names the
     // column as the catalog does, so both sides fold before they meet.
+    // A trailing `table` or `drop` may have removed a group column, so
+    // only the columns the response still carries are offered.
     columns
         .iter()
         .enumerate()
@@ -196,6 +199,11 @@ fn minted_before(stages: &[Spanned<PipeStage>]) -> Option<HashSet<String>> {
     }
     let mut minted = HashSet::new();
     for stage in stages {
+        // Filtering, ordering, projecting and deduplicating stages pass
+        // names through; none of them invents one.
+        if passes_names_through(&stage.node) {
+            continue;
+        }
         match &stage.node {
             PipeStage::Stats(s) => {
                 for agg in &s.aggregations {
@@ -228,31 +236,37 @@ fn minted_before(stages: &[Spanned<PipeStage>]) -> Option<HashSet<String>> {
                     mint(&mut minted, to);
                 }
             }
-            PipeStage::Extract(_) | PipeStage::Pivot(_) | PipeStage::FromSaved(_) => return None,
-            // Filtering, ordering, projecting and deduplicating stages
-            // pass names through; none of them invents one.
-            PipeStage::Where(_)
-            | PipeStage::Sort(_)
-            | PipeStage::Limit(_)
-            | PipeStage::Table(_)
-            | PipeStage::Drop(_)
-            | PipeStage::Dedup(_)
-            | PipeStage::Tail(_)
-            | PipeStage::Sample(_) => {}
+            // `extract`, `pivot` and `from saved` mint names only the data
+            // knows. Pass-through stages were skipped above, so this arm
+            // holds nothing else; it fails closed, so a stage nobody
+            // classified here can never vouch for a name.
+            _ => return None,
         }
     }
     Some(minted)
 }
 
-/// The query's last `stats` stage, if that is what it ends with.
+/// The query's final `stats` stage, if nothing after it changes what the
+/// columns mean.
 ///
-/// The LAST stage, because a later `sort` or `head` does not change what
-/// the columns mean but an earlier `stats` followed by another one does:
-/// only the final aggregation names the columns the response carries.
-fn last_stats(query: &str) -> Option<trawl_core::ast::StatsStage> {
+/// Trailing pass-through stages are skipped: a later `sort` or `head`
+/// does not change what the columns mean. Any other trailing stage does
+/// (a `let`, a `rename`, a non-`stats` aggregation), so such a query
+/// draws no chart. When a query runs `stats` more than once, only the
+/// last one counts: it names the columns the response carries.
+fn last_stats(query: &str) -> Option<StatsStage> {
     let ast = trawl_core::parser::parse(query).ok()?;
-    match &ast.pipeline.last()?.node {
-        PipeStage::Stats(stats) => Some(stats.clone()),
+    final_stats(&ast.pipeline).map(|(_, stats)| stats.clone())
+}
+
+/// The index and body of the last stage that is not pass-through, when
+/// that stage is a `stats`; `None` for any other pipeline.
+fn final_stats(pipeline: &[Spanned<PipeStage>]) -> Option<(usize, &StatsStage)> {
+    let at = pipeline
+        .iter()
+        .rposition(|stage| !passes_names_through(&stage.node))?;
+    match &pipeline[at].node {
+        PipeStage::Stats(stats) => Some((at, stats)),
         _ => None,
     }
 }
@@ -339,6 +353,9 @@ mod tests {
     use trawl_api::value::Column;
 
     const BY_STATUS: &str = "* | stats count() by status";
+    /// The "rank services by errors" quick-start query.
+    const RANKED: &str =
+        "_severity>=error | stats count() as errors by service | sort -errors | head 10";
 
     /// An empty answer only counts as a refusal when the query parsed:
     /// a syntax error withholds the same way and would prove nothing.
@@ -600,13 +617,53 @@ mod tests {
     }
 
     #[test]
-    fn detect_refuses_a_stats_that_is_not_the_last_stage() {
-        // A later stage renames or drops columns, so the grouping the
+    fn detect_charts_a_ranked_stats() {
+        // The quick-start "rank services by errors" query: ordering and
+        // truncating the groups leaves what each column means alone.
+        let shape = detect(
+            RANKED,
+            &result(
+                &["service", "errors"],
+                vec![
+                    vec![Value::String("api".into()), Value::Integer(40)],
+                    vec![Value::String("web".into()), Value::Integer(7)],
+                ],
+            ),
+        )
+        .expect("a trailing sort and head keep the grouped shape");
+        assert_eq!(shape.group, 0);
+        assert_eq!(shape.metric_name, "errors");
+    }
+
+    #[test]
+    fn detect_skips_trailing_pass_through_stages_but_not_minting_ones() {
+        let rows = || result(&["status", "count"], int_rows());
+        assert!(detect("* | stats count() by status | sort count", &rows()).is_some());
+        // A later `let` or `rename` mints a name, so the grouping the
         // response carries is no longer the one this stats named.
+        for q in [
+            "* | stats count() by status | let count = count * 2",
+            "* | stats count() by status | rename count as n",
+            "* | stats count() by status | sort count | rename status as code",
+        ] {
+            assert!(trawl_core::parser::parse(q).is_ok(), "{q}");
+            assert_eq!(detect(q, &rows()), None, "{q}");
+        }
+    }
+
+    #[test]
+    fn detect_refuses_when_a_trailing_projection_removes_the_group() {
+        // `table count` keeps one column: the response has no group to
+        // draw, whatever the stats named.
+        let q = "* | stats count() by status | table count";
+        assert!(trawl_core::parser::parse(q).is_ok());
         assert_eq!(
             detect(
-                "* | stats count() by status | sort count",
-                &result(&["status", "count"], int_rows()),
+                q,
+                &result(
+                    &["count"],
+                    vec![vec![Value::Integer(3)], vec![Value::Integer(1)]]
+                ),
             ),
             None
         );
@@ -701,6 +758,50 @@ mod tests {
             ),
             vec![0]
         );
+    }
+
+    #[test]
+    fn group_columns_survives_trailing_pass_through_stages() {
+        let columns = vec!["service".to_string(), "errors".to_string()];
+        assert_eq!(group_columns(RANKED, &columns), vec![0]);
+        assert_eq!(
+            group_columns(
+                "* | stats count() as errors by service | where errors > 1 | table service, errors",
+                &columns
+            ),
+            vec![0]
+        );
+        // Stages ahead of the final stats still feed provenance: `errors`
+        // is minted there, so a later group by it stays withheld.
+        assert!(withheld(
+            "* | stats count() as errors by service | stats count() by errors | sort -count",
+            &["errors".to_string(), "count".to_string()]
+        ));
+    }
+
+    #[test]
+    fn group_columns_is_empty_after_a_trailing_minting_stage() {
+        let columns = vec!["service".to_string(), "errors".to_string()];
+        for q in [
+            "* | stats count() as errors by service | let errors = errors * 2",
+            "* | stats count() as errors by service | rename service as svc",
+            "* | stats count() as errors by service | sort -errors | let x = 1 | head 10",
+            "* | stats count() by service | eventstats sum(count)",
+            "* | stats count() by service | stats count() by count",
+        ] {
+            assert!(withheld(q, &columns), "{q}");
+        }
+    }
+
+    #[test]
+    fn group_columns_offers_nothing_when_a_trailing_stage_removes_the_group() {
+        for (q, columns) in [
+            ("* | stats count() by service | table count", vec!["count"]),
+            ("* | stats count() by service | drop service", vec!["count"]),
+        ] {
+            let columns: Vec<String> = columns.into_iter().map(str::to_owned).collect();
+            assert!(withheld(q, &columns), "{q}");
+        }
     }
 
     #[test]

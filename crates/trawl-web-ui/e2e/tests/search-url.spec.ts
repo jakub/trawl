@@ -287,7 +287,7 @@ test('a malformed link disables every control that could run it', async ({ page,
   // Export: the one that used to post `{"query":""}`, which the server
   // reads as every row. Disabled, and the modal does not even open.
   await expect(page.locator(SEL.exportAction)).toBeDisabled();
-  await expect(page.locator(SEL.saveAction)).toBeDisabled();
+  await expect(page.locator(SEL.editorTool).filter({ hasText: COPY.saveAsNetTool })).toBeDisabled();
   await page.locator(SEL.exportAction).click({ force: true });
   await expect(page.locator(SEL.modalPanel)).toHaveCount(0);
 

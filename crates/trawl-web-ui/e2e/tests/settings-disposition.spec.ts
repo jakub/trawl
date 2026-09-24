@@ -141,10 +141,10 @@ async function prepareSave(page: Page, request: APIRequestContext, scenario = 's
   expect(new URL(page.url()).searchParams.get('q'), 'editing must leave the executed URL query unchanged').toBe('service=nginx');
 }
 
-function saveEntry(page: Page, entry: 'editor' | 'toolbar') {
-  return entry === 'editor'
-    ? page.locator(SEL.editorTool).filter({ hasText: /^Save as Net$/ })
-    : page.locator(SEL.saveAction);
+// The console's Save as Net is the Search page's one entry to the save
+// flow (ADR-0025, amended 2026-09-23).
+function saveTool(page: Page) {
+  return page.locator(SEL.editorTool).filter({ hasText: COPY.saveAsNetTool });
 }
 
 async function expectExactPreview(page: Page, expected = EDITOR_BUFFER) {
@@ -164,34 +164,33 @@ async function submitSave(page: Page, status = 200) {
   await response.finished();
 }
 
-for (const entry of ['editor', 'toolbar'] as const) {
-  test(`Save captures editor buffer: ${entry} preview and POST preserve exact text without filters or range`, async ({ page, request }) => {
-    await prepareSave(page, request);
-    await saveEntry(page, entry).click();
-    await expectExactPreview(page);
-    await expect(page.locator('.save-scope')).toHaveText([
-      'Save captures the editor query text shown above. It omits sidebar filters and the time range control.',
-      'To share the full browser search state, cancel and use Copy search URL beside the editor. Run any editor changes first.',
-    ]);
-    await page.getByLabel('Name', { exact: true }).fill('editor snapshot');
-    await submitSave(page);
-    await expect(page.locator(SEL.modalPanel)).toHaveCount(0);
-    expect(await capturedSavedRequests(request),
-      'Save snapshot POST must contain the exact editor buffer once').toEqual([
-      { name: 'editor snapshot', query: EDITOR_BUFFER },
-    ]);
-  });
-}
+// check-save-mutation.mjs finds this test by its title prefix.
+test('Save captures editor buffer: editor preview and POST preserve exact text without filters or range', async ({ page, request }) => {
+  await prepareSave(page, request);
+  await saveTool(page).click();
+  await expectExactPreview(page);
+  await expect(page.locator('.save-scope')).toHaveText([
+    'Save captures the editor query text shown above. It omits sidebar filters and the time range control.',
+    'To share the full browser search state, cancel and use Copy search URL beside the editor. Run any editor changes first.',
+  ]);
+  await page.getByLabel('Name', { exact: true }).fill('editor snapshot');
+  await submitSave(page);
+  await expect(page.locator(SEL.modalPanel)).toHaveCount(0);
+  expect(await capturedSavedRequests(request),
+    'Save snapshot POST must contain the exact editor buffer once').toEqual([
+    { name: 'editor snapshot', query: EDITOR_BUFFER },
+  ]);
+});
 
 test('Save cancel sends no POST and reopening captures the new buffer', async ({ page, request }) => {
   await prepareSave(page, request);
-  await saveEntry(page, 'editor').click();
+  await saveTool(page).click();
   await expectExactPreview(page);
   await page.getByRole('button', { name: 'Cancel', exact: true }).click();
   await expect(page.locator(SEL.modalPanel)).toHaveCount(0);
   const next = ' service=postgres | stats count()  ';
   await editBuffer(page, next);
-  await saveEntry(page, 'toolbar').click();
+  await saveTool(page).click();
   await expectExactPreview(page, next);
   await page.keyboard.press('Escape');
   await expect(page.locator(SEL.modalPanel)).toHaveCount(0);
@@ -212,7 +211,7 @@ async function changeReadableUrl(page: Page) {
 
 test('Save keeps one modal and its captured buffer through a readable URL change', async ({ page, request }) => {
   await prepareSave(page, request);
-  await saveEntry(page, 'editor').click();
+  await saveTool(page).click();
   await expectExactPreview(page);
   await page.getByLabel('Name', { exact: true }).fill('unchanged name');
   const originalModal = await page.locator(SEL.modalPanel).elementHandle();
@@ -231,7 +230,7 @@ test('Save keeps one modal and its captured buffer through a readable URL change
 
 test('Save retries an explicit POST failure with the original snapshot', async ({ page, request }) => {
   await prepareSave(page, request, 'saved-retry');
-  await saveEntry(page, 'toolbar').click();
+  await saveTool(page).click();
   await expectExactPreview(page);
   await page.getByLabel('Name', { exact: true }).fill('retry snapshot');
   await submitSave(page, 503);
@@ -248,20 +247,18 @@ test('Save retries an explicit POST failure with the original snapshot', async (
   ]);
 });
 
-test('Save controls refuse malformed URLs and an open Save closes without a POST', async ({ page, request }) => {
+test('Save as Net refuses malformed URLs and an open Save closes without a POST', async ({ page, request }) => {
   await prepareSave(page, request);
-  await saveEntry(page, 'editor').click();
+  await saveTool(page).click();
   await expectExactPreview(page);
   await page.evaluate(() => history.pushState({}, '', '/search?q=service%3Dnginx&f=v1.!'));
   await page.goBack();
   await page.goForward();
   await expect(page.locator(SEL.urlNotice)).toBeVisible();
   await expect(page.locator(SEL.modalPanel)).toHaveCount(0);
-  for (const entry of ['editor', 'toolbar'] as const) {
-    await expect(saveEntry(page, entry)).toBeDisabled();
-    await saveEntry(page, entry).click({ force: true });
-    await expect(page.locator(SEL.modalPanel)).toHaveCount(0);
-  }
+  await expect(saveTool(page)).toBeDisabled();
+  await saveTool(page).click({ force: true });
+  await expect(page.locator(SEL.modalPanel)).toHaveCount(0);
   await page.waitForTimeout(300);
   expect(await capturedSavedRequests(request)).toEqual([]);
 });

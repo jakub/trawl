@@ -6,10 +6,10 @@
 //!
 //! The JS side (crates/trawl-web-ui/vendor/src/codemirror.ts) exposes a
 //! single factory, `createEditor(parent, initial, opts)`, returning a
-//! handle with `destroy()` / `setDoc()`. Everything DSL-specific —
-//! diagnostics, autocomplete candidates — is fed through the `opts`
-//! callbacks so trawl-core remains the single source of truth for DSL
-//! semantics.
+//! handle with `destroy()` / `setDoc()` / `closeCompletion()`. Everything
+//! DSL-specific — diagnostics, autocomplete candidates — is fed through
+//! the `opts` callbacks so trawl-core remains the single source of truth
+//! for DSL semantics.
 
 use wasm_bindgen::prelude::*;
 
@@ -29,4 +29,7 @@ extern "C" {
 
     #[wasm_bindgen(method, js_name = setDoc)]
     pub fn set_doc(this: &EditorHandle, text: &str);
+
+    #[wasm_bindgen(method, js_name = closeCompletion)]
+    pub fn close_completion(this: &EditorHandle);
 }

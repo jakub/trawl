@@ -59,6 +59,7 @@ import {
   aggregateGroupedTimechartResponse,
   aggregatePivotResponse,
   aggregateStatsByResponse,
+  aggregateRankedResponse,
   unavailableRunResponse,
 } from './fixtures.mjs';
 
@@ -824,6 +825,10 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
         }
         if (dsl.includes('| pivot')) {
           sendJson(res, 200, aggregatePivotResponse(aggregate.groups, aggregate.total, offset, limit));
+          return;
+        }
+        if (dsl.includes('| stats count() as errors by service | sort -errors | head 10')) {
+          sendJson(res, 200, aggregateRankedResponse(dsl, offset, limit));
           return;
         }
         if (dsl.includes('| stats count() by')) {

@@ -11,7 +11,8 @@ for (const modifier of ['Control', 'Meta']) {
     await resetScenario(request, 'saved-success');
     await page.goto('/search');
     await expect(page.getByRole('textbox', { name: 'Search query', exact: true })).toBeVisible();
-    await page.locator(SEL.saveAction).click();
+    const saveTool = page.locator(SEL.editorTool).filter({ hasText: COPY.saveAsNetTool });
+    await saveTool.click();
     const dialog = page.getByRole('dialog', { name: 'Save query as Net', exact: true });
     await expect(dialog).toBeVisible();
     await expect(dialog.locator('.hint')).toHaveCount(0);
@@ -23,7 +24,7 @@ for (const modifier of ['Control', 'Meta']) {
     await page.keyboard.press(`${modifier}+Enter`);
     await expect(dialog).toHaveCount(0);
     expect(await capturedSavedRequests(request)).toHaveLength(1);
-    await expect(page.locator(SEL.saveAction)).toBeFocused();
+    await expect(saveTool).toBeFocused();
   });
 }
 
@@ -108,7 +109,7 @@ test('reduced motion stops actual overlays, toasts and live tail pulses', async 
   await page.goto('/search');
   await page.locator(SEL.editorTool).filter({ hasText: COPY.copyUrlTool }).click();
   await expect(page.locator('.toast').first()).toHaveCSS('animation-name', 'none');
-  await page.locator(SEL.saveAction).click();
+  await page.locator(SEL.editorTool).filter({ hasText: COPY.saveAsNetTool }).click();
   await expect(page.locator('.modal')).toHaveCSS('animation-name', 'none');
   await expect(page.locator('.modal-scrim')).toHaveCSS('animation-name', 'none');
   await page.keyboard.press('Escape');

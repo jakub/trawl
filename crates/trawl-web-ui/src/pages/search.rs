@@ -8,7 +8,7 @@
 //! `h1` → query console (header + draft state + `DslEditor` + date
 //! range + Haul + tools + the executed-scope strip)
 //! → tabs (Events / Visualization · trailing Truncated / Stop live /
-//!   Save / Export)
+//!   View / Export)
 //! → degraded-field notice (hidden unless the execution reported one)
 //! → tab body (Events: histogram + results table | Visualization: chart)
 //!   — or, on either tab, the query error notice when the server refused
@@ -1091,12 +1091,6 @@ pub fn Search() -> impl IntoView {
                                 />
                             </Show>
                         </div>
-                        <button
-                            type="button"
-                            class="action save"
-                            disabled=move || unreadable.get()
-                            on:click=move |_| on_save.run(())
-                        >"Save"</button>
                         <button
                             type="button"
                             class="action export"

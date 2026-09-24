@@ -12,7 +12,7 @@ Your key needs the `saved_query` permission.
 ## Save a query
 
 1. Build and run the query in Search.
-2. Select **Save as Net** in the console or **Save** in the results header. The dialog shows the editor text under **Query**.
+2. Select **Save as Net** in the console. The dialog shows the editor text under **Query**.
 3. Enter a **Name** that states the question, such as `Nginx errors by host`, and select **Save as Net**.
 4. Open **Nets** and select the net to inspect or change it.
 

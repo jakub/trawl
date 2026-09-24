@@ -163,8 +163,6 @@ export const SEL = {
   /// crates/trawl-web-ui/src/pages/search.rs — the tab strip's trailing
   /// Export action, which opens the export modal.
   exportAction: '.tabs .action.export',
-  /// crates/trawl-web-ui/src/pages/search.rs — its Save twin.
-  saveAction: '.tabs .action.save',
   /// crates/trawl-web-ui/src/components/save_as_net_modal.rs immutable query preview.
   savePreview: '.modal .preview',
   /// crates/fleet-ui/src/range_dialog.rs RangePanel —
@@ -223,7 +221,7 @@ export const SEL = {
   netAction: '.net-actions button',
   /// crates/fleet-ui/src/tabs.rs TabsStyle::Workspace — one tab of the
   /// workspace strip. Selecting on the ROLE, not `.t`, is the point: the
-  /// trailing Save/Export actions live in `.tabs` too and must not be
+  /// trailing View/Export actions live in `.tabs` too and must not be
   /// tabs.
   workspaceTab: '.tabs [role="tab"]',
   /// crates/fleet-ui/src/tabs.rs TabsStyle::Drawer — one tab of the

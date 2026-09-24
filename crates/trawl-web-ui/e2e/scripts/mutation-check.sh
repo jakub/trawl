@@ -255,7 +255,7 @@ JS
     rm -f "$health_report"
     if [[ $health_assertion -ne 0 ]]; then status=0; fi
   elif [[ $name == 26-save-editor-snapshot.patch ]]; then
-    # The shared callback must break both controls at the snapshot assertion.
+    # The Save callback must break the console control at the snapshot assertion.
     # Keep the JSON outside test-results, which Playwright cleans on each run.
     save_report="$E2E_DIR/save-mutation-report.json"
     (cd "$E2E_DIR" && npx playwright test --workers=1 "tests/$spec" --grep 'Save captures editor buffer:' --reporter=json) > "$save_report"

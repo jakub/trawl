@@ -18,6 +18,7 @@ import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
 import { linter, lintGutter, lintKeymap, Diagnostic } from "@codemirror/lint";
 import {
   autocompletion,
+  closeCompletion,
   CompletionContext,
   CompletionResult,
 } from "@codemirror/autocomplete";
@@ -36,6 +37,8 @@ export interface EditorOpts {
 export interface EditorHandle {
   destroy: () => void;
   setDoc: (text: string) => void;
+  /** Close the completion popup, if one is open. */
+  closeCompletion: () => void;
 }
 
 /** The accessible name of every lint gutter marker. The marker's DOM
@@ -131,20 +134,24 @@ export function createEditor(
         changes: { from: 0, to: view.state.doc.length, insert: text },
       });
     },
+    closeCompletion() {
+      closeCompletion(view);
+    },
   };
 }
 
 // Compile-time shape assertion — mirrors the `#[wasm_bindgen(module=...)]`
-// extern block in `crates/trawl-web-ui/src/interop/codemirror.rs`. If the
+// extern block in `crates/trawl-web-ui/src/interop/codemirror.rs`: the
+// `createEditor` factory, and through `EditorHandle` the `destroy`,
+// `setDoc` and `closeCompletion` methods the Rust side binds. If the
 // exported signature ever drifts (rename, added/removed parameter, return
-// type change), TypeScript rejects this file before `build.sh` finishes,
-// making the vendor-drift CI job fail loudly instead of shipping a runtime
-// `TypeError` to the browser.
+// type change), a TypeScript typecheck of this file rejects it.
 //
-// The runtime-side drift check (committed bundle byte diff) catches content
-// changes but NOT API changes — `createEditor` could be renamed and the
-// content check would just pass the new content. This static typecheck
-// covers that gap.
+// Nothing automated runs that typecheck: `build.sh` bundles with esbuild,
+// which strips types without checking them, so neither the build nor the
+// vendor-drift CI job (a byte diff of the committed bundle) enforces this
+// assertion. Keep it in step with the Rust extern by hand; it is where a
+// reader or an editor's language server sees the contract.
 const _apiShape: (
   parent: HTMLElement,
   initial: string,

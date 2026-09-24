@@ -837,7 +837,7 @@
  *  Tabs — base .tabs family moved to fleet-ui.css (issue #28,
  *  fleet_ui::Tabs emits it). The old .dr-pop .tabs popover reskin was
  *  retired in issue #31: that strip is fleet_ui::Segmented now.
- *  App-side: the strip's trailing slot carries the results Save/Export
+ *  App-side: the strip's trailing slot carries the results View/Export
  *  action links (moved from the meta strip).
  * ─────────────────────────────────────────────────────────────── */
 .tabs .action {
@@ -856,7 +856,7 @@
 .tabs .action.stop-live { color: var(--accent-ink); background: var(--accent-wash); }
 .tabs .action + .action { margin-left: 4px; }
 .tabs .action:hover { color: var(--ink); background: var(--panel-2); }
-/* The trailing Save/Export actions and the editor's tool row are real
+/* The trailing View/Export actions and the editor's tool row are real
  * <button>s so a link that cannot be read can disable them (ADR-0027);
  * these two rules put the text-link look back over the button chrome. */
 /* `color` is deliberately NOT reset here: it would outrank the --ink-2
@@ -1085,18 +1085,25 @@
   color: var(--ink-3);
   pointer-events: none;
 }
+/* Centred on its bar, then shifted sideways by the measured
+ * `--tip-shift` (components/histogram.rs) so an edge bar's tip stays
+ * inside the strip. `--tip-max` is the strip's inner width: a tip that
+ * fits keeps its one-line `max-content` width, and a longer one wraps
+ * to the strip. Anchored by `bottom`, so extra lines grow upward and
+ * the tip never covers the bars. */
 .histo .bar .tip {
   position: absolute;
   bottom: calc(100% + 2px);
   left: 50%;
-  transform: translateX(-50%);
+  transform: translateX(calc(-50% + var(--tip-shift, 0px)));
   background: var(--ink);
   color: var(--panel);
   font-family: var(--font-mono);
   font-size: var(--fs-micro);
   padding: 3px 6px;
   border-radius: var(--radius-sm);
-  white-space: nowrap;
+  width: max-content;
+  max-width: var(--tip-max, none);
   pointer-events: none;
   opacity: 0;
   transition: opacity 120ms;

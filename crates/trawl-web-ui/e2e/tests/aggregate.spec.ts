@@ -31,6 +31,11 @@ const WIDE_URL = '/search?q=' + encodeURIComponent('service=nginx | stats count(
 const AGG_URL = '/search?q=service%3Dnginx%20%7C%20stats%20count()%20by%20status';
 const GROUPS = 5;
 
+// The quick-start "Rank services by errors" answer under `aggregate`:
+// `RANKED_SERVICES` in harness/fixtures.mjs, five services, top first.
+const RANKED = 5;
+const TOP_SERVICE = 'api';
+
 test('an aggregate answers with an exact table and no expansion column', async ({ page, request }) => {
   await resetScenario(request, 'corpus');
   await page.goto(AGG_URL);
@@ -84,6 +89,37 @@ test('a group search adds one include filter to the link', async ({ page, reques
   await expect(page).toHaveURL(/stats/);
   await expect(page.locator(SEL.filterChip)).toHaveCount(1);
   await expect(page.locator(SEL.filterChip)).toContainText('status = 200');
+});
+
+test('the ranked quick-start result offers a group search on every service', async ({ page, request }) => {
+  // `stats … by service | sort -errors | head 10`: the trailing sort and
+  // head only order and cut the groups, so `service` still names the
+  // corpus field and every cell of it can be searched for.
+  await resetScenario(request, 'aggregate');
+  await page.goto('/search');
+  await page.getByRole('button', { name: 'Run Rank services by errors', exact: true }).click();
+
+  const table = page.locator(SEL.exactTable);
+  const rows = table.locator('tbody tr');
+  await expect(rows).toHaveCount(RANKED);
+  await expect(table.locator('thead th.sortable').nth(0)).toContainText('service');
+
+  // One control per `service` cell, none on the generated `errors`.
+  await expect(page.locator(SEL.groupSearch)).toHaveCount(RANKED);
+  await expect(table.locator('tbody tr td:nth-child(1) button')).toHaveCount(RANKED);
+  await expect(table.locator('tbody tr td:nth-child(2) button')).toHaveCount(0);
+  await expect(page.locator(SEL.groupSearch).first()).toHaveAccessibleName(`Search service = ${TOP_SERVICE}`);
+
+  await expect(page.locator(SEL.filterChip)).toHaveCount(0);
+  await page.locator(SEL.groupSearch).first().click();
+
+  // One search, one include filter; the ranked pipeline is untouched and
+  // the follow-up answers the one service it now selects.
+  await expect(page).toHaveURL(/[?&]f=v1\./);
+  await expect(page.locator(SEL.filterChip)).toHaveCount(1);
+  await expect(page.locator(SEL.filterChip)).toContainText(`service = ${TOP_SERVICE}`);
+  await expect(rows).toHaveCount(1);
+  await expect(rows.first().locator('td').first()).toContainText(TOP_SERVICE);
 });
 
 test('the categorical chart draws one bar per group beside the numbers', async ({ page, request }) => {

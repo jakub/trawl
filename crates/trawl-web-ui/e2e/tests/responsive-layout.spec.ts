@@ -3,7 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 import { test, expect, resetScenario } from '../fixtures';
-import { SEL } from '../selectors';
+import { COPY, SEL } from '../selectors';
 import type { Locator, Page } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
 
@@ -28,9 +28,11 @@ for (const width of [320, 720, 900, 1024, 1440]) {
     await page.goto('/search?q=service%3Dnginx');
     await expect(page.locator('.results-table tbody tr')).toHaveCount(8);
     await noPageOverflow(page);
-    for (const selector of ['.topbar .jump', '.topbar .user', '.dsl-editor', '.run', '.tabs .save', '.tabs .export']) {
+    for (const selector of ['.topbar .jump', '.topbar .user', '.dsl-editor', '.run', '.tabs .export']) {
       await insideViewport(page.locator(selector));
     }
+    // The console's Save as Net is the one save entry on this page.
+    await insideViewport(page.locator(SEL.editorTool).filter({ hasText: COPY.saveAsNetTool }));
     if (width >= 900) {
       for (const link of await page.locator(SEL.paletteRailLink).all()) await insideViewport(link);
       for (const control of await page.locator('nav.rail .bot a, nav.rail .bot button').all()) {

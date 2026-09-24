@@ -462,6 +462,30 @@ export function aggregatePivotResponse(groups, total, offset, limit) {
   );
 }
 
+/** The ranked services the quick-start "Rank services by errors" query
+ * answers, already in its `sort -errors` order. */
+export const RANKED_SERVICES = [
+  ['api', 412],
+  ['checkout', 208],
+  ['web', 97],
+  ['auth', 31],
+  ['worker', 4],
+];
+
+/** `POST /api/v1/query` under `aggregate` for the ranked
+ * `stats count() as errors by service | sort -errors | head 10`
+ * pipeline: `service, errors`, descending, never more than the ten rows
+ * its `head` keeps. A group search prepends `service="<name>"` ahead of
+ * the first pipe, and that follow-up answers the one matching row. */
+export function aggregateRankedResponse(dsl, offset, limit) {
+  const only = /(?:^|\s)service\s*=\s*"([^"]*)"/.exec(dsl.split('|')[0])?.[1];
+  const rows = RANKED_SERVICES
+    .filter(([service]) => only === undefined || service === only)
+    .slice(0, 10)
+    .map(([service, errors]) => [service, errors]);
+  return aggregateBody([{ name: 'service' }, { name: 'errors' }], rows, null, offset, limit);
+}
+
 /** `POST /api/v1/query` under `aggregate` for a `| stats count() by`
  * pipeline: `groups` rows of `status, count`, sliced the same way. */
 export function aggregateStatsByResponse(groups, total, offset, limit) {
