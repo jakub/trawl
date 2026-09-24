@@ -231,19 +231,20 @@ struct LedgerState {
 
 impl LedgerState {
     /// The sole hysteresis evaluator, run under the mutex after every
-    /// charge, release and refusal.
+    /// charge and release (never after a refusal).
     ///
-    /// Any state returns to `Open` only below [`PRESSURE_EXIT`] of BOTH
-    /// caps. `Open` enters `Pressure` at [`PRESSURE_ENTER`] of EITHER cap.
-    /// `Refusing` is set only by a refusal and leaves only through the
-    /// exit, so it never decays to `Pressure`. An empty ledger is always
-    /// `Open`, whatever the caps.
-    fn settle(&mut self, caps: Charge) {
+    /// Any state returns to `Open` only on a release (`released`) that
+    /// leaves the ledger below [`PRESSURE_EXIT`] of BOTH caps. `Open` enters
+    /// `Pressure` at [`PRESSURE_ENTER`] of EITHER cap. `Refusing` is set only
+    /// by a refusal and leaves only through the exit, so it never decays to
+    /// `Pressure`, and a refusal latches it whatever the occupancy: only a
+    /// later drain or dropped reservation can clear it.
+    fn settle(&mut self, caps: Charge, released: bool) {
         let c = self.charged;
         let exit = c.is_zero()
             || (below(c.events, caps.events, PRESSURE_EXIT)
                 && below(c.bytes, caps.bytes, PRESSURE_EXIT));
-        if exit {
+        if released && exit {
             self.admission = AdmissionState::Open;
         } else if self.admission == AdmissionState::Open
             && (at_or_above(c.events, caps.events, PRESSURE_ENTER)
@@ -309,16 +310,18 @@ impl Ledger {
     }
 
     /// Settle and mirror. Call with the mutex held.
-    fn publish(&self, state: &mut LedgerState) {
-        state.settle(self.caps);
+    fn publish(&self, state: &mut LedgerState, released: bool) {
+        state.settle(self.caps, released);
         self.mirror
             .store(state.admission.as_u8(), Ordering::Release);
     }
 
-    /// Latch `Refusing` for a lack-of-space refusal. Call with the mutex held.
+    /// Latch `Refusing` for a lack-of-space refusal, without settling.
+    /// Call with the mutex held.
     fn refuse(&self, state: &mut LedgerState) {
         state.admission = AdmissionState::Refusing;
-        self.publish(state);
+        self.mirror
+            .store(state.admission.as_u8(), Ordering::Release);
     }
 
     fn reserve(
@@ -345,7 +348,7 @@ impl Ledger {
                 .filter(|total| total.fits(ceiling))
             {
                 state.charged = total;
-                self.publish(&mut state);
+                self.publish(&mut state, false);
                 true
             } else {
                 self.refuse(&mut state);
@@ -403,9 +406,31 @@ impl Ledger {
                 state.charged
             );
             state.charged = state.charged.saturating_sub(charge);
-            self.publish(&mut state);
+            self.publish(&mut state, true);
         }
         advance(&self.released);
+    }
+
+    /// Replace `held` with `actual` in the charged total, for an insert
+    /// whose reservation does not match its batch (a caller bug, caught by
+    /// `debug_assert` in debug builds). The ledger then charges exactly
+    /// what becomes resident, keeping `charged == reserved + resident`. A
+    /// shortfall is charged without a capacity check: the batch is already
+    /// durable and must be accounted. Returns `actual`, the resident charge.
+    fn reconcile(&self, held: Charge, actual: Charge) -> Charge {
+        if held == actual {
+            return actual;
+        }
+        let gave_back = actual.events < held.events || actual.bytes < held.bytes;
+        {
+            let mut state = self.state.lock();
+            state.charged = state.charged.saturating_sub(held).saturating_add(actual);
+            self.publish(&mut state, gave_back);
+        }
+        if gave_back {
+            advance(&self.released);
+        }
+        actual
     }
 
     /// Charge without a capacity check, for [`HotBuffer::insert_evicting`]
@@ -413,7 +438,7 @@ impl Ledger {
     fn charge_unchecked(&self, charge: Charge) {
         let mut state = self.state.lock();
         state.charged = state.charged.saturating_add(charge);
-        self.publish(&mut state);
+        self.publish(&mut state, false);
     }
 
     fn charged(&self) -> Charge {
@@ -708,17 +733,26 @@ impl HotBuffer {
     /// `(events.len(), byte_size)`, and the batch id must not already be
     /// resident. A duplicate id keeps the existing resident and releases
     /// the new reservation, so a resident is never silently replaced.
+    ///
+    /// # Panics
+    ///
+    /// If the reservation was not taken from this buffer (or is unmetered):
+    /// its charge lives in another ledger, and no local repair keeps both
+    /// ledgers exact. A charge that differs from the batch is a debug
+    /// assertion; release builds reconcile the ledger to the batch's actual
+    /// charge.
     pub fn insert(&self, mut reservation: Reservation, batch: Arc<IngestBatch>) {
-        debug_assert!(
+        assert!(
             reservation.is_for(&self.ledger),
             "hot-buffer insert with a reservation from another ledger"
         );
+        let actual = Charge {
+            events: batch.events.len(),
+            bytes: batch.byte_size,
+        };
         debug_assert_eq!(
             reservation.charge(),
-            Charge {
-                events: batch.events.len(),
-                bytes: batch.byte_size,
-            },
+            actual,
             "hot-buffer insert whose reservation does not match the batch"
         );
         let inserted = {
@@ -733,9 +767,11 @@ impl HotBuffer {
                         .fetch_add(batch.events.len(), Ordering::Relaxed);
                     self.total_bytes
                         .fetch_add(batch.byte_size, Ordering::Relaxed);
+                    // Map lock, then ledger lock (inside `reconcile`).
+                    let charge = self.ledger.reconcile(reservation.convert(), actual);
                     slot.insert(Resident {
                         batch,
-                        charge: reservation.convert(),
+                        charge,
                         inserted: Instant::now(),
                     });
                     true
@@ -1768,9 +1804,11 @@ mod tests {
             (L(10, 0), Open, "low occupancy"),
             (
                 RefuseHttp(90),
-                Open,
-                "a refusal already below the exit settles straight back to open",
+                Refusing,
+                "a full refusal latches even below the exit threshold",
             ),
+            (L(11, 0), Refusing, "a charge never clears refusing"),
+            (L(10, 0), Open, "the next release below the exit clears it"),
         ];
         let buf = ledger_buffer(100, 1_000);
         let mut level = Level {
@@ -2105,5 +2143,65 @@ mod tests {
             (0, 0, 0)
         );
         assert_eq!(buf.admission_state(), AdmissionState::Open);
+    }
+
+    #[test]
+    #[should_panic(expected = "reservation from another ledger")]
+    fn insert_refuses_a_reservation_from_another_ledger() {
+        let ours = ledger_buffer(100, 1_000);
+        let theirs = ledger_buffer(100, 1_000);
+        let foreign = theirs.reserve(Http, charge(1, 1)).unwrap();
+        ours.insert(foreign, batch_of("prod/foreign", charge(1, 1)));
+    }
+
+    #[test]
+    #[should_panic(expected = "reservation from another ledger")]
+    fn insert_refuses_an_unmetered_reservation() {
+        let buf = ledger_buffer(100, 1_000);
+        buf.insert(
+            Reservation::unmetered(charge(1, 1)),
+            batch_of("prod/unmetered", charge(1, 1)),
+        );
+    }
+
+    #[test]
+    fn reconcile_charges_exactly_the_resident_batch() {
+        let buf = ledger_buffer(100, 1_000);
+        let ledger = &buf.ledger;
+        let _other = buf.reserve(Syslog, charge(5, 50)).unwrap();
+        let mut held = buf.reserve(Http, charge(10, 100)).unwrap();
+        let mut released = buf.subscribe_released();
+        released.borrow_and_update();
+
+        // Matching charge: nothing moves.
+        assert_eq!(
+            ledger.reconcile(charge(10, 100), charge(10, 100)),
+            charge(10, 100)
+        );
+        assert_eq!(buf.charged(), charge(15, 150));
+        assert!(!released.has_changed().unwrap());
+
+        // Mismatch on both sides: fewer events, more bytes than reserved.
+        let resident = ledger.reconcile(held.convert(), charge(7, 120));
+        assert_eq!(resident, charge(7, 120));
+        assert_eq!(
+            buf.charged(),
+            charge(12, 170),
+            "charged == other reservation + actual resident charge"
+        );
+        assert!(
+            released.has_changed().unwrap(),
+            "the event shortfall is released"
+        );
+        drop(held);
+        assert_eq!(
+            buf.charged(),
+            charge(12, 170),
+            "a converted reservation releases nothing"
+        );
+
+        // Releasing the resident charge brings the ledger back exactly.
+        ledger.release(resident);
+        assert_eq!(buf.charged(), charge(5, 50));
     }
 }
