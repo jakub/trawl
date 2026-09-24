@@ -203,10 +203,15 @@ pub fn NetDrawer(
         run_in_flight.set(true);
         spawn_local(async move {
             let outcome = api::trigger_run(id).await;
-            if alive.try_get_value() != Some(true) {
-                return;
+            // The drawer may have closed while the request was out. The
+            // server claimed (or refused) the run regardless, and the
+            // Shell's bus outlives the drawer, so the toast still reports
+            // it; only the drawer's own state waits on `alive`, and the
+            // page's refresh stands in for the drawer's.
+            let open = alive.try_get_value() == Some(true);
+            if open {
+                run_in_flight.set(false);
             }
-            run_in_flight.set(false);
             match outcome {
                 Ok(run) => {
                     bus.push_with_link(
@@ -215,7 +220,11 @@ pub fn NetDrawer(
                         Some(current.name),
                         ToastLink::new(format!("/jobs/runs?run={}&net={id}", run.id), VIEW_RUN),
                     );
-                    on_refresh.run(());
+                    if open {
+                        on_refresh.run(());
+                    } else {
+                        parent_refresh.run(());
+                    }
                 }
                 Err(e) => {
                     bus.push(ToastKind::Error, RUN_NOT_STARTED, Some(e.to_string()));

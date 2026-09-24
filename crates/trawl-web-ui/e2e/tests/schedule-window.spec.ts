@@ -268,6 +268,31 @@ test('Run now in the drawer is disabled while its request is in flight', async (
   expect(await capturedRunRequests(request)).toEqual([SCHEDULE.windowedNetId]);
 });
 
+test('Run now from the drawer still reports when the drawer closed mid-request', async ({ page, request }) => {
+  await resetScenario(request, 'schedule');
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  await page.route(`**/api/v1/saved/${SCHEDULE.windowedNetId}/run`, async (route) => {
+    await held;
+    await route.continue();
+  });
+
+  await page.goto(`/jobs/nets?net=${SCHEDULE.windowedNetId}&ntab=query`);
+  await page
+    .locator(SEL.drawerPanel)
+    .getByRole('button', { name: COPY.netRunNow, exact: true })
+    .click();
+  await page.locator(`${SEL.drawerPanel} ${SEL.drawerClose}`).click();
+  await expect(page.locator(SEL.drawerPanel)).toHaveCount(0);
+
+  // The server claimed the run whether or not the drawer is still open.
+  release();
+  await expect(page.locator(SEL.toastSuccess).locator('.title')).toHaveText(
+    nameFrom(COPY.runStartedToast, '09:55', '11:15'),
+  );
+  expect(await capturedRunRequests(request)).toEqual([SCHEDULE.windowedNetId]);
+});
+
 test('Run now of a query-mode schedule claims no window', async ({ page, request }) => {
   await resetScenario(request, 'schedule');
   await page.goto('/jobs/nets');
