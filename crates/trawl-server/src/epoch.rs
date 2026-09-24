@@ -465,7 +465,9 @@ pub(crate) fn mount_root(dir: &Path) -> std::io::Result<Option<bool>> {
             .stx_attributes_mask
             .contains(StatxAttributes::MOUNT_ROOT)
             .then(|| st.stx_attributes.contains(StatxAttributes::MOUNT_ROOT))),
-        Err(rustix::io::Errno::NOSYS) => Ok(None),
+        // ENOSYS: no statx. EPERM: a seccomp profile blocks statx. Either
+        // way the boundary is unknown and the walk falls back to `/`.
+        Err(rustix::io::Errno::NOSYS | rustix::io::Errno::PERM) => Ok(None),
         Err(e) => Err(e.into()),
     }
 }
