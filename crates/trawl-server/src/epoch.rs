@@ -279,22 +279,47 @@ pub(crate) fn publish_marker_staged(dir: &Path, name: &str, body: &str) -> Resul
 /// on disk before its output is renamed into place, so the caller has to
 /// learn that the rename entry may not survive a crash. The marker stays
 /// visible after such a failure; recovery treats it like any other marker.
+///
+/// The staged name is predictable, so this writer never opens it by path:
+/// it removes any leftover entry (a crashed earlier attempt, or a planted
+/// symlink), creates the file exclusively, and writes and fsyncs that one
+/// handle. A symlink planted between the removal and the create makes the
+/// create fail instead of redirecting the write.
 pub(crate) fn publish_marker_durable(dir: &Path, name: &str, body: &str) -> Result<(), String> {
-    stage_and_rename(dir, name, body)?;
+    let staged = staged_path(dir, name);
+    match std::fs::remove_file(&staged) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("failed to remove stale {}: {e}", staged.display())),
+    }
+    let mut file = std::fs::File::create_new(&staged)
+        .map_err(|e| format!("failed to create {}: {e}", staged.display()))?;
+    file.write_all(body.as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(|e| format!("failed to write and fsync {}: {e}", staged.display()))?;
+    drop(file);
+    let marker = dir.join(name);
+    std::fs::rename(&staged, &marker)
+        .map_err(|e| format!("failed to publish {}: {e}", marker.display()))?;
     fsync_dir(dir).map_err(|e| format!("failed to fsync directory {}: {e}", dir.display()))
+}
+
+/// The PID-unique staged name a marker is written under before its rename.
+fn staged_path(dir: &Path, name: &str) -> std::path::PathBuf {
+    // A hidden marker's staged file must not share its discovery prefix.
+    // In particular, rollup recovery recognizes `.rollup-*`; it must never
+    // read a partially written `..rollup-*.next.<pid>` as a complete marker.
+    let prefix = if name.starts_with('.') { "." } else { "" };
+    dir.join(format!(
+        "{prefix}{name}{NEXT_SUFFIX}.{}",
+        std::process::id()
+    ))
 }
 
 /// Staged temp name, write, fsync, atomic rename. The caller owns the
 /// directory fsync that makes the rename durable.
 fn stage_and_rename(dir: &Path, name: &str, body: &str) -> Result<(), String> {
-    // A hidden marker's staged file must not share its discovery prefix.
-    // In particular, rollup recovery recognizes `.rollup-*`; it must never
-    // read a partially written `..rollup-*.next.<pid>` as a complete marker.
-    let prefix = if name.starts_with('.') { "." } else { "" };
-    let staged = dir.join(format!(
-        "{prefix}{name}{NEXT_SUFFIX}.{}",
-        std::process::id()
-    ));
+    let staged = staged_path(dir, name);
     std::fs::write(&staged, body)
         .map_err(|e| format!("failed to write {}: {e}", staged.display()))?;
     std::fs::File::open(&staged)
@@ -763,6 +788,42 @@ mod tests {
             );
             assert!(!data.join("EPOCH").is_file());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_marker_writer_does_not_follow_a_planted_staged_symlink() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("dir");
+        std::fs::create_dir(&dir).unwrap();
+        let sentinel = tmp.path().join("sentinel");
+        std::fs::write(&sentinel, b"keep me").unwrap();
+        let staged = staged_path(&dir, ".marker");
+        symlink(&sentinel, &staged).unwrap();
+
+        publish_marker_durable(&dir, ".marker", "body").unwrap();
+
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep me");
+        let marker = dir.join(".marker");
+        assert!(std::fs::symlink_metadata(&marker).unwrap().is_file());
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "body");
+        assert!(
+            std::fs::symlink_metadata(&staged).is_err(),
+            "staged name consumed"
+        );
+    }
+
+    #[test]
+    fn durable_marker_writer_replaces_a_stale_staged_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::write(staged_path(dir, ".marker"), "a much longer stale body").unwrap();
+        publish_marker_durable(dir, ".marker", "body").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".marker")).unwrap(),
+            "body"
+        );
     }
 
     #[test]
