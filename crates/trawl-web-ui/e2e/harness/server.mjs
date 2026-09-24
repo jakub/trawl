@@ -1063,8 +1063,17 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
           run.query = net.query;
           for (const key of ['window_start', 'window_end', 'window_truncated', 'window_kind']) delete run[key];
         } else if (net.schedule.window !== 'since_last') {
+          // A fixed span trails the claim instant less the net's lag,
+          // [t - lag - span, t - lag), as trawld's `plan_manual_run`
+          // resolves it; the fixture's `started_at` is that `t`.
+          const unitSecs = { s: 1, m: 60, h: 3600, d: 86400, w: 604800 };
+          const [, count, unit] = net.schedule.window.match(/^(\d+)([smhdw])$/);
+          const spanMs = Number(count) * unitSecs[unit] * 1000;
+          const end = Date.parse(run.started_at) - (net.schedule.lag_secs ?? 0) * 1000;
+          const bound = (ms) => new Date(ms).toISOString().replace(/\.(\d{3})Z$/, '.$1000Z');
           run.window_kind = 'fixed';
-          run.window_start = '2026-09-01T11:00:00.000000Z';
+          run.window_start = bound(end - spanMs);
+          run.window_end = bound(end);
           run.query = `earliest="${run.window_start}" latest="${run.window_end}" ${net.query}`;
         }
         startedRuns.unshift({ savedId, run });

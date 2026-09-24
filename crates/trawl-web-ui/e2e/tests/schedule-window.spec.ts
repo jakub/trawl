@@ -236,9 +236,10 @@ test('Run now in a row is disabled while its request is in flight', async ({ pag
 
   release();
   await expect(action).toBeEnabled();
-  // A fixed span reads the span ending now.
+  // A fixed span reads the span ending at the claim instant less the
+  // net's lag: 15m before the 11:20 claim, with no lag.
   await expect(page.locator(SEL.toastSuccess).locator('.title')).toHaveText(
-    nameFrom(COPY.runStartedToast, '11:00', '11:15'),
+    nameFrom(COPY.runStartedToast, '11:05', '11:20'),
   );
   expect(await capturedRunRequests(request)).toEqual([SCHEDULE.fixedNetId]);
 });
