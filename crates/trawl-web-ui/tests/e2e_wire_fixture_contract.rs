@@ -356,6 +356,25 @@ fn the_corpus_service_schema_marks_one_column_degraded() {
     let case: CatalogFieldResponse = decode("catalog-field.json", CATALOG_FIELD);
     assert_eq!(case.name, svc.degraded_fields[0]);
 
+    // `_time`'s sample is what the server writes for compaction's
+    // non-UTC microsecond column (issue 238): fixed-width, six fraction
+    // digits, no `Z`. `field-presentation.spec.ts` reads these back.
+    for schema in [&corpus, &populated] {
+        let time = schema.services[0]
+            .columns
+            .iter()
+            .find(|c| c.name == "_time")
+            .expect("_time column");
+        assert_eq!(
+            time.min_value.as_deref(),
+            Some("2026-09-01T00:00:00.000000")
+        );
+        assert_eq!(
+            time.max_value.as_deref(),
+            Some("2026-09-01T23:59:59.999999")
+        );
+    }
+
     // The split is the point: `populated` stays undegraded, so a spec
     // that wants a badge has to say `corpus` and means it.
     assert!(populated.services[0].degraded_fields.is_empty());

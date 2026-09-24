@@ -1217,6 +1217,24 @@ const CONTRACTS: &[Contract] = &[
         source: SERVICE_DRAWER_RS,
         hook: "\"sf-row\"",
     },
+    Contract {
+        assignment: "serviceFieldSample: '.c-sample',",
+        source_path: "src/components/service_drawer.rs",
+        source: SERVICE_DRAWER_RS,
+        hook: "class=\"c-sample\"",
+    },
+    Contract {
+        assignment: "serviceFieldStat: '.sf-detail .sfd-kv',",
+        source_path: "src/components/service_drawer.rs",
+        source: SERVICE_DRAWER_RS,
+        hook: "class=\"sfd-kv\"",
+    },
+    Contract {
+        assignment: "serviceFieldStat: '.sf-detail .sfd-kv',",
+        source_path: "src/components/service_drawer.rs",
+        source: SERVICE_DRAWER_RS,
+        hook: "class=\"sf-detail\"",
+    },
     // The service drawer's field row uses the shared `rowStretch`
     // selector, so its own control is pinned here rather than under a
     // second name.

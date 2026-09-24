@@ -18,7 +18,7 @@
 // has seven, event 3 has three.
 
 import fs from 'node:fs';
-import { test, expect } from '../fixtures';
+import { test, expect, resetScenario, CORPUS } from '../fixtures';
 import { SEL } from '../selectors';
 import type { Locator, Page } from '@playwright/test';
 
@@ -183,4 +183,24 @@ test('the inspector folds null fields and keeps the choice across events', async
   await page.locator(SEL.resultsExpandControl).nth(1).click();
   await expect(inspector).toContainText('Event 2');
   await expect(toggle).toHaveText(nullLabel(true, NULLS[1]));
+});
+
+// Schema samples come from the parquet footers, and the server renders a
+// timestamp column's bounds as text by the file's logical type. Compaction
+// writes `_time` as non-UTC microseconds, so the text is fixed-width with
+// six fraction digits and no `Z`, never the raw epoch-microsecond integer.
+test('the schema Fields pane shows _time bounds as formatted times', async ({ page, request }) => {
+  const min = '2026-09-01T00:00:00.000000';
+  const max = '2026-09-01T23:59:59.999999';
+  await resetScenario(request, 'corpus');
+  await page.goto(`/search/schema?svc=${CORPUS.service}&stab=fields`);
+
+  const row = page.locator(SEL.serviceFieldRow).filter({ hasText: '_time' });
+  await expect(row).toHaveCount(1);
+  await expect(row.locator(SEL.serviceFieldSample)).toHaveText(`${min} … ${max}`);
+
+  await row.locator(SEL.rowStretch).click();
+  const range = page.locator(SEL.serviceFieldStat).filter({ hasText: 'Range' });
+  await expect(range).toHaveText(`Range${min} → ${max}`);
+  await expect(range).not.toContainText(/\b\d{16}\b/);
 });

@@ -313,6 +313,12 @@ export const SEL = {
   /// crates/trawl-web-ui/src/components/service_drawer.rs — one field
   /// row of the Fields pane.
   serviceFieldRow: '.sd-fields .sf-row',
+  /// That row's Sample cell: the column's min … max from the parquet
+  /// footers, as the server renders them. Row-relative.
+  serviceFieldSample: '.c-sample',
+  /// One labelled stat in an open field row's detail (Cardinality,
+  /// Non-null, Storage, Range). Told apart by its label text.
+  serviceFieldStat: '.sf-detail .sfd-kv',
   /// The degraded badge nested above that row's control, which opens
   /// the field's case file instead of expanding the row. Row-relative;
   /// the row's own control is `rowStretch`.
