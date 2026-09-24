@@ -1,4 +1,4 @@
-== issue #241 negative leg at 47173ff5758e136bd22fa7d6c70e495983e48526
+== issue #241 negative leg at f9da38f6e4ad57634710d7d5d281e914943bd87d
 
 == leg 1: footer session gate removed
 diff --git i/crates/trawl-web-ui/src/pages/layout.rs w/crates/trawl-web-ui/src/pages/layout.rs
