@@ -8,7 +8,7 @@
 //! converts those files to parquet. [`WalWriter::write`] carries the
 //! durability sequence and the reason for each step.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -25,6 +25,10 @@ pub enum WalWriteError {
     /// No file from this write remains under a `.ndjson` name. The write
     /// failed before its rename, or its directory fsync failed and the file
     /// was withdrawn. Writing the same events again cannot duplicate them.
+    ///
+    /// A withdrawal is followed by another directory fsync that makes the
+    /// unlink durable. If that fsync fails too, it is logged and counted,
+    /// and a power loss may bring the name back for compaction to merge.
     #[error("{0}")]
     NotPublished(#[source] std::io::Error),
     /// The directory fsync failed after the rename, and removing the file
@@ -55,19 +59,48 @@ impl From<std::io::Error> for WalWriteError {
     }
 }
 
+/// A directory's `(device, inode)`, which tells a recreated directory apart
+/// from the one whose entry was synced.
+type DirIdentity = (u64, u64);
+
+/// The process-wide order in which WAL files were acknowledged, for tests
+/// that check write order. Filename millis tie within a millisecond, and
+/// tmpfs mtimes tie on its coarse clock.
+#[cfg(test)]
+static ACK_ORDER: std::sync::LazyLock<Mutex<HashMap<PathBuf, u64>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// The position of `path` in the process-wide acknowledgement order, or
+/// `None` if no [`WalWriter`] acknowledged it.
+#[cfg(test)]
+pub(crate) fn ack_sequence_for_test(path: &Path) -> Option<u64> {
+    ACK_ORDER.lock().get(path).copied()
+}
+
 /// Atomic WAL file writer for ingest events.
 #[derive(Debug)]
 pub struct WalWriter {
     wal_dir: PathBuf,
-    /// Environments whose directory entry this process has made durable
-    /// in `wal_dir`. An env is added only after the root fsync succeeds,
-    /// so two racing first writers both sync and neither skips the barrier.
-    /// A directory recreated after removal is synced again regardless.
-    durable_envs: Mutex<HashSet<String>>,
+    /// Environment directories whose entry in `wal_dir` this process has
+    /// made durable, keyed by env and holding that directory's identity.
+    /// An env is recorded only after the root fsync succeeds, so racing
+    /// first writers both sync. A writer that creates the directory clears
+    /// the record under this lock before anyone else can see the new
+    /// directory, and a writer that finds a directory whose identity is not
+    /// the recorded one syncs the root itself.
+    durable_envs: Mutex<HashMap<String, DirIdentity>>,
     #[cfg(any(test, feature = "test-support"))]
-    fail_next_directory_sync: std::sync::atomic::AtomicBool,
+    failing_directory_syncs: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     fail_next_withdraw: std::sync::atomic::AtomicBool,
+    /// Every directory this writer tried to fsync, in call order.
+    #[cfg(test)]
+    synced_dirs: Mutex<Vec<PathBuf>>,
+    /// Parks the next write that creates an env directory, after the
+    /// creation and before its root sync: the write waits on the barrier
+    /// once to say it is parked and once more to resume.
+    #[cfg(test)]
+    pause_after_create: Mutex<Option<std::sync::Arc<std::sync::Barrier>>>,
     #[cfg(test)]
     panic_after_writes: std::sync::atomic::AtomicUsize,
 }
@@ -76,11 +109,15 @@ impl WalWriter {
     pub fn new(wal_dir: PathBuf) -> Self {
         Self {
             wal_dir,
-            durable_envs: Mutex::new(HashSet::new()),
+            durable_envs: Mutex::new(HashMap::new()),
             #[cfg(any(test, feature = "test-support"))]
-            fail_next_directory_sync: std::sync::atomic::AtomicBool::new(false),
+            failing_directory_syncs: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             fail_next_withdraw: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            synced_dirs: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            pause_after_create: Mutex::new(None),
             #[cfg(test)]
             panic_after_writes: std::sync::atomic::AtomicUsize::new(usize::MAX),
         }
@@ -109,9 +146,10 @@ impl WalWriter {
     /// file is withdrawn (unlinked) before the error returns, so a caller
     /// that retries cannot duplicate the batch. If the withdrawal fails too,
     /// [`WalWriteError::LeftVisible`] says so. The first write into an
-    /// environment in this process also fsyncs `wal_dir`, which holds the
-    /// env directory's own entry, and fails before writing anything if
-    /// that sync fails.
+    /// environment directory in this process, including one recreated
+    /// after removal, also fsyncs `wal_dir`, which holds the env
+    /// directory's own entry, and fails before writing anything if that
+    /// sync fails.
     ///
     /// Files land in `wal_dir/{env}/` (lazily created), named
     /// `{service}_{unix_millis}_{4_hex}.ndjson` with the service name
@@ -136,17 +174,31 @@ impl WalWriter {
         // file's data. The rename has already made the file visible to
         // compaction, so a failed sync withdraws it before rejecting the
         // write: an unacknowledged batch must not be merged, or the
-        // sender's retry would duplicate it.
+        // sender's retry would duplicate it. The unlink is synced in turn;
+        // until that sync succeeds, a power loss can bring the name back.
         if let Err(sync) = self.sync_directory(&env_dir) {
             Self::count_directory_sync_failure();
             let withdrawn = self.withdraw(&final_path);
+            let withdrawal_sync = withdrawn
+                .as_ref()
+                .ok()
+                .map(|()| self.sync_directory(&env_dir));
+            if let Some(Err(_)) = withdrawal_sync {
+                Self::count_directory_sync_failure();
+            }
             // `withdrawn = false` means compaction can still merge the file.
+            // `withdrawal_durable = false` means a power loss may restore it.
             tracing::warn!(
                 event_type = "wal_dir_fsync_failed",
                 dir = %env_dir.display(),
                 error = %sync,
                 withdrawn = withdrawn.is_ok(),
                 withdraw_error = withdrawn.as_ref().err().map(tracing::field::display),
+                withdrawal_durable = matches!(withdrawal_sync, Some(Ok(()))),
+                withdrawal_sync_error = withdrawal_sync
+                    .as_ref()
+                    .and_then(|r| r.as_ref().err())
+                    .map(tracing::field::display),
                 "WAL directory fsync failed; the write is rejected"
             );
             return Err(match withdrawn {
@@ -162,6 +214,10 @@ impl WalWriter {
         #[cfg(test)]
         {
             use std::sync::atomic::Ordering;
+            let mut order = ACK_ORDER.lock();
+            let sequence = order.len() as u64;
+            order.insert(final_path.clone(), sequence);
+            drop(order);
             let previous = self.panic_after_writes.fetch_update(
                 Ordering::Relaxed,
                 Ordering::Relaxed,
@@ -173,22 +229,45 @@ impl WalWriter {
     }
 
     /// Create `env_dir` if it is missing, and make its entry in `wal_dir`
-    /// durable whenever this call created it or this process has not synced
-    /// it yet. A file acknowledged into a directory whose own entry is lost
-    /// on power failure is lost with it.
+    /// durable unless this process already synced this same directory. A
+    /// file acknowledged into a directory whose own entry is lost on power
+    /// failure is lost with it.
+    ///
+    /// Creation and the durability check share one lock, so a writer that
+    /// finds a directory another writer just created, before that writer
+    /// has synced the root, never sees the old directory's record. The
+    /// identity check covers a directory removed and recreated outside this
+    /// writer, unless the new directory reuses the old inode number.
     fn ensure_env_dir(&self, env: &str, env_dir: &Path) -> std::io::Result<()> {
-        let created = match std::fs::create_dir(env_dir) {
-            Ok(()) => true,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                std::fs::create_dir_all(env_dir)?;
-                true
+        let identity = {
+            let mut durable = self.durable_envs.lock();
+            let created = match std::fs::create_dir(env_dir) {
+                Ok(()) => true,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    std::fs::create_dir_all(env_dir)?;
+                    true
+                }
+                Err(e) => return Err(e),
+            };
+            if created {
+                durable.remove(env);
             }
-            Err(e) => return Err(e),
+            let identity = Self::dir_identity(env_dir)?;
+            if durable.get(env) == Some(&identity) {
+                return Ok(());
+            }
+            #[cfg(test)]
+            if created {
+                let pause = self.pause_after_create.lock().take();
+                if let Some(barrier) = pause {
+                    drop(durable);
+                    barrier.wait();
+                    barrier.wait();
+                }
+            }
+            identity
         };
-        if !created && self.durable_envs.lock().contains(env) {
-            return Ok(());
-        }
         if let Err(e) = self.sync_directory(&self.wal_dir) {
             Self::count_directory_sync_failure();
             tracing::warn!(
@@ -200,8 +279,14 @@ impl WalWriter {
             );
             return Err(e);
         }
-        self.durable_envs.lock().insert(env.to_owned());
+        self.durable_envs.lock().insert(env.to_owned(), identity);
         Ok(())
+    }
+
+    fn dir_identity(dir: &Path) -> std::io::Result<DirIdentity> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(dir)?;
+        Ok((metadata.dev(), metadata.ino()))
     }
 
     fn count_directory_sync_failure() {
@@ -212,10 +297,17 @@ impl WalWriter {
 
     #[cfg_attr(not(any(test, feature = "test-support")), allow(clippy::unused_self))]
     fn sync_directory(&self, dir: &Path) -> std::io::Result<()> {
+        #[cfg(test)]
+        self.synced_dirs.lock().push(dir.to_path_buf());
         #[cfg(any(test, feature = "test-support"))]
         if self
-            .fail_next_directory_sync
-            .swap(false, std::sync::atomic::Ordering::Relaxed)
+            .failing_directory_syncs
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |remaining| remaining.checked_sub(1),
+            )
+            .is_ok()
         {
             return Err(std::io::Error::other("injected WAL directory sync failure"));
         }
@@ -238,8 +330,21 @@ impl WalWriter {
     /// first write into an env, or the env directory sync after a rename.
     #[cfg(any(test, feature = "test-support"))]
     pub fn fail_next_directory_sync_for_test(&self) {
-        self.fail_next_directory_sync
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.failing_directory_syncs
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Fail this writer's next `count` directory barriers.
+    #[cfg(test)]
+    pub(crate) fn fail_next_directory_syncs_for_test(&self, count: usize) {
+        self.failing_directory_syncs
+            .store(count, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Drain the directories this writer tried to fsync, in call order.
+    #[cfg(test)]
+    pub(crate) fn take_synced_dirs_for_test(&self) -> Vec<PathBuf> {
+        std::mem::take(&mut *self.synced_dirs.lock())
     }
 
     /// Fail the next withdrawal of a file whose directory sync failed,
@@ -379,6 +484,78 @@ mod tests {
         assert!(wal_names(&writer.dir().join("prod")).is_empty());
         let path = writer.write("prod", "third", b"{\"id\":3}\n").unwrap();
         assert_eq!(std::fs::read(path).unwrap(), b"{\"id\":3}\n");
+    }
+
+    #[test]
+    fn a_writer_that_finds_a_recreated_env_dir_syncs_its_entry_before_acking() {
+        use std::sync::{Arc, Barrier};
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = Arc::new(WalWriter::new(tmp.path().join("wal")));
+        // `prod` is recorded as durable, then its directory goes away.
+        std::fs::remove_file(writer.write("prod", "first", b"{}\n").unwrap()).unwrap();
+        std::fs::remove_dir(writer.dir().join("prod")).unwrap();
+        writer.take_synced_dirs_for_test();
+
+        // Writer A recreates `prod` and parks before its root sync.
+        let barrier = Arc::new(Barrier::new(2));
+        *writer.pause_after_create.lock() = Some(Arc::clone(&barrier));
+        let a = std::thread::spawn({
+            let writer = Arc::clone(&writer);
+            move || writer.write("prod", "a", b"{\"id\":1}\n")
+        });
+        barrier.wait();
+        assert_eq!(writer.take_synced_dirs_for_test(), Vec::<PathBuf>::new());
+
+        // Writer B finds the new directory already there. Its entry in
+        // the root is not durable yet, so B must sync the root itself.
+        let b = writer.write("prod", "b", b"{\"id\":2}\n").unwrap();
+        assert_eq!(
+            writer.take_synced_dirs_for_test(),
+            [writer.dir().to_path_buf(), writer.dir().join("prod")],
+            "B acknowledged only after the root and env directory syncs"
+        );
+        barrier.wait();
+        let a = a.join().unwrap().unwrap();
+        assert_eq!(std::fs::read(a).unwrap(), b"{\"id\":1}\n");
+        assert_eq!(std::fs::read(b).unwrap(), b"{\"id\":2}\n");
+    }
+
+    #[test]
+    fn a_withdrawal_is_made_durable_before_the_rejection_returns() {
+        use crate::metrics::test_support::sample;
+        let recorder = crate::metrics::prometheus_builder().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            crate::metrics::init_operational_alert_metrics();
+            let tmp = tempfile::tempdir().unwrap();
+            let writer = WalWriter::new(tmp.path().join("wal"));
+            writer.write("prod", "warm", b"{}\n").unwrap();
+            let env_dir = writer.dir().join("prod");
+            writer.take_synced_dirs_for_test();
+
+            writer.fail_next_directory_sync_for_test();
+            let err = writer.write("prod", "lost", b"{\"id\":1}\n").unwrap_err();
+            assert!(matches!(err, WalWriteError::NotPublished(_)), "{err:?}");
+            assert_eq!(
+                writer.take_synced_dirs_for_test(),
+                [env_dir.clone(), env_dir.clone()],
+                "the unlink is synced after the failed rename sync"
+            );
+            assert_eq!(sample(&handle, DIR_SYNC_FAILURES), 1);
+
+            // Both syncs fail: the name is gone now, but a power loss may
+            // bring it back. The write is still rejected, and each failed
+            // sync is counted.
+            writer.fail_next_directory_syncs_for_test(2);
+            let err = writer.write("prod", "lost", b"{\"id\":2}\n").unwrap_err();
+            assert!(matches!(err, WalWriteError::NotPublished(_)), "{err:?}");
+            assert_eq!(
+                writer.take_synced_dirs_for_test(),
+                [env_dir.clone(), env_dir.clone()]
+            );
+            assert_eq!(sample(&handle, DIR_SYNC_FAILURES), 3);
+            assert_eq!(wal_names(&env_dir).len(), 1, "only the warm file remains");
+        });
     }
 
     #[test]

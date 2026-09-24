@@ -3108,29 +3108,29 @@ mod tests {
     }
 
     fn read_wal_events(env_dir: &std::path::Path) -> Vec<serde_json::Value> {
-        let mut files: Vec<Vec<serde_json::Value>> = std::fs::read_dir(env_dir)
+        let mut files: Vec<(u64, Vec<serde_json::Value>)> = std::fs::read_dir(env_dir)
             .unwrap()
             .filter_map(Result::ok)
             .map(|e| e.path())
             .filter(|p| p.extension().is_some_and(|ext| ext == "ndjson"))
             .map(|p| {
-                std::fs::read_to_string(p)
+                let sequence = crate::ingest::wal::ack_sequence_for_test(&p)
+                    .unwrap_or_else(|| panic!("{} was not written by a WalWriter", p.display()));
+                let events = std::fs::read_to_string(p)
                     .unwrap()
                     .lines()
                     .map(|l| serde_json::from_str(l).unwrap())
-                    .collect()
+                    .collect();
+                (sequence, events)
             })
             .collect();
-        // Order files by their first event's arrival instant (microsecond
-        // RFC 3339, so the strings sort in time order). Filenames embed
-        // unix millis, and same-millisecond writes tie. mtime ties too:
-        // tmpfs stamps files from a coarse clock, and its directory listing
-        // runs newest first.
-        files.sort_by(|a, b| {
-            let first = |events: &[serde_json::Value]| events[0]["_ingested"].to_string();
-            first(a).cmp(&first(b))
-        });
-        files.into_iter().flatten().collect()
+        // Order files by when the writer acknowledged them, so a test sees
+        // the on-disk write order. Filenames embed unix millis, and
+        // same-millisecond writes tie. mtime ties too: tmpfs stamps files
+        // from a coarse clock, and its directory listing runs newest first.
+        // Event timestamps would hide a reordered write.
+        files.sort_by_key(|(sequence, _)| *sequence);
+        files.into_iter().flat_map(|(_, events)| events).collect()
     }
 
     use std::path::PathBuf;
