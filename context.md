@@ -168,6 +168,10 @@ _Avoid_: range (that is the search page's control), period, report window (the w
 The late-arrival allowance that moves both bounds of a window back. It exists only beside a window; zero is spelled as absence.
 _Avoid_: delay, grace period, offset
 
+**Manual run**:
+A run a person starts on a scheduled net outside its cadence: the schedule's next window, fired early. Its success moves coverage and stands in for any scheduled run already overdue; its failure changes nothing.
+_Avoid_: trigger run, ad-hoc run (that is a search), side run
+
 ### Tables and analyses
 
 Objects added in 1.1 (ADR-0035). They belong to the installation and share one namespace; access comes from grants, never from ownership.

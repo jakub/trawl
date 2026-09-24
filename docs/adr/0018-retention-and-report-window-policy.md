@@ -93,3 +93,26 @@ edit plus Save with an inline hint, not a confirmation: the server keeps
 the watermark, so the change is reversible. The manual run control is
 absent for a saved windowed schedule (ADR-0025). Catch-up dashboards still
 ride later work.*
+
+*Amended 2026-09-23 (#236 prep): a windowed schedule can be run by hand,
+superseding "the manual run control is absent for a saved windowed
+schedule" above. A manual run is the schedule's next window fired early,
+not a side run beside it: a side run overlaps the next scheduled window
+and every `from saved` reader counts those events twice. The server reads
+the clock once it holds the claim locks; call it `t`. `since_last` covers
+`[covered_through, t - lag)` under the same catch-up clamp and
+`window_truncated` flag (a schedule with no predecessor covers one
+interval, ruling 14); a fixed span covers `[t - lag - span, t - lag)`.
+An empty window is refused as a conflict naming where coverage stands.
+Success advances the watermark (`since_last` only, ruling 9) and, in
+every mode, moves a fire cursor that is at or before `t` to the first
+boundary after it, so an overdue scheduled run cannot follow with an older
+window. The cursor moves at finish, never at claim: a failed manual run
+leaves the overdue run to retry. The cadence phase never shifts. A fixed
+span shorter than its interval can leave an overdue run's span unread;
+fixed spans promise the last span before each run, never contiguity.
+Manual runs count toward `max_runs`, are allowed on a disabled schedule,
+and record that they were manual. A net with no schedule has no run
+control. When ADR-0035's caller execution lands, a caller's run advancing
+the shared watermark is sound only while no caller can read less than the
+automation key.*
