@@ -252,18 +252,19 @@ export function corpusServiceSchemaResponse() {
 
 // ---- the `schedule` scenario ----------------------------------------------
 //
-// `schedule` is the drawer's schedule form with something to edit: TWO
-// nets, one of them carrying a windowed schedule, plus a run whose
-// stored result is longer than one preview page. It is a separate
+// `schedule` is the drawer's schedule form with something to edit: four
+// nets, one with no schedule and one per schedule mode (a tiling
+// window, a fixed span, and a paused query-mode schedule), plus a run
+// whose stored result is longer than one preview page. It is a separate
 // scenario rather than a change to `populated`/`corpus` because those
 // two are pinned as one service and one net, and the specs written
 // against them count rows.
 
-/** `GET /api/v1/saved` under `schedule`: the `populated` net verbatim,
- * plus a second net whose schedule tiles (`window: "since_last"`, a 5m
- * lag and a coverage watermark). One drawer per case, so a spec can put
- * the windowed and the unwindowed side by side without a second
- * scenario. */
+/** `GET /api/v1/saved` under `schedule`: the `populated` net verbatim
+ * (no schedule), a net whose schedule tiles (`window: "since_last"`, a
+ * 5m lag and a coverage watermark), a fixed-span net and a paused
+ * query-mode net. One drawer per case, so a spec can put every schedule
+ * shape beside the unscheduled net without a second scenario. */
 export function windowedListSavedResponse() {
   return wire('saved-queries-windowed');
 }
@@ -280,6 +281,20 @@ export function scheduleSavedResponse() {
  * renders verbatim in its inline error. */
 export function scheduleConflictResponse() {
   return wire('schedule-conflict');
+}
+
+/** `POST /api/v1/saved/{id}/run` under `schedule`: the claimed manual
+ * run of the tiling net, with the window the server resolved at claim
+ * time (from its watermark to the claim instant less its 5m lag). The
+ * toast states these bounds, never ones the browser computed. */
+export function runStartedResponse() {
+  return wire('run-started');
+}
+
+/** The 409 `/__ctl/run/refuse` arms: an empty since_last window, in the
+ * server's own words. The toast quotes the message verbatim. */
+export function runRefusedResponse() {
+  return wire('run-refused');
 }
 
 /** `GET /api/v1/saved/{id}/runs` under `schedule`: the two `corpus` runs

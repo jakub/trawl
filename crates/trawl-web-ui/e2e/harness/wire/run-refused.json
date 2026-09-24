@@ -1,0 +1,6 @@
+{
+  "error": {
+    "code": "bad_request",
+    "message": "nothing new to read: coverage already reaches 2026-09-01T11:15:00.000000Z, and a run now would end at 2026-09-01T11:14:30.000000Z"
+  }
+}

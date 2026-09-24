@@ -1,0 +1,11 @@
+{
+  "id": 504,
+  "query": "earliest=\"2026-09-01T09:55:00.000000Z\" latest=\"2026-09-01T11:15:00.000000Z\" _severity>=error | stats count() by service",
+  "status": "running",
+  "started_at": "2026-09-01T11:20:00.000000+00:00",
+  "window_start": "2026-09-01T09:55:00.000000Z",
+  "window_end": "2026-09-01T11:15:00.000000Z",
+  "window_truncated": false,
+  "window_kind": "since_last",
+  "origin": "manual"
+}

@@ -184,6 +184,11 @@ export const SEL = {
   /// spec asserting that NOTHING was announced has to watch, since the
   /// kind is the thing under test.
   toastAny: '.toast',
+  /// The same host's success kind, which a started Run now raises.
+  toastSuccess: '.toast.success',
+  /// crates/fleet-ui/src/toast/runtime.rs — a toast's optional link, a
+  /// native anchor below the detail.
+  toastLink: '.toast .link',
   /// crates/fleet-ui/src/drawer.rs — the sliding panel itself (the scrim
   /// is `.sd-scrim`, a different element).
   drawerPanel: '.sd-drawer',

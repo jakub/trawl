@@ -3,16 +3,18 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 // Direct Nets actions use native keyboard navigation and retain dialog focus.
-import { test, expect, resetScenario } from '../fixtures';
-import { SEL } from '../selectors';
+import { test, expect, resetScenario, SCHEDULE } from '../fixtures';
+import { SEL, COPY } from '../selectors';
 
 test('Nets actions are visible, tabbable and restore delete focus', async ({ page, request }) => {
-  await resetScenario(request, 'populated');
+  // The windowed net under `schedule`: its row carries all three direct
+  // actions, Run now included, because it has a schedule to fire.
+  await resetScenario(request, 'schedule');
   await page.goto('/jobs/nets');
   await expect(page.getByRole('columnheader', { name: 'Actions' })).toBeVisible();
-  const actions = page.locator(SEL.netAction);
+  const actions = page.locator(SEL.tableRow).filter({ hasText: SCHEDULE.windowedNetName }).locator(SEL.netAction);
   await expect(actions).toHaveCount(3);
-  for (const [index, name] of ['Open in search', 'Trigger run', 'Delete Net'].entries()) {
+  for (const [index, name] of ['Open in search', COPY.netRunNow, 'Delete Net'].entries()) {
     await expect(actions.nth(index)).toBeVisible();
     await expect(actions.nth(index)).toHaveAttribute('type', 'button');
     await expect(actions.nth(index)).toHaveAttribute('title', name);

@@ -795,6 +795,24 @@ const CONTRACTS: &[Contract] = &[
         hook: ">\"Copy search URL\"<",
     },
     Contract {
+        assignment: "toastSuccess: '.toast.success',",
+        source_path: "../fleet-ui/src/toast/runtime.rs",
+        source: TOAST_RUNTIME_RS,
+        hook: "format!(\"toast {}\", toast.kind.as_class())",
+    },
+    Contract {
+        assignment: "toastSuccess: '.toast.success',",
+        source_path: "../fleet-ui/src/toast/kinds.rs",
+        source: TOAST_KINDS_RS,
+        hook: "Self::Success => \"success\",",
+    },
+    Contract {
+        assignment: "toastLink: '.toast .link',",
+        source_path: "../fleet-ui/src/toast/runtime.rs",
+        source: TOAST_RUNTIME_RS,
+        hook: "<a class=\"link\" href=",
+    },
+    Contract {
         assignment: "toastAny: '.toast',",
         source_path: "../fleet-ui/src/toast/runtime.rs",
         source: TOAST_RUNTIME_RS,

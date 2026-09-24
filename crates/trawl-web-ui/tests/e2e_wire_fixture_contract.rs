@@ -767,40 +767,45 @@ const SCHEDULE_SAVED: &str = include_str!("../e2e/harness/wire/schedule-saved.js
 const SCHEDULE_CONFLICT: &str = include_str!("../e2e/harness/wire/schedule-conflict.json");
 const SCHEDULE_NET_RUNS: &str = include_str!("../e2e/harness/wire/schedule-net-runs.json");
 const RUN_RESULT_PAGED: &str = include_str!("../e2e/harness/wire/run-result-paged.json");
+const RUN_STARTED: &str = include_str!("../e2e/harness/wire/run-started.json");
+const RUN_REFUSED: &str = include_str!("../e2e/harness/wire/run-refused.json");
 
-/// The `schedule` scenario's saved list: two nets, one windowed and one
-/// not, decoded through the SAME type the `populated` list uses.
+/// The `schedule` scenario's saved list: the unscheduled net and one net
+/// per schedule mode, decoded through the SAME type the `populated` list
+/// uses.
 ///
-/// Both halves are the contract. The windowed net is what the form opens
-/// showing, and `lag` and `lag_secs` have to agree, because
+/// Every net is part of the contract. The windowed net is what the form
+/// opens showing, and `lag` and `lag_secs` have to agree, because
 /// `WindowDraft::from_schedule` reads the SECONDS to decide whether a lag
 /// is real and prints the STRING — a fixture where those two disagree
-/// would make the form show a value the spec cannot explain. The
-/// unwindowed net is the control for the withdrawn manual run.
+/// would make the form show a value the spec cannot explain. Run now is
+/// offered on every scheduled net, whatever its mode, and on no other:
+/// the unscheduled net is the control, and the fixed-span and paused
+/// query-mode nets are the modes a window-only reading would miss.
 #[test]
-fn the_schedule_scenario_carries_a_windowed_net_and_an_unwindowed_one() {
+fn the_schedule_scenario_carries_every_schedule_mode_and_an_unscheduled_net() {
     let saved: ListSavedResponse = decode("saved-queries-windowed.json", SAVED_QUERIES_WINDOWED);
-    assert_eq!(saved.queries.len(), 2);
+    assert_eq!(saved.queries.len(), 4);
 
     let plain = &saved.queries[0];
     let windowed = &saved.queries[1];
-    assert_eq!(plain.id, 1);
-    assert_eq!(windowed.id, 2);
+    let fixed = &saved.queries[2];
+    let query_mode = &saved.queries[3];
+    assert_eq!(
+        saved.queries.iter().map(|q| q.id).collect::<Vec<_>>(),
+        [1, 2, 3, 4]
+    );
     assert_eq!(windowed.name, "tiled error digest");
 
-    // The unwindowed net is the `populated` one verbatim: the specs read
-    // it as the case where "⏱ Run" is still offered.
+    // The unscheduled net is the `populated` one verbatim: the specs read
+    // it as the case where Run now is NOT offered.
     let populated: ListSavedResponse = decode("saved-queries.json", SAVED_QUERIES);
     assert_eq!(plain.id, populated.queries[0].id);
     assert_eq!(plain.name, populated.queries[0].name);
     assert_eq!(plain.query, populated.queries[0].query);
     assert!(
-        plain
-            .schedule
-            .as_ref()
-            .and_then(|s| s.window.as_ref())
-            .is_none(),
-        "the plain net must carry no window, or the drawer withdraws the manual run from both",
+        plain.schedule.is_none(),
+        "the plain net must carry no schedule, or Run now is offered on every net",
     );
     // Its query owns a time clause, which is the half a window conflicts
     // with — the refusal fixture below names that clause.
@@ -821,6 +826,79 @@ fn the_schedule_scenario_carries_a_windowed_net_and_an_unwindowed_one() {
     // A window on a query that spells its own interval is what the server
     // refuses, so the windowed net's text must NOT carry one.
     assert!(!windowed.query.contains("last="));
+
+    let fixed_schedule = fixed
+        .schedule
+        .as_ref()
+        .expect("the fixed-span net must carry a schedule");
+    assert_eq!(fixed_schedule.window.as_deref(), Some("15m"));
+    assert!(!fixed.query.contains("last="));
+
+    // Query mode AND paused: Run now fires a disabled schedule too.
+    let query_schedule = query_mode
+        .schedule
+        .as_ref()
+        .expect("the query-mode net must carry a schedule");
+    assert!(query_schedule.window.is_none());
+    assert!(!query_schedule.enabled);
+}
+
+/// What Run now answers: the claimed run and the refusal the stub arms.
+///
+/// The claimed run is a MANUAL run of the tiling net whose window starts
+/// at that net's watermark, which is what a `since_last` manual run covers
+/// (ADR-0018 as amended on 2026-09-23). Its text carries the spliced
+/// bounds, as the run row stores them. The refusal is a 409's envelope
+/// whose message the toast quotes, so the message is the contract.
+#[test]
+fn the_run_now_fixtures_carry_a_manual_window_and_a_refusal() {
+    let saved: ListSavedResponse = decode("saved-queries-windowed.json", SAVED_QUERIES_WINDOWED);
+    let watermark = saved.queries[1]
+        .schedule
+        .as_ref()
+        .and_then(|s| s.covered_through.clone())
+        .expect("the tiling net reports its watermark");
+
+    let run: trawl_api::ReportRunSummary = decode("run-started.json", RUN_STARTED);
+    assert_eq!(run.origin.as_deref(), Some("manual"));
+    assert_eq!(run.status, "running");
+    assert_eq!(run.window_kind.as_deref(), Some("since_last"));
+    assert_eq!(run.window_truncated, Some(false));
+    assert_eq!(run.window_start.as_deref(), Some(watermark.as_str()));
+    let (start, end) = (
+        run.window_start.as_deref().unwrap(),
+        run.window_end
+            .as_deref()
+            .expect("a windowed run carries its end"),
+    );
+    assert!(
+        run.query
+            .starts_with(&format!("earliest=\"{start}\" latest=\"{end}\" ")),
+        "the stored text is the saved text with the window spliced in front",
+    );
+    // The spec's toast expectation is written against these two bounds.
+    assert_eq!(start, "2026-09-01T09:55:00.000000Z");
+    assert_eq!(end, "2026-09-01T11:15:00.000000Z");
+
+    let refusal: trawl_api::ErrorResponse = decode("run-refused.json", RUN_REFUSED);
+    assert_eq!(refusal.error.code, trawl_api::ErrorCode::BadRequest);
+    assert!(
+        refusal
+            .error
+            .message
+            .starts_with("nothing new to read: coverage already reaches "),
+        "the refusal mirrors trawl-server's empty-window sentence",
+    );
+
+    // Recorded runs carry their origin too: the scheduled history rows
+    // say so, and carry no Manual marker.
+    let history: ListReportRunsResponse = decode("schedule-net-runs.json", SCHEDULE_NET_RUNS);
+    assert!(
+        history
+            .runs
+            .iter()
+            .all(|r| r.origin.as_deref() == Some("scheduled"))
+    );
 }
 
 /// The two schedule PUT answers. Shape only for the success, because no
