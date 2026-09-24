@@ -3380,9 +3380,6 @@ struct StagedOutput {
     canonical_path: PathBuf,
     date: chrono::NaiveDate,
     hour: u8,
-    /// Directories this write created. Each one's entry in its parent must
-    /// be durable before the marker names the output inside it.
-    created_dirs: Vec<PathBuf>,
     /// Whether the output merged an existing canonical file.
     merged: bool,
     /// Rows in the output file.
@@ -3468,14 +3465,6 @@ fn write_output(
     let day_dir = data_dir.join(date.format("%Y-%m-%d").to_string());
     let output_dir = day_dir.join(format!("{hour:02}"));
 
-    // The env, date and hour directories this write is about to create.
-    let created_dirs: Vec<PathBuf> = [data_dir.to_path_buf(), day_dir, output_dir.clone()]
-        .into_iter()
-        .filter(|dir| {
-            matches!(std::fs::symlink_metadata(dir),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound)
-        })
-        .collect();
     std::fs::create_dir_all(&output_dir)
         .map_err(|e| format!("failed to create output dir: {e}"))?;
 
@@ -3533,7 +3522,6 @@ fn write_output(
         canonical_path,
         date,
         hour,
-        created_dirs,
         merged,
         rows,
         survivors,
@@ -3687,9 +3675,21 @@ fn durable_marker_for(
         .map_err(|e| format!("failed to fsync {}: {e}", staged.tmp_path.display()))?;
     let identity = publication_marker::identity_of(&staged.tmp_path)
         .map_err(|e| format!("failed to hash {}: {e}", staged.tmp_path.display()))?;
-    let mut entry_dirs = vec![staged.output_dir.as_path()];
-    entry_dirs.extend(staged.created_dirs.iter().filter_map(|dir| dir.parent()));
-    for dir in entry_dirs {
+    // Sync the whole chain on every publish: the hour directory for the
+    // tmp's entry, then the date, env and data root directories for each
+    // directory's entry in its parent. Syncing only the directories this
+    // attempt created would skip one an earlier, failed attempt created, so
+    // a retry could retire WAL under an output path that is not durable.
+    // Directory fsyncs cost little next to the COPY and the tmp's own
+    // fsync, and a per-process "already durable" cache would go stale when
+    // retention deletes a date directory and a publish recreates it.
+    let entry_dirs = [
+        Some(staged.output_dir.as_path()),
+        staged.output_dir.parent(),
+        Some(target.data_dir),
+        target.data_dir.parent(),
+    ];
+    for dir in entry_dirs.into_iter().flatten() {
         crate::epoch::fsync_dir(dir)
             .map_err(|e| format!("failed to fsync directory {}: {e}", dir.display()))?;
     }
@@ -5565,6 +5565,73 @@ mod tests {
             published_messages(&data),
             sorted(&["rollup-claimed", "rollup-unclaimed"])
         );
+    }
+
+    /// Every publish syncs the whole output directory chain before its
+    /// marker, not only the directories that attempt created. The first
+    /// attempt creates `data/prod/{date}/{HH}` and fails on the sync of
+    /// `data/prod`. A retry finds every directory in place, but it must
+    /// still sync `data/prod`, so while that sync fails it may neither
+    /// publish nor retire the WAL.
+    #[test]
+    fn a_retried_publish_syncs_directories_an_earlier_attempt_created() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal = tmp.path().join("wal");
+        let data = tmp.path().join("data");
+        let env_wal = wal.join("prod");
+        let env_data = data.join("prod");
+        std::fs::create_dir_all(&env_wal).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        let tags = ["chain-a0", "chain-a1"];
+        let files = vec![tagged_wal(&env_wal, "svc", &tags)];
+        let attempt = || {
+            let mut quarantined = 0;
+            let prep = prepare_service_batch(
+                &files,
+                &env_data,
+                "svc",
+                "2GB",
+                &mut quarantined,
+                &HashMap::new(),
+            )?
+            .expect("a readable batch");
+            let pins = local_pins(&prep.proposals);
+            let batch_ids = vec![format!(
+                "prod/{}",
+                files[0].file_stem().unwrap().to_str().unwrap()
+            )];
+            conform_and_publish(
+                prep,
+                &pins,
+                &PublishTarget {
+                    data_dir: &env_data,
+                    wal_dir: &wal,
+                    env: "prod",
+                },
+                "svc",
+                None,
+                &batch_ids,
+            )
+        };
+
+        let failing = crate::epoch::fail_dir_fsync::set(&env_data);
+        for round in 1..=2 {
+            let err = attempt().unwrap_err();
+            assert!(
+                err.contains("failed to fsync directory"),
+                "round {round}: {err}"
+            );
+            assert!(files[0].is_file(), "round {round}: the WAL is kept");
+            assert!(!marker_file(&wal, "prod", "svc").exists(), "round {round}");
+            assert!(published_messages(&data).is_empty(), "round {round}");
+        }
+
+        drop(failing);
+        let (_report, incomplete) = attempt().unwrap();
+        assert!(incomplete.is_none(), "{incomplete:?}");
+        assert_eq!(published_messages(&data), sorted(&tags));
+        assert!(!files[0].exists());
+        assert!(!marker_file(&wal, "prod", "svc").exists());
     }
 
     /// A consumed WAL file withdrawn after compaction read it (its writer's
