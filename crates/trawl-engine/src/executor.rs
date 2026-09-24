@@ -7,6 +7,7 @@
 //! Handles connection management, prepared statements, parameter binding,
 //! and result extraction.
 
+use std::borrow::Cow;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -98,6 +99,25 @@ impl RowCap {
     fn trim(self, result: &mut QueryResult) {
         if let Self::Truncate { rows, .. } = self {
             result.rows.truncate(rows);
+        }
+    }
+
+    /// The statement a SQL read under this cap executes.
+    ///
+    /// `DuckDB` builds a whole result before the first row is handed back,
+    /// so a cut made only while copying rows out still pays for every row
+    /// the query matched. `Truncate` therefore wraps the SQL in a `LIMIT`,
+    /// the same shape and the same [`export_row_limit`] decision the
+    /// Parquet export's staging `SELECT` takes; an unbounded cap adds no
+    /// clause. `Refuse` executes the SQL untouched. Neither adds a
+    /// placeholder, so the emitted parameters bind as they are.
+    fn statement(self, sql: &str) -> Cow<'_, str> {
+        match self {
+            Self::Truncate { rows, .. } => match export_row_limit(rows) {
+                Some(limit) => format!("SELECT * FROM ({sql}) LIMIT {limit}").into(),
+                None => sql.into(),
+            },
+            Self::Refuse(_) => sql.into(),
         }
     }
 }
@@ -531,7 +551,10 @@ impl Executor {
         // this is the last moment before the statement's.
         cancel.check()?;
         record_prepare();
-        let mut stmt = match self.conn.prepare(&query.sql) {
+        // Every lane's SQL read reaches `DuckDB` here — cold, hot union,
+        // hot-only, and each one's `_raw`-free retry — so this is the one
+        // place a `Truncate` becomes a `LIMIT`.
+        let mut stmt = match self.conn.prepare(&cap.statement(&query.sql)) {
             Ok(s) => s,
             Err(e) if is_no_files_error(&e) => {
                 return Ok((QueryResult::empty(), TimestampColumns::new()));
@@ -585,6 +608,8 @@ impl Executor {
                 RowCap::Refuse(max_rows) if rows.len() >= max_rows => {
                     return Err(EngineError::ResultTooLarge(max_rows));
                 }
+                // The `LIMIT` above already stops `DuckDB` here; this
+                // holds the cap for the unbounded shape it leaves off.
                 RowCap::Truncate { rows: keep, .. } if rows.len() >= keep => break,
                 _ => {}
             }
@@ -2772,7 +2797,7 @@ mod tests {
 
     use super::{
         ColdAction, ColdPresence, EngineError, EvalContext, Executor, FieldTypes, HotColdOutcome,
-        HotLane, ListEvidence, cold_action, emitter, error_class, export_row_limit,
+        HotLane, ListEvidence, RowCap, cold_action, emitter, error_class, export_row_limit,
         glob_list_items, has_glob_meta, is_conversion_error, is_no_files_error,
         literal_path_is_file, resolve_list_source, with_raw_fallback,
     };
@@ -3997,5 +4022,52 @@ mod tests {
         if let Ok(above) = usize::try_from(1_u128 << 63) {
             assert_eq!(export_row_limit(above), None);
         }
+    }
+
+    /// A cutting cap pushes its cut into the SQL as the Parquet export's
+    /// `LIMIT`; a refusing cap executes the emitted SQL byte for byte.
+    #[test]
+    fn row_cap_statement_pushes_truncate_into_the_sql() {
+        let sql = "SELECT * FROM read_parquet(?) WHERE \"service\" = ? ORDER BY \"_time\"";
+
+        assert_eq!(
+            RowCap::Truncate {
+                rows: 10,
+                tail_input: 50,
+            }
+            .statement(sql),
+            format!("SELECT * FROM ({sql}) LIMIT 10"),
+        );
+        assert_eq!(
+            RowCap::Truncate {
+                rows: 0,
+                tail_input: 50,
+            }
+            .statement(sql),
+            format!("SELECT * FROM ({sql}) LIMIT 0"),
+        );
+
+        // The interactive lane is untouched, however large its cap.
+        for max_rows in [5, 100_000, usize::MAX] {
+            assert_eq!(RowCap::Refuse(max_rows).statement(sql), sql);
+        }
+
+        // The unbounded sentinel adds no clause, as in the Parquet lane.
+        assert_eq!(
+            RowCap::Truncate {
+                rows: usize::MAX,
+                tail_input: usize::MAX,
+            }
+            .statement(sql),
+            sql
+        );
+
+        // The wrapper adds no placeholder: the emitted params bind as is.
+        let wrapped = RowCap::Truncate {
+            rows: 10,
+            tail_input: 50,
+        }
+        .statement(sql);
+        assert_eq!(wrapped.matches('?').count(), sql.matches('?').count());
     }
 }
