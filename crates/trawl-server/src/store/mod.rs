@@ -53,7 +53,7 @@ pub use schedule::{
     MAX_DURATION_SECS, ManualRunClaim, ReportRun, RunClaim, Schedule, ScheduleStore,
     format_interval, parse_duration_secs, parse_interval,
 };
-pub use status::RunStatus;
+pub use status::{RunOrigin, RunStatus};
 
 use crate::ping::{PingCache, ping_cached_with};
 

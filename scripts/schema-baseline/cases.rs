@@ -241,21 +241,18 @@ async fn untracked_objects_are_refused_without_creating_history(pool: PgPool) {
 
 #[sqlx::test(migrations = false)]
 async fn current_checksums_dirty_and_unknown_versions_stay_distinct(pool: PgPool) {
-    for (update, expected) in [
-        (
-            "UPDATE _sqlx_migrations SET checksum=decode('00','hex')",
-            "checksum",
-        ),
-        ("UPDATE _sqlx_migrations SET success=false", "dirty"),
-        ("UPDATE _sqlx_migrations SET version=42", "unknown"),
-        (
-            "UPDATE _sqlx_migrations SET version=20260914000001",
-            "unknown",
-        ),
+    // Each case tampers with the baseline row alone. A ledger that also
+    // holds forward migrations cannot give every row the same version.
+    for (set, expected) in [
+        ("checksum=decode('00','hex')", "checksum"),
+        ("success=false", "dirty"),
+        ("version=42", "unknown"),
+        ("version=20260914000001", "unknown"),
     ] {
         reset(&pool).await;
         migrate(&pool).await.unwrap();
-        pool.execute(update).await.unwrap();
+        let update = format!("UPDATE _sqlx_migrations SET {set} WHERE version={BASELINE}");
+        pool.execute(sqlx::AssertSqlSafe(update)).await.unwrap();
         let before = snapshot(&pool).await;
         let error = tokio::time::timeout(Duration::from_secs(3), migrate(&pool))
             .await

@@ -41,6 +41,18 @@ pub(crate) fn run_status_label(status: &str) -> &str {
     }
 }
 
+/// The marker a run's history row carries for how the run started, or
+/// `None` for no marker. Only a manual run is marked: a scheduled run is
+/// the ordinary case, and a run recorded before origins were has none to
+/// show. Unknown server origins stay visible verbatim.
+pub(crate) fn run_origin_label(origin: Option<&str>) -> Option<&str> {
+    match origin? {
+        "manual" => Some("Manual"),
+        "scheduled" => None,
+        other => Some(other),
+    }
+}
+
 /// Badge counterpart of the shared execution status-dot vocabulary.
 pub(crate) fn run_badge_tone(status: &str) -> fleet_ui::Tone {
     match run_status_tone(status) {
@@ -66,7 +78,9 @@ pub(crate) fn repin_status_label(status: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::{repin_status_label, run_badge_tone, run_status_label, run_status_tone};
+    use super::{
+        repin_status_label, run_badge_tone, run_origin_label, run_status_label, run_status_tone,
+    };
 
     #[test]
     fn run_status_tone_maps_every_arm() {
@@ -98,6 +112,14 @@ mod tests {
             assert_eq!(run_status_label(wire), label);
             assert_eq!(run_badge_tone(wire), tone);
         }
+    }
+
+    #[test]
+    fn only_a_manual_run_is_marked() {
+        assert_eq!(run_origin_label(Some("manual")), Some("Manual"));
+        assert_eq!(run_origin_label(Some("scheduled")), None);
+        assert_eq!(run_origin_label(None), None);
+        assert_eq!(run_origin_label(Some("replayed")), Some("replayed"));
     }
 
     #[test]

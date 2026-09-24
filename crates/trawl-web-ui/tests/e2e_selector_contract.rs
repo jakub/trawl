@@ -795,6 +795,24 @@ const CONTRACTS: &[Contract] = &[
         hook: ">\"Copy search URL\"<",
     },
     Contract {
+        assignment: "toastSuccess: '.toast.success',",
+        source_path: "../fleet-ui/src/toast/runtime.rs",
+        source: TOAST_RUNTIME_RS,
+        hook: "format!(\"toast {}\", toast.kind.as_class())",
+    },
+    Contract {
+        assignment: "toastSuccess: '.toast.success',",
+        source_path: "../fleet-ui/src/toast/kinds.rs",
+        source: TOAST_KINDS_RS,
+        hook: "Self::Success => \"success\",",
+    },
+    Contract {
+        assignment: "toastLink: '.toast .link',",
+        source_path: "../fleet-ui/src/toast/runtime.rs",
+        source: TOAST_RUNTIME_RS,
+        hook: "<a class=\"link\" href=",
+    },
+    Contract {
         assignment: "toastAny: '.toast',",
         source_path: "../fleet-ui/src/toast/runtime.rs",
         source: TOAST_RUNTIME_RS,
@@ -1911,17 +1929,67 @@ const CONTRACTS: &[Contract] = &[
         source: NET_DRAWER_RS,
         hook: "Moves both bounds back by this much. Blank is none.",
     },
+    // Run now: one label, defined once and read by both places that
+    // offer it, so the row and the drawer cannot drift apart.
     Contract {
-        assignment: "netRunAction: '⏱ Run',",
-        source_path: "src/components/net_drawer.rs",
-        source: NET_DRAWER_RS,
-        hook: "\"⏱ Run\"",
+        assignment: "netRunNow: 'Run now',",
+        source_path: "src/schedule_edit.rs",
+        source: SCHEDULE_EDIT_RS,
+        hook: "pub const RUN_NOW: &str = \"Run now\";",
     },
     Contract {
-        assignment: "netTriggerAction: 'Trigger run',",
+        assignment: "netRunNow: 'Run now',",
         source_path: "src/pages/nets.rs",
         source: NETS_RS,
-        hook: "aria-label=\"Trigger run\"",
+        hook: "aria-label=RUN_NOW",
+    },
+    Contract {
+        assignment: "netRunNow: 'Run now',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "{RUN_NOW}",
+    },
+    Contract {
+        assignment: "runStartedToast: 'Run started · covers {from}–{to} UTC',",
+        source_path: "src/schedule_edit.rs",
+        source: SCHEDULE_EDIT_RS,
+        hook: "\"Run started · covers {}–{} UTC\"",
+    },
+    Contract {
+        assignment: "runStartedPlain: 'Run started',",
+        source_path: "src/schedule_edit.rs",
+        source: SCHEDULE_EDIT_RS,
+        hook: "return \"Run started\".to_owned();",
+    },
+    Contract {
+        assignment: "runViewLink: 'View run',",
+        source_path: "src/schedule_edit.rs",
+        source: SCHEDULE_EDIT_RS,
+        hook: "pub const VIEW_RUN: &str = \"View run\";",
+    },
+    Contract {
+        assignment: "runNotStarted: 'Run not started',",
+        source_path: "src/schedule_edit.rs",
+        source: SCHEDULE_EDIT_RS,
+        hook: "pub const RUN_NOT_STARTED: &str = \"Run not started\";",
+    },
+    Contract {
+        assignment: "runNowSinceLastLine: 'Run now reads from where the last successful run stopped.',",
+        source_path: "src/schedule_edit.rs",
+        source: SCHEDULE_EDIT_RS,
+        hook: "\"Run now reads from where the last successful run stopped.\"",
+    },
+    Contract {
+        assignment: "runNowFixedLine: 'Run now reads the span ending now; results can overlap earlier runs.',",
+        source_path: "src/schedule_edit.rs",
+        source: SCHEDULE_EDIT_RS,
+        hook: "\"Run now reads the span ending now; results can overlap earlier runs.\"",
+    },
+    Contract {
+        assignment: "runOriginManual: 'Manual',",
+        source_path: "src/tone_vocab.rs",
+        source: include_str!("../src/tone_vocab.rs"),
+        hook: "\"manual\" => Some(\"Manual\"),",
     },
     Contract {
         assignment: "previewCapLine: 'This run stored {n} rows; {fetched} were fetched. Paging covers the fetched rows.',",

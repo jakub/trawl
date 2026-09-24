@@ -326,7 +326,7 @@ max_catchup_intervals = 24
 Notes:
 
 - `poll_interval_secs` is the polling rate only. A schedule fires on its planned boundary, so a slow poll delays a run without shifting the window that run covers.
-- Runs missed while trawld was down coalesce into one window. Past `max_catchup_intervals`, the start clamps forward to `window_end - max_catchup_intervals * interval`, the run row carries `window_truncated: true`, and `trawl_scheduler_window_truncated_total` counts it. The coverage before the clamp is then missing from the report series.
+- Runs missed while trawld was down coalesce into one window. Past `max_catchup_intervals`, the start clamps forward to `window_end - max_catchup_intervals * interval`, the run row carries `window_truncated: true`, and `trawl_scheduler_window_truncated_total` counts it. A manual run of a `since_last` schedule is clamped and counted the same way. The coverage before the clamp is then missing from the report series.
 - The unit is intervals, not hours, so the default of 24 covers a day of missed hourly runs or 24 days of missed daily ones. There is no switch for "never clamp": spell it as a large number.
 - Window modes, `lag`, and the watermark are per-schedule settings. See [scheduled reports](/architecture/reports-telemetry/#scheduled-reports) and the [schedules API](/reference/api/#schedules).
 

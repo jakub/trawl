@@ -497,6 +497,23 @@ impl From<crate::store::WindowWriteError> for ServerError {
     }
 }
 
+impl From<crate::store::DueClaimError> for ServerError {
+    /// A manual run's claim fails the same four ways a scheduled one does,
+    /// and each already has a considered wire treatment: the store fault
+    /// keeps its SQLSTATE mapping and redaction, the policy refusal keeps
+    /// its 400 naming both sides, and a plan or materialize failure is a
+    /// redacted 500 because its inputs are stored state, not the request.
+    fn from(err: crate::store::DueClaimError) -> Self {
+        use crate::store::DueClaimError as E;
+        match err {
+            E::Store(e) => Self::Store(e),
+            E::Plan(e) => Self::WindowPlan(e),
+            E::Policy(e) => Self::WindowPolicy(e),
+            E::Materialize(e) => Self::WindowMaterialize(e),
+        }
+    }
+}
+
 impl From<fleet_auth::AuthError> for ServerError {
     /// Map fleet-auth keystore failures onto trawl's error contract.
     ///
@@ -1311,6 +1328,35 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = body_string(response).await;
         assert!(body.contains("since_last"), "got: {body}");
+    }
+
+    /// A claim failure keeps the wire treatment its leaf already has: no
+    /// second, differently-mapped route to the same answer.
+    #[test]
+    fn a_claim_failure_maps_to_its_leafs_own_variant() {
+        use crate::store::DueClaimError;
+        assert!(matches!(
+            ServerError::from(DueClaimError::Store(StoreError::Unavailable(
+                sqlx::Error::PoolTimedOut
+            ))),
+            ServerError::Store(StoreError::Unavailable(_))
+        ));
+        assert!(matches!(
+            ServerError::from(DueClaimError::Plan(PlanError::Arithmetic)),
+            ServerError::WindowPlan(PlanError::Arithmetic)
+        ));
+        assert!(matches!(
+            ServerError::from(DueClaimError::Policy(WindowPolicyError::FromSaved {
+                window: crate::report_window::ScheduleWindow::SinceLast,
+            })),
+            ServerError::WindowPolicy(_)
+        ));
+        assert!(matches!(
+            ServerError::from(DueClaimError::Materialize(
+                MaterializeError::SourceFromSaved
+            )),
+            ServerError::WindowMaterialize(_)
+        ));
     }
 
     /// Planning and materialization read a schedule row and the saved DSL,

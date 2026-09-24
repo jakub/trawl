@@ -9,8 +9,8 @@
 //!   contract. Builds on every target so native-compiling consumer
 //!   code (API mappers, test helpers) can name toast kinds without
 //!   pulling leptos.
-//! - [`stack`] — the pure [`ToastStack`] state machine ([`Toast`] +
-//!   id allocation + push/dismiss). Also target-agnostic, so the
+//! - [`stack`] — the pure [`ToastStack`] state machine ([`Toast`],
+//!   its optional [`ToastLink`], id allocation + push/dismiss). Also target-agnostic, so the
 //!   "a success and an error toast are now live" outcome is unit-tested
 //!   natively rather than eyeballed in a browser.
 //! - [`runtime`] — wasm-only `ToastBus` push handle (a reactive
@@ -35,7 +35,7 @@ pub mod stack;
 pub mod runtime;
 
 pub use kinds::ToastKind;
-pub use stack::{Toast, ToastStack};
+pub use stack::{Toast, ToastLink, ToastStack};
 
 #[cfg(target_arch = "wasm32")]
 pub use runtime::{ToastBus, Toasts};

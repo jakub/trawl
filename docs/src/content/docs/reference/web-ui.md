@@ -312,7 +312,7 @@ Closing the drawer stops its polling, not the server job. See
 `/jobs/nets` lists saved queries with **Name**, **Schedule**, **Last run**, and
 **Actions**. **Name** and **Last run** have sorting controls. A row's drawer offers
 **Rename**, **Edit** for the query text, **Open query in search**,
-**Trigger a scheduled run now**, and **Runs**. **Delete** asks for confirmation.
+**Run now**, and **Runs**. **Delete** asks for confirmation.
 
 The schedule block sets **Run every**, **Each run covers**, and
 **Keep schedule running for**. The last field is a run count, with blank meaning
@@ -327,10 +327,18 @@ back by that much so late events can land first; blank is none. A save the serve
 appears under **Save schedule** in the server's own words, and the form keeps
 what you entered.
 
-**Trigger run** is absent for a net whose saved schedule carries a window,
-because the scheduler owns every windowed run: a since-last-run schedule would
-have its coverage point moved out of band, and a fixed-span run outside the
-cadence covers a span the schedule never asked for.
+**Run now** appears in the net's row and in its drawer header whenever the
+saved net has a schedule, in any mode, including a paused schedule. A net with
+no schedule does not show it. The button is disabled while its request is in
+flight. A started run raises a toast with the window the server claimed, in
+UTC, and a **View run** link to the run. Query text mode shows **Run started**
+with no window. A refused run raises a toast with the server's message, for
+example when a run is already in progress or there is nothing new to read.
+Below the window choice, the form says what **Run now** reads in each windowed
+mode.
+
+Run history, in the drawer's **Runs** tab and on the **Runs** page, marks a
+manual run **Manual**.
 
 Expanding a run in **Runs** shows the stored result 20 rows to a page, with a
 pager under the table. Paging works on the rows the response carried and issues

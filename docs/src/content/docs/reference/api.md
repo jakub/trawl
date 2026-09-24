@@ -1431,7 +1431,13 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -X DELETE "$TRAWL_URL/api/v1
 
 Permission: `saved_query`
 
-Starts one run outside the interval, on a schedule in query mode. The run counts against `max_runs`. The response returns at once with status `running`, and the run continues in the background.
+Runs the schedule's next window now, as if its next fire came early. Any schedule can be run this way, in any mode, including a disabled one. The server reads its clock once it holds the claim; call that instant `t`.
+
+- A `since_last` schedule covers `[covered_through, t - lag)`, with the same `max_catchup_intervals` clamp and `window_truncated` flag as a scheduled run. With no `covered_through`, it covers one interval ending at `t - lag`.
+- A fixed window covers the span ending at `t - lag`.
+- Query mode runs the saved text as written.
+
+The run counts against `max_runs` and records `origin: "manual"`. A successful run advances `covered_through` like a scheduled `since_last` run. It also moves an overdue `next_fire_at` to the first fire after `t`, so the overdue scheduled run does not follow with an older window. A `next_fire_at` already after `t` stays where it is. A failed, timed-out, or interrupted run moves neither. The response returns at once with status `running`, and the run continues in the background.
 
 **Request**
 
@@ -1442,18 +1448,18 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -X POST "$TRAWL_URL/api/v1/s
 **Response**
 
 ```json
-{ "id": 43, "query": "_severity>=error | stats count() by service", "status": "running", "started_at": "2026-09-11T08:30:00+00:00" }
+{ "id": 43, "query": "earliest=\"2026-09-11T07:55:00.000000Z\" latest=\"2026-09-11T08:25:00.000000Z\" _severity>=error | stats count() by service", "status": "running", "started_at": "2026-09-11T08:30:00+00:00", "window_start": "2026-09-11T07:55:00.000000Z", "window_end": "2026-09-11T08:25:00.000000Z", "window_truncated": false, "window_kind": "since_last", "origin": "manual" }
 ```
 
-The shape is the [report run](#report-runs) summary with no window fields.
+The shape is the [report run](#report-runs) summary. `started_at` is `t`, and the window fields are the bounds the run covers. A query-mode run has no window fields.
 
 **Errors**
 
 | Status | Code | When |
 |--------|------|------|
-| 400 | `bad_request` | The saved query has no schedule, `max_runs` is reached, or a run is already in progress |
+| 400 | `bad_request` | The saved query has no schedule |
 | 404 | `not_found` | No saved query with this id belongs to the key |
-| 409 | `bad_request` | The schedule has a window: `schedule uses coverage mode "since_last"; manual runs are disabled for windowed schedules; watch GET /api/v1/saved/7/schedule (covered_through, next_fire_at)` |
+| 409 | `bad_request` | A run is already in progress, `max_runs` is reached, or a `since_last` window would be empty: `nothing new to read: coverage already reaches 2026-09-11T08:25:00.000000Z, and a run now would end at 2026-09-11T08:24:10.000000Z`. Nothing is recorded. |
 
 ## Report runs
 
@@ -1471,8 +1477,9 @@ A run summary has these fields:
 | `window_start`, `window_end` | string | The half-open interval `[start, end)` the run covered |
 | `window_truncated` | boolean | `true` when a `since_last` catch-up gap exceeded `[scheduler] max_catchup_intervals` and the start was moved forward |
 | `window_kind` | string | `since_last` or `fixed`, the mode the run was claimed under |
+| `origin` | string | `scheduled` for a run the scheduler started at a planned fire, `manual` for a run started with `POST /api/v1/saved/{id}/run`. Absent for a run recorded before origins were. |
 
-The four `window_*` fields are absent together for a run without a window: a query-mode run or a manual run.
+The four `window_*` fields are absent together for a run without a window: a run of a query-mode schedule.
 
 ### Runs of a saved query
 

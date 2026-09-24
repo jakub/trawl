@@ -52,6 +52,8 @@ import {
   scheduleSavedResponse,
   scheduleConflictResponse,
   scheduleNetRunsResponse,
+  runStartedResponse,
+  runRefusedResponse,
   pagedRunResultResponse,
   aggregateTimechartResponse,
   aggregateGroupedTimechartResponse,
@@ -118,6 +120,13 @@ let savedRequests = [];
 let scheduleRequests = [];
 /** @type {null|'conflict'|'fail'} */
 let scheduleRefusal = null;
+// `POST /api/v1/saved/{id}/run` (Run now) under `schedule`: every saved id
+// asked for, the one-shot 409 a spec arms, and the runs the stub claimed,
+// which the net's run list then shows newest first like trawld does.
+let runRequests = [];
+let runRefusal = false;
+/** @type {Array<{ savedId: number, run: object }>} */
+let startedRuns = [];
 // The run whose stored result file is gone: `GET .../runs/{id}` answers
 // the server's 409 envelope for it, the way trawld does once the operator
 // repoints `data_dir` out from under a recorded run (issue #227).
@@ -317,6 +326,9 @@ function resetState() {
   savedRequests = [];
   scheduleRequests = [];
   scheduleRefusal = null;
+  runRequests = [];
+  runRefusal = false;
+  startedRuns = [];
   unavailableRunId = null;
   runDetailReads = [];
   runListReads = [];
@@ -544,6 +556,7 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
         savedRequests,
         scheduleRequests,
         scheduleRefusal,
+        runRequests,
         runDetailReads,
         runListReads,
       });
@@ -557,6 +570,16 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
     if ((p === '/__ctl/schedule/refuse' || p === '/__ctl/schedule/fail') && req.method === 'POST') {
       scheduleRefusal = p.endsWith('refuse') ? 'conflict' : 'fail';
       sendJson(res, 200, { ok: true, armed: scheduleRefusal });
+      return;
+    }
+    // Arm the NEXT Run now to be refused with the server's 409 envelope:
+    // an empty since_last window. A real server needs coverage to reach
+    // past the claim instant for that, which no click sequence produces
+    // (two clicks inside the lag still cover a sliver), so the stub arms
+    // it instead. One-shot, like the schedule refusal.
+    if (p === '/__ctl/run/refuse' && req.method === 'POST') {
+      runRefusal = true;
+      sendJson(res, 200, { ok: true, armed: 'run-refuse' });
       return;
     }
     // Point the run-detail route at a run whose stored result is gone.
@@ -1018,6 +1041,47 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       return;
     }
 
+    // -- Run now (`schedule`) ---------------------------------------------
+    // Answers the way trawld's `trigger_run` does per saved net: no
+    // schedule is a 400, and otherwise the claimed run with the window
+    // the server resolved (none in query mode, a trailing span for the
+    // fixed net). Ids are the scenario's own nets.
+    const runNow = p.match(/^\/api\/v1\/saved\/(\d+)\/run$/);
+    if (runNow && req.method === 'POST' && scenario === 'schedule') {
+      const savedId = Number(runNow[1]);
+      runRequests.push(savedId);
+      const net = windowedListSavedResponse().queries.find((q) => q.id === savedId);
+      if (runRefusal) {
+        runRefusal = false;
+        sendJson(res, 409, runRefusedResponse());
+      } else if (!net?.schedule) {
+        sendJson(res, 400, { error: { code: 'bad_request', message: 'attach a schedule before triggering a run' } });
+      } else {
+        const run = { ...runStartedResponse(), id: 504 + startedRuns.length };
+        if (!net.schedule.window) {
+          // Query mode: the saved text verbatim, and no window at all.
+          run.query = net.query;
+          for (const key of ['window_start', 'window_end', 'window_truncated', 'window_kind']) delete run[key];
+        } else if (net.schedule.window !== 'since_last') {
+          // A fixed span trails the claim instant less the net's lag,
+          // [t - lag - span, t - lag), as trawld's `plan_manual_run`
+          // resolves it; the fixture's `started_at` is that `t`.
+          const unitSecs = { s: 1, m: 60, h: 3600, d: 86400, w: 604800 };
+          const [, count, unit] = net.schedule.window.match(/^(\d+)([smhdw])$/);
+          const spanMs = Number(count) * unitSecs[unit] * 1000;
+          const end = Date.parse(run.started_at) - (net.schedule.lag_secs ?? 0) * 1000;
+          const bound = (ms) => new Date(ms).toISOString().replace(/\.(\d{3})Z$/, '.$1000Z');
+          run.window_kind = 'fixed';
+          run.window_start = bound(end - spanMs);
+          run.window_end = bound(end);
+          run.query = `earliest="${run.window_start}" latest="${run.window_end}" ${net.query}`;
+        }
+        startedRuns.unshift({ savedId, run });
+        sendJson(res, 200, run);
+      }
+      return;
+    }
+
     // -- report runs (`corpus` and `pagination`) ------------------------------------
     // Gated on the scenario rather than answered everywhere: under every
     // other scenario these paths fall through to the `unstubbed`
@@ -1031,7 +1095,11 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
     const netRun = p.match(/^\/api\/v1\/saved\/\d+\/runs\/\d+$/);
     if (scenario === 'schedule' && req.method === 'GET' && (netRuns || netRun)) {
       if (netRuns) {
-        sendJson(res, 200, scheduleNetRunsResponse());
+        // A run Run now claimed leads its own net's list, as the newest.
+        const savedId = Number(p.split('/')[4]);
+        const base = scheduleNetRunsResponse();
+        const claimed = startedRuns.filter((s) => s.savedId === savedId).map((s) => s.run);
+        sendJson(res, 200, { runs: [...claimed, ...base.runs], total: base.total + claimed.length });
       } else {
         runDetailReads.push(p);
         if (unavailableRunId !== null && p.endsWith(`/${unavailableRunId}`)) {

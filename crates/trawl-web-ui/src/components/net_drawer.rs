@@ -18,12 +18,14 @@ use trawl_api::value::QueryResult;
 use crate::api;
 use fleet_ui::time::{format_duration, time_ago};
 use fleet_ui::{
-    Btn, Drawer, LoadState, Loaded, OffsetPager, PageTotal, PageWindow, Segmented, SegmentedOption,
-    Size, Sparkline, TabItem, ToastBus, ToastKind, Toggle, Variant, effective_active,
+    Badge, Btn, Drawer, LoadState, Loaded, OffsetPager, PageTotal, PageWindow, Segmented,
+    SegmentedOption, Size, Sparkline, TabItem, ToastBus, ToastKind, ToastLink, Toggle, Tone,
+    Variant, effective_active,
 };
 
 use crate::schedule_edit::{
-    WindowDraft, WindowMode, preview_cap, schedule_sentence, validate_max_runs,
+    RUN_NOT_STARTED, RUN_NOW, VIEW_RUN, WindowDraft, WindowMode, preview_cap, run_now_form_line,
+    run_now_offered, run_started_toast, schedule_sentence, validate_max_runs,
 };
 
 use crate::api::RUNS_PAGE_SIZE;
@@ -64,17 +66,18 @@ pub fn NetDrawer(
     });
     let net_for_runs = net.clone();
     let query_for_run = net.query.clone();
-    let net_id_for_trigger = net.id;
-    let name_for_trigger = net.name.clone();
-    // A windowed schedule computes each run's bounds from the last one
-    // it covered, so a manual run out of band moves that point and
-    // leaves a hole the schedule will not revisit. The offer is withdrawn
-    // from the SAVED state, never from an unsaved draft of it.
-    let manual_run_allowed = move || {
-        saved
-            .get()
-            .is_some_and(|n| n.schedule.and_then(|s| s.window).is_none())
-    };
+    let net_id_for_run_now = net.id;
+    // Run now fires the schedule's next run early, and the server
+    // resolves what it runs at claim time (ADR-0018 as amended on
+    // 2026-09-23). For a windowed net that is never the saved text as
+    // written: the window lives in the schedule, not in the text, so
+    // the text alone would scan with no time bounds, and the server
+    // splices the next window onto it. A query-mode net has no window,
+    // so its text runs verbatim, as a scheduled run of it would. The
+    // offer follows the SAVED state, never an unsaved draft of it: what
+    // fires is the schedule the server holds.
+    let run_now_allowed = move || saved.get().is_some_and(|n| run_now_offered(&n));
+    let run_in_flight = RwSignal::new(false);
 
     // -- inline rename --
     let editing_name = RwSignal::new(false);
@@ -189,30 +192,43 @@ pub fn NetDrawer(
         })
     };
 
-    let on_trigger_click = Callback::new(move |()| {
-        if missing.get_untracked() {
+    let on_run_now_click = Callback::new(move |()| {
+        if missing.get_untracked() || run_in_flight.get_untracked() {
             return;
         }
-        let name = name_for_trigger.clone();
-        let id = net_id_for_trigger;
+        let Some(current) = saved.get_untracked().filter(run_now_offered) else {
+            return;
+        };
+        let id = net_id_for_run_now;
+        run_in_flight.set(true);
         spawn_local(async move {
-            match api::trigger_run(id).await {
-                Ok(_) => {
-                    if alive.try_get_value() != Some(true) {
-                        return;
-                    }
-                    bus.push(
+            let outcome = api::trigger_run(id).await;
+            // The drawer may have closed while the request was out. The
+            // server claimed (or refused) the run regardless, and the
+            // Shell's bus outlives the drawer, so the toast still reports
+            // it; only the drawer's own state waits on `alive`, and the
+            // page's refresh stands in for the drawer's. The page may be
+            // gone too (navigated away), so that refresh is a `try_run`.
+            let open = alive.try_get_value() == Some(true);
+            if open {
+                run_in_flight.set(false);
+            }
+            match outcome {
+                Ok(run) => {
+                    bus.push_with_link(
                         ToastKind::Success,
-                        "Run triggered",
-                        Some(format!("'{name}' is executing.")),
+                        run_started_toast(&run),
+                        Some(current.name),
+                        ToastLink::new(format!("/jobs/runs?run={}&net={id}", run.id), VIEW_RUN),
                     );
-                    on_refresh.run(());
+                    if open {
+                        on_refresh.run(());
+                    } else {
+                        let _ = parent_refresh.try_run(());
+                    }
                 }
                 Err(e) => {
-                    if alive.try_get_value() != Some(true) {
-                        return;
-                    }
-                    bus.push(ToastKind::Error, "Trigger failed", Some(e.to_string()));
+                    bus.push(ToastKind::Error, RUN_NOT_STARTED, Some(e.to_string()));
                 }
             }
         });
@@ -289,13 +305,14 @@ pub fn NetDrawer(
                 >
                     "▶ Search"
                 </Btn>
-                {move || manual_run_allowed().then(|| view! {
+                {move || run_now_allowed().then(|| view! {
                     <Btn
                         variant=Variant::Secondary
-                        on_click=on_trigger_click
-                        attr:title="Trigger a scheduled run now"
+                        on_click=on_run_now_click
+                        disabled=Signal::derive(move || run_in_flight.get())
+                        attr:title="Run the schedule's next window now"
                     >
-                        "⏱ Run"
+                        {RUN_NOW}
                     </Btn>
                 })}
             }.into_any())
@@ -652,6 +669,12 @@ fn QuerySchedulePane(
                                     </p>
                                 }.into_any(),
                             }}
+                            // What Run now reads in the chosen mode. Query
+                            // mode says nothing: its manual run reads the
+                            // saved text like any other run.
+                            {move || run_now_form_line(window_draft.get().mode).map(|line| view! {
+                                <p class="run-now-line" style="color:var(--ink-3); font-size:11px; margin:4px 0 0">{line}</p>
+                            })}
                         </div>
 
                         // The two free durations, side by side: one span
@@ -1017,7 +1040,9 @@ fn RunsPane(
                                 </td>
                                 <td>{move || {
                                     crate::tone_vocab::run_status_label(&run.get().status).to_owned()
-                                }}</td>
+                                }}{move || crate::tone_vocab::run_origin_label(run.get().origin.as_deref())
+                                    .map(str::to_owned)
+                                        .map(|origin| view! { " " <Badge tone=Tone::Neutral>{origin}</Badge> })}</td>
                                 <td class="mono">{move || run.get().duration_ms.map_or_else(|| "—".to_string(), format_duration)}</td>
                                 <td class="mono">{move || run.get().row_count.map_or_else(|| "—".to_string(), |n| n.to_string())}</td>
                                 <td class="path">{move || run.get().error_message.unwrap_or_default()}</td>

@@ -1444,8 +1444,10 @@ pub struct ScheduleResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub covered_through: Option<String>,
     /// The planned next fire instant (RFC 3339, UTC, microseconds). Always
-    /// present: every schedule has a fire cursor, windowed or not, and it
-    /// is what an operator watches when manual runs are refused.
+    /// present: every schedule has a fire cursor, windowed or not. A
+    /// successful manual run moves a cursor it overtook to the cadence's
+    /// next boundary, so this is also where to see that a manual run
+    /// consumed an overdue fire.
     pub next_fire_at: String,
 }
 
@@ -1533,6 +1535,11 @@ pub struct ReportRunSummary {
     /// The mode the run was claimed under: `"since_last"` or `"fixed"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window_kind: Option<String>,
+    /// How the run started: `"scheduled"` at a planned fire, or `"manual"`
+    /// when an operator fired the schedule's next window early. Absent for
+    /// a run recorded before origins were.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
 }
 
 /// Paginated list of report runs.

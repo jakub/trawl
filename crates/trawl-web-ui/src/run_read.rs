@@ -80,6 +80,7 @@ mod tests {
             window_end: None,
             window_truncated: None,
             window_kind: None,
+            origin: None,
         }
     }
 

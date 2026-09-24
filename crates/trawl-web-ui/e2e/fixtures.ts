@@ -317,6 +317,10 @@ export const SCHEDULE = {
   plainNetId: 1,
   /** The net whose schedule tiles. */
   windowedNetId: 2,
+  /** The net with a fixed-span schedule. */
+  fixedNetId: 3,
+  /** The net with a paused query-mode schedule: no window, not enabled. */
+  queryModeNetId: 4,
   /** Its name, as the drawer titles itself. */
   windowedNetName: 'tiled error digest',
   /** Its saved window and lag, which the form opens showing. */
@@ -378,6 +382,20 @@ export async function armRunUnavailable(request: Ctl, runId: number): Promise<vo
 export async function armScheduleRefusal(request: Ctl, kind: 'refuse' | 'fail'): Promise<void> {
   const response = await request.post(`/__ctl/schedule/${kind}`);
   expect(response.ok(), `arm ${kind}: HTTP ${response.status()}`).toBe(true);
+}
+
+/** Saved ids `POST /api/v1/saved/{id}/run` (Run now) was sent for since
+ * the last scenario reset, oldest first. */
+export async function capturedRunRequests(request: Ctl): Promise<number[]> {
+  const state = await (await request.get('/__ctl/state')).json();
+  return state.runRequests;
+}
+
+/** Arm the next Run now to answer the server's 409 envelope for an
+ * empty since_last window (`harness/wire/run-refused.json`). */
+export async function armRunRefusal(request: Ctl): Promise<void> {
+  const response = await request.post('/__ctl/run/refuse');
+  expect(response.ok(), `arm run refusal: HTTP ${response.status()}`).toBe(true);
 }
 
 /** How many `POST /api/v1/query` bodies the stub has captured since the

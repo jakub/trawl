@@ -2,7 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-// The net drawer's schedule window control (issue #181). What the form
+// The net drawer's schedule window control (issue #181), and Run now
+// (issue #236). What the form
 // SHOWS is asserted in the browser; what it SENDS is asserted against
 // the stub's recorded PUT bodies, because the whole subject is which
 // keys travel: an omitted `window` is query mode, not "unchanged", so a
@@ -13,7 +14,9 @@ import {
   expect,
   resetScenario,
   armScheduleRefusal,
+  armRunRefusal,
   capturedScheduleRequests,
+  capturedRunRequests,
   trackToasts,
   toastCount,
   SCHEDULE,
@@ -149,29 +152,228 @@ test('a refused save stays in the form with the draft intact', async ({ page, re
   expect(await capturedScheduleRequests(request)).toHaveLength(2);
 });
 
-test('the manual run is offered only where no window owns the coverage', async ({ page, request }) => {
+// ---- Run now ---------------------------------------------------------------
+// A manual run is the schedule's next window fired early, so it is on
+// offer wherever a schedule is saved, in every mode and paused or not,
+// and nowhere else (ADR-0018 as amended on 2026-09-23).
+
+/** Every net in the `schedule` scenario, and whether it has a schedule. */
+const RUN_NOW_CASES = [
+  { id: SCHEDULE.plainNetId, name: 'errors by host', offered: false },
+  { id: SCHEDULE.windowedNetId, name: SCHEDULE.windowedNetName, offered: true },
+  { id: SCHEDULE.fixedNetId, name: 'fixed error window', offered: true },
+  { id: SCHEDULE.queryModeNetId, name: 'paused error sweep', offered: true },
+] as const;
+
+test('Run now is offered on every scheduled net and on no other', async ({ page, request }) => {
   await resetScenario(request, 'schedule');
 
-  await page.goto(`/jobs/nets?net=${SCHEDULE.windowedNetId}&ntab=query`);
-  const windowed = page.locator(SEL.drawerPanel);
-  await expect(windowed).toBeVisible();
-  await expect(windowed.getByRole('button', { name: 'Search' })).toBeVisible();
-  // A windowed schedule advances its own coverage point, so a run out of
-  // band would leave a hole it never revisits: the offer is withdrawn.
-  await expect(windowed.getByRole('button', { name: COPY.netRunAction })).toHaveCount(0);
+  for (const { id, offered } of RUN_NOW_CASES) {
+    await page.goto(`/jobs/nets?net=${id}&ntab=query`);
+    const drawer = page.locator(SEL.drawerPanel);
+    await expect(drawer).toBeVisible();
+    await expect(drawer.getByRole('button', { name: 'Search' })).toBeVisible();
+    await expect(drawer.getByRole('button', { name: COPY.netRunNow, exact: true })).toHaveCount(
+      offered ? 1 : 0,
+    );
+  }
 
-  await page.goto(`/jobs/nets?net=${SCHEDULE.plainNetId}&ntab=query`);
-  const plain = page.locator(SEL.drawerPanel);
-  await expect(plain).toBeVisible();
-  await expect(plain.getByRole('button', { name: COPY.netRunAction })).toHaveCount(1);
-
-  // The nets table's direct actions reads the same saved state, so the two
-  // cannot disagree about whether a run is on offer.
+  // The nets table's direct actions read the same saved state through the
+  // same predicate, so the two cannot disagree about the offer.
   await page.goto('/jobs/nets');
   const rows = page.locator(SEL.tableRow);
-  await expect(rows).toHaveCount(2);
-  for (const [name, offered] of [['errors by host', true], [SCHEDULE.windowedNetName, false]] as const) {
-    const action = rows.filter({ hasText: name }).getByRole('button', { name: COPY.netTriggerAction });
+  await expect(rows).toHaveCount(RUN_NOW_CASES.length);
+  for (const { name, offered } of RUN_NOW_CASES) {
+    const action = rows.filter({ hasText: name }).getByRole('button', { name: COPY.netRunNow, exact: true });
     await expect(action).toHaveCount(offered ? 1 : 0);
   }
+  // Looking sends nothing.
+  expect(await capturedRunRequests(request)).toEqual([]);
+});
+
+test('Run now in the drawer states the claimed window and the run shows as Manual', async ({ page, request }) => {
+  await resetScenario(request, 'schedule');
+  await page.goto(`/jobs/nets?net=${SCHEDULE.windowedNetId}&ntab=query`);
+  const drawer = page.locator(SEL.drawerPanel);
+  await drawer.getByRole('button', { name: COPY.netRunNow, exact: true }).click();
+
+  // The bounds are the server's claim, from the net's watermark to the
+  // claim instant less its lag, printed in UTC. The browser computes none.
+  const toast = page.locator(SEL.toastSuccess);
+  await expect(toast).toHaveCount(1);
+  await expect(toast.locator('.title')).toHaveText(nameFrom(COPY.runStartedToast, '09:55', '11:15'));
+  const link = page.locator(SEL.toastLink);
+  await expect(link).toHaveText(COPY.runViewLink);
+  await expect(link).toHaveAttribute('href', `/jobs/runs?run=504&net=${SCHEDULE.windowedNetId}`);
+  expect(await capturedRunRequests(request)).toEqual([SCHEDULE.windowedNetId]);
+
+  // The run leads the net's history, and it alone is marked Manual.
+  await page.goto(`/jobs/nets?net=${SCHEDULE.windowedNetId}&ntab=runs`);
+  const history = page.locator(SEL.netRunRow);
+  await expect(history).toHaveCount(4);
+  await expect(history.first()).toContainText(COPY.runOriginManual);
+  await expect(history.filter({ hasText: COPY.runOriginManual })).toHaveCount(1);
+});
+
+test('Run now in a row is disabled while its request is in flight', async ({ page, request }) => {
+  await resetScenario(request, 'schedule');
+  // Hold the request so the in-flight state can be observed, then let it
+  // through to the stub.
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  await page.route(`**/api/v1/saved/${SCHEDULE.fixedNetId}/run`, async (route) => {
+    await held;
+    await route.continue();
+  });
+
+  await page.goto('/jobs/nets');
+  const action = page
+    .locator(SEL.tableRow)
+    .filter({ hasText: 'fixed error window' })
+    .getByRole('button', { name: COPY.netRunNow, exact: true });
+  await action.click();
+  await expect(action).toBeDisabled();
+
+  release();
+  await expect(action).toBeEnabled();
+  // A fixed span reads the span ending at the claim instant less the
+  // net's lag: 15m before the 11:20 claim, with no lag.
+  await expect(page.locator(SEL.toastSuccess).locator('.title')).toHaveText(
+    nameFrom(COPY.runStartedToast, '11:05', '11:20'),
+  );
+  expect(await capturedRunRequests(request)).toEqual([SCHEDULE.fixedNetId]);
+});
+
+test('Run now in the drawer is disabled while its request is in flight', async ({ page, request }) => {
+  await resetScenario(request, 'schedule');
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  await page.route(`**/api/v1/saved/${SCHEDULE.windowedNetId}/run`, async (route) => {
+    await held;
+    await route.continue();
+  });
+
+  await page.goto(`/jobs/nets?net=${SCHEDULE.windowedNetId}&ntab=query`);
+  const action = page
+    .locator(SEL.drawerPanel)
+    .getByRole('button', { name: COPY.netRunNow, exact: true });
+  await action.click();
+  await expect(action).toBeDisabled();
+
+  release();
+  await expect(action).toBeEnabled();
+  await expect(page.locator(SEL.toastSuccess).locator('.title')).toHaveText(
+    nameFrom(COPY.runStartedToast, '09:55', '11:15'),
+  );
+  expect(await capturedRunRequests(request)).toEqual([SCHEDULE.windowedNetId]);
+});
+
+test('Run now from the drawer still reports when the drawer closed mid-request', async ({ page, request }) => {
+  await resetScenario(request, 'schedule');
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  await page.route(`**/api/v1/saved/${SCHEDULE.windowedNetId}/run`, async (route) => {
+    await held;
+    await route.continue();
+  });
+
+  await page.goto(`/jobs/nets?net=${SCHEDULE.windowedNetId}&ntab=query`);
+  await page
+    .locator(SEL.drawerPanel)
+    .getByRole('button', { name: COPY.netRunNow, exact: true })
+    .click();
+  await page.locator(`${SEL.drawerPanel} ${SEL.drawerClose}`).click();
+  await expect(page.locator(SEL.drawerPanel)).toHaveCount(0);
+
+  // The server claimed the run whether or not the drawer is still open.
+  release();
+  await expect(page.locator(SEL.toastSuccess).locator('.title')).toHaveText(
+    nameFrom(COPY.runStartedToast, '09:55', '11:15'),
+  );
+  expect(await capturedRunRequests(request)).toEqual([SCHEDULE.windowedNetId]);
+});
+
+test('Run now still reports without panicking when the Nets page is gone', async ({ page, request }) => {
+  await resetScenario(request, 'schedule');
+  const panics: string[] = [];
+  page.on('console', (msg) => {
+    if (msg.type() === 'error' && msg.text().includes('panicked')) panics.push(msg.text());
+  });
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  await page.route('**/api/v1/saved/*/run', async (route) => {
+    await held;
+    await route.continue();
+  });
+
+  // One request from the drawer, one from a row, both answered after an
+  // in-app navigation has disposed the Nets page and everything it owns.
+  await page.goto(`/jobs/nets?net=${SCHEDULE.windowedNetId}&ntab=query`);
+  await page
+    .locator(SEL.drawerPanel)
+    .getByRole('button', { name: COPY.netRunNow, exact: true })
+    .click();
+  await page
+    .locator(SEL.tableRow)
+    .filter({ hasText: 'paused error sweep' })
+    .getByRole('button', { name: COPY.netRunNow, exact: true })
+    .click();
+  await page.locator(SEL.railHistoryLink).click();
+  await expect(page.locator('h1')).toHaveText('Search history');
+
+  release();
+  await expect(page.locator(SEL.toastSuccess)).toHaveCount(2);
+  expect(panics).toEqual([]);
+});
+
+test('Run now of a query-mode schedule claims no window', async ({ page, request }) => {
+  await resetScenario(request, 'schedule');
+  await page.goto('/jobs/nets');
+  await page
+    .locator(SEL.tableRow)
+    .filter({ hasText: 'paused error sweep' })
+    .getByRole('button', { name: COPY.netRunNow, exact: true })
+    .click();
+  // Paused, and still fired: the schedule's enabled flag gates the
+  // scheduler, not a person.
+  await expect(page.locator(SEL.toastSuccess).locator('.title')).toHaveText(COPY.runStartedPlain);
+  expect(await capturedRunRequests(request)).toEqual([SCHEDULE.queryModeNetId]);
+});
+
+test('a refused Run now shows the server\'s message', async ({ page, request }) => {
+  await resetScenario(request, 'schedule');
+  await page.goto('/jobs/nets');
+  await armRunRefusal(request);
+  await page
+    .locator(SEL.tableRow)
+    .filter({ hasText: SCHEDULE.windowedNetName })
+    .getByRole('button', { name: COPY.netRunNow, exact: true })
+    .click();
+
+  // The server's own sentence, which names where coverage stands, and
+  // never the client's bare status text.
+  const toast = page.locator(SEL.toastError);
+  await expect(toast.locator('.title')).toHaveText(COPY.runNotStarted);
+  await expect(toast.locator('.detail')).toHaveText(
+    'nothing new to read: coverage already reaches 2026-09-01T11:15:00.000000Z, and a run now would end at 2026-09-01T11:14:30.000000Z',
+  );
+  await expect(toast).not.toContainText(nameFrom(COPY.apiStatusText, '409'));
+  await expect(page.locator(SEL.toastSuccess)).toHaveCount(0);
+});
+
+test('the schedule form says what Run now reads in each windowed mode', async ({ page, request }) => {
+  await resetScenario(request, 'schedule');
+  const drawer = await openScheduleForm(page, SCHEDULE.windowedNetId);
+
+  await expect(drawer.getByText(COPY.runNowSinceLastLine)).toBeVisible();
+  await expect(drawer.getByText(COPY.runNowFixedLine)).toHaveCount(0);
+
+  await windowOption(drawer, COPY.windowOptionFixed).click();
+  await expect(drawer.getByText(COPY.runNowFixedLine)).toBeVisible();
+  await expect(drawer.getByText(COPY.runNowSinceLastLine)).toHaveCount(0);
+
+  // Query mode reads the saved text whenever it runs: nothing to say.
+  await windowOption(drawer, COPY.windowOptionQuery).click();
+  await expect(drawer.getByText(COPY.runNowFixedLine)).toHaveCount(0);
+  await expect(drawer.getByText(COPY.runNowSinceLastLine)).toHaveCount(0);
 });

@@ -17,7 +17,7 @@ use leptos::prelude::*;
 use std::time::Duration;
 
 use super::kinds::ToastKind;
-use super::stack::{Toast, ToastStack};
+use super::stack::{Toast, ToastLink, ToastStack};
 
 /// Push handle — clone-and-share. Drives the `<Toasts/>` host.
 ///
@@ -59,6 +59,25 @@ impl ToastBus {
         if self
             .stack
             .try_update(|s| s.push(kind, title, detail))
+            .is_none()
+        {
+            web_sys::console::warn_1(&"toast dropped: bus signal disposed".into());
+        }
+    }
+
+    /// Push a toast that also offers `link`, such as the record the
+    /// reported operation created. Expiry follows [`Self::push`].
+    pub fn push_with_link(
+        self,
+        kind: ToastKind,
+        title: impl Into<String>,
+        detail: Option<String>,
+        link: ToastLink,
+    ) {
+        // Same single-closure mutation and disposed-signal trace as `push`.
+        if self
+            .stack
+            .try_update(|s| s.push_with_link(kind, title, detail, link))
             .is_none()
         {
             web_sys::console::warn_1(&"toast dropped: bus signal disposed".into());
@@ -166,6 +185,9 @@ fn ToastItem(toast: Toast, bus: ToastBus, paused: Signal<bool>) -> impl IntoView
             <div class="toast-body">
                 <div class="title">{toast.title}</div>
                 {toast.detail.map(|d| view! { <div class="detail">{d}</div> })}
+                {toast.link.map(|link| view! {
+                    <a class="link" href=link.href().to_owned()>{link.label().to_owned()}</a>
+                })}
             </div>
             // The multiplication sign is decoration; the button's name
             // comes from aria-label, not a spoken "times" glyph.

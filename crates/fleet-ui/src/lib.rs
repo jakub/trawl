@@ -117,7 +117,7 @@ pub use sidebar::{RailItem, SidebarGroup};
 pub use sparkline::SparkPath;
 pub use status_dot::StatusTone;
 pub use theme::{Details, RowStyle, Rows, Theme, ThemePreference};
-pub use toast::{Toast, ToastKind, ToastStack};
+pub use toast::{Toast, ToastKind, ToastLink, ToastStack};
 
 #[cfg(target_arch = "wasm32")]
 pub use actions_menu::{ActionItem, ActionsMenu};

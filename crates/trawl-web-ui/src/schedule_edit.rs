@@ -19,12 +19,17 @@
 //! make without a grammar: a chosen span left blank, a max-runs box
 //! holding something that is not a number.
 //!
+//! Run now lives here too: whether a net offers it, what the form says
+//! it will read, and how its toast states the window the server claimed.
+//! The browser never computes that window (ADR-0018 as amended on
+//! 2026-09-23); it only prints the bounds the response carries.
+//!
 //! Pure + ungated so its tests run natively; the callers are
 //! wasm32-only.
 
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
-use trawl_api::ScheduleResponse;
+use trawl_api::{ReportRunSummary, SavedQueryResponse, ScheduleResponse};
 
 /// Which report window a schedule edit is about to send.
 ///
@@ -206,6 +211,84 @@ pub fn cadence_sentence(schedule: Option<&ScheduleResponse>) -> String {
         Some(span) => format!("fixed span {span}"),
     };
     format!("Every {} · {covers}", schedule.interval)
+}
+
+/// The one label for firing a schedule by hand, in the Nets row and the
+/// net drawer header alike.
+pub const RUN_NOW: &str = "Run now";
+
+/// The success toast's link to the started run.
+pub const VIEW_RUN: &str = "View run";
+
+/// The refusal toast's title. Its detail is the server's own message.
+pub const RUN_NOT_STARTED: &str = "Run not started";
+
+/// What Run now reads for a `since_last` schedule, said under the window
+/// choice.
+pub const RUN_NOW_SINCE_LAST_LINE: &str =
+    "Run now reads from where the last successful run stopped.";
+
+/// What Run now reads for a fixed-span schedule, said under the window
+/// choice.
+pub const RUN_NOW_FIXED_LINE: &str =
+    "Run now reads the span ending now; results can overlap earlier runs.";
+
+/// Whether a net offers Run now: exactly when its SAVED state has a
+/// schedule, in any mode and enabled or paused. A net with no schedule
+/// has nothing to fire, and the server refuses it with a 400, so the
+/// control would not work (ADR-0025).
+#[must_use]
+pub fn run_now_offered(saved: &SavedQueryResponse) -> bool {
+    saved.schedule.is_some()
+}
+
+/// The line the schedule form shows about Run now for `mode`, or `None`
+/// in query mode, where a manual run reads the saved text as a
+/// scheduled one would.
+#[must_use]
+pub const fn run_now_form_line(mode: WindowMode) -> Option<&'static str> {
+    match mode {
+        WindowMode::Query => None,
+        WindowMode::SinceLast => Some(RUN_NOW_SINCE_LAST_LINE),
+        WindowMode::Fixed => Some(RUN_NOW_FIXED_LINE),
+    }
+}
+
+/// The success toast's title for a started manual run: the window the
+/// server claimed, as it claimed it, or plain "Run started" when the run
+/// has no window (query mode).
+///
+/// Bounds print in UTC as `HH:MM`. Bounds on different days carry their
+/// dates, and bounds inside one minute carry seconds (inside one second,
+/// microseconds), so the text never reads as a backwards or empty window. A bound the browser cannot read
+/// is quoted verbatim.
+#[must_use]
+pub fn run_started_toast(run: &ReportRunSummary) -> String {
+    let (Some(start), Some(end)) = (run.window_start.as_deref(), run.window_end.as_deref()) else {
+        return "Run started".to_owned();
+    };
+    let parse = |text: &str| {
+        chrono::DateTime::parse_from_rfc3339(text)
+            .ok()
+            .map(|t| t.with_timezone(&chrono::Utc))
+    };
+    let (Some(from), Some(to)) = (parse(start), parse(end)) else {
+        return format!("Run started · covers {start}–{end}");
+    };
+    let clock = if from.date_naive() == to.date_naive() {
+        // The coarsest clock that tells the two bounds apart.
+        ["%H:%M", "%H:%M:%S", "%H:%M:%S%.6f"]
+            .into_iter()
+            .find(|clock| from.format(clock).to_string() != to.format(clock).to_string())
+            .unwrap_or("%H:%M:%S%.6f")
+    } else {
+        "%Y-%m-%d %H:%M"
+    };
+    format!(
+        "Run started · covers {}–{} UTC",
+        from.format(clock),
+        to.format(clock)
+    )
 }
 
 /// Noon UTC, in seconds from midnight: the anchor the worked example
@@ -415,6 +498,134 @@ mod tests {
             covered_through: None,
             next_fire_at: "2026-03-14T03:00:00Z".to_owned(),
         }
+    }
+
+    /// A net as the server lists it, with or without a schedule.
+    fn net(schedule: Option<ScheduleResponse>) -> SavedQueryResponse {
+        SavedQueryResponse {
+            id: 7,
+            name: "errors".to_owned(),
+            query: "level=error".to_owned(),
+            created_at: "2026-03-14T02:00:00Z".to_owned(),
+            updated_at: "2026-03-14T02:00:00Z".to_owned(),
+            schedule,
+        }
+    }
+
+    /// A manual run as `POST .../run` answers it, with the window the
+    /// server claimed, if any.
+    fn started(window: Option<(&str, &str)>) -> ReportRunSummary {
+        ReportRunSummary {
+            id: 41,
+            query: "level=error".to_owned(),
+            status: "running".to_owned(),
+            started_at: "2026-09-24T14:26:00.000000Z".to_owned(),
+            finished_at: None,
+            duration_ms: None,
+            row_count: None,
+            error_message: None,
+            result_path: None,
+            window_start: window.map(|(start, _)| start.to_owned()),
+            window_end: window.map(|(_, end)| end.to_owned()),
+            window_truncated: window.map(|_| false),
+            window_kind: window.map(|_| "since_last".to_owned()),
+            origin: Some("manual".to_owned()),
+        }
+    }
+
+    /// Run now is offered for every saved schedule, whatever its mode or
+    /// enabled state, and never for a net with no schedule to fire.
+    #[test]
+    fn run_now_is_offered_exactly_when_a_schedule_is_saved() {
+        assert!(!run_now_offered(&net(None)));
+        for window in [None, Some("since_last"), Some("15m")] {
+            assert!(run_now_offered(&net(Some(schedule(window, None)))));
+        }
+        let mut paused = schedule(Some("since_last"), None);
+        paused.enabled = false;
+        assert!(run_now_offered(&net(Some(paused))));
+    }
+
+    /// The toast states the bounds the server claimed, in UTC, to the
+    /// minute when the minute tells them apart.
+    #[test]
+    fn run_started_toast_names_the_claimed_window() {
+        assert_eq!(
+            run_started_toast(&started(Some((
+                "2026-09-24T14:05:00.000000Z",
+                "2026-09-24T14:21:00.000000Z"
+            )))),
+            "Run started · covers 14:05–14:21 UTC"
+        );
+    }
+
+    /// Query mode claims no window, so the toast claims none either.
+    #[test]
+    fn run_started_toast_in_query_mode_names_no_window() {
+        assert_eq!(run_started_toast(&started(None)), "Run started");
+    }
+
+    /// Bounds on two days carry their dates, or 23:55–00:10 would read
+    /// as a window running backwards.
+    #[test]
+    fn run_started_toast_dates_a_window_across_midnight() {
+        assert_eq!(
+            run_started_toast(&started(Some((
+                "2026-09-23T23:55:00.000000Z",
+                "2026-09-24T00:10:00.000000Z"
+            )))),
+            "Run started · covers 2026-09-23 23:55–2026-09-24 00:10 UTC"
+        );
+    }
+
+    /// Two bounds inside one minute print their seconds, or the window
+    /// would read as empty.
+    #[test]
+    fn run_started_toast_prints_seconds_when_bounds_share_a_minute() {
+        assert_eq!(
+            run_started_toast(&started(Some((
+                "2026-09-24T14:05:10.250000Z",
+                "2026-09-24T14:05:50.000000Z"
+            )))),
+            "Run started · covers 14:05:10–14:05:50 UTC"
+        );
+    }
+
+    /// Bounds inside one second print the microseconds the wire carries.
+    #[test]
+    fn run_started_toast_prints_fractions_when_bounds_share_a_second() {
+        assert_eq!(
+            run_started_toast(&started(Some((
+                "2026-09-24T14:05:10.250000Z",
+                "2026-09-24T14:05:10.750000Z"
+            )))),
+            "Run started · covers 14:05:10.250000–14:05:10.750000 UTC"
+        );
+    }
+
+    /// Bounds the browser cannot read are quoted as the server sent
+    /// them rather than dropped: the window is still the server's claim.
+    #[test]
+    fn run_started_toast_quotes_bounds_it_cannot_read() {
+        assert_eq!(
+            run_started_toast(&started(Some(("yesterday", "today")))),
+            "Run started · covers yesterday–today"
+        );
+    }
+
+    /// One line per windowed mode, and none for query mode, which reads
+    /// the saved text whenever it runs.
+    #[test]
+    fn run_now_form_line_speaks_only_for_windowed_modes() {
+        assert_eq!(run_now_form_line(WindowMode::Query), None);
+        assert_eq!(
+            run_now_form_line(WindowMode::SinceLast),
+            Some("Run now reads from where the last successful run stopped.")
+        );
+        assert_eq!(
+            run_now_form_line(WindowMode::Fixed),
+            Some("Run now reads the span ending now; results can overlap earlier runs.")
+        );
     }
 
     /// Every mode the strip can press is a mode the draft can hold, and
