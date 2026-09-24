@@ -11,9 +11,11 @@
 # exits 0 only if both legs behave.
 #
 # A leg is INCONCLUSIVE, and the script exits nonzero, unless the JSON report
-# shows the one test ran with the expected outcome: a mutant failure must
-# carry the "harness counted a health request" assertion, so a port
-# collision, browser launch failure, timeout or crash never reads as a kill.
+# shows the one test ran with the expected outcome. A mutant failure counts
+# only if its error is located at the spec's health-count assertion and its
+# message header is that assertion's failure (issue241-negative-leg.verdict.mjs),
+# so a port collision, launch failure, timeout, crash, or an error on a
+# neighbouring line never reads as a kill.
 #
 # Both builds go to script-owned dist directories under target/, served
 # through TRAWL_E2E_DIST, so crates/trawl-web-ui/dist is never written and no
@@ -21,6 +23,7 @@
 # and removes those directories.
 #
 # Usage: e2e/scripts/issue241-negative-leg.sh   (E2E_PORT defaults to 8123)
+#        e2e/scripts/issue241-negative-leg.sh --self-test   (verdict parser only)
 #
 # Refuses to run against a dirty tree: the restore is `git checkout` of
 # layout.rs, which would discard uncommitted work in that file.
@@ -33,7 +36,10 @@ WEB_UI_DIR="$(cd "$E2E_DIR/.." && pwd)"
 REPO_DIR="$(git -C "$WEB_UI_DIR" rev-parse --show-toplevel)"
 LAYOUT="$WEB_UI_DIR/src/pages/layout.rs"
 SPEC="tests/signed-out-probes.spec.ts"
-KILL_MESSAGE="harness counted a health request"
+
+if [ "${1:-}" = --self-test ]; then
+  exec node "$SCRIPT_DIR/issue241-negative-leg.verdict.mjs" --self-test
+fi
 
 if ! git -C "$WEB_UI_DIR" diff --quiet HEAD --; then
   echo "refusing to run: working tree has uncommitted changes" >&2
@@ -63,28 +69,7 @@ run_spec() {
     npx playwright test "$SPEC" --workers=1 --reporter=line,json 2>&1)" || status=$?
   printf '%s\n' "$out" | grep -E '^\s+[0-9]+ (passed|failed)|Error:|Expected:|Received:' || true
   echo "playwright exit: $status"
-  node - "$report" "$expect" "$status" "$KILL_MESSAGE" "$WORK/verdict-$expect" <<'JS'
-const fs = require('node:fs');
-const [report, expect, status, kill, out] = process.argv.slice(2);
-const verdict = (v, why) => { console.log(`verdict basis: ${why}`); fs.writeFileSync(out, v); process.exit(0); };
-if (!fs.existsSync(report)) verdict('inconclusive', 'no JSON report');
-const r = JSON.parse(fs.readFileSync(report, 'utf8'));
-const results = [];
-const walk = s => {
-  for (const spec of s.specs ?? []) for (const t of spec.tests) for (const res of t.results) results.push(res);
-  for (const c of s.suites ?? []) walk(c);
-};
-for (const s of r.suites ?? []) walk(s);
-const st = r.stats ?? {};
-if (results.length !== 1 || (r.errors ?? []).length) verdict('inconclusive', `${results.length} results, ${(r.errors ?? []).length} run errors`);
-const [res] = results;
-const text = (res.errors ?? []).map(e => e.message ?? '').join('\n');
-if (expect === 'fail' && status !== '0' && st.unexpected === 1 && res.status === 'failed' && text.includes(kill))
-  verdict('fail', `one test failed on "${kill}"`);
-if (expect === 'pass' && status === '0' && st.expected === 1 && st.unexpected === 0 && res.status === 'passed')
-  verdict('pass', 'one test passed');
-verdict('inconclusive', `status=${res.status} exit=${status} stats=${JSON.stringify(st)}`);
-JS
+  node "$SCRIPT_DIR/issue241-negative-leg.verdict.mjs" "$report" "$expect" "$status" "$WORK/verdict-$expect"
 }
 
 echo "== issue #241 negative leg at $(git -C "$WEB_UI_DIR" rev-parse HEAD)"
