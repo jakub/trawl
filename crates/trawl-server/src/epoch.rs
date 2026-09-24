@@ -1103,7 +1103,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn the_host_reports_slash_as_a_mount_root() {
-        assert_eq!(mount_root(Path::new("/")).unwrap(), Some(true));
+        // `None` is the supported answer on a kernel without the attribute
+        // or under a seccomp profile that blocks statx; the walk then falls
+        // back to `/`. Where the attribute is known, `/` must be a mount root.
+        assert_ne!(mount_root(Path::new("/")).unwrap(), Some(false));
     }
 
     #[test]
