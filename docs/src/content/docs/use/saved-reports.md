@@ -56,13 +56,33 @@ Pick a mode in the **Each run covers** control:
 back by that much, so late events land before the window that
 owes them closes. Leave it blank for none.
 
-A **Since last run** schedule advances its own coverage point, and a manual run
-out of band would move that point and leave a hole the schedule never revisits.
-A **Fixed span** run has no coverage point, but the window is still the
-scheduler's to place. The browser withdraws **Trigger run** from a net that has
-a window of either kind. When the
-scheduler misses boundaries, it runs one bounded catch-up window instead of a
-backlog.
+When the scheduler misses boundaries, it runs one bounded catch-up window
+instead of a backlog.
+
+## Run a scheduled net now
+
+To run a net without waiting for its next boundary, select **Run now** in its
+row or in its drawer header. Any net with a saved schedule offers it, including
+a paused one. A net with no schedule does not.
+
+**Run now** fires the schedule's next window early. The server picks the window
+when it accepts the run, and the toast shows it:
+
+- **Since last run** reads from where the last successful run stopped to the
+  current time, less the lag. The same catch-up limit applies. On success, the
+  next scheduled run starts where this one stopped.
+- **Fixed span** reads the trailing span ending at the current time, less the
+  lag. Its results can overlap earlier runs.
+- **Query text** runs the saved text as written.
+
+A successful manual run also counts as any scheduled boundary that is already
+due, so the scheduler does not repeat an older window after it. A failed manual
+run changes nothing, and the due run still fires. Manual runs count toward
+**Keep schedule running for**.
+
+The server refuses a manual run when a run is already in progress, when the
+run count is used up, or when a **Since last run** schedule has nothing new to
+read. The toast shows the server's reason.
 
 Switching a windowed schedule back to **Query text** removes the window and the
 lag. The form says so before you save and, when the schedule reports one, names the point coverage stops at.
@@ -76,11 +96,12 @@ successful run with zero rows mean different things.
 
 Each run keeps the query text it ran. A run under a schedule window stores
 the absolute bounds it covered, which explains why a report included an
-event. A run without a window, including every run of the schedule above and
-every manual run, stores the saved text as written, so its `last=1h` stays
-relative and a rerun of that text reads a different hour. The stored result
-is the record of the run either way. Select **Trigger run** only when you want a new run.
-It changes the server, not only your screen.
+event. A run without a window, including every run of the schedule above,
+stores the saved text as written, so its `last=1h` stays relative and a rerun
+of that text reads a different hour. The stored result is the record of the run
+either way. History marks a run started with **Run now** as **Manual**. Select
+**Run now** only when you want a new run. It changes the server, not only your
+screen.
 
 Expanding a run shows its stored result 20 rows to a page. Paging reads the
 rows the browser already has and sends no further request. A run that stored
