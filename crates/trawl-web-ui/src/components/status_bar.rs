@@ -44,6 +44,14 @@ pub fn StatusBar(
         .and_then(|w| w.location().host().ok())
         .unwrap_or_default();
     let server = LocalResource::new(api::health);
+    // Where the health probe stands, so a test can wait for a settled
+    // failure instead of a timeout: the host-only label reads the same
+    // while the probe is pending and after it has failed.
+    let health_state = move || match server.get() {
+        None => "pending",
+        Some(Ok(_)) => "ok",
+        Some(Err(_)) => "error",
+    };
 
     let status_label = move || match status.get() {
         StatusKind::Connected => match server.get().and_then(Result::ok).and_then(|h| h.version) {
@@ -58,7 +66,7 @@ pub fn StatusBar(
     view! {
         <footer class="statusbar">
             <div class="grp">
-                <span class="strong status-label">{status_label}</span>
+                <span class="strong status-label" data-health=health_state>{status_label}</span>
             </div>
             {move || lagged.get().map(|n| view! {
                 <>

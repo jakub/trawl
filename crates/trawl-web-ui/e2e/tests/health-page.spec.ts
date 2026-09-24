@@ -847,8 +847,7 @@ test('the connected label keeps the host alone when health fails', async ({ page
   await expect.poll(() => failed).toBe(true);
   const host = new URL(page.url()).host;
   const label = page.locator(SEL.statusLabel);
-  await expect(label).toHaveText(`Connected (${host})`);
-  // Let the failed resource settle before proving the label stayed put.
-  await page.waitForTimeout(350);
+  // The label reads the same while pending, so wait for the settled failure.
+  await expect(label).toHaveAttribute('data-health', 'error');
   await expect(label).toHaveText(`Connected (${host})`);
 });
