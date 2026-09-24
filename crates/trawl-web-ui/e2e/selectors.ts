@@ -695,11 +695,25 @@ export const COPY = {
   windowRescheduleHint: 'Changing the window or interval may run the schedule immediately.',
   /// The lag box's own helper.
   windowLagHintText: 'Moves both bounds back by this much. Blank is none.',
-  /// crates/trawl-web-ui/src/components/net_drawer.rs — the manual run
-  /// action, withdrawn when the SAVED schedule carries a window.
-  netRunAction: '⏱ Run',
-  /// Its twin in the nets table's direct actions.
-  netTriggerAction: 'Trigger run',
+  /// crates/trawl-web-ui/src/schedule_edit.rs `RUN_NOW` — the one label
+  /// for firing a schedule by hand, in the nets row and the net drawer
+  /// header alike. Offered exactly when the SAVED net has a schedule.
+  netRunNow: 'Run now',
+  /// The Run now success toast: the window the server claimed, as
+  /// `run_started_toast` formats it. `{from}` and `{to}` are the bounds.
+  runStartedToast: 'Run started · covers {from}–{to} UTC',
+  /// The same toast for a run with no window (query mode).
+  runStartedPlain: 'Run started',
+  /// The success toast's link to the started run.
+  runViewLink: 'View run',
+  /// A refused Run now's toast title; the detail is the server's message.
+  runNotStarted: 'Run not started',
+  /// What the schedule form says Run now reads, per windowed mode.
+  runNowSinceLastLine: 'Run now reads from where the last successful run stopped.',
+  runNowFixedLine: 'Run now reads the span ending now; results can overlap earlier runs.',
+  /// crates/trawl-web-ui/src/tone_vocab.rs `run_origin_label` — the
+  /// marker a manual run carries in run history.
+  runOriginManual: 'Manual',
   /// crates/trawl-web-ui/src/schedule_edit.rs `preview_cap` — the line a
   /// capped preview shows, as the source formats it.
   previewCapLine: 'This run stored {n} rows; {fetched} were fetched. Paging covers the fetched rows.',

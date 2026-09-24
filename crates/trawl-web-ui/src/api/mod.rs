@@ -622,7 +622,9 @@ pub async fn update_saved_full(
     }
 }
 
-/// POST /api/v1/saved/{id}/run — trigger an immediate report run.
+/// POST /api/v1/saved/{id}/run — Run now: fire the schedule's next
+/// window early. The answer is the claimed run, window included, so the
+/// caller can state the bounds the server chose rather than guess them.
 pub async fn trigger_run(saved_id: i64) -> Result<ReportRunSummary, ApiError> {
     let resp = Request::post(&format!("/api/v1/saved/{saved_id}/run"))
         .send()
@@ -633,7 +635,10 @@ pub async fn trigger_run(saved_id: i64) -> Result<ReportRunSummary, ApiError> {
             .await
             .map_err(|e| ApiError::Decode(e.to_string())),
         401 => Err(ApiError::Unauthorized),
-        s => Err(ApiError::Status(s)),
+        // A refusal (a run already in progress, the max-runs cap, nothing
+        // new to read, no schedule) is an operator-facing sentence, and
+        // the toast shows it rather than a bare status.
+        s => Err(server_error(&resp, s).await),
     }
 }
 

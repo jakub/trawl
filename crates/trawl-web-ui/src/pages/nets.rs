@@ -18,12 +18,14 @@ use trawl_api::SavedQueryResponse;
 use crate::api;
 use crate::components::net_drawer::NetDrawer;
 use crate::components::sort_th::table_sort_th;
-use crate::schedule_edit::cadence_sentence;
+use crate::schedule_edit::{
+    RUN_NOT_STARTED, RUN_NOW, VIEW_RUN, cadence_sentence, run_now_offered, run_started_toast,
+};
 use crate::state::query::{Mode, RangeSpec, navigator, report_refusal};
 use fleet_ui::time::{time_ago, time_until};
 use fleet_ui::{
     Badge, ConfirmModal, ConfirmState, LoadState, Loaded, Pager, SearchInput, ToastBus, ToastKind,
-    Tone,
+    ToastLink, Tone,
 };
 
 /// Whether a net survives the list filter: its name or its query text.
@@ -157,24 +159,30 @@ pub fn NetsPage() -> impl IntoView {
         }
     };
 
-    let on_trigger_run = {
-        move |id: i64, name: String| {
-            spawn_local(async move {
-                match api::trigger_run(id).await {
-                    Ok(_) => {
-                        bus.push(
-                            ToastKind::Success,
-                            "Run triggered",
-                            Some(format!("'{name}' is executing.")),
-                        );
-                        refresh.update(|n| *n += 1);
-                    }
-                    Err(e) => {
-                        bus.push(ToastKind::Error, "Trigger failed", Some(e.to_string()));
-                    }
+    // Run now fires the saved schedule's next window early; the server
+    // resolves that window at claim time and the toast repeats it.
+    let on_run_now = move |id: i64, name: String, in_flight: RwSignal<bool>| {
+        in_flight.set(true);
+        spawn_local(async move {
+            let outcome = api::trigger_run(id).await;
+            // The row may have unmounted (deleted, filtered away) while
+            // the request was out; the toast still reports it.
+            let _ = in_flight.try_set(false);
+            match outcome {
+                Ok(run) => {
+                    bus.push_with_link(
+                        ToastKind::Success,
+                        run_started_toast(&run),
+                        Some(name),
+                        ToastLink::new(format!("/jobs/runs?run={}&net={id}", run.id), VIEW_RUN),
+                    );
+                    refresh.update(|n| *n += 1);
                 }
-            });
-        }
+                Err(e) => {
+                    bus.push(ToastKind::Error, RUN_NOT_STARTED, Some(e.to_string()));
+                }
+            }
+        });
     };
 
     #[allow(clippy::cast_possible_truncation)]
@@ -256,6 +264,7 @@ pub fn NetsPage() -> impl IntoView {
                                 // The row owner and its controls survive data and clock ticks.
                                 // Read current values when invoking an action, not the mount-time net.
                                 let run = on_run_in_search.clone();
+                                let run_in_flight = RwSignal::new(false);
                                 // The drawer is a place with a URL, so the row's one
                                 // control is a link built by the same producer
                                 // `push_net` uses; `prop:replace` is that call's
@@ -304,15 +313,17 @@ pub fn NetsPage() -> impl IntoView {
                                                     ev.stop_propagation();
                                                     run(net.get_untracked().query);
                                                 }><span aria-hidden="true">"⌕"</span></button>
-                                            <Show when=move || net.get().schedule.and_then(|s| s.window).is_none()>
-                                                <button type="button" class="btn-icon" aria-label="Trigger run" title="Trigger run"
+                                            <Show when=move || run_now_offered(&net.get())>
+                                                <button type="button" class="btn-icon" aria-label=RUN_NOW title=RUN_NOW
+                                                    disabled=move || run_in_flight.get()
                                                     on:click=move |ev| {
                                                         ev.stop_propagation();
                                                         let current = net.get_untracked();
-                                                        // A window owns its coverage. Recheck saved state
-                                                        // on activation before triggering an out-of-band run.
-                                                        if current.schedule.and_then(|s| s.window).is_none() {
-                                                            on_trigger_run(id, current.name);
+                                                        // Recheck the saved state on activation: a
+                                                        // schedule removed since render has nothing
+                                                        // left to fire.
+                                                        if run_now_offered(&current) && !run_in_flight.get_untracked() {
+                                                            on_run_now(id, current.name, run_in_flight);
                                                         }
                                                     }><span aria-hidden="true">"↻"</span></button>
                                             </Show>

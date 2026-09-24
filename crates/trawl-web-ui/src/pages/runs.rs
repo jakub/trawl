@@ -30,7 +30,7 @@ use crate::run_read::RunRead;
 use crate::state::query::{Mode, RangeSpec, navigator, report_refusal};
 use fleet_ui::time::{format_duration, time_ago};
 use fleet_ui::{
-    Badge, Drawer, LoadState, Loaded, PageTotal, PageWindow, Pager, SearchInput, ToastBus,
+    Badge, Drawer, LoadState, Loaded, PageTotal, PageWindow, Pager, SearchInput, ToastBus, Tone,
 };
 
 /// A server page under one ordering intent. The revision prevents returning
@@ -352,7 +352,9 @@ pub fn RunsPage() -> impl IntoView {
                                     <td><a class="row-stretch" href=href prop:replace=true>{move || run.get().net_name}</a></td>
                                     <td><span style="font-size:11px">{move || {
                                         crate::tone_vocab::run_status_label(&run.get().run.status).to_owned()
-                                    }}</span></td>
+                                    }}</span>{move || crate::tone_vocab::run_origin_label(run.get().run.origin.as_deref())
+                                        .map(str::to_owned)
+                                        .map(|origin| view! { " " <Badge tone=Tone::Neutral>{origin}</Badge> })}</td>
                                     <td>{move || time_ago(&run.get().run.started_at, now_ms.get())}</td>
                                     <td>{move || run.get().run.duration_ms.map_or_else(|| "—".to_string(), format_duration)}</td>
                                     <td style="text-align:right">{move || run.get().run.row_count.map_or_else(|| "—".to_string(), |n| n.to_string())}</td>
