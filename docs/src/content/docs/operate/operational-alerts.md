@@ -473,12 +473,20 @@ refused. [Crash recovery](/architecture/recovery/) describes the protocol.
   and the temporary output is gone. Recovery touches nothing and counts the
   marker on every tick until an operator resolves it.
 
-1. Find `publication_recovery_failed` in the daemon log. It names the
-   environment, the service, and the marker path. A contradiction carries a
-   `reason`: `invalid_marker`, `not_regular_file`, `output_missing`, or
-   `output_mismatch`. A failure carries the filesystem error.
-2. For a failure, correct the reported permission or storage problem. The
-   next tick completes the marker, and the service compacts again.
+1. Find `publication_recovery_failed` in the daemon log. An event about one
+   marker names the environment, the service, and the marker path. A
+   contradiction carries a `reason`: `invalid_marker`, `not_regular_file`,
+   `output_missing`, or `output_mismatch`. A failure carries the filesystem
+   error. Recovery can also fail before it reaches a marker. If recovery
+   cannot list an environment's WAL directory, the event carries only the
+   environment and the error, and every service in that environment stays
+   blocked. This case does not count toward this alert; compaction counts
+   it under `wal_environment_scan`. If a compaction tick cannot list the WAL
+   root, the event carries only the error and counts as `failed`.
+2. For a failure, correct the reported permission or storage problem. When
+   the event has no service or marker path, investigate the directory that
+   its error names. The next tick completes the marker, and the service
+   compacts again.
 3. For a contradiction, stop trawld and preserve the marker, the WAL files it
    lists, and the parquet and temporary files at its partition. Find out what
    changed the canonical file or removed the temporary output, such as a
