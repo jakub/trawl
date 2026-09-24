@@ -282,6 +282,55 @@ test('subsecond events fall inside their histogram tooltip intervals', async ({ 
   }
 });
 
+test('histogram tooltip stays inside the strip at both edges', async ({ page }) => {
+  // Events in the first and the last bucket, both errors, so the two
+  // edge bars carry the longest tip text this strip draws.
+  const events = [['2026-09-01T00:00:00.100Z', 17], ['2026-09-01T00:00:00.900Z', 17]];
+  await page.route('**/api/v1/query', route => route.fulfill({ json: { ...countResult, columns: [{ name: '_time' }, { name: '_severity' }], rows: events } }));
+  await page.goto('/search?q=service%3Dnginx');
+  const histo = page.locator('.histo');
+  const bars = page.locator('.histo .bar');
+  await expect(bars).toHaveCount(48);
+
+  // Layout boxes are fractional and the page offers only whole-pixel
+  // offsets to measure the tip against, so the two boxes may disagree
+  // by sub-pixel rounding. Half a pixel is less than one device pixel
+  // at DPR 1, so a tip that passes cannot visibly cross the strip edge.
+  const ROUNDING = 0.5;
+  const inside = async (label: string, index: number) => {
+    const tip = bars.nth(index).locator('.tip');
+    // The tip fades in over 120ms; measure it once it is fully shown.
+    await expect(tip).toHaveCSS('opacity', '1');
+    const [t, h] = [await tip.boundingBox(), await histo.boundingBox()];
+    expect(t && h, label).toBeTruthy();
+    expect(t!.x, `${label}: left edge`).toBeGreaterThanOrEqual(h!.x - ROUNDING);
+    expect(t!.x + t!.width, `${label}: right edge`).toBeLessThanOrEqual(h!.x + h!.width + ROUNDING);
+  };
+
+  for (const viewport of [{ width: 1400, height: 900 }, { width: 800, height: 900 }]) {
+    await page.setViewportSize(viewport);
+    for (const index of [0, 47]) {
+      const bar = bars.nth(index);
+      const at = `${viewport.width}px, bar ${index}`;
+
+      await bar.hover();
+      await inside(`${at}, hover`, index);
+      await page.mouse.move(0, 0);
+      await expect(bar.locator('.tip')).toHaveCSS('opacity', '0');
+
+      // Keyboard focus, arrived at by Tab so :focus-visible matches.
+      await bar.focus();
+      await page.keyboard.press(index === 0 ? 'Tab' : 'Shift+Tab');
+      await page.keyboard.press(index === 0 ? 'Shift+Tab' : 'Tab');
+      await expect(bar).toBeFocused();
+      await inside(`${at}, focus`, index);
+      await page.locator('body').click({ position: { x: 0, y: 0 } });
+      await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
+      await expect(bar.locator('.tip')).toHaveCSS('opacity', '0');
+    }
+  }
+});
+
 test('numeric group keys are series, labelled by their own digits', async ({ page }) => {
   // `by status` over 200 and 500: the roles come from the query, so the
   // numbers in the group column are two series and not two metrics.

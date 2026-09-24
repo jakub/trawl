@@ -18,15 +18,30 @@
 //! as ok.
 //!
 //! The x axis reads real timestamps off the data.
+//!
+//! A bar's tooltip is centred on it, and on hover or keyboard focus it is
+//! measured against the strip and shifted sideways (`--tip-shift`) so an
+//! edge bar's tip never runs past the strip, where `.search-col` clips
+//! it. The shift is `crate::histogram::tip_shift`.
 
 use fleet_ui::{LoadState, Loaded};
 use leptos::prelude::*;
 use trawl_api::QueryResponse;
 use trawl_api::value::Value;
 
-use crate::histogram::{Series, axis_labels, bucket_time, bucketize_series};
+use wasm_bindgen::JsCast;
+use web_sys::HtmlElement;
+
+use crate::histogram::{Series, axis_labels, bucket_time, bucketize_series, tip_shift};
 
 const N_BUCKETS: usize = 48;
+
+/// Pixels a shifted tip keeps clear of each strip edge. Offsets are whole
+/// pixels but the flex layout is fractional: the bar's left and width,
+/// the tip's width and the strip's width can each be half a pixel off,
+/// and the two halvings in `tip_shift` floor. Clamping into a strip inset
+/// by this much on both sides keeps that error inside the real strip.
+const TIP_EDGE: i32 = 3;
 
 #[component]
 pub fn Histogram(
@@ -80,7 +95,14 @@ pub fn Histogram(
                                     if b.err > 0 { format!(" · {} errors", b.err) } else { String::new() }
                                 );
                                 view! {
-                                    <div class="bar" tabindex="0" role="img" aria-label=tip>
+                                    <div
+                                        class="bar"
+                                        tabindex="0"
+                                        role="img"
+                                        aria-label=tip
+                                        on:mouseenter=move |ev| place_tip(&ev)
+                                        on:focus=move |ev| place_tip(&ev)
+                                    >
                                         <div class="tip" aria-hidden="true">{tip.clone()}</div>
                                         <div class="ok" style=format!("height:{ok_h:.1}%")></div>
                                         <div class="err" style=format!("height:{err_h:.1}%")></div>
@@ -98,6 +120,60 @@ pub fn Histogram(
             />
         </div>
     }
+}
+
+/// Measure the entered or focused bar's tip against the strip and set the
+/// tip's `--tip-shift`, which the stylesheet adds to its centring
+/// transform.
+///
+/// Measured at the moment it is shown rather than once at render: the
+/// strip's width follows the viewport and the tip's width its label.
+fn place_tip(ev: &web_sys::Event) {
+    let Some(bar) = ev
+        .current_target()
+        .and_then(|t| t.dyn_into::<HtmlElement>().ok())
+    else {
+        return;
+    };
+    let Some(strip) = bar.closest(".histo").ok().flatten() else {
+        return;
+    };
+    let Some(tip) = bar
+        .query_selector(".tip")
+        .ok()
+        .flatten()
+        .and_then(|t| t.dyn_into::<HtmlElement>().ok())
+    else {
+        return;
+    };
+    // `.histo` is the nearest positioned ancestor, so it is the bar's
+    // offsetParent and one `offset_left` is the bar's position in the
+    // strip. Walk the chain regardless, so a positioned wrapper added
+    // between them later still measures from the strip.
+    let mut bar_left = 0;
+    let mut node = bar.clone();
+    loop {
+        bar_left += node.offset_left();
+        match node.offset_parent() {
+            Some(parent) if parent == strip => break,
+            Some(parent) => match parent.dyn_into::<HtmlElement>() {
+                Ok(parent) => node = parent,
+                Err(_) => return,
+            },
+            // Not laid out, or the strip is not an ancestor that
+            // positions it: nothing to measure against.
+            None => return,
+        }
+    }
+    let shift = tip_shift(
+        bar_left - TIP_EDGE,
+        bar.offset_width(),
+        tip.offset_width(),
+        strip.client_width() - 2 * TIP_EDGE,
+    );
+    let _ = tip
+        .style()
+        .set_property("--tip-shift", &format!("{shift}px"));
 }
 
 #[allow(clippy::cast_precision_loss)] // bucket index is at most N_BUCKETS

@@ -4,7 +4,7 @@
 
 //! Pure-logic helpers for the histogram surfaces.
 //!
-//! Two independent jobs live here:
+//! Three independent jobs live here:
 //!
 //! - [`bucketize_series`] — the search-page strip. Splits an iterator of
 //!   `(timestamp_seconds, is_error)` tuples into `n_buckets`
@@ -16,6 +16,8 @@
 //!   the server already aggregated (`timechart span=1h`) onto a fixed
 //!   grid, so gaps in the data render as gaps instead of collapsing the
 //!   chart to one bar per returned row.
+//! - [`tip_shift`] — how far a strip bar's tooltip moves sideways so it
+//!   stays inside the strip.
 //!
 //! The histogram component is intentionally tolerant: callers pass
 //! whatever timestamps they can extract (parsed `_time` strings,
@@ -235,6 +237,27 @@ pub fn parse_bucket_ms(s: &str) -> Option<i64> {
     Some((days * 86_400 + h * 3_600 + mi * 60 + sec) * 1_000)
 }
 
+/// How far a bar's tooltip moves sideways, in pixels, to lie inside the
+/// strip.
+///
+/// The tip is centred on its bar: its natural left edge is
+/// `bar_left + bar_width / 2 - tip_width / 2`, with every position
+/// measured from the strip's left edge. The shift moves that edge into
+/// `0..=strip_width - tip_width` and is zero when it is already there.
+/// A tip wider than the strip cannot fit either way; it aligns to the
+/// strip's left edge, so its start (the bucket's start time) stays
+/// readable.
+///
+/// A measured clamp, not a rule for "the first or last few bars": the tip
+/// width follows its label and the bar width follows the bucket count
+/// and the viewport, so no fixed number of edge bars is right.
+#[must_use]
+pub fn tip_shift(bar_left: i32, bar_width: i32, tip_width: i32, strip_width: i32) -> i32 {
+    let natural = bar_left + bar_width / 2 - tip_width / 2;
+    let clamped = natural.min(strip_width - tip_width).max(0);
+    clamped - natural
+}
+
 /// Days since the Unix epoch for a proleptic-Gregorian date.
 /// Hinnant's `days_from_civil`.
 ///
@@ -257,6 +280,43 @@ mod tests {
 
     fn buckets(events: &[(f64, bool)], n: usize) -> Vec<Bucket> {
         bucketize_series(events, n).map_or_else(Vec::new, |s| s.buckets)
+    }
+
+    #[test]
+    fn tip_shift_leaves_a_tip_that_fits_centred() {
+        // Bar 500..520 centres a 100px tip at 460..560, inside 0..1000.
+        assert_eq!(tip_shift(500, 20, 100, 1000), 0);
+    }
+
+    #[test]
+    fn tip_shift_pushes_a_first_bar_tip_right_to_the_strip_edge() {
+        // Natural left is 40 + 10 - 150 = -100; the tip moves 100px right.
+        assert_eq!(tip_shift(40, 20, 300, 1000), 100);
+    }
+
+    #[test]
+    fn tip_shift_pulls_a_last_bar_tip_left_to_the_strip_edge() {
+        // Natural left is 966 + 10 - 150 = 826, so the right edge would be
+        // 1126; the tip moves left until it ends at 1000.
+        let shift = tip_shift(966, 20, 300, 1000);
+        assert_eq!(shift, -126);
+        assert_eq!(826 + shift + 300, 1000);
+    }
+
+    #[test]
+    fn tip_shift_aligns_a_tip_wider_than_the_strip_to_its_left_edge() {
+        // 500px of tip in a 400px strip: left edge at 0, wherever the bar is.
+        for bar_left in [0, 190, 380] {
+            let natural = bar_left + 10 - 250;
+            assert_eq!(natural + tip_shift(bar_left, 20, 500, 400), 0, "{bar_left}");
+        }
+    }
+
+    #[test]
+    fn tip_shift_touching_either_edge_is_inside() {
+        // Exactly at 0 and exactly ending at the strip width: no move.
+        assert_eq!(tip_shift(40, 20, 100, 1000), 0);
+        assert_eq!(tip_shift(940, 20, 100, 1000), 0);
     }
 
     #[test]

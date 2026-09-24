@@ -1085,11 +1085,14 @@
   color: var(--ink-3);
   pointer-events: none;
 }
+/* Centred on its bar, then shifted sideways by the measured
+ * `--tip-shift` (components/histogram.rs) so an edge bar's tip stays
+ * inside the strip. Vertical placement does not move. */
 .histo .bar .tip {
   position: absolute;
   bottom: calc(100% + 2px);
   left: 50%;
-  transform: translateX(-50%);
+  transform: translateX(calc(-50% + var(--tip-shift, 0px)));
   background: var(--ink);
   color: var(--panel);
   font-family: var(--font-mono);
