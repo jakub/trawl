@@ -71,7 +71,6 @@ page URL. These client limits do not guarantee acceptance by every deployment.
 | **Events** tab | The result table, with the row count in the tab. An aggregation renders the exact table and, where the shape allows it, the categorical chart beside it |
 | **Visualization** tab | The chart for a `timechart` or `stats … by` result, as Line, Column, or Bar. It has no pager: it draws a whole result or states why it cannot |
 | **View** | In the results header. Chooses how snapshot events and their details appear |
-| **Save** | In the results header. Opens the same dialog as **Save as Net** and captures the editor text |
 | **Export** | Downloads the results as CSV, JSON, or Parquet |
 | **← Prev**, **Next →** | Under the Events tab's table. Page through results, 50 rows per page |
 
@@ -104,7 +103,7 @@ the chart of one page is a different picture from the chart of the result. See
 and
 [ADR-0038](https://github.com/jakub/trawl/blob/main/docs/adr/0038-the-visualization-tab-draws-time-and-groups.md).
 
-Both Save controls omit the range control and sidebar filters. They save the
+**Save as Net** omits the range control and sidebar filters. It saves the
 editor text, not the effective query or returned rows.
 
 **Edited** appears when the editor differs from the executed query. The strip
@@ -196,7 +195,7 @@ The page reads five URL parameters and ignores the rest.
 Copy the whole URL after the search has run. A malformed `f`, `r`, or `page`
 blocks execution until you apply the offered repair, and the broken URL stays
 intact. While that notice is present, the page also blocks **Haul**,
-**Live Tail**, **Save as Net**, **Save**, **Export**, pagination, range changes,
+**Live Tail**, **Save as Net**, **Export**, pagination, range changes,
 and the filter controls.
 
 A URL larger than 32 KiB, or one with more than 64 parameters, is refused whole,
