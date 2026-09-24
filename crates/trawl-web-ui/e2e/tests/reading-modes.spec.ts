@@ -104,10 +104,12 @@ test('inspector mode opens the selected event beside the table', async ({ page, 
 
   // Three controls per field — Include, Exclude, Copy — each named for
   // the field and value it acts on, since "Include" alone repeats down
-  // the whole grid.
-  await expect(page.locator(SEL.inspectorTag)).toHaveCount(CORPUS.columns.length * 3);
+  // the whole grid. `_time` keeps only its Copy: the Range picker owns
+  // time, so its row offers no value filter.
+  await expect(page.locator(SEL.inspectorTag)).toHaveCount(CORPUS.columns.length * 3 - 2);
   await expect(inspector.getByRole('button', { name: 'Include host = web-02' })).toHaveCount(1);
   await expect(inspector.getByRole('button', { name: 'Exclude host = web-02' })).toHaveCount(1);
+  await expect(inspector.getByRole('button', { name: /^(Include|Exclude) _time = / })).toHaveCount(0);
 
   // Escape closes it while nothing is stacked over the page.
   await page.locator(SEL.resultsPane).focus();

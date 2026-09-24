@@ -1158,6 +1158,18 @@ const CONTRACTS: &[Contract] = &[
         hook: "class=\"tag\"",
     },
     Contract {
+        assignment: "resultsDetailFieldName: '.results-table td.detail .dg .k',",
+        source_path: "src/components/results_table.rs",
+        source: RESULTS_TABLE_RS,
+        hook: "class=\"k\"",
+    },
+    Contract {
+        assignment: "inspectorFieldName: '#search-inspector .dg .k',",
+        source_path: "src/components/results_table.rs",
+        source: RESULTS_TABLE_RS,
+        hook: "class=\"k\"",
+    },
+    Contract {
         assignment: "resultsDetailNullToggle: '.results-table td.detail button.null-toggle',",
         source_path: "src/components/results_table.rs",
         source: RESULTS_TABLE_RS,

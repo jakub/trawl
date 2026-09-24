@@ -293,6 +293,11 @@ export const SEL = {
   /// key-value grid. Told apart by accessible name, which carries the
   /// field and value the press acts on.
   inspectorTag: '#search-inspector button.tag',
+  /// One field name in the expanded row's key/value grid. Counting these
+  /// counts the detail rows rendered.
+  resultsDetailFieldName: '.results-table td.detail .dg .k',
+  /// One field name in the inspector's key/value grid.
+  inspectorFieldName: '#search-inspector .dg .k',
   /// The "Show N null fields" disclosure under the expanded row's field
   /// grid. Absent when the event has no null field.
   resultsDetailNullToggle: '.results-table td.detail button.null-toggle',
