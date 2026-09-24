@@ -3805,6 +3805,153 @@ async fn a_second_finish_of_a_terminal_manual_run_moves_no_cursor() {
     );
 }
 
+/// Block until some backend in this test's database waits on a lock.
+async fn await_lock_waiter(pool: &sqlx::PgPool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_stat_activity
+             WHERE wait_event_type = 'Lock' AND datname = current_database()",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        if waiting > 0 {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no backend ever queued behind the held lock"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// A run's stored `started_at`.
+async fn stored_started_at(pool: &sqlx::PgPool, run_id: i64) -> chrono::DateTime<chrono::Utc> {
+    sqlx::query_scalar("SELECT started_at FROM report_runs WHERE id = $1")
+        .bind(run_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// Every run's `started_at` comes from ONE clock, the application's,
+/// read after the claim holds its locks. A scheduled claim that stamped
+/// the database's `now()` instead would record its transaction's start,
+/// and against a remote Postgres whose clock is skewed that orders a
+/// manual run against scheduled ones wrongly under `run=latest`, history
+/// and count-based retention.
+///
+/// A single host cannot skew the two clocks, so the test pins the stamp's
+/// domain through the one gap it can open: the claim's transaction begins,
+/// then queues behind a held saved-query lock. `now()` is frozen at the
+/// begin; the application clock read after the locks is not.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_claim_stamps_started_at_from_the_app_clock_after_its_locks() {
+    use trawl_server::store::{DueClaim, ManualRunClaim, RunStatus};
+
+    let server = setup().await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+    let store = tick_store(&server).await;
+    let pool = common::app_pool(&server.app_db_url).await;
+
+    let saved = client
+        .create_saved("one-clock", "service=nginx")
+        .await
+        .unwrap();
+    let schedule = client
+        .set_schedule(saved.id, "1h", None, true, None, None)
+        .await
+        .unwrap();
+    let overdue = now_micros() - minutes(90);
+    set_next_fire_at(&server, schedule.id, overdue).await;
+    let key_id: i64 = sqlx::query_scalar("SELECT key_id FROM saved_queries WHERE id = $1")
+        .bind(saved.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    // Hold level 1 so the tick's transaction begins and then waits.
+    let mut holder = pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM saved_queries WHERE id = $1 FOR UPDATE")
+        .bind(saved.id)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+
+    // The tick's `now` is an instant in the past on purpose: the stamp is
+    // a clock reading, not the tick's planning instant.
+    let tick_now = overdue + minutes(30);
+    let claimant = store.clone();
+    let claim =
+        tokio::spawn(async move { claimant.claim_due_run(schedule.id, tick_now, 24).await });
+
+    // Barrier: the claim is queued on the held row, so its transaction
+    // (and with it the database's `now()`) has already begun.
+    await_lock_waiter(&pool).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let released = now_micros();
+    holder.commit().await.unwrap();
+
+    let DueClaim::Started(scheduled) = claim.await.unwrap().unwrap() else {
+        panic!("the overdue tick must start a run");
+    };
+    let after = now_micros();
+    let stamped = stored_started_at(&pool, scheduled.run_id).await;
+    assert!(
+        released <= stamped && stamped <= after,
+        "a scheduled claim stamps the app clock after its locks: \
+         {released} <= {stamped} <= {after}"
+    );
+    store
+        .finish_run(
+            scheduled.run_id,
+            RunStatus::Success,
+            5,
+            Some(0),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // The manual run claimed next is the latest by the same clock.
+    let before_manual = now_micros();
+    let ManualRunClaim::Started(manual) =
+        store.claim_manual_run(saved.id, key_id, 24).await.unwrap()
+    else {
+        panic!("the manual claim must start");
+    };
+    let after_manual = now_micros();
+    let manual_stamp = stored_started_at(&pool, manual.run_id).await;
+    assert_eq!(manual_stamp, manual.claimed_at);
+    assert!(before_manual <= manual_stamp && manual_stamp <= after_manual);
+    store
+        .finish_run(
+            manual.run_id,
+            RunStatus::Success,
+            5,
+            Some(0),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let latest = store
+        .latest_successful_run(saved.id)
+        .await
+        .unwrap()
+        .expect("two successes");
+    assert_eq!(
+        latest.id, manual.run_id,
+        "run=latest orders the manual run after the scheduled one"
+    );
+}
+
 /// A manual run ignores `enabled`: it runs on a paused schedule and leaves
 /// it paused. The boundaries it overtook stay consumed, so resuming does
 /// not re-run a window the manual run already covered, while the next

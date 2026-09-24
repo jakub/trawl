@@ -41,6 +41,13 @@
 //!   in that same transaction. It takes the schedule lock FIRST for them —
 //!   same order as the claim and the delete, so the three can never
 //!   deadlock against each other.
+//!
+//! Run order has one clock. Every claim stamps `report_runs.started_at`
+//! from the application clock, read after its locks are held, never from
+//! the database's `now()`. `run=latest`, run history and count-based
+//! retention sort by that column, and a remote Postgres with a skewed clock
+//! would otherwise order manual runs against scheduled ones wrongly.
+//! Age-based retention compares it against the same application clock.
 
 use std::collections::HashSet;
 
@@ -1072,7 +1079,7 @@ impl ScheduleStore {
             query,
             window,
             RunOrigin::Scheduled,
-            None,
+            truncate_to_micros(Utc::now()),
         )
         .await;
 
@@ -1233,7 +1240,7 @@ impl ScheduleStore {
             &query,
             window.as_ref(),
             RunOrigin::Manual,
-            Some(t),
+            t,
         )
         .await
         {
@@ -1282,7 +1289,10 @@ impl ScheduleStore {
     /// `now` is a value, never a clock reading taken here: the tick samples
     /// one instant and every schedule in it is judged against that same
     /// instant, so two schedules cannot land on either side of a boundary
-    /// that passed mid-poll.
+    /// that passed mid-poll. The run row's `started_at` is the one clock
+    /// reading this claim takes, from the application clock once the locks
+    /// are held, because it records when the run started rather than what
+    /// the tick planned against (see [`insert_running_run`]).
     ///
     /// LOCK ORDER: `saved_queries` -> `schedules` -> `report_runs`, the
     /// order every multi-row path in this module takes, extended one level
@@ -1370,7 +1380,9 @@ impl ScheduleStore {
             }
         }
 
-        // Level 3: the run row.
+        // Level 3: the run row. Its start is a clock reading taken now,
+        // with every lock held, not the tick's planning instant: `now` is
+        // shared by every schedule in the poll, and the run starts later.
         let run_id = match insert_running_run(
             &mut tx,
             schedule_id,
@@ -1378,7 +1390,7 @@ impl ScheduleStore {
             &resolved_query,
             plan.window.as_ref(),
             RunOrigin::Scheduled,
-            None,
+            truncate_to_micros(Utc::now()),
         )
         .await
         {
@@ -1431,9 +1443,10 @@ impl ScheduleStore {
     ///
     /// A SUCCESS of a MANUAL run also consumes the fire boundaries it
     /// overtook (ADR-0018 amended 2026-09-23): a cursor at or before the
-    /// run's `started_at` moves to the first boundary after it, via
-    /// [`fire_boundaries`], so an overdue scheduled run cannot follow with
-    /// an older window. A cursor already past `started_at` is left alone,
+    /// run's `started_at` (the application-clock instant the claim planned
+    /// from, the same domain as every fire cursor) moves to the first
+    /// boundary after it, via [`fire_boundaries`], so an overdue scheduled
+    /// run cannot follow with an older window. A cursor already past `started_at` is left alone,
     /// which includes one a cadence edit re-anchored mid-run, and the phase
     /// never shifts. Only a run that was still `running` gets this: a
     /// finish landing on a terminal row is not the run succeeding. The
@@ -2363,11 +2376,17 @@ fn plan_input(schedule: &Schedule, now: DateTime<Utc>, max_catchup_intervals: u3
 /// forgotten. `origin` has no default for the same reason: every claimant
 /// has to say how its run started.
 ///
-/// `started_at` is `None` for the database's own `now()`, which is what a
-/// scheduled claim records. A manual claim passes the instant it planned
-/// its window from, so the run's start and the clock its window was
-/// measured against are one reading. The raw `sqlx::Error` comes back so each caller classifies
-/// the `report_runs_one_running` 23505 into its own answer.
+/// `started_at` is required, and it is an APPLICATION clock reading taken
+/// after the claimant holds its locks, never the database's `now()`.
+/// `run=latest`, run history and count-based retention all order runs by
+/// it, so every run has to be stamped in one clock domain: a remote
+/// Postgres with a skewed clock would otherwise order a manual run against
+/// scheduled ones wrongly. Reading after the locks means a claim that
+/// queued behind another is stamped after the run it waited for. A manual
+/// claim passes the same instant it planned its window from, so its start
+/// and its window are one reading. The raw `sqlx::Error` comes back so
+/// each caller classifies the `report_runs_one_running` 23505 into its own
+/// answer.
 ///
 /// This statement takes a lock it does not name. The `saved_query_id`
 /// foreign key makes postgres take FOR KEY SHARE on the saved-query row, so
@@ -2382,13 +2401,13 @@ async fn insert_running_run(
     query: &str,
     window: Option<&ReportWindow>,
     origin: RunOrigin,
-    started_at: Option<DateTime<Utc>>,
+    started_at: DateTime<Utc>,
 ) -> Result<i64, sqlx::Error> {
     sqlx::query_scalar::<_, i64>(
         "INSERT INTO report_runs
              (schedule_id, saved_query_id, query, status, started_at,
               window_start, window_end, window_truncated, window_kind, origin)
-         VALUES ($1, $2, $3, 'running', COALESCE($8, now()), $4, $5, $6, $7, $9)
+         VALUES ($1, $2, $3, 'running', $8, $4, $5, $6, $7, $9)
          RETURNING id",
     )
     .bind(schedule_id)
