@@ -20,7 +20,7 @@ use fleet_auth::KeyStore;
 use crate::config::SchedulerConfig;
 use crate::policy::{Permission, TrawlAuthz as _};
 use crate::pool::ExecutorPool;
-use crate::report_window::{format_window_bound, truncate_to_micros};
+use crate::report_window::{ReportWindow, format_window_bound, truncate_to_micros};
 use crate::store::{ClaimedRun, DueClaim, FinishOutcome, FlipOutcome, RunStatus, ScheduleStore};
 
 /// Spawn the scheduler background task.
@@ -215,21 +215,8 @@ pub async fn poll_and_execute(
             }
         };
 
-        if let Some(window) = claimed.window
-            && window.truncated
-        {
-            metrics::counter!(crate::metrics::SCHEDULER_WINDOW_TRUNCATED_TOTAL).increment(1);
-            // The bounds are instants, not operator text, so they are safe
-            // as event fields. They are fields and never metric labels: an
-            // instant is unbounded cardinality.
-            tracing::warn!(
-                event_type = "scheduler_window_truncated",
-                schedule_id = schedule.id,
-                run_id = claimed.run_id,
-                window_start = %format_window_bound(window.start),
-                window_end = %format_window_bound(window.end),
-                "report window clamped to max_catchup_intervals; the span before its start stays uncovered"
-            );
+        if let Some(window) = &claimed.window {
+            note_truncated_window(schedule.id, claimed.run_id, window);
         }
 
         // Execute the text the claim RESOLVED and stored, never the saved
@@ -260,6 +247,31 @@ pub async fn poll_and_execute(
     }
 
     spawned
+}
+
+/// Count and announce a claimed window whose start was clamped forward;
+/// a complete window is not news and records nothing.
+///
+/// One spelling for both claimants, the scheduler tick and a manual run
+/// (ADR-0018 amended 2026-09-23): an operator watching
+/// `trawl_scheduler_window_truncated_total` has to see every uncovered
+/// span, whichever door the run came through.
+pub(crate) fn note_truncated_window(schedule_id: i64, run_id: i64, window: &ReportWindow) {
+    if !window.truncated {
+        return;
+    }
+    metrics::counter!(crate::metrics::SCHEDULER_WINDOW_TRUNCATED_TOTAL).increment(1);
+    // The bounds are instants, not operator text, so they are safe as event
+    // fields. They are fields and never metric labels: an instant is
+    // unbounded cardinality.
+    tracing::warn!(
+        event_type = "scheduler_window_truncated",
+        schedule_id,
+        run_id,
+        window_start = %format_window_bound(window.start),
+        window_end = %format_window_bound(window.end),
+        "report window clamped to max_catchup_intervals; the span before its start stays uncovered"
+    );
 }
 
 /// Whether the schedule's owning key may still run scheduled queries.

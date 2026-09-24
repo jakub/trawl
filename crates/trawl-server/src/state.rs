@@ -68,6 +68,9 @@ pub struct QueryState {
     pub pool: ExecutorPool,
     /// Query timeout in seconds.
     pub timeout_secs: u64,
+    /// `[scheduler] max_catchup_intervals`, which clamps a manual
+    /// `since_last` run's window exactly as it clamps a scheduled one.
+    pub max_catchup_intervals: u32,
     /// Query lifecycle tracker (active + history).
     pub tracker: Arc<QueryTracker>,
     /// Schema cache TTL in seconds.
@@ -678,6 +681,7 @@ impl AppState {
                 // so query-only nodes are covered.
                 .with_field_catalog(Arc::clone(&field_catalog)),
                 timeout_secs: config.server.timeout_secs,
+                max_catchup_intervals: config.scheduler.max_catchup_intervals,
                 tracker: Arc::new(QueryTracker::with_capacity(config.server.max_query_history)),
                 schema_cache_ttl_secs: config.server.schema_cache_ttl_secs,
                 retention_horizon_secs,

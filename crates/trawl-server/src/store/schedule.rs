@@ -27,9 +27,9 @@
 //! - the no-concurrent-run guard is the partial unique index
 //!   `report_runs_one_running`; [`ScheduleStore::claim_run`] maps the named
 //!   23505 to [`RunClaim::AlreadyRunning`];
-//! - the manual-trigger path's `max_runs` check joins the run claim in one
-//!   transaction ([`ScheduleStore::claim_run`], `FOR UPDATE` on the schedule
-//!   row);
+//! - every claim's `max_runs` check joins the run insert in one
+//!   transaction (`FOR UPDATE` on the schedule row), manual runs included
+//!   ([`ScheduleStore::claim_manual_run`]);
 //! - deletions lock the parent row then every `report_runs` row (`FOR
 //!   UPDATE`, no `result_path` filter) before collecting parquet paths, so a
 //!   concurrent `finish_run` either lands its path before the lock or blocks
@@ -52,8 +52,9 @@ use super::history::{bind_u64, bind_usize};
 use super::saved::{SavedQuery, row_to_saved_query_at};
 use super::status::{RunOrigin, RunStatus, decode_origin, decode_status};
 use crate::report_window::{
-    Due, MaterializeError, PlanError, PlanInput, ReportWindow, ScheduleWindow, WindowKind,
-    WindowPolicyError, materialize_window, plan_due_run, validate_window_compatibility,
+    Due, ManualPlan, MaterializeError, PlanError, PlanInput, ReportWindow, ScheduleWindow,
+    WindowKind, WindowPolicyError, materialize_window, plan_due_run, plan_manual_run,
+    truncate_to_micros, validate_window_compatibility,
 };
 
 const MIN_INTERVAL_SECS: u64 = 60;
@@ -140,12 +141,10 @@ pub enum RunClaim {
 /// Outcome of an operator-triggered run claim
 /// ([`ScheduleStore::claim_manual_run`]).
 ///
-/// [`ManualRunClaim::CoverageMode`] is the one that is not about capacity.
-/// A schedule with a window OWNS what its reports cover: `since_last` tiles
-/// from a watermark a manual run would either skip past or double, and a
-/// fixed window is measured from a planned fire a manual run does not have.
-/// Neither has defined bounds outside the schedule, so the run is refused
-/// rather than given bounds nobody chose (ADR-0018 ruling 6).
+/// A manual run is the schedule's next window fired early (ADR-0018 amended
+/// 2026-09-23), so every mode can have one, and the refusals are about the
+/// schedule's state rather than its mode. The variants after `Started` are
+/// listed in the order the claim asks them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManualRunClaim {
     /// A run row was created; execute it.
@@ -153,16 +152,22 @@ pub enum ManualRunClaim {
     /// The saved query has no schedule, so there is nothing to record a
     /// run under.
     NoSchedule,
-    /// The schedule owns a window. The mode travels with the refusal so
-    /// the caller can name it.
-    CoverageMode(ScheduleWindow),
     /// A run is already in progress for this schedule.
     AlreadyRunning,
     /// The schedule has reached its `max_runs` cap.
     MaxRunsReached,
+    /// A `since_last` window ending now would read nothing the watermark
+    /// does not already cover.
+    EmptyWindow {
+        /// Where coverage stands: the schedule's watermark.
+        covered_through: DateTime<Utc>,
+        /// Where the refused window would have ended: `t - lag`.
+        window_end: DateTime<Utc>,
+    },
 }
 
-/// The run a manual claim created, with everything executing it needs.
+/// The run a manual claim created, with everything executing it and
+/// answering for it needs.
 ///
 /// The text comes from the saved-query row the claim locked, never from a
 /// snapshot the handler read a moment earlier, for the reason
@@ -173,10 +178,18 @@ pub enum ManualRunClaim {
 pub struct ClaimedManualRun {
     /// The `report_runs` row id.
     pub run_id: i64,
-    /// The saved DSL, executed and stored verbatim.
+    /// The schedule the run was recorded under.
+    pub schedule_id: i64,
+    /// The resolved DSL: the saved text with the claimed window spliced
+    /// on, or the saved text verbatim in query mode. Executed and stored.
     pub query: String,
     /// The saved query's display name at claim time.
     pub query_name: String,
+    /// The window this run covers, or `None` in query mode.
+    pub window: Option<ReportWindow>,
+    /// The instant `t` the claim planned from, which is also the row's
+    /// `started_at`.
+    pub claimed_at: DateTime<Utc>,
 }
 
 /// Outcome of a scheduler tick's due-run decision
@@ -230,7 +243,7 @@ pub struct ClaimedRun {
     pub window: Option<ReportWindow>,
 }
 
-/// Why a due-run claim failed.
+/// Why a due-run or manual-run claim failed.
 ///
 /// Four distinct causes, kept apart because they mean different things
 /// about the install: the store is down, the schedule's own numbers cannot
@@ -1084,15 +1097,32 @@ impl ScheduleStore {
         }
     }
 
-    /// Claim an operator-triggered run of a saved query's schedule.
+    /// Claim an operator-triggered run of a saved query's schedule: the
+    /// schedule's next window, fired early (ADR-0018 amended 2026-09-23).
     ///
-    /// The whole decision is one transaction, and the coverage-mode test is
-    /// asked FIRST, before the cap count and before the insert. A windowed
-    /// schedule is refused outright (ADR-0018 ruling 6), and asking under
-    /// the schedule lock is what makes the refusal reliable: a
-    /// `PUT .../schedule` that adds a window either commits before this
-    /// read or waits behind it, so a manual run can never slip through on a
-    /// snapshot taken a moment earlier.
+    /// The whole decision is one transaction. Once both locks are held the
+    /// claim reads the clock ONCE, as `t`, and [`plan_manual_run`] resolves
+    /// the window from it: `since_last` covers `[covered_through, t - lag)`
+    /// under the catch-up clamp, a fixed span covers
+    /// `[t - lag - span, t - lag)`, and query mode runs the text verbatim.
+    /// The run row records `t` as its `started_at`, so the window and the
+    /// start are measured against one reading. The clock is read after the
+    /// locks, not before: a claim that queued behind another would
+    /// otherwise plan from an instant older than the run it waited for.
+    ///
+    /// The refusals, in the order they are asked:
+    ///
+    /// 1. no schedule, [`ManualRunClaim::NoSchedule`];
+    /// 2. a run already in progress, [`ManualRunClaim::AlreadyRunning`],
+    ///    asked explicitly under the schedule lock so it outranks the cap
+    ///    and the empty-window test: a run in flight is about to move the
+    ///    watermark, which would make an empty-window answer misleading;
+    /// 3. the `max_runs` cap, which manual runs count toward;
+    /// 4. an empty `since_last` window, [`ManualRunClaim::EmptyWindow`].
+    ///
+    /// None of them writes anything. The schedule's `enabled` flag is not
+    /// asked at all: a disabled schedule can still be run by hand. Neither
+    /// cursor moves here; a success moves them in [`Self::finish_run`].
     ///
     /// A missing saved query is a `NotFound`, not a [`ManualRunClaim`]
     /// variant: the caller has nothing to run and nothing to own the run,
@@ -1105,17 +1135,21 @@ impl ScheduleStore {
     /// foreign key check. Locking the schedule first would leave this
     /// transaction at level 2 waiting for level 1, and
     /// [`Self::set_schedule_checked`] walking 1 then 2 beside it closes the
-    /// cycle postgres answers with 40P01.
+    /// cycle postgres answers with 40P01. This path keeps its own
+    /// key-scoped lookups rather than `lock_for_claim`, which reads a
+    /// disabled schedule as nothing to run.
     ///
     /// Reading the DSL from that locked row rather than from the caller is
     /// the same rule [`ClaimedRun`] states: the text this run executes and
     /// the text `report_runs.query` stores are one string, so a concurrent
     /// edit lands entirely before the claim or waits for it.
+    #[allow(clippy::too_many_lines)] // one transaction, read top to bottom in lock order
     pub async fn claim_manual_run(
         &self,
         saved_query_id: i64,
         key_id: i64,
-    ) -> Result<ManualRunClaim, StoreError> {
+        max_catchup_intervals: u32,
+    ) -> Result<ManualRunClaim, DueClaimError> {
         let mut tx = self.pool.begin().await?;
 
         // Level 1. The lock, the ownership check and the DSL read are one
@@ -1132,10 +1166,11 @@ impl ScheduleStore {
             return Err(StoreError::NotFound {
                 id: saved_query_id,
                 resource: "saved query",
-            });
+            }
+            .into());
         };
         let query_name: String = saved.try_get("name")?;
-        let query: String = saved.try_get("query")?;
+        let dsl: String = saved.try_get("query")?;
 
         // Level 2.
         let locked = sqlx::query(AssertSqlSafe(format!(
@@ -1152,36 +1187,52 @@ impl ScheduleStore {
         };
         let schedule = row_to_schedule(&locked)?;
 
-        if let Some(window) = schedule.window {
+        let t = truncate_to_micros(Utc::now());
+
+        if let Some(refusal) = manual_capacity_refusal(&mut tx, &schedule).await? {
             tx.rollback().await?;
-            return Ok(ManualRunClaim::CoverageMode(window));
+            return Ok(refusal);
         }
 
-        // The cap is counted from the LOCKED row's `max_runs`, not from a
-        // value the caller read earlier: concurrent triggers serialize
-        // here, and each one sees the winner's committed run count.
-        if let Some(max) = schedule.max_runs {
-            let count: i64 =
-                sqlx::query_scalar("SELECT COUNT(*) FROM report_runs WHERE schedule_id = $1")
-                    .bind(schedule.id)
-                    .fetch_one(&mut *tx)
-                    .await?;
-            if u64::try_from(count).unwrap_or_default() >= max {
+        let window = match plan_manual_run(&plan_input(&schedule, t, max_catchup_intervals)) {
+            Ok(ManualPlan::Run(window)) => window,
+            Ok(ManualPlan::Covered {
+                covered_through,
+                end,
+            }) => {
                 tx.rollback().await?;
-                return Ok(ManualRunClaim::MaxRunsReached);
+                return Ok(ManualRunClaim::EmptyWindow {
+                    covered_through,
+                    window_end: end,
+                });
             }
-        }
+            Err(e) => {
+                tx.rollback().await?;
+                return Err(e.into());
+            }
+        };
 
-        // Level 3. A manual run is query mode by definition, so it records
-        // no window and nothing is spliced onto the text.
+        // Ruling 11: what the run executes is what it stores.
+        let query = match window {
+            Some(window) => match resolve_window_text(schedule.window, &dsl, &window) {
+                Ok(text) => text,
+                Err(e) => {
+                    tx.rollback().await?;
+                    return Err(e);
+                }
+            },
+            None => dsl,
+        };
+
+        // Level 3.
         match insert_running_run(
             &mut tx,
             schedule.id,
             saved_query_id,
             &query,
-            None,
+            window.as_ref(),
             RunOrigin::Manual,
-            None,
+            Some(t),
         )
         .await
         {
@@ -1192,19 +1243,25 @@ impl ScheduleStore {
                     run_id,
                     schedule_id = schedule.id,
                     saved_query_id,
+                    origin = RunOrigin::Manual.as_str(),
                     "Report run started"
                 );
                 Ok(ManualRunClaim::Started(ClaimedManualRun {
                     run_id,
+                    schedule_id: schedule.id,
                     query,
                     query_name,
+                    window,
+                    claimed_at: t,
                 }))
             }
             Err(e) => {
                 tx.rollback().await?;
+                // Backstop: the explicit check above already answered this
+                // under the schedule lock.
                 match classify_violation(&e) {
                     Some(PgViolation::RunAlreadyRunning) => Ok(ManualRunClaim::AlreadyRunning),
-                    _ => Err(e.into()),
+                    _ => Err(StoreError::from(e).into()),
                 }
             }
         }
@@ -1263,15 +1320,7 @@ impl ScheduleStore {
             schedule,
         } = locked;
 
-        let plan = match plan_due_run(&PlanInput {
-            now,
-            next_fire_at: schedule.next_fire_at,
-            interval_secs: schedule.interval_secs,
-            window: schedule.window,
-            lag_secs: schedule.lag_secs,
-            covered_through: schedule.covered_through,
-            max_catchup_intervals,
-        }) {
+        let plan = match plan_due_run(&plan_input(&schedule, now, max_catchup_intervals)) {
             Ok(Due::NotYet) => {
                 tx.rollback().await?;
                 return Ok(DueClaim::NotDue);
@@ -2150,6 +2199,57 @@ fn log_schedule_updated(schedule: &Schedule) {
         enabled = schedule.enabled,
         "Schedule updated"
     );
+}
+
+/// Whether a manual claim is refused for capacity: a run in progress
+/// first, then the `max_runs` cap, in the precedence
+/// [`ScheduleStore::claim_manual_run`] documents.
+///
+/// The caller holds the schedule lock. Every claimant takes that lock
+/// before inserting a run, so neither answer can change before the
+/// caller's insert. The cap is counted from the LOCKED row's `max_runs`,
+/// not from a value read earlier: concurrent triggers serialize on the
+/// lock, and each one sees the winner's committed run count.
+async fn manual_capacity_refusal(
+    conn: &mut sqlx::PgConnection,
+    schedule: &Schedule,
+) -> Result<Option<ManualRunClaim>, sqlx::Error> {
+    let running: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM report_runs WHERE schedule_id = $1 AND status = 'running'
+         )",
+    )
+    .bind(schedule.id)
+    .fetch_one(&mut *conn)
+    .await?;
+    if running {
+        return Ok(Some(ManualRunClaim::AlreadyRunning));
+    }
+
+    if let Some(max) = schedule.max_runs {
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM report_runs WHERE schedule_id = $1")
+                .bind(schedule.id)
+                .fetch_one(&mut *conn)
+                .await?;
+        if u64::try_from(count).unwrap_or_default() >= max {
+            return Ok(Some(ManualRunClaim::MaxRunsReached));
+        }
+    }
+    Ok(None)
+}
+
+/// What the planner reads off a locked schedule row, for both claims.
+fn plan_input(schedule: &Schedule, now: DateTime<Utc>, max_catchup_intervals: u32) -> PlanInput {
+    PlanInput {
+        now,
+        next_fire_at: schedule.next_fire_at,
+        interval_secs: schedule.interval_secs,
+        window: schedule.window,
+        lag_secs: schedule.lag_secs,
+        covered_through: schedule.covered_through,
+        max_catchup_intervals,
+    }
 }
 
 /// Insert one `running` row for a claim, returning its id.

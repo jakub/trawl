@@ -1303,6 +1303,7 @@ pub async fn setup_in_dir_with_data_and_timeout(
         timeout_secs,
         true,
         RowCaps::DEFAULT,
+        SchedulerConfig::default(),
     )
     .await
 }
@@ -1333,6 +1334,7 @@ pub async fn setup_with_row_caps(caps: RowCaps) -> TestServer {
         DEFAULT_TEST_TIMEOUT_SECS,
         true,
         caps,
+        SchedulerConfig::default(),
     )
     .await;
     // Leak the tempdir so it survives the test (cleaned up by OS).
@@ -1350,8 +1352,29 @@ pub async fn setup_in_dir_with_ingest(dir: &std::path::Path, enabled: bool) -> T
         DEFAULT_TEST_TIMEOUT_SECS,
         enabled,
         RowCaps::DEFAULT,
+        SchedulerConfig::default(),
     )
     .await
+}
+
+/// A fixture with its own `[scheduler]` section, for tests whose answer
+/// depends on a scheduler setting the request path reads (a manual run's
+/// catch-up clamp). The fixture never spawns the scheduler loop itself.
+pub async fn setup_with_scheduler(scheduler: SchedulerConfig) -> TestServer {
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+    let server = setup_with_ingest_config(
+        tmp.path(),
+        seed_data_root(tmp.path()),
+        RateLimitConfig::default(),
+        DEFAULT_TEST_TIMEOUT_SECS,
+        true,
+        RowCaps::DEFAULT,
+        scheduler,
+    )
+    .await;
+    // Leak the tempdir so it survives the test (cleaned up by OS).
+    std::mem::forget(tmp);
+    server
 }
 
 #[allow(clippy::too_many_lines)] // linear assembly: two databases, two pools, one config
@@ -1362,6 +1385,7 @@ async fn setup_with_ingest_config(
     timeout_secs: u64,
     ingest_enabled: bool,
     row_caps: RowCaps,
+    scheduler: SchedulerConfig,
 ) -> TestServer {
     assert!(
         std::path::Path::new(&data_path).is_dir(),
@@ -1448,7 +1472,7 @@ async fn setup_with_ingest_config(
             }
         },
         retention: RetentionConfig::default(),
-        scheduler: SchedulerConfig::default(),
+        scheduler,
         syslog: SyslogConfig::default(),
         web: WebConfig::default(),
         storage: StorageConfig {

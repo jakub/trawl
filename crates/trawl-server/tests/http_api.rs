@@ -2390,6 +2390,8 @@ async fn put_schedule_honours_enabled_on_create() {
 // Trigger run endpoint
 // ---------------------------------------------------------------------------
 
+/// A net with no schedule has nothing to record a run under. That is the
+/// request's own fault, so it stays a 400.
 #[tokio::test(flavor = "multi_thread")]
 async fn trigger_run_requires_schedule() {
     let server = setup().await;
@@ -2400,16 +2402,9 @@ async fn trigger_run_requires_schedule() {
         .await
         .unwrap();
 
-    let err = client
-        .trigger_run(saved.id)
-        .await
-        .expect_err("expected error");
-    match err {
-        trawl_client::ClientError::Server { status, .. } => {
-            assert_eq!(status, 400);
-        }
-        other => panic!("expected 400, got: {other:?}"),
-    }
+    let (status, message) = refusal(client.trigger_run(saved.id).await);
+    assert_eq!(status, 400, "{message}");
+    assert!(message.contains("attach a schedule"), "{message}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2454,10 +2449,10 @@ async fn trigger_run_rejects_reader() {
     assert_403(reader.trigger_run(1).await);
 }
 
+/// Manual runs count toward `max_runs`, and a reached cap is a conflict
+/// with the schedule's state, not a malformed request: 409.
 #[tokio::test(flavor = "multi_thread")]
 async fn trigger_run_rejects_when_max_runs_reached() {
-    use trawl_server::store::schedule::{RunClaim, ScheduleStore};
-
     let server = setup().await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
@@ -2465,40 +2460,27 @@ async fn trigger_run_rejects_when_max_runs_reached() {
         .create_saved("trigger-cap", "* | head 3")
         .await
         .unwrap();
-    let schedule = client
+    client
         .set_schedule(saved.id, "1h", Some(1), true, None, None)
         .await
         .unwrap();
 
-    // Seed a run directly so the schedule is already at its max_runs=1 cap;
-    // count(*) >= max_runs short-circuits the claim before the insert.
-    let store = ScheduleStore::new(common::app_pool(&server.app_db_url).await);
-    let seeded = store
-        .claim_run(schedule.id, saved.id, "* | head 3", None, None)
+    // The one run the cap allows is itself a manual one.
+    client.trigger_run(saved.id).await.unwrap();
+    wait_for_finished_runs(&client, saved.id, 1).await;
+
+    let (status, message) = refusal(client.trigger_run(saved.id).await);
+    assert_eq!(status, 409, "{message}");
+    assert!(message.contains("max runs reached"), "{message}");
+    let runs = client
+        .list_report_runs(saved.id, Some(10), None)
         .await
         .unwrap();
-    assert!(
-        matches!(seeded, RunClaim::Started(_)),
-        "seeding the cap must start a run, got {seeded:?}"
-    );
-
-    let err = client
-        .trigger_run(saved.id)
-        .await
-        .expect_err("expected max-runs error");
-    match err {
-        trawl_client::ClientError::Server { status, error } => {
-            assert_eq!(status, 400);
-            assert!(
-                error.message.contains("max runs reached"),
-                "unexpected message: {}",
-                error.message
-            );
-        }
-        other => panic!("expected 400, got: {other:?}"),
-    }
+    assert_eq!(runs.runs.len(), 1, "a refused trigger claims nothing");
 }
 
+/// A run in flight refuses another with 409, and says so even when the
+/// cap is also reached: the run in progress is the actionable answer.
 #[tokio::test(flavor = "multi_thread")]
 async fn trigger_run_rejects_when_already_running() {
     use trawl_server::store::schedule::{RunClaim, ScheduleStore};
@@ -2510,9 +2492,10 @@ async fn trigger_run_rejects_when_already_running() {
         .create_saved("trigger-busy", "* | head 3")
         .await
         .unwrap();
-    // No max_runs cap, so the in-progress guard is what rejects the trigger.
+    // max_runs=1, so the seeded run below also reaches the cap. The refusal
+    // must still name the run in progress.
     let schedule = client
-        .set_schedule(saved.id, "1h", None, true, None, None)
+        .set_schedule(saved.id, "1h", Some(1), true, None, None)
         .await
         .unwrap();
 
@@ -2528,21 +2511,9 @@ async fn trigger_run_rejects_when_already_running() {
         "seeding an in-progress run must start it, got {seeded:?}"
     );
 
-    let err = client
-        .trigger_run(saved.id)
-        .await
-        .expect_err("expected already-running error");
-    match err {
-        trawl_client::ClientError::Server { status, error } => {
-            assert_eq!(status, 400);
-            assert!(
-                error.message.contains("already in progress"),
-                "unexpected message: {}",
-                error.message
-            );
-        }
-        other => panic!("expected 400, got: {other:?}"),
-    }
+    let (status, message) = refusal(client.trigger_run(saved.id).await);
+    assert_eq!(status, 409, "{message}");
+    assert!(message.contains("already in progress"), "{message}");
 }
 
 /// Poll until `saved_id` has `n` finished runs, returning them newest first.
@@ -3251,45 +3222,304 @@ async fn from_saved_source_is_refused_a_window() {
     assert!(message.contains("from saved"), "{message}");
 }
 
-/// Ruling 6: a windowed schedule owns what its reports cover, so a manual
-/// run has no bounds anyone chose. The 409 names the mode it found and the
-/// route that answers "where has coverage reached".
+// ---------------------------------------------------------------------------
+// Manual runs of windowed schedules (ADR-0018 amended 2026-09-23)
+// ---------------------------------------------------------------------------
+
+/// An RFC 3339 instant off the wire.
+fn instant(text: &str) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::parse_from_rfc3339(text)
+        .unwrap_or_else(|e| panic!("{text:?} is not RFC 3339: {e}"))
+        .with_timezone(&chrono::Utc)
+}
+
+/// The clock, at the resolution every stored instant has.
+fn now_micros() -> chrono::DateTime<chrono::Utc> {
+    trawl_server::report_window::truncate_to_micros(chrono::Utc::now())
+}
+
+/// The wire spelling of a window bound.
+fn bound(t: chrono::DateTime<chrono::Utc>) -> String {
+    trawl_server::report_window::format_window_bound(t)
+}
+
+fn minutes(n: i64) -> chrono::TimeDelta {
+    chrono::TimeDelta::try_minutes(n).unwrap()
+}
+
+/// Write a schedule's watermark directly. The tests below need coverage to
+/// stand at a chosen instant, and no API moves it anywhere but forward.
+async fn set_covered_through(
+    server: &common::TestServer,
+    schedule_id: i64,
+    covered_through: Option<chrono::DateTime<chrono::Utc>>,
+) {
+    let pool = common::app_pool(&server.app_db_url).await;
+    sqlx::query("UPDATE schedules SET covered_through = $1 WHERE id = $2")
+        .bind(covered_through)
+        .bind(schedule_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+/// A schedule's stored watermark, read past the API, which reports it only
+/// while the schedule tiles.
+async fn stored_covered_through(
+    server: &common::TestServer,
+    schedule_id: i64,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let pool = common::app_pool(&server.app_db_url).await;
+    sqlx::query_scalar("SELECT covered_through FROM schedules WHERE id = $1")
+        .bind(schedule_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+}
+
+/// Trigger a manual run and return its summary with the instant `t` the
+/// server claimed it at, checked to lie inside the request.
+async fn trigger_at(
+    client: &HttpClient,
+    saved_id: i64,
+) -> (trawl_api::ReportRunSummary, chrono::DateTime<chrono::Utc>) {
+    let before = now_micros();
+    let summary = client.trigger_run(saved_id).await.unwrap();
+    let after = now_micros();
+    let t = instant(&summary.started_at);
+    assert!(
+        before <= t && t <= after,
+        "the run starts at the server's clock inside the request: {before} <= {t} <= {after}"
+    );
+    assert_eq!(summary.status, "running");
+    assert_eq!(summary.origin.as_deref(), Some("manual"));
+    (summary, t)
+}
+
+/// The listed run a trigger started, once it has finished, checked to be
+/// the row the trigger's summary described.
+async fn finished(
+    client: &HttpClient,
+    saved_id: i64,
+    summary: &trawl_api::ReportRunSummary,
+) -> trawl_api::ReportRunSummary {
+    let runs = wait_for_finished_runs(client, saved_id, 1).await;
+    let run = runs
+        .iter()
+        .find(|r| r.id == summary.id)
+        .unwrap_or_else(|| panic!("run {} must be listed: {runs:?}", summary.id))
+        .clone();
+    assert_eq!(
+        run.query, summary.query,
+        "the row stores what the run executed"
+    );
+    assert_eq!(
+        instant(&run.started_at),
+        instant(&summary.started_at),
+        "the response names the row's own start"
+    );
+    for (listed, answered) in [
+        (&run.window_start, &summary.window_start),
+        (&run.window_end, &summary.window_end),
+        (&run.window_kind, &summary.window_kind),
+        (&run.origin, &summary.origin),
+    ] {
+        assert_eq!(listed, answered);
+    }
+    assert_eq!(run.window_truncated, summary.window_truncated);
+    run
+}
+
+/// A manual `since_last` run is the next window fired early: it starts at
+/// the watermark, ends at `t - lag`, runs the saved text with those bounds
+/// spliced on, and on success moves the watermark to its end.
 #[tokio::test(flavor = "multi_thread")]
-async fn manual_run_of_a_coverage_mode_schedule_is_409() {
+async fn manual_run_of_since_last_schedule_covers_from_watermark() {
     let server = setup().await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
-    for (name, window) in [("cov-since", "since_last"), ("cov-fixed", "2h")] {
-        let saved = client.create_saved(name, "* | head 3").await.unwrap();
-        client
-            .set_schedule(saved.id, "1h", None, true, Some(window), None)
-            .await
-            .unwrap();
+    let saved = client
+        .create_saved("manual-since", "service=nginx")
+        .await
+        .unwrap();
+    let schedule = client
+        .set_schedule(saved.id, "1h", None, true, Some("since_last"), Some("5m"))
+        .await
+        .unwrap();
+    let watermark = instant(
+        schedule
+            .covered_through
+            .as_deref()
+            .expect("a tiling schedule is seeded with its origin"),
+    );
 
-        let (status, message) = refusal(client.trigger_run(saved.id).await);
-        assert_eq!(status, 409, "for {window}: {message}");
-        assert!(
-            message.contains(&format!("\"{window}\"")),
-            "for {window}: {message}"
-        );
-        assert!(
-            message.contains(&format!("/api/v1/saved/{}/schedule", saved.id)),
-            "for {window}: {message}"
-        );
-        assert!(
-            message.contains("covered_through") && message.contains("next_fire_at"),
-            "for {window}: {message}"
-        );
+    let (summary, t) = trigger_at(&client, saved.id).await;
+    let (start, end) = (bound(watermark), bound(t - minutes(5)));
+    assert_eq!(summary.window_kind.as_deref(), Some("since_last"));
+    assert_eq!(summary.window_start.as_deref(), Some(start.as_str()));
+    assert_eq!(summary.window_end.as_deref(), Some(end.as_str()));
+    assert_eq!(summary.window_truncated, Some(false));
+    assert_eq!(
+        summary.query,
+        format!("earliest=\"{start}\" latest=\"{end}\" service=nginx"),
+        "the saved text runs with the claimed bounds spliced on"
+    );
 
-        let runs = client
-            .list_report_runs(saved.id, Some(10), None)
-            .await
-            .unwrap();
-        assert!(
-            runs.runs.is_empty(),
-            "for {window}: a refused trigger claims nothing"
-        );
-    }
+    let run = finished(&client, saved.id, &summary).await;
+    assert_eq!(run.status, "success", "{run:?}");
+    assert_eq!(
+        client.get_schedule(saved.id).await.unwrap().covered_through,
+        Some(end),
+        "success advances the watermark to the run's end"
+    );
+}
+
+/// A fixed span trails `t - lag`, and neither reads nor moves the
+/// watermark, even one a fixed schedule kept from when it tiled.
+#[tokio::test(flavor = "multi_thread")]
+async fn manual_run_of_fixed_schedule_covers_trailing_span() {
+    let server = setup().await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+
+    let saved = client
+        .create_saved("manual-fixed", "service=nginx")
+        .await
+        .unwrap();
+    let schedule = client
+        .set_schedule(saved.id, "1h", None, true, Some("2h"), Some("5m"))
+        .await
+        .unwrap();
+    let kept = now_micros() - minutes(600);
+    set_covered_through(&server, schedule.id, Some(kept)).await;
+
+    let (summary, t) = trigger_at(&client, saved.id).await;
+    let end = t - minutes(5);
+    assert_eq!(summary.window_kind.as_deref(), Some("fixed"));
+    assert_eq!(
+        summary.window_start.as_deref(),
+        Some(bound(end - minutes(120)).as_str())
+    );
+    assert_eq!(summary.window_end.as_deref(), Some(bound(end).as_str()));
+    assert_eq!(summary.window_truncated, Some(false));
+
+    let run = finished(&client, saved.id, &summary).await;
+    assert_eq!(run.status, "success", "{run:?}");
+    assert_eq!(
+        stored_covered_through(&server, schedule.id).await,
+        Some(kept),
+        "a fixed run never moves the watermark"
+    );
+}
+
+/// The catch-up bound applies to a manual run exactly as to a scheduled
+/// one. The fixture's bound is 3 intervals, not the default 24, so a
+/// handler reading the default instead of the configured value fails here.
+#[tokio::test(flavor = "multi_thread")]
+async fn manual_run_clamps_and_flags_truncated() {
+    let server = common::setup_with_scheduler(trawl_server::config::SchedulerConfig {
+        max_catchup_intervals: 3,
+        ..trawl_server::config::SchedulerConfig::default()
+    })
+    .await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+
+    let saved = client
+        .create_saved("manual-clamp", "service=nginx")
+        .await
+        .unwrap();
+    let schedule = client
+        .set_schedule(saved.id, "1h", None, true, Some("since_last"), None)
+        .await
+        .unwrap();
+    // Ten hours behind: inside the default bound, past the configured one.
+    set_covered_through(&server, schedule.id, Some(now_micros() - minutes(600))).await;
+
+    let (summary, t) = trigger_at(&client, saved.id).await;
+    assert_eq!(summary.window_truncated, Some(true));
+    assert_eq!(
+        summary.window_start.as_deref(),
+        Some(bound(t - minutes(180)).as_str()),
+        "the start is clamped to max_catchup_intervals intervals back"
+    );
+    assert_eq!(summary.window_end.as_deref(), Some(bound(t).as_str()));
+
+    let run = finished(&client, saved.id, &summary).await;
+    assert_eq!(run.status, "success", "{run:?}");
+    assert_eq!(
+        stored_covered_through(&server, schedule.id).await,
+        Some(t),
+        "a truncated success still advances coverage to its end"
+    );
+}
+
+/// Ruling 14: a `since_last` schedule with no watermark covers one
+/// interval back from `t - lag`.
+#[tokio::test(flavor = "multi_thread")]
+async fn manual_run_without_predecessor_covers_one_interval() {
+    let server = setup().await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+
+    let saved = client
+        .create_saved("manual-first", "service=nginx")
+        .await
+        .unwrap();
+    let schedule = client
+        .set_schedule(saved.id, "1h", None, true, Some("since_last"), Some("1m"))
+        .await
+        .unwrap();
+    set_covered_through(&server, schedule.id, None).await;
+
+    let (summary, t) = trigger_at(&client, saved.id).await;
+    let end = t - minutes(1);
+    assert_eq!(
+        summary.window_start.as_deref(),
+        Some(bound(end - minutes(60)).as_str())
+    );
+    assert_eq!(summary.window_end.as_deref(), Some(bound(end).as_str()));
+    assert_eq!(summary.window_truncated, Some(false));
+
+    let run = finished(&client, saved.id, &summary).await;
+    assert_eq!(run.status, "success", "{run:?}");
+}
+
+/// A window with nothing new in it is refused as a conflict that says
+/// where coverage stands, and claims nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn manual_run_with_empty_window_is_409() {
+    let server = setup().await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+
+    let saved = client
+        .create_saved("manual-empty", "service=nginx")
+        .await
+        .unwrap();
+    let schedule = client
+        .set_schedule(saved.id, "1h", None, true, Some("since_last"), Some("5m"))
+        .await
+        .unwrap();
+    // Coverage already past `t - lag`: exactly what a second run inside the
+    // lag would find on a clock that had not moved.
+    let covered = now_micros() + minutes(1);
+    set_covered_through(&server, schedule.id, Some(covered)).await;
+
+    let (status, message) = refusal(client.trigger_run(saved.id).await);
+    assert_eq!(status, 409, "{message}");
+    assert!(
+        message.contains(&bound(covered)),
+        "the refusal names where coverage stands: {message}"
+    );
+
+    let pool = common::app_pool(&server.app_db_url).await;
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM report_runs WHERE schedule_id = $1")
+        .bind(schedule.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0, "a refused trigger creates no run row");
+    assert_eq!(
+        stored_covered_through(&server, schedule.id).await,
+        Some(covered)
+    );
 }
 
 /// Query mode keeps today's manual run exactly: the saved DSL verbatim, and
@@ -3311,7 +3541,11 @@ async fn manual_run_of_a_query_mode_schedule_still_starts() {
     let summary = client.trigger_run(saved.id).await.unwrap();
     assert_eq!(summary.status, "running");
     assert_eq!(summary.query, "* | head 3");
+    assert_eq!(summary.window_start, None);
+    assert_eq!(summary.window_end, None);
+    assert_eq!(summary.window_truncated, None);
     assert_eq!(summary.window_kind, None);
+    assert_eq!(summary.origin.as_deref(), Some("manual"));
 
     let runs = wait_for_finished_runs(&client, saved.id, 1).await;
     assert_eq!(runs.len(), 1);
@@ -3322,6 +3556,7 @@ async fn manual_run_of_a_query_mode_schedule_still_starts() {
     assert_eq!(run.window_end, None);
     assert_eq!(run.window_truncated, None);
     assert_eq!(run.window_kind, None);
+    assert_eq!(run.origin.as_deref(), Some("manual"));
 }
 
 /// What a schedule answers about its own window, and what it refuses to be

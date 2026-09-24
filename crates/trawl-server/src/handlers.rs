@@ -2737,14 +2737,19 @@ pub async fn runs_stats(
     }))
 }
 
-/// `POST /api/v1/saved/{id}/run` — trigger an immediate report run for a saved query.
+/// `POST /api/v1/saved/{id}/run` — run a saved query's schedule now.
 ///
-/// Bypasses the scheduler interval check. Requires a schedule to be attached
-/// (the run is stored under that schedule's history), and that schedule must
-/// be in query mode: a windowed one owns what its reports cover, so a manual
-/// run is a 409 naming the mode and the route that shows where coverage has
-/// reached (ADR-0018 ruling 6). Returns the run summary immediately with
-/// status "running" — execution continues in the background.
+/// A manual run is the schedule's next window fired early (ADR-0018
+/// amended 2026-09-23), in any mode and whether or not the schedule is
+/// enabled. The store claims it in one transaction and resolves the window
+/// from its own clock reading `t`; this handler answers from that claim
+/// and reads no clock of its own, so the response names the bounds the run
+/// row records. Returns the run summary immediately with status "running";
+/// execution continues in the background.
+///
+/// No schedule is a 400: there is nothing to record a run under. A run in
+/// progress, a reached `max_runs` and an empty `since_last` window are 409s:
+/// the request is well formed, and the schedule's state refuses it.
 pub async fn trigger_run(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
@@ -2757,16 +2762,13 @@ pub async fn trigger_run(
     let key_id = verified.id;
 
     // One transaction: lock the saved query and read the DSL from it, lock
-    // the schedule, refuse a coverage mode, enforce max_runs, claim the
-    // run. The ownership check rides the first lock, so this handler takes
-    // no snapshot of its own: what the run executes is what the claim
-    // recorded. Concurrent triggers cannot exceed the cap or double-claim,
-    // and a window added mid-request either lands before the lock (and
-    // refuses this run) or waits behind it.
+    // the schedule, refuse or plan, claim the run. The ownership check
+    // rides the first lock, so this handler takes no snapshot of its own:
+    // what the run executes is what the claim recorded.
     let claimed = match state
         .storage
         .schedule
-        .claim_manual_run(saved_id, key_id)
+        .claim_manual_run(saved_id, key_id, state.query.max_catchup_intervals)
         .await?
     {
         ManualRunClaim::Started(claimed) => claimed,
@@ -2775,47 +2777,48 @@ pub async fn trigger_run(
                 "attach a schedule before triggering a run".into(),
             ));
         }
-        // 409, not 400: the request is well formed and will be fine again
-        // if the operator drops the window. The message names the mode it
-        // found and the route that answers "where has coverage reached",
-        // which is what someone asking for a manual run actually wants.
-        ManualRunClaim::CoverageMode(window) => {
-            return Err(ServerError::Conflict(format!(
-                "schedule uses coverage mode \"{window}\"; manual runs are disabled for \
-                 windowed schedules; watch GET /api/v1/saved/{saved_id}/schedule \
-                 (covered_through, next_fire_at)"
-            )));
-        }
-        ManualRunClaim::MaxRunsReached => {
-            return Err(ServerError::BadRequest(
-                "max runs reached for this net".into(),
-            ));
-        }
         ManualRunClaim::AlreadyRunning => {
-            return Err(ServerError::BadRequest(
+            return Err(ServerError::Conflict(
                 "a run is already in progress for this net".into(),
             ));
         }
+        ManualRunClaim::MaxRunsReached => {
+            return Err(ServerError::Conflict(
+                "max runs reached for this net".into(),
+            ));
+        }
+        ManualRunClaim::EmptyWindow {
+            covered_through,
+            window_end,
+        } => {
+            return Err(ServerError::Conflict(format!(
+                "nothing new to read: coverage already reaches {}, and a run now would end \
+                 at {}",
+                format_window_bound(covered_through),
+                format_window_bound(window_end),
+            )));
+        }
     };
+
+    if let Some(window) = &claimed.window {
+        crate::scheduler::note_truncated_window(claimed.schedule_id, claimed.run_id, window);
+    }
 
     // Return the summary immediately, execute in background.
     let summary = ReportRunSummary {
         id: claimed.run_id,
         query: claimed.query.clone(),
         status: RunStatus::Running.as_str().to_string(),
-        started_at: chrono::Utc::now().to_rfc3339(),
+        started_at: claimed.claimed_at.to_rfc3339(),
         finished_at: None,
         duration_ms: None,
         row_count: None,
         error_message: None,
         result_path: None,
-        // A manual run is query mode by construction: a schedule that owns
-        // a window refuses one (ADR-0018 ruling 6), so there are no bounds
-        // to report here.
-        window_start: None,
-        window_end: None,
-        window_truncated: None,
-        window_kind: None,
+        window_start: claimed.window.map(|w| format_window_bound(w.start)),
+        window_end: claimed.window.map(|w| format_window_bound(w.end)),
+        window_truncated: claimed.window.map(|w| w.truncated),
+        window_kind: claimed.window.map(|w| w.kind.as_str().to_owned()),
         origin: Some(RunOrigin::Manual.as_str().to_owned()),
     };
 

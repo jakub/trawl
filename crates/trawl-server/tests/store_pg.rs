@@ -7402,7 +7402,7 @@ async fn manual_claim_and_schedule_write_do_not_deadlock(pool: PgPool) {
 
     let claimant = sched_store.clone();
     let sq_id = sq.id;
-    let claim = tokio::spawn(async move { claimant.claim_manual_run(sq_id, 1).await });
+    let claim = tokio::spawn(async move { claimant.claim_manual_run(sq_id, 1, 24).await });
 
     // Let the claim reach whatever it blocks on.
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
