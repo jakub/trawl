@@ -86,6 +86,26 @@ _Avoid_: flush, rollup
 The merge of one day's hourly parquet files into a single daily file. It is lossless file consolidation — not downsampling, despite what the word means in metrics systems.
 _Avoid_: compaction, downsampling
 
+**Deletion floor**:
+The free space trawl keeps on the data filesystem (`min_free_disk_bytes`). Falling below it starts pressure deletion; it reserves nothing and does not stop writes.
+_Avoid_: reserve, quota, threshold (unqualified)
+
+**Headroom**:
+The free space on one filesystem trawl writes to, and on the data filesystem, how far it sits above or below the deletion floor. Headroom belongs to a filesystem, never to a directory or an environment.
+_Avoid_: capacity (the Health card of that name is about uptime and pools), disk left
+
+**Pressure deletion**:
+Retention deleting date directories because free space fell below the deletion floor, ahead of their age limit. It shortens retention; the disk stays above the floor while it does.
+_Avoid_: cleanup, eviction (that is the hot buffer)
+
+**Observed day**:
+One of an environment's recent, stored date partitions that a capacity projection reads for its daily volume. Today and yesterday are never observed days; they are still settling.
+_Avoid_: settled day, sample
+
+**Retention reach**:
+How many days of an environment's configured retention the disk is projected to hold if its observed days repeat. A projection, not a guarantee, and never a countdown to a full disk.
+_Avoid_: days left, days until full, forecast (unqualified)
+
 ### Catalog
 
 **Pin**:
