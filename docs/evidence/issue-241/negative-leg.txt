@@ -1,0 +1,36 @@
+== issue #241 negative leg at 36ffde64d29e5337b842e57dfd425e861cf828b7
+
+== leg 1: footer session gate removed
+diff --git i/crates/trawl-web-ui/src/pages/layout.rs w/crates/trawl-web-ui/src/pages/layout.rs
+index 9b6fb391..a8f369c0 100644
+--- i/crates/trawl-web-ui/src/pages/layout.rs
++++ w/crates/trawl-web-ui/src/pages/layout.rs
+@@ -184,14 +184,12 @@ pub fn AuthShell() -> impl IntoView {
+             // `/api/v1/health`, which the trawl-web proxy answers 401 without
+             // a session: mount it only once `/me` confirms one, as `Outlet` does.
+             footer=Box::new(move || view! {
+-                <Show when=move || me.get().is_some()>
+                     <StatusBar
+                         status=Signal::derive(move || shell_status.kind.get())
+                         count=Signal::derive(move || shell_status.count.get())
+                         lagged=Signal::derive(move || shell_status.lagged.get())
+                         admin=admin_stats
+                     />
+-                </Show>
+             }.into_any())
+             sidebar_bottom=ViewFn::from(|| view! {
+                 <a class="it" title="Help" href="https://trawl.sh" target="_blank" rel="noopener noreferrer">
+    Error: harness counted a health request
+    Expected: 0
+    Received: 1
+  1 failed
+playwright exit: 1
+leg 1 outcome: fail (expected fail)
+
+== leg 2: footer session gate restored
+layout.rs identical to HEAD
+  1 passed (1.1s)
+playwright exit: 0
+leg 2 outcome: pass (expected pass)
+
+RESULT: PASS (the spec fails without the gate and passes with it)
