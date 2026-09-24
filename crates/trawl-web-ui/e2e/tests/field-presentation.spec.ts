@@ -139,6 +139,38 @@ test('the inline expansion folds null fields behind a keyboard disclosure', asyn
   await expect(keys).toHaveCount(COLUMNS.length);
 });
 
+// The results view outlives any one response: hauling the same query
+// again replaces the table underneath, and the disclosure must stay the
+// way the reader left it.
+test('the null-field disclosure stays open across a re-haul of the same query', async ({ page }) => {
+  let queries = 0;
+  await page.route('**/api/v1/query', (route) => {
+    queries += 1;
+    return route.fulfill({ json: presentation });
+  });
+  await page.goto('/search?q=service%3Dapi&page=0');
+  await expect(page.locator(SEL.resultsRow)).toHaveCount(presentation.rows.length);
+  const keys = page.locator(SEL.resultsDetailFieldName);
+  const toggle = page.locator(SEL.resultsDetailNullToggle);
+
+  await page.locator(SEL.resultsExpandControl).nth(1).click();
+  await toggle.click();
+  await expect(toggle).toHaveText(nullLabel(true, NULLS[1]));
+  await expect(keys).toHaveCount(COLUMNS.length);
+
+  const before = queries;
+  await page.locator(SEL.runButton).click();
+  await expect.poll(() => queries).toBeGreaterThan(before);
+  await expect(page.locator(SEL.resultsRow)).toHaveCount(presentation.rows.length);
+
+  // The new response closes the row; reopening it shows the choice kept.
+  await expect(page.locator(SEL.resultsDetailCell)).toHaveCount(0);
+  await page.locator(SEL.resultsExpandControl).nth(1).click();
+  await expect(toggle).toHaveText(nullLabel(true, NULLS[1]));
+  await expect(toggle).toHaveAttribute('aria-expanded', 'true');
+  await expect(keys).toHaveText(COLUMNS);
+});
+
 test('the inspector folds null fields and keeps the choice across events', async ({ page }) => {
   await openPresentation(page);
   await pickMode(page, 'Inspector');

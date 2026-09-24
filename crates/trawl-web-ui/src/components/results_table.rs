@@ -27,9 +27,9 @@
 //!
 //! Both detail presentations fold an event's null fields behind one
 //! "Show N null fields" disclosure ([`partition_detail_fields`]). Its
-//! open state is one signal owned by [`ResultsTable`], so it survives
-//! selecting another event and re-mounting the inspector, and it is not
-//! in the URL.
+//! open state is one signal the search page owns and passes in, so it
+//! survives selecting another event, re-mounting the inspector and a new
+//! response, and it is not in the URL.
 
 use crate::api::PAGE_SIZE;
 use crate::context_query::SearchNavigation;
@@ -83,6 +83,10 @@ pub fn ResultsTable(
     /// The response generation that selection is keyed on.
     #[prop(into)]
     generation: Signal<u64>,
+    /// The null-field disclosure's open state, shared by the inline
+    /// expansion and the inspector. Owned by the page, which outlives
+    /// this table: the table is rebuilt for every response.
+    show_nulls: RwSignal<bool>,
 ) -> impl IntoView {
     let bus = expect_context::<ToastBus>();
     let table_viewport = NodeRef::<leptos::html::Div>::new();
@@ -101,9 +105,6 @@ pub fn ResultsTable(
     });
 
     let on_keydown = inspector_keys(details, selected, generation, order);
-    // The null-field disclosure, shared by the inline expansion and the
-    // inspector for the life of this results view.
-    let show_nulls = RwSignal::new(false);
 
     view! {
         <div class="results-split" class:has-inspector=move || inspector_row.get().is_some()>
