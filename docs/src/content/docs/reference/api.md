@@ -407,17 +407,19 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -H "Content-Type: applicatio
 | Field | Type | Description |
 |-------|------|-------------|
 | `accepted` | integer | Events written to the WAL |
-| `rejected` | integer | Number of error entries: one per validation rejection or failed WAL group. Omitted when `0`. |
-| `errors` | array | Validation entries identify the rejected event: `index` is the zero-based array position or line number, counting blank lines. A WAL failure contributes one group error. Omitted when empty. |
+| `rejected` | integer | Number of error entries, one per validation rejection. Omitted when `0`. |
+| `errors` | array | Validation entries identify the rejected event: `index` is the zero-based array position or line number, counting blank lines. Omitted when empty. |
 
 A rejected event does not stop its siblings. Repairs do not change `accepted` or `rejected`. A body whose first non-blank byte is not `[` is read as newline-delimited JSON, so a single event object is accepted and a line that is not an event object counts as one rejected event with the response still 200. See [connect and verify a sender](/operate/ingestion/) for an end-to-end check.
 
-The `wal_failure` metric counts events in failed WAL groups, whereas the
-response records one error per failed group. A failed group of three events
-therefore adds three to `trawl_ingest_events_rejected_total{reason="wal_failure"}`
-and one to the response's `rejected` field. Successfully written sibling
-groups remain accepted. A persistence rejection does not establish permanent
-loss; the sender may retry.
+trawld writes one WAL file per environment and service group. If any group's
+WAL write fails, including its directory fsync, the whole request answers
+500 `internal_error` and the body carries no filesystem detail. Groups that
+wrote before or after the failed one are still accepted and published, so a
+retry of the whole request duplicates them. The events of each failed group
+are counted in `trawl_ingest_events_rejected_total{reason="wal_failure"}`.
+A persistence rejection does not establish permanent loss; the sender may
+retry.
 
 **Errors**
 
@@ -426,6 +428,7 @@ loss; the sender may retry.
 | 400 | `ingest_error` | Empty body, invalid UTF-8, an unparseable or empty JSON array, a gzip body that fails to decode, or a gzip body that expands past 10 times its wire size |
 | 413 | none | The body exceeds `[ingest] max_body_bytes` |
 | 429 | `rate_limited` | The key's ingest bucket is empty |
+| 500 | `internal_error` | A group's WAL write failed. Other groups in the request may still have been accepted. |
 
 ## Schema
 
@@ -1884,7 +1887,7 @@ Prometheus scrape-target labels are separate and remain on every alert.
 | `TrawlTelemetryWriteOutcomeUncertain` | `trawl_telemetry_events_dropped_total{reason="write_crashed"}` | Events consumed from the in-memory telemetry batch when its write task fails; WAL bytes may already exist |
 | `TrawlHttpPersistenceRejection` | `trawl_ingest_events_rejected_total{reason="wal_failure"}` | Events in failed HTTP WAL groups, counted during final ingest accounting |
 | `TrawlTelemetryWalWriteFailure` | `trawl_telemetry_wal_write_failures_total` | Failed telemetry write attempts, including retained retries and crashed tasks; no metric labels |
-| `TrawlWalDurabilityDegraded` | `trawl_wal_durability_failures_total{operation="parent_directory_sync"}` | Failed parent-directory sync operations after WAL publication; counted by the WAL writer |
+| `TrawlWalDurabilityDegraded` | `trawl_wal_durability_failures_total{operation="parent_directory_sync"}` | Failed WAL directory sync operations, each of which rejected its write; counted by the WAL writer |
 | `TrawlCompactionOperationFailure` | `trawl_compaction_operation_failures_total{operation}` | Explicit failed attempts, using the eight closed operations below |
 | `TrawlFileQuarantine` | `trawl_files_quarantined_total{kind}` | Files successfully renamed into quarantine; `kind` is `wal`, `parquet`, or `rollup_temporary` |
 

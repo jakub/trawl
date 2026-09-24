@@ -151,6 +151,29 @@ fn counter(handle: &metrics_exporter_prometheus::PrometheusHandle, series: &str)
         .unwrap_or_else(|| panic!("missing series {series} in {rendered}"))
 }
 
+/// Render a handler failure the way the router does and return its status
+/// and body text.
+async fn rendered(error: trawl_server::error::ServerError) -> (axum::http::StatusCode, String) {
+    use axum::response::IntoResponse;
+    let response = error.into_response();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    (status, String::from_utf8(body.to_vec()).unwrap())
+}
+
+/// A failed group fails the whole request with a redacted 500, after the
+/// groups that did write are published and counted.
+async fn assert_redacted_wal_500(error: trawl_server::error::ServerError, private: &[&str]) {
+    let (status, body) = rendered(error).await;
+    assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(body.contains("internal server error"), "{body}");
+    for text in private {
+        assert!(!body.contains(text), "{text:?} leaked into {body}");
+    }
+}
+
 /// Exercise the actual handler and its blocking finalization, rather than
 /// manually emitting parsed rejection counts. This is not a socket request.
 #[tokio::test]
@@ -185,7 +208,7 @@ async fn http_handler_wal_failure_emits_rejections_and_publishes_only_successful
         &metrics,
         trawl_server::metrics::SYSLOG_WAL_EVENTS_DISCARDED_TOTAL,
     );
-    let response = trawl_server::ingest::handler::ingest(
+    let error = trawl_server::ingest::handler::ingest(
         axum::extract::State(state),
         axum::Extension(verified),
         axum::Extension("127.0.0.1:12345".parse().unwrap()),
@@ -200,14 +223,11 @@ async fn http_handler_wal_failure_emits_rejections_and_publishes_only_successful
         ),
     )
     .await
-    .unwrap()
-    .0;
-    assert_eq!(response.accepted, 3);
-    // Preserve the existing response contract: a failed WAL group adds one
-    // error entry, while its rejection metric records all three events.
-    assert_eq!(response.rejected, 1);
-    assert_eq!(response.errors.len(), 1);
-    assert!(response.errors[0].message.contains("failed"));
+    .unwrap_err();
+    // Any failed WAL group fails the request, and the filesystem error
+    // never reaches the body. The rejection metric still records all
+    // three events of the failed group.
+    assert_redacted_wal_500(error, &["blocked", "WAL", "os error"]).await;
     assert_eq!(counter(&metrics, rejected_series) - rejected_before, 3);
     assert_eq!(
         counter(
@@ -256,6 +276,81 @@ async fn http_handler_wal_failure_emits_rejections_and_publishes_only_successful
         std::fs::read(wal.dir().join("blocked")).unwrap(),
         b"retain this obstruction"
     );
+}
+
+/// A failed WAL directory fsync is a failed ack: the handler answers a
+/// redacted 500, the failed group leaves no WAL file, and the group that
+/// wrote before it failed is still published.
+#[tokio::test]
+async fn http_handler_directory_sync_failure_is_a_redacted_500_after_publishing_written_groups() {
+    let root = tempfile::tempdir().unwrap();
+    let data = root.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let server = common::setup_in_dir_with_data(
+        root.path(),
+        data.to_str().unwrap().to_owned(),
+        trawl_server::config::RateLimitConfig::default(),
+    )
+    .await;
+    let verified = fleet_auth::KeyStore::from_pool(server.fleet_pool.clone())
+        .verify_key(&server.ingest_token)
+        .await
+        .unwrap();
+    let state = server.state.clone();
+    let hot = state.query.hot_buffer.as_ref().unwrap().clone();
+    let wal = state.ingest.wal_writer.as_ref().unwrap().clone();
+    // Make `prod` durable first, so the injected failure hits the env
+    // directory sync after the first group's rename, not the root sync.
+    std::fs::remove_file(wal.write("prod", "warm", b"{}\n").unwrap()).unwrap();
+
+    let metrics = common::test_metrics_handle();
+    trawl_server::metrics::init_operational_alert_metrics();
+    let rejected_series = "trawl_ingest_events_rejected_total{reason=\"wal_failure\"}";
+    let sync_series = "trawl_wal_durability_failures_total{operation=\"parent_directory_sync\"}";
+    let rejected_before = counter(&metrics, rejected_series);
+    let sync_before = counter(&metrics, sync_series);
+    wal.fail_next_directory_sync_for_test();
+    let error = trawl_server::ingest::handler::ingest(
+        axum::extract::State(state),
+        axum::Extension(verified),
+        axum::Extension("127.0.0.1:12345".parse().unwrap()),
+        axum::http::HeaderMap::new(),
+        axum::body::Bytes::from_static(
+            b"{\"service\":\"failed\",\"id\":1}\n\
+              {\"service\":\"written\",\"id\":2}\n\
+              {\"service\":\"written\",\"id\":3}\n",
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert_redacted_wal_500(error, &["injected", "directory", "failed", "WAL"]).await;
+    assert_eq!(counter(&metrics, sync_series) - sync_before, 1);
+    assert_eq!(counter(&metrics, rejected_series) - rejected_before, 1);
+
+    let files: Vec<_> = std::fs::read_dir(wal.dir().join("prod"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(files.len(), 1, "only the written group's file: {files:?}");
+    assert!(
+        files[0]
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("written_")
+    );
+    let durable: Vec<u64> = std::fs::read_to_string(&files[0])
+        .unwrap()
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line).unwrap()["id"]
+                .as_u64()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(durable, [2, 3]);
+    assert_eq!(hot.event_count(), 2, "the written group is published");
 }
 
 #[test]

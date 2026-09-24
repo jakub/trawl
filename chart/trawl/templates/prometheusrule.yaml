@@ -112,8 +112,8 @@ spec:
           labels:
             severity: {{ .Values.prometheusRule.alerts.TrawlWalDurabilityDegraded.severity | quote }}
           annotations:
-            summary: "Published WAL durability is uncertain on {{ `{{ $labels.instance }}` }}"
-            description: "Target {{ `{{ $labels.job }}` }}/{{ `{{ $labels.instance }}` }}: Operation {{ `{{ $labels.operation }}` }} failed after file publication. The directory entry may not survive a crash; this is not an event discard. An increase was observed in the last 10 minutes; resolution does not establish recovery."
+            summary: "WAL directory sync rejected a write on {{ `{{ $labels.instance }}` }}"
+            description: "Target {{ `{{ $labels.job }}` }}/{{ `{{ $labels.instance }}` }}: Operation {{ `{{ $labels.operation }}` }} failed, so the WAL write was rejected: HTTP answers 500, syslog discards the group, and telemetry retains the batch for retry. An increase was observed in the last 10 minutes; resolution does not establish recovery."
             runbook_url: "https://trawl.sh/operate/operational-alerts/#wal-durability-degraded"
         {{- end }}
         {{- if .Values.prometheusRule.alerts.TrawlCompactionOperationFailure.enabled }}

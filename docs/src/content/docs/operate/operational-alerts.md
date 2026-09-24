@@ -334,9 +334,10 @@ sender may retry; this is not confirmed permanent loss. Malformed input,
 producer policy rejections, and field-conformance outcomes are excluded.
 
 1. Read daemon WAL errors and the sender's response, retry, and buffer state.
-2. Check `accepted` and `errors` even when the response is HTTP 200. A failed
-   three-event group increments this metric by three but contributes one
-   group error to the response's `rejected` count.
+2. A request with any failed group answers a redacted HTTP 500. Groups that
+   did write in the same request are still accepted and published, so a
+   retry of the whole request duplicates them. A failed three-event group
+   increments this metric by three.
 3. Correct the storage problem and reconcile accepted siblings before a
    controlled retry. Preserve sender copies and any temporary WAL bytes.
 
@@ -364,17 +365,28 @@ failure alerts; never subtract attempt counts from event counts.
 
 `TrawlWalDurabilityDegraded` observes
 `trawl_wal_durability_failures_total{operation="parent_directory_sync"}`, in
-failed operations. `WalWriter::write` has published the file, then failed to
-sync its parent directory. The directory entry may not survive a crash.
-The write remains accepted; this is neither rejection nor event discard.
+failed operations. `WalWriter::write` failed to sync a WAL directory: the
+environment directory after a rename, or the WAL root before the first write
+into an environment. A write is acknowledged only after that sync, so the
+write is rejected. The writer removes the renamed file before it returns the
+error. Each lane then follows its own failure path:
 
-1. Find `wal_dir_fsync_failed` and the filesystem error it carries.
-2. Inspect filesystem and storage health while preserving the published WAL.
-3. Address the reported sync failure. Avoid an unnecessary restart or blind
-   resend as a repair for this warning; a resend can duplicate visible data.
+- HTTP ingest answers a redacted 500 and counts the failed group under
+  `TrawlHttpPersistenceRejection`. The sender retries.
+- Syslog discards the group and counts it under `TrawlSyslogWalDiscard`.
+- Telemetry retains the batch for retry and counts the attempt under
+  `TrawlTelemetryWalWriteFailure`.
 
-Resolution means no new parent-directory sync failure was observed. It does
-not retroactively prove crash durability for the earlier directory entry.
+1. Find `wal_dir_fsync_failed` and the filesystem error it carries. The
+   `withdrawn` field says whether the renamed file was removed.
+2. If `withdrawn` is `false`, the file stays in the WAL and compaction merges
+   it, although the write was rejected. A sender that retries that batch
+   duplicates it. Telemetry does not retry such a batch.
+3. Inspect filesystem and storage health, and address the reported sync
+   failure.
+
+Resolution means no new directory sync failure was observed. It does not
+prove that rejected writes were retried.
 
 ## Compaction operation failure
 

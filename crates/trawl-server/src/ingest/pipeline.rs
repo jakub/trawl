@@ -87,7 +87,8 @@ impl PipelineWriter {
     /// Write batches through the pipeline: WAL → hot buffer → event bus.
     ///
     /// Returns the number of events successfully written. Events from
-    /// groups that fail WAL writing are dropped (logged, not published).
+    /// groups that fail WAL writing, a failed directory fsync included,
+    /// are dropped (logged, counted, not published).
     /// Syslog is the production caller of this method. HTTP writes groups
     /// separately so it can reject them; telemetry retains failed batches.
     ///
@@ -119,6 +120,7 @@ impl PipelineWriter {
                         batch_env = %env,
                         batch_service = %svc,
                         events_lost = event_count,
+                        left_visible = e.left_visible(),
                         error = %e,
                         "WAL write failed for batch"
                     );
@@ -273,6 +275,55 @@ mod tests {
                 sample(&handle, crate::metrics::SYSLOG_WAL_EVENTS_DISCARDED_TOTAL),
                 3
             );
+        });
+    }
+
+    #[test]
+    fn directory_sync_failure_discards_the_group_and_publishes_nothing() {
+        let recorder = crate::metrics::prometheus_builder().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            crate::metrics::init_operational_alert_metrics();
+            let tmp = tempfile::tempdir().unwrap();
+            let wal = Arc::new(WalWriter::new(tmp.path().join("wal")));
+            wal.ensure_dir().unwrap();
+            let hot = Arc::new(HotBuffer::new(crate::hot_buffer::HotBufferConfig {
+                max_events: 100,
+                max_bytes: 1024 * 1024,
+            }));
+            let pipeline = PipelineWriter::new(Arc::clone(&wal), Some(Arc::clone(&hot)), None);
+            let mut batch = ServiceBatch::default();
+            for id in 0..2 {
+                batch.push(
+                    serde_json::json!({"service": "syslog", "id": id})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                );
+            }
+            // Make `prod` durable first, so the injected failure hits the
+            // env directory sync after the rename, not the root sync.
+            std::fs::remove_file(wal.write("prod", "warm", b"{}\n").unwrap()).unwrap();
+            wal.fail_next_directory_sync_for_test();
+            let batches = IndexMap::from([(("prod".to_owned(), "syslog".to_owned()), batch)]);
+            assert_eq!(pipeline.write(batches), 0);
+            assert_eq!(
+                sample(&handle, crate::metrics::SYSLOG_WAL_EVENTS_DISCARDED_TOTAL),
+                2
+            );
+            assert_eq!(
+                sample(
+                    &handle,
+                    "trawl_wal_durability_failures_total{operation=\"parent_directory_sync\"}"
+                ),
+                1
+            );
+            assert_eq!(hot.event_count(), 0, "nothing is published");
+            let files: Vec<_> = std::fs::read_dir(wal.dir().join("prod"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            assert!(files.is_empty(), "no WAL file for compaction: {files:?}");
         });
     }
 }
