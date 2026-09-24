@@ -10,7 +10,8 @@
 //! `window = "since_last"`, or takes a fixed trailing span under
 //! `window = "<duration>"`. This module owns the types, the two spellings
 //! of an instant, and the pure policy over them: [`plan_due_run`] turns a
-//! schedule plus a clock reading into the window a run covers, and
+//! schedule plus a clock reading into the window a run covers,
+//! [`plan_manual_run`] does the same for a run an operator fires early, and
 //! [`materialize_window`] puts that window onto the saved DSL as absolute
 //! bounds. [`validate_window_compatibility`] is the write-time half: the
 //! one rule both write directions ask before a window and a query text are
@@ -169,7 +170,7 @@ pub fn truncate_to_micros(t: DateTime<Utc>) -> DateTime<Utc> {
 // The due-run planner (ADR-0018 rulings 6, 9, 10, 14)
 // ---------------------------------------------------------------------------
 
-/// Everything one due-run decision reads.
+/// Everything one due-run or manual-run decision reads.
 ///
 /// The planner never samples a clock and never touches the store: `now`
 /// arrives as a value, and the decision comes back as a value the caller
@@ -179,14 +180,15 @@ pub fn truncate_to_micros(t: DateTime<Utc>) -> DateTime<Utc> {
 /// through the scheduler loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlanInput {
-    /// The scheduler's clock reading for this tick. Truncated to
-    /// microseconds by [`plan_due_run`] itself, so a caller that already
+    /// The scheduler's clock reading for this tick, or the instant a
+    /// manual claim took its locks. Truncated to microseconds by
+    /// [`plan_due_run`] and [`plan_manual_run`] themselves, so a caller that already
     /// truncated loses nothing and one that did not cannot leak
     /// nanoseconds into a stored bound.
     pub now: DateTime<Utc>,
     /// The schedule's planned fire instant. Fires are planned from this
     /// cursor rather than from the last run's start, so execution time
-    /// never drifts the schedule.
+    /// never drifts the schedule. A manual plan does not read it.
     pub next_fire_at: DateTime<Utc>,
     /// The schedule's period. Also the first `since_last` window's length
     /// (ruling 14) and the unit `max_catchup_intervals` counts.
@@ -302,16 +304,65 @@ pub fn plan_due_run(input: &PlanInput) -> Result<Due, PlanError> {
     }
 
     let now = truncate_to_micros(input.now);
-    if now < input.next_fire_at {
+    let Some(FireBoundaries {
+        planned_fire,
+        next_fire_at,
+    }) = fire_boundaries(input.next_fire_at, input.interval_secs, now)?
+    else {
         return Ok(Due::NotYet);
+    };
+    let end = lagged(planned_fire, input.lag_secs)?;
+
+    Ok(match window_ending_at(end, input)? {
+        Coverage::Window(window) => Due::Run(DueRunPlan {
+            planned_fire,
+            next_fire_at,
+            window,
+        }),
+        Coverage::Covered { .. } => Due::Advance { next_fire_at },
+    })
+}
+
+/// Where an instant sits on a schedule's cadence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FireBoundaries {
+    /// The latest planned boundary at or before the instant.
+    pub planned_fire: DateTime<Utc>,
+    /// The first planned boundary strictly after the instant: one interval
+    /// past `planned_fire`.
+    pub next_fire_at: DateTime<Utc>,
+}
+
+/// Place `now` on the cadence that runs through `next_fire_at` every
+/// `interval_secs`, or `None` when the cursor is still in the future.
+///
+/// The one spelling of cadence arithmetic. [`plan_due_run`] uses it to pick
+/// the boundary a tick stands for, and a successful manual run's finish uses
+/// it to consume every boundary at or before the instant the manual run
+/// was claimed (ADR-0018 amended 2026-09-23). Both land the cursor on the
+/// same phase, so neither can shift when a schedule fires.
+///
+/// `now` is compared as given; a caller holding a clock reading truncates
+/// it first, as [`plan_due_run`] does. A zero interval is
+/// [`PlanError::InvalidConfig`] rather than a division by zero.
+pub fn fire_boundaries(
+    next_fire_at: DateTime<Utc>,
+    interval_secs: u64,
+    now: DateTime<Utc>,
+) -> Result<Option<FireBoundaries>, PlanError> {
+    if interval_secs == 0 {
+        return Err(PlanError::InvalidConfig);
+    }
+    if now < next_fire_at {
+        return Ok(None);
     }
 
-    let interval_secs = plan_secs(input.interval_secs)?;
+    let interval_secs = plan_secs(interval_secs)?;
     let interval = plan_delta(interval_secs)?;
 
     // `now >= next_fire_at`, so the elapsed span is non-negative and
     // integer division is a floor.
-    let elapsed = now.signed_duration_since(input.next_fire_at);
+    let elapsed = now.signed_duration_since(next_fire_at);
     let missed = elapsed.num_seconds() / interval_secs;
     let skipped = plan_delta(
         missed
@@ -319,25 +370,91 @@ pub fn plan_due_run(input: &PlanInput) -> Result<Due, PlanError> {
             .ok_or(PlanError::Arithmetic)?,
     )?;
 
-    let planned_fire = input
-        .next_fire_at
+    let planned_fire = next_fire_at
         .checked_add_signed(skipped)
         .ok_or(PlanError::Arithmetic)?;
     let next_fire_at = planned_fire
         .checked_add_signed(interval)
         .ok_or(PlanError::Arithmetic)?;
-    let end = planned_fire
-        .checked_sub_signed(plan_delta(plan_secs(input.lag_secs)?)?)
-        .ok_or(PlanError::Arithmetic)?;
+    Ok(Some(FireBoundaries {
+        planned_fire,
+        next_fire_at,
+    }))
+}
 
+/// What a manual run of a schedule covers (ADR-0018 amended 2026-09-23).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManualPlan {
+    /// Run, covering this window, or `None` in query mode.
+    Run(Option<ReportWindow>),
+    /// A `since_last` window ending at `end` would read nothing the
+    /// watermark does not already cover. No run is claimed.
+    Covered {
+        /// The schedule's watermark.
+        covered_through: DateTime<Utc>,
+        /// Where the refused window would have ended: `t - lag`.
+        end: DateTime<Utc>,
+    },
+}
+
+/// Decide what a manual run claimed at `input.now` covers: the schedule's
+/// next window, fired early (ADR-0018 amended 2026-09-23).
+///
+/// `input.now` is the instant the claim holds its locks, called `t`. The
+/// window ends at `t - lag` and is otherwise the one a scheduled fire at
+/// `t` would plan: `since_last` starts at the watermark under the same
+/// catch-up clamp and ruling-14 fallback, a fixed span trails the end, and
+/// query mode plans no window. The fire cursor is not read: the run does
+/// not wait for it, and consuming it is the finish's business, on success
+/// only.
+///
+/// A `since_last` window that would end at or before the watermark is
+/// [`ManualPlan::Covered`]. The scheduler answers the same situation by
+/// advancing its cursor; an operator asking for a run is refused instead.
+pub fn plan_manual_run(input: &PlanInput) -> Result<ManualPlan, PlanError> {
+    if input.interval_secs == 0 || input.max_catchup_intervals == 0 {
+        return Err(PlanError::InvalidConfig);
+    }
+
+    let end = lagged(truncate_to_micros(input.now), input.lag_secs)?;
+    Ok(match window_ending_at(end, input)? {
+        Coverage::Window(window) => ManualPlan::Run(window),
+        Coverage::Covered { covered_through } => ManualPlan::Covered {
+            covered_through,
+            end,
+        },
+    })
+}
+
+/// The window one run ending at `end` covers, before the caller decides
+/// what that means for its cursor.
+enum Coverage {
+    /// A window to run, or `None` in query mode.
+    Window(Option<ReportWindow>),
+    /// `since_last` coverage already reaches `end`.
+    Covered { covered_through: DateTime<Utc> },
+}
+
+/// Shift an instant back by the late-arrival allowance.
+fn lagged(instant: DateTime<Utc>, lag_secs: u64) -> Result<DateTime<Utc>, PlanError> {
+    instant
+        .checked_sub_signed(plan_delta(plan_secs(lag_secs)?)?)
+        .ok_or(PlanError::Arithmetic)
+}
+
+/// The window math every run shares, scheduled or manual: given where the
+/// window ends, where does it start (ADR-0018 rulings 6, 9 and 14)?
+///
+/// Reads the mode, the interval, the watermark and the catch-up bound from
+/// `input`, and never its clock or cursor: those only decide `end`, which
+/// is the caller's.
+fn window_ending_at(end: DateTime<Utc>, input: &PlanInput) -> Result<Coverage, PlanError> {
     let Some(window) = input.window else {
-        return Ok(Due::Run(DueRunPlan {
-            planned_fire,
-            next_fire_at,
-            window: None,
-        }));
+        return Ok(Coverage::Window(None));
     };
 
+    let interval_secs = plan_secs(input.interval_secs)?;
+    let interval = plan_delta(interval_secs)?;
     let (start, truncated) = match window {
         ScheduleWindow::Fixed { secs } => (
             end.checked_sub_signed(plan_delta(plan_secs(secs)?)?)
@@ -352,7 +469,9 @@ pub fn plan_due_run(input: &PlanInput) -> Result<Due, PlanError> {
             ),
             Some(covered) => {
                 if end <= covered {
-                    return Ok(Due::Advance { next_fire_at });
+                    return Ok(Coverage::Covered {
+                        covered_through: covered,
+                    });
                 }
                 let max_span = plan_delta(
                     interval_secs
@@ -372,16 +491,12 @@ pub fn plan_due_run(input: &PlanInput) -> Result<Due, PlanError> {
         },
     };
 
-    Ok(Due::Run(DueRunPlan {
-        planned_fire,
-        next_fire_at,
-        window: Some(ReportWindow {
-            start,
-            end,
-            truncated,
-            kind: window.kind(),
-        }),
-    }))
+    Ok(Coverage::Window(Some(ReportWindow {
+        start,
+        end,
+        truncated,
+        kind: window.kind(),
+    })))
 }
 
 /// A configured second count as the signed number instant arithmetic uses.
@@ -1006,6 +1121,181 @@ mod tests {
         ] {
             assert_eq!(bound.timestamp_subsec_nanos() % 1000, 0, "{bound}");
         }
+    }
+
+    // -- Cadence boundaries ------------------------------------------------
+
+    /// The boundary after an instant is strictly after it: an instant ON a
+    /// boundary has already reached it, so the next one is an interval on.
+    /// A cursor still in the future has no boundary to consume.
+    #[test]
+    fn fire_boundaries_name_the_first_boundary_strictly_after_now() {
+        let on = fire_boundaries(at(3, 0), HOUR, at(5, 0)).unwrap().unwrap();
+        assert_eq!(on.planned_fire, at(5, 0));
+        assert_eq!(on.next_fire_at, at(6, 0));
+
+        let between = fire_boundaries(at(3, 0), HOUR, at(5, 59)).unwrap().unwrap();
+        assert_eq!(between.planned_fire, at(5, 0));
+        assert_eq!(between.next_fire_at, at(6, 0));
+
+        let future = at(3, 0) - TimeDelta::microseconds(1);
+        assert_eq!(fire_boundaries(at(3, 0), HOUR, future).unwrap(), None);
+
+        assert_eq!(
+            fire_boundaries(at(3, 0), 0, at(5, 0)),
+            Err(PlanError::InvalidConfig)
+        );
+    }
+
+    // -- The manual-run planner (ADR-0018 amended 2026-09-23) --------------
+
+    /// A manual `since_last` run is the next window fired early: it starts
+    /// at the watermark and ends at `t - lag`, whatever the fire cursor
+    /// says.
+    #[test]
+    fn a_manual_since_last_run_covers_from_the_watermark_to_now_minus_lag() {
+        let t = at(3, 17) + TimeDelta::nanoseconds(123_456_789);
+        let input = PlanInput {
+            now: t,
+            // A cursor far off in either direction changes nothing.
+            next_fire_at: at(9, 0),
+            interval_secs: HOUR,
+            window: Some(ScheduleWindow::SinceLast),
+            lag_secs: 300,
+            covered_through: Some(at(2, 55)),
+            max_catchup_intervals: 24,
+        };
+        let expected = ReportWindow {
+            start: at(2, 55),
+            end: truncate_to_micros(t) - TimeDelta::try_seconds(300).unwrap(),
+            truncated: false,
+            kind: WindowKind::SinceLast,
+        };
+        assert_eq!(
+            plan_manual_run(&input).unwrap(),
+            ManualPlan::Run(Some(expected))
+        );
+        let behind = PlanInput {
+            next_fire_at: at(0, 0),
+            ..input
+        };
+        assert_eq!(
+            plan_manual_run(&behind).unwrap(),
+            ManualPlan::Run(Some(expected))
+        );
+    }
+
+    /// A fixed span is re-measured from `t - lag`, and the watermark is
+    /// not read.
+    #[test]
+    fn a_manual_fixed_run_covers_the_trailing_span_ending_now_minus_lag() {
+        let input = PlanInput {
+            now: at(6, 10),
+            next_fire_at: at(7, 0),
+            interval_secs: HOUR,
+            window: Some(ScheduleWindow::Fixed { secs: 2 * HOUR }),
+            lag_secs: 300,
+            covered_through: Some(at(9, 0)),
+            max_catchup_intervals: 24,
+        };
+        assert_eq!(
+            plan_manual_run(&input).unwrap(),
+            ManualPlan::Run(Some(ReportWindow {
+                start: at(4, 5),
+                end: at(6, 5),
+                truncated: false,
+                kind: WindowKind::Fixed,
+            }))
+        );
+    }
+
+    /// Query mode has no window to plan: the text runs verbatim.
+    #[test]
+    fn a_manual_query_mode_run_plans_no_window() {
+        let mut input = since_last_input(at(3, 17), Some(at(9, 0)));
+        input.window = None;
+        assert_eq!(plan_manual_run(&input).unwrap(), ManualPlan::Run(None));
+    }
+
+    /// The catch-up clamp and its flag apply to a manual run exactly as to
+    /// a scheduled one.
+    #[test]
+    fn a_manual_run_past_the_catchup_bound_is_clamped_and_flagged() {
+        let mut input = since_last_input(
+            at(3, 17),
+            Some(at(3, 17) - TimeDelta::try_hours(5).unwrap()),
+        );
+        input.max_catchup_intervals = 3;
+        assert_eq!(
+            plan_manual_run(&input).unwrap(),
+            ManualPlan::Run(Some(ReportWindow {
+                start: at(0, 17),
+                end: at(3, 17),
+                truncated: true,
+                kind: WindowKind::SinceLast,
+            }))
+        );
+    }
+
+    /// Ruling 14 holds for a manual run too: no watermark covers one
+    /// interval back from `t - lag`.
+    #[test]
+    fn a_manual_run_without_a_watermark_covers_one_interval() {
+        let mut input = since_last_input(at(3, 17), None);
+        input.lag_secs = 60;
+        assert_eq!(
+            plan_manual_run(&input).unwrap(),
+            ManualPlan::Run(Some(ReportWindow {
+                start: at(2, 16),
+                end: at(3, 16),
+                truncated: false,
+                kind: WindowKind::SinceLast,
+            }))
+        );
+    }
+
+    /// A window that would end at or before the watermark is coverage
+    /// that already exists. Equality is empty too, down to the microsecond,
+    /// because the window is half-open.
+    #[test]
+    fn a_manual_run_with_nothing_new_to_read_is_covered() {
+        let t = at(3, 17);
+        for covered in [t, t + TimeDelta::try_hours(1).unwrap()] {
+            assert_eq!(
+                plan_manual_run(&since_last_input(t, Some(covered))).unwrap(),
+                ManualPlan::Covered {
+                    covered_through: covered,
+                    end: t,
+                }
+            );
+        }
+
+        let one_micro_behind = t - TimeDelta::microseconds(1);
+        assert_eq!(
+            plan_manual_run(&since_last_input(t, Some(one_micro_behind))).unwrap(),
+            ManualPlan::Run(Some(ReportWindow {
+                start: one_micro_behind,
+                end: t,
+                truncated: false,
+                kind: WindowKind::SinceLast,
+            }))
+        );
+    }
+
+    /// The manual planner refuses the same broken numbers the due planner
+    /// does.
+    #[test]
+    fn a_manual_plan_refuses_zero_config() {
+        let no_catchup = PlanInput {
+            max_catchup_intervals: 0,
+            ..since_last_input(at(3, 0), None)
+        };
+        assert_eq!(plan_manual_run(&no_catchup), Err(PlanError::InvalidConfig));
+        let no_interval = PlanInput {
+            interval_secs: 0,
+            ..since_last_input(at(3, 0), None)
+        };
+        assert_eq!(plan_manual_run(&no_interval), Err(PlanError::InvalidConfig));
     }
 
     // -- The window materializer (ADR-0018 ruling 11) ----------------------
