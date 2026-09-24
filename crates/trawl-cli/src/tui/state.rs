@@ -425,7 +425,7 @@ const WELL_KNOWN_FIELDS: &[&str] = &["_time", "env", "service", "host", "_severi
 /// or present in more than 80% of services. Well-known fields come first, then
 /// threshold-promoted fields alphabetically.
 pub fn compute_common_fields(services: &[trawl_api::ServiceSchema]) -> Vec<CommonField> {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     if services.is_empty() {
         return Vec::new();
@@ -435,6 +435,17 @@ pub fn compute_common_fields(services: &[trawl_api::ServiceSchema]) -> Vec<Commo
     let mut field_stats: HashMap<String, CommonField> = HashMap::new();
     // Per field, whether its min / max bound was dropped for mixing shapes.
     let mut dropped: HashMap<String, [bool; 2]> = HashMap::new();
+    // Fields some service types as a timestamp. Collected up front so the
+    // shape rule does not depend on which service the merge meets first.
+    let timestamp_typed: HashSet<&str> = services
+        .iter()
+        .flat_map(|svc| &svc.columns)
+        .filter(|col| {
+            trawl_core::schema::CanonicalType::from_catalog(&col.data_type)
+                == Some(trawl_core::schema::CanonicalType::Timestamp)
+        })
+        .map(|col| col.name.as_str())
+        .collect();
     let threshold = (services.len() * 80) / 100;
 
     for svc in services {
@@ -455,15 +466,18 @@ pub fn compute_common_fields(services: &[trawl_api::ServiceSchema]) -> Vec<Commo
             entry.total_count += col.total_count;
             // Update global min/max (lexicographic).
             let [min_dropped, max_dropped] = dropped.entry(col.name.clone()).or_default();
+            let timestamp = timestamp_typed.contains(col.name.as_str());
             fold_common_bound(
                 &mut entry.min_value,
                 min_dropped,
+                timestamp,
                 col.min_value.as_ref(),
                 |v, cur| v < cur,
             );
             fold_common_bound(
                 &mut entry.max_value,
                 max_dropped,
+                timestamp,
                 col.max_value.as_ref(),
                 |v, cur| v > cur,
             );
@@ -498,12 +512,15 @@ pub fn compute_common_fields(services: &[trawl_api::ServiceSchema]) -> Vec<Commo
 /// and text of one such shape orders as the instants do. Text of two shapes
 /// does not: a UTC and a local sample name different instants, and a
 /// timestamp beside an integer (one service mid-repin) is no range at all.
-/// So when either side is timestamp-shaped and the shapes differ, the common
-/// bound is dropped for good (`dropped`) rather than picking one. Every
-/// other pairing keeps the plain text comparison.
+/// So for a field some service types as a timestamp (`timestamp`), when
+/// either side is timestamp-shaped and the shapes differ, the common bound
+/// is dropped for good (`dropped`) rather than picking one. A field no
+/// service types as a timestamp keeps the plain text comparison, even when
+/// its text happens to look like one.
 fn fold_common_bound(
     bound: &mut Option<String>,
     dropped: &mut bool,
+    timestamp: bool,
     candidate: Option<&String>,
     replaces: fn(&str, &str) -> bool,
 ) {
@@ -515,7 +532,7 @@ fn fold_common_bound(
         None => *bound = Some(v.clone()),
         Some(cur) => {
             let (a, b) = (instant_shape(v), instant_shape(cur));
-            if (a.is_some() || b.is_some()) && a != b {
+            if timestamp && (a.is_some() || b.is_some()) && a != b {
                 *bound = None;
                 *dropped = true;
             } else if replaces(v, cur) {

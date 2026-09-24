@@ -558,14 +558,15 @@ mod tests {
     use super::*;
     use crate::tui::state::compute_common_fields;
 
-    fn service(name: &str, bounds: &[(&str, &str, &str)]) -> trawl_api::ServiceSchema {
+    /// A service whose columns are `(name, type, min, max)`.
+    fn service(name: &str, bounds: &[(&str, &str, &str, &str)]) -> trawl_api::ServiceSchema {
         trawl_api::ServiceSchema {
             name: name.to_owned(),
             columns: bounds
                 .iter()
-                .map(|(column, min, max)| trawl_api::ServiceColumnStats {
+                .map(|(column, ty, min, max)| trawl_api::ServiceColumnStats {
                     name: (*column).to_owned(),
-                    data_type: "TIMESTAMP".to_owned(),
+                    data_type: (*ty).to_owned(),
                     null_count: 0,
                     total_count: 10,
                     min_value: Some((*min).to_owned()),
@@ -610,6 +611,7 @@ mod tests {
             "old",
             &[(
                 "_time",
+                "TIMESTAMP",
                 "1969-12-31T23:59:59.500000",
                 "2026-01-02T03:04:05.123000",
             )],
@@ -618,6 +620,7 @@ mod tests {
             "new",
             &[(
                 "_time",
+                "TIMESTAMP",
                 "2026-01-01T00:00:00.000000",
                 "2026-09-24T18:25:30.654321",
             )],
@@ -636,11 +639,15 @@ mod tests {
             "utc",
             &[(
                 "_time",
+                "TIMESTAMP",
                 "2026-01-01T00:00:00.000000Z",
                 "2026-01-01T00:00:01.000000Z",
             )],
         );
-        let int = service("int", &[("_time", "1767225600000000", "1767225601000000")]);
+        let int = service(
+            "int",
+            &[("_time", "BIGINT", "1767225600000000", "1767225601000000")],
+        );
         for order in [
             vec![old.clone(), utc.clone()],
             vec![utc.clone(), old.clone()],
@@ -652,13 +659,30 @@ mod tests {
             assert_eq!(bounds(&order, "_time"), (None, None), "{names:?}");
         }
 
-        // Non-timestamp text keeps the plain comparison.
-        let a = service("a", &[("_time", "200", "404")]);
-        let b = service("b", &[("_time", "1000", "503")]);
+        // A field no service types as a timestamp keeps the plain text
+        // comparison, numbers and timestamp-looking strings alike.
+        let a = service("a", &[("_time", "BIGINT", "200", "404")]);
+        let b = service("b", &[("_time", "BIGINT", "1000", "503")]);
         assert_eq!(
             bounds(&[a, b], "_time"),
             (Some("1000".to_owned()), Some("503".to_owned()))
         );
+        let looks = service(
+            "looks",
+            &[(
+                "note",
+                "VARCHAR",
+                "2026-01-01T00:00:00.000000Z",
+                "2026-01-01T00:00:00.000000Z",
+            )],
+        );
+        let plain = service("plain", &[("note", "VARCHAR", "abc", "abc")]);
+        let want_text = (
+            Some("2026-01-01T00:00:00.000000Z".to_owned()),
+            Some("abc".to_owned()),
+        );
+        assert_eq!(bounds(&[looks.clone(), plain.clone()], "note"), want_text);
+        assert_eq!(bounds(&[plain, looks], "note"), want_text);
 
         // Rendered: the fixed-width text reads as a time with trailing
         // fractional zeros trimmed; a `Z` sample renders as sent.
