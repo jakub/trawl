@@ -113,7 +113,11 @@ Compaction stops at shutdown without a final pass. WAL files that it has not mer
 The protocol does not cover every failure:
 
 - A successful fsync is the only durability proof that Trawl uses. After a failed fsync, some Linux filesystems drop the unwritten pages and report a later fsync as successful. Recovery fsyncs again and cannot detect that case.
-- Retention re-reads the publication markers immediately before it deletes each date directory. Retention never deletes the date that it reads as today. A publish that starts before midnight can still write into yesterday's directory while retention, already on the new date, deletes that directory. If compaction writes its marker between the re-read and the delete, recovery finds neither output and reports the marker as `contradictory`, and `TrawlPublicationRecoveryBlocked` fires. The WAL files stay, so no acknowledged row is lost or counted twice beyond what retention itself deletes. The service stays blocked until an operator resolves the marker.
+- Retention re-reads the publication markers immediately before it deletes each date directory. Retention never deletes the date that it reads as today. A publish that starts before midnight can still write into yesterday's directory while retention, already on the new date, deletes that directory. If compaction writes its marker between the re-read and the delete, the outcome depends on when the delete lands:
+  - Before the rename: recovery finds neither output and reports the marker as `contradictory`, and `TrawlPublicationRecoveryBlocked` fires. The WAL files stay, and the service stays blocked until an operator resolves the marker.
+  - After the output is published: the published rows are deleted with the rest of that date, and compaction then retires the WAL and removes the marker. No marker or alert remains. Those rows are lost the same way retention expiry loses rows.
+
+  In both cases, no acknowledged row is counted twice, and no row is lost that retention was not already deleting with its date.
 
 ## Recovery is not backup
 
