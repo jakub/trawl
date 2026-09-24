@@ -2944,6 +2944,8 @@ pub async fn get_report_run(
 /// `POST /api/v1/export` — export query results as CSV, JSON, or Parquet.
 ///
 /// Bypasses `max_result_rows` in favor of `max_export_rows` to support larger downloads.
+/// Every format keeps the first `limit` rows (the request's, clamped to
+/// `max_export_rows`) and drops the rest rather than refusing the export.
 #[allow(clippy::too_many_lines)]
 pub async fn export(
     State(state): State<AppState>,
@@ -3037,16 +3039,24 @@ pub async fn export(
         ));
     }
 
-    // CSV and JSON exports: execute query and render in memory.
+    // CSV and JSON exports: execute query and render in memory, cut at
+    // `limit` the way the Parquet lane's `LIMIT` cuts. A kv tail's input
+    // cannot be cut without changing its answer, so it is bounded by
+    // `max_export_rows` instead (see `RowCap::Truncate`).
     let capture_debug = state.query.query_log.is_some();
+    let cap = trawl_engine::executor::RowCap::Truncate {
+        rows: limit,
+        tail_input: max_export_rows,
+    };
     // Exports use UTC — timezone conversion is a display concern for
     // interactive queries, not bulk data exports.
     let outcome = state
         .query
         .pool
-        .execute(
+        .execute_capped(
             query_id,
             &req.query,
+            cap,
             deadline,
             capture_debug,
             0,
@@ -3073,18 +3083,16 @@ pub async fn export(
         }
     };
 
-    let limited = result.paginate(0, limit);
-
     let (content_type, filename, body) = match format {
         trawl_api::ExportFormat::Csv => (
             "text/csv; charset=utf-8".to_owned(),
             "attachment; filename=\"export.csv\"".to_owned(),
-            generate_csv(&limited).into_bytes(),
+            generate_csv(&result).into_bytes(),
         ),
         trawl_api::ExportFormat::Json => (
             "application/x-ndjson".to_owned(),
             "attachment; filename=\"export.ndjson\"".to_owned(),
-            generate_ndjson(&limited).into_bytes(),
+            generate_ndjson(&result).into_bytes(),
         ),
         trawl_api::ExportFormat::Parquet => {
             return Err(ServerError::Internal(
@@ -3099,7 +3107,7 @@ pub async fn export(
         query_id,
         query_len = req.query.len(),
         %format,
-        rows = limited.row_count(),
+        rows = result.row_count(),
         bytes = body.len(),
         duration_ms,
         "export complete"
@@ -3110,7 +3118,7 @@ pub async fn export(
         &verified,
         &req.query,
         outcome.debug.as_ref(),
-        Some(&limited),
+        Some(&result),
         duration_ms,
         None,
     );

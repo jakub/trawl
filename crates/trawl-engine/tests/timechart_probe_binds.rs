@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use trawl_core::schema::FieldTypes;
 use trawl_engine::cancel::CancelLatch;
 use trawl_engine::error::EngineError;
-use trawl_engine::executor::{Executor, prepare_probe};
+use trawl_engine::executor::{Executor, RowCap, prepare_probe};
 
 /// A one-row parquet whose only timestamp column is `good`.
 fn fixture(dir: &tempfile::TempDir) -> String {
@@ -59,7 +59,13 @@ fn cancelled_during_probe_never_binds_main() {
 
     let before = prepare_probe::count();
     exec.cancellable(&latch)
-        .run_query(dsl, &source, &FieldTypes::new(), usize::MAX, 0)
+        .run_query(
+            dsl,
+            &source,
+            &FieldTypes::new(),
+            RowCap::Refuse(usize::MAX),
+            0,
+        )
         .expect("a TIMESTAMP bucket source runs");
     assert!(
         prepare_probe::count() >= before + 2,
@@ -68,9 +74,13 @@ fn cancelled_during_probe_never_binds_main() {
 
     flag.store(true, Ordering::SeqCst);
     let before = prepare_probe::count();
-    let outcome =
-        exec.cancellable(&latch)
-            .run_query(dsl, &source, &FieldTypes::new(), usize::MAX, 0);
+    let outcome = exec.cancellable(&latch).run_query(
+        dsl,
+        &source,
+        &FieldTypes::new(),
+        RowCap::Refuse(usize::MAX),
+        0,
+    );
     assert!(
         matches!(outcome, Err(EngineError::Cancelled)),
         "expected a cancellation, got {outcome:?}"

@@ -2137,6 +2137,156 @@ async fn export_rejects_reader() {
     );
 }
 
+/// Rows in a CSV export: every line but the header.
+fn csv_rows(body: &[u8]) -> usize {
+    std::str::from_utf8(body)
+        .expect("CSV is UTF-8")
+        .lines()
+        .count()
+        .saturating_sub(1)
+}
+
+/// Rows in an NDJSON export: one per non-empty line.
+fn ndjson_rows(body: &[u8]) -> usize {
+    std::str::from_utf8(body)
+        .expect("NDJSON is UTF-8")
+        .lines()
+        .filter(|line| !line.is_empty())
+        .count()
+}
+
+/// Rows in a Parquet export, counted by `DuckDB` over the written bytes.
+fn parquet_rows(body: &[u8]) -> usize {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("export.parquet");
+    std::fs::write(&path, body).expect("write the export");
+    let conn = duckdb::Connection::open_in_memory().expect("open duckdb");
+    let count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM read_parquet(?)",
+            [path.to_str().expect("UTF-8 temp path")],
+            |row| row.get(0),
+        )
+        .expect("count the exported rows");
+    usize::try_from(count).expect("a row count is non-negative")
+}
+
+fn assert_result_too_large<T: std::fmt::Debug>(
+    result: Result<T, trawl_client::ClientError>,
+    what: &str,
+) {
+    match result.expect_err(what) {
+        trawl_client::ClientError::Server { status, error } => {
+            assert_eq!(status, 400, "{what}");
+            assert_eq!(error.code, trawl_api::ErrorCode::ResultTooLarge, "{what}");
+        }
+        other => panic!("{what}: expected a 400 result_too_large, got {other:?}"),
+    }
+}
+
+/// Every export format is capped by `max_export_rows`, never by
+/// `max_result_rows`, and a result past its cap is cut at the cap in all
+/// three formats — the way the Parquet export's `LIMIT` cuts it.
+///
+/// The caps are shrunk to five interactive rows and fifty export rows so
+/// that twenty events cross the first and sixty cross the second.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // one fixture, three formats, four shapes
+async fn export_is_capped_by_max_export_rows_not_max_result_rows() {
+    use trawl_api::ExportFormat;
+
+    let server = common::setup_with_row_caps(common::RowCaps {
+        max_result_rows: 5,
+        max_export_rows: 50,
+    })
+    .await;
+    let ingest = HttpClient::new_insecure(&server.url, &server.ingest_token).unwrap();
+    let analyst = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let records: Vec<_> = (0..60)
+        .map(|i| {
+            let service = if i < 20 {
+                "export-cap-small"
+            } else {
+                "export-cap-bulk"
+            };
+            serde_json::json!({"service": service, "host": "web01", "_time": now,
+                "message": format!("k=v{}", i % 3)})
+        })
+        .collect();
+    assert_eq!(ingest.ingest(&records).await.unwrap().accepted, 60);
+
+    let small = "service=export-cap-small";
+    let everything = "service=export-cap-*";
+
+    // The interactive lane keeps its own cap: twenty rows are past five.
+    assert_result_too_large(
+        analyst.query_paginated(small, None, None).await,
+        "an interactive query past max_result_rows is refused",
+    );
+
+    let export = |dsl: &'static str, format: &ExportFormat, limit: Option<usize>| {
+        let analyst = &analyst;
+        let format = format.clone();
+        async move {
+            let body = analyst
+                .export(dsl, format.clone(), limit)
+                .await
+                .unwrap_or_else(|e| panic!("{format} export of {dsl:?} (limit {limit:?}): {e:?}"));
+            match format {
+                ExportFormat::Csv => csv_rows(&body),
+                ExportFormat::Json => ndjson_rows(&body),
+                ExportFormat::Parquet => parquet_rows(&body),
+            }
+        }
+    };
+
+    for format in [ExportFormat::Csv, ExportFormat::Json, ExportFormat::Parquet] {
+        // Past max_result_rows, inside max_export_rows: every row.
+        assert_eq!(
+            export(small, &format, None).await,
+            20,
+            "{format}: whole result"
+        );
+        // A requested limit cuts the result, it does not refuse it.
+        assert_eq!(export(small, &format, Some(7)).await, 7, "{format}: limit");
+        // Past max_export_rows: cut at the cap, however the limit asks.
+        assert_eq!(
+            export(everything, &format, None).await,
+            50,
+            "{format}: default limit is max_export_rows"
+        );
+        assert_eq!(
+            export(everything, &format, Some(1_000)).await,
+            50,
+            "{format}: a limit above max_export_rows is clamped to it"
+        );
+    }
+
+    // The kv tail aggregates in Rust over the rows SQL hands it, so its
+    // input is never cut, only its answer: twenty events in, three groups
+    // out, two kept.
+    let tail = "service=export-cap-small | extract kv | stats count() by k";
+    for format in [ExportFormat::Csv, ExportFormat::Json] {
+        assert_eq!(export(tail, &format, None).await, 3, "{format}: kv tail");
+        assert_eq!(
+            export(tail, &format, Some(2)).await,
+            2,
+            "{format}: kv tail limit"
+        );
+    }
+    // Cutting sixty events to fifty would publish a wrong count, so a tail
+    // whose input is past max_export_rows is refused instead.
+    let wide_tail = "service=export-cap-* | extract kv | stats count() by k";
+    for format in [ExportFormat::Csv, ExportFormat::Json] {
+        assert_result_too_large(
+            analyst.export(wide_tail, format, Some(2)).await,
+            "a kv tail reading past max_export_rows is refused, not cut",
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn reader_can_query_and_view_history() {
     let server = setup().await;

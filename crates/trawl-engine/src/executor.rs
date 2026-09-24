@@ -64,6 +64,44 @@ fn record_prepare() {
     prepare_probe::record();
 }
 
+/// How a query lane bounds the rows it hands back.
+///
+/// Every lane holds its answer in memory, so every lane has a bound. The
+/// variants differ in what a result past the bound means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowCap {
+    /// Refuse a result longer than this with
+    /// [`EngineError::ResultTooLarge`]. The interactive lanes use it, where
+    /// a cut answer on screen would pass for the whole one.
+    Refuse(usize),
+    /// Keep the first `rows` rows of the answer and drop the rest, as the
+    /// Parquet export's `LIMIT` does. The CSV and JSON exports use it.
+    ///
+    /// A pipeline that runs wholly in SQL stops reading at `rows`. A
+    /// pipeline with a Rust tail cannot: the tail may aggregate, and a
+    /// count over the first `rows` events is a wrong answer, not a short
+    /// one. Its SQL half reads under [`RowCap::Refuse`]`(tail_input)`, and
+    /// the cut applies to what the tail returns.
+    Truncate { rows: usize, tail_input: usize },
+}
+
+impl RowCap {
+    /// The cap the SQL half of a pipeline reads under.
+    fn sql_read(self, rust_tail: bool) -> Self {
+        match self {
+            Self::Truncate { tail_input, .. } if rust_tail => Self::Refuse(tail_input),
+            cap => cap,
+        }
+    }
+
+    /// Cut a finished answer to the rows this cap keeps.
+    fn trim(self, result: &mut QueryResult) {
+        if let Self::Truncate { rows, .. } = self {
+            result.rows.truncate(rows);
+        }
+    }
+}
+
 /// The four query and export lanes, bound to a caller's cancellation
 /// latch.
 ///
@@ -82,21 +120,21 @@ pub struct Cancellable<'a> {
 
 impl Cancellable<'_> {
     /// [`Executor::run_query`], stopping at the bind-to-execute boundary
-    /// once the latch is set.
+    /// once the latch is set, under the caller's [`RowCap`].
     pub fn run_query(
         &self,
         dsl: &str,
         source: &str,
         pins: &FieldTypes,
-        max_rows: usize,
+        cap: RowCap,
         utc_offset_secs: i32,
     ) -> Result<QueryResult, EngineError> {
         self.executor
-            .run_query_latched(dsl, source, pins, max_rows, utc_offset_secs, self.cancel)
+            .run_query_latched(dsl, source, pins, cap, utc_offset_secs, self.cancel)
     }
 
     /// [`Executor::run_query_with_hot`], stopping at the bind-to-execute
-    /// boundary once the latch is set.
+    /// boundary once the latch is set, under the caller's [`RowCap`].
     #[allow(clippy::too_many_arguments)]
     pub fn run_query_with_hot(
         &self,
@@ -105,7 +143,7 @@ impl Cancellable<'_> {
         hot_source: &str,
         hot_pins: &FieldTypes,
         pins: &FieldTypes,
-        max_rows: usize,
+        cap: RowCap,
         utc_offset_secs: i32,
     ) -> Result<QueryResult, EngineError> {
         self.executor.run_query_with_hot_latched(
@@ -114,7 +152,7 @@ impl Cancellable<'_> {
             hot_source,
             hot_pins,
             pins,
-            max_rows,
+            cap,
             utc_offset_secs,
             self.cancel,
         )
@@ -252,6 +290,9 @@ impl Executor {
     /// explicit `FieldTypes::new()`, making its pin-blindness visible at
     /// the call site.
     ///
+    /// A result past `max_rows` is refused ([`RowCap::Refuse`]); a lane
+    /// that cuts instead goes through [`Cancellable::run_query`].
+    ///
     /// `utc_offset_secs` is applied to all timestamp values at format time.
     /// Pass `0` for UTC display.
     pub fn run_query(
@@ -266,7 +307,7 @@ impl Executor {
             dsl,
             source,
             pins,
-            max_rows,
+            RowCap::Refuse(max_rows),
             utc_offset_secs,
             &CancelLatch::never(),
         )
@@ -278,7 +319,7 @@ impl Executor {
         dsl: &str,
         source: &str,
         pins: &FieldTypes,
-        max_rows: usize,
+        cap: RowCap,
         utc_offset_secs: i32,
         cancel: &CancelLatch,
     ) -> Result<QueryResult, EngineError> {
@@ -286,7 +327,8 @@ impl Executor {
         let resolved = self.resolve_source(source);
         let emitted = resolved.emit_cold(&ast, pins, EvalContext::capture())?;
         let sql_offset = sql_render_offset(&emitted, utc_offset_secs);
-        let outcome = self.execute_emitted_tracked(&emitted, max_rows, sql_offset, cancel);
+        let sql_cap = cap.sql_read(!emitted.rust_stages.is_empty());
+        let outcome = self.execute_emitted_tracked(&emitted, sql_cap, sql_offset, cancel);
         // Same gate as the hot lanes, one column over: with no hot buffer to
         // fall back to, `HotOnly` is unreachable (see [`cold_action`]) — but a
         // "no files" answer over a source that still reaches files is the
@@ -310,6 +352,7 @@ impl Executor {
             let tracked = tail_timestamp_scope(&timestamp_columns, &emitted.rust_stages);
             shift_timestamp_columns(&mut result, &tracked, utc_offset_secs);
         }
+        cap.trim(&mut result);
         if emitted.needs_column_reorder {
             result.reorder_log_columns();
         }
@@ -329,7 +372,8 @@ impl Executor {
     /// answering "no files" is a race, not an empty window (ADR-0008).
     /// `hot_pins` conforms the hot branch (pins ∩ snapshot keys); `pins`
     /// is the full catalog snapshot typing the comparisons — one
-    /// interpretation per query (ADR-0011).
+    /// interpretation per query (ADR-0011). `max_rows` refuses as in
+    /// [`Self::run_query`].
     #[allow(clippy::too_many_arguments)]
     pub fn run_query_with_hot(
         &self,
@@ -347,7 +391,7 @@ impl Executor {
             hot_source,
             hot_pins,
             pins,
-            max_rows,
+            RowCap::Refuse(max_rows),
             utc_offset_secs,
             &CancelLatch::never(),
         )
@@ -361,7 +405,7 @@ impl Executor {
         hot_source: &str,
         hot_pins: &FieldTypes,
         pins: &FieldTypes,
-        max_rows: usize,
+        cap: RowCap,
         utc_offset_secs: i32,
         cancel: &CancelLatch,
     ) -> Result<QueryResult, EngineError> {
@@ -370,7 +414,8 @@ impl Executor {
         let emitted =
             resolved.emit_union(&ast, hot_source, hot_pins, pins, EvalContext::capture())?;
         let sql_offset = sql_render_offset(&emitted, utc_offset_secs);
-        let outcome = self.execute_emitted_tracked(&emitted, max_rows, sql_offset, cancel);
+        let sql_cap = cap.sql_read(!emitted.rust_stages.is_empty());
+        let outcome = self.execute_emitted_tracked(&emitted, sql_cap, sql_offset, cancel);
 
         // A hot value disagreeing with a catalog pin is already conformed on
         // the union's hot branch by the emitter (TRY_CAST to NULL), and
@@ -403,7 +448,7 @@ impl Executor {
                 // (ADR-0017 §3).
                 let hot_emitted =
                     emitter::emit_hot_only(&ast, hot_source, hot_pins, pins, emitted.anchor)?;
-                match self.execute_emitted_tracked(&hot_emitted, max_rows, sql_offset, cancel) {
+                match self.execute_emitted_tracked(&hot_emitted, sql_cap, sql_offset, cancel) {
                     // Hot-only also hit a binder/emit error (e.g. empty ndjson
                     // between compaction cycles). Treat as empty, not error.
                     Err(EngineError::Emit(_)) => (QueryResult::empty(), TimestampColumns::new()),
@@ -424,6 +469,7 @@ impl Executor {
             let tracked = tail_timestamp_scope(&timestamp_columns, &emitted.rust_stages);
             shift_timestamp_columns(&mut result, &tracked, utc_offset_secs);
         }
+        cap.trim(&mut result);
         if emitted.needs_column_reorder {
             result.reorder_log_columns();
         }
@@ -442,8 +488,13 @@ impl Executor {
         max_rows: usize,
         utc_offset_secs: i32,
     ) -> Result<QueryResult, EngineError> {
-        self.execute_emitted_tracked(query, max_rows, utc_offset_secs, &CancelLatch::never())
-            .map(|(result, _)| result)
+        self.execute_emitted_tracked(
+            query,
+            RowCap::Refuse(max_rows),
+            utc_offset_secs,
+            &CancelLatch::never(),
+        )
+        .map(|(result, _)| result)
     }
 
     /// [`Self::execute_emitted`], additionally reporting which result
@@ -455,19 +506,19 @@ impl Executor {
     fn execute_emitted_tracked(
         &self,
         query: &EmittedQuery,
-        max_rows: usize,
+        cap: RowCap,
         utc_offset_secs: i32,
         cancel: &CancelLatch,
     ) -> Result<(QueryResult, TimestampColumns), EngineError> {
         with_raw_fallback(query, |q| {
-            self.execute_emitted_once(q, max_rows, utc_offset_secs, cancel)
+            self.execute_emitted_once(q, cap, utc_offset_secs, cancel)
         })
     }
 
     fn execute_emitted_once(
         &self,
         query: &EmittedQuery,
-        max_rows: usize,
+        cap: RowCap,
         utc_offset_secs: i32,
         cancel: &CancelLatch,
     ) -> Result<(QueryResult, TimestampColumns), EngineError> {
@@ -530,8 +581,12 @@ impl Executor {
 
         let mut rows = Vec::new();
         while let Some(row) = result_rows.next()? {
-            if rows.len() >= max_rows {
-                return Err(EngineError::ResultTooLarge(max_rows));
+            match cap {
+                RowCap::Refuse(max_rows) if rows.len() >= max_rows => {
+                    return Err(EngineError::ResultTooLarge(max_rows));
+                }
+                RowCap::Truncate { rows: keep, .. } if rows.len() >= keep => break,
+                _ => {}
             }
             let mut cells = Vec::with_capacity(col_count);
             for (i, seen) in is_timestamp.iter_mut().enumerate() {
