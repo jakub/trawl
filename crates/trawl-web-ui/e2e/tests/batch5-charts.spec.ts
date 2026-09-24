@@ -307,7 +307,10 @@ test('histogram tooltip stays inside the strip at both edges', async ({ page }) 
     expect(t!.x + t!.width, `${label}: right edge`).toBeLessThanOrEqual(h!.x + h!.width + ROUNDING);
   };
 
-  for (const viewport of [{ width: 1400, height: 900 }, { width: 800, height: 900 }]) {
+  // 320px is the narrowest width the responsive suite checks. There the
+  // strip is narrower than an error bucket's one-line label, so the tip
+  // has to wrap to fit at all.
+  for (const viewport of [{ width: 1400, height: 900 }, { width: 800, height: 900 }, { width: 320, height: 900 }]) {
     await page.setViewportSize(viewport);
     for (const index of [0, 47]) {
       const bar = bars.nth(index);

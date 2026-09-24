@@ -212,15 +212,19 @@ fn place_bar_tip(bar: &HtmlElement, strip: &web_sys::Element) {
             None => return,
         }
     }
+    // Bound the tip to the strip first, so a label longer than the strip
+    // wraps instead of overflowing. Reading `offset_width` after setting
+    // it forces layout, so the width measured below is the wrapped one.
+    let room = strip.client_width() - 2 * TIP_EDGE;
+    let style = tip.style();
+    let _ = style.set_property("--tip-max", &format!("{room}px"));
     let shift = tip_shift(
         bar_left - TIP_EDGE,
         bar.offset_width(),
         tip.offset_width(),
-        strip.client_width() - 2 * TIP_EDGE,
+        room,
     );
-    let _ = tip
-        .style()
-        .set_property("--tip-shift", &format!("{shift}px"));
+    let _ = style.set_property("--tip-shift", &format!("{shift}px"));
 }
 
 #[allow(clippy::cast_precision_loss)] // bucket index is at most N_BUCKETS

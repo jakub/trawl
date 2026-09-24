@@ -1087,7 +1087,10 @@
 }
 /* Centred on its bar, then shifted sideways by the measured
  * `--tip-shift` (components/histogram.rs) so an edge bar's tip stays
- * inside the strip. Vertical placement does not move. */
+ * inside the strip. `--tip-max` is the strip's inner width: a tip that
+ * fits keeps its one-line `max-content` width, and a longer one wraps
+ * to the strip. Anchored by `bottom`, so extra lines grow upward and
+ * the tip never covers the bars. */
 .histo .bar .tip {
   position: absolute;
   bottom: calc(100% + 2px);
@@ -1099,7 +1102,8 @@
   font-size: var(--fs-micro);
   padding: 3px 6px;
   border-radius: var(--radius-sm);
-  white-space: nowrap;
+  width: max-content;
+  max-width: var(--tip-max, none);
   pointer-events: none;
   opacity: 0;
   transition: opacity 120ms;

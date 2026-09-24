@@ -246,7 +246,9 @@ pub fn parse_bucket_ms(s: &str) -> Option<i64> {
 /// `0..=strip_width - tip_width` and is zero when it is already there.
 /// A tip wider than the strip cannot fit either way; it aligns to the
 /// strip's left edge, so its start (the bucket's start time) stays
-/// readable.
+/// readable. The component caps a tip's width at the strip's and lets it
+/// wrap, so in practice this case does not arise; the fallback keeps the
+/// function total.
 ///
 /// A measured clamp, not a rule for "the first or last few bars": the tip
 /// width follows its label and the bar width follows the bucket count
