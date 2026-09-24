@@ -327,15 +327,15 @@ fn retention_tick_at(
     // reads the new one. The re-scan keeps that directory if the marker
     // exists when the re-scan runs. What remains is the window between the
     // re-scan and the `remove_dir_all`: a marker written there names a
-    // directory the sweep then deletes. If the delete lands before the
-    // rename, recovery finds neither output and reports the marker as
+    // directory the sweep then deletes. Either the publish fails or
+    // recovery later finds neither output: the marker is reported as
     // contradictory, `TrawlPublicationRecoveryBlocked` fires, the WAL files
     // are kept, and the service stays blocked until an operator resolves
-    // the marker. If it lands after the output is published, those rows go
-    // with the rest of the date, the same as retention expiry, and
-    // compaction retires the WAL and removes the marker normally. Either
-    // way no acknowledged row is counted twice, and none is lost that
-    // retention was not already deleting with its date.
+    // the marker. Or the output was already renamed and fsynced:
+    // compaction retires the WAL and removes the marker, and the published
+    // rows go with the rest of the date, the same as retention expiry.
+    // Either way no acknowledged row is counted twice, and none is lost
+    // that retention was not already deleting with its date.
     let claims = match crate::ingest::publication_marker::scan_claims(wal_dir) {
         Ok(claims) => claims,
         Err(e) => {
