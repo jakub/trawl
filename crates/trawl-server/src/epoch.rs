@@ -43,7 +43,28 @@ pub enum Outcome {
 /// Validate storage before any recovery can mutate the data root or siblings.
 /// All refusal checks run before fresh-root initialization. Filesystem errors
 /// are errors, never evidence of an empty directory or an absent marker.
+///
+/// With ingest enabled, an admitted root's ancestor chain is then synced
+/// ([`sync_ancestor_chain`]) before compaction can retire WAL into it, and
+/// a failed sync is a boot error.
 pub fn ensure_current_epoch(
+    data_root: &Path,
+    wal_dir: &Path,
+    ingest_enabled: bool,
+) -> Result<Outcome, String> {
+    let outcome = admit_data_root(data_root, wal_dir, ingest_enabled)?;
+    if ingest_enabled {
+        sync_ancestor_chain(data_root, fsync_dir).map_err(|e| {
+            format!(
+                "failed to fsync the directories holding data root {}: {e}",
+                data_root.display()
+            )
+        })?;
+    }
+    Ok(outcome)
+}
+
+fn admit_data_root(
     data_root: &Path,
     wal_dir: &Path,
     ingest_enabled: bool,
@@ -392,6 +413,24 @@ pub(crate) fn create_dir_all_durably(
         }
     }
     result
+}
+
+/// fsync every ancestor of `dir`, from its parent up to `/`, so the entry
+/// of each directory on the way to `dir` is durable. Boot runs this once
+/// per root whether or not this process created it: a process killed
+/// between creating a directory and syncing its parent leaves an entry
+/// that only a later sync makes durable, and no process can tell which
+/// entries those are. The walk follows `dir`'s canonical path, the chain
+/// that physically holds its entries.
+///
+/// An ancestor that cannot be opened fails the walk like a failed sync:
+/// its entries cannot be proven durable.
+pub(crate) fn sync_ancestor_chain(
+    dir: &Path,
+    mut sync: impl FnMut(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let dir = std::fs::canonicalize(dir)?;
+    dir.ancestors().skip(1).try_for_each(&mut sync)
 }
 
 /// Unit-test injection for [`fsync_dir`]: fail every fsync of one directory
@@ -900,6 +939,35 @@ mod tests {
         assert_eq!(
             ensure_current_epoch(&data, &wal, true).unwrap(),
             Outcome::FreshRoot
+        );
+    }
+
+    #[test]
+    fn boot_fails_until_an_existing_data_roots_ancestor_chain_is_synced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("state").join("data");
+        let wal = data.join("wal");
+        assert_eq!(
+            ensure_current_epoch(&data, &wal, true).unwrap(),
+            Outcome::FreshRoot
+        );
+        // The root now exists, as after a process killed before syncing
+        // its parent. Every boot syncs the whole chain, up to `/`.
+        let canonical = std::fs::canonicalize(&data).unwrap();
+        for failing in [canonical.parent().unwrap(), Path::new("/")] {
+            let _fail = fail_dir_fsync::set(failing);
+            let err = ensure_current_epoch(&data, &wal, true).unwrap_err();
+            assert!(err.contains("injected directory fsync failure"), "{err}");
+        }
+        assert_eq!(
+            ensure_current_epoch(&data, &wal, true).unwrap(),
+            Outcome::Current
+        );
+        // A query-only node writes nothing into the root and syncs nothing.
+        let _fail = fail_dir_fsync::set(Path::new("/"));
+        assert_eq!(
+            ensure_current_epoch(&data, &wal, false).unwrap(),
+            Outcome::Current
         );
     }
 
