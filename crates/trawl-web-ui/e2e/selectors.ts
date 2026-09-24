@@ -293,6 +293,11 @@ export const SEL = {
   /// key-value grid. Told apart by accessible name, which carries the
   /// field and value the press acts on.
   inspectorTag: '#search-inspector button.tag',
+  /// The "Show N null fields" disclosure under the expanded row's field
+  /// grid. Absent when the event has no null field.
+  resultsDetailNullToggle: '.results-table td.detail button.null-toggle',
+  /// The same disclosure under the inspector's field grid.
+  inspectorNullToggle: '#search-inspector button.null-toggle',
   /// A sortable column header of the real `<table>`. `aria-sort` rides
   /// the CELL, so the assertion target is the th and not its button.
   resultsSortHeader: '.results-table th.sortable',

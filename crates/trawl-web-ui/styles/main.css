@@ -1230,6 +1230,29 @@
   gap: 8px;
 }
 
+/* The null-field disclosure under either detail grid: a quiet toggle in
+ * the grid's own tag idiom, so it reads as part of the field list and
+ * not as one of the event actions below it. */
+.results-table .detail .null-toggle,
+.inspector .null-toggle {
+  display: block;
+  margin-top: 8px;
+  font: inherit;
+  font-size: var(--fs-micro);
+  background: var(--panel-2);
+  border: 1px solid var(--line-2);
+  border-radius: var(--radius-sm);
+  padding: 0 6px;
+  cursor: pointer;
+  color: var(--ink-2);
+}
+.results-table .detail .null-toggle:hover,
+.inspector .null-toggle:hover {
+  border-color: var(--accent);
+  color: var(--accent-ink);
+  background: var(--accent-wash);
+}
+
 /* ─────────────────────────────────────────────────────────────────
  *  Aggregate presentation (ADR-0032): the exact table, and beside it at
  *  1100px and up a bar per group. The chart is decoration over numbers

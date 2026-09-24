@@ -15,6 +15,60 @@
 
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
+use trawl_api::value::Value;
+
+/// One event's detail rows, split for the null-field disclosure: column
+/// indices, each list in wire order.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DetailFields {
+    /// Fields with a value, shown while the disclosure is closed.
+    pub shown: Vec<usize>,
+    /// Null fields, folded behind "Show N null fields".
+    pub null: Vec<usize>,
+}
+
+impl DetailFields {
+    /// The rows to render, in wire order: the fields with a value while
+    /// the disclosure is closed, every field in its place once it opens.
+    #[must_use]
+    pub fn visible(&self, open: bool) -> Vec<usize> {
+        if open {
+            (0..self.shown.len() + self.null.len()).collect()
+        } else {
+            self.shown.clone()
+        }
+    }
+}
+
+/// The null-field disclosure's label: "Show 3 null fields", "Hide 1 null
+/// field".
+#[must_use]
+pub fn null_fields_label(open: bool, count: usize) -> String {
+    let verb = if open { "Hide" } else { "Show" };
+    let noun = if count == 1 { "field" } else { "fields" };
+    format!("{verb} {count} null {noun}")
+}
+
+/// Partition a row's cells into the fields it holds and its null fields.
+///
+/// Both detail presentations (the inline expansion and the docked
+/// inspector) ask here, so they agree on N. Only [`Value::Null`] is a
+/// null field: an empty string, `0`, `false`, an empty array and the
+/// text `"NULL"` are values the event carries. The display text is never
+/// consulted, because it cannot tell `"NULL"` the string from a NULL.
+#[must_use]
+pub fn partition_detail_fields(row: &[Value]) -> DetailFields {
+    let mut out = DetailFields::default();
+    for (i, cell) in row.iter().enumerate() {
+        if matches!(cell, Value::Null) {
+            out.null.push(i);
+        } else {
+            out.shown.push(i);
+        }
+    }
+    out
+}
+
 /// The row index the docked inspector describes, if any.
 ///
 /// A selection is a `(generation, original row index)` pair, and this is
@@ -98,8 +152,48 @@ pub fn message_first(columns: &[String], severity_cols: &[usize]) -> Option<Mess
 mod tests {
     use super::*;
 
+    #[test]
+    fn partition_detail_fields_splits_only_null_preserving_order() {
+        let row = vec![
+            Value::String("2026-01-01T00:00:00Z".into()),
+            Value::Null,
+            Value::String(String::new()),
+            Value::Integer(0),
+            Value::Null,
+            Value::Boolean(false),
+            Value::Array(vec![]),
+            Value::String("NULL".into()),
+            Value::Float(0.0),
+            Value::Null,
+        ];
+        assert_eq!(
+            partition_detail_fields(&row),
+            DetailFields {
+                shown: vec![0, 2, 3, 5, 6, 7, 8],
+                null: vec![1, 4, 9],
+            }
+        );
+        let parts = partition_detail_fields(&row);
+        assert_eq!(parts.visible(false), vec![0, 2, 3, 5, 6, 7, 8]);
+        assert_eq!(parts.visible(true), (0..row.len()).collect::<Vec<_>>());
+        assert_eq!(partition_detail_fields(&[]), DetailFields::default());
+        assert!(
+            partition_detail_fields(&[Value::Integer(1), Value::UInt(2)])
+                .null
+                .is_empty()
+        );
+    }
+
     fn cols(names: &[&str]) -> Vec<String> {
         names.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn null_fields_label_counts_and_names_the_action() {
+        assert_eq!(null_fields_label(false, 3), "Show 3 null fields");
+        assert_eq!(null_fields_label(true, 3), "Hide 3 null fields");
+        assert_eq!(null_fields_label(false, 1), "Show 1 null field");
+        assert_eq!(null_fields_label(true, 1), "Hide 1 null field");
     }
 
     #[test]

@@ -1158,6 +1158,18 @@ const CONTRACTS: &[Contract] = &[
         hook: "class=\"tag\"",
     },
     Contract {
+        assignment: "resultsDetailNullToggle: '.results-table td.detail button.null-toggle',",
+        source_path: "src/components/results_table.rs",
+        source: RESULTS_TABLE_RS,
+        hook: "class=\"null-toggle\"",
+    },
+    Contract {
+        assignment: "inspectorNullToggle: '#search-inspector button.null-toggle',",
+        source_path: "src/components/results_table.rs",
+        source: RESULTS_TABLE_RS,
+        hook: "class=\"null-toggle\"",
+    },
+    Contract {
         assignment: "resultsSortHeader: '.results-table th.sortable',",
         source_path: "src/components/results_table.rs",
         source: RESULTS_TABLE_RS,
