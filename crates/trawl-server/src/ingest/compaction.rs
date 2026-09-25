@@ -160,7 +160,7 @@ async fn pressure_changed(
 /// takes young WAL. See [`Cadence`] for how pressure passes stay bounded.
 ///
 /// Stops when `shutdown_rx` receives a signal.
-#[allow(clippy::too_many_arguments)] // internal API, config struct is overkill here
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // internal API, config struct is overkill here
 pub fn spawn_compaction(
     wal_dir: PathBuf,
     data_dir: PathBuf,
@@ -212,6 +212,10 @@ pub fn spawn_compaction(
             } else {
                 let next_normal = cadence.next_normal;
                 let accepts_pressure = cadence.accepts_pressure(Instant::now());
+                #[cfg(test)]
+                if let Some(stats) = &compaction_stats {
+                    stats.waits.fetch_add(1, Ordering::Release);
+                }
                 tokio::select! {
                     biased;
                     _ = shutdown_rx.changed() => {
@@ -10910,6 +10914,12 @@ mod tests {
     /// With a one-hour interval, the normal pass never fires during
     /// the test, and the WAL files are seconds old. Only a pressure pass
     /// (zero WAL age) can publish them and drain the buffer.
+    ///
+    /// The loop must be waiting before the reservation enters pressure.
+    /// Otherwise its startup check can see `Pressure` before the WAL file
+    /// exists, run a pass that drains nothing and cool down for the whole
+    /// interval, and the test would exercise startup detection instead of
+    /// the insert's pressure wake.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pressure_wakes_compaction_and_drains_young_wal() {
         let tmp = tempfile::tempdir().unwrap();
@@ -10920,6 +10930,17 @@ mod tests {
             None,
         ));
         let compaction = Loop::spawn(tmp.path(), Duration::from_secs(3600), false, &hot);
+        let stats = Arc::clone(&compaction.stats);
+        let waiting = eventually(Duration::from_secs(30), || {
+            stats.waits.load(Ordering::Acquire) == 1
+        })
+        .await;
+        assert!(waiting, "the loop reaches its first wait");
+        assert_eq!(
+            stats.total_runs.load(Ordering::Relaxed),
+            0,
+            "an Open start runs no pass before it waits"
+        );
 
         let group = admitted_group(&pipeline, ProducerKind::Syslog, "svc", 60);
         assert_eq!(
@@ -10944,6 +10965,19 @@ mod tests {
         assert_eq!(hot.charged(), Charge::ZERO);
         assert_eq!(hot.admission_state(), AdmissionState::Open);
         assert_eq!(hot.drained_batches(), 1);
+        // Only the pressure wake can end the first wait: the normal
+        // deadline is an hour out and shutdown is not sent. The loop counts
+        // the pass before it waits again.
+        let waiting_again = eventually(Duration::from_secs(30), || {
+            stats.waits.load(Ordering::Acquire) == 2
+        })
+        .await;
+        assert!(waiting_again, "the loop waits again after its pass");
+        assert_eq!(
+            stats.total_runs.load(Ordering::Relaxed),
+            1,
+            "one pass, woken from the first wait, drained the young WAL"
+        );
         let published = find_files_by_ext(&tmp.path().join("data").join("prod"), "parquet");
         assert_eq!(published.len(), 1, "one hourly parquet: {published:?}");
         let conn = duckdb::Connection::open_in_memory().unwrap();
