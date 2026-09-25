@@ -63,6 +63,26 @@ The body limit is `[ingest] max_body_bytes`, 16M by default, and
 default. For journald and file logs, follow
 [Ship logs with Vector](/getting-started/vector-integration/).
 
+### Keep each batch under the admission ceiling
+
+trawld reserves hot-buffer space for a whole request before it writes it. An
+HTTP request may use at most 15/16 of `[ingest] hot_buffer_max_events` and
+15/16 of `hot_buffer_max_bytes`. With the defaults, that is 93,750 events and
+98,304,000 bytes of canonical ndjson. The byte count is measured after gzip
+decoding.
+
+- Size sender batches well under both limits. A larger request answers 413
+  `ingest_batch_too_large`, and it can never succeed. Vector drops a batch that
+  gets a 413 instead of retrying it. The Vector configuration on this site
+  sends 1 MB batches, far below the default limits.
+- If you lower the hot-buffer caps, lower the sender's batch size with them.
+- Let the sender retry a 503 `hot_buffer_full`. Nothing from that request was
+  written, so a retry does not duplicate events. `Retry-After` gives the
+  compaction interval in seconds, which is when space can next free.
+
+A 503 that repeats for minutes means compaction is not draining. See
+[ingest admission refusing](/operate/operational-alerts/#ingest-admission-refusing).
+
 ## Receive syslog
 
 1. Enable the listener in `/etc/trawl/trawld.toml`:
@@ -99,6 +119,27 @@ default. For journald and file logs, follow
    charset falls back to `default_service` with the repair
    `service.from_profile`. The [`[syslog]` reference](/reference/configuration/#syslog)
    lists every key.
+
+### Syslog delivery under load
+
+When the hot buffer has no room, the syslog batcher keeps its pending events
+in arrival order and stops taking frames from the listener queue. It tries
+again when compaction frees space.
+
+- **TCP** stalls instead of dropping. The listener waits for queue space and
+  stops reading the socket, so the kernel's flow control slows the sender. The
+  connection stays open; trawld does not close it because the queue is full.
+  `tcp_idle_timeout_secs` counts only time spent waiting for data from the
+  sender, not time spent waiting for space.
+- **UDP** has no flow control. A datagram that finds the queue full is dropped
+  and counted in `trawl_syslog_events_dropped_total`. The `reason` label is
+  `backpressure` when the batcher was waiting for hot-buffer space, and
+  `queue_full` when the batcher was only slow.
+- A single event larger than the syslog share of the hot buffer can never be
+  admitted. It is dropped and counted as an `oversized` refusal in
+  `trawl_hot_buffer_admission_refusals_total{producer="syslog"}`.
+- At shutdown, the batcher makes one last attempt. Events that still do not
+  fit are dropped and counted with `reason="backpressure"`.
 
 ## Map a raw syslog severity sent over HTTP
 

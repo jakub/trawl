@@ -21,10 +21,10 @@ establish recovery when an alert resolves.
    curl --fail-with-body --config "$TRAWL_CURL_CONFIG" "$TRAWL_URL/api/v1/health"
    ```
 
-   A serving server answers 200 with `"status":"ok"` and four checks that read `ok`:
+   A serving server answers 200 with `"status":"ok"` and five checks that read `ok`:
 
    ```json
-   {"status":"ok","checks":{"duckdb":"ok","auth_db":"ok","storage_db":"ok","data_path":"ok"},"version":"..."}
+   {"status":"ok","checks":{"duckdb":"ok","auth_db":"ok","storage_db":"ok","data_path":"ok","ingest_capacity":"ok"},"version":"..."}
    ```
 
 2. Confirm that your key is accepted.
@@ -57,12 +57,13 @@ the server `unavailable` and the response 503. Any other failing check leaves
 the response at 200 with `"status":"degraded"`. Read every check, not the status
 alone. The response shape is in [the API reference](/reference/api/#health).
 
-| Check | Meaning when it reads `error` | What to do |
+| Check | Meaning when it fails | What to do |
 | --- | --- | --- |
 | `duckdb` | The query engine did not answer its probe. Every query fails. | Read the trawld journal for engine errors. Restart trawld if the engine does not recover. |
 | `auth_db` | The auth database did not answer within the probe timeout. Bearer checks fail and `trawl_auth_failures_total{reason="backend_unavailable"}` rises. | Check the auth database and the `[auth]` settings in `trawld.toml`. |
 | `storage_db` | The app-state database did not answer. Saved queries, history, and repin jobs fail. | Check the app-state database and the `[storage]` settings. |
 | `data_path` | `[data] path` is missing or is not a readable directory. Cold data is unreadable. | Check the mount and the directory permissions for the `trawl` user. |
+| `ingest_capacity` | Reads `refusing`, not `error`. The hot buffer is full, so ingest is refused until compaction drains it. Reads stay complete. | Follow [ingest admission refusing](/operate/operational-alerts/#ingest-admission-refusing). |
 
 ## Inspect capacity
 
@@ -189,7 +190,7 @@ generated SQL, event values, and the caller's DSL.
 | `stage` | How far the request got. See the next table. |
 | `reached` | On `stage=unrecorded` only: `pre_admission`, `admitted`, or `handler`, the last point the request passed. |
 | `error_class` | The server's closed error class. `panic` for a caught panic, `unknown` when nothing was recorded. |
-| `cause_kind` | A closed kind taken from the typed error beneath the class: an I/O error kind such as `io_storage_full`, a DuckDB kind such as `duckdb_failure`, a Postgres kind such as `pg_pool_timed_out`, or `auth_worker`. `unknown` when a server fault kept no typed source: an `internal` error or a `service_unavailable` other than a capacity refusal, including the 500 and 503 that the authentication layer answers, such as the auth backend being down. `none` when the class is the whole cause, as for `timeout`, `panic`, or a capacity refusal, and when nothing was recorded. |
+| `cause_kind` | A closed kind taken from the typed error beneath the class: an I/O error kind such as `io_storage_full`, a DuckDB kind such as `duckdb_failure`, a Postgres kind such as `pg_pool_timed_out`, `auth_worker`, or `hot_buffer_full` for an ingest request that the hot buffer had no room for. `unknown` when a server fault kept no typed source: an `internal` error or a `service_unavailable` other than a capacity refusal, including the 500 and 503 that the authentication layer answers, such as the auth backend being down. `none` when the class is the whole cause, as for `timeout`, `panic`, or a capacity refusal, and when nothing was recorded. |
 | `query_id` | Present when the request allocated a query ID. |
 | `key_id` | Present when a rate limiter metered the request. Names the key it metered. |
 | `peer_addr` | Present when no rate limiter metered the request. The client address, the only lead when no key is known. |

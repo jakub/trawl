@@ -1,242 +1,668 @@
-[
-  {
-    "name": "idle",
-    "values": "0+0x30",
-    "checks": [
-      [
-        "0m",
-        false
-      ],
-      [
-        "1m",
-        false
-      ],
-      [
-        "15m",
-        false
+{
+  "increase": [
+    {
+      "name": "idle",
+      "values": "0+0x30",
+      "checks": [
+        [
+          "0m",
+          false
+        ],
+        [
+          "1m",
+          false
+        ],
+        [
+          "15m",
+          false
+        ]
       ]
-    ]
-  },
-  {
-    "name": "single increment and expiry",
-    "values": "0 1+0x30",
-    "checks": [
-      [
-        "0m",
-        false
-      ],
-      [
-        "30s",
-        true
-      ],
-      [
-        "9m",
-        true
-      ],
-      [
-        "10m",
-        false
-      ],
-      [
-        "15m",
-        false
+    },
+    {
+      "name": "single increment and expiry",
+      "values": "0 1+0x30",
+      "checks": [
+        [
+          "0m",
+          false
+        ],
+        [
+          "30s",
+          true
+        ],
+        [
+          "9m",
+          true
+        ],
+        [
+          "10m",
+          false
+        ],
+        [
+          "15m",
+          false
+        ]
       ]
-    ]
-  },
-  {
-    "name": "repeated increments",
-    "values": "0+1x30",
-    "checks": [
-      [
-        "30s",
-        true
-      ],
-      [
-        "10m",
-        true
-      ],
-      [
-        "15m",
-        true
+    },
+    {
+      "name": "repeated increments",
+      "values": "0+1x30",
+      "checks": [
+        [
+          "30s",
+          true
+        ],
+        [
+          "10m",
+          true
+        ],
+        [
+          "15m",
+          true
+        ]
       ]
-    ]
-  },
-  {
-    "name": "reset only",
-    "values": "5 0+0x30",
-    "checks": [
-      [
-        "30s",
-        false
-      ],
-      [
-        "5m",
-        false
-      ],
-      [
-        "15m",
-        false
+    },
+    {
+      "name": "reset only",
+      "values": "5 0+0x30",
+      "checks": [
+        [
+          "30s",
+          false
+        ],
+        [
+          "5m",
+          false
+        ],
+        [
+          "15m",
+          false
+        ]
       ]
-    ]
-  },
-  {
-    "name": "reset then failure",
-    "values": "5 0 1+0x28",
-    "checks": [
-      [
-        "30s",
-        false
-      ],
-      [
-        "1m",
-        true
-      ],
-      [
-        "10m",
-        true
-      ],
-      [
-        "11m",
-        false
+    },
+    {
+      "name": "reset then failure",
+      "values": "5 0 1+0x28",
+      "checks": [
+        [
+          "30s",
+          false
+        ],
+        [
+          "1m",
+          true
+        ],
+        [
+          "10m",
+          true
+        ],
+        [
+          "11m",
+          false
+        ]
       ]
-    ]
-  },
-  {
-    "name": "failure then reset",
-    "values": "0 1 0+0x28",
-    "checks": [
-      [
-        "1m",
-        true
-      ],
-      [
-        "9m",
-        true
-      ],
-      [
-        "10m",
-        false
+    },
+    {
+      "name": "failure then reset",
+      "values": "0 1 0+0x28",
+      "checks": [
+        [
+          "1m",
+          true
+        ],
+        [
+          "9m",
+          true
+        ],
+        [
+          "10m",
+          false
+        ]
       ]
-    ]
-  },
-  {
-    "name": "stale after observed failure",
-    "values": "0 1 stale",
-    "checks": [
-      [
-        "2m",
-        true
-      ],
-      [
-        "9m",
-        true
-      ],
-      [
-        "10m",
-        false
+    },
+    {
+      "name": "stale after observed failure",
+      "values": "0 1 stale",
+      "checks": [
+        [
+          "2m",
+          true
+        ],
+        [
+          "9m",
+          true
+        ],
+        [
+          "10m",
+          false
+        ]
       ]
-    ]
-  },
-  {
-    "name": "missing after observed failure",
-    "values": "0 1 _x28",
-    "checks": [
-      [
-        "6m",
-        true
-      ],
-      [
-        "9m",
-        true
-      ],
-      [
-        "10m",
-        false
+    },
+    {
+      "name": "missing after observed failure",
+      "values": "0 1 _x28",
+      "checks": [
+        [
+          "6m",
+          true
+        ],
+        [
+          "9m",
+          true
+        ],
+        [
+          "10m",
+          false
+        ]
       ]
-    ]
-  },
-  {
-    "name": "first nonzero baseline",
-    "values": "5+0x30",
-    "checks": [
-      [
-        "0m",
-        false
-      ],
-      [
-        "1m",
-        false
-      ],
-      [
-        "15m",
-        false
+    },
+    {
+      "name": "first nonzero baseline",
+      "values": "5+0x30",
+      "checks": [
+        [
+          "0m",
+          false
+        ],
+        [
+          "1m",
+          false
+        ],
+        [
+          "15m",
+          false
+        ]
       ]
-    ]
-  },
-  {
-    "name": "single sample",
-    "values": "5",
-    "checks": [
-      [
-        "0m",
-        false
-      ],
-      [
-        "1m",
-        false
-      ],
-      [
-        "10m",
-        false
+    },
+    {
+      "name": "single sample",
+      "values": "5",
+      "checks": [
+        [
+          "0m",
+          false
+        ],
+        [
+          "1m",
+          false
+        ],
+        [
+          "10m",
+          false
+        ]
       ]
-    ]
-  },
-  {
-    "name": "entirely unseen",
-    "values": "_x30",
-    "checks": [
-      [
-        "0m",
-        false
-      ],
-      [
-        "5m",
-        false
-      ],
-      [
-        "15m",
-        false
+    },
+    {
+      "name": "entirely unseen",
+      "values": "_x30",
+      "checks": [
+        [
+          "0m",
+          false
+        ],
+        [
+          "5m",
+          false
+        ],
+        [
+          "15m",
+          false
+        ]
       ]
-    ]
-  },
-  {
-    "name": "counter plateau after producer stop",
-    "values": "7 9+0x40",
-    "checks": [
-      [
-        "0m",
-        false
-      ],
-      [
-        "30s",
-        true
-      ],
-      [
-        "1m",
-        true
-      ],
-      [
-        "9m",
-        true
-      ],
-      [
-        "10m",
-        false
-      ],
-      [
-        "20m",
-        false
+    },
+    {
+      "name": "counter plateau after producer stop",
+      "values": "7 9+0x40",
+      "checks": [
+        [
+          "0m",
+          false
+        ],
+        [
+          "30s",
+          true
+        ],
+        [
+          "1m",
+          true
+        ],
+        [
+          "9m",
+          true
+        ],
+        [
+          "10m",
+          false
+        ],
+        [
+          "20m",
+          false
+        ]
       ]
-    ]
-  }
-]
+    }
+  ],
+  "admission_refusal": [
+    {
+      "name": "idle ledger",
+      "series": [
+        {
+          "metric": "trawl_hot_buffer_admission_refusals_total",
+          "labels": {
+            "producer": "http",
+            "kind": "full"
+          },
+          "values": "0+0x40"
+        },
+        {
+          "metric": "trawl_hot_buffer_admission_refusals_total",
+          "labels": {
+            "producer": "syslog",
+            "kind": "full"
+          },
+          "values": "0+0x40"
+        },
+        {
+          "metric": "trawl_hot_buffer_admission_refusals_total",
+          "labels": {
+            "producer": "trawld",
+            "kind": "full"
+          },
+          "values": "0+0x40"
+        }
+      ],
+      "checks": [
+        [
+          "0m",
+          false
+        ],
+        [
+          "11m",
+          false
+        ],
+        [
+          "20m",
+          false
+        ]
+      ]
+    },
+    {
+      "name": "sustained refusal fires after the for delay",
+      "series": [
+        {
+          "metric": "trawl_hot_buffer_admission_refusals_total",
+          "labels": {
+            "producer": "http",
+            "kind": "full"
+          },
+          "values": "0+1x40"
+        },
+        {
+          "metric": "trawl_hot_buffer_admission_refusals_total",
+          "labels": {
+            "producer": "syslog",
+            "kind": "full"
+          },
+          "values": "0+0x40"
+        },
+        {
+          "metric": "trawl_hot_buffer_admission_refusals_total",
+          "labels": {
+            "producer": "trawld",
+            "kind": "full"
+          },
+          "values": "0+0x40"
+        }
+      ],
+      "checks": [
+        [
+          "30s",
+          false
+        ],
+        [
+          "10m",
+          false
+        ],
+        [
+          "11m",
+          true
+        ],
+        [
+          "20m",
+          true
+        ]
+      ]
+    },
+    {
+      "name": "refusals summed across producers",
+      "series": [
+        {
+          "metric": "trawl_hot_buffer_admission_refusals_total",
+          "labels": {
+            "producer": "http",
+            "kind": "full"
+          },
+          "values": "0+1x6 6+0x34"
+        },
+        {
+          "metric": "trawl_hot_buffer_admission_refusals_total",
+          "labels": {
+            "producer": "syslog",
+            "kind": "full"
+          },
+          "values": "0+0x6 1+1x33"
+        },
+        {
+          "metric": "trawl_hot_buffer_admission_refusals_total",
+          "labels": {
+            "producer": "trawld",
+            "kind": "full"
+          },
+          "values": "0+0x40"
+        }
+      ],
+      "checks": [
+        [
+          "10m",
+          false
+        ],
+        [
+          "11m",
+          true
+        ],
+        [
+          "13m",
+          true
+        ]
+      ]
+    },
+    {
+      "name": "brief refusal never fires",
+      "series": [
+        {
+          "metric": "trawl_hot_buffer_admission_refusals_total",
+          "labels": {
+            "producer": "http",
+            "kind": "full"
+          },
+          "values": "0+1x10 10+0x30"
+        }
+      ],
+      "checks": [
+        [
+          "5m",
+          false
+        ],
+        [
+          "11m",
+          false
+        ],
+        [
+          "20m",
+          false
+        ]
+      ]
+    },
+    {
+      "name": "oversized-only stream never fires",
+      "series": [
+        {
+          "metric": "trawl_hot_buffer_admission_refusals_total",
+          "labels": {
+            "producer": "http",
+            "kind": "oversized"
+          },
+          "values": "0+5x40"
+        },
+        {
+          "metric": "trawl_hot_buffer_admission_refusals_total",
+          "labels": {
+            "producer": "syslog",
+            "kind": "oversized"
+          },
+          "values": "0+5x40"
+        },
+        {
+          "metric": "trawl_hot_buffer_admission_refusals_total",
+          "labels": {
+            "producer": "trawld",
+            "kind": "oversized"
+          },
+          "values": "0+5x40"
+        },
+        {
+          "metric": "trawl_hot_buffer_admission_refusals_total",
+          "labels": {
+            "producer": "http",
+            "kind": "full"
+          },
+          "values": "0+0x40"
+        },
+        {
+          "metric": "trawl_hot_buffer_admission_refusals_total",
+          "labels": {
+            "producer": "syslog",
+            "kind": "full"
+          },
+          "values": "0+0x40"
+        },
+        {
+          "metric": "trawl_hot_buffer_admission_refusals_total",
+          "labels": {
+            "producer": "trawld",
+            "kind": "full"
+          },
+          "values": "0+0x40"
+        }
+      ],
+      "checks": [
+        [
+          "5m",
+          false
+        ],
+        [
+          "11m",
+          false
+        ],
+        [
+          "20m",
+          false
+        ]
+      ]
+    },
+    {
+      "name": "refusals stop and the alert resolves",
+      "series": [
+        {
+          "metric": "trawl_hot_buffer_admission_refusals_total",
+          "labels": {
+            "producer": "http",
+            "kind": "full"
+          },
+          "values": "0+1x30 30+0x20"
+        }
+      ],
+      "checks": [
+        [
+          "14m",
+          true
+        ],
+        [
+          "20m",
+          false
+        ],
+        [
+          "25m",
+          false
+        ]
+      ]
+    }
+  ],
+  "drain_stall": [
+    {
+      "name": "empty buffer",
+      "series": [
+        {
+          "metric": "trawl_hot_buffer_oldest_batch_age_seconds",
+          "labels": {},
+          "values": "0+0x40"
+        },
+        {
+          "metric": "trawl_compaction_interval_seconds",
+          "labels": {},
+          "values": "10+0x40"
+        }
+      ],
+      "checks": [
+        [
+          "0m",
+          false
+        ],
+        [
+          "5m",
+          false
+        ],
+        [
+          "20m",
+          false
+        ]
+      ]
+    },
+    {
+      "name": "stalled drain fires after the for delay",
+      "series": [
+        {
+          "metric": "trawl_hot_buffer_oldest_batch_age_seconds",
+          "labels": {},
+          "values": "0+30x40"
+        },
+        {
+          "metric": "trawl_compaction_interval_seconds",
+          "labels": {},
+          "values": "10+0x40"
+        }
+      ],
+      "checks": [
+        [
+          "1m30s",
+          false
+        ],
+        [
+          "3m30s",
+          false
+        ],
+        [
+          "4m30s",
+          true
+        ],
+        [
+          "20m",
+          true
+        ]
+      ]
+    },
+    {
+      "name": "long interval does not trip the age alert",
+      "series": [
+        {
+          "metric": "trawl_hot_buffer_oldest_batch_age_seconds",
+          "labels": {},
+          "values": "0+30x40"
+        },
+        {
+          "metric": "trawl_compaction_interval_seconds",
+          "labels": {},
+          "values": "600+0x40"
+        }
+      ],
+      "checks": [
+        [
+          "5m",
+          false
+        ],
+        [
+          "20m",
+          false
+        ]
+      ]
+    },
+    {
+      "name": "short interval uses the 60-second floor",
+      "series": [
+        {
+          "metric": "trawl_hot_buffer_oldest_batch_age_seconds",
+          "labels": {},
+          "values": "50+0x40"
+        },
+        {
+          "metric": "trawl_compaction_interval_seconds",
+          "labels": {},
+          "values": "1+0x40"
+        }
+      ],
+      "checks": [
+        [
+          "5m",
+          false
+        ],
+        [
+          "20m",
+          false
+        ]
+      ]
+    },
+    {
+      "name": "floor still fires past 60 seconds",
+      "series": [
+        {
+          "metric": "trawl_hot_buffer_oldest_batch_age_seconds",
+          "labels": {},
+          "values": "90+0x40"
+        },
+        {
+          "metric": "trawl_compaction_interval_seconds",
+          "labels": {},
+          "values": "1+0x40"
+        }
+      ],
+      "checks": [
+        [
+          "1m",
+          false
+        ],
+        [
+          "3m",
+          true
+        ]
+      ]
+    },
+    {
+      "name": "draining resolves the alert",
+      "series": [
+        {
+          "metric": "trawl_hot_buffer_oldest_batch_age_seconds",
+          "labels": {},
+          "values": "0+30x10 0+0x30"
+        },
+        {
+          "metric": "trawl_compaction_interval_seconds",
+          "labels": {},
+          "values": "10+0x40"
+        }
+      ],
+      "checks": [
+        [
+          "4m30s",
+          true
+        ],
+        [
+          "6m",
+          false
+        ],
+        [
+          "15m",
+          false
+        ]
+      ]
+    }
+  ]
+}

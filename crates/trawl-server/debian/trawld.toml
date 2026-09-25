@@ -110,10 +110,14 @@ database_url = "postgres://trawl:CHANGE_ME@db.example.internal:5432/trawl"
 # Capacity of the in-memory event bus broadcast channel.
 # event_bus_capacity = 4096
 
-# Maximum number of events held in the hot buffer.
+# Maximum number of events held in the hot buffer. A write that does not
+# fit is refused (HTTP 503 hot_buffer_full), and admitted events stay
+# until compaction drains them. HTTP and syslog may fill 15/16 of each cap; trawld's own
+# telemetry may fill all of it.
 # hot_buffer_max_events = 100000
 
-# Maximum estimated memory usage for the hot buffer (default: 100M).
+# Maximum estimated memory usage for the hot buffer (default: 100M),
+# counted as serialized ndjson bytes. A write must fit both caps.
 # hot_buffer_max_bytes = "100M"
 
 # How often server stats are emitted as telemetry events (seconds).

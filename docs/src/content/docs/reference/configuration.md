@@ -185,8 +185,8 @@ Notes:
 | `internal_telemetry` | bool | `true` | Write server events into the ingest pipeline as `service=trawld` |
 | `daily_rollup` | bool | `true` | Merge hourly parquet files into daily files for older dates |
 | `event_bus_capacity` | integer | `4096` | Broadcast channel capacity behind SSE. A full channel makes slow subscribers lag |
-| `hot_buffer_max_events` | integer | `100000` | Events held in the hot buffer. Oldest batches are evicted first |
-| `hot_buffer_max_bytes` | byte size | `"100M"` | Estimated memory budget for the hot buffer |
+| `hot_buffer_max_events` | integer | `100000` | Events the hot buffer holds. A write that does not fit is refused, and admitted events stay until compaction drains them. HTTP and syslog may fill 15/16 of the cap, and internal telemetry may fill all of it. See [hot-buffer admission](/architecture/data-flow/#hot-buffer-admission) |
+| `hot_buffer_max_bytes` | byte size | `"100M"` | Serialized ndjson bytes the hot buffer holds, admitted the same way as `hot_buffer_max_events`. A write must fit both caps |
 | `stats_interval_secs` | integer | `60` | How often server stats are emitted as telemetry. `0` disables |
 | `telemetry_flush_interval_secs` | integer | `1` | How often buffered tracing events are flushed to the WAL |
 | `telemetry_buffer_max_bytes` | byte size | `"16M"` | One estimated memory budget for everything self-telemetry holds while the WAL is unhealthy: active buffer, retry queue, and the batch in flight. Minimum `"64K"` |
@@ -348,7 +348,6 @@ mapping is in [the event contract](/reference/events/#syslog-listener-fields).
 | `default_service` | string | `"syslog"` | Service name used when no APP-NAME and no source-IP mapping applies |
 | `tcp_idle_timeout_secs` | integer | `60` | Close a TCP connection that sends no data for this long |
 | `max_events_per_connection` | integer | `100000` | Events accepted from one TCP connection before it is closed |
-| `consecutive_send_failures_limit` | integer | `100` | Close a connection after this many consecutive failed sends to the batcher |
 | `allow_cidrs` | string array | `[]` | Source IP allowlist in CIDR notation. An empty list accepts every source IP |
 | `source_service_map` | map | `{}` | Source IP to service name. Takes priority over the frame's APP-NAME |
 | `channel_capacity` | integer | `10000` | Event queue capacity between the listeners and the batcher |

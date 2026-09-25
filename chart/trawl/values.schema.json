@@ -115,7 +115,9 @@
             "TrawlWalDurabilityDegraded",
             "TrawlCompactionOperationFailure",
             "TrawlFileQuarantine",
-            "TrawlPublicationRecoveryBlocked"
+            "TrawlPublicationRecoveryBlocked",
+            "TrawlIngestAdmissionRefusing",
+            "TrawlHotBufferDrainStalled"
           ],
           "properties": {
             "TrawlSyslogQueueDiscard": {
@@ -149,6 +151,12 @@
               "$ref": "#/definitions/operationalAlert"
             },
             "TrawlPublicationRecoveryBlocked": {
+              "$ref": "#/definitions/operationalAlert"
+            },
+            "TrawlIngestAdmissionRefusing": {
+              "$ref": "#/definitions/operationalAlert"
+            },
+            "TrawlHotBufferDrainStalled": {
               "$ref": "#/definitions/operationalAlert"
             }
           }

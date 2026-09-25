@@ -194,6 +194,12 @@ reason is also its metric label value.
 | `not_object` | The payload is not a JSON object |
 | `invalid_json` | The body is not valid JSON |
 | `wal_failure` | The write-ahead log write failed |
+| `hot_buffer_full` | The hot buffer had no room for the request, which answered 503. See [hot-buffer admission](/architecture/data-flow/#hot-buffer-admission) |
+| `ingest_batch_too_large` | The request was larger than external producers may place in the hot buffer, and answered 413 |
+
+`hot_buffer_full` and `ingest_batch_too_large` reject a whole request, not one
+event. They count every valid event in that request. Per-event rejections in
+the same request keep their own reasons.
 
 One batch can hold rejected events beside accepted siblings. The
 [ingest response](/reference/api/#ingest) carries the counts and the errors.

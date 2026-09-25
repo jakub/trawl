@@ -74,6 +74,7 @@ Every error that trawld itself produces has this body:
 | `result_too_large` | 400 | The result exceeded `max_result_rows` |
 | `bad_request` | 400 | Malformed input. Also the code on every 409, which has no code of its own. |
 | `ingest_error` | 400 | An ingest body that cannot be read |
+| `ingest_batch_too_large` | 413 | An ingest request holds more events or bytes than external producers may place in the hot buffer, so it can never be admitted |
 | `auth_error` | 401 | Authentication failed |
 | `forbidden` | 403 | The key lacks a permission |
 | `not_found` | 404 | No such resource, or the key does not own it. The response does not say which. |
@@ -83,6 +84,7 @@ Every error that trawld itself produces has this body:
 | `internal_error` | 500 | Anything else |
 | `timeout` | 504 | The query started but did not finish within `timeout_secs` |
 | `service_unavailable` | 503 | A dependency is down, the server is at capacity, or the node cannot serve the route |
+| `hot_buffer_full` | 503 | The hot buffer has no room for an ingest request. Sent with `Retry-After` |
 
 Four refusals come from the HTTP framework before a handler runs, with an empty or plain-text body instead of the envelope: 413 when the body exceeds the size limit, 415 when a JSON route receives no `Content-Type: application/json`, 400 when the body is not valid JSON, and 422 when the JSON does not match the request shape.
 
@@ -97,7 +99,7 @@ trawld keeps one token bucket per API key and route class. The bucket refills co
 | Interactive | `[server.rate_limit] default_rpm` | `100` | Every authenticated route except `/api/v1/ingest` |
 | Ingest | `[server.rate_limit] ingest_rpm` | `1000` | `/api/v1/ingest`, for a key that holds `ingest` |
 
-A key without `ingest` spends its interactive bucket when it posts to `/api/v1/ingest`. A `0` disables the class. When any of the key's roles sets `rate_rpm`, the largest such value replaces the class default in both classes. The 429 body is the error envelope with code `rate_limited`. No `Retry-After` or `X-RateLimit-*` headers are sent. `/api/v1/health` and `/metrics` are not rate limited.
+A key without `ingest` spends its interactive bucket when it posts to `/api/v1/ingest`. A `0` disables the class. When any of the key's roles sets `rate_rpm`, the largest such value replaces the class default in both classes. The 429 body is the error envelope with code `rate_limited`. A 429 carries no `Retry-After` or `X-RateLimit-*` headers. The only response that carries `Retry-After` is 503 `hot_buffer_full` from [ingest](#ingest-events). `/api/v1/health` and `/metrics` are not rate limited.
 
 ### Pagination
 
@@ -145,18 +147,20 @@ curl --fail-with-body "$TRAWL_URL/api/v1/health"
 ```json
 {
   "status": "ok",
-  "checks": { "duckdb": "ok", "auth_db": "ok", "storage_db": "ok", "data_path": "ok" },
+  "checks": { "duckdb": "ok", "auth_db": "ok", "storage_db": "ok", "data_path": "ok", "ingest_capacity": "ok" },
   "version": "<installed-version>"
 }
 ```
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `status` | string | `ok` when every check passes. `degraded` when `auth_db`, `storage_db`, or `data_path` fails. `unavailable` when `duckdb` fails. |
-| `checks` | object | Exactly four keys, each `ok` or `error`. No diagnostics or paths. |
+| `status` | string | `ok` when every check passes. `degraded` when `auth_db`, `storage_db`, or `data_path` reads `error`, or `ingest_capacity` reads `refusing`. `unavailable` when `duckdb` fails. |
+| `checks` | object | Exactly five keys. `duckdb`, `auth_db`, `storage_db`, and `data_path` are each `ok` or `error`. `ingest_capacity` is `ok` or `refusing`. No diagnostics or paths. |
 | `version` | string | The trawld package version |
 
 `degraded` does not prove that authenticated requests can run. An `auth_db` failure turns every authenticated route into a 503.
+
+`ingest_capacity` reads `refusing` while the hot buffer refuses ingest for lack of space, and `ok` otherwise, including on a node with ingest disabled. Reads keep working while it refuses, so the response stays 200 and probes do not restart the server. See [hot-buffer admission](/architecture/data-flow/#hot-buffer-admission).
 
 **Errors**
 
@@ -422,14 +426,35 @@ are counted in `trawl_ingest_events_rejected_total{reason="wal_failure"}`.
 A persistence rejection does not establish permanent loss; the sender may
 retry.
 
+Before it writes anything, trawld reserves hot-buffer space for the whole
+request across all its groups. HTTP senders may fill 15/16 of each
+`[ingest] hot_buffer_max_*` cap, counted in events and in serialized ndjson
+bytes. A request that is larger than that share answers 413
+`ingest_batch_too_large` with no `Retry-After`, even when the buffer is empty.
+A request that fits the share but not the free space answers 503
+`hot_buffer_full` with `Retry-After` set to `[ingest] compaction_interval_secs`.
+Space frees only when compaction drains, so a shorter retry only adds refused
+work. A refused request writes nothing, so a retry cannot duplicate its
+events. Its valid events are counted in
+`trawl_ingest_events_rejected_total` under the same reason as the code. A
+request refused before parsing counts no events.
+
+When the buffer has no free space at all, trawld refuses the request before
+it decompresses or parses the body, so it cannot know the request's size. An
+oversized request then answers 503 `hot_buffer_full`, and 413 only once
+space frees. A parsed request gets the same answer each time: 413 if it is
+oversized, whatever the occupancy, and otherwise 503 until it fits.
+
 **Errors**
 
 | Status | Code | When |
 |--------|------|------|
 | 400 | `ingest_error` | Empty body, invalid UTF-8, an unparseable or empty JSON array, a gzip body that fails to decode, or a gzip body that expands past 10 times its wire size |
 | 413 | none | The body exceeds `[ingest] max_body_bytes` |
+| 413 | `ingest_batch_too_large` | The request holds more than 15/16 of `hot_buffer_max_events` or `hot_buffer_max_bytes`. No `Retry-After`. Split the batch |
 | 429 | `rate_limited` | The key's ingest bucket is empty |
 | 500 | `internal_error` | A group's WAL write failed. Other groups in the request may still have been accepted. |
+| 503 | `hot_buffer_full` | The hot buffer has no room for the request. `Retry-After` gives `[ingest] compaction_interval_secs` in seconds. Nothing was written |
 
 ## Schema
 
@@ -1855,6 +1880,20 @@ These gauges expose neither measurement status nor sample age. A flat gauge
 cannot establish collector health. Those facts are available in the
 [dashboard measurement metadata](#dashboard-snapshot).
 
+These series describe [hot-buffer admission](/architecture/data-flow/#hot-buffer-admission).
+A node without a hot buffer publishes the refusal counter and the compaction
+interval but none of the hot-buffer gauges.
+
+| Series | Type | Measurement |
+| --- | --- | --- |
+| `trawl_hot_buffer_events`, `trawl_hot_buffer_bytes` | gauge | Events and serialized ndjson bytes resident in the hot buffer |
+| `trawl_hot_buffer_max_events`, `trawl_hot_buffer_max_bytes` | gauge | The full caps, `hot_buffer_max_events` and `hot_buffer_max_bytes`. HTTP and syslog may fill 15/16 of each |
+| `trawl_hot_buffer_oldest_batch_age_seconds` | gauge | Seconds since the oldest resident batch was inserted. `0` when the buffer is empty |
+| `trawl_hot_buffer_admission_state` | gauge | `0` open, `1` pressure (at or above half of either cap), `2` refusing (a reservation was refused for lack of space). Pressure and refusing clear only below a quarter of both caps |
+| `trawl_hot_buffer_admission_refusals_total{producer,kind}` | counter | Refused reservations. `producer` is `http`, `syslog`, or `trawld`. `kind` is `full`, no free space now, or `oversized`, larger than the producer's share and never admissible. All six series start at zero |
+| `trawl_compaction_interval_seconds` | gauge | `[ingest] compaction_interval_secs` |
+| `trawl_syslog_events_dropped_total{reason}` | counter | Syslog events dropped before a WAL write. `backpressure` means the batcher was refusing for lack of hot-buffer space. `queue_full` means the listener queue was full or closed while admission was open |
+
 **Request**
 
 ```bash
@@ -1888,7 +1927,7 @@ Prometheus scrape-target labels are separate and remain on every alert.
 
 | Alert | Counter selection | Unit and observation owner |
 | --- | --- | --- |
-| `TrawlSyslogQueueDiscard` | `trawl_syslog_events_dropped_total` | Events abandoned by the shared TCP/UDP queue when full or closed; no metric labels |
+| `TrawlSyslogQueueDiscard` | `trawl_syslog_events_dropped_total{reason}` | Events abandoned by the syslog receive path; `reason` is `backpressure` or `queue_full` |
 | `TrawlSyslogWalDiscard` | `trawl_syslog_wal_events_discarded_total` | Events in the failed syslog pipeline WAL group, counted once at group abandonment; no metric labels |
 | `TrawlTelemetryCapacityDiscard` | `trawl_telemetry_events_dropped_total{reason=~"preinit_cap\|buffer_cap"}` | Events abandoned at the pre-sink or active-buffer capacity boundary |
 | `TrawlSyslogWriteOutcomeUncertain` | `trawl_syslog_write_tasks_failed_total` | Failed syslog flush tasks, counted at the handled `JoinError`; no metric labels |
@@ -1899,6 +1938,8 @@ Prometheus scrape-target labels are separate and remain on every alert.
 | `TrawlCompactionOperationFailure` | `trawl_compaction_operation_failures_total{operation}` | Explicit failed attempts, using the eight closed operations below |
 | `TrawlFileQuarantine` | `trawl_files_quarantined_total{kind}` | Files successfully renamed into quarantine; `kind` is `wal`, `parquet`, or `rollup_temporary` |
 | `TrawlPublicationRecoveryBlocked` | `trawl_publication_recovery_total{outcome=~"contradictory\|failed"}` | Publication markers that recovery left blocking their service, counted once per marker per recovery pass |
+| `TrawlIngestAdmissionRefusing` | `trawl_hot_buffer_admission_refusals_total{kind="full"}`, summed over `producer` | Reservations refused for lack of space; `oversized` refusals are excluded |
+| `TrawlHotBufferDrainStalled` | `trawl_hot_buffer_oldest_batch_age_seconds` compared with `trawl_compaction_interval_seconds` | Gauges, not counters: seconds since the oldest resident batch was inserted, against ten compaction intervals with a 60-second floor |
 
 The telemetry drop counter's closed `reason` set is `preinit_cap`,
 `buffer_cap`, `write_crashed`, and `unmetered_cap`. The capacity and
@@ -1908,14 +1949,17 @@ cap of 60 persisted per minute, and each of those events still reaches
 stdout. A crashed telemetry write also increments the
 inclusive failed-attempt counter; both telemetry failure alerts can fire.
 The WAL durability counter has only `operation="parent_directory_sync"`.
-Existing HTTP rejection reasons other than `wal_failure` remain diagnostic.
+HTTP rejection reasons other than `wal_failure` remain diagnostic, including
+`hot_buffer_full` and `ingest_batch_too_large`.
 
-All 22 selected finite series are initialized at zero after recorder
+All 26 selected counter series are initialized at zero after recorder
 installation and before the first scrape, independently of feature enablement.
 Initialization preserves accumulated values. The exporter has no idle expiry
-for these baselines. Counters reset when the process restarts.
+for these baselines. Counters reset when the process restarts. The two gauges
+that `TrawlHotBufferDrainStalled` selects are set at startup and on every
+scrape. The age gauge exists only on a node with a hot buffer.
 
-These rules use a fixed ten-minute `increase` window with no `for` delay,
+The eleven counter rules use a fixed ten-minute `increase` window with no `for` delay,
 aggregation, current-value guard, or ingest-enable gate. The window describes
 scraped observations, not an exact event-loss count. A first nonzero sample
 cannot recover a prior baseline; an unseen process lifetime is unobservable.

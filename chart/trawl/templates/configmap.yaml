@@ -123,7 +123,6 @@ data:
     default_service = {{ .Values.config.syslog.defaultService | quote }}
     tcp_idle_timeout_secs = {{ .Values.config.syslog.tcpIdleTimeoutSecs | int }}
     max_events_per_connection = {{ .Values.config.syslog.maxEventsPerConnection | int }}
-    consecutive_send_failures_limit = {{ .Values.config.syslog.consecutiveSendFailuresLimit | int }}
     channel_capacity = {{ .Values.config.syslog.channelCapacity | int }}
     {{- if .Values.config.syslog.allowCidrs }}
     allow_cidrs = [{{ range $i, $cidr := .Values.config.syslog.allowCidrs }}{{ if $i }}, {{ end }}{{ $cidr | quote }}{{ end }}]
