@@ -1384,7 +1384,8 @@ pub async fn setup_with_scheduler(scheduler: SchedulerConfig) -> TestServer {
 /// The `[ingest]` hot-buffer caps and compaction interval a fixture boots
 /// with, for tests that fill the buffer with a handful of events. The
 /// fixture runs no compaction loop, so the interval reaches only what the
-/// request path reads from it (the `Retry-After` of a full buffer).
+/// request path reads from it (the `Retry-After` of a full buffer), unless
+/// the test spawns a loop of its own.
 #[derive(Debug, Clone, Copy)]
 pub struct HotBufferKnobs {
     pub max_events: usize,
@@ -1396,9 +1397,19 @@ pub struct HotBufferKnobs {
 /// tempdir holding its WAL is leaked so it outlives the server.
 pub async fn setup_with_hot_buffer(knobs: HotBufferKnobs) -> TestServer {
     let tmp = tempfile::tempdir().expect("failed to create temp dir");
-    let server = setup_with_ingest_config(
-        tmp.path(),
-        seed_data_root(tmp.path()),
+    let server = setup_with_hot_buffer_in(tmp.path(), knobs).await;
+    // Leak the tempdir so it survives the test (cleaned up by OS).
+    std::mem::forget(tmp);
+    server
+}
+
+/// [`setup_with_hot_buffer`] in a caller-owned `dir`, for a test that runs
+/// its own compaction loop and so needs the WAL (`dir/wal`) and data
+/// (`dir/data`) paths.
+pub async fn setup_with_hot_buffer_in(dir: &std::path::Path, knobs: HotBufferKnobs) -> TestServer {
+    setup_with_ingest_config(
+        dir,
+        seed_data_root(dir),
         RateLimitConfig::default(),
         DEFAULT_TEST_TIMEOUT_SECS,
         true,
@@ -1406,10 +1417,7 @@ pub async fn setup_with_hot_buffer(knobs: HotBufferKnobs) -> TestServer {
         SchedulerConfig::default(),
         Some(knobs),
     )
-    .await;
-    // Leak the tempdir so it survives the test (cleaned up by OS).
-    std::mem::forget(tmp);
-    server
+    .await
 }
 
 #[allow(clippy::too_many_arguments)] // one knob per fixture variant, all private
