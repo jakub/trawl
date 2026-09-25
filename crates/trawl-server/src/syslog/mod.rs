@@ -17,6 +17,7 @@ pub mod udp;
 
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -36,12 +37,17 @@ use self::convert::SyslogDoor;
 /// hostname-less frame is peer-filled or kept host-less) and the
 /// boot-resolved derivation policy.
 ///
+/// `blocked_poll` is the batcher's retry poll while hot-buffer admission
+/// refuses it (`ingest.compaction_interval_secs`); a release of hot-buffer
+/// charge wakes it sooner.
+///
 /// Returns join handles that complete when all listeners and the batcher
 /// have shut down. Send `true` on `shutdown_tx` to initiate graceful shutdown.
 pub fn spawn_syslog(
     config: &SyslogConfig,
     door: Arc<SyslogDoor>,
     pipeline: Arc<PipelineWriter>,
+    blocked_poll: Duration,
     syslog_stats: Option<Arc<SyslogStats>>,
     shutdown_rx: watch::Receiver<bool>,
 ) -> Result<Vec<JoinHandle<()>>, String> {
@@ -49,7 +55,7 @@ pub fn spawn_syslog(
     config.source_service_map = fold_source_service_map(&config.source_service_map)?;
     let config = &config;
 
-    let batcher = SyslogBatcher::new(config, pipeline, syslog_stats.clone());
+    let batcher = SyslogBatcher::new(config, pipeline, blocked_poll, syslog_stats.clone());
     let sender = batcher.sender();
 
     let mut handles = Vec::new();

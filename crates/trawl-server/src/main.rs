@@ -417,6 +417,7 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
             &config.syslog,
             door,
             Arc::clone(state.ingest.pipeline.as_ref().expect("ingest enabled")),
+            std::time::Duration::from_secs(config.ingest.compaction_interval_secs),
             state.ingest.syslog_stats.clone(),
             shutdown_rx,
         )

@@ -130,10 +130,6 @@ impl PipelineWriter {
     /// nothing: it always admits, with an unmetered reservation whose drop
     /// releases nothing. There is no buffer to protect and no drain to
     /// wait for.
-    #[allow(
-        dead_code,
-        reason = "#253 transition: producers adopt admission in later checkpoints"
-    )]
     pub(crate) fn reserve(
         &self,
         producer: ProducerKind,
@@ -145,12 +141,16 @@ impl PipelineWriter {
         }
     }
 
+    /// The generation that advances whenever hot-buffer charge is released
+    /// ([`HotBuffer::subscribe_released`]): what a producer refused with
+    /// [`Refusal::Full`] waits on before it retries. `None` without a hot
+    /// buffer, which never refuses.
+    pub(crate) fn subscribe_released(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        self.hot_buffer.as_ref().map(|buf| buf.subscribe_released())
+    }
+
     /// The most `producer` may have charged at once
     /// ([`HotBuffer::ceiling`]); unbounded without a hot buffer.
-    #[allow(
-        dead_code,
-        reason = "#253 transition: producers adopt admission in later checkpoints"
-    )]
     pub(crate) fn ceiling(&self, producer: ProducerKind) -> Charge {
         self.hot_buffer.as_ref().map_or(
             Charge {

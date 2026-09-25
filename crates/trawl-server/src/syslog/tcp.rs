@@ -89,7 +89,7 @@ pub async fn run_tcp_listener(
                 let conn_door = Arc::clone(door);
                 let idle_timeout = Duration::from_secs(config.tcp_idle_timeout_secs);
                 let max_events = config.max_events_per_connection;
-                let send_failure_limit = config.consecutive_send_failures_limit;
+                let conn_shutdown = shutdown_rx.clone();
 
                 tokio::spawn(async move {
                     handle_tcp_connection(
@@ -101,8 +101,8 @@ pub async fn run_tcp_listener(
                         &conn_default_service,
                         idle_timeout,
                         max_events,
-                        send_failure_limit,
                         conn_stats.as_ref(),
+                        conn_shutdown,
                     )
                     .await;
 
@@ -117,16 +117,38 @@ pub async fn run_tcp_listener(
     }
 }
 
+/// Resolve once shutdown has been signalled, including a signal sent
+/// before this receiver was cloned. A closed sender never signals.
+async fn shutdown_signalled(shutdown_rx: &mut watch::Receiver<bool>) {
+    loop {
+        if *shutdown_rx.borrow_and_update() {
+            return;
+        }
+        if shutdown_rx.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
 /// Handle a single TCP syslog connection.
 ///
 /// Reads messages using newline-delimited framing. Also supports
 /// RFC 6587 octet-counting if the first byte is a digit.
 ///
+/// Each admitted frame is handed to the batcher with an awaited send. While
+/// the batcher is blocked on hot-buffer admission (ADR-0043) that send
+/// waits, the connection stays open and unread, and TCP flow control pushes
+/// back on the client; nothing is dropped and the client is not
+/// disconnected for it.
+///
 /// The connection is closed when:
 /// - the client disconnects or sends EOF
-/// - the idle timeout fires (no data received within the timeout)
+/// - the idle timeout fires (no data received within the timeout); it
+///   covers reads only, never the wait for batcher capacity
 /// - `max_events` events have been processed
-/// - `send_failure_limit` consecutive sends to the batcher fail
+/// - shutdown is signalled (a frame still waiting for capacity is counted
+///   dropped)
+/// - the batcher has gone away
 #[allow(clippy::too_many_arguments)]
 async fn handle_tcp_connection(
     stream: tokio::net::TcpStream,
@@ -137,17 +159,21 @@ async fn handle_tcp_connection(
     default_service: &str,
     idle_timeout: Duration,
     max_events: usize,
-    send_failure_limit: usize,
     stats: Option<&Arc<SyslogStats>>,
+    mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let mut reader = BufReader::new(stream);
     let mut event_count: usize = 0;
-    let mut consecutive_send_failures: usize = 0;
 
     loop {
         // Wrap the read in an idle timeout — if the client sends nothing
         // for this long, close the connection to free the permit.
-        let read_result = tokio::time::timeout(idle_timeout, read_message(&mut reader)).await;
+        let read_result = tokio::select! {
+            biased;
+
+            () = shutdown_signalled(&mut shutdown_rx) => break,
+            read = tokio::time::timeout(idle_timeout, read_message(&mut reader)) => read,
+        };
 
         let line = match read_result {
             Err(_elapsed) => {
@@ -184,19 +210,22 @@ async fn handle_tcp_connection(
         if let Some(event) =
             door.admit(&line, source_ip, source_service_map, default_service, "tcp")
         {
-            if super::batch::try_enqueue(&sender, event, stats) {
-                consecutive_send_failures = 0;
-            } else {
-                consecutive_send_failures += 1;
-                if consecutive_send_failures >= send_failure_limit {
-                    tracing::warn!(
-                        event_type = "syslog_tcp_backpressure_disconnect",
-                        source = %source_ip,
-                        failures = consecutive_send_failures,
-                        "batcher overwhelmed, disconnecting TCP client"
-                    );
+            let sent = tokio::select! {
+                biased;
+
+                () = shutdown_signalled(&mut shutdown_rx) => {
+                    sender.abandon(stats);
                     break;
                 }
+                sent = sender.send(event, stats) => sent,
+            };
+            if !sent {
+                tracing::debug!(
+                    event_type = "syslog_tcp_batcher_closed",
+                    source = %source_ip,
+                    "syslog batcher is gone, closing TCP connection"
+                );
+                break;
             }
         }
 
@@ -515,7 +544,8 @@ mod tests {
     async fn handle_connection_idle_timeout() {
         let (listener, addr) = bind_free().await;
         let (_client, server) = connect(&listener, addr).await;
-        let (tx, _rx) = tokio::sync::mpsc::channel(100);
+        let (tx, _rx) = SyslogSender::channel_for_test(100);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let start = tokio::time::Instant::now();
         handle_tcp_connection(
@@ -527,8 +557,8 @@ mod tests {
             "syslog",
             Duration::from_millis(50), // very short timeout for test
             100_000,
-            100,
             None,
+            shutdown_rx,
         )
         .await;
         let elapsed = start.elapsed();
@@ -542,7 +572,8 @@ mod tests {
     async fn handle_connection_max_events_limit() {
         let (listener, addr) = bind_free().await;
         let (mut client, server) = connect(&listener, addr).await;
-        let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+        let (tx, mut rx) = SyslogSender::channel_for_test(100);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
         // Send 5 events, set limit to 3
         let handle = tokio::spawn(async move {
@@ -555,8 +586,8 @@ mod tests {
                 "syslog",
                 Duration::from_secs(5),
                 3, // max 3 events
-                100,
                 None,
+                shutdown_rx,
             )
             .await;
         });
@@ -573,5 +604,146 @@ mod tests {
             count += 1;
         }
         assert_eq!(count, 3);
+    }
+
+    /// AC11: while hot-buffer admission refuses the batcher, a TCP sender
+    /// is held, not disconnected, past the idle timeout; once compaction
+    /// drains space, every frame lands exactly once, in the WAL and in the
+    /// hot buffer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tcp_stalls_without_disconnect_and_ingests_each_frame_once_after_drain() {
+        use super::super::batch::{SyslogBatcher, test_support};
+
+        const EARLY: usize = 10;
+        const LATE: usize = 2;
+        const N: usize = EARLY + LATE;
+        let idle_timeout = Duration::from_millis(200);
+
+        // External ceiling 15 of 16 events, all 15 charged to telemetry.
+        let tmp = tempfile::tempdir().unwrap();
+        let (pipeline, hot) = test_support::admission_pipeline(tmp.path(), 16, 1 << 20, 15);
+        let config = SyslogConfig {
+            channel_capacity: 4,
+            batch_max_events: 1,
+            batch_interval_ms: 10,
+            ..SyslogConfig::default()
+        };
+        // The fallback poll is far away: only a release may wake the batcher.
+        let batcher = SyslogBatcher::new(&config, pipeline, Duration::from_secs(3600), None);
+        let sender = batcher.sender();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let batcher_task = tokio::spawn(batcher.run(shutdown_rx.clone()));
+
+        let (listener, addr) = bind_free().await;
+        let (mut client, server) = connect(&listener, addr).await;
+        let conn_sender = sender.clone();
+        let conn_shutdown = shutdown_rx.clone();
+        let conn = tokio::spawn(async move {
+            handle_tcp_connection(
+                server,
+                "127.0.0.1".parse().unwrap(),
+                conn_sender,
+                &test_door(),
+                &std::collections::HashMap::new(),
+                "syslog",
+                idle_timeout,
+                100_000,
+                None,
+                conn_shutdown,
+            )
+            .await;
+        });
+
+        let frame = |i: usize| format!("<13>Mar 12 10:00:00 host app: frame-{i:02}\n");
+        for i in 0..EARLY {
+            client.write_all(frame(i).as_bytes()).await.unwrap();
+        }
+        test_support::eventually("the batcher blocks", || sender.backpressure_for_test()).await;
+
+        // Well past the idle timeout: the connection waits for capacity,
+        // and that wait is not idleness.
+        tokio::time::sleep(idle_timeout * 3).await;
+        assert!(!conn.is_finished(), "the connection is held, not closed");
+        let mut probe = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_millis(100), client.read(&mut probe)).await;
+        assert!(
+            read.is_err(),
+            "no EOF or reset from the server while stalled: {read:?}"
+        );
+        for i in EARLY..N {
+            client.write_all(frame(i).as_bytes()).await.unwrap();
+        }
+        assert_eq!(hot.event_count(), 15, "nothing admitted while full");
+        assert!(sender.backpressure_for_test());
+
+        hot.drain(&[test_support::FILLER_ID]);
+        test_support::eventually("every frame lands", || hot.event_count() == N).await;
+        assert!(!conn.is_finished(), "still open after the drain");
+
+        let count_frames = |lines: &[String]| -> Vec<usize> {
+            (0..N)
+                .map(|i| {
+                    let needle = format!("frame-{i:02}\"");
+                    lines.iter().filter(|line| line.contains(&needle)).count()
+                })
+                .collect()
+        };
+        let wal = test_support::wal_lines(tmp.path(), "prod");
+        assert_eq!(wal.len(), N, "{wal:?}");
+        assert_eq!(count_frames(&wal), vec![1; N], "each frame once in the WAL");
+        let snapshot = hot.snapshot().expect("resident events");
+        let hot_lines: Vec<String> = std::fs::read_to_string(snapshot.path())
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(hot_lines.len(), N, "{hot_lines:?}");
+        assert_eq!(
+            count_frames(&hot_lines),
+            vec![1; N],
+            "each frame once in the hot buffer"
+        );
+
+        drop(client);
+        let _ = shutdown_tx.send(true);
+        conn.await.unwrap();
+        batcher_task.await.unwrap();
+        assert_eq!(hot.event_count(), N, "shutdown adds nothing");
+    }
+
+    /// Shutdown closes a connection that is waiting for batcher capacity.
+    #[tokio::test]
+    async fn shutdown_releases_a_connection_waiting_for_capacity() {
+        let (listener, addr) = bind_free().await;
+        let (mut client, server) = connect(&listener, addr).await;
+        // Nobody receives: the second frame waits for room.
+        let (tx, _rx) = SyslogSender::channel_for_test(1);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let conn = tokio::spawn(async move {
+            handle_tcp_connection(
+                server,
+                "127.0.0.1".parse().unwrap(),
+                tx,
+                &test_door(),
+                &std::collections::HashMap::new(),
+                "syslog",
+                Duration::from_secs(60),
+                100_000,
+                None,
+                shutdown_rx,
+            )
+            .await;
+        });
+        client
+            .write_all(b"<13>test one\n<13>test two\n")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!conn.is_finished());
+        let _ = shutdown_tx.send(true);
+        tokio::time::timeout(Duration::from_secs(2), conn)
+            .await
+            .expect("shutdown closes the waiting connection")
+            .unwrap();
     }
 }
