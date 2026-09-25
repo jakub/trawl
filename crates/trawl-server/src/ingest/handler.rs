@@ -18,9 +18,10 @@ use fleet_auth::VerifiedKey;
 use indexmap::IndexMap;
 
 use crate::error::ServerError;
+use crate::hot_buffer::{Charge, Refusal, Reservation};
 use crate::ingest::envelope::{self, EnvelopeContext, RejectReason};
-use crate::ingest::pipeline::{BatchKey, ServiceBatch};
-use crate::ingest::producer::Producer;
+use crate::ingest::pipeline::{BatchKey, PipelineWriter, ServiceBatch};
+use crate::ingest::producer::{Producer, ProducerKind};
 use crate::policy::{Permission, TrawlAuthz as _};
 use crate::state::AppState;
 use trawl_api::{IngestEventError, IngestResponse};
@@ -135,6 +136,21 @@ impl ParsedEvents {
         }
     }
 
+    /// The hot-buffer charge of every valid event, across all groups: what
+    /// the request reserves as a whole. Saturates on the (unreachable)
+    /// overflow, which then refuses as oversized.
+    fn charge(&self) -> Charge {
+        self.batches
+            .values()
+            .map(ServiceBatch::charge)
+            .fold(Charge::ZERO, |total, group| {
+                total.checked_add(group).unwrap_or(Charge {
+                    events: usize::MAX,
+                    bytes: usize::MAX,
+                })
+            })
+    }
+
     /// Total repair codes applied, for the log line. One event may carry
     /// several codes, so this is not an event count.
     fn total_repairs(&self) -> u64 {
@@ -147,9 +163,26 @@ impl ParsedEvents {
 /// Expects `Content-Type: application/x-ndjson` (or `application/json`).
 /// Supports `Content-Encoding: gzip` for compressed payloads.
 ///
+/// The request is admitted against hot-buffer capacity as a whole before
+/// anything is written (ADR-0043), in this order:
+///
+/// 1. With no free space at all for HTTP, refuse before decompressing
+///    anything: 503 `hot_buffer_full`.
+/// 2. Decompress, parse and canonicalize on a blocking thread.
+/// 3. Reserve the exact charge of every valid event, synchronously. A
+///    request over the per-request ceiling is 413 `ingest_batch_too_large`
+///    whatever the buffer holds; one that fits the ceiling but not the free
+///    space is 503 `hot_buffer_full` with `Retry-After` set to the
+///    compaction interval. A refusal writes nothing and never touches the
+///    publication gate, which compaction needs to drain.
+/// 4. Take the publication gate's ingest side, then write and publish on a
+///    second blocking thread that owns the reservation and the guard.
+///
 /// If any `(env, service)` group's WAL write fails, the request answers a
 /// redacted 500. The groups that did write are still published and
-/// counted first: they are durable, and compaction will merge them.
+/// counted first: they are durable, and compaction will merge them. A 500
+/// is therefore not an atomic rollback. The failed groups' share of the
+/// reservation is released.
 pub async fn ingest(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
@@ -161,18 +194,125 @@ pub async fn ingest(
         return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
 
-    let wal_writer = state
+    let pipeline = state
         .ingest
-        .wal_writer
+        .pipeline
         .as_ref()
+        .map(Arc::clone)
         .ok_or_else(|| ServerError::Internal("ingest not enabled".into()))?;
 
-    // Decompress, parse, and WAL-write in a single blocking task to avoid
-    // hogging tokio worker threads with CPU-bound gzip/JSON work.
+    // Step 1: refuse a full buffer before spending CPU on the body.
+    if let Some(buf) = &state.query.hot_buffer {
+        buf.ensure_free_space(ProducerKind::Http)
+            .map_err(|refusal| refusal_error(&state, &pipeline, refusal, None))?;
+    }
+
     let compressed = is_gzip(&headers);
     let wire_bytes = body.len();
-    let wal_writer = Arc::clone(wal_writer);
 
+    let dispatch = tracing::dispatcher::get_default(Clone::clone);
+    let request_span = tracing::Span::current();
+
+    // Step 2: decompress and parse. No guard is held here.
+    let parsed = parse_request(
+        &state,
+        peer_addr,
+        compressed,
+        body,
+        dispatch.clone(),
+        request_span.clone(),
+    )
+    .await?;
+    let Parsed {
+        events: mut parsed,
+        body_bytes,
+        decompress_ms,
+        parse_ms,
+    } = parsed;
+
+    // Step 3: admit the whole request, or none of it.
+    let requested = parsed.charge();
+    let reservation = match pipeline.reserve(ProducerKind::Http, requested) {
+        Ok(reservation) => reservation,
+        Err(refusal) => {
+            record_refused(&state, &mut parsed, refusal);
+            return Err(refusal_error(&state, &pipeline, refusal, Some(requested)));
+        }
+    };
+
+    // Step 4: wait for the gate before dispatching blocking work. Requests
+    // waiting behind a compactor must leave blocking threads available to
+    // existing readers. Nothing waits for capacity past this point.
+    let publication = state.query.hot_buffer.as_ref().map(|buf| buf.publication());
+    let ingest_guard = match publication {
+        Some(gate) => Some(gate.ingest().await),
+        None => None,
+    };
+
+    let result = tokio::task::spawn_blocking(move || -> Result<_, ServerError> {
+        // Cancellation cannot split durability from insertion once this
+        // task starts. The guard and the reservation stay here until both
+        // steps finish.
+        let _ingest = ingest_guard;
+        let mut reservation = reservation;
+        let _dispatch = tracing::dispatcher::set_default(&dispatch);
+        let _span = request_span.enter();
+
+        let t2 = std::time::Instant::now();
+        let (wal_paths, wal_failed) = write_wal_batches(pipeline.wal_writer(), &mut parsed);
+        let wal_ms = t2.elapsed().as_millis();
+
+        // Groups that did reach the WAL are acknowledged on disk, so they
+        // are published and counted before any failure answers the request.
+        let response = finalize_ingest(
+            &state,
+            &pipeline,
+            &mut parsed,
+            &wal_paths,
+            &mut reservation,
+            &verified,
+            wire_bytes,
+            compressed,
+            body_bytes,
+            decompress_ms,
+            parse_ms,
+            wal_ms,
+        );
+        // What is left is the failed groups' share: released here.
+        drop(reservation);
+        if wal_failed {
+            // A failed group was never acknowledged, so the request fails
+            // as a whole and the sender retries it. The filesystem error
+            // stays in the `wal_write_failed` log, never in the response.
+            return Err(ServerError::Internal("WAL write failed".into()));
+        }
+        Ok(response)
+    })
+    .await
+    .map_err(|e| ServerError::from_join("ingest", e))??;
+
+    Ok(Json(result))
+}
+
+/// What the parse task hands back: the events and its timings.
+#[derive(Debug)]
+struct Parsed {
+    events: ParsedEvents,
+    body_bytes: usize,
+    decompress_ms: u128,
+    parse_ms: u128,
+}
+
+/// Decompress and parse the body on a blocking thread, so CPU-bound gzip
+/// and JSON work does not hog tokio workers.
+async fn parse_request(
+    state: &AppState,
+    peer_addr: SocketAddr,
+    compressed: bool,
+    body: Bytes,
+    dispatch: tracing::Dispatch,
+    span: tracing::Span,
+) -> Result<Parsed, ServerError> {
     // Capture request-scoped context before moving into the blocking task.
     let arrival_instant = chrono::Utc::now();
     let arrival = arrival_instant.to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
@@ -186,22 +326,9 @@ pub async fn ingest(
     let envs = Arc::clone(&state.ingest.envs);
     let default_env = Arc::clone(&state.ingest.default_env);
     let derivation = Arc::clone(&state.ingest.derivation);
-    let dispatch = tracing::dispatcher::get_default(Clone::clone);
-    let request_span = tracing::Span::current();
-    // Wait before dispatching blocking work. Requests waiting behind a
-    // compactor must leave blocking threads available to existing readers.
-    let publication = state.query.hot_buffer.as_ref().map(|buf| buf.publication());
-    let ingest_guard = match publication {
-        Some(gate) => Some(gate.ingest().await),
-        None => None,
-    };
-
-    let result = tokio::task::spawn_blocking(move || -> Result<_, ServerError> {
-        // Cancellation cannot split durability from insertion once this
-        // task starts. The guard stays here until both steps finish.
-        let _ingest = ingest_guard;
+    tokio::task::spawn_blocking(move || -> Result<_, ServerError> {
         let _dispatch = tracing::dispatcher::set_default(&dispatch);
-        let _span = request_span.enter();
+        let _span = span.enter();
         let ctx = EnvelopeContext {
             arrival: &arrival,
             arrival_instant,
@@ -220,46 +347,60 @@ pub async fn ingest(
             body.to_vec()
         };
         let decompress_ms = t0.elapsed().as_millis();
-        let body_bytes = raw.len();
 
         if raw.is_empty() {
             return Err(ServerError::Ingest("empty request body".into()));
         }
 
         let t1 = std::time::Instant::now();
-        let mut parsed = parse_events(&raw, &ctx)?;
-        let parse_ms = t1.elapsed().as_millis();
-
-        let t2 = std::time::Instant::now();
-        let (wal_paths, wal_failed) = write_wal_batches(&wal_writer, &mut parsed);
-        let wal_ms = t2.elapsed().as_millis();
-
-        // Groups that did reach the WAL are acknowledged on disk, so they
-        // are published and counted before any failure answers the request.
-        let response = finalize_ingest(
-            &state,
-            &mut parsed,
-            &wal_paths,
-            &verified,
-            wire_bytes,
-            compressed,
-            body_bytes,
+        let events = parse_events(&raw, &ctx)?;
+        Ok(Parsed {
+            events,
+            body_bytes: raw.len(),
             decompress_ms,
-            parse_ms,
-            wal_ms,
-        );
-        if wal_failed {
-            // A failed group was never acknowledged, so the request fails
-            // as a whole and the sender retries it. The filesystem error
-            // stays in the `wal_write_failed` log, never in the response.
-            return Err(ServerError::Internal("WAL write failed".into()));
-        }
-        Ok(response)
+            parse_ms: t1.elapsed().as_millis(),
+        })
     })
     .await
-    .map_err(|e| ServerError::from_join("ingest", e))??;
+    .map_err(|e| ServerError::from_join("ingest", e))?
+}
 
-    Ok(Json(result))
+/// The response for a refused request. `requested` is `None` for the early
+/// refusal, which runs before the body is parsed.
+fn refusal_error(
+    state: &AppState,
+    pipeline: &PipelineWriter,
+    refusal: Refusal,
+    requested: Option<Charge>,
+) -> ServerError {
+    match refusal {
+        Refusal::Full => ServerError::HotBufferFull {
+            retry_after_secs: state.ingest.retry_after_secs,
+        },
+        Refusal::Oversized => ServerError::IngestBatchTooLarge {
+            requested,
+            ceiling: pipeline.ceiling(ProducerKind::Http),
+        },
+    }
+}
+
+/// Account a parsed request the hot buffer refused: its valid events count
+/// under the refusal's reject reason, its per-event validation rejects
+/// under their own. Nothing was written, so nothing counts as accepted,
+/// repaired or severity-unmapped. No log line: the failure observer's one
+/// `http_failure` is the record of a 503, and a 413 is the client's.
+fn record_refused(state: &AppState, parsed: &mut ParsedEvents, refusal: Refusal) {
+    let reason = match refusal {
+        Refusal::Full => RejectReason::HotBufferFull,
+        Refusal::Oversized => RejectReason::IngestBatchTooLarge,
+    };
+    let refused = parsed.charge().events as u64;
+    parsed.reject_counts.increment_by(reason, refused);
+    parsed.reject_counts.emit_metrics();
+    state.ingest.total_rejected.fetch_add(
+        refused + parsed.errors.len() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 /// Write one WAL file per `(env, service)` group. Every group is attempted,
@@ -312,11 +453,15 @@ fn write_wal_batches(
 
 /// Finish within the blocking task while its publication read guard is held.
 /// Update metrics, publish to the hot buffer and bus, and build the response.
+/// Each published group moves its charge out of `reservation`; what is left
+/// belongs to groups that were not written.
 #[allow(clippy::too_many_arguments)]
 fn finalize_ingest(
     state: &AppState,
+    pipeline: &PipelineWriter,
     parsed: &mut ParsedEvents,
     wal_paths: &[(BatchKey, PathBuf)],
+    reservation: &mut Reservation,
     verified: &VerifiedKey,
     wire_bytes: usize,
     compressed: bool,
@@ -402,12 +547,12 @@ fn finalize_ingest(
     }
 
     // Publish each successfully-written batch to hot buffer + event bus
-    // so events are visible to queries and SSE streams immediately.
-    if let Some(pipeline) = &state.ingest.pipeline {
-        for (key, wal_path) in wal_paths {
-            if let Some(batch) = parsed.batches.swap_remove(key) {
-                pipeline.publish(&key.0, &key.1, batch, wal_path);
-            }
+    // so events are visible to queries and SSE streams immediately. Each
+    // takes its own share of the request's reservation.
+    for (key, wal_path) in wal_paths {
+        if let Some(batch) = parsed.batches.swap_remove(key) {
+            let share = reservation.take(batch.charge());
+            pipeline.publish_admitted(&key.0, &key.1, batch, wal_path, share);
         }
     }
 

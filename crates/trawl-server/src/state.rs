@@ -256,6 +256,11 @@ pub struct IngestState {
     /// a query-only node runs no compaction and refuses repin requests
     /// outright.
     pub repin_coordinator: Option<Arc<crate::repin::RepinCoordinator>>,
+    /// The `Retry-After` a `hot_buffer_full` refusal answers with, in
+    /// seconds: `ingest.compaction_interval_secs` (ADR-0043). Space frees
+    /// only when compaction drains, so a shorter hint only adds refused
+    /// work.
+    pub retry_after_secs: u64,
 }
 
 /// Parse `[ingest] trusted_relays` CIDRs, boot-fatally.
@@ -720,6 +725,7 @@ impl AppState {
                 trusted_relays: parse_trusted_relays(&config.ingest.trusted_relays)?,
                 derivation,
                 repin_coordinator: repin_coordinator.clone(),
+                retry_after_secs: config.ingest.compaction_interval_secs,
             },
             start_time: Instant::now(),
             total_queries: Arc::new(AtomicU64::new(0)),

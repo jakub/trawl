@@ -1304,6 +1304,7 @@ pub async fn setup_in_dir_with_data_and_timeout(
         true,
         RowCaps::DEFAULT,
         SchedulerConfig::default(),
+        None,
     )
     .await
 }
@@ -1335,6 +1336,7 @@ pub async fn setup_with_row_caps(caps: RowCaps) -> TestServer {
         true,
         caps,
         SchedulerConfig::default(),
+        None,
     )
     .await;
     // Leak the tempdir so it survives the test (cleaned up by OS).
@@ -1353,6 +1355,7 @@ pub async fn setup_in_dir_with_ingest(dir: &std::path::Path, enabled: bool) -> T
         enabled,
         RowCaps::DEFAULT,
         SchedulerConfig::default(),
+        None,
     )
     .await
 }
@@ -1370,6 +1373,7 @@ pub async fn setup_with_scheduler(scheduler: SchedulerConfig) -> TestServer {
         true,
         RowCaps::DEFAULT,
         scheduler,
+        None,
     )
     .await;
     // Leak the tempdir so it survives the test (cleaned up by OS).
@@ -1377,6 +1381,38 @@ pub async fn setup_with_scheduler(scheduler: SchedulerConfig) -> TestServer {
     server
 }
 
+/// The `[ingest]` hot-buffer caps and compaction interval a fixture boots
+/// with, for tests that fill the buffer with a handful of events. The
+/// fixture runs no compaction loop, so the interval reaches only what the
+/// request path reads from it (the `Retry-After` of a full buffer).
+#[derive(Debug, Clone, Copy)]
+pub struct HotBufferKnobs {
+    pub max_events: usize,
+    pub max_bytes: usize,
+    pub compaction_interval_secs: u64,
+}
+
+/// A fixture with its own hot-buffer caps and compaction interval. The
+/// tempdir holding its WAL is leaked so it outlives the server.
+pub async fn setup_with_hot_buffer(knobs: HotBufferKnobs) -> TestServer {
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+    let server = setup_with_ingest_config(
+        tmp.path(),
+        seed_data_root(tmp.path()),
+        RateLimitConfig::default(),
+        DEFAULT_TEST_TIMEOUT_SECS,
+        true,
+        RowCaps::DEFAULT,
+        SchedulerConfig::default(),
+        Some(knobs),
+    )
+    .await;
+    // Leak the tempdir so it survives the test (cleaned up by OS).
+    std::mem::forget(tmp);
+    server
+}
+
+#[allow(clippy::too_many_arguments)] // one knob per fixture variant, all private
 #[allow(clippy::too_many_lines)] // linear assembly: two databases, two pools, one config
 async fn setup_with_ingest_config(
     dir: &std::path::Path,
@@ -1386,6 +1422,7 @@ async fn setup_with_ingest_config(
     ingest_enabled: bool,
     row_caps: RowCaps,
     scheduler: SchedulerConfig,
+    hot_buffer: Option<HotBufferKnobs>,
 ) -> TestServer {
     assert!(
         std::path::Path::new(&data_path).is_dir(),
@@ -1465,11 +1502,17 @@ async fn setup_with_ingest_config(
         ingest: {
             let wal_dir = dir.join("wal");
             std::fs::create_dir_all(&wal_dir).unwrap();
-            IngestConfig {
+            let mut ingest = IngestConfig {
                 enabled: ingest_enabled,
                 wal_dir: Some(wal_dir),
                 ..IngestConfig::default()
+            };
+            if let Some(knobs) = hot_buffer {
+                ingest.hot_buffer_max_events = knobs.max_events;
+                ingest.hot_buffer_max_bytes = knobs.max_bytes;
+                ingest.compaction_interval_secs = knobs.compaction_interval_secs;
             }
+            ingest
         },
         retention: RetentionConfig::default(),
         scheduler,

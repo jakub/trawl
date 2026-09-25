@@ -703,10 +703,6 @@ impl HotBuffer {
     /// A producer whose ceiling is zero on a dimension (a cap of 0 or 1 for
     /// an external producer) can fit no non-empty charge, so it gets
     /// [`Refusal::Oversized`] instead, with no state change.
-    #[allow(
-        dead_code,
-        reason = "#253 transition: producers adopt admission in later checkpoints"
-    )]
     pub(crate) fn ensure_free_space(&self, producer: ProducerKind) -> Result<(), Refusal> {
         self.ledger.ensure_free_space(producer)
     }
