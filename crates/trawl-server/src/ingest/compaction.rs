@@ -470,10 +470,8 @@ pub async fn compact_once_coordinated(
 
                 // Publish cold rows and drain these hot batches under one
                 // publication guard so readers cannot see both copies.
-                let batch_ids: Vec<String> = chunk
-                    .iter()
-                    .filter_map(|f| Some(format!("{env}/{}", f.file_stem()?.to_str()?)))
-                    .collect();
+                let batch_ids: Vec<String> =
+                    chunk.iter().filter_map(|f| wal_batch_id(&env, f)).collect();
 
                 // The corpus-gate read guard covers the whole batch —
                 // pin snapshot, conform, publish — so the cutover's write
@@ -1813,7 +1811,7 @@ async fn compact_service_batch(
     // the closure rather than being cloned into it: phase 2 folds this
     // batch's new pins into it instead of re-reading the whole catalog.
     let phase1 = tokio::task::spawn_blocking(move || {
-        let mut quarantined: u64 = 0;
+        let mut quarantined = Vec::new();
         let result = prepare_service_batch(
             &wal_files,
             &data_dir_owned,
@@ -1834,6 +1832,12 @@ async fn compact_service_batch(
             };
         }
     };
+    let quarantine_drain = QuarantineDrain {
+        hot_buffer: hot_buffer.clone(),
+        env,
+        quarantined,
+    };
+    let quarantined = quarantine_drain.count();
     let prep = match prep_result {
         Ok(Some(p)) => p,
         // All inputs corrupt — data loss surfaced via the quarantine count.
@@ -1850,6 +1854,7 @@ async fn compact_service_batch(
             };
         }
         Err(e) => {
+            quarantine_drain.run().await;
             return CompactOutcome {
                 quarantined,
                 result: Err(e),
@@ -1862,6 +1867,7 @@ async fn compact_service_batch(
         Some(cat) => match resolve_pins_durable(cat, known, &prep.proposals).await {
             Ok(pins) => pins,
             Err(e) => {
+                quarantine_drain.run().await;
                 return CompactOutcome {
                     quarantined,
                     result: Err(format!(
@@ -1896,12 +1902,14 @@ async fn compact_service_batch(
     let (report, incomplete) = match phase3 {
         Ok(Ok(published)) => published,
         Ok(Err(e)) => {
+            quarantine_drain.run().await;
             return CompactOutcome {
                 quarantined,
                 result: Err(e),
             };
         }
         Err(e) => {
+            quarantine_drain.run().await;
             return CompactOutcome {
                 quarantined,
                 result: Err(crate::error::join_failure_text("compaction", e)),
@@ -1920,6 +1928,53 @@ async fn compact_service_batch(
     CompactOutcome {
         quarantined,
         result: Ok(incomplete),
+    }
+}
+
+/// The hot batch id of a WAL file: `{env}/{file stem}`, as ingest names it.
+fn wal_batch_id(env: &str, wal_file: &Path) -> Option<String> {
+    Some(format!("{env}/{}", wal_file.file_stem()?.to_str()?))
+}
+
+/// The hot batches of the WAL files one chunk quarantined in phase 1.
+///
+/// A quarantined file is renamed to `.corrupt`, out of every later scan, so
+/// no later chunk can name its batch again. A publish drains it with the
+/// rest of the chunk, since the chunk's batch ids name every input; the
+/// all-corrupt branch drains the whole chunk. A chunk that fails after a
+/// quarantine drains nothing, so [`Self::run`] drains these; otherwise
+/// their charge would stay until restart. The quarantined rows never reach
+/// cold storage, which is outside ADR-0041's publication guarantee.
+struct QuarantineDrain<'a> {
+    hot_buffer: Option<Arc<HotBuffer>>,
+    env: &'a str,
+    quarantined: Vec<PathBuf>,
+}
+
+impl QuarantineDrain<'_> {
+    fn count(&self) -> u64 {
+        self.quarantined.len() as u64
+    }
+
+    /// Drain under the publication write guard, as every drain does. The
+    /// caller holds the repin corpus guard (ADR-0026 lock order: corpus,
+    /// then publication).
+    async fn run(&self) {
+        let Some(buf) = &self.hot_buffer else {
+            return;
+        };
+        if self.quarantined.is_empty() {
+            return;
+        }
+        let ids: Vec<String> = self
+            .quarantined
+            .iter()
+            .filter_map(|f| wal_batch_id(self.env, f))
+            .collect();
+        let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let gate = buf.publication();
+        let _guard = gate.write().await;
+        buf.drain(&ids);
     }
 }
 
@@ -2182,9 +2237,9 @@ fn count_rows(conn: &duckdb::Connection, table: &str) -> Result<u64, String> {
 /// mid-token), it isolates the offender: probe each file alone, quarantine
 /// the ones that throw, and rebuild from the survivors. This makes a single
 /// poison-pill file unable to wedge the whole batch (the residual the byte
-/// sniff alone could not close). `*quarantined` is incremented for each file
-/// set aside. Returns the files that contributed rows, empty when every file
-/// turned out corrupt (the caller treats that as data-loss, not error).
+/// sniff alone could not close). Each file set aside is pushed onto
+/// `quarantined`. Returns the files that contributed rows, empty when every
+/// file turned out corrupt (the caller treats that as data-loss, not error).
 ///
 /// Complex-typed columns cannot arise here: ingest canonicalization
 /// stringifies top-level object/array values before the WAL is written, and
@@ -2194,7 +2249,7 @@ fn read_wal_to_table(
     conn: &duckdb::Connection,
     wal_files: &[PathBuf],
     service: &str,
-    quarantined: &mut u64,
+    quarantined: &mut Vec<PathBuf>,
 ) -> Result<Vec<PathBuf>, String> {
     // Fast path: read the whole batch in one scan. The common case.
     match build_wal_batch(conn, wal_files, service) {
@@ -2221,7 +2276,7 @@ fn read_wal_to_table(
             survivors.push(f.clone());
         } else {
             quarantine_file(f, service, "compaction_quarantine", QuarantineKind::Wal)?;
-            *quarantined += 1;
+            quarantined.push(f.clone());
         }
     }
 
@@ -2534,9 +2589,11 @@ struct WriteReport {
 /// Returns `Ok(None)` when every input was corrupt (data loss surfaced via
 /// the quarantine count — nothing to retry).
 ///
-/// `*quarantined` accumulates corrupt WAL files set aside during this batch
-/// (both the byte sniff and read isolation). It is threaded by reference so
-/// the count survives an `Err` from any later step — see [`CompactOutcome`]
+/// `quarantined` accumulates the corrupt WAL files set aside during this
+/// batch, by their original paths (both the byte sniff and read isolation).
+/// It is threaded by reference so the count, and the drain of those files'
+/// hot batches ([`QuarantineDrain`]), survive an `Err` from any later step —
+/// see [`CompactOutcome`]
 /// (mirrors the rollup [`RollupOutcome`] pattern). Every quarantine is
 /// permanent (`.corrupt` rename), so a retry can't re-count it.
 fn prepare_service_batch(
@@ -2544,7 +2601,7 @@ fn prepare_service_batch(
     data_dir: &Path,
     service: &str,
     memory_limit: &str,
-    quarantined: &mut u64,
+    quarantined: &mut Vec<PathBuf>,
     known_pins: &HashMap<String, CanonicalType>,
 ) -> Result<Option<PreparedBatch>, String> {
     let compact_start = std::time::Instant::now();
@@ -2561,7 +2618,7 @@ fn prepare_service_batch(
             valid_files.push(f.clone());
         } else {
             quarantine_file(f, service, "compaction_quarantine", QuarantineKind::Wal)?;
-            *quarantined += 1;
+            quarantined.push(f.clone());
         }
     }
 
@@ -2573,7 +2630,7 @@ fn prepare_service_batch(
         tracing::error!(
             event_type = "compaction_data_loss",
             compact_service = %service,
-            quarantined = *quarantined,
+            quarantined = quarantined.len(),
             "all WAL files in batch were corrupt — no parquet produced, DATA LOSS"
         );
         return Ok(None);
@@ -2612,7 +2669,7 @@ fn prepare_service_batch(
         tracing::error!(
             event_type = "compaction_data_loss",
             compact_service = %service,
-            quarantined = *quarantined,
+            quarantined = quarantined.len(),
             "all WAL files corrupt after read isolation — no parquet produced, DATA LOSS"
         );
         return Ok(None);
@@ -3978,7 +4035,7 @@ fn compact_service_blocking(
     service: &str,
     memory_limit: &str,
 ) -> Result<u64, String> {
-    let mut quarantined: u64 = 0;
+    let mut quarantined = Vec::new();
     let prep = prepare_service_batch(
         wal_files,
         data_dir,
@@ -3991,7 +4048,7 @@ fn compact_service_blocking(
         let pins = local_pins(&prep.proposals);
         conform_and_write(prep, &pins, data_dir, service)?;
     }
-    Ok(quarantined)
+    Ok(quarantined.len() as u64)
 }
 
 /// Remove stale `.parquet.tmp` files left by interrupted compaction or
@@ -5224,7 +5281,7 @@ mod tests {
         let hot = hot.cloned();
         tokio::task::spawn_blocking(move || {
             let _stop = stop_at.map(publication_marker::interrupt::at);
-            let mut quarantined = 0;
+            let mut quarantined = Vec::new();
             let prep = prepare_service_batch(
                 &files,
                 &env_data,
@@ -5787,7 +5844,7 @@ mod tests {
         let tags = ["chain-a0", "chain-a1"];
         let files = vec![tagged_wal(&env_wal, "svc", &tags)];
         let attempt = || {
-            let mut quarantined = 0;
+            let mut quarantined = Vec::new();
             let prep = prepare_service_batch(
                 &files,
                 &env_data,
@@ -5916,6 +5973,138 @@ mod tests {
         assert_eq!(tick(&wal, &data, &hot).await.unwrap(), 1, "one quarantine");
         assert!(!marker_file(&wal, "prod", "svc").exists());
         assert_eq!(published_messages(&data), ["surv-good"]);
+    }
+
+    /// How [`quarantined_batches_drain_whether_or_not_their_chunk_publishes`]
+    /// ends its first compaction pass.
+    #[derive(Debug, Clone, Copy)]
+    enum ChunkEnd {
+        Publishes,
+        /// Phase 2: the catalog is unreachable, so the pins never become
+        /// durable.
+        CatalogUnreachable,
+        /// Phase 3: the env data path is a file, so the write fails.
+        WriteFails,
+    }
+
+    /// A quarantined WAL file is renamed out of every later scan, so only
+    /// the chunk that quarantined it can drain its hot batch. A publish
+    /// drains it with the chunk; a chunk that fails after the quarantine
+    /// must drain it too, or its charge stays until restart. The chunk's
+    /// other batches stay resident until a retry publishes them.
+    #[tokio::test]
+    async fn quarantined_batches_drain_whether_or_not_their_chunk_publishes() {
+        for end in [
+            ChunkEnd::Publishes,
+            ChunkEnd::CatalogUnreachable,
+            ChunkEnd::WriteFails,
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let wal = tmp.path().join("wal");
+            let data = tmp.path().join("data");
+            let env_wal = wal.join("prod");
+            std::fs::create_dir_all(&env_wal).unwrap();
+            let hot = hot_buffer();
+
+            // The corrupt batch goes in first, so it is the oldest resident.
+            let corrupt = env_wal.join("svc_1729999999999_dead.ndjson");
+            std::fs::write(&corrupt, [0; 32]).unwrap();
+            hot.insert_for_test(Arc::new(crate::bus::IngestBatch {
+                batch_id: "prod/svc_1729999999999_dead".into(),
+                service: "svc".into(),
+                events: vec![serde_json::Map::new(); 3],
+                byte_size: 32,
+            }));
+            let corrupt_charge = hot.charged();
+            assert!(!corrupt_charge.is_zero());
+
+            // A field no pin covers, so phase 2 needs the catalog.
+            let good: Vec<PathBuf> = ["q-good-0", "q-good-1"]
+                .iter()
+                .enumerate()
+                .map(|(n, tag)| {
+                    let path = env_wal.join(format!("svc_173000000000{n}_{n:04x}.ndjson"));
+                    std::fs::write(
+                        &path,
+                        format!(
+                            r#"{{"_time":"2026-01-15T00:00:00Z","_ingested":"2026-01-15T00:00:00Z","service":"svc","message":"{tag}","quarantine_probe":{n}}}"#
+                        ),
+                    )
+                    .unwrap();
+                    insert_hot(&hot, "prod", &path, "svc");
+                    path
+                })
+                .collect();
+            let all_charged = hot.charged();
+            assert_eq!(hot.batch_count(), 3);
+
+            // Deliberately unreachable: this pool simulates a dead catalog
+            // store, not a fixture database (ADR-0021 ruling 3).
+            #[allow(clippy::disallowed_methods)]
+            let dead_catalog = CatalogContext {
+                store: crate::store::CatalogStore::new(
+                    sqlx::postgres::PgPoolOptions::new()
+                        .acquire_timeout(Duration::from_millis(200))
+                        .connect_lazy("postgres://nobody@127.0.0.1:1/nowhere")
+                        .unwrap(),
+                ),
+                cache: Arc::new(crate::catalog::FieldCatalog::new()),
+            };
+            let catalog = match end {
+                ChunkEnd::CatalogUnreachable => Some(&dead_catalog),
+                ChunkEnd::Publishes | ChunkEnd::WriteFails => None,
+            };
+            let env_data = data.join("prod");
+            if matches!(end, ChunkEnd::WriteFails) {
+                std::fs::create_dir_all(&data).unwrap();
+                std::fs::write(&env_data, b"not a directory").unwrap();
+            }
+            let quarantines = compact_once(
+                &wal,
+                &data,
+                Duration::ZERO,
+                false,
+                Some(&hot),
+                DEFAULT_CHUNK_SIZE,
+                "2GB",
+                catalog,
+            )
+            .await
+            .unwrap();
+            assert_eq!(quarantines, 1, "{end:?}");
+            assert!(
+                corrupt.with_extension("ndjson.corrupt").is_file(),
+                "{end:?}"
+            );
+
+            if matches!(end, ChunkEnd::Publishes) {
+                assert_eq!(hot.charged(), Charge::ZERO, "{end:?}");
+                assert_eq!(hot.oldest_batch_age(), None, "{end:?}");
+                assert_eq!(hot.drained_batches(), 3, "{end:?}");
+                assert_eq!(published_messages(&data), ["q-good-0", "q-good-1"]);
+                continue;
+            }
+
+            assert!(good.iter().all(|path| path.is_file()), "{end:?}: WAL kept");
+            assert_eq!(
+                hot.charged(),
+                all_charged.checked_sub(corrupt_charge).unwrap(),
+                "{end:?}: exactly the quarantined batch's charge is released"
+            );
+            assert_eq!(hot.drained_batches(), 1, "{end:?}");
+            assert_eq!(hot.batch_count(), 2, "{end:?}: the failed chunk stays");
+            assert!(published_messages(&data).is_empty(), "{end:?}");
+
+            // Clear the fault: the retry publishes the rest, and nothing
+            // stays behind to age.
+            if matches!(end, ChunkEnd::WriteFails) {
+                std::fs::remove_file(&env_data).unwrap();
+            }
+            assert_eq!(tick(&wal, &data, &hot).await.unwrap(), 0, "{end:?}");
+            assert_eq!(hot.charged(), Charge::ZERO, "{end:?}");
+            assert_eq!(hot.oldest_batch_age(), None, "{end:?}");
+            assert_eq!(published_messages(&data), ["q-good-0", "q-good-1"]);
+        }
     }
 
     #[test]
@@ -6172,7 +6361,7 @@ mod tests {
         let writer_data = data.clone();
         let writer_wal = wal.clone();
         let writer = std::thread::spawn(move || {
-            let mut quarantined = 0;
+            let mut quarantined = Vec::new();
             let prep = prepare_service_batch(
                 &[file],
                 &writer_data,
@@ -6500,7 +6689,7 @@ mod tests {
 
         let report_for = |records: &[&str]| {
             let files = vec![write_wal_file(&wal_dir, "nginx", records)];
-            let mut quarantined: u64 = 0;
+            let mut quarantined = Vec::new();
             let prep = prepare_service_batch(
                 &files,
                 &data_dir,
@@ -9243,7 +9432,7 @@ mod tests {
         let nul_file = wal_dir.join(format!("svc_{millis}_bad.ndjson"));
         std::fs::write(&nul_file, [0u8; 128]).unwrap();
 
-        let mut quarantined: u64 = 0;
+        let mut quarantined = Vec::new();
         let result = prepare_service_batch(
             &[good_file, nul_file.clone()],
             &data_file,
@@ -9260,8 +9449,9 @@ mod tests {
 
         assert!(result.is_err(), "a step after the quarantine must error");
         assert_eq!(
-            quarantined, 1,
-            "quarantine count must survive the Err, not be dropped"
+            quarantined,
+            std::slice::from_ref(&nul_file),
+            "the quarantine must survive the Err, not be dropped"
         );
         assert!(!nul_file.exists(), "the NUL file was really quarantined");
     }
