@@ -445,13 +445,18 @@ oversized request then answers 503 `hot_buffer_full`, and 413 only once
 space frees. A parsed request gets the same answer each time: 413 if it is
 oversized, whatever the occupancy, and otherwise 503 until it fits.
 
+A `hot_buffer_max_events` or `hot_buffer_max_bytes` of 0 or 1 leaves HTTP a
+share of 0. Every request then answers 413 `ingest_batch_too_large` before
+its body is read. The message gives the limit but no request size, and no
+events are counted.
+
 **Errors**
 
 | Status | Code | When |
 |--------|------|------|
 | 400 | `ingest_error` | Empty body, invalid UTF-8, an unparseable or empty JSON array, a gzip body that fails to decode, or a gzip body that expands past 10 times its wire size |
 | 413 | none | The body exceeds `[ingest] max_body_bytes` |
-| 413 | `ingest_batch_too_large` | The request holds more than 15/16 of `hot_buffer_max_events` or `hot_buffer_max_bytes`. No `Retry-After`. Split the batch |
+| 413 | `ingest_batch_too_large` | The request holds more than 15/16 of `hot_buffer_max_events` or `hot_buffer_max_bytes`, or a cap of 0 or 1 admits no request. No `Retry-After`. Split the batch |
 | 429 | `rate_limited` | The key's ingest bucket is empty |
 | 500 | `internal_error` | A group's WAL write failed. Other groups in the request may still have been accepted. |
 | 503 | `hot_buffer_full` | The hot buffer has no room for the request. `Retry-After` gives `[ingest] compaction_interval_secs` in seconds. Nothing was written |
@@ -1731,7 +1736,7 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" "$TRAWL_URL/api/v1/dashboard
 | `ingest_events`, `ingest_rejected` | integer | HTTP accepted and rejected event counts since process startup. Excludes syslog. |
 | `syslog_enabled` | boolean | Configured syslog enablement. This does not test listener health. |
 | `syslog_events_udp`, `syslog_events_tcp` | integer | Messages received by each transport since process startup. Reception does not prove persistence. |
-| `syslog_parse_errors`, `syslog_dropped` | integer | Parse errors and backpressure drops since process startup |
+| `syslog_parse_errors`, `syslog_dropped` | integer | Parse errors and dropped events since process startup. Drops include a full listener queue, events refused by hot-buffer admission at shutdown, and single events too large to admit |
 | `syslog_tcp_connections` | integer | Current active syslog TCP connections |
 | `wal_files`, `wal_bytes` | integer | Last complete count and byte total of WAL `.ndjson` files, including active files. These are not compaction-eligible totals. |
 | `parquet_files`, `parquet_bytes` | integer | Last complete count and byte total of ingested Parquet files. Excludes saved report files under `scheduled/` directories. |

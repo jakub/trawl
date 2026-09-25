@@ -140,6 +140,10 @@ again when compaction frees space.
   `trawl_hot_buffer_admission_refusals_total{producer="syslog"}`.
 - At shutdown, the batcher makes one last attempt. Events that still do not
   fit are dropped and counted with `reason="backpressure"`.
+- A TCP frame that is still waiting for queue space at shutdown is dropped
+  and counted in `trawl_syslog_events_dropped_total`. The `reason` label
+  follows the UDP rule: `backpressure` when the batcher was waiting for
+  hot-buffer space, `queue_full` otherwise.
 
 ## Map a raw syslog severity sent over HTTP
 
