@@ -10,14 +10,40 @@
 //! [`DashboardSnapshot`] — `AuthShell` feeds it from the admin-only
 //! `/api/v1/dashboard/stream` SSE stream, so non-admins never see the
 //! group.
+//!
+//! Health is re-read every [`HEALTH_REFRESH_MS`] for every session, so the
+//! `Ingest refusing` chip (ADR-0043) clears on its own once the server
+//! admits ingest again. The reads run in one sequential loop, not a
+//! `LocalResource`: a `refetch()` issued while a read is in flight is
+//! dropped, and a changed resource input starts a second request beside
+//! the first. The loop awaits each read before it sleeps, so at most one
+//! health request is ever in flight.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use leptos::prelude::*;
+use leptos::task::spawn_local;
 use leptos::web_sys;
-use trawl_api::DashboardSnapshot;
+use trawl_api::{DashboardSnapshot, HealthResponse};
 
 use crate::api;
 use crate::components::service_card_fmt::{format_bytes, format_count, format_uptime};
 use crate::search_status::{FooterCount, StatusKind, footer_count_label};
+
+/// How often the footer re-reads `/api/v1/health`, counted from the end of
+/// the previous read.
+const HEALTH_REFRESH_MS: u32 = 30_000;
+
+/// Whether a health report says hot-buffer admission is refusing ingest.
+/// Back-pressure, not an outage: it never changes the connected label.
+fn ingest_refusing(report: &HealthResponse) -> bool {
+    report
+        .checks
+        .as_ref()
+        .and_then(|checks| checks.get("ingest_capacity"))
+        .is_some_and(|value| value == "refusing")
+}
 
 #[component]
 #[allow(clippy::too_many_lines)] // one footer, one markup tree
@@ -43,7 +69,24 @@ pub fn StatusBar(
     let host = web_sys::window()
         .and_then(|w| w.location().host().ok())
         .unwrap_or_default();
-    let server = LocalResource::new(api::health);
+    // The latest settled health read; `None` until the first one lands.
+    let server = RwSignal::new(None::<Result<HealthResponse, api::ApiError>>);
+    let alive = Arc::new(AtomicBool::new(true));
+    let looping = Arc::clone(&alive);
+    spawn_local(async move {
+        loop {
+            let report = api::health().await;
+            // `try_set` hands the value back once the footer is disposed.
+            if !looping.load(Ordering::Relaxed) || server.try_set(Some(report)).is_some() {
+                return;
+            }
+            gloo_timers::future::TimeoutFuture::new(HEALTH_REFRESH_MS).await;
+            if !looping.load(Ordering::Relaxed) {
+                return;
+            }
+        }
+    });
+    on_cleanup(move || alive.store(false, Ordering::Relaxed));
     // Where the health probe stands, so a test can wait for a settled
     // failure instead of a timeout: the host-only label reads the same
     // while the probe is pending and after it has failed.
@@ -68,6 +111,18 @@ pub fn StatusBar(
             <div class="grp">
                 <span class="strong status-label" data-health=health_state>{status_label}</span>
             </div>
+            {move || server
+                .get()
+                .and_then(Result::ok)
+                .filter(ingest_refusing)
+                .map(|_| view! {
+                    <div
+                        class="grp ingest-refusing"
+                        title="The server is refusing new events until compaction frees hot-buffer space"
+                    >
+                        <span class="strong">"Ingest refusing"</span>
+                    </div>
+                })}
             {move || lagged.get().map(|n| view! {
                 <>
                     <div class="grp lagged">

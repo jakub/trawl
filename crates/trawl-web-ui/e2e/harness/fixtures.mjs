@@ -81,6 +81,7 @@ export function healthResponse() {
       auth_db: 'ok',
       storage_db: 'ok',
       data_path: 'ok',
+      ingest_capacity: 'ok',
     },
   };
 }

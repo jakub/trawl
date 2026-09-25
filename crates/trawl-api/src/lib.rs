@@ -258,7 +258,10 @@ pub struct ExportRequest {
 pub struct HealthResponse {
     /// Daemon health status.
     pub status: HealthStatus,
-    /// Per-subsystem check results (`"ok"` or `"error"`).
+    /// Per-subsystem check results: `"ok"` or `"error"` for `duckdb`,
+    /// `auth_db`, `storage_db` and `data_path`; `"ok"` or `"refusing"` for
+    /// `ingest_capacity`, which reads `"refusing"` while hot-buffer
+    /// admission is refusing ingest (non-critical, so `Degraded`).
     ///
     /// The daemon always fills this; optional so a body that omits it parses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
