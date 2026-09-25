@@ -291,9 +291,13 @@ pub fn init_operational_alert_metrics() {
     for reason in TelemetryDropReason::ALL {
         metrics::counter!(TELEMETRY_EVENTS_DROPPED_TOTAL, "reason" => reason.label()).increment(0);
     }
-    metrics::counter!(INGEST_EVENTS_REJECTED_TOTAL,
-        "reason" => crate::ingest::envelope::RejectReason::WalFailure.as_str())
-    .increment(0);
+    for reason in [
+        crate::ingest::envelope::RejectReason::WalFailure,
+        crate::ingest::envelope::RejectReason::HotBufferFull,
+        crate::ingest::envelope::RejectReason::IngestBatchTooLarge,
+    ] {
+        metrics::counter!(INGEST_EVENTS_REJECTED_TOTAL, "reason" => reason.as_str()).increment(0);
+    }
     for operation in WalDurabilityOperation::ALL {
         metrics::counter!(WAL_DURABILITY_FAILURES_TOTAL, "operation" => operation.label())
             .increment(0);
@@ -1700,6 +1704,8 @@ mod tests {
                 "trawl_telemetry_events_dropped_total{reason=\"write_crashed\"}",
                 "trawl_telemetry_events_dropped_total{reason=\"unmetered_cap\"}",
                 "trawl_ingest_events_rejected_total{reason=\"wal_failure\"}",
+                "trawl_ingest_events_rejected_total{reason=\"hot_buffer_full\"}",
+                "trawl_ingest_events_rejected_total{reason=\"ingest_batch_too_large\"}",
                 "trawl_wal_durability_failures_total{operation=\"parent_directory_sync\"}",
                 "trawl_compaction_operation_failures_total{operation=\"wal_root_scan\"}",
                 "trawl_compaction_operation_failures_total{operation=\"wal_environment_scan\"}",

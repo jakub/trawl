@@ -507,7 +507,7 @@ impl SyslogBatcher {
         let events: usize = groups.iter().map(|g| g.batch.maps.len()).sum();
 
         let pipeline = Arc::clone(&self.pipeline);
-        let written = tokio::task::spawn_blocking(move || pipeline.write_admitted(groups))
+        let written = tokio::task::spawn_blocking(move || pipeline.write(groups))
             .await
             .unwrap_or_else(|e| {
                 // The task may have published earlier groups or the current

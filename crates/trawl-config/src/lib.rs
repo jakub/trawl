@@ -267,7 +267,7 @@ pub struct IngestConfig {
     /// compacted to parquet, plus the space producers have reserved for
     /// events they are writing. Default: 100,000.
     ///
-    /// Ingest is admitted against this cap, never evicted from it
+    /// Ingest is admitted against this cap before it is written
     /// (ADR-0043). HTTP and syslog may fill at most 15/16 of it
     /// (rounded down); the server's own telemetry may fill all of it, so
     /// its self-logs keep landing while external ingest is refused. A
@@ -282,7 +282,7 @@ pub struct IngestConfig {
     /// Maximum serialized bytes the hot buffer holds, counted the same way
     /// as `hot_buffer_max_events` (resident plus reserved) and admitted
     /// against the same way: 15/16 for HTTP and syslog, the full cap for
-    /// the server's own telemetry, refusal instead of eviction.
+    /// the server's own telemetry, and refusal when it is full.
     /// Default: 100 MB. Accepts human-readable sizes like `"100M"`, `"1G"`.
     #[serde(
         default = "default_hot_buffer_max_bytes",

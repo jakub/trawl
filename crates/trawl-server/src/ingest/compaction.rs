@@ -5157,7 +5157,7 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        hot.insert_evicting(Arc::new(crate::bus::IngestBatch {
+        hot.insert_for_test(Arc::new(crate::bus::IngestBatch {
             batch_id: format!("{env}/{}", wal.file_stem().unwrap().to_str().unwrap()).into(),
             service: service.into(),
             events,
@@ -6112,7 +6112,7 @@ mod tests {
             });
             if let Some(buf) = &hot {
                 let id = format!("prod/{}", fresh_wal.file_stem().unwrap().to_str().unwrap());
-                buf.insert_evicting(Arc::new(crate::bus::IngestBatch {
+                buf.insert_for_test(Arc::new(crate::bus::IngestBatch {
                     batch_id: id.into(),
                     service: "nginx".into(),
                     events: vec![serde_json::from_str(fresh).unwrap()],
@@ -6160,7 +6160,7 @@ mod tests {
             max_events: 100,
             max_bytes: 100_000,
         }));
-        hot.insert_evicting(Arc::new(crate::bus::IngestBatch {
+        hot.insert_for_test(Arc::new(crate::bus::IngestBatch {
             batch_id: "prod/batch".into(),
             service: "nginx".into(),
             events: vec![serde_json::from_str(record).unwrap()],
@@ -10661,7 +10661,7 @@ mod tests {
     /// Write admitted groups through the real WAL + hot-buffer path.
     async fn write_groups(pipeline: &Arc<PipelineWriter>, groups: Vec<AdmittedGroup>) -> usize {
         let pipeline = Arc::clone(pipeline);
-        tokio::task::spawn_blocking(move || pipeline.write_admitted(groups))
+        tokio::task::spawn_blocking(move || pipeline.write(groups))
             .await
             .unwrap()
     }

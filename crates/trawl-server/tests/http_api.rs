@@ -1130,7 +1130,7 @@ async fn producer_is_stamped_stored_and_queryable_per_door() {
             .expect("ingest is enabled in the test config"),
     );
     assert_eq!(
-        tokio::task::spawn_blocking(move || pipeline.write(batches))
+        tokio::task::spawn_blocking(move || pipeline.write(pipeline.admit_for_test(batches)))
             .await
             .unwrap(),
         1

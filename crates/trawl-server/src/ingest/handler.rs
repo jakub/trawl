@@ -552,7 +552,7 @@ fn finalize_ingest(
     for (key, wal_path) in wal_paths {
         if let Some(batch) = parsed.batches.swap_remove(key) {
             let share = reservation.take(batch.charge());
-            pipeline.publish_admitted(&key.0, &key.1, batch, wal_path, share);
+            pipeline.publish(&key.0, &key.1, batch, wal_path, share);
         }
     }
 

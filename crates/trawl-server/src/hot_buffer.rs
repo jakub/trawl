@@ -262,10 +262,6 @@ struct Ledger {
     /// The full caps: self-telemetry's ceiling and the hysteresis base.
     caps: Charge,
     /// [`external_ceiling`] of `caps`, computed once.
-    #[allow(
-        dead_code,
-        reason = "#253 transition: producers adopt admission in later checkpoints"
-    )]
     external: Charge,
     state: Mutex<LedgerState>,
     /// Lock-free copy of `state.admission`, written under the mutex.
@@ -278,10 +274,6 @@ struct Ledger {
     drained_batches: AtomicU64,
 }
 
-#[allow(
-    dead_code,
-    reason = "#253 transition: producers adopt admission in later checkpoints"
-)]
 impl Ledger {
     fn new(caps: Charge) -> Self {
         Self {
@@ -433,14 +425,6 @@ impl Ledger {
         actual
     }
 
-    /// Charge without a capacity check, for [`HotBuffer::insert_evicting`]
-    /// only: it evicts to make room and then must account what it stores.
-    fn charge_unchecked(&self, charge: Charge) {
-        let mut state = self.state.lock();
-        state.charged = state.charged.saturating_add(charge);
-        self.publish(&mut state, false);
-    }
-
     fn charged(&self) -> Charge {
         self.state.lock().charged
     }
@@ -453,10 +437,6 @@ fn advance(signal: &watch::Sender<u64>) {
 }
 
 /// Metrics only: this runs on the telemetry flush path.
-#[allow(
-    dead_code,
-    reason = "#253 transition: producers adopt admission in later checkpoints"
-)]
 fn count_refusal(producer: ProducerKind, refusal: Refusal) {
     metrics::counter!(
         crate::metrics::HOT_BUFFER_ADMISSION_REFUSALS_TOTAL,
@@ -489,10 +469,6 @@ impl std::fmt::Debug for Reservation {
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "#253 transition: producers adopt admission in later checkpoints"
-)]
 impl Reservation {
     fn metered(ledger: Arc<Ledger>, charge: Charge) -> Self {
         Self {
@@ -778,73 +754,6 @@ impl HotBuffer {
         }
     }
 
-    /// TRANSITIONAL (#253 CP1): the pre-admission insert, kept so producers
-    /// not yet migrated to [`reserve`](Self::reserve) +
-    /// [`insert`](Self::insert) keep compiling. Deleted once every producer
-    /// reserves.
-    ///
-    /// If insertion would exceed either the event or byte limit,
-    /// the oldest batches are evicted first (logged as warnings). The batch
-    /// is charged to the ledger unchecked, so drain accounting stays exact.
-    pub fn insert_evicting(&self, batch: Arc<IngestBatch>) {
-        let event_count = batch.events.len();
-        let byte_count = batch.byte_size;
-        let charge = Charge {
-            events: event_count,
-            bytes: byte_count,
-        };
-
-        // Evict oldest batches if over either limit.
-        {
-            let mut map = self.batches.write();
-            while self.over_limit(event_count, byte_count) {
-                if let Some((evicted_id, evicted)) = map.shift_remove_index(0) {
-                    self.total_events
-                        .fetch_sub(evicted.batch.events.len(), Ordering::Relaxed);
-                    self.total_bytes
-                        .fetch_sub(evicted.batch.byte_size, Ordering::Relaxed);
-                    self.ledger.release(evicted.charge);
-                    tracing::warn!(
-                        event_type = "hot_buffer_eviction",
-                        batch_id = %evicted_id,
-                        events = evicted.batch.events.len(),
-                        bytes = evicted.batch.byte_size,
-                        "hot buffer evicted batch (over limit)"
-                    );
-                } else {
-                    break;
-                }
-            }
-
-            self.ledger.charge_unchecked(charge);
-            self.total_events.fetch_add(event_count, Ordering::Relaxed);
-            self.total_bytes.fetch_add(byte_count, Ordering::Relaxed);
-            let replaced = map.insert(
-                Arc::clone(&batch.batch_id),
-                Resident {
-                    batch,
-                    charge,
-                    inserted: Instant::now(),
-                },
-            );
-            if let Some(old) = replaced {
-                self.total_events
-                    .fetch_sub(old.batch.events.len(), Ordering::Relaxed);
-                self.total_bytes
-                    .fetch_sub(old.batch.byte_size, Ordering::Relaxed);
-                self.ledger.release(old.charge);
-            }
-        }
-
-        self.generation.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Check if adding `extra_events` / `extra_bytes` would exceed limits.
-    fn over_limit(&self, extra_events: usize, extra_bytes: usize) -> bool {
-        self.total_events.load(Ordering::Relaxed) + extra_events > self.config.max_events
-            || self.total_bytes.load(Ordering::Relaxed) + extra_bytes > self.config.max_bytes
-    }
-
     /// Insert without a producer's reservation, for tests: reserves as
     /// [`ProducerKind::Trawld`] (the full caps) and panics on refusal.
     #[cfg(any(test, feature = "test-support"))]
@@ -996,9 +905,8 @@ impl HotBuffer {
     /// that the reader can rely on `DuckDB`'s cheap default schema sample.
     ///
     /// The key set is ASCII-lowercase by construction, so no case merging
-    /// happens here: the production callers of [`HotBuffer::insert`] and
-    /// [`HotBuffer::insert_evicting`] are exactly `PipelineWriter`'s publish
-    /// paths and telemetry's flush, and every event reaching them was
+    /// happens here: the production callers of [`HotBuffer::insert`] are
+    /// exactly `PipelineWriter`'s publish path and telemetry's flush, and every event reaching them was
     /// canonicalized in `ingest::envelope::canonicalize`,
     /// the one door that folds field names. Test-only constructors that
     /// insert unfolded keys get the loud behaviour: an unnameable `x_1` twin
@@ -1178,7 +1086,7 @@ mod tests {
             max_events: 1000,
             max_bytes: 10_000_000,
         });
-        buf.insert_evicting(make_batch("batch_001", 3));
+        buf.insert_for_test(make_batch("batch_001", 3));
         assert_eq!(buf.event_count(), 3);
         assert_eq!(buf.batch_count(), 1);
 
@@ -1243,7 +1151,7 @@ mod tests {
             max_bytes: 10_000_000,
         });
         let events = events_with_trailing_sparse_key(50);
-        buf.insert_evicting(Arc::new(IngestBatch {
+        buf.insert_for_test(Arc::new(IngestBatch {
             batch_id: "b1".into(),
             service: "svc".into(),
             byte_size: 100,
@@ -1292,7 +1200,7 @@ mod tests {
             max_events: 100_000,
             max_bytes: 100 * 1024 * 1024,
         });
-        buf.insert_evicting(Arc::new(IngestBatch {
+        buf.insert_for_test(Arc::new(IngestBatch {
             batch_id: "b1".into(),
             service: "svc".into(),
             byte_size: 1000,
@@ -1359,7 +1267,7 @@ mod tests {
         let mut ev = serde_json::Map::new();
         ev.insert("service".into(), serde_json::Value::String("svc".into()));
         ev.insert("duration".into(), serde_json::Value::from(42));
-        buf.insert_evicting(Arc::new(IngestBatch {
+        buf.insert_for_test(Arc::new(IngestBatch {
             batch_id: "b1".into(),
             service: "svc".into(),
             byte_size: 100,
@@ -1400,7 +1308,7 @@ mod tests {
         let mut ev = serde_json::Map::new();
         ev.insert("service".into(), serde_json::Value::String("svc".into()));
         ev.insert("duration".into(), serde_json::Value::from(42));
-        buf.insert_evicting(Arc::new(IngestBatch {
+        buf.insert_for_test(Arc::new(IngestBatch {
             batch_id: "b1".into(),
             service: "svc".into(),
             byte_size: 100,
@@ -1435,8 +1343,8 @@ mod tests {
             max_events: 1000,
             max_bytes: 10_000_000,
         });
-        buf.insert_evicting(make_batch("batch_001", 2));
-        buf.insert_evicting(make_batch("batch_002", 3));
+        buf.insert_for_test(make_batch("batch_001", 2));
+        buf.insert_for_test(make_batch("batch_002", 3));
         assert_eq!(buf.event_count(), 5);
 
         buf.drain(&["batch_001"]);
@@ -1449,47 +1357,13 @@ mod tests {
     }
 
     #[test]
-    fn eviction_removes_oldest_by_insertion_order() {
-        let buf = HotBuffer::new(HotBufferConfig {
-            max_events: 5,
-            max_bytes: 10_000_000,
-        });
-        // Insert "zzz" first, then "aaa" — FIFO should evict "zzz" first
-        // even though it sorts last lexicographically.
-        buf.insert_evicting(make_batch("zzz_001", 3));
-        buf.insert_evicting(make_batch("aaa_002", 3));
-        // Inserting 3 more events when limit is 5: must evict zzz (oldest inserted).
-        assert_eq!(buf.event_count(), 3);
-        assert_eq!(buf.batch_count(), 1);
-
-        // Only aaa_002 should remain.
-        let tmpfile = buf.snapshot().unwrap();
-        let content = std::fs::read_to_string(tmpfile.path()).unwrap();
-        assert_eq!(content.lines().count(), 3);
-    }
-
-    #[test]
-    fn eviction_by_bytes_limit() {
-        let buf = HotBuffer::new(HotBufferConfig {
-            max_events: 1_000_000, // effectively unlimited
-            max_bytes: 500,
-        });
-        buf.insert_evicting(make_batch_with_bytes("batch_001", 2, 300));
-        buf.insert_evicting(make_batch_with_bytes("batch_002", 2, 300));
-        // 300 + 300 = 600 > 500, so batch_001 should be evicted.
-        assert_eq!(buf.event_count(), 2);
-        assert_eq!(buf.byte_count(), 300);
-        assert_eq!(buf.batch_count(), 1);
-    }
-
-    #[test]
     fn drain_updates_byte_count() {
         let buf = HotBuffer::new(HotBufferConfig {
             max_events: 1000,
             max_bytes: 10_000_000,
         });
-        buf.insert_evicting(make_batch_with_bytes("batch_001", 2, 200));
-        buf.insert_evicting(make_batch_with_bytes("batch_002", 3, 400));
+        buf.insert_for_test(make_batch_with_bytes("batch_001", 2, 200));
+        buf.insert_for_test(make_batch_with_bytes("batch_002", 3, 400));
         assert_eq!(buf.byte_count(), 600);
 
         buf.drain(&["batch_001"]);
@@ -1502,8 +1376,8 @@ mod tests {
             max_events: 1000,
             max_bytes: 10_000_000,
         });
-        buf.insert_evicting(make_batch("batch_001", 2));
-        buf.insert_evicting(make_batch("batch_002", 3));
+        buf.insert_for_test(make_batch("batch_001", 2));
+        buf.insert_for_test(make_batch("batch_002", 3));
 
         let tmpfile = buf.snapshot().expect("should have events");
         let content = std::fs::read_to_string(tmpfile.path()).unwrap();
@@ -1517,8 +1391,8 @@ mod tests {
             max_events: 1000,
             max_bytes: 10_000_000,
         });
-        buf.insert_evicting(make_batch("batch_001", 2));
-        buf.insert_evicting(make_batch("batch_002", 3));
+        buf.insert_for_test(make_batch("batch_001", 2));
+        buf.insert_for_test(make_batch("batch_002", 3));
 
         // Take a snapshot (Arc-wrapped temp file).
         let snapshot = buf.snapshot().expect("should have events");
@@ -1548,7 +1422,7 @@ mod tests {
             max_events: 100,
             max_bytes: 10_000_000,
         });
-        buf.insert_evicting(make_batch("batch_001", 2));
+        buf.insert_for_test(make_batch("batch_001", 2));
         buf.drain(&["nonexistent"]);
         assert_eq!(buf.event_count(), 2);
     }

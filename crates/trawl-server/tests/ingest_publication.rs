@@ -94,7 +94,7 @@ async fn cancelled_syslog_caller_keeps_wal_and_hot_insert_together() {
     let batches = IndexMap::from([(("prod".into(), "syslog".into()), batch)]);
     let task = tokio::spawn(async move {
         assert_eq!(
-            tokio::task::spawn_blocking(move || pipeline.write(batches))
+            tokio::task::spawn_blocking(move || pipeline.write(pipeline.admit_for_test(batches)))
                 .await
                 .unwrap(),
             2
@@ -430,7 +430,7 @@ async fn pending_rollup_does_not_reject_ingest() {
     assert_eq!(
         tokio::time::timeout(
             Duration::from_secs(5),
-            tokio::task::spawn_blocking(move || pipeline.write(batches)),
+            tokio::task::spawn_blocking(move || pipeline.write(pipeline.admit_for_test(batches))),
         )
         .await
         .unwrap()

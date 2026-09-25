@@ -10,14 +10,13 @@
 //! Admission comes first (ADR-0043): a producer reserves hot-buffer space
 //! for the exact [`ServiceBatch::charge`] before it takes the publication
 //! gate or writes anything, and hands the [`Reservation`] to
-//! [`PipelineWriter::write_admitted`] or [`PipelineWriter::publish_admitted`]
+//! [`PipelineWriter::write`] or [`PipelineWriter::publish`]
 //! with the batch. A group whose write fails drops its reservation, which
 //! releases the space.
 
 use std::path::Path;
 use std::sync::Arc;
 
-use indexmap::IndexMap;
 use serde_json::Map;
 
 use crate::bus::{EventBus as _, IngestBatch, LocalEventBus};
@@ -174,7 +173,7 @@ impl PipelineWriter {
     /// Call from a blocking thread because WAL I/O and the publication
     /// read guard can wait; the caller must not wait for capacity while
     /// holding the gate, which is why admission happened before this call.
-    pub fn write_admitted(&self, groups: Vec<AdmittedGroup>) -> usize {
+    pub fn write(&self, groups: Vec<AdmittedGroup>) -> usize {
         let mut total_written = 0;
 
         for AdmittedGroup {
@@ -192,47 +191,12 @@ impl PipelineWriter {
             match self.wal_writer.write(&env, &svc, &batch.ndjson) {
                 Ok(wal_path) => {
                     total_written += event_count;
-                    self.publish_admitted(&env, &svc, batch, &wal_path, reservation);
+                    self.publish(&env, &svc, batch, &wal_path, reservation);
                 }
                 Err(e) => {
                     drop(reservation);
                     Self::record_discarded_group(&env, &svc, event_count, &e);
                 }
-            }
-        }
-
-        total_written
-    }
-
-    /// Write batches through the pipeline: WAL → hot buffer → event bus.
-    ///
-    /// Returns the number of events successfully written. Events from
-    /// groups that fail WAL writing, a failed directory fsync included,
-    /// are dropped (logged, counted, not published).
-    /// Syslog is the production caller of this method. HTTP writes groups
-    /// separately so it can reject them; telemetry retains failed batches.
-    ///
-    /// The env comes from the key, never from a writer-held default: a
-    /// batcher that grouped by service alone would file every env it
-    /// received under one path root, silently.
-    /// Call from a blocking thread because WAL I/O and the publication
-    /// read guard can wait.
-    pub fn write(&self, batches: IndexMap<BatchKey, ServiceBatch>) -> usize {
-        let mut total_written = 0;
-
-        for ((env, svc), batch) in batches {
-            let event_count = batch.maps.len();
-            // Compaction may read the WAL as soon as its rename completes.
-            // Keep its publication and drain behind this hot insertion.
-            let publication = self.hot_buffer.as_ref().map(|buf| buf.publication());
-            let _ingest = publication.as_ref().map(|gate| gate.blocking_ingest());
-
-            match self.wal_writer.write(&env, &svc, &batch.ndjson) {
-                Ok(wal_path) => {
-                    total_written += event_count;
-                    self.publish(&env, &svc, batch, &wal_path);
-                }
-                Err(e) => Self::record_discarded_group(&env, &svc, event_count, &e),
             }
         }
 
@@ -258,27 +222,16 @@ impl PipelineWriter {
         );
     }
 
-    /// Publish a successfully-written batch to hot buffer and event bus.
+    /// Publish a successfully-written, admitted batch to the hot buffer and
+    /// event bus: the reservation's charge moves into the resident batch.
+    /// Without a hot buffer the (unmetered) reservation is simply dropped.
     ///
     /// Called after WAL writing succeeds to make events immediately
     /// visible to queries (via hot buffer) and SSE streams (via event bus).
     /// The caller holds the publication read guard from before the WAL
     /// write through this call. Reacquiring here can deadlock behind a
     /// queued compactor waiting for the caller's existing read guard.
-    pub(crate) fn publish(&self, env: &str, svc: &str, batch: ServiceBatch, wal_path: &Path) {
-        self.publish_with(env, svc, batch, wal_path, |buf, ingest_batch| {
-            buf.insert_evicting(ingest_batch);
-        });
-    }
-
-    /// Publish a successfully-written, admitted batch: the reservation's
-    /// charge moves into the resident batch. Without a hot buffer the
-    /// (unmetered) reservation is simply dropped.
-    ///
-    /// Same guard discipline as [`publish`](Self::publish): the caller holds
-    /// the publication read guard from before the WAL write through this
-    /// call.
-    pub fn publish_admitted(
+    pub fn publish(
         &self,
         env: &str,
         svc: &str,
@@ -289,21 +242,8 @@ impl PipelineWriter {
         debug_assert_eq!(
             reservation.charge(),
             batch.charge(),
-            "publish_admitted with a reservation that does not match its batch"
+            "publish with a reservation that does not match its batch"
         );
-        self.publish_with(env, svc, batch, wal_path, move |buf, ingest_batch| {
-            buf.insert(reservation, ingest_batch);
-        });
-    }
-
-    fn publish_with(
-        &self,
-        env: &str,
-        svc: &str,
-        batch: ServiceBatch,
-        wal_path: &Path,
-        insert: impl FnOnce(&HotBuffer, Arc<IngestBatch>),
-    ) {
         #[cfg(any(test, feature = "test-support"))]
         {
             let pause = self.pause_before_insert.lock().take();
@@ -331,7 +271,7 @@ impl PipelineWriter {
         });
 
         if let Some(buf) = &self.hot_buffer {
-            insert(buf, Arc::clone(&ingest_batch));
+            buf.insert(reservation, Arc::clone(&ingest_batch));
         }
         if let Some(bus) = &self.event_bus {
             let subscribers = bus.publish(ingest_batch);
@@ -354,143 +294,38 @@ impl PipelineWriter {
         *self.pause_before_insert.lock() = Some((entered_tx, release_rx));
         (entered_rx, release_tx)
     }
+
+    /// Reserve each group as [`ProducerKind::Trawld`] (the full caps) and
+    /// wrap it as an [`AdmittedGroup`], for tests that feed
+    /// [`write`](Self::write) directly. Panics on a refusal.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn admit_for_test(
+        &self,
+        batches: indexmap::IndexMap<BatchKey, ServiceBatch>,
+    ) -> Vec<AdmittedGroup> {
+        batches
+            .into_iter()
+            .map(|(key, batch)| {
+                let charge = batch.charge();
+                let reservation =
+                    self.reserve(ProducerKind::Trawld, charge)
+                        .unwrap_or_else(|refusal| {
+                            panic!("admit_for_test refused {charge:?}: {refusal:?}")
+                        });
+                AdmittedGroup {
+                    key,
+                    batch,
+                    reservation,
+                }
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::metrics::test_support::sample;
-
-    #[test]
-    fn failed_wal_group_discards_only_its_events_between_durable_groups() {
-        let recorder = crate::metrics::prometheus_builder().build_recorder();
-        let handle = recorder.handle();
-        metrics::with_local_recorder(&recorder, || {
-            crate::metrics::init_operational_alert_metrics();
-            let tmp = tempfile::tempdir().unwrap();
-            let wal = Arc::new(WalWriter::new(tmp.path().join("wal")));
-            wal.ensure_dir().unwrap();
-            // A regular file in place of this env directory deterministically
-            // fails only the middle group, including when tests run as root.
-            std::fs::write(wal.dir().join("blocked"), b"keep me").unwrap();
-            let hot = Arc::new(HotBuffer::new(crate::hot_buffer::HotBufferConfig {
-                max_events: 100,
-                max_bytes: 1024 * 1024,
-            }));
-            let pipeline = PipelineWriter::new(Arc::clone(&wal), Some(Arc::clone(&hot)), None);
-            let mut batches = IndexMap::new();
-            for (env, service, count) in [
-                ("prod", "before", 1),
-                ("blocked", "failed", 3),
-                ("prod", "after", 2),
-            ] {
-                let mut batch = ServiceBatch::default();
-                for id in 0..count {
-                    batch.push(
-                        serde_json::json!({"env":env, "service":service, "id":id})
-                            .as_object()
-                            .unwrap()
-                            .clone(),
-                    );
-                }
-                batches.insert((env.to_owned(), service.to_owned()), batch);
-            }
-            assert_eq!(pipeline.write(batches), 3);
-            assert_eq!(
-                sample(&handle, crate::metrics::SYSLOG_WAL_EVENTS_DISCARDED_TOTAL),
-                3
-            );
-            assert_eq!(
-                sample(&handle, crate::metrics::SYSLOG_WRITE_TASKS_FAILED_TOTAL),
-                0
-            );
-            assert_eq!(hot.event_count(), 3);
-            let mut events = Vec::new();
-            for entry in std::fs::read_dir(wal.dir().join("prod")).unwrap() {
-                let path = entry.unwrap().path();
-                assert_eq!(path.extension().unwrap(), "ndjson");
-                events.extend(
-                    std::fs::read_to_string(path)
-                        .unwrap()
-                        .lines()
-                        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()),
-                );
-            }
-            assert_eq!(events.len(), 3);
-            assert_eq!(
-                events
-                    .iter()
-                    .filter(|event| event["service"] == "before")
-                    .count(),
-                1
-            );
-            assert_eq!(
-                events
-                    .iter()
-                    .filter(|event| event["service"] == "after")
-                    .count(),
-                2
-            );
-            assert_eq!(
-                std::fs::read(wal.dir().join("blocked")).unwrap(),
-                b"keep me"
-            );
-            assert_eq!(pipeline.write(IndexMap::new()), 0);
-            assert_eq!(
-                sample(&handle, crate::metrics::SYSLOG_WAL_EVENTS_DISCARDED_TOTAL),
-                3
-            );
-        });
-    }
-
-    #[test]
-    fn directory_sync_failure_discards_the_group_and_publishes_nothing() {
-        let recorder = crate::metrics::prometheus_builder().build_recorder();
-        let handle = recorder.handle();
-        metrics::with_local_recorder(&recorder, || {
-            crate::metrics::init_operational_alert_metrics();
-            let tmp = tempfile::tempdir().unwrap();
-            let wal = Arc::new(WalWriter::new(tmp.path().join("wal")));
-            wal.ensure_dir().unwrap();
-            let hot = Arc::new(HotBuffer::new(crate::hot_buffer::HotBufferConfig {
-                max_events: 100,
-                max_bytes: 1024 * 1024,
-            }));
-            let pipeline = PipelineWriter::new(Arc::clone(&wal), Some(Arc::clone(&hot)), None);
-            let mut batch = ServiceBatch::default();
-            for id in 0..2 {
-                batch.push(
-                    serde_json::json!({"service": "syslog", "id": id})
-                        .as_object()
-                        .unwrap()
-                        .clone(),
-                );
-            }
-            // Make `prod` durable first, so the injected failure hits the
-            // env directory sync after the rename, not the root sync.
-            std::fs::remove_file(wal.write("prod", "warm", b"{}\n").unwrap()).unwrap();
-            wal.fail_next_directory_sync_for_test();
-            let batches = IndexMap::from([(("prod".to_owned(), "syslog".to_owned()), batch)]);
-            assert_eq!(pipeline.write(batches), 0);
-            assert_eq!(
-                sample(&handle, crate::metrics::SYSLOG_WAL_EVENTS_DISCARDED_TOTAL),
-                2
-            );
-            assert_eq!(
-                sample(
-                    &handle,
-                    "trawl_wal_durability_failures_total{operation=\"parent_directory_sync\"}"
-                ),
-                1
-            );
-            assert_eq!(hot.event_count(), 0, "nothing is published");
-            let files: Vec<_> = std::fs::read_dir(wal.dir().join("prod"))
-                .unwrap()
-                .map(|entry| entry.unwrap().path())
-                .collect();
-            assert!(files.is_empty(), "no WAL file for compaction: {files:?}");
-        });
-    }
 
     // -- admitted writes (ADR-0043) -------------------------------------------
 
@@ -568,7 +403,7 @@ mod tests {
                 .unwrap();
             assert_eq!(hot.charged().events, 6, "all three groups reserved");
 
-            assert_eq!(pipeline.write_admitted(groups), 3);
+            assert_eq!(pipeline.write(groups), 3);
             assert_eq!(
                 hot.charged(),
                 durable,
@@ -586,7 +421,7 @@ mod tests {
                 std::fs::read(wal.dir().join("blocked")).unwrap(),
                 b"keep me"
             );
-            assert_eq!(pipeline.write_admitted(Vec::new()), 0);
+            assert_eq!(pipeline.write(Vec::new()), 0);
         });
     }
 
@@ -607,7 +442,7 @@ mod tests {
             // env directory sync after the rename, not the root sync.
             std::fs::remove_file(wal.write("prod", "warm", b"{}\n").unwrap()).unwrap();
             wal.fail_next_directory_sync_for_test();
-            assert_eq!(pipeline.write_admitted(vec![group]), 0);
+            assert_eq!(pipeline.write(vec![group]), 0);
             assert_eq!(
                 hot.charged(),
                 before,
@@ -645,7 +480,7 @@ mod tests {
             // under its final name (`WalWriteError::LeftVisible`).
             wal.fail_next_directory_sync_for_test();
             wal.fail_next_withdraw_for_test();
-            assert_eq!(pipeline.write_admitted(vec![group]), 0);
+            assert_eq!(pipeline.write(vec![group]), 0);
             assert_eq!(
                 hot.charged(),
                 before,
@@ -677,7 +512,7 @@ mod tests {
         assert_eq!(huge.charge(), unbounded);
         drop(huge);
         let group = admit(&pipeline, "prod", "svc", 2);
-        assert_eq!(pipeline.write_admitted(vec![group]), 2);
+        assert_eq!(pipeline.write(vec![group]), 2);
         assert_eq!(
             std::fs::read_dir(wal.dir().join("prod")).unwrap().count(),
             1
@@ -685,7 +520,7 @@ mod tests {
     }
 
     #[test]
-    fn publish_admitted_moves_the_reservation_into_the_hot_buffer() {
+    fn publish_moves_the_reservation_into_the_hot_buffer() {
         let tmp = tempfile::tempdir().unwrap();
         let wal = Arc::new(WalWriter::new(tmp.path().join("wal")));
         wal.ensure_dir().unwrap();
@@ -698,7 +533,7 @@ mod tests {
         } = admit(&pipeline, "prod", "svc", 3);
         let charge = batch.charge();
         let path = wal.write(&env, &svc, &batch.ndjson).unwrap();
-        pipeline.publish_admitted(&env, &svc, batch, &path, reservation);
+        pipeline.publish(&env, &svc, batch, &path, reservation);
         assert_eq!(hot.charged(), charge);
         assert_eq!(
             (hot.event_count(), hot.byte_count()),

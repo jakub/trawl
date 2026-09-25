@@ -2176,7 +2176,7 @@ mod tests {
         let mut event = serde_json::Map::new();
         event.insert("service".into(), "svc".into());
         event.insert("message".into(), "hello".into());
-        hot.insert_evicting(Arc::new(IngestBatch {
+        hot.insert_for_test(Arc::new(IngestBatch {
             batch_id: "b1".into(),
             service: "svc".into(),
             byte_size: 64,
@@ -2424,7 +2424,7 @@ mod tests {
         let mut event = serde_json::Map::new();
         event.insert("service".into(), "svc".into());
         event.insert("lvl".into(), 17.into());
-        hot.insert_evicting(Arc::new(IngestBatch {
+        hot.insert_for_test(Arc::new(IngestBatch {
             batch_id: "b1".into(),
             service: "svc".into(),
             byte_size: 64,
@@ -2497,7 +2497,7 @@ mod tests {
         event.insert("_ingested".into(), "2026-01-03T00:05:01Z".into());
         event.insert("service".into(), "svc".into());
         event.insert("hostname".into(), "web-1".into());
-        hot.insert_evicting(Arc::new(IngestBatch {
+        hot.insert_for_test(Arc::new(IngestBatch {
             batch_id: "b1".into(),
             service: "svc".into(),
             byte_size: 64,
