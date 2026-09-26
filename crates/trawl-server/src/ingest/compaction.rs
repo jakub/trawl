@@ -1859,34 +1859,42 @@ async fn compact_service_batch(
     // Phase 1: read + infer + propose (blocking). `known` comes back out of
     // the closure rather than being cloned into it: phase 2 folds this
     // batch's new pins into it instead of re-reading the whole catalog.
-    let phase1 = tokio::task::spawn_blocking(move || {
-        let mut quarantined = Vec::new();
-        let result = prepare_service_batch(
-            &wal_files,
-            &data_dir_owned,
-            &service_owned,
-            &memory_limit,
-            &mut quarantined,
-            &known,
-        );
-        (result, quarantined, known)
+    // The quarantine list is shared, not returned, so a panic after a
+    // quarantine still leaves the list for the drain.
+    let quarantined = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let phase1 = tokio::task::spawn_blocking({
+        let quarantined = Arc::clone(&quarantined);
+        move || {
+            // parking_lot does not poison: an unwinding panic releases the
+            // lock and keeps what was pushed.
+            let result = prepare_service_batch(
+                &wal_files,
+                &data_dir_owned,
+                &service_owned,
+                &memory_limit,
+                &mut quarantined.lock(),
+                &known,
+            );
+            (result, known)
+        }
     })
     .await;
-    let (prep_result, quarantined, known) = match phase1 {
+    let quarantine_drain = QuarantineDrain {
+        hot_buffer: hot_buffer.clone(),
+        env,
+        quarantined: std::mem::take(&mut *quarantined.lock()),
+    };
+    let quarantined = quarantine_drain.count();
+    let (prep_result, known) = match phase1 {
         Ok(v) => v,
         Err(e) => {
+            quarantine_drain.run().await;
             return CompactOutcome {
-                quarantined: 0,
+                quarantined,
                 result: Err(crate::error::join_failure_text("compaction", e)),
             };
         }
     };
-    let quarantine_drain = QuarantineDrain {
-        hot_buffer: hot_buffer.clone(),
-        env,
-        quarantined,
-    };
-    let quarantined = quarantine_drain.count();
     let prep = match prep_result {
         Ok(Some(p)) => p,
         // All inputs corrupt — data loss surfaced via the quarantine count.
@@ -1990,8 +1998,9 @@ fn wal_batch_id(env: &str, wal_file: &Path) -> Option<String> {
 /// A quarantined file is renamed to `.corrupt`, out of every later scan, so
 /// no later chunk can name its batch again. A publish drains it with the
 /// rest of the chunk, since the chunk's batch ids name every input; the
-/// all-corrupt branch drains the whole chunk. A chunk that fails after a
-/// quarantine drains nothing, so [`Self::run`] drains these; otherwise
+/// all-corrupt branch drains the whole chunk. A chunk that fails (or
+/// panics) after a quarantine drains nothing, so [`Self::run`] drains
+/// these; otherwise
 /// their charge would stay until restart. The quarantined rows never reach
 /// cold storage, which is outside ADR-0041's publication guarantee.
 struct QuarantineDrain<'a> {
@@ -2632,6 +2641,46 @@ struct WriteReport {
     observed_fields: Vec<String>,
 }
 
+/// Unit-test fault: panic in phase 1 right after it quarantines a file.
+///
+/// Phase 1 runs on a blocking-pool thread, so a thread-local switch like
+/// [`publication_marker::interrupt`] cannot reach it. The switch is keyed by
+/// the data directory instead, which each test owns.
+#[cfg(test)]
+mod phase1_panic {
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    static ARMED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+    /// Panic after a quarantine at or under `data_dir` until the guard
+    /// drops. Phase 1 sees the env's data directory.
+    pub(super) fn arm(data_dir: &Path) -> Guard {
+        ARMED.lock().unwrap().push(data_dir.to_path_buf());
+        Guard(data_dir.to_path_buf())
+    }
+
+    pub(super) fn after_quarantine(data_dir: &Path, quarantined: &[PathBuf]) {
+        let armed = ARMED
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|dir| data_dir.starts_with(dir));
+        assert!(
+            !armed || quarantined.is_empty(),
+            "test panic in phase 1 after a quarantine"
+        );
+    }
+
+    pub(super) struct Guard(PathBuf);
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            ARMED.lock().unwrap().retain(|dir| *dir != self.0);
+        }
+    }
+}
+
 /// Blocking phase 1: validate + read WAL files into a `wal_batch` table,
 /// `DESCRIBE` it, and derive pin proposals for unpinned columns.
 ///
@@ -2670,6 +2719,8 @@ fn prepare_service_batch(
             quarantined.push(f.clone());
         }
     }
+    #[cfg(test)]
+    phase1_panic::after_quarantine(data_dir, quarantined);
 
     if valid_files.is_empty() {
         // Every file in the batch was corrupt — nothing readable to compact.
@@ -6034,19 +6085,24 @@ mod tests {
         CatalogUnreachable,
         /// Phase 3: the env data path is a file, so the write fails.
         WriteFails,
+        /// Phase 1 panics right after the quarantine.
+        PrepPanics,
     }
 
     /// A quarantined WAL file is renamed out of every later scan, so only
     /// the chunk that quarantined it can drain its hot batch. A publish
     /// drains it with the chunk; a chunk that fails after the quarantine
-    /// must drain it too, or its charge stays until restart. The chunk's
+    /// must drain it too, or its charge stays until restart. That includes a
+    /// chunk whose preparation panics after the quarantine. The chunk's
     /// other batches stay resident until a retry publishes them.
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one fixture, every way the chunk can end
     async fn quarantined_batches_drain_whether_or_not_their_chunk_publishes() {
         for end in [
             ChunkEnd::Publishes,
             ChunkEnd::CatalogUnreachable,
             ChunkEnd::WriteFails,
+            ChunkEnd::PrepPanics,
         ] {
             let tmp = tempfile::tempdir().unwrap();
             let wal = tmp.path().join("wal");
@@ -6101,8 +6157,9 @@ mod tests {
             };
             let catalog = match end {
                 ChunkEnd::CatalogUnreachable => Some(&dead_catalog),
-                ChunkEnd::Publishes | ChunkEnd::WriteFails => None,
+                ChunkEnd::Publishes | ChunkEnd::WriteFails | ChunkEnd::PrepPanics => None,
             };
+            let panic = matches!(end, ChunkEnd::PrepPanics).then(|| phase1_panic::arm(&data));
             let env_data = data.join("prod");
             if matches!(end, ChunkEnd::WriteFails) {
                 std::fs::create_dir_all(&data).unwrap();
@@ -6149,6 +6206,7 @@ mod tests {
             if matches!(end, ChunkEnd::WriteFails) {
                 std::fs::remove_file(&env_data).unwrap();
             }
+            drop(panic);
             assert_eq!(tick(&wal, &data, &hot).await.unwrap(), 0, "{end:?}");
             assert_eq!(hot.charged(), Charge::ZERO, "{end:?}");
             assert_eq!(hot.oldest_batch_age(), None, "{end:?}");
