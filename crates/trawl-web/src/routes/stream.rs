@@ -23,7 +23,7 @@ use tokio::time::{Instant, sleep_until};
 
 use crate::error::ProxyError;
 use crate::middleware::session_extractor::Auth;
-use crate::routes::proxy::clear_cookie_for_proxied_response;
+use crate::routes::proxy::{clear_cookie_for_proxied_response, refuse_redirect};
 use crate::state::AppState;
 
 #[derive(Debug, Deserialize)]
@@ -87,6 +87,8 @@ fn forward_sse_response(
     // Routing non-2xx through `ProxyError::Upstream` would collapse
     // everything but 401/403 into 502, hiding trawld's 400 (invalid DSL)
     // and 429 (stream-concurrency limit) behind a vague "upstream error".
+    // A 3xx is the exception, for the same reason as there.
+    refuse_redirect(upstream_resp.status())?;
     let status =
         StatusCode::from_u16(upstream_resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let upstream_ct = upstream_resp
