@@ -1,6 +1,6 @@
 # First run is a trial the CLI owns; an installation starts fresh
 
-status: accepted (2026-09-25), prep record for #203
+status: accepted (2026-09-25), prep record for #203; amended (2026-09-25) during the #203 run, see the Amendment
 
 Before a first query, an evaluator needs five executables, PostgreSQL with two databases, two roles, two keys, a certificate, and a hand-written config. No install channel creates a key. A fresh `apt install` starts `trawld` against placeholder database URLs, and systemd restarts it every five seconds. This record adds a **trial**: a disposable installation that the `trawl` CLI creates, runs, and deletes on one Linux machine. It also makes the Debian package install without starting anything.
 
@@ -13,6 +13,7 @@ Before a first query, an evaluator needs five executables, PostgreSQL with two d
 **Loopback only.** The API listens on `127.0.0.1:15514` and the browser UI on `127.0.0.1:18090`. PostgreSQL has no published port, and syslog is off. The browser origins are `http://localhost:18090` and `http://127.0.0.1:18090`. Insecure cookies are allowed because the browser leg is plain HTTP on loopback. Other local processes can reach both ports, and the host's root and Docker administrators can read every secret. The trial does not protect against them.
 
 **Clients verify the trial's certificate.** The trial generates its own certificate with a SAN for the in-network service name. The CLI and `trawl-web` pin it through a new CA setting: `ca_cert` on a CLI profile, and an upstream CA path on `trawl-web`. No insecure flag is part of the trial. With the CA setting in place, the CLI warns when `insecure` is on. `trawl-web` accepts `TRAWL_WEB_INSECURE_UPSTREAM` only for a loopback upstream, which is what the Debian package and the Helm chart use.
+*Amended 2026-09-25 ([the Debian package pins trawld's certificate](#amendment-the-debian-package-pins-trawlds-certificate-2026-09-25)): only the Helm chart uses the loopback switch. The Debian package pins trawld's generated certificate through `[web] upstream_ca_path`.*
 
 **Secrets travel as files, never as environment.** The CLI pipes each secret on stdin into a mode-0400 file in the volume of the container that reads it. The PostgreSQL superuser password never leaves the PostgreSQL volume. Separate `fleet` and `trawl` owner roles own the two databases, as in a durable installation. The host keeps only the two tokens, at mode 0600, and the public certificate.
 
@@ -47,3 +48,11 @@ Before a first query, an evaluator needs five executables, PostgreSQL with two d
 **Three opt-in sample events**, rejected: the histogram, facets, and quick-start examples show nothing.
 
 **A promotion command**, rejected: it turns a loopback, self-signed evaluation into an exposed production server.
+
+## Amendment: the Debian package pins trawld's certificate, 2026-09-25
+
+The Decision said the Debian package uses `TRAWL_WEB_INSECURE_UPSTREAM`. It did not. The package shipped the variable commented out in `/etc/default/trawl-web` and set no CA, so `trawl-web` checked trawld's self-signed certificate against the platform roots. A stock install could not sign in. The human decided during the #203 run to pin the certificate and keep the switch off.
+
+The packaged `trawld.toml` sets `[web] upstream_ca_path` to `/var/lib/trawl/tls/cert.pem`. `trawld` writes that certificate on its first start when `tls_cert_path` is not set. Until the file exists, `trawl-web` refuses to start, and systemd restarts it every 5 seconds. An operator who sets `tls_cert_path` points `upstream_ca_path` at the CA that issued that certificate. To use the switch instead, the operator removes `upstream_ca_path`, because `trawl-web` refuses to start with both set.
+
+The Helm chart keeps the loopback switch. There, `trawl-web` runs beside `trawld` in the same pod and reaches it on loopback.
