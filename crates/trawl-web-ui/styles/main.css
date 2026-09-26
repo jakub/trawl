@@ -2319,7 +2319,8 @@
  * slot is a stretched grid item, which gives its child a definite height
  * to resolve `height: 100%` against. The slot itself (::details-content)
  * keeps its native styles, which are what take a closed rail's controls
- * out of the tab order. */
+ * out of the tab order. FacetSidebar also marks a closed wide rail's
+ * content `inert`, so find-in-page cannot open the rail to show a match. */
 .facet-panel {
   --facet-strip-w: 32px;
   --facet-head-h: 36px;
