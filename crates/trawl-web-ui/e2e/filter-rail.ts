@@ -40,20 +40,32 @@ export async function expectRail(page: Page, open: boolean) {
  *
  * The browser queues `toggle` as a task after the `open` attribute
  * changes, so both ends wait two animation frames and a task. Before
- * the listener goes on, that lets a toggle the preceding automatic
- * change already queued fire uncounted. Before the reader reads, it
- * lets a toggle the last change queued be counted. */
+ * the count starts, that lets a toggle the preceding automatic change
+ * already queued fire uncounted. Before the reader reads, it lets a
+ * toggle the last change queued be counted.
+ *
+ * One listener per document, whatever the number of calls: a second
+ * call starts the count again from zero instead of adding a listener
+ * that counts every toggle twice. `toggle` does not bubble, so the
+ * listener catches it on the way down, in the capture phase. */
 export async function watchToggles(page: Page): Promise<() => Promise<number>> {
-  await page.locator(SEL.filterRail).evaluate(async (el) => {
+  await page.locator(SEL.filterRail).evaluate(async (_el, rail) => {
     await new Promise<void>((resolve) =>
       requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(resolve))),
     );
-    const w = window as unknown as { __railToggles: number };
+    const w = window as unknown as { __railToggles: number; __railTogglesWatched?: true };
     w.__railToggles = 0;
-    el.addEventListener('toggle', () => {
-      w.__railToggles += 1;
-    });
-  });
+    if (!w.__railTogglesWatched) {
+      w.__railTogglesWatched = true;
+      document.addEventListener(
+        'toggle',
+        (event) => {
+          if ((event.target as Element).matches(rail)) w.__railToggles += 1;
+        },
+        true,
+      );
+    }
+  }, SEL.filterRail);
   return () =>
     page.evaluate(
       () =>
