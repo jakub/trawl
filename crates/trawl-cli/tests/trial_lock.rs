@@ -6,7 +6,8 @@
 //!
 //! Both run `trawl trial down --yes` against an empty temp
 //! `XDG_STATE_HOME`, with `docker` on `PATH` replaced by a stub that
-//! passes preflight and lists an empty engine. The stub's container
+//! passes preflight and lists an empty engine, and `DOCKER_HOST` naming
+//! a socket the test binds, because preflight trusts only a real socket. The stub's container
 //! listing blocks until the test releases it, so the first invocation
 //! holds the lifecycle lock while it lists. The second must report that it
 //! is waiting, and must not reach its own listing until the first has
@@ -50,7 +51,7 @@ esac
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-fn down(state: &Path, stub: &Path) -> (Child, mpsc::Receiver<String>) {
+fn down(state: &Path, stub: &Path, host: &str) -> (Child, mpsc::Receiver<String>) {
     let path = std::env::join_paths(
         std::iter::once(stub.to_owned()).chain(std::env::split_paths(
             &std::env::var_os("PATH").unwrap_or_default(),
@@ -68,7 +69,7 @@ fn down(state: &Path, stub: &Path) -> (Child, mpsc::Receiver<String>) {
         .args(["trial", "down", "--yes"])
         .env("XDG_STATE_HOME", state)
         .env("HOME", state)
-        .env("DOCKER_HOST", "unix:///stub/docker.sock")
+        .env("DOCKER_HOST", host)
         .env("PATH", path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -118,13 +119,16 @@ fn concurrent_trial_commands_run_one_at_a_time() {
     std::fs::create_dir(&stub).unwrap();
     stub_docker(&stub);
     let state = tmp.path().join("state");
+    let socket = stub.join("docker.sock");
+    let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let host = format!("unix://{}", socket.display());
 
-    let (first, first_lines) = down(&state, &stub);
+    let (first, first_lines) = down(&state, &stub, &host);
     wait_for("the first command's listing", || log(&stub).len() == 1);
     let first_pid = first.id();
     assert_eq!(log(&stub), [format!("start {first_pid}")]);
 
-    let (second, second_lines) = down(&state, &stub);
+    let (second, second_lines) = down(&state, &stub, &host);
     let second_pid = second.id();
     let deadline = Instant::now() + STEP;
     loop {

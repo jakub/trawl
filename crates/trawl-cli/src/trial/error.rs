@@ -225,6 +225,15 @@ pub enum TrialError {
     )]
     SamplesUnaccounted { counts: String },
 
+    #[error(
+        "refusing the Docker socket {}: {problem}. The trial connects only to a socket \
+         owned by root or by you, reached through directories and links owned by root or \
+         by you that group and other cannot write to (unless the sticky bit is set), so \
+         that no other user can put another socket in its place",
+        path.display()
+    )]
+    UntrustedDockerSocket { path: PathBuf, problem: String },
+
     #[error(transparent)]
     Preflight(#[from] super::preflight::PreflightError),
 

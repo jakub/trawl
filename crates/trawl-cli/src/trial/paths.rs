@@ -51,7 +51,7 @@ const DIR_MODE: u32 = 0o700;
 
 /// Symlinks the ancestry walk follows before giving up, as the kernel's
 /// own `ELOOP` limit.
-const MAX_SYMLINK_HOPS: usize = 40;
+pub(super) const MAX_SYMLINK_HOPS: usize = 40;
 
 /// The trial's host paths.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -232,7 +232,7 @@ fn check_ancestry(path: &Path) -> Result<bool, TrialError> {
 /// A walk rather than `fs::canonicalize`: canonicalizing returns only the
 /// final directory and hides the links it followed, and each link's owner
 /// matters as much as its target's.
-fn walk_ancestry(path: &Path, me: u32) -> Result<bool, TrialError> {
+pub(super) fn walk_ancestry(path: &Path, me: u32) -> Result<bool, TrialError> {
     let mut pending: VecDeque<Step> = steps(path).collect();
     if !matches!(pending.front(), Some(Step::Root)) {
         return Err(TrialError::NotPrivateFile {
@@ -290,7 +290,7 @@ fn walk_ancestry(path: &Path, me: u32) -> Result<bool, TrialError> {
 /// The ancestry rule for one directory or symlink above the state root:
 /// owned by root or `me`, and for a directory, no group or other write
 /// unless the sticky bit is set. Anything else is refused by name.
-fn verify_ancestor(path: &Path, meta: &Metadata, me: u32) -> Result<(), TrialError> {
+pub(super) fn verify_ancestor(path: &Path, meta: &Metadata, me: u32) -> Result<(), TrialError> {
     let path = path.to_owned();
     let file_type = meta.file_type();
     if !file_type.is_dir() && !file_type.is_symlink() {
