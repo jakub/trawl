@@ -347,6 +347,9 @@ The browser address `up` and `status` print is `http://127.0.0.1:<web-port>`.
 A browser tries `localhost` on the IPv6 address `::1` first, where the trial
 does not listen and another local program could.
 
+Every `up` stops `trawl-web` and gives it a new session key before it starts
+it, so every browser session from before that `up` ends.
+
 Ports and the image are fixed when the trial is created. On a resume an
 omitted flag means the recorded value, and a different value is refused with
 a message that points to `down`. The samples are loaded once, and a resume

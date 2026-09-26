@@ -23,14 +23,16 @@
 //!    resume refuses another engine, another image id, or a changed flag.
 //! 3. the state, then the engine claim, then `compose.json`.
 //! 4. databases: the superuser password file, PostgreSQL, the two owner
-//!    roles and databases, the pgpass file, both configs, and the cookie
-//!    key. Every secret goes through [`put_file`] or sealed stdin.
+//!    roles and databases, the pgpass file, and both configs. Every secret
+//!    goes through [`put_file`] or sealed stdin.
 //! 5. `fleet-admin migrate`, through the pgpass file.
 //! 6. the certificate, copied to the host and to trawl-web's volume.
 //! 7. the two keys: kept when the token file matches the recorded prefix,
 //!    else every active key of that name is revoked and a new one minted.
-//! 8. `compose up --wait trawld trawl-web`, then `whoami` for both keys
-//!    through the pinned certificate, and one authenticated query.
+//! 8. every `up`: trawl-web stopped and given a new cookie key, so no
+//!    session from before this `up` survives, then `compose up --wait
+//!    trawld trawl-web`, `whoami` for both keys through the pinned
+//!    certificate, and one authenticated query.
 //! 9. samples, unless `--no-sample-data`: the intent is recorded before
 //!    the one POST, and completion only after the counts are verified.
 //!    [`sample::decide_samples`] rules every branch, and a result `up`
@@ -365,9 +367,18 @@ async fn setup(
     Ok(())
 }
 
-/// `compose up --wait trawld trawl-web`. A failure names the ports,
-/// because Docker's publish error is the backstop of the bind test.
+/// Stop trawl-web, give it a new cookie key, then `compose up --wait
+/// trawld trawl-web`. trawl-web reads the key at startup, so every `up`
+/// ends the browser sessions issued before it: a program that took the
+/// web port while the trial was stopped cannot replay a cookie the browser
+/// sent it. A failure to start names the ports, because Docker's publish
+/// error is the backstop of the bind test.
 async fn start_services(docker: &Docker, state: &TrialState) -> Result<(), TrialError> {
+    compose_stream(docker, &["stop", Service::Web.name()], STOP_TIMEOUT).await?;
+    progress("writing a new cookie key for trawl-web");
+    let cookie = CookieKey::generate();
+    put_file(docker, Target::Web, compose::WEB_COOKIE, cookie.expose()).await?;
+    drop(cookie);
     progress("starting trawld and trawl-web");
     compose_stream(
         docker,
@@ -771,7 +782,7 @@ async fn databases(docker: &Docker, state: &TrialState) -> Result<(), TrialError
     .await?;
     drop(passwords);
 
-    progress("writing the trawld and trawl-web configs and the cookie key");
+    progress("writing the trawld and trawl-web configs");
     put_file(
         docker,
         Target::Trawld,
@@ -786,8 +797,6 @@ async fn databases(docker: &Docker, state: &TrialState) -> Result<(), TrialError
         compose::web_toml(state).as_bytes(),
     )
     .await?;
-    let cookie = CookieKey::generate();
-    put_file(docker, Target::Web, compose::WEB_COOKIE, cookie.expose()).await?;
     Ok(())
 }
 
@@ -1815,6 +1824,49 @@ esac"#,
             "{err:?}"
         );
         assert_eq!(calls, "");
+    }
+
+    /// Every `up`, first or resumed, starts the services through
+    /// [`start_services`]. It stops trawl-web and writes a new cookie key
+    /// before starting it, so trawl-web, which reads the key at startup,
+    /// rejects every session cookie issued before this `up`
+    /// (`fleet_auth::session::decrypt` fails on another key, and
+    /// trawl-web's session extractor answers that with 401). A port taken
+    /// while the trial was stopped can have received such a cookie.
+    #[tokio::test]
+    async fn every_start_rotates_the_cookie_key_while_trawl_web_is_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_script, docker) = crate::trial::docker::tests::stub(&format!(
+            r#"d="{dir}"
+while [ "$1" != "--project-directory" ]; do shift; done
+shift 2
+eval "last=\${{$#}}"
+if [ "$last" = "{cookie}" ]; then
+  echo "put $last" >> "$d/calls"
+  cat > "$d/key.$(wc -l < "$d/calls")"
+else
+  echo "$*" >> "$d/calls"
+fi"#,
+            dir = dir.path().display(),
+            cookie = compose::WEB_COOKIE,
+        ));
+        let state = fixture(crate::trial::DEFAULT_API_PORT);
+        start_services(&docker, &state).await.unwrap();
+        start_services(&docker, &state).await.unwrap();
+
+        let calls = std::fs::read_to_string(dir.path().join("calls")).unwrap();
+        let one = format!(
+            "stop trawl-web\nput {}\nup -d --wait --wait-timeout {WAIT_SECS} trawld trawl-web\n",
+            compose::WEB_COOKIE
+        );
+        assert_eq!(calls, one.repeat(2));
+        let key = |line: usize| std::fs::read(dir.path().join(format!("key.{line}"))).unwrap();
+        let (first, second) = (key(2), key(5));
+        for written in [&first, &second] {
+            assert_eq!(&written[..3], b"32\n");
+            assert_eq!(written.len(), 3 + 32);
+        }
+        assert_ne!(first, second, "a start reused the cookie key");
     }
 
     /// A trial's own running container holds its port; anything else,
