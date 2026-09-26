@@ -519,6 +519,15 @@ refused. [Crash recovery](/architecture/recovery/) describes the protocol.
    file. Removing it makes compaction merge those WAL files again, which
    duplicates their rows if they were published.
 
+While a marker keeps blocking, every compaction pass counts it as a failure.
+After a failed pass, compaction starts no early pass under hot-buffer
+pressure and waits for its next regular pass, at most one
+`[ingest] compaction_interval_secs` away. This applies to every service, not
+only the blocked one, so all ingest drains at the regular cadence until the
+marker is resolved. A WAL file that fails on every pass and a WAL root entry
+that compaction cannot inspect have the same effect. Resolving the fault
+restores early draining.
+
 Resolution means that no recovery outcome of either kind was observed in the
 window. A contradictory marker repeats on every tick, so the alert keeps
 firing while that marker stays.
@@ -549,7 +558,11 @@ While ingest is refused:
 2. If the age stays near the compaction interval, compaction drains but
    senders write faster than it. Compare `trawl_hot_buffer_events` and
    `trawl_hot_buffer_bytes` with `trawl_hot_buffer_max_events` and
-   `trawl_hot_buffer_max_bytes` to see which cap is full.
+   `trawl_hot_buffer_max_bytes` to see which cap is full. Check
+   `TrawlCompactionOperationFailure` and `TrawlPublicationRecoveryBlocked`
+   too. While a failure repeats on every pass, compaction runs no early
+   passes under pressure, for any service, and drains only on its interval.
+   See [publication recovery blocked](#publication-recovery-blocked).
 3. Read the `producer` label on the raw counter to find the sender that is
    refused, and the `http_failure` WARN events with `cause_kind=hot_buffer_full`
    for the HTTP requests.

@@ -181,7 +181,7 @@ Notes:
 | `enabled` | bool | `true` | Enable `POST /api/v1/ingest` |
 | `max_body_bytes` | byte size | `"16M"` | Request body limit for ingest |
 | `wal_dir` | path | `{data.path}/wal/` | Write-ahead log directory |
-| `compaction_interval_secs` | integer | `10` | How often the WAL-to-parquet compaction task runs |
+| `compaction_interval_secs` | integer | `10` | How often the WAL-to-parquet compaction task runs. Must be greater than `0` when ingest is enabled |
 | `internal_telemetry` | bool | `true` | Write server events into the ingest pipeline as `service=trawld` |
 | `daily_rollup` | bool | `true` | Merge hourly parquet files into daily files for older dates |
 | `event_bus_capacity` | integer | `4096` | Broadcast channel capacity behind SSE. A full channel makes slow subscribers lag |

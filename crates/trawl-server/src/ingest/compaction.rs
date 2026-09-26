@@ -82,8 +82,8 @@ impl PassPlan {
 /// Pressure passes follow what the last pass reported ([`PassOutcome`]):
 /// `eligible`, the WAL files its scan selected; `drained`, the batches it
 /// compacted and drained; and `persistent_failures`, its failed chunks,
-/// blocking publication markers and failed WAL scans. The first rule that
-/// matches decides:
+/// blocking publication markers and failed or incomplete WAL scans. The
+/// first rule that matches decides:
 ///
 /// 1. **Cooldown** when `persistent_failures > 0`, or when `eligible > 0`
 ///    and `drained == 0`. The WAL is stuck, and a rerun would fail or skip
@@ -103,6 +103,14 @@ impl PassPlan {
 /// buffer back to `Open` while the stuck WAL stays. Quarantines and rollup
 /// failures do not count: a quarantined file leaves the WAL, and a failed
 /// rollup does not stop the WAL from draining.
+///
+/// A failure that stays until an operator fixes it cools down every pressure
+/// pass, whichever service it belongs to: a contradictory publication marker
+/// for another service, a WAL file that always fails, or a WAL root entry
+/// the scan cannot inspect. Early draining is then lost for every service.
+/// Each cooldown lasts at most one interval, the cadence without pressure
+/// passes, and fixing the fault restores early draining. ADR-0043 accepts
+/// this trade over a cooldown scoped to the services that hold charge.
 ///
 /// A pass with no eligible WAL is not a stall. It ran before the charge that
 /// woke it reached the WAL: a producer reserves, writes its WAL file and
