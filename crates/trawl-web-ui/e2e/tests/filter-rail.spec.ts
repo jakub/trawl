@@ -19,7 +19,7 @@
 
 import fs from 'node:fs';
 import { test, expect, resetScenario } from '../fixtures';
-import { expectRail, watchToggles } from '../filter-rail';
+import { expectRail, expectTextShown, watchToggles } from '../filter-rail';
 import { COPY, SEL } from '../selectors';
 import type { Page } from '@playwright/test';
 
@@ -96,8 +96,7 @@ test('filter rail: idle /search is a closed strip', async ({ page, request }) =>
   await expect(page.locator('.search-quick-start')).toBeVisible();
   await expectRail(page, false);
   // The strip is the summary, set vertically, and nothing else shows.
-  await expect(page.locator(SEL.filterRailSummary)).toBeVisible();
-  await expect(page.locator(SEL.filterRailSummary)).toContainText('Filters');
+  await expectTextShown(page.locator(SEL.filterRailSummary), 'Filters');
   await expect(page.locator(SEL.facetFilterInput)).toBeHidden();
 });
 
@@ -326,11 +325,13 @@ test('filter rail: a hand open on idle holds through an aggregation and says why
   expect(page.url()).toBe(url);
   expect(await page.evaluate(() => localStorage.getItem('trawl.ui'))).toBe(prefs);
   await expect(page.locator(SEL.facetHint)).toHaveText(COPY.railHintNothingToCount);
+  await expectTextShown(page.locator(SEL.facetHint), COPY.railHintNothingToCount);
 
   await haul(page, AGGREGATE);
   await expectAccepted(page);
   await expectRail(page, true);
   await expect(page.locator(SEL.facetHint)).toHaveText(COPY.railHintAggregate);
+  await expectTextShown(page.locator(SEL.facetHint), COPY.railHintAggregate);
   await expect(page.locator(SEL.facetFilterInput)).toHaveCount(0);
   await expect(page.locator(SEL.facetGroup)).toHaveCount(0);
 });
@@ -343,6 +344,7 @@ test('filter rail: a hand-opened rail on a zero-row page says there is nothing t
   await page.locator(SEL.filterRailSummary).click();
   await expectRail(page, true);
   await expect(page.locator(SEL.facetHint)).toHaveText(COPY.railHintNothingToCount);
+  await expectTextShown(page.locator(SEL.facetHint), COPY.railHintNothingToCount);
   await expect(page.locator(SEL.facetFilterInput)).toHaveCount(0);
   await expect(page.locator(SEL.facetGroup)).toHaveCount(0);
 });
@@ -356,6 +358,7 @@ test('filter rail: a malformed link leaves the strip, and an open rail shows its
   await expectRail(page, true);
   // Suppression outranks the hint: nothing but the header row.
   await expect(page.locator(SEL.filterRailSummary)).toHaveText('Filters');
+  await expectTextShown(page.locator(SEL.filterRailSummary), 'Filters');
   await expect(page.locator(SEL.facetCount)).toHaveText('');
   await expect(page.locator(SEL.facetHint)).toHaveCount(0);
   await expect(page.locator(SEL.facetFilterInput)).toHaveCount(0);

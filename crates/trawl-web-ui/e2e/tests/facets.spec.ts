@@ -348,7 +348,16 @@ for (const [name, url] of [
     await page.goto(url);
     await expect(page.locator(SEL.cmContent)).toBeVisible();
     await expectRail(page, false);
-    await page.getByRole('link', { name: 'Skip to results', exact: true }).focus();
+    // By keyboard from the top of the page, as a reader arrives: the
+    // shell's skip link into the main content, then the page's two.
+    await page.keyboard.press('Tab');
+    await expect(page.getByRole('link', { name: 'Skip to main content', exact: true })).toBeFocused();
+    await page.keyboard.press('Enter');
+    await expect(page.locator('#fleet-main-content')).toBeFocused();
+    await page.keyboard.press('Tab');
+    await expect(page.getByRole('link', { name: 'Skip to query editor', exact: true })).toBeFocused();
+    await page.keyboard.press('Tab');
+    await expect(page.getByRole('link', { name: 'Skip to results', exact: true })).toBeFocused();
     await page.keyboard.press('Tab');
     await expectFocusRing(page.locator(SEL.filterRailSummary));
     // The console's first control is the query editor.

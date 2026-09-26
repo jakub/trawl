@@ -8,7 +8,7 @@
 
 import { expect } from './fixtures';
 import { SEL } from './selectors';
-import type { Page } from '@playwright/test';
+import type { Locator, Page } from '@playwright/test';
 
 /** fleet-ui's `--facets-w`, the open rail. */
 export const OPEN_WIDTH = 224;
@@ -64,4 +64,40 @@ export async function watchToggles(page: Page): Promise<() => Promise<number>> {
           ),
         ),
     );
+}
+
+/** `text` is drawn where a reader can see it: one run of it inside
+ * `locator` has a box of its own, inside the element's box, in a visible
+ * element. `toHaveText` passes on text nobody can see, and `toBeVisible`
+ * on an element whose text is clipped away or hidden. */
+export async function expectTextShown(locator: Locator, text: string) {
+  await expect(locator).toBeVisible();
+  await expect
+    .poll(
+      () =>
+        locator.evaluate((el, text) => {
+          const box = el.getBoundingClientRect();
+          const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+          for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+            const at = node.textContent!.indexOf(text);
+            if (at < 0) continue;
+            const range = document.createRange();
+            range.setStart(node, at);
+            range.setEnd(node, at + text.length);
+            const run = range.getBoundingClientRect();
+            return (
+              run.width > 0 &&
+              run.height > 0 &&
+              run.left >= box.left - 1 &&
+              run.right <= box.right + 1 &&
+              run.top >= box.top - 1 &&
+              run.bottom <= box.bottom + 1 &&
+              node.parentElement!.checkVisibility({ opacityProperty: true, visibilityProperty: true })
+            );
+          }
+          return false;
+        }, text),
+      { message: `"${text}" should be drawn inside the element` },
+    )
+    .toBe(true);
 }

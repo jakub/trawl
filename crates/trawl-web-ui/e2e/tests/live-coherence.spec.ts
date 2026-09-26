@@ -19,7 +19,7 @@
 // (ADR-0044).
 
 import { test, expect, resetScenario, capturedQueryCount, lastCapturedQuery } from '../fixtures';
-import { expectRail, watchToggles } from '../filter-rail';
+import { expectRail, expectTextShown, watchToggles } from '../filter-rail';
 import { SEL, COPY } from '../selectors';
 
 type Pg = import('@playwright/test').Page;
@@ -305,16 +305,20 @@ test('an aggregation-shaped result computes no groups while Clear all still remo
   await expect(page.locator(SEL.exactTable).locator('tbody tr')).toHaveCount(2);
   await expect(page.locator(SEL.filterChip)).toHaveCount(2);
   await expectRail(page, false);
+  // Read on the strip itself: the text is drawn, not merely present.
   const summary = page.locator(SEL.filterRailSummary);
-  await expect(summary).toContainText('Filters');
+  await expectTextShown(summary, 'Filters');
   await expect(page.locator(SEL.facetCount)).toHaveText('2 active');
+  await expectTextShown(summary, '2 active');
 
   await summary.click();
   await expectRail(page, true);
-  await expect(summary).toContainText('Filters');
+  await expectTextShown(summary, 'Filters');
   await expect(page.locator(SEL.facetCount)).toHaveText('2 active');
+  await expectTextShown(summary, '2 active');
   await expect(page.locator(SEL.facetClear)).toBeVisible();
   await expect(page.locator(SEL.facetHint)).toHaveText(COPY.railHintAggregate);
+  await expectTextShown(page.locator(SEL.facetHint), COPY.railHintAggregate);
   await expect(page.locator(SEL.facetFilterInput)).toHaveCount(0);
   await expect(page.locator(SEL.facetGroup)).toHaveCount(0);
 
