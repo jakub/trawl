@@ -252,13 +252,20 @@ recursion. [Check health](/operate/health/) covers the serving checks.
 
 `TrawlSyslogQueueDiscard` observes `trawl_syslog_events_dropped_total{reason}`,
 in events, when the syslog receive path abandons events. It cannot observe
-packets lost before receipt. The alert fires separately for each reason:
+packets lost before receipt. The reason follows the syslog batcher's own
+blocked state, not `trawl_hot_buffer_admission_state`. The alert fires
+separately for each reason:
 
-- `queue_full`: a UDP datagram found the listener queue full or closed while
-  hot-buffer admission was open. The batcher was slow, or the daemon was
-  stopping. TCP does not drop on a full queue; it stalls the sender.
-- `backpressure`: a UDP datagram found the queue full while the batcher was
-  waiting for hot-buffer space, or events were still refused at shutdown.
+- `queue_full`: the listener queue was full while the batcher was not
+  blocked, or the batcher was gone. A UDP datagram found the queue full
+  because the batcher was slow, or found it closed because the daemon was
+  stopping. TCP waits on a full queue instead of dropping. It counts here
+  when the batcher was gone, or when shutdown abandoned a waiting frame while
+  the batcher was not blocked.
+- `backpressure`: the batcher was holding a group that hot-buffer admission
+  refused. A UDP datagram found the queue full, or shutdown abandoned a
+  waiting TCP frame, while the batcher was blocked. Events the batcher still
+  held at shutdown count here too.
   See [syslog delivery under load](/operate/ingestion/#syslog-delivery-under-load).
 
 1. Inspect this counter alongside `trawl_syslog_events_total{transport}` and

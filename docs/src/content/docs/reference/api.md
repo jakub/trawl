@@ -1897,7 +1897,7 @@ interval but none of the hot-buffer gauges.
 | `trawl_hot_buffer_admission_state` | gauge | `0` open, `1` pressure (at or above half of either cap), `2` refusing (a reservation was refused for lack of space). Pressure and refusing clear only below a quarter of both caps |
 | `trawl_hot_buffer_admission_refusals_total{producer,kind}` | counter | Refused reservations. `producer` is `http`, `syslog`, or `trawld`. `kind` is `full`, no free space now, or `oversized`, larger than the producer's share and never admissible. All six series start at zero |
 | `trawl_compaction_interval_seconds` | gauge | `[ingest] compaction_interval_secs` |
-| `trawl_syslog_events_dropped_total{reason}` | counter | Syslog events dropped before a WAL write. `backpressure` means the batcher was refusing for lack of hot-buffer space. `queue_full` means the listener queue was full or closed while admission was open |
+| `trawl_syslog_events_dropped_total{reason}` | counter | Syslog events dropped before a WAL write. `backpressure` means the batcher was holding a group that hot-buffer admission refused. `queue_full` means the listener queue was full while the batcher was not blocked, or the batcher was gone |
 
 **Request**
 
