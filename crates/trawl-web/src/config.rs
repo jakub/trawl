@@ -462,8 +462,12 @@ fn resolve_bind_addr(env_value: Option<&str>, configured: Option<&str>) -> Strin
 /// - The variable is honoured only when the upstream URL's host is a
 ///   loopback literal: an IPv4 address in `127.0.0.0/8`, `::1`, or the name
 ///   `localhost` in any case. The decision is made on the parsed URL, by the
-///   same parser the client dials with, and never by resolving a name, so a
-///   DNS answer cannot widen it. A URL that does not parse refuses.
+///   same parser the client dials with, and never by resolving a name. That
+///   alone would not hold the boundary for `localhost`, which the client
+///   resolves when it dials; the client in this mode maps that name to
+///   `127.0.0.1` and `::1` itself and ignores proxy settings (see
+///   `state::upstream_client`), so neither a resolver answer nor a proxy
+///   can widen it. A URL that does not parse refuses.
 /// - The variable also needs an `https` upstream: it skips certificate
 ///   verification, and a plain `http` upstream would send every bearer
 ///   token in cleartext instead.
