@@ -96,8 +96,13 @@ a trial port is taken. `EVIDENCE` receives the log, the rendered configs, and
 the browser screenshots. `PRIVATE` holds the trial's `HOME`, its state, and
 `secrets.tsv`, the list of generated secret values. `scan-trial-secrets.py`
 reads that list and fails when a value appears in the evidence. The script
-never prints a secret. Under GitHub Actions it also passes each value to
-`::add-mask::`. `trial-browser.mjs` follows the tutorial's browser steps in
+never prints a secret. Everything it and its commands print goes first to
+`PRIVATE/capture.log`. Before any of it is printed,
+`harvest-trial-secrets.py` records every secret that exists at that moment,
+and under GitHub Actions passes each one to `::add-mask::`. Then the scanner
+checks the whole capture. When a value is found, the job log gets the scan
+result, and no later output. The exit trap follows the same order.
+`trial-browser.mjs` follows the tutorial's browser steps in
 Chromium, with Playwright from `crates/trawl-web-ui/e2e`. For a local run,
 set `TRIAL_IMAGE` to a locally built image, and set `TRIAL_BROWSER=skip` when
 that image has no SPA. CI refuses both. The `trial` job in
@@ -116,6 +121,8 @@ Fast helper tests:
 python3 scripts/release/test_distribution.py
 python3 scripts/release/test_cargo_runtime.py
 python3 scripts/release/test_release_source.py
+python3 scripts/release/test_scan_trial_secrets.py
+python3 scripts/release/test_trial_capture.py
 bash -n scripts/release/build-distribution.sh scripts/release/build-arm64.sh scripts/release/test-installed-debian.sh scripts/release/test-host-debian.sh
 ```
 
