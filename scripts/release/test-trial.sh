@@ -7,8 +7,8 @@
 #   EVIDENCE  a new directory for the log and the screenshots. CI uploads it,
 #             so no secret may reach it: scan-trial-secrets.py checks it.
 #   PRIVATE   a new directory, mode 0700, never uploaded: the trial's HOME and
-#             XDG_STATE_HOME, scratch files, and `secrets.tsv`, the list of
-#             every generated secret value that the scanner reads.
+#             XDG_STATE_HOME, scratch files, `capture.log`, and `secrets.tsv`,
+#             the list of every generated secret value that the scanner reads.
 #
 # Environment:
 #
@@ -24,8 +24,16 @@
 # The script creates two trials in turn and deletes both. It refuses to start
 # when the engine already holds trial resources or a trial port is taken, and
 # on exit it removes the fixtures it planted. It prints every token file's
-# path but never a secret, and registers each secret with `::add-mask::` on
-# the runner's own stdout (not the evidence log) when GITHUB_ACTIONS is set.
+# path but never a secret.
+#
+# Nothing the script or a command prints goes straight to stdout. Every byte
+# is captured in PRIVATE/capture.log first, and `release` passes it on:
+# harvest-trial-secrets.py records every secret that exists at that moment
+# (and registers its masks with `::add-mask::` when GITHUB_ACTIONS is set),
+# scan-trial-secrets.py scans the whole capture for all of them, and only
+# then is the new part printed and appended to EVIDENCE/trial.log. When the
+# scan finds a value, its result is printed instead, and nothing captured
+# afterwards is ever printed. The exit trap follows the same path.
 set -euo pipefail
 
 usage() {
@@ -68,11 +76,43 @@ SECRETS="$PRIVATE/secrets.tsv"
 mkdir -p "$DOCKER_CONFIG" "$TRIAL_HOME/.config/trawl" "$WORK"
 : >"$SECRETS"
 
-# The runner's stdout stays on fd 3 for ::add-mask:: lines; everything else
-# is also written to the evidence log.
+# The runner's stdout stays on fd 3, for ::add-mask:: lines and released
+# output. Every writer appends, so no two overwrite each other.
+CAPTURE="$PRIVATE/capture.log"
 exec 3>&1
-exec > >(tee -a "$EVIDENCE/trial.log") 2>&1
-tee_pid=$!
+exec >>"$CAPTURE" 2>&1
+released=0     # bytes of the capture already printed
+withheld=false # a scan found a secret: nothing is printed from then on
+harvest=false  # set once this run may have created a trial
+
+# Record the secrets that exist, scan the whole capture for every recorded
+# secret, and print what is new. Returns non-zero, and prints no captured
+# byte, when a secret cannot be read or a value is found.
+release() {
+  [[ $withheld == false ]] || return 1
+  # DOCKER_HOST is unset: `release` also runs inside a command that sets it
+  # for the trial, and the script refused to start with it set.
+  if [[ $harvest == true ]] && ! env -u DOCKER_HOST -u DOCKER_CONTEXT \
+    python3 "$here/harvest-trial-secrets.py" "$SECRETS" "$STATE_DIR" "${IMAGE:-}" 2>&1 >&3; then
+    withhold "the trial's secrets could not be read, so the output cannot be scanned"
+    return 1
+  fi
+  local size
+  size=$(stat -c %s "$CAPTURE")
+  head -c "$size" "$CAPTURE" >"$PRIVATE/snapshot"
+  if [[ -s "$SECRETS" ]] &&
+    ! python3 "$here/scan-trial-secrets.py" "$SECRETS" "$PRIVATE/snapshot" >"$PRIVATE/snapshot.scan" 2>&1; then
+    cat "$PRIVATE/snapshot.scan" >&3
+    withhold "the output holds a secret value"
+    return 1
+  fi
+  tail -c "+$((released + 1))" "$PRIVATE/snapshot" | tee -a "$EVIDENCE/trial.log" >&3
+  released=$size
+}
+withhold() {
+  withheld=true
+  echo "::error::$1; no captured output is printed from here on, and all of it stays in $CAPTURE" >&3
+}
 
 # These literals are checked against the product source by
 # `quick_start_queries_are_the_browsers_literals` in
@@ -93,7 +133,10 @@ PROJECT="trawl-trial"
 LABEL=sh.trawl.trial.id
 PORTS=(15514 18090 25514 28090)
 
-step() { printf '\n==== %s\n' "$*"; }
+step() {
+  release || exit 1
+  printf '\n==== %s\n' "$*"
+}
 fail() {
   echo "::error::$*"
   exit 1
@@ -117,6 +160,7 @@ capture() {
   printf -- '-- %s: exit %s\n' "$name" "$status"
   sed 's/^/   out| /' "$WORK/$name.out"
   sed 's/^/   err| /' "$WORK/$name.err"
+  release || exit 1
   return "$status"
 }
 ok() { capture "$@" || fail "$1 exited non-zero"; }
@@ -158,38 +202,12 @@ cid() {
 
 state() { jq -r "$1" "$STATE_DIR/state.json"; }
 
-record_secret() { # record_secret LABEL CLASS KIND VALUE
-  [[ -n "$4" ]] || fail "empty secret value for $1"
-  printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" >>"$SECRETS"
-  if [[ "${GITHUB_ACTIONS:-}" == true ]]; then
-    if [[ "$3" == hex-bytes ]]; then
-      local b64
-      b64=$(python3 -c 'import base64, sys; print(base64.b64encode(bytes.fromhex(sys.stdin.read().strip())).decode())' <<<"$4")
-      printf '::add-mask::%s\n' "$4" "$b64" "${b64%%=*}" "$(tr '+/' '-_' <<<"$b64")" >&3
-    else
-      printf '::add-mask::%s\n' "$4" >&3
-    fi
-  fi
-}
-
-# Read every secret of the running trial into the private list.
-collect_secrets() { # collect_secrets TRIAL-NAME
-  local pgpass fleet trawl
-  record_secret "operator token ($1)" token text "$(<"$STATE_DIR/operator.token")"
-  record_secret "ingest token ($1)" token text "$(<"$STATE_DIR/ingest.token")"
-  record_secret "operator prefix ($1)" prefix text "$(state .keys.operator.prefix)"
-  record_secret "ingest prefix ($1)" prefix text "$(state .keys.ingest.prefix)"
-  record_secret "postgres superuser password ($1)" password text \
-    "$(docker exec "$(cid postgres)" cat /var/lib/postgresql/trial/superuser.password)"
-  pgpass=$(docker exec "$(cid trawld)" cat /var/lib/trawl/trial/secrets/pgpass)
-  fleet=$(awk -F: '$3 == "fleet" && $4 == "fleet" { print $5 }' <<<"$pgpass")
-  trawl=$(awk -F: '$3 == "trawl" && $4 == "trawl" { print $5 }' <<<"$pgpass")
-  unset pgpass
-  record_secret "fleet role password ($1)" password text "$fleet"
-  record_secret "trawl role password ($1)" password text "$trawl"
-  record_secret "cookie key ($1)" cookie hex-bytes \
-    "$(docker exec "$(cid trawl-web)" od -An -v -tx1 /var/lib/trawl/trial/web.cookie | tr -d ' \n')"
-  note "recorded $(wc -l <"$SECRETS") secret values in the private list (values not shown)"
+# `release` records secrets as they appear; after an `up` that exits 0,
+# this asserts that every secret of the trial is in the private list.
+collect_secrets() {
+  python3 "$here/harvest-trial-secrets.py" --require "$SECRETS" "$STATE_DIR" "$IMAGE" 2>&1 >&3 ||
+    fail "not every secret of the trial could be read"
+  note "the private list holds $(wc -l <"$SECRETS") secret values (values not shown)"
 }
 
 scan() { # scan [--classes C,...] PATH...: nothing in the private list may appear
@@ -305,6 +323,9 @@ PY
 cleanup() {
   local status=$?
   set +e
+  # Read the secrets while the trial still exists, before anything below
+  # can delete it.
+  release
   for pid in "${background[@]}"; do kill -- "-$pid" 2>/dev/null; done
   for item in "${planted[@]}"; do
     read -r kind id <<<"$item"
@@ -314,13 +335,15 @@ cleanup() {
     echo "-- cleanup: deleting the trial this script left behind"
     t trial down --yes </dev/null
   fi
-  step "final state of the engine"
+  printf '\n==== %s\n' "final state of the engine"
   show_listing
   echo "-- listeners on the trial ports:"
   ss -Htln | awk '{ print $4 }' | grep -E ":($(IFS='|'; echo "${PORTS[*]}"))\$" | sed 's/^/   /' || echo "   (none)"
   if [[ $status -eq 0 ]]; then echo "trial proof passed"; else echo "::error::trial proof failed (exit $status)"; fi
-  exec 1>&3 2>&3
-  wait "$tee_pid" 2>/dev/null
+  if ! release; then
+    [[ $status -ne 0 ]] || status=1
+    echo "::error::trial proof failed (exit $status)" >&3
+  fi
   exit "$status"
 }
 trap cleanup EXIT
@@ -349,6 +372,9 @@ else
 fi
 IMAGE_ID=$(docker image inspect --format '{{.Id}}' "$IMAGE")
 note "trawl image $IMAGE is $IMAGE_ID"
+# The engine held no trial resource when the check above ran, so from here
+# on every trial on it is this run's, and `release` reads its secrets.
+harvest=true
 printf '[profiles.unrelated]\nurl = "https://unrelated.invalid:5514"\n' >"$TRIAL_HOME/.config/trawl/config.toml"
 config_hash=$(sha256sum <"$TRIAL_HOME/.config/trawl/config.toml")
 note "config.toml with one unrelated profile: sha256 ${config_hash%% *}"
@@ -428,7 +454,7 @@ if [[ -z "${TRIAL_IMAGE:-}" ]]; then
     fail "the trial did not take the default image reference"
   note "no --image: the trial resolved the default $DEFAULT_IMAGE to the image built from the tarball ($IMAGE_ID)"
 fi
-collect_secrets A
+collect_secrets
 
 step "trial A: a second up resumes without new keys or samples"
 before_keys=$(key_fingerprint)
@@ -618,8 +644,6 @@ printf "SELECT active, revoked_at IS NOT NULL FROM api_keys WHERE prefix = '%s';
 [[ "$(printf "SELECT count(*) FROM api_keys WHERE active AND name = 'trial-operator';\n" | psql_as_superuser fleet)" == 1 ]] ||
   fail "more than one active operator key"
 unset old_operator
-record_secret "operator token (A, re-minted)" token text "$(<"$STATE_DIR/operator.token")"
-record_secret "operator prefix (A, re-minted)" prefix text "$(state .keys.operator.prefix)"
 note "the old operator key is inactive and revoked, one active operator key remains, and the new prefix differs (compared privately)"
 
 step "trial A: stop keeps everything, and up resumes"
@@ -745,7 +769,7 @@ step "trial B: --api-port 25514 --web-port 28090 --no-sample-data"
 ok up-b t trial up --api-port 25514 --web-port 28090 --no-sample-data "${IMAGE_ARGS[@]}"
 says up-b "http://localhost:28090"
 says up-b "https://127.0.0.1:25514"
-collect_secrets B
+collect_secrets
 docker exec "$(cid trawl-web)" cat /var/lib/trawl/trial/web.toml >"$EVIDENCE/web-b.toml"
 grep -F 'public_origins' "$EVIDENCE/web-b.toml" | sed 's/^/   /'
 grep -qxF 'public_origins = ["http://localhost:28090", "http://127.0.0.1:28090"]' "$EVIDENCE/web-b.toml" ||
