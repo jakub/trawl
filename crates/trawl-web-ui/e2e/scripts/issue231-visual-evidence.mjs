@@ -21,6 +21,7 @@ import { spawn, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import fs from 'node:fs/promises';
+import { constants } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium, expect } from '@playwright/test';
@@ -259,6 +260,15 @@ const statusBefore = git('status', '--porcelain=v1');
 const server = spawn(process.execPath, ['harness/server.mjs'], {
   cwd: E2E, env: { ...process.env, E2E_PORT: String(PORT) }, stdio: ['ignore', 'pipe', 'inherit'],
 });
+// A signal ends this process without running the `finally` below, and the
+// harness has no channel to notice its parent went: pass the signal on, or
+// the harness keeps E2E_PORT. Chromium exits with its closed pipe.
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  process.once(signal, () => {
+    server.kill('SIGTERM');
+    process.exit(128 + constants.signals[signal]);
+  });
+}
 let browser;
 try {
   await waitForListener(server);
@@ -288,10 +298,14 @@ try {
   await fs.writeFile(path.join(OUT, 'manifest.json'), JSON.stringify(manifest, null, 2) + '\n');
   console.log(`${captures.length} captures written to ${OUT}`);
 } finally {
-  if (browser) await browser.close();
-  if (server.exitCode === null && server.signalCode === null) {
-    const exited = once(server, 'exit');
-    server.kill('SIGTERM');
-    await exited;
+  // Nested, so a browser that fails to close still lets the harness go.
+  try {
+    if (browser) await browser.close();
+  } finally {
+    if (server.exitCode === null && server.signalCode === null) {
+      const exited = once(server, 'exit');
+      server.kill('SIGTERM');
+      await exited;
+    }
   }
 }
