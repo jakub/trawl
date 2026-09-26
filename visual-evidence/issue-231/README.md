@@ -1,9 +1,8 @@
 # Filter rail evidence (issue 231)
 
-Captured on 2026-09-26 UTC from `c9593bf81e0bdbefa03865cbd8b62eb673a05b0f`.
-The SPA was built from a clean checkout of that commit. The capture script was
-still untracked when it ran and lands in the same commit as these files.
-[`manifest.json`](manifest.json) records the Git status, the script's SHA-256,
+Captured on 2026-09-26 UTC from a clean checkout of the commit that
+[`manifest.json`](manifest.json) names as `head`; the committed capture script
+ran unchanged. The manifest records the Git status, the script's SHA-256,
 the served bundle's SHA-256, and each capture's SHA-256. The rail behaviour
 follows
 [ADR-0044](../../docs/adr/0044-the-filter-rail-opens-for-a-countable-page.md).
